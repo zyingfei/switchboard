@@ -1,0 +1,253 @@
+:root {
+  color: #1b2430;
+  background: #f7f8fb;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+body {
+  margin: 0;
+}
+
+button,
+textarea {
+  font: inherit;
+}
+
+.shell {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 360px;
+  padding: 14px;
+}
+
+.topBar,
+.sectionHeader,
+.buttonRow,
+.runRow,
+.preflight {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.topBar,
+.sectionHeader,
+.runRow {
+  justify-content: space-between;
+}
+
+.eyebrow {
+  color: #52616f;
+  font-size: 12px;
+  font-weight: 700;
+  margin: 0 0 2px;
+  text-transform: uppercase;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 22px;
+  line-height: 1.15;
+}
+
+h2 {
+  font-size: 15px;
+}
+
+h3 {
+  font-size: 13px;
+}
+
+.section {
+  background: #ffffff;
+  border: 1px solid #d8dee8;
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+}
+
+.errorPanel {
+  background: #fff2f2;
+  border-color: #ef9a9a;
+  color: #a02222;
+}
+
+.noteEditor {
+  min-height: 150px;
+  resize: vertical;
+}
+
+.compactEditor {
+  min-height: 70px;
+  resize: vertical;
+}
+
+textarea {
+  border: 1px solid #bcc6d4;
+  border-radius: 6px;
+  box-sizing: border-box;
+  color: #1b2430;
+  padding: 10px;
+  width: 100%;
+}
+
+.buttonRow {
+  flex-wrap: wrap;
+}
+
+.button {
+  appearance: none;
+  background: #264653;
+  border: 1px solid #264653;
+  border-radius: 6px;
+  color: #ffffff;
+  cursor: pointer;
+  font-weight: 700;
+  min-height: 34px;
+  padding: 7px 10px;
+}
+
+.button.primary {
+  background: #2a9d8f;
+  border-color: #2a9d8f;
+}
+
+.button.secondary {
+  background: #ffffff;
+  border-color: #bcc6d4;
+  color: #1b2430;
+}
+
+.button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.eventPill,
+.status {
+  border-radius: 999px;
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 3px 8px;
+}
+
+.eventPill {
+  background: #e9edf5;
+}
+
+.status {
+  margin-left: 8px;
+}
+
+.status-queued,
+.status-injected {
+  background: #edf2ff;
+  color: #2f4f9f;
+}
+
+.status-waiting {
+  background: #fff4d8;
+  color: #845b00;
+}
+
+.status-waiting_on_user,
+.status-waiting_on_ai,
+.status-stale,
+.status-fallback {
+  background: #fff4d8;
+  color: #845b00;
+}
+
+.status-done {
+  background: #dff6ef;
+  color: #0f6e5d;
+}
+
+.status-failed {
+  background: #ffe0e0;
+  color: #9a2424;
+}
+
+.muted {
+  color: #637083;
+  font-size: 13px;
+}
+
+.warning {
+  color: #a15c00;
+}
+
+.runList,
+.preflightList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.preflight {
+  background: #f6f8fb;
+  border-radius: 6px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  padding: 8px;
+}
+
+.runRow {
+  border: 1px solid #e2e7ef;
+  border-radius: 6px;
+  padding: 8px;
+}
+
+.responseGrid,
+.patchGrid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.responsePane {
+  border: 1px solid #e2e7ef;
+  border-radius: 6px;
+  min-height: 130px;
+  padding: 8px;
+}
+
+pre {
+  color: #273241;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+}
+
+.patchGrid label {
+  color: #52616f;
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  font-weight: 700;
+  gap: 5px;
+}
+
+.patchGrid textarea {
+  min-height: 180px;
+}
+
+@media (max-width: 560px) {
+  .responseGrid,
+  .patchGrid {
+    grid-template-columns: 1fr;
+  }
+}

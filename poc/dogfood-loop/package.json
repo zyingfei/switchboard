@@ -1,0 +1,36 @@
+{
+  "name": "browser-ai-companion-poc",
+  "description": "Local-first browser AI companion POC for the mock-chat dogfood loop",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wxt",
+    "build": "wxt build",
+    "compile": "tsc --noEmit",
+    "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "e2e:install": "npx @puppeteer/browsers install chrome@stable --path .cache/chrome-for-testing",
+    "test:e2e": "npm run build && node ./scripts/run-e2e.mjs",
+    "e2e": "npm run test:e2e",
+    "postinstall": "wxt prepare"
+  },
+  "dependencies": {
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1",
+    "@puppeteer/browsers": "^2.13.0",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@types/chrome": "^0.1.40",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@wxt-dev/module-react": "^1.1.5",
+    "jsdom": "^26.0.0",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.8",
+    "wxt": "^0.20.25"
+  }
+}
