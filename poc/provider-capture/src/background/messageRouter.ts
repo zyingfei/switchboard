@@ -1,4 +1,4 @@
-import type { CaptureState, ProviderCapture } from '../capture/model';
+import { normalizeProviderCapture, type CaptureState, type ProviderCapture } from '../capture/model';
 import { nowIso } from '../shared/time';
 import { isProviderRequest, providerMessages, type ProviderRequest, type ProviderResponse } from '../shared/messages';
 import { executeInlineCapture } from './inlineCapture';
@@ -81,10 +81,11 @@ const handleRequest = async (request: ProviderRequest): Promise<ProviderResponse
   }
 
   if (request.type === providerMessages.storeCapture) {
-    const captures = await appendCapture(request.capture);
+    const capture = normalizeProviderCapture(request.capture);
+    const captures = await appendCapture(capture);
     return {
       ok: true,
-      capture: request.capture,
+      capture,
       state: {
         captures,
         lastActiveTab: summarizeTab(await getCaptureCandidateTab()),

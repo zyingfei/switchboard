@@ -19,14 +19,15 @@ export const readCaptures = async (): Promise<ProviderCapture[]> => {
 };
 
 export const writeCaptures = async (captures: ProviderCapture[]): Promise<void> => {
-  await chrome.storage.local.set({ [capturesKey]: captures });
+  await chrome.storage.local.set({ [capturesKey]: captures.map(normalizeProviderCapture) });
 };
 
 export const appendCapture = async (capture: ProviderCapture): Promise<ProviderCapture[]> => {
+  const normalizedCapture = normalizeProviderCapture(capture);
   const captures = await readCaptures();
   const nextCaptures = [
-    capture,
-    ...captures.filter((item) => captureThreadKey(item) !== captureThreadKey(capture)),
+    normalizedCapture,
+    ...captures.filter((item) => captureThreadKey(item) !== captureThreadKey(normalizedCapture)),
   ].slice(0, 30);
   await writeCaptures(nextCaptures);
   return nextCaptures;

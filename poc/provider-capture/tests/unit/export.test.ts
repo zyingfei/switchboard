@@ -72,4 +72,22 @@ describe('capture export', () => {
       'chatgpt-homebrew-claude-upgrade-error-research-report-2026-04-25T12-34-56-000Z.md',
     );
   });
+
+  it('does not throw when rendering a legacy or partial capture shape', () => {
+    const partialCapture = {
+      ...sampleCapture,
+      artifacts: undefined,
+      warnings: undefined,
+      capturedAt: undefined,
+    } as unknown as ProviderCapture;
+
+    expect(() => renderCaptureMarkdown(partialCapture)).not.toThrow();
+    expect(() => buildCaptureDownloadName(partialCapture)).not.toThrow();
+    expect(() =>
+      renderArtifactMarkdown(partialCapture, {
+        ...sampleCapture.artifacts[0],
+        links: undefined,
+      } as unknown as (typeof sampleCapture.artifacts)[number]),
+    ).not.toThrow();
+  });
 });

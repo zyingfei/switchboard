@@ -102,4 +102,31 @@ describe('local storage wrapper', () => {
     expect(captures[0].warnings).toEqual([]);
     expect(storageState.get('bac.providerCapture.captures')).toEqual(captures);
   });
+
+  it('normalizes captures on append before persisting them', async () => {
+    await appendCapture({
+      id: 'partial',
+      provider: 'gemini',
+      url: 'chrome://glic/imported',
+      title: 'partial import',
+      capturedAt: '2026-04-25T00:00:00.000Z',
+      selectorCanary: 'passed',
+      turns: [
+        {
+          id: 'turn-1',
+          role: 'assistant',
+          text: 'Imported response',
+          ordinal: 0,
+          sourceSelector: 'import',
+        },
+      ],
+      artifacts: undefined as unknown as ProviderCapture['artifacts'],
+      warnings: undefined as unknown as ProviderCapture['warnings'],
+      visibleTextCharCount: 17,
+    });
+
+    const captures = await readCaptures();
+    expect(captures[0].artifacts).toEqual([]);
+    expect(captures[0].warnings).toEqual([]);
+  });
 });

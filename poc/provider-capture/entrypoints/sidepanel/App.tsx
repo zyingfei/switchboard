@@ -109,8 +109,12 @@ export default function App({ surface = 'sidepanel' }: AppProps) {
       return;
     }
 
-    saveCaptureMarkdown(selectedCapture);
-    setStatus('Saved formatted capture');
+    try {
+      saveCaptureMarkdown(selectedCapture);
+      setStatus('Saved formatted capture');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not save capture');
+    }
   };
 
   const handleSaveArtifact = (artifact: CapturedArtifact) => {
@@ -118,8 +122,12 @@ export default function App({ surface = 'sidepanel' }: AppProps) {
       return;
     }
 
-    saveArtifactMarkdown(selectedCapture, artifact);
-    setStatus(`Saved artifact: ${artifact.title}`);
+    try {
+      saveArtifactMarkdown(selectedCapture, artifact);
+      setStatus(`Saved artifact: ${artifact.title}`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not save artifact');
+    }
   };
 
   const handleOpenWorkspace = async () => {
