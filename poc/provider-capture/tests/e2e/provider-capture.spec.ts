@@ -219,3 +219,28 @@ test('captures embedded research iframe artifacts and exposes artifact controls'
     await closeFixtureServer(fixtureServer.server);
   }
 });
+
+test('imports a copied Gemini in Chrome reply through the standalone workspace', async () => {
+  const runtime = await launchExtensionRuntime();
+
+  try {
+    const workspacePage = await runtime.context.newPage();
+    await workspacePage.goto(`chrome-extension://${runtime.extensionId}/workspace.html`, {
+      waitUntil: 'domcontentloaded',
+    });
+
+    await workspacePage.getByTestId('workspace-shared-tab-title').fill('AI Design to Code Workflow');
+    await workspacePage.getByTestId('workspace-import-prompt').fill("what's this about?");
+    await workspacePage
+      .getByTestId('workspace-import-response')
+      .fill('Core Workflow\n\n1. Export artifacts\n2. Initialize repo\n3. Use Codex for implementation');
+    await workspacePage.getByTestId('workspace-import-submit').click();
+
+    await expect(workspacePage.getByTestId('capture-card-gemini')).toBeVisible();
+    await expect(workspacePage.getByTestId('capture-preview')).toContainText('Gemini in Chrome - AI Design to Code Workflow');
+    await expect(workspacePage.getByTestId('capture-preview')).toContainText('Core Workflow');
+    await expect(workspacePage.getByTestId('capture-status')).toContainText('Imported Gemini in Chrome reply');
+  } finally {
+    await runtime.close();
+  }
+});

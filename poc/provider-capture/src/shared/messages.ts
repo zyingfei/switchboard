@@ -3,6 +3,7 @@ import type { ActiveTabSummary, CaptureState, ProviderCapture } from '../capture
 export const providerMessages = {
   getState: 'BAC_PROVIDER_GET_STATE',
   reset: 'BAC_PROVIDER_RESET',
+  openWorkspace: 'BAC_PROVIDER_OPEN_WORKSPACE',
   captureActiveTab: 'BAC_PROVIDER_CAPTURE_ACTIVE_TAB',
   captureVisibleThread: 'BAC_PROVIDER_CAPTURE_VISIBLE_THREAD',
   clearCaptures: 'BAC_PROVIDER_CLEAR_CAPTURES',
@@ -14,6 +15,7 @@ export type ProviderMessageType = (typeof providerMessages)[keyof typeof provide
 export type ProviderRequest =
   | { type: typeof providerMessages.getState }
   | { type: typeof providerMessages.reset }
+  | { type: typeof providerMessages.openWorkspace }
   | { type: typeof providerMessages.captureActiveTab }
   | { type: typeof providerMessages.captureVisibleThread }
   | { type: typeof providerMessages.clearCaptures }

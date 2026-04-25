@@ -5,6 +5,7 @@ import {
   renderArtifactMarkdown,
   renderCaptureMarkdown,
 } from '../../src/capture/export';
+import { createGeminiChromeImportCapture } from '../../src/capture/importers';
 import type { CapturedArtifact, CaptureState, ProviderCapture } from '../../src/capture/model';
 import { normalizeCaptureState, providerLabels } from '../../src/capture/model';
 import { providerMessages, type ProviderRequest, type ProviderResponse } from '../../src/shared/messages';
@@ -56,16 +57,25 @@ const openDownloadLink = (url: string) => {
   anchor.click();
 };
 
-export default function App() {
+interface AppProps {
+  surface?: 'sidepanel' | 'workspace';
+}
+
+export default function App({ surface = 'sidepanel' }: AppProps) {
   const [state, setState] = useState<CaptureState>(initialState);
   const [selectedCaptureId, setSelectedCaptureId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState('Ready');
+  const [sharedTabTitle, setSharedTabTitle] = useState('');
+  const [importPrompt, setImportPrompt] = useState('');
+  const [importResponse, setImportResponse] = useState('');
 
   const selectedCapture = useMemo(
     () => state.captures.find((capture) => capture.id === selectedCaptureId) ?? state.captures[0] ?? null,
     [selectedCaptureId, state.captures],
   );
+  const isWorkspace = surface === 'workspace';
+  const activeTabHeading = isWorkspace ? 'Capture Target' : 'Active Tab';
 
   const applyResponse = (response: ProviderResponse) => {
     if (!response.ok) {
@@ -112,6 +122,53 @@ export default function App() {
     setStatus(`Saved artifact: ${artifact.title}`);
   };
 
+  const handleOpenWorkspace = async () => {
+    setBusy(true);
+    try {
+      await sendProviderMessage({ type: providerMessages.openWorkspace });
+      setStatus('Opened workspace');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not open workspace');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleReadClipboard = async () => {
+    setBusy(true);
+    try {
+      const clipboardText = await navigator.clipboard.readText();
+      if (!clipboardText.trim()) {
+        setStatus('Clipboard was empty');
+        return;
+      }
+      setImportResponse(clipboardText);
+      setStatus('Loaded clipboard text');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Clipboard read failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleImportGeminiChrome = async () => {
+    if (!importResponse.trim()) {
+      setStatus('Paste or read a Gemini response first');
+      return;
+    }
+
+    const capture = createGeminiChromeImportCapture({
+      sharedTabTitle,
+      promptText: importPrompt,
+      responseText: importResponse,
+    });
+    await runAction('Importing Gemini in Chrome capture', {
+      type: providerMessages.storeCapture,
+      capture,
+    });
+    setStatus('Imported Gemini in Chrome reply');
+  };
+
   useEffect(() => {
     void runAction('Loading state', { type: providerMessages.getState });
     const timer = window.setInterval(() => {
@@ -125,24 +182,90 @@ export default function App() {
   }, []);
 
   return (
-    <main className="shell">
+    <main className={`shell ${isWorkspace ? 'workspace' : 'sidepanel'}`}>
       <header className="hero">
         <div>
-          <p className="eyebrow">POC 2</p>
-          <h1>Provider Capture POC</h1>
+          <p className="eyebrow">{isWorkspace ? 'POC 2 Workspace' : 'POC 2'}</p>
+          <h1>{isWorkspace ? 'Provider Capture Workspace' : 'Provider Capture POC'}</h1>
         </div>
-        <button
-          className="button"
-          disabled={busy}
-          onClick={() => runAction('Refreshing active tab', { type: providerMessages.getState })}
-        >
-          Refresh
-        </button>
+        <div className="actions">
+          {!isWorkspace ? (
+            <button className="button" disabled={busy} onClick={handleOpenWorkspace}>
+              Open workspace
+            </button>
+          ) : null}
+          <button
+            className="button"
+            disabled={busy}
+            onClick={() => runAction('Refreshing active tab', { type: providerMessages.getState })}
+          >
+            Refresh
+          </button>
+        </div>
       </header>
+
+      {isWorkspace ? (
+        <section className="panel" aria-labelledby="import-heading">
+          <div className="section-heading">
+            <h2 id="import-heading">Gemini In Chrome Import</h2>
+            <div className="actions">
+              <button
+                className="button quiet"
+                data-testid="workspace-read-clipboard"
+                disabled={busy}
+                onClick={handleReadClipboard}
+              >
+                Read clipboard
+              </button>
+              <button
+                className="button primary"
+                data-testid="workspace-import-submit"
+                disabled={busy || !importResponse.trim()}
+                onClick={() => void handleImportGeminiChrome()}
+              >
+                Import copied reply
+              </button>
+            </div>
+          </div>
+          <p className="hint">
+            Keep Gemini in Chrome open in its own panel, copy the Gemini reply there, then import it here without
+            fighting the Chrome side panel UI.
+          </p>
+          <div className="form-grid" data-testid="workspace-import-form">
+            <label>
+              Shared Tab Title
+              <input
+                data-testid="workspace-shared-tab-title"
+                placeholder="Optional: the tab Gemini was looking at"
+                value={sharedTabTitle}
+                onChange={(event) => setSharedTabTitle(event.target.value)}
+              />
+            </label>
+            <label>
+              Prompt
+              <textarea
+                data-testid="workspace-import-prompt"
+                placeholder="Optional: the user prompt or question you gave Gemini"
+                value={importPrompt}
+                onChange={(event) => setImportPrompt(event.target.value)}
+              />
+            </label>
+            <label>
+              Gemini Reply
+              <textarea
+                data-testid="workspace-import-response"
+                placeholder="Paste the copied Gemini response here"
+                value={importResponse}
+                onChange={(event) => setImportResponse(event.target.value)}
+              />
+            </label>
+          </div>
+        </section>
+      ) : null}
 
       <section className="panel" aria-labelledby="active-tab-heading">
         <div className="section-heading">
-          <h2 id="active-tab-heading">Active Tab</h2>
+          <h2 id="active-tab-heading">{activeTabHeading}</h2>
           <span className="status" data-testid="capture-status">
             {status}
           </span>
@@ -151,6 +274,12 @@ export default function App() {
           Captures stay on this machine in <code>chrome.storage.local</code>. No backend, sync, screenshots, cookies,
           or hidden-field reads.
         </p>
+        {isWorkspace ? (
+          <p className="hint">
+            Workspace mode tracks the most recently accessed provider tab across windows, so the extension can stay
+            separate while Gemini in Chrome remains open.
+          </p>
+        ) : null}
         <dl className="tab-summary">
           <div>
             <dt>Provider</dt>
@@ -174,7 +303,7 @@ export default function App() {
           disabled={busy || !state.lastActiveTab}
           onClick={() => runAction('Capturing active tab', { type: providerMessages.captureActiveTab })}
         >
-          Capture active tab
+          {isWorkspace ? 'Capture latest provider tab' : 'Capture active tab'}
         </button>
       </section>
 
@@ -224,6 +353,10 @@ export default function App() {
         {!selectedCapture ? <p className="hint">Select or create a capture.</p> : null}
         {selectedCapture ? (
           <div data-testid="capture-preview">
+            <div className="stacked preview-title">
+              <strong>{selectedCapture.title}</strong>
+              <small>{selectedCapture.capturedAt}</small>
+            </div>
             <div className="preview-meta">
               <span>{providerLabels[selectedCapture.provider]}</span>
               <span>{selectedCapture.selectorCanary}</span>

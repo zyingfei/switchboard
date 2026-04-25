@@ -4,6 +4,7 @@ import { isProviderRequest, providerMessages, type ProviderRequest, type Provide
 import { executeInlineCapture } from './inlineCapture';
 import { appendCapture, clearCaptures, readCaptures } from './storage';
 import { getCaptureCandidateTab, summarizeTab } from './tabs';
+import { openWorkspace } from './workspace';
 
 const emptyState = async (lastError: string | null = null): Promise<CaptureState> => ({
   captures: await readCaptures(),
@@ -71,6 +72,11 @@ const handleRequest = async (request: ProviderRequest): Promise<ProviderResponse
 
   if (request.type === providerMessages.reset || request.type === providerMessages.clearCaptures) {
     await clearCaptures();
+    return { ok: true, state: await emptyState() };
+  }
+
+  if (request.type === providerMessages.openWorkspace) {
+    await openWorkspace();
     return { ok: true, state: await emptyState() };
   }
 

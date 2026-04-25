@@ -27,6 +27,12 @@ textarea {
   padding: 16px;
 }
 
+.shell.workspace {
+  max-width: 1040px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
 .hero,
 .section-heading,
 .preview-meta,
@@ -189,6 +195,11 @@ textarea {
   padding: 10px;
 }
 
+.form-grid {
+  display: grid;
+  gap: 12px;
+}
+
 .capture-list {
   display: grid;
   gap: 8px;
@@ -219,6 +230,11 @@ textarea {
 .preview-meta {
   justify-content: flex-start;
   flex-wrap: wrap;
+}
+
+.preview-title small {
+  color: #617078;
+  font-weight: 500;
 }
 
 .preview-meta span {

@@ -20,7 +20,7 @@ export const getCaptureCandidateTab = async (): Promise<chrome.tabs.Tab | null> 
     return active;
   }
 
-  const tabs = await chrome.tabs.query({ currentWindow: true });
+  const tabs = await chrome.tabs.query({});
   return (
     tabs
       .filter(isCaptureCandidateTab)
