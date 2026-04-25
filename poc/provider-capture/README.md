@@ -10,7 +10,7 @@ The intent here is narrow on purpose. We are not automating prompts or building 
 - The extension can capture visible conversation-oriented text from the active tab without screenshots.
 - Captures are stored only in `chrome.storage.local` in the current browser profile.
 - The side panel can show the active tab, stored captures, selector-canary status, warnings, and turn-by-turn preview.
-- The extension can also open a standalone workspace window and import copied Gemini-in-Chrome replies when `chrome://glic/` cannot be captured directly.
+- The extension can also open an optional standalone workspace window and import copied Gemini-in-Chrome replies when `chrome://glic/` cannot be captured directly.
 - Provider-specific selectors can be tested automatically with fixture pages.
 - The extraction logic can be refined against real provider DOM drift and locked in with regression tests.
 
@@ -28,7 +28,7 @@ The intent here is narrow on purpose. We are not automating prompts or building 
     - capture preview with warnings and per-turn source labels
 - `entrypoints/workspace/*`
   - standalone workspace UI for:
-    - keeping the extension out of Chrome's side panel lane
+    - giving Gemini-in-Chrome a separate surface when needed
     - importing copied Gemini-in-Chrome replies
     - reviewing local captures in a separate window
 - `src/capture/providerDetection.ts`
@@ -129,7 +129,7 @@ That was the most important refinement in this POC so far, because it proves we 
 - Existing-tab capture is mechanically sound for provider-like pages and real logged-in pages.
 - The extension can keep all captured artifacts local.
 - The side panel is enough to review captures and selector health.
-- The standalone workspace avoids UI conflict with Gemini in Chrome and can turn a copied Gemini reply into a local capture.
+- The standalone workspace is an optional fallback for Gemini in Chrome and can turn a copied Gemini reply into a local capture.
 - The TechPulse-style automated harness is working for this POC.
 - Real Gemini capture is strong enough to include assistant output plus rich visible document content.
 
@@ -192,13 +192,15 @@ poc/provider-capture/.output/chrome-mv3
 ## How To Try Gemini In Chrome
 
 1. Build and reload the unpacked extension.
-2. Click the extension action button to open the standalone workspace window.
-3. Keep Gemini in Chrome open in its own Chrome panel.
-4. In Gemini, click `Copy` on the response you want.
-5. In the workspace, click `Read clipboard` or paste the reply manually.
-6. Optionally fill in the shared-tab title and the prompt.
-7. Click `Import copied reply`.
-8. Review the imported Gemini capture in local history and export it like any other capture.
+2. Click the extension action button to open the normal side panel.
+3. In the side panel, click `Open workspace` if you want the separate Gemini-import surface.
+4. Keep Gemini in Chrome open in its own Chrome panel.
+5. In Gemini, click `Copy` on the response you want.
+6. In the workspace, click `Read clipboard` or paste the reply manually.
+7. Optionally fill in the shared-tab title and the prompt.
+8. Click `Import copied reply`.
+9. If you want to go back, click `Open side panel` from the workspace.
+10. Review the imported Gemini capture in local history and export it like any other capture.
 
 ## Why This POC Exists
 

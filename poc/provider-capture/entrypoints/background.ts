@@ -1,11 +1,10 @@
 import { defineBackground } from 'wxt/utils/define-background';
 import { captureActiveTab, createMessageRouter } from '../src/background/messageRouter';
-import { openWorkspace } from '../src/background/workspace';
 import { providerLabels } from '../src/capture/model';
 
 export default defineBackground(() => {
   const syncActionBehavior = () =>
-    chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false }).catch(() => undefined);
+    chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => undefined);
 
   chrome.runtime.onInstalled.addListener(() => {
     void syncActionBehavior();
@@ -13,9 +12,6 @@ export default defineBackground(() => {
   void syncActionBehavior();
 
   chrome.runtime.onMessage.addListener(createMessageRouter());
-  chrome.action.onClicked.addListener(() => {
-    void openWorkspace();
-  });
   chrome.commands.onCommand.addListener((command) => {
     if (command !== 'capture-active-tab') {
       return;

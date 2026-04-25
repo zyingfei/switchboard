@@ -240,6 +240,9 @@ test('imports a copied Gemini in Chrome reply through the standalone workspace',
     await expect(workspacePage.getByTestId('capture-preview')).toContainText('Gemini in Chrome - AI Design to Code Workflow');
     await expect(workspacePage.getByTestId('capture-preview')).toContainText('Core Workflow');
     await expect(workspacePage.getByTestId('capture-status')).toContainText('Imported Gemini in Chrome reply');
+
+    await workspacePage.getByTestId('workspace-open-sidepanel').click();
+    await expect(workspacePage.getByTestId('capture-status')).toContainText('Opened side panel');
   } finally {
     await runtime.close();
   }

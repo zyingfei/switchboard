@@ -134,6 +134,22 @@ export default function App({ surface = 'sidepanel' }: AppProps) {
     }
   };
 
+  const handleOpenSidePanel = async () => {
+    setBusy(true);
+    try {
+      const currentWindow = await chrome.windows.getCurrent();
+      if (typeof currentWindow.id !== 'number') {
+        throw new Error('Current window is unavailable');
+      }
+      await chrome.sidePanel.open({ windowId: currentWindow.id });
+      setStatus('Opened side panel');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not open side panel');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const handleReadClipboard = async () => {
     setBusy(true);
     try {
@@ -189,11 +205,20 @@ export default function App({ surface = 'sidepanel' }: AppProps) {
           <h1>{isWorkspace ? 'Provider Capture Workspace' : 'Provider Capture POC'}</h1>
         </div>
         <div className="actions">
-          {!isWorkspace ? (
+          {isWorkspace ? (
+            <button
+              className="button"
+              data-testid="workspace-open-sidepanel"
+              disabled={busy}
+              onClick={() => void handleOpenSidePanel()}
+            >
+              Open side panel
+            </button>
+          ) : (
             <button className="button" disabled={busy} onClick={handleOpenWorkspace}>
               Open workspace
             </button>
-          ) : null}
+          )}
           <button
             className="button"
             disabled={busy}
