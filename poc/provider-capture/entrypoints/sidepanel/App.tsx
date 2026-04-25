@@ -7,8 +7,9 @@ import {
 } from '../../src/capture/export';
 import { createGeminiChromeImportCapture } from '../../src/capture/importers';
 import type { CapturedArtifact, CaptureState, ProviderCapture } from '../../src/capture/model';
-import { normalizeCaptureState, providerLabels } from '../../src/capture/model';
+import { normalizeCaptureState, normalizeProviderCapture, providerLabels } from '../../src/capture/model';
 import { providerMessages, type ProviderRequest, type ProviderResponse } from '../../src/shared/messages';
+import { providerCaptureUiBuildId } from '../../src/shared/buildInfo';
 
 const initialState: CaptureState = {
   captures: [],
@@ -69,24 +70,32 @@ export default function App({ surface = 'sidepanel' }: AppProps) {
   const [sharedTabTitle, setSharedTabTitle] = useState('');
   const [importPrompt, setImportPrompt] = useState('');
   const [importResponse, setImportResponse] = useState('');
+  const stateView = useMemo(() => normalizeCaptureState(state), [state]);
 
   const selectedCapture = useMemo(
-    () => state.captures.find((capture) => capture.id === selectedCaptureId) ?? state.captures[0] ?? null,
-    [selectedCaptureId, state.captures],
+    () => {
+      const capture =
+        stateView.captures.find((item) => item.id === selectedCaptureId) ?? stateView.captures[0] ?? null;
+      return capture ? normalizeProviderCapture(capture) : null;
+    },
+    [selectedCaptureId, stateView.captures],
   );
+  const selectedArtifacts = selectedCapture?.artifacts ?? [];
+  const selectedWarnings = selectedCapture?.warnings ?? [];
+  const selectedTurns = selectedCapture?.turns ?? [];
   const isWorkspace = surface === 'workspace';
   const activeTabHeading = isWorkspace ? 'Capture Target' : 'Active Tab';
 
   const applyResponse = (response: ProviderResponse) => {
     if (!response.ok) {
-      setState(response.state ? normalizeCaptureState(response.state) : state);
+      setState((current) => (response.state ? normalizeCaptureState(response.state) : normalizeCaptureState(current)));
       throw new Error(response.error);
     }
     if ('state' in response) {
       setState(normalizeCaptureState(response.state));
     }
     if ('capture' in response && response.capture) {
-      setSelectedCaptureId(response.capture.id);
+      setSelectedCaptureId(normalizeProviderCapture(response.capture).id);
     }
   };
 
@@ -211,6 +220,9 @@ export default function App({ surface = 'sidepanel' }: AppProps) {
         <div>
           <p className="eyebrow">{isWorkspace ? 'POC 2 Workspace' : 'POC 2'}</p>
           <h1>{isWorkspace ? 'Provider Capture Workspace' : 'Provider Capture POC'}</h1>
+          <p className="hint" data-testid="build-id">
+            Build {providerCaptureUiBuildId}
+          </p>
         </div>
         <div className="actions">
           {isWorkspace ? (
@@ -317,23 +329,23 @@ export default function App({ surface = 'sidepanel' }: AppProps) {
           <div>
             <dt>Provider</dt>
             <dd data-testid="active-provider">
-              {state.lastActiveTab ? providerLabels[state.lastActiveTab.provider] : 'No tab'}
+              {stateView.lastActiveTab ? providerLabels[stateView.lastActiveTab.provider] : 'No tab'}
             </dd>
           </div>
           <div>
             <dt>Title</dt>
-            <dd data-testid="active-title">{state.lastActiveTab?.title ?? 'No capture-ready tab'}</dd>
+            <dd data-testid="active-title">{stateView.lastActiveTab?.title ?? 'No capture-ready tab'}</dd>
           </div>
           <div>
             <dt>URL</dt>
-            <dd className="url">{state.lastActiveTab?.url ?? 'Open a provider tab, then capture.'}</dd>
+            <dd className="url">{stateView.lastActiveTab?.url ?? 'Open a provider tab, then capture.'}</dd>
           </div>
         </dl>
-        {state.lastActiveTab?.reason ? <p className="hint">{state.lastActiveTab.reason}</p> : null}
+        {stateView.lastActiveTab?.reason ? <p className="hint">{stateView.lastActiveTab.reason}</p> : null}
         <button
           className="button primary"
           data-testid="capture-active-tab"
-          disabled={busy || !state.lastActiveTab}
+          disabled={busy || !stateView.lastActiveTab}
           onClick={() => runAction('Capturing active tab', { type: providerMessages.captureActiveTab })}
         >
           {isWorkspace ? 'Capture latest provider tab' : 'Capture active tab'}
@@ -345,15 +357,15 @@ export default function App({ surface = 'sidepanel' }: AppProps) {
           <h2 id="captures-heading">Captures</h2>
           <button
             className="button quiet"
-            disabled={busy || state.captures.length === 0}
+            disabled={busy || stateView.captures.length === 0}
             onClick={() => runAction('Clearing captures', { type: providerMessages.clearCaptures })}
           >
             Clear
           </button>
         </div>
-        {state.captures.length === 0 ? <p className="hint">No captures yet.</p> : null}
+        {stateView.captures.length === 0 ? <p className="hint">No captures yet.</p> : null}
         <div className="capture-list">
-          {state.captures.map((capture) => (
+          {stateView.captures.map((capture) => (
             <button
               className="capture-card"
               data-testid={`capture-card-${capture.provider}`}
@@ -397,17 +409,17 @@ export default function App({ surface = 'sidepanel' }: AppProps) {
               {selectedCapture.extractionConfigVersion ? <span>{selectedCapture.extractionConfigVersion}</span> : null}
             </div>
             <p className="url">{selectedCapture.url}</p>
-            {(selectedCapture.warnings?.length ?? 0) > 0 ? (
+            {selectedWarnings.length > 0 ? (
               <ul className="warnings" data-testid="capture-warnings">
-                {selectedCapture.warnings.map((warning) => (
+                {selectedWarnings.map((warning) => (
                   <li key={warning.code}>{warning.message}</li>
                 ))}
               </ul>
             ) : null}
-            {(selectedCapture.artifacts?.length ?? 0) > 0 ? (
+            {selectedArtifacts.length > 0 ? (
               <section className="artifact-list" data-testid="capture-artifacts">
                 <h3>Artifacts</h3>
-                {selectedCapture.artifacts.map((artifact) => (
+                {selectedArtifacts.map((artifact) => (
                   <article className="artifact" key={artifact.id} data-testid={`artifact-${artifact.kind}`}>
                     <div className="artifact-header">
                       <div className="stacked artifact-title">
@@ -444,7 +456,7 @@ export default function App({ surface = 'sidepanel' }: AppProps) {
               </section>
             ) : null}
             <div className="turns">
-              {selectedCapture.turns.map((turn) => (
+              {selectedTurns.map((turn) => (
                 <article className="turn" key={turn.id} data-testid={`turn-${turn.role}`}>
                   <header>
                     <strong>{turn.role}</strong>
