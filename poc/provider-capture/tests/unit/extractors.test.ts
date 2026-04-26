@@ -1,5 +1,14 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { captureVisibleConversation, visibleTextFromElement } from '../../src/capture/extractors';
+
+const loadFixtureHtml = (name: string) => {
+  const fixturePath = path.resolve(process.cwd(), 'fixtures/provider-pages', name);
+  document.open();
+  document.write(readFileSync(fixturePath, 'utf8'));
+  document.close();
+};
 
 describe('visible provider extraction', () => {
   beforeEach(() => {
@@ -76,6 +85,40 @@ describe('visible provider extraction', () => {
     expect(capture.provider).toBe('claude');
     expect(capture.turns.map((turn) => turn.role)).toEqual(['user', 'assistant']);
     expect(capture.turns[1].text).toContain('capture drift');
+  });
+
+  it('extracts signed-in ChatGPT live-thread fixture structure', () => {
+    loadFixtureHtml('chatgpt-live-thread.html');
+
+    const capture = captureVisibleConversation(document, {
+      url: 'https://chatgpt.com/c/live-thread-fixture',
+      capturedAt: '2026-04-25T00:00:00.000Z',
+    });
+
+    expect(capture.provider).toBe('chatgpt');
+    expect(capture.selectorCanary).toBe('passed');
+    expect(capture.turns).toHaveLength(2);
+    expect(capture.turns.map((turn) => turn.role)).toEqual(['user', 'assistant']);
+    expect(capture.turns[1].text).toContain('signed-in conversation DOM');
+    expect(capture.turns[1].text).toContain('Second assistant segment should merge');
+    expect(capture.turns.map((turn) => turn.text).join('\n')).not.toContain('Sidebar history should stay outside');
+  });
+
+  it('prefers the Claude live heading structure when direct selectors only see user messages', () => {
+    loadFixtureHtml('claude-live-thread.html');
+
+    const capture = captureVisibleConversation(document, {
+      url: 'https://claude.ai/chat/live-thread-fixture',
+      capturedAt: '2026-04-25T00:00:00.000Z',
+    });
+
+    expect(capture.provider).toBe('claude');
+    expect(capture.selectorCanary).toBe('passed');
+    expect(capture.turns).toHaveLength(2);
+    expect(capture.turns.map((turn) => turn.role)).toEqual(['user', 'assistant']);
+    expect(capture.turns.every((turn) => turn.sourceSelector === 'claude heading fallback')).toBe(true);
+    expect(capture.turns[1].text).toContain('hidden headings are the durable way');
+    expect(capture.turns.map((turn) => turn.text).join('\n')).not.toContain('Reply draft that should not be captured');
   });
 
   it('extracts Gemini-like turns', () => {

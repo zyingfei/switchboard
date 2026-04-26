@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Claude Live Thread Fixture</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 24px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="flex-1 flex flex-col px-4 max-w-3xl mx-auto w-full pt-1">
+        <div data-test-render-count="1">
+          <div class="contents">
+            <div class="mb-1 mt-6 group">
+              <h2 class="sr-only">You said: map the provider capture gaps before the MCP server build starts.</h2>
+              <div class="group relative inline-flex gap-2 bg-bg-300 rounded-xl pl-2.5 py-2.5 break-words text-text-100 transition-all max-w-[75ch] flex-col !px-4 max-w-[85%]">
+                <div class="flex flex-row gap-2 relative">
+                  <div class="flex-1">
+                    <div data-testid="user-message" class="font-large !font-user-message grid grid-cols-1 gap-2 py-0.5 relative">
+                      <p>Map the provider capture gaps before the MCP server build starts.</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div data-test-render-count="1">
+          <div class="group" style="height: auto; opacity: 1; transform: none">
+            <div class="contents">
+              <div data-is-streaming="false" class="group relative pb-3" style="opacity: 1; transform: none">
+                <h2 class="sr-only">
+                  Claude responded: use hidden headings plus the visible response container as the durable path.
+                </h2>
+                <div class="font-claude-response relative leading-[1.65rem]">
+                  <div>
+                    <div class="standard-markdown grid-cols-1 grid [&amp;_&gt;_*]:min-w-0 gap-3">
+                      <p>
+                        Claude live-thread fixture response: hidden headings are the durable way to pair user and
+                        assistant turns when direct selectors drift.
+                      </p>
+                      <ul>
+                        <li>Keep selector health counters local.</li>
+                        <li>Offer clipboard fallback from the side panel.</li>
+                      </ul>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="relative">
+          <div class="w-full overflow-y-auto font-large break-words transition-opacity duration-200 max-h-96 min-h-[1.5rem] pl-[6px] pt-[6px]">
+            <div contenteditable="true" role="textbox" data-testid="chat-input" aria-label="Write your prompt to Claude" aria-multiline="true">
+              Reply draft that should not be captured.
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+  </body>
+</html>
