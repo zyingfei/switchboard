@@ -12,3 +12,5 @@
 
 # Private working directory (kept on poc-planning only)
 imports/
+# Claude -> Codex worker local config and logs
+.claude-codex-worker/
