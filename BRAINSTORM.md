@@ -1,5 +1,16 @@
 # browser-ai-companion — Product Brainstorm
 
+> **Naming note (2026-04-26)**: this brainstorm doc was authored when the
+> product was internally referred to as "browser-ai-companion" / BAC, then
+> "Switchboard." The current product name (locked 2026-04-26 per ADR /
+> PR #11) is **Sidetrack**. Per the user's "keep docs unchanged, just
+> change new things being built" rule, this brainstorm intentionally
+> preserves the historical naming throughout — read "Switchboard" / "BAC"
+> as Sidetrack when applying anchors to current work. The `_BAC/` vault
+> namespace is preserved as a stable convention regardless of product
+> rename. New artifacts (PRD, AGENTS.md, ADRs, milestone plans, code) all
+> use Sidetrack. See [`AGENTS.md`](AGENTS.md) for the rename policy.
+
 > Status: open brainstorm. No scope cuts yet. Items marked `[+claude]` are extensions
 > Claude generated beyond direct user input — flag them for keep / cut.
 > Trim + prioritize → `PRD.md` (later).
