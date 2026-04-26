@@ -91,13 +91,18 @@ All on `main`:
   identity, vault canonical, no mandatory plugins.
 - **CODING_STANDARDS.md** — non-negotiables, ports & adapters,
   POC→product conversion rule.
+- **standards/00-engineering-baseline.md** — boundary validation,
+  typed errors, observability, security baseline.
+- **standards/01-api-component.md** — applies to companion's HTTP
+  surface. Contract-first (OpenAPI), resource-oriented design,
+  standard error shape, idempotency, pagination, authz,
+  observability. Use `templates/api-endpoint-rfc.md` for each
+  endpoint before implementing.
+- **standards/02-mcp-components.md** — MCP capability registry,
+  lifecycle, safety, transport.
 - **standards/03-ts-browser-plugin.md** — MV3 service-worker
   lifecycle, typed message bus, content-script isolation, permission
   minimization, storage migrations.
-- **standards/02-mcp-components.md** — MCP capability registry,
-  lifecycle, safety, transport.
-- **standards/00-engineering-baseline.md** — boundary validation,
-  typed errors, observability, security baseline.
 - **docs/adr/0001-companion-install-http-loopback.md** — companion
   install path is HTTP loopback (locked).
 
@@ -108,8 +113,10 @@ through standard architecture, then archive):
 - **`poc/local-bridge/`** — companion + extension client + 60-min
   sustained tick proven. Foundation lift.
 - **`poc/provider-capture/`** — DOM capture for ChatGPT / Claude /
-  Gemini / Codex web with selector canary + clipboard fallback. **All
-  four providers ship in M1.**
+  Gemini with selector canary + clipboard fallback. **Three providers
+  ship in M1**, plus the existing `unknown.ts` generic-page fallback
+  for any other tracked tab. **Codex web is NOT covered by the PoC** —
+  excluded from M1 (see Out of Scope).
 - **`poc/mcp-server/`** — stdio MCP server reading vault state. Read
   side; teach it to consume the live vault's richer data shape.
 - **`poc/dogfood-loop/`** — workstream graph entities (Workstream,
@@ -133,7 +140,8 @@ Design references (in this PR under `design/`):
 ### 1. `packages/sidetrack-companion/` (production scaffold)
 
 Promote `poc/local-bridge/companion/` to production-grade per
-`standards/00-engineering-baseline.md` + `standards/02-mcp-components.md`:
+`standards/00-engineering-baseline.md` + **`standards/01-api-component.md`** +
+`standards/02-mcp-components.md`:
 
 - Strict TS via `configs/ts/tsconfig.base.json`
 - Typed-lint via `configs/ts/eslint.config.mjs` (typescript-eslint)
@@ -165,6 +173,28 @@ Promote `poc/local-bridge/companion/` to production-grade per
   `POST /v1/workstreams`, `PATCH /v1/workstreams/:id`,
   `POST /v1/queue`, `POST /v1/reminders`, `GET /v1/health`,
   `GET /v1/status`. All Zod-validated. All audit-logged.
+- **Contract-first** per `standards/01-api-component.md`:
+  - One **`api-endpoint-rfc.md`** (template at
+    `templates/api-endpoint-rfc.md`) per endpoint group, landing
+    *before* the route is implemented. Land RFCs in
+    `packages/sidetrack-companion/docs/api/`.
+  - **OpenAPI spec** maintained in `packages/sidetrack-companion/openapi.yaml`
+    using `configs/openapi/openapi.base.yaml` as the base; lint with
+    `configs/openapi/api-style-rules.yaml` (Spectral or equivalent)
+    in CI.
+  - **Standard error shape** per the standard's error-envelope spec
+    (`{ error: { code, message, details } }`).
+  - **Idempotency** keys on `POST /v1/events` and `POST /v1/queue`
+    (extension may retry on companion-down recovery).
+  - **Pagination** on any future list endpoints (M1 has none, but
+    establish the convention).
+  - **Authz boundary**: `x-bac-bridge-key` header validated on every
+    non-health route; non-`127.0.0.1` origins rejected explicitly.
+  - **Observability**: structured logs include `requestId`,
+    `tool`/`route`, `durationMs`, `outcome`. Audit log
+    cross-references `requestId`.
+- Run `checklists/api-design-review.md` before merging the companion
+  scaffold and again before merging any new endpoint.
 
 ### 2. `packages/sidetrack-extension/` (production scaffold)
 
@@ -231,13 +261,17 @@ content-script logic to production-grade per
   there's no dispatch in M1), MCP (read-only enumeration is enough
   for M1; trust list is M2), Redaction rules
 
-**Capture (4 providers)**:
-- ChatGPT, Claude, Gemini, Codex web — full coverage
+**Capture (3 providers + generic fallback)**:
+- ChatGPT, Claude, Gemini — full coverage from `poc/provider-capture`
 - Auto-track on by default; per-site disable
-- Manual "Track current tab" button for any URL
+- Manual "Track current tab" button for any URL → uses the
+  generic/unknown fallback (already in PoC at
+  `poc/provider-capture/src/capture/providerConfigs/unknown.ts`)
 - Selector canary per provider per tab load
 - Clipboard-mode fallback when selector breaks
 - Source/provenance fields on every captured turn
+- **Codex web** explicitly NOT in M1 (no PoC coverage; would require
+  exploratory selector work). Reconsider in M2.
 
 **Capture queue**:
 - `chrome.storage.local`-backed queue for offline companion
@@ -285,6 +319,7 @@ roundtrip, and the cold-start variants.
 completion) — fill the relevant checklists:
 
 - `checklists/production-readiness.md`
+- `checklists/api-design-review.md` (companion HTTP surface)
 - `checklists/browser-plugin-design-review.md`
 - `checklists/mcp-design-review.md`
 
@@ -296,7 +331,7 @@ The milestone is done when **all** of the following pass:
 
 1. **Companion starts cleanly**: `npx @sidetrack/companion --vault /tmp/sidetrack-m1` boots, binds 127.0.0.1, writes `bridge.key`. Health endpoint responds within 1s.
 2. **Extension installs and connects**: load unpacked from `packages/sidetrack-extension/.output/chrome-mv3`. First-run paste of `bridge.key` connects to companion. Side-panel header shows "vault: connected · companion: running".
-3. **Multi-provider capture**: open ChatGPT, Claude, Gemini, Codex web tabs. Send messages, get assistant turns. Within 30 seconds of each turn, an event lands in `_BAC/events/<date>.jsonl` with the right `provider`, `threadId`, `threadUrl`, `capturedAt`. Side-panel Recent section shows all four threads.
+3. **Multi-provider capture**: open ChatGPT, Claude, Gemini tabs. Send messages, get assistant turns. Within 30 seconds of each turn, an event lands in `_BAC/events/<date>.jsonl` with the right `provider`, `threadId`, `threadUrl`, `capturedAt`. Side-panel Recent section shows all three threads. Plus: open one arbitrary URL (e.g. a GitHub PR) and "Track current tab" — generic-fallback capture works (URL + title + favicon land in `_BAC/threads/<bac_id>.json`).
 4. **Selector canary**: simulate a broken selector for one provider — yellow banner appears in side panel, clipboard fallback offered, capture still functional.
 5. **Stop/remove tracking**: per-tab stop and per-site stop both work. Removing a tracked item deletes from the side panel and from the vault index.
 
@@ -391,8 +426,16 @@ The "should I build X?" questions agents commonly ask:
 - **Notebook link-back (PRD §10 Case B/C)** → **No, M3+.**
 - **Screen-share-safe auto-detect** → **No, deferred per Q6 to P1+.**
   Per-workstream privacy flag (in M1) is the substantive control.
-- **Multiple providers** → **Yes, all four (ChatGPT, Claude, Gemini,
-  Codex) in M1.** Capture pattern is identical; ship the full set.
+- **Multiple providers** → **Yes, three providers (ChatGPT, Claude,
+  Gemini) plus the unknown.ts generic-fallback in M1.** Capture
+  pattern from `poc/provider-capture` is identical for the three
+  proven providers; ship the full set.
+- **Codex web** → **No, M2.** `poc/provider-capture` does NOT cover
+  it (only ChatGPT / Claude / Gemini extractors exist). Adding Codex
+  web to M1 would be exploratory selector work, not a lift-from-PoC
+  task. If users need to track Codex conversations in M1, they can
+  use the manual "Track current tab" → generic-fallback path
+  (URL + title + favicon + tab snapshot, no per-turn capture).
 
 ## Reference reading order (for the agent)
 
@@ -401,15 +444,20 @@ The "should I build X?" questions agents commonly ask:
 3. `docs/adr/0001-companion-install-http-loopback.md` (5 min)
 4. `BRAINSTORM.md` §23.0, §24.5, §27, §27.6 (10 min)
 5. `CODING_STANDARDS.md` (10 min)
-6. `standards/03-ts-browser-plugin.md` (15 min)
-7. `standards/02-mcp-components.md` (10 min)
-8. `standards/00-engineering-baseline.md` (10 min)
-9. `poc/local-bridge/README.md` + skim source (20 min)
-10. `poc/provider-capture/README.md` + skim all four extractors (25 min)
-11. `poc/mcp-server/README.md` + skim source (15 min)
-12. `poc/dogfood-loop/README.md` — workstream graph entities (15 min)
-13. `design/MVP-mocks-prompts.md` Mocks 1, 2, 3, 4, 9, 10, 11, 13 (15 min)
-14. `design/mockup-stage/REVIEW.md` + open `project/SwitchBoard.html`
+6. `standards/00-engineering-baseline.md` (10 min)
+7. `standards/01-api-component.md` + skim
+   `templates/api-endpoint-rfc.md` + `configs/openapi/openapi.base.yaml`
+   + `configs/openapi/api-style-rules.yaml` (15 min)
+8. `standards/02-mcp-components.md` (10 min)
+9. `standards/03-ts-browser-plugin.md` (15 min)
+10. `poc/local-bridge/README.md` + skim source (20 min)
+11. `poc/provider-capture/README.md` + skim THREE provider
+    extractors (chatgpt.ts, claude.ts, gemini.ts) plus the
+    unknown.ts generic fallback (20 min) — note: no codex extractor
+12. `poc/mcp-server/README.md` + skim source (15 min)
+13. `poc/dogfood-loop/README.md` — workstream graph entities (15 min)
+14. `design/MVP-mocks-prompts.md` Mocks 1, 2, 3, 4, 9, 10, 11, 13 (15 min)
+15. `design/mockup-stage/REVIEW.md` + open `project/SwitchBoard.html`
     in a browser (20 min)
 
 Total: ~3.5 hours of reading before code.
@@ -421,28 +469,32 @@ Suggested order — each step is independently reviewable:
 1. **Scaffold packages/sidetrack-companion/** — TS strict, lint, vitest, package.json + bin. Smoke: `npm test` passes.
 2. **Scaffold packages/sidetrack-extension/** — WXT + React + TS strict, lint, vitest. Side panel renders "Hello Sidetrack" + companion-status badge. Smoke: `npm run build` produces a loadable extension.
 3. **Scaffold packages/sidetrack-mcp/** — lift `poc/mcp-server` to standards. Smoke: `npm test` passes; stdio harness returns empty arrays for all tools.
-4. **Companion: HTTP server + auth + bridge.key** (lift from `poc/local-bridge/companion`). Zod schemas at every boundary. Smoke: `curl` hits `/v1/health`.
-5. **Companion: vault writer + audit log + capture-event endpoint** (Zod-validated `POST /v1/events`). Smoke: HTTP write → JSONL line in vault.
-6. **Companion: workstream/queue/reminder endpoints** (full vault writer per Deliverable 1). Smoke: each endpoint writes the expected vault file.
-7. **Extension: companion client + hot cache + queue** (lift from `poc/local-bridge/extension`). Smoke: side-panel test event → vault file grows.
-8. **Extension: provider-capture for all four providers** (lift from `poc/provider-capture`). Smoke: each provider captures an assistant turn → POSTed to companion → in vault.
-9. **Extension: side panel — Workboard sections** (Mock 1, all 6 sections). Wire to hot cache + companion state. Apply design tokens.
-10. **Extension: workstream organization** (Mock 2 + Mock 4 — create / move / nested / drag / picker / Inbox / Misc).
-11. **Extension: manual checklist** (Mock 2 sub-feature).
-12. **Extension: queue UX** (add / edit / status; no dispatch wiring).
-13. **Extension: inbound reminders** (Mock 13 first half — detection + surfacing).
-14. **Extension: tab recovery dialog** (Mock 3).
-15. **Extension: settings minimal** (Mock 9 subset — tracking, privacy, companion, about).
-16. **Extension: per-workstream privacy flag** (data model + Mock 9 picker + Mock 11 masked render).
-17. **bac-mcp: wire all M1 read tools to live vault.** Smoke: each tool returns expected data shape from a populated vault.
-18. **Failure modes (PRD §9)**: companion-down banner, vault-unreachable banner, provider-broken canary banner, queue replay on reconnect.
-19. **Standards gates + checklists** — all green.
-20. **DEMO.md + STANDARDS-CHECK.md** — write up.
+4. **Companion API design** — write `packages/sidetrack-companion/docs/api/m1-endpoints.md` from `templates/api-endpoint-rfc.md` covering health, events, threads, workstreams, queue, reminders. Author `packages/sidetrack-companion/openapi.yaml` extending `configs/openapi/openapi.base.yaml`. Wire Spectral (or equivalent) lint via `configs/openapi/api-style-rules.yaml`. Run `checklists/api-design-review.md`. **Land before any route is implemented.** Smoke: `npm run lint:openapi` green.
+5. **Companion: HTTP server + auth + bridge.key** (lift from `poc/local-bridge/companion`, refactor to the route registry pattern). Zod schemas match the RFC. Smoke: `curl` hits `/v1/health`.
+6. **Companion: vault writer + audit log + capture-event endpoint** (`POST /v1/events`). Smoke: HTTP write → JSONL line in vault.
+7. **Companion: workstream/queue/reminder endpoints** (full vault writer per Deliverable 1). Smoke: each endpoint writes the expected vault file.
+8. **Extension: companion client + hot cache + queue** (lift from `poc/local-bridge/extension`). Smoke: side-panel test event → vault file grows.
+9. **Extension: provider-capture for THREE providers** (ChatGPT / Claude / Gemini, lift from `poc/provider-capture`) plus generic-fallback for arbitrary tracked URLs. Smoke: each provider captures an assistant turn → POSTed to companion → in vault; "Track current tab" on a non-AI URL writes a thread record.
+10. **Extension: side panel — Workboard sections** (Mock 1, all 6 sections). Wire to hot cache + companion state. Apply design tokens.
+11. **Extension: workstream organization** (Mock 2 + Mock 4 — create / move / nested / drag / picker / Inbox / Misc).
+12. **Extension: manual checklist** (Mock 2 sub-feature).
+13. **Extension: queue UX** (add / edit / status; no dispatch wiring).
+14. **Extension: inbound reminders** (Mock 13 first half — detection + surfacing).
+15. **Extension: tab recovery dialog** (Mock 3).
+16. **Extension: settings minimal** (Mock 9 subset — tracking, privacy, companion, about).
+17. **Extension: per-workstream privacy flag** (data model + Mock 9 picker + Mock 11 masked render).
+18. **bac-mcp: wire all M1 read tools to live vault.** Smoke: each tool returns expected data shape from a populated vault.
+19. **Failure modes (PRD §9)**: companion-down banner, vault-unreachable banner, provider-broken canary banner, queue replay on reconnect.
+20. **Standards gates + checklists** — all green.
+21. **DEMO.md + STANDARDS-CHECK.md** — write up.
 
 Each step is its own commit (or PR for smaller reviews). The
-boundary at step 9 is intentional — steps 1-8 are infrastructure;
-9-16 are user-facing UX; 17 is glue; 18 is robustness; 19-20 is
-documentation.
+boundary at step 10 is intentional — steps 1–9 are infrastructure
+(scaffolds + API design + companion + capture); 10–17 are
+user-facing UX; 18 is glue; 19 is robustness; 20–21 is
+documentation. **Step 4 (API design RFC + OpenAPI) is a hard
+gate** — no companion route lands until the RFC + OpenAPI lint
+pass.
 
 ## Done
 

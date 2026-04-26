@@ -39,22 +39,29 @@ In this order, before writing any code:
 5.  CODING_STANDARDS.md (10 min) — non-negotiables. Especially the
     POC-to-product conversion rule (capture PoC behavior as tests;
     don't blindly promote).
-6.  standards/03-ts-browser-plugin.md (15 min) — extension standards.
-7.  standards/02-mcp-components.md (10 min) — MCP read-side standards.
-8.  standards/00-engineering-baseline.md (10 min) — boundary
+6.  standards/00-engineering-baseline.md (10 min) — boundary
     validation, typed errors, observability, security.
-9.  poc/local-bridge/README.md + skim companion/ + extension/ source
+7.  standards/01-api-component.md (15 min) — applies to companion
+    HTTP surface. Skim `templates/api-endpoint-rfc.md`,
+    `configs/openapi/openapi.base.yaml`,
+    `configs/openapi/api-style-rules.yaml`. Sequencing step 4 lands
+    the API RFC + OpenAPI before any route is implemented.
+8.  standards/02-mcp-components.md (10 min) — MCP read-side standards.
+9.  standards/03-ts-browser-plugin.md (15 min) — extension standards.
+10. poc/local-bridge/README.md + skim companion/ + extension/ source
     (20 min) — what's been proven; what to lift.
-10. poc/provider-capture/README.md + skim ALL FOUR provider
-    extractors (25 min) — capture pattern; M1 ships all four.
-11. poc/mcp-server/README.md + skim source (15 min) — read side.
-12. poc/dogfood-loop/README.md (15 min) — workstream graph entities
+11. poc/provider-capture/README.md + skim THREE provider extractors
+    (chatgpt.ts, claude.ts, gemini.ts) plus the unknown.ts generic
+    fallback (20 min) — capture pattern; M1 ships three, NOT codex
+    (no PoC).
+12. poc/mcp-server/README.md + skim source (15 min) — read side.
+13. poc/dogfood-loop/README.md (15 min) — workstream graph entities
     (Workstream / Bucket / Source / PromptRun / ContextEdge); lift
     the data model (skip the fork/converge/dispatch parts — those
     are M2).
-13. design/MVP-mocks-prompts.md Mocks 1, 2, 3, 4, 9, 10, 11, 13
+14. design/MVP-mocks-prompts.md Mocks 1, 2, 3, 4, 9, 10, 11, 13
     (15 min) — UI surface for M1.
-14. design/mockup-stage/REVIEW.md + open
+15. design/mockup-stage/REVIEW.md + open
     design/mockup-stage/project/SwitchBoard.html in a browser
     (20 min) — design language live; copy color tokens, fonts, rhythm.
     NOT a pixel-perfect target per user direction; recreate in
@@ -82,9 +89,14 @@ Three packages land in this milestone:
   M1 tool surface (recent_threads, workstream, context_pack, search,
   queued_items, inbound_reminders)
 
-The README has 20 numbered sequencing steps. Land per-step commits
-or PRs (boundary at step 9 separates infrastructure from user-facing
-UX from glue from robustness).
+The README has 21 numbered sequencing steps. Land per-step commits
+or PRs (boundary at step 10 separates infrastructure — scaffolds +
+API design + companion + capture — from user-facing UX from glue
+from robustness). **Step 4 (API design RFC + OpenAPI) is a hard
+gate**: no companion route is implemented before the RFC under
+`packages/sidetrack-companion/docs/api/` and the OpenAPI spec under
+`packages/sidetrack-companion/openapi.yaml` lint clean against
+`configs/openapi/api-style-rules.yaml`.
 
 # What to NOT build (frequent agent over-reach)
 
@@ -133,10 +145,12 @@ Capture & tracking:
    cleanly, binds 127.0.0.1, writes `_BAC/.config/bridge.key`.
 2. Extension installs from packages/sidetrack-extension/.output/
    chrome-mv3, paste-key first-run flow connects.
-3. Open ChatGPT, Claude, Gemini, Codex web → all four capture
-   assistant turns within 30s into _BAC/events/<date>.jsonl.
-4. Selector canary works on each provider; clipboard fallback
-   functional.
+3. Open ChatGPT, Claude, Gemini → all three capture assistant turns
+   within 30s into _BAC/events/<date>.jsonl. Plus: "Track current
+   tab" on a non-AI URL (e.g. a GitHub PR) writes a generic-fallback
+   thread record.
+4. Selector canary works on each of the three providers; clipboard
+   fallback functional.
 5. Stop/remove tracking per-tab and per-site.
 
 Organization:
@@ -171,10 +185,13 @@ Failure modes:
 16. Vault unreachable → banner, re-pick, no data loss.
 
 Standards:
-17. companion: lint + typecheck + test green.
+17. companion: lint + typecheck + test + openapi-lint green.
 18. extension: lint + typecheck + test + build + e2e green.
 19. mcp: lint + typecheck + test green.
 20. No `any` across boundaries; no hidden global state.
+21. checklists/api-design-review.md, browser-plugin-design-review.md,
+    mcp-design-review.md, production-readiness.md filled in
+    STANDARDS-CHECK.md.
 
 # Constraints
 
