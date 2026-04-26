@@ -249,6 +249,23 @@ describe('thread registry, vault projection, context pack, recall, and MCP POCs'
       },
       runtimeData,
     );
+    const recallParams = {
+      name: 'bac.recall',
+      arguments: {
+        query: 'calibrated freshness memory',
+        recencyWindow: '3w',
+        topK: 3,
+      },
+    } satisfies BacToolCallParams<'bac.recall'>;
+    const recall = handleMcpRequest(
+      {
+        jsonrpc: '2.0',
+        id: 6,
+        method: 'tools/call',
+        params: recallParams,
+      },
+      runtimeData,
+    );
 
     expect((list.result as { tools: typeof BAC_MCP_TOOL_DEFINITIONS }).tools.map((tool) => tool.name)).toEqual(
       BAC_MCP_TOOL_DEFINITIONS.map((tool) => tool.name),
@@ -259,5 +276,6 @@ describe('thread registry, vault projection, context pack, recall, and MCP POCs'
       '# BAC Context Pack',
     );
     expect(readJsonResult<BacSearchResponse>(search.result).hits[0]?.nodeId).toBe('note_1');
+    expect(recall.error?.message).toContain('poc/recall-vector');
   });
 });

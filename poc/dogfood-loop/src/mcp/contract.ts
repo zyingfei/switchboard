@@ -7,6 +7,7 @@ export type BacToolName =
   | 'bac.recent_threads'
   | 'bac.workstream'
   | 'bac.context_pack'
+  | 'bac.recall'
   | 'bac.search';
 
 export interface BacRecentThreadsRequest {
@@ -35,6 +36,28 @@ export interface BacContextPackResponse {
   pack: ContextPack;
 }
 
+export interface BacRecallRequest {
+  query: string;
+  recencyWindow?: '3d' | '3w' | '3m' | '3y';
+  topK?: number;
+  project?: string;
+  bucket?: string;
+}
+
+export interface BacRecallHit {
+  title: string;
+  sourcePath: string;
+  capturedAt: string;
+  score: number;
+  snippet: string;
+  recencyBucket: '0-3d' | '4-21d' | '22-90d' | '91d+';
+}
+
+export interface BacRecallResponse {
+  hits: BacRecallHit[];
+  generatedAt: string;
+}
+
 export interface BacSearchRequest {
   query: string;
   minAgeDays?: number;
@@ -50,6 +73,7 @@ export interface BacToolRequestMap {
   'bac.recent_threads': BacRecentThreadsRequest;
   'bac.workstream': BacWorkstreamRequest;
   'bac.context_pack': BacContextPackRequest;
+  'bac.recall': BacRecallRequest;
   'bac.search': BacSearchRequest;
 }
 
@@ -57,6 +81,7 @@ export interface BacToolResponseMap {
   'bac.recent_threads': BacRecentThreadsResponse;
   'bac.workstream': BacWorkstreamResponse;
   'bac.context_pack': BacContextPackResponse;
+  'bac.recall': BacRecallResponse;
   'bac.search': BacSearchResponse;
 }
 
@@ -156,6 +181,22 @@ export const BAC_MCP_TOOL_DEFINITIONS = [
       properties: {
         includeEventLog: { type: 'boolean' },
       },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'bac.recall',
+    description: 'Run calibrated-freshness semantic recall across the vault-backed BAC memory cache.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', minLength: 1 },
+        recencyWindow: { type: 'string', enum: ['3d', '3w', '3m', '3y'] },
+        topK: { type: 'number', minimum: 1 },
+        project: { type: 'string' },
+        bucket: { type: 'string' },
+      },
+      required: ['query'],
       additionalProperties: false,
     },
   },
