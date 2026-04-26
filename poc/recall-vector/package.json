@@ -1,0 +1,34 @@
+{
+  "name": "browser-ai-companion-recall-vector-poc",
+  "description": "Vault-backed recall POC for Browser AI Companion with rebuildable vector cache",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wxt",
+    "build": "wxt build",
+    "compile": "tsc --noEmit",
+    "test": "vitest run",
+    "benchmark": "tsx ./scripts/benchmark.ts",
+    "postinstall": "wxt prepare"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.8.1",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@types/chrome": "^0.1.40",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@wxt-dev/module-react": "^1.1.5",
+    "fake-indexeddb": "^6.2.5",
+    "jsdom": "^26.0.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.8",
+    "wxt": "^0.20.25"
+  }
+}

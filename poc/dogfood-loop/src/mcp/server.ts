@@ -3,6 +3,7 @@ import { findDejaVuHits } from '../recall/dejaVu';
 import {
   BAC_MCP_TOOL_DEFINITIONS,
   type BacContextPackResponse,
+  type BacRecallRequest,
   type BacRecentThreadsRequest,
   type BacRecentThreadsResponse,
   type BacSearchRequest,
@@ -155,6 +156,38 @@ export const handleMcpRequest = (
       jsonrpc: '2.0',
       id,
       result: jsonResult(response),
+    };
+  }
+
+  if (name === 'bac.recall') {
+    const query = typeof args.query === 'string' ? args.query.trim() : '';
+    if (!query) {
+      return {
+        jsonrpc: '2.0',
+        id,
+        error: { code: -32602, message: 'bac.recall requires a non-empty query' },
+      };
+    }
+    const _toolRequest: BacRecallRequest = {
+      query,
+      recencyWindow:
+        args.recencyWindow === '3d' ||
+        args.recencyWindow === '3w' ||
+        args.recencyWindow === '3m' ||
+        args.recencyWindow === '3y'
+          ? args.recencyWindow
+          : undefined,
+      topK: readPositiveInteger(args.topK),
+      project: typeof args.project === 'string' ? args.project : undefined,
+      bucket: typeof args.bucket === 'string' ? args.bucket : undefined,
+    };
+    return {
+      jsonrpc: '2.0',
+      id,
+      error: {
+        code: -32004,
+        message: 'bac.recall is owned by poc/recall-vector and is not wired into dogfood-loop yet',
+      },
     };
   }
 
