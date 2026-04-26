@@ -1,13 +1,20 @@
-# AGENTS.md — Switchboard / browser-ai-companion
+# AGENTS.md — Sidetrack (browser-ai-companion / switchboard repo)
 
 This file is the universal coding-agent guidance for this repository
 (per the Linux Foundation Agentic AI standard). All agents — Claude
 Code, Cursor, Codex CLI, JetBrains, custom — should read this before
 making changes.
 
+> **Product name**: **Sidetrack** (locked 2026-04-26). The GitHub
+> repo is currently named `switchboard` for backward-compat with
+> existing PRs; rename when convenient. Existing docs (BRAINSTORM,
+> PoC READMEs) intentionally keep historical "Switchboard" naming
+> per user direction "keep docs unchanged, just change the new
+> things we are building." New docs and code use Sidetrack.
+
 ## What this repo is
 
-Switchboard is a local-first browser AI companion: a Chrome MV3
+Sidetrack is a local-first browser AI companion: a Chrome MV3
 extension + Node companion process + stateless MCP reader that helps a
 user track active AI work across providers (ChatGPT / Claude / Gemini /
 coding agents), reorganize it manually, queue follow-ups, recover lost
@@ -23,6 +30,11 @@ Core product context:
 - **PRD (in flight)**: see PR #11 on `prd/switchboard-mvp-v1` for the
   v1 MVP scope. The PRD references the brainstorm anchors by section
   number.
+- **ADRs**: under `docs/adr/` (created on the PRD branch). ADR-0001
+  locks the companion install path as HTTP loopback over Native
+  Messaging — see [PR #11 → docs/adr/0001-companion-install-http-loopback.md](docs/adr/0001-companion-install-http-loopback.md).
+  When adding new architectural decisions, follow the same numbered
+  convention; use `templates/adr.md`.
 - **PoC code**: under [`poc/`](poc/) — five PoCs validated specific
   unknowns. Treat as evidence, not as production code. Per
   [`CODING_STANDARDS.md`](CODING_STANDARDS.md) §"POC-to-product
@@ -84,12 +96,14 @@ The verify script at [`scripts/verify-standards.sh`](scripts/verify-standards.sh
 
 ## Repo conventions
 
-These are Switchboard-specific and override anything generic in the
+These are Sidetrack-specific and override anything generic in the
 standards above:
 
-- **`_BAC/` reserved namespace** in the user's vault. All Switchboard-
+- **`_BAC/` reserved namespace** in the user's vault. All Sidetrack-
   owned files live under it; never write outside `_BAC/` without
-  explicit user action. Per BRAINSTORM §23.0 + §27.
+  explicit user action. Per BRAINSTORM §23.0 + §27. (`_BAC/` prefix
+  is preserved from the brainstorm-era naming and is now a stable
+  vault-level convention; do not rename to `_SIDETRACK/`.)
 - **Stable IDs (`bac_id`)** are identity; file paths are projections.
   Renames and moves never break references. Per BRAINSTORM §26.5.1
   invariant.
@@ -130,7 +144,7 @@ If you are an AI agent picking up work here:
    `unknown` until parsed; never use `any`; no hidden global state;
    observability is part of the feature.
 
-If a Switchboard convention conflicts with the generic kit standards,
+If a Sidetrack convention conflicts with the generic kit standards,
 the convention wins (this file is the override surface).
 
 ## Deviations / open issues
