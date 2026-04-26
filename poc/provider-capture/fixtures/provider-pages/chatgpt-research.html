@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>ChatGPT Research Fixture</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 32px;
+      }
+
+      main {
+        display: grid;
+        gap: 18px;
+      }
+
+      article {
+        border-bottom: 1px solid #d8e0e3;
+        padding: 16px 0;
+      }
+
+      iframe {
+        width: 100%;
+        min-height: 560px;
+        border: 1px solid #d8e0e3;
+        border-radius: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <article data-message-author-role="user">
+        Please explain the project and attach the full research report as a captured artifact.
+      </article>
+      <iframe src="/chatgpt-research-frame.html"></iframe>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,310 @@
+:root {
+  color: #172026;
+  background: #f5f7f8;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 360px;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+.shell {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+}
+
+.hero,
+.section-heading,
+.preview-meta,
+.turn header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.hero {
+  padding: 4px 0 2px;
+}
+
+.eyebrow {
+  margin: 0 0 2px;
+  color: #5b6b73;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 24px;
+  line-height: 1.1;
+}
+
+h2 {
+  font-size: 15px;
+}
+
+h3 {
+  font-size: 14px;
+}
+
+.panel {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid #d8e0e3;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.button {
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid #bfccd1;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #172026;
+  cursor: pointer;
+}
+
+.button:hover:not(:disabled) {
+  border-color: #80929a;
+}
+
+.button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.button.primary {
+  border-color: #1b6a70;
+  background: #1b6a70;
+  color: #ffffff;
+}
+
+.button.quiet {
+  min-height: 30px;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.status {
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: #e7f0ef;
+  color: #245a5d;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.tab-summary {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+
+.tab-summary div {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr);
+  gap: 8px;
+}
+
+dt {
+  color: #5b6b73;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.url {
+  color: #516068;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.hint {
+  color: #65747b;
+  font-size: 13px;
+}
+
+label,
+.stacked {
+  display: grid;
+  gap: 6px;
+  color: #334148;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+input,
+select,
+textarea {
+  width: 100%;
+  border: 1px solid #c8d2d6;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #172026;
+}
+
+input,
+select {
+  min-height: 34px;
+  padding: 0 9px;
+}
+
+textarea {
+  min-height: 120px;
+  resize: vertical;
+  padding: 10px;
+}
+
+.capture-list {
+  display: grid;
+  gap: 8px;
+}
+
+.capture-card {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  padding: 10px;
+  border: 1px solid #d8e0e3;
+  border-radius: 8px;
+  background: #fbfcfc;
+  color: #172026;
+  text-align: left;
+}
+
+.capture-card[aria-pressed="true"] {
+  border-color: #1b6a70;
+  background: #eef7f6;
+}
+
+.capture-card span,
+.capture-card small {
+  overflow-wrap: anywhere;
+}
+
+.preview-meta {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
+.preview-meta span {
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: #eef2f3;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.warnings {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 8px 10px 8px 26px;
+  border-radius: 6px;
+  background: #fff5df;
+  color: #694b13;
+  font-size: 13px;
+}
+
+.turns {
+  display: grid;
+  gap: 10px;
+}
+
+.artifact-list {
+  display: grid;
+  gap: 10px;
+}
+
+.artifact,
+.turn {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #d8e0e3;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.artifact-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.artifact-title {
+  min-width: 0;
+}
+
+.artifact-title small {
+  color: #617078;
+  font-weight: 500;
+  text-transform: capitalize;
+}
+
+.artifact-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.turn small {
+  color: #617078;
+}
+
+pre {
+  max-height: 260px;
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+@media (max-width: 460px) {
+  .tab-summary div {
+    grid-template-columns: 1fr;
+  }
+
+  .hero {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
