@@ -111,13 +111,38 @@ export const startFixtureObsidianServer = async (
       }
       const targetType = String(request.headers['target-type'] ?? '');
       const target = String(request.headers.target ?? '');
+      const contentType = String(request.headers['content-type'] ?? '');
       const body = await readBody(request);
       if (targetType === 'frontmatter') {
+        if (contentType !== 'application/json') {
+          send(
+            response,
+            400,
+            JSON.stringify({
+              errorCode: 40012,
+              message: 'Unknown or invalid Content-Type specified in Content-Type header.',
+            }),
+            'application/json',
+          );
+          return;
+        }
         files.set(vaultPath, setFrontmatterField(current, target, JSON.parse(body) as FrontmatterValue));
         send(response, 204, '');
         return;
       }
       if (targetType === 'heading') {
+        if (contentType !== 'text/markdown') {
+          send(
+            response,
+            400,
+            JSON.stringify({
+              errorCode: 40012,
+              message: 'Unknown or invalid Content-Type specified in Content-Type header.',
+            }),
+            'application/json',
+          );
+          return;
+        }
         files.set(vaultPath, appendUnderHeading(current, target, body));
         send(response, 204, '');
         return;

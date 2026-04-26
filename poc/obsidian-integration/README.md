@@ -95,7 +95,7 @@ Load `.output/chrome-mv3` in Chrome:
 To test against a real vault:
 
 1. Install and enable Obsidian Local REST API in Obsidian.
-2. Trust the plugin's local HTTPS certificate in the browser if needed.
+2. Use the insecure local endpoint `http://127.0.0.1:27123`, or trust the plugin's HTTPS certificate and use `https://127.0.0.1:27124`.
 3. Copy the plugin API key.
 4. In the POC side panel, enter the REST endpoint and API key.
 5. Click `Connect`.
@@ -107,6 +107,8 @@ To test against a real vault:
    - `_BAC/canvases/switchboard-map.canvas`
 
 The POC writes synthetic dogfood content into the configured vault. Use a temporary vault when validating manually.
+
+If Obsidian returns `400`, the side panel now includes the Local REST API error detail. This POC intentionally sends exact `Content-Type` values (`text/markdown` and `application/json`) for PATCH requests because the real plugin rejects variants such as `text/markdown; charset=utf-8`.
 
 ## Test Coverage
 

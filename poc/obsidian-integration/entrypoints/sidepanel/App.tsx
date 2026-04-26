@@ -6,7 +6,7 @@ import {
   type ObsidianPocState,
 } from '../../src/shared/messages';
 
-const DEFAULT_BASE_URL = 'http://127.0.0.1:27124';
+const DEFAULT_BASE_URL = 'http://127.0.0.1:27123';
 const DEFAULT_API_KEY = 'test-key';
 
 const isStateResponse = (

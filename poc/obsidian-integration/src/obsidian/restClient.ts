@@ -4,6 +4,7 @@ export class ObsidianRestError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly detail?: string,
   ) {
     super(message);
     this.name = 'ObsidianRestError';
@@ -13,6 +14,31 @@ export class ObsidianRestError extends Error {
 type FetchLike = typeof fetch;
 
 const normalizeBaseUrl = (baseUrl: string): string => baseUrl.replace(/\/+$/u, '');
+const markdownContentType = 'text/markdown';
+const jsonContentType = 'application/json';
+
+const compactErrorDetail = (body: string, contentType: string | null): string | undefined => {
+  const trimmed = body.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  if (contentType?.includes(jsonContentType)) {
+    try {
+      const parsed = JSON.parse(trimmed) as { errorCode?: unknown; message?: unknown };
+      const message = typeof parsed.message === 'string' ? parsed.message : trimmed;
+      const code =
+        typeof parsed.errorCode === 'number' || typeof parsed.errorCode === 'string'
+          ? ` (${parsed.errorCode})`
+          : '';
+      return `${message}${code}`;
+    } catch {
+      return trimmed.slice(0, 400);
+    }
+  }
+
+  return trimmed.length > 400 ? `${trimmed.slice(0, 397)}...` : trimmed;
+};
 
 const encodeVaultPath = (path: string): string =>
   path
@@ -45,7 +71,15 @@ export class ObsidianRestClient {
       headers,
     });
     if (!response.ok) {
-      throw new ObsidianRestError(`Obsidian REST request failed: ${response.status}`, response.status);
+      const detail = compactErrorDetail(
+        await response.text().catch(() => ''),
+        response.headers.get('Content-Type'),
+      );
+      throw new ObsidianRestError(
+        `Obsidian REST request failed: ${response.status}${detail ? ` - ${detail}` : ''}`,
+        response.status,
+        detail,
+      );
     }
     return response;
   }
@@ -84,7 +118,7 @@ export class ObsidianRestClient {
     await this.request(`/vault/${encodeVaultPath(path)}`, {
       method: 'PUT',
       headers: {
-        'Content-Type': 'text/markdown; charset=utf-8',
+        'Content-Type': markdownContentType,
       },
       body: content,
     });
@@ -100,7 +134,7 @@ export class ObsidianRestClient {
     await this.request(`/vault/${encodeVaultPath(path)}`, {
       method: 'PATCH',
       headers: {
-        'Content-Type': 'application/json',
+        'Content-Type': jsonContentType,
         Operation: 'replace',
         'Target-Type': 'frontmatter',
         Target: key,
@@ -114,7 +148,7 @@ export class ObsidianRestClient {
     await this.request(`/vault/${encodeVaultPath(path)}`, {
       method: 'PATCH',
       headers: {
-        'Content-Type': 'text/markdown; charset=utf-8',
+        'Content-Type': markdownContentType,
         Operation: 'append',
         'Target-Type': 'heading',
         Target: heading,
