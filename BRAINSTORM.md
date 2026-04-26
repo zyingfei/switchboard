@@ -2550,6 +2550,121 @@ to surgical PATCH; otherwise it does read-modify-write under a per-path lock.
   with optional REST API acceleration, not "filesystem fallback when REST
   API absent."
 
+### 27.6 Empirical update from `poc/vault-bridge` (2026-04-26): writer moves out of the browser
+
+A feasibility PoC at `poc/vault-bridge` tested the assumption that the
+extension can own the sync-out side of §27 directly via FileSystemAccess.
+Six U1–U6 unknowns; live Chrome + iCloud run on macOS 26.2 / Chrome
+147.0.7727.102 / Node 25.8.2. The data path itself is fine; the **writer
+substrate is not viable for production**.
+
+**Failures that pivot the architecture:**
+
+| # | Outcome | Evidence | Implication |
+|---|---|---|---|
+| **U6** | **Fail** | SW-owned `setInterval` stopped at sequence 30 (~30 s, MV3 idle window); `Refresh` woke a new SW with `Tick count 0` | MV3 service workers cannot host continuous timers. Live-tabs flush, periodic state sync, embedding-index rebuilds, batch sync — none survive in the SW. |
+| **U5** | **Fail-risk** | After a SW restart inside the same Chrome session, `queryPermission({ mode: "readwrite" })` returned `prompt`; manual write blocked with "Vault folder permission is prompt; re-grant from the side panel" | "Silent capture" is not achievable when permission state is tied to SW lifecycle. Every SW restart could mean a re-grant click. |
+| **U1** | Fail-risk (paired with U5) | Persisted handle was available across some SW restarts then lost write permission | The persisted-handle pattern is necessary but not sufficient. |
+
+U2/U3/U4 all hit Acceptable or Pass. The data path (extension → file →
+Node tail reader) works correctly. The failure isn't filesystem semantics
+— it's MV3 lifecycle and FileSystemAccess permission state, both
+properties of the browser the extension runs inside, neither changeable
+from extension code.
+
+**Architectural pivot — Path B promoted from alternative to anchor:**
+
+Add a **companion process** between the extension and the vault. The
+companion owns all writes and any sustained operations:
+
+```text
+                       ┌─ HTTP/WS or Native Messaging
+Extension (sensor) ────┤
+                       ▼
+              ┌──────────────────────┐
+              │ Companion (writer)   │  long-lived process
+              │   - holds vault path │  (no permission UX)
+              │   - owns all writes  │
+              │   - runs sustained   │  (survives SW deaths,
+              │     tasks (tick,     │   browser closes,
+              │     index rebuild)   │   reboots if started)
+              └──────────┬───────────┘
+                         │ Node fs
+                         ▼
+                  Vault folder (canon)
+                         │ Node fs
+                         ▼
+                bac-mcp (reader, unchanged)
+```
+
+This maps to **§26.6 Path B** (the `local-bridge` daemon sketch),
+previously framed as one of two PoC paths the user might pick at PRD
+time. The vault-bridge result empirically eliminates Path A
+(extension-only writer) for production use; Path B is no longer an
+alternative — it's the v1 writer architecture.
+
+**What's preserved (still load-bearing v1 anchors):**
+
+- §23.0 — vault is canonical; substrate is filesystem + Markdown +
+  frontmatter + `.canvas` + `.base` + `_BAC/`. Companion writes via plain
+  Node `fs`; plugins remain opt-in acceleration; nothing about the
+  substrate principle changes.
+- §27.1 — three concepts (connection setup / sync-in / sync-out) still
+  separate; both directions just live in the companion now.
+- MCP read side — `npx bac-mcp --vault <path>` is unchanged. The
+  existing `poc/mcp-server` already validated stdio MCP composition.
+- §28 inline reviews — review *capture* (the user marking spans) can
+  still happen in the side panel; review *write* (vault frontmatter
+  mirror) goes through the companion like any other sync-out.
+
+**What changes:**
+
+- The `VaultBinding` interface sketched in §27.4 now has its primary
+  implementation in the companion (Node `fs` + atomic temp-file-rename),
+  not in the extension. Extension-side becomes a thin client that posts
+  capture events to the companion via NM or localhost HTTP.
+- The "single install" UX dies. User installs (a) the extension and (b)
+  the companion. Documented elsewhere as the install-funnel cost
+  (§24.3n).
+- Extension-side persistence in `chrome.storage.local` shifts role: from
+  "fast cache for side panel" to "queue for in-flight captures while
+  companion is unreachable" (drained on reconnect).
+
+**What this PoC was *not*:**
+
+The vault-bridge PoC was scoped to validate the substrate. It did. The
+substrate fails for sustained / silent operation. The next PoC at
+`poc/local-bridge` (per §26.6) is scoped to the companion's install-UX
+and lifecycle questions, which are the actual unknowns — companion-
+writes-to-vault via Node `fs` is well-trodden and not in question.
+
+**MV3 lessons folded back to other sections (for PRD pass):**
+
+- §24.3f ("`chrome.storage.session` for hot state, IndexedDB for
+  durable, never assume in-memory globals persist — service worker
+  terminates after 30 s inactivity") gets a sharpened corollary: **never
+  assume any in-SW timer or in-SW handle survives idle.** SW is for
+  event handling, not state ownership.
+- §24.3n permissions UX gets a related sharpening: **FileSystemAccess
+  permission state revoking after SW restart is a documented MV3
+  reality, not a bug.** Designs that depend on silent persistent FS
+  access from MV3 are designs that will break.
+- §24.10 safety primitives unchanged but reinforced: read-only MCP by
+  default + paste-mode dispatch by default were already the v1 stance;
+  with writer authority moving to the companion, those defaults compose
+  cleanly (extension can't dispatch silently because it can't even
+  write silently).
+
+**Status as of 2026-04-26:**
+
+- `poc/vault-bridge` complete, partial outcomes, README + NOTES
+  document U1–U6 evidence.
+- `poc/local-bridge` (companion architecture) is the next PoC; planning
+  artifact lives on the local `poc-planning` branch as `poc/local-bridge/
+  TODO.md`.
+- Update memory anchor: companion process is now load-bearing for the
+  writer side; vault-as-canonical and MCP read side unaffected.
+
 ---
 
 ## 28. Addendum (2026-04-26): Inline reviews — draft + dispatch back to chats `[user]`

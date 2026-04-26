@@ -1,6 +1,6 @@
 # BRAINSTORM index
 
-Generated 2026-04-26. Source: `BRAINSTORM.md` (2673 lines).
+Generated 2026-04-26. Source: `BRAINSTORM.md` (2788 lines).
 Built by `scripts/build-brainstorm-index.sh` — re-run after edits.
 
 ## Headings
@@ -134,14 +134,15 @@ Built by `scripts/build-brainstorm-index.sh` — re-run after edits.
     - L2487 — 27.3 What's deferred
     - L2508 — 27.4 Why this matters for the §23.0 principle
     - L2537 — 27.5 What this changes in earlier sections
-- L2555 — 28. Addendum (2026-04-26): Inline reviews — draft + dispatch back to chats `[user]`
-    - L2564 — 28.1 The shape of the feature
-    - L2575 — 28.2 Why this is BAC-shaped, not provider-shaped
-    - L2601 — 28.3 New entity type: `ReviewEvent`
-    - L2625 — 28.4 New scenarios
-    - L2637 — 28.5 Edge cases
-    - L2648 — 28.6 What this changes / connects to
-    - L2663 — 28.7 Out of scope here
+    - L2553 — 27.6 Empirical update from `poc/vault-bridge` (2026-04-26): writer moves out of the browser
+- L2670 — 28. Addendum (2026-04-26): Inline reviews — draft + dispatch back to chats `[user]`
+    - L2679 — 28.1 The shape of the feature
+    - L2690 — 28.2 Why this is BAC-shaped, not provider-shaped
+    - L2716 — 28.3 New entity type: `ReviewEvent`
+    - L2740 — 28.4 New scenarios
+    - L2752 — 28.5 Edge cases
+    - L2763 — 28.6 What this changes / connects to
+    - L2778 — 28.7 Out of scope here
 
 ## Scenarios (S###)
 
@@ -313,13 +314,13 @@ Built by `scripts/build-brainstorm-index.sh` — re-run after edits.
 - L2483 — S166
 - L2484 — S167
 - L2485 — S168
-- L2629 — S169
-- L2630 — S170
-- L2631 — S171
-- L2632 — S172
-- L2633 — S173
-- L2634 — S174
-- L2635 — S175
+- L2744 — S169
+- L2745 — S170
+- L2746 — S171
+- L2747 — S172
+- L2748 — S173
+- L2749 — S174
+- L2750 — S175
 
 ## Edge cases (E##)
 
@@ -363,12 +364,12 @@ Built by `scripts/build-brainstorm-index.sh` — re-run after edits.
 - L2389 — E38
 - L2390 — E39
 - L2391 — E40
-- L2641 — E41
-- L2642 — E42
-- L2643 — E43
-- L2644 — E44
-- L2645 — E45
-- L2646 — E46
+- L2756 — E41
+- L2757 — E42
+- L2758 — E43
+- L2759 — E44
+- L2760 — E45
+- L2761 — E46
 
 ## Risks (R##)
 
