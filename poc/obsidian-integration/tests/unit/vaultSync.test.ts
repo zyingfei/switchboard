@@ -15,12 +15,31 @@ class MemoryVaultClient implements VaultClient {
     };
   }
 
-  async listFiles(): Promise<VaultFileSummary[]> {
-    return Array.from(this.files.entries()).map(([path, content]) => ({
-      path,
-      type: 'file',
-      size: content.length,
-    }));
+  async listFiles(prefix = ''): Promise<VaultFileSummary[]> {
+    const normalizedPrefix = prefix.replace(/^\/+|\/+$/gu, '');
+    const directoryPrefix = normalizedPrefix ? `${normalizedPrefix}/` : '';
+    const children = new Map<string, VaultFileSummary>();
+    for (const [path, content] of this.files.entries()) {
+      if (!path.startsWith(directoryPrefix)) {
+        continue;
+      }
+      const relativePath = path.slice(directoryPrefix.length);
+      if (!relativePath) {
+        continue;
+      }
+      const [firstPart, ...rest] = relativePath.split('/');
+      if (!firstPart) {
+        continue;
+      }
+      const isFolder = rest.length > 0;
+      const childPath = normalizedPrefix ? `${normalizedPrefix}/${firstPart}` : firstPart;
+      children.set(childPath, {
+        path: childPath,
+        type: isFolder ? 'folder' : 'file',
+        size: isFolder ? undefined : content.length,
+      });
+    }
+    return Array.from(children.values()).sort((left, right) => left.path.localeCompare(right.path));
   }
 
   async readFile(path: string): Promise<string> {

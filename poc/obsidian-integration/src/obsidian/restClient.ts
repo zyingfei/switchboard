@@ -16,6 +16,7 @@ type FetchLike = typeof fetch;
 const normalizeBaseUrl = (baseUrl: string): string => baseUrl.replace(/\/+$/u, '');
 const markdownContentType = 'text/markdown';
 const jsonContentType = 'application/json';
+const normalizeVaultPrefix = (prefix: string): string => prefix.replace(/^\/+|\/+$/gu, '');
 
 const compactErrorDetail = (body: string, contentType: string | null): string | undefined => {
   const trimmed = body.trim();
@@ -46,6 +47,14 @@ const encodeVaultPath = (path: string): string =>
     .filter(Boolean)
     .map((part) => encodeURIComponent(part))
     .join('/');
+
+const joinListedPath = (prefix: string, listedPath: string): string => {
+  const normalizedListedPath = listedPath.replace(/^\/+|\/+$/gu, '');
+  if (!prefix || normalizedListedPath === prefix || normalizedListedPath.startsWith(`${prefix}/`)) {
+    return normalizedListedPath;
+  }
+  return `${prefix}/${normalizedListedPath}`;
+};
 
 export class ObsidianRestClient {
   private readonly baseUrl: string;
@@ -95,17 +104,21 @@ export class ObsidianRestClient {
   }
 
   async listFiles(prefix = ''): Promise<VaultFileSummary[]> {
-    const path = prefix ? `/vault/${encodeVaultPath(prefix)}` : '/vault/';
+    const normalizedPrefix = normalizeVaultPrefix(prefix);
+    const path = normalizedPrefix ? `/vault/${encodeVaultPath(normalizedPrefix)}/` : '/vault/';
     const response = await this.request(path);
     const raw = (await response.json()) as { files?: VaultFileSummary[] | string[] };
     const files = raw.files ?? [];
     return files.map((file) =>
       typeof file === 'string'
         ? {
-            path: file,
+            path: joinListedPath(normalizedPrefix, file),
             type: file.endsWith('/') ? 'folder' : 'file',
           }
-        : file,
+        : {
+            ...file,
+            path: joinListedPath(normalizedPrefix, file.path),
+          },
     );
   }
 

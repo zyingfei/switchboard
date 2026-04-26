@@ -43,6 +43,26 @@ const decodeVaultPath = (pathname: string): string =>
     .map((part) => decodeURIComponent(part))
     .join('/');
 
+const listDirectory = (files: Map<string, string>, prefix: string): string[] => {
+  const directoryPrefix = prefix ? `${prefix.replace(/\/+$/u, '')}/` : '';
+  const children = new Set<string>();
+  for (const path of files.keys()) {
+    if (!path.startsWith(directoryPrefix)) {
+      continue;
+    }
+    const relativePath = path.slice(directoryPrefix.length);
+    if (!relativePath) {
+      continue;
+    }
+    const [firstPart, ...rest] = relativePath.split('/');
+    if (!firstPart) {
+      continue;
+    }
+    children.add(rest.length > 0 ? `${firstPart}/` : firstPart);
+  }
+  return Array.from(children).sort();
+};
+
 export const startFixtureObsidianServer = async (
   apiKey = 'test-key',
 ): Promise<FixtureObsidianServer> => {
@@ -75,22 +95,24 @@ export const startFixtureObsidianServer = async (
     }
 
     const vaultPath = decodeVaultPath(url.pathname);
-    if (request.method === 'GET' && vaultPath === '') {
-      const summaries = Array.from(files.entries()).map(([path, content]) => ({
-        path,
-        type: 'file' as const,
-        size: Buffer.byteLength(content, 'utf8'),
-      }));
-      send(response, 200, JSON.stringify({ files: summaries }), 'application/json');
-      return;
-    }
     if (request.method === 'GET') {
       const content = files.get(vaultPath);
-      if (content === undefined) {
-        send(response, 404, 'Missing file');
+      if (content !== undefined) {
+        send(
+          response,
+          200,
+          content,
+          vaultPath.endsWith('.json') ? 'application/json' : 'text/plain; charset=utf-8',
+        );
         return;
       }
-      send(response, 200, content, vaultPath.endsWith('.json') ? 'application/json' : 'text/plain; charset=utf-8');
+
+      const children = listDirectory(files, vaultPath);
+      if (children.length > 0 || vaultPath === '') {
+        send(response, 200, JSON.stringify({ files: children }), 'application/json');
+        return;
+      }
+      send(response, 404, 'Missing file');
       return;
     }
     if (request.method === 'PUT') {

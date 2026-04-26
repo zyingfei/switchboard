@@ -40,6 +40,39 @@ const evidence = (
   detail,
 });
 
+const normalizeVaultPath = (path: string): string => path.replace(/^\/+|\/+$/gu, '');
+
+export const listVaultFilesRecursive = async (
+  client: VaultClient,
+  prefix = '',
+  visitedFolders = new Set<string>(),
+): Promise<VaultFileSummary[]> => {
+  const normalizedPrefix = normalizeVaultPath(prefix);
+  if (visitedFolders.has(normalizedPrefix)) {
+    return [];
+  }
+  visitedFolders.add(normalizedPrefix);
+
+  const entries = await client.listFiles(normalizedPrefix);
+  const files: VaultFileSummary[] = [];
+  for (const entry of entries) {
+    const normalizedPath = normalizeVaultPath(entry.path);
+    if (!normalizedPath) {
+      continue;
+    }
+    if (entry.type === 'folder') {
+      files.push({ ...entry, path: normalizedPath });
+      files.push(...(await listVaultFilesRecursive(client, normalizedPath, visitedFolders)));
+      continue;
+    }
+    files.push({ ...entry, path: normalizedPath });
+  }
+  return files;
+};
+
+export const listVaultMarkdownFiles = async (client: VaultClient): Promise<VaultFileSummary[]> =>
+  (await listVaultFilesRecursive(client)).filter((entry) => entry.type === 'file' && markdownPath(entry.path));
+
 export const readThreadRecord = (path: string, markdown: string): BacThreadRecord | null => {
   const fm = parseFrontmatter(markdown);
   if (fm.bac_type !== 'thread' || typeof fm.bac_id !== 'string') {
@@ -64,8 +97,8 @@ export const scanThreadByBacId = async (
   client: VaultClient,
   bacId: string,
 ): Promise<BacThreadRecord | null> => {
-  const files = await client.listFiles();
-  for (const file of files.filter((entry) => entry.type === 'file' && markdownPath(entry.path))) {
+  const files = await listVaultMarkdownFiles(client);
+  for (const file of files) {
     const markdown = await client.readFile(file.path);
     if (getFrontmatterString(markdown, 'bac_id') === bacId) {
       return readThreadRecord(file.path, markdown);
@@ -78,9 +111,9 @@ export const queryWhereWasI = async (
   client: VaultClient,
   project: string,
 ): Promise<BacThreadRecord[]> => {
-  const files = await client.listFiles();
+  const files = await listVaultMarkdownFiles(client);
   const records: BacThreadRecord[] = [];
-  for (const file of files.filter((entry) => entry.type === 'file' && markdownPath(entry.path))) {
+  for (const file of files) {
     const record = readThreadRecord(file.path, await client.readFile(file.path));
     if (record && record.project === project && record.status !== 'archived') {
       records.push(record);

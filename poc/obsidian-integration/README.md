@@ -23,6 +23,7 @@ The planning branch's recommended thin slice is accepted as this build scope. Th
 - PATCH-frontmatter semantics can update individual properties without replacing the body.
 - PATCH-heading semantics can append under `## Notes` without disturbing surrounding sections.
 - `bac_id`-stable identity works after simulated rename/move because BAC scans frontmatter rather than trusting paths.
+- Vault scans walk Obsidian Local REST API's shallow directory listings recursively before reading markdown frontmatter.
 - User/frontmatter round-trip is represented by changing `topic` after the move and re-scanning it back into BAC state.
 - `_BAC/dashboards/where-was-i.md`, `_BAC/dashboards/where-was-i.base`, and `_BAC/canvases/switchboard-map.canvas` are generated.
 - Canvas output validates 16-character hex node IDs and `text`, `group`, and `file` node types.
@@ -110,6 +111,8 @@ The POC writes synthetic dogfood content into the configured vault. Use a tempor
 
 If Obsidian returns `400`, the side panel now includes the Local REST API error detail. This POC intentionally sends exact `Content-Type` values (`text/markdown` and `application/json`) for PATCH requests because the real plugin rejects variants such as `text/markdown; charset=utf-8`.
 
+If `bac_id` scan fails after a move, reload the latest extension bundle. Real Obsidian returns shallow directory listings from `/vault/`, so the POC must recursively walk folders like `Projects/SwitchBoard/` before it can find moved notes.
+
 ## Test Coverage
 
 Unit tests cover:
@@ -149,7 +152,7 @@ tests/
 
 - Q1 PATCH-frontmatter: proven against the fixture contract and unit helpers; real plugin validation still manual.
 - Q2 PATCH-heading: proven against the fixture contract and unit helpers; real plugin validation still manual.
-- Q3 `bac_id` stable identity: proven by move/delete/write simulation plus frontmatter scan.
+- Q3 `bac_id` stable identity: proven by move/delete/write simulation plus recursive frontmatter scan over shallow vault listings.
 - Q4 Canvas rendering: JSON shape is validated; real Obsidian rendering remains manual.
 - Q5 Bases filtering/reactivity: `.base` syntax is generated and fixture dashboard query updates; real Bases rendering/reactivity remains manual.
 - Q6 Wikilink arrays: frontmatter array write/read is proven; Backlinks/Graph View behavior remains manual.

@@ -1,5 +1,5 @@
 import { ObsidianRestClient } from '../obsidian/restClient';
-import { runThinSliceProof } from '../obsidian/vaultSync';
+import { listVaultFilesRecursive, runThinSliceProof } from '../obsidian/vaultSync';
 import { nowIso } from '../shared/time';
 import { EMPTY_STATE, type ObsidianPocState } from '../shared/messages';
 import type { ObsidianConnection } from '../obsidian/model';
@@ -67,7 +67,7 @@ export const createObsidianCoordinator = (): ObsidianCoordinator => ({
   async runThinSlice(connection) {
     const client = clientFor(connection);
     const result = await runThinSliceProof(client, nowIso());
-    const files = await client.listFiles().catch(() => []);
+    const files = await listVaultFilesRecursive(client).catch(() => []);
     return await writeState({
       connection,
       result,

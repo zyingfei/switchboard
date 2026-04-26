@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ObsidianRestClient, ObsidianRestError } from '../../src/obsidian/restClient';
+import { ObsidianRestClient } from '../../src/obsidian/restClient';
 
 describe('ObsidianRestClient', () => {
   it('sends bearer auth and exact frontmatter patch headers accepted by the real plugin', async () => {
@@ -55,6 +55,40 @@ describe('ObsidianRestClient', () => {
     expect(patchHeaders.get('Operation')).toBe('append');
     expect(patchHeaders.get('Target-Type')).toBe('heading');
     expect(patchHeaders.get('Target')).toBe('Notes');
+  });
+
+  it('normalizes shallow directory listings from the Local REST API', async () => {
+    const calls: string[] = [];
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      calls.push(String(url));
+      return new Response(JSON.stringify({ files: ['MCP discussion.md', 'Archive/'] }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+    }) as typeof fetch;
+    const client = new ObsidianRestClient(
+      {
+        baseUrl: 'http://127.0.0.1:27124/',
+        apiKey: 'secret',
+      },
+      fetchImpl,
+    );
+
+    const files = await client.listFiles('Projects/SwitchBoard');
+
+    expect(calls[0]).toBe('http://127.0.0.1:27124/vault/Projects/SwitchBoard/');
+    expect(files).toEqual([
+      {
+        path: 'Projects/SwitchBoard/MCP discussion.md',
+        type: 'file',
+      },
+      {
+        path: 'Projects/SwitchBoard/Archive',
+        type: 'folder',
+      },
+    ]);
   });
 
   it('includes Obsidian error detail when the plugin rejects a request', async () => {
