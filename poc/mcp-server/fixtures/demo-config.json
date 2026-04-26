@@ -1,0 +1,12 @@
+{
+  "vaultPath": "./demo-vault",
+  "providerCapturesPath": "./demo-provider-captures.json",
+  "project": "SwitchBoard",
+  "currentNotePath": "Projects/SwitchBoard/MCP discussion.md",
+  "auditLogPath": "../.data/demo-audit-log.jsonl",
+  "screenShareSafe": false,
+  "embedder": {
+    "kind": "hashing",
+    "device": "wasm"
+  }
+}
