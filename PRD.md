@@ -1,4 +1,4 @@
-# Switchboard MVP — Product Requirements Document
+# Sidetrack MVP — Product Requirements Document
 
 **Version**: 0.1 (draft for review)
 **Branch**: `prd/switchboard-mvp-v1`
@@ -9,7 +9,7 @@
 
 ## 1. One-line scope
 
-Switchboard MVP is the **side-panel workboard** that keeps active AI work
+Sidetrack MVP is the **side-panel workboard** that keeps active AI work
 from scattering across tabs, providers, searches, and coding sessions.
 Track by default, reorganize manually, queue follow-ups, recover lost
 tabs, and generate portable packets for other AIs, notebooks, and coding
@@ -78,8 +78,8 @@ These constrain every scope decision below.
    identity through every move.
 4. **Queues, inbound reminders, and manual checklists are first-class
    objects** — not afterthoughts attached to other things.
-5. **Switchboard owns workstreams.** Memory products, notebooks, smart
-   recall, and coding agents plug in via interfaces — Switchboard does
+5. **Sidetrack owns workstreams.** Memory products, notebooks, smart
+   recall, and coding agents plug in via interfaces — Sidetrack does
    not become any of those.
 6. **Safety primitives (§24.10) are ship-blocking, not polish.** Every
    outbound dispatch routes through Redaction + token-budget + screen-
@@ -104,7 +104,9 @@ companion bridge for live capture):
 │  - hot cache + capture   │                              │ stdio
 │    queue                 │                              │
 └──────────┬───────────────┘                              │
-           │ HTTP/WS or Native Messaging                  │
+           │ HTTP loopback on 127.0.0.1                   │
+           │ (per ADR-0001 — Q4 decision; Native           │
+           │  Messaging considered and rejected)            │
            ▼                                              │
 ┌──────────────────────────┐                              │
 │ Companion (Node)         │                              │
@@ -174,7 +176,7 @@ the side panel needs.
 
 - Companion writes via plain Node `fs` (atomic temp-file-then-rename)
 - File formats: Markdown + YAML frontmatter + JSON Canvas + `.base`
-- `_BAC/` reserved namespace for Switchboard-owned files
+- `_BAC/` reserved namespace for Sidetrack-owned files
 - Local REST API plugin: opportunistic acceleration only (surgical
   PATCH-with-frontmatter / PATCH-with-heading); detected at startup;
   **never required** for any operation
@@ -183,10 +185,10 @@ the side panel needs.
 
 - **Connection setup**: one-time companion install + vault path config.
   Side panel surfaces "vault: connected · companion: running".
-- **Sync-in (vault → Switchboard)**: companion scans vault on startup +
+- **Sync-in (vault → Sidetrack)**: companion scans vault on startup +
   on FS event (when supported); reconciles `bac_id`-keyed entities;
   surfaces user-edited frontmatter changes back to the side panel.
-- **Sync-out (Switchboard → vault)**: per-event, owned by companion.
+- **Sync-out (Sidetrack → vault)**: per-event, owned by companion.
   Source notes, event log, dashboards, review trail, all written by
   companion via Node `fs`.
 - **Conflicts/merges**: deferred. Tentative posture: last-write-wins on
@@ -369,7 +371,7 @@ Review is a P0 capability for the dogfood demo (§13).
 
 #### 6.1.13 Safety primitives (§24.10 — ship-blocking)
 
-All four are P0, not P1. Without them, Switchboard is one cross-
+All four are P0, not P1. Without them, Sidetrack is one cross-
 pollination away from leaking the user's API keys into a third-party
 chat log.
 
@@ -380,16 +382,48 @@ chat log.
 - **Token-budget warnings** — count tokens with `tiktoken-js` before
   any paste / dispatch; warn if it will exceed the target model's
   context window.
-- **Screen-share-safe mode** — auto-detect via `navigator.mediaDevices.
-  getDisplayMedia` permission state (per §24.10). When active, the side
-  panel masks tracked-item titles, queue text, packet previews. Per-
-  workstream `private` / `shared` / `public` flag for explicit
-  classification.
-- **Captured-page injection scrub** — when Switchboard captures a web
+- **Per-workstream privacy flag** (P0 — substantive privacy control).
+  Each workstream carries a `private` / `shared` / `public` flag.
+  `private` workstreams are masked in the side panel when displayed
+  in any context the user has flagged as "show private label only"
+  (Mock 11). Default for new workstreams: `private`. Users can
+  promote to `shared` / `public` with intent. Per Q6 decision,
+  **this flag is the substantive privacy control for v1**.
+- **Screen-share-safe auto-detect** (deferred to **P1** per Q6) —
+  auto-detect via `navigator.mediaDevices.getDisplayMedia` permission
+  state and trigger masking automatically. Skipped from MVP because
+  (a) per-workstream privacy flag does most of the work when defaults
+  are correct, (b) detection has OS-level edge cases (macOS Screen
+  Recording bypass), (c) "always-add-it-later" is genuinely true
+  here. See §6.3.x for P1 plan.
+- **Captured-page injection scrub** — when Sidetrack captures a web
   page (annotations / source) and includes it in a packet, wrap in
   `<context>...</context>` markers; scrub known prompt-injection
   patterns ("ignore previous instructions" etc.); warn at large
   injections. Captured page bodies are untrusted by default.
+
+#### 6.1.14 MCP write tools with per-workstream trust (NEW per Q1 + Q7)
+
+Per the Q1/Q7 decision, MCP write tools ship in MVP (not P1). Closes
+the napkin's *"based on same api where MCP apis can also be called by
+api agents to do the same."*
+
+- **Tools**: `move_item`, `new_cluster`, `queue_item`, `link_items`,
+  `attach_coding_session`. Each has a typed Zod schema and a
+  capability spec (per `templates/mcp-capability-spec.md`).
+- **Trust model**: per-workstream. User opts in once per workstream
+  ("trust Codex inside `Sidetrack / MVP PRD`"); within scope, tools
+  execute without per-call approval. Outside scope, fall back to
+  per-call approval modal in the side panel ("Codex wants to move 3
+  items into 'X' — approve? / reject?").
+- **Audit log every call** to `_BAC/audit/<date>.jsonl` regardless of
+  trust mode. Includes: agent ID (MCP client), tool name, args,
+  scope (workstream the call was scoped to), trust-mode-active
+  (yes/no), result, timestamp.
+- **Trust scope UX**: settings page exposes per-workstream trusted-
+  agents list; each entry shows last-call timestamp + total calls;
+  one-click "revoke trust." Adding trust is opt-in only — no default.
+- **Token gate**: same API key as the read-only side (Q4 / §5.x).
 
 ### 6.2 P0.5 — strong dogfood additions
 
@@ -431,15 +465,20 @@ you see I might lost track if some of those are async"*.
 Closes the napkin's *"or by default download to structured naming
 conventions"* (the planner draft only handled the manual case).
 
-- Per-workstream toggle (default off for the workstream root, default
-  on for the project / cluster level — TBD in §11 open questions).
+- Per-workstream toggle (per Q3 decision):
+  - **Default off** for workstream root and Inbox/Misc (scratch
+    space stays scratch).
+  - **Default on** for project / cluster / subcluster (real projects
+    get auto-projection — vault is canonical for things that matter).
+  - **Per-workstream override** in settings: user can flip any
+    workstream independently of its tier.
 - When on: every promoted artifact (decision, review verdict, packet)
   writes to vault on creation, using the §6.1.11 naming convention.
 - Off: nothing writes until user explicitly exports.
 
 #### 6.2.4 Markdown / Obsidian projection
 
-- Switchboard-originated structured items project to vault as Markdown
+- Sidetrack-originated structured items project to vault as Markdown
   + frontmatter on every change.
 - Per §27 sync-out via companion.
 - Obsidian renders these via convention; **no plugin required** (per
@@ -487,15 +526,18 @@ The planner draft dropped this entirely; per §24.5 it's load-bearing.
 - Side panel becomes a unified action surface across the user's
   already-installed MCP server ecosystem.
 
-#### 6.3.3 MCP write tools (per-tool opt-in)
+#### 6.3.3 Screen-share-safe auto-detect (moved here from P0 per Q6)
 
-- `move_item`, `new_cluster`, `queue_item`, `link_items`,
-  `attach_coding_session`.
-- Every write requires user approval in the side panel ("Codex wants to
-  move 3 items into 'MVP PRD' — approve? / reject?").
-- Audit log every approval + rejection.
-- §11 open question: do we offer a "trust this agent for this
-  workstream" mode, or always require per-call approval?
+- Auto-detect via `navigator.mediaDevices.getDisplayMedia` permission
+  state; trigger masking in the side panel automatically when active.
+- Per-workstream privacy flag (P0 in §6.1.13) remains the substantive
+  control; this is the convenience layer on top.
+- Edge cases to handle: macOS Screen Recording bypass (OS-level
+  capture doesn't always trigger), self-recording for personal use
+  (toggle to suppress masking).
+
+(MCP write tools moved from here to **§6.1.14 P0** per Q1+Q7
+decision — no longer a P1 deferral.)
 
 #### 6.3.4 Persistent web annotation
 
@@ -508,10 +550,10 @@ The planner draft dropped this entirely; per §24.5 it's load-bearing.
 #### 6.3.5 Notebook link-back (read-only)
 
 - Sync-in scans vault for human-authored notes whose frontmatter links
-  to a Switchboard workstream.
-- Switchboard records the link (workstream now knows "this note
+  to a Sidetrack workstream.
+- Sidetrack records the link (workstream now knows "this note
   references me") but does not parse the note body.
-- Prevents Switchboard from becoming a notebook parser (per the
+- Prevents Sidetrack from becoming a notebook parser (per the
   planner draft's Case B boundary, which we keep).
 
 #### 6.3.6 Suggestion layer
@@ -538,26 +580,28 @@ After manual organization is dogfood-validated:
 ### 6.4 Production Idea Templates (Research Packets)
 
 The napkin lists three "Production Ideas" that are best treated as
-**Research Packet templates**, not standalone product surfaces. They
-ship with the MVP as named templates the user can invoke:
+**Research Packet templates**. P-tiers locked per Q2 decision (§11).
 
-- **Web-to-AI checklist** (the napkin's #1) — bundle web sources +
-  questions + verification asks for a target AI (GPT Pro / Deep
-  Research). Template fields: goal, sources, claims to verify,
-  questions, desired output format.
-- **Resume → tech-stack inference** (napkin #2) — template that
-  emphasizes evidence vs inference, confidence levels, no protected-
-  attribute inference, no hiring recommendations. Inputs: resume text,
-  public profile links. Outputs: languages / frameworks / infra /
-  databases / cloud / scale indicators / missing evidence / follow-up
-  questions.
-- **Latest-developments radar** (napkin's "Latest developments for each
-  area I am familiar with") — template for "watchlist" packets. Fields:
-  topic, prior-known state, sources to check, expected output format.
-
-§11 open question: should #2 and #3 be P0 templates or P1? They're
-small to ship as templates if the Research Packet engine is in place,
-but the planner draft demoted them to "out of scope."
+- **A. Web-to-AI checklist** (the napkin's #1) — **P0**. Bundle web
+  sources + questions + verification asks for a target AI (GPT Pro /
+  Deep Research). Template fields: goal, sources, claims to verify,
+  questions, desired output format. Ships with MVP; appears as a
+  template choice in Mock 5 packet composer.
+- **B. Resume → tech-stack inference** (napkin #2) — **deferred**
+  (per Q2 — "very specific case; reconsider if it fits the system
+  later"). Template design preserved here so it can land later
+  without re-design: emphasizes evidence vs inference, confidence
+  levels, no protected-attribute inference, no hiring
+  recommendations. Inputs: resume text, public profile links.
+  Outputs: languages / frameworks / infra / databases / cloud /
+  scale indicators / missing evidence / follow-up questions.
+- **C. Latest-developments radar** (napkin's "Latest developments for
+  each area I am familiar with") — **P1**. Template for "watchlist"
+  packets. Fields: topic, prior-known state, sources to check,
+  expected output format. **Cross-reference**: this template needs a
+  scheduling mechanism to fire periodically; group with a future
+  generic "scheduled tasks" feature when that lands. Until then, the
+  template is user-triggered ("run radar now").
 
 ### 6.5 P2 — explicitly defer
 
@@ -565,10 +609,10 @@ but the planner draft demoted them to "out of scope."
 |---|---|
 | Auto-organization (AI moves items without user) | Trust risk; explicit principle 1 above |
 | Auto-send into providers (silent dispatch into ChatGPT/Claude/Gemini) | Brittle; per §24.10 paste-mode is default, opt-in only |
-| Notebook → Switchboard structured merge (Case C in planner draft) | Needs schema versioning + 3-way merge + conflict UI; separate spike |
+| Notebook → Sidetrack structured merge (Case C in planner draft) | Needs schema versioning + 3-way merge + conflict UI; separate spike |
 | Multi-vault routing | Single vault per companion instance for MVP |
 | Team / cloud sync | Changes privacy/security architecture; v2 |
-| Standalone web-annotation product spinout | Possible later; not Switchboard MVP |
+| Standalone web-annotation product spinout | Possible later; not Sidetrack MVP |
 | Custom Obsidian-graph UI | Obsidian's Graph/Canvas/Bases handles it (per §23.3 simplifier) |
 | Production-grade vector DB | Local lexical + transformers.js (P1) is enough; PGlite/pgvector deferred |
 | Cross-user review aggregation | Single-user trust boundary only |
@@ -774,7 +818,7 @@ them. Each story maps to a P-tier and a closure napkin item.
 
 ### Story 2 — Auto-track + stop (P0, napkin: sidebar auto-tracking)
 
-> As a user, I want Switchboard to auto-track supported provider tabs
+> As a user, I want Sidetrack to auto-track supported provider tabs
 > by default, but let me stop tracking a specific tab or site without
 > disabling globally.
 
@@ -817,7 +861,7 @@ them. Each story maps to a P-tier and a closure napkin item.
 
 ### Story 9 — Tab recovery (P0, napkin: forgot or accidentally close the tab)
 
-> As a user, if I forget a tab or accidentally close it, Switchboard
+> As a user, if I forget a tab or accidentally close it, Sidetrack
 > should show the last-known tracked thread and let me reopen / focus /
 > recreate it.
 
@@ -899,14 +943,14 @@ what the system does. Production PRD requirement, not optional.
 Per the planner draft's three-case boundary (kept verbatim, mapped to
 §27 sync directions):
 
-### Case A — Switchboard-originated structured content (P0.5 sync-out)
+### Case A — Sidetrack-originated structured content (P0.5 sync-out)
 
 Examples: tracked chats, search history, review packets, context packs,
 checklists, structured project exports.
 
-- **Direction**: sync-out (Switchboard → vault → user sees in Obsidian)
-- **Owner**: Switchboard (companion writes per §27)
-- **Vault is the projection**; Switchboard owns identity and structure
+- **Direction**: sync-out (Sidetrack → vault → user sees in Obsidian)
+- **Owner**: Sidetrack (companion writes per §27)
+- **Vault is the projection**; Sidetrack owns identity and structure
 - Per §23.0, file formats are interface-and-core (Markdown +
   frontmatter + `.canvas` + `.base`); no plugin required
 
@@ -916,79 +960,82 @@ Examples: creative notes, personal records, Canvas sketches, freeform
 mind maps the user writes in Obsidian.
 
 - **Direction**: sync-in, but read-only and link-only
-- Switchboard records that a notebook note links to a workstream
+- Sidetrack records that a notebook note links to a workstream
   (frontmatter `bac_workstream:` field on the user's note)
-- Switchboard does **not** parse the note body
-- Prevents Switchboard from becoming a notebook parser
+- Sidetrack does **not** parse the note body
+- Prevents Sidetrack from becoming a notebook parser
 
 ### Case C — Structured notebook macros that sync back (P2 deferred)
 
 Examples: notebook contains structured `bac_*` blocks the user (or AI)
-edits, and those changes propagate back to Switchboard state.
+edits, and those changes propagate back to Sidetrack state.
 
 - **Direction**: sync-in, structured, requires merge semantics
 - Deferred per §27 conflicts/merges; needs schema versioning + 3-way
   merge + conflict UI design before scope-locking
 - Safe-merge invariant when this lands: never overwrite user notebook
-  changes silently; never delete Switchboard records from notebook
+  changes silently; never delete Sidetrack records from notebook
   edits alone; every structured sync-back must be previewed or
   conflict-checked
 
-## 11. Open questions for user (decisions needed before scope lock)
+## 11. Decisions log (resolved 2026-04-26)
 
-These are intentional asks back to you. The PRD should not be approved
-without an answer to each.
+The eight open questions from this PRD's prior draft were resolved
+together with the user. Recording answers + brief rationale here so
+the trail isn't lost.
 
-1. **MCP API parity with UI actions**. Napkin says: *"alternatively,
-   based on same api where MCP apis can also be called by api agents
-   to do the same."* This implies write tools (move / cluster / queue)
-   should be MCP-callable by API agents. The PRD has them in P1 with
-   per-call user approval (conservative). Do you want:
-   - (a) P1 with per-call approval (current PRD position),
-   - (b) P1 with per-tool "trust this agent for this workstream" mode, or
-   - (c) P0 with audit log only (no approval)?
+1. **MCP API parity with UI actions** → **upgraded to P0 with
+   per-workstream trust mode**. Write tools (`move_item`,
+   `new_cluster`, `queue_item`, `link_items`,
+   `attach_coding_session`) ship in MVP. User opts in once per
+   workstream ("trust Codex inside `Sidetrack / MVP PRD`"); within
+   that scope tools execute without per-call approval; outside the
+   scope, fall back to per-call approval. Audit log every call
+   regardless. See §6.1.14 (new) and the corresponding §6.3.3
+   removal.
 
-2. **Production Idea Templates priority**. The napkin lists three
-   ideas — web-to-AI checklist, resume tech-stack, latest developments
-   radar. Should they be:
-   - (a) P0 templates (ships with MVP),
-   - (b) P0.5 templates (ships if Research Packet engine is in place),
-   - (c) P1 templates (post-MVP)?
-   The planner draft demoted them all to P2 / out-of-scope. PRD lists
-   them in §6.4 with no P-tier yet pending your answer.
+2. **Production Idea Templates priority**:
+   - **A. Web-to-AI checklist** → **P0** ("very desire to have").
+   - **B. Resume → tech-stack inference** → **deferred** (very
+     specific case; reconsider if it fits the system later).
+   - **C. Latest developments radar** → **P1**, with note: may fit
+     into a future generic scheduling feature; cross-reference
+     when scheduling lands.
+   See §6.4 for updated tiers.
 
-3. **Auto-download default**. §6.2.3 has it off by default for
-   workstream root, on by default for project / cluster level. Confirm
-   or override.
+3. **Auto-download default** → **Mixed (current PRD position)** plus
+   **per-workstream override in settings**. Default off for
+   root/Misc, on for project-tier; user can flip any workstream
+   independently. §6.2.3 updated.
 
-4. **Companion install path**. §27.6 leaves Native Messaging vs
-   localhost HTTP open; the `poc/local-bridge` PoC will pick one with
-   evidence, but the PRD should declare a directional preference. Which
-   smells less awful for power users installing across N coding-agent
-   clients:
-   - (a) `npx switchboard-companion --vault <path>` (HTTP path; one-line
-     install per client; companion runs on a port),
-   - (b) Native Messaging host install (registry/plist/dotfile + binary;
-     no port; per-extension manifest pairing)?
+4. **Companion install path** → **HTTP loopback locked.** Decision
+   recorded as ADR-0001 (`docs/adr/0001-companion-install-http-loopback.md`).
+   Native Messaging cannot satisfy §27.6's "long-lived process,
+   sustained tasks, browser-restart survival" requirements without
+   daemonization gymnastics; HTTP loopback is the standard pattern
+   in the broader ecosystem (mcp-chrome, browser-mcp, Local REST
+   API plugin) and is multi-MCP-client neutral. v1.5 ships an
+   `--install-service` flag wiring the companion into `launchd` /
+   `systemd` / Task Scheduler. §5 architecture updated.
 
-5. **Inline-review submit-back default**. §6.1.10 says paste-mode
-   default; auto-send opt-in. Confirm, or do you want auto-send on
-   submit-back specifically (since it's going to a chat the user is
-   already in)?
+5. **Inline-review submit-back default** → **paste-mode locked**
+   for v1. No auto-send on submit-back. Per-provider auto-send
+   opt-in deferred beyond v1.
 
-6. **Screen-share-safe mode**. §6.1.13 has it auto-detect via
-   `getDisplayMedia` permission. Alternative: explicit "private mode"
-   toggle the user enables before screen-sharing, with no auto-detect.
-   Auto-detect is more correct but possibly surprising. Which?
+6. **Screen-share-safe mode** → **auto-detect demoted to P1+**;
+   per-workstream `private` / `shared` / `public` flag stays P0
+   as the substantive privacy control. Auto-detect via
+   `getDisplayMedia` is nice-to-have convenience but adds
+   complexity for a niche scenario; user can flag sensitive
+   workstreams as `private` and rely on that. §6.1.13, §10
+   updated.
 
-7. **Coding-agent silent automation in P1**. §6.3.3 says every write
-   tool requires per-call approval. Does this match your intent, or
-   should "trust this agent for this workstream" be a v1 mode (vs. v1.5
-   / v2)?
+7. **Coding-agent silent automation** → **per-workstream trust
+   mode** (same model as Q1; see above).
 
-8. **MVP product name**. PRD uses "Switchboard" (matching the renamed
-   GitHub repo). Confirm, or is there a specific MVP-branded name
-   ("Switchboard Workstreams", etc.)?
+8. **MVP product name** → **Sidetrack**. (Repo on GitHub remains at
+   `switchboard/` for backward-compat with existing PRs; rename
+   when convenient.)
 
 ## 12. What this PRD intentionally does NOT do (vs the planner draft)
 
@@ -1022,15 +1069,16 @@ actual workflow.
 Setup: companion is running, vault is wired, side panel is open.
 
 1.  Open ChatGPT, Claude, a Google search tab, and a Codex CLI session
-    while working on Switchboard.
-2.  Switchboard auto-tracks the three AI tabs; user clicks "Track
+    while working on the "Sidetrack" workstream (the napkin example —
+    user's project of building Sidetrack itself).
+2.  Sidetrack auto-tracks the three AI tabs; user clicks "Track
     current tab" on the Google search.
 3.  Side panel shows all four items in "Active work."
-4.  User queues two follow-ups into the Switchboard workstream:
+4.  User queues two follow-ups into the "Sidetrack" workstream:
     - "Ask Claude to compare with VM live migration architecture."
     - "Ask Codex to inspect bac-mcp packaging once it lands."
 5.  User creates a nested workstream:
-    Switchboard / MVP PRD / Active Workstreams.
+    Sidetrack / MVP PRD / Active Workstreams.
 6.  User moves the three AI items + the Google search into that
     workstream. Codex session stays in a sibling cluster.
 7.  User adds a manual checklist to "MVP PRD":
@@ -1053,7 +1101,8 @@ Setup: companion is running, vault is wired, side panel is open.
 12. User generates a Coding Agent Packet from the same cluster, target:
     Claude Code. AGENTS.md-shaped output.
 13. User exports the Research Packet to vault: writes to
-    `Switchboard/MVP-PRD/Active-Workstreams/2026-04-26-gpt-pro-mvp-scope-research-packet.md`.
+    `Sidetrack/MVP-PRD/Active-Workstreams/2026-04-26-gpt-pro-mvp-scope-research-packet.md`
+    (path projection of the workstream tree).
 14. User opens the vault in Obsidian. Frontmatter mirror is intact;
     Bases dashboard "Where Was I" shows current state; Canvas project
     map renders the workstream tree.
@@ -1073,7 +1122,7 @@ Mirrors §6.5; restated here for unambiguous PRD-readers:
 
 - AI auto-organization
 - Silent auto-send into providers (paste-mode is the v1 default forever; auto-send is per-provider per-workstream opt-in beyond v1)
-- Notebook → Switchboard structured merge (§27 conflicts/merges deferred)
+- Notebook → Sidetrack structured merge (§27 conflicts/merges deferred)
 - Multi-vault routing
 - Team / cloud sync
 - Custom Obsidian-graph UI (Obsidian native handles it)
@@ -1105,7 +1154,7 @@ If any of these fail, the MVP is bug, not feature.
 
 ## 16. Strongest one-liner
 
-> **Switchboard MVP is the control panel for messy active AI work: it
+> **Sidetrack MVP is the control panel for messy active AI work: it
 > remembers what you're doing across tabs, lets you queue and reorganize
 > it, and turns it into portable packets for the next AI — without
 > burning tokens, without losing privacy, and without depending on any
