@@ -29,7 +29,8 @@ import {
   updatePromptRunStatus,
   recordChatResponse,
 } from '../graph/operations';
-import { handleMcpRequest, type JsonRpcResponse } from '../mcp/server';
+import type { JsonRpcResponse } from '../mcp/contract';
+import { handleMcpRequest } from '../mcp/server';
 import { findDejaVuHits, type DejaVuHit } from '../recall/dejaVu';
 import {
   classifyThreadTab,

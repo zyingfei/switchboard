@@ -1,12 +1,38 @@
 import { describe, expect, it } from 'vitest';
 import { buildContextPack } from '../../src/context/contextPack';
 import type { WorkstreamEvent, WorkstreamNode } from '../../src/graph/model';
+import {
+  BAC_MCP_TOOL_DEFINITIONS,
+  type BacContextPackResponse,
+  type BacRecentThreadsResponse,
+  type BacSearchResponse,
+  type BacToolCallParams,
+  type BacWorkstreamResponse,
+  type McpJsonToolResult,
+  type McpTextToolResult,
+} from '../../src/mcp/contract';
 import { handleMcpRequest } from '../../src/mcp/server';
 import { findDejaVuHits } from '../../src/recall/dejaVu';
 import { classifyThreadTab } from '../../src/registry/threadRegistry';
 import { buildVaultProjection } from '../../src/vault/projection';
 
 const at = '2026-04-25T12:00:00.000Z';
+
+const readJsonResult = <TValue>(result: unknown): TValue => {
+  const content = (result as McpJsonToolResult<TValue>).content;
+  expect(content[0]?.type).toBe('json');
+  const first = content[0];
+  if (!first || first.type !== 'json') {
+    throw new Error('Expected JSON MCP tool result');
+  }
+  return first.json;
+};
+
+const readTextResult = <TValue>(result: unknown): McpTextToolResult<TValue> => {
+  const toolResult = result as McpTextToolResult<TValue>;
+  expect(toolResult.content[0]?.type).toBe('text');
+  return toolResult;
+};
 
 describe('thread registry, vault projection, context pack, recall, and MCP POCs', () => {
   it('classifies fixture thread tabs for Where Was I', () => {
@@ -136,46 +162,102 @@ describe('thread registry, vault projection, context pack, recall, and MCP POCs'
     expect(hits[0]?.score).toBeGreaterThan(0.3);
   });
 
-  it('serves read-only MCP tools over JSON-RPC core', () => {
+  it('serves read-only MCP tools over JSON-RPC core from the typed contract', () => {
+    const thread = {
+      id: 'claude:7',
+      provider: 'claude',
+      title: 'Auth refactor',
+      url: 'chrome-extension://abc/thread-fixture.html',
+      tabId: 7,
+      lastSpeaker: 'user',
+      status: 'waiting_on_ai',
+      selectorCanary: 'passed',
+      updatedAt: at,
+    } as const;
+    const note = {
+      id: 'note_1',
+      type: 'note',
+      title: 'Local markdown note',
+      content: '# Local-first workstream switchboard\nRemember research context.',
+      createdAt: '2026-04-14T12:00:00.000Z',
+      updatedAt: '2026-04-14T12:00:00.000Z',
+    } satisfies WorkstreamNode;
+    const runtimeData = {
+      nodes: [note],
+      promptRuns: [],
+      events: [{ id: 'event_1', type: 'note.created', createdAt: at }],
+      threadRegistry: [thread],
+      generatedAt: at,
+    };
     const list = handleMcpRequest(
       { jsonrpc: '2.0', id: 1, method: 'tools/list' },
-      {
-        nodes: [],
-        promptRuns: [],
-        events: [],
-        threadRegistry: [],
-        generatedAt: at,
-      },
+      runtimeData,
     );
-    const call = handleMcpRequest(
+    const recentThreadsParams = {
+      name: 'bac.recent_threads',
+      arguments: { limit: 1 },
+    } satisfies BacToolCallParams<'bac.recent_threads'>;
+    const recentThreads = handleMcpRequest(
       {
         jsonrpc: '2.0',
         id: 2,
         method: 'tools/call',
-        params: { name: 'bac.recent_threads' },
+        params: recentThreadsParams,
       },
+      runtimeData,
+    );
+    const workstreamParams = {
+      name: 'bac.workstream',
+      arguments: { includeEvents: true },
+    } satisfies BacToolCallParams<'bac.workstream'>;
+    const workstream = handleMcpRequest(
       {
-        nodes: [],
-        promptRuns: [],
-        events: [],
-        threadRegistry: [
-          {
-            id: 'claude:7',
-            provider: 'claude',
-            title: 'Auth refactor',
-            url: 'chrome-extension://abc/thread-fixture.html',
-            tabId: 7,
-            lastSpeaker: 'user',
-            status: 'waiting_on_ai',
-            selectorCanary: 'passed',
-            updatedAt: at,
-          },
-        ],
-        generatedAt: at,
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tools/call',
+        params: workstreamParams,
       },
+      runtimeData,
+    );
+    const contextPackParams = {
+      name: 'bac.context_pack',
+      arguments: {},
+    } satisfies BacToolCallParams<'bac.context_pack'>;
+    const contextPack = handleMcpRequest(
+      {
+        jsonrpc: '2.0',
+        id: 4,
+        method: 'tools/call',
+        params: contextPackParams,
+      },
+      runtimeData,
+    );
+    const searchParams = {
+      name: 'bac.search',
+      arguments: {
+        query: 'local-first workstream switchboard memory',
+        minAgeDays: 3,
+        maxAgeDays: 21,
+      },
+    } satisfies BacToolCallParams<'bac.search'>;
+    const search = handleMcpRequest(
+      {
+        jsonrpc: '2.0',
+        id: 5,
+        method: 'tools/call',
+        params: searchParams,
+      },
+      runtimeData,
     );
 
-    expect(JSON.stringify(list.result)).toContain('bac.context_pack');
-    expect(JSON.stringify(call.result)).toContain('Auth refactor');
+    expect((list.result as { tools: typeof BAC_MCP_TOOL_DEFINITIONS }).tools.map((tool) => tool.name)).toEqual(
+      BAC_MCP_TOOL_DEFINITIONS.map((tool) => tool.name),
+    );
+    expect(readJsonResult<BacRecentThreadsResponse>(recentThreads.result).threads[0]?.title).toBe('Auth refactor');
+    expect(readJsonResult<BacWorkstreamResponse>(workstream.result).events).toHaveLength(1);
+    expect(readTextResult<BacContextPackResponse>(contextPack.result).structuredContent.pack.markdown).toContain(
+      '# BAC Context Pack',
+    );
+    expect(readJsonResult<BacSearchResponse>(search.result).hits[0]?.nodeId).toBe('note_1');
   });
 });
