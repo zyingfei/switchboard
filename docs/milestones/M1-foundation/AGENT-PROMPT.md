@@ -84,7 +84,9 @@ Three packages land in this milestone:
 - packages/sidetrack-extension/ — WXT + React + TS + MV3, side panel
   (full Mock 1), workstream organization (Mock 2/4), manual checklist,
   queue, inbound reminders, tab recovery, settings minimal,
-  per-workstream privacy flag, all four provider captures
+  per-workstream privacy flag, three provider captures (ChatGPT,
+  Claude, Gemini) + generic-fallback for arbitrary URLs (e.g. GitHub
+  PR). Codex web NOT in M1 — no PoC coverage; reconsidered in M2.
 - packages/sidetrack-mcp/ — lift from poc/mcp-server, read-only,
   M1 tool surface (recent_threads, workstream, context_pack, search,
   queued_items, inbound_reminders)

@@ -28,7 +28,8 @@ The user should be able to use M1 daily as a passive observer +
 organizer of their AI work. M2 turns it into an active orchestrator.
 
 > **The acceptance bar**: install Sidetrack → use ChatGPT, Claude,
-> Gemini, and Codex web through the day → side panel shows organized
+> Gemini through the day (and manually track an arbitrary URL like
+> a GitHub PR via the generic-fallback) → side panel shows organized
 > tracked work → user creates a nested workstream and moves things
 > into it → queues a follow-up to a thread → gets an Inbound
 > notification when Claude replies to that thread → accidentally
@@ -182,8 +183,13 @@ Promote `poc/local-bridge/companion/` to production-grade per
     using `configs/openapi/openapi.base.yaml` as the base; lint with
     `configs/openapi/api-style-rules.yaml` (Spectral or equivalent)
     in CI.
-  - **Standard error shape** per the standard's error-envelope spec
-    (`{ error: { code, message, details } }`).
+  - **Standard error shape**: the shared
+    `#/components/schemas/Problem` envelope from
+    `configs/openapi/openapi.base.yaml` (problem+json-compatible:
+    top-level `type`, `title`, `status`, `code`, `correlationId`,
+    optional `detail`, `instance`, `errors[]`). Every non-2xx
+    response body conforms. Use the base's `Problem` schema directly
+    in the companion OpenAPI spec — do not invent a new envelope.
   - **Idempotency** keys on `POST /v1/events` and `POST /v1/queue`
     (extension may retry on companion-down recovery).
   - **Pagination** on any future list endpoints (M1 has none, but
