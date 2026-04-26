@@ -38,6 +38,11 @@ interface ElementCandidate {
   sourceSelector: string;
 }
 
+interface CandidateTurnSet {
+  sourceKind: 'direct' | 'structural';
+  turns: CandidateTurn[];
+}
+
 const maxDefaultChars = 18_000;
 
 const capText = (value: string, maxChars: number): string => {
@@ -62,6 +67,13 @@ const inferRole = (rawValue: string | null | undefined): CaptureRole => {
 const countMatchedPatterns = (value: string, patterns: string[]): number =>
   patterns.reduce((count, pattern) => count + Number(new RegExp(pattern, 'i').test(value)), 0);
 
+const countMatchedHeadingAnchors = (root: Element, source: HeadingTurnSourceConfig): number =>
+  Array.from(root.querySelectorAll(source.selector)).reduce((count, heading) => {
+    const label = normalizeText(visibleTextFromElement(heading) || heading.textContent || '');
+    const matches = source.rolePatterns.some((pattern) => new RegExp(pattern.pattern, 'i').test(label));
+    return count + Number(matches);
+  }, 0);
+
 const findHeadingTurnRoot = (anchor: Element, source: HeadingTurnSourceConfig): Element => {
   let best = anchor.parentElement ?? anchor;
   let current = best;
@@ -75,7 +87,11 @@ const findHeadingTurnRoot = (anchor: Element, source: HeadingTurnSourceConfig): 
 
     const patterns = source.rolePatterns.map((pattern) => pattern.pattern);
     const maxAncestorChars = source.maxAncestorChars ?? 12_000;
-    if (countMatchedPatterns(parentText, patterns) > 1 || parentText.length > maxAncestorChars) {
+    if (
+      countMatchedPatterns(parentText, patterns) > 1 ||
+      countMatchedHeadingAnchors(parent, source) > 1 ||
+      parentText.length > maxAncestorChars
+    ) {
       break;
     }
 
@@ -186,22 +202,66 @@ const extractEditableCandidates = (doc: Document, source: EditableTurnSourceConf
       sourceSelector: source.sourceSelector,
     }));
 
-const extractConfiguredTurns = (doc: Document, config: ProviderExtractionConfig): CandidateTurn[] => {
-  for (const source of config.directSources) {
-    const directTurns = extractDirectTurns(doc, source);
-    if (directTurns.length > 0) {
-      return directTurns;
+const compareCandidateTurnSets = (left: CandidateTurnSet, right: CandidateTurnSet): number => {
+  const leftKnownRoles = new Set(left.turns.filter((turn) => turn.role !== 'unknown').map((turn) => turn.role));
+  const rightKnownRoles = new Set(right.turns.filter((turn) => turn.role !== 'unknown').map((turn) => turn.role));
+
+  const leftScore = [
+    Number(leftKnownRoles.has('user') && leftKnownRoles.has('assistant')),
+    leftKnownRoles.size,
+    left.turns.filter((turn) => turn.role !== 'unknown').length,
+    left.turns.length,
+    Number(left.sourceKind === 'direct'),
+    left.turns.reduce((sum, turn) => sum + turn.text.length, 0),
+  ];
+  const rightScore = [
+    Number(rightKnownRoles.has('user') && rightKnownRoles.has('assistant')),
+    rightKnownRoles.size,
+    right.turns.filter((turn) => turn.role !== 'unknown').length,
+    right.turns.length,
+    Number(right.sourceKind === 'direct'),
+    right.turns.reduce((sum, turn) => sum + turn.text.length, 0),
+  ];
+
+  for (let index = 0; index < leftScore.length; index += 1) {
+    const delta = leftScore[index] - rightScore[index];
+    if (delta !== 0) {
+      return delta;
     }
   }
 
-  const candidates = sortElementsInDocumentOrder([
+  return 0;
+};
+
+const extractConfiguredTurns = (doc: Document, config: ProviderExtractionConfig): CandidateTurn[] => {
+  const turnSets: CandidateTurnSet[] = config.directSources
+    .map((source) => ({
+      sourceKind: 'direct' as const,
+      turns: extractDirectTurns(doc, source),
+    }))
+    .filter((candidate) => candidate.turns.length > 0);
+
+  const structuralCandidates = sortElementsInDocumentOrder([
     ...(config.headingSources?.flatMap((source) => extractHeadingCandidates(doc, source)) ?? []),
     ...(config.editableSources?.flatMap((source) => extractEditableCandidates(doc, source)) ?? []),
   ]);
-
-  return candidates
+  const structuralTurns = structuralCandidates
     .map((candidate) => createCandidateTurn(candidate.element, candidate.role, candidate.sourceSelector))
     .filter((turn): turn is CandidateTurn => Boolean(turn));
+
+  if (structuralTurns.length > 0) {
+    turnSets.push({
+      sourceKind: 'structural',
+      turns: structuralTurns,
+    });
+  }
+
+  return turnSets.reduce<CandidateTurnSet | null>((best, candidate) => {
+    if (!best || compareCandidateTurnSets(candidate, best) > 0) {
+      return candidate;
+    }
+    return best;
+  }, null)?.turns ?? [];
 };
 
 const mergeAdjacentTurns = (turns: CandidateTurn[], config: ProviderExtractionConfig): CandidateTurn[] => {

@@ -5,13 +5,14 @@ import {
   renderArtifactMarkdown,
   renderCaptureMarkdown,
 } from '../../src/capture/export';
-import type { CapturedArtifact, CaptureState, ProviderCapture } from '../../src/capture/model';
-import { normalizeCaptureState, providerLabels } from '../../src/capture/model';
+import type { CapturedArtifact, CaptureState, ProviderCapture, ProviderSelectorHealth } from '../../src/capture/model';
+import { normalizeCaptureState, providerLabels, supportedProviderIds } from '../../src/capture/model';
 import { providerMessages, type ProviderRequest, type ProviderResponse } from '../../src/shared/messages';
 
 const initialState: CaptureState = {
   captures: [],
   lastActiveTab: null,
+  selectorHealth: [],
   lastError: null,
   updatedAt: new Date(0).toISOString(),
 };
@@ -56,6 +57,19 @@ const openDownloadLink = (url: string) => {
   anchor.click();
 };
 
+const selectorHealthLabel = (health: ProviderSelectorHealth): string =>
+  health.recentLoads === 0 ? 'No local canary loads yet.' : `${health.cleanLoads}/${health.recentLoads} recent loads clean`;
+
+const latestSelectorHealthLabel = (health: ProviderSelectorHealth): string =>
+  health.latestStatus ? `Latest: ${health.latestStatus}` : 'Latest: none yet';
+
+const trackedStatusLabel = (value: string | undefined): string => {
+  if (!value) {
+    return 'Checking';
+  }
+  return value.replace(/_/g, ' ');
+};
+
 export default function App() {
   const [state, setState] = useState<CaptureState>(initialState);
   const [selectedCaptureId, setSelectedCaptureId] = useState<string | null>(null);
@@ -65,6 +79,15 @@ export default function App() {
   const selectedCapture = useMemo(
     () => state.captures.find((capture) => capture.id === selectedCaptureId) ?? state.captures[0] ?? null,
     [selectedCaptureId, state.captures],
+  );
+  const fallbackRecommended =
+    state.lastActiveTab?.trackedThreadStatus === 'fallback' || state.lastActiveTab?.trackedThreadStatus === 'stale';
+  const selectorHealth = useMemo(
+    () =>
+      supportedProviderIds.map(
+        (provider) => state.selectorHealth.find((entry) => entry.provider === provider) ?? { provider, cleanLoads: 0, recentLoads: 0, fallbackLoads: 0, failedLoads: 0 },
+      ),
+    [state.selectorHealth],
   );
 
   const applyResponse = (response: ProviderResponse) => {
@@ -110,6 +133,24 @@ export default function App() {
 
     saveArtifactMarkdown(selectedCapture, artifact);
     setStatus(`Saved artifact: ${artifact.title}`);
+  };
+
+  const handleCaptureClipboardFallback = async () => {
+    setBusy(true);
+    setStatus('Capturing clipboard fallback');
+    try {
+      const response = await sendProviderMessage({ type: providerMessages.captureActiveTab });
+      applyResponse(response);
+      if (!response.ok || !('capture' in response) || !response.capture) {
+        throw new Error(response.ok ? 'Capture did not return visible text.' : response.error);
+      }
+      await navigator.clipboard.writeText(renderCaptureMarkdown(response.capture));
+      setStatus('Copied fallback capture to clipboard');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Clipboard fallback failed');
+    } finally {
+      setBusy(false);
+    }
   };
 
   useEffect(() => {
@@ -166,16 +207,65 @@ export default function App() {
             <dt>URL</dt>
             <dd className="url">{state.lastActiveTab?.url ?? 'Open a provider tab, then capture.'}</dd>
           </div>
+          <div>
+            <dt>Extractor</dt>
+            <dd data-testid="active-extractor-status">
+              {state.lastActiveTab?.supported ? trackedStatusLabel(state.lastActiveTab.trackedThreadStatus) : 'n/a'}
+            </dd>
+          </div>
         </dl>
         {state.lastActiveTab?.reason ? <p className="hint">{state.lastActiveTab.reason}</p> : null}
-        <button
-          className="button primary"
-          data-testid="capture-active-tab"
-          disabled={busy || !state.lastActiveTab}
-          onClick={() => runAction('Capturing active tab', { type: providerMessages.captureActiveTab })}
-        >
-          Capture active tab
-        </button>
+        {state.lastActiveTab?.warning ? (
+          <p className="warning-panel" data-testid="active-warning">
+            {state.lastActiveTab.warning}
+          </p>
+        ) : null}
+        <div className="actions">
+          <button
+            className="button primary"
+            data-testid="capture-active-tab"
+            disabled={busy || !state.lastActiveTab}
+            onClick={() => runAction('Capturing active tab', { type: providerMessages.captureActiveTab })}
+          >
+            Capture active tab
+          </button>
+          {fallbackRecommended ? (
+            <button
+              className="button quiet"
+              data-testid="copy-capture-fallback"
+              disabled={busy || !state.lastActiveTab}
+              onClick={handleCaptureClipboardFallback}
+            >
+              Capture + copy fallback
+            </button>
+          ) : null}
+        </div>
+      </section>
+
+      <section className="panel" aria-labelledby="health-heading">
+        <div className="section-heading">
+          <h2 id="health-heading">Extractor Health</h2>
+          <button
+            className="button quiet"
+            disabled={busy || selectorHealth.every((health) => health.recentLoads === 0)}
+            onClick={() => runAction('Clearing selector health', { type: providerMessages.clearSelectorHealth })}
+          >
+            Reset health
+          </button>
+        </div>
+        <p className="hint">Local-only selector canary counts from recent provider tab loads. No telemetry or network calls.</p>
+        <div className="health-list" data-testid="selector-health">
+          {selectorHealth.map((health) => (
+            <article className="health-card" key={health.provider}>
+              <strong>{providerLabels[health.provider]}</strong>
+              <span>{selectorHealthLabel(health)}</span>
+              <small>{latestSelectorHealthLabel(health)}</small>
+              <small>
+                fallback {health.fallbackLoads} · failed {health.failedLoads}
+              </small>
+            </article>
+          ))}
+        </div>
       </section>
 
       <section className="panel" aria-labelledby="captures-heading">

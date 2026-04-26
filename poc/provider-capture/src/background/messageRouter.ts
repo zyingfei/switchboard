@@ -1,13 +1,50 @@
-import type { CaptureState, ProviderCapture } from '../capture/model';
+import type { ActiveTabSummary, CaptureState, ProviderCapture, TrackedThreadStatus } from '../capture/model';
 import { nowIso } from '../shared/time';
 import { isProviderRequest, providerMessages, type ProviderRequest, type ProviderResponse } from '../shared/messages';
 import { executeInlineCapture } from './inlineCapture';
 import { appendCapture, clearCaptures, readCaptures } from './storage';
 import { getCaptureCandidateTab, summarizeTab } from './tabs';
+import { clearSelectorHealth, getTrackedThreads, readSelectorHealth, recordSelectorCanaryCheck } from '../registry/trackedThreads';
 
-const emptyState = async (lastError: string | null = null): Promise<CaptureState> => ({
+const warningForTrackedStatus = (status: TrackedThreadStatus | undefined): string | undefined => {
+  if (status === 'fallback') {
+    return 'Extractor used the conservative DOM fallback on the last local canary check. Review the next capture and use clipboard fallback if needed.';
+  }
+  if (status === 'stale') {
+    return 'Extractor may be stale for this tab. Capture and use the clipboard fallback while selectors are refreshed.';
+  }
+  return undefined;
+};
+
+const buildActiveTabSummary = async (tab: chrome.tabs.Tab | null): Promise<ActiveTabSummary | null> => {
+  const summary = summarizeTab(tab);
+  if (!summary?.supported || !summary.url || summary.provider === 'unknown') {
+    return summary;
+  }
+
+  const trackedThread = (await getTrackedThreads({
+    provider: summary.provider,
+    threadUrl: summary.url,
+    limit: 1,
+  }))[0];
+
+  if (!trackedThread) {
+    return summary;
+  }
+
+  return {
+    ...summary,
+    trackedThreadStatus: trackedThread.status,
+    captureCount: trackedThread.captureCount,
+    lastTurnAt: trackedThread.lastTurnAt,
+    warning: warningForTrackedStatus(trackedThread.status),
+  };
+};
+
+const buildState = async (lastError: string | null = null, tab?: chrome.tabs.Tab | null): Promise<CaptureState> => ({
   captures: await readCaptures(),
-  lastActiveTab: summarizeTab(await getCaptureCandidateTab()),
+  lastActiveTab: await buildActiveTabSummary(tab ?? (await getCaptureCandidateTab())),
+  selectorHealth: await readSelectorHealth(),
   lastError,
   updatedAt: nowIso(),
 });
@@ -30,16 +67,28 @@ const captureTab = async (tab: chrome.tabs.Tab): Promise<ProviderCapture> => {
   }
 
   try {
-    return await executeInlineCapture(tab.id);
+    const capture = await captureWithContentScript(tab.id);
+
+    try {
+      const inlineCapture = await executeInlineCapture(tab.id);
+      const artifactChars = inlineCapture.artifacts.reduce((sum, artifact) => sum + artifact.text.length, 0);
+      return {
+        ...capture,
+        artifacts: inlineCapture.artifacts,
+        visibleTextCharCount: capture.visibleTextCharCount + artifactChars,
+      };
+    } catch {
+      return capture;
+    }
   } catch {
-    return await captureWithContentScript(tab.id);
+    return await executeInlineCapture(tab.id);
   }
 };
 
 export const captureActiveTab = async (): Promise<ProviderResponse> => {
   const tab = await getCaptureCandidateTab();
   if (!tab) {
-    return { ok: false, error: 'No capture-ready tab is available.', state: await emptyState() };
+    return { ok: false, error: 'No capture-ready tab is available.', state: await buildState() };
   }
 
   try {
@@ -49,29 +98,32 @@ export const captureActiveTab = async (): Promise<ProviderResponse> => {
       ok: true,
       capture,
       state: {
+        ...(await buildState(null, tab)),
         captures,
-        lastActiveTab: summarizeTab(tab),
-        lastError: null,
-        updatedAt: nowIso(),
       },
     };
   } catch (error) {
     return {
       ok: false,
       error: error instanceof Error ? error.message : 'Capture failed.',
-      state: await emptyState(error instanceof Error ? error.message : 'Capture failed.'),
+      state: await buildState(error instanceof Error ? error.message : 'Capture failed.'),
     };
   }
 };
 
 const handleRequest = async (request: ProviderRequest): Promise<ProviderResponse> => {
   if (request.type === providerMessages.getState) {
-    return { ok: true, state: await emptyState() };
+    return { ok: true, state: await buildState() };
   }
 
   if (request.type === providerMessages.reset || request.type === providerMessages.clearCaptures) {
     await clearCaptures();
-    return { ok: true, state: await emptyState() };
+    return { ok: true, state: await buildState() };
+  }
+
+  if (request.type === providerMessages.clearSelectorHealth) {
+    await clearSelectorHealth();
+    return { ok: true, state: await buildState() };
   }
 
   if (request.type === providerMessages.storeCapture) {
@@ -80,16 +132,19 @@ const handleRequest = async (request: ProviderRequest): Promise<ProviderResponse
       ok: true,
       capture: request.capture,
       state: {
+        ...(await buildState(null, await getCaptureCandidateTab())),
         captures,
-        lastActiveTab: summarizeTab(await getCaptureCandidateTab()),
-        lastError: null,
-        updatedAt: nowIso(),
       },
     };
   }
 
   if (request.type === providerMessages.captureActiveTab) {
     return await captureActiveTab();
+  }
+
+  if (request.type === providerMessages.reportSelectorCanary) {
+    await recordSelectorCanaryCheck(request.report);
+    return { ok: true, state: await buildState() };
   }
 
   return { ok: false, error: `Unhandled request: ${request.type}` };
@@ -110,7 +165,7 @@ export const createMessageRouter =
       sendResponse({
         ok: false,
         error: error instanceof Error ? error.message : 'Provider capture request failed.',
-        state: await emptyState(error instanceof Error ? error.message : 'Provider capture request failed.'),
+        state: await buildState(error instanceof Error ? error.message : 'Provider capture request failed.'),
       });
     });
     return true;

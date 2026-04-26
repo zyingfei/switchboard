@@ -13,30 +13,14 @@ export default defineContentScript({
   ],
   runAt: 'document_idle',
   main() {
+    const canaryLoadId = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const canaryRetryDelays = [1_200, 3_200, 6_000];
+
     const createCapture = () =>
       captureVisibleConversation(document, {
         url: window.location.href,
         title: document.title,
       });
-
-    chrome.runtime.onMessage.addListener((message, _sender, sendResponse: (response: ProviderResponse) => void) => {
-      if (message?.type !== providerMessages.captureVisibleThread) {
-        return undefined;
-      }
-
-      try {
-        sendResponse({
-          ok: true,
-          capture: createCapture(),
-        });
-      } catch (error) {
-        sendResponse({
-          ok: false,
-          error: error instanceof Error ? error.message : 'Visible conversation capture failed.',
-        });
-      }
-      return true;
-    });
 
     if (window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost') {
       document.documentElement.setAttribute('data-bac-provider-capture', 'ready');
@@ -80,5 +64,57 @@ export default defineContentScript({
         })();
       });
     }
+
+    const reportSelectorCanary = (attempt: number) => {
+      try {
+        const capture = createCapture();
+        document.documentElement.setAttribute('data-bac-provider-canary', capture.selectorCanary);
+        void chrome.runtime.sendMessage({
+          type: providerMessages.reportSelectorCanary,
+          report: {
+            provider: capture.provider,
+            url: capture.url,
+            title: capture.title,
+            selectorCanary: capture.selectorCanary,
+            checkedAt: capture.capturedAt,
+            loadId: canaryLoadId,
+          },
+        });
+
+        const shouldRetry =
+          (capture.provider === 'chatgpt' || capture.provider === 'claude' || capture.provider === 'gemini') &&
+          capture.selectorCanary !== 'passed' &&
+          attempt < canaryRetryDelays.length - 1;
+        if (shouldRetry) {
+          window.setTimeout(() => reportSelectorCanary(attempt + 1), canaryRetryDelays[attempt + 1] - canaryRetryDelays[attempt]);
+        }
+      } catch {
+        document.documentElement.setAttribute('data-bac-provider-canary', 'failed');
+        if (attempt < canaryRetryDelays.length - 1) {
+          window.setTimeout(() => reportSelectorCanary(attempt + 1), canaryRetryDelays[attempt + 1] - canaryRetryDelays[attempt]);
+        }
+      }
+    };
+
+    chrome.runtime.onMessage.addListener((message, _sender, sendResponse: (response: ProviderResponse) => void) => {
+      if (message?.type !== providerMessages.captureVisibleThread) {
+        return undefined;
+      }
+
+      try {
+        sendResponse({
+          ok: true,
+          capture: createCapture(),
+        });
+      } catch (error) {
+        sendResponse({
+          ok: false,
+          error: error instanceof Error ? error.message : 'Visible conversation capture failed.',
+        });
+      }
+      return true;
+    });
+
+    window.setTimeout(() => reportSelectorCanary(0), canaryRetryDelays[0]);
   },
 });

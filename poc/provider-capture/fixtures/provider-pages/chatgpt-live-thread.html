@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>ChatGPT Live Thread Fixture</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 24px;
+      }
+    </style>
+  </head>
+  <body>
+    <aside>
+      <div data-message-author-role="assistant">Sidebar history should stay outside the main-thread capture.</div>
+    </aside>
+    <main>
+      <section dir="auto" data-turn-id="turn-user" data-testid="conversation-turn-1" data-turn="user">
+        <h4 class="sr-only select-none">You said:</h4>
+        <div class="text-base my-auto mx-auto pt-3 px-(--thread-content-margin)">
+          <div class="mx-auto max-w-(--thread-content-max-width) flex-1 group/turn-messages relative flex w-full min-w-0 flex-col">
+            <div class="flex max-w-full flex-col gap-4 grow">
+              <div data-message-author-role="user" data-message-id="msg-user" dir="auto" class="min-h-8 text-message relative flex w-full flex-col items-end gap-2">
+                <div class="flex w-full flex-col gap-1 empty:hidden items-end rtl:items-start">
+                  <div class="user-message-bubble-color relative min-w-0 rounded-[22px] px-4 py-2.5 leading-6">
+                    <div class="[overflow-wrap:anywhere] whitespace-pre-wrap">
+                      Capture the signed-in ChatGPT thread shape without accidentally pulling in sidebar history.
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section dir="auto" data-turn-id="turn-assistant" data-testid="conversation-turn-2" data-turn="assistant">
+        <h4 class="sr-only select-none">ChatGPT said:</h4>
+        <div class="text-base my-auto mx-auto pb-10 px-(--thread-content-margin)">
+          <div class="mx-auto max-w-(--thread-content-max-width) flex-1 group/turn-messages relative flex w-full min-w-0 flex-col agent-turn">
+            <div class="flex max-w-full flex-col gap-4 grow">
+              <div data-message-author-role="assistant" data-message-id="msg-assistant-a" dir="auto" class="min-h-8 text-message relative flex w-full flex-col items-start gap-2">
+                <div class="markdown prose">
+                  <p>ChatGPT live-thread fixture response: use the signed-in conversation DOM as the regression anchor.</p>
+                  <ul>
+                    <li>Prefer main-thread selectors over sidebar echoes.</li>
+                    <li>Keep the extractor local and conservative.</li>
+                  </ul>
+                </div>
+              </div>
+              <div data-message-author-role="assistant" data-message-id="msg-assistant-b" dir="auto" class="min-h-8 text-message relative flex w-full flex-col items-start gap-2">
+                <p>Second assistant segment should merge into the same captured turn.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

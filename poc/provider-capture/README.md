@@ -10,6 +10,8 @@ The intent here is narrow on purpose. We are not automating prompts or building 
 - The extension can capture visible conversation-oriented text from the active tab without screenshots.
 - Captures are stored only in `chrome.storage.local` in the current browser profile.
 - The side panel can show the active tab, stored captures, selector-canary status, warnings, and turn-by-turn preview.
+- A selector canary can run on capture-ready tab load, keep local-only health counters, and surface a clipboard fallback when a provider DOM drifts.
+- A tracked-thread registry can expose `getTrackedThreads(filter?)` for the future `bac.recent_threads` MCP reader without leaking storage details.
 - Provider-specific selectors can be tested automatically with fixture pages.
 - The extraction logic can be refined against real provider DOM drift and locked in with regression tests.
 
@@ -31,6 +33,8 @@ The intent here is narrow on purpose. We are not automating prompts or building 
   - visible-text extractors with provider-aware selectors plus conservative fallback
 - `src/background/storage.ts`
   - local storage wrapper around `chrome.storage.local`
+- `src/registry/trackedThreads.ts`
+  - tracked-thread reader interface plus local selector-health counters
 - `fixtures/provider-pages/*.html`
   - local provider-like pages for automated extension tests
 
@@ -65,6 +69,8 @@ Current automated coverage includes:
 - storage append/read behavior
 - redaction warnings
 - Gemini live-like regression coverage for heading blocks and editable-panel content
+- signed-in DOM-shaped ChatGPT and Claude regression fixtures derived from real captures
+- tracked-thread registry and selector-health counter coverage
 - extension e2e proving capture and persistence across reload with local fixture pages
 
 ## Commands
@@ -91,7 +97,9 @@ On April 25, 2026, we also validated the POC collaboratively in the user's norma
 
 What was proven live:
 
-- ChatGPT shared/canvas page capture worked in the real browser session and stored locally in the extension.
+- ChatGPT signed-in conversation-thread capture worked on a real `https://chatgpt.com/c/<id>` page.
+- ChatGPT project-thread capture also worked on a real `https://chatgpt.com/g/.../c/<id>` page.
+- Claude signed-in conversation-thread capture worked on a real `https://claude.ai/chat/<id>` page after moving Claude to a heading-based structural fallback.
 - Gemini signed-in conversation capture worked in the real browser session.
 - Gemini capture now includes visible assistant turns and large editable/canvas output, not only user prompts.
 
@@ -112,29 +120,75 @@ After that patch, the same live capture became:
 
 That was the most important refinement in this POC so far, because it proves we can respond to real provider DOM shape rather than only passing fixture tests.
 
+### ChatGPT And Claude Live-DOM Lock-In
+
+The April 25, 2026 live passes also closed the remaining signed-in gaps for ChatGPT and Claude:
+
+- ChatGPT's normal thread DOM already matched `main [data-message-author-role]` cleanly, so we locked a sanitized regression fixture around the real `conversation-turn-*` plus `data-message-author-role` structure.
+- Claude's real DOM did not expose a durable assistant-message selector. The stable path was the hidden heading pattern (`You said:` / `Claude responded:`), so the extractor now scores structural candidates against direct-selector candidates instead of stopping after the first direct user-only hit.
+- Both real DOM shapes now have committed sanitized fixtures under `fixtures/provider-pages/` to catch silent provider redesign drift in unit tests.
+
+## Tracked Thread Contract
+
+This POC now owns the reader contract that will feed the future `bac.recent_threads` MCP tool:
+
+```ts
+interface TrackedThread {
+  provider: 'chatgpt' | 'claude' | 'gemini' | 'unknown';
+  threadId: string;
+  threadUrl: string;
+  title: string;
+  lastTurnAt: string;
+  captureCount: number;
+  status: 'active' | 'waiting_on_user' | 'waiting_on_ai' | 'stale' | 'fallback';
+}
+```
+
+`src/registry/trackedThreads.ts` exposes `getTrackedThreads(filter?)` and keeps the current storage backend (`chrome.storage.local`) behind that interface.
+
+Important nuance: `lastTurnAt` is currently the last local observation time from a capture or selector-canary load, not a provider-sourced server timestamp.
+
+## Selector Canary And Clipboard Fallback
+
+- On every capture-ready provider tab load, the content script now runs a selector canary and records the outcome locally.
+- The side panel shows per-provider recent health such as `8/10 recent loads clean`, with separate fallback and failed counts.
+- If the active tab's latest canary is `fallback` or `stale`, the side panel surfaces an extractor warning and a `Capture + copy fallback` action that copies a conservative local markdown capture to the clipboard.
+
 ## What Is Proven Right Now
 
 - Existing-tab capture is mechanically sound for provider-like pages and real logged-in pages.
 - The extension can keep all captured artifacts local.
 - The side panel is enough to review captures and selector health.
 - The TechPulse-style automated harness is working for this POC.
+- Real ChatGPT signed-in thread capture is proven on both normal and project thread routes.
+- Real Claude signed-in thread capture is proven with a live-DOM regression fixture and heading fallback.
 - Real Gemini capture is strong enough to include assistant output plus rich visible document content.
+- The future MCP server can read tracked threads through `getTrackedThreads(filter?)` without knowing about `chrome.storage.local`.
 
 ## What Is Not Yet Proven
 
 - Long-term DOM stability for any real provider
-- Real ChatGPT conversation-thread assistant-turn capture in the user's accessible browser session
-- Real Claude capture in a logged-in session
 - Prompt injection or response automation for real providers
 - Cloud sync
+- Vault `Source` artifact migration for provider captures
 - End-to-end local encryption
 - Production-grade security review
 
-Important nuance:
+## Storage Handoff Decision
 
-- ChatGPT is partially proven here through real shared/canvas capture.
-- A fully convincing real-conversation-thread capture for ChatGPT still needs one more live pass on a visible loaded thread.
-- Claude live validation was deferred pending login.
+For this PoC, captures and the tracked-thread registry stay in `chrome.storage.local`.
+
+Why this stays local for now:
+
+- the future MCP server needs a fast, browser-local reader surface first
+- `poc/obsidian-integration` is still focused on synthetic thin-slice vault mechanics rather than provider-thread ingestion
+- moving capture records into vault `Source` artifacts now would add backfill, dual-write, and artifact-shape decisions before the MCP reader is even wired
+
+The intended v1 path is to keep `getTrackedThreads(filter?)` stable, then change the storage backend behind that interface once vault `Source` artifact ownership is ready.
+
+## Deferred To V1
+
+`window.fetch` / SSE interception remains deferred. The DOM path is now good enough for the PoCs, and fetch interception should be treated as a durability upgrade for v1 rather than a prerequisite for the current provider-capture or MCP-reader slice.
 
 ## How To Try The Live POC Manually
 
@@ -170,6 +224,7 @@ poc/provider-capture/.output/chrome-mv3
 - provider label
 - turn count
 - selector canary
+- selector health
 - warnings
 - extracted turns with source labels
 

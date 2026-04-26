@@ -51,7 +51,8 @@ describe('local storage wrapper', () => {
 
     expect(captures).toHaveLength(1);
     expect(captures[0].id).toBe('one');
-    expect(storageState.size).toBe(1);
+    expect(storageState.has('bac.providerCapture.captures')).toBe(true);
+    expect(storageState.has('bac.providerCapture.trackedThreads')).toBe(true);
   });
 
   it('clears local captures', async () => {

@@ -62,23 +62,9 @@ const closeFixtureServer = async (server: Server): Promise<void> =>
     });
   });
 
-const requestBridge = async <T>(
-  page: Page,
-  requestEvent: string,
-  resultEvent: string,
-): Promise<T> =>
-  await page.evaluate(
-    ({ requestEventName, resultEventName }) =>
-      new Promise<T>((resolve) => {
-        const handler = (event: Event) => {
-          window.removeEventListener(resultEventName, handler as EventListener);
-          resolve((event as CustomEvent<T>).detail);
-        };
-        window.addEventListener(resultEventName, handler as EventListener, { once: true });
-        window.dispatchEvent(new CustomEvent(requestEventName));
-      }),
-    { requestEventName: requestEvent, resultEventName: resultEvent },
-  );
+const refreshSidepanel = async (sidepanelPage: Page) => {
+  await sidepanelPage.getByRole('button', { name: 'Refresh' }).click();
+};
 
 test('captures provider fixture tabs and persists results in local extension storage', async () => {
   const fixtureServer = await startFixtureServer();
@@ -89,76 +75,40 @@ test('captures provider fixture tabs and persists results in local extension sto
     await chatgptPage.goto(`${fixtureServer.origin}/chatgpt.html?provider=chatgpt`, {
       waitUntil: 'domcontentloaded',
     });
-    await expect(chatgptPage.locator('html[data-bac-provider-capture="ready"]')).toBeVisible();
-
-    const resetResponse = await requestBridge<{ ok: boolean }>(
-      chatgptPage,
-      'bac-provider-reset-request',
-      'bac-provider-reset-result',
-    );
-    expect(resetResponse.ok).toBe(true);
-
-    const chatgptCapture = await requestBridge<{
-      ok: boolean;
-      capture?: { provider: string; turns: Array<{ text: string }> };
-      state?: { captures: Array<{ provider: string }> };
-    }>(chatgptPage, 'bac-provider-capture-request', 'bac-provider-capture-result');
-
-    expect(chatgptCapture.ok).toBe(true);
-    expect(chatgptCapture.capture?.provider).toBe('chatgpt');
-    expect(chatgptCapture.capture?.turns[1]?.text).toContain('ChatGPT fixture response');
-    expect(chatgptCapture.state?.captures).toHaveLength(1);
+    const sidepanelPage = await runtime.context.newPage();
+    await sidepanelPage.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await expect(sidepanelPage.getByText('No captures yet.')).toBeVisible();
+    await expect(sidepanelPage.getByTestId('active-title')).toContainText('ChatGPT Fixture Thread');
+    await sidepanelPage.getByTestId('capture-active-tab').click();
+    await expect(sidepanelPage.getByTestId('capture-card-chatgpt')).toContainText('2 turns');
 
     const claudePage = await runtime.context.newPage();
     await claudePage.goto(`${fixtureServer.origin}/claude.html?provider=claude`, {
       waitUntil: 'domcontentloaded',
     });
-    await expect(claudePage.locator('html[data-bac-provider-capture="ready"]')).toBeVisible();
-    const claudeCapture = await requestBridge<{
-      ok: boolean;
-      capture?: { provider: string; turns: Array<{ text: string }> };
-      state?: { captures: Array<{ provider: string }> };
-    }>(claudePage, 'bac-provider-capture-request', 'bac-provider-capture-result');
-
-    expect(claudeCapture.ok).toBe(true);
-    expect(claudeCapture.capture?.provider).toBe('claude');
-    expect(claudeCapture.capture?.turns[1]?.text).toContain('Claude fixture response');
-    expect(claudeCapture.state?.captures).toHaveLength(2);
+    await claudePage.bringToFront();
+    await sidepanelPage.bringToFront();
+    await refreshSidepanel(sidepanelPage);
+    await expect(sidepanelPage.getByTestId('active-title')).toContainText('Claude Fixture Thread');
+    await sidepanelPage.getByTestId('capture-active-tab').click();
+    await expect(sidepanelPage.getByTestId('capture-card-claude')).toContainText('2 turns');
 
     const geminiPage = await runtime.context.newPage();
     await geminiPage.goto(`${fixtureServer.origin}/gemini.html?provider=gemini`, {
       waitUntil: 'domcontentloaded',
     });
-    await expect(geminiPage.locator('html[data-bac-provider-capture="ready"]')).toBeVisible();
-    const geminiCapture = await requestBridge<{
-      ok: boolean;
-      capture?: { provider: string; turns: Array<{ text: string }> };
-      state?: { captures: Array<{ provider: string }> };
-    }>(geminiPage, 'bac-provider-capture-request', 'bac-provider-capture-result');
+    await geminiPage.bringToFront();
+    await sidepanelPage.bringToFront();
+    await refreshSidepanel(sidepanelPage);
+    await expect(sidepanelPage.getByTestId('active-title')).toContainText('Gemini Fixture Thread');
+    await sidepanelPage.getByTestId('capture-active-tab').click();
+    await expect(sidepanelPage.getByTestId('capture-card-gemini')).toContainText('2 turns');
 
-    expect(geminiCapture.ok).toBe(true);
-    expect(geminiCapture.capture?.provider).toBe('gemini');
-    expect(geminiCapture.capture?.turns[1]?.text).toContain('Gemini fixture response');
-    expect(geminiCapture.state?.captures).toHaveLength(3);
-
-    await chatgptPage.reload({ waitUntil: 'domcontentloaded' });
-    await expect(chatgptPage.locator('html[data-bac-provider-capture="ready"]')).toBeVisible();
-    const persistedState = await requestBridge<{
-      ok: boolean;
-      state?: { captures: Array<{ provider: string }> };
-    }>(chatgptPage, 'bac-provider-state-request', 'bac-provider-state-result');
-
-    expect(persistedState.ok).toBe(true);
-    expect(persistedState.state?.captures.map((capture) => capture.provider)).toEqual([
-      'gemini',
-      'claude',
-      'chatgpt',
-    ]);
-
-    const sidepanelPage = await runtime.context.newPage();
-    await sidepanelPage.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
-      waitUntil: 'domcontentloaded',
-    });
+    await sidepanelPage.reload({ waitUntil: 'domcontentloaded' });
+    await expect(sidepanelPage.getByTestId('capture-card-gemini')).toBeVisible();
+    await expect(sidepanelPage.getByTestId('capture-card-claude')).toBeVisible();
     await expect(sidepanelPage.getByTestId('capture-card-chatgpt')).toBeVisible();
     await sidepanelPage.getByTestId('capture-card-chatgpt').click();
     await expect(sidepanelPage.getByTestId('capture-preview')).toContainText('```bash');
@@ -189,14 +139,6 @@ test('captures embedded research iframe artifacts and exposes artifact controls'
     await researchPage.goto(`${fixtureServer.origin}/chatgpt-research.html?provider=chatgpt`, {
       waitUntil: 'domcontentloaded',
     });
-    await expect(researchPage.locator('html[data-bac-provider-capture="ready"]')).toBeVisible();
-
-    const resetResponse = await requestBridge<{ ok: boolean }>(
-      researchPage,
-      'bac-provider-reset-request',
-      'bac-provider-reset-result',
-    );
-    expect(resetResponse.ok).toBe(true);
 
     const sidepanelPage = await runtime.context.newPage();
     await sidepanelPage.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {

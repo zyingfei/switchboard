@@ -108,6 +108,15 @@ h3 {
   min-height: 30px;
 }
 
+.warning-panel {
+  padding: 9px 10px;
+  border: 1px solid #e0c48a;
+  border-radius: 6px;
+  background: #fff4d9;
+  color: #724f12;
+  font-size: 13px;
+}
+
 .actions {
   display: flex;
   gap: 8px;
@@ -192,6 +201,24 @@ textarea {
 .capture-list {
   display: grid;
   gap: 8px;
+}
+
+.health-list {
+  display: grid;
+  gap: 8px;
+}
+
+.health-card {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid #d8e0e3;
+  border-radius: 8px;
+  background: #fbfcfc;
+}
+
+.health-card small {
+  color: #617078;
 }
 
 .capture-card {

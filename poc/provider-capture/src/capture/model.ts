@@ -1,8 +1,14 @@
-export type ProviderId = 'chatgpt' | 'claude' | 'gemini' | 'unknown';
+export const supportedProviderIds = ['chatgpt', 'claude', 'gemini'] as const;
+
+export type SupportedProviderId = (typeof supportedProviderIds)[number];
+
+export type ProviderId = SupportedProviderId | 'unknown';
 
 export type CaptureRole = 'user' | 'assistant' | 'system' | 'unknown';
 
 export type SelectorCanary = 'passed' | 'fallback' | 'failed';
+
+export type TrackedThreadStatus = 'active' | 'waiting_on_user' | 'waiting_on_ai' | 'stale' | 'fallback';
 
 export type CaptureWarningCode =
   | 'possible_api_key'
@@ -65,12 +71,27 @@ export interface ActiveTabSummary {
   supported: boolean;
   title: string;
   url: string;
+  trackedThreadStatus?: TrackedThreadStatus;
+  captureCount?: number;
+  lastTurnAt?: string;
   reason?: string;
+  warning?: string;
+}
+
+export interface ProviderSelectorHealth {
+  provider: SupportedProviderId;
+  cleanLoads: number;
+  recentLoads: number;
+  fallbackLoads: number;
+  failedLoads: number;
+  latestStatus?: SelectorCanary;
+  latestCheckedAt?: string;
 }
 
 export interface CaptureState {
   captures: ProviderCapture[];
   lastActiveTab: ActiveTabSummary | null;
+  selectorHealth: ProviderSelectorHealth[];
   lastError: string | null;
   updatedAt: string;
 }
@@ -90,6 +111,15 @@ const normalizeProviderId = (value: unknown): ProviderId =>
 
 const normalizeSelectorCanary = (value: unknown): SelectorCanary =>
   value === 'passed' || value === 'fallback' || value === 'failed' ? value : 'failed';
+
+const normalizeTrackedThreadStatus = (value: unknown): TrackedThreadStatus =>
+  value === 'active' ||
+  value === 'waiting_on_user' ||
+  value === 'waiting_on_ai' ||
+  value === 'stale' ||
+  value === 'fallback'
+    ? value
+    : 'active';
 
 const normalizeCaptureRole = (value: unknown): CaptureRole =>
   value === 'user' || value === 'assistant' || value === 'system' || value === 'unknown' ? value : 'unknown';
@@ -176,6 +206,7 @@ export const normalizeCaptureState = (value: unknown): CaptureState => {
   const state = isRecord(value) ? value : {};
   const captures = Array.isArray(state.captures) ? state.captures.map(normalizeProviderCapture) : [];
   const activeTab = isRecord(state.lastActiveTab) ? state.lastActiveTab : null;
+  const selectorHealth = Array.isArray(state.selectorHealth) ? state.selectorHealth : [];
 
   return {
     captures,
@@ -186,9 +217,34 @@ export const normalizeCaptureState = (value: unknown): CaptureState => {
           supported: typeof activeTab.supported === 'boolean' ? activeTab.supported : false,
           title: typeof activeTab.title === 'string' ? activeTab.title : 'Untitled page',
           url: typeof activeTab.url === 'string' ? activeTab.url : '',
+          trackedThreadStatus:
+            typeof activeTab.trackedThreadStatus === 'string'
+              ? normalizeTrackedThreadStatus(activeTab.trackedThreadStatus)
+              : undefined,
+          captureCount: typeof activeTab.captureCount === 'number' ? activeTab.captureCount : undefined,
+          lastTurnAt: typeof activeTab.lastTurnAt === 'string' ? activeTab.lastTurnAt : undefined,
           reason: typeof activeTab.reason === 'string' ? activeTab.reason : undefined,
+          warning: typeof activeTab.warning === 'string' ? activeTab.warning : undefined,
         }
       : null,
+    selectorHealth: selectorHealth
+      .map((entry) => (isRecord(entry) ? entry : {}))
+      .filter(
+        (entry): entry is Record<string, unknown> =>
+          entry.provider === 'chatgpt' || entry.provider === 'claude' || entry.provider === 'gemini',
+      )
+      .map((entry) => ({
+        provider: entry.provider as SupportedProviderId,
+        cleanLoads: typeof entry.cleanLoads === 'number' ? entry.cleanLoads : 0,
+        recentLoads: typeof entry.recentLoads === 'number' ? entry.recentLoads : 0,
+        fallbackLoads: typeof entry.fallbackLoads === 'number' ? entry.fallbackLoads : 0,
+        failedLoads: typeof entry.failedLoads === 'number' ? entry.failedLoads : 0,
+        latestStatus:
+          entry.latestStatus === 'passed' || entry.latestStatus === 'fallback' || entry.latestStatus === 'failed'
+            ? entry.latestStatus
+            : undefined,
+        latestCheckedAt: typeof entry.latestCheckedAt === 'string' ? entry.latestCheckedAt : undefined,
+      })),
     lastError: typeof state.lastError === 'string' ? state.lastError : null,
     updatedAt: typeof state.updatedAt === 'string' ? state.updatedAt : new Date(0).toISOString(),
   };
