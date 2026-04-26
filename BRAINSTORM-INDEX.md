@@ -1,0 +1,350 @@
+# BRAINSTORM index
+
+Generated 2026-04-25. Source: `BRAINSTORM.md` (2365 lines).
+Built by `scripts/build-brainstorm-index.sh` — re-run after edits.
+
+## Headings
+
+- L9 — 1. Vision
+- L33 — 2. The three pillars (workflows)
+    - L35 — W1. Cross-AI orchestration
+    - L43 — W2. Reading capture
+    - L49 — W3. Ambient research with long-term memory
+- L59 — 3. Cross-cutting primitives
+- L74 — 4. Use case catalog
+    - L80 — W1 — Cross-AI orchestration
+    - L98 — W2 — Reading capture
+    - L112 — W3 — Ambient research + long-term memory
+- L152 — 5. Capture inputs (every way content enters the system)
+- L168 — 6. Dispatch targets (every place content can go)
+- L189 — 7. Content types (what we move)
+- L195 — 8. Adapter interfaces (the openness substrate)
+- L257 — 9. Storage model
+- L270 — 10. UI surfaces
+- L286 — 11. Identity, permissions, privacy
+- L302 — 12. Long-term memory mechanics
+- L314 — 13. Orchestration mechanics
+- L326 — 14. PR / coding agent loop
+- L338 — 15. Tech stack (default; can revisit)
+- L350 — 16. Edge cases & failure modes (cross-cutting)
+- L382 — 17. Open questions (defer; we'll answer when shaping PRD)
+- L398 — 18. Non-goals (placeholder — fill at PRD time)
+- L407 — 19. Trim-down candidates (for PRD prioritization later — not now)
+- L424 — 20. What's next
+- L432 — 21. Addendum 2026-04-24 — dogfood loop & mindflow capture
+    - L436 — 21.1 Meta-observation: the user is dogfooding the product right now
+    - L453 — 21.2 Structural pattern: research DAG (fork / converge / dotted)
+    - L472 — 21.3 New primitive: Relate
+    - L481 — 21.4 New scenarios — W1 cross-AI orchestration (fork / converge / dogfood)
+    - L493 — 21.5 New scenarios — W3 ambient research / mindflow
+    - L504 — 21.6 Storage model — add graph store
+    - L513 — 21.7 Dogfood loop as a development practice
+    - L528 — 21.8 New edge cases
+    - L540 — 21.9 Updated "what's next"
+- L555 — 22. Addendum 2026-04-24 evening — external review fold-in (ChatGPT)
+    - L569 — 22.1 From File 1: useful disciplines (everything else parked)
+    - L582 — 22.2 Sharpest positioning (confirmed and clarified) `[+gpt]`
+    - L600 — 22.3 Data-model upgrade — workstream graph entities `[+gpt]`
+    - L622 — 22.4 New killer abstraction — Context Pack `[+gpt]`
+    - L664 — 22.5 Thread Knowledge State `[+gpt]`
+    - L688 — 22.6 Typed extraction — manual-first capture buttons `[+gpt]`
+    - L701 — 22.7 Freshness signals — extended `[+gpt]`
+    - L716 — 22.8 Dispatch Preflight (security + transparency) `[+gpt]`
+    - L731 — 22.9 Adapter Health Status `[+gpt]`
+    - L752 — 22.10 Workstream lifecycle states `[+gpt]`
+    - L767 — 22.11 Competitor landscape `[+gpt]`
+    - L780 — 22.12 Reuse map (concrete libraries) `[+gpt]`
+    - L808 — 22.13 New workflow families W4–W9 `[+gpt]`
+        - L812 — W4 — Research decision memory
+        - L822 — W5 — Context pack / handoff workflows
+        - L832 — W6 — Quality and evaluation
+        - L842 — W7 — Security / privacy workflows
+        - L853 — W8 — Coding-specific workflows
+        - L863 — W9 — Onboarding and import
+    - L872 — 22.14 The biggest design principle `[+gpt]`
+    - L890 — 22.15 Strongest-version manifesto `[+gpt]`
+    - L905 — 22.16 Updated "what's next"
+- L923 — 23. Addendum 2026-04-24 evening — Obsidian as the notebook anchor
+    - L935 — 23.1 Decision: Obsidian as canonical notebook anchor
+    - L962 — 23.2 Integration tier picks
+    - L983 — 23.3 The big scope simplifier — write Canvas + Bases instead of building UIs `[+claude]`
+    - L1018 — 23.4 Workstream graph mirrored to frontmatter `[+claude]`
+    - L1062 — 23.5 Inbox-first writing pattern `[+claude from user's Pattern B]`
+    - L1088 — 23.6 Coexistence with Web Clipper
+    - L1099 — 23.7 Updated NotebookAdapter contract (Obsidian-flavored)
+    - L1134 — 23.8 New scenarios — Obsidian-specific
+    - L1152 — 23.9 Tradeoffs and open issues with Obsidian-anchoring
+    - L1167 — 23.10 Updated v1 spine
+    - L1190 — 23.11 What this changes in earlier sections
+    - L1205 — 23.12 Updated "what's next"
+- L1217 — 24. Addendum 2026-04-24 evening — Claude deep research fold-in
+    - L1228 — 24.1 Source
+    - L1235 — 24.2 The five takeaways `[+claude-dr]`
+    - L1276 — 24.3 Technical reality picks (from §A) `[+claude-dr]`
+    - L1300 — 24.4 Reuse map — corrections and additions `[+claude-dr]`
+    - L1320 — 24.5 MCP — the load-bearing axis the brainstorm missed `[+claude-dr]`
+    - L1345 — 24.6 New entity types `[+claude-dr]`
+    - L1368 — 24.7 Cost / optionality reframe — BYO API key as optional power tier `[+claude-dr]`
+    - L1388 — 24.8 Déjà-vu reframe — calibrated-freshness recall `[+claude-dr]`
+    - L1402 — 24.9 Recall UX — the foot-guns from prior attempts `[+claude-dr]`
+    - L1416 — 24.10 Critical safety primitives the brainstorm under-specified `[+claude-dr]`
+    - L1436 — 24.11 New scenarios S112–S136 `[+claude-dr]`
+    - L1472 — 24.12 Risk register / blind spots `[+claude-dr]`
+    - L1489 — 24.13 Local-first dogma — encrypted backup escape valve `[+claude-dr]`
+    - L1506 — 24.14 Positioning + ICP `[+claude-dr]`
+    - L1535 — 24.15 Distribution levers `[+claude-dr]`
+    - L1546 — 24.16 MVP wow — reconciling Claude DR's spine with §22 / §23 spines
+    - L1579 — 24.17 What this changes in earlier sections
+    - L1604 — 24.18 Updated "what's next"
+- L1622 — 25. Addendum 2026-04-24 evening — prompt corpus as autocomplete + training source
+    - L1630 — 25.1 Reframe — the prompt is a first-class artifact
+    - L1645 — 25.2 Five tiers of escalating sophistication
+    - L1659 — 25.3 Privacy posture — the prompt corpus is THE most sensitive corpus
+    - L1683 — 25.4 New scenarios S138–S151
+    - L1702 — 25.5 Cold-start strategy
+    - L1713 — 25.6 What this changes / connects to in earlier sections
+    - L1739 — 25.7 Trim recommendations for v1
+    - L1757 — 25.8 Updated unified v1 spine
+- L1765 — 26. Addendum (2026-04-25): PoC plan after PoC-1/2 — `[+gpt-poc]`
+    - L1777 — 26.1 Where we actually are (verified against `pocs/` READMEs, 2026-04-25)
+    - L1797 — 26.2 PoC philosophy refinement `[+gpt-poc]`
+    - L1809 — 26.3 Sharpened product thesis: Obsidian-native, not Obsidian-dependent `[+gpt-poc]`
+    - L1836 — 26.3.1 What BAC should own vs. what Obsidian should own when present
+    - L1852 — 26.4 Two PoC paths on the table `[+gpt-poc]`
+    - L1869 — 26.5 Path A in detail — three balanced PoCs `[+gpt-poc]`
+        - L1871 — 26.5.1 PoC 1 — Obsidian-native user organization
+        - L1984 — 26.5.2 PoC 2 — Links / Graph / Canvas / Bases as first-class surfaces
+        - L2037 — 26.5.3 PoC 3 — Organization-aware Context Pack and browser-owned MCP
+        - L2117 — 26.5.4 How the three PoCs fit together
+        - L2127 — 26.5.5 Path A explicit deferrals
+    - L2144 — 26.6 Path B in detail — single `poc/local-bridge` PoC `[+gpt-poc]`
+        - L2171 — 26.6.1 Architecture `[+gpt-poc]`
+        - L2205 — 26.6.2 Scope (in/out) `[+gpt-poc]`
+        - L2236 — 26.6.3 Acceptance demo `[+gpt-poc]`
+        - L2252 — 26.6.4 Test plan `[+gpt-poc]`
+    - L2268 — 26.7 Architectural deltas vs. prior anchors `[+gpt-poc]`
+    - L2282 — 26.8 New scenarios this PoC discussion surfaces
+    - L2298 — 26.9 Edge cases this surfaces
+    - L2311 — 26.10 Open questions for user (don't decide unilaterally)
+    - L2348 — 26.11 Bottom-line synthesis (mine, not the discussion's)
+
+## Scenarios (S###)
+
+- L84 — S1
+- L85 — S2
+- L86 — S3
+- L87 — S4
+- L88 — S5
+- L89 — S6
+- L90 — S7
+- L91 — S8
+- L92 — S9
+- L93 — S10
+- L94 — S11
+- L95 — S12
+- L96 — S13
+- L102 — S14
+- L103 — S15
+- L104 — S16
+- L105 — S17
+- L106 — S18
+- L107 — S19
+- L108 — S20
+- L109 — S21
+- L110 — S22
+- L116 — S23
+- L117 — S24
+- L118 — S25
+- L119 — S26
+- L120 — S27
+- L121 — S28
+- L122 — S29
+- L123 — S30
+- L124 — S31
+- L125 — S32
+- L126 — S33
+- L127 — S34
+- L128 — S35
+- L129 — S36
+- L130 — S37
+- L131 — S38
+- L132 — S39
+- L133 — S40
+- L134 — S41
+- L135 — S42
+- L136 — S43
+- L137 — S44
+- L138 — S45
+- L139 — S46
+- L140 — S47
+- L141 — S48
+- L142 — S49
+- L143 — S50
+- L144 — S51
+- L145 — S52
+- L146 — S53
+- L147 — S54
+- L148 — S55
+- L485 — S56
+- L486 — S57
+- L487 — S58
+- L488 — S59
+- L489 — S60
+- L490 — S61
+- L491 — S62
+- L497 — S63
+- L498 — S64
+- L499 — S65
+- L500 — S66
+- L501 — S67
+- L502 — S68
+- L816 — S69
+- L817 — S70
+- L818 — S71
+- L819 — S72
+- L820 — S73
+- L826 — S74
+- L827 — S75
+- L828 — S76
+- L829 — S77
+- L830 — S78
+- L836 — S79
+- L837 — S80
+- L838 — S81
+- L839 — S82
+- L840 — S83
+- L846 — S84
+- L847 — S85
+- L848 — S86
+- L849 — S87
+- L850 — S88
+- L857 — S89
+- L858 — S90
+- L859 — S91
+- L860 — S92
+- L861 — S93
+- L867 — S94
+- L868 — S95
+- L869 — S96
+- L870 — S97
+- L851 — S98
+- L1138 — S99
+- L1139 — S100
+- L1140 — S101
+- L1141 — S102
+- L1142 — S103
+- L1143 — S104
+- L1144 — S105
+- L1145 — S106
+- L1146 — S107
+- L1147 — S108
+- L1148 — S109
+- L1149 — S110
+- L1150 — S111
+- L1442 — S112
+- L1443 — S113
+- L1444 — S114
+- L1445 — S115
+- L1446 — S116
+- L1447 — S117
+- L1448 — S118
+- L1449 — S119
+- L1450 — S120
+- L1451 — S121
+- L1452 — S122
+- L1453 — S123
+- L1454 — S124
+- L1455 — S125
+- L1456 — S126
+- L1457 — S127
+- L1458 — S128
+- L1459 — S129
+- L1460 — S130
+- L1461 — S131
+- L1462 — S132
+- L1463 — S133
+- L1464 — S134
+- L1465 — S135
+- L1466 — S136
+- L1504 — S137
+- L1687 — S138
+- L1688 — S139
+- L1689 — S140
+- L1690 — S141
+- L1691 — S142
+- L1692 — S143
+- L1693 — S144
+- L1694 — S145
+- L1695 — S146
+- L1696 — S147
+- L1697 — S148
+- L1698 — S149
+- L1699 — S150
+- L1700 — S151
+- L2286 — S152
+- L2287 — S153
+- L2288 — S154
+- L2289 — S155
+- L2290 — S156
+- L2291 — S157
+- L2292 — S158
+- L2293 — S159
+- L2294 — S160
+- L2295 — S161
+- L2296 — S162
+
+## Edge cases (E##)
+
+- L354 — E1
+- L355 — E2
+- L356 — E3
+- L357 — E4
+- L358 — E5
+- L359 — E6
+- L360 — E7
+- L361 — E8
+- L362 — E9
+- L363 — E10
+- L364 — E11
+- L365 — E12
+- L366 — E13
+- L367 — E14
+- L368 — E15
+- L369 — E16
+- L370 — E17
+- L371 — E18
+- L372 — E19
+- L373 — E20
+- L374 — E21
+- L375 — E22
+- L376 — E23
+- L377 — E24
+- L378 — E25
+- L532 — E26
+- L533 — E27
+- L534 — E28
+- L535 — E29
+- L536 — E30
+- L537 — E31
+- L538 — E32
+- L2302 — E33
+- L2303 — E34
+- L2304 — E35
+- L2305 — E36
+- L2306 — E37
+- L2307 — E38
+- L2308 — E39
+- L2309 — E40
+
+## Risks (R##)
+
+- L1478 — R1
+- L1479 — R2
+- L1480 — R3
+- L1481 — R4
+- L1482 — R5
+- L1483 — R6
+- L1484 — R7
+- L1485 — R8
+- L1486 — R9
+- L1487 — R10
