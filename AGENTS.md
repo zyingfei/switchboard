@@ -94,6 +94,56 @@ under `packages/`, extend the shared configs:
 
 The verify script at [`scripts/verify-standards.sh`](scripts/verify-standards.sh) runs the kit's basic checks; wire it into CI.
 
+## Milestone-PR convention
+
+Production work is organized into **milestones**. Each milestone has its
+own branch (`mN/<short-name>`), a planning artifact under
+`docs/milestones/MN-<short-name>/`, and an open PR against `main` until
+the milestone's done-criteria are met.
+
+Per-milestone files (mandatory):
+
+- `docs/milestones/MN-<short-name>/README.md` — milestone scope: what's
+  in, what's out (with FAQ for the "should I build X?" questions
+  agents commonly ask), source artifacts the work depends on,
+  deliverables, E2E acceptance criteria, failure modes, sequencing
+  (numbered steps), reference reading order with time estimates.
+- `docs/milestones/MN-<short-name>/AGENT-PROMPT.md` — paste-ready,
+  self-contained handoff prompt for any coding agent (Codex CLI,
+  Claude Code, Cursor, etc.). Designed so the agent can read the
+  prompt + linked references and start without any prior conversation
+  context.
+
+Per-milestone files (created when work completes):
+
+- `docs/milestones/MN-<short-name>/DEMO.md` — copy-paste runbook
+  exercising the E2E acceptance scenario.
+- `docs/milestones/MN-<short-name>/STANDARDS-CHECK.md` — filled
+  checklists from `checklists/`.
+- (Optional) `docs/milestones/MN-<short-name>/SURPRISES.md` — out-of-
+  scope items the agent discovered mid-build.
+
+Conventions:
+
+- **Per-step commits** within the milestone branch — reviewers can
+  sample step boundaries without staring at a 50-file PR.
+- **Time-box per step** named in the milestone README; if any step
+  takes more than the budget, stop and flag, don't silently push past.
+- **Final PR title**: `M<n>: <Name> — <one-line summary>`. Body
+  references the README + AGENT-PROMPT and lists all DoD items as a
+  checklist.
+- **Forward design refs into the milestone PR** (not just
+  `docs/milestones/`) so the agent doing the work has them in the
+  same branch context.
+- The next milestone is **named in the prior milestone's README** so
+  the chain is explicit (e.g., M1 README names M2 as the dispatch
+  milestone).
+- Don't bundle scope changes to PRD / BRAINSTORM / standards into a
+  milestone PR — those are separate fix-PRs.
+
+Track milestones in this file's "Repo navigation" section as they're
+added.
+
 ## Repo conventions
 
 These are Sidetrack-specific and override anything generic in the
