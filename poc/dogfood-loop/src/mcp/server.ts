@@ -1,49 +1,53 @@
 import { buildContextPack } from '../context/contextPack';
-import type { PromptRun, WorkstreamEvent, WorkstreamNode } from '../graph/model';
-import type { ThreadRegistryEntry } from '../registry/threadRegistry';
+import { findDejaVuHits } from '../recall/dejaVu';
+import {
+  BAC_MCP_TOOL_DEFINITIONS,
+  type BacContextPackResponse,
+  type BacRecentThreadsRequest,
+  type BacRecentThreadsResponse,
+  type BacSearchRequest,
+  type BacSearchResponse,
+  type BacToolCallParams,
+  type BacWorkstreamRequest,
+  type BacWorkstreamResponse,
+  type JsonRpcRequest,
+  type JsonRpcResponse,
+  type McpJsonToolResult,
+  type McpRuntimeData,
+  type McpTextToolResult,
+} from './contract';
 
-export interface McpRuntimeData {
-  nodes: WorkstreamNode[];
-  promptRuns: PromptRun[];
-  events: WorkstreamEvent[];
-  threadRegistry: ThreadRegistryEntry[];
-  generatedAt: string;
-}
+export type { JsonRpcRequest, JsonRpcResponse, McpRuntimeData } from './contract';
 
-export interface JsonRpcRequest {
-  jsonrpc: '2.0';
-  id?: string | number | null;
-  method: string;
-  params?: unknown;
-}
+const asRecord = (value: unknown): Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
 
-export interface JsonRpcResponse {
-  jsonrpc: '2.0';
-  id: string | number | null;
-  result?: unknown;
-  error?: {
-    code: number;
-    message: string;
+const readToolCall = (params: unknown): { name: string; args: Record<string, unknown> } => {
+  const call = asRecord(params) as Partial<BacToolCallParams>;
+  return {
+    name: typeof call.name === 'string' ? call.name : '',
+    args: asRecord(call.arguments),
   };
-}
+};
 
-const tools = [
-  {
-    name: 'bac.recent_threads',
-    description: 'Return observed browser AI threads from the local BAC registry.',
-    inputSchema: { type: 'object', properties: {} },
-  },
-  {
-    name: 'bac.workstream',
-    description: 'Return current workstream nodes and prompt runs.',
-    inputSchema: { type: 'object', properties: {} },
-  },
-  {
-    name: 'bac.context_pack',
-    description: 'Return a portable markdown Context Pack for the current workstream.',
-    inputSchema: { type: 'object', properties: {} },
-  },
-];
+const readPositiveInteger = (value: unknown): number | undefined =>
+  typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : undefined;
+
+const readNonNegativeNumber = (value: unknown): number | undefined =>
+  typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
+
+const jsonResult = <TValue>(json: TValue): McpJsonToolResult<TValue> => ({
+  content: [{ type: 'json', json }],
+});
+
+const textResult = <TValue>(text: string, structuredContent: TValue): McpTextToolResult<TValue> => ({
+  content: [{ type: 'text', text }],
+  structuredContent,
+});
 
 export const handleMcpRequest = (
   request: JsonRpcRequest,
@@ -54,7 +58,7 @@ export const handleMcpRequest = (
     return {
       jsonrpc: '2.0',
       id,
-      result: { tools },
+      result: { tools: BAC_MCP_TOOL_DEFINITIONS },
     };
   }
   if (request.method !== 'tools/call') {
@@ -64,34 +68,44 @@ export const handleMcpRequest = (
       error: { code: -32601, message: `Unknown method: ${request.method}` },
     };
   }
-  const params = request.params as { name?: unknown } | undefined;
-  const name = typeof params?.name === 'string' ? params.name : '';
+
+  const { name, args } = readToolCall(request.params);
   if (name === 'bac.recent_threads') {
+    const toolRequest: BacRecentThreadsRequest = {
+      limit: readPositiveInteger(args.limit),
+    };
+    const response: BacRecentThreadsResponse = {
+      threads: toolRequest.limit
+        ? data.threadRegistry.slice(0, toolRequest.limit)
+        : data.threadRegistry,
+      generatedAt: data.generatedAt,
+    };
     return {
       jsonrpc: '2.0',
       id,
-      result: {
-        content: [{ type: 'json', json: data.threadRegistry }],
-      },
+      result: jsonResult(response),
     };
   }
+
   if (name === 'bac.workstream') {
+    const toolRequest: BacWorkstreamRequest = {
+      includeEvents: args.includeEvents === true,
+    };
+    const response: BacWorkstreamResponse = {
+      nodes: data.nodes,
+      promptRuns: data.promptRuns,
+      generatedAt: data.generatedAt,
+    };
+    if (toolRequest.includeEvents) {
+      response.events = data.events;
+    }
     return {
       jsonrpc: '2.0',
       id,
-      result: {
-        content: [
-          {
-            type: 'json',
-            json: {
-              nodes: data.nodes,
-              promptRuns: data.promptRuns,
-            },
-          },
-        ],
-      },
+      result: jsonResult(response),
     };
   }
+
   if (name === 'bac.context_pack') {
     const note = data.nodes.find((node) => node.type === 'note') ?? null;
     const responses = data.nodes.filter((node) => node.type === 'chat_response');
@@ -105,14 +119,45 @@ export const handleMcpRequest = (
       threadRegistry: data.threadRegistry,
       generatedAt: data.generatedAt,
     });
+    const response: BacContextPackResponse = { pack };
     return {
       jsonrpc: '2.0',
       id,
-      result: {
-        content: [{ type: 'text', text: pack.markdown }],
-      },
+      result: textResult(pack.markdown, response),
     };
   }
+
+  if (name === 'bac.search') {
+    const query = typeof args.query === 'string' ? args.query.trim() : '';
+    if (!query) {
+      return {
+        jsonrpc: '2.0',
+        id,
+        error: { code: -32602, message: 'bac.search requires a non-empty query' },
+      };
+    }
+    const toolRequest: BacSearchRequest = {
+      query,
+      minAgeDays: readNonNegativeNumber(args.minAgeDays),
+      maxAgeDays: readNonNegativeNumber(args.maxAgeDays),
+    };
+    const response: BacSearchResponse = {
+      hits: findDejaVuHits(
+        toolRequest.query,
+        data.nodes,
+        new Date(data.generatedAt),
+        toolRequest.minAgeDays,
+        toolRequest.maxAgeDays,
+      ),
+      generatedAt: data.generatedAt,
+    };
+    return {
+      jsonrpc: '2.0',
+      id,
+      result: jsonResult(response),
+    };
+  }
+
   return {
     jsonrpc: '2.0',
     id,

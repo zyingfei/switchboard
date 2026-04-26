@@ -4,7 +4,7 @@ import type { PromptRun, WorkstreamNode } from '../graph/model';
 import type { MockChatRuntimeMessage } from '../adapters/mockChatAdapter';
 import type { ForkProvider } from '../adapters/providers';
 import type { ContextPack } from '../context/contextPack';
-import type { JsonRpcResponse } from '../mcp/server';
+import type { JsonRpcResponse } from '../mcp/contract';
 import type { DejaVuHit } from '../recall/dejaVu';
 import type { ThreadRegistryEntry } from '../registry/threadRegistry';
 import type { VaultProjection } from '../vault/projection';

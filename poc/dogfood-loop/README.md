@@ -40,6 +40,10 @@ The project is intentionally narrow. It reuses the TechPulse browser companion s
 
 The second POC for provider content capture is separate at `poc/provider-capture/`.
 
+## MCP Contract
+
+`src/mcp/contract.ts` is the canonical source for the POC MCP surface. It defines the tool names, input schemas, request types, and response types for `bac.recent_threads`, `bac.workstream`, `bac.context_pack`, and lexical `bac.search`; `src/mcp/server.ts` imports that contract so the smoke implementation and documented tool surface stay in lockstep. Downstream POCs still own the keep, retire, or refactor decisions for `src/vault/`, the in-process `src/mcp/server.ts` smoke, and the lexical `src/recall/` spike.
+
 ## Install And Verify
 
 Run from this folder:
