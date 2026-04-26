@@ -338,10 +338,13 @@ interface IssueTrackerAdapter {
 ## 15. Tech stack (default; can revisit)
 
 - **WXT + React + TypeScript**, MV3 side panel — same as TechPulse companion. Reuse what works.
+- **FileSystemAccess API** for vault write (extension side) — `showDirectoryPicker()` + persisted `FileSystemDirectoryHandle`. Substrate per §23.0 (interfaces and core, no plugin dependency).
 - **IndexedDB** via Dexie (or `idb`) for event log, snapshots, search index.
-- **Readability.js** (Mozilla) for page extraction.
-- **Mark.js** or custom for inverse-search highlight overlay (S34).
-- **Lunr.js** or **MiniSearch** for local FTS (lightweight). Embeddings later if needed.
+- **OPFS** for blob snapshots (per §24.3k).
+- **Defuddle** (replaces Readability.js per §24.4) for page extraction; **Turndown** for HTML→Markdown.
+- **Hypothesis client** (BSD-2) for highlight anchoring (replaces Mark.js, per §24.4).
+- **MiniSearch** (default) for local FTS; **transformers.js + MiniLM-L6-v2** for embeddings (v1 default per §24.4).
+- **Local REST API client** (optional) — used only when user has the Obsidian plugin installed; gives surgical PATCH-with-frontmatter / PATCH-with-heading.
 - **Zod** for adapter contract schemas (TechPulse pattern).
 - **Vitest** + Playwright for unit + e2e tests.
 
@@ -932,6 +935,55 @@ with our hard constraints (local-first, open formats, user-owned data, no
 token burn) so completely that anchoring on Obsidian *removes scope* rather
 than adding it.
 
+### 23.0 Principle: Obsidian-first-citizen, interfaces-and-core-only `[user 2026-04-26]`
+
+Before the integration-tier picks below, fix the load-bearing principle that
+all later tiers must respect:
+
+> **Obsidian is the first-class notebook citizen** — it is the chosen target,
+> and BAC's vault conventions follow Obsidian's (frontmatter Properties,
+> wikilinks, tags, folders, `.canvas`, `.base`, `_BAC/` reserved namespace).
+> **But operation depends only on interfaces and core**: the filesystem, the
+> Markdown + YAML frontmatter substrate, the JSON Canvas spec, the `.base`
+> spec, and the `_BAC/` folder convention. **Plugins** — including the Local
+> REST API plugin — **are opt-in acceleration tiers, never required for BAC
+> to function.**
+
+What this rules out:
+
+- "v1 requires the user to install Local REST API plugin" — wrong framing.
+- "BAC writes through the REST API as the primary path; filesystem is the
+  fallback" — also wrong. The substrate is filesystem-and-files; REST API
+  is the accelerator.
+- "If the user doesn't install plugin X, BAC enters a degraded mode" — only
+  true for plugin-specific niceties (surgical PATCH, Dataview). Core capture,
+  organization, dispatch, recall, MCP must all work plugin-free.
+
+What this admits:
+
+- BAC needs **filesystem write access to the vault folder**. In a Chrome MV3
+  extension that means **FileSystemAccess API** (`showDirectoryPicker()` once
+  + persisted `FileSystemDirectoryHandle`). In a Node companion daemon
+  (§26.6) it means a configured vault path.
+- Where Local REST API *is* installed, BAC opportunistically uses the
+  surgical-PATCH endpoints to avoid read-modify-write races. Where not
+  installed, BAC uses temp-file-then-rename atomic writes to the same files.
+- Same applies to Dataview / Bases / any other plugin: BAC writes the file
+  formats those plugins consume (`.base`, frontmatter conventions), so
+  having them installed *renders* nicer in Obsidian, but BAC neither
+  requires them nor breaks without them.
+
+**Sync vs connection are separate concerns** — see §27 for the explicit
+split between vault-connection setup, sync-in (vault → BAC baseline / keep
+in sync), and sync-out (BAC → vault for items the user manually adds outside
+the tracked set). Conflict / merge semantics deferred.
+
+This principle reverses the §24 anchor that read "Local REST API plugin is
+the primary integration tier; v1 requires user installs it." That sentence
+is retracted. The §26.7 "filesystem-write-first adapter" delta — previously
+demoted to PoC-scope only — is **promoted to a v1 anchor** as the natural
+expression of this principle.
+
 ### 23.1 Decision: Obsidian as canonical notebook anchor
 
 **Anchor on Obsidian for v1.** Other notebooks (Notion, Logseq, Joplin, plain
@@ -948,8 +1000,11 @@ Obsidian-shaped contract, added as needed.
   lock-in, no schema drift hidden inside a SaaS.
 - **Local REST API plugin** ([coddingtonbear/obsidian-local-rest-api]): gives
   authenticated HTTPS read/write/patch access from a browser extension to the
-  vault. *This is the missing primitive* that turns NotebookAdapter from a
-  narrow file-write into a real bidirectional integration.
+  vault. *Opt-in acceleration* — when present, BAC uses surgical PATCH-with-
+  frontmatter-target / PATCH-with-heading-target endpoints. **Not a hard
+  dependency**: BAC's primary write path is the filesystem-and-Markdown
+  substrate (see §23.0 below). The plugin is "nice to have," not "needed to
+  function."
 - **Canvas (`.canvas` JSON)**: native infinite visual board with nodes/edges.
   We can write canvases programmatically — see §23.3.
 - **Bases (`.base` files)**: database-like views over notes/properties. We
@@ -965,20 +1020,26 @@ Of the 8 tiers from user's brief, our picks for v1 / v1.5 / later:
 
 | Tier | What | When | Used for |
 |---|---|---|---|
-| **Local REST API plugin** | Authenticated HTTPS read/write/patch/search/commands | **v1 required** | Primary NotebookAdapter implementation — read entries, append, patch headings, patch frontmatter, search |
-| **Obsidian URI** (`obsidian://`) | Deep-link triggers (open file, search, daily note) | **v1** | "Open this entry in Obsidian" buttons in side panel; quick-capture deep-links from browser action |
+| **Direct filesystem** | Read/write `.md`, `.canvas`, `.base` files via FileSystemAccess API (extension) or vault path (companion daemon) | **v1 — primary** | All vault writes/reads. Atomic temp-file-then-rename. Substrate, not fallback. |
 | **JSON Canvas** (`.canvas`) | Write `.canvas` files into vault | **v1** for spine | DAG view (S59), mind-map (S64), workstream visualization — see §23.3 |
 | **Bases** (`.base`) | Write `.base` files into vault | **v1** for spine | "Where was I?" panel (S1), claim ledger (S70), decision log (S69), workstream lifecycle dashboard — see §23.3 |
-| **Direct filesystem** | Read/write `.md` directly via native messaging host | **v1.5** | Bulk import/export, atomic batch writes, when REST API plugin not installed (graceful degrade) |
+| **Obsidian URI** (`obsidian://`) | Deep-link triggers (open file, search, daily note) | **v1** | "Open this entry in Obsidian" buttons in side panel; quick-capture deep-links from browser action |
+| **Local REST API plugin** | Authenticated HTTPS read/write/PATCH/search/commands when user has installed it | **v1 — opt-in acceleration** | Surgical PATCH-with-frontmatter-target / PATCH-with-heading-target avoids read-modify-write races. BAC detects presence and uses where available; never required. |
 | **Web Clipper coexistence** | Don't replace; recognize when user has it | **v1** | Detect installed; offer "use Web Clipper" as fallback for static page-clip when our flow is overkill |
 | **Obsidian CLI** | Shell out to `obsidian` for scripted ops | **v2** | Power-user automations, agent workflows |
 | **Plugin API (in-Obsidian plugin)** | Companion plugin running inside Obsidian | **v2+** | Native side-panel inside Obsidian itself, real-time vault events |
 
-**Hard dependency for v1**: user must install **Obsidian Local REST API
-plugin** (community, not core). Friction acknowledged; covered by S108
-(first-run setup guide). Without it, browser extension can fall back to
-URI-only mode (capture-only, no read/search), but we lose drift detection
-and recall over notes.
+**Substrate (always required)**: filesystem write access to the vault folder
+(via FileSystemAccess API in the extension, or a configured path in a
+companion daemon). Plus the Markdown + YAML frontmatter + `.canvas` + `.base`
+file formats and the `_BAC/` reserved namespace. These are interfaces and
+core — they exist regardless of which plugins the user has installed.
+
+**Opt-in accelerators (none required)**: Local REST API plugin (surgical
+PATCH; HTTPS bearer auth), Dataview (richer in-vault queries), Bases
+(richer dashboards). When installed, BAC uses them transparently. When
+absent, BAC falls back to plain file writes / Markdown-table dashboards —
+same data model, same scenarios, slightly different rendering.
 
 ### 23.3 The big scope simplifier — write Canvas + Bases instead of building UIs `[+claude]`
 
@@ -1144,7 +1205,7 @@ back in for non-Obsidian users; that's the cost of the simplification.)
 | S105 | **Open entry in Obsidian via URI** | Side panel "open" button uses `obsidian://open?vault=…&file=…` — no separate adapter call needed. |
 | S106 | **Trigger Obsidian search from side panel** | "Search vault for X" via `obsidian://search?vault=…&query=…` URI — falls back to REST API search if URI unavailable. |
 | S107 | **Atomic write protocol** | Writes use REST API `PATCH` (avoid race with user edits) or filesystem temp-file + rename; if a target file is currently open in Obsidian, refuse and queue. |
-| S108 | **First-run vault + plugin detection** | At first run: prompt for vault path; ping Local REST API plugin; if missing, walk user through install + token setup. Show a "limited mode" notice if user opts to skip. |
+| S108 | **First-run vault wiring (connection setup)** | At first run: user picks vault folder via FileSystemAccess `showDirectoryPicker()` (or pastes path for daemon mode); BAC persists handle; opportunistically detects Local REST API plugin and offers to use surgical PATCH if present, with "skip — use plain filesystem writes" always available. Plugin install is suggested, never required. See §27 for how connection setup is separate from sync direction. |
 | S109 | **Mindflow session as one `.canvas`** `[+claude]` | S63 + S64 implemented: each mindflow session writes one `.canvas` to `{vault}/Mindflow/{date}.canvas` with visited URLs as nodes and navigation transitions as edges. User can immediately reorganize the canvas in Obsidian. |
 | S110 | **Context pack as a permanent vault note** `[+claude]` | S74 writes context pack to `{vault}/Context/{bucket}-{date}.md`; user can edit, link, version-control. Coding agents read it from the vault directly. |
 | S111 | **Read user's vault as RAG source** `[+claude]` | When dispatching to a chat, optionally include "relevant prior notes from your vault" — local FTS search against vault for related notes, top N attached to context pack. Subsumes part of S27 déjà-vu when user has a structured vault. |
@@ -1153,7 +1214,7 @@ back in for non-Obsidian users; that's the cost of the simplification.)
 
 | # | Issue | Tentative response |
 |---|---|---|
-| O1 | Requires user to install **Obsidian Local REST API** community plugin (friction) | First-run S108 walks through; document why; offer URI-only "limited mode" for users who refuse |
+| O1 | ~~Requires user to install Local REST API plugin~~ → reframed per §23.0: plugin is **opt-in acceleration only**; baseline filesystem writes work without it | First-run S108 wires vault folder; plugin presence is detected, suggested, never required |
 | O2 | What if user doesn't use Obsidian at all? | v1: "Obsidian-required" positioning, narrows market but sharpens product. v1.5: ship `markdown-folder` adapter (fewer features — no Canvas/Bases UIs) for non-Obsidian users |
 | O3 | Mobile vault access from desktop extension | Out of scope. Cloud-synced vaults (iCloud/Dropbox/Obsidian Sync) work transparently when both devices touch the same files |
 | O4 | Conflict resolution when user edits a note we're patching | Use REST API atomic patches where possible; for filesystem writes, refuse to write to currently-open files (S107) |
@@ -1171,7 +1232,7 @@ Obsidian-anchoring, the spine sharpens:
 
 | Scenario | Why in v1 spine |
 |---|---|
-| **S108** First-run vault + REST API plugin detection | Onboarding gate — without this, nothing works |
+| **S108** First-run vault wiring (connection setup) | Onboarding gate for the vault-write substrate; plugin detection is opportunistic, not gating (§23.0) |
 | **S25** Highlight dispatch | Simplest entry point users meet first |
 | **S62** Dogfood loop (fork → observe → converge → patch) | The canonical demo; exercises every primitive |
 | **S104** Inbox-folder write protocol | Default writing posture — every capture lands somewhere safe |
@@ -1198,8 +1259,9 @@ Obsidian-specific implementations:
 - §9 storage model: vault is the **canonical** tier; IndexedDB demoted to cache.
 - §10 UI surfaces: side panel becomes much thinner — dispatcher + preflight +
   capture, not dashboards. Dashboards live in Obsidian.
-- §15 stack: add Obsidian Local REST API client; add JSON Canvas writer; add
-  Bases writer.
+- §15 stack: add **FileSystemAccess** writer (extension-side primary path);
+  add JSON Canvas writer; add Bases writer; add **optional** Local REST API
+  client (used opportunistically when plugin detected).
 - §17 open question 1 ("Notebook today?") — answered: **Obsidian, anchor in v1**.
 
 ### 23.12 Updated "what's next"
@@ -1557,7 +1619,7 @@ Three candidate spines have now been proposed:
 
 | # | Scenario | Source |
 |---|---|---|
-| S108 | First-run vault + REST API plugin detection | §23 onboarding gate |
+| S108 | First-run vault wiring (FileSystemAccess; opportunistic plugin detect) | §23.0 + §23 onboarding gate |
 | S25 | Highlight → multi-target dispatch | All three converge |
 | S27 | Déjà-vu on highlight, **3-week recency by default** | §24 reframe of §4 |
 | S1 | "Where was I?" panel — chat threads + active note + active bucket across providers | §24 wow + §22 spine |
@@ -1759,3 +1821,968 @@ Defer:
 §24.16 spine + S138 + S139 + S150 (the four-scenario prompt-corpus core).
 S141 piggybacks on the embedding model already loaded for déjà-vu, so it
 arrives "for free" once recall is in.
+
+---
+
+## 26. Addendum (2026-04-25): PoC plan after PoC-1/2 — `[+gpt-poc]`
+
+> **User decision 2026-04-25** (superseded 2026-04-26 — see banner below):
+> §24 anchors stand for v1 (Local REST API plugin is the primary integration
+> tier; v1 requires user installs it; "track + auto-suggest" stance from §24
+> also stands). §26's architectural deltas (filesystem-write-first adapter,
+> "track + organize, suggest later", Obsidian-absent degraded mode) are
+> **PoC-scope only** — useful framing for deciding the next PoC, not a v1
+> product anchor. When PRD is drafted, work from §24 anchors, not from §26
+> deltas.
+>
+> **Update 2026-04-26 (user correction)**: the "Local REST API plugin is the
+> primary integration tier; v1 requires user installs it" half of the prior
+> decision is **retracted**. New principle in §23.0: Obsidian is first-class
+> citizen, but BAC operates on **interfaces and core only** — filesystem,
+> Markdown, frontmatter, `.canvas`, `.base`, `_BAC/`. Plugins are opt-in
+> acceleration, never required. As a consequence, §26.7's "filesystem-write-
+> first adapter" delta is **promoted to a v1 anchor**, no longer PoC-only.
+> The other §26 deltas ("track + organize, suggest later"; "Obsidian-absent
+> degraded mode") remain PoC-scope framing — those are product-positioning
+> bets, not interface principles, and stay open for PRD.
+
+The user has now run two PoCs (`poc/dogfood-loop` and `poc/provider-capture`)
+plus added three import documents in `imports/` (the deep-research competitive
+report, the compass-artifact decision-ready MVP synthesis, and the BAC design
+spec). A subsequent discussion with ChatGPT proposed **two alternative PoC
+strategies** for what to build next. This section folds that discussion in
+with the same exhaustive-first discipline.
+
+Audit-trail marker: **`[+gpt-poc]`** = items originating in the ChatGPT
+PoC-planning discussion attached on 2026-04-25.
+
+### 26.1 Where we actually are (verified against `pocs/` READMEs, 2026-04-25)
+
+| PoC | Proven | Explicitly NOT proven |
+|---|---|---|
+| **`poc/dogfood-loop`** | Local-first loop: note → fork to mock targets → prompt injection into fixture pages → completion observation → IndexedDB artifacts → converge view (`Use A` / `Use B` / `Append both`) → deterministic markdown patch → persisted note. Plus: Google/DuckDuckGo navigation-only fork, active-tab adoption, fixture ChatGPT/Claude/Gemini thread registry, **Obsidian-shaped vault projection** (`_BAC/events/*.jsonl`, `_BAC/workstreams/current.md`, `_BAC/where-was-i.base`), portable Context Pack generation, **read-only in-process MCP-core JSON-RPC smoke** (`bac.recent_threads`, `bac.workstream`, `bac.context_pack`), lexical déjà-vu recall spike, dispatch preflight, Vitest + Playwright extension e2e. | Real provider DOM stability; provider login flows / anti-automation; search result extraction; **real Obsidian Local REST API integration**; **real MCP server transport / process lifetime / native helper packaging**; vector recall (PGlite / pgvector / transformers.js); cloud sync; production security review. |
+| **`poc/provider-capture`** | Provider detection (ChatGPT, Claude, Gemini, fixtures); visible-content extraction with provider-aware selectors + conservative fallback; `chrome.storage.local` persistence; side panel preview with selector-canary status, warnings, per-turn source labels; fixture-driven Vitest unit tests + Playwright extension e2e. **Live**: ChatGPT shared/canvas capture; **Gemini signed-in conversation capture (15 turns / 23,570 chars after extractor patch — up from 7 turns / 664 chars on first pass)**. | Long-term provider DOM stability; **real ChatGPT loaded conversation-thread assistant-turn capture (only shared/canvas live so far)**; **Claude logged-in live capture (deferred pending login)**; prompt injection / response automation; cloud sync; end-to-end local encryption; production security review. |
+
+The shape of the next PoC therefore should not re-prove side panel, capture,
+local graph, Context Pack, or fake MCP. Those are seeded.
+
+The biggest verified gaps are:
+
+1. **Real Obsidian write path** (filesystem and/or Local REST API).
+2. **Real MCP server transport** (something more than in-process JSON-RPC).
+3. **Extension ↔ local daemon bridge** (process boundary that survives MV3 service-worker death).
+4. **Native/helper packaging** (installer, lifetime, security boundary).
+5. **Real Claude live capture** (and a fully proven ChatGPT *conversation-thread* live pass).
+6. **User-driven organization model** (project/topic/tag/link assignment, not auto-organize).
+7. **Obsidian-native rendering surfaces actually in use** (Graph/Canvas/Bases as the dashboard tier).
+
+### 26.2 PoC philosophy refinement `[+gpt-poc]`
+
+The discussion sharpened what a PoC should mean for this product:
+
+> A PoC should not mean "build every layer." It should mean: where there are
+> 2–4 plausible architectures, build the **thinnest experiment that tells us
+> which branch to commit to**. Plan PoCs to validate the most valuable / risky
+> areas, and avoid overlap with prior PoCs.
+
+This is a useful constraint when picking PoC #3 — "where do 2–4 plausible
+architectures still exist?" is a sharper question than "what's missing?"
+
+### 26.3 Sharpened product thesis: Obsidian-native, not Obsidian-dependent `[+gpt-poc]`
+
+A directional pivot from §23's "Obsidian is canonical":
+
+> **BAC should be Obsidian-native when Obsidian is available, but not
+> Obsidian-dependent for survival.**
+
+That means actively use Obsidian's top-level concepts — **Links, Graph,
+Canvas, Bases, Properties, Tags, folders, backlinks** — rather than treating
+the vault as a Markdown export folder. Obsidian's own product positioning
+emphasizes local/private notes, open file formats, Links, Graph, Canvas,
+plugins, and "your knowledge should last," which maps cleanly onto BAC's
+local-first browser-memory ledger framing.
+
+The hierarchy this implies:
+
+```text
+Browser captures what happened.
+User organizes what matters.
+Obsidian renders the knowledge system.
+BAC turns that system into reusable AI context.
+MCP exposes it to coding agents.
+```
+
+(Explicit anti-pattern: "BAC auto-organizes everything. Obsidian is just an
+export. MCP is generic browser automation." That framing is rejected.)
+
+### 26.3.1 What BAC should own vs. what Obsidian should own when present
+
+| Layer | BAC should own | Obsidian should own when available |
+|---|---|---|
+| Browser observation | Tracked AI chats, source URLs, capture events, thread state | — |
+| User organization | Project/topic assignment, move in/out, promote to note, tags, links | Reflect and enrich through files, folders, links, tags |
+| Durable artifacts | Stable IDs, source provenance, context-pack boundaries | Markdown files, properties, backlinks, graph, bases, canvas |
+| Visualization | Minimal side panel, recent/ungrouped, actions | Graph View, Canvas, Bases dashboards |
+| Context reuse | Context-pack generator, MCP tools, retrieval policies | Obsidian note graph as the human-editable source |
+| Integrations | Adapter contracts | Obsidian as first and richest adapter |
+
+Obsidian-without-Obsidian fallback: **BAC must still function in a degraded
+"local-only ledger" mode** for users who have not installed Obsidian.
+Frontmatter-mirror writes become an export step rather than a continuous
+projection; Bases dashboards become Markdown tables.
+
+### 26.4 Two PoC paths on the table `[+gpt-poc]`
+
+Two distinct proposals from the discussion. Both are captured exhaustively;
+the user will decide.
+
+| | Path A — three balanced PoCs | Path B — single `poc/local-bridge` |
+|---|---|---|
+| **Aim** | Validate three architectural branches in turn (organization, surfaces, MCP/context) | Close the largest single gap (extension → daemon → real Obsidian → real MCP) |
+| **PoCs proposed** | 3 | 1 |
+| **Risk** | Sequential; longer to first end-to-end demo; some overlap with PoC-1/2 surfaces | Concentrated; one big PoC to land; less direct exercise of user-organization model |
+| **Best for** | Testing UX/PKM hypotheses (does Obsidian-native organization actually feel right?) | Testing technical-substrate hypotheses (does the daemon/MCP/Obsidian bridge actually hold up?) |
+| **Where they overlap** | Path A's PoC 3 ≈ Path B's MCP + context-pack slice. Path B's daemon assumes some user organization exists; Path A's PoCs 1+2 build that organization. |
+
+These are not mutually exclusive — a hybrid would do **Path B as a substrate
+PoC** then **Path A's PoC 1 layered on top of the daemon**. That's noted but
+not pre-decided.
+
+### 26.5 Path A in detail — three balanced PoCs `[+gpt-poc]`
+
+#### 26.5.1 PoC 1 — Obsidian-native user organization
+
+**Core question.** Can BAC turn passively tracked browser AI work into an
+Obsidian-native project/topic system that users reorganize manually?
+
+**Validates the principle:**
+
+```text
+Track by default.
+User organizes actively.
+Suggestions come later.
+```
+
+(This is a meaningful sharpening: prior anchors leaned toward auto-extraction
+and auto-suggestion. This PoC tests the human-in-the-loop-first variant.)
+
+**Competing approaches (the architectural fork this PoC resolves):**
+
+| Approach | What it means | Risk |
+|---|---|---|
+| BAC-only organizer | Keep all organization in BAC UI; Obsidian is export only | Misses Obsidian's native power |
+| Folder-first | Project/topic hierarchy maps directly to folders | Simple, can become rigid |
+| Link/tag-first | Flat notes; organization comes from tags + wikilinks | Flexible, can feel messy |
+| **Hybrid Obsidian-native** | Folders for projects/topics, properties for metadata, tags for virtual grouping, links for graph | Best balance |
+
+**Thin build.** Reuse captures/threads from PoC-1/2. Add minimal user actions:
+
+```text
+Add chat to project
+Move chat to topic
+Create subtopic
+Remove from topic
+Add tags
+Create link to another item
+Promote capture to note / decision / source
+```
+
+**Example user vault structure:**
+
+```text
+SwitchBoard/
+  Planning/
+    MVP Scope.md
+    Market Validation.md
+  High Level Design/
+    Browser-owned MCP.md
+    Obsidian Projection.md
+  Security/
+    Redaction Boundary.md
+    MCP Permissions.md
+  Payment/
+    Pricing Questions.md
+_BAC/
+  dashboards/
+    where-was-i.base
+    switchboard.base
+  context-packs/
+    switchboard-hld.md
+```
+
+**Note shape (Obsidian-native frontmatter):**
+
+```md
+---
+bac_id: thread_01HT...
+bac_type: thread
+project: SwitchBoard
+topic:
+  - High Level Design
+  - Browser-owned MCP
+provider: claude
+source_url: ...
+status: tracked
+tags:
+  - switchboard
+  - mcp
+  - obsidian
+  - architecture
+related:
+  - "[[Obsidian Projection]]"
+  - "[[Security/Redaction Boundary]]"
+---
+
+# Claude — Browser-owned MCP discussion
+
+## Source
+Original thread: ...
+
+## Notes
+...
+
+## Related
+- [[Obsidian Projection]]
+- [[Security/Redaction Boundary]]
+```
+
+**Critical invariant:** BAC tracks by `bac_id` in frontmatter, **not by file
+path**. Users can reorganize folders freely without breaking BAC state.
+
+**Pass criterion.** A tracked chat moves from "recent/unorganized" → into a
+user-owned project/topic/tag/link structure → without losing source identity
+or context-pack eligibility.
+
+**Failure pivots:**
+
+| Failure | Pivot |
+|---|---|
+| Folder hierarchy feels too rigid | Keep folders shallow (project/topic only); use tags/links for nuance |
+| Tags feel too loose | Require one primary project/topic for "organized" items |
+| Moving files breaks BAC state | Track by `bac_id` (already the design — re-confirm) |
+| Users want Obsidian-first editing | Read frontmatter/links back into BAC |
+| Users dislike file clutter | Store raw captures under `_BAC/items`; expose organized views via Bases |
+
+#### 26.5.2 PoC 2 — Links / Graph / Canvas / Bases as first-class surfaces
+
+**Core question.** Can BAC offload major MVP surfaces to Obsidian's native
+concepts instead of building custom UI?
+
+This is the PoC that **directly tests §23's bet** that Canvas + Bases can
+serve as the dashboard tier instead of building dashboards in the side panel.
+
+**Competing approaches:**
+
+| Approach | What it means | Risk |
+|---|---|---|
+| BAC custom graph | Build our own graph/mind-map UI | Expensive, duplicates Obsidian |
+| Links-only | Generate internal links, rely on Graph View | Lightweight, less curated |
+| Canvas-first | Generate `.canvas` maps for projects/topics | Visual, may be too manual |
+| Bases-first | Generate dashboards for workstreams, captures, decisions | Great for lists/status, weaker for relationships |
+| **Hybrid Obsidian surface** | Links→Graph; Canvas→visual map; Bases→dashboard | Best MVP leverage |
+
+**Thin build.** From one project (e.g. `SwitchBoard`) generate:
+
+```text
+1. Notes with internal links     → Graph View
+2. Project Canvas                → mind map
+3. Bases dashboards              → Where Was I, threads, decisions, OQs
+4. Backlinks                     → reverse navigation, free
+```
+
+**Required behaviors:**
+
+- **Links** — explicit `## Related` wikilink sections so Graph View and
+  Backlinks "just work".
+- **Graph** — do NOT build a custom BAC graph yet; inspect whether Obsidian's
+  Graph View gives enough value with the link density BAC writes.
+- **Canvas** — generate one project map per active project, with groups for
+  Planning / HLD / Security / etc., each containing chat, promoted notes,
+  decisions, OQs.
+- **Bases** — generate `where-was-i.base`, `switchboard-threads.base`,
+  `switchboard-decisions.base`, `switchboard-open-questions.base`.
+
+**Pass criterion.** BAC-generated Obsidian artifacts feel native enough that
+users continue organizing inside Obsidian (rather than retreating to side
+panel for everything).
+
+**Failure pivots:**
+
+| Failure | Pivot |
+|---|---|
+| Graph View too noisy | Generate fewer links; distinguish `explicit`, `suggested`, `source`, `related` link kinds |
+| Canvas too hard to maintain | Generate Canvas only for promoted topics, not every capture |
+| Bases syntax brittle | Generate Markdown dashboards first; `.base` as optional enhancement (matches §24.3 "treat Bases as bonus delight, not core dependency") |
+| Users edit Obsidian, BAC misses changes | Add read-back scan for frontmatter, links, file moves |
+| Obsidian-native surfaces insufficient | Build minimal BAC "map" view later — only after validating need |
+
+#### 26.5.3 PoC 3 — Organization-aware Context Pack and browser-owned MCP
+
+**Core question.** Can the user's Obsidian-native organization drive useful
+AI context?
+
+This is the bridge from KM to AI utility. The discussion calls out:
+
+```text
+organized browser AI work
+  → Obsidian-native graph
+  → reusable context pack
+  → coding agent
+```
+
+Critically, this is **not** "generic browser MCP" — the differentiator is
+that the user's organization (project/topic/tag/link/Canvas group) drives
+context selection.
+
+**Competing approaches:**
+
+| Approach | How context is selected | Risk |
+|---|---|---|
+| Folder/path-based | Use project/topic folder path | Simple, brittle after reorganization |
+| Tag-based | Use tags like `#mcp`, `#security` | Flexible, noisy |
+| Link-neighborhood-based | Use Obsidian links/backlinks around a note | Powerful, depends on link quality |
+| Canvas-based | Use nodes in selected Canvas group | Great for visual planning, not always used |
+| **Hybrid organization-aware** | Project/topic + tags + links + optional Canvas group | Best fit |
+
+**Thin build.** One MCP tool + one side-panel action:
+
+```ts
+bac.context_pack({
+  project: "SwitchBoard",
+  topic: ["High Level Design", "Browser-owned MCP"],
+  includeTags: ["obsidian", "architecture"],
+  includeLinkedDepth: 1,
+  includeCanvas: "_BAC/canvases/switchboard-map.canvas"
+})
+```
+
+**Returned pack (Markdown):**
+
+```md
+# Context Pack: SwitchBoard / High Level Design / Browser-owned MCP
+
+## Goal
+...
+
+## Active decisions
+- [[Security/Redaction Boundary]]
+- [[High Level Design/Obsidian Projection]]
+
+## Relevant threads
+...
+
+## Sources
+...
+
+## Open questions
+...
+
+## Related graph neighborhood
+...
+```
+
+**Pass criterion.** A user-created project/topic/link/tag/Canvas structure
+can drive a useful MCP context for a coding agent — context comes from
+**user organization**, not random full-text search.
+
+**Failure pivots:**
+
+| Failure | Pivot |
+|---|---|
+| Pack too noisy | Include only promoted artifacts (decisions, notes, sources, OQs) |
+| Folder/topic context misses items | Add link-neighborhood expansion |
+| Tags create noise | Use tags as filters only, not expansion |
+| Link graph sparse | Add "suggested links" but require user confirmation |
+| Canvas context inconsistent | Treat Canvas as optional curated context, not primary index |
+| MCP setup too high friction | Ship context-pack export first; MCP as advanced/dev-user mode |
+
+#### 26.5.4 How the three PoCs fit together
+
+```text
+PoC 1: User organizes browser AI work
+        ↓
+PoC 2: Obsidian renders it as links / graph / canvas / bases
+        ↓
+PoC 3: BAC turns that organization into context packs / MCP
+```
+
+#### 26.5.5 Path A explicit deferrals
+
+| Deferred | Reason |
+|---|---|
+| Auto-organization | The whole point is to test manual-first |
+| Auto-send into AI providers | Provider automation risk; not needed for this validation |
+| Generic browser-control MCP | Different product; not BAC's wedge |
+| Full custom graph UI inside BAC | Tested by PoC 2's Graph View dependency |
+| Custom Obsidian plugin | Local REST API + filesystem cover MVP |
+| Production security hardening | Bigger scope than PoC validation |
+| Full vector database | Lexical déjà-vu from PoC-1 is enough for this validation |
+| Team collaboration | Single-user local trust boundary first |
+| Payment / billing | Not load-bearing for any of the architectural questions |
+
+Keep minimal guardrails: local-only, read-only MCP tools, bounded context
+output, basic redaction smoke test, stable IDs in frontmatter.
+
+### 26.6 Path B in detail — single `poc/local-bridge` PoC `[+gpt-poc]`
+
+**One-line goal.** Build the missing local bridge that turns existing
+browser-side captures/workstream state into:
+
+```text
+real Obsidian writes + real MCP server transport + local trust boundary
+```
+
+**Why this is the right "next hardest part".** The capability matrix already
+seeded in PoC-1/2 is:
+
+| Capability | Status |
+|---|---|
+| MV3 side panel | Proven (PoC-1) |
+| Background coordinator | Proven (PoC-1) |
+| Provider visible capture | Mostly proven (PoC-2; ChatGPT thread + Claude live still pending) |
+| Local graph/event model | Proven (PoC-1) |
+| Context Pack generation | Proven (PoC-1) |
+| Obsidian-shaped projection | Proven as files only (PoC-1; not real Obsidian writes) |
+| In-process MCP JSON-RPC core | Proven as smoke (PoC-1; not real transport) |
+| **Real Obsidian write path** | **Not proven** |
+| **Real MCP server transport** | **Not proven** |
+| **Extension ↔ local daemon bridge** | **Not proven** |
+| **Native/helper packaging** | **Not proven** |
+| **Security boundary** | **Not proven** |
+
+#### 26.6.1 Architecture `[+gpt-poc]`
+
+> Do **not** put the real MCP server inside the Chrome extension. Keep the
+> extension as the browser sensor/UI, and add a local companion process.
+
+(This aligns with §24's pivot away from native-messaging toward a localhost
+WebSocket / MCP-server-as-process pattern. It also aligns with `mcp-chrome` /
+`real-browser-mcp` precedents.)
+
+```text
+┌───────────────────────────────────────┐    ┌──────────────────────────────────────────┐
+│  Chrome MV3 extension                 │    │  poc/local-bridge daemon (Node 22+)      │
+│                                       │    │                                          │
+│  provider-capture (visible capture)   │    │  localhost HTTP API (127.0.0.1 only)     │
+│  dogfood-loop (workstream graph)      │ →  │  SQLite event store (FTS optional)       │
+│  side panel                           │    │  Obsidian adapter (REST + filesystem)    │
+│  background coordinator               │    │  real MCP server (stdio first)           │
+└───────────────────────────────────────┘    └──────────────────────────────────────────┘
+                                                       │                  │
+                                                       ↓                  ↓
+                                         ┌─────────────────────┐  ┌──────────────────────┐
+                                         │  Obsidian vault     │  │  MCP clients         │
+                                         │  _BAC/workstreams/  │  │  Claude Code         │
+                                         │  _BAC/where-was-i.  │  │  Cursor              │
+                                         │  base               │  │  Codex CLI           │
+                                         │  _BAC/events/*.     │  │                      │
+                                         │  jsonl              │  │                      │
+                                         └─────────────────────┘  └──────────────────────┘
+```
+
+**Stack:** Node.js 22+, TypeScript, Hono or Fastify, `better-sqlite3`,
+`@modelcontextprotocol/sdk`, Zod, Vitest, Playwright e2e harness reused from
+existing PoCs.
+
+#### 26.6.2 Scope (in/out) `[+gpt-poc]`
+
+**In scope:**
+
+- `poc/local-bridge/daemon/src/{server,mcpServer,obsidianAdapter,eventStore,schema,security}.ts`
+- Extension bridge client (`POST /v1/captures`, `POST /v1/events`, `GET
+  /v1/health`, `GET /v1/context-pack/current`)
+- Obsidian adapter with **two write modes behind one interface**:
+  1. Direct filesystem write to configured vault path (deterministic e2e)
+  2. Obsidian Local REST API (more realistic)
+- Real MCP server promoting the in-process JSON-RPC core to a real
+  `@modelcontextprotocol/sdk` stdio server
+- Initial tools: `bac.recent_threads`, `bac.workstream`, `bac.context_pack`,
+  `bac.search`, `bac.get_capture`
+- Security: bind to `127.0.0.1` only; random local API key generated on
+  first daemon startup; reject requests without token; reject non-local
+  origins; read-only MCP by default; redaction pass before Obsidian writes;
+  audit every bridge write as an event
+
+**Out of scope:**
+
+| Not in scope | Reason |
+|---|---|
+| Real provider auto-send | Provider automation risk |
+| Full refactor of PoC-1/2 | Too much churn |
+| Vector embeddings | Lexical déjà-vu enough for this validation |
+| Cloud sync | Violates local-first PoC clarity |
+| Native installer | Later; first prove daemon contract |
+| Production Obsidian plugin | Local REST + filesystem adapter first |
+| Team / multi-user mode | Single-user local trust boundary first |
+
+#### 26.6.3 Acceptance demo `[+gpt-poc]`
+
+```text
+1. Start local-bridge daemon
+2. Load provider-capture extension
+3. Open a Gemini / fixture provider tab
+4. Click "Capture active tab"
+5. Capture stored locally in extension AND sent to daemon
+6. Daemon writes:
+   - _BAC/events/YYYY-MM-DD.jsonl
+   - _BAC/workstreams/current.md
+   - _BAC/where-was-i.base
+7. MCP client calls bac.context_pack
+8. Returns Markdown containing captured provider content + source metadata
+```
+
+#### 26.6.4 Test plan `[+gpt-poc]`
+
+**Unit:** schema (provider capture → normalized WorkstreamEvent), eventStore
+(append/list/search), obsidianAdapter (writes to temp vault), contextPack
+(includes captures from daemon store), mcpServer (`tools/list` +
+`tools/call`), security (rejects missing/invalid token).
+
+**Extension e2e** (reuse Playwright harness): fixture provider tab → capture
+active tab → daemon receives capture → temp Obsidian vault has Markdown
+projection → MCP smoke returns context pack.
+
+**Manual live validation:** Gemini (capture real signed-in conversation
+and write to Obsidian); ChatGPT (one normal loaded conversation-thread
+pass — also closes the gap from PoC-2); Claude (one logged-in capture pass
+— also closes the gap from PoC-2).
+
+### 26.7 Architectural deltas vs. prior anchors `[+gpt-poc]`
+
+Folding-in surfaces several refinements (not yet user-confirmed):
+
+| Prior anchor (where) | Refinement from this discussion | Tension? |
+|---|---|---|
+| §24 — "Local REST API plugin is the primary integration tier; v1 requires user installs it" | "Direct filesystem write to configured vault path" *first* for deterministic e2e tests; Local REST API *behind same interface*; first-run wizard with filesystem-only fallback if user declines plugin | **Resolved 2026-04-26**: §24 stance retracted in favor of §23.0 (filesystem + interfaces & core; plugin opt-in). This delta is now the v1 anchor. |
+| §24 — "MCP-server-as-process REPLACES native messaging" | Same direction; sharpens with concrete daemon shape (Node + Hono/Fastify + SQLite + `@modelcontextprotocol/sdk` stdio) | No — same direction, sharper recipe |
+| §23 — "Obsidian is canonical" | "Obsidian-native when available, but not Obsidian-dependent for survival" | **Mild** — softens to allow degraded local-only mode for non-Obsidian users |
+| §24 product framing — auto-extract, auto-suggest, auto-organize lean | "Track by default. User organizes actively. Suggestions come later." | **Yes** — meaningful sharpening; trades some wow-moments for trust/control. Consider as ICP-driven choice. |
+| §24 unified spine includes calibrated-freshness recall (W3) | Path A defers automation/suggestion entirely until manual organization is validated | **Yes** — déjà-vu surfaces *are* a form of suggestion. Reconcile by treating recall-at-highlight as "user-initiated suggestion" (not auto). |
+| §22.3 Workstream Graph entities | Sharpens with concrete Obsidian-native frontmatter shape (`bac_id`, `bac_type`, `project`, `topic`, `tags`, `related`) and the **track-by-`bac_id`-not-path invariant** | No — concretizes prior abstraction |
+| §24 default-on safety | "Read-only MCP tools by default; write tools only behind explicit user opt-in"; redaction before Obsidian writes (not just before Inject) | No — extends prior safety primitives consistently |
+
+### 26.8 New scenarios this PoC discussion surfaces
+
+| # | Scenario | Notes |
+|---|---|---|
+| **S152** | **Track-then-organize loop `[+gpt-poc]`** | Capture/track a chat with no project assignment; user later opens BAC, drags it into `SwitchBoard / High Level Design / Browser-owned MCP`. BAC writes a frontmatter-mirror file, no folder structure changes from BAC's side until the user does it. Suggestions deliberately deferred. |
+| **S153** | **Promote capture to typed artifact `[+gpt-poc]`** | One-click "Promote → Note / Decision / Source / Open Question" from the side panel. Each typed artifact gets the appropriate `bac_type` frontmatter and lands in the right vault location. |
+| **S154** | **`bac_id`-stable identity across reorganization `[+gpt-poc]`** | User renames `High Level Design/Browser-owned MCP.md` to `Architecture/MCP server architecture.md`; BAC continues to track it correctly because identity is `bac_id`-keyed in frontmatter, not path-keyed. Test: rename + move + edit + restart, BAC still recognizes the file. |
+| **S155** | **Obsidian-native Properties + wikilinks frontmatter mirror `[+gpt-poc]`** | Sharpens the §23 frontmatter spec with explicit Properties (date, boolean, list) + wikilink `related` arrays. Internal links use wikilink syntax so Backlinks plugin works without extra config. |
+| **S156** | **Generated `.canvas` per active project `[+gpt-poc]`** | Project map: SwitchBoard root → Planning/HLD/Security/Payment groups; each group contains key chats, promoted notes, decisions, OQs. Regenerated from event log on workstream-graph change; not user-round-tripped. |
+| **S157** | **Generated `.base` dashboards: where-was-i + threads + decisions + OQs `[+gpt-poc]`** | Concrete Bases targets per project. Markdown-table fallback if user is on older Obsidian without Bases. |
+| **S158** | **Local daemon localhost API + token gate `[+gpt-poc]`** | First-startup random API key; bound to `127.0.0.1`; extension stores token; non-local origins rejected. Side panel shows "bridge connected / disconnected" badge. |
+| **S159** | **Daemon read-back of vault changes `[+gpt-poc]`** | When user edits frontmatter / wikilinks / moves files in Obsidian, daemon scans and surfaces deltas (e.g. user reassigned a thread to a different topic by editing frontmatter; BAC's state mirrors that). Eventually drift detection (W2) lives here too. |
+| **S160** | **Organization-aware context pack `[+gpt-poc]`** | `bac.context_pack({project, topic, includeTags, includeLinkedDepth, includeCanvas})` — context selected from user organization, not full-text search. Returned as markdown with goal / active decisions / threads / sources / OQs / related neighborhood sections. |
+| **S161** | **Obsidian-absent degraded mode `[+gpt-poc]`** | If user has not installed Obsidian, BAC still functions: side panel shows organized state from local daemon DB; export-to-vault becomes a manual action; Bases dashboards become Markdown tables in a configured local folder. |
+| **S162** | **Frontmatter-driven re-import `[+gpt-poc]`** | Daemon can rebuild its SQLite event store from the vault (`_BAC/events/*.jsonl` + frontmatter mirror) — vault is the canonical source of truth, daemon DB is a cache. Lost daemon DB ≠ lost data. |
+
+### 26.9 Edge cases this surfaces
+
+| # | Case | Mitigation |
+|---|---|---|
+| **E33** | User reorganizes folders/files in Obsidian while daemon is offline | On daemon next-start, reconcile by `bac_id` scan; missing files mark thread `archived` rather than deleting state |
+| **E34** | User installs Obsidian *after* using BAC for weeks | Migration path: daemon emits full vault projection from existing event store; user points at vault path; first sync writes everything |
+| **E35** | Two Obsidian vaults (work + personal) | v1 single-vault binding; multi-vault is v1.5+ |
+| **E36** | Obsidian Local REST API plugin not installed | **Default state, not an error.** Filesystem-write substrate is primary per §23.0; plugin presence is opportunistic acceleration only. First-run wizard simply notes "you'll get surgical PATCH if you install Local REST API" — no warning, no degraded mode. |
+| **E37** | User edits a `.canvas` or `.base` file BAC generated | Treat user edits as a fork: BAC stops regenerating that file; offers "regenerate (overwrites your edits)" or "keep manual" |
+| **E38** | Daemon crashes mid-write | All writes idempotent + content-addressed; WAL-mode SQLite; retry on next event; vault writes use temp-file-then-rename |
+| **E39** | User deletes a frontmatter `bac_id` | Treat as "user wants to detach this file from BAC"; daemon scans and stops mirroring; logged as a decision event |
+| **E40** | Two daemons accidentally running | Lockfile in vault `_BAC/.daemon.lock`; second startup refuses with clear error |
+
+### 26.10 Open questions for user (don't decide unilaterally)
+
+These are the live decisions this addendum surfaces but doesn't resolve.
+
+1. **Path A vs Path B vs hybrid?** Three balanced PoCs (organization-first
+   thesis test) vs one local-bridge PoC (technical-substrate test) vs
+   "Path B as substrate, then Path A's PoC 1 on top".
+
+2. ~~Filesystem-write-first or Local-REST-API-first?~~ **Resolved 2026-04-26**:
+   filesystem-write-first per §23.0. Local REST API is opt-in acceleration
+   only. See §23.0 for the load-bearing principle and the §26 banner update
+   for the supersession of §24's "v1 requires plugin" anchor.
+
+3. **"Track + organize, suggest later" vs "automate-and-suggest from day 1"?**
+   Path A's bet is that human-in-the-loop organization is the trust-building
+   wedge. §24's calibrated-freshness recall (W3) is a form of suggestion —
+   reconcilable as "user-initiated suggestion" (recall fires on highlight,
+   not in background), but worth flagging.
+
+4. **Should next PoC also close the live-capture gaps from PoC-2** (real
+   ChatGPT conversation-thread pass; real Claude logged-in pass)? Both Path
+   A's PoC 1 and Path B's local-bridge naturally surface this since they
+   both consume captures.
+
+5. **Does the `SwitchBoard` example name reflect a real product-naming
+   intent**, or is it just a placeholder used in the discussion? (It also
+   appears as the `zyingfei/switchboard` repo reference in the
+   discussion's first paragraph.)
+
+6. **Hybrid recommendation if user picks one.** If the goal is fastest path
+   to a credible "demo-able product slice", a hybrid that does Path B's
+   daemon + Path A's PoC 1 (organization on top) lands the most product
+   surface in one cycle. If the goal is sharpest architectural decisions,
+   Path A's three sequential PoCs maximize learning per PoC.
+
+### 26.11 Bottom-line synthesis (mine, not the discussion's)
+
+The discussion is internally coherent and aligned with most prior anchors.
+The two genuinely new contributions are:
+
+1. **The "Obsidian-native, not Obsidian-dependent" reframe** — sharper than
+   §23's "canonical" framing because it carries an explicit fallback model.
+2. **The "track + organize, suggest later" stance** — a real ICP/UX bet
+   that trades wow-moments for trust. Worth treating as a PRD-level
+   decision.
+
+The single largest tension with prior anchors is the **filesystem-write-first
+vs. Local-REST-API-first** choice (§24 vs §26.4). That's worth resolving
+before either PoC starts, because it affects the daemon adapter's interface
+shape, the first-run UX, and the install-friction story for the launch.
+
+Floor's yours: pick a PoC path (or hybrid), resolve the §24 anchor question,
+or feed more inputs.
+
+---
+
+## 27. Addendum (2026-04-26): Connection setup vs sync direction `[user]`
+
+User-introduced split. Today the brainstorm collapses three different concepts
+under "vault integration" — connection wiring, sync into BAC, and sync out of
+BAC. They are different in lifecycle, in failure mode, in UX surface, and in
+the user's mental model. Keep them separate.
+
+### 27.1 The three concepts, separated
+
+| Concept | What | When it runs | Failure mode | UX surface |
+|---|---|---|---|---|
+| **Connection setup** | Wire BAC to a vault folder. FileSystemAccess `showDirectoryPicker()` (extension) or vault path config (daemon). One-time per vault per device. Persist the handle / path. Detect Local REST API plugin presence opportunistically (acceleration, not gating). | Once at first run; again if user revokes the handle, switches vaults, or moves the folder. | "No connection" — BAC operates in local-only ledger mode (captures stay in `chrome.storage.local` / daemon DB until a vault is wired). | First-run wizard; settings page; "vault" badge in side panel. |
+| **Sync-in** (vault → BAC) | Read the vault: scan for files with `bac_id` frontmatter, pick up user-authored notes the user wants tracked, baseline existing notes when first connecting, keep BAC's view of vault state in sync after the user edits / moves / renames in Obsidian. | At connect, on user request ("re-scan vault"), and on a periodic / FS-watched cadence after that. Cheap to re-run. | "Out of date" — BAC's view lags the vault; user re-runs scan. | Side-panel "scanned N files, M tracked"; daemon log; explicit "Sync from vault" button. |
+| **Sync-out** (BAC → vault) | Write to the vault: tracked captures land as Source notes; promoted artifacts (decisions, OQs) land as typed notes; generated `.canvas` and `.base` regenerate. **Also** covers the case where the user manually adds a note **outside** the tracked set and explicitly tells BAC "track this from now on" — that's a sync-out, not a sync-in, because BAC is the side that decides what gets attached. | On capture (per-event), on explicit promote, on regeneration of dashboards / canvases. | "Write blocked" — vault unwriteable (handle revoked, disk full, plugin acceleration failed → fall back to plain write). | Side-panel "wrote 3 files"; per-event success toast; "Open in Obsidian" link. |
+
+The reason this matters: today's brainstorm has S99 (frontmatter mirror), S104
+(inbox-folder writing), S107 (atomic write protocol), S108 (first-run vault),
+S159 (daemon read-back of vault changes), and parts of S111 (read user's
+vault as RAG source) all tangled into a single "Obsidian integration" narrative.
+With the split, they line up cleanly:
+
+- **Connection setup**: S108, parts of S107 (atomic-write protocol is a
+  property of the connected handle).
+- **Sync-in**: S159, S111, the vault-baseline part of S108.
+- **Sync-out**: S99, S104, the regeneration of S100 / S101 / S109 / S110, and
+  the "user manually adds a note out of track" case (new — see §27.3).
+
+### 27.2 New scenarios for the split
+
+| # | Scenario | Direction | Notes |
+|---|---|---|---|
+| **S163** | **Connect to vault** | Connection | First-run wizard or settings: pick vault folder via `showDirectoryPicker()`. BAC persists the handle. Detect Local REST API plugin opportunistically. Show "vault: connected · plugin: not installed (optional)". |
+| **S164** | **Disconnect / re-pick vault** | Connection | User can disconnect (BAC stops writing; in-flight captures stay local) or switch vaults (BAC asks: archive prior tracked set or migrate). |
+| **S165** | **Baseline existing notes (sync-in)** | Sync-in | At first connect, scan vault for files with `bac_id` frontmatter (re-attach to known items) and offer the user a list of un-attached notes they may want to track. User opts in per-folder or per-file. No silent global ingest. |
+| **S166** | **Keep-in-sync from vault (sync-in)** | Sync-in | After connection, scan periodically / on FS event for: new `bac_id` files (rare, but possible if user copies a note from another vault), edited frontmatter, file moves/renames, file deletes (treat as detach, not delete-in-BAC). Reconcile on next BAC view. |
+| **S167** | **User manually adds an out-of-track note (sync-out trigger)** | Sync-out | User has a Markdown note in the vault that BAC didn't create (e.g. a meeting transcript they wrote by hand). They open it, click "Track in BAC" (extension popup or Obsidian-side URI handler) → BAC writes `bac_id` + `bac_type` frontmatter to the file (sync-out), then it shows up under the appropriate project/topic in the side panel. |
+| **S168** | **Per-direction status badges in side panel** | Both | Side panel shows three independent indicators: connection (●/○), sync-in (last scan time, items added), sync-out (last write time, items written). Distinguishes "vault not wired" from "vault wired but write failing". |
+
+### 27.3 What's deferred
+
+User explicitly defers conflict / merge semantics. We acknowledge they exist
+but don't design them in this addendum:
+
+- **Conflicts** — BAC writes to a file at the same instant the user edits it
+  in Obsidian, or two devices write to the same file via a shared vault
+  (iCloud / Dropbox / Obsidian Sync).
+- **Merges** — sync-in surfaces a frontmatter change that conflicts with a
+  pending sync-out write (e.g. user changed `topic` in Obsidian while BAC was
+  re-promoting the same file with a different `topic`).
+- **Three-way reconciliation** — BAC state vs. vault state vs. last-known-
+  baseline.
+
+Tentative posture for v1 (not pinned): **last-write-wins per file, scoped to
+frontmatter keys BAC owns** (the `bac_*` namespace). User-owned keys are
+never overwritten. File-body merges are out of scope; if BAC needs to update
+a body region it uses heading-targeted PATCH (REST API path) or a
+delimited-region marker (`<!-- bac:region:notes -->`) for the filesystem
+path. Detailed conflict design lives in a future addendum or PRD.
+
+### 27.4 Why this matters for the §23.0 principle
+
+§23.0 says the substrate is filesystem + interfaces. §27 says the substrate
+exposes three operations, not one. That gives the §26.6 daemon and the
+extension a cleaner shared interface:
+
+```ts
+interface VaultBinding {
+  // 27.1 — connection
+  connect(handleOrPath: FileSystemDirectoryHandle | string): Promise<void>;
+  disconnect(): Promise<void>;
+  status(): { connected: boolean; pluginAccelerator: 'rest-api' | 'none'; };
+
+  // 27.1 — sync-in
+  scanForBacIds(): AsyncIterable<{ path: string; bacId: string; frontmatter: Record<string, unknown>; }>;
+  watchVault(): AsyncIterable<VaultChangeEvent>;     // FS event stream when supported
+
+  // 27.1 — sync-out
+  writeNote(path: string, body: string, frontmatter: Record<string, unknown>): Promise<void>;
+  patchFrontmatter(path: string, keys: Record<string, unknown>): Promise<void>;
+  attachToTrack(path: string, type: BacEntityType): Promise<{ bacId: string; }>;  // S167
+}
+```
+
+Same interface, two implementations: one backed by FileSystemAccess +
+plain-file writes (extension), one backed by Node `fs` + atomic temp-file-
+rename (daemon). When Local REST API is detected, `patchFrontmatter` upgrades
+to surgical PATCH; otherwise it does read-modify-write under a per-path lock.
+
+### 27.5 What this changes in earlier sections
+
+- §23 NotebookAdapter (§23.7): split `appendEntry` / `writeFrontmatter` into
+  the connect / sync-in / sync-out tiers above.
+- §23.5 inbox-first writing: still applies, but classified as a sync-out
+  policy, not a vault-integration concept.
+- §24 storage model: vault is canonical (§24 stands), but BAC's local store
+  is no longer "cache" — it's the **sync-in inbox** for items not yet
+  attached to the vault. The local store is the staging area; the vault is
+  the system of record once items are attached.
+- §26.6 daemon: the daemon's Obsidian-adapter contract collapses onto the
+  `VaultBinding` interface above. The "two write modes behind one interface"
+  in §26.6.2 is still right — just that the modes are filesystem (always)
+  with optional REST API acceleration, not "filesystem fallback when REST
+  API absent."
+
+### 27.6 Empirical update from `poc/vault-bridge` (2026-04-26): writer moves out of the browser
+
+A feasibility PoC at `poc/vault-bridge` tested the assumption that the
+extension can own the sync-out side of §27 directly via FileSystemAccess.
+Six U1–U6 unknowns; live Chrome + iCloud run on macOS 26.2 / Chrome
+147.0.7727.102 / Node 25.8.2. The data path itself is fine; the **writer
+substrate is not viable for production**.
+
+**Failures that pivot the architecture:**
+
+| # | Outcome | Evidence | Implication |
+|---|---|---|---|
+| **U6** | **Fail** | SW-owned `setInterval` stopped at sequence 30 (~30 s, MV3 idle window); `Refresh` woke a new SW with `Tick count 0` | MV3 service workers cannot host continuous timers. Live-tabs flush, periodic state sync, embedding-index rebuilds, batch sync — none survive in the SW. |
+| **U5** | **Fail-risk** | After a SW restart inside the same Chrome session, `queryPermission({ mode: "readwrite" })` returned `prompt`; manual write blocked with "Vault folder permission is prompt; re-grant from the side panel" | "Silent capture" is not achievable when permission state is tied to SW lifecycle. Every SW restart could mean a re-grant click. |
+| **U1** | Fail-risk (paired with U5) | Persisted handle was available across some SW restarts then lost write permission | The persisted-handle pattern is necessary but not sufficient. |
+
+U2/U3/U4 all hit Acceptable or Pass. The data path (extension → file →
+Node tail reader) works correctly. The failure isn't filesystem semantics
+— it's MV3 lifecycle and FileSystemAccess permission state, both
+properties of the browser the extension runs inside, neither changeable
+from extension code.
+
+**Architectural pivot — Path B promoted from alternative to anchor:**
+
+Add a **companion process** between the extension and the vault. The
+companion owns all writes and any sustained operations:
+
+```text
+                       ┌─ HTTP/WS or Native Messaging
+Extension (sensor) ────┤
+                       ▼
+              ┌──────────────────────┐
+              │ Companion (writer)   │  long-lived process
+              │   - holds vault path │  (no permission UX)
+              │   - owns all writes  │
+              │   - runs sustained   │  (survives SW deaths,
+              │     tasks (tick,     │   browser closes,
+              │     index rebuild)   │   reboots if started)
+              └──────────┬───────────┘
+                         │ Node fs
+                         ▼
+                  Vault folder (canon)
+                         │ Node fs
+                         ▼
+                bac-mcp (reader, unchanged)
+```
+
+This maps to **§26.6 Path B** (the `local-bridge` daemon sketch),
+previously framed as one of two PoC paths the user might pick at PRD
+time. The vault-bridge result empirically eliminates Path A
+(extension-only writer) for production use; Path B is no longer an
+alternative — it's the v1 writer architecture.
+
+**What's preserved (still load-bearing v1 anchors):**
+
+- §23.0 — vault is canonical; substrate is filesystem + Markdown +
+  frontmatter + `.canvas` + `.base` + `_BAC/`. Companion writes via plain
+  Node `fs`; plugins remain opt-in acceleration; nothing about the
+  substrate principle changes.
+- §27.1 — three concepts (connection setup / sync-in / sync-out) still
+  separate; both directions just live in the companion now.
+- MCP read side — `npx bac-mcp --vault <path>` is unchanged. The
+  existing `poc/mcp-server` already validated stdio MCP composition.
+- §28 inline reviews — review *capture* (the user marking spans) can
+  still happen in the side panel; review *write* (vault frontmatter
+  mirror) goes through the companion like any other sync-out.
+
+**What changes:**
+
+- The `VaultBinding` interface sketched in §27.4 now has its primary
+  implementation in the companion (Node `fs` + atomic temp-file-rename),
+  not in the extension. Extension-side becomes a thin client that posts
+  capture events to the companion via NM or localhost HTTP.
+- The "single install" UX dies. User installs (a) the extension and (b)
+  the companion. Documented elsewhere as the install-funnel cost
+  (§24.3n).
+- Extension-side persistence in `chrome.storage.local` shifts role: from
+  "fast cache for side panel" to "queue for in-flight captures while
+  companion is unreachable" (drained on reconnect).
+
+**What this PoC was *not*:**
+
+The vault-bridge PoC was scoped to validate the substrate. It did. The
+substrate fails for sustained / silent operation. The next PoC at
+`poc/local-bridge` (per §26.6) is scoped to the companion's install-UX
+and lifecycle questions, which are the actual unknowns — companion-
+writes-to-vault via Node `fs` is well-trodden and not in question.
+
+**MV3 lessons folded back to other sections (for PRD pass):**
+
+- §24.3f ("`chrome.storage.session` for hot state, IndexedDB for
+  durable, never assume in-memory globals persist — service worker
+  terminates after 30 s inactivity") gets a sharpened corollary: **never
+  assume any in-SW timer or in-SW handle survives idle.** SW is for
+  event handling, not state ownership.
+- §24.3n permissions UX gets a related sharpening: **FileSystemAccess
+  permission state revoking after SW restart is a documented MV3
+  reality, not a bug.** Designs that depend on silent persistent FS
+  access from MV3 are designs that will break.
+- §24.10 safety primitives unchanged but reinforced: read-only MCP by
+  default + paste-mode dispatch by default were already the v1 stance;
+  with writer authority moving to the companion, those defaults compose
+  cleanly (extension can't dispatch silently because it can't even
+  write silently).
+
+**Status as of 2026-04-26:**
+
+- `poc/vault-bridge` complete, partial outcomes, README + NOTES
+  document U1–U6 evidence.
+- `poc/local-bridge` (companion architecture) is the next PoC; planning
+  artifact lives on the local `poc-planning` branch as `poc/local-bridge/
+  TODO.md`.
+- Update memory anchor: companion process is now load-bearing for the
+  writer side; vault-as-canonical and MCP read side unaffected.
+
+---
+
+## 28. Addendum (2026-04-26): Inline reviews — draft + dispatch back to chats `[user]`
+
+User observation. Most chat vendors (ChatGPT, Claude, Gemini) lack good
+inline-review affordances on assistant turns: you can copy, edit your next
+prompt, or start a new branch — but you can't *annotate* a turn in place
+("this paragraph is wrong; this one is great; here's a counter-example")
+and have the chat absorb the annotations as feedback. BAC sits one layer
+above and can offer this.
+
+### 28.1 The shape of the feature
+
+A persistent capability set, not a single scenario. Four operations:
+
+| Operation | What | Where the review goes |
+|---|---|---|
+| **Review** | User selects span(s) of an assistant turn (or a whole turn). BAC opens a review composer in the side panel: per-span comment + an overall verdict (`agree` / `disagree` / `partial` / `needs-source`). | Stored locally as a `ReviewEvent` (new entity type, extends §24.6); also written to the vault as a frontmatter mirror under the captured-turn note. |
+| **Submit-back** | "Send review back to original chat" — BAC composes a follow-up user-turn that quotes the spans + attaches the comments + states the verdict, and dispatches into the same thread (same provider, same conversation). Uses the existing dispatch primitive (paste-mode default per §24.10; auto-send opt-in). | Original thread; the assistant sees structured feedback as a normal user turn. |
+| **Dispatch-out** | "Send review as context to another chat" — BAC bundles the reviewed turn + the user's annotations + (optional) the prior 2–3 turns of context, and dispatches to a different chat (different provider or different thread) for a second opinion / fact-check / counterfactual. | Target chat the user picks (multi-target dispatch, same primitive as S25). |
+| **Track** | The review and its outcome stay attached to the captured turn in BAC. Future recall surfaces "you reviewed this turn N weeks ago — your verdict was Y." Future déjà-vu can de-prioritize turns the user marked `disagree`. | Vault note frontmatter (`bac_reviews:` array); BAC event log. |
+
+### 28.2 Why this is BAC-shaped, not provider-shaped
+
+The providers themselves are unlikely to ship this any time soon, for two
+reasons:
+
+1. Inline review is *adversarial* to the provider's "the AI is helpful"
+   framing. Letting users pin "this paragraph is wrong" alongside the
+   assistant's output would be a UX downgrade for the provider (looks like
+   the AI failed) even though it's an upgrade for the user.
+2. Cross-chat dispatch ("send this Claude turn to ChatGPT for a second
+   opinion") is *anti*-positioning for any single provider — they want you
+   to stay in their chat.
+
+BAC, on the other hand, is positioned exactly to serve these two motions
+(W1 cross-AI orchestration; W2 reading capture; W3 calibrated-freshness
+recall over reviewed material). The review feature is a clean fit:
+
+- It piggybacks on existing capture (the assistant turn is already captured
+  — review is metadata layered on top).
+- It piggybacks on existing dispatch (submit-back / dispatch-out are
+  variants of the highlight-dispatch primitive S25).
+- It piggybacks on existing recall (the local ranker can use the review
+  verdict as a signal).
+- It generates net-new content the user values (annotations) that *only
+  BAC* has — strengthening the "your data lives here" wedge.
+
+### 28.3 New entity type: `ReviewEvent`
+
+Extends §24.6 entity types:
+
+```ts
+ReviewEvent {
+  reviewId: string;                          // ULID
+  targetEventId: string;                     // the assistant turn being reviewed
+  targetSpan: { start: number; end: number; quote: string; }[]; // 1+ spans
+  verdict: 'agree' | 'disagree' | 'partial' | 'needs-source' | 'open';
+  comments: { spanIndex: number; text: string; }[];
+  reviewerNote: string;                      // free-form overall comment
+  dispatched?: {
+    submittedBack?: { threadId: string; userTurnId: string; at: string; };
+    dispatchedOut?: { targetThreadId: string; userTurnId: string; at: string; }[];
+  };
+  createdAt: string;
+  updatedAt: string;
+}
+```
+
+Stored in the event log + mirrored to vault as `bac_reviews:` frontmatter
+array on the captured-turn's Source note (per §27 sync-out semantics).
+
+### 28.4 New scenarios
+
+| # | Scenario | Notes |
+|---|---|---|
+| **S169** | **Review an assistant turn inline** `[user]` | User selects span(s) → side-panel composer → write per-span comment + verdict → save. Stays local; nothing dispatched. Useful as a personal-judgment trail even without dispatch. |
+| **S170** | **Submit review back to original chat** `[user]` | Composer offers "Send back to this thread" → BAC builds a follow-up user-turn quoting the spans with the comments → dispatches via existing S25-flavored primitive (paste-mode default; auto-send opt-in). The chat sees structured feedback as a normal turn. |
+| **S171** | **Dispatch review as context to other chat** `[user]` | Composer offers "Get a second opinion in [ChatGPT / Claude / Gemini / …]" — same multi-target dispatch as S25 with the review bundled as context. The other chat sees the original turn, the user's annotations, and a "what would you say?" framing. |
+| **S172** | **Review trail in vault** `[user]` | Reviews appear in the captured-turn's Source note as a `bac_reviews:` frontmatter list and a `## Reviews` body section (Markdown so user can edit). User edits → next sync-in (§27) reconciles back into BAC's state. |
+| **S173** | **Review-verdict signal in recall ranker** `[user]` | When recall surfaces déjà-vu hits, hits the user previously marked `disagree` are demoted by default (with "show all" override). Hits marked `agree` get a small boost. Optional, per-bucket toggle. |
+| **S174** | **Review-driven Context Pack inclusion** `[user]` | Context Pack generation (S74 / S160) can scope to "only assistant turns I marked `agree` or `partial`" — useful for handing off vetted material to a coding agent. |
+| **S175** | **Cross-provider critique loop** `[user]` | Workflow: capture Claude answer → review → dispatch-out to ChatGPT for fact-check → ChatGPT replies with corrections → capture → annotate again. Becomes a cited multi-provider provenance chain. Surfaces in the dogfood loop (§21) as a new fork-pattern. |
+
+### 28.5 Edge cases
+
+| # | Case | Mitigation |
+|---|---|---|
+| **E41** | Provider thread is gone (deleted server-side) before the user submits-back | Fall back to dispatch-out with the original turn snapshot; warn user "original thread is gone, can't reply in place." |
+| **E42** | Reviewed span no longer matches the rendered turn (provider edited / regenerated) | Anchor reviews via Hypothesis-style TextQuote + TextPosition selectors (§24.4 reuse map). On render mismatch, surface "review may be stale" badge. |
+| **E43** | User reviews a captured turn from a thread they no longer have access to (org membership lapsed) | Local review remains valid; submit-back disabled; dispatch-out still works (uses captured snapshot). |
+| **E44** | User submits-back to a thread that has had additional turns since capture | Prepend a brief "(re: your earlier turn quoted below)" so the assistant has anchor; otherwise it'll respond to whatever's most recent in context. |
+| **E45** | Provider rate-limits the submit-back turn | Standard dispatch failure handling; queue + retry + clipboard-mode fallback (§24.3e). |
+| **E46** | Sensitive content in the review (user's frustrated remarks not meant for the chat) | RedactionPipeline (§24.10) runs on submit-back / dispatch-out same as any dispatch. Composer shows a "review preview" before send so the user sees exactly what the chat will see. |
+
+### 28.6 What this changes / connects to
+
+- §3 primitives — add **Review** as a 9th primitive (after MCP-bridge from
+  §24.17). Review composes Capture (already on) + Annotate (new) + Dispatch
+  (existing). Worth flagging at PRD time.
+- §24.6 entity model — add `ReviewEvent`.
+- §24.10 safety — RedactionPipeline applies to submit-back / dispatch-out
+  same as any dispatch.
+- §22.3 graph — `ReviewEvent` connects to the captured turn (`targetEventId`)
+  and to any dispatch-result turns that came out of it. Becomes part of the
+  workstream graph and shows up in `.canvas` views (S100 / S156).
+- §24.8 calibrated-freshness recall — review verdicts feed the local ranker
+  (S173).
+- §74 Context Pack — review verdicts become a filter dimension (S174).
+
+### 28.7 Out of scope here
+
+- Sentiment classification / auto-grading of assistant turns. Reviews are
+  user-driven only.
+- Sharing reviews publicly. Reviews are local to the user; sharing follows
+  the §137 encrypted-blob backup path if the user wants to ship them.
+- Review aggregation across users (e.g. "the community marks this Claude
+  answer wrong"). Single-user trust boundary only for v1.
+- Inline-review UI inside the chat tab DOM (which would need DOM injection
+  past the provider's React tree). Side-panel composer only for v1; in-tab
+  overlays deferred.

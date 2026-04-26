@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+._*
+
+# Editor swap files
+*.swp
+*.swo
+
+# Local environment
+.env
+.env.local
+
+# Private working directory (kept on poc-planning only)
+imports/
