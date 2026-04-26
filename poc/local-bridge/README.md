@@ -41,6 +41,30 @@ Then load `poc/local-bridge/extension/.output/chrome-mv3` in
 `/tmp/bac-local-bridge-live/_BAC/.config/bridge.key`, and click
 `Use pasted key`.
 
+For a mostly hands-off verification run:
+
+```sh
+cd poc/local-bridge
+npm run verify
+```
+
+Useful variants:
+
+```sh
+npm run verify -- --tick-seconds 60
+npm run verify -- --vault "/Users/$USER/Library/Mobile Documents/com~apple~CloudDocs/tmp" --tick-seconds 60
+npm run verify -- --no-browser --tick-seconds 10
+```
+
+The default verifier starts a companion, checks auth, writes events, runs a
+short companion tick, probes whether `tail -f` sees a sentinel event, stops the
+companion to verify outage behavior, restarts it, and prints a PASS/FAIL
+summary. Add `--no-tail` to skip the tail probe. Add `--browser` to also try
+driving the unpacked extension through Chrome DevTools Protocol; that path
+depends on Chrome accepting command-line unpacked-extension loading in the
+temporary profile. Temporary Chrome profiles are left in `/tmp` rather than
+deleted for you.
+
 ## Companion Lifetime (Q2)
 
 The companion is a foreground Node process for v1. It logs to stderr and stops
