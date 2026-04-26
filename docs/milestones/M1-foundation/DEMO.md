@@ -83,3 +83,51 @@ The stdio integration test covers a populated `_BAC` vault fixture and verifies 
 - Vault unreachable: rename `/tmp/sidetrack-m1`; `GET /v1/status` returns `vault: unreachable` and writes return `VAULT_UNAVAILABLE`.
 - Provider selector drift: use a fixture/provider page with selectors missing. Capture falls back to visible text and records a selector warning.
 - Closed tracked tab: close a tab with a stored `TabSnapshot`; the background marks it `restorable`, and the side panel can reopen the URL.
+
+## Manual Acceptance Checklist
+
+### Capture & tracking
+
+- [ ] Companion starts cleanly. Verify `node dist/cli.js --vault /tmp/sidetrack-m1 --port 17373` binds `127.0.0.1`, writes `_BAC/.config/bridge.key`, and `GET /v1/health` responds within 1s.
+- [ ] Extension installs and connects. Verify the unpacked MV3 build loads, the bridge key paste succeeds, and the side panel header reports the vault as connected with the companion running.
+- [ ] Multi-provider capture works. Verify ChatGPT, Claude, and Gemini each produce captured events in `_BAC/events/<date>.jsonl`, then use Track current tab on an arbitrary URL and confirm the generic fallback thread lands in `_BAC/threads/<bac_id>.json`.
+- [ ] Selector canary degrades safely. Verify a broken provider selector raises the yellow warning banner, offers fallback, and capture still works.
+- [ ] Stop/remove tracking works. Verify per-tab stop, per-site stop, and tracked-item removal update both the side panel and the vault index.
+
+### Organization
+
+- [ ] Create nested workstream. Verify you can create `Sidetrack` → `MVP PRD` → `Active Work` and the tree renders in that hierarchy.
+- [ ] Move tracked items without identity loss. Verify moving a thread into `Sidetrack / MVP PRD / Active Work` and then to a sibling preserves references and `bac_id`.
+- [ ] Manual checklist persists. Verify adding three checklist items, checking one, closing/reopening the side panel, and restarting Chrome all preserve state.
+- [ ] Tags and privacy flag render correctly. Verify adding tag `architecture`, marking the workstream `private`, and seeing masked `[private]` titles in the Workboard.
+
+### Queue
+
+- [ ] Queue follow-up creates the pending item. Verify adding `Ask Claude to compare with VM live migration architecture.` produces a `pending` item in both the Queued section and the workstream detail.
+
+### Inbound reminders
+
+- [ ] Inbound detection surfaces replies. Verify a background Claude reply appears in Inbound with the signal-orange pulse indicator, then test mark relevant or dismiss.
+
+### Tab recovery
+
+- [ ] Recovery dialog restores a tracked tab. Verify a closed tracked tab shows `closed (restorable)` and the reopen flow works, plus focus-open or restore-session if Chrome allows it.
+
+### MCP read-side
+
+- [ ] `bac-mcp` returns rich data. Verify `bac.recent_threads` returns the four captured threads, `bac.workstream({ id })` returns the nested tree with items, queued work, and checklist state, `bac.context_pack({ workstreamId })` returns a Markdown context pack, `bac.search({ query: "vm live migration" })` returns lexical matches, `bac.queued_items()` returns the pending follow-up, and `bac.inbound_reminders()` returns the Claude reply.
+
+### Failure modes
+
+- [ ] Chrome restart preserves state. Verify restarting Chrome reconnects the side panel to the still-running companion and capture continues.
+- [ ] Companion crash and restart replays queued capture. Verify killing the companion queues a capture, then restarting replays it into the vault and returns the badge to connected.
+- [ ] Vault unreachable surfaces and recovers. Verify renaming the vault triggers the error state, then restoring or re-picking it resumes capture without losing queued work.
+
+### Standards
+
+- [ ] Companion standards commands pass. Verify `cd packages/sidetrack-companion && npm run lint && npm run typecheck && npm test`.
+- [ ] Extension standards commands pass. Verify `cd packages/sidetrack-extension && npm run lint && npm run typecheck && npm test && npm run build`.
+- [ ] Extension Playwright e2e passes. Verify `cd packages/sidetrack-extension && npm run e2e`.
+- [ ] MCP standards commands pass. Verify `cd packages/sidetrack-mcp && npm run lint && npm run typecheck && npm test`.
+- [ ] No `any` across production boundaries. Verify `grep -nr ": any" packages/` returns nothing in production code.
+- [ ] No hidden global state. Verify composition roots still own dependency wiring and no service-locator style globals were introduced.
