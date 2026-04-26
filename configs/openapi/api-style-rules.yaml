@@ -1,0 +1,48 @@
+# Spectral-style starter rules. Adjust to your exact Spectral version/toolchain.
+# Goal: make API contract quality enforceable in CI.
+
+extends:
+  - spectral:oas
+
+rules:
+  operation-operationId:
+    description: Every operation must have a stable operationId.
+    given: $.paths[*][get,put,post,delete,options,head,patch,trace]
+    severity: error
+    then:
+      field: operationId
+      function: truthy
+
+  operation-tags:
+    description: Every operation must be tagged by domain capability.
+    given: $.paths[*][get,put,post,delete,options,head,patch,trace]
+    severity: error
+    then:
+      field: tags
+      function: truthy
+
+  no-inline-success-schema:
+    description: Prefer reusable component schemas for success responses.
+    given: $.paths[*][get,put,post,delete,options,head,patch,trace].responses[?(@property.match(/^2/))].content[*].schema
+    severity: warn
+    then:
+      field: $ref
+      function: truthy
+
+  error-response-problem-schema:
+    description: Error responses should reference the standard Problem schema.
+    given: $.paths[*][get,put,post,delete,options,head,patch,trace].responses[?(@property.match(/^(4|5)/))].content.application/json.schema
+    severity: warn
+    then:
+      field: $ref
+      function: pattern
+      functionOptions:
+        match: '#/components/schemas/Problem$'
+
+  no-empty-security-for-non-health:
+    description: Non-health endpoints should not disable security without review.
+    given: $.paths[?(@property != '/health')][get,put,post,delete,options,head,patch,trace]
+    severity: warn
+    then:
+      field: security
+      function: undefined
