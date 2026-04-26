@@ -25,6 +25,7 @@ rules:
     description: Prefer reusable component schemas for success responses.
     given: $.paths[*][get,put,post,delete,options,head,patch,trace].responses[?(@property.match(/^2/))].content[*].schema
     severity: warn
+    resolved: false
     then:
       field: $ref
       function: truthy

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "../../configs/ts/tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "paths": {
+      "@/*": ["src/*"]
+    },
+    "types": ["node", "vitest"]
+  },
+  "include": ["src/**/*.ts", "vitest.config.ts"],
+  "exclude": ["dist", "node_modules"]
+}
