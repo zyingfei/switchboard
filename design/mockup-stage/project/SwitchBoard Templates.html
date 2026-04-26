@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>SwitchBoard · Interactive Templates</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..700;1,9..144,300..700&family=Source+Serif+4:ital,opsz,wght@0,8..60,300..700;1,8..60,300..700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
+
+<link rel="stylesheet" href="styles.css"/>
+
+<template id="__bundler_thumbnail">
+  <svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+    <rect width="200" height="200" fill="#F5EFE2"/>
+    <circle cx="100" cy="100" r="36" fill="none" stroke="#1B1916" stroke-width="3"/>
+    <circle cx="100" cy="100" r="20" fill="#C2410C"/>
+    <line x1="78" y1="100" x2="122" y2="100" stroke="#1B1916" stroke-width="3" transform="rotate(35 100 100)"/>
+    <text x="100" y="170" font-family="Georgia, serif" font-size="22" font-style="italic" text-anchor="middle" fill="#1B1916">SwitchBoard</text>
+  </svg>
+</template>
+
+<style>
+  body { background: var(--paper); }
+  #root { width: 100%; min-height: 100vh; }
+</style>
+
+<script type="application/json" id="speaker-notes">[]</script>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<script type="text/babel" src="design-canvas.jsx"></script>
+<script type="text/babel" src="tweaks-panel.jsx"></script>
+<script type="text/babel" src="shared.jsx"></script>
+<script type="text/babel" src="surfaces/side-panel.jsx"></script>
+<script type="text/babel" src="surfaces/flyout.jsx"></script>
+<script type="text/babel" src="surfaces/preflight.jsx"></script>
+<script type="text/babel" src="surfaces/vault.jsx"></script>
+<script type="text/babel" src="surfaces/mcp.jsx"></script>
+<script type="text/babel" src="surfaces/wizard.jsx"></script>
+<script type="text/babel" src="surfaces/extras.jsx"></script>
+<script type="text/babel" src="app.jsx"></script>
+</body>
+</html>
