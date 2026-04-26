@@ -25,6 +25,12 @@ rules:
     description: Prefer reusable component schemas for success responses.
     given: $.paths[*][get,put,post,delete,options,head,patch,trace].responses[?(@property.match(/^2/))].content[*].schema
     severity: warn
+    # `resolved: false` runs this rule against the unresolved spec so the
+    # `field: $ref` / `function: truthy` check actually sees `$ref` references.
+    # Without it, Spectral resolves `$ref` to its target schema before evaluation
+    # and the check no longer fires (every response looks "inline" because there
+    # are no `$ref` keys left to find).
+    resolved: false
     then:
       field: $ref
       function: truthy
