@@ -1,0 +1,2 @@
+{"id":"evt_1","type":"capture.synced","entityId":"capture_claude_browser_owned_mcp","payload":{"provider":"claude","status":"tracked"},"createdAt":"2026-04-26T10:16:00.000Z"}
+{"id":"evt_2","type":"mcp.server.validated","entityId":"thread_obsidian_poc_001","payload":{"transport":"stdio","clients":["claude-code","codex-cli"]},"createdAt":"2026-04-26T10:17:00.000Z"}

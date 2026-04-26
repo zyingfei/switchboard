@@ -1,0 +1,109 @@
+[
+  {
+    "id": "capture_claude_browser_owned_mcp",
+    "provider": "claude",
+    "url": "https://claude.ai/chat/browser-owned-mcp",
+    "title": "Claude - Browser-owned MCP",
+    "capturedAt": "2026-04-26T10:15:00.000Z",
+    "extractionConfigVersion": "fixture-v1",
+    "selectorCanary": "passed",
+    "turns": [
+      {
+        "id": "claude_turn_1",
+        "role": "user",
+        "text": "Can Browser AI Companion expose local research to Claude Code and Codex CLI with MCP?",
+        "formattedText": "Can Browser AI Companion expose local research to Claude Code and Codex CLI with MCP?",
+        "ordinal": 0,
+        "sourceSelector": "fixture"
+      },
+      {
+        "id": "claude_turn_2",
+        "role": "assistant",
+        "text": "Yes. Start with a read-only stdio MCP server that reads local vault notes, provider captures, and recall indexes.",
+        "formattedText": "Yes. Start with a read-only stdio MCP server that reads local vault notes, provider captures, and recall indexes.",
+        "ordinal": 1,
+        "sourceSelector": "fixture"
+      }
+    ],
+    "artifacts": [
+      {
+        "id": "claude_artifact_1",
+        "kind": "report",
+        "title": "Stdio validation checklist",
+        "text": "Validate listTools, callTool, and context pack consumption in both clients.",
+        "formattedText": "# Stdio validation checklist\n\n- listTools\n- callTool\n- context pack",
+        "sourceSelector": "fixture",
+        "sourceUrl": "https://example.com/checklist",
+        "links": [
+          {
+            "id": "claude_artifact_link_1",
+            "label": "Checklist source",
+            "url": "https://example.com/checklist"
+          }
+        ]
+      }
+    ],
+    "warnings": [],
+    "visibleTextCharCount": 303
+  },
+  {
+    "id": "capture_gemini_screenshare_safe",
+    "provider": "gemini",
+    "url": "https://gemini.google.com/app/screenshare-safe",
+    "title": "Gemini - Screen-share-safe mode",
+    "capturedAt": "2026-04-25T18:45:00.000Z",
+    "extractionConfigVersion": "fixture-v1",
+    "selectorCanary": "fallback",
+    "turns": [
+      {
+        "id": "gemini_turn_1",
+        "role": "user",
+        "text": "What should BAC hide when the user is screen sharing?",
+        "formattedText": "What should BAC hide when the user is screen sharing?",
+        "ordinal": 0,
+        "sourceSelector": "fixture"
+      },
+      {
+        "id": "gemini_turn_2",
+        "role": "assistant",
+        "text": "Mask URLs, emails, and token-like strings in recall snippets, context packs, and audit previews.",
+        "formattedText": "Mask URLs, emails, and token-like strings in recall snippets, context packs, and audit previews.",
+        "ordinal": 1,
+        "sourceSelector": "fixture"
+      }
+    ],
+    "artifacts": [],
+    "warnings": [],
+    "visibleTextCharCount": 201
+  },
+  {
+    "id": "capture_chatgpt_setup_snippet",
+    "provider": "chatgpt",
+    "url": "https://chatgpt.com/c/setup-snippet",
+    "title": "ChatGPT - Setup snippet notes",
+    "capturedAt": "2026-04-24T09:30:00.000Z",
+    "extractionConfigVersion": "fixture-v1",
+    "selectorCanary": "passed",
+    "turns": [
+      {
+        "id": "chatgpt_turn_1",
+        "role": "user",
+        "text": "What is the cleanest config path for a local MCP server POC?",
+        "formattedText": "What is the cleanest config path for a local MCP server POC?",
+        "ordinal": 0,
+        "sourceSelector": "fixture"
+      },
+      {
+        "id": "chatgpt_turn_2",
+        "role": "assistant",
+        "text": "Use a single JSON config file so Claude Code and Codex CLI can launch the same command with the same vault and capture paths.",
+        "formattedText": "Use a single JSON config file so Claude Code and Codex CLI can launch the same command with the same vault and capture paths.",
+        "ordinal": 1,
+        "sourceSelector": "fixture"
+      }
+    ],
+    "artifacts": [],
+    "warnings": [],
+    "visibleTextCharCount": 248
+  }
+]
