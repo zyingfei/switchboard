@@ -161,7 +161,7 @@ describe('live side-panel App wiring', () => {
     render(<App />);
 
     expect(await screen.findByText('Set up Sidetrack')).toBeInTheDocument();
-    expect(screen.getByText("Skip — I've already set this up")).toBeInTheDocument();
+    expect(screen.getByText('Use Sidetrack without vault sync →')).toBeInTheDocument();
   });
 
   it('renders Workboard when setupCompleted flag is true', async () => {

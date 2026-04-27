@@ -6,7 +6,7 @@ import type {
   TabSnapshot,
 } from './companion/model';
 
-export type CompanionStatus = 'connected' | 'disconnected' | 'vault-error';
+export type CompanionStatus = 'connected' | 'disconnected' | 'vault-error' | 'local-only';
 export type TrackingMode = 'auto' | 'manual' | 'stopped' | 'removed';
 export type PrivacyMode = 'private' | 'shared' | 'public';
 
@@ -115,7 +115,7 @@ export const initialWorkboardSections: readonly WorkboardSection[] = [
   {
     id: 'active-work',
     label: 'Active Work',
-    emptyText: 'Tracked threads will appear here after the companion connects.',
+    emptyText: 'Tracked threads will appear here once you start capturing.',
   },
   {
     id: 'queued',
@@ -141,14 +141,18 @@ export const initialWorkboardSections: readonly WorkboardSection[] = [
 
 export const companionStatusLabel = (status: CompanionStatus): string => {
   if (status === 'connected') {
-    return 'companion: running';
+    return 'vault: synced';
   }
 
   if (status === 'vault-error') {
-    return 'vault: error';
+    return 'vault: unreachable';
   }
 
-  return 'companion: disconnected';
+  if (status === 'local-only') {
+    return 'local-only';
+  }
+
+  return 'vault: disconnected';
 };
 
 export const maskTitleForPrivacy = (
