@@ -13,28 +13,51 @@ const STEP_LABEL: Record<WizardStep, string> = {
   done: 'Done',
 };
 
+const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+export type CompanionPingResult = 'reachable' | 'unreachable';
+
 export interface WizardProps {
   readonly bridgeKey?: string;
   readonly companionReachable?: boolean;
   readonly localRestApiDetected?: boolean;
+  readonly port?: number;
   readonly onClose: () => void;
   readonly onFinish: () => void;
   readonly onBridgeKeyChange?: (bridgeKey: string) => void;
   readonly onSkip?: () => void;
   readonly onVaultPathChange?: (vaultPath: string) => void;
   readonly vaultPath?: string;
+  /** Test the companion's `/v1/health` endpoint (no auth). Defaults to a fetch against `http://127.0.0.1:<port>/v1/health`. */
+  readonly onPingCompanion?: () => Promise<CompanionPingResult>;
+  /** Read clipboard contents. Defaults to `navigator.clipboard.readText()`. */
+  readonly onReadClipboard?: () => Promise<string>;
 }
+
+const defaultPingCompanion = async (port: number): Promise<CompanionPingResult> => {
+  try {
+    const response = await fetch(`http://127.0.0.1:${String(port)}/v1/health`, { method: 'GET' });
+    return response.ok ? 'reachable' : 'unreachable';
+  } catch {
+    return 'unreachable';
+  }
+};
+
+const defaultReadClipboard = (): Promise<string> => navigator.clipboard.readText();
 
 export function Wizard({
   bridgeKey = '',
   companionReachable = false,
   localRestApiDetected = false,
+  port = 17_373,
   onClose,
   onFinish,
   onBridgeKeyChange,
   onSkip,
   onVaultPathChange,
   vaultPath = '',
+  onPingCompanion,
+  onReadClipboard,
 }: WizardProps) {
   const [stepIndex, setStepIndex] = useState(0);
   const step = STEP_ORDER[stepIndex] ?? 'welcome';
@@ -89,6 +112,9 @@ export function Wizard({
           bridgeKey={bridgeKey}
           companionReachable={companionReachable}
           onBridgeKeyChange={onBridgeKeyChange}
+          onPingCompanion={onPingCompanion ?? (() => defaultPingCompanion(port))}
+          onReadClipboard={onReadClipboard ?? defaultReadClipboard}
+          port={port}
           vaultPath={vaultPath}
         />
       ) : null}
@@ -124,15 +150,63 @@ function CompanionStep({
   bridgeKey,
   companionReachable,
   onBridgeKeyChange,
+  onPingCompanion,
+  onReadClipboard,
+  port,
   vaultPath,
 }: {
   readonly bridgeKey: string;
   readonly companionReachable: boolean;
   readonly onBridgeKeyChange?: (bridgeKey: string) => void;
+  readonly onPingCompanion: () => Promise<CompanionPingResult>;
+  readonly onReadClipboard: () => Promise<string>;
+  readonly port: number;
   readonly vaultPath: string;
 }) {
   const commandPath = vaultPath.trim() || 'path';
   const bridgeKeyPath = `${commandPath.replace(/\/$/, '')}/_BAC/.config/bridge.key`;
+  const [pingState, setPingState] = useState<'idle' | 'testing' | CompanionPingResult>('idle');
+  const [clipboardError, setClipboardError] = useState<string | null>(null);
+
+  const ambientReachable = pingState === 'reachable' || (pingState === 'idle' && companionReachable);
+  const showAmber = !ambientReachable && pingState !== 'unreachable';
+
+  const handleTestConnection = () => {
+    setPingState('testing');
+    void onPingCompanion()
+      .then((result) => {
+        setPingState(result);
+      })
+      .catch(() => {
+        setPingState('unreachable');
+      });
+  };
+
+  const handlePasteFromClipboard = () => {
+    setClipboardError(null);
+    void onReadClipboard()
+      .then((value) => {
+        const trimmed = value.trim();
+        if (trimmed.length < 32 || !BASE64URL_PATTERN.test(trimmed)) {
+          setClipboardError("That doesn't look like a bridge key — open the file and copy the line.");
+          return;
+        }
+        onBridgeKeyChange?.(trimmed);
+      })
+      .catch(() => {
+        setClipboardError('Could not read clipboard — paste manually below.');
+      });
+  };
+
+  const statusClass = ambientReachable ? 'green' : showAmber ? 'amber' : 'red';
+  const statusLabel =
+    pingState === 'testing'
+      ? 'Testing companion at 127.0.0.1:' + String(port) + '…'
+      : ambientReachable
+        ? 'Companion reachable on port ' + String(port)
+        : pingState === 'unreachable'
+          ? 'Cannot reach companion on port ' + String(port)
+          : 'Waiting for companion…';
 
   return (
     <div className="wizard-step">
@@ -149,6 +223,18 @@ function CompanionStep({
           </div>
         </div>
       </div>
+      <div className={'wizard-status ' + statusClass}>
+        <span className={'dot ' + statusClass} />
+        <span className="mono">{statusLabel}</span>
+        <button
+          type="button"
+          className="btn btn-ghost wizard-test-btn"
+          disabled={pingState === 'testing'}
+          onClick={handleTestConnection}
+        >
+          {pingState === 'testing' ? 'Testing…' : 'Test connection'}
+        </button>
+      </div>
       <label>
         Bridge key
         <input
@@ -160,11 +246,17 @@ function CompanionStep({
           value={bridgeKey}
         />
       </label>
-      <div className={'wizard-status ' + (companionReachable ? 'green' : 'amber')}>
-        <span className={'dot ' + (companionReachable ? 'green' : 'amber')} />
-        <span className="mono">
-          {companionReachable ? 'Companion reachable' : 'Waiting for companion...'}
-        </span>
+      <div className="wizard-bridge-actions">
+        <button
+          type="button"
+          className="btn btn-ghost mono"
+          onClick={handlePasteFromClipboard}
+        >
+          Paste from clipboard
+        </button>
+        {clipboardError !== null ? (
+          <span className="wizard-clipboard-error mono">{clipboardError}</span>
+        ) : null}
       </div>
       <div className="wizard-footnote mono">
         <em>

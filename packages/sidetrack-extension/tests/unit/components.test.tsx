@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import {
   Annotation,
   CodingAttach,
@@ -112,6 +112,62 @@ describe('UX skeleton components — render-without-crash + key text present', (
     render(<Wizard onClose={noop} onFinish={noop} />);
     expect(screen.getByText(/Track your AI work without losing the thread/)).toBeInTheDocument();
     expect(screen.getByText(/step 1 of 5/)).toBeInTheDocument();
+  });
+
+  it('Wizard companion step pings via injected onPingCompanion and reflects result', async () => {
+    const ping = vi.fn().mockResolvedValue('reachable' as const);
+    const readClipboard = vi.fn().mockResolvedValue('');
+    render(
+      <Wizard
+        onClose={noop}
+        onFinish={noop}
+        onPingCompanion={ping}
+        onReadClipboard={readClipboard}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText(/Waiting for companion/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+    expect(ping).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText(/Companion reachable on port/)).toBeInTheDocument();
+  });
+
+  it('Wizard companion step paste-from-clipboard accepts a base64url-looking key', async () => {
+    const onBridgeKeyChange = vi.fn();
+    const readClipboard = vi.fn().mockResolvedValue('a'.repeat(40));
+    render(
+      <Wizard
+        onClose={noop}
+        onFinish={noop}
+        onBridgeKeyChange={onBridgeKeyChange}
+        onPingCompanion={vi.fn().mockResolvedValue('unreachable' as const)}
+        onReadClipboard={readClipboard}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Paste from clipboard' }));
+    await vi.waitFor(() => {
+      expect(onBridgeKeyChange).toHaveBeenCalledWith('a'.repeat(40));
+    });
+    expect(readClipboard).toHaveBeenCalledTimes(1);
+  });
+
+  it('Wizard companion step rejects a clipboard value that is too short', async () => {
+    const onBridgeKeyChange = vi.fn();
+    const readClipboard = vi.fn().mockResolvedValue('short');
+    render(
+      <Wizard
+        onClose={noop}
+        onFinish={noop}
+        onBridgeKeyChange={onBridgeKeyChange}
+        onPingCompanion={vi.fn().mockResolvedValue('unreachable' as const)}
+        onReadClipboard={readClipboard}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Paste from clipboard' }));
+    expect(await screen.findByText(/doesn't look like a bridge key/)).toBeInTheDocument();
+    expect(onBridgeKeyChange).not.toHaveBeenCalled();
   });
 
   it('CodingAttach renders tool picker and form fields', () => {
