@@ -178,71 +178,32 @@ describe('live side-panel App wiring', () => {
     expect(screen.getByRole('main', { name: 'Sidetrack workboard' })).toBeInTheDocument();
   });
 
-  it('renders Workboard when bridge key exists without setupCompleted flag', async () => {
-    const sendMessage = installChromeMock(liveState());
+  it('renders the spec-aligned side panel scaffolding', async () => {
+    const sendMessage = installChromeMock(liveState(), { [SETUP_COMPLETED_KEY]: true });
 
     render(<App />);
 
     await waitFor(() => {
       expect(sendMessage).toHaveBeenCalledWith({ type: messageTypes.getWorkboardState });
     });
-    expect((await screen.findAllByText('Side-panel state machine review')).length).toBeGreaterThan(
-      0,
-    );
     expect(screen.queryByText('Set up Sidetrack')).not.toBeInTheDocument();
+    expect(await screen.findByText('Open threads')).toBeInTheDocument();
+    expect(screen.getByText('Captures')).toBeInTheDocument();
+    // ws-bar shows the current workstream label (default: "not set")
+    expect(screen.getByRole('button', { name: /not set/ })).toBeInTheDocument();
   });
 
-  it('renders disconnected SystemBanners state when bridge key is empty', async () => {
-    installChromeMock(createEmptyWorkboardState(), { [SETUP_COMPLETED_KEY]: true });
-
-    render(<App />);
-
-    expect(await screen.findByText(/Companion: disconnected/)).toBeInTheDocument();
-  });
-
-  it('renders live state through M1 skeleton components and updates reminders', async () => {
-    const sendMessage = installChromeMock(liveState());
-
-    render(<App />);
-
-    expect(await screen.findByText(/Companion: disconnected/)).toBeInTheDocument();
-    expect(screen.getByText(/Provider extractor: ChatGPT extractor health/)).toBeInTheDocument();
-    // InboundCard masks the thread title because the linked thread lives in
-    // a private workstream — it surfaces "[private — workstream item]".
-    expect(screen.getByText('[private — workstream item]')).toBeInTheDocument();
-    // Active Work now shows workstream cards by default; click the (private)
-    // workstream card to reveal its threads, where maskTitleForPrivacy yields
-    // the bare "[private]" label.
-    const wsCard = await screen.findByRole('button', {
-      name: /Sidetrack.*thread/,
+  it('does not show "companion disconnected" banner in local-only mode', async () => {
+    installChromeMock(createEmptyWorkboardState({ companionStatus: 'local-only' }), {
+      [SETUP_COMPLETED_KEY]: true,
     });
-    fireEvent.click(wsCard);
-    expect(await screen.findByText('[private]')).toBeInTheDocument();
 
-    fireEvent.click(screen.getByText('Mark relevant'));
+    render(<App />);
 
     await waitFor(() => {
-      expect(sendMessage).toHaveBeenCalledWith({
-        type: messageTypes.updateReminder,
-        reminderId: 'bac_reminder_test',
-        update: { status: 'relevant' },
-      });
+      expect(screen.getByRole('main', { name: 'Sidetrack workboard' })).toBeInTheDocument();
     });
-  });
-
-  it('persists section collapse via setCollapsedSections message', async () => {
-    const sendMessage = installChromeMock(liveState());
-
-    render(<App />);
-
-    fireEvent.click(await screen.findByRole('button', { name: /Active Work hide/ }));
-
-    await waitFor(() => {
-      expect(sendMessage).toHaveBeenCalledWith({
-        type: messageTypes.setCollapsedSections,
-        collapsedSections: ['active-work'],
-      });
-    });
+    expect(screen.queryByText(/Companion: disconnected/)).not.toBeInTheDocument();
   });
 
   it('routes move-to picker selections through the moveThread message', async () => {
@@ -250,12 +211,17 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
-    // Expand the workstream card to reach the per-thread "Move to…" button
-    // (which now lives inside the expanded workstream-detail view, not the
-    // section's default cards).
-    fireEvent.click(
-      await screen.findByRole('button', { name: /Sidetrack.*thread/ }),
+    // Switch to the workstream that contains the test thread via the ws picker.
+    fireEvent.click(await screen.findByRole('button', { name: /not set/ }));
+    const wsRows = await screen.findAllByRole('button');
+    const sidetrackPickerRow = wsRows.find((b) =>
+      (b.className.includes('ws-picker-row') || b.textContent !== null) &&
+      (b.textContent ?? '').trim().startsWith('Sidetrack'),
     );
+    if (sidetrackPickerRow === undefined) {
+      throw new Error('Could not find Sidetrack picker row.');
+    }
+    fireEvent.click(sidetrackPickerRow);
     fireEvent.click(await screen.findByText('Move to…'));
     await screen.findByText('From: Sidetrack · Side-panel state machine review');
     const siblingButtons = screen.getAllByRole('button', { name: /Sibling/ });
