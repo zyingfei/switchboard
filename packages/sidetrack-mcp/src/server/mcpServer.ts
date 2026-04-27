@@ -223,5 +223,30 @@ export const createSidetrackMcpServer = (reader: LiveVaultReader): McpServer => 
       ),
   );
 
+  server.registerTool(
+    'bac.dispatches',
+    {
+      description: 'Return recent dispatch events from the live Sidetrack vault dispatch ledger.',
+      inputSchema: {
+        limit: z.number().int().positive().max(100).optional(),
+        since: z.iso.datetime().optional(),
+        workstreamId: z.string().optional(),
+        provider: z.string().optional(),
+      },
+    },
+    async ({ limit, since, workstreamId, provider }) => {
+      const result = await reader.readDispatches({
+        ...(limit === undefined ? {} : { limit }),
+        ...(since === undefined ? {} : { since }),
+        ...(workstreamId === undefined ? {} : { workstreamId }),
+        ...(provider === undefined ? {} : { provider }),
+      });
+      return asStructuredContent({
+        data: result.data,
+        ...(result.cursor === undefined ? {} : { cursor: result.cursor }),
+      });
+    },
+  );
+
   return server;
 };

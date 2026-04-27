@@ -50,10 +50,50 @@ const reminderSchema = z
   })
   .loose();
 
+const bacIdSchema = z
+  .string()
+  .min(8)
+  .max(64)
+  .regex(/^[A-Za-z0-9_-]+$/u);
+const isoDateTimeSchema = z.iso.datetime();
+
+const dispatchEventSchema = z.object({
+  bac_id: bacIdSchema,
+  kind: z.enum(['research', 'review', 'coding', 'note', 'other']),
+  target: z.object({
+    provider: z.enum(['chatgpt', 'claude', 'gemini', 'codex', 'claude_code', 'cursor', 'other']),
+    mode: z.enum(['paste', 'auto-send']),
+  }),
+  sourceThreadId: z.string().min(1).optional(),
+  workstreamId: z.string().min(1).optional(),
+  title: z.string().min(1),
+  body: z.string().min(1),
+  createdAt: isoDateTimeSchema,
+  redactionSummary: z.object({
+    matched: z.number().int().nonnegative(),
+    categories: z.array(z.string().min(1)),
+  }),
+  tokenEstimate: z.number().int().nonnegative(),
+  status: z.enum(['queued', 'sent', 'replied', 'noted', 'pending', 'failed']),
+});
+
 export type ThreadRecord = z.infer<typeof threadSchema>;
 export type WorkstreamRecord = z.infer<typeof workstreamSchema>;
 export type QueueItemRecord = z.infer<typeof queueItemSchema>;
 export type ReminderRecord = z.infer<typeof reminderSchema>;
+export type DispatchEvent = z.infer<typeof dispatchEventSchema>;
+
+export interface DispatchReadOptions {
+  readonly limit?: number;
+  readonly since?: string;
+  readonly workstreamId?: string;
+  readonly provider?: string;
+}
+
+export interface DispatchReadResult {
+  readonly data: readonly DispatchEvent[];
+  readonly cursor?: string;
+}
 
 export interface LiveVaultSnapshot {
   readonly threads: readonly ThreadRecord[];
@@ -118,6 +158,29 @@ const readEventLogs = async (rootPath: string): Promise<Record<string, unknown>[
   return events;
 };
 
+const parseDispatchLine = (line: string): DispatchEvent | undefined => {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    const result = dispatchEventSchema.safeParse(parsed);
+    return result.success ? result.data : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const readDispatchFile = async (path: string): Promise<DispatchEvent[]> => {
+  const raw = await readFile(path, 'utf8');
+  return raw
+    .split('\n')
+    .map(parseDispatchLine)
+    .filter((event): event is DispatchEvent => event !== undefined);
+};
+
 export class LiveVaultReader {
   constructor(private readonly vaultPath: string) {}
 
@@ -139,6 +202,34 @@ export class LiveVaultReader {
       reminders,
       events,
       generatedAt: new Date().toISOString(),
+    };
+  }
+
+  async readDispatches(options: DispatchReadOptions = {}): Promise<DispatchReadResult> {
+    const dispatchDirectory = ensureInsideRoot(this.vaultPath, '_BAC/dispatches');
+    const entries = await readdir(dispatchDirectory, { withFileTypes: true }).catch(() => []);
+    const limit = Math.min(options.limit ?? 25, 100);
+    const sinceMillis = options.since === undefined ? undefined : Date.parse(options.since);
+    const events = (
+      await Promise.all(
+        entries
+          .filter((entry) => entry.isFile() && /^\d{4}-\d{2}-\d{2}\.jsonl$/u.test(entry.name))
+          .sort((left, right) => right.name.localeCompare(left.name))
+          .slice(0, 100)
+          .map((entry) => readDispatchFile(join(dispatchDirectory, entry.name))),
+      )
+    ).flat();
+
+    return {
+      data: events
+        .filter(
+          (event) =>
+            (sinceMillis === undefined || Date.parse(event.createdAt) >= sinceMillis) &&
+            (options.workstreamId === undefined || event.workstreamId === options.workstreamId) &&
+            (options.provider === undefined || event.target.provider === options.provider),
+        )
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+        .slice(0, limit),
     };
   }
 }
