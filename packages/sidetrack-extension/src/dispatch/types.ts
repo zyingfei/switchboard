@@ -89,6 +89,30 @@ export const mapUiPacketKind = (kind: UiPacketKind): DispatchKind => PACKET_KIND
 
 export const mapUiTarget = (target: UiDispatchTarget): DispatchTargetProvider => TARGET_MAP[target];
 
+const REVERSE_PACKET_KIND: Record<DispatchKind, UiPacketKind> = {
+  research: 'research_packet',
+  review: 'context_pack',
+  coding: 'coding_agent_packet',
+  note: 'context_pack',
+  other: 'context_pack',
+};
+
+const REVERSE_TARGET: Record<DispatchTargetProvider, UiDispatchTarget> = {
+  chatgpt: 'gpt_pro',
+  claude: 'claude',
+  gemini: 'gemini',
+  codex: 'codex',
+  claude_code: 'claude_code',
+  cursor: 'cursor',
+  other: 'notebook',
+};
+
+export const dispatchKindToUiPacketKind = (kind: DispatchKind): UiPacketKind =>
+  REVERSE_PACKET_KIND[kind];
+
+export const dispatchProviderToUiTarget = (provider: DispatchTargetProvider): UiDispatchTarget =>
+  REVERSE_TARGET[provider];
+
 export const providerIdToDispatchProvider = (provider: ProviderId): DispatchTargetProvider => {
   switch (provider) {
     case 'chatgpt':
