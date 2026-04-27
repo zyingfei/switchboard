@@ -105,6 +105,26 @@ export type ReminderRecord = z.infer<typeof reminderSchema>;
 export type DispatchEvent = z.infer<typeof dispatchEventSchema>;
 export type ReviewEvent = z.infer<typeof reviewEventSchema>;
 
+const turnRoleSchema = z.enum(['user', 'assistant', 'system', 'unknown']);
+
+const captureEventSchema = z.object({
+  threadUrl: z.url(),
+  capturedAt: isoDateTimeSchema,
+  turns: z.array(
+    z.object({
+      role: turnRoleSchema,
+      text: z.string().min(1),
+      formattedText: z.string().min(1).optional(),
+      ordinal: z.number().int().nonnegative(),
+      capturedAt: isoDateTimeSchema,
+      sourceSelector: z.string().min(1).optional(),
+    }),
+  ),
+});
+
+export type TurnRole = z.infer<typeof turnRoleSchema>;
+export type CapturedTurn = z.infer<typeof captureEventSchema>['turns'][number];
+
 export interface DispatchReadOptions {
   readonly limit?: number;
   readonly since?: string;
@@ -126,6 +146,17 @@ export interface ReviewReadOptions {
 
 export interface ReviewReadResult {
   readonly data: readonly ReviewEvent[];
+  readonly cursor?: string;
+}
+
+export interface TurnsReadOptions {
+  readonly threadUrl: string;
+  readonly limit?: number;
+  readonly role?: TurnRole;
+}
+
+export interface TurnsReadResult {
+  readonly data: readonly CapturedTurn[];
   readonly cursor?: string;
 }
 
@@ -230,6 +261,28 @@ const parseReviewLine = (line: string): ReviewEvent | undefined => {
   }
 };
 
+const parseEventLine = (line: string): z.infer<typeof captureEventSchema> | undefined => {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    const result = captureEventSchema.safeParse(parsed);
+    return result.success ? result.data : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const readEventFile = async (path: string): Promise<z.infer<typeof captureEventSchema>[]> => {
+  const raw = await readFile(path, 'utf8');
+  return raw
+    .split('\n')
+    .map(parseEventLine)
+    .filter((event): event is z.infer<typeof captureEventSchema> => event !== undefined);
+};
+
 const readReviewFile = async (path: string): Promise<ReviewEvent[]> => {
   const raw = await readFile(path, 'utf8');
   return raw
@@ -286,6 +339,43 @@ export class LiveVaultReader {
             (options.provider === undefined || event.target.provider === options.provider),
         )
         .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+        .slice(0, limit),
+    };
+  }
+
+  async readTurns(options: TurnsReadOptions): Promise<TurnsReadResult> {
+    const eventsDirectory = ensureInsideRoot(this.vaultPath, '_BAC/events');
+    const entries = await readdir(eventsDirectory, { withFileTypes: true }).catch(() => []);
+    const limit = Math.min(options.limit ?? 5, 50);
+    const dedupe = new Map<string, CapturedTurn>();
+    const sortedFiles = entries
+      .filter((entry) => entry.isFile() && /^\d{4}-\d{2}-\d{2}\.jsonl$/u.test(entry.name))
+      .sort((left, right) => right.name.localeCompare(left.name));
+    for (const entry of sortedFiles) {
+      const fileEvents = await readEventFile(join(eventsDirectory, entry.name));
+      for (const event of fileEvents) {
+        if (event.threadUrl !== options.threadUrl) {
+          continue;
+        }
+        for (const turn of event.turns) {
+          if (options.role !== undefined && turn.role !== options.role) {
+            continue;
+          }
+          const key = `${String(turn.ordinal)}::${turn.role}`;
+          const existing = dedupe.get(key);
+          if (existing === undefined || existing.capturedAt < turn.capturedAt) {
+            dedupe.set(key, turn);
+          }
+        }
+      }
+      if (dedupe.size >= limit * 4) {
+        break;
+      }
+    }
+
+    return {
+      data: Array.from(dedupe.values())
+        .sort((left, right) => right.capturedAt.localeCompare(left.capturedAt))
         .slice(0, limit),
     };
   }

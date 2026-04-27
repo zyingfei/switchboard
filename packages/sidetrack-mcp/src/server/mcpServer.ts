@@ -275,5 +275,29 @@ export const createSidetrackMcpServer = (reader: LiveVaultReader): McpServer => 
     },
   );
 
+  server.registerTool(
+    'bac.turns',
+    {
+      description:
+        'Return the most-recent captured assistant/user turns for a thread, by threadUrl, deduped by ordinal.',
+      inputSchema: {
+        threadUrl: z.url(),
+        limit: z.number().int().positive().max(50).optional(),
+        role: z.enum(['user', 'assistant', 'system', 'unknown']).optional(),
+      },
+    },
+    async ({ threadUrl, limit, role }) => {
+      const result = await reader.readTurns({
+        threadUrl,
+        ...(limit === undefined ? {} : { limit }),
+        ...(role === undefined ? {} : { role }),
+      });
+      return asStructuredContent({
+        data: result.data,
+        ...(result.cursor === undefined ? {} : { cursor: result.cursor }),
+      });
+    },
+  );
+
   return server;
 };
