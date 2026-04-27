@@ -55,6 +55,23 @@ const snapshotFromTab = (tab: chrome.tabs.Tab, capturedAt: string) => {
 const idempotencyKey = (prefix: string, value: string): string =>
   `${prefix}-${value.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 160)}`;
 
+const hostFromUrl = (url: string): string => {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return 'current tab';
+  }
+};
+
+const notifyCaptureSuccess = async (event: CaptureEvent): Promise<void> => {
+  await chrome.runtime
+    .sendMessage({
+      type: messageTypes.captureFeedback,
+      host: hostFromUrl(event.threadUrl),
+    })
+    .catch(() => undefined);
+};
+
 const sendToCompanion = async (
   event: CaptureEvent,
 ): Promise<{ readonly bac_id: string; readonly revision: string }> => {
@@ -373,7 +390,11 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
   }
 
   if (request.type === messageTypes.autoCapture) {
-    return await withCompanionStatus(() => storeCaptureEvent(request.capture));
+    const response = await withCompanionStatus(() => storeCaptureEvent(request.capture));
+    if (response.ok) {
+      void notifyCaptureSuccess(request.capture);
+    }
+    return response;
   }
 
   if (request.type === messageTypes.getWorkboardState) {

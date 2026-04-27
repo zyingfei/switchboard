@@ -1314,6 +1314,11 @@ button:disabled {
   color: var(--signal);
   border-color: var(--signal-tint);
 }
+.sys-green {
+  background: var(--green-bg);
+  color: var(--green);
+  border-color: var(--green-tint);
+}
 .sys-title {
   flex: 1;
 }
@@ -1459,6 +1464,11 @@ button:disabled {
   color: var(--signal);
   text-decoration: underline;
   cursor: pointer;
+  justify-self: flex-start;
+  min-height: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
 }
 .wizard-card-row {
   display: grid;

@@ -1,6 +1,5 @@
 import { useState } from 'react';
 import { Modal } from './Modal';
-import { Icons } from './icons';
 
 export type WizardStep = 'welcome' | 'companion' | 'vault' | 'providers' | 'done';
 
@@ -15,19 +14,27 @@ const STEP_LABEL: Record<WizardStep, string> = {
 };
 
 export interface WizardProps {
+  readonly bridgeKey?: string;
   readonly companionReachable?: boolean;
   readonly localRestApiDetected?: boolean;
   readonly onClose: () => void;
-  readonly onPickVault: () => void;
   readonly onFinish: () => void;
+  readonly onBridgeKeyChange?: (bridgeKey: string) => void;
+  readonly onSkip?: () => void;
+  readonly onVaultPathChange?: (vaultPath: string) => void;
+  readonly vaultPath?: string;
 }
 
 export function Wizard({
+  bridgeKey = '',
   companionReachable = false,
   localRestApiDetected = false,
   onClose,
-  onPickVault,
   onFinish,
+  onBridgeKeyChange,
+  onSkip,
+  onVaultPathChange,
+  vaultPath = '',
 }: WizardProps) {
   const [stepIndex, setStepIndex] = useState(0);
   const step = STEP_ORDER[stepIndex] ?? 'welcome';
@@ -62,7 +69,7 @@ export function Wizard({
         </button>
       ) : (
         <button type="button" className="btn btn-primary" onClick={onFinish}>
-          Open Sidetrack
+          Done
         </button>
       )}
     </>
@@ -76,10 +83,21 @@ export function Wizard({
       onClose={onClose}
       footer={footer}
     >
-      {step === 'welcome' ? <WelcomeStep /> : null}
-      {step === 'companion' ? <CompanionStep companionReachable={companionReachable} /> : null}
+      {step === 'welcome' ? <WelcomeStep onSkip={onSkip} /> : null}
+      {step === 'companion' ? (
+        <CompanionStep
+          bridgeKey={bridgeKey}
+          companionReachable={companionReachable}
+          onBridgeKeyChange={onBridgeKeyChange}
+          vaultPath={vaultPath}
+        />
+      ) : null}
       {step === 'vault' ? (
-        <VaultStep onPick={onPickVault} localRestApiDetected={localRestApiDetected} />
+        <VaultStep
+          localRestApiDetected={localRestApiDetected}
+          onVaultPathChange={onVaultPathChange}
+          vaultPath={vaultPath}
+        />
       ) : null}
       {step === 'providers' ? <ProvidersStep /> : null}
       {step === 'done' ? <DoneStep /> : null}
@@ -87,7 +105,7 @@ export function Wizard({
   );
 }
 
-function WelcomeStep() {
+function WelcomeStep({ onSkip }: { readonly onSkip?: () => void }) {
   return (
     <div className="wizard-step">
       <div className="wizard-display">Track your AI work without losing the thread.</div>
@@ -95,33 +113,57 @@ function WelcomeStep() {
         Sidetrack watches your AI tabs, recovers what you lost, and lets you hand context to other
         models — without copy-paste fatigue.
       </div>
-      <a className="wizard-skip mono">skip the tour →</a>
+      <button type="button" className="wizard-skip mono" onClick={onSkip}>
+        Skip — I've already set this up
+      </button>
     </div>
   );
 }
 
-function CompanionStep({ companionReachable }: { readonly companionReachable: boolean }) {
+function CompanionStep({
+  bridgeKey,
+  companionReachable,
+  onBridgeKeyChange,
+  vaultPath,
+}: {
+  readonly bridgeKey: string;
+  readonly companionReachable: boolean;
+  readonly onBridgeKeyChange?: (bridgeKey: string) => void;
+  readonly vaultPath: string;
+}) {
+  const commandPath = vaultPath.trim() || 'path';
+  const bridgeKeyPath = `${commandPath.replace(/\/$/, '')}/_BAC/.config/bridge.key`;
+
   return (
     <div className="wizard-step">
       <div className="wizard-lede ai-italic">
-        Pick how the companion connects. Without it, captures pause when Chrome is idle.
+        Start the companion, then paste the bridge key it creates for this vault.
       </div>
       <div className="wizard-card-row single">
         <div className="wizard-card primary">
           <div className="wizard-card-tag mono">DEFAULT · ADR-0001</div>
           <div className="wizard-card-title">HTTP loopback</div>
-          <code className="wizard-card-cmd mono">
-            npx @sidetrack/companion --vault &lt;path&gt;
-          </code>
+          <code className="wizard-card-cmd mono">npx @sidetrack/companion --vault {commandPath}</code>
           <div className="wizard-card-meta mono">
-            port-based · no installer · lives independent of Chrome
+            Bridge key file: {bridgeKeyPath}
           </div>
         </div>
       </div>
+      <label>
+        Bridge key
+        <input
+          onChange={(event) => {
+            onBridgeKeyChange?.(event.target.value);
+          }}
+          placeholder="Paste the bridge key from the vault"
+          type="password"
+          value={bridgeKey}
+        />
+      </label>
       <div className={'wizard-status ' + (companionReachable ? 'green' : 'amber')}>
         <span className={'dot ' + (companionReachable ? 'green' : 'amber')} />
         <span className="mono">
-          {companionReachable ? 'Companion reachable on :7331' : 'Waiting for companion…'}
+          {companionReachable ? 'Companion reachable' : 'Waiting for companion...'}
         </span>
       </div>
       <div className="wizard-footnote mono">
@@ -135,20 +177,32 @@ function CompanionStep({ companionReachable }: { readonly companionReachable: bo
 }
 
 function VaultStep({
-  onPick,
   localRestApiDetected,
+  onVaultPathChange,
+  vaultPath,
 }: {
-  readonly onPick: () => void;
   readonly localRestApiDetected: boolean;
+  readonly onVaultPathChange?: (vaultPath: string) => void;
+  readonly vaultPath: string;
 }) {
   return (
     <div className="wizard-step">
-      <div className="wizard-lede ai-italic">Pick the folder where Sidetrack writes its vault.</div>
-      <button type="button" className="wizard-folder-pick" onClick={onPick}>
-        <span className="icon-12">{Icons.folder}</span>
-        Choose folder…
-      </button>
-      <div className="wizard-folder-current mono">~/Documents/Sidetrack-vault</div>
+      <div className="wizard-lede ai-italic">
+        Type the folder path Sidetrack should use for its local vault.
+      </div>
+      <label>
+        Vault path
+        <input
+          onChange={(event) => {
+            onVaultPathChange?.(event.target.value);
+          }}
+          placeholder="/Users/you/Documents/Sidetrack-vault"
+          value={vaultPath}
+        />
+      </label>
+      <div className="wizard-folder-current mono">
+        Use this same path in the companion command.
+      </div>
       <div className={'wizard-status ' + (localRestApiDetected ? 'green' : 'neutral')}>
         <span className={'dot ' + (localRestApiDetected ? 'green' : '')} />
         <span className="mono">

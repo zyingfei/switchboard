@@ -10,6 +10,9 @@ import {
 } from '../../src/workboard';
 
 const NOW = '2026-04-26T21:40:00.000Z';
+const SETUP_COMPLETED_KEY = 'sidetrack:setupCompleted';
+
+type StorageQuery = string | readonly string[] | Record<string, unknown> | null | undefined;
 
 const liveState = (): WorkboardState =>
   createEmptyWorkboardState({
@@ -100,7 +103,10 @@ const liveState = (): WorkboardState =>
     ],
   });
 
-const installChromeMock = (state: WorkboardState) => {
+const installChromeMock = (
+  state: WorkboardState,
+  storageValues: Record<string, unknown> = {},
+) => {
   const sendMessage = vi.fn((request: WorkboardRequest) =>
     Promise.resolve({
       ok: true,
@@ -108,7 +114,39 @@ const installChromeMock = (state: WorkboardState) => {
       request,
     }),
   );
-  vi.stubGlobal('chrome', { runtime: { sendMessage } });
+  const localValues: Record<string, unknown> = { ...storageValues };
+  const get = vi.fn((query: StorageQuery): Promise<Record<string, unknown>> => {
+    if (typeof query === 'string') {
+      return Promise.resolve({ [query]: localValues[query] });
+    }
+    if (Array.isArray(query)) {
+      return Promise.resolve(
+        Object.fromEntries(query.map((key) => [key, localValues[key]])),
+      );
+    }
+    if (query !== null && query !== undefined) {
+      return Promise.resolve(
+        Object.fromEntries(
+          Object.entries(query).map(([key, fallback]) => [
+            key,
+            localValues[key] ?? fallback,
+          ]),
+        ),
+      );
+    }
+    return Promise.resolve({ ...localValues });
+  });
+  const set = vi.fn((values: Record<string, unknown>): Promise<void> => {
+    Object.assign(localValues, values);
+    return Promise.resolve();
+  });
+  vi.stubGlobal('chrome', {
+    runtime: {
+      sendMessage,
+      onMessage: { addListener: vi.fn(), removeListener: vi.fn() },
+    },
+    storage: { local: { get, set } },
+  });
   return sendMessage;
 };
 
@@ -117,6 +155,51 @@ afterEach(() => {
 });
 
 describe('live side-panel App wiring', () => {
+  it('renders Wizard on first launch when setup is incomplete and bridge key is empty', async () => {
+    installChromeMock(createEmptyWorkboardState());
+
+    render(<App />);
+
+    expect(await screen.findByText('Set up Sidetrack')).toBeInTheDocument();
+    expect(screen.getByText("Skip — I've already set this up")).toBeInTheDocument();
+  });
+
+  it('renders Workboard when setupCompleted flag is true', async () => {
+    const sendMessage = installChromeMock(createEmptyWorkboardState(), {
+      [SETUP_COMPLETED_KEY]: true,
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(sendMessage).toHaveBeenCalledWith({ type: messageTypes.getWorkboardState });
+    });
+    expect(screen.queryByText('Set up Sidetrack')).not.toBeInTheDocument();
+    expect(screen.getByRole('main', { name: 'Sidetrack workboard' })).toBeInTheDocument();
+  });
+
+  it('renders Workboard when bridge key exists without setupCompleted flag', async () => {
+    const sendMessage = installChromeMock(liveState());
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(sendMessage).toHaveBeenCalledWith({ type: messageTypes.getWorkboardState });
+    });
+    expect((await screen.findAllByText('Side-panel state machine review')).length).toBeGreaterThan(
+      0,
+    );
+    expect(screen.queryByText('Set up Sidetrack')).not.toBeInTheDocument();
+  });
+
+  it('renders disconnected SystemBanners state when bridge key is empty', async () => {
+    installChromeMock(createEmptyWorkboardState(), { [SETUP_COMPLETED_KEY]: true });
+
+    render(<App />);
+
+    expect(await screen.findByText(/Companion: disconnected/)).toBeInTheDocument();
+  });
+
   it('renders live state through M1 skeleton components and updates reminders', async () => {
     const sendMessage = installChromeMock(liveState());
 
