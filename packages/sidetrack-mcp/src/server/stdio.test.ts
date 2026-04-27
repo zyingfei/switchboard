@@ -9,7 +9,9 @@ import { describe, expect, it } from 'vitest';
 import { m1ReadToolNames } from '../capabilities.js';
 
 const packageRoot = fileURLToPath(new URL('../..', import.meta.url));
-const tsxCliPath = fileURLToPath(new URL('../../node_modules/tsx/dist/cli.mjs', import.meta.url));
+const tsxImportPath = fileURLToPath(
+  new URL('../../node_modules/tsx/dist/esm/index.mjs', import.meta.url),
+);
 const serverCliPath = fileURLToPath(new URL('../cli.ts', import.meta.url));
 
 const createVaultFixture = async (): Promise<string> => {
@@ -68,7 +70,7 @@ describe('sidetrack MCP stdio server', () => {
     const vaultPath = await createVaultFixture();
     const transport = new StdioClientTransport({
       command: process.execPath,
-      args: [tsxCliPath, serverCliPath, '--vault', vaultPath],
+      args: ['--import', tsxImportPath, serverCliPath, '--vault', vaultPath],
       cwd: packageRoot,
       stderr: 'pipe',
     });

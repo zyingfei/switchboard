@@ -6,6 +6,7 @@ export const m1ReadToolNames = [
   'bac.queued_items',
   'bac.inbound_reminders',
   'bac.coding_sessions',
+  'bac.dispatches',
 ] as const;
 
 export type M1ReadToolName = (typeof m1ReadToolNames)[number];
