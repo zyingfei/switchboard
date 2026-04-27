@@ -41,6 +41,7 @@ import { createDispatchClient } from '../../src/dispatch/client';
 import {
   type DispatchEventRecord,
   type DispatchMode,
+  dispatchKindToUiPacketKind,
   mapUiPacketKind,
   mapUiTarget,
 } from '../../src/dispatch/types';
@@ -619,6 +620,8 @@ const App = () => {
 
   const handleSettingsSave = (next: {
     readonly autoSendOptIn: SettingsValue['autoSendOptIn'];
+    readonly defaultPacketKind: SettingsValue['defaultPacketKind'];
+    readonly defaultDispatchTarget: SettingsValue['defaultDispatchTarget'];
     readonly screenShareSafeMode: boolean;
   }) => {
     if (settings === null || bridgeKey.length === 0) {
@@ -637,6 +640,8 @@ const App = () => {
       .patch({
         revision: settings.revision,
         autoSendOptIn: next.autoSendOptIn,
+        defaultPacketKind: next.defaultPacketKind,
+        defaultDispatchTarget: next.defaultDispatchTarget,
         screenShareSafeMode: next.screenShareSafeMode,
       })
       .then((updated) => {
@@ -1327,6 +1332,9 @@ const App = () => {
         <PacketComposer
           defaultTitle={composeThread.title}
           defaultBody={`# ${composeThread.title}\n\n## Source thread\n${providerLabel(composeThread.provider)} · ${composeThread.threadUrl}\n\n## Context\n…\n\n## Ask\n…`}
+          {...(settings !== null
+            ? { defaultKind: dispatchKindToUiPacketKind(settings.defaultPacketKind) }
+            : {})}
           scope={{
             label: composeThread.title,
             meta: `${providerLabel(composeThread.provider)} · ${formatRelative(composeThread.lastSeenAt)}`,
@@ -1502,6 +1510,8 @@ const App = () => {
               ? null
               : {
                   autoSendOptIn: settings.autoSendOptIn,
+                  defaultPacketKind: settings.defaultPacketKind,
+                  defaultDispatchTarget: settings.defaultDispatchTarget,
                   screenShareSafeMode: settings.screenShareSafeMode,
                   revision: settings.revision,
                 }

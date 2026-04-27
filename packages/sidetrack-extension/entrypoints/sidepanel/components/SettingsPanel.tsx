@@ -1,12 +1,24 @@
 import { useState } from 'react';
 import { Modal } from './Modal';
 
+export type SettingsPacketKind = 'research' | 'review' | 'coding' | 'note' | 'other';
+export type SettingsTargetProvider =
+  | 'chatgpt'
+  | 'claude'
+  | 'gemini'
+  | 'codex'
+  | 'claude_code'
+  | 'cursor'
+  | 'other';
+
 export interface SettingsValue {
   readonly autoSendOptIn: {
     readonly chatgpt: boolean;
     readonly claude: boolean;
     readonly gemini: boolean;
   };
+  readonly defaultPacketKind: SettingsPacketKind;
+  readonly defaultDispatchTarget: SettingsTargetProvider;
   readonly screenShareSafeMode: boolean;
   readonly revision: string;
 }
@@ -18,6 +30,8 @@ export interface SettingsPanelProps {
   readonly onClose: () => void;
   readonly onSave: (next: {
     readonly autoSendOptIn: SettingsValue['autoSendOptIn'];
+    readonly defaultPacketKind: SettingsPacketKind;
+    readonly defaultDispatchTarget: SettingsTargetProvider;
     readonly screenShareSafeMode: boolean;
   }) => void;
 }
@@ -28,20 +42,48 @@ const PROVIDER_LABELS: Record<keyof SettingsValue['autoSendOptIn'], string> = {
   gemini: 'Gemini',
 };
 
+const PACKET_KIND_LABELS: Record<SettingsPacketKind, string> = {
+  research: 'Research',
+  review: 'Review',
+  coding: 'Coding',
+  note: 'Note',
+  other: 'Other',
+};
+
+const TARGET_LABELS: Record<SettingsTargetProvider, string> = {
+  chatgpt: 'ChatGPT',
+  claude: 'Claude',
+  gemini: 'Gemini',
+  codex: 'Codex CLI',
+  claude_code: 'Claude Code',
+  cursor: 'Cursor',
+  other: 'Other',
+};
+
 export function SettingsPanel({ settings, busy, error, onClose, onSave }: SettingsPanelProps) {
-  const initial = settings ?? {
+  const initial: SettingsValue = settings ?? {
     autoSendOptIn: { chatgpt: false, claude: false, gemini: false },
+    defaultPacketKind: 'research',
+    defaultDispatchTarget: 'claude',
     screenShareSafeMode: false,
     revision: '0',
   };
   const [draftAutoSend, setDraftAutoSend] = useState(initial.autoSendOptIn);
   const [draftScreenShareSafe, setDraftScreenShareSafe] = useState(initial.screenShareSafeMode);
+  const [draftPacketKind, setDraftPacketKind] = useState<SettingsPacketKind>(
+    initial.defaultPacketKind,
+  );
+  const [draftTarget, setDraftTarget] = useState<SettingsTargetProvider>(
+    initial.defaultDispatchTarget,
+  );
 
   const dirty =
     draftAutoSend.chatgpt !== initial.autoSendOptIn.chatgpt ||
     draftAutoSend.claude !== initial.autoSendOptIn.claude ||
     draftAutoSend.gemini !== initial.autoSendOptIn.gemini ||
-    draftScreenShareSafe !== initial.screenShareSafeMode;
+    draftScreenShareSafe !== initial.screenShareSafeMode ||
+    draftPacketKind !== initial.defaultPacketKind ||
+    draftTarget !== initial.defaultDispatchTarget;
 
   const handleToggleProvider = (provider: keyof SettingsValue['autoSendOptIn']) => {
     setDraftAutoSend({ ...draftAutoSend, [provider]: !draftAutoSend[provider] });
@@ -51,7 +93,12 @@ export function SettingsPanel({ settings, busy, error, onClose, onSave }: Settin
     if (!dirty || busy) {
       return;
     }
-    onSave({ autoSendOptIn: draftAutoSend, screenShareSafeMode: draftScreenShareSafe });
+    onSave({
+      autoSendOptIn: draftAutoSend,
+      defaultPacketKind: draftPacketKind,
+      defaultDispatchTarget: draftTarget,
+      screenShareSafeMode: draftScreenShareSafe,
+    });
   };
 
   const footer = (
@@ -100,6 +147,46 @@ export function SettingsPanel({ settings, busy, error, onClose, onSave }: Settin
             </label>
           ),
         )}
+      </div>
+
+      <div className="settings-section">
+        <h3 className="settings-section-title">Composer defaults</h3>
+        <p className="settings-section-lede ai-italic">
+          Pre-fill the packet kind and target when you open Send to… on a thread. You can still
+          change them per packet.
+        </p>
+        <label className="settings-select-row">
+          <span>Default packet kind</span>
+          <select
+            disabled={busy}
+            value={draftPacketKind}
+            onChange={(event) => {
+              setDraftPacketKind(event.target.value as SettingsPacketKind);
+            }}
+          >
+            {(Object.keys(PACKET_KIND_LABELS) as readonly SettingsPacketKind[]).map((kind) => (
+              <option key={kind} value={kind}>
+                {PACKET_KIND_LABELS[kind]}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="settings-select-row">
+          <span>Default dispatch target</span>
+          <select
+            disabled={busy}
+            value={draftTarget}
+            onChange={(event) => {
+              setDraftTarget(event.target.value as SettingsTargetProvider);
+            }}
+          >
+            {(Object.keys(TARGET_LABELS) as readonly SettingsTargetProvider[]).map((target) => (
+              <option key={target} value={target}>
+                {TARGET_LABELS[target]}
+              </option>
+            ))}
+          </select>
+        </label>
       </div>
 
       <div className="settings-section">
