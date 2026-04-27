@@ -19,16 +19,72 @@ import {
   type WorkboardRequest,
 } from '../../src/messages';
 import {
+  type ComposedPacket,
+  DispatchConfirm,
   InboundCard,
   MoveToPicker,
+  PacketComposer,
+  RecentDispatches,
   SystemBannersStack,
   TabRecovery,
   Wizard,
+  type DispatchEvent as LegacyDispatchEvent,
   type InboundReminder as InboundCardReminder,
   type RestoreStrategy,
   type WorkstreamOption,
 } from './components';
+import { createDispatchClient } from '../../src/dispatch/client';
+import {
+  type DispatchEventRecord,
+  mapUiPacketKind,
+  mapUiTarget,
+} from '../../src/dispatch/types';
 import './style.css';
+
+const TARGET_PROVIDER_LABEL: Record<string, string> = {
+  chatgpt: 'ChatGPT',
+  claude: 'Claude',
+  gemini: 'Gemini',
+  codex: 'Codex',
+  claude_code: 'Claude Code',
+  cursor: 'Cursor',
+  other: 'Other',
+};
+
+const dispatchKindToLegacyKind = (
+  kind: DispatchEventRecord['kind'],
+): LegacyDispatchEvent['dispatchKind'] => {
+  switch (kind) {
+    case 'research':
+      return 'research_packet';
+    case 'coding':
+      return 'coding_agent_packet';
+    case 'review':
+      return 'submit_back';
+    case 'note':
+    case 'other':
+      return 'dispatch_out';
+  }
+};
+
+const dispatchStatusToLegacyStatus = (
+  status: DispatchEventRecord['status'],
+): LegacyDispatchEvent['status'] => {
+  if (status === 'replied' || status === 'noted' || status === 'pending') {
+    return status;
+  }
+  return 'sent';
+};
+
+const recordToLegacyEvent = (record: DispatchEventRecord): LegacyDispatchEvent => ({
+  bac_id: record.bac_id,
+  sourceTitle: record.title,
+  targetProviderLabel: TARGET_PROVIDER_LABEL[record.target.provider] ?? record.target.provider,
+  targetThreadTitle: 'new chat',
+  dispatchKind: dispatchKindToLegacyKind(record.kind),
+  dispatchedAt: record.createdAt,
+  status: dispatchStatusToLegacyStatus(record.status),
+});
 
 const sendRequest = async (request: WorkboardRequest): Promise<WorkboardState> => {
   const response = (await chrome.runtime.sendMessage(request)) as unknown;
@@ -204,6 +260,10 @@ const App = () => {
   const [selectedThread, setSelectedThread] = useState('');
   const [moveThreadId, setMoveThreadId] = useState<string | null>(null);
   const [recoveryThreadId, setRecoveryThreadId] = useState<string | null>(null);
+  const [composeThreadId, setComposeThreadId] = useState<string | null>(null);
+  const [pendingDispatch, setPendingDispatch] = useState<ComposedPacket | null>(null);
+  const [recentDispatches, setRecentDispatches] = useState<readonly DispatchEventRecord[]>([]);
+  const [dispatchInFlight, setDispatchInFlight] = useState(false);
   const [setupCompleted, setSetupCompleted] = useState<boolean | null>(null);
   const [stateLoaded, setStateLoaded] = useState(false);
   const [vaultPath, setVaultPath] = useState(DEFAULT_VAULT_PATH);
@@ -232,6 +292,22 @@ const App = () => {
   const recoveryThread = useMemo(
     () => threads.find((thread) => thread.bac_id === recoveryThreadId),
     [recoveryThreadId, threads],
+  );
+  const composeThread = useMemo(
+    () => threads.find((thread) => thread.bac_id === composeThreadId),
+    [composeThreadId, threads],
+  );
+  const composeWorkstream = useMemo(() => {
+    if (composeThread === undefined) {
+      return undefined;
+    }
+    return state.workstreams.find(
+      (workstream) => workstream.bac_id === composeThread.primaryWorkstreamId,
+    );
+  }, [composeThread, state.workstreams]);
+  const recentDispatchEvents = useMemo<readonly LegacyDispatchEvent[]>(
+    () => recentDispatches.map(recordToLegacyEvent),
+    [recentDispatches],
   );
 
   const refresh = async () => {
@@ -289,6 +365,33 @@ const App = () => {
       window.clearTimeout(timeoutId);
     };
   }, [captureToastHost]);
+
+  useEffect(() => {
+    if (state.companionStatus !== 'connected' || bridgeKey.length === 0) {
+      return undefined;
+    }
+    const portNumber = Number(port);
+    if (!Number.isFinite(portNumber) || portNumber <= 0) {
+      return undefined;
+    }
+    let cancelled = false;
+    const client = createDispatchClient({ port: portNumber, bridgeKey });
+    client
+      .listRecent({ limit: 10 })
+      .then((list) => {
+        if (!cancelled) {
+          setRecentDispatches(list);
+        }
+      })
+      .catch(() => {
+        // Companion may not yet have the dispatches endpoint or the vault is
+        // unreachable — surface nothing here; SystemBanners shows the broader
+        // companion/vault state already.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [state.companionStatus, bridgeKey, port]);
 
   const runAction = async (action: () => Promise<WorkboardState>) => {
     setBusy(true);
@@ -403,6 +506,65 @@ const App = () => {
         trackingMode,
       }),
     );
+  };
+
+  const handlePacketDispatch = (packet: ComposedPacket) => {
+    setPendingDispatch(packet);
+    setComposeThreadId(null);
+  };
+
+  const handlePacketSave = (packet: ComposedPacket) => {
+    // Save-to-vault routes through the same companion endpoint with status:'noted'.
+    setPendingDispatch({ ...packet });
+    setComposeThreadId(null);
+  };
+
+  const handlePacketCopy = (packet: ComposedPacket) => {
+    void navigator.clipboard
+      .writeText(packet.body)
+      .catch(() => {
+        // Clipboard rejected (permissions, focus); fall through silently.
+      });
+    setComposeThreadId(null);
+  };
+
+  const submitPendingDispatch = async () => {
+    if (pendingDispatch === null || bridgeKey.length === 0) {
+      return;
+    }
+    const portNumber = Number(port);
+    if (!Number.isFinite(portNumber) || portNumber <= 0) {
+      setError('Invalid companion port.');
+      return;
+    }
+    setDispatchInFlight(true);
+    setError(null);
+    try {
+      const client = createDispatchClient({ port: portNumber, bridgeKey });
+      const idempotencyKey = `disp_ui_${String(Date.now())}_${Math.random().toString(36).slice(2, 10)}`;
+      await client.submit(
+        {
+          kind: mapUiPacketKind(pendingDispatch.kind),
+          target: { provider: mapUiTarget(pendingDispatch.target), mode: 'paste' },
+          title: pendingDispatch.title,
+          body: pendingDispatch.body,
+          ...(pendingDispatch.sourceThreadId !== undefined
+            ? { sourceThreadId: pendingDispatch.sourceThreadId }
+            : {}),
+          ...(pendingDispatch.workstreamId !== undefined
+            ? { workstreamId: pendingDispatch.workstreamId }
+            : {}),
+        },
+        idempotencyKey,
+      );
+      const refreshed = await client.listRecent({ limit: 10 });
+      setRecentDispatches(refreshed);
+      setPendingDispatch(null);
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : 'Dispatch failed.');
+    } finally {
+      setDispatchInFlight(false);
+    }
   };
 
   const queueFollowUp = (event: SyntheticEvent<HTMLFormElement>) => {
@@ -687,6 +849,18 @@ const App = () => {
                           <div className="thread-actions">
                             <button
                               className="btn-link"
+                              disabled={
+                                state.companionStatus !== 'connected' || bridgeKey.length === 0
+                              }
+                              onClick={() => {
+                                setComposeThreadId(thread.bac_id);
+                              }}
+                              type="button"
+                            >
+                              Send to…
+                            </button>
+                            <button
+                              className="btn-link"
                               onClick={() => {
                                 setMoveThreadId(thread.bac_id);
                               }}
@@ -808,6 +982,15 @@ const App = () => {
           );
         })}
       </section>
+
+      {recentDispatchEvents.length > 0 ? (
+        <section className="recent-dispatches-section" aria-label="Recent dispatches">
+          <header className="section-head">
+            <h2>Recent dispatches</h2>
+          </header>
+          <RecentDispatches dispatches={recentDispatchEvents} />
+        </section>
+      ) : null}
 
       <section className="detail-panel">
         <div>
@@ -977,6 +1160,55 @@ const App = () => {
           }}
           onMove={handleMoveTarget}
           workstreams={workstreamOptions}
+        />
+      ) : null}
+
+      {composeThread ? (
+        <PacketComposer
+          defaultTitle={composeThread.title}
+          defaultBody={`# ${composeThread.title}\n\n## Source thread\n${providerLabel(composeThread.provider)} · ${composeThread.threadUrl}\n\n## Context\n…\n\n## Ask\n…`}
+          scope={{
+            label: composeThread.title,
+            meta: `${providerLabel(composeThread.provider)} · ${formatRelative(composeThread.lastSeenAt)}`,
+            sourceThreadId: composeThread.bac_id,
+            ...(composeWorkstream !== undefined ? { workstreamId: composeWorkstream.bac_id } : {}),
+          }}
+          onCancel={() => {
+            setComposeThreadId(null);
+          }}
+          onCopy={handlePacketCopy}
+          onSave={handlePacketSave}
+          onDispatch={handlePacketDispatch}
+        />
+      ) : null}
+
+      {pendingDispatch ? (
+        <DispatchConfirm
+          target={
+            TARGET_PROVIDER_LABEL[mapUiTarget(pendingDispatch.target)] ??
+            mapUiTarget(pendingDispatch.target)
+          }
+          tokenEstimate={pendingDispatch.tokenEstimate}
+          redactedCount={pendingDispatch.redactedItems.reduce((sum, r) => sum + r.count, 0)}
+          {...(pendingDispatch.redactedItems.length > 0
+            ? {
+                redactedKinds: pendingDispatch.redactedItems.map(
+                  (r) => `${String(r.count)} ${r.kind}`,
+                ),
+              }
+            : {})}
+          onCancel={() => {
+            setPendingDispatch(null);
+          }}
+          onEdit={() => {
+            setComposeThreadId(pendingDispatch.sourceThreadId ?? composeThreadId);
+            setPendingDispatch(null);
+          }}
+          onConfirm={() => {
+            if (!dispatchInFlight) {
+              void submitPendingDispatch();
+            }
+          }}
         />
       ) : null}
 
