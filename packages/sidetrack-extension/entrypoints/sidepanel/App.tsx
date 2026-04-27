@@ -173,6 +173,12 @@ const writeCodingSession = async (session: StoredCodingSession): Promise<void> =
   const list = Array.isArray(existing) ? (existing as StoredCodingSession[]) : [];
   await chrome.storage.local.set({ [CODING_SESSIONS_KEY]: [session, ...list].slice(0, 50) });
 };
+
+const readCodingSessions = async (): Promise<readonly StoredCodingSession[]> => {
+  const result = await chrome.storage.local.get({ [CODING_SESSIONS_KEY]: [] });
+  const list = result[CODING_SESSIONS_KEY];
+  return Array.isArray(list) ? (list as StoredCodingSession[]) : [];
+};
 const DEFAULT_VAULT_PATH = '~/Documents/Sidetrack-vault';
 
 const readSetupCompleted = async (): Promise<boolean> => {
@@ -301,6 +307,7 @@ const App = () => {
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [codingAttachOpen, setCodingAttachOpen] = useState(false);
+  const [codingSessions, setCodingSessions] = useState<readonly StoredCodingSession[]>([]);
   const [setupCompleted, setSetupCompleted] = useState<boolean | null>(null);
   const [stateLoaded, setStateLoaded] = useState(false);
   const [vaultPath, setVaultPath] = useState(DEFAULT_VAULT_PATH);
@@ -433,6 +440,22 @@ const App = () => {
       cancelled = true;
     };
   }, [state.companionStatus, bridgeKey, port]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void readCodingSessions()
+      .then((list) => {
+        if (!cancelled) {
+          setCodingSessions(list);
+        }
+      })
+      .catch(() => {
+        // chrome.storage unavailable in test/dev — leave the list empty.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [codingAttachOpen]);
 
   useEffect(() => {
     if (state.companionStatus !== 'connected' || bridgeKey.length === 0) {
@@ -1184,6 +1207,39 @@ const App = () => {
             <h2>Recent dispatches</h2>
           </header>
           <RecentDispatches dispatches={recentDispatchEvents} />
+        </section>
+      ) : null}
+
+      {codingSessions.length > 0 ? (
+        <section className="coding-sessions-section" aria-label="Coding sessions">
+          <header className="section-head">
+            <h2>Coding sessions</h2>
+          </header>
+          <div className="coding-sessions-list">
+            {codingSessions.slice(0, 5).map((session) => (
+              <div key={session.sessionId + ':' + session.attachedAt} className="coding-session-row">
+                <div className="coding-session-meta">
+                  <strong>{session.name || session.sessionId}</strong>
+                  <span className="mono subtle">
+                    {session.tool} · {workstreamPath(session.workstreamId, state.workstreams)} ·{' '}
+                    {formatRelative(session.attachedAt)}
+                  </span>
+                  <code className="mono coding-session-cmd">{session.resumeCommand}</code>
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  onClick={() => {
+                    void navigator.clipboard.writeText(session.resumeCommand).catch(() => {
+                      // Clipboard rejected (permissions, focus); silently ignore.
+                    });
+                  }}
+                >
+                  Copy
+                </button>
+              </div>
+            ))}
+          </div>
         </section>
       ) : null}
 
