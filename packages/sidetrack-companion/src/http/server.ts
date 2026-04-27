@@ -1,13 +1,17 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
 import { bridgeKeysMatch } from '../auth/bridgeKey.js';
-import { createRequestId } from '../domain/ids.js';
+import { createDispatchId, createRequestId } from '../domain/ids.js';
+import { redact } from '../safety/redaction.js';
+import { estimateTokens, tokenBudgetWarningThreshold } from '../safety/tokenBudget.js';
 import type { VaultWriter } from '../vault/writer.js';
 import type { IdempotencyStore } from './idempotency.js';
 import type { ValidationIssue } from './problem.js';
 import { createProblem } from './problem.js';
 import {
   captureEventSchema,
+  dispatchEventSchema,
+  dispatchListQuerySchema,
   queueCreateSchema,
   reminderCreateSchema,
   reminderUpdateSchema,
@@ -211,6 +215,55 @@ const routes: readonly RouteDefinition[] = [
   },
   {
     method: 'POST',
+    pattern: /^\/v1\/dispatches$/,
+    authRequired: true,
+    handle: async (request, requestId, _match, context) => {
+      const idempotencyKey = requireIdempotencyKey(request);
+      return await runIdempotent(context, 'recordDispatch', idempotencyKey, async () => {
+        const input = dispatchEventSchema.parse(await readBody(request));
+        const redaction = redact(input.body);
+        const tokenEstimate = estimateTokens(redaction.output);
+        const result = await context.vaultWriter.writeDispatchEvent(
+          {
+            ...input,
+            bac_id: input.bac_id ?? createDispatchId(),
+            body: redaction.output,
+            createdAt: input.createdAt ?? new Date().toISOString(),
+            redactionSummary: {
+              matched: redaction.matched,
+              categories: [...redaction.categories],
+            },
+            tokenEstimate,
+          },
+          requestId,
+        );
+        return [
+          201,
+          {
+            data: result,
+            ...(tokenEstimate > tokenBudgetWarningThreshold
+              ? { warnings: ['token-budget-exceeded'] }
+              : {}),
+          },
+        ];
+      });
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/dispatches$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+      const query = dispatchListQuerySchema.parse({
+        limit: url.searchParams.get('limit') ?? undefined,
+        since: url.searchParams.get('since') ?? undefined,
+      });
+      return [200, { data: await context.vaultWriter.readDispatchEvents(query) }];
+    },
+  },
+  {
+    method: 'POST',
     pattern: /^\/v1\/events$/,
     authRequired: true,
     handle: async (request, requestId, _match, context) => {
@@ -302,7 +355,7 @@ export const createCompanionHttpServer = (context: CompanionHttpConfig): Server 
     void handleRequest(request, response, context);
   });
 
-const handleRequest = async (
+export const handleRequest = async (
   request: IncomingMessage,
   response: ServerResponse,
   context: CompanionHttpConfig,
