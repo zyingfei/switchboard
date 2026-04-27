@@ -19,6 +19,7 @@ import {
   type WorkboardRequest,
 } from '../../src/messages';
 import {
+  CodingAttach,
   type ComposedPacket,
   DispatchConfirm,
   InboundCard,
@@ -153,6 +154,25 @@ const formatRelative = (isoDate: string): string => {
 const checklistId = (): string => `check_${crypto.randomUUID().replaceAll('-', '_')}`;
 
 const SETUP_COMPLETED_KEY = 'sidetrack:setupCompleted';
+const CODING_SESSIONS_KEY = 'sidetrack:codingSessions';
+
+interface StoredCodingSession {
+  readonly tool: string;
+  readonly cwd: string;
+  readonly branch: string;
+  readonly sessionId: string;
+  readonly name: string;
+  readonly resumeCommand: string;
+  readonly workstreamId: string;
+  readonly attachedAt: string;
+}
+
+const writeCodingSession = async (session: StoredCodingSession): Promise<void> => {
+  const result = await chrome.storage.local.get({ [CODING_SESSIONS_KEY]: [] });
+  const existing = result[CODING_SESSIONS_KEY];
+  const list = Array.isArray(existing) ? (existing as StoredCodingSession[]) : [];
+  await chrome.storage.local.set({ [CODING_SESSIONS_KEY]: [session, ...list].slice(0, 50) });
+};
 const DEFAULT_VAULT_PATH = '~/Documents/Sidetrack-vault';
 
 const readSetupCompleted = async (): Promise<boolean> => {
@@ -280,6 +300,7 @@ const App = () => {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [codingAttachOpen, setCodingAttachOpen] = useState(false);
   const [setupCompleted, setSetupCompleted] = useState<boolean | null>(null);
   const [stateLoaded, setStateLoaded] = useState(false);
   const [vaultPath, setVaultPath] = useState(DEFAULT_VAULT_PATH);
@@ -870,6 +891,15 @@ const App = () => {
           <span className={`status-pill ${state.companionStatus}`}>
             {companionStatusLabel(state.companionStatus)}
           </span>
+          <button
+            className="btn btn-ghost"
+            onClick={() => {
+              setCodingAttachOpen(true);
+            }}
+            type="button"
+          >
+            Coding session
+          </button>
           <button
             className="btn btn-ghost"
             disabled={state.companionStatus !== 'connected' || bridgeKey.length === 0}
@@ -1500,6 +1530,23 @@ const App = () => {
           onVaultPathChange={setVaultPath}
           port={Number.isFinite(Number(port)) && Number(port) > 0 ? Number(port) : 17_373}
           vaultPath={vaultPath}
+        />
+      ) : null}
+
+      {codingAttachOpen ? (
+        <CodingAttach
+          {...(selectedWorkstream !== '' ? { defaultWorkstreamId: selectedWorkstream } : {})}
+          workstreams={workstreamOptions}
+          onCancel={() => {
+            setCodingAttachOpen(false);
+          }}
+          onAttach={(input) => {
+            void writeCodingSession({ ...input, attachedAt: new Date().toISOString() });
+            void navigator.clipboard.writeText(input.resumeCommand).catch(() => {
+              // Clipboard rejected (permissions, focus); resume command is still saved locally.
+            });
+            setCodingAttachOpen(false);
+          }}
         />
       ) : null}
 
