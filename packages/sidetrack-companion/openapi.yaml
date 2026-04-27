@@ -1,0 +1,568 @@
+openapi: 3.1.0
+info:
+  title: Sidetrack Companion API
+  version: 0.1.0
+  description: Localhost-only companion API for Sidetrack M1 vault writes.
+  contact:
+    name: Sidetrack
+    url: https://github.com/zyingfei/switchboard
+servers:
+  - url: http://127.0.0.1:{port}/v1
+    description: Local companion loopback API
+    variables:
+      port:
+        default: '17373'
+security:
+  - bridgeKey: []
+tags:
+  - name: health
+    description: Health and readiness
+  - name: events
+    description: Append-only capture event writes
+  - name: threads
+    description: Tracked thread index writes
+  - name: workstreams
+    description: Workstream tree writes
+  - name: queue
+    description: Queued follow-up writes
+  - name: reminders
+    description: Inbound reminder writes
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      description: Return a minimal unauthenticated liveness signal for the local companion process.
+      tags: [health]
+      security: []
+      responses:
+        '200':
+          description: Companion process is running.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /status:
+    get:
+      operationId: getStatus
+      description: Return authenticated companion and vault readiness details for the extension UI.
+      tags: [health]
+      responses:
+        '200':
+          description: Companion and vault status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /events:
+    post:
+      operationId: appendEvent
+      description: Append a capture event to the canonical vault event log.
+      tags: [events]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CaptureEventRequest'
+      responses:
+        '201':
+          description: Capture event appended.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MutationResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/VaultUnavailable'
+  /threads:
+    post:
+      operationId: upsertThread
+      description: Create or update the per-thread state index in the vault.
+      tags: [threads]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ThreadUpsertRequest'
+      responses:
+        '200':
+          description: Thread index updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MutationResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/VaultUnavailable'
+  /workstreams:
+    post:
+      operationId: createWorkstream
+      description: Create a workstream tree node in the vault.
+      tags: [workstreams]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkstreamCreateRequest'
+      responses:
+        '201':
+          description: Workstream created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MutationResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/VaultUnavailable'
+  /workstreams/{workstreamId}:
+    patch:
+      operationId: updateWorkstream
+      description: Update mutable workstream fields while preserving stable identity.
+      tags: [workstreams]
+      parameters:
+        - name: workstreamId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/BacId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkstreamUpdateRequest'
+      responses:
+        '200':
+          description: Workstream updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MutationResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/VaultUnavailable'
+  /queue:
+    post:
+      operationId: createQueueItem
+      description: Create a queued follow-up ask without dispatching it.
+      tags: [queue]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueueCreateRequest'
+      responses:
+        '201':
+          description: Queue item created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MutationResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/VaultUnavailable'
+  /reminders:
+    post:
+      operationId: createReminder
+      description: Create an inbound reminder for a tracked thread reply.
+      tags: [reminders]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReminderCreateRequest'
+      responses:
+        '201':
+          description: Reminder created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MutationResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/VaultUnavailable'
+components:
+  securitySchemes:
+    bridgeKey:
+      type: apiKey
+      in: header
+      name: x-bac-bridge-key
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 200
+  responses:
+    ValidationError:
+      description: Request validation failed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Bridge key missing or invalid.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: Resource revision conflict.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    VaultUnavailable:
+      description: Vault write failed or vault path is unavailable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    InternalError:
+      description: Internal companion error.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    BacId:
+      type: string
+      minLength: 8
+      maxLength: 64
+      pattern: '^[A-Za-z0-9_-]+$'
+    IsoDateTime:
+      type: string
+      format: date-time
+    ProviderId:
+      type: string
+      enum: [chatgpt, claude, gemini, unknown]
+    Privacy:
+      type: string
+      enum: [private, shared, public]
+    Problem:
+      type: object
+      additionalProperties: true
+      required: [type, title, status, code, correlationId]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+          minimum: 100
+          maximum: 599
+        detail:
+          type: string
+        instance:
+          type: string
+        code:
+          type: string
+        correlationId:
+          type: string
+        errors:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [path, message]
+            properties:
+              path:
+                type: string
+              message:
+                type: string
+    HealthResponse:
+      type: object
+      additionalProperties: false
+      required: [status, requestId]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        requestId:
+          type: string
+    StatusResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [companion, vault, requestId]
+          properties:
+            companion:
+              type: string
+              enum: [running]
+            vault:
+              type: string
+              enum: [connected, unreachable]
+            requestId:
+              type: string
+    MutationResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [bac_id, revision, requestId]
+          properties:
+            bac_id:
+              $ref: '#/components/schemas/BacId'
+            revision:
+              type: string
+            requestId:
+              type: string
+    CapturedTurn:
+      type: object
+      additionalProperties: false
+      required: [role, text, ordinal, capturedAt]
+      properties:
+        role:
+          type: string
+          enum: [user, assistant, system, unknown]
+        text:
+          type: string
+          minLength: 1
+        formattedText:
+          type: string
+          minLength: 1
+        ordinal:
+          type: integer
+          minimum: 0
+        capturedAt:
+          $ref: '#/components/schemas/IsoDateTime'
+        sourceSelector:
+          type: string
+          minLength: 1
+    CaptureWarning:
+      type: object
+      additionalProperties: false
+      required: [code, message, severity]
+      properties:
+        code:
+          type: string
+          enum: [possible_api_key, email, internal_url, long_capture, unsupported_provider]
+        message:
+          type: string
+          minLength: 1
+        severity:
+          type: string
+          enum: [info, warning]
+    TabSnapshot:
+      type: object
+      additionalProperties: false
+      required: [url, title, capturedAt]
+      properties:
+        tabId:
+          type: integer
+        windowId:
+          type: integer
+        url:
+          type: string
+          format: uri
+        title:
+          type: string
+          minLength: 1
+        favIconUrl:
+          type: string
+          format: uri
+        capturedAt:
+          $ref: '#/components/schemas/IsoDateTime'
+    CaptureEventRequest:
+      type: object
+      additionalProperties: false
+      required: [provider, threadUrl, capturedAt, turns]
+      properties:
+        provider:
+          $ref: '#/components/schemas/ProviderId'
+        threadId:
+          type: string
+        threadUrl:
+          type: string
+          format: uri
+        title:
+          type: string
+        capturedAt:
+          $ref: '#/components/schemas/IsoDateTime'
+        selectorCanary:
+          type: string
+          enum: [ok, warning, failed]
+        extractionConfigVersion:
+          type: string
+          minLength: 1
+        visibleTextCharCount:
+          type: integer
+          minimum: 0
+        tabSnapshot:
+          $ref: '#/components/schemas/TabSnapshot'
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaptureWarning'
+        turns:
+          type: array
+          minItems: 0
+          items:
+            $ref: '#/components/schemas/CapturedTurn'
+    ThreadUpsertRequest:
+      type: object
+      additionalProperties: false
+      required: [threadUrl, provider, title, lastSeenAt]
+      properties:
+        bac_id:
+          $ref: '#/components/schemas/BacId'
+        provider:
+          $ref: '#/components/schemas/ProviderId'
+        threadId:
+          type: string
+        threadUrl:
+          type: string
+          format: uri
+        title:
+          type: string
+        lastSeenAt:
+          $ref: '#/components/schemas/IsoDateTime'
+        status:
+          type: string
+          enum: [active, tracked, queued, needs_organize, closed, restorable, archived, removed]
+        primaryWorkstreamId:
+          $ref: '#/components/schemas/BacId'
+        tags:
+          type: array
+          items:
+            type: string
+        trackingMode:
+          type: string
+          enum: [auto, manual, stopped, removed]
+        tabSnapshot:
+          $ref: '#/components/schemas/TabSnapshot'
+    WorkstreamCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [title]
+      properties:
+        title:
+          type: string
+          minLength: 1
+        parentId:
+          $ref: '#/components/schemas/BacId'
+        privacy:
+          $ref: '#/components/schemas/Privacy'
+        tags:
+          type: array
+          items:
+            type: string
+    WorkstreamUpdateRequest:
+      type: object
+      additionalProperties: false
+      required: [revision]
+      properties:
+        revision:
+          type: string
+        title:
+          type: string
+          minLength: 1
+        parentId:
+          $ref: '#/components/schemas/BacId'
+        privacy:
+          $ref: '#/components/schemas/Privacy'
+        tags:
+          type: array
+          items:
+            type: string
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/BacId'
+        checklist:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChecklistItem'
+    ChecklistItem:
+      type: object
+      additionalProperties: false
+      required: [id, text, checked, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          minLength: 1
+        text:
+          type: string
+          minLength: 1
+        checked:
+          type: boolean
+        createdAt:
+          $ref: '#/components/schemas/IsoDateTime'
+        updatedAt:
+          $ref: '#/components/schemas/IsoDateTime'
+    QueueCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [text, scope]
+      properties:
+        text:
+          type: string
+          minLength: 1
+        scope:
+          type: string
+          enum: [thread, workstream, global]
+        targetId:
+          $ref: '#/components/schemas/BacId'
+        status:
+          type: string
+          enum: [pending, done, dismissed]
+    ReminderCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [threadId, provider, detectedAt]
+      properties:
+        threadId:
+          $ref: '#/components/schemas/BacId'
+        provider:
+          $ref: '#/components/schemas/ProviderId'
+        detectedAt:
+          $ref: '#/components/schemas/IsoDateTime'
+        status:
+          type: string
+          enum: [new, seen, relevant, dismissed]
