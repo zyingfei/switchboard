@@ -4,7 +4,39 @@ import { join } from 'node:path';
 import { mkdtemp } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 
-import { LiveVaultReader } from './liveVaultReader.js';
+import { LiveVaultReader, type ReviewEvent } from './liveVaultReader.js';
+
+const buildReviewEvent = (overrides: Partial<ReviewEvent>): ReviewEvent => ({
+  bac_id: 'review_base',
+  sourceThreadId: 'thread_alpha',
+  sourceTurnOrdinal: 1,
+  provider: 'chatgpt',
+  verdict: 'open',
+  reviewerNote: 'Needs follow-up',
+  spans: [
+    {
+      id: 'span_1',
+      text: 'Claim text',
+      comment: 'Check this claim',
+      capturedAt: '2026-04-26T20:00:00.000Z',
+    },
+  ],
+  outcome: 'save',
+  createdAt: '2026-04-26T20:00:00.000Z',
+  ...overrides,
+});
+
+const writeReviewLog = async (
+  vaultPath: string,
+  date: string,
+  events: readonly ReviewEvent[],
+): Promise<void> => {
+  await mkdir(join(vaultPath, '_BAC', 'reviews'), { recursive: true });
+  await writeFile(
+    join(vaultPath, '_BAC', 'reviews', `${date}.jsonl`),
+    `${events.map((event) => JSON.stringify(event)).join('\n')}\n`,
+  );
+};
 
 describe('LiveVaultReader', () => {
   it('reads live _BAC thread, queue, reminder, and event files', async () => {
@@ -120,5 +152,123 @@ describe('LiveVaultReader', () => {
       'disp_evening',
     ]);
     expect(filtered.data.map((event) => event.bac_id)).toEqual(['disp_evening']);
+  });
+
+  it('reads review JSONL files newest first', async () => {
+    const vaultPath = await mkdtemp(join(tmpdir(), 'sidetrack-mcp-reviews-order-'));
+    await writeReviewLog(vaultPath, '2026-04-25', [
+      buildReviewEvent({
+        bac_id: 'review_oldest',
+        createdAt: '2026-04-25T21:00:00.000Z',
+      }),
+    ]);
+    await writeReviewLog(vaultPath, '2026-04-26', [
+      buildReviewEvent({
+        bac_id: 'review_evening',
+        createdAt: '2026-04-26T22:00:00.000Z',
+      }),
+      buildReviewEvent({
+        bac_id: 'review_late',
+        createdAt: '2026-04-26T23:00:00.000Z',
+      }),
+    ]);
+    await writeReviewLog(vaultPath, '2026-04-27', [
+      buildReviewEvent({
+        bac_id: 'review_newest',
+        createdAt: '2026-04-27T01:00:00.000Z',
+      }),
+    ]);
+
+    const result = await new LiveVaultReader(vaultPath).readReviews({ limit: 4 });
+
+    expect(result.data.map((event) => event.bac_id)).toEqual([
+      'review_newest',
+      'review_late',
+      'review_evening',
+      'review_oldest',
+    ]);
+  });
+
+  it('limits review results', async () => {
+    const vaultPath = await mkdtemp(join(tmpdir(), 'sidetrack-mcp-reviews-limit-'));
+    await writeReviewLog(vaultPath, '2026-04-27', [
+      buildReviewEvent({
+        bac_id: 'review_first',
+        createdAt: '2026-04-27T03:00:00.000Z',
+      }),
+      buildReviewEvent({
+        bac_id: 'review_second',
+        createdAt: '2026-04-27T02:00:00.000Z',
+      }),
+      buildReviewEvent({
+        bac_id: 'review_third',
+        createdAt: '2026-04-27T01:00:00.000Z',
+      }),
+    ]);
+
+    const result = await new LiveVaultReader(vaultPath).readReviews({ limit: 2 });
+
+    expect(result.data.map((event) => event.bac_id)).toEqual([
+      'review_first',
+      'review_second',
+    ]);
+  });
+
+  it('filters reviews by since timestamp', async () => {
+    const vaultPath = await mkdtemp(join(tmpdir(), 'sidetrack-mcp-reviews-since-'));
+    await writeReviewLog(vaultPath, '2026-04-26', [
+      buildReviewEvent({
+        bac_id: 'review_before',
+        createdAt: '2026-04-26T11:59:59.000Z',
+      }),
+      buildReviewEvent({
+        bac_id: 'review_at_since',
+        createdAt: '2026-04-26T12:00:00.000Z',
+      }),
+      buildReviewEvent({
+        bac_id: 'review_after',
+        createdAt: '2026-04-26T13:00:00.000Z',
+      }),
+    ]);
+
+    const result = await new LiveVaultReader(vaultPath).readReviews({
+      since: '2026-04-26T12:00:00.000Z',
+    });
+
+    expect(result.data.map((event) => event.bac_id)).toEqual([
+      'review_after',
+      'review_at_since',
+    ]);
+  });
+
+  it('filters reviews by thread and verdict', async () => {
+    const vaultPath = await mkdtemp(join(tmpdir(), 'sidetrack-mcp-reviews-filter-'));
+    await writeReviewLog(vaultPath, '2026-04-27', [
+      buildReviewEvent({
+        bac_id: 'review_keep',
+        sourceThreadId: 'thread_alpha',
+        verdict: 'agree',
+        createdAt: '2026-04-27T03:00:00.000Z',
+      }),
+      buildReviewEvent({
+        bac_id: 'review_wrong_verdict',
+        sourceThreadId: 'thread_alpha',
+        verdict: 'open',
+        createdAt: '2026-04-27T02:00:00.000Z',
+      }),
+      buildReviewEvent({
+        bac_id: 'review_wrong_thread',
+        sourceThreadId: 'thread_beta',
+        verdict: 'agree',
+        createdAt: '2026-04-27T01:00:00.000Z',
+      }),
+    ]);
+
+    const result = await new LiveVaultReader(vaultPath).readReviews({
+      threadId: 'thread_alpha',
+      verdict: 'agree',
+    });
+
+    expect(result.data.map((event) => event.bac_id)).toEqual(['review_keep']);
   });
 });
