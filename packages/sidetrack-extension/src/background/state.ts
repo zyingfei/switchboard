@@ -3,6 +3,7 @@ import type {
   CompanionSettings,
   QueueCreate,
   ReminderCreate,
+  ReminderUpdate,
   ThreadUpsert,
   WorkstreamCreate,
   WorkstreamUpdate,
@@ -63,6 +64,12 @@ export const readReminders = async (): Promise<readonly InboundReminder[]> =>
 
 export const readSelectorHealth = async (): Promise<readonly SelectorHealth[]> =>
   await storageGet<readonly SelectorHealth[]>(SELECTOR_HEALTH_KEY, []);
+
+export const saveCollapsedSections = async (
+  collapsedSections: WorkboardState['collapsedSections'],
+): Promise<void> => {
+  await storageSet({ [COLLAPSED_SECTIONS_KEY]: collapsedSections });
+};
 
 export const upsertLocalThread = async (
   input: ThreadUpsert,
@@ -177,11 +184,12 @@ export const createLocalQueueItem = async (
 
 export const createLocalReminder = async (
   input: ReminderCreate,
-  result?: { readonly bac_id: string },
+  result?: { readonly bac_id: string; readonly revision?: string },
 ): Promise<InboundReminder> => {
   const current = await readReminders();
   const reminder: InboundReminder = {
     bac_id: result?.bac_id ?? createLocalBacId(),
+    revision: result?.revision,
     threadId: input.threadId,
     provider: input.provider,
     detectedAt: input.detectedAt,
@@ -189,6 +197,28 @@ export const createLocalReminder = async (
   };
   await storageSet({ [REMINDERS_KEY]: [reminder, ...current] });
   return reminder;
+};
+
+export const updateLocalReminder = async (
+  reminderId: string,
+  update: ReminderUpdate,
+  result?: { readonly revision: string },
+): Promise<InboundReminder | undefined> => {
+  const current = await readReminders();
+  let updated: InboundReminder | undefined;
+  const next = current.map((reminder) => {
+    if (reminder.bac_id !== reminderId) {
+      return reminder;
+    }
+    updated = {
+      ...reminder,
+      ...update,
+      revision: result?.revision ?? update.revision ?? reminder.revision,
+    };
+    return updated;
+  });
+  await storageSet({ [REMINDERS_KEY]: next });
+  return updated;
 };
 
 export const recordSelectorCanary = async (event: CaptureEvent): Promise<void> => {

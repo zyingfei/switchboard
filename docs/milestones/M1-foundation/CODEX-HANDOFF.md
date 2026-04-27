@@ -4,8 +4,9 @@ This file is the paste-ready prompt for the Codex agent that picks up
 after Claude's M1+M2 UX-skeleton PR (#20) lands.
 
 The skeletons are visual + structural; this handoff wires them to the
-runtime + validates against real Chrome. Codex CLI's Computer Use MCP
-is the path for the E2E validation pass.
+runtime and validates the automated provider path with Playwright's
+bundled Chromium. Branded Google Chrome is reserved for the manual
+Developer Mode acceptance pass.
 
 ---
 
@@ -66,11 +67,17 @@ wire data + handlers.
 
 The preview entry stays as-is — it's useful for design iteration.
 
-## Mission 2 — Manual E2E acceptance pass
+## Mission 2 — E2E acceptance pass
 
-Walk the 22-condition checklist in
+Run `cd packages/sidetrack-extension && npm run e2e` first. This
+launches the MV3 extension in a persistent Playwright-bundled Chromium
+profile, captures the ChatGPT, Claude, and Gemini PoC fixtures, and
+writes to a temp companion vault under `/tmp`.
+
+Then walk the 22-condition checklist in
 docs/milestones/M1-foundation/DEMO.md §"Manual acceptance checklist"
-using Computer Use to drive real Chrome.
+using real Chrome only for the human acceptance items that need a
+signed-in provider profile.
 
 For each condition:
 1. Verify it end-to-end (companion + extension + real provider tabs)

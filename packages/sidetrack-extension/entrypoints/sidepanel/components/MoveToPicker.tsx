@@ -15,7 +15,13 @@ export interface MoveToPickerProps {
   readonly onMove: (target: WorkstreamOption | { create: string }) => void;
 }
 
-export function MoveToPicker({ itemTitle, currentPath, workstreams, onClose, onMove }: MoveToPickerProps) {
+export function MoveToPicker({
+  itemTitle,
+  currentPath,
+  workstreams,
+  onClose,
+  onMove,
+}: MoveToPickerProps) {
   const [filter, setFilter] = useState('');
 
   const filtered = useMemo(() => {
@@ -27,7 +33,8 @@ export function MoveToPicker({ itemTitle, currentPath, workstreams, onClose, onM
   }, [filter, workstreams]);
 
   const showCreateHint =
-    filter.trim() !== '' && !workstreams.some((w) => w.path.toLowerCase() === filter.trim().toLowerCase());
+    filter.trim() !== '' &&
+    !workstreams.some((w) => w.path.toLowerCase() === filter.trim().toLowerCase());
 
   return (
     <Modal
@@ -41,7 +48,9 @@ export function MoveToPicker({ itemTitle, currentPath, workstreams, onClose, onM
         <input
           autoFocus
           value={filter}
-          onChange={(event) => { setFilter(event.target.value); }}
+          onChange={(event) => {
+            setFilter(event.target.value);
+          }}
           placeholder="Filter workstreams…"
         />
       </div>
@@ -52,12 +61,16 @@ export function MoveToPicker({ itemTitle, currentPath, workstreams, onClose, onM
             key={workstream.bac_id}
             type="button"
             className={'move-item' + (workstream.path === currentPath ? ' current' : '')}
-            onClick={() => { onMove(workstream); }}
+            onClick={() => {
+              onMove(workstream);
+            }}
             disabled={workstream.path === currentPath}
           >
             <span className="icon-12">{Icons.folder}</span>
             <span className="move-path">{workstream.path}</span>
-            {workstream.path === currentPath ? <span className="mono move-current">current</span> : null}
+            {workstream.path === currentPath ? (
+              <span className="mono move-current">current</span>
+            ) : null}
           </button>
         ))}
         {filtered.length === 0 ? (
@@ -69,7 +82,9 @@ export function MoveToPicker({ itemTitle, currentPath, workstreams, onClose, onM
         <button
           type="button"
           className="move-create"
-          onClick={() => { onMove({ create: filter.trim() }); }}
+          onClick={() => {
+            onMove({ create: filter.trim() });
+          }}
         >
           <span className="icon-12">{Icons.plus}</span>
           Create new: <strong>{filter.trim()}</strong>

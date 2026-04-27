@@ -15,7 +15,11 @@ export interface ReviewComposerProps {
   readonly spans: readonly ReviewSpan[];
   readonly defaultVerdict?: ReviewVerdict;
   readonly onClose: () => void;
-  readonly onSave: (review: { verdict: ReviewVerdict; reviewerNote: string; perSpan: Record<string, string> }) => void;
+  readonly onSave: (review: {
+    verdict: ReviewVerdict;
+    reviewerNote: string;
+    perSpan: Record<string, string>;
+  }) => void;
   readonly onSubmitBack: () => void;
   readonly onDispatchOut: () => void;
 }
@@ -82,7 +86,9 @@ export function ReviewComposer({
               className="span-comment"
               placeholder="Comment on this span…"
               value={perSpan[span.id] ?? ''}
-              onChange={(event) => { setPerSpan({ ...perSpan, [span.id]: event.target.value }); }}
+              onChange={(event) => {
+                setPerSpan({ ...perSpan, [span.id]: event.target.value });
+              }}
             />
           </div>
         ))}
@@ -91,7 +97,9 @@ export function ReviewComposer({
           <label>Reviewer note</label>
           <textarea
             value={reviewerNote}
-            onChange={(event) => { setReviewerNote(event.target.value); }}
+            onChange={(event) => {
+              setReviewerNote(event.target.value);
+            }}
             placeholder="Overall: what's right, what's wrong, what needs more…"
           />
         </div>
@@ -104,7 +112,9 @@ export function ReviewComposer({
                 key={key}
                 type="button"
                 className={'verdict verdict-' + key + (verdict === key ? ' on' : '')}
-                onClick={() => { setVerdict(key); }}
+                onClick={() => {
+                  setVerdict(key);
+                }}
               >
                 {VERDICT_LABELS[key]}
               </button>
@@ -114,8 +124,8 @@ export function ReviewComposer({
 
         <div className="review-hint">
           <em>
-            Saving this review will be visible later in{' '}
-            <code className="mono">_BAC/reviews/</code> and in déjà-vu surfacing.
+            Saving this review will be visible later in <code className="mono">_BAC/reviews/</code>{' '}
+            and in déjà-vu surfacing.
           </em>
         </div>
       </div>

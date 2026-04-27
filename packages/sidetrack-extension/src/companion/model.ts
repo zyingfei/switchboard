@@ -110,6 +110,11 @@ export interface ReminderCreate {
   readonly status?: 'new' | 'seen' | 'relevant' | 'dismissed';
 }
 
+export interface ReminderUpdate {
+  readonly revision?: string;
+  readonly status?: 'new' | 'seen' | 'relevant' | 'dismissed';
+}
+
 export interface CompanionStatus {
   readonly companion: 'running';
   readonly vault: 'connected' | 'unreachable';

@@ -15,7 +15,7 @@ cd ../sidetrack-mcp
 npm run lint && npm run typecheck && npm test && npm run build
 ```
 
-`npm run e2e` for the extension builds the MV3 bundle and verifies the loadable manifest, side panel, background worker, and content script outputs. A real Chrome/provider manual pass is still required before calling the milestone fully accepted.
+`npm run e2e` for the extension builds the MV3 bundle, verifies the loadable manifest, builds the companion, then launches the extension in Playwright's bundled Chromium with a persistent temp profile. The automated pass uses the `poc/provider-capture` provider fixtures against a temp companion vault under `/tmp`; branded Google Chrome is reserved for the manual Developer Mode path below.
 
 ## Companion
 
@@ -46,6 +46,8 @@ npm run build
 ```
 
 Load unpacked from `packages/sidetrack-extension/.output/chrome-mv3`.
+
+Automated MV3 validation does not side-load into a main Chrome profile. Use `npm run e2e` for Playwright-bundled Chromium coverage, and use Chrome Developer Mode → Load unpacked only for a human acceptance pass.
 
 1. Open the side panel.
 2. Paste the bridge key from `/tmp/sidetrack-m1/_BAC/.config/bridge.key`.
@@ -127,7 +129,7 @@ The stdio integration test covers a populated `_BAC` vault fixture and verifies 
 
 - [ ] Companion standards commands pass. Verify `cd packages/sidetrack-companion && npm run lint && npm run typecheck && npm test`.
 - [ ] Extension standards commands pass. Verify `cd packages/sidetrack-extension && npm run lint && npm run typecheck && npm test && npm run build`.
-- [ ] Extension Playwright e2e passes. Verify `cd packages/sidetrack-extension && npm run e2e`.
+- [ ] Extension Playwright e2e passes. Verify `cd packages/sidetrack-extension && npm run e2e`; this uses bundled Chromium, a persistent temp profile, and a temp companion vault.
 - [ ] MCP standards commands pass. Verify `cd packages/sidetrack-mcp && npm run lint && npm run typecheck && npm test`.
 - [ ] No `any` across production boundaries. Verify `grep -nr ": any" packages/` returns nothing in production code.
 - [ ] No hidden global state. Verify composition roots still own dependency wiring and no service-locator style globals were introduced.

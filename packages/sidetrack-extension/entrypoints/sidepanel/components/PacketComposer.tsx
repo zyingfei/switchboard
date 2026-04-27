@@ -2,8 +2,16 @@ import { useState } from 'react';
 import { Modal } from './Modal';
 import { Icons } from './icons';
 
-export type PacketKind = 'context_pack' | 'research_packet' | 'coding_agent_packet' | 'notebook_export';
-export type ResearchTemplate = 'web_to_ai_checklist' | 'resume_tech_stack' | 'latest_developments_radar' | 'custom';
+export type PacketKind =
+  | 'context_pack'
+  | 'research_packet'
+  | 'coding_agent_packet'
+  | 'notebook_export';
+export type ResearchTemplate =
+  | 'web_to_ai_checklist'
+  | 'resume_tech_stack'
+  | 'latest_developments_radar'
+  | 'custom';
 export type DispatchTarget =
   | 'gpt_pro'
   | 'deep_research'
@@ -85,7 +93,9 @@ export function PacketComposer({
               key={k}
               type="button"
               className={'pill ' + (kind === k ? 'on' : '')}
-              onClick={() => { setKind(k); }}
+              onClick={() => {
+                setKind(k);
+              }}
             >
               {KIND_LABELS[k]}
             </button>
@@ -102,7 +112,9 @@ export function PacketComposer({
                 key={t}
                 type="button"
                 className={'pill ' + (template === t ? 'on' : '')}
-                onClick={() => { setTemplate(t); }}
+                onClick={() => {
+                  setTemplate(t);
+                }}
               >
                 {TEMPLATE_LABELS[t]}
               </button>
@@ -116,7 +128,9 @@ export function PacketComposer({
         <div className="composer-scope">
           <div className="scope-pick">
             <span className="scope-icon">{Icons.folder}</span>
-            <span>Workstream: <em>Sidetrack / MVP PRD</em></span>
+            <span>
+              Workstream: <em>Sidetrack / MVP PRD</em>
+            </span>
             <span className="scope-meta mono">3 threads · 2 queued · 1 closed</span>
           </div>
           <div className="scope-options">
@@ -131,7 +145,9 @@ export function PacketComposer({
                 min={0}
                 max={2}
                 value={linkDepth}
-                onChange={(e) => { setLinkDepth(Number(e.target.value)); }}
+                onChange={(e) => {
+                  setLinkDepth(Number(e.target.value));
+                }}
               />
               <span className="mono">{linkDepth}</span>
             </label>
@@ -147,7 +163,9 @@ export function PacketComposer({
               key={t}
               type="button"
               className={'pill ' + (target === t ? 'on' : '')}
-              onClick={() => { setTarget(t); }}
+              onClick={() => {
+                setTarget(t);
+              }}
             >
               {TARGET_LABELS[t]}
             </button>
@@ -158,7 +176,7 @@ export function PacketComposer({
       <div className="composer-preview">
         <div className="preview-head mono">live preview</div>
         <pre className="preview-body mono">
-{`# Context Pack: Sidetrack / MVP PRD
+          {`# Context Pack: Sidetrack / MVP PRD
 
 ## Goal
 …

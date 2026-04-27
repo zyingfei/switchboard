@@ -48,9 +48,7 @@ const STUB_WORKSTREAMS = [
 
 describe('UX skeleton components — render-without-crash + key text present', () => {
   it('PacketComposer renders kind / template / target selectors and footer actions', () => {
-    render(
-      <PacketComposer onCancel={noop} onCopy={noop} onSave={noop} onDispatch={noop} />,
-    );
+    render(<PacketComposer onCancel={noop} onCopy={noop} onSave={noop} onDispatch={noop} />);
     expect(screen.getByText('Research Packet')).toBeInTheDocument();
     expect(screen.getByText('Web-to-AI checklist')).toBeInTheDocument();
     expect(screen.getByText('Copy to clipboard')).toBeInTheDocument();
@@ -117,9 +115,7 @@ describe('UX skeleton components — render-without-crash + key text present', (
   });
 
   it('CodingAttach renders tool picker and form fields', () => {
-    render(
-      <CodingAttach workstreams={STUB_WORKSTREAMS} onCancel={noop} onAttach={noop} />,
-    );
+    render(<CodingAttach workstreams={STUB_WORKSTREAMS} onCancel={noop} onAttach={noop} />);
     expect(screen.getByText('Codex CLI')).toBeInTheDocument();
     expect(screen.getByText('Claude Code')).toBeInTheDocument();
     expect(screen.getByPlaceholderText('019dcb94-4c4c-…')).toBeInTheDocument();
@@ -189,11 +185,7 @@ describe('UX skeleton components — render-without-crash + key text present', (
 
   it('SystemBannersStack composes multiple states', () => {
     render(
-      <SystemBannersStack
-        companionStatus="down"
-        vaultStatus="unreachable"
-        screenShareActive
-      />,
+      <SystemBannersStack companionStatus="down" vaultStatus="unreachable" screenShareActive />,
     );
     expect(screen.getByText(/Companion: disconnected/)).toBeInTheDocument();
     expect(screen.getByText(/Vault: error/)).toBeInTheDocument();
@@ -202,12 +194,7 @@ describe('UX skeleton components — render-without-crash + key text present', (
 
   it('InboundCard renders thread title, provider chip, action row', () => {
     render(
-      <InboundCard
-        reminder={STUB_INBOUND}
-        onOpen={noop}
-        onMarkRelevant={noop}
-        onDismiss={noop}
-      />,
+      <InboundCard reminder={STUB_INBOUND} onOpen={noop} onMarkRelevant={noop} onDismiss={noop} />,
     );
     expect(screen.getByText('Side-panel state machine review')).toBeInTheDocument();
     expect(screen.getByText('Claude')).toBeInTheDocument();

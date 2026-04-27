@@ -20,7 +20,8 @@ export function Annotation({
   onCancel,
   onSave,
 }: AnnotationProps) {
-  const initialWorkstream = defaultWorkstreamId ?? (workstreams.length > 0 ? workstreams[0].bac_id : '');
+  const initialWorkstream =
+    defaultWorkstreamId ?? (workstreams.length > 0 ? workstreams[0].bac_id : '');
   const [note, setNote] = useState('');
   const [workstreamId, setWorkstreamId] = useState(initialWorkstream);
 
@@ -40,7 +41,9 @@ export function Annotation({
             type="button"
             className="btn btn-primary"
             disabled={workstreamId === ''}
-            onClick={() => { onSave({ note, workstreamId }); }}
+            onClick={() => {
+              onSave({ note, workstreamId });
+            }}
           >
             Save
           </button>
@@ -55,7 +58,9 @@ export function Annotation({
         <textarea
           autoFocus
           value={note}
-          onChange={(event) => { setNote(event.target.value); }}
+          onChange={(event) => {
+            setNote(event.target.value);
+          }}
           placeholder="Why are you saving this?"
           rows={3}
         />
@@ -63,7 +68,12 @@ export function Annotation({
 
       <div className="composer-row">
         <label>Workstream</label>
-        <select value={workstreamId} onChange={(event) => { setWorkstreamId(event.target.value); }}>
+        <select
+          value={workstreamId}
+          onChange={(event) => {
+            setWorkstreamId(event.target.value);
+          }}
+        >
           <option value="">— pick a workstream —</option>
           {workstreams.map((workstream) => (
             <option key={workstream.bac_id} value={workstream.bac_id}>

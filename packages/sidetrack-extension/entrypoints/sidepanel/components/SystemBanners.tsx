@@ -15,7 +15,11 @@ export interface SystemBannerProps {
 
 const STATE_CONFIG: Record<
   SystemState,
-  { tone: 'red' | 'amber' | 'yellow' | 'signal'; icon: keyof typeof Icons; titleFn: (detail?: string) => string }
+  {
+    tone: 'red' | 'amber' | 'yellow' | 'signal';
+    icon: keyof typeof Icons;
+    titleFn: (detail?: string) => string;
+  }
 > = {
   companion_disconnected: {
     tone: 'red',
@@ -31,7 +35,9 @@ const STATE_CONFIG: Record<
     tone: 'yellow',
     icon: 'alert',
     titleFn: (detail) =>
-      detail !== undefined ? `Provider extractor: ${detail}` : 'Provider extractor: clipboard fallback active',
+      detail !== undefined
+        ? `Provider extractor: ${detail}`
+        : 'Provider extractor: clipboard fallback active',
   },
   screen_share_active: {
     tone: 'signal',
@@ -112,7 +118,9 @@ export function SystemBannersStack({
         key="provider"
         state="provider_broken"
         detail={providerHealthDetail}
-        action={onQueueDiagnostic ? { label: 'Queue diagnostic', onClick: onQueueDiagnostic } : undefined}
+        action={
+          onQueueDiagnostic ? { label: 'Queue diagnostic', onClick: onQueueDiagnostic } : undefined
+        }
       />,
     );
   }

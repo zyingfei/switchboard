@@ -26,7 +26,12 @@ export interface CodingAttachProps {
   }) => void;
 }
 
-export function CodingAttach({ defaultWorkstreamId, workstreams, onCancel, onAttach }: CodingAttachProps) {
+export function CodingAttach({
+  defaultWorkstreamId,
+  workstreams,
+  onCancel,
+  onAttach,
+}: CodingAttachProps) {
   const [tool, setTool] = useState<CodingTool>('claude_code');
   const [cwd, setCwd] = useState('');
   const [branch, setBranch] = useState('');
@@ -68,9 +73,9 @@ export function CodingAttach({ defaultWorkstreamId, workstreams, onCancel, onAtt
             type="button"
             className="btn btn-primary"
             disabled={!valid}
-            onClick={() =>
-              { onAttach({ tool, cwd, branch, sessionId, name, resumeCommand, workstreamId }); }
-            }
+            onClick={() => {
+              onAttach({ tool, cwd, branch, sessionId, name, resumeCommand, workstreamId });
+            }}
           >
             Attach
           </button>
@@ -85,7 +90,9 @@ export function CodingAttach({ defaultWorkstreamId, workstreams, onCancel, onAtt
               key={t}
               type="button"
               className={'pill ' + (tool === t ? 'on' : '')}
-              onClick={() => { setTool(t); }}
+              onClick={() => {
+                setTool(t);
+              }}
             >
               {TOOL_LABEL[t]}
             </button>
@@ -94,23 +101,31 @@ export function CodingAttach({ defaultWorkstreamId, workstreams, onCancel, onAtt
       </div>
 
       <div className="composer-row">
-        <label>cwd <span className="mono dim">(working directory)</span></label>
+        <label>
+          cwd <span className="mono dim">(working directory)</span>
+        </label>
         <input
           type="text"
           className="mono"
           value={cwd}
-          onChange={(event) => { setCwd(event.target.value); }}
+          onChange={(event) => {
+            setCwd(event.target.value);
+          }}
           placeholder="/Users/you/Documents/repo"
         />
       </div>
 
       <div className="composer-row">
-        <label>Branch <span className="mono dim">(optional)</span></label>
+        <label>
+          Branch <span className="mono dim">(optional)</span>
+        </label>
         <input
           type="text"
           className="mono"
           value={branch}
-          onChange={(event) => { setBranch(event.target.value); }}
+          onChange={(event) => {
+            setBranch(event.target.value);
+          }}
           placeholder="main"
         />
       </div>
@@ -121,19 +136,25 @@ export function CodingAttach({ defaultWorkstreamId, workstreams, onCancel, onAtt
           type="text"
           className="mono"
           value={sessionId}
-          onChange={(event) => { setSessionId(event.target.value); }}
+          onChange={(event) => {
+            setSessionId(event.target.value);
+          }}
           onBlur={detectResume}
           placeholder="019dcb94-4c4c-…"
         />
       </div>
 
       <div className="composer-row">
-        <label>Name <span className="mono dim">(human-readable)</span></label>
+        <label>
+          Name <span className="mono dim">(human-readable)</span>
+        </label>
         <input
           type="text"
           className="ai-italic"
           value={name}
-          onChange={(event) => { setName(event.target.value); }}
+          onChange={(event) => {
+            setName(event.target.value);
+          }}
           placeholder="MVP PRD iteration"
         />
       </div>
@@ -143,7 +164,9 @@ export function CodingAttach({ defaultWorkstreamId, workstreams, onCancel, onAtt
         <textarea
           className="mono"
           value={resumeCommand}
-          onChange={(event) => { setResumeCommand(event.target.value); }}
+          onChange={(event) => {
+            setResumeCommand(event.target.value);
+          }}
           placeholder="claude resume <session-id>"
           rows={2}
         />
@@ -151,7 +174,12 @@ export function CodingAttach({ defaultWorkstreamId, workstreams, onCancel, onAtt
 
       <div className="composer-row">
         <label>Workstream</label>
-        <select value={workstreamId} onChange={(event) => { setWorkstreamId(event.target.value); }}>
+        <select
+          value={workstreamId}
+          onChange={(event) => {
+            setWorkstreamId(event.target.value);
+          }}
+        >
           <option value="">— pick a workstream —</option>
           {workstreams.map((workstream) => (
             <option key={workstream.bac_id} value={workstream.bac_id}>

@@ -3,10 +3,11 @@ import type {
   CompanionSettings,
   QueueCreate,
   ReminderCreate,
+  ReminderUpdate,
   WorkstreamCreate,
   WorkstreamUpdate,
 } from './companion/model';
-import type { WorkboardState } from './workboard';
+import type { TrackingMode, WorkboardSection, WorkboardState } from './workboard';
 
 export const messageTypes = {
   captureVisibleThread: 'sidetrack.capture.visible-thread',
@@ -18,9 +19,12 @@ export const messageTypes = {
   createWorkstream: 'sidetrack.workstream.create',
   updateWorkstream: 'sidetrack.workstream.update',
   moveThread: 'sidetrack.thread.move',
+  updateThreadTracking: 'sidetrack.thread.tracking.update',
   restoreThreadTab: 'sidetrack.thread.restore-tab',
   queueFollowUp: 'sidetrack.queue.create',
   createReminder: 'sidetrack.reminder.create',
+  updateReminder: 'sidetrack.reminder.update',
+  setCollapsedSections: 'sidetrack.sections.collapsed.set',
 } as const;
 
 export interface SelectorCanaryReport {
@@ -81,6 +85,11 @@ export type WorkboardRequest =
       readonly workstreamId: string;
     }
   | {
+      readonly type: typeof messageTypes.updateThreadTracking;
+      readonly threadId: string;
+      readonly trackingMode: TrackingMode;
+    }
+  | {
       readonly type: typeof messageTypes.restoreThreadTab;
       readonly threadId: string;
     }
@@ -91,6 +100,15 @@ export type WorkboardRequest =
   | {
       readonly type: typeof messageTypes.createReminder;
       readonly reminder: ReminderCreate;
+    }
+  | {
+      readonly type: typeof messageTypes.updateReminder;
+      readonly reminderId: string;
+      readonly update: ReminderUpdate;
+    }
+  | {
+      readonly type: typeof messageTypes.setCollapsedSections;
+      readonly collapsedSections: readonly WorkboardSection['id'][];
     };
 
 export type RuntimeRequest =
@@ -169,6 +187,16 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
     return typeof value.threadId === 'string' && typeof value.workstreamId === 'string';
   }
 
+  if (hasType(value, messageTypes.updateThreadTracking)) {
+    return (
+      typeof value.threadId === 'string' &&
+      (value.trackingMode === 'auto' ||
+        value.trackingMode === 'manual' ||
+        value.trackingMode === 'stopped' ||
+        value.trackingMode === 'removed')
+    );
+  }
+
   if (hasType(value, messageTypes.restoreThreadTab)) {
     return typeof value.threadId === 'string';
   }
@@ -184,6 +212,17 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
       isRecord(reminder) &&
       typeof reminder.threadId === 'string' &&
       typeof reminder.detectedAt === 'string'
+    );
+  }
+
+  if (hasType(value, messageTypes.updateReminder)) {
+    return typeof value.reminderId === 'string' && isRecord(value.update);
+  }
+
+  if (hasType(value, messageTypes.setCollapsedSections)) {
+    return (
+      Array.isArray(value.collapsedSections) &&
+      value.collapsedSections.every((section) => typeof section === 'string')
     );
   }
 

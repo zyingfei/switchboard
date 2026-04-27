@@ -78,7 +78,9 @@ export function Wizard({
     >
       {step === 'welcome' ? <WelcomeStep /> : null}
       {step === 'companion' ? <CompanionStep companionReachable={companionReachable} /> : null}
-      {step === 'vault' ? <VaultStep onPick={onPickVault} localRestApiDetected={localRestApiDetected} /> : null}
+      {step === 'vault' ? (
+        <VaultStep onPick={onPickVault} localRestApiDetected={localRestApiDetected} />
+      ) : null}
       {step === 'providers' ? <ProvidersStep /> : null}
       {step === 'done' ? <DoneStep /> : null}
     </Modal>
@@ -90,7 +92,8 @@ function WelcomeStep() {
     <div className="wizard-step">
       <div className="wizard-display">Track your AI work without losing the thread.</div>
       <div className="wizard-lede ai-italic">
-        Sidetrack watches your AI tabs, recovers what you lost, and lets you hand context to other models — without copy-paste fatigue.
+        Sidetrack watches your AI tabs, recovers what you lost, and lets you hand context to other
+        models — without copy-paste fatigue.
       </div>
       <a className="wizard-skip mono">skip the tour →</a>
     </div>
@@ -107,8 +110,12 @@ function CompanionStep({ companionReachable }: { readonly companionReachable: bo
         <div className="wizard-card primary">
           <div className="wizard-card-tag mono">DEFAULT · ADR-0001</div>
           <div className="wizard-card-title">HTTP loopback</div>
-          <code className="wizard-card-cmd mono">npx @sidetrack/companion --vault &lt;path&gt;</code>
-          <div className="wizard-card-meta mono">port-based · no installer · lives independent of Chrome</div>
+          <code className="wizard-card-cmd mono">
+            npx @sidetrack/companion --vault &lt;path&gt;
+          </code>
+          <div className="wizard-card-meta mono">
+            port-based · no installer · lives independent of Chrome
+          </div>
         </div>
       </div>
       <div className={'wizard-status ' + (companionReachable ? 'green' : 'amber')}>
@@ -119,7 +126,8 @@ function CompanionStep({ companionReachable }: { readonly companionReachable: bo
       </div>
       <div className="wizard-footnote mono">
         <em>
-          Native Messaging considered and rejected for v1 — see ADR-0001 for the lifetime + multi-MCP-client reasoning.
+          Native Messaging considered and rejected for v1 — see ADR-0001 for the lifetime +
+          multi-MCP-client reasoning.
         </em>
       </div>
     </div>
