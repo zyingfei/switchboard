@@ -1,6 +1,10 @@
+import type { ReactElement } from 'react';
+
 import { Icons } from './icons';
 
 export type SystemState =
+  | 'capture_success'
+  | 'captures_queued'
   | 'companion_disconnected'
   | 'vault_unreachable'
   | 'provider_broken'
@@ -16,11 +20,21 @@ export interface SystemBannerProps {
 const STATE_CONFIG: Record<
   SystemState,
   {
-    tone: 'red' | 'amber' | 'yellow' | 'signal';
+    tone: 'red' | 'amber' | 'yellow' | 'signal' | 'green';
     icon: keyof typeof Icons;
     titleFn: (detail?: string) => string;
   }
 > = {
+  capture_success: {
+    tone: 'green',
+    icon: 'check',
+    titleFn: (detail) => 'Captured' + (detail !== undefined ? ` from ${detail}` : ''),
+  },
+  captures_queued: {
+    tone: 'amber',
+    icon: 'alert',
+    titleFn: (detail) => 'Captures queued' + (detail !== undefined ? ` · ${detail}` : ''),
+  },
   companion_disconnected: {
     tone: 'red',
     icon: 'alert',
@@ -67,6 +81,8 @@ export function SystemBanner({ state, detail, action }: SystemBannerProps) {
 }
 
 export interface SystemBannersStackProps {
+  readonly captureSuccessHost?: string;
+  readonly companionActionLabel?: string;
   readonly companionStatus?: 'running' | 'slow' | 'down';
   readonly vaultStatus?: 'connected' | 'unreachable';
   readonly providerHealth?: 'ok' | 'degraded';
@@ -80,6 +96,8 @@ export interface SystemBannersStackProps {
 }
 
 export function SystemBannersStack({
+  captureSuccessHost,
+  companionActionLabel = 'Retry',
   companionStatus = 'running',
   vaultStatus = 'connected',
   providerHealth = 'ok',
@@ -91,14 +109,20 @@ export function SystemBannersStack({
   onRePickVault,
   onQueueDiagnostic,
 }: SystemBannersStackProps) {
-  const banners = [];
+  const banners: ReactElement[] = [];
+  if (captureSuccessHost !== undefined) {
+    banners.push(
+      <SystemBanner key="capture-success" state="capture_success" detail={captureSuccessHost} />,
+    );
+  }
   if (companionStatus === 'down') {
     banners.push(
       <SystemBanner
         key="companion"
         state="companion_disconnected"
-        detail={queuedCount !== undefined ? `${String(queuedCount)} items queued` : undefined}
-        action={onRetryCompanion ? { label: 'Retry', onClick: onRetryCompanion } : undefined}
+        action={
+          onRetryCompanion ? { label: companionActionLabel, onClick: onRetryCompanion } : undefined
+        }
       />,
     );
   }
@@ -109,6 +133,15 @@ export function SystemBannersStack({
         state="vault_unreachable"
         detail="re-pick folder?"
         action={onRePickVault ? { label: 'Re-pick', onClick: onRePickVault } : undefined}
+      />,
+    );
+  }
+  if (queuedCount !== undefined && queuedCount > 0) {
+    banners.push(
+      <SystemBanner
+        key="capture-queue"
+        state="captures_queued"
+        detail={`${String(queuedCount)} pending`}
       />,
     );
   }

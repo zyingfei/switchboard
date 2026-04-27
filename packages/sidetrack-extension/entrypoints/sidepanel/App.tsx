@@ -12,7 +12,12 @@ import {
   type WorkstreamNode,
 } from '../../src/workboard';
 import type { ChecklistItem, WorkstreamUpdate } from '../../src/companion/model';
-import { isRuntimeResponse, messageTypes, type WorkboardRequest } from '../../src/messages';
+import {
+  isCaptureFeedbackMessage,
+  isRuntimeResponse,
+  messageTypes,
+  type WorkboardRequest,
+} from '../../src/messages';
 import {
   InboundCard,
   MoveToPicker,
@@ -80,6 +85,18 @@ const formatRelative = (isoDate: string): string => {
 };
 
 const checklistId = (): string => `check_${crypto.randomUUID().replaceAll('-', '_')}`;
+
+const SETUP_COMPLETED_KEY = 'sidetrack:setupCompleted';
+const DEFAULT_VAULT_PATH = '~/Documents/Sidetrack-vault';
+
+const readSetupCompleted = async (): Promise<boolean> => {
+  const result = await chrome.storage.local.get({ [SETUP_COMPLETED_KEY]: false });
+  return result[SETUP_COMPLETED_KEY] === true;
+};
+
+const writeSetupCompleted = async (): Promise<void> => {
+  await chrome.storage.local.set({ [SETUP_COMPLETED_KEY]: true });
+};
 
 const workstreamPath = (
   workstreamId: string | undefined,
@@ -187,7 +204,11 @@ const App = () => {
   const [selectedThread, setSelectedThread] = useState('');
   const [moveThreadId, setMoveThreadId] = useState<string | null>(null);
   const [recoveryThreadId, setRecoveryThreadId] = useState<string | null>(null);
+  const [setupCompleted, setSetupCompleted] = useState<boolean | null>(null);
+  const [stateLoaded, setStateLoaded] = useState(false);
+  const [vaultPath, setVaultPath] = useState(DEFAULT_VAULT_PATH);
   const [wizardOpen, setWizardOpen] = useState(false);
+  const [captureToastHost, setCaptureToastHost] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -219,16 +240,55 @@ const App = () => {
     setBridgeKey(next.settings.companion.bridgeKey);
     setPort(String(next.settings.companion.port));
     setError(next.lastError ?? null);
+    if (next.vaultPath !== undefined) {
+      setVaultPath(next.vaultPath);
+    }
     if (selectedWorkstream === '' && next.workstreams.length > 0) {
       setSelectedWorkstream(next.workstreams[0]?.bac_id ?? '');
     }
   };
 
   useEffect(() => {
-    void refresh().catch((loadError: unknown) => {
-      setError(loadError instanceof Error ? loadError.message : 'Could not load Sidetrack state.');
-    });
+    void refresh()
+      .catch((loadError: unknown) => {
+        setError(
+          loadError instanceof Error ? loadError.message : 'Could not load Sidetrack state.',
+        );
+      })
+      .finally(() => {
+        setStateLoaded(true);
+      });
+    void readSetupCompleted()
+      .then(setSetupCompleted)
+      .catch(() => {
+        setSetupCompleted(false);
+      });
   }, []);
+
+  useEffect(() => {
+    const runtimeMessages = chrome.runtime.onMessage;
+    const listener = (message: unknown) => {
+      if (isCaptureFeedbackMessage(message)) {
+        setCaptureToastHost(message.host);
+      }
+    };
+    runtimeMessages.addListener(listener);
+    return () => {
+      runtimeMessages.removeListener(listener);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (captureToastHost === null) {
+      return undefined;
+    }
+    const timeoutId = window.setTimeout(() => {
+      setCaptureToastHost(null);
+    }, 3_000);
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [captureToastHost]);
 
   const runAction = async (action: () => Promise<WorkboardState>) => {
     setBusy(true);
@@ -254,6 +314,20 @@ const App = () => {
         settings: { bridgeKey, port: Number(port) },
       }),
     );
+  };
+
+  const completeSetup = async (saveCompanionFirst: boolean): Promise<void> => {
+    if (saveCompanionFirst) {
+      await runAction(() =>
+        sendRequest({
+          type: messageTypes.saveCompanionSettings,
+          settings: { bridgeKey, port: Number(port) },
+        }),
+      );
+    }
+    await writeSetupCompleted();
+    setSetupCompleted(true);
+    setWizardOpen(false);
   };
 
   const createWorkstream = (event: SyntheticEvent<HTMLFormElement>) => {
@@ -464,6 +538,18 @@ const App = () => {
   const selectedWorkstreamQueue = activeWorkstream
     ? state.queueItems.filter((item) => item.targetId === activeWorkstream.bac_id)
     : [];
+  const firstLaunch =
+    stateLoaded && setupCompleted === false && bridgeKey.trim().length === 0;
+  const showWizard = firstLaunch || wizardOpen;
+  const companionDisconnected =
+    bridgeKey.trim().length === 0 || state.companionStatus === 'disconnected';
+  const vaultUnreachable = state.companionStatus === 'vault-error';
+  const hasSystemBanners =
+    companionDisconnected ||
+    vaultUnreachable ||
+    providerHealth !== undefined ||
+    state.queuedCaptureCount > 0 ||
+    captureToastHost !== null;
 
   return (
     <main className="workboard" aria-label="Sidetrack workboard">
@@ -486,26 +572,33 @@ const App = () => {
             }}
             type="button"
           >
-            Setup
+            Setup wizard
           </button>
         </div>
       </header>
 
-      <div className="banner-stack">
-        <SystemBannersStack
-          companionStatus={state.companionStatus === 'connected' ? 'running' : 'down'}
-          vaultStatus={state.companionStatus === 'vault-error' ? 'unreachable' : 'connected'}
-          providerHealth={providerHealth ? 'degraded' : 'ok'}
-          providerHealthDetail={providerHealth?.warning}
-          queuedCount={state.queuedCaptureCount}
-          onRetryCompanion={() => {
-            void refresh();
-          }}
-          onQueueDiagnostic={() => {
-            void refresh();
-          }}
-        />
-      </div>
+      {hasSystemBanners ? (
+        <div className="banner-stack">
+          <SystemBannersStack
+            captureSuccessHost={captureToastHost ?? undefined}
+            companionActionLabel="Open setup"
+            companionStatus={companionDisconnected ? 'down' : 'running'}
+            vaultStatus={vaultUnreachable ? 'unreachable' : 'connected'}
+            providerHealth={providerHealth ? 'degraded' : 'ok'}
+            providerHealthDetail={providerHealth?.warning}
+            queuedCount={state.queuedCaptureCount}
+            onQueueDiagnostic={() => {
+              void refresh();
+            }}
+            onRePickVault={() => {
+              setWizardOpen(true);
+            }}
+            onRetryCompanion={() => {
+              setWizardOpen(true);
+            }}
+          />
+        </div>
+      ) : null}
 
       {error ? <div className="banner danger">{error}</div> : null}
 
@@ -912,18 +1005,32 @@ const App = () => {
         />
       ) : null}
 
-      {wizardOpen ? (
+      {showWizard ? (
         <Wizard
+          bridgeKey={bridgeKey}
           companionReachable={state.companionStatus === 'connected'}
           onClose={() => {
-            setWizardOpen(false);
+            if (!firstLaunch) {
+              setWizardOpen(false);
+            }
           }}
           onFinish={() => {
-            setWizardOpen(false);
+            void completeSetup(true).catch((setupError: unknown) => {
+              setError(
+                setupError instanceof Error ? setupError.message : 'Could not finish setup.',
+              );
+            });
           }}
-          onPickVault={() => {
-            void refresh();
+          onBridgeKeyChange={setBridgeKey}
+          onSkip={() => {
+            void completeSetup(false).catch((setupError: unknown) => {
+              setError(
+                setupError instanceof Error ? setupError.message : 'Could not finish setup.',
+              );
+            });
           }}
+          onVaultPathChange={setVaultPath}
+          vaultPath={vaultPath}
         />
       ) : null}
     </main>

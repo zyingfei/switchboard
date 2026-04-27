@@ -12,6 +12,7 @@ import type { TrackingMode, WorkboardSection, WorkboardState } from './workboard
 export const messageTypes = {
   captureVisibleThread: 'sidetrack.capture.visible-thread',
   autoCapture: 'sidetrack.capture.auto',
+  captureFeedback: 'sidetrack.capture.feedback',
   selectorCanary: 'sidetrack.capture.selector-canary',
   getWorkboardState: 'sidetrack.workboard.state',
   saveCompanionSettings: 'sidetrack.settings.companion.save',
@@ -33,6 +34,11 @@ export interface SelectorCanaryReport {
   readonly title: string;
   readonly selectorCanary: NonNullable<CaptureEvent['selectorCanary']>;
   readonly checkedAt: string;
+}
+
+export interface CaptureFeedbackMessage {
+  readonly type: typeof messageTypes.captureFeedback;
+  readonly host: string;
 }
 
 export interface ContentRequest {
@@ -135,6 +141,9 @@ export type RuntimeResponse =
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;
+
+export const isCaptureFeedbackMessage = (value: unknown): value is CaptureFeedbackMessage =>
+  isRecord(value) && value.type === messageTypes.captureFeedback && typeof value.host === 'string';
 
 const hasType = <TType extends string>(
   value: Record<string, unknown>,

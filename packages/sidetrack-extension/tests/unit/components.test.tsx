@@ -109,7 +109,7 @@ describe('UX skeleton components — render-without-crash + key text present', (
   });
 
   it('Wizard renders welcome step + advances through steps', () => {
-    render(<Wizard onClose={noop} onPickVault={noop} onFinish={noop} />);
+    render(<Wizard onClose={noop} onFinish={noop} />);
     expect(screen.getByText(/Track your AI work without losing the thread/)).toBeInTheDocument();
     expect(screen.getByText(/step 1 of 5/)).toBeInTheDocument();
   });

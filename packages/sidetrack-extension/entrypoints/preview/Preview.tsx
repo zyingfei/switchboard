@@ -169,7 +169,7 @@ export function Preview() {
           </div>
         </div>
       ) : null}
-      {surface === 'wizard' ? <Wizard onClose={close} onPickVault={noop} onFinish={close} /> : null}
+      {surface === 'wizard' ? <Wizard onClose={close} onFinish={close} /> : null}
       {surface === 'coding' ? (
         <CodingAttach workstreams={STUB_WORKSTREAMS} onCancel={close} onAttach={close} />
       ) : null}
