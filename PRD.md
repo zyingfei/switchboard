@@ -21,14 +21,17 @@ auto-organizer.
 
 ## 2. Source of truth
 
-This PRD is grounded in two artifacts. Where this PRD diverges from
-either, the artifacts win and the PRD is the bug.
+This PRD is grounded in two artifacts of different weight:
 
-- **User napkin (2026-04-26)** — direct user input on the side-panel
-  workstream model, queues, async tracking, tab recovery, packet
-  generation, notebook integration boundary, and coding-agent boundary.
-  See PR review thread.
-- **BRAINSTORM.md anchors** (locked):
+- **User napkin (2026-04-26)** — a rough brain-dump capturing user
+  intent on the side-panel workstream model, queues, async tracking,
+  tab recovery, packet generation, notebook integration boundary, and
+  coding-agent boundary. The napkin is authoritative on *what to build
+  and why*, not on precise wording or implementation detail. The PRD's
+  job is to operationalize the napkin's intent without drifting from
+  it. See PR review thread.
+- **BRAINSTORM.md anchors** (locked) — architectural decisions the PRD
+  must not contradict:
   - **§23.0** — Obsidian first-class citizen; BAC depends only on
     interfaces and core (filesystem + Markdown + frontmatter + `.canvas` +
     `.base` + `_BAC/`). Plugins (incl. Local REST API) are opt-in
@@ -47,6 +50,10 @@ either, the artifacts win and the PRD is the bug.
   - **§28** — Inline review primitive: annotate spans of an assistant
     turn; submit-back to original chat; dispatch-out to another chat;
     track via `ReviewEvent`.
+
+If the PRD drifts from napkin intent or contradicts a locked BRAINSTORM
+anchor, the PRD is the bug. Detail and wording the napkin doesn't pin
+down are the PRD's to decide.
 
 ## 3. The user problem
 
