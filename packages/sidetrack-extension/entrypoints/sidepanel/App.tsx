@@ -25,12 +25,14 @@ import {
   MoveToPicker,
   PacketComposer,
   RecentDispatches,
+  ReviewComposer,
   SystemBannersStack,
   TabRecovery,
   Wizard,
   type DispatchEvent as LegacyDispatchEvent,
   type InboundReminder as InboundCardReminder,
   type RestoreStrategy,
+  type ReviewVerdict,
   type WorkstreamOption,
 } from './components';
 import { createDispatchClient } from '../../src/dispatch/client';
@@ -39,6 +41,8 @@ import {
   mapUiPacketKind,
   mapUiTarget,
 } from '../../src/dispatch/types';
+import { createReviewClient } from '../../src/review/client';
+import type { ReviewOutcome } from '../../src/review/types';
 import './style.css';
 
 const TARGET_PROVIDER_LABEL: Record<string, string> = {
@@ -264,6 +268,8 @@ const App = () => {
   const [pendingDispatch, setPendingDispatch] = useState<ComposedPacket | null>(null);
   const [recentDispatches, setRecentDispatches] = useState<readonly DispatchEventRecord[]>([]);
   const [dispatchInFlight, setDispatchInFlight] = useState(false);
+  const [reviewThreadId, setReviewThreadId] = useState<string | null>(null);
+  const [reviewInFlight, setReviewInFlight] = useState(false);
   const [setupCompleted, setSetupCompleted] = useState<boolean | null>(null);
   const [stateLoaded, setStateLoaded] = useState(false);
   const [vaultPath, setVaultPath] = useState(DEFAULT_VAULT_PATH);
@@ -296,6 +302,10 @@ const App = () => {
   const composeThread = useMemo(
     () => threads.find((thread) => thread.bac_id === composeThreadId),
     [composeThreadId, threads],
+  );
+  const reviewThread = useMemo(
+    () => threads.find((thread) => thread.bac_id === reviewThreadId),
+    [reviewThreadId, threads],
   );
   const composeWorkstream = useMemo(() => {
     if (composeThread === undefined) {
@@ -564,6 +574,58 @@ const App = () => {
       setError(submitError instanceof Error ? submitError.message : 'Dispatch failed.');
     } finally {
       setDispatchInFlight(false);
+    }
+  };
+
+  const submitReview = async (
+    thread: TrackedThread,
+    payload: { readonly verdict: ReviewVerdict; readonly reviewerNote: string; readonly perSpan: Record<string, string> },
+    outcome: ReviewOutcome,
+  ): Promise<boolean> => {
+    if (bridgeKey.length === 0) {
+      setError('Connect the companion to record reviews.');
+      return false;
+    }
+    const portNumber = Number(port);
+    if (!Number.isFinite(portNumber) || portNumber <= 0) {
+      setError('Invalid companion port.');
+      return false;
+    }
+    const trimmedNote = payload.reviewerNote.trim();
+    if (trimmedNote.length === 0) {
+      setError('Reviewer note is required before saving the review.');
+      return false;
+    }
+    setReviewInFlight(true);
+    setError(null);
+    try {
+      const client = createReviewClient({ port: portNumber, bridgeKey });
+      const idempotencyKey = `rev_ui_${String(Date.now())}_${Math.random().toString(36).slice(2, 10)}`;
+      const spans = Object.entries(payload.perSpan)
+        .filter(([, comment]) => comment.trim().length > 0)
+        .map(([id, comment]) => ({
+          id,
+          text: thread.title,
+          comment: comment.trim(),
+        }));
+      await client.submit(
+        {
+          sourceThreadId: thread.bac_id,
+          sourceTurnOrdinal: 0,
+          provider: thread.provider,
+          verdict: payload.verdict,
+          reviewerNote: trimmedNote,
+          spans,
+          outcome,
+        },
+        idempotencyKey,
+      );
+      return true;
+    } catch (reviewError) {
+      setError(reviewError instanceof Error ? reviewError.message : 'Review failed.');
+      return false;
+    } finally {
+      setReviewInFlight(false);
     }
   };
 
@@ -858,6 +920,18 @@ const App = () => {
                               type="button"
                             >
                               Send to…
+                            </button>
+                            <button
+                              className="btn-link"
+                              disabled={
+                                state.companionStatus !== 'connected' || bridgeKey.length === 0
+                              }
+                              onClick={() => {
+                                setReviewThreadId(thread.bac_id);
+                              }}
+                              type="button"
+                            >
+                              Review
                             </button>
                             <button
                               className="btn-link"
@@ -1210,6 +1284,74 @@ const App = () => {
             }
           }}
         />
+      ) : null}
+
+      {reviewThread ? (
+        <div className="modal-backdrop" onClick={() => { setReviewThreadId(null); }}>
+          <div
+            className="review-modal-shell"
+            onClick={(e) => {
+              e.stopPropagation();
+            }}
+          >
+            <ReviewComposer
+              provider={providerLabel(reviewThread.provider)}
+              capturedAt={formatRelative(reviewThread.lastSeenAt)}
+              spans={[
+                {
+                  id: `${reviewThread.bac_id}_overall`,
+                  text: reviewThread.title,
+                  capturedAt: reviewThread.lastSeenAt,
+                },
+              ]}
+              onClose={() => {
+                setReviewThreadId(null);
+              }}
+              onSave={(payload) => {
+                if (reviewInFlight) {
+                  return;
+                }
+                void submitReview(reviewThread, payload, 'save').then((ok) => {
+                  if (ok) {
+                    setReviewThreadId(null);
+                  }
+                });
+              }}
+              onSubmitBack={() => {
+                if (reviewInFlight) {
+                  return;
+                }
+                void submitReview(
+                  reviewThread,
+                  { verdict: 'partial', reviewerNote: `Submit-back from Sidetrack — ${reviewThread.title}`, perSpan: {} },
+                  'submit_back',
+                ).then((ok) => {
+                  if (ok) {
+                    setReviewThreadId(null);
+                  }
+                });
+              }}
+              onDispatchOut={() => {
+                const dispatchPacket: ComposedPacket = {
+                  kind: 'context_pack',
+                  template: null,
+                  target: 'claude',
+                  title: `Review: ${reviewThread.title}`,
+                  body: `# Review notes\n\n## Source thread\n${providerLabel(reviewThread.provider)} · ${reviewThread.threadUrl}\n\n## Notes\n…`,
+                  scopeLabel: reviewThread.title,
+                  sourceThreadId: reviewThread.bac_id,
+                  ...(reviewThread.primaryWorkstreamId !== undefined
+                    ? { workstreamId: reviewThread.primaryWorkstreamId }
+                    : {}),
+                  tokenEstimate: 0,
+                  redactedItems: [],
+                };
+                setReviewThreadId(null);
+                setPendingDispatch(dispatchPacket);
+              }}
+            />
+          </div>
+        </div>
       ) : null}
 
       {recoveryThread ? (
