@@ -7,6 +7,16 @@ const bacIdSchema = z
   .regex(/^[A-Za-z0-9_-]+$/);
 const isoDateTimeSchema = z.iso.datetime();
 const providerSchema = z.enum(['chatgpt', 'claude', 'gemini', 'unknown']);
+const dispatchTargetProviderSchema = z.enum([
+  'chatgpt',
+  'claude',
+  'gemini',
+  'codex',
+  'claude_code',
+  'cursor',
+  'other',
+]);
+const dispatchStatusSchema = z.enum(['queued', 'sent', 'replied', 'noted', 'pending', 'failed']);
 const tabSnapshotSchema = z.object({
   tabId: z.number().int().optional(),
   windowId: z.number().int().optional(),
@@ -21,6 +31,10 @@ const checklistItemSchema = z.object({
   checked: z.boolean(),
   createdAt: isoDateTimeSchema,
   updatedAt: isoDateTimeSchema,
+});
+const redactionSummarySchema = z.object({
+  matched: z.number().int().nonnegative(),
+  categories: z.array(z.string().min(1)),
 });
 
 export const captureEventSchema = z.object({
@@ -123,6 +137,40 @@ export const reminderUpdateSchema = z.object({
   status: z.enum(['new', 'seen', 'relevant', 'dismissed']).optional(),
 });
 
+export const dispatchEventSchema = z.object({
+  bac_id: bacIdSchema.optional(),
+  kind: z.enum(['research', 'review', 'coding', 'note', 'other']),
+  target: z.object({
+    provider: dispatchTargetProviderSchema,
+    mode: z.enum(['paste', 'auto-send']),
+  }),
+  sourceThreadId: z.string().min(1).optional(),
+  workstreamId: z.string().min(1).optional(),
+  title: z.string().min(1),
+  body: z.string().min(1),
+  createdAt: isoDateTimeSchema.optional(),
+  redactionSummary: redactionSummarySchema.optional(),
+  tokenEstimate: z.number().int().nonnegative().optional(),
+  status: dispatchStatusSchema.default('sent'),
+});
+
+export const dispatchEventRecordSchema = dispatchEventSchema.extend({
+  bac_id: bacIdSchema,
+  createdAt: isoDateTimeSchema,
+  redactionSummary: redactionSummarySchema,
+  tokenEstimate: z.number().int().nonnegative(),
+});
+
+export const dispatchListQuerySchema = z.object({
+  limit: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .transform((limit) => Math.min(limit ?? 25, 100)),
+  since: isoDateTimeSchema.optional(),
+});
+
 export type CaptureEventInput = z.infer<typeof captureEventSchema>;
 export type ThreadUpsertInput = z.infer<typeof threadUpsertSchema>;
 export type WorkstreamCreateInput = z.infer<typeof workstreamCreateSchema>;
@@ -130,3 +178,6 @@ export type WorkstreamUpdateInput = z.infer<typeof workstreamUpdateSchema>;
 export type QueueCreateInput = z.infer<typeof queueCreateSchema>;
 export type ReminderCreateInput = z.infer<typeof reminderCreateSchema>;
 export type ReminderUpdateInput = z.infer<typeof reminderUpdateSchema>;
+export type DispatchEventInput = z.infer<typeof dispatchEventSchema>;
+export type DispatchEventRecord = z.infer<typeof dispatchEventRecordSchema>;
+export type DispatchListQuery = z.infer<typeof dispatchListQuerySchema>;

@@ -19,6 +19,8 @@ tags:
     description: Health and readiness
   - name: events
     description: Append-only capture event writes
+  - name: dispatches
+    description: Dispatch ledger writes and reads
   - name: threads
     description: Tracked thread index writes
   - name: workstreams
@@ -79,6 +81,63 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/MutationResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/VaultUnavailable'
+  /dispatches:
+    post:
+      operationId: recordDispatch
+      description: Record a redacted dispatch event in the vault ledger. Auto-send mode is accepted as an event attribute only; the companion does not send content to providers.
+      tags: [dispatches]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DispatchEventRequest'
+      responses:
+        '201':
+          description: Dispatch event recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DispatchRecordResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/VaultUnavailable'
+    get:
+      operationId: listDispatches
+      description: List recent dispatch events from the local vault ledger.
+      tags: [dispatches]
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 25
+        - name: since
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/IsoDateTime'
+      responses:
+        '200':
+          description: Recent dispatch events.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DispatchListResponse'
         '400':
           $ref: '#/components/responses/ValidationError'
         '401':
@@ -477,6 +536,134 @@ components:
           minItems: 0
           items:
             $ref: '#/components/schemas/CapturedTurn'
+    DispatchKind:
+      type: string
+      enum: [research, review, coding, note, other]
+    DispatchTargetProvider:
+      type: string
+      enum: [chatgpt, claude, gemini, codex, claude_code, cursor, other]
+    DispatchMode:
+      type: string
+      enum: [paste, auto-send]
+    DispatchStatus:
+      type: string
+      enum: [queued, sent, replied, noted, pending, failed]
+    DispatchTarget:
+      type: object
+      additionalProperties: false
+      required: [provider, mode]
+      properties:
+        provider:
+          $ref: '#/components/schemas/DispatchTargetProvider'
+        mode:
+          $ref: '#/components/schemas/DispatchMode'
+    DispatchRedactionSummary:
+      type: object
+      additionalProperties: false
+      required: [matched, categories]
+      properties:
+        matched:
+          type: integer
+          minimum: 0
+        categories:
+          type: array
+          items:
+            type: string
+            minLength: 1
+    DispatchEventRequest:
+      type: object
+      additionalProperties: false
+      required: [kind, target, title, body]
+      properties:
+        bac_id:
+          $ref: '#/components/schemas/BacId'
+        kind:
+          $ref: '#/components/schemas/DispatchKind'
+        target:
+          $ref: '#/components/schemas/DispatchTarget'
+        sourceThreadId:
+          type: string
+          minLength: 1
+        workstreamId:
+          type: string
+          minLength: 1
+        title:
+          type: string
+          minLength: 1
+        body:
+          type: string
+          minLength: 1
+        createdAt:
+          $ref: '#/components/schemas/IsoDateTime'
+        redactionSummary:
+          $ref: '#/components/schemas/DispatchRedactionSummary'
+        tokenEstimate:
+          type: integer
+          minimum: 0
+        status:
+          $ref: '#/components/schemas/DispatchStatus'
+    DispatchEvent:
+      type: object
+      additionalProperties: false
+      required:
+        [bac_id, kind, target, title, body, createdAt, redactionSummary, tokenEstimate, status]
+      properties:
+        bac_id:
+          $ref: '#/components/schemas/BacId'
+        kind:
+          $ref: '#/components/schemas/DispatchKind'
+        target:
+          $ref: '#/components/schemas/DispatchTarget'
+        sourceThreadId:
+          type: string
+          minLength: 1
+        workstreamId:
+          type: string
+          minLength: 1
+        title:
+          type: string
+          minLength: 1
+        body:
+          type: string
+          minLength: 1
+        createdAt:
+          $ref: '#/components/schemas/IsoDateTime'
+        redactionSummary:
+          $ref: '#/components/schemas/DispatchRedactionSummary'
+        tokenEstimate:
+          type: integer
+          minimum: 0
+        status:
+          $ref: '#/components/schemas/DispatchStatus'
+    DispatchRecordResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [bac_id, status]
+          properties:
+            bac_id:
+              $ref: '#/components/schemas/BacId'
+            status:
+              type: string
+              enum: [recorded]
+        warnings:
+          type: array
+          items:
+            type: string
+            enum: [token-budget-exceeded]
+    DispatchListResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/DispatchEvent'
     ThreadUpsertRequest:
       type: object
       additionalProperties: false

@@ -1,9 +1,12 @@
-import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { createBacId, createRevision } from '../domain/ids.js';
+import { dispatchEventRecordSchema } from '../http/schemas.js';
 import type {
   CaptureEventInput,
+  DispatchEventRecord,
+  DispatchListQuery,
   QueueCreateInput,
   ReminderCreateInput,
   ReminderUpdateInput,
@@ -31,6 +34,13 @@ export interface VaultWriter {
     input: CaptureEventInput,
     requestId: string,
   ) => Promise<MutationResult>;
+  readonly writeDispatchEvent: (
+    input: DispatchEventRecord,
+    requestId: string,
+  ) => Promise<{ readonly bac_id: string; readonly status: 'recorded' }>;
+  readonly readDispatchEvents: (
+    query: DispatchListQuery,
+  ) => Promise<readonly DispatchEventRecord[]>;
   readonly upsertThread: (input: ThreadUpsertInput, requestId: string) => Promise<MutationResult>;
   readonly createWorkstream: (
     input: WorkstreamCreateInput,
@@ -77,6 +87,35 @@ const readJsonRecord = async (path: string): Promise<Record<string, unknown>> =>
 const readStringArray = (value: unknown): string[] =>
   Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 
+const isMissingPathError = (error: unknown): boolean =>
+  typeof error === 'object' &&
+  error !== null &&
+  'code' in error &&
+  (error as { readonly code?: unknown }).code === 'ENOENT';
+
+const parseDispatchLine = (line: string): DispatchEventRecord | undefined => {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    const result = dispatchEventRecordSchema.safeParse(parsed);
+    return result.success ? result.data : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const readDispatchFile = async (path: string): Promise<readonly DispatchEventRecord[]> => {
+  const raw = await readFile(path, 'utf8');
+  return raw
+    .split('\n')
+    .map(parseDispatchLine)
+    .filter((event): event is DispatchEventRecord => event !== undefined);
+};
+
 export const createVaultWriter = (vaultPath: string): VaultWriter => {
   const bacRoot = join(vaultPath, '_BAC');
 
@@ -118,6 +157,55 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
       );
       await audit({ requestId, route: 'appendEvent', outcome: 'success', bac_id, timestamp });
       return { bac_id, revision };
+    },
+
+    async writeDispatchEvent(input, requestId) {
+      await ensureVaultPresent();
+      const timestamp = new Date().toISOString();
+      await appendJsonLine(
+        join(bacRoot, 'dispatches', `${dateStamp(new Date(input.createdAt))}.jsonl`),
+        input,
+      );
+      await audit({
+        requestId,
+        route: 'recordDispatch',
+        outcome: 'success',
+        bac_id: input.bac_id,
+        timestamp,
+      });
+      return { bac_id: input.bac_id, status: 'recorded' };
+    },
+
+    async readDispatchEvents(query) {
+      await ensureVaultPresent();
+      const dispatchRoot = join(bacRoot, 'dispatches');
+      let names: string[];
+
+      try {
+        names = await readdir(dispatchRoot);
+      } catch (error) {
+        if (isMissingPathError(error)) {
+          return [];
+        }
+        throw error;
+      }
+
+      const sinceMillis = query.since === undefined ? undefined : Date.parse(query.since);
+      const events = (
+        await Promise.all(
+          names
+            .filter((name) => /^\d{4}-\d{2}-\d{2}\.jsonl$/u.test(name))
+            .sort()
+            .reverse()
+            .slice(0, 100)
+            .map((name) => readDispatchFile(join(dispatchRoot, name))),
+        )
+      ).flat();
+
+      return events
+        .filter((event) => sinceMillis === undefined || Date.parse(event.createdAt) >= sinceMillis)
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+        .slice(0, query.limit);
     },
 
     async upsertThread(input, requestId) {

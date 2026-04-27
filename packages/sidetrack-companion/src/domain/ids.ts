@@ -15,6 +15,8 @@ const randomBase32 = (length: number): string => {
 
 export const createBacId = (): string => randomBase32(16);
 
+export const createDispatchId = (): string => `disp_${randomBase32(20)}`;
+
 export const createRevision = (): string => randomBase32(20);
 
 export const createRequestId = (): string => `req_${randomBase32(20)}`;
