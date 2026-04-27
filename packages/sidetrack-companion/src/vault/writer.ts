@@ -3,6 +3,7 @@ import { basename, dirname, join } from 'node:path';
 
 import { createBacId, createRevision } from '../domain/ids.js';
 import {
+  captureEventSchema,
   dispatchEventRecordSchema,
   reviewEventRecordSchema,
   settingsDocumentSchema,
@@ -19,6 +20,8 @@ import type {
   SettingsDocument,
   SettingsPatchInput,
   ThreadUpsertInput,
+  TurnRecord,
+  TurnsQuery,
   WorkstreamCreateInput,
   WorkstreamUpdateInput,
 } from '../http/schemas.js';
@@ -49,6 +52,7 @@ export interface VaultWriter {
     input: CaptureEventInput,
     requestId: string,
   ) => Promise<MutationResult>;
+  readonly readRecentTurns: (query: TurnsQuery) => Promise<readonly TurnRecord[]>;
   readonly writeDispatchEvent: (
     input: DispatchEventRecord,
     requestId: string,
@@ -201,6 +205,28 @@ const readReviewFile = async (path: string): Promise<readonly ReviewEvent[]> => 
     .filter((event): event is ReviewEvent => event !== undefined);
 };
 
+const parseEventLine = (line: string): CaptureEventInput | undefined => {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    const result = captureEventSchema.safeParse(parsed);
+    return result.success ? result.data : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const readEventFile = async (path: string): Promise<readonly CaptureEventInput[]> => {
+  const raw = await readFile(path, 'utf8');
+  return raw
+    .split('\n')
+    .map(parseEventLine)
+    .filter((event): event is CaptureEventInput => event !== undefined);
+};
+
 export const createVaultWriter = (vaultPath: string): VaultWriter => {
   const bacRoot = join(vaultPath, '_BAC');
   const settingsPath = join(bacRoot, '.config', 'settings.json');
@@ -243,6 +269,50 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
       );
       await audit({ requestId, route: 'appendEvent', outcome: 'success', bac_id, timestamp });
       return { bac_id, revision };
+    },
+
+    async readRecentTurns(query) {
+      await ensureVaultPresent();
+      const eventsRoot = join(bacRoot, 'events');
+      let names: string[];
+      try {
+        names = await readdir(eventsRoot);
+      } catch (error) {
+        if (isMissingPathError(error)) {
+          return [];
+        }
+        throw error;
+      }
+
+      const dedupe = new Map<string, TurnRecord>();
+      for (const name of names
+        .filter((candidate) => /^\d{4}-\d{2}-\d{2}\.jsonl$/u.test(candidate))
+        .sort()
+        .reverse()) {
+        const fileEvents = await readEventFile(join(eventsRoot, name));
+        for (const event of fileEvents) {
+          if (event.threadUrl !== query.threadUrl) {
+            continue;
+          }
+          for (const turn of event.turns) {
+            if (query.role !== undefined && turn.role !== query.role) {
+              continue;
+            }
+            const key = `${String(turn.ordinal)}::${turn.role}`;
+            const existing = dedupe.get(key);
+            if (existing === undefined || existing.capturedAt < turn.capturedAt) {
+              dedupe.set(key, turn);
+            }
+          }
+        }
+        if (dedupe.size >= query.limit * 4) {
+          break;
+        }
+      }
+
+      return Array.from(dedupe.values())
+        .sort((left, right) => right.capturedAt.localeCompare(left.capturedAt))
+        .slice(0, query.limit);
     },
 
     async writeDispatchEvent(input, requestId) {
