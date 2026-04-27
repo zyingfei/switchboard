@@ -301,6 +301,124 @@ button:disabled {
   gap: var(--r2);
 }
 
+/* Workstream cards (Active Work default view) */
+.ws-cards {
+  display: grid;
+  gap: 6px;
+}
+.ws-card {
+  text-align: left;
+  display: grid;
+  gap: 2px;
+  padding: 8px 10px;
+  border: var(--hair-soft);
+  background: var(--paper);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.ws-card:hover {
+  background: var(--ink-0);
+}
+.ws-card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.ws-card-meta {
+  font-size: 10px;
+  color: var(--ink-3);
+}
+.ws-detail-inline {
+  display: grid;
+  gap: 6px;
+}
+.ws-back {
+  align-self: flex-start;
+}
+.ws-detail-head {
+  display: grid;
+  gap: 2px;
+  padding-bottom: 4px;
+}
+
+/* Current Tab row */
+.current-tab-row {
+  display: grid;
+  gap: 4px;
+}
+.current-tab-title {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.current-tab-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* Queued items */
+.queued-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 8px;
+  border: var(--hair-soft);
+  border-radius: 4px;
+}
+.queued-row .queued-text {
+  font-style: italic;
+}
+.queued-row .pill {
+  padding: 1px 6px;
+  font-size: 10px;
+  border-radius: 999px;
+  border: var(--hair-soft);
+}
+.queued-row .pill-pending {
+  background: var(--paper);
+  color: var(--ink-3);
+}
+.queued-row .pill-done {
+  background: var(--paper);
+  color: var(--ink-2);
+}
+.queued-row .pill-dismissed {
+  opacity: 0.5;
+}
+
+/* Recent search */
+.recent-search {
+  display: grid;
+  gap: 4px;
+}
+.recent-search-input {
+  width: 100%;
+  padding: 6px 8px;
+  border: var(--hair-soft);
+  background: var(--paper);
+  border-radius: 4px;
+}
+.recent-search-row {
+  text-align: left;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 6px;
+  align-items: center;
+  padding: 4px 8px;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+.recent-search-row:hover {
+  background: var(--ink-0);
+}
+.recent-search-title {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .thread-row,
 .compact-row {
   display: grid;

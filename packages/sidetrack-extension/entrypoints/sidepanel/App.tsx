@@ -15,6 +15,7 @@ import type { ChecklistItem, WorkstreamUpdate } from '../../src/companion/model'
 import {
   isCaptureFeedbackMessage,
   isRuntimeResponse,
+  isWorkboardChangedMessage,
   messageTypes,
   type WorkboardRequest,
 } from '../../src/messages';
@@ -297,6 +298,8 @@ const App = () => {
   const [selectedThread, setSelectedThread] = useState('');
   const [moveThreadId, setMoveThreadId] = useState<string | null>(null);
   const [recoveryThreadId, setRecoveryThreadId] = useState<string | null>(null);
+  const [expandedWorkstreamId, setExpandedWorkstreamId] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
   const [composeThreadId, setComposeThreadId] = useState<string | null>(null);
   const [pendingDispatch, setPendingDispatch] = useState<ComposedPacket | null>(null);
   const [recentDispatches, setRecentDispatches] = useState<readonly DispatchEventRecord[]>([]);
@@ -362,6 +365,73 @@ const App = () => {
     [recentDispatches],
   );
 
+  interface WorkstreamCardSummary {
+    readonly bac_id: string | null; // null for the synthetic "Inbox / unplaced" card
+    readonly title: string;
+    readonly threadCount: number;
+    readonly queuedCount: number;
+    readonly closedCount: number;
+    readonly hasInbound: boolean;
+  }
+
+  const workstreamCards = useMemo<readonly WorkstreamCardSummary[]>(() => {
+    const summaries: WorkstreamCardSummary[] = [];
+    for (const ws of state.workstreams) {
+      if (ws.parentId !== undefined) {
+        continue; // only top-level cards in Active Work; sub-workstreams render in detail
+      }
+      const wsThreads = threads.filter((t) => t.primaryWorkstreamId === ws.bac_id);
+      summaries.push({
+        bac_id: ws.bac_id,
+        title: ws.title,
+        threadCount: wsThreads.length,
+        queuedCount: state.queueItems.filter((q) => q.targetId === ws.bac_id).length,
+        closedCount: wsThreads.filter((t) => t.status === 'closed' || t.status === 'restorable').length,
+        hasInbound: state.reminders.some((r) => wsThreads.some((t) => t.bac_id === r.threadId)),
+      });
+    }
+    const unplacedThreads = threads.filter((t) => t.primaryWorkstreamId === undefined);
+    if (unplacedThreads.length > 0) {
+      summaries.push({
+        bac_id: null,
+        title: 'Inbox · unplaced',
+        threadCount: unplacedThreads.length,
+        queuedCount: 0,
+        closedCount: unplacedThreads.filter((t) => t.status === 'closed' || t.status === 'restorable')
+          .length,
+        hasInbound: false,
+      });
+    }
+    return summaries;
+  }, [state.workstreams, state.queueItems, state.reminders, threads]);
+
+  const expandedWorkstream = useMemo(
+    () =>
+      expandedWorkstreamId === null
+        ? null
+        : (state.workstreams.find((w) => w.bac_id === expandedWorkstreamId) ?? null),
+    [expandedWorkstreamId, state.workstreams],
+  );
+
+  const expandedWorkstreamThreads = useMemo<readonly TrackedThread[]>(() => {
+    if (expandedWorkstreamId === null) {
+      return threads.filter((t) => t.primaryWorkstreamId === undefined);
+    }
+    return threads.filter((t) => t.primaryWorkstreamId === expandedWorkstreamId);
+  }, [expandedWorkstreamId, threads]);
+
+  const filteredRecent = useMemo<readonly TrackedThread[]>(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (q.length === 0) {
+      return threads.slice(0, 5);
+    }
+    return threads
+      .filter(
+        (t) => t.title.toLowerCase().includes(q) || t.threadUrl.toLowerCase().includes(q),
+      )
+      .slice(0, 10);
+  }, [searchQuery, threads]);
+
   const refresh = async () => {
     const next = await sendRequest({ type: messageTypes.getWorkboardState });
     setState(next);
@@ -395,14 +465,31 @@ const App = () => {
 
   useEffect(() => {
     const runtimeMessages = chrome.runtime.onMessage;
+    let pendingRefresh: number | undefined;
     const listener = (message: unknown) => {
       if (isCaptureFeedbackMessage(message)) {
         setCaptureToastHost(message.host);
+        return;
+      }
+      if (isWorkboardChangedMessage(message)) {
+        // Debounce bursts of mutations into one refresh.
+        if (pendingRefresh !== undefined) {
+          window.clearTimeout(pendingRefresh);
+        }
+        pendingRefresh = window.setTimeout(() => {
+          pendingRefresh = undefined;
+          void refresh().catch(() => {
+            // Silent: SystemBanners covers the broader companion/vault state.
+          });
+        }, 150);
       }
     };
     runtimeMessages.addListener(listener);
     return () => {
       runtimeMessages.removeListener(listener);
+      if (pendingRefresh !== undefined) {
+        window.clearTimeout(pendingRefresh);
+      }
     };
   }, []);
 
@@ -444,6 +531,37 @@ const App = () => {
       cancelled = true;
     };
   }, [state.companionStatus, bridgeKey, port]);
+
+  useEffect(() => {
+    // Defensive auto-save: if the user typed a plausible bridge key + port in
+    // the inline settings form but didn't click Connect, persist after a
+    // short debounce so closing the panel doesn't lose the value. Skips when
+    // the form is empty (initial state) or matches what's already persisted.
+    if (!stateLoaded) {
+      return undefined;
+    }
+    const portNumber = Number(port);
+    if (!Number.isFinite(portNumber) || portNumber <= 0 || bridgeKey.trim().length === 0) {
+      return undefined;
+    }
+    if (
+      bridgeKey === state.settings.companion.bridgeKey &&
+      portNumber === state.settings.companion.port
+    ) {
+      return undefined;
+    }
+    const handle = window.setTimeout(() => {
+      void runAction(() =>
+        sendRequest({
+          type: messageTypes.saveCompanionSettings,
+          settings: { bridgeKey, port: portNumber },
+        }),
+      );
+    }, 700);
+    return () => {
+      window.clearTimeout(handle);
+    };
+  }, [bridgeKey, port, stateLoaded, state.settings.companion.bridgeKey, state.settings.companion.port]);
 
   useEffect(() => {
     if (
@@ -1083,115 +1201,220 @@ const App = () => {
               {collapsed ? null : (
                 <>
                   {section.id === 'current-tab' ? (
-                    <p>{state.currentTab ? state.currentTab.title : section.emptyText}</p>
+                    state.currentTab ? (
+                      <div className="current-tab-row">
+                        <div className="current-tab-title">
+                          <strong>{state.currentTab.title}</strong>
+                          <span className={'chip chip-' + state.currentTab.provider}>
+                            {providerLabel(state.currentTab.provider)}
+                          </span>
+                        </div>
+                        <div className="current-tab-actions">
+                          <button
+                            className="btn-link"
+                            disabled={busy}
+                            onClick={() => {
+                              void runAction(() =>
+                                sendRequest({ type: messageTypes.captureCurrentTab }),
+                              );
+                            }}
+                            type="button"
+                          >
+                            Track
+                          </button>
+                          <button
+                            className="btn-link"
+                            disabled={
+                              state.companionStatus !== 'connected' || bridgeKey.length === 0
+                            }
+                            onClick={() => {
+                              if (state.currentTab !== undefined) {
+                                setComposeThreadId(state.currentTab.bac_id);
+                              }
+                            }}
+                            type="button"
+                          >
+                            Packet
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <p>{section.emptyText}</p>
+                    )
                   ) : null}
                   {section.id === 'active-work' ? (
-                    <div className="item-list">
-                      {threads.length === 0 ? <p>{section.emptyText}</p> : null}
-                      {threads.map((thread) => (
-                        <div className="thread-row" key={thread.bac_id}>
-                          <div>
-                            <strong>{maskTitleForPrivacy(thread, state.workstreams)}</strong>
-                            <p>
-                              {providerLabel(thread.provider)} / {thread.trackingMode} /{' '}
-                              {thread.status}
-                            </p>
-                            <p className="mono">
-                              {workstreamPath(thread.primaryWorkstreamId, state.workstreams)}
-                            </p>
-                          </div>
-                          <div className="thread-actions">
-                            <button
-                              className="btn-link"
-                              disabled={
-                                state.companionStatus !== 'connected' || bridgeKey.length === 0
-                              }
-                              onClick={() => {
-                                setComposeThreadId(thread.bac_id);
-                              }}
-                              type="button"
-                            >
-                              Send to…
-                            </button>
-                            <button
-                              className="btn-link"
-                              disabled={
-                                state.companionStatus !== 'connected' || bridgeKey.length === 0
-                              }
-                              onClick={() => {
-                                setReviewThreadId(thread.bac_id);
-                              }}
-                              type="button"
-                            >
-                              Review
-                            </button>
-                            <button
-                              className="btn-link"
-                              onClick={() => {
-                                setMoveThreadId(thread.bac_id);
-                              }}
-                              type="button"
-                            >
-                              Move to…
-                            </button>
-                            {thread.trackingMode === 'stopped' ? (
-                              <button
-                                className="btn-link"
-                                onClick={() => {
-                                  updateTracking(
-                                    thread.bac_id,
-                                    thread.provider === 'unknown' ? 'manual' : 'auto',
-                                  );
-                                }}
-                                type="button"
-                              >
-                                Resume
-                              </button>
-                            ) : (
-                              <button
-                                className="btn-link"
-                                onClick={() => {
-                                  updateTracking(thread.bac_id, 'stopped');
-                                }}
-                                type="button"
-                              >
-                                Stop
-                              </button>
-                            )}
-                            <button
-                              className="btn-link btn-muted"
-                              onClick={() => {
-                                updateTracking(thread.bac_id, 'removed');
-                              }}
-                              type="button"
-                            >
-                              Remove
-                            </button>
-                            {thread.status === 'restorable' ? (
-                              <button
-                                className="btn-link"
-                                onClick={() => {
-                                  setRecoveryThreadId(thread.bac_id);
-                                }}
-                                type="button"
-                              >
-                                Reopen
-                              </button>
-                            ) : null}
-                          </div>
+                    expandedWorkstreamId === null ? (
+                      <div className="ws-cards">
+                        {workstreamCards.length === 0 ? <p>{section.emptyText}</p> : null}
+                        {workstreamCards.map((card) => (
+                          <button
+                            type="button"
+                            className="ws-card"
+                            key={card.bac_id ?? '__inbox'}
+                            onClick={() => {
+                              setExpandedWorkstreamId(card.bac_id);
+                              setSelectedWorkstream(card.bac_id ?? '');
+                            }}
+                          >
+                            <div className="ws-card-head">
+                              <strong>{card.title}</strong>
+                              {card.hasInbound ? <span className="dot signal" aria-hidden /> : null}
+                            </div>
+                            <div className="ws-card-meta mono">
+                              {card.threadCount} thread{card.threadCount === 1 ? '' : 's'} ·{' '}
+                              {card.queuedCount} queued · {card.closedCount} closed
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="ws-detail-inline">
+                        <button
+                          type="button"
+                          className="btn-link ws-back"
+                          onClick={() => {
+                            setExpandedWorkstreamId(null);
+                          }}
+                        >
+                          ← Active work
+                        </button>
+                        <div className="ws-detail-head">
+                          <strong>
+                            {expandedWorkstream === null
+                              ? 'Inbox · unplaced'
+                              : workstreamPath(expandedWorkstream.bac_id, state.workstreams)}
+                          </strong>
+                          {expandedWorkstream !== null ? (
+                            <span className="subtle mono">
+                              {privacyLabel(expandedWorkstream.privacy)}
+                              {expandedWorkstream.tags.length > 0
+                                ? ' · ' + expandedWorkstream.tags.join(', ')
+                                : ''}
+                            </span>
+                          ) : null}
                         </div>
-                      ))}
-                    </div>
+                        <div className="item-list">
+                          {expandedWorkstreamThreads.length === 0 ? (
+                            <p>No threads here yet.</p>
+                          ) : null}
+                          {expandedWorkstreamThreads.map((thread) => (
+                            <div className="thread-row" key={thread.bac_id}>
+                              <div>
+                                <strong>{maskTitleForPrivacy(thread, state.workstreams)}</strong>
+                                <p>
+                                  {providerLabel(thread.provider)} / {thread.trackingMode} /{' '}
+                                  {thread.status}
+                                </p>
+                              </div>
+                              <div className="thread-actions">
+                                <button
+                                  className="btn-link"
+                                  disabled={
+                                    state.companionStatus !== 'connected' ||
+                                    bridgeKey.length === 0
+                                  }
+                                  onClick={() => {
+                                    setComposeThreadId(thread.bac_id);
+                                  }}
+                                  type="button"
+                                >
+                                  Send to…
+                                </button>
+                                <button
+                                  className="btn-link"
+                                  disabled={
+                                    state.companionStatus !== 'connected' ||
+                                    bridgeKey.length === 0
+                                  }
+                                  onClick={() => {
+                                    setReviewThreadId(thread.bac_id);
+                                  }}
+                                  type="button"
+                                >
+                                  Review
+                                </button>
+                                <button
+                                  className="btn-link"
+                                  onClick={() => {
+                                    setMoveThreadId(thread.bac_id);
+                                  }}
+                                  type="button"
+                                >
+                                  Move to…
+                                </button>
+                                {thread.trackingMode === 'stopped' ? (
+                                  <button
+                                    className="btn-link"
+                                    onClick={() => {
+                                      updateTracking(
+                                        thread.bac_id,
+                                        thread.provider === 'unknown' ? 'manual' : 'auto',
+                                      );
+                                    }}
+                                    type="button"
+                                  >
+                                    Resume
+                                  </button>
+                                ) : (
+                                  <button
+                                    className="btn-link"
+                                    onClick={() => {
+                                      updateTracking(thread.bac_id, 'stopped');
+                                    }}
+                                    type="button"
+                                  >
+                                    Stop
+                                  </button>
+                                )}
+                                <button
+                                  className="btn-link btn-muted"
+                                  onClick={() => {
+                                    updateTracking(thread.bac_id, 'removed');
+                                  }}
+                                  type="button"
+                                >
+                                  Remove
+                                </button>
+                                {thread.status === 'restorable' ? (
+                                  <button
+                                    className="btn-link"
+                                    onClick={() => {
+                                      setRecoveryThreadId(thread.bac_id);
+                                    }}
+                                    type="button"
+                                  >
+                                    Reopen
+                                  </button>
+                                ) : null}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )
                   ) : null}
                   {section.id === 'queued' ? (
                     <div className="item-list">
                       {state.queueItems.length === 0 ? <p>{section.emptyText}</p> : null}
-                      {state.queueItems.map((item) => (
-                        <div className="compact-row" key={item.bac_id}>
-                          <span>{item.text}</span>
-                          <span className="status-chip">{item.status}</span>
-                        </div>
-                      ))}
+                      {state.queueItems.map((item) => {
+                        const targetThread =
+                          item.scope === 'thread' && item.targetId !== undefined
+                            ? threads.find((t) => t.bac_id === item.targetId)
+                            : undefined;
+                        return (
+                          <div className="queued-row" key={item.bac_id}>
+                            {targetThread !== undefined ? (
+                              <span className={'chip chip-' + targetThread.provider}>
+                                {providerLabel(targetThread.provider)}
+                              </span>
+                            ) : (
+                              <span className="chip chip-other mono">{item.scope}</span>
+                            )}
+                            <span className="queued-text">{item.text}</span>
+                            <span className={'pill pill-' + item.status}>{item.status}</span>
+                          </div>
+                        );
+                      })}
                     </div>
                   ) : null}
                   {section.id === 'inbound' ? (
@@ -1235,12 +1458,46 @@ const App = () => {
                     </p>
                   ) : null}
                   {section.id === 'recent-search' ? (
-                    <p>
-                      {threads
-                        .slice(0, 3)
-                        .map((thread) => thread.title)
-                        .join(' / ') || section.emptyText}
-                    </p>
+                    <div className="recent-search">
+                      <input
+                        type="search"
+                        placeholder="Search threads, captures, packets…"
+                        value={searchQuery}
+                        onChange={(e) => {
+                          setSearchQuery(e.target.value);
+                        }}
+                        className="recent-search-input"
+                      />
+                      {filteredRecent.length === 0 ? (
+                        <p className="subtle">
+                          {searchQuery.trim().length > 0 ? 'No matches.' : section.emptyText}
+                        </p>
+                      ) : null}
+                      {filteredRecent.map((thread) => (
+                        <button
+                          type="button"
+                          key={thread.bac_id}
+                          className="recent-search-row"
+                          onClick={() => {
+                            const ws = state.workstreams.find(
+                              (w) => w.bac_id === thread.primaryWorkstreamId,
+                            );
+                            if (ws !== undefined) {
+                              setExpandedWorkstreamId(ws.bac_id);
+                              setSelectedWorkstream(ws.bac_id);
+                            } else {
+                              setExpandedWorkstreamId(null);
+                            }
+                          }}
+                        >
+                          <span className={'chip chip-' + thread.provider}>
+                            {providerLabel(thread.provider)}
+                          </span>
+                          <span className="recent-search-title">{thread.title}</span>
+                          <span className="subtle mono">{formatRelative(thread.lastSeenAt)}</span>
+                        </button>
+                      ))}
+                    </div>
                   ) : null}
                 </>
               )}
