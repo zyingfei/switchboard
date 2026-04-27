@@ -21,6 +21,8 @@ tags:
     description: Append-only capture event writes
   - name: dispatches
     description: Dispatch ledger writes and reads
+  - name: reviews
+    description: Inline review ledger writes and reads
   - name: threads
     description: Tracked thread index writes
   - name: workstreams
@@ -138,6 +140,68 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DispatchListResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/VaultUnavailable'
+  /reviews:
+    post:
+      operationId: recordReview
+      description: Record an inline review event in the vault review ledger.
+      tags: [reviews]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReviewEventRequest'
+      responses:
+        '201':
+          description: Review event recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReviewRecordResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/VaultUnavailable'
+    get:
+      operationId: listReviews
+      description: List recent inline review events from the local vault ledger.
+      tags: [reviews]
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 25
+        - name: since
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/IsoDateTime'
+        - name: threadId
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/BacId'
+      responses:
+        '200':
+          description: Recent review events.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReviewListResponse'
         '400':
           $ref: '#/components/responses/ValidationError'
         '401':
@@ -664,6 +728,109 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/DispatchEvent'
+    ReviewVerdict:
+      type: string
+      enum: [agree, disagree, partial, needs_source, open]
+    ReviewOutcome:
+      type: string
+      enum: [save, submit_back, dispatch_out]
+    ReviewSpan:
+      type: object
+      additionalProperties: false
+      required: [id, text, comment]
+      properties:
+        id:
+          type: string
+          minLength: 1
+        text:
+          type: string
+          minLength: 1
+        comment:
+          type: string
+          minLength: 1
+        capturedAt:
+          $ref: '#/components/schemas/IsoDateTime'
+    ReviewEventRequest:
+      type: object
+      additionalProperties: false
+      required: [sourceThreadId, sourceTurnOrdinal, provider, verdict, reviewerNote, spans, outcome]
+      properties:
+        bac_id:
+          $ref: '#/components/schemas/BacId'
+        sourceThreadId:
+          type: string
+          minLength: 1
+        sourceTurnOrdinal:
+          type: integer
+          minimum: 0
+        provider:
+          $ref: '#/components/schemas/ProviderId'
+        verdict:
+          $ref: '#/components/schemas/ReviewVerdict'
+        reviewerNote:
+          type: string
+          minLength: 1
+        spans:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReviewSpan'
+        outcome:
+          $ref: '#/components/schemas/ReviewOutcome'
+        createdAt:
+          $ref: '#/components/schemas/IsoDateTime'
+    ReviewEvent:
+      type: object
+      additionalProperties: false
+      required:
+        [bac_id, sourceThreadId, sourceTurnOrdinal, provider, verdict, reviewerNote, spans, outcome, createdAt]
+      properties:
+        bac_id:
+          $ref: '#/components/schemas/BacId'
+        sourceThreadId:
+          type: string
+          minLength: 1
+        sourceTurnOrdinal:
+          type: integer
+          minimum: 0
+        provider:
+          $ref: '#/components/schemas/ProviderId'
+        verdict:
+          $ref: '#/components/schemas/ReviewVerdict'
+        reviewerNote:
+          type: string
+          minLength: 1
+        spans:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReviewSpan'
+        outcome:
+          $ref: '#/components/schemas/ReviewOutcome'
+        createdAt:
+          $ref: '#/components/schemas/IsoDateTime'
+    ReviewRecordResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [bac_id, status]
+          properties:
+            bac_id:
+              $ref: '#/components/schemas/BacId'
+            status:
+              type: string
+              enum: [recorded]
+    ReviewListResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReviewEvent'
     ThreadUpsertRequest:
       type: object
       additionalProperties: false
