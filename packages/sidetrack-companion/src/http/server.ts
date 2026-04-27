@@ -4,7 +4,7 @@ import { bridgeKeysMatch } from '../auth/bridgeKey.js';
 import { createDispatchId, createRequestId, createReviewId } from '../domain/ids.js';
 import { redact } from '../safety/redaction.js';
 import { estimateTokens, tokenBudgetWarningThreshold } from '../safety/tokenBudget.js';
-import type { VaultWriter } from '../vault/writer.js';
+import { SettingsRevisionConflictError, type VaultWriter } from '../vault/writer.js';
 import type { IdempotencyStore } from './idempotency.js';
 import type { ValidationIssue } from './problem.js';
 import { createProblem } from './problem.js';
@@ -17,6 +17,7 @@ import {
   reminderUpdateSchema,
   reviewEventSchema,
   reviewListQuerySchema,
+  settingsPatchSchema,
   threadUpsertSchema,
   workstreamCreateSchema,
   workstreamUpdateSchema,
@@ -214,6 +215,24 @@ const routes: readonly RouteDefinition[] = [
       200,
       { data: { companion: 'running', vault: await context.vaultWriter.status(), requestId } },
     ],
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/settings$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => [
+      200,
+      { data: await context.vaultWriter.readSettings() },
+    ],
+  },
+  {
+    method: 'PATCH',
+    pattern: /^\/v1\/settings$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const input = settingsPatchSchema.parse(await readBody(request));
+      return [200, { data: await context.vaultWriter.updateSettings(input, input.revision) }];
+    },
   },
   {
     method: 'POST',
@@ -464,10 +483,12 @@ export const handleRequest = async (
   } catch (error) {
     const issues = getValidationIssues(error);
     const routeError = error instanceof HttpRouteError ? error : undefined;
+    const settingsRevisionConflict = error instanceof SettingsRevisionConflictError;
     const vaultUnavailable =
       error instanceof Error && error.message === 'Vault path is unavailable.';
     const status =
-      routeError?.status ?? (issues === undefined ? (vaultUnavailable ? 503 : 500) : 400);
+      routeError?.status ??
+      (settingsRevisionConflict ? 409 : issues === undefined ? (vaultUnavailable ? 503 : 500) : 400);
     const detail = error instanceof Error ? error.message : undefined;
     sendJson(
       response,
@@ -476,17 +497,21 @@ export const handleRequest = async (
         status,
         code:
           routeError?.code ??
-          (issues === undefined
-            ? vaultUnavailable
-              ? 'VAULT_UNAVAILABLE'
-              : 'INTERNAL_ERROR'
-            : 'VALIDATION_ERROR'),
+          (settingsRevisionConflict
+            ? 'REVISION_CONFLICT'
+            : issues === undefined
+              ? vaultUnavailable
+                ? 'VAULT_UNAVAILABLE'
+                : 'INTERNAL_ERROR'
+              : 'VALIDATION_ERROR'),
         title:
           routeError?.title ??
           (issues === undefined
-            ? vaultUnavailable
-              ? 'Vault path is unavailable.'
-              : 'Internal companion error.'
+            ? settingsRevisionConflict
+              ? 'Settings revision conflict.'
+              : vaultUnavailable
+                ? 'Vault path is unavailable.'
+                : 'Internal companion error.'
             : 'Validation failed.'),
         correlationId: requestId,
         ...(detail === undefined ? {} : { detail }),

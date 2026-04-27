@@ -169,6 +169,107 @@ describe('companion HTTP server', () => {
     expect(write.body).toMatchObject({ code: 'VAULT_UNAVAILABLE' });
   });
 
+  it('returns default settings for a fresh vault', async () => {
+    const result = await jsonFetch(context, `${baseUrl}/v1/settings`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+
+    expect(result.status).toBe(200);
+    expect(result.body).toEqual({
+      data: {
+        autoSendOptIn: { chatgpt: false, claude: false, gemini: false },
+        defaultPacketKind: 'research',
+        defaultDispatchTarget: 'claude',
+        screenShareSafeMode: false,
+        revision: '0',
+      },
+    });
+  });
+
+  it('patches settings with the current revision and bumps the revision', async () => {
+    const result = await jsonFetch(context, `${baseUrl}/v1/settings`, {
+      method: 'PATCH',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        revision: '0',
+        defaultPacketKind: 'coding',
+        screenShareSafeMode: true,
+      }),
+    });
+
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({
+      data: {
+        autoSendOptIn: { chatgpt: false, claude: false, gemini: false },
+        defaultPacketKind: 'coding',
+        defaultDispatchTarget: 'claude',
+        screenShareSafeMode: true,
+        revision: '1',
+      },
+    });
+    await expect(
+      readFile(join(vaultPath, '_BAC', '.config', 'settings.json'), 'utf8'),
+    ).resolves.toContain('"revision": "1"');
+  });
+
+  it('rejects stale settings revisions', async () => {
+    await jsonFetch(context, `${baseUrl}/v1/settings`, {
+      method: 'PATCH',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({ revision: '0', defaultPacketKind: 'review' }),
+    });
+    const stale = await jsonFetch(context, `${baseUrl}/v1/settings`, {
+      method: 'PATCH',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({ revision: '0', defaultPacketKind: 'note' }),
+    });
+
+    expect(stale.status).toBe(409);
+    expect(stale.body).toMatchObject({ code: 'REVISION_CONFLICT' });
+  });
+
+  it('patches one settings field without changing other defaults', async () => {
+    const result = await jsonFetch(context, `${baseUrl}/v1/settings`, {
+      method: 'PATCH',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({ revision: '0', autoSendOptIn: { chatgpt: true } }),
+    });
+
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({
+      data: {
+        autoSendOptIn: { chatgpt: true, claude: false, gemini: false },
+        defaultPacketKind: 'research',
+        defaultDispatchTarget: 'claude',
+        screenShareSafeMode: false,
+        revision: '1',
+      },
+    });
+  });
+
+  it('returns vault-unreachable for settings when the vault is missing', async () => {
+    await rm(vaultPath, { recursive: true, force: true });
+
+    const result = await jsonFetch(context, `${baseUrl}/v1/settings`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+
+    expect(result.status).toBe(503);
+    expect(result.body).toMatchObject({ code: 'VAULT_UNAVAILABLE' });
+  });
+
   it('accepts extension CORS preflight requests', async () => {
     const response = await memoryFetch(context, `${baseUrl}/v1/events`, {
       method: 'OPTIONS',

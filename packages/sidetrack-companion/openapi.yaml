@@ -17,6 +17,8 @@ security:
 tags:
   - name: health
     description: Health and readiness
+  - name: settings
+    description: Companion settings reads and writes
   - name: events
     description: Append-only capture event writes
   - name: dispatches
@@ -63,6 +65,47 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
+  /settings:
+    get:
+      operationId: getSettings
+      description: Return the current companion settings document, or defaults when no settings file exists.
+      tags: [settings]
+      responses:
+        '200':
+          description: Current settings document.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/VaultUnavailable'
+    patch:
+      operationId: updateSettings
+      description: Merge a partial companion settings document using optimistic revision concurrency.
+      tags: [settings]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SettingsPatchRequest'
+      responses:
+        '200':
+          description: Updated settings document.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/VaultUnavailable'
   /events:
     post:
       operationId: appendEvent
@@ -492,6 +535,73 @@ components:
               enum: [connected, unreachable]
             requestId:
               type: string
+    SettingsProviderOptIn:
+      type: object
+      additionalProperties: false
+      required: [chatgpt, claude, gemini]
+      properties:
+        chatgpt:
+          type: boolean
+        claude:
+          type: boolean
+        gemini:
+          type: boolean
+    SettingsProviderOptInPatch:
+      type: object
+      additionalProperties: false
+      properties:
+        chatgpt:
+          type: boolean
+        claude:
+          type: boolean
+        gemini:
+          type: boolean
+    SettingsDocument:
+      type: object
+      additionalProperties: false
+      required:
+        [
+          autoSendOptIn,
+          defaultPacketKind,
+          defaultDispatchTarget,
+          screenShareSafeMode,
+          revision,
+        ]
+      properties:
+        autoSendOptIn:
+          $ref: '#/components/schemas/SettingsProviderOptIn'
+        defaultPacketKind:
+          $ref: '#/components/schemas/DispatchKind'
+        defaultDispatchTarget:
+          $ref: '#/components/schemas/DispatchTargetProvider'
+        screenShareSafeMode:
+          type: boolean
+        revision:
+          type: string
+          minLength: 1
+    SettingsPatchRequest:
+      type: object
+      additionalProperties: false
+      required: [revision]
+      properties:
+        revision:
+          type: string
+          minLength: 1
+        autoSendOptIn:
+          $ref: '#/components/schemas/SettingsProviderOptInPatch'
+        defaultPacketKind:
+          $ref: '#/components/schemas/DispatchKind'
+        defaultDispatchTarget:
+          $ref: '#/components/schemas/DispatchTargetProvider'
+        screenShareSafeMode:
+          type: boolean
+    SettingsResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/SettingsDocument'
     MutationResponse:
       type: object
       additionalProperties: false
