@@ -17,6 +17,8 @@ const dispatchTargetProviderSchema = z.enum([
   'other',
 ]);
 const dispatchStatusSchema = z.enum(['queued', 'sent', 'replied', 'noted', 'pending', 'failed']);
+const reviewVerdictSchema = z.enum(['agree', 'disagree', 'partial', 'needs_source', 'open']);
+const reviewOutcomeSchema = z.enum(['save', 'submit_back', 'dispatch_out']);
 const tabSnapshotSchema = z.object({
   tabId: z.number().int().optional(),
   windowId: z.number().int().optional(),
@@ -161,6 +163,30 @@ export const dispatchEventRecordSchema = dispatchEventSchema.extend({
   tokenEstimate: z.number().int().nonnegative(),
 });
 
+export const reviewEventSchema = z.object({
+  bac_id: bacIdSchema.optional(),
+  sourceThreadId: z.string().min(1),
+  sourceTurnOrdinal: z.number().int().nonnegative(),
+  provider: providerSchema,
+  verdict: reviewVerdictSchema,
+  reviewerNote: z.string().min(1),
+  spans: z.array(
+    z.object({
+      id: z.string().min(1),
+      text: z.string().min(1),
+      comment: z.string().min(1),
+      capturedAt: isoDateTimeSchema.optional(),
+    }),
+  ),
+  outcome: reviewOutcomeSchema,
+  createdAt: isoDateTimeSchema.optional(),
+});
+
+export const reviewEventRecordSchema = reviewEventSchema.extend({
+  bac_id: bacIdSchema,
+  createdAt: isoDateTimeSchema,
+});
+
 export const dispatchListQuerySchema = z.object({
   limit: z.coerce
     .number()
@@ -169,6 +195,17 @@ export const dispatchListQuerySchema = z.object({
     .optional()
     .transform((limit) => Math.min(limit ?? 25, 100)),
   since: isoDateTimeSchema.optional(),
+});
+
+export const reviewListQuerySchema = z.object({
+  limit: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .transform((limit) => Math.min(limit ?? 25, 100)),
+  since: isoDateTimeSchema.optional(),
+  threadId: bacIdSchema.optional(),
 });
 
 export type CaptureEventInput = z.infer<typeof captureEventSchema>;
@@ -181,3 +218,6 @@ export type ReminderUpdateInput = z.infer<typeof reminderUpdateSchema>;
 export type DispatchEventInput = z.infer<typeof dispatchEventSchema>;
 export type DispatchEventRecord = z.infer<typeof dispatchEventRecordSchema>;
 export type DispatchListQuery = z.infer<typeof dispatchListQuerySchema>;
+export type ReviewEventInput = z.infer<typeof reviewEventSchema>;
+export type ReviewEvent = z.infer<typeof reviewEventRecordSchema>;
+export type ReviewListQuery = z.infer<typeof reviewListQuerySchema>;

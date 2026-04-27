@@ -399,6 +399,206 @@ describe('companion HTTP server', () => {
     expect(result.body).toMatchObject({ code: 'VALIDATION_ERROR' });
   });
 
+  it('records review events and lists them from the vault', async () => {
+    const createdAt = '2026-04-26T23:00:00.000Z';
+    const result = await jsonFetch(context, `${baseUrl}/v1/reviews`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'review-test-001',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        sourceThreadId: 'bac_thread_review_001',
+        sourceTurnOrdinal: 2,
+        provider: 'chatgpt',
+        verdict: 'partial',
+        reviewerNote: 'Needs a citation before reuse.',
+        spans: [
+          {
+            id: 'span_001',
+            text: 'The claim needs support.',
+            comment: 'Ask for a primary source.',
+            capturedAt: createdAt,
+          },
+        ],
+        outcome: 'save',
+        createdAt,
+      }),
+    });
+    const list = await jsonFetch(
+      context,
+      `${baseUrl}/v1/reviews?limit=10&since=2026-04-26T00:00:00.000Z`,
+      { headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+
+    expect(result.status).toBe(201);
+    expect(result.body).toMatchObject({
+      data: { bac_id: expect.stringMatching(/^rev_/u), status: 'recorded' },
+    });
+    expect(list.status).toBe(200);
+    expect(list.body).toMatchObject({
+      data: [
+        {
+          sourceThreadId: 'bac_thread_review_001',
+          sourceTurnOrdinal: 2,
+          provider: 'chatgpt',
+          verdict: 'partial',
+          reviewerNote: 'Needs a citation before reuse.',
+          outcome: 'save',
+        },
+      ],
+    });
+    const reviewLog = await readFile(join(vaultPath, '_BAC', 'reviews', '2026-04-26.jsonl'), 'utf8');
+    expect(reviewLog).toContain('Needs a citation before reuse.');
+  });
+
+  it('replays idempotent review responses without duplicating review lines', async () => {
+    const createdAt = '2026-04-26T23:01:00.000Z';
+    const init = {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'review-test-duplicate',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        sourceThreadId: 'bac_thread_review_002',
+        sourceTurnOrdinal: 3,
+        provider: 'claude',
+        verdict: 'agree',
+        reviewerNote: 'Only one review line.',
+        spans: [],
+        outcome: 'submit_back',
+        createdAt,
+      }),
+    } satisfies RequestInit;
+
+    const first = await jsonFetch(context, `${baseUrl}/v1/reviews`, init);
+    const second = await jsonFetch(context, `${baseUrl}/v1/reviews`, init);
+
+    expect(first).toEqual(second);
+    const reviewLog = await readFile(join(vaultPath, '_BAC', 'reviews', '2026-04-26.jsonl'), 'utf8');
+    expect(reviewLog.match(/Only one review line/g)).toHaveLength(1);
+  });
+
+  it('returns vault-unreachable for review writes when the vault is missing', async () => {
+    await rm(vaultPath, { recursive: true, force: true });
+
+    const result = await jsonFetch(context, `${baseUrl}/v1/reviews`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'review-vault-missing',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        sourceThreadId: 'bac_thread_review_003',
+        sourceTurnOrdinal: 1,
+        provider: 'gemini',
+        verdict: 'open',
+        reviewerNote: 'Record once the vault returns.',
+        spans: [],
+        outcome: 'dispatch_out',
+      }),
+    });
+
+    expect(result.status).toBe(503);
+    expect(result.body).toMatchObject({ code: 'VAULT_UNAVAILABLE' });
+  });
+
+  it('rejects invalid review schemas', async () => {
+    const missingRequired = await jsonFetch(context, `${baseUrl}/v1/reviews`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'review-schema-missing',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        sourceTurnOrdinal: 1,
+        provider: 'unknown',
+        verdict: 'open',
+        reviewerNote: 'Missing source thread.',
+        spans: [],
+        outcome: 'save',
+      }),
+    });
+    const badVerdict = await jsonFetch(context, `${baseUrl}/v1/reviews`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'review-schema-bad-verdict',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        sourceThreadId: 'bac_thread_review_004',
+        sourceTurnOrdinal: 1,
+        provider: 'unknown',
+        verdict: 'unsupported',
+        reviewerNote: 'Bad verdict enum.',
+        spans: [],
+        outcome: 'save',
+      }),
+    });
+
+    expect(missingRequired.status).toBe(400);
+    expect(missingRequired.body).toMatchObject({ code: 'VALIDATION_ERROR' });
+    expect(badVerdict.status).toBe(400);
+    expect(badVerdict.body).toMatchObject({ code: 'VALIDATION_ERROR' });
+  });
+
+  it('filters review listings by source thread id', async () => {
+    const first = {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'review-filter-001',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        sourceThreadId: 'bac_thread_filter_a',
+        sourceTurnOrdinal: 1,
+        provider: 'chatgpt',
+        verdict: 'needs_source',
+        reviewerNote: 'Filter A',
+        spans: [],
+        outcome: 'save',
+        createdAt: '2026-04-26T23:02:00.000Z',
+      }),
+    } satisfies RequestInit;
+    const second = {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'review-filter-002',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        sourceThreadId: 'bac_thread_filter_b',
+        sourceTurnOrdinal: 1,
+        provider: 'chatgpt',
+        verdict: 'open',
+        reviewerNote: 'Filter B',
+        spans: [],
+        outcome: 'save',
+        createdAt: '2026-04-26T23:03:00.000Z',
+      }),
+    } satisfies RequestInit;
+
+    await jsonFetch(context, `${baseUrl}/v1/reviews`, first);
+    await jsonFetch(context, `${baseUrl}/v1/reviews`, second);
+    const list = await jsonFetch(context, `${baseUrl}/v1/reviews?threadId=bac_thread_filter_a`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+
+    expect(list.status).toBe(200);
+    expect(list.body).toMatchObject({
+      data: [{ sourceThreadId: 'bac_thread_filter_a', reviewerNote: 'Filter A' }],
+    });
+    expect(JSON.stringify(list.body)).not.toContain('Filter B');
+  });
+
   it('writes thread, workstream, queue, and reminder indexes', async () => {
     const now = '2026-04-26T21:32:00.000Z';
     const threadResult = await jsonFetch(context, `${baseUrl}/v1/threads`, {

@@ -2,7 +2,7 @@ import { access, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { createBacId, createRevision } from '../domain/ids.js';
-import { dispatchEventRecordSchema } from '../http/schemas.js';
+import { dispatchEventRecordSchema, reviewEventRecordSchema } from '../http/schemas.js';
 import type {
   CaptureEventInput,
   DispatchEventRecord,
@@ -10,6 +10,8 @@ import type {
   QueueCreateInput,
   ReminderCreateInput,
   ReminderUpdateInput,
+  ReviewEvent,
+  ReviewListQuery,
   ThreadUpsertInput,
   WorkstreamCreateInput,
   WorkstreamUpdateInput,
@@ -41,6 +43,11 @@ export interface VaultWriter {
   readonly readDispatchEvents: (
     query: DispatchListQuery,
   ) => Promise<readonly DispatchEventRecord[]>;
+  readonly writeReviewEvent: (
+    input: ReviewEvent,
+    requestId: string,
+  ) => Promise<{ readonly bac_id: string; readonly status: 'recorded' }>;
+  readonly readReviewEvents: (query: ReviewListQuery) => Promise<readonly ReviewEvent[]>;
   readonly upsertThread: (input: ThreadUpsertInput, requestId: string) => Promise<MutationResult>;
   readonly createWorkstream: (
     input: WorkstreamCreateInput,
@@ -114,6 +121,29 @@ const readDispatchFile = async (path: string): Promise<readonly DispatchEventRec
     .split('\n')
     .map(parseDispatchLine)
     .filter((event): event is DispatchEventRecord => event !== undefined);
+};
+
+const parseReviewLine = (line: string): ReviewEvent | undefined => {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    const result = reviewEventRecordSchema.safeParse(parsed);
+    return result.success ? result.data : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const readReviewFile = async (path: string): Promise<readonly ReviewEvent[]> => {
+  const raw = await readFile(path, 'utf8');
+  return raw
+    .split('\n')
+    .map(parseReviewLine)
+    .filter((event): event is ReviewEvent => event !== undefined);
 };
 
 export const createVaultWriter = (vaultPath: string): VaultWriter => {
@@ -204,6 +234,61 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
 
       return events
         .filter((event) => sinceMillis === undefined || Date.parse(event.createdAt) >= sinceMillis)
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+        .slice(0, query.limit);
+    },
+
+    async writeReviewEvent(input, requestId) {
+      await ensureVaultPresent();
+      const timestamp = new Date().toISOString();
+      await appendJsonLine(
+        join(bacRoot, 'reviews', `${dateStamp(new Date(input.createdAt))}.jsonl`),
+        input,
+      );
+      await audit({
+        requestId,
+        route: 'recordReview',
+        outcome: 'success',
+        bac_id: input.bac_id,
+        timestamp,
+      });
+      return { bac_id: input.bac_id, status: 'recorded' };
+    },
+
+    async readReviewEvents(query) {
+      await ensureVaultPresent();
+      const reviewRoot = join(bacRoot, 'reviews');
+      let names: string[];
+
+      try {
+        names = await readdir(reviewRoot);
+      } catch (error) {
+        if (isMissingPathError(error)) {
+          return [];
+        }
+        throw error;
+      }
+
+      const sinceMillis = query.since === undefined ? undefined : Date.parse(query.since);
+      const events: ReviewEvent[] = [];
+      for (const name of names
+        .filter((candidate) => /^\d{4}-\d{2}-\d{2}\.jsonl$/u.test(candidate))
+        .sort()
+        .reverse()) {
+        const fileEvents = await readReviewFile(join(reviewRoot, name));
+        events.push(
+          ...fileEvents.filter(
+            (event) =>
+              (sinceMillis === undefined || Date.parse(event.createdAt) >= sinceMillis) &&
+              (query.threadId === undefined || event.sourceThreadId === query.threadId),
+          ),
+        );
+        if (events.length >= query.limit) {
+          break;
+        }
+      }
+
+      return events
         .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
         .slice(0, query.limit);
     },
