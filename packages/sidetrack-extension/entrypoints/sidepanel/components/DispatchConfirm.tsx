@@ -77,7 +77,10 @@ export function DispatchConfirm({
               </span>
             </div>
             <div className="token-bar">
-              <div className={'token-bar-fill ' + tokenLevel} style={{ width: `${String(Math.min(tokenPct, 100))}%` }} />
+              <div
+                className={'token-bar-fill ' + tokenLevel}
+                style={{ width: `${String(Math.min(tokenPct, 100))}%` }}
+              />
             </div>
           </div>
         </div>
@@ -106,9 +109,7 @@ export function DispatchConfirm({
                 <code>{'<context>...</context>'}</code> markers automatically.
               </>
             ) : (
-              <>
-                No prompt-injection patterns in source content.
-              </>
+              <>No prompt-injection patterns in source content.</>
             )}
           </div>
         </div>
@@ -117,7 +118,7 @@ export function DispatchConfirm({
       <details className="preview-details">
         <summary>Final packet preview</summary>
         <pre className="preview-body mono">
-{`# Sidetrack / MVP PRD — context pack
+          {`# Sidetrack / MVP PRD — context pack
 
 ## Workstream
 kind: project · created 2026-04-12
@@ -135,7 +136,9 @@ kind: project · created 2026-04-12
           <button
             type="button"
             className={'pill ' + (mode === 'paste' ? 'on' : '')}
-            onClick={() => { setMode('paste'); }}
+            onClick={() => {
+              setMode('paste');
+            }}
           >
             Paste mode <span className="mono">(default)</span>
           </button>
@@ -165,7 +168,9 @@ kind: project · created 2026-04-12
           type="button"
           className="btn btn-primary"
           disabled={overBudget}
-          onClick={() => { onConfirm(mode); }}
+          onClick={() => {
+            onConfirm(mode);
+          }}
         >
           Confirm dispatch
         </button>

@@ -20,7 +20,7 @@ Status: production-package smoke evidence for PR #13 implementation work.
 
 - [x] Companion binds loopback and rejects non-local hosts/origins except Chrome extension origins.
 - [x] `x-bac-bridge-key` protects all non-health routes.
-- [x] Extension uses `activeTab`, storage, sidePanel, and optional host permissions.
+- [x] Extension uses `activeTab`, storage, sidePanel, explicit M1 provider host permissions, and optional broad host permissions only for arbitrary-page fallback.
 - [x] Provider capture avoids form-control values and records warnings for sensitive-looking visible text.
 - [ ] Full redaction/dispatch safety chain remains M2 by scope.
 
@@ -48,7 +48,7 @@ Status: production-package smoke evidence for PR #13 implementation work.
 - [x] Side panel uses typed runtime messages.
 - [x] Provider extractor fixture tests cover ChatGPT, Claude, Gemini, unknown fallback, structured Markdown, and private form controls.
 - [x] Build smoke verifies a loadable MV3 output.
-- [ ] Full Playwright real-browser provider pass is still manual/pending.
+- [x] Playwright launches the MV3 bundle in bundled Chromium with a persistent temp profile and captures ChatGPT, Claude, and Gemini PoC fixtures into a temp companion vault.
 
 ## MCP Design Review
 
@@ -63,7 +63,7 @@ Status: production-package smoke evidence for PR #13 implementation work.
 Last local smoke run:
 
 - `packages/sidetrack-companion`: lint, typecheck, test, build, OpenAPI lint.
-- `packages/sidetrack-extension`: lint, typecheck, test, build, e2e build smoke.
+- `packages/sidetrack-extension`: lint, typecheck, test, build, bundled-Chromium e2e.
 - `packages/sidetrack-mcp`: lint, typecheck, test, build.
 
 Residual manual acceptance:

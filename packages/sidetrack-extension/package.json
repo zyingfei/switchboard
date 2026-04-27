@@ -13,7 +13,10 @@
     "format:check": "prettier --check .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "e2e": "npm run build && node scripts/verify-extension-build.mjs",
+    "e2e": "npm run build && npm run e2e:prepare-companion && npm run e2e:verify && npm run e2e:playwright",
+    "e2e:playwright": "playwright test",
+    "e2e:prepare-companion": "npm --prefix ../sidetrack-companion run build",
+    "e2e:verify": "node scripts/verify-extension-build.mjs",
     "postinstall": "wxt prepare"
   },
   "dependencies": {
@@ -22,6 +25,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
+    "@playwright/test": "^1.59.1",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@types/chrome": "^0.1.40",

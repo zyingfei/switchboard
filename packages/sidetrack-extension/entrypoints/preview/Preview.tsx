@@ -80,7 +80,9 @@ const STUB_WORKSTREAMS = [
 export function Preview() {
   const [surface, setSurface] = useState<Surface>('none');
 
-  const close = () => { setSurface('none'); };
+  const close = () => {
+    setSurface('none');
+  };
   const noop = () => {
     // intentional no-op; preview stub handlers are wired by Codex / runtime later
   };
@@ -90,11 +92,7 @@ export function Preview() {
       <PreviewToolbar onPick={setSurface} active={surface} />
       <div className="preview-canvas">
         <PreviewSection title="System banners (Mock 10)">
-          <SystemBannersStack
-            companionStatus="down"
-            queuedCount={12}
-            onRetryCompanion={noop}
-          />
+          <SystemBannersStack companionStatus="down" queuedCount={12} onRetryCompanion={noop} />
           <SystemBannersStack vaultStatus="unreachable" onRePickVault={noop} />
           <SystemBannersStack
             providerHealth="degraded"
@@ -123,7 +121,14 @@ export function Preview() {
       </div>
 
       {surface === 'packet' ? (
-        <PacketComposer onCancel={close} onCopy={close} onSave={close} onDispatch={() => { setSurface('dispatch'); }} />
+        <PacketComposer
+          onCancel={close}
+          onCopy={close}
+          onSave={close}
+          onDispatch={() => {
+            setSurface('dispatch');
+          }}
+        />
       ) : null}
       {surface === 'dispatch' ? (
         <DispatchConfirm
@@ -131,13 +136,20 @@ export function Preview() {
           screenShareActive={false}
           injectionDetected={false}
           onCancel={close}
-          onEdit={() => { setSurface('packet'); }}
+          onEdit={() => {
+            setSurface('packet');
+          }}
           onConfirm={close}
         />
       ) : null}
       {surface === 'review' ? (
         <div className="modal-backdrop" onClick={close}>
-          <div onClick={(e) => { e.stopPropagation(); }} style={{ width: 560 }}>
+          <div
+            onClick={(e) => {
+              e.stopPropagation();
+            }}
+            style={{ width: 560 }}
+          >
             <ReviewComposer
               provider="Claude"
               capturedAt="2026-04-26 14:32"
@@ -150,14 +162,14 @@ export function Preview() {
               onClose={close}
               onSave={close}
               onSubmitBack={close}
-              onDispatchOut={() => { setSurface('dispatch'); }}
+              onDispatchOut={() => {
+                setSurface('dispatch');
+              }}
             />
           </div>
         </div>
       ) : null}
-      {surface === 'wizard' ? (
-        <Wizard onClose={close} onPickVault={noop} onFinish={close} />
-      ) : null}
+      {surface === 'wizard' ? <Wizard onClose={close} onPickVault={noop} onFinish={close} /> : null}
       {surface === 'coding' ? (
         <CodingAttach workstreams={STUB_WORKSTREAMS} onCancel={close} onAttach={close} />
       ) : null}
@@ -198,7 +210,13 @@ export function Preview() {
   );
 }
 
-function PreviewToolbar({ onPick, active }: { readonly onPick: (s: Surface) => void; readonly active: Surface }) {
+function PreviewToolbar({
+  onPick,
+  active,
+}: {
+  readonly onPick: (s: Surface) => void;
+  readonly active: Surface;
+}) {
   const surfaces: { key: Surface; label: string }[] = [
     { key: 'packet', label: 'Mock 5 Packet composer' },
     { key: 'dispatch', label: 'Mock 6 Dispatch confirm + safety' },
@@ -217,7 +235,9 @@ function PreviewToolbar({ onPick, active }: { readonly onPick: (s: Surface) => v
           key={surface.key}
           type="button"
           className={'btn ' + (active === surface.key ? 'btn-primary' : 'btn-ghost')}
-          onClick={() => { onPick(surface.key); }}
+          onClick={() => {
+            onPick(surface.key);
+          }}
         >
           {surface.label}
         </button>
@@ -226,7 +246,13 @@ function PreviewToolbar({ onPick, active }: { readonly onPick: (s: Surface) => v
   );
 }
 
-function PreviewSection({ title, children }: { readonly title: string; readonly children: React.ReactNode }) {
+function PreviewSection({
+  title,
+  children,
+}: {
+  readonly title: string;
+  readonly children: React.ReactNode;
+}) {
   return (
     <section className="preview-section">
       <h3 className="preview-section-title">{title}</h3>

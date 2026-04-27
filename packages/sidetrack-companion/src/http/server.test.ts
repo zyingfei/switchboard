@@ -234,4 +234,66 @@ describe('companion HTTP server', () => {
       readFile(join(vaultPath, '_BAC', 'workstreams', `${workstreamId}.json`), 'utf8'),
     ).resolves.toContain('Sidetrack');
   });
+
+  it('updates workstream checklist fields and reminder status', async () => {
+    const now = '2026-04-26T21:33:00.000Z';
+    const workstreamResult = await jsonFetch(`${server.url}/v1/workstreams`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({ title: 'Sidetrack', privacy: 'private' }),
+    });
+    const workstreamId = (workstreamResult.body as { readonly data: { readonly bac_id: string } })
+      .data.bac_id;
+    const revision = (workstreamResult.body as { readonly data: { readonly revision: string } })
+      .data.revision;
+    const checklistUpdate = await jsonFetch(`${server.url}/v1/workstreams/${workstreamId}`, {
+      method: 'PATCH',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        revision,
+        checklist: [
+          {
+            id: 'check_1',
+            text: 'Verify side panel wiring',
+            checked: true,
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+      }),
+    });
+    const reminderResult = await jsonFetch(`${server.url}/v1/reminders`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({ threadId: 'bac_thread_test', provider: 'claude', detectedAt: now }),
+    });
+    const reminderId = (reminderResult.body as { readonly data: { readonly bac_id: string } }).data
+      .bac_id;
+    const reminderUpdate = await jsonFetch(`${server.url}/v1/reminders/${reminderId}`, {
+      method: 'PATCH',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({ status: 'relevant' }),
+    });
+
+    expect(checklistUpdate.status).toBe(200);
+    expect(reminderUpdate.status).toBe(200);
+    await expect(
+      readFile(join(vaultPath, '_BAC', 'workstreams', `${workstreamId}.json`), 'utf8'),
+    ).resolves.toContain('Verify side panel wiring');
+    await expect(
+      readFile(join(vaultPath, '_BAC', 'reminders', `${reminderId}.json`), 'utf8'),
+    ).resolves.toContain('relevant');
+  });
 });

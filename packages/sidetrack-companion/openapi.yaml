@@ -215,6 +215,38 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '503':
           $ref: '#/components/responses/VaultUnavailable'
+  /reminders/{reminderId}:
+    patch:
+      operationId: updateReminder
+      description: Update mutable inbound reminder fields while preserving stable identity.
+      tags: [reminders]
+      parameters:
+        - name: reminderId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/BacId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReminderUpdateRequest'
+      responses:
+        '200':
+          description: Reminder updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MutationResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/VaultUnavailable'
 components:
   securitySchemes:
     bridgeKey:
@@ -563,6 +595,15 @@ components:
           $ref: '#/components/schemas/ProviderId'
         detectedAt:
           $ref: '#/components/schemas/IsoDateTime'
+        status:
+          type: string
+          enum: [new, seen, relevant, dismissed]
+    ReminderUpdateRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        revision:
+          type: string
         status:
           type: string
           enum: [new, seen, relevant, dismissed]

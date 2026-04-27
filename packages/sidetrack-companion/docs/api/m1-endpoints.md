@@ -22,6 +22,7 @@ The Chrome MV3 extension needs a short-lived request/response API because servic
 | Workstreams | PATCH  | `/v1/workstreams/{workstreamId}` | `updateWorkstream` | `workstreams` | v1      |
 | Queue       | POST   | `/v1/queue`                      | `createQueueItem`  | `queue`       | v1      |
 | Reminders   | POST   | `/v1/reminders`                  | `createReminder`   | `reminders`   | v1      |
+| Reminders   | PATCH  | `/v1/reminders/{reminderId}`     | `updateReminder`   | `reminders`   | v1      |
 
 ## Request schema
 
@@ -76,7 +77,7 @@ M1 has no list endpoints on the companion HTTP surface. Future list endpoints us
 
 ## Observability
 
-- Span names: `companion.health.get`, `companion.status.get`, `companion.events.append`, `companion.threads.upsert`, `companion.workstreams.create`, `companion.workstreams.update`, `companion.queue.create`, `companion.reminders.create`
+- Span names: `companion.health.get`, `companion.status.get`, `companion.events.append`, `companion.threads.upsert`, `companion.workstreams.create`, `companion.workstreams.update`, `companion.queue.create`, `companion.reminders.create`, `companion.reminders.update`
 - Log fields: `requestId`, `route`, `method`, `status`, `durationMs`, `outcome`, `errorCode`, `bac_id`
 - Metrics: request count, latency, status class, validation failures, auth failures, vault write failures, idempotency replays
 - Audit event: every write logs `requestId`, route, input entity id if present, resulting `bac_id`, revision, timestamp, and outcome to `_BAC/audit/<date>.jsonl`

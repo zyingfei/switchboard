@@ -216,9 +216,9 @@ content-script logic to production-grade per
 - `chrome.storage.local` for hot cache + capture queue (per PRD §5.3);
   vault is canonical
 - Permission minimization per `standards/03-ts-browser-plugin.md` —
-  ship at install with `activeTab + storage`; request host
-  permissions per-provider via `chrome.permissions.request()` on
-  first "Connect" click
+  ship with explicit host permissions only for the three M1 providers
+  plus localhost fixtures; broad arbitrary-page access remains optional
+  and generic fallback can use the active tab
 
 **Side panel (full Mock 1 Workboard)**:
 - All six sections: Current Tab · Active Work · Queued · Inbound ·

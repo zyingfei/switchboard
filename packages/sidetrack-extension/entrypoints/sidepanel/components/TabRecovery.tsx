@@ -1,6 +1,11 @@
 import { Modal } from './Modal';
 
-export type RestoreStrategy = 'focus_open' | 'restore_session' | 'reopen_url' | 'recreate' | 'unknown';
+export type RestoreStrategy =
+  | 'focus_open'
+  | 'restore_session'
+  | 'reopen_url'
+  | 'recreate'
+  | 'unknown';
 
 const noopHandler = () => {
   // Placeholder when an optional restore handler is not provided.
@@ -39,7 +44,12 @@ export function TabRecovery({
   onRestoreSession,
   onReopenUrl,
 }: TabRecoveryProps) {
-  const strategies: { key: RestoreStrategy; available: boolean; primary: boolean; handler: () => void }[] = [
+  const strategies: {
+    key: RestoreStrategy;
+    available: boolean;
+    primary: boolean;
+    handler: () => void;
+  }[] = [
     {
       key: 'focus_open',
       available: snapshot.restoreStrategy === 'focus_open' && onFocusOpen !== undefined,
@@ -60,7 +70,8 @@ export function TabRecovery({
     },
   ];
 
-  const primary = strategies.find((s) => s.primary && s.available) ?? strategies.find((s) => s.available);
+  const primary =
+    strategies.find((s) => s.primary && s.available) ?? strategies.find((s) => s.available);
 
   return (
     <Modal title="Reopen this tab?" subtitle={snapshot.url} width={460} onClose={onClose}>
@@ -79,7 +90,9 @@ export function TabRecovery({
           <button
             key={s.key}
             type="button"
-            className={'btn ' + (s.primary ? 'btn-primary' : 'btn-ghost') + (!s.available ? ' disabled' : '')}
+            className={
+              'btn ' + (s.primary ? 'btn-primary' : 'btn-ghost') + (!s.available ? ' disabled' : '')
+            }
             disabled={!s.available}
             onClick={s.handler}
           >

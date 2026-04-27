@@ -10,6 +10,7 @@ import {
   captureEventSchema,
   queueCreateSchema,
   reminderCreateSchema,
+  reminderUpdateSchema,
   threadUpsertSchema,
   workstreamCreateSchema,
   workstreamUpdateSchema,
@@ -32,6 +33,7 @@ type HttpMethod = 'GET' | 'POST' | 'PATCH';
 
 interface RouteMatch {
   readonly workstreamId?: string;
+  readonly reminderId?: string;
 }
 
 interface RouteDefinition {
@@ -278,6 +280,19 @@ const routes: readonly RouteDefinition[] = [
       const input = reminderCreateSchema.parse(await readBody(request));
       const result = await context.vaultWriter.createReminder(input, requestId);
       return [201, mutationResponse(result, requestId)];
+    },
+  },
+  {
+    method: 'PATCH',
+    pattern: /^\/v1\/reminders\/(?<reminderId>[A-Za-z0-9_-]+)$/,
+    authRequired: true,
+    handle: async (request, requestId, match, context) => {
+      if (match.reminderId === undefined) {
+        throw new Error('Missing reminderId path parameter.');
+      }
+      const input = reminderUpdateSchema.parse(await readBody(request));
+      const result = await context.vaultWriter.updateReminder(match.reminderId, input, requestId);
+      return [200, mutationResponse(result, requestId)];
     },
   },
 ];

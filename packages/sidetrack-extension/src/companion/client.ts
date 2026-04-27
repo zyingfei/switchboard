@@ -6,6 +6,7 @@ import type {
   Problem,
   QueueCreate,
   ReminderCreate,
+  ReminderUpdate,
   ThreadUpsert,
   WorkstreamCreate,
   WorkstreamUpdate,
@@ -22,6 +23,10 @@ export interface CompanionClient {
   ) => Promise<MutationResult>;
   readonly createQueueItem: (item: QueueCreate, idempotencyKey: string) => Promise<MutationResult>;
   readonly createReminder: (reminder: ReminderCreate) => Promise<MutationResult>;
+  readonly updateReminder: (
+    reminderId: string,
+    reminder: ReminderUpdate,
+  ) => Promise<MutationResult>;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -162,6 +167,15 @@ export class HttpCompanionClient implements CompanionClient {
     return parseMutationResult(
       await this.request('/reminders', {
         method: 'POST',
+        body: JSON.stringify(reminder),
+      }),
+    );
+  }
+
+  async updateReminder(reminderId: string, reminder: ReminderUpdate): Promise<MutationResult> {
+    return parseMutationResult(
+      await this.request(`/reminders/${encodeURIComponent(reminderId)}`, {
+        method: 'PATCH',
         body: JSON.stringify(reminder),
       }),
     );

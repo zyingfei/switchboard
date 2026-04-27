@@ -7,7 +7,12 @@ export interface DispatchEvent {
   readonly sourceTitle: string;
   readonly targetProviderLabel: string;
   readonly targetThreadTitle?: string;
-  readonly dispatchKind: 'submit_back' | 'dispatch_out' | 'research_packet' | 'clone_to_chat' | 'coding_agent_packet';
+  readonly dispatchKind:
+    | 'submit_back'
+    | 'dispatch_out'
+    | 'research_packet'
+    | 'clone_to_chat'
+    | 'coding_agent_packet';
   readonly dispatchedAt: string; // relative
   readonly status: DispatchStatus;
 }
@@ -33,11 +38,17 @@ export interface RecentDispatchesProps {
   readonly onOpenTarget?: (id: string) => void;
 }
 
-export function RecentDispatches({ dispatches, onFocusSource, onOpenTarget }: RecentDispatchesProps) {
+export function RecentDispatches({
+  dispatches,
+  onFocusSource,
+  onOpenTarget,
+}: RecentDispatchesProps) {
   if (dispatches.length === 0) {
     return (
       <div className="dispatches-empty mono">
-        <em>No dispatches yet. They'll appear here when you send a packet or submit a review back.</em>
+        <em>
+          No dispatches yet. They'll appear here when you send a packet or submit a review back.
+        </em>
       </div>
     );
   }
@@ -60,7 +71,9 @@ export function RecentDispatches({ dispatches, onFocusSource, onOpenTarget }: Re
             onClick={() => onOpenTarget?.(dispatch.bac_id)}
           >
             <span className="chip">{dispatch.targetProviderLabel}</span>
-            <span className="dispatch-target-title">{dispatch.targetThreadTitle ?? 'new chat'}</span>
+            <span className="dispatch-target-title">
+              {dispatch.targetThreadTitle ?? 'new chat'}
+            </span>
           </button>
           <span className={'pill pill-' + dispatch.status}>{STATUS_LABEL[dispatch.status]}</span>
           <span className="dispatch-time mono">{dispatch.dispatchedAt}</span>

@@ -25,7 +25,9 @@ export function Modal({
       <div
         className={'modal' + (variant === 'ink' ? ' modal-ink' : '')}
         style={{ width }}
-        onClick={(e) => { e.stopPropagation(); }}
+        onClick={(e) => {
+          e.stopPropagation();
+        }}
       >
         <div className="modal-head">
           <div className="modal-head-text">

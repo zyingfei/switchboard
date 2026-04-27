@@ -69,6 +69,7 @@ export interface QueueItem {
 
 export interface InboundReminder {
   readonly bac_id: string;
+  readonly revision?: string;
   readonly threadId: string;
   readonly provider: ProviderId;
   readonly detectedAt: string;

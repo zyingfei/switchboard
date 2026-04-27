@@ -6,16 +6,15 @@ export default defineConfig({
     name: 'Sidetrack',
     description: 'Local-first browser AI work tracker.',
     permissions: ['activeTab', 'sidePanel', 'storage'],
-    optional_host_permissions: [
+    host_permissions: [
       'https://chatgpt.com/*',
       'https://chat.openai.com/*',
       'https://claude.ai/*',
       'https://gemini.google.com/*',
       'http://127.0.0.1/*',
       'http://localhost/*',
-      'https://*/*',
-      'http://*/*',
     ],
+    optional_host_permissions: ['https://*/*', 'http://*/*'],
     action: {
       default_title: 'Sidetrack',
     },

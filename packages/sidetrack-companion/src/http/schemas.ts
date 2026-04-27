@@ -100,6 +100,8 @@ export const workstreamUpdateSchema = z.object({
   parentId: bacIdSchema.optional(),
   privacy: z.enum(['private', 'shared', 'public']).optional(),
   tags: z.array(z.string()).optional(),
+  children: z.array(bacIdSchema).optional(),
+  checklist: z.array(checklistItemSchema).optional(),
 });
 
 export const queueCreateSchema = z.object({
@@ -116,9 +118,15 @@ export const reminderCreateSchema = z.object({
   status: z.enum(['new', 'seen', 'relevant', 'dismissed']).optional(),
 });
 
+export const reminderUpdateSchema = z.object({
+  revision: z.string().min(1).optional(),
+  status: z.enum(['new', 'seen', 'relevant', 'dismissed']).optional(),
+});
+
 export type CaptureEventInput = z.infer<typeof captureEventSchema>;
 export type ThreadUpsertInput = z.infer<typeof threadUpsertSchema>;
 export type WorkstreamCreateInput = z.infer<typeof workstreamCreateSchema>;
 export type WorkstreamUpdateInput = z.infer<typeof workstreamUpdateSchema>;
 export type QueueCreateInput = z.infer<typeof queueCreateSchema>;
 export type ReminderCreateInput = z.infer<typeof reminderCreateSchema>;
+export type ReminderUpdateInput = z.infer<typeof reminderUpdateSchema>;

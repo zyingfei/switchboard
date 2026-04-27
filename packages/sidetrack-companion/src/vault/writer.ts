@@ -6,6 +6,7 @@ import type {
   CaptureEventInput,
   QueueCreateInput,
   ReminderCreateInput,
+  ReminderUpdateInput,
   ThreadUpsertInput,
   WorkstreamCreateInput,
   WorkstreamUpdateInput,
@@ -45,6 +46,11 @@ export interface VaultWriter {
     input: ReminderCreateInput,
     requestId: string,
   ) => Promise<MutationResult>;
+  readonly updateReminder: (
+    reminderId: string,
+    input: ReminderUpdateInput,
+    requestId: string,
+  ) => Promise<MutationResult>;
 }
 
 const dateStamp = (value: Date): string => value.toISOString().slice(0, 10);
@@ -67,6 +73,9 @@ const readJsonRecord = async (path: string): Promise<Record<string, unknown>> =>
   }
   return parsed as Record<string, unknown>;
 };
+
+const readStringArray = (value: unknown): string[] =>
+  Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 
 export const createVaultWriter = (vaultPath: string): VaultWriter => {
   const bacRoot = join(vaultPath, '_BAC');
@@ -139,8 +148,8 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
         ...input,
         bac_id,
         revision,
-        children: [],
-        checklist: [],
+        children: input.children ?? [],
+        checklist: input.checklist ?? [],
         tags: input.tags ?? [],
         privacy: input.privacy ?? 'private',
         createdAt: timestamp,
@@ -148,6 +157,16 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
       };
 
       await writeJson(join(bacRoot, 'workstreams', `${bac_id}.json`), workstream);
+      if (input.parentId !== undefined) {
+        const parentPath = join(bacRoot, 'workstreams', `${input.parentId}.json`);
+        const parent = await readJsonRecord(parentPath);
+        await writeJson(parentPath, {
+          ...parent,
+          children: [...new Set([...readStringArray(parent['children']), bac_id])],
+          revision: createRevision(),
+          updatedAt: timestamp,
+        });
+      }
       await audit({ requestId, route: 'createWorkstream', outcome: 'success', bac_id, timestamp });
       return { bac_id, revision };
     },
@@ -156,6 +175,8 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
       await ensureVaultPresent();
       const path = join(bacRoot, 'workstreams', `${workstreamId}.json`);
       const existing = await readJsonRecord(path);
+      const previousParentId =
+        typeof existing['parentId'] === 'string' ? existing['parentId'] : undefined;
       const revision = createRevision();
       const timestamp = new Date().toISOString();
       const updated = {
@@ -167,6 +188,28 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
       };
 
       await writeJson(path, updated);
+      if (input.parentId !== undefined && input.parentId !== previousParentId) {
+        if (previousParentId !== undefined) {
+          const previousParentPath = join(bacRoot, 'workstreams', `${previousParentId}.json`);
+          const previousParent = await readJsonRecord(previousParentPath);
+          await writeJson(previousParentPath, {
+            ...previousParent,
+            children: readStringArray(previousParent['children']).filter(
+              (childId) => childId !== workstreamId,
+            ),
+            revision: createRevision(),
+            updatedAt: timestamp,
+          });
+        }
+        const nextParentPath = join(bacRoot, 'workstreams', `${input.parentId}.json`);
+        const nextParent = await readJsonRecord(nextParentPath);
+        await writeJson(nextParentPath, {
+          ...nextParent,
+          children: [...new Set([...readStringArray(nextParent['children']), workstreamId])],
+          revision: createRevision(),
+          updatedAt: timestamp,
+        });
+      }
       await audit({
         requestId,
         route: 'updateWorkstream',
@@ -213,6 +256,31 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
       await writeJson(join(bacRoot, 'reminders', `${bac_id}.json`), reminder);
       await audit({ requestId, route: 'createReminder', outcome: 'success', bac_id, timestamp });
       return { bac_id, revision };
+    },
+
+    async updateReminder(reminderId, input, requestId) {
+      await ensureVaultPresent();
+      const path = join(bacRoot, 'reminders', `${reminderId}.json`);
+      const existing = await readJsonRecord(path);
+      const revision = createRevision();
+      const timestamp = new Date().toISOString();
+      const reminder = {
+        ...existing,
+        ...input,
+        bac_id: reminderId,
+        revision,
+        updatedAt: timestamp,
+      };
+
+      await writeJson(path, reminder);
+      await audit({
+        requestId,
+        route: 'updateReminder',
+        outcome: 'success',
+        bac_id: reminderId,
+        timestamp,
+      });
+      return { bac_id: reminderId, revision };
     },
   };
 };
