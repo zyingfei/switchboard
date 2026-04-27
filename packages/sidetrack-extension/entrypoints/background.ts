@@ -72,6 +72,22 @@ const notifyCaptureSuccess = async (event: CaptureEvent): Promise<void> => {
     .catch(() => undefined);
 };
 
+const broadcastWorkboardChanged = async (
+  reason:
+    | 'capture'
+    | 'mutation'
+    | 'companion-status'
+    | 'reminder'
+    | 'queue'
+    | 'workstream'
+    | 'thread'
+    | 'settings',
+): Promise<void> => {
+  await chrome.runtime
+    .sendMessage({ type: messageTypes.workboardChanged, reason })
+    .catch(() => undefined);
+};
+
 const sendToCompanion = async (
   event: CaptureEvent,
 ): Promise<{ readonly bac_id: string; readonly revision: string }> => {
@@ -231,14 +247,31 @@ const buildState = async (
   currentTab: await currentTabThread(),
 });
 
+type WorkboardChangeReason =
+  | 'capture'
+  | 'mutation'
+  | 'companion-status'
+  | 'reminder'
+  | 'queue'
+  | 'workstream'
+  | 'thread'
+  | 'settings';
+
 const withCompanionStatus = async (
-  work: () => Promise<void> = () => Promise.resolve(),
+  work?: () => Promise<void>,
+  reason?: WorkboardChangeReason,
 ): Promise<RuntimeResponse> => {
   try {
-    await work();
+    if (work !== undefined) {
+      await work();
+    }
     await replayQueuedCaptures();
     const status = await assertCompanionReachable();
-    return { ok: true, state: await buildState(status) };
+    const state = await buildState(status);
+    if (work !== undefined && reason !== undefined) {
+      void broadcastWorkboardChanged(reason);
+    }
+    return { ok: true, state };
   } catch (error) {
     return {
       ok: false,
@@ -390,7 +423,10 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
   }
 
   if (request.type === messageTypes.autoCapture) {
-    const response = await withCompanionStatus(() => storeCaptureEvent(request.capture));
+    const response = await withCompanionStatus(
+      () => storeCaptureEvent(request.capture),
+      'capture',
+    );
     if (response.ok) {
       void notifyCaptureSuccess(request.capture);
     }
@@ -403,45 +439,55 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
 
   if (request.type === messageTypes.saveCompanionSettings) {
     await saveCompanionSettings(request.settings);
-    return await withCompanionStatus();
+    return await withCompanionStatus(() => Promise.resolve(), 'settings');
   }
 
   if (request.type === messageTypes.captureCurrentTab) {
-    return await withCompanionStatus(captureTab);
+    return await withCompanionStatus(captureTab, 'capture');
   }
 
   if (request.type === messageTypes.createWorkstream) {
-    return await withCompanionStatus(() => createWorkstream(request.workstream));
+    return await withCompanionStatus(() => createWorkstream(request.workstream), 'workstream');
   }
 
   if (request.type === messageTypes.updateWorkstream) {
-    return await withCompanionStatus(() => updateWorkstream(request.workstreamId, request.update));
+    return await withCompanionStatus(
+      () => updateWorkstream(request.workstreamId, request.update),
+      'workstream',
+    );
   }
 
   if (request.type === messageTypes.queueFollowUp) {
-    return await withCompanionStatus(() => createQueueItem(request.item));
+    return await withCompanionStatus(() => createQueueItem(request.item), 'queue');
   }
 
   if (request.type === messageTypes.moveThread) {
-    return await withCompanionStatus(() => moveThread(request.threadId, request.workstreamId));
+    return await withCompanionStatus(
+      () => moveThread(request.threadId, request.workstreamId),
+      'thread',
+    );
   }
 
   if (request.type === messageTypes.updateThreadTracking) {
-    return await withCompanionStatus(() =>
-      updateThreadTracking(request.threadId, request.trackingMode),
+    return await withCompanionStatus(
+      () => updateThreadTracking(request.threadId, request.trackingMode),
+      'thread',
     );
   }
 
   if (request.type === messageTypes.restoreThreadTab) {
-    return await withCompanionStatus(() => restoreThreadTab(request.threadId));
+    return await withCompanionStatus(() => restoreThreadTab(request.threadId), 'thread');
   }
 
   if (request.type === messageTypes.createReminder) {
-    return await withCompanionStatus(() => createReminder(request.reminder));
+    return await withCompanionStatus(() => createReminder(request.reminder), 'reminder');
   }
 
   if (request.type === messageTypes.updateReminder) {
-    return await withCompanionStatus(() => updateReminder(request.reminderId, request.update));
+    return await withCompanionStatus(
+      () => updateReminder(request.reminderId, request.update),
+      'reminder',
+    );
   }
 
   await saveCollapsedSections(request.collapsedSections);

@@ -207,8 +207,17 @@ describe('live side-panel App wiring', () => {
 
     expect(await screen.findByText(/Companion: disconnected/)).toBeInTheDocument();
     expect(screen.getByText(/Provider extractor: ChatGPT extractor health/)).toBeInTheDocument();
-    expect(screen.getByText('[private]')).toBeInTheDocument();
+    // InboundCard masks the thread title because the linked thread lives in
+    // a private workstream — it surfaces "[private — workstream item]".
     expect(screen.getByText('[private — workstream item]')).toBeInTheDocument();
+    // Active Work now shows workstream cards by default; click the (private)
+    // workstream card to reveal its threads, where maskTitleForPrivacy yields
+    // the bare "[private]" label.
+    const wsCard = await screen.findByRole('button', {
+      name: /Sidetrack.*thread/,
+    });
+    fireEvent.click(wsCard);
+    expect(await screen.findByText('[private]')).toBeInTheDocument();
 
     fireEvent.click(screen.getByText('Mark relevant'));
 
@@ -221,7 +230,7 @@ describe('live side-panel App wiring', () => {
     });
   });
 
-  it('persists section collapse and routes move-to picker selections', async () => {
+  it('persists section collapse via setCollapsedSections message', async () => {
     const sendMessage = installChromeMock(liveState());
 
     render(<App />);
@@ -234,8 +243,20 @@ describe('live side-panel App wiring', () => {
         collapsedSections: ['active-work'],
       });
     });
+  });
 
-    fireEvent.click(screen.getByText('Move to…'));
+  it('routes move-to picker selections through the moveThread message', async () => {
+    const sendMessage = installChromeMock(liveState());
+
+    render(<App />);
+
+    // Expand the workstream card to reach the per-thread "Move to…" button
+    // (which now lives inside the expanded workstream-detail view, not the
+    // section's default cards).
+    fireEvent.click(
+      await screen.findByRole('button', { name: /Sidetrack.*thread/ }),
+    );
+    fireEvent.click(await screen.findByText('Move to…'));
     await screen.findByText('From: Sidetrack · Side-panel state machine review');
     const siblingButtons = screen.getAllByRole('button', { name: /Sibling/ });
     const siblingButton = siblingButtons.at(-1);

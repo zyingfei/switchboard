@@ -26,6 +26,7 @@ export const messageTypes = {
   createReminder: 'sidetrack.reminder.create',
   updateReminder: 'sidetrack.reminder.update',
   setCollapsedSections: 'sidetrack.sections.collapsed.set',
+  workboardChanged: 'sidetrack.workboard.changed',
 } as const;
 
 export interface SelectorCanaryReport {
@@ -40,6 +41,22 @@ export interface CaptureFeedbackMessage {
   readonly type: typeof messageTypes.captureFeedback;
   readonly host: string;
 }
+
+export interface WorkboardChangedMessage {
+  readonly type: typeof messageTypes.workboardChanged;
+  readonly reason:
+    | 'capture'
+    | 'mutation'
+    | 'companion-status'
+    | 'reminder'
+    | 'queue'
+    | 'workstream'
+    | 'thread'
+    | 'settings';
+}
+
+export const isWorkboardChangedMessage = (value: unknown): value is WorkboardChangedMessage =>
+  isRecord(value) && value.type === messageTypes.workboardChanged && typeof value.reason === 'string';
 
 export interface ContentRequest {
   readonly type: typeof messageTypes.captureVisibleThread;
