@@ -137,7 +137,12 @@ describe('companion HTTP server', () => {
     const eventLog = await readFile(join(vaultPath, '_BAC', 'events', '2026-04-26.jsonl'), 'utf8');
     expect(eventLog).toContain('Captured locally.');
 
-    const auditLog = await readFile(join(vaultPath, '_BAC', 'audit', '2026-04-26.jsonl'), 'utf8');
+    // Audit timestamp uses Date.now() (not the input's capturedAt), so the
+    // file lives at today's UTC date — compute it here to avoid a flaky
+    // test when the local clock is past UTC midnight on the day of the
+    // capturedAt fixture.
+    const auditDate = new Date().toISOString().slice(0, 10);
+    const auditLog = await readFile(join(vaultPath, '_BAC', 'audit', `${auditDate}.jsonl`), 'utf8');
     expect(auditLog).toContain('appendEvent');
   });
 
