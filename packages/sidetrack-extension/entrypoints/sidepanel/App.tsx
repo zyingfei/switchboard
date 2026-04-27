@@ -1404,6 +1404,7 @@ const App = () => {
             });
           }}
           onVaultPathChange={setVaultPath}
+          port={Number.isFinite(Number(port)) && Number(port) > 0 ? Number(port) : 17_373}
           vaultPath={vaultPath}
         />
       ) : null}
