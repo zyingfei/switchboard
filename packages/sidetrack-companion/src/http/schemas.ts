@@ -163,6 +163,28 @@ export const dispatchEventRecordSchema = dispatchEventSchema.extend({
   tokenEstimate: z.number().int().nonnegative(),
 });
 
+const providerOptInSchema = z.object({
+  chatgpt: z.boolean(),
+  claude: z.boolean(),
+  gemini: z.boolean(),
+});
+
+export const settingsDocumentSchema = z.object({
+  autoSendOptIn: providerOptInSchema,
+  defaultPacketKind: z.enum(['research', 'review', 'coding', 'note', 'other']),
+  defaultDispatchTarget: dispatchTargetProviderSchema,
+  screenShareSafeMode: z.boolean(),
+  revision: z.string().min(1),
+});
+
+export const settingsPatchSchema = z.object({
+  revision: z.string().min(1),
+  autoSendOptIn: providerOptInSchema.partial().optional(),
+  defaultPacketKind: settingsDocumentSchema.shape.defaultPacketKind.optional(),
+  defaultDispatchTarget: settingsDocumentSchema.shape.defaultDispatchTarget.optional(),
+  screenShareSafeMode: z.boolean().optional(),
+});
+
 export const reviewEventSchema = z.object({
   bac_id: bacIdSchema.optional(),
   sourceThreadId: z.string().min(1),
@@ -218,6 +240,8 @@ export type ReminderUpdateInput = z.infer<typeof reminderUpdateSchema>;
 export type DispatchEventInput = z.infer<typeof dispatchEventSchema>;
 export type DispatchEventRecord = z.infer<typeof dispatchEventRecordSchema>;
 export type DispatchListQuery = z.infer<typeof dispatchListQuerySchema>;
+export type SettingsDocument = z.infer<typeof settingsDocumentSchema>;
+export type SettingsPatchInput = z.infer<typeof settingsPatchSchema>;
 export type ReviewEventInput = z.infer<typeof reviewEventSchema>;
 export type ReviewEvent = z.infer<typeof reviewEventRecordSchema>;
 export type ReviewListQuery = z.infer<typeof reviewListQuerySchema>;

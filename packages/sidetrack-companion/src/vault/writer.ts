@@ -1,8 +1,12 @@
-import { access, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { access, mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
 
 import { createBacId, createRevision } from '../domain/ids.js';
-import { dispatchEventRecordSchema, reviewEventRecordSchema } from '../http/schemas.js';
+import {
+  dispatchEventRecordSchema,
+  reviewEventRecordSchema,
+  settingsDocumentSchema,
+} from '../http/schemas.js';
 import type {
   CaptureEventInput,
   DispatchEventRecord,
@@ -12,6 +16,8 @@ import type {
   ReminderUpdateInput,
   ReviewEvent,
   ReviewListQuery,
+  SettingsDocument,
+  SettingsPatchInput,
   ThreadUpsertInput,
   WorkstreamCreateInput,
   WorkstreamUpdateInput,
@@ -20,6 +26,13 @@ import type {
 export interface MutationResult {
   readonly bac_id: string;
   readonly revision: string;
+}
+
+export class SettingsRevisionConflictError extends Error {
+  constructor() {
+    super('Settings revision does not match current settings revision.');
+    this.name = 'SettingsRevisionConflictError';
+  }
 }
 
 export interface AuditEvent {
@@ -48,6 +61,11 @@ export interface VaultWriter {
     requestId: string,
   ) => Promise<{ readonly bac_id: string; readonly status: 'recorded' }>;
   readonly readReviewEvents: (query: ReviewListQuery) => Promise<readonly ReviewEvent[]>;
+  readonly readSettings: () => Promise<SettingsDocument>;
+  readonly updateSettings: (
+    patch: SettingsPatchInput,
+    revision: string,
+  ) => Promise<SettingsDocument>;
   readonly upsertThread: (input: ThreadUpsertInput, requestId: string) => Promise<MutationResult>;
   readonly createWorkstream: (
     input: WorkstreamCreateInput,
@@ -72,9 +90,26 @@ export interface VaultWriter {
 
 const dateStamp = (value: Date): string => value.toISOString().slice(0, 10);
 
+const createDefaultSettings = (revision = '0'): SettingsDocument =>
+  settingsDocumentSchema.parse({
+    autoSendOptIn: { chatgpt: false, claude: false, gemini: false },
+    defaultPacketKind: 'research',
+    defaultDispatchTarget: 'claude',
+    screenShareSafeMode: false,
+    revision,
+  });
+
 const writeJson = async (path: string, value: unknown): Promise<void> => {
   await mkdir(join(path, '..'), { recursive: true });
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+};
+
+const writeJsonAtomic = async (path: string, value: unknown): Promise<void> => {
+  const directory = dirname(path);
+  await mkdir(directory, { recursive: true });
+  const tempPath = join(directory, `.${basename(path)}.${createRevision()}.tmp`);
+  await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  await rename(tempPath, path);
 };
 
 const appendJsonLine = async (path: string, value: unknown): Promise<void> => {
@@ -99,6 +134,26 @@ const isMissingPathError = (error: unknown): boolean =>
   error !== null &&
   'code' in error &&
   (error as { readonly code?: unknown }).code === 'ENOENT';
+
+const incrementSettingsRevision = (revision: string): string => {
+  if (!/^\d+$/u.test(revision)) {
+    throw new Error('Settings revision must be numeric to increment.');
+  }
+
+  return (BigInt(revision) + 1n).toString();
+};
+
+const readSettingsDocument = async (path: string): Promise<SettingsDocument> => {
+  try {
+    const raw = await readFile(path, 'utf8');
+    return settingsDocumentSchema.parse(JSON.parse(raw) as unknown);
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      return createDefaultSettings();
+    }
+    throw error;
+  }
+};
 
 const parseDispatchLine = (line: string): DispatchEventRecord | undefined => {
   const trimmed = line.trim();
@@ -148,6 +203,7 @@ const readReviewFile = async (path: string): Promise<readonly ReviewEvent[]> => 
 
 export const createVaultWriter = (vaultPath: string): VaultWriter => {
   const bacRoot = join(vaultPath, '_BAC');
+  const settingsPath = join(bacRoot, '.config', 'settings.json');
 
   const ensureVaultPresent = async (): Promise<void> => {
     try {
@@ -291,6 +347,33 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
       return events
         .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
         .slice(0, query.limit);
+    },
+
+    async readSettings() {
+      await ensureVaultPresent();
+      return await readSettingsDocument(settingsPath);
+    },
+
+    async updateSettings(patch, revision) {
+      await ensureVaultPresent();
+      const current = await readSettingsDocument(settingsPath);
+      if (current.revision !== revision) {
+        throw new SettingsRevisionConflictError();
+      }
+
+      const updated = settingsDocumentSchema.parse({
+        ...current,
+        autoSendOptIn: {
+          ...current.autoSendOptIn,
+          ...(patch.autoSendOptIn ?? {}),
+        },
+        defaultPacketKind: patch.defaultPacketKind ?? current.defaultPacketKind,
+        defaultDispatchTarget: patch.defaultDispatchTarget ?? current.defaultDispatchTarget,
+        screenShareSafeMode: patch.screenShareSafeMode ?? current.screenShareSafeMode,
+        revision: incrementSettingsRevision(current.revision),
+      });
+      await writeJsonAtomic(settingsPath, updated);
+      return updated;
     },
 
     async upsertThread(input, requestId) {
