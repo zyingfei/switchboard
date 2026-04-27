@@ -248,5 +248,32 @@ export const createSidetrackMcpServer = (reader: LiveVaultReader): McpServer => 
     },
   );
 
+  server.registerTool(
+    'bac.reviews',
+    {
+      description: 'Return recent review events from the live Sidetrack vault review ledger.',
+      inputSchema: {
+        limit: z.number().int().positive().max(100).optional(),
+        since: z.iso.datetime().optional(),
+        threadId: z.string().optional(),
+        verdict: z
+          .enum(['agree', 'disagree', 'partial', 'needs_source', 'open'])
+          .optional(),
+      },
+    },
+    async ({ limit, since, threadId, verdict }) => {
+      const result = await reader.readReviews({
+        ...(limit === undefined ? {} : { limit }),
+        ...(since === undefined ? {} : { since }),
+        ...(threadId === undefined ? {} : { threadId }),
+        ...(verdict === undefined ? {} : { verdict }),
+      });
+      return asStructuredContent({
+        data: result.data,
+        ...(result.cursor === undefined ? {} : { cursor: result.cursor }),
+      });
+    },
+  );
+
   return server;
 };

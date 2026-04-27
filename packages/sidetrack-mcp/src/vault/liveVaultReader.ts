@@ -77,11 +77,33 @@ const dispatchEventSchema = z.object({
   status: z.enum(['queued', 'sent', 'replied', 'noted', 'pending', 'failed']),
 });
 
+const reviewVerdictSchema = z.enum(['agree', 'disagree', 'partial', 'needs_source', 'open']);
+
+const reviewEventSchema = z.object({
+  bac_id: bacIdSchema,
+  sourceThreadId: z.string().min(1),
+  sourceTurnOrdinal: z.number().int().nonnegative(),
+  provider: z.enum(['chatgpt', 'claude', 'gemini', 'unknown']),
+  verdict: reviewVerdictSchema,
+  reviewerNote: z.string().min(1),
+  spans: z.array(
+    z.object({
+      id: z.string().min(1),
+      text: z.string().min(1),
+      comment: z.string().min(1),
+      capturedAt: isoDateTimeSchema.optional(),
+    }),
+  ),
+  outcome: z.enum(['save', 'submit_back', 'dispatch_out']),
+  createdAt: isoDateTimeSchema,
+});
+
 export type ThreadRecord = z.infer<typeof threadSchema>;
 export type WorkstreamRecord = z.infer<typeof workstreamSchema>;
 export type QueueItemRecord = z.infer<typeof queueItemSchema>;
 export type ReminderRecord = z.infer<typeof reminderSchema>;
 export type DispatchEvent = z.infer<typeof dispatchEventSchema>;
+export type ReviewEvent = z.infer<typeof reviewEventSchema>;
 
 export interface DispatchReadOptions {
   readonly limit?: number;
@@ -92,6 +114,18 @@ export interface DispatchReadOptions {
 
 export interface DispatchReadResult {
   readonly data: readonly DispatchEvent[];
+  readonly cursor?: string;
+}
+
+export interface ReviewReadOptions {
+  readonly limit?: number;
+  readonly since?: string;
+  readonly threadId?: string;
+  readonly verdict?: ReviewEvent['verdict'];
+}
+
+export interface ReviewReadResult {
+  readonly data: readonly ReviewEvent[];
   readonly cursor?: string;
 }
 
@@ -181,6 +215,29 @@ const readDispatchFile = async (path: string): Promise<DispatchEvent[]> => {
     .filter((event): event is DispatchEvent => event !== undefined);
 };
 
+const parseReviewLine = (line: string): ReviewEvent | undefined => {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    const result = reviewEventSchema.safeParse(parsed);
+    return result.success ? result.data : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const readReviewFile = async (path: string): Promise<ReviewEvent[]> => {
+  const raw = await readFile(path, 'utf8');
+  return raw
+    .split('\n')
+    .map(parseReviewLine)
+    .filter((event): event is ReviewEvent => event !== undefined);
+};
+
 export class LiveVaultReader {
   constructor(private readonly vaultPath: string) {}
 
@@ -227,6 +284,34 @@ export class LiveVaultReader {
             (sinceMillis === undefined || Date.parse(event.createdAt) >= sinceMillis) &&
             (options.workstreamId === undefined || event.workstreamId === options.workstreamId) &&
             (options.provider === undefined || event.target.provider === options.provider),
+        )
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+        .slice(0, limit),
+    };
+  }
+
+  async readReviews(options: ReviewReadOptions = {}): Promise<ReviewReadResult> {
+    const reviewDirectory = ensureInsideRoot(this.vaultPath, '_BAC/reviews');
+    const entries = await readdir(reviewDirectory, { withFileTypes: true }).catch(() => []);
+    const limit = Math.min(options.limit ?? 25, 100);
+    const sinceMillis = options.since === undefined ? undefined : Date.parse(options.since);
+    const events = (
+      await Promise.all(
+        entries
+          .filter((entry) => entry.isFile() && /^\d{4}-\d{2}-\d{2}\.jsonl$/u.test(entry.name))
+          .sort((left, right) => right.name.localeCompare(left.name))
+          .slice(0, 100)
+          .map((entry) => readReviewFile(join(reviewDirectory, entry.name))),
+      )
+    ).flat();
+
+    return {
+      data: events
+        .filter(
+          (event) =>
+            (sinceMillis === undefined || Date.parse(event.createdAt) >= sinceMillis) &&
+            (options.threadId === undefined || event.sourceThreadId === options.threadId) &&
+            (options.verdict === undefined || event.verdict === options.verdict),
         )
         .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
         .slice(0, limit),
