@@ -20,7 +20,9 @@ export { Modal } from './Modal';
 // M2 surfaces
 export { PacketComposer } from './PacketComposer';
 export type {
+  ComposedPacket,
   PacketComposerProps,
+  PacketComposerScope,
   PacketKind,
   ResearchTemplate,
   DispatchTarget,

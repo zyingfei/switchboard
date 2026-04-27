@@ -23,13 +23,39 @@ export type DispatchTarget =
   | 'notebook'
   | 'markdown';
 
+export interface ComposedPacket {
+  readonly kind: PacketKind;
+  readonly template: ResearchTemplate | null;
+  readonly target: DispatchTarget;
+  readonly title: string;
+  readonly body: string;
+  readonly scopeLabel: string;
+  readonly sourceThreadId?: string;
+  readonly workstreamId?: string;
+  readonly tokenEstimate: number;
+  readonly redactedItems: readonly { readonly kind: string; readonly count: number }[];
+}
+
+export interface PacketComposerScope {
+  readonly label: string;
+  readonly meta?: string;
+  readonly sourceThreadId?: string;
+  readonly workstreamId?: string;
+}
+
 export interface PacketComposerProps {
   readonly defaultKind?: PacketKind;
   readonly defaultTemplate?: ResearchTemplate;
+  readonly defaultTitle?: string;
+  readonly defaultBody?: string;
+  readonly scope?: PacketComposerScope;
+  readonly tokenEstimate?: number;
+  readonly tokenLimit?: number;
+  readonly redactedItems?: readonly { readonly kind: string; readonly count: number }[];
   readonly onCancel: () => void;
-  readonly onCopy: () => void;
-  readonly onSave: () => void;
-  readonly onDispatch: () => void;
+  readonly onCopy: (packet: ComposedPacket) => void;
+  readonly onSave: (packet: ComposedPacket) => void;
+  readonly onDispatch: (packet: ComposedPacket) => void;
 }
 
 const KIND_LABELS: Record<PacketKind, string> = {
@@ -58,9 +84,42 @@ const TARGET_LABELS: Record<DispatchTarget, string> = {
   markdown: 'Markdown',
 };
 
+const DEFAULT_BODY = `# Context Pack: Sidetrack / MVP PRD
+
+## Goal
+…
+
+## Active decisions
+- [[Companion install path — HTTP loopback]]
+- [[Per-workstream privacy flag]]
+
+## Relevant threads
+- claude · "Side-panel state machine review"
+- chatgpt · "PRD §24.10 wording"
+
+## Sources
+…
+
+## Open questions
+…`;
+
+const DEFAULT_SCOPE: PacketComposerScope = {
+  label: 'Workstream: Sidetrack / MVP PRD',
+  meta: '3 threads · 2 queued · 1 closed',
+};
+
 export function PacketComposer({
   defaultKind = 'research_packet',
   defaultTemplate = 'web_to_ai_checklist',
+  defaultTitle,
+  defaultBody = DEFAULT_BODY,
+  scope = DEFAULT_SCOPE,
+  tokenEstimate = 4200,
+  tokenLimit = 200_000,
+  redactedItems = [
+    { kind: 'GitHub token', count: 1 },
+    { kind: 'Email', count: 1 },
+  ],
   onCancel,
   onCopy,
   onSave,
@@ -70,18 +129,48 @@ export function PacketComposer({
   const [template, setTemplate] = useState<ResearchTemplate>(defaultTemplate);
   const [target, setTarget] = useState<DispatchTarget | null>(null);
   const [linkDepth, setLinkDepth] = useState(1);
+  const [body, setBody] = useState(defaultBody);
+  const initialTitle = defaultTitle ?? scope.label.replace(/^Workstream:\s*/i, '').trim();
+  const [title, setTitle] = useState(initialTitle);
 
-  // Stub data — actual scope picker, redaction summary, token estimate wired by Codex
-  const tokenEstimate = 4200;
-  const tokenLimit = 200_000;
   const tokenPct = Math.round((tokenEstimate / tokenLimit) * 100);
   const tokenLevel: 'green' | 'amber' | 'over' =
     tokenPct < 80 ? 'green' : tokenPct < 100 ? 'amber' : 'over';
 
-  const redactedItems = [
-    { kind: 'GitHub token', count: 1 },
-    { kind: 'Email', count: 1 },
-  ];
+  const buildPacket = (selectedTarget: DispatchTarget): ComposedPacket => {
+    const packet: ComposedPacket = {
+      kind,
+      template: kind === 'research_packet' ? template : null,
+      target: selectedTarget,
+      title: title.trim().length > 0 ? title.trim() : initialTitle,
+      body,
+      scopeLabel: scope.label,
+      tokenEstimate,
+      redactedItems,
+      ...(scope.sourceThreadId !== undefined ? { sourceThreadId: scope.sourceThreadId } : {}),
+      ...(scope.workstreamId !== undefined ? { workstreamId: scope.workstreamId } : {}),
+    };
+    return packet;
+  };
+
+  const handleCopy = () => {
+    if (target === null) {
+      return;
+    }
+    onCopy(buildPacket(target));
+  };
+  const handleSave = () => {
+    if (target === null) {
+      return;
+    }
+    onSave(buildPacket(target));
+  };
+  const handleDispatch = () => {
+    if (target === null) {
+      return;
+    }
+    onDispatch(buildPacket(target));
+  };
 
   return (
     <Modal title="New packet" subtitle="Compose, preview, dispatch" width={620} onClose={onCancel}>
@@ -124,14 +213,28 @@ export function PacketComposer({
       ) : null}
 
       <div className="composer-row">
+        <label htmlFor="packet-title">Title</label>
+        <input
+          id="packet-title"
+          type="text"
+          className="packet-title-input"
+          value={title}
+          placeholder="Packet title"
+          onChange={(e) => {
+            setTitle(e.target.value);
+          }}
+        />
+      </div>
+
+      <div className="composer-row">
         <label>Scope</label>
         <div className="composer-scope">
           <div className="scope-pick">
             <span className="scope-icon">{Icons.folder}</span>
-            <span>
-              Workstream: <em>Sidetrack / MVP PRD</em>
-            </span>
-            <span className="scope-meta mono">3 threads · 2 queued · 1 closed</span>
+            <span>{scope.label}</span>
+            {scope.meta !== undefined ? (
+              <span className="scope-meta mono">{scope.meta}</span>
+            ) : null}
           </div>
           <div className="scope-options">
             <label className="check-row">
@@ -174,27 +277,15 @@ export function PacketComposer({
       </div>
 
       <div className="composer-preview">
-        <div className="preview-head mono">live preview</div>
-        <pre className="preview-body mono">
-          {`# Context Pack: Sidetrack / MVP PRD
-
-## Goal
-…
-
-## Active decisions
-- [[Companion install path — HTTP loopback]]
-- [[Per-workstream privacy flag]]
-
-## Relevant threads
-- claude · "Side-panel state machine review"
-- chatgpt · "PRD §24.10 wording"
-
-## Sources
-…
-
-## Open questions
-…`}
-        </pre>
+        <div className="preview-head mono">packet body</div>
+        <textarea
+          className="preview-body mono packet-body-input"
+          value={body}
+          onChange={(e) => {
+            setBody(e.target.value);
+          }}
+          rows={10}
+        />
       </div>
 
       <div className="composer-footer-meta">
@@ -219,10 +310,20 @@ export function PacketComposer({
         <button type="button" className="btn btn-ghost" onClick={onCancel}>
           Cancel
         </button>
-        <button type="button" className="btn btn-ghost" onClick={onCopy}>
+        <button
+          type="button"
+          className="btn btn-ghost"
+          disabled={target === null}
+          onClick={handleCopy}
+        >
           <span className="icon-12">{Icons.copy}</span> Copy to clipboard
         </button>
-        <button type="button" className="btn btn-ghost" onClick={onSave}>
+        <button
+          type="button"
+          className="btn btn-ghost"
+          disabled={target === null}
+          onClick={handleSave}
+        >
           Save to vault
         </button>
         <div className="spacer" />
@@ -230,7 +331,7 @@ export function PacketComposer({
           type="button"
           className="btn btn-primary"
           disabled={target === null}
-          onClick={onDispatch}
+          onClick={handleDispatch}
         >
           <span className="icon-12">{Icons.send}</span> Dispatch
         </button>
