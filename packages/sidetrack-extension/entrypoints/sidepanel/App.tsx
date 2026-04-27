@@ -26,6 +26,8 @@ import {
   PacketComposer,
   RecentDispatches,
   ReviewComposer,
+  SettingsPanel,
+  type SettingsValue,
   SystemBannersStack,
   TabRecovery,
   Wizard,
@@ -38,11 +40,14 @@ import {
 import { createDispatchClient } from '../../src/dispatch/client';
 import {
   type DispatchEventRecord,
+  type DispatchMode,
   mapUiPacketKind,
   mapUiTarget,
 } from '../../src/dispatch/types';
 import { createReviewClient } from '../../src/review/client';
 import type { ReviewOutcome } from '../../src/review/types';
+import { createSettingsClient } from '../../src/settings/client';
+import { isProviderWithOptIn, type SettingsDocument } from '../../src/settings/types';
 import './style.css';
 
 const TARGET_PROVIDER_LABEL: Record<string, string> = {
@@ -270,6 +275,10 @@ const App = () => {
   const [dispatchInFlight, setDispatchInFlight] = useState(false);
   const [reviewThreadId, setReviewThreadId] = useState<string | null>(null);
   const [reviewInFlight, setReviewInFlight] = useState(false);
+  const [settings, setSettings] = useState<SettingsDocument | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsBusy, setSettingsBusy] = useState(false);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
   const [setupCompleted, setSetupCompleted] = useState<boolean | null>(null);
   const [stateLoaded, setStateLoaded] = useState(false);
   const [vaultPath, setVaultPath] = useState(DEFAULT_VAULT_PATH);
@@ -397,6 +406,32 @@ const App = () => {
         // Companion may not yet have the dispatches endpoint or the vault is
         // unreachable — surface nothing here; SystemBanners shows the broader
         // companion/vault state already.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [state.companionStatus, bridgeKey, port]);
+
+  useEffect(() => {
+    if (state.companionStatus !== 'connected' || bridgeKey.length === 0) {
+      return undefined;
+    }
+    const portNumber = Number(port);
+    if (!Number.isFinite(portNumber) || portNumber <= 0) {
+      return undefined;
+    }
+    let cancelled = false;
+    const client = createSettingsClient({ port: portNumber, bridgeKey });
+    client
+      .read()
+      .then((document) => {
+        if (!cancelled) {
+          setSettings(document);
+        }
+      })
+      .catch(() => {
+        // Companion may not yet have the settings endpoint; SystemBanners
+        // already covers companion/vault state.
       });
     return () => {
       cancelled = true;
@@ -552,10 +587,15 @@ const App = () => {
     try {
       const client = createDispatchClient({ port: portNumber, bridgeKey });
       const idempotencyKey = `disp_ui_${String(Date.now())}_${Math.random().toString(36).slice(2, 10)}`;
+      const provider = mapUiTarget(pendingDispatch.target);
+      const mode: DispatchMode =
+        settings !== null && isProviderWithOptIn(provider) && settings.autoSendOptIn[provider]
+          ? 'auto-send'
+          : 'paste';
       await client.submit(
         {
           kind: mapUiPacketKind(pendingDispatch.kind),
-          target: { provider: mapUiTarget(pendingDispatch.target), mode: 'paste' },
+          target: { provider, mode },
           title: pendingDispatch.title,
           body: pendingDispatch.body,
           ...(pendingDispatch.sourceThreadId !== undefined
@@ -575,6 +615,42 @@ const App = () => {
     } finally {
       setDispatchInFlight(false);
     }
+  };
+
+  const handleSettingsSave = (next: {
+    readonly autoSendOptIn: SettingsValue['autoSendOptIn'];
+    readonly screenShareSafeMode: boolean;
+  }) => {
+    if (settings === null || bridgeKey.length === 0) {
+      setSettingsError('Connect the companion first to save settings.');
+      return;
+    }
+    const portNumber = Number(port);
+    if (!Number.isFinite(portNumber) || portNumber <= 0) {
+      setSettingsError('Invalid companion port.');
+      return;
+    }
+    setSettingsBusy(true);
+    setSettingsError(null);
+    const client = createSettingsClient({ port: portNumber, bridgeKey });
+    void client
+      .patch({
+        revision: settings.revision,
+        autoSendOptIn: next.autoSendOptIn,
+        screenShareSafeMode: next.screenShareSafeMode,
+      })
+      .then((updated) => {
+        setSettings(updated);
+        setSettingsOpen(false);
+      })
+      .catch((settingsErr: unknown) => {
+        setSettingsError(
+          settingsErr instanceof Error ? settingsErr.message : 'Could not save settings.',
+        );
+      })
+      .finally(() => {
+        setSettingsBusy(false);
+      });
   };
 
   const submitReview = async (
@@ -789,6 +865,16 @@ const App = () => {
           <span className={`status-pill ${state.companionStatus}`}>
             {companionStatusLabel(state.companionStatus)}
           </span>
+          <button
+            className="btn btn-ghost"
+            disabled={state.companionStatus !== 'connected' || bridgeKey.length === 0}
+            onClick={() => {
+              setSettingsOpen(true);
+            }}
+            type="button"
+          >
+            Settings
+          </button>
           <button
             className="btn btn-ghost"
             onClick={() => {
@@ -1406,6 +1492,27 @@ const App = () => {
           onVaultPathChange={setVaultPath}
           port={Number.isFinite(Number(port)) && Number(port) > 0 ? Number(port) : 17_373}
           vaultPath={vaultPath}
+        />
+      ) : null}
+
+      {settingsOpen ? (
+        <SettingsPanel
+          settings={
+            settings === null
+              ? null
+              : {
+                  autoSendOptIn: settings.autoSendOptIn,
+                  screenShareSafeMode: settings.screenShareSafeMode,
+                  revision: settings.revision,
+                }
+          }
+          busy={settingsBusy}
+          error={settingsError}
+          onClose={() => {
+            setSettingsOpen(false);
+            setSettingsError(null);
+          }}
+          onSave={handleSettingsSave}
         />
       ) : null}
     </main>

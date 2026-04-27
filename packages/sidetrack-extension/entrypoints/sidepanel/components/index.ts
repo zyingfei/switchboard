@@ -58,3 +58,6 @@ export type { SystemBannerProps, SystemBannersStackProps, SystemState } from './
 
 export { InboundCard } from './InboundCard';
 export type { InboundCardProps, InboundReminder } from './InboundCard';
+
+export { SettingsPanel } from './SettingsPanel';
+export type { SettingsPanelProps, SettingsValue } from './SettingsPanel';
