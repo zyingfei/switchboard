@@ -50,6 +50,7 @@ import { createReviewClient } from '../../src/review/client';
 import type { ReviewOutcome } from '../../src/review/types';
 import { createSettingsClient } from '../../src/settings/client';
 import { isProviderWithOptIn, type SettingsDocument } from '../../src/settings/types';
+import { createTurnsClient, type CapturedTurnRecord } from '../../src/turns/client';
 import './style.css';
 
 const TARGET_PROVIDER_LABEL: Record<string, string> = {
@@ -302,6 +303,9 @@ const App = () => {
   const [dispatchInFlight, setDispatchInFlight] = useState(false);
   const [reviewThreadId, setReviewThreadId] = useState<string | null>(null);
   const [reviewInFlight, setReviewInFlight] = useState(false);
+  const [reviewTurnsByUrl, setReviewTurnsByUrl] = useState<ReadonlyMap<string, readonly CapturedTurnRecord[]>>(
+    () => new Map<string, readonly CapturedTurnRecord[]>(),
+  );
   const [settings, setSettings] = useState<SettingsDocument | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsBusy, setSettingsBusy] = useState(false);
@@ -440,6 +444,40 @@ const App = () => {
       cancelled = true;
     };
   }, [state.companionStatus, bridgeKey, port]);
+
+  useEffect(() => {
+    if (
+      reviewThread === undefined ||
+      bridgeKey.length === 0 ||
+      reviewTurnsByUrl.has(reviewThread.threadUrl)
+    ) {
+      return undefined;
+    }
+    const portNumber = Number(port);
+    if (!Number.isFinite(portNumber) || portNumber <= 0) {
+      return undefined;
+    }
+    let cancelled = false;
+    const client = createTurnsClient({ port: portNumber, bridgeKey });
+    const targetUrl = reviewThread.threadUrl;
+    void client
+      .recentForThread(targetUrl, { limit: 5, role: 'assistant' })
+      .then((list) => {
+        if (!cancelled) {
+          setReviewTurnsByUrl((prev) => new Map(prev).set(targetUrl, list));
+        }
+      })
+      .catch(() => {
+        // Companion older than turns endpoint, or vault unreachable. Fall back
+        // to thread-title synthetic span.
+        if (!cancelled) {
+          setReviewTurnsByUrl((prev) => new Map(prev).set(targetUrl, []));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reviewThread, bridgeKey, port, reviewTurnsByUrl]);
 
   useEffect(() => {
     let cancelled = false;
@@ -706,6 +744,7 @@ const App = () => {
     thread: TrackedThread,
     payload: { readonly verdict: ReviewVerdict; readonly reviewerNote: string; readonly perSpan: Record<string, string> },
     outcome: ReviewOutcome,
+    spanContext: ReadonlyMap<string, { readonly text: string; readonly ordinal: number; readonly capturedAt?: string }>,
   ): Promise<boolean> => {
     if (bridgeKey.length === 0) {
       setError('Connect the companion to record reviews.');
@@ -728,15 +767,24 @@ const App = () => {
       const idempotencyKey = `rev_ui_${String(Date.now())}_${Math.random().toString(36).slice(2, 10)}`;
       const spans = Object.entries(payload.perSpan)
         .filter(([, comment]) => comment.trim().length > 0)
-        .map(([id, comment]) => ({
-          id,
-          text: thread.title,
-          comment: comment.trim(),
-        }));
+        .map(([id, comment]) => {
+          const context = spanContext.get(id);
+          return {
+            id,
+            text: context?.text ?? thread.title,
+            comment: comment.trim(),
+            ...(context?.capturedAt !== undefined ? { capturedAt: context.capturedAt } : {}),
+          };
+        });
+      const firstWithComment = Object.entries(payload.perSpan).find(
+        ([, comment]) => comment.trim().length > 0,
+      );
+      const sourceTurnOrdinal =
+        firstWithComment !== undefined ? (spanContext.get(firstWithComment[0])?.ordinal ?? 0) : 0;
       await client.submit(
         {
           sourceThreadId: thread.bac_id,
-          sourceTurnOrdinal: 0,
+          sourceTurnOrdinal,
           provider: thread.provider,
           verdict: payload.verdict,
           reviewerNote: trimmedNote,
@@ -1466,73 +1514,112 @@ const App = () => {
         />
       ) : null}
 
-      {reviewThread ? (
-        <div className="modal-backdrop" onClick={() => { setReviewThreadId(null); }}>
-          <div
-            className="review-modal-shell"
-            onClick={(e) => {
-              e.stopPropagation();
-            }}
-          >
-            <ReviewComposer
-              provider={providerLabel(reviewThread.provider)}
-              capturedAt={formatRelative(reviewThread.lastSeenAt)}
-              spans={[
-                {
-                  id: `${reviewThread.bac_id}_overall`,
-                  text: reviewThread.title,
-                  capturedAt: reviewThread.lastSeenAt,
-                },
-              ]}
-              onClose={() => {
-                setReviewThreadId(null);
-              }}
-              onSave={(payload) => {
-                if (reviewInFlight) {
-                  return;
-                }
-                void submitReview(reviewThread, payload, 'save').then((ok) => {
-                  if (ok) {
-                    setReviewThreadId(null);
-                  }
-                });
-              }}
-              onSubmitBack={() => {
-                if (reviewInFlight) {
-                  return;
-                }
-                void submitReview(
-                  reviewThread,
-                  { verdict: 'partial', reviewerNote: `Submit-back from Sidetrack — ${reviewThread.title}`, perSpan: {} },
-                  'submit_back',
-                ).then((ok) => {
-                  if (ok) {
-                    setReviewThreadId(null);
-                  }
-                });
-              }}
-              onDispatchOut={() => {
-                const dispatchPacket: ComposedPacket = {
-                  kind: 'context_pack',
-                  template: null,
-                  target: 'claude',
-                  title: `Review: ${reviewThread.title}`,
-                  body: `# Review notes\n\n## Source thread\n${providerLabel(reviewThread.provider)} · ${reviewThread.threadUrl}\n\n## Notes\n…`,
-                  scopeLabel: reviewThread.title,
-                  sourceThreadId: reviewThread.bac_id,
-                  ...(reviewThread.primaryWorkstreamId !== undefined
-                    ? { workstreamId: reviewThread.primaryWorkstreamId }
-                    : {}),
-                  tokenEstimate: 0,
-                  redactedItems: [],
-                };
-                setReviewThreadId(null);
-                setPendingDispatch(dispatchPacket);
-              }}
-            />
-          </div>
-        </div>
-      ) : null}
+      {reviewThread
+        ? (() => {
+            const fetchedTurns = reviewTurnsByUrl.get(reviewThread.threadUrl);
+            const realSpans =
+              fetchedTurns !== undefined && fetchedTurns.length > 0
+                ? fetchedTurns.map((turn) => ({
+                    id: `turn_${String(turn.ordinal)}`,
+                    text: turn.text.length > 600 ? `${turn.text.slice(0, 600)}…` : turn.text,
+                    capturedAt: turn.capturedAt,
+                  }))
+                : [
+                    {
+                      id: `${reviewThread.bac_id}_overall`,
+                      text: reviewThread.title,
+                      capturedAt: reviewThread.lastSeenAt,
+                    },
+                  ];
+            const spanContext = new Map(
+              fetchedTurns !== undefined && fetchedTurns.length > 0
+                ? fetchedTurns.map(
+                    (turn) =>
+                      [
+                        `turn_${String(turn.ordinal)}`,
+                        { text: turn.text, ordinal: turn.ordinal, capturedAt: turn.capturedAt },
+                      ] as const,
+                  )
+                : [
+                    [
+                      `${reviewThread.bac_id}_overall`,
+                      { text: reviewThread.title, ordinal: 0, capturedAt: reviewThread.lastSeenAt },
+                    ] as const,
+                  ],
+            );
+            return (
+              <div
+                className="modal-backdrop"
+                onClick={() => {
+                  setReviewThreadId(null);
+                }}
+              >
+                <div
+                  className="review-modal-shell"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                  }}
+                >
+                  <ReviewComposer
+                    provider={providerLabel(reviewThread.provider)}
+                    capturedAt={formatRelative(reviewThread.lastSeenAt)}
+                    spans={realSpans}
+                    onClose={() => {
+                      setReviewThreadId(null);
+                    }}
+                    onSave={(payload) => {
+                      if (reviewInFlight) {
+                        return;
+                      }
+                      void submitReview(reviewThread, payload, 'save', spanContext).then((ok) => {
+                        if (ok) {
+                          setReviewThreadId(null);
+                        }
+                      });
+                    }}
+                    onSubmitBack={() => {
+                      if (reviewInFlight) {
+                        return;
+                      }
+                      void submitReview(
+                        reviewThread,
+                        {
+                          verdict: 'partial',
+                          reviewerNote: `Submit-back from Sidetrack — ${reviewThread.title}`,
+                          perSpan: {},
+                        },
+                        'submit_back',
+                        spanContext,
+                      ).then((ok) => {
+                        if (ok) {
+                          setReviewThreadId(null);
+                        }
+                      });
+                    }}
+                    onDispatchOut={() => {
+                      const dispatchPacket: ComposedPacket = {
+                        kind: 'context_pack',
+                        template: null,
+                        target: 'claude',
+                        title: `Review: ${reviewThread.title}`,
+                        body: `# Review notes\n\n## Source thread\n${providerLabel(reviewThread.provider)} · ${reviewThread.threadUrl}\n\n## Notes\n…`,
+                        scopeLabel: reviewThread.title,
+                        sourceThreadId: reviewThread.bac_id,
+                        ...(reviewThread.primaryWorkstreamId !== undefined
+                          ? { workstreamId: reviewThread.primaryWorkstreamId }
+                          : {}),
+                        tokenEstimate: 0,
+                        redactedItems: [],
+                      };
+                      setReviewThreadId(null);
+                      setPendingDispatch(dispatchPacket);
+                    }}
+                  />
+                </div>
+              </div>
+            );
+          })()
+        : null}
 
       {recoveryThread ? (
         <TabRecovery

@@ -19,6 +19,7 @@ import {
   reviewListQuerySchema,
   settingsPatchSchema,
   threadUpsertSchema,
+  turnsQuerySchema,
   workstreamCreateSchema,
   workstreamUpdateSchema,
 } from './schemas.js';
@@ -281,6 +282,33 @@ const routes: readonly RouteDefinition[] = [
         since: url.searchParams.get('since') ?? undefined,
       });
       return [200, { data: await context.vaultWriter.readDispatchEvents(query) }];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/turns$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+      const threadUrl = url.searchParams.get('threadUrl');
+      if (threadUrl === null) {
+        return [
+          400,
+          createProblem({
+            title: 'threadUrl query parameter is required',
+            status: 400,
+            code: 'MISSING_PARAMETER',
+            correlationId: createRequestId(),
+            detail: 'GET /v1/turns requires a threadUrl query parameter.',
+          }),
+        ];
+      }
+      const query = turnsQuerySchema.parse({
+        threadUrl,
+        limit: url.searchParams.get('limit') ?? undefined,
+        role: url.searchParams.get('role') ?? undefined,
+      });
+      return [200, { data: await context.vaultWriter.readRecentTurns(query) }];
     },
   },
   {

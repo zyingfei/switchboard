@@ -230,6 +230,26 @@ export const reviewListQuerySchema = z.object({
   threadId: bacIdSchema.optional(),
 });
 
+export const turnsQuerySchema = z.object({
+  threadUrl: z.url(),
+  limit: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .transform((limit) => Math.min(limit ?? 5, 50)),
+  role: z.enum(['user', 'assistant', 'system', 'unknown']).optional(),
+});
+
+export const turnRecordSchema = z.object({
+  role: z.enum(['user', 'assistant', 'system', 'unknown']),
+  text: z.string().min(1),
+  formattedText: z.string().min(1).optional(),
+  ordinal: z.number().int().nonnegative(),
+  capturedAt: isoDateTimeSchema,
+  sourceSelector: z.string().min(1).optional(),
+});
+
 export type CaptureEventInput = z.infer<typeof captureEventSchema>;
 export type ThreadUpsertInput = z.infer<typeof threadUpsertSchema>;
 export type WorkstreamCreateInput = z.infer<typeof workstreamCreateSchema>;
@@ -245,3 +265,5 @@ export type SettingsPatchInput = z.infer<typeof settingsPatchSchema>;
 export type ReviewEventInput = z.infer<typeof reviewEventSchema>;
 export type ReviewEvent = z.infer<typeof reviewEventRecordSchema>;
 export type ReviewListQuery = z.infer<typeof reviewListQuerySchema>;
+export type TurnsQuery = z.infer<typeof turnsQuerySchema>;
+export type TurnRecord = z.infer<typeof turnRecordSchema>;

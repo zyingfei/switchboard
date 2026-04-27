@@ -335,6 +335,61 @@ describe('companion HTTP server', () => {
     expect(auditLog).toContain('appendEvent');
   });
 
+  it('returns recent turns for a threadUrl, deduped by ordinal newest-wins', async () => {
+    const earlier = '2026-04-26T20:00:00.000Z';
+    const later = '2026-04-26T22:00:00.000Z';
+    const threadUrl = 'https://claude.ai/chat/turns-test';
+
+    const post = async (capturedAt: string, idem: string, text: string, ordinal = 0) => {
+      const headers: Record<string, string> = {
+        'content-type': 'application/json',
+        'idempotency-key': idem,
+        'x-bac-bridge-key': bridgeKey,
+      };
+      return jsonFetch(context, `${baseUrl}/v1/events`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          provider: 'claude',
+          threadUrl,
+          title: 'Turns test',
+          capturedAt,
+          turns: [{ role: 'assistant', text, ordinal, capturedAt }],
+        }),
+      });
+    };
+
+    const p1 = await post(earlier, 'turns-test-001', 'first capture v1');
+    const p2 = await post(later, 'turns-test-002', 'first capture v2');
+    const p3 = await post(later, 'turns-test-003', 'second turn', 1);
+    expect(p1.status).toBe(201);
+    expect(p2.status).toBe(201);
+    expect(p3.status).toBe(201);
+
+    const list = await jsonFetch(
+      context,
+      `${baseUrl}/v1/turns?threadUrl=${encodeURIComponent(threadUrl)}&limit=10`,
+      { headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+    expect(list.status).toBe(200);
+    const data = (list.body as { readonly data: readonly { readonly text: string; readonly ordinal: number }[] })
+      .data;
+    expect(data).toHaveLength(2);
+    // Both have the same capturedAt; order across ties is unspecified, but
+    // dedupe semantics MUST keep the newest write for ordinal 0 (v2, not v1).
+    const byOrdinal = new Map(data.map((turn) => [turn.ordinal, turn.text]));
+    expect(byOrdinal.get(0)).toBe('first capture v2');
+    expect(byOrdinal.get(1)).toBe('second turn');
+  });
+
+  it('rejects /v1/turns without a threadUrl query param', async () => {
+    const result = await jsonFetch(context, `${baseUrl}/v1/turns`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect(result.status).toBe(400);
+    expect(result.body).toMatchObject({ code: 'MISSING_PARAMETER' });
+  });
+
   it('replays idempotent event responses without duplicating event lines', async () => {
     const capturedAt = '2026-04-26T21:31:00.000Z';
     const init = {
