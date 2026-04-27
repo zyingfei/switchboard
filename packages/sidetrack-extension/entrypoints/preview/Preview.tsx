@@ -2,6 +2,7 @@ import { useState } from 'react';
 import {
   Annotation,
   CodingAttach,
+  type ComposedPacket,
   DispatchConfirm,
   InboundCard,
   type InboundReminder,
@@ -14,6 +15,7 @@ import {
   TabRecovery,
   Wizard,
 } from '../sidepanel/components';
+import { mapUiTarget } from '../../src/dispatch/types';
 
 type Surface =
   | 'none'
@@ -77,15 +79,73 @@ const STUB_WORKSTREAMS = [
   { bac_id: 'ws-vm', path: 'VM Live Migration' },
 ];
 
+const TARGET_LABEL: Record<string, string> = {
+  chatgpt: 'ChatGPT',
+  claude: 'Claude',
+  gemini: 'Gemini',
+  codex: 'Codex',
+  claude_code: 'Claude Code',
+  cursor: 'Cursor',
+  other: 'Other',
+};
+
 export function Preview() {
   const [surface, setSurface] = useState<Surface>('none');
+  const [pendingPacket, setPendingPacket] = useState<ComposedPacket | null>(null);
+  const [recentDispatches, setRecentDispatches] = useState<readonly DispatchEvent[]>(STUB_DISPATCHES);
 
   const close = () => {
     setSurface('none');
+    setPendingPacket(null);
   };
   const noop = () => {
     // intentional no-op; preview stub handlers are wired by Codex / runtime later
   };
+
+  const recordDispatch = (packet: ComposedPacket, kindLabel: DispatchEvent['dispatchKind']) => {
+    const provider = mapUiTarget(packet.target);
+    const event: DispatchEvent = {
+      bac_id: `disp_preview_${String(Date.now())}`,
+      sourceTitle: packet.title,
+      targetProviderLabel: TARGET_LABEL[provider] ?? provider,
+      targetThreadTitle: 'new chat',
+      dispatchKind: kindLabel,
+      dispatchedAt: 'just now',
+      status: 'sent',
+    };
+    setRecentDispatches((prev) => [event, ...prev]);
+  };
+
+  const handlePacketDispatch = (packet: ComposedPacket) => {
+    setPendingPacket(packet);
+    setSurface('dispatch');
+  };
+
+  const handlePacketCopy = (packet: ComposedPacket) => {
+    recordDispatch(packet, 'clone_to_chat');
+    close();
+  };
+
+  const handlePacketSave = (packet: ComposedPacket) => {
+    recordDispatch(packet, 'research_packet');
+    close();
+  };
+
+  const handleConfirmDispatch = () => {
+    if (pendingPacket !== null) {
+      const kindLabel: DispatchEvent['dispatchKind'] =
+        pendingPacket.kind === 'coding_agent_packet' ? 'coding_agent_packet' : 'dispatch_out';
+      recordDispatch(pendingPacket, kindLabel);
+    }
+    close();
+  };
+
+  const dispatchTargetLabel =
+    pendingPacket !== null ? TARGET_LABEL[mapUiTarget(pendingPacket.target)] ?? 'Target' : 'Target';
+  const tokenEstimateForConfirm = pendingPacket?.tokenEstimate ?? 4200;
+  const redactedItems = pendingPacket?.redactedItems ?? [];
+  const redactedCountForConfirm = redactedItems.reduce((sum, r) => sum + r.count, 0);
+  const redactedKindsForConfirm = redactedItems.map((r) => `${String(r.count)} ${r.kind}`);
 
   return (
     <div className="preview-shell">
@@ -116,30 +176,33 @@ export function Preview() {
         </PreviewSection>
 
         <PreviewSection title="Recent dispatches (Mock 13b)">
-          <RecentDispatches dispatches={STUB_DISPATCHES} />
+          <RecentDispatches dispatches={recentDispatches} />
         </PreviewSection>
       </div>
 
       {surface === 'packet' ? (
         <PacketComposer
           onCancel={close}
-          onCopy={close}
-          onSave={close}
-          onDispatch={() => {
-            setSurface('dispatch');
-          }}
+          onCopy={handlePacketCopy}
+          onSave={handlePacketSave}
+          onDispatch={handlePacketDispatch}
         />
       ) : null}
       {surface === 'dispatch' ? (
         <DispatchConfirm
-          target="Claude"
+          target={dispatchTargetLabel}
           screenShareActive={false}
           injectionDetected={false}
+          tokenEstimate={tokenEstimateForConfirm}
+          redactedCount={redactedCountForConfirm}
+          {...(redactedKindsForConfirm.length > 0
+            ? { redactedKinds: redactedKindsForConfirm }
+            : {})}
           onCancel={close}
           onEdit={() => {
             setSurface('packet');
           }}
-          onConfirm={close}
+          onConfirm={handleConfirmDispatch}
         />
       ) : null}
       {surface === 'review' ? (
