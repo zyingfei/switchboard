@@ -8,6 +8,7 @@ export const m1ReadToolNames = [
   'bac.coding_sessions',
   'bac.dispatches',
   'bac.reviews',
+  'bac.turns',
 ] as const;
 
 export type M1ReadToolName = (typeof m1ReadToolNames)[number];

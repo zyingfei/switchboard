@@ -6,6 +6,29 @@ import { describe, expect, it } from 'vitest';
 
 import { LiveVaultReader, type ReviewEvent } from './liveVaultReader.js';
 
+interface CaptureEventForTest {
+  readonly threadUrl: string;
+  readonly capturedAt: string;
+  readonly turns: readonly {
+    readonly role: 'user' | 'assistant' | 'system' | 'unknown';
+    readonly text: string;
+    readonly ordinal: number;
+    readonly capturedAt: string;
+  }[];
+}
+
+const writeEventLog = async (
+  vaultPath: string,
+  date: string,
+  events: readonly CaptureEventForTest[],
+): Promise<void> => {
+  await mkdir(join(vaultPath, '_BAC', 'events'), { recursive: true });
+  await writeFile(
+    join(vaultPath, '_BAC', 'events', `${date}.jsonl`),
+    `${events.map((event) => JSON.stringify(event)).join('\n')}\n`,
+  );
+};
+
 const buildReviewEvent = (overrides: Partial<ReviewEvent>): ReviewEvent => ({
   bac_id: 'review_base',
   sourceThreadId: 'thread_alpha',
@@ -270,5 +293,40 @@ describe('LiveVaultReader', () => {
     });
 
     expect(result.data.map((event) => event.bac_id)).toEqual(['review_keep']);
+  });
+
+  it('reads recent turns for a threadUrl, deduped by ordinal newest-wins', async () => {
+    const vaultPath = await mkdtemp(join(tmpdir(), 'sidetrack-mcp-turns-'));
+    const threadUrl = 'https://claude.ai/chat/turns-mcp-test';
+    await writeEventLog(vaultPath, '2026-04-26', [
+      {
+        threadUrl,
+        capturedAt: '2026-04-26T20:00:00.000Z',
+        turns: [
+          { role: 'assistant', text: 'first capture v1', ordinal: 0, capturedAt: '2026-04-26T20:00:00.000Z' },
+        ],
+      },
+      {
+        threadUrl,
+        capturedAt: '2026-04-26T22:00:00.000Z',
+        turns: [
+          { role: 'assistant', text: 'first capture v2', ordinal: 0, capturedAt: '2026-04-26T22:00:00.000Z' },
+          { role: 'user', text: 'follow-up', ordinal: 1, capturedAt: '2026-04-26T22:01:00.000Z' },
+        ],
+      },
+    ]);
+
+    const all = await new LiveVaultReader(vaultPath).readTurns({ threadUrl });
+    expect(all.data).toHaveLength(2);
+    const byOrdinal = new Map(all.data.map((turn) => [turn.ordinal, turn.text]));
+    expect(byOrdinal.get(0)).toBe('first capture v2');
+    expect(byOrdinal.get(1)).toBe('follow-up');
+
+    const onlyAssistant = await new LiveVaultReader(vaultPath).readTurns({
+      threadUrl,
+      role: 'assistant',
+    });
+    expect(onlyAssistant.data).toHaveLength(1);
+    expect(onlyAssistant.data[0]?.text).toBe('first capture v2');
   });
 });
