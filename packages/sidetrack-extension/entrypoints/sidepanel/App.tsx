@@ -1,17 +1,12 @@
-import { useEffect, useMemo, useState, type CSSProperties, type SyntheticEvent } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 
 import {
   companionStatusLabel,
   createEmptyWorkboardState,
-  initialWorkboardSections,
-  maskTitleForPrivacy,
-  type InboundReminder,
-  type PrivacyMode,
   type TrackedThread,
   type WorkboardState,
   type WorkstreamNode,
 } from '../../src/workboard';
-import type { ChecklistItem, WorkstreamUpdate } from '../../src/companion/model';
 import {
   isCaptureFeedbackMessage,
   isRuntimeResponse,
@@ -23,25 +18,20 @@ import {
   CodingAttach,
   type ComposedPacket,
   DispatchConfirm,
-  InboundCard,
   MoveToPicker,
   PacketComposer,
-  RecentDispatches,
   ReviewComposer,
   SettingsPanel,
   type SettingsValue,
   SystemBannersStack,
   TabRecovery,
   Wizard,
-  type DispatchEvent as LegacyDispatchEvent,
-  type InboundReminder as InboundCardReminder,
   type RestoreStrategy,
   type ReviewVerdict,
   type WorkstreamOption,
 } from './components';
 import { createDispatchClient } from '../../src/dispatch/client';
 import {
-  type DispatchEventRecord,
   type DispatchMode,
   dispatchKindToUiPacketKind,
   mapUiPacketKind,
@@ -64,40 +54,6 @@ const TARGET_PROVIDER_LABEL: Record<string, string> = {
   other: 'Other',
 };
 
-const dispatchKindToLegacyKind = (
-  kind: DispatchEventRecord['kind'],
-): LegacyDispatchEvent['dispatchKind'] => {
-  switch (kind) {
-    case 'research':
-      return 'research_packet';
-    case 'coding':
-      return 'coding_agent_packet';
-    case 'review':
-      return 'submit_back';
-    case 'note':
-    case 'other':
-      return 'dispatch_out';
-  }
-};
-
-const dispatchStatusToLegacyStatus = (
-  status: DispatchEventRecord['status'],
-): LegacyDispatchEvent['status'] => {
-  if (status === 'replied' || status === 'noted' || status === 'pending') {
-    return status;
-  }
-  return 'sent';
-};
-
-const recordToLegacyEvent = (record: DispatchEventRecord): LegacyDispatchEvent => ({
-  bac_id: record.bac_id,
-  sourceTitle: record.title,
-  targetProviderLabel: TARGET_PROVIDER_LABEL[record.target.provider] ?? record.target.provider,
-  targetThreadTitle: 'new chat',
-  dispatchKind: dispatchKindToLegacyKind(record.kind),
-  dispatchedAt: record.createdAt,
-  status: dispatchStatusToLegacyStatus(record.status),
-});
 
 const sendRequest = async (request: WorkboardRequest): Promise<WorkboardState> => {
   const response = (await chrome.runtime.sendMessage(request)) as unknown;
@@ -123,15 +79,6 @@ const providerLabel = (provider: TrackedThread['provider']): string => {
   return 'Generic';
 };
 
-const privacyLabel = (privacy: PrivacyMode): string => {
-  if (privacy === 'private') {
-    return 'Private';
-  }
-  if (privacy === 'public') {
-    return 'Public';
-  }
-  return 'Shared';
-};
 
 const formatRelative = (isoDate: string): string => {
   const then = Date.parse(isoDate);
@@ -153,7 +100,6 @@ const formatRelative = (isoDate: string): string => {
   return `${String(Math.round(hours / 24))} days ago`;
 };
 
-const checklistId = (): string => `check_${crypto.randomUUID().replaceAll('-', '_')}`;
 
 const SETUP_COMPLETED_KEY = 'sidetrack:setupCompleted';
 const CODING_SESSIONS_KEY = 'sidetrack:codingSessions';
@@ -176,11 +122,6 @@ const writeCodingSession = async (session: StoredCodingSession): Promise<void> =
   await chrome.storage.local.set({ [CODING_SESSIONS_KEY]: [session, ...list].slice(0, 50) });
 };
 
-const readCodingSessions = async (): Promise<readonly StoredCodingSession[]> => {
-  const result = await chrome.storage.local.get({ [CODING_SESSIONS_KEY]: [] });
-  const list = result[CODING_SESSIONS_KEY];
-  return Array.isArray(list) ? (list as StoredCodingSession[]) : [];
-};
 const DEFAULT_VAULT_PATH = '~/Documents/Sidetrack-vault';
 
 const readSetupCompleted = async (): Promise<boolean> => {
@@ -231,78 +172,23 @@ const isThreadPrivate = (thread: TrackedThread, workstreams: readonly Workstream
 const visibleThreads = (threads: readonly TrackedThread[]): readonly TrackedThread[] =>
   threads.filter((thread) => thread.status !== 'removed' && thread.trackingMode !== 'removed');
 
-const reminderCardStatus = (status: InboundReminder['status']): InboundCardReminder['status'] => {
-  if (status === 'dismissed') {
-    return 'dismissed';
-  }
-  if (status === 'seen' || status === 'relevant') {
-    return 'seen';
-  }
-  return 'unseen';
-};
 
 const restoreStrategyForThread = (thread: TrackedThread): RestoreStrategy =>
   thread.tabSnapshot?.tabId === undefined ? 'reopen_url' : 'focus_open';
 
-const WorkstreamLine = ({
-  node,
-  all,
-  selectedId,
-  onSelect,
-  depth = 0,
-}: {
-  readonly node: WorkstreamNode;
-  readonly all: readonly WorkstreamNode[];
-  readonly selectedId: string;
-  readonly onSelect: (workstreamId: string) => void;
-  readonly depth?: number;
-}) => (
-  <>
-    <li className="tree-line" style={{ '--depth': String(depth) } as CSSProperties}>
-      <button
-        className={'tree-button' + (selectedId === node.bac_id ? ' selected' : '')}
-        onClick={() => {
-          onSelect(node.bac_id);
-        }}
-        type="button"
-      >
-        <span>{node.title}</span>
-        <span className="muted">{privacyLabel(node.privacy)}</span>
-      </button>
-    </li>
-    {node.children
-      .map((childId) => all.find((candidate) => candidate.bac_id === childId))
-      .filter((child): child is WorkstreamNode => child !== undefined)
-      .map((child) => (
-        <WorkstreamLine
-          all={all}
-          depth={depth + 1}
-          key={child.bac_id}
-          node={child}
-          onSelect={onSelect}
-          selectedId={selectedId}
-        />
-      ))}
-  </>
-);
 
 const App = () => {
   const [state, setState] = useState<WorkboardState>(() => createEmptyWorkboardState());
   const [bridgeKey, setBridgeKey] = useState('');
   const [port, setPort] = useState('17373');
-  const [workstreamTitle, setWorkstreamTitle] = useState('');
-  const [queueText, setQueueText] = useState('');
-  const [checklistText, setChecklistText] = useState('');
-  const [tagText, setTagText] = useState('');
   const [selectedWorkstream, setSelectedWorkstream] = useState('');
-  const [selectedThread, setSelectedThread] = useState('');
   const [moveThreadId, setMoveThreadId] = useState<string | null>(null);
   const [recoveryThreadId, setRecoveryThreadId] = useState<string | null>(null);
   const [expandedWorkstreamId, setExpandedWorkstreamId] = useState<string | null>(null);
-  const [searchQuery, setSearchQuery] = useState('');
+  const [wsPickerOpen, setWsPickerOpen] = useState(false);
+  const [wsPickerCreateMode, setWsPickerCreateMode] = useState(false);
   const [composeThreadId, setComposeThreadId] = useState<string | null>(null);
   const [pendingDispatch, setPendingDispatch] = useState<ComposedPacket | null>(null);
-  const [recentDispatches, setRecentDispatches] = useState<readonly DispatchEventRecord[]>([]);
   const [dispatchInFlight, setDispatchInFlight] = useState(false);
   const [reviewThreadId, setReviewThreadId] = useState<string | null>(null);
   const [reviewInFlight, setReviewInFlight] = useState(false);
@@ -314,7 +200,6 @@ const App = () => {
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [codingAttachOpen, setCodingAttachOpen] = useState(false);
-  const [codingSessions, setCodingSessions] = useState<readonly StoredCodingSession[]>([]);
   const [setupCompleted, setSetupCompleted] = useState<boolean | null>(null);
   const [stateLoaded, setStateLoaded] = useState(false);
   const [vaultPath, setVaultPath] = useState(DEFAULT_VAULT_PATH);
@@ -324,18 +209,6 @@ const App = () => {
   const [error, setError] = useState<string | null>(null);
 
   const threads = useMemo(() => visibleThreads(state.threads), [state.threads]);
-  const rootWorkstreams = useMemo(
-    () => state.workstreams.filter((workstream) => workstream.parentId === undefined),
-    [state.workstreams],
-  );
-  const workstreamOptions = useMemo(
-    () => buildWorkstreamOptions(state.workstreams),
-    [state.workstreams],
-  );
-  const activeWorkstream = useMemo(
-    () => state.workstreams.find((workstream) => workstream.bac_id === selectedWorkstream),
-    [selectedWorkstream, state.workstreams],
-  );
   const moveThread = useMemo(
     () => threads.find((thread) => thread.bac_id === moveThreadId),
     [moveThreadId, threads],
@@ -360,77 +233,7 @@ const App = () => {
       (workstream) => workstream.bac_id === composeThread.primaryWorkstreamId,
     );
   }, [composeThread, state.workstreams]);
-  const recentDispatchEvents = useMemo<readonly LegacyDispatchEvent[]>(
-    () => recentDispatches.map(recordToLegacyEvent),
-    [recentDispatches],
-  );
 
-  interface WorkstreamCardSummary {
-    readonly bac_id: string | null; // null for the synthetic "Inbox / unplaced" card
-    readonly title: string;
-    readonly threadCount: number;
-    readonly queuedCount: number;
-    readonly closedCount: number;
-    readonly hasInbound: boolean;
-  }
-
-  const workstreamCards = useMemo<readonly WorkstreamCardSummary[]>(() => {
-    const summaries: WorkstreamCardSummary[] = [];
-    for (const ws of state.workstreams) {
-      if (ws.parentId !== undefined) {
-        continue; // only top-level cards in Active Work; sub-workstreams render in detail
-      }
-      const wsThreads = threads.filter((t) => t.primaryWorkstreamId === ws.bac_id);
-      summaries.push({
-        bac_id: ws.bac_id,
-        title: ws.title,
-        threadCount: wsThreads.length,
-        queuedCount: state.queueItems.filter((q) => q.targetId === ws.bac_id).length,
-        closedCount: wsThreads.filter((t) => t.status === 'closed' || t.status === 'restorable').length,
-        hasInbound: state.reminders.some((r) => wsThreads.some((t) => t.bac_id === r.threadId)),
-      });
-    }
-    const unplacedThreads = threads.filter((t) => t.primaryWorkstreamId === undefined);
-    if (unplacedThreads.length > 0) {
-      summaries.push({
-        bac_id: null,
-        title: 'Inbox · unplaced',
-        threadCount: unplacedThreads.length,
-        queuedCount: 0,
-        closedCount: unplacedThreads.filter((t) => t.status === 'closed' || t.status === 'restorable')
-          .length,
-        hasInbound: false,
-      });
-    }
-    return summaries;
-  }, [state.workstreams, state.queueItems, state.reminders, threads]);
-
-  const expandedWorkstream = useMemo(
-    () =>
-      expandedWorkstreamId === null
-        ? null
-        : (state.workstreams.find((w) => w.bac_id === expandedWorkstreamId) ?? null),
-    [expandedWorkstreamId, state.workstreams],
-  );
-
-  const expandedWorkstreamThreads = useMemo<readonly TrackedThread[]>(() => {
-    if (expandedWorkstreamId === null) {
-      return threads.filter((t) => t.primaryWorkstreamId === undefined);
-    }
-    return threads.filter((t) => t.primaryWorkstreamId === expandedWorkstreamId);
-  }, [expandedWorkstreamId, threads]);
-
-  const filteredRecent = useMemo<readonly TrackedThread[]>(() => {
-    const q = searchQuery.trim().toLowerCase();
-    if (q.length === 0) {
-      return threads.slice(0, 5);
-    }
-    return threads
-      .filter(
-        (t) => t.title.toLowerCase().includes(q) || t.threadUrl.toLowerCase().includes(q),
-      )
-      .slice(0, 10);
-  }, [searchQuery, threads]);
 
   const refresh = async () => {
     const next = await sendRequest({ type: messageTypes.getWorkboardState });
@@ -441,9 +244,7 @@ const App = () => {
     if (next.vaultPath !== undefined) {
       setVaultPath(next.vaultPath);
     }
-    if (selectedWorkstream === '' && next.workstreams.length > 0) {
-      setSelectedWorkstream(next.workstreams[0]?.bac_id ?? '');
-    }
+    // Default to "not set" (Inbox) on first load — user picks via the ws-bar.
   };
 
   useEffect(() => {
@@ -505,32 +306,6 @@ const App = () => {
     };
   }, [captureToastHost]);
 
-  useEffect(() => {
-    if (state.companionStatus !== 'connected' || bridgeKey.length === 0) {
-      return undefined;
-    }
-    const portNumber = Number(port);
-    if (!Number.isFinite(portNumber) || portNumber <= 0) {
-      return undefined;
-    }
-    let cancelled = false;
-    const client = createDispatchClient({ port: portNumber, bridgeKey });
-    client
-      .listRecent({ limit: 10 })
-      .then((list) => {
-        if (!cancelled) {
-          setRecentDispatches(list);
-        }
-      })
-      .catch(() => {
-        // Companion may not yet have the dispatches endpoint or the vault is
-        // unreachable — surface nothing here; SystemBanners shows the broader
-        // companion/vault state already.
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [state.companionStatus, bridgeKey, port]);
 
   useEffect(() => {
     // Defensive auto-save: if the user typed a plausible bridge key + port in
@@ -597,21 +372,6 @@ const App = () => {
     };
   }, [reviewThread, bridgeKey, port, reviewTurnsByUrl]);
 
-  useEffect(() => {
-    let cancelled = false;
-    void readCodingSessions()
-      .then((list) => {
-        if (!cancelled) {
-          setCodingSessions(list);
-        }
-      })
-      .catch(() => {
-        // chrome.storage unavailable in test/dev — leave the list empty.
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [codingAttachOpen]);
 
   useEffect(() => {
     if (state.companionStatus !== 'connected' || bridgeKey.length === 0) {
@@ -655,15 +415,6 @@ const App = () => {
     }
   };
 
-  const saveSettings = (event: SyntheticEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    void runAction(() =>
-      sendRequest({
-        type: messageTypes.saveCompanionSettings,
-        settings: { bridgeKey, port: Number(port) },
-      }),
-    );
-  };
 
   const completeSetup = async (saveCompanionFirst: boolean): Promise<void> => {
     if (saveCompanionFirst) {
@@ -679,24 +430,6 @@ const App = () => {
     setWizardOpen(false);
   };
 
-  const createWorkstream = (event: SyntheticEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!workstreamTitle.trim()) {
-      return;
-    }
-    void runAction(async () => {
-      const next = await sendRequest({
-        type: messageTypes.createWorkstream,
-        workstream: {
-          title: workstreamTitle.trim(),
-          ...(selectedWorkstream ? { parentId: selectedWorkstream } : {}),
-          privacy: 'private',
-        },
-      });
-      setWorkstreamTitle('');
-      return next;
-    });
-  };
 
   const handleMoveTarget = (target: WorkstreamOption | { readonly create: string }) => {
     if (moveThreadId === null) {
@@ -808,8 +541,6 @@ const App = () => {
         },
         idempotencyKey,
       );
-      const refreshed = await client.listRecent({ limit: 10 });
-      setRecentDispatches(refreshed);
       setPendingDispatch(null);
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : 'Dispatch failed.');
@@ -920,139 +651,7 @@ const App = () => {
     }
   };
 
-  const queueFollowUp = (event: SyntheticEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!queueText.trim()) {
-      return;
-    }
-    void runAction(async () => {
-      const next = await sendRequest({
-        type: messageTypes.queueFollowUp,
-        item: {
-          text: queueText.trim(),
-          scope: selectedThread ? 'thread' : selectedWorkstream ? 'workstream' : 'global',
-          ...(selectedThread
-            ? { targetId: selectedThread }
-            : selectedWorkstream
-              ? { targetId: selectedWorkstream }
-              : {}),
-        },
-      });
-      setQueueText('');
-      return next;
-    });
-  };
 
-  const updateWorkstream = (
-    workstream: WorkstreamNode,
-    update: Omit<WorkstreamUpdate, 'revision'>,
-  ) => {
-    void runAction(() =>
-      sendRequest({
-        type: messageTypes.updateWorkstream,
-        workstreamId: workstream.bac_id,
-        update: {
-          revision: workstream.revision,
-          ...update,
-        },
-      }),
-    );
-  };
-
-  const togglePrivacy = (workstream: WorkstreamNode) => {
-    const nextPrivacy: PrivacyMode = workstream.privacy === 'private' ? 'shared' : 'private';
-    updateWorkstream(workstream, { privacy: nextPrivacy });
-  };
-
-  const addChecklistItem = (event: SyntheticEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (activeWorkstream === undefined || !checklistText.trim()) {
-      return;
-    }
-    const timestamp = new Date().toISOString();
-    const item: ChecklistItem = {
-      id: checklistId(),
-      text: checklistText.trim(),
-      checked: false,
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    };
-    void runAction(async () => {
-      const next = await sendRequest({
-        type: messageTypes.updateWorkstream,
-        workstreamId: activeWorkstream.bac_id,
-        update: {
-          revision: activeWorkstream.revision,
-          checklist: [...activeWorkstream.checklist, item],
-        },
-      });
-      setChecklistText('');
-      return next;
-    });
-  };
-
-  const toggleChecklistItem = (workstream: WorkstreamNode, itemId: string) => {
-    const timestamp = new Date().toISOString();
-    void runAction(() =>
-      sendRequest({
-        type: messageTypes.updateWorkstream,
-        workstreamId: workstream.bac_id,
-        update: {
-          revision: workstream.revision,
-          checklist: workstream.checklist.map((item) =>
-            item.id === itemId ? { ...item, checked: !item.checked, updatedAt: timestamp } : item,
-          ),
-        },
-      }),
-    );
-  };
-
-  const addTag = (event: SyntheticEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (activeWorkstream === undefined || !tagText.trim()) {
-      return;
-    }
-    const tag = tagText.trim();
-    void runAction(async () => {
-      const next = await sendRequest({
-        type: messageTypes.updateWorkstream,
-        workstreamId: activeWorkstream.bac_id,
-        update: {
-          revision: activeWorkstream.revision,
-          tags: [...new Set([...activeWorkstream.tags, tag])],
-        },
-      });
-      setTagText('');
-      return next;
-    });
-  };
-
-  const updateReminderStatus = (reminderId: string, status: InboundReminder['status']) => {
-    void runAction(() =>
-      sendRequest({
-        type: messageTypes.updateReminder,
-        reminderId,
-        update: { status },
-      }),
-    );
-  };
-
-  const toggleSection = (sectionId: (typeof initialWorkboardSections)[number]['id']) => {
-    const collapsed = state.collapsedSections.includes(sectionId)
-      ? state.collapsedSections.filter((id) => id !== sectionId)
-      : [...state.collapsedSections, sectionId];
-    void runAction(() =>
-      sendRequest({
-        type: messageTypes.setCollapsedSections,
-        collapsedSections: collapsed,
-      }),
-    );
-  };
-
-  const providerHealth = state.selectorHealth.find((entry) => entry.latestStatus !== 'ok');
-  const selectedWorkstreamQueue = activeWorkstream
-    ? state.queueItems.filter((item) => item.targetId === activeWorkstream.bac_id)
-    : [];
   // Auto-pop the wizard ONLY for true first-launch users (no setupCompleted
   // flag AND no bridge key in storage). Existing-user migration: a non-empty
   // bridge key from a prior install means they already configured it; don't
@@ -1068,6 +667,11 @@ const App = () => {
     !localOnlyMode &&
     (bridgeKey.trim().length === 0 || state.companionStatus === 'disconnected');
   const vaultUnreachable = state.companionStatus === 'vault-error';
+  const providerHealth = state.selectorHealth.find((entry) => entry.latestStatus !== 'ok');
+  const workstreamOptions = useMemo(
+    () => buildWorkstreamOptions(state.workstreams),
+    [state.workstreams],
+  );
   const hasSystemBanners =
     companionDisconnected ||
     vaultUnreachable ||
@@ -1075,50 +679,117 @@ const App = () => {
     state.queuedCaptureCount > 0 ||
     captureToastHost !== null;
 
+  // Current workstream id; null = "not set / Inbox" (special).
+  const currentWsId =
+    expandedWorkstreamId === null && selectedWorkstream === ''
+      ? null
+      : expandedWorkstreamId ?? (selectedWorkstream || null);
+  const currentWs =
+    currentWsId === null ? null : state.workstreams.find((w) => w.bac_id === currentWsId) ?? null;
+  const currentWsLabel =
+    currentWs === null
+      ? 'not set'
+      : workstreamPath(currentWs.bac_id, state.workstreams);
+  const currentWsThreads =
+    currentWsId === null
+      ? threads.filter((t) => t.primaryWorkstreamId === undefined)
+      : threads.filter((t) => t.primaryWorkstreamId === currentWsId);
+  const activeCount = currentWsThreads.filter(
+    (t) => t.status !== 'closed' && t.status !== 'archived' && t.status !== 'removed',
+  ).length;
+  const staleCount = currentWsThreads.filter(
+    (t) =>
+      t.status === 'closed' || t.status === 'restorable' || t.status === 'needs_organize',
+  ).length;
+  const setCurrentWs = (id: string | null) => {
+    setExpandedWorkstreamId(id);
+    setSelectedWorkstream(id ?? '');
+  };
+
   return (
-    <main className="workboard" aria-label="Sidetrack workboard">
-      <header className="workboard-header">
-        <div>
-          <p className="eyebrow">Sidetrack</p>
-          <h1>Current Work</h1>
-          <p className="subtle">
-            vault: {state.companionStatus === 'vault-error' ? 'error' : 'connected'}
-          </p>
+    <main className="bac-app" aria-label="Sidetrack workboard">
+      <div className="app-head">
+        <div className="app-mark">
+          <span className="glyph" aria-hidden />
+          Sidetrack
         </div>
-        <div className="header-actions">
-          <span className={`status-pill ${state.companionStatus}`}>
-            {companionStatusLabel(state.companionStatus)}
-          </span>
+        <div className="app-actions">
           <button
-            className="btn btn-ghost"
+            className="icon-btn"
+            title="Coding session"
             onClick={() => {
               setCodingAttachOpen(true);
             }}
             type="button"
+            aria-label="Coding session"
           >
-            Coding session
+            <svg viewBox="0 0 24 24">
+              <polyline points="16 18 22 12 16 6" />
+              <polyline points="8 6 2 12 8 18" />
+            </svg>
           </button>
           <button
-            className="btn btn-ghost"
-            disabled={state.companionStatus !== 'connected' || bridgeKey.length === 0}
+            className="icon-btn"
+            title="Settings"
             onClick={() => {
               setSettingsOpen(true);
             }}
             type="button"
+            aria-label="Settings"
           >
-            Settings
-          </button>
-          <button
-            className="btn btn-ghost"
-            onClick={() => {
-              setWizardOpen(true);
-            }}
-            type="button"
-          >
-            Setup wizard
+            <svg viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="3" />
+              <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z" />
+            </svg>
           </button>
         </div>
-      </header>
+      </div>
+
+      <WorkstreamBar
+        currentWsLabel={currentWsLabel}
+        statusLabel={companionStatusLabel(state.companionStatus)}
+        onOpenPicker={() => {
+          setWsPickerOpen(true);
+        }}
+        onAddSubWorkstream={() => {
+          setWsPickerOpen(true);
+          setWsPickerCreateMode(true);
+        }}
+      />
+
+      {wsPickerOpen ? (
+        <WorkstreamPicker
+          workstreams={state.workstreams}
+          threads={threads}
+          currentWsId={currentWsId}
+          createMode={wsPickerCreateMode}
+          onClose={() => {
+            setWsPickerOpen(false);
+            setWsPickerCreateMode(false);
+          }}
+          onSelect={(id) => {
+            setCurrentWs(id);
+            setWsPickerOpen(false);
+            setWsPickerCreateMode(false);
+          }}
+          onCreate={(title, parentId) => {
+            void runAction(async () => {
+              return await sendRequest({
+                type: messageTypes.createWorkstream,
+                workstream: {
+                  title,
+                  ...(parentId === null ? {} : { parentId }),
+                  privacy: 'private',
+                },
+              });
+            }).then(() => {
+              setWsPickerCreateMode(false);
+            });
+          }}
+          /* When opening from "+", default new workstream parent = current */
+          parentForNew={currentWsId}
+        />
+      ) : null}
 
       {hasSystemBanners ? (
         <div className="banner-stack">
@@ -1145,576 +816,171 @@ const App = () => {
 
       {error ? <div className="banner danger">{error}</div> : null}
 
-      <section className="toolbar">
-        <button
-          disabled={busy}
-          onClick={() => {
-            void runAction(() => sendRequest({ type: messageTypes.captureCurrentTab }));
-          }}
-          type="button"
-        >
-          Track current tab
-        </button>
-        <button
-          disabled={busy}
-          onClick={() => {
-            void refresh();
-          }}
-          type="button"
-        >
-          Refresh
-        </button>
-      </section>
-
-      <form className="settings-row" onSubmit={saveSettings}>
-        <label>
-          Port
-          <input
-            inputMode="numeric"
-            onChange={(event) => {
-              setPort(event.target.value);
-            }}
-            value={port}
-          />
-        </label>
-        <label>
-          Bridge key
-          <input
-            onChange={(event) => {
-              setBridgeKey(event.target.value);
-            }}
-            type="password"
-            value={bridgeKey}
-          />
-        </label>
-        <button disabled={busy} type="submit">
-          Connect
-        </button>
-      </form>
-
-      <section className="section-list" aria-label="Workboard sections">
-        {initialWorkboardSections.map((section) => {
-          const collapsed = state.collapsedSections.includes(section.id);
-          return (
-            <article className="section-row" key={section.id}>
-              <button
-                className="section-heading"
-                onClick={() => {
-                  toggleSection(section.id);
-                }}
-                type="button"
-              >
-                <h2>{section.label}</h2>
-                <span className="mono">{collapsed ? 'show' : 'hide'}</span>
-              </button>
-              {collapsed ? null : (
-                <>
-                  {section.id === 'current-tab' ? (
-                    state.currentTab ? (
-                      <div className="current-tab-row">
-                        <div className="current-tab-title">
-                          <strong>{state.currentTab.title}</strong>
-                          <span className={'chip chip-' + state.currentTab.provider}>
-                            {providerLabel(state.currentTab.provider)}
-                          </span>
-                        </div>
-                        <div className="current-tab-actions">
-                          <button
-                            className="btn-link"
-                            disabled={busy}
-                            onClick={() => {
-                              void runAction(() =>
-                                sendRequest({ type: messageTypes.captureCurrentTab }),
-                              );
-                            }}
-                            type="button"
-                          >
-                            Track
-                          </button>
-                          <button
-                            className="btn-link"
-                            disabled={
-                              state.companionStatus !== 'connected' || bridgeKey.length === 0
-                            }
-                            onClick={() => {
-                              if (state.currentTab !== undefined) {
-                                setComposeThreadId(state.currentTab.bac_id);
-                              }
-                            }}
-                            type="button"
-                          >
-                            Packet
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <p>{section.emptyText}</p>
-                    )
-                  ) : null}
-                  {section.id === 'active-work' ? (
-                    expandedWorkstreamId === null ? (
-                      <div className="ws-cards">
-                        {workstreamCards.length === 0 ? <p>{section.emptyText}</p> : null}
-                        {workstreamCards.map((card) => (
-                          <button
-                            type="button"
-                            className="ws-card"
-                            key={card.bac_id ?? '__inbox'}
-                            onClick={() => {
-                              setExpandedWorkstreamId(card.bac_id);
-                              setSelectedWorkstream(card.bac_id ?? '');
-                            }}
-                          >
-                            <div className="ws-card-head">
-                              <strong>{card.title}</strong>
-                              {card.hasInbound ? <span className="dot signal" aria-hidden /> : null}
-                            </div>
-                            <div className="ws-card-meta mono">
-                              {card.threadCount} thread{card.threadCount === 1 ? '' : 's'} ·{' '}
-                              {card.queuedCount} queued · {card.closedCount} closed
-                            </div>
-                          </button>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="ws-detail-inline">
-                        <button
-                          type="button"
-                          className="btn-link ws-back"
-                          onClick={() => {
-                            setExpandedWorkstreamId(null);
-                          }}
-                        >
-                          ← Active work
-                        </button>
-                        <div className="ws-detail-head">
-                          <strong>
-                            {expandedWorkstream === null
-                              ? 'Inbox · unplaced'
-                              : workstreamPath(expandedWorkstream.bac_id, state.workstreams)}
-                          </strong>
-                          {expandedWorkstream !== null ? (
-                            <span className="subtle mono">
-                              {privacyLabel(expandedWorkstream.privacy)}
-                              {expandedWorkstream.tags.length > 0
-                                ? ' · ' + expandedWorkstream.tags.join(', ')
-                                : ''}
-                            </span>
-                          ) : null}
-                        </div>
-                        <div className="item-list">
-                          {expandedWorkstreamThreads.length === 0 ? (
-                            <p>No threads here yet.</p>
-                          ) : null}
-                          {expandedWorkstreamThreads.map((thread) => (
-                            <div className="thread-row" key={thread.bac_id}>
-                              <div>
-                                <strong>{maskTitleForPrivacy(thread, state.workstreams)}</strong>
-                                <p>
-                                  {providerLabel(thread.provider)} / {thread.trackingMode} /{' '}
-                                  {thread.status}
-                                </p>
-                              </div>
-                              <div className="thread-actions">
-                                <button
-                                  className="btn-link"
-                                  disabled={
-                                    state.companionStatus !== 'connected' ||
-                                    bridgeKey.length === 0
-                                  }
-                                  onClick={() => {
-                                    setComposeThreadId(thread.bac_id);
-                                  }}
-                                  type="button"
-                                >
-                                  Send to…
-                                </button>
-                                <button
-                                  className="btn-link"
-                                  disabled={
-                                    state.companionStatus !== 'connected' ||
-                                    bridgeKey.length === 0
-                                  }
-                                  onClick={() => {
-                                    setReviewThreadId(thread.bac_id);
-                                  }}
-                                  type="button"
-                                >
-                                  Review
-                                </button>
-                                <button
-                                  className="btn-link"
-                                  onClick={() => {
-                                    setMoveThreadId(thread.bac_id);
-                                  }}
-                                  type="button"
-                                >
-                                  Move to…
-                                </button>
-                                {thread.trackingMode === 'stopped' ? (
-                                  <button
-                                    className="btn-link"
-                                    onClick={() => {
-                                      updateTracking(
-                                        thread.bac_id,
-                                        thread.provider === 'unknown' ? 'manual' : 'auto',
-                                      );
-                                    }}
-                                    type="button"
-                                  >
-                                    Resume
-                                  </button>
-                                ) : (
-                                  <button
-                                    className="btn-link"
-                                    onClick={() => {
-                                      updateTracking(thread.bac_id, 'stopped');
-                                    }}
-                                    type="button"
-                                  >
-                                    Stop
-                                  </button>
-                                )}
-                                <button
-                                  className="btn-link btn-muted"
-                                  onClick={() => {
-                                    updateTracking(thread.bac_id, 'removed');
-                                  }}
-                                  type="button"
-                                >
-                                  Remove
-                                </button>
-                                {thread.status === 'restorable' ? (
-                                  <button
-                                    className="btn-link"
-                                    onClick={() => {
-                                      setRecoveryThreadId(thread.bac_id);
-                                    }}
-                                    type="button"
-                                  >
-                                    Reopen
-                                  </button>
-                                ) : null}
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )
-                  ) : null}
-                  {section.id === 'queued' ? (
-                    <div className="item-list">
-                      {state.queueItems.length === 0 ? <p>{section.emptyText}</p> : null}
-                      {state.queueItems.map((item) => {
-                        const targetThread =
-                          item.scope === 'thread' && item.targetId !== undefined
-                            ? threads.find((t) => t.bac_id === item.targetId)
-                            : undefined;
-                        return (
-                          <div className="queued-row" key={item.bac_id}>
-                            {targetThread !== undefined ? (
-                              <span className={'chip chip-' + targetThread.provider}>
-                                {providerLabel(targetThread.provider)}
-                              </span>
-                            ) : (
-                              <span className="chip chip-other mono">{item.scope}</span>
-                            )}
-                            <span className="queued-text">{item.text}</span>
-                            <span className={'pill pill-' + item.status}>{item.status}</span>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  ) : null}
-                  {section.id === 'inbound' ? (
-                    <div className="item-list">
-                      {state.reminders.length === 0 ? <p>{section.emptyText}</p> : null}
-                      {state.reminders.map((reminder) => {
-                        const thread = threads.find(
-                          (candidate) => candidate.bac_id === reminder.threadId,
-                        );
-                        return (
-                          <InboundCard
-                            key={reminder.bac_id}
-                            masked={thread ? isThreadPrivate(thread, state.workstreams) : false}
-                            reminder={{
-                              bac_id: reminder.bac_id,
-                              threadTitle: thread?.title ?? reminder.threadId,
-                              provider: reminder.provider,
-                              providerLabel: providerLabel(reminder.provider),
-                              inboundTurnAt: formatRelative(reminder.detectedAt),
-                              status: reminderCardStatus(reminder.status),
-                              aiAuthored: true,
-                            }}
-                            onOpen={() => {
-                              restoreThread(reminder.threadId);
-                            }}
-                            onMarkRelevant={() => {
-                              updateReminderStatus(reminder.bac_id, 'relevant');
-                            }}
-                            onDismiss={() => {
-                              updateReminderStatus(reminder.bac_id, 'dismissed');
-                            }}
-                          />
-                        );
-                      })}
-                    </div>
-                  ) : null}
-                  {section.id === 'needs-organize' ? (
-                    <p>
-                      {threads.filter((thread) => !thread.primaryWorkstreamId).length} unplaced
-                      tracked items
-                    </p>
-                  ) : null}
-                  {section.id === 'recent-search' ? (
-                    <div className="recent-search">
-                      <input
-                        type="search"
-                        placeholder="Search threads, captures, packets…"
-                        value={searchQuery}
-                        onChange={(e) => {
-                          setSearchQuery(e.target.value);
-                        }}
-                        className="recent-search-input"
-                      />
-                      {filteredRecent.length === 0 ? (
-                        <p className="subtle">
-                          {searchQuery.trim().length > 0 ? 'No matches.' : section.emptyText}
-                        </p>
-                      ) : null}
-                      {filteredRecent.map((thread) => (
-                        <button
-                          type="button"
-                          key={thread.bac_id}
-                          className="recent-search-row"
-                          onClick={() => {
-                            const ws = state.workstreams.find(
-                              (w) => w.bac_id === thread.primaryWorkstreamId,
-                            );
-                            if (ws !== undefined) {
-                              setExpandedWorkstreamId(ws.bac_id);
-                              setSelectedWorkstream(ws.bac_id);
-                            } else {
-                              setExpandedWorkstreamId(null);
-                            }
-                          }}
-                        >
-                          <span className={'chip chip-' + thread.provider}>
-                            {providerLabel(thread.provider)}
-                          </span>
-                          <span className="recent-search-title">{thread.title}</span>
-                          <span className="subtle mono">{formatRelative(thread.lastSeenAt)}</span>
-                        </button>
-                      ))}
-                    </div>
-                  ) : null}
-                </>
-              )}
-            </article>
-          );
-        })}
-      </section>
-
-      {recentDispatchEvents.length > 0 ? (
-        <section className="recent-dispatches-section" aria-label="Recent dispatches">
-          <header className="section-head">
-            <h2>Recent dispatches</h2>
-          </header>
-          <RecentDispatches dispatches={recentDispatchEvents} />
-        </section>
-      ) : null}
-
-      {codingSessions.length > 0 ? (
-        <section className="coding-sessions-section" aria-label="Coding sessions">
-          <header className="section-head">
-            <h2>Coding sessions</h2>
-          </header>
-          <div className="coding-sessions-list">
-            {codingSessions.slice(0, 5).map((session) => (
-              <div key={session.sessionId + ':' + session.attachedAt} className="coding-session-row">
-                <div className="coding-session-meta">
-                  <strong>{session.name || session.sessionId}</strong>
-                  <span className="mono subtle">
-                    {session.tool} · {workstreamPath(session.workstreamId, state.workstreams)} ·{' '}
-                    {formatRelative(session.attachedAt)}
-                  </span>
-                  <code className="mono coding-session-cmd">{session.resumeCommand}</code>
-                </div>
-                <button
-                  type="button"
-                  className="btn btn-ghost"
-                  onClick={() => {
-                    void navigator.clipboard.writeText(session.resumeCommand).catch(() => {
-                      // Clipboard rejected (permissions, focus); silently ignore.
-                    });
-                  }}
-                >
-                  Copy
-                </button>
-              </div>
-            ))}
-          </div>
-        </section>
-      ) : null}
-
-      <section className="detail-panel">
-        <div>
-          <h2>Workstreams</h2>
-          <ul className="tree">
-            {rootWorkstreams.map((node) => (
-              <WorkstreamLine
-                all={state.workstreams}
-                key={node.bac_id}
-                node={node}
-                onSelect={setSelectedWorkstream}
-                selectedId={selectedWorkstream}
-              />
-            ))}
-          </ul>
-        </div>
-        <form onSubmit={createWorkstream}>
-          <label>
-            Parent
-            <select
-              onChange={(event) => {
-                setSelectedWorkstream(event.target.value);
+      <div className="sec-head">
+        <span>Open threads</span>
+        <span className="count mono">
+          {String(activeCount)} active{staleCount > 0 ? ' · ' + String(staleCount) + ' stale' : ''}
+        </span>
+      </div>
+      <div className="thread-list">
+        {currentWsThreads.length === 0 ? (
+          <div className="thread-empty subtle">
+            <p>No threads here yet.</p>
+            <button
+              type="button"
+              className="btn-link"
+              disabled={busy}
+              onClick={() => {
+                void runAction(() => sendRequest({ type: messageTypes.captureCurrentTab }));
               }}
-              value={selectedWorkstream}
             >
-              <option value="">Root</option>
-              {workstreamOptions.map((workstream) => (
-                <option key={workstream.bac_id} value={workstream.bac_id}>
-                  {workstream.path}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            New subcluster
-            <input
-              onChange={(event) => {
-                setWorkstreamTitle(event.target.value);
-              }}
-              value={workstreamTitle}
-            />
-          </label>
-          <button disabled={busy} type="submit">
-            Create
-          </button>
-        </form>
-
-        {activeWorkstream ? (
-          <div className="workstream-detail">
-            <div className="detail-head">
-              <div>
-                <h2>{workstreamPath(activeWorkstream.bac_id, state.workstreams)}</h2>
-                <p className="subtle">
-                  {privacyLabel(activeWorkstream.privacy)} /{' '}
-                  {activeWorkstream.tags.join(', ') || 'no tags'}
-                </p>
-              </div>
-              <button
-                className="btn btn-ghost"
-                onClick={() => {
-                  togglePrivacy(activeWorkstream);
-                }}
-                type="button"
-              >
-                Toggle privacy
-              </button>
-            </div>
-
-            <div className="checklist">
-              {activeWorkstream.checklist.length === 0 ? (
-                <p className="subtle">No checklist items yet.</p>
-              ) : null}
-              {activeWorkstream.checklist.map((item) => (
-                <label className="check-row detail-check" key={item.id}>
-                  <input
-                    checked={item.checked}
-                    onChange={() => {
-                      toggleChecklistItem(activeWorkstream, item.id);
-                    }}
-                    type="checkbox"
-                  />
-                  <span>{item.text}</span>
-                </label>
-              ))}
-            </div>
-
-            <form className="inline-form" onSubmit={addChecklistItem}>
-              <label>
-                Checklist item
-                <input
-                  onChange={(event) => {
-                    setChecklistText(event.target.value);
-                  }}
-                  value={checklistText}
-                />
-              </label>
-              <button disabled={busy} type="submit">
-                Add item
-              </button>
-            </form>
-
-            <form className="inline-form" onSubmit={addTag}>
-              <label>
-                Tag
-                <input
-                  onChange={(event) => {
-                    setTagText(event.target.value);
-                  }}
-                  value={tagText}
-                />
-              </label>
-              <button disabled={busy} type="submit">
-                Add tag
-              </button>
-            </form>
-
-            <div className="item-list">
-              <h2>Queued asks</h2>
-              {selectedWorkstreamQueue.length === 0 ? (
-                <p className="subtle">No queued asks for this workstream.</p>
-              ) : null}
-              {selectedWorkstreamQueue.map((item) => (
-                <div className="compact-row" key={item.bac_id}>
-                  <span>{item.text}</span>
-                  <span className="status-chip">{item.status}</span>
-                </div>
-              ))}
-            </div>
+              Track current tab →
+            </button>
           </div>
         ) : null}
-      </section>
+        {currentWsThreads.map((thread) => {
+          const isPrivate = isThreadPrivate(thread, state.workstreams);
+          const dotClass =
+            thread.status === 'restorable' || thread.status === 'closed'
+              ? 'gray'
+              : thread.trackingMode === 'stopped'
+                ? 'gray'
+                : state.reminders.some(
+                      (r) => r.threadId === thread.bac_id && r.status !== 'dismissed',
+                    )
+                  ? 'signal'
+                  : thread.status === 'needs_organize'
+                    ? 'amber'
+                    : 'green';
+          const stamp =
+            thread.status === 'restorable'
+              ? `Tab closed · ${formatRelative(thread.lastSeenAt)}`
+              : thread.trackingMode === 'stopped'
+                ? `Tracking stopped · ${formatRelative(thread.lastSeenAt)}`
+                : `Last seen · ${formatRelative(thread.lastSeenAt)}`;
+          const titleDisplay = isPrivate ? '[private]' : thread.title;
+          return (
+            <div key={thread.bac_id} className="thread">
+              <div className="row1">
+                <span className={'provider ' + thread.provider}>
+                  {providerLabel(thread.provider)}
+                </span>
+                <span className="name">{titleDisplay}</span>
+              </div>
+              <div className="row2">
+                <span className={'dot ' + dotClass} />
+                <span className="stamp">{stamp}</span>
+              </div>
+              <div className="thread-actions row2">
+                <button
+                  type="button"
+                  className="btn-link"
+                  disabled={state.companionStatus !== 'connected' || bridgeKey.length === 0}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setComposeThreadId(thread.bac_id);
+                  }}
+                >
+                  Send to…
+                </button>
+                <button
+                  type="button"
+                  className="btn-link"
+                  disabled={state.companionStatus !== 'connected' || bridgeKey.length === 0}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setReviewThreadId(thread.bac_id);
+                  }}
+                >
+                  Review
+                </button>
+                <button
+                  type="button"
+                  className="btn-link"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setMoveThreadId(thread.bac_id);
+                  }}
+                >
+                  Move to…
+                </button>
+                {thread.trackingMode === 'stopped' ? (
+                  <button
+                    type="button"
+                    className="btn-link"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      updateTracking(
+                        thread.bac_id,
+                        thread.provider === 'unknown' ? 'manual' : 'auto',
+                      );
+                    }}
+                  >
+                    Resume
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn-link"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      updateTracking(thread.bac_id, 'stopped');
+                    }}
+                  >
+                    Stop
+                  </button>
+                )}
+                {thread.status === 'restorable' ? (
+                  <button
+                    type="button"
+                    className="btn-link"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setRecoveryThreadId(thread.bac_id);
+                    }}
+                  >
+                    Reopen
+                  </button>
+                ) : null}
+              </div>
+            </div>
+          );
+        })}
+      </div>
 
-      <form className="queue-form" onSubmit={queueFollowUp}>
-        <label>
-          Queue follow-up
-          <input
-            onChange={(event) => {
-              setQueueText(event.target.value);
-            }}
-            value={queueText}
-          />
-        </label>
-        <select
-          onChange={(event) => {
-            setSelectedThread(event.target.value);
-          }}
-          value={selectedThread}
-        >
-          <option value="">No thread target</option>
-          {threads.map((thread) => (
-            <option key={thread.bac_id} value={thread.bac_id}>
-              {thread.title}
-            </option>
-          ))}
-        </select>
-        <button disabled={busy} type="submit">
-          Queue
-        </button>
-      </form>
+      <div className="sec-head">
+        <span>Captures</span>
+        <span className="count mono">{state.reminders.length}</span>
+      </div>
+      <div className="capture-list">
+        {state.reminders.length === 0 ? (
+          <div className="capture-empty subtle">
+            <p>Captures appear here when an AI thread you tracked replies, when you
+              annotate a page, or when you import notes from a vault.</p>
+          </div>
+        ) : null}
+        {state.reminders.slice(0, 8).map((reminder) => {
+          const linkedThread = threads.find((t) => t.bac_id === reminder.threadId);
+          return (
+            <div className="capture" key={reminder.bac_id}>
+              <svg viewBox="0 0 24 24" aria-hidden>
+                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+              </svg>
+              <div>
+                <div className="text">
+                  {linkedThread !== undefined && isThreadPrivate(linkedThread, state.workstreams)
+                    ? '[private]'
+                    : (linkedThread?.title ?? 'Inbound reply')}
+                </div>
+                <div className="meta mono">
+                  {providerLabel(reminder.provider)} · {formatRelative(reminder.detectedAt)} ·{' '}
+                  {reminder.status === 'new' ? 'unread' : reminder.status}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
 
       {moveThread ? (
         <MoveToPicker
@@ -1986,3 +1252,193 @@ const App = () => {
 };
 
 export default App;
+
+// =====================================================
+// Spec-aligned UI subcomponents (PR 2 / design rewrite)
+// =====================================================
+
+interface WorkstreamBarProps {
+  readonly currentWsLabel: string;
+  readonly statusLabel: string;
+  readonly onOpenPicker: () => void;
+  readonly onAddSubWorkstream: () => void;
+}
+
+function WorkstreamBar({
+  currentWsLabel,
+  statusLabel,
+  onOpenPicker,
+  onAddSubWorkstream,
+}: WorkstreamBarProps) {
+  return (
+    <div className="ws-bar">
+      <span className="lbl">Workstream</span>
+      <button
+        type="button"
+        className="ws-name"
+        onClick={onOpenPicker}
+        aria-haspopup="menu"
+      >
+        {currentWsLabel}
+      </button>
+      <button
+        type="button"
+        className="icon-btn ws-add"
+        title="Add sub-workstream"
+        aria-label="Add sub-workstream"
+        onClick={onAddSubWorkstream}
+      >
+        <svg viewBox="0 0 24 24">
+          <line x1="12" y1="5" x2="12" y2="19" />
+          <line x1="5" y1="12" x2="19" y2="12" />
+        </svg>
+      </button>
+      <span className="ws-status mono">{statusLabel}</span>
+      <span className="swap-arrow" aria-hidden>
+        ↓
+      </span>
+    </div>
+  );
+}
+
+interface WorkstreamPickerProps {
+  readonly workstreams: readonly WorkstreamNode[];
+  readonly threads: readonly TrackedThread[];
+  readonly currentWsId: string | null;
+  readonly createMode: boolean;
+  readonly parentForNew: string | null;
+  readonly onClose: () => void;
+  readonly onSelect: (id: string | null) => void;
+  readonly onCreate: (title: string, parentId: string | null) => void;
+}
+
+function WorkstreamPicker({
+  workstreams,
+  threads,
+  currentWsId,
+  createMode,
+  parentForNew,
+  onClose,
+  onSelect,
+  onCreate,
+}: WorkstreamPickerProps) {
+  const [query, setQuery] = useState('');
+  const [creating, setCreating] = useState(createMode);
+  const [draftTitle, setDraftTitle] = useState('');
+
+  const matches = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (q.length === 0) {
+      return workstreams;
+    }
+    return workstreams.filter((w) => w.title.toLowerCase().includes(q));
+  }, [query, workstreams]);
+
+  const threadCountFor = (wsId: string): number =>
+    threads.filter((t) => t.primaryWorkstreamId === wsId).length;
+  const inboxCount = threads.filter((t) => t.primaryWorkstreamId === undefined).length;
+
+  return (
+    <div className="ws-picker-backdrop" onClick={onClose} role="presentation">
+      <div
+        className="ws-picker"
+        onClick={(e) => {
+          e.stopPropagation();
+        }}
+        role="menu"
+      >
+        <input
+          type="search"
+          className="ws-picker-search mono"
+          placeholder="Search workstreams…"
+          value={query}
+          autoFocus
+          onChange={(e) => {
+            setQuery(e.target.value);
+          }}
+        />
+        <div className="ws-picker-list">
+          <button
+            type="button"
+            className={'ws-picker-row' + (currentWsId === null ? ' on' : '')}
+            onClick={() => {
+              onSelect(null);
+            }}
+          >
+            <span className="ws-picker-name">not set <em className="subtle">· captures land here</em></span>
+            <span className="mono subtle">{inboxCount}</span>
+          </button>
+          {matches.map((w) => (
+            <button
+              type="button"
+              key={w.bac_id}
+              className={'ws-picker-row' + (currentWsId === w.bac_id ? ' on' : '')}
+              onClick={() => {
+                onSelect(w.bac_id);
+              }}
+            >
+              <span className="ws-picker-name">
+                {w.title}
+                {w.parentId !== undefined ? <em className="subtle"> · sub</em> : null}
+              </span>
+              <span className="mono subtle">{threadCountFor(w.bac_id)}</span>
+            </button>
+          ))}
+        </div>
+        {creating ? (
+          <form
+            className="ws-picker-create"
+            onSubmit={(e) => {
+              e.preventDefault();
+              const trimmed = draftTitle.trim();
+              if (trimmed.length === 0) {
+                return;
+              }
+              onCreate(trimmed, parentForNew);
+              setDraftTitle('');
+              setCreating(false);
+            }}
+          >
+            <input
+              type="text"
+              className="ws-picker-create-input"
+              placeholder={
+                parentForNew === null
+                  ? 'New workstream name…'
+                  : 'New sub-workstream under current…'
+              }
+              value={draftTitle}
+              autoFocus
+              onChange={(e) => {
+                setDraftTitle(e.target.value);
+              }}
+            />
+            <button type="submit" className="btn btn-primary">
+              Create
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost"
+              onClick={() => {
+                setCreating(false);
+                setDraftTitle('');
+              }}
+            >
+              Cancel
+            </button>
+          </form>
+        ) : (
+          <button
+            type="button"
+            className="ws-picker-create-trigger"
+            onClick={() => {
+              setCreating(true);
+            }}
+          >
+            + New workstream{parentForNew !== null ? ' under current' : ''}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
