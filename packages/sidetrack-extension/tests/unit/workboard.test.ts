@@ -15,8 +15,9 @@ describe('workboard scaffold', () => {
   });
 
   it('maps companion status to side-panel copy', () => {
-    expect(companionStatusLabel('connected')).toBe('companion: running');
-    expect(companionStatusLabel('disconnected')).toBe('companion: disconnected');
-    expect(companionStatusLabel('vault-error')).toBe('vault: error');
+    expect(companionStatusLabel('connected')).toBe('vault: synced');
+    expect(companionStatusLabel('disconnected')).toBe('vault: disconnected');
+    expect(companionStatusLabel('vault-error')).toBe('vault: unreachable');
+    expect(companionStatusLabel('local-only')).toBe('local-only');
   });
 });

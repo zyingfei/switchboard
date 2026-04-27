@@ -1053,11 +1053,20 @@ const App = () => {
   const selectedWorkstreamQueue = activeWorkstream
     ? state.queueItems.filter((item) => item.targetId === activeWorkstream.bac_id)
     : [];
+  // Auto-pop the wizard ONLY for true first-launch users (no setupCompleted
+  // flag AND no bridge key in storage). Existing-user migration: a non-empty
+  // bridge key from a prior install means they already configured it; don't
+  // re-pop. After "Done" or "Skip", setupCompleted=true → never re-pops.
   const firstLaunch =
     stateLoaded && setupCompleted === false && bridgeKey.trim().length === 0;
   const showWizard = firstLaunch || wizardOpen;
+  const localOnlyMode = state.companionStatus === 'local-only';
+  // When local-only is the chosen mode, the companion isn't expected;
+  // "disconnected" only applies when a bridge key was set but the companion
+  // is unreachable.
   const companionDisconnected =
-    bridgeKey.trim().length === 0 || state.companionStatus === 'disconnected';
+    !localOnlyMode &&
+    (bridgeKey.trim().length === 0 || state.companionStatus === 'disconnected');
   const vaultUnreachable = state.companionStatus === 'vault-error';
   const hasSystemBanners =
     companionDisconnected ||

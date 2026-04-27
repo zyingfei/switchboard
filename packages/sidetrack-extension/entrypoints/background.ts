@@ -149,22 +149,41 @@ const captureFromContentScript = async (tab: chrome.tabs.Tab): Promise<CaptureEv
   return response.capture;
 };
 
+const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
+  const existing = (await readThreads()).find((t) => t.threadUrl === event.threadUrl);
+  await upsertLocalThread({
+    provider: event.provider,
+    threadId: event.threadId,
+    threadUrl: event.threadUrl,
+    title: event.title ?? event.threadUrl,
+    lastSeenAt: event.capturedAt,
+    status: event.turns.length > 0 ? 'active' : 'needs_organize',
+    trackingMode: event.provider === 'unknown' ? 'manual' : 'auto',
+    tags: [],
+    tabSnapshot: event.tabSnapshot,
+  });
+  const lastTurn = event.turns.at(-1);
+  if (existing !== undefined && lastTurn?.role === 'assistant') {
+    await createLocalReminder({
+      threadId: existing.bac_id,
+      provider: event.provider,
+      detectedAt: event.capturedAt,
+      status: 'new',
+    });
+  }
+  await recordSelectorCanary(event);
+};
+
 const storeCaptureEvent = async (event: CaptureEvent): Promise<void> => {
+  if (!(await isCompanionConfigured())) {
+    await storeCaptureEventLocal(event);
+    return;
+  }
   try {
     await sendToCompanion(event);
   } catch {
     await enqueueCapture(event);
-    await upsertLocalThread({
-      provider: event.provider,
-      threadId: event.threadId,
-      threadUrl: event.threadUrl,
-      title: event.title ?? event.threadUrl,
-      lastSeenAt: event.capturedAt,
-      status: 'needs_organize',
-      trackingMode: event.provider === 'unknown' ? 'manual' : 'auto',
-      tags: [],
-      tabSnapshot: event.tabSnapshot,
-    });
+    await storeCaptureEventLocal(event);
   }
 };
 
@@ -204,10 +223,15 @@ const replayQueuedCaptures = async (): Promise<void> => {
   });
 };
 
-const assertCompanionReachable = async (): Promise<'connected' | 'vault-error'> => {
+const isCompanionConfigured = async (): Promise<boolean> => {
+  const settings = await readSettings();
+  return settings.companion.bridgeKey.trim().length > 0;
+};
+
+const assertCompanionReachable = async (): Promise<'connected' | 'vault-error' | 'local-only'> => {
   const settings = await readSettings();
   if (settings.companion.bridgeKey.length === 0) {
-    throw new Error('Paste the companion bridge key to connect.');
+    return 'local-only';
   }
   const status = await createCompanionClient(settings.companion).status();
   return status.vault === 'connected' ? 'connected' : 'vault-error';
@@ -285,27 +309,66 @@ const withCompanionStatus = async (
 };
 
 const createWorkstream = async (input: WorkstreamCreate): Promise<void> => {
+  if (!(await isCompanionConfigured())) {
+    await createLocalWorkstream(input);
+    return;
+  }
   const settings = await readSettings();
   const client = createCompanionClient(settings.companion);
-  const result = await client.createWorkstream(input);
-  await createLocalWorkstream(input, result);
+  try {
+    const result = await client.createWorkstream(input);
+    await createLocalWorkstream(input, result);
+  } catch {
+    await createLocalWorkstream(input);
+  }
 };
 
 const updateWorkstream = async (workstreamId: string, update: WorkstreamUpdate): Promise<void> => {
+  if (!(await isCompanionConfigured())) {
+    await updateLocalWorkstream(workstreamId, update);
+    return;
+  }
   const settings = await readSettings();
   const client = createCompanionClient(settings.companion);
-  const result = await client.updateWorkstream(workstreamId, update);
-  await updateLocalWorkstream(workstreamId, update, result);
+  try {
+    const result = await client.updateWorkstream(workstreamId, update);
+    await updateLocalWorkstream(workstreamId, update, result);
+  } catch {
+    await updateLocalWorkstream(workstreamId, update);
+  }
 };
 
 const createQueueItem = async (item: QueueCreate): Promise<void> => {
+  if (!(await isCompanionConfigured())) {
+    await createLocalQueueItem(item);
+    return;
+  }
   const settings = await readSettings();
   const client = createCompanionClient(settings.companion);
-  const result = await client.createQueueItem(
-    item,
-    idempotencyKey('queue', `${item.scope}-${item.targetId ?? 'global'}-${item.text}`),
-  );
-  await createLocalQueueItem(item, result);
+  try {
+    const result = await client.createQueueItem(
+      item,
+      idempotencyKey('queue', `${item.scope}-${item.targetId ?? 'global'}-${item.text}`),
+    );
+    await createLocalQueueItem(item, result);
+  } catch {
+    await createLocalQueueItem(item);
+  }
+};
+
+const upsertThreadPersisted = async (input: ThreadUpsert): Promise<void> => {
+  if (!(await isCompanionConfigured())) {
+    await upsertLocalThread(input);
+    return;
+  }
+  const settings = await readSettings();
+  const client = createCompanionClient(settings.companion);
+  try {
+    const result = await client.upsertThread(input);
+    await upsertLocalThread(input, result);
+  } catch {
+    await upsertLocalThread(input);
+  }
 };
 
 const moveThread = async (threadId: string, workstreamId: string): Promise<void> => {
@@ -314,7 +377,7 @@ const moveThread = async (threadId: string, workstreamId: string): Promise<void>
     throw new Error('Tracked thread was not found.');
   }
 
-  const input: ThreadUpsert = {
+  await upsertThreadPersisted({
     bac_id: thread.bac_id,
     provider: thread.provider,
     threadId: thread.threadId,
@@ -326,11 +389,7 @@ const moveThread = async (threadId: string, workstreamId: string): Promise<void>
     primaryWorkstreamId: workstreamId,
     tags: thread.tags,
     tabSnapshot: thread.tabSnapshot,
-  };
-  const settings = await readSettings();
-  const client = createCompanionClient(settings.companion);
-  const result = await client.upsertThread(input);
-  await upsertLocalThread(input, result);
+  });
 };
 
 const updateThreadTracking = async (
@@ -344,7 +403,7 @@ const updateThreadTracking = async (
 
   const removed = trackingMode === 'removed';
   const stopped = trackingMode === 'stopped';
-  const input: ThreadUpsert = {
+  await upsertThreadPersisted({
     bac_id: thread.bac_id,
     provider: thread.provider,
     threadId: thread.threadId,
@@ -356,11 +415,7 @@ const updateThreadTracking = async (
     primaryWorkstreamId: thread.primaryWorkstreamId,
     tags: thread.tags,
     tabSnapshot: thread.tabSnapshot,
-  };
-  const settings = await readSettings();
-  const client = createCompanionClient(settings.companion);
-  const result = await client.upsertThread(input);
-  await upsertLocalThread(input, result);
+  });
 };
 
 const markClosedTabRestorable = async (tabId: number): Promise<void> => {
@@ -393,20 +448,36 @@ const restoreThreadTab = async (threadId: string): Promise<void> => {
 };
 
 const createReminder = async (reminder: ReminderCreate): Promise<void> => {
+  if (!(await isCompanionConfigured())) {
+    await createLocalReminder(reminder);
+    return;
+  }
   const settings = await readSettings();
   const client = createCompanionClient(settings.companion);
-  const result = await client.createReminder(reminder);
-  await createLocalReminder(reminder, result);
+  try {
+    const result = await client.createReminder(reminder);
+    await createLocalReminder(reminder, result);
+  } catch {
+    await createLocalReminder(reminder);
+  }
 };
 
 const updateReminder = async (
   reminderId: string,
   update: { readonly status?: 'new' | 'seen' | 'relevant' | 'dismissed' },
 ): Promise<void> => {
+  if (!(await isCompanionConfigured())) {
+    await updateLocalReminder(reminderId, update);
+    return;
+  }
   const settings = await readSettings();
   const client = createCompanionClient(settings.companion);
-  const result = await client.updateReminder(reminderId, update);
-  await updateLocalReminder(reminderId, update, result);
+  try {
+    const result = await client.updateReminder(reminderId, update);
+    await updateLocalReminder(reminderId, update, result);
+  } catch {
+    await updateLocalReminder(reminderId, update);
+  }
 };
 
 const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> => {

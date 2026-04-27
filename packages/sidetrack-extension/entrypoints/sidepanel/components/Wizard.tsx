@@ -139,8 +139,12 @@ function WelcomeStep({ onSkip }: { readonly onSkip?: () => void }) {
         Sidetrack watches your AI tabs, recovers what you lost, and lets you hand context to other
         models — without copy-paste fatigue.
       </div>
+      <p className="wizard-lede">
+        You can use Sidetrack right now — everything is stored locally in your browser. The next
+        steps are optional: connect a vault to sync across devices and persist beyond uninstall.
+      </p>
       <button type="button" className="wizard-skip mono" onClick={onSkip}>
-        Skip — I've already set this up
+        Use Sidetrack without vault sync →
       </button>
     </div>
   );
