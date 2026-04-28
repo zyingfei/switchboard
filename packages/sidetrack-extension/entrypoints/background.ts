@@ -24,9 +24,11 @@ import {
 import type { TrackedThread, WorkboardState } from '../src/workboard';
 import {
   buildWorkboardState,
+  createLocalCaptureNote,
   createLocalQueueItem,
   createLocalReminder,
   createLocalWorkstream,
+  deleteLocalCaptureNote,
   readThreads,
   readSettings,
   recordSelectorCanary,
@@ -34,6 +36,7 @@ import {
   saveCompanionSettings,
   saveCollapsedSections,
   saveVaultPath,
+  updateLocalCaptureNote,
   updateLocalQueueItem,
   updateLocalReminder,
   updateLocalWorkstream,
@@ -94,13 +97,37 @@ const broadcastWorkboardChanged = async (
     .catch(() => undefined);
 };
 
+// If the captured DOM exposed a "Branched from <Title>" hint, look it up
+// against existing tracked threads. Match by URL first (exact), title
+// second (case-insensitive). Returns whatever we have so the new thread
+// row can show "↰ from <parentTitle>" even when the parent isn't tracked.
+const resolveParentFromForkSource = (
+  event: CaptureEvent,
+  threads: readonly TrackedThread[],
+): { readonly parentThreadId?: string; readonly parentTitle?: string } => {
+  if (event.forkedFromUrl !== undefined) {
+    const byUrl = threads.find((t) => t.threadUrl === event.forkedFromUrl);
+    if (byUrl !== undefined) {
+      return { parentThreadId: byUrl.bac_id, parentTitle: byUrl.title };
+    }
+  }
+  if (event.forkedFromTitle !== undefined) {
+    const target = event.forkedFromTitle.toLowerCase();
+    const byTitle = threads.find((t) => t.title.toLowerCase() === target);
+    if (byTitle !== undefined) {
+      return { parentThreadId: byTitle.bac_id, parentTitle: byTitle.title };
+    }
+  }
+  return event.forkedFromTitle === undefined ? {} : { parentTitle: event.forkedFromTitle };
+};
+
 const sendToCompanion = async (
   event: CaptureEvent,
 ): Promise<{ readonly bac_id: string; readonly revision: string }> => {
   const settings = await readSettings();
-  const existingThread = (await readThreads()).find(
-    (thread) => thread.threadUrl === event.threadUrl,
-  );
+  const allThreads = await readThreads();
+  const existingThread = allThreads.find((thread) => thread.threadUrl === event.threadUrl);
+  const parentLink = resolveParentFromForkSource(event, allThreads);
   const client = createCompanionClient(settings.companion);
   const eventResult = await client.appendEvent(
     event,
@@ -119,6 +146,7 @@ const sendToCompanion = async (
     trackingMode,
     tags: [],
     tabSnapshot: event.tabSnapshot,
+    ...parentLink,
   };
   const threadResult = await client.upsertThread(thread);
   await upsertLocalThread(thread, threadResult);
@@ -158,8 +186,10 @@ const captureFromContentScript = async (tab: chrome.tabs.Tab): Promise<CaptureEv
 };
 
 const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
-  const existing = (await readThreads()).find((t) => t.threadUrl === event.threadUrl);
+  const allThreads = await readThreads();
+  const existing = allThreads.find((t) => t.threadUrl === event.threadUrl);
   const settings = await readSettings();
+  const parentLink = resolveParentFromForkSource(event, allThreads);
   const trackingMode: ThreadUpsert['trackingMode'] =
     event.provider === 'unknown' || !settings.autoTrack ? 'manual' : 'auto';
   await upsertLocalThread({
@@ -172,6 +202,7 @@ const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
     trackingMode,
     tags: [],
     tabSnapshot: event.tabSnapshot,
+    ...parentLink,
   });
   const lastTurn = event.turns.at(-1);
   if (existing !== undefined && lastTurn?.role === 'assistant') {
@@ -649,6 +680,27 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
         await saveVaultPath(request.preferences.vaultPath);
       }
     }, 'settings');
+  }
+
+  if (request.type === messageTypes.createCaptureNote) {
+    const note = request.note;
+    return await withCompanionStatus(
+      () => createLocalCaptureNote(note).then(() => undefined),
+      'mutation',
+    );
+  }
+
+  if (request.type === messageTypes.updateCaptureNote) {
+    const { noteId, update } = request;
+    return await withCompanionStatus(
+      () => updateLocalCaptureNote(noteId, update).then(() => undefined),
+      'mutation',
+    );
+  }
+
+  if (request.type === messageTypes.deleteCaptureNote) {
+    const { noteId } = request;
+    return await withCompanionStatus(() => deleteLocalCaptureNote(noteId), 'mutation');
   }
 
   await saveCollapsedSections(request.collapsedSections);

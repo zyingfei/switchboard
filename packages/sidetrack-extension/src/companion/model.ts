@@ -47,6 +47,11 @@ export interface CaptureEvent {
   readonly warnings?: readonly CaptureWarning[];
   readonly tabSnapshot?: TabSnapshot;
   readonly turns: readonly CapturedTurn[];
+  // Provider-side hint that this thread was branched / forked from a
+  // previously-tracked one. The background resolves these to a
+  // parentThreadId by URL match (preferred) or title match (fallback).
+  readonly forkedFromUrl?: string;
+  readonly forkedFromTitle?: string;
 }
 
 export interface ThreadUpsert {
@@ -69,6 +74,20 @@ export interface ThreadUpsert {
   readonly tags?: readonly string[];
   readonly trackingMode?: 'auto' | 'manual' | 'stopped' | 'removed' | 'archived';
   readonly tabSnapshot?: TabSnapshot;
+  readonly parentThreadId?: string;
+  readonly parentTitle?: string;
+}
+
+export interface CaptureNoteCreate {
+  readonly text: string;
+  readonly kind?: 'manual' | 'obsidian' | 'external';
+  readonly workstreamId?: string;
+  readonly source?: string;
+}
+
+export interface CaptureNoteUpdate {
+  readonly text?: string;
+  readonly workstreamId?: string;
 }
 
 export interface WorkstreamCreate {

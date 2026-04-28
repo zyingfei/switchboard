@@ -181,6 +181,9 @@ const App = () => {
   const [queueDraft, setQueueDraft] = useState('');
   const [queueExpandFor, setQueueExpandFor] = useState<string | null>(null);
   const [queueCopiedId, setQueueCopiedId] = useState<string | null>(null);
+  const [noteComposeOpen, setNoteComposeOpen] = useState(false);
+  const [noteDraft, setNoteDraft] = useState('');
+  const [noteEditId, setNoteEditId] = useState<string | null>(null);
   const [composeThreadId, setComposeThreadId] = useState<string | null>(null);
   const [pendingDispatch, setPendingDispatch] = useState<ComposedPacket | null>(null);
   const [dispatchInFlight, setDispatchInFlight] = useState(false);
@@ -558,6 +561,51 @@ const App = () => {
     );
   };
 
+  const submitNote = () => {
+    const text = noteDraft.trim();
+    if (text.length === 0) {
+      return;
+    }
+    if (noteEditId !== null) {
+      const editId = noteEditId;
+      void runAction(async () => {
+        const next = await sendRequest({
+          type: messageTypes.updateCaptureNote,
+          noteId: editId,
+          update: { text },
+        });
+        setNoteDraft('');
+        setNoteEditId(null);
+        setNoteComposeOpen(false);
+        return next;
+      });
+      return;
+    }
+    void runAction(async () => {
+      const next = await sendRequest({
+        type: messageTypes.createCaptureNote,
+        note: {
+          text,
+          kind: 'manual',
+          ...(currentWsId === null ? {} : { workstreamId: currentWsId }),
+        },
+      });
+      setNoteDraft('');
+      setNoteComposeOpen(false);
+      return next;
+    });
+  };
+
+  const deleteNote = (noteId: string) => {
+    void runAction(() => sendRequest({ type: messageTypes.deleteCaptureNote, noteId }));
+  };
+
+  const beginEditNote = (noteId: string, text: string) => {
+    setNoteComposeOpen(true);
+    setNoteEditId(noteId);
+    setNoteDraft(text);
+  };
+
   const copyQueueItemText = (queueItemId: string, text: string) => {
     void (async () => {
       try {
@@ -810,6 +858,30 @@ const App = () => {
     .slice()
     .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
 
+  // Captures: manual notes filtered by the current workstream (or Inbox)
+  // plus inbound reminders whose linked thread sits in scope. In the All
+  // view we show everything.
+  const scopedNotes =
+    viewMode === 'all'
+      ? state.captureNotes
+      : state.captureNotes.filter((note) =>
+          currentWsId === null
+            ? note.workstreamId === undefined
+            : note.workstreamId === currentWsId,
+        );
+  const visibleReminders =
+    viewMode === 'all'
+      ? state.reminders
+      : state.reminders.filter((reminder) => {
+          const linkedThread = state.threads.find((t) => t.bac_id === reminder.threadId);
+          if (linkedThread === undefined) {
+            return currentWsId === null;
+          }
+          return currentWsId === null
+            ? linkedThread.primaryWorkstreamId === undefined
+            : linkedThread.primaryWorkstreamId === currentWsId;
+        });
+
   // Coding sessions (registered via the agent's MCP register tool) render
   // alongside chat threads in the same workstream group.
   const attachedSessions = state.codingSessions.filter((s) => s.status === 'attached');
@@ -886,6 +958,11 @@ const App = () => {
     );
     const queuedCount = pendingQueueItems.length;
     const queueExpanded = queueExpandFor === thread.bac_id && queuedCount > 0;
+    const childForks = state.threads.filter((t) => t.parentThreadId === thread.bac_id);
+    const parent =
+      thread.parentThreadId === undefined
+        ? undefined
+        : state.threads.find((t) => t.bac_id === thread.parentThreadId);
     return (
       <div key={thread.bac_id} className="thread">
         <div className="row1">
@@ -920,6 +997,40 @@ const App = () => {
           <span className={'dot ' + dotClass} />
           <span className="stamp">{stamp}</span>
         </div>
+        {parent !== undefined || thread.parentTitle !== undefined ? (
+          <div className="row2 thread-lineage" title="Branched from a tracked thread">
+            <span className="lineage-arrow">↰</span>
+            <span className="lineage-from mono">from</span>
+            {parent === undefined ? (
+              <span className="lineage-name">{thread.parentTitle ?? 'untracked thread'}</span>
+            ) : (
+              <button
+                type="button"
+                className="btn-link lineage-name"
+                title={`Switch to parent thread: ${parent.title}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openTabForThread(parent);
+                }}
+              >
+                {parent.title}
+              </button>
+            )}
+          </div>
+        ) : null}
+        {childForks.length > 0 ? (
+          <div
+            className="row2 thread-lineage"
+            title={`This thread has ${String(childForks.length)} fork${
+              childForks.length === 1 ? '' : 's'
+            }`}
+          >
+            <span className="lineage-arrow">↳</span>
+            <span className="lineage-from mono">
+              {String(childForks.length)} fork{childForks.length === 1 ? '' : 's'}
+            </span>
+          </div>
+        ) : null}
         <div className="thread-actions row2">
           <button
             type="button"
@@ -1378,18 +1489,114 @@ const App = () => {
 
       <div className="sec-head">
         <span>Captures</span>
-        <span className="count mono">{state.reminders.length}</span>
+        <span className="sec-head-actions">
+          <span className="count mono">{String(scopedNotes.length + visibleReminders.length)}</span>
+          <button
+            type="button"
+            className="btn-link sec-head-btn"
+            title={
+              currentWsId === null ? 'Add a note in the Inbox' : `Add a note in ${currentWsLabel}`
+            }
+            onClick={() => {
+              setNoteEditId(null);
+              setNoteDraft('');
+              setNoteComposeOpen(true);
+            }}
+          >
+            + note
+          </button>
+        </span>
       </div>
+      {noteComposeOpen ? (
+        <form
+          className="note-compose"
+          onSubmit={(e) => {
+            e.preventDefault();
+            submitNote();
+          }}
+        >
+          <textarea
+            autoFocus
+            rows={3}
+            placeholder={
+              currentWsId === null ? 'Note (lands in the Inbox)…' : `Note for ${currentWsLabel}…`
+            }
+            value={noteDraft}
+            onChange={(e) => {
+              setNoteDraft(e.target.value);
+            }}
+          />
+          <div className="note-compose-actions">
+            <button
+              type="submit"
+              className="btn-link"
+              disabled={busy || noteDraft.trim().length === 0}
+            >
+              {noteEditId === null ? 'Save note' : 'Update note'}
+            </button>
+            <button
+              type="button"
+              className="btn-link"
+              onClick={() => {
+                setNoteComposeOpen(false);
+                setNoteDraft('');
+                setNoteEditId(null);
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+        </form>
+      ) : null}
       <div className="capture-list">
-        {state.reminders.length === 0 ? (
+        {scopedNotes.length === 0 && visibleReminders.length === 0 ? (
           <div className="capture-empty subtle">
             <p>
-              Captures appear here when an AI thread you tracked replies, when you annotate a page,
-              or when you import notes from a vault.
+              Notes you save here are scoped to the current workstream. Inbound replies from tracked
+              AI threads also land in this list. Obsidian / external imports come later.
             </p>
           </div>
         ) : null}
-        {state.reminders.slice(0, 8).map((reminder) => {
+        {scopedNotes.slice(0, 12).map((note) => (
+          <div className="capture capture-note" key={note.bac_id}>
+            <svg viewBox="0 0 24 24" aria-hidden>
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+              <polyline points="14 2 14 8 20 8" />
+              <line x1="8" y1="13" x2="16" y2="13" />
+              <line x1="8" y1="17" x2="13" y2="17" />
+            </svg>
+            <div className="capture-body">
+              <div className="text">{note.text}</div>
+              <div className="meta mono">
+                note · {formatRelative(note.createdAt)}
+                {note.kind !== 'manual' ? ` · ${note.kind}` : ''}
+              </div>
+              <div className="capture-actions">
+                <button
+                  type="button"
+                  className="btn-link"
+                  title="Edit this note"
+                  onClick={() => {
+                    beginEditNote(note.bac_id, note.text);
+                  }}
+                >
+                  Edit
+                </button>
+                <button
+                  type="button"
+                  className="btn-link archive"
+                  title="Delete this note"
+                  onClick={() => {
+                    deleteNote(note.bac_id);
+                  }}
+                >
+                  Delete
+                </button>
+              </div>
+            </div>
+          </div>
+        ))}
+        {visibleReminders.slice(0, 8).map((reminder) => {
           const linkedThread = threads.find((t) => t.bac_id === reminder.threadId);
           return (
             <div className="capture" key={reminder.bac_id}>

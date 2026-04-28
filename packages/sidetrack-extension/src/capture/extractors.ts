@@ -402,6 +402,39 @@ const threadIdFromUrl = (provider: ProviderId, rawUrl: string): string | undefin
   return undefined;
 };
 
+// Look for a "Branched from <Title>" / "Forked from <Title>" indicator
+// near the top of the conversation. We try a narrow selector list first
+// (Claude renders it as a small chip/button); fall back to scanning the
+// first ~32 elements of body text for the literal phrase.
+//
+// Returns the matched parent title, plus the parent URL when an anchor
+// is co-located with the indicator (preferred for resolution).
+const detectForkSource = (
+  doc: Document,
+): { readonly forkedFromTitle?: string; readonly forkedFromUrl?: string } => {
+  const candidates = Array.from(
+    doc.querySelectorAll(
+      'a, button, [role="link"], [role="button"], header *, [class*="branch" i], [data-testid*="branch" i]',
+    ),
+  ).slice(0, 200);
+  for (const node of candidates) {
+    const text = node.textContent.trim();
+    if (text.length === 0 || text.length > 200) continue;
+    const match = /^(?:branched|forked)\s+from[:\s]+(.+)$/i.exec(text);
+    if (match === null) continue;
+    const title = match[1].trim().replace(/^["“]|["”]$/g, '');
+    const anchor =
+      node instanceof HTMLAnchorElement ? node : (node.closest('a') ?? node.querySelector('a'));
+    const href =
+      anchor instanceof HTMLAnchorElement && anchor.href.length > 0 ? anchor.href : undefined;
+    return {
+      ...(title.length === 0 ? {} : { forkedFromTitle: title }),
+      ...(href === undefined ? {} : { forkedFromUrl: href }),
+    };
+  }
+  return {};
+};
+
 export const captureVisibleConversation = (
   doc: Document,
   options: CaptureOptions = {},
@@ -434,6 +467,7 @@ export const captureVisibleConversation = (
       severity: 'info',
     });
   }
+  const forkSource = detectForkSource(doc);
 
   return {
     provider,
@@ -446,6 +480,7 @@ export const captureVisibleConversation = (
     visibleTextCharCount: visibleText.length,
     warnings,
     turns,
+    ...forkSource,
   };
 };
 
