@@ -108,6 +108,22 @@ export interface QueueUpdate {
   readonly text?: string;
 }
 
+export interface CodingAttachTokenCreate {
+  readonly workstreamId?: string;
+}
+
+export interface CodingAttachTokenRecord {
+  readonly token: string;
+  readonly workstreamId?: string;
+  readonly createdAt: string;
+  readonly expiresAt: string;
+}
+
+export interface CodingSessionListQuery {
+  readonly token?: string;
+  readonly workstreamId?: string;
+}
+
 export interface ReminderCreate {
   readonly threadId: string;
   readonly provider: ProviderId;

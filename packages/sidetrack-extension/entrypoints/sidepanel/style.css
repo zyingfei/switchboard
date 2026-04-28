@@ -2503,3 +2503,44 @@ button.thread-queued:focus-visible {
   color: var(--ink-4, #a39a8c);
   cursor: not-allowed;
 }
+
+/* =====================================================
+   Coding sessions (interleaved with chat threads)
+   ===================================================== */
+.coding-session-row .provider.coding {
+  font-family: var(--mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-weight: 600;
+  letter-spacing: 0;
+  background: var(--paper-deep, #e8dfc8);
+  color: var(--signal, #c2410c);
+  border: 1px solid var(--rule, #d4cdb8);
+}
+.coding-session-row .name {
+  font-style: normal;
+}
+
+.coding-handoff {
+  display: grid;
+  gap: 8px;
+}
+.coding-handoff-prompt {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--rule-soft, #e5ddc9);
+  border-radius: 6px;
+  background: var(--paper-light, #fbf7ee);
+  color: var(--ink-1, #1b1916);
+  font-size: 11.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  max-height: 220px;
+  overflow: auto;
+}
+.coding-handoff-meta {
+  font-size: 10.5px;
+  color: var(--ink-3, #7a7269);
+  letter-spacing: 0.04em;
+}
+.signal {
+  color: var(--signal, #c2410c);
+}

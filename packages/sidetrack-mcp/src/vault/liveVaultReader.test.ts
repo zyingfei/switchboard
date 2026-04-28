@@ -231,10 +231,7 @@ describe('LiveVaultReader', () => {
 
     const result = await new LiveVaultReader(vaultPath).readReviews({ limit: 2 });
 
-    expect(result.data.map((event) => event.bac_id)).toEqual([
-      'review_first',
-      'review_second',
-    ]);
+    expect(result.data.map((event) => event.bac_id)).toEqual(['review_first', 'review_second']);
   });
 
   it('filters reviews by since timestamp', async () => {
@@ -258,10 +255,7 @@ describe('LiveVaultReader', () => {
       since: '2026-04-26T12:00:00.000Z',
     });
 
-    expect(result.data.map((event) => event.bac_id)).toEqual([
-      'review_after',
-      'review_at_since',
-    ]);
+    expect(result.data.map((event) => event.bac_id)).toEqual(['review_after', 'review_at_since']);
   });
 
   it('filters reviews by thread and verdict', async () => {
@@ -303,14 +297,24 @@ describe('LiveVaultReader', () => {
         threadUrl,
         capturedAt: '2026-04-26T20:00:00.000Z',
         turns: [
-          { role: 'assistant', text: 'first capture v1', ordinal: 0, capturedAt: '2026-04-26T20:00:00.000Z' },
+          {
+            role: 'assistant',
+            text: 'first capture v1',
+            ordinal: 0,
+            capturedAt: '2026-04-26T20:00:00.000Z',
+          },
         ],
       },
       {
         threadUrl,
         capturedAt: '2026-04-26T22:00:00.000Z',
         turns: [
-          { role: 'assistant', text: 'first capture v2', ordinal: 0, capturedAt: '2026-04-26T22:00:00.000Z' },
+          {
+            role: 'assistant',
+            text: 'first capture v2',
+            ordinal: 0,
+            capturedAt: '2026-04-26T22:00:00.000Z',
+          },
           { role: 'user', text: 'follow-up', ordinal: 1, capturedAt: '2026-04-26T22:01:00.000Z' },
         ],
       },

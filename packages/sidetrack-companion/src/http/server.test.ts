@@ -372,8 +372,9 @@ describe('companion HTTP server', () => {
       { headers: { 'x-bac-bridge-key': bridgeKey } },
     );
     expect(list.status).toBe(200);
-    const data = (list.body as { readonly data: readonly { readonly text: string; readonly ordinal: number }[] })
-      .data;
+    const data = (
+      list.body as { readonly data: readonly { readonly text: string; readonly ordinal: number }[] }
+    ).data;
     expect(data).toHaveLength(2);
     // Both have the same capturedAt; order across ties is unspecified, but
     // dedupe semantics MUST keep the newest write for ordinal 0 (v2, not v1).
@@ -605,7 +606,10 @@ describe('companion HTTP server', () => {
         },
       ],
     });
-    const reviewLog = await readFile(join(vaultPath, '_BAC', 'reviews', '2026-04-26.jsonl'), 'utf8');
+    const reviewLog = await readFile(
+      join(vaultPath, '_BAC', 'reviews', '2026-04-26.jsonl'),
+      'utf8',
+    );
     expect(reviewLog).toContain('Needs a citation before reuse.');
   });
 
@@ -634,7 +638,10 @@ describe('companion HTTP server', () => {
     const second = await jsonFetch(context, `${baseUrl}/v1/reviews`, init);
 
     expect(first).toEqual(second);
-    const reviewLog = await readFile(join(vaultPath, '_BAC', 'reviews', '2026-04-26.jsonl'), 'utf8');
+    const reviewLog = await readFile(
+      join(vaultPath, '_BAC', 'reviews', '2026-04-26.jsonl'),
+      'utf8',
+    );
     expect(reviewLog.match(/Only one review line/g)).toHaveLength(1);
   });
 
@@ -878,5 +885,79 @@ describe('companion HTTP server', () => {
     await expect(
       readFile(join(vaultPath, '_BAC', 'reminders', `${reminderId}.json`), 'utf8'),
     ).resolves.toContain('relevant');
+  });
+
+  it('mints an attach token, registers a coding session, lists, then detaches', async () => {
+    const tokenResponse = await jsonFetch(context, `${baseUrl}/v1/coding-sessions/attach-tokens`, {
+      method: 'POST',
+      headers: { 'x-bac-bridge-key': bridgeKey, 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    expect(tokenResponse.status).toBe(201);
+    const token = (
+      tokenResponse.body as {
+        readonly data: { readonly token: string; readonly expiresAt: string };
+      }
+    ).data.token;
+    expect(token.length).toBeGreaterThan(0);
+
+    // Listing while the token is unused returns []; the token survives to be
+    // matched by the agent's register call.
+    const listWhilePending = await jsonFetch(
+      context,
+      `${baseUrl}/v1/coding-sessions?token=${encodeURIComponent(token)}`,
+      { headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+    expect(listWhilePending.status).toBe(200);
+    expect((listWhilePending.body as { readonly data: unknown[] }).data).toHaveLength(0);
+
+    const registerResponse = await jsonFetch(context, `${baseUrl}/v1/coding-sessions`, {
+      method: 'POST',
+      headers: { 'x-bac-bridge-key': bridgeKey, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        token,
+        tool: 'claude_code',
+        cwd: '/Users/test/repo',
+        branch: 'main',
+        sessionId: 'session-abc-123',
+        name: 'claude-code · main',
+      }),
+    });
+    expect(registerResponse.status).toBe(201);
+    const registered = (registerResponse.body as { readonly data: { readonly bac_id: string } })
+      .data;
+    expect(registered.bac_id).toMatch(/^[A-Za-z0-9_-]+$/u);
+
+    // Reusing the token must fail since it was consumed by the register call.
+    const reuseResponse = await jsonFetch(context, `${baseUrl}/v1/coding-sessions`, {
+      method: 'POST',
+      headers: { 'x-bac-bridge-key': bridgeKey, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        token,
+        tool: 'claude_code',
+        cwd: '/Users/test/repo',
+        branch: 'main',
+        sessionId: 'session-abc-456',
+        name: 'duplicate',
+      }),
+    });
+    expect(reuseResponse.status).toBe(410);
+
+    const list = await jsonFetch(context, `${baseUrl}/v1/coding-sessions`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect(list.status).toBe(200);
+    const sessions = (list.body as { readonly data: { readonly bac_id: string }[] }).data;
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]?.bac_id).toBe(registered.bac_id);
+
+    const detach = await jsonFetch(context, `${baseUrl}/v1/coding-sessions/${registered.bac_id}`, {
+      method: 'DELETE',
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect(detach.status).toBe(200);
+    expect((detach.body as { readonly data: { readonly status: string } }).data.status).toBe(
+      'detached',
+    );
   });
 });

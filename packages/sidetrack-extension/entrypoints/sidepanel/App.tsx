@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   companionStatusLabel,
   createEmptyWorkboardState,
+  type CodingSession,
   type TrackedThread,
   type WorkboardState,
   type WorkstreamNode,
@@ -12,6 +13,7 @@ import {
   isRuntimeResponse,
   isWorkboardChangedMessage,
   messageTypes,
+  type RuntimeResponse,
   type WorkboardRequest,
 } from '../../src/messages';
 import {
@@ -54,7 +56,9 @@ const TARGET_PROVIDER_LABEL: Record<string, string> = {
   other: 'Other',
 };
 
-const sendRequest = async (request: WorkboardRequest): Promise<WorkboardState> => {
+const sendRequestRaw = async (
+  request: WorkboardRequest,
+): Promise<Extract<RuntimeResponse, { ok: true }>> => {
   const response = (await chrome.runtime.sendMessage(request)) as unknown;
   if (!isRuntimeResponse(response)) {
     throw new Error('Sidetrack background returned an invalid response.');
@@ -62,8 +66,11 @@ const sendRequest = async (request: WorkboardRequest): Promise<WorkboardState> =
   if (!response.ok) {
     throw new Error(response.error);
   }
-  return response.state;
+  return response;
 };
+
+const sendRequest = async (request: WorkboardRequest): Promise<WorkboardState> =>
+  (await sendRequestRaw(request)).state;
 
 const providerLabel = (provider: TrackedThread['provider']): string => {
   if (provider === 'chatgpt') {
@@ -99,25 +106,6 @@ const formatRelative = (isoDate: string): string => {
 };
 
 const SETUP_COMPLETED_KEY = 'sidetrack:setupCompleted';
-const CODING_SESSIONS_KEY = 'sidetrack:codingSessions';
-
-interface StoredCodingSession {
-  readonly tool: string;
-  readonly cwd: string;
-  readonly branch: string;
-  readonly sessionId: string;
-  readonly name: string;
-  readonly resumeCommand: string;
-  readonly workstreamId: string;
-  readonly attachedAt: string;
-}
-
-const writeCodingSession = async (session: StoredCodingSession): Promise<void> => {
-  const result = await chrome.storage.local.get({ [CODING_SESSIONS_KEY]: [] });
-  const existing = result[CODING_SESSIONS_KEY];
-  const list = Array.isArray(existing) ? (existing as StoredCodingSession[]) : [];
-  await chrome.storage.local.set({ [CODING_SESSIONS_KEY]: [session, ...list].slice(0, 50) });
-};
 
 const DEFAULT_VAULT_PATH = '~/Documents/Sidetrack-vault';
 
@@ -805,6 +793,32 @@ const App = () => {
     .filter((t) => !openStatuses.includes(t.status) || t.trackingMode === 'stopped')
     .slice()
     .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
+
+  // Coding sessions (registered via the agent's MCP register tool) render
+  // alongside chat threads in the same workstream group.
+  const attachedSessions = state.codingSessions.filter((s) => s.status === 'attached');
+  const currentWsCodingSessions =
+    currentWsId === null
+      ? attachedSessions.filter((s) => s.workstreamId === undefined)
+      : attachedSessions.filter((s) => s.workstreamId === currentWsId);
+  const codingSessionsByWs = (() => {
+    const groups = new Map<string | null, CodingSession[]>();
+    groups.set(null, []);
+    for (const ws of state.workstreams) {
+      groups.set(ws.bac_id, []);
+    }
+    for (const session of attachedSessions) {
+      const key = session.workstreamId ?? null;
+      const list = groups.get(key);
+      if (list === undefined) {
+        groups.set(key, [session]);
+      } else {
+        list.push(session);
+      }
+    }
+    return groups;
+  })();
+
   // Group open threads by primary workstream id (null = inbox/not-set)
   const openGroups = (() => {
     const groups = new Map<string | null, TrackedThread[]>();
@@ -821,8 +835,14 @@ const App = () => {
         list.push(t);
       }
     }
-    // Drop empty groups except inbox (always shown so user knows it exists)
-    return Array.from(groups.entries()).filter(([key, list]) => key === null || list.length > 0);
+    // Show a group if it has any threads OR coding sessions, plus always
+    // surface the inbox so the user can see what hasn't been organized.
+    return Array.from(groups.entries()).filter(([key, list]) => {
+      if (key === null) return true;
+      if (list.length > 0) return true;
+      const sessions = codingSessionsByWs.get(key);
+      return sessions !== undefined && sessions.length > 0;
+    });
   })();
 
   // Inline thread-row renderer reused across views.
@@ -1054,6 +1074,58 @@ const App = () => {
     );
   };
 
+  const detachCodingSession = (codingSessionId: string) => {
+    void runAction(() => sendRequest({ type: messageTypes.detachCodingSession, codingSessionId }));
+  };
+
+  // Inline coding-session row, rendered next to chat threads inside the
+  // same workstream group.
+  const renderCodingSessionRow = (session: CodingSession) => (
+    <div key={session.bac_id} className="thread coding-session-row">
+      <div className="row1">
+        <span className="provider coding" aria-hidden>
+          {'>_'}
+        </span>
+        <span className="name">{session.name}</span>
+      </div>
+      <div className="row2">
+        <span className="dot green" />
+        <span className="stamp mono">
+          {session.tool} · {session.branch} · last seen {formatRelative(session.lastSeenAt)}
+        </span>
+      </div>
+      <div className="thread-actions row2">
+        {session.resumeCommand === undefined ? null : (
+          <button
+            type="button"
+            className="btn-link"
+            title="Copy resume command to clipboard"
+            onClick={(e) => {
+              e.stopPropagation();
+              const cmd = session.resumeCommand ?? '';
+              void navigator.clipboard.writeText(cmd).catch(() => {
+                // Clipboard refused — best-effort.
+              });
+            }}
+          >
+            Copy resume
+          </button>
+        )}
+        <button
+          type="button"
+          className="btn-link archive"
+          title="Detach this coding session"
+          onClick={(e) => {
+            e.stopPropagation();
+            detachCodingSession(session.bac_id);
+          }}
+        >
+          Detach
+        </button>
+      </div>
+    </div>
+  );
+
   return (
     <main className="bac-app" aria-label="Sidetrack workboard">
       <div className="app-head">
@@ -1088,12 +1160,17 @@ const App = () => {
         <div className="app-actions">
           <button
             className="icon-btn"
-            title="Attach coding session"
+            title={
+              state.companionStatus === 'connected'
+                ? 'Attach coding session'
+                : 'Coding-session attach needs the companion (configure in Settings)'
+            }
             onClick={() => {
               setCodingAttachOpen(true);
             }}
             type="button"
             aria-label="Attach coding session"
+            disabled={state.companionStatus !== 'connected'}
           >
             <svg viewBox="0 0 24 24">
               <rect x="2" y="4" width="20" height="16" rx="2" />
@@ -1206,7 +1283,7 @@ const App = () => {
             </span>
           </div>
           <div className="thread-list">
-            {currentWsThreads.length === 0 ? (
+            {currentWsThreads.length === 0 && currentWsCodingSessions.length === 0 ? (
               <div className="thread-empty subtle">
                 <p>No threads here yet.</p>
                 <button
@@ -1221,6 +1298,7 @@ const App = () => {
                 </button>
               </div>
             ) : null}
+            {currentWsCodingSessions.map(renderCodingSessionRow)}
             {currentWsThreads.map(renderThreadRow)}
           </div>
         </>
@@ -1237,6 +1315,8 @@ const App = () => {
             {openGroups.map(([wsId, list]) => {
               const ws = wsId === null ? null : state.workstreams.find((w) => w.bac_id === wsId);
               const groupLabel = ws === null ? 'not set · Inbox' : (ws?.title ?? 'unknown');
+              const groupSessions = codingSessionsByWs.get(wsId) ?? [];
+              const totalRows = list.length + groupSessions.length;
               return (
                 <div className="ws-group" key={wsId ?? '__inbox'}>
                   <button
@@ -1249,14 +1329,17 @@ const App = () => {
                   >
                     <span className="ws-group-label">{groupLabel}</span>
                     <span className="ws-group-count mono">
-                      {String(list.length)} thread{list.length === 1 ? '' : 's'} →
+                      {String(totalRows)} item{totalRows === 1 ? '' : 's'} →
                     </span>
                   </button>
-                  {list.length > 0 ? (
-                    <div className="thread-list">{list.map(renderThreadRow)}</div>
+                  {totalRows > 0 ? (
+                    <div className="thread-list">
+                      {groupSessions.map(renderCodingSessionRow)}
+                      {list.map(renderThreadRow)}
+                    </div>
                   ) : (
                     <div className="thread-empty subtle group-empty">
-                      <p>No open threads in this workstream.</p>
+                      <p>No open items in this workstream.</p>
                     </div>
                   )}
                 </div>
@@ -1543,14 +1626,31 @@ const App = () => {
         <CodingAttach
           {...(selectedWorkstream !== '' ? { defaultWorkstreamId: selectedWorkstream } : {})}
           workstreams={workstreamOptions}
+          companionAvailable={state.companionStatus === 'connected'}
           onCancel={() => {
             setCodingAttachOpen(false);
           }}
-          onAttach={(input) => {
-            void writeCodingSession({ ...input, attachedAt: new Date().toISOString() });
-            void navigator.clipboard.writeText(input.resumeCommand).catch(() => {
-              // Clipboard rejected (permissions, focus); resume command is still saved locally.
+          onCreateToken={async (request) => {
+            const response = await sendRequestRaw({
+              type: messageTypes.createCodingAttachToken,
+              request,
             });
+            if (response.attachToken === undefined) {
+              throw new Error('Companion did not return an attach token.');
+            }
+            setState(response.state);
+            return response.attachToken;
+          }}
+          onPoll={async () => {
+            // The background pulls fresh sessions from the companion in
+            // every getWorkboardState response, so polling that is enough.
+            // The token itself isn't needed here; tokens are single-use, so
+            // any new attached session is the one we just asked for.
+            const next = await sendRequest({ type: messageTypes.getWorkboardState });
+            setState(next);
+            return next.codingSessions.filter((session) => session.status === 'attached');
+          }}
+          onAttached={() => {
             setCodingAttachOpen(false);
           }}
         />

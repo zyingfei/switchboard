@@ -1,5 +1,7 @@
 import type {
   CaptureEvent,
+  CodingAttachTokenCreate,
+  CodingAttachTokenRecord,
   CompanionSettings,
   QueueCreate,
   QueueUpdate,
@@ -29,6 +31,8 @@ export const messageTypes = {
   updateReminder: 'sidetrack.reminder.update',
   setCollapsedSections: 'sidetrack.sections.collapsed.set',
   workboardChanged: 'sidetrack.workboard.changed',
+  createCodingAttachToken: 'sidetrack.coding.attach-token.create',
+  detachCodingSession: 'sidetrack.coding.session.detach',
 } as const;
 
 export interface SelectorCanaryReport {
@@ -141,6 +145,14 @@ export type WorkboardRequest =
   | {
       readonly type: typeof messageTypes.setCollapsedSections;
       readonly collapsedSections: readonly WorkboardSection['id'][];
+    }
+  | {
+      readonly type: typeof messageTypes.createCodingAttachToken;
+      readonly request: CodingAttachTokenCreate;
+    }
+  | {
+      readonly type: typeof messageTypes.detachCodingSession;
+      readonly codingSessionId: string;
     };
 
 export type RuntimeRequest =
@@ -158,6 +170,7 @@ export type RuntimeResponse =
   | {
       readonly ok: true;
       readonly state: WorkboardState;
+      readonly attachToken?: CodingAttachTokenRecord;
     }
   | {
       readonly ok: false;
@@ -264,6 +277,14 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
       Array.isArray(value.collapsedSections) &&
       value.collapsedSections.every((section) => typeof section === 'string')
     );
+  }
+
+  if (hasType(value, messageTypes.createCodingAttachToken)) {
+    return isRecord(value.request);
+  }
+
+  if (hasType(value, messageTypes.detachCodingSession)) {
+    return typeof value.codingSessionId === 'string';
   }
 
   return false;

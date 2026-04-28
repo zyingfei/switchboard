@@ -50,6 +50,22 @@ const reminderSchema = z
   })
   .loose();
 
+const codingSessionSchema = z
+  .object({
+    bac_id: z.string(),
+    workstreamId: z.string().optional(),
+    tool: z.enum(['claude_code', 'codex', 'cursor', 'other']),
+    cwd: z.string(),
+    branch: z.string(),
+    sessionId: z.string(),
+    name: z.string(),
+    resumeCommand: z.string().optional(),
+    attachedAt: z.string(),
+    lastSeenAt: z.string(),
+    status: z.enum(['attached', 'detached']),
+  })
+  .loose();
+
 const bacIdSchema = z
   .string()
   .min(8)
@@ -102,6 +118,7 @@ export type ThreadRecord = z.infer<typeof threadSchema>;
 export type WorkstreamRecord = z.infer<typeof workstreamSchema>;
 export type QueueItemRecord = z.infer<typeof queueItemSchema>;
 export type ReminderRecord = z.infer<typeof reminderSchema>;
+export type CodingSessionRecord = z.infer<typeof codingSessionSchema>;
 export type DispatchEvent = z.infer<typeof dispatchEventSchema>;
 export type ReviewEvent = z.infer<typeof reviewEventSchema>;
 
@@ -378,6 +395,26 @@ export class LiveVaultReader {
         .sort((left, right) => right.capturedAt.localeCompare(left.capturedAt))
         .slice(0, limit),
     };
+  }
+
+  async readCodingSessions(
+    options: {
+      readonly workstreamId?: string;
+      readonly status?: 'attached' | 'detached';
+    } = {},
+  ): Promise<readonly CodingSessionRecord[]> {
+    const sessions = await readJsonDirectory(
+      this.vaultPath,
+      '_BAC/coding/sessions',
+      codingSessionSchema,
+    );
+    return sessions
+      .filter(
+        (session) =>
+          (options.workstreamId === undefined || session.workstreamId === options.workstreamId) &&
+          (options.status === undefined || session.status === options.status),
+      )
+      .sort((left, right) => right.attachedAt.localeCompare(left.attachedAt));
   }
 
   async readReviews(options: ReviewReadOptions = {}): Promise<ReviewReadResult> {

@@ -139,6 +139,48 @@ export const reminderUpdateSchema = z.object({
   status: z.enum(['new', 'seen', 'relevant', 'dismissed']).optional(),
 });
 
+const codingToolSchema = z.enum(['claude_code', 'codex', 'cursor', 'other']);
+
+export const codingAttachTokenCreateSchema = z.object({
+  workstreamId: bacIdSchema.optional(),
+});
+
+export const codingAttachTokenSchema = z.object({
+  token: z.string().min(8).max(64),
+  workstreamId: bacIdSchema.optional(),
+  createdAt: isoDateTimeSchema,
+  expiresAt: isoDateTimeSchema,
+});
+
+export const codingSessionRegisterSchema = z.object({
+  token: z.string().min(8).max(64),
+  tool: codingToolSchema,
+  cwd: z.string().min(1),
+  branch: z.string().min(1),
+  sessionId: z.string().min(1),
+  name: z.string().min(1),
+  resumeCommand: z.string().min(1).optional(),
+});
+
+export const codingSessionSchema = z.object({
+  bac_id: bacIdSchema,
+  workstreamId: bacIdSchema.optional(),
+  tool: codingToolSchema,
+  cwd: z.string().min(1),
+  branch: z.string().min(1),
+  sessionId: z.string().min(1),
+  name: z.string().min(1),
+  resumeCommand: z.string().min(1).optional(),
+  attachedAt: isoDateTimeSchema,
+  lastSeenAt: isoDateTimeSchema,
+  status: z.enum(['attached', 'detached']),
+});
+
+export const codingSessionListQuerySchema = z.object({
+  token: z.string().min(8).max(64).optional(),
+  workstreamId: bacIdSchema.optional(),
+});
+
 export const dispatchEventSchema = z.object({
   bac_id: bacIdSchema.optional(),
   kind: z.enum(['research', 'review', 'coding', 'note', 'other']),
@@ -267,3 +309,9 @@ export type ReviewEvent = z.infer<typeof reviewEventRecordSchema>;
 export type ReviewListQuery = z.infer<typeof reviewListQuerySchema>;
 export type TurnsQuery = z.infer<typeof turnsQuerySchema>;
 export type TurnRecord = z.infer<typeof turnRecordSchema>;
+export type CodingTool = z.infer<typeof codingToolSchema>;
+export type CodingAttachTokenCreateInput = z.infer<typeof codingAttachTokenCreateSchema>;
+export type CodingAttachTokenRecord = z.infer<typeof codingAttachTokenSchema>;
+export type CodingSessionRegisterInput = z.infer<typeof codingSessionRegisterSchema>;
+export type CodingSessionRecord = z.infer<typeof codingSessionSchema>;
+export type CodingSessionListQuery = z.infer<typeof codingSessionListQuerySchema>;

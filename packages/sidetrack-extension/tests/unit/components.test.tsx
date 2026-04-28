@@ -170,11 +170,47 @@ describe('UX skeleton components — render-without-crash + key text present', (
     expect(onBridgeKeyChange).not.toHaveBeenCalled();
   });
 
-  it('CodingAttach renders tool picker and form fields', () => {
-    render(<CodingAttach workstreams={STUB_WORKSTREAMS} onCancel={noop} onAttach={noop} />);
-    expect(screen.getByText('Codex CLI')).toBeInTheDocument();
-    expect(screen.getByText('Claude Code')).toBeInTheDocument();
-    expect(screen.getByPlaceholderText('019dcb94-4c4c-…')).toBeInTheDocument();
+  it('CodingAttach renders the handoff modal with workstream picker', () => {
+    render(
+      <CodingAttach
+        workstreams={STUB_WORKSTREAMS}
+        companionAvailable={true}
+        onCancel={noop}
+        onAttached={noop}
+        onCreateToken={() =>
+          Promise.resolve({
+            token: 'TEST_TOKEN_123',
+            createdAt: '2026-04-28T00:00:00.000Z',
+            expiresAt: '2026-04-28T00:05:00.000Z',
+          })
+        }
+        onPoll={() => Promise.resolve([])}
+      />,
+    );
+    expect(screen.getByText('Attach coding session')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Generate prompt' })).toBeInTheDocument();
+    expect(screen.getByRole('combobox')).toBeInTheDocument();
+  });
+
+  it('CodingAttach disables the generate button when companion is unavailable', () => {
+    render(
+      <CodingAttach
+        workstreams={STUB_WORKSTREAMS}
+        companionAvailable={false}
+        onCancel={noop}
+        onAttached={noop}
+        onCreateToken={() =>
+          Promise.resolve({
+            token: 'TEST_TOKEN_456',
+            createdAt: '2026-04-28T00:00:00.000Z',
+            expiresAt: '2026-04-28T00:05:00.000Z',
+          })
+        }
+        onPoll={() => Promise.resolve([])}
+      />,
+    );
+    expect(screen.getByRole('button', { name: 'Generate prompt' })).toBeDisabled();
+    expect(screen.getByText(/needs the companion/)).toBeInTheDocument();
   });
 
   it('Annotation renders selection blockquote and workstream picker', () => {
