@@ -1918,9 +1918,9 @@ button:disabled {
 .icon-btn:hover { background: var(--paper-deep, #E8DFC8); border-color: var(--rule, #D4CDB8); }
 .icon-btn:focus { outline: none; }
 .icon-btn:focus-visible {
-  outline: none;
+  outline: 1.5px solid var(--signal, #C2410C);
+  outline-offset: -1.5px;
   border-color: var(--signal, #C2410C);
-  box-shadow: 0 0 0 2px var(--signal-tint, #FED7AA);
 }
 .icon-btn svg {
   width: 16px;
@@ -2112,7 +2112,7 @@ button:disabled {
 .thread-actions {
   gap: 10px;
   padding-top: 4px;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   max-height: 0;
   opacity: 0;
   overflow: hidden;
@@ -2120,7 +2120,7 @@ button:disabled {
 }
 .thread:hover .thread-actions,
 .thread:focus-within .thread-actions {
-  max-height: 28px;
+  max-height: 60px;
   opacity: 1;
   padding-top: 6px;
 }
@@ -2272,3 +2272,56 @@ button:disabled {
 }
 .thread-actions .btn-link.archive { color: var(--ink-3, #7A7269); }
 .thread-actions .btn-link.archive:hover { color: var(--amber, #A16207); }
+
+/* =====================================================
+   Title clickable + queue compose row + tighter actions (PR follow-up)
+   ===================================================== */
+.thread-name-btn {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.thread-name-btn .name {
+  display: inline-block;
+  max-width: 100%;
+}
+.thread-name-btn:hover .name { color: var(--signal, #C2410C); }
+.thread-name-btn:focus { outline: none; }
+.thread-name-btn:focus-visible .name {
+  text-decoration: underline;
+  text-decoration-color: var(--signal, #C2410C);
+  text-underline-offset: 2px;
+}
+
+.thread-queue-compose {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 0 4px;
+  margin-top: 4px;
+  border-top: 1px dashed var(--rule-soft, #E5DDC9);
+}
+.thread-queue-compose input {
+  flex: 1 1 auto;
+  font-size: 11px;
+  padding: 4px 6px;
+  border: 1px solid var(--rule, #D4CDB8);
+  border-radius: 4px;
+  background: var(--paper-light, #FBF7EE);
+}
+.thread-queue-compose input:focus { outline: none; border-color: var(--signal, #C2410C); }
+.thread-queue-compose .btn-link {
+  font-family: var(--mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 10px;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  color: var(--ink-2, #4A453D);
+}
+.thread-queue-compose .btn-link:hover { color: var(--signal, #C2410C); }
+.thread-queue-compose .btn-link:disabled { color: var(--ink-4, #A39A8C); cursor: not-allowed; }

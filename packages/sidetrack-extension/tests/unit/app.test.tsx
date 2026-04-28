@@ -222,7 +222,7 @@ describe('live side-panel App wiring', () => {
       throw new Error('Could not find Sidetrack picker row.');
     }
     fireEvent.click(sidetrackPickerRow);
-    fireEvent.click(await screen.findByText('Move to…'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Move' }));
     await screen.findByText('From: Sidetrack · Side-panel state machine review');
     const siblingButtons = screen.getAllByRole('button', { name: /Sibling/ });
     const siblingButton = siblingButtons.at(-1);
