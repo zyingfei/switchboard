@@ -1906,6 +1906,10 @@ button:disabled {
 .icon-btn {
   width: 28px;
   height: 28px;
+  /* Override the global button { min-height: 34px } so the box stays 28x28
+     and the focus border sits flush around the icon. */
+  min-height: 28px;
+  padding: 0;
   display: grid;
   place-items: center;
   border: 1px solid transparent;
