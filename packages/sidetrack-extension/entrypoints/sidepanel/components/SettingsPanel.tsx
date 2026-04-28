@@ -119,7 +119,13 @@ export function SettingsPanel({ settings, busy, error, onClose, onSave }: Settin
   );
 
   return (
-    <Modal title="Settings" subtitle="Companion-backed preferences" width={520} onClose={onClose} footer={footer}>
+    <Modal
+      title="Settings"
+      subtitle="Companion-backed preferences"
+      width={520}
+      onClose={onClose}
+      footer={footer}
+    >
       <div className="settings-section">
         <h3 className="settings-section-title">Auto-send opt-in (§24.10)</h3>
         <p className="settings-section-lede ai-italic">

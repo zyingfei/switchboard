@@ -30,6 +30,7 @@ import {
   recordSelectorCanary,
   saveCompanionSettings,
   saveCollapsedSections,
+  updateLocalQueueItem,
   updateLocalReminder,
   updateLocalWorkstream,
   upsertLocalThread,
@@ -495,10 +496,7 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
   }
 
   if (request.type === messageTypes.autoCapture) {
-    const response = await withCompanionStatus(
-      () => storeCaptureEvent(request.capture),
-      'capture',
-    );
+    const response = await withCompanionStatus(() => storeCaptureEvent(request.capture), 'capture');
     if (response.ok) {
       void notifyCaptureSuccess(request.capture);
     }
@@ -531,6 +529,13 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
 
   if (request.type === messageTypes.queueFollowUp) {
     return await withCompanionStatus(() => createQueueItem(request.item), 'queue');
+  }
+
+  if (request.type === messageTypes.updateQueueItem) {
+    return await withCompanionStatus(
+      () => updateLocalQueueItem(request.queueItemId, request.update).then(() => undefined),
+      'queue',
+    );
   }
 
   if (request.type === messageTypes.moveThread) {
