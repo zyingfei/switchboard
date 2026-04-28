@@ -89,6 +89,22 @@ export interface UiSettings {
   readonly siteToggles: Readonly<Record<Exclude<ProviderId, 'unknown'>, boolean>>;
 }
 
+export type CodingTool = 'claude_code' | 'codex' | 'cursor' | 'other';
+
+export interface CodingSession {
+  readonly bac_id: string;
+  readonly workstreamId?: string;
+  readonly tool: CodingTool;
+  readonly cwd: string;
+  readonly branch: string;
+  readonly sessionId: string;
+  readonly name: string;
+  readonly resumeCommand?: string;
+  readonly attachedAt: string;
+  readonly lastSeenAt: string;
+  readonly status: 'attached' | 'detached';
+}
+
 export interface WorkboardState {
   readonly companionStatus: CompanionStatus;
   readonly vaultPath?: string;
@@ -102,6 +118,7 @@ export interface WorkboardState {
   readonly reminders: readonly InboundReminder[];
   readonly selectorHealth: readonly SelectorHealth[];
   readonly collapsedSections: readonly WorkboardSection['id'][];
+  readonly codingSessions: readonly CodingSession[];
   readonly lastError?: string;
   readonly updatedAt: string;
 }
@@ -191,6 +208,7 @@ export const createEmptyWorkboardState = (
   reminders: [],
   selectorHealth: [],
   collapsedSections: [],
+  codingSessions: [],
   updatedAt: new Date().toISOString(),
   ...overrides,
 });

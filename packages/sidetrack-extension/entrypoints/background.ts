@@ -5,6 +5,8 @@ import { detectProviderFromUrl } from '../src/capture/providerDetection';
 import { createCompanionClient } from '../src/companion/client';
 import type {
   CaptureEvent,
+  CodingAttachTokenCreate,
+  CodingAttachTokenRecord,
   QueueCreate,
   ReminderCreate,
   ThreadUpsert,
@@ -34,6 +36,7 @@ import {
   updateLocalReminder,
   updateLocalWorkstream,
   upsertLocalThread,
+  writeCachedCodingSessions,
 } from '../src/background/state';
 
 const activeTab = async (): Promise<chrome.tabs.Tab | undefined> => {
@@ -282,6 +285,21 @@ type WorkboardChangeReason =
   | 'thread'
   | 'settings';
 
+const refreshCachedCodingSessions = async (): Promise<void> => {
+  if (!(await isCompanionConfigured())) {
+    await writeCachedCodingSessions([]);
+    return;
+  }
+  const settings = await readSettings();
+  try {
+    const sessions = await createCompanionClient(settings.companion).listCodingSessions({});
+    await writeCachedCodingSessions(sessions);
+  } catch {
+    // Companion unreachable — leave the cache as-is so the side panel keeps
+    // showing the last-known list rather than blanking it on transient errors.
+  }
+};
+
 const withCompanionStatus = async (
   work?: () => Promise<void>,
   reason?: WorkboardChangeReason,
@@ -292,6 +310,7 @@ const withCompanionStatus = async (
     }
     await replayQueuedCaptures();
     const status = await assertCompanionReachable();
+    await refreshCachedCodingSessions();
     const state = await buildState(status);
     if (work !== undefined && reason !== undefined) {
       void broadcastWorkboardChanged(reason);
@@ -307,6 +326,24 @@ const withCompanionStatus = async (
       ),
     };
   }
+};
+
+const createCodingAttachToken = async (
+  request: CodingAttachTokenCreate,
+): Promise<CodingAttachTokenRecord> => {
+  const settings = await readSettings();
+  if (settings.companion.bridgeKey.length === 0) {
+    throw new Error('Companion is required to create attach tokens; configure it in Settings.');
+  }
+  return await createCompanionClient(settings.companion).createCodingAttachToken(request);
+};
+
+const detachCodingSession = async (codingSessionId: string): Promise<void> => {
+  const settings = await readSettings();
+  if (settings.companion.bridgeKey.length === 0) {
+    throw new Error('Companion is required to detach coding sessions.');
+  }
+  await createCompanionClient(settings.companion).detachCodingSession(codingSessionId);
 };
 
 const createWorkstream = async (input: WorkstreamCreate): Promise<void> => {
@@ -564,6 +601,35 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
     return await withCompanionStatus(
       () => updateReminder(request.reminderId, request.update),
       'reminder',
+    );
+  }
+
+  if (request.type === messageTypes.createCodingAttachToken) {
+    try {
+      const attachToken = await createCodingAttachToken(request.request);
+      // Refresh state so the side panel sees a current snapshot before
+      // it starts polling. The token isn't persisted in the cache; it's
+      // returned through the response envelope below.
+      await refreshCachedCodingSessions();
+      const status = await assertCompanionReachable();
+      const state = await buildState(status);
+      return { ok: true, state, attachToken };
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : 'Could not create attach token.',
+        state: await buildState(
+          'disconnected',
+          error instanceof Error ? error.message : 'Action failed.',
+        ),
+      };
+    }
+  }
+
+  if (request.type === messageTypes.detachCodingSession) {
+    return await withCompanionStatus(
+      () => detachCodingSession(request.codingSessionId),
+      'mutation',
     );
   }
 

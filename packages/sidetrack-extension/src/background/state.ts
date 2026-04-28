@@ -13,6 +13,7 @@ import { readDroppedCount, readQueue } from '../companion/queue';
 import {
   createEmptyWorkboardState,
   defaultSettings,
+  type CodingSession,
   type InboundReminder,
   type QueueItem,
   type SelectorHealth,
@@ -29,6 +30,7 @@ const QUEUE_ITEMS_KEY = 'sidetrack.queueItems';
 const REMINDERS_KEY = 'sidetrack.reminders';
 const SELECTOR_HEALTH_KEY = 'sidetrack.selectorHealth';
 const COLLAPSED_SECTIONS_KEY = 'sidetrack.collapsedSections';
+const CODING_SESSIONS_KEY = 'sidetrack.codingSessions';
 
 const storageGet = async <TValue>(key: string, fallback: TValue): Promise<TValue> => {
   const result = await chrome.storage.local.get({ [key]: fallback });
@@ -65,6 +67,15 @@ export const readReminders = async (): Promise<readonly InboundReminder[]> =>
 
 export const readSelectorHealth = async (): Promise<readonly SelectorHealth[]> =>
   await storageGet<readonly SelectorHealth[]>(SELECTOR_HEALTH_KEY, []);
+
+export const readCachedCodingSessions = async (): Promise<readonly CodingSession[]> =>
+  await storageGet<readonly CodingSession[]>(CODING_SESSIONS_KEY, []);
+
+export const writeCachedCodingSessions = async (
+  sessions: readonly CodingSession[],
+): Promise<void> => {
+  await storageSet({ [CODING_SESSIONS_KEY]: sessions });
+};
 
 export const saveCollapsedSections = async (
   collapsedSections: WorkboardState['collapsedSections'],
@@ -279,6 +290,7 @@ export const buildWorkboardState = async (
     queueItems: await readQueueItems(),
     reminders: await readReminders(),
     selectorHealth: await readSelectorHealth(),
+    codingSessions: await readCachedCodingSessions(),
     collapsedSections: await storageGet<WorkboardState['collapsedSections']>(
       COLLAPSED_SECTIONS_KEY,
       [],

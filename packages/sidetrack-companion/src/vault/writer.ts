@@ -1,15 +1,23 @@
-import { access, mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 
 import { createBacId, createRevision } from '../domain/ids.js';
 import {
   captureEventSchema,
+  codingAttachTokenSchema,
+  codingSessionSchema,
   dispatchEventRecordSchema,
   reviewEventRecordSchema,
   settingsDocumentSchema,
 } from '../http/schemas.js';
 import type {
   CaptureEventInput,
+  CodingAttachTokenCreateInput,
+  CodingAttachTokenRecord,
+  CodingSessionListQuery,
+  CodingSessionRecord,
+  CodingSessionRegisterInput,
   DispatchEventRecord,
   DispatchListQuery,
   QueueCreateInput,
@@ -35,6 +43,20 @@ export class SettingsRevisionConflictError extends Error {
   constructor() {
     super('Settings revision does not match current settings revision.');
     this.name = 'SettingsRevisionConflictError';
+  }
+}
+
+export class CodingAttachTokenInvalidError extends Error {
+  constructor(message = 'Attach token is unknown, expired, or already consumed.') {
+    super(message);
+    this.name = 'CodingAttachTokenInvalidError';
+  }
+}
+
+export class CodingSessionNotFoundError extends Error {
+  constructor() {
+    super('Coding session not found.');
+    this.name = 'CodingSessionNotFoundError';
   }
 }
 
@@ -90,6 +112,18 @@ export interface VaultWriter {
     input: ReminderUpdateInput,
     requestId: string,
   ) => Promise<MutationResult>;
+  readonly createCodingAttachToken: (
+    input: CodingAttachTokenCreateInput,
+    requestId: string,
+  ) => Promise<CodingAttachTokenRecord>;
+  readonly registerCodingSession: (
+    input: CodingSessionRegisterInput,
+    requestId: string,
+  ) => Promise<CodingSessionRecord>;
+  readonly listCodingSessions: (
+    query: CodingSessionListQuery,
+  ) => Promise<readonly CodingSessionRecord[]>;
+  readonly detachCodingSession: (bac_id: string, requestId: string) => Promise<CodingSessionRecord>;
 }
 
 const dateStamp = (value: Date): string => value.toISOString().slice(0, 10);
@@ -607,6 +641,163 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
         timestamp,
       });
       return { bac_id: reminderId, revision };
+    },
+
+    async createCodingAttachToken(input, requestId) {
+      await ensureVaultPresent();
+      // 16 chars, URL-safe, easy to paste verbatim. Lifetime: 5 minutes.
+      const token = randomBytes(12).toString('base64url').slice(0, 16);
+      const createdAt = new Date();
+      const expiresAt = new Date(createdAt.getTime() + 5 * 60 * 1000);
+      const record = codingAttachTokenSchema.parse({
+        token,
+        ...(input.workstreamId === undefined ? {} : { workstreamId: input.workstreamId }),
+        createdAt: createdAt.toISOString(),
+        expiresAt: expiresAt.toISOString(),
+      });
+      await writeJsonAtomic(join(bacRoot, 'coding', 'tokens', `${token}.json`), record);
+      await audit({
+        requestId,
+        route: 'createCodingAttachToken',
+        outcome: 'success',
+        bac_id: token,
+        timestamp: createdAt.toISOString(),
+      });
+      return record;
+    },
+
+    async registerCodingSession(input, requestId) {
+      await ensureVaultPresent();
+      const tokenPath = join(bacRoot, 'coding', 'tokens', `${input.token}.json`);
+      let tokenRecord: CodingAttachTokenRecord;
+      try {
+        const raw = await readFile(tokenPath, 'utf8');
+        tokenRecord = codingAttachTokenSchema.parse(JSON.parse(raw) as unknown);
+      } catch (error) {
+        if (isMissingPathError(error)) {
+          throw new CodingAttachTokenInvalidError();
+        }
+        throw error;
+      }
+      if (Date.parse(tokenRecord.expiresAt) < Date.now()) {
+        // Best-effort cleanup; ignore missing.
+        try {
+          await unlink(tokenPath);
+        } catch {
+          // Token already gone — fine.
+        }
+        throw new CodingAttachTokenInvalidError('Attach token has expired.');
+      }
+      const bac_id = createBacId();
+      const timestamp = new Date().toISOString();
+      const session = codingSessionSchema.parse({
+        bac_id,
+        ...(tokenRecord.workstreamId === undefined
+          ? {}
+          : { workstreamId: tokenRecord.workstreamId }),
+        tool: input.tool,
+        cwd: input.cwd,
+        branch: input.branch,
+        sessionId: input.sessionId,
+        name: input.name,
+        ...(input.resumeCommand === undefined ? {} : { resumeCommand: input.resumeCommand }),
+        attachedAt: timestamp,
+        lastSeenAt: timestamp,
+        status: 'attached',
+      });
+      await writeJsonAtomic(join(bacRoot, 'coding', 'sessions', `${bac_id}.json`), session);
+      try {
+        await unlink(tokenPath);
+      } catch {
+        // Token might have been swept already; safe to ignore.
+      }
+      await audit({
+        requestId,
+        route: 'registerCodingSession',
+        outcome: 'success',
+        bac_id,
+        timestamp,
+      });
+      return session;
+    },
+
+    async listCodingSessions(query) {
+      await ensureVaultPresent();
+      // Query by token: look in tokens/ first; if a session was registered
+      // with this token, the token file is gone, so fall through to sessions
+      // directory, find the most recent session whose attachedAt >= token
+      // createdAt. To avoid re-reading the deleted token, we instead scan
+      // sessions and filter by workstreamId or createdAt window upstream.
+      const sessionsRoot = join(bacRoot, 'coding', 'sessions');
+      let names: string[];
+      try {
+        names = await readdir(sessionsRoot);
+      } catch (error) {
+        if (isMissingPathError(error)) {
+          return [];
+        }
+        throw error;
+      }
+      const sessions: CodingSessionRecord[] = [];
+      for (const name of names.filter((candidate) => candidate.endsWith('.json'))) {
+        try {
+          const raw = await readFile(join(sessionsRoot, name), 'utf8');
+          const parsed = codingSessionSchema.safeParse(JSON.parse(raw) as unknown);
+          if (parsed.success) {
+            sessions.push(parsed.data);
+          }
+        } catch {
+          // Skip unreadable files — vault may be mid-write.
+        }
+      }
+      // If a token query was provided and the token still exists, the agent
+      // hasn't registered yet — return an empty list. If the token is gone,
+      // the most recently attached session within its workstream is the
+      // likely match; the side panel polls and dedupes by bac_id anyway.
+      if (query.token !== undefined) {
+        const tokenPath = join(bacRoot, 'coding', 'tokens', `${query.token}.json`);
+        try {
+          await access(tokenPath);
+          return [];
+        } catch {
+          // Token consumed; fall through to filter by workstream below.
+        }
+      }
+      const filtered =
+        query.workstreamId === undefined
+          ? sessions
+          : sessions.filter((session) => session.workstreamId === query.workstreamId);
+      return filtered.sort((left, right) => right.attachedAt.localeCompare(left.attachedAt));
+    },
+
+    async detachCodingSession(bac_id, requestId) {
+      await ensureVaultPresent();
+      const path = join(bacRoot, 'coding', 'sessions', `${bac_id}.json`);
+      let existing: CodingSessionRecord;
+      try {
+        const raw = await readFile(path, 'utf8');
+        existing = codingSessionSchema.parse(JSON.parse(raw) as unknown);
+      } catch (error) {
+        if (isMissingPathError(error)) {
+          throw new CodingSessionNotFoundError();
+        }
+        throw error;
+      }
+      const timestamp = new Date().toISOString();
+      const updated = codingSessionSchema.parse({
+        ...existing,
+        status: 'detached',
+        lastSeenAt: timestamp,
+      });
+      await writeJsonAtomic(path, updated);
+      await audit({
+        requestId,
+        route: 'detachCodingSession',
+        outcome: 'success',
+        bac_id,
+        timestamp,
+      });
+      return updated;
     },
   };
 };

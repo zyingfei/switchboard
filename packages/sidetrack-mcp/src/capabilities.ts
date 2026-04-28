@@ -6,6 +6,7 @@ export const m1ReadToolNames = [
   'bac.queued_items',
   'bac.inbound_reminders',
   'bac.coding_sessions',
+  'bac.coding_session_register',
   'bac.dispatches',
   'bac.reviews',
   'bac.turns',

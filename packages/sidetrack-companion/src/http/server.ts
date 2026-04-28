@@ -4,12 +4,20 @@ import { bridgeKeysMatch } from '../auth/bridgeKey.js';
 import { createDispatchId, createRequestId, createReviewId } from '../domain/ids.js';
 import { redact } from '../safety/redaction.js';
 import { estimateTokens, tokenBudgetWarningThreshold } from '../safety/tokenBudget.js';
-import { SettingsRevisionConflictError, type VaultWriter } from '../vault/writer.js';
+import {
+  CodingAttachTokenInvalidError,
+  CodingSessionNotFoundError,
+  SettingsRevisionConflictError,
+  type VaultWriter,
+} from '../vault/writer.js';
 import type { IdempotencyStore } from './idempotency.js';
 import type { ValidationIssue } from './problem.js';
 import { createProblem } from './problem.js';
 import {
   captureEventSchema,
+  codingAttachTokenCreateSchema,
+  codingSessionListQuerySchema,
+  codingSessionRegisterSchema,
   dispatchEventSchema,
   dispatchListQuerySchema,
   queueCreateSchema,
@@ -37,11 +45,12 @@ export interface StartedHttpServer {
   readonly close: () => Promise<void>;
 }
 
-type HttpMethod = 'GET' | 'POST' | 'PATCH';
+type HttpMethod = 'GET' | 'POST' | 'PATCH' | 'DELETE';
 
 interface RouteMatch {
   readonly workstreamId?: string;
   readonly reminderId?: string;
+  readonly codingSessionId?: string;
 }
 
 interface RouteDefinition {
@@ -431,6 +440,54 @@ const routes: readonly RouteDefinition[] = [
       return [200, mutationResponse(result, requestId)];
     },
   },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/coding-sessions\/attach-tokens$/,
+    authRequired: true,
+    handle: async (request, requestId, _match, context) => {
+      const input = codingAttachTokenCreateSchema.parse(await readBody(request));
+      const result = await context.vaultWriter.createCodingAttachToken(input, requestId);
+      return [201, { data: result }];
+    },
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/coding-sessions$/,
+    authRequired: true,
+    handle: async (request, requestId, _match, context) => {
+      const input = codingSessionRegisterSchema.parse(await readBody(request));
+      const result = await context.vaultWriter.registerCodingSession(input, requestId);
+      return [201, { data: result }];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/coding-sessions$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+      const query = codingSessionListQuerySchema.parse({
+        token: url.searchParams.get('token') ?? undefined,
+        workstreamId: url.searchParams.get('workstreamId') ?? undefined,
+      });
+      return [200, { data: await context.vaultWriter.listCodingSessions(query) }];
+    },
+  },
+  {
+    method: 'DELETE',
+    pattern: /^\/v1\/coding-sessions\/(?<codingSessionId>[A-Za-z0-9_-]+)$/,
+    authRequired: true,
+    handle: async (_request, requestId, match, context) => {
+      if (match.codingSessionId === undefined) {
+        throw new Error('Missing codingSessionId path parameter.');
+      }
+      const result = await context.vaultWriter.detachCodingSession(
+        match.codingSessionId,
+        requestId,
+      );
+      return [200, { data: result }];
+    },
+  },
 ];
 
 export const createCompanionHttpServer = (context: CompanionHttpConfig): Server =>
@@ -512,11 +569,23 @@ export const handleRequest = async (
     const issues = getValidationIssues(error);
     const routeError = error instanceof HttpRouteError ? error : undefined;
     const settingsRevisionConflict = error instanceof SettingsRevisionConflictError;
+    const codingTokenInvalid = error instanceof CodingAttachTokenInvalidError;
+    const codingSessionNotFound = error instanceof CodingSessionNotFoundError;
     const vaultUnavailable =
       error instanceof Error && error.message === 'Vault path is unavailable.';
     const status =
       routeError?.status ??
-      (settingsRevisionConflict ? 409 : issues === undefined ? (vaultUnavailable ? 503 : 500) : 400);
+      (settingsRevisionConflict
+        ? 409
+        : codingTokenInvalid
+          ? 410
+          : codingSessionNotFound
+            ? 404
+            : issues === undefined
+              ? vaultUnavailable
+                ? 503
+                : 500
+              : 400);
     const detail = error instanceof Error ? error.message : undefined;
     sendJson(
       response,
@@ -527,19 +596,27 @@ export const handleRequest = async (
           routeError?.code ??
           (settingsRevisionConflict
             ? 'REVISION_CONFLICT'
-            : issues === undefined
-              ? vaultUnavailable
-                ? 'VAULT_UNAVAILABLE'
-                : 'INTERNAL_ERROR'
-              : 'VALIDATION_ERROR'),
+            : codingTokenInvalid
+              ? 'ATTACH_TOKEN_INVALID'
+              : codingSessionNotFound
+                ? 'CODING_SESSION_NOT_FOUND'
+                : issues === undefined
+                  ? vaultUnavailable
+                    ? 'VAULT_UNAVAILABLE'
+                    : 'INTERNAL_ERROR'
+                  : 'VALIDATION_ERROR'),
         title:
           routeError?.title ??
           (issues === undefined
             ? settingsRevisionConflict
               ? 'Settings revision conflict.'
-              : vaultUnavailable
-                ? 'Vault path is unavailable.'
-                : 'Internal companion error.'
+              : codingTokenInvalid
+                ? 'Attach token invalid or expired.'
+                : codingSessionNotFound
+                  ? 'Coding session not found.'
+                  : vaultUnavailable
+                    ? 'Vault path is unavailable.'
+                    : 'Internal companion error.'
             : 'Validation failed.'),
         correlationId: requestId,
         ...(detail === undefined ? {} : { detail }),

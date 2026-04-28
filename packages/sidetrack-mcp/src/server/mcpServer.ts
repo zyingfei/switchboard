@@ -3,6 +3,18 @@ import { z } from 'zod';
 
 import type { LiveVaultReader, LiveVaultSnapshot } from '../vault/liveVaultReader.js';
 
+export interface CompanionWriteClient {
+  readonly registerCodingSession: (input: {
+    readonly token: string;
+    readonly tool: 'claude_code' | 'codex' | 'cursor' | 'other';
+    readonly cwd: string;
+    readonly branch: string;
+    readonly sessionId: string;
+    readonly name: string;
+    readonly resumeCommand?: string;
+  }) => Promise<{ readonly bac_id: string }>;
+}
+
 const toolText = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`;
 
 const asStructuredContent = (value: Record<string, unknown>) => ({
@@ -96,7 +108,10 @@ const searchSnapshot = (snapshot: LiveVaultSnapshot, query: string) => {
     }));
 };
 
-export const createSidetrackMcpServer = (reader: LiveVaultReader): McpServer => {
+export const createSidetrackMcpServer = (
+  reader: LiveVaultReader,
+  companionClient?: CompanionWriteClient,
+): McpServer => {
   const server = new McpServer({
     name: 'sidetrack-mcp',
     version: '0.0.0',
@@ -214,13 +229,68 @@ export const createSidetrackMcpServer = (reader: LiveVaultReader): McpServer => 
   server.registerTool(
     'bac.coding_sessions',
     {
-      description: 'Return coding sessions. M1 has no attach UI, so this returns an empty list.',
-      inputSchema: {},
+      description:
+        'Return coding sessions registered by coding agents (Claude Code / Codex / Cursor). Filterable by workstreamId and status.',
+      inputSchema: {
+        workstreamId: z.string().optional(),
+        status: z.enum(['attached', 'detached']).optional(),
+      },
     },
-    () =>
-      Promise.resolve(
-        asStructuredContent({ codingSessions: [], generatedAt: new Date().toISOString() }),
-      ),
+    async ({ workstreamId, status }) => {
+      const sessions = await reader.readCodingSessions({
+        ...(workstreamId === undefined ? {} : { workstreamId }),
+        ...(status === undefined ? {} : { status }),
+      });
+      return asStructuredContent({
+        codingSessions: sessions,
+        generatedAt: new Date().toISOString(),
+      });
+    },
+  );
+
+  server.registerTool(
+    'bac.coding_session_register',
+    {
+      description:
+        "Register the current coding agent's session against a Sidetrack workstream. Call this once at the start of a coding session. The user provides the attach token; auto-detect cwd, branch, sessionId, and a short display name from your runtime — do not ask the user for those.",
+      inputSchema: {
+        token: z
+          .string()
+          .min(8)
+          .max(64)
+          .describe('One-time attach token, supplied by the Sidetrack side panel.'),
+        tool: z.enum(['claude_code', 'codex', 'cursor', 'other']),
+        cwd: z.string().min(1).describe('Absolute working directory.'),
+        branch: z.string().min(1).describe('Current git branch.'),
+        sessionId: z.string().min(1).describe('Stable agent-side session identifier.'),
+        name: z.string().min(1).describe('Short display name (e.g. "claude-code · feat/queue").'),
+        resumeCommand: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Shell command that resumes this agent session.'),
+      },
+    },
+    async ({ token, tool, cwd, branch, sessionId, name, resumeCommand }) => {
+      if (companionClient === undefined) {
+        throw new Error(
+          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.coding_session_register is unavailable.',
+        );
+      }
+      const result = await companionClient.registerCodingSession({
+        token,
+        tool,
+        cwd,
+        branch,
+        sessionId,
+        name,
+        ...(resumeCommand === undefined ? {} : { resumeCommand }),
+      });
+      return asStructuredContent({
+        bac_id: result.bac_id,
+        registeredAt: new Date().toISOString(),
+      });
+    },
   );
 
   server.registerTool(
@@ -256,9 +326,7 @@ export const createSidetrackMcpServer = (reader: LiveVaultReader): McpServer => 
         limit: z.number().int().positive().max(100).optional(),
         since: z.iso.datetime().optional(),
         threadId: z.string().optional(),
-        verdict: z
-          .enum(['agree', 'disagree', 'partial', 'needs_source', 'open'])
-          .optional(),
+        verdict: z.enum(['agree', 'disagree', 'partial', 'needs_source', 'open']).optional(),
       },
     },
     async ({ limit, since, threadId, verdict }) => {

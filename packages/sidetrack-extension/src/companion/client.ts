@@ -1,5 +1,7 @@
 import type {
   CaptureEvent,
+  CodingAttachTokenCreate,
+  CodingAttachTokenRecord,
   CompanionSettings,
   CompanionStatus,
   MutationResult,
@@ -11,6 +13,7 @@ import type {
   WorkstreamCreate,
   WorkstreamUpdate,
 } from './model';
+import type { CodingSession } from '../workboard';
 
 export interface CompanionClient {
   readonly status: () => Promise<CompanionStatus>;
@@ -27,6 +30,14 @@ export interface CompanionClient {
     reminderId: string,
     reminder: ReminderUpdate,
   ) => Promise<MutationResult>;
+  readonly createCodingAttachToken: (
+    request: CodingAttachTokenCreate,
+  ) => Promise<CodingAttachTokenRecord>;
+  readonly listCodingSessions: (query: {
+    readonly token?: string;
+    readonly workstreamId?: string;
+  }) => Promise<readonly CodingSession[]>;
+  readonly detachCodingSession: (codingSessionId: string) => Promise<CodingSession>;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -179,6 +190,48 @@ export class HttpCompanionClient implements CompanionClient {
         body: JSON.stringify(reminder),
       }),
     );
+  }
+
+  async createCodingAttachToken(
+    request: CodingAttachTokenCreate,
+  ): Promise<CodingAttachTokenRecord> {
+    const value = await this.request('/coding-sessions/attach-tokens', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+    if (!isRecord(value) || !isRecord((value as { data?: unknown }).data)) {
+      throw new Error('Companion attach-token response missing data.');
+    }
+    return (value as { data: CodingAttachTokenRecord }).data;
+  }
+
+  async listCodingSessions(query: {
+    readonly token?: string;
+    readonly workstreamId?: string;
+  }): Promise<readonly CodingSession[]> {
+    const params = new URLSearchParams();
+    if (query.token !== undefined) {
+      params.set('token', query.token);
+    }
+    if (query.workstreamId !== undefined) {
+      params.set('workstreamId', query.workstreamId);
+    }
+    const suffix = params.toString().length === 0 ? '' : `?${params.toString()}`;
+    const value = await this.request(`/coding-sessions${suffix}`, { method: 'GET' });
+    if (!isRecord(value) || !Array.isArray((value as { data?: unknown }).data)) {
+      throw new Error('Companion coding-sessions response missing data array.');
+    }
+    return (value as { data: CodingSession[] }).data;
+  }
+
+  async detachCodingSession(codingSessionId: string): Promise<CodingSession> {
+    const value = await this.request(`/coding-sessions/${encodeURIComponent(codingSessionId)}`, {
+      method: 'DELETE',
+    });
+    if (!isRecord(value) || !isRecord((value as { data?: unknown }).data)) {
+      throw new Error('Companion detach response missing data.');
+    }
+    return (value as { data: CodingSession }).data;
   }
 
   private async request(path: string, init: RequestInit): Promise<unknown> {

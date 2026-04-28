@@ -237,7 +237,21 @@ export function Preview() {
       ) : null}
       {surface === 'wizard' ? <Wizard onClose={close} onFinish={close} /> : null}
       {surface === 'coding' ? (
-        <CodingAttach workstreams={STUB_WORKSTREAMS} onCancel={close} onAttach={close} />
+        <CodingAttach
+          workstreams={STUB_WORKSTREAMS}
+          companionAvailable={true}
+          onCancel={close}
+          onAttached={close}
+          onCreateToken={() =>
+            Promise.resolve({
+              token: 'PREVIEW_TOKEN_X9',
+              workstreamId: STUB_WORKSTREAMS[0]?.bac_id,
+              createdAt: new Date().toISOString(),
+              expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+            })
+          }
+          onPoll={() => Promise.resolve([])}
+        />
       ) : null}
       {surface === 'annotation' ? (
         <Annotation

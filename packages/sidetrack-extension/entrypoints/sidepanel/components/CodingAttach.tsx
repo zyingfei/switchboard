@@ -1,176 +1,195 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+
+import type { CodingAttachTokenRecord } from '../../../src/companion/model';
+import type { CodingSession } from '../../../src/workboard';
 import { Modal } from './Modal';
 
-export type CodingTool = 'codex' | 'claude_code' | 'cursor' | 'jetbrains' | 'other';
-
-const TOOL_LABEL: Record<CodingTool, string> = {
-  codex: 'Codex CLI',
-  claude_code: 'Claude Code',
-  cursor: 'Cursor',
-  jetbrains: 'JetBrains',
-  other: 'Other',
-};
+export type CodingTool = CodingSession['tool'];
 
 export interface CodingAttachProps {
   readonly defaultWorkstreamId?: string;
   readonly workstreams: readonly { readonly bac_id: string; readonly path: string }[];
+  readonly companionAvailable: boolean;
   readonly onCancel: () => void;
-  readonly onAttach: (input: {
-    readonly tool: CodingTool;
-    readonly cwd: string;
-    readonly branch: string;
-    readonly sessionId: string;
-    readonly name: string;
-    readonly resumeCommand: string;
-    readonly workstreamId: string;
-  }) => void;
+  readonly onAttached: (session: CodingSession) => void;
+  readonly onCreateToken: (request: {
+    readonly workstreamId?: string;
+  }) => Promise<CodingAttachTokenRecord>;
+  readonly onPoll: (token: string) => Promise<readonly CodingSession[]>;
 }
+
+interface PendingAttach {
+  readonly token: string;
+  readonly expiresAt: string;
+  readonly workstreamId?: string;
+}
+
+const buildAgentPrompt = (token: string, workstreamId: string | undefined): string =>
+  [
+    'Sidetrack handoff. Register this coding session against my workstream.',
+    '',
+    `Run the bac.coding_session_register MCP tool with these arguments:`,
+    `- token: ${token}`,
+    workstreamId === undefined
+      ? '- workstreamId: (none — Inbox)'
+      : `- workstreamId: ${workstreamId}`,
+    '- tool: <claude_code | codex | cursor | other> (your runtime)',
+    '- cwd: <your absolute working directory>',
+    '- branch: <your current git branch>',
+    '- sessionId: <your stable agent-side session ID>',
+    '- name: <short label, e.g. "claude-code · feat/queue">',
+    '- resumeCommand: <command that resumes this session> (optional)',
+    '',
+    'Auto-detect every field except token / workstreamId from your runtime.',
+    'Do not ask me for them. The token is single-use and expires in 5 minutes.',
+  ].join('\n');
 
 export function CodingAttach({
   defaultWorkstreamId,
   workstreams,
+  companionAvailable,
   onCancel,
-  onAttach,
+  onAttached,
+  onCreateToken,
+  onPoll,
 }: CodingAttachProps) {
-  const [tool, setTool] = useState<CodingTool>('claude_code');
-  const [cwd, setCwd] = useState('');
-  const [branch, setBranch] = useState('');
-  const [sessionId, setSessionId] = useState('');
-  const [name, setName] = useState('');
-  const [resumeCommand, setResumeCommand] = useState('');
-  const [workstreamId, setWorkstreamId] = useState(
-    defaultWorkstreamId ?? (workstreams.length > 0 ? workstreams[0].bac_id : ''),
+  const [workstreamId, setWorkstreamId] = useState(defaultWorkstreamId ?? '');
+  const [pending, setPending] = useState<PendingAttach | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [expired, setExpired] = useState(false);
+  const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const expiryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(
+    () => () => {
+      if (pollTimer.current !== null) {
+        clearInterval(pollTimer.current);
+      }
+      if (expiryTimer.current !== null) {
+        clearTimeout(expiryTimer.current);
+      }
+    },
+    [],
   );
 
-  const valid = sessionId.trim() !== '' && name.trim() !== '' && workstreamId !== '';
-
-  const detectResume = () => {
-    if (sessionId.trim() === '') {
-      return;
+  const stopPolling = () => {
+    if (pollTimer.current !== null) {
+      clearInterval(pollTimer.current);
+      pollTimer.current = null;
     }
-    if (tool === 'claude_code') {
-      setResumeCommand(`claude resume ${sessionId.trim()}`);
-    } else if (tool === 'codex') {
-      setResumeCommand(`codex resume ${sessionId.trim()}`);
-    } else {
-      setResumeCommand('');
+    if (expiryTimer.current !== null) {
+      clearTimeout(expiryTimer.current);
+      expiryTimer.current = null;
     }
   };
+
+  const startHandoff = () => {
+    if (busy) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setExpired(false);
+    setCopied(false);
+    void (async () => {
+      try {
+        const record = await onCreateToken(workstreamId === '' ? {} : { workstreamId });
+        const token = record.token;
+        const prompt = buildAgentPrompt(token, record.workstreamId);
+        try {
+          await navigator.clipboard.writeText(prompt);
+          setCopied(true);
+        } catch {
+          // Clipboard refused (focus / permissions); the prompt block below
+          // still shows the text for manual copy.
+        }
+        setPending({
+          token,
+          expiresAt: record.expiresAt,
+          ...(record.workstreamId === undefined ? {} : { workstreamId: record.workstreamId }),
+        });
+        const expiresMs = Math.max(1000, Date.parse(record.expiresAt) - Date.now());
+        expiryTimer.current = setTimeout(() => {
+          setExpired(true);
+          stopPolling();
+        }, expiresMs);
+        pollTimer.current = setInterval(() => {
+          void (async () => {
+            try {
+              const sessions = await onPoll(token);
+              if (sessions.length > 0) {
+                stopPolling();
+                onAttached(sessions[0]);
+              }
+            } catch {
+              // Transient — keep polling. The expiry timer is the upper bound.
+            }
+          })();
+        }, 2000);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Could not create attach token.');
+      } finally {
+        setBusy(false);
+      }
+    })();
+  };
+
+  const cancel = () => {
+    stopPolling();
+    onCancel();
+  };
+
+  const reset = () => {
+    stopPolling();
+    setPending(null);
+    setExpired(false);
+    setCopied(false);
+    setError(null);
+  };
+
+  const promptText = pending === null ? '' : buildAgentPrompt(pending.token, pending.workstreamId);
 
   return (
     <Modal
       title="Attach coding session"
-      subtitle="Attached sessions appear in the workstream tree alongside chats."
-      width={520}
-      onClose={onCancel}
+      subtitle="Hand a one-time token to your coding agent — it registers itself via MCP."
+      width={560}
+      onClose={cancel}
       footer={
         <>
-          <button type="button" className="btn btn-ghost" onClick={onCancel}>
-            Cancel
+          <button type="button" className="btn btn-ghost" onClick={cancel}>
+            {pending === null ? 'Cancel' : 'Close'}
           </button>
           <div className="spacer" />
-          <button
-            type="button"
-            className="btn btn-primary"
-            disabled={!valid}
-            onClick={() => {
-              onAttach({ tool, cwd, branch, sessionId, name, resumeCommand, workstreamId });
-            }}
-          >
-            Attach
-          </button>
+          {pending === null ? (
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={!companionAvailable || busy}
+              onClick={startHandoff}
+            >
+              {busy ? 'Generating…' : 'Generate prompt'}
+            </button>
+          ) : expired ? (
+            <button type="button" className="btn btn-primary" onClick={reset}>
+              Generate new token
+            </button>
+          ) : (
+            <span className="muted mono" aria-live="polite">
+              Waiting for your agent to register…
+            </span>
+          )}
         </>
       }
     >
-      <div className="composer-row">
-        <label>Tool</label>
-        <div className="pill-row">
-          {(Object.keys(TOOL_LABEL) as readonly CodingTool[]).map((t) => (
-            <button
-              key={t}
-              type="button"
-              className={'pill ' + (tool === t ? 'on' : '')}
-              onClick={() => {
-                setTool(t);
-              }}
-            >
-              {TOOL_LABEL[t]}
-            </button>
-          ))}
+      {!companionAvailable ? (
+        <div className="banner warning">
+          Coding-session attach needs the companion. Configure a vault path and bridge key in
+          Settings, then try again.
         </div>
-      </div>
-
-      <div className="composer-row">
-        <label>
-          cwd <span className="mono dim">(working directory)</span>
-        </label>
-        <input
-          type="text"
-          className="mono"
-          value={cwd}
-          onChange={(event) => {
-            setCwd(event.target.value);
-          }}
-          placeholder="/Users/you/Documents/repo"
-        />
-      </div>
-
-      <div className="composer-row">
-        <label>
-          Branch <span className="mono dim">(optional)</span>
-        </label>
-        <input
-          type="text"
-          className="mono"
-          value={branch}
-          onChange={(event) => {
-            setBranch(event.target.value);
-          }}
-          placeholder="main"
-        />
-      </div>
-
-      <div className="composer-row">
-        <label>Session ID</label>
-        <input
-          type="text"
-          className="mono"
-          value={sessionId}
-          onChange={(event) => {
-            setSessionId(event.target.value);
-          }}
-          onBlur={detectResume}
-          placeholder="019dcb94-4c4c-…"
-        />
-      </div>
-
-      <div className="composer-row">
-        <label>
-          Name <span className="mono dim">(human-readable)</span>
-        </label>
-        <input
-          type="text"
-          className="ai-italic"
-          value={name}
-          onChange={(event) => {
-            setName(event.target.value);
-          }}
-          placeholder="MVP PRD iteration"
-        />
-      </div>
-
-      <div className="composer-row">
-        <label>Resume command</label>
-        <textarea
-          className="mono"
-          value={resumeCommand}
-          onChange={(event) => {
-            setResumeCommand(event.target.value);
-          }}
-          placeholder="claude resume <session-id>"
-          rows={2}
-        />
-      </div>
+      ) : null}
 
       <div className="composer-row">
         <label>Workstream</label>
@@ -179,8 +198,9 @@ export function CodingAttach({
           onChange={(event) => {
             setWorkstreamId(event.target.value);
           }}
+          disabled={pending !== null}
         >
-          <option value="">— pick a workstream —</option>
+          <option value="">— Inbox (no workstream) —</option>
           {workstreams.map((workstream) => (
             <option key={workstream.bac_id} value={workstream.bac_id}>
               {workstream.path}
@@ -188,6 +208,34 @@ export function CodingAttach({
           ))}
         </select>
       </div>
+
+      {pending === null ? (
+        <p className="muted">
+          Click "Generate prompt" to mint a 5-minute attach token. We'll copy a ready-to-paste
+          prompt to your clipboard — paste it into your coding agent (Claude Code, Codex CLI,
+          Cursor) and the agent will fill in cwd, branch, sessionId from its own runtime.
+        </p>
+      ) : (
+        <div className="coding-handoff">
+          <p className="muted">
+            Paste this into your coding agent.{' '}
+            {copied ? (
+              <span className="mono signal">(copied to clipboard)</span>
+            ) : (
+              <span className="mono">(copy manually if your clipboard refused focus)</span>
+            )}
+          </p>
+          <pre className="mono coding-handoff-prompt">{promptText}</pre>
+          <div className="coding-handoff-meta mono">
+            Token: {pending.token} · expires {new Date(pending.expiresAt).toLocaleTimeString()}
+          </div>
+          {expired ? (
+            <div className="banner warning">Token expired. Generate a new one and re-paste.</div>
+          ) : null}
+        </div>
+      )}
+
+      {error === null ? null : <div className="banner danger">{error}</div>}
     </Modal>
   );
 }
