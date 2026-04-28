@@ -187,6 +187,7 @@ const App = () => {
   const [expandedWorkstreamId, setExpandedWorkstreamId] = useState<string | null>(null);
   const [wsPickerOpen, setWsPickerOpen] = useState(false);
   const [wsPickerCreateMode, setWsPickerCreateMode] = useState(false);
+  const [viewMode, setViewMode] = useState<'workstream' | 'all'>('workstream');
   const [composeThreadId, setComposeThreadId] = useState<string | null>(null);
   const [pendingDispatch, setPendingDispatch] = useState<ComposedPacket | null>(null);
   const [dispatchInFlight, setDispatchInFlight] = useState(false);
@@ -706,12 +707,178 @@ const App = () => {
     setSelectedWorkstream(id ?? '');
   };
 
+  // Open vs closed/stale buckets across ALL workstreams (used by All view)
+  const openStatuses: TrackedThread['status'][] = [
+    'active',
+    'tracked',
+    'queued',
+    'needs_organize',
+  ];
+  const allOpenThreads = threads.filter(
+    (t) => openStatuses.includes(t.status) && t.trackingMode !== 'stopped',
+  );
+  const allClosedThreads = threads
+    .filter((t) => !openStatuses.includes(t.status) || t.trackingMode === 'stopped')
+    .slice()
+    .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
+  // Group open threads by primary workstream id (null = inbox/not-set)
+  const openGroups = (() => {
+    const groups = new Map<string | null, TrackedThread[]>();
+    groups.set(null, []);
+    for (const ws of state.workstreams) {
+      groups.set(ws.bac_id, []);
+    }
+    for (const t of allOpenThreads) {
+      const key = t.primaryWorkstreamId ?? null;
+      const list = groups.get(key);
+      if (list === undefined) {
+        groups.set(key, [t]);
+      } else {
+        list.push(t);
+      }
+    }
+    // Drop empty groups except inbox (always shown so user knows it exists)
+    return Array.from(groups.entries()).filter(([key, list]) => key === null || list.length > 0);
+  })();
+
+  // Inline thread-row renderer reused across views.
+  const renderThreadRow = (thread: TrackedThread) => {
+    const isPrivate = isThreadPrivate(thread, state.workstreams);
+    const dotClass =
+      thread.status === 'restorable' || thread.status === 'closed'
+        ? 'gray'
+        : thread.trackingMode === 'stopped'
+          ? 'gray'
+          : state.reminders.some(
+                (r) => r.threadId === thread.bac_id && r.status !== 'dismissed',
+              )
+            ? 'signal'
+            : thread.status === 'needs_organize'
+              ? 'amber'
+              : 'green';
+    const stamp =
+      thread.status === 'restorable'
+        ? `Tab closed · ${formatRelative(thread.lastSeenAt)}`
+        : thread.trackingMode === 'stopped'
+          ? `Tracking stopped · ${formatRelative(thread.lastSeenAt)}`
+          : `Last seen · ${formatRelative(thread.lastSeenAt)}`;
+    const titleDisplay = isPrivate ? '[private]' : thread.title;
+    return (
+      <div key={thread.bac_id} className="thread">
+        <div className="row1">
+          <span className={'provider ' + thread.provider}>{providerLabel(thread.provider)}</span>
+          <span className="name">{titleDisplay}</span>
+        </div>
+        <div className="row2">
+          <span className={'dot ' + dotClass} />
+          <span className="stamp">{stamp}</span>
+        </div>
+        <div className="thread-actions row2">
+          <button
+            type="button"
+            className="btn-link"
+            disabled={state.companionStatus !== 'connected' || bridgeKey.length === 0}
+            onClick={(e) => {
+              e.stopPropagation();
+              setComposeThreadId(thread.bac_id);
+            }}
+          >
+            Send to…
+          </button>
+          <button
+            type="button"
+            className="btn-link"
+            disabled={state.companionStatus !== 'connected' || bridgeKey.length === 0}
+            onClick={(e) => {
+              e.stopPropagation();
+              setReviewThreadId(thread.bac_id);
+            }}
+          >
+            Review
+          </button>
+          <button
+            type="button"
+            className="btn-link"
+            onClick={(e) => {
+              e.stopPropagation();
+              setMoveThreadId(thread.bac_id);
+            }}
+          >
+            Move to…
+          </button>
+          {thread.trackingMode === 'stopped' ? (
+            <button
+              type="button"
+              className="btn-link"
+              onClick={(e) => {
+                e.stopPropagation();
+                updateTracking(
+                  thread.bac_id,
+                  thread.provider === 'unknown' ? 'manual' : 'auto',
+                );
+              }}
+            >
+              Resume
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="btn-link"
+              onClick={(e) => {
+                e.stopPropagation();
+                updateTracking(thread.bac_id, 'stopped');
+              }}
+            >
+              Stop
+            </button>
+          )}
+          {thread.status === 'restorable' ? (
+            <button
+              type="button"
+              className="btn-link"
+              onClick={(e) => {
+                e.stopPropagation();
+                setRecoveryThreadId(thread.bac_id);
+              }}
+            >
+              Reopen
+            </button>
+          ) : null}
+        </div>
+      </div>
+    );
+  };
+
   return (
     <main className="bac-app" aria-label="Sidetrack workboard">
       <div className="app-head">
         <div className="app-mark">
           <span className="glyph" aria-hidden />
           Sidetrack
+        </div>
+        <div className="view-tabs" role="tablist" aria-label="View">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === 'workstream'}
+            className={'view-tab' + (viewMode === 'workstream' ? ' on' : '')}
+            onClick={() => {
+              setViewMode('workstream');
+            }}
+          >
+            Workstream
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === 'all'}
+            className={'view-tab' + (viewMode === 'all' ? ' on' : '')}
+            onClick={() => {
+              setViewMode('all');
+            }}
+          >
+            All threads
+          </button>
         </div>
         <div className="app-actions">
           <button
@@ -746,17 +913,24 @@ const App = () => {
         </div>
       </div>
 
-      <WorkstreamBar
-        currentWsLabel={currentWsLabel}
-        statusLabel={companionStatusLabel(state.companionStatus)}
-        onOpenPicker={() => {
-          setWsPickerOpen(true);
-        }}
-        onAddSubWorkstream={() => {
-          setWsPickerOpen(true);
-          setWsPickerCreateMode(true);
-        }}
-      />
+      {viewMode === 'workstream' ? (
+        <WorkstreamBar
+          currentWsLabel={currentWsLabel}
+          statusLabel={companionStatusLabel(state.companionStatus)}
+          onOpenPicker={() => {
+            setWsPickerOpen(true);
+          }}
+          onAddSubWorkstream={() => {
+            setWsPickerOpen(true);
+            setWsPickerCreateMode(true);
+          }}
+        />
+      ) : (
+        <div className="ws-bar all-bar">
+          <span className="lbl">All threads</span>
+          <span className="ws-status mono">{companionStatusLabel(state.companionStatus)}</span>
+        </div>
+      )}
 
       {wsPickerOpen ? (
         <WorkstreamPicker
@@ -817,137 +991,86 @@ const App = () => {
 
       {error ? <div className="banner danger">{error}</div> : null}
 
-      <div className="sec-head">
-        <span>Open threads</span>
-        <span className="count mono">
-          {String(activeCount)} active{staleCount > 0 ? ' · ' + String(staleCount) + ' stale' : ''}
-        </span>
-      </div>
-      <div className="thread-list">
-        {currentWsThreads.length === 0 ? (
-          <div className="thread-empty subtle">
-            <p>No threads here yet.</p>
-            <button
-              type="button"
-              className="btn-link"
-              disabled={busy}
-              onClick={() => {
-                void runAction(() => sendRequest({ type: messageTypes.captureCurrentTab }));
-              }}
-            >
-              Track current tab →
-            </button>
+      {viewMode === 'workstream' ? (
+        <>
+          <div className="sec-head">
+            <span>Open threads</span>
+            <span className="count mono">
+              {String(activeCount)} active
+              {staleCount > 0 ? ' · ' + String(staleCount) + ' stale' : ''}
+            </span>
           </div>
-        ) : null}
-        {currentWsThreads.map((thread) => {
-          const isPrivate = isThreadPrivate(thread, state.workstreams);
-          const dotClass =
-            thread.status === 'restorable' || thread.status === 'closed'
-              ? 'gray'
-              : thread.trackingMode === 'stopped'
-                ? 'gray'
-                : state.reminders.some(
-                      (r) => r.threadId === thread.bac_id && r.status !== 'dismissed',
-                    )
-                  ? 'signal'
-                  : thread.status === 'needs_organize'
-                    ? 'amber'
-                    : 'green';
-          const stamp =
-            thread.status === 'restorable'
-              ? `Tab closed · ${formatRelative(thread.lastSeenAt)}`
-              : thread.trackingMode === 'stopped'
-                ? `Tracking stopped · ${formatRelative(thread.lastSeenAt)}`
-                : `Last seen · ${formatRelative(thread.lastSeenAt)}`;
-          const titleDisplay = isPrivate ? '[private]' : thread.title;
-          return (
-            <div key={thread.bac_id} className="thread">
-              <div className="row1">
-                <span className={'provider ' + thread.provider}>
-                  {providerLabel(thread.provider)}
+          <div className="thread-list">
+            {currentWsThreads.length === 0 ? (
+              <div className="thread-empty subtle">
+                <p>No threads here yet.</p>
+                <button
+                  type="button"
+                  className="btn-link"
+                  disabled={busy}
+                  onClick={() => {
+                    void runAction(() => sendRequest({ type: messageTypes.captureCurrentTab }));
+                  }}
+                >
+                  Track current tab →
+                </button>
+              </div>
+            ) : null}
+            {currentWsThreads.map(renderThreadRow)}
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="sec-head">
+            <span>Open threads</span>
+            <span className="count mono">
+              {String(allOpenThreads.length)} active across {String(openGroups.length)}{' '}
+              workstream{openGroups.length === 1 ? '' : 's'}
+            </span>
+          </div>
+          <div className="all-groups">
+            {openGroups.map(([wsId, list]) => {
+              const ws = wsId === null ? null : state.workstreams.find((w) => w.bac_id === wsId);
+              const groupLabel = ws === null ? 'not set · Inbox' : ws?.title ?? 'unknown';
+              return (
+                <div className="ws-group" key={wsId ?? '__inbox'}>
+                  <button
+                    type="button"
+                    className="ws-group-head"
+                    onClick={() => {
+                      setCurrentWs(wsId);
+                      setViewMode('workstream');
+                    }}
+                  >
+                    <span className="ws-group-label">{groupLabel}</span>
+                    <span className="ws-group-count mono">
+                      {String(list.length)} thread{list.length === 1 ? '' : 's'} →
+                    </span>
+                  </button>
+                  {list.length > 0 ? (
+                    <div className="thread-list">{list.map(renderThreadRow)}</div>
+                  ) : (
+                    <div className="thread-empty subtle group-empty">
+                      <p>No open threads in this workstream.</p>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          {allClosedThreads.length > 0 ? (
+            <>
+              <div className="sec-head">
+                <span>Closed · stale</span>
+                <span className="count mono">
+                  {String(allClosedThreads.length)} · ordered by last seen
                 </span>
-                <span className="name">{titleDisplay}</span>
               </div>
-              <div className="row2">
-                <span className={'dot ' + dotClass} />
-                <span className="stamp">{stamp}</span>
-              </div>
-              <div className="thread-actions row2">
-                <button
-                  type="button"
-                  className="btn-link"
-                  disabled={state.companionStatus !== 'connected' || bridgeKey.length === 0}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setComposeThreadId(thread.bac_id);
-                  }}
-                >
-                  Send to…
-                </button>
-                <button
-                  type="button"
-                  className="btn-link"
-                  disabled={state.companionStatus !== 'connected' || bridgeKey.length === 0}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setReviewThreadId(thread.bac_id);
-                  }}
-                >
-                  Review
-                </button>
-                <button
-                  type="button"
-                  className="btn-link"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setMoveThreadId(thread.bac_id);
-                  }}
-                >
-                  Move to…
-                </button>
-                {thread.trackingMode === 'stopped' ? (
-                  <button
-                    type="button"
-                    className="btn-link"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      updateTracking(
-                        thread.bac_id,
-                        thread.provider === 'unknown' ? 'manual' : 'auto',
-                      );
-                    }}
-                  >
-                    Resume
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    className="btn-link"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      updateTracking(thread.bac_id, 'stopped');
-                    }}
-                  >
-                    Stop
-                  </button>
-                )}
-                {thread.status === 'restorable' ? (
-                  <button
-                    type="button"
-                    className="btn-link"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setRecoveryThreadId(thread.bac_id);
-                    }}
-                  >
-                    Reopen
-                  </button>
-                ) : null}
-              </div>
-            </div>
-          );
-        })}
-      </div>
+              <div className="thread-list">{allClosedThreads.map(renderThreadRow)}</div>
+            </>
+          ) : null}
+        </>
+      )}
 
       <div className="sec-head">
         <span>Captures</span>
