@@ -187,7 +187,10 @@ export const defaultSettings: UiSettings = {
     port: 17_373,
     bridgeKey: '',
   },
-  autoTrack: true,
+  // Default = manual per spec. Known-provider captures still land in
+  // Open threads, but the user owns the choice to keep tracking them.
+  // Toggle on in Settings to auto-track every detected AI thread.
+  autoTrack: false,
   siteToggles: {
     chatgpt: true,
     claude: true,

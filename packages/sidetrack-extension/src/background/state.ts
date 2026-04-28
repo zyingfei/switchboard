@@ -31,6 +31,7 @@ const REMINDERS_KEY = 'sidetrack.reminders';
 const SELECTOR_HEALTH_KEY = 'sidetrack.selectorHealth';
 const COLLAPSED_SECTIONS_KEY = 'sidetrack.collapsedSections';
 const CODING_SESSIONS_KEY = 'sidetrack.codingSessions';
+const VAULT_PATH_KEY = 'sidetrack.vaultPath';
 
 const storageGet = async <TValue>(key: string, fallback: TValue): Promise<TValue> => {
   const result = await chrome.storage.local.get({ [key]: fallback });
@@ -51,6 +52,22 @@ export const saveCompanionSettings = async (settings: CompanionSettings): Promis
   const next: UiSettings = { ...current, companion: settings };
   await storageSet({ [SETTINGS_KEY]: next });
   return next;
+};
+
+export const saveAutoTrack = async (autoTrack: boolean): Promise<UiSettings> => {
+  const current = await readSettings();
+  const next: UiSettings = { ...current, autoTrack };
+  await storageSet({ [SETTINGS_KEY]: next });
+  return next;
+};
+
+export const readVaultPath = async (): Promise<string | undefined> => {
+  const value = await storageGet<string | undefined>(VAULT_PATH_KEY, undefined);
+  return value === undefined || value.length === 0 ? undefined : value;
+};
+
+export const saveVaultPath = async (vaultPath: string): Promise<void> => {
+  await storageSet({ [VAULT_PATH_KEY]: vaultPath });
 };
 
 export const readThreads = async (): Promise<readonly TrackedThread[]> =>
@@ -279,8 +296,9 @@ export const recordSelectorCanary = async (event: CaptureEvent): Promise<void> =
 export const buildWorkboardState = async (
   companionStatus: WorkboardState['companionStatus'],
   lastError?: string,
-): Promise<WorkboardState> =>
-  createEmptyWorkboardState({
+): Promise<WorkboardState> => {
+  const vaultPath = await readVaultPath();
+  return createEmptyWorkboardState({
     companionStatus,
     queuedCaptureCount: (await readQueue()).length,
     droppedCaptureCount: await readDroppedCount(),
@@ -296,4 +314,6 @@ export const buildWorkboardState = async (
       [],
     ),
     ...(lastError === undefined ? {} : { lastError }),
+    ...(vaultPath === undefined ? {} : { vaultPath }),
   });
+};

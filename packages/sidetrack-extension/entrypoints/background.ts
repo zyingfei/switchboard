@@ -30,8 +30,10 @@ import {
   readThreads,
   readSettings,
   recordSelectorCanary,
+  saveAutoTrack,
   saveCompanionSettings,
   saveCollapsedSections,
+  saveVaultPath,
   updateLocalQueueItem,
   updateLocalReminder,
   updateLocalWorkstream,
@@ -104,6 +106,8 @@ const sendToCompanion = async (
     event,
     idempotencyKey('capture', `${event.threadUrl}-${event.capturedAt}`),
   );
+  const trackingMode: ThreadUpsert['trackingMode'] =
+    event.provider === 'unknown' || !settings.autoTrack ? 'manual' : 'auto';
   const thread: ThreadUpsert = {
     bac_id: eventResult.bac_id,
     provider: event.provider,
@@ -112,7 +116,7 @@ const sendToCompanion = async (
     title: event.title ?? event.threadUrl,
     lastSeenAt: event.capturedAt,
     status: event.turns.length > 0 ? 'active' : 'needs_organize',
-    trackingMode: event.provider === 'unknown' ? 'manual' : 'auto',
+    trackingMode,
     tags: [],
     tabSnapshot: event.tabSnapshot,
   };
@@ -155,6 +159,9 @@ const captureFromContentScript = async (tab: chrome.tabs.Tab): Promise<CaptureEv
 
 const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
   const existing = (await readThreads()).find((t) => t.threadUrl === event.threadUrl);
+  const settings = await readSettings();
+  const trackingMode: ThreadUpsert['trackingMode'] =
+    event.provider === 'unknown' || !settings.autoTrack ? 'manual' : 'auto';
   await upsertLocalThread({
     provider: event.provider,
     threadId: event.threadId,
@@ -162,7 +169,7 @@ const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
     title: event.title ?? event.threadUrl,
     lastSeenAt: event.capturedAt,
     status: event.turns.length > 0 ? 'active' : 'needs_organize',
-    trackingMode: event.provider === 'unknown' ? 'manual' : 'auto',
+    trackingMode,
     tags: [],
     tabSnapshot: event.tabSnapshot,
   });
@@ -631,6 +638,17 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
       () => detachCodingSession(request.codingSessionId),
       'mutation',
     );
+  }
+
+  if (request.type === messageTypes.saveLocalPreferences) {
+    return await withCompanionStatus(async () => {
+      if (typeof request.preferences.autoTrack === 'boolean') {
+        await saveAutoTrack(request.preferences.autoTrack);
+      }
+      if (typeof request.preferences.vaultPath === 'string') {
+        await saveVaultPath(request.preferences.vaultPath);
+      }
+    }, 'settings');
   }
 
   await saveCollapsedSections(request.collapsedSections);
