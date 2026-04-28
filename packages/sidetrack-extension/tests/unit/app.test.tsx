@@ -215,8 +215,8 @@ describe('live side-panel App wiring', () => {
     fireEvent.click(await screen.findByRole('button', { name: /not set/ }));
     const wsRows = await screen.findAllByRole('button');
     const sidetrackPickerRow = wsRows.find((b) =>
-      (b.className.includes('ws-picker-row') || b.textContent !== null) &&
-      (b.textContent ?? '').trim().startsWith('Sidetrack'),
+      b.className.includes('ws-picker-row') &&
+      (b.textContent ?? '').trim().startsWith('Sidetrack'), // eslint-disable-line @typescript-eslint/no-unnecessary-condition
     );
     if (sidetrackPickerRow === undefined) {
       throw new Error('Could not find Sidetrack picker row.');

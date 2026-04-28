@@ -1889,6 +1889,16 @@ button:disabled {
   border-radius: 50%;
   background: var(--signal, #C2410C);
 }
+.app-mark .glyph::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 16px;
+  height: 1.5px;
+  background: var(--ink, #1B1916);
+  transform: translate(-50%, -50%) rotate(35deg);
+}
 .app-actions {
   display: flex;
   gap: 4px;
@@ -2037,13 +2047,13 @@ button:disabled {
 .thread-list { padding: 0 8px; }
 .thread-empty { padding: 12px 8px; }
 .thread {
-  padding: 10px 12px;
+  padding: 8px 12px;
   border: 1px solid transparent;
   border-radius: 6px;
-  margin-bottom: 4px;
+  margin-bottom: 2px;
   transition: background 120ms ease, border-color 120ms ease;
 }
-.thread:hover { background: var(--paper, #F5EFE2); border-color: var(--rule-soft, #E5DDC9); }
+.thread:hover { background: var(--paper-light, #FBF7EE); border-color: var(--rule-soft, #E5DDC9); }
 .thread .row1 {
   display: flex;
   align-items: center;
@@ -2093,7 +2103,33 @@ button:disabled {
 .thread .row2 .dot.amber   { background: #A16207; }
 .thread .row2 .dot.signal  { background: var(--signal, #C2410C); }
 .thread .row2 .dot.gray    { background: var(--ink-4, #A39A8C); }
-.thread-actions { gap: 8px; padding-top: 4px; }
+.thread-actions {
+  gap: 10px;
+  padding-top: 4px;
+  flex-wrap: nowrap;
+  max-height: 0;
+  opacity: 0;
+  overflow: hidden;
+  transition: max-height 140ms ease, opacity 140ms ease, padding-top 140ms ease;
+}
+.thread:hover .thread-actions,
+.thread:focus-within .thread-actions {
+  max-height: 28px;
+  opacity: 1;
+  padding-top: 6px;
+}
+.thread-actions .btn-link {
+  font-family: var(--mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--ink-2, #4A453D);
+  cursor: pointer;
+}
+.thread-actions .btn-link:hover { color: var(--signal, #C2410C); }
+.thread-actions .btn-link:disabled { color: var(--ink-4, #A39A8C); cursor: not-allowed; }
 
 .capture-list { padding: 0 8px 8px; }
 .capture-empty { padding: 8px 12px; }
