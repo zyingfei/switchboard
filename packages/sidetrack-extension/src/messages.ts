@@ -33,6 +33,7 @@ export const messageTypes = {
   workboardChanged: 'sidetrack.workboard.changed',
   createCodingAttachToken: 'sidetrack.coding.attach-token.create',
   detachCodingSession: 'sidetrack.coding.session.detach',
+  saveLocalPreferences: 'sidetrack.preferences.local.save',
 } as const;
 
 export interface SelectorCanaryReport {
@@ -153,6 +154,13 @@ export type WorkboardRequest =
   | {
       readonly type: typeof messageTypes.detachCodingSession;
       readonly codingSessionId: string;
+    }
+  | {
+      readonly type: typeof messageTypes.saveLocalPreferences;
+      readonly preferences: {
+        readonly autoTrack?: boolean;
+        readonly vaultPath?: string;
+      };
     };
 
 export type RuntimeRequest =
@@ -285,6 +293,10 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
 
   if (hasType(value, messageTypes.detachCodingSession)) {
     return typeof value.codingSessionId === 'string';
+  }
+
+  if (hasType(value, messageTypes.saveLocalPreferences)) {
+    return isRecord(value.preferences);
   }
 
   return false;

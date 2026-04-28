@@ -299,6 +299,22 @@ const App = () => {
     };
   }, [captureToastHost]);
 
+  // Spec: if the current tab is tracked and lives in a workstream, focus
+  // that workstream. If the current tab isn't tracked, leave the picker on
+  // whatever the user last had selected — the panel doesn't follow random
+  // tab switches into "not set".
+  useEffect(() => {
+    const currentWsForTab = state.currentTab?.primaryWorkstreamId;
+    if (currentWsForTab === undefined) {
+      return;
+    }
+    if (selectedWorkstream === currentWsForTab) {
+      return;
+    }
+    setSelectedWorkstream(currentWsForTab);
+    setExpandedWorkstreamId(null);
+  }, [state.currentTab?.bac_id, state.currentTab?.primaryWorkstreamId, selectedWorkstream]);
+
   useEffect(() => {
     // Defensive auto-save: if the user typed a plausible bridge key + port in
     // the inline settings form but didn't click Connect, persist after a
@@ -1676,6 +1692,16 @@ const App = () => {
             setSettingsError(null);
           }}
           onSave={handleSettingsSave}
+          localPreferences={{
+            autoTrack: state.settings.autoTrack,
+            vaultPath: state.vaultPath ?? '',
+          }}
+          companionConfigured={bridgeKey.length > 0}
+          onSaveLocalPreferences={(next) => {
+            void runAction(() =>
+              sendRequest({ type: messageTypes.saveLocalPreferences, preferences: next }),
+            );
+          }}
         />
       ) : null}
     </main>

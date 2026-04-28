@@ -23,8 +23,15 @@ export interface SettingsValue {
   readonly revision: string;
 }
 
+export interface LocalPreferences {
+  readonly autoTrack: boolean;
+  readonly vaultPath: string;
+}
+
 export interface SettingsPanelProps {
   readonly settings: SettingsValue | null;
+  readonly localPreferences: LocalPreferences;
+  readonly companionConfigured: boolean;
   readonly busy: boolean;
   readonly error?: string | null;
   readonly onClose: () => void;
@@ -33,6 +40,10 @@ export interface SettingsPanelProps {
     readonly defaultPacketKind: SettingsPacketKind;
     readonly defaultDispatchTarget: SettingsTargetProvider;
     readonly screenShareSafeMode: boolean;
+  }) => void;
+  readonly onSaveLocalPreferences: (next: {
+    readonly autoTrack?: boolean;
+    readonly vaultPath?: string;
   }) => void;
 }
 
@@ -60,7 +71,16 @@ const TARGET_LABELS: Record<SettingsTargetProvider, string> = {
   other: 'Other',
 };
 
-export function SettingsPanel({ settings, busy, error, onClose, onSave }: SettingsPanelProps) {
+export function SettingsPanel({
+  settings,
+  localPreferences,
+  companionConfigured,
+  busy,
+  error,
+  onClose,
+  onSave,
+  onSaveLocalPreferences,
+}: SettingsPanelProps) {
   const initial: SettingsValue = settings ?? {
     autoSendOptIn: { chatgpt: false, claude: false, gemini: false },
     defaultPacketKind: 'research',
@@ -76,14 +96,20 @@ export function SettingsPanel({ settings, busy, error, onClose, onSave }: Settin
   const [draftTarget, setDraftTarget] = useState<SettingsTargetProvider>(
     initial.defaultDispatchTarget,
   );
+  const [draftAutoTrack, setDraftAutoTrack] = useState(localPreferences.autoTrack);
+  const [draftVaultPath, setDraftVaultPath] = useState(localPreferences.vaultPath);
 
-  const dirty =
+  const companionDirty =
     draftAutoSend.chatgpt !== initial.autoSendOptIn.chatgpt ||
     draftAutoSend.claude !== initial.autoSendOptIn.claude ||
     draftAutoSend.gemini !== initial.autoSendOptIn.gemini ||
     draftScreenShareSafe !== initial.screenShareSafeMode ||
     draftPacketKind !== initial.defaultPacketKind ||
     draftTarget !== initial.defaultDispatchTarget;
+  const localDirty =
+    draftAutoTrack !== localPreferences.autoTrack ||
+    draftVaultPath.trim() !== localPreferences.vaultPath.trim();
+  const dirty = companionDirty || localDirty;
 
   const handleToggleProvider = (provider: keyof SettingsValue['autoSendOptIn']) => {
     setDraftAutoSend({ ...draftAutoSend, [provider]: !draftAutoSend[provider] });
@@ -93,12 +119,22 @@ export function SettingsPanel({ settings, busy, error, onClose, onSave }: Settin
     if (!dirty || busy) {
       return;
     }
-    onSave({
-      autoSendOptIn: draftAutoSend,
-      defaultPacketKind: draftPacketKind,
-      defaultDispatchTarget: draftTarget,
-      screenShareSafeMode: draftScreenShareSafe,
-    });
+    if (companionDirty && companionConfigured) {
+      onSave({
+        autoSendOptIn: draftAutoSend,
+        defaultPacketKind: draftPacketKind,
+        defaultDispatchTarget: draftTarget,
+        screenShareSafeMode: draftScreenShareSafe,
+      });
+    }
+    if (localDirty) {
+      onSaveLocalPreferences({
+        ...(draftAutoTrack === localPreferences.autoTrack ? {} : { autoTrack: draftAutoTrack }),
+        ...(draftVaultPath.trim() === localPreferences.vaultPath.trim()
+          ? {}
+          : { vaultPath: draftVaultPath.trim() }),
+      });
+    }
   };
 
   const footer = (
@@ -127,10 +163,63 @@ export function SettingsPanel({ settings, busy, error, onClose, onSave }: Settin
       footer={footer}
     >
       <div className="settings-section">
+        <h3 className="settings-section-title">Vault &amp; tracking</h3>
+        <p className="settings-section-lede ai-italic">
+          Without a vault, Sidetrack runs entirely in your browser's local storage. With a vault
+          path configured, the companion writes a canonical Markdown record under
+          <span className="mono"> _BAC/</span> so it survives reinstalls and is readable by other
+          tools. Tracking-by-default keeps every detected AI thread; manual default keeps the panel
+          quiet until you explicitly track something.
+        </p>
+        <label className="settings-text-row">
+          <span>Vault path</span>
+          <input
+            type="text"
+            className="mono"
+            placeholder="~/Documents/Sidetrack-vault"
+            value={draftVaultPath}
+            disabled={busy}
+            onChange={(event) => {
+              setDraftVaultPath(event.target.value);
+            }}
+          />
+        </label>
+        <p className="settings-hint mono">
+          The companion process picks up the vault path at startup. Edit here for the next session
+          or after re-running the companion.
+        </p>
+        <label className={'switch ' + (draftAutoTrack ? 'on' : '')}>
+          <input
+            type="checkbox"
+            checked={draftAutoTrack}
+            disabled={busy}
+            onChange={() => {
+              setDraftAutoTrack(!draftAutoTrack);
+            }}
+          />
+          <span className="knob" />
+          <span className="lbl">
+            Auto-track detected AI threads
+            <span className="desc mono">
+              {draftAutoTrack
+                ? 'on — every detected thread is tracked'
+                : 'off — manual tracking only (default)'}
+            </span>
+          </span>
+        </label>
+      </div>
+
+      <div className="settings-section">
         <h3 className="settings-section-title">Auto-send opt-in (§24.10)</h3>
         <p className="settings-section-lede ai-italic">
           Default is paste-mode for safety. Opt-in per provider only after you've reviewed how
           Sidetrack inserts into that chat. Opt-ins live in the vault, not the browser.
+          {companionConfigured ? null : (
+            <>
+              {' '}
+              <span className="mono">(disabled until a vault is configured)</span>
+            </>
+          )}
         </p>
         {(Object.keys(PROVIDER_LABELS) as readonly (keyof SettingsValue['autoSendOptIn'])[]).map(
           (provider) => (
