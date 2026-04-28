@@ -28,10 +28,19 @@ export interface LocalPreferences {
   readonly vaultPath: string;
 }
 
+export interface ArchivedThreadRow {
+  readonly bac_id: string;
+  readonly title: string;
+  readonly workstreamPath: string;
+  readonly archivedAt: string;
+  readonly providerLabel: string;
+}
+
 export interface SettingsPanelProps {
   readonly settings: SettingsValue | null;
   readonly localPreferences: LocalPreferences;
   readonly companionConfigured: boolean;
+  readonly archivedThreads: readonly ArchivedThreadRow[];
   readonly busy: boolean;
   readonly error?: string | null;
   readonly onClose: () => void;
@@ -45,6 +54,8 @@ export interface SettingsPanelProps {
     readonly autoTrack?: boolean;
     readonly vaultPath?: string;
   }) => void;
+  readonly onRestoreThread: (threadId: string) => void;
+  readonly onDeleteThread: (threadId: string) => void;
 }
 
 const PROVIDER_LABELS: Record<keyof SettingsValue['autoSendOptIn'], string> = {
@@ -75,11 +86,14 @@ export function SettingsPanel({
   settings,
   localPreferences,
   companionConfigured,
+  archivedThreads,
   busy,
   error,
   onClose,
   onSave,
   onSaveLocalPreferences,
+  onRestoreThread,
+  onDeleteThread,
 }: SettingsPanelProps) {
   const initial: SettingsValue = settings ?? {
     autoSendOptIn: { chatgpt: false, claude: false, gemini: false },
@@ -307,6 +321,53 @@ export function SettingsPanel({
             </span>
           </span>
         </label>
+      </div>
+
+      <div className="settings-section">
+        <h3 className="settings-section-title">Archived threads</h3>
+        <p className="settings-section-lede ai-italic">
+          Archive hides threads from the workboard. Restore brings one back as a manually-tracked
+          thread; Delete removes it permanently — local-only state is wiped, vault data (if you have
+          a companion) stays for audit.
+        </p>
+        {archivedThreads.length === 0 ? (
+          <p className="settings-hint mono">No archived threads.</p>
+        ) : (
+          <ul className="settings-archive-list">
+            {archivedThreads.map((row) => (
+              <li key={row.bac_id} className="settings-archive-row">
+                <div className="settings-archive-meta">
+                  <div className="settings-archive-title">{row.title}</div>
+                  <div className="settings-archive-sub mono">
+                    {row.providerLabel} · {row.workstreamPath} · archived {row.archivedAt}
+                  </div>
+                </div>
+                <div className="settings-archive-actions">
+                  <button
+                    type="button"
+                    className="btn-link"
+                    disabled={busy}
+                    onClick={() => {
+                      onRestoreThread(row.bac_id);
+                    }}
+                  >
+                    Restore
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-link archive"
+                    disabled={busy}
+                    onClick={() => {
+                      onDeleteThread(row.bac_id);
+                    }}
+                  >
+                    Delete
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
 
       {error !== null && error !== undefined ? (

@@ -1909,6 +1909,27 @@ const App = () => {
               sendRequest({ type: messageTypes.saveLocalPreferences, preferences: next }),
             );
           }}
+          archivedThreads={state.threads
+            .filter((t) => t.trackingMode === 'archived' && t.status !== 'removed')
+            .slice()
+            .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt))
+            .map((t) => ({
+              bac_id: t.bac_id,
+              title: t.title,
+              workstreamPath: workstreamPath(t.primaryWorkstreamId, state.workstreams),
+              archivedAt: formatRelative(t.lastSeenAt),
+              providerLabel: providerLabel(t.provider),
+            }))}
+          onRestoreThread={(threadId) => {
+            const target = state.threads.find((t) => t.bac_id === threadId);
+            const knownProvider = target !== undefined && target.provider !== 'unknown';
+            const restoredMode: TrackedThread['trackingMode'] =
+              state.settings.autoTrack && knownProvider ? 'auto' : 'manual';
+            updateTracking(threadId, restoredMode);
+          }}
+          onDeleteThread={(threadId) => {
+            updateTracking(threadId, 'removed');
+          }}
         />
       ) : null}
     </main>
