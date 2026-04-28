@@ -2256,3 +2256,19 @@ button:disabled {
 .ws-group .thread-list { padding: 0 4px; }
 .ws-group .thread { margin-bottom: 1px; }
 .group-empty { padding: 6px 12px; }
+
+/* =====================================================
+   Per-thread queue indicator + Archive (PR 4)
+   ===================================================== */
+.thread-queued {
+  margin-left: auto;
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--rule-soft, #E5DDC9);
+  background: var(--paper-light, #FBF7EE);
+  color: var(--ink-3, #7A7269);
+}
+.thread-actions .btn-link.archive { color: var(--ink-3, #7A7269); }
+.thread-actions .btn-link.archive:hover { color: var(--amber, #A16207); }

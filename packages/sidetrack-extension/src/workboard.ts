@@ -7,7 +7,7 @@ import type {
 } from './companion/model';
 
 export type CompanionStatus = 'connected' | 'disconnected' | 'vault-error' | 'local-only';
-export type TrackingMode = 'auto' | 'manual' | 'stopped' | 'removed';
+export type TrackingMode = 'auto' | 'manual' | 'stopped' | 'removed' | 'archived';
 export type PrivacyMode = 'private' | 'shared' | 'public';
 
 export interface WorkboardSection {

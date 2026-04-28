@@ -170,7 +170,13 @@ const isThreadPrivate = (thread: TrackedThread, workstreams: readonly Workstream
   );
 
 const visibleThreads = (threads: readonly TrackedThread[]): readonly TrackedThread[] =>
-  threads.filter((thread) => thread.status !== 'removed' && thread.trackingMode !== 'removed');
+  threads.filter(
+    (thread) =>
+      thread.status !== 'removed' &&
+      thread.status !== 'archived' &&
+      thread.trackingMode !== 'removed' &&
+      thread.trackingMode !== 'archived',
+  );
 
 
 const restoreStrategyForThread = (thread: TrackedThread): RestoreStrategy =>
@@ -763,11 +769,19 @@ const App = () => {
           ? `Tracking stopped · ${formatRelative(thread.lastSeenAt)}`
           : `Last seen · ${formatRelative(thread.lastSeenAt)}`;
     const titleDisplay = isPrivate ? '[private]' : thread.title;
+    const queuedCount = state.queueItems.filter(
+      (q) => q.targetId === thread.bac_id && q.status === 'pending',
+    ).length;
     return (
       <div key={thread.bac_id} className="thread">
         <div className="row1">
           <span className={'provider ' + thread.provider}>{providerLabel(thread.provider)}</span>
           <span className="name">{titleDisplay}</span>
+          {queuedCount > 0 ? (
+            <span className="thread-queued mono" title={`${String(queuedCount)} queued follow-up${queuedCount === 1 ? '' : 's'}`}>
+              {String(queuedCount)} queued
+            </span>
+          ) : null}
         </div>
         <div className="row2">
           <span className={'dot ' + dotClass} />
@@ -844,6 +858,17 @@ const App = () => {
               Reopen
             </button>
           ) : null}
+          <button
+            type="button"
+            className="btn-link archive"
+            title="Archive this thread (hide from default views)"
+            onClick={(e) => {
+              e.stopPropagation();
+              updateTracking(thread.bac_id, 'archived');
+            }}
+          >
+            Archive
+          </button>
         </div>
       </div>
     );

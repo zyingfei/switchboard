@@ -67,7 +67,7 @@ export interface ThreadUpsert {
     | 'removed';
   readonly primaryWorkstreamId?: string;
   readonly tags?: readonly string[];
-  readonly trackingMode?: 'auto' | 'manual' | 'stopped' | 'removed';
+  readonly trackingMode?: 'auto' | 'manual' | 'stopped' | 'removed' | 'archived';
   readonly tabSnapshot?: TabSnapshot;
 }
 
