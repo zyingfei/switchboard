@@ -219,7 +219,8 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
       (value.trackingMode === 'auto' ||
         value.trackingMode === 'manual' ||
         value.trackingMode === 'stopped' ||
-        value.trackingMode === 'removed')
+        value.trackingMode === 'removed' ||
+        value.trackingMode === 'archived')
     );
   }
 

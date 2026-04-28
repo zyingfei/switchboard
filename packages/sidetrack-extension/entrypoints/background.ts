@@ -402,6 +402,7 @@ const updateThreadTracking = async (
   }
 
   const removed = trackingMode === 'removed';
+  const archived = trackingMode === 'archived';
   const stopped = trackingMode === 'stopped';
   await upsertThreadPersisted({
     bac_id: thread.bac_id,
@@ -410,7 +411,7 @@ const updateThreadTracking = async (
     threadUrl: thread.threadUrl,
     title: thread.title,
     lastSeenAt: new Date().toISOString(),
-    status: removed ? 'removed' : stopped ? 'closed' : 'tracked',
+    status: removed ? 'removed' : archived ? 'archived' : stopped ? 'closed' : 'tracked',
     trackingMode,
     primaryWorkstreamId: thread.primaryWorkstreamId,
     tags: thread.tags,
