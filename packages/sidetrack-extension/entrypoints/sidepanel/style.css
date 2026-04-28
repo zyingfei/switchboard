@@ -1916,6 +1916,12 @@ button:disabled {
   transition: background 120ms ease, border-color 120ms ease;
 }
 .icon-btn:hover { background: var(--paper-deep, #E8DFC8); border-color: var(--rule, #D4CDB8); }
+.icon-btn:focus { outline: none; }
+.icon-btn:focus-visible {
+  outline: none;
+  border-color: var(--signal, #C2410C);
+  box-shadow: 0 0 0 2px var(--signal-tint, #FED7AA);
+}
 .icon-btn svg {
   width: 16px;
   height: 16px;
@@ -2121,12 +2127,15 @@ button:disabled {
 .thread-actions .btn-link {
   font-family: var(--mono, 'JetBrains Mono', ui-monospace, monospace);
   font-size: 10px;
+  line-height: 14px;
   letter-spacing: 0.02em;
   background: transparent;
   border: 0;
   padding: 0;
   color: var(--ink-2, #4A453D);
   cursor: pointer;
+  white-space: nowrap;
+  flex: 0 0 auto;
 }
 .thread-actions .btn-link:hover { color: var(--signal, #C2410C); }
 .thread-actions .btn-link:disabled { color: var(--ink-4, #A39A8C); cursor: not-allowed; }
