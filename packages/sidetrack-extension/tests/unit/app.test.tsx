@@ -103,10 +103,7 @@ const liveState = (): WorkboardState =>
     ],
   });
 
-const installChromeMock = (
-  state: WorkboardState,
-  storageValues: Record<string, unknown> = {},
-) => {
+const installChromeMock = (state: WorkboardState, storageValues: Record<string, unknown> = {}) => {
   const sendMessage = vi.fn((request: WorkboardRequest) =>
     Promise.resolve({
       ok: true,
@@ -120,17 +117,12 @@ const installChromeMock = (
       return Promise.resolve({ [query]: localValues[query] });
     }
     if (Array.isArray(query)) {
-      return Promise.resolve(
-        Object.fromEntries(query.map((key) => [key, localValues[key]])),
-      );
+      return Promise.resolve(Object.fromEntries(query.map((key) => [key, localValues[key]])));
     }
     if (query !== null && query !== undefined) {
       return Promise.resolve(
         Object.fromEntries(
-          Object.entries(query).map(([key, fallback]) => [
-            key,
-            localValues[key] ?? fallback,
-          ]),
+          Object.entries(query).map(([key, fallback]) => [key, localValues[key] ?? fallback]),
         ),
       );
     }
@@ -214,9 +206,10 @@ describe('live side-panel App wiring', () => {
     // Switch to the workstream that contains the test thread via the ws picker.
     fireEvent.click(await screen.findByRole('button', { name: /not set/ }));
     const wsRows = await screen.findAllByRole('button');
-    const sidetrackPickerRow = wsRows.find((b) =>
-      b.className.includes('ws-picker-row') &&
-      (b.textContent ?? '').trim().startsWith('Sidetrack'), // eslint-disable-line @typescript-eslint/no-unnecessary-condition
+    const sidetrackPickerRow = wsRows.find(
+      (b) =>
+        b.className.includes('ws-picker-row') &&
+        (b.textContent ?? '').trim().startsWith('Sidetrack'), // eslint-disable-line @typescript-eslint/no-unnecessary-condition
     );
     if (sidetrackPickerRow === undefined) {
       throw new Error('Could not find Sidetrack picker row.');

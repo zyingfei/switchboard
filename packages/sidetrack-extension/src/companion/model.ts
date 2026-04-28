@@ -103,6 +103,11 @@ export interface QueueCreate {
   readonly status?: 'pending' | 'done' | 'dismissed';
 }
 
+export interface QueueUpdate {
+  readonly status?: 'pending' | 'done' | 'dismissed';
+  readonly text?: string;
+}
+
 export interface ReminderCreate {
   readonly threadId: string;
   readonly provider: ProviderId;

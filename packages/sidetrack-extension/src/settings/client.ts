@@ -20,7 +20,11 @@ const parseProviderOptIn = (value: unknown): SettingsDocument['autoSendOptIn'] =
   if (!isRecord(value)) {
     throw new Error('Settings autoSendOptIn missing.');
   }
-  if (typeof value.chatgpt !== 'boolean' || typeof value.claude !== 'boolean' || typeof value.gemini !== 'boolean') {
+  if (
+    typeof value.chatgpt !== 'boolean' ||
+    typeof value.claude !== 'boolean' ||
+    typeof value.gemini !== 'boolean'
+  ) {
     throw new Error('Settings autoSendOptIn missing required boolean per provider.');
   }
   return { chatgpt: value.chatgpt, claude: value.claude, gemini: value.gemini };

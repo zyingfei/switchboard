@@ -54,7 +54,6 @@ const TARGET_PROVIDER_LABEL: Record<string, string> = {
   other: 'Other',
 };
 
-
 const sendRequest = async (request: WorkboardRequest): Promise<WorkboardState> => {
   const response = (await chrome.runtime.sendMessage(request)) as unknown;
   if (!isRuntimeResponse(response)) {
@@ -79,7 +78,6 @@ const providerLabel = (provider: TrackedThread['provider']): string => {
   return 'Generic';
 };
 
-
 const formatRelative = (isoDate: string): string => {
   const then = Date.parse(isoDate);
   if (Number.isNaN(then)) {
@@ -99,7 +97,6 @@ const formatRelative = (isoDate: string): string => {
   }
   return `${String(Math.round(hours / 24))} days ago`;
 };
-
 
 const SETUP_COMPLETED_KEY = 'sidetrack:setupCompleted';
 const CODING_SESSIONS_KEY = 'sidetrack:codingSessions';
@@ -178,10 +175,8 @@ const visibleThreads = (threads: readonly TrackedThread[]): readonly TrackedThre
       thread.trackingMode !== 'archived',
   );
 
-
 const restoreStrategyForThread = (thread: TrackedThread): RestoreStrategy =>
   thread.tabSnapshot?.tabId === undefined ? 'reopen_url' : 'focus_open';
-
 
 const App = () => {
   const [state, setState] = useState<WorkboardState>(() => createEmptyWorkboardState());
@@ -196,14 +191,16 @@ const App = () => {
   const [viewMode, setViewMode] = useState<'workstream' | 'all'>('workstream');
   const [queueComposeFor, setQueueComposeFor] = useState<string | null>(null);
   const [queueDraft, setQueueDraft] = useState('');
+  const [queueExpandFor, setQueueExpandFor] = useState<string | null>(null);
+  const [queueCopiedId, setQueueCopiedId] = useState<string | null>(null);
   const [composeThreadId, setComposeThreadId] = useState<string | null>(null);
   const [pendingDispatch, setPendingDispatch] = useState<ComposedPacket | null>(null);
   const [dispatchInFlight, setDispatchInFlight] = useState(false);
   const [reviewThreadId, setReviewThreadId] = useState<string | null>(null);
   const [reviewInFlight, setReviewInFlight] = useState(false);
-  const [reviewTurnsByUrl, setReviewTurnsByUrl] = useState<ReadonlyMap<string, readonly CapturedTurnRecord[]>>(
-    () => new Map<string, readonly CapturedTurnRecord[]>(),
-  );
+  const [reviewTurnsByUrl, setReviewTurnsByUrl] = useState<
+    ReadonlyMap<string, readonly CapturedTurnRecord[]>
+  >(() => new Map<string, readonly CapturedTurnRecord[]>());
   const [settings, setSettings] = useState<SettingsDocument | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsBusy, setSettingsBusy] = useState(false);
@@ -242,7 +239,6 @@ const App = () => {
       (workstream) => workstream.bac_id === composeThread.primaryWorkstreamId,
     );
   }, [composeThread, state.workstreams]);
-
 
   const refresh = async () => {
     const next = await sendRequest({ type: messageTypes.getWorkboardState });
@@ -315,7 +311,6 @@ const App = () => {
     };
   }, [captureToastHost]);
 
-
   useEffect(() => {
     // Defensive auto-save: if the user typed a plausible bridge key + port in
     // the inline settings form but didn't click Connect, persist after a
@@ -345,7 +340,13 @@ const App = () => {
     return () => {
       window.clearTimeout(handle);
     };
-  }, [bridgeKey, port, stateLoaded, state.settings.companion.bridgeKey, state.settings.companion.port]);
+  }, [
+    bridgeKey,
+    port,
+    stateLoaded,
+    state.settings.companion.bridgeKey,
+    state.settings.companion.port,
+  ]);
 
   useEffect(() => {
     if (
@@ -380,7 +381,6 @@ const App = () => {
       cancelled = true;
     };
   }, [reviewThread, bridgeKey, port, reviewTurnsByUrl]);
-
 
   useEffect(() => {
     if (state.companionStatus !== 'connected' || bridgeKey.length === 0) {
@@ -424,7 +424,6 @@ const App = () => {
     }
   };
 
-
   const completeSetup = async (saveCompanionFirst: boolean): Promise<void> => {
     if (saveCompanionFirst) {
       await runAction(() =>
@@ -438,7 +437,6 @@ const App = () => {
     setSetupCompleted(true);
     setWizardOpen(false);
   };
-
 
   const handleMoveTarget = (target: WorkstreamOption | { readonly create: string }) => {
     if (moveThreadId === null) {
@@ -487,24 +485,46 @@ const App = () => {
   };
 
   // Switch to the thread's existing tab if still alive, otherwise open a new
-  // one at the same URL. The companion-side restoreThread does this too, but
-  // it's simpler to do tab-only operations directly from the side panel.
+  // one at the same URL.
+  // (1) Try chrome.tabs.update(tabId) using the captured tabId.
+  // (2) If that fails (tab was closed and re-opened, so tabId is stale),
+  //     query all tabs matching threadUrl and focus the first one.
+  // (3) Otherwise create a new tab at threadUrl.
   const openTabForThread = (thread: TrackedThread) => {
     const tabId = thread.tabSnapshot?.tabId;
-    if (typeof tabId === 'number') {
-      chrome.tabs
-        .update(tabId, { active: true })
-        .then((tab) => {
+    const focusByQuery = async () => {
+      try {
+        const tabs = await chrome.tabs.query({ url: thread.threadUrl });
+        const live = tabs.find((t) => typeof t.id === 'number');
+        if (live !== undefined && typeof live.id === 'number') {
+          await chrome.tabs.update(live.id, { active: true });
+          await chrome.windows.update(live.windowId, { focused: true });
+          return true;
+        }
+      } catch {
+        // chrome.tabs.query may fail without host_permissions on the URL —
+        // fall through to create.
+      }
+      return false;
+    };
+    void (async () => {
+      if (typeof tabId === 'number') {
+        try {
+          const tab = await chrome.tabs.update(tabId, { active: true });
           if (tab?.windowId !== undefined) {
-            void chrome.windows.update(tab.windowId, { focused: true });
+            await chrome.windows.update(tab.windowId, { focused: true });
           }
-        })
-        .catch(() => {
-          void chrome.tabs.create({ url: thread.threadUrl });
-        });
-      return;
-    }
-    void chrome.tabs.create({ url: thread.threadUrl });
+          return;
+        } catch {
+          // tabId is stale — fall through.
+        }
+      }
+      const focused = await focusByQuery();
+      if (focused) {
+        return;
+      }
+      await chrome.tabs.create({ url: thread.threadUrl });
+    })();
   };
 
   const submitQueueFollowUp = (threadId: string) => {
@@ -519,8 +539,33 @@ const App = () => {
       });
       setQueueDraft('');
       setQueueComposeFor(null);
+      setQueueExpandFor(threadId);
       return next;
     });
+  };
+
+  const dismissQueueItem = (queueItemId: string) => {
+    void runAction(() =>
+      sendRequest({
+        type: messageTypes.updateQueueItem,
+        queueItemId,
+        update: { status: 'dismissed' },
+      }),
+    );
+  };
+
+  const copyQueueItemText = (queueItemId: string, text: string) => {
+    void (async () => {
+      try {
+        await navigator.clipboard.writeText(text);
+        setQueueCopiedId(queueItemId);
+        setTimeout(() => {
+          setQueueCopiedId((current) => (current === queueItemId ? null : current));
+        }, 1200);
+      } catch {
+        // Clipboard API can be unavailable in some contexts; fail quietly.
+      }
+    })();
   };
 
   const updateTracking = (threadId: string, trackingMode: TrackedThread['trackingMode']) => {
@@ -545,11 +590,9 @@ const App = () => {
   };
 
   const handlePacketCopy = (packet: ComposedPacket) => {
-    void navigator.clipboard
-      .writeText(packet.body)
-      .catch(() => {
-        // Clipboard rejected (permissions, focus); fall through silently.
-      });
+    void navigator.clipboard.writeText(packet.body).catch(() => {
+      // Clipboard rejected (permissions, focus); fall through silently.
+    });
     setComposeThreadId(null);
   };
 
@@ -637,9 +680,16 @@ const App = () => {
 
   const submitReview = async (
     thread: TrackedThread,
-    payload: { readonly verdict: ReviewVerdict; readonly reviewerNote: string; readonly perSpan: Record<string, string> },
+    payload: {
+      readonly verdict: ReviewVerdict;
+      readonly reviewerNote: string;
+      readonly perSpan: Record<string, string>;
+    },
     outcome: ReviewOutcome,
-    spanContext: ReadonlyMap<string, { readonly text: string; readonly ordinal: number; readonly capturedAt?: string }>,
+    spanContext: ReadonlyMap<
+      string,
+      { readonly text: string; readonly ordinal: number; readonly capturedAt?: string }
+    >,
   ): Promise<boolean> => {
     if (bridgeKey.length === 0) {
       setError('Connect the companion to record reviews.');
@@ -697,21 +747,18 @@ const App = () => {
     }
   };
 
-
   // Auto-pop the wizard ONLY for true first-launch users (no setupCompleted
   // flag AND no bridge key in storage). Existing-user migration: a non-empty
   // bridge key from a prior install means they already configured it; don't
   // re-pop. After "Done" or "Skip", setupCompleted=true → never re-pops.
-  const firstLaunch =
-    stateLoaded && setupCompleted === false && bridgeKey.trim().length === 0;
+  const firstLaunch = stateLoaded && setupCompleted === false && bridgeKey.trim().length === 0;
   const showWizard = firstLaunch || wizardOpen;
   const localOnlyMode = state.companionStatus === 'local-only';
   // When local-only is the chosen mode, the companion isn't expected;
   // "disconnected" only applies when a bridge key was set but the companion
   // is unreachable.
   const companionDisconnected =
-    !localOnlyMode &&
-    (bridgeKey.trim().length === 0 || state.companionStatus === 'disconnected');
+    !localOnlyMode && (bridgeKey.trim().length === 0 || state.companionStatus === 'disconnected');
   const vaultUnreachable = state.companionStatus === 'vault-error';
   const providerHealth = state.selectorHealth.find((entry) => entry.latestStatus !== 'ok');
   const workstreamOptions = useMemo(
@@ -729,13 +776,11 @@ const App = () => {
   const currentWsId =
     expandedWorkstreamId === null && selectedWorkstream === ''
       ? null
-      : expandedWorkstreamId ?? (selectedWorkstream || null);
+      : (expandedWorkstreamId ?? (selectedWorkstream || null));
   const currentWs =
-    currentWsId === null ? null : state.workstreams.find((w) => w.bac_id === currentWsId) ?? null;
+    currentWsId === null ? null : (state.workstreams.find((w) => w.bac_id === currentWsId) ?? null);
   const currentWsLabel =
-    currentWs === null
-      ? 'not set'
-      : workstreamPath(currentWs.bac_id, state.workstreams);
+    currentWs === null ? 'not set' : workstreamPath(currentWs.bac_id, state.workstreams);
   const currentWsThreads =
     currentWsId === null
       ? threads.filter((t) => t.primaryWorkstreamId === undefined)
@@ -744,8 +789,7 @@ const App = () => {
     (t) => t.status !== 'closed' && t.status !== 'archived' && t.status !== 'removed',
   ).length;
   const staleCount = currentWsThreads.filter(
-    (t) =>
-      t.status === 'closed' || t.status === 'restorable' || t.status === 'needs_organize',
+    (t) => t.status === 'closed' || t.status === 'restorable' || t.status === 'needs_organize',
   ).length;
   const setCurrentWs = (id: string | null) => {
     setExpandedWorkstreamId(id);
@@ -753,12 +797,7 @@ const App = () => {
   };
 
   // Open vs closed/stale buckets across ALL workstreams (used by All view)
-  const openStatuses: TrackedThread['status'][] = [
-    'active',
-    'tracked',
-    'queued',
-    'needs_organize',
-  ];
+  const openStatuses: TrackedThread['status'][] = ['active', 'tracked', 'queued', 'needs_organize'];
   const allOpenThreads = threads.filter(
     (t) => openStatuses.includes(t.status) && t.trackingMode !== 'stopped',
   );
@@ -794,9 +833,7 @@ const App = () => {
         ? 'gray'
         : thread.trackingMode === 'stopped'
           ? 'gray'
-          : state.reminders.some(
-                (r) => r.threadId === thread.bac_id && r.status !== 'dismissed',
-              )
+          : state.reminders.some((r) => r.threadId === thread.bac_id && r.status !== 'dismissed')
             ? 'signal'
             : thread.status === 'needs_organize'
               ? 'amber'
@@ -808,9 +845,11 @@ const App = () => {
           ? `Tracking stopped · ${formatRelative(thread.lastSeenAt)}`
           : `Last seen · ${formatRelative(thread.lastSeenAt)}`;
     const titleDisplay = isPrivate ? '[private]' : thread.title;
-    const queuedCount = state.queueItems.filter(
+    const pendingQueueItems = state.queueItems.filter(
       (q) => q.targetId === thread.bac_id && q.status === 'pending',
-    ).length;
+    );
+    const queuedCount = pendingQueueItems.length;
+    const queueExpanded = queueExpandFor === thread.bac_id && queuedCount > 0;
     return (
       <div key={thread.bac_id} className="thread">
         <div className="row1">
@@ -827,12 +866,18 @@ const App = () => {
             <span className="name">{titleDisplay}</span>
           </button>
           {queuedCount > 0 ? (
-            <span
-              className="thread-queued mono"
-              title={`${String(queuedCount)} queued follow-up${queuedCount === 1 ? '' : 's'} — fires when this AI replies`}
+            <button
+              type="button"
+              className={'thread-queued mono' + (queueExpanded ? ' on' : '')}
+              title={`Show ${String(queuedCount)} queued follow-up${queuedCount === 1 ? '' : 's'} — copy or dismiss before replying`}
+              aria-expanded={queueExpanded}
+              onClick={(e) => {
+                e.stopPropagation();
+                setQueueExpandFor(queueExpanded ? null : thread.bac_id);
+              }}
             >
               {String(queuedCount)} queued
-            </span>
+            </button>
           ) : null}
         </div>
         <div className="row2">
@@ -857,9 +902,7 @@ const App = () => {
             title="Queue a follow-up question that fires when this AI replies"
             onClick={(e) => {
               e.stopPropagation();
-              setQueueComposeFor(
-                queueComposeFor === thread.bac_id ? null : thread.bac_id,
-              );
+              setQueueComposeFor(queueComposeFor === thread.bac_id ? null : thread.bac_id);
               setQueueDraft('');
             }}
           >
@@ -907,10 +950,7 @@ const App = () => {
               title="Resume tracking this thread"
               onClick={(e) => {
                 e.stopPropagation();
-                updateTracking(
-                  thread.bac_id,
-                  thread.provider === 'unknown' ? 'manual' : 'auto',
-                );
+                updateTracking(thread.bac_id, thread.provider === 'unknown' ? 'manual' : 'auto');
               }}
             >
               Resume
@@ -958,7 +998,11 @@ const App = () => {
                 setQueueDraft(e.target.value);
               }}
             />
-            <button type="submit" className="btn-link" disabled={busy || queueDraft.trim().length === 0}>
+            <button
+              type="submit"
+              className="btn-link"
+              disabled={busy || queueDraft.trim().length === 0}
+            >
               Add
             </button>
             <button
@@ -972,6 +1016,39 @@ const App = () => {
               Cancel
             </button>
           </form>
+        ) : null}
+        {queueExpanded ? (
+          <ul className="thread-queue-list" aria-label="Queued follow-ups">
+            {pendingQueueItems.map((item) => (
+              <li key={item.bac_id} className="thread-queue-item">
+                <span className="thread-queue-text">{item.text}</span>
+                <span className="thread-queue-actions">
+                  <button
+                    type="button"
+                    className="btn-link"
+                    title="Copy this question to the clipboard"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      copyQueueItemText(item.bac_id, item.text);
+                    }}
+                  >
+                    {queueCopiedId === item.bac_id ? 'Copied' : 'Copy'}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-link"
+                    title="Dismiss this queued follow-up"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      dismissQueueItem(item.bac_id);
+                    }}
+                  >
+                    Dismiss
+                  </button>
+                </span>
+              </li>
+            ))}
+          </ul>
         ) : null}
       </div>
     );
@@ -1152,14 +1229,14 @@ const App = () => {
           <div className="sec-head">
             <span>Open threads</span>
             <span className="count mono">
-              {String(allOpenThreads.length)} active across {String(openGroups.length)}{' '}
-              workstream{openGroups.length === 1 ? '' : 's'}
+              {String(allOpenThreads.length)} active across {String(openGroups.length)} workstream
+              {openGroups.length === 1 ? '' : 's'}
             </span>
           </div>
           <div className="all-groups">
             {openGroups.map(([wsId, list]) => {
               const ws = wsId === null ? null : state.workstreams.find((w) => w.bac_id === wsId);
-              const groupLabel = ws === null ? 'not set · Inbox' : ws?.title ?? 'unknown';
+              const groupLabel = ws === null ? 'not set · Inbox' : (ws?.title ?? 'unknown');
               return (
                 <div className="ws-group" key={wsId ?? '__inbox'}>
                   <button
@@ -1207,8 +1284,10 @@ const App = () => {
       <div className="capture-list">
         {state.reminders.length === 0 ? (
           <div className="capture-empty subtle">
-            <p>Captures appear here when an AI thread you tracked replies, when you
-              annotate a page, or when you import notes from a vault.</p>
+            <p>
+              Captures appear here when an AI thread you tracked replies, when you annotate a page,
+              or when you import notes from a vault.
+            </p>
           </div>
         ) : null}
         {state.reminders.slice(0, 8).map((reminder) => {
@@ -1525,12 +1604,7 @@ function WorkstreamBar({
   return (
     <div className="ws-bar">
       <span className="lbl">Workstream</span>
-      <button
-        type="button"
-        className="ws-name"
-        onClick={onOpenPicker}
-        aria-haspopup="menu"
-      >
+      <button type="button" className="ws-name" onClick={onOpenPicker} aria-haspopup="menu">
         {currentWsLabel}
       </button>
       <button
@@ -1617,7 +1691,9 @@ function WorkstreamPicker({
               onSelect(null);
             }}
           >
-            <span className="ws-picker-name">not set <em className="subtle">· captures land here</em></span>
+            <span className="ws-picker-name">
+              not set <em className="subtle">· captures land here</em>
+            </span>
             <span className="mono subtle">{inboxCount}</span>
           </button>
           {matches.map((w) => (
@@ -1655,9 +1731,7 @@ function WorkstreamPicker({
               type="text"
               className="ws-picker-create-input"
               placeholder={
-                parentForNew === null
-                  ? 'New workstream name…'
-                  : 'New sub-workstream under current…'
+                parentForNew === null ? 'New workstream name…' : 'New sub-workstream under current…'
               }
               value={draftTitle}
               autoFocus

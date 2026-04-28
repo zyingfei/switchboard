@@ -2,6 +2,7 @@ import type {
   CaptureEvent,
   CompanionSettings,
   QueueCreate,
+  QueueUpdate,
   ReminderCreate,
   ReminderUpdate,
   ThreadUpsert,
@@ -180,6 +181,29 @@ export const createLocalQueueItem = async (
   };
   await storageSet({ [QUEUE_ITEMS_KEY]: [item, ...current] });
   return item;
+};
+
+export const updateLocalQueueItem = async (
+  queueItemId: string,
+  update: QueueUpdate,
+): Promise<QueueItem | undefined> => {
+  const current = await readQueueItems();
+  const timestamp = new Date().toISOString();
+  let updated: QueueItem | undefined;
+  const next = current.map((item) => {
+    if (item.bac_id !== queueItemId) {
+      return item;
+    }
+    updated = {
+      ...item,
+      status: update.status ?? item.status,
+      text: update.text ?? item.text,
+      updatedAt: timestamp,
+    };
+    return updated;
+  });
+  await storageSet({ [QUEUE_ITEMS_KEY]: next });
+  return updated;
 };
 
 export const createLocalReminder = async (

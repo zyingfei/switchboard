@@ -1,9 +1,5 @@
 import type { CompanionSettings, Problem } from '../companion/model';
-import type {
-  DispatchEventInput,
-  DispatchEventRecord,
-  DispatchSubmitResult,
-} from './types';
+import type { DispatchEventInput, DispatchEventRecord, DispatchSubmitResult } from './types';
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;
@@ -81,7 +77,10 @@ const parseListResponse = (value: unknown): readonly DispatchEventRecord[] => {
 };
 
 export interface DispatchClient {
-  readonly submit: (event: DispatchEventInput, idempotencyKey: string) => Promise<DispatchSubmitResult>;
+  readonly submit: (
+    event: DispatchEventInput,
+    idempotencyKey: string,
+  ) => Promise<DispatchSubmitResult>;
   readonly listRecent: (options?: {
     readonly limit?: number;
     readonly since?: string;

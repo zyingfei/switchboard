@@ -172,7 +172,8 @@ function CompanionStep({
   const [pingState, setPingState] = useState<'idle' | 'testing' | CompanionPingResult>('idle');
   const [clipboardError, setClipboardError] = useState<string | null>(null);
 
-  const ambientReachable = pingState === 'reachable' || (pingState === 'idle' && companionReachable);
+  const ambientReachable =
+    pingState === 'reachable' || (pingState === 'idle' && companionReachable);
   const showAmber = !ambientReachable && pingState !== 'unreachable';
 
   const handleTestConnection = () => {
@@ -192,7 +193,9 @@ function CompanionStep({
       .then((value) => {
         const trimmed = value.trim();
         if (trimmed.length < 32 || !BASE64URL_PATTERN.test(trimmed)) {
-          setClipboardError("That doesn't look like a bridge key — open the file and copy the line.");
+          setClipboardError(
+            "That doesn't look like a bridge key — open the file and copy the line.",
+          );
           return;
         }
         onBridgeKeyChange?.(trimmed);
@@ -221,10 +224,10 @@ function CompanionStep({
         <div className="wizard-card primary">
           <div className="wizard-card-tag mono">DEFAULT · ADR-0001</div>
           <div className="wizard-card-title">HTTP loopback</div>
-          <code className="wizard-card-cmd mono">npx @sidetrack/companion --vault {commandPath}</code>
-          <div className="wizard-card-meta mono">
-            Bridge key file: {bridgeKeyPath}
-          </div>
+          <code className="wizard-card-cmd mono">
+            npx @sidetrack/companion --vault {commandPath}
+          </code>
+          <div className="wizard-card-meta mono">Bridge key file: {bridgeKeyPath}</div>
         </div>
       </div>
       <div className={'wizard-status ' + statusClass}>
@@ -251,11 +254,7 @@ function CompanionStep({
         />
       </label>
       <div className="wizard-bridge-actions">
-        <button
-          type="button"
-          className="btn btn-ghost mono"
-          onClick={handlePasteFromClipboard}
-        >
+        <button type="button" className="btn btn-ghost mono" onClick={handlePasteFromClipboard}>
           Paste from clipboard
         </button>
         {clipboardError !== null ? (
@@ -296,9 +295,7 @@ function VaultStep({
           value={vaultPath}
         />
       </label>
-      <div className="wizard-folder-current mono">
-        Use this same path in the companion command.
-      </div>
+      <div className="wizard-folder-current mono">Use this same path in the companion command.</div>
       <div className={'wizard-status ' + (localRestApiDetected ? 'green' : 'neutral')}>
         <span className={'dot ' + (localRestApiDetected ? 'green' : '')} />
         <span className="mono">

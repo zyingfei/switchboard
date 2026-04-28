@@ -92,7 +92,8 @@ const TARGET_LABEL: Record<string, string> = {
 export function Preview() {
   const [surface, setSurface] = useState<Surface>('none');
   const [pendingPacket, setPendingPacket] = useState<ComposedPacket | null>(null);
-  const [recentDispatches, setRecentDispatches] = useState<readonly DispatchEvent[]>(STUB_DISPATCHES);
+  const [recentDispatches, setRecentDispatches] =
+    useState<readonly DispatchEvent[]>(STUB_DISPATCHES);
 
   const close = () => {
     setSurface('none');
@@ -141,7 +142,9 @@ export function Preview() {
   };
 
   const dispatchTargetLabel =
-    pendingPacket !== null ? TARGET_LABEL[mapUiTarget(pendingPacket.target)] ?? 'Target' : 'Target';
+    pendingPacket !== null
+      ? (TARGET_LABEL[mapUiTarget(pendingPacket.target)] ?? 'Target')
+      : 'Target';
   const tokenEstimateForConfirm = pendingPacket?.tokenEstimate ?? 4200;
   const redactedItems = pendingPacket?.redactedItems ?? [];
   const redactedCountForConfirm = redactedItems.reduce((sum, r) => sum + r.count, 0);

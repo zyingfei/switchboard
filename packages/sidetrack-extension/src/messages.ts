@@ -2,6 +2,7 @@ import type {
   CaptureEvent,
   CompanionSettings,
   QueueCreate,
+  QueueUpdate,
   ReminderCreate,
   ReminderUpdate,
   WorkstreamCreate,
@@ -23,6 +24,7 @@ export const messageTypes = {
   updateThreadTracking: 'sidetrack.thread.tracking.update',
   restoreThreadTab: 'sidetrack.thread.restore-tab',
   queueFollowUp: 'sidetrack.queue.create',
+  updateQueueItem: 'sidetrack.queue.update',
   createReminder: 'sidetrack.reminder.create',
   updateReminder: 'sidetrack.reminder.update',
   setCollapsedSections: 'sidetrack.sections.collapsed.set',
@@ -56,7 +58,9 @@ export interface WorkboardChangedMessage {
 }
 
 export const isWorkboardChangedMessage = (value: unknown): value is WorkboardChangedMessage =>
-  isRecord(value) && value.type === messageTypes.workboardChanged && typeof value.reason === 'string';
+  isRecord(value) &&
+  value.type === messageTypes.workboardChanged &&
+  typeof value.reason === 'string';
 
 export interface ContentRequest {
   readonly type: typeof messageTypes.captureVisibleThread;
@@ -119,6 +123,11 @@ export type WorkboardRequest =
   | {
       readonly type: typeof messageTypes.queueFollowUp;
       readonly item: QueueCreate;
+    }
+  | {
+      readonly type: typeof messageTypes.updateQueueItem;
+      readonly queueItemId: string;
+      readonly update: QueueUpdate;
     }
   | {
       readonly type: typeof messageTypes.createReminder;
@@ -231,6 +240,10 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
   if (hasType(value, messageTypes.queueFollowUp)) {
     const item = value.item;
     return isRecord(item) && typeof item.text === 'string' && typeof item.scope === 'string';
+  }
+
+  if (hasType(value, messageTypes.updateQueueItem)) {
+    return typeof value.queueItemId === 'string' && isRecord(value.update);
   }
 
   if (hasType(value, messageTypes.createReminder)) {
