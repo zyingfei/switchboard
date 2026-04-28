@@ -2171,3 +2171,88 @@ button:disabled {
   color: var(--ink-3, #7A7269);
   margin-top: 3px;
 }
+
+/* =====================================================
+   View toggle (Workstream | All threads) — PR 3
+   ===================================================== */
+.view-tabs {
+  display: flex;
+  gap: 2px;
+  margin-left: 12px;
+  margin-right: auto;
+  padding-left: 12px;
+  border-left: 1px solid var(--rule-soft, #E5DDC9);
+}
+.view-tab {
+  font-family: var(--mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  padding: 4px 8px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ink-3, #7A7269);
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+.view-tab:hover { background: var(--paper-deep, #E8DFC8); color: var(--ink-2, #4A453D); }
+.view-tab.on {
+  background: var(--paper-light, #FBF7EE);
+  color: var(--ink, #1B1916);
+  border-color: var(--rule, #D4CDB8);
+}
+.view-tab:focus { outline: none; }
+.view-tab:focus-visible {
+  outline: none;
+  border-color: var(--signal, #C2410C);
+  box-shadow: 0 0 0 2px var(--signal-tint, #FED7AA);
+}
+
+/* All-threads view groups */
+.all-bar {
+  /* same shell as ws-bar but no actionable workstream pill */
+  background: var(--paper-light, #FBF7EE);
+}
+.all-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 8px;
+}
+.ws-group {
+  border: 1px solid var(--rule-soft, #E5DDC9);
+  border-radius: 6px;
+  background: var(--paper, #F5EFE2);
+  padding: 4px 0 6px;
+}
+.ws-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 6px 12px 4px;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+}
+.ws-group-head:hover { background: var(--paper-light, #FBF7EE); }
+.ws-group-head:focus { outline: none; }
+.ws-group-head:focus-visible {
+  outline: none;
+  background: var(--signal-bg, #FFF7ED);
+}
+.ws-group-label {
+  font-family: var(--display, 'Fraunces', serif);
+  font-weight: 500;
+  font-size: 13px;
+  color: var(--ink, #1B1916);
+}
+.ws-group-count {
+  font-size: 9.5px;
+  color: var(--ink-3, #7A7269);
+  letter-spacing: 0.06em;
+}
+.ws-group .thread-list { padding: 0 4px; }
+.ws-group .thread { margin-bottom: 1px; }
+.group-empty { padding: 6px 12px; }
