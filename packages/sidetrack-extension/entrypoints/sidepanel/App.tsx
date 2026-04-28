@@ -194,6 +194,8 @@ const App = () => {
   const [wsPickerOpen, setWsPickerOpen] = useState(false);
   const [wsPickerCreateMode, setWsPickerCreateMode] = useState(false);
   const [viewMode, setViewMode] = useState<'workstream' | 'all'>('workstream');
+  const [queueComposeFor, setQueueComposeFor] = useState<string | null>(null);
+  const [queueDraft, setQueueDraft] = useState('');
   const [composeThreadId, setComposeThreadId] = useState<string | null>(null);
   const [pendingDispatch, setPendingDispatch] = useState<ComposedPacket | null>(null);
   const [dispatchInFlight, setDispatchInFlight] = useState(false);
@@ -482,6 +484,43 @@ const App = () => {
         threadId,
       }),
     );
+  };
+
+  // Switch to the thread's existing tab if still alive, otherwise open a new
+  // one at the same URL. The companion-side restoreThread does this too, but
+  // it's simpler to do tab-only operations directly from the side panel.
+  const openTabForThread = (thread: TrackedThread) => {
+    const tabId = thread.tabSnapshot?.tabId;
+    if (typeof tabId === 'number') {
+      chrome.tabs
+        .update(tabId, { active: true })
+        .then((tab) => {
+          if (tab?.windowId !== undefined) {
+            void chrome.windows.update(tab.windowId, { focused: true });
+          }
+        })
+        .catch(() => {
+          void chrome.tabs.create({ url: thread.threadUrl });
+        });
+      return;
+    }
+    void chrome.tabs.create({ url: thread.threadUrl });
+  };
+
+  const submitQueueFollowUp = (threadId: string) => {
+    const text = queueDraft.trim();
+    if (text.length === 0) {
+      return;
+    }
+    void runAction(async () => {
+      const next = await sendRequest({
+        type: messageTypes.queueFollowUp,
+        item: { text, scope: 'thread', targetId: threadId },
+      });
+      setQueueDraft('');
+      setQueueComposeFor(null);
+      return next;
+    });
   };
 
   const updateTracking = (threadId: string, trackingMode: TrackedThread['trackingMode']) => {
@@ -776,9 +815,22 @@ const App = () => {
       <div key={thread.bac_id} className="thread">
         <div className="row1">
           <span className={'provider ' + thread.provider}>{providerLabel(thread.provider)}</span>
-          <span className="name">{titleDisplay}</span>
+          <button
+            type="button"
+            className="thread-name-btn"
+            title={isPrivate ? 'Open thread tab' : `Open: ${thread.title}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              openTabForThread(thread);
+            }}
+          >
+            <span className="name">{titleDisplay}</span>
+          </button>
           {queuedCount > 0 ? (
-            <span className="thread-queued mono" title={`${String(queuedCount)} queued follow-up${queuedCount === 1 ? '' : 's'}`}>
+            <span
+              className="thread-queued mono"
+              title={`${String(queuedCount)} queued follow-up${queuedCount === 1 ? '' : 's'} — fires when this AI replies`}
+            >
               {String(queuedCount)} queued
             </span>
           ) : null}
@@ -791,18 +843,45 @@ const App = () => {
           <button
             type="button"
             className="btn-link"
-            disabled={state.companionStatus !== 'connected' || bridgeKey.length === 0}
+            title="Open the thread's tab (or reopen if closed)"
             onClick={(e) => {
               e.stopPropagation();
-              setComposeThreadId(thread.bac_id);
+              openTabForThread(thread);
             }}
           >
-            Send to…
+            Open
+          </button>
+          <button
+            type="button"
+            className="btn-link"
+            title="Queue a follow-up question that fires when this AI replies"
+            onClick={(e) => {
+              e.stopPropagation();
+              setQueueComposeFor(
+                queueComposeFor === thread.bac_id ? null : thread.bac_id,
+              );
+              setQueueDraft('');
+            }}
+          >
+            Queue
           </button>
           <button
             type="button"
             className="btn-link"
             disabled={state.companionStatus !== 'connected' || bridgeKey.length === 0}
+            title="Compose a packet from this thread and dispatch to another AI"
+            onClick={(e) => {
+              e.stopPropagation();
+              setComposeThreadId(thread.bac_id);
+            }}
+          >
+            Send
+          </button>
+          <button
+            type="button"
+            className="btn-link"
+            disabled={state.companionStatus !== 'connected' || bridgeKey.length === 0}
+            title="Review captured turns of this thread"
             onClick={(e) => {
               e.stopPropagation();
               setReviewThreadId(thread.bac_id);
@@ -813,17 +892,19 @@ const App = () => {
           <button
             type="button"
             className="btn-link"
+            title="Move this thread into another workstream"
             onClick={(e) => {
               e.stopPropagation();
               setMoveThreadId(thread.bac_id);
             }}
           >
-            Move to…
+            Move
           </button>
           {thread.trackingMode === 'stopped' ? (
             <button
               type="button"
               className="btn-link"
+              title="Resume tracking this thread"
               onClick={(e) => {
                 e.stopPropagation();
                 updateTracking(
@@ -838,6 +919,7 @@ const App = () => {
             <button
               type="button"
               className="btn-link"
+              title="Stop tracking — keep the thread but don't capture new turns"
               onClick={(e) => {
                 e.stopPropagation();
                 updateTracking(thread.bac_id, 'stopped');
@@ -846,22 +928,10 @@ const App = () => {
               Stop
             </button>
           )}
-          {thread.status === 'restorable' ? (
-            <button
-              type="button"
-              className="btn-link"
-              onClick={(e) => {
-                e.stopPropagation();
-                setRecoveryThreadId(thread.bac_id);
-              }}
-            >
-              Reopen
-            </button>
-          ) : null}
           <button
             type="button"
             className="btn-link archive"
-            title="Archive this thread (hide from default views)"
+            title="Archive — hide from default views; restorable from Settings"
             onClick={(e) => {
               e.stopPropagation();
               updateTracking(thread.bac_id, 'archived');
@@ -870,6 +940,39 @@ const App = () => {
             Archive
           </button>
         </div>
+        {queueComposeFor === thread.bac_id ? (
+          <form
+            className="thread-queue-compose"
+            onSubmit={(e) => {
+              e.preventDefault();
+              submitQueueFollowUp(thread.bac_id);
+            }}
+          >
+            <input
+              type="text"
+              autoFocus
+              className="mono"
+              placeholder="Ask next… (fires after this thread replies)"
+              value={queueDraft}
+              onChange={(e) => {
+                setQueueDraft(e.target.value);
+              }}
+            />
+            <button type="submit" className="btn-link" disabled={busy || queueDraft.trim().length === 0}>
+              Add
+            </button>
+            <button
+              type="button"
+              className="btn-link"
+              onClick={() => {
+                setQueueComposeFor(null);
+                setQueueDraft('');
+              }}
+            >
+              Cancel
+            </button>
+          </form>
+        ) : null}
       </div>
     );
   };
