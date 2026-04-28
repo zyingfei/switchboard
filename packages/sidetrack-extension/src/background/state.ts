@@ -1,5 +1,7 @@
 import type {
   CaptureEvent,
+  CaptureNoteCreate,
+  CaptureNoteUpdate,
   CompanionSettings,
   QueueCreate,
   QueueUpdate,
@@ -13,6 +15,7 @@ import { readDroppedCount, readQueue } from '../companion/queue';
 import {
   createEmptyWorkboardState,
   defaultSettings,
+  type CaptureNote,
   type CodingSession,
   type InboundReminder,
   type QueueItem,
@@ -31,6 +34,7 @@ const REMINDERS_KEY = 'sidetrack.reminders';
 const SELECTOR_HEALTH_KEY = 'sidetrack.selectorHealth';
 const COLLAPSED_SECTIONS_KEY = 'sidetrack.collapsedSections';
 const CODING_SESSIONS_KEY = 'sidetrack.codingSessions';
+const CAPTURE_NOTES_KEY = 'sidetrack.captureNotes';
 const VAULT_PATH_KEY = 'sidetrack.vaultPath';
 
 const storageGet = async <TValue>(key: string, fallback: TValue): Promise<TValue> => {
@@ -94,6 +98,57 @@ export const writeCachedCodingSessions = async (
   await storageSet({ [CODING_SESSIONS_KEY]: sessions });
 };
 
+export const readCaptureNotes = async (): Promise<readonly CaptureNote[]> =>
+  await storageGet<readonly CaptureNote[]>(CAPTURE_NOTES_KEY, []);
+
+export const createLocalCaptureNote = async (input: CaptureNoteCreate): Promise<CaptureNote> => {
+  const current = await readCaptureNotes();
+  const timestamp = new Date().toISOString();
+  const note: CaptureNote = {
+    bac_id: createLocalBacId(),
+    kind: input.kind ?? 'manual',
+    text: input.text,
+    ...(input.workstreamId === undefined ? {} : { workstreamId: input.workstreamId }),
+    ...(input.source === undefined ? {} : { source: input.source }),
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  await storageSet({ [CAPTURE_NOTES_KEY]: [note, ...current] });
+  return note;
+};
+
+export const updateLocalCaptureNote = async (
+  noteId: string,
+  update: CaptureNoteUpdate,
+): Promise<CaptureNote | undefined> => {
+  const current = await readCaptureNotes();
+  const timestamp = new Date().toISOString();
+  let updated: CaptureNote | undefined;
+  const next = current.map((note) => {
+    if (note.bac_id !== noteId) {
+      return note;
+    }
+    updated = {
+      ...note,
+      text: update.text ?? note.text,
+      // workstreamId is intentionally allowed to be set to undefined to
+      // re-park a note in the Inbox.
+      workstreamId: 'workstreamId' in update ? update.workstreamId : note.workstreamId,
+      updatedAt: timestamp,
+    };
+    return updated;
+  });
+  await storageSet({ [CAPTURE_NOTES_KEY]: next });
+  return updated;
+};
+
+export const deleteLocalCaptureNote = async (noteId: string): Promise<void> => {
+  const current = await readCaptureNotes();
+  await storageSet({
+    [CAPTURE_NOTES_KEY]: current.filter((note) => note.bac_id !== noteId),
+  });
+};
+
 export const saveCollapsedSections = async (
   collapsedSections: WorkboardState['collapsedSections'],
 ): Promise<void> => {
@@ -121,6 +176,8 @@ export const upsertLocalThread = async (
     primaryWorkstreamId: input.primaryWorkstreamId ?? existing?.primaryWorkstreamId,
     tags: input.tags ?? existing?.tags ?? [],
     tabSnapshot: input.tabSnapshot ?? existing?.tabSnapshot,
+    parentThreadId: input.parentThreadId ?? existing?.parentThreadId,
+    parentTitle: input.parentTitle ?? existing?.parentTitle,
   };
   await storageSet({
     [THREADS_KEY]: [
@@ -309,6 +366,7 @@ export const buildWorkboardState = async (
     reminders: await readReminders(),
     selectorHealth: await readSelectorHealth(),
     codingSessions: await readCachedCodingSessions(),
+    captureNotes: await readCaptureNotes(),
     collapsedSections: await storageGet<WorkboardState['collapsedSections']>(
       COLLAPSED_SECTIONS_KEY,
       [],

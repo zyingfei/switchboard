@@ -1,5 +1,7 @@
 import type {
   CaptureEvent,
+  CaptureNoteCreate,
+  CaptureNoteUpdate,
   CodingAttachTokenCreate,
   CodingAttachTokenRecord,
   CompanionSettings,
@@ -34,6 +36,9 @@ export const messageTypes = {
   createCodingAttachToken: 'sidetrack.coding.attach-token.create',
   detachCodingSession: 'sidetrack.coding.session.detach',
   saveLocalPreferences: 'sidetrack.preferences.local.save',
+  createCaptureNote: 'sidetrack.capture.note.create',
+  updateCaptureNote: 'sidetrack.capture.note.update',
+  deleteCaptureNote: 'sidetrack.capture.note.delete',
 } as const;
 
 export interface SelectorCanaryReport {
@@ -161,6 +166,19 @@ export type WorkboardRequest =
         readonly autoTrack?: boolean;
         readonly vaultPath?: string;
       };
+    }
+  | {
+      readonly type: typeof messageTypes.createCaptureNote;
+      readonly note: CaptureNoteCreate;
+    }
+  | {
+      readonly type: typeof messageTypes.updateCaptureNote;
+      readonly noteId: string;
+      readonly update: CaptureNoteUpdate;
+    }
+  | {
+      readonly type: typeof messageTypes.deleteCaptureNote;
+      readonly noteId: string;
     };
 
 export type RuntimeRequest =
@@ -297,6 +315,19 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
 
   if (hasType(value, messageTypes.saveLocalPreferences)) {
     return isRecord(value.preferences);
+  }
+
+  if (hasType(value, messageTypes.createCaptureNote)) {
+    const note = value.note;
+    return isRecord(note) && typeof note.text === 'string';
+  }
+
+  if (hasType(value, messageTypes.updateCaptureNote)) {
+    return typeof value.noteId === 'string' && isRecord(value.update);
+  }
+
+  if (hasType(value, messageTypes.deleteCaptureNote)) {
+    return typeof value.noteId === 'string';
   }
 
   return false;

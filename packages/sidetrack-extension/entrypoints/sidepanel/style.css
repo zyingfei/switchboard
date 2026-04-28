@@ -2591,6 +2591,156 @@ button.thread-queued:focus-visible {
 }
 
 /* =====================================================
+   Thread lineage (forks / branched-from)
+   ===================================================== */
+.thread-lineage {
+  margin-top: 2px;
+  color: var(--ink-3, #7a7269);
+  font-size: 10.5px;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.thread-lineage .lineage-arrow {
+  font-family: var(--mono, 'JetBrains Mono', ui-monospace, monospace);
+  color: var(--signal, #c2410c);
+  font-size: 11px;
+}
+.thread-lineage .lineage-from {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 9px;
+  color: var(--ink-4, #a39a8c);
+}
+.thread-lineage .lineage-name {
+  font-family: var(--display, 'Fraunces', Georgia, serif);
+  font-size: 12px;
+  color: var(--ink-2, #4a453d);
+  font-style: italic;
+}
+button.btn-link.lineage-name {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+}
+button.btn-link.lineage-name:hover {
+  color: var(--signal, #c2410c);
+}
+
+/* =====================================================
+   Captures: notes + section action button
+   ===================================================== */
+.sec-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+.sec-head-btn {
+  font-family: var(--mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--ink-2, #4a453d);
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+.sec-head-btn:hover {
+  color: var(--signal, #c2410c);
+}
+
+.note-compose {
+  margin: 0 8px 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--rule-soft, #e5ddc9);
+  border-radius: 6px;
+  background: var(--paper-light, #fbf7ee);
+  display: grid;
+  gap: 6px;
+}
+.note-compose textarea {
+  width: 100%;
+  font-family: var(--display, 'Fraunces', Georgia, serif);
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 8px 10px;
+  border: 1px solid var(--rule, #d4cdb8);
+  border-radius: 4px;
+  background: var(--paper, #f5efe2);
+  color: var(--ink, #1b1916);
+  resize: vertical;
+  min-height: 60px;
+}
+.note-compose textarea:focus {
+  outline: none;
+  border-color: var(--signal, #c2410c);
+}
+.note-compose-actions {
+  display: flex;
+  gap: 12px;
+  font-family: var(--mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 10.5px;
+}
+.note-compose-actions .btn-link {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  color: var(--ink-2, #4a453d);
+}
+.note-compose-actions .btn-link:hover {
+  color: var(--signal, #c2410c);
+}
+.note-compose-actions .btn-link:disabled {
+  color: var(--ink-4, #a39a8c);
+  cursor: not-allowed;
+}
+
+.capture.capture-note .text {
+  font-family: var(--display, 'Fraunces', Georgia, serif);
+  font-style: italic;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+.capture-body {
+  display: grid;
+  gap: 4px;
+  flex: 1 1 auto;
+}
+.capture-actions {
+  display: flex;
+  gap: 12px;
+  margin-top: 2px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.capture:hover .capture-actions,
+.capture:focus-within .capture-actions {
+  opacity: 1;
+}
+.capture-actions .btn-link {
+  font-family: var(--mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 10px;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  color: var(--ink-2, #4a453d);
+}
+.capture-actions .btn-link:hover {
+  color: var(--signal, #c2410c);
+}
+.capture-actions .btn-link.archive {
+  color: var(--ink-3, #7a7269);
+}
+.capture-actions .btn-link.archive:hover {
+  color: var(--amber, #a16207);
+}
+
+/* =====================================================
    Coding sessions (interleaved with chat threads)
    ===================================================== */
 .coding-session-row .provider.coding {

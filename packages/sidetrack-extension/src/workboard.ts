@@ -43,6 +43,11 @@ export interface TrackedThread {
   readonly tags: readonly string[];
   readonly selectorCanary?: NonNullable<CaptureEvent['selectorCanary']>;
   readonly tabSnapshot?: TabSnapshot;
+  // Set when the provider DOM exposed a "branched from" / "forked from"
+  // hint that we matched to an already-tracked thread. parentTitle is a
+  // soft fallback when the parent isn't tracked yet.
+  readonly parentThreadId?: string;
+  readonly parentTitle?: string;
 }
 
 export interface WorkstreamNode {
@@ -89,6 +94,22 @@ export interface UiSettings {
   readonly siteToggles: Readonly<Record<Exclude<ProviderId, 'unknown'>, boolean>>;
 }
 
+// Manual notes the user types in the side panel (and, later, Obsidian /
+// external imports). These render in the Captures section, scoped to a
+// workstream when one is selected. Distinct from CaptureEvent (which is
+// the AI-thread capture log).
+export type NoteKind = 'manual' | 'obsidian' | 'external';
+
+export interface CaptureNote {
+  readonly bac_id: string;
+  readonly kind: NoteKind;
+  readonly text: string;
+  readonly workstreamId?: string;
+  readonly source?: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
 export type CodingTool = 'claude_code' | 'codex' | 'cursor' | 'other';
 
 export interface CodingSession {
@@ -119,6 +140,7 @@ export interface WorkboardState {
   readonly selectorHealth: readonly SelectorHealth[];
   readonly collapsedSections: readonly WorkboardSection['id'][];
   readonly codingSessions: readonly CodingSession[];
+  readonly captureNotes: readonly CaptureNote[];
   readonly lastError?: string;
   readonly updatedAt: string;
 }
@@ -212,6 +234,7 @@ export const createEmptyWorkboardState = (
   selectorHealth: [],
   collapsedSections: [],
   codingSessions: [],
+  captureNotes: [],
   updatedAt: new Date().toISOString(),
   ...overrides,
 });
