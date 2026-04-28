@@ -716,16 +716,17 @@ const App = () => {
         <div className="app-actions">
           <button
             className="icon-btn"
-            title="Coding session"
+            title="Attach coding session"
             onClick={() => {
               setCodingAttachOpen(true);
             }}
             type="button"
-            aria-label="Coding session"
+            aria-label="Attach coding session"
           >
             <svg viewBox="0 0 24 24">
-              <polyline points="16 18 22 12 16 6" />
-              <polyline points="8 6 2 12 8 18" />
+              <rect x="2" y="4" width="20" height="16" rx="2" />
+              <polyline points="6 10 9 13 6 16" />
+              <line x1="13" y1="16" x2="18" y2="16" />
             </svg>
           </button>
           <button
