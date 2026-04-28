@@ -1758,6 +1758,69 @@ button:disabled {
   letter-spacing: 0.04em;
 }
 
+.settings-archive-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.settings-archive-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--rule-soft);
+  border-radius: 6px;
+  background: var(--paper-light);
+}
+.settings-archive-meta {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.settings-archive-title {
+  font-family: var(--display);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.settings-archive-sub {
+  margin-top: 2px;
+  font-size: 10.5px;
+  color: var(--ink-3);
+}
+.settings-archive-actions {
+  display: inline-flex;
+  gap: 12px;
+  flex: 0 0 auto;
+  padding-top: 2px;
+}
+.settings-archive-actions .btn-link {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  color: var(--ink-2);
+}
+.settings-archive-actions .btn-link:hover {
+  color: var(--signal);
+}
+.settings-archive-actions .btn-link.archive {
+  color: var(--ink-3);
+}
+.settings-archive-actions .btn-link.archive:hover {
+  color: var(--amber);
+}
+.settings-archive-actions .btn-link:disabled {
+  color: var(--ink-4);
+  cursor: not-allowed;
+}
+
 /* ── Switch (used in Wizard providers + Settings) ── */
 .switch {
   display: flex;
