@@ -34,7 +34,10 @@ test('queue auto-detect: a queued follow-up flips to done after the user types i
       waitUntil: 'domcontentloaded',
     });
 
-    const threadUrl = `${fixtureServer.origin}/chatgpt-queue-lifecycle.html`;
+    // ?provider=chatgpt opts the URL into the fixture-server escape
+    // hatch in isProviderThreadUrl so the auto-capture gate doesn't
+    // reject this localhost fixture.
+    const threadUrl = `${fixtureServer.origin}/chatgpt-queue-lifecycle.html?provider=chatgpt`;
     const now = new Date().toISOString();
     await runtime.seedStorage(seederPage, {
       [SETUP_KEY]: true,

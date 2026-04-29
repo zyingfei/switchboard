@@ -75,6 +75,17 @@ export default defineContentScript({
           'data-sidetrack-provider-canary',
           capture.selectorCanary ?? 'failed',
         );
+        // Only report the canary for actual chat-thread URLs. Non-chat
+        // pages on a known provider host (claude.ai/code, chatgpt.com
+        // landing, etc.) trivially fail extraction — surfacing that as
+        // "selectors may have drifted" is a false alarm that masks real
+        // drift on actual chat pages.
+        if (
+          capture.provider === 'unknown' ||
+          !isProviderThreadUrl(capture.provider, capture.threadUrl)
+        ) {
+          return;
+        }
         void chrome.runtime.sendMessage({
           type: messageTypes.selectorCanary,
           report: {

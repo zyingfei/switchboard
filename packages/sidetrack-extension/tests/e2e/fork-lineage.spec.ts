@@ -30,8 +30,11 @@ test('fork lineage: a captured thread linked to a tracked parent renders the "â†
       waitUntil: 'domcontentloaded',
     });
 
-    const parentUrl = `${fixtureServer.origin}/parent-thread.html`;
-    const childUrl = `${fixtureServer.origin}/forked-thread.html`;
+    // ?provider=claude opts both URLs into the fixture-server escape
+    // hatch in isProviderThreadUrl so the auto-capture gate doesn't
+    // reject these localhost fixtures.
+    const parentUrl = `${fixtureServer.origin}/parent-thread.html?provider=claude`;
+    const childUrl = `${fixtureServer.origin}/forked-thread.html?provider=claude`;
     const now = new Date().toISOString();
 
     await runtime.seedStorage(seederPage, {

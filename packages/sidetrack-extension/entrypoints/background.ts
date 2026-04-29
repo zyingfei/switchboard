@@ -587,6 +587,16 @@ const updateReminder = async (
 
 const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> => {
   if (request.type === messageTypes.selectorCanary) {
+    // Drop canary reports for non-chat URLs on a known provider host
+    // (claude.ai/code, chatgpt.com landing, etc.) — they trivially fail
+    // extraction and would otherwise poison the "Provider extractor:
+    // selectors may have drifted" banner with false positives.
+    if (
+      request.report.provider !== 'unknown' &&
+      !isProviderThreadUrl(request.report.provider, request.report.url)
+    ) {
+      return { ok: true, state: await buildState('connected') };
+    }
     await recordSelectorCanary({
       provider: request.report.provider,
       threadUrl: request.report.url,

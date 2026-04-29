@@ -984,19 +984,6 @@ const App = () => {
             ? note.workstreamId === undefined
             : note.workstreamId === currentWsId,
         );
-  const visibleReminders =
-    viewMode === 'all'
-      ? state.reminders
-      : state.reminders.filter((reminder) => {
-          const linkedThread = state.threads.find((t) => t.bac_id === reminder.threadId);
-          if (linkedThread === undefined) {
-            return currentWsId === null;
-          }
-          return currentWsId === null
-            ? linkedThread.primaryWorkstreamId === undefined
-            : linkedThread.primaryWorkstreamId === currentWsId;
-        });
-
   // Coding sessions (registered via the agent's MCP register tool) render
   // alongside chat threads in the same workstream group.
   const attachedSessions = state.codingSessions.filter((s) => s.status === 'attached');
@@ -1602,7 +1589,7 @@ const App = () => {
       <div className="sec-head">
         <span>Captures</span>
         <span className="sec-head-actions">
-          <span className="count mono">{String(scopedNotes.length + visibleReminders.length)}</span>
+          <span className="count mono">{String(scopedNotes.length)}</span>
           <button
             type="button"
             className="btn-link sec-head-btn"
@@ -1661,11 +1648,12 @@ const App = () => {
         </form>
       ) : null}
       <div className="capture-list">
-        {scopedNotes.length === 0 && visibleReminders.length === 0 ? (
+        {scopedNotes.length === 0 ? (
           <div className="capture-empty subtle">
             <p>
-              Notes you save here are scoped to the current workstream. Inbound replies from tracked
-              AI threads also land in this list. Obsidian / external imports come later.
+              Notes you save here are scoped to the current workstream. Inbound replies surface as the{' '}
+              <strong>Unread reply</strong> badge on the thread row above. Obsidian / external imports
+              come later.
             </p>
           </div>
         ) : null}
@@ -1708,27 +1696,6 @@ const App = () => {
             </div>
           </div>
         ))}
-        {visibleReminders.slice(0, 8).map((reminder) => {
-          const linkedThread = threads.find((t) => t.bac_id === reminder.threadId);
-          return (
-            <div className="capture" key={reminder.bac_id}>
-              <svg viewBox="0 0 24 24" aria-hidden>
-                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-              </svg>
-              <div>
-                <div className="text">
-                  {linkedThread !== undefined && isThreadPrivate(linkedThread, state.workstreams)
-                    ? '[private]'
-                    : (linkedThread?.title ?? 'Inbound reply')}
-                </div>
-                <div className="meta mono">
-                  {providerLabel(reminder.provider)} · {formatRelative(reminder.detectedAt)} ·{' '}
-                  {reminder.status === 'new' ? 'unread' : reminder.status}
-                </div>
-              </div>
-            </div>
-          );
-        })}
       </div>
 
       {moveThread ? (

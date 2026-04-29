@@ -84,8 +84,11 @@ test.describe('workstream privacy (synthetic)', () => {
       });
       await expect(sharedRow.getByText('Public roadmap draft')).toBeVisible();
 
-      await expect(page.locator('.capture').filter({ hasText: '[private]' }).first()).toBeVisible();
-      await expect(page.locator('.capture').filter({ hasText: 'Public roadmap draft' }).first()).toBeVisible();
+      // Reminders no longer render in the captures rail — the
+      // "Unread reply" lifecycle pill on the thread row is the canonical
+      // inbound-reply signal. See refactor/captures-rail. Privacy
+      // masking on the thread row is asserted above (privateRow doesn't
+      // expose 'Stealth planning doc'; sharedRow does expose its title).
     } finally {
       await runtime?.close();
     }
