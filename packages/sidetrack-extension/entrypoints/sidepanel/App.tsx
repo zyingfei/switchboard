@@ -1252,6 +1252,29 @@ const App = () => {
           >
             Archive
           </button>
+          {queuedCount > 0 ? (
+            <button
+              type="button"
+              className={'btn-link thread-autosend' + (thread.autoSendEnabled ? ' on' : '')}
+              title={
+                thread.autoSendEnabled
+                  ? 'Auto-send is ON — queued items will paste-and-send into this chat one at a time'
+                  : 'Turn on auto-send to drain queued follow-ups into this chat (requires §24.10 opt-in per provider in Settings)'
+              }
+              onClick={(e) => {
+                e.stopPropagation();
+                void runAction(() =>
+                  sendRequest({
+                    type: messageTypes.setThreadAutoSend,
+                    threadId: thread.bac_id,
+                    enabled: !thread.autoSendEnabled,
+                  }),
+                );
+              }}
+            >
+              {thread.autoSendEnabled ? '⚡ Auto-send: on' : 'Auto-send: off'}
+            </button>
+          ) : null}
         </div>
         {queueComposeFor === thread.bac_id ? (
           <form

@@ -51,6 +51,13 @@ export interface TrackedThread {
   // Role of the most-recent captured turn — drives the lifecycle pill
   // (Waiting on AI vs You replied last vs Unread reply).
   readonly lastTurnRole?: 'user' | 'assistant' | 'system' | 'unknown';
+  // Per-thread auto-send opt-in. When true AND
+  // settings.autoSendOptIn[provider] is true, queued follow-ups for
+  // this thread are eligible for auto-paste-and-send into the chat
+  // composer (one at a time, waiting for the AI to finish replying
+  // before sending the next). The actual drain implementation lives
+  // behind the §24.10 safety chain in M2; this flag is the contract.
+  readonly autoSendEnabled?: boolean;
 }
 
 export interface WorkstreamNode {

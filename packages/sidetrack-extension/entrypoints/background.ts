@@ -28,6 +28,7 @@ import {
   createLocalQueueItem,
   createLocalReminder,
   dismissRemindersForThread,
+  setThreadAutoSend,
   createLocalWorkstream,
   deleteLocalCaptureNote,
   markQueueItemsDoneFromTurns,
@@ -683,6 +684,12 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
       () => updateThreadTracking(request.threadId, request.trackingMode),
       'thread',
     );
+  }
+
+  if (request.type === messageTypes.setThreadAutoSend) {
+    return await withCompanionStatus(async () => {
+      await setThreadAutoSend(request.threadId, request.enabled);
+    }, 'thread');
   }
 
   if (request.type === messageTypes.restoreThreadTab) {

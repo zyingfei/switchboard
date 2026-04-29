@@ -26,6 +26,7 @@ export const messageTypes = {
   updateWorkstream: 'sidetrack.workstream.update',
   moveThread: 'sidetrack.thread.move',
   updateThreadTracking: 'sidetrack.thread.tracking.update',
+  setThreadAutoSend: 'sidetrack.thread.autoSend.set',
   restoreThreadTab: 'sidetrack.thread.restore-tab',
   queueFollowUp: 'sidetrack.queue.create',
   updateQueueItem: 'sidetrack.queue.update',
@@ -125,6 +126,11 @@ export type WorkboardRequest =
       readonly type: typeof messageTypes.updateThreadTracking;
       readonly threadId: string;
       readonly trackingMode: TrackingMode;
+    }
+  | {
+      readonly type: typeof messageTypes.setThreadAutoSend;
+      readonly threadId: string;
+      readonly enabled: boolean;
     }
   | {
       readonly type: typeof messageTypes.restoreThreadTab;
@@ -270,6 +276,10 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
         value.trackingMode === 'removed' ||
         value.trackingMode === 'archived')
     );
+  }
+
+  if (hasType(value, messageTypes.setThreadAutoSend)) {
+    return typeof value.threadId === 'string' && typeof value.enabled === 'boolean';
   }
 
   if (hasType(value, messageTypes.restoreThreadTab)) {
