@@ -2425,7 +2425,10 @@ button:disabled {
 }
 .thread:hover .thread-actions,
 .thread:focus-within .thread-actions {
-  max-height: 60px;
+  /* 8+ wrappable buttons (Open Queue Send Review Move Stop Archive
+     Auto-send) need room for two rows on narrow side-panel widths.
+     The earlier 60px cap clipped Move/Stop/Archive/Auto-send. */
+  max-height: 140px;
   opacity: 1;
   padding-top: 6px;
 }

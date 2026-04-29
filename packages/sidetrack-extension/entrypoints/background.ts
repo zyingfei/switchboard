@@ -346,22 +346,25 @@ const runAutoSendDrain = async (threadId: string): Promise<void> => {
     return;
   }
   const localSettings = await readSettings();
-  if (localSettings.companion.bridgeKey.trim().length === 0) {
-    // Auto-send needs the companion to host the per-provider opt-in
-    // settings. Local-only mode → no drain.
-    return;
+  // Per-provider opt-in + screenShareSafeMode live on the companion
+  // when configured. Local-only users don't have a companion to store
+  // those flags, so we fall back to "the per-thread toggle is the
+  // consent" — the user explicitly flipped Auto-send: on, that's
+  // enough. Same applies to screenShareSafeMode (default false).
+  let autoSendOptIn = { chatgpt: true, claude: true, gemini: true };
+  let screenShareSafeMode = false;
+  if (localSettings.companion.bridgeKey.trim().length > 0) {
+    try {
+      const companionSettings = await createSettingsClient(localSettings.companion).read();
+      autoSendOptIn = companionSettings.autoSendOptIn;
+      screenShareSafeMode = companionSettings.screenShareSafeMode;
+    } catch (error) {
+      console.warn(
+        '[autoSend] could not fetch companion settings; falling back to local defaults:',
+        error instanceof Error ? error.message : error,
+      );
+    }
   }
-  let companionSettings;
-  try {
-    companionSettings = await createSettingsClient(localSettings.companion).read();
-  } catch (error) {
-    console.warn(
-      '[autoSend] could not fetch companion settings:',
-      error instanceof Error ? error.message : error,
-    );
-    return;
-  }
-  const autoSendOptIn = companionSettings.autoSendOptIn;
 
   // Find the chat tab matching the thread URL — required to
   // chrome.tabs.sendMessage. If the tab isn't open we abort with a
@@ -380,7 +383,7 @@ const runAutoSendDrain = async (threadId: string): Promise<void> => {
       provider,
       threadAutoSendEnabled: true,
       autoSendOptIn,
-      screenShareSafeMode: companionSettings.screenShareSafeMode,
+      screenShareSafeMode,
     });
     if (!verdict.ok) {
       // Preflight blocked — log + stop the drain so the user sees the
