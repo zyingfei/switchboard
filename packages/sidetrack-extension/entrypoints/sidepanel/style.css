@@ -1865,6 +1865,25 @@ button:disabled {
   cursor: not-allowed;
 }
 
+/* Per-thread auto-send toggle — appears on the thread row only when
+   the thread has pending queued follow-ups. The "on" variant gets
+   ink-on-paper emphasis so it's obvious which threads are draining
+   themselves into the live chat. */
+.thread-autosend {
+  border: var(--hair);
+  border-radius: var(--rad-s);
+  padding: 1px var(--r2);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+  color: var(--ink-3);
+}
+.thread-autosend.on {
+  background: var(--ink);
+  color: var(--paper-light);
+  border-color: var(--ink);
+}
+
 /* Settings: "Connect companion →" CTA shown when running local-only.
    Sits between the vault-path field and the auto-track switch. */
 .settings-cta-row {

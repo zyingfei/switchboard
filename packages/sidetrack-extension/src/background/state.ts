@@ -179,6 +179,7 @@ export const upsertLocalThread = async (
     parentThreadId: input.parentThreadId ?? existing?.parentThreadId,
     parentTitle: input.parentTitle ?? existing?.parentTitle,
     lastTurnRole: input.lastTurnRole ?? existing?.lastTurnRole,
+    autoSendEnabled: existing?.autoSendEnabled,
   };
   await storageSet({
     [THREADS_KEY]: [
@@ -395,6 +396,29 @@ export const updateLocalReminder = async (
     return updated;
   });
   await storageSet({ [REMINDERS_KEY]: next });
+  return updated;
+};
+
+// Per-thread auto-send opt-in. Independent of the per-provider gate
+// in companionSettings.autoSendOptIn — both must be true for the
+// drain to actually fire (see docs/proposals/auto-send-queue.md).
+export const setThreadAutoSend = async (
+  threadId: string,
+  enabled: boolean,
+): Promise<TrackedThread | undefined> => {
+  const current = await readThreads();
+  let updated: TrackedThread | undefined;
+  const next = current.map((thread) => {
+    if (thread.bac_id !== threadId) {
+      return thread;
+    }
+    updated = { ...thread, autoSendEnabled: enabled };
+    return updated;
+  });
+  if (updated === undefined) {
+    return undefined;
+  }
+  await storageSet({ [THREADS_KEY]: next });
   return updated;
 };
 
