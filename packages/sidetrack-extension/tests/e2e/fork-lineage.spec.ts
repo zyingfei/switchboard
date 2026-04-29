@@ -23,7 +23,7 @@ test('fork lineage: a captured thread linked to a tracked parent renders the "â†
 
   try {
     fixtureServer = await startProviderFixtureServer();
-    runtime = await launchExtensionRuntime();
+    runtime = await launchExtensionRuntime({ forceLocalProfile: true });
 
     const seederPage = await runtime.context.newPage();
     await seederPage.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {

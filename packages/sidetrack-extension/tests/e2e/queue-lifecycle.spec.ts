@@ -24,7 +24,7 @@ test('queue auto-detect: a queued follow-up flips to done after the user types i
 
   try {
     fixtureServer = await startProviderFixtureServer();
-    runtime = await launchExtensionRuntime();
+    runtime = await launchExtensionRuntime({ forceLocalProfile: true });
 
     // The side-panel preview page is a real extension page; loading it
     // gives us a chrome.* context we can use to seed storage before the

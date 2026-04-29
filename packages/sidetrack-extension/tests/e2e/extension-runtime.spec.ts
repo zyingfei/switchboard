@@ -57,7 +57,7 @@ test('loads the MV3 bundle in Playwright Chromium and captures provider fixtures
   try {
     companion = await startTestCompanion();
     fixtureServer = await startProviderFixtureServer();
-    runtime = await launchExtensionRuntime();
+    runtime = await launchExtensionRuntime({ forceLocalProfile: true });
 
     const sidepanelPage = await runtime.context.newPage();
     await sidepanelPage.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
