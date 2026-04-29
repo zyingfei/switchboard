@@ -27,6 +27,10 @@ export const messageTypes = {
   moveThread: 'sidetrack.thread.move',
   updateThreadTracking: 'sidetrack.thread.tracking.update',
   setThreadAutoSend: 'sidetrack.thread.autoSend.set',
+  // Background asks the content script in the chat tab to type+send
+  // a single queue item's text. Content script reports back when the
+  // AI is done responding (Stop button → Send button transition).
+  autoSendItem: 'sidetrack.queue.autoSend.item',
   restoreThreadTab: 'sidetrack.thread.restore-tab',
   queueFollowUp: 'sidetrack.queue.create',
   updateQueueItem: 'sidetrack.queue.update',
