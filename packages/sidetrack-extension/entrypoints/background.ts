@@ -372,6 +372,61 @@ const findTabForThread = async (
   return { reason: 'Open the chat tab; auto-send needs the conversation visible to type into.' };
 };
 
+// Chrome's exact error string when sendMessage targets a tab with
+// no live content script — happens when the user reloaded the
+// extension but didn't reload the chat tab, so the new content
+// script never injected itself into the existing page. We catch
+// this specifically and recover with chrome.scripting.executeScript.
+const RECEIVER_MISSING = /Receiving end does not exist/i;
+
+const ensureContentScriptInTab = async (tabId: number): Promise<{ ok: boolean; error?: string }> => {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content-scripts/content.js'],
+    });
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : 'Could not inject content script.',
+    };
+  }
+};
+
+// Send `message` to the tab's content script, recovering once from
+// the receiver-missing condition by injecting content.js then
+// retrying. Any other error is returned as-is.
+const sendToContentScriptWithRecovery = async (
+  tabId: number,
+  message: unknown,
+): Promise<{ ok: boolean; data?: unknown; error?: string }> => {
+  const attempt = async (): Promise<{ ok: boolean; data?: unknown; error?: string }> => {
+    try {
+      const data: unknown = await chrome.tabs.sendMessage(tabId, message);
+      return { ok: true, data };
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : 'Content script is not reachable.',
+      };
+    }
+  };
+
+  const first = await attempt();
+  if (first.ok || !RECEIVER_MISSING.test(first.error ?? '')) {
+    return first;
+  }
+  const inject = await ensureContentScriptInTab(tabId);
+  if (!inject.ok) {
+    return {
+      ok: false,
+      error: `${first.error ?? 'Receiving end does not exist.'} Tried to recover but: ${inject.error ?? 'inject failed'}.`,
+    };
+  }
+  return await attempt();
+};
+
 // Drains pending queue items for `threadId` into the provider chat
 // one at a time, gated by the §24.10 preflight. Triggered when:
 //
@@ -455,22 +510,20 @@ const runAutoSendDrain = async (threadId: string): Promise<boolean> => {
       mutated = true;
       return mutated;
     }
+    const dispatch = await sendToContentScriptWithRecovery(tabLookup.tabId, {
+      type: messageTypes.autoSendItem,
+      text: verdict.text,
+      perItemTimeoutMs: 90_000,
+    });
     let result: { ok: boolean; error?: string };
-    try {
-      const raw: unknown = await chrome.tabs.sendMessage(tabLookup.tabId, {
-        type: messageTypes.autoSendItem,
-        text: verdict.text,
-        perItemTimeoutMs: 90_000,
-      });
+    if (!dispatch.ok) {
+      result = { ok: false, error: dispatch.error ?? 'Content script is not reachable.' };
+    } else {
+      const raw = dispatch.data;
       result =
         typeof raw === 'object' && raw !== null && 'ok' in raw
           ? (raw as { ok: boolean; error?: string })
           : { ok: false, error: 'Content script returned an unexpected response.' };
-    } catch (error) {
-      result = {
-        ok: false,
-        error: error instanceof Error ? error.message : 'Content script is not reachable.',
-      };
     }
     if (!result.ok) {
       const reason = result.error ?? 'Content script send failed.';
