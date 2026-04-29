@@ -2709,6 +2709,32 @@ button.thread-queued:focus-visible {
 }
 
 /* =====================================================
+   Lifecycle pills (Unread reply / Waiting on AI / etc.)
+   ===================================================== */
+.lifecycle-pill {
+  margin-left: auto;
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--rule-soft, #e5ddc9);
+  background: var(--paper-light, #fbf7ee);
+  color: var(--ink-3, #7a7269);
+  white-space: nowrap;
+}
+.lifecycle-pill.signal {
+  border-color: var(--signal-tint, #fed7aa);
+  background: var(--signal-bg, #fff7ed);
+  color: var(--signal, #c2410c);
+}
+.lifecycle-pill.amber {
+  border-color: var(--amber-tint, #fef3c7);
+  background: var(--amber-bg, #fffbeb);
+  color: var(--amber, #a16207);
+}
+
+/* =====================================================
    Thread lineage (forks / branched-from)
    ===================================================== */
 .thread-lineage {

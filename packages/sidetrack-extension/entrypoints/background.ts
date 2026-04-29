@@ -29,6 +29,7 @@ import {
   createLocalReminder,
   createLocalWorkstream,
   deleteLocalCaptureNote,
+  markQueueItemsDoneFromTurns,
   readThreads,
   readSettings,
   recordSelectorCanary,
@@ -135,6 +136,7 @@ const sendToCompanion = async (
   );
   const trackingMode: ThreadUpsert['trackingMode'] =
     event.provider === 'unknown' || !settings.autoTrack ? 'manual' : 'auto';
+  const lastTurnRole = event.turns.at(-1)?.role;
   const thread: ThreadUpsert = {
     bac_id: eventResult.bac_id,
     provider: event.provider,
@@ -147,6 +149,7 @@ const sendToCompanion = async (
     tags: [],
     tabSnapshot: event.tabSnapshot,
     ...parentLink,
+    ...(lastTurnRole === undefined ? {} : { lastTurnRole }),
   };
   const threadResult = await client.upsertThread(thread);
   await upsertLocalThread(thread, threadResult);
@@ -161,6 +164,12 @@ const sendToCompanion = async (
     const reminderResult = await client.createReminder(reminder);
     await createLocalReminder(reminder, reminderResult);
   }
+  // Auto-resolve queued follow-ups whose text appears in the captured user
+  // turns — the user copied + sent them, so the queue item is fulfilled.
+  const recentUserTexts = event.turns
+    .filter((turn) => turn.role === 'user')
+    .map((turn) => turn.text);
+  await markQueueItemsDoneFromTurns(threadResult.bac_id, recentUserTexts);
   await recordSelectorCanary(event);
   return threadResult;
 };
@@ -192,7 +201,8 @@ const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
   const parentLink = resolveParentFromForkSource(event, allThreads);
   const trackingMode: ThreadUpsert['trackingMode'] =
     event.provider === 'unknown' || !settings.autoTrack ? 'manual' : 'auto';
-  await upsertLocalThread({
+  const lastTurnRole = event.turns.at(-1)?.role;
+  const upserted = await upsertLocalThread({
     provider: event.provider,
     threadId: event.threadId,
     threadUrl: event.threadUrl,
@@ -203,7 +213,14 @@ const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
     tags: [],
     tabSnapshot: event.tabSnapshot,
     ...parentLink,
+    ...(lastTurnRole === undefined ? {} : { lastTurnRole }),
   });
+  // Auto-resolve queued follow-ups whose text appears in the captured user
+  // turns — same logic as sendToCompanion but for the local-only path.
+  const recentUserTexts = event.turns
+    .filter((turn) => turn.role === 'user')
+    .map((turn) => turn.text);
+  await markQueueItemsDoneFromTurns(upserted.bac_id, recentUserTexts);
   const lastTurn = event.turns.at(-1);
   if (existing !== undefined && lastTurn?.role === 'assistant') {
     await createLocalReminder({

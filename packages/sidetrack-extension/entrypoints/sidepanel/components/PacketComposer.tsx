@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Modal } from './Modal';
 import { Icons } from './icons';
 
@@ -36,11 +36,22 @@ export interface ComposedPacket {
   readonly redactedItems: readonly { readonly kind: string; readonly count: number }[];
 }
 
+export interface PacketComposerTurn {
+  readonly role: 'user' | 'assistant' | 'system' | 'unknown';
+  readonly text: string;
+  readonly capturedAt?: string;
+}
+
 export interface PacketComposerScope {
   readonly label: string;
   readonly meta?: string;
   readonly sourceThreadId?: string;
   readonly workstreamId?: string;
+  readonly threadUrl?: string;
+  readonly providerLabel?: string;
+  // Recent turns from the source thread, oldest → newest. The composer's
+  // "Include last N turns" picker walks from the end of this list.
+  readonly availableTurns?: readonly PacketComposerTurn[];
 }
 
 export interface PacketComposerProps {
@@ -49,7 +60,6 @@ export interface PacketComposerProps {
   readonly defaultTitle?: string;
   readonly defaultBody?: string;
   readonly scope?: PacketComposerScope;
-  readonly tokenEstimate?: number;
   readonly tokenLimit?: number;
   readonly redactedItems?: readonly { readonly kind: string; readonly count: number }[];
   readonly onCancel: () => void;
@@ -63,6 +73,15 @@ const KIND_LABELS: Record<PacketKind, string> = {
   research_packet: 'Research Packet',
   coding_agent_packet: 'Coding Agent Packet',
   notebook_export: 'Notebook Export',
+};
+
+const KIND_HELP: Record<PacketKind, string> = {
+  context_pack:
+    'Generic context bundle. Use when handing a thread to another AI for "catch me up".',
+  research_packet: 'Targeted research ask. Pick a sub-template for the framing.',
+  coding_agent_packet:
+    'For Claude Code / Codex / Cursor — file-aware handoff with acceptance criteria.',
+  notebook_export: 'Markdown export with frontmatter, ready for Obsidian / Notion.',
 };
 
 const TEMPLATE_LABELS: Record<ResearchTemplate, string> = {
@@ -84,20 +103,12 @@ const TARGET_LABELS: Record<DispatchTarget, string> = {
   markdown: 'Markdown',
 };
 
-const DEFAULT_BODY = `# Context Pack: Sidetrack / MVP PRD
+const FALLBACK_BODY = `# Context Pack
 
-## Goal
+## Scope
 …
 
-## Active decisions
-- [[Companion install path — HTTP loopback]]
-- [[Per-workstream privacy flag]]
-
-## Relevant threads
-- claude · "Side-panel state machine review"
-- chatgpt · "PRD §24.10 wording"
-
-## Sources
+## Recent context
 …
 
 ## Open questions
@@ -108,18 +119,164 @@ const DEFAULT_SCOPE: PacketComposerScope = {
   meta: '3 threads · 2 queued · 1 closed',
 };
 
+const TURN_TEXT_CAP = 1200;
+
+const renderTurnBlock = (turn: PacketComposerTurn): string => {
+  const roleHeader = turn.role === 'assistant' ? '### Assistant' : '### User';
+  const text =
+    turn.text.length > TURN_TEXT_CAP ? `${turn.text.slice(0, TURN_TEXT_CAP)}…` : turn.text;
+  return `${roleHeader}\n${text}`;
+};
+
+const renderTurnsMarkdown = (turns: readonly PacketComposerTurn[], count: number): string => {
+  if (count <= 0 || turns.length === 0) {
+    return '_No turns included._';
+  }
+  const slice = turns.slice(Math.max(0, turns.length - count));
+  return slice.map(renderTurnBlock).join('\n\n');
+};
+
+const threadInfoLine = (scope: PacketComposerScope): string => {
+  const provider = scope.providerLabel ?? 'AI thread';
+  if (scope.threadUrl !== undefined) {
+    return `${provider} · ${scope.threadUrl}`;
+  }
+  return provider;
+};
+
+const buildContextPack = (title: string, scope: PacketComposerScope, turnsMd: string): string =>
+  `# Context Pack: ${title}
+
+## Scope
+${threadInfoLine(scope)}
+
+## Recent thread context
+${turnsMd}
+
+## Open questions
+…`;
+
+const buildResearchPacket = (
+  title: string,
+  template: ResearchTemplate,
+  scope: PacketComposerScope,
+  turnsMd: string,
+): string => {
+  const head = `# Research request: ${title}\n\n## Source\n${threadInfoLine(scope)}`;
+  const ctx = `## Recent context\n${turnsMd}`;
+  if (template === 'web_to_ai_checklist') {
+    return `${head}
+
+## Pre-flight checklist for the receiving AI
+- [ ] Verify the conclusion against the original source
+- [ ] Note any framework versions / dates the source assumes
+- [ ] Flag if the question has shifted since first ask
+- [ ] Distinguish what was asserted vs cited
+
+${ctx}
+
+## Ask
+…`;
+  }
+  if (template === 'resume_tech_stack') {
+    return `# Tech-stack extraction: ${title}
+
+## Source
+${threadInfoLine(scope)}
+
+${ctx}
+
+## Goal
+Pull the technologies, frameworks, and tools mentioned above.
+Output as a comma-separated list grouped by category
+(frontend / backend / ops / data / ml).`;
+  }
+  if (template === 'latest_developments_radar') {
+    return `# What's new since: ${title}
+
+## Baseline understanding (from source thread)
+${turnsMd}
+
+## Ask
+Surface developments, releases, breaking changes, or new tools
+in this space published in the last 30 days. Cite sources.`;
+  }
+  return `${head}
+
+${ctx}
+
+## Ask
+…`;
+};
+
+const buildCodingAgentPacket = (
+  title: string,
+  scope: PacketComposerScope,
+  turnsMd: string,
+): string =>
+  `# Coding handoff: ${title}
+
+## Source thread
+${threadInfoLine(scope)}
+
+## Recent context
+${turnsMd}
+
+## Files / modules involved
+…
+
+## Acceptance criteria
+- [ ] …
+- [ ] …
+
+## Constraints
+- Do not modify unrelated files.
+- Run the existing test suite before reporting done.`;
+
+const buildNotebookExport = (
+  title: string,
+  scope: PacketComposerScope,
+  turnsMd: string,
+): string => {
+  const today = new Date().toISOString().slice(0, 10);
+  return `---
+title: ${title}
+created: ${today}
+source: ${scope.threadUrl ?? '(unknown)'}
+provider: ${scope.providerLabel ?? '(unknown)'}
+---
+
+# ${title}
+
+${turnsMd}`;
+};
+
+const buildBody = (
+  kind: PacketKind,
+  template: ResearchTemplate,
+  scope: PacketComposerScope,
+  title: string,
+  includeTurnCount: number,
+): string => {
+  const turnsMd = renderTurnsMarkdown(scope.availableTurns ?? [], includeTurnCount);
+  if (kind === 'context_pack') return buildContextPack(title, scope, turnsMd);
+  if (kind === 'coding_agent_packet') return buildCodingAgentPacket(title, scope, turnsMd);
+  if (kind === 'notebook_export') return buildNotebookExport(title, scope, turnsMd);
+  return buildResearchPacket(title, template, scope, turnsMd);
+};
+
+// Char-count / 4 — same heuristic the companion uses, so the dispatch
+// confirm modal won't disagree by more than rounding.
+const estimateTokens = (text: string): number => Math.ceil(text.length / 4);
+
 export function PacketComposer({
   defaultKind = 'research_packet',
   defaultTemplate = 'web_to_ai_checklist',
   defaultTitle,
-  defaultBody = DEFAULT_BODY,
+  defaultBody,
   scope = DEFAULT_SCOPE,
-  tokenEstimate = 4200,
   tokenLimit = 200_000,
-  redactedItems = [
-    { kind: 'GitHub token', count: 1 },
-    { kind: 'Email', count: 1 },
-  ],
+  redactedItems = [],
   onCancel,
   onCopy,
   onSave,
@@ -128,47 +285,68 @@ export function PacketComposer({
   const [kind, setKind] = useState<PacketKind>(defaultKind);
   const [template, setTemplate] = useState<ResearchTemplate>(defaultTemplate);
   const [target, setTarget] = useState<DispatchTarget | null>(null);
-  const [linkDepth, setLinkDepth] = useState(1);
-  const [body, setBody] = useState(defaultBody);
   const initialTitle = defaultTitle ?? scope.label.replace(/^Workstream:\s*/i, '').trim();
   const [title, setTitle] = useState(initialTitle);
 
+  const availableTurns = scope.availableTurns ?? [];
+  const maxTurns = availableTurns.length;
+  const [includeTurnCount, setIncludeTurnCount] = useState(Math.min(maxTurns, 4));
+  // Stop auto-rebuilding the body once the user has hand-edited it.
+  const [bodyManuallyEdited, setBodyManuallyEdited] = useState(defaultBody !== undefined);
+  const [body, setBody] = useState(
+    defaultBody ??
+      (maxTurns > 0
+        ? buildBody(defaultKind, defaultTemplate, scope, initialTitle, Math.min(maxTurns, 4))
+        : FALLBACK_BODY),
+  );
+
+  // Keep includeTurnCount in range when the available-turns prop changes.
+  const lastMaxRef = useRef(maxTurns);
+  useEffect(() => {
+    if (maxTurns !== lastMaxRef.current) {
+      lastMaxRef.current = maxTurns;
+      setIncludeTurnCount((current) => Math.min(current, maxTurns));
+    }
+  }, [maxTurns]);
+
+  // Rebuild body from kind/template/turns/title until the user types into
+  // the textarea — at that point we lock in their edits. We intentionally
+  // depend on flattened scope fields (not the scope object itself) since
+  // its identity churns every render.
+  const scopeKey = `${scope.threadUrl ?? ''}::${scope.providerLabel ?? ''}::${scope.label}::${String(maxTurns)}`;
+  useEffect(() => {
+    if (bodyManuallyEdited) return;
+    setBody(buildBody(kind, template, scope, title.trim() || initialTitle, includeTurnCount));
+  }, [bodyManuallyEdited, kind, template, title, initialTitle, includeTurnCount, scope, scopeKey]);
+
+  const tokenEstimate = useMemo(() => estimateTokens(body), [body]);
   const tokenPct = Math.round((tokenEstimate / tokenLimit) * 100);
   const tokenLevel: 'green' | 'amber' | 'over' =
     tokenPct < 80 ? 'green' : tokenPct < 100 ? 'amber' : 'over';
 
-  const buildPacket = (selectedTarget: DispatchTarget): ComposedPacket => {
-    const packet: ComposedPacket = {
-      kind,
-      template: kind === 'research_packet' ? template : null,
-      target: selectedTarget,
-      title: title.trim().length > 0 ? title.trim() : initialTitle,
-      body,
-      scopeLabel: scope.label,
-      tokenEstimate,
-      redactedItems,
-      ...(scope.sourceThreadId !== undefined ? { sourceThreadId: scope.sourceThreadId } : {}),
-      ...(scope.workstreamId !== undefined ? { workstreamId: scope.workstreamId } : {}),
-    };
-    return packet;
-  };
+  const buildPacket = (selectedTarget: DispatchTarget): ComposedPacket => ({
+    kind,
+    template: kind === 'research_packet' ? template : null,
+    target: selectedTarget,
+    title: title.trim().length > 0 ? title.trim() : initialTitle,
+    body,
+    scopeLabel: scope.label,
+    tokenEstimate,
+    redactedItems,
+    ...(scope.sourceThreadId !== undefined ? { sourceThreadId: scope.sourceThreadId } : {}),
+    ...(scope.workstreamId !== undefined ? { workstreamId: scope.workstreamId } : {}),
+  });
 
   const handleCopy = () => {
-    if (target === null) {
-      return;
-    }
+    if (target === null) return;
     onCopy(buildPacket(target));
   };
   const handleSave = () => {
-    if (target === null) {
-      return;
-    }
+    if (target === null) return;
     onSave(buildPacket(target));
   };
   const handleDispatch = () => {
-    if (target === null) {
-      return;
-    }
+    if (target === null) return;
     onDispatch(buildPacket(target));
   };
 
@@ -182,6 +360,7 @@ export function PacketComposer({
               key={k}
               type="button"
               className={'pill ' + (kind === k ? 'on' : '')}
+              title={KIND_HELP[k]}
               onClick={() => {
                 setKind(k);
               }}
@@ -190,6 +369,7 @@ export function PacketComposer({
             </button>
           ))}
         </div>
+        <p className="composer-help mono">{KIND_HELP[kind]}</p>
       </div>
 
       {kind === 'research_packet' ? (
@@ -237,23 +417,34 @@ export function PacketComposer({
             ) : null}
           </div>
           <div className="scope-options">
-            <label className="check-row">
-              <input type="checkbox" defaultChecked />
-              <span>Include queued asks</span>
-            </label>
             <label className="slider-row">
-              <span>Link depth</span>
+              <span>Include last</span>
               <input
                 type="range"
                 min={0}
-                max={2}
-                value={linkDepth}
+                max={Math.max(0, maxTurns)}
+                value={includeTurnCount}
+                disabled={maxTurns === 0}
                 onChange={(e) => {
-                  setLinkDepth(Number(e.target.value));
+                  setIncludeTurnCount(Number(e.target.value));
                 }}
               />
-              <span className="mono">{linkDepth}</span>
+              <span className="mono">
+                {String(includeTurnCount)} / {String(maxTurns)} turn
+                {maxTurns === 1 ? '' : 's'}
+              </span>
             </label>
+            {bodyManuallyEdited ? (
+              <button
+                type="button"
+                className="btn-link mono"
+                onClick={() => {
+                  setBodyManuallyEdited(false);
+                }}
+              >
+                Reset body to template
+              </button>
+            ) : null}
           </div>
         </div>
       </div>
@@ -277,14 +468,17 @@ export function PacketComposer({
       </div>
 
       <div className="composer-preview">
-        <div className="preview-head mono">packet body</div>
+        <div className="preview-head mono">
+          packet body {bodyManuallyEdited ? '· manually edited' : '· auto from template'}
+        </div>
         <textarea
           className="preview-body mono packet-body-input"
           value={body}
           onChange={(e) => {
             setBody(e.target.value);
+            if (!bodyManuallyEdited) setBodyManuallyEdited(true);
           }}
-          rows={10}
+          rows={12}
         />
       </div>
 
@@ -295,15 +489,21 @@ export function PacketComposer({
           </span>
           <span className="mono">({tokenPct}%)</span>
         </div>
-        <div className="redaction-summary">
-          <em>
-            Redacted {redactedItems.reduce((sum, r) => sum + r.count, 0)} items:{' '}
-            {redactedItems.map((r) => `${String(r.count)} ${r.kind}`).join(', ')}
-          </em>
-          <button type="button" className="reveal-link mono">
-            [reveal]
-          </button>
-        </div>
+        {redactedItems.length === 0 ? (
+          <div className="redaction-summary">
+            <em>No sensitive items detected.</em>
+          </div>
+        ) : (
+          <div className="redaction-summary">
+            <em>
+              Redacted {redactedItems.reduce((sum, r) => sum + r.count, 0)} items:{' '}
+              {redactedItems.map((r) => `${String(r.count)} ${r.kind}`).join(', ')}
+            </em>
+            <button type="button" className="reveal-link mono">
+              [reveal]
+            </button>
+          </div>
+        )}
       </div>
 
       <div className="modal-foot">

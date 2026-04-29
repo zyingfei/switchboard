@@ -48,6 +48,9 @@ export interface TrackedThread {
   // soft fallback when the parent isn't tracked yet.
   readonly parentThreadId?: string;
   readonly parentTitle?: string;
+  // Role of the most-recent captured turn — drives the lifecycle pill
+  // (Waiting on AI vs You replied last vs Unread reply).
+  readonly lastTurnRole?: 'user' | 'assistant' | 'system' | 'unknown';
 }
 
 export interface WorkstreamNode {

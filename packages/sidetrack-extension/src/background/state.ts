@@ -178,6 +178,7 @@ export const upsertLocalThread = async (
     tabSnapshot: input.tabSnapshot ?? existing?.tabSnapshot,
     parentThreadId: input.parentThreadId ?? existing?.parentThreadId,
     parentTitle: input.parentTitle ?? existing?.parentTitle,
+    lastTurnRole: input.lastTurnRole ?? existing?.lastTurnRole,
   };
   await storageSet({
     [THREADS_KEY]: [
@@ -289,6 +290,54 @@ export const updateLocalQueueItem = async (
   });
   await storageSet({ [QUEUE_ITEMS_KEY]: next });
   return updated;
+};
+
+const normalizeForMatch = (text: string): string =>
+  text
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/[^\p{L}\p{N} ]/gu, '')
+    .trim();
+
+// After a capture lands, scan pending queue items for the thread and flip
+// any whose text appears as a substring of a recent USER turn to done.
+// Returns the bac_ids that were transitioned (caller broadcasts).
+export const markQueueItemsDoneFromTurns = async (
+  threadId: string,
+  recentUserTexts: readonly string[],
+): Promise<readonly string[]> => {
+  if (recentUserTexts.length === 0) {
+    return [];
+  }
+  const haystacks = recentUserTexts.map(normalizeForMatch).filter((value) => value.length >= 4);
+  if (haystacks.length === 0) {
+    return [];
+  }
+  const current = await readQueueItems();
+  const timestamp = new Date().toISOString();
+  const transitioned: string[] = [];
+  const next = current.map((item) => {
+    if (item.targetId !== threadId || item.status !== 'pending') {
+      return item;
+    }
+    const needle = normalizeForMatch(item.text);
+    if (needle.length < 4) {
+      return item;
+    }
+    const matched = haystacks.some(
+      (hay) => hay === needle || hay.includes(needle) || needle.includes(hay),
+    );
+    if (!matched) {
+      return item;
+    }
+    transitioned.push(item.bac_id);
+    return { ...item, status: 'done' as const, updatedAt: timestamp };
+  });
+  if (transitioned.length === 0) {
+    return [];
+  }
+  await storageSet({ [QUEUE_ITEMS_KEY]: next });
+  return transitioned;
 };
 
 export const createLocalReminder = async (

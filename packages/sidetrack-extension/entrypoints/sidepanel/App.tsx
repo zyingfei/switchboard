@@ -163,6 +163,83 @@ const visibleThreads = (threads: readonly TrackedThread[]): readonly TrackedThre
       thread.trackingMode !== 'archived',
   );
 
+// Lifecycle pill states from the design spec — the dot color +
+// the row2 stamp word both come from this single derivation, so the
+// signal-orange pulse and the "Unread reply" text always agree.
+type LifecycleKind =
+  | 'unread-reply'
+  | 'waiting-ai'
+  | 'you-replied'
+  | 'needs-organize'
+  | 'stale'
+  | 'tab-closed'
+  | 'tracking-stopped'
+  | 'fresh';
+
+interface LifecycleResult {
+  readonly kind: LifecycleKind;
+  readonly dotClass: 'signal' | 'amber' | 'green' | 'gray';
+  readonly stampLabel: string;
+  readonly lifecyclePill?: { readonly label: string; readonly tone: 'signal' | 'amber' | 'gray' };
+}
+
+const STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+
+const deriveLifecycle = (
+  thread: TrackedThread,
+  reminders: readonly { readonly threadId: string; readonly status: string }[],
+): LifecycleResult => {
+  if (thread.status === 'restorable' || thread.status === 'closed') {
+    return { kind: 'tab-closed', dotClass: 'gray', stampLabel: 'Tab closed' };
+  }
+  if (thread.trackingMode === 'stopped') {
+    return { kind: 'tracking-stopped', dotClass: 'gray', stampLabel: 'Tracking stopped' };
+  }
+  const hasUnread = reminders.some((r) => r.threadId === thread.bac_id && r.status !== 'dismissed');
+  if (hasUnread) {
+    return {
+      kind: 'unread-reply',
+      dotClass: 'signal',
+      stampLabel: 'Last seen',
+      lifecyclePill: { label: 'Unread reply', tone: 'signal' },
+    };
+  }
+  if (thread.status === 'needs_organize') {
+    return {
+      kind: 'needs-organize',
+      dotClass: 'amber',
+      stampLabel: 'Last seen',
+      lifecyclePill: { label: 'Needs organize', tone: 'amber' },
+    };
+  }
+  const ageMs = Date.now() - Date.parse(thread.lastSeenAt);
+  if (Number.isFinite(ageMs) && ageMs > STALE_AFTER_MS) {
+    return {
+      kind: 'stale',
+      dotClass: 'gray',
+      stampLabel: 'Last seen',
+      lifecyclePill: { label: 'Stale', tone: 'gray' },
+    };
+  }
+  if (thread.lastTurnRole === 'user') {
+    return {
+      kind: 'waiting-ai',
+      dotClass: 'amber',
+      stampLabel: 'Last sent',
+      lifecyclePill: { label: 'Waiting on AI', tone: 'amber' },
+    };
+  }
+  if (thread.lastTurnRole === 'assistant') {
+    return {
+      kind: 'you-replied',
+      dotClass: 'green',
+      stampLabel: 'Last seen',
+      lifecyclePill: { label: 'You replied last', tone: 'gray' },
+    };
+  }
+  return { kind: 'fresh', dotClass: 'green', stampLabel: 'Last seen' };
+};
+
 const restoreStrategyForThread = (thread: TrackedThread): RestoreStrategy =>
   thread.tabSnapshot?.tabId === undefined ? 'reopen_url' : 'focus_open';
 
@@ -388,6 +465,44 @@ const App = () => {
       cancelled = true;
     };
   }, [reviewThread, bridgeKey, port, reviewTurnsByUrl]);
+
+  // Mirror of the review-turns fetch for the packet composer. Loads the
+  // most-recent N turns (both roles) so the composer can offer a
+  // "Include last N turns" picker with live token preview.
+  const [composeTurnsByUrl, setComposeTurnsByUrl] = useState<
+    ReadonlyMap<string, readonly CapturedTurnRecord[]>
+  >(() => new Map<string, readonly CapturedTurnRecord[]>());
+  useEffect(() => {
+    if (
+      composeThread === undefined ||
+      bridgeKey.length === 0 ||
+      composeTurnsByUrl.has(composeThread.threadUrl)
+    ) {
+      return undefined;
+    }
+    const portNumber = Number(port);
+    if (!Number.isFinite(portNumber) || portNumber <= 0) {
+      return undefined;
+    }
+    let cancelled = false;
+    const client = createTurnsClient({ port: portNumber, bridgeKey });
+    const targetUrl = composeThread.threadUrl;
+    void client
+      .recentForThread(targetUrl, { limit: 12 })
+      .then((list) => {
+        if (!cancelled) {
+          setComposeTurnsByUrl((prev) => new Map(prev).set(targetUrl, list));
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setComposeTurnsByUrl((prev) => new Map(prev).set(targetUrl, []));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [composeThread, bridgeKey, port, composeTurnsByUrl]);
 
   useEffect(() => {
     if (state.companionStatus !== 'connected' || bridgeKey.length === 0) {
@@ -936,22 +1051,14 @@ const App = () => {
   // Inline thread-row renderer reused across views.
   const renderThreadRow = (thread: TrackedThread) => {
     const isPrivate = isThreadPrivate(thread, state.workstreams);
-    const dotClass =
-      thread.status === 'restorable' || thread.status === 'closed'
-        ? 'gray'
-        : thread.trackingMode === 'stopped'
-          ? 'gray'
-          : state.reminders.some((r) => r.threadId === thread.bac_id && r.status !== 'dismissed')
-            ? 'signal'
-            : thread.status === 'needs_organize'
-              ? 'amber'
-              : 'green';
+    const lifecycle = deriveLifecycle(thread, state.reminders);
+    const { dotClass, stampLabel, lifecyclePill } = lifecycle;
     const stamp =
       thread.status === 'restorable'
         ? `Tab closed · ${formatRelative(thread.lastSeenAt)}`
         : thread.trackingMode === 'stopped'
           ? `Tracking stopped · ${formatRelative(thread.lastSeenAt)}`
-          : `Last seen · ${formatRelative(thread.lastSeenAt)}`;
+          : `${stampLabel} · ${formatRelative(thread.lastSeenAt)}`;
     const titleDisplay = isPrivate ? '[private]' : thread.title;
     const pendingQueueItems = state.queueItems.filter(
       (q) => q.targetId === thread.bac_id && q.status === 'pending',
@@ -996,6 +1103,11 @@ const App = () => {
         <div className="row2">
           <span className={'dot ' + dotClass} />
           <span className="stamp">{stamp}</span>
+          {lifecyclePill === undefined ? null : (
+            <span className={'lifecycle-pill mono ' + lifecyclePill.tone}>
+              {lifecyclePill.label}
+            </span>
+          )}
         </div>
         {parent !== undefined || thread.parentTitle !== undefined ? (
           <div className="row2 thread-lineage" title="Branched from a tracked thread">
@@ -1634,7 +1746,6 @@ const App = () => {
       {composeThread ? (
         <PacketComposer
           defaultTitle={composeThread.title}
-          defaultBody={`# ${composeThread.title}\n\n## Source thread\n${providerLabel(composeThread.provider)} · ${composeThread.threadUrl}\n\n## Context\n…\n\n## Ask\n…`}
           {...(settings !== null
             ? { defaultKind: dispatchKindToUiPacketKind(settings.defaultPacketKind) }
             : {})}
@@ -1642,6 +1753,13 @@ const App = () => {
             label: composeThread.title,
             meta: `${providerLabel(composeThread.provider)} · ${formatRelative(composeThread.lastSeenAt)}`,
             sourceThreadId: composeThread.bac_id,
+            threadUrl: composeThread.threadUrl,
+            providerLabel: providerLabel(composeThread.provider),
+            availableTurns: (composeTurnsByUrl.get(composeThread.threadUrl) ?? []).map((t) => ({
+              role: t.role,
+              text: t.text,
+              capturedAt: t.capturedAt,
+            })),
             ...(composeWorkstream !== undefined ? { workstreamId: composeWorkstream.bac_id } : {}),
           }}
           onCancel={() => {
