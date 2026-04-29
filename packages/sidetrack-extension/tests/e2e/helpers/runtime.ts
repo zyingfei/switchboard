@@ -54,11 +54,17 @@ export const launchExtensionRuntime = async (): Promise<ExtensionRuntime> => {
       : await mkdtemp(path.join(tmpdir(), 'sidetrack-extension-e2e-profile-'));
   const cleanupOnClose = persistentDir === undefined || persistentDir.length === 0;
   const headless = process.env.SIDETRACK_E2E_HEADLESS !== '0';
+  // Use Chrome stable when a persistent profile is requested (the
+  // login-test-profile script uses Chrome to bypass Google's OAuth
+  // automation block, and the same profile must be opened with the
+  // same browser to read its cookies). Default to Playwright's
+  // Chromium for the throwaway-profile path.
+  const channel = process.env.SIDETRACK_E2E_BROWSER ?? (cleanupOnClose ? 'chromium' : 'chrome');
 
   const context = await chromium.launchPersistentContext(userDataDir, {
-    channel: 'chromium',
+    channel,
     headless,
-    ignoreDefaultArgs: ['--disable-extensions'],
+    ignoreDefaultArgs: ['--disable-extensions', '--enable-automation'],
     viewport: {
       width: 1280,
       height: 900,
@@ -67,6 +73,7 @@ export const launchExtensionRuntime = async (): Promise<ExtensionRuntime> => {
       ...(headless ? ['--headless=new'] : []),
       '--no-first-run',
       '--no-default-browser-check',
+      '--disable-blink-features=AutomationControlled',
       `--disable-extensions-except=${extensionPath}`,
       `--load-extension=${extensionPath}`,
     ],

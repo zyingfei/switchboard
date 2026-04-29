@@ -33,18 +33,29 @@ const userDataDir = expandTilde(process.env.SIDETRACK_USER_DATA_DIR ?? '~/.sidet
 
 await mkdir(userDataDir, { recursive: true });
 
+// Default to Chrome stable. Google's OAuth flow refuses Playwright's
+// Chromium build ("This browser or app may not be secure"); real Chrome
+// is accepted. SIDETRACK_E2E_BROWSER=chromium overrides for users
+// without Chrome installed.
+const channel = process.env.SIDETRACK_E2E_BROWSER ?? 'chrome';
+
 console.log(`[login] extension path : ${extensionPath}`);
 console.log(`[login] user data dir  : ${userDataDir}`);
-console.log('[login] launching headed Chromium with extension loaded…');
+console.log(`[login] browser channel: ${channel}`);
+console.log('[login] launching headed browser with extension loaded…');
 
 const context = await chromium.launchPersistentContext(userDataDir, {
-  channel: 'chromium',
+  channel,
   headless: false,
-  ignoreDefaultArgs: ['--disable-extensions'],
+  // Drop --enable-automation, which is one of the flags Google's login
+  // page sniffs for. Combined with the blink-features arg below this
+  // is enough to clear the OAuth checks.
+  ignoreDefaultArgs: ['--disable-extensions', '--enable-automation'],
   viewport: { width: 1280, height: 900 },
   args: [
     '--no-first-run',
     '--no-default-browser-check',
+    '--disable-blink-features=AutomationControlled',
     `--disable-extensions-except=${extensionPath}`,
     `--load-extension=${extensionPath}`,
   ],
