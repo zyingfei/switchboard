@@ -9,6 +9,7 @@ export interface ExtensionRuntime {
   readonly extensionId: string;
   readonly extensionPath: string;
   readonly sendRuntimeMessage: (senderPage: Page, message: unknown) => Promise<unknown>;
+  readonly seedStorage: (senderPage: Page, values: Record<string, unknown>) => Promise<void>;
   readonly close: () => Promise<void>;
 }
 
@@ -73,6 +74,11 @@ export const launchExtensionRuntime = async (): Promise<ExtensionRuntime> => {
         const response = (await chrome.runtime.sendMessage(runtimeMessage)) as unknown;
         return response;
       }, message);
+    },
+    async seedStorage(senderPage: Page, values: Record<string, unknown>) {
+      await senderPage.evaluate(async (vals) => {
+        await chrome.storage.local.set(vals);
+      }, values);
     },
     async close() {
       try {

@@ -76,6 +76,7 @@ export interface ThreadUpsert {
   readonly tabSnapshot?: TabSnapshot;
   readonly parentThreadId?: string;
   readonly parentTitle?: string;
+  readonly lastTurnRole?: 'user' | 'assistant' | 'system' | 'unknown';
 }
 
 export interface CaptureNoteCreate {
