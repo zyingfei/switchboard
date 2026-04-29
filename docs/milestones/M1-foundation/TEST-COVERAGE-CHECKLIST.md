@@ -38,13 +38,15 @@ Findings:
   the banner state comes from `assertCompanionReachable()` which does
   a real status() ping — seed-settings-only produces "disconnected",
   not "connected". The spec exercises the disconnected path.
-- **A (dispatch-packet)** ❌ rejected. Codex made out-of-scope
-  production-code changes (replaced the deliberate char/4 token
-  heuristic with a cross-package `cl100k` import that would bloat the
-  side-panel bundle, and partly wired up `RecentDispatches` which
-  isn't a test concern). Synthetic spec also still failed. Reverted
-  all of A's prod changes; specs dropped pending another iteration
-  with a tighter "do not touch production code" gate.
+- **A (dispatch-packet)** — first attempt rejected (codex made
+  out-of-scope production-code changes). **Re-run with hard
+  guardrails landed** as `d78377c`. Spec passes, no prod-code
+  edits. Three real fixes applied during review:
+  - "vault: synced" not "vault: connected" (codex selector miss)
+  - The packet-composer slider initial value races the companion
+    turns fetch — test now drives the slider explicitly
+  - React onChange doesn't fire on `input.value = X`; switched to the
+    native HTMLInputElement value setter
 
 ### ⏳ Remaining (codex divide-and-conquer targets)
 
