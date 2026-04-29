@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -43,7 +43,16 @@ const waitForExtensionWorker = async (context: BrowserContext): Promise<Worker> 
 
 export const launchExtensionRuntime = async (): Promise<ExtensionRuntime> => {
   const extensionPath = readExtensionPath();
-  const userDataDir = await mkdtemp(path.join(tmpdir(), 'sidetrack-extension-e2e-profile-'));
+  // SIDETRACK_USER_DATA_DIR lets the dev pin a long-lived profile (e.g.
+  // ~/.sidetrack-test-profile) so logins to chatgpt.com / claude.ai /
+  // gemini.google.com survive across runs. When unset, every run gets a
+  // fresh tmpdir profile that's wiped on close.
+  const persistentDir = process.env.SIDETRACK_USER_DATA_DIR;
+  const userDataDir =
+    persistentDir !== undefined && persistentDir.length > 0
+      ? (await mkdir(persistentDir, { recursive: true }), persistentDir)
+      : await mkdtemp(path.join(tmpdir(), 'sidetrack-extension-e2e-profile-'));
+  const cleanupOnClose = persistentDir === undefined || persistentDir.length === 0;
   const headless = process.env.SIDETRACK_E2E_HEADLESS !== '0';
 
   const context = await chromium.launchPersistentContext(userDataDir, {
@@ -84,7 +93,9 @@ export const launchExtensionRuntime = async (): Promise<ExtensionRuntime> => {
       try {
         await context.close();
       } finally {
-        await rm(userDataDir, { recursive: true, force: true });
+        if (cleanupOnClose) {
+          await rm(userDataDir, { recursive: true, force: true });
+        }
       }
     },
   };
