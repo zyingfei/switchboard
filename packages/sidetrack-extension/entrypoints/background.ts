@@ -1,7 +1,7 @@
 import { defineBackground } from 'wxt/utils/define-background';
 
 import { captureGenericTab } from '../src/capture/genericFallback';
-import { detectProviderFromUrl } from '../src/capture/providerDetection';
+import { detectProviderFromUrl, isProviderThreadUrl } from '../src/capture/providerDetection';
 import { createCompanionClient } from '../src/companion/client';
 import type {
   CaptureEvent,
@@ -250,6 +250,17 @@ const captureTab = async (): Promise<void> => {
   const tab = await activeTab();
   if (!tab) {
     throw new Error('No active tab is available.');
+  }
+  // Reject explicit captures of known-provider URLs that aren't a chat
+  // thread — e.g. claude.ai/code, chatgpt.com root, gemini.google.com
+  // landing. Unknown providers fall through to the generic-fallback
+  // path; the user explicitly chose to track those.
+  const tabUrl = tab.url ?? '';
+  const detectedProvider = detectProviderFromUrl(tabUrl);
+  if (detectedProvider !== 'unknown' && !isProviderThreadUrl(detectedProvider, tabUrl)) {
+    throw new Error(
+      `This ${detectedProvider} page is not a chat thread. Open a specific conversation and try again.`,
+    );
   }
 
   const capturedAt = new Date().toISOString();
@@ -588,6 +599,15 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
   }
 
   if (request.type === messageTypes.autoCapture) {
+    // Defense-in-depth gate: even if a content script (or test) injects
+    // an autoCapture for a non-thread URL on a known provider, drop it
+    // silently rather than create a junk thread row.
+    if (
+      request.capture.provider !== 'unknown' &&
+      !isProviderThreadUrl(request.capture.provider, request.capture.threadUrl)
+    ) {
+      return { ok: true, state: await buildState('connected') };
+    }
     const response = await withCompanionStatus(() => storeCaptureEvent(request.capture), 'capture');
     if (response.ok) {
       void notifyCaptureSuccess(request.capture);
