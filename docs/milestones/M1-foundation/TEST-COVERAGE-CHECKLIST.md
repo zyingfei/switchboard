@@ -4,9 +4,25 @@ Live-check methodology applies to every item below: **probe DOM →
 write spec → observe → persist findings as unit tests if a bug
 surfaces**. Reference: `docs/dev-testing.md` §"Live-check methodology".
 
-## Status (2026-04-29)
+## Status (2026-04-29 — late session)
 
-### ✅ Done
+Authoritative coverage list moved to
+[`docs/dev-testing.md`](../../dev-testing.md) §"Tasks the user wants
+automated". This file now just records the methodology pattern + the
+codex divide-and-conquer outcome history.
+
+### Latest tally (as of 2026-04-29 13:10 UTC)
+
+- **28 synthetic e2e tests passing** across 18 spec files
+- **46 unit tests passing**
+- **3 live providers** (ChatGPT / Claude / Gemini) verified end-to-end
+  against real signed-in chats; lifecycle-transition roundtrip
+  verified per provider
+- All M1 P0 testable features have at least synthetic coverage; M1
+  features without UI yet (search, manual checklists, structured
+  export, selector-canary banner) deferred until implementation lands
+
+### ✅ Done (early session)
 
 - Side panel mounts; workboard renders.
 - Queue auto-detect: pending follow-up flips to `done` when text
