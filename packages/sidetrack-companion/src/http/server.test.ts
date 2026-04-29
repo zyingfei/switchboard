@@ -496,6 +496,10 @@ describe('companion HTTP server', () => {
   });
 
   it('returns a token budget warning for oversized dispatches', async () => {
+    // ~9000 distinct lowercase ASCII words — each is ≈1 cl100k token,
+    // putting us comfortably above the 8000 warning threshold without
+    // depending on the heuristic's quirks.
+    const body = Array.from({ length: 9_000 }, (_, i) => `tok${String(i)}`).join(' ');
     const result = await jsonFetch(context, `${baseUrl}/v1/dispatches`, {
       method: 'POST',
       headers: {
@@ -507,7 +511,7 @@ describe('companion HTTP server', () => {
         kind: 'other',
         target: { provider: 'other', mode: 'paste' },
         title: 'Large dispatch',
-        body: 'a'.repeat(32_001),
+        body,
       }),
     });
 

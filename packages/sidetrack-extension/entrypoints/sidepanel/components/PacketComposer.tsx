@@ -265,8 +265,10 @@ const buildBody = (
   return buildResearchPacket(title, template, scope, turnsMd);
 };
 
-// Char-count / 4 — same heuristic the companion uses, so the dispatch
-// confirm modal won't disagree by more than rounding.
+// Quick char/4 heuristic for the live composer count. The
+// authoritative number is the cl100k count the companion computes on
+// dispatch (see safety/tokenBudget.ts) — we don't ship the full BPE
+// table to the side panel just to render a live preview number.
 const estimateTokens = (text: string): number => Math.ceil(text.length / 4);
 
 export function PacketComposer({

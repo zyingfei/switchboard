@@ -123,27 +123,42 @@ pattern.
 
 ## Working with real providers (logged-in profile)
 
-When you need to drive real ChatGPT / Claude / Gemini pages — for
-example to capture a fresh DOM dump or to verify the fork-source
-detector against a live "Branched from" indicator — use a long-lived
-persistent profile so you only log in once:
+For specs that drive real chatgpt.com / claude.ai / gemini.google.com
+pages — verifying live DOM extraction, fork-source detection against a
+real "Branched from" indicator, or the dispatch flow against a live
+chat — use a long-lived Chromium profile so you only log in once.
+
+### One-time setup
 
 ```bash
-mkdir -p ~/.sidetrack-test-profile
-SIDETRACK_E2E_HEADLESS=0 \
-  SIDETRACK_USER_DATA_DIR=~/.sidetrack-test-profile \
+cd packages/sidetrack-extension
+npm run e2e:login
+```
+
+That builds the extension, opens a headed Chromium window with the
+extension loaded and the persistent profile attached
+(`~/.sidetrack-test-profile` by default), and pre-opens tabs for
+chatgpt.com / claude.ai / gemini.google.com. Log in to each one. Close
+the window when done — your cookies stay in the profile dir.
+
+Override the profile path:
+
+```bash
+SIDETRACK_USER_DATA_DIR=~/.my-test-profile npm run e2e:login
+```
+
+### Running a spec against the logged-in profile
+
+```bash
+SIDETRACK_USER_DATA_DIR=~/.sidetrack-test-profile \
+  SIDETRACK_E2E_HEADLESS=0 \
   npx playwright test tests/e2e/<your-spec>.spec.ts
 ```
 
-> The `runtime` helper currently always creates a fresh tmpdir profile;
-> if you want the env-var to take effect, edit
-> `tests/e2e/helpers/runtime.ts` `launchExtensionRuntime` to honour
-> `SIDETRACK_USER_DATA_DIR` before calling `mkdtemp`. Small follow-up;
-> not blocking real-provider runs today (you can manually point a spec
-> at a fixed dir).
-
-In the persistent profile, log into each provider once. Cookies + local
-storage survive across runs.
+`SIDETRACK_E2E_HEADLESS=0` opens the Chromium window so you can see the
+spec drive the page. The runtime helper honours
+`SIDETRACK_USER_DATA_DIR` and skips cleanup of that dir on close so
+logins persist across runs.
 
 ## Capturing a new fixture
 
