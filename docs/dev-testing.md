@@ -135,11 +135,21 @@ cd packages/sidetrack-extension
 npm run e2e:login
 ```
 
-That builds the extension, opens a headed Chromium window with the
-extension loaded and the persistent profile attached
-(`~/.sidetrack-test-profile` by default), and pre-opens tabs for
-chatgpt.com / claude.ai / gemini.google.com. Log in to each one. Close
-the window when done — your cookies stay in the profile dir.
+That builds the extension, opens a **headed Chrome stable window**
+(not Playwright's Chromium — see below) with the extension loaded and
+the persistent profile attached (`~/.sidetrack-test-profile` by
+default), and pre-opens tabs for chatgpt.com / claude.ai /
+gemini.google.com. Log in to each one. Close the window when done —
+your cookies stay in the profile dir.
+
+> **Why Chrome stable, not Chromium?** Google's OAuth flow refuses
+> Playwright's Chromium build with *"This browser or app may not be
+> secure"*. Real Chrome is accepted. The login script defaults to
+> `channel: 'chrome'`. If you don't have Chrome installed,
+> `SIDETRACK_E2E_BROWSER=chromium npm run e2e:login` falls back —
+> but Gemini login won't work and ChatGPT-via-Google-SSO won't
+> either. ChatGPT email/password and Claude email/password still
+> work in Chromium.
 
 Override the profile path:
 
@@ -155,10 +165,15 @@ SIDETRACK_USER_DATA_DIR=~/.sidetrack-test-profile \
   npx playwright test tests/e2e/<your-spec>.spec.ts
 ```
 
-`SIDETRACK_E2E_HEADLESS=0` opens the Chromium window so you can see the
-spec drive the page. The runtime helper honours
-`SIDETRACK_USER_DATA_DIR` and skips cleanup of that dir on close so
-logins persist across runs.
+`SIDETRACK_E2E_HEADLESS=0` opens the browser window so you can see the
+spec drive the page. The runtime helper:
+
+- honours `SIDETRACK_USER_DATA_DIR` and skips cleanup of that dir on
+  close so logins persist across runs;
+- **switches the channel to Chrome stable when the persistent dir is
+  set** (and stays on Chromium for the throwaway tmpdir flow), so
+  cookies you logged in with via `e2e:login` are readable. Override
+  with `SIDETRACK_E2E_BROWSER=chromium|chrome|msedge`.
 
 ## Capturing a new fixture
 
