@@ -1812,35 +1812,35 @@ button:disabled {
 .settings-archive-row {
   display: flex;
   align-items: flex-start;
-  gap: 12px;
-  padding: 8px 10px;
-  border: 1px solid var(--rule-soft);
-  border-radius: 6px;
-  background: var(--paper-light);
+  gap: var(--r3, 12px);
+  padding: var(--r2, 8px) var(--r3, 12px);
+  border: 1px solid var(--rule-soft, #e5ddc9);
+  border-radius: var(--rad-m, 6px);
+  background: var(--paper-light, #fbf7ee);
 }
 .settings-archive-meta {
   flex: 1 1 auto;
   min-width: 0;
 }
 .settings-archive-title {
-  font-family: var(--display);
+  font-family: var(--display, 'Fraunces', Georgia, serif);
   font-size: 13px;
   font-weight: 500;
-  color: var(--ink);
+  color: var(--ink, #1b1916);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .settings-archive-sub {
-  margin-top: 2px;
+  margin-top: var(--r1, 4px);
   font-size: 10.5px;
-  color: var(--ink-3);
+  color: var(--ink-3, #7a7269);
 }
 .settings-archive-actions {
   display: inline-flex;
-  gap: 12px;
+  gap: var(--r3, 12px);
   flex: 0 0 auto;
-  padding-top: 2px;
+  padding-top: var(--r1, 4px);
 }
 .settings-archive-actions .btn-link {
   font-family: var(--mono);
@@ -2716,8 +2716,8 @@ button.thread-queued:focus-visible {
   font-size: 9px;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  padding: 1px 6px;
-  border-radius: 3px;
+  padding: 1px var(--r2, 8px);
+  border-radius: var(--rad-s, 4px);
   border: 1px solid var(--rule-soft, #e5ddc9);
   background: var(--paper-light, #fbf7ee);
   color: var(--ink-3, #7a7269);
@@ -2738,12 +2738,12 @@ button.thread-queued:focus-visible {
    Thread lineage (forks / branched-from)
    ===================================================== */
 .thread-lineage {
-  margin-top: 2px;
+  margin-top: var(--r1, 4px);
   color: var(--ink-3, #7a7269);
   font-size: 10.5px;
   display: flex;
   align-items: baseline;
-  gap: 6px;
+  gap: var(--r2, 8px);
 }
 .thread-lineage .lineage-arrow {
   font-family: var(--mono, 'JetBrains Mono', ui-monospace, monospace);
@@ -2779,7 +2779,7 @@ button.btn-link.lineage-name:hover {
 .sec-head-actions {
   display: inline-flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--r3, 12px);
 }
 .sec-head-btn {
   font-family: var(--mono, 'JetBrains Mono', ui-monospace, monospace);
@@ -2796,26 +2796,27 @@ button.btn-link.lineage-name:hover {
 }
 
 .note-compose {
-  margin: 0 8px 8px;
-  padding: 8px 10px;
+  margin: 0 var(--r2, 8px) var(--r2, 8px);
+  padding: var(--r2, 8px) var(--r3, 12px);
   border: 1px solid var(--rule-soft, #e5ddc9);
-  border-radius: 6px;
+  border-radius: var(--rad-m, 6px);
   background: var(--paper-light, #fbf7ee);
   display: grid;
-  gap: 6px;
+  gap: var(--r2, 8px);
 }
 .note-compose textarea {
   width: 100%;
-  font-family: var(--display, 'Fraunces', Georgia, serif);
+  /* Body font for prose/inputs — display (Fraunces) is for headings only. */
+  font-family: var(--body, 'Source Serif 4', Georgia, serif);
   font-size: 13px;
   line-height: 1.5;
-  padding: 8px 10px;
+  padding: var(--r2, 8px) var(--r3, 12px);
   border: 1px solid var(--rule, #d4cdb8);
-  border-radius: 4px;
+  border-radius: var(--rad-s, 4px);
   background: var(--paper, #f5efe2);
   color: var(--ink, #1b1916);
   resize: vertical;
-  min-height: 60px;
+  min-height: var(--r8, 64px);
 }
 .note-compose textarea:focus {
   outline: none;
@@ -2823,7 +2824,7 @@ button.btn-link.lineage-name:hover {
 }
 .note-compose-actions {
   display: flex;
-  gap: 12px;
+  gap: var(--r3, 12px);
   font-family: var(--mono, 'JetBrains Mono', ui-monospace, monospace);
   font-size: 10.5px;
 }
@@ -2863,8 +2864,8 @@ button.btn-link.lineage-name:hover {
 }
 .capture-actions {
   display: flex;
-  gap: 12px;
-  margin-top: 2px;
+  gap: var(--r3, 12px);
+  margin-top: var(--r1, 4px);
   opacity: 0;
   transition: opacity 120ms ease;
 }

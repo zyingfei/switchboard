@@ -157,8 +157,10 @@ const attachOverCdp = async (cdpUrl: string): Promise<ExtensionRuntime> => {
       }, values);
     },
     async close() {
-      // Don't close the user's Chrome, just detach Playwright.
-      await browser.close();
+      // Don't close the user's Chrome AND don't call browser.close()
+      // — for CDP-attached browsers, close() can race with subsequent
+      // attaches in the same test run and break "no browser contexts"
+      // on tests #2+. Just let the WebSocket idle; Node exit cleans up.
     },
   };
 };
