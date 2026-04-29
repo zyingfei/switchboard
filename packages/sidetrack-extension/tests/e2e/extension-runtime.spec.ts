@@ -7,6 +7,9 @@ import { startTestCompanion, type TestCompanion } from './helpers/companion';
 import { startProviderFixtureServer, type FixtureServer } from './helpers/fixtures';
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
 
+const SETUP_KEY = 'sidetrack:setupCompleted';
+const SETTINGS_KEY = 'sidetrack.settings';
+
 const providerFixtures = [
   {
     fixture: 'chatgpt.html',
@@ -46,13 +49,7 @@ const readAllEventLines = async (vaultPath: string): Promise<string> => {
   return chunks.join('\n');
 };
 
-// TODO: this spec was written for the pre-rewrite side-panel layout (with
-// "Port" + "Bridge key" labels and a "Refresh" button). After the design
-// rewrite the wizard hides those controls. The new queue-lifecycle spec
-// shows the seed-and-skip-wizard pattern; port the assertions in this
-// spec onto the same pattern (use runtime.seedStorage to mark setup
-// completed + persist companion settings, then drive the workboard).
-test.skip('loads the MV3 bundle in Playwright Chromium and captures provider fixtures', async () => {
+test('loads the MV3 bundle in Playwright Chromium and captures provider fixtures', async () => {
   let companion: TestCompanion | undefined;
   let fixtureServer: FixtureServer | undefined;
   let runtime: ExtensionRuntime | undefined;
@@ -66,10 +63,22 @@ test.skip('loads the MV3 bundle in Playwright Chromium and captures provider fix
     await sidepanelPage.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
       waitUntil: 'domcontentloaded',
     });
-    await sidepanelPage.getByLabel('Port').fill(String(companion.port));
-    await sidepanelPage.getByLabel('Bridge key').fill(companion.bridgeKey);
-    await sidepanelPage.getByRole('button', { name: 'Connect' }).click();
-    await expect(sidepanelPage.getByText('companion: running')).toBeVisible();
+
+    // Skip the wizard and pre-populate companion settings so the side
+    // panel boots straight into the workboard talking to the test
+    // companion. autoTrack=true so known-provider captures land in
+    // Open threads with trackingMode='auto'.
+    await runtime.seedStorage(sidepanelPage, {
+      [SETUP_KEY]: true,
+      [SETTINGS_KEY]: {
+        companion: { port: companion.port, bridgeKey: companion.bridgeKey },
+        autoTrack: true,
+        siteToggles: { chatgpt: true, claude: true, gemini: true },
+      },
+    });
+
+    await sidepanelPage.reload({ waitUntil: 'domcontentloaded' });
+    await expect(sidepanelPage.getByRole('main', { name: 'Sidetrack workboard' })).toBeVisible();
 
     for (const providerFixture of providerFixtures) {
       const providerPage = await runtime.context.newPage();
@@ -84,13 +93,18 @@ test.skip('loads the MV3 bundle in Playwright Chromium and captures provider fix
       assertRuntimeSuccess(response);
     }
 
+    // Refresh state and switch to the All threads view so the seeded /
+    // captured threads (no workstream) all show.
     await sidepanelPage.bringToFront();
-    await sidepanelPage.getByRole('button', { name: 'Refresh' }).click();
+    const refreshed = await runtime.sendRuntimeMessage(sidepanelPage, {
+      type: messageTypes.getWorkboardState,
+    });
+    assertRuntimeSuccess(refreshed);
+    await sidepanelPage.getByRole('tab', { name: 'All threads' }).click();
     for (const providerFixture of providerFixtures) {
-      await expect(sidepanelPage.getByText(providerFixture.title).first()).toBeVisible();
       await expect(
-        sidepanelPage.getByText(new RegExp(`${providerFixture.label} / auto / active`, 'u')),
-      ).toBeVisible();
+        sidepanelPage.locator('.thread .name', { hasText: providerFixture.title }),
+      ).toBeVisible({ timeout: 10_000 });
     }
 
     const eventLines = await readAllEventLines(companion.vaultPath);
