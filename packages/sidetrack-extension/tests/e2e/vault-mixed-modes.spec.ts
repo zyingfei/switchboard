@@ -85,20 +85,36 @@ const attachToggleableMock = async (
     }
     if (route.request().method() === 'POST' && url.pathname === '/v1/events') {
       state.appendEventCalls += 1;
+      // parseMutationResult in src/companion/client.ts requires
+      // bac_id + revision + requestId — all three must be strings or
+      // the client throws and sendToCompanion's catch enqueues the
+      // event into the replay queue.
       await fulfillJson(route, 200, {
-        data: { revision: `rev_event_${String(state.appendEventCalls)}`, bac_id: 'bac_event_x' },
+        data: {
+          revision: `rev_event_${String(state.appendEventCalls)}`,
+          bac_id: `bac_event_${String(state.appendEventCalls)}`,
+          requestId: `req_event_${String(state.appendEventCalls)}`,
+        },
       });
       return;
     }
     if (route.request().method() === 'POST' && url.pathname === '/v1/threads') {
       await fulfillJson(route, 200, {
-        data: { revision: `rev_thread_${String(state.appendEventCalls)}`, bac_id: 'bac_thread_x' },
+        data: {
+          revision: `rev_thread_${String(state.appendEventCalls)}`,
+          bac_id: `bac_thread_${String(state.appendEventCalls)}`,
+          requestId: `req_thread_${String(state.appendEventCalls)}`,
+        },
       });
       return;
     }
     if (route.request().method() === 'POST' && url.pathname === '/v1/reminders') {
       await fulfillJson(route, 200, {
-        data: { revision: 'rev_reminder', bac_id: 'bac_reminder_x' },
+        data: {
+          revision: 'rev_reminder',
+          bac_id: 'bac_reminder_x',
+          requestId: `req_reminder_${String(state.appendEventCalls)}`,
+        },
       });
       return;
     }
@@ -213,16 +229,68 @@ test.describe('vault mixed modes (synthetic)', () => {
       expect(offlineState.queueLength).toBeGreaterThanOrEqual(1);
       expect(offlineState.queueTitles).toContain('Queued during outage');
 
-      // We deliberately stop here. The online-replay path (drain via
-      // replayQueuedCaptures triggered by the next withCompanionStatus
-      // call) is unit-tested in tests/unit/queue.test.ts where the HTTP
-      // surface can be fully mocked; layering a multi-call drain on top
-      // of Playwright route.fulfill in this spec turned out flaky
-      // because sendToCompanion fans out to /v1/events + /v1/threads +
-      // optional /v1/reminders + local writes, and any partial mock
-      // mismatch leaves the queue partially populated. The high-value
-      // assertion here is the offline → enqueue side effect, which the
-      // synthetic e2e is uniquely placed to verify.
+    } finally {
+      await runtime?.close();
+    }
+  });
+
+  test('reconnect drains the queue: offline-queued capture POSTs to /v1/events on next online request', async () => {
+    let runtime: ExtensionRuntime | undefined;
+    try {
+      runtime = await launchExtensionRuntime({ forceLocalProfile: true });
+      const state: CompanionMock = { reachable: false, appendEventCalls: 0 };
+      await attachToggleableMock(runtime.context, state);
+
+      const page = await seedAndOpenSidepanel(runtime, {
+        [SETTINGS_KEY]: connectedSettings,
+        [WORKSTREAMS_KEY]: [ws('bac_ws_drain', 'Drain suite')],
+        [THREADS_KEY]: [],
+      });
+      await page.getByRole('tab', { name: 'All threads' }).click();
+
+      // Phase 1: offline. autoCapture lands in queue.
+      await runtime.sendRuntimeMessage(page, {
+        type: messageTypes.autoCapture,
+        capture: {
+          provider: 'claude',
+          threadUrl,
+          title: 'Queued during outage',
+          capturedAt: now,
+          turns,
+        },
+      });
+      const phase1 = await page.evaluate(async (key) => {
+        const all = await chrome.storage.local.get([key]);
+        return ((all[key] ?? []) as unknown[]).length;
+      }, QUEUE_KEY);
+      expect(phase1).toBe(1);
+      // No /v1/events POSTs while offline (route.abort'd).
+      expect(state.appendEventCalls).toBe(0);
+
+      // Phase 2: companion comes back online.
+      state.reachable = true;
+
+      // Trigger replayQueuedCaptures via getWorkboardState — the
+      // simplest withCompanionStatus path that doesn't queue a NEW
+      // capture (so we can isolate drain behaviour from store
+      // behaviour).
+      await runtime.sendRuntimeMessage(page, {
+        type: messageTypes.getWorkboardState,
+      });
+
+      // Drain happened: at least 1 /v1/events POST fired (the queued
+      // event), and the queue is now empty.
+      await expect
+        .poll(
+          async () =>
+            page.evaluate(async (key) => {
+              const all = await chrome.storage.local.get([key]);
+              return ((all[key] ?? []) as unknown[]).length;
+            }, QUEUE_KEY),
+          { timeout: 10_000 },
+        )
+        .toBe(0);
+      expect(state.appendEventCalls).toBeGreaterThanOrEqual(1);
     } finally {
       await runtime?.close();
     }
