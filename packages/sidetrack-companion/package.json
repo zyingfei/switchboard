@@ -14,6 +14,7 @@
     "node": ">=22"
   },
   "dependencies": {
+    "gpt-tokenizer": "^3.4.0",
     "zod": "^4.3.6"
   },
   "scripts": {

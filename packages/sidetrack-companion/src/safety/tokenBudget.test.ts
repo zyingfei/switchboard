@@ -3,16 +3,23 @@ import { describe, expect, it } from 'vitest';
 import { estimateTokens, tokenBudgetWarningThreshold } from './tokenBudget.js';
 
 describe('estimateTokens', () => {
-  it('estimates short input by four characters per token', () => {
-    expect(estimateTokens('hello')).toBe(2);
+  it('returns 0 for empty input', () => {
+    expect(estimateTokens('')).toBe(0);
   });
 
-  it('estimates long input by rounding up', () => {
-    expect(estimateTokens('a'.repeat(32_001))).toBe(8_001);
+  it('returns the cl100k token count for ASCII text', () => {
+    // "hello" is a single token under cl100k_base.
+    expect(estimateTokens('hello')).toBe(1);
   });
 
-  it('supports the dispatch warning threshold', () => {
-    expect(estimateTokens('a'.repeat(tokenBudgetWarningThreshold * 4 + 1))).toBeGreaterThan(
+  it('returns a positive count for CJK text', () => {
+    // cl100k handles short CJK efficiently — a few common chars may
+    // collapse into 1-2 tokens — but the count should be non-zero.
+    expect(estimateTokens('你好世界')).toBeGreaterThan(0);
+  });
+
+  it('crosses the dispatch warning threshold for large inputs', () => {
+    expect(estimateTokens('a '.repeat(tokenBudgetWarningThreshold + 100))).toBeGreaterThan(
       tokenBudgetWarningThreshold,
     );
   });
