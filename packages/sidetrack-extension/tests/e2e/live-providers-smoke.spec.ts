@@ -5,20 +5,30 @@ import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime
 
 const SETUP_KEY = 'sidetrack:setupCompleted';
 
+// Specific chat URLs the spec drives — these point at real
+// conversations in the logged-in profile. Override per-provider via
+// SIDETRACK_E2E_<NAME>_URL env vars when testing against different
+// chats.
 const providers = [
   {
     name: 'ChatGPT',
-    url: 'https://chatgpt.com/',
+    url:
+      process.env.SIDETRACK_E2E_CHATGPT_URL ??
+      'https://chatgpt.com/c/69f0c125-3a04-832c-b858-02ab155e0264',
     expectedProvider: 'chatgpt',
   },
   {
     name: 'Claude',
-    url: 'https://claude.ai/',
+    url:
+      process.env.SIDETRACK_E2E_CLAUDE_URL ??
+      'https://claude.ai/chat/89195bc1-74a9-4b07-99de-ca7b4dec3465',
     expectedProvider: 'claude',
   },
   {
     name: 'Gemini',
-    url: 'https://gemini.google.com/',
+    url:
+      process.env.SIDETRACK_E2E_GEMINI_URL ??
+      'https://gemini.google.com/app/76bd837104ab1990',
     expectedProvider: 'gemini',
   },
 ] as const;
@@ -69,7 +79,9 @@ test.describe('live providers (logged-in profile)', () => {
         // side panel's "Track current tab" button does).
         const providerPage = await runtime.context.newPage();
         await providerPage.goto(provider.url, { waitUntil: 'domcontentloaded' });
-        await providerPage.waitForTimeout(2_500);
+        // Real chat pages render asynchronously — give the DOM time to
+        // settle before the content script reads it.
+        await providerPage.waitForTimeout(5_000);
         await providerPage.bringToFront();
 
         const captureResponse = await runtime.sendRuntimeMessage(sidepanel, {
