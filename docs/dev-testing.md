@@ -338,27 +338,69 @@ test.
 
 ## Tasks the user wants automated
 
-The current scope of automated coverage:
+The current scope of automated coverage (~28 synthetic e2e tests
+passing as of 2026-04-29):
 
-- ✅ Side panel mounts, workboard renders.
-- ✅ Queue auto-detect: a pending follow-up flips to `done` when its
-  text appears as a user turn in a subsequent capture.
-- ✅ Lifecycle pill state transitions (synthetic via
-  `spec-coverage.spec.ts` + live via `live-status-transitions.spec.ts`).
-- ✅ Live capture against real signed-in chats
-  (`live-providers-smoke.spec.ts`, all 3 providers).
-- ✅ Workstream privacy modes: private workstreams mask thread /
-  reminder titles while shared workstreams keep them visible
-  (`workstream-privacy.spec.ts` + `live-workstream-privacy.spec.ts`).
-- ✅ Fork lineage parity: synthetic capture resolution plus a live
-  Claude branched-thread check against explicit parent/child URLs
-  (`fork-lineage-synthetic.spec.ts` + `live-fork-lineage.spec.ts`).
-- 🔧 Provider extractors against the existing fixture set — covered by
-  the older `extension-runtime.spec.ts` which is currently skipped
-  pending a port to the post-rewrite UI (see TODO in that file).
-- ⏳ Dispatch flow end-to-end including PacketComposer template
-  rendering, last-N-turns slider, token-preview math.
-- ⏳ Coding-attach token issuance + MCP reader handshake.
-- ⏳ Companion sync (vault writes + status banner).
+### ✅ Done
 
-Pull from this list when picking the next spec to write.
+- Side panel mounts, workboard renders (`spec-coverage`,
+  `extension-runtime`).
+- Queue auto-detect: a pending follow-up flips to `done` when its
+  text appears as a user turn in a subsequent capture
+  (`queue-lifecycle`, `spec-coverage`).
+- Lifecycle pill state transitions, all 5 kinds (`spec-coverage`) +
+  the 2 stamp-only kinds tab-closed / tracking-stopped
+  (`tab-recovery`).
+- Live capture against real signed-in chats
+  (`live-providers-smoke`, all 3 providers).
+- Live status-transition roundtrip per provider
+  (`live-status-transitions`).
+- Workstream privacy modes (`workstream-privacy` +
+  `live-workstream-privacy`).
+- Workstream creation via picker + search filter
+  (`workstream-create`).
+- Fork lineage parity: synthetic capture resolution plus a live
+  Claude branched-thread check (`fork-lineage-synthetic`,
+  `fork-lineage`, `live-fork-lineage`).
+- Move thread between workstreams (`spec-coverage`).
+- Archive + restore (`archive-restore`).
+- Tracking-mode Stop / Resume toggle (`tracking-mode`).
+- Capture notes: create (`spec-coverage`), edit + delete
+  (`capture-notes`).
+- Coding-attach token mint / detach + MCP reader handshake
+  (`coding-attach` + `live-coding-attach`).
+- Companion sync banner derives from settings (`companion-sync` +
+  `live-companion-sync`).
+- Dispatch packet composer: template buttons, slider, token math,
+  cancel (`dispatch-packet`).
+- Dispatch confirm modal: §24.10 safety chain, cancel + edit
+  (`dispatch-confirm`).
+- §28 inline review composer: turns, verdict pills, save payload
+  (`review-composer`).
+- First-launch Wizard auto-pop + skip (`wizard-flow`).
+- Capture extractor regression: distinct same-text turns survive
+  dedup; adjacent same-role chunks merge (`tests/unit/extractors`).
+
+### ⏳ Remaining
+
+- ⏳ Dispatch flow end-to-end against a real companion + chat
+  (live counterpart for `dispatch-packet`).
+- ⏳ Persistent web annotation (P1 per ROADMAP — M3 work).
+- ⏳ Smart recall (vector) (P1 per ROADMAP — M3 work).
+- ⏳ Search + recent déjà-vu (lexical) — implementation isn't in
+  side panel yet.
+- ⏳ Manual checklists — data model exists (`ChecklistItem`) but no
+  side-panel UI yet.
+- ⏳ Structured download / export — implementation pending.
+- ⏳ MCP write tools with per-workstream trust — M2 scope.
+- ⏳ Selector-canary banner UI — currently surfaced only in capture
+  events; no banner UI yet.
+
+### Components not directly tested at e2e level
+
+These render through unit tests but aren't exercised by an e2e
+spec because they aren't currently mounted by `App.tsx`:
+
+- `InboundCard` — not used in App; existed for future inbound rail.
+
+Pull from the remaining list when picking the next spec to write.
