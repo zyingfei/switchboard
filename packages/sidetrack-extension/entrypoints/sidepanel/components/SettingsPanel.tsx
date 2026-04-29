@@ -56,6 +56,7 @@ export interface SettingsPanelProps {
   }) => void;
   readonly onRestoreThread: (threadId: string) => void;
   readonly onDeleteThread: (threadId: string) => void;
+  readonly onConnectCompanion?: () => void;
 }
 
 const PROVIDER_LABELS: Record<keyof SettingsValue['autoSendOptIn'], string> = {
@@ -94,6 +95,7 @@ export function SettingsPanel({
   onSaveLocalPreferences,
   onRestoreThread,
   onDeleteThread,
+  onConnectCompanion,
 }: SettingsPanelProps) {
   const initial: SettingsValue = settings ?? {
     autoSendOptIn: { chatgpt: false, claude: false, gemini: false },
@@ -202,6 +204,21 @@ export function SettingsPanel({
           The companion process picks up the vault path at startup. Edit here for the next session
           or after re-running the companion.
         </p>
+        {!companionConfigured && onConnectCompanion !== undefined ? (
+          <div className="settings-cta-row">
+            <span className="mono">
+              Currently <strong>local-only</strong> — captures stay in this browser.
+            </span>
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={onConnectCompanion}
+              disabled={busy}
+            >
+              Connect companion →
+            </button>
+          </div>
+        ) : null}
         <label className={'switch ' + (draftAutoTrack ? 'on' : '')}>
           <input
             type="checkbox"

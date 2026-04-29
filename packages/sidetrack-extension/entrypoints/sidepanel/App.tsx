@@ -1168,30 +1168,43 @@ const App = () => {
           >
             Queue
           </button>
-          <button
-            type="button"
-            className="btn-link"
-            disabled={state.companionStatus !== 'connected' || bridgeKey.length === 0}
-            title="Compose a packet from this thread and dispatch to another AI"
-            onClick={(e) => {
-              e.stopPropagation();
-              setComposeThreadId(thread.bac_id);
-            }}
-          >
-            Send
-          </button>
-          <button
-            type="button"
-            className="btn-link"
-            disabled={state.companionStatus !== 'connected' || bridgeKey.length === 0}
-            title="Review captured turns of this thread"
-            onClick={(e) => {
-              e.stopPropagation();
-              setReviewThreadId(thread.bac_id);
-            }}
-          >
-            Review
-          </button>
+          {(() => {
+            const requiresCompanion = state.companionStatus !== 'connected' || bridgeKey.length === 0;
+            const disabledReason = requiresCompanion
+              ? 'Connect a companion in Settings to enable — Send and Review need vault-stored turns'
+              : undefined;
+            return (
+              <>
+                <button
+                  type="button"
+                  className="btn-link"
+                  disabled={requiresCompanion}
+                  title={
+                    disabledReason ??
+                    'Compose a packet from this thread and dispatch to another AI'
+                  }
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setComposeThreadId(thread.bac_id);
+                  }}
+                >
+                  Send
+                </button>
+                <button
+                  type="button"
+                  className="btn-link"
+                  disabled={requiresCompanion}
+                  title={disabledReason ?? 'Review captured turns of this thread'}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setReviewThreadId(thread.bac_id);
+                  }}
+                >
+                  Review
+                </button>
+              </>
+            );
+          })()}
           <button
             type="button"
             className="btn-link"
@@ -1403,14 +1416,19 @@ const App = () => {
             title={
               state.companionStatus === 'connected'
                 ? 'Attach coding session'
-                : 'Coding-session attach needs the companion (configure in Settings)'
+                : 'Coding-session attach needs a companion — click to configure'
             }
             onClick={() => {
+              // Don't gate the icon dead — when companion is missing,
+              // route the user to the wizard so they can fix it.
+              if (state.companionStatus !== 'connected') {
+                setWizardOpen(true);
+                return;
+              }
               setCodingAttachOpen(true);
             }}
             type="button"
             aria-label="Attach coding session"
-            disabled={state.companionStatus !== 'connected'}
           >
             <svg viewBox="0 0 24 24">
               <rect x="2" y="4" width="20" height="16" rx="2" />
@@ -2030,6 +2048,13 @@ const App = () => {
           }}
           onDeleteThread={(threadId) => {
             updateTracking(threadId, 'removed');
+          }}
+          onConnectCompanion={() => {
+            // Switch from local-only → companion-backed by re-opening
+            // the wizard. Closing Settings first so the wizard isn't
+            // stacked behind it.
+            setSettingsOpen(false);
+            setWizardOpen(true);
           }}
         />
       ) : null}

@@ -27,6 +27,7 @@ import {
   createLocalCaptureNote,
   createLocalQueueItem,
   createLocalReminder,
+  dismissRemindersForThread,
   createLocalWorkstream,
   deleteLocalCaptureNote,
   markQueueItemsDoneFromTurns,
@@ -280,6 +281,16 @@ const captureTab = async (): Promise<void> => {
   };
 
   await storeCaptureEvent(event);
+
+  // Explicit captureCurrentTab means the user is actively looking at
+  // this thread — any pending "Unread reply" reminders for it are
+  // stale (the user just read it). Dismiss them so the lifecycle pill
+  // doesn't claim "Unread reply" on a thread the user is staring at.
+  const allThreads = await readThreads();
+  const tabThread = allThreads.find((t) => t.threadUrl === event.threadUrl);
+  if (tabThread !== undefined) {
+    await dismissRemindersForThread(tabThread.bac_id);
+  }
 };
 
 const replayQueuedCaptures = async (): Promise<void> => {

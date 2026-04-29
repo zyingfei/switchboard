@@ -398,6 +398,25 @@ export const updateLocalReminder = async (
   return updated;
 };
 
+// Mark every non-dismissed reminder for a thread as dismissed.
+// Called when the user explicitly captures the thread — they're
+// actively looking at it, so the "Unread reply" pill is wrong.
+export const dismissRemindersForThread = async (threadId: string): Promise<number> => {
+  const current = await readReminders();
+  let changed = 0;
+  const next = current.map((reminder) => {
+    if (reminder.threadId !== threadId || reminder.status === 'dismissed') {
+      return reminder;
+    }
+    changed += 1;
+    return { ...reminder, status: 'dismissed' as const };
+  });
+  if (changed > 0) {
+    await storageSet({ [REMINDERS_KEY]: next });
+  }
+  return changed;
+};
+
 export const recordSelectorCanary = async (event: CaptureEvent): Promise<void> => {
   if (event.provider === 'unknown' || event.selectorCanary === undefined) {
     return;
