@@ -157,23 +157,72 @@ Override the profile path:
 SIDETRACK_USER_DATA_DIR=~/.my-test-profile npm run e2e:login
 ```
 
-### Running a spec against the logged-in profile
+### Running a spec against the logged-in profile (CDP-attach flow)
+
+**Important: this uses Chrome for Testing (CfT), not regular Chrome
+stable.** Regular Chrome stable on macOS silently rejects unpacked
+extensions when launched outside Playwright, and Playwright's launch
+flags (`--use-mock-keychain`, `--remote-debugging-pipe`) collide with
+external CDP attach. CfT is Google's automation distribution and
+doesn't have either restriction.
+
+**One-time install:**
 
 ```bash
-SIDETRACK_USER_DATA_DIR=~/.sidetrack-test-profile \
-  SIDETRACK_E2E_HEADLESS=0 \
-  npx playwright test tests/e2e/<your-spec>.spec.ts
+cd packages/sidetrack-extension
+npm run e2e:install-cft
 ```
 
-`SIDETRACK_E2E_HEADLESS=0` opens the browser window so you can see the
-spec drive the page. The runtime helper:
+That downloads CfT into `./.chrome-for-testing/` (~200MB; gitignored).
 
-- honours `SIDETRACK_USER_DATA_DIR` and skips cleanup of that dir on
-  close so logins persist across runs;
-- **switches the channel to Chrome stable when the persistent dir is
-  set** (and stays on Chromium for the throwaway tmpdir flow), so
-  cookies you logged in with via `e2e:login` are readable. Override
-  with `SIDETRACK_E2E_BROWSER=chromium|chrome|msedge`.
+**Terminal A — keep CfT running with the extension + your cookies:**
+
+```bash
+cd packages/sidetrack-extension
+npm run e2e:chrome-debug
+```
+
+This launches CfT with the extension loaded, the dedicated profile
+attached (`~/.sidetrack-test-profile-cft`), and
+`--remote-debugging-port=9222` open. It also pre-opens chatgpt.com /
+claude.ai / gemini.google.com tabs. **First run, sign in to each
+provider.** Cookies persist across runs. Leave the window open;
+navigate to whichever chats you want specs to capture against.
+
+**Terminal B — run any spec, attaching over CDP:**
+
+```bash
+SIDETRACK_E2E_CDP_URL=http://localhost:9222 \
+  npx playwright test tests/e2e/live-providers-smoke.spec.ts
+```
+
+Specs detect `SIDETRACK_E2E_CDP_URL` and skip launching a new browser
+— they attach to the running Chrome via `chromium.connectOverCDP`,
+reuse its existing context, and find the extension's service worker
+that Chrome already registered.
+
+Why CDP-attach and not `launchPersistentContext` against a Chrome
+stable profile? Two reasons:
+
+1. **Cookies.** Chrome stable encrypts cookies with the macOS keychain
+   key. If Playwright launches the same profile under Chromium, the
+   cookies can't be decrypted — Claude shows the login page,
+   ChatGPT goes to the public landing, Gemini hits Cloudflare.
+2. **MV3 service workers.** Playwright + Chrome stable +
+   `--load-extension` is unreliable about exposing the extension's
+   service worker; Playwright + Chromium works but suffers (1).
+   CDP-attach hands the lifecycle to Chrome, which works.
+
+### Older tmpdir flow (still supported, no login required)
+
+```bash
+npx playwright test tests/e2e/queue-lifecycle.spec.ts
+```
+
+When neither `SIDETRACK_E2E_CDP_URL` nor `SIDETRACK_USER_DATA_DIR` is
+set, every run gets a fresh tmpdir profile under Playwright Chromium,
+wiped on close. This is what the synthetic specs (queue-lifecycle,
+fork-lineage, archive-restore, extension-runtime) use.
 
 ## Capturing a new fixture
 
