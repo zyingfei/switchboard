@@ -915,11 +915,25 @@ const App = () => {
   };
 
   // Auto-pop the wizard ONLY for true first-launch users (no setupCompleted
-  // flag AND no bridge key in storage). Existing-user migration: a non-empty
-  // bridge key from a prior install means they already configured it; don't
-  // re-pop. After "Done" or "Skip", setupCompleted=true → never re-pops.
-  const firstLaunch = stateLoaded && setupCompleted === false && bridgeKey.trim().length === 0;
-  const showWizard = firstLaunch || wizardOpen;
+  // flag AND no bridge key in storage on first mount). Existing-user
+  // migration: a non-empty bridge key from a prior install means they
+  // already configured it; don't re-pop. After "Done" or "Skip",
+  // setupCompleted=true → never re-pops.
+  //
+  // We anchor firstLaunch on the initial mount via a sticky flag —
+  // otherwise typing into the bridge-key field inside the wizard would
+  // flip firstLaunch to false and yank the wizard out from under the
+  // user mid-interaction.
+  const firstLaunchPending =
+    stateLoaded && setupCompleted === false && bridgeKey.trim().length === 0;
+  const [firstLaunchAnchored, setFirstLaunchAnchored] = useState(false);
+  useEffect(() => {
+    if (firstLaunchPending && !firstLaunchAnchored) {
+      setFirstLaunchAnchored(true);
+    }
+  }, [firstLaunchPending, firstLaunchAnchored]);
+  const inFirstLaunchMode = firstLaunchAnchored && setupCompleted === false;
+  const showWizard = inFirstLaunchMode || wizardOpen;
   const localOnlyMode = state.companionStatus === 'local-only';
   // When local-only is the chosen mode, the companion isn't expected;
   // "disconnected" only applies when a bridge key was set but the companion
@@ -984,19 +998,6 @@ const App = () => {
             ? note.workstreamId === undefined
             : note.workstreamId === currentWsId,
         );
-  const visibleReminders =
-    viewMode === 'all'
-      ? state.reminders
-      : state.reminders.filter((reminder) => {
-          const linkedThread = state.threads.find((t) => t.bac_id === reminder.threadId);
-          if (linkedThread === undefined) {
-            return currentWsId === null;
-          }
-          return currentWsId === null
-            ? linkedThread.primaryWorkstreamId === undefined
-            : linkedThread.primaryWorkstreamId === currentWsId;
-        });
-
   // Coding sessions (registered via the agent's MCP register tool) render
   // alongside chat threads in the same workstream group.
   const attachedSessions = state.codingSessions.filter((s) => s.status === 'attached');
@@ -1602,7 +1603,7 @@ const App = () => {
       <div className="sec-head">
         <span>Captures</span>
         <span className="sec-head-actions">
-          <span className="count mono">{String(scopedNotes.length + visibleReminders.length)}</span>
+          <span className="count mono">{String(scopedNotes.length)}</span>
           <button
             type="button"
             className="btn-link sec-head-btn"
@@ -1661,11 +1662,12 @@ const App = () => {
         </form>
       ) : null}
       <div className="capture-list">
-        {scopedNotes.length === 0 && visibleReminders.length === 0 ? (
+        {scopedNotes.length === 0 ? (
           <div className="capture-empty subtle">
             <p>
-              Notes you save here are scoped to the current workstream. Inbound replies from tracked
-              AI threads also land in this list. Obsidian / external imports come later.
+              Notes you save here are scoped to the current workstream. Inbound replies surface as the{' '}
+              <strong>Unread reply</strong> badge on the thread row above. Obsidian / external imports
+              come later.
             </p>
           </div>
         ) : null}
@@ -1708,27 +1710,6 @@ const App = () => {
             </div>
           </div>
         ))}
-        {visibleReminders.slice(0, 8).map((reminder) => {
-          const linkedThread = threads.find((t) => t.bac_id === reminder.threadId);
-          return (
-            <div className="capture" key={reminder.bac_id}>
-              <svg viewBox="0 0 24 24" aria-hidden>
-                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-              </svg>
-              <div>
-                <div className="text">
-                  {linkedThread !== undefined && isThreadPrivate(linkedThread, state.workstreams)
-                    ? '[private]'
-                    : (linkedThread?.title ?? 'Inbound reply')}
-                </div>
-                <div className="meta mono">
-                  {providerLabel(reminder.provider)} · {formatRelative(reminder.detectedAt)} ·{' '}
-                  {reminder.status === 'new' ? 'unread' : reminder.status}
-                </div>
-              </div>
-            </div>
-          );
-        })}
       </div>
 
       {moveThread ? (
@@ -1938,7 +1919,9 @@ const App = () => {
           bridgeKey={bridgeKey}
           companionReachable={state.companionStatus === 'connected'}
           onClose={() => {
-            if (!firstLaunch) {
+            // Lock the wizard open during first-launch (no Skip / Done
+            // pressed yet) so users can't accidentally ESC out of setup.
+            if (!inFirstLaunchMode) {
               setWizardOpen(false);
             }
           }}

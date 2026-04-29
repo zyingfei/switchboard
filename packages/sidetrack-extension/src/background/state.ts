@@ -299,9 +299,30 @@ const normalizeForMatch = (text: string): string =>
     .replace(/[^\p{L}\p{N} ]/gu, '')
     .trim();
 
+const escapeRegex = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// True if `haystack` contains `needle` as whole word(s). Word-boundary
+// match avoids false positives like "hi" matching "history" while still
+// catching short queue items like "hi" inside a captured user turn
+// "You said hi" — both \w/\W transitions hold.
+const containsAsWord = (haystack: string, needle: string): boolean => {
+  if (needle.length === 0) {
+    return false;
+  }
+  // For multi-word needles ("on demand"), word-boundary on each side
+  // works on the whole string since the inner space stays word-equivalent.
+  const pattern = new RegExp(`\\b${escapeRegex(needle)}\\b`, 'u');
+  return pattern.test(haystack);
+};
+
 // After a capture lands, scan pending queue items for the thread and flip
-// any whose text appears as a substring of a recent USER turn to done.
-// Returns the bac_ids that were transitioned (caller broadcasts).
+// any whose normalized text appears as a whole-word match in a recent
+// USER turn. Returns the bac_ids that were transitioned (caller broadcasts).
+//
+// Word-boundary match (vs raw substring) lets short queue items like
+// "hi" or "ok" auto-resolve when the user actually typed them, without
+// false-positive matches against words that happen to start the same
+// way ("history", "okay").
 export const markQueueItemsDoneFromTurns = async (
   threadId: string,
   recentUserTexts: readonly string[],
@@ -309,7 +330,7 @@ export const markQueueItemsDoneFromTurns = async (
   if (recentUserTexts.length === 0) {
     return [];
   }
-  const haystacks = recentUserTexts.map(normalizeForMatch).filter((value) => value.length >= 4);
+  const haystacks = recentUserTexts.map(normalizeForMatch).filter((value) => value.length > 0);
   if (haystacks.length === 0) {
     return [];
   }
@@ -321,12 +342,10 @@ export const markQueueItemsDoneFromTurns = async (
       return item;
     }
     const needle = normalizeForMatch(item.text);
-    if (needle.length < 4) {
+    if (needle.length === 0) {
       return item;
     }
-    const matched = haystacks.some(
-      (hay) => hay === needle || hay.includes(needle) || needle.includes(hay),
-    );
+    const matched = haystacks.some((hay) => containsAsWord(hay, needle));
     if (!matched) {
       return item;
     }

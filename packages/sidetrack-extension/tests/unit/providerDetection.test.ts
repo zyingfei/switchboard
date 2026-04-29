@@ -59,5 +59,18 @@ describe('provider detection', () => {
       expect(isProviderThreadUrl('unknown', 'https://example.com/article')).toBe(false);
       expect(isProviderThreadUrl('claude', 'not a url')).toBe(false);
     });
+
+    it('accepts localhost fixture URLs that carry an explicit ?provider= override', () => {
+      expect(
+        isProviderThreadUrl('chatgpt', 'http://127.0.0.1:4321/chatgpt.html?provider=chatgpt'),
+      ).toBe(true);
+      expect(isProviderThreadUrl('claude', 'http://localhost:4321/claude.html?provider=claude')).toBe(
+        true,
+      );
+      // Mismatched param doesn't qualify.
+      expect(
+        isProviderThreadUrl('claude', 'http://127.0.0.1:4321/anything.html?provider=chatgpt'),
+      ).toBe(false);
+    });
   });
 });

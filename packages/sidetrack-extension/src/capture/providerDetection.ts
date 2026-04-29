@@ -67,8 +67,16 @@ export const isProviderThreadUrl = (provider: ProviderId, inputUrl: string): boo
   } catch {
     return false;
   }
-  // Fixture-server URLs that carry an explicit ?provider= override
-  // qualify as long as the path looks chat-shaped.
+  // Fixture-server escape hatch: localhost / 127.0.0.1 URLs that carry
+  // an explicit ?provider= override are test fixtures and qualify
+  // regardless of their path — `tests/e2e/helpers/fixtures.ts` serves
+  // chat-shaped HTML at `/chatgpt.html` etc., not under /chat/<id>.
+  if (
+    (url.hostname === '127.0.0.1' || url.hostname === 'localhost') &&
+    providerFromFixtureParam(url) === provider
+  ) {
+    return true;
+  }
   const pathname = url.pathname;
   switch (provider) {
     case 'chatgpt':
