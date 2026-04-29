@@ -27,21 +27,95 @@ const extensionIdFromWorker = (worker: Worker): string => {
   return extensionId;
 };
 
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
 const waitForExtensionWorker = async (context: BrowserContext): Promise<Worker> => {
-  const existing = context
-    .serviceWorkers()
-    .find((worker) => worker.url().startsWith('chrome-extension://'));
+  const findWorker = (): Worker | undefined =>
+    context.serviceWorkers().find((worker) => worker.url().startsWith('chrome-extension://'));
+
+  const existing = findWorker();
   if (existing !== undefined) {
     return existing;
   }
 
-  return await context.waitForEvent('serviceworker', {
-    timeout: 15_000,
+  // Open a placeholder page so Chrome has a UI to attach to — Chrome
+  // stable on macOS sometimes defers MV3 service-worker registration
+  // until at least one page has rendered.
+  await context.newPage().then((page) => page.goto('about:blank').catch(() => undefined));
+
+  // Race the event listener and a polling fallback. Chrome stable +
+  // Playwright doesn't reliably emit the 'serviceworker' event for
+  // --load-extension MV3 workers, but the worker DOES eventually
+  // appear in context.serviceWorkers().
+  const eventWait = context.waitForEvent('serviceworker', {
+    timeout: 45_000,
     predicate: (worker) => worker.url().startsWith('chrome-extension://'),
   });
+  const pollWait = (async (): Promise<Worker> => {
+    for (let attempt = 0; attempt < 90; attempt += 1) {
+      await sleep(500);
+      const found = findWorker();
+      if (found !== undefined) {
+        return found;
+      }
+      if (attempt % 10 === 9) {
+        const allWorkers = context.serviceWorkers().map((w) => w.url());
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[runtime] still waiting for ext worker, attempt ${String(attempt + 1)}/90, ` +
+            `current workers: ${allWorkers.length === 0 ? '<none>' : JSON.stringify(allWorkers)}`,
+        );
+      }
+    }
+    throw new Error(
+      'Extension service worker never appeared in context.serviceWorkers() after 45s.',
+    );
+  })();
+  return await Promise.race([eventWait, pollWait]);
+};
+
+// Attach to a Chrome that was started outside Playwright (via
+// scripts/chrome-debug.mjs) — gives real Chrome cookies + reliable
+// MV3 service-worker registration without us having to manage the
+// browser process.
+const attachOverCdp = async (cdpUrl: string): Promise<ExtensionRuntime> => {
+  const browser = await chromium.connectOverCDP(cdpUrl);
+  const contexts = browser.contexts();
+  if (contexts.length === 0) {
+    throw new Error(`Chrome at ${cdpUrl} has no browser contexts.`);
+  }
+  const context = contexts[0];
+  const worker = await waitForExtensionWorker(context);
+  const extensionId = extensionIdFromWorker(worker);
+  const extensionPath = readExtensionPath();
+
+  return {
+    context,
+    extensionId,
+    extensionPath,
+    async sendRuntimeMessage(senderPage: Page, message: unknown) {
+      return await senderPage.evaluate(async (runtimeMessage) => {
+        const response = (await chrome.runtime.sendMessage(runtimeMessage)) as unknown;
+        return response;
+      }, message);
+    },
+    async seedStorage(senderPage: Page, values: Record<string, unknown>) {
+      await senderPage.evaluate(async (vals) => {
+        await chrome.storage.local.set(vals);
+      }, values);
+    },
+    async close() {
+      // Don't close the user's Chrome, just detach Playwright.
+      await browser.close();
+    },
+  };
 };
 
 export const launchExtensionRuntime = async (): Promise<ExtensionRuntime> => {
+  const cdpUrl = process.env.SIDETRACK_E2E_CDP_URL;
+  if (cdpUrl !== undefined && cdpUrl.length > 0) {
+    return await attachOverCdp(cdpUrl);
+  }
   const extensionPath = readExtensionPath();
   // SIDETRACK_USER_DATA_DIR lets the dev pin a long-lived profile (e.g.
   // ~/.sidetrack-test-profile) so logins to chatgpt.com / claude.ai /
