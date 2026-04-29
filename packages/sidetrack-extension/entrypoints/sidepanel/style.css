@@ -1866,22 +1866,97 @@ button:disabled {
 }
 
 /* Per-thread auto-send toggle — appears on the thread row only when
-   the thread has pending queued follow-ups. The "on" variant gets
-   ink-on-paper emphasis so it's obvious which threads are draining
-   themselves into the live chat. */
+   the thread has pending queued follow-ups. Editorial pill: muted
+   ink-on-paper when off, signal-on-paper with a pulsing dot when on.
+   The dot is the only colour signal in this row, matching the
+   provider-status dots used elsewhere in the side panel. */
 .thread-autosend {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   border: var(--hair);
   border-radius: var(--rad-s);
-  padding: 1px var(--r2);
+  padding: 1px 6px 2px;
+  background: transparent;
   font-family: var(--mono);
-  font-size: 10.5px;
-  letter-spacing: 0.02em;
+  font-size: 10px;
+  line-height: 14px;
+  letter-spacing: 0.04em;
   color: var(--ink-3);
+  cursor: pointer;
+  transition:
+    color 140ms ease,
+    background 140ms ease,
+    border-color 140ms ease;
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.thread-autosend:hover {
+  color: var(--ink);
+  border-color: var(--ink-3);
+}
+.thread-autosend:focus-visible {
+  outline: 1px solid var(--ink);
+  outline-offset: 1px;
+}
+.thread-autosend-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ink-4);
+  flex: 0 0 auto;
+}
+.thread-autosend-label {
+  text-transform: lowercase;
+}
+.thread-autosend-state {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-2);
 }
 .thread-autosend.on {
-  background: var(--ink);
-  color: var(--paper-light);
-  border-color: var(--ink);
+  background: var(--paper-deep);
+  border-color: var(--ink-3);
+  color: var(--ink);
+}
+.thread-autosend.on .thread-autosend-state {
+  color: var(--signal);
+}
+.thread-autosend.on .thread-autosend-dot {
+  background: var(--signal);
+  box-shadow: 0 0 0 0 var(--signal-tint);
+  animation: thread-autosend-pulse 1.6s ease-in-out infinite;
+}
+@keyframes thread-autosend-pulse {
+  0% {
+    box-shadow: 0 0 0 0 var(--signal-tint);
+  }
+  70% {
+    box-shadow: 0 0 0 4px transparent;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .thread-autosend.on .thread-autosend-dot {
+    animation: none;
+  }
+}
+
+/* Failure note rendered under a queue item when the auto-send drain
+   bailed (no chat tab open, preflight blocked, content-script error,
+   etc.). Small signal-tinted italic, full row width so it doesn't
+   crowd the inline Copy/Dismiss actions above it. */
+.thread-queue-error {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.45;
+  font-style: italic;
+  color: var(--signal);
 }
 
 /* Settings: "Connect companion →" CTA shown when running local-only.

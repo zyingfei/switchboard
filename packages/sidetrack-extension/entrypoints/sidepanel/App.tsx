@@ -1255,11 +1255,12 @@ const App = () => {
           {queuedCount > 0 ? (
             <button
               type="button"
-              className={'btn-link thread-autosend' + (thread.autoSendEnabled ? ' on' : '')}
+              className={'thread-autosend' + (thread.autoSendEnabled ? ' on' : '')}
+              aria-pressed={thread.autoSendEnabled === true}
               title={
                 thread.autoSendEnabled
-                  ? 'Auto-send is ON — queued items will paste-and-send into this chat one at a time'
-                  : 'Turn on auto-send to drain queued follow-ups into this chat (requires §24.10 opt-in per provider in Settings)'
+                  ? 'Auto-send on — queued items ship into this chat one at a time, waiting for each reply.'
+                  : 'Auto-send off — turn on to drain queued follow-ups into this chat (per-provider opt-in lives in Settings).'
               }
               onClick={(e) => {
                 e.stopPropagation();
@@ -1272,7 +1273,9 @@ const App = () => {
                 );
               }}
             >
-              {thread.autoSendEnabled ? '⚡ Auto-send: on' : 'Auto-send: off'}
+              <span className="thread-autosend-dot" aria-hidden />
+              <span className="thread-autosend-label">auto-send</span>
+              <span className="thread-autosend-state">{thread.autoSendEnabled ? 'on' : 'off'}</span>
             </button>
           ) : null}
         </div>
@@ -1342,6 +1345,11 @@ const App = () => {
                     Dismiss
                   </button>
                 </span>
+                {item.lastError !== undefined ? (
+                  <span className="thread-queue-error" role="status">
+                    auto-send paused — {item.lastError}
+                  </span>
+                ) : null}
               </li>
             ))}
           </ul>

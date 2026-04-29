@@ -322,28 +322,83 @@ const assertCompanionReachable = async (): Promise<'connected' | 'vault-error' |
   return status.vault === 'connected' ? 'connected' : 'vault-error';
 };
 
+// Translate a §24.10 preflight reason into a single line the user can act on.
+const preflightReasonText = (
+  reason: 'thread-toggle-off' | 'provider-opt-out' | 'screen-share-safe' | 'token-budget' | 'unsupported-provider',
+): string => {
+  switch (reason) {
+    case 'thread-toggle-off':
+      return 'Auto-send is off for this thread.';
+    case 'provider-opt-out':
+      return 'This provider is not opted in for auto-send (Settings → Auto-send).';
+    case 'screen-share-safe':
+      return 'Screen-share-safe mode is on; auto-send is paused.';
+    case 'token-budget':
+      return 'This item exceeds the auto-send token budget.';
+    case 'unsupported-provider':
+      return 'Auto-send does not support this provider.';
+  }
+};
+
+// Find the live tab that hosts a tracked thread. Try the snapshot's
+// tabId first (covers the common case where the user keeps the tab
+// open), then fall back to a URL match. chrome.tabs.query treats
+// `url` as a match pattern, so plain literal URLs may fail to match
+// when the live URL has hash/query fragments. The tabSnapshot path
+// avoids that entirely.
+const findTabForThread = async (
+  thread: TrackedThread,
+): Promise<{ tabId?: number; reason?: string }> => {
+  const snapshotId = thread.tabSnapshot?.tabId;
+  if (typeof snapshotId === 'number') {
+    try {
+      const tab = await chrome.tabs.get(snapshotId);
+      if (typeof tab.id === 'number') {
+        return { tabId: tab.id };
+      }
+    } catch {
+      // Tab was closed; fall through to URL match.
+    }
+  }
+  try {
+    const tabs = await chrome.tabs.query({ url: thread.threadUrl });
+    const found = tabs.find((tab) => typeof tab.id === 'number');
+    if (found?.id !== undefined) {
+      return { tabId: found.id };
+    }
+  } catch {
+    // chrome.tabs.query rejects on invalid match patterns — fall through.
+  }
+  return { reason: 'Open the chat tab; auto-send needs the conversation visible to type into.' };
+};
+
 // Drains pending queue items for `threadId` into the provider chat
-// one at a time, gated by the §24.10 preflight. Called after the
-// user toggles autoSendEnabled=true on a thread that has pending
-// items. Each item:
+// one at a time, gated by the §24.10 preflight. Triggered when:
+//
+//   1. The user toggles autoSendEnabled=true on a thread.
+//   2. The user adds a queue item to a thread that is already on.
+//
+// Per item:
 //
 //   1. Runs `evaluateAutoSendPreflight` — drops items that fail any
 //      of the four ship-blocking gates (per-thread toggle off,
 //      provider not opted in, screen-share-safe on, token-budget
-//      exceeded). Failed items are marked 'failed' with the reason.
+//      exceeded). The item stays 'pending' but gets `lastError` set
+//      so the side panel can surface why nothing happened.
 //   2. Sends the wrapped text to the content script in the chat tab
 //      via `messageTypes.autoSendItem`. Content script types it +
 //      clicks send and waits for the AI to finish responding.
-//   3. On success, the queue item is marked 'done'. On failure,
-//      'failed' with the content-script error.
+//   3. On success, the queue item is marked 'done'. On failure, the
+//      drain stops and the failing item carries `lastError` for the
+//      user to see and retry.
 //
-// The drain stops if any item fails — the user is signalled to look
-// before the next item ships into the chat.
-const runAutoSendDrain = async (threadId: string): Promise<void> => {
+// The drain stops on the first failure — the user should look before
+// more items would ship into the chat with the same gate failing.
+const runAutoSendDrain = async (threadId: string): Promise<boolean> => {
   const threads = await readThreads();
   const thread = threads.find((t) => t.bac_id === threadId);
   if (thread?.autoSendEnabled !== true) {
-    return;
+    return false;
   }
   const localSettings = await readSettings();
   // Per-provider opt-in + screenShareSafeMode live on the companion
@@ -366,16 +421,17 @@ const runAutoSendDrain = async (threadId: string): Promise<void> => {
     }
   }
 
-  // Find the chat tab matching the thread URL — required to
-  // chrome.tabs.sendMessage. If the tab isn't open we abort with a
-  // failed status on the first pending item.
-  const tabs = await chrome.tabs.query({ url: thread.threadUrl }).catch(() => []);
-  const tabId = tabs.find((tab) => typeof tab.id === 'number')?.id;
+  const tabLookup = await findTabForThread(thread);
 
   const pending = (await readQueueItems())
     .filter((item) => item.targetId === threadId && item.status === 'pending')
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 
+  if (pending.length === 0) {
+    return false;
+  }
+
+  let mutated = false;
   for (const item of pending) {
     const provider = thread.provider;
     const verdict = evaluateAutoSendPreflight({
@@ -386,24 +442,22 @@ const runAutoSendDrain = async (threadId: string): Promise<void> => {
       screenShareSafeMode,
     });
     if (!verdict.ok) {
-      // Preflight blocked — log + stop the drain so the user sees the
-      // failure before more items would ship through with the same gate
-      // probably failing too. Item stays 'pending' for retry after
-      // they fix the underlying setting.
-      console.warn(
-        `[autoSend] preflight blocked for ${item.bac_id}: ${verdict.blockedBy ?? 'unknown'}`,
-      );
-      return;
+      const reason = preflightReasonText(verdict.blockedBy ?? 'unsupported-provider');
+      console.warn(`[autoSend] preflight blocked for ${item.bac_id}: ${reason}`);
+      await updateLocalQueueItem(item.bac_id, { lastError: reason });
+      mutated = true;
+      return mutated;
     }
-    if (tabId === undefined) {
-      console.warn(
-        `[autoSend] no chat tab open for ${thread.threadUrl}; user must open it`,
-      );
-      return;
+    if (tabLookup.tabId === undefined) {
+      const reason = tabLookup.reason ?? 'No chat tab is open for this thread.';
+      console.warn(`[autoSend] ${reason} (${thread.threadUrl})`);
+      await updateLocalQueueItem(item.bac_id, { lastError: reason });
+      mutated = true;
+      return mutated;
     }
     let result: { ok: boolean; error?: string };
     try {
-      const raw: unknown = await chrome.tabs.sendMessage(tabId, {
+      const raw: unknown = await chrome.tabs.sendMessage(tabLookup.tabId, {
         type: messageTypes.autoSendItem,
         text: verdict.text,
         perItemTimeoutMs: 90_000,
@@ -411,21 +465,38 @@ const runAutoSendDrain = async (threadId: string): Promise<void> => {
       result =
         typeof raw === 'object' && raw !== null && 'ok' in raw
           ? (raw as { ok: boolean; error?: string })
-          : { ok: false, error: 'unexpected content-script response shape' };
+          : { ok: false, error: 'Content script returned an unexpected response.' };
     } catch (error) {
       result = {
         ok: false,
-        error: error instanceof Error ? error.message : 'content script unreachable',
+        error: error instanceof Error ? error.message : 'Content script is not reachable.',
       };
     }
     if (!result.ok) {
-      console.warn(
-        `[autoSend] content script send failed for ${item.bac_id}: ${result.error ?? 'unknown'}`,
-      );
-      return;
+      const reason = result.error ?? 'Content script send failed.';
+      console.warn(`[autoSend] send failed for ${item.bac_id}: ${reason}`);
+      await updateLocalQueueItem(item.bac_id, { lastError: reason });
+      mutated = true;
+      return mutated;
     }
-    await updateLocalQueueItem(item.bac_id, { status: 'done' });
+    await updateLocalQueueItem(item.bac_id, { status: 'done', lastError: null });
+    mutated = true;
   }
+  return mutated;
+};
+
+// Fire-and-forget wrapper: spawns the drain unawaited and broadcasts
+// the workboard once it lands so the side panel re-reads the queue.
+const triggerAutoSendDrain = (threadId: string): void => {
+  void runAutoSendDrain(threadId)
+    .then((mutated) => {
+      if (mutated) {
+        void broadcastWorkboardChanged('queue');
+      }
+    })
+    .catch((error: unknown) => {
+      console.warn('[autoSend] drain crashed:', error);
+    });
 };
 
 const currentTabThread = async (): Promise<TrackedThread | undefined> => {
@@ -566,18 +637,28 @@ const updateWorkstream = async (workstreamId: string, update: WorkstreamUpdate):
 const createQueueItem = async (item: QueueCreate): Promise<void> => {
   if (!(await isCompanionConfigured())) {
     await createLocalQueueItem(item);
-    return;
+  } else {
+    const settings = await readSettings();
+    const client = createCompanionClient(settings.companion);
+    try {
+      const result = await client.createQueueItem(
+        item,
+        idempotencyKey('queue', `${item.scope}-${item.targetId ?? 'global'}-${item.text}`),
+      );
+      await createLocalQueueItem(item, result);
+    } catch {
+      await createLocalQueueItem(item);
+    }
   }
-  const settings = await readSettings();
-  const client = createCompanionClient(settings.companion);
-  try {
-    const result = await client.createQueueItem(
-      item,
-      idempotencyKey('queue', `${item.scope}-${item.targetId ?? 'global'}-${item.text}`),
-    );
-    await createLocalQueueItem(item, result);
-  } catch {
-    await createLocalQueueItem(item);
+  // If this item targets a thread that already has Auto-send: on, the
+  // user expects it to ship immediately — they don't need to flip the
+  // toggle off and back on. Drain runs unawaited; the side panel sees
+  // the result via the queue broadcast in triggerAutoSendDrain.
+  if (item.scope === 'thread' && typeof item.targetId === 'string') {
+    const targetThread = (await readThreads()).find((t) => t.bac_id === item.targetId);
+    if (targetThread?.autoSendEnabled === true) {
+      triggerAutoSendDrain(targetThread.bac_id);
+    }
   }
 };
 
@@ -798,12 +879,13 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
   if (request.type === messageTypes.setThreadAutoSend) {
     return await withCompanionStatus(async () => {
       await setThreadAutoSend(request.threadId, request.enabled);
-      // Auto-fire the drain when the toggle flips ON. We spawn it
-      // unawaited so the runtime response returns immediately — the
-      // drain itself can take many seconds per item and the side
-      // panel polls workboard state to see progress.
+      // Auto-fire the drain when the toggle flips ON. The trigger
+      // helper spawns it unawaited so the runtime response returns
+      // immediately — the drain can take many seconds per item, and
+      // the side panel re-reads workboard state on the queue
+      // broadcast that fires when the drain completes.
       if (request.enabled) {
-        void runAutoSendDrain(request.threadId).catch(() => undefined);
+        triggerAutoSendDrain(request.threadId);
       }
     }, 'thread');
   }

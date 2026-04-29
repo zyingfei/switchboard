@@ -126,6 +126,8 @@ export interface QueueCreate {
 export interface QueueUpdate {
   readonly status?: 'pending' | 'done' | 'dismissed';
   readonly text?: string;
+  // Pass null to clear; pass a string to set; omit to leave unchanged.
+  readonly lastError?: string | null;
 }
 
 export interface CodingAttachTokenCreate {

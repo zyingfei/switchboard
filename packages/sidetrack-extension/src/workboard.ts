@@ -80,6 +80,11 @@ export interface QueueItem {
   readonly status: 'pending' | 'done' | 'dismissed';
   readonly createdAt: string;
   readonly updatedAt: string;
+  // Set when the auto-send drain tried to ship this item and bailed.
+  // Item stays 'pending' so the user can retry once they've fixed the
+  // root cause (e.g. open the chat tab, opt the provider in). Cleared
+  // on the next successful drain pass.
+  readonly lastError?: string;
 }
 
 export interface InboundReminder {
