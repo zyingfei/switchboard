@@ -915,11 +915,25 @@ const App = () => {
   };
 
   // Auto-pop the wizard ONLY for true first-launch users (no setupCompleted
-  // flag AND no bridge key in storage). Existing-user migration: a non-empty
-  // bridge key from a prior install means they already configured it; don't
-  // re-pop. After "Done" or "Skip", setupCompleted=true → never re-pops.
-  const firstLaunch = stateLoaded && setupCompleted === false && bridgeKey.trim().length === 0;
-  const showWizard = firstLaunch || wizardOpen;
+  // flag AND no bridge key in storage on first mount). Existing-user
+  // migration: a non-empty bridge key from a prior install means they
+  // already configured it; don't re-pop. After "Done" or "Skip",
+  // setupCompleted=true → never re-pops.
+  //
+  // We anchor firstLaunch on the initial mount via a sticky flag —
+  // otherwise typing into the bridge-key field inside the wizard would
+  // flip firstLaunch to false and yank the wizard out from under the
+  // user mid-interaction.
+  const firstLaunchPending =
+    stateLoaded && setupCompleted === false && bridgeKey.trim().length === 0;
+  const [firstLaunchAnchored, setFirstLaunchAnchored] = useState(false);
+  useEffect(() => {
+    if (firstLaunchPending && !firstLaunchAnchored) {
+      setFirstLaunchAnchored(true);
+    }
+  }, [firstLaunchPending, firstLaunchAnchored]);
+  const inFirstLaunchMode = firstLaunchAnchored && setupCompleted === false;
+  const showWizard = inFirstLaunchMode || wizardOpen;
   const localOnlyMode = state.companionStatus === 'local-only';
   // When local-only is the chosen mode, the companion isn't expected;
   // "disconnected" only applies when a bridge key was set but the companion
@@ -1905,7 +1919,9 @@ const App = () => {
           bridgeKey={bridgeKey}
           companionReachable={state.companionStatus === 'connected'}
           onClose={() => {
-            if (!firstLaunch) {
+            // Lock the wizard open during first-launch (no Skip / Done
+            // pressed yet) so users can't accidentally ESC out of setup.
+            if (!inFirstLaunchMode) {
               setWizardOpen(false);
             }
           }}
