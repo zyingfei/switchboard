@@ -11,6 +11,7 @@ export default defineConfig(
       '.output/**',
       '.wxt/**',
       '.cache/**',
+      '.chrome-for-testing/**',
       'coverage/**',
       'dist/**',
       'node_modules/**',

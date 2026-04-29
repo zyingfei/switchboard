@@ -3,3 +3,5 @@ node_modules/
 .wxt/
 .cache/
 coverage/
+# Chrome for Testing binary (downloaded by `npm run e2e:install-cft`)
+.chrome-for-testing/

@@ -60,7 +60,6 @@ const waitForExtensionWorker = async (context: BrowserContext): Promise<Worker> 
       }
       if (attempt % 10 === 9) {
         const allWorkers = context.serviceWorkers().map((w) => w.url());
-        // eslint-disable-next-line no-console
         console.warn(
           `[runtime] still waiting for ext worker, attempt ${String(attempt + 1)}/90, ` +
             `current workers: ${allWorkers.length === 0 ? '<none>' : JSON.stringify(allWorkers)}`,

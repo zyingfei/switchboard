@@ -19,6 +19,7 @@
     "e2e:verify": "node scripts/verify-extension-build.mjs",
     "e2e:login": "npm run build && node scripts/login-test-profile.mjs",
     "e2e:chrome-debug": "npm run build && node scripts/chrome-debug.mjs",
+    "e2e:install-cft": "npx --yes @puppeteer/browsers install chrome@stable --path ./.chrome-for-testing",
     "postinstall": "wxt prepare"
   },
   "dependencies": {

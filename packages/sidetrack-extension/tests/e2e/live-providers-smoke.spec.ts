@@ -107,7 +107,6 @@ test.describe('live providers (logged-in profile)', () => {
             lastTurnRole: t.lastTurnRole ?? '(none)',
           }));
         });
-        // eslint-disable-next-line no-console
         console.warn(`[live-${provider.expectedProvider}] captured`, JSON.stringify(captured));
       } finally {
         await runtime?.close();

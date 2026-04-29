@@ -159,20 +159,35 @@ SIDETRACK_USER_DATA_DIR=~/.my-test-profile npm run e2e:login
 
 ### Running a spec against the logged-in profile (CDP-attach flow)
 
-The two-process flow you actually want for live providers:
+**Important: this uses Chrome for Testing (CfT), not regular Chrome
+stable.** Regular Chrome stable on macOS silently rejects unpacked
+extensions when launched outside Playwright, and Playwright's launch
+flags (`--use-mock-keychain`, `--remote-debugging-pipe`) collide with
+external CDP attach. CfT is Google's automation distribution and
+doesn't have either restriction.
 
-**Terminal A — keep Chrome running with the extension + your cookies:**
+**One-time install:**
+
+```bash
+cd packages/sidetrack-extension
+npm run e2e:install-cft
+```
+
+That downloads CfT into `./.chrome-for-testing/` (~200MB; gitignored).
+
+**Terminal A — keep CfT running with the extension + your cookies:**
 
 ```bash
 cd packages/sidetrack-extension
 npm run e2e:chrome-debug
 ```
 
-This launches Chrome stable with the extension loaded, the persistent
-profile attached, and `--remote-debugging-port=9222` open. It also
-opens chatgpt.com / claude.ai / gemini.google.com tabs. Leave this
-window open while you're testing; navigate to whichever chats you want
-the specs to capture against.
+This launches CfT with the extension loaded, the dedicated profile
+attached (`~/.sidetrack-test-profile-cft`), and
+`--remote-debugging-port=9222` open. It also pre-opens chatgpt.com /
+claude.ai / gemini.google.com tabs. **First run, sign in to each
+provider.** Cookies persist across runs. Leave the window open;
+navigate to whichever chats you want specs to capture against.
 
 **Terminal B — run any spec, attaching over CDP:**
 
