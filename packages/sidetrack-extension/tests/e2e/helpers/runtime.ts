@@ -61,23 +61,36 @@ export const launchExtensionRuntime = async (): Promise<ExtensionRuntime> => {
   // Chromium for the throwaway-profile path.
   const channel = process.env.SIDETRACK_E2E_BROWSER ?? (cleanupOnClose ? 'chromium' : 'chrome');
 
-  const context = await chromium.launchPersistentContext(userDataDir, {
-    channel,
-    headless,
-    ignoreDefaultArgs: ['--disable-extensions', '--enable-automation'],
-    viewport: {
-      width: 1280,
-      height: 900,
-    },
-    args: [
-      ...(headless ? ['--headless=new'] : []),
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--disable-blink-features=AutomationControlled',
-      `--disable-extensions-except=${extensionPath}`,
-      `--load-extension=${extensionPath}`,
-    ],
-  });
+  const context = await chromium
+    .launchPersistentContext(userDataDir, {
+      channel,
+      headless,
+      ignoreDefaultArgs: ['--disable-extensions', '--enable-automation'],
+      viewport: {
+        width: 1280,
+        height: 900,
+      },
+      args: [
+        ...(headless ? ['--headless=new'] : []),
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-blink-features=AutomationControlled',
+        `--disable-extensions-except=${extensionPath}`,
+        `--load-extension=${extensionPath}`,
+      ],
+    })
+    .catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('ProcessSingleton')) {
+        throw new Error(
+          `Could not lock the user-data dir at ${userDataDir}. ` +
+            `Another Chrome process (likely the one started by ` +
+            `\`npm run e2e:login\`) still holds it. Close that window ` +
+            `(Cmd-Q on the login window) and re-run.`,
+        );
+      }
+      throw error;
+    });
   const worker = await waitForExtensionWorker(context);
   const extensionId = extensionIdFromWorker(worker);
 
