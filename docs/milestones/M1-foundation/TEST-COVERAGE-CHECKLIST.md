@@ -23,13 +23,52 @@ surfaces**. Reference: `docs/dev-testing.md` §"Live-check methodology".
 - Capture extractor dedup bug — fixed; regression unit test in place
   (`tests/unit/extractors.test.ts`).
 
+### Codex parallel-worker outcome (2026-04-29)
+
+Three workers ran in parallel against sections A, B, C below.
+Findings:
+
+- **B (coding-attach)** ✅ landed. Spec passes. Important correction
+  to the checklist: tokens persist at `_BAC/coding/tokens/<token>.json`
+  on the companion, not under `chrome.storage.local`. Both helpers
+  (`mockVaultCompanion.ts`, `inProcessMcp.ts`) intercept HTTP via
+  Playwright `route.fulfill` so no localhost binding is needed
+  (sandbox-safe).
+- **C (companion-sync)** ✅ landed. Spec passes. Important correction:
+  the banner state comes from `assertCompanionReachable()` which does
+  a real status() ping — seed-settings-only produces "disconnected",
+  not "connected". The spec exercises the disconnected path.
+- **A (dispatch-packet)** ❌ rejected. Codex made out-of-scope
+  production-code changes (replaced the deliberate char/4 token
+  heuristic with a cross-package `cl100k` import that would bloat the
+  side-panel bundle, and partly wired up `RecentDispatches` which
+  isn't a test concern). Synthetic spec also still failed. Reverted
+  all of A's prod changes; specs dropped pending another iteration
+  with a tighter "do not touch production code" gate.
+
 ### ⏳ Remaining (codex divide-and-conquer targets)
 
 Each item below is **independent of the others** — different feature
 surfaces, different DOM subtrees, different storage keys. Safe to run
 codex in parallel on each.
 
-#### A. Dispatch-packet flow (PacketComposer)
+#### A. Dispatch-packet flow (PacketComposer) — **needs re-do**
+
+Codex iteration 1 was rejected (see findings above). For the next
+attempt, hard guardrails:
+
+- **Do NOT modify production code** (`src/`, `entrypoints/`). Tests
+  must work against the existing UI as-is. If something is genuinely
+  un-testable without a prod fix, report that and STOP — don't fix it.
+- **Do NOT add cross-package source imports** (no
+  `import .. from '../../../../sidetrack-companion/src/...'`). If a
+  test needs cl100k math, it must use the same heuristic the prod
+  side panel uses (char/4) — otherwise the test is over-specifying.
+- The slider's actual range / value mapping must be confirmed BEFORE
+  writing assertions. Read `PacketComposer.tsx` to find the real
+  default and step.
+
+Original scope:
 
 **Scope:**
 - PacketComposer template selector renders all built-in templates;
