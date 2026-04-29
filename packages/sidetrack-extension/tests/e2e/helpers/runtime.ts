@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -73,19 +73,72 @@ const waitForExtensionWorker = async (context: BrowserContext): Promise<Worker> 
   return await Promise.race([eventWait, pollWait]);
 };
 
+// Resolve the Sidetrack extension ID. Tries three sources in order:
+//   1) the .output/cdp-extension-id file written by chrome-debug.mjs
+//      when it first sees the worker register
+//   2) CDP's HTTP /json/list (works while the worker is awake)
+//   3) explicit error
+const resolveExtensionId = async (cdpUrl: string): Promise<string> => {
+  try {
+    const idFile = path.join(packageRoot, '.output/cdp-extension-id');
+    const fromFile = (await readFile(idFile, 'utf8')).trim();
+    if (fromFile.length > 0) {
+      return fromFile;
+    }
+  } catch {
+    // No file; fall through to CDP query.
+  }
+  const listUrl = `${cdpUrl.replace(/\/+$/, '')}/json/list`;
+  const response = await fetch(listUrl);
+  if (!response.ok) {
+    throw new Error(`CDP /json/list returned HTTP ${String(response.status)}`);
+  }
+  const targets = (await response.json()) as { type?: string; url?: string }[];
+  const swTarget = targets.find(
+    (t) => t.type === 'service_worker' && (t.url ?? '').startsWith('chrome-extension://'),
+  );
+  if (swTarget !== undefined) {
+    const match = /^chrome-extension:\/\/([^/]+)\//u.exec(swTarget.url ?? '');
+    if (match !== null) {
+      return match[1];
+    }
+  }
+  throw new Error(
+    `Could not resolve the Sidetrack extension id. Make sure ` +
+      `\`npm run e2e:chrome-debug\` is running, then re-run. ` +
+      `Looked at .output/cdp-extension-id and ${listUrl}.`,
+  );
+};
+
+// MV3 service workers go dormant after ~30s idle. Hit any URL on the
+// extension's origin to wake it up before doing real work.
+const wakeServiceWorker = async (context: BrowserContext, extensionId: string): Promise<void> => {
+  const wakePage = await context.newPage();
+  try {
+    await wakePage.goto(`chrome-extension://${extensionId}/sidepanel.html`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 10_000,
+    });
+  } finally {
+    await wakePage.close();
+  }
+};
+
 // Attach to a Chrome that was started outside Playwright (via
 // scripts/chrome-debug.mjs) — gives real Chrome cookies + reliable
 // MV3 service-worker registration without us having to manage the
 // browser process.
 const attachOverCdp = async (cdpUrl: string): Promise<ExtensionRuntime> => {
+  const extensionId = await resolveExtensionId(cdpUrl);
   const browser = await chromium.connectOverCDP(cdpUrl);
   const contexts = browser.contexts();
   if (contexts.length === 0) {
     throw new Error(`Chrome at ${cdpUrl} has no browser contexts.`);
   }
   const context = contexts[0];
-  const worker = await waitForExtensionWorker(context);
-  const extensionId = extensionIdFromWorker(worker);
+  // Wake the worker before any test code runs — MV3 workers go
+  // dormant after ~30s and our message handler won't respond.
+  await wakeServiceWorker(context, extensionId);
   const extensionPath = readExtensionPath();
 
   return {

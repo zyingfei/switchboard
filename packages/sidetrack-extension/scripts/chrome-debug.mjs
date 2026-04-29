@@ -18,7 +18,7 @@
 //   in the CfT window and sign in. Cookies persist in the profile dir
 //   below; subsequent runs reuse them.
 
-import { mkdir, readdir, stat } from 'node:fs/promises';
+import { mkdir, readdir, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -133,3 +133,34 @@ child.on('exit', (code, signal) => {
   console.log(`[chrome-debug] Chrome exited (code=${String(code)}, signal=${String(signal)}).`);
   process.exit(code ?? 0);
 });
+
+// Watch CDP for the extension service worker. Once it appears, write
+// the extension ID to .output/cdp-extension-id so the spec runner
+// doesn't have to guess. MV3 workers go dormant after ~30s idle, so
+// the spec wakes the worker by opening chrome-extension://<id>/sidepanel.html.
+const idFile = path.join(packageRoot, '.output/cdp-extension-id');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+(async () => {
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    await sleep(1_000);
+    try {
+      const list = await fetch(`http://localhost:${port}/json/list`).then((r) => r.json());
+      const sw = list.find(
+        (t) => t.type === 'service_worker' && (t.url ?? '').startsWith('chrome-extension://'),
+      );
+      if (sw === undefined) continue;
+      const match = /^chrome-extension:\/\/([^/]+)\//u.exec(sw.url);
+      if (match === null) continue;
+      const extId = match[1];
+      await writeFile(idFile, extId, 'utf8');
+      console.log(`[chrome-debug] extension id   : ${extId}`);
+      console.log(`[chrome-debug] wrote          : ${idFile}`);
+      return;
+    } catch {
+      // Chrome not ready yet; retry.
+    }
+  }
+  console.warn(
+    '[chrome-debug] WARNING: extension service worker never appeared. The spec will fail.',
+  );
+})();
