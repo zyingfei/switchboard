@@ -347,14 +347,17 @@ The current scope of automated coverage:
   `spec-coverage.spec.ts` + live via `live-status-transitions.spec.ts`).
 - ✅ Live capture against real signed-in chats
   (`live-providers-smoke.spec.ts`, all 3 providers).
+- ✅ Workstream privacy modes: private workstreams mask thread /
+  reminder titles while shared workstreams keep them visible
+  (`workstream-privacy.spec.ts` + `live-workstream-privacy.spec.ts`).
+- ✅ Fork lineage parity: synthetic capture resolution plus a live
+  Claude branched-thread check against explicit parent/child URLs
+  (`fork-lineage-synthetic.spec.ts` + `live-fork-lineage.spec.ts`).
 - 🔧 Provider extractors against the existing fixture set — covered by
   the older `extension-runtime.spec.ts` which is currently skipped
   pending a port to the post-rewrite UI (see TODO in that file).
-- ⏳ Fork lineage detection against a real Claude "Branched from"
-  thread — needs a captured Claude fixture.
 - ⏳ Dispatch flow end-to-end including PacketComposer template
   rendering, last-N-turns slider, token-preview math.
-- ⏳ Workstream privacy modes (private vs shared title rendering).
 - ⏳ Coding-attach token issuance + MCP reader handshake.
 - ⏳ Companion sync (vault writes + status banner).
 
