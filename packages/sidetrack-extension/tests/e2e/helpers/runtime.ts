@@ -157,15 +157,26 @@ const attachOverCdp = async (cdpUrl: string): Promise<ExtensionRuntime> => {
       }, values);
     },
     async close() {
-      // Don't close the user's Chrome, just detach Playwright.
-      await browser.close();
+      // Don't close the user's Chrome AND don't call browser.close()
+      // — for CDP-attached browsers, close() can race with subsequent
+      // attaches in the same test run and break "no browser contexts"
+      // on tests #2+. Just let the WebSocket idle; Node exit cleans up.
     },
   };
 };
 
-export const launchExtensionRuntime = async (): Promise<ExtensionRuntime> => {
+export interface LaunchOptions {
+  // Force the throwaway-tmpdir launch path even when SIDETRACK_E2E_CDP_URL
+  // is set. Synthetic specs use this so they don't write into the user's
+  // real Chrome profile when running mixed with live specs.
+  readonly forceLocalProfile?: boolean;
+}
+
+export const launchExtensionRuntime = async (
+  options: LaunchOptions = {},
+): Promise<ExtensionRuntime> => {
   const cdpUrl = process.env.SIDETRACK_E2E_CDP_URL;
-  if (cdpUrl !== undefined && cdpUrl.length > 0) {
+  if (cdpUrl !== undefined && cdpUrl.length > 0 && options.forceLocalProfile !== true) {
     return await attachOverCdp(cdpUrl);
   }
   const extensionPath = readExtensionPath();

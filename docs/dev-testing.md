@@ -245,6 +245,97 @@ Sanitization rules:
 - Keep enough turn structure for the extractor to exercise both `user`
   and `assistant` selectors.
 
+## Live-check methodology
+
+Synthetic specs verify rendering and state-update correctness. **Live
+specs verify the assumptions** synthetic specs encode about the real
+provider DOMs and the side-panel ↔ background pipeline. Run live
+specs whenever a feature touches:
+
+- the capture extractor (provider DOM selectors, role inference)
+- the lifecycle pill / status derivation
+- auto-capture / mutation observers
+- the message-dispatch flow into a real chat composer
+
+### The loop
+
+1. **Probe** — write a one-off `tests/e2e/probe-*.spec.ts` that opens
+   the live page and dumps whatever DOM you need (composer selectors,
+   send-button candidates, turn elements, role attributes). Gate it on
+   an opt-in env var (`SIDETRACK_E2E_PROBE_*=1`). Run it once, copy
+   the selectors into the real spec, then **delete the probe**. They
+   are scaffolding, not coverage.
+2. **Drive** — write a permanent live spec (e.g.
+   `live-status-transitions.spec.ts`) that exercises the feature
+   end-to-end, gated on an opt-in env var
+   (`SIDETRACK_E2E_LIVE_*=1`). Use `launchExtensionRuntime()` (no
+   `forceLocalProfile`) so it attaches to the CDP-running CfT and
+   reuses your logged-in cookies.
+3. **Observe + persist** — when the live spec surfaces an unexpected
+   behavior (extractor wedged, pill in the wrong state, content script
+   not picking up a turn), **add a unit test that reproduces the bug
+   from synthetic DOM** in `tests/unit/extractors.test.ts` or the
+   relevant module's test file. Then fix the bug and verify both the
+   unit test and the live spec pass. Without the unit test, the next
+   regression won't be caught until someone re-runs the live spec.
+
+### Worked example
+
+`live-status-transitions.spec.ts` typed a "please reply OK only" ping
+into ChatGPT, expected `lastTurnRole=user`, then `=assistant`. The
+chat ended in `[assistant] OK` per the DOM, but the extractor reported
+`lastTurnRole=user`. Probing showed `dedupeAndFinalizeTurns` was
+collapsing identical short assistant replies (two `OK`s → one), so the
+surviving last turn was a user turn.
+
+The persistence loop:
+
+- `tests/unit/extractors.test.ts` — added `preserves distinct turns at
+  different positions even when text matches`, which builds a
+  ChatGPT-shaped DOM with two identical assistant `OK` replies and
+  asserts all four turns survive.
+- `src/capture/extractors.ts` — replaced `dedupeAndFinalizeTurns` with
+  `finalizeTurns` (no global dedup). `mergeAdjacentTurns` already
+  handles the legitimate "two consecutive same-role chunks" case.
+- `live-status-transitions.spec.ts` still asks the AI to echo a unique
+  pingId, but only as belt-and-suspenders — the underlying bug is now
+  guarded by the unit test.
+
+### Provider-quirk catalog
+
+Things the live runs revealed about each provider that future specs
+should respect:
+
+| Provider | Composer selector | Submit |
+|----------|-------------------|--------|
+| ChatGPT  | `div#prompt-textarea[role="textbox"]` (ProseMirror) | `Enter` |
+| Claude   | `div[data-testid="chat-input"][role="textbox"]` (Tiptap) | `Enter` |
+| Gemini   | `rich-textarea div.ql-editor[role="textbox"]` (Quill) | **Click `button[aria-label*="Send message" i]`** — `Enter` inserts a newline |
+
+For all three: empty ProseMirror/Tiptap/Quill editors render with
+zero box-height, so Playwright's "visible" check rejects them. Use
+`waitFor({ state: 'attached' })` and `click({ force: true })`.
+
+Reply latency observed:
+
+- **ChatGPT**: 5–60s, varies with model
+- **Claude**: 3–30s
+- **Gemini**: <2s — the `lastTurnRole=user` intermediate window is
+  effectively unobservable through 2s polling. Live specs that need to
+  observe both the user-final and assistant-final state should make
+  the user-state check best-effort, not strict.
+
+### Auto-capture-induced reminder priority
+
+`deriveLifecycle` in `entrypoints/sidepanel/App.tsx` checks `hasUnread`
+**before** the `lastTurnRole` derivation. Once auto-capture has logged
+a reminder for a thread (which happens for any assistant reply that
+arrives after the user was last seen), the pill stays `Unread reply`
+regardless of the underlying turn role. Live specs that assert the
+pill should accept either the natural pill (`Waiting on AI` /
+`You replied last`) or `Unread reply`, since auto-capture races every
+test.
+
 ## Tasks the user wants automated
 
 The current scope of automated coverage:
@@ -252,12 +343,22 @@ The current scope of automated coverage:
 - ✅ Side panel mounts, workboard renders.
 - ✅ Queue auto-detect: a pending follow-up flips to `done` when its
   text appears as a user turn in a subsequent capture.
+- ✅ Lifecycle pill state transitions (synthetic via
+  `spec-coverage.spec.ts` + live via `live-status-transitions.spec.ts`).
+- ✅ Live capture against real signed-in chats
+  (`live-providers-smoke.spec.ts`, all 3 providers).
+- ✅ Workstream privacy modes: private workstreams mask thread /
+  reminder titles while shared workstreams keep them visible
+  (`workstream-privacy.spec.ts` + `live-workstream-privacy.spec.ts`).
+- ✅ Fork lineage parity: synthetic capture resolution plus a live
+  Claude branched-thread check against explicit parent/child URLs
+  (`fork-lineage-synthetic.spec.ts` + `live-fork-lineage.spec.ts`).
 - 🔧 Provider extractors against the existing fixture set — covered by
   the older `extension-runtime.spec.ts` which is currently skipped
   pending a port to the post-rewrite UI (see TODO in that file).
-- ⏳ Fork lineage detection against a real Claude "Branched from"
-  thread — needs a captured Claude fixture.
 - ⏳ Dispatch flow end-to-end including PacketComposer template
   rendering, last-N-turns slider, token-preview math.
+- ⏳ Coding-attach token issuance + MCP reader handshake.
+- ⏳ Companion sync (vault writes + status banner).
 
 Pull from this list when picking the next spec to write.

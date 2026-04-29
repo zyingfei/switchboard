@@ -324,25 +324,23 @@ const mergeAdjacentTurns = (
   return merged;
 };
 
-const dedupeAndFinalizeTurns = (
+const finalizeTurns = (
   turns: readonly CandidateTurn[],
   maxChars: number,
   config: ProviderExtractionConfig,
   capturedAt: string,
 ): CapturedTurn[] => {
-  const seen = new Set<string>();
+  // Adjacent same-role merging is enough — never dedupe by text
+  // globally. Two distinct assistant turns that happen to share text
+  // (e.g. two short "OK" replies) are NOT duplicates; collapsing them
+  // moves the surviving "last" turn to the wrong role and corrupts
+  // the workboard pill. See extractors.test.ts regression case.
   const finalized: CapturedTurn[] = [];
-
   for (const turn of mergeAdjacentTurns(turns, config)) {
     const text = capText(turn.text, maxChars);
     if (!text) {
       continue;
     }
-    const key = `${turn.role}:${text}`;
-    if (seen.has(key)) {
-      continue;
-    }
-    seen.add(key);
     finalized.push({
       role: turn.role,
       text,
@@ -352,14 +350,13 @@ const dedupeAndFinalizeTurns = (
       sourceSelector: turn.sourceSelector,
     });
   }
-
   return finalized;
 };
 
 const fallbackTurns = (doc: Document, maxChars: number, capturedAt: string): CapturedTurn[] => {
   const root = doc.querySelector('main') ?? doc.body;
 
-  return dedupeAndFinalizeTurns(
+  return finalizeTurns(
     [
       {
         role: 'unknown',
@@ -447,7 +444,7 @@ export const captureVisibleConversation = (
   const config = providerConfigs[provider];
 
   let usedFallback = false;
-  let turns = dedupeAndFinalizeTurns(
+  let turns = finalizeTurns(
     extractConfiguredTurns(doc, config),
     maxChars,
     config,

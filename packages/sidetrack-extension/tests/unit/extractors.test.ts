@@ -108,4 +108,58 @@ describe('provider capture extractors', () => {
     expect(text).toContain('Rendered assistant text');
     expect(text).not.toContain('draft value should not be captured');
   });
+
+  // Regression: previously, two distinct assistant replies with
+  // identical text (e.g. two short "OK" replies) collapsed in
+  // dedupeAndFinalizeTurns into one. That moved the surviving "last"
+  // turn back to a user turn, which then drove the workboard pill into
+  // a "Waiting on AI" state even when the chat actually ended in an
+  // assistant turn. Found by `live-status-transitions.spec.ts` after
+  // sending two `please reply OK only` pings produced wedged state.
+  it('preserves distinct turns at different positions even when text matches', () => {
+    document.body.innerHTML = `
+      <main>
+        <article data-message-author-role="user">First question</article>
+        <article data-message-author-role="assistant">OK</article>
+        <article data-message-author-role="user">Second question</article>
+        <article data-message-author-role="assistant">OK</article>
+      </main>
+    `;
+
+    const capture = captureVisibleConversation(document, {
+      url: 'https://chatgpt.com/c/dedup-regression',
+      capturedAt: '2026-04-29T00:00:00.000Z',
+    });
+
+    expect(capture.turns.map((turn) => turn.role)).toEqual([
+      'user',
+      'assistant',
+      'user',
+      'assistant',
+    ]);
+    expect(capture.turns.at(-1)?.role).toBe('assistant');
+  });
+
+  // The dedup fix above must NOT break the legitimate merge-adjacent
+  // pathway (ChatGPT has `mergeAdjacentSameRoleTurns: true` in its
+  // config). Two consecutive assistant chunks should still collapse
+  // into one merged turn.
+  it('merges adjacent same-role chunks for ChatGPT-like configs', () => {
+    document.body.innerHTML = `
+      <main>
+        <article data-message-author-role="user">Plan tomorrow</article>
+        <article data-message-author-role="assistant">Step one: outline</article>
+        <article data-message-author-role="assistant">Step two: draft</article>
+      </main>
+    `;
+
+    const capture = captureVisibleConversation(document, {
+      url: 'https://chatgpt.com/c/merge-adjacent',
+      capturedAt: '2026-04-29T00:00:00.000Z',
+    });
+
+    expect(capture.turns.map((turn) => turn.role)).toEqual(['user', 'assistant']);
+    expect(capture.turns[1].text).toContain('Step one: outline');
+    expect(capture.turns[1].text).toContain('Step two: draft');
+  });
 });

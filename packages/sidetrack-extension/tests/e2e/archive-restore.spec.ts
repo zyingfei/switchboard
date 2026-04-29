@@ -13,7 +13,7 @@ test('archive restore: an archived thread reappears in the workboard after Setti
 
   try {
     fixtureServer = await startProviderFixtureServer();
-    runtime = await launchExtensionRuntime();
+    runtime = await launchExtensionRuntime({ forceLocalProfile: true });
 
     const seederPage = await runtime.context.newPage();
     await seederPage.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
