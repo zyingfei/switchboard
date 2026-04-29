@@ -40,9 +40,11 @@ const assertOk = (response: unknown): void => {
 test.describe('live providers (logged-in profile)', () => {
   test.skip(
     () =>
-      process.env.SIDETRACK_USER_DATA_DIR === undefined ||
-      process.env.SIDETRACK_USER_DATA_DIR.length === 0,
-    'requires SIDETRACK_USER_DATA_DIR pointing at a logged-in Chrome profile',
+      (process.env.SIDETRACK_USER_DATA_DIR === undefined ||
+        process.env.SIDETRACK_USER_DATA_DIR.length === 0) &&
+      (process.env.SIDETRACK_E2E_CDP_URL === undefined ||
+        process.env.SIDETRACK_E2E_CDP_URL.length === 0),
+    'requires SIDETRACK_USER_DATA_DIR or SIDETRACK_E2E_CDP_URL',
   );
 
   for (const provider of providers) {

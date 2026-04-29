@@ -1,29 +1,29 @@
 #!/usr/bin/env node
-// Spawn Chrome stable with the Sidetrack extension loaded, the
-// persistent profile attached, and a remote debugging port open.
-// Playwright e2e specs then attach via chromium.connectOverCDP, which
-// gives us:
-//   - real Chrome cookie storage (so chatgpt.com / claude.ai /
-//     gemini.google.com logins from `npm run e2e:login` actually work)
-//   - reliable MV3 service-worker registration (Chrome owns the
-//     extension lifecycle, not Playwright)
-// The Chrome window stays open across test runs; close it manually
-// (Cmd-Q) when you're done.
+// Launch Chrome stable via Playwright's launchPersistentContext (same
+// flag set the e2e:login script uses, which Chrome 147 actually
+// accepts for unpacked extensions) PLUS --remote-debugging-port so
+// e2e specs can attach via chromium.connectOverCDP.
+//
+// Why not plain child_process.spawn? Chrome 147 silently refuses
+// --load-extension in non-Playwright sessions when the user-data-dir
+// has Developer Mode off — even with --no-first-run. Going through
+// Playwright sets the right combination of flags (including
+// --enable-automation handling) so the extension actually loads.
 //
 // Usage:
-//   npm run e2e:chrome-debug          # default port 9222, default profile
+//   npm run e2e:chrome-debug
 //   SIDETRACK_E2E_CDP_PORT=9333 npm run e2e:chrome-debug
 //
-// Then in another terminal:
+// Then, in another terminal:
 //   SIDETRACK_E2E_CDP_URL=http://localhost:9222 \
 //     npx playwright test live-providers-smoke
 
 import { mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
+import { chromium } from '@playwright/test';
 
 const packageRoot = path.resolve(fileURLToPath(new URL('../', import.meta.url)));
 const extensionPath =
@@ -32,16 +32,15 @@ const extensionPath =
 const expandTilde = (input) =>
   input.startsWith('~') ? path.join(homedir(), input.slice(1).replace(/^[/\\]/, '')) : input;
 
-const userDataDir = expandTilde(process.env.SIDETRACK_USER_DATA_DIR ?? '~/.sidetrack-test-profile');
+const userDataDir = expandTilde(
+  process.env.SIDETRACK_USER_DATA_DIR ?? '~/.sidetrack-test-profile',
+);
 const port = process.env.SIDETRACK_E2E_CDP_PORT ?? '9222';
-
-const chromeBinary =
-  process.env.SIDETRACK_E2E_CHROME_BIN ??
-  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const channel = process.env.SIDETRACK_E2E_BROWSER ?? 'chrome';
 
 await mkdir(userDataDir, { recursive: true });
 
-console.log(`[chrome-debug] chrome binary  : ${chromeBinary}`);
+console.log(`[chrome-debug] browser channel: ${channel}`);
 console.log(`[chrome-debug] extension path : ${extensionPath}`);
 console.log(`[chrome-debug] user data dir  : ${userDataDir}`);
 console.log(`[chrome-debug] debug port     : ${port}`);
@@ -55,29 +54,39 @@ console.log('');
 console.log('[chrome-debug] Close the Chrome window (Cmd-Q) to stop this script.');
 console.log('');
 
-const args = [
-  `--user-data-dir=${userDataDir}`,
-  `--remote-debugging-port=${port}`,
-  `--disable-extensions-except=${extensionPath}`,
-  `--load-extension=${extensionPath}`,
-  '--no-first-run',
-  '--no-default-browser-check',
-  '--disable-blink-features=AutomationControlled',
+const context = await chromium.launchPersistentContext(userDataDir, {
+  channel,
+  headless: false,
+  ignoreDefaultArgs: ['--disable-extensions', '--enable-automation'],
+  viewport: { width: 1280, height: 900 },
+  args: [
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-blink-features=AutomationControlled',
+    `--remote-debugging-port=${port}`,
+    `--disable-extensions-except=${extensionPath}`,
+    `--load-extension=${extensionPath}`,
+  ],
+});
+
+// Pre-open the three providers in the existing window so the user
+// doesn't have to type the URLs.
+const startupUrls = [
   'https://chatgpt.com/',
   'https://claude.ai/',
   'https://gemini.google.com/',
 ];
+for (const [index, url] of startupUrls.entries()) {
+  const page =
+    index === 0 ? (context.pages()[0] ?? (await context.newPage())) : await context.newPage();
+  await page.goto(url, { waitUntil: 'domcontentloaded' }).catch((error) => {
+    console.warn(`[chrome-debug] failed to open ${url}: ${error.message ?? String(error)}`);
+  });
+}
 
-const child = spawn(chromeBinary, args, { stdio: 'inherit' });
+console.log('[chrome-debug] Chrome ready. Tabs open: chatgpt.com / claude.ai / gemini.google.com.');
+console.log('[chrome-debug] Open whichever specific chats you want the specs to capture.');
+console.log('');
 
-const onSignal = (signal) => {
-  console.log(`\n[chrome-debug] received ${signal}, asking Chrome to quit…`);
-  child.kill(signal);
-};
-process.on('SIGINT', () => onSignal('SIGINT'));
-process.on('SIGTERM', () => onSignal('SIGTERM'));
-
-child.on('exit', (code, signal) => {
-  console.log(`[chrome-debug] Chrome exited (code=${String(code)}, signal=${String(signal)}).`);
-  process.exit(code ?? 0);
-});
+await context.waitForEvent('close', { timeout: 0 });
+console.log('[chrome-debug] Chrome closed.');
