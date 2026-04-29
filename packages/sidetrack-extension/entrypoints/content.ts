@@ -1,6 +1,7 @@
 import { defineContentScript } from 'wxt/utils/define-content-script';
 
 import { captureVisibleConversation } from '../src/capture/extractors';
+import { isProviderThreadUrl } from '../src/capture/providerDetection';
 import { messageTypes, type ContentRequest, type ContentResponse } from '../src/messages';
 
 const isContentRequest = (value: unknown): value is ContentRequest =>
@@ -38,6 +39,12 @@ export default defineContentScript({
       try {
         const capture = createCapture();
         if (capture.provider === 'unknown' || capture.turns.length === 0) {
+          return;
+        }
+        // Stricter gate: auto-capture only fires on the provider's
+        // actual chat-thread URL shape (e.g. claude.ai/chat/<id>),
+        // never on landing / settings / docs pages like claude.ai/code.
+        if (!isProviderThreadUrl(capture.provider, capture.threadUrl)) {
           return;
         }
         const signature = captureSignature(capture);
