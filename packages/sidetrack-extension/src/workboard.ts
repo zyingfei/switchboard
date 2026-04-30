@@ -120,6 +120,12 @@ export interface CaptureNote {
   readonly kind: NoteKind;
   readonly text: string;
   readonly workstreamId?: string;
+  // When set, the note is anchored to a specific tracked thread and
+  // renders inline under that thread row as part of its history. The
+  // workstream-level captures rail filters these out so notes don't
+  // double-render. A note can have both a threadId and a workstreamId
+  // (the thread's home workstream); only the inline render fires.
+  readonly threadId?: string;
   readonly source?: string;
   readonly createdAt: string;
   readonly updatedAt: string;

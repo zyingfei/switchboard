@@ -261,6 +261,15 @@ const App = () => {
   const [noteComposeOpen, setNoteComposeOpen] = useState(false);
   const [noteDraft, setNoteDraft] = useState('');
   const [noteEditId, setNoteEditId] = useState<string | null>(null);
+  // Per-thread inline note compose. Holds the thread bac_id whose
+  // history strip is currently in compose mode; null = none open.
+  // Separate from noteComposeOpen so the workstream-level rail and
+  // the per-thread strip don't fight each other for state.
+  const [threadNoteFor, setThreadNoteFor] = useState<string | null>(null);
+  const [threadNoteDraft, setThreadNoteDraft] = useState('');
+  const [threadHistoryOpen, setThreadHistoryOpen] = useState<ReadonlySet<string>>(
+    () => new Set<string>(),
+  );
   const [composeThreadId, setComposeThreadId] = useState<string | null>(null);
   const [pendingDispatch, setPendingDispatch] = useState<ComposedPacket | null>(null);
   const [dispatchInFlight, setDispatchInFlight] = useState(false);
@@ -721,6 +730,52 @@ const App = () => {
     setNoteDraft(text);
   };
 
+  const submitThreadNote = (threadId: string) => {
+    const text = threadNoteDraft.trim();
+    if (text.length === 0) {
+      return;
+    }
+    const targetThread = state.threads.find((t) => t.bac_id === threadId);
+    void runAction(async () => {
+      const next = await sendRequest({
+        type: messageTypes.createCaptureNote,
+        note: {
+          text,
+          kind: 'manual',
+          threadId,
+          ...(targetThread?.primaryWorkstreamId === undefined
+            ? {}
+            : { workstreamId: targetThread.primaryWorkstreamId }),
+        },
+      });
+      setThreadNoteDraft('');
+      setThreadNoteFor(null);
+      // Make sure the strip stays expanded after add so the user sees
+      // the new entry land.
+      setThreadHistoryOpen((prev) => {
+        if (prev.has(threadId)) {
+          return prev;
+        }
+        const nextSet = new Set(prev);
+        nextSet.add(threadId);
+        return nextSet;
+      });
+      return next;
+    });
+  };
+
+  const toggleThreadHistory = (threadId: string) => {
+    setThreadHistoryOpen((prev) => {
+      const nextSet = new Set(prev);
+      if (nextSet.has(threadId)) {
+        nextSet.delete(threadId);
+      } else {
+        nextSet.add(threadId);
+      }
+      return nextSet;
+    });
+  };
+
   const copyQueueItemText = (queueItemId: string, text: string) => {
     void (async () => {
       try {
@@ -988,16 +1043,18 @@ const App = () => {
     .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
 
   // Captures: manual notes filtered by the current workstream (or Inbox)
-  // plus inbound reminders whose linked thread sits in scope. In the All
-  // view we show everything.
-  const scopedNotes =
+  // plus inbound reminders whose linked thread sits in scope. Notes that
+  // are anchored to a specific thread render under that thread's history
+  // strip instead — exclude them here so they don't double-render.
+  const scopedNotes = (
     viewMode === 'all'
       ? state.captureNotes
       : state.captureNotes.filter((note) =>
           currentWsId === null
             ? note.workstreamId === undefined
             : note.workstreamId === currentWsId,
-        );
+        )
+  ).filter((note) => note.threadId === undefined);
   // Coding sessions (registered via the agent's MCP register tool) render
   // alongside chat threads in the same workstream group.
   const attachedSessions = state.codingSessions.filter((s) => s.status === 'attached');
@@ -1071,6 +1128,13 @@ const App = () => {
       thread.parentThreadId === undefined
         ? undefined
         : state.threads.find((t) => t.bac_id === thread.parentThreadId);
+    // Thread-anchored notes form the inline history under the row,
+    // sorted newest-first to match the workstream rail.
+    const threadNotes = state.captureNotes
+      .filter((note) => note.threadId === thread.bac_id)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    const historyOpen = threadHistoryOpen.has(thread.bac_id);
+    const historyComposeOpen = threadNoteFor === thread.bac_id;
     return (
       <div key={thread.bac_id} className="thread">
         <div className="row1">
@@ -1170,21 +1234,31 @@ const App = () => {
           </button>
           {(() => {
             const requiresCompanion = state.companionStatus !== 'connected' || bridgeKey.length === 0;
-            const disabledReason = requiresCompanion
-              ? 'Connect a companion in Settings to enable — Send and Review need vault-stored turns'
-              : undefined;
+            // Don't use the `disabled` attribute when companion is missing —
+            // a click should explain how to enable, not be silently swallowed.
+            // The `.disabled-look` class mutes the colour while the button
+            // remains a real, clickable target.
+            const explainNeedsCompanion = (action: 'Send' | 'Review') => {
+              setError(
+                `${action} needs a connected companion to read this thread's turns from the vault. Open Settings (cog, top right) → enter the bridge port and key → Save, then try again.`,
+              );
+            };
             return (
               <>
                 <button
                   type="button"
-                  className="btn-link"
-                  disabled={requiresCompanion}
+                  className={'btn-link' + (requiresCompanion ? ' disabled-look' : '')}
                   title={
-                    disabledReason ??
-                    'Compose a packet from this thread and dispatch to another AI'
+                    requiresCompanion
+                      ? 'Send is unavailable in local-only mode — click for setup steps'
+                      : 'Compose a packet from this thread and dispatch to another AI'
                   }
                   onClick={(e) => {
                     e.stopPropagation();
+                    if (requiresCompanion) {
+                      explainNeedsCompanion('Send');
+                      return;
+                    }
                     setComposeThreadId(thread.bac_id);
                   }}
                 >
@@ -1192,11 +1266,18 @@ const App = () => {
                 </button>
                 <button
                   type="button"
-                  className="btn-link"
-                  disabled={requiresCompanion}
-                  title={disabledReason ?? 'Review captured turns of this thread'}
+                  className={'btn-link' + (requiresCompanion ? ' disabled-look' : '')}
+                  title={
+                    requiresCompanion
+                      ? 'Review is unavailable in local-only mode — click for setup steps'
+                      : 'Review captured turns of this thread'
+                  }
                   onClick={(e) => {
                     e.stopPropagation();
+                    if (requiresCompanion) {
+                      explainNeedsCompanion('Review');
+                      return;
+                    }
                     setReviewThreadId(thread.bac_id);
                   }}
                 >
@@ -1354,6 +1435,125 @@ const App = () => {
             ))}
           </ul>
         ) : null}
+        <div className="thread-history">
+          {historyOpen ? (
+            <>
+              {threadNotes.length === 0 ? (
+                <span className="thread-history-empty">
+                  no notes yet — capture context as the thread evolves
+                </span>
+              ) : (
+                threadNotes.map((note) => (
+                  <div key={note.bac_id} className="thread-history-item">
+                    <span className="glyph" aria-hidden>
+                      ▍
+                    </span>
+                    <div className="body">{note.text}</div>
+                    <span className="meta">{formatRelative(note.createdAt)}</span>
+                    <div className="actions">
+                      <button
+                        type="button"
+                        className="btn-link"
+                        title="Edit this note"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          beginEditNote(note.bac_id, note.text);
+                        }}
+                      >
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-link"
+                        title="Delete this note"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          deleteNote(note.bac_id);
+                        }}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+              {historyComposeOpen ? (
+                <form
+                  className="thread-history-compose"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    submitThreadNote(thread.bac_id);
+                  }}
+                >
+                  <textarea
+                    autoFocus
+                    rows={2}
+                    placeholder="Note for this thread…"
+                    value={threadNoteDraft}
+                    onChange={(e) => {
+                      setThreadNoteDraft(e.target.value);
+                    }}
+                  />
+                  <div className="thread-history-compose-actions">
+                    <button
+                      type="submit"
+                      className="btn-link"
+                      disabled={busy || threadNoteDraft.trim().length === 0}
+                    >
+                      Save note
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-link"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setThreadNoteFor(null);
+                        setThreadNoteDraft('');
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </form>
+              ) : (
+                <button
+                  type="button"
+                  className="thread-history-add"
+                  title="Attach a note to this thread"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setThreadNoteFor(thread.bac_id);
+                    setThreadNoteDraft('');
+                  }}
+                >
+                  + note
+                </button>
+              )}
+            </>
+          ) : (
+            <button
+              type="button"
+              className="thread-history-add"
+              title={
+                threadNotes.length > 0
+                  ? `Show ${String(threadNotes.length)} thread note${threadNotes.length === 1 ? '' : 's'}`
+                  : 'Attach a note to this thread'
+              }
+              onClick={(e) => {
+                e.stopPropagation();
+                toggleThreadHistory(thread.bac_id);
+                if (threadNotes.length === 0) {
+                  setThreadNoteFor(thread.bac_id);
+                  setThreadNoteDraft('');
+                }
+              }}
+            >
+              {threadNotes.length > 0
+                ? `▾ history · ${String(threadNotes.length)} note${threadNotes.length === 1 ? '' : 's'}`
+                : '+ note'}
+            </button>
+          )}
+        </div>
       </div>
     );
   };

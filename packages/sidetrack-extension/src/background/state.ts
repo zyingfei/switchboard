@@ -109,6 +109,7 @@ export const createLocalCaptureNote = async (input: CaptureNoteCreate): Promise<
     kind: input.kind ?? 'manual',
     text: input.text,
     ...(input.workstreamId === undefined ? {} : { workstreamId: input.workstreamId }),
+    ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
     ...(input.source === undefined ? {} : { source: input.source }),
     createdAt: timestamp,
     updatedAt: timestamp,

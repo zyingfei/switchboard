@@ -2527,6 +2527,118 @@ button:disabled {
   color: var(--ink-4, #a39a8c);
   cursor: not-allowed;
 }
+/* Looks disabled but is still clickable — used for Send/Review when
+   the companion isn't connected, so a click can explain how to enable
+   instead of being silently swallowed by the browser. */
+.thread-actions .btn-link.disabled-look {
+  color: var(--ink-4, #a39a8c);
+  cursor: help;
+}
+.thread-actions .btn-link.disabled-look:hover {
+  color: var(--ink-2, #4a453d);
+}
+
+/* =====================================================
+   Thread history strip — captures rendered inline under a thread
+   ===================================================== */
+.thread-history {
+  margin: 6px 0 0;
+  padding: 6px 0 0;
+  border-top: 1px dashed var(--rule, rgba(27, 25, 22, 0.12));
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.thread-history-empty {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink-4);
+  font-style: italic;
+}
+.thread-history-item {
+  display: grid;
+  grid-template-columns: 14px 1fr auto;
+  gap: 6px 8px;
+  align-items: baseline;
+  padding: 2px 0;
+}
+.thread-history-item .glyph {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-4);
+  text-align: center;
+  user-select: none;
+}
+.thread-history-item .body {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--ink);
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+}
+.thread-history-item .meta {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-3);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+.thread-history-item .actions {
+  grid-column: 2 / 4;
+  display: inline-flex;
+  gap: 8px;
+  margin-top: 2px;
+}
+.thread-history-item .actions .btn-link {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-3);
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+.thread-history-item .actions .btn-link:hover {
+  color: var(--signal);
+}
+.thread-history-add {
+  display: inline-flex;
+  align-self: flex-start;
+  margin-top: 2px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+.thread-history-add:hover {
+  color: var(--signal);
+}
+.thread-history-compose {
+  margin-top: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.thread-history-compose textarea {
+  width: 100%;
+  font-family: inherit;
+  font-size: 12px;
+  padding: 6px 8px;
+  border: var(--hair);
+  border-radius: var(--rad-s);
+  background: var(--paper-light);
+  color: var(--ink);
+  resize: vertical;
+  min-height: 48px;
+}
+.thread-history-compose-actions {
+  display: inline-flex;
+  gap: 10px;
+}
 
 .capture-list {
   padding: 0 8px 8px;
