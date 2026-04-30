@@ -3143,6 +3143,20 @@ textarea.preview-body:focus {
 .capture-empty {
   padding: 8px 12px;
 }
+
+/* Build identity footer — small, low-contrast, sits at the very
+   bottom of the side panel so the user can confirm "did the new
+   build actually load?" at a glance. */
+.build-version {
+  padding: 12px 14px 16px;
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  color: var(--ink-4, #a39a8c);
+  text-align: center;
+  user-select: text;
+  border-top: 1px dashed var(--rule-soft, #e5ddc9);
+  margin-top: 12px;
+}
 .capture {
   padding: 8px 12px;
   margin: 0 8px;

@@ -798,6 +798,44 @@ const App = () => {
     })();
   };
 
+  // "Find" icon in the side-panel header. Reads the active tab in
+  // the focused window, finds a tracked thread whose threadUrl
+  // matches, scrolls + flashes the row using the same
+  // threadRowRefs / focusingThreadId machinery we ship for the
+  // background-broadcast focus path. If the active tab isn't a
+  // tracked thread, surface a banner.
+  const findActiveTabThread = (): void => {
+    void (async () => {
+      try {
+        const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        const url = tabs[0]?.url;
+        if (url === undefined) {
+          setError('Could not read the active tab. Try focusing a chat tab first.');
+          return;
+        }
+        const match = state.threads.find((t) => t.threadUrl === url);
+        if (match === undefined) {
+          setError(
+            'The active tab is not a tracked thread. Open one of your tracked chats and try again.',
+          );
+          return;
+        }
+        const node = threadRowRefs.current.get(match.bac_id);
+        node?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        setFocusingThreadId(match.bac_id);
+        window.setTimeout(() => {
+          setFocusingThreadId((prev) => (prev === match.bac_id ? null : prev));
+        }, 1500);
+      } catch (lookupError) {
+        setError(
+          lookupError instanceof Error
+            ? lookupError.message
+            : 'Could not find a matching thread row.',
+        );
+      }
+    })();
+  };
+
   const submitQueueFollowUp = (threadId: string) => {
     const text = queueDraft.trim();
     if (text.length === 0) {
@@ -1909,6 +1947,18 @@ const App = () => {
         <div className="app-actions">
           <button
             className="icon-btn"
+            title="Find this tab in the side panel — scrolls + flashes the matching thread row"
+            onClick={findActiveTabThread}
+            type="button"
+            aria-label="Find active tab in side panel"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="11" cy="11" r="7" />
+              <line x1="21" y1="21" x2="16.65" y2="16.65" />
+            </svg>
+          </button>
+          <button
+            className="icon-btn"
             title={
               state.companionStatus === 'connected'
                 ? 'Attach coding session'
@@ -2349,6 +2399,23 @@ const App = () => {
             </div>
           </div>
         ))}
+      </div>
+
+      {/* Build identity — small mono line at the very bottom of the
+          side panel. Lets the user confirm the loaded extension
+          matches their git state at a glance ("did the new build
+          actually load?"). Sourced from the vite-define inject in
+          wxt.config.ts. */}
+      <div className="build-version mono" title="Sidetrack build identity">
+        v{__BUILD_INFO__.version} · {__BUILD_INFO__.sha} · built{' '}
+        {(() => {
+          try {
+            const d = new Date(__BUILD_INFO__.builtAt);
+            return d.toISOString().slice(11, 16) + ' UTC';
+          } catch {
+            return __BUILD_INFO__.builtAt;
+          }
+        })()}
       </div>
 
       {moveThread ? (
