@@ -2116,17 +2116,16 @@ const App = () => {
                         }
                       });
                     }}
-                    onSubmitBack={() => {
+                    onSubmitBack={(payload) => {
                       if (reviewInFlight) {
                         return;
                       }
+                      // Use the user's verdict + note, NOT a synthetic
+                      // boilerplate. Previous implementation threw the
+                      // form away and shipped a placeholder.
                       void submitReview(
                         reviewThread,
-                        {
-                          verdict: 'partial',
-                          reviewerNote: `Submit-back from Sidetrack — ${reviewThread.title}`,
-                          perSpan: {},
-                        },
+                        payload,
                         'submit_back',
                         spanContext,
                       ).then((ok) => {
@@ -2135,13 +2134,35 @@ const App = () => {
                         }
                       });
                     }}
-                    onDispatchOut={() => {
+                    onDispatchOut={(payload) => {
+                      // Build the dispatch body from the user's review
+                      // payload — verdict, note, and per-span comments
+                      // — instead of the old "…" placeholder.
+                      const perSpanLines = Object.entries(payload.perSpan)
+                        .filter(([, comment]) => comment.trim().length > 0)
+                        .map(([id, comment]) => `- ${id}: ${comment.trim()}`)
+                        .join('\n');
+                      const body = [
+                        `# Review notes`,
+                        '',
+                        `## Source thread`,
+                        `${providerLabel(reviewThread.provider)} · ${reviewThread.threadUrl}`,
+                        '',
+                        `## Verdict`,
+                        payload.verdict,
+                        '',
+                        `## Reviewer note`,
+                        payload.reviewerNote.trim().length > 0 ? payload.reviewerNote : '_(empty)_',
+                        ...(perSpanLines.length > 0
+                          ? ['', `## Per-span comments`, perSpanLines]
+                          : []),
+                      ].join('\n');
                       const dispatchPacket: ComposedPacket = {
                         kind: 'context_pack',
                         template: null,
                         target: 'claude',
                         title: `Review: ${reviewThread.title}`,
-                        body: `# Review notes\n\n## Source thread\n${providerLabel(reviewThread.provider)} · ${reviewThread.threadUrl}\n\n## Notes\n…`,
+                        body,
                         scopeLabel: reviewThread.title,
                         sourceThreadId: reviewThread.bac_id,
                         ...(reviewThread.primaryWorkstreamId !== undefined

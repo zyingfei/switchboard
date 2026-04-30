@@ -51,8 +51,11 @@ describe('UX skeleton components — render-without-crash + key text present', (
     render(<PacketComposer onCancel={noop} onCopy={noop} onSave={noop} onDispatch={noop} />);
     expect(screen.getByText('Research Packet')).toBeInTheDocument();
     expect(screen.getByText('Web-to-AI checklist')).toBeInTheDocument();
-    expect(screen.getByText('Copy to clipboard')).toBeInTheDocument();
-    expect(screen.getByText(/Dispatch$/)).toBeInTheDocument();
+    // Footer is now a primary Dispatch + a split-button caret. Copy /
+    // Save live in the menu, opened via the caret — they're not in the
+    // initial DOM.
+    expect(screen.getByRole('button', { name: /Dispatch/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /More packet actions/ })).toBeInTheDocument();
   });
 
   it('DispatchConfirm renders all four §24.10 safety guards', () => {
@@ -103,9 +106,12 @@ describe('UX skeleton components — render-without-crash + key text present', (
     expect(screen.getByText('A captured assistant turn span.')).toBeInTheDocument();
     expect(screen.getByText('Agree')).toBeInTheDocument();
     expect(screen.getByText('Disagree')).toBeInTheDocument();
-    expect(screen.getByText('Save review only')).toBeInTheDocument();
-    expect(screen.getByText(/Submit-back to Claude/)).toBeInTheDocument();
-    expect(screen.getByText('Dispatch to…')).toBeInTheDocument();
+    // Save is now the primary terminal action ("Save review"); the
+    // two side-effect actions (Submit-back, Dispatch) are demoted to
+    // ghost. They're disabled until the reviewer types a note.
+    expect(screen.getByRole('button', { name: 'Save review' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Submit-back to Claude/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Dispatch to…' })).toBeInTheDocument();
   });
 
   it('Wizard renders welcome step + advances through steps', () => {

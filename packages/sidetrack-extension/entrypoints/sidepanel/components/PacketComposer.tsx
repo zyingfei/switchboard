@@ -103,6 +103,38 @@ const TARGET_LABELS: Record<DispatchTarget, string> = {
   markdown: 'Markdown',
 };
 
+// Group targets so the user sees three intent lanes instead of one
+// flat strip of nine pills:
+//   1. AI providers (web chats) — drives a real dispatch
+//   2. Coding agents (CLI tools) — also a dispatch, different surface
+//   3. Export sinks (Notebook / Markdown) — produces a file, not a chat
+// Tier sub-pills (GPT Pro / Deep Research) nest under their parent
+// provider in the AI lane.
+interface ProviderTargetGroup {
+  readonly id: DispatchTarget;
+  readonly label: string;
+  readonly variants?: readonly { readonly id: DispatchTarget; readonly label: string }[];
+}
+const SEND_TO_AI_TARGETS: readonly ProviderTargetGroup[] = [
+  {
+    id: 'gpt_pro',
+    label: 'GPT',
+    variants: [
+      { id: 'gpt_pro', label: 'Pro' },
+      { id: 'deep_research', label: 'Deep Research' },
+    ],
+  },
+  { id: 'claude', label: 'Claude' },
+  { id: 'gemini', label: 'Gemini' },
+];
+const SEND_TO_CODING_TARGETS: readonly DispatchTarget[] = ['codex', 'claude_code', 'cursor'];
+const EXPORT_AS_TARGETS: readonly DispatchTarget[] = ['notebook', 'markdown'];
+
+// True if the chosen target represents a "send" (AI / coding) action.
+// Notebook / Markdown are file exports, not dispatches.
+const isExportTarget = (t: DispatchTarget): boolean =>
+  t === 'notebook' || t === 'markdown';
+
 const FALLBACK_BODY = `# Context Pack
 
 ## Scope
@@ -287,8 +319,15 @@ export function PacketComposer({
   const [kind, setKind] = useState<PacketKind>(defaultKind);
   const [template, setTemplate] = useState<ResearchTemplate>(defaultTemplate);
   const [target, setTarget] = useState<DispatchTarget | null>(null);
+  // Title is owned by Scope — a packet about a thread is named after
+  // the thread. Click the scope label to rename inline.
   const initialTitle = defaultTitle ?? scope.label.replace(/^Workstream:\s*/i, '').trim();
   const [title, setTitle] = useState(initialTitle);
+  const [scopeEditing, setScopeEditing] = useState(false);
+  // Split-button menu state for the secondary footer actions
+  // (Copy to clipboard / Save to vault). Closed by default; only
+  // opens when the user clicks the caret.
+  const [secondaryMenuOpen, setSecondaryMenuOpen] = useState(false);
 
   const availableTurns = scope.availableTurns ?? [];
   const maxTurns = availableTurns.length;
@@ -339,13 +378,18 @@ export function PacketComposer({
     ...(scope.workstreamId !== undefined ? { workstreamId: scope.workstreamId } : {}),
   });
 
+  // Copy + Save are target-independent — they operate on the body,
+  // not the destination. Only Dispatch needs a target. Use a
+  // stable fallback (markdown) for the packet's `target` field on
+  // the secondary actions so downstream consumers always have a
+  // value, but never demand the user pick one to copy/save.
   const handleCopy = () => {
-    if (target === null) return;
-    onCopy(buildPacket(target));
+    onCopy(buildPacket(target ?? 'markdown'));
+    setSecondaryMenuOpen(false);
   };
   const handleSave = () => {
-    if (target === null) return;
-    onSave(buildPacket(target));
+    onSave(buildPacket(target ?? 'markdown'));
+    setSecondaryMenuOpen(false);
   };
   const handleDispatch = () => {
     if (target === null) return;
@@ -394,26 +438,45 @@ export function PacketComposer({
         </div>
       ) : null}
 
-      <div className="composer-row">
-        <label htmlFor="packet-title">Title</label>
-        <input
-          id="packet-title"
-          type="text"
-          className="packet-title-input"
-          value={title}
-          placeholder="Packet title"
-          onChange={(e) => {
-            setTitle(e.target.value);
-          }}
-        />
-      </div>
-
+      {/* Scope owns the packet name. Click the label to rename
+          inline — the underlying scope.label keeps showing the
+          source thread / workstream identity. */}
       <div className="composer-row">
         <label>Scope</label>
         <div className="composer-scope">
           <div className="scope-pick">
             <span className="scope-icon">{Icons.folder}</span>
-            <span>{scope.label}</span>
+            {scopeEditing ? (
+              <input
+                type="text"
+                autoFocus
+                className="packet-title-input"
+                value={title}
+                placeholder={initialTitle}
+                onChange={(e) => {
+                  setTitle(e.target.value);
+                }}
+                onBlur={() => {
+                  setScopeEditing(false);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === 'Escape') {
+                    setScopeEditing(false);
+                  }
+                }}
+              />
+            ) : (
+              <button
+                type="button"
+                className="scope-label-btn"
+                title="Click to rename this packet"
+                onClick={() => {
+                  setScopeEditing(true);
+                }}
+              >
+                {title.trim().length > 0 ? title : initialTitle}
+              </button>
+            )}
             {scope.meta !== undefined ? (
               <span className="scope-meta mono">{scope.meta}</span>
             ) : null}
@@ -451,10 +514,72 @@ export function PacketComposer({
         </div>
       </div>
 
+      {/* Target now in two lanes — "Send to AI" (chat + coding agents)
+          drives a real Dispatch; "Export as" produces a file. The
+          footer's Dispatch button reads the lane to know whether to
+          ship to a chat or write a file. */}
       <div className="composer-row">
-        <label>Target</label>
+        <label>Send to AI</label>
+        <div className="pill-row pill-row-grouped">
+          {SEND_TO_AI_TARGETS.map((group) => {
+            const groupActive =
+              group.id === target ||
+              (group.variants?.some((v) => v.id === target) ?? false);
+            const isVariantSelected = group.variants?.some((v) => v.id === target) ?? false;
+            return (
+              <span
+                key={group.id}
+                className={'pill-group' + (groupActive ? ' on' : '')}
+              >
+                <button
+                  type="button"
+                  className={'pill ' + (groupActive ? 'on' : '')}
+                  onClick={() => {
+                    setTarget(group.id);
+                  }}
+                >
+                  {group.label}
+                </button>
+                {group.variants !== undefined && groupActive
+                  ? group.variants.map((v) => (
+                      <button
+                        key={v.id}
+                        type="button"
+                        className={'pill pill-variant ' + (target === v.id ? 'on' : '')}
+                        onClick={() => {
+                          setTarget(v.id);
+                        }}
+                      >
+                        {v.label}
+                      </button>
+                    ))
+                  : null}
+                {/* Hide the variant-only highlight when nothing is
+                    selected so the parent pill doesn't read as active
+                    on its own. */}
+                {group.id === target && isVariantSelected ? null : null}
+              </span>
+            );
+          })}
+          {SEND_TO_CODING_TARGETS.map((t) => (
+            <button
+              key={t}
+              type="button"
+              className={'pill ' + (target === t ? 'on' : '')}
+              onClick={() => {
+                setTarget(t);
+              }}
+            >
+              {TARGET_LABELS[t]}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="composer-row">
+        <label>Or export as</label>
         <div className="pill-row">
-          {(Object.keys(TARGET_LABELS) as readonly DispatchTarget[]).map((t) => (
+          {EXPORT_AS_TARGETS.map((t) => (
             <button
               key={t}
               type="button"
@@ -491,11 +616,9 @@ export function PacketComposer({
           </span>
           <span className="mono">({tokenPct}%)</span>
         </div>
-        {redactedItems.length === 0 ? (
-          <div className="redaction-summary">
-            <em>No sensitive items detected.</em>
-          </div>
-        ) : (
+        {/* Only render the redaction line when something was actually
+            redacted. Status-quo confirmations are noise. */}
+        {redactedItems.length > 0 ? (
           <div className="redaction-summary">
             <em>
               Redacted {redactedItems.reduce((sum, r) => sum + r.count, 0)} items:{' '}
@@ -505,38 +628,64 @@ export function PacketComposer({
               [reveal]
             </button>
           </div>
-        )}
+        ) : null}
       </div>
 
+      {/* Footer: Cancel on the left, primary Dispatch on the right
+          with a split-button caret for Copy / Save (target-independent
+          escape hatches). 95% of the time the user wants Dispatch. */}
       <div className="modal-foot">
         <button type="button" className="btn btn-ghost" onClick={onCancel}>
           Cancel
         </button>
-        <button
-          type="button"
-          className="btn btn-ghost"
-          disabled={target === null}
-          onClick={handleCopy}
-        >
-          <span className="icon-12">{Icons.copy}</span> Copy to clipboard
-        </button>
-        <button
-          type="button"
-          className="btn btn-ghost"
-          disabled={target === null}
-          onClick={handleSave}
-        >
-          Save to vault
-        </button>
         <div className="spacer" />
-        <button
-          type="button"
-          className="btn btn-primary"
-          disabled={target === null}
-          onClick={handleDispatch}
-        >
-          <span className="icon-12">{Icons.send}</span> Dispatch
-        </button>
+        <div className="split-button">
+          <button
+            type="button"
+            className="btn btn-primary split-button-main"
+            disabled={target === null}
+            title={
+              target === null
+                ? 'Pick a Send-to-AI target or an Export sink first'
+                : `Dispatch this packet to ${TARGET_LABELS[target]}`
+            }
+            onClick={handleDispatch}
+          >
+            <span className="icon-12">{Icons.send}</span>{' '}
+            {target !== null && isExportTarget(target) ? 'Export' : 'Dispatch'}
+          </button>
+          <button
+            type="button"
+            className="btn btn-primary split-button-caret"
+            aria-label="More packet actions"
+            aria-expanded={secondaryMenuOpen}
+            onClick={() => {
+              setSecondaryMenuOpen(!secondaryMenuOpen);
+            }}
+          >
+            ▾
+          </button>
+          {secondaryMenuOpen ? (
+            <div className="split-button-menu" role="menu">
+              <button
+                type="button"
+                className="split-button-menu-item"
+                role="menuitem"
+                onClick={handleCopy}
+              >
+                <span className="icon-12">{Icons.copy}</span> Copy to clipboard
+              </button>
+              <button
+                type="button"
+                className="split-button-menu-item"
+                role="menuitem"
+                onClick={handleSave}
+              >
+                Save to vault
+              </button>
+            </div>
+          ) : null}
+        </div>
       </div>
     </Modal>
   );

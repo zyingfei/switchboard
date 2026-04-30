@@ -903,6 +903,111 @@ button:disabled {
   color: var(--paper-light);
   border-color: var(--ink);
 }
+
+/* Grouped pill row — used in PacketComposer's "Send to AI" lane to
+   nest tier sub-pills (Pro / Deep Research) under the parent
+   provider pill. The group is just visual sugar; it has no
+   selection state of its own — the parent pill handles selection. */
+.pill-row-grouped {
+  align-items: center;
+}
+.pill-group {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 4px;
+  padding: 2px 4px;
+  border-radius: var(--rad-s);
+}
+.pill-group.on {
+  background: var(--paper-deep);
+}
+.pill.pill-variant {
+  font-size: 10.5px;
+  padding: 3px 8px;
+  letter-spacing: 0.04em;
+  background: transparent;
+  border-color: transparent;
+  color: var(--ink-3);
+}
+.pill.pill-variant.on {
+  background: var(--ink);
+  color: var(--paper-light);
+  border-color: var(--ink);
+}
+
+/* Click-to-rename scope label — looks like editable text not a
+   button until you hover, then a subtle background hint shows it's
+   actionable. */
+.scope-label-btn {
+  background: transparent;
+  border: 0;
+  padding: 0 2px;
+  font: inherit;
+  color: var(--ink);
+  cursor: text;
+  border-radius: var(--rad-s);
+  text-align: left;
+}
+.scope-label-btn:hover {
+  background: var(--paper-deep);
+}
+.scope-label-btn:focus-visible {
+  outline: 1px solid var(--ink-3);
+  outline-offset: 2px;
+}
+
+/* Split-button: primary action + caret that opens a small menu
+   with the secondary actions (Copy / Save). The user gets one
+   clearly-primary CTA without losing the escape hatches. */
+.split-button {
+  position: relative;
+  display: inline-flex;
+}
+.split-button-main {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.split-button-caret {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  border-left: 1px solid var(--paper-tinted);
+  padding-left: 8px;
+  padding-right: 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1;
+}
+.split-button-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 4px);
+  min-width: 180px;
+  display: flex;
+  flex-direction: column;
+  background: var(--paper-light);
+  border: var(--hair);
+  border-radius: var(--rad-s);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.08);
+  padding: 4px;
+  z-index: 10;
+}
+.split-button-menu-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  font-family: var(--display);
+  font-size: 12px;
+  color: var(--ink);
+  background: transparent;
+  border: 0;
+  border-radius: var(--rad-s);
+  text-align: left;
+  cursor: pointer;
+}
+.split-button-menu-item:hover {
+  background: var(--paper-deep);
+}
 .pill:disabled {
   cursor: not-allowed;
   opacity: 0.55;
