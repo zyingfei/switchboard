@@ -173,6 +173,49 @@ const visibleThreads = (threads: readonly TrackedThread[]): readonly TrackedThre
 const restoreStrategyForThread = (thread: TrackedThread): RestoreStrategy =>
   thread.tabSnapshot?.tabId === undefined ? 'reopen_url' : 'focus_open';
 
+// Lifecycle bucket — used by the All Threads view to render explicit
+// subgroup headers. Order matches the user's priority list:
+// Unread → Ungrouped → Waiting on AI → Stale or closed → Normal.
+// A thread goes into the FIRST matching bucket.
+export type AllThreadsBucket = 'unread' | 'ungrouped' | 'waiting' | 'stale' | 'normal';
+
+const ALL_THREAD_BUCKET_ORDER: readonly AllThreadsBucket[] = [
+  'unread',
+  'ungrouped',
+  'waiting',
+  'stale',
+  'normal',
+];
+
+const ALL_THREAD_BUCKET_LABEL: Record<AllThreadsBucket, string> = {
+  unread: 'Unread reply',
+  ungrouped: 'Ungrouped',
+  waiting: 'Waiting on AI',
+  stale: 'Stale or closed',
+  normal: 'Normal',
+};
+
+const isStaleOrClosed = (thread: TrackedThread): boolean =>
+  thread.status === 'closed' ||
+  thread.status === 'restorable' ||
+  thread.status === 'archived' ||
+  thread.status === 'removed' ||
+  thread.trackingMode === 'stopped';
+
+const classifyAllThread = (
+  thread: TrackedThread,
+  reminders: readonly { readonly threadId: string; readonly status: string }[],
+): AllThreadsBucket => {
+  const hasUnread = reminders.some(
+    (r) => r.threadId === thread.bac_id && r.status !== 'dismissed',
+  );
+  if (hasUnread) return 'unread';
+  if (thread.primaryWorkstreamId === undefined) return 'ungrouped';
+  if (thread.lastTurnRole === 'user') return 'waiting';
+  if (isStaleOrClosed(thread)) return 'stale';
+  return 'normal';
+};
+
 // Spec rank order: signal (unread) → amber (waiting on AI / needs
 // organize) → green (you replied last / fresh) → gray (stale /
 // closed). One flat list, signal-first. Tiebreak by lastSeenAt desc.
@@ -1091,16 +1134,22 @@ const App = () => {
     setSelectedWorkstream(id ?? '');
   };
 
-  // Open vs closed/stale buckets across ALL workstreams (used by All view)
-  const openStatuses: TrackedThread['status'][] = ['active', 'tracked', 'queued', 'needs_organize'];
-  const allOpenThreads = sortThreadsByLifecycle(
-    threads.filter((t) => openStatuses.includes(t.status) && t.trackingMode !== 'stopped'),
-    state.reminders,
-  );
-  const allClosedThreads = threads
-    .filter((t) => !openStatuses.includes(t.status) || t.trackingMode === 'stopped')
-    .slice()
-    .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
+  // All Threads view bucketing: classify EVERY thread (open + closed)
+  // into the first matching lifecycle bucket per user priority order.
+  // Within each bucket: lastSeenAt desc.
+  const allThreadsByBucket = (() => {
+    const buckets = new Map<AllThreadsBucket, TrackedThread[]>(
+      ALL_THREAD_BUCKET_ORDER.map((b) => [b, []] as const),
+    );
+    for (const t of threads) {
+      const bucket = classifyAllThread(t, state.reminders);
+      buckets.get(bucket)?.push(t);
+    }
+    for (const [, list] of buckets) {
+      list.sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
+    }
+    return buckets;
+  })();
 
   // Captures: manual notes filtered by the current workstream (or Inbox)
   // plus inbound reminders whose linked thread sits in scope. Notes that
@@ -1122,50 +1171,6 @@ const App = () => {
     currentWsId === null
       ? attachedSessions.filter((s) => s.workstreamId === undefined)
       : attachedSessions.filter((s) => s.workstreamId === currentWsId);
-  const codingSessionsByWs = (() => {
-    const groups = new Map<string | null, CodingSession[]>();
-    groups.set(null, []);
-    for (const ws of state.workstreams) {
-      groups.set(ws.bac_id, []);
-    }
-    for (const session of attachedSessions) {
-      const key = session.workstreamId ?? null;
-      const list = groups.get(key);
-      if (list === undefined) {
-        groups.set(key, [session]);
-      } else {
-        list.push(session);
-      }
-    }
-    return groups;
-  })();
-
-  // Group open threads by primary workstream id (null = inbox/not-set)
-  const openGroups = (() => {
-    const groups = new Map<string | null, TrackedThread[]>();
-    groups.set(null, []);
-    for (const ws of state.workstreams) {
-      groups.set(ws.bac_id, []);
-    }
-    for (const t of allOpenThreads) {
-      const key = t.primaryWorkstreamId ?? null;
-      const list = groups.get(key);
-      if (list === undefined) {
-        groups.set(key, [t]);
-      } else {
-        list.push(t);
-      }
-    }
-    // Show a group if it has any threads OR coding sessions, plus always
-    // surface the inbox so the user can see what hasn't been organized.
-    return Array.from(groups.entries()).filter(([key, list]) => {
-      if (key === null) return true;
-      if (list.length > 0) return true;
-      const sessions = codingSessionsByWs.get(key);
-      return sessions !== undefined && sessions.length > 0;
-    });
-  })();
-
   // Inline thread-row renderer reused across views.
   const renderThreadRow = (thread: TrackedThread) => {
     const isPrivate = isThreadPrivate(thread, state.workstreams);
@@ -1883,58 +1888,28 @@ const App = () => {
       ) : (
         <>
           <div className="sec-head">
-            <span>Open threads</span>
+            <span>All threads</span>
             <span className="count mono">
-              {String(allOpenThreads.length)} active across {String(openGroups.length)} workstream
-              {openGroups.length === 1 ? '' : 's'}
+              {String(threads.length)} total · grouped by lifecycle
             </span>
           </div>
-          <div className="all-groups">
-            {openGroups.map(([wsId, list]) => {
-              const ws = wsId === null ? null : state.workstreams.find((w) => w.bac_id === wsId);
-              const groupLabel = ws === null ? 'not set · Inbox' : (ws?.title ?? 'unknown');
-              const groupSessions = codingSessionsByWs.get(wsId) ?? [];
-              const totalRows = list.length + groupSessions.length;
-              return (
-                <div className="ws-group" key={wsId ?? '__inbox'}>
-                  <button
-                    type="button"
-                    className="ws-group-head"
-                    onClick={() => {
-                      setCurrentWs(wsId);
-                      setViewMode('workstream');
-                    }}
-                  >
-                    <span className="ws-group-label">{groupLabel}</span>
-                    <span className="ws-group-count mono">
-                      {String(totalRows)} item{totalRows === 1 ? '' : 's'} →
-                    </span>
-                  </button>
-                  {totalRows > 0 ? (
-                    <div className="thread-list">
-                      {groupSessions.map(renderCodingSessionRow)}
-                      {list.map(renderThreadRow)}
-                    </div>
-                  ) : (
-                    <div className="thread-empty subtle group-empty">
-                      <p>No open items in this workstream.</p>
-                    </div>
-                  )}
+          {ALL_THREAD_BUCKET_ORDER.map((bucket) => {
+            const list = allThreadsByBucket.get(bucket) ?? [];
+            if (list.length === 0) {
+              return null;
+            }
+            return (
+              <div className={'thread-bucket thread-bucket-' + bucket} key={bucket}>
+                <div className="thread-bucket-head">
+                  <span className="thread-bucket-label">
+                    {ALL_THREAD_BUCKET_LABEL[bucket]}
+                  </span>
+                  <span className="thread-bucket-count mono">{String(list.length)}</span>
                 </div>
-              );
-            })}
-          </div>
-          {allClosedThreads.length > 0 ? (
-            <>
-              <div className="sec-head">
-                <span>Closed · stale</span>
-                <span className="count mono">
-                  {String(allClosedThreads.length)} · ordered by last seen
-                </span>
+                <div className="thread-list">{list.map(renderThreadRow)}</div>
               </div>
-              <div className="thread-list">{allClosedThreads.map(renderThreadRow)}</div>
-            </>
-          ) : null}
+            );
+          })}
         </>
       )}
 
@@ -1971,11 +1946,54 @@ const App = () => {
             <RecentDispatches
               dispatches={dispatchEvents}
               onFocusSource={(id) => {
+                // Click the LEFT side of a row → jump back to the
+                // source thread. If we no longer track that thread
+                // (was removed / archived), surface a banner explaining
+                // why the click did nothing.
                 const dispatch = state.recentDispatches.find((d) => d.bac_id === id);
-                const thread = state.threads.find((t) => t.bac_id === dispatch?.sourceThreadId);
+                if (dispatch === undefined) {
+                  return;
+                }
+                const thread = state.threads.find((t) => t.bac_id === dispatch.sourceThreadId);
                 if (thread !== undefined) {
                   openTabForThread(thread);
+                  return;
                 }
+                setError(
+                  'Source thread is no longer tracked (archived or removed). Use the target side of the row to reopen the destination chat.',
+                );
+              }}
+              onOpenTarget={(id) => {
+                // Click the RIGHT side of a row → reopen the target
+                // chat in a new tab. For chat targets we know the
+                // provider URL; for export targets there's no chat
+                // to reopen so we just say so.
+                const dispatch = state.recentDispatches.find((d) => d.bac_id === id);
+                if (dispatch === undefined) {
+                  return;
+                }
+                // Map companion target.provider → ComposedPacket
+                // target shape used by TARGET_CHAT_URL.
+                const provider = dispatch.target.provider;
+                const targetKey = (
+                  provider === 'chatgpt'
+                    ? 'gpt_pro'
+                    : provider === 'claude_code'
+                      ? 'claude_code'
+                      : provider
+                ) as keyof typeof TARGET_CHAT_URL;
+                const url = TARGET_CHAT_URL[targetKey];
+                if (url !== undefined) {
+                  window.open(url, '_blank', 'noopener,noreferrer');
+                  return;
+                }
+                if (provider === 'other') {
+                  setError(
+                    'This dispatch was an export (Notebook / Markdown). The packet was downloaded as a file at dispatch time — there is no chat to reopen.',
+                  );
+                  return;
+                }
+                setError(`No reopen URL is wired for target "${provider}" yet.`);
               }}
             />
           </>

@@ -1793,6 +1793,13 @@ textarea.preview-body:focus {
   gap: 8px;
   padding: 6px 10px;
   border-bottom: var(--hair-soft);
+  /* Faint hover highlight so the row reads as actionable as a whole.
+     Either side (source / target) is its own clickable button; the
+     row tint is just a visual cue. */
+  transition: background-color 120ms ease;
+}
+.dispatch-row:hover {
+  background: var(--paper-deep);
 }
 .dispatch-source,
 .dispatch-target {
@@ -1806,11 +1813,19 @@ textarea.preview-body:focus {
   font-family: var(--body);
   font-size: 12.5px;
   color: var(--ink);
-  padding: 0;
+  padding: 4px 6px;
+  border-radius: var(--rad-s);
+  margin: -4px -6px;
 }
 .dispatch-source:hover,
 .dispatch-target:hover {
-  text-decoration: underline;
+  background: var(--paper-light);
+  color: var(--signal);
+}
+.dispatch-source:focus-visible,
+.dispatch-target:focus-visible {
+  outline: 1px solid var(--ink);
+  outline-offset: 1px;
 }
 .dispatch-kind {
   color: var(--ink-3);
@@ -3020,6 +3035,59 @@ textarea.preview-body:focus {
   border-radius: 6px;
   background: var(--paper, #f5efe2);
   padding: 4px 0 6px;
+}
+
+/* All Threads lifecycle buckets — explicit subgroup headers in
+   priority order: Unread → Ungrouped → Waiting → Stale or closed
+   → Normal. Each header is a thin caps line with a colored leading
+   tick that matches the dot color used elsewhere, so the bucket
+   identity reads at a glance even when collapsed visually. */
+.thread-bucket {
+  margin: 0 0 14px;
+}
+.thread-bucket-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  border-bottom: 1px dashed var(--rule-soft, #e5ddc9);
+  margin-bottom: 4px;
+}
+.thread-bucket-label::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  margin-right: 8px;
+  vertical-align: middle;
+  background: var(--ink-4);
+}
+.thread-bucket-unread .thread-bucket-label::before {
+  background: var(--signal);
+  box-shadow: 0 0 0 2px var(--signal-tint);
+}
+.thread-bucket-waiting .thread-bucket-label::before {
+  background: var(--amber);
+}
+.thread-bucket-stale .thread-bucket-label::before {
+  background: var(--ink-4);
+}
+.thread-bucket-normal .thread-bucket-label::before {
+  background: var(--green, #16a34a);
+}
+.thread-bucket-ungrouped .thread-bucket-label::before {
+  background: var(--ink-3);
+  border-radius: 1px;
+}
+.thread-bucket-count {
+  margin-left: auto;
+  color: var(--ink-3);
 }
 .ws-group-head {
   display: flex;
