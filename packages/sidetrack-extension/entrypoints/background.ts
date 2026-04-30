@@ -55,6 +55,21 @@ const activeTab = async (): Promise<chrome.tabs.Tab | undefined> => {
   return tab;
 };
 
+// True when the captured thread is the active tab in the currently
+// focused browser window. Auto-capture should NOT create an
+// "Unread reply" reminder in this case — the user is staring at
+// the chat, the new turn is by definition not unread. Pre-existing
+// reminders for the same thread are also dismissed so a stale pill
+// doesn't linger after the user catches up.
+const userIsViewingThreadUrl = async (threadUrl: string): Promise<boolean> => {
+  try {
+    const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    return tabs[0]?.url === threadUrl;
+  } catch {
+    return false;
+  }
+};
+
 const snapshotFromTab = (tab: chrome.tabs.Tab, capturedAt: string) => {
   const url = tab.url ?? '';
   return {
@@ -160,14 +175,20 @@ const sendToCompanion = async (
   await upsertLocalThread(thread, threadResult);
   const lastTurn = event.turns.at(-1);
   if (existingThread !== undefined && lastTurn?.role === 'assistant') {
-    const reminder: ReminderCreate = {
-      threadId: threadResult.bac_id,
-      provider: event.provider,
-      detectedAt: event.capturedAt,
-      status: 'new',
-    };
-    const reminderResult = await client.createReminder(reminder);
-    await createLocalReminder(reminder, reminderResult);
+    if (await userIsViewingThreadUrl(event.threadUrl)) {
+      // User is staring at the chat — the new turn isn't unread.
+      // Also clear any pending pill the user has already caught up on.
+      await dismissRemindersForThread(threadResult.bac_id);
+    } else {
+      const reminder: ReminderCreate = {
+        threadId: threadResult.bac_id,
+        provider: event.provider,
+        detectedAt: event.capturedAt,
+        status: 'new',
+      };
+      const reminderResult = await client.createReminder(reminder);
+      await createLocalReminder(reminder, reminderResult);
+    }
   }
   // Auto-resolve queued follow-ups whose text appears in the captured user
   // turns — the user copied + sent them, so the queue item is fulfilled.
@@ -228,12 +249,16 @@ const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
   await markQueueItemsDoneFromTurns(upserted.bac_id, recentUserTexts);
   const lastTurn = event.turns.at(-1);
   if (existing !== undefined && lastTurn?.role === 'assistant') {
-    await createLocalReminder({
-      threadId: existing.bac_id,
-      provider: event.provider,
-      detectedAt: event.capturedAt,
-      status: 'new',
-    });
+    if (await userIsViewingThreadUrl(event.threadUrl)) {
+      await dismissRemindersForThread(existing.bac_id);
+    } else {
+      await createLocalReminder({
+        threadId: existing.bac_id,
+        provider: event.provider,
+        detectedAt: event.capturedAt,
+        status: 'new',
+      });
+    }
   }
   await recordSelectorCanary(event);
 };
