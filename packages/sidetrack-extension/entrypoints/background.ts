@@ -70,6 +70,30 @@ const userIsViewingThreadUrl = async (threadUrl: string): Promise<boolean> => {
   }
 };
 
+// Look at the currently-active tab in the focused window — if it
+// matches a tracked thread that has any non-dismissed reminder,
+// dismiss them. Called on tab activation/URL-change AND every
+// time the side panel polls workboard state, so an idle chat
+// doesn't leave a stale "Unread reply" pill behind. Returns true
+// if anything changed (caller can broadcast).
+const dismissRemindersForActiveTab = async (): Promise<boolean> => {
+  try {
+    const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    const url = tabs[0]?.url;
+    if (url === undefined) {
+      return false;
+    }
+    const thread = (await readThreads()).find((t) => t.threadUrl === url);
+    if (thread === undefined) {
+      return false;
+    }
+    const dismissed = await dismissRemindersForThread(thread.bac_id);
+    return dismissed > 0;
+  } catch {
+    return false;
+  }
+};
+
 const snapshotFromTab = (tab: chrome.tabs.Tab, capturedAt: string) => {
   const url = tab.url ?? '';
   return {
@@ -906,6 +930,11 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
   }
 
   if (request.type === messageTypes.getWorkboardState) {
+    // Side panel just polled for state — if the user is currently
+    // staring at a tracked thread, drop any "Unread reply" pill for
+    // it before we return so the panel doesn't render the stale
+    // signal. Cheap; runs in parallel with the rest of the build.
+    await dismissRemindersForActiveTab();
     return await withCompanionStatus();
   }
 
@@ -1055,6 +1084,39 @@ export default defineBackground(() => {
 
   chrome.tabs.onRemoved.addListener((tabId) => {
     void markClosedTabRestorable(tabId).catch(() => undefined);
+  });
+
+  // Whenever the user activates a different tab or a tab's URL
+  // changes (SPA nav, browser back/forward), check if they landed
+  // on a tracked thread that has unread-reply reminders waiting.
+  // Dismiss them — they're looking at it now, the pill is wrong.
+  // Broadcast on success so the side panel re-renders without a
+  // poll round-trip.
+  const dismissAndBroadcast = (): void => {
+    void dismissRemindersForActiveTab()
+      .then((changed) => {
+        if (changed) {
+          void broadcastWorkboardChanged('reminder');
+        }
+      })
+      .catch(() => undefined);
+  };
+  chrome.tabs.onActivated.addListener(() => {
+    dismissAndBroadcast();
+  });
+  chrome.tabs.onUpdated.addListener((_tabId, changeInfo) => {
+    // Only react when the URL actually changed — ignore title/favicon
+    // updates that fire on every page mutation.
+    if (changeInfo.url === undefined) {
+      return;
+    }
+    dismissAndBroadcast();
+  });
+  chrome.windows.onFocusChanged.addListener((windowId) => {
+    if (windowId === chrome.windows.WINDOW_ID_NONE) {
+      return;
+    }
+    dismissAndBroadcast();
   });
 
   chrome.runtime.onMessage.addListener(
