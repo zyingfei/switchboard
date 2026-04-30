@@ -47,6 +47,12 @@ export const messageTypes = {
   // auto-link matcher can match against the unredacted text instead
   // of the redacted form the companion stores.
   cacheDispatchOriginal: 'sidetrack.dispatch.cacheOriginal',
+  // Content script asks the background to surface the matching
+  // thread row in the side panel (scroll + flash). Sent from the
+  // floating "↗ Sidetrack" button injected into provider chat
+  // pages. Background relays via the workboard broadcast so the
+  // side panel can pick up the focus target.
+  focusThreadInSidePanel: 'sidetrack.sidepanel.focusThread',
   restoreThreadTab: 'sidetrack.thread.restore-tab',
   queueFollowUp: 'sidetrack.queue.create',
   updateQueueItem: 'sidetrack.queue.update',
@@ -92,6 +98,21 @@ export const isWorkboardChangedMessage = (value: unknown): value is WorkboardCha
   isRecord(value) &&
   value.type === messageTypes.workboardChanged &&
   typeof value.reason === 'string';
+
+// Broadcast: side panel should scroll to + flash the row whose
+// thread.threadUrl matches. Fired by the background after a
+// content-script focus button click.
+export interface FocusThreadInSidePanelMessage {
+  readonly type: typeof messageTypes.focusThreadInSidePanel;
+  readonly threadUrl: string;
+}
+
+export const isFocusThreadInSidePanelMessage = (
+  value: unknown,
+): value is FocusThreadInSidePanelMessage =>
+  isRecord(value) &&
+  value.type === messageTypes.focusThreadInSidePanel &&
+  typeof value.threadUrl === 'string';
 
 export interface ContentRequest {
   readonly type: typeof messageTypes.captureVisibleThread;
@@ -179,6 +200,10 @@ export type WorkboardRequest =
       readonly type: typeof messageTypes.cacheDispatchOriginal;
       readonly dispatchId: string;
       readonly body: string;
+    }
+  | {
+      readonly type: typeof messageTypes.focusThreadInSidePanel;
+      readonly threadUrl: string;
     }
   | {
       readonly type: typeof messageTypes.createReminder;
@@ -344,6 +369,10 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
 
   if (hasType(value, messageTypes.cacheDispatchOriginal)) {
     return typeof value.dispatchId === 'string' && typeof value.body === 'string';
+  }
+
+  if (hasType(value, messageTypes.focusThreadInSidePanel)) {
+    return typeof value.threadUrl === 'string';
   }
 
   if (hasType(value, messageTypes.createReminder)) {

@@ -1084,6 +1084,21 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
     }, 'queue');
   }
 
+  if (request.type === messageTypes.focusThreadInSidePanel) {
+    // Content-script focus button → broadcast to the side panel so
+    // it can scroll + flash the matching thread row. We re-broadcast
+    // verbatim because the side panel listens on chrome.runtime
+    // already (no need for a sticky storage hand-off — the side
+    // panel is always-on once opened).
+    void chrome.runtime
+      .sendMessage({
+        type: messageTypes.focusThreadInSidePanel,
+        threadUrl: request.threadUrl,
+      })
+      .catch(() => undefined);
+    return await withCompanionStatus();
+  }
+
   if (request.type === messageTypes.dispatchAutoSendInNewTab) {
     return await withCompanionStatus(async () => {
       const { url, body } = request;

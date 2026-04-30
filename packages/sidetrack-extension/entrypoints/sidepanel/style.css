@@ -2884,6 +2884,142 @@ textarea.preview-body:focus {
 }
 
 /* =====================================================
+   Inline captured-turn history (click thread title to expand)
+   ===================================================== */
+.thread-turn-history {
+  margin: 4px 0 6px;
+  padding: 6px 0 2px;
+  border-top: 1px solid var(--rule-soft, #e5ddc9);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.thread-turn-history-head {
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.thread-turn-history-count {
+  color: var(--ink-4);
+}
+.thread-turn-history-empty {
+  font-size: 10.5px;
+  color: var(--ink-4);
+  font-style: italic;
+}
+.thread-turn-card {
+  display: grid;
+  grid-template-columns: 50px 1fr auto;
+  gap: 6px 8px;
+  align-items: baseline;
+  padding: 3px 6px;
+  border-radius: var(--rad-s);
+  background: var(--paper);
+}
+.thread-turn-card:hover {
+  background: var(--paper-deep);
+}
+.thread-turn-role {
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  padding: 1px 4px;
+  border: var(--hair);
+  border-radius: 3px;
+  text-align: center;
+  align-self: start;
+}
+.thread-turn-user .thread-turn-role {
+  background: var(--paper-light);
+  border-color: var(--ink-4);
+  color: var(--ink-2);
+}
+.thread-turn-assistant .thread-turn-role {
+  background: var(--signal-bg, #fff7ed);
+  border-color: var(--signal-tint, #fed7aa);
+  color: var(--signal, #c2410c);
+}
+.thread-turn-text {
+  font-family: var(--display);
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--ink);
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+}
+.thread-turn-time {
+  font-size: 10px;
+  color: var(--ink-3);
+  white-space: nowrap;
+  align-self: start;
+}
+
+/* Focus icon — small ↗ arrow next to the title that opens / focuses
+   the chat tab. Stays low-opacity until row hover so it doesn't
+   compete with the title text. */
+.thread-focus-btn {
+  background: transparent;
+  border: 0;
+  padding: 0 4px;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--ink-3);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease, color 120ms ease;
+  flex: 0 0 auto;
+}
+.thread:hover .thread-focus-btn,
+.thread:focus-within .thread-focus-btn {
+  opacity: 1;
+}
+.thread-focus-btn:hover {
+  color: var(--signal, #c2410c);
+}
+.thread-focus-btn:focus-visible {
+  outline: 1px solid var(--ink);
+  outline-offset: 1px;
+  opacity: 1;
+}
+/* Title button now toggles inline history. Add a small chevron-ish
+   visual cue when expanded. */
+.thread-name-btn.expanded {
+  color: var(--signal, #c2410c);
+}
+
+/* Flash when the chat-side floating button asked the side panel to
+   surface this row. The keyframe ramps a paper-deep background with
+   a signal border and fades back to transparent over 1.5s. */
+.thread.focusing {
+  animation: thread-focus-pulse 1.5s ease-out;
+}
+@keyframes thread-focus-pulse {
+  0% {
+    background: var(--signal-bg, #fff7ed);
+    border-color: var(--signal, #c2410c);
+    box-shadow: 0 0 0 4px var(--signal-tint, #fed7aa);
+  }
+  70% {
+    background: var(--paper-deep);
+    border-color: var(--rule-soft, #e5ddc9);
+    box-shadow: 0 0 0 0 transparent;
+  }
+  100% {
+    background: transparent;
+    border-color: transparent;
+    box-shadow: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .thread.focusing {
+    animation: none;
+    background: var(--paper-deep);
+  }
+}
+
+/* =====================================================
    Thread history strip — captures rendered inline under a thread
    ===================================================== */
 .thread-history {

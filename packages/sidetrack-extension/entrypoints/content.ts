@@ -298,5 +298,90 @@ export default defineContentScript({
       subtree: true,
       characterData: true,
     });
+
+    // Mount the floating "↗ Sidetrack" focus button — only on actual
+    // provider chat threads. Clicking it asks the background to
+    // surface the matching thread row in the side panel. Hosted in
+    // a Shadow DOM so the host page's CSS can't break it.
+    const mountFocusButton = (): void => {
+      const provider = detectProviderFromUrl(window.location.href);
+      if (provider === 'unknown') {
+        return;
+      }
+      if (!isProviderThreadUrl(provider, window.location.href)) {
+        return;
+      }
+      if (document.getElementById('sidetrack-focus-host') !== null) {
+        return;
+      }
+      const host = document.createElement('div');
+      host.id = 'sidetrack-focus-host';
+      host.style.position = 'fixed';
+      host.style.right = '16px';
+      host.style.bottom = '16px';
+      host.style.zIndex = '2147483647';
+      host.style.pointerEvents = 'none';
+      const shadow = host.attachShadow({ mode: 'open' });
+      const style = document.createElement('style');
+      style.textContent = `
+        :host { all: initial; }
+        button {
+          pointer-events: auto;
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+          font-size: 11px;
+          letter-spacing: 0.04em;
+          background: rgba(27, 25, 22, 0.78);
+          color: #fbf7ee;
+          border: 1px solid rgba(251, 247, 238, 0.18);
+          border-radius: 6px;
+          padding: 6px 10px;
+          cursor: pointer;
+          opacity: 0.55;
+          transition: opacity 140ms ease, background 140ms ease, transform 140ms ease;
+          backdrop-filter: blur(6px);
+          box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+        }
+        button:hover { opacity: 1; background: rgba(194, 65, 12, 0.92); transform: translateY(-1px); }
+        button:focus-visible { outline: 2px solid #fed7aa; outline-offset: 2px; }
+        .arrow { font-size: 13px; line-height: 1; }
+        .label { font-size: 10.5px; }
+      `;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.title = 'Surface this chat in Sidetrack side panel';
+      btn.innerHTML = '<span class="arrow">↗</span><span class="label">Sidetrack</span>';
+      btn.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        void chrome.runtime
+          .sendMessage({
+            type: messageTypes.focusThreadInSidePanel,
+            threadUrl: window.location.href,
+          })
+          .catch(() => undefined);
+      });
+      shadow.append(style, btn);
+      document.body.appendChild(host);
+    };
+    // Mount once on load + re-check on URL changes (Gemini / Claude
+    // are SPAs; the URL changes without a full page reload).
+    mountFocusButton();
+    let lastHref = window.location.href;
+    new MutationObserver(() => {
+      if (window.location.href !== lastHref) {
+        lastHref = window.location.href;
+        // Tear down the old button if the URL is no longer a thread.
+        const existing = document.getElementById('sidetrack-focus-host');
+        const provider = detectProviderFromUrl(window.location.href);
+        if (provider === 'unknown' || !isProviderThreadUrl(provider, window.location.href)) {
+          existing?.remove();
+        } else if (existing === null) {
+          mountFocusButton();
+        }
+      }
+    }).observe(document.body, { childList: true, subtree: true });
   },
 });

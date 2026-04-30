@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 import {
   companionStatusLabel,
@@ -11,6 +11,7 @@ import {
 import {
   isCaptureFeedbackMessage,
   isRuntimeResponse,
+  isFocusThreadInSidePanelMessage,
   isWorkboardChangedMessage,
   messageTypes,
   type RuntimeResponse,
@@ -426,6 +427,31 @@ const App = () => {
           });
         }, 150);
       }
+      if (isFocusThreadInSidePanelMessage(message)) {
+        // Chat-side floating button → find the matching thread by URL,
+        // scroll its row into view, briefly highlight via the
+        // .focusing CSS class. We read state via a stale closure here,
+        // which is fine — the side panel's last refresh is what the
+        // user is looking at.
+        const targetUrl = message.threadUrl;
+        // Defer to next tick so the message handler doesn't block.
+        window.setTimeout(() => {
+          // Search the live state via a state setter callback to
+          // avoid a stale closure on `state`.
+          setState((current) => {
+            const match = current.threads.find((t) => t.threadUrl === targetUrl);
+            if (match !== undefined) {
+              const node = threadRowRefs.current.get(match.bac_id);
+              node?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              setFocusingThreadId(match.bac_id);
+              window.setTimeout(() => {
+                setFocusingThreadId((prev) => (prev === match.bac_id ? null : prev));
+              }, 1500);
+            }
+            return current;
+          });
+        }, 0);
+      }
     };
     runtimeMessages.addListener(listener);
     return () => {
@@ -541,6 +567,19 @@ const App = () => {
   const [composeTurnsByUrl, setComposeTurnsByUrl] = useState<
     ReadonlyMap<string, readonly CapturedTurnRecord[]>
   >(() => new Map<string, readonly CapturedTurnRecord[]>());
+  // Inline captured-turn history under a thread row. Title click
+  // toggles which thread is expanded; the fetch pattern mirrors
+  // composeTurnsByUrl above. We cache by threadUrl so collapsing
+  // and re-expanding doesn't re-fetch.
+  const [titleExpandedFor, setTitleExpandedFor] = useState<string | null>(null);
+  const [inlineTurnsByUrl, setInlineTurnsByUrl] = useState<
+    ReadonlyMap<string, readonly CapturedTurnRecord[]>
+  >(() => new Map<string, readonly CapturedTurnRecord[]>());
+  // Refs to thread row DOM elements, keyed by bac_id, so the
+  // chat-side focus button can scrollIntoView + flash the matching
+  // row. Map mutated via the ref callback below.
+  const threadRowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const [focusingThreadId, setFocusingThreadId] = useState<string | null>(null);
   useEffect(() => {
     if (
       composeThread === undefined ||
@@ -572,6 +611,47 @@ const App = () => {
       cancelled = true;
     };
   }, [composeThread, bridgeKey, port, composeTurnsByUrl]);
+
+  // Lazy-fetch the most recent turns for the inline-expanded thread.
+  // Triggered when the user clicks the title; cached by threadUrl
+  // so a second expansion of the same row is instant.
+  useEffect(() => {
+    if (titleExpandedFor === null || bridgeKey.length === 0) {
+      return undefined;
+    }
+    const expandedThread = state.threads.find((t) => t.bac_id === titleExpandedFor);
+    if (expandedThread === undefined) {
+      return undefined;
+    }
+    const targetUrl = expandedThread.threadUrl;
+    if (inlineTurnsByUrl.has(targetUrl)) {
+      return undefined;
+    }
+    const portNumber = Number(port);
+    if (!Number.isFinite(portNumber) || portNumber <= 0) {
+      return undefined;
+    }
+    let cancelled = false;
+    const client = createTurnsClient({ port: portNumber, bridgeKey });
+    void client
+      .recentForThread(targetUrl, { limit: 5 })
+      .then((list) => {
+        if (!cancelled) {
+          setInlineTurnsByUrl((prev) => new Map(prev).set(targetUrl, list));
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          // Cache an empty result so we don't keep retrying on a
+          // companion that's down. The user can collapse + re-
+          // expand to retry.
+          setInlineTurnsByUrl((prev) => new Map(prev).set(targetUrl, []));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [titleExpandedFor, state.threads, bridgeKey, port, inlineTurnsByUrl]);
 
   useEffect(() => {
     if (state.companionStatus !== 'connected' || bridgeKey.length === 0) {
@@ -1190,12 +1270,27 @@ const App = () => {
     const isPrivate = isThreadPrivate(thread, state.workstreams);
     const lifecycle = deriveLifecycle(thread, state.reminders);
     const { dotClass, stampLabel, lifecyclePill } = lifecycle;
+    // Two timestamps when we have captured turns:
+    //   - synced (lastSeenAt) = when the side panel last fetched
+    //   - updated (max turn capturedAt) = when the chat last changed
+    // Fall back to a single line when no turns are fetched yet so we
+    // don't display a redundant "synced 2m · updated 2m" pair.
+    const cachedTurnsForRow = inlineTurnsByUrl.get(thread.threadUrl);
+    const lastTurnAt =
+      cachedTurnsForRow !== undefined && cachedTurnsForRow.length > 0
+        ? cachedTurnsForRow.reduce<string>(
+            (latest, t) => (t.capturedAt > latest ? t.capturedAt : latest),
+            '',
+          )
+        : null;
     const stamp =
       thread.status === 'restorable'
         ? `Tab closed · ${formatRelative(thread.lastSeenAt)}`
         : thread.trackingMode === 'stopped'
           ? `Tracking stopped · ${formatRelative(thread.lastSeenAt)}`
-          : `${stampLabel} · ${formatRelative(thread.lastSeenAt)}`;
+          : lastTurnAt !== null && lastTurnAt !== thread.lastSeenAt
+            ? `synced ${formatRelative(thread.lastSeenAt)} · updated ${formatRelative(lastTurnAt)}`
+            : `${stampLabel} · ${formatRelative(thread.lastSeenAt)}`;
     const titleDisplay = isPrivate ? '[private]' : thread.title;
     const pendingQueueItems = state.queueItems.filter(
       (q) => q.targetId === thread.bac_id && q.status === 'pending',
@@ -1220,20 +1315,46 @@ const App = () => {
     const historyExplicitlyToggled = threadHistoryOpen.has(thread.bac_id);
     const historyOpen = historyExplicitlyToggled || threadNotes.length > 0;
     const historyComposeOpen = threadNoteFor === thread.bac_id;
+    const titleExpanded = titleExpandedFor === thread.bac_id;
+    const inlineTurns = inlineTurnsByUrl.get(thread.threadUrl);
+    const isFocusing = focusingThreadId === thread.bac_id;
     return (
-      <div key={thread.bac_id} className="thread">
+      <div
+        key={thread.bac_id}
+        className={'thread' + (isFocusing ? ' focusing' : '')}
+        ref={(node) => {
+          if (node === null) {
+            threadRowRefs.current.delete(thread.bac_id);
+          } else {
+            threadRowRefs.current.set(thread.bac_id, node);
+          }
+        }}
+      >
         <div className="row1">
           <span className={'provider ' + thread.provider}>{providerLabel(thread.provider)}</span>
           <button
             type="button"
-            className="thread-name-btn"
-            title={isPrivate ? 'Open thread tab' : `Open: ${thread.title}`}
+            className={'thread-name-btn' + (titleExpanded ? ' expanded' : '')}
+            title="Click to view captured turns from this thread"
+            aria-expanded={titleExpanded}
+            onClick={(e) => {
+              e.stopPropagation();
+              setTitleExpandedFor(titleExpanded ? null : thread.bac_id);
+            }}
+          >
+            <span className="name">{titleDisplay}</span>
+          </button>
+          <button
+            type="button"
+            className="thread-focus-btn"
+            title={isPrivate ? 'Open thread tab' : `Focus: ${thread.title}`}
+            aria-label="Open or focus the thread tab"
             onClick={(e) => {
               e.stopPropagation();
               openTabForThread(thread);
             }}
           >
-            <span className="name">{titleDisplay}</span>
+            ↗
           </button>
           {queuedCount > 0 ? (
             <button
@@ -1542,6 +1663,42 @@ const App = () => {
               </li>
             ))}
           </ul>
+        ) : null}
+        {titleExpanded ? (
+          <div className="thread-turn-history">
+            <div className="thread-turn-history-head mono">
+              captured turns
+              {inlineTurns !== undefined ? (
+                <span className="thread-turn-history-count">
+                  · {String(inlineTurns.length)} {inlineTurns.length === 1 ? 'turn' : 'turns'}
+                </span>
+              ) : null}
+            </div>
+            {inlineTurns === undefined ? (
+              <div className="thread-turn-history-empty mono">loading…</div>
+            ) : inlineTurns.length === 0 ? (
+              <div className="thread-turn-history-empty mono">
+                no captured turns for this thread (companion may be unreachable)
+              </div>
+            ) : (
+              inlineTurns.map((turn) => (
+                <div
+                  key={`${turn.role}-${String(turn.ordinal)}-${turn.capturedAt}`}
+                  className={'thread-turn-card thread-turn-' + turn.role}
+                >
+                  <span className="thread-turn-role mono">{turn.role}</span>
+                  <span className="thread-turn-text">
+                    {turn.text.length > 200
+                      ? `${turn.text.slice(0, 200).trim()}…`
+                      : turn.text}
+                  </span>
+                  <span className="thread-turn-time mono">
+                    {formatRelative(turn.capturedAt)}
+                  </span>
+                </div>
+              ))
+            )}
+          </div>
         ) : null}
         <div className="thread-history">
           {historyOpen ? (
