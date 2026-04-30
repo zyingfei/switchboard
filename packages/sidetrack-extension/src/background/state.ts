@@ -109,6 +109,7 @@ export const createLocalCaptureNote = async (input: CaptureNoteCreate): Promise<
     kind: input.kind ?? 'manual',
     text: input.text,
     ...(input.workstreamId === undefined ? {} : { workstreamId: input.workstreamId }),
+    ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
     ...(input.source === undefined ? {} : { source: input.source }),
     createdAt: timestamp,
     updatedAt: timestamp,
@@ -281,12 +282,29 @@ export const updateLocalQueueItem = async (
     if (item.bac_id !== queueItemId) {
       return item;
     }
-    updated = {
-      ...item,
-      status: update.status ?? item.status,
-      text: update.text ?? item.text,
+    // lastError tri-state: undefined = leave alone, null = clear,
+    // string = overwrite. Build the next record without lastError
+    // first, then add it back only when it should be set — that way
+    // null actually clears the key rather than carrying it forward
+    // from the old record via the spread.
+    const status = update.status ?? item.status;
+    const text = update.text ?? item.text;
+    const next: QueueItem = {
+      bac_id: item.bac_id,
+      text,
+      scope: item.scope,
+      ...(item.targetId === undefined ? {} : { targetId: item.targetId }),
+      status,
+      createdAt: item.createdAt,
       updatedAt: timestamp,
     };
+    let nextLastError: string | undefined = item.lastError;
+    if (update.lastError === null) {
+      nextLastError = undefined;
+    } else if (typeof update.lastError === 'string') {
+      nextLastError = update.lastError;
+    }
+    updated = nextLastError === undefined ? next : { ...next, lastError: nextLastError };
     return updated;
   });
   await storageSet({ [QUEUE_ITEMS_KEY]: next });

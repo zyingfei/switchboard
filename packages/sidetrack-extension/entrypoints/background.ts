@@ -2,7 +2,12 @@ import { defineBackground } from 'wxt/utils/define-background';
 
 import { captureGenericTab } from '../src/capture/genericFallback';
 import { detectProviderFromUrl, isProviderThreadUrl } from '../src/capture/providerDetection';
+import {
+  DEFAULT_LOCAL_CONFIG,
+  runAutoSendDrain as driveAutoSendImpl,
+} from '../src/companion/autoSendDrain';
 import { createCompanionClient } from '../src/companion/client';
+import { createSettingsClient } from '../src/settings/client';
 import type {
   CaptureEvent,
   CodingAttachTokenCreate,
@@ -32,6 +37,7 @@ import {
   createLocalWorkstream,
   deleteLocalCaptureNote,
   markQueueItemsDoneFromTurns,
+  readQueueItems,
   readThreads,
   readSettings,
   recordSelectorCanary,
@@ -50,6 +56,45 @@ import {
 const activeTab = async (): Promise<chrome.tabs.Tab | undefined> => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   return tab;
+};
+
+// True when the captured thread is the active tab in the currently
+// focused browser window. Auto-capture should NOT create an
+// "Unread reply" reminder in this case — the user is staring at
+// the chat, the new turn is by definition not unread. Pre-existing
+// reminders for the same thread are also dismissed so a stale pill
+// doesn't linger after the user catches up.
+const userIsViewingThreadUrl = async (threadUrl: string): Promise<boolean> => {
+  try {
+    const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    return tabs[0]?.url === threadUrl;
+  } catch {
+    return false;
+  }
+};
+
+// Look at the currently-active tab in the focused window — if it
+// matches a tracked thread that has any non-dismissed reminder,
+// dismiss them. Called on tab activation/URL-change AND every
+// time the side panel polls workboard state, so an idle chat
+// doesn't leave a stale "Unread reply" pill behind. Returns true
+// if anything changed (caller can broadcast).
+const dismissRemindersForActiveTab = async (): Promise<boolean> => {
+  try {
+    const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    const url = tabs[0]?.url;
+    if (url === undefined) {
+      return false;
+    }
+    const thread = (await readThreads()).find((t) => t.threadUrl === url);
+    if (thread === undefined) {
+      return false;
+    }
+    const dismissed = await dismissRemindersForThread(thread.bac_id);
+    return dismissed > 0;
+  } catch {
+    return false;
+  }
 };
 
 const snapshotFromTab = (tab: chrome.tabs.Tab, capturedAt: string) => {
@@ -157,14 +202,20 @@ const sendToCompanion = async (
   await upsertLocalThread(thread, threadResult);
   const lastTurn = event.turns.at(-1);
   if (existingThread !== undefined && lastTurn?.role === 'assistant') {
-    const reminder: ReminderCreate = {
-      threadId: threadResult.bac_id,
-      provider: event.provider,
-      detectedAt: event.capturedAt,
-      status: 'new',
-    };
-    const reminderResult = await client.createReminder(reminder);
-    await createLocalReminder(reminder, reminderResult);
+    if (await userIsViewingThreadUrl(event.threadUrl)) {
+      // User is staring at the chat — the new turn isn't unread.
+      // Also clear any pending pill the user has already caught up on.
+      await dismissRemindersForThread(threadResult.bac_id);
+    } else {
+      const reminder: ReminderCreate = {
+        threadId: threadResult.bac_id,
+        provider: event.provider,
+        detectedAt: event.capturedAt,
+        status: 'new',
+      };
+      const reminderResult = await client.createReminder(reminder);
+      await createLocalReminder(reminder, reminderResult);
+    }
   }
   // Auto-resolve queued follow-ups whose text appears in the captured user
   // turns — the user copied + sent them, so the queue item is fulfilled.
@@ -225,12 +276,16 @@ const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
   await markQueueItemsDoneFromTurns(upserted.bac_id, recentUserTexts);
   const lastTurn = event.turns.at(-1);
   if (existing !== undefined && lastTurn?.role === 'assistant') {
-    await createLocalReminder({
-      threadId: existing.bac_id,
-      provider: event.provider,
-      detectedAt: event.capturedAt,
-      status: 'new',
-    });
+    if (await userIsViewingThreadUrl(event.threadUrl)) {
+      await dismissRemindersForThread(existing.bac_id);
+    } else {
+      await createLocalReminder({
+        threadId: existing.bac_id,
+        provider: event.provider,
+        detectedAt: event.capturedAt,
+        status: 'new',
+      });
+    }
   }
   await recordSelectorCanary(event);
 };
@@ -317,6 +372,177 @@ const assertCompanionReachable = async (): Promise<'connected' | 'vault-error' |
   }
   const status = await createCompanionClient(settings.companion).status();
   return status.vault === 'connected' ? 'connected' : 'vault-error';
+};
+
+// Find the live tab that hosts a tracked thread. Try the snapshot's
+// tabId first (covers the common case where the user keeps the tab
+// open), then fall back to a URL match. chrome.tabs.query treats
+// `url` as a match pattern, so plain literal URLs may fail to match
+// when the live URL has hash/query fragments. The tabSnapshot path
+// avoids that entirely.
+const findTabForThread = async (
+  thread: { tabSnapshot?: { tabId?: number }; threadUrl: string },
+): Promise<{ tabId?: number; reason?: string }> => {
+  const snapshotId = thread.tabSnapshot?.tabId;
+  if (typeof snapshotId === 'number') {
+    try {
+      const tab = await chrome.tabs.get(snapshotId);
+      if (typeof tab.id === 'number') {
+        return { tabId: tab.id };
+      }
+    } catch {
+      // Tab was closed; fall through to URL match.
+    }
+  }
+  try {
+    const tabs = await chrome.tabs.query({ url: thread.threadUrl });
+    const found = tabs.find((tab) => typeof tab.id === 'number');
+    if (found?.id !== undefined) {
+      return { tabId: found.id };
+    }
+  } catch {
+    // chrome.tabs.query rejects on invalid match patterns — fall through.
+  }
+  return { reason: 'Open the chat tab; auto-send needs the conversation visible to type into.' };
+};
+
+// Chrome's exact error string when sendMessage targets a tab with
+// no live content script — happens when the user reloaded the
+// extension but didn't reload the chat tab, so the new content
+// script never injected itself into the existing page. We catch
+// this specifically and recover with chrome.scripting.executeScript.
+const RECEIVER_MISSING = /Receiving end does not exist/i;
+
+const ensureContentScriptInTab = async (tabId: number): Promise<{ ok: boolean; error?: string }> => {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content-scripts/content.js'],
+    });
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : 'Could not inject content script.',
+    };
+  }
+};
+
+// Send `message` to the tab's content script, recovering once from
+// the receiver-missing condition by injecting content.js then
+// retrying. Any other error is returned as-is.
+const sendToContentScriptWithRecovery = async (
+  tabId: number,
+  message: unknown,
+): Promise<{ ok: boolean; data?: unknown; error?: string }> => {
+  const attempt = async (): Promise<{ ok: boolean; data?: unknown; error?: string }> => {
+    try {
+      const data: unknown = await chrome.tabs.sendMessage(tabId, message);
+      return { ok: true, data };
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : 'Content script is not reachable.',
+      };
+    }
+  };
+
+  const first = await attempt();
+  if (first.ok || !RECEIVER_MISSING.test(first.error ?? '')) {
+    return first;
+  }
+  const inject = await ensureContentScriptInTab(tabId);
+  if (!inject.ok) {
+    return {
+      ok: false,
+      error: `${first.error ?? 'Receiving end does not exist.'} Tried to recover but: ${inject.error ?? 'inject failed'}.`,
+    };
+  }
+  return await attempt();
+};
+
+// Wires real chrome.* / network ports to the pure orchestrator in
+// src/companion/autoSendDrain.ts. The orchestrator handles the
+// per-item §24.10 preflight, sequencing, stop-on-failure, and the
+// status / lastError transitions. See that file for flow + reasoning.
+const runAutoSendDrain = async (threadId: string): Promise<boolean> => {
+  const outcome = await driveAutoSendImpl(threadId, {
+    readThread: async (id) => {
+      const t = (await readThreads()).find((x) => x.bac_id === id);
+      if (t === undefined) {
+        return undefined;
+      }
+      return {
+        bac_id: t.bac_id,
+        provider: t.provider,
+        threadUrl: t.threadUrl,
+        ...(t.autoSendEnabled === undefined ? {} : { autoSendEnabled: t.autoSendEnabled }),
+      };
+    },
+    readPendingItemsForThread: async (id) => {
+      return (await readQueueItems()).filter((item) => item.targetId === id);
+    },
+    readCompanionConfig: async () => {
+      const localSettings = await readSettings();
+      // Per-provider opt-in + screenShareSafeMode live on the companion
+      // when configured. Local-only users don't have a companion to store
+      // those flags, so fall back to "the per-thread toggle is the
+      // consent" — the user explicitly flipped Auto-send: on.
+      if (localSettings.companion.bridgeKey.trim().length === 0) {
+        return DEFAULT_LOCAL_CONFIG;
+      }
+      try {
+        const companionSettings = await createSettingsClient(localSettings.companion).read();
+        return {
+          autoSendOptIn: companionSettings.autoSendOptIn,
+          screenShareSafeMode: companionSettings.screenShareSafeMode,
+        };
+      } catch (error) {
+        console.warn(
+          '[autoSend] could not fetch companion settings; falling back to local defaults:',
+          error instanceof Error ? error.message : error,
+        );
+        return DEFAULT_LOCAL_CONFIG;
+      }
+    },
+    findTabForThread: async (t) => await findTabForThread(t),
+    sendItemToTab: async (tabId, text) => {
+      const dispatch = await sendToContentScriptWithRecovery(tabId, {
+        type: messageTypes.autoSendItem,
+        text,
+        perItemTimeoutMs: 90_000,
+      });
+      if (!dispatch.ok) {
+        return { ok: false, error: dispatch.error ?? 'Content script is not reachable.' };
+      }
+      const raw = dispatch.data;
+      if (typeof raw !== 'object' || raw === null || !('ok' in raw)) {
+        return { ok: false, error: 'Content script returned an unexpected response.' };
+      }
+      return raw as { ok: boolean; error?: string };
+    },
+    updateQueueItem: async (itemId, update) => {
+      await updateLocalQueueItem(itemId, update);
+    },
+    logWarning: (message: string) => {
+      console.warn(message);
+    },
+  });
+  return outcome.mutated;
+};
+
+// Fire-and-forget wrapper: spawns the drain unawaited and broadcasts
+// the workboard once it lands so the side panel re-reads the queue.
+const triggerAutoSendDrain = (threadId: string): void => {
+  void runAutoSendDrain(threadId)
+    .then((mutated) => {
+      if (mutated) {
+        void broadcastWorkboardChanged('queue');
+      }
+    })
+    .catch((error: unknown) => {
+      console.warn('[autoSend] drain crashed:', error);
+    });
 };
 
 const currentTabThread = async (): Promise<TrackedThread | undefined> => {
@@ -457,18 +683,28 @@ const updateWorkstream = async (workstreamId: string, update: WorkstreamUpdate):
 const createQueueItem = async (item: QueueCreate): Promise<void> => {
   if (!(await isCompanionConfigured())) {
     await createLocalQueueItem(item);
-    return;
+  } else {
+    const settings = await readSettings();
+    const client = createCompanionClient(settings.companion);
+    try {
+      const result = await client.createQueueItem(
+        item,
+        idempotencyKey('queue', `${item.scope}-${item.targetId ?? 'global'}-${item.text}`),
+      );
+      await createLocalQueueItem(item, result);
+    } catch {
+      await createLocalQueueItem(item);
+    }
   }
-  const settings = await readSettings();
-  const client = createCompanionClient(settings.companion);
-  try {
-    const result = await client.createQueueItem(
-      item,
-      idempotencyKey('queue', `${item.scope}-${item.targetId ?? 'global'}-${item.text}`),
-    );
-    await createLocalQueueItem(item, result);
-  } catch {
-    await createLocalQueueItem(item);
+  // If this item targets a thread that already has Auto-send: on, the
+  // user expects it to ship immediately — they don't need to flip the
+  // toggle off and back on. Drain runs unawaited; the side panel sees
+  // the result via the queue broadcast in triggerAutoSendDrain.
+  if (item.scope === 'thread' && typeof item.targetId === 'string') {
+    const targetThread = (await readThreads()).find((t) => t.bac_id === item.targetId);
+    if (targetThread?.autoSendEnabled === true) {
+      triggerAutoSendDrain(targetThread.bac_id);
+    }
   }
 };
 
@@ -638,6 +874,11 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
   }
 
   if (request.type === messageTypes.getWorkboardState) {
+    // Side panel just polled for state — if the user is currently
+    // staring at a tracked thread, drop any "Unread reply" pill for
+    // it before we return so the panel doesn't render the stale
+    // signal. Cheap; runs in parallel with the rest of the build.
+    await dismissRemindersForActiveTab();
     return await withCompanionStatus();
   }
 
@@ -672,6 +913,19 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
     );
   }
 
+  if (request.type === messageTypes.retryAutoSend) {
+    return await withCompanionStatus(async () => {
+      // Clear lastError so the row stops showing the failure note
+      // immediately (the side panel re-renders before the drain
+      // finishes), then re-fire the drain for the item's thread.
+      const item = (await readQueueItems()).find((i) => i.bac_id === request.queueItemId);
+      await updateLocalQueueItem(request.queueItemId, { lastError: null });
+      if (item?.scope === 'thread' && typeof item.targetId === 'string') {
+        triggerAutoSendDrain(item.targetId);
+      }
+    }, 'queue');
+  }
+
   if (request.type === messageTypes.moveThread) {
     return await withCompanionStatus(
       () => moveThread(request.threadId, request.workstreamId),
@@ -689,6 +943,14 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
   if (request.type === messageTypes.setThreadAutoSend) {
     return await withCompanionStatus(async () => {
       await setThreadAutoSend(request.threadId, request.enabled);
+      // Auto-fire the drain when the toggle flips ON. The trigger
+      // helper spawns it unawaited so the runtime response returns
+      // immediately — the drain can take many seconds per item, and
+      // the side panel re-reads workboard state on the queue
+      // broadcast that fires when the drain completes.
+      if (request.enabled) {
+        triggerAutoSendDrain(request.threadId);
+      }
     }, 'thread');
   }
 
@@ -772,13 +1034,103 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
   return await withCompanionStatus();
 };
 
+// URL match patterns the content script wants to live in. Kept in
+// sync with the `matches` field on entrypoints/content.ts (and the
+// generated manifest's content_scripts[].matches). Used by the
+// startup re-injection loop below — Chrome MV3 doesn't replay
+// content_scripts into pre-existing tabs after an extension reload,
+// so we have to do it ourselves.
+const CONTENT_SCRIPT_MATCH_PATTERNS = [
+  'https://chatgpt.com/*',
+  'https://chat.openai.com/*',
+  'https://claude.ai/*',
+  'https://gemini.google.com/*',
+  'http://127.0.0.1/*',
+  'http://localhost/*',
+];
+
+const reinjectContentScriptIntoOpenTabs = async (): Promise<void> => {
+  try {
+    const tabs = await chrome.tabs.query({ url: CONTENT_SCRIPT_MATCH_PATTERNS });
+    await Promise.all(
+      tabs.map(async (tab) => {
+        if (typeof tab.id !== 'number') {
+          return;
+        }
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            files: ['content-scripts/content.js'],
+          });
+        } catch {
+          // Restricted pages (chrome://, the Web Store, etc.) reject the
+          // injection. That's expected — skip them quietly.
+        }
+      }),
+    );
+  } catch {
+    // chrome.tabs.query / scripting unavailable — nothing useful to log.
+  }
+};
+
 export default defineBackground(() => {
-  chrome.runtime.onInstalled.addListener(() => {
+  chrome.runtime.onInstalled.addListener((details) => {
     void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => undefined);
+    // Heal pre-existing tabs after an install/update/reload so the
+    // user doesn't have to refresh each chat tab manually. The first
+    // install case is harmless: matching tabs that already had no
+    // script get one; tabs that have one shrug it off.
+    if (
+      details.reason === 'install' ||
+      details.reason === 'update' ||
+      details.reason === 'chrome_update'
+    ) {
+      void reinjectContentScriptIntoOpenTabs();
+    }
+  });
+
+  // Service workers can be restarted by Chrome on idle — onStartup
+  // fires when the browser launches. Re-inject is cheap and idempotent
+  // so we can always do it.
+  chrome.runtime.onStartup.addListener(() => {
+    void reinjectContentScriptIntoOpenTabs();
   });
 
   chrome.tabs.onRemoved.addListener((tabId) => {
     void markClosedTabRestorable(tabId).catch(() => undefined);
+  });
+
+  // Whenever the user activates a different tab or a tab's URL
+  // changes (SPA nav, browser back/forward), check if they landed
+  // on a tracked thread that has unread-reply reminders waiting.
+  // Dismiss them — they're looking at it now, the pill is wrong.
+  // Broadcast on success so the side panel re-renders without a
+  // poll round-trip.
+  const dismissAndBroadcast = (): void => {
+    void dismissRemindersForActiveTab()
+      .then((changed) => {
+        if (changed) {
+          void broadcastWorkboardChanged('reminder');
+        }
+      })
+      .catch(() => undefined);
+  };
+  chrome.tabs.onActivated.addListener(() => {
+    dismissAndBroadcast();
+  });
+  chrome.tabs.onUpdated.addListener((_tabId, changeInfo) => {
+    // Only react when the URL actually changed — ignore title/favicon
+    // updates that fire on every page mutation.
+    if (changeInfo.url === undefined) {
+      return;
+    }
+    dismissAndBroadcast();
+  });
+  chrome.windows.onFocusChanged.addListener((windowId) => {
+    if (windowId === chrome.windows.WINDOW_ID_NONE) {
+      return;
+    }
+    dismissAndBroadcast();
   });
 
   chrome.runtime.onMessage.addListener(

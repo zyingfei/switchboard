@@ -83,6 +83,9 @@ export interface CaptureNoteCreate {
   readonly text: string;
   readonly kind?: 'manual' | 'obsidian' | 'external';
   readonly workstreamId?: string;
+  // When set, the note attaches to a specific thread and renders
+  // inline as part of that thread's history.
+  readonly threadId?: string;
   readonly source?: string;
 }
 
@@ -126,6 +129,8 @@ export interface QueueCreate {
 export interface QueueUpdate {
   readonly status?: 'pending' | 'done' | 'dismissed';
   readonly text?: string;
+  // Pass null to clear; pass a string to set; omit to leave unchanged.
+  readonly lastError?: string | null;
 }
 
 export interface CodingAttachTokenCreate {
