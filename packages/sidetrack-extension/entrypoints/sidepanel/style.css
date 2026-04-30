@@ -1802,6 +1802,41 @@ button:disabled {
   letter-spacing: 0.04em;
 }
 
+/* Read-only vault status block — shown when companion is connected so
+   the user can copy the vault path / bridge key file location. Looks
+   like a small terminal-output panel to signal "this is a fact about
+   the running process, not a setting you can edit here." */
+.settings-vault-status {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border: var(--hair);
+  border-radius: var(--rad-s);
+  background: var(--paper-deep);
+  display: grid;
+  gap: 4px;
+}
+.settings-vault-status-row {
+  display: grid;
+  grid-template-columns: 80px 1fr;
+  gap: 8px;
+  align-items: baseline;
+}
+.settings-vault-status-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-3);
+}
+.settings-vault-status-value {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink);
+  background: transparent;
+  word-break: break-all;
+  user-select: text;
+}
+
 .settings-archive-list {
   list-style: none;
   margin: 0;

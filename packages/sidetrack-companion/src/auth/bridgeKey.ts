@@ -7,14 +7,24 @@ export const bridgeKeyPath = (vaultPath: string): string =>
 
 export const createBridgeKey = (): string => randomBytes(32).toString('base64url');
 
-export const ensureBridgeKey = async (vaultPath: string): Promise<string> => {
+export interface EnsuredBridgeKey {
+  readonly key: string;
+  readonly path: string;
+  // True if this call generated the key (first run); false if an
+  // existing key file was reused. CLI uses this to decide whether
+  // to print the key value (only on first generation — subsequent
+  // runs just point the user at the file path).
+  readonly created: boolean;
+}
+
+export const ensureBridgeKey = async (vaultPath: string): Promise<EnsuredBridgeKey> => {
   const path = bridgeKeyPath(vaultPath);
 
   try {
     const existing = await readFile(path, 'utf8');
     const trimmed = existing.trim();
     if (trimmed.length > 0) {
-      return trimmed;
+      return { key: trimmed, path, created: false };
     }
   } catch (error) {
     if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') {
@@ -25,7 +35,7 @@ export const ensureBridgeKey = async (vaultPath: string): Promise<string> => {
   const key = createBridgeKey();
   await mkdir(join(vaultPath, '_BAC', '.config'), { recursive: true });
   await writeFile(path, `${key}\n`, { encoding: 'utf8', mode: 0o600 });
-  return key;
+  return { key, path, created: true };
 };
 
 export const bridgeKeysMatch = (expected: string, actual: string): boolean => {

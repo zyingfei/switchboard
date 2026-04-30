@@ -115,7 +115,7 @@ describe('companion HTTP server', () => {
 
   beforeEach(async () => {
     vaultPath = await mkdtemp(join(tmpdir(), 'sidetrack-companion-test-'));
-    bridgeKey = await ensureBridgeKey(vaultPath);
+    bridgeKey = (await ensureBridgeKey(vaultPath)).key;
     context = {
       bridgeKey,
       vaultWriter: createVaultWriter(vaultPath),
