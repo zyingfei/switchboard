@@ -91,7 +91,7 @@ describe('UX skeleton components — render-without-crash + key text present', (
     expect(screen.getByText(/Captured-page injection detected/)).toBeInTheDocument();
   });
 
-  it('ReviewComposer renders span quote, verdict picker, and three actions', () => {
+  it('ReviewComposer renders editable span + comment-driven actions', () => {
     render(
       <ReviewComposer
         provider="Claude"
@@ -99,19 +99,26 @@ describe('UX skeleton components — render-without-crash + key text present', (
         spans={[{ id: 's1', text: 'A captured assistant turn span.' }]}
         onClose={noop}
         onSave={noop}
-        onSubmitBack={noop}
+        onSendBack={noop}
         onDispatchOut={noop}
       />,
     );
-    expect(screen.getByText('A captured assistant turn span.')).toBeInTheDocument();
-    expect(screen.getByText('Agree')).toBeInTheDocument();
-    expect(screen.getByText('Disagree')).toBeInTheDocument();
-    // Save is now the primary terminal action ("Save review"); the
-    // two side-effect actions (Submit-back, Dispatch) are demoted to
-    // ghost. They're disabled until the reviewer types a note.
-    expect(screen.getByRole('button', { name: 'Save review' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Submit-back to Claude/ })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Dispatch to…' })).toBeInTheDocument();
+    // Span text is now an editable textarea, not a static blockquote.
+    expect(
+      screen.getByDisplayValue('A captured assistant turn span.'),
+    ).toBeInTheDocument();
+    // Verdict picker is hidden behind a disclosure — only the
+    // disclosure button is in the initial DOM.
+    expect(screen.getByRole('button', { name: /add verdict/i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Agree' })).toBeNull();
+    // Three terminal actions: Save only / Dispatch to other AI / Send back.
+    expect(screen.getByRole('button', { name: 'Save only' })).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /Dispatch to other AI/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /Send back to Claude/ }),
+    ).toBeInTheDocument();
   });
 
   it('Wizard renders welcome step + advances through steps', () => {

@@ -13,112 +13,124 @@ const renderComposer = (overrides: Partial<Parameters<typeof ReviewComposer>[0]>
       spans={[{ id: 's1', text: 'A captured assistant turn span.' }]}
       onClose={noop}
       onSave={noop}
-      onSubmitBack={noop}
+      onSendBack={noop}
       onDispatchOut={noop}
       {...overrides}
     />,
   );
 
-describe('ReviewComposer — order + defaults', () => {
-  it('renders Verdict before Reviewer note (thesis-first reading order)', () => {
+describe('ReviewComposer — verdict is optional + de-emphasized', () => {
+  it('hides the verdict pills behind a disclosure by default', () => {
     renderComposer();
-    const labels = screen
-      .getAllByText(/Verdict|Reviewer note/, { selector: 'label' })
-      .map((node) => node.textContent);
-    expect(labels[0]).toBe('Verdict');
-    expect(labels[1]).toBe('Reviewer note');
+    expect(screen.queryByRole('button', { name: 'Agree' })).toBeNull();
+    expect(screen.getByRole('button', { name: /add verdict/i })).toBeInTheDocument();
   });
 
-  it('does not pre-select a verdict (no biased default)', () => {
+  it('opens the verdict picker when "+ add verdict" is clicked', () => {
     renderComposer();
-    // None of the verdict pills should carry the .on selection class
-    // when the form first opens.
-    const verdictButtons = screen.getAllByRole('button', {
-      name: /Agree|Disagree|Partial|Needs source|Open/,
-    });
-    expect(verdictButtons.every((btn) => !btn.className.includes(' on'))).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: /add verdict/i }));
+    expect(screen.getByRole('button', { name: 'Agree' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Disagree' })).toBeInTheDocument();
   });
 
-  it('honours an explicit defaultVerdict when caller passes one', () => {
+  it('honours an explicit defaultVerdict by opening the picker pre-selected', () => {
     renderComposer({ defaultVerdict: 'agree' });
     const agree = screen.getByRole('button', { name: 'Agree' });
     expect(agree.className).toContain('on');
   });
+
+  it('toggles a verdict off when its pill is clicked twice', () => {
+    renderComposer({ defaultVerdict: 'agree' });
+    const agree = screen.getByRole('button', { name: 'Agree' });
+    fireEvent.click(agree);
+    expect(agree.className).not.toContain('on');
+  });
 });
 
-describe('ReviewComposer — note-gate on side-effect actions', () => {
-  it('disables Submit-back and Dispatch-to until a reviewer note is typed', () => {
+describe('ReviewComposer — comment-driven gating', () => {
+  it('disables Send-back and Dispatch-to until any comment is typed', () => {
     renderComposer();
-    const submitBack = screen.getByRole('button', { name: /Submit-back to Claude/ });
-    const dispatchOut = screen.getByRole('button', { name: /Dispatch to…/ });
-    const save = screen.getByRole('button', { name: 'Save review' });
-    expect(submitBack).toBeDisabled();
-    expect(dispatchOut).toBeDisabled();
-    // Save is the always-safe terminal action — never gated.
-    expect(save).not.toBeDisabled();
+    expect(screen.getByRole('button', { name: /Send back to Claude/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /Dispatch to other AI/i })).toBeDisabled();
+    // Save-only is always available — it's the safe path.
+    expect(screen.getByRole('button', { name: 'Save only' })).not.toBeDisabled();
   });
 
-  it('enables Submit-back + Dispatch-to once the user types a note', () => {
+  it('enables Send-back when the per-span comment field has text', () => {
     renderComposer();
-    const note = screen.getByPlaceholderText(/Overall: what's right/);
-    fireEvent.change(note, { target: { value: 'My actual feedback' } });
-    expect(screen.getByRole('button', { name: /Submit-back to Claude/ })).not.toBeDisabled();
-    expect(screen.getByRole('button', { name: /Dispatch to…/ })).not.toBeDisabled();
+    fireEvent.change(screen.getByPlaceholderText(/right, what's wrong/), {
+      target: { value: 'Source for this claim?' },
+    });
+    expect(screen.getByRole('button', { name: /Send back to Claude/i })).not.toBeDisabled();
+  });
+
+  it('enables Send-back when only the overall note is typed', () => {
+    renderComposer();
+    fireEvent.change(screen.getByPlaceholderText(/ties the per-span/), {
+      target: { value: 'Solid summary, missing one citation.' },
+    });
+    expect(screen.getByRole('button', { name: /Send back to Claude/i })).not.toBeDisabled();
+  });
+});
+
+describe('ReviewComposer — inline span editing', () => {
+  it('renders the captured span as an editable textarea', () => {
+    renderComposer({
+      spans: [{ id: 'sX', text: 'original captured text' }],
+    });
+    const editor = screen.getByDisplayValue('original captured text');
+    expect(editor.tagName).toBe('TEXTAREA');
+  });
+
+  it('passes the edited span text in the payload', () => {
+    const onSave = vi.fn();
+    renderComposer({
+      spans: [{ id: 'sX', text: 'original' }],
+      onSave,
+    });
+    fireEvent.change(screen.getByDisplayValue('original'), {
+      target: { value: 'corrected wording' },
+    });
+    fireEvent.change(screen.getByPlaceholderText(/right, what's wrong/), {
+      target: { value: 'fixed transcription' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save only' }));
+    expect(onSave).toHaveBeenCalledTimes(1);
+    expect(onSave).toHaveBeenCalledWith(
+      expect.objectContaining({
+        spanText: { sX: 'corrected wording' },
+        perSpan: { sX: 'fixed transcription' },
+      }),
+    );
   });
 });
 
 describe('ReviewComposer — live state passes through to handlers', () => {
-  it('Save passes the typed verdict + note + per-span comments', () => {
+  it('Send-back passes the live payload (including null verdict)', () => {
+    const onSendBack = vi.fn();
+    renderComposer({ onSendBack });
+    fireEvent.change(screen.getByPlaceholderText(/right, what's wrong/), {
+      target: { value: 'Need a citation here.' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Send back to Claude/i }));
+    expect(onSendBack).toHaveBeenCalledTimes(1);
+    expect(onSendBack).toHaveBeenCalledWith({
+      verdict: null,
+      reviewerNote: '',
+      perSpan: { s1: 'Need a citation here.' },
+      spanText: { s1: 'A captured assistant turn span.' },
+    });
+  });
+
+  it('Save passes the live verdict when one was picked', () => {
     const onSave = vi.fn();
     renderComposer({ onSave });
+    fireEvent.click(screen.getByRole('button', { name: /add verdict/i }));
     fireEvent.click(screen.getByRole('button', { name: 'Disagree' }));
-    fireEvent.change(screen.getByPlaceholderText(/Overall: what's right/), {
-      target: { value: 'The reasoning has a gap at step 3.' },
-    });
-    fireEvent.change(screen.getByPlaceholderText('Comment on this span…'), {
-      target: { value: 'Source for this claim?' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Save review' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save only' }));
     expect(onSave).toHaveBeenCalledTimes(1);
-    expect(onSave).toHaveBeenCalledWith({
-      verdict: 'disagree',
-      reviewerNote: 'The reasoning has a gap at step 3.',
-      perSpan: { s1: 'Source for this claim?' },
-    });
-  });
-
-  it('Submit-back passes the live payload, NOT a synthetic placeholder', () => {
-    // Regression guard for the bug we just fixed — the old onSubmitBack
-    // signature was `() => void` and threw away the typed state.
-    const onSubmitBack = vi.fn();
-    renderComposer({ onSubmitBack });
-    fireEvent.change(screen.getByPlaceholderText(/Overall: what's right/), {
-      target: { value: 'Looks good but cite sources.' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Needs source' }));
-    fireEvent.click(screen.getByRole('button', { name: /Submit-back to Claude/ }));
-    expect(onSubmitBack).toHaveBeenCalledTimes(1);
-    expect(onSubmitBack).toHaveBeenCalledWith({
-      verdict: 'needs_source',
-      reviewerNote: 'Looks good but cite sources.',
-      perSpan: {},
-    });
-  });
-
-  it('Dispatch-to passes the live payload', () => {
-    const onDispatchOut = vi.fn();
-    renderComposer({ onDispatchOut });
-    fireEvent.change(screen.getByPlaceholderText(/Overall: what's right/), {
-      target: { value: 'Need a fan-out review.' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: /Dispatch to…/ }));
-    expect(onDispatchOut).toHaveBeenCalledTimes(1);
-    const call = onDispatchOut.mock.calls[0]?.[0] as {
-      verdict: string;
-      reviewerNote: string;
-    };
-    expect(call.reviewerNote).toBe('Need a fan-out review.');
-    // No verdict picked → defaults to 'open' (neutral) on outbound.
-    expect(call.verdict).toBe('open');
+    expect(onSave).toHaveBeenCalledWith(
+      expect.objectContaining({ verdict: 'disagree' }),
+    );
   });
 });

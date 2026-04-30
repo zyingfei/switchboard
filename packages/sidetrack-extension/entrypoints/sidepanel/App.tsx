@@ -173,6 +173,59 @@ const visibleThreads = (threads: readonly TrackedThread[]): readonly TrackedThre
 const restoreStrategyForThread = (thread: TrackedThread): RestoreStrategy =>
   thread.tabSnapshot?.tabId === undefined ? 'reopen_url' : 'focus_open';
 
+// Spec rank order: signal (unread) → amber (waiting on AI / needs
+// organize) → green (you replied last / fresh) → gray (stale /
+// closed). One flat list, signal-first. Tiebreak by lastSeenAt desc.
+const lifecycleRank = (
+  thread: TrackedThread,
+  reminders: readonly { readonly threadId: string; readonly status: string }[],
+): number => {
+  const lc = deriveLifecycle(thread, reminders);
+  if (lc.dotClass === 'signal') return 0;
+  if (lc.dotClass === 'amber') return 1;
+  if (lc.dotClass === 'green') return 2;
+  return 3;
+};
+
+const sortThreadsByLifecycle = (
+  list: readonly TrackedThread[],
+  reminders: readonly { readonly threadId: string; readonly status: string }[],
+): readonly TrackedThread[] =>
+  list.slice().sort((a, b) => {
+    const rankDelta = lifecycleRank(a, reminders) - lifecycleRank(b, reminders);
+    if (rankDelta !== 0) {
+      return rankDelta;
+    }
+    return b.lastSeenAt.localeCompare(a.lastSeenAt);
+  });
+
+// Map a composed-packet target to the URL we open in a new tab on
+// Dispatch. The user's "where did this go?" confusion is solved by
+// actually opening the chat + putting the packet on their clipboard
+// to paste in. Export targets (notebook/markdown) skip this and get
+// a file download via downloadAsFile below.
+const TARGET_CHAT_URL: Partial<Record<ComposedPacket['target'], string>> = {
+  gpt_pro: 'https://chatgpt.com/',
+  deep_research: 'https://chatgpt.com/',
+  claude: 'https://claude.ai/new',
+  gemini: 'https://gemini.google.com/app',
+  codex: 'https://chatgpt.com/codex',
+};
+
+const downloadAsFile = (filename: string, body: string, mime = 'text/markdown'): void => {
+  const blob = new Blob([body], { type: `${mime};charset=utf-8` });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => {
+    URL.revokeObjectURL(url);
+  }, 1000);
+};
+
 // Adapt the companion's DispatchEventRecord shape to the visual
 // component's expected shape. Companion gives us kind+target+raw
 // timestamp; component wants a label-friendly summary.
@@ -761,20 +814,42 @@ const App = () => {
   };
 
   const handlePacketDispatch = (packet: ComposedPacket) => {
+    // Export targets bypass DispatchConfirm — they're a file write,
+    // not a chat round-trip. Render a download immediately and
+    // record a 'noted' DispatchEvent so it shows up in Recent
+    // Dispatches.
+    if (packet.target === 'notebook' || packet.target === 'markdown') {
+      const safeTitle = packet.title.replace(/[^a-z0-9-_]+/gi, '-').slice(0, 80);
+      const filename = `${safeTitle || 'sidetrack-packet'}.md`;
+      downloadAsFile(filename, packet.body);
+      setError(`Downloaded ${filename}.`);
+      // Still record the dispatch so Recent Dispatches has the row.
+      setPendingDispatch(packet);
+      setComposeThreadId(null);
+      return;
+    }
     setPendingDispatch(packet);
     setComposeThreadId(null);
   };
 
   const handlePacketSave = (packet: ComposedPacket) => {
-    // Save-to-vault routes through the same companion endpoint with status:'noted'.
+    // Save-to-vault: copy body to clipboard for the user's
+    // convenience, record the dispatch event with status:'noted'.
+    void navigator.clipboard.writeText(packet.body).catch(() => undefined);
     setPendingDispatch({ ...packet });
     setComposeThreadId(null);
+    setError('Packet saved to vault and copied to clipboard.');
   };
 
   const handlePacketCopy = (packet: ComposedPacket) => {
-    void navigator.clipboard.writeText(packet.body).catch(() => {
-      // Clipboard rejected (permissions, focus); fall through silently.
-    });
+    void navigator.clipboard
+      .writeText(packet.body)
+      .then(() => {
+        setError(`Packet copied to clipboard (${packet.tokenEstimate.toLocaleString()} tokens).`);
+      })
+      .catch(() => {
+        setError('Could not copy to clipboard — paste from the body field above.');
+      });
     setComposeThreadId(null);
   };
 
@@ -812,6 +887,19 @@ const App = () => {
         },
         idempotencyKey,
       );
+      // Side-effect: copy the body + open the target provider in a
+      // new tab so the user can paste right into a fresh chat. Skip
+      // for export targets — those got their download in the
+      // composer handler. Skip for noted-only sinks (other) — no
+      // chat to open.
+      const targetUrl = TARGET_CHAT_URL[pendingDispatch.target];
+      if (targetUrl !== undefined) {
+        await navigator.clipboard.writeText(pendingDispatch.body).catch(() => undefined);
+        window.open(targetUrl, '_blank', 'noopener,noreferrer');
+        setError(
+          `Opened ${TARGET_PROVIDER_LABEL[provider] ?? provider} in a new tab. Packet copied to your clipboard — paste to send.`,
+        );
+      }
       setPendingDispatch(null);
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : 'Dispatch failed.');
@@ -863,9 +951,10 @@ const App = () => {
   const submitReview = async (
     thread: TrackedThread,
     payload: {
-      readonly verdict: ReviewVerdict;
+      readonly verdict: ReviewVerdict | null;
       readonly reviewerNote: string;
       readonly perSpan: Record<string, string>;
+      readonly spanText?: Record<string, string>;
     },
     outcome: ReviewOutcome,
     spanContext: ReadonlyMap<
@@ -883,8 +972,11 @@ const App = () => {
       return false;
     }
     const trimmedNote = payload.reviewerNote.trim();
-    if (trimmedNote.length === 0) {
-      setError('Reviewer note is required before saving the review.');
+    const hasPerSpanComment = Object.values(payload.perSpan).some(
+      (c) => c.trim().length > 0,
+    );
+    if (trimmedNote.length === 0 && !hasPerSpanComment) {
+      setError('Add a comment (overall or per-span) before saving the review.');
       return false;
     }
     setReviewInFlight(true);
@@ -896,9 +988,11 @@ const App = () => {
         .filter(([, comment]) => comment.trim().length > 0)
         .map(([id, comment]) => {
           const context = spanContext.get(id);
+          // Prefer the user-edited text; fall back to the captured text.
+          const editedText = payload.spanText?.[id];
           return {
             id,
-            text: context?.text ?? thread.title,
+            text: editedText ?? context?.text ?? thread.title,
             comment: comment.trim(),
             ...(context?.capturedAt !== undefined ? { capturedAt: context.capturedAt } : {}),
           };
@@ -913,8 +1007,11 @@ const App = () => {
           sourceThreadId: thread.bac_id,
           sourceTurnOrdinal,
           provider: thread.provider,
-          verdict: payload.verdict,
-          reviewerNote: trimmedNote,
+          // Verdict is optional in the new UX — fall back to 'open' on
+          // the wire so we don't change the schema until we're sure
+          // the new comment-driven model sticks.
+          verdict: payload.verdict ?? 'open',
+          reviewerNote: trimmedNote.length > 0 ? trimmedNote : '(per-span comments only)',
           spans,
           outcome,
         },
@@ -977,10 +1074,12 @@ const App = () => {
     currentWsId === null ? null : (state.workstreams.find((w) => w.bac_id === currentWsId) ?? null);
   const currentWsLabel =
     currentWs === null ? 'not set' : workstreamPath(currentWs.bac_id, state.workstreams);
-  const currentWsThreads =
+  const currentWsThreads = sortThreadsByLifecycle(
     currentWsId === null
       ? threads.filter((t) => t.primaryWorkstreamId === undefined)
-      : threads.filter((t) => t.primaryWorkstreamId === currentWsId);
+      : threads.filter((t) => t.primaryWorkstreamId === currentWsId),
+    state.reminders,
+  );
   const activeCount = currentWsThreads.filter(
     (t) => t.status !== 'closed' && t.status !== 'archived' && t.status !== 'removed',
   ).length;
@@ -994,8 +1093,9 @@ const App = () => {
 
   // Open vs closed/stale buckets across ALL workstreams (used by All view)
   const openStatuses: TrackedThread['status'][] = ['active', 'tracked', 'queued', 'needs_organize'];
-  const allOpenThreads = threads.filter(
-    (t) => openStatuses.includes(t.status) && t.trackingMode !== 'stopped',
+  const allOpenThreads = sortThreadsByLifecycle(
+    threads.filter((t) => openStatuses.includes(t.status) && t.trackingMode !== 'stopped'),
+    state.reminders,
   );
   const allClosedThreads = threads
     .filter((t) => !openStatuses.includes(t.status) || t.trackingMode === 'stopped')
@@ -1093,7 +1193,13 @@ const App = () => {
     const threadNotes = state.captureNotes
       .filter((note) => note.threadId === thread.bac_id)
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-    const historyOpen = threadHistoryOpen.has(thread.bac_id);
+    // Auto-expand the inline history strip when the thread has any
+    // notes — captures should be visible without a click. Empty
+    // strips collapse to the "+ note" affordance. The user can still
+    // toggle explicitly via the strip header, which overrides the
+    // auto-expand.
+    const historyExplicitlyToggled = threadHistoryOpen.has(thread.bac_id);
+    const historyOpen = historyExplicitlyToggled || threadNotes.length > 0;
     const historyComposeOpen = threadNoteFor === thread.bac_id;
     return (
       <div key={thread.bac_id} className="thread">
@@ -1128,11 +1234,16 @@ const App = () => {
         <div className="row2">
           <span className={'dot ' + dotClass} />
           <span className="stamp">{stamp}</span>
-          {lifecyclePill === undefined ? null : (
+          {/* Per spec: dot + stamp already convey lifecycle. The
+              lifecycle pill is redundant for unread / waiting /
+              you-replied / stale / tab-closed / tracking-stopped
+              (the dot color + stamp text agree). Keep it only for
+              "Needs organize" — no dot-color story for that. */}
+          {lifecyclePill?.label === 'Needs organize' ? (
             <span className={'lifecycle-pill mono ' + lifecyclePill.tone}>
               {lifecyclePill.label}
             </span>
-          )}
+          ) : null}
         </div>
         {parent !== undefined || thread.parentTitle !== undefined ? (
           <div className="row2 thread-lineage" title="Branched from a tracked thread">
@@ -2116,45 +2227,98 @@ const App = () => {
                         }
                       });
                     }}
-                    onSubmitBack={(payload) => {
+                    onSendBack={(payload) => {
                       if (reviewInFlight) {
                         return;
                       }
-                      // Use the user's verdict + note, NOT a synthetic
-                      // boilerplate. Previous implementation threw the
-                      // form away and shipped a placeholder.
+                      // 1) Record the review to the vault.
+                      // 2) Queue the rendered comment as a follow-up
+                      //    against the same thread.
+                      // 3) Toggle auto-send on if it isn't already —
+                      //    the orchestrator wired in feat/auto-send-drain
+                      //    will paste-and-send into the live chat.
+                      const perSpanLines = Object.entries(payload.perSpan)
+                        .filter(([, comment]) => comment.trim().length > 0)
+                        .map(([, comment], i) => `${String(i + 1)}. ${comment.trim()}`)
+                        .join('\n');
+                      const followUpBody = [
+                        payload.reviewerNote.trim(),
+                        perSpanLines.length > 0
+                          ? `\n\nPer-span feedback:\n${perSpanLines}`
+                          : '',
+                      ]
+                        .join('')
+                        .trim();
                       void submitReview(
                         reviewThread,
                         payload,
                         'submit_back',
                         spanContext,
-                      ).then((ok) => {
-                        if (ok) {
-                          setReviewThreadId(null);
+                      ).then((reviewOk) => {
+                        if (!reviewOk) {
+                          return;
                         }
+                        // Skip the queue+drain step if there's nothing
+                        // to send (review-only save). Should not happen
+                        // because the button is gated, but defend.
+                        if (followUpBody.length === 0) {
+                          setReviewThreadId(null);
+                          return;
+                        }
+                        void runAction(async () => {
+                          // Park the comment as a queue item against the
+                          // source thread.
+                          await sendRequest({
+                            type: messageTypes.queueFollowUp,
+                            item: {
+                              text: followUpBody,
+                              scope: 'thread',
+                              targetId: reviewThread.bac_id,
+                            },
+                          });
+                          // Make sure auto-send is on so the orchestrator
+                          // ships the queued comment into the chat.
+                          if (reviewThread.autoSendEnabled !== true) {
+                            await sendRequest({
+                              type: messageTypes.setThreadAutoSend,
+                              threadId: reviewThread.bac_id,
+                              enabled: true,
+                            });
+                          }
+                          return await sendRequest({ type: messageTypes.getWorkboardState });
+                        });
+                        setReviewThreadId(null);
                       });
                     }}
                     onDispatchOut={(payload) => {
                       // Build the dispatch body from the user's review
-                      // payload — verdict, note, and per-span comments
-                      // — instead of the old "…" placeholder.
-                      const perSpanLines = Object.entries(payload.perSpan)
+                      // payload — verdict (optional now), note, and per-
+                      // span comments paired with the (possibly edited)
+                      // span text.
+                      const perSpanBlocks = Object.entries(payload.perSpan)
                         .filter(([, comment]) => comment.trim().length > 0)
-                        .map(([id, comment]) => `- ${id}: ${comment.trim()}`)
-                        .join('\n');
+                        .map(([id, comment]) => {
+                          const spanBody = payload.spanText[id] ?? '';
+                          return [
+                            `> ${spanBody.replace(/\n/g, '\n> ')}`,
+                            '',
+                            comment.trim(),
+                          ].join('\n');
+                        })
+                        .join('\n\n---\n\n');
                       const body = [
                         `# Review notes`,
                         '',
                         `## Source thread`,
                         `${providerLabel(reviewThread.provider)} · ${reviewThread.threadUrl}`,
-                        '',
-                        `## Verdict`,
-                        payload.verdict,
-                        '',
-                        `## Reviewer note`,
-                        payload.reviewerNote.trim().length > 0 ? payload.reviewerNote : '_(empty)_',
-                        ...(perSpanLines.length > 0
-                          ? ['', `## Per-span comments`, perSpanLines]
+                        ...(payload.verdict !== null
+                          ? ['', `## Verdict`, payload.verdict]
+                          : []),
+                        ...(payload.reviewerNote.trim().length > 0
+                          ? ['', `## Reviewer note`, payload.reviewerNote]
+                          : []),
+                        ...(perSpanBlocks.length > 0
+                          ? ['', `## Per-span feedback`, perSpanBlocks]
                           : []),
                       ].join('\n');
                       const dispatchPacket: ComposedPacket = {

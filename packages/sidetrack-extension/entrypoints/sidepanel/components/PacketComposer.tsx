@@ -397,7 +397,7 @@ export function PacketComposer({
   };
 
   return (
-    <Modal title="New packet" subtitle="Compose, preview, dispatch" width={620} onClose={onCancel}>
+    <Modal title="New packet" subtitle="Compose, preview, dispatch" width={780} onClose={onCancel}>
       <div className="composer-row">
         <label>Packet kind</label>
         <div className="pill-row">

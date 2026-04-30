@@ -227,7 +227,7 @@ export function Preview() {
               ]}
               onClose={close}
               onSave={close}
-              onSubmitBack={close}
+              onSendBack={close}
               onDispatchOut={() => {
                 setSurface('dispatch');
               }}

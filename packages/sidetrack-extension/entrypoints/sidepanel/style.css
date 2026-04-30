@@ -1144,10 +1144,28 @@ button:disabled {
   padding: 10px 12px;
   background: var(--paper-light);
   color: var(--ink-2);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.55;
-  max-height: 140px;
+  /* Body is the most-used field in the composer — give it real
+     vertical room. The textarea variant below also gets full width
+     and resize=vertical so the user can grow it. */
+  min-height: 320px;
+  max-height: 60vh;
   overflow: auto;
+  width: 100%;
+  box-sizing: border-box;
+}
+/* Textarea variant — same as the read-only block but resizable. */
+textarea.preview-body {
+  display: block;
+  width: 100%;
+  resize: vertical;
+  border: 0;
+  outline: none;
+  font-family: var(--mono, ui-monospace, monospace);
+}
+textarea.preview-body:focus {
+  background: var(--paper);
 }
 .preview-details {
   border: var(--hair);
@@ -1332,6 +1350,121 @@ button:disabled {
   flex-direction: column;
   gap: 18px;
   overflow: auto;
+}
+
+/* Two-column variant: spans on the left (read + inline edit),
+   reviewer's comments on the right. The vertical alignment teaches
+   "this comment goes with that span." Each row card pair shares an
+   index number so even on narrow widths the relationship reads. */
+.review-body-split {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  padding: 16px 18px 8px;
+  overflow: auto;
+}
+.review-spans-col,
+.review-comments-col {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.review-span-card,
+.review-comment-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.review-span-meta {
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.review-span-text {
+  width: 100%;
+  font-family: var(--display);
+  font-style: italic;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink);
+  padding: 8px 10px 8px 14px;
+  background: var(--paper);
+  border: var(--hair);
+  border-left: 3px solid var(--signal);
+  border-radius: var(--rad-s);
+  resize: vertical;
+  min-height: 80px;
+  outline: none;
+}
+.review-span-text:focus {
+  background: var(--paper-light);
+  border-left-color: var(--ink);
+}
+.review-comment-label {
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.review-comment-text {
+  width: 100%;
+  font-family: var(--body, inherit);
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 8px 10px;
+  border: var(--hair);
+  border-radius: var(--rad-s);
+  background: var(--paper-light);
+  color: var(--ink);
+  resize: vertical;
+  min-height: 80px;
+  outline: none;
+}
+.review-overall {
+  padding: 0 18px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.review-overall-text {
+  width: 100%;
+  font-family: var(--body, inherit);
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 8px 10px;
+  border: var(--hair);
+  border-radius: var(--rad-s);
+  background: var(--paper-light);
+  color: var(--ink);
+  resize: vertical;
+  min-height: 56px;
+  outline: none;
+}
+.review-verdict-disclosure {
+  padding: 0 18px 8px;
+}
+.review-verdict-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.review-verdict-label {
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.review-hint {
+  padding: 0 18px 8px;
+  font-size: 11px;
+  color: var(--ink-3);
+}
+@media (max-width: 720px) {
+  .review-body-split {
+    grid-template-columns: 1fr;
+  }
 }
 .review-foot {
   padding: 12px 18px;
