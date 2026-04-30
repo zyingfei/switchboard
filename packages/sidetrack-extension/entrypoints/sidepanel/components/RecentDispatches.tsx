@@ -93,7 +93,8 @@ export function RecentDispatches({
             >
               <span className="chip">{dispatch.targetProviderLabel}</span>
               <span className="dispatch-target-title">
-                {dispatch.targetThreadTitle ?? 'pending chat'}
+                {dispatch.targetThreadTitle ??
+                  (dispatch.mode === 'auto-send' ? 'send to new thread' : 'open new thread')}
               </span>
             </button>
             {/* Action area: replaces the static status pill with a

@@ -170,6 +170,11 @@ export interface WorkboardState {
   // dispatch's body prefix. Lives in chrome.storage; not part of the
   // companion vault schema.
   readonly dispatchLinks: Readonly<Partial<Record<string, string>>>;
+  // Map of dispatchId → unredacted body (the body the user copied).
+  // Local-only; the companion stores the redacted form. Used by the
+  // auto-link matcher and surfaced to the dispatch viewer modal so
+  // the user can see what they actually shipped, not the vault copy.
+  readonly dispatchOriginals: Readonly<Partial<Record<string, string>>>;
   readonly lastError?: string;
   readonly updatedAt: string;
 }
@@ -266,6 +271,7 @@ export const createEmptyWorkboardState = (
   captureNotes: [],
   recentDispatches: [],
   dispatchLinks: {},
+  dispatchOriginals: {},
   updatedAt: new Date().toISOString(),
   ...overrides,
 });

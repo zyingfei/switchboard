@@ -95,17 +95,26 @@ describe('RecentDispatches — mode-aware actions', () => {
     expect(onFocusSource).toHaveBeenCalledWith('d1');
   });
 
-  it('target chip text reflects link state ("destination chat" vs "pending chat")', () => {
-    const { rerender } = render(
-      <RecentDispatches dispatches={[buildEvent()]} />,
-    );
-    expect(screen.getByText('pending chat')).toBeInTheDocument();
-    rerender(
+  it('paste-mode unlinked row chip says "open new thread"', () => {
+    render(<RecentDispatches dispatches={[buildEvent({ mode: 'paste' })]} />);
+    expect(screen.getByText('open new thread')).toBeInTheDocument();
+    expect(screen.queryByText(/pending chat/)).toBeNull();
+  });
+
+  it('auto-send unlinked row chip says "send to new thread"', () => {
+    render(<RecentDispatches dispatches={[buildEvent({ mode: 'auto-send' })]} />);
+    expect(screen.getByText('send to new thread')).toBeInTheDocument();
+    expect(screen.queryByText(/pending chat/)).toBeNull();
+  });
+
+  it('linked row chip shows the destination thread title (not the placeholder)', () => {
+    render(
       <RecentDispatches
         dispatches={[buildEvent({ targetThreadTitle: 'my new chat' })]}
       />,
     );
     expect(screen.getByText('my new chat')).toBeInTheDocument();
-    expect(screen.queryByText('pending chat')).toBeNull();
+    expect(screen.queryByText('open new thread')).toBeNull();
+    expect(screen.queryByText('send to new thread')).toBeNull();
   });
 });

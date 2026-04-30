@@ -919,7 +919,7 @@ const App = () => {
         settings !== null && isProviderWithOptIn(provider) && settings.autoSendOptIn[provider]
           ? 'auto-send'
           : 'paste';
-      await client.submit(
+      const submitResult = await client.submit(
         {
           kind: mapUiPacketKind(pendingDispatch.kind),
           target: { provider, mode },
@@ -934,6 +934,16 @@ const App = () => {
         },
         idempotencyKey,
       );
+      // Cache the unredacted body locally — the companion stored a
+      // redacted form, but the user pastes the original into the
+      // chat, and the auto-link matcher needs to compare against
+      // what the user actually pasted. Fire-and-forget; failures
+      // shouldn't block the dispatch flow.
+      void sendRequest({
+        type: messageTypes.cacheDispatchOriginal,
+        dispatchId: submitResult.bac_id,
+        body: pendingDispatch.body,
+      }).catch(() => undefined);
       // Side-effect: copy the body + open the target provider in a
       // new tab so the user can paste right into a fresh chat. Skip
       // for export targets — those got their download in the

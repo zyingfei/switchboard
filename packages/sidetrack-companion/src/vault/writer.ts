@@ -136,7 +136,13 @@ const dateStamp = (value: Date): string => value.toISOString().slice(0, 10);
 
 const createDefaultSettings = (revision = '0'): SettingsDocument =>
   settingsDocumentSchema.parse({
-    autoSendOptIn: { chatgpt: false, claude: false, gemini: false },
+    // Default-ON for new installs. Auto-send still requires the
+    // per-thread toggle PLUS this provider opt-in PLUS screen-share-
+    // safe being off (§24.10 quartet), so flipping these on by
+    // default doesn't ship anything without an explicit thread
+    // toggle. Existing users keep their stored values — this only
+    // applies on first vault initialisation.
+    autoSendOptIn: { chatgpt: true, claude: true, gemini: true },
     defaultPacketKind: 'research',
     defaultDispatchTarget: 'claude',
     screenShareSafeMode: false,

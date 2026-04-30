@@ -39,6 +39,12 @@ const CAPTURE_NOTES_KEY = 'sidetrack.captureNotes';
 const VAULT_PATH_KEY = 'sidetrack.vaultPath';
 const RECENT_DISPATCHES_KEY = 'sidetrack.recentDispatches';
 const DISPATCH_LINKS_KEY = 'sidetrack.dispatchLinks';
+// Local cache of UNREDACTED dispatch bodies, keyed by dispatchId. The
+// companion stores the redacted body (PII / API keys → [category]),
+// but the auto-link matcher needs the body the user actually copied
+// to clipboard — which is the unredacted form. We record it on the
+// extension side at submit time and use it for substring matching.
+const DISPATCH_ORIGINALS_KEY = 'sidetrack.dispatchOriginals';
 
 const storageGet = async <TValue>(key: string, fallback: TValue): Promise<TValue> => {
   const result = await chrome.storage.local.get({ [key]: fallback });
@@ -132,6 +138,53 @@ export const writeDispatchLink = async (
   await storageSet({
     [DISPATCH_LINKS_KEY]: { ...current, [dispatchId]: threadId },
   });
+};
+
+// Original (pre-redaction) dispatch bodies, keyed by dispatchId.
+// Used by the auto-link matcher so it sees what the user actually
+// copied to clipboard, not the redacted vault form. Same access
+// pattern as dispatchLinks; tri-state Partial so absent lookups
+// return undefined (not the empty string).
+export const readDispatchOriginals = async (): Promise<
+  Readonly<Partial<Record<string, string>>>
+> => await storageGet<Readonly<Partial<Record<string, string>>>>(DISPATCH_ORIGINALS_KEY, {});
+
+export const writeDispatchOriginal = async (
+  dispatchId: string,
+  body: string,
+): Promise<void> => {
+  const current = await readDispatchOriginals();
+  if (current[dispatchId] === body) {
+    return;
+  }
+  await storageSet({
+    [DISPATCH_ORIGINALS_KEY]: { ...current, [dispatchId]: body },
+  });
+};
+
+// Drop entries for dispatches that have aged out of recentDispatches.
+// Called from the same broadcast point as pruneDispatchLinks so the
+// caches stay roughly in sync.
+export const pruneDispatchOriginals = async (
+  knownDispatchIds: ReadonlySet<string>,
+): Promise<void> => {
+  const current = await readDispatchOriginals();
+  const next: Record<string, string> = {};
+  let changed = false;
+  for (const [dispatchId, body] of Object.entries(current)) {
+    if (body === undefined) {
+      changed = true;
+      continue;
+    }
+    if (knownDispatchIds.has(dispatchId)) {
+      next[dispatchId] = body;
+    } else {
+      changed = true;
+    }
+  }
+  if (changed) {
+    await storageSet({ [DISPATCH_ORIGINALS_KEY]: next });
+  }
 };
 
 // Drop links that point at threads no longer in the cache (cleanup).
@@ -582,6 +635,7 @@ export const buildWorkboardState = async (
     captureNotes: await readCaptureNotes(),
     recentDispatches: await readCachedDispatches(),
     dispatchLinks: await readDispatchLinks(),
+    dispatchOriginals: await readDispatchOriginals(),
     collapsedSections: await storageGet<WorkboardState['collapsedSections']>(
       COLLAPSED_SECTIONS_KEY,
       [],

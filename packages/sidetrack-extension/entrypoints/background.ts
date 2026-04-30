@@ -54,8 +54,10 @@ import {
   updateLocalWorkstream,
   upsertLocalThread,
   writeCachedCodingSessions,
+  readDispatchOriginals,
   writeCachedDispatches,
   writeDispatchLink,
+  writeDispatchOriginal,
 } from '../src/background/state';
 import { createDispatchClient } from '../src/dispatch/client';
 import { tryLinkCapturedThread } from '../src/companion/dispatchLinking';
@@ -84,9 +86,10 @@ const tryAutoLinkCapturedThread = async (
   if (userTurnTexts.length === 0) {
     return;
   }
-  const [recentDispatches, existingLinks] = await Promise.all([
+  const [recentDispatches, existingLinks, originalBodiesById] = await Promise.all([
     readCachedDispatches(),
     readDispatchLinks(),
+    readDispatchOriginals(),
   ]);
   if (recentDispatches.length === 0) {
     return;
@@ -98,6 +101,7 @@ const tryAutoLinkCapturedThread = async (
     capturedAtMs,
     recentDispatches,
     existingLinks,
+    originalBodiesById,
   });
   if (result === null) {
     return;
@@ -1068,6 +1072,15 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
       if (item?.scope === 'thread' && typeof item.targetId === 'string') {
         triggerAutoSendDrain(item.targetId);
       }
+    }, 'queue');
+  }
+
+  if (request.type === messageTypes.cacheDispatchOriginal) {
+    // Side panel just successfully submitted a dispatch and got back
+    // a bac_id. Stash the unredacted body locally so the auto-link
+    // matcher can use it on the next captured user turn.
+    return await withCompanionStatus(async () => {
+      await writeDispatchOriginal(request.dispatchId, request.body);
     }, 'queue');
   }
 

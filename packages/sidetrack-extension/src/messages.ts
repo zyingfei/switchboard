@@ -41,6 +41,12 @@ export const messageTypes = {
   // once the tab finishes loading. Used by Recent Dispatches'
   // "Dispatch" button on auto-send-mode rows.
   dispatchAutoSendInNewTab: 'sidetrack.dispatch.autoSend.newTab',
+  // Side panel records the unredacted dispatch body (what the user
+  // actually copied to clipboard) keyed by the companion-assigned
+  // dispatch bac_id. Background stashes it in chrome.storage so the
+  // auto-link matcher can match against the unredacted text instead
+  // of the redacted form the companion stores.
+  cacheDispatchOriginal: 'sidetrack.dispatch.cacheOriginal',
   restoreThreadTab: 'sidetrack.thread.restore-tab',
   queueFollowUp: 'sidetrack.queue.create',
   updateQueueItem: 'sidetrack.queue.update',
@@ -167,6 +173,11 @@ export type WorkboardRequest =
       readonly type: typeof messageTypes.dispatchAutoSendInNewTab;
       readonly dispatchId: string;
       readonly url: string;
+      readonly body: string;
+    }
+  | {
+      readonly type: typeof messageTypes.cacheDispatchOriginal;
+      readonly dispatchId: string;
       readonly body: string;
     }
   | {
@@ -329,6 +340,10 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
       typeof value.url === 'string' &&
       typeof value.body === 'string'
     );
+  }
+
+  if (hasType(value, messageTypes.cacheDispatchOriginal)) {
+    return typeof value.dispatchId === 'string' && typeof value.body === 'string';
   }
 
   if (hasType(value, messageTypes.createReminder)) {

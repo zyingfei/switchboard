@@ -18,8 +18,18 @@
 import type { DispatchEventRecord } from '../dispatch/types';
 import type { ProviderId } from './model';
 
-const MATCH_PREFIX_LEN = 100;
+// Was 100 — pulled in to 60 because the user usually pastes a
+// research-packet body whose first ~80 chars are a generic header
+// ("# Research request: <title>\n\n## Source\n…"). Matching the
+// first 60 normalised chars cuts in earlier and is more robust to
+// stray Gemini whitespace transforms while still being long enough
+// to discriminate.
+const MATCH_PREFIX_LEN = 60;
 const MATCH_WINDOW_MS = 30 * 60 * 1000;
+// Was 16 — bumped to 24 to keep the false-positive floor tight now
+// that we match a shorter prefix. Generic words like "research"
+// would otherwise hit too many tracked threads.
+const MATCH_MIN_NEEDLE = 24;
 
 export const normaliseForMatch = (text: string): string =>
   text
@@ -60,6 +70,14 @@ export interface DispatchLinkInput {
   // already have a link (they belong to whatever thread we matched
   // them to earlier).
   readonly existingLinks: Readonly<Partial<Record<string, string>>>;
+  // Optional override map: dispatchId → unredacted body. When
+  // provided, the matcher uses this body for prefix matching
+  // instead of the stored (redacted) DispatchEventRecord.body.
+  // Critical for matching real captures because the user pastes
+  // the unredacted form into the chat — the redacted prefix
+  // ("Email: [email]") wouldn't substring-match the captured turn
+  // ("Email: user@example.com").
+  readonly originalBodiesById?: Readonly<Partial<Record<string, string>>>;
 }
 
 export interface DispatchLinkResult {
@@ -92,8 +110,12 @@ export const tryLinkCapturedThread = (
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 
   for (const dispatch of candidates) {
-    const needle = normaliseForMatch(dispatch.body).slice(0, MATCH_PREFIX_LEN);
-    if (needle.length < 16) {
+    // Prefer the unredacted body — that's what the user pasted.
+    // Fall back to the stored (redacted) body when no original is
+    // cached (older dispatches predating PR1.1).
+    const sourceBody = input.originalBodiesById?.[dispatch.bac_id] ?? dispatch.body;
+    const needle = normaliseForMatch(sourceBody).slice(0, MATCH_PREFIX_LEN);
+    if (needle.length < MATCH_MIN_NEEDLE) {
       // Too short to match safely — skip rather than risk a false
       // positive on a one-word packet.
       continue;

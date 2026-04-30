@@ -159,6 +159,44 @@ describe('tryLinkCapturedThread', () => {
     );
     expect(out?.dispatchId).toBe(real.bac_id);
   });
+
+  it('matches against the unredacted ORIGINAL body when the redacted form would not', () => {
+    // Regression guard: companion stores `body` in redacted form
+    // (PII / API keys → `[email]`, `[anthropic-key]`). The user
+    // pasted the unredacted form into the chat. Without
+    // originalBodiesById, the redacted prefix can't substring-match
+    // the captured turn, and the link silently misses.
+    const dispatch = buildDispatch({
+      bac_id: 'bac_disp_redacted',
+      // Redacted version stored on the companion side.
+      body: '# Research request: Pro-Questions [email]\n\n## Source\nClaude · …',
+    });
+    const originalBody =
+      '# Research request: Pro-Questions user@example.com\n\n## Source\nClaude · …';
+    const out = tryLinkCapturedThread(
+      baseInput({
+        userTurnTexts: [originalBody],
+        recentDispatches: [dispatch],
+        originalBodiesById: { 'bac_disp_redacted': originalBody },
+      }),
+    );
+    expect(out?.dispatchId).toBe('bac_disp_redacted');
+  });
+
+  it('falls back to the stored body when no original is cached', () => {
+    // Older dispatches predating the originals cache should still
+    // link (just less reliably). The matcher must NOT crash when
+    // originalBodiesById is absent.
+    const dispatch = buildDispatch();
+    const out = tryLinkCapturedThread(
+      baseInput({
+        userTurnTexts: [dispatch.body],
+        recentDispatches: [dispatch],
+        // originalBodiesById intentionally omitted.
+      }),
+    );
+    expect(out?.dispatchId).toBe(dispatch.bac_id);
+  });
 });
 
 describe('normaliseForMatch', () => {
