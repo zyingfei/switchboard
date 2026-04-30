@@ -39,6 +39,7 @@ import {
   markDispatchesRepliedForThread,
   markQueueItemsDoneFromTurns,
   readCachedDispatches,
+  readDispatchLinks,
   readQueueItems,
   readThreads,
   readSettings,
@@ -54,8 +55,10 @@ import {
   upsertLocalThread,
   writeCachedCodingSessions,
   writeCachedDispatches,
+  writeDispatchLink,
 } from '../src/background/state';
 import { createDispatchClient } from '../src/dispatch/client';
+import { tryLinkCapturedThread } from '../src/companion/dispatchLinking';
 
 const activeTab = async (): Promise<chrome.tabs.Tab | undefined> => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -68,6 +71,40 @@ const activeTab = async (): Promise<chrome.tabs.Tab | undefined> => {
 // the chat, the new turn is by definition not unread. Pre-existing
 // reminders for the same thread are also dismissed so a stale pill
 // doesn't linger after the user catches up.
+// Try to link a freshly captured thread to a recent un-linked
+// dispatch by matching the dispatch body prefix against any user
+// turn. Idempotent — re-running on the same thread doesn't move an
+// existing self-link. No-op if no recent dispatches.
+const tryAutoLinkCapturedThread = async (
+  threadId: string,
+  threadProvider: CaptureEvent['provider'],
+  userTurnTexts: readonly string[],
+  capturedAtMs: number,
+): Promise<void> => {
+  if (userTurnTexts.length === 0) {
+    return;
+  }
+  const [recentDispatches, existingLinks] = await Promise.all([
+    readCachedDispatches(),
+    readDispatchLinks(),
+  ]);
+  if (recentDispatches.length === 0) {
+    return;
+  }
+  const result = tryLinkCapturedThread({
+    threadId,
+    threadProvider,
+    userTurnTexts,
+    capturedAtMs,
+    recentDispatches,
+    existingLinks,
+  });
+  if (result === null) {
+    return;
+  }
+  await writeDispatchLink(result.dispatchId, threadId);
+};
+
 const userIsViewingThreadUrl = async (threadUrl: string): Promise<boolean> => {
   try {
     const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
@@ -227,6 +264,16 @@ const sendToCompanion = async (
     .filter((turn) => turn.role === 'user')
     .map((turn) => turn.text);
   await markQueueItemsDoneFromTurns(threadResult.bac_id, recentUserTexts);
+  // Try to link this captured thread to a recent un-linked dispatch.
+  // If the user pasted a packet body into a fresh chat on the target
+  // provider, this turns "sent · pending" into "linked → <thread>"
+  // on the Recent Dispatches row.
+  await tryAutoLinkCapturedThread(
+    threadResult.bac_id,
+    event.provider,
+    recentUserTexts,
+    Date.parse(event.capturedAt),
+  );
   // Flip 'sent' / 'pending' / 'queued' dispatches sourced from this
   // thread to 'replied' once a fresh assistant turn lands. The user
   // sees the pill update on the next side-panel poll.
@@ -284,6 +331,12 @@ const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
     .filter((turn) => turn.role === 'user')
     .map((turn) => turn.text);
   await markQueueItemsDoneFromTurns(upserted.bac_id, recentUserTexts);
+  await tryAutoLinkCapturedThread(
+    upserted.bac_id,
+    event.provider,
+    recentUserTexts,
+    Date.parse(event.capturedAt),
+  );
   const lastTurn = event.turns.at(-1);
   if (existing !== undefined && lastTurn?.role === 'assistant') {
     if (await userIsViewingThreadUrl(event.threadUrl)) {
@@ -437,6 +490,61 @@ const ensureContentScriptInTab = async (tabId: number): Promise<{ ok: boolean; e
       error: error instanceof Error ? error.message : 'Could not inject content script.',
     };
   }
+};
+
+// One-shot auto-send into a freshly-opened tab. Used by the
+// dispatchAutoSendInNewTab handler: open URL → wait for `complete` →
+// inject content script → autoSendItem. The listener removes itself
+// after the first matching update so we don't accumulate handlers.
+//
+// We give the page a 30s grace period; provider chats sometimes load
+// quickly but their composer/Stop button lights up later. The
+// content-script driver has its own per-item timeout (90s) which
+// covers the AI's reply window.
+const autoSendOnceTabReady = (tabId: number, body: string): void => {
+  let cleared = false;
+  const fire = (): void => {
+    if (cleared) {
+      return;
+    }
+    cleared = true;
+    chrome.tabs.onUpdated.removeListener(listener);
+    void (async () => {
+      // Small extra delay so SPA shells finish hydrating their
+      // composer (Quill / ProseMirror / Tiptap) before we type.
+      await new Promise<void>((resolve) => setTimeout(resolve, 1500));
+      const dispatch = await sendToContentScriptWithRecovery(tabId, {
+        type: messageTypes.autoSendItem,
+        text: body,
+        perItemTimeoutMs: 90_000,
+      });
+      if (!dispatch.ok) {
+        console.warn(
+          '[dispatchAutoSendInNewTab] content-script send failed:',
+          dispatch.error ?? 'unknown',
+        );
+      }
+    })();
+  };
+  const listener = (
+    updatedTabId: number,
+    changeInfo: { readonly status?: string },
+  ): void => {
+    if (updatedTabId !== tabId) {
+      return;
+    }
+    if (changeInfo.status === 'complete') {
+      fire();
+    }
+  };
+  chrome.tabs.onUpdated.addListener(listener);
+  // Safety net — if the load event never fires (cross-origin redirect,
+  // service worker quirks), fall back to firing after 30s anyway. The
+  // content-script driver will report a clear error to the side panel
+  // if the composer isn't ready.
+  setTimeout(() => {
+    fire();
+  }, 30_000);
 };
 
 // Send `message` to the tab's content script, recovering once from
@@ -959,6 +1067,27 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
       await updateLocalQueueItem(request.queueItemId, { lastError: null });
       if (item?.scope === 'thread' && typeof item.targetId === 'string') {
         triggerAutoSendDrain(item.targetId);
+      }
+    }, 'queue');
+  }
+
+  if (request.type === messageTypes.dispatchAutoSendInNewTab) {
+    return await withCompanionStatus(async () => {
+      const { url, body } = request;
+      // Open the target chat URL in a new tab and let the
+      // tabs.onUpdated listener below auto-send into it once it
+      // finishes loading. Returns immediately — the side panel
+      // already showed a "opening + auto-sending…" banner.
+      try {
+        const created = await chrome.tabs.create({ url, active: true });
+        const tabId = created.id;
+        if (typeof tabId !== 'number') {
+          console.warn('[dispatchAutoSendInNewTab] tab create returned no tabId');
+          return;
+        }
+        autoSendOnceTabReady(tabId, body);
+      } catch (error) {
+        console.warn('[dispatchAutoSendInNewTab] open failed:', error);
       }
     }, 'queue');
   }

@@ -36,6 +36,7 @@ const STUB_DISPATCH: DispatchEvent = {
   sourceTitle: 'Side-panel state machine review',
   targetProviderLabel: 'GPT Pro',
   targetThreadTitle: 'new chat',
+  mode: 'paste',
   dispatchKind: 'research_packet',
   dispatchedAt: '12 min ago',
   status: 'replied',
@@ -321,11 +322,13 @@ describe('UX skeleton components — render-without-crash + key text present', (
     expect(screen.getByText('[private — workstream item]')).toBeInTheDocument();
   });
 
-  it('RecentDispatches renders dispatch row with status pill', () => {
+  it('RecentDispatches renders dispatch row with linked-target action', () => {
+    // STUB_DISPATCH has targetThreadTitle set, so the row counts as
+    // "linked" — action collapses to "↗ open" instead of Copy/Dispatch.
     render(<RecentDispatches dispatches={[STUB_DISPATCH]} />);
     expect(screen.getByText('Side-panel state machine review')).toBeInTheDocument();
     expect(screen.getByText('GPT Pro')).toBeInTheDocument();
-    expect(screen.getByText('replied')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /↗ open/ })).toBeInTheDocument();
   });
 
   it('RecentDispatches empty state renders helper text', () => {

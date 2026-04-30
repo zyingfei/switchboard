@@ -38,6 +38,7 @@ const CODING_SESSIONS_KEY = 'sidetrack.codingSessions';
 const CAPTURE_NOTES_KEY = 'sidetrack.captureNotes';
 const VAULT_PATH_KEY = 'sidetrack.vaultPath';
 const RECENT_DISPATCHES_KEY = 'sidetrack.recentDispatches';
+const DISPATCH_LINKS_KEY = 'sidetrack.dispatchLinks';
 
 const storageGet = async <TValue>(key: string, fallback: TValue): Promise<TValue> => {
   const result = await chrome.storage.local.get({ [key]: fallback });
@@ -112,6 +113,48 @@ export const writeCachedDispatches = async (
   dispatches: readonly DispatchEventRecord[],
 ): Promise<void> => {
   await storageSet({ [RECENT_DISPATCHES_KEY]: dispatches });
+};
+
+// Dispatch → destination thread links. We can't add this to the
+// companion DispatchEventRecord without bumping its schema, so we
+// track it locally in chrome.storage. Map: dispatchId → threadId.
+export const readDispatchLinks = async (): Promise<Readonly<Partial<Record<string, string>>>> =>
+  await storageGet<Readonly<Partial<Record<string, string>>>>(DISPATCH_LINKS_KEY, {});
+
+export const writeDispatchLink = async (
+  dispatchId: string,
+  threadId: string,
+): Promise<void> => {
+  const current = await readDispatchLinks();
+  if (current[dispatchId] === threadId) {
+    return;
+  }
+  await storageSet({
+    [DISPATCH_LINKS_KEY]: { ...current, [dispatchId]: threadId },
+  });
+};
+
+// Drop links that point at threads no longer in the cache (cleanup).
+export const pruneDispatchLinks = async (
+  knownThreadIds: ReadonlySet<string>,
+): Promise<void> => {
+  const current = await readDispatchLinks();
+  const next: Record<string, string> = {};
+  let changed = false;
+  for (const [dispatchId, threadId] of Object.entries(current)) {
+    if (threadId === undefined) {
+      changed = true;
+      continue;
+    }
+    if (knownThreadIds.has(threadId)) {
+      next[dispatchId] = threadId;
+    } else {
+      changed = true;
+    }
+  }
+  if (changed) {
+    await storageSet({ [DISPATCH_LINKS_KEY]: next });
+  }
 };
 
 // Flip a dispatch's status to 'replied' once we detect a fresh
@@ -538,6 +581,7 @@ export const buildWorkboardState = async (
     codingSessions: await readCachedCodingSessions(),
     captureNotes: await readCaptureNotes(),
     recentDispatches: await readCachedDispatches(),
+    dispatchLinks: await readDispatchLinks(),
     collapsedSections: await storageGet<WorkboardState['collapsedSections']>(
       COLLAPSED_SECTIONS_KEY,
       [],

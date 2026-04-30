@@ -35,6 +35,12 @@ export const messageTypes = {
   // previously failed (lastError set). Background clears lastError,
   // re-fires the drain for the item's thread.
   retryAutoSend: 'sidetrack.queue.autoSend.retry',
+  // Side panel asks the background to (re-)dispatch a recorded
+  // packet by opening the target chat URL in a new tab and
+  // auto-sending the body via the existing content-script driver
+  // once the tab finishes loading. Used by Recent Dispatches'
+  // "Dispatch" button on auto-send-mode rows.
+  dispatchAutoSendInNewTab: 'sidetrack.dispatch.autoSend.newTab',
   restoreThreadTab: 'sidetrack.thread.restore-tab',
   queueFollowUp: 'sidetrack.queue.create',
   updateQueueItem: 'sidetrack.queue.update',
@@ -156,6 +162,12 @@ export type WorkboardRequest =
   | {
       readonly type: typeof messageTypes.retryAutoSend;
       readonly queueItemId: string;
+    }
+  | {
+      readonly type: typeof messageTypes.dispatchAutoSendInNewTab;
+      readonly dispatchId: string;
+      readonly url: string;
+      readonly body: string;
     }
   | {
       readonly type: typeof messageTypes.createReminder;
@@ -309,6 +321,14 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
 
   if (hasType(value, messageTypes.retryAutoSend)) {
     return typeof value.queueItemId === 'string';
+  }
+
+  if (hasType(value, messageTypes.dispatchAutoSendInNewTab)) {
+    return (
+      typeof value.dispatchId === 'string' &&
+      typeof value.url === 'string' &&
+      typeof value.body === 'string'
+    );
   }
 
   if (hasType(value, messageTypes.createReminder)) {

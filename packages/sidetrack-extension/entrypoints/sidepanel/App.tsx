@@ -1920,25 +1920,50 @@ const App = () => {
       {(() => {
         // Recent Dispatches: chronological log of packets sent out of
         // Sidetrack (review submit-backs, dispatch-out packets, coding
-        // agent packets). Only render when there's at least one — an
-        // empty section is noise on first-launch.
+        // agent packets). Only render when there's at least one.
         const dispatches = state.recentDispatches.slice(0, 12);
         if (dispatches.length === 0) {
           return null;
         }
+        const linksMap = state.dispatchLinks;
         const dispatchEvents: RecentDispatchEvent[] = dispatches.map((d) => {
           const sourceTitle =
             state.threads.find((t) => t.bac_id === d.sourceThreadId)?.title ?? d.title;
+          // Auto-link: if the matcher paired this dispatch to a
+          // captured destination thread, surface its title so the
+          // row reads "→ Gemini · my new chat" instead of "pending
+          // chat". The action button also flips to "↗ open".
+          const linkedThreadId = linksMap[d.bac_id];
+          const linkedThread =
+            linkedThreadId === undefined
+              ? undefined
+              : state.threads.find((t) => t.bac_id === linkedThreadId);
           return {
             bac_id: d.bac_id,
             sourceTitle,
             targetProviderLabel:
               DISPATCH_PROVIDER_LABEL[d.target.provider] ?? d.target.provider,
+            ...(linkedThread === undefined
+              ? {}
+              : { targetThreadTitle: linkedThread.title }),
+            mode: d.target.mode,
             dispatchKind: DISPATCH_KIND_TO_DISPLAY[d.kind] ?? 'dispatch_out',
             dispatchedAt: formatRelative(d.createdAt),
             status: DISPATCH_STATUS_TO_DISPLAY(d.status),
           };
         });
+        // Helper: map companion target.provider → ComposedPacket
+        // target shape used by TARGET_CHAT_URL.
+        const lookupChatUrl = (provider: string): string | undefined => {
+          const targetKey = (
+            provider === 'chatgpt'
+              ? 'gpt_pro'
+              : provider === 'claude_code'
+                ? 'claude_code'
+                : provider
+          ) as keyof typeof TARGET_CHAT_URL;
+          return TARGET_CHAT_URL[targetKey];
+        };
         return (
           <>
             <div className="sec-head">
@@ -1950,10 +1975,6 @@ const App = () => {
             <RecentDispatches
               dispatches={dispatchEvents}
               onFocusSource={(id) => {
-                // Click the LEFT side of a row → jump back to the
-                // source thread. If we no longer track that thread
-                // (was removed / archived), surface a banner explaining
-                // why the click did nothing.
                 const dispatch = state.recentDispatches.find((d) => d.bac_id === id);
                 if (dispatch === undefined) {
                   return;
@@ -1968,46 +1989,83 @@ const App = () => {
                 );
               }}
               onOpenTarget={(id) => {
-                // Click the RIGHT side of a row → re-copy the packet
-                // body to clipboard AND reopen the target chat in a
-                // new tab. Re-copy is critical: the user may have
-                // overwritten the clipboard since the original
-                // dispatch, and the WHOLE point of clicking is "I
-                // want to ship this again."
+                // For LINKED rows: jump to the destination thread (if
+                // we still track it). For UNLINKED rows the dedicated
+                // Copy / Dispatch buttons handle the action; a click
+                // on the target chip opens the viewer modal instead
+                // of doing anything destructive.
                 const dispatch = state.recentDispatches.find((d) => d.bac_id === id);
                 if (dispatch === undefined) {
                   return;
                 }
-                const provider = dispatch.target.provider;
-                const targetKey = (
-                  provider === 'chatgpt'
-                    ? 'gpt_pro'
-                    : provider === 'claude_code'
-                      ? 'claude_code'
-                      : provider
-                ) as keyof typeof TARGET_CHAT_URL;
-                const url = TARGET_CHAT_URL[targetKey];
-                if (url !== undefined) {
-                  void navigator.clipboard
-                    .writeText(dispatch.body)
-                    .then(() => {
-                      setError(
-                        `Re-copied packet to clipboard. Opening ${TARGET_PROVIDER_LABEL[provider] ?? provider} — paste to send.`,
-                      );
-                    })
-                    .catch(() => {
-                      setError(
-                        `Could not re-copy to clipboard. Open the dispatch (click target again) to view + copy the packet body.`,
-                      );
-                    });
-                  window.open(url, '_blank', 'noopener,noreferrer');
+                const linkedThreadId = linksMap[id];
+                if (linkedThreadId !== undefined) {
+                  const linkedThread = state.threads.find((t) => t.bac_id === linkedThreadId);
+                  if (linkedThread !== undefined) {
+                    openTabForThread(linkedThread);
+                    return;
+                  }
+                }
+                // No link → open viewer (read-only, with copy +
+                // download). Avoids the surprise of opening a fresh
+                // empty chat just from clicking the target chip.
+                setViewingDispatchId(id);
+              }}
+              onView={(id) => {
+                setViewingDispatchId(id);
+              }}
+              onCopy={(id) => {
+                // Paste-mode action: re-copy + open new chat.
+                const dispatch = state.recentDispatches.find((d) => d.bac_id === id);
+                if (dispatch === undefined) {
                   return;
                 }
-                // Export / external target — no chat to reopen. Open
-                // the dispatch viewer so the user can re-view + re-
-                // download / re-copy. This is the previously
-                // "non-interactive" branch the user complained about.
-                setViewingDispatchId(id);
+                const url = lookupChatUrl(dispatch.target.provider);
+                if (url === undefined) {
+                  // Export / external target → open viewer instead.
+                  setViewingDispatchId(id);
+                  return;
+                }
+                void navigator.clipboard
+                  .writeText(dispatch.body)
+                  .then(() => {
+                    setError(
+                      `Re-copied packet to clipboard. Opening ${TARGET_PROVIDER_LABEL[dispatch.target.provider] ?? dispatch.target.provider} — paste to send.`,
+                    );
+                  })
+                  .catch(() => {
+                    setError(
+                      `Could not re-copy to clipboard. Click "view" to open the body and copy manually.`,
+                    );
+                  });
+                window.open(url, '_blank', 'noopener,noreferrer');
+              }}
+              onDispatch={(id) => {
+                // Auto-send mode action: open the target tab AND
+                // auto-send via the orchestrator. Background owns the
+                // "wait for tab to load → inject content script →
+                // autoSendItem" flow.
+                const dispatch = state.recentDispatches.find((d) => d.bac_id === id);
+                if (dispatch === undefined) {
+                  return;
+                }
+                const url = lookupChatUrl(dispatch.target.provider);
+                if (url === undefined) {
+                  setViewingDispatchId(id);
+                  return;
+                }
+                void runAction(async () => {
+                  await sendRequest({
+                    type: messageTypes.dispatchAutoSendInNewTab,
+                    dispatchId: id,
+                    url,
+                    body: dispatch.body,
+                  });
+                  setError(
+                    `Opening ${TARGET_PROVIDER_LABEL[dispatch.target.provider] ?? dispatch.target.provider} and auto-sending the packet…`,
+                  );
+                  return await sendRequest({ type: messageTypes.getWorkboardState });
+                });
               }}
             />
           </>

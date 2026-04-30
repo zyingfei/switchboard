@@ -164,6 +164,12 @@ export interface WorkboardState {
   readonly codingSessions: readonly CodingSession[];
   readonly captureNotes: readonly CaptureNote[];
   readonly recentDispatches: readonly DispatchEventRecord[];
+  // Map of dispatchId → linked destination threadId. Populated by
+  // the auto-link matcher in src/companion/dispatchLinking.ts when a
+  // freshly captured thread's first user turn matches a recent
+  // dispatch's body prefix. Lives in chrome.storage; not part of the
+  // companion vault schema.
+  readonly dispatchLinks: Readonly<Partial<Record<string, string>>>;
   readonly lastError?: string;
   readonly updatedAt: string;
 }
@@ -259,6 +265,7 @@ export const createEmptyWorkboardState = (
   codingSessions: [],
   captureNotes: [],
   recentDispatches: [],
+  dispatchLinks: {},
   updatedAt: new Date().toISOString(),
   ...overrides,
 });
