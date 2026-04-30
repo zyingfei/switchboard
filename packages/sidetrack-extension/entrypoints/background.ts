@@ -1077,9 +1077,66 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
   return await withCompanionStatus();
 };
 
+// URL match patterns the content script wants to live in. Kept in
+// sync with the `matches` field on entrypoints/content.ts (and the
+// generated manifest's content_scripts[].matches). Used by the
+// startup re-injection loop below — Chrome MV3 doesn't replay
+// content_scripts into pre-existing tabs after an extension reload,
+// so we have to do it ourselves.
+const CONTENT_SCRIPT_MATCH_PATTERNS = [
+  'https://chatgpt.com/*',
+  'https://chat.openai.com/*',
+  'https://claude.ai/*',
+  'https://gemini.google.com/*',
+  'http://127.0.0.1/*',
+  'http://localhost/*',
+];
+
+const reinjectContentScriptIntoOpenTabs = async (): Promise<void> => {
+  try {
+    const tabs = await chrome.tabs.query({ url: CONTENT_SCRIPT_MATCH_PATTERNS });
+    await Promise.all(
+      tabs.map(async (tab) => {
+        if (typeof tab.id !== 'number') {
+          return;
+        }
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            files: ['content-scripts/content.js'],
+          });
+        } catch {
+          // Restricted pages (chrome://, the Web Store, etc.) reject the
+          // injection. That's expected — skip them quietly.
+        }
+      }),
+    );
+  } catch {
+    // chrome.tabs.query / scripting unavailable — nothing useful to log.
+  }
+};
+
 export default defineBackground(() => {
-  chrome.runtime.onInstalled.addListener(() => {
+  chrome.runtime.onInstalled.addListener((details) => {
     void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => undefined);
+    // Heal pre-existing tabs after an install/update/reload so the
+    // user doesn't have to refresh each chat tab manually. The first
+    // install case is harmless: matching tabs that already had no
+    // script get one; tabs that have one shrug it off.
+    if (
+      details.reason === 'install' ||
+      details.reason === 'update' ||
+      details.reason === 'chrome_update'
+    ) {
+      void reinjectContentScriptIntoOpenTabs();
+    }
+  });
+
+  // Service workers can be restarted by Chrome on idle — onStartup
+  // fires when the browser launches. Re-inject is cheap and idempotent
+  // so we can always do it.
+  chrome.runtime.onStartup.addListener(() => {
+    void reinjectContentScriptIntoOpenTabs();
   });
 
   chrome.tabs.onRemoved.addListener((tabId) => {
