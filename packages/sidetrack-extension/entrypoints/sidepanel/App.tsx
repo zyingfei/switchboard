@@ -306,6 +306,10 @@ const App = () => {
   const [selectedWorkstream, setSelectedWorkstream] = useState('');
   const [moveThreadId, setMoveThreadId] = useState<string | null>(null);
   const [recoveryThreadId, setRecoveryThreadId] = useState<string | null>(null);
+  // Bac_id of a dispatch the user clicked to inspect — used by the
+  // External viewer modal (and as a fallback "show me the body" for
+  // any dispatch the user wants to see again). Null = closed.
+  const [viewingDispatchId, setViewingDispatchId] = useState<string | null>(null);
   const [expandedWorkstreamId, setExpandedWorkstreamId] = useState<string | null>(null);
   const [wsPickerOpen, setWsPickerOpen] = useState(false);
   const [wsPickerCreateMode, setWsPickerCreateMode] = useState(false);
@@ -1964,16 +1968,16 @@ const App = () => {
                 );
               }}
               onOpenTarget={(id) => {
-                // Click the RIGHT side of a row → reopen the target
-                // chat in a new tab. For chat targets we know the
-                // provider URL; for export targets there's no chat
-                // to reopen so we just say so.
+                // Click the RIGHT side of a row → re-copy the packet
+                // body to clipboard AND reopen the target chat in a
+                // new tab. Re-copy is critical: the user may have
+                // overwritten the clipboard since the original
+                // dispatch, and the WHOLE point of clicking is "I
+                // want to ship this again."
                 const dispatch = state.recentDispatches.find((d) => d.bac_id === id);
                 if (dispatch === undefined) {
                   return;
                 }
-                // Map companion target.provider → ComposedPacket
-                // target shape used by TARGET_CHAT_URL.
                 const provider = dispatch.target.provider;
                 const targetKey = (
                   provider === 'chatgpt'
@@ -1984,16 +1988,26 @@ const App = () => {
                 ) as keyof typeof TARGET_CHAT_URL;
                 const url = TARGET_CHAT_URL[targetKey];
                 if (url !== undefined) {
+                  void navigator.clipboard
+                    .writeText(dispatch.body)
+                    .then(() => {
+                      setError(
+                        `Re-copied packet to clipboard. Opening ${TARGET_PROVIDER_LABEL[provider] ?? provider} — paste to send.`,
+                      );
+                    })
+                    .catch(() => {
+                      setError(
+                        `Could not re-copy to clipboard. Open the dispatch (click target again) to view + copy the packet body.`,
+                      );
+                    });
                   window.open(url, '_blank', 'noopener,noreferrer');
                   return;
                 }
-                if (provider === 'other') {
-                  setError(
-                    'This dispatch was an export (Notebook / Markdown). The packet was downloaded as a file at dispatch time — there is no chat to reopen.',
-                  );
-                  return;
-                }
-                setError(`No reopen URL is wired for target "${provider}" yet.`);
+                // Export / external target — no chat to reopen. Open
+                // the dispatch viewer so the user can re-view + re-
+                // download / re-copy. This is the previously
+                // "non-interactive" branch the user complained about.
+                setViewingDispatchId(id);
               }}
             />
           </>
@@ -2387,6 +2401,91 @@ const App = () => {
           }}
         />
       ) : null}
+
+      {viewingDispatchId !== null
+        ? (() => {
+            const dispatch = state.recentDispatches.find(
+              (d) => d.bac_id === viewingDispatchId,
+            );
+            if (dispatch === undefined) {
+              return null;
+            }
+            const targetLabel =
+              TARGET_PROVIDER_LABEL[dispatch.target.provider] ?? dispatch.target.provider;
+            const close = () => {
+              setViewingDispatchId(null);
+            };
+            return (
+              <div className="modal-backdrop" onClick={close}>
+                <div
+                  className="dispatch-viewer"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                  }}
+                >
+                  <div className="dispatch-viewer-head">
+                    <div>
+                      <h3 className="dispatch-viewer-title">{dispatch.title}</h3>
+                      <div className="dispatch-viewer-meta mono">
+                        {dispatch.kind} · {targetLabel} · {formatRelative(dispatch.createdAt)} ·{' '}
+                        {dispatch.tokenEstimate.toLocaleString()} tokens
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className="modal-close"
+                      onClick={close}
+                      aria-label="Close"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                  <textarea
+                    className="dispatch-viewer-body mono"
+                    value={dispatch.body}
+                    readOnly
+                  />
+                  <div className="dispatch-viewer-foot">
+                    <button type="button" className="btn btn-ghost" onClick={close}>
+                      Close
+                    </button>
+                    <div className="spacer" />
+                    <button
+                      type="button"
+                      className="btn btn-ghost"
+                      onClick={() => {
+                        const safeTitle = dispatch.title.replace(/[^a-z0-9-_]+/gi, '-').slice(0, 80);
+                        downloadAsFile(
+                          `${safeTitle || 'sidetrack-dispatch'}.md`,
+                          dispatch.body,
+                        );
+                        setError(`Re-downloaded ${safeTitle || 'sidetrack-dispatch'}.md.`);
+                      }}
+                    >
+                      ⤓ Download .md
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      onClick={() => {
+                        void navigator.clipboard
+                          .writeText(dispatch.body)
+                          .then(() => {
+                            setError('Copied dispatch body to clipboard.');
+                          })
+                          .catch(() => {
+                            setError('Could not copy — select the text above and copy manually.');
+                          });
+                      }}
+                    >
+                      Copy to clipboard
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })()
+        : null}
 
       {showWizard ? (
         <Wizard
