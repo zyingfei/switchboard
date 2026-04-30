@@ -2872,6 +2872,16 @@ button.thread-queued:focus-visible {
 .thread-queue-actions .btn-link:hover {
   color: var(--signal, #c2410c);
 }
+/* Retry sits between Copy and Dismiss only when the item has a
+   lastError. Coloured upfront so it reads as the primary affordance
+   for the failure case, not a secondary action. */
+.thread-queue-actions .btn-link.thread-queue-retry {
+  color: var(--signal, #c2410c);
+  font-weight: 500;
+}
+.thread-queue-actions .btn-link.thread-queue-retry:hover {
+  color: var(--signal-2, #ea580c);
+}
 
 .thread-actions .btn-link.archive {
   color: var(--ink-3, #7a7269);

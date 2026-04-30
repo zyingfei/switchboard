@@ -2,7 +2,10 @@ import { defineBackground } from 'wxt/utils/define-background';
 
 import { captureGenericTab } from '../src/capture/genericFallback';
 import { detectProviderFromUrl, isProviderThreadUrl } from '../src/capture/providerDetection';
-import { evaluateAutoSendPreflight } from '../src/safety/preflight';
+import {
+  DEFAULT_LOCAL_CONFIG,
+  runAutoSendDrain as driveAutoSendImpl,
+} from '../src/companion/autoSendDrain';
 import { createCompanionClient } from '../src/companion/client';
 import { createSettingsClient } from '../src/settings/client';
 import type {
@@ -371,24 +374,6 @@ const assertCompanionReachable = async (): Promise<'connected' | 'vault-error' |
   return status.vault === 'connected' ? 'connected' : 'vault-error';
 };
 
-// Translate a §24.10 preflight reason into a single line the user can act on.
-const preflightReasonText = (
-  reason: 'thread-toggle-off' | 'provider-opt-out' | 'screen-share-safe' | 'token-budget' | 'unsupported-provider',
-): string => {
-  switch (reason) {
-    case 'thread-toggle-off':
-      return 'Auto-send is off for this thread.';
-    case 'provider-opt-out':
-      return 'This provider is not opted in for auto-send (Settings → Auto-send).';
-    case 'screen-share-safe':
-      return 'Screen-share-safe mode is on; auto-send is paused.';
-    case 'token-budget':
-      return 'This item exceeds the auto-send token budget.';
-    case 'unsupported-provider':
-      return 'Auto-send does not support this provider.';
-  }
-};
-
 // Find the live tab that hosts a tracked thread. Try the snapshot's
 // tabId first (covers the common case where the user keeps the tab
 // open), then fall back to a URL match. chrome.tabs.query treats
@@ -396,7 +381,7 @@ const preflightReasonText = (
 // when the live URL has hash/query fragments. The tabSnapshot path
 // avoids that entirely.
 const findTabForThread = async (
-  thread: TrackedThread,
+  thread: { tabSnapshot?: { tabId?: number }; threadUrl: string },
 ): Promise<{ tabId?: number; reason?: string }> => {
   const snapshotId = thread.tabSnapshot?.tabId;
   if (typeof snapshotId === 'number') {
@@ -476,115 +461,74 @@ const sendToContentScriptWithRecovery = async (
   return await attempt();
 };
 
-// Drains pending queue items for `threadId` into the provider chat
-// one at a time, gated by the §24.10 preflight. Triggered when:
-//
-//   1. The user toggles autoSendEnabled=true on a thread.
-//   2. The user adds a queue item to a thread that is already on.
-//
-// Per item:
-//
-//   1. Runs `evaluateAutoSendPreflight` — drops items that fail any
-//      of the four ship-blocking gates (per-thread toggle off,
-//      provider not opted in, screen-share-safe on, token-budget
-//      exceeded). The item stays 'pending' but gets `lastError` set
-//      so the side panel can surface why nothing happened.
-//   2. Sends the wrapped text to the content script in the chat tab
-//      via `messageTypes.autoSendItem`. Content script types it +
-//      clicks send and waits for the AI to finish responding.
-//   3. On success, the queue item is marked 'done'. On failure, the
-//      drain stops and the failing item carries `lastError` for the
-//      user to see and retry.
-//
-// The drain stops on the first failure — the user should look before
-// more items would ship into the chat with the same gate failing.
+// Wires real chrome.* / network ports to the pure orchestrator in
+// src/companion/autoSendDrain.ts. The orchestrator handles the
+// per-item §24.10 preflight, sequencing, stop-on-failure, and the
+// status / lastError transitions. See that file for flow + reasoning.
 const runAutoSendDrain = async (threadId: string): Promise<boolean> => {
-  const threads = await readThreads();
-  const thread = threads.find((t) => t.bac_id === threadId);
-  if (thread?.autoSendEnabled !== true) {
-    return false;
-  }
-  const localSettings = await readSettings();
-  // Per-provider opt-in + screenShareSafeMode live on the companion
-  // when configured. Local-only users don't have a companion to store
-  // those flags, so we fall back to "the per-thread toggle is the
-  // consent" — the user explicitly flipped Auto-send: on, that's
-  // enough. Same applies to screenShareSafeMode (default false).
-  let autoSendOptIn = { chatgpt: true, claude: true, gemini: true };
-  let screenShareSafeMode = false;
-  if (localSettings.companion.bridgeKey.trim().length > 0) {
-    try {
-      const companionSettings = await createSettingsClient(localSettings.companion).read();
-      autoSendOptIn = companionSettings.autoSendOptIn;
-      screenShareSafeMode = companionSettings.screenShareSafeMode;
-    } catch (error) {
-      console.warn(
-        '[autoSend] could not fetch companion settings; falling back to local defaults:',
-        error instanceof Error ? error.message : error,
-      );
-    }
-  }
-
-  const tabLookup = await findTabForThread(thread);
-
-  const pending = (await readQueueItems())
-    .filter((item) => item.targetId === threadId && item.status === 'pending')
-    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-
-  if (pending.length === 0) {
-    return false;
-  }
-
-  let mutated = false;
-  for (const item of pending) {
-    const provider = thread.provider;
-    const verdict = evaluateAutoSendPreflight({
-      text: item.text,
-      provider,
-      threadAutoSendEnabled: true,
-      autoSendOptIn,
-      screenShareSafeMode,
-    });
-    if (!verdict.ok) {
-      const reason = preflightReasonText(verdict.blockedBy ?? 'unsupported-provider');
-      console.warn(`[autoSend] preflight blocked for ${item.bac_id}: ${reason}`);
-      await updateLocalQueueItem(item.bac_id, { lastError: reason });
-      mutated = true;
-      return mutated;
-    }
-    if (tabLookup.tabId === undefined) {
-      const reason = tabLookup.reason ?? 'No chat tab is open for this thread.';
-      console.warn(`[autoSend] ${reason} (${thread.threadUrl})`);
-      await updateLocalQueueItem(item.bac_id, { lastError: reason });
-      mutated = true;
-      return mutated;
-    }
-    const dispatch = await sendToContentScriptWithRecovery(tabLookup.tabId, {
-      type: messageTypes.autoSendItem,
-      text: verdict.text,
-      perItemTimeoutMs: 90_000,
-    });
-    let result: { ok: boolean; error?: string };
-    if (!dispatch.ok) {
-      result = { ok: false, error: dispatch.error ?? 'Content script is not reachable.' };
-    } else {
+  const outcome = await driveAutoSendImpl(threadId, {
+    readThread: async (id) => {
+      const t = (await readThreads()).find((x) => x.bac_id === id);
+      if (t === undefined) {
+        return undefined;
+      }
+      return {
+        bac_id: t.bac_id,
+        provider: t.provider,
+        threadUrl: t.threadUrl,
+        ...(t.autoSendEnabled === undefined ? {} : { autoSendEnabled: t.autoSendEnabled }),
+      };
+    },
+    readPendingItemsForThread: async (id) => {
+      return (await readQueueItems()).filter((item) => item.targetId === id);
+    },
+    readCompanionConfig: async () => {
+      const localSettings = await readSettings();
+      // Per-provider opt-in + screenShareSafeMode live on the companion
+      // when configured. Local-only users don't have a companion to store
+      // those flags, so fall back to "the per-thread toggle is the
+      // consent" — the user explicitly flipped Auto-send: on.
+      if (localSettings.companion.bridgeKey.trim().length === 0) {
+        return DEFAULT_LOCAL_CONFIG;
+      }
+      try {
+        const companionSettings = await createSettingsClient(localSettings.companion).read();
+        return {
+          autoSendOptIn: companionSettings.autoSendOptIn,
+          screenShareSafeMode: companionSettings.screenShareSafeMode,
+        };
+      } catch (error) {
+        console.warn(
+          '[autoSend] could not fetch companion settings; falling back to local defaults:',
+          error instanceof Error ? error.message : error,
+        );
+        return DEFAULT_LOCAL_CONFIG;
+      }
+    },
+    findTabForThread: async (t) => await findTabForThread(t),
+    sendItemToTab: async (tabId, text) => {
+      const dispatch = await sendToContentScriptWithRecovery(tabId, {
+        type: messageTypes.autoSendItem,
+        text,
+        perItemTimeoutMs: 90_000,
+      });
+      if (!dispatch.ok) {
+        return { ok: false, error: dispatch.error ?? 'Content script is not reachable.' };
+      }
       const raw = dispatch.data;
-      result =
-        typeof raw === 'object' && raw !== null && 'ok' in raw
-          ? (raw as { ok: boolean; error?: string })
-          : { ok: false, error: 'Content script returned an unexpected response.' };
-    }
-    if (!result.ok) {
-      const reason = result.error ?? 'Content script send failed.';
-      console.warn(`[autoSend] send failed for ${item.bac_id}: ${reason}`);
-      await updateLocalQueueItem(item.bac_id, { lastError: reason });
-      mutated = true;
-      return mutated;
-    }
-    await updateLocalQueueItem(item.bac_id, { status: 'done', lastError: null });
-    mutated = true;
-  }
-  return mutated;
+      if (typeof raw !== 'object' || raw === null || !('ok' in raw)) {
+        return { ok: false, error: 'Content script returned an unexpected response.' };
+      }
+      return raw as { ok: boolean; error?: string };
+    },
+    updateQueueItem: async (itemId, update) => {
+      await updateLocalQueueItem(itemId, update);
+    },
+    logWarning: (message: string) => {
+      console.warn(message);
+    },
+  });
+  return outcome.mutated;
 };
 
 // Fire-and-forget wrapper: spawns the drain unawaited and broadcasts
@@ -967,6 +911,19 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
       () => updateLocalQueueItem(request.queueItemId, request.update).then(() => undefined),
       'queue',
     );
+  }
+
+  if (request.type === messageTypes.retryAutoSend) {
+    return await withCompanionStatus(async () => {
+      // Clear lastError so the row stops showing the failure note
+      // immediately (the side panel re-renders before the drain
+      // finishes), then re-fire the drain for the item's thread.
+      const item = (await readQueueItems()).find((i) => i.bac_id === request.queueItemId);
+      await updateLocalQueueItem(request.queueItemId, { lastError: null });
+      if (item?.scope === 'thread' && typeof item.targetId === 'string') {
+        triggerAutoSendDrain(item.targetId);
+      }
+    }, 'queue');
   }
 
   if (request.type === messageTypes.moveThread) {

@@ -1341,6 +1341,24 @@ const App = () => {
                   >
                     {queueCopiedId === item.bac_id ? 'Copied' : 'Copy'}
                   </button>
+                  {item.lastError !== undefined ? (
+                    <button
+                      type="button"
+                      className="btn-link thread-queue-retry"
+                      title="Try the auto-send drain again now"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void runAction(() =>
+                          sendRequest({
+                            type: messageTypes.retryAutoSend,
+                            queueItemId: item.bac_id,
+                          }),
+                        );
+                      }}
+                    >
+                      Retry
+                    </button>
+                  ) : null}
                   <button
                     type="button"
                     className="btn-link"

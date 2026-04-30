@@ -31,6 +31,10 @@ export const messageTypes = {
   // a single queue item's text. Content script reports back when the
   // AI is done responding (Stop button → Send button transition).
   autoSendItem: 'sidetrack.queue.autoSend.item',
+  // Side panel asks the background to retry a queue item that
+  // previously failed (lastError set). Background clears lastError,
+  // re-fires the drain for the item's thread.
+  retryAutoSend: 'sidetrack.queue.autoSend.retry',
   restoreThreadTab: 'sidetrack.thread.restore-tab',
   queueFollowUp: 'sidetrack.queue.create',
   updateQueueItem: 'sidetrack.queue.update',
@@ -148,6 +152,10 @@ export type WorkboardRequest =
       readonly type: typeof messageTypes.updateQueueItem;
       readonly queueItemId: string;
       readonly update: QueueUpdate;
+    }
+  | {
+      readonly type: typeof messageTypes.retryAutoSend;
+      readonly queueItemId: string;
     }
   | {
       readonly type: typeof messageTypes.createReminder;
@@ -297,6 +305,10 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
 
   if (hasType(value, messageTypes.updateQueueItem)) {
     return typeof value.queueItemId === 'string' && isRecord(value.update);
+  }
+
+  if (hasType(value, messageTypes.retryAutoSend)) {
+    return typeof value.queueItemId === 'string';
   }
 
   if (hasType(value, messageTypes.createReminder)) {
