@@ -197,6 +197,7 @@ export function Preview() {
       {surface === 'dispatch' ? (
         <DispatchConfirm
           target={dispatchTargetLabel}
+          body={pendingPacket?.body ?? ''}
           screenShareActive={false}
           injectionDetected={false}
           tokenEstimate={tokenEstimateForConfirm}

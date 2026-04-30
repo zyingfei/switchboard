@@ -2230,6 +2230,7 @@ const App = () => {
             TARGET_PROVIDER_LABEL[mapUiTarget(pendingDispatch.target)] ??
             mapUiTarget(pendingDispatch.target)
           }
+          body={pendingDispatch.body}
           tokenEstimate={pendingDispatch.tokenEstimate}
           redactedCount={pendingDispatch.redactedItems.reduce((sum, r) => sum + r.count, 0)}
           {...(pendingDispatch.redactedItems.length > 0

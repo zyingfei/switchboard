@@ -355,9 +355,18 @@ export function PacketComposer({
   // depend on flattened scope fields (not the scope object itself) since
   // its identity churns every render.
   const scopeKey = `${scope.threadUrl ?? ''}::${scope.providerLabel ?? ''}::${scope.label}::${String(maxTurns)}`;
+  const bodyTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   useEffect(() => {
     if (bodyManuallyEdited) return;
     setBody(buildBody(kind, template, scope, title.trim() || initialTitle, includeTurnCount));
+    // Reset scroll to the top of the textarea so the user sees the
+    // beginning of the regenerated template, not whatever line their
+    // previous body was scrolled to. Without this, switching from
+    // Context Pack → Research Packet often shows a single mid-body
+    // line ("Key-share wallet") and looks like the body was wiped.
+    if (bodyTextareaRef.current !== null) {
+      bodyTextareaRef.current.scrollTop = 0;
+    }
   }, [bodyManuallyEdited, kind, template, title, initialTitle, includeTurnCount, scope, scopeKey]);
 
   const tokenEstimate = useMemo(() => estimateTokens(body), [body]);
@@ -599,13 +608,14 @@ export function PacketComposer({
           packet body {bodyManuallyEdited ? '· manually edited' : '· auto from template'}
         </div>
         <textarea
+          ref={bodyTextareaRef}
           className="preview-body mono packet-body-input"
           value={body}
           onChange={(e) => {
             setBody(e.target.value);
             if (!bodyManuallyEdited) setBodyManuallyEdited(true);
           }}
-          rows={12}
+          rows={16}
         />
       </div>
 

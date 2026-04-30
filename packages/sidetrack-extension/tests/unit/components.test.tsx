@@ -59,10 +59,13 @@ describe('UX skeleton components — render-without-crash + key text present', (
     expect(screen.getByRole('button', { name: /More packet actions/ })).toBeInTheDocument();
   });
 
-  it('DispatchConfirm renders all four §24.10 safety guards', () => {
+  it('DispatchConfirm renders all four §24.10 safety guards (clean state)', () => {
     render(
       <DispatchConfirm
         target="Claude"
+        body="# Real packet body\n\nThis is the user's real composed packet."
+        redactedCount={0}
+        tokenEstimate={1200}
         screenShareActive={false}
         injectionDetected={false}
         onCancel={noop}
@@ -70,17 +73,71 @@ describe('UX skeleton components — render-without-crash + key text present', (
         onConfirm={noop}
       />,
     );
-    expect(screen.getByText(/Redaction fired/)).toBeInTheDocument();
+    // No items redacted → friendly empty-state, NOT "Redaction fired".
+    // Regression guard for the "0 items removed — 1 GitHub token, 1 email"
+    // contradictory copy that was leaking from the stub defaults.
+    expect(screen.queryByText(/Redaction fired/)).toBeNull();
+    expect(screen.queryByText(/1 GitHub token/)).toBeNull();
+    expect(screen.getByText(/Nothing redacted/)).toBeInTheDocument();
     expect(screen.getByText(/Token budget/)).toBeInTheDocument();
     expect(screen.getByText(/safe to dispatch/)).toBeInTheDocument();
     expect(screen.getByText(/No prompt-injection patterns/)).toBeInTheDocument();
     expect(screen.getByText(/Paste mode is locked per §24.10/)).toBeInTheDocument();
   });
 
+  it('DispatchConfirm renders the actual packet body in the preview', () => {
+    // Regression guard for the bug where the preview was a hardcoded
+    // stub ("# Sidetrack / MVP PRD — context pack") regardless of
+    // what the user composed.
+    render(
+      <DispatchConfirm
+        target="Claude"
+        body="# Real packet body\n\nThis is the user's real composed packet."
+        redactedCount={0}
+        tokenEstimate={1200}
+        onCancel={noop}
+        onEdit={noop}
+        onConfirm={noop}
+      />,
+    );
+    // <pre> renders the body with newlines, so testing-library's
+    // default text-matcher won't find a substring directly. Look at
+    // the rendered <pre> element's textContent instead.
+    const pre = document.querySelector('pre.preview-body');
+    expect(pre?.textContent ?? '').toContain(
+      "This is the user's real composed packet.",
+    );
+    // Old stub strings must not appear.
+    expect(pre?.textContent ?? '').not.toContain('Sidetrack / MVP PRD — context pack');
+    expect(pre?.textContent ?? '').not.toContain('PRD §24.10 wording');
+  });
+
+  it('DispatchConfirm shows redaction details only when items were removed', () => {
+    render(
+      <DispatchConfirm
+        target="Claude"
+        body="…"
+        redactedCount={2}
+        redactedKinds={['1 GitHub token', '1 email']}
+        tokenEstimate={1200}
+        onCancel={noop}
+        onEdit={noop}
+        onConfirm={noop}
+      />,
+    );
+    expect(screen.getByText(/Redaction fired/)).toBeInTheDocument();
+    expect(screen.getByText(/2 items removed/)).toBeInTheDocument();
+    expect(screen.getByText('1 GitHub token, 1 email')).toBeInTheDocument();
+    expect(screen.queryByText(/Nothing redacted/)).toBeNull();
+  });
+
   it('DispatchConfirm flips screen-share + injection states when active', () => {
     render(
       <DispatchConfirm
         target="Claude"
+        body="…"
+        redactedCount={0}
+        tokenEstimate={1200}
         screenShareActive
         injectionDetected
         onCancel={noop}
