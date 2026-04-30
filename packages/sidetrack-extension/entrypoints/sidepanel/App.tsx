@@ -20,8 +20,11 @@ import {
   CodingAttach,
   type ComposedPacket,
   DispatchConfirm,
+  type DispatchEvent as RecentDispatchEvent,
+  type DispatchStatus as RecentDispatchStatus,
   MoveToPicker,
   PacketComposer,
+  RecentDispatches,
   ReviewComposer,
   SettingsPanel,
   type SettingsValue,
@@ -169,6 +172,36 @@ const visibleThreads = (threads: readonly TrackedThread[]): readonly TrackedThre
 
 const restoreStrategyForThread = (thread: TrackedThread): RestoreStrategy =>
   thread.tabSnapshot?.tabId === undefined ? 'reopen_url' : 'focus_open';
+
+// Adapt the companion's DispatchEventRecord shape to the visual
+// component's expected shape. Companion gives us kind+target+raw
+// timestamp; component wants a label-friendly summary.
+const DISPATCH_KIND_TO_DISPLAY: Record<string, RecentDispatchEvent['dispatchKind']> = {
+  research: 'research_packet',
+  review: 'submit_back',
+  coding: 'coding_agent_packet',
+  note: 'clone_to_chat',
+  other: 'dispatch_out',
+};
+
+const DISPATCH_PROVIDER_LABEL: Record<string, string> = {
+  chatgpt: 'ChatGPT',
+  claude: 'Claude',
+  gemini: 'Gemini',
+  codex: 'Codex',
+  claude_code: 'Claude Code',
+  cursor: 'Cursor',
+  other: 'External',
+};
+
+const DISPATCH_STATUS_TO_DISPLAY = (status: string): RecentDispatchStatus => {
+  if (status === 'replied' || status === 'noted' || status === 'pending') {
+    return status;
+  }
+  // 'sent', 'queued', 'failed' all map to 'sent' visually — failed is
+  // an internal companion state, not user-facing yet.
+  return 'sent';
+};
 
 const App = () => {
   const [state, setState] = useState<WorkboardState>(() => createEmptyWorkboardState());
@@ -1793,6 +1826,50 @@ const App = () => {
           ) : null}
         </>
       )}
+
+      {(() => {
+        // Recent Dispatches: chronological log of packets sent out of
+        // Sidetrack (review submit-backs, dispatch-out packets, coding
+        // agent packets). Only render when there's at least one — an
+        // empty section is noise on first-launch.
+        const dispatches = state.recentDispatches.slice(0, 12);
+        if (dispatches.length === 0) {
+          return null;
+        }
+        const dispatchEvents: RecentDispatchEvent[] = dispatches.map((d) => {
+          const sourceTitle =
+            state.threads.find((t) => t.bac_id === d.sourceThreadId)?.title ?? d.title;
+          return {
+            bac_id: d.bac_id,
+            sourceTitle,
+            targetProviderLabel:
+              DISPATCH_PROVIDER_LABEL[d.target.provider] ?? d.target.provider,
+            dispatchKind: DISPATCH_KIND_TO_DISPLAY[d.kind] ?? 'dispatch_out',
+            dispatchedAt: formatRelative(d.createdAt),
+            status: DISPATCH_STATUS_TO_DISPLAY(d.status),
+          };
+        });
+        return (
+          <>
+            <div className="sec-head">
+              <span>Recent dispatches</span>
+              <span className="sec-head-actions">
+                <span className="count mono">{String(dispatchEvents.length)}</span>
+              </span>
+            </div>
+            <RecentDispatches
+              dispatches={dispatchEvents}
+              onFocusSource={(id) => {
+                const dispatch = state.recentDispatches.find((d) => d.bac_id === id);
+                const thread = state.threads.find((t) => t.bac_id === dispatch?.sourceThreadId);
+                if (thread !== undefined) {
+                  openTabForThread(thread);
+                }
+              }}
+            />
+          </>
+        );
+      })()}
 
       <div className="sec-head">
         <span>Captures</span>

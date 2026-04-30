@@ -5,6 +5,7 @@ import type {
   ProviderId,
   TabSnapshot,
 } from './companion/model';
+import type { DispatchEventRecord } from './dispatch/types';
 
 export type CompanionStatus = 'connected' | 'disconnected' | 'vault-error' | 'local-only';
 export type TrackingMode = 'auto' | 'manual' | 'stopped' | 'removed' | 'archived';
@@ -162,6 +163,7 @@ export interface WorkboardState {
   readonly collapsedSections: readonly WorkboardSection['id'][];
   readonly codingSessions: readonly CodingSession[];
   readonly captureNotes: readonly CaptureNote[];
+  readonly recentDispatches: readonly DispatchEventRecord[];
   readonly lastError?: string;
   readonly updatedAt: string;
 }
@@ -256,6 +258,7 @@ export const createEmptyWorkboardState = (
   collapsedSections: [],
   codingSessions: [],
   captureNotes: [],
+  recentDispatches: [],
   updatedAt: new Date().toISOString(),
   ...overrides,
 });

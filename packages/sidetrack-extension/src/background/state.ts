@@ -12,6 +12,7 @@ import type {
   WorkstreamUpdate,
 } from '../companion/model';
 import { readDroppedCount, readQueue } from '../companion/queue';
+import type { DispatchEventRecord } from '../dispatch/types';
 import {
   createEmptyWorkboardState,
   defaultSettings,
@@ -36,6 +37,7 @@ const COLLAPSED_SECTIONS_KEY = 'sidetrack.collapsedSections';
 const CODING_SESSIONS_KEY = 'sidetrack.codingSessions';
 const CAPTURE_NOTES_KEY = 'sidetrack.captureNotes';
 const VAULT_PATH_KEY = 'sidetrack.vaultPath';
+const RECENT_DISPATCHES_KEY = 'sidetrack.recentDispatches';
 
 const storageGet = async <TValue>(key: string, fallback: TValue): Promise<TValue> => {
   const result = await chrome.storage.local.get({ [key]: fallback });
@@ -96,6 +98,45 @@ export const writeCachedCodingSessions = async (
   sessions: readonly CodingSession[],
 ): Promise<void> => {
   await storageSet({ [CODING_SESSIONS_KEY]: sessions });
+};
+
+// Recent-dispatches cache. Refreshed from companion's GET /v1/dispatches
+// on every withCompanionStatus poll (alongside coding sessions). The
+// cache lets the side panel render the section without waiting for
+// the companion round-trip on each state read; a stale read just
+// shows the previous batch until the next poll lands.
+export const readCachedDispatches = async (): Promise<readonly DispatchEventRecord[]> =>
+  await storageGet<readonly DispatchEventRecord[]>(RECENT_DISPATCHES_KEY, []);
+
+export const writeCachedDispatches = async (
+  dispatches: readonly DispatchEventRecord[],
+): Promise<void> => {
+  await storageSet({ [RECENT_DISPATCHES_KEY]: dispatches });
+};
+
+// Flip a dispatch's status to 'replied' once we detect a fresh
+// inbound assistant turn for the dispatch's source thread. Idempotent:
+// already-replied or noted dispatches are left alone. Returns the
+// dispatch ids that were transitioned (caller can broadcast).
+export const markDispatchesRepliedForThread = async (
+  threadId: string,
+): Promise<readonly string[]> => {
+  const current = await readCachedDispatches();
+  const flipped: string[] = [];
+  const next = current.map((d) => {
+    if (d.sourceThreadId !== threadId) {
+      return d;
+    }
+    if (d.status !== 'sent' && d.status !== 'pending' && d.status !== 'queued') {
+      return d;
+    }
+    flipped.push(d.bac_id);
+    return { ...d, status: 'replied' as const };
+  });
+  if (flipped.length > 0) {
+    await writeCachedDispatches(next);
+  }
+  return flipped;
 };
 
 export const readCaptureNotes = async (): Promise<readonly CaptureNote[]> =>
@@ -496,6 +537,7 @@ export const buildWorkboardState = async (
     selectorHealth: await readSelectorHealth(),
     codingSessions: await readCachedCodingSessions(),
     captureNotes: await readCaptureNotes(),
+    recentDispatches: await readCachedDispatches(),
     collapsedSections: await storageGet<WorkboardState['collapsedSections']>(
       COLLAPSED_SECTIONS_KEY,
       [],

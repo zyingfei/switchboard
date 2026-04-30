@@ -13,6 +13,21 @@ export interface CompanionWriteClient {
     readonly name: string;
     readonly resumeCommand?: string;
   }) => Promise<{ readonly bac_id: string }>;
+  // Move a tracked thread into a workstream (or out of any workstream
+  // when workstreamId is omitted). Maps to POST /v1/threads (upsert
+  // with primaryWorkstreamId set/cleared).
+  readonly moveThread?: (input: {
+    readonly threadId: string;
+    readonly workstreamId?: string;
+  }) => Promise<{ readonly bac_id: string; readonly revision: string }>;
+  // Park a follow-up question. Scope = thread/workstream/global; targetId
+  // identifies the thread or workstream when scope != global. Maps to
+  // POST /v1/queue.
+  readonly createQueueItem?: (input: {
+    readonly text: string;
+    readonly scope: 'thread' | 'workstream' | 'global';
+    readonly targetId?: string;
+  }) => Promise<{ readonly bac_id: string; readonly revision: string }>;
 }
 
 const toolText = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`;
@@ -289,6 +304,87 @@ export const createSidetrackMcpServer = (
       return asStructuredContent({
         bac_id: result.bac_id,
         registeredAt: new Date().toISOString(),
+      });
+    },
+  );
+
+  // Write tools — let an attached coding agent move a thread into a
+  // workstream and park a follow-up question. Both wrap existing
+  // companion endpoints (POST /v1/threads upsert with
+  // primaryWorkstreamId, POST /v1/queue), so no new schema lands here.
+  // The companion enforces auth via x-bac-bridge-key; per-workstream
+  // trust UI is intentionally deferred.
+  server.registerTool(
+    'bac.move_item',
+    {
+      description:
+        'Move a tracked thread into a workstream. Pass workstreamId="" (empty string) to clear the assignment and park the thread back at the top level. Returns the updated thread bac_id + revision.',
+      inputSchema: {
+        threadId: z.string().min(1).describe('bac_id of the thread to move.'),
+        workstreamId: z
+          .string()
+          .optional()
+          .describe('Target workstream bac_id; omit or pass empty to clear.'),
+      },
+    },
+    async ({ threadId, workstreamId }) => {
+      if (companionClient?.moveThread === undefined) {
+        throw new Error(
+          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.move_item is unavailable.',
+        );
+      }
+      const target =
+        workstreamId === undefined || workstreamId.length === 0 ? undefined : workstreamId;
+      const result = await companionClient.moveThread({
+        threadId,
+        ...(target === undefined ? {} : { workstreamId: target }),
+      });
+      return asStructuredContent({
+        bac_id: result.bac_id,
+        revision: result.revision,
+        movedAt: new Date().toISOString(),
+      });
+    },
+  );
+
+  server.registerTool(
+    'bac.queue_item',
+    {
+      description:
+        "Park a follow-up question for the user. Scope determines where it lands: 'thread' (set targetId to a thread bac_id), 'workstream' (set targetId to a workstream bac_id), or 'global' (no target). Returns the queue item bac_id.",
+      inputSchema: {
+        text: z.string().min(1).max(2000).describe('The follow-up question text.'),
+        scope: z
+          .enum(['thread', 'workstream', 'global'])
+          .describe("Where the item lives. 'global' means no target."),
+        targetId: z
+          .string()
+          .optional()
+          .describe(
+            "Thread or workstream bac_id; required when scope != 'global', ignored otherwise.",
+          ),
+      },
+    },
+    async ({ text, scope, targetId }) => {
+      if (companionClient?.createQueueItem === undefined) {
+        throw new Error(
+          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.queue_item is unavailable.',
+        );
+      }
+      if (scope !== 'global' && (targetId === undefined || targetId.length === 0)) {
+        throw new Error(
+          `bac.queue_item requires targetId when scope='${scope}'. Pass the thread or workstream bac_id, or use scope='global'.`,
+        );
+      }
+      const result = await companionClient.createQueueItem({
+        text,
+        scope,
+        ...(scope === 'global' || targetId === undefined ? {} : { targetId }),
+      });
+      return asStructuredContent({
+        bac_id: result.bac_id,
+        revision: result.revision,
+        queuedAt: new Date().toISOString(),
       });
     },
   );

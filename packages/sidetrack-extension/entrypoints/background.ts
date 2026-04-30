@@ -36,7 +36,9 @@ import {
   setThreadAutoSend,
   createLocalWorkstream,
   deleteLocalCaptureNote,
+  markDispatchesRepliedForThread,
   markQueueItemsDoneFromTurns,
+  readCachedDispatches,
   readQueueItems,
   readThreads,
   readSettings,
@@ -51,7 +53,9 @@ import {
   updateLocalWorkstream,
   upsertLocalThread,
   writeCachedCodingSessions,
+  writeCachedDispatches,
 } from '../src/background/state';
+import { createDispatchClient } from '../src/dispatch/client';
 
 const activeTab = async (): Promise<chrome.tabs.Tab | undefined> => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -223,6 +227,12 @@ const sendToCompanion = async (
     .filter((turn) => turn.role === 'user')
     .map((turn) => turn.text);
   await markQueueItemsDoneFromTurns(threadResult.bac_id, recentUserTexts);
+  // Flip 'sent' / 'pending' / 'queued' dispatches sourced from this
+  // thread to 'replied' once a fresh assistant turn lands. The user
+  // sees the pill update on the next side-panel poll.
+  if (lastTurn?.role === 'assistant') {
+    await markDispatchesRepliedForThread(threadResult.bac_id);
+  }
   await recordSelectorCanary(event);
   return threadResult;
 };
@@ -286,6 +296,7 @@ const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
         status: 'new',
       });
     }
+    await markDispatchesRepliedForThread(existing.bac_id);
   }
   await recordSelectorCanary(event);
 };
@@ -604,6 +615,31 @@ const refreshCachedCodingSessions = async (): Promise<void> => {
   }
 };
 
+const refreshCachedDispatches = async (): Promise<void> => {
+  if (!(await isCompanionConfigured())) {
+    await writeCachedDispatches([]);
+    return;
+  }
+  const settings = await readSettings();
+  try {
+    const dispatches = await createDispatchClient(settings.companion).listRecent({ limit: 20 });
+    // Keep the side-panel cache merged with any local 'replied' flips
+    // already on it — markDispatchesRepliedForThread runs on capture
+    // and writes locally; the next refresh from the companion would
+    // otherwise revert it until the companion learns about the reply.
+    const local = await readCachedDispatches();
+    const localReplies = new Map(
+      local.filter((d) => d.status === 'replied').map((d) => [d.bac_id, d.status]),
+    );
+    const merged = dispatches.map((d) =>
+      localReplies.has(d.bac_id) ? { ...d, status: 'replied' as const } : d,
+    );
+    await writeCachedDispatches(merged);
+  } catch {
+    // Companion unreachable — keep the existing cache.
+  }
+};
+
 const withCompanionStatus = async (
   work?: () => Promise<void>,
   reason?: WorkboardChangeReason,
@@ -615,6 +651,7 @@ const withCompanionStatus = async (
     await replayQueuedCaptures();
     const status = await assertCompanionReachable();
     await refreshCachedCodingSessions();
+    await refreshCachedDispatches();
     const state = await buildState(status);
     if (work !== undefined && reason !== undefined) {
       void broadcastWorkboardChanged(reason);
@@ -976,6 +1013,7 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
       // it starts polling. The token isn't persisted in the cache; it's
       // returned through the response envelope below.
       await refreshCachedCodingSessions();
+    await refreshCachedDispatches();
       const status = await assertCompanionReachable();
       const state = await buildState(status);
       return { ok: true, state, attachToken };
