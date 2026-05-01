@@ -198,6 +198,57 @@ describe('live side-panel App wiring', () => {
     expect(screen.queryByText(/Companion: disconnected/)).not.toBeInTheDocument();
   });
 
+  it('Send to dropdown → Claude opens DispatchConfirm with side-effect header', async () => {
+    // Smoke test for the new one-tap dispatch path. We need
+    // companion-connected state so the dropdown isn't disabled.
+    const state = liveState();
+    installChromeMock(
+      {
+        ...state,
+        companionStatus: 'connected',
+      },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    render(<App />);
+
+    // The default view is "Workstream: not set" (Inbox); the test
+    // thread lives in a Sidetrack workstream marked private. Switch
+    // to "All threads" which shows every thread regardless of
+    // workstream so we can drive the row directly. The thread title
+    // renders masked as `[private]` because the workstream is
+    // private — find by that, not by the actual title string.
+    await screen.findByRole('main', { name: 'Sidetrack workboard' });
+    fireEvent.click(screen.getByRole('tab', { name: 'All threads' }));
+
+    // Wait for the thread bucket to render under All-threads view.
+    const threadRow = (await screen.findByText('[private]')).closest('.thread');
+    expect(threadRow).not.toBeNull();
+    if (threadRow !== null) {
+      fireEvent.mouseEnter(threadRow);
+    }
+
+    // Click "Send to ▾".
+    const sendToBtn = await screen.findByRole('button', { name: /Send to ▾/ });
+    fireEvent.click(sendToBtn);
+
+    // Dropdown opens with sectioned options.
+    expect(await screen.findByText('Ask another AI')).toBeInTheDocument();
+    expect(screen.getByText('Hand to coding agent')).toBeInTheDocument();
+    expect(screen.getByText('Export as file')).toBeInTheDocument();
+
+    // Pick Claude — packet composes silently and DispatchConfirm
+    // mounts with the side-effect header. Use getAllByRole because
+    // "Claude" appears in multiple dropdown sections / chips.
+    const claudeButtons = screen.getAllByRole('button', { name: 'Claude' });
+    // First match in the dropdown is the AI provider row.
+    fireEvent.click(claudeButtons[0]!);
+
+    // DispatchConfirm header text spells out the side-effect.
+    expect(
+      await screen.findByText(/Will copy the packet to your clipboard and open Claude/),
+    ).toBeInTheDocument();
+  });
+
   it('routes move-to picker selections through the moveThread message', async () => {
     const sendMessage = installChromeMock(liveState());
 
