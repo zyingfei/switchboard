@@ -175,6 +175,10 @@ export interface WorkboardState {
   // auto-link matcher and surfaced to the dispatch viewer modal so
   // the user can see what they actually shipped, not the vault copy.
   readonly dispatchOriginals: Readonly<Partial<Record<string, string>>>;
+  // Map threadId → SendToTarget id of the last dispatch the user
+  // fired against that thread. Drives the "Recent" row in the
+  // SendToDropdown so a repeat send is one click.
+  readonly lastDispatchTargetByThread: Readonly<Partial<Record<string, string>>>;
   readonly lastError?: string;
   readonly updatedAt: string;
 }
@@ -272,6 +276,7 @@ export const createEmptyWorkboardState = (
   recentDispatches: [],
   dispatchLinks: {},
   dispatchOriginals: {},
+  lastDispatchTargetByThread: {},
   updatedAt: new Date().toISOString(),
   ...overrides,
 });

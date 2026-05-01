@@ -27,6 +27,8 @@ import {
   PacketComposer,
   RecentDispatches,
   ReviewComposer,
+  SendToDropdown,
+  type SendToTarget,
   SettingsPanel,
   type SettingsValue,
   SystemBannersStack,
@@ -332,6 +334,9 @@ const App = () => {
     () => new Set<string>(),
   );
   const [composeThreadId, setComposeThreadId] = useState<string | null>(null);
+  // Which thread row currently has its Send-to dropdown open (null
+  // = none). Only one open at a time.
+  const [sendToOpenFor, setSendToOpenFor] = useState<string | null>(null);
   const [pendingDispatch, setPendingDispatch] = useState<ComposedPacket | null>(null);
   const [dispatchInFlight, setDispatchInFlight] = useState(false);
   const [reviewThreadId, setReviewThreadId] = useState<string | null>(null);
@@ -612,6 +617,45 @@ const App = () => {
     };
   }, [composeThread, bridgeKey, port, composeTurnsByUrl]);
 
+  // Pre-fetch turns when the Send-to dropdown opens, so the smart-
+  // default packet builder has full chat context cached when the
+  // user picks a target. Reuses composeTurnsByUrl as the shared
+  // cache. No-op when the user closes the dropdown without picking.
+  useEffect(() => {
+    if (sendToOpenFor === null || bridgeKey.length === 0) {
+      return undefined;
+    }
+    const targetThread = state.threads.find((t) => t.bac_id === sendToOpenFor);
+    if (targetThread === undefined) {
+      return undefined;
+    }
+    const targetUrl = targetThread.threadUrl;
+    if (composeTurnsByUrl.has(targetUrl)) {
+      return undefined;
+    }
+    const portNumber = Number(port);
+    if (!Number.isFinite(portNumber) || portNumber <= 0) {
+      return undefined;
+    }
+    let cancelled = false;
+    const client = createTurnsClient({ port: portNumber, bridgeKey });
+    void client
+      .recentForThread(targetUrl, { limit: 12 })
+      .then((list) => {
+        if (!cancelled) {
+          setComposeTurnsByUrl((prev) => new Map(prev).set(targetUrl, list));
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setComposeTurnsByUrl((prev) => new Map(prev).set(targetUrl, []));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sendToOpenFor, state.threads, bridgeKey, port, composeTurnsByUrl]);
+
   // Lazy-fetch the most recent turns for the inline-expanded thread.
   // Triggered when the user clicks the title; cached by threadUrl
   // so a second expansion of the same row is instant.
@@ -834,6 +878,97 @@ const App = () => {
         );
       }
     })();
+  };
+
+  // ─── Send-to dropdown smart-default packet builder ─────────────
+  // Bypass the composer for the 70% case: pick a target → build a
+  // packet with smart defaults and route to DispatchConfirm. Map
+  // each SendToTarget to (kind, ComposedPacket.target). The body
+  // is rendered from the existing PacketComposer template helpers
+  // (research / coding / notebook) so output matches what the
+  // composer would produce.
+  const SEND_TO_INTENT: Record<
+    SendToTarget,
+    {
+      readonly kind: ComposedPacket['kind'];
+      readonly target: ComposedPacket['target'];
+    }
+  > = {
+    claude: { kind: 'research_packet', target: 'claude' },
+    gpt_pro: { kind: 'research_packet', target: 'gpt_pro' },
+    gemini: { kind: 'research_packet', target: 'gemini' },
+    claude_code: { kind: 'coding_agent_packet', target: 'claude_code' },
+    codex: { kind: 'coding_agent_packet', target: 'codex' },
+    cursor: { kind: 'coding_agent_packet', target: 'cursor' },
+    markdown: { kind: 'notebook_export', target: 'markdown' },
+    notebook: { kind: 'notebook_export', target: 'notebook' },
+  };
+
+  const buildSmartDefaultPacket = (
+    thread: TrackedThread,
+    target: SendToTarget,
+  ): ComposedPacket => {
+    const intent = SEND_TO_INTENT[target];
+    const turns = composeTurnsByUrl.get(thread.threadUrl) ?? [];
+    const turnsMd =
+      turns.length === 0
+        ? '_No turns captured yet._'
+        : turns
+            .map((t) => {
+              const role = t.role === 'assistant' ? '### Assistant' : '### User';
+              const text = t.text.length > 1200 ? `${t.text.slice(0, 1200)}…` : t.text;
+              return `${role}\n${text}`;
+            })
+            .join('\n\n');
+    const provider = providerLabel(thread.provider);
+    const head = `## Source\n${provider} · ${thread.threadUrl}`;
+    let body: string;
+    if (intent.kind === 'research_packet') {
+      body = `# Research request: ${thread.title}\n\n${head}\n\n## Pre-flight checklist for the receiving AI\n- [ ] Verify the conclusion against the original source\n- [ ] Note any framework versions / dates the source assumes\n- [ ] Flag if the question has shifted since first ask\n- [ ] Distinguish what was asserted vs cited\n\n## Recent context\n${turnsMd}\n\n## Ask\n…`;
+    } else if (intent.kind === 'coding_agent_packet') {
+      body = `# Coding handoff: ${thread.title}\n\n## Source thread\n${provider} · ${thread.threadUrl}\n\n## Recent context\n${turnsMd}\n\n## Files / modules involved\n…\n\n## Acceptance criteria\n- [ ] …\n- [ ] …\n\n## Constraints\n- Do not modify unrelated files.\n- Run the existing test suite before reporting done.`;
+    } else {
+      const today = new Date().toISOString().slice(0, 10);
+      body = `---\ntitle: ${thread.title}\ncreated: ${today}\nsource: ${thread.threadUrl}\nprovider: ${provider}\n---\n\n# ${thread.title}\n\n${turnsMd}`;
+    }
+    return {
+      kind: intent.kind,
+      template: intent.kind === 'research_packet' ? 'web_to_ai_checklist' : null,
+      target: intent.target,
+      title: thread.title,
+      body,
+      scopeLabel: thread.title,
+      sourceThreadId: thread.bac_id,
+      tokenEstimate: Math.ceil(body.length / 4),
+      redactedItems: [],
+      ...(thread.primaryWorkstreamId === undefined
+        ? {}
+        : { workstreamId: thread.primaryWorkstreamId }),
+    };
+  };
+
+  const handleSendToPick = (thread: TrackedThread, target: SendToTarget): void => {
+    setSendToOpenFor(null);
+    const packet = buildSmartDefaultPacket(thread, target);
+    // Cache the user's last target so the dropdown's "Recent" row
+    // pre-selects it next time.
+    void sendRequest({
+      type: messageTypes.cacheLastDispatchTarget,
+      threadId: thread.bac_id,
+      target,
+    }).catch(() => undefined);
+    if (target === 'markdown' || target === 'notebook') {
+      // Export targets bypass DispatchConfirm — write the file
+      // immediately and record the dispatch event so it shows up in
+      // Recent Dispatches.
+      const safeTitle = thread.title.replace(/[^a-z0-9-_]+/gi, '-').slice(0, 80);
+      downloadAsFile(`${safeTitle || 'sidetrack-packet'}.md`, packet.body);
+      setError(`Downloaded ${safeTitle || 'sidetrack-packet'}.md.`);
+      setPendingDispatch(packet);
+      return;
+    }
+    // AI providers + coding agents → confirm modal, then dispatch.
+    setPendingDispatch(packet);
   };
 
   const submitQueueFollowUp = (threadId: string) => {
@@ -1062,6 +1197,16 @@ const App = () => {
         dispatchId: submitResult.bac_id,
         body: pendingDispatch.body,
       }).catch(() => undefined);
+      // Update the per-thread "last target" so the SendToDropdown
+      // can pre-select it next time. Same for composer-driven
+      // dispatches as for one-tap Send-to picks.
+      if (pendingDispatch.sourceThreadId !== undefined) {
+        void sendRequest({
+          type: messageTypes.cacheLastDispatchTarget,
+          threadId: pendingDispatch.sourceThreadId,
+          target: pendingDispatch.target,
+        }).catch(() => undefined);
+      }
       // Side-effect: copy the body + open the target provider in a
       // new tab so the user can paste right into a fresh chat. Skip
       // for export targets — those got their download in the
@@ -1492,27 +1637,50 @@ const App = () => {
                 `${action} needs a connected companion to read this thread's turns from the vault. Open Settings (cog, top right) → enter the bridge port and key → Save, then try again.`,
               );
             };
+            const sendDropdownOpen = sendToOpenFor === thread.bac_id;
+            const recentTarget = state.lastDispatchTargetByThread[thread.bac_id] as
+              | SendToTarget
+              | undefined;
             return (
               <>
-                <button
-                  type="button"
-                  className={'btn-link' + (requiresCompanion ? ' disabled-look' : '')}
-                  title={
-                    requiresCompanion
-                      ? 'Send is unavailable in local-only mode — click for setup steps'
-                      : 'Compose a packet from this thread and dispatch to another AI'
-                  }
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    if (requiresCompanion) {
-                      explainNeedsCompanion('Send');
-                      return;
+                <span className="send-to-anchor">
+                  <button
+                    type="button"
+                    className={'btn-link' + (requiresCompanion ? ' disabled-look' : '')}
+                    title={
+                      requiresCompanion
+                        ? 'Send is unavailable in local-only mode — click for setup steps'
+                        : 'Send this thread to another AI / coding agent / file'
                     }
-                    setComposeThreadId(thread.bac_id);
-                  }}
-                >
-                  Send
-                </button>
+                    aria-haspopup="menu"
+                    aria-expanded={sendDropdownOpen}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (requiresCompanion) {
+                        explainNeedsCompanion('Send');
+                        return;
+                      }
+                      setSendToOpenFor(sendDropdownOpen ? null : thread.bac_id);
+                    }}
+                  >
+                    Send to ▾
+                  </button>
+                  {sendDropdownOpen ? (
+                    <SendToDropdown
+                      recentTarget={recentTarget}
+                      onPick={(target) => {
+                        handleSendToPick(thread, target);
+                      }}
+                      onCustomize={() => {
+                        setSendToOpenFor(null);
+                        setComposeThreadId(thread.bac_id);
+                      }}
+                      onClose={() => {
+                        setSendToOpenFor(null);
+                      }}
+                    />
+                  ) : null}
+                </span>
                 <button
                   type="button"
                   className={'btn-link' + (requiresCompanion ? ' disabled-look' : '')}
@@ -2465,6 +2633,22 @@ const App = () => {
             mapUiTarget(pendingDispatch.target)
           }
           body={pendingDispatch.body}
+          dispatchKind={(() => {
+            // Map the packet target → side-effect lane the modal
+            // uses for its "Will ..." header.
+            const t = pendingDispatch.target;
+            if (t === 'markdown' || t === 'notebook') return 'export' as const;
+            if (t === 'codex' || t === 'claude_code' || t === 'cursor')
+              return 'coding' as const;
+            // AI providers: paste vs auto-send depends on the user's
+            // settings + the thread's autoSendEnabled toggle.
+            const provider = mapUiTarget(t);
+            const autoOn =
+              settings !== null &&
+              isProviderWithOptIn(provider) &&
+              settings.autoSendOptIn[provider];
+            return autoOn ? ('chat-auto' as const) : ('chat-paste' as const);
+          })()}
           tokenEstimate={pendingDispatch.tokenEstimate}
           redactedCount={pendingDispatch.redactedItems.reduce((sum, r) => sum + r.count, 0)}
           {...(pendingDispatch.redactedItems.length > 0

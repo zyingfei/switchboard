@@ -1238,6 +1238,34 @@ textarea.preview-body:focus {
 }
 
 /* ── Dispatch confirm safety chain ── */
+/* Intent-first picker at the top of the composer. Slightly bigger
+   pills than the regular pill row to read as the primary chooser. */
+.composer-intent-row {
+  gap: 8px;
+}
+.composer-intent-pill {
+  font-size: 13px;
+  padding: 7px 14px;
+  font-family: var(--display, 'Fraunces', serif);
+  font-weight: 500;
+}
+
+/* Side-effect preview — single italic mono line above the safety
+   chain that spells out exactly what clicking Confirm will do.
+   Sits on its own row so the user reads it before scanning the
+   chain. */
+.dispatch-side-effect {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  background: var(--paper, #f5efe2);
+  border-left: 3px solid var(--signal, #c2410c);
+  border-radius: var(--rad-s);
+  font-size: 12px;
+  font-style: italic;
+  color: var(--ink-2);
+  line-height: 1.45;
+}
+
 .safety-chain {
   display: flex;
   flex-direction: column;
@@ -3142,6 +3170,75 @@ textarea.preview-body:focus {
 }
 .capture-empty {
   padding: 8px 12px;
+}
+
+/* Send-to dropdown — anchored under the thread row's "Send to ▾"
+   button. One-tap dispatch picker for the 70% case. Sections:
+   Recent (if any) → Ask another AI → Hand to coding agent →
+   Export → Customize first. */
+.send-to-anchor {
+  position: relative;
+  display: inline-flex;
+}
+.send-to-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  min-width: 200px;
+  max-height: 60vh;
+  overflow-y: auto;
+  background: var(--paper-light);
+  border: var(--hair);
+  border-radius: var(--rad-s);
+  box-shadow: 0 8px 24px rgba(27, 25, 22, 0.16);
+  padding: 4px;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+}
+.send-to-section-head {
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  padding: 6px 10px 2px;
+}
+.send-to-divider {
+  height: 1px;
+  background: var(--rule-soft, #e5ddc9);
+  margin: 4px 0;
+}
+.send-to-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 10px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--rad-s);
+  cursor: pointer;
+  text-align: left;
+  font-family: var(--display);
+  font-size: 12.5px;
+  color: var(--ink);
+  white-space: nowrap;
+}
+.send-to-item:hover {
+  background: var(--paper-deep);
+}
+.send-to-item:focus-visible {
+  outline: 1px solid var(--ink);
+  outline-offset: -1px;
+}
+.send-to-item-extra {
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+}
+.send-to-customize {
+  font-style: italic;
+  color: var(--ink-2);
 }
 
 /* Build identity footer — small, low-contrast, sits at the very

@@ -46,6 +46,9 @@ export type { AnnotationProps } from './Annotation';
 export { RecentDispatches } from './RecentDispatches';
 export type { RecentDispatchesProps, DispatchEvent, DispatchStatus } from './RecentDispatches';
 
+export { SendToDropdown } from './SendToDropdown';
+export type { SendToDropdownProps, SendToTarget } from './SendToDropdown';
+
 // M1 polish
 export { TabRecovery } from './TabRecovery';
 export type { TabRecoveryProps, TabSnapshot, RestoreStrategy } from './TabRecovery';

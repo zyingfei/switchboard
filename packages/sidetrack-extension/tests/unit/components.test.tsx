@@ -48,9 +48,12 @@ const STUB_WORKSTREAMS = [
 ];
 
 describe('UX skeleton components — render-without-crash + key text present', () => {
-  it('PacketComposer renders kind / template / target selectors and footer actions', () => {
+  it('PacketComposer renders intent picker / framing / target selectors and footer actions', () => {
     render(<PacketComposer onCancel={noop} onCopy={noop} onSave={noop} onDispatch={noop} />);
-    expect(screen.getByText('Research Packet')).toBeInTheDocument();
+    // Intent-first picker replaces the old "Packet kind" pill row;
+    // default intent = "Ask another AI" so framing field renders.
+    expect(screen.getByRole('button', { name: 'Ask another AI' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Hand to a coding agent' })).toBeInTheDocument();
     expect(screen.getByText('Web-to-AI checklist')).toBeInTheDocument();
     // Footer is now a primary Dispatch + a split-button caret. Copy /
     // Save live in the menu, opened via the caret — they're not in the

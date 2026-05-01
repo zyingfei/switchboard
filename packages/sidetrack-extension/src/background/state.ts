@@ -45,6 +45,10 @@ const DISPATCH_LINKS_KEY = 'sidetrack.dispatchLinks';
 // to clipboard — which is the unredacted form. We record it on the
 // extension side at submit time and use it for substring matching.
 const DISPATCH_ORIGINALS_KEY = 'sidetrack.dispatchOriginals';
+// Per-thread "last dispatch target" — surfaces in the SendToDropdown
+// "Recent" section so the user can repeat their last dispatch with
+// one click. Map: threadId → SendToTarget id (string).
+const LAST_DISPATCH_TARGET_KEY = 'sidetrack.lastDispatchTargetByThread';
 
 const storageGet = async <TValue>(key: string, fallback: TValue): Promise<TValue> => {
   const result = await chrome.storage.local.get({ [key]: fallback });
@@ -159,6 +163,27 @@ export const writeDispatchOriginal = async (
   }
   await storageSet({
     [DISPATCH_ORIGINALS_KEY]: { ...current, [dispatchId]: body },
+  });
+};
+
+// Per-thread last dispatch target — populated each time the user
+// successfully fires a Send-to dispatch. Surfaces in the dropdown's
+// "Recent" section.
+export const readLastDispatchTargetByThread = async (): Promise<
+  Readonly<Partial<Record<string, string>>>
+> =>
+  await storageGet<Readonly<Partial<Record<string, string>>>>(LAST_DISPATCH_TARGET_KEY, {});
+
+export const writeLastDispatchTargetByThread = async (
+  threadId: string,
+  target: string,
+): Promise<void> => {
+  const current = await readLastDispatchTargetByThread();
+  if (current[threadId] === target) {
+    return;
+  }
+  await storageSet({
+    [LAST_DISPATCH_TARGET_KEY]: { ...current, [threadId]: target },
   });
 };
 
@@ -636,6 +661,7 @@ export const buildWorkboardState = async (
     recentDispatches: await readCachedDispatches(),
     dispatchLinks: await readDispatchLinks(),
     dispatchOriginals: await readDispatchOriginals(),
+    lastDispatchTargetByThread: await readLastDispatchTargetByThread(),
     collapsedSections: await storageGet<WorkboardState['collapsedSections']>(
       COLLAPSED_SECTIONS_KEY,
       [],

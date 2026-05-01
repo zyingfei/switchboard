@@ -58,6 +58,7 @@ import {
   writeCachedDispatches,
   writeDispatchLink,
   writeDispatchOriginal,
+  writeLastDispatchTargetByThread,
 } from '../src/background/state';
 import { createDispatchClient } from '../src/dispatch/client';
 import { tryLinkCapturedThread } from '../src/companion/dispatchLinking';
@@ -1081,6 +1082,14 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
     // matcher can use it on the next captured user turn.
     return await withCompanionStatus(async () => {
       await writeDispatchOriginal(request.dispatchId, request.body);
+    }, 'queue');
+  }
+
+  if (request.type === messageTypes.cacheLastDispatchTarget) {
+    // Side panel just fired a Send-to dispatch — record the target
+    // so the dropdown's "Recent" row can pre-select it next time.
+    return await withCompanionStatus(async () => {
+      await writeLastDispatchTargetByThread(request.threadId, request.target);
     }, 'queue');
   }
 

@@ -47,6 +47,10 @@ export const messageTypes = {
   // auto-link matcher can match against the unredacted text instead
   // of the redacted form the companion stores.
   cacheDispatchOriginal: 'sidetrack.dispatch.cacheOriginal',
+  // Side panel records the user's last Send-to target per thread so
+  // the SendToDropdown can highlight it under the "Recent" header
+  // for a one-click repeat.
+  cacheLastDispatchTarget: 'sidetrack.dispatch.cacheLastTarget',
   // Content script asks the background to surface the matching
   // thread row in the side panel (scroll + flash). Sent from the
   // floating "↗ Sidetrack" button injected into provider chat
@@ -200,6 +204,11 @@ export type WorkboardRequest =
       readonly type: typeof messageTypes.cacheDispatchOriginal;
       readonly dispatchId: string;
       readonly body: string;
+    }
+  | {
+      readonly type: typeof messageTypes.cacheLastDispatchTarget;
+      readonly threadId: string;
+      readonly target: string;
     }
   | {
       readonly type: typeof messageTypes.focusThreadInSidePanel;
@@ -369,6 +378,10 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
 
   if (hasType(value, messageTypes.cacheDispatchOriginal)) {
     return typeof value.dispatchId === 'string' && typeof value.body === 'string';
+  }
+
+  if (hasType(value, messageTypes.cacheLastDispatchTarget)) {
+    return typeof value.threadId === 'string' && typeof value.target === 'string';
   }
 
   if (hasType(value, messageTypes.focusThreadInSidePanel)) {

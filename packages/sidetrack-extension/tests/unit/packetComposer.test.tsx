@@ -48,11 +48,37 @@ describe('PacketComposer — title is owned by Scope', () => {
   });
 });
 
-describe('PacketComposer — Target is two lanes', () => {
-  it('groups providers under "Send to AI" and exports under "Or export as"', () => {
+describe('PacketComposer — intent-first target lanes', () => {
+  it('default intent "Ask another AI" shows AI providers and the framing field', () => {
     renderComposer();
-    expect(screen.getByText('Send to AI')).toBeInTheDocument();
-    expect(screen.getByText('Or export as')).toBeInTheDocument();
+    // The single-axis target row is labelled "Send to" inside the
+    // AI-asking intent. AI provider pills are rendered.
+    expect(screen.getByText('Send to')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Claude' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'GPT' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Gemini' })).toBeInTheDocument();
+    // Framing row is visible inside this intent.
+    expect(screen.getByText('Framing')).toBeInTheDocument();
+  });
+
+  it('switching to "Hand to a coding agent" hides framing and shows coding agents only', () => {
+    renderComposer();
+    fireEvent.click(screen.getByRole('button', { name: 'Hand to a coding agent' }));
+    expect(screen.queryByText('Framing')).toBeNull();
+    expect(screen.getByText('Send to coding agent')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Claude Code' })).toBeInTheDocument();
+    // AI providers are NOT in this lane.
+    expect(screen.queryByRole('button', { name: 'Claude' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'GPT' })).toBeNull();
+  });
+
+  it('switching to "Save as reference" shows the export sinks only', () => {
+    renderComposer();
+    fireEvent.click(screen.getByRole('button', { name: 'Save as reference' }));
+    expect(screen.queryByText('Framing')).toBeNull();
+    expect(screen.getByText('Save as')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Notebook' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Markdown' })).toBeInTheDocument();
   });
 
   it('reveals tier sub-pills (Pro / Deep Research) only when GPT is selected', () => {
@@ -107,9 +133,10 @@ describe('PacketComposer — footer hierarchy', () => {
 
   it('primary CTA flips to "Export" when a file sink is selected', () => {
     const { container } = renderComposer();
+    // Notebook is now only reachable inside the "Save as reference"
+    // intent — switch to that intent first, then pick Notebook.
+    fireEvent.click(screen.getByRole('button', { name: 'Save as reference' }));
     fireEvent.click(screen.getByRole('button', { name: 'Notebook' }));
-    // The packet-kind "Notebook Export" pill also matches /Export/ so
-    // we pin to the actual primary CTA via its class.
     const cta = container.querySelector('.split-button-main');
     expect(cta?.textContent ?? '').toMatch(/Export$/);
   });

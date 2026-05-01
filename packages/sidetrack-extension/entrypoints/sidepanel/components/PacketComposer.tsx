@@ -68,21 +68,49 @@ export interface PacketComposerProps {
   readonly onDispatch: (packet: ComposedPacket) => void;
 }
 
-const KIND_LABELS: Record<PacketKind, string> = {
-  context_pack: 'Context Pack',
-  research_packet: 'Research Packet',
-  coding_agent_packet: 'Coding Agent Packet',
-  notebook_export: 'Notebook Export',
+// Intent-first model — 3 plain-English buckets the user picks
+// before any other choices. Each intent locks the kind, gates which
+// targets show, and decides whether the template field renders. The
+// underlying ComposedPacket schema is unchanged; intent is purely a
+// UI organiser.
+type ComposerIntent = 'ask-ai' | 'hand-to-coder' | 'save-as-file';
+
+const INTENT_LABELS: Record<ComposerIntent, string> = {
+  'ask-ai': 'Ask another AI',
+  'hand-to-coder': 'Hand to a coding agent',
+  'save-as-file': 'Save as reference',
 };
 
-const KIND_HELP: Record<PacketKind, string> = {
-  context_pack:
-    'Generic context bundle. Use when handing a thread to another AI for "catch me up".',
-  research_packet: 'Targeted research ask. Pick a sub-template for the framing.',
-  coding_agent_packet:
-    'For Claude Code / Codex / Cursor — file-aware handoff with acceptance criteria.',
-  notebook_export: 'Markdown export with frontmatter, ready for Obsidian / Notion.',
+const INTENT_HELP: Record<ComposerIntent, string> = {
+  'ask-ai':
+    'Forward this thread to Claude / GPT / Gemini for a follow-up question or research ask.',
+  'hand-to-coder':
+    'Build a file-aware handoff for Claude Code / Codex / Cursor — includes acceptance criteria.',
+  'save-as-file':
+    'Save the thread as Markdown for your notes vault / Obsidian / Notion.',
 };
+
+const intentForKind = (kind: PacketKind): ComposerIntent => {
+  if (kind === 'coding_agent_packet') return 'hand-to-coder';
+  if (kind === 'notebook_export') return 'save-as-file';
+  return 'ask-ai';
+};
+
+const defaultKindForIntent = (intent: ComposerIntent): PacketKind => {
+  if (intent === 'hand-to-coder') return 'coding_agent_packet';
+  if (intent === 'save-as-file') return 'notebook_export';
+  return 'research_packet';
+};
+
+// KIND_LABELS used to drive the now-replaced four-pill kind row; it
+// stays as documentation of how PacketKind maps to display text. If
+// a future debug surface needs it, uncomment.
+// const KIND_LABELS: Record<PacketKind, string> = {
+//   context_pack: 'Context Pack',
+//   research_packet: 'Research Packet',
+//   coding_agent_packet: 'Coding Agent Packet',
+//   notebook_export: 'Notebook Export',
+// };
 
 const TEMPLATE_LABELS: Record<ResearchTemplate, string> = {
   web_to_ai_checklist: 'Web-to-AI checklist',
@@ -317,6 +345,15 @@ export function PacketComposer({
   onDispatch,
 }: PacketComposerProps) {
   const [kind, setKind] = useState<PacketKind>(defaultKind);
+  const [intent, setIntent] = useState<ComposerIntent>(intentForKind(defaultKind));
+  // Pick-intent handler: set both intent + kind, and reset target
+  // when crossing intent lanes so the user doesn't end up with
+  // (intent: ask-ai, target: codex).
+  const handleIntentPick = (next: ComposerIntent): void => {
+    setIntent(next);
+    setKind(defaultKindForIntent(next));
+    setTarget(null);
+  };
   const [template, setTemplate] = useState<ResearchTemplate>(defaultTemplate);
   const [target, setTarget] = useState<DispatchTarget | null>(null);
   // Title is owned by Scope — a packet about a thread is named after
@@ -407,29 +444,36 @@ export function PacketComposer({
 
   return (
     <Modal title="New packet" subtitle="Compose, preview, dispatch" width={780} onClose={onCancel}>
+      {/* Intent-first organiser. Three plain-English buckets that
+          map to a kind + lock the target lane. Replaces the four-pill
+          Packet kind row + the Template row, both of which were too
+          much choice for the common case. */}
       <div className="composer-row">
-        <label>Packet kind</label>
-        <div className="pill-row">
-          {(Object.keys(KIND_LABELS) as readonly PacketKind[]).map((k) => (
+        <label>What do you want to do?</label>
+        <div className="pill-row composer-intent-row">
+          {(Object.keys(INTENT_LABELS) as readonly ComposerIntent[]).map((i) => (
             <button
-              key={k}
+              key={i}
               type="button"
-              className={'pill ' + (kind === k ? 'on' : '')}
-              title={KIND_HELP[k]}
+              className={'pill composer-intent-pill ' + (intent === i ? 'on' : '')}
+              title={INTENT_HELP[i]}
               onClick={() => {
-                setKind(k);
+                handleIntentPick(i);
               }}
             >
-              {KIND_LABELS[k]}
+              {INTENT_LABELS[i]}
             </button>
           ))}
         </div>
-        <p className="composer-help mono">{KIND_HELP[kind]}</p>
+        <p className="composer-help">{INTENT_HELP[intent]}</p>
       </div>
 
-      {kind === 'research_packet' ? (
+      {/* Template lives only inside the "Ask another AI" intent —
+          it's research-packet-specific framing. Hidden for coding
+          handoffs and exports. */}
+      {intent === 'ask-ai' ? (
         <div className="composer-row">
-          <label>Template</label>
+          <label>Framing</label>
           <div className="pill-row">
             {(Object.keys(TEMPLATE_LABELS) as readonly ResearchTemplate[]).map((t) => (
               <button
@@ -523,85 +567,87 @@ export function PacketComposer({
         </div>
       </div>
 
-      {/* Target now in two lanes — "Send to AI" (chat + coding agents)
-          drives a real Dispatch; "Export as" produces a file. The
-          footer's Dispatch button reads the lane to know whether to
-          ship to a chat or write a file. */}
-      <div className="composer-row">
-        <label>Send to AI</label>
-        <div className="pill-row pill-row-grouped">
-          {SEND_TO_AI_TARGETS.map((group) => {
-            const groupActive =
-              group.id === target ||
-              (group.variants?.some((v) => v.id === target) ?? false);
-            const isVariantSelected = group.variants?.some((v) => v.id === target) ?? false;
-            return (
-              <span
-                key={group.id}
-                className={'pill-group' + (groupActive ? ' on' : '')}
-              >
-                <button
-                  type="button"
-                  className={'pill ' + (groupActive ? 'on' : '')}
-                  onClick={() => {
-                    setTarget(group.id);
-                  }}
+      {/* Target row is intent-scoped so the user can't pick
+          (intent: ask-ai, target: codex). Each intent shows ONLY
+          its own target lane. */}
+      {intent === 'ask-ai' ? (
+        <div className="composer-row">
+          <label>Send to</label>
+          <div className="pill-row pill-row-grouped">
+            {SEND_TO_AI_TARGETS.map((group) => {
+              const groupActive =
+                group.id === target ||
+                (group.variants?.some((v) => v.id === target) ?? false);
+              return (
+                <span
+                  key={group.id}
+                  className={'pill-group' + (groupActive ? ' on' : '')}
                 >
-                  {group.label}
-                </button>
-                {group.variants !== undefined && groupActive
-                  ? group.variants.map((v) => (
-                      <button
-                        key={v.id}
-                        type="button"
-                        className={'pill pill-variant ' + (target === v.id ? 'on' : '')}
-                        onClick={() => {
-                          setTarget(v.id);
-                        }}
-                      >
-                        {v.label}
-                      </button>
-                    ))
-                  : null}
-                {/* Hide the variant-only highlight when nothing is
-                    selected so the parent pill doesn't read as active
-                    on its own. */}
-                {group.id === target && isVariantSelected ? null : null}
-              </span>
-            );
-          })}
-          {SEND_TO_CODING_TARGETS.map((t) => (
-            <button
-              key={t}
-              type="button"
-              className={'pill ' + (target === t ? 'on' : '')}
-              onClick={() => {
-                setTarget(t);
-              }}
-            >
-              {TARGET_LABELS[t]}
-            </button>
-          ))}
+                  <button
+                    type="button"
+                    className={'pill ' + (groupActive ? 'on' : '')}
+                    onClick={() => {
+                      setTarget(group.id);
+                    }}
+                  >
+                    {group.label}
+                  </button>
+                  {group.variants !== undefined && groupActive
+                    ? group.variants.map((v) => (
+                        <button
+                          key={v.id}
+                          type="button"
+                          className={'pill pill-variant ' + (target === v.id ? 'on' : '')}
+                          onClick={() => {
+                            setTarget(v.id);
+                          }}
+                        >
+                          {v.label}
+                        </button>
+                      ))
+                    : null}
+                </span>
+              );
+            })}
+          </div>
         </div>
-      </div>
-
-      <div className="composer-row">
-        <label>Or export as</label>
-        <div className="pill-row">
-          {EXPORT_AS_TARGETS.map((t) => (
-            <button
-              key={t}
-              type="button"
-              className={'pill ' + (target === t ? 'on' : '')}
-              onClick={() => {
-                setTarget(t);
-              }}
-            >
-              {TARGET_LABELS[t]}
-            </button>
-          ))}
+      ) : intent === 'hand-to-coder' ? (
+        <div className="composer-row">
+          <label>Send to coding agent</label>
+          <div className="pill-row">
+            {SEND_TO_CODING_TARGETS.map((t) => (
+              <button
+                key={t}
+                type="button"
+                className={'pill ' + (target === t ? 'on' : '')}
+                onClick={() => {
+                  setTarget(t);
+                }}
+              >
+                {TARGET_LABELS[t]}
+              </button>
+            ))}
+          </div>
         </div>
-      </div>
+      ) : (
+        <div className="composer-row">
+          <label>Save as</label>
+          <div className="pill-row">
+            {EXPORT_AS_TARGETS.map((t) => (
+              <button
+                key={t}
+                type="button"
+                className={'pill ' + (target === t ? 'on' : '')}
+                onClick={() => {
+                  setTarget(t);
+                }}
+              >
+                {TARGET_LABELS[t]}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="composer-preview">
         <div className="preview-head mono">

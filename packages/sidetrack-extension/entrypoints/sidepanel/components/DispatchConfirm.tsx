@@ -2,6 +2,15 @@ import { useState } from 'react';
 import { Modal } from './Modal';
 import { Icons } from './icons';
 
+// Lane the dispatch belongs to — drives the side-effect preview
+// header above the safety chain. The 4 lanes correspond to the
+// 4 visible outcomes the user can experience post-confirm:
+//   - chat-paste: copy body + open AI chat tab
+//   - chat-auto:  open AI chat tab + auto-paste + auto-send
+//   - coding:     copy body, paste into your terminal session
+//   - export:     download a .md file to Downloads
+export type DispatchKindForPreview = 'chat-paste' | 'chat-auto' | 'coding' | 'export';
+
 export interface DispatchConfirmProps {
   readonly target: string;
   // The actual composed packet body. Required — the modal previews
@@ -9,6 +18,11 @@ export interface DispatchConfirmProps {
   // stub which silently shipped the wrong text into the dispatch
   // confirmation, masking the real content.
   readonly body: string;
+  // Which side-effect category this dispatch falls into. Drives the
+  // single-sentence "Will ..." header that spells out exactly what
+  // will happen post-confirm. Optional for back-compat; defaults to
+  // chat-paste which matches the historical behaviour.
+  readonly dispatchKind?: DispatchKindForPreview;
   readonly screenShareActive?: boolean;
   readonly redactedCount?: number;
   readonly redactedKinds?: readonly string[];
@@ -35,6 +49,7 @@ export interface DispatchConfirmProps {
 export function DispatchConfirm({
   target,
   body,
+  dispatchKind = 'chat-paste',
   screenShareActive = false,
   // No stub defaults — caller must pass the real numbers. Stubs
   // silently masked an actual bug where 0-redaction dispatches
@@ -55,6 +70,22 @@ export function DispatchConfirm({
     tokenPct < 80 ? 'green' : tokenPct < 100 ? 'amber' : 'over';
   const overBudget = tokenLevel === 'over';
 
+  // Build the "Will ..." sentence. The user kept asking "where does
+  // this go?" — spell it out. Lane is decided by the caller based on
+  // the packet's target + the user's auto-send opt-in setting.
+  const sideEffectText = ((): string => {
+    switch (dispatchKind) {
+      case 'chat-paste':
+        return `Will copy the packet to your clipboard and open ${target} in a new tab. Paste to send.`;
+      case 'chat-auto':
+        return `Will open ${target} in a new tab, auto-paste the packet, and auto-send it.`;
+      case 'coding':
+        return `Will copy the packet to your clipboard. Paste it into your ${target} session.`;
+      case 'export':
+        return `Will save the packet as a Markdown file to your Downloads folder.`;
+    }
+  })();
+
   return (
     <Modal
       title="Confirm dispatch"
@@ -63,6 +94,12 @@ export function DispatchConfirm({
       variant="ink"
       onClose={onCancel}
     >
+      {/* Side-effect preview — single sentence so the user knows
+          exactly what clicking Confirm will do. Sits above the
+          safety chain. The user kept asking "where does this go?"
+          — this answers it before they have to click. */}
+      <div className="dispatch-side-effect mono">{sideEffectText}</div>
+
       <div className="safety-chain">
         {redactedCount > 0 ? (
           <div className="safety-row signal">
