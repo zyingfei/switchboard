@@ -241,7 +241,8 @@ describe('live side-panel App wiring', () => {
     // "Claude" appears in multiple dropdown sections / chips.
     const claudeButtons = screen.getAllByRole('button', { name: 'Claude' });
     // First match in the dropdown is the AI provider row.
-    fireEvent.click(claudeButtons[0]!);
+    const [claudeButton] = claudeButtons;
+    fireEvent.click(claudeButton);
 
     // DispatchConfirm header text spells out the side-effect.
     expect(

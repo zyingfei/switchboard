@@ -169,20 +169,14 @@ const setSliderValue = async (page: Page, value: number): Promise<void> => {
   // React tracks input value via its own descriptor — direct
   // input.value = X does NOT trigger onChange. Use the native setter so
   // React's synthetic event dispatch picks up the new value.
-  await slider.evaluate(
-    (element, nextValue) => {
-      const input = element as HTMLInputElement;
-      const descriptor = Object.getOwnPropertyDescriptor(
-        HTMLInputElement.prototype,
-        'value',
-      );
-      if (descriptor?.set !== undefined) {
-        descriptor.set.call(input, String(nextValue));
-      }
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-    },
-    value,
-  );
+  await slider.evaluate((element, nextValue) => {
+    const input = element as HTMLInputElement;
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+    if (descriptor?.set !== undefined) {
+      descriptor.set.call(input, String(nextValue));
+    }
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  }, value);
 };
 
 test.describe('dispatch packet (synthetic)', () => {
@@ -219,9 +213,12 @@ test.describe('dispatch packet (synthetic)', () => {
       const threadRow = page
         .locator('.thread')
         .filter({ has: page.locator('.name', { hasText: thread.title }) });
-      await threadRow.getByRole('button', { name: 'Send' }).click();
+      await threadRow.getByRole('button', { name: /Send to/u }).click();
+      await page.getByRole('button', { name: 'Customize first…' }).click();
 
-      const modal = page.locator('.modal').filter({ has: page.getByRole('heading', { name: 'New packet' }) });
+      const modal = page
+        .locator('.modal')
+        .filter({ has: page.getByRole('heading', { name: 'New packet' }) });
       await expect(modal).toBeVisible();
       // Wait for the turns fetch to land — the indicator's denominator
       // becomes 6 once availableTurns populates. The numerator (initial

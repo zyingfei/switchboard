@@ -2,19 +2,25 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { describe, expect, it, vi } from 'vitest';
 
-import type { LiveVaultReader, LiveVaultSnapshot } from '../vault/liveVaultReader.js';
-import { createSidetrackMcpServer, type CompanionWriteClient } from './mcpServer.js';
+import type { LiveVaultSnapshot } from '../vault/liveVaultReader.js';
+import {
+  createSidetrackMcpServer,
+  type CompanionWriteClient,
+  type SidetrackMcpReader,
+} from './mcpServer.js';
 
 const emptySnapshot: LiveVaultSnapshot = {
   workstreams: [],
   threads: [],
   queueItems: [],
   reminders: [],
+  events: [],
   generatedAt: '2026-04-30T00:00:00.000Z',
 };
 
-const fakeReader: LiveVaultReader = {
+const fakeReader: SidetrackMcpReader = {
   readSnapshot: () => Promise.resolve(emptySnapshot),
+  readCodingSessions: () => Promise.resolve([]),
   readDispatches: () => Promise.resolve({ data: [] }),
   readReviews: () => Promise.resolve({ data: [] }),
   readTurns: () => Promise.resolve({ data: [] }),
@@ -44,9 +50,19 @@ const startInProcessServer = async (writeClient?: CompanionWriteClient): Promise
 
 // MCP SDK surfaces tool-thrown errors as `{ isError: true, content: [{ text }] }`
 // instead of rejecting the promise. Helper keeps the tests readable.
-const errorText = (result: { content?: unknown }): string => {
-  const content = result.content as { readonly text?: string }[] | undefined;
-  return content?.[0]?.text ?? '';
+const errorText = (result: unknown): string => {
+  if (typeof result !== 'object' || result === null || !('content' in result)) {
+    return '';
+  }
+  const content = result.content;
+  if (!Array.isArray(content)) {
+    return '';
+  }
+  const first = content[0] as unknown;
+  if (typeof first !== 'object' || first === null || !('text' in first)) {
+    return '';
+  }
+  return typeof first.text === 'string' ? first.text : '';
 };
 
 describe('bac.move_item', () => {

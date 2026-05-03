@@ -6,11 +6,7 @@
 import { expect, test } from '@playwright/test';
 
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
-import {
-  THREADS_KEY,
-  WORKSTREAMS_KEY,
-  seedAndOpenSidepanel,
-} from './helpers/sidepanel';
+import { THREADS_KEY, WORKSTREAMS_KEY, seedAndOpenSidepanel } from './helpers/sidepanel';
 
 const QUEUE_ITEMS_KEY = 'sidetrack.queueItems';
 
@@ -92,20 +88,20 @@ test.describe('per-thread auto-send toggle (synthetic)', () => {
         .filter({ has: page.locator('.name', { hasText: 'Auto-send target' }) });
       const toggle = threadRow.locator('.thread-autosend');
       await expect(toggle).toBeVisible();
-      await expect(toggle).toContainText('Auto-send: off');
+      await expect(toggle.locator('.thread-autosend-label')).toHaveText('auto-send');
+      await expect(toggle.locator('.thread-autosend-state')).toHaveText('off');
       await expect(toggle).not.toHaveClass(/\bon\b/u);
 
       await toggle.click();
 
-      await expect(toggle).toContainText('Auto-send: on');
+      await expect(toggle.locator('.thread-autosend-state')).toHaveText('on');
       await expect(toggle).toHaveClass(/\bon\b/u);
 
       // Storage round-trip.
       const stored = await page.evaluate(async (key) => {
         const all = await chrome.storage.local.get([key]);
         const threads = (all[key] ?? []) as { bac_id: string; autoSendEnabled?: boolean }[];
-        return threads.find((thread) => thread.bac_id === 'bac_thread_autosend')
-          ?.autoSendEnabled;
+        return threads.find((thread) => thread.bac_id === 'bac_thread_autosend')?.autoSendEnabled;
       }, THREADS_KEY);
       expect(stored).toBe(true);
 

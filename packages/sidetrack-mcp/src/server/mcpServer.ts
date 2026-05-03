@@ -1,7 +1,16 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
-import type { LiveVaultReader, LiveVaultSnapshot } from '../vault/liveVaultReader.js';
+import type {
+  CodingSessionRecord,
+  DispatchReadOptions,
+  DispatchReadResult,
+  LiveVaultSnapshot,
+  ReviewReadOptions,
+  ReviewReadResult,
+  TurnsReadOptions,
+  TurnsReadResult,
+} from '../vault/liveVaultReader.js';
 
 export interface CompanionWriteClient {
   readonly registerCodingSession: (input: {
@@ -28,6 +37,17 @@ export interface CompanionWriteClient {
     readonly scope: 'thread' | 'workstream' | 'global';
     readonly targetId?: string;
   }) => Promise<{ readonly bac_id: string; readonly revision: string }>;
+}
+
+export interface SidetrackMcpReader {
+  readonly readSnapshot: () => Promise<LiveVaultSnapshot>;
+  readonly readCodingSessions: (options?: {
+    readonly workstreamId?: string;
+    readonly status?: 'attached' | 'detached';
+  }) => Promise<readonly CodingSessionRecord[]>;
+  readonly readDispatches: (options?: DispatchReadOptions) => Promise<DispatchReadResult>;
+  readonly readReviews: (options?: ReviewReadOptions) => Promise<ReviewReadResult>;
+  readonly readTurns: (options: TurnsReadOptions) => Promise<TurnsReadResult>;
 }
 
 const toolText = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`;
@@ -124,7 +144,7 @@ const searchSnapshot = (snapshot: LiveVaultSnapshot, query: string) => {
 };
 
 export const createSidetrackMcpServer = (
-  reader: LiveVaultReader,
+  reader: SidetrackMcpReader,
   companionClient?: CompanionWriteClient,
 ): McpServer => {
   const server = new McpServer({

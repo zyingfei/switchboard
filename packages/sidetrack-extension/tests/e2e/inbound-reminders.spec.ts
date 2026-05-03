@@ -1,6 +1,6 @@
 // Synthetic e2e: confirms reminders no longer render in the captures
-// rail. The "Unread reply" lifecycle pill on the thread row is the
-// canonical inbound-reply signal; the rail is notes-only.
+// rail. The All Threads "Unread reply" bucket is the canonical
+// inbound-reply signal; the rail is notes-only.
 import { expect, test } from '@playwright/test';
 
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
@@ -26,7 +26,7 @@ const ws = (id: string, title: string) => ({
 });
 
 test.describe('captures rail: reminders no longer render (synthetic)', () => {
-  test('two reminders on the same thread surface as ONE row with an Unread reply pill — captures rail stays empty', async () => {
+  test('two reminders on the same thread surface as ONE row in the Unread reply bucket — captures rail stays empty', async () => {
     let runtime: ExtensionRuntime | undefined;
     try {
       runtime = await launchExtensionRuntime({ forceLocalProfile: true });
@@ -66,19 +66,19 @@ test.describe('captures rail: reminders no longer render (synthetic)', () => {
 
       await page.getByRole('tab', { name: 'All threads' }).click();
 
-      // The thread renders exactly once with the Unread reply pill.
-      const threadRow = page.locator('.thread').filter({
+      // The thread renders exactly once in the Unread reply bucket.
+      const unreadBucket = page.locator('.thread-bucket-unread');
+      await expect(unreadBucket.locator('.thread-bucket-label')).toContainText('Unread reply');
+      const threadRow = unreadBucket.locator('.thread').filter({
         has: page.locator('.name', { hasText: 'Domain Name Productivity Tool' }),
       });
       await expect(threadRow).toHaveCount(1);
-      await expect(threadRow.locator('.lifecycle-pill')).toContainText('Unread reply');
+      await expect(threadRow.locator('.dot.signal')).toBeVisible();
 
       // The captures rail does NOT render either reminder. Notes-only.
       // (No `.capture-list .capture` rows for reminder text.)
       await expect(
-        page
-          .locator('.capture-list .capture')
-          .filter({ hasText: 'Domain Name Productivity Tool' }),
+        page.locator('.capture-list .capture').filter({ hasText: 'Domain Name Productivity Tool' }),
       ).toHaveCount(0);
 
       // When SIDETRACK_E2E_DEMO_PAUSE_MS is set, leave the page up so a

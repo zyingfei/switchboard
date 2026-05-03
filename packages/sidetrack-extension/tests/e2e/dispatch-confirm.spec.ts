@@ -6,7 +6,7 @@
 // Complements components.test.tsx unit coverage of DispatchConfirm by
 // asserting the full App-level wire-up (PacketComposer → setPendingDispatch
 // → DispatchConfirm modal mount).
-import { expect, test, type BrowserContext, type Route } from '@playwright/test';
+import { expect, test, type BrowserContext, type Page, type Route } from '@playwright/test';
 
 import { messageTypes } from '../../src/messages';
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
@@ -25,9 +25,19 @@ const threadUrl = 'https://claude.ai/chat/dispatch-confirm-synthetic';
 
 const turns = [
   { role: 'user' as const, text: 'Plan the experiment.', ordinal: 0, capturedAt: now },
-  { role: 'assistant' as const, text: 'Steps: outline, draft, review.', ordinal: 1, capturedAt: now },
+  {
+    role: 'assistant' as const,
+    text: 'Steps: outline, draft, review.',
+    ordinal: 1,
+    capturedAt: now,
+  },
   { role: 'user' as const, text: 'Add a control arm.', ordinal: 2, capturedAt: now },
-  { role: 'assistant' as const, text: 'Adding control: same prompt without context.', ordinal: 3, capturedAt: now },
+  {
+    role: 'assistant' as const,
+    text: 'Adding control: same prompt without context.',
+    ordinal: 3,
+    capturedAt: now,
+  },
 ] as const;
 
 const workstream = {
@@ -113,6 +123,15 @@ const attachCompanionMocks = async (context: BrowserContext): Promise<void> => {
   });
 };
 
+const openComposerFromThreadRow = async (page: Page, threadTitle: string) => {
+  const threadRow = page
+    .locator('.thread')
+    .filter({ has: page.locator('.name', { hasText: threadTitle }) });
+  await threadRow.getByRole('button', { name: /Send to/u }).click();
+  await page.getByRole('button', { name: 'Customize first…' }).click();
+  return page.locator('.modal').filter({ has: page.getByRole('heading', { name: 'New packet' }) });
+};
+
 test.describe('dispatch confirm (synthetic)', () => {
   test('dispatching from PacketComposer mounts DispatchConfirm with the §24.10 safety chain', async () => {
     let runtime: ExtensionRuntime | undefined;
@@ -142,20 +161,13 @@ test.describe('dispatch confirm (synthetic)', () => {
       });
       assertOk(captureResponse);
 
-      const threadRow = page
-        .locator('.thread')
-        .filter({ has: page.locator('.name', { hasText: thread.title }) });
-      await threadRow.getByRole('button', { name: 'Send' }).click();
-
-      const composer = page
-        .locator('.modal')
-        .filter({ has: page.getByRole('heading', { name: 'New packet' }) });
+      const composer = await openComposerFromThreadRow(page, thread.title);
       await expect(composer).toBeVisible();
 
       // Pick a target — Dispatch button is disabled until target is set.
       await composer.getByRole('button', { name: /^Claude$/u }).click();
       // Click Dispatch — opens DispatchConfirm and dismisses PacketComposer.
-      await composer.getByRole('button', { name: /Dispatch/u }).click();
+      await composer.getByRole('button', { name: 'Dispatch', exact: true }).click();
 
       const confirm = page
         .locator('.modal')
@@ -174,10 +186,10 @@ test.describe('dispatch confirm (synthetic)', () => {
       const tokenBar = confirm.locator('.token-bar-fill');
       await expect(tokenBar).toBeAttached();
       await expect(tokenBar).toHaveClass(/\b(green|amber|over)\b/u);
-      // Default redacted-count copy.
-      await expect(confirm.locator('.safety-row.signal').first()).toContainText('Redaction fired');
-      // No screen share + no injection by default → both green rows.
-      await expect(confirm.locator('.safety-row.green')).toHaveCount(2);
+      // Default no-redaction copy.
+      await expect(confirm.locator('.safety-row.green').first()).toContainText('Nothing redacted');
+      // No redaction + no screen share + no injection by default → three green rows.
+      await expect(confirm.locator('.safety-row.green')).toHaveCount(3);
 
       // Send-mode pills: Paste is the default; Auto-send is disabled
       // because autoSendOptIn.claude=false in the mocked settings.
@@ -220,18 +232,11 @@ test.describe('dispatch confirm (synthetic)', () => {
       });
       assertOk(captureResponse);
 
-      const threadRow = page
-        .locator('.thread')
-        .filter({ has: page.locator('.name', { hasText: thread.title }) });
-      await threadRow.getByRole('button', { name: 'Send' }).click();
-
-      const composer = page
-        .locator('.modal')
-        .filter({ has: page.getByRole('heading', { name: 'New packet' }) });
+      const composer = await openComposerFromThreadRow(page, thread.title);
       await expect(composer).toBeVisible();
       // Pick a target — Dispatch is disabled until target is set.
       await composer.getByRole('button', { name: /^Claude$/u }).click();
-      await composer.getByRole('button', { name: /Dispatch/u }).click();
+      await composer.getByRole('button', { name: 'Dispatch', exact: true }).click();
 
       const confirm = page
         .locator('.modal')

@@ -1,6 +1,6 @@
 // Synthetic e2e: when the user dismisses a thread's reminders, the
-// lifecycle pill flips from "Unread reply" to the natural derivation
-// ("You replied last" for an assistant-final turn). This is the
+// All Threads bucket moves from "Unread reply" to the natural
+// lifecycle bucket. This is the
 // observable side effect of dismissRemindersForThread() which runs
 // after every explicit captureCurrentTab — the user is actively
 // looking at the thread, so the pill shouldn't claim it's unread.
@@ -62,12 +62,16 @@ test.describe('explicit capture clears reminder (synthetic)', () => {
       });
       await page.getByRole('tab', { name: 'All threads' }).click();
 
+      const unreadThreadRow = page
+        .locator('.thread-bucket-unread .thread')
+        .filter({ has: page.locator('.name', { hasText: 'Reminder dismissal target' }) });
       const threadRow = page
         .locator('.thread')
         .filter({ has: page.locator('.name', { hasText: 'Reminder dismissal target' }) });
 
-      // Initial: pending reminder → "Unread reply" pill.
-      await expect(threadRow.locator('.lifecycle-pill')).toContainText('Unread reply');
+      // Initial: pending reminder → Unread reply bucket.
+      await expect(unreadThreadRow).toHaveCount(1);
+      await expect(threadRow.locator('.dot.signal')).toBeVisible();
 
       // Simulate dismissRemindersForThread (the side effect of
       // explicit captureCurrentTab) by flipping the reminder status.
@@ -80,9 +84,10 @@ test.describe('explicit capture clears reminder (synthetic)', () => {
       await page.reload({ waitUntil: 'domcontentloaded' });
       await page.getByRole('tab', { name: 'All threads' }).click();
 
-      // After dismissal: natural pill kicks in. Last turn was assistant
-      // so the lifecycle resolves to "You replied last".
-      await expect(threadRow.locator('.lifecycle-pill')).toContainText('You replied last');
+      // After dismissal: the row leaves the unread bucket and returns
+      // to its natural normal lifecycle.
+      await expect(unreadThreadRow).toHaveCount(0);
+      await expect(threadRow.locator('.dot.green')).toBeVisible();
     } finally {
       await runtime?.close();
     }

@@ -174,22 +174,23 @@ test.describe('review composer (synthetic)', () => {
 
       const modal = page
         .locator('.review-composer')
-        .filter({ has: page.getByRole('heading', { name: 'Review — captured turn' }) });
+        .filter({ has: page.getByRole('heading', { name: 'Review' }) });
       await expect(modal).toBeVisible();
 
-      await expect(modal.locator('.review-span')).toHaveCount(3);
+      await expect(modal.locator('.review-span-card')).toHaveCount(3);
       await expect(modal).toContainText(turns[0].text);
       await expect(modal).toContainText(turns[1].text);
       await expect(modal).toContainText(turns[2].text);
 
+      await modal.getByRole('button', { name: '+ add verdict (optional)' }).click();
       // Use exact match for these verdict names — they're prefix-y
       // (e.g. "Agree" partially matches "Disagree").
       for (const verdict of ['Agree', 'Disagree', 'Partial', 'Needs source', 'Open']) {
         await expect(modal.getByRole('button', { name: verdict, exact: true })).toBeVisible();
       }
-      await expect(modal.getByRole('button', { name: 'Save review only' })).toBeVisible();
-      await expect(modal.getByRole('button', { name: 'Submit-back to Claude' })).toBeVisible();
-      await expect(modal.getByRole('button', { name: 'Dispatch to…' })).toBeVisible();
+      await expect(modal.getByRole('button', { name: 'Save only' })).toBeVisible();
+      await expect(modal.getByRole('button', { name: 'Send back to Claude' })).toBeVisible();
+      await expect(modal.getByRole('button', { name: 'Dispatch to other AI…' })).toBeVisible();
 
       await modal.getByRole('button', { name: 'Close' }).click();
       await expect(page.locator('.review-composer')).toHaveCount(0);
@@ -197,14 +198,17 @@ test.describe('review composer (synthetic)', () => {
       await threadRow.getByRole('button', { name: 'Review', exact: true }).click();
       await expect(modal).toBeVisible();
 
-      await modal.locator('.review-span').nth(1).locator('textarea').fill('This needs a source.');
       await modal
-        .locator('.review-field')
-        .filter({ hasText: 'Reviewer note' })
+        .locator('.review-comment-card')
+        .nth(1)
         .locator('textarea')
+        .fill('This needs a source.');
+      await modal
+        .locator('.review-overall textarea')
         .fill('Capture the caveat before we ship this.');
+      await modal.getByRole('button', { name: '+ add verdict (optional)' }).click();
       await modal.getByRole('button', { name: 'Needs source' }).click();
-      await modal.getByRole('button', { name: 'Save review only' }).click();
+      await modal.getByRole('button', { name: 'Save only' }).click();
 
       await expect(page.locator('.review-composer')).toHaveCount(0);
       expect(submittedReview).toEqual({
