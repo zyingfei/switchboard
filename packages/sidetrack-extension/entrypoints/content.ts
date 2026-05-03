@@ -88,6 +88,9 @@ const driveAutoSend = async (
   if (provider === 'unknown') {
     return { ok: false, error: 'Not on a supported provider page.' };
   }
+  if (provider === 'codex') {
+    return { ok: false, error: 'Auto-send does not support Codex sessions yet.' };
+  }
   if (!isProviderThreadUrl(provider, window.location.href)) {
     return { ok: false, error: 'Current page is not a chat thread.' };
   }

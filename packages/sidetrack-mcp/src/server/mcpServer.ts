@@ -62,6 +62,8 @@ export interface CompanionWriteClient {
     readonly threadId: string;
     readonly limit?: number;
   }) => Promise<readonly unknown[]>;
+  readonly exportSettings?: () => Promise<Record<string, unknown>>;
+  readonly systemUpdateCheck?: () => Promise<Record<string, unknown>>;
 }
 
 export interface SidetrackMcpReader {
@@ -536,6 +538,38 @@ export const createSidetrackMcpServer = (
         ...(limit === undefined ? {} : { limit }),
       });
       return asStructuredContent({ data: [...data] });
+    },
+  );
+
+  server.registerTool(
+    'bac.export_settings',
+    {
+      description: 'Export portable Sidetrack settings and workstream metadata.',
+      inputSchema: {},
+    },
+    async () => {
+      if (companionClient?.exportSettings === undefined) {
+        throw new Error(
+          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.export_settings is unavailable.',
+        );
+      }
+      return asStructuredContent(await companionClient.exportSettings());
+    },
+  );
+
+  server.registerTool(
+    'bac.system_update_check',
+    {
+      description: 'Return read-only companion version update advisory.',
+      inputSchema: {},
+    },
+    async () => {
+      if (companionClient?.systemUpdateCheck === undefined) {
+        throw new Error(
+          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.system_update_check is unavailable.',
+        );
+      }
+      return asStructuredContent(await companionClient.systemUpdateCheck());
     },
   );
 

@@ -385,6 +385,10 @@ const threadIdFromUrl = (provider: ProviderId, rawUrl: string): string | undefin
       const match = /\/(?:c|g\/[^/]+\/c)\/([^/?#]+)/.exec(url.pathname);
       return match?.[1];
     }
+    if (provider === 'codex') {
+      const match = /\/codex\/([^/?#]+)/.exec(url.pathname);
+      return match?.[1];
+    }
     if (provider === 'claude') {
       const match = /\/chat\/([^/?#]+)/.exec(url.pathname);
       return match?.[1];

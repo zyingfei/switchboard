@@ -1,5 +1,6 @@
 import { ensureBridgeKey } from '../auth/bridgeKey.js';
 import { createIdempotencyStore } from '../http/idempotency.js';
+import { pickInstaller } from '../install/index.js';
 import {
   createCompanionHttpServer,
   startHttpServer,
@@ -30,6 +31,7 @@ export const startCompanion = async (
     bridgeKey: ensured.key,
     vaultWriter,
     vaultRoot: options.vaultPath,
+    serviceInstaller: pickInstaller(),
     idempotencyStore: createIdempotencyStore(options.vaultPath),
   });
   const started: StartedHttpServer = await startHttpServer(server, options.port);

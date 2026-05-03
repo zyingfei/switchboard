@@ -122,6 +122,21 @@ const createCompanionWriteClient = (
     }
     return (body as { readonly data: readonly unknown[] }).data;
   };
+  const getObject = async (path: string): Promise<Record<string, unknown>> => {
+    const response = await fetch(`${base}${path}`, {
+      method: 'GET',
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      throw new Error(`Companion ${path} failed (${String(response.status)}): ${detail}`);
+    }
+    const body = (await response.json()) as unknown;
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+      throw new Error(`Companion ${path} did not return an object.`);
+    }
+    return body as Record<string, unknown>;
+  };
   const readList = (
     path: string,
     input: { readonly limit?: number; readonly since?: string },
@@ -218,6 +233,14 @@ const createCompanionWriteClient = (
         params,
       );
     },
+    exportSettings: () => getObject('/v1/settings/export'),
+    systemUpdateCheck: () => getObject('/v1/system/update-check').then((body) => {
+      const data = body['data'];
+      if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+        throw new Error('Companion update-check response missing data object.');
+      }
+      return data as Record<string, unknown>;
+    }),
     async listWorkstreamNotes(input) {
       const response = await fetch(
         `${base}/v1/workstreams/${encodeURIComponent(input.workstreamId)}/linked-notes`,

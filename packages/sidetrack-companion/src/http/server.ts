@@ -4,6 +4,9 @@ import { join } from 'node:path';
 
 import { bridgeKeysMatch } from '../auth/bridgeKey.js';
 import { createDispatchId, createRequestId, createReviewId } from '../domain/ids.js';
+import { pickInstaller, type Installer } from '../install/index.js';
+import { exportSettings } from '../portability/exportBundle.js';
+import { importSettings } from '../portability/importBundle.js';
 import { embed, MODEL_ID } from '../recall/embedder.js';
 import { appendEntry, readIndex } from '../recall/indexFile.js';
 import { rank } from '../recall/ranker.js';
@@ -12,6 +15,7 @@ import { redact } from '../safety/redaction.js';
 import { estimateTokens, tokenBudgetWarningThreshold } from '../safety/tokenBudget.js';
 import { buildSignals, type BuildSignalsWorkstream } from '../suggestions/buildSignals.js';
 import { scoreSuggestions } from '../suggestions/score.js';
+import { checkLatestVersion, type UpdateAdvisory } from '../system/versionCheck.js';
 import { listAnnotations, writeAnnotation } from '../vault/annotationStore.js';
 import { scanVaultForLinkedNotes } from '../vault/linkback.js';
 import {
@@ -52,6 +56,8 @@ export interface CompanionHttpConfig {
   readonly bridgeKey: string;
   readonly vaultWriter: VaultWriter;
   readonly vaultRoot?: string;
+  readonly serviceInstaller?: Installer;
+  readonly updateChecker?: () => Promise<UpdateAdvisory>;
   readonly idempotencyStore?: IdempotencyStore;
 }
 
@@ -303,11 +309,47 @@ const routes: readonly RouteDefinition[] = [
   },
   {
     method: 'GET',
+    pattern: /^\/v1\/system\/service-status$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => [
+      200,
+      { data: await (context.serviceInstaller ?? pickInstaller()).status() },
+    ],
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/system\/update-check$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => [
+      200,
+      { data: await (context.updateChecker ?? (() => checkLatestVersion('0.0.0')))() },
+    ],
+  },
+  {
+    method: 'GET',
     pattern: /^\/v1\/settings$/,
     authRequired: true,
     handle: async (_request, _requestId, _match, context) => [
       200,
       { data: await context.vaultWriter.readSettings() },
+    ],
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/settings\/export$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => [
+      200,
+      await exportSettings(requireVaultRoot(context)),
+    ],
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/settings\/import$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => [
+      200,
+      { data: await importSettings(requireVaultRoot(context), await readBody(request)) },
     ],
   },
   {
