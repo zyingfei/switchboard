@@ -837,6 +837,44 @@ describe('companion HTTP server', () => {
     ).resolves.toContain('Sidetrack');
   });
 
+  it('defaults new workstreams to shared and supports screenshare-sensitive metadata', async () => {
+    const workstreamResult = await jsonFetch(context, `${baseUrl}/v1/workstreams`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({ title: 'Default shared' }),
+    });
+    expect(workstreamResult.status).toBe(201);
+    const workstreamId = (workstreamResult.body as { readonly data: { readonly bac_id: string } })
+      .data.bac_id;
+    const json = JSON.parse(
+      await readFile(join(vaultPath, '_BAC', 'workstreams', `${workstreamId}.json`), 'utf8'),
+    ) as { readonly privacy?: string; readonly screenShareSensitive?: boolean };
+    expect(json.privacy).toBe('shared');
+    expect(json.screenShareSensitive).toBe(false);
+
+    const updateResult = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}`, {
+      method: 'PATCH',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        revision: (workstreamResult.body as { readonly data: { readonly revision: string } }).data
+          .revision,
+        screenShareSensitive: true,
+      }),
+    });
+    expect(updateResult.status).toBe(200);
+    const updated = JSON.parse(
+      await readFile(join(vaultPath, '_BAC', 'workstreams', `${workstreamId}.json`), 'utf8'),
+    ) as { readonly privacy?: string; readonly screenShareSensitive?: boolean };
+    expect(updated.privacy).toBe('shared');
+    expect(updated.screenShareSensitive).toBe(true);
+  });
+
   it('writes rich promoted-thread Markdown once and preserves later projections', async () => {
     const now = '2026-04-30T21:32:00.000Z';
     await jsonFetch(context, `${baseUrl}/v1/events`, {

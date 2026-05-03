@@ -2208,6 +2208,52 @@ textarea.preview-body:focus {
   user-select: text;
 }
 
+.settings-privacy-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 8px 0 10px;
+}
+.settings-workstream-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.settings-workstream-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--rule-soft, #e5ddc9);
+  border-radius: var(--rad-s);
+  background: var(--paper-light, #fbf7ee);
+}
+.settings-workstream-title {
+  font-family: var(--display, 'Fraunces', Georgia, serif);
+  font-size: 13px;
+  color: var(--ink, #1b1916);
+}
+.settings-workstream-sub {
+  margin-top: 2px;
+  font-size: 10px;
+  color: var(--ink-3, #7a7269);
+}
+.settings-mini-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink-2, #4a453d);
+  font-size: 10px;
+  white-space: nowrap;
+}
+.settings-mini-check input {
+  margin: 0;
+}
+
 .settings-archive-list {
   list-style: none;
   margin: 0;
@@ -2596,6 +2642,11 @@ textarea.preview-body:focus {
 .icon-btn:hover {
   background: var(--paper-deep, #e8dfc8);
   border-color: var(--rule, #d4cdb8);
+}
+.icon-btn.on {
+  color: var(--signal, #c2410c);
+  background: var(--signal-bg, #fff7ed);
+  border-color: var(--signal-tint, #fed7aa);
 }
 .icon-btn:focus {
   outline: none;
@@ -3271,7 +3322,9 @@ textarea.preview-body:focus {
   position: absolute;
   top: calc(100% + 4px);
   right: 0;
-  min-width: 200px;
+  left: auto;
+  min-width: 220px;
+  max-width: calc(100vw - 24px);
   max-height: 60vh;
   overflow-y: auto;
   background: var(--paper-light);
@@ -3604,33 +3657,87 @@ button.thread-queued:focus-visible {
   flex-direction: column;
   gap: 4px;
 }
-.thread-queue-item {
+.queue-retry-all-row {
   display: flex;
+  justify-content: flex-end;
+}
+.queue-row {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
   gap: 8px;
-  align-items: flex-start;
+  align-items: start;
+  padding: 7px 8px;
+  border: 1px solid var(--rule-soft, #e5ddc9);
+  border-radius: 4px;
+  background: var(--paper, #f5efe2);
   font-size: 11px;
-  line-height: 1.45;
+  line-height: 1.35;
 }
-.thread-queue-text {
-  flex: 1 1 auto;
+.queue-row.active {
+  background: var(--paper-light, #fbf7ee);
+  border-color: var(--signal-tint, #fed7aa);
+}
+.queue-row.failed {
+  background: #fff1f2;
+  border-color: #fecdd3;
+}
+.queue-row.sent {
+  opacity: 0;
+  transition: opacity 800ms ease;
+}
+.queue-row.queued {
+  opacity: 0.72;
+}
+.queue-row-status {
+  color: var(--ink-4, #a39a8c);
+}
+.queue-row.active .queue-row-status {
+  color: var(--signal, #c2410c);
+}
+.queue-row.failed .queue-row-status {
+  color: #be123c;
+}
+.queue-row-main {
+  min-width: 0;
+}
+.queue-row-head {
+  display: flex;
+  gap: 5px;
+  color: var(--ink-3, #7a7269);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+}
+.queue-row-text {
   color: var(--ink-1, #1b1916);
-  word-break: break-word;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-top: 2px;
 }
-.queue-item-progress {
-  flex: 0 0 auto;
+.queue-row-phase {
+  margin-top: 3px;
   color: var(--signal, #c2410c);
   font-size: 10px;
-  font-style: italic;
-  white-space: nowrap;
-  padding-top: 1px;
 }
-.thread-queue-actions {
+.queue-row-spinner {
+  display: inline-block;
+  width: 12px;
+}
+.queue-row-error {
+  margin-top: 3px;
+  color: #be123c;
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.queue-row-actions {
   display: inline-flex;
   gap: 8px;
-  flex: 0 0 auto;
   padding-top: 1px;
 }
-.thread-queue-actions .btn-link {
+.queue-row-actions .btn-link,
+.queue-retry-all-row .btn-link {
   font-family: var(--mono, 'JetBrains Mono', ui-monospace, monospace);
   font-size: 10px;
   background: transparent;
@@ -3640,18 +3747,36 @@ button.thread-queued:focus-visible {
   color: var(--ink-2, #4a453d);
   white-space: nowrap;
 }
-.thread-queue-actions .btn-link:hover {
+.queue-row-actions .btn-link:hover,
+.queue-retry-all-row .btn-link:hover {
   color: var(--signal, #c2410c);
 }
 /* Retry sits between Copy and Dismiss only when the item has a
    lastError. Coloured upfront so it reads as the primary affordance
    for the failure case, not a secondary action. */
-.thread-queue-actions .btn-link.thread-queue-retry {
+.queue-row-actions .btn-link.thread-queue-retry,
+.queue-retry-all-row .btn-link.thread-queue-retry {
   color: var(--signal, #c2410c);
   font-weight: 500;
 }
-.thread-queue-actions .btn-link.thread-queue-retry:hover {
+.queue-row-actions .btn-link.thread-queue-retry:hover,
+.queue-retry-all-row .btn-link.thread-queue-retry:hover {
   color: var(--signal-2, #ea580c);
+}
+
+.thread-ws-path {
+  display: inline-flex;
+  margin: 2px 0 0 26px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink-4, #a39a8c);
+  font-size: 11px;
+  cursor: pointer;
+}
+.thread-ws-path:hover {
+  color: var(--ink-2, #4a453d);
+  text-decoration: underline;
 }
 
 .thread-actions .btn-link.archive {

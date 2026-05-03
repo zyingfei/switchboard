@@ -71,6 +71,7 @@ export interface WorkstreamNode {
   readonly tags: readonly string[];
   readonly checklist: readonly ChecklistItem[];
   readonly privacy: PrivacyMode;
+  readonly screenShareSensitive?: boolean;
   readonly updatedAt: string;
 }
 
@@ -171,6 +172,7 @@ export interface WorkboardState {
   readonly queuedCaptureCount: number;
   readonly droppedCaptureCount: number;
   readonly settings: UiSettings;
+  readonly screenShareMode: boolean;
   readonly activeTabUrl?: string;
   readonly currentTab?: TrackedThread;
   readonly threads: readonly TrackedThread[];
@@ -255,11 +257,15 @@ export const companionStatusLabel = (status: CompanionStatus): string => {
 export const maskTitleForPrivacy = (
   thread: TrackedThread,
   workstreams: readonly WorkstreamNode[],
+  screenShareMode = false,
 ): string => {
   const workstream = workstreams.find(
     (candidate) => candidate.bac_id === thread.primaryWorkstreamId,
   );
-  return workstream?.privacy === 'private' ? '[private]' : thread.title;
+  return workstream?.privacy === 'private' ||
+    (screenShareMode && workstream?.screenShareSensitive === true)
+    ? '[private]'
+    : thread.title;
 };
 
 export const defaultSettings: UiSettings = {
@@ -285,6 +291,7 @@ export const createEmptyWorkboardState = (
   queuedCaptureCount: 0,
   droppedCaptureCount: 0,
   settings: defaultSettings,
+  screenShareMode: false,
   threads: [],
   workstreams: [],
   queueItems: [],

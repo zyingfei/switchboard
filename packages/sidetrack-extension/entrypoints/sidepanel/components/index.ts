@@ -48,6 +48,8 @@ export type { RecentDispatchesProps, DispatchEvent, DispatchStatus } from './Rec
 
 export { SendToDropdown } from './SendToDropdown';
 export type { SendToDropdownProps, SendToTarget } from './SendToDropdown';
+export { AutoSendQueueRow } from './AutoSendQueueRow';
+export type { AutoSendQueueRowProps } from './AutoSendQueueRow';
 
 // M1 polish
 export { TabRecovery } from './TabRecovery';

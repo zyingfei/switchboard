@@ -72,6 +72,7 @@ export interface WorkstreamProjectionInput {
   readonly children?: readonly string[];
   readonly tags?: readonly string[];
   readonly privacy?: 'private' | 'shared' | 'public';
+  readonly screenShareSensitive?: boolean;
   readonly checklist?: readonly { readonly text: string; readonly checked: boolean }[];
   readonly createdAt?: string;
   readonly updatedAt?: string;
@@ -83,7 +84,8 @@ export const renderWorkstreamMarkdown = (input: WorkstreamProjectionInput): stri
     ['revision', input.revision],
     ['kind', 'workstream'],
     ['title', input.title ?? input.bac_id],
-    ['privacy', input.privacy ?? 'private'],
+    ['privacy', input.privacy ?? 'shared'],
+    ['screenShareSensitive', input.screenShareSensitive ?? false],
     ['parent', input.parentId],
     ['tags', input.tags ?? []],
     ['createdAt', input.createdAt],

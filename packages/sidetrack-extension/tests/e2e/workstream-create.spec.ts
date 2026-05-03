@@ -56,7 +56,7 @@ test.describe('workstream creation (synthetic)', () => {
       );
       expect(persisted).toContainEqual({
         title: 'Brand new workstream',
-        privacy: 'private',
+        privacy: 'shared',
       });
     } finally {
       await runtime?.close();

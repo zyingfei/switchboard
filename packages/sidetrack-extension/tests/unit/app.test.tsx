@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import App from '../../entrypoints/sidepanel/App';
+import App, { formatBuildTimestamp } from '../../entrypoints/sidepanel/App';
 import { messageTypes, type WorkboardRequest } from '../../src/messages';
 import {
   createEmptyWorkboardState,
@@ -103,7 +103,11 @@ const liveState = (): WorkboardState =>
     ],
   });
 
-const installChromeMock = (state: WorkboardState, storageValues: Record<string, unknown> = {}) => {
+const installChromeMock = (
+  state: WorkboardState,
+  storageValues: Record<string, unknown> = {},
+  activeTabUrl?: string,
+) => {
   const sendMessage = vi.fn((request: WorkboardRequest) =>
     Promise.resolve({
       ok: true,
@@ -137,7 +141,12 @@ const installChromeMock = (state: WorkboardState, storageValues: Record<string, 
       sendMessage,
       onMessage: { addListener: vi.fn(), removeListener: vi.fn() },
     },
-    storage: { local: { get, set } },
+    storage: { local: { get, set }, session: { get, set } },
+    tabs: {
+      query: vi.fn(() =>
+        Promise.resolve(activeTabUrl === undefined ? [] : [{ url: activeTabUrl }]),
+      ),
+    },
   });
   return sendMessage;
 };
@@ -147,6 +156,10 @@ afterEach(() => {
 });
 
 describe('live side-panel App wiring', () => {
+  it('formats build timestamps with date and UTC time', () => {
+    expect(formatBuildTimestamp('2026-05-03T20:16:57.395Z')).toBe('2026-05-03 20:16Z');
+  });
+
   it('renders Wizard on first launch when setup is incomplete and bridge key is empty', async () => {
     installChromeMock(createEmptyWorkboardState());
 
@@ -370,7 +383,35 @@ describe('live side-panel App wiring', () => {
     fireEvent.click(await screen.findByRole('tab', { name: 'All threads' }));
     fireEvent.click(await screen.findByRole('button', { name: '1 queued' }));
 
-    expect(await screen.findByText('waiting for reply…')).toBeInTheDocument();
+    expect(await screen.findByText(/waiting for Claude's reply/)).toBeInTheDocument();
+  });
+
+  it('keeps shared workstream titles visible and masks screenshare-sensitive rows only when enabled', async () => {
+    const state = liveState();
+    const sharedState: WorkboardState = {
+      ...state,
+      workstreams: state.workstreams.map((workstream) =>
+        workstream.bac_id === 'bac_workstream_root'
+          ? { ...workstream, privacy: 'shared', screenShareSensitive: true }
+          : workstream,
+      ),
+    };
+    installChromeMock(sharedState, { [SETUP_COMPLETED_KEY]: true });
+
+    const { unmount } = render(<App />);
+
+    fireEvent.click(await screen.findByRole('tab', { name: 'All threads' }));
+    expect(await screen.findByText('Side-panel state machine review')).toBeInTheDocument();
+
+    unmount();
+    vi.unstubAllGlobals();
+    installChromeMock(
+      { ...sharedState, screenShareMode: true },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    render(<App />);
+    fireEvent.click(await screen.findByRole('tab', { name: 'All threads' }));
+    expect(await screen.findByText('[private]')).toBeInTheDocument();
   });
 
   it('collapses lifecycle buckets and persists the requested bucket list', async () => {
@@ -410,6 +451,61 @@ describe('live side-panel App wiring', () => {
       expect(sendMessage).toHaveBeenCalledWith({
         type: messageTypes.setCollapsedBuckets,
         collapsedBuckets: [],
+      });
+    });
+  });
+
+  it('find expands a collapsed lifecycle bucket before focusing the active tab row', async () => {
+    const state = liveState();
+    const sendMessage = installChromeMock(
+      {
+        ...state,
+        activeTabUrl: 'https://claude.ai/chat/thread',
+        collapsedBuckets: ['unread'],
+      },
+      { [SETUP_COMPLETED_KEY]: true },
+      'https://claude.ai/chat/thread',
+    );
+
+    render(<App />);
+
+    const findButton = await screen.findByRole('button', {
+      name: 'Find active tab in side panel',
+    });
+    fireEvent.click(findButton);
+
+    await waitFor(() => {
+      expect(sendMessage).toHaveBeenCalledWith({
+        type: messageTypes.setCollapsedBuckets,
+        collapsedBuckets: [],
+      });
+    });
+  });
+
+  it('routes drag/drop from All threads through the moveThread message', async () => {
+    const sendMessage = installChromeMock(liveState(), { [SETUP_COMPLETED_KEY]: true });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('tab', { name: 'All threads' }));
+    const threadRow = (await screen.findByText('[private]')).closest('.thread');
+    expect(threadRow).not.toBeNull();
+    if (threadRow === null) {
+      return;
+    }
+    const dataTransfer = {
+      dropEffect: 'none',
+      effectAllowed: 'uninitialized',
+      setData: vi.fn(),
+    };
+    fireEvent.dragStart(threadRow, { dataTransfer });
+    fireEvent.drop(screen.getByRole('button', { name: 'Sibling' }), { dataTransfer });
+
+    await waitFor(() => {
+      expect(sendMessage).toHaveBeenCalledWith({
+        type: messageTypes.moveThread,
+        threadId: 'bac_thread_test',
+        workstreamId: 'bac_workstream_sibling',
       });
     });
   });

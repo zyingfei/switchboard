@@ -53,6 +53,7 @@ const DISPATCH_ORIGINALS_KEY = 'sidetrack.dispatchOriginals';
 // "Recent" section so the user can repeat their last dispatch with
 // one click. Map: threadId → SendToTarget id (string).
 const LAST_DISPATCH_TARGET_KEY = 'sidetrack.lastDispatchTargetByThread';
+const SCREEN_SHARE_MODE_KEY = 'sidetrack.screenShareMode';
 
 const storageGet = async <TValue>(key: string, fallback: TValue): Promise<TValue> => {
   const result = await chrome.storage.local.get({ [key]: fallback });
@@ -61,6 +62,15 @@ const storageGet = async <TValue>(key: string, fallback: TValue): Promise<TValue
 
 const storageSet = async (values: Record<string, unknown>): Promise<void> => {
   await chrome.storage.local.set(values);
+};
+
+const storageSessionGet = async <TValue>(key: string, fallback: TValue): Promise<TValue> => {
+  const result = await chrome.storage.session.get({ [key]: fallback });
+  return result[key] as TValue;
+};
+
+const storageSessionSet = async (values: Record<string, unknown>): Promise<void> => {
+  await chrome.storage.session.set(values);
 };
 
 const createLocalBacId = (): string => `bac_${crypto.randomUUID().replaceAll('-', '_')}`;
@@ -333,6 +343,13 @@ export const saveCollapsedBuckets = async (
   await storageSet({ [COLLAPSED_BUCKETS_KEY]: collapsedBuckets });
 };
 
+export const readScreenShareMode = async (): Promise<boolean> =>
+  await storageSessionGet<boolean>(SCREEN_SHARE_MODE_KEY, false);
+
+export const saveScreenShareMode = async (enabled: boolean): Promise<void> => {
+  await storageSessionSet({ [SCREEN_SHARE_MODE_KEY]: enabled });
+};
+
 export const upsertLocalThread = async (
   input: ThreadUpsert,
   result?: { readonly bac_id: string },
@@ -384,7 +401,8 @@ export const createLocalWorkstream = async (
     children: [],
     tags: input.tags ?? [],
     checklist: [],
-    privacy: input.privacy ?? 'private',
+    privacy: input.privacy ?? 'shared',
+    screenShareSensitive: input.screenShareSensitive ?? false,
     updatedAt: timestamp,
   };
   const withParent = current.map((candidate) =>
@@ -421,6 +439,7 @@ export const updateLocalWorkstream = async (
       checklist: update.checklist ?? candidate.checklist,
       tags: update.tags ?? candidate.tags,
       privacy: update.privacy ?? candidate.privacy,
+      screenShareSensitive: update.screenShareSensitive ?? candidate.screenShareSensitive,
       updatedAt: timestamp,
     };
     return updated;
@@ -676,6 +695,7 @@ export const buildWorkboardState = async (
     queuedCaptureCount: (await readQueue()).length,
     droppedCaptureCount: await readDroppedCount(),
     settings: await readSettings(),
+    screenShareMode: await readScreenShareMode(),
     threads: await readThreads(),
     workstreams: await readWorkstreams(),
     queueItems: await readQueueItems(),
