@@ -131,6 +131,8 @@ export interface QueueUpdate {
   readonly text?: string;
   // Pass null to clear; pass a string to set; omit to leave unchanged.
   readonly lastError?: string | null;
+  // Pass null to clear; pass a value to set; omit to leave unchanged.
+  readonly progress?: 'typing' | 'waiting' | null;
 }
 
 export interface CodingAttachTokenCreate {

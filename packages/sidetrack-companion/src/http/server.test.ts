@@ -1,5 +1,5 @@
 import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:http';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -835,6 +835,122 @@ describe('companion HTTP server', () => {
     await expect(
       readFile(join(vaultPath, '_BAC', 'workstreams', `${workstreamId}.json`), 'utf8'),
     ).resolves.toContain('Sidetrack');
+  });
+
+  it('writes rich promoted-thread Markdown once and preserves later projections', async () => {
+    const now = '2026-04-30T21:32:00.000Z';
+    await jsonFetch(context, `${baseUrl}/v1/events`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'promote-capture-001',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        provider: 'claude',
+        threadUrl: 'https://claude.ai/chat/promote-test',
+        title: 'Promote me',
+        capturedAt: now,
+        turns: [
+          { role: 'user', text: 'Please make a plan.', ordinal: 0, capturedAt: now },
+          { role: 'assistant', text: 'First, write the projection.', ordinal: 1, capturedAt: now },
+        ],
+      }),
+    });
+    await jsonFetch(context, `${baseUrl}/v1/threads`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        bac_id: 'bac_thread_promote',
+        provider: 'claude',
+        threadUrl: 'https://claude.ai/chat/promote-test',
+        title: 'Promote me',
+        lastSeenAt: now,
+      }),
+    });
+    const workstreamResult = await jsonFetch(context, `${baseUrl}/v1/workstreams`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({ title: 'M2 polish', privacy: 'private' }),
+    });
+    const workstreamId = (workstreamResult.body as { readonly data: { readonly bac_id: string } })
+      .data.bac_id;
+
+    await jsonFetch(context, `${baseUrl}/v1/threads`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        bac_id: 'bac_thread_promote',
+        provider: 'claude',
+        threadUrl: 'https://claude.ai/chat/promote-test',
+        title: 'Promote me',
+        lastSeenAt: now,
+        primaryWorkstreamId: workstreamId,
+      }),
+    });
+
+    const markdownPath = join(vaultPath, '_BAC', 'threads', 'bac_thread_promote.md');
+    const promoted = await readFile(markdownPath, 'utf8');
+    expect(promoted).toContain('Promoted to M2 polish on');
+    expect(promoted).toContain('### User');
+    expect(promoted).toContain('Please make a plan.');
+    expect(promoted).toContain('### Assistant');
+    expect(promoted).toContain('First, write the projection.');
+
+    await jsonFetch(context, `${baseUrl}/v1/threads`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        bac_id: 'bac_thread_promote',
+        provider: 'claude',
+        threadUrl: 'https://claude.ai/chat/promote-test',
+        title: 'Promote me again',
+        lastSeenAt: now,
+        primaryWorkstreamId: workstreamId,
+      }),
+    });
+    await expect(readFile(markdownPath, 'utf8')).resolves.toBe(promoted);
+  });
+
+  it('does not overwrite locked thread Markdown sidecars', async () => {
+    const now = '2026-04-30T21:40:00.000Z';
+    const markdownPath = join(vaultPath, '_BAC', 'threads', 'bac_thread_locked.md');
+    await mkdir(join(vaultPath, '_BAC', 'threads'), { recursive: true });
+    await writeFile(
+      markdownPath,
+      '---\nbac_id: bac_thread_locked\nbac_locked: true\n---\n# Hand edited\n',
+      'utf8',
+    );
+
+    const result = await jsonFetch(context, `${baseUrl}/v1/threads`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        bac_id: 'bac_thread_locked',
+        provider: 'claude',
+        threadUrl: 'https://claude.ai/chat/locked',
+        title: 'Machine update',
+        lastSeenAt: now,
+      }),
+    });
+
+    expect(result.status).toBe(200);
+    await expect(readFile(markdownPath, 'utf8')).resolves.toContain('# Hand edited');
   });
 
   it('updates workstream checklist fields and reminder status', async () => {

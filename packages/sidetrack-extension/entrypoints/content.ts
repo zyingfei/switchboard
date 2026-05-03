@@ -29,10 +29,7 @@ const PROVIDER_DRIVERS: Record<'chatgpt' | 'claude' | 'gemini', ProviderDriverCo
     stopButton: ['button[aria-label*="Stop" i]'],
   },
   gemini: {
-    composer: [
-      'rich-textarea div.ql-editor[role="textbox"]',
-      'rich-textarea div.ql-editor',
-    ],
+    composer: ['rich-textarea div.ql-editor[role="textbox"]', 'rich-textarea div.ql-editor'],
     sendButton: ['button[aria-label*="Send message" i]', 'button.send-button'],
     stopButton: ['button[aria-label*="Stop" i]'],
   },
@@ -81,6 +78,7 @@ interface AutoSendResult {
 }
 
 const driveAutoSend = async (
+  itemId: string | undefined,
   text: string,
   perItemTimeoutMs: number,
 ): Promise<AutoSendResult> => {
@@ -136,7 +134,14 @@ const driveAutoSend = async (
   // for it to finish (stop button disappears). The "started" check
   // has a short window — providers usually show the stop button
   // within ~1s of submit.
-  await waitFor(() => isStopButtonActive(driver), 5_000, 200);
+  const started = await waitFor(() => isStopButtonActive(driver), 5_000, 200);
+  if (started && itemId !== undefined) {
+    void chrome.runtime.sendMessage({
+      type: messageTypes.autoSendInterimReport,
+      itemId,
+      phase: 'waiting',
+    });
+  }
   // Now wait for completion. The per-item timeout is the upper bound.
   const settled = await waitFor(() => !isStopButtonActive(driver), perItemTimeoutMs, 500);
   if (!settled) {
@@ -147,6 +152,7 @@ const driveAutoSend = async (
 
 interface AutoSendItemMessage {
   readonly type: typeof messageTypes.autoSendItem;
+  readonly itemId?: string;
   readonly text: string;
   readonly perItemTimeoutMs?: number;
 }
@@ -268,14 +274,15 @@ export default defineContentScript({
           } catch (error) {
             sendResponse({
               ok: false,
-              error: error instanceof Error ? error.message : 'Visible conversation capture failed.',
+              error:
+                error instanceof Error ? error.message : 'Visible conversation capture failed.',
             });
           }
           return true;
         }
         if (isAutoSendItemMessage(message)) {
           const perItemTimeoutMs = message.perItemTimeoutMs ?? 90_000;
-          driveAutoSend(message.text, perItemTimeoutMs)
+          driveAutoSend(message.itemId, message.text, perItemTimeoutMs)
             .then((result) => {
               sendResponse(result);
             })

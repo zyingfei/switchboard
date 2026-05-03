@@ -2,7 +2,7 @@
 // Stop → updates trackingMode to 'stopped'; Resume → flips it back.
 // Complements tab-recovery.spec.ts which only covers the rendered
 // state, not the transition.
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
 import { THREADS_KEY, WORKSTREAMS_KEY, seedAndOpenSidepanel } from './helpers/sidepanel';
@@ -35,6 +35,13 @@ const thread = (overrides: Record<string, unknown>) => ({
   ...overrides,
 });
 
+const expandStaleBucket = async (page: Page) => {
+  const staleHeader = page.getByRole('button', { name: /Stale or closed/u });
+  if ((await staleHeader.getAttribute('aria-expanded')) === 'false') {
+    await staleHeader.click();
+  }
+};
+
 test.describe('tracking mode toggle (synthetic)', () => {
   test('Stop on an actively-tracked thread flips trackingMode to stopped', async () => {
     let runtime: ExtensionRuntime | undefined;
@@ -61,6 +68,7 @@ test.describe('tracking mode toggle (synthetic)', () => {
       await expect(row.getByRole('button', { name: 'Resume', exact: true })).toHaveCount(0);
 
       await row.getByRole('button', { name: 'Stop', exact: true }).click();
+      await expandStaleBucket(page);
 
       // After flip: stamp shows "Tracking stopped"; Resume button replaces Stop.
       await expect(row.locator('.stamp')).toContainText('Tracking stopped');
@@ -68,17 +76,14 @@ test.describe('tracking mode toggle (synthetic)', () => {
       await expect(row.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0);
 
       // Storage round-trip.
-      const persisted = await page.evaluate(
-        async (id) => {
-          const all = await chrome.storage.local.get(['sidetrack.threads']);
-          const threads = (all['sidetrack.threads'] ?? []) as {
-            bac_id: string;
-            trackingMode: string;
-          }[];
-          return threads.find((t) => t.bac_id === id)?.trackingMode ?? null;
-        },
-        tracked.bac_id,
-      );
+      const persisted = await page.evaluate(async (id) => {
+        const all = await chrome.storage.local.get(['sidetrack.threads']);
+        const threads = (all['sidetrack.threads'] ?? []) as {
+          bac_id: string;
+          trackingMode: string;
+        }[];
+        return threads.find((t) => t.bac_id === id)?.trackingMode ?? null;
+      }, tracked.bac_id);
       expect(persisted).toBe('stopped');
     } finally {
       await runtime?.close();
@@ -100,6 +105,7 @@ test.describe('tracking mode toggle (synthetic)', () => {
         [THREADS_KEY]: [stopped],
       });
       await page.getByRole('tab', { name: 'All threads' }).click();
+      await expandStaleBucket(page);
 
       const row = page
         .locator('.thread')
@@ -113,17 +119,14 @@ test.describe('tracking mode toggle (synthetic)', () => {
       await expect(row.locator('.stamp')).not.toContainText('Tracking stopped');
 
       // Known-provider thread should resume to "auto", not "manual".
-      const persisted = await page.evaluate(
-        async (id) => {
-          const all = await chrome.storage.local.get(['sidetrack.threads']);
-          const threads = (all['sidetrack.threads'] ?? []) as {
-            bac_id: string;
-            trackingMode: string;
-          }[];
-          return threads.find((t) => t.bac_id === id)?.trackingMode ?? null;
-        },
-        stopped.bac_id,
-      );
+      const persisted = await page.evaluate(async (id) => {
+        const all = await chrome.storage.local.get(['sidetrack.threads']);
+        const threads = (all['sidetrack.threads'] ?? []) as {
+          bac_id: string;
+          trackingMode: string;
+        }[];
+        return threads.find((t) => t.bac_id === id)?.trackingMode ?? null;
+      }, stopped.bac_id);
       expect(persisted).toBe('auto');
     } finally {
       await runtime?.close();

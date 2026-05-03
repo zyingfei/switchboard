@@ -16,8 +16,10 @@ import type { DispatchEventRecord } from '../dispatch/types';
 import {
   createEmptyWorkboardState,
   defaultSettings,
+  type AllThreadsBucket,
   type CaptureNote,
   type CodingSession,
+  type DispatchDiagnostic,
   type InboundReminder,
   type QueueItem,
   type SelectorHealth,
@@ -34,11 +36,13 @@ const QUEUE_ITEMS_KEY = 'sidetrack.queueItems';
 const REMINDERS_KEY = 'sidetrack.reminders';
 const SELECTOR_HEALTH_KEY = 'sidetrack.selectorHealth';
 const COLLAPSED_SECTIONS_KEY = 'sidetrack.collapsedSections';
+const COLLAPSED_BUCKETS_KEY = 'sidetrack.collapsedBuckets';
 const CODING_SESSIONS_KEY = 'sidetrack.codingSessions';
 const CAPTURE_NOTES_KEY = 'sidetrack.captureNotes';
 const VAULT_PATH_KEY = 'sidetrack.vaultPath';
 const RECENT_DISPATCHES_KEY = 'sidetrack.recentDispatches';
 const DISPATCH_LINKS_KEY = 'sidetrack.dispatchLinks';
+const DISPATCH_DIAGNOSTICS_KEY = 'sidetrack.dispatchDiagnostics';
 // Local cache of UNREDACTED dispatch bodies, keyed by dispatchId. The
 // companion stores the redacted body (PII / API keys → [category]),
 // but the auto-link matcher needs the body the user actually copied
@@ -131,10 +135,19 @@ export const writeCachedDispatches = async (
 export const readDispatchLinks = async (): Promise<Readonly<Partial<Record<string, string>>>> =>
   await storageGet<Readonly<Partial<Record<string, string>>>>(DISPATCH_LINKS_KEY, {});
 
-export const writeDispatchLink = async (
-  dispatchId: string,
-  threadId: string,
-): Promise<void> => {
+export const readDispatchDiagnostics = async (): Promise<readonly DispatchDiagnostic[]> =>
+  await storageGet<readonly DispatchDiagnostic[]>(DISPATCH_DIAGNOSTICS_KEY, []);
+
+export const writeDispatchDiagnostic = async (diagnostic: DispatchDiagnostic): Promise<void> => {
+  const current = await readDispatchDiagnostics();
+  await storageSet({
+    [DISPATCH_DIAGNOSTICS_KEY]: [diagnostic, ...current]
+      .sort((left, right) => right.capturedAt.localeCompare(left.capturedAt))
+      .slice(0, 20),
+  });
+};
+
+export const writeDispatchLink = async (dispatchId: string, threadId: string): Promise<void> => {
   const current = await readDispatchLinks();
   if (current[dispatchId] === threadId) {
     return;
@@ -149,14 +162,10 @@ export const writeDispatchLink = async (
 // copied to clipboard, not the redacted vault form. Same access
 // pattern as dispatchLinks; tri-state Partial so absent lookups
 // return undefined (not the empty string).
-export const readDispatchOriginals = async (): Promise<
-  Readonly<Partial<Record<string, string>>>
-> => await storageGet<Readonly<Partial<Record<string, string>>>>(DISPATCH_ORIGINALS_KEY, {});
+export const readDispatchOriginals = async (): Promise<Readonly<Partial<Record<string, string>>>> =>
+  await storageGet<Readonly<Partial<Record<string, string>>>>(DISPATCH_ORIGINALS_KEY, {});
 
-export const writeDispatchOriginal = async (
-  dispatchId: string,
-  body: string,
-): Promise<void> => {
+export const writeDispatchOriginal = async (dispatchId: string, body: string): Promise<void> => {
   const current = await readDispatchOriginals();
   if (current[dispatchId] === body) {
     return;
@@ -171,8 +180,7 @@ export const writeDispatchOriginal = async (
 // "Recent" section.
 export const readLastDispatchTargetByThread = async (): Promise<
   Readonly<Partial<Record<string, string>>>
-> =>
-  await storageGet<Readonly<Partial<Record<string, string>>>>(LAST_DISPATCH_TARGET_KEY, {});
+> => await storageGet<Readonly<Partial<Record<string, string>>>>(LAST_DISPATCH_TARGET_KEY, {});
 
 export const writeLastDispatchTargetByThread = async (
   threadId: string,
@@ -213,9 +221,7 @@ export const pruneDispatchOriginals = async (
 };
 
 // Drop links that point at threads no longer in the cache (cleanup).
-export const pruneDispatchLinks = async (
-  knownThreadIds: ReadonlySet<string>,
-): Promise<void> => {
+export const pruneDispatchLinks = async (knownThreadIds: ReadonlySet<string>): Promise<void> => {
   const current = await readDispatchLinks();
   const next: Record<string, string> = {};
   let changed = false;
@@ -316,6 +322,15 @@ export const saveCollapsedSections = async (
   collapsedSections: WorkboardState['collapsedSections'],
 ): Promise<void> => {
   await storageSet({ [COLLAPSED_SECTIONS_KEY]: collapsedSections });
+};
+
+export const readCollapsedBuckets = async (): Promise<readonly AllThreadsBucket[]> =>
+  await storageGet<readonly AllThreadsBucket[]>(COLLAPSED_BUCKETS_KEY, ['stale']);
+
+export const saveCollapsedBuckets = async (
+  collapsedBuckets: WorkboardState['collapsedBuckets'],
+): Promise<void> => {
+  await storageSet({ [COLLAPSED_BUCKETS_KEY]: collapsedBuckets });
 };
 
 export const upsertLocalThread = async (
@@ -466,7 +481,17 @@ export const updateLocalQueueItem = async (
     } else if (typeof update.lastError === 'string') {
       nextLastError = update.lastError;
     }
-    updated = nextLastError === undefined ? next : { ...next, lastError: nextLastError };
+    let nextProgress: QueueItem['progress'] | undefined = item.progress;
+    if (update.progress === null || status !== 'pending') {
+      nextProgress = undefined;
+    } else if (update.progress === 'typing' || update.progress === 'waiting') {
+      nextProgress = update.progress;
+    }
+    updated = {
+      ...next,
+      ...(nextLastError === undefined ? {} : { lastError: nextLastError }),
+      ...(nextProgress === undefined ? {} : { progress: nextProgress }),
+    };
     return updated;
   });
   await storageSet({ [QUEUE_ITEMS_KEY]: next });
@@ -660,12 +685,14 @@ export const buildWorkboardState = async (
     captureNotes: await readCaptureNotes(),
     recentDispatches: await readCachedDispatches(),
     dispatchLinks: await readDispatchLinks(),
+    dispatchDiagnostics: await readDispatchDiagnostics(),
     dispatchOriginals: await readDispatchOriginals(),
     lastDispatchTargetByThread: await readLastDispatchTargetByThread(),
     collapsedSections: await storageGet<WorkboardState['collapsedSections']>(
       COLLAPSED_SECTIONS_KEY,
       [],
     ),
+    collapsedBuckets: await readCollapsedBuckets(),
     ...(lastError === undefined ? {} : { lastError }),
     ...(vaultPath === undefined ? {} : { vaultPath }),
   });

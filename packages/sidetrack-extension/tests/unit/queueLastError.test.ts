@@ -106,4 +106,24 @@ describe('updateLocalQueueItem.lastError tri-state', () => {
     expect(done?.status).toBe('done');
     expect(done?.lastError).toBeUndefined();
   });
+
+  it('sets and clears transient progress independently from lastError', async () => {
+    const item = await createLocalQueueItem({
+      text: 'q1',
+      scope: 'thread',
+      targetId: 'bac_thread_test',
+    });
+
+    const typing = await updateLocalQueueItem(item.bac_id, { progress: 'typing' });
+    expect(typing?.progress).toBe('typing');
+    const waiting = await updateLocalQueueItem(item.bac_id, { progress: 'waiting' });
+    expect(waiting?.progress).toBe('waiting');
+    const done = await updateLocalQueueItem(item.bac_id, {
+      status: 'done',
+      lastError: null,
+      progress: null,
+    });
+    expect(done?.progress).toBeUndefined();
+    expect(done?.lastError).toBeUndefined();
+  });
 });

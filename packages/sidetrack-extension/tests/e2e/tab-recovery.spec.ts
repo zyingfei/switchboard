@@ -42,6 +42,13 @@ const thread = (overrides: Record<string, unknown>) => ({
 const findThreadRowByTitle = (page: Page, title: string) =>
   page.locator('.thread').filter({ has: page.locator('.name', { hasText: title }) });
 
+const expandStaleBucket = async (page: Page) => {
+  const staleHeader = page.getByRole('button', { name: /Stale or closed/u });
+  if ((await staleHeader.getAttribute('aria-expanded')) === 'false') {
+    await staleHeader.click();
+  }
+};
+
 test.describe('tab-recovery / tracking-stopped lifecycle (synthetic)', () => {
   test('a thread with status=restorable shows "Tab closed" stamp and no lifecycle pill', async () => {
     let runtime: ExtensionRuntime | undefined;
@@ -64,6 +71,7 @@ test.describe('tab-recovery / tracking-stopped lifecycle (synthetic)', () => {
         [THREADS_KEY]: [closedThread, liveThread],
       });
       await page.getByRole('tab', { name: 'All threads' }).click();
+      await expandStaleBucket(page);
 
       const closedRow = findThreadRowByTitle(page, closedThread.title);
       await expect(closedRow).toBeVisible();
@@ -99,6 +107,7 @@ test.describe('tab-recovery / tracking-stopped lifecycle (synthetic)', () => {
         [THREADS_KEY]: [stoppedThread],
       });
       await page.getByRole('tab', { name: 'All threads' }).click();
+      await expandStaleBucket(page);
 
       const row = findThreadRowByTitle(page, stoppedThread.title);
       await expect(row).toBeVisible();

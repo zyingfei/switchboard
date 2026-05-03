@@ -81,50 +81,81 @@ export interface DispatchLinkInput {
 }
 
 export interface DispatchLinkResult {
+  readonly matched: true;
   readonly dispatchId: string;
   readonly matchedTurnIndex: number;
+  readonly candidatesConsidered: number;
+  readonly bestPrefixMatchLen: number;
 }
 
-export const tryLinkCapturedThread = (
-  input: DispatchLinkInput,
-): DispatchLinkResult | null => {
-  if (input.userTurnTexts.length === 0) {
-    return null;
-  }
+export type DispatchLinkMissReason =
+  | 'window-expired'
+  | 'provider-mismatch'
+  | 'no-prefix-match'
+  | 'tiny-prefix'
+  | 'already-linked';
+
+export interface DispatchLinkMiss {
+  readonly matched: false;
+  readonly reason: DispatchLinkMissReason;
+  readonly candidatesConsidered: number;
+  readonly bestPrefixMatchLen: number;
+}
+
+export type DispatchLinkDiagnosticResult = DispatchLinkResult | DispatchLinkMiss;
+
+export const tryLinkCapturedThread = (input: DispatchLinkInput): DispatchLinkDiagnosticResult => {
   const normalisedTurns = input.userTurnTexts.map(normaliseForMatch);
-  // Build sortable candidates — newest first.
-  const candidates = input.recentDispatches
-    .filter((d) => {
-      if (d.body.length === 0) return false;
-      if (!sameProvider(input.threadProvider, d.target.provider)) return false;
-      const age = input.capturedAtMs - Date.parse(d.createdAt);
-      if (!Number.isFinite(age) || age < 0 || age > MATCH_WINDOW_MS) return false;
-      const linkedTo = input.existingLinks[d.bac_id];
-      // Only skip if linked to a DIFFERENT thread; an existing
-      // self-link is fine (re-running the matcher on the same thread
-      // shouldn't move the link).
-      if (linkedTo !== undefined && linkedTo !== input.threadId) return false;
-      return true;
-    })
+  let candidatesConsidered = 0;
+  let bestPrefixMatchLen = 0;
+  let reason: DispatchLinkMissReason = 'no-prefix-match';
+
+  const dispatches = input.recentDispatches
     .slice()
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 
-  for (const dispatch of candidates) {
+  for (const dispatch of dispatches) {
+    if (dispatch.body.length === 0) {
+      continue;
+    }
+    if (!sameProvider(input.threadProvider, dispatch.target.provider)) {
+      reason = reason === 'no-prefix-match' ? 'provider-mismatch' : reason;
+      continue;
+    }
+    const age = input.capturedAtMs - Date.parse(dispatch.createdAt);
+    if (!Number.isFinite(age) || age < 0 || age > MATCH_WINDOW_MS) {
+      reason = reason === 'no-prefix-match' ? 'window-expired' : reason;
+      continue;
+    }
+    const linkedTo = input.existingLinks[dispatch.bac_id];
+    if (linkedTo !== undefined && linkedTo !== input.threadId) {
+      reason = reason === 'no-prefix-match' ? 'already-linked' : reason;
+      continue;
+    }
+    candidatesConsidered += 1;
     // Prefer the unredacted body — that's what the user pasted.
     // Fall back to the stored (redacted) body when no original is
     // cached (older dispatches predating PR1.1).
     const sourceBody = input.originalBodiesById?.[dispatch.bac_id] ?? dispatch.body;
     const needle = normaliseForMatch(sourceBody).slice(0, MATCH_PREFIX_LEN);
+    bestPrefixMatchLen = Math.max(bestPrefixMatchLen, needle.length);
     if (needle.length < MATCH_MIN_NEEDLE) {
       // Too short to match safely — skip rather than risk a false
       // positive on a one-word packet.
+      reason = 'tiny-prefix';
       continue;
     }
     for (let i = 0; i < normalisedTurns.length; i += 1) {
       if (normalisedTurns[i]?.includes(needle) ?? false) {
-        return { dispatchId: dispatch.bac_id, matchedTurnIndex: i };
+        return {
+          matched: true,
+          dispatchId: dispatch.bac_id,
+          matchedTurnIndex: i,
+          candidatesConsidered,
+          bestPrefixMatchLen,
+        };
       }
     }
   }
-  return null;
+  return { matched: false, reason, candidatesConsidered, bestPrefixMatchLen };
 };

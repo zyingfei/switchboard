@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
 
 import {
   companionStatusLabel,
   createEmptyWorkboardState,
+  type AllThreadsBucket,
   type CodingSession,
+  type DispatchDiagnostic,
   type TrackedThread,
   type WorkboardState,
   type WorkstreamNode,
@@ -180,8 +182,6 @@ const restoreStrategyForThread = (thread: TrackedThread): RestoreStrategy =>
 // subgroup headers. Order matches the user's priority list:
 // Unread → Ungrouped → Waiting on AI → Stale or closed → Normal.
 // A thread goes into the FIRST matching bucket.
-export type AllThreadsBucket = 'unread' | 'ungrouped' | 'waiting' | 'stale' | 'normal';
-
 const ALL_THREAD_BUCKET_ORDER: readonly AllThreadsBucket[] = [
   'unread',
   'ungrouped',
@@ -209,9 +209,7 @@ const classifyAllThread = (
   thread: TrackedThread,
   reminders: readonly { readonly threadId: string; readonly status: string }[],
 ): AllThreadsBucket => {
-  const hasUnread = reminders.some(
-    (r) => r.threadId === thread.bac_id && r.status !== 'dismissed',
-  );
+  const hasUnread = reminders.some((r) => r.threadId === thread.bac_id && r.status !== 'dismissed');
   if (hasUnread) return 'unread';
   if (thread.primaryWorkstreamId === undefined) return 'ungrouped';
   if (thread.lastTurnRole === 'user') return 'waiting';
@@ -302,12 +300,31 @@ const DISPATCH_STATUS_TO_DISPLAY = (status: string): RecentDispatchStatus => {
   return 'sent';
 };
 
+const dispatchDiagnosticReasonText = (
+  reason: NonNullable<DispatchDiagnostic['reason']>,
+): string => {
+  switch (reason) {
+    case 'window-expired':
+      return 'The capture landed outside the 30-minute dispatch matching window.';
+    case 'provider-mismatch':
+      return 'The captured provider did not match this dispatch target.';
+    case 'tiny-prefix':
+      return 'The dispatch prefix was too short to link safely.';
+    case 'already-linked':
+      return 'The best candidate was already linked to another thread.';
+    case 'no-prefix-match':
+      return 'No captured user turn contained the dispatch prefix.';
+  }
+};
+
 const App = () => {
   const [state, setState] = useState<WorkboardState>(() => createEmptyWorkboardState());
   const [bridgeKey, setBridgeKey] = useState('');
   const [port, setPort] = useState('17373');
   const [selectedWorkstream, setSelectedWorkstream] = useState('');
   const [moveThreadId, setMoveThreadId] = useState<string | null>(null);
+  const [draggingThreadId, setDraggingThreadId] = useState<string | null>(null);
+  const [dropWorkstreamId, setDropWorkstreamId] = useState<string | null>(null);
   const [recoveryThreadId, setRecoveryThreadId] = useState<string | null>(null);
   // Bac_id of a dispatch the user clicked to inspect — used by the
   // External viewer modal (and as a fallback "show me the body" for
@@ -354,6 +371,7 @@ const App = () => {
   const [vaultPath, setVaultPath] = useState(DEFAULT_VAULT_PATH);
   const [wizardOpen, setWizardOpen] = useState(false);
   const [captureToastHost, setCaptureToastHost] = useState<string | null>(null);
+  const [findPulseDismissedUrl, setFindPulseDismissedUrl] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -585,6 +603,17 @@ const App = () => {
   // row. Map mutated via the ref callback below.
   const threadRowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const [focusingThreadId, setFocusingThreadId] = useState<string | null>(null);
+  const activeTabTrackedThread = useMemo(
+    () =>
+      state.activeTabUrl === undefined
+        ? undefined
+        : threads.find((thread) => thread.threadUrl === state.activeTabUrl),
+    [state.activeTabUrl, threads],
+  );
+  const findIconPulsing =
+    activeTabTrackedThread !== undefined &&
+    focusingThreadId !== activeTabTrackedThread.bac_id &&
+    state.activeTabUrl !== findPulseDismissedUrl;
   useEffect(() => {
     if (
       composeThread === undefined ||
@@ -753,8 +782,19 @@ const App = () => {
     setWizardOpen(false);
   };
 
+  const moveThreadToWorkstream = async (
+    threadId: string,
+    workstreamId: string,
+  ): Promise<WorkboardState> =>
+    await sendRequest({
+      type: messageTypes.moveThread,
+      threadId,
+      workstreamId,
+    });
+
   const handleMoveTarget = (target: WorkstreamOption | { readonly create: string }) => {
-    if (moveThreadId === null) {
+    const threadId = moveThreadId;
+    if (threadId === null) {
       return;
     }
 
@@ -771,23 +811,38 @@ const App = () => {
           setMoveThreadId(null);
           return afterCreate;
         }
-        const afterMove = await sendRequest({
-          type: messageTypes.moveThread,
-          threadId: moveThreadId,
-          workstreamId: created.bac_id,
-        });
+        const afterMove = await moveThreadToWorkstream(threadId, created.bac_id);
         setMoveThreadId(null);
         return afterMove;
       }
 
-      const next = await sendRequest({
-        type: messageTypes.moveThread,
-        threadId: moveThreadId,
-        workstreamId: target.bac_id,
-      });
+      const next = await moveThreadToWorkstream(threadId, target.bac_id);
       setMoveThreadId(null);
       return next;
     });
+  };
+
+  const handleThreadDrop = (workstreamId: string) => {
+    const threadId = draggingThreadId;
+    setDropWorkstreamId(null);
+    setDraggingThreadId(null);
+    if (threadId === null) {
+      return;
+    }
+    const thread = state.threads.find((candidate) => candidate.bac_id === threadId);
+    if (thread?.primaryWorkstreamId === workstreamId) {
+      return;
+    }
+    void runAction(() => moveThreadToWorkstream(threadId, workstreamId));
+  };
+
+  const allowThreadDrop = (event: DragEvent<HTMLElement>, workstreamId: string) => {
+    if (draggingThreadId === null) {
+      return;
+    }
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+    setDropWorkstreamId(workstreamId);
   };
 
   const restoreThread = (threadId: string) => {
@@ -864,6 +919,7 @@ const App = () => {
           );
           return;
         }
+        setFindPulseDismissedUrl(url);
         const node = threadRowRefs.current.get(match.bac_id);
         node?.scrollIntoView({ behavior: 'smooth', block: 'center' });
         setFocusingThreadId(match.bac_id);
@@ -904,10 +960,7 @@ const App = () => {
     notebook: { kind: 'notebook_export', target: 'notebook' },
   };
 
-  const buildSmartDefaultPacket = (
-    thread: TrackedThread,
-    target: SendToTarget,
-  ): ComposedPacket => {
+  const buildSmartDefaultPacket = (thread: TrackedThread, target: SendToTarget): ComposedPacket => {
     const intent = SEND_TO_INTENT[target];
     const turns = composeTurnsByUrl.get(thread.threadUrl) ?? [];
     const turnsMd =
@@ -1292,9 +1345,7 @@ const App = () => {
       return false;
     }
     const trimmedNote = payload.reviewerNote.trim();
-    const hasPerSpanComment = Object.values(payload.perSpan).some(
-      (c) => c.trim().length > 0,
-    );
+    const hasPerSpanComment = Object.values(payload.perSpan).some((c) => c.trim().length > 0);
     if (trimmedNote.length === 0 && !hasPerSpanComment) {
       setError('Add a comment (overall or per-span) before saving the review.');
       return false;
@@ -1428,6 +1479,22 @@ const App = () => {
     return buckets;
   })();
 
+  const toggleThreadBucket = (bucket: AllThreadsBucket) => {
+    const current = new Set(state.collapsedBuckets);
+    if (current.has(bucket)) {
+      current.delete(bucket);
+    } else {
+      current.add(bucket);
+    }
+    const collapsedBuckets = ALL_THREAD_BUCKET_ORDER.filter((candidate) => current.has(candidate));
+    void runAction(() =>
+      sendRequest({
+        type: messageTypes.setCollapsedBuckets,
+        collapsedBuckets,
+      }),
+    );
+  };
+
   // Captures: manual notes filtered by the current workstream (or Inbox)
   // plus inbound reminders whose linked thread sits in scope. Notes that
   // are anchored to a specific thread render under that thread's history
@@ -1504,7 +1571,25 @@ const App = () => {
     return (
       <div
         key={thread.bac_id}
-        className={'thread' + (isFocusing ? ' focusing' : '')}
+        className={
+          'thread' +
+          (isFocusing ? ' focusing' : '') +
+          (draggingThreadId === thread.bac_id ? ' dragging' : '')
+        }
+        draggable={viewMode === 'workstream'}
+        onDragStart={(event) => {
+          if (viewMode !== 'workstream') {
+            event.preventDefault();
+            return;
+          }
+          event.dataTransfer.effectAllowed = 'move';
+          event.dataTransfer.setData('text/plain', thread.bac_id);
+          setDraggingThreadId(thread.bac_id);
+        }}
+        onDragEnd={() => {
+          setDraggingThreadId(null);
+          setDropWorkstreamId(null);
+        }}
         ref={(node) => {
           if (node === null) {
             threadRowRefs.current.delete(thread.bac_id);
@@ -1627,7 +1712,8 @@ const App = () => {
             Queue
           </button>
           {(() => {
-            const requiresCompanion = state.companionStatus !== 'connected' || bridgeKey.length === 0;
+            const requiresCompanion =
+              state.companionStatus !== 'connected' || bridgeKey.length === 0;
             // Don't use the `disabled` attribute when companion is missing —
             // a click should explain how to enable, not be silently swallowed.
             // The `.disabled-look` class mutes the colour while the button
@@ -1819,6 +1905,11 @@ const App = () => {
             {pendingQueueItems.map((item) => (
               <li key={item.bac_id} className="thread-queue-item">
                 <span className="thread-queue-text">{item.text}</span>
+                {item.progress !== undefined ? (
+                  <span className="queue-item-progress mono" role="status">
+                    {item.progress === 'typing' ? 'typing…' : 'waiting for reply…'}
+                  </span>
+                ) : null}
                 <span className="thread-queue-actions">
                   <button
                     type="button"
@@ -1894,13 +1985,9 @@ const App = () => {
                 >
                   <span className="thread-turn-role mono">{turn.role}</span>
                   <span className="thread-turn-text">
-                    {turn.text.length > 200
-                      ? `${turn.text.slice(0, 200).trim()}…`
-                      : turn.text}
+                    {turn.text.length > 200 ? `${turn.text.slice(0, 200).trim()}…` : turn.text}
                   </span>
-                  <span className="thread-turn-time mono">
-                    {formatRelative(turn.capturedAt)}
-                  </span>
+                  <span className="thread-turn-time mono">{formatRelative(turn.capturedAt)}</span>
                 </div>
               ))
             )}
@@ -2114,13 +2201,20 @@ const App = () => {
         </div>
         <div className="app-actions">
           <button
-            className="icon-btn"
+            className={'icon-btn' + (findIconPulsing ? ' pulsing' : '')}
             title="Find this tab in the side panel — scrolls + flashes the matching thread row"
             onClick={findActiveTabThread}
             type="button"
             aria-label="Find active tab in side panel"
           >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
               <circle cx="11" cy="11" r="7" />
               <line x1="21" y1="21" x2="16.65" y2="16.65" />
             </svg>
@@ -2168,17 +2262,49 @@ const App = () => {
       </div>
 
       {viewMode === 'workstream' ? (
-        <WorkstreamBar
-          currentWsLabel={currentWsLabel}
-          statusLabel={companionStatusLabel(state.companionStatus)}
-          onOpenPicker={() => {
-            setWsPickerOpen(true);
-          }}
-          onAddSubWorkstream={() => {
-            setWsPickerOpen(true);
-            setWsPickerCreateMode(true);
-          }}
-        />
+        <>
+          <WorkstreamBar
+            currentWsLabel={currentWsLabel}
+            statusLabel={companionStatusLabel(state.companionStatus)}
+            onOpenPicker={() => {
+              setWsPickerOpen(true);
+            }}
+            onAddSubWorkstream={() => {
+              setWsPickerOpen(true);
+              setWsPickerCreateMode(true);
+            }}
+          />
+          <div className="ws-drop-strip" aria-label="Drop thread on a workstream">
+            {state.workstreams.map((workstream) => (
+              <button
+                type="button"
+                key={workstream.bac_id}
+                className={
+                  'ws-picker-pill' +
+                  (workstream.bac_id === currentWsId ? ' current' : '') +
+                  (dropWorkstreamId === workstream.bac_id ? ' drop-target' : '')
+                }
+                onClick={() => {
+                  setCurrentWs(workstream.bac_id);
+                }}
+                onDragOver={(event) => {
+                  allowThreadDrop(event, workstream.bac_id);
+                }}
+                onDragLeave={() => {
+                  setDropWorkstreamId((current) =>
+                    current === workstream.bac_id ? null : current,
+                  );
+                }}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  handleThreadDrop(workstream.bac_id);
+                }}
+              >
+                {workstream.title}
+              </button>
+            ))}
+          </div>
+        </>
       ) : (
         <div className="ws-bar all-bar">
           <span className="lbl">All threads</span>
@@ -2287,15 +2413,31 @@ const App = () => {
             if (list.length === 0) {
               return null;
             }
+            const collapsed = state.collapsedBuckets.includes(bucket);
             return (
-              <div className={'thread-bucket thread-bucket-' + bucket} key={bucket}>
-                <div className="thread-bucket-head">
+              <div
+                className={
+                  'thread-bucket thread-bucket-' + bucket + (collapsed ? ' collapsed' : '')
+                }
+                key={bucket}
+              >
+                <button
+                  type="button"
+                  className="thread-bucket-head"
+                  aria-expanded={!collapsed}
+                  onClick={() => {
+                    toggleThreadBucket(bucket);
+                  }}
+                >
                   <span className="thread-bucket-label">
+                    <span className="thread-bucket-chevron" aria-hidden>
+                      {collapsed ? '▸' : '▾'}
+                    </span>
                     {ALL_THREAD_BUCKET_LABEL[bucket]}
                   </span>
                   <span className="thread-bucket-count mono">{String(list.length)}</span>
-                </div>
-                <div className="thread-list">{list.map(renderThreadRow)}</div>
+                </button>
+                {collapsed ? null : <div className="thread-list">{list.map(renderThreadRow)}</div>}
               </div>
             );
           })}
@@ -2326,11 +2468,8 @@ const App = () => {
           return {
             bac_id: d.bac_id,
             sourceTitle,
-            targetProviderLabel:
-              DISPATCH_PROVIDER_LABEL[d.target.provider] ?? d.target.provider,
-            ...(linkedThread === undefined
-              ? {}
-              : { targetThreadTitle: linkedThread.title }),
+            targetProviderLabel: DISPATCH_PROVIDER_LABEL[d.target.provider] ?? d.target.provider,
+            ...(linkedThread === undefined ? {} : { targetThreadTitle: linkedThread.title }),
             mode: d.target.mode,
             dispatchKind: DISPATCH_KIND_TO_DISPLAY[d.kind] ?? 'dispatch_out',
             dispatchedAt: formatRelative(d.createdAt),
@@ -2522,9 +2661,9 @@ const App = () => {
         {scopedNotes.length === 0 ? (
           <div className="capture-empty subtle">
             <p>
-              Notes you save here are scoped to the current workstream. Inbound replies surface as the{' '}
-              <strong>Unread reply</strong> badge on the thread row above. Obsidian / external imports
-              come later.
+              Notes you save here are scoped to the current workstream. Inbound replies surface as
+              the <strong>Unread reply</strong> badge on the thread row above. Obsidian / external
+              imports come later.
             </p>
           </div>
         ) : null}
@@ -2638,8 +2777,7 @@ const App = () => {
             // uses for its "Will ..." header.
             const t = pendingDispatch.target;
             if (t === 'markdown' || t === 'notebook') return 'export' as const;
-            if (t === 'codex' || t === 'claude_code' || t === 'cursor')
-              return 'coding' as const;
+            if (t === 'codex' || t === 'claude_code' || t === 'cursor') return 'coding' as const;
             // AI providers: paste vs auto-send depends on the user's
             // settings + the thread's autoSendEnabled toggle.
             const provider = mapUiTarget(t);
@@ -2752,52 +2890,47 @@ const App = () => {
                         .join('\n');
                       const followUpBody = [
                         payload.reviewerNote.trim(),
-                        perSpanLines.length > 0
-                          ? `\n\nPer-span feedback:\n${perSpanLines}`
-                          : '',
+                        perSpanLines.length > 0 ? `\n\nPer-span feedback:\n${perSpanLines}` : '',
                       ]
                         .join('')
                         .trim();
-                      void submitReview(
-                        reviewThread,
-                        payload,
-                        'submit_back',
-                        spanContext,
-                      ).then((reviewOk) => {
-                        if (!reviewOk) {
-                          return;
-                        }
-                        // Skip the queue+drain step if there's nothing
-                        // to send (review-only save). Should not happen
-                        // because the button is gated, but defend.
-                        if (followUpBody.length === 0) {
-                          setReviewThreadId(null);
-                          return;
-                        }
-                        void runAction(async () => {
-                          // Park the comment as a queue item against the
-                          // source thread.
-                          await sendRequest({
-                            type: messageTypes.queueFollowUp,
-                            item: {
-                              text: followUpBody,
-                              scope: 'thread',
-                              targetId: reviewThread.bac_id,
-                            },
-                          });
-                          // Make sure auto-send is on so the orchestrator
-                          // ships the queued comment into the chat.
-                          if (reviewThread.autoSendEnabled !== true) {
-                            await sendRequest({
-                              type: messageTypes.setThreadAutoSend,
-                              threadId: reviewThread.bac_id,
-                              enabled: true,
-                            });
+                      void submitReview(reviewThread, payload, 'submit_back', spanContext).then(
+                        (reviewOk) => {
+                          if (!reviewOk) {
+                            return;
                           }
-                          return await sendRequest({ type: messageTypes.getWorkboardState });
-                        });
-                        setReviewThreadId(null);
-                      });
+                          // Skip the queue+drain step if there's nothing
+                          // to send (review-only save). Should not happen
+                          // because the button is gated, but defend.
+                          if (followUpBody.length === 0) {
+                            setReviewThreadId(null);
+                            return;
+                          }
+                          void runAction(async () => {
+                            // Park the comment as a queue item against the
+                            // source thread.
+                            await sendRequest({
+                              type: messageTypes.queueFollowUp,
+                              item: {
+                                text: followUpBody,
+                                scope: 'thread',
+                                targetId: reviewThread.bac_id,
+                              },
+                            });
+                            // Make sure auto-send is on so the orchestrator
+                            // ships the queued comment into the chat.
+                            if (reviewThread.autoSendEnabled !== true) {
+                              await sendRequest({
+                                type: messageTypes.setThreadAutoSend,
+                                threadId: reviewThread.bac_id,
+                                enabled: true,
+                              });
+                            }
+                            return await sendRequest({ type: messageTypes.getWorkboardState });
+                          });
+                          setReviewThreadId(null);
+                        },
+                      );
                     }}
                     onDispatchOut={(payload) => {
                       // Build the dispatch body from the user's review
@@ -2808,11 +2941,9 @@ const App = () => {
                         .filter(([, comment]) => comment.trim().length > 0)
                         .map(([id, comment]) => {
                           const spanBody = payload.spanText[id] ?? '';
-                          return [
-                            `> ${spanBody.replace(/\n/g, '\n> ')}`,
-                            '',
-                            comment.trim(),
-                          ].join('\n');
+                          return [`> ${spanBody.replace(/\n/g, '\n> ')}`, '', comment.trim()].join(
+                            '\n',
+                          );
                         })
                         .join('\n\n---\n\n');
                       const body = [
@@ -2820,9 +2951,7 @@ const App = () => {
                         '',
                         `## Source thread`,
                         `${providerLabel(reviewThread.provider)} · ${reviewThread.threadUrl}`,
-                        ...(payload.verdict !== null
-                          ? ['', `## Verdict`, payload.verdict]
-                          : []),
+                        ...(payload.verdict !== null ? ['', `## Verdict`, payload.verdict] : []),
                         ...(payload.reviewerNote.trim().length > 0
                           ? ['', `## Reviewer note`, payload.reviewerNote]
                           : []),
@@ -2881,14 +3010,22 @@ const App = () => {
 
       {viewingDispatchId !== null
         ? (() => {
-            const dispatch = state.recentDispatches.find(
-              (d) => d.bac_id === viewingDispatchId,
-            );
+            const dispatch = state.recentDispatches.find((d) => d.bac_id === viewingDispatchId);
             if (dispatch === undefined) {
               return null;
             }
             const targetLabel =
               TARGET_PROVIDER_LABEL[dispatch.target.provider] ?? dispatch.target.provider;
+            const linkedThreadId = state.dispatchLinks[dispatch.bac_id];
+            const oneHourAgo = Date.now() - 60 * 60 * 1000;
+            const diagnostic =
+              linkedThreadId !== undefined
+                ? undefined
+                : state.dispatchDiagnostics.find(
+                    (entry) =>
+                      entry.provider === dispatch.target.provider &&
+                      Date.parse(entry.capturedAt) >= oneHourAgo,
+                  );
             const close = () => {
               setViewingDispatchId(null);
             };
@@ -2917,11 +3054,23 @@ const App = () => {
                       ✕
                     </button>
                   </div>
-                  <textarea
-                    className="dispatch-viewer-body mono"
-                    value={dispatch.body}
-                    readOnly
-                  />
+                  <textarea className="dispatch-viewer-body mono" value={dispatch.body} readOnly />
+                  {diagnostic === undefined ? null : (
+                    <details className="dispatch-diagnostic">
+                      <summary>Why didn't this link?</summary>
+                      <p>{dispatchDiagnosticReasonText(diagnostic.reason ?? 'no-prefix-match')}</p>
+                      <dl className="dispatch-diagnostic-grid mono">
+                        <div>
+                          <dt>candidates</dt>
+                          <dd>{String(diagnostic.candidatesConsidered)}</dd>
+                        </div>
+                        <div>
+                          <dt>best prefix</dt>
+                          <dd>{String(diagnostic.bestPrefixMatchLen)}</dd>
+                        </div>
+                      </dl>
+                    </details>
+                  )}
                   <div className="dispatch-viewer-foot">
                     <button type="button" className="btn btn-ghost" onClick={close}>
                       Close
@@ -2931,11 +3080,10 @@ const App = () => {
                       type="button"
                       className="btn btn-ghost"
                       onClick={() => {
-                        const safeTitle = dispatch.title.replace(/[^a-z0-9-_]+/gi, '-').slice(0, 80);
-                        downloadAsFile(
-                          `${safeTitle || 'sidetrack-dispatch'}.md`,
-                          dispatch.body,
-                        );
+                        const safeTitle = dispatch.title
+                          .replace(/[^a-z0-9-_]+/gi, '-')
+                          .slice(0, 80);
+                        downloadAsFile(`${safeTitle || 'sidetrack-dispatch'}.md`, dispatch.body);
                         setError(`Re-downloaded ${safeTitle || 'sidetrack-dispatch'}.md.`);
                       }}
                     >

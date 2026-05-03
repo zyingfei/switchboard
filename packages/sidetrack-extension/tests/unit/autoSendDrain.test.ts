@@ -147,7 +147,9 @@ describe('runAutoSendDrain — tab resolution', () => {
   it('sets lastError + stops when no chat tab is open', async () => {
     const state = baseState({
       items: [buildItem()],
-      tabLookup: { reason: 'Open the chat tab; auto-send needs the conversation visible to type into.' },
+      tabLookup: {
+        reason: 'Open the chat tab; auto-send needs the conversation visible to type into.',
+      },
     });
     const ports = buildFakePorts(state);
     const outcome = await runAutoSendDrain('bac_thread_1', ports);
@@ -177,8 +179,13 @@ describe('runAutoSendDrain — content-script send', () => {
     expect(outcome.mutated).toBe(true);
     expect(outcome.itemsSent).toBe(1);
     expect(outcome.stoppedReason).toBe('completed');
-    expect(state.updates).toHaveLength(1);
-    expect(state.updates[0]?.update).toEqual({ status: 'done', lastError: null });
+    expect(state.updates).toHaveLength(2);
+    expect(state.updates[0]?.update).toEqual({ progress: 'typing', lastError: null });
+    expect(state.updates[1]?.update).toEqual({
+      status: 'done',
+      lastError: null,
+      progress: null,
+    });
   });
 
   it('sets lastError + stops on content-script failure', async () => {
@@ -188,7 +195,9 @@ describe('runAutoSendDrain — content-script send', () => {
     });
     const outcome = await runAutoSendDrain('bac_thread_1', buildFakePorts(state));
     expect(outcome.stoppedReason).toBe('send-failed');
-    expect(state.updates[0]?.update.lastError).toContain('AI did not finish');
+    expect(state.updates[0]?.update.progress).toBe('typing');
+    expect(state.updates[1]?.update.lastError).toContain('AI did not finish');
+    expect(state.updates[1]?.update.progress).toBeNull();
   });
 });
 
@@ -206,7 +215,7 @@ describe('runAutoSendDrain — multi-item sequencing', () => {
     const outcome = await runAutoSendDrain('bac_thread_1', ports);
     expect(outcome.itemsSent).toBe(3);
     expect(outcome.stoppedReason).toBe('completed');
-    expect(state.updates.map((u) => u.itemId)).toEqual(['q1', 'q2', 'q3']);
+    expect(state.updates.map((u) => u.itemId)).toEqual(['q1', 'q1', 'q2', 'q2', 'q3', 'q3']);
   });
 
   it('processes oldest items first regardless of array order', async () => {
@@ -219,7 +228,7 @@ describe('runAutoSendDrain — multi-item sequencing', () => {
     });
     const outcome = await runAutoSendDrain('bac_thread_1', buildFakePorts(state));
     expect(outcome.itemsSent).toBe(2);
-    expect(state.updates.map((u) => u.itemId)).toEqual(['older', 'newer']);
+    expect(state.updates.map((u) => u.itemId)).toEqual(['older', 'older', 'newer', 'newer']);
   });
 
   it('stops mid-drain on first failure; later items left pending', async () => {
@@ -238,9 +247,16 @@ describe('runAutoSendDrain — multi-item sequencing', () => {
     const outcome = await runAutoSendDrain('bac_thread_1', buildFakePorts(state));
     expect(outcome.itemsSent).toBe(1);
     expect(outcome.stoppedReason).toBe('send-failed');
-    expect(state.updates.map((u) => u.itemId)).toEqual(['q1', 'q2']);
-    expect(state.updates[0]?.update).toEqual({ status: 'done', lastError: null });
-    expect(state.updates[1]?.update.lastError).toContain('Composer not found');
+    expect(state.updates.map((u) => u.itemId)).toEqual(['q1', 'q1', 'q2', 'q2']);
+    expect(state.updates[0]?.update).toEqual({ progress: 'typing', lastError: null });
+    expect(state.updates[1]?.update).toEqual({
+      status: 'done',
+      lastError: null,
+      progress: null,
+    });
+    expect(state.updates[2]?.update).toEqual({ progress: 'typing', lastError: null });
+    expect(state.updates[3]?.update.lastError).toContain('Composer not found');
+    expect(state.updates[3]?.update.progress).toBeNull();
     // q3 must NOT have been touched.
     expect(state.updates.find((u) => u.itemId === 'q3')).toBeUndefined();
   });

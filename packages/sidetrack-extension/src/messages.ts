@@ -12,7 +12,7 @@ import type {
   WorkstreamCreate,
   WorkstreamUpdate,
 } from './companion/model';
-import type { TrackingMode, WorkboardSection, WorkboardState } from './workboard';
+import type { AllThreadsBucket, TrackingMode, WorkboardSection, WorkboardState } from './workboard';
 
 export const messageTypes = {
   captureVisibleThread: 'sidetrack.capture.visible-thread',
@@ -31,6 +31,7 @@ export const messageTypes = {
   // a single queue item's text. Content script reports back when the
   // AI is done responding (Stop button → Send button transition).
   autoSendItem: 'sidetrack.queue.autoSend.item',
+  autoSendInterimReport: 'sidetrack.queue.autoSend.interimReport',
   // Side panel asks the background to retry a queue item that
   // previously failed (lastError set). Background clears lastError,
   // re-fires the drain for the item's thread.
@@ -63,6 +64,7 @@ export const messageTypes = {
   createReminder: 'sidetrack.reminder.create',
   updateReminder: 'sidetrack.reminder.update',
   setCollapsedSections: 'sidetrack.sections.collapsed.set',
+  setCollapsedBuckets: 'sidetrack.threadBuckets.collapsed.set',
   workboardChanged: 'sidetrack.workboard.changed',
   createCodingAttachToken: 'sidetrack.coding.attach-token.create',
   detachCodingSession: 'sidetrack.coding.session.detach',
@@ -228,6 +230,10 @@ export type WorkboardRequest =
       readonly collapsedSections: readonly WorkboardSection['id'][];
     }
   | {
+      readonly type: typeof messageTypes.setCollapsedBuckets;
+      readonly collapsedBuckets: readonly AllThreadsBucket[];
+    }
+  | {
       readonly type: typeof messageTypes.createCodingAttachToken;
       readonly request: CodingAttachTokenCreate;
     }
@@ -261,6 +267,11 @@ export type RuntimeRequest =
   | {
       readonly type: typeof messageTypes.autoCapture;
       readonly capture: CaptureEvent;
+    }
+  | {
+      readonly type: typeof messageTypes.autoSendInterimReport;
+      readonly itemId: string;
+      readonly phase: 'waiting';
     }
   | {
       readonly type: typeof messageTypes.selectorCanary;
@@ -321,6 +332,10 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
 
   if (hasType(value, messageTypes.autoCapture)) {
     return isRecord(value.capture);
+  }
+
+  if (hasType(value, messageTypes.autoSendInterimReport)) {
+    return typeof value.itemId === 'string' && value.phase === 'waiting';
   }
 
   if (hasType(value, messageTypes.createWorkstream)) {
@@ -405,6 +420,13 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
     return (
       Array.isArray(value.collapsedSections) &&
       value.collapsedSections.every((section) => typeof section === 'string')
+    );
+  }
+
+  if (hasType(value, messageTypes.setCollapsedBuckets)) {
+    return (
+      Array.isArray(value.collapsedBuckets) &&
+      value.collapsedBuckets.every((bucket) => typeof bucket === 'string')
     );
   }
 

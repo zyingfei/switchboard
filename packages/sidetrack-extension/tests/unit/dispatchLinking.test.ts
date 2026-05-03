@@ -15,8 +15,7 @@ const buildDispatch = (overrides: Partial<DispatchEventRecord> = {}): DispatchEv
   target: { provider: 'gemini', mode: 'paste' },
   sourceThreadId: 'bac_thread_src',
   title: 'Pro-Questions',
-  body:
-    '# Research request: Pro-Questions - Binance Agentic AI Wallet\n\n## Source\nClaude · …',
+  body: '# Research request: Pro-Questions - Binance Agentic AI Wallet\n\n## Source\nClaude · …',
   createdAt: '2026-04-30T11:55:00.000Z',
   redactionSummary: { matched: 0, categories: [] },
   tokenEstimate: 100,
@@ -36,10 +35,8 @@ const baseInput = (overrides: Partial<DispatchLinkInput> = {}): DispatchLinkInpu
 
 describe('tryLinkCapturedThread', () => {
   it('returns null when there are no captured user turns', () => {
-    const out = tryLinkCapturedThread(
-      baseInput({ recentDispatches: [buildDispatch()] }),
-    );
-    expect(out).toBeNull();
+    const out = tryLinkCapturedThread(baseInput({ recentDispatches: [buildDispatch()] }));
+    expect(out).toMatchObject({ matched: false, reason: 'no-prefix-match' });
   });
 
   it('matches when the dispatch body prefix appears in a user turn', () => {
@@ -52,7 +49,11 @@ describe('tryLinkCapturedThread', () => {
         recentDispatches: [dispatch],
       }),
     );
-    expect(out).toEqual({ dispatchId: dispatch.bac_id, matchedTurnIndex: 0 });
+    expect(out).toMatchObject({
+      matched: true,
+      dispatchId: dispatch.bac_id,
+      matchedTurnIndex: 0,
+    });
   });
 
   it('matches when the user pastes only a slightly modified prefix', () => {
@@ -67,7 +68,7 @@ describe('tryLinkCapturedThread', () => {
         recentDispatches: [dispatch],
       }),
     );
-    expect(out?.dispatchId).toBe(dispatch.bac_id);
+    expect(out).toMatchObject({ matched: true, dispatchId: dispatch.bac_id });
   });
 
   it('rejects a dispatch on a different provider', () => {
@@ -79,7 +80,7 @@ describe('tryLinkCapturedThread', () => {
         recentDispatches: [dispatch],
       }),
     );
-    expect(out).toBeNull();
+    expect(out).toMatchObject({ matched: false, reason: 'provider-mismatch' });
   });
 
   it('rejects a dispatch older than the 30-minute window', () => {
@@ -92,7 +93,7 @@ describe('tryLinkCapturedThread', () => {
         recentDispatches: [dispatch],
       }),
     );
-    expect(out).toBeNull();
+    expect(out).toMatchObject({ matched: false, reason: 'window-expired' });
   });
 
   it('rejects a dispatch already linked to a different thread', () => {
@@ -104,7 +105,7 @@ describe('tryLinkCapturedThread', () => {
         existingLinks: { [dispatch.bac_id]: 'bac_thread_OTHER' },
       }),
     );
-    expect(out).toBeNull();
+    expect(out).toMatchObject({ matched: false, reason: 'already-linked' });
   });
 
   it('allows re-linking when the existing link points to the SAME thread (idempotent)', () => {
@@ -116,7 +117,7 @@ describe('tryLinkCapturedThread', () => {
         existingLinks: { [dispatch.bac_id]: 'bac_thread_dest' },
       }),
     );
-    expect(out?.dispatchId).toBe(dispatch.bac_id);
+    expect(out).toMatchObject({ matched: true, dispatchId: dispatch.bac_id });
   });
 
   it('picks the most recent matching dispatch when multiple are eligible', () => {
@@ -134,7 +135,7 @@ describe('tryLinkCapturedThread', () => {
         recentDispatches: [older, newer],
       }),
     );
-    expect(out?.dispatchId).toBe('newer');
+    expect(out).toMatchObject({ matched: true, dispatchId: 'newer' });
   });
 
   it('skips dispatches with a body that normalises to less than the safety floor', () => {
@@ -145,7 +146,7 @@ describe('tryLinkCapturedThread', () => {
         recentDispatches: [tiny],
       }),
     );
-    expect(out).toBeNull();
+    expect(out).toMatchObject({ matched: false, reason: 'tiny-prefix' });
   });
 
   it('falls back to a longer dispatch when a tiny one would also match', () => {
@@ -157,7 +158,7 @@ describe('tryLinkCapturedThread', () => {
         recentDispatches: [tiny, real],
       }),
     );
-    expect(out?.dispatchId).toBe(real.bac_id);
+    expect(out).toMatchObject({ matched: true, dispatchId: real.bac_id });
   });
 
   it('matches against the unredacted ORIGINAL body when the redacted form would not', () => {
@@ -177,10 +178,10 @@ describe('tryLinkCapturedThread', () => {
       baseInput({
         userTurnTexts: [originalBody],
         recentDispatches: [dispatch],
-        originalBodiesById: { 'bac_disp_redacted': originalBody },
+        originalBodiesById: { bac_disp_redacted: originalBody },
       }),
     );
-    expect(out?.dispatchId).toBe('bac_disp_redacted');
+    expect(out).toMatchObject({ matched: true, dispatchId: 'bac_disp_redacted' });
   });
 
   it('falls back to the stored body when no original is cached', () => {
@@ -195,7 +196,7 @@ describe('tryLinkCapturedThread', () => {
         // originalBodiesById intentionally omitted.
       }),
     );
-    expect(out?.dispatchId).toBe(dispatch.bac_id);
+    expect(out).toMatchObject({ matched: true, dispatchId: dispatch.bac_id });
   });
 });
 

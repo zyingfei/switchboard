@@ -46,6 +46,7 @@ import {
   recordSelectorCanary,
   saveAutoTrack,
   saveCompanionSettings,
+  saveCollapsedBuckets,
   saveCollapsedSections,
   saveVaultPath,
   updateLocalCaptureNote,
@@ -56,6 +57,7 @@ import {
   writeCachedCodingSessions,
   readDispatchOriginals,
   writeCachedDispatches,
+  writeDispatchDiagnostic,
   writeDispatchLink,
   writeDispatchOriginal,
   writeLastDispatchTargetByThread,
@@ -84,9 +86,6 @@ const tryAutoLinkCapturedThread = async (
   userTurnTexts: readonly string[],
   capturedAtMs: number,
 ): Promise<void> => {
-  if (userTurnTexts.length === 0) {
-    return;
-  }
   const [recentDispatches, existingLinks, originalBodiesById] = await Promise.all([
     readCachedDispatches(),
     readDispatchLinks(),
@@ -104,7 +103,15 @@ const tryAutoLinkCapturedThread = async (
     existingLinks,
     originalBodiesById,
   });
-  if (result === null) {
+  await writeDispatchDiagnostic({
+    capturedAt: new Date(capturedAtMs).toISOString(),
+    provider: threadProvider,
+    matched: result.matched,
+    ...(result.matched ? { dispatchId: result.dispatchId } : { reason: result.reason }),
+    candidatesConsidered: result.candidatesConsidered,
+    bestPrefixMatchLen: result.bestPrefixMatchLen,
+  });
+  if (!result.matched) {
     return;
   }
   await writeDispatchLink(result.dispatchId, threadId);
@@ -449,9 +456,10 @@ const assertCompanionReachable = async (): Promise<'connected' | 'vault-error' |
 // `url` as a match pattern, so plain literal URLs may fail to match
 // when the live URL has hash/query fragments. The tabSnapshot path
 // avoids that entirely.
-const findTabForThread = async (
-  thread: { tabSnapshot?: { tabId?: number }; threadUrl: string },
-): Promise<{ tabId?: number; reason?: string }> => {
+const findTabForThread = async (thread: {
+  tabSnapshot?: { tabId?: number };
+  threadUrl: string;
+}): Promise<{ tabId?: number; reason?: string }> => {
   const snapshotId = thread.tabSnapshot?.tabId;
   if (typeof snapshotId === 'number') {
     try {
@@ -482,7 +490,9 @@ const findTabForThread = async (
 // this specifically and recover with chrome.scripting.executeScript.
 const RECEIVER_MISSING = /Receiving end does not exist/i;
 
-const ensureContentScriptInTab = async (tabId: number): Promise<{ ok: boolean; error?: string }> => {
+const ensureContentScriptInTab = async (
+  tabId: number,
+): Promise<{ ok: boolean; error?: string }> => {
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
@@ -531,10 +541,7 @@ const autoSendOnceTabReady = (tabId: number, body: string): void => {
       }
     })();
   };
-  const listener = (
-    updatedTabId: number,
-    changeInfo: { readonly status?: string },
-  ): void => {
+  const listener = (updatedTabId: number, changeInfo: { readonly status?: string }): void => {
     if (updatedTabId !== tabId) {
       return;
     }
@@ -630,9 +637,10 @@ const runAutoSendDrain = async (threadId: string): Promise<boolean> => {
       }
     },
     findTabForThread: async (t) => await findTabForThread(t),
-    sendItemToTab: async (tabId, text) => {
+    sendItemToTab: async (tabId, text, itemId) => {
       const dispatch = await sendToContentScriptWithRecovery(tabId, {
         type: messageTypes.autoSendItem,
+        itemId,
         text,
         perItemTimeoutMs: 90_000,
       });
@@ -698,10 +706,14 @@ const currentTabThread = async (): Promise<TrackedThread | undefined> => {
 const buildState = async (
   companionStatus: WorkboardState['companionStatus'],
   lastError?: string,
-): Promise<WorkboardState> => ({
-  ...(await buildWorkboardState(companionStatus, lastError)),
-  currentTab: await currentTabThread(),
-});
+): Promise<WorkboardState> => {
+  const tab = await activeTab();
+  return {
+    ...(await buildWorkboardState(companionStatus, lastError)),
+    ...(tab?.url === undefined ? {} : { activeTabUrl: tab.url }),
+    currentTab: await currentTabThread(),
+  };
+};
 
 type WorkboardChangeReason =
   | 'capture'
@@ -1023,6 +1035,12 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
     return response;
   }
 
+  if (request.type === messageTypes.autoSendInterimReport) {
+    await updateLocalQueueItem(request.itemId, { progress: request.phase });
+    void broadcastWorkboardChanged('queue');
+    return { ok: true, state: await buildState('connected') };
+  }
+
   if (request.type === messageTypes.getWorkboardState) {
     // Side panel just polled for state — if the user is currently
     // staring at a tracked thread, drop any "Unread reply" pill for
@@ -1179,7 +1197,7 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
       // it starts polling. The token isn't persisted in the cache; it's
       // returned through the response envelope below.
       await refreshCachedCodingSessions();
-    await refreshCachedDispatches();
+      await refreshCachedDispatches();
       const status = await assertCompanionReachable();
       const state = await buildState(status);
       return { ok: true, state, attachToken };
@@ -1234,7 +1252,12 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
     return await withCompanionStatus(() => deleteLocalCaptureNote(noteId), 'mutation');
   }
 
-  await saveCollapsedSections(request.collapsedSections);
+  if (request.type === messageTypes.setCollapsedSections) {
+    await saveCollapsedSections(request.collapsedSections);
+    return await withCompanionStatus();
+  }
+
+  await saveCollapsedBuckets(request.collapsedBuckets);
   return await withCompanionStatus();
 };
 
@@ -1313,9 +1336,7 @@ export default defineBackground(() => {
   const dismissAndBroadcast = (): void => {
     void dismissRemindersForActiveTab()
       .then((changed) => {
-        if (changed) {
-          void broadcastWorkboardChanged('reminder');
-        }
+        void broadcastWorkboardChanged(changed ? 'reminder' : 'thread');
       })
       .catch(() => undefined);
   };
