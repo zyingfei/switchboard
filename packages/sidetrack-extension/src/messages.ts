@@ -12,7 +12,13 @@ import type {
   WorkstreamCreate,
   WorkstreamUpdate,
 } from './companion/model';
-import type { AllThreadsBucket, TrackingMode, WorkboardSection, WorkboardState } from './workboard';
+import type {
+  AllThreadsBucket,
+  PrivacyMode,
+  TrackingMode,
+  WorkboardSection,
+  WorkboardState,
+} from './workboard';
 
 export const messageTypes = {
   captureVisibleThread: 'sidetrack.capture.visible-thread',
@@ -24,6 +30,7 @@ export const messageTypes = {
   captureCurrentTab: 'sidetrack.capture.current-tab',
   createWorkstream: 'sidetrack.workstream.create',
   updateWorkstream: 'sidetrack.workstream.update',
+  bulkUpdateWorkstreamPrivacy: 'sidetrack.workstream.privacy.bulkUpdate',
   moveThread: 'sidetrack.thread.move',
   updateThreadTracking: 'sidetrack.thread.tracking.update',
   setThreadAutoSend: 'sidetrack.thread.autoSend.set',
@@ -65,6 +72,7 @@ export const messageTypes = {
   updateReminder: 'sidetrack.reminder.update',
   setCollapsedSections: 'sidetrack.sections.collapsed.set',
   setCollapsedBuckets: 'sidetrack.threadBuckets.collapsed.set',
+  setScreenShareMode: 'sidetrack.screenShareMode.set',
   workboardChanged: 'sidetrack.workboard.changed',
   createCodingAttachToken: 'sidetrack.coding.attach-token.create',
   detachCodingSession: 'sidetrack.coding.session.detach',
@@ -165,6 +173,11 @@ export type WorkboardRequest =
       readonly update: WorkstreamUpdate;
     }
   | {
+      readonly type: typeof messageTypes.bulkUpdateWorkstreamPrivacy;
+      readonly from: PrivacyMode;
+      readonly to: PrivacyMode;
+    }
+  | {
       readonly type: typeof messageTypes.moveThread;
       readonly threadId: string;
       readonly workstreamId: string;
@@ -232,6 +245,10 @@ export type WorkboardRequest =
   | {
       readonly type: typeof messageTypes.setCollapsedBuckets;
       readonly collapsedBuckets: readonly AllThreadsBucket[];
+    }
+  | {
+      readonly type: typeof messageTypes.setScreenShareMode;
+      readonly enabled: boolean;
     }
   | {
       readonly type: typeof messageTypes.createCodingAttachToken;
@@ -347,6 +364,13 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
     return typeof value.workstreamId === 'string' && isRecord(value.update);
   }
 
+  if (hasType(value, messageTypes.bulkUpdateWorkstreamPrivacy)) {
+    return (
+      (value.from === 'private' || value.from === 'shared' || value.from === 'public') &&
+      (value.to === 'private' || value.to === 'shared' || value.to === 'public')
+    );
+  }
+
   if (hasType(value, messageTypes.moveThread)) {
     return typeof value.threadId === 'string' && typeof value.workstreamId === 'string';
   }
@@ -428,6 +452,10 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
       Array.isArray(value.collapsedBuckets) &&
       value.collapsedBuckets.every((bucket) => typeof bucket === 'string')
     );
+  }
+
+  if (hasType(value, messageTypes.setScreenShareMode)) {
+    return typeof value.enabled === 'boolean';
   }
 
   if (hasType(value, messageTypes.createCodingAttachToken)) {

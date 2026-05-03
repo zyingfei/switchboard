@@ -21,6 +21,7 @@ import {
 } from '../../src/messages';
 import {
   CodingAttach,
+  AutoSendQueueRow,
   type ComposedPacket,
   DispatchConfirm,
   type DispatchEvent as RecentDispatchEvent,
@@ -114,6 +115,14 @@ const formatRelative = (isoDate: string): string => {
   return `${String(Math.round(hours / 24))} days ago`;
 };
 
+export const formatBuildTimestamp = (iso: string): string => {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) {
+    return iso;
+  }
+  return `${d.toISOString().slice(0, 10)} ${d.toISOString().slice(11, 16)}Z`;
+};
+
 const SETUP_COMPLETED_KEY = 'sidetrack:setupCompleted';
 
 const DEFAULT_VAULT_PATH = '~/Documents/Sidetrack-vault';
@@ -157,10 +166,16 @@ const buildWorkstreamOptions = (
     path: workstreamPath(workstream.bac_id, workstreams),
   }));
 
-const isThreadPrivate = (thread: TrackedThread, workstreams: readonly WorkstreamNode[]): boolean =>
+const isThreadPrivate = (
+  thread: TrackedThread,
+  workstreams: readonly WorkstreamNode[],
+  screenShareMode: boolean,
+): boolean =>
   workstreams.some(
     (workstream) =>
-      workstream.bac_id === thread.primaryWorkstreamId && workstream.privacy === 'private',
+      workstream.bac_id === thread.primaryWorkstreamId &&
+      (workstream.privacy === 'private' ||
+        (screenShareMode && workstream.screenShareSensitive === true)),
   );
 
 const visibleThreads = (threads: readonly TrackedThread[]): readonly TrackedThread[] =>
@@ -802,7 +817,7 @@ const App = () => {
       if ('create' in target) {
         const afterCreate = await sendRequest({
           type: messageTypes.createWorkstream,
-          workstream: { title: target.create, privacy: 'private' },
+          workstream: { title: target.create, privacy: 'shared' },
         });
         const created = afterCreate.workstreams.find(
           (workstream) => workstream.title === target.create && workstream.parentId === undefined,
@@ -903,6 +918,38 @@ const App = () => {
   // threadRowRefs / focusingThreadId machinery we ship for the
   // background-broadcast focus path. If the active tab isn't a
   // tracked thread, surface a banner.
+  const scrollAndFlashThread = (threadId: string, delayMs = 0): void => {
+    window.setTimeout(() => {
+      const node = threadRowRefs.current.get(threadId);
+      node?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      setFocusingThreadId(threadId);
+      window.setTimeout(() => {
+        setFocusingThreadId((prev) => (prev === threadId ? null : prev));
+      }, 1500);
+    }, delayMs);
+  };
+
+  const expandBucketForThread = async (thread: TrackedThread): Promise<void> => {
+    const bucket = classifyAllThread(thread, state.reminders);
+    if (!state.collapsedBuckets.includes(bucket)) {
+      return;
+    }
+    const collapsedBuckets = ALL_THREAD_BUCKET_ORDER.filter(
+      (candidate) => candidate !== bucket && state.collapsedBuckets.includes(candidate),
+    );
+    const next = await sendRequest({
+      type: messageTypes.setCollapsedBuckets,
+      collapsedBuckets,
+    });
+    setState(next);
+  };
+
+  const focusThreadInWorkstream = (thread: TrackedThread): void => {
+    setViewMode('workstream');
+    setCurrentWs(thread.primaryWorkstreamId ?? null);
+    scrollAndFlashThread(thread.bac_id, 120);
+  };
+
   const findActiveTabThread = (): void => {
     void (async () => {
       try {
@@ -920,12 +967,11 @@ const App = () => {
           return;
         }
         setFindPulseDismissedUrl(url);
-        const node = threadRowRefs.current.get(match.bac_id);
-        node?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        setFocusingThreadId(match.bac_id);
-        window.setTimeout(() => {
-          setFocusingThreadId((prev) => (prev === match.bac_id ? null : prev));
-        }, 1500);
+        if (viewMode === 'workstream' && match.primaryWorkstreamId !== currentWsId) {
+          setViewMode('all');
+        }
+        await expandBucketForThread(match);
+        scrollAndFlashThread(match.bac_id, 140);
       } catch (lookupError) {
         setError(
           lookupError instanceof Error
@@ -1479,6 +1525,17 @@ const App = () => {
     return buckets;
   })();
 
+  const currentWsThreadsByBucket = (() => {
+    const buckets = new Map<AllThreadsBucket, TrackedThread[]>(
+      ALL_THREAD_BUCKET_ORDER.map((b) => [b, []] as const),
+    );
+    for (const t of currentWsThreads) {
+      const bucket = classifyAllThread(t, state.reminders);
+      buckets.get(bucket)?.push(t);
+    }
+    return buckets;
+  })();
+
   const toggleThreadBucket = (bucket: AllThreadsBucket) => {
     const current = new Set(state.collapsedBuckets);
     if (current.has(bucket)) {
@@ -1517,7 +1574,7 @@ const App = () => {
       : attachedSessions.filter((s) => s.workstreamId === currentWsId);
   // Inline thread-row renderer reused across views.
   const renderThreadRow = (thread: TrackedThread) => {
-    const isPrivate = isThreadPrivate(thread, state.workstreams);
+    const isPrivate = isThreadPrivate(thread, state.workstreams, state.screenShareMode);
     const lifecycle = deriveLifecycle(thread, state.reminders);
     const { dotClass, stampLabel, lifecyclePill } = lifecycle;
     // Two timestamps when we have captured turns:
@@ -1542,9 +1599,10 @@ const App = () => {
             ? `synced ${formatRelative(thread.lastSeenAt)} · updated ${formatRelative(lastTurnAt)}`
             : `${stampLabel} · ${formatRelative(thread.lastSeenAt)}`;
     const titleDisplay = isPrivate ? '[private]' : thread.title;
-    const pendingQueueItems = state.queueItems.filter(
-      (q) => q.targetId === thread.bac_id && q.status === 'pending',
-    );
+    const pendingQueueItems = state.queueItems
+      .filter((q) => q.targetId === thread.bac_id && q.status === 'pending')
+      .slice()
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     const queuedCount = pendingQueueItems.length;
     const queueExpanded = queueExpandFor === thread.bac_id && queuedCount > 0;
     const childForks = state.threads.filter((t) => t.parentThreadId === thread.bac_id);
@@ -1576,12 +1634,8 @@ const App = () => {
           (isFocusing ? ' focusing' : '') +
           (draggingThreadId === thread.bac_id ? ' dragging' : '')
         }
-        draggable={viewMode === 'workstream'}
+        draggable
         onDragStart={(event) => {
-          if (viewMode !== 'workstream') {
-            event.preventDefault();
-            return;
-          }
           event.dataTransfer.effectAllowed = 'move';
           event.dataTransfer.setData('text/plain', thread.bac_id);
           setDraggingThreadId(thread.bac_id);
@@ -1653,6 +1707,25 @@ const App = () => {
             </span>
           ) : null}
         </div>
+        {viewMode === 'all' ? (
+          <button
+            type="button"
+            className="thread-ws-path mono"
+            title={
+              thread.primaryWorkstreamId === undefined
+                ? 'Switch to Ungrouped workstream view'
+                : 'Switch to this workstream'
+            }
+            onClick={(e) => {
+              e.stopPropagation();
+              focusThreadInWorkstream(thread);
+            }}
+          >
+            {thread.primaryWorkstreamId === undefined
+              ? 'Ungrouped'
+              : workstreamPath(thread.primaryWorkstreamId, state.workstreams)}
+          </button>
+        ) : null}
         {parent !== undefined || thread.parentTitle !== undefined ? (
           <div className="row2 thread-lineage" title="Branched from a tracked thread">
             <span className="lineage-arrow">↰</span>
@@ -1902,62 +1975,52 @@ const App = () => {
         ) : null}
         {queueExpanded ? (
           <ul className="thread-queue-list" aria-label="Queued follow-ups">
-            {pendingQueueItems.map((item) => (
-              <li key={item.bac_id} className="thread-queue-item">
-                <span className="thread-queue-text">{item.text}</span>
-                {item.progress !== undefined ? (
-                  <span className="queue-item-progress mono" role="status">
-                    {item.progress === 'typing' ? 'typing…' : 'waiting for reply…'}
-                  </span>
-                ) : null}
-                <span className="thread-queue-actions">
-                  <button
-                    type="button"
-                    className="btn-link"
-                    title="Copy this question to the clipboard"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      copyQueueItemText(item.bac_id, item.text);
-                    }}
-                  >
-                    {queueCopiedId === item.bac_id ? 'Copied' : 'Copy'}
-                  </button>
-                  {item.lastError !== undefined ? (
-                    <button
-                      type="button"
-                      className="btn-link thread-queue-retry"
-                      title="Try the auto-send drain again now"
-                      onClick={(e) => {
-                        e.stopPropagation();
+            {pendingQueueItems.some((item) => item.lastError !== undefined) ? (
+              <li className="queue-retry-all-row">
+                <button
+                  type="button"
+                  className="btn-link thread-queue-retry"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    pendingQueueItems
+                      .filter((item) => item.lastError !== undefined)
+                      .forEach((item) => {
                         void runAction(() =>
                           sendRequest({
                             type: messageTypes.retryAutoSend,
                             queueItemId: item.bac_id,
                           }),
                         );
-                      }}
-                    >
-                      Retry
-                    </button>
-                  ) : null}
-                  <button
-                    type="button"
-                    className="btn-link"
-                    title="Dismiss this queued follow-up"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      dismissQueueItem(item.bac_id);
-                    }}
-                  >
-                    Dismiss
-                  </button>
-                </span>
-                {item.lastError !== undefined ? (
-                  <span className="thread-queue-error" role="status">
-                    auto-send paused — {item.lastError}
-                  </span>
-                ) : null}
+                      });
+                  }}
+                >
+                  Retry all failed
+                </button>
               </li>
+            ) : null}
+            {pendingQueueItems.map((item, index) => (
+              <AutoSendQueueRow
+                key={item.bac_id}
+                item={item}
+                index={index}
+                total={pendingQueueItems.length}
+                providerLabel={providerLabel(thread.provider)}
+                copied={queueCopiedId === item.bac_id}
+                onCopy={() => {
+                  copyQueueItemText(item.bac_id, item.text);
+                }}
+                onRetry={() => {
+                  void runAction(() =>
+                    sendRequest({
+                      type: messageTypes.retryAutoSend,
+                      queueItemId: item.bac_id,
+                    }),
+                  );
+                }}
+                onDismiss={() => {
+                  dismissQueueItem(item.bac_id);
+                }}
+              />
             ))}
           </ul>
         ) : null}
@@ -2201,6 +2264,26 @@ const App = () => {
         </div>
         <div className="app-actions">
           <button
+            className={'icon-btn' + (state.screenShareMode ? ' on' : '')}
+            title="Screenshare mode — mask sensitive workstreams"
+            onClick={() => {
+              void runAction(() =>
+                sendRequest({
+                  type: messageTypes.setScreenShareMode,
+                  enabled: !state.screenShareMode,
+                }),
+              );
+            }}
+            type="button"
+            aria-label="Toggle screenshare mode"
+            aria-pressed={state.screenShareMode}
+          >
+            <svg viewBox="0 0 24 24">
+              <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z" />
+              <circle cx="12" cy="12" r="3" />
+            </svg>
+          </button>
+          <button
             className={'icon-btn' + (findIconPulsing ? ' pulsing' : '')}
             title="Find this tab in the side panel — scrolls + flashes the matching thread row"
             onClick={findActiveTabThread}
@@ -2262,55 +2345,52 @@ const App = () => {
       </div>
 
       {viewMode === 'workstream' ? (
-        <>
-          <WorkstreamBar
-            currentWsLabel={currentWsLabel}
-            statusLabel={companionStatusLabel(state.companionStatus)}
-            onOpenPicker={() => {
-              setWsPickerOpen(true);
-            }}
-            onAddSubWorkstream={() => {
-              setWsPickerOpen(true);
-              setWsPickerCreateMode(true);
-            }}
-          />
-          <div className="ws-drop-strip" aria-label="Drop thread on a workstream">
-            {state.workstreams.map((workstream) => (
-              <button
-                type="button"
-                key={workstream.bac_id}
-                className={
-                  'ws-picker-pill' +
-                  (workstream.bac_id === currentWsId ? ' current' : '') +
-                  (dropWorkstreamId === workstream.bac_id ? ' drop-target' : '')
-                }
-                onClick={() => {
-                  setCurrentWs(workstream.bac_id);
-                }}
-                onDragOver={(event) => {
-                  allowThreadDrop(event, workstream.bac_id);
-                }}
-                onDragLeave={() => {
-                  setDropWorkstreamId((current) =>
-                    current === workstream.bac_id ? null : current,
-                  );
-                }}
-                onDrop={(event) => {
-                  event.preventDefault();
-                  handleThreadDrop(workstream.bac_id);
-                }}
-              >
-                {workstream.title}
-              </button>
-            ))}
-          </div>
-        </>
+        <WorkstreamBar
+          currentWsLabel={currentWsLabel}
+          statusLabel={companionStatusLabel(state.companionStatus)}
+          onOpenPicker={() => {
+            setWsPickerOpen(true);
+          }}
+          onAddSubWorkstream={() => {
+            setWsPickerOpen(true);
+            setWsPickerCreateMode(true);
+          }}
+        />
       ) : (
         <div className="ws-bar all-bar">
           <span className="lbl">All threads</span>
           <span className="ws-status mono">{companionStatusLabel(state.companionStatus)}</span>
         </div>
       )}
+
+      <div className="ws-drop-strip" aria-label="Drop thread on a workstream">
+        {state.workstreams.map((workstream) => (
+          <button
+            type="button"
+            key={workstream.bac_id}
+            className={
+              'ws-picker-pill' +
+              (workstream.bac_id === currentWsId ? ' current' : '') +
+              (dropWorkstreamId === workstream.bac_id ? ' drop-target' : '')
+            }
+            onClick={() => {
+              setCurrentWs(workstream.bac_id);
+            }}
+            onDragOver={(event) => {
+              allowThreadDrop(event, workstream.bac_id);
+            }}
+            onDragLeave={() => {
+              setDropWorkstreamId((current) => (current === workstream.bac_id ? null : current));
+            }}
+            onDrop={(event) => {
+              event.preventDefault();
+              handleThreadDrop(workstream.bac_id);
+            }}
+          >
+            {workstream.title}
+          </button>
+        ))}
+      </div>
 
       {wsPickerOpen ? (
         <WorkstreamPicker
@@ -2334,7 +2414,7 @@ const App = () => {
                 workstream: {
                   title,
                   ...(parentId === null ? {} : { parentId }),
-                  privacy: 'private',
+                  privacy: 'shared',
                 },
               });
             }).then(() => {
@@ -2397,7 +2477,39 @@ const App = () => {
               </div>
             ) : null}
             {currentWsCodingSessions.map(renderCodingSessionRow)}
-            {currentWsThreads.map(renderThreadRow)}
+            {ALL_THREAD_BUCKET_ORDER.map((bucket) => {
+              const list = currentWsThreadsByBucket.get(bucket) ?? [];
+              if (list.length === 0) {
+                return null;
+              }
+              const collapsed = state.collapsedBuckets.includes(bucket);
+              return (
+                <div
+                  className={
+                    'thread-bucket thread-bucket-' + bucket + (collapsed ? ' collapsed' : '')
+                  }
+                  key={bucket}
+                >
+                  <button
+                    type="button"
+                    className="thread-bucket-head"
+                    aria-expanded={!collapsed}
+                    onClick={() => {
+                      toggleThreadBucket(bucket);
+                    }}
+                  >
+                    <span className="thread-bucket-label">
+                      <span className="thread-bucket-chevron" aria-hidden>
+                        {collapsed ? '▸' : '▾'}
+                      </span>
+                      {ALL_THREAD_BUCKET_LABEL[bucket]}
+                    </span>
+                    <span className="thread-bucket-count mono">{String(list.length)}</span>
+                  </button>
+                  {collapsed ? null : <div className="thread-list">{list.map(renderThreadRow)}</div>}
+                </div>
+              );
+            })}
           </div>
         </>
       ) : (
@@ -2715,14 +2827,7 @@ const App = () => {
           wxt.config.ts. */}
       <div className="build-version mono" title="Sidetrack build identity">
         v{__BUILD_INFO__.version} · {__BUILD_INFO__.sha} · built{' '}
-        {(() => {
-          try {
-            const d = new Date(__BUILD_INFO__.builtAt);
-            return d.toISOString().slice(11, 16) + ' UTC';
-          } catch {
-            return __BUILD_INFO__.builtAt;
-          }
-        })()}
+        {formatBuildTimestamp(__BUILD_INFO__.builtAt)}
       </div>
 
       {moveThread ? (
@@ -3203,6 +3308,8 @@ const App = () => {
             vaultPath: state.vaultPath ?? '',
           }}
           companionConfigured={bridgeKey.length > 0}
+          workstreams={state.workstreams}
+          screenShareMode={state.screenShareMode}
           onSaveLocalPreferences={(next) => {
             void runAction(() =>
               sendRequest({ type: messageTypes.saveLocalPreferences, preferences: next }),
@@ -3228,6 +3335,35 @@ const App = () => {
           }}
           onDeleteThread={(threadId) => {
             updateTracking(threadId, 'removed');
+          }}
+          onBulkUpdateWorkstreamPrivacy={() => {
+            void runAction(() =>
+              sendRequest({
+                type: messageTypes.bulkUpdateWorkstreamPrivacy,
+                from: 'private',
+                to: 'shared',
+              }),
+            );
+          }}
+          onToggleWorkstreamSensitive={(workstream, sensitive) => {
+            void runAction(() =>
+              sendRequest({
+                type: messageTypes.updateWorkstream,
+                workstreamId: workstream.bac_id,
+                update: {
+                  revision: workstream.revision,
+                  screenShareSensitive: sensitive,
+                },
+              }),
+            );
+          }}
+          onSetScreenShareMode={(enabled) => {
+            void runAction(() =>
+              sendRequest({
+                type: messageTypes.setScreenShareMode,
+                enabled,
+              }),
+            );
           }}
           onConnectCompanion={() => {
             // Switch from local-only → companion-backed by re-opening

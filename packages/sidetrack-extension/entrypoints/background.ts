@@ -41,6 +41,7 @@ import {
   readCachedDispatches,
   readDispatchLinks,
   readQueueItems,
+  readWorkstreams,
   readThreads,
   readSettings,
   recordSelectorCanary,
@@ -48,6 +49,7 @@ import {
   saveCompanionSettings,
   saveCollapsedBuckets,
   saveCollapsedSections,
+  saveScreenShareMode,
   saveVaultPath,
   updateLocalCaptureNote,
   updateLocalQueueItem,
@@ -842,6 +844,26 @@ const updateWorkstream = async (workstreamId: string, update: WorkstreamUpdate):
   }
 };
 
+const bulkUpdateWorkstreamPrivacy = async (
+  from: WorkstreamUpdate['privacy'],
+  to: WorkstreamUpdate['privacy'],
+): Promise<void> => {
+  if (from === undefined || to === undefined || from === to) {
+    return;
+  }
+  const workstreams = await readWorkstreams();
+  await Promise.all(
+    workstreams
+      .filter((workstream) => workstream.privacy === from)
+      .map(async (workstream) => {
+        await updateWorkstream(workstream.bac_id, {
+          revision: workstream.revision,
+          privacy: to,
+        });
+      }),
+  );
+};
+
 const createQueueItem = async (item: QueueCreate): Promise<void> => {
   if (!(await isCompanionConfigured())) {
     await createLocalQueueItem(item);
@@ -1070,6 +1092,13 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
     );
   }
 
+  if (request.type === messageTypes.bulkUpdateWorkstreamPrivacy) {
+    return await withCompanionStatus(
+      () => bulkUpdateWorkstreamPrivacy(request.from, request.to),
+      'workstream',
+    );
+  }
+
   if (request.type === messageTypes.queueFollowUp) {
     return await withCompanionStatus(() => createQueueItem(request.item), 'queue');
   }
@@ -1173,6 +1202,11 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
         triggerAutoSendDrain(request.threadId);
       }
     }, 'thread');
+  }
+
+  if (request.type === messageTypes.setScreenShareMode) {
+    await saveScreenShareMode(request.enabled);
+    return await withCompanionStatus();
   }
 
   if (request.type === messageTypes.restoreThreadTab) {

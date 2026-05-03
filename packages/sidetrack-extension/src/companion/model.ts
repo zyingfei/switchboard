@@ -98,6 +98,7 @@ export interface WorkstreamCreate {
   readonly title: string;
   readonly parentId?: string;
   readonly privacy?: 'private' | 'shared' | 'public';
+  readonly screenShareSensitive?: boolean;
   readonly tags?: readonly string[];
 }
 
@@ -114,6 +115,7 @@ export interface WorkstreamUpdate {
   readonly title?: string;
   readonly parentId?: string;
   readonly privacy?: 'private' | 'shared' | 'public';
+  readonly screenShareSensitive?: boolean;
   readonly tags?: readonly string[];
   readonly children?: readonly string[];
   readonly checklist?: readonly ChecklistItem[];

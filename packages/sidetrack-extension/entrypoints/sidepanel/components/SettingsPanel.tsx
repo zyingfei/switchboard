@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import type { WorkstreamNode } from '../../../src/workboard';
 import { Modal } from './Modal';
 
 export type SettingsPacketKind = 'research' | 'review' | 'coding' | 'note' | 'other';
@@ -41,6 +42,8 @@ export interface SettingsPanelProps {
   readonly localPreferences: LocalPreferences;
   readonly companionConfigured: boolean;
   readonly archivedThreads: readonly ArchivedThreadRow[];
+  readonly workstreams: readonly WorkstreamNode[];
+  readonly screenShareMode: boolean;
   readonly busy: boolean;
   readonly error?: string | null;
   readonly onClose: () => void;
@@ -57,6 +60,9 @@ export interface SettingsPanelProps {
   readonly onRestoreThread: (threadId: string) => void;
   readonly onDeleteThread: (threadId: string) => void;
   readonly onConnectCompanion?: () => void;
+  readonly onBulkUpdateWorkstreamPrivacy: () => void;
+  readonly onToggleWorkstreamSensitive: (workstream: WorkstreamNode, sensitive: boolean) => void;
+  readonly onSetScreenShareMode: (enabled: boolean) => void;
 }
 
 const PROVIDER_LABELS: Record<keyof SettingsValue['autoSendOptIn'], string> = {
@@ -88,6 +94,8 @@ export function SettingsPanel({
   localPreferences,
   companionConfigured,
   archivedThreads,
+  workstreams,
+  screenShareMode,
   busy,
   error,
   onClose,
@@ -96,6 +104,9 @@ export function SettingsPanel({
   onRestoreThread,
   onDeleteThread,
   onConnectCompanion,
+  onBulkUpdateWorkstreamPrivacy,
+  onToggleWorkstreamSensitive,
+  onSetScreenShareMode,
 }: SettingsPanelProps) {
   const initial: SettingsValue = settings ?? {
     autoSendOptIn: { chatgpt: false, claude: false, gemini: false },
@@ -126,6 +137,7 @@ export function SettingsPanel({
     draftAutoTrack !== localPreferences.autoTrack ||
     draftVaultPath.trim() !== localPreferences.vaultPath.trim();
   const dirty = companionDirty || localDirty;
+  const privateWorkstreams = workstreams.filter((workstream) => workstream.privacy === 'private');
 
   const handleToggleProvider = (provider: keyof SettingsValue['autoSendOptIn']) => {
     setDraftAutoSend({ ...draftAutoSend, [provider]: !draftAutoSend[provider] });
@@ -363,6 +375,84 @@ export function SettingsPanel({
             </span>
           </span>
         </label>
+      </div>
+
+      <div className="settings-section">
+        <h3 className="settings-section-title">Workstream privacy</h3>
+        <p className="settings-section-lede ai-italic">
+          Private workstreams always mask thread titles. Sensitive workstreams only mask when
+          screenshare mode is on.
+        </p>
+        <label className={'switch ' + (screenShareMode ? 'on' : '')}>
+          <input
+            type="checkbox"
+            checked={screenShareMode}
+            disabled={busy}
+            onChange={() => {
+              onSetScreenShareMode(!screenShareMode);
+            }}
+          />
+          <span className="knob" />
+          <span className="lbl">
+            Screenshare mode
+            <span className="desc mono">{screenShareMode ? 'masking sensitive rows' : 'off'}</span>
+          </span>
+        </label>
+        <div className="settings-privacy-actions">
+          <span className="settings-hint mono">
+            {String(privateWorkstreams.length)} private workstream
+            {privateWorkstreams.length === 1 ? '' : 's'}
+          </span>
+          <button
+            type="button"
+            className="btn btn-ghost"
+            disabled={busy || privateWorkstreams.length === 0}
+            onClick={() => {
+              if (
+                window.confirm(
+                  `Mark ${String(privateWorkstreams.length)} private workstream${
+                    privateWorkstreams.length === 1 ? '' : 's'
+                  } as shared? Thread titles in those workstreams will be unmasked.`,
+                )
+              ) {
+                onBulkUpdateWorkstreamPrivacy();
+              }
+            }}
+          >
+            Mark all workstreams as shared ({String(privateWorkstreams.length)})
+          </button>
+        </div>
+        {workstreams.length === 0 ? (
+          <p className="settings-hint mono">No workstreams yet.</p>
+        ) : (
+          <ul className="settings-workstream-list">
+            {workstreams.map((workstream) => (
+              <li key={workstream.bac_id} className="settings-workstream-row">
+                <div>
+                  <div className="settings-workstream-title">{workstream.title}</div>
+                  <div className="settings-workstream-sub mono">
+                    {workstream.privacy}
+                    {workstream.screenShareSensitive === true ? ' · screenshare sensitive' : ''}
+                  </div>
+                </div>
+                <label className="settings-mini-check mono">
+                  <input
+                    type="checkbox"
+                    checked={workstream.screenShareSensitive === true}
+                    disabled={busy || workstream.privacy === 'private'}
+                    onChange={() => {
+                      onToggleWorkstreamSensitive(
+                        workstream,
+                        workstream.screenShareSensitive !== true,
+                      );
+                    }}
+                  />
+                  Sensitive
+                </label>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
 
       <div className="settings-section">
