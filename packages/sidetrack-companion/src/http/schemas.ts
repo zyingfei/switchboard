@@ -39,6 +39,19 @@ const redactionSummarySchema = z.object({
   categories: z.array(z.string().min(1)),
 });
 
+export const serializedAnchorSchema = z.object({
+  textQuote: z.object({
+    exact: z.string(),
+    prefix: z.string(),
+    suffix: z.string(),
+  }),
+  textPosition: z.object({
+    start: z.number().int().nonnegative(),
+    end: z.number().int().nonnegative(),
+  }),
+  cssSelector: z.string(),
+});
+
 export const captureEventSchema = z.object({
   provider: providerSchema,
   threadId: z.string().min(1).optional(),
@@ -263,6 +276,24 @@ export const dispatchListQuerySchema = z.object({
   since: isoDateTimeSchema.optional(),
 });
 
+export const auditEventSchema = z.object({
+  requestId: z.string().min(1),
+  route: z.string().min(1),
+  outcome: z.enum(['success', 'failure']),
+  bac_id: z.string().min(1).optional(),
+  timestamp: isoDateTimeSchema,
+});
+
+export const auditListQuerySchema = z.object({
+  limit: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .transform((limit) => Math.min(limit ?? 20, 100)),
+  since: isoDateTimeSchema.optional(),
+});
+
 export const reviewListQuerySchema = z.object({
   limit: z.coerce
     .number()
@@ -294,6 +325,54 @@ export const turnRecordSchema = z.object({
   sourceSelector: z.string().min(1).optional(),
 });
 
+export const annotationCreateSchema = z.object({
+  url: z.url(),
+  pageTitle: z.string().min(1),
+  anchor: serializedAnchorSchema,
+  note: z.string(),
+});
+
+export const annotationListQuerySchema = z.object({
+  url: z.url().optional(),
+  limit: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .transform((limit) => Math.min(limit ?? 100, 100)),
+});
+
+export const recallIndexSchema = z.object({
+  items: z.array(
+    z.object({
+      id: z.string().min(1),
+      threadId: z.string().min(1),
+      capturedAt: isoDateTimeSchema,
+      text: z.string().min(1),
+    }),
+  ),
+});
+
+export const recallQuerySchema = z.object({
+  q: z.string().min(1),
+  limit: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .transform((limit) => Math.min(limit ?? 10, 50)),
+  workstreamId: bacIdSchema.optional(),
+});
+
+export const suggestionQuerySchema = z.object({
+  limit: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .transform((limit) => Math.min(limit ?? 5, 20)),
+});
+
 export type CaptureEventInput = z.infer<typeof captureEventSchema>;
 export type ThreadUpsertInput = z.infer<typeof threadUpsertSchema>;
 export type WorkstreamCreateInput = z.infer<typeof workstreamCreateSchema>;
@@ -304,6 +383,8 @@ export type ReminderUpdateInput = z.infer<typeof reminderUpdateSchema>;
 export type DispatchEventInput = z.infer<typeof dispatchEventSchema>;
 export type DispatchEventRecord = z.infer<typeof dispatchEventRecordSchema>;
 export type DispatchListQuery = z.infer<typeof dispatchListQuerySchema>;
+export type AuditEventRecord = z.infer<typeof auditEventSchema>;
+export type AuditListQuery = z.infer<typeof auditListQuerySchema>;
 export type SettingsDocument = z.infer<typeof settingsDocumentSchema>;
 export type SettingsPatchInput = z.infer<typeof settingsPatchSchema>;
 export type ReviewEventInput = z.infer<typeof reviewEventSchema>;
@@ -311,6 +392,12 @@ export type ReviewEvent = z.infer<typeof reviewEventRecordSchema>;
 export type ReviewListQuery = z.infer<typeof reviewListQuerySchema>;
 export type TurnsQuery = z.infer<typeof turnsQuerySchema>;
 export type TurnRecord = z.infer<typeof turnRecordSchema>;
+export type SerializedAnchor = z.infer<typeof serializedAnchorSchema>;
+export type AnnotationCreateInput = z.infer<typeof annotationCreateSchema>;
+export type AnnotationListQuery = z.infer<typeof annotationListQuerySchema>;
+export type RecallIndexInput = z.infer<typeof recallIndexSchema>;
+export type RecallQuery = z.infer<typeof recallQuerySchema>;
+export type SuggestionQuery = z.infer<typeof suggestionQuerySchema>;
 export type CodingTool = z.infer<typeof codingToolSchema>;
 export type CodingAttachTokenCreateInput = z.infer<typeof codingAttachTokenCreateSchema>;
 export type CodingAttachTokenRecord = z.infer<typeof codingAttachTokenSchema>;

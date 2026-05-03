@@ -13,6 +13,7 @@ import {
 } from './markdownProjection.js';
 import {
   captureEventSchema,
+  auditEventSchema,
   codingAttachTokenSchema,
   codingSessionSchema,
   dispatchEventRecordSchema,
@@ -20,6 +21,8 @@ import {
   settingsDocumentSchema,
 } from '../http/schemas.js';
 import type {
+  AuditEventRecord,
+  AuditListQuery,
   CaptureEventInput,
   CodingAttachTokenCreateInput,
   CodingAttachTokenRecord,
@@ -90,6 +93,7 @@ export interface VaultWriter {
   readonly readDispatchEvents: (
     query: DispatchListQuery,
   ) => Promise<readonly DispatchEventRecord[]>;
+  readonly readAuditEvents: (query: AuditListQuery) => Promise<readonly AuditEventRecord[]>;
   readonly writeReviewEvent: (
     input: ReviewEvent,
     requestId: string,
@@ -253,6 +257,29 @@ const readDispatchFile = async (path: string): Promise<readonly DispatchEventRec
     .split('\n')
     .map(parseDispatchLine)
     .filter((event): event is DispatchEventRecord => event !== undefined);
+};
+
+const parseAuditLine = (line: string): AuditEventRecord | undefined => {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    const result = auditEventSchema.safeParse(parsed);
+    return result.success ? result.data : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const readAuditFile = async (path: string): Promise<readonly AuditEventRecord[]> => {
+  const raw = await readFile(path, 'utf8');
+  return raw
+    .split('\n')
+    .map(parseAuditLine)
+    .filter((event): event is AuditEventRecord => event !== undefined);
 };
 
 const parseReviewLine = (line: string): ReviewEvent | undefined => {
@@ -458,6 +485,38 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
       return events
         .filter((event) => sinceMillis === undefined || Date.parse(event.createdAt) >= sinceMillis)
         .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+        .slice(0, query.limit);
+    },
+
+    async readAuditEvents(query) {
+      await ensureVaultPresent();
+      const auditRoot = join(bacRoot, 'audit');
+      let names: string[];
+
+      try {
+        names = await readdir(auditRoot);
+      } catch (error) {
+        if (isMissingPathError(error)) {
+          return [];
+        }
+        throw error;
+      }
+
+      const sinceMillis = query.since === undefined ? undefined : Date.parse(query.since);
+      const events = (
+        await Promise.all(
+          names
+            .filter((name) => /^\d{4}-\d{2}-\d{2}\.jsonl$/u.test(name))
+            .sort()
+            .reverse()
+            .slice(0, 100)
+            .map((name) => readAuditFile(join(auditRoot, name))),
+        )
+      ).flat();
+
+      return events
+        .filter((event) => sinceMillis === undefined || Date.parse(event.timestamp) >= sinceMillis)
+        .sort((left, right) => right.timestamp.localeCompare(left.timestamp))
         .slice(0, query.limit);
     },
 

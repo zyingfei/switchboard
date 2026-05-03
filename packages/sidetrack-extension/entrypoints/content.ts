@@ -1,5 +1,7 @@
 import { defineContentScript } from 'wxt/utils/define-content-script';
 
+import { findAnchor } from '../src/annotation/anchors';
+import { createAnnotationClient } from '../src/annotation/client';
 import { captureVisibleConversation } from '../src/capture/extractors';
 import { detectProviderFromUrl, isProviderThreadUrl } from '../src/capture/providerDetection';
 import { messageTypes, type ContentRequest, type ContentResponse } from '../src/messages';
@@ -191,6 +193,25 @@ export default defineContentScript({
         title: document.title,
       });
 
+    const restoreAnnotations = async (): Promise<void> => {
+      try {
+        const client = await createAnnotationClient();
+        if (client === undefined) {
+          return;
+        }
+        const annotations = await client.listAnnotationsForUrl(window.location.href);
+        for (const annotation of annotations) {
+          const range = findAnchor(document.documentElement, annotation.anchor);
+          if (range !== null) {
+            // eslint-disable-next-line no-console
+            console.info('sidetrack:anchor-restored', { id: annotation.bac_id, range });
+          }
+        }
+      } catch {
+        // Restore is best-effort and must never disturb the host page.
+      }
+    };
+
     const captureSignature = (capture: ReturnType<typeof createCapture>): string => {
       const lastTurn = capture.turns.at(-1);
       return `${capture.provider}:${capture.threadUrl}:${String(capture.turns.length)}:${lastTurn?.role ?? ''}:${lastTurn?.text.slice(0, 120) ?? ''}`;
@@ -299,6 +320,9 @@ export default defineContentScript({
     );
 
     window.setTimeout(reportSelectorCanary, 1_200);
+    window.setTimeout(() => {
+      void restoreAnnotations();
+    }, 1_500);
     window.setTimeout(sendAutoCapture, 3_000);
     new MutationObserver(scheduleAutoCapture).observe(document.body, {
       childList: true,
