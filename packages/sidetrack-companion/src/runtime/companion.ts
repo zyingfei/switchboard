@@ -29,6 +29,7 @@ export const startCompanion = async (
   const server = createCompanionHttpServer({
     bridgeKey: ensured.key,
     vaultWriter,
+    vaultRoot: options.vaultPath,
     idempotencyStore: createIdempotencyStore(options.vaultPath),
   });
   const started: StartedHttpServer = await startHttpServer(server, options.port);

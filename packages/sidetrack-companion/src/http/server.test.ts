@@ -119,6 +119,7 @@ describe('companion HTTP server', () => {
     context = {
       bridgeKey,
       vaultWriter: createVaultWriter(vaultPath),
+      vaultRoot: vaultPath,
       idempotencyStore: createIdempotencyStore(vaultPath),
     };
   });
@@ -472,6 +473,75 @@ describe('companion HTTP server', () => {
     );
     expect(dispatchLog).not.toContain(githubToken);
     expect(dispatchLog).not.toContain('owner@example.com');
+  });
+
+  it('lists audit events with limit and since filters', async () => {
+    const createdAt = '2026-04-26T22:00:00.000Z';
+    await jsonFetch(context, `${baseUrl}/v1/dispatches`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'dispatch-audit-list',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        kind: 'research',
+        target: { provider: 'chatgpt', mode: 'paste' },
+        title: 'Dispatch packet',
+        body: 'Audit me',
+        createdAt,
+      }),
+    });
+
+    const result = await jsonFetch(
+      context,
+      `${baseUrl}/v1/audit?limit=1&since=2026-04-26T00:00:00.000Z`,
+      { headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({
+      data: [
+        {
+          route: 'recordDispatch',
+          outcome: 'success',
+        },
+      ],
+    });
+  });
+
+  it('creates and lists annotations', async () => {
+    const anchor = {
+      textQuote: { exact: 'hello', prefix: '', suffix: '' },
+      textPosition: { start: 0, end: 5 },
+      cssSelector: 'body',
+    };
+    const create = await jsonFetch(context, `${baseUrl}/v1/annotations`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'annotation-create-001',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        url: 'https://example.test/page',
+        pageTitle: 'Page',
+        anchor,
+        note: 'Remember this',
+      }),
+    });
+    const list = await jsonFetch(
+      context,
+      `${baseUrl}/v1/annotations?url=${encodeURIComponent('https://example.test/page')}`,
+      { headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+
+    expect(create.status).toBe(201);
+    expect(create.body).toMatchObject({ data: { url: 'https://example.test/page', anchor } });
+    expect(list.status).toBe(200);
+    expect(list.body).toMatchObject({
+      data: [{ url: 'https://example.test/page', note: 'Remember this' }],
+    });
   });
 
   it('replays idempotent dispatch responses without duplicating dispatch lines', async () => {
@@ -873,6 +943,35 @@ describe('companion HTTP server', () => {
     ) as { readonly privacy?: string; readonly screenShareSensitive?: boolean };
     expect(updated.privacy).toBe('shared');
     expect(updated.screenShareSensitive).toBe(true);
+  });
+
+  it('lists human-authored notes linked to a workstream', async () => {
+    const workstreamResult = await jsonFetch(context, `${baseUrl}/v1/workstreams`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({ title: 'Linked notes' }),
+    });
+    const workstreamId = (workstreamResult.body as { readonly data: { readonly bac_id: string } })
+      .data.bac_id;
+    await writeFile(
+      join(vaultPath, 'research.md'),
+      `---\ntitle: Human note\nbac_workstream: ${workstreamId}\n---\n\nThe body is not parsed.`,
+      'utf8',
+    );
+
+    const result = await jsonFetch(
+      context,
+      `${baseUrl}/v1/workstreams/${workstreamId}/linked-notes`,
+      { headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({
+      items: [{ workstreamId, notePath: 'research.md', title: 'Human note' }],
+    });
   });
 
   it('writes rich promoted-thread Markdown once and preserves later projections', async () => {

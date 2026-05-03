@@ -38,6 +38,30 @@ export interface CompanionWriteClient {
     readonly scope: 'thread' | 'workstream' | 'global';
     readonly targetId?: string;
   }) => Promise<{ readonly bac_id: string; readonly revision: string }>;
+  readonly listDispatches?: (input: {
+    readonly limit?: number;
+    readonly since?: string;
+  }) => Promise<readonly unknown[]>;
+  readonly listAuditEvents?: (input: {
+    readonly limit?: number;
+    readonly since?: string;
+  }) => Promise<readonly unknown[]>;
+  readonly listWorkstreamNotes?: (input: {
+    readonly workstreamId: string;
+  }) => Promise<readonly unknown[]>;
+  readonly listAnnotations?: (input: {
+    readonly url?: string;
+    readonly limit?: number;
+  }) => Promise<readonly unknown[]>;
+  readonly recall?: (input: {
+    readonly query: string;
+    readonly limit?: number;
+    readonly workstreamId?: string;
+  }) => Promise<readonly unknown[]>;
+  readonly suggestWorkstream?: (input: {
+    readonly threadId: string;
+    readonly limit?: number;
+  }) => Promise<readonly unknown[]>;
 }
 
 export interface SidetrackMcpReader {
@@ -374,6 +398,144 @@ export const createSidetrackMcpServer = (
         revision: result.revision,
         queuedAt: new Date().toISOString(),
       });
+    },
+  );
+
+  server.registerTool(
+    'bac.list_dispatches',
+    {
+      description:
+        'Return recent dispatch events through the bridge-authenticated companion API.',
+      inputSchema: {
+        limit: z.number().int().positive().max(100).optional(),
+        since: z.iso.datetime().optional(),
+      },
+    },
+    async ({ limit, since }) => {
+      if (companionClient?.listDispatches === undefined) {
+        throw new Error(
+          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.list_dispatches is unavailable.',
+        );
+      }
+      const data = await companionClient.listDispatches({
+        ...(limit === undefined ? {} : { limit }),
+        ...(since === undefined ? {} : { since }),
+      });
+      return asStructuredContent({ data: [...data] });
+    },
+  );
+
+  server.registerTool(
+    'bac.list_audit_events',
+    {
+      description: 'Return recent companion audit events through the companion API.',
+      inputSchema: {
+        limit: z.number().int().positive().max(100).optional(),
+        since: z.iso.datetime().optional(),
+      },
+    },
+    async ({ limit, since }) => {
+      if (companionClient?.listAuditEvents === undefined) {
+        throw new Error(
+          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.list_audit_events is unavailable.',
+        );
+      }
+      const data = await companionClient.listAuditEvents({
+        ...(limit === undefined ? {} : { limit }),
+        ...(since === undefined ? {} : { since }),
+      });
+      return asStructuredContent({ data: [...data] });
+    },
+  );
+
+  server.registerTool(
+    'bac.list_workstream_notes',
+    {
+      description:
+        'Return human-authored markdown notes whose frontmatter links to a workstream.',
+      inputSchema: {
+        workstreamId: z.string().min(1),
+      },
+    },
+    async ({ workstreamId }) => {
+      if (companionClient?.listWorkstreamNotes === undefined) {
+        throw new Error(
+          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.list_workstream_notes is unavailable.',
+        );
+      }
+      const items = await companionClient.listWorkstreamNotes({ workstreamId });
+      return asStructuredContent({ items: [...items] });
+    },
+  );
+
+  server.registerTool(
+    'bac.list_annotations',
+    {
+      description: 'Return persisted web annotations, optionally filtered by URL.',
+      inputSchema: {
+        url: z.url().optional(),
+        limit: z.number().int().positive().max(100).optional(),
+      },
+    },
+    async ({ url, limit }) => {
+      if (companionClient?.listAnnotations === undefined) {
+        throw new Error(
+          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.list_annotations is unavailable.',
+        );
+      }
+      const data = await companionClient.listAnnotations({
+        ...(url === undefined ? {} : { url }),
+        ...(limit === undefined ? {} : { limit }),
+      });
+      return asStructuredContent({ data: [...data] });
+    },
+  );
+
+  server.registerTool(
+    'bac.recall',
+    {
+      description: 'Run companion-backed vector recall over captured turns.',
+      inputSchema: {
+        query: z.string().min(1),
+        limit: z.number().int().positive().max(50).optional(),
+        workstreamId: z.string().min(1).optional(),
+      },
+    },
+    async ({ query, limit, workstreamId }) => {
+      if (companionClient?.recall === undefined) {
+        throw new Error(
+          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.recall is unavailable.',
+        );
+      }
+      const data = await companionClient.recall({
+        query,
+        ...(limit === undefined ? {} : { limit }),
+        ...(workstreamId === undefined ? {} : { workstreamId }),
+      });
+      return asStructuredContent({ data: [...data] });
+    },
+  );
+
+  server.registerTool(
+    'bac.suggest_workstream',
+    {
+      description: 'Score likely workstreams for a tracked thread without auto-applying.',
+      inputSchema: {
+        threadId: z.string().min(1),
+        limit: z.number().int().positive().max(20).optional(),
+      },
+    },
+    async ({ threadId, limit }) => {
+      if (companionClient?.suggestWorkstream === undefined) {
+        throw new Error(
+          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.suggest_workstream is unavailable.',
+        );
+      }
+      const data = await companionClient.suggestWorkstream({
+        threadId,
+        ...(limit === undefined ? {} : { limit }),
+      });
+      return asStructuredContent({ data: [...data] });
     },
   );
 

@@ -19,6 +19,7 @@ import type {
   WorkstreamUpdate,
 } from '../src/companion/model';
 import { drainQueue, enqueueCapture } from '../src/companion/queue';
+import { createRecallClient } from '../src/companion/recallClient';
 import {
   isContentResponse,
   isRuntimeRequest,
@@ -254,6 +255,23 @@ const sendToCompanion = async (
     ...(lastTurnRole === undefined ? {} : { lastTurnRole }),
   };
   const threadResult = await client.upsertThread(thread);
+  const lastIndexableTurn = event.turns.at(-1);
+  if (lastIndexableTurn !== undefined) {
+    void createRecallClient(settings.companion)
+      .indexTurn({
+        id: `${threadResult.bac_id}:${String(lastIndexableTurn.ordinal)}`,
+        threadId: threadResult.bac_id,
+        capturedAt: lastIndexableTurn.capturedAt,
+        text: lastIndexableTurn.text,
+      })
+      .catch((error: unknown) => {
+        // eslint-disable-next-line no-console
+        console.debug(
+          '[recall] best-effort indexing failed:',
+          error instanceof Error ? error.message : error,
+        );
+      });
+  }
   await upsertLocalThread(thread, threadResult);
   const lastTurn = event.turns.at(-1);
   if (existingThread !== undefined && lastTurn?.role === 'assistant') {

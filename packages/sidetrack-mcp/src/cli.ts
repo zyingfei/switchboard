@@ -96,6 +96,45 @@ const createCompanionWriteClient = (
     }
     return (await response.json()) as TResult;
   };
+  const getDataArray = async (
+    path: string,
+    params: URLSearchParams = new URLSearchParams(),
+  ): Promise<readonly unknown[]> => {
+    const suffix = params.toString().length === 0 ? '' : `?${params.toString()}`;
+    const response = await fetch(`${base}${path}${suffix}`, {
+      method: 'GET',
+      headers: {
+        'x-bac-bridge-key': bridgeKey,
+      },
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      throw new Error(`Companion ${path} failed (${String(response.status)}): ${detail}`);
+    }
+    const body = (await response.json()) as unknown;
+    if (
+      typeof body !== 'object' ||
+      body === null ||
+      !('data' in body) ||
+      !Array.isArray((body as { readonly data?: unknown }).data)
+    ) {
+      throw new Error(`Companion ${path} did not return a data array.`);
+    }
+    return (body as { readonly data: readonly unknown[] }).data;
+  };
+  const readList = (
+    path: string,
+    input: { readonly limit?: number; readonly since?: string },
+  ): Promise<readonly unknown[]> => {
+    const params = new URLSearchParams();
+    if (input.limit !== undefined) {
+      params.set('limit', String(input.limit));
+    }
+    if (input.since !== undefined) {
+      params.set('since', input.since);
+    }
+    return getDataArray(path, params);
+  };
   // Idempotency keys: same shape as the extension uses, so concurrent
   // moves/queue items don't double-write the vault.
   const idempotencyKey = (prefix: string, value: string): string =>
@@ -146,6 +185,65 @@ const createCompanionWriteClient = (
         throw new Error('Companion did not return bac_id + revision for the queued item.');
       }
       return { bac_id: body.data.bac_id, revision: body.data.revision };
+    },
+    listDispatches: (input) => readList('/v1/dispatches', input),
+    listAuditEvents: (input) => readList('/v1/audit', input),
+    listAnnotations: (input) => {
+      const params = new URLSearchParams();
+      if (input.url !== undefined) {
+        params.set('url', input.url);
+      }
+      if (input.limit !== undefined) {
+        params.set('limit', String(input.limit));
+      }
+      return getDataArray('/v1/annotations', params);
+    },
+    recall: (input) => {
+      const params = new URLSearchParams({ q: input.query });
+      if (input.limit !== undefined) {
+        params.set('limit', String(input.limit));
+      }
+      if (input.workstreamId !== undefined) {
+        params.set('workstreamId', input.workstreamId);
+      }
+      return getDataArray('/v1/recall/query', params);
+    },
+    suggestWorkstream: (input) => {
+      const params = new URLSearchParams();
+      if (input.limit !== undefined) {
+        params.set('limit', String(input.limit));
+      }
+      return getDataArray(
+        `/v1/suggestions/thread/${encodeURIComponent(input.threadId)}`,
+        params,
+      );
+    },
+    async listWorkstreamNotes(input) {
+      const response = await fetch(
+        `${base}/v1/workstreams/${encodeURIComponent(input.workstreamId)}/linked-notes`,
+        {
+          method: 'GET',
+          headers: {
+            'x-bac-bridge-key': bridgeKey,
+          },
+        },
+      );
+      if (!response.ok) {
+        const detail = await response.text().catch(() => '');
+        throw new Error(
+          `Companion linked-notes failed (${String(response.status)}): ${detail}`,
+        );
+      }
+      const body = (await response.json()) as unknown;
+      if (
+        typeof body !== 'object' ||
+        body === null ||
+        !('items' in body) ||
+        !Array.isArray((body as { readonly items?: unknown }).items)
+      ) {
+        throw new Error('Companion linked-notes response missing items array.');
+      }
+      return (body as { readonly items: readonly unknown[] }).items;
     },
   };
 };

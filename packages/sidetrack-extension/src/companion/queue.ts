@@ -3,6 +3,8 @@ import type { CaptureEvent } from './model';
 export interface QueuedCapture {
   readonly id: string;
   readonly queuedAt: string;
+  readonly attempts: number;
+  readonly nextAttemptAt: string;
   readonly event: CaptureEvent;
 }
 
@@ -19,6 +21,10 @@ export interface StoragePort {
 const QUEUE_KEY = 'sidetrack.captureQueue';
 const DROPPED_KEY = 'sidetrack.captureQueue.droppedCount';
 export const QUEUE_LIMIT = 1_000;
+const BASE_BACKOFF_MS = 2_000;
+const MAX_BACKOFF_MS = 5 * 60 * 1_000;
+const JITTER_RATIO = 0.25;
+const MAX_ATTEMPTS = 12;
 
 export const chromeStoragePort: StoragePort = {
   async get(key, fallback) {
@@ -30,15 +36,57 @@ export const chromeStoragePort: StoragePort = {
   },
 };
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null;
+
+const migrateQueuedCapture = (value: unknown): QueuedCapture | null => {
+  if (!isRecord(value) || typeof value.id !== 'string' || typeof value.queuedAt !== 'string') {
+    return null;
+  }
+  const eventValue = value.event;
+  if (!isRecord(eventValue)) {
+    return null;
+  }
+  const attempts = typeof value.attempts === 'number' && Number.isFinite(value.attempts)
+    ? Math.max(0, Math.floor(value.attempts))
+    : 0;
+  const nextAttemptAt =
+    typeof value.nextAttemptAt === 'string' && value.nextAttemptAt.length > 0
+      ? value.nextAttemptAt
+      : value.queuedAt;
+  return {
+    id: value.id,
+    queuedAt: value.queuedAt,
+    attempts,
+    nextAttemptAt,
+    event: eventValue as unknown as CaptureEvent,
+  };
+};
+
 export const readQueue = async (
   storage: StoragePort = chromeStoragePort,
-): Promise<readonly QueuedCapture[]> => await storage.get<readonly QueuedCapture[]>(QUEUE_KEY, []);
+): Promise<readonly QueuedCapture[]> => {
+  const raw = await storage.get<readonly unknown[]>(QUEUE_KEY, []);
+  return raw.map(migrateQueuedCapture).filter((item): item is QueuedCapture => item !== null);
+};
 
 export const readDroppedCount = async (storage: StoragePort = chromeStoragePort): Promise<number> =>
   await storage.get<number>(DROPPED_KEY, 0);
 
 export const clearQueue = async (storage: StoragePort = chromeStoragePort): Promise<void> => {
   await storage.set({ [QUEUE_KEY]: [] });
+};
+
+export const computeNextAttempt = (
+  attempts: number,
+  now: Date,
+  random: () => number = Math.random,
+): string => {
+  const clampedAttempts = Math.max(0, Math.floor(attempts));
+  const exponential = BASE_BACKOFF_MS * 2 ** Math.max(0, clampedAttempts - 1);
+  const capped = Math.min(exponential, MAX_BACKOFF_MS);
+  const jitter = 1 + (random() * 2 - 1) * JITTER_RATIO;
+  return new Date(now.getTime() + Math.round(capped * jitter)).toISOString();
 };
 
 export const enqueueCapture = async (
@@ -52,6 +100,8 @@ export const enqueueCapture = async (
     {
       id: crypto.randomUUID(),
       queuedAt: new Date().toISOString(),
+      attempts: 0,
+      nextAttemptAt: new Date().toISOString(),
       event,
     },
   ];
@@ -67,22 +117,45 @@ export const enqueueCapture = async (
 export const drainQueue = async (
   send: (event: CaptureEvent) => Promise<void>,
   storage: StoragePort = chromeStoragePort,
+  now: Date = new Date(),
+  random: () => number = Math.random,
 ): Promise<DrainResult> => {
   const queue = await readQueue(storage);
   let sent = 0;
+  let dropped = 0;
+  let changed = false;
+  const nextQueue: QueuedCapture[] = [];
 
-  for (let index = 0; index < queue.length; index += 1) {
-    const item = queue[index];
+  for (const item of queue) {
+    if (Date.parse(item.nextAttemptAt) > now.getTime()) {
+      nextQueue.push(item);
+      continue;
+    }
 
     try {
       await send(item.event);
       sent += 1;
+      changed = true;
     } catch {
-      await storage.set({ [QUEUE_KEY]: queue.slice(index) });
-      return { sent, remaining: queue.length - index };
+      const attempts = item.attempts + 1;
+      changed = true;
+      if (attempts > MAX_ATTEMPTS) {
+        dropped += 1;
+      } else {
+        nextQueue.push({
+          ...item,
+          attempts,
+          nextAttemptAt: computeNextAttempt(attempts, now, random),
+        });
+      }
     }
   }
 
-  await clearQueue(storage);
-  return { sent, remaining: 0 };
+  if (dropped > 0) {
+    await storage.set({ [DROPPED_KEY]: (await readDroppedCount(storage)) + dropped });
+  }
+  if (changed) {
+    await storage.set({ [QUEUE_KEY]: nextQueue });
+  }
+  return { sent, remaining: nextQueue.length };
 };
