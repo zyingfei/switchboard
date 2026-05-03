@@ -35,7 +35,11 @@ export interface DrainThread {
 }
 
 export interface DrainCompanionConfig {
-  readonly autoSendOptIn: { readonly chatgpt: boolean; readonly claude: boolean; readonly gemini: boolean };
+  readonly autoSendOptIn: {
+    readonly chatgpt: boolean;
+    readonly claude: boolean;
+    readonly gemini: boolean;
+  };
   readonly screenShareSafeMode: boolean;
 }
 
@@ -53,6 +57,8 @@ export interface DrainItemUpdate {
   readonly status?: 'pending' | 'done';
   // null = clear the field, string = set, undefined = leave alone.
   readonly lastError?: string | null;
+  // null = clear the field, value = set, undefined = leave alone.
+  readonly progress?: 'typing' | 'waiting' | null;
 }
 
 export interface DrainPorts {
@@ -60,7 +66,7 @@ export interface DrainPorts {
   readonly readPendingItemsForThread: (threadId: string) => Promise<readonly DrainQueueItem[]>;
   readonly readCompanionConfig: () => Promise<DrainCompanionConfig>;
   readonly findTabForThread: (thread: DrainThread) => Promise<DrainTabLookup>;
-  readonly sendItemToTab: (tabId: number, text: string) => Promise<DrainSendResult>;
+  readonly sendItemToTab: (tabId: number, text: string, itemId: string) => Promise<DrainSendResult>;
   readonly updateQueueItem: (itemId: string, update: DrainItemUpdate) => Promise<void>;
   readonly logWarning?: (message: string) => void;
 }
@@ -96,7 +102,13 @@ export interface DrainOutcome {
   // For introspection / tests. Populated even on no-op runs.
   readonly itemsConsidered: number;
   readonly itemsSent: number;
-  readonly stoppedReason?: 'thread-off' | 'no-pending' | 'preflight' | 'no-tab' | 'send-failed' | 'completed';
+  readonly stoppedReason?:
+    | 'thread-off'
+    | 'no-pending'
+    | 'preflight'
+    | 'no-tab'
+    | 'send-failed'
+    | 'completed';
 }
 
 export const runAutoSendDrain = async (
@@ -136,7 +148,7 @@ export const runAutoSendDrain = async (
     if (!verdict.ok) {
       const reason = preflightReasonText(verdict.blockedBy ?? 'unsupported-provider');
       log(`[autoSend] preflight blocked for ${item.bac_id}: ${reason}`);
-      await ports.updateQueueItem(item.bac_id, { lastError: reason });
+      await ports.updateQueueItem(item.bac_id, { lastError: reason, progress: null });
       return {
         mutated: true,
         itemsConsidered: pending.length,
@@ -147,7 +159,7 @@ export const runAutoSendDrain = async (
     if (tabLookup.tabId === undefined) {
       const reason = tabLookup.reason ?? 'No chat tab is open for this thread.';
       log(`[autoSend] ${reason} (${thread.threadUrl})`);
-      await ports.updateQueueItem(item.bac_id, { lastError: reason });
+      await ports.updateQueueItem(item.bac_id, { lastError: reason, progress: null });
       return {
         mutated: true,
         itemsConsidered: pending.length,
@@ -155,11 +167,13 @@ export const runAutoSendDrain = async (
         stoppedReason: 'no-tab',
       };
     }
-    const result = await ports.sendItemToTab(tabLookup.tabId, verdict.text);
+    await ports.updateQueueItem(item.bac_id, { progress: 'typing', lastError: null });
+    mutated = true;
+    const result = await ports.sendItemToTab(tabLookup.tabId, verdict.text, item.bac_id);
     if (!result.ok) {
       const reason = result.error ?? 'Content script send failed.';
       log(`[autoSend] send failed for ${item.bac_id}: ${reason}`);
-      await ports.updateQueueItem(item.bac_id, { lastError: reason });
+      await ports.updateQueueItem(item.bac_id, { lastError: reason, progress: null });
       return {
         mutated: true,
         itemsConsidered: pending.length,
@@ -167,7 +181,7 @@ export const runAutoSendDrain = async (
         stoppedReason: 'send-failed',
       };
     }
-    await ports.updateQueueItem(item.bac_id, { status: 'done', lastError: null });
+    await ports.updateQueueItem(item.bac_id, { status: 'done', lastError: null, progress: null });
     mutated = true;
     sent += 1;
   }

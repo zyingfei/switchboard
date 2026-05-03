@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  parseMarkdownLockSentinel,
+  renderPromotedThreadMarkdown,
   renderThreadMarkdown,
   renderWorkstreamMarkdown,
 } from './markdownProjection.js';
@@ -131,5 +133,76 @@ describe('renderThreadMarkdown', () => {
     expect(md).not.toContain('url:');
     expect(md).not.toContain('status:');
     expect(md).not.toContain('workstream:');
+  });
+});
+
+describe('renderPromotedThreadMarkdown', () => {
+  it('renders promoted metadata and captured turns in ordinal order', () => {
+    const md = renderPromotedThreadMarkdown(
+      {
+        bac_id: 'bac_t',
+        revision: 'rev',
+        title: 'Migration thread',
+        provider: 'claude',
+        threadUrl: 'https://claude.ai/chat/migration',
+        primaryWorkstreamId: 'bac_ws',
+      },
+      [
+        {
+          role: 'assistant',
+          text: 'Use a checkpoint.',
+          ordinal: 1,
+          capturedAt: '2026-04-30T10:01:00.000Z',
+        },
+        {
+          role: 'user',
+          text: 'How should we migrate?',
+          ordinal: 0,
+          capturedAt: '2026-04-30T10:00:00.000Z',
+        },
+      ],
+      'M2 polish',
+      '2026-04-30T11:00:00.000Z',
+    );
+
+    expect(md).toContain('Promoted to M2 polish on 2026-04-30.');
+    expect(md.indexOf('### User')).toBeLessThan(md.indexOf('### Assistant'));
+    expect(md).toContain('How should we migrate?');
+    expect(md).toContain('Use a checkpoint.');
+    expect(md).toContain('turns: 2');
+    expect(md).toContain('bac_locked: true');
+  });
+
+  it('ellipsises long turn bodies because full text stays in the ledger', () => {
+    const md = renderPromotedThreadMarkdown(
+      { bac_id: 'bac_t', revision: 'rev', title: 'Long' },
+      [
+        {
+          role: 'user',
+          text: 'x'.repeat(2100),
+          ordinal: 0,
+          capturedAt: '2026-04-30T10:00:00.000Z',
+        },
+      ],
+      'M2 polish',
+      '2026-04-30T11:00:00.000Z',
+    );
+
+    expect(md).toContain('[...]');
+    expect(md.length).toBeLessThan(2400);
+  });
+});
+
+describe('parseMarkdownLockSentinel', () => {
+  it('detects bac_locked: true in YAML frontmatter', () => {
+    expect(parseMarkdownLockSentinel('---\nbac_locked: true\ntitle: X\n---\n# X\n')).toBe(true);
+    expect(parseMarkdownLockSentinel('---\nbac_locked: "true"\n---\n# X\n')).toBe(true);
+  });
+
+  it('ignores body text and non-true values', () => {
+    expect(parseMarkdownLockSentinel('---\nbac_locked: false\n---\nbac_locked: true\n')).toBe(
+      false,
+    );
+    expect(parseMarkdownLockSentinel('# no frontmatter\nbac_locked: true\n')).toBe(false);
   });
 });

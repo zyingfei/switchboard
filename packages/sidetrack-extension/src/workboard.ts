@@ -10,6 +10,7 @@ import type { DispatchEventRecord } from './dispatch/types';
 export type CompanionStatus = 'connected' | 'disconnected' | 'vault-error' | 'local-only';
 export type TrackingMode = 'auto' | 'manual' | 'stopped' | 'removed' | 'archived';
 export type PrivacyMode = 'private' | 'shared' | 'public';
+export type AllThreadsBucket = 'unread' | 'ungrouped' | 'waiting' | 'stale' | 'normal';
 
 export interface WorkboardSection {
   readonly id:
@@ -86,6 +87,7 @@ export interface QueueItem {
   // root cause (e.g. open the chat tab, opt the provider in). Cleared
   // on the next successful drain pass.
   readonly lastError?: string;
+  readonly progress?: 'typing' | 'waiting';
 }
 
 export interface InboundReminder {
@@ -132,6 +134,21 @@ export interface CaptureNote {
   readonly updatedAt: string;
 }
 
+export interface DispatchDiagnostic {
+  readonly capturedAt: string;
+  readonly provider: ProviderId;
+  readonly matched: boolean;
+  readonly reason?:
+    | 'window-expired'
+    | 'provider-mismatch'
+    | 'no-prefix-match'
+    | 'tiny-prefix'
+    | 'already-linked';
+  readonly candidatesConsidered: number;
+  readonly bestPrefixMatchLen: number;
+  readonly dispatchId?: string;
+}
+
 export type CodingTool = 'claude_code' | 'codex' | 'cursor' | 'other';
 
 export interface CodingSession {
@@ -154,6 +171,7 @@ export interface WorkboardState {
   readonly queuedCaptureCount: number;
   readonly droppedCaptureCount: number;
   readonly settings: UiSettings;
+  readonly activeTabUrl?: string;
   readonly currentTab?: TrackedThread;
   readonly threads: readonly TrackedThread[];
   readonly workstreams: readonly WorkstreamNode[];
@@ -161,6 +179,7 @@ export interface WorkboardState {
   readonly reminders: readonly InboundReminder[];
   readonly selectorHealth: readonly SelectorHealth[];
   readonly collapsedSections: readonly WorkboardSection['id'][];
+  readonly collapsedBuckets: readonly AllThreadsBucket[];
   readonly codingSessions: readonly CodingSession[];
   readonly captureNotes: readonly CaptureNote[];
   readonly recentDispatches: readonly DispatchEventRecord[];
@@ -175,6 +194,7 @@ export interface WorkboardState {
   // auto-link matcher and surfaced to the dispatch viewer modal so
   // the user can see what they actually shipped, not the vault copy.
   readonly dispatchOriginals: Readonly<Partial<Record<string, string>>>;
+  readonly dispatchDiagnostics: readonly DispatchDiagnostic[];
   // Map threadId → SendToTarget id of the last dispatch the user
   // fired against that thread. Drives the "Recent" row in the
   // SendToDropdown so a repeat send is one click.
@@ -271,11 +291,13 @@ export const createEmptyWorkboardState = (
   reminders: [],
   selectorHealth: [],
   collapsedSections: [],
+  collapsedBuckets: ['stale'],
   codingSessions: [],
   captureNotes: [],
   recentDispatches: [],
   dispatchLinks: {},
   dispatchOriginals: {},
+  dispatchDiagnostics: [],
   lastDispatchTargetByThread: {},
   updatedAt: new Date().toISOString(),
   ...overrides,

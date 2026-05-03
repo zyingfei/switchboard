@@ -11,6 +11,7 @@ import type {
   TurnsReadOptions,
   TurnsReadResult,
 } from '../vault/liveVaultReader.js';
+import { searchIndex } from '../vault/searchIndex.js';
 
 export interface CompanionWriteClient {
   readonly registerCodingSession: (input: {
@@ -110,39 +111,6 @@ const buildContextPack = (
   ].join('\n');
 };
 
-const searchSnapshot = (snapshot: LiveVaultSnapshot, query: string) => {
-  const normalizedQuery = query.toLowerCase();
-  const hits = [
-    ...snapshot.threads.map((thread) => ({
-      kind: 'thread',
-      id: thread.bac_id,
-      title: thread.title ?? thread.threadUrl ?? thread.bac_id,
-      text: JSON.stringify(thread),
-    })),
-    ...snapshot.queueItems.map((item) => ({
-      kind: 'queue',
-      id: item.bac_id,
-      title: item.text ?? item.bac_id,
-      text: JSON.stringify(item),
-    })),
-    ...snapshot.reminders.map((reminder) => ({
-      kind: 'reminder',
-      id: reminder.bac_id,
-      title: reminder.threadId ?? reminder.bac_id,
-      text: JSON.stringify(reminder),
-    })),
-  ];
-
-  return hits
-    .filter((hit) => hit.text.toLowerCase().includes(normalizedQuery))
-    .map((hit) => ({
-      kind: hit.kind,
-      id: hit.id,
-      title: hit.title,
-      excerpt: hit.text.slice(0, 240),
-    }));
-};
-
 export const createSidetrackMcpServer = (
   reader: SidetrackMcpReader,
   companionClient?: CompanionWriteClient,
@@ -219,7 +187,7 @@ export const createSidetrackMcpServer = (
     async ({ query }) => {
       const snapshot = await reader.readSnapshot();
       return asStructuredContent({
-        hits: searchSnapshot(snapshot, query),
+        hits: searchIndex(snapshot, query),
         generatedAt: snapshot.generatedAt,
       });
     },

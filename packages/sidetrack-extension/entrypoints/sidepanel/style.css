@@ -1931,6 +1931,39 @@ textarea.preview-body:focus {
   border-top: var(--hair);
   background: var(--paper);
 }
+.dispatch-diagnostic {
+  padding: 10px 18px;
+  border-top: var(--hair);
+  background: var(--paper-light);
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.dispatch-diagnostic summary {
+  cursor: pointer;
+  color: var(--signal, #c2410c);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.dispatch-diagnostic p {
+  margin: 8px 0;
+}
+.dispatch-diagnostic-grid {
+  display: flex;
+  gap: 16px;
+  margin: 0;
+  font-size: 10px;
+}
+.dispatch-diagnostic-grid div {
+  display: grid;
+  gap: 2px;
+}
+.dispatch-diagnostic-grid dt {
+  color: var(--ink-3);
+}
+.dispatch-diagnostic-grid dd {
+  margin: 0;
+  color: var(--ink);
+}
 
 /* ── Wizard ── */
 .wizard-step {
@@ -2573,6 +2606,19 @@ textarea.preview-body:focus {
   background: var(--signal-bg, #fff7ed);
   color: var(--signal, #c2410c);
 }
+.icon-btn.pulsing {
+  animation: icon-btn-pulse 4s ease-in-out infinite;
+}
+@keyframes icon-btn-pulse {
+  0%,
+  30%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(194, 65, 12, 0);
+  }
+  12% {
+    box-shadow: 0 0 0 4px rgba(194, 65, 12, 0.24);
+  }
+}
 .icon-btn svg {
   width: 16px;
   height: 16px;
@@ -2646,6 +2692,38 @@ textarea.preview-body:focus {
 .ws-bar .swap-arrow {
   color: var(--ink-3, #7a7269);
   font-size: 11px;
+}
+
+.ws-drop-strip {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--rule-soft, #e5ddc9);
+  background: var(--paper, #f5efe2);
+}
+
+.ws-picker-pill {
+  border: 1px solid var(--rule, #d4cdb8);
+  background: var(--paper-2, #fbf7ee);
+  color: var(--ink-2, #4a453d);
+  border-radius: var(--rad-s, 4px);
+  padding: 3px 8px;
+  font-family: var(--mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 10px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.ws-picker-pill.current {
+  border-color: var(--signal-tint, #fed7aa);
+  background: var(--signal-bg, #fff7ed);
+  color: var(--ink, #1b1916);
+}
+
+.ws-picker-pill.drop-target {
+  border-color: var(--signal, #c2410c);
+  box-shadow: 0 0 0 2px rgba(194, 65, 12, 0.18);
 }
 
 .ws-picker-backdrop {
@@ -2761,6 +2839,10 @@ textarea.preview-body:focus {
   background: var(--paper, #f5efe2);
   border-color: var(--rule-soft, #e5ddc9);
 }
+.thread.dragging {
+  opacity: 0.48;
+  border-color: var(--signal-tint, #fed7aa);
+}
 .thread .row1 {
   display: flex;
   align-items: center;
@@ -2854,6 +2936,7 @@ textarea.preview-body:focus {
 }
 @media (prefers-reduced-motion: reduce) {
   .ws-bar .ws-name::before,
+  .icon-btn.pulsing,
   .thread .row2 .dot.amber,
   .thread .row2 .dot.signal {
     animation: none;
@@ -2996,7 +3079,9 @@ textarea.preview-body:focus {
   color: var(--ink-3);
   cursor: pointer;
   opacity: 0;
-  transition: opacity 120ms ease, color 120ms ease;
+  transition:
+    opacity 120ms ease,
+    color 120ms ease;
   flex: 0 0 auto;
 }
 .thread:hover .thread-focus-btn,
@@ -3132,7 +3217,9 @@ textarea.preview-body:focus {
   border: 0;
   padding: 0;
   opacity: 0;
-  transition: opacity 120ms ease, color 120ms ease;
+  transition:
+    opacity 120ms ease,
+    color 120ms ease;
   cursor: pointer;
 }
 .thread:hover .thread-history-add,
@@ -3369,14 +3456,29 @@ textarea.preview-body:focus {
   display: flex;
   align-items: center;
   gap: 8px;
+  width: 100%;
   padding: 4px 8px 6px;
   font-family: var(--mono);
   font-size: 10px;
   letter-spacing: 0.16em;
   text-transform: uppercase;
   color: var(--ink-3);
+  background: transparent;
   border-bottom: 1px dashed var(--rule-soft, #e5ddc9);
+  border-left: 0;
+  border-right: 0;
+  border-top: 0;
   margin-bottom: 4px;
+  cursor: pointer;
+  min-height: 0;
+}
+.thread-bucket-head:hover {
+  color: var(--ink-1, #1b1916);
+}
+.thread-bucket-chevron {
+  display: inline-block;
+  width: 12px;
+  letter-spacing: 0;
 }
 .thread-bucket-label::before {
   content: '';
@@ -3513,6 +3615,14 @@ button.thread-queued:focus-visible {
   flex: 1 1 auto;
   color: var(--ink-1, #1b1916);
   word-break: break-word;
+}
+.queue-item-progress {
+  flex: 0 0 auto;
+  color: var(--signal, #c2410c);
+  font-size: 10px;
+  font-style: italic;
+  white-space: nowrap;
+  padding-top: 1px;
 }
 .thread-queue-actions {
   display: inline-flex;

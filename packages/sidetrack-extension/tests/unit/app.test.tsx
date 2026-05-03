@@ -284,4 +284,133 @@ describe('live side-panel App wiring', () => {
       });
     });
   });
+
+  it('routes drag/drop across workstream pills through the moveThread message', async () => {
+    const sendMessage = installChromeMock(liveState(), { [SETUP_COMPLETED_KEY]: true });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /not set/ }));
+    const wsRows = await screen.findAllByRole('button');
+    const sidetrackPickerRow = wsRows.find(
+      (b) =>
+        b.className.includes('ws-picker-row') &&
+        (b.textContent ?? '').trim().startsWith('Sidetrack'), // eslint-disable-line @typescript-eslint/no-unnecessary-condition
+    );
+    if (sidetrackPickerRow === undefined) {
+      throw new Error('Could not find Sidetrack picker row.');
+    }
+    fireEvent.click(sidetrackPickerRow);
+
+    const threadRow = (await screen.findByText('[private]')).closest('.thread');
+    expect(threadRow).not.toBeNull();
+    if (threadRow === null) {
+      return;
+    }
+    const dataTransfer = {
+      dropEffect: 'none',
+      effectAllowed: 'uninitialized',
+      setData: vi.fn(),
+    };
+    fireEvent.dragStart(threadRow, { dataTransfer });
+    const siblingDropPill = screen.getByRole('button', { name: 'Sibling' });
+    fireEvent.dragOver(siblingDropPill, { dataTransfer });
+    fireEvent.drop(siblingDropPill, { dataTransfer });
+
+    await waitFor(() => {
+      expect(sendMessage).toHaveBeenCalledWith({
+        type: messageTypes.moveThread,
+        threadId: 'bac_thread_test',
+        workstreamId: 'bac_workstream_sibling',
+      });
+    });
+  });
+
+  it('pulses the find icon when the active tab matches an unfocused tracked thread', async () => {
+    const state = liveState();
+    installChromeMock(
+      {
+        ...state,
+        activeTabUrl: 'https://claude.ai/chat/thread',
+      },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+
+    render(<App />);
+
+    const findButton = await screen.findByRole('button', {
+      name: 'Find active tab in side panel',
+    });
+    expect(findButton.className).toContain('pulsing');
+  });
+
+  it('renders queue-item progress chips for auto-send state', async () => {
+    const state = liveState();
+    installChromeMock(
+      {
+        ...state,
+        queueItems: [
+          {
+            bac_id: 'bac_queue_thread',
+            text: 'Send the next ask.',
+            scope: 'thread',
+            targetId: 'bac_thread_test',
+            status: 'pending',
+            progress: 'waiting',
+            createdAt: NOW,
+            updatedAt: NOW,
+          },
+        ],
+      },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('tab', { name: 'All threads' }));
+    fireEvent.click(await screen.findByRole('button', { name: '1 queued' }));
+
+    expect(await screen.findByText('waiting for reply…')).toBeInTheDocument();
+  });
+
+  it('collapses lifecycle buckets and persists the requested bucket list', async () => {
+    const state = liveState();
+    const sendMessage = installChromeMock(
+      {
+        ...state,
+        collapsedBuckets: ['stale'],
+        threads: [
+          ...state.threads,
+          {
+            bac_id: 'bac_thread_stale',
+            provider: 'claude',
+            threadUrl: 'https://claude.ai/chat/stale',
+            title: 'Stale row',
+            lastSeenAt: NOW,
+            status: 'restorable',
+            trackingMode: 'auto',
+            primaryWorkstreamId: 'bac_workstream_root',
+            tags: [],
+          },
+        ],
+      },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('tab', { name: 'All threads' }));
+    const staleHeader = await screen.findByRole('button', { name: /Stale or closed/u });
+    expect(staleHeader).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText('Stale row')).not.toBeInTheDocument();
+
+    fireEvent.click(staleHeader);
+
+    await waitFor(() => {
+      expect(sendMessage).toHaveBeenCalledWith({
+        type: messageTypes.setCollapsedBuckets,
+        collapsedBuckets: [],
+      });
+    });
+  });
 });

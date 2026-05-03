@@ -4,6 +4,8 @@ import { basename, dirname, join } from 'node:path';
 
 import { createBacId, createRevision } from '../domain/ids.js';
 import {
+  parseMarkdownLockSentinel,
+  renderPromotedThreadMarkdown,
   renderThreadMarkdown,
   renderWorkstreamMarkdown,
   type ThreadProjectionInput,
@@ -199,6 +201,17 @@ const isMissingPathError = (error: unknown): boolean =>
   'code' in error &&
   (error as { readonly code?: unknown }).code === 'ENOENT';
 
+const readMarkdownLockSentinel = async (path: string): Promise<boolean> => {
+  try {
+    return parseMarkdownLockSentinel(await readFile(path, 'utf8'));
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      return false;
+    }
+    throw error;
+  }
+};
+
 const incrementSettingsRevision = (revision: string): string => {
   if (!/^\d+$/u.test(revision)) {
     throw new Error('Settings revision must be numeric to increment.');
@@ -306,6 +319,65 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
     );
   };
 
+  const readRecentTurnsFromEvents = async (query: {
+    readonly threadUrl: string;
+    readonly limit: number;
+    readonly role?: TurnRecord['role'];
+  }): Promise<readonly TurnRecord[]> => {
+    const eventsRoot = join(bacRoot, 'events');
+    let names: string[];
+    try {
+      names = await readdir(eventsRoot);
+    } catch (error) {
+      if (isMissingPathError(error)) {
+        return [];
+      }
+      throw error;
+    }
+
+    const dedupe = new Map<string, TurnRecord>();
+    for (const name of names
+      .filter((candidate) => /^\d{4}-\d{2}-\d{2}\.jsonl$/u.test(candidate))
+      .sort()
+      .reverse()) {
+      const fileEvents = await readEventFile(join(eventsRoot, name));
+      for (const event of fileEvents) {
+        if (event.threadUrl !== query.threadUrl) {
+          continue;
+        }
+        for (const turn of event.turns) {
+          if (query.role !== undefined && turn.role !== query.role) {
+            continue;
+          }
+          const key = `${String(turn.ordinal)}::${turn.role}`;
+          const existing = dedupe.get(key);
+          if (existing === undefined || existing.capturedAt < turn.capturedAt) {
+            dedupe.set(key, turn);
+          }
+        }
+      }
+      if (dedupe.size >= query.limit * 4) {
+        break;
+      }
+    }
+
+    return Array.from(dedupe.values())
+      .sort((left, right) => right.capturedAt.localeCompare(left.capturedAt))
+      .slice(0, query.limit);
+  };
+
+  const readWorkstreamTitle = async (workstreamId: string): Promise<string> => {
+    try {
+      const workstream = await readJsonRecord(join(bacRoot, 'workstreams', `${workstreamId}.json`));
+      return typeof workstream['title'] === 'string' ? workstream['title'] : workstreamId;
+    } catch (error) {
+      if (isMissingPathError(error)) {
+        return workstreamId;
+      }
+      throw error;
+    }
+  };
+
   return {
     async status() {
       try {
@@ -333,46 +405,11 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
 
     async readRecentTurns(query) {
       await ensureVaultPresent();
-      const eventsRoot = join(bacRoot, 'events');
-      let names: string[];
-      try {
-        names = await readdir(eventsRoot);
-      } catch (error) {
-        if (isMissingPathError(error)) {
-          return [];
-        }
-        throw error;
-      }
-
-      const dedupe = new Map<string, TurnRecord>();
-      for (const name of names
-        .filter((candidate) => /^\d{4}-\d{2}-\d{2}\.jsonl$/u.test(candidate))
-        .sort()
-        .reverse()) {
-        const fileEvents = await readEventFile(join(eventsRoot, name));
-        for (const event of fileEvents) {
-          if (event.threadUrl !== query.threadUrl) {
-            continue;
-          }
-          for (const turn of event.turns) {
-            if (query.role !== undefined && turn.role !== query.role) {
-              continue;
-            }
-            const key = `${String(turn.ordinal)}::${turn.role}`;
-            const existing = dedupe.get(key);
-            if (existing === undefined || existing.capturedAt < turn.capturedAt) {
-              dedupe.set(key, turn);
-            }
-          }
-        }
-        if (dedupe.size >= query.limit * 4) {
-          break;
-        }
-      }
-
-      return Array.from(dedupe.values())
-        .sort((left, right) => right.capturedAt.localeCompare(left.capturedAt))
-        .slice(0, query.limit);
+      return await readRecentTurnsFromEvents({
+        threadUrl: query.threadUrl,
+        limit: query.limit,
+        ...(query.role === undefined ? {} : { role: query.role }),
+      });
     },
 
     async writeDispatchEvent(input, requestId) {
@@ -511,6 +548,20 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
       const bac_id = input.bac_id ?? createBacId();
       const revision = createRevision();
       const timestamp = new Date().toISOString();
+      const threadPath = join(bacRoot, 'threads', `${bac_id}.json`);
+      const threadMarkdownPath = join(bacRoot, 'threads', `${bac_id}.md`);
+      let existingThread: Record<string, unknown> | undefined;
+      try {
+        existingThread = await readJsonRecord(threadPath);
+      } catch (error) {
+        if (!isMissingPathError(error)) {
+          throw error;
+        }
+      }
+      const previousWorkstreamId =
+        typeof existingThread?.['primaryWorkstreamId'] === 'string'
+          ? existingThread['primaryWorkstreamId']
+          : undefined;
       const thread = {
         ...input,
         bac_id,
@@ -519,12 +570,36 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
         tags: input.tags ?? [],
         status: input.status ?? 'tracked',
       };
+      const promotedForFirstTime =
+        existingThread !== undefined &&
+        previousWorkstreamId === undefined &&
+        input.primaryWorkstreamId !== undefined;
+      const promotedWorkstreamId = input.primaryWorkstreamId;
 
-      await writeJson(join(bacRoot, 'threads', `${bac_id}.json`), thread);
-      await writeMarkdownProjection(
-        join(bacRoot, 'threads', `${bac_id}.md`),
-        renderThreadMarkdown(thread as ThreadProjectionInput),
-      );
+      await writeJson(threadPath, thread);
+      if (!(await readMarkdownLockSentinel(threadMarkdownPath))) {
+        if (promotedForFirstTime && promotedWorkstreamId !== undefined) {
+          const turns = await readRecentTurnsFromEvents({
+            threadUrl: input.threadUrl,
+            limit: 1000,
+          });
+          const workstreamTitle = await readWorkstreamTitle(promotedWorkstreamId);
+          await writeMarkdownProjection(
+            threadMarkdownPath,
+            renderPromotedThreadMarkdown(
+              thread as ThreadProjectionInput,
+              turns,
+              workstreamTitle,
+              timestamp,
+            ),
+          );
+        } else if (existingThread === undefined || previousWorkstreamId === undefined) {
+          await writeMarkdownProjection(
+            threadMarkdownPath,
+            renderThreadMarkdown(thread as ThreadProjectionInput),
+          );
+        }
+      }
       await audit({ requestId, route: 'upsertThread', outcome: 'success', bac_id, timestamp });
       return { bac_id, revision };
     },
