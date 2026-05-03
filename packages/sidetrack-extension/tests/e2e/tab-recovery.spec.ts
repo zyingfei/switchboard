@@ -74,10 +74,10 @@ test.describe('tab-recovery / tracking-stopped lifecycle (synthetic)', () => {
       // Dot class is gray.
       await expect(closedRow.locator('.dot.gray')).toBeVisible();
 
-      // The active thread alongside it still gets its normal pill, so we
+      // The active thread alongside it still gets its normal green dot, so we
       // know the difference is per-thread, not panel-wide.
       const liveRow = findThreadRowByTitle(page, liveThread.title);
-      await expect(liveRow.locator('.lifecycle-pill')).toBeVisible();
+      await expect(liveRow.locator('.dot.green')).toBeVisible();
     } finally {
       await runtime?.close();
     }

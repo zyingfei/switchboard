@@ -5,6 +5,7 @@ import type {
   ProviderId,
   TabSnapshot,
 } from './companion/model';
+import type { DispatchEventRecord } from './dispatch/types';
 
 export type CompanionStatus = 'connected' | 'disconnected' | 'vault-error' | 'local-only';
 export type TrackingMode = 'auto' | 'manual' | 'stopped' | 'removed' | 'archived';
@@ -162,6 +163,22 @@ export interface WorkboardState {
   readonly collapsedSections: readonly WorkboardSection['id'][];
   readonly codingSessions: readonly CodingSession[];
   readonly captureNotes: readonly CaptureNote[];
+  readonly recentDispatches: readonly DispatchEventRecord[];
+  // Map of dispatchId → linked destination threadId. Populated by
+  // the auto-link matcher in src/companion/dispatchLinking.ts when a
+  // freshly captured thread's first user turn matches a recent
+  // dispatch's body prefix. Lives in chrome.storage; not part of the
+  // companion vault schema.
+  readonly dispatchLinks: Readonly<Partial<Record<string, string>>>;
+  // Map of dispatchId → unredacted body (the body the user copied).
+  // Local-only; the companion stores the redacted form. Used by the
+  // auto-link matcher and surfaced to the dispatch viewer modal so
+  // the user can see what they actually shipped, not the vault copy.
+  readonly dispatchOriginals: Readonly<Partial<Record<string, string>>>;
+  // Map threadId → SendToTarget id of the last dispatch the user
+  // fired against that thread. Drives the "Recent" row in the
+  // SendToDropdown so a repeat send is one click.
+  readonly lastDispatchTargetByThread: Readonly<Partial<Record<string, string>>>;
   readonly lastError?: string;
   readonly updatedAt: string;
 }
@@ -256,6 +273,10 @@ export const createEmptyWorkboardState = (
   collapsedSections: [],
   codingSessions: [],
   captureNotes: [],
+  recentDispatches: [],
+  dispatchLinks: {},
+  dispatchOriginals: {},
+  lastDispatchTargetByThread: {},
   updatedAt: new Date().toISOString(),
   ...overrides,
 });

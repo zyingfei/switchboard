@@ -298,5 +298,12 @@ export default defineContentScript({
       subtree: true,
       characterData: true,
     });
+    // Note: an earlier iteration injected a Shadow-DOM floating
+    // "↗ Sidetrack" button into the host page. The user preferred
+    // a side-panel-side find icon instead — see
+    // entrypoints/sidepanel/App.tsx for the new affordance. The
+    // chat-side button is gone; messageTypes.focusThreadInSidePanel
+    // stays in the wire protocol because the side panel reuses it
+    // for its own internal focus broadcast.
   },
 });

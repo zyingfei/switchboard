@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 import {
   companionStatusLabel,
@@ -11,6 +11,7 @@ import {
 import {
   isCaptureFeedbackMessage,
   isRuntimeResponse,
+  isFocusThreadInSidePanelMessage,
   isWorkboardChangedMessage,
   messageTypes,
   type RuntimeResponse,
@@ -20,9 +21,14 @@ import {
   CodingAttach,
   type ComposedPacket,
   DispatchConfirm,
+  type DispatchEvent as RecentDispatchEvent,
+  type DispatchStatus as RecentDispatchStatus,
   MoveToPicker,
   PacketComposer,
+  RecentDispatches,
   ReviewComposer,
+  SendToDropdown,
+  type SendToTarget,
   SettingsPanel,
   type SettingsValue,
   SystemBannersStack,
@@ -170,6 +176,132 @@ const visibleThreads = (threads: readonly TrackedThread[]): readonly TrackedThre
 const restoreStrategyForThread = (thread: TrackedThread): RestoreStrategy =>
   thread.tabSnapshot?.tabId === undefined ? 'reopen_url' : 'focus_open';
 
+// Lifecycle bucket — used by the All Threads view to render explicit
+// subgroup headers. Order matches the user's priority list:
+// Unread → Ungrouped → Waiting on AI → Stale or closed → Normal.
+// A thread goes into the FIRST matching bucket.
+export type AllThreadsBucket = 'unread' | 'ungrouped' | 'waiting' | 'stale' | 'normal';
+
+const ALL_THREAD_BUCKET_ORDER: readonly AllThreadsBucket[] = [
+  'unread',
+  'ungrouped',
+  'waiting',
+  'stale',
+  'normal',
+];
+
+const ALL_THREAD_BUCKET_LABEL: Record<AllThreadsBucket, string> = {
+  unread: 'Unread reply',
+  ungrouped: 'Ungrouped',
+  waiting: 'Waiting on AI',
+  stale: 'Stale or closed',
+  normal: 'Normal',
+};
+
+const isStaleOrClosed = (thread: TrackedThread): boolean =>
+  thread.status === 'closed' ||
+  thread.status === 'restorable' ||
+  thread.status === 'archived' ||
+  thread.status === 'removed' ||
+  thread.trackingMode === 'stopped';
+
+const classifyAllThread = (
+  thread: TrackedThread,
+  reminders: readonly { readonly threadId: string; readonly status: string }[],
+): AllThreadsBucket => {
+  const hasUnread = reminders.some(
+    (r) => r.threadId === thread.bac_id && r.status !== 'dismissed',
+  );
+  if (hasUnread) return 'unread';
+  if (thread.primaryWorkstreamId === undefined) return 'ungrouped';
+  if (thread.lastTurnRole === 'user') return 'waiting';
+  if (isStaleOrClosed(thread)) return 'stale';
+  return 'normal';
+};
+
+// Spec rank order: signal (unread) → amber (waiting on AI / needs
+// organize) → green (you replied last / fresh) → gray (stale /
+// closed). One flat list, signal-first. Tiebreak by lastSeenAt desc.
+const lifecycleRank = (
+  thread: TrackedThread,
+  reminders: readonly { readonly threadId: string; readonly status: string }[],
+): number => {
+  const lc = deriveLifecycle(thread, reminders);
+  if (lc.dotClass === 'signal') return 0;
+  if (lc.dotClass === 'amber') return 1;
+  if (lc.dotClass === 'green') return 2;
+  return 3;
+};
+
+const sortThreadsByLifecycle = (
+  list: readonly TrackedThread[],
+  reminders: readonly { readonly threadId: string; readonly status: string }[],
+): readonly TrackedThread[] =>
+  list.slice().sort((a, b) => {
+    const rankDelta = lifecycleRank(a, reminders) - lifecycleRank(b, reminders);
+    if (rankDelta !== 0) {
+      return rankDelta;
+    }
+    return b.lastSeenAt.localeCompare(a.lastSeenAt);
+  });
+
+// Map a composed-packet target to the URL we open in a new tab on
+// Dispatch. The user's "where did this go?" confusion is solved by
+// actually opening the chat + putting the packet on their clipboard
+// to paste in. Export targets (notebook/markdown) skip this and get
+// a file download via downloadAsFile below.
+const TARGET_CHAT_URL: Partial<Record<ComposedPacket['target'], string>> = {
+  gpt_pro: 'https://chatgpt.com/',
+  deep_research: 'https://chatgpt.com/',
+  claude: 'https://claude.ai/new',
+  gemini: 'https://gemini.google.com/app',
+  codex: 'https://chatgpt.com/codex',
+};
+
+const downloadAsFile = (filename: string, body: string, mime = 'text/markdown'): void => {
+  const blob = new Blob([body], { type: `${mime};charset=utf-8` });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => {
+    URL.revokeObjectURL(url);
+  }, 1000);
+};
+
+// Adapt the companion's DispatchEventRecord shape to the visual
+// component's expected shape. Companion gives us kind+target+raw
+// timestamp; component wants a label-friendly summary.
+const DISPATCH_KIND_TO_DISPLAY: Record<string, RecentDispatchEvent['dispatchKind']> = {
+  research: 'research_packet',
+  review: 'submit_back',
+  coding: 'coding_agent_packet',
+  note: 'clone_to_chat',
+  other: 'dispatch_out',
+};
+
+const DISPATCH_PROVIDER_LABEL: Record<string, string> = {
+  chatgpt: 'ChatGPT',
+  claude: 'Claude',
+  gemini: 'Gemini',
+  codex: 'Codex',
+  claude_code: 'Claude Code',
+  cursor: 'Cursor',
+  other: 'External',
+};
+
+const DISPATCH_STATUS_TO_DISPLAY = (status: string): RecentDispatchStatus => {
+  if (status === 'replied' || status === 'noted' || status === 'pending') {
+    return status;
+  }
+  // 'sent', 'queued', 'failed' all map to 'sent' visually — failed is
+  // an internal companion state, not user-facing yet.
+  return 'sent';
+};
+
 const App = () => {
   const [state, setState] = useState<WorkboardState>(() => createEmptyWorkboardState());
   const [bridgeKey, setBridgeKey] = useState('');
@@ -177,6 +309,10 @@ const App = () => {
   const [selectedWorkstream, setSelectedWorkstream] = useState('');
   const [moveThreadId, setMoveThreadId] = useState<string | null>(null);
   const [recoveryThreadId, setRecoveryThreadId] = useState<string | null>(null);
+  // Bac_id of a dispatch the user clicked to inspect — used by the
+  // External viewer modal (and as a fallback "show me the body" for
+  // any dispatch the user wants to see again). Null = closed.
+  const [viewingDispatchId, setViewingDispatchId] = useState<string | null>(null);
   const [expandedWorkstreamId, setExpandedWorkstreamId] = useState<string | null>(null);
   const [wsPickerOpen, setWsPickerOpen] = useState(false);
   const [wsPickerCreateMode, setWsPickerCreateMode] = useState(false);
@@ -198,6 +334,9 @@ const App = () => {
     () => new Set<string>(),
   );
   const [composeThreadId, setComposeThreadId] = useState<string | null>(null);
+  // Which thread row currently has its Send-to dropdown open (null
+  // = none). Only one open at a time.
+  const [sendToOpenFor, setSendToOpenFor] = useState<string | null>(null);
   const [pendingDispatch, setPendingDispatch] = useState<ComposedPacket | null>(null);
   const [dispatchInFlight, setDispatchInFlight] = useState(false);
   const [reviewThreadId, setReviewThreadId] = useState<string | null>(null);
@@ -292,6 +431,31 @@ const App = () => {
             // Silent: SystemBanners covers the broader companion/vault state.
           });
         }, 150);
+      }
+      if (isFocusThreadInSidePanelMessage(message)) {
+        // Chat-side floating button → find the matching thread by URL,
+        // scroll its row into view, briefly highlight via the
+        // .focusing CSS class. We read state via a stale closure here,
+        // which is fine — the side panel's last refresh is what the
+        // user is looking at.
+        const targetUrl = message.threadUrl;
+        // Defer to next tick so the message handler doesn't block.
+        window.setTimeout(() => {
+          // Search the live state via a state setter callback to
+          // avoid a stale closure on `state`.
+          setState((current) => {
+            const match = current.threads.find((t) => t.threadUrl === targetUrl);
+            if (match !== undefined) {
+              const node = threadRowRefs.current.get(match.bac_id);
+              node?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              setFocusingThreadId(match.bac_id);
+              window.setTimeout(() => {
+                setFocusingThreadId((prev) => (prev === match.bac_id ? null : prev));
+              }, 1500);
+            }
+            return current;
+          });
+        }, 0);
       }
     };
     runtimeMessages.addListener(listener);
@@ -408,6 +572,19 @@ const App = () => {
   const [composeTurnsByUrl, setComposeTurnsByUrl] = useState<
     ReadonlyMap<string, readonly CapturedTurnRecord[]>
   >(() => new Map<string, readonly CapturedTurnRecord[]>());
+  // Inline captured-turn history under a thread row. Title click
+  // toggles which thread is expanded; the fetch pattern mirrors
+  // composeTurnsByUrl above. We cache by threadUrl so collapsing
+  // and re-expanding doesn't re-fetch.
+  const [titleExpandedFor, setTitleExpandedFor] = useState<string | null>(null);
+  const [inlineTurnsByUrl, setInlineTurnsByUrl] = useState<
+    ReadonlyMap<string, readonly CapturedTurnRecord[]>
+  >(() => new Map<string, readonly CapturedTurnRecord[]>());
+  // Refs to thread row DOM elements, keyed by bac_id, so the
+  // chat-side focus button can scrollIntoView + flash the matching
+  // row. Map mutated via the ref callback below.
+  const threadRowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const [focusingThreadId, setFocusingThreadId] = useState<string | null>(null);
   useEffect(() => {
     if (
       composeThread === undefined ||
@@ -439,6 +616,86 @@ const App = () => {
       cancelled = true;
     };
   }, [composeThread, bridgeKey, port, composeTurnsByUrl]);
+
+  // Pre-fetch turns when the Send-to dropdown opens, so the smart-
+  // default packet builder has full chat context cached when the
+  // user picks a target. Reuses composeTurnsByUrl as the shared
+  // cache. No-op when the user closes the dropdown without picking.
+  useEffect(() => {
+    if (sendToOpenFor === null || bridgeKey.length === 0) {
+      return undefined;
+    }
+    const targetThread = state.threads.find((t) => t.bac_id === sendToOpenFor);
+    if (targetThread === undefined) {
+      return undefined;
+    }
+    const targetUrl = targetThread.threadUrl;
+    if (composeTurnsByUrl.has(targetUrl)) {
+      return undefined;
+    }
+    const portNumber = Number(port);
+    if (!Number.isFinite(portNumber) || portNumber <= 0) {
+      return undefined;
+    }
+    let cancelled = false;
+    const client = createTurnsClient({ port: portNumber, bridgeKey });
+    void client
+      .recentForThread(targetUrl, { limit: 12 })
+      .then((list) => {
+        if (!cancelled) {
+          setComposeTurnsByUrl((prev) => new Map(prev).set(targetUrl, list));
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setComposeTurnsByUrl((prev) => new Map(prev).set(targetUrl, []));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sendToOpenFor, state.threads, bridgeKey, port, composeTurnsByUrl]);
+
+  // Lazy-fetch the most recent turns for the inline-expanded thread.
+  // Triggered when the user clicks the title; cached by threadUrl
+  // so a second expansion of the same row is instant.
+  useEffect(() => {
+    if (titleExpandedFor === null || bridgeKey.length === 0) {
+      return undefined;
+    }
+    const expandedThread = state.threads.find((t) => t.bac_id === titleExpandedFor);
+    if (expandedThread === undefined) {
+      return undefined;
+    }
+    const targetUrl = expandedThread.threadUrl;
+    if (inlineTurnsByUrl.has(targetUrl)) {
+      return undefined;
+    }
+    const portNumber = Number(port);
+    if (!Number.isFinite(portNumber) || portNumber <= 0) {
+      return undefined;
+    }
+    let cancelled = false;
+    const client = createTurnsClient({ port: portNumber, bridgeKey });
+    void client
+      .recentForThread(targetUrl, { limit: 5 })
+      .then((list) => {
+        if (!cancelled) {
+          setInlineTurnsByUrl((prev) => new Map(prev).set(targetUrl, list));
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          // Cache an empty result so we don't keep retrying on a
+          // companion that's down. The user can collapse + re-
+          // expand to retry.
+          setInlineTurnsByUrl((prev) => new Map(prev).set(targetUrl, []));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [titleExpandedFor, state.threads, bridgeKey, port, inlineTurnsByUrl]);
 
   useEffect(() => {
     if (state.companionStatus !== 'connected' || bridgeKey.length === 0) {
@@ -585,6 +842,135 @@ const App = () => {
     })();
   };
 
+  // "Find" icon in the side-panel header. Reads the active tab in
+  // the focused window, finds a tracked thread whose threadUrl
+  // matches, scrolls + flashes the row using the same
+  // threadRowRefs / focusingThreadId machinery we ship for the
+  // background-broadcast focus path. If the active tab isn't a
+  // tracked thread, surface a banner.
+  const findActiveTabThread = (): void => {
+    void (async () => {
+      try {
+        const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        const url = tabs[0]?.url;
+        if (url === undefined) {
+          setError('Could not read the active tab. Try focusing a chat tab first.');
+          return;
+        }
+        const match = state.threads.find((t) => t.threadUrl === url);
+        if (match === undefined) {
+          setError(
+            'The active tab is not a tracked thread. Open one of your tracked chats and try again.',
+          );
+          return;
+        }
+        const node = threadRowRefs.current.get(match.bac_id);
+        node?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        setFocusingThreadId(match.bac_id);
+        window.setTimeout(() => {
+          setFocusingThreadId((prev) => (prev === match.bac_id ? null : prev));
+        }, 1500);
+      } catch (lookupError) {
+        setError(
+          lookupError instanceof Error
+            ? lookupError.message
+            : 'Could not find a matching thread row.',
+        );
+      }
+    })();
+  };
+
+  // ─── Send-to dropdown smart-default packet builder ─────────────
+  // Bypass the composer for the 70% case: pick a target → build a
+  // packet with smart defaults and route to DispatchConfirm. Map
+  // each SendToTarget to (kind, ComposedPacket.target). The body
+  // is rendered from the existing PacketComposer template helpers
+  // (research / coding / notebook) so output matches what the
+  // composer would produce.
+  const SEND_TO_INTENT: Record<
+    SendToTarget,
+    {
+      readonly kind: ComposedPacket['kind'];
+      readonly target: ComposedPacket['target'];
+    }
+  > = {
+    claude: { kind: 'research_packet', target: 'claude' },
+    gpt_pro: { kind: 'research_packet', target: 'gpt_pro' },
+    gemini: { kind: 'research_packet', target: 'gemini' },
+    claude_code: { kind: 'coding_agent_packet', target: 'claude_code' },
+    codex: { kind: 'coding_agent_packet', target: 'codex' },
+    cursor: { kind: 'coding_agent_packet', target: 'cursor' },
+    markdown: { kind: 'notebook_export', target: 'markdown' },
+    notebook: { kind: 'notebook_export', target: 'notebook' },
+  };
+
+  const buildSmartDefaultPacket = (
+    thread: TrackedThread,
+    target: SendToTarget,
+  ): ComposedPacket => {
+    const intent = SEND_TO_INTENT[target];
+    const turns = composeTurnsByUrl.get(thread.threadUrl) ?? [];
+    const turnsMd =
+      turns.length === 0
+        ? '_No turns captured yet._'
+        : turns
+            .map((t) => {
+              const role = t.role === 'assistant' ? '### Assistant' : '### User';
+              const text = t.text.length > 1200 ? `${t.text.slice(0, 1200)}…` : t.text;
+              return `${role}\n${text}`;
+            })
+            .join('\n\n');
+    const provider = providerLabel(thread.provider);
+    const head = `## Source\n${provider} · ${thread.threadUrl}`;
+    let body: string;
+    if (intent.kind === 'research_packet') {
+      body = `# Research request: ${thread.title}\n\n${head}\n\n## Pre-flight checklist for the receiving AI\n- [ ] Verify the conclusion against the original source\n- [ ] Note any framework versions / dates the source assumes\n- [ ] Flag if the question has shifted since first ask\n- [ ] Distinguish what was asserted vs cited\n\n## Recent context\n${turnsMd}\n\n## Ask\n…`;
+    } else if (intent.kind === 'coding_agent_packet') {
+      body = `# Coding handoff: ${thread.title}\n\n## Source thread\n${provider} · ${thread.threadUrl}\n\n## Recent context\n${turnsMd}\n\n## Files / modules involved\n…\n\n## Acceptance criteria\n- [ ] …\n- [ ] …\n\n## Constraints\n- Do not modify unrelated files.\n- Run the existing test suite before reporting done.`;
+    } else {
+      const today = new Date().toISOString().slice(0, 10);
+      body = `---\ntitle: ${thread.title}\ncreated: ${today}\nsource: ${thread.threadUrl}\nprovider: ${provider}\n---\n\n# ${thread.title}\n\n${turnsMd}`;
+    }
+    return {
+      kind: intent.kind,
+      template: intent.kind === 'research_packet' ? 'web_to_ai_checklist' : null,
+      target: intent.target,
+      title: thread.title,
+      body,
+      scopeLabel: thread.title,
+      sourceThreadId: thread.bac_id,
+      tokenEstimate: Math.ceil(body.length / 4),
+      redactedItems: [],
+      ...(thread.primaryWorkstreamId === undefined
+        ? {}
+        : { workstreamId: thread.primaryWorkstreamId }),
+    };
+  };
+
+  const handleSendToPick = (thread: TrackedThread, target: SendToTarget): void => {
+    setSendToOpenFor(null);
+    const packet = buildSmartDefaultPacket(thread, target);
+    // Cache the user's last target so the dropdown's "Recent" row
+    // pre-selects it next time.
+    void sendRequest({
+      type: messageTypes.cacheLastDispatchTarget,
+      threadId: thread.bac_id,
+      target,
+    }).catch(() => undefined);
+    if (target === 'markdown' || target === 'notebook') {
+      // Export targets bypass DispatchConfirm — write the file
+      // immediately and record the dispatch event so it shows up in
+      // Recent Dispatches.
+      const safeTitle = thread.title.replace(/[^a-z0-9-_]+/gi, '-').slice(0, 80);
+      downloadAsFile(`${safeTitle || 'sidetrack-packet'}.md`, packet.body);
+      setError(`Downloaded ${safeTitle || 'sidetrack-packet'}.md.`);
+      setPendingDispatch(packet);
+      return;
+    }
+    // AI providers + coding agents → confirm modal, then dispatch.
+    setPendingDispatch(packet);
+  };
+
   const submitQueueFollowUp = (threadId: string) => {
     const text = queueDraft.trim();
     if (text.length === 0) {
@@ -728,20 +1114,42 @@ const App = () => {
   };
 
   const handlePacketDispatch = (packet: ComposedPacket) => {
+    // Export targets bypass DispatchConfirm — they're a file write,
+    // not a chat round-trip. Render a download immediately and
+    // record a 'noted' DispatchEvent so it shows up in Recent
+    // Dispatches.
+    if (packet.target === 'notebook' || packet.target === 'markdown') {
+      const safeTitle = packet.title.replace(/[^a-z0-9-_]+/gi, '-').slice(0, 80);
+      const filename = `${safeTitle || 'sidetrack-packet'}.md`;
+      downloadAsFile(filename, packet.body);
+      setError(`Downloaded ${filename}.`);
+      // Still record the dispatch so Recent Dispatches has the row.
+      setPendingDispatch(packet);
+      setComposeThreadId(null);
+      return;
+    }
     setPendingDispatch(packet);
     setComposeThreadId(null);
   };
 
   const handlePacketSave = (packet: ComposedPacket) => {
-    // Save-to-vault routes through the same companion endpoint with status:'noted'.
+    // Save-to-vault: copy body to clipboard for the user's
+    // convenience, record the dispatch event with status:'noted'.
+    void navigator.clipboard.writeText(packet.body).catch(() => undefined);
     setPendingDispatch({ ...packet });
     setComposeThreadId(null);
+    setError('Packet saved to vault and copied to clipboard.');
   };
 
   const handlePacketCopy = (packet: ComposedPacket) => {
-    void navigator.clipboard.writeText(packet.body).catch(() => {
-      // Clipboard rejected (permissions, focus); fall through silently.
-    });
+    void navigator.clipboard
+      .writeText(packet.body)
+      .then(() => {
+        setError(`Packet copied to clipboard (${packet.tokenEstimate.toLocaleString()} tokens).`);
+      })
+      .catch(() => {
+        setError('Could not copy to clipboard — paste from the body field above.');
+      });
     setComposeThreadId(null);
   };
 
@@ -764,7 +1172,7 @@ const App = () => {
         settings !== null && isProviderWithOptIn(provider) && settings.autoSendOptIn[provider]
           ? 'auto-send'
           : 'paste';
-      await client.submit(
+      const submitResult = await client.submit(
         {
           kind: mapUiPacketKind(pendingDispatch.kind),
           target: { provider, mode },
@@ -779,6 +1187,39 @@ const App = () => {
         },
         idempotencyKey,
       );
+      // Cache the unredacted body locally — the companion stored a
+      // redacted form, but the user pastes the original into the
+      // chat, and the auto-link matcher needs to compare against
+      // what the user actually pasted. Fire-and-forget; failures
+      // shouldn't block the dispatch flow.
+      void sendRequest({
+        type: messageTypes.cacheDispatchOriginal,
+        dispatchId: submitResult.bac_id,
+        body: pendingDispatch.body,
+      }).catch(() => undefined);
+      // Update the per-thread "last target" so the SendToDropdown
+      // can pre-select it next time. Same for composer-driven
+      // dispatches as for one-tap Send-to picks.
+      if (pendingDispatch.sourceThreadId !== undefined) {
+        void sendRequest({
+          type: messageTypes.cacheLastDispatchTarget,
+          threadId: pendingDispatch.sourceThreadId,
+          target: pendingDispatch.target,
+        }).catch(() => undefined);
+      }
+      // Side-effect: copy the body + open the target provider in a
+      // new tab so the user can paste right into a fresh chat. Skip
+      // for export targets — those got their download in the
+      // composer handler. Skip for noted-only sinks (other) — no
+      // chat to open.
+      const targetUrl = TARGET_CHAT_URL[pendingDispatch.target];
+      if (targetUrl !== undefined) {
+        await navigator.clipboard.writeText(pendingDispatch.body).catch(() => undefined);
+        window.open(targetUrl, '_blank', 'noopener,noreferrer');
+        setError(
+          `Opened ${TARGET_PROVIDER_LABEL[provider] ?? provider} in a new tab. Packet copied to your clipboard — paste to send.`,
+        );
+      }
       setPendingDispatch(null);
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : 'Dispatch failed.');
@@ -830,9 +1271,10 @@ const App = () => {
   const submitReview = async (
     thread: TrackedThread,
     payload: {
-      readonly verdict: ReviewVerdict;
+      readonly verdict: ReviewVerdict | null;
       readonly reviewerNote: string;
       readonly perSpan: Record<string, string>;
+      readonly spanText?: Record<string, string>;
     },
     outcome: ReviewOutcome,
     spanContext: ReadonlyMap<
@@ -850,8 +1292,11 @@ const App = () => {
       return false;
     }
     const trimmedNote = payload.reviewerNote.trim();
-    if (trimmedNote.length === 0) {
-      setError('Reviewer note is required before saving the review.');
+    const hasPerSpanComment = Object.values(payload.perSpan).some(
+      (c) => c.trim().length > 0,
+    );
+    if (trimmedNote.length === 0 && !hasPerSpanComment) {
+      setError('Add a comment (overall or per-span) before saving the review.');
       return false;
     }
     setReviewInFlight(true);
@@ -863,9 +1308,11 @@ const App = () => {
         .filter(([, comment]) => comment.trim().length > 0)
         .map(([id, comment]) => {
           const context = spanContext.get(id);
+          // Prefer the user-edited text; fall back to the captured text.
+          const editedText = payload.spanText?.[id];
           return {
             id,
-            text: context?.text ?? thread.title,
+            text: editedText ?? context?.text ?? thread.title,
             comment: comment.trim(),
             ...(context?.capturedAt !== undefined ? { capturedAt: context.capturedAt } : {}),
           };
@@ -880,8 +1327,11 @@ const App = () => {
           sourceThreadId: thread.bac_id,
           sourceTurnOrdinal,
           provider: thread.provider,
-          verdict: payload.verdict,
-          reviewerNote: trimmedNote,
+          // Verdict is optional in the new UX — fall back to 'open' on
+          // the wire so we don't change the schema until we're sure
+          // the new comment-driven model sticks.
+          verdict: payload.verdict ?? 'open',
+          reviewerNote: trimmedNote.length > 0 ? trimmedNote : '(per-span comments only)',
           spans,
           outcome,
         },
@@ -944,10 +1394,12 @@ const App = () => {
     currentWsId === null ? null : (state.workstreams.find((w) => w.bac_id === currentWsId) ?? null);
   const currentWsLabel =
     currentWs === null ? 'not set' : workstreamPath(currentWs.bac_id, state.workstreams);
-  const currentWsThreads =
+  const currentWsThreads = sortThreadsByLifecycle(
     currentWsId === null
       ? threads.filter((t) => t.primaryWorkstreamId === undefined)
-      : threads.filter((t) => t.primaryWorkstreamId === currentWsId);
+      : threads.filter((t) => t.primaryWorkstreamId === currentWsId),
+    state.reminders,
+  );
   const activeCount = currentWsThreads.filter(
     (t) => t.status !== 'closed' && t.status !== 'archived' && t.status !== 'removed',
   ).length;
@@ -959,15 +1411,22 @@ const App = () => {
     setSelectedWorkstream(id ?? '');
   };
 
-  // Open vs closed/stale buckets across ALL workstreams (used by All view)
-  const openStatuses: TrackedThread['status'][] = ['active', 'tracked', 'queued', 'needs_organize'];
-  const allOpenThreads = threads.filter(
-    (t) => openStatuses.includes(t.status) && t.trackingMode !== 'stopped',
-  );
-  const allClosedThreads = threads
-    .filter((t) => !openStatuses.includes(t.status) || t.trackingMode === 'stopped')
-    .slice()
-    .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
+  // All Threads view bucketing: classify EVERY thread (open + closed)
+  // into the first matching lifecycle bucket per user priority order.
+  // Within each bucket: lastSeenAt desc.
+  const allThreadsByBucket = (() => {
+    const buckets = new Map<AllThreadsBucket, TrackedThread[]>(
+      ALL_THREAD_BUCKET_ORDER.map((b) => [b, []] as const),
+    );
+    for (const t of threads) {
+      const bucket = classifyAllThread(t, state.reminders);
+      buckets.get(bucket)?.push(t);
+    }
+    for (const [, list] of buckets) {
+      list.sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
+    }
+    return buckets;
+  })();
 
   // Captures: manual notes filtered by the current workstream (or Inbox)
   // plus inbound reminders whose linked thread sits in scope. Notes that
@@ -989,61 +1448,32 @@ const App = () => {
     currentWsId === null
       ? attachedSessions.filter((s) => s.workstreamId === undefined)
       : attachedSessions.filter((s) => s.workstreamId === currentWsId);
-  const codingSessionsByWs = (() => {
-    const groups = new Map<string | null, CodingSession[]>();
-    groups.set(null, []);
-    for (const ws of state.workstreams) {
-      groups.set(ws.bac_id, []);
-    }
-    for (const session of attachedSessions) {
-      const key = session.workstreamId ?? null;
-      const list = groups.get(key);
-      if (list === undefined) {
-        groups.set(key, [session]);
-      } else {
-        list.push(session);
-      }
-    }
-    return groups;
-  })();
-
-  // Group open threads by primary workstream id (null = inbox/not-set)
-  const openGroups = (() => {
-    const groups = new Map<string | null, TrackedThread[]>();
-    groups.set(null, []);
-    for (const ws of state.workstreams) {
-      groups.set(ws.bac_id, []);
-    }
-    for (const t of allOpenThreads) {
-      const key = t.primaryWorkstreamId ?? null;
-      const list = groups.get(key);
-      if (list === undefined) {
-        groups.set(key, [t]);
-      } else {
-        list.push(t);
-      }
-    }
-    // Show a group if it has any threads OR coding sessions, plus always
-    // surface the inbox so the user can see what hasn't been organized.
-    return Array.from(groups.entries()).filter(([key, list]) => {
-      if (key === null) return true;
-      if (list.length > 0) return true;
-      const sessions = codingSessionsByWs.get(key);
-      return sessions !== undefined && sessions.length > 0;
-    });
-  })();
-
   // Inline thread-row renderer reused across views.
   const renderThreadRow = (thread: TrackedThread) => {
     const isPrivate = isThreadPrivate(thread, state.workstreams);
     const lifecycle = deriveLifecycle(thread, state.reminders);
     const { dotClass, stampLabel, lifecyclePill } = lifecycle;
+    // Two timestamps when we have captured turns:
+    //   - synced (lastSeenAt) = when the side panel last fetched
+    //   - updated (max turn capturedAt) = when the chat last changed
+    // Fall back to a single line when no turns are fetched yet so we
+    // don't display a redundant "synced 2m · updated 2m" pair.
+    const cachedTurnsForRow = inlineTurnsByUrl.get(thread.threadUrl);
+    const lastTurnAt =
+      cachedTurnsForRow !== undefined && cachedTurnsForRow.length > 0
+        ? cachedTurnsForRow.reduce<string>(
+            (latest, t) => (t.capturedAt > latest ? t.capturedAt : latest),
+            '',
+          )
+        : null;
     const stamp =
       thread.status === 'restorable'
         ? `Tab closed · ${formatRelative(thread.lastSeenAt)}`
         : thread.trackingMode === 'stopped'
           ? `Tracking stopped · ${formatRelative(thread.lastSeenAt)}`
-          : `${stampLabel} · ${formatRelative(thread.lastSeenAt)}`;
+          : lastTurnAt !== null && lastTurnAt !== thread.lastSeenAt
+            ? `synced ${formatRelative(thread.lastSeenAt)} · updated ${formatRelative(lastTurnAt)}`
+            : `${stampLabel} · ${formatRelative(thread.lastSeenAt)}`;
     const titleDisplay = isPrivate ? '[private]' : thread.title;
     const pendingQueueItems = state.queueItems.filter(
       (q) => q.targetId === thread.bac_id && q.status === 'pending',
@@ -1060,22 +1490,54 @@ const App = () => {
     const threadNotes = state.captureNotes
       .filter((note) => note.threadId === thread.bac_id)
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-    const historyOpen = threadHistoryOpen.has(thread.bac_id);
+    // Auto-expand the inline history strip when the thread has any
+    // notes — captures should be visible without a click. Empty
+    // strips collapse to the "+ note" affordance. The user can still
+    // toggle explicitly via the strip header, which overrides the
+    // auto-expand.
+    const historyExplicitlyToggled = threadHistoryOpen.has(thread.bac_id);
+    const historyOpen = historyExplicitlyToggled || threadNotes.length > 0;
     const historyComposeOpen = threadNoteFor === thread.bac_id;
+    const titleExpanded = titleExpandedFor === thread.bac_id;
+    const inlineTurns = inlineTurnsByUrl.get(thread.threadUrl);
+    const isFocusing = focusingThreadId === thread.bac_id;
     return (
-      <div key={thread.bac_id} className="thread">
+      <div
+        key={thread.bac_id}
+        className={'thread' + (isFocusing ? ' focusing' : '')}
+        ref={(node) => {
+          if (node === null) {
+            threadRowRefs.current.delete(thread.bac_id);
+          } else {
+            threadRowRefs.current.set(thread.bac_id, node);
+          }
+        }}
+      >
         <div className="row1">
           <span className={'provider ' + thread.provider}>{providerLabel(thread.provider)}</span>
           <button
             type="button"
-            className="thread-name-btn"
-            title={isPrivate ? 'Open thread tab' : `Open: ${thread.title}`}
+            className={'thread-name-btn' + (titleExpanded ? ' expanded' : '')}
+            title="Click to view captured turns from this thread"
+            aria-expanded={titleExpanded}
+            onClick={(e) => {
+              e.stopPropagation();
+              setTitleExpandedFor(titleExpanded ? null : thread.bac_id);
+            }}
+          >
+            <span className="name">{titleDisplay}</span>
+          </button>
+          <button
+            type="button"
+            className="thread-focus-btn"
+            title={isPrivate ? 'Open thread tab' : `Focus: ${thread.title}`}
+            aria-label="Open or focus the thread tab"
             onClick={(e) => {
               e.stopPropagation();
               openTabForThread(thread);
             }}
           >
-            <span className="name">{titleDisplay}</span>
+            ↗
           </button>
           {queuedCount > 0 ? (
             <button
@@ -1095,11 +1557,16 @@ const App = () => {
         <div className="row2">
           <span className={'dot ' + dotClass} />
           <span className="stamp">{stamp}</span>
-          {lifecyclePill === undefined ? null : (
+          {/* Per spec: dot + stamp already convey lifecycle. The
+              lifecycle pill is redundant for unread / waiting /
+              you-replied / stale / tab-closed / tracking-stopped
+              (the dot color + stamp text agree). Keep it only for
+              "Needs organize" — no dot-color story for that. */}
+          {lifecyclePill?.label === 'Needs organize' ? (
             <span className={'lifecycle-pill mono ' + lifecyclePill.tone}>
               {lifecyclePill.label}
             </span>
-          )}
+          ) : null}
         </div>
         {parent !== undefined || thread.parentTitle !== undefined ? (
           <div className="row2 thread-lineage" title="Branched from a tracked thread">
@@ -1170,27 +1637,50 @@ const App = () => {
                 `${action} needs a connected companion to read this thread's turns from the vault. Open Settings (cog, top right) → enter the bridge port and key → Save, then try again.`,
               );
             };
+            const sendDropdownOpen = sendToOpenFor === thread.bac_id;
+            const recentTarget = state.lastDispatchTargetByThread[thread.bac_id] as
+              | SendToTarget
+              | undefined;
             return (
               <>
-                <button
-                  type="button"
-                  className={'btn-link' + (requiresCompanion ? ' disabled-look' : '')}
-                  title={
-                    requiresCompanion
-                      ? 'Send is unavailable in local-only mode — click for setup steps'
-                      : 'Compose a packet from this thread and dispatch to another AI'
-                  }
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    if (requiresCompanion) {
-                      explainNeedsCompanion('Send');
-                      return;
+                <span className="send-to-anchor">
+                  <button
+                    type="button"
+                    className={'btn-link' + (requiresCompanion ? ' disabled-look' : '')}
+                    title={
+                      requiresCompanion
+                        ? 'Send is unavailable in local-only mode — click for setup steps'
+                        : 'Send this thread to another AI / coding agent / file'
                     }
-                    setComposeThreadId(thread.bac_id);
-                  }}
-                >
-                  Send
-                </button>
+                    aria-haspopup="menu"
+                    aria-expanded={sendDropdownOpen}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (requiresCompanion) {
+                        explainNeedsCompanion('Send');
+                        return;
+                      }
+                      setSendToOpenFor(sendDropdownOpen ? null : thread.bac_id);
+                    }}
+                  >
+                    Send to ▾
+                  </button>
+                  {sendDropdownOpen ? (
+                    <SendToDropdown
+                      recentTarget={recentTarget}
+                      onPick={(target) => {
+                        handleSendToPick(thread, target);
+                      }}
+                      onCustomize={() => {
+                        setSendToOpenFor(null);
+                        setComposeThreadId(thread.bac_id);
+                      }}
+                      onClose={() => {
+                        setSendToOpenFor(null);
+                      }}
+                    />
+                  ) : null}
+                </span>
                 <button
                   type="button"
                   className={'btn-link' + (requiresCompanion ? ' disabled-look' : '')}
@@ -1379,6 +1869,42 @@ const App = () => {
               </li>
             ))}
           </ul>
+        ) : null}
+        {titleExpanded ? (
+          <div className="thread-turn-history">
+            <div className="thread-turn-history-head mono">
+              captured turns
+              {inlineTurns !== undefined ? (
+                <span className="thread-turn-history-count">
+                  · {String(inlineTurns.length)} {inlineTurns.length === 1 ? 'turn' : 'turns'}
+                </span>
+              ) : null}
+            </div>
+            {inlineTurns === undefined ? (
+              <div className="thread-turn-history-empty mono">loading…</div>
+            ) : inlineTurns.length === 0 ? (
+              <div className="thread-turn-history-empty mono">
+                no captured turns for this thread (companion may be unreachable)
+              </div>
+            ) : (
+              inlineTurns.map((turn) => (
+                <div
+                  key={`${turn.role}-${String(turn.ordinal)}-${turn.capturedAt}`}
+                  className={'thread-turn-card thread-turn-' + turn.role}
+                >
+                  <span className="thread-turn-role mono">{turn.role}</span>
+                  <span className="thread-turn-text">
+                    {turn.text.length > 200
+                      ? `${turn.text.slice(0, 200).trim()}…`
+                      : turn.text}
+                  </span>
+                  <span className="thread-turn-time mono">
+                    {formatRelative(turn.capturedAt)}
+                  </span>
+                </div>
+              ))
+            )}
+          </div>
         ) : null}
         <div className="thread-history">
           {historyOpen ? (
@@ -1589,6 +2115,18 @@ const App = () => {
         <div className="app-actions">
           <button
             className="icon-btn"
+            title="Find this tab in the side panel — scrolls + flashes the matching thread row"
+            onClick={findActiveTabThread}
+            type="button"
+            aria-label="Find active tab in side panel"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="11" cy="11" r="7" />
+              <line x1="21" y1="21" x2="16.65" y2="16.65" />
+            </svg>
+          </button>
+          <button
+            className="icon-btn"
             title={
               state.companionStatus === 'connected'
                 ? 'Attach coding session'
@@ -1739,60 +2277,185 @@ const App = () => {
       ) : (
         <>
           <div className="sec-head">
-            <span>Open threads</span>
+            <span>All threads</span>
             <span className="count mono">
-              {String(allOpenThreads.length)} active across {String(openGroups.length)} workstream
-              {openGroups.length === 1 ? '' : 's'}
+              {String(threads.length)} total · grouped by lifecycle
             </span>
           </div>
-          <div className="all-groups">
-            {openGroups.map(([wsId, list]) => {
-              const ws = wsId === null ? null : state.workstreams.find((w) => w.bac_id === wsId);
-              const groupLabel = ws === null ? 'not set · Inbox' : (ws?.title ?? 'unknown');
-              const groupSessions = codingSessionsByWs.get(wsId) ?? [];
-              const totalRows = list.length + groupSessions.length;
-              return (
-                <div className="ws-group" key={wsId ?? '__inbox'}>
-                  <button
-                    type="button"
-                    className="ws-group-head"
-                    onClick={() => {
-                      setCurrentWs(wsId);
-                      setViewMode('workstream');
-                    }}
-                  >
-                    <span className="ws-group-label">{groupLabel}</span>
-                    <span className="ws-group-count mono">
-                      {String(totalRows)} item{totalRows === 1 ? '' : 's'} →
-                    </span>
-                  </button>
-                  {totalRows > 0 ? (
-                    <div className="thread-list">
-                      {groupSessions.map(renderCodingSessionRow)}
-                      {list.map(renderThreadRow)}
-                    </div>
-                  ) : (
-                    <div className="thread-empty subtle group-empty">
-                      <p>No open items in this workstream.</p>
-                    </div>
-                  )}
+          {ALL_THREAD_BUCKET_ORDER.map((bucket) => {
+            const list = allThreadsByBucket.get(bucket) ?? [];
+            if (list.length === 0) {
+              return null;
+            }
+            return (
+              <div className={'thread-bucket thread-bucket-' + bucket} key={bucket}>
+                <div className="thread-bucket-head">
+                  <span className="thread-bucket-label">
+                    {ALL_THREAD_BUCKET_LABEL[bucket]}
+                  </span>
+                  <span className="thread-bucket-count mono">{String(list.length)}</span>
                 </div>
-              );
-            })}
-          </div>
-          {allClosedThreads.length > 0 ? (
-            <>
-              <div className="sec-head">
-                <span>Closed · stale</span>
-                <span className="count mono">
-                  {String(allClosedThreads.length)} · ordered by last seen
-                </span>
+                <div className="thread-list">{list.map(renderThreadRow)}</div>
               </div>
-              <div className="thread-list">{allClosedThreads.map(renderThreadRow)}</div>
-            </>
-          ) : null}
+            );
+          })}
         </>
       )}
+
+      {(() => {
+        // Recent Dispatches: chronological log of packets sent out of
+        // Sidetrack (review submit-backs, dispatch-out packets, coding
+        // agent packets). Only render when there's at least one.
+        const dispatches = state.recentDispatches.slice(0, 12);
+        if (dispatches.length === 0) {
+          return null;
+        }
+        const linksMap = state.dispatchLinks;
+        const dispatchEvents: RecentDispatchEvent[] = dispatches.map((d) => {
+          const sourceTitle =
+            state.threads.find((t) => t.bac_id === d.sourceThreadId)?.title ?? d.title;
+          // Auto-link: if the matcher paired this dispatch to a
+          // captured destination thread, surface its title so the
+          // row reads "→ Gemini · my new chat" instead of "pending
+          // chat". The action button also flips to "↗ open".
+          const linkedThreadId = linksMap[d.bac_id];
+          const linkedThread =
+            linkedThreadId === undefined
+              ? undefined
+              : state.threads.find((t) => t.bac_id === linkedThreadId);
+          return {
+            bac_id: d.bac_id,
+            sourceTitle,
+            targetProviderLabel:
+              DISPATCH_PROVIDER_LABEL[d.target.provider] ?? d.target.provider,
+            ...(linkedThread === undefined
+              ? {}
+              : { targetThreadTitle: linkedThread.title }),
+            mode: d.target.mode,
+            dispatchKind: DISPATCH_KIND_TO_DISPLAY[d.kind] ?? 'dispatch_out',
+            dispatchedAt: formatRelative(d.createdAt),
+            status: DISPATCH_STATUS_TO_DISPLAY(d.status),
+          };
+        });
+        // Helper: map companion target.provider → ComposedPacket
+        // target shape used by TARGET_CHAT_URL.
+        const lookupChatUrl = (provider: string): string | undefined => {
+          const targetKey = (
+            provider === 'chatgpt'
+              ? 'gpt_pro'
+              : provider === 'claude_code'
+                ? 'claude_code'
+                : provider
+          ) as keyof typeof TARGET_CHAT_URL;
+          return TARGET_CHAT_URL[targetKey];
+        };
+        return (
+          <>
+            <div className="sec-head">
+              <span>Recent dispatches</span>
+              <span className="sec-head-actions">
+                <span className="count mono">{String(dispatchEvents.length)}</span>
+              </span>
+            </div>
+            <RecentDispatches
+              dispatches={dispatchEvents}
+              onFocusSource={(id) => {
+                const dispatch = state.recentDispatches.find((d) => d.bac_id === id);
+                if (dispatch === undefined) {
+                  return;
+                }
+                const thread = state.threads.find((t) => t.bac_id === dispatch.sourceThreadId);
+                if (thread !== undefined) {
+                  openTabForThread(thread);
+                  return;
+                }
+                setError(
+                  'Source thread is no longer tracked (archived or removed). Use the target side of the row to reopen the destination chat.',
+                );
+              }}
+              onOpenTarget={(id) => {
+                // For LINKED rows: jump to the destination thread (if
+                // we still track it). For UNLINKED rows the dedicated
+                // Copy / Dispatch buttons handle the action; a click
+                // on the target chip opens the viewer modal instead
+                // of doing anything destructive.
+                const dispatch = state.recentDispatches.find((d) => d.bac_id === id);
+                if (dispatch === undefined) {
+                  return;
+                }
+                const linkedThreadId = linksMap[id];
+                if (linkedThreadId !== undefined) {
+                  const linkedThread = state.threads.find((t) => t.bac_id === linkedThreadId);
+                  if (linkedThread !== undefined) {
+                    openTabForThread(linkedThread);
+                    return;
+                  }
+                }
+                // No link → open viewer (read-only, with copy +
+                // download). Avoids the surprise of opening a fresh
+                // empty chat just from clicking the target chip.
+                setViewingDispatchId(id);
+              }}
+              onView={(id) => {
+                setViewingDispatchId(id);
+              }}
+              onCopy={(id) => {
+                // Paste-mode action: re-copy + open new chat.
+                const dispatch = state.recentDispatches.find((d) => d.bac_id === id);
+                if (dispatch === undefined) {
+                  return;
+                }
+                const url = lookupChatUrl(dispatch.target.provider);
+                if (url === undefined) {
+                  // Export / external target → open viewer instead.
+                  setViewingDispatchId(id);
+                  return;
+                }
+                void navigator.clipboard
+                  .writeText(dispatch.body)
+                  .then(() => {
+                    setError(
+                      `Re-copied packet to clipboard. Opening ${TARGET_PROVIDER_LABEL[dispatch.target.provider] ?? dispatch.target.provider} — paste to send.`,
+                    );
+                  })
+                  .catch(() => {
+                    setError(
+                      `Could not re-copy to clipboard. Click "view" to open the body and copy manually.`,
+                    );
+                  });
+                window.open(url, '_blank', 'noopener,noreferrer');
+              }}
+              onDispatch={(id) => {
+                // Auto-send mode action: open the target tab AND
+                // auto-send via the orchestrator. Background owns the
+                // "wait for tab to load → inject content script →
+                // autoSendItem" flow.
+                const dispatch = state.recentDispatches.find((d) => d.bac_id === id);
+                if (dispatch === undefined) {
+                  return;
+                }
+                const url = lookupChatUrl(dispatch.target.provider);
+                if (url === undefined) {
+                  setViewingDispatchId(id);
+                  return;
+                }
+                void runAction(async () => {
+                  await sendRequest({
+                    type: messageTypes.dispatchAutoSendInNewTab,
+                    dispatchId: id,
+                    url,
+                    body: dispatch.body,
+                  });
+                  setError(
+                    `Opening ${TARGET_PROVIDER_LABEL[dispatch.target.provider] ?? dispatch.target.provider} and auto-sending the packet…`,
+                  );
+                  return await sendRequest({ type: messageTypes.getWorkboardState });
+                });
+              }}
+            />
+          </>
+        );
+      })()}
 
       <div className="sec-head">
         <span>Captures</span>
@@ -1906,6 +2569,23 @@ const App = () => {
         ))}
       </div>
 
+      {/* Build identity — small mono line at the very bottom of the
+          side panel. Lets the user confirm the loaded extension
+          matches their git state at a glance ("did the new build
+          actually load?"). Sourced from the vite-define inject in
+          wxt.config.ts. */}
+      <div className="build-version mono" title="Sidetrack build identity">
+        v{__BUILD_INFO__.version} · {__BUILD_INFO__.sha} · built{' '}
+        {(() => {
+          try {
+            const d = new Date(__BUILD_INFO__.builtAt);
+            return d.toISOString().slice(11, 16) + ' UTC';
+          } catch {
+            return __BUILD_INFO__.builtAt;
+          }
+        })()}
+      </div>
+
       {moveThread ? (
         <MoveToPicker
           currentPath={workstreamPath(moveThread.primaryWorkstreamId, state.workstreams)}
@@ -1952,6 +2632,23 @@ const App = () => {
             TARGET_PROVIDER_LABEL[mapUiTarget(pendingDispatch.target)] ??
             mapUiTarget(pendingDispatch.target)
           }
+          body={pendingDispatch.body}
+          dispatchKind={(() => {
+            // Map the packet target → side-effect lane the modal
+            // uses for its "Will ..." header.
+            const t = pendingDispatch.target;
+            if (t === 'markdown' || t === 'notebook') return 'export' as const;
+            if (t === 'codex' || t === 'claude_code' || t === 'cursor')
+              return 'coding' as const;
+            // AI providers: paste vs auto-send depends on the user's
+            // settings + the thread's autoSendEnabled toggle.
+            const provider = mapUiTarget(t);
+            const autoOn =
+              settings !== null &&
+              isProviderWithOptIn(provider) &&
+              settings.autoSendOptIn[provider];
+            return autoOn ? ('chat-auto' as const) : ('chat-paste' as const);
+          })()}
           tokenEstimate={pendingDispatch.tokenEstimate}
           redactedCount={pendingDispatch.redactedItems.reduce((sum, r) => sum + r.count, 0)}
           {...(pendingDispatch.redactedItems.length > 0
@@ -2039,32 +2736,106 @@ const App = () => {
                         }
                       });
                     }}
-                    onSubmitBack={() => {
+                    onSendBack={(payload) => {
                       if (reviewInFlight) {
                         return;
                       }
+                      // 1) Record the review to the vault.
+                      // 2) Queue the rendered comment as a follow-up
+                      //    against the same thread.
+                      // 3) Toggle auto-send on if it isn't already —
+                      //    the orchestrator wired in feat/auto-send-drain
+                      //    will paste-and-send into the live chat.
+                      const perSpanLines = Object.entries(payload.perSpan)
+                        .filter(([, comment]) => comment.trim().length > 0)
+                        .map(([, comment], i) => `${String(i + 1)}. ${comment.trim()}`)
+                        .join('\n');
+                      const followUpBody = [
+                        payload.reviewerNote.trim(),
+                        perSpanLines.length > 0
+                          ? `\n\nPer-span feedback:\n${perSpanLines}`
+                          : '',
+                      ]
+                        .join('')
+                        .trim();
                       void submitReview(
                         reviewThread,
-                        {
-                          verdict: 'partial',
-                          reviewerNote: `Submit-back from Sidetrack — ${reviewThread.title}`,
-                          perSpan: {},
-                        },
+                        payload,
                         'submit_back',
                         spanContext,
-                      ).then((ok) => {
-                        if (ok) {
-                          setReviewThreadId(null);
+                      ).then((reviewOk) => {
+                        if (!reviewOk) {
+                          return;
                         }
+                        // Skip the queue+drain step if there's nothing
+                        // to send (review-only save). Should not happen
+                        // because the button is gated, but defend.
+                        if (followUpBody.length === 0) {
+                          setReviewThreadId(null);
+                          return;
+                        }
+                        void runAction(async () => {
+                          // Park the comment as a queue item against the
+                          // source thread.
+                          await sendRequest({
+                            type: messageTypes.queueFollowUp,
+                            item: {
+                              text: followUpBody,
+                              scope: 'thread',
+                              targetId: reviewThread.bac_id,
+                            },
+                          });
+                          // Make sure auto-send is on so the orchestrator
+                          // ships the queued comment into the chat.
+                          if (reviewThread.autoSendEnabled !== true) {
+                            await sendRequest({
+                              type: messageTypes.setThreadAutoSend,
+                              threadId: reviewThread.bac_id,
+                              enabled: true,
+                            });
+                          }
+                          return await sendRequest({ type: messageTypes.getWorkboardState });
+                        });
+                        setReviewThreadId(null);
                       });
                     }}
-                    onDispatchOut={() => {
+                    onDispatchOut={(payload) => {
+                      // Build the dispatch body from the user's review
+                      // payload — verdict (optional now), note, and per-
+                      // span comments paired with the (possibly edited)
+                      // span text.
+                      const perSpanBlocks = Object.entries(payload.perSpan)
+                        .filter(([, comment]) => comment.trim().length > 0)
+                        .map(([id, comment]) => {
+                          const spanBody = payload.spanText[id] ?? '';
+                          return [
+                            `> ${spanBody.replace(/\n/g, '\n> ')}`,
+                            '',
+                            comment.trim(),
+                          ].join('\n');
+                        })
+                        .join('\n\n---\n\n');
+                      const body = [
+                        `# Review notes`,
+                        '',
+                        `## Source thread`,
+                        `${providerLabel(reviewThread.provider)} · ${reviewThread.threadUrl}`,
+                        ...(payload.verdict !== null
+                          ? ['', `## Verdict`, payload.verdict]
+                          : []),
+                        ...(payload.reviewerNote.trim().length > 0
+                          ? ['', `## Reviewer note`, payload.reviewerNote]
+                          : []),
+                        ...(perSpanBlocks.length > 0
+                          ? ['', `## Per-span feedback`, perSpanBlocks]
+                          : []),
+                      ].join('\n');
                       const dispatchPacket: ComposedPacket = {
                         kind: 'context_pack',
                         template: null,
                         target: 'claude',
                         title: `Review: ${reviewThread.title}`,
-                        body: `# Review notes\n\n## Source thread\n${providerLabel(reviewThread.provider)} · ${reviewThread.threadUrl}\n\n## Notes\n…`,
+                        body,
                         scopeLabel: reviewThread.title,
                         sourceThreadId: reviewThread.bac_id,
                         ...(reviewThread.primaryWorkstreamId !== undefined
@@ -2107,6 +2878,91 @@ const App = () => {
           }}
         />
       ) : null}
+
+      {viewingDispatchId !== null
+        ? (() => {
+            const dispatch = state.recentDispatches.find(
+              (d) => d.bac_id === viewingDispatchId,
+            );
+            if (dispatch === undefined) {
+              return null;
+            }
+            const targetLabel =
+              TARGET_PROVIDER_LABEL[dispatch.target.provider] ?? dispatch.target.provider;
+            const close = () => {
+              setViewingDispatchId(null);
+            };
+            return (
+              <div className="modal-backdrop" onClick={close}>
+                <div
+                  className="dispatch-viewer"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                  }}
+                >
+                  <div className="dispatch-viewer-head">
+                    <div>
+                      <h3 className="dispatch-viewer-title">{dispatch.title}</h3>
+                      <div className="dispatch-viewer-meta mono">
+                        {dispatch.kind} · {targetLabel} · {formatRelative(dispatch.createdAt)} ·{' '}
+                        {dispatch.tokenEstimate.toLocaleString()} tokens
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className="modal-close"
+                      onClick={close}
+                      aria-label="Close"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                  <textarea
+                    className="dispatch-viewer-body mono"
+                    value={dispatch.body}
+                    readOnly
+                  />
+                  <div className="dispatch-viewer-foot">
+                    <button type="button" className="btn btn-ghost" onClick={close}>
+                      Close
+                    </button>
+                    <div className="spacer" />
+                    <button
+                      type="button"
+                      className="btn btn-ghost"
+                      onClick={() => {
+                        const safeTitle = dispatch.title.replace(/[^a-z0-9-_]+/gi, '-').slice(0, 80);
+                        downloadAsFile(
+                          `${safeTitle || 'sidetrack-dispatch'}.md`,
+                          dispatch.body,
+                        );
+                        setError(`Re-downloaded ${safeTitle || 'sidetrack-dispatch'}.md.`);
+                      }}
+                    >
+                      ⤓ Download .md
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      onClick={() => {
+                        void navigator.clipboard
+                          .writeText(dispatch.body)
+                          .then(() => {
+                            setError('Copied dispatch body to clipboard.');
+                          })
+                          .catch(() => {
+                            setError('Could not copy — select the text above and copy manually.');
+                          });
+                      }}
+                    >
+                      Copy to clipboard
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })()
+        : null}
 
       {showWizard ? (
         <Wizard

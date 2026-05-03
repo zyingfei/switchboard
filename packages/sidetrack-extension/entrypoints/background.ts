@@ -36,7 +36,10 @@ import {
   setThreadAutoSend,
   createLocalWorkstream,
   deleteLocalCaptureNote,
+  markDispatchesRepliedForThread,
   markQueueItemsDoneFromTurns,
+  readCachedDispatches,
+  readDispatchLinks,
   readQueueItems,
   readThreads,
   readSettings,
@@ -51,7 +54,14 @@ import {
   updateLocalWorkstream,
   upsertLocalThread,
   writeCachedCodingSessions,
+  readDispatchOriginals,
+  writeCachedDispatches,
+  writeDispatchLink,
+  writeDispatchOriginal,
+  writeLastDispatchTargetByThread,
 } from '../src/background/state';
+import { createDispatchClient } from '../src/dispatch/client';
+import { tryLinkCapturedThread } from '../src/companion/dispatchLinking';
 
 const activeTab = async (): Promise<chrome.tabs.Tab | undefined> => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -64,6 +74,42 @@ const activeTab = async (): Promise<chrome.tabs.Tab | undefined> => {
 // the chat, the new turn is by definition not unread. Pre-existing
 // reminders for the same thread are also dismissed so a stale pill
 // doesn't linger after the user catches up.
+// Try to link a freshly captured thread to a recent un-linked
+// dispatch by matching the dispatch body prefix against any user
+// turn. Idempotent — re-running on the same thread doesn't move an
+// existing self-link. No-op if no recent dispatches.
+const tryAutoLinkCapturedThread = async (
+  threadId: string,
+  threadProvider: CaptureEvent['provider'],
+  userTurnTexts: readonly string[],
+  capturedAtMs: number,
+): Promise<void> => {
+  if (userTurnTexts.length === 0) {
+    return;
+  }
+  const [recentDispatches, existingLinks, originalBodiesById] = await Promise.all([
+    readCachedDispatches(),
+    readDispatchLinks(),
+    readDispatchOriginals(),
+  ]);
+  if (recentDispatches.length === 0) {
+    return;
+  }
+  const result = tryLinkCapturedThread({
+    threadId,
+    threadProvider,
+    userTurnTexts,
+    capturedAtMs,
+    recentDispatches,
+    existingLinks,
+    originalBodiesById,
+  });
+  if (result === null) {
+    return;
+  }
+  await writeDispatchLink(result.dispatchId, threadId);
+};
+
 const userIsViewingThreadUrl = async (threadUrl: string): Promise<boolean> => {
   try {
     const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
@@ -223,6 +269,22 @@ const sendToCompanion = async (
     .filter((turn) => turn.role === 'user')
     .map((turn) => turn.text);
   await markQueueItemsDoneFromTurns(threadResult.bac_id, recentUserTexts);
+  // Try to link this captured thread to a recent un-linked dispatch.
+  // If the user pasted a packet body into a fresh chat on the target
+  // provider, this turns "sent · pending" into "linked → <thread>"
+  // on the Recent Dispatches row.
+  await tryAutoLinkCapturedThread(
+    threadResult.bac_id,
+    event.provider,
+    recentUserTexts,
+    Date.parse(event.capturedAt),
+  );
+  // Flip 'sent' / 'pending' / 'queued' dispatches sourced from this
+  // thread to 'replied' once a fresh assistant turn lands. The user
+  // sees the pill update on the next side-panel poll.
+  if (lastTurn?.role === 'assistant') {
+    await markDispatchesRepliedForThread(threadResult.bac_id);
+  }
   await recordSelectorCanary(event);
   return threadResult;
 };
@@ -274,6 +336,12 @@ const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
     .filter((turn) => turn.role === 'user')
     .map((turn) => turn.text);
   await markQueueItemsDoneFromTurns(upserted.bac_id, recentUserTexts);
+  await tryAutoLinkCapturedThread(
+    upserted.bac_id,
+    event.provider,
+    recentUserTexts,
+    Date.parse(event.capturedAt),
+  );
   const lastTurn = event.turns.at(-1);
   if (existing !== undefined && lastTurn?.role === 'assistant') {
     if (await userIsViewingThreadUrl(event.threadUrl)) {
@@ -286,6 +354,7 @@ const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
         status: 'new',
       });
     }
+    await markDispatchesRepliedForThread(existing.bac_id);
   }
   await recordSelectorCanary(event);
 };
@@ -426,6 +495,61 @@ const ensureContentScriptInTab = async (tabId: number): Promise<{ ok: boolean; e
       error: error instanceof Error ? error.message : 'Could not inject content script.',
     };
   }
+};
+
+// One-shot auto-send into a freshly-opened tab. Used by the
+// dispatchAutoSendInNewTab handler: open URL → wait for `complete` →
+// inject content script → autoSendItem. The listener removes itself
+// after the first matching update so we don't accumulate handlers.
+//
+// We give the page a 30s grace period; provider chats sometimes load
+// quickly but their composer/Stop button lights up later. The
+// content-script driver has its own per-item timeout (90s) which
+// covers the AI's reply window.
+const autoSendOnceTabReady = (tabId: number, body: string): void => {
+  let cleared = false;
+  const fire = (): void => {
+    if (cleared) {
+      return;
+    }
+    cleared = true;
+    chrome.tabs.onUpdated.removeListener(listener);
+    void (async () => {
+      // Small extra delay so SPA shells finish hydrating their
+      // composer (Quill / ProseMirror / Tiptap) before we type.
+      await new Promise<void>((resolve) => setTimeout(resolve, 1500));
+      const dispatch = await sendToContentScriptWithRecovery(tabId, {
+        type: messageTypes.autoSendItem,
+        text: body,
+        perItemTimeoutMs: 90_000,
+      });
+      if (!dispatch.ok) {
+        console.warn(
+          '[dispatchAutoSendInNewTab] content-script send failed:',
+          dispatch.error ?? 'unknown',
+        );
+      }
+    })();
+  };
+  const listener = (
+    updatedTabId: number,
+    changeInfo: { readonly status?: string },
+  ): void => {
+    if (updatedTabId !== tabId) {
+      return;
+    }
+    if (changeInfo.status === 'complete') {
+      fire();
+    }
+  };
+  chrome.tabs.onUpdated.addListener(listener);
+  // Safety net — if the load event never fires (cross-origin redirect,
+  // service worker quirks), fall back to firing after 30s anyway. The
+  // content-script driver will report a clear error to the side panel
+  // if the composer isn't ready.
+  setTimeout(() => {
+    fire();
+  }, 30_000);
 };
 
 // Send `message` to the tab's content script, recovering once from
@@ -604,6 +728,31 @@ const refreshCachedCodingSessions = async (): Promise<void> => {
   }
 };
 
+const refreshCachedDispatches = async (): Promise<void> => {
+  if (!(await isCompanionConfigured())) {
+    await writeCachedDispatches([]);
+    return;
+  }
+  const settings = await readSettings();
+  try {
+    const dispatches = await createDispatchClient(settings.companion).listRecent({ limit: 20 });
+    // Keep the side-panel cache merged with any local 'replied' flips
+    // already on it — markDispatchesRepliedForThread runs on capture
+    // and writes locally; the next refresh from the companion would
+    // otherwise revert it until the companion learns about the reply.
+    const local = await readCachedDispatches();
+    const localReplies = new Map(
+      local.filter((d) => d.status === 'replied').map((d) => [d.bac_id, d.status]),
+    );
+    const merged = dispatches.map((d) =>
+      localReplies.has(d.bac_id) ? { ...d, status: 'replied' as const } : d,
+    );
+    await writeCachedDispatches(merged);
+  } catch {
+    // Companion unreachable — keep the existing cache.
+  }
+};
+
 const withCompanionStatus = async (
   work?: () => Promise<void>,
   reason?: WorkboardChangeReason,
@@ -615,6 +764,7 @@ const withCompanionStatus = async (
     await replayQueuedCaptures();
     const status = await assertCompanionReachable();
     await refreshCachedCodingSessions();
+    await refreshCachedDispatches();
     const state = await buildState(status);
     if (work !== undefined && reason !== undefined) {
       void broadcastWorkboardChanged(reason);
@@ -926,6 +1076,59 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
     }, 'queue');
   }
 
+  if (request.type === messageTypes.cacheDispatchOriginal) {
+    // Side panel just successfully submitted a dispatch and got back
+    // a bac_id. Stash the unredacted body locally so the auto-link
+    // matcher can use it on the next captured user turn.
+    return await withCompanionStatus(async () => {
+      await writeDispatchOriginal(request.dispatchId, request.body);
+    }, 'queue');
+  }
+
+  if (request.type === messageTypes.cacheLastDispatchTarget) {
+    // Side panel just fired a Send-to dispatch — record the target
+    // so the dropdown's "Recent" row can pre-select it next time.
+    return await withCompanionStatus(async () => {
+      await writeLastDispatchTargetByThread(request.threadId, request.target);
+    }, 'queue');
+  }
+
+  if (request.type === messageTypes.focusThreadInSidePanel) {
+    // Content-script focus button → broadcast to the side panel so
+    // it can scroll + flash the matching thread row. We re-broadcast
+    // verbatim because the side panel listens on chrome.runtime
+    // already (no need for a sticky storage hand-off — the side
+    // panel is always-on once opened).
+    void chrome.runtime
+      .sendMessage({
+        type: messageTypes.focusThreadInSidePanel,
+        threadUrl: request.threadUrl,
+      })
+      .catch(() => undefined);
+    return await withCompanionStatus();
+  }
+
+  if (request.type === messageTypes.dispatchAutoSendInNewTab) {
+    return await withCompanionStatus(async () => {
+      const { url, body } = request;
+      // Open the target chat URL in a new tab and let the
+      // tabs.onUpdated listener below auto-send into it once it
+      // finishes loading. Returns immediately — the side panel
+      // already showed a "opening + auto-sending…" banner.
+      try {
+        const created = await chrome.tabs.create({ url, active: true });
+        const tabId = created.id;
+        if (typeof tabId !== 'number') {
+          console.warn('[dispatchAutoSendInNewTab] tab create returned no tabId');
+          return;
+        }
+        autoSendOnceTabReady(tabId, body);
+      } catch (error) {
+        console.warn('[dispatchAutoSendInNewTab] open failed:', error);
+      }
+    }, 'queue');
+  }
+
   if (request.type === messageTypes.moveThread) {
     return await withCompanionStatus(
       () => moveThread(request.threadId, request.workstreamId),
@@ -976,6 +1179,7 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
       // it starts polling. The token isn't persisted in the cache; it's
       // returned through the response envelope below.
       await refreshCachedCodingSessions();
+    await refreshCachedDispatches();
       const status = await assertCompanionReachable();
       const state = await buildState(status);
       return { ok: true, state, attachToken };

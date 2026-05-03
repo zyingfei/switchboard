@@ -2,7 +2,12 @@ import { access, readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { expect, test } from '@playwright/test';
 
-import { seedAndOpenSidepanel, SETTINGS_KEY, THREADS_KEY, WORKSTREAMS_KEY } from './helpers/sidepanel';
+import {
+  seedAndOpenSidepanel,
+  SETTINGS_KEY,
+  THREADS_KEY,
+  WORKSTREAMS_KEY,
+} from './helpers/sidepanel';
 import { createMockVaultCompanion, type MockVaultCompanion } from './helpers/mockVaultCompanion';
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
 
@@ -67,7 +72,6 @@ test.describe('coding attach (synthetic)', () => {
         [WORKSTREAMS_KEY]: [workstream],
       });
 
-      await sidepanel.getByRole('tab', { name: 'All threads' }).click();
       await sidepanel.getByRole('button', { name: 'Attach coding session' }).click();
       await expect(sidepanel.getByRole('heading', { name: 'Attach coding session' })).toBeVisible();
       await sidepanel.locator('select').selectOption({ label: workstream.title });
@@ -92,6 +96,11 @@ test.describe('coding attach (synthetic)', () => {
       );
       expect(registerResult.workstreamId).toBe(workstreamId);
       await expectTokenConsumed(companion.vaultPath, minted.token);
+
+      await sidepanel.reload({ waitUntil: 'domcontentloaded' });
+      await expect(sidepanel.getByRole('main', { name: 'Sidetrack workboard' })).toBeVisible();
+      await sidepanel.getByRole('button', { name: /not set/ }).click();
+      await sidepanel.locator('.ws-picker-row', { hasText: workstream.title }).click();
 
       await expect(
         sidepanel.locator('.coding-session-row .name', { hasText: 'codex · synthetic' }),

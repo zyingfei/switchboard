@@ -47,7 +47,7 @@ const problem = (status: number, detail: string, requestId: string) => ({
 
 export const createMockVaultCompanion = async (port = 17373): Promise<MockVaultCompanion> => {
   const vaultPath = await mkdtemp(path.join(tmpdir(), 'sidetrack-extension-mock-companion-'));
-  const bridgeKey = await ensureBridgeKey(vaultPath);
+  const bridgeKey = (await ensureBridgeKey(vaultPath)).key;
   const writer = createVaultWriter(vaultPath);
   let requestCounter = 0;
   const nextRequestId = (): string => `mock-companion-${String(++requestCounter)}`;

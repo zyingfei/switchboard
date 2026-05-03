@@ -94,6 +94,29 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
   });
 
   writeLine(streams.stdout, `sidetrack-companion listening on ${runtime.url}`);
+  writeLine(streams.stdout, `vault           ${runtime.vaultPath}`);
+  writeLine(streams.stdout, `bridge key file ${runtime.bridgeKeyPath}`);
+  if (runtime.bridgeKeyCreated) {
+    // First run for this vault — print the key once so the user can
+    // paste it into the side panel without going to the file system.
+    // Subsequent runs reuse the file; we only point at the path.
+    writeLine(streams.stdout, '');
+    writeLine(
+      streams.stdout,
+      'A new bridge key was generated. Paste this into the side panel:',
+    );
+    writeLine(streams.stdout, `Settings → Companion bridge key → ${runtime.bridgeKey}`);
+    writeLine(streams.stdout, '');
+    writeLine(
+      streams.stdout,
+      `(The key is saved to ${runtime.bridgeKeyPath} — \`cat\` it any time you need to recover it.)`,
+    );
+  } else {
+    writeLine(
+      streams.stdout,
+      `(Reusing the existing key. Run \`cat ${runtime.bridgeKeyPath}\` to copy it again.)`,
+    );
+  }
   return 0;
 };
 

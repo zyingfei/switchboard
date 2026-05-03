@@ -74,27 +74,81 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
 const createCompanionWriteClient = (
   companionUrl: string,
   bridgeKey: string,
-): CompanionWriteClient => ({
-  async registerCodingSession(input) {
-    const response = await fetch(`${companionUrl.replace(/\/$/, '')}/v1/coding-sessions`, {
+): CompanionWriteClient => {
+  const base = companionUrl.replace(/\/$/, '');
+  const post = async <TResult>(
+    path: string,
+    body: unknown,
+    extraHeaders: Record<string, string> = {},
+  ): Promise<TResult> => {
+    const response = await fetch(`${base}${path}`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
         'x-bac-bridge-key': bridgeKey,
+        ...extraHeaders,
       },
-      body: JSON.stringify(input),
+      body: JSON.stringify(body),
     });
     if (!response.ok) {
       const detail = await response.text().catch(() => '');
-      throw new Error(`Companion register failed (${String(response.status)}): ${detail}`);
+      throw new Error(`Companion ${path} failed (${String(response.status)}): ${detail}`);
     }
-    const body = (await response.json()) as { readonly data?: { readonly bac_id?: string } };
-    if (typeof body.data?.bac_id !== 'string') {
-      throw new Error('Companion did not return bac_id for the registered coding session.');
-    }
-    return { bac_id: body.data.bac_id };
-  },
-});
+    return (await response.json()) as TResult;
+  };
+  // Idempotency keys: same shape as the extension uses, so concurrent
+  // moves/queue items don't double-write the vault.
+  const idempotencyKey = (prefix: string, value: string): string =>
+    `${prefix}-${value.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 160)}`;
+
+  return {
+    async registerCodingSession(input) {
+      const body = await post<{ readonly data?: { readonly bac_id?: string } }>(
+        '/v1/coding-sessions',
+        input,
+      );
+      if (typeof body.data?.bac_id !== 'string') {
+        throw new Error('Companion did not return bac_id for the registered coding session.');
+      }
+      return { bac_id: body.data.bac_id };
+    },
+    async moveThread(input) {
+      // Companion expects a full ThreadUpsert; an MCP move only knows
+      // the threadId, so we look up the existing thread first via the
+      // dispatch ledger isn't right — instead, we POST the partial
+      // upsert and let the companion's vault writer fill in the rest
+      // from its current snapshot. The companion handles this by
+      // merging on bac_id.
+      const upsert = {
+        bac_id: input.threadId,
+        ...(input.workstreamId === undefined
+          ? { primaryWorkstreamId: null }
+          : { primaryWorkstreamId: input.workstreamId }),
+      };
+      const body = await post<{
+        readonly data?: { readonly bac_id?: string; readonly revision?: string };
+      }>('/v1/threads', upsert);
+      if (typeof body.data?.bac_id !== 'string' || typeof body.data.revision !== 'string') {
+        throw new Error('Companion did not return bac_id + revision for the moved thread.');
+      }
+      return { bac_id: body.data.bac_id, revision: body.data.revision };
+    },
+    async createQueueItem(input) {
+      const body = await post<{
+        readonly data?: { readonly bac_id?: string; readonly revision?: string };
+      }>('/v1/queue', input, {
+        'idempotency-key': idempotencyKey(
+          'mcp-queue',
+          `${input.scope}-${input.targetId ?? 'global'}-${input.text}`,
+        ),
+      });
+      if (typeof body.data?.bac_id !== 'string' || typeof body.data.revision !== 'string') {
+        throw new Error('Companion did not return bac_id + revision for the queued item.');
+      }
+      return { bac_id: body.data.bac_id, revision: body.data.revision };
+    },
+  };
+};
 
 export const runCli = async (argv: readonly string[], streams: CliStreams): Promise<number> => {
   const args = parseArgs(argv);

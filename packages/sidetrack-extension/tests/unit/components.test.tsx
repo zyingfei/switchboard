@@ -36,6 +36,7 @@ const STUB_DISPATCH: DispatchEvent = {
   sourceTitle: 'Side-panel state machine review',
   targetProviderLabel: 'GPT Pro',
   targetThreadTitle: 'new chat',
+  mode: 'paste',
   dispatchKind: 'research_packet',
   dispatchedAt: '12 min ago',
   status: 'replied',
@@ -47,18 +48,27 @@ const STUB_WORKSTREAMS = [
 ];
 
 describe('UX skeleton components — render-without-crash + key text present', () => {
-  it('PacketComposer renders kind / template / target selectors and footer actions', () => {
+  it('PacketComposer renders intent picker / framing / target selectors and footer actions', () => {
     render(<PacketComposer onCancel={noop} onCopy={noop} onSave={noop} onDispatch={noop} />);
-    expect(screen.getByText('Research Packet')).toBeInTheDocument();
+    // Intent-first picker replaces the old "Packet kind" pill row;
+    // default intent = "Ask another AI" so framing field renders.
+    expect(screen.getByRole('button', { name: 'Ask another AI' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Hand to a coding agent' })).toBeInTheDocument();
     expect(screen.getByText('Web-to-AI checklist')).toBeInTheDocument();
-    expect(screen.getByText('Copy to clipboard')).toBeInTheDocument();
-    expect(screen.getByText(/Dispatch$/)).toBeInTheDocument();
+    // Footer is now a primary Dispatch + a split-button caret. Copy /
+    // Save live in the menu, opened via the caret — they're not in the
+    // initial DOM.
+    expect(screen.getByRole('button', { name: /Dispatch/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /More packet actions/ })).toBeInTheDocument();
   });
 
-  it('DispatchConfirm renders all four §24.10 safety guards', () => {
+  it('DispatchConfirm renders all four §24.10 safety guards (clean state)', () => {
     render(
       <DispatchConfirm
         target="Claude"
+        body="# Real packet body\n\nThis is the user's real composed packet."
+        redactedCount={0}
+        tokenEstimate={1200}
         screenShareActive={false}
         injectionDetected={false}
         onCancel={noop}
@@ -66,17 +76,71 @@ describe('UX skeleton components — render-without-crash + key text present', (
         onConfirm={noop}
       />,
     );
-    expect(screen.getByText(/Redaction fired/)).toBeInTheDocument();
+    // No items redacted → friendly empty-state, NOT "Redaction fired".
+    // Regression guard for the "0 items removed — 1 GitHub token, 1 email"
+    // contradictory copy that was leaking from the stub defaults.
+    expect(screen.queryByText(/Redaction fired/)).toBeNull();
+    expect(screen.queryByText(/1 GitHub token/)).toBeNull();
+    expect(screen.getByText(/Nothing redacted/)).toBeInTheDocument();
     expect(screen.getByText(/Token budget/)).toBeInTheDocument();
     expect(screen.getByText(/safe to dispatch/)).toBeInTheDocument();
     expect(screen.getByText(/No prompt-injection patterns/)).toBeInTheDocument();
     expect(screen.getByText(/Paste mode is locked per §24.10/)).toBeInTheDocument();
   });
 
+  it('DispatchConfirm renders the actual packet body in the preview', () => {
+    // Regression guard for the bug where the preview was a hardcoded
+    // stub ("# Sidetrack / MVP PRD — context pack") regardless of
+    // what the user composed.
+    render(
+      <DispatchConfirm
+        target="Claude"
+        body="# Real packet body\n\nThis is the user's real composed packet."
+        redactedCount={0}
+        tokenEstimate={1200}
+        onCancel={noop}
+        onEdit={noop}
+        onConfirm={noop}
+      />,
+    );
+    // <pre> renders the body with newlines, so testing-library's
+    // default text-matcher won't find a substring directly. Look at
+    // the rendered <pre> element's textContent instead.
+    const pre = document.querySelector('pre.preview-body');
+    expect(pre?.textContent ?? '').toContain(
+      "This is the user's real composed packet.",
+    );
+    // Old stub strings must not appear.
+    expect(pre?.textContent ?? '').not.toContain('Sidetrack / MVP PRD — context pack');
+    expect(pre?.textContent ?? '').not.toContain('PRD §24.10 wording');
+  });
+
+  it('DispatchConfirm shows redaction details only when items were removed', () => {
+    render(
+      <DispatchConfirm
+        target="Claude"
+        body="…"
+        redactedCount={2}
+        redactedKinds={['1 GitHub token', '1 email']}
+        tokenEstimate={1200}
+        onCancel={noop}
+        onEdit={noop}
+        onConfirm={noop}
+      />,
+    );
+    expect(screen.getByText(/Redaction fired/)).toBeInTheDocument();
+    expect(screen.getByText(/2 items removed/)).toBeInTheDocument();
+    expect(screen.getByText('1 GitHub token, 1 email')).toBeInTheDocument();
+    expect(screen.queryByText(/Nothing redacted/)).toBeNull();
+  });
+
   it('DispatchConfirm flips screen-share + injection states when active', () => {
     render(
       <DispatchConfirm
         target="Claude"
+        body="…"
+        redactedCount={0}
+        tokenEstimate={1200}
         screenShareActive
         injectionDetected
         onCancel={noop}
@@ -88,7 +152,7 @@ describe('UX skeleton components — render-without-crash + key text present', (
     expect(screen.getByText(/Captured-page injection detected/)).toBeInTheDocument();
   });
 
-  it('ReviewComposer renders span quote, verdict picker, and three actions', () => {
+  it('ReviewComposer renders editable span + comment-driven actions', () => {
     render(
       <ReviewComposer
         provider="Claude"
@@ -96,16 +160,26 @@ describe('UX skeleton components — render-without-crash + key text present', (
         spans={[{ id: 's1', text: 'A captured assistant turn span.' }]}
         onClose={noop}
         onSave={noop}
-        onSubmitBack={noop}
+        onSendBack={noop}
         onDispatchOut={noop}
       />,
     );
-    expect(screen.getByText('A captured assistant turn span.')).toBeInTheDocument();
-    expect(screen.getByText('Agree')).toBeInTheDocument();
-    expect(screen.getByText('Disagree')).toBeInTheDocument();
-    expect(screen.getByText('Save review only')).toBeInTheDocument();
-    expect(screen.getByText(/Submit-back to Claude/)).toBeInTheDocument();
-    expect(screen.getByText('Dispatch to…')).toBeInTheDocument();
+    // Span text is now an editable textarea, not a static blockquote.
+    expect(
+      screen.getByDisplayValue('A captured assistant turn span.'),
+    ).toBeInTheDocument();
+    // Verdict picker is hidden behind a disclosure — only the
+    // disclosure button is in the initial DOM.
+    expect(screen.getByRole('button', { name: /add verdict/i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Agree' })).toBeNull();
+    // Three terminal actions: Save only / Dispatch to other AI / Send back.
+    expect(screen.getByRole('button', { name: 'Save only' })).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /Dispatch to other AI/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /Send back to Claude/ }),
+    ).toBeInTheDocument();
   });
 
   it('Wizard renders welcome step + advances through steps', () => {
@@ -308,11 +382,13 @@ describe('UX skeleton components — render-without-crash + key text present', (
     expect(screen.getByText('[private — workstream item]')).toBeInTheDocument();
   });
 
-  it('RecentDispatches renders dispatch row with status pill', () => {
+  it('RecentDispatches renders dispatch row with linked-target action', () => {
+    // STUB_DISPATCH has targetThreadTitle set, so the row counts as
+    // "linked" — action collapses to "↗ open" instead of Copy/Dispatch.
     render(<RecentDispatches dispatches={[STUB_DISPATCH]} />);
     expect(screen.getByText('Side-panel state machine review')).toBeInTheDocument();
     expect(screen.getByText('GPT Pro')).toBeInTheDocument();
-    expect(screen.getByText('replied')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /↗ open/ })).toBeInTheDocument();
   });
 
   it('RecentDispatches empty state renders helper text', () => {

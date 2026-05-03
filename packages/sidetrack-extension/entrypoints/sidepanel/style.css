@@ -903,6 +903,111 @@ button:disabled {
   color: var(--paper-light);
   border-color: var(--ink);
 }
+
+/* Grouped pill row — used in PacketComposer's "Send to AI" lane to
+   nest tier sub-pills (Pro / Deep Research) under the parent
+   provider pill. The group is just visual sugar; it has no
+   selection state of its own — the parent pill handles selection. */
+.pill-row-grouped {
+  align-items: center;
+}
+.pill-group {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 4px;
+  padding: 2px 4px;
+  border-radius: var(--rad-s);
+}
+.pill-group.on {
+  background: var(--paper-deep);
+}
+.pill.pill-variant {
+  font-size: 10.5px;
+  padding: 3px 8px;
+  letter-spacing: 0.04em;
+  background: transparent;
+  border-color: transparent;
+  color: var(--ink-3);
+}
+.pill.pill-variant.on {
+  background: var(--ink);
+  color: var(--paper-light);
+  border-color: var(--ink);
+}
+
+/* Click-to-rename scope label — looks like editable text not a
+   button until you hover, then a subtle background hint shows it's
+   actionable. */
+.scope-label-btn {
+  background: transparent;
+  border: 0;
+  padding: 0 2px;
+  font: inherit;
+  color: var(--ink);
+  cursor: text;
+  border-radius: var(--rad-s);
+  text-align: left;
+}
+.scope-label-btn:hover {
+  background: var(--paper-deep);
+}
+.scope-label-btn:focus-visible {
+  outline: 1px solid var(--ink-3);
+  outline-offset: 2px;
+}
+
+/* Split-button: primary action + caret that opens a small menu
+   with the secondary actions (Copy / Save). The user gets one
+   clearly-primary CTA without losing the escape hatches. */
+.split-button {
+  position: relative;
+  display: inline-flex;
+}
+.split-button-main {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.split-button-caret {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  border-left: 1px solid var(--paper-tinted);
+  padding-left: 8px;
+  padding-right: 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1;
+}
+.split-button-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 4px);
+  min-width: 180px;
+  display: flex;
+  flex-direction: column;
+  background: var(--paper-light);
+  border: var(--hair);
+  border-radius: var(--rad-s);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.08);
+  padding: 4px;
+  z-index: 10;
+}
+.split-button-menu-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  font-family: var(--display);
+  font-size: 12px;
+  color: var(--ink);
+  background: transparent;
+  border: 0;
+  border-radius: var(--rad-s);
+  text-align: left;
+  cursor: pointer;
+}
+.split-button-menu-item:hover {
+  background: var(--paper-deep);
+}
 .pill:disabled {
   cursor: not-allowed;
   opacity: 0.55;
@@ -1039,10 +1144,28 @@ button:disabled {
   padding: 10px 12px;
   background: var(--paper-light);
   color: var(--ink-2);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.55;
-  max-height: 140px;
+  /* Body is the most-used field in the composer — give it real
+     vertical room. The textarea variant below also gets full width
+     and resize=vertical so the user can grow it. */
+  min-height: 320px;
+  max-height: 60vh;
   overflow: auto;
+  width: 100%;
+  box-sizing: border-box;
+}
+/* Textarea variant — same as the read-only block but resizable. */
+textarea.preview-body {
+  display: block;
+  width: 100%;
+  resize: vertical;
+  border: 0;
+  outline: none;
+  font-family: var(--mono, ui-monospace, monospace);
+}
+textarea.preview-body:focus {
+  background: var(--paper);
 }
 .preview-details {
   border: var(--hair);
@@ -1115,6 +1238,34 @@ button:disabled {
 }
 
 /* ── Dispatch confirm safety chain ── */
+/* Intent-first picker at the top of the composer. Slightly bigger
+   pills than the regular pill row to read as the primary chooser. */
+.composer-intent-row {
+  gap: 8px;
+}
+.composer-intent-pill {
+  font-size: 13px;
+  padding: 7px 14px;
+  font-family: var(--display, 'Fraunces', serif);
+  font-weight: 500;
+}
+
+/* Side-effect preview — single italic mono line above the safety
+   chain that spells out exactly what clicking Confirm will do.
+   Sits on its own row so the user reads it before scanning the
+   chain. */
+.dispatch-side-effect {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  background: var(--paper, #f5efe2);
+  border-left: 3px solid var(--signal, #c2410c);
+  border-radius: var(--rad-s);
+  font-size: 12px;
+  font-style: italic;
+  color: var(--ink-2);
+  line-height: 1.45;
+}
+
 .safety-chain {
   display: flex;
   flex-direction: column;
@@ -1227,6 +1378,121 @@ button:disabled {
   flex-direction: column;
   gap: 18px;
   overflow: auto;
+}
+
+/* Two-column variant: spans on the left (read + inline edit),
+   reviewer's comments on the right. The vertical alignment teaches
+   "this comment goes with that span." Each row card pair shares an
+   index number so even on narrow widths the relationship reads. */
+.review-body-split {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  padding: 16px 18px 8px;
+  overflow: auto;
+}
+.review-spans-col,
+.review-comments-col {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.review-span-card,
+.review-comment-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.review-span-meta {
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.review-span-text {
+  width: 100%;
+  font-family: var(--display);
+  font-style: italic;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink);
+  padding: 8px 10px 8px 14px;
+  background: var(--paper);
+  border: var(--hair);
+  border-left: 3px solid var(--signal);
+  border-radius: var(--rad-s);
+  resize: vertical;
+  min-height: 80px;
+  outline: none;
+}
+.review-span-text:focus {
+  background: var(--paper-light);
+  border-left-color: var(--ink);
+}
+.review-comment-label {
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.review-comment-text {
+  width: 100%;
+  font-family: var(--body, inherit);
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 8px 10px;
+  border: var(--hair);
+  border-radius: var(--rad-s);
+  background: var(--paper-light);
+  color: var(--ink);
+  resize: vertical;
+  min-height: 80px;
+  outline: none;
+}
+.review-overall {
+  padding: 0 18px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.review-overall-text {
+  width: 100%;
+  font-family: var(--body, inherit);
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 8px 10px;
+  border: var(--hair);
+  border-radius: var(--rad-s);
+  background: var(--paper-light);
+  color: var(--ink);
+  resize: vertical;
+  min-height: 56px;
+  outline: none;
+}
+.review-verdict-disclosure {
+  padding: 0 18px 8px;
+}
+.review-verdict-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.review-verdict-label {
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.review-hint {
+  padding: 0 18px 8px;
+  font-size: 11px;
+  color: var(--ink-3);
+}
+@media (max-width: 720px) {
+  .review-body-split {
+    grid-template-columns: 1fr;
+  }
 }
 .review-foot {
   padding: 12px 18px;
@@ -1555,6 +1821,13 @@ button:disabled {
   gap: 8px;
   padding: 6px 10px;
   border-bottom: var(--hair-soft);
+  /* Faint hover highlight so the row reads as actionable as a whole.
+     Either side (source / target) is its own clickable button; the
+     row tint is just a visual cue. */
+  transition: background-color 120ms ease;
+}
+.dispatch-row:hover {
+  background: var(--paper-deep);
 }
 .dispatch-source,
 .dispatch-target {
@@ -1568,11 +1841,19 @@ button:disabled {
   font-family: var(--body);
   font-size: 12.5px;
   color: var(--ink);
-  padding: 0;
+  padding: 4px 6px;
+  border-radius: var(--rad-s);
+  margin: -4px -6px;
 }
 .dispatch-source:hover,
 .dispatch-target:hover {
-  text-decoration: underline;
+  background: var(--paper-light);
+  color: var(--signal);
+}
+.dispatch-source:focus-visible,
+.dispatch-target:focus-visible {
+  outline: 1px solid var(--ink);
+  outline-offset: 1px;
 }
 .dispatch-kind {
   color: var(--ink-3);
@@ -1592,6 +1873,63 @@ button:disabled {
 }
 .dispatch-time {
   color: var(--ink-3);
+}
+
+/* Re-view + re-download modal for a recorded dispatch. Used when
+   the user clicks the target side of a row whose target was an
+   export sink (no chat to reopen) — gives them a way to recover
+   the body even if the clipboard / download was lost. */
+.dispatch-viewer {
+  background: var(--paper-light);
+  border: var(--hair);
+  border-radius: var(--rad-l);
+  box-shadow: 0 14px 36px rgba(27, 25, 22, 0.18);
+  width: min(720px, 92vw);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.dispatch-viewer-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 14px 18px;
+  border-bottom: var(--hair);
+}
+.dispatch-viewer-title {
+  margin: 0;
+  font-family: var(--display);
+  font-weight: 500;
+  font-size: 16px;
+}
+.dispatch-viewer-meta {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--ink-3);
+}
+.dispatch-viewer-body {
+  flex: 1;
+  margin: 0;
+  padding: 14px 18px;
+  background: var(--paper);
+  border: 0;
+  resize: none;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--ink);
+  outline: none;
+  min-height: 240px;
+  width: 100%;
+  box-sizing: border-box;
+}
+.dispatch-viewer-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 18px;
+  border-top: var(--hair);
+  background: var(--paper);
 }
 
 /* ── Wizard ── */
@@ -1800,6 +2138,41 @@ button:disabled {
   font-size: 10.5px;
   color: var(--ink-3);
   letter-spacing: 0.04em;
+}
+
+/* Read-only vault status block — shown when companion is connected so
+   the user can copy the vault path / bridge key file location. Looks
+   like a small terminal-output panel to signal "this is a fact about
+   the running process, not a setting you can edit here." */
+.settings-vault-status {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border: var(--hair);
+  border-radius: var(--rad-s);
+  background: var(--paper-deep);
+  display: grid;
+  gap: 4px;
+}
+.settings-vault-status-row {
+  display: grid;
+  grid-template-columns: 80px 1fr;
+  gap: 8px;
+  align-items: baseline;
+}
+.settings-vault-status-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-3);
+}
+.settings-vault-status-value {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink);
+  background: transparent;
+  word-break: break-all;
+  user-select: text;
 }
 
 .settings-archive-list {
@@ -2376,10 +2749,10 @@ button:disabled {
   padding: 12px 8px;
 }
 .thread {
-  padding: 10px 12px;
+  padding: 6px 10px;
   border: 1px solid transparent;
   border-radius: var(--rad-m);
-  margin-bottom: 4px;
+  margin-bottom: 2px;
   transition:
     background 120ms ease,
     border-color 120ms ease;
@@ -2391,8 +2764,8 @@ button:disabled {
 .thread .row1 {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 4px;
+  gap: 6px;
+  margin-bottom: 2px;
 }
 .thread .provider {
   font-family: var(--mono, 'JetBrains Mono', ui-monospace, monospace);
@@ -2424,7 +2797,7 @@ button:disabled {
 .thread .name {
   font-family: var(--display, 'Fraunces', serif);
   font-weight: 500;
-  font-size: 14px;
+  font-size: 13px;
   letter-spacing: -0.005em;
   color: var(--ink, #1b1916);
   white-space: nowrap;
@@ -2434,10 +2807,10 @@ button:disabled {
 .thread .row2 {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   font-family: var(--mono, 'JetBrains Mono', ui-monospace, monospace);
-  font-size: 10.5px;
-  line-height: 1.45;
+  font-size: 10px;
+  line-height: 1.3;
   color: var(--ink-3, #7a7269);
 }
 .thread .row2 .dot {
@@ -2539,28 +2912,174 @@ button:disabled {
 }
 
 /* =====================================================
-   Thread history strip — captures rendered inline under a thread
+   Inline captured-turn history (click thread title to expand)
    ===================================================== */
-.thread-history {
-  margin: 6px 0 0;
-  padding: 6px 0 0;
-  border-top: 1px dashed var(--rule, rgba(27, 25, 22, 0.12));
+.thread-turn-history {
+  margin: 4px 0 6px;
+  padding: 6px 0 2px;
+  border-top: 1px solid var(--rule-soft, #e5ddc9);
   display: flex;
   flex-direction: column;
   gap: 4px;
 }
+.thread-turn-history-head {
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.thread-turn-history-count {
+  color: var(--ink-4);
+}
+.thread-turn-history-empty {
+  font-size: 10.5px;
+  color: var(--ink-4);
+  font-style: italic;
+}
+.thread-turn-card {
+  display: grid;
+  grid-template-columns: 50px 1fr auto;
+  gap: 6px 8px;
+  align-items: baseline;
+  padding: 3px 6px;
+  border-radius: var(--rad-s);
+  background: var(--paper);
+}
+.thread-turn-card:hover {
+  background: var(--paper-deep);
+}
+.thread-turn-role {
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  padding: 1px 4px;
+  border: var(--hair);
+  border-radius: 3px;
+  text-align: center;
+  align-self: start;
+}
+.thread-turn-user .thread-turn-role {
+  background: var(--paper-light);
+  border-color: var(--ink-4);
+  color: var(--ink-2);
+}
+.thread-turn-assistant .thread-turn-role {
+  background: var(--signal-bg, #fff7ed);
+  border-color: var(--signal-tint, #fed7aa);
+  color: var(--signal, #c2410c);
+}
+.thread-turn-text {
+  font-family: var(--display);
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--ink);
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+}
+.thread-turn-time {
+  font-size: 10px;
+  color: var(--ink-3);
+  white-space: nowrap;
+  align-self: start;
+}
+
+/* Focus icon — small ↗ arrow next to the title that opens / focuses
+   the chat tab. Stays low-opacity until row hover so it doesn't
+   compete with the title text. */
+.thread-focus-btn {
+  background: transparent;
+  border: 0;
+  padding: 0 4px;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--ink-3);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease, color 120ms ease;
+  flex: 0 0 auto;
+}
+.thread:hover .thread-focus-btn,
+.thread:focus-within .thread-focus-btn {
+  opacity: 1;
+}
+.thread-focus-btn:hover {
+  color: var(--signal, #c2410c);
+}
+.thread-focus-btn:focus-visible {
+  outline: 1px solid var(--ink);
+  outline-offset: 1px;
+  opacity: 1;
+}
+/* Title button now toggles inline history. Add a small chevron-ish
+   visual cue when expanded. */
+.thread-name-btn.expanded {
+  color: var(--signal, #c2410c);
+}
+
+/* Flash when the chat-side floating button asked the side panel to
+   surface this row. The keyframe ramps a paper-deep background with
+   a signal border and fades back to transparent over 1.5s. */
+.thread.focusing {
+  animation: thread-focus-pulse 1.5s ease-out;
+}
+@keyframes thread-focus-pulse {
+  0% {
+    background: var(--signal-bg, #fff7ed);
+    border-color: var(--signal, #c2410c);
+    box-shadow: 0 0 0 4px var(--signal-tint, #fed7aa);
+  }
+  70% {
+    background: var(--paper-deep);
+    border-color: var(--rule-soft, #e5ddc9);
+    box-shadow: 0 0 0 0 transparent;
+  }
+  100% {
+    background: transparent;
+    border-color: transparent;
+    box-shadow: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .thread.focusing {
+    animation: none;
+    background: var(--paper-deep);
+  }
+}
+
+/* =====================================================
+   Thread history strip — captures rendered inline under a thread
+   ===================================================== */
+.thread-history {
+  margin: 4px 0 0;
+  padding: 4px 0 0;
+  border-top: 1px dashed transparent;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+/* Show the dashed separator only when the strip actually has content
+   (the inline note list, the compose form, or the disclosure
+   button). React always renders the .thread-history wrapper; we use
+   :has to scope the border to non-empty states so empty threads
+   don't carry an orphan dashed line. */
+.thread-history:has(.thread-history-item),
+.thread-history:has(.thread-history-compose),
+.thread:hover .thread-history {
+  border-top-color: var(--rule, rgba(27, 25, 22, 0.12));
+}
 .thread-history-empty {
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: 10px;
   color: var(--ink-4);
   font-style: italic;
 }
 .thread-history-item {
   display: grid;
-  grid-template-columns: 14px 1fr auto;
-  gap: 6px 8px;
+  grid-template-columns: 12px 1fr auto;
+  gap: 4px 6px;
   align-items: baseline;
-  padding: 2px 0;
+  padding: 1px 0;
 }
 .thread-history-item .glyph {
   font-family: var(--mono);
@@ -2570,8 +3089,8 @@ button:disabled {
   user-select: none;
 }
 .thread-history-item .body {
-  font-size: 12px;
-  line-height: 1.45;
+  font-size: 11.5px;
+  line-height: 1.4;
   color: var(--ink);
   word-wrap: break-word;
   overflow-wrap: anywhere;
@@ -2608,11 +3127,17 @@ button:disabled {
   font-family: var(--mono);
   font-size: 10px;
   letter-spacing: 0.04em;
-  color: var(--ink-3);
+  color: var(--ink-4);
   background: transparent;
   border: 0;
   padding: 0;
+  opacity: 0;
+  transition: opacity 120ms ease, color 120ms ease;
   cursor: pointer;
+}
+.thread:hover .thread-history-add,
+.thread:focus-within .thread-history-add {
+  opacity: 1;
 }
 .thread-history-add:hover {
   color: var(--signal);
@@ -2645,6 +3170,89 @@ button:disabled {
 }
 .capture-empty {
   padding: 8px 12px;
+}
+
+/* Send-to dropdown — anchored under the thread row's "Send to ▾"
+   button. One-tap dispatch picker for the 70% case. Sections:
+   Recent (if any) → Ask another AI → Hand to coding agent →
+   Export → Customize first. */
+.send-to-anchor {
+  position: relative;
+  display: inline-flex;
+}
+.send-to-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  min-width: 200px;
+  max-height: 60vh;
+  overflow-y: auto;
+  background: var(--paper-light);
+  border: var(--hair);
+  border-radius: var(--rad-s);
+  box-shadow: 0 8px 24px rgba(27, 25, 22, 0.16);
+  padding: 4px;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+}
+.send-to-section-head {
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  padding: 6px 10px 2px;
+}
+.send-to-divider {
+  height: 1px;
+  background: var(--rule-soft, #e5ddc9);
+  margin: 4px 0;
+}
+.send-to-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 10px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--rad-s);
+  cursor: pointer;
+  text-align: left;
+  font-family: var(--display);
+  font-size: 12.5px;
+  color: var(--ink);
+  white-space: nowrap;
+}
+.send-to-item:hover {
+  background: var(--paper-deep);
+}
+.send-to-item:focus-visible {
+  outline: 1px solid var(--ink);
+  outline-offset: -1px;
+}
+.send-to-item-extra {
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+}
+.send-to-customize {
+  font-style: italic;
+  color: var(--ink-2);
+}
+
+/* Build identity footer — small, low-contrast, sits at the very
+   bottom of the side panel so the user can confirm "did the new
+   build actually load?" at a glance. */
+.build-version {
+  padding: 12px 14px 16px;
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  color: var(--ink-4, #a39a8c);
+  text-align: center;
+  user-select: text;
+  border-top: 1px dashed var(--rule-soft, #e5ddc9);
+  margin-top: 12px;
 }
 .capture {
   padding: 8px 12px;
@@ -2747,6 +3355,59 @@ button:disabled {
   border-radius: 6px;
   background: var(--paper, #f5efe2);
   padding: 4px 0 6px;
+}
+
+/* All Threads lifecycle buckets — explicit subgroup headers in
+   priority order: Unread → Ungrouped → Waiting → Stale or closed
+   → Normal. Each header is a thin caps line with a colored leading
+   tick that matches the dot color used elsewhere, so the bucket
+   identity reads at a glance even when collapsed visually. */
+.thread-bucket {
+  margin: 0 0 14px;
+}
+.thread-bucket-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  border-bottom: 1px dashed var(--rule-soft, #e5ddc9);
+  margin-bottom: 4px;
+}
+.thread-bucket-label::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  margin-right: 8px;
+  vertical-align: middle;
+  background: var(--ink-4);
+}
+.thread-bucket-unread .thread-bucket-label::before {
+  background: var(--signal);
+  box-shadow: 0 0 0 2px var(--signal-tint);
+}
+.thread-bucket-waiting .thread-bucket-label::before {
+  background: var(--amber);
+}
+.thread-bucket-stale .thread-bucket-label::before {
+  background: var(--ink-4);
+}
+.thread-bucket-normal .thread-bucket-label::before {
+  background: var(--green, #16a34a);
+}
+.thread-bucket-ungrouped .thread-bucket-label::before {
+  background: var(--ink-3);
+  border-radius: 1px;
+}
+.thread-bucket-count {
+  margin-left: auto;
+  color: var(--ink-3);
 }
 .ws-group-head {
   display: flex;

@@ -4,6 +4,12 @@ import { basename, dirname, join } from 'node:path';
 
 import { createBacId, createRevision } from '../domain/ids.js';
 import {
+  renderThreadMarkdown,
+  renderWorkstreamMarkdown,
+  type ThreadProjectionInput,
+  type WorkstreamProjectionInput,
+} from './markdownProjection.js';
+import {
   captureEventSchema,
   codingAttachTokenSchema,
   codingSessionSchema,
@@ -130,7 +136,13 @@ const dateStamp = (value: Date): string => value.toISOString().slice(0, 10);
 
 const createDefaultSettings = (revision = '0'): SettingsDocument =>
   settingsDocumentSchema.parse({
-    autoSendOptIn: { chatgpt: false, claude: false, gemini: false },
+    // Default-ON for new installs. Auto-send still requires the
+    // per-thread toggle PLUS this provider opt-in PLUS screen-share-
+    // safe being off (§24.10 quartet), so flipping these on by
+    // default doesn't ship anything without an explicit thread
+    // toggle. Existing users keep their stored values — this only
+    // applies on first vault initialisation.
+    autoSendOptIn: { chatgpt: true, claude: true, gemini: true },
     defaultPacketKind: 'research',
     defaultDispatchTarget: 'claude',
     screenShareSafeMode: false,
@@ -140,6 +152,20 @@ const createDefaultSettings = (revision = '0'): SettingsDocument =>
 const writeJson = async (path: string, value: unknown): Promise<void> => {
   await mkdir(join(path, '..'), { recursive: true });
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+};
+
+// Markdown sidecar for a vault record. Lives next to the .json with
+// the same bac_id stem. Failures here are best-effort — the JSON is
+// the canonical store, the .md is for human browsing. We swallow
+// errors so a flaky filesystem can't take down a write.
+const writeMarkdownProjection = async (path: string, body: string): Promise<void> => {
+  try {
+    await mkdir(join(path, '..'), { recursive: true });
+    await writeFile(path, body, 'utf8');
+  } catch {
+    // Vault write failures are surfaced via audit elsewhere; the
+    // markdown sidecar is non-critical, do not fail the upsert.
+  }
 };
 
 const writeJsonAtomic = async (path: string, value: unknown): Promise<void> => {
@@ -495,6 +521,10 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
       };
 
       await writeJson(join(bacRoot, 'threads', `${bac_id}.json`), thread);
+      await writeMarkdownProjection(
+        join(bacRoot, 'threads', `${bac_id}.md`),
+        renderThreadMarkdown(thread as ThreadProjectionInput),
+      );
       await audit({ requestId, route: 'upsertThread', outcome: 'success', bac_id, timestamp });
       return { bac_id, revision };
     },
@@ -517,15 +547,26 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
       };
 
       await writeJson(join(bacRoot, 'workstreams', `${bac_id}.json`), workstream);
+      await writeMarkdownProjection(
+        join(bacRoot, 'workstreams', `${bac_id}.md`),
+        renderWorkstreamMarkdown(workstream as WorkstreamProjectionInput),
+      );
       if (input.parentId !== undefined) {
-        const parentPath = join(bacRoot, 'workstreams', `${input.parentId}.json`);
+        const parentId = input.parentId;
+        const parentPath = join(bacRoot, 'workstreams', `${parentId}.json`);
         const parent = await readJsonRecord(parentPath);
-        await writeJson(parentPath, {
+        const updatedParent = {
           ...parent,
+          bac_id: parentId,
           children: [...new Set([...readStringArray(parent['children']), bac_id])],
           revision: createRevision(),
           updatedAt: timestamp,
-        });
+        };
+        await writeJson(parentPath, updatedParent);
+        await writeMarkdownProjection(
+          join(bacRoot, 'workstreams', `${parentId}.md`),
+          renderWorkstreamMarkdown(updatedParent),
+        );
       }
       await audit({ requestId, route: 'createWorkstream', outcome: 'success', bac_id, timestamp });
       return { bac_id, revision };
@@ -548,27 +589,44 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
       };
 
       await writeJson(path, updated);
+      await writeMarkdownProjection(
+        join(bacRoot, 'workstreams', `${workstreamId}.md`),
+        renderWorkstreamMarkdown(updated as unknown as WorkstreamProjectionInput),
+      );
       if (input.parentId !== undefined && input.parentId !== previousParentId) {
         if (previousParentId !== undefined) {
           const previousParentPath = join(bacRoot, 'workstreams', `${previousParentId}.json`);
           const previousParent = await readJsonRecord(previousParentPath);
-          await writeJson(previousParentPath, {
+          const updatedPrev = {
             ...previousParent,
+            bac_id: previousParentId,
             children: readStringArray(previousParent['children']).filter(
               (childId) => childId !== workstreamId,
             ),
             revision: createRevision(),
             updatedAt: timestamp,
-          });
+          };
+          await writeJson(previousParentPath, updatedPrev);
+          await writeMarkdownProjection(
+            join(bacRoot, 'workstreams', `${previousParentId}.md`),
+            renderWorkstreamMarkdown(updatedPrev),
+          );
         }
-        const nextParentPath = join(bacRoot, 'workstreams', `${input.parentId}.json`);
+        const nextParentId = input.parentId;
+        const nextParentPath = join(bacRoot, 'workstreams', `${nextParentId}.json`);
         const nextParent = await readJsonRecord(nextParentPath);
-        await writeJson(nextParentPath, {
+        const updatedNext = {
           ...nextParent,
+          bac_id: nextParentId,
           children: [...new Set([...readStringArray(nextParent['children']), workstreamId])],
           revision: createRevision(),
           updatedAt: timestamp,
-        });
+        };
+        await writeJson(nextParentPath, updatedNext);
+        await writeMarkdownProjection(
+          join(bacRoot, 'workstreams', `${nextParentId}.md`),
+          renderWorkstreamMarkdown(updatedNext),
+        );
       }
       await audit({
         requestId,

@@ -2,8 +2,27 @@ import { useState } from 'react';
 import { Modal } from './Modal';
 import { Icons } from './icons';
 
+// Lane the dispatch belongs to — drives the side-effect preview
+// header above the safety chain. The 4 lanes correspond to the
+// 4 visible outcomes the user can experience post-confirm:
+//   - chat-paste: copy body + open AI chat tab
+//   - chat-auto:  open AI chat tab + auto-paste + auto-send
+//   - coding:     copy body, paste into your terminal session
+//   - export:     download a .md file to Downloads
+export type DispatchKindForPreview = 'chat-paste' | 'chat-auto' | 'coding' | 'export';
+
 export interface DispatchConfirmProps {
   readonly target: string;
+  // The actual composed packet body. Required — the modal previews
+  // EXACTLY what is about to ship. Previously this was a hardcoded
+  // stub which silently shipped the wrong text into the dispatch
+  // confirmation, masking the real content.
+  readonly body: string;
+  // Which side-effect category this dispatch falls into. Drives the
+  // single-sentence "Will ..." header that spells out exactly what
+  // will happen post-confirm. Optional for back-compat; defaults to
+  // chat-paste which matches the historical behaviour.
+  readonly dispatchKind?: DispatchKindForPreview;
   readonly screenShareActive?: boolean;
   readonly redactedCount?: number;
   readonly redactedKinds?: readonly string[];
@@ -29,10 +48,15 @@ export interface DispatchConfirmProps {
  */
 export function DispatchConfirm({
   target,
+  body,
+  dispatchKind = 'chat-paste',
   screenShareActive = false,
-  redactedCount = 2,
-  redactedKinds = ['1 GitHub token', '1 email'],
-  tokenEstimate = 4200,
+  // No stub defaults — caller must pass the real numbers. Stubs
+  // silently masked an actual bug where 0-redaction dispatches
+  // showed "1 GitHub token, 1 email" anyway.
+  redactedCount = 0,
+  redactedKinds = [],
+  tokenEstimate = 0,
   tokenLimit = 200_000,
   injectionDetected = false,
   autoSendOptedIn = false,
@@ -46,6 +70,22 @@ export function DispatchConfirm({
     tokenPct < 80 ? 'green' : tokenPct < 100 ? 'amber' : 'over';
   const overBudget = tokenLevel === 'over';
 
+  // Build the "Will ..." sentence. The user kept asking "where does
+  // this go?" — spell it out. Lane is decided by the caller based on
+  // the packet's target + the user's auto-send opt-in setting.
+  const sideEffectText = ((): string => {
+    switch (dispatchKind) {
+      case 'chat-paste':
+        return `Will copy the packet to your clipboard and open ${target} in a new tab. Paste to send.`;
+      case 'chat-auto':
+        return `Will open ${target} in a new tab, auto-paste the packet, and auto-send it.`;
+      case 'coding':
+        return `Will copy the packet to your clipboard. Paste it into your ${target} session.`;
+      case 'export':
+        return `Will save the packet as a Markdown file to your Downloads folder.`;
+    }
+  })();
+
   return (
     <Modal
       title="Confirm dispatch"
@@ -54,19 +94,40 @@ export function DispatchConfirm({
       variant="ink"
       onClose={onCancel}
     >
+      {/* Side-effect preview — single sentence so the user knows
+          exactly what clicking Confirm will do. Sits above the
+          safety chain. The user kept asking "where does this go?"
+          — this answers it before they have to click. */}
+      <div className="dispatch-side-effect mono">{sideEffectText}</div>
+
       <div className="safety-chain">
-        <div className="safety-row signal">
-          <span className="icon-12">{Icons.lock}</span>
-          <div className="safety-text">
-            <div>
-              <strong className="mono">Redaction fired:</strong> {redactedCount} items removed —{' '}
-              <span className="mono">{redactedKinds.join(', ')}</span>
+        {redactedCount > 0 ? (
+          <div className="safety-row signal">
+            <span className="icon-12">{Icons.lock}</span>
+            <div className="safety-text">
+              <div>
+                <strong className="mono">Redaction fired:</strong> {redactedCount} item
+                {redactedCount === 1 ? '' : 's'} removed
+                {redactedKinds.length > 0 ? (
+                  <>
+                    {' '}
+                    — <span className="mono">{redactedKinds.join(', ')}</span>
+                  </>
+                ) : null}
+              </div>
+              <button type="button" className="reveal-link mono">
+                [reveal redacted]
+              </button>
             </div>
-            <button type="button" className="reveal-link mono">
-              [reveal redacted]
-            </button>
           </div>
-        </div>
+        ) : (
+          <div className="safety-row green">
+            <span className="icon-12">{Icons.check}</span>
+            <div className="safety-text mono">
+              No PII / API-key patterns detected. Nothing redacted.
+            </div>
+          </div>
+        )}
 
         <div className="safety-row neutral">
           <div className="safety-text" style={{ flex: 1 }}>
@@ -115,19 +176,9 @@ export function DispatchConfirm({
         </div>
       </div>
 
-      <details className="preview-details">
+      <details className="preview-details" open>
         <summary>Final packet preview</summary>
-        <pre className="preview-body mono">
-          {`# Sidetrack / MVP PRD — context pack
-
-## Workstream
-kind: project · created 2026-04-12
-
-## Recent activity
-- claude · "Side-panel state machine review"
-- chatgpt · "PRD §24.10 wording"
-…`}
-        </pre>
+        <pre className="preview-body mono">{body}</pre>
       </details>
 
       <div className="composer-row">

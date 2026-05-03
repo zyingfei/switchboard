@@ -115,7 +115,7 @@ describe('companion HTTP server', () => {
 
   beforeEach(async () => {
     vaultPath = await mkdtemp(join(tmpdir(), 'sidetrack-companion-test-'));
-    bridgeKey = await ensureBridgeKey(vaultPath);
+    bridgeKey = (await ensureBridgeKey(vaultPath)).key;
     context = {
       bridgeKey,
       vaultWriter: createVaultWriter(vaultPath),
@@ -177,7 +177,11 @@ describe('companion HTTP server', () => {
     expect(result.status).toBe(200);
     expect(result.body).toEqual({
       data: {
-        autoSendOptIn: { chatgpt: false, claude: false, gemini: false },
+        // New installs default to ON for all three providers per
+        // post-PR1.4 direction. The §24.10 quartet still requires
+        // a per-thread toggle and not-screen-sharing before any
+        // auto-send actually fires.
+        autoSendOptIn: { chatgpt: true, claude: true, gemini: true },
         defaultPacketKind: 'research',
         defaultDispatchTarget: 'claude',
         screenShareSafeMode: false,
@@ -203,7 +207,9 @@ describe('companion HTTP server', () => {
     expect(result.status).toBe(200);
     expect(result.body).toMatchObject({
       data: {
-        autoSendOptIn: { chatgpt: false, claude: false, gemini: false },
+        // PATCH that doesn't touch autoSendOptIn keeps the new
+        // (default-ON) baseline for any unspecified provider.
+        autoSendOptIn: { chatgpt: true, claude: true, gemini: true },
         defaultPacketKind: 'coding',
         defaultDispatchTarget: 'claude',
         screenShareSafeMode: true,
@@ -250,7 +256,9 @@ describe('companion HTTP server', () => {
     expect(result.status).toBe(200);
     expect(result.body).toMatchObject({
       data: {
-        autoSendOptIn: { chatgpt: true, claude: false, gemini: false },
+        // Patch only specified chatgpt: true; claude/gemini stay at
+        // the new (post-PR1.4) default-ON baseline.
+        autoSendOptIn: { chatgpt: true, claude: true, gemini: true },
         defaultPacketKind: 'research',
         defaultDispatchTarget: 'claude',
         screenShareSafeMode: false,

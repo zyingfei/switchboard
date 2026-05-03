@@ -180,13 +180,42 @@ export function SettingsPanel({
     >
       <div className="settings-section">
         <h3 className="settings-section-title">Vault &amp; tracking</h3>
-        <p className="settings-section-lede ai-italic">
-          Without a vault, Sidetrack runs entirely in your browser's local storage. With a vault
-          path configured, the companion writes a canonical Markdown record under
-          <span className="mono"> _BAC/</span> so it survives reinstalls and is readable by other
-          tools. Tracking-by-default keeps every detected AI thread; manual default keeps the panel
-          quiet until you explicitly track something.
-        </p>
+        {companionConfigured ? (
+          <>
+            <p className="settings-section-lede ai-italic">
+              The companion is connected and writing to the vault below. Captures, dispatches,
+              and reviews land as Markdown + JSON under <span className="mono">_BAC/</span> so
+              they survive reinstalls and are readable by other tools.
+            </p>
+            <div className="settings-vault-status">
+              <div className="settings-vault-status-row">
+                <span className="settings-vault-status-label mono">vault</span>
+                <code className="settings-vault-status-value">
+                  {draftVaultPath.length > 0 ? draftVaultPath : '(unknown — restart companion)'}
+                </code>
+              </div>
+              {draftVaultPath.length > 0 ? (
+                <div className="settings-vault-status-row">
+                  <span className="settings-vault-status-label mono">bridge key</span>
+                  <code className="settings-vault-status-value">
+                    {draftVaultPath.replace(/\/$/, '')}/_BAC/.config/bridge.key
+                  </code>
+                </div>
+              ) : null}
+            </div>
+            <p className="settings-hint mono">
+              Lost the key? Run <code>cat &lt;bridge key path&gt;</code> in your terminal — the
+              file is the canonical store. The vault path can be edited below for the NEXT
+              companion launch (the running process keeps its current path).
+            </p>
+          </>
+        ) : (
+          <p className="settings-section-lede ai-italic">
+            Sidetrack is running <strong>local-only</strong> — captures stay in this browser's
+            storage. Configure a vault to get a Markdown + JSON record under{' '}
+            <span className="mono">_BAC/</span> that survives reinstalls.
+          </p>
+        )}
         <label className="settings-text-row">
           <span>Vault path</span>
           <input
@@ -200,14 +229,10 @@ export function SettingsPanel({
             }}
           />
         </label>
-        <p className="settings-hint mono">
-          The companion process picks up the vault path at startup. Edit here for the next session
-          or after re-running the companion.
-        </p>
         {!companionConfigured && onConnectCompanion !== undefined ? (
           <div className="settings-cta-row">
             <span className="mono">
-              Currently <strong>local-only</strong> — captures stay in this browser.
+              Connect the companion to enable Send / Review and vault sync.
             </span>
             <button
               type="button"

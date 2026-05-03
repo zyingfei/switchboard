@@ -63,8 +63,9 @@ const thread = (overrides: Record<string, unknown> = {}) => {
 };
 
 test.describe('spec coverage (synthetic)', () => {
-  // Spec §Threads Tracking logic — image showing four distinct pills.
-  test('lifecycle pills render all five states correctly', async () => {
+  // Spec §Threads Tracking logic — All Threads buckets + dot colors
+  // carry lifecycle; "Needs organize" keeps the only explicit pill.
+  test('lifecycle buckets render all five states correctly', async () => {
     let runtime: ExtensionRuntime | undefined;
     const opened: Page[] = [];
     try {
@@ -113,7 +114,7 @@ test.describe('spec coverage (synthetic)', () => {
       const page = await seedAndOpen(runtime, {
         [WORKSTREAMS_KEY]: [ws(wsId, 'Lifecycle')],
         [THREADS_KEY]: [tUnread, tWaiting, tReplied, tStale, tNeeds],
-        // tUnread has an active reminder → "Unread reply" pill.
+        // tUnread has an active reminder -> Unread reply bucket.
         [REMINDERS_KEY]: [
           {
             bac_id: 'bac_reminder_unread',
@@ -127,27 +128,35 @@ test.describe('spec coverage (synthetic)', () => {
       opened.push(page);
       await page.getByRole('tab', { name: 'All threads' }).click();
 
-      // Assert each lifecycle pill renders with its expected label.
+      // Assert each lifecycle bucket / row affordance renders.
       await expect(
         page
-          .locator('.thread', { has: page.locator('.name', { hasText: 'Reply received' }) })
-          .locator('.lifecycle-pill'),
-      ).toContainText('Unread reply');
+          .locator('.thread-bucket-unread .thread', {
+            has: page.locator('.name', { hasText: 'Reply received' }),
+          })
+          .locator('.dot.signal'),
+      ).toBeVisible();
       await expect(
         page
-          .locator('.thread', { has: page.locator('.name', { hasText: 'Awaiting your reply' }) })
-          .locator('.lifecycle-pill'),
-      ).toContainText('Waiting on AI');
+          .locator('.thread-bucket-waiting .thread', {
+            has: page.locator('.name', { hasText: 'Awaiting your reply' }),
+          })
+          .locator('.dot.amber'),
+      ).toBeVisible();
       await expect(
         page
-          .locator('.thread', { has: page.locator('.name', { hasText: 'You replied last' }) })
-          .locator('.lifecycle-pill'),
-      ).toContainText('You replied last');
+          .locator('.thread-bucket-normal .thread', {
+            has: page.locator('.name', { hasText: 'You replied last' }),
+          })
+          .locator('.dot.green'),
+      ).toBeVisible();
       await expect(
         page
-          .locator('.thread', { has: page.locator('.name', { hasText: 'Stale thread' }) })
-          .locator('.lifecycle-pill'),
-      ).toContainText('Stale');
+          .locator('.thread', {
+            has: page.locator('.name', { hasText: 'Stale thread' }),
+          })
+          .locator('.dot.gray'),
+      ).toBeVisible();
       await expect(
         page
           .locator('.thread', { has: page.locator('.name', { hasText: 'Needs organize' }) })

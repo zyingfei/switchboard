@@ -35,6 +35,28 @@ export const messageTypes = {
   // previously failed (lastError set). Background clears lastError,
   // re-fires the drain for the item's thread.
   retryAutoSend: 'sidetrack.queue.autoSend.retry',
+  // Side panel asks the background to (re-)dispatch a recorded
+  // packet by opening the target chat URL in a new tab and
+  // auto-sending the body via the existing content-script driver
+  // once the tab finishes loading. Used by Recent Dispatches'
+  // "Dispatch" button on auto-send-mode rows.
+  dispatchAutoSendInNewTab: 'sidetrack.dispatch.autoSend.newTab',
+  // Side panel records the unredacted dispatch body (what the user
+  // actually copied to clipboard) keyed by the companion-assigned
+  // dispatch bac_id. Background stashes it in chrome.storage so the
+  // auto-link matcher can match against the unredacted text instead
+  // of the redacted form the companion stores.
+  cacheDispatchOriginal: 'sidetrack.dispatch.cacheOriginal',
+  // Side panel records the user's last Send-to target per thread so
+  // the SendToDropdown can highlight it under the "Recent" header
+  // for a one-click repeat.
+  cacheLastDispatchTarget: 'sidetrack.dispatch.cacheLastTarget',
+  // Content script asks the background to surface the matching
+  // thread row in the side panel (scroll + flash). Sent from the
+  // floating "↗ Sidetrack" button injected into provider chat
+  // pages. Background relays via the workboard broadcast so the
+  // side panel can pick up the focus target.
+  focusThreadInSidePanel: 'sidetrack.sidepanel.focusThread',
   restoreThreadTab: 'sidetrack.thread.restore-tab',
   queueFollowUp: 'sidetrack.queue.create',
   updateQueueItem: 'sidetrack.queue.update',
@@ -80,6 +102,21 @@ export const isWorkboardChangedMessage = (value: unknown): value is WorkboardCha
   isRecord(value) &&
   value.type === messageTypes.workboardChanged &&
   typeof value.reason === 'string';
+
+// Broadcast: side panel should scroll to + flash the row whose
+// thread.threadUrl matches. Fired by the background after a
+// content-script focus button click.
+export interface FocusThreadInSidePanelMessage {
+  readonly type: typeof messageTypes.focusThreadInSidePanel;
+  readonly threadUrl: string;
+}
+
+export const isFocusThreadInSidePanelMessage = (
+  value: unknown,
+): value is FocusThreadInSidePanelMessage =>
+  isRecord(value) &&
+  value.type === messageTypes.focusThreadInSidePanel &&
+  typeof value.threadUrl === 'string';
 
 export interface ContentRequest {
   readonly type: typeof messageTypes.captureVisibleThread;
@@ -156,6 +193,26 @@ export type WorkboardRequest =
   | {
       readonly type: typeof messageTypes.retryAutoSend;
       readonly queueItemId: string;
+    }
+  | {
+      readonly type: typeof messageTypes.dispatchAutoSendInNewTab;
+      readonly dispatchId: string;
+      readonly url: string;
+      readonly body: string;
+    }
+  | {
+      readonly type: typeof messageTypes.cacheDispatchOriginal;
+      readonly dispatchId: string;
+      readonly body: string;
+    }
+  | {
+      readonly type: typeof messageTypes.cacheLastDispatchTarget;
+      readonly threadId: string;
+      readonly target: string;
+    }
+  | {
+      readonly type: typeof messageTypes.focusThreadInSidePanel;
+      readonly threadUrl: string;
     }
   | {
       readonly type: typeof messageTypes.createReminder;
@@ -309,6 +366,26 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
 
   if (hasType(value, messageTypes.retryAutoSend)) {
     return typeof value.queueItemId === 'string';
+  }
+
+  if (hasType(value, messageTypes.dispatchAutoSendInNewTab)) {
+    return (
+      typeof value.dispatchId === 'string' &&
+      typeof value.url === 'string' &&
+      typeof value.body === 'string'
+    );
+  }
+
+  if (hasType(value, messageTypes.cacheDispatchOriginal)) {
+    return typeof value.dispatchId === 'string' && typeof value.body === 'string';
+  }
+
+  if (hasType(value, messageTypes.cacheLastDispatchTarget)) {
+    return typeof value.threadId === 'string' && typeof value.target === 'string';
+  }
+
+  if (hasType(value, messageTypes.focusThreadInSidePanel)) {
+    return typeof value.threadUrl === 'string';
   }
 
   if (hasType(value, messageTypes.createReminder)) {
