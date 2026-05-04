@@ -76,6 +76,8 @@ export const messageTypes = {
   workboardChanged: 'sidetrack.workboard.changed',
   createCodingAttachToken: 'sidetrack.coding.attach-token.create',
   detachCodingSession: 'sidetrack.coding.session.detach',
+  codingAttachListOffers: 'sidetrack.codingAttach.listOffers',
+  codingAttachMarkStatus: 'sidetrack.codingAttach.markStatus',
   saveLocalPreferences: 'sidetrack.preferences.local.save',
   createCaptureNote: 'sidetrack.capture.note.create',
   updateCaptureNote: 'sidetrack.capture.note.update',
@@ -259,6 +261,14 @@ export type WorkboardRequest =
       readonly codingSessionId: string;
     }
   | {
+      readonly type: typeof messageTypes.codingAttachListOffers;
+    }
+  | {
+      readonly type: typeof messageTypes.codingAttachMarkStatus;
+      readonly tabId: number;
+      readonly status: 'pending' | 'accepted' | 'declined' | 'expired';
+    }
+  | {
       readonly type: typeof messageTypes.saveLocalPreferences;
       readonly preferences: {
         readonly autoTrack?: boolean;
@@ -300,6 +310,7 @@ export type RuntimeResponse =
       readonly ok: true;
       readonly state: WorkboardState;
       readonly attachToken?: CodingAttachTokenRecord;
+      readonly codingAttachOffers?: readonly unknown[];
     }
   | {
       readonly ok: false;
@@ -464,6 +475,20 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
 
   if (hasType(value, messageTypes.detachCodingSession)) {
     return typeof value.codingSessionId === 'string';
+  }
+
+  if (hasType(value, messageTypes.codingAttachListOffers)) {
+    return true;
+  }
+
+  if (hasType(value, messageTypes.codingAttachMarkStatus)) {
+    return (
+      typeof value.tabId === 'number' &&
+      (value.status === 'pending' ||
+        value.status === 'accepted' ||
+        value.status === 'declined' ||
+        value.status === 'expired')
+    );
   }
 
   if (hasType(value, messageTypes.saveLocalPreferences)) {

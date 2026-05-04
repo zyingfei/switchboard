@@ -3,7 +3,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { listAnnotations, writeAnnotation } from './annotationStore.js';
+import {
+  listAnnotations,
+  softDeleteAnnotation,
+  updateAnnotation,
+  writeAnnotation,
+} from './annotationStore.js';
 
 const anchor = {
   textQuote: { exact: 'hello', prefix: '', suffix: ' world' },
@@ -59,5 +64,40 @@ describe('annotationStore', () => {
     await writeFile(join(vaultRoot, '_BAC', 'annotations', 'bad.md'), '---\nbad\n---\n');
 
     await expect(listAnnotations(vaultRoot)).resolves.toEqual([]);
+  });
+
+  it('updates notes with most-recent-first revision history', async () => {
+    const written = await writeAnnotation(vaultRoot, {
+      url: 'https://example.test/page',
+      pageTitle: 'Page',
+      anchor,
+      note: 'first',
+    });
+
+    const updated = await updateAnnotation(vaultRoot, written.bac_id, { note: 'second' });
+
+    expect(updated.note).toBe('second');
+    expect(updated.revisions[0]?.note).toBe('first');
+    expect(updated.deletedAt).toBeNull();
+  });
+
+  it('soft-deletes idempotently and hides deleted records by default', async () => {
+    const written = await writeAnnotation(vaultRoot, {
+      url: 'https://example.test/page',
+      pageTitle: 'Page',
+      anchor,
+      note: 'doomed',
+    });
+
+    const deleted = await softDeleteAnnotation(vaultRoot, written.bac_id);
+    const deletedAgain = await softDeleteAnnotation(vaultRoot, written.bac_id);
+
+    expect(deleted.deletedAt).not.toBeNull();
+    expect(deletedAgain.deletedAt).toBe(deleted.deletedAt);
+    await expect(listAnnotations(vaultRoot)).resolves.toEqual([]);
+    await expect(listAnnotations(vaultRoot, { includeDeleted: true })).resolves.toHaveLength(1);
+    await expect(updateAnnotation(vaultRoot, written.bac_id, { note: 'nope' })).rejects.toThrow(
+      /deleted/iu,
+    );
   });
 });

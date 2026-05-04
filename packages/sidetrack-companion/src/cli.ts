@@ -19,6 +19,7 @@ interface ParsedArgs {
   readonly installService: boolean;
   readonly uninstallService: boolean;
   readonly serviceStatus: boolean;
+  readonly allowAutoUpdate: boolean;
   readonly vaultPath?: string;
   readonly port: number;
 }
@@ -35,7 +36,7 @@ export const renderHelp = (): string =>
     '  sidetrack-companion --install-service --vault <path> [--port 17373]',
     '  sidetrack-companion --uninstall-service',
     '  sidetrack-companion --service-status',
-    '  sidetrack-companion --vault <path> [--port 17373]',
+    '  sidetrack-companion --vault <path> [--port 17373] [--allow-auto-update]',
     '',
     'Starts the localhost companion API and writes Sidetrack-owned files under _BAC/.',
   ].join('\n');
@@ -73,6 +74,7 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
     installService: argv.includes('--install-service'),
     uninstallService: argv.includes('--uninstall-service'),
     serviceStatus: argv.includes('--service-status'),
+    allowAutoUpdate: argv.includes('--allow-auto-update'),
     port,
   };
 
@@ -130,11 +132,13 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
   const runtime = await startCompanion({
     vaultPath: args.vaultPath,
     port: args.port,
+    allowAutoUpdate: args.allowAutoUpdate,
   });
 
   writeLine(streams.stdout, `sidetrack-companion listening on ${runtime.url}`);
   writeLine(streams.stdout, `vault           ${runtime.vaultPath}`);
   writeLine(streams.stdout, `bridge key file ${runtime.bridgeKeyPath}`);
+  writeLine(streams.stdout, `auto-update     ${args.allowAutoUpdate ? 'enabled' : 'disabled'}`);
   if (runtime.bridgeKeyCreated) {
     // First run for this vault — print the key once so the user can
     // paste it into the side panel without going to the file system.

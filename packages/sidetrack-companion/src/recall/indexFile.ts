@@ -118,8 +118,41 @@ export const appendEntry = async (
   entry: IndexEntry,
   modelId: string,
 ): Promise<void> => {
+  await upsertEntries(path, [entry], modelId);
+};
+
+export const upsertEntries = async (
+  path: string,
+  entries: readonly IndexEntry[],
+  modelId: string,
+): Promise<{ readonly added: number; readonly replaced: number }> => {
   const existing = await readIndex(path);
-  await writeIndex(path, [...(existing?.items ?? []), entry], modelId);
+  const byId = new Map((existing?.items ?? []).map((item) => [item.id, item]));
+  let added = 0;
+  let replaced = 0;
+  for (const entry of entries) {
+    if (byId.has(entry.id)) {
+      replaced += 1;
+    } else {
+      added += 1;
+    }
+    byId.set(entry.id, entry);
+  }
+  await writeIndex(path, [...byId.values()], modelId);
+  return { added, replaced };
+};
+
+export const gcEntries = async (
+  path: string,
+  validIds: ReadonlySet<string>,
+): Promise<{ readonly removed: number }> => {
+  const existing = await readIndex(path);
+  if (existing === null) {
+    return { removed: 0 };
+  }
+  const kept = existing.items.filter((item) => validIds.has(item.id));
+  await writeIndex(path, kept, existing.modelId);
+  return { removed: existing.items.length - kept.length };
 };
 
 export const INDEX_DIM = DIM;

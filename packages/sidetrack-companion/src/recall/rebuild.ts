@@ -2,7 +2,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { embed, MODEL_ID } from './embedder.js';
-import { writeIndex } from './indexFile.js';
+import { upsertEntries } from './indexFile.js';
 import type { IndexEntry } from './ranker.js';
 
 const isCaptureEventRecord = (
@@ -83,6 +83,6 @@ export const rebuildFromEventLog = async (
     capturedAt: item.capturedAt,
     embedding: vectors[index] ?? new Float32Array(384),
   }));
-  await writeIndex(join(vaultRoot, '_BAC', 'recall', 'index.bin'), entries, MODEL_ID);
+  await upsertEntries(join(vaultRoot, '_BAC', 'recall', 'index.bin'), entries, MODEL_ID);
   return { indexed: entries.length };
 };

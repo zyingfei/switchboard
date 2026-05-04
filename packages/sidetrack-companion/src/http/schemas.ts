@@ -334,12 +334,17 @@ export const annotationCreateSchema = z.object({
 
 export const annotationListQuerySchema = z.object({
   url: z.url().optional(),
+  includeDeleted: z.coerce.boolean().optional().default(false),
   limit: z.coerce
     .number()
     .int()
     .positive()
     .optional()
     .transform((limit) => Math.min(limit ?? 100, 100)),
+});
+
+export const annotationUpdateSchema = z.object({
+  note: z.string(),
 });
 
 export const recallIndexSchema = z.object({
@@ -351,6 +356,10 @@ export const recallIndexSchema = z.object({
       text: z.string().min(1),
     }),
   ),
+});
+
+export const recallGcSchema = z.object({
+  validIds: z.array(z.string().min(1)),
 });
 
 export const recallQuerySchema = z.object({
@@ -371,6 +380,38 @@ export const suggestionQuerySchema = z.object({
     .positive()
     .optional()
     .transform((limit) => Math.min(limit ?? 5, 20)),
+});
+
+export const autoUpdateSchema = z.object({
+  confirm: z.string().min(1),
+});
+
+export const bucketSchema = z.object({
+  id: z.string().min(1),
+  label: z.string().min(1),
+  vaultRoot: z.string().min(1),
+  matchers: z.array(
+    z.object({
+      kind: z.enum(['workstream', 'provider', 'urlPattern']),
+      value: z.string().min(1),
+    }),
+  ),
+});
+
+export const bucketsPutSchema = z.object({
+  buckets: z.array(bucketSchema),
+});
+
+export const workstreamTrustPutSchema = z.object({
+  allowedTools: z.array(
+    z.enum([
+      'bac.move_item',
+      'bac.queue_item',
+      'bac.bump_workstream',
+      'bac.archive_thread',
+      'bac.unarchive_thread',
+    ]),
+  ),
 });
 
 export type CaptureEventInput = z.infer<typeof captureEventSchema>;
@@ -398,6 +439,7 @@ export type AnnotationListQuery = z.infer<typeof annotationListQuerySchema>;
 export type RecallIndexInput = z.infer<typeof recallIndexSchema>;
 export type RecallQuery = z.infer<typeof recallQuerySchema>;
 export type SuggestionQuery = z.infer<typeof suggestionQuerySchema>;
+export type BucketRecord = z.infer<typeof bucketSchema>;
 export type CodingTool = z.infer<typeof codingToolSchema>;
 export type CodingAttachTokenCreateInput = z.infer<typeof codingAttachTokenCreateSchema>;
 export type CodingAttachTokenRecord = z.infer<typeof codingAttachTokenSchema>;
