@@ -93,8 +93,8 @@ These constrain every scope decision below.
    share-safe + injection-scrub. Default-deny.
 7. **Vault is canonical state.** Per §23.0 + §27.6, the companion writes
    to the vault via plain filesystem; the extension is a sensor + UI;
-   the MCP server is a stateless reader. No production state lives only
-   in `chrome.storage.local`.
+   the MCP server is a stateless reader over stdio or local WebSocket.
+   No production state lives only in `chrome.storage.local`.
 
 ## 5. Architecture (load-bearing — not an implementation detail)
 
@@ -108,7 +108,7 @@ companion bridge for live capture):
 │  (browser sensor + UI)   │                │ (Claude Code, Cursor,    │
 │  - provider-capture      │                │  Codex CLI, JetBrains…)  │
 │  - side-panel workboard  │                └─────────────┬────────────┘
-│  - hot cache + capture   │                              │ stdio
+│  - hot cache + capture   │                              │ stdio / WebSocket
 │    queue                 │                              │
 └──────────┬───────────────┘                              │
            │ HTTP loopback on 127.0.0.1                   │
@@ -137,11 +137,11 @@ companion bridge for live capture):
 └──────────────────│───────────────────────────────────┘  │
                    │ Node fs                              │
                    ▼                                      ▼
-          ┌────────────────────────┐
-          │ bac-mcp (Node, stateless reader)            │
-          │ spawned per MCP client via standard MCP    │
-          │ config (`npx bac-mcp --vault <path>`)      │
-          └────────────────────────┘
+          ┌────────────────────────────────────────────┐
+          │ sidetrack-mcp (Node, stateless reader)     │
+          │ stdio or ws://127.0.0.1:8721/mcp          │
+          │ bridge-key gated when WebSocket is used    │
+          └────────────────────────────────────────────┘
 ```
 
 ### 5.1 Process responsibilities
@@ -151,7 +151,7 @@ companion bridge for live capture):
 | **Extension** | DOM capture, side-panel UI, hot cache for snappy reads, capture queue when companion is offline | Vault writes, sustained timers, long-lived state |
 | **Companion** | All vault writes, live-tab tick, embedding-index rebuild, replay of extension's offline queue, audit log | UI, browser DOM, MCP client config |
 | **Vault** | Canonical state in plain files | Anything else; it's just files |
-| **bac-mcp** | Read-only access to vault state via stdio MCP | Any state of its own; spawns per tool call, exits |
+| **sidetrack-mcp** | Read-only access to vault state via stdio MCP or local WebSocket JSON-RPC (`ws://127.0.0.1:8721/mcp`) | Any state of its own; the side panel and companion HTTP routes keep working without MCP |
 
 ### 5.2 Why the companion (not just extension)
 
@@ -501,16 +501,23 @@ inline review):
 - Persistent overlay deferred to P1 (Hypothesis-style anchoring).
 - The captured annotation can be opened later as a §28 review target.
 
-#### 6.2.6 MCP server (read-only, stdio)
+#### 6.2.6 MCP server (read-only, stdio + local WebSocket)
 
 Reuses `poc/mcp-server` from main (already validated against fixtures):
 
-- Tools: `where_am_i`, `recent_threads`, `workstream`, `context_pack`,
-  `queued_items`, `inbound_reminders`, `coding_sessions`, `search`,
-  `recall` (lexical only at MVP; vector P1).
+- Tools use the `bac.*` namespace and mirror the existing read-side
+  companion surface: `bac.recall`, `bac.read_thread_md`,
+  `bac.read_workstream_md`, `bac.list_dispatches`,
+  `bac.list_workstream_notes`, `bac.list_buckets`,
+  `bac.list_audit_events`, `bac.list_annotations`,
+  `bac.system_health`, archive/unarchive helpers, and workstream
+  suggestions/bumps.
 - Reads vault state via Node `fs` (per §27.6).
-- One-line install in Claude Code / Cursor / Codex MCP config:
-  `npx bac-mcp --vault <path>`.
+- One-line stdio install in Claude Code / Cursor / Codex MCP config:
+  `npx sidetrack-mcp --vault <path>`.
+- Long-lived local-agent route:
+  `ws://127.0.0.1:8721/mcp?token=<bridge-key>` or
+  `Sec-WebSocket-Protocol: bearer.<bridge-key>`.
 - Audit log every tool call to `_BAC/audit/<date>.jsonl`.
 
 ### 6.3 P1 — post-MVP
@@ -935,6 +942,7 @@ what the system does. Production PRD requirement, not optional.
 | Failure | Detection | Side-panel surface | Behavior |
 |---|---|---|---|
 | **Companion process down** | Extension can't reach NM/HTTP endpoint | "Companion: disconnected · N items queued" red badge | Captures queue locally; reads from hot cache; replays on reconnect; oldest-eviction at 1000 items |
+| **Bridge key setup invalid** | First-run / settings validation distinguishes missing key, malformed copied value, and companion auth rejection | Inline setup error: "Bridge key missing", "Bridge key malformed", or "Bridge key rejected" | Do not close setup; do not persist rejected keys; user can paste the correct `_BAC/.config/bridge.key` and retry |
 | **Vault folder unreachable** | Companion `fs` operations fail | "Vault: error" yellow badge with reason | Companion buffers writes in-memory (cap 100 items); side panel surfaces "vault unreachable for X minutes — re-pick folder?" |
 | **Provider-capture broken** (selector failure) | Per-load selector canary detects miss | Yellow banner on side panel: "ChatGPT extractor health: 4/10 recent captures clean" | Switch to clipboard mode; surface a "queue diagnostic bundle" button |
 | **Token budget exceeded** (about to dispatch) | tiktoken count > model context window | Pre-dispatch warning with "edit / proceed anyway / cancel" | Default-deny; user must explicitly proceed |

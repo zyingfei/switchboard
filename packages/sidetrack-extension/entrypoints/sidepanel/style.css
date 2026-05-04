@@ -2302,6 +2302,15 @@ textarea.preview-body:focus {
 .wizard-status .dot.amber {
   background: var(--amber);
 }
+.wizard-bridge-error {
+  padding: 8px 10px;
+  border-radius: var(--rad-s);
+  border: 1px solid var(--signal-tint);
+  background: var(--signal-bg);
+  color: var(--signal);
+  font-size: 11px;
+  line-height: 1.4;
+}
 .wizard-footnote {
   color: var(--ink-3);
   font-size: 10.5px;

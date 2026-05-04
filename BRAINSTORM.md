@@ -1415,6 +1415,15 @@ as clients — much better incentive structure than a BAC-specific contract.
 logged-in chat tab. BAC sits *uniquely* in the slot where the user's existing
 browser sessions are first-class MCP context. Make that the headline.
 
+**Implementation sync 2026-05-04.** The production path is now
+`sidetrack-mcp` as a stateless Node reader with both stdio and localhost
+WebSocket JSON-RPC transport. The WebSocket route is
+`ws://127.0.0.1:8721/mcp`; it reuses the same local bridge key as the
+companion HTTP surface, preferably via `Sec-WebSocket-Protocol:
+bearer.<bridge-key>` and with `?token=<bridge-key>` as fallback. Coding-agent
+handoff packets should name that WebSocket endpoint first and keep the older
+HTTP+headers route as a fallback for agents that do not speak MCP yet.
+
 ### 24.6 New entity types `[+claude-dr]`
 
 Extend §22.3 entity model with capture types the spec missed:
@@ -2471,6 +2480,13 @@ the user's mental model. Keep them separate.
 | **Connection setup** | Wire BAC to a vault folder. FileSystemAccess `showDirectoryPicker()` (extension) or vault path config (daemon). One-time per vault per device. Persist the handle / path. Detect Local REST API plugin presence opportunistically (acceleration, not gating). | Once at first run; again if user revokes the handle, switches vaults, or moves the folder. | "No connection" — BAC operates in local-only ledger mode (captures stay in `chrome.storage.local` / daemon DB until a vault is wired). | First-run wizard; settings page; "vault" badge in side panel. |
 | **Sync-in** (vault → BAC) | Read the vault: scan for files with `bac_id` frontmatter, pick up user-authored notes the user wants tracked, baseline existing notes when first connecting, keep BAC's view of vault state in sync after the user edits / moves / renames in Obsidian. | At connect, on user request ("re-scan vault"), and on a periodic / FS-watched cadence after that. Cheap to re-run. | "Out of date" — BAC's view lags the vault; user re-runs scan. | Side-panel "scanned N files, M tracked"; daemon log; explicit "Sync from vault" button. |
 | **Sync-out** (BAC → vault) | Write to the vault: tracked captures land as Source notes; promoted artifacts (decisions, OQs) land as typed notes; generated `.canvas` and `.base` regenerate. **Also** covers the case where the user manually adds a note **outside** the tracked set and explicitly tells BAC "track this from now on" — that's a sync-out, not a sync-in, because BAC is the side that decides what gets attached. | On capture (per-event), on explicit promote, on regeneration of dashboards / canvases. | "Write blocked" — vault unwriteable (handle revoked, disk full, plugin acceleration failed → fall back to plain write). | Side-panel "wrote 3 files"; per-event success toast; "Open in Obsidian" link. |
+
+Bridge-key validation is part of **Connection setup**, not a generic
+companion-down state. The user should see three explicit failure states:
+missing key (nothing pasted), malformed key (copied fragment or wrong
+characters), and rejected key (well-formed value, but the running companion
+authenticates a different vault key). Missing/malformed keys never advance
+the wizard; rejected keys are not persisted.
 
 The reason this matters: today's brainstorm has S99 (frontmatter mirror), S104
 (inbox-folder writing), S107 (atomic write protocol), S108 (first-run vault),

@@ -1,6 +1,6 @@
 # BRAINSTORM index
 
-Generated 2026-04-26. Source: `BRAINSTORM.md` (2799 lines).
+Generated 2026-05-04. Source: `BRAINSTORM.md` (2815 lines).
 Built by `scripts/build-brainstorm-index.sh` — re-run after edits.
 
 ## Headings
@@ -84,65 +84,65 @@ Built by `scripts/build-brainstorm-index.sh` — re-run after edits.
     - L1349 — 24.3 Technical reality picks (from §A) `[+claude-dr]`
     - L1373 — 24.4 Reuse map — corrections and additions `[+claude-dr]`
     - L1393 — 24.5 MCP — the load-bearing axis the brainstorm missed `[+claude-dr]`
-    - L1418 — 24.6 New entity types `[+claude-dr]`
-    - L1441 — 24.7 Cost / optionality reframe — BYO API key as optional power tier `[+claude-dr]`
-    - L1461 — 24.8 Déjà-vu reframe — calibrated-freshness recall `[+claude-dr]`
-    - L1475 — 24.9 Recall UX — the foot-guns from prior attempts `[+claude-dr]`
-    - L1489 — 24.10 Critical safety primitives the brainstorm under-specified `[+claude-dr]`
-    - L1509 — 24.11 New scenarios S112–S136 `[+claude-dr]`
-    - L1545 — 24.12 Risk register / blind spots `[+claude-dr]`
-    - L1562 — 24.13 Local-first dogma — encrypted backup escape valve `[+claude-dr]`
-    - L1579 — 24.14 Positioning + ICP `[+claude-dr]`
-    - L1608 — 24.15 Distribution levers `[+claude-dr]`
-    - L1619 — 24.16 MVP wow — reconciling Claude DR's spine with §22 / §23 spines
-    - L1652 — 24.17 What this changes in earlier sections
-    - L1677 — 24.18 Updated "what's next"
-- L1695 — 25. Addendum 2026-04-24 evening — prompt corpus as autocomplete + training source
-    - L1703 — 25.1 Reframe — the prompt is a first-class artifact
-    - L1718 — 25.2 Five tiers of escalating sophistication
-    - L1732 — 25.3 Privacy posture — the prompt corpus is THE most sensitive corpus
-    - L1756 — 25.4 New scenarios S138–S151
-    - L1775 — 25.5 Cold-start strategy
-    - L1786 — 25.6 What this changes / connects to in earlier sections
-    - L1812 — 25.7 Trim recommendations for v1
-    - L1830 — 25.8 Updated unified v1 spine
-- L1838 — 26. Addendum (2026-04-25): PoC plan after PoC-1/2 — `[+gpt-poc]`
-    - L1870 — 26.1 Where we actually are (verified against `pocs/` READMEs, 2026-04-25)
-    - L1890 — 26.2 PoC philosophy refinement `[+gpt-poc]`
-    - L1902 — 26.3 Sharpened product thesis: Obsidian-native, not Obsidian-dependent `[+gpt-poc]`
-    - L1929 — 26.3.1 What BAC should own vs. what Obsidian should own when present
-    - L1945 — 26.4 Two PoC paths on the table `[+gpt-poc]`
-    - L1962 — 26.5 Path A in detail — three balanced PoCs `[+gpt-poc]`
-        - L1964 — 26.5.1 PoC 1 — Obsidian-native user organization
-        - L2077 — 26.5.2 PoC 2 — Links / Graph / Canvas / Bases as first-class surfaces
-        - L2130 — 26.5.3 PoC 3 — Organization-aware Context Pack and browser-owned MCP
-        - L2210 — 26.5.4 How the three PoCs fit together
-        - L2220 — 26.5.5 Path A explicit deferrals
-    - L2237 — 26.6 Path B in detail — single `poc/local-bridge` PoC `[+gpt-poc]`
-        - L2264 — 26.6.1 Architecture `[+gpt-poc]`
-        - L2298 — 26.6.2 Scope (in/out) `[+gpt-poc]`
-        - L2329 — 26.6.3 Acceptance demo `[+gpt-poc]`
-        - L2345 — 26.6.4 Test plan `[+gpt-poc]`
-    - L2361 — 26.7 Architectural deltas vs. prior anchors `[+gpt-poc]`
-    - L2375 — 26.8 New scenarios this PoC discussion surfaces
-    - L2391 — 26.9 Edge cases this surfaces
-    - L2404 — 26.10 Open questions for user (don't decide unilaterally)
-    - L2439 — 26.11 Bottom-line synthesis (mine, not the discussion's)
-- L2460 — 27. Addendum (2026-04-26): Connection setup vs sync direction `[user]`
-    - L2467 — 27.1 The three concepts, separated
-    - L2487 — 27.2 New scenarios for the split
-    - L2498 — 27.3 What's deferred
-    - L2519 — 27.4 Why this matters for the §23.0 principle
-    - L2548 — 27.5 What this changes in earlier sections
-    - L2564 — 27.6 Empirical update from `poc/vault-bridge` (2026-04-26): writer moves out of the browser
-- L2681 — 28. Addendum (2026-04-26): Inline reviews — draft + dispatch back to chats `[user]`
-    - L2690 — 28.1 The shape of the feature
-    - L2701 — 28.2 Why this is BAC-shaped, not provider-shaped
-    - L2727 — 28.3 New entity type: `ReviewEvent`
-    - L2751 — 28.4 New scenarios
-    - L2763 — 28.5 Edge cases
-    - L2774 — 28.6 What this changes / connects to
-    - L2789 — 28.7 Out of scope here
+    - L1427 — 24.6 New entity types `[+claude-dr]`
+    - L1450 — 24.7 Cost / optionality reframe — BYO API key as optional power tier `[+claude-dr]`
+    - L1470 — 24.8 Déjà-vu reframe — calibrated-freshness recall `[+claude-dr]`
+    - L1484 — 24.9 Recall UX — the foot-guns from prior attempts `[+claude-dr]`
+    - L1498 — 24.10 Critical safety primitives the brainstorm under-specified `[+claude-dr]`
+    - L1518 — 24.11 New scenarios S112–S136 `[+claude-dr]`
+    - L1554 — 24.12 Risk register / blind spots `[+claude-dr]`
+    - L1571 — 24.13 Local-first dogma — encrypted backup escape valve `[+claude-dr]`
+    - L1588 — 24.14 Positioning + ICP `[+claude-dr]`
+    - L1617 — 24.15 Distribution levers `[+claude-dr]`
+    - L1628 — 24.16 MVP wow — reconciling Claude DR's spine with §22 / §23 spines
+    - L1661 — 24.17 What this changes in earlier sections
+    - L1686 — 24.18 Updated "what's next"
+- L1704 — 25. Addendum 2026-04-24 evening — prompt corpus as autocomplete + training source
+    - L1712 — 25.1 Reframe — the prompt is a first-class artifact
+    - L1727 — 25.2 Five tiers of escalating sophistication
+    - L1741 — 25.3 Privacy posture — the prompt corpus is THE most sensitive corpus
+    - L1765 — 25.4 New scenarios S138–S151
+    - L1784 — 25.5 Cold-start strategy
+    - L1795 — 25.6 What this changes / connects to in earlier sections
+    - L1821 — 25.7 Trim recommendations for v1
+    - L1839 — 25.8 Updated unified v1 spine
+- L1847 — 26. Addendum (2026-04-25): PoC plan after PoC-1/2 — `[+gpt-poc]`
+    - L1879 — 26.1 Where we actually are (verified against `pocs/` READMEs, 2026-04-25)
+    - L1899 — 26.2 PoC philosophy refinement `[+gpt-poc]`
+    - L1911 — 26.3 Sharpened product thesis: Obsidian-native, not Obsidian-dependent `[+gpt-poc]`
+    - L1938 — 26.3.1 What BAC should own vs. what Obsidian should own when present
+    - L1954 — 26.4 Two PoC paths on the table `[+gpt-poc]`
+    - L1971 — 26.5 Path A in detail — three balanced PoCs `[+gpt-poc]`
+        - L1973 — 26.5.1 PoC 1 — Obsidian-native user organization
+        - L2086 — 26.5.2 PoC 2 — Links / Graph / Canvas / Bases as first-class surfaces
+        - L2139 — 26.5.3 PoC 3 — Organization-aware Context Pack and browser-owned MCP
+        - L2219 — 26.5.4 How the three PoCs fit together
+        - L2229 — 26.5.5 Path A explicit deferrals
+    - L2246 — 26.6 Path B in detail — single `poc/local-bridge` PoC `[+gpt-poc]`
+        - L2273 — 26.6.1 Architecture `[+gpt-poc]`
+        - L2307 — 26.6.2 Scope (in/out) `[+gpt-poc]`
+        - L2338 — 26.6.3 Acceptance demo `[+gpt-poc]`
+        - L2354 — 26.6.4 Test plan `[+gpt-poc]`
+    - L2370 — 26.7 Architectural deltas vs. prior anchors `[+gpt-poc]`
+    - L2384 — 26.8 New scenarios this PoC discussion surfaces
+    - L2400 — 26.9 Edge cases this surfaces
+    - L2413 — 26.10 Open questions for user (don't decide unilaterally)
+    - L2448 — 26.11 Bottom-line synthesis (mine, not the discussion's)
+- L2469 — 27. Addendum (2026-04-26): Connection setup vs sync direction `[user]`
+    - L2476 — 27.1 The three concepts, separated
+    - L2503 — 27.2 New scenarios for the split
+    - L2514 — 27.3 What's deferred
+    - L2535 — 27.4 Why this matters for the §23.0 principle
+    - L2564 — 27.5 What this changes in earlier sections
+    - L2580 — 27.6 Empirical update from `poc/vault-bridge` (2026-04-26): writer moves out of the browser
+- L2697 — 28. Addendum (2026-04-26): Inline reviews — draft + dispatch back to chats `[user]`
+    - L2706 — 28.1 The shape of the feature
+    - L2717 — 28.2 Why this is BAC-shaped, not provider-shaped
+    - L2743 — 28.3 New entity type: `ReviewEvent`
+    - L2767 — 28.4 New scenarios
+    - L2779 — 28.5 Edge cases
+    - L2790 — 28.6 What this changes / connects to
+    - L2805 — 28.7 Out of scope here
 
 ## Scenarios (S###)
 
@@ -257,70 +257,70 @@ Built by `scripts/build-brainstorm-index.sh` — re-run after edits.
 - L1220 — S109
 - L1221 — S110
 - L1222 — S111
-- L1515 — S112
-- L1516 — S113
-- L1517 — S114
-- L1518 — S115
-- L1519 — S116
-- L1520 — S117
-- L1521 — S118
-- L1522 — S119
-- L1523 — S120
-- L1524 — S121
-- L1525 — S122
-- L1526 — S123
-- L1527 — S124
-- L1528 — S125
-- L1529 — S126
-- L1530 — S127
-- L1531 — S128
-- L1532 — S129
-- L1533 — S130
-- L1534 — S131
-- L1535 — S132
-- L1536 — S133
-- L1537 — S134
-- L1538 — S135
-- L1539 — S136
-- L1577 — S137
-- L1760 — S138
-- L1761 — S139
-- L1762 — S140
-- L1763 — S141
-- L1764 — S142
-- L1765 — S143
-- L1766 — S144
-- L1767 — S145
-- L1768 — S146
-- L1769 — S147
-- L1770 — S148
-- L1771 — S149
-- L1772 — S150
-- L1773 — S151
-- L2379 — S152
-- L2380 — S153
-- L2381 — S154
-- L2382 — S155
-- L2383 — S156
-- L2384 — S157
-- L2385 — S158
-- L2386 — S159
-- L2387 — S160
-- L2388 — S161
-- L2389 — S162
-- L2491 — S163
-- L2492 — S164
-- L2493 — S165
-- L2494 — S166
-- L2495 — S167
-- L2496 — S168
-- L2755 — S169
-- L2756 — S170
-- L2757 — S171
-- L2758 — S172
-- L2759 — S173
-- L2760 — S174
-- L2761 — S175
+- L1524 — S112
+- L1525 — S113
+- L1526 — S114
+- L1527 — S115
+- L1528 — S116
+- L1529 — S117
+- L1530 — S118
+- L1531 — S119
+- L1532 — S120
+- L1533 — S121
+- L1534 — S122
+- L1535 — S123
+- L1536 — S124
+- L1537 — S125
+- L1538 — S126
+- L1539 — S127
+- L1540 — S128
+- L1541 — S129
+- L1542 — S130
+- L1543 — S131
+- L1544 — S132
+- L1545 — S133
+- L1546 — S134
+- L1547 — S135
+- L1548 — S136
+- L1586 — S137
+- L1769 — S138
+- L1770 — S139
+- L1771 — S140
+- L1772 — S141
+- L1773 — S142
+- L1774 — S143
+- L1775 — S144
+- L1776 — S145
+- L1777 — S146
+- L1778 — S147
+- L1779 — S148
+- L1780 — S149
+- L1781 — S150
+- L1782 — S151
+- L2388 — S152
+- L2389 — S153
+- L2390 — S154
+- L2391 — S155
+- L2392 — S156
+- L2393 — S157
+- L2394 — S158
+- L2395 — S159
+- L2396 — S160
+- L2397 — S161
+- L2398 — S162
+- L2507 — S163
+- L2508 — S164
+- L2509 — S165
+- L2510 — S166
+- L2511 — S167
+- L2512 — S168
+- L2771 — S169
+- L2772 — S170
+- L2773 — S171
+- L2774 — S172
+- L2775 — S173
+- L2776 — S174
+- L2777 — S175
 
 ## Edge cases (E##)
 
@@ -356,30 +356,30 @@ Built by `scripts/build-brainstorm-index.sh` — re-run after edits.
 - L550 — E30
 - L551 — E31
 - L552 — E32
-- L2395 — E33
-- L2396 — E34
-- L2397 — E35
-- L2398 — E36
-- L2399 — E37
-- L2400 — E38
-- L2401 — E39
-- L2402 — E40
-- L2767 — E41
-- L2768 — E42
-- L2769 — E43
-- L2770 — E44
-- L2771 — E45
-- L2772 — E46
+- L2404 — E33
+- L2405 — E34
+- L2406 — E35
+- L2407 — E36
+- L2408 — E37
+- L2409 — E38
+- L2410 — E39
+- L2411 — E40
+- L2783 — E41
+- L2784 — E42
+- L2785 — E43
+- L2786 — E44
+- L2787 — E45
+- L2788 — E46
 
 ## Risks (R##)
 
-- L1551 — R1
-- L1552 — R2
-- L1553 — R3
-- L1554 — R4
-- L1555 — R5
-- L1556 — R6
-- L1557 — R7
-- L1558 — R8
-- L1559 — R9
-- L1560 — R10
+- L1560 — R1
+- L1561 — R2
+- L1562 — R3
+- L1563 — R4
+- L1564 — R5
+- L1565 — R6
+- L1566 — R7
+- L1567 — R8
+- L1568 — R9
+- L1569 — R10

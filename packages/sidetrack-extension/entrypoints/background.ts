@@ -6,12 +6,17 @@ import {
   DEFAULT_LOCAL_CONFIG,
   runAutoSendDrain as driveAutoSendImpl,
 } from '../src/companion/autoSendDrain';
+import {
+  bridgeKeyValidationCopy,
+  validateBridgeKeyCandidate,
+} from '../src/companion/bridgeKeyValidation';
 import { createCompanionClient } from '../src/companion/client';
 import { listPendingOffers, markStatus, upsertOffer } from '../src/codingAttach/state';
 import type { CodingSurface } from '../src/codingAttach/detection';
 import { createSettingsClient } from '../src/settings/client';
 import type {
   CaptureEvent,
+  CompanionSettings,
   CodingAttachTokenCreate,
   CodingAttachTokenRecord,
   QueueCreate,
@@ -492,6 +497,43 @@ const replayQueuedCaptures = async (): Promise<void> => {
 const isCompanionConfigured = async (): Promise<boolean> => {
   const settings = await readSettings();
   return settings.companion.bridgeKey.trim().length > 0;
+};
+
+const isBridgeKeyRejection = (message: string): boolean =>
+  /bridge key|unauthorized|401/iu.test(message);
+
+const normalizeCompanionSettings = (settings: CompanionSettings): CompanionSettings => ({
+  bridgeKey: settings.bridgeKey.trim(),
+  port: settings.port,
+});
+
+const verifyCompanionSettingsBeforeSave = async (
+  settings: CompanionSettings,
+): Promise<CompanionSettings> => {
+  const normalized = normalizeCompanionSettings(settings);
+  if (normalized.bridgeKey.length === 0) {
+    return normalized;
+  }
+
+  const failure = validateBridgeKeyCandidate(normalized.bridgeKey);
+  if (failure !== null) {
+    throw new Error(bridgeKeyValidationCopy[failure]);
+  }
+
+  try {
+    await createCompanionClient(normalized).status();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (isBridgeKeyRejection(message)) {
+      throw new Error(bridgeKeyValidationCopy.rejected);
+    }
+    throw new Error(
+      `Cannot reach the companion on port ${String(
+        normalized.port,
+      )}. Start the companion for this vault, then try again.`,
+    );
+  }
+  return normalized;
 };
 
 const assertCompanionReachable = async (): Promise<'connected' | 'vault-error' | 'local-only'> => {
@@ -1124,7 +1166,7 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
   }
 
   if (request.type === messageTypes.saveCompanionSettings) {
-    await saveCompanionSettings(request.settings);
+    await saveCompanionSettings(await verifyCompanionSettingsBeforeSave(request.settings));
     return await withCompanionStatus(() => Promise.resolve(), 'settings');
   }
 

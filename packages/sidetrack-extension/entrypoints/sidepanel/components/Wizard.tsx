@@ -1,5 +1,10 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Modal } from './Modal';
+import {
+  bridgeKeyValidationCopy,
+  validateBridgeKeyCandidate,
+  type BridgeKeyValidationFailure,
+} from '../../../src/companion/bridgeKeyValidation';
 
 export type WizardStep = 'welcome' | 'vault' | 'companion' | 'providers' | 'done';
 
@@ -16,13 +21,12 @@ const STEP_LABEL: Record<WizardStep, string> = {
   done: 'Done',
 };
 
-const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
-
 export type CompanionPingResult = 'reachable' | 'unreachable';
 
 export interface WizardProps {
   readonly bridgeKey?: string;
   readonly companionReachable?: boolean;
+  readonly connectionError?: string | null;
   readonly localRestApiDetected?: boolean;
   readonly port?: number;
   readonly onClose: () => void;
@@ -51,6 +55,7 @@ const defaultReadClipboard = (): Promise<string> => navigator.clipboard.readText
 export function Wizard({
   bridgeKey = '',
   companionReachable = false,
+  connectionError = null,
   localRestApiDetected = false,
   port = 17_373,
   onClose,
@@ -63,9 +68,24 @@ export function Wizard({
   onReadClipboard,
 }: WizardProps) {
   const [stepIndex, setStepIndex] = useState(0);
+  const [bridgeKeyFailure, setBridgeKeyFailure] = useState<BridgeKeyValidationFailure | null>(null);
   const step = STEP_ORDER[stepIndex] ?? 'welcome';
 
+  useEffect(() => {
+    if (connectionError !== null) {
+      setStepIndex(STEP_ORDER.indexOf('companion'));
+    }
+  }, [connectionError]);
+
   const next = () => {
+    if (step === 'companion') {
+      const failure = validateBridgeKeyCandidate(bridgeKey);
+      if (failure !== null) {
+        setBridgeKeyFailure(failure);
+        return;
+      }
+      setBridgeKeyFailure(null);
+    }
     if (stepIndex < STEP_ORDER.length - 1) {
       setStepIndex(stepIndex + 1);
     }
@@ -113,7 +133,12 @@ export function Wizard({
       {step === 'companion' ? (
         <CompanionStep
           bridgeKey={bridgeKey}
+          bridgeKeyFailure={bridgeKeyFailure}
           companionReachable={companionReachable}
+          connectionError={connectionError}
+          onBridgeKeyFailureClear={() => {
+            setBridgeKeyFailure(null);
+          }}
           onBridgeKeyChange={onBridgeKeyChange}
           onPingCompanion={onPingCompanion ?? (() => defaultPingCompanion(port))}
           onReadClipboard={onReadClipboard ?? defaultReadClipboard}
@@ -155,7 +180,10 @@ function WelcomeStep({ onSkip }: { readonly onSkip?: () => void }) {
 
 function CompanionStep({
   bridgeKey,
+  bridgeKeyFailure,
   companionReachable,
+  connectionError,
+  onBridgeKeyFailureClear,
   onBridgeKeyChange,
   onPingCompanion,
   onReadClipboard,
@@ -163,7 +191,10 @@ function CompanionStep({
   vaultPath,
 }: {
   readonly bridgeKey: string;
+  readonly bridgeKeyFailure: BridgeKeyValidationFailure | null;
   readonly companionReachable: boolean;
+  readonly connectionError: string | null;
+  readonly onBridgeKeyFailureClear: () => void;
   readonly onBridgeKeyChange?: (bridgeKey: string) => void;
   readonly onPingCompanion: () => Promise<CompanionPingResult>;
   readonly onReadClipboard: () => Promise<string>;
@@ -174,6 +205,9 @@ function CompanionStep({
   const bridgeKeyPath = `${commandPath.replace(/\/$/, '')}/_BAC/.config/bridge.key`;
   const [pingState, setPingState] = useState<'idle' | 'testing' | CompanionPingResult>('idle');
   const [clipboardError, setClipboardError] = useState<string | null>(null);
+  const validationError =
+    connectionError ??
+    (bridgeKeyFailure === null ? null : bridgeKeyValidationCopy[bridgeKeyFailure]);
 
   const ambientReachable =
     pingState === 'reachable' || (pingState === 'idle' && companionReachable);
@@ -195,12 +229,12 @@ function CompanionStep({
     void onReadClipboard()
       .then((value) => {
         const trimmed = value.trim();
-        if (trimmed.length < 32 || !BASE64URL_PATTERN.test(trimmed)) {
-          setClipboardError(
-            "That doesn't look like a bridge key — open the file and copy the line.",
-          );
+        const failure = validateBridgeKeyCandidate(trimmed);
+        if (failure !== null) {
+          setClipboardError(bridgeKeyValidationCopy[failure]);
           return;
         }
+        onBridgeKeyFailureClear();
         onBridgeKeyChange?.(trimmed);
       })
       .catch(() => {
@@ -248,6 +282,7 @@ function CompanionStep({
         Bridge key
         <input
           onChange={(event) => {
+            onBridgeKeyFailureClear();
             onBridgeKeyChange?.(event.target.value);
           }}
           placeholder="Paste the bridge key from the vault"
@@ -263,6 +298,11 @@ function CompanionStep({
           <span className="wizard-clipboard-error mono">{clipboardError}</span>
         ) : null}
       </div>
+      {validationError !== null ? (
+        <div className="wizard-bridge-error mono" role="alert">
+          {validationError}
+        </div>
+      ) : null}
       <div className="wizard-footnote mono">
         <em>
           The companion runs locally on your machine. The bridge key keeps the vault outside

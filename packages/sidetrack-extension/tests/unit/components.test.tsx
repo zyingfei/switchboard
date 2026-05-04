@@ -242,8 +242,8 @@ describe('UX skeleton components — render-without-crash + key text present', (
       />,
     );
     // Vault step is now first after Welcome (vaultPath defaults to
-     // '~/Documents/Sidetrack-vault' so the npx command can render
-     // it). Next twice → companion step.
+    // '~/Documents/Sidetrack-vault' so the npx command can render
+    // it). Next twice → companion step.
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     fireEvent.click(screen.getByRole('button', { name: 'Paste from clipboard' }));
@@ -266,13 +266,54 @@ describe('UX skeleton components — render-without-crash + key text present', (
       />,
     );
     // Vault step is now first after Welcome (vaultPath defaults to
-     // '~/Documents/Sidetrack-vault' so the npx command can render
-     // it). Next twice → companion step.
+    // '~/Documents/Sidetrack-vault' so the npx command can render
+    // it). Next twice → companion step.
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     fireEvent.click(screen.getByRole('button', { name: 'Paste from clipboard' }));
-    expect(await screen.findByText(/doesn't look like a bridge key/)).toBeInTheDocument();
+    expect(await screen.findByText(/Bridge key malformed/)).toBeInTheDocument();
     expect(onBridgeKeyChange).not.toHaveBeenCalled();
+  });
+
+  it('Wizard companion step names missing and malformed bridge keys before continuing', () => {
+    const onBridgeKeyChange = vi.fn();
+    const renderWizard = (bridgeKey = '') => (
+      <Wizard
+        bridgeKey={bridgeKey}
+        onClose={noop}
+        onFinish={noop}
+        onBridgeKeyChange={onBridgeKeyChange}
+        onPingCompanion={vi.fn().mockResolvedValue('unreachable' as const)}
+        onReadClipboard={vi.fn().mockResolvedValue('')}
+      />
+    );
+    const { rerender } = render(renderWizard());
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText(/Bridge key missing/)).toBeInTheDocument();
+
+    fireEvent.change(screen.getByPlaceholderText(/bridge key/i), { target: { value: 'short' } });
+    rerender(renderWizard('short'));
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText(/Bridge key malformed/)).toBeInTheDocument();
+    expect(onBridgeKeyChange).toHaveBeenCalledWith('short');
+  });
+
+  it('Wizard returns to the companion step when the bridge key is rejected', async () => {
+    render(
+      <Wizard
+        bridgeKey={'a'.repeat(43)}
+        connectionError="Bridge key rejected — this companion is running with a different vault key."
+        onClose={noop}
+        onFinish={noop}
+        onPingCompanion={vi.fn().mockResolvedValue('unreachable' as const)}
+        onReadClipboard={vi.fn().mockResolvedValue('')}
+      />,
+    );
+    expect(await screen.findByText(/Bridge key rejected/)).toBeInTheDocument();
+    expect(screen.getByPlaceholderText(/bridge key/i)).toBeInTheDocument();
   });
 
   it('CodingAttach renders the handoff modal with workstream picker', () => {

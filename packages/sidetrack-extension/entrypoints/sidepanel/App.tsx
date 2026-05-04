@@ -56,6 +56,10 @@ import {
 } from './components';
 import { createDispatchClient } from '../../src/dispatch/client';
 import {
+  bridgeKeyValidationCopy,
+  validateBridgeKeyCandidate,
+} from '../../src/companion/bridgeKeyValidation';
+import {
   type DispatchMode,
   dispatchKindToUiPacketKind,
   mapUiPacketKind,
@@ -547,6 +551,7 @@ const App = () => {
   const [findPulseDismissedUrl, setFindPulseDismissedUrl] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [wizardConnectionError, setWizardConnectionError] = useState<string | null>(null);
 
   const threads = useMemo(() => visibleThreads(state.threads), [state.threads]);
   const moveThread = useMemo(
@@ -943,12 +948,39 @@ const App = () => {
 
   const completeSetup = async (saveCompanionFirst: boolean): Promise<void> => {
     if (saveCompanionFirst) {
-      await runAction(() =>
-        sendRequest({
+      const portNumber = Number(port);
+      if (!Number.isFinite(portNumber) || portNumber <= 0) {
+        const message = 'Invalid companion port.';
+        setWizardConnectionError(message);
+        throw new Error(message);
+      }
+      const bridgeKeyFailure = validateBridgeKeyCandidate(bridgeKey);
+      if (bridgeKeyFailure !== null) {
+        const message = bridgeKeyValidationCopy[bridgeKeyFailure];
+        setWizardConnectionError(message);
+        throw new Error(message);
+      }
+      setWizardConnectionError(null);
+      setBusy(true);
+      setError(null);
+      try {
+        const next = await sendRequest({
           type: messageTypes.saveCompanionSettings,
-          settings: { bridgeKey, port: Number(port) },
-        }),
-      );
+          settings: { bridgeKey: bridgeKey.trim(), port: portNumber },
+        });
+        setState(next);
+        setError(next.lastError ?? null);
+        setBridgeKey(next.settings.companion.bridgeKey);
+        setPort(String(next.settings.companion.port));
+      } catch (setupError) {
+        const message =
+          setupError instanceof Error ? setupError.message : 'Could not connect companion.';
+        setWizardConnectionError(message);
+        setError(message);
+        throw setupError;
+      } finally {
+        setBusy(false);
+      }
     }
     await writeSetupCompleted();
     setSetupCompleted(true);
@@ -3721,6 +3753,7 @@ const App = () => {
         <Wizard
           bridgeKey={bridgeKey}
           companionReachable={state.companionStatus === 'connected'}
+          connectionError={wizardConnectionError}
           onClose={() => {
             // Lock the wizard open during first-launch (no Skip / Done
             // pressed yet) so users can't accidentally ESC out of setup.
@@ -3735,8 +3768,12 @@ const App = () => {
               );
             });
           }}
-          onBridgeKeyChange={setBridgeKey}
+          onBridgeKeyChange={(value) => {
+            setWizardConnectionError(null);
+            setBridgeKey(value);
+          }}
           onSkip={() => {
+            setWizardConnectionError(null);
             void completeSetup(false).catch((setupError: unknown) => {
               setError(
                 setupError instanceof Error ? setupError.message : 'Could not finish setup.',

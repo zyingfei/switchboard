@@ -1,12 +1,14 @@
 import { expect, test, type BrowserContext, type Page, type Route } from '@playwright/test';
 
 import { messageTypes } from '../../src/messages';
+import { startTestCompanion, type TestCompanion } from './helpers/companion';
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
 import {
   SETTINGS_KEY,
   THREADS_KEY,
   WORKSTREAMS_KEY,
   assertOk,
+  clearSidetrackStorage,
   seedAndOpenSidepanel,
 } from './helpers/sidepanel';
 
@@ -144,7 +146,116 @@ const attachCompanionMocks = async (context: BrowserContext): Promise<void> => {
   });
 };
 
+const openFirstLaunchWizard = async (
+  runtime: ExtensionRuntime,
+  companion: TestCompanion,
+): Promise<Page> => {
+  const page = await runtime.context.newPage();
+  await page.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
+    waitUntil: 'domcontentloaded',
+  });
+  await clearSidetrackStorage(page);
+  await runtime.seedStorage(page, {
+    [SETTINGS_KEY]: {
+      companion: { port: companion.port, bridgeKey: '' },
+      autoTrack: false,
+      siteToggles: { chatgpt: true, claude: true, gemini: true },
+    },
+  });
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  const wizard = page.locator('.modal').filter({
+    has: page.getByRole('heading', { name: 'Set up Sidetrack' }),
+  });
+  await expect(wizard).toBeVisible();
+  await wizard.getByRole('button', { name: 'Next' }).click();
+  await expect(wizard.getByLabel('Vault path')).toBeVisible();
+  await wizard.getByRole('button', { name: 'Next' }).click();
+  await expect(wizard.locator('input[placeholder*="bridge key" i]')).toBeVisible();
+  return page;
+};
+
 test.describe('M1/M2 requirements BDD (user experience)', () => {
+  test('Scenario: bridge-key setup names each failure before accepting the real key', async () => {
+    test.setTimeout(120_000);
+    let companion: TestCompanion | undefined;
+    let runtime: ExtensionRuntime | undefined;
+    let page: Page | undefined;
+
+    try {
+      companion = await startTestCompanion();
+      runtime = await launchExtensionRuntime({ forceLocalProfile: true });
+
+      await test.step('Given first-run setup is connected to a real companion port', async () => {
+        if (runtime === undefined || companion === undefined) {
+          throw new Error('Runtime or companion was not launched.');
+        }
+        page = await openFirstLaunchWizard(runtime, companion);
+      });
+
+      await test.step('Then an empty bridge key is reported as missing', async () => {
+        if (page === undefined) throw new Error('Side panel did not open.');
+        const wizard = page.locator('.modal').filter({
+          has: page.getByRole('heading', { name: 'Set up Sidetrack' }),
+        });
+        await wizard.getByRole('button', { name: 'Next' }).click();
+        await expect(wizard.getByText(/Bridge key missing/u)).toBeVisible();
+      });
+
+      await test.step('And a copied fragment is reported as malformed', async () => {
+        if (page === undefined) throw new Error('Side panel did not open.');
+        const wizard = page.locator('.modal').filter({
+          has: page.getByRole('heading', { name: 'Set up Sidetrack' }),
+        });
+        await wizard.locator('input[placeholder*="bridge key" i]').fill('short-fragment');
+        await wizard.getByRole('button', { name: 'Next' }).click();
+        await expect(wizard.getByText(/Bridge key malformed/u)).toBeVisible();
+      });
+
+      await test.step('And a well-formed key from the wrong vault is rejected without closing setup', async () => {
+        if (page === undefined) throw new Error('Side panel did not open.');
+        const wizard = page.locator('.modal').filter({
+          has: page.getByRole('heading', { name: 'Set up Sidetrack' }),
+        });
+        await wizard.locator('input[placeholder*="bridge key" i]').fill('a'.repeat(43));
+        await wizard.getByRole('button', { name: 'Next' }).click();
+        await expect(wizard).toContainText('· Providers');
+        await wizard.getByRole('button', { name: 'Next' }).click();
+        await expect(wizard).toContainText('· Done');
+        await wizard.getByRole('button', { name: 'Done' }).click();
+        await expect(wizard.getByText(/Bridge key rejected/u)).toBeVisible();
+        await expect(wizard.locator('input[placeholder*="bridge key" i]')).toBeVisible();
+
+        const stored = await page.evaluate(async (key) => {
+          const all = await chrome.storage.local.get([key]);
+          const record = all[key] as { companion?: { bridgeKey?: string } } | undefined;
+          return record?.companion?.bridgeKey ?? null;
+        }, SETTINGS_KEY);
+        expect(stored).toBe('');
+      });
+
+      await test.step('When the user pastes the real bridge key, setup completes and syncs', async () => {
+        if (page === undefined || companion === undefined) {
+          throw new Error('Side panel or companion was not ready.');
+        }
+        const wizard = page.locator('.modal').filter({
+          has: page.getByRole('heading', { name: 'Set up Sidetrack' }),
+        });
+        await wizard.locator('input[placeholder*="bridge key" i]').fill(companion.bridgeKey);
+        await wizard.getByRole('button', { name: 'Next' }).click();
+        await expect(wizard).toContainText('· Providers');
+        await wizard.getByRole('button', { name: 'Next' }).click();
+        await expect(wizard).toContainText('· Done');
+        await wizard.getByRole('button', { name: 'Done' }).click();
+        await expect(wizard).toHaveCount(0, { timeout: 15_000 });
+        await expect(page.locator('.ws-status')).toHaveText('vault: synced', { timeout: 15_000 });
+      });
+    } finally {
+      await page?.close().catch(() => undefined);
+      await runtime?.close();
+      await companion?.close();
+    }
+  });
+
   test('Scenario: active work is visible, reply-aware, and privacy-safe', async () => {
     let runtime: ExtensionRuntime | undefined;
     let page: Page | undefined;
@@ -379,7 +490,7 @@ test.describe('M1/M2 requirements BDD (user experience)', () => {
           .locator('.modal')
           .filter({ has: page.getByRole('heading', { name: 'Confirm dispatch' }) });
         await expect(confirm).toBeVisible();
-        await expect(confirm).toContainText('paste mode');
+        await expect(confirm).toContainText(/Paste mode/i);
         const chain = confirm.locator('.safety-chain');
         await expect(chain).toBeVisible();
         await expect(chain.locator('.sc-pip')).toHaveCount(4);
