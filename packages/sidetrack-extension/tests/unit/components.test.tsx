@@ -76,15 +76,18 @@ describe('UX skeleton components — render-without-crash + key text present', (
         onConfirm={noop}
       />,
     );
-    // No items redacted → friendly empty-state, NOT "Redaction fired".
-    // Regression guard for the "0 items removed — 1 GitHub token, 1 email"
-    // contradictory copy that was leaking from the stub defaults.
+    // SafetyChainSummary collapses the four §24.10 checks into a single
+    // summary line. Clean state → "checks ok" header (no "redaction" pip
+    // in warn state). Regression guard for the "0 items removed — 1
+    // GitHub token, 1 email" contradictory copy bug.
     expect(screen.queryByText(/Redaction fired/)).toBeNull();
     expect(screen.queryByText(/1 GitHub token/)).toBeNull();
-    expect(screen.getByText(/Nothing redacted/)).toBeInTheDocument();
-    expect(screen.getByText(/Token budget/)).toBeInTheDocument();
-    expect(screen.getByText(/safe to dispatch/)).toBeInTheDocument();
-    expect(screen.getByText(/No prompt-injection patterns/)).toBeInTheDocument();
+    expect(screen.getByText(/checks ok/)).toBeInTheDocument();
+    // Pips render the four check labels in the collapsed summary.
+    expect(screen.getAllByText(/redaction/i).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/token budget/i).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/screen-share-safe/i).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/injection scrub/i).length).toBeGreaterThan(0);
     expect(screen.getByText(/Paste mode is locked per §24.10/)).toBeInTheDocument();
   });
 
@@ -128,10 +131,13 @@ describe('UX skeleton components — render-without-crash + key text present', (
         onConfirm={noop}
       />,
     );
-    expect(screen.getByText(/Redaction fired/)).toBeInTheDocument();
-    expect(screen.getByText(/2 items removed/)).toBeInTheDocument();
-    expect(screen.getByText('1 GitHub token, 1 email')).toBeInTheDocument();
-    expect(screen.queryByText(/Nothing redacted/)).toBeNull();
+    // With redactedCount > 0, the summary auto-opens (warn) and the
+    // detail row shows the masked-spans note. The summary header reads
+    // "needs review" instead of "checks ok".
+    expect(screen.getByText(/needs review/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/2 spans masked — 1 GitHub token, 1 email/),
+    ).toBeInTheDocument();
   });
 
   it('DispatchConfirm flips screen-share + injection states when active', () => {
@@ -148,8 +154,15 @@ describe('UX skeleton components — render-without-crash + key text present', (
         onConfirm={noop}
       />,
     );
-    expect(screen.getByText(/Screen-share active/)).toBeInTheDocument();
-    expect(screen.getByText(/Captured-page injection detected/)).toBeInTheDocument();
+    // Both warnings auto-open the safety chain detail; check for the
+    // detail-row prose now that the inline rich rows are collapsed.
+    expect(screen.getByText(/needs review/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/screen-share active — contents visible to viewers/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/captured-page injection detected/),
+    ).toBeInTheDocument();
   });
 
   it('ReviewComposer renders editable span + comment-driven actions', () => {

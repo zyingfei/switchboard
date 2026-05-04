@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import { Icons } from './icons';
 
@@ -6,10 +6,9 @@ import { Icons } from './icons';
 // header diagnostics icon. Renders the v2 design's 4-card health
 // summary + per-provider 24h breakdown + recent errors.
 //
-// Wires to the companion's GET /v1/system/health endpoint when it
-// lands on main (PR #78). Until then, falls back to fixture data so
-// the visual surface ships and the user can iterate on the design
-// in the test browser.
+// Fetches GET /v1/system/health (PR #78) when companion port + bridge
+// key are provided; falls back to fixture data otherwise so the
+// surface stays visible without a configured companion.
 
 interface HealthReport {
   readonly uptimeSec: number;
@@ -71,7 +70,21 @@ const PROVIDER_ROWS: readonly ProviderRow[] = [
 
 interface HealthPanelProps {
   readonly onClose: () => void;
+  readonly companionPort?: number | null;
+  readonly bridgeKey?: string | null;
 }
+
+const isHealthReport = (value: unknown): value is HealthReport => {
+  if (typeof value !== 'object' || value === null) return false;
+  const v = value as Partial<HealthReport>;
+  return (
+    typeof v.uptimeSec === 'number' &&
+    typeof v.vault === 'object' &&
+    typeof v.capture === 'object' &&
+    typeof v.recall === 'object' &&
+    typeof v.service === 'object'
+  );
+};
 
 const formatBytes = (n: number | null): string => {
   if (n === null) return '?';
@@ -80,9 +93,41 @@ const formatBytes = (n: number | null): string => {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 };
 
-export function HealthPanel({ onClose }: HealthPanelProps) {
+export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelProps) {
   const [copied, setCopied] = useState(false);
-  const report = FIXTURE_REPORT;
+  const [report, setReport] = useState<HealthReport>(FIXTURE_REPORT);
+  const [isLive, setIsLive] = useState(false);
+
+  // Fetch the live report when companion is configured. Silent on failure
+  // — the fixture stays in place so the visual surface never blanks.
+  useEffect(() => {
+    if (companionPort === undefined || companionPort === null || !bridgeKey) {
+      return undefined;
+    }
+    let cancelled = false;
+    const fetchReport = async () => {
+      try {
+        const url = `http://127.0.0.1:${String(companionPort)}/v1/system/health`;
+        const response = await fetch(url, { headers: { 'x-bac-bridge-key': bridgeKey } });
+        if (!response.ok) return;
+        const body = (await response.json()) as { readonly data?: unknown };
+        if (cancelled || !isHealthReport(body.data)) return;
+        setReport(body.data);
+        setIsLive(true);
+      } catch {
+        // Keep fixture; surface stays usable offline.
+      }
+    };
+    void fetchReport();
+    const id = window.setInterval(() => {
+      void fetchReport();
+    }, 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [companionPort, bridgeKey]);
+
   const queueWarn =
     report.capture.queueDepthHint !== null && report.capture.queueDepthHint > 10;
 
@@ -102,7 +147,7 @@ export function HealthPanel({ onClose }: HealthPanelProps) {
           <span style={{ display: 'inline-flex', width: 14, height: 14 }}>{Icons.back}</span>
         </button>
         <span className="title">Capture health</span>
-        <span className="muted">snapshot · live</span>
+        <span className="muted">snapshot · {isLive ? 'live' : 'preview'}</span>
       </div>
 
       <div className="health-grid">
