@@ -44,9 +44,7 @@ const assertOk = (response: unknown): void => {
 const readSidetrackStorage = async (page: Page): Promise<SidetrackStorage> => {
   return await page.evaluate(async () => {
     const all = await chrome.storage.local.get(null);
-    return Object.fromEntries(
-      Object.entries(all).filter(([key]) => key.startsWith('sidetrack')),
-    );
+    return Object.fromEntries(Object.entries(all).filter(([key]) => key.startsWith('sidetrack')));
   });
 };
 
@@ -67,7 +65,7 @@ const focusTabForCapture = async (sidepanel: Page, targetUrl: string): Promise<v
   await sidepanel.evaluate(async (url) => {
     const tabs = await chrome.tabs.query({});
     const tab = tabs.find((candidate) => candidate.url === url);
-    if (tab?.id === undefined || tab.windowId === undefined) {
+    if (tab === undefined) {
       throw new Error(`Could not find a Chrome tab for ${url}.`);
     }
     await chrome.windows.update(tab.windowId, { focused: true });
@@ -79,7 +77,7 @@ const focusTabForCapture = async (sidepanel: Page, targetUrl: string): Promise<v
       async () =>
         await sidepanel.evaluate(async () => {
           const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-          return tab?.url ?? '';
+          return tab.url;
         }),
       { timeout: 5_000 },
     )

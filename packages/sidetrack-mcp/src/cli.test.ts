@@ -54,4 +54,10 @@ describe('runCli', () => {
     expect(exitCode).toBe(2);
     expect(streams.stderr.text()).toContain('Missing required --vault <path>.');
   });
+
+  it('rejects an unsupported transport', async () => {
+    await expect(runCli(['--transport', 'sse'], createStreams())).rejects.toThrow(
+      '--transport must be either stdio or websocket.',
+    );
+  });
 });

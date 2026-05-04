@@ -68,11 +68,7 @@ import { createSettingsClient } from '../../src/settings/client';
 import { isProviderWithOptIn, type SettingsDocument } from '../../src/settings/types';
 import { createTurnsClient, type CapturedTurnRecord } from '../../src/turns/client';
 import { deriveLifecycle } from '../../src/sidepanel/lifecycle';
-import {
-  listPendingOffers,
-  markStatus,
-  type OfferRecord,
-} from '../../src/codingAttach/state';
+import { listPendingOffers, markStatus, type OfferRecord } from '../../src/codingAttach/state';
 import './style.css';
 
 const TARGET_PROVIDER_LABEL: Record<string, string> = {
@@ -326,12 +322,7 @@ const DISPATCH_PROVIDER_LABEL: Record<string, string> = {
 };
 
 const DISPATCH_STATUS_TO_DISPLAY = (status: string): RecentDispatchStatus => {
-  if (
-    status === 'replied' ||
-    status === 'noted' ||
-    status === 'pending' ||
-    status === 'archived'
-  ) {
+  if (status === 'replied' || status === 'noted' || status === 'pending' || status === 'archived') {
     return status;
   }
   // 'sent', 'queued', 'failed' all map to 'sent' visually — failed is
@@ -514,7 +505,7 @@ const App = () => {
     const onChanged: StorageOnChanged | null =
       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
       typeof chrome.storage?.onChanged?.addListener === 'function'
-        ? (chrome.storage.onChanged)
+        ? chrome.storage.onChanged
         : null;
     onChanged?.addListener(onStorageChanged);
     return () => {
@@ -533,8 +524,7 @@ const App = () => {
     const matchMedia: ((query: string) => MediaQueryList) | undefined =
       typeof window.matchMedia === 'function' ? window.matchMedia.bind(window) : undefined;
     const prefersDark = matchMedia?.('(prefers-color-scheme: dark)').matches ?? false;
-    const resolved: 'light' | 'ink' =
-      theme === 'auto' ? (prefersDark ? 'ink' : 'light') : theme;
+    const resolved: 'light' | 'ink' = theme === 'auto' ? (prefersDark ? 'ink' : 'light') : theme;
     if (resolved === 'ink') {
       root.setAttribute('data-theme', 'ink');
     } else {
@@ -1193,16 +1183,16 @@ const App = () => {
     if (intent.kind === 'research_packet') {
       body = `# Research request: ${thread.title}\n\n${head}\n\n## Pre-flight checklist for the receiving AI\n- [ ] Verify the conclusion against the original source\n- [ ] Note any framework versions / dates the source assumes\n- [ ] Flag if the question has shifted since first ask\n- [ ] Distinguish what was asserted vs cited\n\n## Recent context\n${turnsMd}\n\n## Ask\n…`;
     } else if (intent.kind === 'coding_agent_packet') {
-      // MCP-aware handoff: tells the coding agent how to call the
-      // local Sidetrack companion's tool surface for live thread +
-      // recent dispatches + recall, and includes the captured turns
-      // as an offline fallback if the companion is unreachable.
+      // MCP-aware handoff: tells the coding agent how to connect to
+      // Sidetrack's local MCP endpoint for live thread + recent
+      // dispatches + recall, with the old HTTP route as fallback.
+      // It also includes captured turns as an offline fallback.
       // Bridge key + port are interpolated from the side-panel's
       // current settings — clipboard is local, companion only listens
       // on 127.0.0.1, so it's safe to render the key inline.
       const portStr = port.length > 0 ? port : '17373';
       const keyStr = bridgeKey.length > 0 ? bridgeKey : '<run the companion to generate>';
-      body = `# Coding handoff: ${thread.title}\n\nYou are continuing work from a Sidetrack thread. The user's local Sidetrack companion is running and exposes a tool surface you can call to read live thread context, recent dispatches, and decisions.\n\n## Thread reference\n${provider} · ${thread.threadUrl}\nthread_id: ${thread.bac_id}\n\n## Companion endpoint\n- base url   : http://127.0.0.1:${portStr}\n- auth       : send header  x-bac-bridge-key: ${keyStr}\n- tool route : send header  x-sidetrack-mcp-tool: <tool-name>\n\n(Companion runs locally only; the bridge key is local-machine.)\n\n## Tools you can call (read-only)\n- bac.read_thread_md       full markdown of this thread\n- bac.list_dispatches      recent context packets / asks the user shipped\n- bac.recall               vector recall over related threads + decisions\n- bac.read_workstream_md   workstream context if this thread is grouped\n- bac.list_annotations     user-saved highlights with comments\n- bac.list_audit_events    decisions, archives, edits\n\nRecommended sequence on first call: read_thread_md → list_dispatches → recall (if you need cross-thread context). Cite the tool name when you reference what you pulled so the user can verify.\n\n## Snapshot of the captured turns (offline fallback)\nIf the companion is unreachable, work from this snapshot. It's the same data bac.read_thread_md would return, just frozen at clipboard time.\n\n${turnsMd}\n\n## User's ask\n…`;
+      body = `# Coding handoff: ${thread.title}\n\nYou are continuing work from a Sidetrack thread. The user's local Sidetrack MCP endpoint can read live thread context, recent dispatches, and decisions.\n\n## Thread reference\n${provider} · ${thread.threadUrl}\nthread_id: ${thread.bac_id}\n\n## MCP endpoint\n- primary : ws://127.0.0.1:8721/mcp?token=${keyStr}\n- auth    : the token is the local Sidetrack bridge key\n\n## HTTP fallback\n- base url   : http://127.0.0.1:${portStr}\n- auth       : send header  x-bac-bridge-key: ${keyStr}\n- tool route : send header  x-sidetrack-mcp-tool: <tool-name>\n\n(Everything is localhost-only; the bridge key is local-machine.)\n\n## Tools you can call (read-only)\n- bac.read_thread_md       full markdown of this thread\n- bac.list_dispatches      recent context packets / asks the user shipped\n- bac.recall               vector recall over related threads + decisions\n- bac.read_workstream_md   workstream context if this thread is grouped\n- bac.list_annotations     user-saved highlights with comments\n- bac.list_audit_events    decisions, archives, edits\n\nRecommended sequence on first call: read_thread_md → list_dispatches → recall (if you need cross-thread context). Cite the tool name when you reference what you pulled so the user can verify.\n\n## Snapshot of the captured turns (offline fallback)\nIf Sidetrack is unreachable, work from this snapshot. It's the same data bac.read_thread_md would return, just frozen at clipboard time.\n\n${turnsMd}\n\n## User's ask\n…`;
     } else {
       const today = new Date().toISOString().slice(0, 10);
       body = `---\ntitle: ${thread.title}\ncreated: ${today}\nsource: ${thread.threadUrl}\nprovider: ${provider}\n---\n\n# ${thread.title}\n\n${turnsMd}`;
@@ -1627,18 +1617,14 @@ const App = () => {
   // thread). Save-to-vault uses the same review HTTP client as the
   // modal flow but reads the staged draft from chrome.storage.
   const dropReviewDraftSpan = (threadId: string, spanId: string) => {
-    void runAction(() =>
-      sendRequest({ type: messageTypes.dropReviewDraftSpan, threadId, spanId }),
-    );
+    void runAction(() => sendRequest({ type: messageTypes.dropReviewDraftSpan, threadId, spanId }));
   };
 
   const updateInlineReviewDraft = (
     threadId: string,
     patch: { overall?: string; verdict?: ReviewVerdictType },
   ) => {
-    void runAction(() =>
-      sendRequest({ type: messageTypes.updateReviewDraft, threadId, ...patch }),
-    );
+    void runAction(() => sendRequest({ type: messageTypes.updateReviewDraft, threadId, ...patch }));
   };
 
   // Two ways to ship the staged draft. Both bundle into the queue
@@ -1958,8 +1944,7 @@ const App = () => {
             </span>
           ) : null}
         </div>
-        {lifecyclePill?.label === 'Needs organize' &&
-        !dismissedSuggestions.has(thread.bac_id) ? (
+        {lifecyclePill?.label === 'Needs organize' && !dismissedSuggestions.has(thread.bac_id) ? (
           <NeedsOrganizeSuggestionRow
             threadId={thread.bac_id}
             companionPort={port.length > 0 ? Number(port) : null}
@@ -2871,17 +2856,13 @@ const App = () => {
                 }}
                 onAccept={() => {
                   void markStatus(offer.tabId, 'accepted').then(() => {
-                    setPendingCodingOffers((prev) =>
-                      prev.filter((o) => o.tabId !== offer.tabId),
-                    );
+                    setPendingCodingOffers((prev) => prev.filter((o) => o.tabId !== offer.tabId));
                     setCodingAttachOpen(true);
                   });
                 }}
                 onDismiss={() => {
                   void markStatus(offer.tabId, 'declined').then(() => {
-                    setPendingCodingOffers((prev) =>
-                      prev.filter((o) => o.tabId !== offer.tabId),
-                    );
+                    setPendingCodingOffers((prev) => prev.filter((o) => o.tabId !== offer.tabId));
                   });
                 }}
               />
@@ -2977,7 +2958,9 @@ const App = () => {
                     </span>
                     <span className="thread-bucket-count mono">{String(list.length)}</span>
                   </button>
-                  {collapsed ? null : <div className="thread-list">{list.map(renderThreadRow)}</div>}
+                  {collapsed ? null : (
+                    <div className="thread-list">{list.map(renderThreadRow)}</div>
+                  )}
                 </div>
               );
             })}
@@ -3377,9 +3360,8 @@ const App = () => {
             );
             if (sourceThread === undefined) return undefined;
             const provLabel =
-              TARGET_PROVIDER_LABEL[
-                providerIdToDispatchProvider(sourceThread.provider)
-              ] ?? sourceThread.provider;
+              TARGET_PROVIDER_LABEL[providerIdToDispatchProvider(sourceThread.provider)] ??
+              sourceThread.provider;
             const model = sourceThread.selectedModel;
             return model === undefined || model.length === 0
               ? provLabel
@@ -3392,9 +3374,7 @@ const App = () => {
             if (t === 'codex' || t === 'claude_code' || t === 'cursor') return false;
             const provider = mapUiTarget(t);
             return (
-              settings !== null &&
-              isProviderWithOptIn(provider) &&
-              settings.autoSendOptIn[provider]
+              settings !== null && isProviderWithOptIn(provider) && settings.autoSendOptIn[provider]
             );
           })()}
           dispatchKind={(() => {
@@ -3989,9 +3969,11 @@ function NeedsOrganizeSuggestionRow({
   onPickManual,
   onDismiss,
 }: NeedsOrganizeSuggestionRowProps) {
-  const [suggestion, setSuggestion] = useState<
-    { readonly workstreamId: string; readonly label: string; readonly confidence: number } | null
-  >(
+  const [suggestion, setSuggestion] = useState<{
+    readonly workstreamId: string;
+    readonly label: string;
+    readonly confidence: number;
+  } | null>(
     cached !== undefined
       ? {
           workstreamId: '',

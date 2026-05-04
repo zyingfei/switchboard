@@ -95,8 +95,7 @@ const INTENT_HELP: Record<ComposerIntent, string> = {
     'Forward this thread to Claude / GPT / Gemini for a follow-up question or research ask.',
   'hand-to-coder':
     'Build a file-aware handoff for Claude Code / Codex / Cursor — includes acceptance criteria.',
-  'save-as-file':
-    'Save the thread as Markdown for your notes vault / Obsidian / Notion.',
+  'save-as-file': 'Save the thread as Markdown for your notes vault / Obsidian / Notion.',
 };
 
 const intentForKind = (kind: PacketKind): ComposerIntent => {
@@ -170,8 +169,7 @@ const EXPORT_AS_TARGETS: readonly DispatchTarget[] = ['notebook', 'markdown'];
 
 // True if the chosen target represents a "send" (AI / coding) action.
 // Notebook / Markdown are file exports, not dispatches.
-const isExportTarget = (t: DispatchTarget): boolean =>
-  t === 'notebook' || t === 'markdown';
+const isExportTarget = (t: DispatchTarget): boolean => t === 'notebook' || t === 'markdown';
 
 const FALLBACK_BODY = `# Context Pack
 
@@ -291,9 +289,10 @@ ${ctx}
 // (Files / Acceptance criteria / Constraints) bolted onto a markdown
 // dump of the captured turns. That copy was lossy — the agent would
 // only see what the user already had in clipboard. The new packet is
-// MCP-aware: it points the agent at the running Sidetrack companion
-// over HTTP-with-headers and lists the read tools the agent should
-// call to pull live thread context, decisions, and recent dispatches.
+// MCP-aware: it points the agent at the running Sidetrack MCP endpoint
+// first, with the older companion HTTP-with-headers surface as fallback.
+// The tools list tells the agent what to call for live thread context,
+// decisions, and recent dispatches.
 //
 // The bridge key is rendered inline because the clipboard is local
 // and the companion only listens on 127.0.0.1 — no network exposure.
@@ -313,16 +312,13 @@ call to read live thread context, recent dispatches, and decisions.
 
 ## Thread reference
 ${threadInfoLine(scope)}
-${
-  scope.sourceThreadId === undefined
-    ? ''
-    : `\nthread_id: ${scope.sourceThreadId}`
-}
+${scope.sourceThreadId === undefined ? '' : `\nthread_id: ${scope.sourceThreadId}`}
 
 ## Companion endpoint
-- base url   : http://127.0.0.1:{COMPANION_PORT}
-- auth       : send header  x-bac-bridge-key: {BRIDGE_KEY}
-- tool route : send header  x-sidetrack-mcp-tool: <tool-name>
+- MCP primary : ws://127.0.0.1:8721/mcp?token={BRIDGE_KEY}
+- HTTP fallback base url : http://127.0.0.1:{COMPANION_PORT}
+- HTTP fallback auth     : send header  x-bac-bridge-key: {BRIDGE_KEY}
+- HTTP fallback route    : send header  x-sidetrack-mcp-tool: <tool-name>
 
 (The companion runs locally only; the bridge key is local-machine.)
 
@@ -631,13 +627,9 @@ export function PacketComposer({
           <div className="pill-row pill-row-grouped">
             {SEND_TO_AI_TARGETS.map((group) => {
               const groupActive =
-                group.id === target ||
-                (group.variants?.some((v) => v.id === target) ?? false);
+                group.id === target || (group.variants?.some((v) => v.id === target) ?? false);
               return (
-                <span
-                  key={group.id}
-                  className={'pill-group' + (groupActive ? ' on' : '')}
-                >
+                <span key={group.id} className={'pill-group' + (groupActive ? ' on' : '')}>
                   <button
                     type="button"
                     className={'pill ' + (groupActive ? 'on' : '')}

@@ -1,9 +1,11 @@
 # Proposal: JSON-RPC MCP server in the Sidetrack companion
 
-> Status: Spec — implementation deferred.
+> Status: Shipped — `packages/sidetrack-mcp` now provides the local
+> WebSocket JSON-RPC endpoint. Companion-embedded bootstrap remains a
+> follow-up.
 > Audience: the next coder who picks this up.
 > Author: drafted alongside the inline-review and coding-agent handoff
->         work in the M1+M2 push (see `BRAINSTORM-INDEX.md` §24.5).
+> work in the M1+M2 push (see `BRAINSTORM-INDEX.md` §24.5).
 
 ## Why
 
@@ -19,9 +21,9 @@ real MCP server (Claude Code, Cursor, etc.) can't connect to it. The
 v2 design (`switchboard/project/surfaces/mcp.jsx`) envisions the
 companion shipping a proper MCP server alongside the existing HTTP:
 
-  - endpoint: `ws://127.0.0.1:8721/mcp`
-  - transport: WebSocket, with a Streamable-HTTP fallback
-  - auth: bearer (the existing bridge key)
+- endpoint: `ws://127.0.0.1:8721/mcp`
+- transport: WebSocket, with a Streamable-HTTP fallback
+- auth: bearer (the existing bridge key)
 
 This proposal scopes that server. It does NOT remove or replace the
 existing HTTP surface — both run side by side.
@@ -49,21 +51,21 @@ Sidetrack companion and read thread / dispatch / workstream data.
 Read-only. Each tool delegates to the existing handler logic in
 `src/http/server.ts` so the response shape stays identical.
 
-| MCP tool name | Backed by HTTP route | Doc |
-|---|---|---|
-| `bac.recall` | `POST /v1/recall` | `docs/mcp/bac.recall.md` |
-| `bac.read_thread_md` | `GET /v1/threads/{id}.md` | `docs/mcp/bac.read_thread_md.md` |
-| `bac.read_workstream_md` | `GET /v1/workstreams/{id}.md` | `docs/mcp/bac.read_workstream_md.md` |
-| `bac.list_dispatches` | `GET /v1/dispatch-events` (+ tool header) | `docs/mcp/bac.list_dispatches.md` |
-| `bac.list_workstream_notes` | `GET /v1/workstream-notes` | `docs/mcp/bac.list_workstream_notes.md` |
-| `bac.list_buckets` | `GET /v1/buckets` | `docs/mcp/bac.list_buckets.md` |
-| `bac.list_audit_events` | `GET /v1/audit-events` | `docs/mcp/bac.list_audit_events.md` |
-| `bac.list_annotations` | `GET /v1/annotations` | `docs/mcp/bac.list_annotations.md` |
-| `bac.system_health` | `GET /v1/health` | `docs/mcp/bac.system_health.md` |
-| `bac.archive_thread` | `POST /v1/threads/{id}/archive` | `docs/mcp/bac.archive_thread.md` |
-| `bac.unarchive_thread` | `POST /v1/threads/{id}/unarchive` | `docs/mcp/bac.unarchive_thread.md` |
-| `bac.suggest_workstream` | `POST /v1/suggest-workstream` | `docs/mcp/bac.suggest_workstream.md` |
-| `bac.bump_workstream` | `POST /v1/workstreams/{id}/bump` | `docs/mcp/bac.bump_workstream.md` |
+| MCP tool name               | Backed by HTTP route                      | Doc                                     |
+| --------------------------- | ----------------------------------------- | --------------------------------------- |
+| `bac.recall`                | `POST /v1/recall`                         | `docs/mcp/bac.recall.md`                |
+| `bac.read_thread_md`        | `GET /v1/threads/{id}.md`                 | `docs/mcp/bac.read_thread_md.md`        |
+| `bac.read_workstream_md`    | `GET /v1/workstreams/{id}.md`             | `docs/mcp/bac.read_workstream_md.md`    |
+| `bac.list_dispatches`       | `GET /v1/dispatch-events` (+ tool header) | `docs/mcp/bac.list_dispatches.md`       |
+| `bac.list_workstream_notes` | `GET /v1/workstream-notes`                | `docs/mcp/bac.list_workstream_notes.md` |
+| `bac.list_buckets`          | `GET /v1/buckets`                         | `docs/mcp/bac.list_buckets.md`          |
+| `bac.list_audit_events`     | `GET /v1/audit-events`                    | `docs/mcp/bac.list_audit_events.md`     |
+| `bac.list_annotations`      | `GET /v1/annotations`                     | `docs/mcp/bac.list_annotations.md`      |
+| `bac.system_health`         | `GET /v1/health`                          | `docs/mcp/bac.system_health.md`         |
+| `bac.archive_thread`        | `POST /v1/threads/{id}/archive`           | `docs/mcp/bac.archive_thread.md`        |
+| `bac.unarchive_thread`      | `POST /v1/threads/{id}/unarchive`         | `docs/mcp/bac.unarchive_thread.md`      |
+| `bac.suggest_workstream`    | `POST /v1/suggest-workstream`             | `docs/mcp/bac.suggest_workstream.md`    |
+| `bac.bump_workstream`       | `POST /v1/workstreams/{id}/bump`          | `docs/mcp/bac.bump_workstream.md`       |
 
 Plus one new tool that the v2 design names but hasn't been built:
 
