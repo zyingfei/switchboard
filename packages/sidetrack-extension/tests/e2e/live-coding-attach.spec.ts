@@ -146,6 +146,14 @@ test.describe('live coding attach (logged-in profile)', () => {
       expect(registerResult.isError).not.toBe(true);
       expect(registerResult.structuredContent?.bac_id).toBeTruthy();
 
+      // Force a workboard refresh so the side panel's cached
+      // codingSessions includes the freshly-registered MCP session.
+      // (Side panel doesn't poll for MCP-side session registrations
+      // today — separate product gap; tracked as future work.)
+      await runtime.sendRuntimeMessage(sidepanel, {
+        type: messageTypes.getWorkboardState,
+      });
+
       await expect(
         sidepanel.locator('.coding-session-row .name', { hasText: 'codex · live' }),
       ).toBeVisible({ timeout: 10_000 });
