@@ -403,6 +403,65 @@ const threadIdFromUrl = (provider: ProviderId, rawUrl: string): string | undefin
   return undefined;
 };
 
+// Best-effort scrape of the model the user has selected in the chat
+// composer. Provider-specific:
+//   Gemini  — `bard-mode-switcher button` shows the active mode
+//             ("Thinking", "Pro", "Fast", "Heavy") as visible text.
+//   Claude  — model name shows on a button near the composer; we
+//             match the first button whose text starts with one of
+//             "Claude" / "Sonnet" / "Opus" / "Haiku".
+//   ChatGPT — the "Switch model" button is icon-only; we look at
+//             nearby model-mode pills (e.g. "Heavy", "Thinking") and
+//             cap the result. Falls back to undefined when nothing
+//             readable is in the DOM.
+// All return undefined on extractor errors so capture never crashes.
+const trimModelLabel = (raw: string): string | undefined => {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0 || trimmed.length > 80) return undefined;
+  return trimmed;
+};
+
+const detectSelectedModel = (doc: Document, provider: ProviderId): string | undefined => {
+  try {
+    if (provider === 'gemini') {
+      const switcher = doc.querySelector('bard-mode-switcher button');
+      if (switcher !== null) {
+        return trimModelLabel(switcher.textContent);
+      }
+      return undefined;
+    }
+    if (provider === 'claude') {
+      const claudeButton = Array.from(doc.querySelectorAll('button')).find((button) => {
+        const text = button.textContent.trim();
+        return /^(?:Claude\s|Sonnet|Opus|Haiku)/i.test(text) && text.length <= 60;
+      });
+      if (claudeButton !== undefined) {
+        return trimModelLabel(claudeButton.textContent);
+      }
+      return undefined;
+    }
+    if (provider === 'chatgpt') {
+      // Probe the composer / message area for known mode pills. The
+      // model picker itself is icon-only; "Heavy", "Thinking" etc.
+      // surface as visible text on adjacent toggle buttons.
+      const candidates = ['Heavy', 'Thinking', 'Pro', 'Auto'];
+      for (const candidate of candidates) {
+        const match = Array.from(doc.querySelectorAll('button, span')).find((el) => {
+          const text = el.textContent.trim();
+          return text === candidate;
+        });
+        if (match !== undefined) {
+          return candidate;
+        }
+      }
+      return undefined;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+};
+
 // Look for a "Branched from <Title>" / "Forked from <Title>" indicator
 // near the top of the conversation. We try a narrow selector list first
 // (Claude renders it as a small chip/button); fall back to scanning the
@@ -455,8 +514,17 @@ export const captureVisibleConversation = (
     capturedAt,
   );
   if (turns.length === 0) {
-    usedFallback = true;
-    turns = fallbackTurns(doc, maxChars, capturedAt);
+    // Fallback grabs visible text from <main>/<body>. On real provider
+    // pages (Gemini's Angular shell wraps sidebar + conversation in a
+    // single <main>; ChatGPT's app similarly mounts the nav inside the
+    // main app shell), this turns into nav-text noise when capture
+    // races ahead of conversation mount. Reserve fallback for unknown
+    // providers — known providers should produce zero turns and let
+    // the caller (auto-capture gate / explicit captureTab) decide.
+    if (provider === 'unknown') {
+      usedFallback = true;
+      turns = fallbackTurns(doc, maxChars, capturedAt);
+    }
   }
 
   const visibleText = turns.map((turn) => turn.text).join('\n\n');
@@ -469,6 +537,7 @@ export const captureVisibleConversation = (
     });
   }
   const forkSource = detectForkSource(doc);
+  const selectedModel = detectSelectedModel(doc, provider);
 
   return {
     provider,
@@ -482,6 +551,7 @@ export const captureVisibleConversation = (
     warnings,
     turns,
     ...forkSource,
+    ...(selectedModel === undefined ? {} : { selectedModel }),
   };
 };
 

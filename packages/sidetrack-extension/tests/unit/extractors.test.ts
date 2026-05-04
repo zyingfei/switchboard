@@ -140,6 +140,93 @@ describe('provider capture extractors', () => {
     expect(capture.turns.at(-1)?.role).toBe('assistant');
   });
 
+  // Regression: on a fresh nav to a Gemini chat URL, the Angular
+  // shell renders the sidebar (Search for chats, New chat, Notebooks,
+  // recent thread titles) before mounting `<user-query>` /
+  // `<model-response>`. The visible-main fallback would slurp that
+  // sidebar text and store it as an "unknown" role turn, surfacing
+  // nav text in the side panel's captured-turns view. For known
+  // providers we now produce zero turns instead of falling back, and
+  // the auto-capture gate drops the empty event so nothing pollutes
+  // the vault.
+  it('returns zero turns for a known-provider page with no message selectors yet', () => {
+    document.body.innerHTML = `
+      <main>
+        <bard-sidenav>
+          <search-nav-button>Search for chats</search-nav-button>
+          <side-nav-action-button>New chat</side-nav-action-button>
+          <conversations-list>
+            <side-nav-entry-button>TrenchBoot Installation Guide</side-nav-entry-button>
+            <side-nav-entry-button>Hyatt Early Check-In Options</side-nav-entry-button>
+          </conversations-list>
+        </bard-sidenav>
+        <chat-window></chat-window>
+      </main>
+    `;
+
+    const capture = captureVisibleConversation(document, {
+      url: 'https://gemini.google.com/app/test-thread',
+      capturedAt: '2026-05-04T00:00:00.000Z',
+    });
+
+    expect(capture.provider).toBe('gemini');
+    expect(capture.turns).toEqual([]);
+    expect(capture.selectorCanary).toBe('failed');
+    expect(capture.visibleTextCharCount).toBe(0);
+  });
+
+  it('captures the active Gemini mode from bard-mode-switcher', () => {
+    document.body.innerHTML = `
+      <main>
+        <bard-mode-switcher>
+          <button>Thinking</button>
+        </bard-mode-switcher>
+        <user-query>Plan tomorrow.</user-query>
+        <model-response>Sure, here's a plan.</model-response>
+      </main>
+    `;
+
+    const capture = captureVisibleConversation(document, {
+      url: 'https://gemini.google.com/app/abc',
+      capturedAt: '2026-05-04T00:00:00.000Z',
+    });
+
+    expect(capture.selectedModel).toBe('Thinking');
+  });
+
+  it('falls back to undefined when no model picker is in the DOM', () => {
+    document.body.innerHTML = `
+      <main>
+        <user-query>Plan tomorrow.</user-query>
+        <model-response>Sure.</model-response>
+      </main>
+    `;
+
+    const capture = captureVisibleConversation(document, {
+      url: 'https://gemini.google.com/app/abc',
+      capturedAt: '2026-05-04T00:00:00.000Z',
+    });
+
+    expect(capture.selectedModel).toBeUndefined();
+  });
+
+  it('detects a Claude composer model button', () => {
+    document.body.innerHTML = `
+      <main>
+        <div data-testid="user-message">Hi</div>
+        <div data-testid="assistant-message">Hello back.</div>
+        <button>Sonnet 4.6</button>
+      </main>
+    `;
+
+    const capture = captureVisibleConversation(document, {
+      url: 'https://claude.ai/chat/abc',
+      capturedAt: '2026-05-04T00:00:00.000Z',
+    });
+
+    expect(capture.selectedModel).toBe('Sonnet 4.6');
+  });
+
   // The dedup fix above must NOT break the legitimate merge-adjacent
   // pathway (ChatGPT has `mergeAdjacentSameRoleTurns: true` in its
   // config). Two consecutive assistant chunks should still collapse

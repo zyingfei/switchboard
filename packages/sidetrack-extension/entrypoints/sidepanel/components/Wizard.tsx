@@ -1,14 +1,17 @@
 import { useState } from 'react';
 import { Modal } from './Modal';
 
-export type WizardStep = 'welcome' | 'companion' | 'vault' | 'providers' | 'done';
+export type WizardStep = 'welcome' | 'vault' | 'companion' | 'providers' | 'done';
 
-const STEP_ORDER: readonly WizardStep[] = ['welcome', 'companion', 'vault', 'providers', 'done'];
+// Vault before Companion — the companion's npx command needs the
+// vault path the user just picked, so we collect it first and
+// interpolate the chosen path into the command shown to the user.
+const STEP_ORDER: readonly WizardStep[] = ['welcome', 'vault', 'companion', 'providers', 'done'];
 
 const STEP_LABEL: Record<WizardStep, string> = {
   welcome: 'Welcome',
-  companion: 'Companion',
   vault: 'Vault',
+  companion: 'Companion',
   providers: 'Providers',
   done: 'Done',
 };
@@ -222,7 +225,6 @@ function CompanionStep({
       </div>
       <div className="wizard-card-row single">
         <div className="wizard-card primary">
-          <div className="wizard-card-tag mono">DEFAULT · ADR-0001</div>
           <div className="wizard-card-title">HTTP loopback</div>
           <code className="wizard-card-cmd mono">
             npx @sidetrack/companion --vault {commandPath}
@@ -263,8 +265,8 @@ function CompanionStep({
       </div>
       <div className="wizard-footnote mono">
         <em>
-          Native Messaging considered and rejected for v1 — see ADR-0001 for the lifetime +
-          multi-MCP-client reasoning.
+          The companion runs locally on your machine. The bridge key keeps the vault outside
+          Chrome's profile so other extensions can't reach it.
         </em>
       </div>
     </div>

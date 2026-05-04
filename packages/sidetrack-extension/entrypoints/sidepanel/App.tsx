@@ -30,6 +30,7 @@ import {
   PacketComposer,
   RecentDispatches,
   ReviewComposer,
+  ReviewDraftFooter,
   SendToDropdown,
   type SendToTarget,
   SettingsPanel,
@@ -59,9 +60,10 @@ import {
   dispatchKindToUiPacketKind,
   mapUiPacketKind,
   mapUiTarget,
+  providerIdToDispatchProvider,
 } from '../../src/dispatch/types';
 import { createReviewClient } from '../../src/review/client';
-import type { ReviewOutcome } from '../../src/review/types';
+import type { ReviewOutcome, ReviewVerdict as ReviewVerdictType } from '../../src/review/types';
 import { createSettingsClient } from '../../src/settings/client';
 import { isProviderWithOptIn, type SettingsDocument } from '../../src/settings/types';
 import { createTurnsClient, type CapturedTurnRecord } from '../../src/turns/client';
@@ -324,7 +326,12 @@ const DISPATCH_PROVIDER_LABEL: Record<string, string> = {
 };
 
 const DISPATCH_STATUS_TO_DISPLAY = (status: string): RecentDispatchStatus => {
-  if (status === 'replied' || status === 'noted' || status === 'pending') {
+  if (
+    status === 'replied' ||
+    status === 'noted' ||
+    status === 'pending' ||
+    status === 'archived'
+  ) {
     return status;
   }
   // 'sent', 'queued', 'failed' all map to 'sent' visually — failed is
@@ -370,6 +377,12 @@ const App = () => {
   const [queueDraft, setQueueDraft] = useState('');
   const [queueExpandFor, setQueueExpandFor] = useState<string | null>(null);
   const [queueCopiedId, setQueueCopiedId] = useState<string | null>(null);
+  // Per-thread inline-review draft expansion. Mirrors queueExpandFor:
+  // null = chip collapsed, threadId = footer expanded for that thread.
+  const [reviewDraftExpandFor, setReviewDraftExpandFor] = useState<string | null>(null);
+  // Recent Dispatches "show archived" toggle. Local-only — archived
+  // is a UI filter, not a persisted preference.
+  const [showArchivedDispatches, setShowArchivedDispatches] = useState(false);
   const [noteComposeOpen, setNoteComposeOpen] = useState(false);
   const [noteDraft, setNoteDraft] = useState('');
   const [noteEditId, setNoteEditId] = useState<string | null>(null);
@@ -1180,14 +1193,23 @@ const App = () => {
     if (intent.kind === 'research_packet') {
       body = `# Research request: ${thread.title}\n\n${head}\n\n## Pre-flight checklist for the receiving AI\n- [ ] Verify the conclusion against the original source\n- [ ] Note any framework versions / dates the source assumes\n- [ ] Flag if the question has shifted since first ask\n- [ ] Distinguish what was asserted vs cited\n\n## Recent context\n${turnsMd}\n\n## Ask\n…`;
     } else if (intent.kind === 'coding_agent_packet') {
-      body = `# Coding handoff: ${thread.title}\n\n## Source thread\n${provider} · ${thread.threadUrl}\n\n## Recent context\n${turnsMd}\n\n## Files / modules involved\n…\n\n## Acceptance criteria\n- [ ] …\n- [ ] …\n\n## Constraints\n- Do not modify unrelated files.\n- Run the existing test suite before reporting done.`;
+      // MCP-aware handoff: tells the coding agent how to call the
+      // local Sidetrack companion's tool surface for live thread +
+      // recent dispatches + recall, and includes the captured turns
+      // as an offline fallback if the companion is unreachable.
+      // Bridge key + port are interpolated from the side-panel's
+      // current settings — clipboard is local, companion only listens
+      // on 127.0.0.1, so it's safe to render the key inline.
+      const portStr = port.length > 0 ? port : '17373';
+      const keyStr = bridgeKey.length > 0 ? bridgeKey : '<run the companion to generate>';
+      body = `# Coding handoff: ${thread.title}\n\nYou are continuing work from a Sidetrack thread. The user's local Sidetrack companion is running and exposes a tool surface you can call to read live thread context, recent dispatches, and decisions.\n\n## Thread reference\n${provider} · ${thread.threadUrl}\nthread_id: ${thread.bac_id}\n\n## Companion endpoint\n- base url   : http://127.0.0.1:${portStr}\n- auth       : send header  x-bac-bridge-key: ${keyStr}\n- tool route : send header  x-sidetrack-mcp-tool: <tool-name>\n\n(Companion runs locally only; the bridge key is local-machine.)\n\n## Tools you can call (read-only)\n- bac.read_thread_md       full markdown of this thread\n- bac.list_dispatches      recent context packets / asks the user shipped\n- bac.recall               vector recall over related threads + decisions\n- bac.read_workstream_md   workstream context if this thread is grouped\n- bac.list_annotations     user-saved highlights with comments\n- bac.list_audit_events    decisions, archives, edits\n\nRecommended sequence on first call: read_thread_md → list_dispatches → recall (if you need cross-thread context). Cite the tool name when you reference what you pulled so the user can verify.\n\n## Snapshot of the captured turns (offline fallback)\nIf the companion is unreachable, work from this snapshot. It's the same data bac.read_thread_md would return, just frozen at clipboard time.\n\n${turnsMd}\n\n## User's ask\n…`;
     } else {
       const today = new Date().toISOString().slice(0, 10);
       body = `---\ntitle: ${thread.title}\ncreated: ${today}\nsource: ${thread.threadUrl}\nprovider: ${provider}\n---\n\n# ${thread.title}\n\n${turnsMd}`;
     }
     return {
       kind: intent.kind,
-      template: intent.kind === 'research_packet' ? 'web_to_ai_checklist' : null,
+      template: intent.kind === 'research_packet' ? 'critique' : null,
       target: intent.target,
       title: thread.title,
       body,
@@ -1598,6 +1620,58 @@ const App = () => {
     }
   };
 
+  // Inline-review draft handlers — wire the per-thread chip + footer
+  // into the new draft message types. The send-as-follow-up path
+  // delegates entirely to the background handler (which bundles the
+  // draft, queues a follow-up, and turns auto-send on for the
+  // thread). Save-to-vault uses the same review HTTP client as the
+  // modal flow but reads the staged draft from chrome.storage.
+  const dropReviewDraftSpan = (threadId: string, spanId: string) => {
+    void runAction(() =>
+      sendRequest({ type: messageTypes.dropReviewDraftSpan, threadId, spanId }),
+    );
+  };
+
+  const updateInlineReviewDraft = (
+    threadId: string,
+    patch: { overall?: string; verdict?: ReviewVerdictType },
+  ) => {
+    void runAction(() =>
+      sendRequest({ type: messageTypes.updateReviewDraft, threadId, ...patch }),
+    );
+  };
+
+  // Two ways to ship the staged draft. Both bundle into the queue
+  // template + clear the draft. Difference is whether the per-thread
+  // auto-send chip flips on. Footer expansion state stays put — the
+  // chip + footer naturally vanish once the draft clears, and reappear
+  // pre-expanded when the user adds another comment from the chat
+  // page. The user keeps working without losing their place.
+  const addInlineReviewToQueue = (threadId: string) => {
+    void runAction(() =>
+      sendRequest({
+        type: messageTypes.sendReviewDraftAsFollowUp,
+        threadId,
+        autoSend: false,
+      }),
+    );
+  };
+
+  const sendInlineReviewNow = (threadId: string) => {
+    void runAction(() =>
+      sendRequest({
+        type: messageTypes.sendReviewDraftAsFollowUp,
+        threadId,
+        autoSend: true,
+      }),
+    );
+  };
+
+  const discardInlineReviewDraft = (threadId: string) => {
+    setReviewDraftExpandFor(null);
+    void runAction(() => sendRequest({ type: messageTypes.discardReviewDraft, threadId }));
+  };
+
   // Auto-pop the wizard ONLY for true first-launch users (no setupCompleted
   // flag AND no bridge key in storage on first mount). Existing-user
   // migration: a non-empty bridge key from a prior install means they
@@ -1781,6 +1855,14 @@ const App = () => {
     const titleExpanded = titleExpandedFor === thread.bac_id;
     const inlineTurns = inlineTurnsByUrl.get(thread.threadUrl);
     const isFocusing = focusingThreadId === thread.bac_id;
+    // Inline-review draft staged from on-page selection. Surfaced as
+    // a "Review draft (N) ⌄" chip in row1 next to the queued chip.
+    const reviewDraft = state.reviewDrafts[thread.bac_id];
+    // Only "expanded" if the row is the chosen target AND a draft
+    // exists. Splitting the boolean keeps the JSX narrowing clean.
+    const expandedDraft =
+      reviewDraftExpandFor === thread.bac_id && reviewDraft !== undefined ? reviewDraft : null;
+    const reviewDraftExpanded = expandedDraft !== null;
     return (
       <div
         key={thread.bac_id}
@@ -1845,6 +1927,20 @@ const App = () => {
               }}
             >
               {String(queuedCount)} queued
+            </button>
+          ) : null}
+          {reviewDraft !== undefined ? (
+            <button
+              type="button"
+              className={'thread-review-draft-chip' + (reviewDraftExpanded ? ' on' : '')}
+              title={`Review draft staged with ${String(reviewDraft.spans.length)} comment${reviewDraft.spans.length === 1 ? '' : 's'} — expand to send as follow-up`}
+              aria-expanded={reviewDraftExpanded}
+              onClick={(e) => {
+                e.stopPropagation();
+                setReviewDraftExpandFor(reviewDraftExpanded ? null : thread.bac_id);
+              }}
+            >
+              Review draft ({String(reviewDraft.spans.length)}) {reviewDraftExpanded ? '▴' : '▾'}
             </button>
           ) : null}
         </div>
@@ -1967,50 +2063,30 @@ const App = () => {
               );
             };
             const sendDropdownOpen = sendToOpenFor === thread.bac_id;
-            const recentTarget = state.lastDispatchTargetByThread[thread.bac_id] as
-              | SendToTarget
-              | undefined;
             const menuOpen = actionMenuOpenFor === thread.bac_id;
             return (
               <>
-                <span className="send-to-anchor">
-                  <button
-                    type="button"
-                    className={'btn-link' + (requiresCompanion ? ' disabled-look' : '')}
-                    title={
-                      requiresCompanion
-                        ? 'Send is unavailable in local-only mode — click for setup steps'
-                        : 'Send this thread to another AI / coding agent / file'
+                <button
+                  type="button"
+                  className={'btn-link' + (requiresCompanion ? ' disabled-look' : '')}
+                  title={
+                    requiresCompanion
+                      ? 'Send is unavailable in local-only mode — click for setup steps'
+                      : 'Send this thread to another AI / coding agent / file'
+                  }
+                  aria-haspopup="menu"
+                  aria-expanded={sendDropdownOpen}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (requiresCompanion) {
+                      explainNeedsCompanion('Send');
+                      return;
                     }
-                    aria-haspopup="menu"
-                    aria-expanded={sendDropdownOpen}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      if (requiresCompanion) {
-                        explainNeedsCompanion('Send');
-                        return;
-                      }
-                      setSendToOpenFor(sendDropdownOpen ? null : thread.bac_id);
-                    }}
-                  >
-                    Send to ▾
-                  </button>
-                  {sendDropdownOpen ? (
-                    <SendToDropdown
-                      recentTarget={recentTarget}
-                      onPick={(target) => {
-                        handleSendToPick(thread, target);
-                      }}
-                      onCustomize={() => {
-                        setSendToOpenFor(null);
-                        setComposeThreadId(thread.bac_id);
-                      }}
-                      onClose={() => {
-                        setSendToOpenFor(null);
-                      }}
-                    />
-                  ) : null}
-                </span>
+                    setSendToOpenFor(sendDropdownOpen ? null : thread.bac_id);
+                  }}
+                >
+                  Send to ▾
+                </button>
                 <span className="thread-overflow-anchor">
                   <button
                     type="button"
@@ -2142,6 +2218,25 @@ const App = () => {
             </button>
           ) : null}
         </div>
+        {sendToOpenFor === thread.bac_id ? (
+          <div className="thread-send-to-inline">
+            <SendToDropdown
+              recentTarget={
+                state.lastDispatchTargetByThread[thread.bac_id] as SendToTarget | undefined
+              }
+              onPick={(target) => {
+                handleSendToPick(thread, target);
+              }}
+              onCustomize={() => {
+                setSendToOpenFor(null);
+                setComposeThreadId(thread.bac_id);
+              }}
+              onClose={() => {
+                setSendToOpenFor(null);
+              }}
+            />
+          </div>
+        ) : null}
         {queueComposeFor === thread.bac_id ? (
           <form
             className="thread-queue-compose"
@@ -2178,6 +2273,35 @@ const App = () => {
               Cancel
             </button>
           </form>
+        ) : null}
+        {expandedDraft !== null ? (
+          <div className="thread-review-draft">
+            <div className="thread-review-draft-head mono">
+              <span>review draft</span>
+              <span className="count">
+                · {String(expandedDraft.spans.length)} comment
+                {expandedDraft.spans.length === 1 ? '' : 's'}
+              </span>
+            </div>
+            <ReviewDraftFooter
+              draft={expandedDraft}
+              onDropSpan={(spanId) => {
+                dropReviewDraftSpan(thread.bac_id, spanId);
+              }}
+              onUpdate={(patch) => {
+                updateInlineReviewDraft(thread.bac_id, patch);
+              }}
+              onAddToQueue={() => {
+                addInlineReviewToQueue(thread.bac_id);
+              }}
+              onSendNow={() => {
+                sendInlineReviewNow(thread.bac_id);
+              }}
+              onDiscard={() => {
+                discardInlineReviewDraft(thread.bac_id);
+              }}
+            />
+          </div>
         ) : null}
         {queueExpanded ? (
           <ul className="thread-queue-list" aria-label="Queued follow-ups">
@@ -2973,10 +3097,13 @@ const App = () => {
               }}
               onOpenTarget={(id) => {
                 // For LINKED rows: jump to the destination thread (if
-                // we still track it). For UNLINKED rows the dedicated
-                // Copy / Dispatch buttons handle the action; a click
-                // on the target chip opens the viewer modal instead
-                // of doing anything destructive.
+                // we still track it). For UNLINKED rows: open the
+                // customize composer pre-populated from the source
+                // thread (auto-send on by default for AI providers
+                // per the per-provider opt-in). The new Dispatch
+                // button (always-visible) handles the no-customize
+                // fast path; the view button still exists if the
+                // user just wants to inspect the body.
                 const dispatch = state.recentDispatches.find((d) => d.bac_id === id);
                 if (dispatch === undefined) {
                   return;
@@ -2989,9 +3116,12 @@ const App = () => {
                     return;
                   }
                 }
-                // No link → open viewer (read-only, with copy +
-                // download). Avoids the surprise of opening a fresh
-                // empty chat just from clicking the target chip.
+                if (dispatch.sourceThreadId !== undefined) {
+                  setComposeThreadId(dispatch.sourceThreadId);
+                  return;
+                }
+                // Source thread untracked / vanished — fall back to
+                // the read-only viewer.
                 setViewingDispatchId(id);
               }}
               onView={(id) => {
@@ -3049,6 +3179,20 @@ const App = () => {
                   );
                   return await sendRequest({ type: messageTypes.getWorkboardState });
                 });
+              }}
+              showArchived={showArchivedDispatches}
+              onToggleShowArchived={() => {
+                setShowArchivedDispatches((prev) => !prev);
+              }}
+              onArchive={(id) => {
+                void runAction(() =>
+                  sendRequest({ type: messageTypes.archiveDispatch, dispatchId: id }),
+                );
+              }}
+              onUnarchive={(id) => {
+                void runAction(() =>
+                  sendRequest({ type: messageTypes.unarchiveDispatch, dispatchId: id }),
+                );
               }}
             />
           </>
@@ -3223,7 +3367,36 @@ const App = () => {
             TARGET_PROVIDER_LABEL[mapUiTarget(pendingDispatch.target)] ??
             mapUiTarget(pendingDispatch.target)
           }
+          sourceLabel={(() => {
+            // Surface the source thread's provider + model in the
+            // confirm modal subtitle so the user sees which chat the
+            // context came from. Display-only.
+            if (pendingDispatch.sourceThreadId === undefined) return undefined;
+            const sourceThread = state.threads.find(
+              (t) => t.bac_id === pendingDispatch.sourceThreadId,
+            );
+            if (sourceThread === undefined) return undefined;
+            const provLabel =
+              TARGET_PROVIDER_LABEL[
+                providerIdToDispatchProvider(sourceThread.provider)
+              ] ?? sourceThread.provider;
+            const model = sourceThread.selectedModel;
+            return model === undefined || model.length === 0
+              ? provLabel
+              : `${provLabel} · ${model}`;
+          })()}
           body={pendingDispatch.body}
+          autoSendOptedIn={(() => {
+            const t = pendingDispatch.target;
+            if (t === 'markdown' || t === 'notebook') return false;
+            if (t === 'codex' || t === 'claude_code' || t === 'cursor') return false;
+            const provider = mapUiTarget(t);
+            return (
+              settings !== null &&
+              isProviderWithOptIn(provider) &&
+              settings.autoSendOptIn[provider]
+            );
+          })()}
           dispatchKind={(() => {
             // Map the packet target → side-effect lane the modal
             // uses for its "Will ..." header.

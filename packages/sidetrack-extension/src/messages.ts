@@ -1,3 +1,4 @@
+import type { SerializedAnchor } from './annotation/anchors';
 import type {
   CaptureEvent,
   CaptureNoteCreate,
@@ -12,6 +13,7 @@ import type {
   WorkstreamCreate,
   WorkstreamUpdate,
 } from './companion/model';
+import type { ReviewVerdict } from './review/types';
 import type {
   AllThreadsBucket,
   PrivacyMode,
@@ -82,6 +84,22 @@ export const messageTypes = {
   createCaptureNote: 'sidetrack.capture.note.create',
   updateCaptureNote: 'sidetrack.capture.note.update',
   deleteCaptureNote: 'sidetrack.capture.note.delete',
+  // Inline review (selection-anchored) draft mutators. Content script
+  // appends a span when the user comments on a highlighted phrase;
+  // the side panel edits + sends. The "send-as-follow-up" path
+  // bundles the draft into a queue item via the existing follow-up
+  // pipeline so it inherits ordering, auto-send, and notifications.
+  appendReviewDraftSpan: 'sidetrack.review.draft.appendSpan',
+  dropReviewDraftSpan: 'sidetrack.review.draft.dropSpan',
+  updateReviewDraft: 'sidetrack.review.draft.update',
+  discardReviewDraft: 'sidetrack.review.draft.discard',
+  sendReviewDraftAsFollowUp: 'sidetrack.review.draft.sendAsFollowUp',
+  // Recent Dispatches lifecycle: archive hides a row from the default
+  // list; unarchive brings it back. Both update the dispatch's local
+  // status field; the companion vault record is unchanged (archive
+  // is a UI-only filter).
+  archiveDispatch: 'sidetrack.dispatch.archive',
+  unarchiveDispatch: 'sidetrack.dispatch.unarchive',
 } as const;
 
 export interface SelectorCanaryReport {
@@ -287,6 +305,45 @@ export type WorkboardRequest =
   | {
       readonly type: typeof messageTypes.deleteCaptureNote;
       readonly noteId: string;
+    }
+  | {
+      readonly type: typeof messageTypes.appendReviewDraftSpan;
+      readonly threadUrl: string;
+      readonly anchor: SerializedAnchor;
+      readonly quote: string;
+      readonly comment: string;
+      readonly capturedAt: string;
+    }
+  | {
+      readonly type: typeof messageTypes.dropReviewDraftSpan;
+      readonly threadId: string;
+      readonly spanId: string;
+    }
+  | {
+      readonly type: typeof messageTypes.updateReviewDraft;
+      readonly threadId: string;
+      readonly overall?: string;
+      readonly verdict?: ReviewVerdict;
+    }
+  | {
+      readonly type: typeof messageTypes.discardReviewDraft;
+      readonly threadId: string;
+    }
+  | {
+      readonly type: typeof messageTypes.sendReviewDraftAsFollowUp;
+      readonly threadId: string;
+      // true → also flip the thread's auto-send chip on so the queue
+      // item ships immediately (Send now). false → just queue, leave
+      // the user to trigger the drain manually (Add to queue).
+      readonly autoSend: boolean;
+    }
+  | {
+      readonly type: typeof messageTypes.archiveDispatch;
+      readonly dispatchId: string;
+    }
+  | {
+      readonly type: typeof messageTypes.unarchiveDispatch;
+      readonly dispatchId: string;
     };
 
 export type RuntimeRequest =
@@ -506,6 +563,39 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
 
   if (hasType(value, messageTypes.deleteCaptureNote)) {
     return typeof value.noteId === 'string';
+  }
+
+  if (hasType(value, messageTypes.appendReviewDraftSpan)) {
+    return (
+      typeof value.threadUrl === 'string' &&
+      isRecord(value.anchor) &&
+      typeof value.quote === 'string' &&
+      typeof value.comment === 'string' &&
+      typeof value.capturedAt === 'string'
+    );
+  }
+
+  if (hasType(value, messageTypes.dropReviewDraftSpan)) {
+    return typeof value.threadId === 'string' && typeof value.spanId === 'string';
+  }
+
+  if (hasType(value, messageTypes.updateReviewDraft)) {
+    return typeof value.threadId === 'string';
+  }
+
+  if (hasType(value, messageTypes.discardReviewDraft)) {
+    return typeof value.threadId === 'string';
+  }
+
+  if (hasType(value, messageTypes.sendReviewDraftAsFollowUp)) {
+    return typeof value.threadId === 'string' && typeof value.autoSend === 'boolean';
+  }
+
+  if (
+    hasType(value, messageTypes.archiveDispatch) ||
+    hasType(value, messageTypes.unarchiveDispatch)
+  ) {
+    return typeof value.dispatchId === 'string';
   }
 
   return false;

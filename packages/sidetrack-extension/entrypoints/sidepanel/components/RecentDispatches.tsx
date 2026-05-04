@@ -1,6 +1,6 @@
 import { Icons } from './icons';
 
-export type DispatchStatus = 'sent' | 'replied' | 'noted' | 'pending';
+export type DispatchStatus = 'sent' | 'replied' | 'noted' | 'pending' | 'archived';
 export type DispatchMode = 'paste' | 'auto-send';
 
 export interface DispatchEvent {
@@ -45,6 +45,12 @@ export interface RecentDispatchesProps {
   readonly onCopy?: (id: string) => void;
   readonly onDispatch?: (id: string) => void;
   readonly onView?: (id: string) => void;
+  // Archive lifecycle. Archived rows hide from the default list; the
+  // section header gets a "Show archived" toggle to bring them back.
+  readonly onArchive?: (id: string) => void;
+  readonly onUnarchive?: (id: string) => void;
+  readonly showArchived?: boolean;
+  readonly onToggleShowArchived?: () => void;
 }
 
 export function RecentDispatches({
@@ -54,23 +60,46 @@ export function RecentDispatches({
   onCopy,
   onDispatch,
   onView,
+  onArchive,
+  onUnarchive,
+  showArchived = false,
+  onToggleShowArchived,
 }: RecentDispatchesProps) {
-  if (dispatches.length === 0) {
+  const visible = dispatches.filter((d) => showArchived || d.status !== 'archived');
+  const archivedCount = dispatches.filter((d) => d.status === 'archived').length;
+  const archivedToggle =
+    archivedCount > 0 && onToggleShowArchived !== undefined ? (
+      <button
+        type="button"
+        className="btn-link dispatches-archived-toggle mono"
+        onClick={onToggleShowArchived}
+        title={showArchived ? 'Hide archived dispatches' : 'Show archived dispatches'}
+      >
+        {showArchived ? `Hide archived (${String(archivedCount)})` : `Show archived (${String(archivedCount)})`}
+      </button>
+    ) : null;
+  if (visible.length === 0) {
     return (
       <div className="dispatches-empty mono">
         <em>
           No dispatches yet. They&apos;ll appear here when you send a packet or submit a review
           back.
         </em>
+        {archivedToggle}
       </div>
     );
   }
   return (
     <div className="dispatches-list">
-      {dispatches.map((dispatch) => {
+      {archivedToggle}
+      {visible.map((dispatch) => {
         const linked = dispatch.targetThreadTitle !== undefined;
+        const isArchived = dispatch.status === 'archived';
         return (
-          <div key={dispatch.bac_id} className="dispatch-row">
+          <div
+            key={dispatch.bac_id}
+            className={'dispatch-row' + (isArchived ? ' is-archived' : '')}
+          >
             <button
               type="button"
               className="dispatch-source"
@@ -143,6 +172,39 @@ export function RecentDispatches({
               >
                 view
               </button>
+              {/* Always-visible Dispatch button: re-fires the packet
+                  in auto-send mode to a fresh chat. Different from the
+                  default unlinked target click (which opens the
+                  customize composer pre-loaded from the packet). */}
+              {!linked && dispatch.mode !== 'auto-send' ? (
+                <button
+                  type="button"
+                  className="btn btn-link dispatch-action dispatch-action-secondary"
+                  onClick={() => onDispatch?.(dispatch.bac_id)}
+                  title="Open a new chat and auto-send this packet"
+                >
+                  dispatch
+                </button>
+              ) : null}
+              {isArchived ? (
+                <button
+                  type="button"
+                  className="btn btn-link dispatch-action dispatch-action-secondary"
+                  onClick={() => onUnarchive?.(dispatch.bac_id)}
+                  title="Move back to the active list"
+                >
+                  unarchive
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="btn btn-link dispatch-action dispatch-action-secondary"
+                  onClick={() => onArchive?.(dispatch.bac_id)}
+                  title="Hide this dispatch from the default list"
+                >
+                  archive
+                </button>
+              )}
             </span>
             <span className="dispatch-time mono">{dispatch.dispatchedAt}</span>
           </div>

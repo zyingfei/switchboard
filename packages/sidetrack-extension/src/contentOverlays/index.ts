@@ -207,6 +207,83 @@ const OVERLAY_CSS = `
   font-size: 10px;
   color: var(--ink-3);
 }
+.sidetrack-rv-chip {
+  position: absolute;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  background: var(--ink);
+  color: var(--paper-light);
+  border: 1px solid var(--ink);
+  border-radius: 99px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  cursor: pointer;
+  pointer-events: auto;
+  box-shadow: 0 8px 24px -8px rgba(0,0,0,0.25);
+}
+.sidetrack-rv-chip:hover { background: var(--signal); border-color: var(--signal); }
+.sidetrack-rv-chip .glyph {
+  font-family: var(--display); font-size: 12px; line-height: 1; font-weight: 500;
+}
+.sidetrack-rv-pop {
+  position: absolute;
+  background: var(--paper-light);
+  border: 1px solid var(--ink);
+  border-radius: 8px;
+  width: 320px;
+  max-width: 90vw;
+  pointer-events: auto;
+  box-shadow: 0 22px 60px -12px rgba(0,0,0,0.45), 0 0 0 1px rgba(0,0,0,0.05);
+  overflow: hidden;
+}
+.sidetrack-rv-pop .head {
+  padding: 8px 12px;
+  background: var(--paper);
+  border-bottom: 1px solid var(--rule-soft);
+  font-family: var(--mono); font-size: 10px;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--signal);
+  display: flex; align-items: center; gap: 8px;
+}
+.sidetrack-rv-pop .head .meta { margin-left: auto; color: var(--ink-3); }
+.sidetrack-rv-pop .head .close {
+  background: transparent; color: var(--ink-3); border: none; cursor: pointer;
+  padding: 0 4px; font-size: 14px; line-height: 1;
+}
+.sidetrack-rv-pop .head .close:hover { color: var(--ink); }
+.sidetrack-rv-pop .quote {
+  padding: 10px 12px 6px;
+  font-family: var(--display); font-style: italic;
+  font-size: 12px; color: var(--ink-2); line-height: 1.45;
+  border-left: 2px solid var(--signal-tint);
+  margin: 8px 12px 4px;
+}
+.sidetrack-rv-pop textarea {
+  display: block; width: calc(100% - 24px); margin: 6px 12px 8px;
+  min-height: 80px; resize: vertical;
+  font-family: var(--body); font-size: 13px; color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--rule); border-radius: 5px;
+  padding: 7px 9px; outline: none;
+}
+.sidetrack-rv-pop textarea:focus { border-color: var(--ink-3); }
+.sidetrack-rv-pop .acts {
+  display: flex; gap: 6px; padding: 7px 12px;
+  background: var(--paper); border-top: 1px solid var(--rule-soft);
+}
+.sidetrack-rv-pop .acts .grow { flex: 1; }
+.sidetrack-rv-pop .acts button {
+  font-family: var(--mono); font-size: 10.5px;
+  padding: 5px 11px; border-radius: 4px; cursor: pointer;
+  border: 1px solid var(--rule); background: var(--paper-light); color: var(--ink-2);
+}
+.sidetrack-rv-pop .acts button.primary {
+  background: var(--ink); color: var(--paper-light); border-color: var(--ink);
+}
+.sidetrack-rv-pop .acts button.primary:hover { background: var(--signal); border-color: var(--signal); }
+.sidetrack-rv-pop .acts button:disabled { opacity: 0.5; cursor: not-allowed; }
 `;
 
 const ensureOverlayInfra = (): HTMLElement => {
@@ -292,6 +369,120 @@ const clearDejaPop = (root: HTMLElement): void => {
   for (const node of root.querySelectorAll('.sidetrack-deja-pop')) {
     node.remove();
   }
+};
+
+// Inline review chip — a compact "+ Comment" pill that floats next to
+// the user's text selection inside an extracted turn. Clicking the
+// chip swaps in a small popover with the quoted text + a textarea
+// + Save / Cancel. Saving fires the onSave callback (the content
+// script forwards it to the background as appendReviewDraftSpan).
+//
+// Position is computed from the selection's bounding rect — chip
+// hovers a few px below the right edge; popover mounts in the same
+// quadrant, clamped to the viewport.
+
+interface ReviewChipMountOptions {
+  readonly anchorRect: DOMRect;
+  readonly quote: string;
+  readonly onSave: (comment: string) => Promise<void> | void;
+  readonly onDismiss?: () => void;
+}
+
+const POP_WIDTH_RV = 320;
+
+const clearReviewOverlays = (root: HTMLElement): void => {
+  for (const node of root.querySelectorAll('.sidetrack-rv-chip, .sidetrack-rv-pop')) {
+    node.remove();
+  }
+};
+
+export const mountReviewSelectionChip = (
+  opts: ReviewChipMountOptions,
+): { close: () => void } => {
+  const root = ensureOverlayInfra();
+  clearReviewOverlays(root);
+
+  const chipLeft = Math.min(
+    document.documentElement.clientWidth - 110 - 8,
+    Math.max(8, opts.anchorRect.right - 50),
+  );
+  const chipTop = opts.anchorRect.bottom + 6;
+  const chip = document.createElement('button');
+  chip.type = 'button';
+  chip.className = 'sidetrack-rv-chip';
+  chip.style.left = `${String(chipLeft)}px`;
+  chip.style.top = `${String(chipTop)}px`;
+  chip.innerHTML = '<span class="glyph">+</span><span>Comment</span>';
+
+  const close = (): void => {
+    chip.remove();
+    for (const pop of root.querySelectorAll('.sidetrack-rv-pop')) {
+      pop.remove();
+    }
+    opts.onDismiss?.();
+  };
+
+  const expandToPopover = (): void => {
+    chip.remove();
+    const pop = document.createElement('div');
+    pop.className = 'sidetrack-rv-pop';
+    const viewportWidth = document.documentElement.clientWidth;
+    let left = opts.anchorRect.left + opts.anchorRect.width / 2 - POP_WIDTH_RV / 2;
+    if (left < 8) left = 8;
+    if (left + POP_WIDTH_RV > viewportWidth - 8) left = viewportWidth - 8 - POP_WIDTH_RV;
+    pop.style.left = `${String(left)}px`;
+    pop.style.top = `${String(opts.anchorRect.bottom + 6)}px`;
+
+    const quoteCapped =
+      opts.quote.length > 200 ? `${opts.quote.slice(0, 200).trimEnd()}…` : opts.quote;
+    pop.innerHTML = `
+      <div class="head">
+        <span>Comment on selection</span>
+        <span class="meta"></span>
+        <button type="button" class="close" aria-label="Dismiss">×</button>
+      </div>
+      <div class="quote"></div>
+      <textarea placeholder="What did this miss / get wrong / need next?" autofocus></textarea>
+      <div class="acts">
+        <span class="grow"></span>
+        <button type="button" class="cancel">Cancel</button>
+        <button type="button" class="primary save" disabled>Save</button>
+      </div>
+    `;
+    const quoteEl = pop.querySelector('.quote');
+    if (quoteEl !== null) quoteEl.textContent = quoteCapped;
+    const textarea = pop.querySelector<HTMLTextAreaElement>('textarea');
+    const saveBtn = pop.querySelector<HTMLButtonElement>('.save');
+    if (textarea !== null && saveBtn !== null) {
+      textarea.addEventListener('input', () => {
+        saveBtn.disabled = textarea.value.trim().length === 0;
+      });
+      saveBtn.addEventListener('click', () => {
+        const value = textarea.value.trim();
+        if (value.length === 0) return;
+        saveBtn.disabled = true;
+        Promise.resolve(opts.onSave(value))
+          .then(() => {
+            close();
+          })
+          .catch(() => {
+            saveBtn.disabled = false;
+          });
+      });
+    }
+    pop.querySelector<HTMLButtonElement>('.cancel')?.addEventListener('click', close);
+    pop.querySelector<HTMLButtonElement>('.head .close')?.addEventListener('click', close);
+    root.appendChild(pop);
+    window.setTimeout(() => textarea?.focus(), 0);
+  };
+
+  chip.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    expandToPopover();
+  });
+  root.appendChild(chip);
+  return { close };
 };
 
 // Mount the Déjà-vu popover anchored just above the selection's bounding

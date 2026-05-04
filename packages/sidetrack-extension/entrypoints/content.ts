@@ -1,13 +1,15 @@
 import { defineContentScript } from 'wxt/utils/define-content-script';
 
-import { findAnchor } from '../src/annotation/anchors';
+import { findAnchor, serializeAnchor } from '../src/annotation/anchors';
 import { createAnnotationClient } from '../src/annotation/client';
 import { captureVisibleConversation } from '../src/capture/extractors';
 import { detectProviderFromUrl, isProviderThreadUrl } from '../src/capture/providerDetection';
+import { providerConfigs } from '../src/capture/providerConfigs';
 import { messageTypes, type ContentRequest, type ContentResponse } from '../src/messages';
 import {
   mountAnnotationOverlay,
   mountDejaVuPopover,
+  mountReviewSelectionChip,
   type DejaVuItem,
   type RestoredAnchor,
 } from '../src/contentOverlays';
@@ -232,12 +234,81 @@ export default defineContentScript({
     // the host page stays unaffected.
     let dejaVuDebounceTimer: number | undefined;
     let dejaVuMounted: { close: () => void } | null = null;
+    let reviewChipMounted: { close: () => void } | null = null;
     const dejaVuMutedForUrl = '';
     const SELECTION_MIN_CHARS = 18;
 
     const closeDejaVu = (): void => {
       dejaVuMounted?.close();
       dejaVuMounted = null;
+    };
+
+    const closeReviewChip = (): void => {
+      reviewChipMounted?.close();
+      reviewChipMounted = null;
+    };
+
+    // Selection-anchored review chip. Fires when the user highlights
+    // text inside an extracted turn element (provider config's
+    // directSources). The chip lets the user attach a comment that
+    // gets staged into a per-thread review draft on the background
+    // side, which the side panel surfaces and ultimately sends as a
+    // follow-up. Selection on non-turn elements (sidebar, header,
+    // composer) is ignored.
+    const turnSelectorForCurrentProvider = (): string | null => {
+      const provider = detectProviderFromUrl(window.location.href);
+      if (provider === 'unknown') return null;
+      const config = providerConfigs[provider];
+      const direct = config.directSources.map((source) => source.selector).filter((s) => s.length > 0);
+      if (direct.length === 0) return null;
+      return direct.join(', ');
+    };
+
+    const selectionInsideTurn = (selection: Selection): boolean => {
+      const turnSelector = turnSelectorForCurrentProvider();
+      if (turnSelector === null) return false;
+      const anchor = selection.anchorNode;
+      if (anchor === null) return false;
+      const element = anchor instanceof Element ? anchor : anchor.parentElement;
+      if (element === null) return false;
+      try {
+        return element.closest(turnSelector) !== null;
+      } catch {
+        return false;
+      }
+    };
+
+    const offerReviewChip = (selection: Selection, anchorRect: DOMRect): void => {
+      const provider = detectProviderFromUrl(window.location.href);
+      if (provider === 'unknown') return;
+      if (!isProviderThreadUrl(provider, window.location.href)) return;
+      const range = selection.getRangeAt(0);
+      const quote = selection.toString();
+      let serialized;
+      try {
+        serialized = serializeAnchor(range);
+      } catch {
+        return;
+      }
+      const threadUrl = window.location.href;
+      closeReviewChip();
+      reviewChipMounted = mountReviewSelectionChip({
+        anchorRect,
+        quote,
+        onSave: async (comment) => {
+          await chrome.runtime.sendMessage({
+            type: messageTypes.appendReviewDraftSpan,
+            threadUrl,
+            anchor: serialized,
+            quote,
+            comment,
+            capturedAt: new Date().toISOString(),
+          });
+        },
+        onDismiss: () => {
+          reviewChipMounted = null;
+        },
+      });
     };
 
     const fetchDejaVu = async (text: string, anchorRect: DOMRect): Promise<void> => {
@@ -286,6 +357,13 @@ export default defineContentScript({
         const range = selection.getRangeAt(0);
         const rect = range.getBoundingClientRect();
         if (rect.width === 0 && rect.height === 0) return;
+        // Show the review-comment chip when the selection lives
+        // inside an extracted turn (provider directSource selectors).
+        // Déjà-vu still fires for non-turn selections (e.g. composer
+        // drafts) so recall keeps working everywhere.
+        if (selectionInsideTurn(selection)) {
+          offerReviewChip(selection, rect);
+        }
         void fetchDejaVu(text, rect);
       }, 400);
     };
@@ -295,12 +373,19 @@ export default defineContentScript({
       // Click outside the popover dismisses it. Inside-pop clicks bubble
       // to the popover's own listeners (jump / close button).
       const target = event.target;
-      if (
-        dejaVuMounted !== null &&
-        target instanceof Element &&
-        target.closest('.sidetrack-deja-pop') === null
-      ) {
-        closeDejaVu();
+      if (target instanceof Element) {
+        if (
+          dejaVuMounted !== null &&
+          target.closest('.sidetrack-deja-pop') === null
+        ) {
+          closeDejaVu();
+        }
+        if (
+          reviewChipMounted !== null &&
+          target.closest('.sidetrack-rv-chip, .sidetrack-rv-pop') === null
+        ) {
+          closeReviewChip();
+        }
       }
     });
 
@@ -358,6 +443,14 @@ export default defineContentScript({
           capture.provider === 'unknown' ||
           !isProviderThreadUrl(capture.provider, capture.threadUrl)
         ) {
+          return;
+        }
+        // Conversation may still be rendering — Gemini's Angular shell
+        // can take >1.2s to mount user-query / model-response elements
+        // on a fresh nav. Don't flag a transient zero-turn capture as
+        // selector drift; the mutation observer will fire an auto-
+        // capture once the DOM settles, recording an accurate canary.
+        if (capture.turns.length === 0) {
           return;
         }
         void chrome.runtime.sendMessage({

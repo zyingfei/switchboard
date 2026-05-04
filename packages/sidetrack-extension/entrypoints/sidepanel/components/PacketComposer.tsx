@@ -7,10 +7,19 @@ export type PacketKind =
   | 'research_packet'
   | 'coding_agent_packet'
   | 'notebook_export';
+// Generic "what kind of follow-up am I asking?" intents. Replaces
+// the earlier domain-specific templates (job-search) with five
+// universal asks that map to any thread regardless of topic.
+//   - critique:        find problems with the answer below
+//   - compare:         compare alternatives along given axes
+//   - drill_deeper:    push past the surface
+//   - continue_thread: pick up from where this thread stopped
+//   - custom:          empty body, user writes their own ask
 export type ResearchTemplate =
-  | 'web_to_ai_checklist'
-  | 'resume_tech_stack'
-  | 'latest_developments_radar'
+  | 'critique'
+  | 'compare'
+  | 'drill_deeper'
+  | 'continue_thread'
   | 'custom';
 export type DispatchTarget =
   | 'gpt_pro'
@@ -113,9 +122,10 @@ const defaultKindForIntent = (intent: ComposerIntent): PacketKind => {
 // };
 
 const TEMPLATE_LABELS: Record<ResearchTemplate, string> = {
-  web_to_ai_checklist: 'Web-to-AI checklist',
-  resume_tech_stack: 'Resume → tech-stack',
-  latest_developments_radar: 'Latest developments radar',
+  critique: 'Critique',
+  compare: 'Compare',
+  drill_deeper: 'Drill deeper',
+  continue_thread: 'Continue',
   custom: 'Custom',
 };
 
@@ -222,45 +232,53 @@ const buildResearchPacket = (
   scope: PacketComposerScope,
   turnsMd: string,
 ): string => {
-  const head = `# Research request: ${title}\n\n## Source\n${threadInfoLine(scope)}`;
-  const ctx = `## Recent context\n${turnsMd}`;
-  if (template === 'web_to_ai_checklist') {
+  const head = `# ${title}\n\n## Source\n${threadInfoLine(scope)}`;
+  const ctx = `## Source thread\n${turnsMd}`;
+  if (template === 'critique') {
     return `${head}
 
-## Pre-flight checklist for the receiving AI
-- [ ] Verify the conclusion against the original source
-- [ ] Note any framework versions / dates the source assumes
-- [ ] Flag if the question has shifted since first ask
-- [ ] Distinguish what was asserted vs cited
+${ctx}
+
+## Ask
+Review the previous response above. Find the gaps, weak claims,
+unsupported leaps, and outdated assumptions. Be specific about
+what's wrong and what evidence would change your mind.`;
+  }
+  if (template === 'compare') {
+    return `${head}
 
 ${ctx}
 
 ## Ask
-…`;
+Compare the alternatives discussed above along these axes:
+- …
+- …
+- …
+For each axis, say which option wins and by how much. End with
+a recommendation grounded in the user's stated constraints.`;
   }
-  if (template === 'resume_tech_stack') {
-    return `# Tech-stack extraction: ${title}
-
-## Source
-${threadInfoLine(scope)}
+  if (template === 'drill_deeper') {
+    return `${head}
 
 ${ctx}
 
-## Goal
-Pull the technologies, frameworks, and tools mentioned above.
-Output as a comma-separated list grouped by category
-(frontend / backend / ops / data / ml).`;
+## Ask
+Push past the surface. The thread above is at level 1; take it
+to level 3. What second-order implications, edge cases, or
+adjacent considerations did the prior answer skip? Cite sources
+when claiming facts.`;
   }
-  if (template === 'latest_developments_radar') {
-    return `# What's new since: ${title}
+  if (template === 'continue_thread') {
+    return `${head}
 
-## Baseline understanding (from source thread)
-${turnsMd}
+${ctx}
 
 ## Ask
-Surface developments, releases, breaking changes, or new tools
-in this space published in the last 30 days. Cite sources.`;
+Pick up from where the thread above left off. Don't restate the
+context; assume I've read it. Move to the next concrete step or
+question and answer it.`;
   }
+  // custom: empty body — user writes their own ask
   return `${head}
 
 ${ctx}
@@ -269,6 +287,19 @@ ${ctx}
 …`;
 };
 
+// Coding-agent packets used to ship a static checklist
+// (Files / Acceptance criteria / Constraints) bolted onto a markdown
+// dump of the captured turns. That copy was lossy — the agent would
+// only see what the user already had in clipboard. The new packet is
+// MCP-aware: it points the agent at the running Sidetrack companion
+// over HTTP-with-headers and lists the read tools the agent should
+// call to pull live thread context, decisions, and recent dispatches.
+//
+// The bridge key is rendered inline because the clipboard is local
+// and the companion only listens on 127.0.0.1 — no network exposure.
+//
+// Companion port + bridge key are interpolated by the host (App.tsx)
+// when it builds the packet; defaults shown here are illustrative.
 const buildCodingAgentPacket = (
   title: string,
   scope: PacketComposerScope,
@@ -276,22 +307,46 @@ const buildCodingAgentPacket = (
 ): string =>
   `# Coding handoff: ${title}
 
-## Source thread
-${threadInfoLine(scope)}
+You are continuing work from a Sidetrack thread. The user's local
+Sidetrack companion is running and exposes a tool surface you can
+call to read live thread context, recent dispatches, and decisions.
 
-## Recent context
+## Thread reference
+${threadInfoLine(scope)}
+${
+  scope.sourceThreadId === undefined
+    ? ''
+    : `\nthread_id: ${scope.sourceThreadId}`
+}
+
+## Companion endpoint
+- base url   : http://127.0.0.1:{COMPANION_PORT}
+- auth       : send header  x-bac-bridge-key: {BRIDGE_KEY}
+- tool route : send header  x-sidetrack-mcp-tool: <tool-name>
+
+(The companion runs locally only; the bridge key is local-machine.)
+
+## Tools you can call (read-only)
+- bac.read_thread_md       full markdown of this thread
+- bac.list_dispatches      recent context packets / asks the user shipped
+- bac.recall               vector recall over related threads + decisions
+- bac.read_workstream_md   workstream context if this thread is grouped
+- bac.list_annotations     user-saved highlights with comments
+- bac.list_audit_events    decisions, archives, edits
+
+Recommended sequence on first call: read_thread_md → list_dispatches →
+recall (if you need cross-thread context). Cite the tool name when
+you reference what you pulled so the user can verify.
+
+## Snapshot of the captured turns (offline fallback)
+If the companion is unreachable, work from this snapshot. It's the
+same data bac.read_thread_md would return, just frozen at clipboard
+time.
+
 ${turnsMd}
 
-## Files / modules involved
-…
-
-## Acceptance criteria
-- [ ] …
-- [ ] …
-
-## Constraints
-- Do not modify unrelated files.
-- Run the existing test suite before reporting done.`;
+## User's ask
+…`;
 
 const buildNotebookExport = (
   title: string,
@@ -333,7 +388,7 @@ const estimateTokens = (text: string): number => Math.ceil(text.length / 4);
 
 export function PacketComposer({
   defaultKind = 'research_packet',
-  defaultTemplate = 'web_to_ai_checklist',
+  defaultTemplate = 'critique',
   defaultTitle,
   defaultBody,
   scope = DEFAULT_SCOPE,

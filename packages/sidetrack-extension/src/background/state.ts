@@ -13,6 +13,11 @@ import type {
 } from '../companion/model';
 import { readDroppedCount, readQueue } from '../companion/queue';
 import type { DispatchEventRecord } from '../dispatch/types';
+import type {
+  ReviewDraft,
+  ReviewDraftSpan,
+  ReviewVerdict,
+} from '../review/types';
 import {
   createEmptyWorkboardState,
   defaultSettings,
@@ -54,6 +59,11 @@ const DISPATCH_ORIGINALS_KEY = 'sidetrack.dispatchOriginals';
 // one click. Map: threadId → SendToTarget id (string).
 const LAST_DISPATCH_TARGET_KEY = 'sidetrack.lastDispatchTargetByThread';
 const SCREEN_SHARE_MODE_KEY = 'sidetrack.screenShareMode';
+// Per-thread inline-review drafts (selection + comment + overall +
+// verdict). Stored locally only; not part of the companion vault
+// schema. The vault is written via the existing /v1/reviews endpoint
+// only when the user explicitly saves or sends-as-follow-up.
+const REVIEW_DRAFTS_KEY = 'sidetrack.reviewDrafts';
 
 const storageGet = async <TValue>(key: string, fallback: TValue): Promise<TValue> => {
   const result = await chrome.storage.local.get({ [key]: fallback });
@@ -139,6 +149,29 @@ export const writeCachedDispatches = async (
   await storageSet({ [RECENT_DISPATCHES_KEY]: dispatches });
 };
 
+// Set / clear the local 'archived' status on a recorded dispatch.
+// Archive is a UI-only filter — we don't write through to the
+// companion vault since the underlying review/sent/replied lifecycle
+// is separate. Idempotent if the row is already in the target state.
+export const setDispatchArchived = async (
+  dispatchId: string,
+  archived: boolean,
+): Promise<void> => {
+  const current = await readCachedDispatches();
+  const target = current.find((dispatch) => dispatch.bac_id === dispatchId);
+  if (target === undefined) return;
+  if (archived && target.status === 'archived') return;
+  if (!archived && target.status !== 'archived') return;
+  // Going-into-archive: write 'archived'. Going-out: assume the
+  // rehydrated status is 'sent' — we don't store the prior status to
+  // avoid bloating the local cache schema.
+  const nextStatus: DispatchEventRecord['status'] = archived ? 'archived' : 'sent';
+  const next = current.map((dispatch) =>
+    dispatch.bac_id === dispatchId ? { ...dispatch, status: nextStatus } : dispatch,
+  );
+  await writeCachedDispatches(next);
+};
+
 // Dispatch → destination thread links. We can't add this to the
 // companion DispatchEventRecord without bumping its schema, so we
 // track it locally in chrome.storage. Map: dispatchId → threadId.
@@ -203,6 +236,110 @@ export const writeLastDispatchTargetByThread = async (
   await storageSet({
     [LAST_DISPATCH_TARGET_KEY]: { ...current, [threadId]: target },
   });
+};
+
+// Per-thread inline-review drafts. The content script appends spans
+// as the user comments on selected text on the chat page; the side
+// panel renders + lets the user edit and send. Storage is keyed by
+// the tracked thread's bac_id (not threadUrl) so rename / re-resolve
+// of the URL doesn't orphan the draft.
+export const readReviewDrafts = async (): Promise<
+  Readonly<Partial<Record<string, ReviewDraft>>>
+> => await storageGet<Readonly<Partial<Record<string, ReviewDraft>>>>(REVIEW_DRAFTS_KEY, {});
+
+const writeReviewDrafts = async (
+  next: Readonly<Partial<Record<string, ReviewDraft>>>,
+): Promise<void> => {
+  await storageSet({ [REVIEW_DRAFTS_KEY]: next });
+};
+
+export const appendReviewDraftSpan = async (
+  threadId: string,
+  threadUrl: string,
+  span: Omit<ReviewDraftSpan, 'bac_id'>,
+): Promise<ReviewDraft> => {
+  const current = await readReviewDrafts();
+  const existing = current[threadId];
+  const newSpan: ReviewDraftSpan = { ...span, bac_id: createLocalBacId() };
+  const next: ReviewDraft = {
+    threadId,
+    threadUrl,
+    spans: existing === undefined ? [newSpan] : [...existing.spans, newSpan],
+    ...(existing?.overall === undefined ? {} : { overall: existing.overall }),
+    ...(existing?.verdict === undefined ? {} : { verdict: existing.verdict }),
+    updatedAt: span.capturedAt,
+  };
+  await writeReviewDrafts({ ...current, [threadId]: next });
+  return next;
+};
+
+export const dropReviewDraftSpan = async (
+  threadId: string,
+  spanId: string,
+): Promise<ReviewDraft | undefined> => {
+  const current = await readReviewDrafts();
+  const existing = current[threadId];
+  if (existing === undefined) {
+    return undefined;
+  }
+  const remaining = existing.spans.filter((span) => span.bac_id !== spanId);
+  if (remaining.length === 0 && existing.overall === undefined && existing.verdict === undefined) {
+    const { [threadId]: _, ...rest } = current;
+    void _;
+    await writeReviewDrafts(rest);
+    return undefined;
+  }
+  const next: ReviewDraft = {
+    ...existing,
+    spans: remaining,
+    updatedAt: new Date().toISOString(),
+  };
+  await writeReviewDrafts({ ...current, [threadId]: next });
+  return next;
+};
+
+export const updateReviewDraft = async (
+  threadId: string,
+  patch: { readonly overall?: string; readonly verdict?: ReviewVerdict },
+): Promise<ReviewDraft | undefined> => {
+  const current = await readReviewDrafts();
+  const existing = current[threadId];
+  if (existing === undefined) {
+    return undefined;
+  }
+  const nextOverall =
+    patch.overall === undefined
+      ? existing.overall
+      : patch.overall.length === 0
+        ? undefined
+        : patch.overall;
+  const nextVerdict = patch.verdict ?? existing.verdict;
+  const next: ReviewDraft = {
+    ...existing,
+    ...(nextOverall === undefined ? {} : { overall: nextOverall }),
+    ...(nextVerdict === undefined ? {} : { verdict: nextVerdict }),
+    updatedAt: new Date().toISOString(),
+  };
+  // Strip undefined keys cleanly so storage doesn't carry deleted
+  // overall/verdict via prior values.
+  if (nextOverall === undefined && 'overall' in existing) {
+    delete (next as { overall?: string }).overall;
+  }
+  if (nextVerdict === undefined && 'verdict' in existing) {
+    delete (next as { verdict?: ReviewVerdict }).verdict;
+  }
+  await writeReviewDrafts({ ...current, [threadId]: next });
+  return next;
+};
+
+export const discardReviewDraft = async (threadId: string): Promise<void> => {
+  const current = await readReviewDrafts();
+  if (current[threadId] === undefined) {
+    return;
+  }
+  const { [threadId]: _, ...rest } = current;
+  void _;
+  await writeReviewDrafts(rest);
 };
 
 // Drop entries for dispatches that have aged out of recentDispatches.
@@ -375,6 +512,7 @@ export const upsertLocalThread = async (
     parentTitle: input.parentTitle ?? existing?.parentTitle,
     lastTurnRole: input.lastTurnRole ?? existing?.lastTurnRole,
     autoSendEnabled: existing?.autoSendEnabled,
+    selectedModel: input.selectedModel ?? existing?.selectedModel,
   };
   await storageSet({
     [THREADS_KEY]: [
@@ -708,6 +846,7 @@ export const buildWorkboardState = async (
     dispatchDiagnostics: await readDispatchDiagnostics(),
     dispatchOriginals: await readDispatchOriginals(),
     lastDispatchTargetByThread: await readLastDispatchTargetByThread(),
+    reviewDrafts: await readReviewDrafts(),
     collapsedSections: await storageGet<WorkboardState['collapsedSections']>(
       COLLAPSED_SECTIONS_KEY,
       [],

@@ -9,6 +9,12 @@ import { useEffect, useRef } from 'react';
 //
 // "Customize first..." opens the existing PacketComposer for the
 // long-tail cases that genuinely need template tweaks.
+//
+// Layout: rendered inline as a panel inside the thread card (a
+// sibling of `.thread-actions`) — narrow side panels can't fit a
+// floating popover anchored under the trigger button without it
+// overflowing the panel viewport. Escape and the trigger button
+// itself are the two ways to dismiss.
 
 export type SendToTarget =
   | 'gpt_pro'
@@ -65,31 +71,18 @@ export function SendToDropdown({
 }: SendToDropdownProps) {
   const rootRef = useRef<HTMLDivElement | null>(null);
 
-  // Close on click-outside or Escape.
+  // Inline panels don't need click-outside dismissal (clicking
+  // elsewhere in the side panel shouldn't yank the picker away
+  // mid-decision). Esc still closes for keyboard users; the trigger
+  // button toggles for everyone else.
   useEffect(() => {
-    const onDoc = (event: MouseEvent) => {
-      if (rootRef.current === null) {
-        return;
-      }
-      const target = event.target;
-      if (target instanceof Node && !rootRef.current.contains(target)) {
-        onClose();
-      }
-    };
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         onClose();
       }
     };
-    // Defer one tick so the click that opened the menu doesn't
-    // immediately close it.
-    const handle = window.setTimeout(() => {
-      document.addEventListener('mousedown', onDoc);
-      document.addEventListener('keydown', onKey);
-    }, 0);
+    document.addEventListener('keydown', onKey);
     return () => {
-      window.clearTimeout(handle);
-      document.removeEventListener('mousedown', onDoc);
       document.removeEventListener('keydown', onKey);
     };
   }, [onClose]);
@@ -117,18 +110,20 @@ export function SendToDropdown({
       {recentTarget !== undefined ? (
         <>
           <div className="send-to-section-head mono">Recent</div>
-          {renderRow(recentTarget, '✓ ' + TARGET_LABELS[recentTarget], 'last target')}
+          <div className="send-to-row">
+            {renderRow(recentTarget, '✓ ' + TARGET_LABELS[recentTarget], 'last target')}
+          </div>
           <div className="send-to-divider" />
         </>
       ) : null}
       <div className="send-to-section-head mono">Ask another AI</div>
-      {AI_PROVIDERS.map((p) => renderRow(p.id, p.label))}
+      <div className="send-to-row">{AI_PROVIDERS.map((p) => renderRow(p.id, p.label))}</div>
       <div className="send-to-divider" />
       <div className="send-to-section-head mono">Hand to coding agent</div>
-      {CODING_AGENTS.map((p) => renderRow(p.id, p.label))}
+      <div className="send-to-row">{CODING_AGENTS.map((p) => renderRow(p.id, p.label))}</div>
       <div className="send-to-divider" />
       <div className="send-to-section-head mono">Export as file</div>
-      {EXPORTS.map((p) => renderRow(p.id, p.label))}
+      <div className="send-to-row">{EXPORTS.map((p) => renderRow(p.id, p.label))}</div>
       <div className="send-to-divider" />
       <button
         type="button"

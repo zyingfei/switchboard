@@ -33,6 +33,8 @@ export type { DispatchConfirmProps } from './DispatchConfirm';
 
 export { ReviewComposer } from './ReviewComposer';
 export type { ReviewComposerProps, ReviewVerdict, ReviewSpan } from './ReviewComposer';
+export { ReviewDraftFooter } from './ReviewDraftFooter';
+export type { ReviewDraftFooterProps } from './ReviewDraftFooter';
 
 export { Wizard } from './Wizard';
 export type { WizardProps, WizardStep } from './Wizard';

@@ -227,16 +227,17 @@ test.describe('dispatch packet (synthetic)', () => {
       await expect(modal.locator('.slider-row .mono')).toHaveText(/^\d+ \/ 6 turns$/u);
 
       const body = modal.locator('.packet-body-input');
-      // The default research template is web_to_ai_checklist — assert the
-      // body initialises to that template's content. (Driving every
-      // template button in a loop turned out racy with the body-regen
-      // useEffect; covered by unit tests in components.test.tsx instead.)
-      await expect(body).toHaveValue(/Pre-flight checklist for the receiving AI/u);
-      // All four template buttons should at least be present + clickable.
+      // The default framing is 'critique' — assert the body initialises
+      // to that template's content. (Driving every template button in
+      // a loop turned out racy with the body-regen useEffect; covered
+      // by unit tests in components.test.tsx instead.)
+      await expect(body).toHaveValue(/Find the gaps, weak claims/u);
+      // All five framing buttons should at least be present + clickable.
       for (const buttonName of [
-        'Web-to-AI checklist',
-        'Resume → tech-stack',
-        'Latest developments radar',
+        'Critique',
+        'Compare',
+        'Drill deeper',
+        'Continue',
         'Custom',
       ]) {
         await expect(modal.getByRole('button', { name: buttonName })).toBeVisible();

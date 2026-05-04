@@ -14,6 +14,13 @@ export type DispatchKindForPreview = 'chat-paste' | 'chat-auto' | 'coding' | 'ex
 
 export interface DispatchConfirmProps {
   readonly target: string;
+  // The source thread's provider + model the user had selected when
+  // the captured turns were taken (e.g. "Gemini · Thinking" or
+  // "Claude · Sonnet 4.6"). Surfaced as a small subtitle so the user
+  // sees which model the context came from before they ship it
+  // elsewhere. Display-only — never used to route or pick a model
+  // in the destination tab.
+  readonly sourceLabel?: string;
   // The actual composed packet body. Required — the modal previews
   // EXACTLY what is about to ship. Previously this was a hardcoded
   // stub which silently shipped the wrong text into the dispatch
@@ -37,7 +44,7 @@ export interface DispatchConfirmProps {
 }
 
 /**
- * §24.10 ship-blocking safety chain rendered side-by-side.
+ * Ship-blocking safety chain rendered side-by-side.
  *
  * All four primitives must be visible before the user confirms dispatch:
  * - Redaction (PII / API key removal)
@@ -45,10 +52,13 @@ export interface DispatchConfirmProps {
  * - Screen-share-safe (mask if `getDisplayMedia` is active)
  * - Captured-page injection scrub (warn if source has injection patterns)
  *
- * Per Q5, paste-mode is locked; auto-send is opt-in per provider.
+ * Send mode default follows the per-provider auto-send opt-in: AI
+ * providers default to auto-send, coding agents and exports stay on
+ * paste mode (auto-send doesn't apply to those targets).
  */
 export function DispatchConfirm({
   target,
+  sourceLabel,
   body,
   dispatchKind = 'chat-paste',
   screenShareActive = false,
@@ -65,7 +75,9 @@ export function DispatchConfirm({
   onEdit,
   onConfirm,
 }: DispatchConfirmProps) {
-  const [mode, setMode] = useState<'paste' | 'auto_send'>('paste');
+  const [mode, setMode] = useState<'paste' | 'auto_send'>(
+    autoSendOptedIn ? 'auto_send' : 'paste',
+  );
   const tokenPct = Math.round((tokenEstimate / tokenLimit) * 100);
   const tokenLevel: 'green' | 'amber' | 'over' =
     tokenPct < 80 ? 'green' : tokenPct < 100 ? 'amber' : 'over';
@@ -87,10 +99,15 @@ export function DispatchConfirm({
     }
   })();
 
+  const subtitle =
+    sourceLabel !== undefined && sourceLabel.length > 0
+      ? `${sourceLabel} → ${target}`
+      : `→ ${target}`;
+
   return (
     <Modal
       title="Confirm dispatch"
-      subtitle={`→ ${target} · paste mode`}
+      subtitle={subtitle}
       width={620}
       variant="ink"
       onClose={onCancel}
@@ -156,19 +173,23 @@ export function DispatchConfirm({
               setMode('paste');
             }}
           >
-            Paste mode <span className="mono">(default)</span>
+            Paste mode
           </button>
           <button
             type="button"
-            className="pill"
+            className={'pill ' + (mode === 'auto_send' ? 'on' : '')}
             disabled={!autoSendOptedIn}
-            title="Auto-send is opt-in per provider in Settings"
+            title={
+              autoSendOptedIn
+                ? `Auto-send into ${target}`
+                : `Turn auto-send on for ${target} in Settings to enable this`
+            }
+            onClick={() => {
+              if (autoSendOptedIn) setMode('auto_send');
+            }}
           >
-            <span className="icon-12">{Icons.lock}</span> Auto-send · not enabled for {target}
+            {autoSendOptedIn ? null : <span className="icon-12">{Icons.lock}</span>} Auto-send
           </button>
-        </div>
-        <div className="hint">
-          <em>Paste mode is locked per §24.10. Opt-in to auto-send per provider in Settings.</em>
         </div>
       </div>
 

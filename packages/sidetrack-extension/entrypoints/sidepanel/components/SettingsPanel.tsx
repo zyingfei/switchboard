@@ -282,7 +282,10 @@ export function SettingsPanel({
     };
   }, [companionPort, bridgeKey]);
   const initial: SettingsValue = settings ?? {
-    autoSendOptIn: { chatgpt: false, claude: false, gemini: false },
+    // AI providers default to auto-send on. The user can flip individual
+    // providers off here; coding-agent / export targets always use
+    // paste mode (auto-send doesn't apply) so they aren't represented.
+    autoSendOptIn: { chatgpt: true, claude: true, gemini: true },
     defaultPacketKind: 'research',
     defaultDispatchTarget: 'claude',
     screenShareSafeMode: false,
@@ -451,10 +454,11 @@ export function SettingsPanel({
       </div>
 
       <div className="settings-section">
-        <h3 className="settings-section-title">Auto-send opt-in (§24.10)</h3>
+        <h3 className="settings-section-title">Auto-send per provider</h3>
         <p className="settings-section-lede ai-italic">
-          Default is paste-mode for safety. Opt-in per provider only after you've reviewed how
-          Sidetrack inserts into that chat. Opt-ins live in the vault, not the browser.
+          Auto-send opens the AI's tab and types the packet for you. AI providers default to on;
+          turn one off and Sidetrack falls back to copying the packet so you can paste it
+          yourself. Settings live in the vault, not the browser.
           {companionConfigured ? null : (
             <>
               {' '}

@@ -52,6 +52,12 @@ export interface CaptureEvent {
   // parentThreadId by URL match (preferred) or title match (fallback).
   readonly forkedFromUrl?: string;
   readonly forkedFromTitle?: string;
+  // Active model the user picked in the chat UI when this snapshot was
+  // captured (e.g. "Thinking", "GPT-5.1 Pro", "Sonnet 4.6"). Best-
+  // effort string scraped from the provider's model picker — used
+  // only for display in the dispatch confirm header so the user sees
+  // which model their context came from. Never used for routing.
+  readonly selectedModel?: string;
 }
 
 export interface ThreadUpsert {
@@ -77,6 +83,7 @@ export interface ThreadUpsert {
   readonly parentThreadId?: string;
   readonly parentTitle?: string;
   readonly lastTurnRole?: 'user' | 'assistant' | 'system' | 'unknown';
+  readonly selectedModel?: string;
 }
 
 export interface CaptureNoteCreate {

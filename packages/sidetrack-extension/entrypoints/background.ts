@@ -22,6 +22,8 @@ import type {
 } from '../src/companion/model';
 import { drainQueue, enqueueCapture } from '../src/companion/queue';
 import { createRecallClient } from '../src/companion/recallClient';
+import { buildReviewFollowUpText } from '../src/review/draft';
+import type { ReviewDraft } from '../src/review/types';
 import {
   isContentResponse,
   isRuntimeRequest,
@@ -66,6 +68,12 @@ import {
   writeDispatchLink,
   writeDispatchOriginal,
   writeLastDispatchTargetByThread,
+  appendReviewDraftSpan as persistReviewDraftSpan,
+  dropReviewDraftSpan,
+  updateReviewDraft,
+  discardReviewDraft,
+  readReviewDrafts,
+  setDispatchArchived,
 } from '../src/background/state';
 import { createDispatchClient } from '../src/dispatch/client';
 import { tryLinkCapturedThread } from '../src/companion/dispatchLinking';
@@ -358,6 +366,7 @@ const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
     tabSnapshot: event.tabSnapshot,
     ...parentLink,
     ...(lastTurnRole === undefined ? {} : { lastTurnRole }),
+    ...(event.selectedModel === undefined ? {} : { selectedModel: event.selectedModel }),
   });
   // Auto-resolve queued follow-ups whose text appears in the captured user
   // turns — same logic as sendToCompanion but for the local-only path.
@@ -429,6 +438,16 @@ const captureTab = async (): Promise<void> => {
       capturedAt,
     ),
   );
+  // Known-provider chat URL but the extractor produced zero turns —
+  // the conversation hasn't mounted yet (Gemini's Angular shell can
+  // lag a few seconds on a fresh nav). Refuse rather than create a
+  // junk thread row; the previous behavior captured sidebar nav text
+  // as an "unknown" turn and polluted the vault.
+  if (baseCapture.provider !== 'unknown' && baseCapture.turns.length === 0) {
+    throw new Error(
+      `The ${baseCapture.provider} conversation hasn't finished loading. Wait a moment and try again.`,
+    );
+  }
   const event: CaptureEvent = {
     ...baseCapture,
     tabSnapshot: snapshotFromTab(tab, baseCapture.capturedAt),
@@ -1333,6 +1352,89 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
   if (request.type === messageTypes.deleteCaptureNote) {
     const { noteId } = request;
     return await withCompanionStatus(() => deleteLocalCaptureNote(noteId), 'mutation');
+  }
+
+  if (request.type === messageTypes.appendReviewDraftSpan) {
+    return await withCompanionStatus(async () => {
+      // Resolve the threadUrl back to a tracked thread so the draft is
+      // keyed by bac_id (stable across URL re-resolution). If no thread
+      // exists yet, drop the span — there's no row in the side panel
+      // to surface it on. Capture should run before review.
+      const threads = await readThreads();
+      const thread = threads.find((t) => t.threadUrl === request.threadUrl);
+      if (thread === undefined) {
+        return;
+      }
+      await persistReviewDraftSpan(thread.bac_id, request.threadUrl, {
+        threadUrl: request.threadUrl,
+        anchor: request.anchor,
+        quote: request.quote,
+        comment: request.comment,
+        capturedAt: request.capturedAt,
+      });
+    }, 'mutation');
+  }
+
+  if (request.type === messageTypes.dropReviewDraftSpan) {
+    return await withCompanionStatus(async () => {
+      await dropReviewDraftSpan(request.threadId, request.spanId);
+    }, 'mutation');
+  }
+
+  if (request.type === messageTypes.updateReviewDraft) {
+    return await withCompanionStatus(async () => {
+      const patch: { overall?: string; verdict?: ReviewDraft['verdict'] } = {};
+      if (request.overall !== undefined) patch.overall = request.overall;
+      if (request.verdict !== undefined) patch.verdict = request.verdict;
+      await updateReviewDraft(request.threadId, patch);
+    }, 'mutation');
+  }
+
+  if (request.type === messageTypes.discardReviewDraft) {
+    return await withCompanionStatus(async () => {
+      await discardReviewDraft(request.threadId);
+    }, 'mutation');
+  }
+
+  if (request.type === messageTypes.sendReviewDraftAsFollowUp) {
+    return await withCompanionStatus(async () => {
+      const drafts = await readReviewDrafts();
+      const draft = drafts[request.threadId];
+      if (draft === undefined || draft.spans.length === 0) {
+        return;
+      }
+      const text = buildReviewFollowUpText(draft);
+      // Two flavors:
+      //   autoSend=true  → "Send now": ensure the per-thread auto-send
+      //                    chip is on so createQueueItem's auto-drain
+      //                    path fires immediately.
+      //   autoSend=false → "Add to queue": queue the item but don't
+      //                    touch the thread's auto-send state. If it
+      //                    was already on, the existing drain will
+      //                    pick it up; if it was off, the item just
+      //                    waits for the user to flip auto-send.
+      if (request.autoSend) {
+        await setThreadAutoSend(request.threadId, true);
+      }
+      await createQueueItem({
+        text,
+        scope: 'thread',
+        targetId: request.threadId,
+      });
+      await discardReviewDraft(request.threadId);
+    }, 'queue');
+  }
+
+  if (
+    request.type === messageTypes.archiveDispatch ||
+    request.type === messageTypes.unarchiveDispatch
+  ) {
+    return await withCompanionStatus(async () => {
+      await setDispatchArchived(
+        request.dispatchId,
+        request.type === messageTypes.archiveDispatch,
+      );
+    }, 'mutation');
   }
 
   if (request.type === messageTypes.setCollapsedSections) {

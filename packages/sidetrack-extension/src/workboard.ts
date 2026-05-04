@@ -6,6 +6,7 @@ import type {
   TabSnapshot,
 } from './companion/model';
 import type { DispatchEventRecord } from './dispatch/types';
+import type { ReviewDraft } from './review/types';
 
 export type CompanionStatus = 'connected' | 'disconnected' | 'vault-error' | 'local-only';
 export type TrackingMode = 'auto' | 'manual' | 'stopped' | 'removed' | 'archived';
@@ -60,6 +61,12 @@ export interface TrackedThread {
   // before sending the next). The actual drain implementation lives
   // behind the §24.10 safety chain in M2; this flag is the contract.
   readonly autoSendEnabled?: boolean;
+  // Last observed model the user had picked in the chat (e.g. "Pro",
+  // "Thinking", "GPT-5.1 Pro"). Best-effort; surfaced in the dispatch
+  // confirm header so the user sees which model their context came
+  // from. Provider-specific scraping; absent means we couldn't read
+  // the picker (icon-only buttons, dynamic loading, etc).
+  readonly selectedModel?: string;
 }
 
 export interface WorkstreamNode {
@@ -201,6 +208,11 @@ export interface WorkboardState {
   // fired against that thread. Drives the "Recent" row in the
   // SendToDropdown so a repeat send is one click.
   readonly lastDispatchTargetByThread: Readonly<Partial<Record<string, string>>>;
+  // Per-thread inline-review drafts staged by the user via on-page
+  // selection in the chat tab. Drives the "Review draft (N)" chip on
+  // the thread row; cleared when the user sends-as-follow-up, saves
+  // to vault, or discards.
+  readonly reviewDrafts: Readonly<Partial<Record<string, ReviewDraft>>>;
   readonly lastError?: string;
   readonly updatedAt: string;
 }
@@ -307,6 +319,7 @@ export const createEmptyWorkboardState = (
   dispatchOriginals: {},
   dispatchDiagnostics: [],
   lastDispatchTargetByThread: {},
+  reviewDrafts: {},
   updatedAt: new Date().toISOString(),
   ...overrides,
 });

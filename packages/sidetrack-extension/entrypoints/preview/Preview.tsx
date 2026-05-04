@@ -40,7 +40,7 @@ const STUB_INBOUND: InboundReminder[] = [
   },
   {
     bac_id: 'inbound-2',
-    threadTitle: 'PRD §24.10 wording',
+    threadTitle: 'PRD wording cleanup',
     provider: 'chatgpt',
     providerLabel: 'ChatGPT',
     inboundTurnAt: '1 hr ago',
@@ -62,9 +62,9 @@ const STUB_DISPATCHES: DispatchEvent[] = [
   },
   {
     bac_id: 'dispatch-2',
-    sourceTitle: 'PRD §24.10 wording',
+    sourceTitle: 'PRD wording cleanup',
     targetProviderLabel: 'Claude',
-    targetThreadTitle: 'compare with §27.6',
+    targetThreadTitle: 'compare with prior thread',
     mode: 'paste',
     dispatchKind: 'submit_back',
     dispatchedAt: '3 hr ago',
