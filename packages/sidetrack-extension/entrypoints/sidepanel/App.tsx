@@ -3546,8 +3546,8 @@ const App = () => {
             ? { defaultKind: dispatchKindToUiPacketKind(settings.defaultPacketKind) }
             : {})}
           scope={{
-            label: composeThread.title,
-            meta: `${providerLabel(composeThread.provider)} · ${formatRelative(composeThread.lastSeenAt)}`,
+            label: workstreamPath(composeWorkstream?.bac_id, state.workstreams),
+            meta: `${composeThread.title} · ${providerLabel(composeThread.provider)} · ${formatRelative(composeThread.lastSeenAt)}`,
             sourceThreadId: composeThread.bac_id,
             threadUrl: composeThread.threadUrl,
             providerLabel: providerLabel(composeThread.provider),
