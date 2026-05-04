@@ -184,13 +184,12 @@ test.describe('spec coverage (synthetic)', () => {
       // Switch to the source workstream first so the thread row shows.
       await page.getByRole('tab', { name: 'All threads' }).click();
       await expect(page.locator('.thread .name', { hasText: 'Movable thread' })).toBeVisible();
-      // Click Move on the row.
-      await page
-        .locator('.thread', {
-          has: page.locator('.name', { hasText: 'Movable thread' }),
-        })
-        .getByRole('button', { name: 'Move' })
-        .click();
+      // v2 design pass: Move now lives behind the ⋯ overflow menu.
+      const movableRow = page.locator('.thread', {
+        has: page.locator('.name', { hasText: 'Movable thread' }),
+      });
+      await movableRow.getByRole('button', { name: 'More actions', exact: true }).click();
+      await page.getByRole('menuitem', { name: 'Move to workstream…', exact: true }).click();
       // Move-to picker shows; click "Destination".
       const destButton = page.getByRole('button', { name: /Destination/ });
       await destButton.last().click();
@@ -222,13 +221,12 @@ test.describe('spec coverage (synthetic)', () => {
       opened.push(page);
       await page.getByRole('tab', { name: 'All threads' }).click();
 
-      // Click Queue button on the row → composer opens → type → save.
+      // v2 design pass: Queue now lives behind the ⋯ overflow menu.
       const row = page.locator('.thread', {
         has: page.locator('.name', { hasText: 'Queue host' }),
       });
-      // Multiple buttons match (the action label + the queue pill once
-      // it shows). Use the action-strip button — it's in .thread-actions.
-      await row.locator('.thread-actions').getByRole('button', { name: 'Queue' }).click();
+      await row.getByRole('button', { name: 'More actions', exact: true }).click();
+      await page.getByRole('menuitem', { name: 'Queue follow-up', exact: true }).click();
       await row.getByPlaceholder(/Ask next/i).fill('What about edge case X?');
       await row.getByRole('button', { name: 'Add' }).click();
 

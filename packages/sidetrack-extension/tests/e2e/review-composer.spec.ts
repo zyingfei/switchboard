@@ -170,7 +170,9 @@ test.describe('review composer (synthetic)', () => {
       const threadRow = page
         .locator('.thread')
         .filter({ has: page.locator('.name', { hasText: thread.title }) });
-      await threadRow.getByRole('button', { name: 'Review', exact: true }).click();
+      // v2 design pass: Review now lives behind the ⋯ overflow menu.
+      await threadRow.getByRole('button', { name: 'More actions', exact: true }).click();
+      await page.getByRole('menuitem', { name: 'Review captured turns', exact: true }).click();
 
       const modal = page
         .locator('.review-composer')
@@ -195,7 +197,9 @@ test.describe('review composer (synthetic)', () => {
       await modal.getByRole('button', { name: 'Close' }).click();
       await expect(page.locator('.review-composer')).toHaveCount(0);
 
-      await threadRow.getByRole('button', { name: 'Review', exact: true }).click();
+      // v2 design pass: Review now lives behind the ⋯ overflow menu.
+      await threadRow.getByRole('button', { name: 'More actions', exact: true }).click();
+      await page.getByRole('menuitem', { name: 'Review captured turns', exact: true }).click();
       await expect(modal).toBeVisible();
 
       await modal

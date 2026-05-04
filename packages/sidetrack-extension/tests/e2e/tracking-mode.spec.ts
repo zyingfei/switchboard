@@ -63,17 +63,15 @@ test.describe('tracking mode toggle (synthetic)', () => {
         .locator('.thread')
         .filter({ has: page.locator('.name', { hasText: tracked.title }) });
       await expect(row).toBeVisible();
-      // Initial state: a Stop button is visible (and a Resume is not).
-      await expect(row.getByRole('button', { name: 'Stop', exact: true })).toBeVisible();
-      await expect(row.getByRole('button', { name: 'Resume', exact: true })).toHaveCount(0);
-
-      await row.getByRole('button', { name: 'Stop', exact: true }).click();
+      // v2 design pass: Stop / Resume now live behind the ⋯ overflow menu.
+      await row.getByRole('button', { name: 'More actions', exact: true }).click();
+      await page
+        .getByRole('menuitem', { name: 'Stop tracking', exact: true })
+        .click();
       await expandStaleBucket(page);
 
-      // After flip: stamp shows "Tracking stopped"; Resume button replaces Stop.
+      // After flip: stamp shows "Tracking stopped".
       await expect(row.locator('.stamp')).toContainText('Tracking stopped');
-      await expect(row.getByRole('button', { name: 'Resume', exact: true })).toBeVisible();
-      await expect(row.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0);
 
       // Storage round-trip.
       const persisted = await page.evaluate(async (id) => {
@@ -110,12 +108,12 @@ test.describe('tracking mode toggle (synthetic)', () => {
       const row = page
         .locator('.thread')
         .filter({ has: page.locator('.name', { hasText: stopped.title }) });
-      await expect(row.getByRole('button', { name: 'Resume', exact: true })).toBeVisible();
-      await row.getByRole('button', { name: 'Resume', exact: true }).click();
+      await expect(row).toBeVisible();
+      // v2 design pass: Resume now lives behind the ⋯ overflow menu.
+      await row.getByRole('button', { name: 'More actions', exact: true }).click();
+      await page.getByRole('menuitem', { name: 'Resume tracking', exact: true }).click();
 
-      // After resume: Stop button reappears, the "Tracking stopped"
-      // stamp goes away.
-      await expect(row.getByRole('button', { name: 'Stop', exact: true })).toBeVisible();
+      // After resume: the "Tracking stopped" stamp goes away.
       await expect(row.locator('.stamp')).not.toContainText('Tracking stopped');
 
       // Known-provider thread should resume to "auto", not "manual".

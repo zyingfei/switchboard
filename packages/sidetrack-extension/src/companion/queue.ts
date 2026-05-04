@@ -114,11 +114,21 @@ export const enqueueCapture = async (
   return { queue: kept, evicted };
 };
 
+export interface DrainOptions {
+  // When true, treat every queued item as eligible regardless of its
+  // backoff state. Use this on user-initiated reconnect paths where the
+  // backoff is moot (we have a fresh, positive signal that companion is
+  // up). Automatic / scheduled drains should leave this false so the
+  // backoff respects the prior failure history.
+  readonly ignoreBackoff?: boolean;
+}
+
 export const drainQueue = async (
   send: (event: CaptureEvent) => Promise<void>,
   storage: StoragePort = chromeStoragePort,
   now: Date = new Date(),
   random: () => number = Math.random,
+  opts: DrainOptions = {},
 ): Promise<DrainResult> => {
   const queue = await readQueue(storage);
   let sent = 0;
@@ -127,7 +137,7 @@ export const drainQueue = async (
   const nextQueue: QueuedCapture[] = [];
 
   for (const item of queue) {
-    if (Date.parse(item.nextAttemptAt) > now.getTime()) {
+    if (opts.ignoreBackoff !== true && Date.parse(item.nextAttemptAt) > now.getTime()) {
       nextQueue.push(item);
       continue;
     }
