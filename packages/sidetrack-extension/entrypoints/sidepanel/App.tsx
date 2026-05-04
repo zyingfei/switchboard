@@ -439,6 +439,27 @@ const App = () => {
   const [dismissedSuggestions, setDismissedSuggestions] = useState<ReadonlySet<string>>(
     () => new Set<string>(),
   );
+  // Which thread row's action overflow menu (⋯) is open. One at a
+  // time across the workboard.
+  const [actionMenuOpenFor, setActionMenuOpenFor] = useState<string | null>(null);
+
+  // Click-outside dismissal for the overflow menu. The menu's own
+  // contents stop propagation, so any click that reaches document
+  // came from outside.
+  useEffect(() => {
+    if (actionMenuOpenFor === null) return undefined;
+    const onDoc = (event: MouseEvent) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest('.thread-overflow-anchor') !== null) {
+        return;
+      }
+      setActionMenuOpenFor(null);
+    };
+    document.addEventListener('mousedown', onDoc);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+    };
+  }, [actionMenuOpenFor]);
   // Cache of suggested workstream per thread, keyed by thread bac_id.
   // Populated from companion's GET /v1/suggestions/thread/{id} (PR #76
   // Track F) when the row is rendered. Empty fallback shows nothing.
@@ -1935,25 +1956,11 @@ const App = () => {
           >
             Open
           </button>
-          <button
-            type="button"
-            className="btn-link"
-            title="Queue a follow-up question that fires when this AI replies"
-            onClick={(e) => {
-              e.stopPropagation();
-              setQueueComposeFor(queueComposeFor === thread.bac_id ? null : thread.bac_id);
-              setQueueDraft('');
-            }}
-          >
-            Queue
-          </button>
           {(() => {
             const requiresCompanion =
               state.companionStatus !== 'connected' || bridgeKey.length === 0;
             // Don't use the `disabled` attribute when companion is missing —
             // a click should explain how to enable, not be silently swallowed.
-            // The `.disabled-look` class mutes the colour while the button
-            // remains a real, clickable target.
             const explainNeedsCompanion = (action: 'Send' | 'Review') => {
               setError(
                 `${action} needs a connected companion to read this thread's turns from the vault. Open Settings (cog, top right) → enter the bridge port and key → Save, then try again.`,
@@ -1963,6 +1970,7 @@ const App = () => {
             const recentTarget = state.lastDispatchTargetByThread[thread.bac_id] as
               | SendToTarget
               | undefined;
+            const menuOpen = actionMenuOpenFor === thread.bac_id;
             return (
               <>
                 <span className="send-to-anchor">
@@ -2003,75 +2011,110 @@ const App = () => {
                     />
                   ) : null}
                 </span>
-                <button
-                  type="button"
-                  className={'btn-link' + (requiresCompanion ? ' disabled-look' : '')}
-                  title={
-                    requiresCompanion
-                      ? 'Review is unavailable in local-only mode — click for setup steps'
-                      : 'Review captured turns of this thread'
-                  }
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    if (requiresCompanion) {
-                      explainNeedsCompanion('Review');
-                      return;
-                    }
-                    setReviewThreadId(thread.bac_id);
-                  }}
-                >
-                  Review
-                </button>
+                <span className="thread-overflow-anchor">
+                  <button
+                    type="button"
+                    className="btn-link thread-overflow-trigger"
+                    title="More actions"
+                    aria-haspopup="menu"
+                    aria-expanded={menuOpen}
+                    aria-label="More actions"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setActionMenuOpenFor(menuOpen ? null : thread.bac_id);
+                    }}
+                  >
+                    ⋯
+                  </button>
+                  {menuOpen ? (
+                    <div
+                      className="thread-overflow-menu"
+                      role="menu"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                      }}
+                    >
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setActionMenuOpenFor(null);
+                          setQueueComposeFor(
+                            queueComposeFor === thread.bac_id ? null : thread.bac_id,
+                          );
+                          setQueueDraft('');
+                        }}
+                      >
+                        Queue follow-up
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className={requiresCompanion ? 'disabled-look' : ''}
+                        onClick={() => {
+                          setActionMenuOpenFor(null);
+                          if (requiresCompanion) {
+                            explainNeedsCompanion('Review');
+                            return;
+                          }
+                          setReviewThreadId(thread.bac_id);
+                        }}
+                      >
+                        Review captured turns
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setActionMenuOpenFor(null);
+                          setMoveThreadId(thread.bac_id);
+                        }}
+                      >
+                        Move to workstream…
+                      </button>
+                      {thread.trackingMode === 'stopped' ? (
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={() => {
+                            setActionMenuOpenFor(null);
+                            updateTracking(
+                              thread.bac_id,
+                              thread.provider === 'unknown' ? 'manual' : 'auto',
+                            );
+                          }}
+                        >
+                          Resume tracking
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={() => {
+                            setActionMenuOpenFor(null);
+                            updateTracking(thread.bac_id, 'stopped');
+                          }}
+                        >
+                          Stop tracking
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="archive"
+                        onClick={() => {
+                          setActionMenuOpenFor(null);
+                          updateTracking(thread.bac_id, 'archived');
+                        }}
+                      >
+                        Archive
+                      </button>
+                    </div>
+                  ) : null}
+                </span>
               </>
             );
           })()}
-          <button
-            type="button"
-            className="btn-link"
-            title="Move this thread into another workstream"
-            onClick={(e) => {
-              e.stopPropagation();
-              setMoveThreadId(thread.bac_id);
-            }}
-          >
-            Move
-          </button>
-          {thread.trackingMode === 'stopped' ? (
-            <button
-              type="button"
-              className="btn-link"
-              title="Resume tracking this thread"
-              onClick={(e) => {
-                e.stopPropagation();
-                updateTracking(thread.bac_id, thread.provider === 'unknown' ? 'manual' : 'auto');
-              }}
-            >
-              Resume
-            </button>
-          ) : (
-            <button
-              type="button"
-              className="btn-link"
-              title="Stop tracking — keep the thread but don't capture new turns"
-              onClick={(e) => {
-                e.stopPropagation();
-                updateTracking(thread.bac_id, 'stopped');
-              }}
-            >
-              Stop
-            </button>
-          )}
-          <button
-            type="button"
-            className="btn-link archive"
-            title="Archive — hide from default views; restorable from Settings"
-            onClick={(e) => {
-              e.stopPropagation();
-              updateTracking(thread.bac_id, 'archived');
-            }}
-          >
-            Archive
-          </button>
           {queuedCount > 0 ? (
             <button
               type="button"

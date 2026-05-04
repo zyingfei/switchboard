@@ -5642,6 +5642,66 @@ pre.diff {
   margin-bottom: 8px;
 }
 
+/* Thread-row action overflow menu — collapses Queue/Review/Move/Stop/
+   Archive behind a ⋯ button, leaving Open + Send to ▾ visible. */
+.thread-overflow-anchor {
+  position: relative;
+  display: inline-flex;
+}
+.thread-overflow-trigger {
+  font-family: var(--mono);
+  font-size: 13px;
+  letter-spacing: 0.1em;
+  padding: 2px 8px;
+  line-height: 1;
+}
+.thread-overflow-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  min-width: 180px;
+  background: var(--paper-light);
+  border: var(--hair);
+  border-radius: var(--rad-s);
+  box-shadow: 0 8px 24px rgba(27, 25, 22, 0.16);
+  padding: 4px;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  animation: thread-overflow-in 140ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+@keyframes thread-overflow-in {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.thread-overflow-menu button {
+  background: transparent;
+  border: none;
+  text-align: left;
+  padding: 7px 10px;
+  font-family: var(--body);
+  font-size: 13px;
+  color: var(--ink);
+  cursor: pointer;
+  border-radius: var(--rad-s);
+}
+.thread-overflow-menu button:hover {
+  background: var(--paper-deep);
+}
+.thread-overflow-menu button.archive {
+  color: var(--signal);
+}
+.thread-overflow-menu button.disabled-look {
+  color: var(--ink-3);
+}
+
 /* Inline images inside captured-turn cards. Constrain to the card width
    and add a subtle border so the image clearly belongs to the turn. */
 .thread-turn-image {
