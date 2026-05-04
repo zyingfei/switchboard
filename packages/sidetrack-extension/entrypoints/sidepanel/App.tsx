@@ -40,6 +40,8 @@ import {
   HealthPanel,
   DesignPreview,
   WorkstreamDetailPanel,
+  TurnText,
+  NeedsOrganizeSuggestion,
   type LinkedNote,
   type TrustEntry,
   type TrustTool,
@@ -432,6 +434,17 @@ const App = () => {
     },
   ]);
   const [pendingCodingOffers, setPendingCodingOffers] = useState<readonly OfferRecord[]>([]);
+  // Per-row dismissals for the Needs-Organize inline suggestion. Local
+  // (per-session) — survives panel close but not extension reload.
+  const [dismissedSuggestions, setDismissedSuggestions] = useState<ReadonlySet<string>>(
+    () => new Set<string>(),
+  );
+  // Cache of suggested workstream per thread, keyed by thread bac_id.
+  // Populated from companion's GET /v1/suggestions/thread/{id} (PR #76
+  // Track F) when the row is rendered. Empty fallback shows nothing.
+  const [suggestionCache, setSuggestionCache] = useState<
+    ReadonlyMap<string, { readonly label: string; readonly confidence: number }>
+  >(() => new Map());
 
   // Refresh pending coding-session offers from chrome.storage. Driven
   // by storage events (set by the background detection handler) plus
@@ -1828,6 +1841,35 @@ const App = () => {
             </span>
           ) : null}
         </div>
+        {lifecyclePill?.label === 'Needs organize' &&
+        !dismissedSuggestions.has(thread.bac_id) ? (
+          <NeedsOrganizeSuggestionRow
+            threadId={thread.bac_id}
+            companionPort={port.length > 0 ? Number(port) : null}
+            bridgeKey={bridgeKey.length > 0 ? bridgeKey : null}
+            cached={suggestionCache.get(thread.bac_id)}
+            onCache={(label, confidence) => {
+              setSuggestionCache((prev) => {
+                const next = new Map(prev);
+                next.set(thread.bac_id, { label, confidence });
+                return next;
+              });
+            }}
+            onAccept={(workstreamId) => {
+              void moveThreadToWorkstream(thread.bac_id, workstreamId);
+            }}
+            onPickManual={() => {
+              setMoveThreadId(thread.bac_id);
+            }}
+            onDismiss={() => {
+              setDismissedSuggestions((prev) => {
+                const next = new Set(prev);
+                next.add(thread.bac_id);
+                return next;
+              });
+            }}
+          />
+        ) : null}
         {viewMode === 'all' ? (
           <button
             type="button"
@@ -2169,7 +2211,7 @@ const App = () => {
                 >
                   <span className="thread-turn-role mono">{turn.role}</span>
                   <span className="thread-turn-text">
-                    {turn.text.length > 200 ? `${turn.text.slice(0, 200).trim()}…` : turn.text}
+                    <TurnText text={turn.text} maxChars={200} />
                   </span>
                   <span className="thread-turn-time mono">{formatRelative(turn.capturedAt)}</span>
                 </div>
@@ -3704,6 +3746,94 @@ export default App;
 // =====================================================
 // Spec-aligned UI subcomponents (PR 2 / design rewrite)
 // =====================================================
+
+// Per-row workstream-suggestion fetcher. Calls
+// GET /v1/suggestions/thread/{id} (PR #76 Track F) when companion is
+// configured. Caches the top suggestion via the parent's onCache so
+// repeated row renders don't re-fetch.
+
+interface NeedsOrganizeSuggestionRowProps {
+  readonly threadId: string;
+  readonly companionPort: number | null;
+  readonly bridgeKey: string | null;
+  readonly cached?: { readonly label: string; readonly confidence: number };
+  readonly onCache: (label: string, confidence: number) => void;
+  readonly onAccept: (workstreamId: string) => void;
+  readonly onPickManual: () => void;
+  readonly onDismiss: () => void;
+}
+
+function NeedsOrganizeSuggestionRow({
+  threadId,
+  companionPort,
+  bridgeKey,
+  cached,
+  onCache,
+  onAccept,
+  onPickManual,
+  onDismiss,
+}: NeedsOrganizeSuggestionRowProps) {
+  const [suggestion, setSuggestion] = useState<
+    { readonly workstreamId: string; readonly label: string; readonly confidence: number } | null
+  >(
+    cached !== undefined
+      ? {
+          workstreamId: '',
+          label: cached.label,
+          confidence: cached.confidence,
+        }
+      : null,
+  );
+
+  useEffect(() => {
+    if (cached !== undefined) return undefined;
+    if (companionPort === null || bridgeKey === null) return undefined;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const url = `http://127.0.0.1:${String(companionPort)}/v1/suggestions/thread/${threadId}?limit=1`;
+        const response = await fetch(url, { headers: { 'x-bac-bridge-key': bridgeKey } });
+        if (!response.ok) return;
+        const body = (await response.json()) as {
+          readonly data?: {
+            readonly items?: readonly {
+              readonly workstreamId: string;
+              readonly score: number;
+            }[];
+          };
+        };
+        const top = body.data?.items?.[0];
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled mutated by closure on cleanup
+        if (top === undefined || cancelled) return;
+        const label = `workstream ${top.workstreamId.slice(0, 12)}`;
+        setSuggestion({ workstreamId: top.workstreamId, label, confidence: top.score });
+        onCache(label, top.score);
+      } catch {
+        // Silent — empty render
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [companionPort, bridgeKey, cached, threadId, onCache]);
+
+  if (suggestion === null) return null;
+  return (
+    <NeedsOrganizeSuggestion
+      suggestedLabel={suggestion.label}
+      confidence={suggestion.confidence}
+      onAccept={() => {
+        if (suggestion.workstreamId.length > 0) {
+          onAccept(suggestion.workstreamId);
+        } else {
+          onPickManual();
+        }
+      }}
+      onPickManual={onPickManual}
+      onDismiss={onDismiss}
+    />
+  );
+}
 
 interface WorkstreamBarProps {
   readonly currentWsLabel: string;
