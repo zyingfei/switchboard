@@ -154,21 +154,23 @@ test.describe('live providers (logged-in profile)', () => {
         }
 
         // The chat ends in an assistant turn → lifecycle is either
-        // "you-replied" ("You replied last", first capture for this URL)
-        // or "unread-reply" ("Unread reply", subsequent captures because
-        // the content script's own auto-capture beat us to it and a
+        // "you-replied" (green dot, first capture for this URL) or
+        // "unread-reply" (signal dot, subsequent captures because the
+        // content script's own auto-capture beat us to it and a
         // reminder was created). Both prove the assistant turn was
-        // detected.
+        // detected. The lifecycle-pill itself only renders for
+        // "Needs organize"; for these states the dot color carries
+        // the signal (per the comment in App.tsx).
         if (justCaptured.lastTurnRole === 'assistant') {
-          await expect(
-            sidepanel
-              .locator('.thread')
-              .filter({
-                has: sidepanel.locator(`.provider.${provider.expectedProvider}`),
-              })
-              .first()
-              .locator('.lifecycle-pill'),
-          ).toContainText(/You replied last|Unread reply/, { timeout: 5_000 });
+          const dot = sidepanel
+            .locator('.thread')
+            .filter({
+              has: sidepanel.locator(`.provider.${provider.expectedProvider}`),
+            })
+            .first()
+            .locator('.row2 .dot')
+            .first();
+          await expect(dot).toHaveClass(/\b(green|signal)\b/u, { timeout: 5_000 });
         }
 
         console.warn(
