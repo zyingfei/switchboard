@@ -97,15 +97,25 @@ const findThreadFor = async (sidepanel: Page, url: string): Promise<CapturedThre
   }, url);
 };
 
-const lifecycleLabelFor = async (sidepanel: Page, providerSlug: string): Promise<string> => {
-  const pill = sidepanel
+// The lifecycle-pill only renders for "Needs organize" — for the
+// states this test covers (waiting / you-replied / unread-reply) the
+// dot color carries the signal. Returns the dot class so callers can
+// assert green | amber | signal | gray (mapping to you-replied |
+// waiting-ai | unread-reply | tab-closed/tracking-stopped).
+const lifecycleStateFor = async (sidepanel: Page, providerSlug: string): Promise<string> => {
+  const dot = sidepanel
     .locator('.thread')
     .filter({ has: sidepanel.locator(`.provider.${providerSlug}`) })
     .first()
-    .locator('.lifecycle-pill');
-  await pill.first().waitFor({ state: 'visible', timeout: 10_000 });
-  const text = (await pill.first().textContent())?.trim() ?? '';
-  return text;
+    .locator('.row2 .dot')
+    .first();
+  await dot.waitFor({ state: 'attached', timeout: 10_000 });
+  const cls = (await dot.getAttribute('class')) ?? '';
+  // The dot has 'dot <state>' — pick the state class name.
+  for (const candidate of ['signal', 'amber', 'green', 'gray']) {
+    if (cls.split(/\s+/u).includes(candidate)) return candidate;
+  }
+  return cls.trim();
 };
 
 type CaptureFn = () => Promise<CapturedThread | null>;
@@ -243,7 +253,7 @@ test.describe('live status transitions (logged-in profile)', () => {
         // strategy below recovers from that automatically.
         const t0Thread = await captureAndFetch();
         await sidepanel.getByRole('tab', { name: 'All threads' }).click();
-        const t0Pill = await lifecycleLabelFor(sidepanel, provider.expectedProvider);
+        const t0Pill = await lifecycleStateFor(sidepanel, provider.expectedProvider);
         console.warn(
           `[${provider.expectedProvider}] T0 pill=${JSON.stringify(t0Pill)} ` +
             `lastTurnRole=${t0Thread?.lastTurnRole ?? '(none)'} title=${JSON.stringify(t0Thread?.title ?? '(none)')}`,
@@ -301,25 +311,26 @@ test.describe('live status transitions (logged-in profile)', () => {
             `[${provider.expectedProvider}] T1 (skipped) — AI replied before we could observe lastTurnRole=user`,
           );
         } else {
-          const t1Pill = await lifecycleLabelFor(sidepanel, provider.expectedProvider);
+          const t1Pill = await lifecycleStateFor(sidepanel, provider.expectedProvider);
           console.warn(
             `[${provider.expectedProvider}] T1 pill=${JSON.stringify(t1Pill)} ` +
               `lastTurnRole=${t1Thread.lastTurnRole ?? '(none)'}`,
           );
-          // "Waiting on AI" is the natural derivation; "Unread reply"
-          // appears when an earlier auto-capture left a reminder behind
-          // (the reminder takes priority in the lifecycle derivation).
-          expect(t1Pill).toMatch(/Waiting on AI|Unread reply/);
+          // amber = waiting-ai (natural derivation after user turn);
+          // signal = unread-reply (when an earlier auto-capture left a
+          // reminder behind, which takes priority over waiting-ai).
+          expect(t1Pill).toMatch(/^(amber|signal)$/u);
         }
 
         // ── T2: wait for the assistant turn to come back ──
         const t2Thread = await waitForLastTurnRole(captureAndFetch, 'assistant', 90_000);
-        const t2Pill = await lifecycleLabelFor(sidepanel, provider.expectedProvider);
+        const t2Pill = await lifecycleStateFor(sidepanel, provider.expectedProvider);
         console.warn(
           `[${provider.expectedProvider}] T2 pill=${JSON.stringify(t2Pill)} ` +
             `lastTurnRole=${t2Thread.lastTurnRole ?? '(none)'}`,
         );
-        expect(t2Pill).toMatch(/You replied last|Unread reply/);
+        // green = you-replied; signal = unread-reply (reminder seeded).
+        expect(t2Pill).toMatch(/^(green|signal)$/u);
       } finally {
         for (const page of opened) {
           await page.close().catch(() => undefined);
