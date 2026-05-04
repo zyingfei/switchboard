@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Modal } from './Modal';
 import { Icons } from './icons';
+import { SafetyChainSummary, type SafetyCheck } from './SafetyChainSummary';
 
 // Lane the dispatch belongs to — drives the side-effect preview
 // header above the safety chain. The 4 lanes correspond to the
@@ -100,81 +101,45 @@ export function DispatchConfirm({
           — this answers it before they have to click. */}
       <div className="dispatch-side-effect mono">{sideEffectText}</div>
 
-      <div className="safety-chain">
-        {redactedCount > 0 ? (
-          <div className="safety-row signal">
-            <span className="icon-12">{Icons.lock}</span>
-            <div className="safety-text">
-              <div>
-                <strong className="mono">Redaction fired:</strong> {redactedCount} item
-                {redactedCount === 1 ? '' : 's'} removed
-                {redactedKinds.length > 0 ? (
-                  <>
-                    {' '}
-                    — <span className="mono">{redactedKinds.join(', ')}</span>
-                  </>
-                ) : null}
-              </div>
-              <button type="button" className="reveal-link mono">
-                [reveal redacted]
-              </button>
-            </div>
-          </div>
-        ) : (
-          <div className="safety-row green">
-            <span className="icon-12">{Icons.check}</span>
-            <div className="safety-text mono">
-              No PII / API-key patterns detected. Nothing redacted.
-            </div>
-          </div>
-        )}
-
-        <div className="safety-row neutral">
-          <div className="safety-text" style={{ flex: 1 }}>
-            <div className="token-bar-row mono">
-              <span>Token budget</span>
-              <span>
-                {tokenEstimate.toLocaleString()} / {tokenLimit.toLocaleString()}
-              </span>
-            </div>
-            <div className="token-bar">
-              <div
-                className={'token-bar-fill ' + tokenLevel}
-                style={{ width: `${String(Math.min(tokenPct, 100))}%` }}
-              />
-            </div>
-          </div>
-        </div>
-
-        <div className={'safety-row ' + (screenShareActive ? 'signal' : 'green')}>
-          <span className="icon-12">{screenShareActive ? Icons.cast : Icons.check}</span>
-          <div className="safety-text mono">
-            {screenShareActive ? (
-              <>
-                <strong>Screen-share active</strong> — packet contents will be visible to viewers.
-              </>
-            ) : (
-              <>
-                Screen-share <strong>not</strong> active · safe to dispatch.
-              </>
-            )}
-          </div>
-        </div>
-
-        <div className={'safety-row ' + (injectionDetected ? 'signal' : 'green')}>
-          <span className="icon-12">{injectionDetected ? Icons.alert : Icons.check}</span>
-          <div className="safety-text mono">
-            {injectionDetected ? (
-              <>
-                <strong>Captured-page injection detected</strong> — wrapped in{' '}
-                <code>{'<context>...</context>'}</code> markers automatically.
-              </>
-            ) : (
-              <>No prompt-injection patterns in source content.</>
-            )}
-          </div>
-        </div>
-      </div>
+      {(() => {
+        const checks: readonly SafetyCheck[] = [
+          {
+            key: 'redaction',
+            label: 'redaction',
+            status: redactedCount > 0 ? 'warn' : 'ok',
+            detail:
+              redactedCount > 0
+                ? `${String(redactedCount)} span${redactedCount === 1 ? '' : 's'} masked${redactedKinds.length > 0 ? ` — ${redactedKinds.join(', ')}` : ''}`
+                : 'no PII / API-key patterns detected',
+          },
+          {
+            key: 'token-budget',
+            label: 'token budget',
+            status: overBudget ? 'bad' : tokenLevel === 'amber' ? 'warn' : 'ok',
+            detail: `${tokenEstimate.toLocaleString()} / ${tokenLimit.toLocaleString()} (${String(tokenPct)}%)`,
+          },
+          {
+            key: 'screen-share-safe',
+            label: 'screen-share-safe',
+            status: screenShareActive ? 'warn' : 'ok',
+            detail: screenShareActive
+              ? 'screen-share active — contents visible to viewers'
+              : 'no display capture',
+          },
+          {
+            key: 'injection-scrub',
+            label: 'injection scrub',
+            status: injectionDetected ? 'warn' : 'ok',
+            detail: injectionDetected
+              ? 'captured-page injection detected — wrapped in <context>'
+              : 'no suspicious patterns',
+          },
+        ];
+        // Auto-open when any check is non-ok so the user sees the issue
+        // without an extra click.
+        const hasIssue = checks.some((c) => c.status !== 'ok');
+        return <SafetyChainSummary checks={checks} defaultOpen={hasIssue} />;
+      })()}
 
       <details className="preview-details" open>
         <summary>Final packet preview</summary>

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { WorkstreamNode } from '../../../src/workboard';
 import { Modal } from './Modal';
 import {
@@ -15,6 +15,11 @@ import type {
   ThemeMode,
   VaultBucket,
 } from './SettingsV2Sections';
+import {
+  addServer as mcpHostAddServer,
+  listConfiguredServers as mcpHostListServers,
+  removeServer as mcpHostRemoveServer,
+} from '../../../src/mcpHost/registry';
 
 export type SettingsPacketKind = 'research' | 'review' | 'coding' | 'note' | 'other';
 export type SettingsTargetProvider =
@@ -88,6 +93,11 @@ export interface SettingsPanelProps {
   readonly density?: DensityMode;
   readonly onThemeChange?: (mode: ThemeMode) => void;
   readonly onDensityChange?: (mode: DensityMode) => void;
+  // Companion connection — required for service install / import-export /
+  // bucket sections to talk to the live HTTP endpoints. Without these,
+  // those sections degrade to local-only state with TODO logging.
+  readonly companionPort?: number | null;
+  readonly bridgeKey?: string | null;
 }
 
 const PROVIDER_LABELS: Record<keyof SettingsValue['autoSendOptIn'], string> = {
@@ -136,26 +146,38 @@ export function SettingsPanel({
   density,
   onThemeChange,
   onDensityChange,
+  companionPort,
+  bridgeKey,
 }: SettingsPanelProps) {
+  // Helper for companion-backed sections. Returns null on missing
+  // config so callers can fall back gracefully.
+  const callCompanion = async (
+    path: string,
+    init?: RequestInit,
+  ): Promise<Response | null> => {
+    if (
+      companionPort === undefined ||
+      companionPort === null ||
+      bridgeKey === undefined ||
+      bridgeKey === null
+    ) {
+      return null;
+    }
+    try {
+      const headers = new Headers(init?.headers);
+      headers.set('x-bac-bridge-key', bridgeKey);
+      return await fetch(`http://127.0.0.1:${String(companionPort)}${path}`, {
+        ...init,
+        headers,
+      });
+    } catch {
+      return null;
+    }
+  };
   const [serviceInstalled, setServiceInstalled] = useState(false);
   const [serviceRunning] = useState(true);
   const [importDiff, setImportDiff] = useState<ImportDiff | null>(null);
-  const [mcpHosts, setMcpHosts] = useState<readonly McpHost[]>([
-    {
-      id: 'h1',
-      url: 'http://localhost:7331',
-      tokenMasked: 'sb_localhost',
-      role: 'self',
-      online: true,
-    },
-    {
-      id: 'h2',
-      url: 'http://localhost:6277',
-      tokenMasked: 'cc_••••••2f0',
-      role: 'claude-code',
-      online: true,
-    },
-  ]);
+  const [mcpHosts, setMcpHosts] = useState<readonly McpHost[]>([]);
   const [buckets, setBuckets] = useState<readonly VaultBucket[]>([
     {
       id: 'default',
@@ -164,6 +186,101 @@ export function SettingsPanel({
       isDefault: true,
     },
   ]);
+
+  // Hydrate MCP-host list from chrome.storage on mount. Falls back to
+  // empty list when chrome.storage isn't available (jsdom unit tests).
+  useEffect(() => {
+    let cancelled = false;
+    const hydrate = async () => {
+      try {
+        const servers = await mcpHostListServers();
+        if (cancelled) return;
+        setMcpHosts(
+          servers.map((server) => ({
+            id: server.id,
+            url: server.url,
+            tokenMasked:
+              server.bearerToken !== undefined
+                ? server.bearerToken.slice(0, 4) + '••••'
+                : '—',
+            role: server.transport,
+            online: false,
+          })),
+        );
+      } catch {
+        // chrome.storage missing or empty — leave list empty
+      }
+    };
+    void hydrate();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Hydrate service-install state and bucket list from companion.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const svcResponse = await callCompanion('/v1/system/service-status');
+      if (svcResponse?.ok) {
+        try {
+          const body = (await svcResponse.json()) as {
+            readonly data?: { readonly installed?: boolean };
+          };
+          // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled is mutated by the cleanup closure
+          if (cancelled) return;
+          const installed = body.data?.installed;
+          if (typeof installed === 'boolean') {
+            setServiceInstalled(installed);
+          }
+        } catch {
+          // ignore
+        }
+      }
+      const bucketsResponse = await callCompanion('/v1/buckets');
+      if (bucketsResponse?.ok) {
+        try {
+          const body: unknown = await bucketsResponse.json();
+          const items = (
+            body as { readonly data?: { readonly items?: readonly unknown[] } }
+          ).data?.items;
+          if (Array.isArray(items) && items.length > 0) {
+            const validBuckets = items.flatMap((raw) => {
+              if (typeof raw !== 'object' || raw === null) return [];
+              const r = raw as {
+                readonly id?: unknown;
+                readonly label?: unknown;
+                readonly vaultRoot?: unknown;
+              };
+              if (
+                typeof r.id !== 'string' ||
+                typeof r.label !== 'string' ||
+                typeof r.vaultRoot !== 'string'
+              ) {
+                return [];
+              }
+              return [
+                {
+                  id: r.id,
+                  rule: r.label,
+                  vaultPath: r.vaultRoot,
+                  isDefault: r.id === 'default',
+                },
+              ];
+            });
+            if (validBuckets.length > 0) {
+              setBuckets(validBuckets);
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [companionPort, bridgeKey]);
   const initial: SettingsValue = settings ?? {
     autoSendOptIn: { chatgpt: false, claude: false, gemini: false },
     defaultPacketKind: 'research',
@@ -576,34 +693,98 @@ export function SettingsPanel({
         installed={serviceInstalled}
         running={serviceRunning}
         onInstall={() => {
-          // TODO(PR-#77 wiring): POST /v1/system/install-service via companion
           setServiceInstalled(true);
+          void callCompanion('/v1/system/install-service', { method: 'POST' }).then(
+            (resp) => {
+              if (!resp?.ok) {
+                setServiceInstalled(false);
+              }
+            },
+          );
         }}
         onUninstall={() => {
-          // TODO(PR-#77 wiring): POST /v1/system/uninstall-service
           setServiceInstalled(false);
+          void callCompanion('/v1/system/uninstall-service', { method: 'POST' });
         }}
       />
       <ImportExportSection
         onExport={() => {
-          // TODO(PR-#77 wiring): GET /v1/settings/export → trigger download
+          void (async () => {
+            const resp = await callCompanion('/v1/settings/export');
+            if (!resp?.ok) return;
+            const blob = await resp.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `sidetrack-config-${new Date().toISOString().slice(0, 10)}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+          })();
         }}
         onChooseImportFile={() => {
-          // Stub diff so the user can see the diff card. Real wiring
-          // POSTs the file to /v1/settings/import?dryRun=true.
-          setImportDiff({
-            added: ['provider.gemini.auto-send  false → true'],
-            removed: [],
-            changed: ['vault.path  ~/Documents/Sidetrack-vault'],
-            conflicts: 0,
-          });
+          // Open a file picker; on selection, POST to /v1/settings/import
+          // with dryRun=true to fetch the diff preview before applying.
+          const input = document.createElement('input');
+          input.type = 'file';
+          input.accept = 'application/json';
+          input.onchange = () => {
+            const file = input.files?.[0];
+            if (file === undefined) return;
+            void (async () => {
+              const text = await file.text();
+              const resp = await callCompanion('/v1/settings/import?dryRun=true', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: text,
+              });
+              if (!resp?.ok) {
+                // Fall back to a synthetic diff so the user still sees the surface.
+                setImportDiff({
+                  added: ['(companion unreachable — preview unavailable)'],
+                  removed: [],
+                  changed: [],
+                  conflicts: 0,
+                });
+                return;
+              }
+              try {
+                const body = (await resp.json()) as {
+                  readonly data?: {
+                    readonly added?: readonly string[];
+                    readonly removed?: readonly string[];
+                    readonly changed?: readonly string[];
+                    readonly conflicts?: number;
+                  };
+                };
+                setImportDiff({
+                  added: body.data?.added ?? [],
+                  removed: body.data?.removed ?? [],
+                  changed: body.data?.changed ?? [],
+                  conflicts: body.data?.conflicts ?? 0,
+                });
+              } catch {
+                setImportDiff({
+                  added: [],
+                  removed: [],
+                  changed: [],
+                  conflicts: 0,
+                });
+              }
+            })();
+          };
+          input.click();
         }}
         diff={importDiff}
         onCancelImport={() => {
           setImportDiff(null);
         }}
         onApplyImport={() => {
-          // TODO(PR-#77 wiring): POST /v1/settings/import (commit)
+          // The file content was already POSTed in dry-run; we'd need to
+          // re-send it without dryRun. For the first cut, just clear the
+          // diff and let the user re-import with confirm. A persistent
+          // file-handle would let us POST committed; that's a follow-up.
           setImportDiff(null);
         }}
       />
@@ -611,37 +792,70 @@ export function SettingsPanel({
         hosts={mcpHosts}
         onRemove={(id) => {
           setMcpHosts((prev) => prev.filter((h) => h.id !== id));
+          void mcpHostRemoveServer(id).catch(() => undefined);
         }}
         onAdd={(input) => {
-          // TODO(PR-#78 wiring): persist via mcpHost.registry
+          const id = `h${String(Date.now())}`;
           setMcpHosts((prev) => [
             ...prev,
             {
-              id: `h${String(Date.now())}`,
+              id,
               url: input.url,
               tokenMasked: input.token.slice(0, 4) + '••••',
-              role: 'unknown',
+              role: 'http',
               online: false,
             },
           ]);
+          void mcpHostAddServer({
+            id,
+            url: input.url,
+            transport: 'http',
+            bearerToken: input.token,
+          }).catch(() => undefined);
         }}
       />
       <BucketsSection
         buckets={buckets}
         onRemove={(id) => {
-          setBuckets((prev) => prev.filter((b) => b.id !== id));
+          const next = buckets.filter((b) => b.id !== id);
+          setBuckets(next);
+          void callCompanion('/v1/buckets', {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              buckets: next.map((b) => ({
+                id: b.id,
+                label: b.rule,
+                vaultRoot: b.vaultPath,
+                matchers: [],
+              })),
+            }),
+          });
         }}
         onAddBucket={() => {
-          // TODO(PR-#78 wiring): open a bucket-create dialog and PUT /v1/buckets
-          setBuckets((prev) => [
-            ...prev,
+          const id = `b${String(Date.now())}`;
+          const next = [
+            ...buckets,
             {
-              id: `b${String(Date.now())}`,
+              id,
               rule: 'workstream:new-bucket',
-              vaultPath: '~/Documents/new-vault',
+              vaultPath: localPreferences.vaultPath || '~/Documents/Sidetrack-vault',
               isDefault: false,
             },
-          ]);
+          ];
+          setBuckets(next);
+          void callCompanion('/v1/buckets', {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              buckets: next.map((b) => ({
+                id: b.id,
+                label: b.rule,
+                vaultRoot: b.vaultPath,
+                matchers: [],
+              })),
+            }),
+          });
         }}
       />
 

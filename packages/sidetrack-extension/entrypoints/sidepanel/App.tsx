@@ -36,8 +36,13 @@ import {
   type SettingsValue,
   SystemBannersStack,
   UpdateBanner,
+  CodingOfferBanner,
   HealthPanel,
   DesignPreview,
+  WorkstreamDetailPanel,
+  type LinkedNote,
+  type TrustEntry,
+  type TrustTool,
   type ThemeMode,
   type DensityMode,
   TabRecovery,
@@ -59,6 +64,11 @@ import { createSettingsClient } from '../../src/settings/client';
 import { isProviderWithOptIn, type SettingsDocument } from '../../src/settings/types';
 import { createTurnsClient, type CapturedTurnRecord } from '../../src/turns/client';
 import { deriveLifecycle } from '../../src/sidepanel/lifecycle';
+import {
+  listPendingOffers,
+  markStatus,
+  type OfferRecord,
+} from '../../src/codingAttach/state';
 import './style.css';
 
 const TARGET_PROVIDER_LABEL: Record<string, string> = {
@@ -385,6 +395,86 @@ const App = () => {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [healthPanelOpen, setHealthPanelOpen] = useState(false);
   const [designPreviewOpen, setDesignPreviewOpen] = useState(false);
+  const [workstreamDetailOpen, setWorkstreamDetailOpen] = useState(false);
+  const [workstreamDetailLinkedNotes, setWorkstreamDetailLinkedNotes] = useState<
+    readonly LinkedNote[]
+  >([]);
+  const [workstreamDetailTrust, setWorkstreamDetailTrust] = useState<readonly TrustEntry[]>([
+    {
+      tool: 'bac.queue_item',
+      humanLabel: 'queue_item',
+      description: 'queue an outbound follow-up to a provider',
+      allowed: true,
+    },
+    {
+      tool: 'bac.move_item',
+      humanLabel: 'move_item',
+      description: 'move a tracked thread to this workstream',
+      allowed: false,
+    },
+    {
+      tool: 'bac.bump_workstream',
+      humanLabel: 'bump_workstream',
+      description: 'raise priority on a queued ask',
+      allowed: false,
+    },
+    {
+      tool: 'bac.archive_thread',
+      humanLabel: 'archive_thread',
+      description: 'archive a tracked thread',
+      allowed: false,
+    },
+    {
+      tool: 'bac.unarchive_thread',
+      humanLabel: 'unarchive_thread',
+      description: 'restore an archived thread',
+      allowed: false,
+    },
+  ]);
+  const [pendingCodingOffers, setPendingCodingOffers] = useState<readonly OfferRecord[]>([]);
+
+  // Refresh pending coding-session offers from chrome.storage. Driven
+  // by storage events (set by the background detection handler) plus
+  // a one-shot read on mount so we pick up any offers staged before
+  // the panel opened. PR #78 ships the detection writes; offers stay
+  // empty in environments without the background script.
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const offers = await listPendingOffers();
+        if (!cancelled) setPendingCodingOffers(offers);
+      } catch {
+        // chrome.storage missing (e.g., test env) — no banner
+      }
+    };
+    void refresh();
+    const onStorageChanged = (changes: Record<string, chrome.storage.StorageChange>) => {
+      if ('sidetrack.codingAttach.offers' in changes) {
+        void refresh();
+      }
+    };
+    // chrome.storage is undefined in jsdom (unit tests), so guard. The
+    // typedef has it as always-defined globally; the check is real.
+    interface StorageOnChanged {
+      readonly addListener: (
+        cb: (changes: Record<string, chrome.storage.StorageChange>) => void,
+      ) => void;
+      readonly removeListener: (
+        cb: (changes: Record<string, chrome.storage.StorageChange>) => void,
+      ) => void;
+    }
+    const onChanged: StorageOnChanged | null =
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+      typeof chrome.storage?.onChanged?.addListener === 'function'
+        ? (chrome.storage.onChanged)
+        : null;
+    onChanged?.addListener(onStorageChanged);
+    return () => {
+      cancelled = true;
+      onChanged?.removeListener(onStorageChanged);
+    };
+  }, []);
   const [theme, setTheme] = useState<ThemeMode>('auto');
   const [density, setDensity] = useState<DensityMode>('cozy');
 
@@ -2433,6 +2523,55 @@ const App = () => {
             setWsPickerOpen(true);
             setWsPickerCreateMode(true);
           }}
+          onOpenDetail={
+            currentWsId === null
+              ? undefined
+              : () => {
+                  setWorkstreamDetailOpen(true);
+                  // Fire-and-forget linked-notes fetch when companion is
+                  // configured. Empty list is a fine fallback.
+                  if (port.length > 0 && bridgeKey.length > 0) {
+                    void (async () => {
+                      try {
+                        const url = `http://127.0.0.1:${port}/v1/workstreams/${currentWsId}/linked-notes`;
+                        const response = await fetch(url, {
+                          headers: { 'x-bac-bridge-key': bridgeKey },
+                        });
+                        if (!response.ok) return;
+                        const body = (await response.json()) as {
+                          readonly data?: { readonly items?: readonly unknown[] };
+                        };
+                        const items = body.data?.items;
+                        if (!Array.isArray(items)) return;
+                        setWorkstreamDetailLinkedNotes(
+                          items
+                            .filter(
+                              (
+                                item,
+                              ): item is {
+                                readonly notePath: string;
+                                readonly title: string;
+                                readonly updatedAt: string;
+                              } =>
+                                typeof item === 'object' &&
+                                item !== null &&
+                                typeof (item as { readonly notePath?: unknown }).notePath ===
+                                  'string',
+                            )
+                            .map((item, idx) => ({
+                              id: `${item.notePath}-${String(idx)}`,
+                              title: item.title,
+                              relativePath: item.notePath,
+                              editedAt: item.updatedAt,
+                            })),
+                        );
+                      } catch {
+                        // Empty list — UI shows the empty state.
+                      }
+                    })();
+                  }
+                }
+          }
         />
       ) : (
         <div className="ws-bar all-bar">
@@ -2503,6 +2642,43 @@ const App = () => {
           parentForNew={currentWsId}
         />
       ) : null}
+
+      {pendingCodingOffers.length > 0
+        ? (() => {
+            const offer = pendingCodingOffers[0];
+            const surfaceLabel =
+              offer.surface.id === 'codex'
+                ? 'Codex'
+                : offer.surface.id === 'claude_code'
+                  ? 'Claude Code'
+                  : 'Cursor';
+            return (
+              <CodingOfferBanner
+                key={offer.tabId}
+                offer={{
+                  tabId: offer.tabId,
+                  surfaceLabel,
+                  suggestedWorkstreamLabel: currentWsLabel,
+                }}
+                onAccept={() => {
+                  void markStatus(offer.tabId, 'accepted').then(() => {
+                    setPendingCodingOffers((prev) =>
+                      prev.filter((o) => o.tabId !== offer.tabId),
+                    );
+                    setCodingAttachOpen(true);
+                  });
+                }}
+                onDismiss={() => {
+                  void markStatus(offer.tabId, 'declined').then(() => {
+                    setPendingCodingOffers((prev) =>
+                      prev.filter((o) => o.tabId !== offer.tabId),
+                    );
+                  });
+                }}
+              />
+            );
+          })()
+        : null}
 
       <UpdateBanner
         companionPort={port.length > 0 ? Number(port) : null}
@@ -3462,6 +3638,8 @@ const App = () => {
           density={density}
           onThemeChange={setTheme}
           onDensityChange={setDensity}
+          companionPort={port.length > 0 ? Number(port) : null}
+          bridgeKey={bridgeKey.length > 0 ? bridgeKey : null}
         />
       ) : null}
 
@@ -3470,6 +3648,8 @@ const App = () => {
           onClose={() => {
             setHealthPanelOpen(false);
           }}
+          companionPort={port.length > 0 ? Number(port) : null}
+          bridgeKey={bridgeKey.length > 0 ? bridgeKey : null}
         />
       ) : null}
 
@@ -3477,6 +3657,41 @@ const App = () => {
         <DesignPreview
           onClose={() => {
             setDesignPreviewOpen(false);
+          }}
+        />
+      ) : null}
+
+      {workstreamDetailOpen ? (
+        <WorkstreamDetailPanel
+          workstreamLabel={currentWsLabel}
+          linkedNotes={workstreamDetailLinkedNotes}
+          trustEntries={workstreamDetailTrust}
+          onClose={() => {
+            setWorkstreamDetailOpen(false);
+          }}
+          onTrustChange={(tool: TrustTool, next: boolean) => {
+            // Optimistic — update local state immediately. PUT to the
+            // companion is best-effort; revert on failure would need a
+            // request-id pattern not yet in place for this endpoint.
+            setWorkstreamDetailTrust((prev) =>
+              prev.map((entry) => (entry.tool === tool ? { ...entry, allowed: next } : entry)),
+            );
+            if (port.length > 0 && bridgeKey.length > 0 && currentWsId !== null) {
+              const allowedTools = workstreamDetailTrust
+                .map((e) => (e.tool === tool ? { ...e, allowed: next } : e))
+                .filter((e) => e.allowed)
+                .map((e) => e.tool);
+              void fetch(`http://127.0.0.1:${port}/v1/workstreams/${currentWsId}/trust`, {
+                method: 'PUT',
+                headers: {
+                  'x-bac-bridge-key': bridgeKey,
+                  'content-type': 'application/json',
+                },
+                body: JSON.stringify({ allowedTools }),
+              }).catch(() => {
+                // Best-effort — companion may not be running.
+              });
+            }
           }}
         />
       ) : null}
@@ -3495,6 +3710,7 @@ interface WorkstreamBarProps {
   readonly statusLabel: string;
   readonly onOpenPicker: () => void;
   readonly onAddSubWorkstream: () => void;
+  readonly onOpenDetail?: () => void;
 }
 
 function WorkstreamBar({
@@ -3502,6 +3718,7 @@ function WorkstreamBar({
   statusLabel,
   onOpenPicker,
   onAddSubWorkstream,
+  onOpenDetail,
 }: WorkstreamBarProps) {
   return (
     <div className="ws-bar">
@@ -3521,6 +3738,28 @@ function WorkstreamBar({
           <line x1="5" y1="12" x2="19" y2="12" />
         </svg>
       </button>
+      {onOpenDetail !== undefined ? (
+        <button
+          type="button"
+          className="icon-btn"
+          title="Workstream detail — linked notes + MCP write trust"
+          aria-label="Open workstream detail"
+          onClick={onOpenDetail}
+        >
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.6"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <circle cx="12" cy="12" r="2" />
+            <circle cx="12" cy="5" r="2" />
+            <circle cx="12" cy="19" r="2" />
+          </svg>
+        </button>
+      ) : null}
       <span className="ws-status mono">{statusLabel}</span>
       <span className="swap-arrow" aria-hidden>
         ↓
