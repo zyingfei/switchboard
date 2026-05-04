@@ -1,27 +1,43 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { readFile, readdir } from 'node:fs/promises';
+import { access, readFile, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { bridgeKeysMatch } from '../auth/bridgeKey.js';
+import { isBridgeKeyAccepted, rotateBridgeKey } from '../auth/bridgeKey.js';
+import {
+  isAllowed,
+  readTrust,
+  writeTrust,
+  type WorkstreamWriteTool,
+} from '../auth/workstreamTrust.js';
 import { createDispatchId, createRequestId, createReviewId } from '../domain/ids.js';
 import { pickInstaller, type Installer } from '../install/index.js';
 import { exportSettings } from '../portability/exportBundle.js';
 import { importSettings } from '../portability/importBundle.js';
 import { embed, MODEL_ID } from '../recall/embedder.js';
-import { appendEntry, readIndex } from '../recall/indexFile.js';
+import { appendEntry, gcEntries, readIndex } from '../recall/indexFile.js';
 import { rank } from '../recall/ranker.js';
 import { rebuildFromEventLog } from '../recall/rebuild.js';
+import type { BucketRegistry } from '../routing/registry.js';
 import { redact } from '../safety/redaction.js';
 import { estimateTokens, tokenBudgetWarningThreshold } from '../safety/tokenBudget.js';
 import { buildSignals, type BuildSignalsWorkstream } from '../suggestions/buildSignals.js';
 import { scoreSuggestions } from '../suggestions/score.js';
+import { runAutoUpdate } from '../system/autoUpdate.js';
+import { collectHealth } from '../system/health.js';
 import { checkLatestVersion, type UpdateAdvisory } from '../system/versionCheck.js';
-import { listAnnotations, writeAnnotation } from '../vault/annotationStore.js';
+import {
+  listAnnotations,
+  softDeleteAnnotation,
+  updateAnnotation,
+  writeAnnotation,
+} from '../vault/annotationStore.js';
 import { scanVaultForLinkedNotes } from '../vault/linkback.js';
+import type { VaultChangeEvent } from '../vault/watcher.js';
 import {
   CodingAttachTokenInvalidError,
   CodingSessionNotFoundError,
   SettingsRevisionConflictError,
+  createVaultWriter,
   type VaultWriter,
 } from '../vault/writer.js';
 import type { IdempotencyStore } from './idempotency.js';
@@ -30,6 +46,7 @@ import { createProblem } from './problem.js';
 import {
   annotationCreateSchema,
   annotationListQuerySchema,
+  annotationUpdateSchema,
   auditListQuerySchema,
   captureEventSchema,
   codingAttachTokenCreateSchema,
@@ -41,6 +58,7 @@ import {
   reminderCreateSchema,
   reminderUpdateSchema,
   recallIndexSchema,
+  recallGcSchema,
   recallQuerySchema,
   reviewEventSchema,
   reviewListQuerySchema,
@@ -50,6 +68,9 @@ import {
   turnsQuerySchema,
   workstreamCreateSchema,
   workstreamUpdateSchema,
+  autoUpdateSchema,
+  bucketsPutSchema,
+  workstreamTrustPutSchema,
 } from './schemas.js';
 
 export interface CompanionHttpConfig {
@@ -59,6 +80,16 @@ export interface CompanionHttpConfig {
   readonly serviceInstaller?: Installer;
   readonly updateChecker?: () => Promise<UpdateAdvisory>;
   readonly idempotencyStore?: IdempotencyStore;
+  readonly allowAutoUpdate?: boolean;
+  readonly startedAt?: Date;
+  readonly bucketRegistry?: BucketRegistry;
+  readonly vaultChanges?: {
+    readonly subscribe: (listener: (event: VaultChangeEvent) => void) => () => void;
+  };
+  readonly hygieneStatus?: {
+    lastIdempotencyGcAt?: string;
+    lastAuditRetentionAt?: string;
+  };
 }
 
 export interface StartedHttpServer {
@@ -68,13 +99,15 @@ export interface StartedHttpServer {
   readonly close: () => Promise<void>;
 }
 
-type HttpMethod = 'GET' | 'POST' | 'PATCH' | 'DELETE';
+type HttpMethod = 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE';
 
 interface RouteMatch {
   readonly workstreamId?: string;
   readonly reminderId?: string;
   readonly codingSessionId?: string;
   readonly threadId?: string;
+  readonly annotationId?: string;
+  readonly bacId?: string;
 }
 
 interface RouteDefinition {
@@ -130,7 +163,7 @@ const readBody = async (request: IncomingMessage): Promise<unknown> => {
 
 const responseHeaders = {
   'access-control-allow-headers': 'content-type,x-bac-bridge-key,idempotency-key',
-  'access-control-allow-methods': 'GET,POST,PATCH,OPTIONS',
+  'access-control-allow-methods': 'GET,POST,PATCH,PUT,DELETE,OPTIONS',
   'access-control-allow-origin': '*',
   'content-type': 'application/json; charset=utf-8',
 };
@@ -291,6 +324,144 @@ const readWorkstreams = async (vaultRoot: string): Promise<readonly BuildSignals
   return workstreams;
 };
 
+const readVaultMarkdown = async (
+  vaultRoot: string,
+  kind: 'threads' | 'workstreams',
+  bacId: string,
+): Promise<{ readonly path: string; readonly content: string }> => {
+  const path = join(vaultRoot, '_BAC', kind, `${bacId}.md`);
+  const info = await stat(path);
+  // Raw Markdown reads are capped at 10 MiB because coding agents have token
+  // budgets and this endpoint returns the body verbatim.
+  if (info.size > 10 * 1024 * 1024) {
+    throw new HttpRouteError(413, 'PAYLOAD_TOO_LARGE', 'Markdown file is too large.');
+  }
+  return { path, content: await readFile(path, 'utf8') };
+};
+
+const writerForBucket = async (
+  context: CompanionHttpConfig,
+  input: { readonly workstreamId?: string; readonly provider?: string; readonly url?: string },
+): Promise<VaultWriter> => {
+  const bucket = await context.bucketRegistry?.pickBucket(input);
+  return bucket === undefined || bucket.vaultRoot === context.vaultRoot
+    ? context.vaultWriter
+    : createVaultWriter(bucket.vaultRoot);
+};
+
+const requireWorkstreamTrust = async (
+  context: CompanionHttpConfig,
+  workstreamId: string | undefined,
+  tool: WorkstreamWriteTool,
+): Promise<void> => {
+  if (workstreamId === undefined || context.vaultRoot === undefined) {
+    return;
+  }
+  if (!isAllowed(workstreamId, tool, await readTrust(context.vaultRoot))) {
+    throw new HttpRouteError(
+      403,
+      'WORKSTREAM_NOT_TRUSTED',
+      'Workstream has not trusted this MCP write tool.',
+      `${tool} is not allowed for workstream ${workstreamId}.`,
+    );
+  }
+};
+
+const mcpToolHeader = (request: IncomingMessage): WorkstreamWriteTool | undefined => {
+  const value = request.headers['x-sidetrack-mcp-tool'];
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  return (
+    ['bac.move_item', 'bac.queue_item', 'bac.bump_workstream', 'bac.archive_thread', 'bac.unarchive_thread'] as const
+  ).find((tool) => tool === value);
+};
+
+const directorySize = async (path: string): Promise<number> => {
+  const info = await stat(path);
+  if (!info.isDirectory()) {
+    return info.size;
+  }
+  const names = await readdir(path).catch(() => []);
+  const sizes = await Promise.all(names.map((name) => directorySize(join(path, name)).catch(() => 0)));
+  return sizes.reduce((sum, size) => sum + size, 0);
+};
+
+const recentCaptureByProvider = async (
+  vaultRoot: string,
+): Promise<Record<string, string | null>> => {
+  const root = join(vaultRoot, '_BAC', 'events');
+  const names = await readdir(root).catch(() => []);
+  const last: Record<string, string | null> = {};
+  for (const name of names.filter((candidate) => candidate.endsWith('.jsonl')).sort().reverse().slice(0, 14)) {
+    const raw = await readFile(join(root, name), 'utf8').catch(() => '');
+    for (const line of raw.split('\n')) {
+      try {
+        const event = JSON.parse(line) as { readonly provider?: unknown; readonly capturedAt?: unknown };
+        if (typeof event.provider === 'string' && typeof event.capturedAt === 'string') {
+          const existing = last[event.provider];
+          if (existing === undefined || existing === null || existing < event.capturedAt) {
+            last[event.provider] = event.capturedAt;
+          }
+        }
+      } catch {
+        // Ignore malformed event-log rows for health reporting.
+      }
+    }
+  }
+  return last;
+};
+
+const readThreadWorkstreamId = async (
+  vaultRoot: string,
+  threadId: string,
+): Promise<string | undefined> => {
+  try {
+    const parsed = JSON.parse(
+      await readFile(join(vaultRoot, '_BAC', 'threads', `${threadId}.json`), 'utf8'),
+    ) as { readonly primaryWorkstreamId?: unknown };
+    return typeof parsed.primaryWorkstreamId === 'string' ? parsed.primaryWorkstreamId : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const objectRecord = (value: unknown): Record<string, unknown> | undefined =>
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+
+const parseThreadUpsertBody = async (vaultRoot: string, body: unknown) => {
+  const full = threadUpsertSchema.safeParse(body);
+  if (full.success) {
+    return full.data;
+  }
+  const record = objectRecord(body);
+  const bacId = record?.['bac_id'];
+  if (typeof bacId !== 'string') {
+    return threadUpsertSchema.parse(body);
+  }
+  const existing = objectRecord(
+    JSON.parse(await readFile(join(vaultRoot, '_BAC', 'threads', `${bacId}.json`), 'utf8')) as unknown,
+  );
+  if (existing === undefined) {
+    return threadUpsertSchema.parse(body);
+  }
+  const rawWorkstreamId = record?.['primaryWorkstreamId'];
+  return threadUpsertSchema.parse({
+    ...existing,
+    bac_id: bacId,
+    ...(rawWorkstreamId === null
+      ? { primaryWorkstreamId: undefined }
+      : typeof rawWorkstreamId === 'string'
+        ? { primaryWorkstreamId: rawWorkstreamId }
+        : {}),
+    lastSeenAt:
+      typeof existing['lastSeenAt'] === 'string' ? existing['lastSeenAt'] : new Date().toISOString(),
+    title: typeof existing['title'] === 'string' ? existing['title'] : bacId,
+  });
+};
+
 const routes: readonly RouteDefinition[] = [
   {
     method: 'GET',
@@ -309,6 +480,12 @@ const routes: readonly RouteDefinition[] = [
   },
   {
     method: 'GET',
+    pattern: /^\/v1\/vault\/changes$/,
+    authRequired: true,
+    handle: () => Promise.resolve([500, { data: { error: 'stream route was not intercepted' } }]),
+  },
+  {
+    method: 'GET',
     pattern: /^\/v1\/system\/service-status$/,
     authRequired: true,
     handle: async (_request, _requestId, _match, context) => [
@@ -324,6 +501,117 @@ const routes: readonly RouteDefinition[] = [
       200,
       { data: await (context.updateChecker ?? (() => checkLatestVersion('0.0.0')))() },
     ],
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/system\/auto-update$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      if (context.allowAutoUpdate !== true) {
+        throw new HttpRouteError(
+          403,
+          'AUTO_UPDATE_DISABLED',
+          'Auto-update is disabled.',
+          'Start the companion with --allow-auto-update before invoking this endpoint.',
+        );
+      }
+      const input = autoUpdateSchema.parse(await readBody(request));
+      return [
+        200,
+        {
+          data: await runAutoUpdate({
+            confirm: input.confirm,
+            currentVersion: '0.0.0',
+          }),
+        },
+      ];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/system\/health$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      const indexPath = recallIndexPath(vaultRoot);
+      return [
+        200,
+        {
+          data: await collectHealth({
+            startedAt: context.startedAt ?? new Date(),
+            vaultRoot,
+            vaultWritable: async () => {
+              try {
+                await access(vaultRoot);
+                return true;
+              } catch {
+                return false;
+              }
+            },
+            vaultSizeBytes: () => directorySize(join(vaultRoot, '_BAC')).catch(() => null),
+            captureSummary: async () => ({
+              lastByProvider: await recentCaptureByProvider(vaultRoot),
+              queueDepthHint: null,
+              droppedHint: null,
+            }),
+            recallSummary: async () => {
+              const [index, info] = await Promise.all([
+                readIndex(indexPath),
+                stat(indexPath).catch(() => undefined),
+              ]);
+              return {
+                indexExists: index !== null,
+                entryCount: index?.items.length ?? null,
+                modelId: index?.modelId ?? null,
+                sizeBytes: info?.size ?? null,
+              };
+            },
+            serviceStatus: async () => {
+              const status = await (context.serviceInstaller ?? pickInstaller()).status();
+              return { installed: status.installed, running: status.running };
+            },
+          }),
+        },
+      ];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/system\/hygiene-status$/,
+    authRequired: true,
+    handle: (_request, _requestId, _match, context) =>
+      Promise.resolve([200, { data: context.hygieneStatus ?? {} }]),
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/auth\/rotate-bridge-key$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => [
+      200,
+      { data: await rotateBridgeKey(requireVaultRoot(context), context.bridgeKey) },
+    ],
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/buckets$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => [
+      200,
+      { items: await context.bucketRegistry?.readBuckets() ?? [] },
+    ],
+  },
+  {
+    method: 'PUT',
+    pattern: /^\/v1\/buckets$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      if (context.bucketRegistry === undefined) {
+        throw new Error('Bucket registry is unavailable.');
+      }
+      const input = bucketsPutSchema.parse(await readBody(request));
+      await context.bucketRegistry.writeBuckets(input.buckets);
+      return [200, { items: await context.bucketRegistry.readBuckets() }];
+    },
   },
   {
     method: 'GET',
@@ -369,9 +657,13 @@ const routes: readonly RouteDefinition[] = [
       const idempotencyKey = requireIdempotencyKey(request);
       return await runIdempotent(context, 'recordDispatch', idempotencyKey, async () => {
         const input = dispatchEventSchema.parse(await readBody(request));
+        const writer = await writerForBucket(context, {
+          provider: input.target.provider,
+          ...(input.workstreamId === undefined ? {} : { workstreamId: input.workstreamId }),
+        });
         const redaction = redact(input.body);
         const tokenEstimate = estimateTokens(redaction.output);
-        const result = await context.vaultWriter.writeDispatchEvent(
+        const result = await writer.writeDispatchEvent(
           {
             ...input,
             bac_id: input.bac_id ?? createDispatchId(),
@@ -511,12 +803,40 @@ const routes: readonly RouteDefinition[] = [
       const url = new URL(request.url ?? '/', 'http://127.0.0.1');
       const query = annotationListQuerySchema.parse({
         url: url.searchParams.get('url') ?? undefined,
+        includeDeleted: url.searchParams.get('includeDeleted') ?? undefined,
         limit: url.searchParams.get('limit') ?? undefined,
       });
       const annotations = await listAnnotations(context.vaultRoot, {
         ...(query.url === undefined ? {} : { url: query.url }),
+        includeDeleted: query.includeDeleted,
       });
       return [200, { data: annotations.slice(0, query.limit) }];
+    },
+  },
+  {
+    method: 'PATCH',
+    pattern: /^\/v1\/annotations\/(?<annotationId>[A-Za-z0-9_-]+)$/,
+    authRequired: true,
+    handle: async (request, _requestId, match, context) => {
+      if (match.annotationId === undefined) {
+        throw new Error('Missing annotationId path parameter.');
+      }
+      const input = annotationUpdateSchema.parse(await readBody(request));
+      return [
+        200,
+        { data: await updateAnnotation(requireVaultRoot(context), match.annotationId, input) },
+      ];
+    },
+  },
+  {
+    method: 'DELETE',
+    pattern: /^\/v1\/annotations\/(?<annotationId>[A-Za-z0-9_-]+)$/,
+    authRequired: true,
+    handle: async (_request, _requestId, match, context) => {
+      if (match.annotationId === undefined) {
+        throw new Error('Missing annotationId path parameter.');
+      }
+      return [200, { data: await softDeleteAnnotation(requireVaultRoot(context), match.annotationId) }];
     },
   },
   {
@@ -606,6 +926,18 @@ const routes: readonly RouteDefinition[] = [
     },
   },
   {
+    method: 'POST',
+    pattern: /^\/v1\/recall\/gc$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const input = recallGcSchema.parse(await readBody(request));
+      return [
+        200,
+        { data: await gcEntries(recallIndexPath(requireVaultRoot(context)), new Set(input.validIds)) },
+      ];
+    },
+  },
+  {
     method: 'GET',
     pattern: /^\/v1\/suggestions\/thread\/(?<threadId>[A-Za-z0-9_-]+)$/,
     authRequired: true,
@@ -640,7 +972,11 @@ const routes: readonly RouteDefinition[] = [
       const idempotencyKey = requireIdempotencyKey(request);
       return await runIdempotent(context, 'appendEvent', idempotencyKey, async () => {
         const input = captureEventSchema.parse(await readBody(request));
-        const result = await context.vaultWriter.writeCaptureEvent(input, requestId);
+        const writer = await writerForBucket(context, {
+          provider: input.provider,
+          url: input.threadUrl,
+        });
+        const result = await writer.writeCaptureEvent(input, requestId);
         return [201, mutationResponse(result, requestId)];
       });
     },
@@ -650,9 +986,60 @@ const routes: readonly RouteDefinition[] = [
     pattern: /^\/v1\/threads$/,
     authRequired: true,
     handle: async (request, requestId, _match, context) => {
-      const input = threadUpsertSchema.parse(await readBody(request));
+      const input = await parseThreadUpsertBody(requireVaultRoot(context), await readBody(request));
+      const tool = mcpToolHeader(request);
+      if (tool === 'bac.move_item') {
+        await requireWorkstreamTrust(context, input.primaryWorkstreamId, tool);
+      }
       const result = await context.vaultWriter.upsertThread(input, requestId);
       return [200, mutationResponse(result, requestId)];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/threads\/(?<bacId>[A-Za-z0-9_-]+)\/markdown$/,
+    authRequired: true,
+    handle: async (_request, _requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing bacId path parameter.');
+      }
+      return [200, await readVaultMarkdown(requireVaultRoot(context), 'threads', match.bacId)];
+    },
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/threads\/(?<bacId>[A-Za-z0-9_-]+)\/archive$/,
+    authRequired: true,
+    handle: async (_request, requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing bacId path parameter.');
+      }
+      if (mcpToolHeader(_request) === 'bac.archive_thread') {
+        await requireWorkstreamTrust(
+          context,
+          await readThreadWorkstreamId(requireVaultRoot(context), match.bacId),
+          'bac.archive_thread',
+        );
+      }
+      return [200, mutationResponse(await context.vaultWriter.archiveThread(match.bacId, requestId), requestId)];
+    },
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/threads\/(?<bacId>[A-Za-z0-9_-]+)\/unarchive$/,
+    authRequired: true,
+    handle: async (_request, requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing bacId path parameter.');
+      }
+      if (mcpToolHeader(_request) === 'bac.unarchive_thread') {
+        await requireWorkstreamTrust(
+          context,
+          await readThreadWorkstreamId(requireVaultRoot(context), match.bacId),
+          'bac.unarchive_thread',
+        );
+      }
+      return [200, mutationResponse(await context.vaultWriter.unarchiveThread(match.bacId, requestId), requestId)];
     },
   },
   {
@@ -663,6 +1050,74 @@ const routes: readonly RouteDefinition[] = [
       const input = workstreamCreateSchema.parse(await readBody(request));
       const result = await context.vaultWriter.createWorkstream(input, requestId);
       return [201, mutationResponse(result, requestId)];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/workstreams\/(?<bacId>[A-Za-z0-9_-]+)\/markdown$/,
+    authRequired: true,
+    handle: async (_request, _requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing bacId path parameter.');
+      }
+      return [200, await readVaultMarkdown(requireVaultRoot(context), 'workstreams', match.bacId)];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/workstreams\/(?<workstreamId>[A-Za-z0-9_-]+)\/trust$/,
+    authRequired: true,
+    handle: async (_request, _requestId, match, context) => {
+      if (match.workstreamId === undefined) {
+        throw new Error('Missing workstreamId path parameter.');
+      }
+      const record = (await readTrust(requireVaultRoot(context))).find(
+        (item) => item.workstreamId === match.workstreamId,
+      );
+      return [
+        200,
+        {
+          data: {
+            workstreamId: match.workstreamId,
+            allowedTools: record === undefined ? [] : [...record.allowedTools],
+          },
+        },
+      ];
+    },
+  },
+  {
+    method: 'PUT',
+    pattern: /^\/v1\/workstreams\/(?<workstreamId>[A-Za-z0-9_-]+)\/trust$/,
+    authRequired: true,
+    handle: async (request, _requestId, match, context) => {
+      if (match.workstreamId === undefined) {
+        throw new Error('Missing workstreamId path parameter.');
+      }
+      const input = workstreamTrustPutSchema.parse(await readBody(request));
+      const vaultRoot = requireVaultRoot(context);
+      const current = await readTrust(vaultRoot);
+      await writeTrust(vaultRoot, [
+        ...current.filter((record) => record.workstreamId !== match.workstreamId),
+        { workstreamId: match.workstreamId, allowedTools: new Set(input.allowedTools) },
+      ]);
+      return [
+        200,
+        { data: { workstreamId: match.workstreamId, allowedTools: input.allowedTools } },
+      ];
+    },
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/workstreams\/(?<bacId>[A-Za-z0-9_-]+)\/bump$/,
+    authRequired: true,
+    handle: async (_request, requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing bacId path parameter.');
+      }
+      if (mcpToolHeader(_request) === 'bac.bump_workstream') {
+        await requireWorkstreamTrust(context, match.bacId, 'bac.bump_workstream');
+      }
+      return [200, mutationResponse(await context.vaultWriter.bumpWorkstream(match.bacId, requestId), requestId)];
     },
   },
   {
@@ -708,6 +1163,10 @@ const routes: readonly RouteDefinition[] = [
       const idempotencyKey = requireIdempotencyKey(request);
       return await runIdempotent(context, 'createQueueItem', idempotencyKey, async () => {
         const input = queueCreateSchema.parse(await readBody(request));
+        const tool = mcpToolHeader(request);
+        if (tool === 'bac.queue_item' && input.scope === 'workstream') {
+          await requireWorkstreamTrust(context, input.targetId, tool);
+        }
         const result = await context.vaultWriter.createQueueItem(input, requestId);
         return [201, mutationResponse(result, requestId)];
       });
@@ -842,7 +1301,10 @@ export const handleRequest = async (
 
   if (route.authRequired) {
     const actualKey = request.headers['x-bac-bridge-key'];
-    if (typeof actualKey !== 'string' || !bridgeKeysMatch(context.bridgeKey, actualKey)) {
+    if (
+      typeof actualKey !== 'string' ||
+      !(await isBridgeKeyAccepted(context.vaultRoot, context.bridgeKey, actualKey))
+    ) {
       sendJson(
         response,
         401,
@@ -855,6 +1317,29 @@ export const handleRequest = async (
       );
       return;
     }
+  }
+
+  if (method === 'GET' && url.pathname === '/v1/vault/changes') {
+    response.writeHead(200, {
+      'access-control-allow-origin': '*',
+      'cache-control': 'no-store',
+      connection: 'keep-alive',
+      'content-type': 'text/event-stream; charset=utf-8',
+    });
+    response.write(': sidetrack vault changes connected\n\n');
+    const heartbeat = setInterval(() => {
+      response.write(': heartbeat\n\n');
+    }, 25_000);
+    const unsubscribe =
+      context.vaultChanges?.subscribe((event) => {
+        response.write(`data: ${JSON.stringify(event)}\n\n`);
+      }) ?? (() => undefined);
+    request.on('close', () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+      response.end();
+    });
+    return;
   }
 
   try {

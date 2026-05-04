@@ -1,16 +1,20 @@
 import { ensureBridgeKey } from '../auth/bridgeKey.js';
 import { createIdempotencyStore } from '../http/idempotency.js';
 import { pickInstaller } from '../install/index.js';
+import { createBucketRegistry } from '../routing/registry.js';
 import {
   createCompanionHttpServer,
   startHttpServer,
   type StartedHttpServer,
 } from '../http/server.js';
+import { enforceRetention } from '../vault/auditRetention.js';
+import { createVaultWatcher, type VaultChangeEvent, type VaultWatcher } from '../vault/watcher.js';
 import { createVaultWriter } from '../vault/writer.js';
 
 export interface CompanionRuntimeOptions {
   readonly vaultPath: string;
   readonly port: number;
+  readonly allowAutoUpdate?: boolean;
 }
 
 export interface CompanionRuntime {
@@ -27,12 +31,49 @@ export const startCompanion = async (
 ): Promise<CompanionRuntime> => {
   const ensured = await ensureBridgeKey(options.vaultPath);
   const vaultWriter = createVaultWriter(options.vaultPath);
+  const idempotencyStore = createIdempotencyStore(options.vaultPath);
+  const listeners = new Set<(event: VaultChangeEvent) => void>();
+  let watcher: VaultWatcher | undefined;
+  try {
+    watcher = createVaultWatcher(options.vaultPath, {
+      onChange: (event) => {
+        for (const listener of listeners) {
+          listener(event);
+        }
+      },
+    });
+  } catch {
+    watcher = undefined;
+  }
+  const hygieneStatus: { lastIdempotencyGcAt?: string; lastAuditRetentionAt?: string } = {};
+  const idempotencyGc = setInterval(() => {
+    void idempotencyStore.gcExpired?.(new Date()).then(() => {
+      hygieneStatus.lastIdempotencyGcAt = new Date().toISOString();
+    });
+  }, 60 * 60 * 1000);
+  const auditRetention = setInterval(() => {
+    void enforceRetention(options.vaultPath).then(() => {
+      hygieneStatus.lastAuditRetentionAt = new Date().toISOString();
+    });
+  }, 24 * 60 * 60 * 1000);
   const server = createCompanionHttpServer({
     bridgeKey: ensured.key,
     vaultWriter,
     vaultRoot: options.vaultPath,
     serviceInstaller: pickInstaller(),
-    idempotencyStore: createIdempotencyStore(options.vaultPath),
+    idempotencyStore,
+    allowAutoUpdate: options.allowAutoUpdate ?? false,
+    startedAt: new Date(),
+    bucketRegistry: createBucketRegistry(options.vaultPath),
+    hygieneStatus,
+    vaultChanges: {
+      subscribe(listener) {
+        listeners.add(listener);
+        return () => {
+          listeners.delete(listener);
+        };
+      },
+    },
   });
   const started: StartedHttpServer = await startHttpServer(server, options.port);
 
@@ -42,6 +83,11 @@ export const startCompanion = async (
     bridgeKey: ensured.key,
     bridgeKeyPath: ensured.path,
     bridgeKeyCreated: ensured.created,
-    close: started.close,
+    close: async () => {
+      clearInterval(idempotencyGc);
+      clearInterval(auditRetention);
+      await watcher?.close();
+      await started.close();
+    },
   };
 };

@@ -96,6 +96,32 @@ const createCompanionWriteClient = (
     }
     return (await response.json()) as TResult;
   };
+  const patch = async <TResult>(path: string, body: unknown): Promise<TResult> => {
+    const response = await fetch(`${base}${path}`, {
+      method: 'PATCH',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      throw new Error(`Companion ${path} failed (${String(response.status)}): ${detail}`);
+    }
+    return (await response.json()) as TResult;
+  };
+  const del = async <TResult>(path: string): Promise<TResult> => {
+    const response = await fetch(`${base}${path}`, {
+      method: 'DELETE',
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      throw new Error(`Companion ${path} failed (${String(response.status)}): ${detail}`);
+    }
+    return (await response.json()) as TResult;
+  };
   const getDataArray = async (
     path: string,
     params: URLSearchParams = new URLSearchParams(),
@@ -181,7 +207,7 @@ const createCompanionWriteClient = (
       };
       const body = await post<{
         readonly data?: { readonly bac_id?: string; readonly revision?: string };
-      }>('/v1/threads', upsert);
+      }>('/v1/threads', upsert, { 'x-sidetrack-mcp-tool': 'bac.move_item' });
       if (typeof body.data?.bac_id !== 'string' || typeof body.data.revision !== 'string') {
         throw new Error('Companion did not return bac_id + revision for the moved thread.');
       }
@@ -191,6 +217,7 @@ const createCompanionWriteClient = (
       const body = await post<{
         readonly data?: { readonly bac_id?: string; readonly revision?: string };
       }>('/v1/queue', input, {
+        'x-sidetrack-mcp-tool': 'bac.queue_item',
         'idempotency-key': idempotencyKey(
           'mcp-queue',
           `${input.scope}-${input.targetId ?? 'global'}-${input.text}`,
@@ -200,6 +227,52 @@ const createCompanionWriteClient = (
         throw new Error('Companion did not return bac_id + revision for the queued item.');
       }
       return { bac_id: body.data.bac_id, revision: body.data.revision };
+    },
+    async bumpWorkstream(input) {
+      const body = await post<{
+        readonly data?: { readonly bac_id?: string; readonly revision?: string };
+      }>(`/v1/workstreams/${encodeURIComponent(input.bac_id)}/bump`, {}, {
+        'x-sidetrack-mcp-tool': 'bac.bump_workstream',
+      });
+      if (typeof body.data?.bac_id !== 'string' || typeof body.data.revision !== 'string') {
+        throw new Error('Companion did not return bac_id + revision for bumped workstream.');
+      }
+      return { bac_id: body.data.bac_id, revision: body.data.revision };
+    },
+    async archiveThread(input) {
+      const body = await post<{
+        readonly data?: { readonly bac_id?: string; readonly revision?: string };
+      }>(`/v1/threads/${encodeURIComponent(input.bac_id)}/archive`, {}, {
+        'x-sidetrack-mcp-tool': 'bac.archive_thread',
+      });
+      if (typeof body.data?.bac_id !== 'string' || typeof body.data.revision !== 'string') {
+        throw new Error('Companion did not return bac_id + revision for archived thread.');
+      }
+      return { bac_id: body.data.bac_id, revision: body.data.revision };
+    },
+    async unarchiveThread(input) {
+      const body = await post<{
+        readonly data?: { readonly bac_id?: string; readonly revision?: string };
+      }>(`/v1/threads/${encodeURIComponent(input.bac_id)}/unarchive`, {}, {
+        'x-sidetrack-mcp-tool': 'bac.unarchive_thread',
+      });
+      if (typeof body.data?.bac_id !== 'string' || typeof body.data.revision !== 'string') {
+        throw new Error('Companion did not return bac_id + revision for unarchived thread.');
+      }
+      return { bac_id: body.data.bac_id, revision: body.data.revision };
+    },
+    async updateAnnotation(input) {
+      const body = await patch<{ readonly data?: Record<string, unknown> }>(
+        `/v1/annotations/${encodeURIComponent(input.bac_id)}`,
+        { note: input.note },
+      );
+      return body.data ?? {};
+    },
+    async deleteAnnotation(input) {
+      const body = await del<{ readonly data?: Record<string, unknown> }>(
+        `/v1/annotations/${encodeURIComponent(input.bac_id)}`,
+      );
+      return body.data ?? {};
     },
     listDispatches: (input) => readList('/v1/dispatches', input),
     listAuditEvents: (input) => readList('/v1/audit', input),
@@ -213,6 +286,10 @@ const createCompanionWriteClient = (
       }
       return getDataArray('/v1/annotations', params);
     },
+    readThreadMarkdown: (input) =>
+      getObject(`/v1/threads/${encodeURIComponent(input.bac_id)}/markdown`),
+    readWorkstreamMarkdown: (input) =>
+      getObject(`/v1/workstreams/${encodeURIComponent(input.bac_id)}/markdown`),
     recall: (input) => {
       const params = new URLSearchParams({ q: input.query });
       if (input.limit !== undefined) {
@@ -234,6 +311,21 @@ const createCompanionWriteClient = (
       );
     },
     exportSettings: () => getObject('/v1/settings/export'),
+    async listBuckets() {
+      const body = await getObject('/v1/buckets');
+      const items = body['items'];
+      if (!Array.isArray(items)) {
+        throw new Error('Companion buckets response missing items array.');
+      }
+      return items as readonly unknown[];
+    },
+    systemHealth: () => getObject('/v1/system/health').then((body) => {
+      const data = body['data'];
+      if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+        throw new Error('Companion health response missing data object.');
+      }
+      return data as Record<string, unknown>;
+    }),
     systemUpdateCheck: () => getObject('/v1/system/update-check').then((body) => {
       const data = body['data'];
       if (typeof data !== 'object' || data === null || Array.isArray(data)) {

@@ -7,6 +7,8 @@ import {
   runAutoSendDrain as driveAutoSendImpl,
 } from '../src/companion/autoSendDrain';
 import { createCompanionClient } from '../src/companion/client';
+import { listPendingOffers, markStatus, upsertOffer } from '../src/codingAttach/state';
+import type { CodingSurface } from '../src/codingAttach/detection';
 import { createSettingsClient } from '../src/settings/client';
 import type {
   CaptureEvent,
@@ -1272,6 +1274,23 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
     );
   }
 
+  if (request.type === messageTypes.codingAttachListOffers) {
+    return {
+      ok: true,
+      state: await buildState('connected'),
+      codingAttachOffers: await listPendingOffers(),
+    };
+  }
+
+  if (request.type === messageTypes.codingAttachMarkStatus) {
+    await markStatus(request.tabId, request.status);
+    return {
+      ok: true,
+      state: await buildState('connected'),
+      codingAttachOffers: await listPendingOffers(),
+    };
+  }
+
   if (request.type === messageTypes.saveLocalPreferences) {
     return await withCompanionStatus(async () => {
       if (typeof request.preferences.autoTrack === 'boolean') {
@@ -1352,6 +1371,53 @@ const reinjectContentScriptIntoOpenTabs = async (): Promise<void> => {
   }
 };
 
+const detectCodingAttachForTab = async (tabId: number, url: string): Promise<void> => {
+  try {
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (currentUrl: string): CodingSurface | null => {
+        const bodyText = document.body.textContent;
+        const confidenceFor = (urlMatch: boolean, domHint: boolean): CodingSurface['confidence'] =>
+          urlMatch && domHint ? 'high' : urlMatch ? 'medium' : 'low';
+        const codexUrl = /^https:\/\/chatgpt\.com\/codex(?:\/|$)/u.test(currentUrl);
+        const codexDom = /\b(Codex|workspace|diff|branch)\b/iu.test(bodyText);
+        if (codexUrl || codexDom) {
+          return {
+            id: 'codex',
+            signals: { urlMatch: codexUrl, domHint: codexDom },
+            confidence: confidenceFor(codexUrl, codexDom),
+          };
+        }
+        const claudeUrl = /^https:\/\/claude\.ai\/code(?:\/|$)/u.test(currentUrl);
+        const claudeDom = /\b(Claude Code|repository|terminal)\b/iu.test(bodyText);
+        if (claudeUrl || claudeDom) {
+          return {
+            id: 'claude_code',
+            signals: { urlMatch: claudeUrl, domHint: claudeDom },
+            confidence: confidenceFor(claudeUrl, claudeDom),
+          };
+        }
+        const cursorUrl = /^https:\/\/(?:www\.)?cursor\.com\//u.test(currentUrl);
+        const cursorDom = /\b(Cursor|agent|workspace)\b/iu.test(bodyText);
+        if (cursorUrl || cursorDom) {
+          return {
+            id: 'cursor',
+            signals: { urlMatch: cursorUrl, domHint: cursorDom },
+            confidence: confidenceFor(cursorUrl, cursorDom),
+          };
+        }
+        return null;
+      },
+      args: [url],
+    });
+    if (result.result !== null && result.result !== undefined) {
+      await upsertOffer({ tabId, url, surface: result.result });
+    }
+  } catch {
+    // Restricted tabs or pages without the content script surface are ignored.
+  }
+};
+
 export default defineBackground(() => {
   chrome.runtime.onInstalled.addListener((details) => {
     void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => undefined);
@@ -1395,12 +1461,13 @@ export default defineBackground(() => {
   chrome.tabs.onActivated.addListener(() => {
     dismissAndBroadcast();
   });
-  chrome.tabs.onUpdated.addListener((_tabId, changeInfo) => {
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     // Only react when the URL actually changed — ignore title/favicon
     // updates that fire on every page mutation.
     if (changeInfo.url === undefined) {
       return;
     }
+    void detectCodingAttachForTab(tabId, changeInfo.url);
     dismissAndBroadcast();
   });
   chrome.windows.onFocusChanged.addListener((windowId) => {

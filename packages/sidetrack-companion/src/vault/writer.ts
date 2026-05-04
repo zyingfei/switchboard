@@ -136,6 +136,9 @@ export interface VaultWriter {
     query: CodingSessionListQuery,
   ) => Promise<readonly CodingSessionRecord[]>;
   readonly detachCodingSession: (bac_id: string, requestId: string) => Promise<CodingSessionRecord>;
+  readonly bumpWorkstream: (bac_id: string, requestId: string) => Promise<MutationResult>;
+  readonly archiveThread: (bac_id: string, requestId: string) => Promise<MutationResult>;
+  readonly unarchiveThread: (bac_id: string, requestId: string) => Promise<MutationResult>;
 }
 
 const dateStamp = (value: Date): string => value.toISOString().slice(0, 10);
@@ -991,6 +994,51 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
         timestamp,
       });
       return updated;
+    },
+
+    async bumpWorkstream(bac_id, requestId) {
+      await ensureVaultPresent();
+      const path = join(bacRoot, 'workstreams', `${bac_id}.json`);
+      const existing = await readJsonRecord(path);
+      const revision = createRevision();
+      const timestamp = new Date().toISOString();
+      const updated = { ...existing, bac_id, revision, lastBumpedAt: timestamp, updatedAt: timestamp };
+      await writeJson(path, updated);
+      await audit({ requestId, route: 'bumpWorkstream', outcome: 'success', bac_id, timestamp });
+      return { bac_id, revision };
+    },
+
+    async archiveThread(bac_id, requestId) {
+      await ensureVaultPresent();
+      const path = join(bacRoot, 'threads', `${bac_id}.json`);
+      const existing = await readJsonRecord(path);
+      const revision = createRevision();
+      const timestamp = new Date().toISOString();
+      const updated = {
+        ...existing,
+        bac_id,
+        revision,
+        status: 'archived',
+        archivedAt: typeof existing['archivedAt'] === 'string' ? existing['archivedAt'] : timestamp,
+        updatedAt: timestamp,
+      };
+      await writeJson(path, updated);
+      await audit({ requestId, route: 'archiveThread', outcome: 'success', bac_id, timestamp });
+      return { bac_id, revision };
+    },
+
+    async unarchiveThread(bac_id, requestId) {
+      await ensureVaultPresent();
+      const path = join(bacRoot, 'threads', `${bac_id}.json`);
+      const existing = await readJsonRecord(path);
+      const revision = createRevision();
+      const timestamp = new Date().toISOString();
+      const { archivedAt: _archivedAt, ...rest } = existing;
+      void _archivedAt;
+      const updated = { ...rest, bac_id, revision, status: 'tracked', updatedAt: timestamp };
+      await writeJson(path, updated);
+      await audit({ requestId, route: 'unarchiveThread', outcome: 'success', bac_id, timestamp });
+      return { bac_id, revision };
     },
   };
 };

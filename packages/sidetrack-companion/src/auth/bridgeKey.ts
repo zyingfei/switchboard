@@ -7,6 +7,9 @@ export const bridgeKeyPath = (vaultPath: string): string =>
 
 export const createBridgeKey = (): string => randomBytes(32).toString('base64url');
 
+const ROTATION_GRACE_MS = 60_000;
+const graceKeys = new Map<string, number>();
+
 export interface EnsuredBridgeKey {
   readonly key: string;
   readonly path: string;
@@ -45,4 +48,46 @@ export const bridgeKeysMatch = (expected: string, actual: string): boolean => {
   return (
     expectedBuffer.length === actualBuffer.length && timingSafeEqual(expectedBuffer, actualBuffer)
   );
+};
+
+export const isBridgeKeyAccepted = async (
+  vaultPath: string | undefined,
+  expected: string,
+  actual: string,
+  now: Date = new Date(),
+): Promise<boolean> => {
+  const matchesExpected = bridgeKeysMatch(expected, actual);
+  if (matchesExpected) {
+    return true;
+  }
+  for (const [key, expiresAt] of graceKeys) {
+    if (expiresAt <= now.getTime()) {
+      graceKeys.delete(key);
+    } else if (bridgeKeysMatch(key, actual)) {
+      return true;
+    }
+  }
+  if (vaultPath === undefined) {
+    return false;
+  }
+  try {
+    const current = (await readFile(bridgeKeyPath(vaultPath), 'utf8')).trim();
+    return current.length > 0 && bridgeKeysMatch(current, actual);
+  } catch {
+    return false;
+  }
+};
+
+export const rotateBridgeKey = async (
+  vaultPath: string,
+  previousKey: string,
+  now: Date = new Date(),
+): Promise<{ readonly previous: string; readonly current: string; readonly rotatedAt: string }> => {
+  const current = createBridgeKey();
+  await mkdir(join(vaultPath, '_BAC', '.config'), { recursive: true });
+  await writeFile(bridgeKeyPath(vaultPath), `${current}\n`, { encoding: 'utf8', mode: 0o600 });
+  // Keep the previous key alive briefly so in-flight browser requests do not
+  // fail during a manual rotation.
+  graceKeys.set(previousKey, now.getTime() + ROTATION_GRACE_MS);
+  return { previous: previousKey, current, rotatedAt: now.toISOString() };
 };
