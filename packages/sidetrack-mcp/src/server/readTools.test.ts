@@ -303,4 +303,86 @@ describe('companion-backed read tools', () => {
       await client.close();
     }
   });
+
+  it('passes annotation write tools through to the companion client', async () => {
+    const companionClient = buildFakeCompanionClient({
+      updateAnnotation: vi.fn(() => Promise.resolve({ bac_id: 'ann_1', note: 'new' })),
+      deleteAnnotation: vi.fn(() => Promise.resolve({ bac_id: 'ann_1', deletedAt: 'now' })),
+    });
+    const client = await startInProcessServer(companionClient);
+    try {
+      await expect(
+        client.callTool({
+          name: 'bac.update_annotation',
+          arguments: { bac_id: 'ann_1', note: 'new' },
+        }),
+      ).resolves.toMatchObject({ structuredContent: { bac_id: 'ann_1', note: 'new' } });
+      await expect(
+        client.callTool({ name: 'bac.delete_annotation', arguments: { bac_id: 'ann_1' } }),
+      ).resolves.toMatchObject({ structuredContent: { bac_id: 'ann_1', deletedAt: 'now' } });
+      expect(companionClient.updateAnnotation).toHaveBeenCalledWith({ bac_id: 'ann_1', note: 'new' });
+      expect(companionClient.deleteAnnotation).toHaveBeenCalledWith({ bac_id: 'ann_1' });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('returns raw Markdown through bac.read_thread_md and bac.read_workstream_md', async () => {
+    const companionClient = buildFakeCompanionClient({
+      readThreadMarkdown: vi.fn(() => Promise.resolve({ path: '/vault/_BAC/threads/t.md', content: '# T' })),
+      readWorkstreamMarkdown: vi.fn(() =>
+        Promise.resolve({ path: '/vault/_BAC/workstreams/w.md', content: '# W' }),
+      ),
+    });
+    const client = await startInProcessServer(companionClient);
+    try {
+      await expect(
+        client.callTool({ name: 'bac.read_thread_md', arguments: { bac_id: 'thread_1' } }),
+      ).resolves.toMatchObject({ structuredContent: { content: '# T' } });
+      await expect(
+        client.callTool({ name: 'bac.read_workstream_md', arguments: { bac_id: 'ws_1' } }),
+      ).resolves.toMatchObject({ structuredContent: { content: '# W' } });
+      expect(companionClient.readThreadMarkdown).toHaveBeenCalledWith({ bac_id: 'thread_1' });
+      expect(companionClient.readWorkstreamMarkdown).toHaveBeenCalledWith({ bac_id: 'ws_1' });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('passes completed write tools through to the companion client', async () => {
+    const companionClient = buildFakeCompanionClient({
+      bumpWorkstream: vi.fn(() => Promise.resolve({ bac_id: 'ws_1', revision: '1' })),
+      archiveThread: vi.fn(() => Promise.resolve({ bac_id: 'thread_1', revision: '2' })),
+      unarchiveThread: vi.fn(() => Promise.resolve({ bac_id: 'thread_1', revision: '3' })),
+    });
+    const client = await startInProcessServer(companionClient);
+    try {
+      await client.callTool({ name: 'bac.bump_workstream', arguments: { bac_id: 'ws_1' } });
+      await client.callTool({ name: 'bac.archive_thread', arguments: { bac_id: 'thread_1' } });
+      await client.callTool({ name: 'bac.unarchive_thread', arguments: { bac_id: 'thread_1' } });
+      expect(companionClient.bumpWorkstream).toHaveBeenCalledWith({ bac_id: 'ws_1' });
+      expect(companionClient.archiveThread).toHaveBeenCalledWith({ bac_id: 'thread_1' });
+      expect(companionClient.unarchiveThread).toHaveBeenCalledWith({ bac_id: 'thread_1' });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('returns buckets and system health from companion-backed tools', async () => {
+    const companionClient = buildFakeCompanionClient({
+      listBuckets: vi.fn(() => Promise.resolve([{ id: 'default' }])),
+      systemHealth: vi.fn(() => Promise.resolve({ uptimeSec: 1 })),
+    });
+    const client = await startInProcessServer(companionClient);
+    try {
+      await expect(client.callTool({ name: 'bac.list_buckets', arguments: {} })).resolves.toMatchObject({
+        structuredContent: { items: [{ id: 'default' }] },
+      });
+      await expect(client.callTool({ name: 'bac.system_health', arguments: {} })).resolves.toMatchObject({
+        structuredContent: { uptimeSec: 1 },
+      });
+    } finally {
+      await client.close();
+    }
+  });
 });

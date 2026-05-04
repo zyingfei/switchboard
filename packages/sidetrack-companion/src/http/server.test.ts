@@ -6,6 +6,7 @@ import { Readable } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { ensureBridgeKey } from '../auth/bridgeKey.js';
+import { createBucketRegistry } from '../routing/registry.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { createIdempotencyStore } from './idempotency.js';
 import { handleRequest, type CompanionHttpConfig } from './server.js';
@@ -77,6 +78,11 @@ class MemoryServerResponse {
       this.headers.set(key, value);
     }
     return this;
+  }
+
+  write(chunk: string | Buffer): boolean {
+    this.body += chunk.toString();
+    return true;
   }
 
   end(chunk?: string | Buffer): void {
@@ -635,6 +641,53 @@ describe('companion HTTP server', () => {
     });
   });
 
+  it('updates and soft-deletes annotations through HTTP', async () => {
+    const anchor = {
+      textQuote: { exact: 'hello', prefix: '', suffix: '' },
+      textPosition: { start: 0, end: 5 },
+      cssSelector: 'body',
+    };
+    const create = await jsonFetch(context, `${baseUrl}/v1/annotations`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'annotation-update-001',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        url: 'https://example.test/page',
+        pageTitle: 'Page',
+        anchor,
+        note: 'First',
+      }),
+    });
+    const annotationId = (create.body as { readonly data: { readonly bac_id: string } }).data
+      .bac_id;
+
+    const update = await jsonFetch(context, `${baseUrl}/v1/annotations/${annotationId}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({ note: 'Second' }),
+    });
+    const deleted = await jsonFetch(context, `${baseUrl}/v1/annotations/${annotationId}`, {
+      method: 'DELETE',
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    const hidden = await jsonFetch(context, `${baseUrl}/v1/annotations`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    const included = await jsonFetch(context, `${baseUrl}/v1/annotations?includeDeleted=true`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+
+    expect(update.status).toBe(200);
+    expect(update.body).toMatchObject({ data: { note: 'Second', revisions: [{ note: 'First' }] } });
+    expect(deleted.status).toBe(200);
+    expect(deleted.body).toMatchObject({ data: { deletedAt: expect.any(String) } });
+    expect(hidden.body).toMatchObject({ data: [] });
+    expect(included.body).toMatchObject({ data: [{ bac_id: annotationId }] });
+  });
+
   it('replays idempotent dispatch responses without duplicating dispatch lines', async () => {
     const createdAt = '2026-04-26T22:01:00.000Z';
     const init = {
@@ -998,6 +1051,45 @@ describe('companion HTTP server', () => {
     ).resolves.toContain('Sidetrack');
   });
 
+  it('reads raw thread and workstream markdown with a failure path for missing files', async () => {
+    const now = '2026-04-26T21:32:00.000Z';
+    await jsonFetch(context, `${baseUrl}/v1/threads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({
+        bac_id: 'bac_thread_md',
+        provider: 'gemini',
+        threadUrl: 'https://gemini.google.com/app/thread-md',
+        title: 'Thread MD',
+        lastSeenAt: now,
+      }),
+    });
+    const workstream = await jsonFetch(context, `${baseUrl}/v1/workstreams`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({ title: 'Workstream MD' }),
+    });
+    const workstreamId = (workstream.body as { readonly data: { readonly bac_id: string } }).data
+      .bac_id;
+
+    const threadMd = await jsonFetch(context, `${baseUrl}/v1/threads/bac_thread_md/markdown`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    const workstreamMd = await jsonFetch(
+      context,
+      `${baseUrl}/v1/workstreams/${workstreamId}/markdown`,
+      { headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+    const missing = await jsonFetch(context, `${baseUrl}/v1/threads/bac_missing_md/markdown`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+
+    expect(threadMd.body).toMatchObject({ content: expect.stringContaining('Thread MD') });
+    expect(workstreamMd.body).toMatchObject({ content: expect.stringContaining('Workstream MD') });
+    expect(missing.status).toBe(500);
+    expect(missing.body).toMatchObject({ code: 'INTERNAL_ERROR' });
+  });
+
   it('defaults new workstreams to shared and supports screenshare-sensitive metadata', async () => {
     const workstreamResult = await jsonFetch(context, `${baseUrl}/v1/workstreams`, {
       method: 'POST',
@@ -1062,6 +1154,185 @@ describe('companion HTTP server', () => {
     expect(result.status).toBe(200);
     expect(result.body).toMatchObject({
       items: [{ workstreamId, notePath: 'research.md', title: 'Human note' }],
+    });
+  });
+
+  it('bumps workstreams and archives/unarchives threads idempotently', async () => {
+    const now = '2026-04-26T21:32:00.000Z';
+    await jsonFetch(context, `${baseUrl}/v1/threads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({
+        bac_id: 'bac_thread_archive',
+        provider: 'claude',
+        threadUrl: 'https://claude.ai/chat/archive',
+        title: 'Archive me',
+        lastSeenAt: now,
+      }),
+    });
+    const workstream = await jsonFetch(context, `${baseUrl}/v1/workstreams`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({ title: 'Bump me' }),
+    });
+    const workstreamId = (workstream.body as { readonly data: { readonly bac_id: string } }).data
+      .bac_id;
+
+    const bump = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/bump`, {
+      method: 'POST',
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    const archived = await jsonFetch(context, `${baseUrl}/v1/threads/bac_thread_archive/archive`, {
+      method: 'POST',
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    const unarchived = await jsonFetch(
+      context,
+      `${baseUrl}/v1/threads/bac_thread_archive/unarchive`,
+      { method: 'POST', headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+
+    expect(bump.status).toBe(200);
+    expect(archived.status).toBe(200);
+    expect(unarchived.status).toBe(200);
+    await expect(
+      readFile(join(vaultPath, '_BAC', 'threads', 'bac_thread_archive.json'), 'utf8'),
+    ).resolves.toContain('"status": "tracked"');
+  });
+
+  it('rotates bridge keys and exposes hygiene/system health endpoints', async () => {
+    context = {
+      ...context,
+      hygieneStatus: { lastIdempotencyGcAt: '2026-05-03T00:00:00.000Z' },
+      startedAt: new Date('2026-05-03T00:00:00.000Z'),
+      serviceInstaller: {
+        install: () => Promise.reject(new Error('not used')),
+        uninstall: () => Promise.reject(new Error('not used')),
+        status: () => Promise.resolve({ installed: false, running: false, platform: 'darwin' }),
+      },
+    };
+
+    const rotate = await jsonFetch(context, `${baseUrl}/v1/auth/rotate-bridge-key`, {
+      method: 'POST',
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    const current = (rotate.body as { readonly data: { readonly current: string } }).data.current;
+    const health = await jsonFetch(context, `${baseUrl}/v1/system/health`, {
+      headers: { 'x-bac-bridge-key': current },
+    });
+    const hygiene = await jsonFetch(context, `${baseUrl}/v1/system/hygiene-status`, {
+      headers: { 'x-bac-bridge-key': current },
+    });
+
+    expect(rotate.status).toBe(200);
+    expect(current).not.toBe(bridgeKey);
+    expect(health.body).toMatchObject({ data: { vault: { root: vaultPath }, service: { running: false } } });
+    expect(hygiene.body).toMatchObject({
+      data: { lastIdempotencyGcAt: '2026-05-03T00:00:00.000Z' },
+    });
+  });
+
+  it('refuses auto-update execution when the startup flag is off', async () => {
+    const result = await jsonFetch(context, `${baseUrl}/v1/system/auto-update`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({ confirm: '1.0.0' }),
+    });
+
+    expect(result.status).toBe(403);
+    expect(result.body).toMatchObject({ code: 'AUTO_UPDATE_DISABLED' });
+  });
+
+  it('lists and replaces multi-vault buckets', async () => {
+    const secondary = await mkdtemp(join(tmpdir(), 'sidetrack-secondary-vault-'));
+    context = { ...context, bucketRegistry: createBucketRegistry(vaultPath) };
+    try {
+      const put = await jsonFetch(context, `${baseUrl}/v1/buckets`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+        body: JSON.stringify({
+          buckets: [
+            {
+              id: 'secondary',
+              label: 'Secondary',
+              vaultRoot: secondary,
+              matchers: [{ kind: 'provider', value: 'chatgpt' }],
+            },
+          ],
+        }),
+      });
+      const list = await jsonFetch(context, `${baseUrl}/v1/buckets`, {
+        headers: { 'x-bac-bridge-key': bridgeKey },
+      });
+
+      expect(put.status).toBe(200);
+      expect(list.body).toMatchObject({
+        items: [
+          { id: 'default', vaultRoot: vaultPath },
+          { id: 'secondary', vaultRoot: secondary },
+        ],
+      });
+    } finally {
+      await rm(secondary, { recursive: true, force: true });
+    }
+  });
+
+  it('streams vault change events as SSE frames', async () => {
+    context = {
+      ...context,
+      vaultChanges: {
+        subscribe(listener) {
+          listener({
+            type: 'modified',
+            relPath: '_BAC/threads/bac_1.json',
+            at: '2026-05-03T00:00:00.000Z',
+            kind: 'thread',
+          });
+          return () => undefined;
+        },
+      },
+    };
+
+    const response = await memoryFetch(context, `${baseUrl}/v1/vault/changes`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('text/event-stream');
+    expect(response.bodyText).toContain('data: {"type":"modified"');
+  });
+
+  it('manages workstream trust and enforces default-deny for MCP write calls', async () => {
+    const workstream = await jsonFetch(context, `${baseUrl}/v1/workstreams`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({ title: 'Trusted' }),
+    });
+    const workstreamId = (workstream.body as { readonly data: { readonly bac_id: string } }).data
+      .bac_id;
+    const denied = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/bump`, {
+      method: 'POST',
+      headers: { 'x-bac-bridge-key': bridgeKey, 'x-sidetrack-mcp-tool': 'bac.bump_workstream' },
+    });
+    const putTrust = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/trust`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({ allowedTools: ['bac.bump_workstream'] }),
+    });
+    const trusted = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/bump`, {
+      method: 'POST',
+      headers: { 'x-bac-bridge-key': bridgeKey, 'x-sidetrack-mcp-tool': 'bac.bump_workstream' },
+    });
+    const getTrust = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/trust`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+
+    expect(denied.status).toBe(403);
+    expect(denied.body).toMatchObject({ code: 'WORKSTREAM_NOT_TRUSTED' });
+    expect(putTrust.status).toBe(200);
+    expect(trusted.status).toBe(200);
+    expect(getTrust.body).toMatchObject({
+      data: { workstreamId, allowedTools: ['bac.bump_workstream'] },
     });
   });
 
