@@ -101,3 +101,4 @@ export type {
   VaultBucket,
 } from './SettingsV2Sections';
 export { DesignPreview } from './DesignPreview';
+export { TurnText } from './TurnText';
