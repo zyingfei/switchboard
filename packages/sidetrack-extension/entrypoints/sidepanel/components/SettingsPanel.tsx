@@ -1,6 +1,20 @@
 import { useState } from 'react';
 import type { WorkstreamNode } from '../../../src/workboard';
 import { Modal } from './Modal';
+import {
+  AppearanceSection,
+  BucketsSection,
+  ImportExportSection,
+  McpHostsSection,
+  ServiceInstallSection,
+} from './SettingsV2Sections';
+import type {
+  DensityMode,
+  ImportDiff,
+  McpHost,
+  ThemeMode,
+  VaultBucket,
+} from './SettingsV2Sections';
 
 export type SettingsPacketKind = 'research' | 'review' | 'coding' | 'note' | 'other';
 export type SettingsTargetProvider =
@@ -63,6 +77,17 @@ export interface SettingsPanelProps {
   readonly onBulkUpdateWorkstreamPrivacy: () => void;
   readonly onToggleWorkstreamSensitive: (workstream: WorkstreamNode, sensitive: boolean) => void;
   readonly onSetScreenShareMode: (enabled: boolean) => void;
+  // v2 design pass — appearance + portability + multi-vault + MCP host
+  // sections. All optional (additive). Backends:
+  //   - theme/density: local document attributes (no network)
+  //   - service install: /v1/system/service-status (PR #77, on main)
+  //   - import/export: /v1/settings/{export,import} (PR #77, on main)
+  //   - mcp hosts: extension-side mcpHost.registry (PR #78, pending)
+  //   - buckets: /v1/buckets (PR #78, pending)
+  readonly theme?: ThemeMode;
+  readonly density?: DensityMode;
+  readonly onThemeChange?: (mode: ThemeMode) => void;
+  readonly onDensityChange?: (mode: DensityMode) => void;
 }
 
 const PROVIDER_LABELS: Record<keyof SettingsValue['autoSendOptIn'], string> = {
@@ -107,7 +132,38 @@ export function SettingsPanel({
   onBulkUpdateWorkstreamPrivacy,
   onToggleWorkstreamSensitive,
   onSetScreenShareMode,
+  theme,
+  density,
+  onThemeChange,
+  onDensityChange,
 }: SettingsPanelProps) {
+  const [serviceInstalled, setServiceInstalled] = useState(false);
+  const [serviceRunning] = useState(true);
+  const [importDiff, setImportDiff] = useState<ImportDiff | null>(null);
+  const [mcpHosts, setMcpHosts] = useState<readonly McpHost[]>([
+    {
+      id: 'h1',
+      url: 'http://localhost:7331',
+      tokenMasked: 'sb_localhost',
+      role: 'self',
+      online: true,
+    },
+    {
+      id: 'h2',
+      url: 'http://localhost:6277',
+      tokenMasked: 'cc_••••••2f0',
+      role: 'claude-code',
+      online: true,
+    },
+  ]);
+  const [buckets, setBuckets] = useState<readonly VaultBucket[]>([
+    {
+      id: 'default',
+      rule: '* (default)',
+      vaultPath: localPreferences.vaultPath || '~/Documents/Sidetrack-vault',
+      isDefault: true,
+    },
+  ]);
   const initial: SettingsValue = settings ?? {
     autoSendOptIn: { chatgpt: false, claude: false, gemini: false },
     defaultPacketKind: 'research',
@@ -501,6 +557,93 @@ export function SettingsPanel({
           </ul>
         )}
       </div>
+
+      {/* v2 design — appearance + service install + portability + MCP + buckets.
+          Each is opt-in: AppearanceSection only renders when the parent
+          provides theme/density wiring. */}
+      {theme !== undefined &&
+      density !== undefined &&
+      onThemeChange !== undefined &&
+      onDensityChange !== undefined ? (
+        <AppearanceSection
+          theme={theme}
+          density={density}
+          onThemeChange={onThemeChange}
+          onDensityChange={onDensityChange}
+        />
+      ) : null}
+      <ServiceInstallSection
+        installed={serviceInstalled}
+        running={serviceRunning}
+        onInstall={() => {
+          // TODO(PR-#77 wiring): POST /v1/system/install-service via companion
+          setServiceInstalled(true);
+        }}
+        onUninstall={() => {
+          // TODO(PR-#77 wiring): POST /v1/system/uninstall-service
+          setServiceInstalled(false);
+        }}
+      />
+      <ImportExportSection
+        onExport={() => {
+          // TODO(PR-#77 wiring): GET /v1/settings/export → trigger download
+        }}
+        onChooseImportFile={() => {
+          // Stub diff so the user can see the diff card. Real wiring
+          // POSTs the file to /v1/settings/import?dryRun=true.
+          setImportDiff({
+            added: ['provider.gemini.auto-send  false → true'],
+            removed: [],
+            changed: ['vault.path  ~/Documents/Sidetrack-vault'],
+            conflicts: 0,
+          });
+        }}
+        diff={importDiff}
+        onCancelImport={() => {
+          setImportDiff(null);
+        }}
+        onApplyImport={() => {
+          // TODO(PR-#77 wiring): POST /v1/settings/import (commit)
+          setImportDiff(null);
+        }}
+      />
+      <McpHostsSection
+        hosts={mcpHosts}
+        onRemove={(id) => {
+          setMcpHosts((prev) => prev.filter((h) => h.id !== id));
+        }}
+        onAdd={(input) => {
+          // TODO(PR-#78 wiring): persist via mcpHost.registry
+          setMcpHosts((prev) => [
+            ...prev,
+            {
+              id: `h${String(Date.now())}`,
+              url: input.url,
+              tokenMasked: input.token.slice(0, 4) + '••••',
+              role: 'unknown',
+              online: false,
+            },
+          ]);
+        }}
+      />
+      <BucketsSection
+        buckets={buckets}
+        onRemove={(id) => {
+          setBuckets((prev) => prev.filter((b) => b.id !== id));
+        }}
+        onAddBucket={() => {
+          // TODO(PR-#78 wiring): open a bucket-create dialog and PUT /v1/buckets
+          setBuckets((prev) => [
+            ...prev,
+            {
+              id: `b${String(Date.now())}`,
+              rule: 'workstream:new-bucket',
+              vaultPath: '~/Documents/new-vault',
+              isDefault: false,
+            },
+          ]);
+        }}
+      />
 
       {error !== null && error !== undefined ? (
         <div className="settings-error mono">{error}</div>

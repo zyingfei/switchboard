@@ -66,3 +66,38 @@ export type { InboundCardProps, InboundReminder } from './InboundCard';
 
 export { SettingsPanel } from './SettingsPanel';
 export type { SettingsPanelProps, SettingsValue } from './SettingsPanel';
+
+// v2 design pass — new surfaces backed by recently-shipped backend.
+export { UpdateBanner } from './UpdateBanner';
+export { HealthPanel } from './HealthPanel';
+export { CodingOfferBanner } from './CodingOfferBanner';
+export type { CodingOffer } from './CodingOfferBanner';
+export { ScopeSuggestions } from './ScopeSuggestions';
+export type { ScopeSuggestion } from './ScopeSuggestions';
+export { DejaVuPopover } from './DejaVuPopover';
+export type { DejaVuItem } from './DejaVuPopover';
+export { AnnotationOverlay } from './AnnotationOverlay';
+export type { AnnotationMarker } from './AnnotationOverlay';
+export { LinkedNotes } from './LinkedNotes';
+export type { LinkedNote } from './LinkedNotes';
+export { TrustToggles } from './TrustToggles';
+export type { TrustEntry, TrustTool } from './TrustToggles';
+export { SafetyChainSummary } from './SafetyChainSummary';
+export type { SafetyCheck, CheckStatus } from './SafetyChainSummary';
+export { NeedsOrganizeSuggestion } from './NeedsOrganizeSuggestion';
+export { WorkstreamDetailPanel } from './WorkstreamDetailPanel';
+export {
+  AppearanceSection,
+  ServiceInstallSection,
+  ImportExportSection,
+  McpHostsSection,
+  BucketsSection,
+} from './SettingsV2Sections';
+export type {
+  ThemeMode,
+  DensityMode,
+  ImportDiff,
+  McpHost,
+  VaultBucket,
+} from './SettingsV2Sections';
+export { DesignPreview } from './DesignPreview';

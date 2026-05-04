@@ -35,6 +35,11 @@ import {
   SettingsPanel,
   type SettingsValue,
   SystemBannersStack,
+  UpdateBanner,
+  HealthPanel,
+  DesignPreview,
+  type ThemeMode,
+  type DensityMode,
   TabRecovery,
   Wizard,
   type RestoreStrategy,
@@ -378,6 +383,32 @@ const App = () => {
   >(() => new Map<string, readonly CapturedTurnRecord[]>());
   const [settings, setSettings] = useState<SettingsDocument | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [healthPanelOpen, setHealthPanelOpen] = useState(false);
+  const [designPreviewOpen, setDesignPreviewOpen] = useState(false);
+  const [theme, setTheme] = useState<ThemeMode>('auto');
+  const [density, setDensity] = useState<DensityMode>('cozy');
+
+  // Apply theme + density to the root <html> element so all sidepanel
+  // styles inherit. 'auto' resolves via prefers-color-scheme; guarded
+  // for environments without matchMedia (e.g. jsdom in unit tests).
+  useEffect(() => {
+    const root = document.documentElement;
+    const matchMedia: ((query: string) => MediaQueryList) | undefined =
+      typeof window.matchMedia === 'function' ? window.matchMedia.bind(window) : undefined;
+    const prefersDark = matchMedia?.('(prefers-color-scheme: dark)').matches ?? false;
+    const resolved: 'light' | 'ink' =
+      theme === 'auto' ? (prefersDark ? 'ink' : 'light') : theme;
+    if (resolved === 'ink') {
+      root.setAttribute('data-theme', 'ink');
+    } else {
+      root.removeAttribute('data-theme');
+    }
+    if (density === 'compact') {
+      root.setAttribute('data-density', 'compact');
+    } else {
+      root.removeAttribute('data-density');
+    }
+  }, [theme, density]);
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [codingAttachOpen, setCodingAttachOpen] = useState(false);
@@ -2329,6 +2360,53 @@ const App = () => {
           </button>
           <button
             className="icon-btn"
+            title="Capture health diagnostics"
+            onClick={() => {
+              setHealthPanelOpen(true);
+            }}
+            type="button"
+            aria-label="Open capture health diagnostics"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+            </svg>
+          </button>
+          <button
+            className="icon-btn"
+            title="Design preview — v2 surfaces"
+            onClick={() => {
+              setDesignPreviewOpen(true);
+            }}
+            type="button"
+            aria-label="Open design preview"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <circle cx="13" cy="6" r="2" />
+              <circle cx="6" cy="13" r="2" />
+              <circle cx="13" cy="20" r="2" />
+              <circle cx="20" cy="13" r="2" />
+              <line x1="11.6" y1="7.4" x2="7.4" y2="11.6" />
+              <line x1="14.4" y1="7.4" x2="18.6" y2="11.6" />
+              <line x1="11.6" y1="18.6" x2="7.4" y2="14.4" />
+              <line x1="14.4" y1="18.6" x2="18.6" y2="14.4" />
+            </svg>
+          </button>
+          <button
+            className="icon-btn"
             title="Settings"
             onClick={() => {
               setSettingsOpen(true);
@@ -2425,6 +2503,14 @@ const App = () => {
           parentForNew={currentWsId}
         />
       ) : null}
+
+      <UpdateBanner
+        companionPort={port.length > 0 ? Number(port) : null}
+        bridgeKey={bridgeKey.length > 0 ? bridgeKey : null}
+        onUpdate={() => {
+          setSettingsOpen(true);
+        }}
+      />
 
       {hasSystemBanners ? (
         <div className="banner-stack">
@@ -3371,6 +3457,26 @@ const App = () => {
             // stacked behind it.
             setSettingsOpen(false);
             setWizardOpen(true);
+          }}
+          theme={theme}
+          density={density}
+          onThemeChange={setTheme}
+          onDensityChange={setDensity}
+        />
+      ) : null}
+
+      {healthPanelOpen ? (
+        <HealthPanel
+          onClose={() => {
+            setHealthPanelOpen(false);
+          }}
+        />
+      ) : null}
+
+      {designPreviewOpen ? (
+        <DesignPreview
+          onClose={() => {
+            setDesignPreviewOpen(false);
           }}
         />
       ) : null}
