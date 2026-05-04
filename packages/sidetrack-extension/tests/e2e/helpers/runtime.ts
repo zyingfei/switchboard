@@ -94,10 +94,12 @@ const resolveExtensionId = async (cdpUrl: string): Promise<string> => {
     throw new Error(`CDP /json/list returned HTTP ${String(response.status)}`);
   }
   const targets = (await response.json()) as { type?: string; url?: string }[];
-  const swTarget = targets.find(
+  const serviceWorkers = targets.filter(
     (t) => t.type === 'service_worker' && (t.url ?? '').startsWith('chrome-extension://'),
   );
-  if (swTarget !== undefined) {
+  if (serviceWorkers.length > 0) {
+    const swTarget =
+      serviceWorkers.find((t) => (t.url ?? '').endsWith('/background.js')) ?? serviceWorkers[0];
     const match = /^chrome-extension:\/\/([^/]+)\//u.exec(swTarget.url ?? '');
     if (match !== null) {
       return match[1];

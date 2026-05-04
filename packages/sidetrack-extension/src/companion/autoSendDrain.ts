@@ -25,7 +25,17 @@ export interface DrainQueueItem {
   readonly status: 'pending' | 'done' | 'dismissed';
   readonly targetId?: string;
   readonly createdAt: string;
+  readonly sortOrder?: number;
 }
+
+const compareQueueItems = (a: DrainQueueItem, b: DrainQueueItem): number => {
+  if (a.sortOrder !== undefined && b.sortOrder !== undefined) {
+    return a.sortOrder - b.sortOrder;
+  }
+  if (a.sortOrder !== undefined) return -1;
+  if (b.sortOrder !== undefined) return 1;
+  return a.createdAt.localeCompare(b.createdAt);
+};
 
 export interface DrainThread {
   readonly bac_id: string;
@@ -128,7 +138,7 @@ export const runAutoSendDrain = async (
   const pending = (await ports.readPendingItemsForThread(threadId))
     .filter((item) => item.status === 'pending')
     .slice()
-    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    .sort(compareQueueItems);
 
   if (pending.length === 0) {
     return { mutated: false, itemsConsidered: 0, itemsSent: 0, stoppedReason: 'no-pending' };

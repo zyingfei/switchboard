@@ -96,7 +96,21 @@ export interface QueueItem {
   // on the next successful drain pass.
   readonly lastError?: string;
   readonly progress?: 'typing' | 'waiting';
+  // Drag-reorder rank. Stamped per-thread when the user moves rows;
+  // sort prefers this over createdAt for items that have it. Items
+  // created before reorder shipped (or never reordered) fall back to
+  // createdAt — the comparator handles the mixed case.
+  readonly sortOrder?: number;
 }
+
+export const compareQueueItems = (a: QueueItem, b: QueueItem): number => {
+  if (a.sortOrder !== undefined && b.sortOrder !== undefined) {
+    return a.sortOrder - b.sortOrder;
+  }
+  if (a.sortOrder !== undefined) return -1;
+  if (b.sortOrder !== undefined) return 1;
+  return a.createdAt.localeCompare(b.createdAt);
+};
 
 export interface InboundReminder {
   readonly bac_id: string;
@@ -118,6 +132,11 @@ export interface UiSettings {
   readonly companion: CompanionSettings;
   readonly autoTrack: boolean;
   readonly siteToggles: Readonly<Record<Exclude<ProviderId, 'unknown'>, boolean>>;
+  // Fire a chrome.notifications toast when the auto-send drain
+  // finishes shipping the last item for a thread. Default on — the
+  // whole point of auto-send is so the user can context-switch
+  // away and come back when it's done.
+  readonly notifyOnQueueComplete: boolean;
 }
 
 // Manual notes the user types in the side panel (and, later, Obsidian /
@@ -295,6 +314,7 @@ export const defaultSettings: UiSettings = {
     gemini: true,
     codex: true,
   },
+  notifyOnQueueComplete: true,
 };
 
 export const createEmptyWorkboardState = (

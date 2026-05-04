@@ -70,6 +70,10 @@ export const messageTypes = {
   restoreThreadTab: 'sidetrack.thread.restore-tab',
   queueFollowUp: 'sidetrack.queue.create',
   updateQueueItem: 'sidetrack.queue.update',
+  // User dropped queue rows in a new order. Payload is the ordered
+  // list of pending bac_ids; the storage layer stamps each one's
+  // sortOrder so the auto-send drain ships them in that order.
+  reorderQueueItems: 'sidetrack.queue.reorder',
   createReminder: 'sidetrack.reminder.create',
   updateReminder: 'sidetrack.reminder.update',
   setCollapsedSections: 'sidetrack.sections.collapsed.set',
@@ -226,6 +230,10 @@ export type WorkboardRequest =
       readonly update: QueueUpdate;
     }
   | {
+      readonly type: typeof messageTypes.reorderQueueItems;
+      readonly queueItemIds: readonly string[];
+    }
+  | {
       readonly type: typeof messageTypes.retryAutoSend;
       readonly queueItemId: string;
     }
@@ -291,6 +299,7 @@ export type WorkboardRequest =
       readonly preferences: {
         readonly autoTrack?: boolean;
         readonly vaultPath?: string;
+        readonly notifyOnQueueComplete?: boolean;
       };
     }
   | {
@@ -469,6 +478,13 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
 
   if (hasType(value, messageTypes.updateQueueItem)) {
     return typeof value.queueItemId === 'string' && isRecord(value.update);
+  }
+
+  if (hasType(value, messageTypes.reorderQueueItems)) {
+    return (
+      Array.isArray(value.queueItemIds) &&
+      value.queueItemIds.every((id) => typeof id === 'string')
+    );
   }
 
   if (hasType(value, messageTypes.retryAutoSend)) {

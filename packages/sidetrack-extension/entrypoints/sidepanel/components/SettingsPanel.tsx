@@ -46,6 +46,7 @@ export interface SettingsValue {
 export interface LocalPreferences {
   readonly autoTrack: boolean;
   readonly vaultPath: string;
+  readonly notifyOnQueueComplete: boolean;
 }
 
 export interface ArchivedThreadRow {
@@ -75,6 +76,7 @@ export interface SettingsPanelProps {
   readonly onSaveLocalPreferences: (next: {
     readonly autoTrack?: boolean;
     readonly vaultPath?: string;
+    readonly notifyOnQueueComplete?: boolean;
   }) => void;
   readonly onRestoreThread: (threadId: string) => void;
   readonly onDeleteThread: (threadId: string) => void;
@@ -301,6 +303,9 @@ export function SettingsPanel({
   );
   const [draftAutoTrack, setDraftAutoTrack] = useState(localPreferences.autoTrack);
   const [draftVaultPath, setDraftVaultPath] = useState(localPreferences.vaultPath);
+  const [draftNotifyOnQueueComplete, setDraftNotifyOnQueueComplete] = useState(
+    localPreferences.notifyOnQueueComplete,
+  );
 
   const companionDirty =
     draftAutoSend.chatgpt !== initial.autoSendOptIn.chatgpt ||
@@ -311,7 +316,8 @@ export function SettingsPanel({
     draftTarget !== initial.defaultDispatchTarget;
   const localDirty =
     draftAutoTrack !== localPreferences.autoTrack ||
-    draftVaultPath.trim() !== localPreferences.vaultPath.trim();
+    draftVaultPath.trim() !== localPreferences.vaultPath.trim() ||
+    draftNotifyOnQueueComplete !== localPreferences.notifyOnQueueComplete;
   const dirty = companionDirty || localDirty;
   const privateWorkstreams = workstreams.filter((workstream) => workstream.privacy === 'private');
 
@@ -337,6 +343,9 @@ export function SettingsPanel({
         ...(draftVaultPath.trim() === localPreferences.vaultPath.trim()
           ? {}
           : { vaultPath: draftVaultPath.trim() }),
+        ...(draftNotifyOnQueueComplete === localPreferences.notifyOnQueueComplete
+          ? {}
+          : { notifyOnQueueComplete: draftNotifyOnQueueComplete }),
       });
     }
   };
@@ -487,6 +496,28 @@ export function SettingsPanel({
             </label>
           ),
         )}
+        <label
+          className={'switch ' + (draftNotifyOnQueueComplete ? 'on' : '')}
+          style={{ marginTop: 8 }}
+        >
+          <input
+            type="checkbox"
+            checked={draftNotifyOnQueueComplete}
+            disabled={busy}
+            onChange={() => {
+              setDraftNotifyOnQueueComplete(!draftNotifyOnQueueComplete);
+            }}
+          />
+          <span className="knob" />
+          <span className="lbl">
+            Notify when the queue finishes
+            <span className="desc mono">
+              {draftNotifyOnQueueComplete
+                ? 'system toast when the last item ships'
+                : 'silent — check the side panel'}
+            </span>
+          </span>
+        </label>
       </div>
 
       <div className="settings-section">

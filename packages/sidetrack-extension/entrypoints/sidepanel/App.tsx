@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
 
 import {
   companionStatusLabel,
+  compareQueueItems,
   createEmptyWorkboardState,
   type AllThreadsBucket,
   type CodingSession,
@@ -368,9 +369,13 @@ const App = () => {
   const [wsPickerOpen, setWsPickerOpen] = useState(false);
   const [wsPickerCreateMode, setWsPickerCreateMode] = useState(false);
   const [viewMode, setViewMode] = useState<'workstream' | 'all'>('workstream');
-  const [queueComposeFor, setQueueComposeFor] = useState<string | null>(null);
   const [queueDraft, setQueueDraft] = useState('');
   const [queueExpandFor, setQueueExpandFor] = useState<string | null>(null);
+  // Set briefly after the user opens compose-at-end via the row's
+  // "Queue follow-up" menu so the input grabs focus on the next render.
+  const [queueComposeAutoFocus, setQueueComposeAutoFocus] = useState<string | null>(null);
+  const [draggedQueueItemId, setDraggedQueueItemId] = useState<string | null>(null);
+  const [dragOverQueueItemId, setDragOverQueueItemId] = useState<string | null>(null);
   const [queueCopiedId, setQueueCopiedId] = useState<string | null>(null);
   // Per-thread inline-review draft expansion. Mirrors queueExpandFor:
   // null = chip collapsed, threadId = footer expanded for that thread.
@@ -1279,9 +1284,12 @@ const App = () => {
         type: messageTypes.queueFollowUp,
         item: { text, scope: 'thread', targetId: threadId },
       });
+      // Keep the queue expanded and the compose input focused so the
+      // user can stack the next follow-up without re-clicking. Only
+      // the draft text is cleared.
       setQueueDraft('');
-      setQueueComposeFor(null);
       setQueueExpandFor(threadId);
+      setQueueComposeAutoFocus(threadId);
       return next;
     });
   };
@@ -1292,6 +1300,38 @@ const App = () => {
         type: messageTypes.updateQueueItem,
         queueItemId,
         update: { status: 'dismissed' },
+      }),
+    );
+  };
+
+  const reorderQueueItem = (
+    pendingItems: readonly { readonly bac_id: string }[],
+    sourceId: string,
+    targetId: string | null,
+  ) => {
+    // targetId === null => drop at the tail. Otherwise insert the
+    // dragged item before targetId. Active items (mid-send) keep
+    // their existing position; the drain ships them next regardless
+    // of where reorder happened.
+    const ids = pendingItems.map((i) => i.bac_id).filter((id) => id !== sourceId);
+    let nextOrder: string[];
+    if (targetId === null) {
+      nextOrder = [...ids, sourceId];
+    } else {
+      const targetIndex = ids.indexOf(targetId);
+      if (targetIndex < 0) {
+        nextOrder = [...ids, sourceId];
+      } else {
+        nextOrder = [...ids.slice(0, targetIndex), sourceId, ...ids.slice(targetIndex)];
+      }
+    }
+    if (nextOrder.length === 0) {
+      return;
+    }
+    void runAction(() =>
+      sendRequest({
+        type: messageTypes.reorderQueueItems,
+        queueItemIds: nextOrder,
       }),
     );
   };
@@ -1849,9 +1889,12 @@ const App = () => {
     const pendingQueueItems = state.queueItems
       .filter((q) => q.targetId === thread.bac_id && q.status === 'pending')
       .slice()
-      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      .sort(compareQueueItems);
     const queuedCount = pendingQueueItems.length;
-    const queueExpanded = queueExpandFor === thread.bac_id && queuedCount > 0;
+    // Expansion holds the compose-at-end row even when the queue is
+    // empty, so the user can keep stacking follow-ups without the
+    // list collapsing under them.
+    const queueExpanded = queueExpandFor === thread.bac_id;
     const childForks = state.threads.filter((t) => t.parentThreadId === thread.bac_id);
     const parent =
       thread.parentThreadId === undefined
@@ -2132,13 +2175,20 @@ const App = () => {
                         role="menuitem"
                         onClick={() => {
                           setActionMenuOpenFor(null);
-                          setQueueComposeFor(
-                            queueComposeFor === thread.bac_id ? null : thread.bac_id,
-                          );
-                          setQueueDraft('');
+                          // Toggle so the menu item is the collapse
+                          // affordance when the queue pill is gone
+                          // (e.g. count just drained to 0).
+                          if (queueExpandFor === thread.bac_id) {
+                            setQueueExpandFor(null);
+                            setQueueDraft('');
+                          } else {
+                            setQueueExpandFor(thread.bac_id);
+                            setQueueDraft('');
+                            setQueueComposeAutoFocus(thread.bac_id);
+                          }
                         }}
                       >
-                        Queue follow-up
+                        {queueExpandFor === thread.bac_id ? 'Hide queue' : 'Queue follow-up'}
                       </button>
                       <button
                         type="button"
@@ -2254,43 +2304,6 @@ const App = () => {
             />
           </div>
         ) : null}
-        {queueComposeFor === thread.bac_id ? (
-          <form
-            className="thread-queue-compose"
-            onSubmit={(e) => {
-              e.preventDefault();
-              submitQueueFollowUp(thread.bac_id);
-            }}
-          >
-            <input
-              type="text"
-              autoFocus
-              className="mono"
-              placeholder="Ask next… (fires after this thread replies)"
-              value={queueDraft}
-              onChange={(e) => {
-                setQueueDraft(e.target.value);
-              }}
-            />
-            <button
-              type="submit"
-              className="btn-link"
-              disabled={busy || queueDraft.trim().length === 0}
-            >
-              Add
-            </button>
-            <button
-              type="button"
-              className="btn-link"
-              onClick={() => {
-                setQueueComposeFor(null);
-                setQueueDraft('');
-              }}
-            >
-              Cancel
-            </button>
-          </form>
-        ) : null}
         {expandedDraft !== null ? (
           <div className="thread-review-draft">
             <div className="thread-review-draft-head mono">
@@ -2322,6 +2335,11 @@ const App = () => {
         ) : null}
         {queueExpanded ? (
           <ul className="thread-queue-list" aria-label="Queued follow-ups">
+            {pendingQueueItems.length === 0 ? (
+              <li className="queue-empty-hint mono">
+                no queued follow-ups · type below to stack one for after the next reply
+              </li>
+            ) : null}
             {pendingQueueItems.some((item) => item.lastError !== undefined) ? (
               <li className="queue-retry-all-row">
                 <button
@@ -2345,30 +2363,151 @@ const App = () => {
                 </button>
               </li>
             ) : null}
-            {pendingQueueItems.map((item, index) => (
-              <AutoSendQueueRow
-                key={item.bac_id}
-                item={item}
-                index={index}
-                total={pendingQueueItems.length}
-                providerLabel={providerLabel(thread.provider)}
-                copied={queueCopiedId === item.bac_id}
-                onCopy={() => {
-                  copyQueueItemText(item.bac_id, item.text);
+            {pendingQueueItems.map((item, index) => {
+              const itemDraggable = item.progress === undefined;
+              return (
+                <AutoSendQueueRow
+                  key={item.bac_id}
+                  item={item}
+                  index={index}
+                  total={pendingQueueItems.length}
+                  providerLabel={providerLabel(thread.provider)}
+                  copied={queueCopiedId === item.bac_id}
+                  onCopy={() => {
+                    copyQueueItemText(item.bac_id, item.text);
+                  }}
+                  onRetry={() => {
+                    void runAction(() =>
+                      sendRequest({
+                        type: messageTypes.retryAutoSend,
+                        queueItemId: item.bac_id,
+                      }),
+                    );
+                  }}
+                  onDismiss={() => {
+                    dismissQueueItem(item.bac_id);
+                  }}
+                  dnd={
+                    pendingQueueItems.length > 1
+                      ? {
+                          draggable: itemDraggable,
+                          dragOverActive:
+                            dragOverQueueItemId === item.bac_id &&
+                            draggedQueueItemId !== null &&
+                            draggedQueueItemId !== item.bac_id,
+                          onDragStart: (event) => {
+                            event.dataTransfer.effectAllowed = 'move';
+                            event.dataTransfer.setData('text/plain', item.bac_id);
+                            setDraggedQueueItemId(item.bac_id);
+                          },
+                          onDragEnd: () => {
+                            setDraggedQueueItemId(null);
+                            setDragOverQueueItemId(null);
+                          },
+                          onDragOver: (event) => {
+                            if (draggedQueueItemId === null) {
+                              return;
+                            }
+                            event.preventDefault();
+                            event.dataTransfer.dropEffect = 'move';
+                            if (dragOverQueueItemId !== item.bac_id) {
+                              setDragOverQueueItemId(item.bac_id);
+                            }
+                          },
+                          onDragLeave: () => {
+                            if (dragOverQueueItemId === item.bac_id) {
+                              setDragOverQueueItemId(null);
+                            }
+                          },
+                          onDrop: (event) => {
+                            event.preventDefault();
+                            const fromTransfer = event.dataTransfer.getData('text/plain');
+                            const sourceId =
+                              fromTransfer.length > 0
+                                ? fromTransfer
+                                : (draggedQueueItemId ?? '');
+                            setDraggedQueueItemId(null);
+                            setDragOverQueueItemId(null);
+                            if (sourceId.length === 0 || sourceId === item.bac_id) {
+                              return;
+                            }
+                            reorderQueueItem(pendingQueueItems, sourceId, item.bac_id);
+                          },
+                        }
+                      : undefined
+                  }
+                />
+              );
+            })}
+            <li
+              className={`queue-compose-row${
+                draggedQueueItemId !== null && dragOverQueueItemId === '__tail__'
+                  ? ' drag-over-tail'
+                  : ''
+              }`}
+              onDragOver={(event) => {
+                if (draggedQueueItemId === null) {
+                  return;
+                }
+                event.preventDefault();
+                event.dataTransfer.dropEffect = 'move';
+                if (dragOverQueueItemId !== '__tail__') {
+                  setDragOverQueueItemId('__tail__');
+                }
+              }}
+              onDragLeave={() => {
+                if (dragOverQueueItemId === '__tail__') {
+                  setDragOverQueueItemId(null);
+                }
+              }}
+              onDrop={(event) => {
+                event.preventDefault();
+                const fromTransfer = event.dataTransfer.getData('text/plain');
+                const sourceId =
+                  fromTransfer.length > 0 ? fromTransfer : (draggedQueueItemId ?? '');
+                setDraggedQueueItemId(null);
+                setDragOverQueueItemId(null);
+                if (sourceId.length === 0) {
+                  return;
+                }
+                reorderQueueItem(pendingQueueItems, sourceId, null);
+              }}
+            >
+              <form
+                className="thread-queue-compose"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  submitQueueFollowUp(thread.bac_id);
                 }}
-                onRetry={() => {
-                  void runAction(() =>
-                    sendRequest({
-                      type: messageTypes.retryAutoSend,
-                      queueItemId: item.bac_id,
-                    }),
-                  );
-                }}
-                onDismiss={() => {
-                  dismissQueueItem(item.bac_id);
-                }}
-              />
-            ))}
+              >
+                <input
+                  type="text"
+                  className="mono"
+                  placeholder="Ask next… (fires after this thread replies)"
+                  value={queueDraft}
+                  ref={(node) => {
+                    if (
+                      node !== null &&
+                      queueComposeAutoFocus === thread.bac_id &&
+                      document.activeElement !== node
+                    ) {
+                      node.focus();
+                      setQueueComposeAutoFocus(null);
+                    }
+                  }}
+                  onChange={(e) => {
+                    setQueueDraft(e.target.value);
+                  }}
+                />
+                <button
+                  type="submit"
+                  className="btn-link"
+                  disabled={busy || queueDraft.trim().length === 0}
+                >
+                  Add
+                </button>
+              </form>
+            </li>
           </ul>
         ) : null}
         {titleExpanded ? (
@@ -3843,6 +3982,7 @@ const App = () => {
           localPreferences={{
             autoTrack: state.settings.autoTrack,
             vaultPath: state.vaultPath ?? '',
+            notifyOnQueueComplete: state.settings.notifyOnQueueComplete,
           }}
           companionConfigured={bridgeKey.length > 0}
           workstreams={state.workstreams}

@@ -61,6 +61,8 @@ import {
   saveCollapsedSections,
   saveScreenShareMode,
   saveVaultPath,
+  reorderLocalQueueItems,
+  saveNotifyOnQueueComplete,
   updateLocalCaptureNote,
   updateLocalQueueItem,
   updateLocalReminder,
@@ -691,7 +693,13 @@ const sendToContentScriptWithRecovery = async (
 // src/companion/autoSendDrain.ts. The orchestrator handles the
 // per-item §24.10 preflight, sequencing, stop-on-failure, and the
 // status / lastError transitions. See that file for flow + reasoning.
-const runAutoSendDrain = async (threadId: string): Promise<boolean> => {
+interface AutoSendDrainOutcome {
+  readonly mutated: boolean;
+  readonly itemsSent: number;
+  readonly completed: boolean;
+}
+
+const runAutoSendDrain = async (threadId: string): Promise<AutoSendDrainOutcome> => {
   const outcome = await driveAutoSendImpl(threadId, {
     readThread: async (id) => {
       const t = (await readThreads()).find((x) => x.bac_id === id);
@@ -755,21 +763,66 @@ const runAutoSendDrain = async (threadId: string): Promise<boolean> => {
       console.warn(message);
     },
   });
-  return outcome.mutated;
+  return {
+    mutated: outcome.mutated,
+    itemsSent: outcome.itemsSent,
+    completed: outcome.stoppedReason === 'completed',
+  };
 };
 
 // Fire-and-forget wrapper: spawns the drain unawaited and broadcasts
 // the workboard once it lands so the side panel re-reads the queue.
+// When the drain ships the last pending item for a thread, surface
+// a system notification so the user can context-switch away while
+// auto-send works through the queue (gated by notifyOnQueueComplete).
 const triggerAutoSendDrain = (threadId: string): void => {
   void runAutoSendDrain(threadId)
-    .then((mutated) => {
-      if (mutated) {
+    .then((outcome) => {
+      if (outcome.mutated) {
         void broadcastWorkboardChanged('queue');
+      }
+      if (outcome.completed && outcome.itemsSent > 0) {
+        void notifyQueueDrained(threadId, outcome.itemsSent).catch((error: unknown) => {
+          console.warn('[autoSend] notify failed:', error);
+        });
       }
     })
     .catch((error: unknown) => {
       console.warn('[autoSend] drain crashed:', error);
     });
+};
+
+// 1x1 transparent PNG. Chrome.notifications.create requires iconUrl
+// for type 'basic'; we ship a tiny inline placeholder so the
+// notification renders without an asset dependency.
+const NOTIFY_ICON_DATA_URL =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+
+const notifyQueueDrained = async (threadId: string, itemsSent: number): Promise<void> => {
+  const settings = await readSettings();
+  if (!settings.notifyOnQueueComplete) {
+    return;
+  }
+  if (typeof chrome.notifications.create !== 'function') {
+    return;
+  }
+  const thread = (await readThreads()).find((t) => t.bac_id === threadId);
+  const title = thread?.title ?? 'thread';
+  await new Promise<void>((resolve) => {
+    chrome.notifications.create(
+      `sidetrack.queue.complete.${threadId}.${String(Date.now())}`,
+      {
+        type: 'basic',
+        iconUrl: NOTIFY_ICON_DATA_URL,
+        title: 'Auto-send queue complete',
+        message: `Sidetrack finished sending ${String(itemsSent)} follow-up${itemsSent === 1 ? '' : 's'} into "${title}".`,
+        priority: 0,
+      },
+      () => {
+        resolve();
+      },
+    );
+  });
 };
 
 const currentTabThread = async (): Promise<TrackedThread | undefined> => {
@@ -1203,6 +1256,13 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
     );
   }
 
+  if (request.type === messageTypes.reorderQueueItems) {
+    return await withCompanionStatus(
+      () => reorderLocalQueueItems(request.queueItemIds),
+      'queue',
+    );
+  }
+
   if (request.type === messageTypes.retryAutoSend) {
     return await withCompanionStatus(async () => {
       // Clear lastError so the row stops showing the failure note
@@ -1371,6 +1431,9 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
       }
       if (typeof request.preferences.vaultPath === 'string') {
         await saveVaultPath(request.preferences.vaultPath);
+      }
+      if (typeof request.preferences.notifyOnQueueComplete === 'boolean') {
+        await saveNotifyOnQueueComplete(request.preferences.notifyOnQueueComplete);
       }
     }, 'settings');
   }

@@ -85,8 +85,13 @@ const storageSessionSet = async (values: Record<string, unknown>): Promise<void>
 
 const createLocalBacId = (): string => `bac_${crypto.randomUUID().replaceAll('-', '_')}`;
 
-export const readSettings = async (): Promise<UiSettings> =>
-  await storageGet<UiSettings>(SETTINGS_KEY, defaultSettings);
+export const readSettings = async (): Promise<UiSettings> => {
+  const stored = await storageGet<UiSettings>(SETTINGS_KEY, defaultSettings);
+  // Merge against defaults so installs that pre-date a new flag pick
+  // it up at its default rather than `undefined` (which behaves as
+  // "off" for booleans).
+  return { ...defaultSettings, ...stored };
+};
 
 export const saveCompanionSettings = async (settings: CompanionSettings): Promise<UiSettings> => {
   const current = await readSettings();
@@ -98,6 +103,15 @@ export const saveCompanionSettings = async (settings: CompanionSettings): Promis
 export const saveAutoTrack = async (autoTrack: boolean): Promise<UiSettings> => {
   const current = await readSettings();
   const next: UiSettings = { ...current, autoTrack };
+  await storageSet({ [SETTINGS_KEY]: next });
+  return next;
+};
+
+export const saveNotifyOnQueueComplete = async (
+  notifyOnQueueComplete: boolean,
+): Promise<UiSettings> => {
+  const current = await readSettings();
+  const next: UiSettings = { ...current, notifyOnQueueComplete };
   await storageSet({ [SETTINGS_KEY]: next });
   return next;
 };
@@ -653,6 +667,32 @@ export const updateLocalQueueItem = async (
   });
   await storageSet({ [QUEUE_ITEMS_KEY]: next });
   return updated;
+};
+
+// Stamp sortOrder on the items in the supplied id list (in order),
+// preserving every other item untouched. Items not in the list keep
+// whatever sortOrder they had — the caller is expected to pass the
+// full ordered set of pending items it wants to re-rank (typically
+// one thread's queue).
+export const reorderLocalQueueItems = async (
+  orderedIds: readonly string[],
+): Promise<void> => {
+  if (orderedIds.length === 0) {
+    return;
+  }
+  const current = await readQueueItems();
+  const rankByItemId = new Map<string, number>();
+  orderedIds.forEach((id, index) => {
+    rankByItemId.set(id, index);
+  });
+  const next = current.map((item) => {
+    const rank = rankByItemId.get(item.bac_id);
+    if (rank === undefined) {
+      return item;
+    }
+    return { ...item, sortOrder: rank };
+  });
+  await storageSet({ [QUEUE_ITEMS_KEY]: next });
 };
 
 const normalizeForMatch = (text: string): string =>

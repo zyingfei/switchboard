@@ -46,7 +46,7 @@ export default defineConfig({
   manifest: {
     name: 'Sidetrack',
     description: 'Local-first browser AI work tracker.',
-    permissions: ['activeTab', 'sidePanel', 'storage', 'scripting'],
+    permissions: ['activeTab', 'sidePanel', 'storage', 'scripting', 'notifications'],
     host_permissions: [
       'https://chatgpt.com/*',
       'https://chat.openai.com/*',
