@@ -453,9 +453,21 @@ const replayQueuedCaptures = async (): Promise<void> => {
     return;
   }
 
-  await drainQueue(async (event) => {
-    await sendToCompanion(event);
-  });
+  // Trigger came from withCompanionStatus — the user just touched the
+  // panel and we're about to verify companion reachability. Treat this
+  // as a positive reconnect signal: bypass the per-item backoff so any
+  // queued items from a prior offline window drain on the first try.
+  // If send still fails here, the catch path resets attempts via
+  // computeNextAttempt, restoring the backoff.
+  await drainQueue(
+    async (event) => {
+      await sendToCompanion(event);
+    },
+    undefined,
+    undefined,
+    undefined,
+    { ignoreBackoff: true },
+  );
 };
 
 const isCompanionConfigured = async (): Promise<boolean> => {

@@ -176,20 +176,14 @@ test.describe('dispatch confirm (synthetic)', () => {
       // Subtitle shows target + paste mode.
       await expect(confirm).toContainText('paste mode');
 
-      // Four safety rows are present.
-      const rows = confirm.locator('.safety-row');
-      await expect(rows).toHaveCount(4);
-
-      // Token-budget bar is attached even at 0% (width:0 makes it
-      // invisible per Playwright's heuristic, but the element is in the
-      // DOM with the right level class).
-      const tokenBar = confirm.locator('.token-bar-fill');
-      await expect(tokenBar).toBeAttached();
-      await expect(tokenBar).toHaveClass(/\b(green|amber|over)\b/u);
-      // Default no-redaction copy.
-      await expect(confirm.locator('.safety-row.green').first()).toContainText('Nothing redacted');
-      // No redaction + no screen share + no injection by default → three green rows.
-      await expect(confirm.locator('.safety-row.green')).toHaveCount(3);
+      // v2 design pass: safety chain is a single collapsible summary
+      // with four .sc-pip chips for the §24.10 quartet.
+      const chain = confirm.locator('.safety-chain');
+      await expect(chain).toBeVisible();
+      await expect(chain).toHaveClass(/\bok\b/u);
+      const pips = chain.locator('.sc-pip');
+      await expect(pips).toHaveCount(4);
+      await expect(chain).toContainText('checks ok');
 
       // Send-mode pills: Paste is the default; Auto-send is disabled
       // because autoSendOptIn.claude=false in the mocked settings.
