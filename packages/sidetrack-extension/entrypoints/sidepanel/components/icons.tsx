@@ -124,6 +124,25 @@ export const Icons = {
       <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
     </svg>
   ),
+  refresh: (
+    <svg viewBox="0 0 24 24" {...sw}>
+      <path d="M3 12a9 9 0 0 1 15.5-6.4L21 8" />
+      <path d="M21 3v5h-5" />
+      <path d="M21 12a9 9 0 0 1-15.5 6.4L3 16" />
+      <path d="M3 21v-5h5" />
+    </svg>
+  ),
+  back: (
+    <svg viewBox="0 0 24 24" {...sw}>
+      <path d="M19 12H5" />
+      <path d="m12 19-7-7 7-7" />
+    </svg>
+  ),
+  activity: (
+    <svg viewBox="0 0 24 24" {...sw}>
+      <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+    </svg>
+  ),
 } satisfies Record<string, ReactElement>;
 
 export type IconName = keyof typeof Icons;
