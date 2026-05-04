@@ -43,7 +43,43 @@ export class RecallClient {
       throw new Error(parseProblemMessage(value) ?? `Companion HTTP ${String(response.status)}`);
     }
   }
+
+  async query(
+    q: string,
+    opts: { readonly limit?: number; readonly workstreamId?: string } = {},
+  ): Promise<readonly RankedItem[]> {
+    const params = new URLSearchParams({ q });
+    if (opts.limit !== undefined) params.set('limit', String(opts.limit));
+    if (opts.workstreamId !== undefined) params.set('workstreamId', opts.workstreamId);
+    const response = await fetch(`${this.baseUrl}/recall/query?${params.toString()}`, {
+      method: 'GET',
+      headers: { 'x-bac-bridge-key': this.settings.bridgeKey },
+    });
+    if (!response.ok) {
+      const value = (await response.json().catch(() => ({}))) as unknown;
+      throw new Error(parseProblemMessage(value) ?? `Companion HTTP ${String(response.status)}`);
+    }
+    const body = (await response.json()) as { readonly data?: unknown };
+    if (!Array.isArray(body.data)) return [];
+    return body.data.filter((item: unknown): item is RankedItem => isRankedItem(item));
+  }
 }
+
+export interface RankedItem {
+  readonly id: string;
+  readonly threadId: string;
+  readonly capturedAt: string;
+  readonly score: number;
+  readonly title?: string;
+  readonly snippet?: string;
+}
+
+const isRankedItem = (value: unknown): value is RankedItem =>
+  isRecord(value) &&
+  typeof value.id === 'string' &&
+  typeof value.threadId === 'string' &&
+  typeof value.capturedAt === 'string' &&
+  typeof value.score === 'number';
 
 export const createRecallClient = (settings: CompanionSettings): RecallClient =>
   new RecallClient(settings);

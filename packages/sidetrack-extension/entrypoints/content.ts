@@ -5,6 +5,14 @@ import { createAnnotationClient } from '../src/annotation/client';
 import { captureVisibleConversation } from '../src/capture/extractors';
 import { detectProviderFromUrl, isProviderThreadUrl } from '../src/capture/providerDetection';
 import { messageTypes, type ContentRequest, type ContentResponse } from '../src/messages';
+import {
+  mountAnnotationOverlay,
+  mountDejaVuPopover,
+  type DejaVuItem,
+  type RestoredAnchor,
+} from '../src/contentOverlays';
+import { createRecallClient, type RankedItem } from '../src/companion/recallClient';
+import { readCompanionSettingsFromStorage } from '../src/companion/settingsBridge';
 
 // Per-provider composer + send-button + AI-done selectors. Sourced
 // from `tests/e2e/live-status-transitions.spec.ts` which proved each
@@ -203,17 +211,98 @@ export default defineContentScript({
           return;
         }
         const annotations = await client.listAnnotationsForUrl(window.location.href);
+        const restored: RestoredAnchor[] = [];
         for (const annotation of annotations) {
           const range = findAnchor(document.documentElement, annotation.anchor);
           if (range !== null) {
-            // eslint-disable-next-line no-console
-            console.info('sidetrack:anchor-restored', { id: annotation.bac_id, range });
+            restored.push({ id: annotation.bac_id, rect: range.getBoundingClientRect() });
           }
+        }
+        if (restored.length > 0) {
+          mountAnnotationOverlay(restored);
         }
       } catch {
         // Restore is best-effort and must never disturb the host page.
       }
     };
+
+    // Déjà-vu pop-on-highlight — debounced selection listener that
+    // queries the companion's recall index and surfaces matching prior
+    // threads above the selection. Soft-fails on every error path so
+    // the host page stays unaffected.
+    let dejaVuDebounceTimer: number | undefined;
+    let dejaVuMounted: { close: () => void } | null = null;
+    const dejaVuMutedForUrl = '';
+    const SELECTION_MIN_CHARS = 18;
+
+    const closeDejaVu = (): void => {
+      dejaVuMounted?.close();
+      dejaVuMounted = null;
+    };
+
+    const fetchDejaVu = async (text: string, anchorRect: DOMRect): Promise<void> => {
+      if (dejaVuMutedForUrl === window.location.href) return;
+      try {
+        const settings = await readCompanionSettingsFromStorage();
+        if (settings === null) return;
+        const client = createRecallClient(settings);
+        const results = await client.query(text, { limit: 5 });
+        if (results.length === 0) return;
+        closeDejaVu();
+        dejaVuMounted = mountDejaVuPopover({
+          items: results.map((r: RankedItem): DejaVuItem => ({
+            id: r.id,
+            title: r.title ?? `thread ${r.threadId.slice(0, 12)}`,
+            snippet: r.snippet ?? '',
+            score: r.score,
+            relativeWhen: r.capturedAt,
+          })),
+          anchorRect,
+          onJump: () => {
+            closeDejaVu();
+          },
+          onDismiss: () => {
+            dejaVuMounted = null;
+          },
+        });
+      } catch {
+        // Silent — recall is best-effort
+      }
+    };
+
+    const onSelectionChange = (): void => {
+      if (dejaVuDebounceTimer !== undefined) {
+        window.clearTimeout(dejaVuDebounceTimer);
+      }
+      dejaVuDebounceTimer = window.setTimeout(() => {
+        const selection = window.getSelection();
+        if (selection === null || selection.rangeCount === 0) {
+          return;
+        }
+        const text = selection.toString().trim();
+        if (text.length < SELECTION_MIN_CHARS) {
+          return;
+        }
+        const range = selection.getRangeAt(0);
+        const rect = range.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) return;
+        void fetchDejaVu(text, rect);
+      }, 400);
+    };
+
+    document.addEventListener('selectionchange', onSelectionChange);
+    document.addEventListener('mousedown', (event) => {
+      // Click outside the popover dismisses it. Inside-pop clicks bubble
+      // to the popover's own listeners (jump / close button).
+      const target = event.target;
+      if (
+        dejaVuMounted !== null &&
+        target instanceof Element &&
+        target.closest('.sidetrack-deja-pop') === null
+      ) {
+        closeDejaVu();
+      }
+    });
 
     const captureSignature = (capture: ReturnType<typeof createCapture>): string => {
       const lastTurn = capture.turns.at(-1);
