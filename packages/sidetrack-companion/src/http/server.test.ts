@@ -142,6 +142,53 @@ describe('companion HTTP server', () => {
     expect(result.body).toMatchObject({ code: 'AUTHENTICATION_FAILED' });
   });
 
+  it('reports service status through a stubbed installer', async () => {
+    context = {
+      ...context,
+      serviceInstaller: {
+        install: () => Promise.reject(new Error('not used')),
+        uninstall: () => Promise.reject(new Error('not used')),
+        status: () =>
+          Promise.resolve({
+            installed: true,
+            running: false,
+            platform: 'linux',
+            path: '/home/test/.config/systemd/user/sidetrack-companion.service',
+          }),
+      },
+    };
+
+    const result = await jsonFetch(context, `${baseUrl}/v1/system/service-status`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({
+      data: { installed: true, running: false, platform: 'linux' },
+    });
+  });
+
+  it('reports update advisory through a stubbed checker', async () => {
+    context = {
+      ...context,
+      updateChecker: () =>
+        Promise.resolve({
+          current: '0.0.0',
+          latest: '0.1.0',
+          behind: true,
+          ageDays: 1,
+          releasedAt: '2026-05-02T00:00:00.000Z',
+        }),
+    };
+
+    const result = await jsonFetch(context, `${baseUrl}/v1/system/update-check`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({ data: { latest: '0.1.0', behind: true } });
+  });
+
   it('surfaces vault-unreachable status without accepting writes', async () => {
     await rm(vaultPath, { recursive: true, force: true });
 
@@ -266,6 +313,50 @@ describe('companion HTTP server', () => {
         revision: '1',
       },
     });
+  });
+
+  it('exports and imports portable settings bundles', async () => {
+    await mkdir(join(vaultPath, '_BAC', '.config'), { recursive: true });
+    await mkdir(join(vaultPath, '_BAC', 'workstreams'), { recursive: true });
+    await writeFile(
+      join(vaultPath, '_BAC', '.config', 'settings.json'),
+      JSON.stringify({
+        autoSendOptIn: { chatgpt: true, claude: true, gemini: true },
+        defaultPacketKind: 'research',
+        defaultDispatchTarget: 'claude',
+        screenShareSafeMode: false,
+        revision: '0',
+      }),
+      'utf8',
+    );
+    await writeFile(
+      join(vaultPath, '_BAC', 'workstreams', 'ws_export.json'),
+      JSON.stringify({ bac_id: 'ws_export', title: 'Exported' }),
+      'utf8',
+    );
+
+    const exported = await jsonFetch(context, `${baseUrl}/v1/settings/export`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    const imported = await jsonFetch(context, `${baseUrl}/v1/settings/import`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        ...(exported.body as Record<string, unknown>),
+        workstreams: [{ bac_id: 'ws_imported', title: 'Imported' }],
+      }),
+    });
+
+    expect(exported.status).toBe(200);
+    expect(exported.body).toMatchObject({
+      schemaVersion: 1,
+      workstreams: [{ bac_id: 'ws_export' }],
+    });
+    expect(imported.status).toBe(200);
+    expect(imported.body).toMatchObject({ data: { applied: 2, skipped: 0 } });
   });
 
   it('returns vault-unreachable for settings when the vault is missing', async () => {

@@ -121,6 +121,8 @@ export const providerIdToDispatchProvider = (provider: ProviderId): DispatchTarg
       return 'claude';
     case 'gemini':
       return 'gemini';
+    case 'codex':
+      return 'codex';
     case 'unknown':
       return 'other';
   }

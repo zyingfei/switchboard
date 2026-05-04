@@ -281,6 +281,7 @@ export const defaultSettings: UiSettings = {
     chatgpt: true,
     claude: true,
     gemini: true,
+    codex: true,
   },
 };
 

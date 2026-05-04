@@ -1,6 +1,6 @@
 import type { ProviderId } from '../companion/model';
 
-const fixtureProviders = new Set<ProviderId>(['chatgpt', 'claude', 'gemini']);
+const fixtureProviders = new Set<ProviderId>(['chatgpt', 'claude', 'gemini', 'codex']);
 
 const providerFromFixtureParam = (url: URL): ProviderId | null => {
   const provider = url.searchParams.get('provider') as ProviderId | null;
@@ -22,6 +22,9 @@ export const detectProviderFromUrl = (inputUrl: string): ProviderId => {
 
   const host = url.hostname.toLowerCase();
   if (host === 'chatgpt.com' || host === 'chat.openai.com') {
+    if (host === 'chatgpt.com' && url.pathname.startsWith('/codex/')) {
+      return 'codex';
+    }
     return 'chatgpt';
   }
   if (host === 'claude.ai') {
@@ -82,6 +85,9 @@ export const isProviderThreadUrl = (provider: ProviderId, inputUrl: string): boo
     case 'chatgpt':
       // /c/<threadId> or /g/<gptId>/c/<threadId>
       return /\/(?:c|g\/[^/]+\/c)\/[^/?#]+/u.test(pathname);
+    case 'codex':
+      // /codex/<sessionId>
+      return /\/codex\/[^/?#]+/u.test(pathname);
     case 'claude':
       // /chat/<threadId>
       return /\/chat\/[^/?#]+/u.test(pathname);

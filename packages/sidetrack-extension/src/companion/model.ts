@@ -1,4 +1,4 @@
-export type ProviderId = 'chatgpt' | 'claude' | 'gemini' | 'unknown';
+export type ProviderId = 'chatgpt' | 'claude' | 'gemini' | 'codex' | 'unknown';
 export type SelectorCanary = 'ok' | 'warning' | 'failed';
 
 export interface CompanionSettings {

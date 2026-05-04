@@ -19,6 +19,8 @@ export const sidetrackToolNames = [
   'bac.list_annotations',
   'bac.recall',
   'bac.suggest_workstream',
+  'bac.export_settings',
+  'bac.system_update_check',
   'bac.dispatches',
   'bac.reviews',
   'bac.turns',

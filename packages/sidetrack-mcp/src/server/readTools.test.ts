@@ -265,4 +265,42 @@ describe('companion-backed read tools', () => {
       await client.close();
     }
   });
+
+  it('returns portable settings export via bac.export_settings', async () => {
+    const companionClient = buildFakeCompanionClient({
+      exportSettings: vi.fn(() =>
+        Promise.resolve({
+          schemaVersion: 1,
+          exportedAt: '2026-05-03T00:00:00.000Z',
+          settings: {},
+          workstreams: [],
+          templates: [],
+        }),
+      ),
+    });
+    const client = await startInProcessServer(companionClient);
+    try {
+      const result = await client.callTool({ name: 'bac.export_settings', arguments: {} });
+      expect(companionClient.exportSettings).toHaveBeenCalled();
+      expect(result.structuredContent).toMatchObject({ schemaVersion: 1 });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('returns update advisory via bac.system_update_check', async () => {
+    const companionClient = buildFakeCompanionClient({
+      systemUpdateCheck: vi.fn(() =>
+        Promise.resolve({ current: '0.0.0', latest: '0.1.0', behind: true }),
+      ),
+    });
+    const client = await startInProcessServer(companionClient);
+    try {
+      const result = await client.callTool({ name: 'bac.system_update_check', arguments: {} });
+      expect(companionClient.systemUpdateCheck).toHaveBeenCalled();
+      expect(result.structuredContent).toMatchObject({ latest: '0.1.0', behind: true });
+    } finally {
+      await client.close();
+    }
+  });
 });

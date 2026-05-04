@@ -6,7 +6,7 @@ const bacIdSchema = z
   .max(64)
   .regex(/^[A-Za-z0-9_-]+$/);
 const isoDateTimeSchema = z.iso.datetime();
-const providerSchema = z.enum(['chatgpt', 'claude', 'gemini', 'unknown']);
+const providerSchema = z.enum(['chatgpt', 'claude', 'gemini', 'codex', 'unknown']);
 const dispatchTargetProviderSchema = z.enum([
   'chatgpt',
   'claude',

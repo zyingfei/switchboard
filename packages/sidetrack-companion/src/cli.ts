@@ -3,6 +3,7 @@
 import type { Writable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 
+import { pickInstaller } from './install/index.js';
 import { startCompanion } from './runtime/companion.js';
 
 export const companionVersion = '0.0.0';
@@ -15,6 +16,9 @@ export interface CliStreams {
 interface ParsedArgs {
   readonly help: boolean;
   readonly version: boolean;
+  readonly installService: boolean;
+  readonly uninstallService: boolean;
+  readonly serviceStatus: boolean;
   readonly vaultPath?: string;
   readonly port: number;
 }
@@ -28,6 +32,9 @@ export const renderHelp = (): string =>
     'Usage:',
     '  sidetrack-companion --help',
     '  sidetrack-companion --version',
+    '  sidetrack-companion --install-service --vault <path> [--port 17373]',
+    '  sidetrack-companion --uninstall-service',
+    '  sidetrack-companion --service-status',
     '  sidetrack-companion --vault <path> [--port 17373]',
     '',
     'Starts the localhost companion API and writes Sidetrack-owned files under _BAC/.',
@@ -63,6 +70,9 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
   const parsed: ParsedArgs = {
     help: argv.includes('--help') || argv.includes('-h'),
     version: argv.includes('--version'),
+    installService: argv.includes('--install-service'),
+    uninstallService: argv.includes('--uninstall-service'),
+    serviceStatus: argv.includes('--service-status'),
     port,
   };
 
@@ -82,10 +92,39 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
     return 0;
   }
 
+  if (args.serviceStatus) {
+    const status = await pickInstaller().status();
+    writeLine(
+      streams.stdout,
+      `service ${status.installed ? 'installed' : 'not installed'}; ${status.running ? 'running' : 'not running'} (${status.platform})`,
+    );
+    if (status.path !== undefined) {
+      writeLine(streams.stdout, `path ${status.path}`);
+    }
+    return 0;
+  }
+
+  if (args.uninstallService) {
+    await pickInstaller().uninstall();
+    writeLine(streams.stdout, 'sidetrack companion service uninstalled');
+    return 0;
+  }
+
   if (args.vaultPath === undefined || args.vaultPath.length === 0) {
     writeLine(streams.stderr, 'Missing required --vault <path>.');
     writeLine(streams.stderr, renderHelp());
     return 2;
+  }
+
+  if (args.installService) {
+    const result = await pickInstaller().install({
+      vaultPath: args.vaultPath,
+      port: args.port,
+      ...(process.argv[1] === undefined ? {} : { companionBin: process.argv[1] }),
+    });
+    writeLine(streams.stdout, `sidetrack companion service installed (${result.platform})`);
+    writeLine(streams.stdout, `path ${result.path}`);
+    return result.installed ? 0 : 1;
   }
 
   const runtime = await startCompanion({
