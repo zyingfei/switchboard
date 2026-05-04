@@ -16,6 +16,9 @@ and is iterated against the live PRD in `PRD.md`.
 - `project/{stage,surfaces,modals,...}.jsx` — the prototype's component
   tree. JSX is the design medium, **not** the implementation pattern;
   match visual output, not the file structure.
+- `chats/*.md` — related SwitchBoard chat exports recovered from the
+  local Downloads folder after the original handoff bundle landed
+  without transcripts.
 - `project/uploads/` — supporting design briefs and external research
   (BAC design spec, comp review, etc.).
 
