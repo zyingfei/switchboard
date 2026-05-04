@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Modal } from './Modal';
 import { Icons } from './icons';
+import { ScopeSuggestions, type ScopeSuggestion } from './ScopeSuggestions';
 
 export type PacketKind =
   | 'context_pack'
@@ -71,6 +72,8 @@ export interface PacketComposerProps {
   readonly scope?: PacketComposerScope;
   readonly tokenLimit?: number;
   readonly redactedItems?: readonly { readonly kind: string; readonly count: number }[];
+  readonly scopeSuggestions?: readonly ScopeSuggestion[];
+  readonly onScopeChange?: (workstreamId: string) => void;
   readonly onCancel: () => void;
   readonly onCopy: (packet: ComposedPacket) => void;
   readonly onSave: (packet: ComposedPacket) => void;
@@ -390,6 +393,8 @@ export function PacketComposer({
   scope = DEFAULT_SCOPE,
   tokenLimit = 200_000,
   redactedItems = [],
+  scopeSuggestions = [],
+  onScopeChange,
   onCancel,
   onCopy,
   onSave,
@@ -615,6 +620,13 @@ export function PacketComposer({
               </button>
             ) : null}
           </div>
+          <ScopeSuggestions
+            suggestions={scopeSuggestions}
+            value={scope.workstreamId ?? null}
+            onChange={(workstreamId) => {
+              onScopeChange?.(workstreamId);
+            }}
+          />
         </div>
       </div>
 

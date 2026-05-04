@@ -9,3 +9,4 @@ import '@testing-library/jest-dom/vitest';
   sha: 'test',
   builtAt: '2026-04-30T00:00:00.000Z',
 };
+(globalThis as { __DEV__?: unknown }).__DEV__ = true;

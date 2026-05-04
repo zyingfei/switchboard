@@ -1,3 +1,6 @@
+import type { ProviderId } from '../companion/model';
+import { formatRelative } from '../util/time';
+
 // Native-DOM overlay mounters for the content script. The sidepanel
 // React components (DejaVuPopover, AnnotationOverlay) can't mount in
 // the host page (different runtime, no React, no design tokens), so
@@ -144,6 +147,23 @@ const OVERLAY_CSS = `
   line-height: 1;
 }
 .sidetrack-deja-head .close:hover { color: var(--ink); }
+.sidetrack-deja-head .sidetrack-deja-mute {
+  background: transparent;
+  color: var(--ink-3);
+  border: 1px solid var(--rule);
+  border-radius: 99px;
+  cursor: pointer;
+  padding: 2px 7px;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.sidetrack-deja-head .sidetrack-deja-mute:hover {
+  color: var(--ink);
+  border-color: var(--signal-tint);
+  background: var(--signal-bg);
+}
 .sidetrack-deja-list {
   max-height: 280px;
   overflow: auto;
@@ -155,7 +175,7 @@ const OVERLAY_CSS = `
   padding: 9px 12px;
   border: none;
   background: transparent;
-  cursor: pointer;
+  cursor: default;
   border-bottom: 1px solid var(--rule-soft);
   font-family: inherit;
   color: inherit;
@@ -186,6 +206,22 @@ const OVERLAY_CSS = `
   padding: 1px 5px;
   border-radius: 3px;
 }
+.sidetrack-deja-provider {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--ink-2);
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  padding: 1px 5px;
+  border-radius: 99px;
+  white-space: nowrap;
+}
+.sidetrack-deja-when {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
 .sidetrack-deja-row .snippet {
   font-family: var(--display);
   font-style: italic;
@@ -195,6 +231,27 @@ const OVERLAY_CSS = `
   padding-left: 8px;
   border-left: 2px solid var(--signal-tint);
   margin: 4px 0 0;
+}
+.sidetrack-deja-row .r2 {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 7px;
+}
+.sidetrack-deja-row .r2 button {
+  font-family: var(--mono);
+  font-size: 10px;
+  border-radius: 99px;
+  border: 1px solid var(--rule);
+  background: var(--paper-light);
+  color: var(--ink-2);
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.sidetrack-deja-row .r2 button:hover {
+  border-color: var(--signal-tint);
+  background: var(--signal-bg);
+  color: var(--ink);
 }
 .sidetrack-deja-foot {
   display: flex;
@@ -354,12 +411,15 @@ export interface DejaVuItem {
   readonly snippet: string;
   readonly score: number;
   readonly relativeWhen: string;
+  readonly provider?: ProviderId;
+  readonly threadUrl?: string;
 }
 
 interface DejaVuMountOptions {
   readonly items: readonly DejaVuItem[];
   readonly anchorRect: DOMRect;
   readonly onJump?: (item: DejaVuItem) => void;
+  readonly onMute?: () => void;
   readonly onDismiss?: () => void;
 }
 
@@ -485,6 +545,14 @@ export const mountReviewSelectionChip = (
   return { close };
 };
 
+const providerLabel = (provider: ProviderId | undefined): string => {
+  if (provider === 'chatgpt') return 'ChatGPT';
+  if (provider === 'claude') return 'Claude';
+  if (provider === 'gemini') return 'Gemini';
+  if (provider === 'codex') return 'Codex';
+  return 'Generic';
+};
+
 // Mount the Déjà-vu popover anchored just above the selection's bounding
 // rect, clamped to the viewport with 8px padding.
 export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => void } => {
@@ -513,6 +581,7 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
       <span class="dot"></span>
       <span>Seen this before</span>
       <span class="meta">${String(opts.items.length)} prior thread${opts.items.length === 1 ? '' : 's'}</span>
+      <button type="button" class="sidetrack-deja-mute">Mute on this page</button>
       <button type="button" class="close" aria-label="Dismiss">×</button>
     </div>
     <div class="sidetrack-deja-list"></div>
@@ -523,24 +592,36 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
   const list = pop.querySelector<HTMLDivElement>('.sidetrack-deja-list');
   if (list !== null) {
     for (const item of opts.items) {
-      const row = document.createElement('button');
-      row.type = 'button';
+      const row = document.createElement('div');
       row.className = 'sidetrack-deja-row';
       row.innerHTML = `
         <div class="r1">
           <span class="title"></span>
+          <span class="sidetrack-deja-provider"></span>
+          <span class="sidetrack-deja-when"></span>
           <span class="score"></span>
         </div>
         <div class="snippet"></div>
+        <div class="r2">
+          <button type="button" class="jump">Jump</button>
+          <button type="button" class="mute">Mute on this page</button>
+        </div>
       `;
       const titleEl = row.querySelector('.title');
       if (titleEl !== null) titleEl.textContent = item.title;
+      const providerEl = row.querySelector('.sidetrack-deja-provider');
+      if (providerEl !== null) providerEl.textContent = providerLabel(item.provider);
+      const whenEl = row.querySelector('.sidetrack-deja-when');
+      if (whenEl !== null) whenEl.textContent = formatRelative(item.relativeWhen);
       const scoreEl = row.querySelector('.score');
       if (scoreEl !== null) scoreEl.textContent = item.score.toFixed(2);
       const snippetEl = row.querySelector('.snippet');
       if (snippetEl !== null) snippetEl.textContent = item.snippet;
-      row.addEventListener('click', () => {
+      row.querySelector('.jump')?.addEventListener('click', () => {
         opts.onJump?.(item);
+      });
+      row.querySelector('.mute')?.addEventListener('click', () => {
+        opts.onMute?.();
       });
       list.appendChild(row);
     }
@@ -550,6 +631,9 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
     opts.onDismiss?.();
   };
   pop.querySelector('.close')?.addEventListener('click', close);
+  pop.querySelector('.sidetrack-deja-mute')?.addEventListener('click', () => {
+    opts.onMute?.();
+  });
   root.appendChild(pop);
   return { close };
 };

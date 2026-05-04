@@ -6,3 +6,5 @@ declare const __BUILD_INFO__: {
   readonly sha: string;
   readonly builtAt: string;
 };
+
+declare const __DEV__: boolean;

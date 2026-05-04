@@ -235,8 +235,39 @@ export default defineContentScript({
     let dejaVuDebounceTimer: number | undefined;
     let dejaVuMounted: { close: () => void } | null = null;
     let reviewChipMounted: { close: () => void } | null = null;
-    const dejaVuMutedForUrl = '';
+    const dejaVuMutedUrls = new Set<string>();
+    const DEJA_VU_MUTED_URLS_KEY = 'dejaVuMutedUrls';
     const SELECTION_MIN_CHARS = 18;
+
+    const hydrateDejaVuMuteState = async (): Promise<void> => {
+      try {
+        const result = await chrome.storage.session.get({ [DEJA_VU_MUTED_URLS_KEY]: [] });
+        const urls = result[DEJA_VU_MUTED_URLS_KEY];
+        if (Array.isArray(urls)) {
+          dejaVuMutedUrls.clear();
+          for (const url of urls) {
+            if (typeof url === 'string') {
+              dejaVuMutedUrls.add(url);
+            }
+          }
+        }
+      } catch {
+        // Session storage may be unavailable in tests; mute stays in-memory.
+      }
+    };
+
+    const muteDejaVuForCurrentUrl = async (): Promise<void> => {
+      dejaVuMutedUrls.add(window.location.href);
+      try {
+        await chrome.storage.session.set({
+          [DEJA_VU_MUTED_URLS_KEY]: Array.from(dejaVuMutedUrls),
+        });
+      } catch {
+        // In-memory mute still applies for this content-script instance.
+      }
+    };
+
+    void hydrateDejaVuMuteState();
 
     const closeDejaVu = (): void => {
       dejaVuMounted?.close();
@@ -312,7 +343,7 @@ export default defineContentScript({
     };
 
     const fetchDejaVu = async (text: string, anchorRect: DOMRect): Promise<void> => {
-      if (dejaVuMutedForUrl === window.location.href) return;
+      if (dejaVuMutedUrls.has(window.location.href)) return;
       try {
         const settings = await readCompanionSettingsFromStorage();
         if (settings === null) return;
@@ -327,9 +358,21 @@ export default defineContentScript({
             snippet: r.snippet ?? '',
             score: r.score,
             relativeWhen: r.capturedAt,
+            provider: detectProviderFromUrl(window.location.href),
+            threadUrl: window.location.href,
           })),
           anchorRect,
-          onJump: () => {
+          onJump: (item) => {
+            if (item.threadUrl !== undefined) {
+              void chrome.runtime.sendMessage({
+                type: messageTypes.focusThreadInSidePanel,
+                threadUrl: item.threadUrl,
+              });
+            }
+            closeDejaVu();
+          },
+          onMute: () => {
+            void muteDejaVuForCurrentUrl();
             closeDejaVu();
           },
           onDismiss: () => {

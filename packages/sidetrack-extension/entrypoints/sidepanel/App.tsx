@@ -53,6 +53,7 @@ import {
   Wizard,
   type RestoreStrategy,
   type ReviewVerdict,
+  type ScopeSuggestion,
   type WorkstreamOption,
 } from './components';
 import { createDispatchClient } from '../../src/dispatch/client';
@@ -73,6 +74,8 @@ import { createSettingsClient } from '../../src/settings/client';
 import { isProviderWithOptIn, type SettingsDocument } from '../../src/settings/types';
 import { createTurnsClient, type CapturedTurnRecord } from '../../src/turns/client';
 import { deriveLifecycle } from '../../src/sidepanel/lifecycle';
+import { formatRelative } from '../../src/util/time';
+import { createSuggestionsClient } from '../../src/companion/suggestionsClient';
 import { listPendingOffers, markStatus, type OfferRecord } from '../../src/codingAttach/state';
 import './style.css';
 
@@ -113,26 +116,6 @@ const providerLabel = (provider: TrackedThread['provider']): string => {
     return 'Gemini';
   }
   return 'Generic';
-};
-
-const formatRelative = (isoDate: string): string => {
-  const then = Date.parse(isoDate);
-  if (Number.isNaN(then)) {
-    return 'recently';
-  }
-  const seconds = Math.max(1, Math.round((Date.now() - then) / 1000));
-  if (seconds < 60) {
-    return `${String(seconds)} sec ago`;
-  }
-  const minutes = Math.round(seconds / 60);
-  if (minutes < 60) {
-    return `${String(minutes)} min ago`;
-  }
-  const hours = Math.round(minutes / 60);
-  if (hours < 48) {
-    return `${String(hours)} hr ago`;
-  }
-  return `${String(Math.round(hours / 24))} days ago`;
 };
 
 export const formatBuildTimestamp = (iso: string): string => {
@@ -396,6 +379,12 @@ const App = () => {
     () => new Set<string>(),
   );
   const [composeThreadId, setComposeThreadId] = useState<string | null>(null);
+  const [composeWorkstreamOverrideId, setComposeWorkstreamOverrideId] = useState<string | null>(
+    null,
+  );
+  const [composeScopeSuggestionsByThread, setComposeScopeSuggestionsByThread] = useState<
+    ReadonlyMap<string, readonly ScopeSuggestion[]>
+  >(() => new Map<string, readonly ScopeSuggestion[]>());
   // Which thread row currently has its Send-to dropdown open (null
   // = none). Only one open at a time.
   const [sendToOpenFor, setSendToOpenFor] = useState<string | null>(null);
@@ -579,10 +568,11 @@ const App = () => {
     if (composeThread === undefined) {
       return undefined;
     }
+    const targetWorkstreamId = composeWorkstreamOverrideId ?? composeThread.primaryWorkstreamId;
     return state.workstreams.find(
-      (workstream) => workstream.bac_id === composeThread.primaryWorkstreamId,
+      (workstream) => workstream.bac_id === targetWorkstreamId,
     );
-  }, [composeThread, state.workstreams]);
+  }, [composeThread, composeWorkstreamOverrideId, state.workstreams]);
 
   const refresh = async () => {
     const next = await sendRequest({ type: messageTypes.getWorkboardState });
@@ -797,6 +787,8 @@ const App = () => {
     activeTabTrackedThread !== undefined &&
     focusingThreadId !== activeTabTrackedThread.bac_id &&
     state.activeTabUrl !== findPulseDismissedUrl;
+  const designPreviewEnabled =
+    __DEV__ || new URLSearchParams(window.location.search).has('design-preview');
   useEffect(() => {
     if (
       composeThread === undefined ||
@@ -828,6 +820,64 @@ const App = () => {
       cancelled = true;
     };
   }, [composeThread, bridgeKey, port, composeTurnsByUrl]);
+
+  useEffect(() => {
+    setComposeWorkstreamOverrideId(null);
+  }, [composeThreadId]);
+
+  useEffect(() => {
+    if (
+      composeThread === undefined ||
+      bridgeKey.length === 0 ||
+      composeScopeSuggestionsByThread.has(composeThread.bac_id)
+    ) {
+      return undefined;
+    }
+    const portNumber = Number(port);
+    if (!Number.isFinite(portNumber) || portNumber <= 0) {
+      return undefined;
+    }
+    let cancelled = false;
+    const client = createSuggestionsClient({ port: portNumber, bridgeKey });
+    const targetThreadId = composeThread.bac_id;
+    void client
+      .forThread(targetThreadId, { limit: 3 })
+      .then((list) => {
+        if (cancelled) return;
+        const suggestions = list.map((item): ScopeSuggestion => {
+          const breakdown =
+            item.breakdown === undefined
+              ? []
+              : Object.entries(item.breakdown)
+                  .filter(([, value]) => Number.isFinite(value))
+                  .sort(([a], [b]) => a.localeCompare(b))
+                  .map(([key, value]) => `${key} ${value.toFixed(2)}`);
+          return {
+            id: item.workstreamId,
+            label: workstreamPath(item.workstreamId, state.workstreams),
+            confidence: item.score,
+            reason: breakdown.length > 0 ? breakdown.join(' · ') : 'suggested by companion',
+          };
+        });
+        setComposeScopeSuggestionsByThread((prev) =>
+          new Map(prev).set(targetThreadId, suggestions),
+        );
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setComposeScopeSuggestionsByThread((prev) => new Map(prev).set(targetThreadId, []));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    composeThread,
+    bridgeKey,
+    port,
+    composeScopeSuggestionsByThread,
+    state.workstreams,
+  ]);
 
   // Pre-fetch turns when the Send-to dropdown opens, so the smart-
   // default packet builder has full chat context cached when the
@@ -2833,33 +2883,35 @@ const App = () => {
               <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
             </svg>
           </button>
-          <button
-            className="icon-btn"
-            title="Design preview — v2 surfaces"
-            onClick={() => {
-              setDesignPreviewOpen(true);
-            }}
-            type="button"
-            aria-label="Open design preview"
-          >
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.6"
-              strokeLinecap="round"
-              strokeLinejoin="round"
+          {designPreviewEnabled ? (
+            <button
+              className="icon-btn"
+              title="Design preview — v2 surfaces"
+              onClick={() => {
+                setDesignPreviewOpen(true);
+              }}
+              type="button"
+              aria-label="Open design preview"
             >
-              <circle cx="13" cy="6" r="2" />
-              <circle cx="6" cy="13" r="2" />
-              <circle cx="13" cy="20" r="2" />
-              <circle cx="20" cy="13" r="2" />
-              <line x1="11.6" y1="7.4" x2="7.4" y2="11.6" />
-              <line x1="14.4" y1="7.4" x2="18.6" y2="11.6" />
-              <line x1="11.6" y1="18.6" x2="7.4" y2="14.4" />
-              <line x1="14.4" y1="18.6" x2="18.6" y2="14.4" />
-            </svg>
-          </button>
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.6"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <circle cx="13" cy="6" r="2" />
+                <circle cx="6" cy="13" r="2" />
+                <circle cx="13" cy="20" r="2" />
+                <circle cx="20" cy="13" r="2" />
+                <line x1="11.6" y1="7.4" x2="7.4" y2="11.6" />
+                <line x1="14.4" y1="7.4" x2="18.6" y2="11.6" />
+                <line x1="11.6" y1="18.6" x2="7.4" y2="14.4" />
+                <line x1="14.4" y1="18.6" x2="18.6" y2="14.4" />
+              </svg>
+            </button>
+          ) : null}
           <button
             className="icon-btn"
             title="Settings"
@@ -3505,6 +3557,10 @@ const App = () => {
               capturedAt: t.capturedAt,
             })),
             ...(composeWorkstream !== undefined ? { workstreamId: composeWorkstream.bac_id } : {}),
+          }}
+          scopeSuggestions={composeScopeSuggestionsByThread.get(composeThread.bac_id) ?? []}
+          onScopeChange={(workstreamId) => {
+            setComposeWorkstreamOverrideId(workstreamId);
           }}
           onCancel={() => {
             setComposeThreadId(null);

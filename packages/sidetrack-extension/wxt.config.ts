@@ -41,6 +41,7 @@ export default defineConfig({
   vite: () => ({
     define: {
       __BUILD_INFO__: JSON.stringify(buildInfo),
+      __DEV__: JSON.stringify(process.env.NODE_ENV !== 'production'),
     },
   }),
   manifest: {
