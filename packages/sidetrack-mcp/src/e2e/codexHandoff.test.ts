@@ -39,7 +39,7 @@ import {
   startWebSocketMcpServer,
   type StartedWebSocketMcpServer,
 } from '../server/websocketServer.js';
-import type { LiveVaultSnapshot } from '../vault/liveVaultReader.js';
+import type { CodingSessionRecord, LiveVaultSnapshot } from '../vault/liveVaultReader.js';
 
 // ────────────────── Seed data ──────────────────
 //
@@ -52,6 +52,11 @@ const NOW = '2026-05-05T12:00:00.000Z';
 const TARGET_THREAD_ID = 'bac_thread_target';
 const NEIGHBOUR_THREAD_ID = 'bac_thread_neighbour';
 const WORKSTREAM_ID = 'bac_ws_recall_infra';
+const CODEX_SESSION_ID = 'bac_session_codex_inbound';
+const REQUESTED_DISPATCH_ID = 'bac_dispatch_requested';
+
+const registeredSessions: CodingSessionRecord[] = [];
+const requestedDispatches: unknown[] = [];
 
 const snapshot: LiveVaultSnapshot = {
   workstreams: [
@@ -101,7 +106,15 @@ const snapshot: LiveVaultSnapshot = {
 // hit this codepath.
 const reader: SidetrackMcpReader = {
   readSnapshot: vi.fn(() => Promise.resolve(snapshot)),
-  readCodingSessions: vi.fn(() => Promise.resolve([])),
+  readCodingSessions: vi.fn(({ workstreamId, status } = {}) =>
+    Promise.resolve(
+      registeredSessions.filter(
+        (session) =>
+          (workstreamId === undefined || session.workstreamId === workstreamId) &&
+          (status === undefined || session.status === status),
+      ),
+    ),
+  ),
   readDispatches: vi.fn(
     () =>
       Promise.resolve({
@@ -153,24 +166,62 @@ const writeClient: CompanionWriteClient & {
   const recordedCalls: { readonly tool: string; readonly input: unknown }[] = [];
   return {
     recordedCalls,
-    registerCodingSession: () =>
-      Promise.reject(new Error('not exercised in this test')),
-    moveThread: () =>
-      Promise.reject(new Error('not exercised in this test')),
+    registerCodingSession: (input) => {
+      const session: CodingSessionRecord = {
+        bac_id: CODEX_SESSION_ID,
+        workstreamId: WORKSTREAM_ID,
+        tool: input.tool,
+        cwd: input.cwd,
+        branch: input.branch,
+        sessionId: input.sessionId,
+        name: input.name,
+        ...(input.resumeCommand === undefined ? {} : { resumeCommand: input.resumeCommand }),
+        attachedAt: NOW,
+        lastSeenAt: NOW,
+        status: 'attached',
+      };
+      registeredSessions.push(session);
+      recordedCalls.push({ tool: 'registerCodingSession', input });
+      return Promise.resolve(session);
+    },
+    requestDispatch: (input) => {
+      recordedCalls.push({ tool: 'requestDispatch', input });
+      requestedDispatches.push({
+        bac_id: REQUESTED_DISPATCH_ID,
+        kind: 'coding',
+        target: { provider: input.targetProvider, mode: input.mode },
+        title: input.title,
+        body: input.body,
+        workstreamId: input.workstreamId,
+        sourceThreadId: input.sourceThreadId,
+        createdAt: NOW,
+        status: 'pending',
+        mcpRequest: {
+          codingSessionId: input.codingSessionId,
+          approval: 'auto-approved',
+          requestedAt: NOW,
+        },
+      });
+      return Promise.resolve({
+        dispatchId: REQUESTED_DISPATCH_ID,
+        approval: 'auto-approved',
+        status: 'recorded',
+        requestedAt: NOW,
+      });
+    },
+    moveThread: () => Promise.reject(new Error('not exercised in this test')),
     createQueueItem: (input) => {
       recordedCalls.push({ tool: 'createQueueItem', input });
       return Promise.resolve({ bac_id: 'bac_queue_followup', revision: 'rev_q_1' });
     },
-    bumpWorkstream: () =>
-      Promise.reject(new Error('not exercised in this test')),
-    archiveThread: () =>
-      Promise.reject(new Error('not exercised in this test')),
-    unarchiveThread: () =>
-      Promise.reject(new Error('not exercised in this test')),
+    bumpWorkstream: () => Promise.reject(new Error('not exercised in this test')),
+    archiveThread: () => Promise.reject(new Error('not exercised in this test')),
+    unarchiveThread: () => Promise.reject(new Error('not exercised in this test')),
     updateAnnotation: () => Promise.resolve({}),
     deleteAnnotation: () => Promise.resolve({}),
     listDispatches: () =>
       Promise.resolve([
+        ...requestedDispatches,
         {
           bac_id: 'disp_prior',
           sourceThreadId: TARGET_THREAD_ID,
@@ -255,22 +306,20 @@ const writeClient: CompanionWriteClient & {
 // `sidetrack_mcp`. Anything else is intentionally absent — the
 // agent must reach for it via MCP.
 
-const buildLeanHandoff = (
-  threadId: string,
-  mcpEndpoint: string,
-  ask: string,
-): string =>
+const buildLeanHandoff = (threadId: string, mcpEndpoint: string, ask: string): string =>
   [
     '# Coding handoff: Recall index lifecycle',
     `sidetrack_mcp: ${mcpEndpoint}`,
     `sidetrack_thread_id: ${threadId}`,
     '(connect → tools/list → bac.read_thread_md)',
     '',
-    '## User\'s ask',
+    "## User's ask",
     ask,
   ].join('\n');
 
-const parseHandoffPrompt = (prompt: string): {
+const parseHandoffPrompt = (
+  prompt: string,
+): {
   readonly threadId: string;
   readonly mcpEndpoint: string;
   readonly ask: string;
@@ -288,12 +337,49 @@ const parseHandoffPrompt = (prompt: string): {
   };
 };
 
+const buildAttachPrompt = (
+  attachToken: string,
+  mcpEndpoint: string,
+  workstreamId: string,
+): string =>
+  [
+    '# Sidetrack coding session',
+    '',
+    `sidetrack_mcp: ${mcpEndpoint}`,
+    `sidetrack_attach_token: ${attachToken}`,
+    `sidetrack_workstream_id: ${workstreamId}`,
+    'flow: tools/list -> bac.coding_session_register -> bac.workstream/bac.context_pack -> bac.request_dispatch',
+  ].join('\n');
+
+const parseAttachPrompt = (
+  prompt: string,
+): {
+  readonly mcpEndpoint: string;
+  readonly attachToken: string;
+  readonly workstreamId?: string;
+} => {
+  const endpoint = /sidetrack_mcp:\s*(\S+)/.exec(prompt)?.[1];
+  const attachToken = /sidetrack_attach_token:\s*(\S+)/.exec(prompt)?.[1];
+  const workstreamId = /sidetrack_workstream_id:\s*(\S+)/.exec(prompt)?.[1];
+  if (endpoint === undefined || attachToken === undefined) {
+    throw new Error('attach prompt missing required fields');
+  }
+  return {
+    mcpEndpoint: endpoint,
+    attachToken,
+    ...(workstreamId === undefined || workstreamId === '(none)' ? {} : { workstreamId }),
+  };
+};
+
 // ────────────────── Test harness ──────────────────
 
 const startedServers: StartedWebSocketMcpServer[] = [];
 
 afterEach(async () => {
   await Promise.all(startedServers.splice(0).map((server) => server.close()));
+  registeredSessions.splice(0);
+  requestedDispatches.splice(0);
+  writeClient.recordedCalls.splice(0);
 });
 
 const startServer = async (): Promise<StartedWebSocketMcpServer> => {
@@ -310,11 +396,7 @@ const startServer = async (): Promise<StartedWebSocketMcpServer> => {
 // `structuredContent` field on success. Returns unknown so the
 // caller casts at the assertion site.
 const structured = (result: unknown): unknown => {
-  if (
-    typeof result === 'object' &&
-    result !== null &&
-    'structuredContent' in result
-  ) {
+  if (typeof result === 'object' && result !== null && 'structuredContent' in result) {
     return (result as { readonly structuredContent: unknown }).structuredContent;
   }
   throw new Error('tools/call response missing structuredContent');
@@ -340,7 +422,7 @@ describe('codex handoff over MCP', () => {
     // Positive assertions: the agent has exactly what it needs.
     expect(prompt).toContain(`sidetrack_thread_id: ${TARGET_THREAD_ID}`);
     expect(prompt).toContain('sidetrack_mcp: ws://127.0.0.1:8721/mcp?token=local');
-    expect(prompt).toContain('## User\'s ask');
+    expect(prompt).toContain("## User's ask");
     // Discovery breadcrumb is the only instruction-shaped content;
     // capable agents need just this to find bac.read_thread_md.
     expect(prompt).toContain('(connect → tools/list → bac.read_thread_md)');
@@ -438,6 +520,106 @@ describe('codex handoff over MCP', () => {
       expect(queuedData.bac_id).toBe('bac_queue_followup');
       expect(writeClient.recordedCalls).toHaveLength(1);
       expect(writeClient.recordedCalls[0]?.tool).toBe('createQueueItem');
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('Codex starts from attach prompt, requests dispatch, reads back, and queues follow-up', async () => {
+    const started = await startServer();
+    const prompt = buildAttachPrompt('attach_TOKEN_123', started.url, WORKSTREAM_ID);
+    expect(prompt).toContain('sidetrack_mcp:');
+    expect(prompt).toContain('sidetrack_attach_token: attach_TOKEN_123');
+    expect(prompt).toContain('bac.request_dispatch');
+
+    const parsed = parseAttachPrompt(prompt);
+    const client = new Client({ name: 'codex-inbound-e2e', version: '0.0.0' });
+    await client.connect(new WebSocketClientTransport(new URL(parsed.mcpEndpoint)));
+    try {
+      const tools = await client.listTools();
+      expect(tools.tools.map((tool) => tool.name)).toEqual(
+        expect.arrayContaining([
+          'bac.coding_session_register',
+          'bac.workstream',
+          'bac.context_pack',
+          'bac.request_dispatch',
+          'bac.list_dispatches',
+          'bac.queue_item',
+        ]),
+      );
+
+      const registered = await client.callTool({
+        name: 'bac.coding_session_register',
+        arguments: {
+          token: parsed.attachToken,
+          tool: 'codex',
+          cwd: '/Users/zyingfei/switchboard',
+          branch: 'codex/mcp-inbound-dispatch',
+          sessionId: 'codex-inbound-e2e',
+          name: 'codex · inbound e2e',
+          resumeCommand: 'codex resume codex-inbound-e2e',
+        },
+      });
+      const registeredData = structured(registered) as {
+        readonly bac_id?: string;
+        readonly workstreamId?: string;
+      };
+      expect(registeredData.bac_id).toBe(CODEX_SESSION_ID);
+      expect(registeredData.workstreamId).toBe(WORKSTREAM_ID);
+
+      const workstream = await client.callTool({
+        name: 'bac.workstream',
+        arguments: { id: parsed.workstreamId },
+      });
+      const workstreamData = structured(workstream) as {
+        readonly workstreams?: readonly { readonly bac_id?: string }[];
+      };
+      expect(workstreamData.workstreams?.[0]?.bac_id).toBe(WORKSTREAM_ID);
+
+      const contextPack = await client.callTool({
+        name: 'bac.context_pack',
+        arguments: { workstreamId: parsed.workstreamId },
+      });
+      expect(JSON.stringify(structured(contextPack))).toContain('Recall infra');
+
+      const requested = await client.callTool({
+        name: 'bac.request_dispatch',
+        arguments: {
+          codingSessionId: CODEX_SESSION_ID,
+          targetProvider: 'chatgpt',
+          title: 'Codex asks ChatGPT for a second pass',
+          body: 'Codex inbound e2e: review the recall lifecycle context and identify risks.',
+        },
+      });
+      expect(structured(requested)).toMatchObject({
+        dispatchId: REQUESTED_DISPATCH_ID,
+        approval: 'auto-approved',
+        targetProvider: 'chatgpt',
+        mode: 'auto-send',
+        workstreamId: WORKSTREAM_ID,
+      });
+
+      const dispatches = await client.callTool({
+        name: 'bac.list_dispatches',
+        arguments: { limit: 5 },
+      });
+      expect(JSON.stringify(structured(dispatches))).toContain(REQUESTED_DISPATCH_ID);
+
+      const queued = await client.callTool({
+        name: 'bac.queue_item',
+        arguments: {
+          scope: 'workstream',
+          targetId: WORKSTREAM_ID,
+          text: 'Codex inbound e2e follow-up: inspect the ChatGPT response once linked.',
+        },
+      });
+      const queuedData = structured(queued) as { readonly bac_id?: string };
+      expect(queuedData.bac_id).toBe('bac_queue_followup');
+      expect(writeClient.recordedCalls.map((call) => call.tool)).toEqual([
+        'registerCodingSession',
+        'requestDispatch',
+        'createQueueItem',
+      ]);
     } finally {
       await client.close();
     }

@@ -54,6 +54,11 @@ export interface DispatchEventInput {
   readonly redactionSummary?: DispatchRedactionSummary;
   readonly tokenEstimate?: number;
   readonly status?: DispatchStatus;
+  readonly mcpRequest?: {
+    readonly codingSessionId: string;
+    readonly approval: 'auto-approved';
+    readonly requestedAt: string;
+  };
 }
 
 export interface DispatchEventRecord {
@@ -68,6 +73,11 @@ export interface DispatchEventRecord {
   readonly redactionSummary: DispatchRedactionSummary;
   readonly tokenEstimate: number;
   readonly status: DispatchStatus;
+  readonly mcpRequest?: {
+    readonly codingSessionId: string;
+    readonly approval: 'auto-approved';
+    readonly requestedAt: string;
+  };
 }
 
 export interface DispatchSubmitResult {

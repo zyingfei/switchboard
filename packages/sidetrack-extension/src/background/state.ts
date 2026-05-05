@@ -14,11 +14,7 @@ import type {
 import { readDroppedCount, readQueue } from '../companion/queue';
 import { canonicalThreadUrl } from '../capture/providerDetection';
 import type { DispatchEventRecord } from '../dispatch/types';
-import type {
-  ReviewDraft,
-  ReviewDraftSpan,
-  ReviewVerdict,
-} from '../review/types';
+import type { ReviewDraft, ReviewDraftSpan, ReviewVerdict } from '../review/types';
 import {
   createEmptyWorkboardState,
   defaultSettings,
@@ -49,6 +45,7 @@ const VAULT_PATH_KEY = 'sidetrack.vaultPath';
 const RECENT_DISPATCHES_KEY = 'sidetrack.recentDispatches';
 const DISPATCH_LINKS_KEY = 'sidetrack.dispatchLinks';
 const DISPATCH_DIAGNOSTICS_KEY = 'sidetrack.dispatchDiagnostics';
+const MCP_AUTO_DISPATCHED_KEY = 'sidetrack.mcpAutoDispatched';
 // Local cache of UNREDACTED dispatch bodies, keyed by dispatchId. The
 // companion stores the redacted body (PII / API keys → [category]),
 // but the auto-link matcher needs the body the user actually copied
@@ -168,10 +165,7 @@ export const writeCachedDispatches = async (
 // Archive is a UI-only filter — we don't write through to the
 // companion vault since the underlying review/sent/replied lifecycle
 // is separate. Idempotent if the row is already in the target state.
-export const setDispatchArchived = async (
-  dispatchId: string,
-  archived: boolean,
-): Promise<void> => {
+export const setDispatchArchived = async (dispatchId: string, archived: boolean): Promise<void> => {
   const current = await readCachedDispatches();
   const target = current.find((dispatch) => dispatch.bac_id === dispatchId);
   if (target === undefined) return;
@@ -212,6 +206,19 @@ export const writeDispatchLink = async (dispatchId: string, threadId: string): P
   }
   await storageSet({
     [DISPATCH_LINKS_KEY]: { ...current, [dispatchId]: threadId },
+  });
+};
+
+export const readMcpAutoDispatched = async (): Promise<Readonly<Partial<Record<string, string>>>> =>
+  await storageGet<Readonly<Partial<Record<string, string>>>>(MCP_AUTO_DISPATCHED_KEY, {});
+
+export const markMcpAutoDispatchStarted = async (dispatchId: string): Promise<void> => {
+  const current = await readMcpAutoDispatched();
+  if (current[dispatchId] !== undefined) {
+    return;
+  }
+  await storageSet({
+    [MCP_AUTO_DISPATCHED_KEY]: { ...current, [dispatchId]: new Date().toISOString() },
   });
 };
 
@@ -258,9 +265,8 @@ export const writeLastDispatchTargetByThread = async (
 // panel renders + lets the user edit and send. Storage is keyed by
 // the tracked thread's bac_id (not threadUrl) so rename / re-resolve
 // of the URL doesn't orphan the draft.
-export const readReviewDrafts = async (): Promise<
-  Readonly<Partial<Record<string, ReviewDraft>>>
-> => await storageGet<Readonly<Partial<Record<string, ReviewDraft>>>>(REVIEW_DRAFTS_KEY, {});
+export const readReviewDrafts = async (): Promise<Readonly<Partial<Record<string, ReviewDraft>>>> =>
+  await storageGet<Readonly<Partial<Record<string, ReviewDraft>>>>(REVIEW_DRAFTS_KEY, {});
 
 const writeReviewDrafts = async (
   next: Readonly<Partial<Record<string, ReviewDraft>>>,
@@ -703,9 +709,7 @@ export const updateLocalQueueItem = async (
 // whatever sortOrder they had — the caller is expected to pass the
 // full ordered set of pending items it wants to re-rank (typically
 // one thread's queue).
-export const reorderLocalQueueItems = async (
-  orderedIds: readonly string[],
-): Promise<void> => {
+export const reorderLocalQueueItems = async (orderedIds: readonly string[]): Promise<void> => {
   if (orderedIds.length === 0) {
     return;
   }

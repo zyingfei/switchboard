@@ -34,8 +34,8 @@ export const renderHelp = (): string =>
     'sidetrack-mcp',
     '',
     'MCP server for Sidetrack vault state. Read-only by default; pass',
-    '--companion-url + --bridge-key to enable the bac.coding_session_register',
-    'write tool that lets a coding agent self-register against a workstream.',
+    '--companion-url + --bridge-key to enable coding-session and dispatch',
+    'write tools that let an agent self-register and request auto-approved dispatches.',
     '',
     'Usage:',
     '  sidetrack-mcp --help',
@@ -222,14 +222,82 @@ const createCompanionWriteClient = (
 
   return {
     async registerCodingSession(input) {
-      const body = await post<{ readonly data?: { readonly bac_id?: string } }>(
+      const body = await post<{ readonly data?: Record<string, unknown> }>(
         '/v1/coding-sessions',
         input,
       );
-      if (typeof body.data?.bac_id !== 'string') {
+      const data = body.data;
+      if (typeof data?.['bac_id'] !== 'string') {
         throw new Error('Companion did not return bac_id for the registered coding session.');
       }
-      return { bac_id: body.data.bac_id };
+      return {
+        bac_id: data['bac_id'],
+        ...(typeof data['workstreamId'] === 'string' ? { workstreamId: data['workstreamId'] } : {}),
+        ...(data['tool'] === 'claude_code' ||
+        data['tool'] === 'codex' ||
+        data['tool'] === 'cursor' ||
+        data['tool'] === 'other'
+          ? { tool: data['tool'] }
+          : {}),
+        ...(typeof data['cwd'] === 'string' ? { cwd: data['cwd'] } : {}),
+        ...(typeof data['branch'] === 'string' ? { branch: data['branch'] } : {}),
+        ...(typeof data['sessionId'] === 'string' ? { sessionId: data['sessionId'] } : {}),
+        ...(typeof data['name'] === 'string' ? { name: data['name'] } : {}),
+        ...(typeof data['resumeCommand'] === 'string'
+          ? { resumeCommand: data['resumeCommand'] }
+          : {}),
+        ...(typeof data['attachedAt'] === 'string' ? { attachedAt: data['attachedAt'] } : {}),
+        ...(typeof data['lastSeenAt'] === 'string' ? { lastSeenAt: data['lastSeenAt'] } : {}),
+        ...(data['status'] === 'attached' || data['status'] === 'detached'
+          ? { status: data['status'] }
+          : {}),
+      };
+    },
+    async requestDispatch(input) {
+      const requestedAt = new Date().toISOString();
+      const body = await post<{
+        readonly data?: { readonly bac_id?: string; readonly status?: string };
+      }>(
+        '/v1/dispatches',
+        {
+          kind: 'coding',
+          target: { provider: input.targetProvider, mode: input.mode },
+          title: input.title,
+          body: input.body,
+          status: 'pending',
+          ...(input.workstreamId === undefined ? {} : { workstreamId: input.workstreamId }),
+          ...(input.sourceThreadId === undefined ? {} : { sourceThreadId: input.sourceThreadId }),
+          mcpRequest: {
+            codingSessionId: input.codingSessionId,
+            approval: 'auto-approved',
+            requestedAt,
+          },
+        },
+        {
+          'x-sidetrack-mcp-tool': 'bac.request_dispatch',
+          'idempotency-key': idempotencyKey(
+            'mcp-dispatch',
+            [
+              input.codingSessionId,
+              input.targetProvider,
+              input.mode,
+              input.workstreamId ?? '',
+              input.sourceThreadId ?? '',
+              input.title,
+              input.body,
+            ].join('-'),
+          ),
+        },
+      );
+      if (typeof body.data?.bac_id !== 'string') {
+        throw new Error('Companion did not return bac_id for the requested dispatch.');
+      }
+      return {
+        dispatchId: body.data.bac_id,
+        approval: 'auto-approved',
+        status: body.data.status ?? 'recorded',
+        requestedAt,
+      };
     },
     async moveThread(input) {
       // Companion expects a full ThreadUpsert; an MCP move only knows

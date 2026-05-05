@@ -554,6 +554,11 @@ describe('companion HTTP server', () => {
         title: 'Dispatch packet',
         body: `Email owner@example.com and token ${githubToken}`,
         createdAt,
+        mcpRequest: {
+          codingSessionId: 'bac_session_mcp_dispatch',
+          approval: 'auto-approved',
+          requestedAt: createdAt,
+        },
       }),
     });
     const list = await jsonFetch(
@@ -576,6 +581,11 @@ describe('companion HTTP server', () => {
           redactionSummary: { matched: 2, categories: ['github-token', 'email'] },
           tokenEstimate: 10,
           status: 'sent',
+          mcpRequest: {
+            codingSessionId: 'bac_session_mcp_dispatch',
+            approval: 'auto-approved',
+            requestedAt: createdAt,
+          },
         },
       ],
     });

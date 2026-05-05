@@ -22,6 +22,7 @@
     "e2e:install-cft": "node scripts/install-cft.mjs",
     "e2e:gc-cft": "node scripts/gc-cft.mjs",
     "e2e:pair": "node scripts/pair-extension.mjs",
+    "e2e:codex-inbound": "node scripts/codex-inbound-e2e.mjs",
     "postinstall": "wxt prepare"
   },
   "dependencies": {

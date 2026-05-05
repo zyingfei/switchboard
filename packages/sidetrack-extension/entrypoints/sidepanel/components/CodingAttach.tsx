@@ -10,6 +10,7 @@ export interface CodingAttachProps {
   readonly defaultWorkstreamId?: string;
   readonly workstreams: readonly { readonly bac_id: string; readonly path: string }[];
   readonly companionAvailable: boolean;
+  readonly mcpEndpoint?: string;
   readonly onCancel: () => void;
   readonly onAttached: (session: CodingSession) => void;
   readonly onCreateToken: (request: {
@@ -24,23 +25,29 @@ interface PendingAttach {
   readonly workstreamId?: string;
 }
 
-const buildAgentPrompt = (token: string, workstreamId: string | undefined): string =>
+const buildAgentPrompt = (
+  token: string,
+  workstreamId: string | undefined,
+  mcpEndpoint: string,
+): string =>
   [
-    'Sidetrack handoff. Register this coding session against my workstream.',
+    '# Sidetrack coding session',
     '',
-    `Run the bac.coding_session_register MCP tool with these arguments:`,
-    `- token: ${token}`,
+    `sidetrack_mcp: ${mcpEndpoint}`,
+    `sidetrack_attach_token: ${token}`,
     workstreamId === undefined
-      ? '- workstreamId: (none — Inbox)'
-      : `- workstreamId: ${workstreamId}`,
-    '- tool: <claude_code | codex | cursor | other> (your runtime)',
-    '- cwd: <your absolute working directory>',
-    '- branch: <your current git branch>',
-    '- sessionId: <your stable agent-side session ID>',
-    '- name: <short label, e.g. "claude-code · feat/queue">',
-    '- resumeCommand: <command that resumes this session> (optional)',
+      ? 'sidetrack_workstream_id: (none)'
+      : `sidetrack_workstream_id: ${workstreamId}`,
+    'flow: tools/list -> bac.coding_session_register -> bac.workstream/bac.context_pack -> bac.request_dispatch',
     '',
-    'Auto-detect every field except token / workstreamId from your runtime.',
+    'Use the MCP endpoint above. Register this coding session by calling bac.coding_session_register with:',
+    `- token: ${token}`,
+    '- tool: <claude_code | codex | cursor | other>',
+    '- cwd, branch, sessionId, name, and optional resumeCommand from your runtime',
+    '',
+    'After registration, fetch Sidetrack context with bac.workstream or bac.context_pack.',
+    'When you need Sidetrack to send context to a target AI, call bac.request_dispatch.',
+    'Use bac.queue_item for follow-up work after a target thread exists.',
     'Do not ask me for them. The token is single-use and expires in 5 minutes.',
   ].join('\n');
 
@@ -48,6 +55,7 @@ export function CodingAttach({
   defaultWorkstreamId,
   workstreams,
   companionAvailable,
+  mcpEndpoint = 'ws://127.0.0.1:8721/mcp',
   onCancel,
   onAttached,
   onCreateToken,
@@ -97,7 +105,7 @@ export function CodingAttach({
       try {
         const record = await onCreateToken(workstreamId === '' ? {} : { workstreamId });
         const token = record.token;
-        const prompt = buildAgentPrompt(token, record.workstreamId);
+        const prompt = buildAgentPrompt(token, record.workstreamId, mcpEndpoint);
         try {
           await navigator.clipboard.writeText(prompt);
           setCopied(true);
@@ -149,7 +157,8 @@ export function CodingAttach({
     setError(null);
   };
 
-  const promptText = pending === null ? '' : buildAgentPrompt(pending.token, pending.workstreamId);
+  const promptText =
+    pending === null ? '' : buildAgentPrompt(pending.token, pending.workstreamId, mcpEndpoint);
 
   return (
     <Modal

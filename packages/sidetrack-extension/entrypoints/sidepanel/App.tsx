@@ -4756,6 +4756,11 @@ const App = () => {
           {...(selectedWorkstream !== '' ? { defaultWorkstreamId: selectedWorkstream } : {})}
           workstreams={workstreamOptions}
           companionAvailable={state.companionStatus === 'connected'}
+          mcpEndpoint={
+            bridgeKey.length === 0
+              ? 'ws://127.0.0.1:8721/mcp'
+              : `ws://127.0.0.1:8721/mcp?token=${encodeURIComponent(bridgeKey)}`
+          }
           onCancel={() => {
             setCodingAttachOpen(false);
           }}
