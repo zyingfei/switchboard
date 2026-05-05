@@ -276,56 +276,92 @@ export default defineContentScript({
       mountAnnotationOverlay(liveAnchors);
     };
 
+    // Normalize text for cross-source comparison. Captured turn.text
+    // is markdown (** _ ` # etc.) but the live page's textContent has
+    // none of those decorations. We strip markdown punctuation from
+    // both sides, collapse whitespace, and lowercase so a probe taken
+    // from one matches the other reliably.
+    const normalizeForMatch = (input: string): string =>
+      input
+        .replace(/[*_`~#>|\\[\]()]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+
+    // Pick a discriminating probe from the middle of the turn — head
+    // probes collide on common openings ("Sure, here's…", "I'll
+    // help you…"). We slide a window into the body and grab a 60-
+    // char fragment of mostly-alphanumeric text, which survives both
+    // markdown stripping on the captured side and DOM whitespace
+    // weirdness on the live side.
+    const buildProbe = (normalized: string): string => {
+      if (normalized.length <= 60) return normalized;
+      const start = Math.max(0, Math.floor(normalized.length / 3));
+      return normalized.slice(start, start + 60);
+    };
+
     // Find the turn element on this page using the captured selector
-    // first, then fall back to a textContent search using the head of
-    // the captured turn body. The fallback exists because provider
-    // chat pages re-render aggressively (Claude / Gemini Angular,
-    // ChatGPT React) — the same turn keeps the same text but its DOM
-    // path can drift mid-session.
+    // first, then fall back to a normalized-text search. The fallback
+    // exists because provider chat pages re-render aggressively
+    // (Claude / Gemini Angular, ChatGPT React) and reuse selectors
+    // like data-testid="conversation-turn-3" that renumber on
+    // regenerate / branch.
     const findTurnElementOnPage = (
       sourceSelector: string | undefined,
       turnText: string,
-    ): HTMLElement | null => {
+    ): { readonly element: HTMLElement | null; readonly diagnostic: string } => {
+      const tried: string[] = [];
       if (sourceSelector !== undefined && sourceSelector.length > 0) {
+        tried.push(`sourceSelector=${sourceSelector}`);
         try {
           const direct = document.querySelector(sourceSelector);
           if (direct instanceof HTMLElement) {
-            return direct;
+            return { element: direct, diagnostic: 'matched on sourceSelector' };
           }
         } catch {
-          // Selector is provider-supplied — silently fall back rather
-          // than throw on an unsupported pseudo-class.
+          tried.push('sourceSelector threw on querySelector');
         }
       }
-      // Trim the turn body and pick a stable head of ~60 chars to
-      // search for. Anything shorter risks matching a sub-phrase that
-      // appears in many turns (e.g. "Sure, here's…"); anything longer
-      // breaks if the turn was lightly edited or images/markdown got
-      // stripped during extraction.
-      const probe = turnText.trim().slice(0, 80);
+      const normalizedTurn = normalizeForMatch(turnText);
+      const probe = buildProbe(normalizedTurn);
       if (probe.length < 12) {
-        return null;
+        return {
+          element: null,
+          diagnostic: `probe too short (${String(probe.length)} chars after normalize); tried=[${tried.join(', ')}]`,
+        };
       }
       const turnSelector = turnSelectorForCurrentProvider();
+      tried.push(`turnSelector=${turnSelector ?? 'null'}`);
       const candidates =
         turnSelector === null ? [] : Array.from(document.querySelectorAll(turnSelector));
       for (const node of candidates) {
-        if (node instanceof HTMLElement && node.textContent.includes(probe)) {
-          return node;
+        if (!(node instanceof HTMLElement)) continue;
+        if (normalizeForMatch(node.textContent).includes(probe)) {
+          return {
+            element: node,
+            diagnostic: `matched on text-quote across ${String(candidates.length)} candidates`,
+          };
         }
       }
-      return null;
+      return {
+        element: null,
+        diagnostic: `no match across ${String(candidates.length)} candidates (probe="${probe.slice(0, 40)}…", tried=[${tried.join(', ')}])`,
+      };
     };
 
     const annotateTurnFromSidepanel = async (
       message: AnnotateTurnMessage,
     ): Promise<{ readonly ok: boolean; readonly error?: string; readonly annotationId?: string }> => {
-      const target = findTurnElementOnPage(message.sourceSelector, message.turnText);
+      const lookup = findTurnElementOnPage(message.sourceSelector, message.turnText);
+      const target = lookup.element;
       if (target === null) {
+        // Surface the diagnostic in the page console so the user can
+        // open devtools and see exactly which path failed without
+        // leaking the full turn body into the side panel error pill.
+        console.warn('[sidetrack] annotateTurn lookup failed:', lookup.diagnostic);
         return {
           ok: false,
-          error:
-            'Could not locate that turn on the live page — it may have been edited or scrolled out of the rendered DOM.',
+          error: `Could not locate that turn on the live page (${lookup.diagnostic}). Open devtools to inspect.`,
         };
       }
       // Range over the entire turn element so the marker pins to the

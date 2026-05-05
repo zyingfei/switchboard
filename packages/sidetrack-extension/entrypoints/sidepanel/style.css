@@ -3464,16 +3464,19 @@ textarea.preview-body:focus {
    reload. */
 .thread-turn-annotate-btn {
   background: transparent;
-  border: 0;
-  padding: 1px 4px;
+  border: 1px solid var(--rule, #d4cdb8);
+  border-radius: 99px;
+  padding: 1px 7px;
   font-size: 10px;
-  line-height: 1.4;
-  color: var(--ink-4);
+  line-height: 1.5;
+  color: var(--ink-3);
   cursor: pointer;
-  opacity: 0;
+  opacity: 0.7;
   transition:
     opacity 120ms ease,
-    color 120ms ease;
+    color 120ms ease,
+    border-color 120ms ease,
+    background-color 120ms ease;
   align-self: start;
   white-space: nowrap;
 }
@@ -3484,6 +3487,8 @@ textarea.preview-body:focus {
 .thread-turn-annotate-btn:focus-visible {
   opacity: 1;
   color: var(--signal, #c2410c);
+  border-color: var(--signal-tint, #fed7aa);
+  background-color: var(--signal-bg, #fff7ed);
 }
 .thread-turn-annotate-form {
   grid-column: 1 / -1;
