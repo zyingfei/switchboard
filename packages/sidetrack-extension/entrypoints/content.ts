@@ -256,7 +256,12 @@ export default defineContentScript({
         for (const annotation of annotations) {
           const range = findAnchor(document.documentElement, annotation.anchor);
           if (range !== null) {
-            liveAnchors.push({ id: annotation.bac_id, rect: range.getBoundingClientRect() });
+            liveAnchors.push({
+              id: annotation.bac_id,
+              rect: range.getBoundingClientRect(),
+              note: annotation.note,
+              quote: range.toString().slice(0, 280),
+            });
           }
         }
         if (liveAnchors.length > 0) {
@@ -267,12 +272,24 @@ export default defineContentScript({
       }
     };
 
-    const addLiveAnnotation = (id: string, range: Range): void => {
+    const addLiveAnnotation = (
+      id: string,
+      range: Range,
+      note?: string,
+      quote?: string,
+    ): void => {
       // Optimistic mount: drop in the marker at the user's selection
       // immediately so they get visible feedback that their save took
       // effect. The companion's persisted record syncs on next page
-      // load (mountAnnotationOverlay clears + re-renders).
-      liveAnchors.push({ id, rect: range.getBoundingClientRect() });
+      // load (mountAnnotationOverlay clears + re-renders). Note +
+      // quote ride along so click-to-reveal on the marker shows the
+      // user's own annotation right after they save.
+      liveAnchors.push({
+        id,
+        rect: range.getBoundingClientRect(),
+        ...(note === undefined ? {} : { note }),
+        ...(quote === undefined ? {} : { quote }),
+      });
       mountAnnotationOverlay(liveAnchors);
     };
 
@@ -407,9 +424,13 @@ export default defineContentScript({
       // Optimistic marker first — even if persistence fails, the
       // user gets immediate visual confirmation that their note
       // landed on the right turn. Local id stays unique enough to
-      // not collide with persisted bac_ids.
+      // not collide with persisted bac_ids. The quote excerpt is
+      // the live page's textContent for the matched element so the
+      // popover shows what's actually under the marker (vs the
+      // markdown turn body, which has formatting decorations).
       const optimisticId = `local-turn-${String(Date.now())}`;
-      addLiveAnnotation(optimisticId, range);
+      const liveQuote = target.textContent.trim().slice(0, 280);
+      addLiveAnnotation(optimisticId, range, message.note, liveQuote);
 
       // Best-effort persist via the existing AnnotationClient. The
       // sidepanel could persist instead, but doing it here keeps the
@@ -552,7 +573,7 @@ export default defineContentScript({
           // confirmation their note saved without waiting for a page
           // reload. The id is local-only; on next page load the
           // companion's persisted annotation list takes over.
-          addLiveAnnotation(`local-${String(Date.now())}`, range);
+          addLiveAnnotation(`local-${String(Date.now())}`, range, comment, quote);
         },
         onDismiss: () => {
           reviewChipMounted = null;
