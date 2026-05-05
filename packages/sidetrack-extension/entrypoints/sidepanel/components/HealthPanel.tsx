@@ -33,6 +33,8 @@ interface HealthReport {
     readonly lastRebuildAt?: string | null;
     readonly lastRebuildIndexed?: number | null;
     readonly lastError?: string | null;
+    readonly rebuildEmbedded?: number;
+    readonly rebuildTotal?: number;
   };
   readonly service: { readonly installed: boolean; readonly running: boolean };
 }
@@ -325,10 +327,17 @@ export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelPr
           }}
         >
           {report.recall.status === 'rebuilding'
-            ? `Re-indexing… (${String(report.recall.entryCount)}${
-                report.recall.eventTurnCount !== undefined
-                  ? `/${String(report.recall.eventTurnCount)}`
-                  : ''
+            ? `Re-indexing… (${String(
+                // Prefer the live embedded counter (updates between
+                // batches) over the on-disk entry count, which only
+                // moves on the final write.
+                report.recall.rebuildEmbedded ?? report.recall.entryCount,
+              )}${
+                report.recall.rebuildTotal !== undefined && report.recall.rebuildTotal > 0
+                  ? `/${String(report.recall.rebuildTotal)}`
+                  : report.recall.eventTurnCount !== undefined
+                    ? `/${String(report.recall.eventTurnCount)}`
+                    : ''
               })`
             : rebuildState.kind === 'accepted'
               ? 'Started — watching…'

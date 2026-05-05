@@ -586,6 +586,8 @@ const routes: readonly RouteDefinition[] = [
                       lastRebuildAt: lifecycleReport.lastRebuildAt,
                       lastRebuildIndexed: lifecycleReport.lastRebuildIndexed,
                       lastError: lifecycleReport.lastError,
+                      rebuildEmbedded: lifecycleReport.rebuildEmbedded,
+                      rebuildTotal: lifecycleReport.rebuildTotal,
                     }),
               };
             },

@@ -21,6 +21,8 @@ export interface HealthReport {
     readonly lastRebuildAt?: string | null;
     readonly lastRebuildIndexed?: number | null;
     readonly lastError?: string | null;
+    readonly rebuildEmbedded?: number;
+    readonly rebuildTotal?: number;
   };
   readonly service: { readonly installed: boolean; readonly running: boolean };
 }

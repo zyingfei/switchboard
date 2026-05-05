@@ -34,6 +34,13 @@ export interface RecallStatusReport {
   readonly lastRebuildAt: string | null;
   readonly lastRebuildIndexed: number | null;
   readonly lastError: string | null;
+  // Live progress while status === 'rebuilding'. `embedded` ticks
+  // up after each batch the embedder finishes; `total` is the
+  // upper bound (= every turn in the vault). Both are 0 outside
+  // a rebuild, so the UI can guard on `status === 'rebuilding'`
+  // before showing the fraction.
+  readonly rebuildEmbedded: number;
+  readonly rebuildTotal: number;
 }
 
 export interface RecallLifecycle {
@@ -50,15 +57,21 @@ export interface CreateRecallLifecycleOptions {
   // Override for tests — defaults to the production embedder model.
   readonly currentModelId?: string;
   // Override for tests — defaults to the production rebuilder.
-  readonly rebuilder?: (
-    vaultRoot: string,
-    eventLogPath: string,
-  ) => Promise<{ readonly indexed: number }>;
+  readonly rebuilder?: RebuilderFn;
   // Optional logger — defaults to console.info / console.warn so the
   // companion stdout shows when a rebuild kicks in.
   readonly log?: (message: string) => void;
   readonly warn?: (message: string) => void;
 }
+
+// Rebuilder signature must accept an `onProgress` so the lifecycle
+// can surface live counts via /v1/system/health while embedding is
+// in flight. The production rebuilder calls this after each batch.
+type RebuilderFn = (
+  vaultRoot: string,
+  eventLogPath: string,
+  options?: { readonly onProgress?: (embedded: number, total: number) => void },
+) => Promise<{ readonly indexed: number }>;
 
 const indexPathFor = (vaultRoot: string): string => join(vaultRoot, '_BAC', 'recall', 'index.bin');
 
@@ -109,6 +122,11 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
   let lastError: string | null = null;
   let lastRebuildAt: string | null = null;
   let lastRebuildIndexed: number | null = null;
+  // Live progress fields — only meaningful while rebuildPromise is
+  // active; reset to 0 between runs so the UI doesn't latch onto
+  // a stale fraction.
+  let rebuildEmbedded = 0;
+  let rebuildTotal = 0;
 
   const report = async (): Promise<RecallStatusReport> => {
     const [index, eventTurnCount] = await Promise.all([
@@ -146,6 +164,8 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
       lastRebuildAt,
       lastRebuildIndexed,
       lastError,
+      rebuildEmbedded,
+      rebuildTotal,
     };
   };
 
@@ -153,9 +173,16 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
     if (rebuildPromise !== null) return;
     log(`[recall] starting background rebuild (${reason})`);
     lastError = null;
+    rebuildEmbedded = 0;
+    rebuildTotal = 0;
     rebuildPromise = (async () => {
       try {
-        const result = await rebuilder(opts.vaultRoot, eventLogPathFor(opts.vaultRoot));
+        const result = await rebuilder(opts.vaultRoot, eventLogPathFor(opts.vaultRoot), {
+          onProgress: (embedded, total) => {
+            rebuildEmbedded = embedded;
+            rebuildTotal = total;
+          },
+        });
         lastRebuildAt = new Date().toISOString();
         lastRebuildIndexed = result.indexed;
         log(`[recall] background rebuild finished: indexed ${String(result.indexed)} entries`);
@@ -165,6 +192,8 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
         warn(`[recall] background rebuild failed: ${message}`);
       } finally {
         rebuildPromise = null;
+        rebuildEmbedded = 0;
+        rebuildTotal = 0;
       }
     })();
   };
