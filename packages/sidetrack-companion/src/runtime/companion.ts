@@ -18,6 +18,10 @@ export interface CompanionRuntimeOptions {
   readonly vaultPath: string;
   readonly port: number;
   readonly allowAutoUpdate?: boolean;
+  // Set when the companion is launching the MCP WS server as a child.
+  // Plumbed into HTTP config so /v1/status echoes the same key the
+  // MCP server is accepting — the side panel reads it from there.
+  readonly mcp?: { readonly port: number; readonly authKey: string };
 }
 
 export interface CompanionRuntime {
@@ -80,6 +84,7 @@ export const startCompanion = async (
     hygieneStatus,
     recallLifecycle,
     recallActivity,
+    ...(options.mcp === undefined ? {} : { mcp: options.mcp }),
     vaultChanges: {
       subscribe(listener) {
         listeners.add(listener);

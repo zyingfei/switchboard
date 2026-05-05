@@ -100,6 +100,11 @@ export interface CompanionHttpConfig {
   // background-rebuild affordance.
   readonly recallLifecycle?: RecallLifecycle;
   readonly recallActivity?: RecallActivityTracker;
+  // Set when the companion is also managing a sidetrack-mcp child.
+  // Exposed via /v1/status so the side panel can build attach prompts
+  // whose ?token=… matches whatever the running MCP server actually
+  // accepts — without the user copying keys between two terminals.
+  readonly mcp?: { readonly port: number; readonly authKey: string };
 }
 
 export interface StartedHttpServer {
@@ -613,7 +618,22 @@ const routes: readonly RouteDefinition[] = [
     authRequired: true,
     handle: async (_request, requestId, _match, context) => [
       200,
-      { data: { companion: 'running', vault: await context.vaultWriter.status(), requestId } },
+      {
+        data: {
+          companion: 'running',
+          vault: await context.vaultWriter.status(),
+          ...(context.mcp === undefined
+            ? {}
+            : {
+                mcp: {
+                  port: context.mcp.port,
+                  authKey: context.mcp.authKey,
+                  url: `ws://127.0.0.1:${String(context.mcp.port)}/mcp`,
+                },
+              }),
+          requestId,
+        },
+      },
     ],
   },
   {

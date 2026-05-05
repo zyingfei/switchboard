@@ -603,6 +603,18 @@ const App = () => {
     'missing' | 'stale' | 'empty' | 'rebuilding' | 'ready' | null
   >(null);
 
+  // MCP WebSocket info exposed by the companion's /v1/status when the
+  // companion is also managing the sidetrack-mcp child. Side-panel
+  // attach prompts use this to embed the *real* auth key the MCP
+  // server is accepting, instead of the user's bridge key (which is
+  // a different secret and only worked previously by accident when
+  // the user manually started MCP with --mcp-auth-key=<bridge>).
+  const [mcpInfo, setMcpInfo] = useState<{
+    readonly url: string;
+    readonly port: number;
+    readonly authKey: string;
+  } | null>(null);
+
   const threads = useMemo(() => visibleThreads(state.threads), [state.threads]);
   // Stable string that mutates whenever the workstream graph or any
   // thread's primary-workstream assignment changes. Drives both the
@@ -752,6 +764,55 @@ const App = () => {
       window.clearInterval(handle);
     };
   }, [state.companionStatus, bridgeKey, state.settings.companion.port, recallStatus]);
+
+  // Fetch /v1/status to discover the companion-managed MCP WebSocket
+  // server (port + auth key). Only present when the user starts the
+  // companion with --mcp-port. Refreshed when companion reconnects;
+  // a stale-but-non-zero value still works because the auth key is
+  // persisted on disk and stable across companion restarts.
+  useEffect(() => {
+    if (state.companionStatus !== 'connected' || bridgeKey.trim().length === 0) {
+      setMcpInfo(null);
+      return undefined;
+    }
+    const portValue = state.settings.companion.port;
+    let cancelled = false;
+    const fetchMcp = async (): Promise<void> => {
+      try {
+        const response = await fetch(`http://127.0.0.1:${String(portValue)}/v1/status`, {
+          headers: { 'x-bac-bridge-key': bridgeKey },
+        });
+        if (!response.ok || cancelled) return;
+        const body = (await response.json()) as {
+          readonly data?: {
+            readonly mcp?: {
+              readonly url?: unknown;
+              readonly port?: unknown;
+              readonly authKey?: unknown;
+            };
+          };
+        };
+        const mcp = body.data?.mcp;
+        if (
+          mcp !== undefined &&
+          typeof mcp.url === 'string' &&
+          typeof mcp.port === 'number' &&
+          typeof mcp.authKey === 'string'
+        ) {
+          setMcpInfo({ url: mcp.url, port: mcp.port, authKey: mcp.authKey });
+        } else {
+          setMcpInfo(null);
+        }
+      } catch {
+        // Companion unreachable mid-poll — keep last known value;
+        // CodingAttach gracefully falls back to the bridge-key URL.
+      }
+    };
+    void fetchMcp();
+    return () => {
+      cancelled = true;
+    };
+  }, [state.companionStatus, bridgeKey, state.settings.companion.port]);
 
   useEffect(() => {
     const runtimeMessages = chrome.runtime.onMessage;
@@ -4836,11 +4897,20 @@ const App = () => {
           {...(selectedWorkstream !== '' ? { defaultWorkstreamId: selectedWorkstream } : {})}
           workstreams={workstreamOptions}
           companionAvailable={state.companionStatus === 'connected'}
-          mcpEndpoint={
-            bridgeKey.length === 0
-              ? 'ws://127.0.0.1:8721/mcp'
-              : `ws://127.0.0.1:8721/mcp?token=${encodeURIComponent(bridgeKey)}`
-          }
+          mcpEndpoint={(() => {
+            // Prefer the companion-managed MCP info from /v1/status —
+            // its authKey is what the running MCP server actually
+            // accepts. Fall back to the legacy bridge-key URL only
+            // when the companion isn't managing MCP (older setup
+            // where the user starts sidetrack-mcp by hand).
+            if (mcpInfo !== null) {
+              return `${mcpInfo.url}?token=${encodeURIComponent(mcpInfo.authKey)}`;
+            }
+            if (bridgeKey.length === 0) {
+              return 'ws://127.0.0.1:8721/mcp';
+            }
+            return `ws://127.0.0.1:8721/mcp?token=${encodeURIComponent(bridgeKey)}`;
+          })()}
           onCancel={() => {
             setCodingAttachOpen(false);
           }}
