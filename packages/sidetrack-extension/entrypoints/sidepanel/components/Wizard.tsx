@@ -266,6 +266,21 @@ function CompanionStep({
           <div className="wizard-card-meta mono">Bridge key file: {bridgeKeyPath}</div>
         </div>
       </div>
+      {__DEV__ ? (
+        <div className="wizard-card-row single">
+          <div className="wizard-card">
+            <div className="wizard-card-title">Dev build — run from local worktree</div>
+            <code className="wizard-card-cmd mono">
+              node ~/Documents/playground/browser-ai-companion/.claude/worktrees/m1+foundation/packages/sidetrack-companion/dist/cli.js
+              --vault {commandPath}
+            </code>
+            <div className="wizard-card-meta mono">
+              The npm package isn&apos;t published yet, so the npx command above won&apos;t resolve.
+              Run this directly against the built CLI.
+            </div>
+          </div>
+        </div>
+      ) : null}
       <div className={'wizard-status ' + statusClass}>
         <span className={'dot ' + statusClass} />
         <span className="mono">{statusLabel}</span>

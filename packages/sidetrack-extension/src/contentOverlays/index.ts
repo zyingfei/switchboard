@@ -272,6 +272,7 @@ const OVERLAY_CSS = `
   pointer-events: auto;
 }
 .sidetrack-rv-chip {
+  position: absolute;
   display: inline-flex;
   align-items: center;
   gap: 5px;
