@@ -97,6 +97,38 @@ export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelPr
   const [copied, setCopied] = useState(false);
   const [report, setReport] = useState<HealthReport>(FIXTURE_REPORT);
   const [isLive, setIsLive] = useState(false);
+  type RebuildState =
+    | { kind: 'idle' }
+    | { kind: 'running' }
+    | { kind: 'done'; indexed: number }
+    | { kind: 'error'; message: string };
+  const [rebuildState, setRebuildState] = useState<RebuildState>({ kind: 'idle' });
+
+  const triggerRebuild = async (): Promise<void> => {
+    if (companionPort === undefined || companionPort === null || !bridgeKey) {
+      setRebuildState({ kind: 'error', message: 'Companion not configured.' });
+      return;
+    }
+    setRebuildState({ kind: 'running' });
+    try {
+      const url = `http://127.0.0.1:${String(companionPort)}/v1/recall/rebuild`;
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'x-bac-bridge-key': bridgeKey },
+      });
+      if (!response.ok) {
+        setRebuildState({ kind: 'error', message: `HTTP ${String(response.status)}` });
+        return;
+      }
+      const body = (await response.json()) as { readonly data?: { readonly indexed?: number } };
+      setRebuildState({ kind: 'done', indexed: body.data?.indexed ?? 0 });
+    } catch (error) {
+      setRebuildState({
+        kind: 'error',
+        message: error instanceof Error ? error.message : 'Rebuild failed.',
+      });
+    }
+  };
 
   // Fetch the live report when companion is configured. Silent on failure
   // — the fixture stays in place so the visual surface never blanks.
@@ -173,11 +205,36 @@ export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelPr
         <div className="hc">
           <div className="hc-lbl">recall index</div>
           <div className="hc-num small">
-            {(report.recall.entryCount / 1000).toFixed(1)}k
+            {report.recall.entryCount >= 1000
+              ? `${(report.recall.entryCount / 1000).toFixed(1)}k`
+              : String(report.recall.entryCount)}
           </div>
           <div className="hc-foot">
             vectors · {formatBytes(report.recall.sizeBytes)} ·{' '}
             {report.recall.modelId?.split('/').pop() ?? 'no model'}
+          </div>
+          <div className="hc-foot" style={{ marginTop: 6 }}>
+            <button
+              type="button"
+              className="btn btn-ghost mono"
+              style={{ fontSize: 10, padding: '2px 8px' }}
+              disabled={rebuildState.kind === 'running'}
+              onClick={() => {
+                void triggerRebuild();
+              }}
+            >
+              {rebuildState.kind === 'running' ? 'Rebuilding…' : 'Rebuild index'}
+            </button>
+            {rebuildState.kind === 'done' ? (
+              <span className="muted" style={{ marginLeft: 6 }}>
+                indexed {String(rebuildState.indexed)}
+              </span>
+            ) : null}
+            {rebuildState.kind === 'error' ? (
+              <span className="muted" style={{ marginLeft: 6 }}>
+                {rebuildState.message}
+              </span>
+            ) : null}
           </div>
         </div>
         <div className="hc">

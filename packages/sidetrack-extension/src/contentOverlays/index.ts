@@ -360,11 +360,20 @@ const OVERLAY_CSS = `
 `;
 
 const ensureOverlayInfra = (): HTMLElement => {
-  if (document.getElementById(STYLE_ID) === null) {
-    const style = document.createElement('style');
+  // Always overwrite the style tag's textContent. Without this, an
+  // older extension build that left a <style id=...> in the page
+  // keeps its stale CSS (e.g. missing `position: absolute` on chips,
+  // which collapses both buttons to the overlay root's top-left).
+  // Replacing the textContent on every call costs ~nothing and keeps
+  // the page in sync with the currently-loaded content script.
+  let style = document.getElementById(STYLE_ID) as HTMLStyleElement | null;
+  if (style === null) {
+    style = document.createElement('style');
     style.id = STYLE_ID;
-    style.textContent = OVERLAY_CSS;
     document.head.appendChild(style);
+  }
+  if (style.textContent !== OVERLAY_CSS) {
+    style.textContent = OVERLAY_CSS;
   }
   let root = document.getElementById(ROOT_ID);
   if (root === null) {
