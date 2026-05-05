@@ -901,8 +901,11 @@ const App = () => {
     }
     let cancelled = false;
     const client = createTurnsClient({ port: portNumber, bridgeKey });
+    // Ask for the server-side max (Math.min(limit ?? 5, 50) in
+    // schemas.ts) so the smart-default packet ships the full thread
+    // tail. The DispatchConfirm token-budget guard catches outliers.
     void client
-      .recentForThread(targetUrl, { limit: 12 })
+      .recentForThread(targetUrl, { limit: 50 })
       .then((list) => {
         if (!cancelled) {
           setComposeTurnsByUrl((prev) => new Map(prev).set(targetUrl, list));
@@ -1260,8 +1263,13 @@ const App = () => {
         : turns
             .map((t) => {
               const role = t.role === 'assistant' ? '### Assistant' : '### User';
-              const text = t.text.length > 1200 ? `${t.text.slice(0, 1200)}…` : t.text;
-              return `${role}\n${text}`;
+              // Ship the full turn body. The DispatchConfirm modal's
+              // token-budget chip warns the user when the packet
+              // exceeds the target model's context window; it is the
+              // user's call to edit or proceed. Per-turn truncation
+              // here used to silently drop long replies before that
+              // guard existed.
+              return `${role}\n${t.text}`;
             })
             .join('\n\n');
     const provider = providerLabel(thread.provider);
@@ -3334,11 +3342,16 @@ const App = () => {
                 setViewingDispatchId(id);
               }}
               onCopy={(id) => {
-                // Paste-mode action: re-copy + open new chat.
+                // Paste-mode action: re-copy + open new chat. Use the
+                // unredacted body (cached locally on submit) so the
+                // user pastes the same text the matcher will compare
+                // against — see dispatchLinking.ts and the viewer
+                // modal below.
                 const dispatch = state.recentDispatches.find((d) => d.bac_id === id);
                 if (dispatch === undefined) {
                   return;
                 }
+                const bodyToShip = state.dispatchOriginals[id] ?? dispatch.body;
                 const url = lookupChatUrl(dispatch.target.provider);
                 if (url === undefined) {
                   // Export / external target → open viewer instead.
@@ -3346,7 +3359,7 @@ const App = () => {
                   return;
                 }
                 void navigator.clipboard
-                  .writeText(dispatch.body)
+                  .writeText(bodyToShip)
                   .then(() => {
                     setError(
                       `Re-copied packet to clipboard. Opening ${TARGET_PROVIDER_LABEL[dispatch.target.provider] ?? dispatch.target.provider} — paste to send.`,
@@ -3368,6 +3381,7 @@ const App = () => {
                 if (dispatch === undefined) {
                   return;
                 }
+                const bodyToShip = state.dispatchOriginals[id] ?? dispatch.body;
                 const url = lookupChatUrl(dispatch.target.provider);
                 if (url === undefined) {
                   setViewingDispatchId(id);
@@ -3378,7 +3392,7 @@ const App = () => {
                     type: messageTypes.dispatchAutoSendInNewTab,
                     dispatchId: id,
                     url,
-                    body: dispatch.body,
+                    body: bodyToShip,
                   });
                   setError(
                     `Opening ${TARGET_PROVIDER_LABEL[dispatch.target.provider] ?? dispatch.target.provider} and auto-sending the packet…`,
@@ -3846,6 +3860,15 @@ const App = () => {
             if (dispatch === undefined) {
               return null;
             }
+            // The companion stores a redacted body (PII / API keys
+            // → [category] tokens). The matcher in dispatchLinking.ts
+            // matches against the *unredacted* body cached locally on
+            // submit — so the viewer must show + copy the unredacted
+            // form too. Otherwise the user pastes the redacted text,
+            // the matcher's needle (unredacted) never substring-hits
+            // the captured turn, and the dispatch never links.
+            const displayBody =
+              state.dispatchOriginals[dispatch.bac_id] ?? dispatch.body;
             const targetLabel =
               TARGET_PROVIDER_LABEL[dispatch.target.provider] ?? dispatch.target.provider;
             const linkedThreadId = state.dispatchLinks[dispatch.bac_id];
@@ -3886,7 +3909,7 @@ const App = () => {
                       ✕
                     </button>
                   </div>
-                  <textarea className="dispatch-viewer-body mono" value={dispatch.body} readOnly />
+                  <textarea className="dispatch-viewer-body mono" value={displayBody} readOnly />
                   {diagnostic === undefined ? null : (
                     <details className="dispatch-diagnostic">
                       <summary>Why didn't this link?</summary>
@@ -3915,7 +3938,7 @@ const App = () => {
                         const safeTitle = dispatch.title
                           .replace(/[^a-z0-9-_]+/gi, '-')
                           .slice(0, 80);
-                        downloadAsFile(`${safeTitle || 'sidetrack-dispatch'}.md`, dispatch.body);
+                        downloadAsFile(`${safeTitle || 'sidetrack-dispatch'}.md`, displayBody);
                         setError(`Re-downloaded ${safeTitle || 'sidetrack-dispatch'}.md.`);
                       }}
                     >
@@ -3926,7 +3949,7 @@ const App = () => {
                       className="btn btn-primary"
                       onClick={() => {
                         void navigator.clipboard
-                          .writeText(dispatch.body)
+                          .writeText(displayBody)
                           .then(() => {
                             setError('Copied dispatch body to clipboard.');
                           })

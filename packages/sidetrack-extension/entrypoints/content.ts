@@ -101,9 +101,12 @@ const driveAutoSend = async (
   if (provider === 'codex') {
     return { ok: false, error: 'Auto-send does not support Codex sessions yet.' };
   }
-  if (!isProviderThreadUrl(provider, window.location.href)) {
-    return { ok: false, error: 'Current page is not a chat thread.' };
-  }
+  // Composer presence — not URL shape — gates auto-send. The new-chat
+  // landing page (e.g. https://gemini.google.com/app, the bare ChatGPT
+  // root) shows a composer that becomes a thread on submit; the
+  // dispatchAutoSendInNewTab flow relies on this. isProviderThreadUrl
+  // is the right gate for *capture* (we don't want a "thread" record
+  // for the landing page), not for typing.
   const driver = PROVIDER_DRIVERS[provider];
   const composerEl = findFirstElement(driver.composer);
   if (!(composerEl instanceof HTMLElement)) {

@@ -1130,6 +1130,13 @@ button:disabled {
   border-radius: var(--rad-s);
   background: var(--paper);
   overflow: hidden;
+  /* Don't let the flex parent (.modal-body) shrink the preview — it
+     houses the packet textarea, which is the most-used field in the
+     composer. Without this, sibling sections compete for height and
+     the textarea collapses to ~2 visible lines on shorter modals. */
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
 }
 .preview-head {
   padding: 5px 10px;
@@ -1147,13 +1154,16 @@ button:disabled {
   font-size: 12px;
   line-height: 1.55;
   /* Body is the most-used field in the composer — give it real
-     vertical room. The textarea variant below also gets full width
-     and resize=vertical so the user can grow it. */
-  min-height: 320px;
-  max-height: 60vh;
+     vertical room. height: clamp() guarantees a visible workspace
+     even when the modal is short, and lets it grow on tall screens.
+     The textarea variant below also gets resize=vertical so the user
+     can grow it further. */
+  height: clamp(320px, 50vh, 560px);
   overflow: auto;
   width: 100%;
   box-sizing: border-box;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 /* Textarea variant — same as the read-only block but resizable. */
 textarea.preview-body {
