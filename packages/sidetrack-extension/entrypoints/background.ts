@@ -66,6 +66,8 @@ import {
   readScreenShareMode,
   saveScreenShareMode,
   saveVaultPath,
+  pruneDispatchLinks,
+  pruneReminders,
   reorderLocalQueueItems,
   saveNotifyOnQueueComplete,
   updateLocalCaptureNote,
@@ -1759,8 +1761,30 @@ const detectCodingAttachForTab = async (tabId: number, url: string): Promise<voi
 };
 
 export default defineBackground(() => {
+  // Drop reminders bound to thread bac_ids that no longer exist.
+  // Cleanup pass for the historical mess caused by the pre-fix
+  // sendToCompanion bug (every capture reissued a thread bac_id;
+  // reminders accumulated against orphans). Idempotent — runs on
+  // every service-worker boot, no-op when storage is already clean.
+  const pruneOrphanRemindersAndLinks = async (): Promise<void> => {
+    try {
+      const knownThreadIds = new Set((await readThreads()).map((t) => t.bac_id));
+      const remindersDropped = await pruneReminders(knownThreadIds);
+      if (remindersDropped > 0) {
+        console.warn(
+          `[startup] pruned ${String(remindersDropped)} reminders bound to dead thread bac_ids`,
+        );
+        void broadcastWorkboardChanged('reminder');
+      }
+      await pruneDispatchLinks(knownThreadIds);
+    } catch (error) {
+      console.warn('[startup] orphan prune failed:', error);
+    }
+  };
+
   chrome.runtime.onInstalled.addListener((details) => {
     void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => undefined);
+    void pruneOrphanRemindersAndLinks();
     // Heal pre-existing tabs after an install/update/reload so the
     // user doesn't have to refresh each chat tab manually. The first
     // install case is harmless: matching tabs that already had no
@@ -1778,6 +1802,7 @@ export default defineBackground(() => {
   // fires when the browser launches. Re-inject is cheap and idempotent
   // so we can always do it.
   chrome.runtime.onStartup.addListener(() => {
+    void pruneOrphanRemindersAndLinks();
     void reinjectContentScriptIntoOpenTabs();
   });
 

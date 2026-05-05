@@ -382,6 +382,22 @@ export const pruneDispatchOriginals = async (
   }
 };
 
+// Drop reminders that point at thread bac_ids no longer in storage.
+// Runs at extension startup to clean up the orphan accumulation
+// caused by the pre-fix sendToCompanion bug where every capture
+// reissued a thread bac_id; users had hundreds of "Unread reply"
+// pills bound to dead threadIds. Idempotent — no-op when there are
+// no orphans to drop.
+export const pruneReminders = async (knownThreadIds: ReadonlySet<string>): Promise<number> => {
+  const current = await readReminders();
+  const next = current.filter((r) => knownThreadIds.has(r.threadId));
+  if (next.length === current.length) {
+    return 0;
+  }
+  await storageSet({ [REMINDERS_KEY]: next });
+  return current.length - next.length;
+};
+
 // Drop links that point at threads no longer in the cache (cleanup).
 export const pruneDispatchLinks = async (knownThreadIds: ReadonlySet<string>): Promise<void> => {
   const current = await readDispatchLinks();
