@@ -25,7 +25,15 @@ import { INDEX_DIM } from './indexFile.js';
 // or split across external-data refs that @huggingface/transformers
 // doesn't fetch — Protobuf parsing fails at load. multilingual-e5-
 // small ships clean q8 + fp16 + fp32 files of expected sizes.
-export const MODEL_ID = 'Xenova/multilingual-e5-small';
+//
+// MODEL_ID is the *identity string* the lifecycle compares against
+// the on-disk index header to detect stale embeddings — separate
+// from HF_MODEL which is what we actually pass to the pipeline.
+// Suffixing the identity (e.g. with the prefix variant) means a
+// change to embedding behavior triggers an auto-rebuild even
+// though the underlying HF model didn't change.
+const HF_MODEL = 'Xenova/multilingual-e5-small';
+export const MODEL_ID = `${HF_MODEL}#prefix-query-v1`;
 
 type FeatureExtractor = (
   text: string,
@@ -102,7 +110,7 @@ export const getEmbedder = async (): Promise<FeatureExtractor> => {
       const errors: string[] = [];
       for (const dtype of dtypeCandidates) {
         try {
-          const pipe = (await module.pipeline('feature-extraction', MODEL_ID, {
+          const pipe = (await module.pipeline('feature-extraction', HF_MODEL, {
             device: 'cpu',
             dtype,
           } as Parameters<typeof module.pipeline>[2])) as unknown as FeatureExtractor;
@@ -140,6 +148,17 @@ const padOrTruncate = (values: Float32Array): Float32Array => {
   return out;
 };
 
+// E5 family models (current MODEL_ID is multilingual-e5-small)
+// require task-specific prefixes — feeding raw text yields collapsed
+// cosine scores (~0.06 even between obviously-similar items).
+// "query: " is the recommended prefix for symmetric text-text
+// similarity which is what we do (thread-thread / selection-thread
+// search), so we prepend it on every embedded string. Non-E5 models
+// will simply prepend "query: " as part of the input — harmless
+// at the cost of ~3 tokens of extra input. Switch the prefix to ""
+// here if a future model swap doesn't want it.
+const E5_PREFIX = 'query: ';
+
 // We embed one text per pipeline call rather than passing the whole
 // batch as a single tensor. The all-at-once path used to run with
 // @xenova/transformers allocated a [batch, seq, hidden] tensor that
@@ -155,7 +174,10 @@ export const embed = async (texts: readonly string[]): Promise<readonly Float32A
   const extractor = await getEmbedder();
   const vectors: Float32Array[] = [];
   for (const text of texts) {
-    const output = await extractor(text, { pooling: 'mean', normalize: true });
+    const output = await extractor(`${E5_PREFIX}${text}`, {
+      pooling: 'mean',
+      normalize: true,
+    });
     vectors.push(padOrTruncate(toFloat32(output.data)));
   }
   return vectors;
