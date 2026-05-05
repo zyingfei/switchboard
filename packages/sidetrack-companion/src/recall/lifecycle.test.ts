@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
+import { createRecallActivityTracker } from './activity.js';
 import { createRecallLifecycle } from './lifecycle.js';
 import { writeIndex } from './indexFile.js';
 
@@ -16,9 +17,7 @@ const seedEvents = async (vaultRoot: string, count: number): Promise<void> => {
     JSON.stringify({
       bac_id: 'thread_x',
       capturedAt: '2026-05-04T00:00:00.000Z',
-      turns: [
-        { ordinal, role: 'user', text: `seed turn ${String(ordinal)}` },
-      ],
+      turns: [{ ordinal, role: 'user', text: `seed turn ${String(ordinal)}` }],
     }),
   );
   await writeFile(join(dir, '2026-05-04.jsonl'), `${lines.join('\n')}\n`);
@@ -108,6 +107,36 @@ describe('recall lifecycle', () => {
       expect(after.entryCount).toBe(2);
       expect(after.lastRebuildIndexed).toBe(2);
       expect(calls).toBe(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('records rebuild activity for health diagnostics', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'recall-lifecycle-activity-'));
+    try {
+      await seedEvents(root, 1);
+      const activity = createRecallActivityTracker(() => new Date('2026-05-05T00:00:00.000Z'));
+      const lifecycle = createRecallLifecycle({
+        vaultRoot: root,
+        companionVersion: '0.0.0-test',
+        currentModelId: 'fresh/model',
+        rebuilder: async () => ({ indexed: 1 }),
+        log: () => undefined,
+        warn: () => undefined,
+        activity,
+      });
+      lifecycle.scheduleRebuild('manual');
+      await lifecycle.waitForRebuild();
+
+      expect(activity.report()).toMatchObject({
+        lastIndexedAt: '2026-05-05T00:00:00.000Z',
+        lastIndexedCount: 1,
+        recent: [
+          { kind: 'rebuild-finished', count: 1 },
+          { kind: 'rebuild-started', reason: 'manual' },
+        ],
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }

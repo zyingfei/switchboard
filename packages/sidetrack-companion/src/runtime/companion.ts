@@ -1,6 +1,7 @@
 import { ensureBridgeKey } from '../auth/bridgeKey.js';
 import { createIdempotencyStore } from '../http/idempotency.js';
 import { pickInstaller } from '../install/index.js';
+import { createRecallActivityTracker } from '../recall/activity.js';
 import { createRecallLifecycle } from '../recall/lifecycle.js';
 import { createBucketRegistry } from '../routing/registry.js';
 import {
@@ -58,9 +59,11 @@ export const startCompanion = async (
       hygieneStatus.lastAuditRetentionAt = new Date().toISOString();
     });
   }, 24 * 60 * 60 * 1000);
+  const recallActivity = createRecallActivityTracker();
   const recallLifecycle = createRecallLifecycle({
     vaultRoot: options.vaultPath,
     companionVersion: COMPANION_VERSION,
+    activity: recallActivity,
   });
   // Don't block startup on the rebuild — health endpoint will report
   // status: 'rebuilding' until the background task completes.
@@ -76,6 +79,7 @@ export const startCompanion = async (
     bucketRegistry: createBucketRegistry(options.vaultPath),
     hygieneStatus,
     recallLifecycle,
+    recallActivity,
     vaultChanges: {
       subscribe(listener) {
         listeners.add(listener);

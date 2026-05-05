@@ -9,13 +9,18 @@ describe('embedder module', () => {
     expect(typeof embed).toBe('function');
   });
 
-  it.skipIf(process.env['CI'] === 'true')('embeds text as a normalized 384-dim vector', async () => {
-    const [vector] = await embed(['hello']);
-    const norm = Math.sqrt(Array.from(vector ?? []).reduce((sum, value) => sum + value * value, 0));
+  it.skipIf(process.env['SIDETRACK_RUN_EMBEDDER_TESTS'] !== 'true')(
+    'embeds text as a normalized 384-dim vector',
+    async () => {
+      const [vector] = await embed(['hello']);
+      const norm = Math.sqrt(
+        Array.from(vector ?? []).reduce((sum, value) => sum + value * value, 0),
+      );
 
-    expect(vector).toBeInstanceOf(Float32Array);
-    expect(vector).toHaveLength(384);
-    expect(norm).toBeGreaterThan(0.99);
-    expect(norm).toBeLessThan(1.01);
-  });
+      expect(vector).toBeInstanceOf(Float32Array);
+      expect(vector).toHaveLength(384);
+      expect(norm).toBeGreaterThan(0.99);
+      expect(norm).toBeLessThan(1.01);
+    },
+  );
 });

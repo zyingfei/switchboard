@@ -10,6 +10,7 @@ import {
 } from './embedder.js';
 import { readIndex } from './indexFile.js';
 import { rebuildFromEventLog } from './rebuild.js';
+import type { RecallActivityTracker } from './activity.js';
 
 // Surfaces the current freshness of the recall index so the side
 // panel can show what's happening (and so the companion can decide
@@ -74,6 +75,10 @@ export interface CreateRecallLifecycleOptions {
   // companion stdout shows when a rebuild kicks in.
   readonly log?: (message: string) => void;
   readonly warn?: (message: string) => void;
+  readonly activity?: Pick<
+    RecallActivityTracker,
+    'recordRebuildStarted' | 'recordRebuildFinished' | 'recordRebuildFailed'
+  >;
 }
 
 // Rebuilder signature must accept an `onProgress` so the lifecycle
@@ -122,13 +127,17 @@ const countTurnsInEventLog = async (vaultRoot: string): Promise<number> => {
 export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): RecallLifecycle => {
   const currentModelId = opts.currentModelId ?? MODEL_ID;
   const rebuilder = opts.rebuilder ?? rebuildFromEventLog;
-  const log = opts.log ?? ((message: string) => {
-    // eslint-disable-next-line no-console
-    console.info(message);
-  });
-  const warn = opts.warn ?? ((message: string) => {
-    console.warn(message);
-  });
+  const log =
+    opts.log ??
+    ((message: string) => {
+      // eslint-disable-next-line no-console
+      console.info(message);
+    });
+  const warn =
+    opts.warn ??
+    ((message: string) => {
+      console.warn(message);
+    });
 
   let rebuildPromise: Promise<void> | null = null;
   let lastError: string | null = null;
@@ -185,6 +194,7 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
 
   const scheduleRebuild = (reason: 'startup' | 'manual' | 'reconnect'): void => {
     if (rebuildPromise !== null) return;
+    opts.activity?.recordRebuildStarted(reason);
     log(`[recall] starting background rebuild (${reason})`);
     lastError = null;
     rebuildEmbedded = 0;
@@ -197,12 +207,14 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
             rebuildTotal = total;
           },
         });
+        opts.activity?.recordRebuildFinished(result.indexed);
         lastRebuildAt = new Date().toISOString();
         lastRebuildIndexed = result.indexed;
         log(`[recall] background rebuild finished: indexed ${String(result.indexed)} entries`);
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Recall rebuild failed.';
         lastError = message;
+        opts.activity?.recordRebuildFailed(message);
         warn(`[recall] background rebuild failed: ${message}`);
       } finally {
         rebuildPromise = null;

@@ -1,9 +1,10 @@
-import { describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import {
   Annotation,
   CodingAttach,
   DispatchConfirm,
+  HealthPanel,
   InboundCard,
   type InboundReminder,
   MoveToPicker,
@@ -46,6 +47,10 @@ const STUB_WORKSTREAMS = [
   { bac_id: 'ws-root', path: 'Inbox' },
   { bac_id: 'ws-sb-prd', path: 'Sidetrack / MVP PRD' },
 ];
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe('UX skeleton components — render-without-crash + key text present', () => {
   it('PacketComposer renders intent picker / framing / target selectors and footer actions', () => {
@@ -117,9 +122,7 @@ describe('UX skeleton components — render-without-crash + key text present', (
     // default text-matcher won't find a substring directly. Look at
     // the rendered <pre> element's textContent instead.
     const pre = document.querySelector('pre.preview-body');
-    expect(pre?.textContent ?? '').toContain(
-      "This is the user's real composed packet.",
-    );
+    expect(pre?.textContent ?? '').toContain("This is the user's real composed packet.");
     // Old stub strings must not appear.
     expect(pre?.textContent ?? '').not.toContain('Sidetrack / MVP PRD — context pack');
     expect(pre?.textContent ?? '').not.toContain('PRD §24.10 wording');
@@ -142,9 +145,7 @@ describe('UX skeleton components — render-without-crash + key text present', (
     // detail row shows the masked-spans note. The summary header reads
     // "needs review" instead of "checks ok".
     expect(screen.getByText(/needs review/)).toBeInTheDocument();
-    expect(
-      screen.getByText(/2 spans masked — 1 GitHub token, 1 email/),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/2 spans masked — 1 GitHub token, 1 email/)).toBeInTheDocument();
   });
 
   it('DispatchConfirm flips screen-share + injection states when active', () => {
@@ -167,9 +168,7 @@ describe('UX skeleton components — render-without-crash + key text present', (
     expect(
       screen.getByText(/screen-share active — contents visible to viewers/),
     ).toBeInTheDocument();
-    expect(
-      screen.getByText(/captured-page injection detected/),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/captured-page injection detected/)).toBeInTheDocument();
   });
 
   it('ReviewComposer renders editable span + comment-driven actions', () => {
@@ -185,21 +184,15 @@ describe('UX skeleton components — render-without-crash + key text present', (
       />,
     );
     // Span text is now an editable textarea, not a static blockquote.
-    expect(
-      screen.getByDisplayValue('A captured assistant turn span.'),
-    ).toBeInTheDocument();
+    expect(screen.getByDisplayValue('A captured assistant turn span.')).toBeInTheDocument();
     // Verdict picker is hidden behind a disclosure — only the
     // disclosure button is in the initial DOM.
     expect(screen.getByRole('button', { name: /add verdict/i })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Agree' })).toBeNull();
     // Three terminal actions: Save only / Dispatch to other AI / Send back.
     expect(screen.getByRole('button', { name: 'Save only' })).toBeInTheDocument();
-    expect(
-      screen.getByRole('button', { name: /Dispatch to other AI/ }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole('button', { name: /Send back to Claude/ }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Dispatch to other AI/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Send back to Claude/ })).toBeInTheDocument();
   });
 
   it('Wizard renders welcome step + advances through steps', () => {
@@ -428,6 +421,101 @@ describe('UX skeleton components — render-without-crash + key text present', (
     expect(screen.getByText(/Companion: disconnected/)).toBeInTheDocument();
     expect(screen.getByText(/Vault: error/)).toBeInTheDocument();
     expect(screen.getByText(/Screen-share active/)).toBeInTheDocument();
+  });
+
+  it('HealthPanel shows an unavailable state instead of preview fixture data', () => {
+    render(<HealthPanel onClose={noop} />);
+
+    expect(screen.getByText('Companion not configured')).toBeInTheDocument();
+    expect(screen.queryByText('~/Documents/Sidetrack-vault')).not.toBeInTheDocument();
+    expect(screen.queryByText('12.4k')).not.toBeInTheDocument();
+  });
+
+  it('HealthPanel renders live queue, provider, and recall activity data', async () => {
+    const fetchMock = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            data: {
+              uptimeSec: 42,
+              vault: { root: '/tmp/sidetrack-vault', writable: true, sizeBytes: 2048 },
+              capture: {
+                lastByProvider: { chatgpt: '2026-05-05T00:00:00.000Z' },
+                queueDepthHint: null,
+                droppedHint: null,
+                providers: [
+                  {
+                    provider: 'chatgpt',
+                    lastCaptureAt: '2026-05-05T00:00:00.000Z',
+                    lastStatus: 'warning',
+                    ok24h: 2,
+                    warn24h: 1,
+                    fail24h: 0,
+                    warning: 'Visible text is unusually long.',
+                  },
+                ],
+                recentWarnings: [
+                  {
+                    provider: 'chatgpt',
+                    capturedAt: '2026-05-05T00:00:00.000Z',
+                    code: 'long_capture',
+                    message: 'Visible text is unusually long.',
+                    severity: 'warning',
+                  },
+                ],
+              },
+              recall: {
+                indexExists: true,
+                entryCount: 5,
+                modelId: 'test/model',
+                sizeBytes: 4096,
+                status: 'ready',
+                activity: {
+                  lastIndexedAt: '2026-05-05T00:01:00.000Z',
+                  lastIndexedCount: 3,
+                  lastIndexedThreadIds: ['bac_thread_1'],
+                  lastRecallQueryAt: null,
+                  lastRecallQueryResultCount: null,
+                  lastSuggestionAt: '2026-05-05T00:02:00.000Z',
+                  lastSuggestionThreadId: 'bac_thread_1',
+                  recent: [
+                    {
+                      kind: 'suggestion',
+                      at: '2026-05-05T00:02:00.000Z',
+                      threadId: 'bac_thread_1',
+                      resultCount: 1,
+                    },
+                  ],
+                },
+              },
+              service: { installed: true, running: true },
+            },
+          }),
+      }),
+    ) as unknown as typeof fetch;
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(
+      <HealthPanel
+        onClose={noop}
+        companionPort={17_373}
+        bridgeKey="bridge"
+        queuedCaptureCount={4}
+        droppedCaptureCount={1}
+      />,
+    );
+
+    expect(await screen.findByText('ChatGPT')).toBeInTheDocument();
+    expect(screen.getByText('queued captures')).toBeInTheDocument();
+    expect(screen.getByText(/dropped 1/)).toBeInTheDocument();
+    expect(screen.getByText(/Group recommendation/)).toBeInTheDocument();
+    expect(screen.getAllByText('Visible text is unusually long.').length).toBeGreaterThan(0);
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith('http://127.0.0.1:17373/v1/system/health', {
+        headers: { 'x-bac-bridge-key': 'bridge' },
+      });
+    });
   });
 
   it('InboundCard renders thread title, provider chip, action row', () => {

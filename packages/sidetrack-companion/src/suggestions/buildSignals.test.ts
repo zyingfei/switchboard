@@ -70,6 +70,7 @@ describe('buildSignals', () => {
         { id: 'ws_other', title: 'Unrelated design' },
       ],
       () => Promise.resolve(index),
+      () => Promise.resolve([vector(0, 1)] as readonly Float32Array[]),
     );
 
     expect(signals.lexical['ws_recall']).toBeGreaterThan(signals.lexical['ws_other'] ?? 0);
@@ -107,8 +108,7 @@ describe('buildSignals', () => {
     };
     // Stub embedder returns a vector close to the thread's so the
     // cold-start cosine is non-trivial but not artificially perfect.
-    const stubEmbedder = () =>
-      Promise.resolve([vector(0.6, 0.4)] as readonly Float32Array[]);
+    const stubEmbedder = () => Promise.resolve([vector(0.6, 0.4)] as readonly Float32Array[]);
     const signals = await buildSignals(
       vaultRoot,
       'thread_hn',

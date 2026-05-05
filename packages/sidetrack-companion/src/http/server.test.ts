@@ -3,13 +3,26 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ensureBridgeKey } from '../auth/bridgeKey.js';
+import { createRecallActivityTracker } from '../recall/activity.js';
 import { createBucketRegistry } from '../routing/registry.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { createIdempotencyStore } from './idempotency.js';
 import { handleRequest, type CompanionHttpConfig } from './server.js';
+
+vi.mock('../recall/embedder.js', () => ({
+  MODEL_ID: 'test/model',
+  embed: (texts: readonly string[]) =>
+    Promise.resolve(
+      texts.map((_text, index) => {
+        const vector = new Float32Array(384);
+        vector[index % 384] = 1;
+        return vector;
+      }),
+    ),
+}));
 
 const jsonFetch = async (
   context: CompanionHttpConfig,
@@ -1228,9 +1241,152 @@ describe('companion HTTP server', () => {
 
     expect(rotate.status).toBe(200);
     expect(current).not.toBe(bridgeKey);
-    expect(health.body).toMatchObject({ data: { vault: { root: vaultPath }, service: { running: false } } });
+    expect(health.body).toMatchObject({
+      data: { vault: { root: vaultPath }, service: { running: false } },
+    });
     expect(hygiene.body).toMatchObject({
       data: { lastIdempotencyGcAt: '2026-05-03T00:00:00.000Z' },
+    });
+  });
+
+  it('reports recall activity after incremental indexing', async () => {
+    context = {
+      ...context,
+      recallActivity: createRecallActivityTracker(() => new Date('2026-05-05T01:02:03.000Z')),
+    };
+
+    const indexed = await jsonFetch(context, `${baseUrl}/v1/recall/index`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({
+        items: [
+          {
+            id: 'bac_thread_health:0',
+            threadId: 'bac_thread_health',
+            capturedAt: '2026-05-05T01:00:00.000Z',
+            text: 'index me',
+          },
+        ],
+      }),
+    });
+    const health = await jsonFetch(context, `${baseUrl}/v1/system/health`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+
+    expect(indexed.body).toMatchObject({ data: { indexed: 1 } });
+    expect(health.body).toMatchObject({
+      data: {
+        recall: {
+          activity: {
+            lastIndexedAt: '2026-05-05T01:02:03.000Z',
+            lastIndexedCount: 1,
+            lastIndexedThreadIds: ['bac_thread_health'],
+            recent: [{ kind: 'incremental-index', count: 1 }],
+          },
+        },
+      },
+    });
+  });
+
+  it('reports group-recommendation activity after workstream suggestions', async () => {
+    context = {
+      ...context,
+      recallActivity: createRecallActivityTracker(() => new Date('2026-05-05T02:03:04.000Z')),
+    };
+    await mkdir(join(vaultPath, '_BAC', 'threads'), { recursive: true });
+    await mkdir(join(vaultPath, '_BAC', 'workstreams'), { recursive: true });
+    await writeFile(
+      join(vaultPath, '_BAC', 'threads', 'bac_thread_suggest.json'),
+      `${JSON.stringify({
+        bac_id: 'bac_thread_suggest',
+        title: 'Alpha Research Plan',
+        primaryWorkstreamId: 'bac_ws_alpha',
+      })}\n`,
+      'utf8',
+    );
+    await writeFile(
+      join(vaultPath, '_BAC', 'workstreams', 'bac_ws_alpha.json'),
+      `${JSON.stringify({ bac_id: 'bac_ws_alpha', title: 'Alpha Research' })}\n`,
+      'utf8',
+    );
+
+    const suggestions = await jsonFetch(
+      context,
+      `${baseUrl}/v1/suggestions/thread/bac_thread_suggest?limit=1`,
+      { headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+    const health = await jsonFetch(context, `${baseUrl}/v1/system/health`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+
+    expect(suggestions.status).toBe(200);
+    expect(health.body).toMatchObject({
+      data: {
+        recall: {
+          activity: {
+            lastSuggestionAt: '2026-05-05T02:03:04.000Z',
+            lastSuggestionThreadId: 'bac_thread_suggest',
+            recent: [{ kind: 'suggestion', threadId: 'bac_thread_suggest', resultCount: 1 }],
+          },
+        },
+      },
+    });
+  });
+
+  it('derives provider health rows and warnings from capture event logs', async () => {
+    const capturedAt = new Date().toISOString();
+    await mkdir(join(vaultPath, '_BAC', 'events'), { recursive: true });
+    await writeFile(
+      join(vaultPath, '_BAC', 'events', `${capturedAt.slice(0, 10)}.jsonl`),
+      `${JSON.stringify({
+        provider: 'chatgpt',
+        capturedAt,
+        selectorCanary: 'ok',
+        threadUrl: 'https://chatgpt.com/c/one',
+        turns: [{ role: 'user', text: 'hello', ordinal: 0, capturedAt }],
+      })}\n${JSON.stringify({
+        provider: 'claude',
+        capturedAt,
+        selectorCanary: 'warning',
+        warnings: [
+          {
+            code: 'long_capture',
+            message: 'Visible text is unusually long.',
+            severity: 'warning',
+          },
+        ],
+        threadUrl: 'https://claude.ai/chat/two',
+        turns: [{ role: 'assistant', text: 'world', ordinal: 0, capturedAt }],
+      })}\n`,
+      'utf8',
+    );
+
+    const health = await jsonFetch(context, `${baseUrl}/v1/system/health`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+
+    expect(health.body).toMatchObject({
+      data: {
+        capture: {
+          lastByProvider: { chatgpt: capturedAt, claude: capturedAt },
+          providers: expect.arrayContaining([
+            expect.objectContaining({ provider: 'chatgpt', ok24h: 1, warn24h: 0 }),
+            expect.objectContaining({
+              provider: 'claude',
+              ok24h: 0,
+              warn24h: 1,
+              warning: 'Visible text is unusually long.',
+            }),
+          ]),
+          recentWarnings: expect.arrayContaining([
+            expect.objectContaining({
+              provider: 'claude',
+              code: 'long_capture',
+              message: 'Visible text is unusually long.',
+            }),
+          ]),
+        },
+      },
     });
   });
 

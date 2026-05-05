@@ -13,6 +13,7 @@ import { createDispatchId, createRequestId, createReviewId } from '../domain/ids
 import { pickInstaller, type Installer } from '../install/index.js';
 import { exportSettings } from '../portability/exportBundle.js';
 import { importSettings } from '../portability/importBundle.js';
+import type { RecallActivityTracker } from '../recall/activity.js';
 import { embed, MODEL_ID } from '../recall/embedder.js';
 import { appendEntry, gcEntries, readIndex, tombstoneByThread } from '../recall/indexFile.js';
 import type { RecallLifecycle } from '../recall/lifecycle.js';
@@ -24,7 +25,7 @@ import { estimateTokens, tokenBudgetWarningThreshold } from '../safety/tokenBudg
 import { buildSignals, type BuildSignalsWorkstream } from '../suggestions/buildSignals.js';
 import { scoreSuggestions } from '../suggestions/score.js';
 import { runAutoUpdate } from '../system/autoUpdate.js';
-import { collectHealth } from '../system/health.js';
+import { collectHealth, type CaptureWarningHealth, type HealthReport } from '../system/health.js';
 import { checkLatestVersion, type UpdateAdvisory } from '../system/versionCheck.js';
 import {
   listAnnotations,
@@ -98,6 +99,7 @@ export interface CompanionHttpConfig {
   // calls and health reports `status: 'ready' | 'missing'` with no
   // background-rebuild affordance.
   readonly recallLifecycle?: RecallLifecycle;
+  readonly recallActivity?: RecallActivityTracker;
 }
 
 export interface StartedHttpServer {
@@ -282,7 +284,8 @@ const requireVaultRoot = (context: CompanionHttpConfig): string => {
   return context.vaultRoot;
 };
 
-const recallIndexPath = (vaultRoot: string): string => join(vaultRoot, '_BAC', 'recall', 'index.bin');
+const recallIndexPath = (vaultRoot: string): string =>
+  join(vaultRoot, '_BAC', 'recall', 'index.bin');
 
 const readWorkstreamThreadIds = async (
   vaultRoot: string,
@@ -381,7 +384,13 @@ const mcpToolHeader = (request: IncomingMessage): WorkstreamWriteTool | undefine
     return undefined;
   }
   return (
-    ['bac.move_item', 'bac.queue_item', 'bac.bump_workstream', 'bac.archive_thread', 'bac.unarchive_thread'] as const
+    [
+      'bac.move_item',
+      'bac.queue_item',
+      'bac.bump_workstream',
+      'bac.archive_thread',
+      'bac.unarchive_thread',
+    ] as const
   ).find((tool) => tool === value);
 };
 
@@ -391,33 +400,150 @@ const directorySize = async (path: string): Promise<number> => {
     return info.size;
   }
   const names = await readdir(path).catch(() => []);
-  const sizes = await Promise.all(names.map((name) => directorySize(join(path, name)).catch(() => 0)));
+  const sizes = await Promise.all(
+    names.map((name) => directorySize(join(path, name)).catch(() => 0)),
+  );
   return sizes.reduce((sum, size) => sum + size, 0);
 };
 
-const recentCaptureByProvider = async (
-  vaultRoot: string,
-): Promise<Record<string, string | null>> => {
+const isSelectorCanary = (value: unknown): value is 'ok' | 'warning' | 'failed' =>
+  value === 'ok' || value === 'warning' || value === 'failed';
+
+const firstCaptureWarningMessage = (value: unknown): string | undefined => {
+  if (!Array.isArray(value)) return undefined;
+  for (const item of value) {
+    if (typeof item !== 'object' || item === null) continue;
+    const message = (item as { readonly message?: unknown }).message;
+    if (typeof message === 'string' && message.length > 0) return message;
+  }
+  return undefined;
+};
+
+const captureHealthSummary = async (vaultRoot: string): Promise<HealthReport['capture']> => {
   const root = join(vaultRoot, '_BAC', 'events');
   const names = await readdir(root).catch(() => []);
   const last: Record<string, string | null> = {};
-  for (const name of names.filter((candidate) => candidate.endsWith('.jsonl')).sort().reverse().slice(0, 14)) {
+  const providerRows = new Map<
+    string,
+    {
+      provider: string;
+      lastCaptureAt: string | null;
+      lastStatus: 'ok' | 'warning' | 'failed' | null;
+      ok24h: number;
+      warn24h: number;
+      fail24h: number;
+      warning?: string;
+    }
+  >();
+  const recentWarnings: CaptureWarningHealth[] = [];
+  const since24h = Date.now() - 24 * 60 * 60 * 1000;
+  for (const name of names
+    .filter((candidate) => candidate.endsWith('.jsonl'))
+    .sort()
+    .reverse()
+    .slice(0, 14)) {
     const raw = await readFile(join(root, name), 'utf8').catch(() => '');
     for (const line of raw.split('\n')) {
       try {
-        const event = JSON.parse(line) as { readonly provider?: unknown; readonly capturedAt?: unknown };
+        const event = JSON.parse(line) as {
+          readonly provider?: unknown;
+          readonly capturedAt?: unknown;
+          readonly selectorCanary?: unknown;
+          readonly warnings?: unknown;
+        };
         if (typeof event.provider === 'string' && typeof event.capturedAt === 'string') {
           const existing = last[event.provider];
           if (existing === undefined || existing === null || existing < event.capturedAt) {
             last[event.provider] = event.capturedAt;
           }
+          const current = providerRows.get(event.provider) ?? {
+            provider: event.provider,
+            lastCaptureAt: null,
+            lastStatus: null,
+            ok24h: 0,
+            warn24h: 0,
+            fail24h: 0,
+          };
+          const selectorCanary = isSelectorCanary(event.selectorCanary)
+            ? event.selectorCanary
+            : null;
+          const capturedMillis = Date.parse(event.capturedAt);
+          if (
+            !Number.isNaN(capturedMillis) &&
+            capturedMillis >= since24h &&
+            selectorCanary !== null
+          ) {
+            if (selectorCanary === 'ok') current.ok24h += 1;
+            if (selectorCanary === 'warning') current.warn24h += 1;
+            if (selectorCanary === 'failed') current.fail24h += 1;
+          }
+          if (current.lastCaptureAt === null || current.lastCaptureAt < event.capturedAt) {
+            current.lastCaptureAt = event.capturedAt;
+            current.lastStatus = selectorCanary;
+            const warning = firstCaptureWarningMessage(event.warnings);
+            if (warning !== undefined) {
+              current.warning = warning;
+            } else if (selectorCanary === 'warning') {
+              current.warning = 'Selector canary warning.';
+            } else if (selectorCanary === 'failed') {
+              current.warning = 'Selector canary failed.';
+            } else {
+              delete current.warning;
+            }
+          }
+          if (selectorCanary === 'warning' || selectorCanary === 'failed') {
+            recentWarnings.push({
+              provider: event.provider,
+              capturedAt: event.capturedAt,
+              code: `selector_${selectorCanary}`,
+              message:
+                selectorCanary === 'failed'
+                  ? 'Selector canary failed.'
+                  : 'Selector canary warning.',
+              severity: 'warning',
+            });
+          }
+          if (Array.isArray(event.warnings)) {
+            for (const item of event.warnings) {
+              if (typeof item !== 'object' || item === null) continue;
+              const warning = item as {
+                readonly code?: unknown;
+                readonly message?: unknown;
+                readonly severity?: unknown;
+              };
+              if (
+                typeof warning.code === 'string' &&
+                typeof warning.message === 'string' &&
+                (warning.severity === 'info' || warning.severity === 'warning')
+              ) {
+                recentWarnings.push({
+                  provider: event.provider,
+                  capturedAt: event.capturedAt,
+                  code: warning.code,
+                  message: warning.message,
+                  severity: warning.severity,
+                });
+              }
+            }
+          }
+          providerRows.set(event.provider, current);
         }
       } catch {
         // Ignore malformed event-log rows for health reporting.
       }
     }
   }
-  return last;
+  return {
+    lastByProvider: last,
+    queueDepthHint: null,
+    droppedHint: null,
+    providers: [...providerRows.values()].sort((left, right) =>
+      (right.lastCaptureAt ?? '').localeCompare(left.lastCaptureAt ?? ''),
+    ),
+    recentWarnings: recentWarnings
+      .sort((left, right) => right.capturedAt.localeCompare(left.capturedAt))
+      .slice(0, 10),
+  };
 };
 
 const readThreadWorkstreamId = async (
@@ -450,7 +576,9 @@ const parseThreadUpsertBody = async (vaultRoot: string, body: unknown) => {
     return threadUpsertSchema.parse(body);
   }
   const existing = objectRecord(
-    JSON.parse(await readFile(join(vaultRoot, '_BAC', 'threads', `${bacId}.json`), 'utf8')) as unknown,
+    JSON.parse(
+      await readFile(join(vaultRoot, '_BAC', 'threads', `${bacId}.json`), 'utf8'),
+    ) as unknown,
   );
   if (existing === undefined) {
     return threadUpsertSchema.parse(body);
@@ -465,7 +593,9 @@ const parseThreadUpsertBody = async (vaultRoot: string, body: unknown) => {
         ? { primaryWorkstreamId: rawWorkstreamId }
         : {}),
     lastSeenAt:
-      typeof existing['lastSeenAt'] === 'string' ? existing['lastSeenAt'] : new Date().toISOString(),
+      typeof existing['lastSeenAt'] === 'string'
+        ? existing['lastSeenAt']
+        : new Date().toISOString(),
     title: typeof existing['title'] === 'string' ? existing['title'] : bacId,
   });
 };
@@ -557,11 +687,7 @@ const routes: readonly RouteDefinition[] = [
               }
             },
             vaultSizeBytes: () => directorySize(join(vaultRoot, '_BAC')).catch(() => null),
-            captureSummary: async () => ({
-              lastByProvider: await recentCaptureByProvider(vaultRoot),
-              queueDepthHint: null,
-              droppedHint: null,
-            }),
+            captureSummary: () => captureHealthSummary(vaultRoot),
             recallSummary: async () => {
               const [index, info, lifecycleReport] = await Promise.all([
                 readIndex(indexPath),
@@ -591,6 +717,9 @@ const routes: readonly RouteDefinition[] = [
                       embedderDevice: lifecycleReport.embedderDevice,
                       embedderAccelerator: lifecycleReport.embedderAccelerator,
                     }),
+                ...(context.recallActivity === undefined
+                  ? {}
+                  : { activity: context.recallActivity.report() }),
               };
             },
             serviceStatus: async () => {
@@ -624,7 +753,7 @@ const routes: readonly RouteDefinition[] = [
     authRequired: true,
     handle: async (_request, _requestId, _match, context) => [
       200,
-      { items: await context.bucketRegistry?.readBuckets() ?? [] },
+      { items: (await context.bucketRegistry?.readBuckets()) ?? [] },
     ],
   },
   {
@@ -863,7 +992,10 @@ const routes: readonly RouteDefinition[] = [
       if (match.annotationId === undefined) {
         throw new Error('Missing annotationId path parameter.');
       }
-      return [200, { data: await softDeleteAnnotation(requireVaultRoot(context), match.annotationId) }];
+      return [
+        200,
+        { data: await softDeleteAnnotation(requireVaultRoot(context), match.annotationId) },
+      ];
     },
   },
   {
@@ -874,6 +1006,8 @@ const routes: readonly RouteDefinition[] = [
       const vaultRoot = requireVaultRoot(context);
       const input = recallIndexSchema.parse(await readBody(request));
       const vectors = await embed(input.items.map((item) => item.text));
+      let indexed = 0;
+      const indexedThreadIds: string[] = [];
       for (let index = 0; index < input.items.length; index += 1) {
         const item = input.items[index];
         const embedding = vectors[index];
@@ -888,9 +1022,15 @@ const routes: readonly RouteDefinition[] = [
             },
             MODEL_ID,
           );
+          indexed += 1;
+          indexedThreadIds.push(item.threadId);
         }
       }
-      return [202, { data: { indexed: input.items.length } }];
+      context.recallActivity?.recordIncrementalIndex({
+        count: indexed,
+        threadIds: indexedThreadIds,
+      });
+      return [202, { data: { indexed } }];
     },
   },
   {
@@ -969,6 +1109,10 @@ const routes: readonly RouteDefinition[] = [
           return Object.keys(additions).length > 0 ? { ...item, ...additions } : item;
         }),
       );
+      context.recallActivity?.recordQuery({
+        queryLength: query.q.length,
+        resultCount: enriched.length,
+      });
       return [200, { data: enriched }];
     },
   },
@@ -1023,7 +1167,12 @@ const routes: readonly RouteDefinition[] = [
       const input = recallGcSchema.parse(await readBody(request));
       return [
         200,
-        { data: await gcEntries(recallIndexPath(requireVaultRoot(context)), new Set(input.validIds)) },
+        {
+          data: await gcEntries(
+            recallIndexPath(requireVaultRoot(context)),
+            new Set(input.validIds),
+          ),
+        },
       ];
     },
   },
@@ -1061,6 +1210,10 @@ const routes: readonly RouteDefinition[] = [
         },
         { threshold },
       ).slice(0, query.limit);
+      context.recallActivity?.recordSuggestion({
+        threadId: match.threadId,
+        resultCount: suggestions.length,
+      });
       return [200, { data: suggestions }];
     },
   },
@@ -1234,7 +1387,13 @@ const routes: readonly RouteDefinition[] = [
       if (mcpToolHeader(_request) === 'bac.bump_workstream') {
         await requireWorkstreamTrust(context, match.bacId, 'bac.bump_workstream');
       }
-      return [200, mutationResponse(await context.vaultWriter.bumpWorkstream(match.bacId, requestId), requestId)];
+      return [
+        200,
+        mutationResponse(
+          await context.vaultWriter.bumpWorkstream(match.bacId, requestId),
+          requestId,
+        ),
+      ];
     },
   },
   {
@@ -1266,10 +1425,7 @@ const routes: readonly RouteDefinition[] = [
         throw new Error('Vault root is unavailable.');
       }
       const notes = await scanVaultForLinkedNotes(context.vaultRoot);
-      return [
-        200,
-        { items: notes.filter((note) => note.workstreamId === match.workstreamId) },
-      ];
+      return [200, { items: notes.filter((note) => note.workstreamId === match.workstreamId) }];
     },
   },
   {
