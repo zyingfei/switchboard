@@ -262,14 +262,9 @@ const buildLeanHandoff = (
 ): string =>
   [
     '# Coding handoff: Recall index lifecycle',
-    '',
-    `sidetrack_thread_id: ${threadId}`,
     `sidetrack_mcp: ${mcpEndpoint}`,
-    '',
-    'The Sidetrack companion is running locally and exposes the thread\'s',
-    'full context (markdown, dispatches, annotations, recall) over MCP.',
-    'Connect to the endpoint above and call `tools/list` to see what\'s',
-    'available; `bac.read_thread_md` returns the conversation body.',
+    `sidetrack_thread_id: ${threadId}`,
+    '(connect → tools/list → bac.read_thread_md)',
     '',
     '## User\'s ask',
     ask,
@@ -328,7 +323,7 @@ const structured = (result: unknown): unknown => {
 // ────────────────── The E2E ──────────────────
 
 describe('codex handoff over MCP', () => {
-  it('lean prompt carries only thread_id + mcp endpoint + ask (nothing else)', () => {
+  it('compact prompt carries only thread_id + mcp endpoint + ask (nothing else)', () => {
     const prompt = buildLeanHandoff(
       TARGET_THREAD_ID,
       'ws://127.0.0.1:8721/mcp?token=local',
@@ -346,6 +341,11 @@ describe('codex handoff over MCP', () => {
     expect(prompt).toContain(`sidetrack_thread_id: ${TARGET_THREAD_ID}`);
     expect(prompt).toContain('sidetrack_mcp: ws://127.0.0.1:8721/mcp?token=local');
     expect(prompt).toContain('## User\'s ask');
+    // Discovery breadcrumb is the only instruction-shaped content;
+    // capable agents need just this to find bac.read_thread_md.
+    expect(prompt).toContain('(connect → tools/list → bac.read_thread_md)');
+    // Compact-budget guard: ~225 chars baseline + room for ask.
+    expect(prompt.length).toBeLessThan(400);
   });
 
   it('agent connects to MCP, discovers tools, and walks the canonical handoff flow', async () => {

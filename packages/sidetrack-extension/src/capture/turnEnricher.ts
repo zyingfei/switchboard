@@ -75,8 +75,7 @@ const formatModelSlug = (slug: string): string => {
     // "GPT-4o" is the canonical spelling.
     .replace(/^gpt-(\d+)([a-z]+)?\b/i, (_m, n, suffix) =>
       `GPT${HYPHEN_PLACEHOLDER}${String(n)}${typeof suffix === 'string' ? suffix : ''}`,
-    )
-    .replace(/^o(\d+)\b/i, `o${HYPHEN_PLACEHOLDER}$1`);
+    );
   out = out
     .split('-')
     .map((part, idx) => (idx === 0 ? part : part.charAt(0).toUpperCase() + part.slice(1)))

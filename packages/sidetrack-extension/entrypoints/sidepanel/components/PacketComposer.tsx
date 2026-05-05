@@ -321,15 +321,16 @@ const buildCodingAgentPacket = (
   title: string,
   scope: PacketComposerScope,
 ): string =>
+  // Even leaner than the previous lean version: drops the 274-char
+  // explanatory paragraph in favor of a one-line breadcrumb. Modern
+  // coding agents (Codex, Claude Code, Cursor) auto-discover MCP
+  // tools via tools/list on connect; the prose was front-loading
+  // a contract the agent never read. Side-by-side review in
+  // sidetrack-mcp/src/e2e/handoff-prompt-trim-review.md.
   `# Coding handoff: ${title}
-
-sidetrack_thread_id: ${scope.sourceThreadId ?? '(unknown)'}
 sidetrack_mcp: ws://127.0.0.1:8721/mcp?token={BRIDGE_KEY}
-
-The Sidetrack companion is running locally and exposes the thread's
-full context (markdown, dispatches, annotations, recall) over MCP.
-Connect to the endpoint above and call \`tools/list\` to see what's
-available; \`bac.read_thread_md\` returns the conversation body.
+sidetrack_thread_id: ${scope.sourceThreadId ?? '(unknown)'}
+(connect → tools/list → bac.read_thread_md)
 
 ## User's ask
 …`;

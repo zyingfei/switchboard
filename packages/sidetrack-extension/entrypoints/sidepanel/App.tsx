@@ -1483,12 +1483,13 @@ const App = () => {
       // is interpolated inline because clipboard is local-only and
       // the companion only listens on 127.0.0.1.
       const keyStr = bridgeKey.length > 0 ? bridgeKey : '<run the companion to generate>';
-      // Lean handoff: drop the chat URL, provider label, HTTP
-      // fallback block, tools list, recommended sequence, AND the
-      // frozen turn snapshot. Everything reachable via MCP stays
-      // there. See PacketComposer's buildCodingAgentPacket for the
-      // canonical version + the rationale.
-      body = `# Coding handoff: ${thread.title}\n\nsidetrack_thread_id: ${thread.bac_id}\nsidetrack_mcp: ws://127.0.0.1:8721/mcp?token=${keyStr}\n\nThe Sidetrack companion is running locally and exposes the thread's full context (markdown, dispatches, annotations, recall) over MCP. Connect to the endpoint above and call \`tools/list\` to see what's available; \`bac.read_thread_md\` returns the conversation body.\n\n## User's ask\n…`;
+      // Compact handoff (~225 chars): title + endpoint + thread_id
+      // + a one-line breadcrumb pointing at the discovery path. The
+      // verbose explanatory paragraph from the prior packet was
+      // front-loading a contract that capable agents auto-discover
+      // via tools/list. Side-by-side review:
+      // packages/sidetrack-mcp/src/e2e/handoff-prompt-trim-review.md.
+      body = `# Coding handoff: ${thread.title}\nsidetrack_mcp: ws://127.0.0.1:8721/mcp?token=${keyStr}\nsidetrack_thread_id: ${thread.bac_id}\n(connect → tools/list → bac.read_thread_md)\n\n## User's ask\n…`;
     } else {
       const today = new Date().toISOString().slice(0, 10);
       body = `---\ntitle: ${thread.title}\ncreated: ${today}\nsource: ${thread.threadUrl}\nprovider: ${provider}\n---\n\n# ${thread.title}\n\n${turnsMd}`;
