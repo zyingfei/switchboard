@@ -896,17 +896,22 @@ const refreshCachedDispatches = async (): Promise<void> => {
   const settings = await readSettings();
   try {
     const dispatches = await createDispatchClient(settings.companion).listRecent({ limit: 20 });
-    // Keep the side-panel cache merged with any local 'replied' flips
-    // already on it — markDispatchesRepliedForThread runs on capture
-    // and writes locally; the next refresh from the companion would
-    // otherwise revert it until the companion learns about the reply.
+    // Keep the side-panel cache merged with any local status overrides
+    // already on it. Two local-only flips: 'replied' (from
+    // markDispatchesRepliedForThread on capture) and 'archived' (from
+    // the user's UI action via setDispatchArchived). Without this
+    // merge, the next companion refresh would revert both back to
+    // 'sent' on every action.
     const local = await readCachedDispatches();
-    const localReplies = new Map(
-      local.filter((d) => d.status === 'replied').map((d) => [d.bac_id, d.status]),
+    const localOverrides = new Map(
+      local
+        .filter((d) => d.status === 'replied' || d.status === 'archived')
+        .map((d) => [d.bac_id, d.status]),
     );
-    const merged = dispatches.map((d) =>
-      localReplies.has(d.bac_id) ? { ...d, status: 'replied' as const } : d,
-    );
+    const merged = dispatches.map((d) => {
+      const override = localOverrides.get(d.bac_id);
+      return override === undefined ? d : { ...d, status: override };
+    });
     await writeCachedDispatches(merged);
   } catch {
     // Companion unreachable — keep the existing cache.
