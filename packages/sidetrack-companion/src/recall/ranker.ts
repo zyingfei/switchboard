@@ -3,6 +3,25 @@ export interface IndexEntry {
   readonly threadId: string;
   readonly capturedAt: string;
   readonly embedding: Float32Array;
+  // CRDT-extension fields. Populated by the V2 writer with sensible
+  // defaults when the caller omits them; ignored by the single-replica
+  // reader path today (kept on-disk so a future multi-replica reader
+  // can merge two index files via OR-Set semantics).
+  //
+  //   replicaId — identifies which companion wrote this entry.
+  //               Single-vault deployments always see 'local'.
+  //               Multi-device replicas use a stable per-machine id.
+  //   lamport   — monotonic logical clock per replica. When two
+  //               entries share the same id, the one with the higher
+  //               (lamport, replicaId) wins on read.
+  //   tombstoned — soft-delete flag for OR-Set semantics. The
+  //               single-replica reader filters tombstoned entries
+  //               out of query results today; the multi-replica
+  //               reader will continue to honor them across merges
+  //               so a delete on replica A propagates to replica B.
+  readonly replicaId?: string;
+  readonly lamport?: number;
+  readonly tombstoned?: boolean;
 }
 
 export interface RankedItem {
@@ -53,6 +72,10 @@ export const rank = (
   } = {},
 ): readonly RankedItem[] =>
   items
+    // OR-Set tombstone filter — single-replica reader treats a
+    // tombstoned entry as deleted. The future multi-replica reader
+    // will resolve tombstones at merge time before this point.
+    .filter((item) => item.tombstoned !== true)
     .filter((item) => opts.workstreamMembership?.(item.threadId) ?? true)
     .map((item) => {
       const similarity = cosine(queryEmbedding, item.embedding);

@@ -13,16 +13,26 @@
 interface NeedsOrganizeSuggestionProps {
   readonly suggestedLabel: string;
   readonly confidence: number;
+  // True while a background fetch is in flight so the refresh button
+  // can show its spinning state without blocking the existing UI.
+  readonly pending?: boolean;
   readonly onAccept: () => void;
   readonly onPickManual: () => void;
+  // Optional explicit re-fetch handle. Lets the user force the
+  // companion to recompute the suggestion (e.g. after renaming a
+  // workstream the panel hasn't picked up yet, or to verify that a
+  // dismissed suggestion no longer ranks high).
+  readonly onRefresh?: () => void;
   readonly onDismiss: () => void;
 }
 
 export function NeedsOrganizeSuggestion({
   suggestedLabel,
   confidence,
+  pending = false,
   onAccept,
   onPickManual,
+  onRefresh,
   onDismiss,
 }: NeedsOrganizeSuggestionProps) {
   const hasRecommendation = confidence > 0;
@@ -49,6 +59,18 @@ export function NeedsOrganizeSuggestion({
         <button type="button" className={hasRecommendation ? '' : 'primary'} onClick={onPickManual}>
           Pick…
         </button>
+        {onRefresh !== undefined ? (
+          <button
+            type="button"
+            className="ghost"
+            onClick={onRefresh}
+            aria-label="Recompute suggestion"
+            title={pending ? 'Refreshing…' : 'Recompute suggestion'}
+            disabled={pending}
+          >
+            {pending ? '⟳' : '↻'}
+          </button>
+        ) : null}
         <button type="button" className="dismiss" onClick={onDismiss} aria-label="Dismiss">
           ×
         </button>

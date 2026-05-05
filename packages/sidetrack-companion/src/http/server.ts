@@ -14,7 +14,7 @@ import { pickInstaller, type Installer } from '../install/index.js';
 import { exportSettings } from '../portability/exportBundle.js';
 import { importSettings } from '../portability/importBundle.js';
 import { embed, MODEL_ID } from '../recall/embedder.js';
-import { appendEntry, gcEntries, readIndex } from '../recall/indexFile.js';
+import { appendEntry, gcEntries, readIndex, tombstoneByThread } from '../recall/indexFile.js';
 import type { RecallLifecycle } from '../recall/lifecycle.js';
 import { rank } from '../recall/ranker.js';
 import { rebuildFromEventLog } from '../recall/rebuild.js';
@@ -1104,14 +1104,25 @@ const routes: readonly RouteDefinition[] = [
       if (match.bacId === undefined) {
         throw new Error('Missing bacId path parameter.');
       }
+      const vaultRoot = requireVaultRoot(context);
       if (mcpToolHeader(_request) === 'bac.archive_thread') {
         await requireWorkstreamTrust(
           context,
-          await readThreadWorkstreamId(requireVaultRoot(context), match.bacId),
+          await readThreadWorkstreamId(vaultRoot, match.bacId),
           'bac.archive_thread',
         );
       }
-      return [200, mutationResponse(await context.vaultWriter.archiveThread(match.bacId, requestId), requestId)];
+      const result = await context.vaultWriter.archiveThread(match.bacId, requestId);
+      // Tombstone every recall index entry for this thread so
+      // /v1/recall/query stops returning rows from archived threads.
+      // OR-Set semantics: rows stay on disk with tombstoned=true; a
+      // future replica merging an older un-archived write won't
+      // resurrect them. Best-effort — a missing index file is a
+      // benign no-op (tombstoneByThread returns 0).
+      await tombstoneByThread(recallIndexPath(vaultRoot), match.bacId).catch(() => {
+        /* index optional; archive succeeds regardless */
+      });
+      return [200, mutationResponse(result, requestId)];
     },
   },
   {
@@ -1129,7 +1140,13 @@ const routes: readonly RouteDefinition[] = [
           'bac.unarchive_thread',
         );
       }
-      return [200, mutationResponse(await context.vaultWriter.unarchiveThread(match.bacId, requestId), requestId)];
+      const result = await context.vaultWriter.unarchiveThread(match.bacId, requestId);
+      // We deliberately do NOT clear the tombstones on unarchive —
+      // an OR-Set tombstone is permanent (creating a fresh write
+      // with a higher lamport is the right way to bring an entry
+      // back). The lifecycle's incremental indexer will write fresh
+      // (untombstoned) rows for any new captures on this thread.
+      return [200, mutationResponse(result, requestId)];
     },
   },
   {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
 
 import {
   companionStatusLabel,
@@ -467,9 +467,19 @@ const App = () => {
   // Cache of suggested workstream per thread, keyed by thread bac_id.
   // Populated from companion's GET /v1/suggestions/thread/{id} (PR #76
   // Track F) when the row is rendered. Empty fallback shows nothing.
+  // Stale-while-revalidate semantics: each row renders the cached
+  // value immediately AND always kicks a background fetch on mount
+  // / on workstream-state change / on explicit refresh. Cache is
+  // dropped wholesale when the workstream fingerprint shifts so a
+  // workstream rename, member move, or new workstream invalidates
+  // every cached suggestion at once.
   const [suggestionCache, setSuggestionCache] = useState<
-    ReadonlyMap<string, { readonly label: string; readonly confidence: number }>
+    ReadonlyMap<
+      string,
+      { readonly workstreamId: string; readonly label: string; readonly confidence: number }
+    >
   >(() => new Map());
+  const lastFingerprintRef = useRef<string | null>(null);
 
   // Refresh pending coding-session offers from chrome.storage. Driven
   // by storage events (set by the background detection handler) plus
@@ -560,6 +570,44 @@ const App = () => {
   >(null);
 
   const threads = useMemo(() => visibleThreads(state.threads), [state.threads]);
+  // Stable string that mutates whenever the workstream graph or any
+  // thread's primary-workstream assignment changes. Drives both the
+  // wholesale cache flush below and the per-row useEffect dep so the
+  // companion's suggestion gets re-fetched whenever the inputs that
+  // shaped it changed.
+  const workstreamFingerprint = useMemo(() => {
+    const wsParts = state.workstreams
+      .map((ws) => `${ws.bac_id}:${ws.revision}`)
+      .sort()
+      .join('|');
+    const memberParts = state.threads
+      .map((t) => `${t.bac_id}->${t.primaryWorkstreamId ?? ''}`)
+      .sort()
+      .join('|');
+    return `${wsParts}#${memberParts}`;
+  }, [state.workstreams, state.threads]);
+  // Stable callback so the row effect's `resolveLabel` dep doesn't
+  // thrash on every render. workstreamPath is pure over the
+  // workstreams array, so we re-create only when the array changes.
+  const resolveWorkstreamLabel = useCallback(
+    (workstreamId: string) => workstreamPath(workstreamId, state.workstreams),
+    [state.workstreams],
+  );
+  // Invalidate every cached suggestion when the workstream
+  // fingerprint shifts (rename, member move, new/deleted workstream).
+  // The per-row effect will re-fetch on its next render.
+  useEffect(() => {
+    // Skip the initial render so we don't drop a freshly-populated
+    // cache that hasn't observed any mutation yet.
+    if (lastFingerprintRef.current === null) {
+      lastFingerprintRef.current = workstreamFingerprint;
+      return;
+    }
+    if (lastFingerprintRef.current !== workstreamFingerprint) {
+      lastFingerprintRef.current = workstreamFingerprint;
+      setSuggestionCache(new Map());
+    }
+  }, [workstreamFingerprint]);
   const moveThread = useMemo(
     () => threads.find((thread) => thread.bac_id === moveThreadId),
     [moveThreadId, threads],
@@ -2311,10 +2359,20 @@ const App = () => {
             companionPort={port.length > 0 ? Number(port) : null}
             bridgeKey={bridgeKey.length > 0 ? bridgeKey : null}
             cached={suggestionCache.get(thread.bac_id)}
-            onCache={(label, confidence) => {
+            workstreamFingerprint={workstreamFingerprint}
+            resolveLabel={resolveWorkstreamLabel}
+            onCache={(payload) => {
               setSuggestionCache((prev) => {
                 const next = new Map(prev);
-                next.set(thread.bac_id, { label, confidence });
+                next.set(thread.bac_id, payload);
+                return next;
+              });
+            }}
+            onClearCache={() => {
+              setSuggestionCache((prev) => {
+                if (!prev.has(thread.bac_id)) return prev;
+                const next = new Map(prev);
+                next.delete(thread.bac_id);
                 return next;
               });
             }}
@@ -4569,8 +4627,24 @@ interface NeedsOrganizeSuggestionRowProps {
   readonly threadId: string;
   readonly companionPort: number | null;
   readonly bridgeKey: string | null;
-  readonly cached?: { readonly label: string; readonly confidence: number };
-  readonly onCache: (label: string, confidence: number) => void;
+  readonly cached?: {
+    readonly workstreamId: string;
+    readonly label: string;
+    readonly confidence: number;
+  };
+  // Stable string that changes whenever the workstream graph
+  // changes (counts, revisions, members). The fetch effect depends
+  // on it, so any workstream mutation invalidates the cached
+  // suggestion automatically.
+  readonly workstreamFingerprint: string;
+  // Resolves a workstreamId to its display label (`workstreamPath`
+  // semantics). Threaded in so the row shows real names instead of
+  // a bac_id slice.
+  readonly resolveLabel: (workstreamId: string) => string;
+  readonly onCache: (
+    payload: { readonly workstreamId: string; readonly label: string; readonly confidence: number },
+  ) => void;
+  readonly onClearCache: () => void;
   readonly onAccept: (workstreamId: string) => void;
   readonly onPickManual: () => void;
   readonly onDismiss: () => void;
@@ -4581,34 +4655,37 @@ function NeedsOrganizeSuggestionRow({
   companionPort,
   bridgeKey,
   cached,
+  workstreamFingerprint,
+  resolveLabel,
   onCache,
+  onClearCache,
   onAccept,
   onPickManual,
   onDismiss,
 }: NeedsOrganizeSuggestionRowProps) {
+  // Render the cached value immediately; the fetch effect below
+  // always runs (stale-while-revalidate) so a subsequent mutation
+  // on the companion side propagates without forcing a side-panel
+  // reload. If the user explicitly hits the refresh icon we clear
+  // both the local state AND the parent cache and re-fetch.
   const [suggestion, setSuggestion] = useState<{
     readonly workstreamId: string;
     readonly label: string;
     readonly confidence: number;
-  } | null>(
-    cached !== undefined
-      ? {
-          workstreamId: '',
-          label: cached.label,
-          confidence: cached.confidence,
-        }
-      : null,
-  );
+  } | null>(cached ?? null);
+  const [refreshTick, setRefreshTick] = useState(0);
+  const [pending, setPending] = useState(false);
 
   useEffect(() => {
-    if (cached !== undefined) return undefined;
     if (companionPort === null || bridgeKey === null) return undefined;
     let cancelled = false;
+    setPending(true);
     void (async () => {
       try {
         const url = `http://127.0.0.1:${String(companionPort)}/v1/suggestions/thread/${threadId}?limit=1`;
         const response = await fetch(url, { headers: { 'x-bac-bridge-key': bridgeKey } });
-        if (!response.ok) return;
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled mutated by cleanup
+        if (cancelled || !response.ok) return;
         const body = (await response.json()) as {
           readonly data?: {
             readonly items?: readonly {
@@ -4618,30 +4695,48 @@ function NeedsOrganizeSuggestionRow({
           };
         };
         const top = body.data?.items?.[0];
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled mutated by closure on cleanup
-        if (top === undefined || cancelled) return;
-        const label = `workstream ${top.workstreamId.slice(0, 12)}`;
-        setSuggestion({ workstreamId: top.workstreamId, label, confidence: top.score });
-        onCache(label, top.score);
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled mutated by cleanup
+        if (cancelled) return;
+        if (top === undefined) {
+          // No suggestion above threshold any more — clear so the
+          // row falls back to the manual-pick affordance.
+          setSuggestion(null);
+          return;
+        }
+        const label = resolveLabel(top.workstreamId);
+        const next = { workstreamId: top.workstreamId, label, confidence: top.score };
+        setSuggestion(next);
+        onCache(next);
       } catch {
         // Silent — empty render
+      } finally {
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled mutated by cleanup
+        if (!cancelled) setPending(false);
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [companionPort, bridgeKey, cached, threadId, onCache]);
+  }, [
+    companionPort,
+    bridgeKey,
+    threadId,
+    onCache,
+    resolveLabel,
+    workstreamFingerprint,
+    refreshTick,
+  ]);
 
   // Always render the row even when the companion has no automatic
   // suggestion above threshold — surface the manual picker so the
   // user has a path to file the thread without hunting for the
-  // workstream chip elsewhere. Previously returned null on empty,
-  // leaving "Needs organize" pill with no actionable affordance.
+  // workstream chip elsewhere.
   const hasAuto = suggestion !== null;
   return (
     <NeedsOrganizeSuggestion
       suggestedLabel={hasAuto ? suggestion.label : 'Pick a workstream…'}
       confidence={hasAuto ? suggestion.confidence : 0}
+      pending={pending}
       onAccept={() => {
         if (hasAuto && suggestion.workstreamId.length > 0) {
           onAccept(suggestion.workstreamId);
@@ -4650,6 +4745,13 @@ function NeedsOrganizeSuggestionRow({
         }
       }}
       onPickManual={onPickManual}
+      onRefresh={() => {
+        // Clearing the parent cache then bumping refreshTick forces
+        // the effect to re-run with no cached fallback to render.
+        onClearCache();
+        setSuggestion(null);
+        setRefreshTick((tick) => tick + 1);
+      }}
       onDismiss={onDismiss}
     />
   );
