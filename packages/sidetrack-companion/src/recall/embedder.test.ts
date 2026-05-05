@@ -4,7 +4,7 @@ import { embed, getEmbedder, MODEL_ID } from './embedder.js';
 
 describe('embedder module', () => {
   it('exports the expected lazy embedder interface', () => {
-    expect(MODEL_ID).toBe('Xenova/paraphrase-multilingual-MiniLM-L12-v2');
+    expect(MODEL_ID).toBe('Xenova/multilingual-e5-small');
     expect(typeof getEmbedder).toBe('function');
     expect(typeof embed).toBe('function');
   });

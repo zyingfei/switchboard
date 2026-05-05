@@ -10,16 +10,22 @@ import { INDEX_DIM } from './indexFile.js';
 // `poc/recall-vector/src/recall/embedder.ts` validated this and
 // produced the benchmarks in `poc/recall-vector/README.md`.
 //
-// Model is multilingual: `paraphrase-multilingual-MiniLM-L12-v2` was
-// chosen over the English-only `all-MiniLM-L6-v2` so cross-language
-// thread/workstream matching works (a Chinese-titled thread should
-// still cluster with its English-titled workstream peers). The
-// dimensionality stays 384, so the index format is unchanged — the
-// only effect of the swap is that an existing index becomes "stale"
-// per the lifecycle's modelId check, and the next companion start
-// auto-rebuilds against the new model. ~120MB cold-load (vs 30MB
-// for the english-only variant); cached on disk thereafter.
-export const MODEL_ID = 'Xenova/paraphrase-multilingual-MiniLM-L12-v2';
+// Model is multilingual: `multilingual-e5-small` was chosen over
+// the English-only `all-MiniLM-L6-v2` so cross-language thread /
+// workstream matching works — a Chinese-titled thread still
+// clusters with its English-titled workstream peers (smoke-test:
+// "hello world" ↔ "你好世界" cosine = 0.901). The dimensionality
+// stays 384, so the index format is unchanged — the only effect
+// of the swap is that an existing index becomes "stale" per the
+// lifecycle's modelId check, and the next companion start auto-
+// rebuilds against the new model. ~30MB quantized; cached on disk.
+//
+// We tried Xenova/paraphrase-multilingual-MiniLM-L12-v2 first but
+// its uploaded ONNX files for fp32 / fp16 / q8 are all incomplete
+// or split across external-data refs that @huggingface/transformers
+// doesn't fetch — Protobuf parsing fails at load. multilingual-e5-
+// small ships clean q8 + fp16 + fp32 files of expected sizes.
+export const MODEL_ID = 'Xenova/multilingual-e5-small';
 
 type FeatureExtractor = (
   text: string,
@@ -83,32 +89,38 @@ export const getEmbedder = async (): Promise<FeatureExtractor> => {
         env['useFSCache'] = true;
       }
       // `device: 'cpu'` selects onnxruntime-node which on macOS uses
-      // Apple Accelerate. If that fails (e.g. older Linux without
-      // the onnxruntime-node binary) we fall back to the wasm path.
-      try {
-        const pipe = (await module.pipeline('feature-extraction', MODEL_ID, {
-          device: 'cpu',
-        })) as unknown as FeatureExtractor;
-        resolvedDevice = 'cpu';
-        resolvedAccelerator = detectAccelerator();
-        log(
-          `[recall] loaded embedding model ${MODEL_ID} (cpu/${resolvedAccelerator}) in ${String(Math.round(performance.now() - started))}ms`,
-        );
-        return pipe;
-      } catch (cpuError) {
-        log(
-          `[recall] cpu device unavailable (${cpuError instanceof Error ? cpuError.message : 'unknown'}), falling back to wasm`,
-        );
-        const pipe = (await module.pipeline('feature-extraction', MODEL_ID, {
-          device: 'wasm',
-        })) as unknown as FeatureExtractor;
-        resolvedDevice = 'wasm';
-        resolvedAccelerator = 'cpu';
-        log(
-          `[recall] loaded embedding model ${MODEL_ID} (wasm) in ${String(Math.round(performance.now() - started))}ms`,
-        );
-        return pipe;
+      // Apple Accelerate.
+      //
+      // dtype cascade: many community-uploaded models (especially
+      // multilingual variants) ship ONLY quantized weights — no
+      // fp32 file at all. Loading with the default dtype then fails
+      // mid-Protobuf parsing with no useful hint. We try q8 first
+      // (smallest + fastest, what most models publish) and walk up
+      // through fp16 / fp32 if a given model happens to ship those
+      // instead. The first one that loads sticks.
+      const dtypeCandidates: readonly string[] = ['q8', 'fp16', 'fp32'];
+      const errors: string[] = [];
+      for (const dtype of dtypeCandidates) {
+        try {
+          const pipe = (await module.pipeline('feature-extraction', MODEL_ID, {
+            device: 'cpu',
+            dtype,
+          } as Parameters<typeof module.pipeline>[2])) as unknown as FeatureExtractor;
+          resolvedDevice = 'cpu';
+          resolvedAccelerator = detectAccelerator();
+          log(
+            `[recall] loaded embedding model ${MODEL_ID} (cpu/${resolvedAccelerator}/${dtype}) in ${String(Math.round(performance.now() - started))}ms`,
+          );
+          return pipe;
+        } catch (error) {
+          errors.push(
+            `${dtype}: ${error instanceof Error ? error.message.slice(0, 120) : 'unknown'}`,
+          );
+        }
       }
+      throw new Error(
+        `[recall] could not load ${MODEL_ID} on any dtype. Tried: ${errors.join(' | ')}`,
+      );
     })();
   }
   return await extractorPromise;
