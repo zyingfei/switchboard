@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-// Probe whether https://chatgpt.com/?temporary-chat=true bypasses the
-// "redirect to last active chat" behavior that bare https://chatgpt.com/
-// triggers for logged-in users. Connects to the already-running
-// Chrome-for-Testing instance via CDP (defaults to port 9222 — the
-// e2e:chrome-debug script's default), opens a probe tab, and prints
-// where the URL settles.
+// Probe two things against the running CfT instance (CDP @ 9222):
+//   (1) https://chatgpt.com/?temporary-chat=true bypasses the
+//       redirect-to-last-chat behavior of the bare URL.
+//   (2) After submitting a short prompt, what URL does ChatGPT
+//       settle on? (Stays at ?temporary-chat=true, or pushState to
+//       /c/<temp-id>?…) This decides what isProviderThreadUrl
+//       needs to accept so auto-capture can fire on temp chats.
 
 import { chromium } from '@playwright/test';
 
@@ -22,38 +23,74 @@ const main = async () => {
   const page = await context.newPage();
   try {
     const target = 'https://chatgpt.com/?temporary-chat=true';
-    console.log(`[probe] navigating to ${target}`);
+    console.log(`[probe] (1) navigate to ${target}`);
     await page.goto(target, { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(8_000);
+    await page.waitForTimeout(6_000);
+    const initialUrl = page.url();
+    console.log(`  initial URL: ${initialUrl}`);
+    if (initialUrl.includes('/c/')) {
+      console.log('  redirect bypass: FAILED');
+      process.exit(2);
+    }
+    console.log('  redirect bypass: OK');
+
+    console.log('[probe] (2) submit a tiny prompt and observe URL behavior.');
+    const composerSelector = '#prompt-textarea[role="textbox"], #prompt-textarea';
+    await page.waitForSelector(composerSelector, { timeout: 8_000 });
+    await page.click(composerSelector);
+    // execCommand insertText is what the extension's content script
+    // uses; mirror it so we exercise the same code path ChatGPT's
+    // ProseMirror editor expects.
+    await page.evaluate(() => {
+      const el = document.querySelector(
+        '#prompt-textarea[role="textbox"], #prompt-textarea',
+      );
+      if (el instanceof HTMLElement) el.focus();
+      // eslint-disable-next-line @typescript-eslint/no-deprecated
+      document.execCommand('insertText', false, 'Reply with one word: hi');
+    });
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Enter');
+    // Wait for the stop button to appear (response streaming).
+    let urlOnStreamStart = '';
+    try {
+      await page.waitForFunction(
+        () =>
+          document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop" i]')
+            ?.checkVisibility?.() ?? false,
+        null,
+        { timeout: 12_000 },
+      );
+      urlOnStreamStart = page.url();
+      console.log(`  url at stream-start: ${urlOnStreamStart}`);
+    } catch {
+      console.log('  stream-start not detected within 12s (auto-send may have failed).');
+    }
+    // Wait for streaming to finish (stop button gone) or 30s.
+    try {
+      await page.waitForFunction(
+        () =>
+          document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop" i]')
+            ?.checkVisibility?.() === false ||
+          document.querySelector('button[data-testid="stop-button"]') === null,
+        null,
+        { timeout: 30_000 },
+      );
+    } catch {
+      // Streaming didn't finish; we still report what URL we saw.
+    }
     const finalUrl = page.url();
-    const title = await page.title();
-    const hasComposer = await page.evaluate(() =>
-      document.querySelector('#prompt-textarea, [data-testid="prompt-textarea"]') !== null,
-    );
-    const hasTempBadge = await page.evaluate(() =>
-      Array.from(document.querySelectorAll('*')).some((node) =>
-        /temporary chat/i.test(node.textContent ?? ''),
-      ),
-    );
-    const looksLikeLogin = await page.evaluate(() =>
-      Array.from(document.querySelectorAll('button, a')).some((node) =>
-        /log\s*in|sign\s*up/i.test(node.textContent ?? ''),
-      ),
-    );
-
-    console.log('[probe] result:');
-    console.log(`  final URL:      ${finalUrl}`);
-    console.log(`  page title:     ${title}`);
-    console.log(`  composer ready: ${String(hasComposer)}`);
-    console.log(`  temp-chat UI:   ${String(hasTempBadge)}`);
-    console.log(`  login wall:     ${String(looksLikeLogin)}`);
+    console.log(`  final URL:           ${finalUrl}`);
+    console.log(`  contains /c/<id>:    ${finalUrl.includes('/c/')}`);
     console.log(
-      `  redirected to /c/<id>: ${finalUrl.includes('/c/') ? 'YES (fix did NOT work)' : 'no (good)'}`,
+      `  contains ?temporary-chat=true: ${finalUrl.includes('temporary-chat=true')}`,
     );
+    const articleCount = await page.evaluate(
+      () => document.querySelectorAll('article[data-message-author-role]').length,
+    );
+    console.log(`  article count:       ${articleCount}`);
 
-    // Leave the probe tab visible for 3 more seconds so the developer
-    // can eyeball it, then close it (don't litter tabs).
-    await page.waitForTimeout(3_000);
+    await page.waitForTimeout(2_000);
   } finally {
     await page.close();
     await browser.close();

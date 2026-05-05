@@ -1060,17 +1060,15 @@ const buildState = async (
 };
 
 // Per-provider URL the auto-approved MCP dispatch flow opens to seed
-// a fresh thread. ChatGPT's bare /  redirects to the user's last
-// active chat for logged-in users, which makes auto-send append to
-// an unrelated thread instead of starting a new one — and any
-// auto-capture we observe is the redirected-to thread, not the
-// dispatched one. /?temporary-chat=true bypasses that redirect and
-// lands on a clean composer. Temp chats don't persist in the user's
-// history, but for agent-initiated dispatches that's the right
-// default — the resulting URL is unique and stable for the lifetime
-// of the tab, which is what annotations anchor to.
+// a fresh thread. ChatGPT's bare / lands on a clean composer that
+// pushState's to /c/<id> on submit (the agent's body becomes the
+// first user turn). If the user has been redirected to an existing
+// chat, the content-script driver clicks the
+// data-testid="create-new-chat-button" sidebar link first to reset.
+// Probed against live chatgpt.com 2026-05; the data-testid is
+// long-standing and consistent across signed-in views.
 const MCP_AUTO_DISPATCH_URL: Partial<Record<DispatchEventRecord['target']['provider'], string>> = {
-  chatgpt: 'https://chatgpt.com/?temporary-chat=true',
+  chatgpt: 'https://chatgpt.com/',
   claude: 'https://claude.ai/new',
   gemini: 'https://gemini.google.com/app',
 };
@@ -2089,6 +2087,18 @@ export default defineBackground(() => {
   // sendToCompanion bug (every capture reissued a thread bac_id;
   // reminders accumulated against orphans). Idempotent — runs on
   // every service-worker boot, no-op when storage is already clean.
+  const DISPATCH_POLL_ALARM = 'sidetrack.dispatch.poll';
+  // Idempotent: chrome.alarms.create with the same name replaces any
+  // existing alarm of that name. Safe to call from onInstalled,
+  // onStartup, and on every SW boot.
+  const ensureDispatchPollAlarm = async (): Promise<void> => {
+    try {
+      await chrome.alarms.create(DISPATCH_POLL_ALARM, { periodInMinutes: 1 });
+    } catch (error) {
+      console.warn('[dispatch.poll] alarm create failed:', error);
+    }
+  };
+
   const pruneOrphanRemindersAndLinks = async (): Promise<void> => {
     try {
       const knownThreadIds = new Set((await readThreads()).map((t) => t.bac_id));
@@ -2108,6 +2118,7 @@ export default defineBackground(() => {
   chrome.runtime.onInstalled.addListener((details) => {
     void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => undefined);
     void pruneOrphanRemindersAndLinks();
+    void ensureDispatchPollAlarm();
     // Heal pre-existing tabs after an install/update/reload so the
     // user doesn't have to refresh each chat tab manually. The first
     // install case is harmless: matching tabs that already had no
@@ -2127,7 +2138,28 @@ export default defineBackground(() => {
   chrome.runtime.onStartup.addListener(() => {
     void pruneOrphanRemindersAndLinks();
     void reinjectContentScriptIntoOpenTabs();
+    void ensureDispatchPollAlarm();
   });
+
+  // Periodic background poll for new MCP-auto-approved dispatches.
+  // Without this, refreshCachedDispatches only fires when the side
+  // panel makes a workboard request — meaning agent-initiated
+  // dispatches sit unconsumed if the side panel is closed. Chrome's
+  // alarm minimum is 1 minute, so the worst-case latency from
+  // bac.request_dispatch to "tab opens" is ~1 minute. The alarm is
+  // additive; explicit side-panel actions still trigger immediately.
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name !== DISPATCH_POLL_ALARM) return;
+    void (async () => {
+      try {
+        if (!(await isCompanionConfigured())) return;
+        await refreshCachedDispatches();
+      } catch (error) {
+        console.warn('[dispatch.poll] failed:', error);
+      }
+    })();
+  });
+  void ensureDispatchPollAlarm();
 
   chrome.tabs.onRemoved.addListener((tabId) => {
     void markClosedTabRestorable(tabId).catch(() => undefined);
