@@ -1059,8 +1059,18 @@ const buildState = async (
   };
 };
 
+// Per-provider URL the auto-approved MCP dispatch flow opens to seed
+// a fresh thread. ChatGPT's bare /  redirects to the user's last
+// active chat for logged-in users, which makes auto-send append to
+// an unrelated thread instead of starting a new one — and any
+// auto-capture we observe is the redirected-to thread, not the
+// dispatched one. /?temporary-chat=true bypasses that redirect and
+// lands on a clean composer. Temp chats don't persist in the user's
+// history, but for agent-initiated dispatches that's the right
+// default — the resulting URL is unique and stable for the lifetime
+// of the tab, which is what annotations anchor to.
 const MCP_AUTO_DISPATCH_URL: Partial<Record<DispatchEventRecord['target']['provider'], string>> = {
-  chatgpt: 'https://chatgpt.com/',
+  chatgpt: 'https://chatgpt.com/?temporary-chat=true',
   claude: 'https://claude.ai/new',
   gemini: 'https://gemini.google.com/app',
 };
