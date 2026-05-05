@@ -36,6 +36,14 @@ const buildFakeWriteClient = (
   createQueueItem: vi.fn(() =>
     Promise.resolve({ bac_id: 'bac_queue_fake', revision: 'rev_queue_fake' }),
   ),
+  createAnnotation: vi.fn(() =>
+    Promise.resolve({
+      bac_id: 'bac_annotation_fake',
+      url: 'https://chatgpt.com/c/thread',
+      pageTitle: 'ChatGPT',
+      note: 'Architect note',
+    }),
+  ),
   requestDispatch: vi.fn(() =>
     Promise.resolve({
       dispatchId: 'bac_dispatch_fake',
@@ -313,6 +321,71 @@ describe('bac.request_dispatch', () => {
         mode: 'auto-send',
         workstreamId: 'bac_ws_attached',
       });
+    } finally {
+      await client.close();
+    }
+  });
+});
+
+describe('bac.create_annotation', () => {
+  it('reports unavailable when no companion client is wired', async () => {
+    const client = await startInProcessServer();
+    try {
+      const result = await client.callTool({
+        name: 'bac.create_annotation',
+        arguments: {
+          url: 'https://chatgpt.com/c/thread',
+          pageTitle: 'ChatGPT',
+          term: 'WebGPU',
+          note: 'GPU API context for architects.',
+        },
+      });
+      expect(result.isError).toBe(true);
+      expect(errorText(result)).toMatch(/bac\.create_annotation is unavailable/);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('builds a term-scoped TextQuote anchor with prefix and suffix context', async () => {
+    const writeClient = buildFakeWriteClient();
+    const client = await startInProcessServer(writeClient);
+    try {
+      const result = await client.callTool({
+        name: 'bac.create_annotation',
+        arguments: {
+          url: 'https://chatgpt.com/c/thread',
+          pageTitle: 'HN analysis',
+          term: 'WebGPU',
+          prefix: 'Long section context before the keyword: browser graphics and compute through ',
+          suffix: ' gives web apps lower-level GPU access without native application installs.',
+          note: 'WebGPU: browser GPU compute/rendering API for modern app architectures.',
+        },
+      });
+
+      expect(writeClient.createAnnotation).toHaveBeenCalledWith({
+        url: 'https://chatgpt.com/c/thread',
+        pageTitle: 'HN analysis',
+        anchor: {
+          textQuote: {
+            exact: 'WebGPU',
+            prefix: 'er graphics and compute through ',
+            suffix: ' gives web apps lower-level GPU ',
+          },
+          textPosition: {
+            start: Number.MAX_SAFE_INTEGER,
+            end: Number.MAX_SAFE_INTEGER,
+          },
+          cssSelector: '[data-sidetrack-mcp-term-anchor-fallback="missing"]',
+        },
+        note: 'WebGPU: browser GPU compute/rendering API for modern app architectures.',
+      });
+      const structured = result.structuredContent as {
+        readonly annotation?: { readonly bac_id?: string };
+        readonly term?: string;
+      };
+      expect(structured.annotation?.bac_id).toBe('bac_annotation_fake');
+      expect(structured.term).toBe('WebGPU');
     } finally {
       await client.close();
     }

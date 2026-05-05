@@ -263,6 +263,7 @@ export default defineContentScript({
           return;
         }
         const annotations = await client.listAnnotationsForUrl(window.location.href);
+        liveAnchors.splice(0, liveAnchors.length);
         for (const annotation of annotations) {
           const range = findAnchor(document.documentElement, annotation.anchor);
           if (range !== null) {
@@ -939,6 +940,7 @@ export default defineContentScript({
       ) => {
         if (isContentRequest(message)) {
           try {
+            void restoreAnnotations();
             sendResponse({ ok: true, capture: createCapture() });
           } catch (error) {
             sendResponse({

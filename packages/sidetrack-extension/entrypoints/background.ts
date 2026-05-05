@@ -692,6 +692,17 @@ const ensureContentScriptInTab = async (
 // quickly but their composer/Stop button lights up later. The
 // content-script driver has its own per-item timeout (90s) which
 // covers the AI's reply window.
+const delay = (ms: number): Promise<void> =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+const isAutoSendResult = (
+  value: unknown,
+): value is { readonly ok: boolean; readonly error?: string } =>
+  typeof value === 'object' &&
+  value !== null &&
+  'ok' in value &&
+  typeof (value as { readonly ok?: unknown }).ok === 'boolean';
+
 const autoSendOnceTabReady = (tabId: number, body: string): void => {
   let cleared = false;
   const fire = (): void => {
@@ -703,18 +714,36 @@ const autoSendOnceTabReady = (tabId: number, body: string): void => {
     void (async () => {
       // Small extra delay so SPA shells finish hydrating their
       // composer (Quill / ProseMirror / Tiptap) before we type.
-      await new Promise<void>((resolve) => setTimeout(resolve, 1500));
-      const dispatch = await sendToContentScriptWithRecovery(tabId, {
-        type: messageTypes.autoSendItem,
-        text: body,
-        perItemTimeoutMs: 90_000,
-      });
-      if (!dispatch.ok) {
+      await delay(1500);
+      const deadline = Date.now() + 45_000;
+      let lastSendError = 'unknown';
+      for (;;) {
+        const dispatch = await sendToContentScriptWithRecovery(tabId, {
+          type: messageTypes.autoSendItem,
+          text: body,
+          perItemTimeoutMs: 90_000,
+        });
+        if (!dispatch.ok) {
+          lastSendError = dispatch.error ?? 'content script transport failed';
+        } else if (isAutoSendResult(dispatch.data)) {
+          if (dispatch.data.ok) {
+            break;
+          }
+          lastSendError = dispatch.data.error ?? 'provider auto-send failed';
+        } else {
+          lastSendError = 'content script returned an unexpected auto-send response';
+        }
+        if (Date.now() >= deadline) {
+          console.warn('[dispatchAutoSendInNewTab] content-script send failed:', lastSendError);
+          return;
+        }
+        await delay(750);
+      }
+      if (lastSendError !== 'unknown') {
         console.warn(
-          '[dispatchAutoSendInNewTab] content-script send failed:',
-          dispatch.error ?? 'unknown',
+          '[dispatchAutoSendInNewTab] content-script send recovered after:',
+          lastSendError,
         );
-        return;
       }
       // Auto-capture the destination chat after auto-send completes.
       // Without this, the freshly-created chat at /app/<id> is never

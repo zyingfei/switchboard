@@ -214,6 +214,17 @@ const writeClient: CompanionWriteClient & {
       recordedCalls.push({ tool: 'createQueueItem', input });
       return Promise.resolve({ bac_id: 'bac_queue_followup', revision: 'rev_q_1' });
     },
+    createAnnotation: (input) => {
+      recordedCalls.push({ tool: 'createAnnotation', input });
+      return Promise.resolve({
+        bac_id: 'bac_annotation_term',
+        url: input.url,
+        pageTitle: input.pageTitle,
+        anchor: input.anchor,
+        note: input.note,
+        createdAt: NOW,
+      });
+    },
     bumpWorkstream: () => Promise.reject(new Error('not exercised in this test')),
     archiveThread: () => Promise.reject(new Error('not exercised in this test')),
     unarchiveThread: () => Promise.reject(new Error('not exercised in this test')),
@@ -453,6 +464,7 @@ describe('codex handoff over MCP', () => {
         expect.arrayContaining([
           'bac.read_thread_md',
           'bac.list_dispatches',
+          'bac.create_annotation',
           'bac.list_annotations',
           'bac.recall',
           'bac.queue_item',
@@ -544,6 +556,7 @@ describe('codex handoff over MCP', () => {
           'bac.context_pack',
           'bac.request_dispatch',
           'bac.list_dispatches',
+          'bac.create_annotation',
           'bac.queue_item',
         ]),
       );
@@ -605,6 +618,24 @@ describe('codex handoff over MCP', () => {
       });
       expect(JSON.stringify(structured(dispatches))).toContain(REQUESTED_DISPATCH_ID);
 
+      const annotation = await client.callTool({
+        name: 'bac.create_annotation',
+        arguments: {
+          url: 'https://chatgpt.com/c/target-thread',
+          pageTitle: 'ChatGPT HN analysis',
+          term: 'WebGPU',
+          prefix: 'Top tech keywords: ',
+          suffix: ' - browser GPU access for modern apps.',
+          note: 'WebGPU: browser GPU compute/rendering API for architect-level context.',
+        },
+      });
+      const annotationData = structured(annotation) as {
+        readonly annotation?: { readonly bac_id?: string };
+        readonly term?: string;
+      };
+      expect(annotationData.annotation?.bac_id).toBe('bac_annotation_term');
+      expect(annotationData.term).toBe('WebGPU');
+
       const queued = await client.callTool({
         name: 'bac.queue_item',
         arguments: {
@@ -618,6 +649,7 @@ describe('codex handoff over MCP', () => {
       expect(writeClient.recordedCalls.map((call) => call.tool)).toEqual([
         'registerCodingSession',
         'requestDispatch',
+        'createAnnotation',
         'createQueueItem',
       ]);
     } finally {

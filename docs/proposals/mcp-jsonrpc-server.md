@@ -60,6 +60,7 @@ Read-only. Each tool delegates to the existing handler logic in
 | `bac.list_workstream_notes` | `GET /v1/workstream-notes`                | `docs/mcp/bac.list_workstream_notes.md` |
 | `bac.list_buckets`          | `GET /v1/buckets`                         | `docs/mcp/bac.list_buckets.md`          |
 | `bac.list_audit_events`     | `GET /v1/audit-events`                    | `docs/mcp/bac.list_audit_events.md`     |
+| `bac.create_annotation`     | `POST /v1/annotations`                    | `docs/mcp/bac.create_annotation.md`     |
 | `bac.list_annotations`      | `GET /v1/annotations`                     | `docs/mcp/bac.list_annotations.md`      |
 | `bac.system_health`         | `GET /v1/health`                          | `docs/mcp/bac.system_health.md`         |
 | `bac.archive_thread`        | `POST /v1/threads/{id}/archive`           | `docs/mcp/bac.archive_thread.md`        |

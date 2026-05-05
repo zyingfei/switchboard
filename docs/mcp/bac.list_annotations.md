@@ -15,4 +15,5 @@ Returns `{ data: Annotation[] }` from `GET /v1/annotations`.
 
 ## Notes
 
-This is a substrate-only capability. Visual highlight overlay and edit/delete flows are deferred.
+Use with `bac.create_annotation` for term-scoped highlights that the extension
+restores visually on the annotated page.

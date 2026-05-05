@@ -20,6 +20,7 @@ export const sidetrackToolNames = [
   'bac.list_dispatches',
   'bac.list_audit_events',
   'bac.list_workstream_notes',
+  'bac.create_annotation',
   'bac.list_annotations',
   'bac.update_annotation',
   'bac.delete_annotation',

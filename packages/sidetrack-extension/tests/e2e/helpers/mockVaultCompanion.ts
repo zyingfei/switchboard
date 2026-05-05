@@ -11,7 +11,16 @@ import {
   type VaultWriter,
 } from '../../../../sidetrack-companion/src/vault/writer.js';
 import {
+  listAnnotations,
+  writeAnnotation,
+} from '../../../../sidetrack-companion/src/vault/annotationStore.js';
+import {
+  annotationCreateSchema,
+  annotationListQuerySchema,
+  captureEventSchema,
   dispatchEventSchema,
+  threadUpsertSchema,
+  turnsQuerySchema,
   type DispatchEventRecord,
 } from '../../../../sidetrack-companion/src/http/schemas.js';
 
@@ -78,6 +87,19 @@ export const createMockVaultCompanion = async (port = 17373): Promise<MockVaultC
         return;
       }
 
+      if (route.request().method() === 'GET' && url.pathname === '/v1/settings') {
+        await fulfillJson(route, 200, {
+          data: {
+            revision: 'rev_mock_settings',
+            autoSendOptIn: { chatgpt: false, claude: false, gemini: false },
+            defaultPacketKind: 'research',
+            defaultDispatchTarget: 'chatgpt',
+            screenShareSafeMode: false,
+          },
+        });
+        return;
+      }
+
       if (route.request().method() === 'POST' && url.pathname === '/v1/workstreams') {
         const result = await writer.createWorkstream(readJsonBody(route) as never, requestId);
         await fulfillJson(route, 201, { data: { ...result, requestId } });
@@ -101,6 +123,40 @@ export const createMockVaultCompanion = async (port = 17373): Promise<MockVaultC
           token: url.searchParams.get('token') ?? undefined,
           workstreamId: url.searchParams.get('workstreamId') ?? undefined,
         });
+        await fulfillJson(route, 200, { data: result });
+        return;
+      }
+
+      if (route.request().method() === 'POST' && url.pathname === '/v1/events') {
+        const input = captureEventSchema.parse(readJsonBody(route));
+        const result = await writer.writeCaptureEvent(input, requestId);
+        await fulfillJson(route, 201, { data: { ...result, requestId } });
+        return;
+      }
+
+      if (route.request().method() === 'POST' && url.pathname === '/v1/threads') {
+        const input = threadUpsertSchema.parse(readJsonBody(route));
+        const result = await writer.upsertThread(input, requestId);
+        await fulfillJson(route, 200, { data: { ...result, requestId } });
+        return;
+      }
+
+      if (route.request().method() === 'GET' && url.pathname === '/v1/turns') {
+        const threadUrl = url.searchParams.get('threadUrl');
+        if (threadUrl === null) {
+          await fulfillJson(
+            route,
+            400,
+            problem(400, 'threadUrl query parameter is required', requestId),
+          );
+          return;
+        }
+        const query = turnsQuerySchema.parse({
+          threadUrl,
+          limit: url.searchParams.get('limit') ?? undefined,
+          role: url.searchParams.get('role') ?? undefined,
+        });
+        const result = await writer.readRecentTurns(query);
         await fulfillJson(route, 200, { data: result });
         return;
       }
@@ -130,6 +186,27 @@ export const createMockVaultCompanion = async (port = 17373): Promise<MockVaultC
           since: url.searchParams.get('since') ?? undefined,
         });
         await fulfillJson(route, 200, { data: result });
+        return;
+      }
+
+      if (route.request().method() === 'POST' && url.pathname === '/v1/annotations') {
+        const input = annotationCreateSchema.parse(readJsonBody(route));
+        const result = await writeAnnotation(vaultPath, input);
+        await fulfillJson(route, 201, { data: result });
+        return;
+      }
+
+      if (route.request().method() === 'GET' && url.pathname === '/v1/annotations') {
+        const query = annotationListQuerySchema.parse({
+          url: url.searchParams.get('url') ?? undefined,
+          includeDeleted: url.searchParams.get('includeDeleted') ?? undefined,
+          limit: url.searchParams.get('limit') ?? undefined,
+        });
+        const result = await listAnnotations(vaultPath, {
+          ...(query.url === undefined ? {} : { url: query.url }),
+          includeDeleted: query.includeDeleted,
+        });
+        await fulfillJson(route, 200, { data: result.slice(0, query.limit) });
         return;
       }
 

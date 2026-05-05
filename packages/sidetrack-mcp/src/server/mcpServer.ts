@@ -16,6 +16,19 @@ import { searchIndex } from '../vault/searchIndex.js';
 export type RequestDispatchTargetProvider = 'chatgpt' | 'claude' | 'gemini';
 export type RequestDispatchMode = 'paste' | 'auto-send';
 
+export interface SerializedAnchor {
+  readonly textQuote: {
+    readonly exact: string;
+    readonly prefix: string;
+    readonly suffix: string;
+  };
+  readonly textPosition: {
+    readonly start: number;
+    readonly end: number;
+  };
+  readonly cssSelector: string;
+}
+
 export interface CodingSessionRegisterResult {
   readonly bac_id: string;
   readonly workstreamId?: string | undefined;
@@ -69,6 +82,12 @@ export interface CompanionWriteClient {
     readonly scope: 'thread' | 'workstream' | 'global';
     readonly targetId?: string;
   }) => Promise<{ readonly bac_id: string; readonly revision: string }>;
+  readonly createAnnotation?: (input: {
+    readonly url: string;
+    readonly pageTitle: string;
+    readonly anchor: SerializedAnchor;
+    readonly note: string;
+  }) => Promise<Record<string, unknown>>;
   readonly updateAnnotation?: (input: {
     readonly bac_id: string;
     readonly note: string;
@@ -133,10 +152,43 @@ export interface SidetrackMcpReader {
 }
 
 const toolText = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`;
+const TERM_CONTEXT_CHARS = 32;
+const UNMATCHED_TERM_FALLBACK_SELECTOR = '[data-sidetrack-mcp-term-anchor-fallback="missing"]';
 
 const asStructuredContent = (value: Record<string, unknown>) => ({
   content: [{ type: 'text' as const, text: toolText(value) }],
   structuredContent: value,
+});
+
+const termContextPrefix = (prefix: string | undefined): string => {
+  if (prefix === undefined) {
+    return '';
+  }
+  return prefix.slice(Math.max(0, prefix.length - TERM_CONTEXT_CHARS));
+};
+
+const termContextSuffix = (suffix: string | undefined): string => {
+  if (suffix === undefined) {
+    return '';
+  }
+  return suffix.slice(0, TERM_CONTEXT_CHARS);
+};
+
+const buildTermAnchor = (input: {
+  readonly term: string;
+  readonly prefix?: string;
+  readonly suffix?: string;
+}): SerializedAnchor => ({
+  textQuote: {
+    exact: input.term,
+    prefix: termContextPrefix(input.prefix),
+    suffix: termContextSuffix(input.suffix),
+  },
+  // MCP-created annotations are intentionally quote-bound. If the
+  // term/context cannot be found after page changes, do not fall back
+  // to highlighting the start of the document or an entire selector.
+  textPosition: { start: Number.MAX_SAFE_INTEGER, end: Number.MAX_SAFE_INTEGER },
+  cssSelector: UNMATCHED_TERM_FALLBACK_SELECTOR,
 });
 
 const buildContextPack = (
@@ -639,6 +691,61 @@ export const createSidetrackMcpServer = (
       }
       const items = await companionClient.listWorkstreamNotes({ workstreamId });
       return asStructuredContent({ items: [...items] });
+    },
+  );
+
+  server.registerTool(
+    'bac.create_annotation',
+    {
+      description:
+        'Persist a term-scoped web annotation. Use prefix/suffix from the surrounding text when the term appears multiple times on the page.',
+      inputSchema: {
+        url: z.url().describe('Exact page URL where the annotation should be restored.'),
+        pageTitle: z.string().min(1).describe('Current page title.'),
+        term: z
+          .string()
+          .trim()
+          .min(1)
+          .max(400)
+          .describe('Exact term or short quote to highlight on the page.'),
+        note: z.string().max(5000).describe('Annotation note to show in Sidetrack.'),
+        prefix: z
+          .string()
+          .max(512)
+          .optional()
+          .describe(
+            'Optional text immediately before the target term. Used to disambiguate repeated terms.',
+          ),
+        suffix: z
+          .string()
+          .max(512)
+          .optional()
+          .describe(
+            'Optional text immediately after the target term. Used to disambiguate repeated terms.',
+          ),
+      },
+    },
+    async ({ url, pageTitle, term, note, prefix, suffix }) => {
+      if (companionClient?.createAnnotation === undefined) {
+        throw new Error(
+          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.create_annotation is unavailable.',
+        );
+      }
+      const annotation = await companionClient.createAnnotation({
+        url,
+        pageTitle,
+        anchor: buildTermAnchor({
+          term,
+          ...(prefix === undefined ? {} : { prefix }),
+          ...(suffix === undefined ? {} : { suffix }),
+        }),
+        note,
+      });
+      return asStructuredContent({
+        annotation,
+        term,
+        createdAt: new Date().toISOString(),
+      });
     },
   );
 

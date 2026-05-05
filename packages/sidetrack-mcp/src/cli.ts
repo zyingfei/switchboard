@@ -335,6 +335,27 @@ const createCompanionWriteClient = (
       }
       return { bac_id: body.data.bac_id, revision: body.data.revision };
     },
+    async createAnnotation(input) {
+      const body = await post<{ readonly data?: Record<string, unknown> }>(
+        '/v1/annotations',
+        input,
+        {
+          'x-sidetrack-mcp-tool': 'bac.create_annotation',
+          'idempotency-key': idempotencyKey(
+            'mcp-annotation',
+            [
+              input.url,
+              input.pageTitle,
+              input.anchor.textQuote.exact,
+              input.anchor.textQuote.prefix,
+              input.anchor.textQuote.suffix,
+              input.note,
+            ].join('-'),
+          ),
+        },
+      );
+      return body.data ?? {};
+    },
     async bumpWorkstream(input) {
       const body = await post<{
         readonly data?: { readonly bac_id?: string; readonly revision?: string };
