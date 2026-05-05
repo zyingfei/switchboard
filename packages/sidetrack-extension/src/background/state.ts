@@ -12,6 +12,7 @@ import type {
   WorkstreamUpdate,
 } from '../companion/model';
 import { readDroppedCount, readQueue } from '../companion/queue';
+import { canonicalThreadUrl } from '../capture/providerDetection';
 import type { DispatchEventRecord } from '../dispatch/types';
 import type {
   ReviewDraft,
@@ -506,15 +507,23 @@ export const upsertLocalThread = async (
   result?: { readonly bac_id: string },
 ): Promise<TrackedThread> => {
   const current = await readThreads();
+  // Canonicalize the URL so SPA URL drift (e.g. Gemini /app/<id> →
+  // /app/<id>?something) doesn't fan one chat into multiple thread
+  // records, which made dispatch links flicker as the matcher chased
+  // whichever bac_id was created most recently.
+  const canonicalUrl = canonicalThreadUrl(input.threadUrl);
   const existing = current.find(
-    (thread) => thread.bac_id === input.bac_id || thread.threadUrl === input.threadUrl,
+    (thread) =>
+      thread.bac_id === input.bac_id ||
+      thread.threadUrl === canonicalUrl ||
+      canonicalThreadUrl(thread.threadUrl) === canonicalUrl,
   );
   const bacId = result?.bac_id ?? input.bac_id ?? existing?.bac_id ?? createLocalBacId();
   const nextThread: TrackedThread = {
     bac_id: bacId,
     provider: input.provider,
     threadId: input.threadId,
-    threadUrl: input.threadUrl,
+    threadUrl: canonicalUrl,
     title: input.title,
     lastSeenAt: input.lastSeenAt,
     status: input.status ?? existing?.status ?? 'tracked',
@@ -532,7 +541,10 @@ export const upsertLocalThread = async (
     [THREADS_KEY]: [
       nextThread,
       ...current.filter(
-        (thread) => thread.bac_id !== bacId && thread.threadUrl !== input.threadUrl,
+        (thread) =>
+          thread.bac_id !== bacId &&
+          thread.threadUrl !== canonicalUrl &&
+          canonicalThreadUrl(thread.threadUrl) !== canonicalUrl,
       ),
     ],
   });

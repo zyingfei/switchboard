@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  canonicalThreadUrl,
   detectProviderFromUrl,
   isLikelyCaptureUrl,
   isProviderThreadUrl,
@@ -58,6 +59,33 @@ describe('provider detection', () => {
     it('rejects unknown providers and malformed URLs', () => {
       expect(isProviderThreadUrl('unknown', 'https://example.com/article')).toBe(false);
       expect(isProviderThreadUrl('claude', 'not a url')).toBe(false);
+    });
+
+    it('strips query and fragment from provider thread URLs (canonicalThreadUrl)', () => {
+      expect(canonicalThreadUrl('https://gemini.google.com/app/abc123?session=xyz')).toBe(
+        'https://gemini.google.com/app/abc123',
+      );
+      expect(canonicalThreadUrl('https://gemini.google.com/app/abc123#t=42')).toBe(
+        'https://gemini.google.com/app/abc123',
+      );
+      expect(canonicalThreadUrl('https://chatgpt.com/c/foo?model=gpt-4o')).toBe(
+        'https://chatgpt.com/c/foo',
+      );
+      expect(canonicalThreadUrl('https://claude.ai/chat/bar?compact=1')).toBe(
+        'https://claude.ai/chat/bar',
+      );
+    });
+
+    it('leaves non-thread URLs untouched (canonicalThreadUrl)', () => {
+      // Bare landing pages aren't thread URLs — preserve query so other
+      // capture paths can read whatever they need from the URL.
+      expect(canonicalThreadUrl('https://gemini.google.com/app?test=1')).toBe(
+        'https://gemini.google.com/app?test=1',
+      );
+      expect(canonicalThreadUrl('https://example.com/article?q=1')).toBe(
+        'https://example.com/article?q=1',
+      );
+      expect(canonicalThreadUrl('not a url')).toBe('not a url');
     });
 
     it('accepts localhost fixture URLs that carry an explicit ?provider= override', () => {

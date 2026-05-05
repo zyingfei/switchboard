@@ -108,9 +108,15 @@ const driveAutoSend = async (
   // is the right gate for *capture* (we don't want a "thread" record
   // for the landing page), not for typing.
   const driver = PROVIDER_DRIVERS[provider];
+  // Wait up to 15s for the composer to mount. Provider SPAs hydrate
+  // their editor (Quill / ProseMirror / Tiptap) lazily after the
+  // first `tabs.onUpdated` complete event, especially on first load
+  // of /app or a brand-new chat. Bailing immediately on a missing
+  // composer was the root cause of dispatch-into-new-tab no-ops.
+  await waitFor(() => findFirstElement(driver.composer) !== null, 15_000, 200);
   const composerEl = findFirstElement(driver.composer);
   if (!(composerEl instanceof HTMLElement)) {
-    return { ok: false, error: 'Composer not found in DOM.' };
+    return { ok: false, error: 'Composer not found in DOM (timed out after 15s).' };
   }
   const composer = composerEl;
 

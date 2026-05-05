@@ -190,13 +190,15 @@ const DEFAULT_SCOPE: PacketComposerScope = {
   meta: '3 threads · 2 queued · 1 closed',
 };
 
-const TURN_TEXT_CAP = 1200;
-
 const renderTurnBlock = (turn: PacketComposerTurn): string => {
   const roleHeader = turn.role === 'assistant' ? '### Assistant' : '### User';
-  const text =
-    turn.text.length > TURN_TEXT_CAP ? `${turn.text.slice(0, TURN_TEXT_CAP)}…` : turn.text;
-  return `${roleHeader}\n${text}`;
+  // Ship the full turn body. The DispatchConfirm modal's token-budget
+  // chip warns when the packet exceeds the target model's context
+  // window; it is the user's call to edit or proceed. The earlier
+  // 1200-char cap silently truncated long replies — that's what the
+  // user reported as "still redact the text" after picking framing
+  // options (each pick re-rendered the body from cap-truncated turns).
+  return `${roleHeader}\n${turn.text}`;
 };
 
 const renderTurnsMarkdown = (turns: readonly PacketComposerTurn[], count: number): string => {
