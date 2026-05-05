@@ -694,14 +694,24 @@ const App = () => {
       }
       if (isFocusThreadInSidePanelMessage(message)) {
         // Chat-side floating button OR Déjà-vu Jump → find the
-        // matching thread by canonical URL, scroll its row into
-        // view, briefly highlight it via the .focusing CSS class.
+        // matching thread by canonical URL, switch to whichever view
+        // contains it (the workstream filter or All Threads), expand
+        // the bucket if collapsed, then scroll the row into view and
+        // flash the .focusing class.
+        //
         // Reads from stateRef (synced via the effect below) instead
         // of using setState as a state-reader — React 18 will silently
         // skip the inner setFocusingThreadId update inside an updater
         // function that returns the same reference.
+        //
+        // The view-switch + bucket-expand are critical: ~10% of
+        // threads in a typical vault sit outside the currently-
+        // visible workstream filter, and without this branch the
+        // setFocusingThreadId fires correctly but no DOM row exists
+        // for the .focusing class to attach to → Jump silently looks
+        // like a no-op.
         const targetCanonical = canonicalThreadUrl(message.threadUrl);
-        window.setTimeout(() => {
+        void (async () => {
           const threads = stateRef.current.threads;
           const match = threads.find(
             (thread) =>
@@ -709,13 +719,31 @@ const App = () => {
               canonicalThreadUrl(thread.threadUrl) === targetCanonical,
           );
           if (match === undefined) return;
+          // If the matched thread isn't in the active workstream
+          // view, fall back to "All threads" so the row renders.
+          if (
+            viewModeRef.current === 'workstream' &&
+            match.primaryWorkstreamId !== currentWsIdRef.current
+          ) {
+            setViewMode('all');
+          }
+          await expandBucketForThreadRef.current?.(match);
+          // Yield two animation frames so React commits the view +
+          // bucket changes and the row's ref callback fires.
+          await new Promise<void>((resolve) => {
+            requestAnimationFrame(() => {
+              requestAnimationFrame(() => {
+                resolve();
+              });
+            });
+          });
           const node = threadRowRefs.current.get(match.bac_id);
           node?.scrollIntoView({ behavior: 'smooth', block: 'center' });
           setFocusingThreadId(match.bac_id);
           window.setTimeout(() => {
             setFocusingThreadId((prev) => (prev === match.bac_id ? null : prev));
           }, 1500);
-        }, 0);
+        })();
       }
     };
     runtimeMessages.addListener(listener);
@@ -854,6 +882,17 @@ const App = () => {
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
+  // Same trick for the bits the focus-thread handler needs to read
+  // from outside the empty-deps useEffect closure: which view we're
+  // on, which workstream is selected, and the helper that expands
+  // the All-Threads bucket containing a given thread. Each is mirrored
+  // through a ref so the listener always reads the latest values
+  // even though the registration runs only once.
+  const viewModeRef = useRef<'workstream' | 'all'>('workstream');
+  const currentWsIdRef = useRef<string | null>(null);
+  const expandBucketForThreadRef = useRef<
+    ((thread: TrackedThread) => Promise<void>) | null
+  >(null);
   const activeTabTrackedThread = useMemo(
     () =>
       state.activeTabUrl === undefined
@@ -1267,6 +1306,12 @@ const App = () => {
     });
     setState(next);
   };
+  // Mirror the helper into a ref so the focus-thread handler can
+  // call it without re-binding when state changes (the handler's
+  // useEffect has empty deps).
+  useEffect(() => {
+    expandBucketForThreadRef.current = expandBucketForThread;
+  });
 
   const focusThreadInWorkstream = (thread: TrackedThread): void => {
     setViewMode('workstream');
@@ -1913,6 +1958,14 @@ const App = () => {
     expandedWorkstreamId === null && selectedWorkstream === ''
       ? null
       : (expandedWorkstreamId ?? (selectedWorkstream || null));
+  // Sync refs the focus-thread handler reads from outside its
+  // empty-deps closure — see stateRef declaration above for context.
+  useEffect(() => {
+    viewModeRef.current = viewMode;
+  }, [viewMode]);
+  useEffect(() => {
+    currentWsIdRef.current = currentWsId;
+  }, [currentWsId]);
   const currentWs =
     currentWsId === null ? null : (state.workstreams.find((w) => w.bac_id === currentWsId) ?? null);
   const currentWsLabel =
