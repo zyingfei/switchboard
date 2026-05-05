@@ -40,6 +40,7 @@ import {
   UpdateBanner,
   CodingOfferBanner,
   HealthPanel,
+  Icons,
   DesignPreview,
   WorkstreamDetailPanel,
   TurnText,
@@ -2231,14 +2232,17 @@ const App = () => {
         <div className="thread-actions row2">
           <button
             type="button"
-            className="btn-link"
+            className="btn-link thread-action-icon"
             title="Open the thread's tab (or reopen if closed)"
+            aria-label="Open thread tab"
             onClick={(e) => {
               e.stopPropagation();
               openTabForThread(thread);
             }}
           >
-            Open
+            <span className="icon-12" aria-hidden>
+              {Icons.arrowR}
+            </span>
           </button>
           {(() => {
             const requiresCompanion =
@@ -2256,7 +2260,10 @@ const App = () => {
               <>
                 <button
                   type="button"
-                  className={'btn-link' + (requiresCompanion ? ' disabled-look' : '')}
+                  className={
+                    'btn-link thread-action-icon' +
+                    (requiresCompanion ? ' disabled-look' : '')
+                  }
                   title={
                     requiresCompanion
                       ? 'Send is unavailable in local-only mode — click for setup steps'
@@ -2264,6 +2271,7 @@ const App = () => {
                   }
                   aria-haspopup="menu"
                   aria-expanded={sendDropdownOpen}
+                  aria-label="Send to another AI or coding agent"
                   onClick={(e) => {
                     e.stopPropagation();
                     if (requiresCompanion) {
@@ -2273,7 +2281,12 @@ const App = () => {
                     setSendToOpenFor(sendDropdownOpen ? null : thread.bac_id);
                   }}
                 >
-                  Send to ▾
+                  <span className="icon-12" aria-hidden>
+                    {Icons.send}
+                  </span>
+                  <span className="thread-action-caret" aria-hidden>
+                    ▾
+                  </span>
                 </button>
                 <span className="thread-overflow-anchor">
                   <button

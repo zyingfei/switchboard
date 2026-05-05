@@ -3283,6 +3283,35 @@ textarea.preview-body:focus {
   white-space: nowrap;
   flex: 0 0 auto;
 }
+/* Icon-only action buttons (Open, Send to, ⋯) — match the chip and
+   pencil tone in the card header so the visual language stays
+   consistent across the surface. */
+.thread-actions .thread-action-icon {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px 4px;
+  border-radius: 3px;
+  color: var(--ink-3, #7a7269);
+}
+.thread-actions .thread-action-icon:hover {
+  background: var(--paper, #f5efe2);
+  color: var(--signal, #c2410c);
+}
+.thread-actions .thread-action-icon .icon-12 {
+  width: 13px;
+  height: 13px;
+  display: inline-flex;
+}
+.thread-actions .thread-action-icon .icon-12 svg {
+  width: 13px;
+  height: 13px;
+}
+.thread-actions .thread-action-caret {
+  font-size: 9px;
+  line-height: 1;
+  color: var(--ink-4, #a39a8c);
+}
 .thread-actions .btn-link:hover {
   color: var(--signal, #c2410c);
 }
@@ -3446,9 +3475,19 @@ textarea.preview-body:focus {
   margin: 4px 0 0;
   padding: 4px 0 0;
   border-top: 1px dashed transparent;
-  display: flex;
+  /* Collapsed by default — empty cards (no notes, no open compose)
+     don't reserve vertical space for an invisible "+ note" button.
+     Revealed when the strip has real content OR the card is being
+     interacted with (hover / focus). */
+  display: none;
   flex-direction: column;
   gap: 2px;
+}
+.thread-history:has(.thread-history-item),
+.thread-history:has(.thread-history-compose),
+.thread:hover .thread-history,
+.thread:focus-within .thread-history {
+  display: flex;
 }
 /* Show the dashed separator only when the strip has REAL content —
    notes or an open compose form. The earlier `.thread:hover` arm
@@ -3514,7 +3553,13 @@ textarea.preview-body:focus {
   color: var(--signal);
 }
 .thread-history-add {
-  display: inline-flex;
+  /* Hidden entirely (display:none) so it doesn't take vertical
+     space on un-highlighted cards. Revealed on hover / focus —
+     layout shift on hover is acceptable when the user is actively
+     interacting with the card. Stays visible when the strip
+     already has notes (the parent .thread-history :has() rule
+     elsewhere keeps the dashed separator + content visible). */
+  display: none;
   align-self: flex-start;
   margin-top: 2px;
   font-family: var(--mono);
@@ -3524,15 +3569,14 @@ textarea.preview-body:focus {
   background: transparent;
   border: 0;
   padding: 0;
-  opacity: 0;
-  transition:
-    opacity 120ms ease,
-    color 120ms ease;
   cursor: pointer;
+  transition: color 120ms ease;
 }
 .thread:hover .thread-history-add,
-.thread:focus-within .thread-history-add {
-  opacity: 1;
+.thread:focus-within .thread-history-add,
+.thread-history:has(.thread-history-item) .thread-history-add,
+.thread-history:has(.thread-history-compose) .thread-history-add {
+  display: inline-flex;
 }
 .thread-history-add:hover {
   color: var(--signal);
