@@ -588,6 +588,8 @@ const routes: readonly RouteDefinition[] = [
                       lastError: lifecycleReport.lastError,
                       rebuildEmbedded: lifecycleReport.rebuildEmbedded,
                       rebuildTotal: lifecycleReport.rebuildTotal,
+                      embedderDevice: lifecycleReport.embedderDevice,
+                      embedderAccelerator: lifecycleReport.embedderAccelerator,
                     }),
               };
             },
@@ -925,17 +927,39 @@ const routes: readonly RouteDefinition[] = [
         query.workstreamId === undefined
           ? undefined
           : await readWorkstreamThreadIds(vaultRoot, query.workstreamId);
-      return [
-        200,
-        {
-          data: rank(queryEmbedding ?? new Float32Array(384), index.items, new Date(), {
-            limit: query.limit,
-            ...(threadIds === undefined
-              ? {}
-              : { workstreamMembership: (threadId: string) => threadIds.has(threadId) }),
-          }),
-        },
-      ];
+      const ranked = rank(queryEmbedding ?? new Float32Array(384), index.items, new Date(), {
+        limit: query.limit,
+        ...(threadIds === undefined
+          ? {}
+          : { workstreamMembership: (threadId: string) => threadIds.has(threadId) }),
+      });
+      // Enrich each result with the thread title so the Déjà-vu
+      // popover can show something more meaningful than the raw
+      // bac_id. The cost is O(limit) tiny JSON reads — acceptable
+      // because the limit is clamped at 50 and SSD reads are cheap.
+      // Snippet remains absent for now (would need an index format
+      // bump to store per-turn text without re-reading event logs).
+      const titles = new Map<string, string>();
+      const enriched = await Promise.all(
+        ranked.map(async (item) => {
+          let title = titles.get(item.threadId);
+          if (title === undefined) {
+            try {
+              const threadFile = await readFile(
+                join(vaultRoot, '_BAC', 'threads', `${item.threadId}.json`),
+                'utf8',
+              );
+              const parsed = JSON.parse(threadFile) as { readonly title?: unknown };
+              title = typeof parsed.title === 'string' ? parsed.title : '';
+            } catch {
+              title = '';
+            }
+            titles.set(item.threadId, title);
+          }
+          return title.length > 0 ? { ...item, title } : item;
+        }),
+      );
+      return [200, { data: enriched }];
     },
   },
   {

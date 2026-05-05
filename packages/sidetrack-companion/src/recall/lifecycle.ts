@@ -1,7 +1,13 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { MODEL_ID } from './embedder.js';
+import {
+  getResolvedEmbedderAccelerator,
+  getResolvedEmbedderDevice,
+  MODEL_ID,
+  type EmbedderAccelerator,
+  type EmbedderDevice,
+} from './embedder.js';
 import { readIndex } from './indexFile.js';
 import { rebuildFromEventLog } from './rebuild.js';
 
@@ -41,6 +47,12 @@ export interface RecallStatusReport {
   // before showing the fraction.
   readonly rebuildEmbedded: number;
   readonly rebuildTotal: number;
+  // Resolved embedder backend + accelerator from the most recent
+  // pipeline load. 'unknown' until the first embed() call has
+  // completed, after which it stays sticky for the process
+  // lifetime (the pipeline is cached).
+  readonly embedderDevice: EmbedderDevice;
+  readonly embedderAccelerator: EmbedderAccelerator;
 }
 
 export interface RecallLifecycle {
@@ -166,6 +178,8 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
       lastError,
       rebuildEmbedded,
       rebuildTotal,
+      embedderDevice: getResolvedEmbedderDevice(),
+      embedderAccelerator: getResolvedEmbedderAccelerator(),
     };
   };
 

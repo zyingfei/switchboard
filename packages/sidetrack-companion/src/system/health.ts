@@ -23,6 +23,8 @@ export interface HealthReport {
     readonly lastError?: string | null;
     readonly rebuildEmbedded?: number;
     readonly rebuildTotal?: number;
+    readonly embedderDevice?: 'cpu' | 'wasm' | 'webgpu' | 'unknown';
+    readonly embedderAccelerator?: 'accelerate' | 'mkl' | 'cpu' | 'unknown';
   };
   readonly service: { readonly installed: boolean; readonly running: boolean };
 }

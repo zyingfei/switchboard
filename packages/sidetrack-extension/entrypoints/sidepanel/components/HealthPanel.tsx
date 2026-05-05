@@ -35,6 +35,8 @@ interface HealthReport {
     readonly lastError?: string | null;
     readonly rebuildEmbedded?: number;
     readonly rebuildTotal?: number;
+    readonly embedderDevice?: 'cpu' | 'wasm' | 'webgpu' | 'unknown';
+    readonly embedderAccelerator?: 'accelerate' | 'mkl' | 'cpu' | 'unknown';
   };
   readonly service: { readonly installed: boolean; readonly running: boolean };
 }
@@ -103,6 +105,25 @@ const formatBytes = (n: number | null): string => {
   if (n < 1024) return `${String(n)} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+};
+
+// Compose a human-readable label for the embedder backend so the
+// user can tell at a glance whether the rebuild path is running on
+// the fast native CPU EP (Apple Accelerate / MKL) or the slow wasm
+// fallback. "cpu (Accelerate)" reads as "this is the M-series fast
+// path" without forcing the user to know what onnxruntime is.
+const formatEmbedderLabel = (
+  device: 'cpu' | 'wasm' | 'webgpu' | 'unknown',
+  accelerator: 'accelerate' | 'mkl' | 'cpu' | 'unknown' | undefined,
+): string => {
+  if (device === 'wasm') return 'wasm (slow)';
+  if (device === 'webgpu') return 'webgpu';
+  if (device === 'cpu') {
+    if (accelerator === 'accelerate') return 'cpu (Accelerate)';
+    if (accelerator === 'mkl') return 'cpu (MKL)';
+    return 'cpu';
+  }
+  return device;
 };
 
 export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelProps) {
@@ -260,6 +281,18 @@ export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelPr
                   {String(report.recall.eventTurnCount)} turns
                 </>
               ) : null}
+            </div>
+          ) : null}
+          {report.recall.embedderDevice !== undefined &&
+          report.recall.embedderDevice !== 'unknown' ? (
+            <div className="hc-foot">
+              embedder:{' '}
+              <span className="mono">
+                {formatEmbedderLabel(
+                  report.recall.embedderDevice,
+                  report.recall.embedderAccelerator,
+                )}
+              </span>
             </div>
           ) : null}
           {report.recall.lastError !== undefined && report.recall.lastError !== null ? (

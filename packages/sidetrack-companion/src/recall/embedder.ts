@@ -16,7 +16,43 @@ type FeatureExtractor = (
   options: { readonly pooling: 'mean'; readonly normalize: true },
 ) => Promise<{ readonly data: ArrayLike<number> }>;
 
+// Identifies which runtime backend the model loaded onto. Surfaced
+// in /v1/system/health.recall.embedderDevice so the side panel can
+// show the user "embedder: cpu (Accelerate)" vs "wasm" — useful
+// for diagnosing slow rebuilds and for confirming the platform
+// upgrade actually took effect.
+//
+//   cpu  — onnxruntime-node, native CPU. On Apple Silicon this
+//          runs through Apple Accelerate (AMX/SIMD) and is the
+//          fastest CPU path; on x86_64 macOS / Linux it uses the
+//          native ONNX CPU EP.
+//   wasm — JS/WASM fallback. ~5-10× slower than cpu, only used
+//          if onnxruntime-node fails to load (no native binary
+//          for the host platform).
+//   webgpu — only reachable from a browser context (extension
+//          offscreen document). Unavailable in Node.
+export type EmbedderDevice = 'cpu' | 'wasm' | 'webgpu' | 'unknown';
+
+// On Apple Silicon, onnxruntime-node CPU EP routes through the
+// Accelerate framework (AMX SIMD); on x86_64 it goes through MKL
+// or generic CPU. We can't introspect onnxruntime's actual EP at
+// runtime through @huggingface/transformers, but we can derive a
+// reasonable label from process.platform + process.arch.
+export type EmbedderAccelerator = 'accelerate' | 'mkl' | 'cpu' | 'unknown';
+
+const detectAccelerator = (): EmbedderAccelerator => {
+  if (process.platform === 'darwin' && process.arch === 'arm64') return 'accelerate';
+  if (process.platform === 'darwin') return 'cpu';
+  if (process.platform === 'linux' || process.platform === 'win32') return 'mkl';
+  return 'unknown';
+};
+
 let extractorPromise: Promise<FeatureExtractor> | undefined;
+let resolvedDevice: EmbedderDevice = 'unknown';
+let resolvedAccelerator: EmbedderAccelerator = 'unknown';
+
+export const getResolvedEmbedderDevice = (): EmbedderDevice => resolvedDevice;
+export const getResolvedEmbedderAccelerator = (): EmbedderAccelerator => resolvedAccelerator;
 
 const log = (message: string): void => {
   // eslint-disable-next-line no-console
@@ -43,8 +79,10 @@ export const getEmbedder = async (): Promise<FeatureExtractor> => {
         const pipe = (await module.pipeline('feature-extraction', MODEL_ID, {
           device: 'cpu',
         })) as unknown as FeatureExtractor;
+        resolvedDevice = 'cpu';
+        resolvedAccelerator = detectAccelerator();
         log(
-          `[recall] loaded embedding model ${MODEL_ID} (cpu) in ${String(Math.round(performance.now() - started))}ms`,
+          `[recall] loaded embedding model ${MODEL_ID} (cpu/${resolvedAccelerator}) in ${String(Math.round(performance.now() - started))}ms`,
         );
         return pipe;
       } catch (cpuError) {
@@ -54,6 +92,8 @@ export const getEmbedder = async (): Promise<FeatureExtractor> => {
         const pipe = (await module.pipeline('feature-extraction', MODEL_ID, {
           device: 'wasm',
         })) as unknown as FeatureExtractor;
+        resolvedDevice = 'wasm';
+        resolvedAccelerator = 'cpu';
         log(
           `[recall] loaded embedding model ${MODEL_ID} (wasm) in ${String(Math.round(performance.now() - started))}ms`,
         );
