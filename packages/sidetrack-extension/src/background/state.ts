@@ -779,20 +779,25 @@ export const createLocalReminder = async (
   result?: { readonly bac_id: string; readonly revision?: string },
 ): Promise<InboundReminder> => {
   const current = await readReminders();
-  // Dedup: if there's already ANY reminder for this thread (any
-  // status) at or after this detectedAt timestamp, the new one is
-  // a duplicate of an event we already processed. Common case:
-  // extension reload re-injects content scripts → each open chat
-  // tab re-captures → the assistant turn timestamp matches the
-  // last-stored reminder → we'd otherwise spawn a fresh "new"
-  // reminder for an already-dismissed read. Skip in that case.
-  const newDetected = Date.parse(input.detectedAt);
-  const stalest = current.find(
-    (r) =>
-      r.threadId === input.threadId && Date.parse(r.detectedAt) >= newDetected,
-  );
-  if (stalest !== undefined) {
-    return stalest;
+  // Dedup by assistant-turn ordinal — stable across re-captures of
+  // the same chat. detectedAt was a poor key because every fresh
+  // capture writes a new capturedAt timestamp; on extension reload,
+  // the re-injected content script re-captures every open chat and
+  // the new reminder always had a later detectedAt than the dismissed
+  // one, so the dedup never fired. Ordinal is pinned to the AI's
+  // specific reply; if the user already saw it, every re-capture has
+  // the same ordinal and we skip.
+  if (input.lastAssistantTurnOrdinal !== undefined) {
+    const newOrdinal = input.lastAssistantTurnOrdinal;
+    const seen = current.find(
+      (r) =>
+        r.threadId === input.threadId &&
+        r.lastAssistantTurnOrdinal !== undefined &&
+        r.lastAssistantTurnOrdinal >= newOrdinal,
+    );
+    if (seen !== undefined) {
+      return seen;
+    }
   }
   const reminder: InboundReminder = {
     bac_id: result?.bac_id ?? createLocalBacId(),
@@ -801,6 +806,9 @@ export const createLocalReminder = async (
     provider: input.provider,
     detectedAt: input.detectedAt,
     status: input.status ?? 'new',
+    ...(input.lastAssistantTurnOrdinal === undefined
+      ? {}
+      : { lastAssistantTurnOrdinal: input.lastAssistantTurnOrdinal }),
   };
   await storageSet({ [REMINDERS_KEY]: [reminder, ...current] });
   return reminder;

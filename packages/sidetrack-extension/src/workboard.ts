@@ -119,6 +119,14 @@ export interface InboundReminder {
   readonly provider: ProviderId;
   readonly detectedAt: string;
   readonly status: 'new' | 'seen' | 'relevant' | 'dismissed';
+  // Ordinal of the assistant turn that triggered this reminder.
+  // Stable across re-captures of the same chat — re-injection of the
+  // content script (extension reload) replays captures with new
+  // capturedAt timestamps, but the assistant turn's ordinal stays
+  // pinned to that specific reply. Used by createLocalReminder to
+  // dedup: if any existing reminder for this thread already records
+  // an ordinal >= the new one, the user has already seen this reply.
+  readonly lastAssistantTurnOrdinal?: number;
 }
 
 export interface SelectorHealth {

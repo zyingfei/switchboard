@@ -165,6 +165,10 @@ export interface ReminderCreate {
   readonly provider: ProviderId;
   readonly detectedAt: string;
   readonly status?: 'new' | 'seen' | 'relevant' | 'dismissed';
+  // Optional dedup key — see InboundReminder.lastAssistantTurnOrdinal.
+  // The local-only path uses this to skip duplicate reminders when
+  // re-captures replay an already-seen assistant turn.
+  readonly lastAssistantTurnOrdinal?: number;
 }
 
 export interface ReminderUpdate {

@@ -1278,7 +1278,12 @@ const App = () => {
     const head = `## Source\n${provider} · ${thread.threadUrl}`;
     let body: string;
     if (intent.kind === 'research_packet') {
-      body = `# Research request: ${thread.title}\n\n${head}\n\n## Pre-flight checklist for the receiving AI\n- [ ] Verify the conclusion against the original source\n- [ ] Note any framework versions / dates the source assumes\n- [ ] Flag if the question has shifted since first ask\n- [ ] Distinguish what was asserted vs cited\n\n## Recent context\n${turnsMd}\n\n## Ask\n…`;
+      // Default = raw forward. The user asked for a "just here's the
+      // context from another conversation" packet by default; the
+      // structured Critique/Compare/Drill-deeper templates are
+      // available in the Customize composer if they want them. Brief
+      // title + source + the captured turns.
+      body = `# Context from another conversation: ${thread.title}\n\n${head}\n\n${turnsMd}`;
     } else if (intent.kind === 'coding_agent_packet') {
       // MCP-aware handoff: tells the coding agent how to connect to
       // Sidetrack's local MCP endpoint for live thread + recent

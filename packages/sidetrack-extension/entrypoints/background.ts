@@ -318,11 +318,21 @@ const sendToCompanion = async (
       // Also clear any pending pill the user has already caught up on.
       await dismissRemindersForThread(threadResult.bac_id);
     } else {
+      // Pin the reminder to this assistant turn's ordinal so re-
+      // captures (extension reload re-injection, page refresh) of
+      // the same reply get deduped instead of spawning fresh
+      // "Unread reply" pills the user has already dismissed.
+      const lastAssistantOrdinal = [...event.turns]
+        .reverse()
+        .find((t) => t.role === 'assistant')?.ordinal;
       const reminder: ReminderCreate = {
         threadId: threadResult.bac_id,
         provider: event.provider,
         detectedAt: event.capturedAt,
         status: 'new',
+        ...(lastAssistantOrdinal === undefined
+          ? {}
+          : { lastAssistantTurnOrdinal: lastAssistantOrdinal }),
       };
       const reminderResult = await client.createReminder(reminder);
       await createLocalReminder(reminder, reminderResult);
@@ -413,11 +423,13 @@ const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
     if (await userIsViewingThreadUrl(event.threadUrl)) {
       await dismissRemindersForThread(existing.bac_id);
     } else {
+      const lastAssistantOrdinal = lastTurn.ordinal;
       await createLocalReminder({
         threadId: existing.bac_id,
         provider: event.provider,
         detectedAt: event.capturedAt,
         status: 'new',
+        lastAssistantTurnOrdinal: lastAssistantOrdinal,
       });
     }
     await markDispatchesRepliedForThread(existing.bac_id);
