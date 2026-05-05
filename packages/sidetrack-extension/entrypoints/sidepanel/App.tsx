@@ -1959,8 +1959,28 @@ const App = () => {
     // Gemini / Claude / Codex." Cap at the most recent 5 to avoid
     // crowding the card; the full list still lives in Recent
     // Dispatches at the section level.
+    //
+    // bac_id-equality is the strict path. When local thread bac_ids
+    // get re-issued (companion regenerates, storage drift), the
+    // dispatch's sourceThreadId points at a dead bac_id. In that
+    // orphan case, fall back to matching the dispatch.title against
+    // the thread.title — dispatch.title IS the source thread title
+    // captured at submit time, so an exact-string match is
+    // surprisingly robust. The proper fix is adding sourceThreadUrl
+    // to the dispatch schema so we can match by URL; tracked as a
+    // follow-up.
+    const liveThreadIdSet = new Set(state.threads.map((t) => t.bac_id));
     const outgoingDispatches = state.recentDispatches
-      .filter((d) => d.sourceThreadId === thread.bac_id && d.status !== 'archived')
+      .filter((d) => {
+        if (d.status === 'archived') return false;
+        if (d.sourceThreadId === thread.bac_id) return true;
+        if (d.sourceThreadId === undefined) return false;
+        // Stale sourceThreadId only matters when the bac_id is dead
+        // — a live but different thread should not steal dispatches.
+        const sourceLive = liveThreadIdSet.has(d.sourceThreadId);
+        if (sourceLive) return false;
+        return d.title === thread.title;
+      })
       .slice()
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .slice(0, 5);
