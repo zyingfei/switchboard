@@ -106,14 +106,22 @@ const tryAutoLinkCapturedThread = async (
   userTurnTexts: readonly string[],
   capturedAtMs: number,
 ): Promise<void> => {
-  const [recentDispatches, existingLinks, originalBodiesById] = await Promise.all([
+  const [recentDispatches, existingLinks, originalBodiesById, allThreads] = await Promise.all([
     readCachedDispatches(),
     readDispatchLinks(),
     readDispatchOriginals(),
+    readThreads(),
   ]);
   if (recentDispatches.length === 0) {
     return;
   }
+  // Pass the live set so the matcher can ignore "already-linked"
+  // entries that point at threads no longer in storage. Without
+  // this, a wiped/reassigned destination thread leaves the dispatch
+  // permanently linked to a dead bac_id — exactly the symptom the
+  // CDP storage dump showed: 5 of 7 dispatches with linkedTo
+  // bac_ids absent from sidetrack.threads.
+  const liveThreadIds = new Set(allThreads.map((t) => t.bac_id));
   const result = tryLinkCapturedThread({
     threadId,
     threadProvider,
@@ -122,6 +130,7 @@ const tryAutoLinkCapturedThread = async (
     recentDispatches,
     existingLinks,
     originalBodiesById,
+    liveThreadIds,
   });
   await writeDispatchDiagnostic({
     capturedAt: new Date(capturedAtMs).toISOString(),

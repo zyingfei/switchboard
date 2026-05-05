@@ -67,9 +67,17 @@ export interface DispatchLinkInput {
   readonly capturedAtMs: number;
   readonly recentDispatches: readonly DispatchEventRecord[];
   // Existing dispatchId → threadId map. We skip dispatches that
-  // already have a link (they belong to whatever thread we matched
-  // them to earlier).
+  // already have a link to a *live* thread; orphaned links (the
+  // linked thread was wiped from local storage or got a new bac_id)
+  // are NOT a reason to skip — they should be re-linked to the
+  // current thread when the prefix matches. The `liveThreadIds`
+  // set lets the matcher tell which links are still valid.
   readonly existingLinks: Readonly<Partial<Record<string, string>>>;
+  // bac_ids of every thread currently in chrome.storage. A linked
+  // dispatch whose threadId is NOT in this set is treated as
+  // unlinked — its old destination thread is gone (storage wipe,
+  // companion bac_id reissue) and the matcher is free to relink.
+  readonly liveThreadIds?: ReadonlySet<string>;
   // Optional override map: dispatchId → unredacted body. When
   // provided, the matcher uses this body for prefix matching
   // instead of the stored (redacted) DispatchEventRecord.body.
@@ -129,8 +137,17 @@ export const tryLinkCapturedThread = (input: DispatchLinkInput): DispatchLinkDia
     }
     const linkedTo = input.existingLinks[dispatch.bac_id];
     if (linkedTo !== undefined && linkedTo !== input.threadId) {
-      reason = reason === 'no-prefix-match' ? 'already-linked' : reason;
-      continue;
+      // Treat the existing link as stale (and skippable as a "real"
+      // link) only when the linked thread still exists. If
+      // liveThreadIds was supplied and it doesn't include linkedTo,
+      // the link is orphaned — let the matcher relink to the
+      // current capture if the prefix matches.
+      const linkIsLive =
+        input.liveThreadIds === undefined || input.liveThreadIds.has(linkedTo);
+      if (linkIsLive) {
+        reason = reason === 'no-prefix-match' ? 'already-linked' : reason;
+        continue;
+      }
     }
     candidatesConsidered += 1;
     // Prefer the unredacted body — that's what the user pasted.
