@@ -2360,6 +2360,7 @@ const App = () => {
             bridgeKey={bridgeKey.length > 0 ? bridgeKey : null}
             cached={suggestionCache.get(thread.bac_id)}
             workstreamFingerprint={workstreamFingerprint}
+            indexRebuilding={recallStatus === 'rebuilding' || recallStatus === 'stale'}
             resolveLabel={resolveWorkstreamLabel}
             onCache={(payload) => {
               setSuggestionCache((prev) => {
@@ -4640,6 +4641,14 @@ interface NeedsOrganizeSuggestionRowProps {
   // on it, so any workstream mutation invalidates the cached
   // suggestion automatically.
   readonly workstreamFingerprint: string;
+  // True while the recall index is being rebuilt (model swap,
+  // schema change, or empty index). Clicking ↻ during this window
+  // returns scores against a partially-rebuilt index — the row
+  // would flip every few seconds as new entries land. We pause the
+  // fetch and surface a clear "indexing" hint instead, so the user
+  // doesn't read the noise as instability. The effect re-runs once
+  // this flips false (rebuild settled).
+  readonly indexRebuilding: boolean;
   // Resolves a workstreamId to its display label (`workstreamPath`
   // semantics). Threaded in so the row shows real names instead of
   // a bac_id slice.
@@ -4659,6 +4668,7 @@ function NeedsOrganizeSuggestionRow({
   bridgeKey,
   cached,
   workstreamFingerprint,
+  indexRebuilding,
   resolveLabel,
   onCache,
   onClearCache,
@@ -4681,6 +4691,15 @@ function NeedsOrganizeSuggestionRow({
 
   useEffect(() => {
     if (companionPort === null || bridgeKey === null) return undefined;
+    // Suppress fetches while the recall index is rebuilding —
+    // partially-rebuilt index gives oscillating scores and the user
+    // reads the flicker as instability. The deps below include
+    // `indexRebuilding`, so the fetch fires automatically the
+    // moment the rebuild settles to 'ready'.
+    if (indexRebuilding) {
+      setPending(true);
+      return undefined;
+    }
     let cancelled = false;
     setPending(true);
     void (async () => {
@@ -4732,6 +4751,7 @@ function NeedsOrganizeSuggestionRow({
     onCache,
     resolveLabel,
     workstreamFingerprint,
+    indexRebuilding,
     refreshTick,
   ]);
 
@@ -4740,11 +4760,21 @@ function NeedsOrganizeSuggestionRow({
   // user has a path to file the thread without hunting for the
   // workstream chip elsewhere.
   const hasAuto = suggestion !== null;
+  // While the index is rebuilding, scores oscillate as new turns
+  // land. Show a clear "indexing…" hint instead of the score so
+  // the user understands the suggestion will be accurate again
+  // shortly. The fetch effect re-fires automatically when
+  // indexRebuilding flips false.
+  const suggestedLabel = indexRebuilding
+    ? 'Indexing — suggestions paused'
+    : hasAuto
+      ? suggestion.label
+      : 'Pick a workstream…';
   return (
     <NeedsOrganizeSuggestion
-      suggestedLabel={hasAuto ? suggestion.label : 'Pick a workstream…'}
-      confidence={hasAuto ? suggestion.confidence : 0}
-      pending={pending}
+      suggestedLabel={suggestedLabel}
+      confidence={hasAuto && !indexRebuilding ? suggestion.confidence : 0}
+      pending={pending || indexRebuilding}
       onAccept={() => {
         if (hasAuto && suggestion.workstreamId.length > 0) {
           onAccept(suggestion.workstreamId);

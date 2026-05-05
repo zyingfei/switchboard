@@ -73,10 +73,10 @@ describe('deriveLifecycle', () => {
     expect(result.stampLabel).toBe('Last sent');
   });
 
-  it('returns you-replied when last turn is by assistant (no pending reminder)', () => {
+  it('returns ai-replied when last turn is by assistant (no pending reminder)', () => {
     const result = deriveLifecycle(thread({ lastTurnRole: 'assistant' }), [], NOW_MS);
-    expect(result.kind).toBe('you-replied');
-    expect(result.lifecyclePill?.label).toBe('You replied last');
+    expect(result.kind).toBe('ai-replied');
+    expect(result.lifecyclePill?.label).toBe('AI replied last');
     expect(result.dotClass).toBe('green');
   });
 
