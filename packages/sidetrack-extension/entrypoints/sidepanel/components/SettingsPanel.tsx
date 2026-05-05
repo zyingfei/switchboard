@@ -20,6 +20,7 @@ import {
   listConfiguredServers as mcpHostListServers,
   removeServer as mcpHostRemoveServer,
 } from '../../../src/mcpHost/registry';
+import { probeServer } from '../../../src/mcpHost/probe';
 
 export type SettingsPacketKind = 'research' | 'review' | 'coding' | 'note' | 'other';
 export type SettingsTargetProvider =
@@ -46,6 +47,7 @@ export interface SettingsValue {
 export interface LocalPreferences {
   readonly autoTrack: boolean;
   readonly vaultPath: string;
+  readonly notifyOnQueueComplete: boolean;
 }
 
 export interface ArchivedThreadRow {
@@ -75,6 +77,7 @@ export interface SettingsPanelProps {
   readonly onSaveLocalPreferences: (next: {
     readonly autoTrack?: boolean;
     readonly vaultPath?: string;
+    readonly notifyOnQueueComplete?: boolean;
   }) => void;
   readonly onRestoreThread: (threadId: string) => void;
   readonly onDeleteThread: (threadId: string) => void;
@@ -175,8 +178,10 @@ export function SettingsPanel({
     }
   };
   const [serviceInstalled, setServiceInstalled] = useState(false);
-  const [serviceRunning] = useState(true);
+  const [serviceRunning, setServiceRunning] = useState(false);
   const [importDiff, setImportDiff] = useState<ImportDiff | null>(null);
+  const [pendingImportPayload, setPendingImportPayload] = useState<string | null>(null);
+  const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
   const [mcpHosts, setMcpHosts] = useState<readonly McpHost[]>([]);
   const [buckets, setBuckets] = useState<readonly VaultBucket[]>([
     {
@@ -187,16 +192,38 @@ export function SettingsPanel({
     },
   ]);
 
+  const refreshServiceStatus = async (): Promise<void> => {
+    const svcResponse = await callCompanion('/v1/system/service-status');
+    if (svcResponse?.ok) {
+      try {
+        const body = (await svcResponse.json()) as {
+          readonly data?: { readonly installed?: boolean; readonly running?: boolean };
+        };
+        const installed = body.data?.installed;
+        const running = body.data?.running;
+        if (typeof installed === 'boolean') {
+          setServiceInstalled(installed);
+        }
+        if (typeof running === 'boolean') {
+          setServiceRunning(running);
+        }
+      } catch {
+        // ignore
+      }
+    }
+  };
+
   // Hydrate MCP-host list from chrome.storage on mount. Falls back to
   // empty list when chrome.storage isn't available (jsdom unit tests).
   useEffect(() => {
     let cancelled = false;
-    const hydrate = async () => {
+    const hydrate = async (): Promise<void> => {
       try {
         const servers = await mcpHostListServers();
         if (cancelled) return;
-        setMcpHosts(
-          servers.map((server) => ({
+        const baseHosts = servers.map((server) => ({
+          server,
+          host: {
             id: server.id,
             url: server.url,
             tokenMasked:
@@ -205,15 +232,30 @@ export function SettingsPanel({
                 : '—',
             role: server.transport,
             online: false,
+          },
+        }));
+        setMcpHosts(baseHosts.map((item) => item.host));
+        const probed = await Promise.all(
+          baseHosts.map(async ({ server, host }) => ({
+            ...host,
+            ...(await probeServer(server)),
           })),
         );
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled is mutated by the cleanup closure
+        if (!cancelled) {
+          setMcpHosts(probed);
+        }
       } catch {
         // chrome.storage missing or empty — leave list empty
       }
     };
     void hydrate();
+    const intervalId = window.setInterval(() => {
+      void hydrate();
+    }, 30_000);
     return () => {
       cancelled = true;
+      window.clearInterval(intervalId);
     };
   }, []);
 
@@ -221,22 +263,9 @@ export function SettingsPanel({
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const svcResponse = await callCompanion('/v1/system/service-status');
-      if (svcResponse?.ok) {
-        try {
-          const body = (await svcResponse.json()) as {
-            readonly data?: { readonly installed?: boolean };
-          };
-          // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled is mutated by the cleanup closure
-          if (cancelled) return;
-          const installed = body.data?.installed;
-          if (typeof installed === 'boolean') {
-            setServiceInstalled(installed);
-          }
-        } catch {
-          // ignore
-        }
-      }
+      await refreshServiceStatus();
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled is mutated by the cleanup closure
+      if (cancelled) return;
       const bucketsResponse = await callCompanion('/v1/buckets');
       if (bucketsResponse?.ok) {
         try {
@@ -282,14 +311,21 @@ export function SettingsPanel({
     };
   }, [companionPort, bridgeKey]);
   const initial: SettingsValue = settings ?? {
-    autoSendOptIn: { chatgpt: false, claude: false, gemini: false },
+    // AI providers default to auto-send on. The user can flip individual
+    // providers off here; coding-agent / export targets always use
+    // paste mode (auto-send doesn't apply) so they aren't represented.
+    autoSendOptIn: { chatgpt: true, claude: true, gemini: true },
     defaultPacketKind: 'research',
     defaultDispatchTarget: 'claude',
     screenShareSafeMode: false,
     revision: '0',
   };
   const [draftAutoSend, setDraftAutoSend] = useState(initial.autoSendOptIn);
-  const [draftScreenShareSafe, setDraftScreenShareSafe] = useState(initial.screenShareSafeMode);
+  // The Settings UI for screenShareSafeMode was removed (the top-bar
+  // toggle is the canonical control), but we keep the draft state
+  // pinned to the existing companion value so save() doesn't flip
+  // it. Read-only here; mutation lives in the top bar.
+  const [draftScreenShareSafe] = useState(initial.screenShareSafeMode);
   const [draftPacketKind, setDraftPacketKind] = useState<SettingsPacketKind>(
     initial.defaultPacketKind,
   );
@@ -298,6 +334,9 @@ export function SettingsPanel({
   );
   const [draftAutoTrack, setDraftAutoTrack] = useState(localPreferences.autoTrack);
   const [draftVaultPath, setDraftVaultPath] = useState(localPreferences.vaultPath);
+  const [draftNotifyOnQueueComplete, setDraftNotifyOnQueueComplete] = useState(
+    localPreferences.notifyOnQueueComplete,
+  );
 
   const companionDirty =
     draftAutoSend.chatgpt !== initial.autoSendOptIn.chatgpt ||
@@ -308,7 +347,8 @@ export function SettingsPanel({
     draftTarget !== initial.defaultDispatchTarget;
   const localDirty =
     draftAutoTrack !== localPreferences.autoTrack ||
-    draftVaultPath.trim() !== localPreferences.vaultPath.trim();
+    draftVaultPath.trim() !== localPreferences.vaultPath.trim() ||
+    draftNotifyOnQueueComplete !== localPreferences.notifyOnQueueComplete;
   const dirty = companionDirty || localDirty;
   const privateWorkstreams = workstreams.filter((workstream) => workstream.privacy === 'private');
 
@@ -334,6 +374,9 @@ export function SettingsPanel({
         ...(draftVaultPath.trim() === localPreferences.vaultPath.trim()
           ? {}
           : { vaultPath: draftVaultPath.trim() }),
+        ...(draftNotifyOnQueueComplete === localPreferences.notifyOnQueueComplete
+          ? {}
+          : { notifyOnQueueComplete: draftNotifyOnQueueComplete }),
       });
     }
   };
@@ -451,10 +494,11 @@ export function SettingsPanel({
       </div>
 
       <div className="settings-section">
-        <h3 className="settings-section-title">Auto-send opt-in (§24.10)</h3>
+        <h3 className="settings-section-title">Auto-send per provider</h3>
         <p className="settings-section-lede ai-italic">
-          Default is paste-mode for safety. Opt-in per provider only after you've reviewed how
-          Sidetrack inserts into that chat. Opt-ins live in the vault, not the browser.
+          Auto-send opens the AI's tab and types the packet for you. AI providers default to on;
+          turn one off and Sidetrack falls back to copying the packet so you can paste it
+          yourself. Settings live in the vault, not the browser.
           {companionConfigured ? null : (
             <>
               {' '}
@@ -483,6 +527,28 @@ export function SettingsPanel({
             </label>
           ),
         )}
+        <label
+          className={'switch ' + (draftNotifyOnQueueComplete ? 'on' : '')}
+          style={{ marginTop: 8 }}
+        >
+          <input
+            type="checkbox"
+            checked={draftNotifyOnQueueComplete}
+            disabled={busy}
+            onChange={() => {
+              setDraftNotifyOnQueueComplete(!draftNotifyOnQueueComplete);
+            }}
+          />
+          <span className="knob" />
+          <span className="lbl">
+            Notify when the queue finishes
+            <span className="desc mono">
+              {draftNotifyOnQueueComplete
+                ? 'system toast when the last item ships'
+                : 'silent — check the side panel'}
+            </span>
+          </span>
+        </label>
       </div>
 
       <div className="settings-section">
@@ -525,30 +591,6 @@ export function SettingsPanel({
         </label>
       </div>
 
-      <div className="settings-section">
-        <h3 className="settings-section-title">Screen-share-safe mode</h3>
-        <p className="settings-section-lede ai-italic">
-          When on, Sidetrack masks sensitive previews (private workstream titles, packet bodies) in
-          the side panel — useful when you might be screen-sharing.
-        </p>
-        <label className={'switch ' + (draftScreenShareSafe ? 'on' : '')}>
-          <input
-            type="checkbox"
-            checked={draftScreenShareSafe}
-            disabled={busy}
-            onChange={() => {
-              setDraftScreenShareSafe(!draftScreenShareSafe);
-            }}
-          />
-          <span className="knob" />
-          <span className="lbl">
-            Mask previews
-            <span className="desc mono">
-              {draftScreenShareSafe ? 'on — masking active' : 'off'}
-            </span>
-          </span>
-        </label>
-      </div>
 
       <div className="settings-section">
         <h3 className="settings-section-title">Workstream privacy</h3>
@@ -694,13 +736,13 @@ export function SettingsPanel({
         running={serviceRunning}
         onInstall={() => {
           setServiceInstalled(true);
-          void callCompanion('/v1/system/install-service', { method: 'POST' }).then(
-            (resp) => {
+          void callCompanion('/v1/system/install-service', { method: 'POST' })
+            .then((resp) => {
               if (!resp?.ok) {
                 setServiceInstalled(false);
               }
-            },
-          );
+            })
+            .then(() => refreshServiceStatus());
         }}
         onUninstall={() => {
           setServiceInstalled(false);
@@ -741,6 +783,7 @@ export function SettingsPanel({
               });
               if (!resp?.ok) {
                 // Fall back to a synthetic diff so the user still sees the surface.
+                setPendingImportPayload(null);
                 setImportDiff({
                   added: ['(companion unreachable — preview unavailable)'],
                   removed: [],
@@ -758,6 +801,7 @@ export function SettingsPanel({
                     readonly conflicts?: number;
                   };
                 };
+                setPendingImportPayload(text);
                 setImportDiff({
                   added: body.data?.added ?? [],
                   removed: body.data?.removed ?? [],
@@ -765,6 +809,7 @@ export function SettingsPanel({
                   conflicts: body.data?.conflicts ?? 0,
                 });
               } catch {
+                setPendingImportPayload(text);
                 setImportDiff({
                   added: [],
                   removed: [],
@@ -779,13 +824,37 @@ export function SettingsPanel({
         diff={importDiff}
         onCancelImport={() => {
           setImportDiff(null);
+          setPendingImportPayload(null);
         }}
         onApplyImport={() => {
-          // The file content was already POSTed in dry-run; we'd need to
-          // re-send it without dryRun. For the first cut, just clear the
-          // diff and let the user re-import with confirm. A persistent
-          // file-handle would let us POST committed; that's a follow-up.
-          setImportDiff(null);
+          if (pendingImportPayload === null) {
+            return;
+          }
+          void (async () => {
+            const resp = await callCompanion('/v1/settings/import', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: pendingImportPayload,
+            });
+            if (!resp?.ok) {
+              setSettingsNotice('Import failed — the preview is still open.');
+              return;
+            }
+            try {
+              const body = (await resp.json()) as {
+                readonly data?: { readonly applied?: number; readonly skipped?: number };
+              };
+              setSettingsNotice(
+                `Import applied: ${String(body.data?.applied ?? 0)} applied, ${String(
+                  body.data?.skipped ?? 0,
+                )} skipped.`,
+              );
+            } catch {
+              setSettingsNotice('Import applied.');
+            }
+            setImportDiff(null);
+            setPendingImportPayload(null);
+          })();
         }}
       />
       <McpHostsSection
@@ -796,6 +865,12 @@ export function SettingsPanel({
         }}
         onAdd={(input) => {
           const id = `h${String(Date.now())}`;
+          const server = {
+            id,
+            url: input.url,
+            transport: 'http' as const,
+            bearerToken: input.token,
+          };
           setMcpHosts((prev) => [
             ...prev,
             {
@@ -806,12 +881,14 @@ export function SettingsPanel({
               online: false,
             },
           ]);
-          void mcpHostAddServer({
-            id,
-            url: input.url,
-            transport: 'http',
-            bearerToken: input.token,
-          }).catch(() => undefined);
+          void mcpHostAddServer(server).catch(() => undefined);
+          void probeServer(server)
+            .then((probe) => {
+              setMcpHosts((prev) =>
+                prev.map((host) => (host.id === id ? { ...host, ...probe } : host)),
+              );
+            })
+            .catch(() => undefined);
         }}
       />
       <BucketsSection
@@ -832,14 +909,14 @@ export function SettingsPanel({
             }),
           });
         }}
-        onAddBucket={() => {
+        onAddBucket={(input) => {
           const id = `b${String(Date.now())}`;
           const next = [
             ...buckets,
             {
               id,
-              rule: 'workstream:new-bucket',
-              vaultPath: localPreferences.vaultPath || '~/Documents/Sidetrack-vault',
+              rule: input.rule,
+              vaultPath: input.vaultPath,
               isDefault: false,
             },
           ];
@@ -859,6 +936,9 @@ export function SettingsPanel({
         }}
       />
 
+      {settingsNotice !== null ? (
+        <div className="settings-hint mono">{settingsNotice}</div>
+      ) : null}
       {error !== null && error !== undefined ? (
         <div className="settings-error mono">{error}</div>
       ) : null}

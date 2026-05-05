@@ -441,7 +441,7 @@ describe('companion HTTP server', () => {
     expect(auditLog).toContain('appendEvent');
   });
 
-  it('returns recent turns for a threadUrl, deduped by ordinal newest-wins', async () => {
+  it('returns recent turns for a threadUrl, deduped by ordinal earliest-wins', async () => {
     const earlier = '2026-04-26T20:00:00.000Z';
     const later = '2026-04-26T22:00:00.000Z';
     const threadUrl = 'https://claude.ai/chat/turns-test';
@@ -482,10 +482,12 @@ describe('companion HTTP server', () => {
       list.body as { readonly data: readonly { readonly text: string; readonly ordinal: number }[] }
     ).data;
     expect(data).toHaveLength(2);
-    // Both have the same capturedAt; order across ties is unspecified, but
-    // dedupe semantics MUST keep the newest write for ordinal 0 (v2, not v1).
+    // Dedup keeps the EARLIEST capturedAt per (ordinal, role) so the
+    // "X min ago" stamp reflects when the AI actually replied, not
+    // when we last re-captured. v1 (the first write at the earlier
+    // timestamp) wins for ordinal 0.
     const byOrdinal = new Map(data.map((turn) => [turn.ordinal, turn.text]));
-    expect(byOrdinal.get(0)).toBe('first capture v2');
+    expect(byOrdinal.get(0)).toBe('first capture v1');
     expect(byOrdinal.get(1)).toBe('second turn');
   });
 

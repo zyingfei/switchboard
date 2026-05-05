@@ -64,22 +64,22 @@ test.describe('vault bind / unbind (real companion)', () => {
       console.warn('[bind-test] wizard visible');
       await demoPause(page);
 
-      // Welcome → Companion. Use the Next button inside the modal
+      // Welcome → Vault → Companion. Use the Next button inside the modal
       // footer, scoped tightly so we don't accidentally match the
       // skip link or any unrelated button.
       const nextBtn = wizard.getByRole('button', { name: 'Next' });
       await nextBtn.click();
+      await expect(wizard.getByLabel('Vault path')).toBeVisible({ timeout: 10_000 });
+      await nextBtn.click();
       // Wait for the Companion step's distinctive content rather than
       // a possibly-ambiguous 'Companion' substring.
-      await expect(
-        wizard.locator('input[placeholder*="bridge key" i]'),
-      ).toBeVisible({ timeout: 10_000 });
+      await expect(wizard.locator('input[placeholder*="bridge key" i]')).toBeVisible({
+        timeout: 10_000,
+      });
       console.warn('[bind-test] companion step visible');
 
       // Paste the real bridge key into the input.
-      await wizard
-        .locator('input[placeholder*="bridge key" i]')
-        .fill(companion.bridgeKey);
+      await wizard.locator('input[placeholder*="bridge key" i]').fill(companion.bridgeKey);
       console.warn('[bind-test] bridge key filled');
 
       // (We deliberately skip clicking "Test connection" — the
@@ -92,11 +92,14 @@ test.describe('vault bind / unbind (real companion)', () => {
       await demoPause(page);
 
       // Step through the remaining wizard pages until Done is shown.
-      for (const expected of ['vault', 'providers', 'done']) {
+      for (const expected of ['providers', 'done']) {
         await wizard.getByRole('button', { name: 'Next' }).click();
-        await expect(wizard).toContainText(`· ${expected.charAt(0).toUpperCase()}${expected.slice(1)}`, {
-          timeout: 10_000,
-        });
+        await expect(wizard).toContainText(
+          `· ${expected.charAt(0).toUpperCase()}${expected.slice(1)}`,
+          {
+            timeout: 10_000,
+          },
+        );
         console.warn(`[bind-test] reached step: ${expected}`);
       }
 

@@ -1,3 +1,6 @@
+import type { ProviderId } from '../companion/model';
+import { formatRelative } from '../util/time';
+
 // Native-DOM overlay mounters for the content script. The sidepanel
 // React components (DejaVuPopover, AnnotationOverlay) can't mount in
 // the host page (different runtime, no React, no design tokens), so
@@ -144,6 +147,23 @@ const OVERLAY_CSS = `
   line-height: 1;
 }
 .sidetrack-deja-head .close:hover { color: var(--ink); }
+.sidetrack-deja-head .sidetrack-deja-mute {
+  background: transparent;
+  color: var(--ink-3);
+  border: 1px solid var(--rule);
+  border-radius: 99px;
+  cursor: pointer;
+  padding: 2px 7px;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.sidetrack-deja-head .sidetrack-deja-mute:hover {
+  color: var(--ink);
+  border-color: var(--signal-tint);
+  background: var(--signal-bg);
+}
 .sidetrack-deja-list {
   max-height: 280px;
   overflow: auto;
@@ -155,7 +175,7 @@ const OVERLAY_CSS = `
   padding: 9px 12px;
   border: none;
   background: transparent;
-  cursor: pointer;
+  cursor: default;
   border-bottom: 1px solid var(--rule-soft);
   font-family: inherit;
   color: inherit;
@@ -186,6 +206,22 @@ const OVERLAY_CSS = `
   padding: 1px 5px;
   border-radius: 3px;
 }
+.sidetrack-deja-provider {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--ink-2);
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  padding: 1px 5px;
+  border-radius: 99px;
+  white-space: nowrap;
+}
+.sidetrack-deja-when {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
 .sidetrack-deja-row .snippet {
   font-family: var(--display);
   font-style: italic;
@@ -195,6 +231,27 @@ const OVERLAY_CSS = `
   padding-left: 8px;
   border-left: 2px solid var(--signal-tint);
   margin: 4px 0 0;
+}
+.sidetrack-deja-row .r2 {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 7px;
+}
+.sidetrack-deja-row .r2 button {
+  font-family: var(--mono);
+  font-size: 10px;
+  border-radius: 99px;
+  border: 1px solid var(--rule);
+  background: var(--paper-light);
+  color: var(--ink-2);
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.sidetrack-deja-row .r2 button:hover {
+  border-color: var(--signal-tint);
+  background: var(--signal-bg);
+  color: var(--ink);
 }
 .sidetrack-deja-foot {
   display: flex;
@@ -207,14 +264,112 @@ const OVERLAY_CSS = `
   font-size: 10px;
   color: var(--ink-3);
 }
+.sidetrack-rv-chip-group {
+  position: absolute;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  pointer-events: auto;
+}
+.sidetrack-rv-chip {
+  position: absolute;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  background: var(--ink);
+  color: var(--paper-light);
+  border: 1px solid var(--ink);
+  border-radius: 99px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  cursor: pointer;
+  pointer-events: auto;
+  box-shadow: 0 8px 24px -8px rgba(0,0,0,0.25);
+}
+.sidetrack-rv-chip:hover { background: var(--signal); border-color: var(--signal); }
+/* Both chips share the same dark-on-paper palette so they read as a
+   single chip cluster. The Déjà-vu chip used to invert (paper bg,
+   ink text), which broke the visual pairing — they looked like two
+   different controls instead of two siblings of one selection
+   action. Glyphs differentiate intent. */
+.sidetrack-rv-chip .glyph {
+  font-family: var(--display); font-size: 12px; line-height: 1; font-weight: 500;
+}
+.sidetrack-rv-pop {
+  position: absolute;
+  background: var(--paper-light);
+  border: 1px solid var(--ink);
+  border-radius: 8px;
+  width: 320px;
+  max-width: 90vw;
+  pointer-events: auto;
+  box-shadow: 0 22px 60px -12px rgba(0,0,0,0.45), 0 0 0 1px rgba(0,0,0,0.05);
+  overflow: hidden;
+}
+.sidetrack-rv-pop .head {
+  padding: 8px 12px;
+  background: var(--paper);
+  border-bottom: 1px solid var(--rule-soft);
+  font-family: var(--mono); font-size: 10px;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--signal);
+  display: flex; align-items: center; gap: 8px;
+}
+.sidetrack-rv-pop .head .meta { margin-left: auto; color: var(--ink-3); }
+.sidetrack-rv-pop .head .close {
+  background: transparent; color: var(--ink-3); border: none; cursor: pointer;
+  padding: 0 4px; font-size: 14px; line-height: 1;
+}
+.sidetrack-rv-pop .head .close:hover { color: var(--ink); }
+.sidetrack-rv-pop .quote {
+  padding: 10px 12px 6px;
+  font-family: var(--display); font-style: italic;
+  font-size: 12px; color: var(--ink-2); line-height: 1.45;
+  border-left: 2px solid var(--signal-tint);
+  margin: 8px 12px 4px;
+}
+.sidetrack-rv-pop textarea {
+  display: block; width: calc(100% - 24px); margin: 6px 12px 8px;
+  min-height: 80px; resize: vertical;
+  font-family: var(--body); font-size: 13px; color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--rule); border-radius: 5px;
+  padding: 7px 9px; outline: none;
+}
+.sidetrack-rv-pop textarea:focus { border-color: var(--ink-3); }
+.sidetrack-rv-pop .acts {
+  display: flex; gap: 6px; padding: 7px 12px;
+  background: var(--paper); border-top: 1px solid var(--rule-soft);
+}
+.sidetrack-rv-pop .acts .grow { flex: 1; }
+.sidetrack-rv-pop .acts button {
+  font-family: var(--mono); font-size: 10.5px;
+  padding: 5px 11px; border-radius: 4px; cursor: pointer;
+  border: 1px solid var(--rule); background: var(--paper-light); color: var(--ink-2);
+}
+.sidetrack-rv-pop .acts button.primary {
+  background: var(--ink); color: var(--paper-light); border-color: var(--ink);
+}
+.sidetrack-rv-pop .acts button.primary:hover { background: var(--signal); border-color: var(--signal); }
+.sidetrack-rv-pop .acts button:disabled { opacity: 0.5; cursor: not-allowed; }
 `;
 
 const ensureOverlayInfra = (): HTMLElement => {
-  if (document.getElementById(STYLE_ID) === null) {
-    const style = document.createElement('style');
+  // Always overwrite the style tag's textContent. Without this, an
+  // older extension build that left a <style id=...> in the page
+  // keeps its stale CSS (e.g. missing `position: absolute` on chips,
+  // which collapses both buttons to the overlay root's top-left).
+  // Replacing the textContent on every call costs ~nothing and keeps
+  // the page in sync with the currently-loaded content script.
+  let style = document.getElementById(STYLE_ID) as HTMLStyleElement | null;
+  if (style === null) {
+    style = document.createElement('style');
     style.id = STYLE_ID;
-    style.textContent = OVERLAY_CSS;
     document.head.appendChild(style);
+  }
+  if (style.textContent !== OVERLAY_CSS) {
+    style.textContent = OVERLAY_CSS;
   }
   let root = document.getElementById(ROOT_ID);
   if (root === null) {
@@ -277,12 +432,20 @@ export interface DejaVuItem {
   readonly snippet: string;
   readonly score: number;
   readonly relativeWhen: string;
+  readonly provider?: ProviderId;
+  readonly threadUrl?: string;
+  // Full thread bac_id + last-seen timestamp from the recall result.
+  // Plumbed through Jump so the side panel can synthesize a card
+  // for threads that aren't yet in the local thread cache (e.g.
+  // captured on another device, only in the companion's vault).
+  readonly bacId?: string;
 }
 
 interface DejaVuMountOptions {
   readonly items: readonly DejaVuItem[];
   readonly anchorRect: DOMRect;
   readonly onJump?: (item: DejaVuItem) => void;
+  readonly onMute?: () => void;
   readonly onDismiss?: () => void;
 }
 
@@ -294,34 +457,204 @@ const clearDejaPop = (root: HTMLElement): void => {
   }
 };
 
-// Mount the Déjà-vu popover anchored just above the selection's bounding
-// rect, clamped to the viewport with 8px padding.
-export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => void } => {
-  if (opts.items.length === 0) {
-    return { close: () => undefined };
+// Inline review chip — a compact "+ Comment" pill that floats next to
+// the user's text selection inside an extracted turn. Clicking the
+// chip swaps in a small popover with the quoted text + a textarea
+// + Save / Cancel. Saving fires the onSave callback (the content
+// script forwards it to the background as appendReviewDraftSpan).
+//
+// Position is computed from the selection's bounding rect — chip
+// hovers a few px below the right edge; popover mounts in the same
+// quadrant, clamped to the viewport.
+
+interface ReviewChipMountOptions {
+  readonly anchorRect: DOMRect;
+  readonly quote: string;
+  readonly onSave: (comment: string) => Promise<void> | void;
+  readonly onDismiss?: () => void;
+  // When provided, the chip renders a second button "Déjà-vu" that
+  // unconditionally invokes this callback. The caller (content
+  // script) handles fetching recall + mounting the popover, even
+  // when results are empty (so the user gets explicit "no matches"
+  // feedback instead of the previous silent no-op).
+  readonly onDejaVu?: () => void;
+}
+
+const POP_WIDTH_RV = 320;
+
+const clearReviewOverlays = (root: HTMLElement): void => {
+  for (const node of root.querySelectorAll(
+    '.sidetrack-rv-chip, .sidetrack-rv-chip-group, .sidetrack-rv-pop',
+  )) {
+    node.remove();
   }
+};
+
+export const mountReviewSelectionChip = (
+  opts: ReviewChipMountOptions,
+): { close: () => void } => {
+  const root = ensureOverlayInfra();
+  clearReviewOverlays(root);
+
+  // Anchor: chip pair sits just below the selection's bounding rect,
+  // clamped to viewport. Two independent absolute-positioned chips —
+  // simpler than a wrapper div with flex (the wrapper version was
+  // dropping the + Comment button on some renders, see prior bug).
+  const COMMENT_W = 110;
+  const DEJA_W = 100;
+  const GAP = 6;
+  const totalWidth =
+    opts.onDejaVu !== undefined ? COMMENT_W + GAP + DEJA_W : COMMENT_W;
+  const viewportWidth = document.documentElement.clientWidth;
+  let leftAnchor = Math.max(8, opts.anchorRect.right - 50);
+  if (leftAnchor + totalWidth > viewportWidth - 8) {
+    leftAnchor = viewportWidth - totalWidth - 8;
+  }
+  if (leftAnchor < 8) leftAnchor = 8;
+  const chipTop = opts.anchorRect.bottom + 6;
+
+  const commentBtn = document.createElement('button');
+  commentBtn.type = 'button';
+  commentBtn.className = 'sidetrack-rv-chip';
+  commentBtn.style.left = `${String(leftAnchor)}px`;
+  commentBtn.style.top = `${String(chipTop)}px`;
+  commentBtn.innerHTML = '<span class="glyph">+</span><span>Comment</span>';
+
+  let dejaBtn: HTMLButtonElement | undefined;
+  if (opts.onDejaVu !== undefined) {
+    dejaBtn = document.createElement('button');
+    dejaBtn.type = 'button';
+    dejaBtn.className = 'sidetrack-rv-chip';
+    dejaBtn.style.left = `${String(leftAnchor + COMMENT_W + GAP)}px`;
+    dejaBtn.style.top = `${String(chipTop)}px`;
+    dejaBtn.innerHTML = '<span class="glyph">⟲</span><span>Déjà-vu</span>';
+  }
+
+  const close = (): void => {
+    commentBtn.remove();
+    dejaBtn?.remove();
+    for (const pop of root.querySelectorAll('.sidetrack-rv-pop')) {
+      pop.remove();
+    }
+    opts.onDismiss?.();
+  };
+
+  const expandToPopover = (): void => {
+    commentBtn.remove();
+    dejaBtn?.remove();
+    const pop = document.createElement('div');
+    pop.className = 'sidetrack-rv-pop';
+    const viewportWidth = document.documentElement.clientWidth;
+    let left = opts.anchorRect.left + opts.anchorRect.width / 2 - POP_WIDTH_RV / 2;
+    if (left < 8) left = 8;
+    if (left + POP_WIDTH_RV > viewportWidth - 8) left = viewportWidth - 8 - POP_WIDTH_RV;
+    pop.style.left = `${String(left)}px`;
+    pop.style.top = `${String(opts.anchorRect.bottom + 6)}px`;
+
+    const quoteCapped =
+      opts.quote.length > 200 ? `${opts.quote.slice(0, 200).trimEnd()}…` : opts.quote;
+    pop.innerHTML = `
+      <div class="head">
+        <span>Comment on selection</span>
+        <span class="meta"></span>
+        <button type="button" class="close" aria-label="Dismiss">×</button>
+      </div>
+      <div class="quote"></div>
+      <textarea placeholder="What did this miss / get wrong / need next?" autofocus></textarea>
+      <div class="acts">
+        <span class="grow"></span>
+        <button type="button" class="cancel">Cancel</button>
+        <button type="button" class="primary save" disabled>Save</button>
+      </div>
+    `;
+    const quoteEl = pop.querySelector('.quote');
+    if (quoteEl !== null) quoteEl.textContent = quoteCapped;
+    const textarea = pop.querySelector<HTMLTextAreaElement>('textarea');
+    const saveBtn = pop.querySelector<HTMLButtonElement>('.save');
+    if (textarea !== null && saveBtn !== null) {
+      textarea.addEventListener('input', () => {
+        saveBtn.disabled = textarea.value.trim().length === 0;
+      });
+      saveBtn.addEventListener('click', () => {
+        const value = textarea.value.trim();
+        if (value.length === 0) return;
+        saveBtn.disabled = true;
+        Promise.resolve(opts.onSave(value))
+          .then(() => {
+            close();
+          })
+          .catch(() => {
+            saveBtn.disabled = false;
+          });
+      });
+    }
+    pop.querySelector<HTMLButtonElement>('.cancel')?.addEventListener('click', close);
+    pop.querySelector<HTMLButtonElement>('.head .close')?.addEventListener('click', close);
+    root.appendChild(pop);
+    window.setTimeout(() => textarea?.focus(), 0);
+  };
+
+  commentBtn.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    expandToPopover();
+  });
+  if (dejaBtn !== undefined) {
+    const dejaBtnHandle = dejaBtn;
+    dejaBtnHandle.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      commentBtn.remove();
+      dejaBtnHandle.remove();
+      opts.onDejaVu?.();
+    });
+  }
+  root.appendChild(commentBtn);
+  if (dejaBtn !== undefined) {
+    root.appendChild(dejaBtn);
+  }
+  return { close };
+};
+
+const providerLabel = (provider: ProviderId | undefined): string => {
+  if (provider === 'chatgpt') return 'ChatGPT';
+  if (provider === 'claude') return 'Claude';
+  if (provider === 'gemini') return 'Gemini';
+  if (provider === 'codex') return 'Codex';
+  return 'Generic';
+};
+
+// Mount the Déjà-vu popover anchored just above the selection's bounding
+// rect, clamped to the viewport with 8px padding. Empty items now
+// renders an explicit "no matches found" panel so the user sees
+// the query ran (vs the previous silent no-mount which made the
+// feature feel broken).
+export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => void } => {
   const root = ensureOverlayInfra();
   clearDejaPop(root);
   const pop = document.createElement('div');
   pop.className = 'sidetrack-deja-pop';
-  const viewportWidth = document.documentElement.clientWidth;
-  let left = opts.anchorRect.left + opts.anchorRect.width / 2 - POP_WIDTH / 2;
-  if (left < 8) left = 8;
-  if (left + POP_WIDTH > viewportWidth - 8) left = viewportWidth - 8 - POP_WIDTH;
-  // Default: above the selection. Flip below if it would go off-screen.
-  let top = opts.anchorRect.top - 8;
-  let placeAbove = true;
-  if (top < 80) {
-    top = opts.anchorRect.bottom + 8;
-    placeAbove = false;
-  }
-  pop.style.left = `${String(left)}px`;
-  pop.style.top = `${String(placeAbove ? top - 320 : top)}px`;
+  // Initial position is best-effort — the real clamp happens after
+  // the popover mounts and we can measure its actual height. Until
+  // then we use a left-aligned offscreen position so the user
+  // never sees the unclamped intermediate frame.
+  pop.style.left = '-9999px';
+  pop.style.top = '0px';
+  // Cap the height so a popover with many rows can't push past the
+  // viewport. The list scrolls inside this max.
+  pop.style.maxHeight = `${String(Math.min(420, document.documentElement.clientHeight - 40))}px`;
+  pop.style.overflow = 'auto';
+  const isEmpty = opts.items.length === 0;
   pop.innerHTML = `
     <div class="sidetrack-deja-head">
       <span class="dot"></span>
-      <span>Seen this before</span>
-      <span class="meta">${String(opts.items.length)} prior thread${opts.items.length === 1 ? '' : 's'}</span>
+      <span>${isEmpty ? 'Déjà-vu' : 'Seen this before'}</span>
+      <span class="meta">${
+        isEmpty
+          ? 'no prior threads matched'
+          : `${String(opts.items.length)} prior thread${opts.items.length === 1 ? '' : 's'}`
+      }</span>
+      <button type="button" class="sidetrack-deja-mute">Mute on this page</button>
       <button type="button" class="close" aria-label="Dismiss">×</button>
     </div>
     <div class="sidetrack-deja-list"></div>
@@ -330,26 +663,45 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
     </div>
   `;
   const list = pop.querySelector<HTMLDivElement>('.sidetrack-deja-list');
-  if (list !== null) {
+  if (isEmpty && list !== null) {
+    const empty = document.createElement('div');
+    empty.className = 'sidetrack-deja-empty';
+    empty.style.cssText = 'padding: 18px 14px; text-align: center; color: var(--ink-3); font-style: italic; font-size: 12px;';
+    empty.textContent = 'No similar prior threads found in your vault.';
+    list.appendChild(empty);
+  }
+  if (!isEmpty && list !== null) {
     for (const item of opts.items) {
-      const row = document.createElement('button');
-      row.type = 'button';
+      const row = document.createElement('div');
       row.className = 'sidetrack-deja-row';
       row.innerHTML = `
         <div class="r1">
           <span class="title"></span>
+          <span class="sidetrack-deja-provider"></span>
+          <span class="sidetrack-deja-when"></span>
           <span class="score"></span>
         </div>
         <div class="snippet"></div>
+        <div class="r2">
+          <button type="button" class="jump">Jump</button>
+          <button type="button" class="mute">Mute on this page</button>
+        </div>
       `;
       const titleEl = row.querySelector('.title');
       if (titleEl !== null) titleEl.textContent = item.title;
+      const providerEl = row.querySelector('.sidetrack-deja-provider');
+      if (providerEl !== null) providerEl.textContent = providerLabel(item.provider);
+      const whenEl = row.querySelector('.sidetrack-deja-when');
+      if (whenEl !== null) whenEl.textContent = formatRelative(item.relativeWhen);
       const scoreEl = row.querySelector('.score');
       if (scoreEl !== null) scoreEl.textContent = item.score.toFixed(2);
       const snippetEl = row.querySelector('.snippet');
       if (snippetEl !== null) snippetEl.textContent = item.snippet;
-      row.addEventListener('click', () => {
+      row.querySelector('.jump')?.addEventListener('click', () => {
         opts.onJump?.(item);
+      });
+      row.querySelector('.mute')?.addEventListener('click', () => {
+        opts.onMute?.();
       });
       list.appendChild(row);
     }
@@ -359,6 +711,56 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
     opts.onDismiss?.();
   };
   pop.querySelector('.close')?.addEventListener('click', close);
+  pop.querySelector('.sidetrack-deja-mute')?.addEventListener('click', () => {
+    opts.onMute?.();
+  });
   root.appendChild(pop);
+  // Now that the popover is in the DOM we know its real size and can
+  // place it correctly relative to the selection. Order of preference:
+  //   1. Above the selection if there's room for the full popover
+  //   2. Below the selection if there's room there
+  //   3. Pinned to the available edge (clamped) if neither side fits,
+  //      so the popover stays on-screen even if it has to overlap the
+  //      selection a little.
+  // Width clamp is independent — center on selection, then pull back
+  // from any viewport edge it would cross.
+  const positionPopover = (): void => {
+    const popRect = pop.getBoundingClientRect();
+    const popHeight = popRect.height;
+    const popWidth = popRect.width || POP_WIDTH;
+    const viewportW = document.documentElement.clientWidth;
+    const viewportH = document.documentElement.clientHeight;
+    const margin = 8;
+    const gap = 6;
+
+    let left = opts.anchorRect.left + opts.anchorRect.width / 2 - popWidth / 2;
+    if (left < margin) left = margin;
+    if (left + popWidth > viewportW - margin) left = viewportW - margin - popWidth;
+
+    const spaceAbove = opts.anchorRect.top - margin;
+    const spaceBelow = viewportH - opts.anchorRect.bottom - margin;
+    let top: number;
+    if (popHeight + gap <= spaceAbove) {
+      top = opts.anchorRect.top - popHeight - gap;
+    } else if (popHeight + gap <= spaceBelow) {
+      top = opts.anchorRect.bottom + gap;
+    } else {
+      // Neither side has the full popover height. Pin to whichever
+      // side has more room and let the popover scroll internally
+      // (the maxHeight cap above keeps it inside the viewport).
+      if (spaceBelow >= spaceAbove) {
+        top = Math.max(margin, viewportH - popHeight - margin);
+      } else {
+        top = margin;
+      }
+    }
+
+    pop.style.left = `${String(Math.round(left))}px`;
+    pop.style.top = `${String(Math.round(top))}px`;
+  };
+  // First pass synchronously after mount; second pass next frame in
+  // case the row contents triggered a reflow that changed height.
+  positionPopover();
+  requestAnimationFrame(positionPopover);
   return { close };
 };

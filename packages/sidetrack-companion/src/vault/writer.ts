@@ -381,7 +381,12 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
           }
           const key = `${String(turn.ordinal)}::${turn.role}`;
           const existing = dedupe.get(key);
-          if (existing === undefined || existing.capturedAt < turn.capturedAt) {
+          // Keep the EARLIEST capturedAt for each (ordinal, role) so
+          // re-captures of the same chat (e.g. extension reload
+          // re-injection) don't overwrite the original time we first
+          // saw the turn. The user's "X min ago" stamp should reflect
+          // when the AI actually replied, not when we last extracted.
+          if (existing === undefined || existing.capturedAt > turn.capturedAt) {
             dedupe.set(key, turn);
           }
         }
@@ -391,8 +396,11 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
       }
     }
 
+    // Sort by ordinal desc (newest turn in chat sequence first) —
+    // capturedAt sort breaks once we preserve earliest timestamps,
+    // because a re-stamp on an older turn would float it to the top.
     return Array.from(dedupe.values())
-      .sort((left, right) => right.capturedAt.localeCompare(left.capturedAt))
+      .sort((left, right) => right.ordinal - left.ordinal)
       .slice(0, query.limit);
   };
 

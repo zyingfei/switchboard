@@ -14,7 +14,8 @@ import { pickInstaller, type Installer } from '../install/index.js';
 import { exportSettings } from '../portability/exportBundle.js';
 import { importSettings } from '../portability/importBundle.js';
 import { embed, MODEL_ID } from '../recall/embedder.js';
-import { appendEntry, gcEntries, readIndex } from '../recall/indexFile.js';
+import { appendEntry, gcEntries, readIndex, tombstoneByThread } from '../recall/indexFile.js';
+import type { RecallLifecycle } from '../recall/lifecycle.js';
 import { rank } from '../recall/ranker.js';
 import { rebuildFromEventLog } from '../recall/rebuild.js';
 import type { BucketRegistry } from '../routing/registry.js';
@@ -90,6 +91,13 @@ export interface CompanionHttpConfig {
     lastIdempotencyGcAt?: string;
     lastAuditRetentionAt?: string;
   };
+  // Owns the recall index lifecycle (auto-rebuild on stale, status
+  // surface for /v1/system/health). Optional so tests + legacy
+  // call-sites that don't care about recall keep working — when
+  // omitted, /v1/recall/rebuild falls back to direct rebuilder
+  // calls and health reports `status: 'ready' | 'missing'` with no
+  // background-rebuild affordance.
+  readonly recallLifecycle?: RecallLifecycle;
 }
 
 export interface StartedHttpServer {
@@ -555,15 +563,34 @@ const routes: readonly RouteDefinition[] = [
               droppedHint: null,
             }),
             recallSummary: async () => {
-              const [index, info] = await Promise.all([
+              const [index, info, lifecycleReport] = await Promise.all([
                 readIndex(indexPath),
                 stat(indexPath).catch(() => undefined),
+                context.recallLifecycle?.report() ?? Promise.resolve(undefined),
               ]);
+              const indexExists = index !== null;
               return {
-                indexExists: index !== null,
+                indexExists,
                 entryCount: index?.items.length ?? null,
                 modelId: index?.modelId ?? null,
                 sizeBytes: info?.size ?? null,
+                // Lifecycle fields are optional so legacy callers
+                // (no recallLifecycle injected) keep the old shape.
+                ...(lifecycleReport === undefined
+                  ? {}
+                  : {
+                      status: lifecycleReport.status,
+                      eventTurnCount: lifecycleReport.eventTurnCount,
+                      currentModelId: lifecycleReport.currentModelId,
+                      companionVersion: lifecycleReport.companionVersion,
+                      lastRebuildAt: lifecycleReport.lastRebuildAt,
+                      lastRebuildIndexed: lifecycleReport.lastRebuildIndexed,
+                      lastError: lifecycleReport.lastError,
+                      rebuildEmbedded: lifecycleReport.rebuildEmbedded,
+                      rebuildTotal: lifecycleReport.rebuildTotal,
+                      embedderDevice: lifecycleReport.embedderDevice,
+                      embedderAccelerator: lifecycleReport.embedderAccelerator,
+                    }),
               };
             },
             serviceStatus: async () => {
@@ -900,17 +927,49 @@ const routes: readonly RouteDefinition[] = [
         query.workstreamId === undefined
           ? undefined
           : await readWorkstreamThreadIds(vaultRoot, query.workstreamId);
-      return [
-        200,
-        {
-          data: rank(queryEmbedding ?? new Float32Array(384), index.items, new Date(), {
-            limit: query.limit,
-            ...(threadIds === undefined
-              ? {}
-              : { workstreamMembership: (threadId: string) => threadIds.has(threadId) }),
-          }),
-        },
-      ];
+      const ranked = rank(queryEmbedding ?? new Float32Array(384), index.items, new Date(), {
+        limit: query.limit,
+        ...(threadIds === undefined
+          ? {}
+          : { workstreamMembership: (threadId: string) => threadIds.has(threadId) }),
+      });
+      // Enrich each result with the thread title + canonical URL so
+      // the side panel can render meaningful labels and the SW proxy
+      // can dedup across stale duplicate bac_ids that point at the
+      // same chat URL. The cost is O(limit) tiny JSON reads —
+      // acceptable because the limit is clamped at 50.
+      // Snippet remains absent for now (would need an index format
+      // bump to store per-turn text without re-reading event logs).
+      const meta = new Map<string, { title: string; threadUrl: string }>();
+      const enriched = await Promise.all(
+        ranked.map(async (item) => {
+          let info = meta.get(item.threadId);
+          if (info === undefined) {
+            try {
+              const threadFile = await readFile(
+                join(vaultRoot, '_BAC', 'threads', `${item.threadId}.json`),
+                'utf8',
+              );
+              const parsed = JSON.parse(threadFile) as {
+                readonly title?: unknown;
+                readonly threadUrl?: unknown;
+              };
+              info = {
+                title: typeof parsed.title === 'string' ? parsed.title : '',
+                threadUrl: typeof parsed.threadUrl === 'string' ? parsed.threadUrl : '',
+              };
+            } catch {
+              info = { title: '', threadUrl: '' };
+            }
+            meta.set(item.threadId, info);
+          }
+          const additions: Record<string, string> = {};
+          if (info.title.length > 0) additions['title'] = info.title;
+          if (info.threadUrl.length > 0) additions['threadUrl'] = info.threadUrl;
+          return Object.keys(additions).length > 0 ? { ...item, ...additions } : item;
+        }),
+      );
+      return [200, { data: enriched }];
     },
   },
   {
@@ -919,6 +978,37 @@ const routes: readonly RouteDefinition[] = [
     authRequired: true,
     handle: async (_request, _requestId, _match, context) => {
       const vaultRoot = requireVaultRoot(context);
+      // Prefer the lifecycle path so the manual button + auto-rebuild
+      // share the same scheduler (one rebuild at a time, status flips
+      // to "rebuilding" in /v1/system/health, errors are captured).
+      // Fall back to the direct rebuilder for legacy callers that
+      // didn't inject a lifecycle.
+      //
+      // Critical: do NOT await the rebuild here. The first rebuild
+      // downloads the embedder model (~30MB) and embeds every turn
+      // — that can take minutes. Holding the request open until it
+      // finishes causes Chrome's fetch to time out with "Failed to
+      // fetch" and the user thinks the rebuild errored when it's
+      // actually still chugging along. Returning 202 + the current
+      // status lets the side-panel pill + Health card poll
+      // /v1/system/health to track progress.
+      if (context.recallLifecycle !== undefined) {
+        context.recallLifecycle.scheduleRebuild('manual');
+        const report = await context.recallLifecycle.report();
+        return [
+          202,
+          {
+            data: {
+              accepted: true,
+              status: report.status,
+              entryCount: report.entryCount,
+              eventTurnCount: report.eventTurnCount,
+              lastRebuildAt: report.lastRebuildAt,
+              lastError: report.lastError,
+            },
+          },
+        ];
+      }
       return [
         202,
         { data: await rebuildFromEventLog(vaultRoot, join(vaultRoot, '_BAC', 'events')) },
@@ -949,17 +1039,27 @@ const routes: readonly RouteDefinition[] = [
       const url = new URL(request.url ?? '/', 'http://127.0.0.1');
       const query = suggestionQuerySchema.parse({
         limit: url.searchParams.get('limit') ?? undefined,
+        threshold: url.searchParams.get('threshold') ?? undefined,
       });
       const workstreams = await readWorkstreams(vaultRoot);
       const signals = await buildSignals(vaultRoot, match.threadId, workstreams);
-      const threshold = Number.parseFloat(process.env['SIDETRACK_SUGGEST_THRESHOLD'] ?? '0.55');
+      // Threshold precedence: per-request param wins, then env var,
+      // then a permissive default (0.25). The pre-fix value (0.55)
+      // was calibrated for richly-populated workstreams where the
+      // 0.5*vector term dominated; with the cold-start title-
+      // embedding fallback and the asymmetric ws→thread containment
+      // signal, real positive matches typically score 0.25–0.45,
+      // so 0.25 surfaces them without a flood of noise.
+      const envThreshold = Number.parseFloat(process.env['SIDETRACK_SUGGEST_THRESHOLD'] ?? '');
+      const defaultThreshold = Number.isFinite(envThreshold) ? envThreshold : 0.25;
+      const threshold = query.threshold ?? defaultThreshold;
       const suggestions = scoreSuggestions(
         {
           thread: { id: match.threadId },
           workstreams,
           signals,
         },
-        { threshold: Number.isFinite(threshold) ? threshold : 0.55 },
+        { threshold },
       ).slice(0, query.limit);
       return [200, { data: suggestions }];
     },
@@ -1014,14 +1114,25 @@ const routes: readonly RouteDefinition[] = [
       if (match.bacId === undefined) {
         throw new Error('Missing bacId path parameter.');
       }
+      const vaultRoot = requireVaultRoot(context);
       if (mcpToolHeader(_request) === 'bac.archive_thread') {
         await requireWorkstreamTrust(
           context,
-          await readThreadWorkstreamId(requireVaultRoot(context), match.bacId),
+          await readThreadWorkstreamId(vaultRoot, match.bacId),
           'bac.archive_thread',
         );
       }
-      return [200, mutationResponse(await context.vaultWriter.archiveThread(match.bacId, requestId), requestId)];
+      const result = await context.vaultWriter.archiveThread(match.bacId, requestId);
+      // Tombstone every recall index entry for this thread so
+      // /v1/recall/query stops returning rows from archived threads.
+      // OR-Set semantics: rows stay on disk with tombstoned=true; a
+      // future replica merging an older un-archived write won't
+      // resurrect them. Best-effort — a missing index file is a
+      // benign no-op (tombstoneByThread returns 0).
+      await tombstoneByThread(recallIndexPath(vaultRoot), match.bacId).catch(() => {
+        /* index optional; archive succeeds regardless */
+      });
+      return [200, mutationResponse(result, requestId)];
     },
   },
   {
@@ -1039,7 +1150,13 @@ const routes: readonly RouteDefinition[] = [
           'bac.unarchive_thread',
         );
       }
-      return [200, mutationResponse(await context.vaultWriter.unarchiveThread(match.bacId, requestId), requestId)];
+      const result = await context.vaultWriter.unarchiveThread(match.bacId, requestId);
+      // We deliberately do NOT clear the tombstones on unarchive —
+      // an OR-Set tombstone is permanent (creating a fresh write
+      // with a higher lamport is the right way to bring an entry
+      // back). The lifecycle's incremental indexer will write fresh
+      // (untombstoned) rows for any new captures on this thread.
+      return [200, mutationResponse(result, requestId)];
     },
   },
   {

@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
 
 import {
   companionStatusLabel,
+  compareQueueItems,
   createEmptyWorkboardState,
   type AllThreadsBucket,
   type CodingSession,
@@ -19,6 +20,7 @@ import {
   type RuntimeResponse,
   type WorkboardRequest,
 } from '../../src/messages';
+import { canonicalThreadUrl, detectProviderFromUrl } from '../../src/capture/providerDetection';
 import {
   CodingAttach,
   AutoSendQueueRow,
@@ -30,6 +32,7 @@ import {
   PacketComposer,
   RecentDispatches,
   ReviewComposer,
+  ReviewDraftFooter,
   SendToDropdown,
   type SendToTarget,
   SettingsPanel,
@@ -38,6 +41,7 @@ import {
   UpdateBanner,
   CodingOfferBanner,
   HealthPanel,
+  Icons,
   DesignPreview,
   WorkstreamDetailPanel,
   TurnText,
@@ -51,26 +55,30 @@ import {
   Wizard,
   type RestoreStrategy,
   type ReviewVerdict,
+  type ScopeSuggestion,
   type WorkstreamOption,
 } from './components';
 import { createDispatchClient } from '../../src/dispatch/client';
+import {
+  bridgeKeyValidationCopy,
+  validateBridgeKeyCandidate,
+} from '../../src/companion/bridgeKeyValidation';
 import {
   type DispatchMode,
   dispatchKindToUiPacketKind,
   mapUiPacketKind,
   mapUiTarget,
+  providerIdToDispatchProvider,
 } from '../../src/dispatch/types';
 import { createReviewClient } from '../../src/review/client';
-import type { ReviewOutcome } from '../../src/review/types';
+import type { ReviewOutcome, ReviewVerdict as ReviewVerdictType } from '../../src/review/types';
 import { createSettingsClient } from '../../src/settings/client';
 import { isProviderWithOptIn, type SettingsDocument } from '../../src/settings/types';
 import { createTurnsClient, type CapturedTurnRecord } from '../../src/turns/client';
 import { deriveLifecycle } from '../../src/sidepanel/lifecycle';
-import {
-  listPendingOffers,
-  markStatus,
-  type OfferRecord,
-} from '../../src/codingAttach/state';
+import { formatRelative } from '../../src/util/time';
+import { createSuggestionsClient } from '../../src/companion/suggestionsClient';
+import { listPendingOffers, markStatus, type OfferRecord } from '../../src/codingAttach/state';
 import './style.css';
 
 const TARGET_PROVIDER_LABEL: Record<string, string> = {
@@ -110,26 +118,6 @@ const providerLabel = (provider: TrackedThread['provider']): string => {
     return 'Gemini';
   }
   return 'Generic';
-};
-
-const formatRelative = (isoDate: string): string => {
-  const then = Date.parse(isoDate);
-  if (Number.isNaN(then)) {
-    return 'recently';
-  }
-  const seconds = Math.max(1, Math.round((Date.now() - then) / 1000));
-  if (seconds < 60) {
-    return `${String(seconds)} sec ago`;
-  }
-  const minutes = Math.round(seconds / 60);
-  if (minutes < 60) {
-    return `${String(minutes)} min ago`;
-  }
-  const hours = Math.round(minutes / 60);
-  if (hours < 48) {
-    return `${String(hours)} hr ago`;
-  }
-  return `${String(Math.round(hours / 24))} days ago`;
 };
 
 export const formatBuildTimestamp = (iso: string): string => {
@@ -324,7 +312,7 @@ const DISPATCH_PROVIDER_LABEL: Record<string, string> = {
 };
 
 const DISPATCH_STATUS_TO_DISPLAY = (status: string): RecentDispatchStatus => {
-  if (status === 'replied' || status === 'noted' || status === 'pending') {
+  if (status === 'replied' || status === 'noted' || status === 'pending' || status === 'archived') {
     return status;
   }
   // 'sent', 'queued', 'failed' all map to 'sent' visually — failed is
@@ -366,10 +354,20 @@ const App = () => {
   const [wsPickerOpen, setWsPickerOpen] = useState(false);
   const [wsPickerCreateMode, setWsPickerCreateMode] = useState(false);
   const [viewMode, setViewMode] = useState<'workstream' | 'all'>('workstream');
-  const [queueComposeFor, setQueueComposeFor] = useState<string | null>(null);
   const [queueDraft, setQueueDraft] = useState('');
   const [queueExpandFor, setQueueExpandFor] = useState<string | null>(null);
+  // Set briefly after the user opens compose-at-end via the row's
+  // "Queue follow-up" menu so the input grabs focus on the next render.
+  const [queueComposeAutoFocus, setQueueComposeAutoFocus] = useState<string | null>(null);
+  const [draggedQueueItemId, setDraggedQueueItemId] = useState<string | null>(null);
+  const [dragOverQueueItemId, setDragOverQueueItemId] = useState<string | null>(null);
   const [queueCopiedId, setQueueCopiedId] = useState<string | null>(null);
+  // Per-thread inline-review draft expansion. Mirrors queueExpandFor:
+  // null = chip collapsed, threadId = footer expanded for that thread.
+  const [reviewDraftExpandFor, setReviewDraftExpandFor] = useState<string | null>(null);
+  // Recent Dispatches "show archived" toggle. Local-only — archived
+  // is a UI filter, not a persisted preference.
+  const [showArchivedDispatches, setShowArchivedDispatches] = useState(false);
   const [noteComposeOpen, setNoteComposeOpen] = useState(false);
   const [noteDraft, setNoteDraft] = useState('');
   const [noteEditId, setNoteEditId] = useState<string | null>(null);
@@ -383,6 +381,12 @@ const App = () => {
     () => new Set<string>(),
   );
   const [composeThreadId, setComposeThreadId] = useState<string | null>(null);
+  const [composeWorkstreamOverrideId, setComposeWorkstreamOverrideId] = useState<string | null>(
+    null,
+  );
+  const [composeScopeSuggestionsByThread, setComposeScopeSuggestionsByThread] = useState<
+    ReadonlyMap<string, readonly ScopeSuggestion[]>
+  >(() => new Map<string, readonly ScopeSuggestion[]>());
   // Which thread row currently has its Send-to dropdown open (null
   // = none). Only one open at a time.
   const [sendToOpenFor, setSendToOpenFor] = useState<string | null>(null);
@@ -463,9 +467,19 @@ const App = () => {
   // Cache of suggested workstream per thread, keyed by thread bac_id.
   // Populated from companion's GET /v1/suggestions/thread/{id} (PR #76
   // Track F) when the row is rendered. Empty fallback shows nothing.
+  // Stale-while-revalidate semantics: each row renders the cached
+  // value immediately AND always kicks a background fetch on mount
+  // / on workstream-state change / on explicit refresh. Cache is
+  // dropped wholesale when the workstream fingerprint shifts so a
+  // workstream rename, member move, or new workstream invalidates
+  // every cached suggestion at once.
   const [suggestionCache, setSuggestionCache] = useState<
-    ReadonlyMap<string, { readonly label: string; readonly confidence: number }>
+    ReadonlyMap<
+      string,
+      { readonly workstreamId: string; readonly label: string; readonly confidence: number }
+    >
   >(() => new Map());
+  const lastFingerprintRef = useRef<string | null>(null);
 
   // Refresh pending coding-session offers from chrome.storage. Driven
   // by storage events (set by the background detection handler) plus
@@ -501,7 +515,7 @@ const App = () => {
     const onChanged: StorageOnChanged | null =
       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
       typeof chrome.storage?.onChanged?.addListener === 'function'
-        ? (chrome.storage.onChanged)
+        ? chrome.storage.onChanged
         : null;
     onChanged?.addListener(onStorageChanged);
     return () => {
@@ -509,7 +523,10 @@ const App = () => {
       onChanged?.removeListener(onStorageChanged);
     };
   }, []);
-  const [theme, setTheme] = useState<ThemeMode>('auto');
+  // Default to light explicitly — 'auto' was tracking system theme,
+  // surprising users who keep their OS in dark mode but expect the
+  // side panel to stay light. User can flip in Settings.
+  const [theme, setTheme] = useState<ThemeMode>('light');
   const [density, setDensity] = useState<DensityMode>('cozy');
 
   // Apply theme + density to the root <html> element so all sidepanel
@@ -520,8 +537,7 @@ const App = () => {
     const matchMedia: ((query: string) => MediaQueryList) | undefined =
       typeof window.matchMedia === 'function' ? window.matchMedia.bind(window) : undefined;
     const prefersDark = matchMedia?.('(prefers-color-scheme: dark)').matches ?? false;
-    const resolved: 'light' | 'ink' =
-      theme === 'auto' ? (prefersDark ? 'ink' : 'light') : theme;
+    const resolved: 'light' | 'ink' = theme === 'auto' ? (prefersDark ? 'ink' : 'light') : theme;
     if (resolved === 'ink') {
       root.setAttribute('data-theme', 'ink');
     } else {
@@ -544,8 +560,54 @@ const App = () => {
   const [findPulseDismissedUrl, setFindPulseDismissedUrl] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [wizardConnectionError, setWizardConnectionError] = useState<string | null>(null);
+  // Recall index lifecycle state — polled from /v1/system/health when
+  // the companion is reachable. The header pill flips to "indexing"
+  // amber while the companion's background rebuild is in flight, so
+  // the user understands why Déjà-vu queries return nothing yet.
+  const [recallStatus, setRecallStatus] = useState<
+    'missing' | 'stale' | 'empty' | 'rebuilding' | 'ready' | null
+  >(null);
 
   const threads = useMemo(() => visibleThreads(state.threads), [state.threads]);
+  // Stable string that mutates whenever the workstream graph or any
+  // thread's primary-workstream assignment changes. Drives both the
+  // wholesale cache flush below and the per-row useEffect dep so the
+  // companion's suggestion gets re-fetched whenever the inputs that
+  // shaped it changed.
+  const workstreamFingerprint = useMemo(() => {
+    const wsParts = state.workstreams
+      .map((ws) => `${ws.bac_id}:${ws.revision}`)
+      .sort()
+      .join('|');
+    const memberParts = state.threads
+      .map((t) => `${t.bac_id}->${t.primaryWorkstreamId ?? ''}`)
+      .sort()
+      .join('|');
+    return `${wsParts}#${memberParts}`;
+  }, [state.workstreams, state.threads]);
+  // Stable callback so the row effect's `resolveLabel` dep doesn't
+  // thrash on every render. workstreamPath is pure over the
+  // workstreams array, so we re-create only when the array changes.
+  const resolveWorkstreamLabel = useCallback(
+    (workstreamId: string) => workstreamPath(workstreamId, state.workstreams),
+    [state.workstreams],
+  );
+  // Invalidate every cached suggestion when the workstream
+  // fingerprint shifts (rename, member move, new/deleted workstream).
+  // The per-row effect will re-fetch on its next render.
+  useEffect(() => {
+    // Skip the initial render so we don't drop a freshly-populated
+    // cache that hasn't observed any mutation yet.
+    if (lastFingerprintRef.current === null) {
+      lastFingerprintRef.current = workstreamFingerprint;
+      return;
+    }
+    if (lastFingerprintRef.current !== workstreamFingerprint) {
+      lastFingerprintRef.current = workstreamFingerprint;
+      setSuggestionCache(new Map());
+    }
+  }, [workstreamFingerprint]);
   const moveThread = useMemo(
     () => threads.find((thread) => thread.bac_id === moveThreadId),
     [moveThreadId, threads],
@@ -566,10 +628,11 @@ const App = () => {
     if (composeThread === undefined) {
       return undefined;
     }
+    const targetWorkstreamId = composeWorkstreamOverrideId ?? composeThread.primaryWorkstreamId;
     return state.workstreams.find(
-      (workstream) => workstream.bac_id === composeThread.primaryWorkstreamId,
+      (workstream) => workstream.bac_id === targetWorkstreamId,
     );
-  }, [composeThread, state.workstreams]);
+  }, [composeThread, composeWorkstreamOverrideId, state.workstreams]);
 
   const refresh = async () => {
     const next = await sendRequest({ type: messageTypes.getWorkboardState });
@@ -598,7 +661,64 @@ const App = () => {
       .catch(() => {
         setSetupCompleted(false);
       });
+    // Periodic state refresh — keeps the header status pills (vault +
+    // companion) in sync with reality. Without this, companion going
+    // down between user actions wasn't detected and the pill stayed
+    // green until the next user action.
+    const id = window.setInterval(() => {
+      void refresh().catch(() => undefined);
+    }, 15_000);
+    return () => {
+      window.clearInterval(id);
+    };
   }, []);
+
+  // Recall lifecycle poll — only runs when companion is reachable
+  // and we have a bridge key. Surfaces 'rebuilding' as an amber
+  // pill in the header so the user knows why Déjà-vu is silent
+  // immediately after companion startup or a model upgrade.
+  useEffect(() => {
+    if (state.companionStatus !== 'connected' || bridgeKey.trim().length === 0) {
+      setRecallStatus(null);
+      return undefined;
+    }
+    const portValue = state.settings.companion.port;
+    let cancelled = false;
+    const fetchRecall = async (): Promise<void> => {
+      try {
+        const response = await fetch(
+          `http://127.0.0.1:${String(portValue)}/v1/system/health`,
+          { headers: { 'x-bac-bridge-key': bridgeKey } },
+        );
+        if (!response.ok || cancelled) return;
+        const body = (await response.json()) as { readonly data?: { readonly recall?: { readonly status?: unknown } } };
+        const status = body.data?.recall?.status;
+        if (
+          status === 'missing' ||
+          status === 'stale' ||
+          status === 'empty' ||
+          status === 'rebuilding' ||
+          status === 'ready'
+        ) {
+          setRecallStatus(status);
+        } else {
+          setRecallStatus(null);
+        }
+      } catch {
+        // Ignore — pill just stays at last known value until next tick.
+      }
+    };
+    void fetchRecall();
+    // Poll faster while rebuilding so the pill clears promptly.
+    const intervalMs = recallStatus === 'rebuilding' ? 5_000 : 30_000;
+    const handle = window.setInterval(() => {
+      void fetchRecall();
+    }, intervalMs);
+    return () => {
+      cancelled = true;
+      window.clearInterval(handle);
+    };
+  }, [state.companionStatus, bridgeKey, state.settings.companion.port, recallStatus]);
 
   useEffect(() => {
     const runtimeMessages = chrome.runtime.onMessage;
@@ -621,29 +741,82 @@ const App = () => {
         }, 150);
       }
       if (isFocusThreadInSidePanelMessage(message)) {
-        // Chat-side floating button → find the matching thread by URL,
-        // scroll its row into view, briefly highlight via the
-        // .focusing CSS class. We read state via a stale closure here,
-        // which is fine — the side panel's last refresh is what the
-        // user is looking at.
-        const targetUrl = message.threadUrl;
-        // Defer to next tick so the message handler doesn't block.
-        window.setTimeout(() => {
-          // Search the live state via a state setter callback to
-          // avoid a stale closure on `state`.
-          setState((current) => {
-            const match = current.threads.find((t) => t.threadUrl === targetUrl);
-            if (match !== undefined) {
-              const node = threadRowRefs.current.get(match.bac_id);
-              node?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-              setFocusingThreadId(match.bac_id);
-              window.setTimeout(() => {
-                setFocusingThreadId((prev) => (prev === match.bac_id ? null : prev));
-              }, 1500);
-            }
-            return current;
+        // Chat-side floating button OR Déjà-vu Jump → find the
+        // matching thread by canonical URL, switch to whichever view
+        // contains it (the workstream filter or All Threads), expand
+        // the bucket if collapsed, then scroll the row into view and
+        // flash the .focusing class.
+        //
+        // Reads from stateRef (synced via the effect below) instead
+        // of using setState as a state-reader — React 18 will silently
+        // skip the inner setFocusingThreadId update inside an updater
+        // function that returns the same reference.
+        //
+        // The view-switch + bucket-expand are critical: ~10% of
+        // threads in a typical vault sit outside the currently-
+        // visible workstream filter, and without this branch the
+        // setFocusingThreadId fires correctly but no DOM row exists
+        // for the .focusing class to attach to → Jump silently looks
+        // like a no-op.
+        const targetCanonical = canonicalThreadUrl(message.threadUrl);
+        void (async () => {
+          let match = stateRef.current.threads.find(
+            (thread) =>
+              thread.threadUrl === message.threadUrl ||
+              canonicalThreadUrl(thread.threadUrl) === targetCanonical,
+          );
+          // No local card for this thread (typical for recall hits
+          // sourced from the companion vault that the local cache
+          // never captured). Synthesize one inline from the message
+          // payload so the user can still focus + click into it.
+          if (match === undefined && message.bacId !== undefined) {
+            const synthesized: TrackedThread = {
+              bac_id: message.bacId,
+              provider: detectProviderFromUrl(message.threadUrl),
+              threadUrl: message.threadUrl,
+              title: message.title ?? message.threadUrl,
+              lastSeenAt: message.lastSeenAt ?? new Date().toISOString(),
+              status: 'active',
+              trackingMode: 'manual',
+              tags: [],
+            };
+            setState((current) => ({
+              ...current,
+              threads: [synthesized, ...current.threads],
+            }));
+            // Also push into stateRef so the focus logic below sees it.
+            stateRef.current = {
+              ...stateRef.current,
+              threads: [synthesized, ...stateRef.current.threads],
+            };
+            match = synthesized;
+          }
+          if (match === undefined) return;
+          // If the matched thread isn't in the active workstream
+          // view, fall back to "All threads" so the row renders.
+          if (
+            viewModeRef.current === 'workstream' &&
+            match.primaryWorkstreamId !== currentWsIdRef.current
+          ) {
+            setViewMode('all');
+          }
+          await expandBucketForThreadRef.current?.(match);
+          // Yield two animation frames so React commits the view +
+          // bucket changes and the row's ref callback fires.
+          await new Promise<void>((resolve) => {
+            requestAnimationFrame(() => {
+              requestAnimationFrame(() => {
+                resolve();
+              });
+            });
           });
-        }, 0);
+          const node = threadRowRefs.current.get(match.bac_id);
+          node?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          setFocusingThreadId(match.bac_id);
+          window.setTimeout(() => {
+            setFocusingThreadId((prev) => (prev === match.bac_id ? null : prev));
+          }, 1500);
+        })();
       }
     };
     runtimeMessages.addListener(listener);
@@ -773,6 +946,26 @@ const App = () => {
   // row. Map mutated via the ref callback below.
   const threadRowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const [focusingThreadId, setFocusingThreadId] = useState<string | null>(null);
+  // Mirror of `state` for the message listener registered with empty
+  // deps. Without this, the listener can only see state via a
+  // setState((current) => ...) callback — and React 18 will skip
+  // re-renders if the callback returns the same reference, suppressing
+  // any nested state setters fired inside.
+  const stateRef = useRef(state);
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
+  // Same trick for the bits the focus-thread handler needs to read
+  // from outside the empty-deps useEffect closure: which view we're
+  // on, which workstream is selected, and the helper that expands
+  // the All-Threads bucket containing a given thread. Each is mirrored
+  // through a ref so the listener always reads the latest values
+  // even though the registration runs only once.
+  const viewModeRef = useRef<'workstream' | 'all'>('workstream');
+  const currentWsIdRef = useRef<string | null>(null);
+  const expandBucketForThreadRef = useRef<
+    ((thread: TrackedThread) => Promise<void>) | null
+  >(null);
   const activeTabTrackedThread = useMemo(
     () =>
       state.activeTabUrl === undefined
@@ -816,6 +1009,64 @@ const App = () => {
     };
   }, [composeThread, bridgeKey, port, composeTurnsByUrl]);
 
+  useEffect(() => {
+    setComposeWorkstreamOverrideId(null);
+  }, [composeThreadId]);
+
+  useEffect(() => {
+    if (
+      composeThread === undefined ||
+      bridgeKey.length === 0 ||
+      composeScopeSuggestionsByThread.has(composeThread.bac_id)
+    ) {
+      return undefined;
+    }
+    const portNumber = Number(port);
+    if (!Number.isFinite(portNumber) || portNumber <= 0) {
+      return undefined;
+    }
+    let cancelled = false;
+    const client = createSuggestionsClient({ port: portNumber, bridgeKey });
+    const targetThreadId = composeThread.bac_id;
+    void client
+      .forThread(targetThreadId, { limit: 3 })
+      .then((list) => {
+        if (cancelled) return;
+        const suggestions = list.map((item): ScopeSuggestion => {
+          const breakdown =
+            item.breakdown === undefined
+              ? []
+              : Object.entries(item.breakdown)
+                  .filter(([, value]) => Number.isFinite(value))
+                  .sort(([a], [b]) => a.localeCompare(b))
+                  .map(([key, value]) => `${key} ${value.toFixed(2)}`);
+          return {
+            id: item.workstreamId,
+            label: workstreamPath(item.workstreamId, state.workstreams),
+            confidence: item.score,
+            reason: breakdown.length > 0 ? breakdown.join(' · ') : 'suggested by companion',
+          };
+        });
+        setComposeScopeSuggestionsByThread((prev) =>
+          new Map(prev).set(targetThreadId, suggestions),
+        );
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setComposeScopeSuggestionsByThread((prev) => new Map(prev).set(targetThreadId, []));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    composeThread,
+    bridgeKey,
+    port,
+    composeScopeSuggestionsByThread,
+    state.workstreams,
+  ]);
+
   // Pre-fetch turns when the Send-to dropdown opens, so the smart-
   // default packet builder has full chat context cached when the
   // user picks a target. Reuses composeTurnsByUrl as the shared
@@ -838,8 +1089,11 @@ const App = () => {
     }
     let cancelled = false;
     const client = createTurnsClient({ port: portNumber, bridgeKey });
+    // Ask for the server-side max (Math.min(limit ?? 5, 50) in
+    // schemas.ts) so the smart-default packet ships the full thread
+    // tail. The DispatchConfirm token-budget guard catches outliers.
     void client
-      .recentForThread(targetUrl, { limit: 12 })
+      .recentForThread(targetUrl, { limit: 50 })
       .then((list) => {
         if (!cancelled) {
           setComposeTurnsByUrl((prev) => new Map(prev).set(targetUrl, list));
@@ -940,12 +1194,39 @@ const App = () => {
 
   const completeSetup = async (saveCompanionFirst: boolean): Promise<void> => {
     if (saveCompanionFirst) {
-      await runAction(() =>
-        sendRequest({
+      const portNumber = Number(port);
+      if (!Number.isFinite(portNumber) || portNumber <= 0) {
+        const message = 'Invalid companion port.';
+        setWizardConnectionError(message);
+        throw new Error(message);
+      }
+      const bridgeKeyFailure = validateBridgeKeyCandidate(bridgeKey);
+      if (bridgeKeyFailure !== null) {
+        const message = bridgeKeyValidationCopy[bridgeKeyFailure];
+        setWizardConnectionError(message);
+        throw new Error(message);
+      }
+      setWizardConnectionError(null);
+      setBusy(true);
+      setError(null);
+      try {
+        const next = await sendRequest({
           type: messageTypes.saveCompanionSettings,
-          settings: { bridgeKey, port: Number(port) },
-        }),
-      );
+          settings: { bridgeKey: bridgeKey.trim(), port: portNumber },
+        });
+        setState(next);
+        setError(next.lastError ?? null);
+        setBridgeKey(next.settings.companion.bridgeKey);
+        setPort(String(next.settings.companion.port));
+      } catch (setupError) {
+        const message =
+          setupError instanceof Error ? setupError.message : 'Could not connect companion.';
+        setWizardConnectionError(message);
+        setError(message);
+        throw setupError;
+      } finally {
+        setBusy(false);
+      }
     }
     await writeSetupCompleted();
     setSetupCompleted(true);
@@ -1098,6 +1379,12 @@ const App = () => {
     });
     setState(next);
   };
+  // Mirror the helper into a ref so the focus-thread handler can
+  // call it without re-binding when state changes (the handler's
+  // useEffect has empty deps).
+  useEffect(() => {
+    expandBucketForThreadRef.current = expandBucketForThread;
+  });
 
   const focusThreadInWorkstream = (thread: TrackedThread): void => {
     setViewMode('workstream');
@@ -1170,24 +1457,43 @@ const App = () => {
         : turns
             .map((t) => {
               const role = t.role === 'assistant' ? '### Assistant' : '### User';
-              const text = t.text.length > 1200 ? `${t.text.slice(0, 1200)}…` : t.text;
-              return `${role}\n${text}`;
+              // Ship the full turn body. The DispatchConfirm modal's
+              // token-budget chip warns the user when the packet
+              // exceeds the target model's context window; it is the
+              // user's call to edit or proceed. Per-turn truncation
+              // here used to silently drop long replies before that
+              // guard existed.
+              return `${role}\n${t.text}`;
             })
             .join('\n\n');
     const provider = providerLabel(thread.provider);
     const head = `## Source\n${provider} · ${thread.threadUrl}`;
     let body: string;
     if (intent.kind === 'research_packet') {
-      body = `# Research request: ${thread.title}\n\n${head}\n\n## Pre-flight checklist for the receiving AI\n- [ ] Verify the conclusion against the original source\n- [ ] Note any framework versions / dates the source assumes\n- [ ] Flag if the question has shifted since first ask\n- [ ] Distinguish what was asserted vs cited\n\n## Recent context\n${turnsMd}\n\n## Ask\n…`;
+      // Default = raw forward. The user asked for a "just here's the
+      // context from another conversation" packet by default; the
+      // structured Critique/Compare/Drill-deeper templates are
+      // available in the Customize composer if they want them. Brief
+      // title + source + the captured turns.
+      body = `# Context from another conversation: ${thread.title}\n\n${head}\n\n${turnsMd}`;
     } else if (intent.kind === 'coding_agent_packet') {
-      body = `# Coding handoff: ${thread.title}\n\n## Source thread\n${provider} · ${thread.threadUrl}\n\n## Recent context\n${turnsMd}\n\n## Files / modules involved\n…\n\n## Acceptance criteria\n- [ ] …\n- [ ] …\n\n## Constraints\n- Do not modify unrelated files.\n- Run the existing test suite before reporting done.`;
+      // MCP-aware handoff: tells the coding agent how to connect to
+      // Sidetrack's local MCP endpoint for live thread + recent
+      // dispatches + recall, with the old HTTP route as fallback.
+      // It also includes captured turns as an offline fallback.
+      // Bridge key + port are interpolated from the side-panel's
+      // current settings — clipboard is local, companion only listens
+      // on 127.0.0.1, so it's safe to render the key inline.
+      const portStr = port.length > 0 ? port : '17373';
+      const keyStr = bridgeKey.length > 0 ? bridgeKey : '<run the companion to generate>';
+      body = `# Coding handoff: ${thread.title}\n\nYou are continuing work from a Sidetrack thread. The user's local Sidetrack MCP endpoint can read live thread context, recent dispatches, and decisions.\n\n## Thread reference\n${provider} · ${thread.threadUrl}\nthread_id: ${thread.bac_id}\n\n## MCP endpoint\n- primary : ws://127.0.0.1:8721/mcp?token=${keyStr}\n- auth    : the token is the local Sidetrack bridge key\n\n## HTTP fallback\n- base url   : http://127.0.0.1:${portStr}\n- auth       : send header  x-bac-bridge-key: ${keyStr}\n- tool route : send header  x-sidetrack-mcp-tool: <tool-name>\n\n(Everything is localhost-only; the bridge key is local-machine.)\n\n## Tools you can call (read-only)\n- bac.read_thread_md       full markdown of this thread\n- bac.list_dispatches      recent context packets / asks the user shipped\n- bac.recall               vector recall over related threads + decisions\n- bac.read_workstream_md   workstream context if this thread is grouped\n- bac.list_annotations     user-saved highlights with comments\n- bac.list_audit_events    decisions, archives, edits\n\nRecommended sequence on first call: read_thread_md → list_dispatches → recall (if you need cross-thread context). Cite the tool name when you reference what you pulled so the user can verify.\n\n## Snapshot of the captured turns (offline fallback)\nIf Sidetrack is unreachable, work from this snapshot. It's the same data bac.read_thread_md would return, just frozen at clipboard time.\n\n${turnsMd}\n\n## User's ask\n…`;
     } else {
       const today = new Date().toISOString().slice(0, 10);
       body = `---\ntitle: ${thread.title}\ncreated: ${today}\nsource: ${thread.threadUrl}\nprovider: ${provider}\n---\n\n# ${thread.title}\n\n${turnsMd}`;
     }
     return {
       kind: intent.kind,
-      template: intent.kind === 'research_packet' ? 'web_to_ai_checklist' : null,
+      template: intent.kind === 'research_packet' ? 'critique' : null,
       target: intent.target,
       title: thread.title,
       body,
@@ -1235,9 +1541,12 @@ const App = () => {
         type: messageTypes.queueFollowUp,
         item: { text, scope: 'thread', targetId: threadId },
       });
+      // Keep the queue expanded and the compose input focused so the
+      // user can stack the next follow-up without re-clicking. Only
+      // the draft text is cleared.
       setQueueDraft('');
-      setQueueComposeFor(null);
       setQueueExpandFor(threadId);
+      setQueueComposeAutoFocus(threadId);
       return next;
     });
   };
@@ -1248,6 +1557,38 @@ const App = () => {
         type: messageTypes.updateQueueItem,
         queueItemId,
         update: { status: 'dismissed' },
+      }),
+    );
+  };
+
+  const reorderQueueItem = (
+    pendingItems: readonly { readonly bac_id: string }[],
+    sourceId: string,
+    targetId: string | null,
+  ) => {
+    // targetId === null => drop at the tail. Otherwise insert the
+    // dragged item before targetId. Active items (mid-send) keep
+    // their existing position; the drain ships them next regardless
+    // of where reorder happened.
+    const ids = pendingItems.map((i) => i.bac_id).filter((id) => id !== sourceId);
+    let nextOrder: string[];
+    if (targetId === null) {
+      nextOrder = [...ids, sourceId];
+    } else {
+      const targetIndex = ids.indexOf(targetId);
+      if (targetIndex < 0) {
+        nextOrder = [...ids, sourceId];
+      } else {
+        nextOrder = [...ids.slice(0, targetIndex), sourceId, ...ids.slice(targetIndex)];
+      }
+    }
+    if (nextOrder.length === 0) {
+      return;
+    }
+    void runAction(() =>
+      sendRequest({
+        type: messageTypes.reorderQueueItems,
+        queueItemIds: nextOrder,
       }),
     );
   };
@@ -1598,6 +1939,54 @@ const App = () => {
     }
   };
 
+  // Inline-review draft handlers — wire the per-thread chip + footer
+  // into the new draft message types. The send-as-follow-up path
+  // delegates entirely to the background handler (which bundles the
+  // draft, queues a follow-up, and turns auto-send on for the
+  // thread). Save-to-vault uses the same review HTTP client as the
+  // modal flow but reads the staged draft from chrome.storage.
+  const dropReviewDraftSpan = (threadId: string, spanId: string) => {
+    void runAction(() => sendRequest({ type: messageTypes.dropReviewDraftSpan, threadId, spanId }));
+  };
+
+  const updateInlineReviewDraft = (
+    threadId: string,
+    patch: { overall?: string; verdict?: ReviewVerdictType },
+  ) => {
+    void runAction(() => sendRequest({ type: messageTypes.updateReviewDraft, threadId, ...patch }));
+  };
+
+  // Two ways to ship the staged draft. Both bundle into the queue
+  // template + clear the draft. Difference is whether the per-thread
+  // auto-send chip flips on. Footer expansion state stays put — the
+  // chip + footer naturally vanish once the draft clears, and reappear
+  // pre-expanded when the user adds another comment from the chat
+  // page. The user keeps working without losing their place.
+  const addInlineReviewToQueue = (threadId: string) => {
+    void runAction(() =>
+      sendRequest({
+        type: messageTypes.sendReviewDraftAsFollowUp,
+        threadId,
+        autoSend: false,
+      }),
+    );
+  };
+
+  const sendInlineReviewNow = (threadId: string) => {
+    void runAction(() =>
+      sendRequest({
+        type: messageTypes.sendReviewDraftAsFollowUp,
+        threadId,
+        autoSend: true,
+      }),
+    );
+  };
+
+  const discardInlineReviewDraft = (threadId: string) => {
+    setReviewDraftExpandFor(null);
+    void runAction(() => sendRequest({ type: messageTypes.discardReviewDraft, threadId }));
+  };
+
   // Auto-pop the wizard ONLY for true first-launch users (no setupCompleted
   // flag AND no bridge key in storage on first mount). Existing-user
   // migration: a non-empty bridge key from a prior install means they
@@ -1642,6 +2031,14 @@ const App = () => {
     expandedWorkstreamId === null && selectedWorkstream === ''
       ? null
       : (expandedWorkstreamId ?? (selectedWorkstream || null));
+  // Sync refs the focus-thread handler reads from outside its
+  // empty-deps closure — see stateRef declaration above for context.
+  useEffect(() => {
+    viewModeRef.current = viewMode;
+  }, [viewMode]);
+  useEffect(() => {
+    currentWsIdRef.current = currentWsId;
+  }, [currentWsId]);
   const currentWs =
     currentWsId === null ? null : (state.workstreams.find((w) => w.bac_id === currentWsId) ?? null);
   const currentWsLabel =
@@ -1757,10 +2154,43 @@ const App = () => {
     const pendingQueueItems = state.queueItems
       .filter((q) => q.targetId === thread.bac_id && q.status === 'pending')
       .slice()
-      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      .sort(compareQueueItems);
     const queuedCount = pendingQueueItems.length;
-    const queueExpanded = queueExpandFor === thread.bac_id && queuedCount > 0;
+    // Expansion holds the compose-at-end row even when the queue is
+    // empty, so the user can keep stacking follow-ups without the
+    // list collapsing under them.
+    const queueExpanded = queueExpandFor === thread.bac_id;
     const childForks = state.threads.filter((t) => t.parentThreadId === thread.bac_id);
+    // Outgoing dispatches sourced from this thread — the user wants
+    // each source-thread card to surface "this is where I shipped X to
+    // Gemini / Claude / Codex." Cap at the most recent 5 to avoid
+    // crowding the card; the full list still lives in Recent
+    // Dispatches at the section level.
+    //
+    // bac_id-equality is the strict path. When local thread bac_ids
+    // get re-issued (companion regenerates, storage drift), the
+    // dispatch's sourceThreadId points at a dead bac_id. In that
+    // orphan case, fall back to matching the dispatch.title against
+    // the thread.title — dispatch.title IS the source thread title
+    // captured at submit time, so an exact-string match is
+    // surprisingly robust. The proper fix is adding sourceThreadUrl
+    // to the dispatch schema so we can match by URL; tracked as a
+    // follow-up.
+    const liveThreadIdSet = new Set(state.threads.map((t) => t.bac_id));
+    const outgoingDispatches = state.recentDispatches
+      .filter((d) => {
+        if (d.status === 'archived') return false;
+        if (d.sourceThreadId === thread.bac_id) return true;
+        if (d.sourceThreadId === undefined) return false;
+        // Stale sourceThreadId only matters when the bac_id is dead
+        // — a live but different thread should not steal dispatches.
+        const sourceLive = liveThreadIdSet.has(d.sourceThreadId);
+        if (sourceLive) return false;
+        return d.title === thread.title;
+      })
+      .slice()
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, 5);
     const parent =
       thread.parentThreadId === undefined
         ? undefined
@@ -1781,6 +2211,14 @@ const App = () => {
     const titleExpanded = titleExpandedFor === thread.bac_id;
     const inlineTurns = inlineTurnsByUrl.get(thread.threadUrl);
     const isFocusing = focusingThreadId === thread.bac_id;
+    // Inline-review draft staged from on-page selection. Surfaced as
+    // a "Review draft (N) ⌄" chip in row1 next to the queued chip.
+    const reviewDraft = state.reviewDrafts[thread.bac_id];
+    // Only "expanded" if the row is the chosen target AND a draft
+    // exists. Splitting the boolean keeps the JSX narrowing clean.
+    const expandedDraft =
+      reviewDraftExpandFor === thread.bac_id && reviewDraft !== undefined ? reviewDraft : null;
+    const reviewDraftExpanded = expandedDraft !== null;
     return (
       <div
         key={thread.bac_id}
@@ -1821,18 +2259,6 @@ const App = () => {
           >
             <span className="name">{titleDisplay}</span>
           </button>
-          <button
-            type="button"
-            className="thread-focus-btn"
-            title={isPrivate ? 'Open thread tab' : `Focus: ${thread.title}`}
-            aria-label="Open or focus the thread tab"
-            onClick={(e) => {
-              e.stopPropagation();
-              openTabForThread(thread);
-            }}
-          >
-            ↗
-          </button>
           {queuedCount > 0 ? (
             <button
               type="button"
@@ -1847,8 +2273,22 @@ const App = () => {
               {String(queuedCount)} queued
             </button>
           ) : null}
+          {reviewDraft !== undefined ? (
+            <button
+              type="button"
+              className={'thread-review-draft-chip' + (reviewDraftExpanded ? ' on' : '')}
+              title={`Review draft staged with ${String(reviewDraft.spans.length)} comment${reviewDraft.spans.length === 1 ? '' : 's'} — expand to send as follow-up`}
+              aria-expanded={reviewDraftExpanded}
+              onClick={(e) => {
+                e.stopPropagation();
+                setReviewDraftExpandFor(reviewDraftExpanded ? null : thread.bac_id);
+              }}
+            >
+              Review draft ({String(reviewDraft.spans.length)}) {reviewDraftExpanded ? '▴' : '▾'}
+            </button>
+          ) : null}
         </div>
-        <div className="row2">
+        <div className="row2 row2-lifecycle">
           <span className={'dot ' + dotClass} />
           <span className="stamp">{stamp}</span>
           {/* Per spec: dot + stamp already convey lifecycle. The
@@ -1861,18 +2301,79 @@ const App = () => {
               {lifecyclePill.label}
             </span>
           ) : null}
+          {viewMode === 'all' ? (
+            <button
+              type="button"
+              className="thread-ws-path mono"
+              title={
+                thread.primaryWorkstreamId === undefined
+                  ? 'Switch to Ungrouped workstream view'
+                  : 'Switch to this workstream'
+              }
+              onClick={(e) => {
+                e.stopPropagation();
+                focusThreadInWorkstream(thread);
+              }}
+            >
+              {thread.primaryWorkstreamId === undefined
+                ? 'Ungrouped'
+                : workstreamPath(thread.primaryWorkstreamId, state.workstreams)}
+            </button>
+          ) : null}
+          {/* Auto-send state pill — moved out of .thread-actions
+              (the absolute-positioned action strip at top-right)
+              into the lifecycle row so it stops crowding the icons.
+              Renders inline with stamp + workstream path. */}
+          {queuedCount > 0 ? (
+            <button
+              type="button"
+              className={'thread-autosend' + (thread.autoSendEnabled ? ' on' : '')}
+              aria-pressed={thread.autoSendEnabled === true}
+              title={
+                thread.autoSendEnabled
+                  ? 'Auto-send on — queued items ship into this chat one at a time, waiting for each reply.'
+                  : 'Auto-send off — turn on to drain queued follow-ups into this chat (per-provider opt-in lives in Settings).'
+              }
+              onClick={(e) => {
+                e.stopPropagation();
+                void runAction(() =>
+                  sendRequest({
+                    type: messageTypes.setThreadAutoSend,
+                    threadId: thread.bac_id,
+                    enabled: !thread.autoSendEnabled,
+                  }),
+                );
+              }}
+            >
+              <span className="thread-autosend-dot" aria-hidden />
+              <span className="thread-autosend-label">auto-send</span>
+              <span className="thread-autosend-state">
+                {thread.autoSendEnabled ? 'on' : 'off'}
+              </span>
+            </button>
+          ) : null}
         </div>
-        {lifecyclePill?.label === 'Needs organize' &&
-        !dismissedSuggestions.has(thread.bac_id) ? (
+        {lifecyclePill?.label === 'Needs organize' && !dismissedSuggestions.has(thread.bac_id) ? (
           <NeedsOrganizeSuggestionRow
             threadId={thread.bac_id}
             companionPort={port.length > 0 ? Number(port) : null}
             bridgeKey={bridgeKey.length > 0 ? bridgeKey : null}
             cached={suggestionCache.get(thread.bac_id)}
-            onCache={(label, confidence) => {
+            workstreamFingerprint={workstreamFingerprint}
+            indexRebuilding={recallStatus === 'rebuilding' || recallStatus === 'stale'}
+            resolveLabel={resolveWorkstreamLabel}
+            onCache={(payload) => {
               setSuggestionCache((prev) => {
                 const next = new Map(prev);
-                next.set(thread.bac_id, { label, confidence });
+                next.set(thread.bac_id, payload);
+                return next;
+              });
+            }}
+            onClearCache={() => {
+              setSuggestionCache((prev) => {
+                if (!prev.has(thread.bac_id)) return prev;
+                const next = new Map(prev);
+                next.delete(thread.bac_id);
                 return next;
               });
             }}
@@ -1890,25 +2391,6 @@ const App = () => {
               });
             }}
           />
-        ) : null}
-        {viewMode === 'all' ? (
-          <button
-            type="button"
-            className="thread-ws-path mono"
-            title={
-              thread.primaryWorkstreamId === undefined
-                ? 'Switch to Ungrouped workstream view'
-                : 'Switch to this workstream'
-            }
-            onClick={(e) => {
-              e.stopPropagation();
-              focusThreadInWorkstream(thread);
-            }}
-          >
-            {thread.primaryWorkstreamId === undefined
-              ? 'Ungrouped'
-              : workstreamPath(thread.primaryWorkstreamId, state.workstreams)}
-          </button>
         ) : null}
         {parent !== undefined || thread.parentTitle !== undefined ? (
           <div className="row2 thread-lineage" title="Branched from a tracked thread">
@@ -1944,17 +2426,60 @@ const App = () => {
             </span>
           </div>
         ) : null}
+        {outgoingDispatches.length > 0 ? (
+          <ul className="thread-dispatched-list" aria-label="Outgoing dispatches">
+            {outgoingDispatches.map((d) => {
+              const linkedThreadId = state.dispatchLinks[d.bac_id];
+              const linkedThread =
+                linkedThreadId === undefined
+                  ? undefined
+                  : state.threads.find((t) => t.bac_id === linkedThreadId);
+              const targetLabel =
+                TARGET_PROVIDER_LABEL[d.target.provider] ?? d.target.provider;
+              const destTitle =
+                linkedThread?.title ??
+                (d.target.mode === 'auto-send' ? 'pending — new chat' : 'pending — paste it');
+              return (
+                <li key={d.bac_id} className="thread-dispatched-row">
+                  <span className="lineage-arrow">↗</span>
+                  <span className="thread-dispatched-target chip mono">{targetLabel}</span>
+                  {linkedThread !== undefined ? (
+                    <button
+                      type="button"
+                      className="btn-link thread-dispatched-name"
+                      title={`Open destination chat: ${linkedThread.title}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openTabForThread(linkedThread);
+                      }}
+                    >
+                      {destTitle}
+                    </button>
+                  ) : (
+                    <span className="thread-dispatched-name muted">{destTitle}</span>
+                  )}
+                  <span className="thread-dispatched-when mono">
+                    {formatRelative(d.createdAt)}
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+        ) : null}
         <div className="thread-actions row2">
           <button
             type="button"
-            className="btn-link"
+            className="btn-link thread-action-icon"
             title="Open the thread's tab (or reopen if closed)"
+            aria-label="Open thread tab"
             onClick={(e) => {
               e.stopPropagation();
               openTabForThread(thread);
             }}
           >
-            Open
+            <span className="icon-12" aria-hidden>
+              {Icons.arrowR}
+            </span>
           </button>
           {(() => {
             const requiresCompanion =
@@ -1967,50 +2492,39 @@ const App = () => {
               );
             };
             const sendDropdownOpen = sendToOpenFor === thread.bac_id;
-            const recentTarget = state.lastDispatchTargetByThread[thread.bac_id] as
-              | SendToTarget
-              | undefined;
             const menuOpen = actionMenuOpenFor === thread.bac_id;
             return (
               <>
-                <span className="send-to-anchor">
-                  <button
-                    type="button"
-                    className={'btn-link' + (requiresCompanion ? ' disabled-look' : '')}
-                    title={
-                      requiresCompanion
-                        ? 'Send is unavailable in local-only mode — click for setup steps'
-                        : 'Send this thread to another AI / coding agent / file'
+                <button
+                  type="button"
+                  className={
+                    'btn-link thread-action-icon' +
+                    (requiresCompanion ? ' disabled-look' : '')
+                  }
+                  title={
+                    requiresCompanion
+                      ? 'Send is unavailable in local-only mode — click for setup steps'
+                      : 'Send this thread to another AI / coding agent / file'
+                  }
+                  aria-haspopup="menu"
+                  aria-expanded={sendDropdownOpen}
+                  aria-label="Send to another AI or coding agent"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (requiresCompanion) {
+                      explainNeedsCompanion('Send');
+                      return;
                     }
-                    aria-haspopup="menu"
-                    aria-expanded={sendDropdownOpen}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      if (requiresCompanion) {
-                        explainNeedsCompanion('Send');
-                        return;
-                      }
-                      setSendToOpenFor(sendDropdownOpen ? null : thread.bac_id);
-                    }}
-                  >
-                    Send to ▾
-                  </button>
-                  {sendDropdownOpen ? (
-                    <SendToDropdown
-                      recentTarget={recentTarget}
-                      onPick={(target) => {
-                        handleSendToPick(thread, target);
-                      }}
-                      onCustomize={() => {
-                        setSendToOpenFor(null);
-                        setComposeThreadId(thread.bac_id);
-                      }}
-                      onClose={() => {
-                        setSendToOpenFor(null);
-                      }}
-                    />
-                  ) : null}
-                </span>
+                    setSendToOpenFor(sendDropdownOpen ? null : thread.bac_id);
+                  }}
+                >
+                  <span className="icon-12" aria-hidden>
+                    {Icons.send}
+                  </span>
+                  <span className="thread-action-caret" aria-hidden>
+                    ▾
+                  </span>
+                </button>
                 <span className="thread-overflow-anchor">
                   <button
                     type="button"
@@ -2039,13 +2553,20 @@ const App = () => {
                         role="menuitem"
                         onClick={() => {
                           setActionMenuOpenFor(null);
-                          setQueueComposeFor(
-                            queueComposeFor === thread.bac_id ? null : thread.bac_id,
-                          );
-                          setQueueDraft('');
+                          // Toggle so the menu item is the collapse
+                          // affordance when the queue pill is gone
+                          // (e.g. count just drained to 0).
+                          if (queueExpandFor === thread.bac_id) {
+                            setQueueExpandFor(null);
+                            setQueueDraft('');
+                          } else {
+                            setQueueExpandFor(thread.bac_id);
+                            setQueueDraft('');
+                            setQueueComposeAutoFocus(thread.bac_id);
+                          }
                         }}
                       >
-                        Queue follow-up
+                        {queueExpandFor === thread.bac_id ? 'Hide queue' : 'Queue follow-up'}
                       </button>
                       <button
                         type="button"
@@ -2090,6 +2611,7 @@ const App = () => {
                         <button
                           type="button"
                           role="menuitem"
+                          className="warn"
                           onClick={() => {
                             setActionMenuOpenFor(null);
                             updateTracking(thread.bac_id, 'stopped');
@@ -2115,72 +2637,62 @@ const App = () => {
               </>
             );
           })()}
-          {queuedCount > 0 ? (
-            <button
-              type="button"
-              className={'thread-autosend' + (thread.autoSendEnabled ? ' on' : '')}
-              aria-pressed={thread.autoSendEnabled === true}
-              title={
-                thread.autoSendEnabled
-                  ? 'Auto-send on — queued items ship into this chat one at a time, waiting for each reply.'
-                  : 'Auto-send off — turn on to drain queued follow-ups into this chat (per-provider opt-in lives in Settings).'
-              }
-              onClick={(e) => {
-                e.stopPropagation();
-                void runAction(() =>
-                  sendRequest({
-                    type: messageTypes.setThreadAutoSend,
-                    threadId: thread.bac_id,
-                    enabled: !thread.autoSendEnabled,
-                  }),
-                );
-              }}
-            >
-              <span className="thread-autosend-dot" aria-hidden />
-              <span className="thread-autosend-label">auto-send</span>
-              <span className="thread-autosend-state">{thread.autoSendEnabled ? 'on' : 'off'}</span>
-            </button>
-          ) : null}
         </div>
-        {queueComposeFor === thread.bac_id ? (
-          <form
-            className="thread-queue-compose"
-            onSubmit={(e) => {
-              e.preventDefault();
-              submitQueueFollowUp(thread.bac_id);
-            }}
-          >
-            <input
-              type="text"
-              autoFocus
-              className="mono"
-              placeholder="Ask next… (fires after this thread replies)"
-              value={queueDraft}
-              onChange={(e) => {
-                setQueueDraft(e.target.value);
+        {sendToOpenFor === thread.bac_id ? (
+          <div className="thread-send-to-inline">
+            <SendToDropdown
+              recentTarget={
+                state.lastDispatchTargetByThread[thread.bac_id] as SendToTarget | undefined
+              }
+              onPick={(target) => {
+                handleSendToPick(thread, target);
+              }}
+              onCustomize={() => {
+                setSendToOpenFor(null);
+                setComposeThreadId(thread.bac_id);
+              }}
+              onClose={() => {
+                setSendToOpenFor(null);
               }}
             />
-            <button
-              type="submit"
-              className="btn-link"
-              disabled={busy || queueDraft.trim().length === 0}
-            >
-              Add
-            </button>
-            <button
-              type="button"
-              className="btn-link"
-              onClick={() => {
-                setQueueComposeFor(null);
-                setQueueDraft('');
+          </div>
+        ) : null}
+        {expandedDraft !== null ? (
+          <div className="thread-review-draft">
+            <div className="thread-review-draft-head mono">
+              <span>review draft</span>
+              <span className="count">
+                · {String(expandedDraft.spans.length)} comment
+                {expandedDraft.spans.length === 1 ? '' : 's'}
+              </span>
+            </div>
+            <ReviewDraftFooter
+              draft={expandedDraft}
+              onDropSpan={(spanId) => {
+                dropReviewDraftSpan(thread.bac_id, spanId);
               }}
-            >
-              Cancel
-            </button>
-          </form>
+              onUpdate={(patch) => {
+                updateInlineReviewDraft(thread.bac_id, patch);
+              }}
+              onAddToQueue={() => {
+                addInlineReviewToQueue(thread.bac_id);
+              }}
+              onSendNow={() => {
+                sendInlineReviewNow(thread.bac_id);
+              }}
+              onDiscard={() => {
+                discardInlineReviewDraft(thread.bac_id);
+              }}
+            />
+          </div>
         ) : null}
         {queueExpanded ? (
           <ul className="thread-queue-list" aria-label="Queued follow-ups">
+            {pendingQueueItems.length === 0 ? (
+              <li className="queue-empty-hint mono">
+                no queued follow-ups · type below to stack one for after the next reply
+              </li>
+            ) : null}
             {pendingQueueItems.some((item) => item.lastError !== undefined) ? (
               <li className="queue-retry-all-row">
                 <button
@@ -2204,30 +2716,151 @@ const App = () => {
                 </button>
               </li>
             ) : null}
-            {pendingQueueItems.map((item, index) => (
-              <AutoSendQueueRow
-                key={item.bac_id}
-                item={item}
-                index={index}
-                total={pendingQueueItems.length}
-                providerLabel={providerLabel(thread.provider)}
-                copied={queueCopiedId === item.bac_id}
-                onCopy={() => {
-                  copyQueueItemText(item.bac_id, item.text);
+            {pendingQueueItems.map((item, index) => {
+              const itemDraggable = item.progress === undefined;
+              return (
+                <AutoSendQueueRow
+                  key={item.bac_id}
+                  item={item}
+                  index={index}
+                  total={pendingQueueItems.length}
+                  providerLabel={providerLabel(thread.provider)}
+                  copied={queueCopiedId === item.bac_id}
+                  onCopy={() => {
+                    copyQueueItemText(item.bac_id, item.text);
+                  }}
+                  onRetry={() => {
+                    void runAction(() =>
+                      sendRequest({
+                        type: messageTypes.retryAutoSend,
+                        queueItemId: item.bac_id,
+                      }),
+                    );
+                  }}
+                  onDismiss={() => {
+                    dismissQueueItem(item.bac_id);
+                  }}
+                  dnd={
+                    pendingQueueItems.length > 1
+                      ? {
+                          draggable: itemDraggable,
+                          dragOverActive:
+                            dragOverQueueItemId === item.bac_id &&
+                            draggedQueueItemId !== null &&
+                            draggedQueueItemId !== item.bac_id,
+                          onDragStart: (event) => {
+                            event.dataTransfer.effectAllowed = 'move';
+                            event.dataTransfer.setData('text/plain', item.bac_id);
+                            setDraggedQueueItemId(item.bac_id);
+                          },
+                          onDragEnd: () => {
+                            setDraggedQueueItemId(null);
+                            setDragOverQueueItemId(null);
+                          },
+                          onDragOver: (event) => {
+                            if (draggedQueueItemId === null) {
+                              return;
+                            }
+                            event.preventDefault();
+                            event.dataTransfer.dropEffect = 'move';
+                            if (dragOverQueueItemId !== item.bac_id) {
+                              setDragOverQueueItemId(item.bac_id);
+                            }
+                          },
+                          onDragLeave: () => {
+                            if (dragOverQueueItemId === item.bac_id) {
+                              setDragOverQueueItemId(null);
+                            }
+                          },
+                          onDrop: (event) => {
+                            event.preventDefault();
+                            const fromTransfer = event.dataTransfer.getData('text/plain');
+                            const sourceId =
+                              fromTransfer.length > 0
+                                ? fromTransfer
+                                : (draggedQueueItemId ?? '');
+                            setDraggedQueueItemId(null);
+                            setDragOverQueueItemId(null);
+                            if (sourceId.length === 0 || sourceId === item.bac_id) {
+                              return;
+                            }
+                            reorderQueueItem(pendingQueueItems, sourceId, item.bac_id);
+                          },
+                        }
+                      : undefined
+                  }
+                />
+              );
+            })}
+            <li
+              className={`queue-compose-row${
+                draggedQueueItemId !== null && dragOverQueueItemId === '__tail__'
+                  ? ' drag-over-tail'
+                  : ''
+              }`}
+              onDragOver={(event) => {
+                if (draggedQueueItemId === null) {
+                  return;
+                }
+                event.preventDefault();
+                event.dataTransfer.dropEffect = 'move';
+                if (dragOverQueueItemId !== '__tail__') {
+                  setDragOverQueueItemId('__tail__');
+                }
+              }}
+              onDragLeave={() => {
+                if (dragOverQueueItemId === '__tail__') {
+                  setDragOverQueueItemId(null);
+                }
+              }}
+              onDrop={(event) => {
+                event.preventDefault();
+                const fromTransfer = event.dataTransfer.getData('text/plain');
+                const sourceId =
+                  fromTransfer.length > 0 ? fromTransfer : (draggedQueueItemId ?? '');
+                setDraggedQueueItemId(null);
+                setDragOverQueueItemId(null);
+                if (sourceId.length === 0) {
+                  return;
+                }
+                reorderQueueItem(pendingQueueItems, sourceId, null);
+              }}
+            >
+              <form
+                className="thread-queue-compose"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  submitQueueFollowUp(thread.bac_id);
                 }}
-                onRetry={() => {
-                  void runAction(() =>
-                    sendRequest({
-                      type: messageTypes.retryAutoSend,
-                      queueItemId: item.bac_id,
-                    }),
-                  );
-                }}
-                onDismiss={() => {
-                  dismissQueueItem(item.bac_id);
-                }}
-              />
-            ))}
+              >
+                <input
+                  type="text"
+                  className="mono"
+                  placeholder="Ask next… (fires after this thread replies)"
+                  value={queueDraft}
+                  ref={(node) => {
+                    if (
+                      node !== null &&
+                      queueComposeAutoFocus === thread.bac_id &&
+                      document.activeElement !== node
+                    ) {
+                      node.focus();
+                      setQueueComposeAutoFocus(null);
+                    }
+                  }}
+                  onChange={(e) => {
+                    setQueueDraft(e.target.value);
+                  }}
+                />
+                <button
+                  type="submit"
+                  className="btn-link"
+                  disabled={busy || queueDraft.trim().length === 0}
+                >
+                  Add
+                </button>
+              </form>
+            </li>
           </ul>
         ) : null}
         {titleExpanded ? (
@@ -2256,7 +2889,13 @@ const App = () => {
                   <span className="thread-turn-text">
                     <TurnText text={turn.text} maxChars={200} />
                   </span>
-                  <span className="thread-turn-time mono">{formatRelative(turn.capturedAt)}</span>
+                  {/* No per-turn time stamp: providers don't expose
+                      stable per-message timestamps in their DOM, and
+                      capturedAt is "first seen by Sidetrack" not
+                      "AI replied at" — showing it as "X min ago"
+                      misleads users who captured the chat after the
+                      conversation. The thread-level "Last seen · X
+                      ago" already conveys the right signal. */}
                 </div>
               ))
             )}
@@ -2265,11 +2904,7 @@ const App = () => {
         <div className="thread-history">
           {historyOpen ? (
             <>
-              {threadNotes.length === 0 ? (
-                <span className="thread-history-empty">
-                  no notes yet — capture context as the thread evolves
-                </span>
-              ) : (
+              {threadNotes.length === 0 ? null : (
                 threadNotes.map((note) => (
                   <div key={note.bac_id} className="thread-history-item">
                     <span className="glyph" aria-hidden>
@@ -2443,29 +3078,45 @@ const App = () => {
         <div className="app-mark">
           <span className="glyph" aria-hidden />
           Sidetrack
+          {__DEV__ ? (
+            <span
+              className="app-mark-dev mono"
+              title="Development build — production omits this badge and the design-preview icon"
+            >
+              DEV
+            </span>
+          ) : null}
         </div>
-        <div className="view-tabs" role="tablist" aria-label="View">
+        <div className="view-tabs sp-tabs" role="tablist" aria-label="View">
           <button
             type="button"
             role="tab"
             aria-selected={viewMode === 'workstream'}
+            aria-label="Workstream"
             className={'view-tab' + (viewMode === 'workstream' ? ' on' : '')}
             onClick={() => {
               setViewMode('workstream');
             }}
           >
             Workstream
+            <span className="ct mono" aria-hidden>
+              {state.workstreams.length}
+            </span>
           </button>
           <button
             type="button"
             role="tab"
             aria-selected={viewMode === 'all'}
+            aria-label="All threads"
             className={'view-tab' + (viewMode === 'all' ? ' on' : '')}
             onClick={() => {
               setViewMode('all');
             }}
           >
             All threads
+            <span className="ct mono" aria-hidden>
+              {state.threads.length}
+            </span>
           </button>
         </div>
         <div className="app-actions">
@@ -2506,6 +3157,27 @@ const App = () => {
             >
               <circle cx="11" cy="11" r="7" />
               <line x1="21" y1="21" x2="16.65" y2="16.65" />
+            </svg>
+          </button>
+          <button
+            className="icon-btn"
+            title="Capture / track the current tab — adds it to your side panel as a tracked thread"
+            onClick={() => {
+              void runAction(() => sendRequest({ type: messageTypes.captureCurrentTab }));
+            }}
+            type="button"
+            aria-label="Capture current tab"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M12 5v14" />
+              <path d="M5 12h14" />
             </svg>
           </button>
           <button
@@ -2553,6 +3225,9 @@ const App = () => {
               <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
             </svg>
           </button>
+          {/* Design preview — always-on for now (was gated by __DEV__).
+              Re-gate once the surfaces it shows are wired into
+              production rendering. */}
           <button
             className="icon-btn"
             title="Design preview — v2 surfaces"
@@ -2595,6 +3270,91 @@ const App = () => {
             </svg>
           </button>
         </div>
+      </div>
+
+      {/* Vault + companion status pills (v2 .sp-status). Glance-able
+          health at the top so the user doesn't have to dive into
+          Settings to see whether the companion is reachable. */}
+      <div className="sp-status">
+        <span
+          className={
+            'sp-status-pill mono ' +
+            (state.companionStatus === 'vault-error' ? 'err' : 'ok')
+          }
+          title={
+            state.companionStatus === 'vault-error'
+              ? 'Vault: companion can\'t reach the configured folder'
+              : 'Vault: synced via companion'
+          }
+        >
+          <span
+            className={
+              'sp-status-dot ' +
+              (state.companionStatus === 'vault-error' ? 'red' : 'green')
+            }
+            aria-hidden
+          />
+          vault {state.companionStatus === 'vault-error' ? 'error' : 'connected'}
+        </span>
+        <span
+          className={
+            'sp-status-pill mono ' +
+            (state.companionStatus === 'connected'
+              ? 'ok'
+              : state.companionStatus === 'local-only'
+                ? 'warn'
+                : 'err')
+          }
+          title={`Companion: ${companionStatusLabel(state.companionStatus)}`}
+        >
+          <span
+            className={
+              'sp-status-dot ' +
+              (state.companionStatus === 'connected'
+                ? 'green'
+                : state.companionStatus === 'local-only'
+                  ? 'amber'
+                  : 'red')
+            }
+            aria-hidden
+          />
+          companion{' '}
+          {state.companionStatus === 'connected'
+            ? 'running'
+            : state.companionStatus === 'local-only'
+              ? 'local-only'
+              : 'down'}
+        </span>
+        {/* Recall pill — only shown when status is non-ready, so the
+            steady state stays clean. Lets the user see "indexing…"
+            after companion startup or a model change without having
+            to dig into the diagnostics panel. */}
+        {recallStatus !== null && recallStatus !== 'ready' ? (
+          <span
+            className={
+              'sp-status-pill mono ' +
+              (recallStatus === 'rebuilding' || recallStatus === 'empty' ? 'warn' : 'err')
+            }
+            title={
+              recallStatus === 'rebuilding'
+                ? 'Recall: indexing in background. Déjà-vu lookups will return matches once the rebuild completes.'
+                : recallStatus === 'empty'
+                  ? 'Recall: index has no entries yet. Capture some threads to populate it.'
+                  : recallStatus === 'missing'
+                    ? 'Recall: no index file. The companion will rebuild it on the next startup.'
+                    : 'Recall: index is stale (model or schema mismatch). Open Capture health and click Re-index.'
+            }
+          >
+            <span
+              className={
+                'sp-status-dot ' +
+                (recallStatus === 'rebuilding' || recallStatus === 'empty' ? 'amber' : 'red')
+              }
+              aria-hidden
+            />
+            recall {recallStatus === 'rebuilding' ? 'indexing' : recallStatus}
+          </span>
+        ) : null}
       </div>
 
       {viewMode === 'workstream' ? (
@@ -2709,7 +3469,7 @@ const App = () => {
             setWsPickerOpen(false);
             setWsPickerCreateMode(false);
           }}
-          onCreate={(title, parentId) => {
+          onCreate={(title, parentId, description) => {
             void runAction(async () => {
               return await sendRequest({
                 type: messageTypes.createWorkstream,
@@ -2717,6 +3477,9 @@ const App = () => {
                   title,
                   ...(parentId === null ? {} : { parentId }),
                   privacy: 'shared',
+                  ...(description !== undefined && description.length > 0
+                    ? { description }
+                    : {}),
                 },
               });
             }).then(() => {
@@ -2747,17 +3510,13 @@ const App = () => {
                 }}
                 onAccept={() => {
                   void markStatus(offer.tabId, 'accepted').then(() => {
-                    setPendingCodingOffers((prev) =>
-                      prev.filter((o) => o.tabId !== offer.tabId),
-                    );
+                    setPendingCodingOffers((prev) => prev.filter((o) => o.tabId !== offer.tabId));
                     setCodingAttachOpen(true);
                   });
                 }}
                 onDismiss={() => {
                   void markStatus(offer.tabId, 'declined').then(() => {
-                    setPendingCodingOffers((prev) =>
-                      prev.filter((o) => o.tabId !== offer.tabId),
-                    );
+                    setPendingCodingOffers((prev) => prev.filter((o) => o.tabId !== offer.tabId));
                   });
                 }}
               />
@@ -2853,7 +3612,9 @@ const App = () => {
                     </span>
                     <span className="thread-bucket-count mono">{String(list.length)}</span>
                   </button>
-                  {collapsed ? null : <div className="thread-list">{list.map(renderThreadRow)}</div>}
+                  {collapsed ? null : (
+                    <div className="thread-list">{list.map(renderThreadRow)}</div>
+                  )}
                 </div>
               );
             })}
@@ -2973,10 +3734,13 @@ const App = () => {
               }}
               onOpenTarget={(id) => {
                 // For LINKED rows: jump to the destination thread (if
-                // we still track it). For UNLINKED rows the dedicated
-                // Copy / Dispatch buttons handle the action; a click
-                // on the target chip opens the viewer modal instead
-                // of doing anything destructive.
+                // we still track it). For UNLINKED rows: open the
+                // customize composer pre-populated from the source
+                // thread (auto-send on by default for AI providers
+                // per the per-provider opt-in). The new Dispatch
+                // button (always-visible) handles the no-customize
+                // fast path; the view button still exists if the
+                // user just wants to inspect the body.
                 const dispatch = state.recentDispatches.find((d) => d.bac_id === id);
                 if (dispatch === undefined) {
                   return;
@@ -2989,20 +3753,28 @@ const App = () => {
                     return;
                   }
                 }
-                // No link → open viewer (read-only, with copy +
-                // download). Avoids the surprise of opening a fresh
-                // empty chat just from clicking the target chip.
+                if (dispatch.sourceThreadId !== undefined) {
+                  setComposeThreadId(dispatch.sourceThreadId);
+                  return;
+                }
+                // Source thread untracked / vanished — fall back to
+                // the read-only viewer.
                 setViewingDispatchId(id);
               }}
               onView={(id) => {
                 setViewingDispatchId(id);
               }}
               onCopy={(id) => {
-                // Paste-mode action: re-copy + open new chat.
+                // Paste-mode action: re-copy + open new chat. Use the
+                // unredacted body (cached locally on submit) so the
+                // user pastes the same text the matcher will compare
+                // against — see dispatchLinking.ts and the viewer
+                // modal below.
                 const dispatch = state.recentDispatches.find((d) => d.bac_id === id);
                 if (dispatch === undefined) {
                   return;
                 }
+                const bodyToShip = state.dispatchOriginals[id] ?? dispatch.body;
                 const url = lookupChatUrl(dispatch.target.provider);
                 if (url === undefined) {
                   // Export / external target → open viewer instead.
@@ -3010,7 +3782,7 @@ const App = () => {
                   return;
                 }
                 void navigator.clipboard
-                  .writeText(dispatch.body)
+                  .writeText(bodyToShip)
                   .then(() => {
                     setError(
                       `Re-copied packet to clipboard. Opening ${TARGET_PROVIDER_LABEL[dispatch.target.provider] ?? dispatch.target.provider} — paste to send.`,
@@ -3032,6 +3804,7 @@ const App = () => {
                 if (dispatch === undefined) {
                   return;
                 }
+                const bodyToShip = state.dispatchOriginals[id] ?? dispatch.body;
                 const url = lookupChatUrl(dispatch.target.provider);
                 if (url === undefined) {
                   setViewingDispatchId(id);
@@ -3042,13 +3815,27 @@ const App = () => {
                     type: messageTypes.dispatchAutoSendInNewTab,
                     dispatchId: id,
                     url,
-                    body: dispatch.body,
+                    body: bodyToShip,
                   });
                   setError(
                     `Opening ${TARGET_PROVIDER_LABEL[dispatch.target.provider] ?? dispatch.target.provider} and auto-sending the packet…`,
                   );
                   return await sendRequest({ type: messageTypes.getWorkboardState });
                 });
+              }}
+              showArchived={showArchivedDispatches}
+              onToggleShowArchived={() => {
+                setShowArchivedDispatches((prev) => !prev);
+              }}
+              onArchive={(id) => {
+                void runAction(() =>
+                  sendRequest({ type: messageTypes.archiveDispatch, dispatchId: id }),
+                );
+              }}
+              onUnarchive={(id) => {
+                void runAction(() =>
+                  sendRequest({ type: messageTypes.unarchiveDispatch, dispatchId: id }),
+                );
               }}
             />
           </>
@@ -3196,8 +3983,8 @@ const App = () => {
             ? { defaultKind: dispatchKindToUiPacketKind(settings.defaultPacketKind) }
             : {})}
           scope={{
-            label: composeThread.title,
-            meta: `${providerLabel(composeThread.provider)} · ${formatRelative(composeThread.lastSeenAt)}`,
+            label: workstreamPath(composeWorkstream?.bac_id, state.workstreams),
+            meta: `${composeThread.title} · ${providerLabel(composeThread.provider)} · ${formatRelative(composeThread.lastSeenAt)}`,
             sourceThreadId: composeThread.bac_id,
             threadUrl: composeThread.threadUrl,
             providerLabel: providerLabel(composeThread.provider),
@@ -3207,6 +3994,10 @@ const App = () => {
               capturedAt: t.capturedAt,
             })),
             ...(composeWorkstream !== undefined ? { workstreamId: composeWorkstream.bac_id } : {}),
+          }}
+          scopeSuggestions={composeScopeSuggestionsByThread.get(composeThread.bac_id) ?? []}
+          onScopeChange={(workstreamId) => {
+            setComposeWorkstreamOverrideId(workstreamId);
           }}
           onCancel={() => {
             setComposeThreadId(null);
@@ -3223,7 +4014,33 @@ const App = () => {
             TARGET_PROVIDER_LABEL[mapUiTarget(pendingDispatch.target)] ??
             mapUiTarget(pendingDispatch.target)
           }
+          sourceLabel={(() => {
+            // Surface the source thread's provider + model in the
+            // confirm modal subtitle so the user sees which chat the
+            // context came from. Display-only.
+            if (pendingDispatch.sourceThreadId === undefined) return undefined;
+            const sourceThread = state.threads.find(
+              (t) => t.bac_id === pendingDispatch.sourceThreadId,
+            );
+            if (sourceThread === undefined) return undefined;
+            const provLabel =
+              TARGET_PROVIDER_LABEL[providerIdToDispatchProvider(sourceThread.provider)] ??
+              sourceThread.provider;
+            const model = sourceThread.selectedModel;
+            return model === undefined || model.length === 0
+              ? provLabel
+              : `${provLabel} · ${model}`;
+          })()}
           body={pendingDispatch.body}
+          autoSendOptedIn={(() => {
+            const t = pendingDispatch.target;
+            if (t === 'markdown' || t === 'notebook') return false;
+            if (t === 'codex' || t === 'claude_code' || t === 'cursor') return false;
+            const provider = mapUiTarget(t);
+            return (
+              settings !== null && isProviderWithOptIn(provider) && settings.autoSendOptIn[provider]
+            );
+          })()}
           dispatchKind={(() => {
             // Map the packet target → side-effect lane the modal
             // uses for its "Will ..." header.
@@ -3466,6 +4283,15 @@ const App = () => {
             if (dispatch === undefined) {
               return null;
             }
+            // The companion stores a redacted body (PII / API keys
+            // → [category] tokens). The matcher in dispatchLinking.ts
+            // matches against the *unredacted* body cached locally on
+            // submit — so the viewer must show + copy the unredacted
+            // form too. Otherwise the user pastes the redacted text,
+            // the matcher's needle (unredacted) never substring-hits
+            // the captured turn, and the dispatch never links.
+            const displayBody =
+              state.dispatchOriginals[dispatch.bac_id] ?? dispatch.body;
             const targetLabel =
               TARGET_PROVIDER_LABEL[dispatch.target.provider] ?? dispatch.target.provider;
             const linkedThreadId = state.dispatchLinks[dispatch.bac_id];
@@ -3506,7 +4332,7 @@ const App = () => {
                       ✕
                     </button>
                   </div>
-                  <textarea className="dispatch-viewer-body mono" value={dispatch.body} readOnly />
+                  <textarea className="dispatch-viewer-body mono" value={displayBody} readOnly />
                   {diagnostic === undefined ? null : (
                     <details className="dispatch-diagnostic">
                       <summary>Why didn't this link?</summary>
@@ -3535,7 +4361,7 @@ const App = () => {
                         const safeTitle = dispatch.title
                           .replace(/[^a-z0-9-_]+/gi, '-')
                           .slice(0, 80);
-                        downloadAsFile(`${safeTitle || 'sidetrack-dispatch'}.md`, dispatch.body);
+                        downloadAsFile(`${safeTitle || 'sidetrack-dispatch'}.md`, displayBody);
                         setError(`Re-downloaded ${safeTitle || 'sidetrack-dispatch'}.md.`);
                       }}
                     >
@@ -3546,7 +4372,7 @@ const App = () => {
                       className="btn btn-primary"
                       onClick={() => {
                         void navigator.clipboard
-                          .writeText(dispatch.body)
+                          .writeText(displayBody)
                           .then(() => {
                             setError('Copied dispatch body to clipboard.');
                           })
@@ -3568,6 +4394,7 @@ const App = () => {
         <Wizard
           bridgeKey={bridgeKey}
           companionReachable={state.companionStatus === 'connected'}
+          connectionError={wizardConnectionError}
           onClose={() => {
             // Lock the wizard open during first-launch (no Skip / Done
             // pressed yet) so users can't accidentally ESC out of setup.
@@ -3582,8 +4409,12 @@ const App = () => {
               );
             });
           }}
-          onBridgeKeyChange={setBridgeKey}
+          onBridgeKeyChange={(value) => {
+            setWizardConnectionError(null);
+            setBridgeKey(value);
+          }}
           onSkip={() => {
+            setWizardConnectionError(null);
             void completeSetup(false).catch((setupError: unknown) => {
               setError(
                 setupError instanceof Error ? setupError.message : 'Could not finish setup.',
@@ -3653,6 +4484,7 @@ const App = () => {
           localPreferences={{
             autoTrack: state.settings.autoTrack,
             vaultPath: state.vaultPath ?? '',
+            notifyOnQueueComplete: state.settings.notifyOnQueueComplete,
           }}
           companionConfigured={bridgeKey.length > 0}
           workstreams={state.workstreams}
@@ -3799,8 +4631,32 @@ interface NeedsOrganizeSuggestionRowProps {
   readonly threadId: string;
   readonly companionPort: number | null;
   readonly bridgeKey: string | null;
-  readonly cached?: { readonly label: string; readonly confidence: number };
-  readonly onCache: (label: string, confidence: number) => void;
+  readonly cached?: {
+    readonly workstreamId: string;
+    readonly label: string;
+    readonly confidence: number;
+  };
+  // Stable string that changes whenever the workstream graph
+  // changes (counts, revisions, members). The fetch effect depends
+  // on it, so any workstream mutation invalidates the cached
+  // suggestion automatically.
+  readonly workstreamFingerprint: string;
+  // True while the recall index is being rebuilt (model swap,
+  // schema change, or empty index). Clicking ↻ during this window
+  // returns scores against a partially-rebuilt index — the row
+  // would flip every few seconds as new entries land. We pause the
+  // fetch and surface a clear "indexing" hint instead, so the user
+  // doesn't read the noise as instability. The effect re-runs once
+  // this flips false (rebuild settled).
+  readonly indexRebuilding: boolean;
+  // Resolves a workstreamId to its display label (`workstreamPath`
+  // semantics). Threaded in so the row shows real names instead of
+  // a bac_id slice.
+  readonly resolveLabel: (workstreamId: string) => string;
+  readonly onCache: (
+    payload: { readonly workstreamId: string; readonly label: string; readonly confidence: number },
+  ) => void;
+  readonly onClearCache: () => void;
   readonly onAccept: (workstreamId: string) => void;
   readonly onPickManual: () => void;
   readonly onDismiss: () => void;
@@ -3811,68 +4667,129 @@ function NeedsOrganizeSuggestionRow({
   companionPort,
   bridgeKey,
   cached,
+  workstreamFingerprint,
+  indexRebuilding,
+  resolveLabel,
   onCache,
+  onClearCache,
   onAccept,
   onPickManual,
   onDismiss,
 }: NeedsOrganizeSuggestionRowProps) {
-  const [suggestion, setSuggestion] = useState<
-    { readonly workstreamId: string; readonly label: string; readonly confidence: number } | null
-  >(
-    cached !== undefined
-      ? {
-          workstreamId: '',
-          label: cached.label,
-          confidence: cached.confidence,
-        }
-      : null,
-  );
+  // Render the cached value immediately; the fetch effect below
+  // always runs (stale-while-revalidate) so a subsequent mutation
+  // on the companion side propagates without forcing a side-panel
+  // reload. If the user explicitly hits the refresh icon we clear
+  // both the local state AND the parent cache and re-fetch.
+  const [suggestion, setSuggestion] = useState<{
+    readonly workstreamId: string;
+    readonly label: string;
+    readonly confidence: number;
+  } | null>(cached ?? null);
+  const [refreshTick, setRefreshTick] = useState(0);
+  const [pending, setPending] = useState(false);
 
   useEffect(() => {
-    if (cached !== undefined) return undefined;
     if (companionPort === null || bridgeKey === null) return undefined;
+    // Suppress fetches while the recall index is rebuilding —
+    // partially-rebuilt index gives oscillating scores and the user
+    // reads the flicker as instability. The deps below include
+    // `indexRebuilding`, so the fetch fires automatically the
+    // moment the rebuild settles to 'ready'.
+    if (indexRebuilding) {
+      setPending(true);
+      return undefined;
+    }
     let cancelled = false;
+    setPending(true);
     void (async () => {
       try {
         const url = `http://127.0.0.1:${String(companionPort)}/v1/suggestions/thread/${threadId}?limit=1`;
         const response = await fetch(url, { headers: { 'x-bac-bridge-key': bridgeKey } });
-        if (!response.ok) return;
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled mutated by cleanup
+        if (cancelled || !response.ok) return;
+        // Server shape: { data: Suggestion[] } — `data` is the
+        // ranked array DIRECTLY, not `{ items: Suggestion[] }`.
+        // The previous parser unwrapped `body.data?.items?.[0]`,
+        // which silently returned undefined and cleared the
+        // suggestion even when the companion replied with a real
+        // top match. Confirmed via scripts/raw-suggest.mjs against
+        // a live companion (score 0.50, lex 0.67, vec 0.60).
         const body = (await response.json()) as {
-          readonly data?: {
-            readonly items?: readonly {
-              readonly workstreamId: string;
-              readonly score: number;
-            }[];
-          };
+          readonly data?: readonly {
+            readonly workstreamId: string;
+            readonly score: number;
+          }[];
         };
-        const top = body.data?.items?.[0];
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled mutated by closure on cleanup
-        if (top === undefined || cancelled) return;
-        const label = `workstream ${top.workstreamId.slice(0, 12)}`;
-        setSuggestion({ workstreamId: top.workstreamId, label, confidence: top.score });
-        onCache(label, top.score);
+        const top = body.data?.[0];
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled mutated by cleanup
+        if (cancelled) return;
+        if (top === undefined) {
+          // No suggestion above threshold any more — clear so the
+          // row falls back to the manual-pick affordance.
+          setSuggestion(null);
+          return;
+        }
+        const label = resolveLabel(top.workstreamId);
+        const next = { workstreamId: top.workstreamId, label, confidence: top.score };
+        setSuggestion(next);
+        onCache(next);
       } catch {
         // Silent — empty render
+      } finally {
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled mutated by cleanup
+        if (!cancelled) setPending(false);
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [companionPort, bridgeKey, cached, threadId, onCache]);
+  }, [
+    companionPort,
+    bridgeKey,
+    threadId,
+    onCache,
+    resolveLabel,
+    workstreamFingerprint,
+    indexRebuilding,
+    refreshTick,
+  ]);
 
-  if (suggestion === null) return null;
+  // Always render the row even when the companion has no automatic
+  // suggestion above threshold — surface the manual picker so the
+  // user has a path to file the thread without hunting for the
+  // workstream chip elsewhere.
+  const hasAuto = suggestion !== null;
+  // While the index is rebuilding, scores oscillate as new turns
+  // land. Show a clear "indexing…" hint instead of the score so
+  // the user understands the suggestion will be accurate again
+  // shortly. The fetch effect re-fires automatically when
+  // indexRebuilding flips false.
+  const suggestedLabel = indexRebuilding
+    ? 'Indexing — suggestions paused'
+    : hasAuto
+      ? suggestion.label
+      : 'Pick a workstream…';
   return (
     <NeedsOrganizeSuggestion
-      suggestedLabel={suggestion.label}
-      confidence={suggestion.confidence}
+      suggestedLabel={suggestedLabel}
+      confidence={hasAuto && !indexRebuilding ? suggestion.confidence : 0}
+      pending={pending || indexRebuilding}
       onAccept={() => {
-        if (suggestion.workstreamId.length > 0) {
+        if (hasAuto && suggestion.workstreamId.length > 0) {
           onAccept(suggestion.workstreamId);
         } else {
           onPickManual();
         }
       }}
       onPickManual={onPickManual}
+      onRefresh={() => {
+        // Clearing the parent cache then bumping refreshTick forces
+        // the effect to re-run with no cached fallback to render.
+        onClearCache();
+        setSuggestion(null);
+        setRefreshTick((tick) => tick + 1);
+      }}
       onDismiss={onDismiss}
     />
   );
@@ -3949,7 +4866,11 @@ interface WorkstreamPickerProps {
   readonly parentForNew: string | null;
   readonly onClose: () => void;
   readonly onSelect: (id: string | null) => void;
-  readonly onCreate: (title: string, parentId: string | null) => void;
+  readonly onCreate: (
+    title: string,
+    parentId: string | null,
+    description?: string,
+  ) => void;
 }
 
 function WorkstreamPicker({
@@ -3965,6 +4886,7 @@ function WorkstreamPicker({
   const [query, setQuery] = useState('');
   const [creating, setCreating] = useState(createMode);
   const [draftTitle, setDraftTitle] = useState('');
+  const [draftDescription, setDraftDescription] = useState('');
 
   const matches = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -4036,8 +4958,9 @@ function WorkstreamPicker({
               if (trimmed.length === 0) {
                 return;
               }
-              onCreate(trimmed, parentForNew);
+              onCreate(trimmed, parentForNew, draftDescription.trim());
               setDraftTitle('');
+              setDraftDescription('');
               setCreating(false);
             }}
           >
@@ -4053,6 +4976,20 @@ function WorkstreamPicker({
                 setDraftTitle(e.target.value);
               }}
             />
+            {/* Optional description — flows into the suggester's
+                lexical match + cold-start centroid, so multi-language
+                or topic-keyword hints land here. Keep it short:
+                "travel hotel hiking 旅游 酒店 徒步" is enough to
+                attract foreign-language threads. */}
+            <textarea
+              className="ws-picker-create-input"
+              placeholder="Description / keywords (optional, helps auto-match — multi-language ok)"
+              value={draftDescription}
+              rows={2}
+              onChange={(e) => {
+                setDraftDescription(e.target.value);
+              }}
+            />
             <button type="submit" className="btn btn-primary">
               Create
             </button>
@@ -4062,6 +4999,7 @@ function WorkstreamPicker({
               onClick={() => {
                 setCreating(false);
                 setDraftTitle('');
+                setDraftDescription('');
               }}
             >
               Cancel

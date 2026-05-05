@@ -18,7 +18,7 @@
 //   in the CfT window and sign in. Cookies persist in the profile dir
 //   below; subsequent runs reuse them.
 
-import { mkdir, readdir, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -29,12 +29,13 @@ import { fileURLToPath } from 'node:url';
 const packageRoot = path.resolve(fileURLToPath(new URL('../', import.meta.url)));
 const extensionPath =
   process.env.SIDETRACK_EXTENSION_PATH ?? path.join(packageRoot, '.output/chrome-mv3');
+const idFile = path.join(packageRoot, '.output/cdp-extension-id');
 
 const expandTilde = (input) =>
   input.startsWith('~') ? path.join(homedir(), input.slice(1).replace(/^[/\\]/, '')) : input;
 
 const userDataDir = expandTilde(
-  process.env.SIDETRACK_USER_DATA_DIR ?? '~/.sidetrack-test-profile-cft',
+  process.env.SIDETRACK_USER_DATA_DIR ?? '~/.sidetrack-test-profile',
 );
 const port = process.env.SIDETRACK_E2E_CDP_PORT ?? '9222';
 
@@ -85,6 +86,7 @@ const findChromeForTesting = async () => {
 const { binary, channel } = await findChromeForTesting();
 
 await mkdir(userDataDir, { recursive: true });
+await rm(idFile, { force: true });
 
 console.log(`[chrome-debug] chrome binary  : ${binary}`);
 console.log(`[chrome-debug] channel        : ${channel}`);
@@ -110,6 +112,12 @@ console.log('');
 const args = [
   `--user-data-dir=${userDataDir}`,
   `--remote-debugging-port=${port}`,
+  // Allow CDP WebSocket connections from any origin so external
+  // automation scripts (Playwright, custom CDP drivers) can attach.
+  // Recent Chrome versions reject ws upgrades from non-default
+  // origins by default; without this flag, /devtools/page/<id>
+  // returns 403 even from localhost.
+  '--remote-allow-origins=*',
   `--disable-extensions-except=${extensionPath}`,
   `--load-extension=${extensionPath}`,
   '--no-first-run',
@@ -138,16 +146,18 @@ child.on('exit', (code, signal) => {
 // the extension ID to .output/cdp-extension-id so the spec runner
 // doesn't have to guess. MV3 workers go dormant after ~30s idle, so
 // the spec wakes the worker by opening chrome-extension://<id>/sidepanel.html.
-const idFile = path.join(packageRoot, '.output/cdp-extension-id');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 (async () => {
   for (let attempt = 0; attempt < 60; attempt += 1) {
     await sleep(1_000);
     try {
       const list = await fetch(`http://localhost:${port}/json/list`).then((r) => r.json());
-      const sw = list.find(
+      const serviceWorkers = list.filter(
         (t) => t.type === 'service_worker' && (t.url ?? '').startsWith('chrome-extension://'),
       );
+      const sw =
+        serviceWorkers.find((t) => (t.url ?? '').endsWith('/background.js')) ??
+        serviceWorkers[0];
       if (sw === undefined) continue;
       const match = /^chrome-extension:\/\/([^/]+)\//u.exec(sw.url);
       if (match === null) continue;

@@ -240,8 +240,8 @@ describe('live side-panel App wiring', () => {
       fireEvent.mouseEnter(threadRow);
     }
 
-    // Click "Send to ▾".
-    const sendToBtn = await screen.findByRole('button', { name: /Send to ▾/ });
+    // Click the Send-to action (icon-only button; matched by aria-label).
+    const sendToBtn = await screen.findByRole('button', { name: /Send to another AI/i });
     fireEvent.click(sendToBtn);
 
     // Dropdown opens with sectioned options.

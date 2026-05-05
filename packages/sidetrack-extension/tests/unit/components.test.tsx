@@ -54,7 +54,7 @@ describe('UX skeleton components — render-without-crash + key text present', (
     // default intent = "Ask another AI" so framing field renders.
     expect(screen.getByRole('button', { name: 'Ask another AI' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Hand to a coding agent' })).toBeInTheDocument();
-    expect(screen.getByText('Web-to-AI checklist')).toBeInTheDocument();
+    expect(screen.getByText('Critique')).toBeInTheDocument();
     // Footer is now a primary Dispatch + a split-button caret. Copy /
     // Save live in the menu, opened via the caret — they're not in the
     // initial DOM.
@@ -62,7 +62,7 @@ describe('UX skeleton components — render-without-crash + key text present', (
     expect(screen.getByRole('button', { name: /More packet actions/ })).toBeInTheDocument();
   });
 
-  it('DispatchConfirm renders all four §24.10 safety guards (clean state)', () => {
+  it('DispatchConfirm renders all four safety guards (clean state)', () => {
     render(
       <DispatchConfirm
         target="Claude"
@@ -76,7 +76,7 @@ describe('UX skeleton components — render-without-crash + key text present', (
         onConfirm={noop}
       />,
     );
-    // SafetyChainSummary collapses the four §24.10 checks into a single
+    // SafetyChainSummary collapses the four checks into a single
     // summary line. Clean state → "checks ok" header (no "redaction" pip
     // in warn state). Regression guard for the "0 items removed — 1
     // GitHub token, 1 email" contradictory copy bug.
@@ -88,7 +88,14 @@ describe('UX skeleton components — render-without-crash + key text present', (
     expect(screen.getAllByText(/token budget/i).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/screen-share-safe/i).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/injection scrub/i).length).toBeGreaterThan(0);
-    expect(screen.getByText(/Paste mode is locked per §24.10/)).toBeInTheDocument();
+    // Mode pills are present; auto-send is locked when not opted-in.
+    expect(screen.getByRole('button', { name: /Paste mode/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Auto-send/ })).toBeDisabled();
+    // Internal section markers should never bleed into user-visible
+    // copy. Regression guard for the §24.10 / ADR-0001 leaks the user
+    // flagged.
+    expect(screen.queryByText(/§24\.10/)).toBeNull();
+    expect(screen.queryByText(/ADR-0001/)).toBeNull();
   });
 
   it('DispatchConfirm renders the actual packet body in the preview', () => {
@@ -212,6 +219,9 @@ describe('UX skeleton components — render-without-crash + key text present', (
         onReadClipboard={readClipboard}
       />,
     );
+    // Vault step is now first after Welcome; advance twice to reach
+    // the Companion step.
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     expect(screen.getByText(/Waiting for companion/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
@@ -231,6 +241,10 @@ describe('UX skeleton components — render-without-crash + key text present', (
         onReadClipboard={readClipboard}
       />,
     );
+    // Vault step is now first after Welcome (vaultPath defaults to
+    // '~/Documents/Sidetrack-vault' so the npx command can render
+    // it). Next twice → companion step.
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     fireEvent.click(screen.getByRole('button', { name: 'Paste from clipboard' }));
     await vi.waitFor(() => {
@@ -251,10 +265,55 @@ describe('UX skeleton components — render-without-crash + key text present', (
         onReadClipboard={readClipboard}
       />,
     );
+    // Vault step is now first after Welcome (vaultPath defaults to
+    // '~/Documents/Sidetrack-vault' so the npx command can render
+    // it). Next twice → companion step.
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     fireEvent.click(screen.getByRole('button', { name: 'Paste from clipboard' }));
-    expect(await screen.findByText(/doesn't look like a bridge key/)).toBeInTheDocument();
+    expect(await screen.findByText(/Bridge key malformed/)).toBeInTheDocument();
     expect(onBridgeKeyChange).not.toHaveBeenCalled();
+  });
+
+  it('Wizard companion step names missing and malformed bridge keys before continuing', () => {
+    const onBridgeKeyChange = vi.fn();
+    const renderWizard = (bridgeKey = '') => (
+      <Wizard
+        bridgeKey={bridgeKey}
+        onClose={noop}
+        onFinish={noop}
+        onBridgeKeyChange={onBridgeKeyChange}
+        onPingCompanion={vi.fn().mockResolvedValue('unreachable' as const)}
+        onReadClipboard={vi.fn().mockResolvedValue('')}
+      />
+    );
+    const { rerender } = render(renderWizard());
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText(/Bridge key missing/)).toBeInTheDocument();
+
+    fireEvent.change(screen.getByPlaceholderText(/bridge key/i), { target: { value: 'short' } });
+    rerender(renderWizard('short'));
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText(/Bridge key malformed/)).toBeInTheDocument();
+    expect(onBridgeKeyChange).toHaveBeenCalledWith('short');
+  });
+
+  it('Wizard returns to the companion step when the bridge key is rejected', async () => {
+    render(
+      <Wizard
+        bridgeKey={'a'.repeat(43)}
+        connectionError="Bridge key rejected — this companion is running with a different vault key."
+        onClose={noop}
+        onFinish={noop}
+        onPingCompanion={vi.fn().mockResolvedValue('unreachable' as const)}
+        onReadClipboard={vi.fn().mockResolvedValue('')}
+      />,
+    );
+    expect(await screen.findByText(/Bridge key rejected/)).toBeInTheDocument();
+    expect(screen.getByPlaceholderText(/bridge key/i)).toBeInTheDocument();
   });
 
   it('CodingAttach renders the handoff modal with workstream picker', () => {

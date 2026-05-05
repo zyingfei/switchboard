@@ -16,7 +16,19 @@ export type DispatchTargetProvider =
   | 'cursor'
   | 'other';
 
-export type DispatchStatus = 'queued' | 'sent' | 'replied' | 'noted' | 'pending' | 'failed';
+// 'archived' is a UI-only flag: archived dispatches are hidden from
+// the default Recent Dispatches list but still recorded so the user
+// can show + reopen them. The companion's review of dispatch lifecycle
+// (sent / replied / noted / failed) is unaffected — archived rows
+// keep whatever stage they reached.
+export type DispatchStatus =
+  | 'queued'
+  | 'sent'
+  | 'replied'
+  | 'noted'
+  | 'pending'
+  | 'failed'
+  | 'archived';
 
 export type DispatchMode = 'paste' | 'auto-send';
 

@@ -67,9 +67,17 @@ export interface DispatchLinkInput {
   readonly capturedAtMs: number;
   readonly recentDispatches: readonly DispatchEventRecord[];
   // Existing dispatchId → threadId map. We skip dispatches that
-  // already have a link (they belong to whatever thread we matched
-  // them to earlier).
+  // already have a link to a *live* thread; orphaned links (the
+  // linked thread was wiped from local storage or got a new bac_id)
+  // are NOT a reason to skip — they should be re-linked to the
+  // current thread when the prefix matches. The `liveThreadIds`
+  // set lets the matcher tell which links are still valid.
   readonly existingLinks: Readonly<Partial<Record<string, string>>>;
+  // bac_ids of every thread currently in chrome.storage. A linked
+  // dispatch whose threadId is NOT in this set is treated as
+  // unlinked — its old destination thread is gone (storage wipe,
+  // companion bac_id reissue) and the matcher is free to relink.
+  readonly liveThreadIds?: ReadonlySet<string>;
   // Optional override map: dispatchId → unredacted body. When
   // provided, the matcher uses this body for prefix matching
   // instead of the stored (redacted) DispatchEventRecord.body.
@@ -122,13 +130,29 @@ export const tryLinkCapturedThread = (input: DispatchLinkInput): DispatchLinkDia
       reason = reason === 'no-prefix-match' ? 'provider-mismatch' : reason;
       continue;
     }
-    const age = input.capturedAtMs - Date.parse(dispatch.createdAt);
-    if (!Number.isFinite(age) || age < 0 || age > MATCH_WINDOW_MS) {
-      reason = reason === 'no-prefix-match' ? 'window-expired' : reason;
-      continue;
-    }
     const linkedTo = input.existingLinks[dispatch.bac_id];
-    if (linkedTo !== undefined && linkedTo !== input.threadId) {
+    const isOrphanRelink =
+      linkedTo !== undefined &&
+      linkedTo !== input.threadId &&
+      input.liveThreadIds !== undefined &&
+      !input.liveThreadIds.has(linkedTo);
+    // Time-window gate exists to prevent false positives: a user
+    // pasting a generic message into a chat that happens to match
+    // an old dispatch's first 60 chars. For orphan re-links the
+    // dispatch already matched once before — we're not creating a
+    // new association, we're healing a broken one — so the window
+    // shouldn't cut us off. Skip the window check in that case.
+    if (!isOrphanRelink) {
+      const age = input.capturedAtMs - Date.parse(dispatch.createdAt);
+      if (!Number.isFinite(age) || age < 0 || age > MATCH_WINDOW_MS) {
+        reason = reason === 'no-prefix-match' ? 'window-expired' : reason;
+        continue;
+      }
+    }
+    if (linkedTo !== undefined && linkedTo !== input.threadId && !isOrphanRelink) {
+      // Skip dispatches already linked to a different LIVE thread.
+      // (Orphan re-links handled above — they fall through to
+      // candidate counting.)
       reason = reason === 'no-prefix-match' ? 'already-linked' : reason;
       continue;
     }

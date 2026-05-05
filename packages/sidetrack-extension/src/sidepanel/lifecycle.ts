@@ -12,7 +12,7 @@ import type { TrackedThread } from '../workboard';
 export type LifecycleKind =
   | 'unread-reply'
   | 'waiting-ai'
-  | 'you-replied'
+  | 'ai-replied'
   | 'needs-organize'
   | 'stale'
   | 'tab-closed'
@@ -53,7 +53,13 @@ export const deriveLifecycle = (
       lifecyclePill: { label: 'Unread reply', tone: 'signal' },
     };
   }
-  if (thread.status === 'needs_organize') {
+  // "Needs organize" fires when the thread has no workstream
+  // assignment OR has the explicit needs_organize status. The
+  // status-only check missed all the auto-captured threads that
+  // landed without a workstream — the user reported 16/18 threads
+  // had primaryWorkstreamId === undefined yet zero showed the
+  // suggestion row.
+  if (thread.status === 'needs_organize' || thread.primaryWorkstreamId === undefined) {
     return {
       kind: 'needs-organize',
       dotClass: 'amber',
@@ -79,11 +85,16 @@ export const deriveLifecycle = (
     };
   }
   if (thread.lastTurnRole === 'assistant') {
+    // The AI sent the last turn. The previous label "You replied
+    // last" was inverted from the data — it ran on lastTurnRole ===
+    // 'assistant' but read as if the user had replied. The user's
+    // mental model is "what's the most recent action on this
+    // thread?", so the pill now mirrors the actual last actor.
     return {
-      kind: 'you-replied',
+      kind: 'ai-replied',
       dotClass: 'green',
       stampLabel: 'Last seen',
-      lifecyclePill: { label: 'You replied last', tone: 'gray' },
+      lifecyclePill: { label: 'AI replied last', tone: 'gray' },
     };
   }
   return { kind: 'fresh', dotClass: 'green', stampLabel: 'Last seen' };

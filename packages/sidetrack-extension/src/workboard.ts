@@ -6,6 +6,7 @@ import type {
   TabSnapshot,
 } from './companion/model';
 import type { DispatchEventRecord } from './dispatch/types';
+import type { ReviewDraft } from './review/types';
 
 export type CompanionStatus = 'connected' | 'disconnected' | 'vault-error' | 'local-only';
 export type TrackingMode = 'auto' | 'manual' | 'stopped' | 'removed' | 'archived';
@@ -60,6 +61,12 @@ export interface TrackedThread {
   // before sending the next). The actual drain implementation lives
   // behind the §24.10 safety chain in M2; this flag is the contract.
   readonly autoSendEnabled?: boolean;
+  // Last observed model the user had picked in the chat (e.g. "Pro",
+  // "Thinking", "GPT-5.1 Pro"). Best-effort; surfaced in the dispatch
+  // confirm header so the user sees which model their context came
+  // from. Provider-specific scraping; absent means we couldn't read
+  // the picker (icon-only buttons, dynamic loading, etc).
+  readonly selectedModel?: string;
 }
 
 export interface WorkstreamNode {
@@ -73,6 +80,11 @@ export interface WorkstreamNode {
   readonly privacy: PrivacyMode;
   readonly screenShareSensitive?: boolean;
   readonly updatedAt: string;
+  // User-curated free-form description. Flows through to the
+  // companion's suggester (`buildSignals` reads `${title} {description}`)
+  // for both lexical token match and cold-start vector centroid.
+  // Surfaced in the workstream-detail panel as a multi-line field.
+  readonly description?: string;
 }
 
 export interface QueueItem {
@@ -89,7 +101,21 @@ export interface QueueItem {
   // on the next successful drain pass.
   readonly lastError?: string;
   readonly progress?: 'typing' | 'waiting';
+  // Drag-reorder rank. Stamped per-thread when the user moves rows;
+  // sort prefers this over createdAt for items that have it. Items
+  // created before reorder shipped (or never reordered) fall back to
+  // createdAt — the comparator handles the mixed case.
+  readonly sortOrder?: number;
 }
+
+export const compareQueueItems = (a: QueueItem, b: QueueItem): number => {
+  if (a.sortOrder !== undefined && b.sortOrder !== undefined) {
+    return a.sortOrder - b.sortOrder;
+  }
+  if (a.sortOrder !== undefined) return -1;
+  if (b.sortOrder !== undefined) return 1;
+  return a.createdAt.localeCompare(b.createdAt);
+};
 
 export interface InboundReminder {
   readonly bac_id: string;
@@ -98,6 +124,14 @@ export interface InboundReminder {
   readonly provider: ProviderId;
   readonly detectedAt: string;
   readonly status: 'new' | 'seen' | 'relevant' | 'dismissed';
+  // Ordinal of the assistant turn that triggered this reminder.
+  // Stable across re-captures of the same chat — re-injection of the
+  // content script (extension reload) replays captures with new
+  // capturedAt timestamps, but the assistant turn's ordinal stays
+  // pinned to that specific reply. Used by createLocalReminder to
+  // dedup: if any existing reminder for this thread already records
+  // an ordinal >= the new one, the user has already seen this reply.
+  readonly lastAssistantTurnOrdinal?: number;
 }
 
 export interface SelectorHealth {
@@ -111,6 +145,11 @@ export interface UiSettings {
   readonly companion: CompanionSettings;
   readonly autoTrack: boolean;
   readonly siteToggles: Readonly<Record<Exclude<ProviderId, 'unknown'>, boolean>>;
+  // Fire a chrome.notifications toast when the auto-send drain
+  // finishes shipping the last item for a thread. Default on — the
+  // whole point of auto-send is so the user can context-switch
+  // away and come back when it's done.
+  readonly notifyOnQueueComplete: boolean;
 }
 
 // Manual notes the user types in the side panel (and, later, Obsidian /
@@ -201,6 +240,11 @@ export interface WorkboardState {
   // fired against that thread. Drives the "Recent" row in the
   // SendToDropdown so a repeat send is one click.
   readonly lastDispatchTargetByThread: Readonly<Partial<Record<string, string>>>;
+  // Per-thread inline-review drafts staged by the user via on-page
+  // selection in the chat tab. Drives the "Review draft (N)" chip on
+  // the thread row; cleared when the user sends-as-follow-up, saves
+  // to vault, or discards.
+  readonly reviewDrafts: Readonly<Partial<Record<string, ReviewDraft>>>;
   readonly lastError?: string;
   readonly updatedAt: string;
 }
@@ -283,6 +327,7 @@ export const defaultSettings: UiSettings = {
     gemini: true,
     codex: true,
   },
+  notifyOnQueueComplete: true,
 };
 
 export const createEmptyWorkboardState = (
@@ -307,6 +352,7 @@ export const createEmptyWorkboardState = (
   dispatchOriginals: {},
   dispatchDiagnostics: [],
   lastDispatchTargetByThread: {},
+  reviewDrafts: {},
   updatedAt: new Date().toISOString(),
   ...overrides,
 });

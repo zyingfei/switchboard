@@ -52,6 +52,12 @@ export interface CaptureEvent {
   // parentThreadId by URL match (preferred) or title match (fallback).
   readonly forkedFromUrl?: string;
   readonly forkedFromTitle?: string;
+  // Active model the user picked in the chat UI when this snapshot was
+  // captured (e.g. "Thinking", "GPT-5.1 Pro", "Sonnet 4.6"). Best-
+  // effort string scraped from the provider's model picker — used
+  // only for display in the dispatch confirm header so the user sees
+  // which model their context came from. Never used for routing.
+  readonly selectedModel?: string;
 }
 
 export interface ThreadUpsert {
@@ -77,6 +83,7 @@ export interface ThreadUpsert {
   readonly parentThreadId?: string;
   readonly parentTitle?: string;
   readonly lastTurnRole?: 'user' | 'assistant' | 'system' | 'unknown';
+  readonly selectedModel?: string;
 }
 
 export interface CaptureNoteCreate {
@@ -100,6 +107,12 @@ export interface WorkstreamCreate {
   readonly privacy?: 'private' | 'shared' | 'public';
   readonly screenShareSensitive?: boolean;
   readonly tags?: readonly string[];
+  // Free-form description the user can curate; flows through to the
+  // companion's suggester via buildSignals (lexical match against
+  // thread tokens + cold-start centroid embedding). Useful for
+  // cross-language hints — e.g. add `"travel hotel hiking 旅游 旅行"`
+  // so a Chinese thread gets matched into the english-named ws.
+  readonly description?: string;
 }
 
 export interface ChecklistItem {
@@ -119,6 +132,7 @@ export interface WorkstreamUpdate {
   readonly tags?: readonly string[];
   readonly children?: readonly string[];
   readonly checklist?: readonly ChecklistItem[];
+  readonly description?: string;
 }
 
 export interface QueueCreate {
@@ -158,6 +172,10 @@ export interface ReminderCreate {
   readonly provider: ProviderId;
   readonly detectedAt: string;
   readonly status?: 'new' | 'seen' | 'relevant' | 'dismissed';
+  // Optional dedup key — see InboundReminder.lastAssistantTurnOrdinal.
+  // The local-only path uses this to skip duplicate reminders when
+  // re-captures replay an already-seen assistant turn.
+  readonly lastAssistantTurnOrdinal?: number;
 }
 
 export interface ReminderUpdate {

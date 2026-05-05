@@ -13,6 +13,9 @@ const thread = (overrides: Partial<TrackedThread> = {}): TrackedThread => ({
   lastSeenAt: '2026-04-29T11:59:00.000Z',
   status: 'active',
   trackingMode: 'auto',
+  // Default to a workstream so the new "needs-organize when no
+  // workstream" rule doesn't short-circuit every other lifecycle test.
+  primaryWorkstreamId: 'ws_test',
   tags: [],
   ...overrides,
 });
@@ -70,10 +73,10 @@ describe('deriveLifecycle', () => {
     expect(result.stampLabel).toBe('Last sent');
   });
 
-  it('returns you-replied when last turn is by assistant (no pending reminder)', () => {
+  it('returns ai-replied when last turn is by assistant (no pending reminder)', () => {
     const result = deriveLifecycle(thread({ lastTurnRole: 'assistant' }), [], NOW_MS);
-    expect(result.kind).toBe('you-replied');
-    expect(result.lifecyclePill?.label).toBe('You replied last');
+    expect(result.kind).toBe('ai-replied');
+    expect(result.lifecyclePill?.label).toBe('AI replied last');
     expect(result.dotClass).toBe('green');
   });
 

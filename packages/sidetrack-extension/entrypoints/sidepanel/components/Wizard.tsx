@@ -1,25 +1,32 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Modal } from './Modal';
+import {
+  bridgeKeyValidationCopy,
+  validateBridgeKeyCandidate,
+  type BridgeKeyValidationFailure,
+} from '../../../src/companion/bridgeKeyValidation';
 
-export type WizardStep = 'welcome' | 'companion' | 'vault' | 'providers' | 'done';
+export type WizardStep = 'welcome' | 'vault' | 'companion' | 'providers' | 'done';
 
-const STEP_ORDER: readonly WizardStep[] = ['welcome', 'companion', 'vault', 'providers', 'done'];
+// Vault before Companion — the companion's npx command needs the
+// vault path the user just picked, so we collect it first and
+// interpolate the chosen path into the command shown to the user.
+const STEP_ORDER: readonly WizardStep[] = ['welcome', 'vault', 'companion', 'providers', 'done'];
 
 const STEP_LABEL: Record<WizardStep, string> = {
   welcome: 'Welcome',
-  companion: 'Companion',
   vault: 'Vault',
+  companion: 'Companion',
   providers: 'Providers',
   done: 'Done',
 };
-
-const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 export type CompanionPingResult = 'reachable' | 'unreachable';
 
 export interface WizardProps {
   readonly bridgeKey?: string;
   readonly companionReachable?: boolean;
+  readonly connectionError?: string | null;
   readonly localRestApiDetected?: boolean;
   readonly port?: number;
   readonly onClose: () => void;
@@ -48,6 +55,7 @@ const defaultReadClipboard = (): Promise<string> => navigator.clipboard.readText
 export function Wizard({
   bridgeKey = '',
   companionReachable = false,
+  connectionError = null,
   localRestApiDetected = false,
   port = 17_373,
   onClose,
@@ -60,9 +68,24 @@ export function Wizard({
   onReadClipboard,
 }: WizardProps) {
   const [stepIndex, setStepIndex] = useState(0);
+  const [bridgeKeyFailure, setBridgeKeyFailure] = useState<BridgeKeyValidationFailure | null>(null);
   const step = STEP_ORDER[stepIndex] ?? 'welcome';
 
+  useEffect(() => {
+    if (connectionError !== null) {
+      setStepIndex(STEP_ORDER.indexOf('companion'));
+    }
+  }, [connectionError]);
+
   const next = () => {
+    if (step === 'companion') {
+      const failure = validateBridgeKeyCandidate(bridgeKey);
+      if (failure !== null) {
+        setBridgeKeyFailure(failure);
+        return;
+      }
+      setBridgeKeyFailure(null);
+    }
     if (stepIndex < STEP_ORDER.length - 1) {
       setStepIndex(stepIndex + 1);
     }
@@ -110,7 +133,12 @@ export function Wizard({
       {step === 'companion' ? (
         <CompanionStep
           bridgeKey={bridgeKey}
+          bridgeKeyFailure={bridgeKeyFailure}
           companionReachable={companionReachable}
+          connectionError={connectionError}
+          onBridgeKeyFailureClear={() => {
+            setBridgeKeyFailure(null);
+          }}
           onBridgeKeyChange={onBridgeKeyChange}
           onPingCompanion={onPingCompanion ?? (() => defaultPingCompanion(port))}
           onReadClipboard={onReadClipboard ?? defaultReadClipboard}
@@ -152,7 +180,10 @@ function WelcomeStep({ onSkip }: { readonly onSkip?: () => void }) {
 
 function CompanionStep({
   bridgeKey,
+  bridgeKeyFailure,
   companionReachable,
+  connectionError,
+  onBridgeKeyFailureClear,
   onBridgeKeyChange,
   onPingCompanion,
   onReadClipboard,
@@ -160,7 +191,10 @@ function CompanionStep({
   vaultPath,
 }: {
   readonly bridgeKey: string;
+  readonly bridgeKeyFailure: BridgeKeyValidationFailure | null;
   readonly companionReachable: boolean;
+  readonly connectionError: string | null;
+  readonly onBridgeKeyFailureClear: () => void;
   readonly onBridgeKeyChange?: (bridgeKey: string) => void;
   readonly onPingCompanion: () => Promise<CompanionPingResult>;
   readonly onReadClipboard: () => Promise<string>;
@@ -171,6 +205,9 @@ function CompanionStep({
   const bridgeKeyPath = `${commandPath.replace(/\/$/, '')}/_BAC/.config/bridge.key`;
   const [pingState, setPingState] = useState<'idle' | 'testing' | CompanionPingResult>('idle');
   const [clipboardError, setClipboardError] = useState<string | null>(null);
+  const validationError =
+    connectionError ??
+    (bridgeKeyFailure === null ? null : bridgeKeyValidationCopy[bridgeKeyFailure]);
 
   const ambientReachable =
     pingState === 'reachable' || (pingState === 'idle' && companionReachable);
@@ -192,12 +229,12 @@ function CompanionStep({
     void onReadClipboard()
       .then((value) => {
         const trimmed = value.trim();
-        if (trimmed.length < 32 || !BASE64URL_PATTERN.test(trimmed)) {
-          setClipboardError(
-            "That doesn't look like a bridge key — open the file and copy the line.",
-          );
+        const failure = validateBridgeKeyCandidate(trimmed);
+        if (failure !== null) {
+          setClipboardError(bridgeKeyValidationCopy[failure]);
           return;
         }
+        onBridgeKeyFailureClear();
         onBridgeKeyChange?.(trimmed);
       })
       .catch(() => {
@@ -222,7 +259,6 @@ function CompanionStep({
       </div>
       <div className="wizard-card-row single">
         <div className="wizard-card primary">
-          <div className="wizard-card-tag mono">DEFAULT · ADR-0001</div>
           <div className="wizard-card-title">HTTP loopback</div>
           <code className="wizard-card-cmd mono">
             npx @sidetrack/companion --vault {commandPath}
@@ -230,6 +266,21 @@ function CompanionStep({
           <div className="wizard-card-meta mono">Bridge key file: {bridgeKeyPath}</div>
         </div>
       </div>
+      {__DEV__ ? (
+        <div className="wizard-card-row single">
+          <div className="wizard-card">
+            <div className="wizard-card-title">Dev build — run from local worktree</div>
+            <code className="wizard-card-cmd mono">
+              node ~/Documents/playground/browser-ai-companion/.claude/worktrees/m1+foundation/packages/sidetrack-companion/dist/cli.js
+              --vault {commandPath}
+            </code>
+            <div className="wizard-card-meta mono">
+              The npm package isn&apos;t published yet, so the npx command above won&apos;t resolve.
+              Run this directly against the built CLI.
+            </div>
+          </div>
+        </div>
+      ) : null}
       <div className={'wizard-status ' + statusClass}>
         <span className={'dot ' + statusClass} />
         <span className="mono">{statusLabel}</span>
@@ -246,6 +297,7 @@ function CompanionStep({
         Bridge key
         <input
           onChange={(event) => {
+            onBridgeKeyFailureClear();
             onBridgeKeyChange?.(event.target.value);
           }}
           placeholder="Paste the bridge key from the vault"
@@ -261,10 +313,15 @@ function CompanionStep({
           <span className="wizard-clipboard-error mono">{clipboardError}</span>
         ) : null}
       </div>
+      {validationError !== null ? (
+        <div className="wizard-bridge-error mono" role="alert">
+          {validationError}
+        </div>
+      ) : null}
       <div className="wizard-footnote mono">
         <em>
-          Native Messaging considered and rejected for v1 — see ADR-0001 for the lifetime +
-          multi-MCP-client reasoning.
+          The companion runs locally on your machine. The bridge key keeps the vault outside
+          Chrome's profile so other extensions can't reach it.
         </em>
       </div>
     </div>

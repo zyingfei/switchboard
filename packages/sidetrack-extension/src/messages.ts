@@ -1,3 +1,4 @@
+import type { SerializedAnchor } from './annotation/anchors';
 import type {
   CaptureEvent,
   CaptureNoteCreate,
@@ -12,6 +13,7 @@ import type {
   WorkstreamCreate,
   WorkstreamUpdate,
 } from './companion/model';
+import type { ReviewVerdict } from './review/types';
 import type {
   AllThreadsBucket,
   PrivacyMode,
@@ -68,6 +70,10 @@ export const messageTypes = {
   restoreThreadTab: 'sidetrack.thread.restore-tab',
   queueFollowUp: 'sidetrack.queue.create',
   updateQueueItem: 'sidetrack.queue.update',
+  // User dropped queue rows in a new order. Payload is the ordered
+  // list of pending bac_ids; the storage layer stamps each one's
+  // sortOrder so the auto-send drain ships them in that order.
+  reorderQueueItems: 'sidetrack.queue.reorder',
   createReminder: 'sidetrack.reminder.create',
   updateReminder: 'sidetrack.reminder.update',
   setCollapsedSections: 'sidetrack.sections.collapsed.set',
@@ -82,6 +88,30 @@ export const messageTypes = {
   createCaptureNote: 'sidetrack.capture.note.create',
   updateCaptureNote: 'sidetrack.capture.note.update',
   deleteCaptureNote: 'sidetrack.capture.note.delete',
+  // Inline review (selection-anchored) draft mutators. Content script
+  // appends a span when the user comments on a highlighted phrase;
+  // the side panel edits + sends. The "send-as-follow-up" path
+  // bundles the draft into a queue item via the existing follow-up
+  // pipeline so it inherits ordering, auto-send, and notifications.
+  appendReviewDraftSpan: 'sidetrack.review.draft.appendSpan',
+  dropReviewDraftSpan: 'sidetrack.review.draft.dropSpan',
+  updateReviewDraft: 'sidetrack.review.draft.update',
+  discardReviewDraft: 'sidetrack.review.draft.discard',
+  sendReviewDraftAsFollowUp: 'sidetrack.review.draft.sendAsFollowUp',
+  // Recent Dispatches lifecycle: archive hides a row from the default
+  // list; unarchive brings it back. Both update the dispatch's local
+  // status field; the companion vault record is unchanged (archive
+  // is a UI-only filter).
+  archiveDispatch: 'sidetrack.dispatch.archive',
+  unarchiveDispatch: 'sidetrack.dispatch.unarchive',
+  // Content script asks the background to run a recall query against
+  // the local companion. Routed through the SW because direct fetch
+  // from a content script in an HTTPS page (e.g. chatgpt.com) to
+  // http://127.0.0.1 is blocked by Chrome's mixed-content policy
+  // even with host_permissions — only chrome-extension:// origins
+  // bypass that block. The SW returns the parsed RankedItem[] so
+  // the popover can render titles and scores.
+  recallQuery: 'sidetrack.recall.query',
 } as const;
 
 export interface SelectorCanaryReport {
@@ -117,10 +147,18 @@ export const isWorkboardChangedMessage = (value: unknown): value is WorkboardCha
 
 // Broadcast: side panel should scroll to + flash the row whose
 // thread.threadUrl matches. Fired by the background after a
-// content-script focus button click.
+// content-script focus button click. Optional `bacId` / `title` /
+// `lastSeenAt` let the sidebar surface a synthetic card when the
+// requested thread is in the recall index but missing from the
+// local thread cache (e.g. captured on another device, or pruned
+// locally). Without these, the handler can only fall back to the
+// no-op behavior since there's nothing to focus on.
 export interface FocusThreadInSidePanelMessage {
   readonly type: typeof messageTypes.focusThreadInSidePanel;
   readonly threadUrl: string;
+  readonly bacId?: string;
+  readonly title?: string;
+  readonly lastSeenAt?: string;
 }
 
 export const isFocusThreadInSidePanelMessage = (
@@ -128,7 +166,10 @@ export const isFocusThreadInSidePanelMessage = (
 ): value is FocusThreadInSidePanelMessage =>
   isRecord(value) &&
   value.type === messageTypes.focusThreadInSidePanel &&
-  typeof value.threadUrl === 'string';
+  typeof value.threadUrl === 'string' &&
+  (value.bacId === undefined || typeof value.bacId === 'string') &&
+  (value.title === undefined || typeof value.title === 'string') &&
+  (value.lastSeenAt === undefined || typeof value.lastSeenAt === 'string');
 
 export interface ContentRequest {
   readonly type: typeof messageTypes.captureVisibleThread;
@@ -208,6 +249,10 @@ export type WorkboardRequest =
       readonly update: QueueUpdate;
     }
   | {
+      readonly type: typeof messageTypes.reorderQueueItems;
+      readonly queueItemIds: readonly string[];
+    }
+  | {
       readonly type: typeof messageTypes.retryAutoSend;
       readonly queueItemId: string;
     }
@@ -273,6 +318,7 @@ export type WorkboardRequest =
       readonly preferences: {
         readonly autoTrack?: boolean;
         readonly vaultPath?: string;
+        readonly notifyOnQueueComplete?: boolean;
       };
     }
   | {
@@ -287,6 +333,56 @@ export type WorkboardRequest =
   | {
       readonly type: typeof messageTypes.deleteCaptureNote;
       readonly noteId: string;
+    }
+  | {
+      readonly type: typeof messageTypes.appendReviewDraftSpan;
+      readonly threadUrl: string;
+      readonly anchor: SerializedAnchor;
+      readonly quote: string;
+      readonly comment: string;
+      readonly capturedAt: string;
+    }
+  | {
+      readonly type: typeof messageTypes.dropReviewDraftSpan;
+      readonly threadId: string;
+      readonly spanId: string;
+    }
+  | {
+      readonly type: typeof messageTypes.updateReviewDraft;
+      readonly threadId: string;
+      readonly overall?: string;
+      readonly verdict?: ReviewVerdict;
+    }
+  | {
+      readonly type: typeof messageTypes.discardReviewDraft;
+      readonly threadId: string;
+    }
+  | {
+      readonly type: typeof messageTypes.sendReviewDraftAsFollowUp;
+      readonly threadId: string;
+      // true → also flip the thread's auto-send chip on so the queue
+      // item ships immediately (Send now). false → just queue, leave
+      // the user to trigger the drain manually (Add to queue).
+      readonly autoSend: boolean;
+    }
+  | {
+      readonly type: typeof messageTypes.archiveDispatch;
+      readonly dispatchId: string;
+    }
+  | {
+      readonly type: typeof messageTypes.unarchiveDispatch;
+      readonly dispatchId: string;
+    }
+  | {
+      readonly type: typeof messageTypes.recallQuery;
+      readonly q: string;
+      readonly limit?: number;
+      readonly workstreamId?: string;
+      // URL of the page issuing the query. Background uses it to drop
+      // results that point back at the same thread the user is
+      // already reading (no point in saying "you've seen this before"
+      // about the page in front of them).
+      readonly currentUrl?: string;
     };
 
 export type RuntimeRequest =
@@ -317,6 +413,17 @@ export type RuntimeResponse =
       readonly error: string;
       readonly state?: WorkboardState;
     };
+
+// Recall-query response — sent only in reply to messageTypes.recallQuery.
+// Kept out of the RuntimeResponse union because it doesn't carry a
+// WorkboardState and a third variant would force every existing caller
+// to narrow before reading `state`. The content script casts the
+// chrome.runtime.sendMessage reply to this type at the call site.
+export interface RecallQueryResponse {
+  readonly ok: boolean;
+  readonly items: readonly unknown[];
+  readonly error?: string;
+}
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;
@@ -414,6 +521,13 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
     return typeof value.queueItemId === 'string' && isRecord(value.update);
   }
 
+  if (hasType(value, messageTypes.reorderQueueItems)) {
+    return (
+      Array.isArray(value.queueItemIds) &&
+      value.queueItemIds.every((id) => typeof id === 'string')
+    );
+  }
+
   if (hasType(value, messageTypes.retryAutoSend)) {
     return typeof value.queueItemId === 'string';
   }
@@ -506,6 +620,48 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
 
   if (hasType(value, messageTypes.deleteCaptureNote)) {
     return typeof value.noteId === 'string';
+  }
+
+  if (hasType(value, messageTypes.appendReviewDraftSpan)) {
+    return (
+      typeof value.threadUrl === 'string' &&
+      isRecord(value.anchor) &&
+      typeof value.quote === 'string' &&
+      typeof value.comment === 'string' &&
+      typeof value.capturedAt === 'string'
+    );
+  }
+
+  if (hasType(value, messageTypes.dropReviewDraftSpan)) {
+    return typeof value.threadId === 'string' && typeof value.spanId === 'string';
+  }
+
+  if (hasType(value, messageTypes.updateReviewDraft)) {
+    return typeof value.threadId === 'string';
+  }
+
+  if (hasType(value, messageTypes.discardReviewDraft)) {
+    return typeof value.threadId === 'string';
+  }
+
+  if (hasType(value, messageTypes.sendReviewDraftAsFollowUp)) {
+    return typeof value.threadId === 'string' && typeof value.autoSend === 'boolean';
+  }
+
+  if (
+    hasType(value, messageTypes.archiveDispatch) ||
+    hasType(value, messageTypes.unarchiveDispatch)
+  ) {
+    return typeof value.dispatchId === 'string';
+  }
+
+  if (hasType(value, messageTypes.recallQuery)) {
+    return (
+      typeof value.q === 'string' &&
+      (value.limit === undefined || typeof value.limit === 'number') &&
+      (value.workstreamId === undefined || typeof value.workstreamId === 'string') &&
+      (value.currentUrl === undefined || typeof value.currentUrl === 'string')
+    );
   }
 
   return false;

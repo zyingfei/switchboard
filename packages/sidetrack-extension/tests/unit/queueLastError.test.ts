@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   createLocalQueueItem,
   readQueueItems,
+  reorderLocalQueueItems,
   updateLocalQueueItem,
 } from '../../src/background/state';
 
@@ -125,5 +126,60 @@ describe('updateLocalQueueItem.lastError tri-state', () => {
     });
     expect(done?.progress).toBeUndefined();
     expect(done?.lastError).toBeUndefined();
+  });
+});
+
+describe('reorderLocalQueueItems', () => {
+  beforeEach(() => {
+    installChromeStorageMock();
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('stamps sortOrder in the supplied id order', async () => {
+    const a = await createLocalQueueItem({
+      text: 'a',
+      scope: 'thread',
+      targetId: 'bac_thread_test',
+    });
+    const b = await createLocalQueueItem({
+      text: 'b',
+      scope: 'thread',
+      targetId: 'bac_thread_test',
+    });
+    const c = await createLocalQueueItem({
+      text: 'c',
+      scope: 'thread',
+      targetId: 'bac_thread_test',
+    });
+
+    await reorderLocalQueueItems([c.bac_id, a.bac_id, b.bac_id]);
+
+    const items = await readQueueItems();
+    const byId = new Map(items.map((item) => [item.bac_id, item]));
+    expect(byId.get(c.bac_id)?.sortOrder).toBe(0);
+    expect(byId.get(a.bac_id)?.sortOrder).toBe(1);
+    expect(byId.get(b.bac_id)?.sortOrder).toBe(2);
+  });
+
+  it('leaves items not in the id list untouched', async () => {
+    const a = await createLocalQueueItem({
+      text: 'a',
+      scope: 'thread',
+      targetId: 'bac_thread_test',
+    });
+    const b = await createLocalQueueItem({
+      text: 'b',
+      scope: 'thread',
+      targetId: 'bac_thread_other',
+    });
+
+    await reorderLocalQueueItems([a.bac_id]);
+
+    const items = await readQueueItems();
+    const byId = new Map(items.map((item) => [item.bac_id, item]));
+    expect(byId.get(a.bac_id)?.sortOrder).toBe(0);
+    expect(byId.get(b.bac_id)?.sortOrder).toBeUndefined();
   });
 });

@@ -5,8 +5,9 @@ import { pathToFileURL } from 'node:url';
 
 import { pickInstaller } from './install/index.js';
 import { startCompanion } from './runtime/companion.js';
+import { COMPANION_VERSION } from './version.js';
 
-export const companionVersion = '0.0.0';
+export const companionVersion = COMPANION_VERSION;
 
 export interface CliStreams {
   readonly stdout: Writable;

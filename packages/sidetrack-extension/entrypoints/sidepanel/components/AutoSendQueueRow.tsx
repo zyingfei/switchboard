@@ -1,5 +1,15 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type DragEvent } from 'react';
 import type { QueueItem } from '../../../src/workboard';
+
+export interface AutoSendQueueRowDnd {
+  readonly draggable: boolean;
+  readonly dragOverActive: boolean;
+  readonly onDragStart: (event: DragEvent<HTMLLIElement>) => void;
+  readonly onDragEnd: (event: DragEvent<HTMLLIElement>) => void;
+  readonly onDragOver: (event: DragEvent<HTMLLIElement>) => void;
+  readonly onDragLeave: (event: DragEvent<HTMLLIElement>) => void;
+  readonly onDrop: (event: DragEvent<HTMLLIElement>) => void;
+}
 
 export interface AutoSendQueueRowProps {
   readonly item: QueueItem;
@@ -10,6 +20,7 @@ export interface AutoSendQueueRowProps {
   readonly onCopy: () => void;
   readonly onRetry: () => void;
   readonly onDismiss: () => void;
+  readonly dnd?: AutoSendQueueRowDnd;
 }
 
 const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as const;
@@ -23,6 +34,7 @@ export function AutoSendQueueRow({
   onCopy,
   onRetry,
   onDismiss,
+  dnd,
 }: AutoSendQueueRowProps) {
   const [now, setNow] = useState(() => Date.now());
 
@@ -54,8 +66,36 @@ export function AutoSendQueueRow({
   const label = failed ? 'Failed' : sent ? 'Sent' : active ? 'Sending now' : 'Queued';
   const spinnerFrame = SPINNER_FRAMES[Math.floor(now / 120) % SPINNER_FRAMES.length];
 
+  const dndProps = dnd
+    ? {
+        draggable: dnd.draggable,
+        onDragStart: dnd.onDragStart,
+        onDragEnd: dnd.onDragEnd,
+        onDragOver: dnd.onDragOver,
+        onDragLeave: dnd.onDragLeave,
+        onDrop: dnd.onDrop,
+      }
+    : {};
+  const className = [
+    'queue-row',
+    statusClass,
+    dnd?.draggable ? 'draggable' : '',
+    dnd?.dragOverActive ? 'drag-over' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+
   return (
-    <li className={`queue-row ${statusClass}`}>
+    <li className={className} {...dndProps}>
+      {dnd?.draggable ? (
+        <span
+          className="queue-row-grip mono"
+          aria-hidden
+          title="Drag to reorder"
+        >
+          ⋮⋮
+        </span>
+      ) : null}
       <div className="queue-row-status mono" aria-hidden>
         {glyph}
       </div>

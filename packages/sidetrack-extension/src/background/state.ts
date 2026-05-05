@@ -12,7 +12,13 @@ import type {
   WorkstreamUpdate,
 } from '../companion/model';
 import { readDroppedCount, readQueue } from '../companion/queue';
+import { canonicalThreadUrl } from '../capture/providerDetection';
 import type { DispatchEventRecord } from '../dispatch/types';
+import type {
+  ReviewDraft,
+  ReviewDraftSpan,
+  ReviewVerdict,
+} from '../review/types';
 import {
   createEmptyWorkboardState,
   defaultSettings,
@@ -54,6 +60,11 @@ const DISPATCH_ORIGINALS_KEY = 'sidetrack.dispatchOriginals';
 // one click. Map: threadId → SendToTarget id (string).
 const LAST_DISPATCH_TARGET_KEY = 'sidetrack.lastDispatchTargetByThread';
 const SCREEN_SHARE_MODE_KEY = 'sidetrack.screenShareMode';
+// Per-thread inline-review drafts (selection + comment + overall +
+// verdict). Stored locally only; not part of the companion vault
+// schema. The vault is written via the existing /v1/reviews endpoint
+// only when the user explicitly saves or sends-as-follow-up.
+const REVIEW_DRAFTS_KEY = 'sidetrack.reviewDrafts';
 
 const storageGet = async <TValue>(key: string, fallback: TValue): Promise<TValue> => {
   const result = await chrome.storage.local.get({ [key]: fallback });
@@ -75,8 +86,13 @@ const storageSessionSet = async (values: Record<string, unknown>): Promise<void>
 
 const createLocalBacId = (): string => `bac_${crypto.randomUUID().replaceAll('-', '_')}`;
 
-export const readSettings = async (): Promise<UiSettings> =>
-  await storageGet<UiSettings>(SETTINGS_KEY, defaultSettings);
+export const readSettings = async (): Promise<UiSettings> => {
+  const stored = await storageGet<UiSettings>(SETTINGS_KEY, defaultSettings);
+  // Merge against defaults so installs that pre-date a new flag pick
+  // it up at its default rather than `undefined` (which behaves as
+  // "off" for booleans).
+  return { ...defaultSettings, ...stored };
+};
 
 export const saveCompanionSettings = async (settings: CompanionSettings): Promise<UiSettings> => {
   const current = await readSettings();
@@ -88,6 +104,15 @@ export const saveCompanionSettings = async (settings: CompanionSettings): Promis
 export const saveAutoTrack = async (autoTrack: boolean): Promise<UiSettings> => {
   const current = await readSettings();
   const next: UiSettings = { ...current, autoTrack };
+  await storageSet({ [SETTINGS_KEY]: next });
+  return next;
+};
+
+export const saveNotifyOnQueueComplete = async (
+  notifyOnQueueComplete: boolean,
+): Promise<UiSettings> => {
+  const current = await readSettings();
+  const next: UiSettings = { ...current, notifyOnQueueComplete };
   await storageSet({ [SETTINGS_KEY]: next });
   return next;
 };
@@ -137,6 +162,29 @@ export const writeCachedDispatches = async (
   dispatches: readonly DispatchEventRecord[],
 ): Promise<void> => {
   await storageSet({ [RECENT_DISPATCHES_KEY]: dispatches });
+};
+
+// Set / clear the local 'archived' status on a recorded dispatch.
+// Archive is a UI-only filter — we don't write through to the
+// companion vault since the underlying review/sent/replied lifecycle
+// is separate. Idempotent if the row is already in the target state.
+export const setDispatchArchived = async (
+  dispatchId: string,
+  archived: boolean,
+): Promise<void> => {
+  const current = await readCachedDispatches();
+  const target = current.find((dispatch) => dispatch.bac_id === dispatchId);
+  if (target === undefined) return;
+  if (archived && target.status === 'archived') return;
+  if (!archived && target.status !== 'archived') return;
+  // Going-into-archive: write 'archived'. Going-out: assume the
+  // rehydrated status is 'sent' — we don't store the prior status to
+  // avoid bloating the local cache schema.
+  const nextStatus: DispatchEventRecord['status'] = archived ? 'archived' : 'sent';
+  const next = current.map((dispatch) =>
+    dispatch.bac_id === dispatchId ? { ...dispatch, status: nextStatus } : dispatch,
+  );
+  await writeCachedDispatches(next);
 };
 
 // Dispatch → destination thread links. We can't add this to the
@@ -205,6 +253,110 @@ export const writeLastDispatchTargetByThread = async (
   });
 };
 
+// Per-thread inline-review drafts. The content script appends spans
+// as the user comments on selected text on the chat page; the side
+// panel renders + lets the user edit and send. Storage is keyed by
+// the tracked thread's bac_id (not threadUrl) so rename / re-resolve
+// of the URL doesn't orphan the draft.
+export const readReviewDrafts = async (): Promise<
+  Readonly<Partial<Record<string, ReviewDraft>>>
+> => await storageGet<Readonly<Partial<Record<string, ReviewDraft>>>>(REVIEW_DRAFTS_KEY, {});
+
+const writeReviewDrafts = async (
+  next: Readonly<Partial<Record<string, ReviewDraft>>>,
+): Promise<void> => {
+  await storageSet({ [REVIEW_DRAFTS_KEY]: next });
+};
+
+export const appendReviewDraftSpan = async (
+  threadId: string,
+  threadUrl: string,
+  span: Omit<ReviewDraftSpan, 'bac_id'>,
+): Promise<ReviewDraft> => {
+  const current = await readReviewDrafts();
+  const existing = current[threadId];
+  const newSpan: ReviewDraftSpan = { ...span, bac_id: createLocalBacId() };
+  const next: ReviewDraft = {
+    threadId,
+    threadUrl,
+    spans: existing === undefined ? [newSpan] : [...existing.spans, newSpan],
+    ...(existing?.overall === undefined ? {} : { overall: existing.overall }),
+    ...(existing?.verdict === undefined ? {} : { verdict: existing.verdict }),
+    updatedAt: span.capturedAt,
+  };
+  await writeReviewDrafts({ ...current, [threadId]: next });
+  return next;
+};
+
+export const dropReviewDraftSpan = async (
+  threadId: string,
+  spanId: string,
+): Promise<ReviewDraft | undefined> => {
+  const current = await readReviewDrafts();
+  const existing = current[threadId];
+  if (existing === undefined) {
+    return undefined;
+  }
+  const remaining = existing.spans.filter((span) => span.bac_id !== spanId);
+  if (remaining.length === 0 && existing.overall === undefined && existing.verdict === undefined) {
+    const { [threadId]: _, ...rest } = current;
+    void _;
+    await writeReviewDrafts(rest);
+    return undefined;
+  }
+  const next: ReviewDraft = {
+    ...existing,
+    spans: remaining,
+    updatedAt: new Date().toISOString(),
+  };
+  await writeReviewDrafts({ ...current, [threadId]: next });
+  return next;
+};
+
+export const updateReviewDraft = async (
+  threadId: string,
+  patch: { readonly overall?: string; readonly verdict?: ReviewVerdict },
+): Promise<ReviewDraft | undefined> => {
+  const current = await readReviewDrafts();
+  const existing = current[threadId];
+  if (existing === undefined) {
+    return undefined;
+  }
+  const nextOverall =
+    patch.overall === undefined
+      ? existing.overall
+      : patch.overall.length === 0
+        ? undefined
+        : patch.overall;
+  const nextVerdict = patch.verdict ?? existing.verdict;
+  const next: ReviewDraft = {
+    ...existing,
+    ...(nextOverall === undefined ? {} : { overall: nextOverall }),
+    ...(nextVerdict === undefined ? {} : { verdict: nextVerdict }),
+    updatedAt: new Date().toISOString(),
+  };
+  // Strip undefined keys cleanly so storage doesn't carry deleted
+  // overall/verdict via prior values.
+  if (nextOverall === undefined && 'overall' in existing) {
+    delete (next as { overall?: string }).overall;
+  }
+  if (nextVerdict === undefined && 'verdict' in existing) {
+    delete (next as { verdict?: ReviewVerdict }).verdict;
+  }
+  await writeReviewDrafts({ ...current, [threadId]: next });
+  return next;
+};
+
+export const discardReviewDraft = async (threadId: string): Promise<void> => {
+  const current = await readReviewDrafts();
+  if (current[threadId] === undefined) {
+    return;
+  }
+  const { [threadId]: _, ...rest } = current;
+  void _;
+  await writeReviewDrafts(rest);
+};
+
 // Drop entries for dispatches that have aged out of recentDispatches.
 // Called from the same broadcast point as pruneDispatchLinks so the
 // caches stay roughly in sync.
@@ -228,6 +380,22 @@ export const pruneDispatchOriginals = async (
   if (changed) {
     await storageSet({ [DISPATCH_ORIGINALS_KEY]: next });
   }
+};
+
+// Drop reminders that point at thread bac_ids no longer in storage.
+// Runs at extension startup to clean up the orphan accumulation
+// caused by the pre-fix sendToCompanion bug where every capture
+// reissued a thread bac_id; users had hundreds of "Unread reply"
+// pills bound to dead threadIds. Idempotent — no-op when there are
+// no orphans to drop.
+export const pruneReminders = async (knownThreadIds: ReadonlySet<string>): Promise<number> => {
+  const current = await readReminders();
+  const next = current.filter((r) => knownThreadIds.has(r.threadId));
+  if (next.length === current.length) {
+    return 0;
+  }
+  await storageSet({ [REMINDERS_KEY]: next });
+  return current.length - next.length;
 };
 
 // Drop links that point at threads no longer in the cache (cleanup).
@@ -355,15 +523,23 @@ export const upsertLocalThread = async (
   result?: { readonly bac_id: string },
 ): Promise<TrackedThread> => {
   const current = await readThreads();
+  // Canonicalize the URL so SPA URL drift (e.g. Gemini /app/<id> →
+  // /app/<id>?something) doesn't fan one chat into multiple thread
+  // records, which made dispatch links flicker as the matcher chased
+  // whichever bac_id was created most recently.
+  const canonicalUrl = canonicalThreadUrl(input.threadUrl);
   const existing = current.find(
-    (thread) => thread.bac_id === input.bac_id || thread.threadUrl === input.threadUrl,
+    (thread) =>
+      thread.bac_id === input.bac_id ||
+      thread.threadUrl === canonicalUrl ||
+      canonicalThreadUrl(thread.threadUrl) === canonicalUrl,
   );
   const bacId = result?.bac_id ?? input.bac_id ?? existing?.bac_id ?? createLocalBacId();
   const nextThread: TrackedThread = {
     bac_id: bacId,
     provider: input.provider,
     threadId: input.threadId,
-    threadUrl: input.threadUrl,
+    threadUrl: canonicalUrl,
     title: input.title,
     lastSeenAt: input.lastSeenAt,
     status: input.status ?? existing?.status ?? 'tracked',
@@ -375,12 +551,16 @@ export const upsertLocalThread = async (
     parentTitle: input.parentTitle ?? existing?.parentTitle,
     lastTurnRole: input.lastTurnRole ?? existing?.lastTurnRole,
     autoSendEnabled: existing?.autoSendEnabled,
+    selectedModel: input.selectedModel ?? existing?.selectedModel,
   };
   await storageSet({
     [THREADS_KEY]: [
       nextThread,
       ...current.filter(
-        (thread) => thread.bac_id !== bacId && thread.threadUrl !== input.threadUrl,
+        (thread) =>
+          thread.bac_id !== bacId &&
+          thread.threadUrl !== canonicalUrl &&
+          canonicalThreadUrl(thread.threadUrl) !== canonicalUrl,
       ),
     ],
   });
@@ -404,6 +584,7 @@ export const createLocalWorkstream = async (
     privacy: input.privacy ?? 'shared',
     screenShareSensitive: input.screenShareSensitive ?? false,
     updatedAt: timestamp,
+    ...(input.description === undefined ? {} : { description: input.description }),
   };
   const withParent = current.map((candidate) =>
     candidate.bac_id === input.parentId
@@ -517,6 +698,32 @@ export const updateLocalQueueItem = async (
   return updated;
 };
 
+// Stamp sortOrder on the items in the supplied id list (in order),
+// preserving every other item untouched. Items not in the list keep
+// whatever sortOrder they had — the caller is expected to pass the
+// full ordered set of pending items it wants to re-rank (typically
+// one thread's queue).
+export const reorderLocalQueueItems = async (
+  orderedIds: readonly string[],
+): Promise<void> => {
+  if (orderedIds.length === 0) {
+    return;
+  }
+  const current = await readQueueItems();
+  const rankByItemId = new Map<string, number>();
+  orderedIds.forEach((id, index) => {
+    rankByItemId.set(id, index);
+  });
+  const next = current.map((item) => {
+    const rank = rankByItemId.get(item.bac_id);
+    if (rank === undefined) {
+      return item;
+    }
+    return { ...item, sortOrder: rank };
+  });
+  await storageSet({ [QUEUE_ITEMS_KEY]: next });
+};
+
 const normalizeForMatch = (text: string): string =>
   text
     .toLowerCase()
@@ -589,6 +796,26 @@ export const createLocalReminder = async (
   result?: { readonly bac_id: string; readonly revision?: string },
 ): Promise<InboundReminder> => {
   const current = await readReminders();
+  // Dedup by assistant-turn ordinal — stable across re-captures of
+  // the same chat. detectedAt was a poor key because every fresh
+  // capture writes a new capturedAt timestamp; on extension reload,
+  // the re-injected content script re-captures every open chat and
+  // the new reminder always had a later detectedAt than the dismissed
+  // one, so the dedup never fired. Ordinal is pinned to the AI's
+  // specific reply; if the user already saw it, every re-capture has
+  // the same ordinal and we skip.
+  if (input.lastAssistantTurnOrdinal !== undefined) {
+    const newOrdinal = input.lastAssistantTurnOrdinal;
+    const seen = current.find(
+      (r) =>
+        r.threadId === input.threadId &&
+        r.lastAssistantTurnOrdinal !== undefined &&
+        r.lastAssistantTurnOrdinal >= newOrdinal,
+    );
+    if (seen !== undefined) {
+      return seen;
+    }
+  }
   const reminder: InboundReminder = {
     bac_id: result?.bac_id ?? createLocalBacId(),
     revision: result?.revision,
@@ -596,6 +823,9 @@ export const createLocalReminder = async (
     provider: input.provider,
     detectedAt: input.detectedAt,
     status: input.status ?? 'new',
+    ...(input.lastAssistantTurnOrdinal === undefined
+      ? {}
+      : { lastAssistantTurnOrdinal: input.lastAssistantTurnOrdinal }),
   };
   await storageSet({ [REMINDERS_KEY]: [reminder, ...current] });
   return reminder;
@@ -708,6 +938,7 @@ export const buildWorkboardState = async (
     dispatchDiagnostics: await readDispatchDiagnostics(),
     dispatchOriginals: await readDispatchOriginals(),
     lastDispatchTargetByThread: await readLastDispatchTargetByThread(),
+    reviewDrafts: await readReviewDrafts(),
     collapsedSections: await storageGet<WorkboardState['collapsedSections']>(
       COLLAPSED_SECTIONS_KEY,
       [],

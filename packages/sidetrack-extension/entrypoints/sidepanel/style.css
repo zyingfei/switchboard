@@ -492,10 +492,17 @@ button:disabled {
 
 .thread-actions {
   display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
+  flex-wrap: nowrap;
+  gap: 6px;
   justify-content: flex-end;
-  max-width: 150px;
+  /* Float the action strip to the top-right of the card so it sits
+     visually on the same row as the title (replacing the old
+     .thread-focus-btn ↗ which has been removed — the action strip's
+     own arrow icon does the same thing). */
+  position: absolute;
+  top: 6px;
+  right: 10px;
+  width: auto;
 }
 
 .status-chip,
@@ -1130,6 +1137,13 @@ button:disabled {
   border-radius: var(--rad-s);
   background: var(--paper);
   overflow: hidden;
+  /* Don't let the flex parent (.modal-body) shrink the preview — it
+     houses the packet textarea, which is the most-used field in the
+     composer. Without this, sibling sections compete for height and
+     the textarea collapses to ~2 visible lines on shorter modals. */
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
 }
 .preview-head {
   padding: 5px 10px;
@@ -1147,13 +1161,16 @@ button:disabled {
   font-size: 12px;
   line-height: 1.55;
   /* Body is the most-used field in the composer — give it real
-     vertical room. The textarea variant below also gets full width
-     and resize=vertical so the user can grow it. */
-  min-height: 320px;
-  max-height: 60vh;
+     vertical room. height: clamp() guarantees a visible workspace
+     even when the modal is short, and lets it grow on tall screens.
+     The textarea variant below also gets resize=vertical so the user
+     can grow it further. */
+  height: clamp(320px, 50vh, 560px);
   overflow: auto;
   width: 100%;
   box-sizing: border-box;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 /* Textarea variant — same as the read-only block but resizable. */
 textarea.preview-body {
@@ -1608,6 +1625,178 @@ textarea.preview-body:focus {
   border-radius: 3px;
 }
 
+/* Inline-review draft footer — surfaces under a thread row when the
+   user has staged comments via on-page selection (content script's
+   review chip). Sibling of the queue compose form; lives in the same
+   indented block. */
+.thread-review-draft {
+  margin: 6px 12px 4px;
+  padding: 10px 12px;
+  background: var(--paper-light);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--rad-s);
+  animation: send-to-in 140ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.thread-review-draft-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin-bottom: 6px;
+}
+.thread-review-draft-head .count {
+  color: var(--signal);
+  letter-spacing: 0.06em;
+}
+.thread-review-draft-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border-radius: 99px;
+  border: 1px solid var(--signal-tint);
+  background: var(--signal-bg);
+  color: var(--signal);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+}
+.thread-review-draft-chip.on {
+  background: var(--signal);
+  color: var(--paper-light);
+  border-color: var(--signal);
+}
+.review-draft-spans {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.review-draft-span {
+  background: var(--paper);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--rad-s);
+  padding: 6px 8px;
+}
+.review-draft-quote {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-family: var(--display);
+  font-style: italic;
+  font-size: 12px;
+  color: var(--ink-2);
+  line-height: 1.4;
+  border-left: 2px solid var(--signal-tint);
+  padding-left: 8px;
+}
+.review-draft-quote-text {
+  flex: 1;
+}
+.review-draft-drop {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-3);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  padding: 0 4px;
+}
+.review-draft-drop:hover {
+  color: var(--signal);
+}
+.review-draft-comment {
+  font-family: var(--body);
+  font-size: 13px;
+  color: var(--ink);
+  margin-top: 4px;
+  padding-left: 10px;
+}
+.review-draft-overall-label {
+  display: block;
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin-bottom: 4px;
+}
+.review-draft-overall {
+  width: 100%;
+  font-family: var(--body);
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: var(--rad-s);
+  padding: 6px 8px;
+  margin-bottom: 8px;
+  resize: vertical;
+}
+.review-draft-overall:focus {
+  outline: none;
+  border-color: var(--ink-3);
+}
+.review-draft-verdict-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.review-draft-verdict-label {
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.review-draft-verdict-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.review-draft-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.review-draft-actions .grow {
+  flex: 1;
+}
+.review-draft-discard {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-3);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  padding: 4px 6px;
+}
+.review-draft-discard:hover {
+  color: var(--signal);
+}
+.review-draft-actions .btn-primary {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  padding: 4px 11px;
+  border-radius: var(--rad-s);
+  background: var(--ink);
+  color: var(--paper-light);
+  border: 1px solid var(--ink);
+  cursor: pointer;
+}
+.review-draft-actions .btn-primary:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.review-draft-actions .btn-primary:hover:not(:disabled) {
+  background: var(--signal);
+  border-color: var(--signal);
+}
+
 /* ── Tab recovery ── */
 .recovery-snapshot {
   padding: 12px 14px;
@@ -1843,7 +2032,18 @@ textarea.preview-body:focus {
   color: var(--ink);
   padding: 4px 6px;
   border-radius: var(--rad-s);
-  margin: -4px -6px;
+  /* Vertical bleed only — horizontal bleed would extend the button's
+     hit area into the adjacent grid track and steal clicks from the
+     dispatch-actions column. */
+  margin: -4px 0;
+  min-width: 0;
+}
+.dispatch-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 .dispatch-source:hover,
 .dispatch-target:hover {
@@ -1873,6 +2073,58 @@ textarea.preview-body:focus {
 }
 .dispatch-time {
   color: var(--ink-3);
+}
+
+/* Per-row action buttons — Copy / Dispatch / Archive / view, etc.
+   Two variants:
+   - .dispatch-action-primary fills with --ink for the lead action
+     (e.g. Dispatch on an unlinked auto-send row, where the user
+     should immediately see the next step).
+   - .dispatch-action-secondary uses a hairline border for less
+     prominent actions (Copy, Archive, view).
+   Both share the same monospace 10–10.5px footprint so the action
+   cell aligns regardless of which mix the row shows. */
+.dispatch-action-primary,
+.dispatch-action-secondary {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+  padding: 4px 9px;
+  border-radius: var(--rad-s);
+  cursor: pointer;
+  white-space: nowrap;
+  line-height: 14px;
+}
+.dispatch-action-secondary {
+  background: var(--paper-light);
+  border: 1px solid var(--rule);
+  color: var(--ink-2);
+}
+.dispatch-action-secondary:hover {
+  border-color: var(--ink-3);
+  color: var(--ink);
+}
+.dispatch-action-secondary:focus-visible {
+  outline: 1px solid var(--ink);
+  outline-offset: 1px;
+}
+.dispatch-action-primary {
+  background: var(--ink);
+  border: 1px solid var(--ink);
+  color: var(--paper-light);
+}
+.dispatch-action-primary:hover {
+  background: var(--signal);
+  border-color: var(--signal);
+}
+.dispatch-action-primary:focus-visible {
+  outline: 1px solid var(--signal);
+  outline-offset: 1px;
+}
+.dispatch-action-primary:disabled,
+.dispatch-action-secondary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 /* Re-view + re-download modal for a recorded dispatch. Used when
@@ -2077,6 +2329,15 @@ textarea.preview-body:focus {
 }
 .wizard-status .dot.amber {
   background: var(--amber);
+}
+.wizard-bridge-error {
+  padding: 8px 10px;
+  border-radius: var(--rad-s);
+  border: 1px solid var(--signal-tint);
+  background: var(--signal-bg);
+  color: var(--signal);
+  font-size: 11px;
+  line-height: 1.4;
 }
 .wizard-footnote {
   color: var(--ink-3);
@@ -2591,6 +2852,18 @@ textarea.preview-body:focus {
   font-weight: 500;
   letter-spacing: -0.01em;
 }
+.app-mark-dev {
+  display: inline-flex;
+  align-items: center;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--signal, #c2410c);
+  color: var(--signal, #c2410c);
+  background: var(--signal-bg, #fef3ec);
+  text-transform: uppercase;
+}
 .app-mark .glyph {
   width: 22px;
   height: 22px;
@@ -2878,7 +3151,12 @@ textarea.preview-body:focus {
   padding: 12px 8px;
 }
 .thread {
-  padding: 6px 10px;
+  position: relative;
+  /* Right padding reserves space for the absolute-positioned
+     .thread-actions strip at top-right (3 icon-buttons + gaps ~ 120px).
+     Without it, row1 content (title, queued pill, review-draft chip)
+     extends into the action-strip space and overlaps. */
+  padding: 6px 130px 6px 10px;
   border: 1px solid transparent;
   border-radius: var(--rad-m);
   margin-bottom: 2px;
@@ -2994,25 +3272,19 @@ textarea.preview-body:focus {
   }
 }
 .thread-actions {
-  gap: 10px;
-  padding-top: 4px;
+  /* Always visible per v2 design — the action strip is part of the
+     card surface, not a hover affordance. */
+  gap: 6px;
+  padding-top: 1px;
   flex-wrap: wrap;
-  max-height: 0;
-  opacity: 0;
-  overflow: hidden;
-  transition:
-    max-height 140ms ease,
-    opacity 140ms ease,
-    padding-top 140ms ease;
 }
-.thread:hover .thread-actions,
-.thread:focus-within .thread-actions {
-  /* 8+ wrappable buttons (Open Queue Send Review Move Stop Archive
-     Auto-send) need room for two rows on narrow side-panel widths.
-     The earlier 60px cap clipped Move/Stop/Archive/Auto-send. */
-  max-height: 140px;
-  opacity: 1;
-  padding-top: 6px;
+/* When the ⋯ overflow menu is open, switch .thread-actions to
+   overflow: visible so the absolute-positioned popup escapes the
+   row's slide-down clip rect. The Send-to dropdown no longer needs
+   this — it renders inline as a sibling panel (see
+   `.thread-send-to-inline` below). */
+.thread-actions:has(.thread-overflow-menu) {
+  overflow: visible;
 }
 .thread-actions .btn-link {
   font-family: var(--mono, 'JetBrains Mono', ui-monospace, monospace);
@@ -3026,6 +3298,51 @@ textarea.preview-body:focus {
   cursor: pointer;
   white-space: nowrap;
   flex: 0 0 auto;
+}
+/* Icon-only action buttons (Open, Send to, ⋯) — match the GEMINI
+   provider chip's tone (1px hairline + paper-light fill) so the
+   buttons read as tappable instead of decorative strokes. */
+.thread-actions .thread-action-icon {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 7px;
+  border: 1px solid var(--rule-soft, #e5ddc9);
+  border-radius: 4px;
+  background: var(--paper-light, #fbf7ee);
+  color: var(--ink-3, #7a7269);
+  /* Override the global `button { min-height: 34px }` — the icon
+     buttons should size to their 13px icon + 4px padding pair. */
+  min-height: 0;
+  line-height: 1;
+  transition:
+    border-color 120ms ease,
+    color 120ms ease,
+    background-color 120ms ease;
+}
+.thread-actions .thread-action-icon:hover,
+.thread-actions .thread-action-icon:focus-visible {
+  border-color: var(--rule, #d4cdb8);
+  background: var(--paper, #f5efe2);
+  color: var(--signal, #c2410c);
+  outline: none;
+}
+.thread-actions .thread-action-icon.disabled-look {
+  opacity: 0.5;
+}
+.thread-actions .thread-action-icon .icon-12 {
+  width: 13px;
+  height: 13px;
+  display: inline-flex;
+}
+.thread-actions .thread-action-icon .icon-12 svg {
+  width: 13px;
+  height: 13px;
+}
+.thread-actions .thread-action-caret {
+  font-size: 9px;
+  line-height: 1;
+  color: var(--ink-4, #a39a8c);
 }
 .thread-actions .btn-link:hover {
   color: var(--signal, #c2410c);
@@ -3072,9 +3389,11 @@ textarea.preview-body:focus {
 }
 .thread-turn-card {
   display: grid;
-  grid-template-columns: 50px 1fr auto;
+  /* "ASSISTANT" at 9.5px + 0.08em letter-spacing + 4px padding needs
+     ~70px; the old 50px column truncated the role chip text. */
+  grid-template-columns: 70px minmax(0, 1fr) auto;
   gap: 6px 8px;
-  align-items: baseline;
+  align-items: start;
   padding: 3px 6px;
   border-radius: var(--rad-s);
   background: var(--paper);
@@ -3187,21 +3506,35 @@ textarea.preview-body:focus {
    Thread history strip — captures rendered inline under a thread
    ===================================================== */
 .thread-history {
-  margin: 4px 0 0;
-  padding: 4px 0 0;
+  /* Tight margins so the "+ note" affordance and any notes sit
+     close to the lifecycle row above and the card's bottom edge
+     below — no extra vertical band. */
+  margin: 2px 0 0;
+  padding: 2px 0 0;
   border-top: 1px dashed transparent;
-  display: flex;
+  /* Collapsed by default — empty cards (no notes, no open compose)
+     don't reserve vertical space for an invisible "+ note" button.
+     Revealed when the strip has real content OR the card is being
+     interacted with (hover / focus). */
+  display: none;
   flex-direction: column;
   gap: 2px;
 }
-/* Show the dashed separator only when the strip actually has content
-   (the inline note list, the compose form, or the disclosure
-   button). React always renders the .thread-history wrapper; we use
-   :has to scope the border to non-empty states so empty threads
-   don't carry an orphan dashed line. */
 .thread-history:has(.thread-history-item),
 .thread-history:has(.thread-history-compose),
-.thread:hover .thread-history {
+.thread:hover .thread-history,
+.thread:focus-within .thread-history {
+  display: flex;
+}
+/* Show the dashed separator only when the strip has REAL content —
+   notes or an open compose form. The earlier `.thread:hover` arm
+   made the line appear on every hover, even for cards whose strip
+   only holds a "+ note" affordance, putting a heavy stroke between
+   the action row and a single small button. With the action strip
+   now always visible (no hover toggle) the strip's hover state no
+   longer needs the dashed reveal — drop it. */
+.thread-history:has(.thread-history-item),
+.thread-history:has(.thread-history-compose) {
   border-top-color: var(--rule, rgba(27, 25, 22, 0.12));
 }
 .thread-history-empty {
@@ -3257,25 +3590,34 @@ textarea.preview-body:focus {
   color: var(--signal);
 }
 .thread-history-add {
-  display: inline-flex;
+  /* Hidden entirely (display:none) so it doesn't take vertical
+     space on un-highlighted cards. Revealed on hover / focus —
+     layout shift on hover is acceptable when the user is actively
+     interacting with the card. Stays visible when the strip
+     already has notes. */
+  display: none;
   align-self: flex-start;
-  margin-top: 2px;
+  margin: 0;
   font-family: var(--mono);
   font-size: 10px;
+  line-height: 1.2;
   letter-spacing: 0.04em;
   color: var(--ink-4);
   background: transparent;
   border: 0;
   padding: 0;
-  opacity: 0;
-  transition:
-    opacity 120ms ease,
-    color 120ms ease;
+  /* Override the global `button { min-height: 34px }` so the
+     "+ note" affordance is just its text height — no padding
+     hardcoded by the global reset. */
+  min-height: 0;
   cursor: pointer;
+  transition: color 120ms ease;
 }
 .thread:hover .thread-history-add,
-.thread:focus-within .thread-history-add {
-  opacity: 1;
+.thread:focus-within .thread-history-add,
+.thread-history:has(.thread-history-item) .thread-history-add,
+.thread-history:has(.thread-history-compose) .thread-history-add {
+  display: inline-flex;
 }
 .thread-history-add:hover {
   color: var(--signal);
@@ -3310,29 +3652,31 @@ textarea.preview-body:focus {
   padding: 8px 12px;
 }
 
-/* Send-to dropdown — anchored under the thread row's "Send to ▾"
-   button. One-tap dispatch picker for the 70% case. Sections:
-   Recent (if any) → Ask another AI → Hand to coding agent →
-   Export → Customize first. */
-.send-to-anchor {
-  position: relative;
-  display: inline-flex;
+/* Send-to dropdown — rendered inline as a panel inside the thread
+   card (sibling of `.thread-actions`). Floating popovers anchored
+   under the trigger don't fit a narrow side-panel viewport without
+   overflowing — the inline layout always fits the card width.
+   Sections: Recent (if any) → Ask another AI → Hand to coding agent
+   → Export → Customize first. */
+.thread-send-to-inline {
+  margin: 6px 12px 4px;
+  animation: send-to-in 140ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+@keyframes send-to-in {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 .send-to-menu {
-  position: absolute;
-  top: calc(100% + 4px);
-  right: 0;
-  left: auto;
-  min-width: 220px;
-  max-width: calc(100vw - 24px);
-  max-height: 60vh;
-  overflow-y: auto;
   background: var(--paper-light);
   border: var(--hair);
   border-radius: var(--rad-s);
-  box-shadow: 0 8px 24px rgba(27, 25, 22, 0.16);
   padding: 4px;
-  z-index: 100;
   display: flex;
   flex-direction: column;
 }
@@ -3341,35 +3685,43 @@ textarea.preview-body:focus {
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--ink-3);
-  padding: 6px 10px 2px;
+  padding: 6px 6px 2px;
 }
 .send-to-divider {
   height: 1px;
   background: var(--rule-soft, #e5ddc9);
   margin: 4px 0;
 }
-.send-to-item {
+/* Each section's targets sit as wrap-friendly chips so the inline
+   panel stays compact on a narrow side-panel viewport. */
+.send-to-row {
   display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 0 4px 2px;
+}
+.send-to-item {
+  display: inline-flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 6px 10px;
+  gap: 6px;
+  padding: 4px 10px;
   background: transparent;
-  border: 0;
-  border-radius: var(--rad-s);
+  border: 1px solid var(--rule-soft, #e5ddc9);
+  border-radius: 999px;
   cursor: pointer;
   text-align: left;
   font-family: var(--display);
-  font-size: 12.5px;
+  font-size: 12px;
   color: var(--ink);
   white-space: nowrap;
 }
 .send-to-item:hover {
   background: var(--paper-deep);
+  border-color: var(--ink-3);
 }
 .send-to-item:focus-visible {
   outline: 1px solid var(--ink);
-  outline-offset: -1px;
+  outline-offset: 1px;
 }
 .send-to-item-extra {
   font-size: 9.5px;
@@ -3377,8 +3729,14 @@ textarea.preview-body:focus {
   color: var(--ink-3);
 }
 .send-to-customize {
+  margin: 4px 6px 2px;
   font-style: italic;
   color: var(--ink-2);
+  border-radius: var(--rad-s);
+  border: 0;
+}
+.send-to-customize:hover {
+  background: var(--paper-deep);
 }
 
 /* Build identity footer — small, low-contrast, sits at the very
@@ -3477,6 +3835,61 @@ textarea.preview-body:focus {
   outline: none;
   border-color: var(--signal, #c2410c);
   box-shadow: 0 0 0 2px var(--signal-tint, #fed7aa);
+}
+/* Count chip inside the v2 sp-tabs (e.g. "All threads 12"). */
+.view-tab .ct {
+  margin-left: 5px;
+  color: var(--ink-4, #a39a8c);
+  font-size: 9px;
+}
+.view-tab.on .ct {
+  color: var(--ink-3, #7a7269);
+}
+
+/* Header status pills (vault + companion) — sit just under the
+   .view-tabs row so the user can glance at health without diving
+   into Settings. */
+.sp-status {
+  display: flex;
+  gap: 8px;
+  padding: 4px 12px 6px;
+  border-bottom: 1px solid var(--rule-soft, #e5ddc9);
+}
+.sp-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 99px;
+  border: 1px solid var(--rule-soft, #e5ddc9);
+  background: var(--paper-light, #fbf7ee);
+  color: var(--ink-3, #7a7269);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+}
+.sp-status-pill.warn {
+  border-color: #d6a256;
+  color: #6b4500;
+}
+.sp-status-pill.err {
+  border-color: #b91c1c;
+  color: #b91c1c;
+}
+.sp-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ink-4, #a39a8c);
+  flex: none;
+}
+.sp-status-dot.green {
+  background: #166534;
+}
+.sp-status-dot.amber {
+  background: #a16207;
+}
+.sp-status-dot.red {
+  background: #b91c1c;
 }
 
 /* All-threads view groups */
@@ -3661,6 +4074,12 @@ button.thread-queued:focus-visible {
   display: flex;
   justify-content: flex-end;
 }
+.queue-empty-hint {
+  list-style: none;
+  font-size: 10px;
+  color: var(--ink-4, #a39a8c);
+  padding: 4px 4px 0;
+}
 .queue-row {
   display: grid;
   grid-template-columns: 16px minmax(0, 1fr) auto;
@@ -3672,6 +4091,28 @@ button.thread-queued:focus-visible {
   background: var(--paper, #f5efe2);
   font-size: 11px;
   line-height: 1.35;
+}
+.queue-row.draggable {
+  grid-template-columns: 14px 16px minmax(0, 1fr) auto;
+  cursor: grab;
+}
+.queue-row.draggable:active {
+  cursor: grabbing;
+}
+.queue-row.drag-over {
+  border-top: 2px solid var(--signal, #c2410c);
+  padding-top: 6px;
+}
+.queue-row-grip {
+  color: var(--ink-4, #a39a8c);
+  user-select: none;
+  font-size: 12px;
+  line-height: 1;
+  padding-top: 2px;
+  letter-spacing: -1px;
+}
+.queue-row.draggable:hover .queue-row-grip {
+  color: var(--ink-2, #4a453d);
 }
 .queue-row.active {
   background: var(--paper-light, #fbf7ee);
@@ -3766,17 +4207,31 @@ button.thread-queued:focus-visible {
 
 .thread-ws-path {
   display: inline-flex;
-  margin: 2px 0 0 26px;
+  /* Inline-block so it sits alongside the lifecycle row, not on its
+     own line. Self-aligned to the row2 baseline by the parent flex.
+     Tight margin so there's no vertical band when the card has no
+     other content underneath. */
+  align-self: center;
+  margin: 0 0 0 14px;
   padding: 0;
   border: 0;
   background: transparent;
   color: var(--ink-4, #a39a8c);
-  font-size: 11px;
+  font-size: 10.5px;
   cursor: pointer;
+  /* Override the global `button { min-height: 34px }` so the
+     workstream-path button is just its text height — same fix
+     applied to .thread-history-add and .thread-action-icon. */
+  min-height: 0;
+  line-height: 1.4;
+  /* Never-underlined, only color-shift on hover — keeps the path
+     reading as metadata, not a hyperlink. */
+  text-decoration: none;
 }
-.thread-ws-path:hover {
+.thread-ws-path:hover,
+.thread-ws-path:focus-visible {
   color: var(--ink-2, #4a453d);
-  text-decoration: underline;
+  outline: none;
 }
 
 .thread-actions .btn-link.archive {
@@ -3814,6 +4269,22 @@ button.thread-queued:focus-visible {
   text-underline-offset: 2px;
 }
 
+.queue-compose-row {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.queue-compose-row .thread-queue-compose {
+  margin-top: 0;
+  padding: 6px 8px;
+  border: 1px dashed var(--rule-soft, #e5ddc9);
+  border-radius: 4px;
+  background: var(--paper-light, #fbf7ee);
+}
+.queue-compose-row.drag-over-tail .thread-queue-compose {
+  border-color: var(--signal, #c2410c);
+  background: var(--paper, #f5efe2);
+}
 .thread-queue-compose {
   display: flex;
   gap: 6px;
@@ -3914,6 +4385,83 @@ button.btn-link.lineage-name {
 }
 button.btn-link.lineage-name:hover {
   color: var(--signal, #c2410c);
+}
+
+/* Outgoing dispatches surfaced inside the source thread card.
+   Mirrors the lineage row's tone (italic display font, monospace
+   metadata) but uses ↗ to read as "this thread shipped a packet to
+   X" rather than "branched from X". */
+.thread-dispatched-list {
+  list-style: none;
+  margin: 4px 0 0 24px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.thread-dispatched-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  color: var(--ink-3, #7a7269);
+  min-width: 0;
+}
+.thread-dispatched-row .lineage-arrow {
+  color: var(--ink-4, #a39a8c);
+  font-size: 11px;
+  flex: none;
+}
+.thread-dispatched-target {
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  border: 1px solid var(--rule, #d4cdb8);
+  border-radius: 3px;
+  background: var(--paper, #f5efe2);
+  color: var(--ink-2, #4a453d);
+  flex: none;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease;
+}
+.thread-dispatched-row:hover .thread-dispatched-target {
+  background: var(--signal-bg, #fef3ec);
+  border-color: var(--signal-tint, #fed7aa);
+  color: var(--signal, #c2410c);
+}
+.thread-dispatched-name {
+  font-family: var(--display, 'Fraunces', Georgia, serif);
+  font-size: 12px;
+  color: var(--ink-2, #4a453d);
+  font-style: italic;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+button.btn-link.thread-dispatched-name {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+}
+button.btn-link.thread-dispatched-name:hover {
+  color: var(--signal, #c2410c);
+}
+.thread-dispatched-name.muted {
+  color: var(--ink-4, #a39a8c);
+  font-style: italic;
+}
+.thread-dispatched-when {
+  color: var(--ink-4, #a39a8c);
+  font-size: 9.5px;
+  flex: none;
 }
 
 /* =====================================================
@@ -5643,9 +6191,11 @@ pre.diff {
 }
 
 /* Thread-row action overflow menu — collapses Queue/Review/Move/Stop/
-   Archive behind a ⋯ button, leaving Open + Send to ▾ visible. */
+   Archive behind a ⋯ button, leaving the open + send icons visible.
+   The .thread-actions rule above already sets position: absolute, so
+   it's its own containing block — the menu inside inherits the
+   right-anchor positioning from that. */
 .thread-overflow-anchor {
-  position: relative;
   display: inline-flex;
 }
 .thread-overflow-trigger {
@@ -5654,12 +6204,21 @@ pre.diff {
   letter-spacing: 0.1em;
   padding: 2px 8px;
   line-height: 1;
+  /* Override the global `button { min-height: 34px }` — sized
+     to its glyph + padding (~17px) so it lines up with the
+     other action icons. */
+  min-height: 0;
 }
 .thread-overflow-menu {
   position: absolute;
   top: calc(100% + 4px);
+  /* Anchor the menu's right edge to the trigger button (the ⋯
+     overflow icon, which is itself flush against the card's right
+     edge). Opens to the LEFT so it never clips off the side panel
+     on narrow widths. */
   right: 0;
-  min-width: 180px;
+  left: auto;
+  min-width: 200px;
   background: var(--paper-light);
   border: var(--hair);
   border-radius: var(--rad-s);
@@ -5695,7 +6254,8 @@ pre.diff {
 .thread-overflow-menu button:hover {
   background: var(--paper-deep);
 }
-.thread-overflow-menu button.archive {
+.thread-overflow-menu button.archive,
+.thread-overflow-menu button.warn {
   color: var(--signal);
 }
 .thread-overflow-menu button.disabled-look {

@@ -1,0 +1,2011 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Browser-AI Companion · Design Spec v1.0 · April 2026</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght,SOFT@9..144,300..900,0..100&family=Source+Serif+4:ital,opsz,wght@0,8..60,200..900;1,8..60,200..900&family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+  /* =========================================================
+     DESIGN TOKENS
+     ========================================================= */
+  :root {
+    /* Paper & Ink */
+    --paper:        #F5EFE2;
+    --paper-light:  #FBF7EE;
+    --paper-tinted: #EDE5D2;
+    --paper-deep:   #E8DFC8;
+    --ink:          #1B1916;
+    --ink-2:        #4A453D;
+    --ink-3:        #7A7269;
+    --ink-4:        #A39A8C;
+    --rule:         #D4CDB8;
+    --rule-soft:    #E5DDC9;
+
+    /* Single signal accent — used only for LIVE signals */
+    --signal:       #C2410C;
+    --signal-2:     #EA580C;
+    --signal-tint:  #FED7AA;
+    --signal-bg:    #FFF7ED;
+
+    /* Status semantics */
+    --amber:        #A16207;
+    --amber-tint:   #FEF3C7;
+    --amber-bg:     #FFFBEB;
+    --green:        #166534;
+    --green-tint:   #DCFCE7;
+    --green-bg:     #F0FDF4;
+    --slate:        #475569;
+    --slate-bg:     #F1F5F9;
+
+    /* Type */
+    --display: 'Fraunces', 'EB Garamond', Georgia, serif;
+    --body:    'Source Serif 4', 'Source Serif Pro', Georgia, serif;
+    --mono:    'JetBrains Mono', 'IBM Plex Mono', ui-monospace, monospace;
+
+    /* Rhythm */
+    --r1: 4px;  --r2: 8px;  --r3: 12px; --r4: 16px;
+    --r5: 24px; --r6: 32px; --r7: 48px; --r8: 64px;
+
+    /* Frame radii */
+    --rad-s: 4px;  --rad-m: 6px;  --rad-l: 10px;
+
+    /* Hairlines */
+    --hair: 1px solid var(--rule);
+    --hair-soft: 1px solid var(--rule-soft);
+  }
+
+  /* =========================================================
+     RESET & BASE
+     ========================================================= */
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  html { background: var(--paper); }
+  body {
+    font-family: var(--body);
+    font-size: 16px;
+    line-height: 1.55;
+    color: var(--ink);
+    background:
+      radial-gradient(1200px 600px at 80% -10%, rgba(194,65,12,0.04), transparent 60%),
+      radial-gradient(800px 500px at -5% 30%, rgba(166,98,7,0.04), transparent 60%),
+      var(--paper);
+    background-attachment: fixed;
+    min-height: 100vh;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-feature-settings: "kern" 1, "liga" 1;
+  }
+  /* Hairline graph-paper texture, very faint */
+  body::before {
+    content: "";
+    position: fixed; inset: 0;
+    background-image:
+      linear-gradient(to right, rgba(27,25,22,0.025) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(27,25,22,0.025) 1px, transparent 1px);
+    background-size: 32px 32px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* =========================================================
+     LAYOUT WRAPPERS
+     ========================================================= */
+  .page {
+    max-width: 1320px;
+    margin: 0 auto;
+    padding: var(--r8) var(--r6) var(--r8);
+    position: relative;
+    z-index: 1;
+  }
+
+  /* =========================================================
+     EDITORIAL HEADER
+     ========================================================= */
+  .masthead { border-top: 2px solid var(--ink); padding-top: var(--r4); margin-bottom: var(--r8); }
+  .masthead .top-rule {
+    display: flex; justify-content: space-between; align-items: center;
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--ink-2);
+    padding-bottom: var(--r5); border-bottom: var(--hair);
+  }
+  .masthead .top-rule .crest { display: flex; align-items: center; gap: var(--r3); }
+  .masthead .top-rule .crest .mk { width: 18px; height: 18px; border: 1.5px solid var(--ink); display: grid; place-items: center; border-radius: 50%; }
+  .masthead .top-rule .crest .mk::after { content: ""; width: 6px; height: 6px; background: var(--signal); border-radius: 50%; }
+  .masthead h1 {
+    font-family: var(--display);
+    font-weight: 400; font-style: normal;
+    font-size: clamp(56px, 9vw, 112px);
+    letter-spacing: -0.04em;
+    line-height: 0.95;
+    margin: var(--r6) 0 var(--r5);
+    font-variation-settings: "opsz" 144, "SOFT" 100;
+  }
+  .masthead h1 em { font-style: italic; font-weight: 350; color: var(--signal); }
+  .masthead .standfirst {
+    font-family: var(--body); font-style: italic; font-weight: 300;
+    font-size: 22px; line-height: 1.45; max-width: 880px; color: var(--ink-2);
+    margin-bottom: var(--r6);
+  }
+  .masthead .meta-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--r5);
+    border-top: var(--hair); padding-top: var(--r4);
+  }
+  .meta-grid > div { font-family: var(--mono); font-size: 11px; line-height: 1.5; color: var(--ink-2); }
+  .meta-grid .lbl { display: block; font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-3); margin-bottom: var(--r1); }
+
+  /* =========================================================
+     SECTION
+     ========================================================= */
+  section.spec { margin-bottom: var(--r8); position: relative; }
+  .spec-head { display: grid; grid-template-columns: 80px 1fr; gap: var(--r5); margin-bottom: var(--r6); align-items: baseline; }
+  .spec-num {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em;
+    color: var(--signal); text-transform: uppercase;
+    border-top: 2px solid var(--signal); padding-top: var(--r2);
+  }
+  .spec-title { font-family: var(--display); font-weight: 400; font-size: 40px; letter-spacing: -0.025em; line-height: 1.05; margin: 0 0 var(--r2); font-variation-settings: "opsz" 72; }
+  .spec-title em { font-style: italic; font-weight: 350; color: var(--ink-2); }
+  .spec-caption { font-family: var(--body); font-style: italic; font-size: 17px; color: var(--ink-2); max-width: 640px; line-height: 1.55; }
+
+  /* =========================================================
+     DEVICE FRAMES
+     ========================================================= */
+  .frame {
+    position: relative;
+    background: var(--paper-light);
+    border: 1px solid var(--ink);
+    border-radius: var(--rad-l);
+    box-shadow:
+      0 1px 0 0 rgba(27,25,22,0.04),
+      0 12px 24px -16px rgba(27,25,22,0.18),
+      0 36px 60px -32px rgba(27,25,22,0.22);
+    overflow: hidden;
+  }
+  .frame .titlebar {
+    display: flex; align-items: center; gap: var(--r2);
+    padding: 8px 12px;
+    border-bottom: var(--hair-soft);
+    background: var(--paper);
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3);
+  }
+  .frame .titlebar .dots { display: flex; gap: 5px; margin-right: var(--r2); }
+  .frame .titlebar .dots span { width: 8px; height: 8px; border-radius: 50%; background: var(--rule); display: block; }
+  .frame .titlebar .url { color: var(--ink-3); font-size: 10px; }
+  .frame .titlebar .url b { color: var(--ink); font-weight: 500; }
+
+  .frame--sidepanel { width: 380px; }
+  .frame--sidepanel .titlebar { background: var(--paper-deep); }
+  .frame--obsidian { width: 100%; max-width: 920px; }
+  .frame--modal { width: 480px; }
+  .frame--flyout { width: 320px; }
+  .frame--wizard { width: 520px; }
+
+  /* =========================================================
+     SHARED COMPONENT STYLES (inside frames)
+     ========================================================= */
+
+  /* App chrome */
+  .app {
+    padding: 0;
+    color: var(--ink);
+    background: var(--paper-light);
+  }
+  .app-head {
+    padding: 14px 16px 12px;
+    border-bottom: var(--hair-soft);
+    display: flex; align-items: center; justify-content: space-between;
+    background: var(--paper-light);
+  }
+  .app-mark {
+    display: flex; align-items: center; gap: 8px;
+    font-family: var(--display); font-size: 17px; font-weight: 500; letter-spacing: -0.01em;
+  }
+  .app-mark .glyph {
+    width: 22px; height: 22px; border: 1.5px solid var(--ink); border-radius: 50%;
+    display: grid; place-items: center;
+    position: relative;
+  }
+  .app-mark .glyph::before {
+    content: ""; position: absolute; inset: 4px; border-radius: 50%;
+    background: var(--signal);
+  }
+  .app-mark .glyph::after {
+    content: ""; position: absolute; left: 50%; top: 50%;
+    width: 16px; height: 1.5px; background: var(--ink);
+    transform: translate(-50%, -50%) rotate(35deg);
+  }
+  .app-mark span.bac { font-style: italic; font-weight: 400; color: var(--ink-2); }
+  .app-actions { display: flex; gap: 4px; }
+  .icon-btn {
+    width: 28px; height: 28px; display: grid; place-items: center;
+    border: 1px solid transparent; border-radius: var(--rad-s);
+    background: transparent; color: var(--ink-2); cursor: pointer;
+    transition: background 120ms ease, border-color 120ms ease;
+  }
+  .icon-btn:hover { background: var(--paper-deep); border-color: var(--rule); }
+  .icon-btn svg { width: 16px; height: 16px; stroke-width: 1.6; stroke: currentColor; fill: none; }
+
+  /* Workstream selector */
+  .ws-bar {
+    padding: 10px 16px;
+    border-bottom: var(--hair-soft);
+    display: flex; align-items: center; gap: var(--r2);
+    background: var(--paper);
+    font-family: var(--mono); font-size: 11px; color: var(--ink-2);
+  }
+  .ws-bar .lbl { font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-3); }
+  .ws-bar .ws-name {
+    font-family: var(--mono); font-size: 11px; color: var(--ink);
+    font-weight: 500; letter-spacing: -0.005em;
+    background: var(--signal-bg);
+    border: 1px solid var(--signal-tint);
+    padding: 2px 8px; border-radius: var(--rad-s);
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .ws-bar .ws-name::before {
+    content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--signal);
+    box-shadow: 0 0 0 3px rgba(194,65,12,0.18);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 3px rgba(194,65,12,0.18); }
+    50% { box-shadow: 0 0 0 6px rgba(194,65,12,0.06); }
+  }
+  .ws-bar .swap-arrow { margin-left: auto; color: var(--ink-3); font-size: 11px; }
+
+  /* Section heading inside app */
+  .sec-head {
+    font-family: var(--mono); font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--ink-3); padding: 14px 16px 8px;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .sec-head .count { color: var(--ink-4); font-size: 9px; }
+
+  /* Thread cards */
+  .thread-list { padding: 0 8px; }
+  .thread {
+    padding: 10px 12px;
+    border: 1px solid transparent;
+    border-radius: var(--rad-m);
+    margin-bottom: 4px;
+    cursor: pointer;
+    transition: background 120ms ease, border-color 120ms ease;
+  }
+  .thread:hover { background: var(--paper); border-color: var(--rule-soft); }
+  .thread .row1 {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 4px;
+  }
+  .thread .provider {
+    font-family: var(--mono); font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase;
+    padding: 1px 6px; border-radius: 3px; border: 1px solid var(--rule);
+    color: var(--ink-2); background: var(--paper);
+    flex: none;
+  }
+  .thread .provider.gpt    { color: #1B5E3F; border-color: #BFE2D2; background: #F0FAF5; }
+  .thread .provider.claude { color: #884617; border-color: #F1D6BF; background: #FBF1E8; }
+  .thread .provider.gemini { color: #2E4A8C; border-color: #C8D5F0; background: #F2F5FC; }
+  .thread .name {
+    font-family: var(--display); font-weight: 500; font-size: 14px;
+    letter-spacing: -0.005em; color: var(--ink);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .thread .row2 {
+    display: flex; align-items: center; gap: 8px;
+    font-family: var(--mono); font-size: 10.5px; color: var(--ink-3);
+    line-height: 1.45;
+  }
+  .thread .row2 .dot {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--ink-4);
+    flex: none;
+  }
+  .thread .row2 .dot.green   { background: var(--green); }
+  .thread .row2 .dot.amber   { background: var(--amber); animation: pulse-amber 2.4s infinite; }
+  .thread .row2 .dot.signal  { background: var(--signal); animation: pulse-signal 1.6s infinite; }
+  .thread .row2 .dot.gray    { background: var(--ink-4); }
+  @keyframes pulse-amber {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(161,98,7,0.4); }
+    50% { box-shadow: 0 0 0 4px rgba(161,98,7,0); }
+  }
+  @keyframes pulse-signal {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(194,65,12,0.5); }
+    50% { box-shadow: 0 0 0 5px rgba(194,65,12,0); }
+  }
+  .thread .row2 .stamp { color: var(--ink-3); }
+  .thread .row2 .badge {
+    margin-left: auto; font-family: var(--mono); font-size: 9px; letter-spacing: 0.06em; text-transform: uppercase;
+    padding: 1px 6px; border-radius: 3px;
+    color: var(--amber); background: var(--amber-bg); border: 1px solid var(--amber-tint);
+  }
+  .thread .drift-line {
+    margin-top: 6px; padding: 6px 8px;
+    background: var(--amber-bg); border: 1px solid var(--amber-tint); border-radius: var(--rad-s);
+    font-family: var(--mono); font-size: 10px; color: var(--amber); display: flex; gap: 6px; align-items: center;
+  }
+  .thread .drift-line svg { width: 12px; height: 12px; stroke-width: 1.7; stroke: currentColor; fill: none; }
+
+  /* Recent captures row */
+  .capture {
+    padding: 8px 12px; display: grid; grid-template-columns: 16px 1fr; gap: 10px; align-items: start;
+    margin: 0 8px; border-radius: var(--rad-s); cursor: pointer;
+  }
+  .capture:hover { background: var(--paper); }
+  .capture svg { width: 14px; height: 14px; margin-top: 2px; stroke-width: 1.6; stroke: var(--ink-3); fill: none; }
+  .capture .text {
+    font-family: var(--body); font-size: 13px; line-height: 1.45; color: var(--ink-2);
+    overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  }
+  .capture .meta { font-family: var(--mono); font-size: 9.5px; color: var(--ink-3); margin-top: 3px; letter-spacing: 0.02em; }
+
+  /* Composer */
+  .composer {
+    border-top: var(--hair-soft); margin-top: var(--r3);
+    padding: 12px 14px 14px; background: var(--paper);
+  }
+  .composer textarea {
+    width: 100%; min-height: 56px; resize: none;
+    border: 1px solid var(--rule); border-radius: var(--rad-m);
+    background: var(--paper-light); color: var(--ink);
+    font-family: var(--body); font-size: 14px; line-height: 1.5;
+    padding: 9px 11px;
+    outline: none; transition: border-color 120ms ease, box-shadow 120ms ease;
+  }
+  .composer textarea:focus { border-color: var(--signal); box-shadow: 0 0 0 3px rgba(194,65,12,0.1); }
+  .composer textarea::placeholder { color: var(--ink-4); font-style: italic; }
+  .composer .targets {
+    display: flex; gap: 4px; flex-wrap: wrap; margin-top: 8px; align-items: center;
+  }
+  .target-chip {
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.04em;
+    padding: 3px 8px; border-radius: 99px;
+    border: 1px solid var(--rule); background: var(--paper-light); color: var(--ink-2);
+    display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+  }
+  .target-chip.on { background: var(--ink); color: var(--paper-light); border-color: var(--ink); }
+  .target-chip.on::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: var(--signal); }
+  .target-chip:not(.on)::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: var(--ink-4); }
+  .composer .footer-row {
+    display: flex; align-items: center; gap: 8px; margin-top: 10px;
+  }
+  .composer .preflight {
+    font-family: var(--mono); font-size: 10px; color: var(--green);
+    display: inline-flex; align-items: center; gap: 5px;
+  }
+  .composer .preflight svg { width: 12px; height: 12px; stroke-width: 1.8; stroke: currentColor; fill: none; }
+  .send-btn {
+    margin-left: auto;
+    font-family: var(--display); font-size: 13px; font-weight: 500;
+    background: var(--ink); color: var(--paper-light);
+    border: 1px solid var(--ink); border-radius: var(--rad-m);
+    padding: 6px 14px; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 6px;
+    transition: background 120ms ease;
+  }
+  .send-btn:hover { background: var(--signal); border-color: var(--signal); }
+  .send-btn svg { width: 13px; height: 13px; stroke-width: 1.8; stroke: currentColor; fill: none; }
+
+  /* =========================================================
+     DÉJÀ-VU CARD
+     ========================================================= */
+  .deja {
+    margin: 12px 12px 0;
+    border: 1px solid var(--signal);
+    background: var(--signal-bg);
+    border-radius: var(--rad-m);
+    padding: 12px 14px;
+    position: relative;
+  }
+  .deja::before {
+    content: ""; position: absolute; left: -3px; top: 14px; bottom: 14px; width: 3px;
+    background: var(--signal); border-radius: 99px;
+  }
+  .deja .head {
+    display: flex; align-items: center; gap: 6px;
+    font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.1em; text-transform: uppercase;
+    color: var(--signal); margin-bottom: 6px;
+  }
+  .deja .head svg { width: 12px; height: 12px; stroke-width: 1.8; stroke: currentColor; fill: none; }
+  .deja .body {
+    font-family: var(--display); font-style: italic; font-weight: 400; font-size: 15px;
+    color: var(--ink); line-height: 1.4; letter-spacing: -0.005em; margin-bottom: 4px;
+  }
+  .deja .body .term { font-style: normal; font-weight: 600; color: var(--ink); background: var(--signal-tint); padding: 0 3px; border-radius: 2px; }
+  .deja .snippet {
+    font-family: var(--body); font-size: 12.5px; color: var(--ink-2); line-height: 1.5;
+    margin: 8px 0; padding-left: 10px; border-left: 2px solid var(--signal-tint);
+  }
+  .deja .snippet em { color: var(--ink-3); }
+  .deja .actions { display: flex; gap: 6px; margin-top: 10px; }
+  .deja .ghost-btn {
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.02em;
+    background: transparent; border: 1px solid var(--signal-tint); color: var(--signal);
+    padding: 4px 9px; border-radius: var(--rad-s); cursor: pointer;
+  }
+  .deja .ghost-btn.primary { background: var(--signal); color: var(--paper-light); border-color: var(--signal); }
+  .deja .ghost-btn:hover { background: var(--signal-tint); }
+  .deja .ghost-btn.primary:hover { background: var(--signal-2); }
+
+  /* =========================================================
+     ON-PAGE FLYOUT
+     ========================================================= */
+  .flyout {
+    background: var(--paper-light);
+    border: 1px solid var(--ink);
+    border-radius: var(--rad-l);
+    padding: 12px;
+    box-shadow:
+      0 1px 0 rgba(27,25,22,0.04),
+      0 14px 32px -10px rgba(27,25,22,0.25),
+      0 30px 60px -20px rgba(27,25,22,0.18);
+    width: 320px;
+  }
+  .flyout-quote {
+    font-family: var(--display); font-style: italic; font-size: 13px;
+    color: var(--ink-2); padding: 6px 10px;
+    background: var(--paper); border-radius: var(--rad-s);
+    border-left: 2px solid var(--signal); margin-bottom: 10px;
+    line-height: 1.5;
+  }
+  .flyout-section {
+    font-family: var(--mono); font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--ink-3); margin: 10px 0 6px; display: flex; align-items: center; justify-content: space-between;
+  }
+  .flyout-row { display: flex; flex-wrap: wrap; gap: 4px; }
+  .flyout-pill {
+    font-family: var(--mono); font-size: 10px;
+    padding: 4px 9px; border-radius: 99px;
+    border: 1px solid var(--rule); background: var(--paper);
+    color: var(--ink); display: inline-flex; align-items: center; gap: 5px;
+    cursor: pointer; transition: all 120ms ease;
+  }
+  .flyout-pill:hover { border-color: var(--ink); }
+  .flyout-pill .marker { width: 5px; height: 5px; border-radius: 50%; }
+  .flyout-pill .marker.gpt { background: #1B5E3F; }
+  .flyout-pill .marker.claude { background: #884617; }
+  .flyout-pill .marker.gemini { background: #2E4A8C; }
+  .flyout-pill .marker.search { background: var(--ink-3); }
+  .flyout-pill .marker.notebook { background: var(--ink); }
+  .flyout-pill.active { background: var(--ink); color: var(--paper-light); border-color: var(--ink); }
+  .flyout-footer {
+    margin-top: 12px; padding-top: 10px; border-top: var(--hair-soft);
+    font-family: var(--mono); font-size: 10px; color: var(--amber);
+    display: flex; align-items: center; gap: 6px;
+  }
+  .flyout-footer svg { width: 12px; height: 12px; stroke-width: 1.8; stroke: currentColor; fill: none; }
+  .flyout-footer b { font-weight: 600; color: var(--amber); }
+
+  /* =========================================================
+     DISPATCH PREFLIGHT
+     ========================================================= */
+  .preflight-modal { padding: 0; }
+  .preflight-modal .head {
+    padding: 16px 20px; border-bottom: var(--hair-soft);
+    background: var(--paper);
+  }
+  .preflight-modal .head h3 {
+    font-family: var(--display); font-weight: 500; font-size: 19px; letter-spacing: -0.01em;
+    margin: 0 0 4px;
+  }
+  .preflight-modal .head .sub { font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
+  .preflight-modal .body { padding: 16px 20px; }
+  .pf-row {
+    display: grid; grid-template-columns: 110px 1fr; gap: var(--r3);
+    padding: 8px 0; border-bottom: var(--hair-soft); align-items: start;
+  }
+  .pf-row:last-child { border-bottom: none; }
+  .pf-row .lbl {
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3);
+    padding-top: 2px;
+  }
+  .pf-row .val { font-family: var(--body); font-size: 13.5px; color: var(--ink); line-height: 1.45; }
+  .pf-row .val .target-mono { font-family: var(--mono); font-size: 12px; }
+  .pf-row .val .signal-marker { color: var(--signal); font-weight: 600; }
+  .pf-row .val .green-marker { color: var(--green); font-weight: 600; }
+  .pf-bar {
+    display: flex; align-items: center; gap: 8px;
+    font-family: var(--mono); font-size: 11px; color: var(--ink-2);
+  }
+  .pf-bar .track {
+    flex: 1; height: 6px; background: var(--paper-deep); border-radius: 99px; overflow: hidden;
+  }
+  .pf-bar .fill { height: 100%; background: var(--green); border-radius: 99px; }
+  .pf-warn {
+    background: var(--amber-bg); border: 1px solid var(--amber-tint); border-radius: var(--rad-m);
+    padding: 10px 12px; margin-top: 8px;
+    font-family: var(--mono); font-size: 11px; color: var(--amber); line-height: 1.5;
+  }
+  .pf-warn .warn-head {
+    display: flex; align-items: center; gap: 6px; margin-bottom: 6px;
+    font-weight: 600; letter-spacing: 0.04em;
+  }
+  .pf-warn .warn-head svg { width: 13px; height: 13px; stroke-width: 1.8; stroke: currentColor; fill: none; }
+  .pf-warn code {
+    font-family: var(--mono); background: rgba(161,98,7,0.1); padding: 1px 5px; border-radius: 3px;
+    color: var(--amber); font-size: 11px;
+  }
+  .pf-warn .arrow { color: var(--amber); margin: 0 4px; }
+  .pf-actions {
+    padding: 14px 20px; border-top: var(--hair-soft);
+    display: flex; gap: 8px; align-items: center; background: var(--paper);
+  }
+  .pf-actions .toggle {
+    font-family: var(--mono); font-size: 11px; color: var(--ink-2);
+    display: flex; align-items: center; gap: 6px; cursor: pointer;
+  }
+  .pf-actions .toggle .switch {
+    width: 28px; height: 16px; background: var(--rule); border-radius: 99px; position: relative;
+    transition: background 120ms ease;
+  }
+  .pf-actions .toggle .switch::after {
+    content: ""; width: 12px; height: 12px; background: var(--paper-light);
+    border-radius: 50%; position: absolute; top: 2px; left: 2px;
+    transition: left 120ms ease;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.15);
+  }
+  .pf-actions .toggle.on .switch { background: var(--ink); }
+  .pf-actions .toggle.on .switch::after { left: 14px; }
+  .pf-actions .spacer { flex: 1; }
+  .btn {
+    font-family: var(--display); font-weight: 500; font-size: 13px;
+    border: 1px solid var(--rule); border-radius: var(--rad-m);
+    padding: 7px 14px; cursor: pointer; background: var(--paper-light); color: var(--ink);
+    transition: background 120ms ease;
+  }
+  .btn:hover { background: var(--paper-deep); }
+  .btn.primary {
+    background: var(--ink); color: var(--paper-light); border-color: var(--ink);
+  }
+  .btn.primary:hover { background: var(--signal); border-color: var(--signal); }
+
+  /* =========================================================
+     OBSIDIAN BASES
+     ========================================================= */
+  .obs-app { background: #FAF8F2; padding: 0; }
+  .obs-tabs {
+    display: flex; gap: 1px; background: var(--paper-deep); padding: 6px 8px 0;
+    font-family: var(--mono); font-size: 10.5px;
+  }
+  .obs-tabs .tab {
+    padding: 5px 12px; background: var(--paper-deep); color: var(--ink-3);
+    border-radius: 4px 4px 0 0; cursor: pointer;
+  }
+  .obs-tabs .tab.active { background: #FAF8F2; color: var(--ink); border-bottom: none; }
+  .obs-tabs .tab.active b { font-weight: 600; }
+  .obs-head {
+    padding: 18px 24px 14px;
+    display: flex; align-items: baseline; justify-content: space-between;
+    border-bottom: var(--hair-soft);
+  }
+  .obs-head h2 {
+    font-family: var(--display); font-weight: 500; font-size: 26px; letter-spacing: -0.015em;
+    margin: 0; line-height: 1.1;
+  }
+  .obs-head .pathline {
+    font-family: var(--mono); font-size: 10px; color: var(--ink-3); margin-top: 4px;
+  }
+  .obs-toolbar {
+    padding: 10px 24px;
+    display: flex; gap: 6px; align-items: center;
+    border-bottom: var(--hair-soft); background: var(--paper);
+  }
+  .filter-chip {
+    font-family: var(--mono); font-size: 10px;
+    padding: 3px 9px; border-radius: 99px; background: var(--paper-light);
+    border: 1px solid var(--rule); color: var(--ink-2);
+    display: inline-flex; align-items: center; gap: 5px;
+  }
+  .filter-chip svg { width: 10px; height: 10px; stroke: currentColor; fill: none; stroke-width: 1.8; }
+  .filter-chip.on { background: var(--ink); color: var(--paper-light); border-color: var(--ink); }
+  .obs-toolbar .right { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--ink-3); display: flex; gap: 14px; }
+  .obs-table { width: 100%; border-collapse: collapse; }
+  .obs-table thead th {
+    text-align: left; padding: 10px 24px;
+    font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--ink-3); border-bottom: var(--hair-soft); font-weight: 500;
+    background: var(--paper);
+  }
+  .obs-table tbody td {
+    padding: 12px 24px; vertical-align: top;
+    border-bottom: var(--hair-soft); font-size: 13.5px;
+  }
+  .obs-table tbody tr:hover { background: var(--paper); }
+  .obs-table .cell-thread { font-family: var(--display); font-weight: 500; color: var(--ink); font-size: 14px; letter-spacing: -0.005em; }
+  .obs-table .cell-thread .sub { display: block; font-family: var(--mono); font-size: 10px; color: var(--ink-3); font-weight: 400; margin-top: 2px; letter-spacing: 0; }
+  .obs-table .cell-mono { font-family: var(--mono); font-size: 11px; color: var(--ink-2); }
+  .obs-table .pill {
+    font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.04em;
+    padding: 2px 7px; border-radius: 99px; display: inline-flex; align-items: center; gap: 5px;
+    border: 1px solid;
+  }
+  .obs-table .pill .dot { width: 5px; height: 5px; border-radius: 50%; }
+  .pill.s-await { background: var(--green-bg); border-color: var(--green-tint); color: var(--green); }
+  .pill.s-await .dot { background: var(--green); }
+  .pill.s-wait  { background: var(--amber-bg); border-color: var(--amber-tint); color: var(--amber); }
+  .pill.s-wait .dot { background: var(--amber); }
+  .pill.s-stale { background: var(--slate-bg); border-color: #CBD5E1; color: var(--slate); }
+  .pill.s-stale .dot { background: var(--slate); }
+  .pill.s-unread { background: var(--signal-bg); border-color: var(--signal-tint); color: var(--signal); }
+  .pill.s-unread .dot { background: var(--signal); animation: pulse-signal 1.6s infinite; }
+  .pill.s-decided { background: #FBF7EE; border-color: var(--rule); color: var(--ink-2); }
+  .pill.s-decided .dot { background: var(--ink-2); }
+
+  /* YAML snippet */
+  .yaml-frame {
+    background: #2A2620; color: #F5EFE2;
+    border-radius: var(--rad-l); padding: 16px 18px;
+    font-family: var(--mono); font-size: 12px; line-height: 1.7;
+    overflow: hidden; position: relative;
+    border: 1px solid var(--ink);
+  }
+  .yaml-frame .filename {
+    position: absolute; top: 12px; right: 14px;
+    font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.1em; text-transform: uppercase;
+    color: rgba(245,239,226,0.4);
+  }
+  .yaml-frame .ln { color: rgba(245,239,226,0.25); width: 24px; display: inline-block; user-select: none; }
+  .yaml-frame .key { color: #DDB892; }
+  .yaml-frame .val { color: #F5EFE2; }
+  .yaml-frame .str { color: #B5E48C; }
+  .yaml-frame .num { color: #FFB4A2; }
+  .yaml-frame .com { color: rgba(245,239,226,0.4); font-style: italic; }
+  .yaml-frame .signal-val { color: #FED7AA; }
+  .yaml-frame hr { border: none; border-top: 1px dashed rgba(245,239,226,0.18); margin: 8px 0; }
+
+  /* =========================================================
+     MCP SETTINGS
+     ========================================================= */
+  .settings { padding: 0; }
+  .set-section {
+    padding: 18px 20px;
+    border-bottom: var(--hair-soft);
+  }
+  .set-section h4 {
+    font-family: var(--display); font-weight: 500; font-size: 16px; letter-spacing: -0.005em;
+    margin: 0 0 12px;
+  }
+  .set-section h4 em { font-style: italic; font-weight: 400; color: var(--ink-3); font-size: 13px; margin-left: 6px; }
+  .endpoint-card {
+    background: var(--paper); border: 1px solid var(--rule); border-radius: var(--rad-m);
+    padding: 12px;
+  }
+  .endpoint-row {
+    display: grid; grid-template-columns: 90px 1fr auto; gap: var(--r3);
+    align-items: center; padding: 4px 0;
+  }
+  .endpoint-row .lbl { font-family: var(--mono); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-3); }
+  .endpoint-row .val { font-family: var(--mono); font-size: 12px; color: var(--ink); }
+  .endpoint-row .val.signal-text {
+    color: var(--green); display: inline-flex; align-items: center; gap: 6px;
+  }
+  .endpoint-row .val.signal-text::before {
+    content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--green);
+    animation: pulse-green 2s infinite;
+  }
+  @keyframes pulse-green {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(22,101,52,0.4); }
+    50% { box-shadow: 0 0 0 5px rgba(22,101,52,0); }
+  }
+  .endpoint-row .copy {
+    background: transparent; border: 1px solid var(--rule); color: var(--ink-3);
+    width: 26px; height: 26px; border-radius: var(--rad-s); cursor: pointer; display: grid; place-items: center;
+  }
+  .endpoint-row .copy svg { width: 13px; height: 13px; stroke: currentColor; fill: none; stroke-width: 1.6; }
+  .endpoint-row .copy:hover { color: var(--ink); border-color: var(--ink); }
+
+  .tool-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 10px; }
+  .tool {
+    border: 1px solid var(--rule-soft); border-radius: var(--rad-s); padding: 8px 10px;
+    background: var(--paper-light);
+  }
+  .tool .tn { font-family: var(--mono); font-size: 11px; color: var(--ink); font-weight: 600; }
+  .tool .td { font-family: var(--body); font-size: 11.5px; color: var(--ink-3); margin-top: 2px; line-height: 1.4; }
+  .tool.read::after { content: "READ"; }
+  .tool.read::after, .tool.write::after {
+    display: inline-block; margin-left: 6px; font-family: var(--mono); font-size: 8.5px; letter-spacing: 0.1em;
+    padding: 1px 4px; border-radius: 2px; vertical-align: 1px;
+  }
+  .tool.read::after { color: var(--green); background: var(--green-bg); }
+  .tool.write { opacity: 0.55; }
+  .tool.write::after { content: "v1.5"; color: var(--amber); background: var(--amber-bg); }
+
+  .agent-list { display: flex; flex-direction: column; gap: 6px; }
+  .agent {
+    display: grid; grid-template-columns: 32px 1fr auto auto; gap: 12px; align-items: center;
+    padding: 10px 12px; border: 1px solid var(--rule-soft); border-radius: var(--rad-m);
+    background: var(--paper);
+  }
+  .agent .ic {
+    width: 32px; height: 32px; border-radius: var(--rad-s);
+    border: 1px solid var(--rule); display: grid; place-items: center;
+    font-family: var(--mono); font-size: 12px; font-weight: 600;
+    background: var(--paper-light); color: var(--ink);
+  }
+  .agent .nm { font-family: var(--display); font-weight: 500; font-size: 14px; }
+  .agent .nm .sub { display: block; font-family: var(--mono); font-size: 10px; color: var(--ink-3); font-weight: 400; margin-top: 2px; }
+  .agent .stat {
+    font-family: var(--mono); font-size: 10.5px; color: var(--green);
+    display: inline-flex; align-items: center; gap: 5px;
+  }
+  .agent .stat::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--green); }
+  .agent.off .stat { color: var(--ink-3); }
+  .agent.off .stat::before { background: var(--ink-4); }
+  .agent .ct { font-family: var(--mono); font-size: 10px; color: var(--ink-3); }
+  .agent.off .ct { display: none; }
+  .agent.off button {
+    font-family: var(--mono); font-size: 10px;
+    padding: 4px 10px; background: transparent; border: 1px solid var(--rule); border-radius: var(--rad-s);
+    color: var(--ink-2); cursor: pointer;
+  }
+  .agent.off button:hover { border-color: var(--ink); color: var(--ink); }
+
+  /* =========================================================
+     FIRST-RUN WIZARD
+     ========================================================= */
+  .wizard { padding: 0; }
+  .wizard .header {
+    padding: 22px 28px 18px; border-bottom: var(--hair-soft);
+    background: var(--paper-deep);
+    position: relative;
+  }
+  .wizard .header .step {
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--ink-3); margin-bottom: 6px;
+  }
+  .wizard .header h2 {
+    font-family: var(--display); font-weight: 400; font-size: 28px;
+    margin: 0; letter-spacing: -0.02em; line-height: 1.1;
+    font-variation-settings: "opsz" 72;
+  }
+  .wizard .header h2 em { font-style: italic; color: var(--signal); font-weight: 400; }
+  .wizard .progress {
+    display: flex; gap: 4px; margin-top: 14px;
+  }
+  .wizard .progress span {
+    height: 3px; background: var(--rule); flex: 1; border-radius: 2px;
+  }
+  .wizard .progress span.done { background: var(--ink); }
+  .wizard .progress span.now { background: var(--signal); }
+  .wizard .body { padding: 22px 28px; }
+  .wizard .lead {
+    font-family: var(--body); font-size: 15px; color: var(--ink-2); margin-bottom: 18px; line-height: 1.55;
+  }
+  .form-row { margin-bottom: 14px; }
+  .form-row label {
+    display: block; font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--ink-3); margin-bottom: 6px;
+  }
+  .form-row .input {
+    display: flex; align-items: stretch; border: 1px solid var(--rule); border-radius: var(--rad-m);
+    background: var(--paper-light); overflow: hidden;
+    transition: border-color 120ms ease;
+  }
+  .form-row .input:focus-within { border-color: var(--signal); box-shadow: 0 0 0 3px rgba(194,65,12,0.1); }
+  .form-row input {
+    flex: 1; border: 0; background: transparent; outline: none;
+    padding: 9px 12px;
+    font-family: var(--mono); font-size: 12.5px; color: var(--ink);
+  }
+  .form-row .input-suffix {
+    padding: 0 12px; border-left: var(--hair-soft); display: grid; place-items: center;
+    font-family: var(--mono); font-size: 10px; color: var(--ink-3); cursor: pointer;
+    background: var(--paper);
+  }
+  .form-row .input-suffix:hover { color: var(--ink); }
+  .helper {
+    background: var(--paper); border: 1px solid var(--rule); border-radius: var(--rad-m);
+    padding: 12px 14px; margin-top: 18px;
+    font-family: var(--body); font-size: 13px; color: var(--ink-2); line-height: 1.55;
+  }
+  .helper code { font-family: var(--mono); background: var(--paper-deep); padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+  .helper a { color: var(--signal); text-decoration: underline dotted; text-underline-offset: 2px; }
+  .wizard .actions { padding: 14px 28px; border-top: var(--hair-soft); display: flex; gap: 8px; background: var(--paper); }
+  .wizard .actions .ghost { background: transparent; }
+  .wizard .actions .spacer { flex: 1; }
+
+  /* =========================================================
+     SCREEN-SHARE-SAFE
+     ========================================================= */
+  .ss-banner {
+    background: linear-gradient(90deg, #1B1916 0%, #2A2620 100%);
+    color: var(--paper-light);
+    padding: 8px 14px;
+    display: flex; align-items: center; gap: 8px;
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.04em;
+  }
+  .ss-banner svg { width: 13px; height: 13px; stroke: currentColor; fill: none; stroke-width: 1.8; flex: none; }
+  .ss-banner b { color: var(--signal-tint); margin-right: 4px; }
+  .masked-text {
+    background: var(--ink); color: var(--ink); border-radius: 2px; padding: 0 1px;
+    user-select: none; font-family: var(--body);
+    letter-spacing: 0.4em;
+  }
+  .masked-block {
+    display: block; height: 12px; background:
+      repeating-linear-gradient(45deg, #1B1916 0 6px, #2A2620 6px 12px);
+    border-radius: 2px; margin: 4px 0;
+  }
+
+  /* =========================================================
+     CALLOUTS / ANNOTATIONS
+     ========================================================= */
+  .callouts {
+    margin-top: var(--r5);
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--r4) var(--r5);
+  }
+  .callout {
+    display: grid; grid-template-columns: 28px 1fr; gap: 10px;
+    font-family: var(--body); font-size: 13px; color: var(--ink-2); line-height: 1.55;
+  }
+  .callout .num {
+    width: 22px; height: 22px; border-radius: 50%;
+    border: 1.5px solid var(--ink); color: var(--ink);
+    font-family: var(--mono); font-size: 11px; font-weight: 600;
+    display: grid; place-items: center; flex: none;
+    margin-top: 1px;
+  }
+  .callout p { margin: 0; }
+  .callout b { font-family: var(--display); font-weight: 600; color: var(--ink); font-size: 13.5px; }
+
+  /* Surface row layouts */
+  .surface-row {
+    display: grid; gap: var(--r6); align-items: start;
+    margin-bottom: var(--r5);
+  }
+  .surface-row.two-up { grid-template-columns: auto auto; justify-content: start; }
+  .surface-row.split-3060 { grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); }
+  .surface-row.center { justify-content: center; grid-template-columns: auto; }
+
+  /* Section tags */
+  .surface-tag {
+    font-family: var(--mono); font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--ink-3);
+    border-top: 1px solid var(--ink);
+    padding-top: 6px;
+    margin-bottom: var(--r2);
+    display: flex; justify-content: space-between; align-items: baseline;
+  }
+  .surface-tag .ctx { color: var(--ink-3); }
+  .surface-tag b { color: var(--ink); }
+
+  /* =========================================================
+     FOOTER — DESIGN TOKENS PANEL
+     ========================================================= */
+  .tokens {
+    margin-top: var(--r8);
+    border-top: 2px solid var(--ink);
+    padding-top: var(--r5);
+  }
+  .tokens-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--r5);
+  }
+  .token-block { font-family: var(--mono); font-size: 11px; }
+  .token-block h5 {
+    font-family: var(--mono); font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--ink-3); margin: 0 0 var(--r3); border-bottom: var(--hair); padding-bottom: 6px; font-weight: 500;
+  }
+  .swatch-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; color: var(--ink-2); }
+  .sw { width: 18px; height: 18px; border-radius: 3px; border: 1px solid rgba(27,25,22,0.15); flex: none; }
+  .swatch-row code { font-size: 10.5px; color: var(--ink-3); }
+
+  .type-row { padding: 4px 0; color: var(--ink-2); display: grid; grid-template-columns: 64px 1fr; gap: 8px; align-items: baseline; }
+  .type-row .label { font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-3); }
+  .type-row .show.display { font-family: var(--display); font-size: 22px; color: var(--ink); font-weight: 400; font-style: italic; }
+  .type-row .show.body { font-family: var(--body); font-size: 16px; color: var(--ink); }
+  .type-row .show.mono { font-family: var(--mono); font-size: 13px; color: var(--ink); }
+
+  /* =========================================================
+     PAGE FOOTER
+     ========================================================= */
+  .colophon {
+    margin-top: var(--r7);
+    padding-top: var(--r5);
+    border-top: var(--hair);
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-family: var(--mono); font-size: 10.5px; color: var(--ink-3);
+    letter-spacing: 0.04em;
+  }
+
+  /* Responsive nudges */
+  @media (max-width: 980px) {
+    .surface-row.split-3060, .surface-row.two-up { grid-template-columns: 1fr; }
+    .meta-grid { grid-template-columns: repeat(2, 1fr); }
+    .tokens-grid { grid-template-columns: repeat(2, 1fr); }
+    .callouts { grid-template-columns: 1fr; }
+    .frame--sidepanel, .frame--obsidian, .frame--modal, .frame--flyout, .frame--wizard { width: 100%; max-width: 480px; }
+    .masthead h1 { font-size: 56px; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- =====================================================
+       MASTHEAD
+       ===================================================== -->
+  <header class="masthead">
+    <div class="top-rule">
+      <div class="crest">
+        <div class="mk"></div>
+        <span>Browser-AI Companion</span>
+      </div>
+      <div>Design Spec · v1.0 · April 2026 · Anchor surfaces / MVP</div>
+    </div>
+
+    <h1>The switchboard for<br/>your <em>AI tabs.</em></h1>
+    <p class="standfirst">
+      A design specification for a Chrome extension and Obsidian-anchored memory ledger
+      that observes every AI thread you have open, remembers the last three weeks of your
+      research, and exposes that memory as an MCP server to your coding agents — without
+      burning tokens, without uploading data, without becoming yet another sidebar AI.
+    </p>
+
+    <div class="meta-grid">
+      <div>
+        <span class="lbl">Primary ICP</span>
+        Multi-provider AI<br/>power user with Obsidian.
+      </div>
+      <div>
+        <span class="lbl">v1 Spine</span>
+        6 scenarios · 3 safety primitives · 1 MCP server.
+      </div>
+      <div>
+        <span class="lbl">Surfaces</span>
+        Side panel · on-page · vault · localhost MCP.
+      </div>
+      <div>
+        <span class="lbl">Hard constraints</span>
+        Don't burn tokens · open architecture · privacy-first.
+      </div>
+    </div>
+  </header>
+
+  <!-- =====================================================
+       SECTION 01 — WHERE WAS I (anchor surface)
+       ===================================================== -->
+  <section class="spec">
+    <div class="spec-head">
+      <div class="spec-num">01 / Anchor</div>
+      <div>
+        <h2 class="spec-title"><em>"Where was I?"</em> — the side panel.</h2>
+        <p class="spec-caption">
+          The first thing a user sees when they pin BAC. A live registry of every chat thread across
+          ChatGPT, Claude, and Gemini, grouped under the active workstream, with status indicators
+          that tell them what needs attention without opening a single tab. To the right, the same
+          surface a beat later — a calibrated-freshness recall card surfacing prior research before
+          the user re-asks.
+        </p>
+      </div>
+    </div>
+
+    <div class="surface-row two-up">
+      <!-- ============== STATE A: DEFAULT ============== -->
+      <div>
+        <div class="surface-tag">
+          <span><b>State A</b> · Default</span>
+          <span class="ctx">Chrome side panel · 380 × 720</span>
+        </div>
+        <div class="frame frame--sidepanel">
+          <div class="titlebar">
+            <div class="dots"><span></span><span></span><span></span></div>
+            <div class="url">chrome-extension://<b>bac</b>/sidepanel.html</div>
+          </div>
+
+          <div class="app">
+            <!-- Header -->
+            <div class="app-head">
+              <div class="app-mark">
+                <span class="glyph"></span>
+                BAC <span class="bac">/ companion</span>
+              </div>
+              <div class="app-actions">
+                <button class="icon-btn" title="Search">
+                  <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+                </button>
+                <button class="icon-btn" title="Settings">
+                  <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>
+                </button>
+              </div>
+            </div>
+
+            <!-- Workstream selector -->
+            <div class="ws-bar">
+              <span class="lbl">Workstream</span>
+              <span class="ws-name">auth-redesign</span>
+              <span class="swap-arrow">↓</span>
+            </div>
+
+            <!-- Open threads -->
+            <div class="sec-head">
+              <span>Open threads</span>
+              <span class="count">4 active · 1 stale</span>
+            </div>
+
+            <div class="thread-list">
+              <div class="thread">
+                <div class="row1">
+                  <span class="provider claude">Claude</span>
+                  <span class="name">Stripe webhook signature flow</span>
+                </div>
+                <div class="row2">
+                  <span class="dot signal"></span>
+                  <span class="stamp">Reply received · 14 min ago · unread</span>
+                </div>
+              </div>
+
+              <div class="thread">
+                <div class="row1">
+                  <span class="provider gpt">ChatGPT</span>
+                  <span class="name">Pricing-experiment writeup</span>
+                </div>
+                <div class="row2">
+                  <span class="dot green"></span>
+                  <span class="stamp">You replied last · 2h ago</span>
+                </div>
+              </div>
+
+              <div class="thread">
+                <div class="row1">
+                  <span class="provider claude">Claude</span>
+                  <span class="name">Auth-refactor — threat model</span>
+                </div>
+                <div class="row2">
+                  <span class="dot amber"></span>
+                  <span class="stamp">Awaiting your reply · 1d</span>
+                </div>
+              </div>
+
+              <div class="thread">
+                <div class="row1">
+                  <span class="provider gemini">Gemini</span>
+                  <span class="name">Competitor scan — Q2</span>
+                  <span style="margin-left:auto;font-family:var(--mono);font-size:9px;color:var(--amber);background:var(--amber-bg);padding:1px 6px;border-radius:3px;border:1px solid var(--amber-tint)">DRIFT</span>
+                </div>
+                <div class="row2">
+                  <span class="dot gray"></span>
+                  <span class="stamp">Stale · 4d</span>
+                </div>
+                <div class="drift-line">
+                  <svg viewBox="0 0 24 24"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/></svg>
+                  Note <code style="font-family:var(--mono)">v5</code> — Gemini saw <code style="font-family:var(--mono)">v3</code>. Push delta?
+                </div>
+              </div>
+            </div>
+
+            <!-- Recent captures -->
+            <div class="sec-head">
+              <span>Recent captures</span>
+              <span class="count">Today</span>
+            </div>
+
+            <div class="capture">
+              <svg viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/><path d="M14 3v6h6"/></svg>
+              <div>
+                <div class="text">"Webhooks should verify the <em>tolerance window</em> server-side; ours is currently 5min which is too generous…"</div>
+                <div class="meta">Claude · stripe-webhook · 14:32 · cite-id <b style="color:var(--ink-2)">e3a7</b></div>
+              </div>
+            </div>
+
+            <div class="capture">
+              <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+              <div>
+                <div class="text">stripe.com/docs/webhooks/signatures — full page clip, redacted (1 PII match removed)</div>
+                <div class="meta">stripe.com · auth-redesign/threats · 13:08</div>
+              </div>
+            </div>
+
+            <!-- Composer -->
+            <div class="composer">
+              <textarea placeholder="Dispatch a prompt to selected targets…"></textarea>
+              <div class="targets">
+                <button class="target-chip on">ChatGPT</button>
+                <button class="target-chip on">Claude</button>
+                <button class="target-chip">Gemini</button>
+                <button class="target-chip">Notebook</button>
+                <button class="target-chip">+</button>
+              </div>
+              <div class="footer-row">
+                <span class="preflight">
+                  <svg viewBox="0 0 24 24"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
+                  Preflight clean · ~412 tok
+                </span>
+                <button class="send-btn">
+                  Dispatch
+                  <svg viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4 20-7Z"/></svg>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============== STATE B: WITH DÉJÀ-VU ============== -->
+      <div>
+        <div class="surface-tag">
+          <span><b>State B</b> · Recall surfacing on highlight</span>
+          <span class="ctx">Triggered: 3-day–3-week window</span>
+        </div>
+        <div class="frame frame--sidepanel">
+          <div class="titlebar">
+            <div class="dots"><span></span><span></span><span></span></div>
+            <div class="url">chrome-extension://<b>bac</b>/sidepanel.html</div>
+          </div>
+
+          <div class="app">
+            <!-- Header -->
+            <div class="app-head">
+              <div class="app-mark">
+                <span class="glyph"></span>
+                BAC <span class="bac">/ companion</span>
+              </div>
+              <div class="app-actions">
+                <button class="icon-btn">
+                  <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+                </button>
+                <button class="icon-btn">
+                  <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>
+                </button>
+              </div>
+            </div>
+
+            <!-- Workstream -->
+            <div class="ws-bar">
+              <span class="lbl">Workstream</span>
+              <span class="ws-name">auth-redesign</span>
+              <span class="swap-arrow">↓</span>
+            </div>
+
+            <!-- DÉJÀ-VU CARD — the moment -->
+            <div class="deja">
+              <div class="head">
+                <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+                Déjà-vu · 6 days ago
+              </div>
+              <div class="body">
+                You discussed <span class="term">Stripe idempotency keys</span> with Claude six days ago.
+              </div>
+              <div class="snippet">
+                <em>"…the key should be derived from the request body, not auto-generated, otherwise retries duplicate. Stripe rejects with 409 after 24h…"</em>
+              </div>
+              <div class="actions">
+                <button class="ghost-btn primary">Open thread</button>
+                <button class="ghost-btn">Show all 3 prior</button>
+                <button class="ghost-btn">Dismiss</button>
+              </div>
+            </div>
+
+            <!-- Open threads (compressed) -->
+            <div class="sec-head" style="margin-top: 6px;">
+              <span>Open threads</span>
+              <span class="count">4 active · 1 stale</span>
+            </div>
+
+            <div class="thread-list">
+              <div class="thread">
+                <div class="row1">
+                  <span class="provider claude">Claude</span>
+                  <span class="name">Stripe webhook signature flow</span>
+                </div>
+                <div class="row2">
+                  <span class="dot signal"></span>
+                  <span class="stamp">Reply received · 14 min ago · unread</span>
+                </div>
+              </div>
+
+              <div class="thread">
+                <div class="row1">
+                  <span class="provider gpt">ChatGPT</span>
+                  <span class="name">Pricing-experiment writeup</span>
+                </div>
+                <div class="row2">
+                  <span class="dot green"></span>
+                  <span class="stamp">You replied last · 2h ago</span>
+                </div>
+              </div>
+
+              <div class="thread">
+                <div class="row1">
+                  <span class="provider claude">Claude</span>
+                  <span class="name">Auth-refactor — threat model</span>
+                </div>
+                <div class="row2">
+                  <span class="dot amber"></span>
+                  <span class="stamp">Awaiting your reply · 1d</span>
+                </div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="callouts">
+      <div class="callout">
+        <span class="num">1</span>
+        <p><b>Active workstream is the only saturated element.</b> Pulse-glow on the chip, signal-orange tint. Everything else is paper-and-ink. Eye learns immediately what's "now."</p>
+      </div>
+      <div class="callout">
+        <span class="num">2</span>
+        <p><b>Provider tags are color-coded, not branded.</b> Forest-green for ChatGPT, terracotta for Claude, slate-blue for Gemini — distinct without using anyone's logos (TOS-clean).</p>
+      </div>
+      <div class="callout">
+        <span class="num">3</span>
+        <p><b>Status dots are semantic, not decorative.</b> Pulsing signal-orange = unread reply (the highest-value signal). Pulsing amber = needs your action. Solid green = you replied last. Gray = stale.</p>
+      </div>
+      <div class="callout">
+        <span class="num">4</span>
+        <p><b>Drift line is a row affordance, not a separate alert.</b> Inline amber band on the affected thread shows the version mismatch and offers a one-click "push delta" — the spec's S7/S76 made tactile.</p>
+      </div>
+      <div class="callout">
+        <span class="num">5</span>
+        <p><b>Capture rows show provenance inline.</b> Cite-IDs (<code>e3a7</code>) make every saved chat turn referenceable from a written document via S134.</p>
+      </div>
+      <div class="callout">
+        <span class="num">6</span>
+        <p><b>Déjà-vu card uses signal-orange because it's a live signal.</b> The italicised serif body distinguishes it from utilitarian text — this is the surface where BAC says something interesting.</p>
+      </div>
+    </div>
+  </section>
+
+
+  <!-- =====================================================
+       SECTION 02 — CAPTURE & DISPATCH
+       ===================================================== -->
+  <section class="spec">
+    <div class="spec-head">
+      <div class="spec-num">02 / Hook</div>
+      <div>
+        <h2 class="spec-title">Capture &amp; <em>dispatch.</em></h2>
+        <p class="spec-caption">
+          The on-page selection flyout (left) is the entry point most users meet first — a floating
+          card that appears when text is selected, offering parallel dispatch to chat providers,
+          search engines, and notebook capture, with redaction status surfaced at the bottom edge.
+          The dispatch preflight (right) is the safety gate every dispatch passes through: target
+          context, version-aware delta detection, redaction warnings, and an explicit confirm.
+        </p>
+      </div>
+    </div>
+
+    <div class="surface-row split-3060">
+      <!-- ============== ON-PAGE FLYOUT ============== -->
+      <div>
+        <div class="surface-tag">
+          <span><b>On-page</b> · Selection flyout</span>
+          <span class="ctx">Anchored to selection · any tab</span>
+        </div>
+        <div class="frame flyout">
+          <div class="flyout-quote">
+            "…retries should derive an idempotency key from the request body…"
+          </div>
+
+          <div class="flyout-section">
+            <span>Send to</span>
+            <span style="font-size: 9px; color: var(--ink-4);">⏎ to dispatch</span>
+          </div>
+          <div class="flyout-row">
+            <button class="flyout-pill active"><span class="marker gpt"></span>ChatGPT</button>
+            <button class="flyout-pill active"><span class="marker claude"></span>Claude</button>
+            <button class="flyout-pill"><span class="marker gemini"></span>Gemini</button>
+            <button class="flyout-pill"><span class="marker search"></span>Google</button>
+            <button class="flyout-pill"><span class="marker search"></span>MDN</button>
+          </div>
+
+          <div class="flyout-section"><span>Capture</span></div>
+          <div class="flyout-row">
+            <button class="flyout-pill"><span class="marker notebook"></span>Inbox</button>
+            <button class="flyout-pill"><span class="marker notebook"></span>auth-redesign</button>
+            <button class="flyout-pill"><span class="marker"></span>Cite</button>
+          </div>
+
+          <div class="flyout-footer">
+            <svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="M9 12l2 2 4-4"/></svg>
+            Preflight: <b>clean</b> · 247 chars · ~62 tokens
+          </div>
+        </div>
+      </div>
+
+      <!-- ============== DISPATCH PREFLIGHT ============== -->
+      <div>
+        <div class="surface-tag">
+          <span><b>Modal</b> · Dispatch preflight</span>
+          <span class="ctx">Triggered on Inject · ship-blocking</span>
+        </div>
+        <div class="frame frame--modal">
+          <div class="titlebar">
+            <div class="dots"><span></span><span></span><span></span></div>
+            <div class="url">bac://preflight/dispatch-7f3a</div>
+          </div>
+          <div class="preflight-modal">
+            <div class="head">
+              <h3>Confirm dispatch</h3>
+              <div class="sub">PromptRun → 2 targets · workstream <span style="color: var(--signal); font-weight: 500;">auth-redesign</span></div>
+            </div>
+
+            <div class="body">
+              <div class="pf-row">
+                <span class="lbl">Target</span>
+                <span class="val">
+                  <span class="signal-marker">●</span>
+                  Claude.ai · thread <span class="target-mono">"Auth-refactor — threat model"</span>
+                  <br/>
+                  <span class="signal-marker">●</span>
+                  ChatGPT · <span class="target-mono">new thread</span> in workstream
+                </span>
+              </div>
+              <div class="pf-row">
+                <span class="lbl">Bucket</span>
+                <span class="val target-mono">auth-redesign / threats</span>
+              </div>
+              <div class="pf-row">
+                <span class="lbl">Context</span>
+                <span class="val">
+                  <div class="pf-bar">
+                    <span>2,847 chars · ~712 tok</span>
+                    <div class="track"><div class="fill" style="width: 28%;"></div></div>
+                    <span>200K window</span>
+                  </div>
+                </span>
+              </div>
+              <div class="pf-row">
+                <span class="lbl">Version</span>
+                <span class="val">
+                  <span class="green-marker">●</span>
+                  Claude has seen <code style="font-family:var(--mono); background:var(--paper-deep); padding:1px 5px; border-radius:3px;">v3</code> — sending delta to <code style="font-family:var(--mono); background:var(--paper-deep); padding:1px 5px; border-radius:3px;">v5</code>
+                </span>
+              </div>
+              <div class="pf-row">
+                <span class="lbl">Redaction</span>
+                <span class="val">
+                  <div class="pf-warn">
+                    <div class="warn-head">
+                      <svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/></svg>
+                      1 secret detected — will redact before paste
+                    </div>
+                    <code>sk-ant-api03-N7•••</code><span class="arrow">→</span><code>[REDACTED:anthropic-key:1]</code>
+                  </div>
+                </span>
+              </div>
+            </div>
+
+            <div class="pf-actions">
+              <div class="toggle">
+                <span class="switch"></span>
+                Auto-send
+              </div>
+              <div class="toggle on" style="margin-left: 12px;">
+                <span class="switch"></span>
+                Sign &amp; log
+              </div>
+              <div class="spacer"></div>
+              <button class="btn">Cancel</button>
+              <button class="btn primary">Confirm dispatch</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="callouts">
+      <div class="callout">
+        <span class="num">7</span>
+        <p><b>Selection becomes a quote, not a string.</b> The italicised serif treatment of the selection inside the flyout makes it feel "captured," not "highlighted." A small thing that signals provenance is real.</p>
+      </div>
+      <div class="callout">
+        <span class="num">8</span>
+        <p><b>Multi-target is one click each, not a wizard.</b> Pills toggle independently; <kbd>⏎</kbd> dispatches to all active. Same dispatch, different threads — the spec's S25 reduced to its minimum.</p>
+      </div>
+      <div class="callout">
+        <span class="num">9</span>
+        <p><b>Preflight surfaces the four things that matter.</b> Target, version delta (drift made operational), token budget against the actual window, and any secret/PII the RedactionPipeline caught. Nothing more.</p>
+      </div>
+      <div class="callout">
+        <span class="num">10</span>
+        <p><b>Auto-send is off by default.</b> Per the spec's §17 Q4 resolution. The "Sign &amp; log" toggle is on — every dispatch becomes an event-log entry with Ed25519 signature.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- =====================================================
+       SECTION 03 — VAULT AS CANONICAL PROJECTION
+       ===================================================== -->
+  <section class="spec">
+    <div class="spec-head">
+      <div class="spec-num">03 / Architecture</div>
+      <div>
+        <h2 class="spec-title">Vault as <em>canonical projection.</em></h2>
+        <p class="spec-caption">
+          BAC writes plain Markdown into the user's Obsidian vault. The workstream graph lives as
+          YAML frontmatter on captured artifacts; dashboards are auto-generated <code>.base</code> files Obsidian
+          renders natively. The user owns the data in plain text the day they install — and the day
+          they uninstall. Below: the "Where Was I" Bases dashboard rendered inside Obsidian, and a
+          mirror of the same workstream graph as written-to-disk YAML.
+        </p>
+      </div>
+    </div>
+
+    <div class="surface-row center">
+      <div>
+        <div class="surface-tag">
+          <span><b>Obsidian</b> · <code style="font-family:var(--mono);font-size:10px;background:var(--paper-deep);padding:1px 5px;border-radius:3px;">_BAC/where-was-i.base</code></span>
+          <span class="ctx">Auto-written · regenerated on event</span>
+        </div>
+        <div class="frame frame--obsidian">
+          <div class="titlebar">
+            <div class="dots"><span></span><span></span><span></span></div>
+            <div class="url">obsidian.md / vault: <b>research</b> / _BAC / where-was-i.base</div>
+          </div>
+          <div class="obs-app">
+            <div class="obs-tabs">
+              <div class="tab">research-notes</div>
+              <div class="tab active"><b>where-was-i.base</b></div>
+              <div class="tab">claims.base</div>
+              <div class="tab">+</div>
+            </div>
+            <div class="obs-head">
+              <div>
+                <h2>Where Was I</h2>
+                <div class="pathline">_BAC/where-was-i.base · auto-generated · last refresh 14:42</div>
+              </div>
+              <div style="font-family:var(--mono); font-size: 10px; color: var(--ink-3); text-align: right;">
+                <div>9 threads · 4 workstreams</div>
+                <div style="color: var(--amber)">2 stale · 1 unread</div>
+              </div>
+            </div>
+            <div class="obs-toolbar">
+              <span class="filter-chip on">Status: any</span>
+              <span class="filter-chip">Workstream: any</span>
+              <span class="filter-chip">Provider: any</span>
+              <span class="filter-chip">
+                <svg viewBox="0 0 24 24"><path d="M3 6h18M6 12h12M10 18h4"/></svg>
+                Sort: last activity ↓
+              </span>
+              <div class="right">
+                <span>Group: workstream</span>
+                <span>View: table</span>
+              </div>
+            </div>
+            <table class="obs-table">
+              <thead>
+                <tr>
+                  <th style="width: 36%;">Thread</th>
+                  <th>Provider</th>
+                  <th>Last activity</th>
+                  <th>Status</th>
+                  <th>Workstream</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td class="cell-thread">Stripe webhook signature flow<span class="sub">cite-id: e3a7 · 7 turns</span></td>
+                  <td class="cell-mono">claude-web</td>
+                  <td class="cell-mono">14 min ago</td>
+                  <td><span class="pill s-unread"><span class="dot"></span>Unread reply</span></td>
+                  <td class="cell-mono">auth-redesign / threats</td>
+                </tr>
+                <tr>
+                  <td class="cell-thread">Pricing-experiment writeup<span class="sub">cite-id: a91c · 12 turns</span></td>
+                  <td class="cell-mono">openai-web</td>
+                  <td class="cell-mono">2h ago</td>
+                  <td><span class="pill s-await"><span class="dot"></span>You replied last</span></td>
+                  <td class="cell-mono">pricing-q2</td>
+                </tr>
+                <tr>
+                  <td class="cell-thread">Auth-refactor — threat model<span class="sub">cite-id: f2b8 · 9 turns</span></td>
+                  <td class="cell-mono">claude-web</td>
+                  <td class="cell-mono">1d ago</td>
+                  <td><span class="pill s-wait"><span class="dot"></span>Waiting on AI</span></td>
+                  <td class="cell-mono">auth-redesign / threats</td>
+                </tr>
+                <tr>
+                  <td class="cell-thread">Competitor scan — Q2<span class="sub">cite-id: 6d4e · 4 turns · drift</span></td>
+                  <td class="cell-mono">gemini-web</td>
+                  <td class="cell-mono">4d ago</td>
+                  <td><span class="pill s-stale"><span class="dot"></span>Stale</span></td>
+                  <td class="cell-mono">competitive-research</td>
+                </tr>
+                <tr>
+                  <td class="cell-thread">Yjs delete-set merging<span class="sub">cite-id: 2a17 · 5 turns</span></td>
+                  <td class="cell-mono">claude-web</td>
+                  <td class="cell-mono">6d ago</td>
+                  <td><span class="pill s-decided"><span class="dot"></span>Decided</span></td>
+                  <td class="cell-mono">auth-redesign / sync</td>
+                </tr>
+                <tr>
+                  <td class="cell-thread">Customer onboarding rewrite<span class="sub">cite-id: 8c93 · 3 turns</span></td>
+                  <td class="cell-mono">openai-web</td>
+                  <td class="cell-mono">8d ago</td>
+                  <td><span class="pill s-stale"><span class="dot"></span>Stale</span></td>
+                  <td class="cell-mono">pricing-q2</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="surface-row two-up" style="margin-top: var(--r6); justify-content: center;">
+      <!-- YAML mirror -->
+      <div style="width: 540px;">
+        <div class="surface-tag">
+          <span><b>Mirror</b> · YAML frontmatter on a captured artifact</span>
+          <span class="ctx"><code style="font-family:var(--mono);font-size:10px;background:var(--paper-deep);padding:1px 5px;border-radius:3px;">research/auth-redesign/threats/stripe-webhook.md</code></span>
+        </div>
+        <div class="yaml-frame">
+          <div class="filename">.md · YAML</div>
+          <span class="ln">1</span><span class="key">---</span><br/>
+          <span class="ln">2</span><span class="key">bac-id:</span> <span class="val">artifact-2026-04-25-1432-e3a7</span><br/>
+          <span class="ln">3</span><span class="key">bac-type:</span> <span class="signal-val">claim</span><br/>
+          <span class="ln">4</span><span class="key">bac-workstream:</span> <span class="val">auth-redesign</span><br/>
+          <span class="ln">5</span><span class="key">bac-bucket:</span> <span class="val">auth-redesign / threats</span><br/>
+          <span class="ln">6</span><span class="key">bac-source:</span><br/>
+          <span class="ln">7</span>&nbsp;&nbsp;<span class="key">provider:</span> <span class="str">claude-web</span><br/>
+          <span class="ln">8</span>&nbsp;&nbsp;<span class="key">thread:</span> <span class="str">"Stripe webhook signature flow"</span><br/>
+          <span class="ln">9</span>&nbsp;&nbsp;<span class="key">turn-id:</span> <span class="num">5</span><br/>
+          <span class="ln">10</span>&nbsp;<span class="key">model:</span> <span class="str">claude-opus-4-7</span><br/>
+          <span class="ln">11</span><span class="key">bac-confidence:</span> <span class="signal-val">medium</span><br/>
+          <span class="ln">12</span><span class="key">bac-freshness:</span> <span class="signal-val">ok</span><br/>
+          <span class="ln">13</span><span class="key">bac-related:</span><br/>
+          <span class="ln">14</span>&nbsp;&nbsp;- <span class="val">artifact-2026-04-19-1115-a91c</span><br/>
+          <span class="ln">15</span>&nbsp;&nbsp;- <span class="val">artifact-2026-04-22-0903-f2b8</span><br/>
+          <span class="ln">16</span><span class="key">bac-cid:</span> <span class="val">sha256:7a3c...</span> <span class="com"># content addr.</span><br/>
+          <span class="ln">17</span><span class="key">bac-prev-hash:</span> <span class="val">sha256:b1f4...</span> <span class="com"># Merkle chain</span><br/>
+          <span class="ln">18</span><span class="key">bac-signature:</span> <span class="val">ed25519:Mj7K...</span><br/>
+          <span class="ln">19</span><span class="key">bac-redaction:</span> <span class="num">1</span> <span class="com"># 1 secret scrubbed</span><br/>
+          <span class="ln">20</span><span class="key">---</span><br/>
+          <span class="ln">21</span><br/>
+          <span class="ln">22</span><span class="com"># Idempotency key derivation</span><br/>
+          <span class="ln">23</span><br/>
+          <span class="ln">24</span>The key should be derived from the request <span class="com">[…]</span><br/>
+        </div>
+      </div>
+    </div>
+
+    <div class="callouts">
+      <div class="callout">
+        <span class="num">11</span>
+        <p><b>Native Obsidian Bases rendering.</b> BAC writes the <code>.base</code> file once; Obsidian renders the table, filters, sorting, grouping. We never build that UI ourselves — the §23.3 scope simplifier in execution.</p>
+      </div>
+      <div class="callout">
+        <span class="num">12</span>
+        <p><b>Lifecycle states are visible without a dedicated UI.</b> Status pills (Unread reply / Waiting on AI / Stale / Decided) emerge from event-log queries — explicit lifecycle UI is deferred to v1.5 per the consolidated spec.</p>
+      </div>
+      <div class="callout">
+        <span class="num">13</span>
+        <p><b>The YAML mirror makes BAC lock-out-proof.</b> If the user uninstalls BAC tomorrow, every artifact is still a Markdown file with structured properties. Future tools can read the same shape.</p>
+      </div>
+      <div class="callout">
+        <span class="num">14</span>
+        <p><b>Provenance fields are first-class.</b> <code>bac-cid</code> (content address), <code>bac-prev-hash</code> (Merkle chain), <code>bac-signature</code> (Ed25519) — auditability shipped from day one, per §24.6.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- =====================================================
+       SECTION 04 — MCP SERVER (ARCHITECTURAL MOAT)
+       ===================================================== -->
+  <section class="spec">
+    <div class="spec-head">
+      <div class="spec-num">04 / Moat</div>
+      <div>
+        <h2 class="spec-title">MCP <em>both ways.</em></h2>
+        <p class="spec-caption">
+          BAC exposes the user's cross-provider research memory as a localhost MCP server consumed
+          by Claude Code, Cursor, and Codex. This is what makes BAC architecturally novel — server-side
+          MCP servers can't reach into the user's logged-in browser sessions; BAC is the only thing
+          that can. Read tools ship in v1, write tools follow in v1.5 behind an explicit opt-in.
+        </p>
+      </div>
+    </div>
+
+    <div class="surface-row center">
+      <div>
+        <div class="surface-tag">
+          <span><b>Settings</b> · MCP Server</span>
+          <span class="ctx">Side panel · Settings → Integrations</span>
+        </div>
+        <div class="frame frame--sidepanel" style="width: 480px;">
+          <div class="titlebar">
+            <div class="dots"><span></span><span></span><span></span></div>
+            <div class="url">chrome-extension://<b>bac</b>/settings#mcp</div>
+          </div>
+
+          <div class="settings">
+            <div class="set-section">
+              <h4>MCP Server <em>· localhost only</em></h4>
+
+              <div class="endpoint-card">
+                <div class="endpoint-row">
+                  <span class="lbl">Status</span>
+                  <span class="val signal-text">Running</span>
+                  <button class="copy"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/></svg></button>
+                </div>
+                <div class="endpoint-row">
+                  <span class="lbl">Endpoint</span>
+                  <span class="val">ws://127.0.0.1:7301</span>
+                  <button class="copy" title="Copy">
+                    <svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                  </button>
+                </div>
+                <div class="endpoint-row">
+                  <span class="lbl">API key</span>
+                  <span class="val">bac_•••••••••••••••3a9f</span>
+                  <button class="copy" title="Copy">
+                    <svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                  </button>
+                </div>
+              </div>
+
+              <div style="font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-3); margin-top: 16px; margin-bottom: 6px;">Tools exposed</div>
+
+              <div class="tool-grid">
+                <div class="tool read">
+                  <div class="tn">bac.search</div>
+                  <div class="td">FTS + semantic over event log + captures.</div>
+                </div>
+                <div class="tool read">
+                  <div class="tn">bac.recent_threads</div>
+                  <div class="td">Cross-provider thread registry.</div>
+                </div>
+                <div class="tool read">
+                  <div class="tn">bac.workstream</div>
+                  <div class="td">Active workstream + linked artifacts.</div>
+                </div>
+                <div class="tool read">
+                  <div class="tn">bac.context_pack</div>
+                  <div class="td">Bundle a bucket as Markdown packet.</div>
+                </div>
+                <div class="tool read">
+                  <div class="tn">bac.deja_vu</div>
+                  <div class="td">Calibrated recall over highlight/query.</div>
+                </div>
+                <div class="tool write">
+                  <div class="tn">bac.append_decision</div>
+                  <div class="td">Write a Decision artifact to vault.</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="set-section">
+              <h4>Connected agents <em>· read-only</em></h4>
+
+              <div class="agent-list">
+                <div class="agent">
+                  <div class="ic">CC</div>
+                  <div class="nm">Claude Code <span class="sub">~/.claude/mcp.json · last call 4m ago</span></div>
+                  <div class="stat">connected</div>
+                  <div class="ct">14 queries today</div>
+                </div>
+                <div class="agent">
+                  <div class="ic">Cu</div>
+                  <div class="nm">Cursor <span class="sub">~/.cursor/mcp.json · last call 38m ago</span></div>
+                  <div class="stat">connected</div>
+                  <div class="ct">3 queries today</div>
+                </div>
+                <div class="agent off">
+                  <div class="ic">Cx</div>
+                  <div class="nm">Codex CLI <span class="sub">~/.codex/config.toml · not yet configured</span></div>
+                  <div class="stat">offline</div>
+                  <button>Copy config</button>
+                </div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="callouts">
+      <div class="callout">
+        <span class="num">15</span>
+        <p><b>Read-only by default — write tools deferred and visibly v1.5.</b> The dimmed <code>bac.append_decision</code> tile signals architectural intent without shipping risk.</p>
+      </div>
+      <div class="callout">
+        <span class="num">16</span>
+        <p><b>Localhost-only, API-key-gated.</b> WebSocket on 127.0.0.1, never exposed beyond loopback. The "Copy config" affordance writes the right snippet for each agent's config file.</p>
+      </div>
+      <div class="callout">
+        <span class="num">17</span>
+        <p><b>Live query counts make the integration feel real.</b> Local-only counters; if Claude Code asks "what was I researching about WebGPU last March?", that count ticks up immediately — visible feedback that the moat is working.</p>
+      </div>
+      <div class="callout">
+        <span class="num">18</span>
+        <p><b>Mono-typed tool names mirror what they look like in Cursor/Claude Code.</b> Visual continuity from BAC's UI to the user's terminal — same naming conventions, same readability.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- =====================================================
+       SECTION 05 — ONBOARDING
+       ===================================================== -->
+  <section class="spec">
+    <div class="spec-head">
+      <div class="spec-num">05 / Onboarding</div>
+      <div>
+        <h2 class="spec-title">First run.</h2>
+        <p class="spec-caption">
+          Four steps: install, connect Obsidian, observe your tabs, configure MCP. This is step
+          two — connecting the Obsidian Local REST API plugin. Real friction, named honestly,
+          with a "limited mode" exit if the user doesn't want to install the community plugin.
+        </p>
+      </div>
+    </div>
+
+    <div class="surface-row center">
+      <div>
+        <div class="surface-tag">
+          <span><b>Modal</b> · First-run wizard / step 2 of 4</span>
+          <span class="ctx">Connect Obsidian</span>
+        </div>
+        <div class="frame frame--wizard">
+          <div class="titlebar">
+            <div class="dots"><span></span><span></span><span></span></div>
+            <div class="url">bac://welcome/step-2</div>
+          </div>
+          <div class="wizard">
+            <div class="header">
+              <div class="step">Step 2 of 4</div>
+              <h2>Connect your <em>Obsidian vault.</em></h2>
+              <div class="progress">
+                <span class="done"></span>
+                <span class="now"></span>
+                <span></span>
+                <span></span>
+              </div>
+            </div>
+            <div class="body">
+              <p class="lead">
+                BAC writes plain Markdown into your Obsidian vault as the canonical record of your
+                research. Nothing leaves your machine. Provide your vault path and the API key from
+                the <em>Local REST API</em> community plugin.
+              </p>
+
+              <div class="form-row">
+                <label>Vault path</label>
+                <div class="input">
+                  <input type="text" value="/Users/maya/Documents/Obsidian/research" />
+                  <span class="input-suffix">Browse</span>
+                </div>
+              </div>
+
+              <div class="form-row">
+                <label>Local REST API key</label>
+                <div class="input">
+                  <input type="password" value="••••••••••••••••••••••••" />
+                  <span class="input-suffix">Paste</span>
+                </div>
+              </div>
+
+              <div class="helper">
+                Don't have the plugin yet? Open Obsidian → <code>Settings → Community plugins → Browse → "Local REST API"</code>.
+                It's BSD-2-licensed, ~2K stars, ~355K installs. <a href="#">Install guide ↗</a>
+                <br/><br/>
+                Or use BAC in <a href="#">limited mode</a> — capture-only, no cross-thread recall over your vault.
+              </div>
+            </div>
+            <div class="actions">
+              <button class="btn ghost">← Back</button>
+              <div class="spacer"></div>
+              <button class="btn">Skip · limited mode</button>
+              <button class="btn primary">Test &amp; continue →</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =====================================================
+       SECTION 06 — SCREEN-SHARE-SAFE
+       ===================================================== -->
+  <section class="spec">
+    <div class="spec-head">
+      <div class="spec-num">06 / Safety</div>
+      <div>
+        <h2 class="spec-title">Screen-share-safe <em>mode.</em></h2>
+        <p class="spec-caption">
+          When <code style="font-family:var(--mono);font-size:13px;background:var(--paper-deep);padding:1px 5px;border-radius:3px;">navigator.mediaDevices.getDisplayMedia</code> reports active screen capture, BAC masks
+          bucket names, thread titles, and provenance metadata automatically. Nothing the user
+          configured comes off the screen unless they explicitly opt out. Auto-on; user-overridable.
+        </p>
+      </div>
+    </div>
+
+    <div class="surface-row center">
+      <div>
+        <div class="surface-tag">
+          <span><b>State C</b> · Side panel during screen share</span>
+          <span class="ctx">Auto-detected · masking active</span>
+        </div>
+        <div class="frame frame--sidepanel">
+          <div class="titlebar">
+            <div class="dots"><span></span><span></span><span></span></div>
+            <div class="url">chrome-extension://<b>bac</b>/sidepanel.html</div>
+          </div>
+          <div class="ss-banner">
+            <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
+            <b>Screen share detected.</b> Sensitive content masked. <a style="color: var(--signal-tint); margin-left: auto; cursor: pointer;">Override →</a>
+          </div>
+
+          <div class="app">
+            <div class="app-head">
+              <div class="app-mark">
+                <span class="glyph"></span>
+                BAC <span class="bac">/ companion</span>
+              </div>
+              <div class="app-actions">
+                <button class="icon-btn"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></button>
+              </div>
+            </div>
+
+            <div class="ws-bar">
+              <span class="lbl">Workstream</span>
+              <span class="ws-name"><span style="filter: blur(4px);">redacted</span></span>
+              <span class="swap-arrow">↓</span>
+            </div>
+
+            <div class="sec-head">
+              <span>Open threads</span>
+              <span class="count">4 active · 1 stale</span>
+            </div>
+
+            <div class="thread-list">
+              <div class="thread">
+                <div class="row1">
+                  <span class="provider claude">Claude</span>
+                  <span class="name" style="filter: blur(5px); user-select: none;">██████ ████████ ████ ████</span>
+                </div>
+                <div class="row2">
+                  <span class="dot signal"></span>
+                  <span class="stamp">Reply received · 14 min ago · unread</span>
+                </div>
+              </div>
+
+              <div class="thread">
+                <div class="row1">
+                  <span class="provider gpt">ChatGPT</span>
+                  <span class="name" style="filter: blur(5px); user-select: none;">█████████ █████ ██████</span>
+                </div>
+                <div class="row2">
+                  <span class="dot green"></span>
+                  <span class="stamp">You replied last · 2h ago</span>
+                </div>
+              </div>
+
+              <div class="thread">
+                <div class="row1">
+                  <span class="provider claude">Claude</span>
+                  <span class="name" style="filter: blur(5px); user-select: none;">████-████████ — ██████ █████</span>
+                </div>
+                <div class="row2">
+                  <span class="dot amber"></span>
+                  <span class="stamp">Awaiting your reply · 1d</span>
+                </div>
+              </div>
+
+              <div class="thread">
+                <div class="row1">
+                  <span class="provider gemini">Gemini</span>
+                  <span class="name" style="filter: blur(5px); user-select: none;">██████████ ████ — ██</span>
+                </div>
+                <div class="row2">
+                  <span class="dot gray"></span>
+                  <span class="stamp">Stale · 4d</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="sec-head">
+              <span>Recent captures</span>
+              <span class="count">Today</span>
+            </div>
+
+            <div class="capture">
+              <svg viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/></svg>
+              <div>
+                <div class="text" style="filter: blur(5px); user-select: none;">██████████ ██████ ████████ ████ ████████-█████ ██ ██ ████████ ██ ███ ██ ████ ███ ████████.</div>
+                <div class="meta" style="filter: blur(3.5px); user-select: none;">Claude · ████████-████████ · 14:32</div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="callouts">
+      <div class="callout">
+        <span class="num">19</span>
+        <p><b>Status structure stays visible — content is masked.</b> The shape of the side panel is unchanged so the user can still navigate. What's hidden: thread titles, bucket names, capture content, provenance footnotes. What's shown: provider tags, recency, status semantics.</p>
+      </div>
+      <div class="callout">
+        <span class="num">20</span>
+        <p><b>One-click override.</b> The banner has an "Override" link for the cases where the user is intentionally sharing BAC (a demo, a teaching moment). Trust requires reversibility.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- =====================================================
+       DESIGN SYSTEM TOKENS
+       ===================================================== -->
+  <section class="tokens">
+    <div class="spec-head">
+      <div class="spec-num">∞ / System</div>
+      <div>
+        <h2 class="spec-title">Design tokens.</h2>
+        <p class="spec-caption">
+          The implementation reference. Every value in the mocks above resolves to one of
+          these tokens. Three serifs do all the typographic work; the palette has exactly one
+          accent reserved for live signals.
+        </p>
+      </div>
+    </div>
+
+    <div class="tokens-grid">
+      <div class="token-block">
+        <h5>Paper &amp; ink</h5>
+        <div class="swatch-row"><span class="sw" style="background: #F5EFE2"></span>paper&nbsp;&nbsp;<code>#F5EFE2</code></div>
+        <div class="swatch-row"><span class="sw" style="background: #FBF7EE"></span>paper-light&nbsp;&nbsp;<code>#FBF7EE</code></div>
+        <div class="swatch-row"><span class="sw" style="background: #EDE5D2"></span>paper-tinted&nbsp;&nbsp;<code>#EDE5D2</code></div>
+        <div class="swatch-row"><span class="sw" style="background: #1B1916"></span>ink&nbsp;&nbsp;<code>#1B1916</code></div>
+        <div class="swatch-row"><span class="sw" style="background: #4A453D"></span>ink-2&nbsp;&nbsp;<code>#4A453D</code></div>
+        <div class="swatch-row"><span class="sw" style="background: #7A7269"></span>ink-3&nbsp;&nbsp;<code>#7A7269</code></div>
+        <div class="swatch-row"><span class="sw" style="background: #D4CDB8"></span>rule&nbsp;&nbsp;<code>#D4CDB8</code></div>
+      </div>
+
+      <div class="token-block">
+        <h5>Signal &amp; status</h5>
+        <div class="swatch-row"><span class="sw" style="background: #C2410C"></span>signal&nbsp;&nbsp;<code>#C2410C</code></div>
+        <div class="swatch-row"><span class="sw" style="background: #FED7AA"></span>signal-tint&nbsp;&nbsp;<code>#FED7AA</code></div>
+        <div class="swatch-row"><span class="sw" style="background: #FFF7ED"></span>signal-bg&nbsp;&nbsp;<code>#FFF7ED</code></div>
+        <div class="swatch-row"><span class="sw" style="background: #A16207"></span>amber&nbsp;&nbsp;<code>#A16207</code></div>
+        <div class="swatch-row"><span class="sw" style="background: #166534"></span>green&nbsp;&nbsp;<code>#166534</code></div>
+        <div class="swatch-row"><span class="sw" style="background: #475569"></span>slate&nbsp;&nbsp;<code>#475569</code></div>
+        <div style="margin-top: 8px; font-family: var(--body); font-size: 12px; font-style: italic; color: var(--ink-3); line-height: 1.5;">
+          Signal-orange is reserved for live signals: active workstream, unread reply, déjà-vu surfacing. Do not use for decoration.
+        </div>
+      </div>
+
+      <div class="token-block">
+        <h5>Type</h5>
+        <div class="type-row"><span class="label">Display</span><span class="show display">Fraunces</span></div>
+        <div class="type-row"><span class="label">Body</span><span class="show body">Source Serif 4</span></div>
+        <div class="type-row"><span class="label">Mono</span><span class="show mono">JetBrains Mono</span></div>
+        <div style="margin-top: 12px; font-family: var(--body); font-size: 12px; font-style: italic; color: var(--ink-3); line-height: 1.5;">
+          Display: serif headings, italic for accents.<br/>
+          Body: editorial serif for narrative.<br/>
+          Mono: every technical field, ID, status code.
+        </div>
+      </div>
+
+      <div class="token-block">
+        <h5>Semantics</h5>
+        <div style="font-family: var(--body); font-size: 12.5px; color: var(--ink-2); line-height: 1.6;">
+          <b style="font-family: var(--display); font-weight: 600;">Pulse-signal</b>: unread reply (highest-value, rarest).<br/>
+          <b style="font-family: var(--display); font-weight: 600;">Pulse-amber</b>: needs your action.<br/>
+          <b style="font-family: var(--display); font-weight: 600;">Solid green</b>: you replied last.<br/>
+          <b style="font-family: var(--display); font-weight: 600;">Gray</b>: stale, no action implied.<br/>
+          <b style="font-family: var(--display); font-weight: 600;">Italic serif</b>: the system speaking. Captured quotes, déjà-vu prompts, helper copy.<br/>
+          <b style="font-family: var(--display); font-weight: 600;">Mono</b>: system-generated identifiers, paths, IDs, technical data.
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =====================================================
+       COLOPHON
+       ===================================================== -->
+  <footer class="colophon">
+    <div>BAC · Design Spec v1.0 · April 2026</div>
+    <div>Surfaces: 7 · Tokens: 18 · Mocks rendered with Fraunces, Source Serif 4, JetBrains Mono.</div>
+  </footer>
+
+</div>
+</body>
+</html>

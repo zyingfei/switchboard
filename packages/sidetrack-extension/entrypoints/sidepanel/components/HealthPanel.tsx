@@ -23,6 +23,20 @@ interface HealthReport {
     readonly entryCount: number;
     readonly modelId: string | null;
     readonly sizeBytes: number | null;
+    // Optional lifecycle fields (companion ≥ this version) — drive
+    // the rebuild affordance + status copy. Older companions omit
+    // them and the UI falls back to the legacy "Re-index" button.
+    readonly status?: 'missing' | 'stale' | 'empty' | 'rebuilding' | 'ready';
+    readonly eventTurnCount?: number;
+    readonly currentModelId?: string | null;
+    readonly companionVersion?: string;
+    readonly lastRebuildAt?: string | null;
+    readonly lastRebuildIndexed?: number | null;
+    readonly lastError?: string | null;
+    readonly rebuildEmbedded?: number;
+    readonly rebuildTotal?: number;
+    readonly embedderDevice?: 'cpu' | 'wasm' | 'webgpu' | 'unknown';
+    readonly embedderAccelerator?: 'accelerate' | 'mkl' | 'cpu' | 'unknown';
   };
   readonly service: { readonly installed: boolean; readonly running: boolean };
 }
@@ -93,10 +107,83 @@ const formatBytes = (n: number | null): string => {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 };
 
+// Compose a human-readable label for the embedder backend so the
+// user can tell at a glance whether the rebuild path is running on
+// the fast native CPU EP (Apple Accelerate / MKL) or the slow wasm
+// fallback. "cpu (Accelerate)" reads as "this is the M-series fast
+// path" without forcing the user to know what onnxruntime is.
+const formatEmbedderLabel = (
+  device: 'cpu' | 'wasm' | 'webgpu' | 'unknown',
+  accelerator: 'accelerate' | 'mkl' | 'cpu' | 'unknown' | undefined,
+): string => {
+  if (device === 'wasm') return 'wasm (slow)';
+  if (device === 'webgpu') return 'webgpu';
+  if (device === 'cpu') {
+    if (accelerator === 'accelerate') return 'cpu (Accelerate)';
+    if (accelerator === 'mkl') return 'cpu (MKL)';
+    return 'cpu';
+  }
+  return device;
+};
+
 export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelProps) {
   const [copied, setCopied] = useState(false);
   const [report, setReport] = useState<HealthReport>(FIXTURE_REPORT);
   const [isLive, setIsLive] = useState(false);
+  type RebuildState =
+    | { kind: 'idle' }
+    | { kind: 'accepted' }
+    | { kind: 'error'; message: string };
+  const [rebuildState, setRebuildState] = useState<RebuildState>({ kind: 'idle' });
+
+  // Fire-and-monitor: POST /v1/recall/rebuild returns 202 immediately
+  // (the rebuild itself runs in the background — model download +
+  // embedding can take minutes). The recall index card already
+  // polls /v1/system/health every 5s while status === 'rebuilding',
+  // so the user sees the entry count tick up live without us
+  // holding the fetch open.
+  const triggerRebuild = async (): Promise<void> => {
+    if (companionPort === undefined || companionPort === null || !bridgeKey) {
+      setRebuildState({ kind: 'error', message: 'Companion not configured.' });
+      return;
+    }
+    setRebuildState({ kind: 'accepted' });
+    try {
+      const url = `http://127.0.0.1:${String(companionPort)}/v1/recall/rebuild`;
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'x-bac-bridge-key': bridgeKey },
+      });
+      if (!response.ok) {
+        setRebuildState({ kind: 'error', message: `HTTP ${String(response.status)}` });
+        return;
+      }
+      const body = (await response.json()) as {
+        readonly data?: { readonly lastError?: string | null };
+      };
+      if (typeof body.data?.lastError === 'string' && body.data.lastError.length > 0) {
+        setRebuildState({ kind: 'error', message: body.data.lastError });
+        return;
+      }
+      // Pull a fresh health snapshot so the card flips to "rebuilding"
+      // without waiting for the 30s poll cadence.
+      const healthUrl = `http://127.0.0.1:${String(companionPort)}/v1/system/health`;
+      const healthResponse = await fetch(healthUrl, {
+        headers: { 'x-bac-bridge-key': bridgeKey },
+      });
+      if (healthResponse.ok) {
+        const healthBody = (await healthResponse.json()) as { readonly data?: unknown };
+        if (isHealthReport(healthBody.data)) {
+          setReport(healthBody.data);
+        }
+      }
+    } catch (error) {
+      setRebuildState({
+        kind: 'error',
+        message: error instanceof Error ? error.message : 'Rebuild failed.',
+      });
+    }
+  };
 
   // Fetch the live report when companion is configured. Silent on failure
   // — the fixture stays in place so the visual surface never blanks.
@@ -119,14 +206,17 @@ export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelPr
       }
     };
     void fetchReport();
+    // Poll faster while a rebuild is in flight so the entry count
+    // ticks up live; fall back to 30s once it's settled.
+    const intervalMs = report.recall.status === 'rebuilding' ? 5_000 : 30_000;
     const id = window.setInterval(() => {
       void fetchReport();
-    }, 30_000);
+    }, intervalMs);
     return () => {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [companionPort, bridgeKey]);
+  }, [companionPort, bridgeKey, report.recall.status]);
 
   const queueWarn =
     report.capture.queueDepthHint !== null && report.capture.queueDepthHint > 10;
@@ -173,12 +263,41 @@ export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelPr
         <div className="hc">
           <div className="hc-lbl">recall index</div>
           <div className="hc-num small">
-            {(report.recall.entryCount / 1000).toFixed(1)}k
+            {report.recall.entryCount >= 1000
+              ? `${(report.recall.entryCount / 1000).toFixed(1)}k`
+              : String(report.recall.entryCount)}
           </div>
           <div className="hc-foot">
             vectors · {formatBytes(report.recall.sizeBytes)} ·{' '}
             {report.recall.modelId?.split('/').pop() ?? 'no model'}
           </div>
+          {report.recall.status !== undefined ? (
+            <div className="hc-foot">
+              status: <span className="mono">{report.recall.status}</span>
+              {report.recall.eventTurnCount !== undefined ? (
+                <>
+                  {' · '}
+                  {String(report.recall.entryCount)}/
+                  {String(report.recall.eventTurnCount)} turns
+                </>
+              ) : null}
+            </div>
+          ) : null}
+          {report.recall.embedderDevice !== undefined &&
+          report.recall.embedderDevice !== 'unknown' ? (
+            <div className="hc-foot">
+              embedder:{' '}
+              <span className="mono">
+                {formatEmbedderLabel(
+                  report.recall.embedderDevice,
+                  report.recall.embedderAccelerator,
+                )}
+              </span>
+            </div>
+          ) : null}
+          {report.recall.lastError !== undefined && report.recall.lastError !== null ? (
+            <div className="hc-foot warn">last error: {report.recall.lastError}</div>
+          ) : null}
         </div>
         <div className="hc">
           <div className="hc-lbl">vault writable</div>
@@ -233,7 +352,35 @@ export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelPr
             'Copy diagnostics'
           )}
         </button>
-        <button type="button">Re-index</button>
+        <button
+          type="button"
+          disabled={rebuildState.kind === 'accepted' || report.recall.status === 'rebuilding'}
+          onClick={() => {
+            void triggerRebuild();
+          }}
+        >
+          {report.recall.status === 'rebuilding'
+            ? `Re-indexing… (${String(
+                // Prefer the live embedded counter (updates between
+                // batches) over the on-disk entry count, which only
+                // moves on the final write.
+                report.recall.rebuildEmbedded ?? report.recall.entryCount,
+              )}${
+                report.recall.rebuildTotal !== undefined && report.recall.rebuildTotal > 0
+                  ? `/${String(report.recall.rebuildTotal)}`
+                  : report.recall.eventTurnCount !== undefined
+                    ? `/${String(report.recall.eventTurnCount)}`
+                    : ''
+              })`
+            : rebuildState.kind === 'accepted'
+              ? 'Started — watching…'
+              : 'Re-index'}
+        </button>
+        {rebuildState.kind === 'error' ? (
+          <span className="muted" style={{ alignSelf: 'center', marginLeft: 6 }}>
+            {rebuildState.message}
+          </span>
+        ) : null}
         <button type="button">Open log</button>
       </div>
     </div>

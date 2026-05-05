@@ -46,6 +46,26 @@ describe('PacketComposer — title is owned by Scope', () => {
     const input = screen.getByDisplayValue('X');
     expect(input.tagName).toBe('INPUT');
   });
+
+  it('renders scope suggestions and reports selection changes', () => {
+    const onScopeChange = vi.fn();
+    renderComposer({
+      scope: {
+        label: 'My packet',
+        workstreamId: 'ws-a',
+        availableTurns: [],
+      },
+      scopeSuggestions: [
+        { id: 'ws-a', label: 'Sidetrack / MVP', confidence: 0.8, reason: 'lexical 0.40' },
+        { id: 'ws-b', label: 'Research', confidence: 0.6, reason: 'vector 0.32' },
+      ],
+      onScopeChange,
+    });
+
+    expect(screen.getByText('Suggested scope')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Research/ }));
+    expect(onScopeChange).toHaveBeenCalledWith('ws-b');
+  });
 });
 
 describe('PacketComposer — intent-first target lanes', () => {

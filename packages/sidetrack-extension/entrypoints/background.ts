@@ -1,17 +1,26 @@
 import { defineBackground } from 'wxt/utils/define-background';
 
 import { captureGenericTab } from '../src/capture/genericFallback';
-import { detectProviderFromUrl, isProviderThreadUrl } from '../src/capture/providerDetection';
+import {
+  canonicalThreadUrl,
+  detectProviderFromUrl,
+  isProviderThreadUrl,
+} from '../src/capture/providerDetection';
 import {
   DEFAULT_LOCAL_CONFIG,
   runAutoSendDrain as driveAutoSendImpl,
 } from '../src/companion/autoSendDrain';
+import {
+  bridgeKeyValidationCopy,
+  validateBridgeKeyCandidate,
+} from '../src/companion/bridgeKeyValidation';
 import { createCompanionClient } from '../src/companion/client';
 import { listPendingOffers, markStatus, upsertOffer } from '../src/codingAttach/state';
 import type { CodingSurface } from '../src/codingAttach/detection';
 import { createSettingsClient } from '../src/settings/client';
 import type {
   CaptureEvent,
+  CompanionSettings,
   CodingAttachTokenCreate,
   CodingAttachTokenRecord,
   QueueCreate,
@@ -22,10 +31,13 @@ import type {
 } from '../src/companion/model';
 import { drainQueue, enqueueCapture } from '../src/companion/queue';
 import { createRecallClient } from '../src/companion/recallClient';
+import { buildReviewFollowUpText } from '../src/review/draft';
+import type { ReviewDraft } from '../src/review/types';
 import {
   isContentResponse,
   isRuntimeRequest,
   messageTypes,
+  type RecallQueryResponse,
   type RuntimeRequest,
   type RuntimeResponse,
 } from '../src/messages';
@@ -52,8 +64,13 @@ import {
   saveCompanionSettings,
   saveCollapsedBuckets,
   saveCollapsedSections,
+  readScreenShareMode,
   saveScreenShareMode,
   saveVaultPath,
+  pruneDispatchLinks,
+  pruneReminders,
+  reorderLocalQueueItems,
+  saveNotifyOnQueueComplete,
   updateLocalCaptureNote,
   updateLocalQueueItem,
   updateLocalReminder,
@@ -66,6 +83,12 @@ import {
   writeDispatchLink,
   writeDispatchOriginal,
   writeLastDispatchTargetByThread,
+  appendReviewDraftSpan as persistReviewDraftSpan,
+  dropReviewDraftSpan,
+  updateReviewDraft,
+  discardReviewDraft,
+  readReviewDrafts,
+  setDispatchArchived,
 } from '../src/background/state';
 import { createDispatchClient } from '../src/dispatch/client';
 import { tryLinkCapturedThread } from '../src/companion/dispatchLinking';
@@ -91,14 +114,22 @@ const tryAutoLinkCapturedThread = async (
   userTurnTexts: readonly string[],
   capturedAtMs: number,
 ): Promise<void> => {
-  const [recentDispatches, existingLinks, originalBodiesById] = await Promise.all([
+  const [recentDispatches, existingLinks, originalBodiesById, allThreads] = await Promise.all([
     readCachedDispatches(),
     readDispatchLinks(),
     readDispatchOriginals(),
+    readThreads(),
   ]);
   if (recentDispatches.length === 0) {
     return;
   }
+  // Pass the live set so the matcher can ignore "already-linked"
+  // entries that point at threads no longer in storage. Without
+  // this, a wiped/reassigned destination thread leaves the dispatch
+  // permanently linked to a dead bac_id — exactly the symptom the
+  // CDP storage dump showed: 5 of 7 dispatches with linkedTo
+  // bac_ids absent from sidetrack.threads.
+  const liveThreadIds = new Set(allThreads.map((t) => t.bac_id));
   const result = tryLinkCapturedThread({
     threadId,
     threadProvider,
@@ -107,6 +138,7 @@ const tryAutoLinkCapturedThread = async (
     recentDispatches,
     existingLinks,
     originalBodiesById,
+    liveThreadIds,
   });
   await writeDispatchDiagnostic({
     capturedAt: new Date(capturedAtMs).toISOString(),
@@ -122,10 +154,18 @@ const tryAutoLinkCapturedThread = async (
   await writeDispatchLink(result.dispatchId, threadId);
 };
 
+// Compare canonical forms so SPA URL drift on the active tab
+// (e.g. Gemini /app/<id>?session=…) doesn't cause an exact-match
+// miss against the canonical form stored on the thread record. The
+// previous strict-equality check caused "Unread reply" reminders to
+// keep firing on every assistant turn even when the user was
+// actively reading the chat.
 const userIsViewingThreadUrl = async (threadUrl: string): Promise<boolean> => {
   try {
     const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-    return tabs[0]?.url === threadUrl;
+    const activeUrl = tabs[0]?.url;
+    if (activeUrl === undefined) return false;
+    return canonicalThreadUrl(activeUrl) === canonicalThreadUrl(threadUrl);
   } catch {
     return false;
   }
@@ -232,7 +272,18 @@ const sendToCompanion = async (
 ): Promise<{ readonly bac_id: string; readonly revision: string }> => {
   const settings = await readSettings();
   const allThreads = await readThreads();
-  const existingThread = allThreads.find((thread) => thread.threadUrl === event.threadUrl);
+  // Find existing thread by canonical URL — companion's
+  // writeCaptureEvent always issues a fresh event-id and the old
+  // exact-string match against event.threadUrl missed Gemini's SPA
+  // drift (`/app/<id>` vs `/app/<id>?session=…`). Without this,
+  // every capture spawned a new thread record with a new bac_id,
+  // and reminders kept piling up against orphan threadIds.
+  const canonicalUrl = canonicalThreadUrl(event.threadUrl);
+  const existingThread = allThreads.find(
+    (thread) =>
+      thread.threadUrl === canonicalUrl ||
+      canonicalThreadUrl(thread.threadUrl) === canonicalUrl,
+  );
   const parentLink = resolveParentFromForkSource(event, allThreads);
   const client = createCompanionClient(settings.companion);
   const eventResult = await client.appendEvent(
@@ -242,8 +293,13 @@ const sendToCompanion = async (
   const trackingMode: ThreadUpsert['trackingMode'] =
     event.provider === 'unknown' || !settings.autoTrack ? 'manual' : 'auto';
   const lastTurnRole = event.turns.at(-1)?.role;
+  // Reuse the existing thread's bac_id — the event-result bac_id
+  // is the per-event record id, NOT a thread id. Sending it as
+  // thread.bac_id was forcing the companion's upsertThread to
+  // create a brand-new thread record on every capture.
+  const threadBacId = existingThread?.bac_id ?? eventResult.bac_id;
   const thread: ThreadUpsert = {
-    bac_id: eventResult.bac_id,
+    bac_id: threadBacId,
     provider: event.provider,
     threadId: event.threadId,
     threadUrl: event.threadUrl,
@@ -257,15 +313,25 @@ const sendToCompanion = async (
     ...(lastTurnRole === undefined ? {} : { lastTurnRole }),
   };
   const threadResult = await client.upsertThread(thread);
-  const lastIndexableTurn = event.turns.at(-1);
-  if (lastIndexableTurn !== undefined) {
+  // Index EVERY turn of the capture event, not just the last. The
+  // earlier path (only `event.turns.at(-1)`) created a slow drift
+  // where the recall index trailed the event log by ~90 entries
+  // until the next full rebuild — a "+ Capture" of a fresh thread
+  // appeared to add only the most-recent assistant turn to recall.
+  // Skip blank-text turns to mirror the rebuilder's behaviour.
+  const indexableTurns = event.turns.filter(
+    (turn) => typeof turn.text === 'string' && turn.text.trim().length > 0,
+  );
+  if (indexableTurns.length > 0) {
     void createRecallClient(settings.companion)
-      .indexTurn({
-        id: `${threadResult.bac_id}:${String(lastIndexableTurn.ordinal)}`,
-        threadId: threadResult.bac_id,
-        capturedAt: lastIndexableTurn.capturedAt,
-        text: lastIndexableTurn.text,
-      })
+      .indexTurns(
+        indexableTurns.map((turn) => ({
+          id: `${threadResult.bac_id}:${String(turn.ordinal)}`,
+          threadId: threadResult.bac_id,
+          capturedAt: turn.capturedAt,
+          text: turn.text,
+        })),
+      )
       .catch((error: unknown) => {
         // eslint-disable-next-line no-console
         console.debug(
@@ -282,11 +348,21 @@ const sendToCompanion = async (
       // Also clear any pending pill the user has already caught up on.
       await dismissRemindersForThread(threadResult.bac_id);
     } else {
+      // Pin the reminder to this assistant turn's ordinal so re-
+      // captures (extension reload re-injection, page refresh) of
+      // the same reply get deduped instead of spawning fresh
+      // "Unread reply" pills the user has already dismissed.
+      const lastAssistantOrdinal = [...event.turns]
+        .reverse()
+        .find((t) => t.role === 'assistant')?.ordinal;
       const reminder: ReminderCreate = {
         threadId: threadResult.bac_id,
         provider: event.provider,
         detectedAt: event.capturedAt,
         status: 'new',
+        ...(lastAssistantOrdinal === undefined
+          ? {}
+          : { lastAssistantTurnOrdinal: lastAssistantOrdinal }),
       };
       const reminderResult = await client.createReminder(reminder);
       await createLocalReminder(reminder, reminderResult);
@@ -358,6 +434,7 @@ const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
     tabSnapshot: event.tabSnapshot,
     ...parentLink,
     ...(lastTurnRole === undefined ? {} : { lastTurnRole }),
+    ...(event.selectedModel === undefined ? {} : { selectedModel: event.selectedModel }),
   });
   // Auto-resolve queued follow-ups whose text appears in the captured user
   // turns — same logic as sendToCompanion but for the local-only path.
@@ -376,11 +453,13 @@ const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
     if (await userIsViewingThreadUrl(event.threadUrl)) {
       await dismissRemindersForThread(existing.bac_id);
     } else {
+      const lastAssistantOrdinal = lastTurn.ordinal;
       await createLocalReminder({
         threadId: existing.bac_id,
         provider: event.provider,
         detectedAt: event.capturedAt,
         status: 'new',
+        lastAssistantTurnOrdinal: lastAssistantOrdinal,
       });
     }
     await markDispatchesRepliedForThread(existing.bac_id);
@@ -429,6 +508,16 @@ const captureTab = async (): Promise<void> => {
       capturedAt,
     ),
   );
+  // Known-provider chat URL but the extractor produced zero turns —
+  // the conversation hasn't mounted yet (Gemini's Angular shell can
+  // lag a few seconds on a fresh nav). Refuse rather than create a
+  // junk thread row; the previous behavior captured sidebar nav text
+  // as an "unknown" turn and polluted the vault.
+  if (baseCapture.provider !== 'unknown' && baseCapture.turns.length === 0) {
+    throw new Error(
+      `The ${baseCapture.provider} conversation hasn't finished loading. Wait a moment and try again.`,
+    );
+  }
   const event: CaptureEvent = {
     ...baseCapture,
     tabSnapshot: snapshotFromTab(tab, baseCapture.capturedAt),
@@ -473,6 +562,43 @@ const replayQueuedCaptures = async (): Promise<void> => {
 const isCompanionConfigured = async (): Promise<boolean> => {
   const settings = await readSettings();
   return settings.companion.bridgeKey.trim().length > 0;
+};
+
+const isBridgeKeyRejection = (message: string): boolean =>
+  /bridge key|unauthorized|401/iu.test(message);
+
+const normalizeCompanionSettings = (settings: CompanionSettings): CompanionSettings => ({
+  bridgeKey: settings.bridgeKey.trim(),
+  port: settings.port,
+});
+
+const verifyCompanionSettingsBeforeSave = async (
+  settings: CompanionSettings,
+): Promise<CompanionSettings> => {
+  const normalized = normalizeCompanionSettings(settings);
+  if (normalized.bridgeKey.length === 0) {
+    return normalized;
+  }
+
+  const failure = validateBridgeKeyCandidate(normalized.bridgeKey);
+  if (failure !== null) {
+    throw new Error(bridgeKeyValidationCopy[failure]);
+  }
+
+  try {
+    await createCompanionClient(normalized).status();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (isBridgeKeyRejection(message)) {
+      throw new Error(bridgeKeyValidationCopy.rejected);
+    }
+    throw new Error(
+      `Cannot reach the companion on port ${String(
+        normalized.port,
+      )}. Start the companion for this vault, then try again.`,
+    );
+  }
+  return normalized;
 };
 
 const assertCompanionReachable = async (): Promise<'connected' | 'vault-error' | 'local-only'> => {
@@ -572,6 +698,35 @@ const autoSendOnceTabReady = (tabId: number, body: string): void => {
           '[dispatchAutoSendInNewTab] content-script send failed:',
           dispatch.error ?? 'unknown',
         );
+        return;
+      }
+      // Auto-capture the destination chat after auto-send completes.
+      // Without this, the freshly-created chat at /app/<id> is never
+      // tracked (autoTrack is off by default), the matcher in
+      // dispatchLinking.ts never fires for it, and the source row in
+      // Recent Dispatches stays "send to new thread" forever — even
+      // across reloads. The user's report image #7 is exactly this
+      // symptom. Best-effort; failures don't block.
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        const captureResp: unknown = await chrome.tabs.sendMessage(tabId, {
+          type: messageTypes.captureVisibleThread,
+        });
+        if (isContentResponse(captureResp) && captureResp.ok) {
+          await storeCaptureEvent(captureResp.capture);
+          void broadcastWorkboardChanged('capture');
+        } else if (isContentResponse(captureResp) && !captureResp.ok) {
+          console.warn(
+            '[dispatchAutoSendInNewTab] post-send capture failed:',
+            captureResp.error,
+          );
+        }
+        void tab; // noop; reserved for future tab-state checks
+      } catch (error) {
+        console.warn(
+          '[dispatchAutoSendInNewTab] post-send capture threw:',
+          error instanceof Error ? error.message : error,
+        );
       }
     })();
   };
@@ -630,7 +785,13 @@ const sendToContentScriptWithRecovery = async (
 // src/companion/autoSendDrain.ts. The orchestrator handles the
 // per-item §24.10 preflight, sequencing, stop-on-failure, and the
 // status / lastError transitions. See that file for flow + reasoning.
-const runAutoSendDrain = async (threadId: string): Promise<boolean> => {
+interface AutoSendDrainOutcome {
+  readonly mutated: boolean;
+  readonly itemsSent: number;
+  readonly completed: boolean;
+}
+
+const runAutoSendDrain = async (threadId: string): Promise<AutoSendDrainOutcome> => {
   const outcome = await driveAutoSendImpl(threadId, {
     readThread: async (id) => {
       const t = (await readThreads()).find((x) => x.bac_id === id);
@@ -649,25 +810,38 @@ const runAutoSendDrain = async (threadId: string): Promise<boolean> => {
     },
     readCompanionConfig: async () => {
       const localSettings = await readSettings();
-      // Per-provider opt-in + screenShareSafeMode live on the companion
-      // when configured. Local-only users don't have a companion to store
-      // those flags, so fall back to "the per-thread toggle is the
-      // consent" — the user explicitly flipped Auto-send: on.
+      // The top-bar screenshare toggle (local screenShareMode) is the
+      // canonical source — UNION it with the companion's settings-only
+      // screenShareSafeMode so the user's expectation that "the
+      // top-bar toggle controls everything" actually holds. Without
+      // this, the user could disable the top-bar toggle and still see
+      // "Screen-share-safe mode is on; auto-send is paused" because
+      // the companion's separate setting was independently true.
+      const localScreenShareOn = await readScreenShareMode();
       if (localSettings.companion.bridgeKey.trim().length === 0) {
-        return DEFAULT_LOCAL_CONFIG;
+        return {
+          ...DEFAULT_LOCAL_CONFIG,
+          screenShareSafeMode:
+            DEFAULT_LOCAL_CONFIG.screenShareSafeMode || localScreenShareOn,
+        };
       }
       try {
         const companionSettings = await createSettingsClient(localSettings.companion).read();
         return {
           autoSendOptIn: companionSettings.autoSendOptIn,
-          screenShareSafeMode: companionSettings.screenShareSafeMode,
+          screenShareSafeMode:
+            companionSettings.screenShareSafeMode || localScreenShareOn,
         };
       } catch (error) {
         console.warn(
           '[autoSend] could not fetch companion settings; falling back to local defaults:',
           error instanceof Error ? error.message : error,
         );
-        return DEFAULT_LOCAL_CONFIG;
+        return {
+          ...DEFAULT_LOCAL_CONFIG,
+          screenShareSafeMode:
+            DEFAULT_LOCAL_CONFIG.screenShareSafeMode || localScreenShareOn,
+        };
       }
     },
     findTabForThread: async (t) => await findTabForThread(t),
@@ -694,21 +868,66 @@ const runAutoSendDrain = async (threadId: string): Promise<boolean> => {
       console.warn(message);
     },
   });
-  return outcome.mutated;
+  return {
+    mutated: outcome.mutated,
+    itemsSent: outcome.itemsSent,
+    completed: outcome.stoppedReason === 'completed',
+  };
 };
 
 // Fire-and-forget wrapper: spawns the drain unawaited and broadcasts
 // the workboard once it lands so the side panel re-reads the queue.
+// When the drain ships the last pending item for a thread, surface
+// a system notification so the user can context-switch away while
+// auto-send works through the queue (gated by notifyOnQueueComplete).
 const triggerAutoSendDrain = (threadId: string): void => {
   void runAutoSendDrain(threadId)
-    .then((mutated) => {
-      if (mutated) {
+    .then((outcome) => {
+      if (outcome.mutated) {
         void broadcastWorkboardChanged('queue');
+      }
+      if (outcome.completed && outcome.itemsSent > 0) {
+        void notifyQueueDrained(threadId, outcome.itemsSent).catch((error: unknown) => {
+          console.warn('[autoSend] notify failed:', error);
+        });
       }
     })
     .catch((error: unknown) => {
       console.warn('[autoSend] drain crashed:', error);
     });
+};
+
+// 1x1 transparent PNG. Chrome.notifications.create requires iconUrl
+// for type 'basic'; we ship a tiny inline placeholder so the
+// notification renders without an asset dependency.
+const NOTIFY_ICON_DATA_URL =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+
+const notifyQueueDrained = async (threadId: string, itemsSent: number): Promise<void> => {
+  const settings = await readSettings();
+  if (!settings.notifyOnQueueComplete) {
+    return;
+  }
+  if (typeof chrome.notifications.create !== 'function') {
+    return;
+  }
+  const thread = (await readThreads()).find((t) => t.bac_id === threadId);
+  const title = thread?.title ?? 'thread';
+  await new Promise<void>((resolve) => {
+    chrome.notifications.create(
+      `sidetrack.queue.complete.${threadId}.${String(Date.now())}`,
+      {
+        type: 'basic',
+        iconUrl: NOTIFY_ICON_DATA_URL,
+        title: 'Auto-send queue complete',
+        message: `Sidetrack finished sending ${String(itemsSent)} follow-up${itemsSent === 1 ? '' : 's'} into "${title}".`,
+        priority: 0,
+      },
+      () => {
+        resolve();
+      },
+    );
+  });
 };
 
 const currentTabThread = async (): Promise<TrackedThread | undefined> => {
@@ -782,17 +1001,22 @@ const refreshCachedDispatches = async (): Promise<void> => {
   const settings = await readSettings();
   try {
     const dispatches = await createDispatchClient(settings.companion).listRecent({ limit: 20 });
-    // Keep the side-panel cache merged with any local 'replied' flips
-    // already on it — markDispatchesRepliedForThread runs on capture
-    // and writes locally; the next refresh from the companion would
-    // otherwise revert it until the companion learns about the reply.
+    // Keep the side-panel cache merged with any local status overrides
+    // already on it. Two local-only flips: 'replied' (from
+    // markDispatchesRepliedForThread on capture) and 'archived' (from
+    // the user's UI action via setDispatchArchived). Without this
+    // merge, the next companion refresh would revert both back to
+    // 'sent' on every action.
     const local = await readCachedDispatches();
-    const localReplies = new Map(
-      local.filter((d) => d.status === 'replied').map((d) => [d.bac_id, d.status]),
+    const localOverrides = new Map(
+      local
+        .filter((d) => d.status === 'replied' || d.status === 'archived')
+        .map((d) => [d.bac_id, d.status]),
     );
-    const merged = dispatches.map((d) =>
-      localReplies.has(d.bac_id) ? { ...d, status: 'replied' as const } : d,
-    );
+    const merged = dispatches.map((d) => {
+      const override = localOverrides.get(d.bac_id);
+      return override === undefined ? d : { ...d, status: override };
+    });
     await writeCachedDispatches(merged);
   } catch {
     // Companion unreachable — keep the existing cache.
@@ -1082,6 +1306,21 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
     ) {
       return { ok: true, state: await buildState('connected') };
     }
+    // autoTrack gate: when off (default), auto-captures from the
+    // content script must NOT spawn brand-new thread records. The
+    // user's expectation is "manual tracking only" — they explicitly
+    // capture the threads they care about. Refresh-captures for
+    // already-tracked threads still flow through (so existing rows
+    // stay current); new-thread captures are silently dropped.
+    const settings = await readSettings();
+    if (!settings.autoTrack) {
+      const known = (await readThreads()).find(
+        (t) => t.threadUrl === request.capture.threadUrl,
+      );
+      if (known === undefined) {
+        return { ok: true, state: await buildState('connected') };
+      }
+    }
     const response = await withCompanionStatus(() => storeCaptureEvent(request.capture), 'capture');
     if (response.ok) {
       void notifyCaptureSuccess(request.capture);
@@ -1105,7 +1344,7 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
   }
 
   if (request.type === messageTypes.saveCompanionSettings) {
-    await saveCompanionSettings(request.settings);
+    await saveCompanionSettings(await verifyCompanionSettingsBeforeSave(request.settings));
     return await withCompanionStatus(() => Promise.resolve(), 'settings');
   }
 
@@ -1142,6 +1381,13 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
     );
   }
 
+  if (request.type === messageTypes.reorderQueueItems) {
+    return await withCompanionStatus(
+      () => reorderLocalQueueItems(request.queueItemIds),
+      'queue',
+    );
+  }
+
   if (request.type === messageTypes.retryAutoSend) {
     return await withCompanionStatus(async () => {
       // Clear lastError so the row stops showing the failure note
@@ -1170,6 +1416,84 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
     return await withCompanionStatus(async () => {
       await writeLastDispatchTargetByThread(request.threadId, request.target);
     }, 'queue');
+  }
+
+  if (request.type === messageTypes.recallQuery) {
+    // Content scripts on HTTPS chat pages can't fetch http://127.0.0.1
+    // directly — Chrome's mixed-content policy blocks the connection
+    // even with host_permissions. The service worker (chrome-extension://
+    // origin) is the one place fetches to localhost succeed reliably,
+    // so we proxy the recall query through here. Returns the parsed
+    // RankedItem[] (with title/snippet attached server-side) so the
+    // popover can render them. On any failure we return an empty list
+    // and surface the error in `error` for diagnostics.
+    //
+    // The cast to `unknown` and back through RecallQueryResponse keeps
+    // the per-handler return type local — RuntimeResponse stays the
+    // WorkboardState-bearing union for every other consumer.
+    const buildRecallResponse = async (): Promise<RecallQueryResponse> => {
+      try {
+        const settings = await readSettings();
+        const companion = settings.companion;
+        if (companion.bridgeKey.trim().length === 0 || companion.port <= 0) {
+          return { ok: false, items: [], error: 'Companion not configured.' };
+        }
+        const requestedLimit = request.limit ?? 5;
+        const client = createRecallClient(companion);
+        // Over-fetch so the post-filter (drop current thread + dedup
+        // by threadId) still has enough rows to fill `requestedLimit`.
+        // The companion clamps to 50 internally, so cap at 50.
+        const fetchLimit = Math.min(50, Math.max(requestedLimit * 4, 12));
+        const raw = await client.query(request.q, {
+          limit: fetchLimit,
+          ...(request.workstreamId === undefined ? {} : { workstreamId: request.workstreamId }),
+        });
+        // Cache local threads once for both the current-page filter
+        // and bac_id → threadUrl fallback (older companions that
+        // didn't enrich threadUrl).
+        const localThreads = await readThreads();
+        const threadUrlByBacId = new Map(
+          localThreads.map((thread) => [thread.bac_id, thread.threadUrl]),
+        );
+        const currentCanonical =
+          request.currentUrl !== undefined && request.currentUrl.length > 0
+            ? canonicalThreadUrl(request.currentUrl)
+            : '';
+        const dedupKey = (item: (typeof raw)[number]): string => {
+          // Prefer the server-provided threadUrl; fall back to the
+          // local thread record's URL; last resort, the bac_id (so
+          // stale results without any URL still dedup against
+          // themselves rather than collapsing across threads).
+          const url = item.threadUrl ?? threadUrlByBacId.get(item.threadId) ?? '';
+          return url.length > 0 ? canonicalThreadUrl(url) : `bac:${item.threadId}`;
+        };
+        // Dedup by canonical URL, keeping the highest-scoring row per
+        // thread. URL-based dedup catches the case where the same
+        // chat got captured under multiple bac_ids before the
+        // bac_id-stability fix landed (5 rows of "Hacker News
+        // Summary" all from the same Gemini conversation).
+        const bestPerUrl = new Map<string, (typeof raw)[number]>();
+        for (const item of raw) {
+          const key = dedupKey(item);
+          if (key === currentCanonical) continue; // skip current page
+          const existing = bestPerUrl.get(key);
+          if (existing === undefined || item.score > existing.score) {
+            bestPerUrl.set(key, item);
+          }
+        }
+        const items = Array.from(bestPerUrl.values())
+          .sort((left, right) => right.score - left.score)
+          .slice(0, requestedLimit);
+        return { ok: true, items };
+      } catch (error) {
+        return {
+          ok: false,
+          items: [],
+          error: error instanceof Error ? error.message : 'recall query failed',
+        };
+      }
+    };
+    return (await buildRecallResponse()) as unknown as RuntimeResponse;
   }
 
   if (request.type === messageTypes.focusThreadInSidePanel) {
@@ -1311,6 +1635,9 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
       if (typeof request.preferences.vaultPath === 'string') {
         await saveVaultPath(request.preferences.vaultPath);
       }
+      if (typeof request.preferences.notifyOnQueueComplete === 'boolean') {
+        await saveNotifyOnQueueComplete(request.preferences.notifyOnQueueComplete);
+      }
     }, 'settings');
   }
 
@@ -1333,6 +1660,89 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
   if (request.type === messageTypes.deleteCaptureNote) {
     const { noteId } = request;
     return await withCompanionStatus(() => deleteLocalCaptureNote(noteId), 'mutation');
+  }
+
+  if (request.type === messageTypes.appendReviewDraftSpan) {
+    return await withCompanionStatus(async () => {
+      // Resolve the threadUrl back to a tracked thread so the draft is
+      // keyed by bac_id (stable across URL re-resolution). If no thread
+      // exists yet, drop the span — there's no row in the side panel
+      // to surface it on. Capture should run before review.
+      const threads = await readThreads();
+      const thread = threads.find((t) => t.threadUrl === request.threadUrl);
+      if (thread === undefined) {
+        return;
+      }
+      await persistReviewDraftSpan(thread.bac_id, request.threadUrl, {
+        threadUrl: request.threadUrl,
+        anchor: request.anchor,
+        quote: request.quote,
+        comment: request.comment,
+        capturedAt: request.capturedAt,
+      });
+    }, 'mutation');
+  }
+
+  if (request.type === messageTypes.dropReviewDraftSpan) {
+    return await withCompanionStatus(async () => {
+      await dropReviewDraftSpan(request.threadId, request.spanId);
+    }, 'mutation');
+  }
+
+  if (request.type === messageTypes.updateReviewDraft) {
+    return await withCompanionStatus(async () => {
+      const patch: { overall?: string; verdict?: ReviewDraft['verdict'] } = {};
+      if (request.overall !== undefined) patch.overall = request.overall;
+      if (request.verdict !== undefined) patch.verdict = request.verdict;
+      await updateReviewDraft(request.threadId, patch);
+    }, 'mutation');
+  }
+
+  if (request.type === messageTypes.discardReviewDraft) {
+    return await withCompanionStatus(async () => {
+      await discardReviewDraft(request.threadId);
+    }, 'mutation');
+  }
+
+  if (request.type === messageTypes.sendReviewDraftAsFollowUp) {
+    return await withCompanionStatus(async () => {
+      const drafts = await readReviewDrafts();
+      const draft = drafts[request.threadId];
+      if (draft === undefined || draft.spans.length === 0) {
+        return;
+      }
+      const text = buildReviewFollowUpText(draft);
+      // Two flavors:
+      //   autoSend=true  → "Send now": ensure the per-thread auto-send
+      //                    chip is on so createQueueItem's auto-drain
+      //                    path fires immediately.
+      //   autoSend=false → "Add to queue": queue the item but don't
+      //                    touch the thread's auto-send state. If it
+      //                    was already on, the existing drain will
+      //                    pick it up; if it was off, the item just
+      //                    waits for the user to flip auto-send.
+      if (request.autoSend) {
+        await setThreadAutoSend(request.threadId, true);
+      }
+      await createQueueItem({
+        text,
+        scope: 'thread',
+        targetId: request.threadId,
+      });
+      await discardReviewDraft(request.threadId);
+    }, 'queue');
+  }
+
+  if (
+    request.type === messageTypes.archiveDispatch ||
+    request.type === messageTypes.unarchiveDispatch
+  ) {
+    return await withCompanionStatus(async () => {
+      await setDispatchArchived(
+        request.dispatchId,
+        request.type === messageTypes.archiveDispatch,
+      );
+    }, 'mutation');
   }
 
   if (request.type === messageTypes.setCollapsedSections) {
@@ -1423,7 +1833,16 @@ const detectCodingAttachForTab = async (tabId: number, url: string): Promise<voi
       args: [url],
     });
     if (result.result !== null && result.result !== undefined) {
-      await upsertOffer({ tabId, url, surface: result.result });
+      // Only emit offers when the URL actually matches the coding-
+      // surface pattern (medium / high confidence). DOM-only matches
+      // (low confidence) are too noisy: a regular ChatGPT chat that
+      // happens to mention "workspace", "diff", or "branch" trips the
+      // codex DOM regex and surfaces a false-positive Codex offer.
+      // The detection function still returns the low-confidence
+      // surface for diagnostics; we just don't act on it here.
+      if (result.result.confidence !== 'low') {
+        await upsertOffer({ tabId, url, surface: result.result });
+      }
     }
   } catch {
     // Restricted tabs or pages without the content script surface are ignored.
@@ -1431,8 +1850,30 @@ const detectCodingAttachForTab = async (tabId: number, url: string): Promise<voi
 };
 
 export default defineBackground(() => {
+  // Drop reminders bound to thread bac_ids that no longer exist.
+  // Cleanup pass for the historical mess caused by the pre-fix
+  // sendToCompanion bug (every capture reissued a thread bac_id;
+  // reminders accumulated against orphans). Idempotent — runs on
+  // every service-worker boot, no-op when storage is already clean.
+  const pruneOrphanRemindersAndLinks = async (): Promise<void> => {
+    try {
+      const knownThreadIds = new Set((await readThreads()).map((t) => t.bac_id));
+      const remindersDropped = await pruneReminders(knownThreadIds);
+      if (remindersDropped > 0) {
+        console.warn(
+          `[startup] pruned ${String(remindersDropped)} reminders bound to dead thread bac_ids`,
+        );
+        void broadcastWorkboardChanged('reminder');
+      }
+      await pruneDispatchLinks(knownThreadIds);
+    } catch (error) {
+      console.warn('[startup] orphan prune failed:', error);
+    }
+  };
+
   chrome.runtime.onInstalled.addListener((details) => {
     void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => undefined);
+    void pruneOrphanRemindersAndLinks();
     // Heal pre-existing tabs after an install/update/reload so the
     // user doesn't have to refresh each chat tab manually. The first
     // install case is harmless: matching tabs that already had no
@@ -1450,6 +1891,7 @@ export default defineBackground(() => {
   // fires when the browser launches. Re-inject is cheap and idempotent
   // so we can always do it.
   chrome.runtime.onStartup.addListener(() => {
+    void pruneOrphanRemindersAndLinks();
     void reinjectContentScriptIntoOpenTabs();
   });
 

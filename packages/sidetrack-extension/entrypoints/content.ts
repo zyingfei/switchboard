@@ -1,18 +1,24 @@
 import { defineContentScript } from 'wxt/utils/define-content-script';
 
-import { findAnchor } from '../src/annotation/anchors';
+import { findAnchor, serializeAnchor } from '../src/annotation/anchors';
 import { createAnnotationClient } from '../src/annotation/client';
 import { captureVisibleConversation } from '../src/capture/extractors';
 import { detectProviderFromUrl, isProviderThreadUrl } from '../src/capture/providerDetection';
-import { messageTypes, type ContentRequest, type ContentResponse } from '../src/messages';
+import { providerConfigs } from '../src/capture/providerConfigs';
+import {
+  messageTypes,
+  type ContentRequest,
+  type ContentResponse,
+  type RecallQueryResponse,
+} from '../src/messages';
 import {
   mountAnnotationOverlay,
   mountDejaVuPopover,
+  mountReviewSelectionChip,
   type DejaVuItem,
   type RestoredAnchor,
 } from '../src/contentOverlays';
-import { createRecallClient, type RankedItem } from '../src/companion/recallClient';
-import { readCompanionSettingsFromStorage } from '../src/companion/settingsBridge';
+import type { RankedItem } from '../src/companion/recallClient';
 
 // Per-provider composer + send-button + AI-done selectors. Sourced
 // from `tests/e2e/live-status-transitions.spec.ts` which proved each
@@ -99,13 +105,22 @@ const driveAutoSend = async (
   if (provider === 'codex') {
     return { ok: false, error: 'Auto-send does not support Codex sessions yet.' };
   }
-  if (!isProviderThreadUrl(provider, window.location.href)) {
-    return { ok: false, error: 'Current page is not a chat thread.' };
-  }
+  // Composer presence — not URL shape — gates auto-send. The new-chat
+  // landing page (e.g. https://gemini.google.com/app, the bare ChatGPT
+  // root) shows a composer that becomes a thread on submit; the
+  // dispatchAutoSendInNewTab flow relies on this. isProviderThreadUrl
+  // is the right gate for *capture* (we don't want a "thread" record
+  // for the landing page), not for typing.
   const driver = PROVIDER_DRIVERS[provider];
+  // Wait up to 15s for the composer to mount. Provider SPAs hydrate
+  // their editor (Quill / ProseMirror / Tiptap) lazily after the
+  // first `tabs.onUpdated` complete event, especially on first load
+  // of /app or a brand-new chat. Bailing immediately on a missing
+  // composer was the root cause of dispatch-into-new-tab no-ops.
+  await waitFor(() => findFirstElement(driver.composer) !== null, 15_000, 200);
   const composerEl = findFirstElement(driver.composer);
   if (!(composerEl instanceof HTMLElement)) {
-    return { ok: false, error: 'Composer not found in DOM.' };
+    return { ok: false, error: 'Composer not found in DOM (timed out after 15s).' };
   }
   const composer = composerEl;
 
@@ -204,6 +219,12 @@ export default defineContentScript({
         title: document.title,
       });
 
+    // Live in-page annotation set. Initially populated from the
+     // companion's persisted list on page load; appended to
+     // optimistically when the user saves a new comment so the
+     // margin marker shows up without requiring a page reload.
+    const liveAnchors: RestoredAnchor[] = [];
+
     const restoreAnnotations = async (): Promise<void> => {
       try {
         const client = await createAnnotationClient();
@@ -211,19 +232,27 @@ export default defineContentScript({
           return;
         }
         const annotations = await client.listAnnotationsForUrl(window.location.href);
-        const restored: RestoredAnchor[] = [];
         for (const annotation of annotations) {
           const range = findAnchor(document.documentElement, annotation.anchor);
           if (range !== null) {
-            restored.push({ id: annotation.bac_id, rect: range.getBoundingClientRect() });
+            liveAnchors.push({ id: annotation.bac_id, rect: range.getBoundingClientRect() });
           }
         }
-        if (restored.length > 0) {
-          mountAnnotationOverlay(restored);
+        if (liveAnchors.length > 0) {
+          mountAnnotationOverlay(liveAnchors);
         }
       } catch {
         // Restore is best-effort and must never disturb the host page.
       }
+    };
+
+    const addLiveAnnotation = (id: string, range: Range): void => {
+      // Optimistic mount: drop in the marker at the user's selection
+      // immediately so they get visible feedback that their save took
+      // effect. The companion's persisted record syncs on next page
+      // load (mountAnnotationOverlay clears + re-renders).
+      liveAnchors.push({ id, rect: range.getBoundingClientRect() });
+      mountAnnotationOverlay(liveAnchors);
     };
 
     // Déjà-vu pop-on-highlight — debounced selection listener that
@@ -232,22 +261,162 @@ export default defineContentScript({
     // the host page stays unaffected.
     let dejaVuDebounceTimer: number | undefined;
     let dejaVuMounted: { close: () => void } | null = null;
-    const dejaVuMutedForUrl = '';
+    let reviewChipMounted: { close: () => void } | null = null;
+    const dejaVuMutedUrls = new Set<string>();
+    const DEJA_VU_MUTED_URLS_KEY = 'dejaVuMutedUrls';
     const SELECTION_MIN_CHARS = 18;
+
+    const hydrateDejaVuMuteState = async (): Promise<void> => {
+      try {
+        const result = await chrome.storage.session.get({ [DEJA_VU_MUTED_URLS_KEY]: [] });
+        const urls = result[DEJA_VU_MUTED_URLS_KEY];
+        if (Array.isArray(urls)) {
+          dejaVuMutedUrls.clear();
+          for (const url of urls) {
+            if (typeof url === 'string') {
+              dejaVuMutedUrls.add(url);
+            }
+          }
+        }
+      } catch {
+        // Session storage may be unavailable in tests; mute stays in-memory.
+      }
+    };
+
+    const muteDejaVuForCurrentUrl = async (): Promise<void> => {
+      dejaVuMutedUrls.add(window.location.href);
+      try {
+        await chrome.storage.session.set({
+          [DEJA_VU_MUTED_URLS_KEY]: Array.from(dejaVuMutedUrls),
+        });
+      } catch {
+        // In-memory mute still applies for this content-script instance.
+      }
+    };
+
+    void hydrateDejaVuMuteState();
 
     const closeDejaVu = (): void => {
       dejaVuMounted?.close();
       dejaVuMounted = null;
     };
 
-    const fetchDejaVu = async (text: string, anchorRect: DOMRect): Promise<void> => {
-      if (dejaVuMutedForUrl === window.location.href) return;
+    const closeReviewChip = (): void => {
+      reviewChipMounted?.close();
+      reviewChipMounted = null;
+    };
+
+    // Selection-anchored review chip. Fires when the user highlights
+    // text inside an extracted turn element (provider config's
+    // directSources). The chip lets the user attach a comment that
+    // gets staged into a per-thread review draft on the background
+    // side, which the side panel surfaces and ultimately sends as a
+    // follow-up. Selection on non-turn elements (sidebar, header,
+    // composer) is ignored.
+    const turnSelectorForCurrentProvider = (): string | null => {
+      const provider = detectProviderFromUrl(window.location.href);
+      if (provider === 'unknown') return null;
+      const config = providerConfigs[provider];
+      const direct = config.directSources.map((source) => source.selector).filter((s) => s.length > 0);
+      if (direct.length === 0) return null;
+      return direct.join(', ');
+    };
+
+    const selectionInsideTurn = (selection: Selection): boolean => {
+      const turnSelector = turnSelectorForCurrentProvider();
+      if (turnSelector === null) return false;
+      const anchor = selection.anchorNode;
+      if (anchor === null) return false;
+      const element = anchor instanceof Element ? anchor : anchor.parentElement;
+      if (element === null) return false;
       try {
-        const settings = await readCompanionSettingsFromStorage();
-        if (settings === null) return;
-        const client = createRecallClient(settings);
-        const results = await client.query(text, { limit: 5 });
-        if (results.length === 0) return;
+        return element.closest(turnSelector) !== null;
+      } catch {
+        return false;
+      }
+    };
+
+    const offerReviewChip = (selection: Selection, anchorRect: DOMRect): void => {
+      const provider = detectProviderFromUrl(window.location.href);
+      if (provider === 'unknown') return;
+      if (!isProviderThreadUrl(provider, window.location.href)) return;
+      const range = selection.getRangeAt(0);
+      const quote = selection.toString();
+      let serialized;
+      try {
+        serialized = serializeAnchor(range);
+      } catch {
+        return;
+      }
+      const threadUrl = window.location.href;
+      closeReviewChip();
+      reviewChipMounted = mountReviewSelectionChip({
+        anchorRect,
+        quote,
+        onSave: async (comment) => {
+          await chrome.runtime.sendMessage({
+            type: messageTypes.appendReviewDraftSpan,
+            threadUrl,
+            anchor: serialized,
+            quote,
+            comment,
+            capturedAt: new Date().toISOString(),
+          });
+          // Optimistic in-page marker — gives the user instant visual
+          // confirmation their note saved without waiting for a page
+          // reload. The id is local-only; on next page load the
+          // companion's persisted annotation list takes over.
+          addLiveAnnotation(`local-${String(Date.now())}`, range);
+        },
+        onDismiss: () => {
+          reviewChipMounted = null;
+        },
+        onDejaVu: () => {
+          reviewChipMounted = null;
+          // Force the popover to mount even on empty results so the
+          // user gets explicit "no matches" feedback when they
+          // explicitly invoked Déjà-vu.
+          void fetchDejaVu(quote.trim(), anchorRect, true);
+        },
+      });
+    };
+
+    const fetchDejaVu = async (
+      text: string,
+      anchorRect: DOMRect,
+      // When `force` is true, always mount the popover (even on empty
+      // results) so the user gets explicit "no matches" feedback.
+      // The default automatic path stays implicit — only mounts on
+      // hits — so we don't pop empty cards on every selection.
+      force = false,
+    ): Promise<void> => {
+      if (!force && dejaVuMutedUrls.has(window.location.href)) return;
+      try {
+        // Route through the background SW. A direct fetch from this
+        // content script to http://127.0.0.1 is silently blocked by
+        // Chrome's mixed-content policy on HTTPS chat pages
+        // (chatgpt.com, claude.ai, etc.) — even with host_permissions
+        // — and the resulting "Failed to fetch" was caught by the
+        // outer try/catch and rendered as an empty popover. The SW's
+        // chrome-extension:// origin bypasses the block.
+        const response: Omit<RecallQueryResponse, 'items'> & {
+          readonly items: readonly RankedItem[];
+        } = await chrome.runtime.sendMessage({
+          type: messageTypes.recallQuery,
+          q: text,
+          limit: 5,
+          currentUrl: window.location.href,
+        });
+        if (!response.ok) {
+          // Surface the failure in the console so future regressions
+          // are visible to anyone with devtools open. The popover
+          // keeps showing the empty state — a noisy alert here would
+          // be worse than silence.
+          console.warn('[sidetrack] recall query failed:', response.error);
+          if (!force) return;
+        }
+        const results = response.items;
+        if (results.length === 0 && !force) return;
         closeDejaVu();
         dejaVuMounted = mountDejaVuPopover({
           items: results.map((r: RankedItem): DejaVuItem => ({
@@ -256,9 +425,38 @@ export default defineContentScript({
             snippet: r.snippet ?? '',
             score: r.score,
             relativeWhen: r.capturedAt,
+            // Provider is derived from the matched thread's URL when
+            // we have it (different chat → different provider chip);
+            // we fall back to the current page's provider for legacy
+            // results that don't carry a threadUrl yet.
+            provider: detectProviderFromUrl(r.threadUrl ?? window.location.href),
+            // Jump must go to the MATCHED thread, not the current
+            // page. Setting threadUrl to window.location.href here
+            // was a copy-paste leftover that made every Jump a no-op
+            // (focus-in-side-panel for the page you're already on).
+            ...(r.threadUrl === undefined ? {} : { threadUrl: r.threadUrl }),
+            bacId: r.threadId,
           })),
           anchorRect,
-          onJump: () => {
+          onJump: (item) => {
+            if (item.threadUrl !== undefined) {
+              void chrome.runtime.sendMessage({
+                type: messageTypes.focusThreadInSidePanel,
+                threadUrl: item.threadUrl,
+                // Pass the matched thread's bac_id + title + last-seen
+                // through to the side panel. Lets the focus handler
+                // render a synthetic card for recall results that
+                // aren't in the local thread cache yet (e.g. captured
+                // on another device, vault-only).
+                ...(item.bacId === undefined ? {} : { bacId: item.bacId }),
+                title: item.title,
+                lastSeenAt: item.relativeWhen,
+              });
+            }
+            closeDejaVu();
+          },
+          onMute: () => {
+            void muteDejaVuForCurrentUrl();
             closeDejaVu();
           },
           onDismiss: () => {
@@ -280,13 +478,30 @@ export default defineContentScript({
           return;
         }
         const text = selection.toString().trim();
-        if (text.length < SELECTION_MIN_CHARS) {
+        // Chip min: 3 chars (was 18). The 18-char floor was meant
+        // to prevent the auto-fire popover from spamming on tiny
+        // selections, but it also blocked the chip — so a user
+        // selecting a single phrase couldn't even see "+ Comment"
+        // or "Déjà-vu". The auto-fire popover keeps the higher
+        // floor inside fetchDejaVu; the chip surfaces at 3+ chars.
+        if (text.length < 3) {
           return;
         }
         const range = selection.getRangeAt(0);
         const rect = range.getBoundingClientRect();
         if (rect.width === 0 && rect.height === 0) return;
-        void fetchDejaVu(text, rect);
+        // Show the review-comment chip when the selection lives
+        // inside an extracted turn (provider directSource selectors).
+        // Déjà-vu still fires for non-turn selections (e.g. composer
+        // drafts) so recall keeps working everywhere.
+        if (selectionInsideTurn(selection)) {
+          offerReviewChip(selection, rect);
+        }
+        // Auto-fire the popover only at the original min — the
+        // explicit Déjà-vu chip works regardless.
+        if (text.length >= SELECTION_MIN_CHARS) {
+          void fetchDejaVu(text, rect);
+        }
       }, 400);
     };
 
@@ -295,12 +510,19 @@ export default defineContentScript({
       // Click outside the popover dismisses it. Inside-pop clicks bubble
       // to the popover's own listeners (jump / close button).
       const target = event.target;
-      if (
-        dejaVuMounted !== null &&
-        target instanceof Element &&
-        target.closest('.sidetrack-deja-pop') === null
-      ) {
-        closeDejaVu();
+      if (target instanceof Element) {
+        if (
+          dejaVuMounted !== null &&
+          target.closest('.sidetrack-deja-pop') === null
+        ) {
+          closeDejaVu();
+        }
+        if (
+          reviewChipMounted !== null &&
+          target.closest('.sidetrack-rv-chip, .sidetrack-rv-pop') === null
+        ) {
+          closeReviewChip();
+        }
       }
     });
 
@@ -358,6 +580,14 @@ export default defineContentScript({
           capture.provider === 'unknown' ||
           !isProviderThreadUrl(capture.provider, capture.threadUrl)
         ) {
+          return;
+        }
+        // Conversation may still be rendering — Gemini's Angular shell
+        // can take >1.2s to mount user-query / model-response elements
+        // on a fresh nav. Don't flag a transient zero-turn capture as
+        // selector drift; the mutation observer will fire an auto-
+        // capture once the DOM settles, recording an accurate canary.
+        if (capture.turns.length === 0) {
           return;
         }
         void chrome.runtime.sendMessage({

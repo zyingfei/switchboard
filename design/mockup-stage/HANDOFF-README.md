@@ -1,5 +1,9 @@
 # CODING AGENTS: READ THIS FIRST
 
+> **Note:** This is the **v1** mockup stage. The current design intent
+> lives at [`../switchboard-v2/`](../switchboard-v2/). Use v1 only for
+> historical context; do not extend v1.
+
 This is a **handoff bundle** from Claude Design (claude.ai/design).
 
 A user mocked up designs in HTML/CSS/JS using an AI design tool, then exported this bundle so a coding agent can implement the designs for real.

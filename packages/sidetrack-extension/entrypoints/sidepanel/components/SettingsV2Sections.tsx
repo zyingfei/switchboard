@@ -1,5 +1,6 @@
 import { useState } from 'react';
 
+import { formatRelative } from '../../../src/util/time';
 import { Icons } from './icons';
 
 // Settings v2 — section components for the SettingsPanel. Each is
@@ -303,6 +304,7 @@ export interface McpHost {
   readonly tokenMasked: string;
   readonly role: string;
   readonly online: boolean;
+  readonly checkedAt?: string;
 }
 
 interface McpHostsSectionProps {
@@ -332,6 +334,9 @@ export function McpHostsSection({ hosts, onRemove, onAdd }: McpHostsSectionProps
           <span className={'hp-dot ' + (h.online ? 'green' : '')} />
           <code className="url">{h.url}</code>
           <span className="role">{h.role}</span>
+          {h.checkedAt !== undefined ? (
+            <span className="role">{formatRelative(h.checkedAt)}</span>
+          ) : null}
           <code className="token">{h.tokenMasked}</code>
           <button
             type="button"
@@ -393,10 +398,13 @@ export interface VaultBucket {
 interface BucketsSectionProps {
   readonly buckets: readonly VaultBucket[];
   readonly onRemove: (id: string) => void;
-  readonly onAddBucket: () => void;
+  readonly onAddBucket: (input: { readonly rule: string; readonly vaultPath: string }) => void;
 }
 
 export function BucketsSection({ buckets, onRemove, onAddBucket }: BucketsSectionProps) {
+  const [adding, setAdding] = useState(false);
+  const [rule, setRule] = useState('');
+  const [vaultPath, setVaultPath] = useState('');
   return (
     <div className="settings-sec-v2" id="sec-vault">
       <div className="sec-h">Vaults &amp; buckets</div>
@@ -429,14 +437,61 @@ export function BucketsSection({ buckets, onRemove, onAddBucket }: BucketsSectio
           ) : null}
         </div>
       ))}
-      <button
-        type="button"
-        className="settings-button"
-        onClick={onAddBucket}
-        style={{ marginTop: 8 }}
-      >
-        {Icons.plus} Add bucket
-      </button>
+      {adding ? (
+        <div className="mcp-add bucket-add">
+          <input
+            className="mono"
+            placeholder="workstream:research"
+            value={rule}
+            onChange={(e) => {
+              setRule(e.target.value);
+            }}
+          />
+          <input
+            className="mono"
+            placeholder="~/Documents/Sidetrack-vault"
+            value={vaultPath}
+            onChange={(e) => {
+              setVaultPath(e.target.value);
+            }}
+          />
+          <button
+            type="button"
+            className="settings-button settings-button-primary"
+            disabled={rule.trim().length === 0 || vaultPath.trim().length === 0}
+            onClick={() => {
+              onAddBucket({ rule: rule.trim(), vaultPath: vaultPath.trim() });
+              setRule('');
+              setVaultPath('');
+              setAdding(false);
+            }}
+          >
+            Save
+          </button>
+          <button
+            type="button"
+            className="settings-button"
+            onClick={() => {
+              setRule('');
+              setVaultPath('');
+              setAdding(false);
+            }}
+          >
+            Cancel
+          </button>
+        </div>
+      ) : (
+        <button
+          type="button"
+          className="settings-button"
+          onClick={() => {
+            setAdding(true);
+          }}
+          style={{ marginTop: 8 }}
+        >
+          {Icons.plus} Add bucket
+        </button>
+      )}
     </div>
   );
 }

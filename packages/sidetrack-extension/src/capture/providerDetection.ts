@@ -38,6 +38,32 @@ export const detectProviderFromUrl = (inputUrl: string): ProviderId => {
 
 export const isSupportedProvider = (provider: ProviderId): boolean => provider !== 'unknown';
 
+// Canonical form of a provider thread URL — strips query and fragment
+// so SPA-driven URL drift (Gemini occasionally appending tracking
+// params after load, ChatGPT's ?model= query) doesn't fan out a
+// single chat into multiple thread records under different bac_ids.
+// The dispatch-link cache (dispatchId → threadBacId) was visibly
+// flickering when a second capture under a slightly-different URL
+// upserted a NEW thread record, the matcher relinked to it, and the
+// row briefly lost its destination title until the canonical capture
+// re-ran. Non-provider URLs (localhost, fixtures, unknown) are
+// returned unchanged so non-thread captures keep their full URL.
+export const canonicalThreadUrl = (inputUrl: string): string => {
+  let url: URL;
+  try {
+    url = new URL(inputUrl);
+  } catch {
+    return inputUrl;
+  }
+  const provider = detectProviderFromUrl(inputUrl);
+  if (provider === 'unknown' || !isProviderThreadUrl(provider, inputUrl)) {
+    return inputUrl;
+  }
+  url.search = '';
+  url.hash = '';
+  return url.toString();
+};
+
 export const isLikelyCaptureUrl = (inputUrl: string): boolean => {
   let url: URL;
   try {

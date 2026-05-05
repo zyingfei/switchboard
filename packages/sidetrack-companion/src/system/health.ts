@@ -11,6 +11,20 @@ export interface HealthReport {
     readonly entryCount: number | null;
     readonly modelId: string | null;
     readonly sizeBytes: number | null;
+    // Lifecycle fields — present when the companion was started with
+    // a recall lifecycle manager (production); absent in tests that
+    // don't care about freshness state.
+    readonly status?: 'missing' | 'stale' | 'empty' | 'rebuilding' | 'ready';
+    readonly eventTurnCount?: number;
+    readonly currentModelId?: string;
+    readonly companionVersion?: string;
+    readonly lastRebuildAt?: string | null;
+    readonly lastRebuildIndexed?: number | null;
+    readonly lastError?: string | null;
+    readonly rebuildEmbedded?: number;
+    readonly rebuildTotal?: number;
+    readonly embedderDevice?: 'cpu' | 'wasm' | 'webgpu' | 'unknown';
+    readonly embedderAccelerator?: 'accelerate' | 'mkl' | 'cpu' | 'unknown';
   };
   readonly service: { readonly installed: boolean; readonly running: boolean };
 }
