@@ -3633,10 +3633,11 @@ textarea.preview-body:focus {
 .thread-turn-annotate-row {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
 }
 .thread-turn-annotate-status {
-  flex: 1;
+  flex: 1 1 180px;
   font-size: 10px;
   color: var(--ink-3);
   font-style: italic;
@@ -3649,6 +3650,19 @@ textarea.preview-body:focus {
   font-style: normal;
 }
 .thread-turn-annotate-status.tone-error {
+  color: var(--signal, #c2410c);
+}
+.thread-turn-annotate-result {
+  grid-column: 1 / -1;
+  font-size: 10px;
+  color: var(--ink-3);
+  font-style: italic;
+}
+.thread-turn-annotate-result.tone-ok {
+  color: var(--green, #166534);
+  font-style: normal;
+}
+.thread-turn-annotate-result.tone-error {
   color: var(--signal, #c2410c);
 }
 

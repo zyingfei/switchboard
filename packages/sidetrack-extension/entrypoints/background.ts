@@ -38,6 +38,7 @@ import {
   isRuntimeRequest,
   messageTypes,
   type AnnotateTurnResponse,
+  type PublishAnnotationToChatResponse,
   type RecallQueryResponse,
   type RuntimeRequest,
   type RuntimeResponse,
@@ -791,6 +792,54 @@ const sendToContentScriptWithRecovery = async (
     };
   }
   return await attempt();
+};
+
+const findTabByCanonicalThreadUrl = async (
+  threadUrl: string,
+): Promise<chrome.tabs.Tab | undefined> => {
+  const targetCanonical = canonicalThreadUrl(threadUrl);
+  const allTabs = await chrome.tabs.query({});
+  return allTabs.find(
+    (tab) =>
+      typeof tab.url === 'string' &&
+      tab.id !== undefined &&
+      canonicalThreadUrl(tab.url) === targetCanonical,
+  );
+};
+
+const focusTabForUserVisibleSend = async (tab: chrome.tabs.Tab): Promise<void> => {
+  if (typeof tab.id === 'number') {
+    await chrome.tabs.update(tab.id, { active: true });
+  }
+  if (typeof tab.windowId === 'number') {
+    await chrome.windows.update(tab.windowId, { focused: true });
+  }
+};
+
+const quoteForChat = (input: string): string =>
+  input
+    .trim()
+    .split('\n')
+    .map((line) => `> ${line}`)
+    .join('\n');
+
+const buildAnnotationChatMessage = (input: {
+  readonly turnText: string;
+  readonly turnRole: string;
+  readonly note: string;
+  readonly capturedAt: string;
+}): string => {
+  const quote = input.turnText.trim().slice(0, 900);
+  return [
+    `Sidetrack annotation on a captured ${input.turnRole} turn:`,
+    '',
+    quoteForChat(quote.length > 0 ? quote : '(turn text unavailable)'),
+    '',
+    'Annotation:',
+    input.note.trim(),
+    '',
+    `Captured by Sidetrack at ${input.capturedAt}.`,
+  ].join('\n');
 };
 
 // Wires real chrome.* / network ports to the pure orchestrator in
@@ -1550,14 +1599,7 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
     // RuntimeResponse the same way recallQuery does.
     const buildAnnotateResponse = async (): Promise<AnnotateTurnResponse> => {
       try {
-        const targetCanonical = canonicalThreadUrl(request.threadUrl);
-        const allTabs = await chrome.tabs.query({});
-        const match = allTabs.find(
-          (tab) =>
-            typeof tab.url === 'string' &&
-            tab.id !== undefined &&
-            canonicalThreadUrl(tab.url) === targetCanonical,
-        );
+        const match = await findTabByCanonicalThreadUrl(request.threadUrl);
         if (match?.id === undefined) {
           return {
             ok: false,
@@ -1596,6 +1638,54 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
       }
     };
     return (await buildAnnotateResponse()) as unknown as RuntimeResponse;
+  }
+
+  if (request.type === messageTypes.publishAnnotationToChat) {
+    // Side-panel publish action for a turn annotation. This deliberately
+    // reuses the existing provider auto-send driver instead of adding
+    // another composer implementation path.
+    const buildPublishResponse = async (): Promise<PublishAnnotationToChatResponse> => {
+      try {
+        const match = await findTabByCanonicalThreadUrl(request.threadUrl);
+        if (match?.id === undefined) {
+          return {
+            ok: false,
+            error: 'Open the chat tab in this window first — Sidetrack needs a live composer.',
+          };
+        }
+        await focusTabForUserVisibleSend(match);
+        const result = await sendToContentScriptWithRecovery(match.id, {
+          type: messageTypes.autoSendItem,
+          text: buildAnnotationChatMessage({
+            turnText: request.turnText,
+            turnRole: request.turnRole,
+            note: request.note,
+            capturedAt: request.capturedAt,
+          }),
+          perItemTimeoutMs: 120_000,
+          waitForCompletion: false,
+        });
+        if (!result.ok) {
+          return { ok: false, error: result.error ?? 'Tab is not reachable.' };
+        }
+        const data = result.data;
+        if (
+          data !== null &&
+          typeof data === 'object' &&
+          'ok' in data &&
+          typeof data.ok === 'boolean'
+        ) {
+          return data as PublishAnnotationToChatResponse;
+        }
+        return { ok: false, error: 'Content script returned an unexpected shape.' };
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : 'publishAnnotationToChat relay failed.',
+        };
+      }
+    };
+    return (await buildPublishResponse()) as unknown as RuntimeResponse;
   }
 
   if (request.type === messageTypes.focusThreadInSidePanel) {

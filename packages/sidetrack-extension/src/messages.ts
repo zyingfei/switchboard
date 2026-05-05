@@ -122,6 +122,11 @@ export const messageTypes = {
   // that was actually used so the side panel can show the same
   // anchor in any subsequent UI.
   annotateTurn: 'sidetrack.annotation.turn.create',
+  // Side panel asks the chat tab to publish a saved turn annotation
+  // back into the provider composer. Background finds the live tab by
+  // canonical threadUrl, focuses it for user-visible behavior, then
+  // relays to the existing content-script autoSendItem driver.
+  publishAnnotationToChat: 'sidetrack.annotation.publishToChat',
 } as const;
 
 export interface SelectorCanaryReport {
@@ -403,6 +408,14 @@ export type WorkboardRequest =
       // by matching textContent.
       readonly turnText: string;
       readonly sourceSelector?: string;
+      readonly note: string;
+      readonly capturedAt: string;
+    }
+  | {
+      readonly type: typeof messageTypes.publishAnnotationToChat;
+      readonly threadUrl: string;
+      readonly turnText: string;
+      readonly turnRole: CaptureEvent['turns'][number]['role'];
       readonly note: string;
       readonly capturedAt: string;
     };
@@ -695,6 +708,19 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
     );
   }
 
+  if (hasType(value, messageTypes.publishAnnotationToChat)) {
+    return (
+      typeof value.threadUrl === 'string' &&
+      typeof value.turnText === 'string' &&
+      typeof value.note === 'string' &&
+      typeof value.capturedAt === 'string' &&
+      (value.turnRole === 'user' ||
+        value.turnRole === 'assistant' ||
+        value.turnRole === 'system' ||
+        value.turnRole === 'unknown')
+    );
+  }
+
   return false;
 };
 
@@ -709,6 +735,11 @@ export interface AnnotateTurnResponse {
   // Optional because content-script will still mount an optimistic
   // marker even if the persist call fails.
   readonly annotationId?: string;
+}
+
+export interface PublishAnnotationToChatResponse {
+  readonly ok: boolean;
+  readonly error?: string;
 }
 
 export const isRuntimeResponse = (value: unknown): value is RuntimeResponse => {

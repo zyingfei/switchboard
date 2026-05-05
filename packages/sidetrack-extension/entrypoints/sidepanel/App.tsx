@@ -18,6 +18,7 @@ import {
   isWorkboardChangedMessage,
   messageTypes,
   type AnnotateTurnResponse,
+  type PublishAnnotationToChatResponse,
   type RecallQueryResponse,
   type RuntimeResponse,
   type WorkboardRequest,
@@ -1785,21 +1786,33 @@ const App = () => {
     });
   };
 
-  const submitTurnAnnotation = (threadUrl: string, turn: CapturedTurnRecord, key: string): void => {
+  const submitTurnAnnotation = (
+    threadUrl: string,
+    turn: CapturedTurnRecord,
+    key: string,
+    publishToChat = false,
+  ): void => {
     const note = annotateTurnDraft.trim();
     if (note.length === 0) {
       return;
     }
-    setAnnotateTurnStatus({ key, tone: 'saving', text: 'placing marker on the live page…' });
+    setAnnotateTurnStatus({
+      key,
+      tone: 'saving',
+      text: publishToChat
+        ? 'placing marker and publishing to chat…'
+        : 'placing marker on the live page…',
+    });
     void (async () => {
       try {
+        const capturedAt = new Date().toISOString();
         const response: AnnotateTurnResponse = await chrome.runtime.sendMessage({
           type: messageTypes.annotateTurn,
           threadUrl,
           turnText: turn.text,
           ...(turn.sourceSelector === undefined ? {} : { sourceSelector: turn.sourceSelector }),
           note,
-          capturedAt: new Date().toISOString(),
+          capturedAt,
         });
         if (!response.ok) {
           setAnnotateTurnStatus({
@@ -1808,6 +1821,28 @@ const App = () => {
             text: response.error ?? 'Could not place the marker.',
           });
           return;
+        }
+        if (publishToChat) {
+          const publishResponse: PublishAnnotationToChatResponse = await chrome.runtime.sendMessage(
+            {
+              type: messageTypes.publishAnnotationToChat,
+              threadUrl,
+              turnText: turn.text,
+              turnRole: turn.role,
+              note,
+              capturedAt,
+            },
+          );
+          if (!publishResponse.ok) {
+            setAnnotateTurnStatus({
+              key,
+              tone: 'error',
+              text: `marker placed; publish failed: ${
+                publishResponse.error ?? 'Could not publish annotation to chat.'
+              }`,
+            });
+            return;
+          }
         }
         setAnnotateTurnDraft('');
         setAnnotateTurnKey(null);
@@ -1819,13 +1854,17 @@ const App = () => {
         setAnnotateTurnStatus({
           key,
           tone: response.error === undefined ? 'ok' : 'error',
-          text: response.error ?? 'marker placed on live page',
+          text:
+            response.error ??
+            (publishToChat ? 'marker placed and published to chat' : 'marker placed on live page'),
         });
-        window.setTimeout(() => {
-          setAnnotateTurnStatus((current) =>
-            current !== null && current.key === key ? null : current,
-          );
-        }, 4_000);
+        if (!publishToChat) {
+          window.setTimeout(() => {
+            setAnnotateTurnStatus((current) =>
+              current !== null && current.key === key ? null : current,
+            );
+          }, 4_000);
+        }
       } catch (error) {
         setAnnotateTurnStatus({
           key,
@@ -3123,8 +3162,28 @@ const App = () => {
                           >
                             {(status?.tone ?? '') === 'saving' ? 'placing…' : 'place marker'}
                           </button>
+                          <button
+                            type="button"
+                            className="btn-link mono"
+                            title="Place the marker, then send the annotation into the live chat"
+                            disabled={
+                              annotateTurnDraft.trim().length === 0 ||
+                              (status?.tone ?? '') === 'saving'
+                            }
+                            onClick={(e) => {
+                              e.preventDefault();
+                              submitTurnAnnotation(thread.threadUrl, turn, turnKey, true);
+                            }}
+                          >
+                            publish to chat
+                          </button>
                         </div>
                       </form>
+                    ) : null}
+                    {!annotateOpen && status !== null ? (
+                      <div className={'thread-turn-annotate-result mono' + ' tone-' + status.tone}>
+                        {status.text}
+                      </div>
                     ) : null}
                   </div>
                 );
