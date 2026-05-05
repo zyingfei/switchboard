@@ -98,8 +98,13 @@ const resolveExtensionId = async (cdpUrl: string): Promise<string> => {
     (t) => t.type === 'service_worker' && (t.url ?? '').startsWith('chrome-extension://'),
   );
   if (serviceWorkers.length > 0) {
-    const swTarget =
-      serviceWorkers.find((t) => (t.url ?? '').endsWith('/background.js')) ?? serviceWorkers[0];
+    const swTarget = serviceWorkers.find((t) => (t.url ?? '').endsWith('/background.js'));
+    if (swTarget === undefined) {
+      throw new Error(
+        `CDP reported extension service workers but none was Sidetrack's background.js. ` +
+          `Targets: ${JSON.stringify(serviceWorkers.map((t) => t.url ?? ''))}`,
+      );
+    }
     const match = /^chrome-extension:\/\/([^/]+)\//u.exec(swTarget.url ?? '');
     if (match !== null) {
       return match[1];

@@ -233,6 +233,27 @@ npm run e2e:pair
 The script also calls `/v1/system/health` and prints the resolved
 status, so a successful run is its own evidence.
 
+**Already-authenticated test browser on another port/worktree:**
+
+If a known-good Sidetrack test browser is already running with the
+extension loaded and provider sessions intact, do not relaunch it.
+Point the pair/e2e scripts at that CDP endpoint and target an
+already-open provider thread:
+
+```bash
+cd packages/sidetrack-extension
+SIDETRACK_E2E_CDP_URL=http://127.0.0.1:9223 npm run e2e:pair
+
+cd ../..
+SIDETRACK_E2E_CDP_URL=http://127.0.0.1:9223 \
+SIDETRACK_TARGET_URL='https://chatgpt.com/.../c/<thread-id>' \
+  node packages/sidetrack-extension/scripts/codex-real-e2e.mjs
+```
+
+This path also handles an idle MV3 service worker: the scripts can
+use the live `sidepanel.html` page as the extension control context
+when `context.serviceWorkers()` is empty.
+
 **Manual flow (when you have a human at the wheel):**
 
 1. Read the key:

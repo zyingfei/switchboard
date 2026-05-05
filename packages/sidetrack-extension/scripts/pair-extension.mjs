@@ -124,7 +124,9 @@ try {
     timeout: 10_000,
   });
 } catch (err) {
-  console.error(`[pair-extension] failed to open side panel at ${extensionId}: ${err.message ?? err}`);
+  console.error(
+    `[pair-extension] failed to open side panel at ${extensionId}: ${err.message ?? err}`,
+  );
   process.exit(1);
 }
 
@@ -165,11 +167,12 @@ try {
     const entries = typeof recall?.entryCount === 'number' ? recall.entryCount : null;
     const status = typeof recall?.status === 'string' ? recall.status : null;
     const uptime = body?.data?.uptimeSec ?? 0;
-    const recallSlug = status !== null
-      ? `recall=${status}${entries !== null ? ` (${String(entries)} entries)` : ''}, `
-      : entries !== null
-        ? `recall=${String(entries)} entries, `
-        : '';
+    const recallSlug =
+      status !== null
+        ? `recall=${status}${entries !== null ? ` (${String(entries)} entries)` : ''}, `
+        : entries !== null
+          ? `recall=${String(entries)} entries, `
+          : '';
     console.log(
       `[pair-extension]   companion health  : HTTP 200, ${recallSlug}uptime ${String(uptime)}s`,
     );

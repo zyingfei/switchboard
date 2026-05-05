@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // Spawn Chrome for Testing (CfT) directly, with the Sidetrack extension
 // loaded and a remote debugging port open. CfT is Google's automation
-// distribution — it accepts --load-extension, doesn't add
-// --use-mock-keychain on top, and won't get blocked by Google sign-in
-// the way regular Chrome stable + Playwright does.
+// distribution — it accepts --load-extension and avoids Playwright's
+// extra automation flags. Provider passkey sign-in still requires a
+// human with the passkey hardware; see the Codex handoff runbook.
 //
 // Two-terminal usage:
 //
@@ -34,9 +34,7 @@ const idFile = path.join(packageRoot, '.output/cdp-extension-id');
 const expandTilde = (input) =>
   input.startsWith('~') ? path.join(homedir(), input.slice(1).replace(/^[/\\]/, '')) : input;
 
-const userDataDir = expandTilde(
-  process.env.SIDETRACK_USER_DATA_DIR ?? '~/.sidetrack-test-profile',
-);
+const userDataDir = expandTilde(process.env.SIDETRACK_USER_DATA_DIR ?? '~/.sidetrack-test-profile');
 const port = process.env.SIDETRACK_E2E_CDP_PORT ?? '9222';
 
 // Shared CfT install root, in the OS user-cache. One copy serves all
@@ -44,7 +42,8 @@ const port = process.env.SIDETRACK_E2E_CDP_PORT ?? '9222';
 // dropping a 340 MB tree under `.chrome-for-testing/` per worktree.
 // Override with SIDETRACK_CFT_ROOT.
 const SHARED_CFT_ROOT =
-  process.env.SIDETRACK_CFT_ROOT ?? path.join(homedir(), 'Library/Caches/sidetrack/chrome-for-testing');
+  process.env.SIDETRACK_CFT_ROOT ??
+  path.join(homedir(), 'Library/Caches/sidetrack/chrome-for-testing');
 
 const findCftBinaryUnder = async (rootWithChromeSubdir) => {
   try {
@@ -174,12 +173,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     await sleep(1_000);
     try {
       const list = await fetch(`http://localhost:${port}/json/list`).then((r) => r.json());
-      const serviceWorkers = list.filter(
-        (t) => t.type === 'service_worker' && (t.url ?? '').startsWith('chrome-extension://'),
+      const sw = list.find(
+        (t) =>
+          t.type === 'service_worker' &&
+          (t.url ?? '').startsWith('chrome-extension://') &&
+          (t.url ?? '').endsWith('/background.js'),
       );
-      const sw =
-        serviceWorkers.find((t) => (t.url ?? '').endsWith('/background.js')) ??
-        serviceWorkers[0];
       if (sw === undefined) continue;
       const match = /^chrome-extension:\/\/([^/]+)\//u.exec(sw.url);
       if (match === null) continue;
