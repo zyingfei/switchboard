@@ -492,12 +492,17 @@ button:disabled {
 
 .thread-actions {
   display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
+  flex-wrap: nowrap;
+  gap: 6px;
   justify-content: flex-end;
-  /* Span the full card width so the action strip hugs the right
-     edge instead of floating in a fixed 150px box at the left. */
-  width: 100%;
+  /* Float the action strip to the top-right of the card so it sits
+     visually on the same row as the title (replacing the old
+     .thread-focus-btn ↗ which has been removed — the action strip's
+     own arrow icon does the same thing). */
+  position: absolute;
+  top: 6px;
+  right: 10px;
+  width: auto;
 }
 
 .status-chip,
@@ -3134,6 +3139,7 @@ textarea.preview-body:focus {
   padding: 12px 8px;
 }
 .thread {
+  position: relative;
   padding: 6px 10px;
   border: 1px solid transparent;
   border-radius: var(--rad-m);
@@ -3251,14 +3257,8 @@ textarea.preview-body:focus {
 }
 .thread-actions {
   /* Always visible per v2 design — the action strip is part of the
-     card surface, not a hover affordance. Hover-only hiding created
-     a jarring layout shift between cards (one expanded, others
-     short) and left a blank vertical band under "Ungrouped" while
-     the user moved the cursor. */
-  gap: 10px;
-  /* Tightened from 4px → 1px so the strip sits closer to the
-     lifecycle line instead of leaving a visible vertical band on
-     cards with no workstream/lineage row in between. */
+     card surface, not a hover affordance. */
+  gap: 6px;
   padding-top: 1px;
   flex-wrap: wrap;
 }
@@ -3283,20 +3283,32 @@ textarea.preview-body:focus {
   white-space: nowrap;
   flex: 0 0 auto;
 }
-/* Icon-only action buttons (Open, Send to, ⋯) — match the chip and
-   pencil tone in the card header so the visual language stays
-   consistent across the surface. */
+/* Icon-only action buttons (Open, Send to, ⋯) — match the GEMINI
+   provider chip's tone (1px hairline + paper-light fill) so the
+   buttons read as tappable instead of decorative strokes. */
 .thread-actions .thread-action-icon {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
-  padding: 3px 4px;
-  border-radius: 3px;
+  gap: 4px;
+  padding: 4px 7px;
+  border: 1px solid var(--rule-soft, #e5ddc9);
+  border-radius: 4px;
+  background: var(--paper-light, #fbf7ee);
   color: var(--ink-3, #7a7269);
+  transition:
+    border-color 120ms ease,
+    color 120ms ease,
+    background-color 120ms ease;
 }
-.thread-actions .thread-action-icon:hover {
+.thread-actions .thread-action-icon:hover,
+.thread-actions .thread-action-icon:focus-visible {
+  border-color: var(--rule, #d4cdb8);
   background: var(--paper, #f5efe2);
   color: var(--signal, #c2410c);
+  outline: none;
+}
+.thread-actions .thread-action-icon.disabled-look {
+  opacity: 0.5;
 }
 .thread-actions .thread-action-icon .icon-12 {
   width: 13px;
@@ -3472,8 +3484,11 @@ textarea.preview-body:focus {
    Thread history strip — captures rendered inline under a thread
    ===================================================== */
 .thread-history {
-  margin: 4px 0 0;
-  padding: 4px 0 0;
+  /* Tight margins so the "+ note" affordance and any notes sit
+     close to the lifecycle row above and the card's bottom edge
+     below — no extra vertical band. */
+  margin: 2px 0 0;
+  padding: 2px 0 0;
   border-top: 1px dashed transparent;
   /* Collapsed by default — empty cards (no notes, no open compose)
      don't reserve vertical space for an invisible "+ note" button.
@@ -3557,11 +3572,10 @@ textarea.preview-body:focus {
      space on un-highlighted cards. Revealed on hover / focus —
      layout shift on hover is acceptable when the user is actively
      interacting with the card. Stays visible when the strip
-     already has notes (the parent .thread-history :has() rule
-     elsewhere keeps the dashed separator + content visible). */
+     already has notes. */
   display: none;
   align-self: flex-start;
-  margin-top: 2px;
+  margin: 0;
   font-family: var(--mono);
   font-size: 10px;
   letter-spacing: 0.04em;
@@ -4111,17 +4125,26 @@ button.thread-queued:focus-visible {
 
 .thread-ws-path {
   display: inline-flex;
-  margin: 2px 0 0 26px;
+  /* Inline-block so it sits alongside the lifecycle row, not on its
+     own line. Self-aligned to the row2 baseline by the parent flex.
+     Tight margin so there's no vertical band when the card has no
+     other content underneath. */
+  align-self: flex-start;
+  margin: 2px 0 0 14px;
   padding: 0;
   border: 0;
   background: transparent;
   color: var(--ink-4, #a39a8c);
-  font-size: 11px;
+  font-size: 10.5px;
   cursor: pointer;
+  /* Never-underlined, only color-shift on hover — keeps the path
+     reading as metadata, not a hyperlink. */
+  text-decoration: none;
 }
-.thread-ws-path:hover {
+.thread-ws-path:hover,
+.thread-ws-path:focus-visible {
   color: var(--ink-2, #4a453d);
-  text-decoration: underline;
+  outline: none;
 }
 
 .thread-actions .btn-link.archive {
@@ -6092,9 +6115,13 @@ pre.diff {
 .thread-overflow-menu {
   position: absolute;
   top: calc(100% + 4px);
-  left: 0;
-  right: auto;
-  min-width: 180px;
+  /* Anchor the menu's right edge to the trigger button (the ⋯
+     overflow icon, which is itself flush against the card's right
+     edge). Opens to the LEFT so it never clips off the side panel
+     on narrow widths. */
+  right: 0;
+  left: auto;
+  min-width: 200px;
   background: var(--paper-light);
   border: var(--hair);
   border-radius: var(--rad-s);
@@ -6130,7 +6157,8 @@ pre.diff {
 .thread-overflow-menu button:hover {
   background: var(--paper-deep);
 }
-.thread-overflow-menu button.archive {
+.thread-overflow-menu button.archive,
+.thread-overflow-menu button.warn {
   color: var(--signal);
 }
 .thread-overflow-menu button.disabled-look {

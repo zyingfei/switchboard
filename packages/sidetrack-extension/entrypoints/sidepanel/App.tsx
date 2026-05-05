@@ -2053,18 +2053,6 @@ const App = () => {
           >
             <span className="name">{titleDisplay}</span>
           </button>
-          <button
-            type="button"
-            className="thread-focus-btn"
-            title={isPrivate ? 'Open thread tab' : `Focus: ${thread.title}`}
-            aria-label="Open or focus the thread tab"
-            onClick={(e) => {
-              e.stopPropagation();
-              openTabForThread(thread);
-            }}
-          >
-            ↗
-          </button>
           {queuedCount > 0 ? (
             <button
               type="button"
@@ -2094,7 +2082,7 @@ const App = () => {
             </button>
           ) : null}
         </div>
-        <div className="row2">
+        <div className="row2 row2-lifecycle">
           <span className={'dot ' + dotClass} />
           <span className="stamp">{stamp}</span>
           {/* Per spec: dot + stamp already convey lifecycle. The
@@ -2106,6 +2094,25 @@ const App = () => {
             <span className={'lifecycle-pill mono ' + lifecyclePill.tone}>
               {lifecyclePill.label}
             </span>
+          ) : null}
+          {viewMode === 'all' ? (
+            <button
+              type="button"
+              className="thread-ws-path mono"
+              title={
+                thread.primaryWorkstreamId === undefined
+                  ? 'Switch to Ungrouped workstream view'
+                  : 'Switch to this workstream'
+              }
+              onClick={(e) => {
+                e.stopPropagation();
+                focusThreadInWorkstream(thread);
+              }}
+            >
+              {thread.primaryWorkstreamId === undefined
+                ? 'Ungrouped'
+                : workstreamPath(thread.primaryWorkstreamId, state.workstreams)}
+            </button>
           ) : null}
         </div>
         {lifecyclePill?.label === 'Needs organize' && !dismissedSuggestions.has(thread.bac_id) ? (
@@ -2135,25 +2142,6 @@ const App = () => {
               });
             }}
           />
-        ) : null}
-        {viewMode === 'all' ? (
-          <button
-            type="button"
-            className="thread-ws-path mono"
-            title={
-              thread.primaryWorkstreamId === undefined
-                ? 'Switch to Ungrouped workstream view'
-                : 'Switch to this workstream'
-            }
-            onClick={(e) => {
-              e.stopPropagation();
-              focusThreadInWorkstream(thread);
-            }}
-          >
-            {thread.primaryWorkstreamId === undefined
-              ? 'Ungrouped'
-              : workstreamPath(thread.primaryWorkstreamId, state.workstreams)}
-          </button>
         ) : null}
         {parent !== undefined || thread.parentTitle !== undefined ? (
           <div className="row2 thread-lineage" title="Branched from a tracked thread">
@@ -2374,6 +2362,7 @@ const App = () => {
                         <button
                           type="button"
                           role="menuitem"
+                          className="warn"
                           onClick={() => {
                             setActionMenuOpenFor(null);
                             updateTracking(thread.bac_id, 'stopped');
@@ -2686,11 +2675,7 @@ const App = () => {
         <div className="thread-history">
           {historyOpen ? (
             <>
-              {threadNotes.length === 0 ? (
-                <span className="thread-history-empty">
-                  no notes yet — capture context as the thread evolves
-                </span>
-              ) : (
+              {threadNotes.length === 0 ? null : (
                 threadNotes.map((note) => (
                   <div key={note.bac_id} className="thread-history-item">
                     <span className="glyph" aria-hidden>
