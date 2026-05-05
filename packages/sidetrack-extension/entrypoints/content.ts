@@ -405,6 +405,7 @@ export default defineContentScript({
           type: messageTypes.recallQuery,
           q: text,
           limit: 5,
+          currentUrl: window.location.href,
         });
         if (!response.ok) {
           // Surface the failure in the console so future regressions

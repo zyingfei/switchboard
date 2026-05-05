@@ -367,6 +367,11 @@ export type WorkboardRequest =
       readonly q: string;
       readonly limit?: number;
       readonly workstreamId?: string;
+      // URL of the page issuing the query. Background uses it to drop
+      // results that point back at the same thread the user is
+      // already reading (no point in saying "you've seen this before"
+      // about the page in front of them).
+      readonly currentUrl?: string;
     };
 
 export type RuntimeRequest =
@@ -643,7 +648,8 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
     return (
       typeof value.q === 'string' &&
       (value.limit === undefined || typeof value.limit === 'number') &&
-      (value.workstreamId === undefined || typeof value.workstreamId === 'string')
+      (value.workstreamId === undefined || typeof value.workstreamId === 'string') &&
+      (value.currentUrl === undefined || typeof value.currentUrl === 'string')
     );
   }
 

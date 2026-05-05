@@ -629,19 +629,16 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
   clearDejaPop(root);
   const pop = document.createElement('div');
   pop.className = 'sidetrack-deja-pop';
-  const viewportWidth = document.documentElement.clientWidth;
-  let left = opts.anchorRect.left + opts.anchorRect.width / 2 - POP_WIDTH / 2;
-  if (left < 8) left = 8;
-  if (left + POP_WIDTH > viewportWidth - 8) left = viewportWidth - 8 - POP_WIDTH;
-  // Default: above the selection. Flip below if it would go off-screen.
-  let top = opts.anchorRect.top - 8;
-  let placeAbove = true;
-  if (top < 80) {
-    top = opts.anchorRect.bottom + 8;
-    placeAbove = false;
-  }
-  pop.style.left = `${String(left)}px`;
-  pop.style.top = `${String(placeAbove ? top - 320 : top)}px`;
+  // Initial position is best-effort — the real clamp happens after
+  // the popover mounts and we can measure its actual height. Until
+  // then we use a left-aligned offscreen position so the user
+  // never sees the unclamped intermediate frame.
+  pop.style.left = '-9999px';
+  pop.style.top = '0px';
+  // Cap the height so a popover with many rows can't push past the
+  // viewport. The list scrolls inside this max.
+  pop.style.maxHeight = `${String(Math.min(420, document.documentElement.clientHeight - 40))}px`;
+  pop.style.overflow = 'auto';
   const isEmpty = opts.items.length === 0;
   pop.innerHTML = `
     <div class="sidetrack-deja-head">
@@ -713,5 +710,52 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
     opts.onMute?.();
   });
   root.appendChild(pop);
+  // Now that the popover is in the DOM we know its real size and can
+  // place it correctly relative to the selection. Order of preference:
+  //   1. Above the selection if there's room for the full popover
+  //   2. Below the selection if there's room there
+  //   3. Pinned to the available edge (clamped) if neither side fits,
+  //      so the popover stays on-screen even if it has to overlap the
+  //      selection a little.
+  // Width clamp is independent — center on selection, then pull back
+  // from any viewport edge it would cross.
+  const positionPopover = (): void => {
+    const popRect = pop.getBoundingClientRect();
+    const popHeight = popRect.height;
+    const popWidth = popRect.width || POP_WIDTH;
+    const viewportW = document.documentElement.clientWidth;
+    const viewportH = document.documentElement.clientHeight;
+    const margin = 8;
+    const gap = 6;
+
+    let left = opts.anchorRect.left + opts.anchorRect.width / 2 - popWidth / 2;
+    if (left < margin) left = margin;
+    if (left + popWidth > viewportW - margin) left = viewportW - margin - popWidth;
+
+    const spaceAbove = opts.anchorRect.top - margin;
+    const spaceBelow = viewportH - opts.anchorRect.bottom - margin;
+    let top: number;
+    if (popHeight + gap <= spaceAbove) {
+      top = opts.anchorRect.top - popHeight - gap;
+    } else if (popHeight + gap <= spaceBelow) {
+      top = opts.anchorRect.bottom + gap;
+    } else {
+      // Neither side has the full popover height. Pin to whichever
+      // side has more room and let the popover scroll internally
+      // (the maxHeight cap above keeps it inside the viewport).
+      if (spaceBelow >= spaceAbove) {
+        top = Math.max(margin, viewportH - popHeight - margin);
+      } else {
+        top = margin;
+      }
+    }
+
+    pop.style.left = `${String(Math.round(left))}px`;
+    pop.style.top = `${String(Math.round(top))}px`;
+  };
+  // First pass synchronously after mount; second pass next frame in
+  // case the row contents triggered a reflow that changed height.
+  positionPopover();
+  requestAnimationFrame(positionPopover);
   return { close };
 };

@@ -1428,11 +1428,45 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
         if (companion.bridgeKey.trim().length === 0 || companion.port <= 0) {
           return { ok: false, items: [], error: 'Companion not configured.' };
         }
+        const requestedLimit = request.limit ?? 5;
         const client = createRecallClient(companion);
-        const items = await client.query(request.q, {
-          ...(request.limit === undefined ? {} : { limit: request.limit }),
+        // Over-fetch so the post-filter (drop current thread + dedup
+        // by threadId) still has enough rows to fill `requestedLimit`.
+        // The companion clamps to 50 internally, so cap at 50.
+        const fetchLimit = Math.min(50, Math.max(requestedLimit * 4, 12));
+        const raw = await client.query(request.q, {
+          limit: fetchLimit,
           ...(request.workstreamId === undefined ? {} : { workstreamId: request.workstreamId }),
         });
+        // Resolve the current page's bac_id (if any) so we can drop
+        // results that point back at the same thread. Threads are
+        // matched on canonical URL — querystring noise like
+        // `?source=...` doesn't break the match.
+        let currentBacId: string | undefined;
+        if (request.currentUrl !== undefined && request.currentUrl.length > 0) {
+          const target = canonicalThreadUrl(request.currentUrl);
+          const threads = await readThreads();
+          const match = threads.find(
+            (thread) =>
+              thread.threadUrl === target || canonicalThreadUrl(thread.threadUrl) === target,
+          );
+          currentBacId = match?.bac_id;
+        }
+        // Dedup by threadId, keeping the highest-scoring row per
+        // thread. Without this, a query like "react component" can
+        // surface 5 rows that are all different turns of the same
+        // thread, drowning out other matches.
+        const bestPerThread = new Map<string, (typeof raw)[number]>();
+        for (const item of raw) {
+          if (item.threadId === currentBacId) continue;
+          const existing = bestPerThread.get(item.threadId);
+          if (existing === undefined || item.score > existing.score) {
+            bestPerThread.set(item.threadId, item);
+          }
+        }
+        const items = Array.from(bestPerThread.values())
+          .sort((left, right) => right.score - left.score)
+          .slice(0, requestedLimit);
         return { ok: true, items };
       } catch (error) {
         return {
