@@ -2850,28 +2850,36 @@ const App = () => {
           <span className="glyph" aria-hidden />
           Sidetrack
         </div>
-        <div className="view-tabs" role="tablist" aria-label="View">
+        <div className="view-tabs sp-tabs" role="tablist" aria-label="View">
           <button
             type="button"
             role="tab"
             aria-selected={viewMode === 'workstream'}
+            aria-label="Workstream"
             className={'view-tab' + (viewMode === 'workstream' ? ' on' : '')}
             onClick={() => {
               setViewMode('workstream');
             }}
           >
             Workstream
+            <span className="ct mono" aria-hidden>
+              {state.workstreams.length}
+            </span>
           </button>
           <button
             type="button"
             role="tab"
             aria-selected={viewMode === 'all'}
+            aria-label="All threads"
             className={'view-tab' + (viewMode === 'all' ? ' on' : '')}
             onClick={() => {
               setViewMode('all');
             }}
           >
             All threads
+            <span className="ct mono" aria-hidden>
+              {state.threads.length}
+            </span>
           </button>
         </div>
         <div className="app-actions">
@@ -3003,6 +3011,61 @@ const App = () => {
             </svg>
           </button>
         </div>
+      </div>
+
+      {/* Vault + companion status pills (v2 .sp-status). Glance-able
+          health at the top so the user doesn't have to dive into
+          Settings to see whether the companion is reachable. */}
+      <div className="sp-status">
+        <span
+          className={
+            'sp-status-pill mono ' +
+            (state.companionStatus === 'vault-error' ? 'err' : 'ok')
+          }
+          title={
+            state.companionStatus === 'vault-error'
+              ? 'Vault: companion can\'t reach the configured folder'
+              : 'Vault: synced via companion'
+          }
+        >
+          <span
+            className={
+              'sp-status-dot ' +
+              (state.companionStatus === 'vault-error' ? 'red' : 'green')
+            }
+            aria-hidden
+          />
+          vault {state.companionStatus === 'vault-error' ? 'error' : 'connected'}
+        </span>
+        <span
+          className={
+            'sp-status-pill mono ' +
+            (state.companionStatus === 'connected'
+              ? 'ok'
+              : state.companionStatus === 'local-only'
+                ? 'warn'
+                : 'err')
+          }
+          title={`Companion: ${companionStatusLabel(state.companionStatus)}`}
+        >
+          <span
+            className={
+              'sp-status-dot ' +
+              (state.companionStatus === 'connected'
+                ? 'green'
+                : state.companionStatus === 'local-only'
+                  ? 'amber'
+                  : 'red')
+            }
+            aria-hidden
+          />
+          companion{' '}
+          {state.companionStatus === 'connected'
+            ? 'running'
+            : state.companionStatus === 'local-only'
+              ? 'local-only'
+              : 'down'}
+        </span>
       </div>
 
       {viewMode === 'workstream' ? (

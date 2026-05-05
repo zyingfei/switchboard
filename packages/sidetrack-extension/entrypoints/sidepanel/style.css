@@ -3818,6 +3818,61 @@ textarea.preview-body:focus {
   border-color: var(--signal, #c2410c);
   box-shadow: 0 0 0 2px var(--signal-tint, #fed7aa);
 }
+/* Count chip inside the v2 sp-tabs (e.g. "All threads 12"). */
+.view-tab .ct {
+  margin-left: 5px;
+  color: var(--ink-4, #a39a8c);
+  font-size: 9px;
+}
+.view-tab.on .ct {
+  color: var(--ink-3, #7a7269);
+}
+
+/* Header status pills (vault + companion) — sit just under the
+   .view-tabs row so the user can glance at health without diving
+   into Settings. */
+.sp-status {
+  display: flex;
+  gap: 8px;
+  padding: 4px 12px 6px;
+  border-bottom: 1px solid var(--rule-soft, #e5ddc9);
+}
+.sp-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 99px;
+  border: 1px solid var(--rule-soft, #e5ddc9);
+  background: var(--paper-light, #fbf7ee);
+  color: var(--ink-3, #7a7269);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+}
+.sp-status-pill.warn {
+  border-color: #d6a256;
+  color: #6b4500;
+}
+.sp-status-pill.err {
+  border-color: #b91c1c;
+  color: #b91c1c;
+}
+.sp-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ink-4, #a39a8c);
+  flex: none;
+}
+.sp-status-dot.green {
+  background: #166534;
+}
+.sp-status-dot.amber {
+  background: #a16207;
+}
+.sp-status-dot.red {
+  background: #b91c1c;
+}
 
 /* All-threads view groups */
 .all-bar {
@@ -4138,14 +4193,19 @@ button.thread-queued:focus-visible {
      own line. Self-aligned to the row2 baseline by the parent flex.
      Tight margin so there's no vertical band when the card has no
      other content underneath. */
-  align-self: flex-start;
-  margin: 2px 0 0 14px;
+  align-self: center;
+  margin: 0 0 0 14px;
   padding: 0;
   border: 0;
   background: transparent;
   color: var(--ink-4, #a39a8c);
   font-size: 10.5px;
   cursor: pointer;
+  /* Override the global `button { min-height: 34px }` so the
+     workstream-path button is just its text height — same fix
+     applied to .thread-history-add and .thread-action-icon. */
+  min-height: 0;
+  line-height: 1.4;
   /* Never-underlined, only color-shift on hover — keeps the path
      reading as metadata, not a hyperlink. */
   text-decoration: none;
@@ -6113,13 +6173,10 @@ pre.diff {
 }
 
 /* Thread-row action overflow menu — collapses Queue/Review/Move/Stop/
-   Archive behind a ⋯ button, leaving Open + Send to ▾ visible. The
-   menu is positioned relative to the action row (not the small ⋯
-   button) so it aligns with the thread card's left edge instead of
-   extending leftward off the side panel. */
-.thread-actions {
-  position: relative;
-}
+   Archive behind a ⋯ button, leaving the open + send icons visible.
+   The .thread-actions rule above already sets position: absolute, so
+   it's its own containing block — the menu inside inherits the
+   right-anchor positioning from that. */
 .thread-overflow-anchor {
   display: inline-flex;
 }

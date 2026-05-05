@@ -1,7 +1,11 @@
 import { defineBackground } from 'wxt/utils/define-background';
 
 import { captureGenericTab } from '../src/capture/genericFallback';
-import { detectProviderFromUrl, isProviderThreadUrl } from '../src/capture/providerDetection';
+import {
+  canonicalThreadUrl,
+  detectProviderFromUrl,
+  isProviderThreadUrl,
+} from '../src/capture/providerDetection';
 import {
   DEFAULT_LOCAL_CONFIG,
   runAutoSendDrain as driveAutoSendImpl,
@@ -146,10 +150,18 @@ const tryAutoLinkCapturedThread = async (
   await writeDispatchLink(result.dispatchId, threadId);
 };
 
+// Compare canonical forms so SPA URL drift on the active tab
+// (e.g. Gemini /app/<id>?session=…) doesn't cause an exact-match
+// miss against the canonical form stored on the thread record. The
+// previous strict-equality check caused "Unread reply" reminders to
+// keep firing on every assistant turn even when the user was
+// actively reading the chat.
 const userIsViewingThreadUrl = async (threadUrl: string): Promise<boolean> => {
   try {
     const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-    return tabs[0]?.url === threadUrl;
+    const activeUrl = tabs[0]?.url;
+    if (activeUrl === undefined) return false;
+    return canonicalThreadUrl(activeUrl) === canonicalThreadUrl(threadUrl);
   } catch {
     return false;
   }
@@ -1673,7 +1685,16 @@ const detectCodingAttachForTab = async (tabId: number, url: string): Promise<voi
       args: [url],
     });
     if (result.result !== null && result.result !== undefined) {
-      await upsertOffer({ tabId, url, surface: result.result });
+      // Only emit offers when the URL actually matches the coding-
+      // surface pattern (medium / high confidence). DOM-only matches
+      // (low confidence) are too noisy: a regular ChatGPT chat that
+      // happens to mention "workspace", "diff", or "branch" trips the
+      // codex DOM regex and surfaces a false-positive Codex offer.
+      // The detection function still returns the low-confidence
+      // surface for diagnostics; we just don't act on it here.
+      if (result.result.confidence !== 'low') {
+        await upsertOffer({ tabId, url, surface: result.result });
+      }
     }
   } catch {
     // Restricted tabs or pages without the content script surface are ignored.
