@@ -4686,15 +4686,20 @@ function NeedsOrganizeSuggestionRow({
         const response = await fetch(url, { headers: { 'x-bac-bridge-key': bridgeKey } });
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled mutated by cleanup
         if (cancelled || !response.ok) return;
+        // Server shape: { data: Suggestion[] } — `data` is the
+        // ranked array DIRECTLY, not `{ items: Suggestion[] }`.
+        // The previous parser unwrapped `body.data?.items?.[0]`,
+        // which silently returned undefined and cleared the
+        // suggestion even when the companion replied with a real
+        // top match. Confirmed via scripts/raw-suggest.mjs against
+        // a live companion (score 0.50, lex 0.67, vec 0.60).
         const body = (await response.json()) as {
-          readonly data?: {
-            readonly items?: readonly {
-              readonly workstreamId: string;
-              readonly score: number;
-            }[];
-          };
+          readonly data?: readonly {
+            readonly workstreamId: string;
+            readonly score: number;
+          }[];
         };
-        const top = body.data?.items?.[0];
+        const top = body.data?.[0];
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled mutated by cleanup
         if (cancelled) return;
         if (top === undefined) {
