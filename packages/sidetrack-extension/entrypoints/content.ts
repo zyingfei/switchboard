@@ -97,6 +97,7 @@ const driveAutoSend = async (
   itemId: string | undefined,
   text: string,
   perItemTimeoutMs: number,
+  waitForCompletion = true,
 ): Promise<AutoSendResult> => {
   const provider = detectProviderFromUrl(window.location.href);
   if (provider === 'unknown') {
@@ -158,6 +159,10 @@ const driveAutoSend = async (
     );
   }
 
+  if (!waitForCompletion) {
+    return { ok: true };
+  }
+
   // Wait for the AI to start responding (stop button appears) then
   // for it to finish (stop button disappears). The "started" check
   // has a short window — providers usually show the stop button
@@ -183,6 +188,7 @@ interface AutoSendItemMessage {
   readonly itemId?: string;
   readonly text: string;
   readonly perItemTimeoutMs?: number;
+  readonly waitForCompletion?: boolean;
 }
 
 const isAutoSendItemMessage = (value: unknown): value is AutoSendItemMessage =>
@@ -191,7 +197,9 @@ const isAutoSendItemMessage = (value: unknown): value is AutoSendItemMessage =>
   'type' in value &&
   value.type === messageTypes.autoSendItem &&
   'text' in value &&
-  typeof (value as { text: unknown }).text === 'string';
+  typeof (value as { text: unknown }).text === 'string' &&
+  (!('waitForCompletion' in value) ||
+    typeof (value as { waitForCompletion?: unknown }).waitForCompletion === 'boolean');
 
 interface AnnotateTurnMessage {
   readonly type: typeof messageTypes.annotateTurn;
@@ -312,13 +320,30 @@ export default defineContentScript({
         '',
       );
 
-    // Pick a discriminating probe from the middle of the turn — head
-    // probes collide on common openings ("Sure, here's…", "I'll
-    // help you…"). For very short turns the whole body IS the probe.
-    const buildProbe = (normalized: string): string => {
-      if (normalized.length <= 60) return normalized;
-      const start = Math.max(0, Math.floor(normalized.length / 3));
-      return normalized.slice(start, start + 60);
+    // Pick multiple discriminating probes across the turn. A single
+    // middle probe can land inside a markdown table or list segment
+    // whose rendered DOM text differs from the captured markdown; a
+    // small set across the head/body/tail keeps matching robust while
+    // still avoiding common "Sure, here's..." collisions.
+    const buildProbes = (normalized: string): readonly string[] => {
+      if (normalized.length <= 60) return normalized.length === 0 ? [] : [normalized];
+      const starts = [
+        0,
+        Math.floor(normalized.length / 4),
+        Math.floor(normalized.length / 2),
+        Math.floor((normalized.length * 3) / 4),
+        Math.max(0, normalized.length - 60),
+      ];
+      const seen = new Set<string>();
+      const probes: string[] = [];
+      for (const start of starts) {
+        const probe = normalized.slice(start, start + 60).trim();
+        if (probe.length >= 12 && !seen.has(probe)) {
+          seen.add(probe);
+          probes.push(probe);
+        }
+      }
+      return probes;
     };
 
     const queryTurnCandidates = (selector: string): readonly HTMLElement[] | null => {
@@ -333,27 +358,32 @@ export default defineContentScript({
 
     const findTurnInCandidates = (
       candidates: readonly HTMLElement[],
-      probe: string,
+      probes: readonly string[],
     ): { readonly element: HTMLElement | null; readonly diagnostic: string } => {
       // First pass: exact equality. Wins on short turns ("test123")
       // where many candidates would also pass `includes`.
-      for (const node of candidates) {
-        if (normalizeForMatch(node.textContent) === probe) {
-          return {
-            element: node,
-            diagnostic: `matched on exact text equality across ${String(candidates.length)} candidates`,
-          };
+      if (probes.length === 1) {
+        for (const node of candidates) {
+          if (normalizeForMatch(node.textContent) === probes[0]) {
+            return {
+              element: node,
+              diagnostic: `matched on exact text equality across ${String(candidates.length)} candidates`,
+            };
+          }
         }
       }
       // Second pass: substring. For longer turns the live DOM's
       // textContent often includes extra UI chrome (timestamps,
       // model labels) so exact equality is too strict.
       for (const node of candidates) {
-        if (normalizeForMatch(node.textContent).includes(probe)) {
-          return {
-            element: node,
-            diagnostic: `matched on text-quote substring across ${String(candidates.length)} candidates`,
-          };
+        const candidateText = normalizeForMatch(node.textContent);
+        for (const [index, probe] of probes.entries()) {
+          if (candidateText.includes(probe)) {
+            return {
+              element: node,
+              diagnostic: `matched on text-quote probe ${String(index + 1)} across ${String(candidates.length)} candidates`,
+            };
+          }
         }
       }
       return { element: null, diagnostic: 'no text match' };
@@ -370,8 +400,8 @@ export default defineContentScript({
       turnText: string,
     ): { readonly element: HTMLElement | null; readonly diagnostic: string } => {
       const tried: string[] = [];
-      const probe = buildProbe(normalizeForMatch(stripRolePrefix(turnText)));
-      if (probe.length === 0) {
+      const probes = buildProbes(normalizeForMatch(stripRolePrefix(turnText)));
+      if (probes.length === 0) {
         return {
           element: null,
           diagnostic: `probe empty after strip+normalize; tried=[${tried.join(', ')}]`,
@@ -385,7 +415,7 @@ export default defineContentScript({
           tried.push(
             `sourceSelector=${sourceSelector} candidates=${String(sourceCandidates.length)}`,
           );
-          const sourceMatch = findTurnInCandidates(sourceCandidates, probe);
+          const sourceMatch = findTurnInCandidates(sourceCandidates, probes);
           if (sourceMatch.element !== null) {
             return {
               element: sourceMatch.element,
@@ -397,7 +427,7 @@ export default defineContentScript({
       const turnSelector = turnSelectorForCurrentProvider();
       tried.push(`turnSelector=${turnSelector ?? 'null'}`);
       const candidates = turnSelector === null ? [] : (queryTurnCandidates(turnSelector) ?? []);
-      const turnMatch = findTurnInCandidates(candidates, probe);
+      const turnMatch = findTurnInCandidates(candidates, probes);
       if (turnMatch.element !== null) {
         return {
           element: turnMatch.element,
@@ -406,7 +436,7 @@ export default defineContentScript({
       }
       return {
         element: null,
-        diagnostic: `no match across ${String(candidates.length)} candidates (probe="${probe.slice(0, 40)}…", tried=[${tried.join(', ')}])`,
+        diagnostic: `no match across ${String(candidates.length)} candidates (probe="${probes[0]?.slice(0, 40) ?? ''}…", tried=[${tried.join(', ')}])`,
       };
     };
 
@@ -863,7 +893,12 @@ export default defineContentScript({
         }
         if (isAutoSendItemMessage(message)) {
           const perItemTimeoutMs = message.perItemTimeoutMs ?? 90_000;
-          driveAutoSend(message.itemId, message.text, perItemTimeoutMs)
+          driveAutoSend(
+            message.itemId,
+            message.text,
+            perItemTimeoutMs,
+            message.waitForCompletion ?? true,
+          )
             .then((result) => {
               sendResponse(result);
             })
