@@ -321,7 +321,11 @@ export function SettingsPanel({
     revision: '0',
   };
   const [draftAutoSend, setDraftAutoSend] = useState(initial.autoSendOptIn);
-  const [draftScreenShareSafe, setDraftScreenShareSafe] = useState(initial.screenShareSafeMode);
+  // The Settings UI for screenShareSafeMode was removed (the top-bar
+  // toggle is the canonical control), but we keep the draft state
+  // pinned to the existing companion value so save() doesn't flip
+  // it. Read-only here; mutation lives in the top bar.
+  const [draftScreenShareSafe] = useState(initial.screenShareSafeMode);
   const [draftPacketKind, setDraftPacketKind] = useState<SettingsPacketKind>(
     initial.defaultPacketKind,
   );
@@ -587,32 +591,6 @@ export function SettingsPanel({
         </label>
       </div>
 
-      <div className="settings-section">
-        <h3 className="settings-section-title">Screen-share-safe mode (also pauses auto-send)</h3>
-        <p className="settings-section-lede ai-italic">
-          Mirror of the top-bar screenshare toggle. Either source turning ON masks
-          private workstream previews AND pauses the auto-send drain. Setting this here
-          persists to the companion (so it survives extension reload even when no
-          top-bar toggle has been clicked); the top-bar toggle is the quick on/off.
-        </p>
-        <label className={'switch ' + (draftScreenShareSafe ? 'on' : '')}>
-          <input
-            type="checkbox"
-            checked={draftScreenShareSafe}
-            disabled={busy}
-            onChange={() => {
-              setDraftScreenShareSafe(!draftScreenShareSafe);
-            }}
-          />
-          <span className="knob" />
-          <span className="lbl">
-            Mask previews + pause auto-send
-            <span className="desc mono">
-              {draftScreenShareSafe ? 'on — masking active' : 'off'}
-            </span>
-          </span>
-        </label>
-      </div>
 
       <div className="settings-section">
         <h3 className="settings-section-title">Workstream privacy</h3>

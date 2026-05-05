@@ -13,6 +13,9 @@ const thread = (overrides: Partial<TrackedThread> = {}): TrackedThread => ({
   lastSeenAt: '2026-04-29T11:59:00.000Z',
   status: 'active',
   trackingMode: 'auto',
+  // Default to a workstream so the new "needs-organize when no
+  // workstream" rule doesn't short-circuit every other lifecycle test.
+  primaryWorkstreamId: 'ws_test',
   tags: [],
   ...overrides,
 });

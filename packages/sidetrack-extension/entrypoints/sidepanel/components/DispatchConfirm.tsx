@@ -152,10 +152,10 @@ export function DispatchConfirm({
               : 'no suspicious patterns',
           },
         ];
-        // Auto-open when any check is non-ok so the user sees the issue
-        // without an extra click.
-        const hasIssue = checks.some((c) => c.status !== 'ok');
-        return <SafetyChainSummary checks={checks} defaultOpen={hasIssue} />;
+        // Always open by default so the user can see the safety chain
+        // — earlier "collapsed when no issues" was too easy to miss
+        // and made users doubt the feature was implemented.
+        return <SafetyChainSummary checks={checks} defaultOpen />;
       })()}
 
       <details className="preview-details" open>

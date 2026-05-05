@@ -269,7 +269,18 @@ const sendToCompanion = async (
 ): Promise<{ readonly bac_id: string; readonly revision: string }> => {
   const settings = await readSettings();
   const allThreads = await readThreads();
-  const existingThread = allThreads.find((thread) => thread.threadUrl === event.threadUrl);
+  // Find existing thread by canonical URL — companion's
+  // writeCaptureEvent always issues a fresh event-id and the old
+  // exact-string match against event.threadUrl missed Gemini's SPA
+  // drift (`/app/<id>` vs `/app/<id>?session=…`). Without this,
+  // every capture spawned a new thread record with a new bac_id,
+  // and reminders kept piling up against orphan threadIds.
+  const canonicalUrl = canonicalThreadUrl(event.threadUrl);
+  const existingThread = allThreads.find(
+    (thread) =>
+      thread.threadUrl === canonicalUrl ||
+      canonicalThreadUrl(thread.threadUrl) === canonicalUrl,
+  );
   const parentLink = resolveParentFromForkSource(event, allThreads);
   const client = createCompanionClient(settings.companion);
   const eventResult = await client.appendEvent(
@@ -279,8 +290,13 @@ const sendToCompanion = async (
   const trackingMode: ThreadUpsert['trackingMode'] =
     event.provider === 'unknown' || !settings.autoTrack ? 'manual' : 'auto';
   const lastTurnRole = event.turns.at(-1)?.role;
+  // Reuse the existing thread's bac_id — the event-result bac_id
+  // is the per-event record id, NOT a thread id. Sending it as
+  // thread.bac_id was forcing the companion's upsertThread to
+  // create a brand-new thread record on every capture.
+  const threadBacId = existingThread?.bac_id ?? eventResult.bac_id;
   const thread: ThreadUpsert = {
-    bac_id: eventResult.bac_id,
+    bac_id: threadBacId,
     provider: event.provider,
     threadId: event.threadId,
     threadUrl: event.threadUrl,

@@ -2936,6 +2936,27 @@ const App = () => {
           </button>
           <button
             className="icon-btn"
+            title="Capture / track the current tab — adds it to your side panel as a tracked thread"
+            onClick={() => {
+              void runAction(() => sendRequest({ type: messageTypes.captureCurrentTab }));
+            }}
+            type="button"
+            aria-label="Capture current tab"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M12 5v14" />
+              <path d="M5 12h14" />
+            </svg>
+          </button>
+          <button
+            className="icon-btn"
             title={
               state.companionStatus === 'connected'
                 ? 'Attach coding session'

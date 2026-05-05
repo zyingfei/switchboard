@@ -53,7 +53,13 @@ export const deriveLifecycle = (
       lifecyclePill: { label: 'Unread reply', tone: 'signal' },
     };
   }
-  if (thread.status === 'needs_organize') {
+  // "Needs organize" fires when the thread has no workstream
+  // assignment OR has the explicit needs_organize status. The
+  // status-only check missed all the auto-captured threads that
+  // landed without a workstream — the user reported 16/18 threads
+  // had primaryWorkstreamId === undefined yet zero showed the
+  // suggestion row.
+  if (thread.status === 'needs_organize' || thread.primaryWorkstreamId === undefined) {
     return {
       kind: 'needs-organize',
       dotClass: 'amber',
