@@ -255,30 +255,55 @@ export default defineContentScript({
     // optimistically when the user saves a new comment so the
     // margin marker shows up without requiring a page reload.
     const liveAnchors: RestoredAnchor[] = [];
+    // Range objects for currently-mounted highlights, keyed by anchor
+    // id. Kept alive across renders so scroll/resize handlers can
+    // re-measure getClientRects() and reposition highlight overlays
+    // without having to re-fetch from the companion.
+    const liveRanges = new Map<string, Range>();
+
+    // Re-entry guard for restoreAnnotations: the function is fired by
+    // page-load timer, captureVisibleThread requests, and mutation
+    // observers. Without a guard, two concurrent calls both splice
+    // and push, racing for last-writer-wins; the guard sequences them
+    // so only the most recent caller's results land in liveAnchors.
+    let restoreSeq = 0;
 
     const restoreAnnotations = async (): Promise<void> => {
+      const mySeq = ++restoreSeq;
       try {
         const client = await createAnnotationClient();
         if (client === undefined) {
           return;
         }
         const annotations = await client.listAnnotationsForUrl(window.location.href);
-        liveAnchors.splice(0, liveAnchors.length);
+        if (mySeq !== restoreSeq) {
+          // A newer call superseded this one; abandon results.
+          return;
+        }
+        const nextAnchors: RestoredAnchor[] = [];
+        const nextRanges = new Map<string, Range>();
         for (const annotation of annotations) {
           const range = findAnchor(document.documentElement, annotation.anchor);
           if (range !== null) {
-            liveAnchors.push({
+            nextAnchors.push({
               id: annotation.bac_id,
               rect: range.getBoundingClientRect(),
               rects: Array.from(range.getClientRects()),
               note: annotation.note,
               quote: range.toString().slice(0, 280),
             });
+            nextRanges.set(annotation.bac_id, range);
           }
         }
-        if (liveAnchors.length > 0) {
-          mountAnnotationOverlay(liveAnchors);
+        if (mySeq !== restoreSeq) {
+          return;
         }
+        liveAnchors.splice(0, liveAnchors.length, ...nextAnchors);
+        liveRanges.clear();
+        for (const [id, range] of nextRanges) {
+          liveRanges.set(id, range);
+        }
+        mountAnnotationOverlay(liveAnchors);
       } catch {
         // Restore is best-effort and must never disturb the host page.
       }
@@ -298,8 +323,55 @@ export default defineContentScript({
         ...(note === undefined ? {} : { note }),
         ...(quote === undefined ? {} : { quote }),
       });
+      liveRanges.set(id, range);
       mountAnnotationOverlay(liveAnchors);
     };
+
+    // Re-measure each live range against the current viewport and
+    // re-mount highlights. Cheap (getClientRects() is browser-native)
+    // and runs on scroll + resize so highlights stick to the underlying
+    // text instead of drifting because the overlay root is fixed-positioned.
+    // Detached ranges (text removed by SPA virtualization) drop their
+    // highlight rects but keep the margin pill at its prior position
+    // until restoreAnnotations re-anchors them.
+    let repositionScheduled = false;
+    const repositionLiveAnnotations = (): void => {
+      if (liveAnchors.length === 0) return;
+      if (repositionScheduled) return;
+      repositionScheduled = true;
+      requestAnimationFrame(() => {
+        repositionScheduled = false;
+        const refreshed: RestoredAnchor[] = [];
+        for (const anchor of liveAnchors) {
+          const range = liveRanges.get(anchor.id);
+          if (range === undefined) {
+            refreshed.push(anchor);
+            continue;
+          }
+          try {
+            const clientRects = Array.from(range.getClientRects());
+            if (clientRects.length === 0) {
+              refreshed.push(anchor);
+              continue;
+            }
+            refreshed.push({
+              ...anchor,
+              rect: range.getBoundingClientRect(),
+              rects: clientRects,
+            });
+          } catch {
+            refreshed.push(anchor);
+          }
+        }
+        liveAnchors.splice(0, liveAnchors.length, ...refreshed);
+        mountAnnotationOverlay(liveAnchors);
+      });
+    };
+    window.addEventListener('scroll', repositionLiveAnnotations, {
+      passive: true,
+      capture: true,
+    });
+    window.addEventListener('resize', repositionLiveAnnotations, { passive: true });
 
     // Normalize text for cross-source comparison. Captured turn.text
     // is markdown (** _ ` # etc.) but the live page's textContent has
@@ -461,7 +533,7 @@ export default defineContentScript({
       if (needle.length === 0) {
         return null;
       }
-      const fullText = root.textContent ?? '';
+      const fullText = root.textContent;
       let start = fullText.indexOf(needle);
       if (start < 0) {
         start = fullText.toLocaleLowerCase().indexOf(needle.toLocaleLowerCase());
@@ -997,6 +1069,53 @@ export default defineContentScript({
       subtree: true,
       characterData: true,
     });
+
+    // Annotation re-anchor observer. Provider chat shells virtualize
+    // long threads (turns above the viewport leave the DOM until the
+    // user scrolls back). When new turn elements get inserted, any
+    // annotations whose anchor lived in those turns need to be
+    // re-located. We watch the same body subtree the auto-capture
+    // observer does but with a tighter debounce (200ms) so highlights
+    // pop back quickly. The scheduleAutoCapture path uses 2.5s
+    // which is too slow for visual restore UX.
+    let annotationRestoreTimer: number | undefined;
+    const looksLikeTurnElement = (node: Node): boolean => {
+      if (!(node instanceof HTMLElement)) return false;
+      // Match what every provider's directSources select on, plus
+      // the generic data-capture-turn used by the e2e fixture. Cheap
+      // attribute checks; we don't run the full provider selector
+      // here because the observer fires on every DOM change and
+      // querySelectorAll on subtree would be too expensive.
+      if (node.hasAttribute('data-message-author-role')) return true;
+      if (node.hasAttribute('data-capture-turn')) return true;
+      if (node.querySelector('[data-message-author-role], [data-capture-turn]') !== null) {
+        return true;
+      }
+      return false;
+    };
+    const scheduleAnnotationRestore = (): void => {
+      if (liveAnchors.length === 0 && liveRanges.size === 0) {
+        // Cheap exit if there are no annotations to track on this
+        // page yet — the page-load timer will pick them up later.
+        return;
+      }
+      if (annotationRestoreTimer !== undefined) {
+        window.clearTimeout(annotationRestoreTimer);
+      }
+      annotationRestoreTimer = window.setTimeout(() => {
+        void restoreAnnotations();
+      }, 200);
+    };
+    new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        for (const node of mutation.addedNodes) {
+          if (looksLikeTurnElement(node)) {
+            scheduleAnnotationRestore();
+            return;
+          }
+        }
+      }
+    }).observe(document.body, { childList: true, subtree: true });
     // Note: an earlier iteration injected a Shadow-DOM floating
     // "↗ Sidetrack" button into the host page. The user preferred
     // a side-panel-side find icon instead — see

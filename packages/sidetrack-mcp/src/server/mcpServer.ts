@@ -153,7 +153,11 @@ export interface SidetrackMcpReader {
 
 const toolText = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`;
 const TERM_CONTEXT_CHARS = 32;
-const UNMATCHED_TERM_FALLBACK_SELECTOR = '[data-sidetrack-mcp-term-anchor-fallback="missing"]';
+// Minimum term length below which prefix or suffix is required, to
+// avoid highlighting the wrong occurrence on a page where the term
+// repeats. Picked to clear common short tokens (~5 chars) like
+// "node", "code", "AI" while still allowing real terms like "WebGPU".
+const TERM_MIN_LEN_WITHOUT_CONTEXT = 6;
 
 const asStructuredContent = (value: Record<string, unknown>) => ({
   content: [{ type: 'text' as const, text: toolText(value) }],
@@ -184,11 +188,14 @@ const buildTermAnchor = (input: {
     prefix: termContextPrefix(input.prefix),
     suffix: termContextSuffix(input.suffix),
   },
-  // MCP-created annotations are intentionally quote-bound. If the
-  // term/context cannot be found after page changes, do not fall back
-  // to highlighting the start of the document or an entire selector.
-  textPosition: { start: Number.MAX_SAFE_INTEGER, end: Number.MAX_SAFE_INTEGER },
-  cssSelector: UNMATCHED_TERM_FALLBACK_SELECTOR,
+  // MCP-created annotations are intentionally quote-bound. Out-of-band
+  // poison values (MAX_SAFE_INTEGER, magic selectors) misrepresent
+  // intent and risk matching unrelated DOM. Empty cssSelector + an
+  // out-of-range textPosition mean "term-quote only"; the extension's
+  // findAnchor() short-circuits both fallbacks when they are empty
+  // or unsatisfiable.
+  textPosition: { start: -1, end: -1 },
+  cssSelector: '',
 });
 
 const buildContextPack = (
@@ -729,6 +736,20 @@ export const createSidetrackMcpServer = (
       if (companionClient?.createAnnotation === undefined) {
         throw new Error(
           'sidetrack-mcp was started without --companion-url / --bridge-key; bac.create_annotation is unavailable.',
+        );
+      }
+      // Short terms collide on common pages — "node" or "AI" hits a
+      // dozen unrelated occurrences. Refuse without context so the
+      // agent has to provide prefix/suffix that pins to the right
+      // sentence. Anything ≥ TERM_MIN_LEN_WITHOUT_CONTEXT is allowed
+      // unconditionally; the agent is trusted to be specific.
+      const trimmedTerm = term.trim();
+      const hasContext =
+        (prefix !== undefined && prefix.trim().length > 0) ||
+        (suffix !== undefined && suffix.trim().length > 0);
+      if (trimmedTerm.length < TERM_MIN_LEN_WITHOUT_CONTEXT && !hasContext) {
+        throw new Error(
+          `bac.create_annotation: term "${trimmedTerm}" is shorter than ${String(TERM_MIN_LEN_WITHOUT_CONTEXT)} chars; provide prefix or suffix from the surrounding sentence so the highlight pins to the intended occurrence.`,
         );
       }
       const annotation = await companionClient.createAnnotation({

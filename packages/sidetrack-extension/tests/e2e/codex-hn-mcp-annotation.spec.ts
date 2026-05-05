@@ -190,20 +190,6 @@ const routeChatGptFixture = async (context: BrowserContext): Promise<void> => {
   });
 };
 
-const openChatGptFixturePage = async (context: BrowserContext, url: string): Promise<Page> => {
-  const page = await context.newPage();
-  await page.route('https://chatgpt.com/**', async (route: Route) => {
-    const routeUrl = new URL(route.request().url());
-    await route.fulfill({
-      status: 200,
-      contentType: 'text/html; charset=utf-8',
-      body: chatGptFixtureHtml(routeUrl.pathname === finalPath),
-    });
-  });
-  await page.goto(url, { waitUntil: 'domcontentloaded' });
-  return page;
-};
-
 const extractPrompt = async (page: Page): Promise<string> =>
   (await page.locator('.coding-handoff-prompt').textContent()) ?? '';
 
@@ -452,8 +438,14 @@ test.describe('Codex MCP Hacker News annotation flow (synthetic browser)', () =>
         text: 'Follow up on the annotated HN analysis thread and check whether the WebGPU/WASM tradeoffs need a deeper security note.',
       });
 
-      const annotatedPage = await openChatGptFixturePage(runtime.context, finalUrl);
-      const activatedUrl = await sidepanel.evaluate(async (url) => {
+      // Real user flow: the chat tab the dispatch auto-opened (chatPage)
+      // is still rendering the user/assistant articles. Activate it,
+      // ask the side panel to re-capture (the same call that fires
+      // when the user clicks the side-panel capture icon), and the
+      // content script's restore path will pick up the four MCP
+      // annotations and mount visible highlights — without ever
+      // opening a second tab.
+      const dispatchedTabUrl = await sidepanel.evaluate(async (url) => {
         const tabs = await chrome.tabs.query({});
         const target = tabs.find((tab) => tab.url === url);
         if (typeof target?.id === 'number') {
@@ -461,39 +453,98 @@ test.describe('Codex MCP Hacker News annotation flow (synthetic browser)', () =>
         }
         return target?.url ?? '';
       }, finalUrl);
-      expect(activatedUrl).toBe(finalUrl);
+      expect(dispatchedTabUrl).toBe(finalUrl);
+      expect(chatPage.url()).toBe(finalUrl);
       const captureResponse = await runtime.sendRuntimeMessage(sidepanel, {
         type: messageTypes.captureCurrentTab,
       });
       expect(captureResponse).toMatchObject({ ok: true });
-      await expect
-        .poll(
-          async () =>
-            await annotatedPage.evaluate(() =>
-              document.documentElement.getAttribute('data-sidetrack-provider-canary'),
-            ),
-          { timeout: 10_000 },
-        )
-        .toBe('ok');
-      await expect(annotatedPage.locator('.sidetrack-ann-highlight')).toHaveCount(
+      // Note: we deliberately don't gate on data-sidetrack-provider-canary
+      // here. That attribute is set once at content-script boot (~1.2s
+      // after page load) and reflects whatever capture state existed
+      // then. On the dispatched tab, the script booted before the
+      // assistant article was rendered, so the canary stays 'failed'
+      // forever. The earlier turn-readback poll already proved capture
+      // works on this tab; the highlight-count assertion below is the
+      // real proof that restore fired and rendered.
+      // Restore is triggered inside the captureVisibleThread handler;
+      // the response above resolves once the content script has both
+      // re-captured turns AND requested the latest annotations from
+      // the companion. The four highlights mount on the same chat tab
+      // the agent dispatched into.
+      await expect(chatPage.locator('.sidetrack-ann-highlight')).toHaveCount(
         termAnnotations.length,
         { timeout: 10_000 },
       );
-      const highlightTitles = await annotatedPage
+      const highlightTitles = await chatPage
         .locator('.sidetrack-ann-highlight')
         .evaluateAll((nodes) => nodes.map((node) => (node as HTMLElement).title));
       expect([...highlightTitles].sort()).toEqual(
         [...termAnnotations.map((annotation) => annotation.term)].sort(),
       );
-      await expect(annotatedPage.locator('.sidetrack-ann-margin')).toHaveCount(
+      await expect(chatPage.locator('.sidetrack-ann-margin')).toHaveCount(
         termAnnotations.length,
       );
-      await expect(annotatedPage.locator('.sidetrack-ann-hint')).toContainText(
+      await expect(chatPage.locator('.sidetrack-ann-hint')).toContainText(
         `${String(termAnnotations.length)} annotations restored`,
       );
 
+      // Scroll the live page and confirm the highlight stays glued to
+      // its underlying text — guards against the "fixed-positioned
+      // overlay drifts when the page scrolls" regression we just fixed
+      // in contentOverlays. Note: the reposition handler re-mounts
+      // highlight DOM nodes on each scroll, so we re-query for the
+      // current node after scroll instead of caching a reference that
+      // would become detached.
+      const drift = await chatPage.evaluate(async () => {
+        const annId = document
+          .querySelector('.sidetrack-ann-highlight')
+          ?.getAttribute('data-ann-id');
+        if (annId === null || annId === undefined) return { failed: true } as const;
+        const sampleSelector = `.sidetrack-ann-highlight[data-ann-id="${annId}"]`;
+        const before = document.querySelector(sampleSelector)?.getBoundingClientRect();
+        const article = document.querySelector('article[data-message-author-role="assistant"]');
+        const beforeText = article?.getBoundingClientRect();
+        if (before === undefined || beforeText === undefined) return { failed: true } as const;
+        window.scrollBy({ top: 200, behavior: 'instant' as ScrollBehavior });
+        await new Promise((resolve) => {
+          requestAnimationFrame(() => {
+            resolve(undefined);
+          });
+        });
+        await new Promise((resolve) => {
+          requestAnimationFrame(() => {
+            resolve(undefined);
+          });
+        });
+        const afterEl = document.querySelector(sampleSelector);
+        const after = afterEl?.getBoundingClientRect();
+        const afterText = article?.getBoundingClientRect();
+        if (after === undefined || afterText === undefined) return { failed: true } as const;
+        return {
+          failed: false,
+          highlightDelta: after.top - before.top,
+          textDelta: afterText.top - beforeText.top,
+        } as const;
+      });
+      expect(drift.failed).toBe(false);
+      if (!drift.failed) {
+        // Highlight should track the underlying article rect within a
+        // few pixels — both move together when the viewport scrolls.
+        // Without the scroll-tracking fix, highlightDelta stayed at 0
+        // while textDelta hit roughly -200.
+        expect(Math.abs(drift.highlightDelta - drift.textDelta)).toBeLessThanOrEqual(2);
+      }
+
+      // Scroll back so the screenshot captures the canonical first-fold
+      // view, then attach the artifact. The HTML report shows this image
+      // as the proof of "annotated chat page left visible to the user".
+      await chatPage.evaluate(() => {
+        window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
+      });
+      await chatPage.waitForTimeout(50);
       const screenshotPath = test.info().outputPath('codex-hn-mcp-annotation.png');
-      await annotatedPage.screenshot({ path: screenshotPath, fullPage: true });
+      await chatPage.screenshot({ path: screenshotPath, fullPage: true });
       await test.info().attach('codex HN MCP annotation', {
         path: screenshotPath,
         contentType: 'image/png',

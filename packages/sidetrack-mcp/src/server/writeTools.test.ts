@@ -372,11 +372,8 @@ describe('bac.create_annotation', () => {
             prefix: 'er graphics and compute through ',
             suffix: ' gives web apps lower-level GPU ',
           },
-          textPosition: {
-            start: Number.MAX_SAFE_INTEGER,
-            end: Number.MAX_SAFE_INTEGER,
-          },
-          cssSelector: '[data-sidetrack-mcp-term-anchor-fallback="missing"]',
+          textPosition: { start: -1, end: -1 },
+          cssSelector: '',
         },
         note: 'WebGPU: browser GPU compute/rendering API for modern app architectures.',
       });
@@ -386,6 +383,48 @@ describe('bac.create_annotation', () => {
       };
       expect(structured.annotation?.bac_id).toBe('bac_annotation_fake');
       expect(structured.term).toBe('WebGPU');
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('rejects short terms when neither prefix nor suffix is provided', async () => {
+    const writeClient = buildFakeWriteClient();
+    const client = await startInProcessServer(writeClient);
+    try {
+      const result = await client.callTool({
+        name: 'bac.create_annotation',
+        arguments: {
+          url: 'https://chatgpt.com/c/thread',
+          pageTitle: 'ChatGPT',
+          term: 'AI',
+          note: 'Too generic without context.',
+        },
+      });
+      expect(result.isError).toBe(true);
+      expect(errorText(result)).toMatch(/shorter than \d+ chars; provide prefix or suffix/);
+      expect(writeClient.createAnnotation).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('accepts short terms when prefix or suffix is provided', async () => {
+    const writeClient = buildFakeWriteClient();
+    const client = await startInProcessServer(writeClient);
+    try {
+      const result = await client.callTool({
+        name: 'bac.create_annotation',
+        arguments: {
+          url: 'https://chatgpt.com/c/thread',
+          pageTitle: 'ChatGPT',
+          term: 'AI',
+          suffix: ' models trained on architecture docs',
+          note: 'AI here means LLM, not the broader field.',
+        },
+      });
+      expect(result.isError).not.toBe(true);
+      expect(writeClient.createAnnotation).toHaveBeenCalledTimes(1);
     } finally {
       await client.close();
     }

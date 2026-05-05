@@ -26,6 +26,13 @@ annotation record returned by `POST /v1/annotations`.
 The tool builds the same `TextQuote` anchor that the extension restores in the
 content script. Prefix and suffix are capped to the extension's 32-character
 context window so MCP-created highlights match browser-created highlights.
-Position and selector fallbacks are intentionally disabled for this tool: if
-the term/context cannot be found, the extension should leave the page unmarked
-instead of highlighting the wrong section.
+Position and selector fallbacks are intentionally disabled for this tool: the
+anchor's `cssSelector` is empty and `textPosition` is out of range, so if the
+term/context cannot be found the extension leaves the page unmarked instead of
+highlighting the wrong section.
+
+Terms shorter than 6 characters (`AI`, `node`, `code`, …) require either
+`prefix` or `suffix` so the highlight pins to the intended sentence — the tool
+returns an error otherwise. Longer terms (`WebGPU`, `eBPF`, `CRDT`) are
+allowed without context, but the agent is still encouraged to supply context
+when the term may repeat on the page.

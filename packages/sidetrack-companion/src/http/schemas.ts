@@ -45,9 +45,13 @@ export const serializedAnchorSchema = z.object({
     prefix: z.string(),
     suffix: z.string(),
   }),
+  // Negative values mean "no position fallback" — the extension's
+  // findAnchor() short-circuits the position branch when start/end
+  // are < 0. Used by MCP-created term-scoped anchors that should
+  // refuse to fall back to a position match if the term moved.
   textPosition: z.object({
-    start: z.number().int().nonnegative(),
-    end: z.number().int().nonnegative(),
+    start: z.number().int(),
+    end: z.number().int(),
   }),
   cssSelector: z.string(),
 });

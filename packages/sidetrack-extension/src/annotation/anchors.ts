@@ -131,20 +131,24 @@ export const findAnchor = (root: HTMLElement, anchor: SerializedAnchor): Range |
       }
     }
 
-    const positionRange = rangeAtTextOffsets(
-      root,
-      anchor.textPosition.start,
-      anchor.textPosition.end,
-    );
-    if (positionRange !== null) {
-      return positionRange;
+    if (anchor.textPosition.start >= 0 && anchor.textPosition.end >= 0) {
+      const positionRange = rangeAtTextOffsets(
+        root,
+        anchor.textPosition.start,
+        anchor.textPosition.end,
+      );
+      if (positionRange !== null) {
+        return positionRange;
+      }
     }
 
-    const element = root.querySelector(anchor.cssSelector);
-    if (element !== null) {
-      const fallback = rangeAtTextOffsets(element, 0, element.textContent.length);
-      if (fallback !== null) {
-        return fallback;
+    if (anchor.cssSelector.length > 0) {
+      const element = root.querySelector(anchor.cssSelector);
+      if (element !== null) {
+        const fallback = rangeAtTextOffsets(element, 0, element.textContent.length);
+        if (fallback !== null) {
+          return fallback;
+        }
       }
     }
     return null;
