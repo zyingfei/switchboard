@@ -495,7 +495,9 @@ button:disabled {
   flex-wrap: wrap;
   gap: 4px;
   justify-content: flex-end;
-  max-width: 150px;
+  /* Span the full card width so the action strip hugs the right
+     edge instead of floating in a fixed 150px box at the left. */
+  width: 100%;
 }
 
 .status-chip,
@@ -3254,7 +3256,10 @@ textarea.preview-body:focus {
      short) and left a blank vertical band under "Ungrouped" while
      the user moved the cursor. */
   gap: 10px;
-  padding-top: 4px;
+  /* Tightened from 4px → 1px so the strip sits closer to the
+     lifecycle line instead of leaving a visible vertical band on
+     cards with no workstream/lineage row in between. */
+  padding-top: 1px;
   flex-wrap: wrap;
 }
 /* When the ⋯ overflow menu is open, switch .thread-actions to
@@ -3445,14 +3450,15 @@ textarea.preview-body:focus {
   flex-direction: column;
   gap: 2px;
 }
-/* Show the dashed separator only when the strip actually has content
-   (the inline note list, the compose form, or the disclosure
-   button). React always renders the .thread-history wrapper; we use
-   :has to scope the border to non-empty states so empty threads
-   don't carry an orphan dashed line. */
+/* Show the dashed separator only when the strip has REAL content —
+   notes or an open compose form. The earlier `.thread:hover` arm
+   made the line appear on every hover, even for cards whose strip
+   only holds a "+ note" affordance, putting a heavy stroke between
+   the action row and a single small button. With the action strip
+   now always visible (no hover toggle) the strip's hover state no
+   longer needs the dashed reveal — drop it. */
 .thread-history:has(.thread-history-item),
-.thread-history:has(.thread-history-compose),
-.thread:hover .thread-history {
+.thread-history:has(.thread-history-compose) {
   border-top-color: var(--rule, rgba(27, 25, 22, 0.12));
 }
 .thread-history-empty {
