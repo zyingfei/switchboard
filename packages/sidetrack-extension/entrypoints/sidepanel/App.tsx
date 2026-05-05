@@ -20,6 +20,7 @@ import {
   type RuntimeResponse,
   type WorkboardRequest,
 } from '../../src/messages';
+import { canonicalThreadUrl } from '../../src/capture/providerDetection';
 import {
   CodingAttach,
   AutoSendQueueRow,
@@ -692,28 +693,28 @@ const App = () => {
         }, 150);
       }
       if (isFocusThreadInSidePanelMessage(message)) {
-        // Chat-side floating button → find the matching thread by URL,
-        // scroll its row into view, briefly highlight via the
-        // .focusing CSS class. We read state via a stale closure here,
-        // which is fine — the side panel's last refresh is what the
-        // user is looking at.
-        const targetUrl = message.threadUrl;
-        // Defer to next tick so the message handler doesn't block.
+        // Chat-side floating button OR Déjà-vu Jump → find the
+        // matching thread by canonical URL, scroll its row into
+        // view, briefly highlight it via the .focusing CSS class.
+        // Reads from stateRef (synced via the effect below) instead
+        // of using setState as a state-reader — React 18 will silently
+        // skip the inner setFocusingThreadId update inside an updater
+        // function that returns the same reference.
+        const targetCanonical = canonicalThreadUrl(message.threadUrl);
         window.setTimeout(() => {
-          // Search the live state via a state setter callback to
-          // avoid a stale closure on `state`.
-          setState((current) => {
-            const match = current.threads.find((t) => t.threadUrl === targetUrl);
-            if (match !== undefined) {
-              const node = threadRowRefs.current.get(match.bac_id);
-              node?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-              setFocusingThreadId(match.bac_id);
-              window.setTimeout(() => {
-                setFocusingThreadId((prev) => (prev === match.bac_id ? null : prev));
-              }, 1500);
-            }
-            return current;
-          });
+          const threads = stateRef.current.threads;
+          const match = threads.find(
+            (thread) =>
+              thread.threadUrl === message.threadUrl ||
+              canonicalThreadUrl(thread.threadUrl) === targetCanonical,
+          );
+          if (match === undefined) return;
+          const node = threadRowRefs.current.get(match.bac_id);
+          node?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          setFocusingThreadId(match.bac_id);
+          window.setTimeout(() => {
+            setFocusingThreadId((prev) => (prev === match.bac_id ? null : prev));
+          }, 1500);
         }, 0);
       }
     };
@@ -844,6 +845,15 @@ const App = () => {
   // row. Map mutated via the ref callback below.
   const threadRowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const [focusingThreadId, setFocusingThreadId] = useState<string | null>(null);
+  // Mirror of `state` for the message listener registered with empty
+  // deps. Without this, the listener can only see state via a
+  // setState((current) => ...) callback — and React 18 will skip
+  // re-renders if the callback returns the same reference, suppressing
+  // any nested state setters fired inside.
+  const stateRef = useRef(state);
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
   const activeTabTrackedThread = useMemo(
     () =>
       state.activeTabUrl === undefined
