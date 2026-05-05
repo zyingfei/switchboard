@@ -288,15 +288,11 @@ const OVERLAY_CSS = `
   box-shadow: 0 8px 24px -8px rgba(0,0,0,0.25);
 }
 .sidetrack-rv-chip:hover { background: var(--signal); border-color: var(--signal); }
-.sidetrack-rv-chip-dv {
-  background: var(--paper-light);
-  color: var(--ink);
-}
-.sidetrack-rv-chip-dv:hover {
-  background: var(--paper);
-  border-color: var(--ink);
-  color: var(--signal);
-}
+/* Both chips share the same dark-on-paper palette so they read as a
+   single chip cluster. The Déjà-vu chip used to invert (paper bg,
+   ink text), which broke the visual pairing — they looked like two
+   different controls instead of two siblings of one selection
+   action. Glyphs differentiate intent. */
 .sidetrack-rv-chip .glyph {
   font-family: var(--display); font-size: 12px; line-height: 1; font-weight: 500;
 }
@@ -523,7 +519,7 @@ export const mountReviewSelectionChip = (
   if (opts.onDejaVu !== undefined) {
     dejaBtn = document.createElement('button');
     dejaBtn.type = 'button';
-    dejaBtn.className = 'sidetrack-rv-chip sidetrack-rv-chip-dv';
+    dejaBtn.className = 'sidetrack-rv-chip';
     dejaBtn.style.left = `${String(leftAnchor + COMMENT_W + GAP)}px`;
     dejaBtn.style.top = `${String(chipTop)}px`;
     dejaBtn.innerHTML = '<span class="glyph">⟲</span><span>Déjà-vu</span>';
