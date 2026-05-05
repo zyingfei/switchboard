@@ -10,6 +10,10 @@ import {
   createVaultWriter,
   type VaultWriter,
 } from '../../../../sidetrack-companion/src/vault/writer.js';
+import {
+  dispatchEventSchema,
+  type DispatchEventRecord,
+} from '../../../../sidetrack-companion/src/http/schemas.js';
 
 export interface MockVaultCompanion {
   readonly bridgeKey: string;
@@ -80,8 +84,14 @@ export const createMockVaultCompanion = async (port = 17373): Promise<MockVaultC
         return;
       }
 
-      if (route.request().method() === 'POST' && url.pathname === '/v1/coding-sessions/attach-tokens') {
-        const result = await writer.createCodingAttachToken(readJsonBody(route) as never, requestId);
+      if (
+        route.request().method() === 'POST' &&
+        url.pathname === '/v1/coding-sessions/attach-tokens'
+      ) {
+        const result = await writer.createCodingAttachToken(
+          readJsonBody(route) as never,
+          requestId,
+        );
         await fulfillJson(route, 201, { data: result });
         return;
       }
@@ -90,6 +100,34 @@ export const createMockVaultCompanion = async (port = 17373): Promise<MockVaultC
         const result = await writer.listCodingSessions({
           token: url.searchParams.get('token') ?? undefined,
           workstreamId: url.searchParams.get('workstreamId') ?? undefined,
+        });
+        await fulfillJson(route, 200, { data: result });
+        return;
+      }
+
+      if (route.request().method() === 'POST' && url.pathname === '/v1/dispatches') {
+        const input = dispatchEventSchema.parse(readJsonBody(route));
+        const createdAt = input.createdAt ?? new Date().toISOString();
+        const body = input.body;
+        const record: DispatchEventRecord = {
+          ...input,
+          bac_id:
+            input.bac_id ??
+            `bac_dispatch_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+          createdAt,
+          redactionSummary: input.redactionSummary ?? { matched: 0, categories: [] },
+          tokenEstimate: input.tokenEstimate ?? Math.ceil(body.length / 4),
+          status: input.status,
+        };
+        const result = await writer.writeDispatchEvent(record, requestId);
+        await fulfillJson(route, 201, { data: result });
+        return;
+      }
+
+      if (route.request().method() === 'GET' && url.pathname === '/v1/dispatches') {
+        const result = await writer.readDispatchEvents({
+          limit: Number(url.searchParams.get('limit') ?? '25'),
+          since: url.searchParams.get('since') ?? undefined,
         });
         await fulfillJson(route, 200, { data: result });
         return;
@@ -111,7 +149,11 @@ export const createMockVaultCompanion = async (port = 17373): Promise<MockVaultC
       await fulfillJson(
         route,
         404,
-        problem(404, `Unhandled mock route: ${route.request().method()} ${url.pathname}`, requestId),
+        problem(
+          404,
+          `Unhandled mock route: ${route.request().method()} ${url.pathname}`,
+          requestId,
+        ),
       );
     } catch (error) {
       if (error instanceof CodingAttachTokenInvalidError) {

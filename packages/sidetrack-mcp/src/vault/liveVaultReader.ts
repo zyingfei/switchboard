@@ -91,6 +91,13 @@ const dispatchEventSchema = z.object({
   }),
   tokenEstimate: z.number().int().nonnegative(),
   status: z.enum(['queued', 'sent', 'replied', 'noted', 'pending', 'failed']),
+  mcpRequest: z
+    .object({
+      codingSessionId: bacIdSchema,
+      approval: z.literal('auto-approved'),
+      requestedAt: isoDateTimeSchema,
+    })
+    .optional(),
 });
 
 const reviewVerdictSchema = z.enum(['agree', 'disagree', 'partial', 'needs_source', 'open']);

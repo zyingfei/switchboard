@@ -251,6 +251,13 @@ export const dispatchEventSchema = z.object({
   redactionSummary: redactionSummarySchema.optional(),
   tokenEstimate: z.number().int().nonnegative().optional(),
   status: dispatchStatusSchema.default('sent'),
+  mcpRequest: z
+    .object({
+      codingSessionId: bacIdSchema,
+      approval: z.literal('auto-approved'),
+      requestedAt: isoDateTimeSchema,
+    })
+    .optional(),
 });
 
 export const dispatchEventRecordSchema = dispatchEventSchema.extend({
@@ -424,11 +431,7 @@ export const suggestionQuerySchema = z.object({
   // SIDETRACK_SUGGEST_THRESHOLD env (or 0.35 if unset). Lets the UI
   // ask for a lower bar on explicit refresh, and lets debug probes
   // pass `threshold=0` to see the raw score breakdown.
-  threshold: z.coerce
-    .number()
-    .min(0)
-    .max(1)
-    .optional(),
+  threshold: z.coerce.number().min(0).max(1).optional(),
 });
 
 export const autoUpdateSchema = z.object({

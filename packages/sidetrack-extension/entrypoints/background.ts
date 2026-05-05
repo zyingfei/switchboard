@@ -53,9 +53,11 @@ import {
   createLocalWorkstream,
   deleteLocalCaptureNote,
   markDispatchesRepliedForThread,
+  markMcpAutoDispatchStarted,
   markQueueItemsDoneFromTurns,
   readCachedDispatches,
   readDispatchLinks,
+  readMcpAutoDispatched,
   readQueueItems,
   readWorkstreams,
   readThreads,
@@ -92,6 +94,7 @@ import {
   setDispatchArchived,
 } from '../src/background/state';
 import { createDispatchClient } from '../src/dispatch/client';
+import type { DispatchEventRecord } from '../src/dispatch/types';
 import { tryLinkCapturedThread } from '../src/companion/dispatchLinking';
 
 const activeTab = async (): Promise<chrome.tabs.Tab | undefined> => {
@@ -974,6 +977,45 @@ const buildState = async (
   };
 };
 
+const MCP_AUTO_DISPATCH_URL: Partial<Record<DispatchEventRecord['target']['provider'], string>> = {
+  chatgpt: 'https://chatgpt.com/',
+  claude: 'https://claude.ai/new',
+  gemini: 'https://gemini.google.com/app',
+};
+
+const shouldAutoDispatchMcpRequest = (dispatch: DispatchEventRecord): boolean =>
+  dispatch.mcpRequest?.approval === 'auto-approved' &&
+  dispatch.target.mode === 'auto-send' &&
+  (dispatch.status === 'sent' || dispatch.status === 'pending' || dispatch.status === 'queued') &&
+  MCP_AUTO_DISPATCH_URL[dispatch.target.provider] !== undefined;
+
+const openAutoApprovedMcpDispatches = async (
+  dispatches: readonly DispatchEventRecord[],
+): Promise<void> => {
+  const alreadyStarted = await readMcpAutoDispatched();
+  for (const dispatch of dispatches) {
+    if (!shouldAutoDispatchMcpRequest(dispatch) || alreadyStarted[dispatch.bac_id] !== undefined) {
+      continue;
+    }
+    const url = MCP_AUTO_DISPATCH_URL[dispatch.target.provider];
+    if (url === undefined) {
+      continue;
+    }
+    await markMcpAutoDispatchStarted(dispatch.bac_id);
+    try {
+      const created = await chrome.tabs.create({ url, active: true });
+      if (typeof created.id === 'number') {
+        autoSendOnceTabReady(created.id, dispatch.body);
+      }
+    } catch (error) {
+      console.warn(
+        '[mcp.request_dispatch] auto-approved dispatch open failed:',
+        error instanceof Error ? error.message : error,
+      );
+    }
+  }
+};
+
 type WorkboardChangeReason =
   | 'capture'
   | 'mutation'
@@ -1024,6 +1066,7 @@ const refreshCachedDispatches = async (): Promise<void> => {
       return override === undefined ? d : { ...d, status: override };
     });
     await writeCachedDispatches(merged);
+    await openAutoApprovedMcpDispatches(merged);
   } catch {
     // Companion unreachable — keep the existing cache.
   }

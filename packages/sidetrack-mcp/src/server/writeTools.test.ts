@@ -2,7 +2,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { describe, expect, it, vi } from 'vitest';
 
-import type { LiveVaultSnapshot } from '../vault/liveVaultReader.js';
+import type { CodingSessionRecord, LiveVaultSnapshot } from '../vault/liveVaultReader.js';
 import {
   createSidetrackMcpServer,
   type CompanionWriteClient,
@@ -36,11 +36,22 @@ const buildFakeWriteClient = (
   createQueueItem: vi.fn(() =>
     Promise.resolve({ bac_id: 'bac_queue_fake', revision: 'rev_queue_fake' }),
   ),
+  requestDispatch: vi.fn(() =>
+    Promise.resolve({
+      dispatchId: 'bac_dispatch_fake',
+      approval: 'auto-approved' as const,
+      status: 'recorded',
+      requestedAt: '2026-05-05T12:00:00.000Z',
+    }),
+  ),
   ...overrides,
 });
 
-const startInProcessServer = async (writeClient?: CompanionWriteClient): Promise<Client> => {
-  const server = createSidetrackMcpServer(fakeReader, writeClient);
+const startInProcessServer = async (
+  writeClient?: CompanionWriteClient,
+  reader: SidetrackMcpReader = fakeReader,
+): Promise<Client> => {
+  const server = createSidetrackMcpServer(reader, writeClient);
   const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
   const client = new Client({ name: 'sidetrack-mcp-write-tools-test', version: '0.0.0' });
@@ -130,6 +141,20 @@ describe('bac.move_item', () => {
   });
 });
 
+const attachedSession = (overrides: Partial<CodingSessionRecord> = {}): CodingSessionRecord => ({
+  bac_id: 'bac_session_attached',
+  workstreamId: 'bac_ws_attached',
+  tool: 'codex',
+  cwd: '/tmp/sidetrack',
+  branch: 'codex/mcp-inbound-dispatch',
+  sessionId: 'codex-session',
+  name: 'codex · inbound',
+  attachedAt: '2026-05-05T12:00:00.000Z',
+  lastSeenAt: '2026-05-05T12:00:00.000Z',
+  status: 'attached',
+  ...overrides,
+});
+
 describe('bac.queue_item', () => {
   it('reports unavailable when no companion client is wired', async () => {
     const client = await startInProcessServer();
@@ -208,6 +233,86 @@ describe('bac.queue_item', () => {
       });
       const structured = result.structuredContent as { readonly bac_id?: string };
       expect(structured.bac_id).toBe('bac_queue_fake');
+    } finally {
+      await client.close();
+    }
+  });
+});
+
+describe('bac.request_dispatch', () => {
+  it('reports unavailable when no companion client is wired', async () => {
+    const client = await startInProcessServer();
+    try {
+      const result = await client.callTool({
+        name: 'bac.request_dispatch',
+        arguments: {
+          codingSessionId: 'bac_session_attached',
+          targetProvider: 'chatgpt',
+          title: 'Ask ChatGPT',
+          body: 'Please review this context.',
+        },
+      });
+      expect(result.isError).toBe(true);
+      expect(errorText(result)).toMatch(/bac\.request_dispatch is unavailable/);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('rejects calls for sessions that are not attached', async () => {
+    const writeClient = buildFakeWriteClient();
+    const client = await startInProcessServer(writeClient);
+    try {
+      const result = await client.callTool({
+        name: 'bac.request_dispatch',
+        arguments: {
+          codingSessionId: 'bac_session_missing',
+          targetProvider: 'chatgpt',
+          title: 'Ask ChatGPT',
+          body: 'Please review this context.',
+        },
+      });
+      expect(result.isError).toBe(true);
+      expect(errorText(result)).toMatch(/requires an attached coding session/);
+      expect(writeClient.requestDispatch).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('auto-approves and records dispatch requests for attached sessions', async () => {
+    const writeClient = buildFakeWriteClient();
+    const reader: SidetrackMcpReader = {
+      ...fakeReader,
+      readCodingSessions: () => Promise.resolve([attachedSession()]),
+    };
+    const client = await startInProcessServer(writeClient, reader);
+    try {
+      const result = await client.callTool({
+        name: 'bac.request_dispatch',
+        arguments: {
+          codingSessionId: 'bac_session_attached',
+          targetProvider: 'chatgpt',
+          title: 'Ask ChatGPT',
+          body: 'Please review this context.',
+        },
+      });
+      expect(writeClient.requestDispatch).toHaveBeenCalledWith({
+        codingSessionId: 'bac_session_attached',
+        targetProvider: 'chatgpt',
+        title: 'Ask ChatGPT',
+        body: 'Please review this context.',
+        mode: 'auto-send',
+        workstreamId: 'bac_ws_attached',
+      });
+      expect(result.structuredContent).toMatchObject({
+        dispatchId: 'bac_dispatch_fake',
+        approval: 'auto-approved',
+        status: 'recorded',
+        targetProvider: 'chatgpt',
+        mode: 'auto-send',
+        workstreamId: 'bac_ws_attached',
+      });
     } finally {
       await client.close();
     }

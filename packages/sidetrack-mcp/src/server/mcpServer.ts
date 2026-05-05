@@ -13,6 +13,23 @@ import type {
 } from '../vault/liveVaultReader.js';
 import { searchIndex } from '../vault/searchIndex.js';
 
+export type RequestDispatchTargetProvider = 'chatgpt' | 'claude' | 'gemini';
+export type RequestDispatchMode = 'paste' | 'auto-send';
+
+export interface CodingSessionRegisterResult {
+  readonly bac_id: string;
+  readonly workstreamId?: string | undefined;
+  readonly tool?: 'claude_code' | 'codex' | 'cursor' | 'other' | undefined;
+  readonly cwd?: string | undefined;
+  readonly branch?: string | undefined;
+  readonly sessionId?: string | undefined;
+  readonly name?: string | undefined;
+  readonly resumeCommand?: string | undefined;
+  readonly attachedAt?: string | undefined;
+  readonly lastSeenAt?: string | undefined;
+  readonly status?: 'attached' | 'detached' | undefined;
+}
+
 export interface CompanionWriteClient {
   readonly registerCodingSession: (input: {
     readonly token: string;
@@ -22,7 +39,21 @@ export interface CompanionWriteClient {
     readonly sessionId: string;
     readonly name: string;
     readonly resumeCommand?: string;
-  }) => Promise<{ readonly bac_id: string }>;
+  }) => Promise<CodingSessionRegisterResult>;
+  readonly requestDispatch?: (input: {
+    readonly codingSessionId: string;
+    readonly targetProvider: RequestDispatchTargetProvider;
+    readonly title: string;
+    readonly body: string;
+    readonly mode: RequestDispatchMode;
+    readonly workstreamId?: string;
+    readonly sourceThreadId?: string;
+  }) => Promise<{
+    readonly dispatchId: string;
+    readonly approval: 'auto-approved';
+    readonly status: string;
+    readonly requestedAt: string;
+  }>;
   // Move a tracked thread into a workstream (or out of any workstream
   // when workstreamId is omitted). Maps to POST /v1/threads (upsert
   // with primaryWorkstreamId set/cleared).
@@ -341,7 +372,78 @@ export const createSidetrackMcpServer = (
       });
       return asStructuredContent({
         bac_id: result.bac_id,
+        ...(result.workstreamId === undefined ? {} : { workstreamId: result.workstreamId }),
+        session: result,
         registeredAt: new Date().toISOString(),
+      });
+    },
+  );
+
+  server.registerTool(
+    'bac.request_dispatch',
+    {
+      description:
+        'Ask Sidetrack to dispatch a packet from this attached coding session to a target AI. The request is auto-approved for now and recorded through the normal dispatch ledger.',
+      inputSchema: {
+        codingSessionId: z
+          .string()
+          .min(1)
+          .describe('bac_id returned by bac.coding_session_register.'),
+        targetProvider: z
+          .enum(['chatgpt', 'claude', 'gemini'])
+          .describe('Target AI provider that should receive the packet.'),
+        title: z.string().min(1).describe('Short dispatch title shown in Recent dispatches.'),
+        body: z.string().min(1).max(20000).describe('Packet body to send to the target AI.'),
+        workstreamId: z
+          .string()
+          .optional()
+          .describe('Workstream bac_id. Defaults to the registered session workstream.'),
+        sourceThreadId: z.string().optional().describe('Optional source thread bac_id.'),
+        mode: z
+          .enum(['paste', 'auto-send'])
+          .optional()
+          .describe("Dispatch mode. Defaults to 'auto-send'."),
+      },
+    },
+    async ({
+      codingSessionId,
+      targetProvider,
+      title,
+      body,
+      workstreamId,
+      sourceThreadId,
+      mode,
+    }) => {
+      if (companionClient?.requestDispatch === undefined) {
+        throw new Error(
+          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.request_dispatch is unavailable.',
+        );
+      }
+      const sessions = await reader.readCodingSessions({ status: 'attached' });
+      const session = sessions.find((candidate) => candidate.bac_id === codingSessionId);
+      if (session === undefined) {
+        throw new Error(
+          `bac.request_dispatch requires an attached coding session; '${codingSessionId}' is not attached.`,
+        );
+      }
+      const resolvedWorkstreamId = workstreamId ?? session.workstreamId;
+      const result = await companionClient.requestDispatch({
+        codingSessionId,
+        targetProvider,
+        title,
+        body,
+        mode: mode ?? 'auto-send',
+        ...(resolvedWorkstreamId === undefined ? {} : { workstreamId: resolvedWorkstreamId }),
+        ...(sourceThreadId === undefined ? {} : { sourceThreadId }),
+      });
+      return asStructuredContent({
+        dispatchId: result.dispatchId,
+        approval: result.approval,
+        status: result.status,
+        requestedAt: result.requestedAt,
+        targetProvider,
+        mode: mode ?? 'auto-send',
+        ...(resolvedWorkstreamId === undefined ? {} : { workstreamId: resolvedWorkstreamId }),
       });
     },
   );
@@ -478,8 +580,7 @@ export const createSidetrackMcpServer = (
   server.registerTool(
     'bac.list_dispatches',
     {
-      description:
-        'Return recent dispatch events through the bridge-authenticated companion API.',
+      description: 'Return recent dispatch events through the bridge-authenticated companion API.',
       inputSchema: {
         limit: z.number().int().positive().max(100).optional(),
         since: z.iso.datetime().optional(),
@@ -525,8 +626,7 @@ export const createSidetrackMcpServer = (
   server.registerTool(
     'bac.list_workstream_notes',
     {
-      description:
-        'Return human-authored markdown notes whose frontmatter links to a workstream.',
+      description: 'Return human-authored markdown notes whose frontmatter links to a workstream.',
       inputSchema: {
         workstreamId: z.string().min(1),
       },
@@ -568,7 +668,8 @@ export const createSidetrackMcpServer = (
   server.registerTool(
     'bac.update_annotation',
     {
-      description: 'Update an annotation note while preserving the previous note in revision history.',
+      description:
+        'Update an annotation note while preserving the previous note in revision history.',
       inputSchema: { bac_id: z.string().min(1), note: z.string() },
     },
     async ({ bac_id, note }) => {

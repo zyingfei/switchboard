@@ -11,6 +11,7 @@ export const sidetrackToolNames = [
   'bac.inbound_reminders',
   'bac.coding_sessions',
   'bac.coding_session_register',
+  'bac.request_dispatch',
   'bac.move_item',
   'bac.queue_item',
   'bac.bump_workstream',
