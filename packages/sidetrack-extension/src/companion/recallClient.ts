@@ -72,6 +72,13 @@ export interface RankedItem {
   readonly score: number;
   readonly title?: string;
   readonly snippet?: string;
+  // Canonical URL of the source thread, populated by the companion
+  // from the thread JSON. Used for: dedup across stale duplicate
+  // bac_ids that point at the same chat URL (common after a
+  // re-capture before the bac_id-stability fix), filtering out the
+  // current page in the side panel proxy, and giving "Jump" a real
+  // target instead of the current page URL.
+  readonly threadUrl?: string;
 }
 
 const isRankedItem = (value: unknown): value is RankedItem =>

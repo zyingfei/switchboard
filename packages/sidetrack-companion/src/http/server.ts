@@ -933,30 +933,40 @@ const routes: readonly RouteDefinition[] = [
           ? {}
           : { workstreamMembership: (threadId: string) => threadIds.has(threadId) }),
       });
-      // Enrich each result with the thread title so the Déjà-vu
-      // popover can show something more meaningful than the raw
-      // bac_id. The cost is O(limit) tiny JSON reads — acceptable
-      // because the limit is clamped at 50 and SSD reads are cheap.
+      // Enrich each result with the thread title + canonical URL so
+      // the side panel can render meaningful labels and the SW proxy
+      // can dedup across stale duplicate bac_ids that point at the
+      // same chat URL. The cost is O(limit) tiny JSON reads —
+      // acceptable because the limit is clamped at 50.
       // Snippet remains absent for now (would need an index format
       // bump to store per-turn text without re-reading event logs).
-      const titles = new Map<string, string>();
+      const meta = new Map<string, { title: string; threadUrl: string }>();
       const enriched = await Promise.all(
         ranked.map(async (item) => {
-          let title = titles.get(item.threadId);
-          if (title === undefined) {
+          let info = meta.get(item.threadId);
+          if (info === undefined) {
             try {
               const threadFile = await readFile(
                 join(vaultRoot, '_BAC', 'threads', `${item.threadId}.json`),
                 'utf8',
               );
-              const parsed = JSON.parse(threadFile) as { readonly title?: unknown };
-              title = typeof parsed.title === 'string' ? parsed.title : '';
+              const parsed = JSON.parse(threadFile) as {
+                readonly title?: unknown;
+                readonly threadUrl?: unknown;
+              };
+              info = {
+                title: typeof parsed.title === 'string' ? parsed.title : '',
+                threadUrl: typeof parsed.threadUrl === 'string' ? parsed.threadUrl : '',
+              };
             } catch {
-              title = '';
+              info = { title: '', threadUrl: '' };
             }
-            titles.set(item.threadId, title);
+            meta.set(item.threadId, info);
           }
-          return title.length > 0 ? { ...item, title } : item;
+          const additions: Record<string, string> = {};
+          if (info.title.length > 0) additions['title'] = info.title;
+          if (info.threadUrl.length > 0) additions['threadUrl'] = info.threadUrl;
+          return Object.keys(additions).length > 0 ? { ...item, ...additions } : item;
         }),
       );
       return [200, { data: enriched }];

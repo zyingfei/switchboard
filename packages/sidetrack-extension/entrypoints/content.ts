@@ -425,8 +425,16 @@ export default defineContentScript({
             snippet: r.snippet ?? '',
             score: r.score,
             relativeWhen: r.capturedAt,
-            provider: detectProviderFromUrl(window.location.href),
-            threadUrl: window.location.href,
+            // Provider is derived from the matched thread's URL when
+            // we have it (different chat → different provider chip);
+            // we fall back to the current page's provider for legacy
+            // results that don't carry a threadUrl yet.
+            provider: detectProviderFromUrl(r.threadUrl ?? window.location.href),
+            // Jump must go to the MATCHED thread, not the current
+            // page. Setting threadUrl to window.location.href here
+            // was a copy-paste leftover that made every Jump a no-op
+            // (focus-in-side-panel for the page you're already on).
+            ...(r.threadUrl === undefined ? {} : { threadUrl: r.threadUrl }),
           })),
           anchorRect,
           onJump: (item) => {
