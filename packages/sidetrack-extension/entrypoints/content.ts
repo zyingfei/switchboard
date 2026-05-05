@@ -215,6 +215,12 @@ export default defineContentScript({
         title: document.title,
       });
 
+    // Live in-page annotation set. Initially populated from the
+     // companion's persisted list on page load; appended to
+     // optimistically when the user saves a new comment so the
+     // margin marker shows up without requiring a page reload.
+    const liveAnchors: RestoredAnchor[] = [];
+
     const restoreAnnotations = async (): Promise<void> => {
       try {
         const client = await createAnnotationClient();
@@ -222,19 +228,27 @@ export default defineContentScript({
           return;
         }
         const annotations = await client.listAnnotationsForUrl(window.location.href);
-        const restored: RestoredAnchor[] = [];
         for (const annotation of annotations) {
           const range = findAnchor(document.documentElement, annotation.anchor);
           if (range !== null) {
-            restored.push({ id: annotation.bac_id, rect: range.getBoundingClientRect() });
+            liveAnchors.push({ id: annotation.bac_id, rect: range.getBoundingClientRect() });
           }
         }
-        if (restored.length > 0) {
-          mountAnnotationOverlay(restored);
+        if (liveAnchors.length > 0) {
+          mountAnnotationOverlay(liveAnchors);
         }
       } catch {
         // Restore is best-effort and must never disturb the host page.
       }
+    };
+
+    const addLiveAnnotation = (id: string, range: Range): void => {
+      // Optimistic mount: drop in the marker at the user's selection
+      // immediately so they get visible feedback that their save took
+      // effect. The companion's persisted record syncs on next page
+      // load (mountAnnotationOverlay clears + re-renders).
+      liveAnchors.push({ id, rect: range.getBoundingClientRect() });
+      mountAnnotationOverlay(liveAnchors);
     };
 
     // Déjà-vu pop-on-highlight — debounced selection listener that
@@ -344,21 +358,52 @@ export default defineContentScript({
             comment,
             capturedAt: new Date().toISOString(),
           });
+          // Optimistic in-page marker — gives the user instant visual
+          // confirmation their note saved without waiting for a page
+          // reload. The id is local-only; on next page load the
+          // companion's persisted annotation list takes over.
+          addLiveAnnotation(`local-${String(Date.now())}`, range);
         },
         onDismiss: () => {
           reviewChipMounted = null;
         },
+        onDejaVu: () => {
+          reviewChipMounted = null;
+          // Force the popover to mount even on empty results so the
+          // user gets explicit "no matches" feedback when they
+          // explicitly invoked Déjà-vu.
+          void fetchDejaVu(quote.trim(), anchorRect, true);
+        },
       });
     };
 
-    const fetchDejaVu = async (text: string, anchorRect: DOMRect): Promise<void> => {
-      if (dejaVuMutedUrls.has(window.location.href)) return;
+    const fetchDejaVu = async (
+      text: string,
+      anchorRect: DOMRect,
+      // When `force` is true, always mount the popover (even on empty
+      // results) so the user gets explicit "no matches" feedback.
+      // The default automatic path stays implicit — only mounts on
+      // hits — so we don't pop empty cards on every selection.
+      force = false,
+    ): Promise<void> => {
+      if (!force && dejaVuMutedUrls.has(window.location.href)) return;
       try {
         const settings = await readCompanionSettingsFromStorage();
-        if (settings === null) return;
+        if (settings === null) {
+          if (!force) return;
+          closeDejaVu();
+          dejaVuMounted = mountDejaVuPopover({
+            items: [],
+            anchorRect,
+            onDismiss: () => {
+              dejaVuMounted = null;
+            },
+          });
+          return;
+        }
         const client = createRecallClient(settings);
         const results = await client.query(text, { limit: 5 });
-        if (results.length === 0) return;
+        if (results.length === 0 && !force) return;
         closeDejaVu();
         dejaVuMounted = mountDejaVuPopover({
           items: results.map((r: RankedItem): DejaVuItem => ({

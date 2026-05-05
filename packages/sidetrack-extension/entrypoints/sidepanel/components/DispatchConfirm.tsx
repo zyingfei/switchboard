@@ -112,12 +112,8 @@ export function DispatchConfirm({
       variant="ink"
       onClose={onCancel}
     >
-      {/* Side-effect preview — single sentence so the user knows
-          exactly what clicking Confirm will do. Sits above the
-          safety chain. The user kept asking "where does this go?"
-          — this answers it before they have to click. */}
-      <div className="dispatch-side-effect mono">{sideEffectText}</div>
-
+      {/* Safety chain — moved to top of modal so it can't be missed
+          if the packet preview pushes other content off-screen. */}
       {(() => {
         const checks: readonly SafetyCheck[] = [
           {
@@ -152,11 +148,12 @@ export function DispatchConfirm({
               : 'no suspicious patterns',
           },
         ];
-        // Always open by default so the user can see the safety chain
-        // — earlier "collapsed when no issues" was too easy to miss
-        // and made users doubt the feature was implemented.
         return <SafetyChainSummary checks={checks} defaultOpen />;
       })()}
+
+      {/* Side-effect preview — single sentence so the user knows
+          exactly what clicking Confirm will do. */}
+      <div className="dispatch-side-effect mono">{sideEffectText}</div>
 
       <details className="preview-details" open>
         <summary>Final packet preview</summary>

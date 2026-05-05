@@ -264,8 +264,14 @@ const OVERLAY_CSS = `
   font-size: 10px;
   color: var(--ink-3);
 }
-.sidetrack-rv-chip {
+.sidetrack-rv-chip-group {
   position: absolute;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  pointer-events: auto;
+}
+.sidetrack-rv-chip {
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -281,6 +287,15 @@ const OVERLAY_CSS = `
   box-shadow: 0 8px 24px -8px rgba(0,0,0,0.25);
 }
 .sidetrack-rv-chip:hover { background: var(--signal); border-color: var(--signal); }
+.sidetrack-rv-chip-dv {
+  background: var(--paper-light);
+  color: var(--ink);
+}
+.sidetrack-rv-chip-dv:hover {
+  background: var(--paper);
+  border-color: var(--ink);
+  color: var(--signal);
+}
 .sidetrack-rv-chip .glyph {
   font-family: var(--display); font-size: 12px; line-height: 1; font-weight: 500;
 }
@@ -446,6 +461,12 @@ interface ReviewChipMountOptions {
   readonly quote: string;
   readonly onSave: (comment: string) => Promise<void> | void;
   readonly onDismiss?: () => void;
+  // When provided, the chip renders a second button "Déjà-vu" that
+  // unconditionally invokes this callback. The caller (content
+  // script) handles fetching recall + mounting the popover, even
+  // when results are empty (so the user gets explicit "no matches"
+  // feedback instead of the previous silent no-op).
+  readonly onDejaVu?: () => void;
 }
 
 const POP_WIDTH_RV = 320;
@@ -462,17 +483,30 @@ export const mountReviewSelectionChip = (
   const root = ensureOverlayInfra();
   clearReviewOverlays(root);
 
+  // Wider when the Déjà-vu button is also shown.
+  const chipWidth = opts.onDejaVu !== undefined ? 200 : 110;
   const chipLeft = Math.min(
-    document.documentElement.clientWidth - 110 - 8,
+    document.documentElement.clientWidth - chipWidth - 8,
     Math.max(8, opts.anchorRect.right - 50),
   );
   const chipTop = opts.anchorRect.bottom + 6;
-  const chip = document.createElement('button');
-  chip.type = 'button';
-  chip.className = 'sidetrack-rv-chip';
+  const chip = document.createElement('div');
+  chip.className = 'sidetrack-rv-chip-group';
   chip.style.left = `${String(chipLeft)}px`;
   chip.style.top = `${String(chipTop)}px`;
-  chip.innerHTML = '<span class="glyph">+</span><span>Comment</span>';
+  const commentBtn = document.createElement('button');
+  commentBtn.type = 'button';
+  commentBtn.className = 'sidetrack-rv-chip';
+  commentBtn.innerHTML = '<span class="glyph">+</span><span>Comment</span>';
+  chip.appendChild(commentBtn);
+  let dejaBtn: HTMLButtonElement | undefined;
+  if (opts.onDejaVu !== undefined) {
+    dejaBtn = document.createElement('button');
+    dejaBtn.type = 'button';
+    dejaBtn.className = 'sidetrack-rv-chip sidetrack-rv-chip-dv';
+    dejaBtn.innerHTML = '<span class="glyph">⟲</span><span>Déjà-vu</span>';
+    chip.appendChild(dejaBtn);
+  }
 
   const close = (): void => {
     chip.remove();
@@ -536,11 +570,19 @@ export const mountReviewSelectionChip = (
     window.setTimeout(() => textarea?.focus(), 0);
   };
 
-  chip.addEventListener('click', (event) => {
+  commentBtn.addEventListener('click', (event) => {
     event.preventDefault();
     event.stopPropagation();
     expandToPopover();
   });
+  if (dejaBtn !== undefined) {
+    dejaBtn.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      chip.remove();
+      opts.onDejaVu?.();
+    });
+  }
   root.appendChild(chip);
   return { close };
 };
@@ -554,11 +596,11 @@ const providerLabel = (provider: ProviderId | undefined): string => {
 };
 
 // Mount the Déjà-vu popover anchored just above the selection's bounding
-// rect, clamped to the viewport with 8px padding.
+// rect, clamped to the viewport with 8px padding. Empty items now
+// renders an explicit "no matches found" panel so the user sees
+// the query ran (vs the previous silent no-mount which made the
+// feature feel broken).
 export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => void } => {
-  if (opts.items.length === 0) {
-    return { close: () => undefined };
-  }
   const root = ensureOverlayInfra();
   clearDejaPop(root);
   const pop = document.createElement('div');
@@ -576,11 +618,16 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
   }
   pop.style.left = `${String(left)}px`;
   pop.style.top = `${String(placeAbove ? top - 320 : top)}px`;
+  const isEmpty = opts.items.length === 0;
   pop.innerHTML = `
     <div class="sidetrack-deja-head">
       <span class="dot"></span>
-      <span>Seen this before</span>
-      <span class="meta">${String(opts.items.length)} prior thread${opts.items.length === 1 ? '' : 's'}</span>
+      <span>${isEmpty ? 'Déjà-vu' : 'Seen this before'}</span>
+      <span class="meta">${
+        isEmpty
+          ? 'no prior threads matched'
+          : `${String(opts.items.length)} prior thread${opts.items.length === 1 ? '' : 's'}`
+      }</span>
       <button type="button" class="sidetrack-deja-mute">Mute on this page</button>
       <button type="button" class="close" aria-label="Dismiss">×</button>
     </div>
@@ -590,7 +637,14 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
     </div>
   `;
   const list = pop.querySelector<HTMLDivElement>('.sidetrack-deja-list');
-  if (list !== null) {
+  if (isEmpty && list !== null) {
+    const empty = document.createElement('div');
+    empty.className = 'sidetrack-deja-empty';
+    empty.style.cssText = 'padding: 18px 14px; text-align: center; color: var(--ink-3); font-style: italic; font-size: 12px;';
+    empty.textContent = 'No similar prior threads found in your vault.';
+    list.appendChild(empty);
+  }
+  if (!isEmpty && list !== null) {
     for (const item of opts.items) {
       const row = document.createElement('div');
       row.className = 'sidetrack-deja-row';

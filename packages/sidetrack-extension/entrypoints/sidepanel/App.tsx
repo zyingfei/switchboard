@@ -4436,13 +4436,18 @@ function NeedsOrganizeSuggestionRow({
     };
   }, [companionPort, bridgeKey, cached, threadId, onCache]);
 
-  if (suggestion === null) return null;
+  // Always render the row even when the companion has no automatic
+  // suggestion above threshold — surface the manual picker so the
+  // user has a path to file the thread without hunting for the
+  // workstream chip elsewhere. Previously returned null on empty,
+  // leaving "Needs organize" pill with no actionable affordance.
+  const hasAuto = suggestion !== null;
   return (
     <NeedsOrganizeSuggestion
-      suggestedLabel={suggestion.label}
-      confidence={suggestion.confidence}
+      suggestedLabel={hasAuto ? suggestion.label : 'Pick a workstream…'}
+      confidence={hasAuto ? suggestion.confidence : 0}
       onAccept={() => {
-        if (suggestion.workstreamId.length > 0) {
+        if (hasAuto && suggestion.workstreamId.length > 0) {
           onAccept(suggestion.workstreamId);
         } else {
           onPickManual();
