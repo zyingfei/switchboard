@@ -21,6 +21,7 @@
     "e2e:chrome-debug": "npm run build && node scripts/chrome-debug.mjs",
     "e2e:install-cft": "node scripts/install-cft.mjs",
     "e2e:gc-cft": "node scripts/gc-cft.mjs",
+    "e2e:pair": "node scripts/pair-extension.mjs",
     "postinstall": "wxt prepare"
   },
   "dependencies": {

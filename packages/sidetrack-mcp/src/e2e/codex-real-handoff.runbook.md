@@ -136,27 +136,79 @@ The script also opens CDP, watches for the extension service worker,
 and writes its ID to `.output/cdp-extension-id`. **Leave this script
 running** — closing the Chrome window (Cmd-Q) stops it.
 
-### 3.3 Sign in to providers (one-time per profile)
+### 3.3 Sign in to providers (the **passkey** problem)
 
-Because the user-data-dir persists, provider sign-ins are a one-time
-chore. In the freshly-launched window:
+This is the step that breaks first when an agent tries to run the
+e2e on a fresh machine. **chatgpt.com (Google OAuth) requires a
+WebAuthn passkey** that is device-bound — Touch ID, a hardware
+security key, or a phone-as-passkey. A coding agent on a remote
+machine has none of these, so the OAuth flow stalls forever.
 
-1. **chatgpt.com** — Continue with Google / Apple / email; complete
-   any captcha. CfT is a clean automation profile, so providers will
-   issue a verification code on first login.
-2. **claude.ai** — same.
-3. **gemini.google.com** — same.
+There is no fully-automatic workaround. Pick whichever applies:
 
-If you want to script the sign-in step (Playwright will park the
-browser on the login page until you manually finish), use:
+**A. Human signs in once per machine** (recommended for a human
+operator + agent on the same machine).
+
+The user-data-dir at `~/.sidetrack-test-profile` persists cookies
+and Google session tokens between launches. After one successful
+sign-in (Touch ID at the right moment), subsequent
+`npm run e2e:chrome-debug` runs reuse the session for weeks.
+
+```bash
+# On the machine that has the passkey hardware:
+npm run e2e:chrome-debug
+# → in the launched window, sign in to chatgpt.com / claude.ai /
+#   gemini.google.com once. Cmd-Q when done.
+# All later runs (including agents) skip sign-in entirely.
+```
+
+**B. Transfer a signed-in profile between machines.**
+
+If the agent needs to run on a host that can't host a passkey, copy
+the entire user-data-dir from a host that can:
+
+```bash
+# On host with the passkey (after one sign-in):
+tar czf sidetrack-test-profile.tar.gz -C ~ .sidetrack-test-profile
+
+# Transfer the tarball to the target host. Then on the target:
+tar xzf sidetrack-test-profile.tar.gz -C ~
+npm run e2e:chrome-debug   # cookies + session carry across
+```
+
+Caveat: Google's session-binding (device-bound credentials, DBSC)
+will sometimes invalidate the moved cookies and re-prompt for the
+passkey. If that happens, fall back to (A) on each host, or use (C).
+
+**C. Use providers that don't require a hardware passkey.**
+
+The e2e demonstrates the flow with a ChatGPT thread, but the
+extension also captures from claude.ai (email magic link) and from
+the OpenAI-Codex web UI. If the only obstacle is Google's passkey,
+point `SIDETRACK_TARGET_URL` at a `claude.ai` thread instead — the
+script will navigate there and the rest of the pipeline is identical.
+
+```bash
+SIDETRACK_TARGET_URL=https://claude.ai/chat/<id> \
+  node packages/sidetrack-extension/scripts/codex-real-e2e.mjs
+```
+
+**Don't try to automate the passkey itself.** Google detects and
+blocks scripted WebAuthn responses; bypassing them is bot-detection
+evasion, not a fix. The user-data-dir reuse pattern above is the
+sanctioned path.
+
+If you want to script the sign-in step interactively (a window that
+stays open while you complete the passkey, instead of timing out),
+use:
 
 ```bash
 node scripts/login-test-profile.mjs
 ```
 
 This launches Playwright with the same extension and user-data-dir
-as `e2e:chrome-debug`, but without the CDP port — handy when CDP
-attach contention is causing test flakes.
+as `e2e:chrome-debug`, but without the CDP port — handy because the
+profile is identical and a CDP-attached run won't fight the login UI.
 
 ### 3.4 Verify the extension is loaded
 
@@ -173,7 +225,11 @@ If the extension is missing: re-run `npm run build` then
 `npm run e2e:chrome-debug`, and confirm `.output/chrome-mv3/manifest.json`
 exists.
 
-### 3.5 Wire the bridge key (the "passkey")
+### 3.5 Wire the bridge key (extension ↔ companion auth)
+
+> Note: this is **not** the same as the Google passkey covered in §3.3.
+> The bridge key is a per-vault token the companion uses to authenticate
+> the extension. It is filesystem-readable and can be wired headlessly.
 
 The companion mints a per-vault bridge key at startup; the extension
 must hold the same key to make HTTP calls. The plumbing:
@@ -189,7 +245,21 @@ extension stores at chrome.storage.local["sidetrack.settings"]
                               .companion.bridgeKey
 ```
 
-**Recommended flow (manual paste):**
+**Headless flow (recommended for agents):**
+
+```bash
+npm run e2e:pair
+# Reads <vault>/_BAC/.config/bridge.key, writes it to
+# chrome.storage.local["sidetrack.settings"].companion.bridgeKey,
+# and flips sidetrack:setupCompleted=true so the wizard skips.
+# Override with SIDETRACK_VAULT, SIDETRACK_COMPANION_PORT,
+# SIDETRACK_E2E_CDP_URL.
+```
+
+The script also calls `/v1/system/health` and prints the resolved
+status, so a successful run is its own evidence.
+
+**Manual flow (when you have a human at the wheel):**
 
 1. Read the key:
 

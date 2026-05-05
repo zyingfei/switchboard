@@ -2,25 +2,65 @@
 // extension → start MCP server → simulate Codex via MCP SDK,
 // pulling everything via MCP only (no direct companion calls).
 // Logs every step so the run is its own evidence trail.
-// Imports use absolute paths into each package's node_modules so
-// this script can run from any cwd (extension has playwright; MCP
-// has the MCP SDK + ws transport).
-const ROOT = '/Users/yingfei/Documents/playground/browser-ai-companion/.claude/worktrees/m1+foundation';
-const { chromium } = await import(`${ROOT}/packages/sidetrack-extension/node_modules/playwright/index.mjs`);
-const { Client } = await import(`${ROOT}/packages/sidetrack-mcp/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js`);
-const { WebSocketClientTransport } = await import(`${ROOT}/packages/sidetrack-mcp/node_modules/@modelcontextprotocol/sdk/dist/esm/client/websocket.js`);
-const { spawn } = await import('node:child_process');
+//
+// Resolves paths and the bridge key relative to the script's own
+// location + env vars, so it works on any machine without edits:
+//
+//   SIDETRACK_TARGET_URL       (default: a known-good ChatGPT thread)
+//   SIDETRACK_VAULT            (default: ~/Documents/Sidetrack-vault)
+//   SIDETRACK_COMPANION_PORT   (default: 17373)
+//   SIDETRACK_E2E_CDP_URL      (default: http://localhost:9222)
+//
+// The bridge key is read from <vault>/_BAC/.config/bridge.key, which
+// the companion writes on first start. To pre-pair the extension on
+// a fresh machine: `npm run e2e:pair`.
 
-const TARGET_URL = 'https://chatgpt.com/c/69fa10f8-ae00-8330-a104-ee21469af0e0';
-const VAULT = '/Users/yingfei/Documents/Sidetrack-vault';
-const COMPANION_PORT = 17373;
-const BRIDGE_KEY = 'Xnr-n2HC2QO5aSvpWFRPROqrhTiSJyWUTYP7WHb2QZg';
+import { readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import path from 'node:path';
+import process from 'node:process';
+import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
+
+const packageRoot = path.resolve(fileURLToPath(new URL('../', import.meta.url)));
+const repoRoot = path.resolve(packageRoot, '../..');
+const expandTilde = (input) =>
+  input.startsWith('~') ? path.join(homedir(), input.slice(1).replace(/^[/\\]/, '')) : input;
+
+const TARGET_URL =
+  process.env.SIDETRACK_TARGET_URL ?? 'https://chatgpt.com/c/69fa10f8-ae00-8330-a104-ee21469af0e0';
+const VAULT = expandTilde(process.env.SIDETRACK_VAULT ?? '~/Documents/Sidetrack-vault');
+const COMPANION_PORT = Number(process.env.SIDETRACK_COMPANION_PORT ?? '17373');
+const CDP_URL = process.env.SIDETRACK_E2E_CDP_URL ?? 'http://localhost:9222';
 const MCP_PORT = 8730 + Math.floor(Math.random() * 100); // pick a free-ish port
+
+const BRIDGE_KEY_PATH = path.join(VAULT, '_BAC/.config/bridge.key');
+let BRIDGE_KEY;
+try {
+  BRIDGE_KEY = (await readFile(BRIDGE_KEY_PATH, 'utf8')).trim();
+  if (BRIDGE_KEY.length === 0) throw new Error(`${BRIDGE_KEY_PATH} is empty`);
+} catch (err) {
+  console.error(`[setup] cannot read bridge key from ${BRIDGE_KEY_PATH}`);
+  console.error('  Start the companion first:');
+  console.error(`    node packages/sidetrack-companion/dist/cli.js --vault ${VAULT}`);
+  console.error('  Then pair the extension:');
+  console.error('    npm run e2e:pair');
+  console.error('  Underlying error:', err.message ?? err);
+  process.exit(1);
+}
+
+const { chromium } = await import(path.join(packageRoot, 'node_modules/playwright/index.mjs'));
+const { Client } = await import(
+  path.join(repoRoot, 'packages/sidetrack-mcp/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js')
+);
+const { WebSocketClientTransport } = await import(
+  path.join(repoRoot, 'packages/sidetrack-mcp/node_modules/@modelcontextprotocol/sdk/dist/esm/client/websocket.js')
+);
 
 const log = (step, ...args) => console.log(`\n[${step}]`, ...args);
 
 // ───────── Step 1 — connect to test browser, open target tab
-const browser = await chromium.connectOverCDP('http://localhost:9222');
+const browser = await chromium.connectOverCDP(CDP_URL);
 const ctx = browser.contexts()[0];
 let tab = ctx.pages().find(p => p.url() === TARGET_URL);
 if (!tab) {
@@ -75,7 +115,7 @@ log('2.capture', 'thread bac_id:', bacId);
 // ───────── Step 3 — start MCP server (websocket) pointing at vault + companion
 log('3.mcp', `starting sidetrack-mcp on ws://127.0.0.1:${MCP_PORT}/mcp`);
 const mcpProc = spawn('node', [
-  '/Users/yingfei/Documents/playground/browser-ai-companion/.claude/worktrees/m1+foundation/packages/sidetrack-mcp/dist/cli.js',
+  path.join(repoRoot, 'packages/sidetrack-mcp/dist/cli.js'),
   '--vault', VAULT,
   '--transport', 'websocket',
   '--port', String(MCP_PORT),
