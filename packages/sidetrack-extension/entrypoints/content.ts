@@ -448,7 +448,13 @@ export default defineContentScript({
           return;
         }
         const text = selection.toString().trim();
-        if (text.length < SELECTION_MIN_CHARS) {
+        // Chip min: 3 chars (was 18). The 18-char floor was meant
+        // to prevent the auto-fire popover from spamming on tiny
+        // selections, but it also blocked the chip — so a user
+        // selecting a single phrase couldn't even see "+ Comment"
+        // or "Déjà-vu". The auto-fire popover keeps the higher
+        // floor inside fetchDejaVu; the chip surfaces at 3+ chars.
+        if (text.length < 3) {
           return;
         }
         const range = selection.getRangeAt(0);
@@ -461,7 +467,11 @@ export default defineContentScript({
         if (selectionInsideTurn(selection)) {
           offerReviewChip(selection, rect);
         }
-        void fetchDejaVu(text, rect);
+        // Auto-fire the popover only at the original min — the
+        // explicit Déjà-vu chip works regardless.
+        if (text.length >= SELECTION_MIN_CHARS) {
+          void fetchDejaVu(text, rect);
+        }
       }, 400);
     };
 

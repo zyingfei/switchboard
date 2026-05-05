@@ -472,7 +472,9 @@ interface ReviewChipMountOptions {
 const POP_WIDTH_RV = 320;
 
 const clearReviewOverlays = (root: HTMLElement): void => {
-  for (const node of root.querySelectorAll('.sidetrack-rv-chip, .sidetrack-rv-pop')) {
+  for (const node of root.querySelectorAll(
+    '.sidetrack-rv-chip, .sidetrack-rv-chip-group, .sidetrack-rv-pop',
+  )) {
     node.remove();
   }
 };
@@ -483,33 +485,43 @@ export const mountReviewSelectionChip = (
   const root = ensureOverlayInfra();
   clearReviewOverlays(root);
 
-  // Wider when the Déjà-vu button is also shown.
-  const chipWidth = opts.onDejaVu !== undefined ? 200 : 110;
-  const chipLeft = Math.min(
-    document.documentElement.clientWidth - chipWidth - 8,
-    Math.max(8, opts.anchorRect.right - 50),
-  );
+  // Anchor: chip pair sits just below the selection's bounding rect,
+  // clamped to viewport. Two independent absolute-positioned chips —
+  // simpler than a wrapper div with flex (the wrapper version was
+  // dropping the + Comment button on some renders, see prior bug).
+  const COMMENT_W = 110;
+  const DEJA_W = 100;
+  const GAP = 6;
+  const totalWidth =
+    opts.onDejaVu !== undefined ? COMMENT_W + GAP + DEJA_W : COMMENT_W;
+  const viewportWidth = document.documentElement.clientWidth;
+  let leftAnchor = Math.max(8, opts.anchorRect.right - 50);
+  if (leftAnchor + totalWidth > viewportWidth - 8) {
+    leftAnchor = viewportWidth - totalWidth - 8;
+  }
+  if (leftAnchor < 8) leftAnchor = 8;
   const chipTop = opts.anchorRect.bottom + 6;
-  const chip = document.createElement('div');
-  chip.className = 'sidetrack-rv-chip-group';
-  chip.style.left = `${String(chipLeft)}px`;
-  chip.style.top = `${String(chipTop)}px`;
+
   const commentBtn = document.createElement('button');
   commentBtn.type = 'button';
   commentBtn.className = 'sidetrack-rv-chip';
+  commentBtn.style.left = `${String(leftAnchor)}px`;
+  commentBtn.style.top = `${String(chipTop)}px`;
   commentBtn.innerHTML = '<span class="glyph">+</span><span>Comment</span>';
-  chip.appendChild(commentBtn);
+
   let dejaBtn: HTMLButtonElement | undefined;
   if (opts.onDejaVu !== undefined) {
     dejaBtn = document.createElement('button');
     dejaBtn.type = 'button';
     dejaBtn.className = 'sidetrack-rv-chip sidetrack-rv-chip-dv';
+    dejaBtn.style.left = `${String(leftAnchor + COMMENT_W + GAP)}px`;
+    dejaBtn.style.top = `${String(chipTop)}px`;
     dejaBtn.innerHTML = '<span class="glyph">⟲</span><span>Déjà-vu</span>';
-    chip.appendChild(dejaBtn);
   }
 
   const close = (): void => {
-    chip.remove();
+    commentBtn.remove();
+    dejaBtn?.remove();
     for (const pop of root.querySelectorAll('.sidetrack-rv-pop')) {
       pop.remove();
     }
@@ -517,7 +529,8 @@ export const mountReviewSelectionChip = (
   };
 
   const expandToPopover = (): void => {
-    chip.remove();
+    commentBtn.remove();
+    dejaBtn?.remove();
     const pop = document.createElement('div');
     pop.className = 'sidetrack-rv-pop';
     const viewportWidth = document.documentElement.clientWidth;
@@ -576,14 +589,19 @@ export const mountReviewSelectionChip = (
     expandToPopover();
   });
   if (dejaBtn !== undefined) {
-    dejaBtn.addEventListener('click', (event) => {
+    const dejaBtnHandle = dejaBtn;
+    dejaBtnHandle.addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
-      chip.remove();
+      commentBtn.remove();
+      dejaBtnHandle.remove();
       opts.onDejaVu?.();
     });
   }
-  root.appendChild(chip);
+  root.appendChild(commentBtn);
+  if (dejaBtn !== undefined) {
+    root.appendChild(dejaBtn);
+  }
   return { close };
 };
 

@@ -2678,7 +2678,13 @@ const App = () => {
                   <span className="thread-turn-text">
                     <TurnText text={turn.text} maxChars={200} />
                   </span>
-                  <span className="thread-turn-time mono">{formatRelative(turn.capturedAt)}</span>
+                  {/* No per-turn time stamp: providers don't expose
+                      stable per-message timestamps in their DOM, and
+                      capturedAt is "first seen by Sidetrack" not
+                      "AI replied at" — showing it as "X min ago"
+                      misleads users who captured the chat after the
+                      conversation. The thread-level "Last seen · X
+                      ago" already conveys the right signal. */}
                 </div>
               ))
             )}
