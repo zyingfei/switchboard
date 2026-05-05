@@ -981,6 +981,7 @@ const App = () => {
   // half-typed note.
   const [annotateTurnKey, setAnnotateTurnKey] = useState<string | null>(null);
   const [annotateTurnDraft, setAnnotateTurnDraft] = useState('');
+  const [annotateTurnAnchorText, setAnnotateTurnAnchorText] = useState('');
   const [annotateTurnStatus, setAnnotateTurnStatus] = useState<{
     readonly key: string;
     readonly tone: 'saving' | 'ok' | 'error';
@@ -1793,6 +1794,7 @@ const App = () => {
     publishToChat = false,
   ): void => {
     const note = annotateTurnDraft.trim();
+    const anchorText = annotateTurnAnchorText.trim();
     if (note.length === 0) {
       return;
     }
@@ -1811,6 +1813,7 @@ const App = () => {
           threadUrl,
           turnText: turn.text,
           ...(turn.sourceSelector === undefined ? {} : { sourceSelector: turn.sourceSelector }),
+          ...(anchorText.length === 0 ? {} : { anchorText }),
           note,
           capturedAt,
         });
@@ -1829,6 +1832,7 @@ const App = () => {
               threadUrl,
               turnText: turn.text,
               turnRole: turn.role,
+              ...(anchorText.length === 0 ? {} : { anchorText }),
               note,
               capturedAt,
             },
@@ -1845,6 +1849,7 @@ const App = () => {
           }
         }
         setAnnotateTurnDraft('');
+        setAnnotateTurnAnchorText('');
         setAnnotateTurnKey(null);
         // Surface a soft success line so the user can confirm the
         // marker landed even though the side panel doesn't show the
@@ -1853,10 +1858,15 @@ const App = () => {
         // but the in-page marker still mounted.
         setAnnotateTurnStatus({
           key,
-          tone: response.error === undefined ? 'ok' : 'error',
+          tone: response.error === undefined || publishToChat ? 'ok' : 'error',
           text:
-            response.error ??
-            (publishToChat ? 'marker placed and published to chat' : 'marker placed on live page'),
+            response.error === undefined
+              ? publishToChat
+                ? 'marker placed and published to chat'
+                : 'marker placed on live page'
+              : publishToChat
+                ? `marker placed and published to chat; ${response.error}`
+                : response.error,
         });
         if (!publishToChat) {
           window.setTimeout(() => {
@@ -3113,10 +3123,12 @@ const App = () => {
                         if (annotateOpen) {
                           setAnnotateTurnKey(null);
                           setAnnotateTurnDraft('');
+                          setAnnotateTurnAnchorText('');
                           return;
                         }
                         setAnnotateTurnKey(turnKey);
                         setAnnotateTurnDraft('');
+                        setAnnotateTurnAnchorText('');
                         setAnnotateTurnStatus(null);
                       }}
                     >
@@ -3133,6 +3145,15 @@ const App = () => {
                           submitTurnAnnotation(thread.threadUrl, turn, turnKey);
                         }}
                       >
+                        <input
+                          className="thread-turn-annotate-input"
+                          aria-label="Keyword or quote to highlight"
+                          placeholder="Keyword / quote to highlight (optional)"
+                          value={annotateTurnAnchorText}
+                          onChange={(e) => {
+                            setAnnotateTurnAnchorText(e.target.value);
+                          }}
+                        />
                         <textarea
                           className="thread-turn-annotate-input"
                           rows={2}

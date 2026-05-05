@@ -3627,6 +3627,10 @@ textarea.preview-body:focus {
   padding: 5px 7px;
   outline: none;
 }
+input.thread-turn-annotate-input {
+  resize: none;
+  min-height: 30px;
+}
 .thread-turn-annotate-input:focus {
   border-color: var(--ink-3);
 }

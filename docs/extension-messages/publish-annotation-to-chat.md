@@ -20,10 +20,13 @@ Publishes a side-panel turn annotation into the live provider chat. The side pan
   "threadUrl": "https://chatgpt.com/c/example",
   "turnText": "Captured turn body",
   "turnRole": "assistant",
+  "anchorText": "Optional exact keyword or quote highlighted on the page",
   "note": "Annotation note to publish",
   "capturedAt": "2026-05-05T00:00:00.000Z"
 }
 ```
+
+`anchorText` is optional. When present, Sidetrack also uses it as the visual annotation target for the live-page marker/highlight and includes it in the published chat message as the keyword or quote being explained.
 
 ## Response schema
 
@@ -69,3 +72,4 @@ The content script uses the existing provider auto-send driver in submit-only mo
 - [x] Schema rejects missing typed fields via `isRuntimeRequest`
 - [x] Typecheck covers the message and response shapes
 - [x] Build covers handler registration and content-script wiring
+- [x] Browser e2e covers keyword-targeted annotation highlights on a ChatGPT-shaped page

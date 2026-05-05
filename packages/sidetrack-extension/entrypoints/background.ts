@@ -826,6 +826,7 @@ const quoteForChat = (input: string): string =>
 const buildAnnotationChatMessage = (input: {
   readonly turnText: string;
   readonly turnRole: string;
+  readonly anchorText?: string;
   readonly note: string;
   readonly capturedAt: string;
 }): string => {
@@ -835,6 +836,9 @@ const buildAnnotationChatMessage = (input: {
     '',
     quoteForChat(quote.length > 0 ? quote : '(turn text unavailable)'),
     '',
+    ...(input.anchorText === undefined || input.anchorText.trim().length === 0
+      ? []
+      : ['Keyword / quote:', input.anchorText.trim(), '']),
     'Annotation:',
     input.note.trim(),
     '',
@@ -1614,6 +1618,7 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
           ...(request.sourceSelector === undefined
             ? {}
             : { sourceSelector: request.sourceSelector }),
+          ...(request.anchorText === undefined ? {} : { anchorText: request.anchorText }),
           note: request.note,
           capturedAt: request.capturedAt,
         });
@@ -1659,6 +1664,7 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
           text: buildAnnotationChatMessage({
             turnText: request.turnText,
             turnRole: request.turnRole,
+            ...(request.anchorText === undefined ? {} : { anchorText: request.anchorText }),
             note: request.note,
             capturedAt: request.capturedAt,
           }),

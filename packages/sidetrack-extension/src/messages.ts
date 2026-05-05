@@ -408,6 +408,10 @@ export type WorkboardRequest =
       // by matching textContent.
       readonly turnText: string;
       readonly sourceSelector?: string;
+      // Optional exact text inside the turn. When present, the live
+      // page anchor targets this keyword/quote instead of the whole
+      // turn block.
+      readonly anchorText?: string;
       readonly note: string;
       readonly capturedAt: string;
     }
@@ -416,6 +420,7 @@ export type WorkboardRequest =
       readonly threadUrl: string;
       readonly turnText: string;
       readonly turnRole: CaptureEvent['turns'][number]['role'];
+      readonly anchorText?: string;
       readonly note: string;
       readonly capturedAt: string;
     };
@@ -704,7 +709,8 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
       typeof value.turnText === 'string' &&
       typeof value.note === 'string' &&
       typeof value.capturedAt === 'string' &&
-      (value.sourceSelector === undefined || typeof value.sourceSelector === 'string')
+      (value.sourceSelector === undefined || typeof value.sourceSelector === 'string') &&
+      (value.anchorText === undefined || typeof value.anchorText === 'string')
     );
   }
 
@@ -714,6 +720,7 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
       typeof value.turnText === 'string' &&
       typeof value.note === 'string' &&
       typeof value.capturedAt === 'string' &&
+      (value.anchorText === undefined || typeof value.anchorText === 'string') &&
       (value.turnRole === 'user' ||
         value.turnRole === 'assistant' ||
         value.turnRole === 'system' ||

@@ -206,6 +206,7 @@ interface AnnotateTurnMessage {
   readonly threadUrl: string;
   readonly turnText: string;
   readonly sourceSelector?: string;
+  readonly anchorText?: string;
   readonly note: string;
   readonly capturedAt: string;
 }
@@ -220,7 +221,8 @@ const isAnnotateTurnMessage = (value: unknown): value is AnnotateTurnMessage =>
   'turnText' in value &&
   typeof (value as { turnText: unknown }).turnText === 'string' &&
   'note' in value &&
-  typeof (value as { note: unknown }).note === 'string';
+  typeof (value as { note: unknown }).note === 'string' &&
+  (!('anchorText' in value) || typeof (value as { anchorText?: unknown }).anchorText === 'string');
 
 const isContentRequest = (value: unknown): value is ContentRequest =>
   typeof value === 'object' &&
@@ -267,6 +269,7 @@ export default defineContentScript({
             liveAnchors.push({
               id: annotation.bac_id,
               rect: range.getBoundingClientRect(),
+              rects: Array.from(range.getClientRects()),
               note: annotation.note,
               quote: range.toString().slice(0, 280),
             });
@@ -290,6 +293,7 @@ export default defineContentScript({
       liveAnchors.push({
         id,
         rect: range.getBoundingClientRect(),
+        rects: Array.from(range.getClientRects()),
         ...(note === undefined ? {} : { note }),
         ...(quote === undefined ? {} : { quote }),
       });
@@ -440,6 +444,49 @@ export default defineContentScript({
       };
     };
 
+    const textNodesWithin = (root: Node): Text[] => {
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      const nodes: Text[] = [];
+      let current = walker.nextNode();
+      while (current !== null) {
+        nodes.push(current as Text);
+        current = walker.nextNode();
+      }
+      return nodes;
+    };
+
+    const rangeWithinElementByText = (root: HTMLElement, exactText: string): Range | null => {
+      const needle = exactText.trim();
+      if (needle.length === 0) {
+        return null;
+      }
+      const fullText = root.textContent ?? '';
+      let start = fullText.indexOf(needle);
+      if (start < 0) {
+        start = fullText.toLocaleLowerCase().indexOf(needle.toLocaleLowerCase());
+      }
+      if (start < 0) {
+        return null;
+      }
+      const end = start + needle.length;
+      const range = document.createRange();
+      let cursor = 0;
+      let started = false;
+      for (const node of textNodesWithin(root)) {
+        const next = cursor + node.data.length;
+        if (!started && start >= cursor && start <= next) {
+          range.setStart(node, start - cursor);
+          started = true;
+        }
+        if (started && end >= cursor && end <= next) {
+          range.setEnd(node, end - cursor);
+          return range;
+        }
+        cursor = next;
+      }
+      return null;
+    };
+
     const annotateTurnFromSidepanel = async (
       message: AnnotateTurnMessage,
     ): Promise<{
@@ -459,16 +506,26 @@ export default defineContentScript({
           error: `Could not locate that turn on the live page (${lookup.diagnostic}). Open devtools to inspect.`,
         };
       }
-      // Range over the entire turn element so the marker pins to the
-      // turn's visual block, not a sub-selection. Using textContent
-      // length keeps the range valid even when the turn contains
-      // mixed inline + block content.
       let range: Range;
       try {
-        range = document.createRange();
-        range.selectNodeContents(target);
+        if (message.anchorText !== undefined && message.anchorText.trim().length > 0) {
+          const keywordRange = rangeWithinElementByText(target, message.anchorText);
+          if (keywordRange === null) {
+            return {
+              ok: false,
+              error: `Could not locate "${message.anchorText.trim()}" inside the matched turn.`,
+            };
+          }
+          range = keywordRange;
+        } else {
+          // Range over the entire turn element so the marker pins to the
+          // turn's visual block when the user did not provide a precise
+          // keyword/quote target.
+          range = document.createRange();
+          range.selectNodeContents(target);
+        }
       } catch {
-        return { ok: false, error: 'Failed to build a Range over the turn element.' };
+        return { ok: false, error: 'Failed to build an annotation range on the live page.' };
       }
       let anchor;
       try {
@@ -484,7 +541,8 @@ export default defineContentScript({
       // popover shows what's actually under the marker (vs the
       // markdown turn body, which has formatting decorations).
       const optimisticId = `local-turn-${String(Date.now())}`;
-      const liveQuote = target.textContent.trim().slice(0, 280);
+      const liveQuote =
+        range.toString().trim().slice(0, 280) || target.textContent.trim().slice(0, 280);
       addLiveAnnotation(optimisticId, range, message.note, liveQuote);
 
       // Best-effort persist via the existing AnnotationClient. The

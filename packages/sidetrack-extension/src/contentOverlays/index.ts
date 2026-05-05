@@ -66,6 +66,14 @@ const OVERLAY_CSS = `
 .sidetrack-ann-margin .dot {
   width: 6px; height: 6px; border-radius: 50%; background: var(--signal);
 }
+.sidetrack-ann-highlight {
+  position: fixed;
+  border-radius: 4px;
+  background: rgba(254, 215, 170, 0.55);
+  box-shadow: inset 0 0 0 1px rgba(194, 65, 12, 0.38);
+  mix-blend-mode: multiply;
+  pointer-events: none;
+}
 .sidetrack-ann-hint {
   position: fixed;
   bottom: 18px;
@@ -433,7 +441,9 @@ const ensureOverlayInfra = (): HTMLElement => {
 };
 
 const clearAnnotationMarkers = (root: HTMLElement): void => {
-  for (const node of root.querySelectorAll('.sidetrack-ann-margin, .sidetrack-ann-hint')) {
+  for (const node of root.querySelectorAll(
+    '.sidetrack-ann-highlight, .sidetrack-ann-margin, .sidetrack-ann-hint',
+  )) {
     node.remove();
   }
 };
@@ -441,6 +451,7 @@ const clearAnnotationMarkers = (root: HTMLElement): void => {
 export interface RestoredAnchor {
   readonly id: string;
   readonly rect: DOMRect;
+  readonly rects?: readonly DOMRect[];
   // Note + quote enable click-to-reveal on the margin marker. Both
   // are optional so the legacy code paths that mount markers
   // without note context (e.g. transient session-only markers
@@ -463,6 +474,25 @@ export const mountAnnotationOverlay = (anchors: readonly RestoredAnchor[]): void
     1,
   );
   for (const anchor of anchors) {
+    const highlightRects = anchor.rects ?? [anchor.rect];
+    for (const [index, rect] of highlightRects.entries()) {
+      if (rect.width <= 0 || rect.height <= 0) {
+        continue;
+      }
+      const highlight = document.createElement('div');
+      highlight.className = 'sidetrack-ann-highlight';
+      highlight.dataset.annId = anchor.id;
+      highlight.dataset.annRect = String(index);
+      if (anchor.quote !== undefined && anchor.quote.length > 0) {
+        highlight.title = anchor.quote;
+      }
+      highlight.style.left = `${String(Math.round(rect.left))}px`;
+      highlight.style.top = `${String(Math.round(rect.top))}px`;
+      highlight.style.width = `${String(Math.round(rect.width))}px`;
+      highlight.style.height = `${String(Math.round(rect.height))}px`;
+      root.appendChild(highlight);
+    }
+
     const marker = document.createElement('div');
     marker.className = 'sidetrack-ann-margin';
     const rectTop = anchor.rect.top + window.scrollY;
