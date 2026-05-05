@@ -112,6 +112,16 @@ export const messageTypes = {
   // bypass that block. The SW returns the parsed RankedItem[] so
   // the popover can render titles and scores.
   recallQuery: 'sidetrack.recall.query',
+  // Side panel asks the chat tab to drop a margin annotation onto
+  // a captured turn — without forcing the user to re-select text on
+  // the live page or reload it. Background relays to the tab whose
+  // canonical URL matches `threadUrl`. The content script locates
+  // the turn (sourceSelector → text-quote fallback), builds a Range,
+  // mounts the optimistic margin marker, and persists via the
+  // existing AnnotationClient. Response carries the SerializedAnchor
+  // that was actually used so the side panel can show the same
+  // anchor in any subsequent UI.
+  annotateTurn: 'sidetrack.annotation.turn.create',
 } as const;
 
 export interface SelectorCanaryReport {
@@ -383,6 +393,18 @@ export type WorkboardRequest =
       // already reading (no point in saying "you've seen this before"
       // about the page in front of them).
       readonly currentUrl?: string;
+    }
+  | {
+      readonly type: typeof messageTypes.annotateTurn;
+      readonly threadUrl: string;
+      // First few hundred chars of the turn body. Used as the text
+      // quote when sourceSelector misses (turn DOM was re-rendered,
+      // selector drifted) so the content script can still re-anchor
+      // by matching textContent.
+      readonly turnText: string;
+      readonly sourceSelector?: string;
+      readonly note: string;
+      readonly capturedAt: string;
     };
 
 export type RuntimeRequest =
@@ -664,8 +686,31 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
     );
   }
 
+  if (hasType(value, messageTypes.annotateTurn)) {
+    return (
+      typeof value.threadUrl === 'string' &&
+      typeof value.turnText === 'string' &&
+      typeof value.note === 'string' &&
+      typeof value.capturedAt === 'string' &&
+      (value.sourceSelector === undefined || typeof value.sourceSelector === 'string')
+    );
+  }
+
   return false;
 };
+
+// Sidepanel-facing reply for annotateTurn. Carried out-of-band of
+// RuntimeResponse for the same reason RecallQueryResponse is — it has
+// no WorkboardState attached. The side panel casts the
+// chrome.runtime.sendMessage reply at the call site.
+export interface AnnotateTurnResponse {
+  readonly ok: boolean;
+  readonly error?: string;
+  // bac_id of the persisted annotation when companion was reachable.
+  // Optional because content-script will still mount an optimistic
+  // marker even if the persist call fails.
+  readonly annotationId?: string;
+}
 
 export const isRuntimeResponse = (value: unknown): value is RuntimeResponse => {
   if (!isRecord(value) || typeof value.ok !== 'boolean') {

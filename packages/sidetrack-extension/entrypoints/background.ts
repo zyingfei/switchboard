@@ -37,6 +37,7 @@ import {
   isContentResponse,
   isRuntimeRequest,
   messageTypes,
+  type AnnotateTurnResponse,
   type RecallQueryResponse,
   type RuntimeRequest,
   type RuntimeResponse,
@@ -1506,6 +1507,64 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
       }
     };
     return (await buildRecallResponse()) as unknown as RuntimeResponse;
+  }
+
+  if (request.type === messageTypes.annotateTurn) {
+    // Side-panel-driven turn annotation. We identify the chat tab by
+    // canonical URL match — provider SPAs add ?session=… and other
+    // drift to the live URL that's not on the captured threadUrl, so
+    // strict equality misses. The tab's content script does the
+    // actual work (locate the turn, anchor, persist, mount marker)
+    // and returns AnnotateTurnResponse, which we tunnel through
+    // RuntimeResponse the same way recallQuery does.
+    const buildAnnotateResponse = async (): Promise<AnnotateTurnResponse> => {
+      try {
+        const targetCanonical = canonicalThreadUrl(request.threadUrl);
+        const allTabs = await chrome.tabs.query({});
+        const match = allTabs.find(
+          (tab) =>
+            typeof tab.url === 'string' &&
+            tab.id !== undefined &&
+            canonicalThreadUrl(tab.url) === targetCanonical,
+        );
+        if (match?.id === undefined) {
+          return {
+            ok: false,
+            error:
+              'Open the chat tab in this window first — the annotation marker has to land on a live page.',
+          };
+        }
+        const result = await sendToContentScriptWithRecovery(match.id, {
+          type: messageTypes.annotateTurn,
+          threadUrl: request.threadUrl,
+          turnText: request.turnText,
+          ...(request.sourceSelector === undefined
+            ? {}
+            : { sourceSelector: request.sourceSelector }),
+          note: request.note,
+          capturedAt: request.capturedAt,
+        });
+        if (!result.ok) {
+          return { ok: false, error: result.error ?? 'Tab is not reachable.' };
+        }
+        const data = result.data;
+        if (
+          data !== null &&
+          typeof data === 'object' &&
+          'ok' in data &&
+          typeof data.ok === 'boolean'
+        ) {
+          return data as AnnotateTurnResponse;
+        }
+        return { ok: false, error: 'Content script returned an unexpected shape.' };
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : 'annotateTurn relay failed.',
+        };
+      }
+    };
+    return (await buildAnnotateResponse()) as unknown as RuntimeResponse;
   }
 
   if (request.type === messageTypes.focusThreadInSidePanel) {

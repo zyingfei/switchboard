@@ -17,6 +17,7 @@ import {
   isFocusThreadInSidePanelMessage,
   isWorkboardChangedMessage,
   messageTypes,
+  type AnnotateTurnResponse,
   type RuntimeResponse,
   type WorkboardRequest,
 } from '../../src/messages';
@@ -941,6 +942,16 @@ const App = () => {
   const [inlineTurnsByUrl, setInlineTurnsByUrl] = useState<
     ReadonlyMap<string, readonly CapturedTurnRecord[]>
   >(() => new Map<string, readonly CapturedTurnRecord[]>());
+  // Inline per-turn annotation composer state. Only one turn is open
+  // for annotation at a time across the side panel — saving or
+  // cancelling clears it. We key by `${threadUrl}::${ordinal}` so
+  // re-collapsing and re-expanding the same thread doesn't drop a
+  // half-typed note.
+  const [annotateTurnKey, setAnnotateTurnKey] = useState<string | null>(null);
+  const [annotateTurnDraft, setAnnotateTurnDraft] = useState('');
+  const [annotateTurnStatus, setAnnotateTurnStatus] = useState<
+    { readonly key: string; readonly tone: 'saving' | 'ok' | 'error'; readonly text: string } | null
+  >(null);
   // Refs to thread row DOM elements, keyed by bac_id, so the
   // chat-side focus button can scrollIntoView + flash the matching
   // row. Map mutated via the ref callback below.
@@ -1673,6 +1684,63 @@ const App = () => {
       });
       return next;
     });
+  };
+
+  const submitTurnAnnotation = (
+    threadUrl: string,
+    turn: CapturedTurnRecord,
+    key: string,
+  ): void => {
+    const note = annotateTurnDraft.trim();
+    if (note.length === 0) {
+      return;
+    }
+    setAnnotateTurnStatus({ key, tone: 'saving', text: 'placing marker on the live page…' });
+    void (async () => {
+      try {
+        const response: AnnotateTurnResponse = await chrome.runtime.sendMessage({
+          type: messageTypes.annotateTurn,
+          threadUrl,
+          turnText: turn.text,
+          ...(turn.sourceSelector === undefined
+            ? {}
+            : { sourceSelector: turn.sourceSelector }),
+          note,
+          capturedAt: new Date().toISOString(),
+        });
+        if (!response.ok) {
+          setAnnotateTurnStatus({
+            key,
+            tone: 'error',
+            text: response.error ?? 'Could not place the marker.',
+          });
+          return;
+        }
+        setAnnotateTurnDraft('');
+        setAnnotateTurnKey(null);
+        // Surface a soft success line so the user can confirm the
+        // marker landed even though the side panel doesn't show the
+        // live page. The fallback message ("kept in this session
+        // only") flows through here when companion persistence fails
+        // but the in-page marker still mounted.
+        setAnnotateTurnStatus({
+          key,
+          tone: response.error === undefined ? 'ok' : 'error',
+          text: response.error ?? 'marker placed on live page',
+        });
+        window.setTimeout(() => {
+          setAnnotateTurnStatus((current) =>
+            current !== null && current.key === key ? null : current,
+          );
+        }, 4_000);
+      } catch (error) {
+        setAnnotateTurnStatus({
+          key,
+          tone: 'error',
+          text: error instanceof Error ? error.message : 'annotateTurn failed.',
+        });
+      }
+    })();
   };
 
   const toggleThreadHistory = (threadId: string) => {
@@ -2896,24 +2964,86 @@ const App = () => {
                 no captured turns for this thread (companion may be unreachable)
               </div>
             ) : (
-              inlineTurns.map((turn) => (
-                <div
-                  key={`${turn.role}-${String(turn.ordinal)}-${turn.capturedAt}`}
-                  className={'thread-turn-card thread-turn-' + turn.role}
-                >
-                  <span className="thread-turn-role mono">{turn.role}</span>
-                  <span className="thread-turn-text">
-                    <TurnText text={turn.text} maxChars={200} />
-                  </span>
-                  {/* No per-turn time stamp: providers don't expose
-                      stable per-message timestamps in their DOM, and
-                      capturedAt is "first seen by Sidetrack" not
-                      "AI replied at" — showing it as "X min ago"
-                      misleads users who captured the chat after the
-                      conversation. The thread-level "Last seen · X
-                      ago" already conveys the right signal. */}
-                </div>
-              ))
+              inlineTurns.map((turn) => {
+                const turnKey = `${thread.threadUrl}::${String(turn.ordinal)}::${turn.role}`;
+                const annotateOpen = annotateTurnKey === turnKey;
+                const status =
+                  annotateTurnStatus !== null && annotateTurnStatus.key === turnKey
+                    ? annotateTurnStatus
+                    : null;
+                return (
+                  <div
+                    key={`${turn.role}-${String(turn.ordinal)}-${turn.capturedAt}`}
+                    className={'thread-turn-card thread-turn-' + turn.role}
+                  >
+                    <span className="thread-turn-role mono">{turn.role}</span>
+                    <span className="thread-turn-text">
+                      <TurnText text={turn.text} maxChars={200} />
+                    </span>
+                    <button
+                      type="button"
+                      className="thread-turn-annotate-btn mono"
+                      title="Drop a margin annotation on this turn — appears on the live page without reload"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (annotateOpen) {
+                          setAnnotateTurnKey(null);
+                          setAnnotateTurnDraft('');
+                          return;
+                        }
+                        setAnnotateTurnKey(turnKey);
+                        setAnnotateTurnDraft('');
+                        setAnnotateTurnStatus(null);
+                      }}
+                    >
+                      {annotateOpen ? '× cancel' : '✎ annotate'}
+                    </button>
+                    {annotateOpen ? (
+                      <form
+                        className="thread-turn-annotate-form"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                        }}
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          submitTurnAnnotation(thread.threadUrl, turn, turnKey);
+                        }}
+                      >
+                        <textarea
+                          className="thread-turn-annotate-input"
+                          rows={2}
+                          autoFocus
+                          placeholder="What's worth flagging on this turn? (saves a margin marker on the live page)"
+                          value={annotateTurnDraft}
+                          onChange={(e) => {
+                            setAnnotateTurnDraft(e.target.value);
+                          }}
+                        />
+                        <div className="thread-turn-annotate-row">
+                          <span
+                            className={
+                              'thread-turn-annotate-status mono' +
+                              (status === null ? '' : ' tone-' + status.tone)
+                            }
+                          >
+                            {status?.text ?? ''}
+                          </span>
+                          <button
+                            type="submit"
+                            className="btn-link mono"
+                            disabled={
+                              annotateTurnDraft.trim().length === 0 ||
+                              (status?.tone ?? '') === 'saving'
+                            }
+                          >
+                            {(status?.tone ?? '') === 'saving' ? 'placing…' : 'place marker'}
+                          </button>
+                        </div>
+                      </form>
+                    ) : null}
+                  </div>
+                );
+              })
             )}
           </div>
         ) : null}

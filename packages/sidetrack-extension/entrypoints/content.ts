@@ -193,6 +193,27 @@ const isAutoSendItemMessage = (value: unknown): value is AutoSendItemMessage =>
   'text' in value &&
   typeof (value as { text: unknown }).text === 'string';
 
+interface AnnotateTurnMessage {
+  readonly type: typeof messageTypes.annotateTurn;
+  readonly threadUrl: string;
+  readonly turnText: string;
+  readonly sourceSelector?: string;
+  readonly note: string;
+  readonly capturedAt: string;
+}
+
+const isAnnotateTurnMessage = (value: unknown): value is AnnotateTurnMessage =>
+  typeof value === 'object' &&
+  value !== null &&
+  'type' in value &&
+  value.type === messageTypes.annotateTurn &&
+  'threadUrl' in value &&
+  typeof (value as { threadUrl: unknown }).threadUrl === 'string' &&
+  'turnText' in value &&
+  typeof (value as { turnText: unknown }).turnText === 'string' &&
+  'note' in value &&
+  typeof (value as { note: unknown }).note === 'string';
+
 const isContentRequest = (value: unknown): value is ContentRequest =>
   typeof value === 'object' &&
   value !== null &&
@@ -253,6 +274,112 @@ export default defineContentScript({
       // load (mountAnnotationOverlay clears + re-renders).
       liveAnchors.push({ id, rect: range.getBoundingClientRect() });
       mountAnnotationOverlay(liveAnchors);
+    };
+
+    // Find the turn element on this page using the captured selector
+    // first, then fall back to a textContent search using the head of
+    // the captured turn body. The fallback exists because provider
+    // chat pages re-render aggressively (Claude / Gemini Angular,
+    // ChatGPT React) — the same turn keeps the same text but its DOM
+    // path can drift mid-session.
+    const findTurnElementOnPage = (
+      sourceSelector: string | undefined,
+      turnText: string,
+    ): HTMLElement | null => {
+      if (sourceSelector !== undefined && sourceSelector.length > 0) {
+        try {
+          const direct = document.querySelector(sourceSelector);
+          if (direct instanceof HTMLElement) {
+            return direct;
+          }
+        } catch {
+          // Selector is provider-supplied — silently fall back rather
+          // than throw on an unsupported pseudo-class.
+        }
+      }
+      // Trim the turn body and pick a stable head of ~60 chars to
+      // search for. Anything shorter risks matching a sub-phrase that
+      // appears in many turns (e.g. "Sure, here's…"); anything longer
+      // breaks if the turn was lightly edited or images/markdown got
+      // stripped during extraction.
+      const probe = turnText.trim().slice(0, 80);
+      if (probe.length < 12) {
+        return null;
+      }
+      const turnSelector = turnSelectorForCurrentProvider();
+      const candidates =
+        turnSelector === null ? [] : Array.from(document.querySelectorAll(turnSelector));
+      for (const node of candidates) {
+        if (node instanceof HTMLElement && node.textContent.includes(probe)) {
+          return node;
+        }
+      }
+      return null;
+    };
+
+    const annotateTurnFromSidepanel = async (
+      message: AnnotateTurnMessage,
+    ): Promise<{ readonly ok: boolean; readonly error?: string; readonly annotationId?: string }> => {
+      const target = findTurnElementOnPage(message.sourceSelector, message.turnText);
+      if (target === null) {
+        return {
+          ok: false,
+          error:
+            'Could not locate that turn on the live page — it may have been edited or scrolled out of the rendered DOM.',
+        };
+      }
+      // Range over the entire turn element so the marker pins to the
+      // turn's visual block, not a sub-selection. Using textContent
+      // length keeps the range valid even when the turn contains
+      // mixed inline + block content.
+      let range: Range;
+      try {
+        range = document.createRange();
+        range.selectNodeContents(target);
+      } catch {
+        return { ok: false, error: 'Failed to build a Range over the turn element.' };
+      }
+      let anchor;
+      try {
+        anchor = serializeAnchor(range);
+      } catch {
+        return { ok: false, error: 'Failed to serialize the turn anchor.' };
+      }
+      // Optimistic marker first — even if persistence fails, the
+      // user gets immediate visual confirmation that their note
+      // landed on the right turn. Local id stays unique enough to
+      // not collide with persisted bac_ids.
+      const optimisticId = `local-turn-${String(Date.now())}`;
+      addLiveAnnotation(optimisticId, range);
+
+      // Best-effort persist via the existing AnnotationClient. The
+      // sidepanel could persist instead, but doing it here keeps the
+      // anchor and persist call together so they can't drift out of
+      // sync (sidepanel sees a different anchor than what got mounted).
+      try {
+        const client = await createAnnotationClient();
+        if (client === undefined) {
+          return {
+            ok: true,
+            error: 'Companion not configured — annotation kept in this session only.',
+          };
+        }
+        const persisted = await client.createAnnotation({
+          url: message.threadUrl,
+          pageTitle: document.title,
+          anchor,
+          note: message.note,
+        });
+        return { ok: true, annotationId: persisted.bac_id };
+      } catch (error) {
+        return {
+          ok: true,
+          error:
+            error instanceof Error
+              ? `${error.message} (annotation kept in this session only.)`
+              : 'Persist failed — annotation kept in this session only.',
+        };
+      }
     };
 
     // Déjà-vu pop-on-highlight — debounced selection listener that
@@ -609,7 +736,12 @@ export default defineContentScript({
       (
         message: unknown,
         _sender,
-        sendResponse: (response: ContentResponse | AutoSendResult) => void,
+        sendResponse: (
+          response:
+            | ContentResponse
+            | AutoSendResult
+            | { readonly ok: boolean; readonly error?: string; readonly annotationId?: string },
+        ) => void,
       ) => {
         if (isContentRequest(message)) {
           try {
@@ -633,6 +765,19 @@ export default defineContentScript({
               sendResponse({
                 ok: false,
                 error: error instanceof Error ? error.message : 'auto-send failed.',
+              });
+            });
+          return true;
+        }
+        if (isAnnotateTurnMessage(message)) {
+          annotateTurnFromSidepanel(message)
+            .then((result) => {
+              sendResponse(result);
+            })
+            .catch((error: unknown) => {
+              sendResponse({
+                ok: false,
+                error: error instanceof Error ? error.message : 'annotateTurn failed.',
               });
             });
           return true;
