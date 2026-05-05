@@ -136,79 +136,53 @@ The script also opens CDP, watches for the extension service worker,
 and writes its ID to `.output/cdp-extension-id`. **Leave this script
 running** — closing the Chrome window (Cmd-Q) stops it.
 
-### 3.3 Sign in to providers (the **passkey** problem)
-
-This is the step that breaks first when an agent tries to run the
-e2e on a fresh machine. **chatgpt.com (Google OAuth) requires a
-WebAuthn passkey** that is device-bound — Touch ID, a hardware
-security key, or a phone-as-passkey. A coding agent on a remote
-machine has none of these, so the OAuth flow stalls forever.
-
-There is no fully-automatic workaround. Pick whichever applies:
-
-**A. Human signs in once per machine** (recommended for a human
-operator + agent on the same machine).
+### 3.3 Sign in to providers (one-time per machine)
 
 The user-data-dir at `~/.sidetrack-test-profile` persists cookies
-and Google session tokens between launches. After one successful
-sign-in (Touch ID at the right moment), subsequent
-`npm run e2e:chrome-debug` runs reuse the session for weeks.
+and session tokens. Sign in once with a human at the keyboard and
+all later runs — including agent-driven ones — reuse the session.
 
 ```bash
-# On the machine that has the passkey hardware:
 npm run e2e:chrome-debug
-# → in the launched window, sign in to chatgpt.com / claude.ai /
-#   gemini.google.com once. Cmd-Q when done.
-# All later runs (including agents) skip sign-in entirely.
+# In the launched window, sign in to chatgpt.com / claude.ai /
+# gemini.google.com (Touch ID / passkey at the prompt). Cmd-Q when
+# done. The next run skips the login.
 ```
 
-**B. Transfer a signed-in profile between machines.**
-
-If the agent needs to run on a host that can't host a passkey, copy
-the entire user-data-dir from a host that can:
-
-```bash
-# On host with the passkey (after one sign-in):
-tar czf sidetrack-test-profile.tar.gz -C ~ .sidetrack-test-profile
-
-# Transfer the tarball to the target host. Then on the target:
-tar xzf sidetrack-test-profile.tar.gz -C ~
-npm run e2e:chrome-debug   # cookies + session carry across
-```
-
-Caveat: Google's session-binding (device-bound credentials, DBSC)
-will sometimes invalidate the moved cookies and re-prompt for the
-passkey. If that happens, fall back to (A) on each host, or use (C).
-
-**C. Use providers that don't require a hardware passkey.**
-
-The e2e demonstrates the flow with a ChatGPT thread, but the
-extension also captures from claude.ai (email magic link) and from
-the OpenAI-Codex web UI. If the only obstacle is Google's passkey,
-point `SIDETRACK_TARGET_URL` at a `claude.ai` thread instead — the
-script will navigate there and the rest of the pipeline is identical.
-
-```bash
-SIDETRACK_TARGET_URL=https://claude.ai/chat/<id> \
-  node packages/sidetrack-extension/scripts/codex-real-e2e.mjs
-```
-
-**Don't try to automate the passkey itself.** Google detects and
-blocks scripted WebAuthn responses; bypassing them is bot-detection
-evasion, not a fix. The user-data-dir reuse pattern above is the
-sanctioned path.
-
-If you want to script the sign-in step interactively (a window that
-stays open while you complete the passkey, instead of timing out),
-use:
+If you also want to script Playwright while keeping the same
+profile — useful when you're hand-completing a passkey and don't
+want a CDP-attached run fighting the login UI:
 
 ```bash
 node scripts/login-test-profile.mjs
 ```
 
-This launches Playwright with the same extension and user-data-dir
-as `e2e:chrome-debug`, but without the CDP port — handy because the
-profile is identical and a CDP-attached run won't fight the login UI.
+**Setting up an agent on a second machine.** Two practical options:
+
+1. **Human signs in once on each machine.** The profile is per-host
+   (it lives under `$HOME`), so a Touch ID prompt on the new host
+   is the simplest unblock.
+2. **Carry the profile across.** Tar the working profile and
+   restore it on the target:
+   ```bash
+   # source machine (has working sign-in):
+   tar czf sidetrack-test-profile.tar.gz -C ~ .sidetrack-test-profile
+   # target machine:
+   tar xzf sidetrack-test-profile.tar.gz -C ~
+   npm run e2e:chrome-debug
+   ```
+   Google's session-binding (DBSC) sometimes invalidates moved
+   cookies and re-prompts for the passkey on first navigation —
+   if that happens, just complete the prompt once on the target.
+
+If a particular host can't host a passkey at all, the e2e accepts a
+non-Google provider via `SIDETRACK_TARGET_URL` (claude.ai uses email
+magic links, no hardware key needed):
+
+```bash
+SIDETRACK_TARGET_URL=https://claude.ai/chat/<id> \
+  node packages/sidetrack-extension/scripts/codex-real-e2e.mjs
+```
 
 ### 3.4 Verify the extension is loaded
 
