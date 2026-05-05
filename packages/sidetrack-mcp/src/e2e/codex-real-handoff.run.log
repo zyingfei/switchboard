@@ -1,0 +1,57 @@
+
+[1.nav] tab url: https://chatgpt.com/c/69fa10f8-ae00-8330-a104-ee21469af0e0
+
+[1.nav] tab loaded with 7 message turns
+
+[2.capture] focusing target tab + window, then sending captureCurrentTab from side panel context
+
+[2.capture] capture response keys: ok,state ok: true
+
+[2.capture] thread bac_id: 2ZRHJ5ZHV9TDTT3A
+
+[3.mcp] starting sidetrack-mcp on ws://127.0.0.1:8786/mcp
+  [mcp.err] sidetrack-mcp websocket listening on ws://127.0.0.1:8786/mcp
+
+[3.mcp] MCP listening
+
+[4.prompt] lean prompt length: 512 chars (no chat URL, no provider, no turn snapshot)
+
+[5.parse] agent parsed: thread_id=2ZRHJ5ZHV9TDTT3A endpoint=ws://127.0.0.1:8786/mcp?token=Xnr-n2HC2Q…
+
+[5.connect] MCP client connected
+
+[6.tools/list] calling tools/list
+
+[6.tools/list] advertised: 30 tools
+  sample: bac.recent_threads, bac.workstream, bac.context_pack, bac.search, bac.queued_items, bac.inbound_reminders, bac.coding_sessions, bac.coding_session_register
+  ...
+
+[6.read_thread_md] bac.read_thread_md(2ZRHJ5ZHV9TDTT3A)
+  vault path: /Users/yingfei/Documents/Sidetrack-vault/_BAC/threads/2ZRHJ5ZHV9TDTT3A.md
+  header content len: 407
+  header preview: "---\nbac_id: 2ZRHJ5ZHV9TDTT3A\nrevision: W0B3HMPB5TBFTP5Y3C65\nkind: thread\ntitle: Heap rank algorithm\nprovider: chatgpt\nurl: \"https://chatgpt.com/c/69fa10f8-ae00-8330-a104-ee21469af0e0\"\nstatus: active\nt"
+
+[6.turns] bac.turns — captured-turn payload for the thread
+  turn count: 6
+  first role: user len: 39
+  first preview: "what's the b* algorithm to do heap rank"
+  last role: assistant len: 2970
+
+[6.list_dispatches] bac.list_dispatches(limit=5)
+  count: 5
+  first: {"bac_id":"disp_TRY967K7R9XR54MQSNQN","kind":"research","target":{"provider":"gemini","mode":"auto-send"},"sourceThreadId":"JXPENZV4DM3QQK22","title":"Test Message Response","body":"# Context from ano
+
+[6.recall] bac.recall — agent finds related threads using a snippet from a captured turn
+  query: "what's the b* algorithm to do heap rank"
+  related-thread count: 5
+  [0] score=1.000 title=Heap rank algorithm threadId=2ZRHJ5ZHV9TDTT3A
+  [1] score=0.918 title=Heap rank algorithm threadId=2ZRHJ5ZHV9TDTT3A
+  [2] score=0.865 title=Heap rank algorithm threadId=2ZRHJ5ZHV9TDTT3A
+
+[6.list_annotations] bac.list_annotations(url=...)
+  annotation count: 0
+
+[6.queue_item] agent writes back: bac.queue_item with a follow-up note
+  queue item bac_id: WKRYAJM01KM6FPJF
+
+[DONE] ✓ all steps green; queue item bac_id: WKRYAJM01KM6FPJF

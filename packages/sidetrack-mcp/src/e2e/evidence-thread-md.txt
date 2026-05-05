@@ -1,0 +1,16 @@
+---
+bac_id: 2ZRHJ5ZHV9TDTT3A
+revision: W0B3HMPB5TBFTP5Y3C65
+kind: thread
+title: Heap rank algorithm
+provider: chatgpt
+url: "https://chatgpt.com/c/69fa10f8-ae00-8330-a104-ee21469af0e0"
+status: active
+trackingMode: manual
+lastSeenAt: "2026-05-05T15:59:27.316Z"
+tags: []
+updatedAt: "2026-05-05T15:59:27.884Z"
+---
+# Heap rank algorithm
+
+[Open thread](https://chatgpt.com/c/69fa10f8-ae00-8330-a104-ee21469af0e0)
