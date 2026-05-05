@@ -1,4 +1,6 @@
 import type { CaptureEvent, CapturedTurn, ProviderId, SelectorCanary } from '../companion/model';
+
+import { enrichTurn } from './turnEnricher';
 import {
   elementsForSelector,
   normalizeText,
@@ -30,6 +32,10 @@ interface CandidateTurn {
   text: string;
   formattedText: string;
   sourceSelector: string;
+  // Source DOM element kept around for the enrichment pass
+  // (markdown / model name / reasoning / images / research mode).
+  // Optional because fallback / synthesized turns may not have one.
+  element?: Element;
 }
 
 interface ElementCandidate {
@@ -156,6 +162,7 @@ const createCandidateTurn = (
     text,
     formattedText,
     sourceSelector,
+    element,
   };
 };
 
@@ -329,6 +336,7 @@ const finalizeTurns = (
   maxChars: number,
   config: ProviderExtractionConfig,
   capturedAt: string,
+  doc?: Document,
 ): CapturedTurn[] => {
   // Adjacent same-role merging is enough — never dedupe by text
   // globally. Two distinct assistant turns that happen to share text
@@ -341,6 +349,18 @@ const finalizeTurns = (
     if (!text) {
       continue;
     }
+    // Provider-specific enrichment fills in markdown / modelName /
+    // reasoning / attachments / researchReport. Each provider's
+    // extractor is opt-in; missing signals are simply omitted.
+    const enrichment =
+      turn.element !== undefined && doc !== undefined
+        ? enrichTurn({
+            provider: config.provider,
+            turnNode: turn.element,
+            role: turn.role,
+            doc,
+          })
+        : {};
     finalized.push({
       role: turn.role,
       text,
@@ -348,6 +368,13 @@ const finalizeTurns = (
       ordinal: finalized.length,
       capturedAt,
       sourceSelector: turn.sourceSelector,
+      ...(enrichment.modelName === undefined ? {} : { modelName: enrichment.modelName }),
+      ...(enrichment.markdown === undefined ? {} : { markdown: enrichment.markdown }),
+      ...(enrichment.reasoning === undefined ? {} : { reasoning: enrichment.reasoning }),
+      ...(enrichment.attachments === undefined ? {} : { attachments: enrichment.attachments }),
+      ...(enrichment.researchReport === undefined
+        ? {}
+        : { researchReport: enrichment.researchReport }),
     });
   }
   return finalized;
@@ -512,6 +539,7 @@ export const captureVisibleConversation = (
     maxChars,
     config,
     capturedAt,
+    doc,
   );
   if (turns.length === 0) {
     // Fallback grabs visible text from <main>/<body>. On real provider

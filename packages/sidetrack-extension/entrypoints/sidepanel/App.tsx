@@ -2320,6 +2320,19 @@ const App = () => {
                 : workstreamPath(thread.primaryWorkstreamId, state.workstreams)}
             </button>
           ) : null}
+          {/* Model badge — populated by the per-turn enricher
+              (turnEnricher.ts) when the provider's model picker is
+              scrapeable. Surface as an inline pill so users can see
+              "this thread was talking to GPT-5.1 Pro" without opening
+              the dispatch confirm. Click is a no-op pure label. */}
+          {thread.selectedModel !== undefined && thread.selectedModel.length > 0 ? (
+            <span
+              className="thread-model-pill mono"
+              title={`Model captured at last turn: ${thread.selectedModel}`}
+            >
+              {thread.selectedModel}
+            </span>
+          ) : null}
           {/* Auto-send state pill — moved out of .thread-actions
               (the absolute-positioned action strip at top-right)
               into the lifecycle row so it stops crowding the icons.

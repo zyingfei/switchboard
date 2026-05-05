@@ -85,6 +85,37 @@ export const captureEventSchema = z.object({
       ordinal: z.number().int().nonnegative(),
       capturedAt: isoDateTimeSchema,
       sourceSelector: z.string().min(1).optional(),
+      // Per-turn enrichment from `turnEnricher.ts` (extension side).
+      // Each field is optional because providers expose different
+      // signals — and we'd rather drop a field than reject the
+      // whole event when an extractor regresses.
+      modelName: z.string().min(1).max(120).optional(),
+      markdown: z.string().min(1).optional(),
+      reasoning: z.string().min(1).optional(),
+      attachments: z
+        .array(
+          z.object({
+            kind: z.enum(['image', 'upload', 'artifact', 'tool']),
+            url: z.string().min(1).optional(),
+            alt: z.string().max(500).optional(),
+            mimeType: z.string().max(120).optional(),
+          }),
+        )
+        .optional(),
+      researchReport: z
+        .object({
+          mode: z.enum(['deep-research', 'gemini-deep-research', 'unknown']),
+          citations: z
+            .array(
+              z.object({
+                source: z.string().min(1),
+                url: z.string().min(1).optional(),
+              }),
+            )
+            .optional(),
+          sections: z.array(z.string().min(1)).optional(),
+        })
+        .optional(),
     }),
   ),
 });
