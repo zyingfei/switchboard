@@ -1,10 +1,36 @@
+import type { RecallActivityReport } from '../recall/activity.js';
+
+export interface CaptureProviderHealth {
+  readonly provider: string;
+  readonly lastCaptureAt: string | null;
+  readonly lastStatus: 'ok' | 'warning' | 'failed' | null;
+  readonly ok24h: number;
+  readonly warn24h: number;
+  readonly fail24h: number;
+  readonly warning?: string;
+}
+
+export interface CaptureWarningHealth {
+  readonly provider: string;
+  readonly capturedAt: string;
+  readonly code: string;
+  readonly message: string;
+  readonly severity: 'info' | 'warning';
+}
+
 export interface HealthReport {
   readonly uptimeSec: number;
-  readonly vault: { readonly root: string; readonly writable: boolean; readonly sizeBytes: number | null };
+  readonly vault: {
+    readonly root: string;
+    readonly writable: boolean;
+    readonly sizeBytes: number | null;
+  };
   readonly capture: {
     readonly lastByProvider: Record<string, string | null>;
     readonly queueDepthHint: number | null;
     readonly droppedHint: number | null;
+    readonly providers?: readonly CaptureProviderHealth[];
+    readonly recentWarnings?: readonly CaptureWarningHealth[];
   };
   readonly recall: {
     readonly indexExists: boolean;
@@ -25,6 +51,7 @@ export interface HealthReport {
     readonly rebuildTotal?: number;
     readonly embedderDevice?: 'cpu' | 'wasm' | 'webgpu' | 'unknown';
     readonly embedderAccelerator?: 'accelerate' | 'mkl' | 'cpu' | 'unknown';
+    readonly activity?: RecallActivityReport;
   };
   readonly service: { readonly installed: boolean; readonly running: boolean };
 }

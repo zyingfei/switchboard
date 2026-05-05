@@ -107,14 +107,18 @@ const installChromeMock = (
   state: WorkboardState,
   storageValues: Record<string, unknown> = {},
   activeTabUrl?: string,
+  recallResponse: unknown = { ok: true, items: [] },
 ) => {
-  const sendMessage = vi.fn((request: WorkboardRequest) =>
-    Promise.resolve({
+  const sendMessage = vi.fn((request: WorkboardRequest | { readonly type?: unknown }) => {
+    if (request.type === messageTypes.recallQuery) {
+      return Promise.resolve(recallResponse);
+    }
+    return Promise.resolve({
       ok: true,
       state,
       request,
-    }),
-  );
+    });
+  });
   const localValues: Record<string, unknown> = { ...storageValues };
   const get = vi.fn((query: StorageQuery): Promise<Record<string, unknown>> => {
     if (typeof query === 'string') {
@@ -196,6 +200,57 @@ describe('live side-panel App wiring', () => {
     expect(screen.getByText('Captures')).toBeInTheDocument();
     // ws-bar shows the current workstream label (default: "not set")
     expect(screen.getByRole('button', { name: /not set/ })).toBeInTheDocument();
+  });
+
+  it('searches indexed threads through the recall proxy', async () => {
+    const sendMessage = installChromeMock(liveState(), { [SETUP_COMPLETED_KEY]: true }, undefined, {
+      ok: true,
+      items: [
+        {
+          id: 'bac_thread_test:0',
+          threadId: 'bac_thread_test',
+          capturedAt: NOW,
+          score: 0.91,
+          title: 'Side-panel state machine review',
+          threadUrl: 'https://claude.ai/chat/thread',
+        },
+      ],
+    });
+
+    render(<App />);
+
+    await screen.findByRole('main', { name: 'Sidetrack workboard' });
+    fireEvent.click(screen.getByRole('button', { name: 'Search indexed threads' }));
+    fireEvent.change(screen.getByPlaceholderText('Search indexed threads'), {
+      target: { value: 'state machine' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+
+    expect(await screen.findByText(/score 0\.91/)).toBeInTheDocument();
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: messageTypes.recallQuery,
+      q: 'state machine',
+      limit: 10,
+    });
+  });
+
+  it('shows thread search errors from the recall proxy', async () => {
+    installChromeMock(liveState(), { [SETUP_COMPLETED_KEY]: true }, undefined, {
+      ok: false,
+      items: [],
+      error: 'Companion not configured.',
+    });
+
+    render(<App />);
+
+    await screen.findByRole('main', { name: 'Sidetrack workboard' });
+    fireEvent.click(screen.getByRole('button', { name: 'Search indexed threads' }));
+    fireEvent.change(screen.getByPlaceholderText('Search indexed threads'), {
+      target: { value: 'missing' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+
+    expect(await screen.findByText('Companion not configured.')).toBeInTheDocument();
   });
 
   it('does not show "companion disconnected" banner in local-only mode', async () => {
@@ -407,10 +462,7 @@ describe('live side-panel App wiring', () => {
 
     unmount();
     vi.unstubAllGlobals();
-    installChromeMock(
-      { ...sharedState, screenShareMode: true },
-      { [SETUP_COMPLETED_KEY]: true },
-    );
+    installChromeMock({ ...sharedState, screenShareMode: true }, { [SETUP_COMPLETED_KEY]: true });
     render(<App />);
     fireEvent.click(await screen.findByRole('tab', { name: 'All threads' }));
     expect(await screen.findByText('[private]')).toBeInTheDocument();

@@ -50,6 +50,23 @@ Every mutation returns:
 
 Health and status return stable response schemas defined in `openapi.yaml`.
 
+`GET /v1/system/health` is the richer authenticated diagnostics surface used by
+the side panel and MCP `bac.system_health`. In addition to uptime, vault,
+capture, recall, and service status, newer companions may include:
+
+- `capture.providers[]`: provider, last capture time, latest selector canary
+  state, and 24h ok/warn/fail counts derived from `_BAC/events/*.jsonl`
+- `capture.recentWarnings[]`: recent capture warnings from event logs
+- `recall.activity`: in-memory activity for this companion process, including
+  recent incremental indexing, rebuild start/finish/failure, recall query, and
+  group-recommendation events
+- `recall.activity.lastIndexedAt`, `lastIndexedCount`, and
+  `lastIndexedThreadIds`: the latest indexing work, with thread ids capped for
+  diagnostics
+
+Recall activity intentionally records query length and result count, not raw
+query text.
+
 ## Error behavior
 
 All non-2xx responses use the shared `Problem` schema from `configs/openapi/openapi.base.yaml`: top-level `type`, `title`, `status`, `code`, `correlationId`, with optional `detail`, `instance`, and `errors[]`.

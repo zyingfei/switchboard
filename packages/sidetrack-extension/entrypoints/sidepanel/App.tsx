@@ -18,6 +18,7 @@ import {
   isWorkboardChangedMessage,
   messageTypes,
   type AnnotateTurnResponse,
+  type RecallQueryResponse,
   type RuntimeResponse,
   type WorkboardRequest,
 } from '../../src/messages';
@@ -120,6 +121,32 @@ const providerLabel = (provider: TrackedThread['provider']): string => {
   }
   return 'Generic';
 };
+
+interface ThreadSearchResult {
+  readonly id: string;
+  readonly threadId: string;
+  readonly capturedAt: string;
+  readonly score: number;
+  readonly title?: string;
+  readonly snippet?: string;
+  readonly threadUrl?: string;
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null;
+
+const isThreadSearchResult = (value: unknown): value is ThreadSearchResult =>
+  isRecord(value) &&
+  typeof value.id === 'string' &&
+  typeof value.threadId === 'string' &&
+  typeof value.capturedAt === 'string' &&
+  typeof value.score === 'number' &&
+  (value.title === undefined || typeof value.title === 'string') &&
+  (value.snippet === undefined || typeof value.snippet === 'string') &&
+  (value.threadUrl === undefined || typeof value.threadUrl === 'string');
+
+const isRecallQueryResponse = (value: unknown): value is RecallQueryResponse =>
+  isRecord(value) && typeof value.ok === 'boolean' && Array.isArray(value.items);
 
 export const formatBuildTimestamp = (iso: string): string => {
   const d = new Date(iso);
@@ -401,6 +428,11 @@ const App = () => {
   const [settings, setSettings] = useState<SettingsDocument | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [healthPanelOpen, setHealthPanelOpen] = useState(false);
+  const [threadSearchOpen, setThreadSearchOpen] = useState(false);
+  const [threadSearchQuery, setThreadSearchQuery] = useState('');
+  const [threadSearchResults, setThreadSearchResults] = useState<readonly ThreadSearchResult[]>([]);
+  const [threadSearchState, setThreadSearchState] = useState<'idle' | 'loading' | 'error'>('idle');
+  const [threadSearchError, setThreadSearchError] = useState<string | null>(null);
   const [designPreviewOpen, setDesignPreviewOpen] = useState(false);
   const [workstreamDetailOpen, setWorkstreamDetailOpen] = useState(false);
   const [workstreamDetailLinkedNotes, setWorkstreamDetailLinkedNotes] = useState<
@@ -1426,6 +1458,80 @@ const App = () => {
         );
       }
     })();
+  };
+
+  const runThreadSearch = (): void => {
+    const q = threadSearchQuery.trim();
+    if (q.length === 0) {
+      setThreadSearchResults([]);
+      setThreadSearchState('idle');
+      setThreadSearchError(null);
+      return;
+    }
+    setThreadSearchState('loading');
+    setThreadSearchError(null);
+    void (async () => {
+      try {
+        const response = (await chrome.runtime.sendMessage({
+          type: messageTypes.recallQuery,
+          q,
+          limit: 10,
+        })) as unknown;
+        if (!isRecallQueryResponse(response)) {
+          throw new Error('Search returned an invalid response.');
+        }
+        if (!response.ok) {
+          throw new Error(response.error ?? 'Thread search failed.');
+        }
+        setThreadSearchResults(response.items.filter(isThreadSearchResult));
+        setThreadSearchState('idle');
+      } catch (searchError) {
+        setThreadSearchResults([]);
+        setThreadSearchState('error');
+        setThreadSearchError(
+          searchError instanceof Error ? searchError.message : 'Thread search failed.',
+        );
+      }
+    })();
+  };
+
+  const findThreadForSearchResult = (result: ThreadSearchResult): TrackedThread | undefined => {
+    const byId = state.threads.find((thread) => thread.bac_id === result.threadId);
+    if (byId !== undefined) return byId;
+    if (result.threadUrl === undefined || result.threadUrl.length === 0) return undefined;
+    const canonical = canonicalThreadUrl(result.threadUrl);
+    return state.threads.find((thread) => canonicalThreadUrl(thread.threadUrl) === canonical);
+  };
+
+  const focusThreadSearchResult = (result: ThreadSearchResult): void => {
+    void (async () => {
+      const match = findThreadForSearchResult(result);
+      if (match === undefined) {
+        if (result.threadUrl !== undefined && result.threadUrl.length > 0) {
+          await chrome.tabs.create({ url: result.threadUrl });
+          return;
+        }
+        setError('Search result is not in the current thread list.');
+        return;
+      }
+      setThreadSearchOpen(false);
+      if (viewMode === 'workstream' && match.primaryWorkstreamId !== currentWsId) {
+        setViewMode('all');
+      }
+      await expandBucketForThread(match);
+      scrollAndFlashThread(match.bac_id, 140);
+    })();
+  };
+
+  const openThreadSearchResult = (result: ThreadSearchResult): void => {
+    const match = findThreadForSearchResult(result);
+    if (match !== undefined) {
+      openTabForThread(match);
+      return;
+    }
+    if (result.threadUrl !== undefined && result.threadUrl.length > 0) {
+      void chrome.tabs.create({ url: result.threadUrl });
+    }
   };
 
   // ─── Send-to dropdown smart-default packet builder ─────────────
@@ -3285,6 +3391,18 @@ const App = () => {
             </svg>
           </button>
           <button
+            className={'icon-btn' + (threadSearchOpen ? ' on' : '')}
+            title="Search indexed threads"
+            onClick={() => {
+              setThreadSearchOpen((open) => !open);
+            }}
+            type="button"
+            aria-label="Search indexed threads"
+            aria-pressed={threadSearchOpen}
+          >
+            <span style={{ display: 'inline-flex', width: 14, height: 14 }}>{Icons.search}</span>
+          </button>
+          <button
             className="icon-btn"
             title="Capture / track the current tab — adds it to your side panel as a tracked thread"
             onClick={() => {
@@ -3547,6 +3665,92 @@ const App = () => {
           <span className="ws-status mono">{companionStatusLabel(state.companionStatus)}</span>
         </div>
       )}
+
+      {threadSearchOpen ? (
+        <form
+          className="thread-search-panel"
+          role="search"
+          aria-label="Search indexed threads"
+          onSubmit={(event) => {
+            event.preventDefault();
+            runThreadSearch();
+          }}
+        >
+          <div className="thread-search-row">
+            <span className="thread-search-icon" aria-hidden>
+              {Icons.search}
+            </span>
+            <input
+              type="search"
+              className="thread-search-input mono"
+              placeholder="Search indexed threads"
+              value={threadSearchQuery}
+              onChange={(event) => {
+                setThreadSearchQuery(event.target.value);
+                if (event.target.value.trim().length === 0) {
+                  setThreadSearchResults([]);
+                  setThreadSearchState('idle');
+                  setThreadSearchError(null);
+                }
+              }}
+              autoFocus
+            />
+            <button
+              type="submit"
+              className="thread-search-submit"
+              disabled={threadSearchState === 'loading' || threadSearchQuery.trim().length === 0}
+            >
+              {threadSearchState === 'loading' ? 'Searching' : 'Search'}
+            </button>
+          </div>
+          {threadSearchError !== null ? (
+            <div className="thread-search-note err">{threadSearchError}</div>
+          ) : null}
+          {threadSearchState !== 'loading' &&
+          threadSearchQuery.trim().length > 0 &&
+          threadSearchResults.length === 0 &&
+          threadSearchError === null ? (
+            <div className="thread-search-note">No indexed thread matches yet.</div>
+          ) : null}
+          {threadSearchResults.length > 0 ? (
+            <div className="thread-search-results">
+              {threadSearchResults.map((result) => {
+                const local = findThreadForSearchResult(result);
+                return (
+                  <div className="thread-search-result" key={`${result.id}-${result.threadId}`}>
+                    <button
+                      type="button"
+                      className="thread-search-result-main"
+                      onClick={() => {
+                        focusThreadSearchResult(result);
+                      }}
+                    >
+                      <span className="thread-search-title">
+                        {result.title ?? local?.title ?? result.threadId}
+                      </span>
+                      <span className="thread-search-meta mono">
+                        score {result.score.toFixed(2)} · {formatRelative(result.capturedAt)}
+                      </span>
+                      {result.snippet !== undefined && result.snippet.length > 0 ? (
+                        <span className="thread-search-snippet">{result.snippet}</span>
+                      ) : null}
+                    </button>
+                    <button
+                      type="button"
+                      className="thread-search-open mono"
+                      onClick={() => {
+                        openThreadSearchResult(result);
+                      }}
+                    >
+                      open
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
+        </form>
+      ) : null}
 
       <div className="ws-drop-strip" aria-label="Drop thread on a workstream">
         {state.workstreams.map((workstream) => (
@@ -4687,6 +4891,8 @@ const App = () => {
           }}
           companionPort={port.length > 0 ? Number(port) : null}
           bridgeKey={bridgeKey.length > 0 ? bridgeKey : null}
+          queuedCaptureCount={state.queuedCaptureCount}
+          droppedCaptureCount={state.droppedCaptureCount}
         />
       ) : null}
 

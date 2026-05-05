@@ -1,31 +1,74 @@
 import { useEffect, useState } from 'react';
 
+import { formatRelative } from '../../../src/util/time';
 import { Icons } from './icons';
 
-// Capture-health diagnostics — full-panel surface reachable from the
-// header diagnostics icon. Renders the v2 design's 4-card health
-// summary + per-provider 24h breakdown + recent errors.
-//
-// Fetches GET /v1/system/health (PR #78) when companion port + bridge
-// key are provided; falls back to fixture data otherwise so the
-// surface stays visible without a configured companion.
+interface CaptureProviderHealth {
+  readonly provider: string;
+  readonly lastCaptureAt: string | null;
+  readonly lastStatus: 'ok' | 'warning' | 'failed' | null;
+  readonly ok24h: number;
+  readonly warn24h: number;
+  readonly fail24h: number;
+  readonly warning?: string;
+}
+
+interface CaptureWarningHealth {
+  readonly provider: string;
+  readonly capturedAt: string;
+  readonly code: string;
+  readonly message: string;
+  readonly severity: 'info' | 'warning';
+}
+
+interface RecallActivityEvent {
+  readonly kind:
+    | 'incremental-index'
+    | 'rebuild-started'
+    | 'rebuild-finished'
+    | 'rebuild-failed'
+    | 'query'
+    | 'suggestion';
+  readonly at: string;
+  readonly count?: number;
+  readonly threadIds?: readonly string[];
+  readonly queryLength?: number;
+  readonly resultCount?: number;
+  readonly threadId?: string;
+  readonly reason?: 'startup' | 'manual' | 'reconnect';
+  readonly error?: string;
+}
+
+interface RecallActivityReport {
+  readonly lastIndexedAt: string | null;
+  readonly lastIndexedCount: number | null;
+  readonly lastIndexedThreadIds: readonly string[];
+  readonly lastRecallQueryAt: string | null;
+  readonly lastRecallQueryResultCount: number | null;
+  readonly lastSuggestionAt: string | null;
+  readonly lastSuggestionThreadId: string | null;
+  readonly recent: readonly RecallActivityEvent[];
+}
 
 interface HealthReport {
   readonly uptimeSec: number;
-  readonly vault: { readonly root: string; readonly writable: boolean; readonly sizeBytes: number };
+  readonly vault: {
+    readonly root: string;
+    readonly writable: boolean;
+    readonly sizeBytes: number | null;
+  };
   readonly capture: {
     readonly lastByProvider: Record<string, string | null>;
     readonly queueDepthHint: number | null;
     readonly droppedHint: number | null;
+    readonly providers?: readonly CaptureProviderHealth[];
+    readonly recentWarnings?: readonly CaptureWarningHealth[];
   };
   readonly recall: {
     readonly indexExists: boolean;
-    readonly entryCount: number;
+    readonly entryCount: number | null;
     readonly modelId: string | null;
     readonly sizeBytes: number | null;
-    // Optional lifecycle fields (companion ≥ this version) — drive
-    // the rebuild affordance + status copy. Older companions omit
-    // them and the UI falls back to the legacy "Re-index" button.
     readonly status?: 'missing' | 'stale' | 'empty' | 'rebuilding' | 'ready';
     readonly eventTurnCount?: number;
     readonly currentModelId?: string | null;
@@ -37,55 +80,17 @@ interface HealthReport {
     readonly rebuildTotal?: number;
     readonly embedderDevice?: 'cpu' | 'wasm' | 'webgpu' | 'unknown';
     readonly embedderAccelerator?: 'accelerate' | 'mkl' | 'cpu' | 'unknown';
+    readonly activity?: RecallActivityReport;
   };
   readonly service: { readonly installed: boolean; readonly running: boolean };
 }
-
-const FIXTURE_REPORT: HealthReport = {
-  uptimeSec: 7240,
-  vault: {
-    root: '~/Documents/Sidetrack-vault',
-    writable: true,
-    sizeBytes: 12_400_000,
-  },
-  capture: {
-    lastByProvider: {
-      claude: '8m ago',
-      chatgpt: '12m ago',
-      gemini: '2h ago',
-      codex: 'yesterday',
-    },
-    queueDepthHint: 3,
-    droppedHint: 0,
-  },
-  recall: {
-    indexExists: true,
-    entryCount: 12_400,
-    modelId: 'Xenova/all-MiniLM-L6-v2',
-    sizeBytes: 28_000_000,
-  },
-  service: { installed: false, running: true },
-};
-
-interface ProviderRow {
-  readonly key: string;
-  readonly label: string;
-  readonly ok: number;
-  readonly err: number;
-  readonly state: 'ok' | 'warn';
-}
-
-const PROVIDER_ROWS: readonly ProviderRow[] = [
-  { key: 'claude', label: 'Claude', ok: 18, err: 0, state: 'ok' },
-  { key: 'gpt', label: 'ChatGPT', ok: 24, err: 1, state: 'ok' },
-  { key: 'gemini', label: 'Gemini', ok: 4, err: 0, state: 'ok' },
-  { key: 'codex', label: 'Codex', ok: 2, err: 2, state: 'warn' },
-];
 
 interface HealthPanelProps {
   readonly onClose: () => void;
   readonly companionPort?: number | null;
   readonly bridgeKey?: string | null;
+  readonly queuedCaptureCount?: number;
+  readonly droppedCaptureCount?: number;
 }
 
 const isHealthReport = (value: unknown): value is HealthReport => {
@@ -100,6 +105,17 @@ const isHealthReport = (value: unknown): value is HealthReport => {
   );
 };
 
+const providerLabel = (provider: string): string => {
+  if (provider === 'chatgpt' || provider === 'gpt') return 'ChatGPT';
+  if (provider === 'claude') return 'Claude';
+  if (provider === 'gemini') return 'Gemini';
+  if (provider === 'codex') return 'Codex';
+  return provider;
+};
+
+const providerClass = (provider: string): string =>
+  provider === 'chatgpt' ? 'gpt' : provider.toLowerCase().replace(/[^a-z0-9_-]/gu, '-');
+
 const formatBytes = (n: number | null): string => {
   if (n === null) return '?';
   if (n < 1024) return `${String(n)} B`;
@@ -107,11 +123,34 @@ const formatBytes = (n: number | null): string => {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 };
 
-// Compose a human-readable label for the embedder backend so the
-// user can tell at a glance whether the rebuild path is running on
-// the fast native CPU EP (Apple Accelerate / MKL) or the slow wasm
-// fallback. "cpu (Accelerate)" reads as "this is the M-series fast
-// path" without forcing the user to know what onnxruntime is.
+const formatCount = (value: number | null): string => {
+  if (value === null) return '?';
+  if (value >= 1000) return `${(value / 1000).toFixed(1)}k`;
+  return String(value);
+};
+
+const formatWhen = (iso: string | null | undefined): string => {
+  if (iso === null || iso === undefined || iso.length === 0) return '-';
+  return formatRelative(iso);
+};
+
+const statusState = (status: CaptureProviderHealth['lastStatus']): 'ok' | 'warn' =>
+  status === 'ok' || status === null ? 'ok' : 'warn';
+
+const fallbackProviderRows = (
+  lastByProvider: Record<string, string | null>,
+): readonly CaptureProviderHealth[] =>
+  Object.entries(lastByProvider)
+    .map(([provider, lastCaptureAt]) => ({
+      provider,
+      lastCaptureAt,
+      lastStatus: null,
+      ok24h: 0,
+      warn24h: 0,
+      fail24h: 0,
+    }))
+    .sort((left, right) => (right.lastCaptureAt ?? '').localeCompare(left.lastCaptureAt ?? ''));
+
 const formatEmbedderLabel = (
   device: 'cpu' | 'wasm' | 'webgpu' | 'unknown',
   accelerator: 'accelerate' | 'mkl' | 'cpu' | 'unknown' | undefined,
@@ -126,22 +165,71 @@ const formatEmbedderLabel = (
   return device;
 };
 
-export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelProps) {
+const activityText = (event: RecallActivityEvent): string => {
+  if (event.kind === 'incremental-index') {
+    const ids =
+      event.threadIds !== undefined && event.threadIds.length > 0
+        ? ` · ${event.threadIds.join(', ')}`
+        : '';
+    return `Indexed ${String(event.count ?? 0)} turn${event.count === 1 ? '' : 's'}${ids}`;
+  }
+  if (event.kind === 'rebuild-started') {
+    return `Rebuild started${event.reason === undefined ? '' : ` · ${event.reason}`}`;
+  }
+  if (event.kind === 'rebuild-finished') {
+    return `Rebuild finished · ${String(event.count ?? 0)} turn${event.count === 1 ? '' : 's'}`;
+  }
+  if (event.kind === 'rebuild-failed') {
+    return `Rebuild failed${event.error === undefined ? '' : ` · ${event.error}`}`;
+  }
+  if (event.kind === 'query') {
+    return `Thread search · ${String(event.resultCount ?? 0)} result${event.resultCount === 1 ? '' : 's'} · ${String(event.queryLength ?? 0)} chars`;
+  }
+  return `Group recommendation · ${event.threadId ?? 'thread'} · ${String(event.resultCount ?? 0)} result${event.resultCount === 1 ? '' : 's'}`;
+};
+
+export function HealthPanel({
+  onClose,
+  companionPort,
+  bridgeKey,
+  queuedCaptureCount,
+  droppedCaptureCount,
+}: HealthPanelProps) {
   const [copied, setCopied] = useState(false);
-  const [report, setReport] = useState<HealthReport>(FIXTURE_REPORT);
-  const [isLive, setIsLive] = useState(false);
-  type RebuildState =
-    | { kind: 'idle' }
-    | { kind: 'accepted' }
-    | { kind: 'error'; message: string };
+  const [report, setReport] = useState<HealthReport | null>(null);
+  const [loadState, setLoadState] = useState<'loading' | 'live' | 'unavailable' | 'not-configured'>(
+    companionPort === undefined || companionPort === null || !bridgeKey
+      ? 'not-configured'
+      : 'loading',
+  );
+  type RebuildState = { kind: 'idle' } | { kind: 'accepted' } | { kind: 'error'; message: string };
   const [rebuildState, setRebuildState] = useState<RebuildState>({ kind: 'idle' });
 
-  // Fire-and-monitor: POST /v1/recall/rebuild returns 202 immediately
-  // (the rebuild itself runs in the background — model download +
-  // embedding can take minutes). The recall index card already
-  // polls /v1/system/health every 5s while status === 'rebuilding',
-  // so the user sees the entry count tick up live without us
-  // holding the fetch open.
+  const fetchReport = async (): Promise<void> => {
+    if (companionPort === undefined || companionPort === null || !bridgeKey) {
+      setReport(null);
+      setLoadState('not-configured');
+      return;
+    }
+    try {
+      const url = `http://127.0.0.1:${String(companionPort)}/v1/system/health`;
+      const response = await fetch(url, { headers: { 'x-bac-bridge-key': bridgeKey } });
+      if (!response.ok) {
+        setLoadState('unavailable');
+        return;
+      }
+      const body = (await response.json()) as { readonly data?: unknown };
+      if (!isHealthReport(body.data)) {
+        setLoadState('unavailable');
+        return;
+      }
+      setReport(body.data);
+      setLoadState('live');
+    } catch {
+      setLoadState('unavailable');
+    }
+  };
+
   const triggerRebuild = async (): Promise<void> => {
     if (companionPort === undefined || companionPort === null || !bridgeKey) {
       setRebuildState({ kind: 'error', message: 'Companion not configured.' });
@@ -165,18 +253,7 @@ export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelPr
         setRebuildState({ kind: 'error', message: body.data.lastError });
         return;
       }
-      // Pull a fresh health snapshot so the card flips to "rebuilding"
-      // without waiting for the 30s poll cadence.
-      const healthUrl = `http://127.0.0.1:${String(companionPort)}/v1/system/health`;
-      const healthResponse = await fetch(healthUrl, {
-        headers: { 'x-bac-bridge-key': bridgeKey },
-      });
-      if (healthResponse.ok) {
-        const healthBody = (await healthResponse.json()) as { readonly data?: unknown };
-        if (isHealthReport(healthBody.data)) {
-          setReport(healthBody.data);
-        }
-      }
+      await fetchReport();
     } catch (error) {
       setRebuildState({
         kind: 'error',
@@ -185,44 +262,49 @@ export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelPr
     }
   };
 
-  // Fetch the live report when companion is configured. Silent on failure
-  // — the fixture stays in place so the visual surface never blanks.
   useEffect(() => {
     if (companionPort === undefined || companionPort === null || !bridgeKey) {
+      setReport(null);
+      setLoadState('not-configured');
       return undefined;
     }
     let cancelled = false;
-    const fetchReport = async () => {
-      try {
-        const url = `http://127.0.0.1:${String(companionPort)}/v1/system/health`;
-        const response = await fetch(url, { headers: { 'x-bac-bridge-key': bridgeKey } });
-        if (!response.ok) return;
-        const body = (await response.json()) as { readonly data?: unknown };
-        if (cancelled || !isHealthReport(body.data)) return;
-        setReport(body.data);
-        setIsLive(true);
-      } catch {
-        // Keep fixture; surface stays usable offline.
-      }
+    const run = async (): Promise<void> => {
+      if (report === null) setLoadState('loading');
+      await fetchReport();
+      if (cancelled) return;
     };
-    void fetchReport();
-    // Poll faster while a rebuild is in flight so the entry count
-    // ticks up live; fall back to 30s once it's settled.
-    const intervalMs = report.recall.status === 'rebuilding' ? 5_000 : 30_000;
+    void run();
+    const intervalMs = report?.recall.status === 'rebuilding' ? 5_000 : 30_000;
     const id = window.setInterval(() => {
-      void fetchReport();
+      void run();
     }, intervalMs);
     return () => {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [companionPort, bridgeKey, report.recall.status]);
+  }, [companionPort, bridgeKey, report?.recall.status]);
 
-  const queueWarn =
-    report.capture.queueDepthHint !== null && report.capture.queueDepthHint > 10;
+  const queueDepth = queuedCaptureCount ?? report?.capture.queueDepthHint ?? null;
+  const dropped = droppedCaptureCount ?? report?.capture.droppedHint ?? null;
+  const queueWarn = queueDepth !== null && queueDepth > 10;
+  const providerRows =
+    report === null
+      ? []
+      : (report.capture.providers ?? fallbackProviderRows(report.capture.lastByProvider));
+  const lastProvider = providerRows.find((row) => row.lastCaptureAt !== null);
+  const activity = report?.recall.activity;
 
   const copyDiagnostics = () => {
-    const dump = JSON.stringify(report, null, 2);
+    if (report === null) return;
+    const dump = JSON.stringify(
+      {
+        ...report,
+        localExtension: { queuedCaptureCount, droppedCaptureCount },
+      },
+      null,
+      2,
+    );
     void navigator.clipboard.writeText(dump);
     setCopied(true);
     window.setTimeout(() => {
@@ -233,116 +315,188 @@ export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelPr
   return (
     <div className="health-view" role="dialog" aria-label="Capture health">
       <div className="health-head">
-        <button type="button" className="hp-foot-back icon-btn" onClick={onClose} aria-label="Close">
+        <button
+          type="button"
+          className="hp-foot-back icon-btn"
+          onClick={onClose}
+          aria-label="Close"
+        >
           <span style={{ display: 'inline-flex', width: 14, height: 14 }}>{Icons.back}</span>
         </button>
         <span className="title">Capture health</span>
-        <span className="muted">snapshot · {isLive ? 'live' : 'preview'}</span>
+        <span className="muted">snapshot · {loadState === 'live' ? 'live' : loadState}</span>
       </div>
 
-      <div className="health-grid">
-        <div className={'hc' + (queueWarn ? ' warn' : '')}>
-          <div className="hc-lbl">queue depth</div>
-          <div className="hc-num">{report.capture.queueDepthHint ?? '?'}</div>
-          <div className="hc-bar">
-            <span
-              style={{
-                width: `${String(Math.min(100, ((report.capture.queueDepthHint ?? 0) / 20) * 100))}%`,
-              }}
-            />
+      {report === null ? (
+        <div className="hp-empty">
+          <div className="hp-empty-title">
+            {loadState === 'not-configured' ? 'Companion not configured' : 'Health unavailable'}
           </div>
-          <div className="hc-foot">cap 20 · {queueWarn ? 'warn' : 'ok'}</div>
-        </div>
-        <div className="hc">
-          <div className="hc-lbl">last capture</div>
-          <div className="hc-num small">{report.capture.lastByProvider.claude ?? '—'}</div>
-          <div className="hc-foot">
-            claude.ai · dropped {report.capture.droppedHint ?? 0}
+          <div className="hp-empty-copy">
+            {loadState === 'loading'
+              ? 'Loading companion diagnostics…'
+              : 'Connect the Sidetrack companion to show live capture, recall, and service diagnostics.'}
           </div>
         </div>
-        <div className="hc">
-          <div className="hc-lbl">recall index</div>
-          <div className="hc-num small">
-            {report.recall.entryCount >= 1000
-              ? `${(report.recall.entryCount / 1000).toFixed(1)}k`
-              : String(report.recall.entryCount)}
-          </div>
-          <div className="hc-foot">
-            vectors · {formatBytes(report.recall.sizeBytes)} ·{' '}
-            {report.recall.modelId?.split('/').pop() ?? 'no model'}
-          </div>
-          {report.recall.status !== undefined ? (
-            <div className="hc-foot">
-              status: <span className="mono">{report.recall.status}</span>
-              {report.recall.eventTurnCount !== undefined ? (
-                <>
-                  {' · '}
-                  {String(report.recall.entryCount)}/
-                  {String(report.recall.eventTurnCount)} turns
-                </>
+      ) : (
+        <>
+          <div className="health-grid">
+            <div className={'hc' + (queueWarn ? ' warn' : '')}>
+              <div className="hc-lbl">queued captures</div>
+              <div className="hc-num">{queueDepth ?? '?'}</div>
+              <div className="hc-bar">
+                <span
+                  style={{
+                    width: `${String(Math.min(100, ((queueDepth ?? 0) / 20) * 100))}%`,
+                  }}
+                />
+              </div>
+              <div className="hc-foot">
+                cap 20 · dropped {dropped ?? 0} · {queueWarn ? 'warn' : 'ok'}
+              </div>
+            </div>
+            <div className="hc">
+              <div className="hc-lbl">last capture</div>
+              <div className="hc-num small">
+                {lastProvider === undefined ? '-' : formatWhen(lastProvider.lastCaptureAt)}
+              </div>
+              <div className="hc-foot">
+                {lastProvider === undefined
+                  ? 'no provider events'
+                  : `${providerLabel(lastProvider.provider)} · ${lastProvider.lastStatus ?? 'no canary'}`}
+              </div>
+            </div>
+            <div className="hc">
+              <div className="hc-lbl">recall index</div>
+              <div className="hc-num small">{formatCount(report.recall.entryCount)}</div>
+              <div className="hc-foot">
+                vectors · {formatBytes(report.recall.sizeBytes)} ·{' '}
+                {report.recall.modelId?.split('/').pop() ?? 'no model'}
+              </div>
+              {report.recall.status !== undefined ? (
+                <div className="hc-foot">
+                  status: <span className="mono">{report.recall.status}</span>
+                  {report.recall.eventTurnCount !== undefined ? (
+                    <>
+                      {' · '}
+                      {String(report.recall.entryCount ?? 0)}/{String(report.recall.eventTurnCount)}{' '}
+                      turns
+                    </>
+                  ) : null}
+                </div>
+              ) : null}
+              {activity?.lastIndexedAt !== null && activity?.lastIndexedAt !== undefined ? (
+                <div className="hc-foot">
+                  last indexed: {formatWhen(activity.lastIndexedAt)}
+                  {activity.lastIndexedCount === null
+                    ? ''
+                    : ` · ${String(activity.lastIndexedCount)} turns`}
+                </div>
+              ) : null}
+              {report.recall.embedderDevice !== undefined &&
+              report.recall.embedderDevice !== 'unknown' ? (
+                <div className="hc-foot">
+                  embedder:{' '}
+                  <span className="mono">
+                    {formatEmbedderLabel(
+                      report.recall.embedderDevice,
+                      report.recall.embedderAccelerator,
+                    )}
+                  </span>
+                </div>
+              ) : null}
+              {report.recall.lastError !== undefined && report.recall.lastError !== null ? (
+                <div className="hc-foot warn">last error: {report.recall.lastError}</div>
               ) : null}
             </div>
-          ) : null}
-          {report.recall.embedderDevice !== undefined &&
-          report.recall.embedderDevice !== 'unknown' ? (
-            <div className="hc-foot">
-              embedder:{' '}
-              <span className="mono">
-                {formatEmbedderLabel(
-                  report.recall.embedderDevice,
-                  report.recall.embedderAccelerator,
-                )}
-              </span>
+            <div className="hc">
+              <div className="hc-lbl">vault writable</div>
+              <div className={'hc-num small' + (report.vault.writable ? ' ok' : '')}>
+                {report.vault.writable ? 'yes' : 'no'}
+              </div>
+              <div className="hc-foot">{report.vault.root}</div>
             </div>
-          ) : null}
-          {report.recall.lastError !== undefined && report.recall.lastError !== null ? (
-            <div className="hc-foot warn">last error: {report.recall.lastError}</div>
-          ) : null}
-        </div>
-        <div className="hc">
-          <div className="hc-lbl">vault writable</div>
-          <div className={'hc-num small' + (report.vault.writable ? ' ok' : '')}>
-            {report.vault.writable ? 'yes' : 'no'}
           </div>
-          <div className="hc-foot">{report.vault.root}</div>
-        </div>
-      </div>
 
-      <div className="hp-sec">
-        <div className="hp-sec-head">By provider · last 24h</div>
-        {PROVIDER_ROWS.map((row) => (
-          <div key={row.key} className="hp-row">
-            <span className={`prov-pill ${row.key}`}>{row.label}</span>
-            <span className="hp-num">
-              {row.ok}
-              <span className="muted"> ok</span>
-            </span>
-            <span className={'hp-num' + (row.err > 0 ? ' err' : '')}>
-              {row.err}
-              <span className="muted"> err</span>
-            </span>
-            <span className="hp-last muted">
-              {report.capture.lastByProvider[row.key === 'gpt' ? 'chatgpt' : row.key] ?? '—'}
-            </span>
-            <span className={`hp-state ${row.state}`}>{row.state}</span>
+          <div className="hp-sec">
+            <div className="hp-sec-head">By provider · last 24h</div>
+            {providerRows.length === 0 ? (
+              <div className="hp-muted-row">No capture events found.</div>
+            ) : (
+              providerRows.map((row) => (
+                <div key={row.provider} className="hp-row">
+                  <span className={`prov-pill ${providerClass(row.provider)}`}>
+                    {providerLabel(row.provider)}
+                  </span>
+                  <span className="hp-num">
+                    {row.ok24h}
+                    <span className="muted"> ok</span>
+                  </span>
+                  <span className={'hp-num' + (row.warn24h > 0 ? ' warn' : '')}>
+                    {row.warn24h}
+                    <span className="muted"> warn</span>
+                  </span>
+                  <span className={'hp-num' + (row.fail24h > 0 ? ' err' : '')}>
+                    {row.fail24h}
+                    <span className="muted"> fail</span>
+                  </span>
+                  <span className="hp-last muted">{formatWhen(row.lastCaptureAt)}</span>
+                  <span className={`hp-state ${statusState(row.lastStatus)}`}>
+                    {row.lastStatus ?? 'seen'}
+                  </span>
+                  {row.warning !== undefined ? (
+                    <span className="hp-row-note">{row.warning}</span>
+                  ) : null}
+                </div>
+              ))
+            )}
           </div>
-        ))}
-      </div>
 
-      <div className="hp-sec">
-        <div className="hp-sec-head">Recent errors</div>
-        <div className="hp-err">
-          <div className="r1">
-            <span className="hp-dot amber" />
-            <code>codex.capture · timeout</code>
-            <span className="muted">2 occurrences · last yesterday 22:14</span>
+          <div className="hp-sec">
+            <div className="hp-sec-head">Recall activity</div>
+            {activity === undefined || activity.recent.length === 0 ? (
+              <div className="hp-muted-row">No recall activity recorded this run.</div>
+            ) : (
+              <div className="hp-activity-list">
+                {activity.recent.slice(0, 8).map((event, index) => (
+                  <div className="hp-activity" key={`${event.kind}-${event.at}-${String(index)}`}>
+                    <span className="hp-dot signal" />
+                    <span>{activityText(event)}</span>
+                    <span className="muted">{formatWhen(event.at)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
-          <div className="r2">net::ERR_TIMED_OUT on chatgpt.com/codex/c/…</div>
-        </div>
-      </div>
+
+          <div className="hp-sec">
+            <div className="hp-sec-head">Recent warnings</div>
+            {report.capture.recentWarnings === undefined ||
+            report.capture.recentWarnings.length === 0 ? (
+              <div className="hp-muted-row">No recent capture warnings.</div>
+            ) : (
+              report.capture.recentWarnings.slice(0, 6).map((warning) => (
+                <div
+                  className="hp-err"
+                  key={`${warning.provider}-${warning.capturedAt}-${warning.code}`}
+                >
+                  <div className="r1">
+                    <span className="hp-dot amber" />
+                    <code>
+                      {warning.provider}.{warning.code}
+                    </code>
+                    <span className="muted">{formatWhen(warning.capturedAt)}</span>
+                  </div>
+                  <div className="r2">{warning.message}</div>
+                </div>
+              ))
+            )}
+          </div>
+        </>
+      )}
 
       <div className="hp-foot">
-        <button type="button" onClick={copyDiagnostics}>
+        <button type="button" onClick={copyDiagnostics} disabled={report === null}>
           {copied ? (
             <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
               <span style={{ display: 'inline-flex', width: 12, height: 12 }}>{Icons.check}</span>
@@ -354,17 +508,14 @@ export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelPr
         </button>
         <button
           type="button"
-          disabled={rebuildState.kind === 'accepted' || report.recall.status === 'rebuilding'}
+          disabled={rebuildState.kind === 'accepted' || report?.recall.status === 'rebuilding'}
           onClick={() => {
             void triggerRebuild();
           }}
         >
-          {report.recall.status === 'rebuilding'
+          {report?.recall.status === 'rebuilding'
             ? `Re-indexing… (${String(
-                // Prefer the live embedded counter (updates between
-                // batches) over the on-disk entry count, which only
-                // moves on the final write.
-                report.recall.rebuildEmbedded ?? report.recall.entryCount,
+                report.recall.rebuildEmbedded ?? report.recall.entryCount ?? 0,
               )}${
                 report.recall.rebuildTotal !== undefined && report.recall.rebuildTotal > 0
                   ? `/${String(report.recall.rebuildTotal)}`
@@ -381,7 +532,6 @@ export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelPr
             {rebuildState.message}
           </span>
         ) : null}
-        <button type="button">Open log</button>
       </div>
     </div>
   );
