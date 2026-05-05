@@ -313,15 +313,25 @@ const sendToCompanion = async (
     ...(lastTurnRole === undefined ? {} : { lastTurnRole }),
   };
   const threadResult = await client.upsertThread(thread);
-  const lastIndexableTurn = event.turns.at(-1);
-  if (lastIndexableTurn !== undefined) {
+  // Index EVERY turn of the capture event, not just the last. The
+  // earlier path (only `event.turns.at(-1)`) created a slow drift
+  // where the recall index trailed the event log by ~90 entries
+  // until the next full rebuild — a "+ Capture" of a fresh thread
+  // appeared to add only the most-recent assistant turn to recall.
+  // Skip blank-text turns to mirror the rebuilder's behaviour.
+  const indexableTurns = event.turns.filter(
+    (turn) => typeof turn.text === 'string' && turn.text.trim().length > 0,
+  );
+  if (indexableTurns.length > 0) {
     void createRecallClient(settings.companion)
-      .indexTurn({
-        id: `${threadResult.bac_id}:${String(lastIndexableTurn.ordinal)}`,
-        threadId: threadResult.bac_id,
-        capturedAt: lastIndexableTurn.capturedAt,
-        text: lastIndexableTurn.text,
-      })
+      .indexTurns(
+        indexableTurns.map((turn) => ({
+          id: `${threadResult.bac_id}:${String(turn.ordinal)}`,
+          threadId: threadResult.bac_id,
+          capturedAt: turn.capturedAt,
+          text: turn.text,
+        })),
+      )
       .catch((error: unknown) => {
         // eslint-disable-next-line no-console
         console.debug(

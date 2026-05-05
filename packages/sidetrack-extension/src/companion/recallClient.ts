@@ -30,13 +30,25 @@ export class RecallClient {
   }
 
   async indexTurn(item: RecallTurnInput): Promise<void> {
+    await this.indexTurns([item]);
+  }
+
+  // Batched variant — used by the capture flow to push every turn
+  // of a multi-turn capture event in one request. The companion's
+  // /v1/recall/index endpoint already accepts an `items[]` array
+  // and embeds them in batches internally, so this is just the
+  // client surface that was missing. Without this, sendToCompanion
+  // could only push one turn per capture and 90% of the index drift
+  // came from un-indexed earlier turns waiting for a full rebuild.
+  async indexTurns(items: readonly RecallTurnInput[]): Promise<void> {
+    if (items.length === 0) return;
     const response = await fetch(`${this.baseUrl}/recall/index`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
         'x-bac-bridge-key': this.settings.bridgeKey,
       },
-      body: JSON.stringify({ items: [item] }),
+      body: JSON.stringify({ items }),
     });
     if (!response.ok) {
       const value = (await response.json().catch(() => ({}))) as unknown;
