@@ -288,12 +288,21 @@ export default defineContentScript({
         .trim()
         .toLowerCase();
 
+    // Strip the role prefix the capture pipeline prepends to each
+    // turn body ("You said:", "ChatGPT said:", "Claude said:", etc.).
+    // The live page's DOM doesn't carry that prefix — it's a
+    // convention of domToMarkdown for read-back, not part of the
+    // rendered turn. Without this strip, a "test123" user turn shows
+    // up as "you said: test123" in the probe and matches nothing.
+    const stripRolePrefix = (input: string): string =>
+      input.replace(
+        /^\s*(?:you|chatgpt|claude|gemini|assistant|user|model)\s+said\s*[:：]\s*/i,
+        '',
+      );
+
     // Pick a discriminating probe from the middle of the turn — head
     // probes collide on common openings ("Sure, here's…", "I'll
-    // help you…"). We slide a window into the body and grab a 60-
-    // char fragment of mostly-alphanumeric text, which survives both
-    // markdown stripping on the captured side and DOM whitespace
-    // weirdness on the live side.
+    // help you…"). For very short turns the whole body IS the probe.
     const buildProbe = (normalized: string): string => {
       if (normalized.length <= 60) return normalized;
       const start = Math.max(0, Math.floor(normalized.length / 3));
@@ -303,9 +312,10 @@ export default defineContentScript({
     // Find the turn element on this page using the captured selector
     // first, then fall back to a normalized-text search. The fallback
     // exists because provider chat pages re-render aggressively
-    // (Claude / Gemini Angular, ChatGPT React) and reuse selectors
-    // like data-testid="conversation-turn-3" that renumber on
-    // regenerate / branch.
+    // (Claude / Gemini Angular, ChatGPT React) and the saved
+    // `sourceSelector` is sometimes a label like "chatgpt heading
+    // fallback" rather than a real CSS selector — when querySelector
+    // returns null we proceed to the text-quote search regardless.
     const findTurnElementOnPage = (
       sourceSelector: string | undefined,
       turnText: string,
@@ -322,24 +332,37 @@ export default defineContentScript({
           tried.push('sourceSelector threw on querySelector');
         }
       }
-      const normalizedTurn = normalizeForMatch(turnText);
-      const probe = buildProbe(normalizedTurn);
-      if (probe.length < 12) {
+      const probe = buildProbe(normalizeForMatch(stripRolePrefix(turnText)));
+      if (probe.length === 0) {
         return {
           element: null,
-          diagnostic: `probe too short (${String(probe.length)} chars after normalize); tried=[${tried.join(', ')}]`,
+          diagnostic: `probe empty after strip+normalize; tried=[${tried.join(', ')}]`,
         };
       }
       const turnSelector = turnSelectorForCurrentProvider();
       tried.push(`turnSelector=${turnSelector ?? 'null'}`);
       const candidates =
         turnSelector === null ? [] : Array.from(document.querySelectorAll(turnSelector));
+      // First pass: exact equality. Wins on short turns ("test123")
+      // where many candidates would also pass `includes`.
+      for (const node of candidates) {
+        if (!(node instanceof HTMLElement)) continue;
+        if (normalizeForMatch(node.textContent) === probe) {
+          return {
+            element: node,
+            diagnostic: `matched on exact text equality across ${String(candidates.length)} candidates`,
+          };
+        }
+      }
+      // Second pass: substring. For longer turns the live DOM's
+      // textContent often includes extra UI chrome (timestamps,
+      // model labels) so exact equality is too strict.
       for (const node of candidates) {
         if (!(node instanceof HTMLElement)) continue;
         if (normalizeForMatch(node.textContent).includes(probe)) {
           return {
             element: node,
-            diagnostic: `matched on text-quote across ${String(candidates.length)} candidates`,
+            diagnostic: `matched on text-quote substring across ${String(candidates.length)} candidates`,
           };
         }
       }
