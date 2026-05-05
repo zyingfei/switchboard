@@ -130,24 +130,31 @@ export const tryLinkCapturedThread = (input: DispatchLinkInput): DispatchLinkDia
       reason = reason === 'no-prefix-match' ? 'provider-mismatch' : reason;
       continue;
     }
-    const age = input.capturedAtMs - Date.parse(dispatch.createdAt);
-    if (!Number.isFinite(age) || age < 0 || age > MATCH_WINDOW_MS) {
-      reason = reason === 'no-prefix-match' ? 'window-expired' : reason;
-      continue;
-    }
     const linkedTo = input.existingLinks[dispatch.bac_id];
-    if (linkedTo !== undefined && linkedTo !== input.threadId) {
-      // Treat the existing link as stale (and skippable as a "real"
-      // link) only when the linked thread still exists. If
-      // liveThreadIds was supplied and it doesn't include linkedTo,
-      // the link is orphaned — let the matcher relink to the
-      // current capture if the prefix matches.
-      const linkIsLive =
-        input.liveThreadIds === undefined || input.liveThreadIds.has(linkedTo);
-      if (linkIsLive) {
-        reason = reason === 'no-prefix-match' ? 'already-linked' : reason;
+    const isOrphanRelink =
+      linkedTo !== undefined &&
+      linkedTo !== input.threadId &&
+      input.liveThreadIds !== undefined &&
+      !input.liveThreadIds.has(linkedTo);
+    // Time-window gate exists to prevent false positives: a user
+    // pasting a generic message into a chat that happens to match
+    // an old dispatch's first 60 chars. For orphan re-links the
+    // dispatch already matched once before — we're not creating a
+    // new association, we're healing a broken one — so the window
+    // shouldn't cut us off. Skip the window check in that case.
+    if (!isOrphanRelink) {
+      const age = input.capturedAtMs - Date.parse(dispatch.createdAt);
+      if (!Number.isFinite(age) || age < 0 || age > MATCH_WINDOW_MS) {
+        reason = reason === 'no-prefix-match' ? 'window-expired' : reason;
         continue;
       }
+    }
+    if (linkedTo !== undefined && linkedTo !== input.threadId && !isOrphanRelink) {
+      // Skip dispatches already linked to a different LIVE thread.
+      // (Orphan re-links handled above — they fall through to
+      // candidate counting.)
+      reason = reason === 'no-prefix-match' ? 'already-linked' : reason;
+      continue;
     }
     candidatesConsidered += 1;
     // Prefer the unredacted body — that's what the user pasted.
