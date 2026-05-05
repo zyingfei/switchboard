@@ -635,6 +635,35 @@ const autoSendOnceTabReady = (tabId: number, body: string): void => {
           '[dispatchAutoSendInNewTab] content-script send failed:',
           dispatch.error ?? 'unknown',
         );
+        return;
+      }
+      // Auto-capture the destination chat after auto-send completes.
+      // Without this, the freshly-created chat at /app/<id> is never
+      // tracked (autoTrack is off by default), the matcher in
+      // dispatchLinking.ts never fires for it, and the source row in
+      // Recent Dispatches stays "send to new thread" forever — even
+      // across reloads. The user's report image #7 is exactly this
+      // symptom. Best-effort; failures don't block.
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        const captureResp: unknown = await chrome.tabs.sendMessage(tabId, {
+          type: messageTypes.captureVisibleThread,
+        });
+        if (isContentResponse(captureResp) && captureResp.ok) {
+          await storeCaptureEvent(captureResp.capture);
+          void broadcastWorkboardChanged('capture');
+        } else if (isContentResponse(captureResp) && !captureResp.ok) {
+          console.warn(
+            '[dispatchAutoSendInNewTab] post-send capture failed:',
+            captureResp.error,
+          );
+        }
+        void tab; // noop; reserved for future tab-state checks
+      } catch (error) {
+        console.warn(
+          '[dispatchAutoSendInNewTab] post-send capture threw:',
+          error instanceof Error ? error.message : error,
+        );
       }
     })();
   };
