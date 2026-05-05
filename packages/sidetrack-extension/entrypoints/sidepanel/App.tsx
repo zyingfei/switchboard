@@ -1477,16 +1477,18 @@ const App = () => {
       // title + source + the captured turns.
       body = `# Context from another conversation: ${thread.title}\n\n${head}\n\n${turnsMd}`;
     } else if (intent.kind === 'coding_agent_packet') {
-      // MCP-aware handoff: tells the coding agent how to connect to
-      // Sidetrack's local MCP endpoint for live thread + recent
-      // dispatches + recall, with the old HTTP route as fallback.
-      // It also includes captured turns as an offline fallback.
-      // Bridge key + port are interpolated from the side-panel's
-      // current settings — clipboard is local, companion only listens
-      // on 127.0.0.1, so it's safe to render the key inline.
-      const portStr = port.length > 0 ? port : '17373';
+      // MCP-aware handoff. The agent connects to the local MCP
+      // endpoint and pulls thread/dispatch/recall context over the
+      // tool channel — nothing else is in the prompt. Bridge key
+      // is interpolated inline because clipboard is local-only and
+      // the companion only listens on 127.0.0.1.
       const keyStr = bridgeKey.length > 0 ? bridgeKey : '<run the companion to generate>';
-      body = `# Coding handoff: ${thread.title}\n\nYou are continuing work from a Sidetrack thread. The user's local Sidetrack MCP endpoint can read live thread context, recent dispatches, and decisions.\n\n## Thread reference\n${provider} · ${thread.threadUrl}\nthread_id: ${thread.bac_id}\n\n## MCP endpoint\n- primary : ws://127.0.0.1:8721/mcp?token=${keyStr}\n- auth    : the token is the local Sidetrack bridge key\n\n## HTTP fallback\n- base url   : http://127.0.0.1:${portStr}\n- auth       : send header  x-bac-bridge-key: ${keyStr}\n- tool route : send header  x-sidetrack-mcp-tool: <tool-name>\n\n(Everything is localhost-only; the bridge key is local-machine.)\n\n## Tools you can call (read-only)\n- bac.read_thread_md       full markdown of this thread\n- bac.list_dispatches      recent context packets / asks the user shipped\n- bac.recall               vector recall over related threads + decisions\n- bac.read_workstream_md   workstream context if this thread is grouped\n- bac.list_annotations     user-saved highlights with comments\n- bac.list_audit_events    decisions, archives, edits\n\nRecommended sequence on first call: read_thread_md → list_dispatches → recall (if you need cross-thread context). Cite the tool name when you reference what you pulled so the user can verify.\n\n## Snapshot of the captured turns (offline fallback)\nIf Sidetrack is unreachable, work from this snapshot. It's the same data bac.read_thread_md would return, just frozen at clipboard time.\n\n${turnsMd}\n\n## User's ask\n…`;
+      // Lean handoff: drop the chat URL, provider label, HTTP
+      // fallback block, tools list, recommended sequence, AND the
+      // frozen turn snapshot. Everything reachable via MCP stays
+      // there. See PacketComposer's buildCodingAgentPacket for the
+      // canonical version + the rationale.
+      body = `# Coding handoff: ${thread.title}\n\nsidetrack_thread_id: ${thread.bac_id}\nsidetrack_mcp: ws://127.0.0.1:8721/mcp?token=${keyStr}\n\nThe Sidetrack companion is running locally and exposes the thread's full context (markdown, dispatches, annotations, recall) over MCP. Connect to the endpoint above and call \`tools/list\` to see what's available; \`bac.read_thread_md\` returns the conversation body.\n\n## User's ask\n…`;
     } else {
       const today = new Date().toISOString().slice(0, 10);
       body = `---\ntitle: ${thread.title}\ncreated: ${today}\nsource: ${thread.threadUrl}\nprovider: ${provider}\n---\n\n# ${thread.title}\n\n${turnsMd}`;

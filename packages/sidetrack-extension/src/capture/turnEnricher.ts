@@ -68,8 +68,14 @@ const formatModelSlug = (slug: string): string => {
   // (e.g. "GPT-5" or "GPT-5.5") from the split-on-dash pass below.
   const HYPHEN_PLACEHOLDER = '§';
   let out = trimmed
+    // Two-digit version + variant (gpt-5-5-thinking → GPT-5.5 …):
     .replace(/^gpt-(\d)-(\d)\b/i, `GPT${HYPHEN_PLACEHOLDER}$1.$2`)
-    .replace(/^gpt-(\d+)\b/i, `GPT${HYPHEN_PLACEHOLDER}$1`)
+    // gpt-<number>[suffix] (gpt-4o, gpt-5, gpt-4-turbo) — keep the
+    // suffix attached to the version (no extra hyphen), since
+    // "GPT-4o" is the canonical spelling.
+    .replace(/^gpt-(\d+)([a-z]+)?\b/i, (_m, n, suffix) =>
+      `GPT${HYPHEN_PLACEHOLDER}${String(n)}${typeof suffix === 'string' ? suffix : ''}`,
+    )
     .replace(/^o(\d+)\b/i, `o${HYPHEN_PLACEHOLDER}$1`);
   out = out
     .split('-')
@@ -142,8 +148,16 @@ const enrichChatgpt = (ctx: EnrichmentContext): TurnEnrichment => {
   const markdown = markdownRoot !== null ? domToMarkdown(markdownRoot) : undefined;
   const modelName = chatgptModelName(ctx.turnNode, ctx.doc);
   const attachments = chatgptAttachments(ctx.turnNode);
+  // Use the RAW pill count for deep-research detection: the user's
+  // page may have N citation REFERENCES that all point at the same
+  // ~2 unique sources after dedup, but the raw count is the right
+  // "is this a deep-research answer?" signal. Citations field
+  // surfaces the deduped list to keep the UI clean.
+  const rawPillCount = ctx.turnNode.querySelectorAll(
+    '[data-testid="webpage-citation-pill"]',
+  ).length;
   const citations = chatgptCitations(ctx.turnNode);
-  const isDeepResearch = chatgptDeepResearchActive(ctx.doc) || citations.length >= 3;
+  const isDeepResearch = chatgptDeepResearchActive(ctx.doc) || rawPillCount >= 3;
   const researchReport: CapturedResearchReport | undefined =
     ctx.role === 'assistant' && isDeepResearch
       ? {
