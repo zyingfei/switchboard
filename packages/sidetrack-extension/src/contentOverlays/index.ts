@@ -353,6 +353,57 @@ const OVERLAY_CSS = `
 }
 .sidetrack-rv-pop .acts button.primary:hover { background: var(--signal); border-color: var(--signal); }
 .sidetrack-rv-pop .acts button:disabled { opacity: 0.5; cursor: not-allowed; }
+.sidetrack-ann-pop {
+  position: absolute;
+  width: 320px;
+  max-width: 90vw;
+  background: var(--paper-light);
+  border: 1px solid var(--ink);
+  border-radius: 8px;
+  box-shadow: 0 22px 60px -12px rgba(0,0,0,0.45), 0 0 0 1px rgba(0,0,0,0.05);
+  pointer-events: auto;
+  overflow: hidden;
+}
+.sidetrack-ann-pop .head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px;
+  background: var(--paper);
+  border-bottom: 1px solid var(--rule-soft);
+  font-family: var(--mono); font-size: 10px;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--signal);
+}
+.sidetrack-ann-pop .head .dot {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--signal);
+}
+.sidetrack-ann-pop .head .meta { margin-left: auto; color: var(--ink-3); }
+.sidetrack-ann-pop .head .close {
+  background: transparent; color: var(--ink-3); border: none; cursor: pointer;
+  padding: 0 4px; font-size: 14px; line-height: 1;
+}
+.sidetrack-ann-pop .head .close:hover { color: var(--ink); }
+.sidetrack-ann-pop .quote {
+  margin: 8px 12px 0;
+  padding: 4px 0 4px 8px;
+  border-left: 2px solid var(--signal-tint);
+  font-family: var(--display); font-style: italic;
+  font-size: 12px; line-height: 1.45;
+  color: var(--ink-2);
+  max-height: 6em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+}
+.sidetrack-ann-pop .note {
+  padding: 8px 12px 12px;
+  font-family: var(--body);
+  font-size: 13px; line-height: 1.5;
+  color: var(--ink);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
 `;
 
 const ensureOverlayInfra = (): HTMLElement => {
@@ -390,10 +441,18 @@ const clearAnnotationMarkers = (root: HTMLElement): void => {
 export interface RestoredAnchor {
   readonly id: string;
   readonly rect: DOMRect;
+  // Note + quote enable click-to-reveal on the margin marker. Both
+  // are optional so the legacy code paths that mount markers
+  // without note context (e.g. transient session-only markers
+  // before the persist call returns) still render.
+  readonly note?: string;
+  readonly quote?: string;
 }
 
 // Mount per-anchor margin markers and a single bottom hint. Idempotent:
-// re-calling clears any prior overlays first.
+// re-calling clears any prior overlays first. Each marker is clickable —
+// a popover anchored near the dot reveals the note + quoted turn
+// excerpt; a second click on the dot or the popover's close dismisses.
 export const mountAnnotationOverlay = (anchors: readonly RestoredAnchor[]): void => {
   if (anchors.length === 0) return;
   const root = ensureOverlayInfra();
@@ -409,8 +468,29 @@ export const mountAnnotationOverlay = (anchors: readonly RestoredAnchor[]): void
     const rectTop = anchor.rect.top + window.scrollY;
     const topPercent = Math.max(2, Math.min(96, (rectTop / docHeight) * 100));
     marker.style.top = `${String(topPercent)}%`;
-    marker.title = `Annotation ${anchor.id}`;
+    marker.title =
+      anchor.note !== undefined && anchor.note.length > 0
+        ? `Click to read · ${anchor.note.slice(0, 60)}${anchor.note.length > 60 ? '…' : ''}`
+        : `Annotation ${anchor.id}`;
     marker.innerHTML = '<span class="dot"></span><span>1</span>';
+    marker.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      // Toggle: clicking the same dot a second time dismisses.
+      const existing = root.querySelector<HTMLElement>(
+        `.sidetrack-ann-pop[data-ann-id="${CSS.escape(anchor.id)}"]`,
+      );
+      if (existing !== null) {
+        existing.remove();
+        return;
+      }
+      mountAnnotationNotePopover({
+        anchorId: anchor.id,
+        anchorRect: marker.getBoundingClientRect(),
+        note: anchor.note ?? '(no note attached)',
+        quote: anchor.quote,
+      });
+    });
     root.appendChild(marker);
   }
   const hint = document.createElement('div');
@@ -424,6 +504,94 @@ export const mountAnnotationOverlay = (anchors: readonly RestoredAnchor[]): void
     hint.remove();
   });
   root.appendChild(hint);
+};
+
+interface AnnotationNotePopoverOptions {
+  readonly anchorId: string;
+  readonly anchorRect: DOMRect;
+  readonly note: string;
+  readonly quote?: string;
+}
+
+const ANN_POP_WIDTH = 320;
+
+const clearAnnotationPopovers = (root: HTMLElement): void => {
+  for (const node of root.querySelectorAll('.sidetrack-ann-pop')) {
+    node.remove();
+  }
+};
+
+// Read-only popover for an existing annotation marker. Position:
+// to the left of the marker (markers sit in the right gutter), with
+// vertical clamp so it stays inside the viewport. Click outside or
+// the close button dismisses.
+export const mountAnnotationNotePopover = (
+  opts: AnnotationNotePopoverOptions,
+): { close: () => void } => {
+  const root = ensureOverlayInfra();
+  clearAnnotationPopovers(root);
+  const pop = document.createElement('div');
+  pop.className = 'sidetrack-ann-pop';
+  pop.dataset.annId = opts.anchorId;
+  pop.innerHTML = `
+    <div class="head">
+      <span class="dot"></span>
+      <span>annotation</span>
+      <span class="meta"></span>
+      <button type="button" class="close" aria-label="Dismiss">×</button>
+    </div>
+    ${opts.quote === undefined || opts.quote.length === 0 ? '' : '<div class="quote"></div>'}
+    <div class="note"></div>
+  `;
+  // setText keeps the host page's HTML out of the popover — note
+  // and quote come from a captured turn body and from the user's
+  // own input, both treated as untrusted text.
+  if (opts.quote !== undefined && opts.quote.length > 0) {
+    const quoteEl = pop.querySelector<HTMLElement>('.quote');
+    if (quoteEl !== null) quoteEl.textContent = opts.quote;
+  }
+  const noteEl = pop.querySelector<HTMLElement>('.note');
+  if (noteEl !== null) noteEl.textContent = opts.note;
+  pop.querySelector<HTMLButtonElement>('.close')?.addEventListener('click', () => {
+    pop.remove();
+  });
+
+  // Left of the marker: marker is in the right gutter, popover slides
+  // out toward the page body. If there isn't room on the left (rare
+  // — the gutter is at viewport right), pin to the right edge.
+  const margin = 8;
+  const viewportH = document.documentElement.clientHeight;
+  let left = opts.anchorRect.left - ANN_POP_WIDTH - 10;
+  if (left < margin) {
+    left = Math.max(margin, opts.anchorRect.right - ANN_POP_WIDTH);
+  }
+  pop.style.left = `${String(Math.round(left))}px`;
+  pop.style.top = `${String(Math.round(Math.min(opts.anchorRect.top, viewportH - 80)))}px`;
+  root.appendChild(pop);
+
+  const onDocClick = (event: MouseEvent): void => {
+    const target = event.target;
+    if (
+      target instanceof Element &&
+      target.closest('.sidetrack-ann-pop') === null &&
+      target.closest('.sidetrack-ann-margin') === null
+    ) {
+      pop.remove();
+      document.removeEventListener('mousedown', onDocClick);
+    }
+  };
+  // Defer one frame so the click that opened the popover doesn't
+  // immediately close it.
+  window.requestAnimationFrame(() => {
+    document.addEventListener('mousedown', onDocClick);
+  });
+
+  return {
+    close: () => {
+      pop.remove();
+      document.removeEventListener('mousedown', onDocClick);
+    },
+  };
 };
 
 export interface DejaVuItem {
@@ -490,9 +658,7 @@ const clearReviewOverlays = (root: HTMLElement): void => {
   }
 };
 
-export const mountReviewSelectionChip = (
-  opts: ReviewChipMountOptions,
-): { close: () => void } => {
+export const mountReviewSelectionChip = (opts: ReviewChipMountOptions): { close: () => void } => {
   const root = ensureOverlayInfra();
   clearReviewOverlays(root);
 
@@ -503,8 +669,7 @@ export const mountReviewSelectionChip = (
   const COMMENT_W = 110;
   const DEJA_W = 100;
   const GAP = 6;
-  const totalWidth =
-    opts.onDejaVu !== undefined ? COMMENT_W + GAP + DEJA_W : COMMENT_W;
+  const totalWidth = opts.onDejaVu !== undefined ? COMMENT_W + GAP + DEJA_W : COMMENT_W;
   const viewportWidth = document.documentElement.clientWidth;
   let leftAnchor = Math.max(8, opts.anchorRect.right - 50);
   if (leftAnchor + totalWidth > viewportWidth - 8) {
@@ -666,7 +831,8 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
   if (isEmpty && list !== null) {
     const empty = document.createElement('div');
     empty.className = 'sidetrack-deja-empty';
-    empty.style.cssText = 'padding: 18px 14px; text-align: center; color: var(--ink-3); font-style: italic; font-size: 12px;';
+    empty.style.cssText =
+      'padding: 18px 14px; text-align: center; color: var(--ink-3); font-style: italic; font-size: 12px;';
     empty.textContent = 'No similar prior threads found in your vault.';
     list.appendChild(empty);
   }

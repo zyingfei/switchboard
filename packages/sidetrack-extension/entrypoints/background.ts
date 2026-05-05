@@ -37,6 +37,7 @@ import {
   isContentResponse,
   isRuntimeRequest,
   messageTypes,
+  type AnnotateTurnResponse,
   type RecallQueryResponse,
   type RuntimeRequest,
   type RuntimeResponse,
@@ -281,8 +282,7 @@ const sendToCompanion = async (
   const canonicalUrl = canonicalThreadUrl(event.threadUrl);
   const existingThread = allThreads.find(
     (thread) =>
-      thread.threadUrl === canonicalUrl ||
-      canonicalThreadUrl(thread.threadUrl) === canonicalUrl,
+      thread.threadUrl === canonicalUrl || canonicalThreadUrl(thread.threadUrl) === canonicalUrl,
   );
   const parentLink = resolveParentFromForkSource(event, allThreads);
   const client = createCompanionClient(settings.companion);
@@ -302,8 +302,8 @@ const sendToCompanion = async (
     event.turns
       .slice()
       .reverse()
-      .find((turn) => turn.role === 'assistant' && turn.modelName !== undefined)
-      ?.modelName ?? event.selectedModel;
+      .find((turn) => turn.role === 'assistant' && turn.modelName !== undefined)?.modelName ??
+    event.selectedModel;
   // Reuse the existing thread's bac_id — the event-result bac_id
   // is the per-event record id, NOT a thread id. Sending it as
   // thread.bac_id was forcing the companion's upsertThread to
@@ -728,10 +728,7 @@ const autoSendOnceTabReady = (tabId: number, body: string): void => {
           await storeCaptureEvent(captureResp.capture);
           void broadcastWorkboardChanged('capture');
         } else if (isContentResponse(captureResp) && !captureResp.ok) {
-          console.warn(
-            '[dispatchAutoSendInNewTab] post-send capture failed:',
-            captureResp.error,
-          );
+          console.warn('[dispatchAutoSendInNewTab] post-send capture failed:', captureResp.error);
         }
         void tab; // noop; reserved for future tab-state checks
       } catch (error) {
@@ -833,16 +830,14 @@ const runAutoSendDrain = async (threadId: string): Promise<AutoSendDrainOutcome>
       if (localSettings.companion.bridgeKey.trim().length === 0) {
         return {
           ...DEFAULT_LOCAL_CONFIG,
-          screenShareSafeMode:
-            DEFAULT_LOCAL_CONFIG.screenShareSafeMode || localScreenShareOn,
+          screenShareSafeMode: DEFAULT_LOCAL_CONFIG.screenShareSafeMode || localScreenShareOn,
         };
       }
       try {
         const companionSettings = await createSettingsClient(localSettings.companion).read();
         return {
           autoSendOptIn: companionSettings.autoSendOptIn,
-          screenShareSafeMode:
-            companionSettings.screenShareSafeMode || localScreenShareOn,
+          screenShareSafeMode: companionSettings.screenShareSafeMode || localScreenShareOn,
         };
       } catch (error) {
         console.warn(
@@ -851,8 +846,7 @@ const runAutoSendDrain = async (threadId: string): Promise<AutoSendDrainOutcome>
         );
         return {
           ...DEFAULT_LOCAL_CONFIG,
-          screenShareSafeMode:
-            DEFAULT_LOCAL_CONFIG.screenShareSafeMode || localScreenShareOn,
+          screenShareSafeMode: DEFAULT_LOCAL_CONFIG.screenShareSafeMode || localScreenShareOn,
         };
       }
     },
@@ -1326,9 +1320,7 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
     // stay current); new-thread captures are silently dropped.
     const settings = await readSettings();
     if (!settings.autoTrack) {
-      const known = (await readThreads()).find(
-        (t) => t.threadUrl === request.capture.threadUrl,
-      );
+      const known = (await readThreads()).find((t) => t.threadUrl === request.capture.threadUrl);
       if (known === undefined) {
         return { ok: true, state: await buildState('connected') };
       }
@@ -1394,10 +1386,7 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
   }
 
   if (request.type === messageTypes.reorderQueueItems) {
-    return await withCompanionStatus(
-      () => reorderLocalQueueItems(request.queueItemIds),
-      'queue',
-    );
+    return await withCompanionStatus(() => reorderLocalQueueItems(request.queueItemIds), 'queue');
   }
 
   if (request.type === messageTypes.retryAutoSend) {
@@ -1506,6 +1495,64 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
       }
     };
     return (await buildRecallResponse()) as unknown as RuntimeResponse;
+  }
+
+  if (request.type === messageTypes.annotateTurn) {
+    // Side-panel-driven turn annotation. We identify the chat tab by
+    // canonical URL match — provider SPAs add ?session=… and other
+    // drift to the live URL that's not on the captured threadUrl, so
+    // strict equality misses. The tab's content script does the
+    // actual work (locate the turn, anchor, persist, mount marker)
+    // and returns AnnotateTurnResponse, which we tunnel through
+    // RuntimeResponse the same way recallQuery does.
+    const buildAnnotateResponse = async (): Promise<AnnotateTurnResponse> => {
+      try {
+        const targetCanonical = canonicalThreadUrl(request.threadUrl);
+        const allTabs = await chrome.tabs.query({});
+        const match = allTabs.find(
+          (tab) =>
+            typeof tab.url === 'string' &&
+            tab.id !== undefined &&
+            canonicalThreadUrl(tab.url) === targetCanonical,
+        );
+        if (match?.id === undefined) {
+          return {
+            ok: false,
+            error:
+              'Open the chat tab in this window first — the annotation marker has to land on a live page.',
+          };
+        }
+        const result = await sendToContentScriptWithRecovery(match.id, {
+          type: messageTypes.annotateTurn,
+          threadUrl: request.threadUrl,
+          turnText: request.turnText,
+          ...(request.sourceSelector === undefined
+            ? {}
+            : { sourceSelector: request.sourceSelector }),
+          note: request.note,
+          capturedAt: request.capturedAt,
+        });
+        if (!result.ok) {
+          return { ok: false, error: result.error ?? 'Tab is not reachable.' };
+        }
+        const data = result.data;
+        if (
+          data !== null &&
+          typeof data === 'object' &&
+          'ok' in data &&
+          typeof data.ok === 'boolean'
+        ) {
+          return data as AnnotateTurnResponse;
+        }
+        return { ok: false, error: 'Content script returned an unexpected shape.' };
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : 'annotateTurn relay failed.',
+        };
+      }
+    };
+    return (await buildAnnotateResponse()) as unknown as RuntimeResponse;
   }
 
   if (request.type === messageTypes.focusThreadInSidePanel) {
@@ -1750,10 +1797,7 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
     request.type === messageTypes.unarchiveDispatch
   ) {
     return await withCompanionStatus(async () => {
-      await setDispatchArchived(
-        request.dispatchId,
-        request.type === messageTypes.archiveDispatch,
-      );
+      await setDispatchArchived(request.dispatchId, request.type === messageTypes.archiveDispatch);
     }, 'mutation');
   }
 

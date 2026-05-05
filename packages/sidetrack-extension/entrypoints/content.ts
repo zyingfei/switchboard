@@ -193,6 +193,27 @@ const isAutoSendItemMessage = (value: unknown): value is AutoSendItemMessage =>
   'text' in value &&
   typeof (value as { text: unknown }).text === 'string';
 
+interface AnnotateTurnMessage {
+  readonly type: typeof messageTypes.annotateTurn;
+  readonly threadUrl: string;
+  readonly turnText: string;
+  readonly sourceSelector?: string;
+  readonly note: string;
+  readonly capturedAt: string;
+}
+
+const isAnnotateTurnMessage = (value: unknown): value is AnnotateTurnMessage =>
+  typeof value === 'object' &&
+  value !== null &&
+  'type' in value &&
+  value.type === messageTypes.annotateTurn &&
+  'threadUrl' in value &&
+  typeof (value as { threadUrl: unknown }).threadUrl === 'string' &&
+  'turnText' in value &&
+  typeof (value as { turnText: unknown }).turnText === 'string' &&
+  'note' in value &&
+  typeof (value as { note: unknown }).note === 'string';
+
 const isContentRequest = (value: unknown): value is ContentRequest =>
   typeof value === 'object' &&
   value !== null &&
@@ -220,9 +241,9 @@ export default defineContentScript({
       });
 
     // Live in-page annotation set. Initially populated from the
-     // companion's persisted list on page load; appended to
-     // optimistically when the user saves a new comment so the
-     // margin marker shows up without requiring a page reload.
+    // companion's persisted list on page load; appended to
+    // optimistically when the user saves a new comment so the
+    // margin marker shows up without requiring a page reload.
     const liveAnchors: RestoredAnchor[] = [];
 
     const restoreAnnotations = async (): Promise<void> => {
@@ -235,7 +256,12 @@ export default defineContentScript({
         for (const annotation of annotations) {
           const range = findAnchor(document.documentElement, annotation.anchor);
           if (range !== null) {
-            liveAnchors.push({ id: annotation.bac_id, rect: range.getBoundingClientRect() });
+            liveAnchors.push({
+              id: annotation.bac_id,
+              rect: range.getBoundingClientRect(),
+              note: annotation.note,
+              quote: range.toString().slice(0, 280),
+            });
           }
         }
         if (liveAnchors.length > 0) {
@@ -246,13 +272,219 @@ export default defineContentScript({
       }
     };
 
-    const addLiveAnnotation = (id: string, range: Range): void => {
+    const addLiveAnnotation = (id: string, range: Range, note?: string, quote?: string): void => {
       // Optimistic mount: drop in the marker at the user's selection
       // immediately so they get visible feedback that their save took
       // effect. The companion's persisted record syncs on next page
-      // load (mountAnnotationOverlay clears + re-renders).
-      liveAnchors.push({ id, rect: range.getBoundingClientRect() });
+      // load (mountAnnotationOverlay clears + re-renders). Note +
+      // quote ride along so click-to-reveal on the marker shows the
+      // user's own annotation right after they save.
+      liveAnchors.push({
+        id,
+        rect: range.getBoundingClientRect(),
+        ...(note === undefined ? {} : { note }),
+        ...(quote === undefined ? {} : { quote }),
+      });
       mountAnnotationOverlay(liveAnchors);
+    };
+
+    // Normalize text for cross-source comparison. Captured turn.text
+    // is markdown (** _ ` # etc.) but the live page's textContent has
+    // none of those decorations. We strip markdown punctuation from
+    // both sides, collapse whitespace, and lowercase so a probe taken
+    // from one matches the other reliably.
+    const normalizeForMatch = (input: string): string =>
+      input
+        .replace(/[*_`~#>|\\[\]()]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+
+    // Strip the role prefix the capture pipeline prepends to each
+    // turn body ("You said:", "ChatGPT said:", "Claude said:", etc.).
+    // The live page's DOM doesn't carry that prefix — it's a
+    // convention of domToMarkdown for read-back, not part of the
+    // rendered turn. Without this strip, a "test123" user turn shows
+    // up as "you said: test123" in the probe and matches nothing.
+    const stripRolePrefix = (input: string): string =>
+      input.replace(
+        /^\s*(?:you|chatgpt|claude|gemini|assistant|user|model)\s+said\s*[:：]\s*/i,
+        '',
+      );
+
+    // Pick a discriminating probe from the middle of the turn — head
+    // probes collide on common openings ("Sure, here's…", "I'll
+    // help you…"). For very short turns the whole body IS the probe.
+    const buildProbe = (normalized: string): string => {
+      if (normalized.length <= 60) return normalized;
+      const start = Math.max(0, Math.floor(normalized.length / 3));
+      return normalized.slice(start, start + 60);
+    };
+
+    const queryTurnCandidates = (selector: string): readonly HTMLElement[] | null => {
+      try {
+        return Array.from(document.querySelectorAll(selector)).filter(
+          (node): node is HTMLElement => node instanceof HTMLElement,
+        );
+      } catch {
+        return null;
+      }
+    };
+
+    const findTurnInCandidates = (
+      candidates: readonly HTMLElement[],
+      probe: string,
+    ): { readonly element: HTMLElement | null; readonly diagnostic: string } => {
+      // First pass: exact equality. Wins on short turns ("test123")
+      // where many candidates would also pass `includes`.
+      for (const node of candidates) {
+        if (normalizeForMatch(node.textContent) === probe) {
+          return {
+            element: node,
+            diagnostic: `matched on exact text equality across ${String(candidates.length)} candidates`,
+          };
+        }
+      }
+      // Second pass: substring. For longer turns the live DOM's
+      // textContent often includes extra UI chrome (timestamps,
+      // model labels) so exact equality is too strict.
+      for (const node of candidates) {
+        if (normalizeForMatch(node.textContent).includes(probe)) {
+          return {
+            element: node,
+            diagnostic: `matched on text-quote substring across ${String(candidates.length)} candidates`,
+          };
+        }
+      }
+      return { element: null, diagnostic: 'no text match' };
+    };
+
+    // Find the turn element on this page using text matching across
+    // the captured selector's candidate set first, then the provider's
+    // broader turn selector. Captured `sourceSelector` values are not
+    // unique anchors — ChatGPT may store a broad selector such as
+    // `main [data-message-author-role]` — so a raw querySelector()
+    // would incorrectly pin every annotation to the first turn.
+    const findTurnElementOnPage = (
+      sourceSelector: string | undefined,
+      turnText: string,
+    ): { readonly element: HTMLElement | null; readonly diagnostic: string } => {
+      const tried: string[] = [];
+      const probe = buildProbe(normalizeForMatch(stripRolePrefix(turnText)));
+      if (probe.length === 0) {
+        return {
+          element: null,
+          diagnostic: `probe empty after strip+normalize; tried=[${tried.join(', ')}]`,
+        };
+      }
+      if (sourceSelector !== undefined && sourceSelector.length > 0) {
+        const sourceCandidates = queryTurnCandidates(sourceSelector);
+        if (sourceCandidates === null) {
+          tried.push(`sourceSelector threw on querySelector (${sourceSelector})`);
+        } else {
+          tried.push(
+            `sourceSelector=${sourceSelector} candidates=${String(sourceCandidates.length)}`,
+          );
+          const sourceMatch = findTurnInCandidates(sourceCandidates, probe);
+          if (sourceMatch.element !== null) {
+            return {
+              element: sourceMatch.element,
+              diagnostic: `${sourceMatch.diagnostic} via sourceSelector`,
+            };
+          }
+        }
+      }
+      const turnSelector = turnSelectorForCurrentProvider();
+      tried.push(`turnSelector=${turnSelector ?? 'null'}`);
+      const candidates = turnSelector === null ? [] : (queryTurnCandidates(turnSelector) ?? []);
+      const turnMatch = findTurnInCandidates(candidates, probe);
+      if (turnMatch.element !== null) {
+        return {
+          element: turnMatch.element,
+          diagnostic: `${turnMatch.diagnostic} via turnSelector`,
+        };
+      }
+      return {
+        element: null,
+        diagnostic: `no match across ${String(candidates.length)} candidates (probe="${probe.slice(0, 40)}…", tried=[${tried.join(', ')}])`,
+      };
+    };
+
+    const annotateTurnFromSidepanel = async (
+      message: AnnotateTurnMessage,
+    ): Promise<{
+      readonly ok: boolean;
+      readonly error?: string;
+      readonly annotationId?: string;
+    }> => {
+      const lookup = findTurnElementOnPage(message.sourceSelector, message.turnText);
+      const target = lookup.element;
+      if (target === null) {
+        // Surface the diagnostic in the page console so the user can
+        // open devtools and see exactly which path failed without
+        // leaking the full turn body into the side panel error pill.
+        console.warn('[sidetrack] annotateTurn lookup failed:', lookup.diagnostic);
+        return {
+          ok: false,
+          error: `Could not locate that turn on the live page (${lookup.diagnostic}). Open devtools to inspect.`,
+        };
+      }
+      // Range over the entire turn element so the marker pins to the
+      // turn's visual block, not a sub-selection. Using textContent
+      // length keeps the range valid even when the turn contains
+      // mixed inline + block content.
+      let range: Range;
+      try {
+        range = document.createRange();
+        range.selectNodeContents(target);
+      } catch {
+        return { ok: false, error: 'Failed to build a Range over the turn element.' };
+      }
+      let anchor;
+      try {
+        anchor = serializeAnchor(range);
+      } catch {
+        return { ok: false, error: 'Failed to serialize the turn anchor.' };
+      }
+      // Optimistic marker first — even if persistence fails, the
+      // user gets immediate visual confirmation that their note
+      // landed on the right turn. Local id stays unique enough to
+      // not collide with persisted bac_ids. The quote excerpt is
+      // the live page's textContent for the matched element so the
+      // popover shows what's actually under the marker (vs the
+      // markdown turn body, which has formatting decorations).
+      const optimisticId = `local-turn-${String(Date.now())}`;
+      const liveQuote = target.textContent.trim().slice(0, 280);
+      addLiveAnnotation(optimisticId, range, message.note, liveQuote);
+
+      // Best-effort persist via the existing AnnotationClient. The
+      // sidepanel could persist instead, but doing it here keeps the
+      // anchor and persist call together so they can't drift out of
+      // sync (sidepanel sees a different anchor than what got mounted).
+      try {
+        const client = await createAnnotationClient();
+        if (client === undefined) {
+          return {
+            ok: true,
+            error: 'Companion not configured — annotation kept in this session only.',
+          };
+        }
+        const persisted = await client.createAnnotation({
+          url: message.threadUrl,
+          pageTitle: document.title,
+          anchor,
+          note: message.note,
+        });
+        return { ok: true, annotationId: persisted.bac_id };
+      } catch (error) {
+        return {
+          ok: true,
+          error:
+            error instanceof Error
+              ? `${error.message} (annotation kept in this session only.)`
+              : 'Persist failed — annotation kept in this session only.',
+        };
+      }
     };
 
     // Déjà-vu pop-on-highlight — debounced selection listener that
@@ -317,7 +549,9 @@ export default defineContentScript({
       const provider = detectProviderFromUrl(window.location.href);
       if (provider === 'unknown') return null;
       const config = providerConfigs[provider];
-      const direct = config.directSources.map((source) => source.selector).filter((s) => s.length > 0);
+      const direct = config.directSources
+        .map((source) => source.selector)
+        .filter((s) => s.length > 0);
       if (direct.length === 0) return null;
       return direct.join(', ');
     };
@@ -366,7 +600,7 @@ export default defineContentScript({
           // confirmation their note saved without waiting for a page
           // reload. The id is local-only; on next page load the
           // companion's persisted annotation list takes over.
-          addLiveAnnotation(`local-${String(Date.now())}`, range);
+          addLiveAnnotation(`local-${String(Date.now())}`, range, comment, quote);
         },
         onDismiss: () => {
           reviewChipMounted = null;
@@ -419,24 +653,26 @@ export default defineContentScript({
         if (results.length === 0 && !force) return;
         closeDejaVu();
         dejaVuMounted = mountDejaVuPopover({
-          items: results.map((r: RankedItem): DejaVuItem => ({
-            id: r.id,
-            title: r.title ?? `thread ${r.threadId.slice(0, 12)}`,
-            snippet: r.snippet ?? '',
-            score: r.score,
-            relativeWhen: r.capturedAt,
-            // Provider is derived from the matched thread's URL when
-            // we have it (different chat → different provider chip);
-            // we fall back to the current page's provider for legacy
-            // results that don't carry a threadUrl yet.
-            provider: detectProviderFromUrl(r.threadUrl ?? window.location.href),
-            // Jump must go to the MATCHED thread, not the current
-            // page. Setting threadUrl to window.location.href here
-            // was a copy-paste leftover that made every Jump a no-op
-            // (focus-in-side-panel for the page you're already on).
-            ...(r.threadUrl === undefined ? {} : { threadUrl: r.threadUrl }),
-            bacId: r.threadId,
-          })),
+          items: results.map(
+            (r: RankedItem): DejaVuItem => ({
+              id: r.id,
+              title: r.title ?? `thread ${r.threadId.slice(0, 12)}`,
+              snippet: r.snippet ?? '',
+              score: r.score,
+              relativeWhen: r.capturedAt,
+              // Provider is derived from the matched thread's URL when
+              // we have it (different chat → different provider chip);
+              // we fall back to the current page's provider for legacy
+              // results that don't carry a threadUrl yet.
+              provider: detectProviderFromUrl(r.threadUrl ?? window.location.href),
+              // Jump must go to the MATCHED thread, not the current
+              // page. Setting threadUrl to window.location.href here
+              // was a copy-paste leftover that made every Jump a no-op
+              // (focus-in-side-panel for the page you're already on).
+              ...(r.threadUrl === undefined ? {} : { threadUrl: r.threadUrl }),
+              bacId: r.threadId,
+            }),
+          ),
           anchorRect,
           onJump: (item) => {
             if (item.threadUrl !== undefined) {
@@ -511,10 +747,7 @@ export default defineContentScript({
       // to the popover's own listeners (jump / close button).
       const target = event.target;
       if (target instanceof Element) {
-        if (
-          dejaVuMounted !== null &&
-          target.closest('.sidetrack-deja-pop') === null
-        ) {
+        if (dejaVuMounted !== null && target.closest('.sidetrack-deja-pop') === null) {
           closeDejaVu();
         }
         if (
@@ -609,7 +842,12 @@ export default defineContentScript({
       (
         message: unknown,
         _sender,
-        sendResponse: (response: ContentResponse | AutoSendResult) => void,
+        sendResponse: (
+          response:
+            | ContentResponse
+            | AutoSendResult
+            | { readonly ok: boolean; readonly error?: string; readonly annotationId?: string },
+        ) => void,
       ) => {
         if (isContentRequest(message)) {
           try {
@@ -633,6 +871,19 @@ export default defineContentScript({
               sendResponse({
                 ok: false,
                 error: error instanceof Error ? error.message : 'auto-send failed.',
+              });
+            });
+          return true;
+        }
+        if (isAnnotateTurnMessage(message)) {
+          annotateTurnFromSidepanel(message)
+            .then((result) => {
+              sendResponse(result);
+            })
+            .catch((error: unknown) => {
+              sendResponse({
+                ok: false,
+                error: error instanceof Error ? error.message : 'annotateTurn failed.',
               });
             });
           return true;

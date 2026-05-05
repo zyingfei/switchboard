@@ -17,6 +17,7 @@ import {
   isFocusThreadInSidePanelMessage,
   isWorkboardChangedMessage,
   messageTypes,
+  type AnnotateTurnResponse,
   type RuntimeResponse,
   type WorkboardRequest,
 } from '../../src/messages';
@@ -629,9 +630,7 @@ const App = () => {
       return undefined;
     }
     const targetWorkstreamId = composeWorkstreamOverrideId ?? composeThread.primaryWorkstreamId;
-    return state.workstreams.find(
-      (workstream) => workstream.bac_id === targetWorkstreamId,
-    );
+    return state.workstreams.find((workstream) => workstream.bac_id === targetWorkstreamId);
   }, [composeThread, composeWorkstreamOverrideId, state.workstreams]);
 
   const refresh = async () => {
@@ -686,12 +685,13 @@ const App = () => {
     let cancelled = false;
     const fetchRecall = async (): Promise<void> => {
       try {
-        const response = await fetch(
-          `http://127.0.0.1:${String(portValue)}/v1/system/health`,
-          { headers: { 'x-bac-bridge-key': bridgeKey } },
-        );
+        const response = await fetch(`http://127.0.0.1:${String(portValue)}/v1/system/health`, {
+          headers: { 'x-bac-bridge-key': bridgeKey },
+        });
         if (!response.ok || cancelled) return;
-        const body = (await response.json()) as { readonly data?: { readonly recall?: { readonly status?: unknown } } };
+        const body = (await response.json()) as {
+          readonly data?: { readonly recall?: { readonly status?: unknown } };
+        };
         const status = body.data?.recall?.status;
         if (
           status === 'missing' ||
@@ -941,6 +941,18 @@ const App = () => {
   const [inlineTurnsByUrl, setInlineTurnsByUrl] = useState<
     ReadonlyMap<string, readonly CapturedTurnRecord[]>
   >(() => new Map<string, readonly CapturedTurnRecord[]>());
+  // Inline per-turn annotation composer state. Only one turn is open
+  // for annotation at a time across the side panel — saving or
+  // cancelling clears it. We key by `${threadUrl}::${ordinal}` so
+  // re-collapsing and re-expanding the same thread doesn't drop a
+  // half-typed note.
+  const [annotateTurnKey, setAnnotateTurnKey] = useState<string | null>(null);
+  const [annotateTurnDraft, setAnnotateTurnDraft] = useState('');
+  const [annotateTurnStatus, setAnnotateTurnStatus] = useState<{
+    readonly key: string;
+    readonly tone: 'saving' | 'ok' | 'error';
+    readonly text: string;
+  } | null>(null);
   // Refs to thread row DOM elements, keyed by bac_id, so the
   // chat-side focus button can scrollIntoView + flash the matching
   // row. Map mutated via the ref callback below.
@@ -963,9 +975,7 @@ const App = () => {
   // even though the registration runs only once.
   const viewModeRef = useRef<'workstream' | 'all'>('workstream');
   const currentWsIdRef = useRef<string | null>(null);
-  const expandBucketForThreadRef = useRef<
-    ((thread: TrackedThread) => Promise<void>) | null
-  >(null);
+  const expandBucketForThreadRef = useRef<((thread: TrackedThread) => Promise<void>) | null>(null);
   const activeTabTrackedThread = useMemo(
     () =>
       state.activeTabUrl === undefined
@@ -1059,13 +1069,7 @@ const App = () => {
     return () => {
       cancelled = true;
     };
-  }, [
-    composeThread,
-    bridgeKey,
-    port,
-    composeScopeSuggestionsByThread,
-    state.workstreams,
-  ]);
+  }, [composeThread, bridgeKey, port, composeScopeSuggestionsByThread, state.workstreams]);
 
   // Pre-fetch turns when the Send-to dropdown opens, so the smart-
   // default packet builder has full chat context cached when the
@@ -1673,6 +1677,57 @@ const App = () => {
       });
       return next;
     });
+  };
+
+  const submitTurnAnnotation = (threadUrl: string, turn: CapturedTurnRecord, key: string): void => {
+    const note = annotateTurnDraft.trim();
+    if (note.length === 0) {
+      return;
+    }
+    setAnnotateTurnStatus({ key, tone: 'saving', text: 'placing marker on the live page…' });
+    void (async () => {
+      try {
+        const response: AnnotateTurnResponse = await chrome.runtime.sendMessage({
+          type: messageTypes.annotateTurn,
+          threadUrl,
+          turnText: turn.text,
+          ...(turn.sourceSelector === undefined ? {} : { sourceSelector: turn.sourceSelector }),
+          note,
+          capturedAt: new Date().toISOString(),
+        });
+        if (!response.ok) {
+          setAnnotateTurnStatus({
+            key,
+            tone: 'error',
+            text: response.error ?? 'Could not place the marker.',
+          });
+          return;
+        }
+        setAnnotateTurnDraft('');
+        setAnnotateTurnKey(null);
+        // Surface a soft success line so the user can confirm the
+        // marker landed even though the side panel doesn't show the
+        // live page. The fallback message ("kept in this session
+        // only") flows through here when companion persistence fails
+        // but the in-page marker still mounted.
+        setAnnotateTurnStatus({
+          key,
+          tone: response.error === undefined ? 'ok' : 'error',
+          text: response.error ?? 'marker placed on live page',
+        });
+        window.setTimeout(() => {
+          setAnnotateTurnStatus((current) =>
+            current !== null && current.key === key ? null : current,
+          );
+        }, 4_000);
+      } catch (error) {
+        setAnnotateTurnStatus({
+          key,
+          tone: 'error',
+          text: error instanceof Error ? error.message : 'annotateTurn failed.',
+        });
+      }
+    })();
   };
 
   const toggleThreadHistory = (threadId: string) => {
@@ -2363,9 +2418,7 @@ const App = () => {
             >
               <span className="thread-autosend-dot" aria-hidden />
               <span className="thread-autosend-label">auto-send</span>
-              <span className="thread-autosend-state">
-                {thread.autoSendEnabled ? 'on' : 'off'}
-              </span>
+              <span className="thread-autosend-state">{thread.autoSendEnabled ? 'on' : 'off'}</span>
             </button>
           ) : null}
         </div>
@@ -2450,8 +2503,7 @@ const App = () => {
                 linkedThreadId === undefined
                   ? undefined
                   : state.threads.find((t) => t.bac_id === linkedThreadId);
-              const targetLabel =
-                TARGET_PROVIDER_LABEL[d.target.provider] ?? d.target.provider;
+              const targetLabel = TARGET_PROVIDER_LABEL[d.target.provider] ?? d.target.provider;
               const destTitle =
                 linkedThread?.title ??
                 (d.target.mode === 'auto-send' ? 'pending — new chat' : 'pending — paste it');
@@ -2474,9 +2526,7 @@ const App = () => {
                   ) : (
                     <span className="thread-dispatched-name muted">{destTitle}</span>
                   )}
-                  <span className="thread-dispatched-when mono">
-                    {formatRelative(d.createdAt)}
-                  </span>
+                  <span className="thread-dispatched-when mono">{formatRelative(d.createdAt)}</span>
                 </li>
               );
             })}
@@ -2514,8 +2564,7 @@ const App = () => {
                 <button
                   type="button"
                   className={
-                    'btn-link thread-action-icon' +
-                    (requiresCompanion ? ' disabled-look' : '')
+                    'btn-link thread-action-icon' + (requiresCompanion ? ' disabled-look' : '')
                   }
                   title={
                     requiresCompanion
@@ -2792,9 +2841,7 @@ const App = () => {
                             event.preventDefault();
                             const fromTransfer = event.dataTransfer.getData('text/plain');
                             const sourceId =
-                              fromTransfer.length > 0
-                                ? fromTransfer
-                                : (draggedQueueItemId ?? '');
+                              fromTransfer.length > 0 ? fromTransfer : (draggedQueueItemId ?? '');
                             setDraggedQueueItemId(null);
                             setDragOverQueueItemId(null);
                             if (sourceId.length === 0 || sourceId === item.bac_id) {
@@ -2896,65 +2943,127 @@ const App = () => {
                 no captured turns for this thread (companion may be unreachable)
               </div>
             ) : (
-              inlineTurns.map((turn) => (
-                <div
-                  key={`${turn.role}-${String(turn.ordinal)}-${turn.capturedAt}`}
-                  className={'thread-turn-card thread-turn-' + turn.role}
-                >
-                  <span className="thread-turn-role mono">{turn.role}</span>
-                  <span className="thread-turn-text">
-                    <TurnText text={turn.text} maxChars={200} />
-                  </span>
-                  {/* No per-turn time stamp: providers don't expose
-                      stable per-message timestamps in their DOM, and
-                      capturedAt is "first seen by Sidetrack" not
-                      "AI replied at" — showing it as "X min ago"
-                      misleads users who captured the chat after the
-                      conversation. The thread-level "Last seen · X
-                      ago" already conveys the right signal. */}
-                </div>
-              ))
+              inlineTurns.map((turn) => {
+                const turnKey = `${thread.threadUrl}::${String(turn.ordinal)}::${turn.role}`;
+                const annotateOpen = annotateTurnKey === turnKey;
+                const status =
+                  annotateTurnStatus !== null && annotateTurnStatus.key === turnKey
+                    ? annotateTurnStatus
+                    : null;
+                return (
+                  <div
+                    key={`${turn.role}-${String(turn.ordinal)}-${turn.capturedAt}`}
+                    className={'thread-turn-card thread-turn-' + turn.role}
+                  >
+                    <span className="thread-turn-role mono">{turn.role}</span>
+                    <span className="thread-turn-text">
+                      <TurnText text={turn.text} maxChars={200} />
+                    </span>
+                    <button
+                      type="button"
+                      className="thread-turn-annotate-btn mono"
+                      title="Drop a margin annotation on this turn — appears on the live page without reload"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (annotateOpen) {
+                          setAnnotateTurnKey(null);
+                          setAnnotateTurnDraft('');
+                          return;
+                        }
+                        setAnnotateTurnKey(turnKey);
+                        setAnnotateTurnDraft('');
+                        setAnnotateTurnStatus(null);
+                      }}
+                    >
+                      {annotateOpen ? '× cancel' : '✎ annotate'}
+                    </button>
+                    {annotateOpen ? (
+                      <form
+                        className="thread-turn-annotate-form"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                        }}
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          submitTurnAnnotation(thread.threadUrl, turn, turnKey);
+                        }}
+                      >
+                        <textarea
+                          className="thread-turn-annotate-input"
+                          rows={2}
+                          autoFocus
+                          placeholder="What's worth flagging on this turn? (saves a margin marker on the live page)"
+                          value={annotateTurnDraft}
+                          onChange={(e) => {
+                            setAnnotateTurnDraft(e.target.value);
+                          }}
+                        />
+                        <div className="thread-turn-annotate-row">
+                          <span
+                            className={
+                              'thread-turn-annotate-status mono' +
+                              (status === null ? '' : ' tone-' + status.tone)
+                            }
+                          >
+                            {status?.text ?? ''}
+                          </span>
+                          <button
+                            type="submit"
+                            className="btn-link mono"
+                            disabled={
+                              annotateTurnDraft.trim().length === 0 ||
+                              (status?.tone ?? '') === 'saving'
+                            }
+                          >
+                            {(status?.tone ?? '') === 'saving' ? 'placing…' : 'place marker'}
+                          </button>
+                        </div>
+                      </form>
+                    ) : null}
+                  </div>
+                );
+              })
             )}
           </div>
         ) : null}
         <div className="thread-history">
           {historyOpen ? (
             <>
-              {threadNotes.length === 0 ? null : (
-                threadNotes.map((note) => (
-                  <div key={note.bac_id} className="thread-history-item">
-                    <span className="glyph" aria-hidden>
-                      ▍
-                    </span>
-                    <div className="body">{note.text}</div>
-                    <span className="meta">{formatRelative(note.createdAt)}</span>
-                    <div className="actions">
-                      <button
-                        type="button"
-                        className="btn-link"
-                        title="Edit this note"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          beginEditNote(note.bac_id, note.text);
-                        }}
-                      >
-                        Edit
-                      </button>
-                      <button
-                        type="button"
-                        className="btn-link"
-                        title="Delete this note"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          deleteNote(note.bac_id);
-                        }}
-                      >
-                        Delete
-                      </button>
+              {threadNotes.length === 0
+                ? null
+                : threadNotes.map((note) => (
+                    <div key={note.bac_id} className="thread-history-item">
+                      <span className="glyph" aria-hidden>
+                        ▍
+                      </span>
+                      <div className="body">{note.text}</div>
+                      <span className="meta">{formatRelative(note.createdAt)}</span>
+                      <div className="actions">
+                        <button
+                          type="button"
+                          className="btn-link"
+                          title="Edit this note"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            beginEditNote(note.bac_id, note.text);
+                          }}
+                        >
+                          Edit
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-link"
+                          title="Delete this note"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            deleteNote(note.bac_id);
+                          }}
+                        >
+                          Delete
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                ))
-              )}
+                  ))}
               {historyComposeOpen ? (
                 <form
                   className="thread-history-compose"
@@ -3294,19 +3403,17 @@ const App = () => {
       <div className="sp-status">
         <span
           className={
-            'sp-status-pill mono ' +
-            (state.companionStatus === 'vault-error' ? 'err' : 'ok')
+            'sp-status-pill mono ' + (state.companionStatus === 'vault-error' ? 'err' : 'ok')
           }
           title={
             state.companionStatus === 'vault-error'
-              ? 'Vault: companion can\'t reach the configured folder'
+              ? "Vault: companion can't reach the configured folder"
               : 'Vault: synced via companion'
           }
         >
           <span
             className={
-              'sp-status-dot ' +
-              (state.companionStatus === 'vault-error' ? 'red' : 'green')
+              'sp-status-dot ' + (state.companionStatus === 'vault-error' ? 'red' : 'green')
             }
             aria-hidden
           />
@@ -3493,9 +3600,7 @@ const App = () => {
                   title,
                   ...(parentId === null ? {} : { parentId }),
                   privacy: 'shared',
-                  ...(description !== undefined && description.length > 0
-                    ? { description }
-                    : {}),
+                  ...(description !== undefined && description.length > 0 ? { description } : {}),
                 },
               });
             }).then(() => {
@@ -4306,8 +4411,7 @@ const App = () => {
             // form too. Otherwise the user pastes the redacted text,
             // the matcher's needle (unredacted) never substring-hits
             // the captured turn, and the dispatch never links.
-            const displayBody =
-              state.dispatchOriginals[dispatch.bac_id] ?? dispatch.body;
+            const displayBody = state.dispatchOriginals[dispatch.bac_id] ?? dispatch.body;
             const targetLabel =
               TARGET_PROVIDER_LABEL[dispatch.target.provider] ?? dispatch.target.provider;
             const linkedThreadId = state.dispatchLinks[dispatch.bac_id];
@@ -4669,9 +4773,11 @@ interface NeedsOrganizeSuggestionRowProps {
   // semantics). Threaded in so the row shows real names instead of
   // a bac_id slice.
   readonly resolveLabel: (workstreamId: string) => string;
-  readonly onCache: (
-    payload: { readonly workstreamId: string; readonly label: string; readonly confidence: number },
-  ) => void;
+  readonly onCache: (payload: {
+    readonly workstreamId: string;
+    readonly label: string;
+    readonly confidence: number;
+  }) => void;
   readonly onClearCache: () => void;
   readonly onAccept: (workstreamId: string) => void;
   readonly onPickManual: () => void;
@@ -4882,11 +4988,7 @@ interface WorkstreamPickerProps {
   readonly parentForNew: string | null;
   readonly onClose: () => void;
   readonly onSelect: (id: string | null) => void;
-  readonly onCreate: (
-    title: string,
-    parentId: string | null,
-    description?: string,
-  ) => void;
+  readonly onCreate: (title: string, parentId: string | null, description?: string) => void;
 }
 
 function WorkstreamPicker({
