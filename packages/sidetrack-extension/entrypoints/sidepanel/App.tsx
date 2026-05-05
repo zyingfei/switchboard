@@ -605,6 +605,16 @@ const App = () => {
       .catch(() => {
         setSetupCompleted(false);
       });
+    // Periodic state refresh — keeps the header status pills (vault +
+    // companion) in sync with reality. Without this, companion going
+    // down between user actions wasn't detected and the pill stayed
+    // green until the next user action.
+    const id = window.setInterval(() => {
+      void refresh().catch(() => undefined);
+    }, 15_000);
+    return () => {
+      window.clearInterval(id);
+    };
   }, []);
 
   useEffect(() => {
@@ -2867,6 +2877,14 @@ const App = () => {
         <div className="app-mark">
           <span className="glyph" aria-hidden />
           Sidetrack
+          {__DEV__ ? (
+            <span
+              className="app-mark-dev mono"
+              title="Development build — production omits this badge and the design-preview icon"
+            >
+              DEV
+            </span>
+          ) : null}
         </div>
         <div className="view-tabs sp-tabs" role="tablist" aria-label="View">
           <button
