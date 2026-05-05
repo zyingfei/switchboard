@@ -779,6 +779,21 @@ export const createLocalReminder = async (
   result?: { readonly bac_id: string; readonly revision?: string },
 ): Promise<InboundReminder> => {
   const current = await readReminders();
+  // Dedup: if there's already ANY reminder for this thread (any
+  // status) at or after this detectedAt timestamp, the new one is
+  // a duplicate of an event we already processed. Common case:
+  // extension reload re-injects content scripts → each open chat
+  // tab re-captures → the assistant turn timestamp matches the
+  // last-stored reminder → we'd otherwise spawn a fresh "new"
+  // reminder for an already-dismissed read. Skip in that case.
+  const newDetected = Date.parse(input.detectedAt);
+  const stalest = current.find(
+    (r) =>
+      r.threadId === input.threadId && Date.parse(r.detectedAt) >= newDetected,
+  );
+  if (stalest !== undefined) {
+    return stalest;
+  }
   const reminder: InboundReminder = {
     bac_id: result?.bac_id ?? createLocalBacId(),
     revision: result?.revision,

@@ -512,7 +512,10 @@ const App = () => {
       onChanged?.removeListener(onStorageChanged);
     };
   }, []);
-  const [theme, setTheme] = useState<ThemeMode>('auto');
+  // Default to light explicitly — 'auto' was tracking system theme,
+  // surprising users who keep their OS in dark mode but expect the
+  // side panel to stay light. User can flip in Settings.
+  const [theme, setTheme] = useState<ThemeMode>('light');
   const [density, setDensity] = useState<DensityMode>('cozy');
 
   // Apply theme + density to the root <html> element so all sidepanel
@@ -788,8 +791,6 @@ const App = () => {
     activeTabTrackedThread !== undefined &&
     focusingThreadId !== activeTabTrackedThread.bac_id &&
     state.activeTabUrl !== findPulseDismissedUrl;
-  const designPreviewEnabled =
-    __DEV__ || new URLSearchParams(window.location.search).has('design-preview');
   useEffect(() => {
     if (
       composeThread === undefined ||
@@ -2967,35 +2968,36 @@ const App = () => {
               <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
             </svg>
           </button>
-          {designPreviewEnabled ? (
-            <button
-              className="icon-btn"
-              title="Design preview — v2 surfaces"
-              onClick={() => {
-                setDesignPreviewOpen(true);
-              }}
-              type="button"
-              aria-label="Open design preview"
+          {/* Design preview — always-on for now (was gated by __DEV__).
+              Re-gate once the surfaces it shows are wired into
+              production rendering. */}
+          <button
+            className="icon-btn"
+            title="Design preview — v2 surfaces"
+            onClick={() => {
+              setDesignPreviewOpen(true);
+            }}
+            type="button"
+            aria-label="Open design preview"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+              strokeLinejoin="round"
             >
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.6"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <circle cx="13" cy="6" r="2" />
-                <circle cx="6" cy="13" r="2" />
-                <circle cx="13" cy="20" r="2" />
-                <circle cx="20" cy="13" r="2" />
-                <line x1="11.6" y1="7.4" x2="7.4" y2="11.6" />
-                <line x1="14.4" y1="7.4" x2="18.6" y2="11.6" />
-                <line x1="11.6" y1="18.6" x2="7.4" y2="14.4" />
-                <line x1="14.4" y1="18.6" x2="18.6" y2="14.4" />
-              </svg>
-            </button>
-          ) : null}
+              <circle cx="13" cy="6" r="2" />
+              <circle cx="6" cy="13" r="2" />
+              <circle cx="13" cy="20" r="2" />
+              <circle cx="20" cy="13" r="2" />
+              <line x1="11.6" y1="7.4" x2="7.4" y2="11.6" />
+              <line x1="14.4" y1="7.4" x2="18.6" y2="11.6" />
+              <line x1="11.6" y1="18.6" x2="7.4" y2="14.4" />
+              <line x1="14.4" y1="18.6" x2="18.6" y2="14.4" />
+            </svg>
+          </button>
           <button
             className="icon-btn"
             title="Settings"
