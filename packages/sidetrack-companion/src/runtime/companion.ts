@@ -1,6 +1,7 @@
 import { ensureBridgeKey } from '../auth/bridgeKey.js';
 import { createIdempotencyStore } from '../http/idempotency.js';
 import { pickInstaller } from '../install/index.js';
+import { createRecallLifecycle } from '../recall/lifecycle.js';
 import { createBucketRegistry } from '../routing/registry.js';
 import {
   createCompanionHttpServer,
@@ -10,6 +11,7 @@ import {
 import { enforceRetention } from '../vault/auditRetention.js';
 import { createVaultWatcher, type VaultChangeEvent, type VaultWatcher } from '../vault/watcher.js';
 import { createVaultWriter } from '../vault/writer.js';
+import { COMPANION_VERSION } from '../version.js';
 
 export interface CompanionRuntimeOptions {
   readonly vaultPath: string;
@@ -56,6 +58,13 @@ export const startCompanion = async (
       hygieneStatus.lastAuditRetentionAt = new Date().toISOString();
     });
   }, 24 * 60 * 60 * 1000);
+  const recallLifecycle = createRecallLifecycle({
+    vaultRoot: options.vaultPath,
+    companionVersion: COMPANION_VERSION,
+  });
+  // Don't block startup on the rebuild — health endpoint will report
+  // status: 'rebuilding' until the background task completes.
+  void recallLifecycle.ensureFresh();
   const server = createCompanionHttpServer({
     bridgeKey: ensured.key,
     vaultWriter,
@@ -66,6 +75,7 @@ export const startCompanion = async (
     startedAt: new Date(),
     bucketRegistry: createBucketRegistry(options.vaultPath),
     hygieneStatus,
+    recallLifecycle,
     vaultChanges: {
       subscribe(listener) {
         listeners.add(listener);

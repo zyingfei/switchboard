@@ -23,6 +23,16 @@ interface HealthReport {
     readonly entryCount: number;
     readonly modelId: string | null;
     readonly sizeBytes: number | null;
+    // Optional lifecycle fields (companion ≥ this version) — drive
+    // the rebuild affordance + status copy. Older companions omit
+    // them and the UI falls back to the legacy "Re-index" button.
+    readonly status?: 'missing' | 'stale' | 'empty' | 'rebuilding' | 'ready';
+    readonly eventTurnCount?: number;
+    readonly currentModelId?: string | null;
+    readonly companionVersion?: string;
+    readonly lastRebuildAt?: string | null;
+    readonly lastRebuildIndexed?: number | null;
+    readonly lastError?: string | null;
   };
   readonly service: { readonly installed: boolean; readonly running: boolean };
 }
@@ -120,8 +130,26 @@ export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelPr
         setRebuildState({ kind: 'error', message: `HTTP ${String(response.status)}` });
         return;
       }
-      const body = (await response.json()) as { readonly data?: { readonly indexed?: number } };
+      const body = (await response.json()) as {
+        readonly data?: { readonly indexed?: number; readonly lastError?: string | null };
+      };
+      if (typeof body.data?.lastError === 'string' && body.data.lastError.length > 0) {
+        setRebuildState({ kind: 'error', message: body.data.lastError });
+        return;
+      }
       setRebuildState({ kind: 'done', indexed: body.data?.indexed ?? 0 });
+      // Eagerly refresh the snapshot so the recall card reflects the
+      // new entryCount + status without waiting for the 30s poll.
+      const healthUrl = `http://127.0.0.1:${String(companionPort)}/v1/system/health`;
+      const healthResponse = await fetch(healthUrl, {
+        headers: { 'x-bac-bridge-key': bridgeKey },
+      });
+      if (healthResponse.ok) {
+        const healthBody = (await healthResponse.json()) as { readonly data?: unknown };
+        if (isHealthReport(healthBody.data)) {
+          setReport(healthBody.data);
+        }
+      }
     } catch (error) {
       setRebuildState({
         kind: 'error',
@@ -213,29 +241,21 @@ export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelPr
             vectors · {formatBytes(report.recall.sizeBytes)} ·{' '}
             {report.recall.modelId?.split('/').pop() ?? 'no model'}
           </div>
-          <div className="hc-foot" style={{ marginTop: 6 }}>
-            <button
-              type="button"
-              className="btn btn-ghost mono"
-              style={{ fontSize: 10, padding: '2px 8px' }}
-              disabled={rebuildState.kind === 'running'}
-              onClick={() => {
-                void triggerRebuild();
-              }}
-            >
-              {rebuildState.kind === 'running' ? 'Rebuilding…' : 'Rebuild index'}
-            </button>
-            {rebuildState.kind === 'done' ? (
-              <span className="muted" style={{ marginLeft: 6 }}>
-                indexed {String(rebuildState.indexed)}
-              </span>
-            ) : null}
-            {rebuildState.kind === 'error' ? (
-              <span className="muted" style={{ marginLeft: 6 }}>
-                {rebuildState.message}
-              </span>
-            ) : null}
-          </div>
+          {report.recall.status !== undefined ? (
+            <div className="hc-foot">
+              status: <span className="mono">{report.recall.status}</span>
+              {report.recall.eventTurnCount !== undefined ? (
+                <>
+                  {' · '}
+                  {String(report.recall.entryCount)}/
+                  {String(report.recall.eventTurnCount)} turns
+                </>
+              ) : null}
+            </div>
+          ) : null}
+          {report.recall.lastError !== undefined && report.recall.lastError !== null ? (
+            <div className="hc-foot warn">last error: {report.recall.lastError}</div>
+          ) : null}
         </div>
         <div className="hc">
           <div className="hc-lbl">vault writable</div>
@@ -290,7 +310,27 @@ export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelPr
             'Copy diagnostics'
           )}
         </button>
-        <button type="button">Re-index</button>
+        <button
+          type="button"
+          disabled={rebuildState.kind === 'running' || report.recall.status === 'rebuilding'}
+          onClick={() => {
+            void triggerRebuild();
+          }}
+        >
+          {rebuildState.kind === 'running' || report.recall.status === 'rebuilding'
+            ? 'Re-indexing…'
+            : 'Re-index'}
+        </button>
+        {rebuildState.kind === 'done' ? (
+          <span className="muted" style={{ alignSelf: 'center', marginLeft: 6 }}>
+            indexed {String(rebuildState.indexed)}
+          </span>
+        ) : null}
+        {rebuildState.kind === 'error' ? (
+          <span className="muted" style={{ alignSelf: 'center', marginLeft: 6 }}>
+            {rebuildState.message}
+          </span>
+        ) : null}
         <button type="button">Open log</button>
       </div>
     </div>

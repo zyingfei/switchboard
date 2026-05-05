@@ -15,6 +15,7 @@ import { exportSettings } from '../portability/exportBundle.js';
 import { importSettings } from '../portability/importBundle.js';
 import { embed, MODEL_ID } from '../recall/embedder.js';
 import { appendEntry, gcEntries, readIndex } from '../recall/indexFile.js';
+import type { RecallLifecycle } from '../recall/lifecycle.js';
 import { rank } from '../recall/ranker.js';
 import { rebuildFromEventLog } from '../recall/rebuild.js';
 import type { BucketRegistry } from '../routing/registry.js';
@@ -90,6 +91,13 @@ export interface CompanionHttpConfig {
     lastIdempotencyGcAt?: string;
     lastAuditRetentionAt?: string;
   };
+  // Owns the recall index lifecycle (auto-rebuild on stale, status
+  // surface for /v1/system/health). Optional so tests + legacy
+  // call-sites that don't care about recall keep working — when
+  // omitted, /v1/recall/rebuild falls back to direct rebuilder
+  // calls and health reports `status: 'ready' | 'missing'` with no
+  // background-rebuild affordance.
+  readonly recallLifecycle?: RecallLifecycle;
 }
 
 export interface StartedHttpServer {
@@ -555,15 +563,30 @@ const routes: readonly RouteDefinition[] = [
               droppedHint: null,
             }),
             recallSummary: async () => {
-              const [index, info] = await Promise.all([
+              const [index, info, lifecycleReport] = await Promise.all([
                 readIndex(indexPath),
                 stat(indexPath).catch(() => undefined),
+                context.recallLifecycle?.report() ?? Promise.resolve(undefined),
               ]);
+              const indexExists = index !== null;
               return {
-                indexExists: index !== null,
+                indexExists,
                 entryCount: index?.items.length ?? null,
                 modelId: index?.modelId ?? null,
                 sizeBytes: info?.size ?? null,
+                // Lifecycle fields are optional so legacy callers
+                // (no recallLifecycle injected) keep the old shape.
+                ...(lifecycleReport === undefined
+                  ? {}
+                  : {
+                      status: lifecycleReport.status,
+                      eventTurnCount: lifecycleReport.eventTurnCount,
+                      currentModelId: lifecycleReport.currentModelId,
+                      companionVersion: lifecycleReport.companionVersion,
+                      lastRebuildAt: lifecycleReport.lastRebuildAt,
+                      lastRebuildIndexed: lifecycleReport.lastRebuildIndexed,
+                      lastError: lifecycleReport.lastError,
+                    }),
               };
             },
             serviceStatus: async () => {
@@ -919,6 +942,27 @@ const routes: readonly RouteDefinition[] = [
     authRequired: true,
     handle: async (_request, _requestId, _match, context) => {
       const vaultRoot = requireVaultRoot(context);
+      // Prefer the lifecycle path so the manual button + auto-rebuild
+      // share the same scheduler (one rebuild at a time, status flips
+      // to "rebuilding" in /v1/system/health, errors are captured).
+      // Fall back to the direct rebuilder for legacy callers that
+      // didn't inject a lifecycle.
+      if (context.recallLifecycle !== undefined) {
+        context.recallLifecycle.scheduleRebuild('manual');
+        await context.recallLifecycle.waitForRebuild();
+        const report = await context.recallLifecycle.report();
+        return [
+          202,
+          {
+            data: {
+              indexed: report.entryCount,
+              status: report.status,
+              lastRebuildAt: report.lastRebuildAt,
+              lastError: report.lastError,
+            },
+          },
+        ];
+      }
       return [
         202,
         { data: await rebuildFromEventLog(vaultRoot, join(vaultRoot, '_BAC', 'events')) },

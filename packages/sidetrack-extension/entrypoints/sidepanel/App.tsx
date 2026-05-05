@@ -550,6 +550,13 @@ const App = () => {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [wizardConnectionError, setWizardConnectionError] = useState<string | null>(null);
+  // Recall index lifecycle state — polled from /v1/system/health when
+  // the companion is reachable. The header pill flips to "indexing"
+  // amber while the companion's background rebuild is in flight, so
+  // the user understands why Déjà-vu queries return nothing yet.
+  const [recallStatus, setRecallStatus] = useState<
+    'missing' | 'stale' | 'empty' | 'rebuilding' | 'ready' | null
+  >(null);
 
   const threads = useMemo(() => visibleThreads(state.threads), [state.threads]);
   const moveThread = useMemo(
@@ -616,6 +623,53 @@ const App = () => {
       window.clearInterval(id);
     };
   }, []);
+
+  // Recall lifecycle poll — only runs when companion is reachable
+  // and we have a bridge key. Surfaces 'rebuilding' as an amber
+  // pill in the header so the user knows why Déjà-vu is silent
+  // immediately after companion startup or a model upgrade.
+  useEffect(() => {
+    if (state.companionStatus !== 'connected' || bridgeKey.trim().length === 0) {
+      setRecallStatus(null);
+      return undefined;
+    }
+    const portValue = state.settings.companion.port;
+    let cancelled = false;
+    const fetchRecall = async (): Promise<void> => {
+      try {
+        const response = await fetch(
+          `http://127.0.0.1:${String(portValue)}/v1/system/health`,
+          { headers: { 'x-bac-bridge-key': bridgeKey } },
+        );
+        if (!response.ok || cancelled) return;
+        const body = (await response.json()) as { readonly data?: { readonly recall?: { readonly status?: unknown } } };
+        const status = body.data?.recall?.status;
+        if (
+          status === 'missing' ||
+          status === 'stale' ||
+          status === 'empty' ||
+          status === 'rebuilding' ||
+          status === 'ready'
+        ) {
+          setRecallStatus(status);
+        } else {
+          setRecallStatus(null);
+        }
+      } catch {
+        // Ignore — pill just stays at last known value until next tick.
+      }
+    };
+    void fetchRecall();
+    // Poll faster while rebuilding so the pill clears promptly.
+    const intervalMs = recallStatus === 'rebuilding' ? 5_000 : 30_000;
+    const handle = window.setInterval(() => {
+      void fetchRecall();
+    }, intervalMs);
+    return () => {
+      cancelled = true;
+      window.clearInterval(handle);
+    };
+  }, [state.companionStatus, bridgeKey, state.settings.companion.port, recallStatus]);
 
   useEffect(() => {
     const runtimeMessages = chrome.runtime.onMessage;
@@ -3124,6 +3178,36 @@ const App = () => {
               ? 'local-only'
               : 'down'}
         </span>
+        {/* Recall pill — only shown when status is non-ready, so the
+            steady state stays clean. Lets the user see "indexing…"
+            after companion startup or a model change without having
+            to dig into the diagnostics panel. */}
+        {recallStatus !== null && recallStatus !== 'ready' ? (
+          <span
+            className={
+              'sp-status-pill mono ' +
+              (recallStatus === 'rebuilding' || recallStatus === 'empty' ? 'warn' : 'err')
+            }
+            title={
+              recallStatus === 'rebuilding'
+                ? 'Recall: indexing in background. Déjà-vu lookups will return matches once the rebuild completes.'
+                : recallStatus === 'empty'
+                  ? 'Recall: index has no entries yet. Capture some threads to populate it.'
+                  : recallStatus === 'missing'
+                    ? 'Recall: no index file. The companion will rebuild it on the next startup.'
+                    : 'Recall: index is stale (model or schema mismatch). Open Capture health and click Re-index.'
+            }
+          >
+            <span
+              className={
+                'sp-status-dot ' +
+                (recallStatus === 'rebuilding' || recallStatus === 'empty' ? 'amber' : 'red')
+              }
+              aria-hidden
+            />
+            recall {recallStatus === 'rebuilding' ? 'indexing' : recallStatus}
+          </span>
+        ) : null}
       </div>
 
       {viewMode === 'workstream' ? (
