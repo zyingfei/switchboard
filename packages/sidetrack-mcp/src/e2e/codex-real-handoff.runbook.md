@@ -83,35 +83,154 @@ curl -s -H "x-bac-bridge-key: $(cat ~/Documents/Sidetrack-vault/_BAC/.config/bri
 You should see `"status": "ok"` (eventually — recall may report
 `rebuilding` while the model loads).
 
-## 3. Start the test browser
+## 3. Start the test browser (definitive)
 
-A Chrome window with the remote-debug port open + the extension
-loaded as an unpacked extension. The script's CDP attach point is
-`http://localhost:9222`.
+The e2e expects a Chrome-for-Testing (CfT) window with:
+- the remote-debug port open at `http://localhost:9222`,
+- the unpacked Sidetrack extension loaded,
+- a persistent user-data dir (so provider sign-ins survive between
+  runs),
+- the companion's bridge key registered with the extension.
+
+**Use the managed script — don't hand-launch Chrome.** The script
+finds the right binary, sets all four flags consistently, and writes
+the extension ID to `.output/cdp-extension-id` for the spec runner.
+
+### 3.1 One-time install of Chrome for Testing
 
 ```bash
-# Mac:
-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-  --remote-debugging-port=9222 \
-  --user-data-dir=/tmp/sidetrack-e2e-profile \
-  --load-extension=$PWD/packages/sidetrack-extension/.output/chrome-mv3 \
-  &
+cd packages/sidetrack-extension
+npm run e2e:install-cft
 ```
 
-(There's also `npm run e2e:chrome-debug` in
-`packages/sidetrack-extension` which does the same thing if you
-want a managed CFT install.)
+Installs to the **shared OS cache** at
+`~/Library/Caches/sidetrack/chrome-for-testing/` (one copy serves
+every worktree; see `scripts/install-cft.mjs`). Override with
+`SIDETRACK_CFT_ROOT` if you have a sandboxed setup.
 
-In the test browser:
-1. Navigate to chatgpt.com and log in (the script reuses the session
-   to load private chat threads).
-2. Open the Sidetrack side panel (toolbar icon → Sidetrack).
-3. In the side panel's setup wizard, paste the bridge key from step 2.
-4. Confirm the companion pill turns green and the recall index
-   reports `status: ready` in the diagnostics panel.
+You can prune stale per-worktree copies any time with:
 
-The extension is now wired to the companion. Leave the browser
-running.
+```bash
+npm run e2e:gc-cft           # dry-run
+npm run e2e:gc-cft -- --apply
+```
+
+### 3.2 Launch
+
+```bash
+cd packages/sidetrack-extension
+npm run e2e:chrome-debug
+```
+
+This runs `npm run build` then `scripts/chrome-debug.mjs`, which:
+
+| Setting | Value | Override |
+|---|---|---|
+| Binary | shared CfT install | `SIDETRACK_E2E_CHROME_BIN` |
+| Extension | `./.output/chrome-mv3` | `SIDETRACK_EXTENSION_PATH` |
+| User-data-dir | `~/.sidetrack-test-profile` | `SIDETRACK_USER_DATA_DIR` |
+| CDP port | 9222 | `SIDETRACK_E2E_CDP_PORT` |
+| Initial tabs | chatgpt.com, claude.ai, gemini.google.com | (script-internal) |
+
+The script also opens CDP, watches for the extension service worker,
+and writes its ID to `.output/cdp-extension-id`. **Leave this script
+running** — closing the Chrome window (Cmd-Q) stops it.
+
+### 3.3 Sign in to providers (one-time per profile)
+
+Because the user-data-dir persists, provider sign-ins are a one-time
+chore. In the freshly-launched window:
+
+1. **chatgpt.com** — Continue with Google / Apple / email; complete
+   any captcha. CfT is a clean automation profile, so providers will
+   issue a verification code on first login.
+2. **claude.ai** — same.
+3. **gemini.google.com** — same.
+
+If you want to script the sign-in step (Playwright will park the
+browser on the login page until you manually finish), use:
+
+```bash
+node scripts/login-test-profile.mjs
+```
+
+This launches Playwright with the same extension and user-data-dir
+as `e2e:chrome-debug`, but without the CDP port — handy when CDP
+attach contention is causing test flakes.
+
+### 3.4 Verify the extension is loaded
+
+A correctly-launched browser should show:
+
+- The Sidetrack toolbar icon (puzzle-piece menu → pin Sidetrack).
+- An `.output/cdp-extension-id` file in
+  `packages/sidetrack-extension/` containing the 32-char extension
+  ID (the script logs it as `[chrome-debug] extension id : …`).
+- `curl http://localhost:9222/json/list | grep -c chrome-extension`
+  returns ≥ 1 service-worker target.
+
+If the extension is missing: re-run `npm run build` then
+`npm run e2e:chrome-debug`, and confirm `.output/chrome-mv3/manifest.json`
+exists.
+
+### 3.5 Wire the bridge key (the "passkey")
+
+The companion mints a per-vault bridge key at startup; the extension
+must hold the same key to make HTTP calls. The plumbing:
+
+```
+companion ──writes──▶ <vault>/_BAC/.config/bridge.key
+                           │
+                           ▼
+              (you copy + paste once)
+                           │
+                           ▼
+extension stores at chrome.storage.local["sidetrack.settings"]
+                              .companion.bridgeKey
+```
+
+**Recommended flow (manual paste):**
+
+1. Read the key:
+
+   ```bash
+   cat ~/Documents/Sidetrack-vault/_BAC/.config/bridge.key
+   ```
+
+2. Click the Sidetrack toolbar icon to open the side panel.
+3. The setup wizard asks for the bridge key on first run; paste it.
+4. The companion-status pill turns green within ~2s. Recall index
+   transitions to `ready` once the embedder finishes loading
+   (background — first run can take ~60s on a cold model cache).
+
+**Verify from the shell:**
+
+```bash
+KEY=$(cat ~/Documents/Sidetrack-vault/_BAC/.config/bridge.key)
+curl -s -H "x-bac-bridge-key: $KEY" \
+  http://127.0.0.1:17373/v1/system/health \
+  | python3 -m json.tool | head -8
+```
+
+`"status": "ok"` confirms companion is running and the key is valid.
+
+**Key drift / "401 invalid bridge key":**
+
+- The companion regenerates the key only if `bridge.key` is missing.
+  Deleting the file (e.g. fresh-vault dance) means the extension's
+  stored key no longer matches — repeat the paste above.
+- The extension caches the key inside `sidetrack.settings` in
+  `chrome.storage.local` (nested at `companion.bridgeKey`). To clear
+  it without touching the file, open DevTools on the side panel:
+  ```js
+  chrome.storage.local.remove('sidetrack.settings')
+  ```
+  Reload the side panel; the wizard re-prompts. (This also clears
+  vault path + per-host overrides, so re-paste both if customised.)
+
+There is no auto-import-from-disk path today — the paste is the
+authoritative install. (The vault file is filesystem-readable and a
+stray `cat` into a panel could silently swap keys.)
 
 ## 4. Pick a target ChatGPT thread
 
