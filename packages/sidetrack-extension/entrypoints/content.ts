@@ -5,7 +5,12 @@ import { createAnnotationClient } from '../src/annotation/client';
 import { captureVisibleConversation } from '../src/capture/extractors';
 import { detectProviderFromUrl, isProviderThreadUrl } from '../src/capture/providerDetection';
 import { providerConfigs } from '../src/capture/providerConfigs';
-import { messageTypes, type ContentRequest, type ContentResponse } from '../src/messages';
+import {
+  messageTypes,
+  type ContentRequest,
+  type ContentResponse,
+  type RecallQueryResponse,
+} from '../src/messages';
 import {
   mountAnnotationOverlay,
   mountDejaVuPopover,
@@ -13,8 +18,7 @@ import {
   type DejaVuItem,
   type RestoredAnchor,
 } from '../src/contentOverlays';
-import { createRecallClient, type RankedItem } from '../src/companion/recallClient';
-import { readCompanionSettingsFromStorage } from '../src/companion/settingsBridge';
+import type { RankedItem } from '../src/companion/recallClient';
 
 // Per-provider composer + send-button + AI-done selectors. Sourced
 // from `tests/e2e/live-status-transitions.spec.ts` which proved each
@@ -388,21 +392,29 @@ export default defineContentScript({
     ): Promise<void> => {
       if (!force && dejaVuMutedUrls.has(window.location.href)) return;
       try {
-        const settings = await readCompanionSettingsFromStorage();
-        if (settings === null) {
+        // Route through the background SW. A direct fetch from this
+        // content script to http://127.0.0.1 is silently blocked by
+        // Chrome's mixed-content policy on HTTPS chat pages
+        // (chatgpt.com, claude.ai, etc.) — even with host_permissions
+        // — and the resulting "Failed to fetch" was caught by the
+        // outer try/catch and rendered as an empty popover. The SW's
+        // chrome-extension:// origin bypasses the block.
+        const response: Omit<RecallQueryResponse, 'items'> & {
+          readonly items: readonly RankedItem[];
+        } = await chrome.runtime.sendMessage({
+          type: messageTypes.recallQuery,
+          q: text,
+          limit: 5,
+        });
+        if (!response.ok) {
+          // Surface the failure in the console so future regressions
+          // are visible to anyone with devtools open. The popover
+          // keeps showing the empty state — a noisy alert here would
+          // be worse than silence.
+          console.warn('[sidetrack] recall query failed:', response.error);
           if (!force) return;
-          closeDejaVu();
-          dejaVuMounted = mountDejaVuPopover({
-            items: [],
-            anchorRect,
-            onDismiss: () => {
-              dejaVuMounted = null;
-            },
-          });
-          return;
         }
-        const client = createRecallClient(settings);
-        const results = await client.query(text, { limit: 5 });
+        const results = response.items;
         if (results.length === 0 && !force) return;
         closeDejaVu();
         dejaVuMounted = mountDejaVuPopover({

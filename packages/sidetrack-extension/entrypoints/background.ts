@@ -37,6 +37,7 @@ import {
   isContentResponse,
   isRuntimeRequest,
   messageTypes,
+  type RecallQueryResponse,
   type RuntimeRequest,
   type RuntimeResponse,
 } from '../src/messages';
@@ -1405,6 +1406,43 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
     return await withCompanionStatus(async () => {
       await writeLastDispatchTargetByThread(request.threadId, request.target);
     }, 'queue');
+  }
+
+  if (request.type === messageTypes.recallQuery) {
+    // Content scripts on HTTPS chat pages can't fetch http://127.0.0.1
+    // directly — Chrome's mixed-content policy blocks the connection
+    // even with host_permissions. The service worker (chrome-extension://
+    // origin) is the one place fetches to localhost succeed reliably,
+    // so we proxy the recall query through here. Returns the parsed
+    // RankedItem[] (with title/snippet attached server-side) so the
+    // popover can render them. On any failure we return an empty list
+    // and surface the error in `error` for diagnostics.
+    //
+    // The cast to `unknown` and back through RecallQueryResponse keeps
+    // the per-handler return type local — RuntimeResponse stays the
+    // WorkboardState-bearing union for every other consumer.
+    const buildRecallResponse = async (): Promise<RecallQueryResponse> => {
+      try {
+        const settings = await readSettings();
+        const companion = settings.companion;
+        if (companion.bridgeKey.trim().length === 0 || companion.port <= 0) {
+          return { ok: false, items: [], error: 'Companion not configured.' };
+        }
+        const client = createRecallClient(companion);
+        const items = await client.query(request.q, {
+          ...(request.limit === undefined ? {} : { limit: request.limit }),
+          ...(request.workstreamId === undefined ? {} : { workstreamId: request.workstreamId }),
+        });
+        return { ok: true, items };
+      } catch (error) {
+        return {
+          ok: false,
+          items: [],
+          error: error instanceof Error ? error.message : 'recall query failed',
+        };
+      }
+    };
+    return (await buildRecallResponse()) as unknown as RuntimeResponse;
   }
 
   if (request.type === messageTypes.focusThreadInSidePanel) {

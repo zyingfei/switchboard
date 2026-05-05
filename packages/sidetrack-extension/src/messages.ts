@@ -104,6 +104,14 @@ export const messageTypes = {
   // is a UI-only filter).
   archiveDispatch: 'sidetrack.dispatch.archive',
   unarchiveDispatch: 'sidetrack.dispatch.unarchive',
+  // Content script asks the background to run a recall query against
+  // the local companion. Routed through the SW because direct fetch
+  // from a content script in an HTTPS page (e.g. chatgpt.com) to
+  // http://127.0.0.1 is blocked by Chrome's mixed-content policy
+  // even with host_permissions — only chrome-extension:// origins
+  // bypass that block. The SW returns the parsed RankedItem[] so
+  // the popover can render titles and scores.
+  recallQuery: 'sidetrack.recall.query',
 } as const;
 
 export interface SelectorCanaryReport {
@@ -353,6 +361,12 @@ export type WorkboardRequest =
   | {
       readonly type: typeof messageTypes.unarchiveDispatch;
       readonly dispatchId: string;
+    }
+  | {
+      readonly type: typeof messageTypes.recallQuery;
+      readonly q: string;
+      readonly limit?: number;
+      readonly workstreamId?: string;
     };
 
 export type RuntimeRequest =
@@ -383,6 +397,17 @@ export type RuntimeResponse =
       readonly error: string;
       readonly state?: WorkboardState;
     };
+
+// Recall-query response — sent only in reply to messageTypes.recallQuery.
+// Kept out of the RuntimeResponse union because it doesn't carry a
+// WorkboardState and a third variant would force every existing caller
+// to narrow before reading `state`. The content script casts the
+// chrome.runtime.sendMessage reply to this type at the call site.
+export interface RecallQueryResponse {
+  readonly ok: boolean;
+  readonly items: readonly unknown[];
+  readonly error?: string;
+}
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;
@@ -612,6 +637,14 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
     hasType(value, messageTypes.unarchiveDispatch)
   ) {
     return typeof value.dispatchId === 'string';
+  }
+
+  if (hasType(value, messageTypes.recallQuery)) {
+    return (
+      typeof value.q === 'string' &&
+      (value.limit === undefined || typeof value.limit === 'number') &&
+      (value.workstreamId === undefined || typeof value.workstreamId === 'string')
+    );
   }
 
   return false;
