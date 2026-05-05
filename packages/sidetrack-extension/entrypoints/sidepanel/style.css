@@ -4345,6 +4345,15 @@ button.btn-link.lineage-name:hover {
   background: var(--paper, #f5efe2);
   color: var(--ink-2, #4a453d);
   flex: none;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease;
+}
+.thread-dispatched-row:hover .thread-dispatched-target {
+  background: var(--signal-bg, #fef3ec);
+  border-color: var(--signal-tint, #fed7aa);
+  color: var(--signal, #c2410c);
 }
 .thread-dispatched-name {
   font-family: var(--display, 'Fraunces', Georgia, serif);
