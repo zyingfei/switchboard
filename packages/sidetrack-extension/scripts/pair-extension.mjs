@@ -66,14 +66,69 @@ try {
 }
 
 const ctx = browser.contexts()[0];
-const sw = ctx.serviceWorkers().find((w) => w.url().includes('background.js'));
-if (sw === undefined) {
-  console.error('[pair-extension] extension service worker not found.');
-  console.error('  Confirm .output/chrome-mv3 was loaded by chrome-debug.mjs.');
+
+// Find the Sidetrack extension's ID. Two paths because MV3 SWs are
+// flaky after idle:
+//   1. /json/list service_worker target — works when SW is at least
+//      registered (warm or recently-warm).
+//   2. chrome://extensions UI scrape — works whenever the extension
+//      is installed + enabled, regardless of SW state.
+const findExtensionId = async () => {
+  try {
+    const targets = await fetch(`${cdpUrl}/json/list`).then((r) => r.json());
+    const swTarget = targets.find(
+      (t) => t.type === 'service_worker' && (t.url ?? '').includes('background.js'),
+    );
+    const m = /^chrome-extension:\/\/([^/]+)\//u.exec(swTarget?.url ?? '');
+    if (m !== null) return m[1];
+  } catch {
+    // fall through to chrome://extensions
+  }
+  const probe = await ctx.newPage();
+  try {
+    await probe.goto('chrome://extensions/', { timeout: 5_000 });
+    await probe.waitForTimeout(500);
+    const ids = await probe.evaluate(() => {
+      const root = document.querySelector('extensions-manager')?.shadowRoot;
+      const list = root?.querySelector('extensions-item-list')?.shadowRoot;
+      if (list === null || list === undefined) return [];
+      return Array.from(list.querySelectorAll('extensions-item'))
+        .map((c) => {
+          const name = c.shadowRoot?.querySelector('#name')?.textContent?.trim() ?? '';
+          return { id: c.id, name };
+        })
+        .filter((it) => /sidetrack/i.test(it.name));
+    });
+    if (Array.isArray(ids) && ids.length > 0) return ids[0].id;
+    return null;
+  } finally {
+    await probe.close();
+  }
+};
+
+const extensionId = await findExtensionId();
+if (extensionId === null) {
+  console.error('[pair-extension] cannot find Sidetrack extension.');
+  console.error('  Confirm chrome://extensions/ shows Sidetrack as enabled,');
+  console.error('  or relaunch the test browser:');
+  console.error('    npm run e2e:chrome-debug');
   process.exit(1);
 }
 
-await sw.evaluate(
+// Opening sidepanel.html forces the dormant SW to wake so that the
+// page-side chrome.storage call (next) is serviced.
+const page = await ctx.newPage();
+try {
+  await page.goto(`chrome-extension://${extensionId}/sidepanel.html`, {
+    waitUntil: 'domcontentloaded',
+    timeout: 10_000,
+  });
+} catch (err) {
+  console.error(`[pair-extension] failed to open side panel at ${extensionId}: ${err.message ?? err}`);
+  process.exit(1);
+}
+
+await page.evaluate(
   async ({ key, port }) => {
     const SETTINGS_KEY = 'sidetrack.settings';
     const SETUP_KEY = 'sidetrack:setupCompleted';
@@ -93,6 +148,8 @@ await sw.evaluate(
   { key: bridgeKey, port: companionPort },
 );
 
+await page.close();
+
 console.log(`[pair-extension] paired extension with companion (vault: ${vault})`);
 console.log(`[pair-extension]   bridge key length : ${String(bridgeKey.length)} chars`);
 console.log(`[pair-extension]   companion port    : ${String(companionPort)}`);
@@ -104,8 +161,18 @@ try {
   });
   const body = await resp.json();
   if (resp.ok) {
-    const status = body?.data?.status ?? body?.status ?? 'unknown';
-    console.log(`[pair-extension]   companion health  : ${String(status)} (HTTP ${String(resp.status)})`);
+    const recall = body?.data?.recall;
+    const entries = typeof recall?.entryCount === 'number' ? recall.entryCount : null;
+    const status = typeof recall?.status === 'string' ? recall.status : null;
+    const uptime = body?.data?.uptimeSec ?? 0;
+    const recallSlug = status !== null
+      ? `recall=${status}${entries !== null ? ` (${String(entries)} entries)` : ''}, `
+      : entries !== null
+        ? `recall=${String(entries)} entries, `
+        : '';
+    console.log(
+      `[pair-extension]   companion health  : HTTP 200, ${recallSlug}uptime ${String(uptime)}s`,
+    );
   } else {
     console.warn(`[pair-extension] WARN: companion returned HTTP ${String(resp.status)}`);
   }
