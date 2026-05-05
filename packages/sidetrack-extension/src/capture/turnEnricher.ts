@@ -50,10 +50,46 @@ const attr = (el: Element | null, name: string): string => {
 
 // ────────────────── ChatGPT ──────────────────
 
-const chatgptModelName = (doc: Document): string | undefined => {
-  // The model picker is a button at the top-right with the model
-  // name as its text content. It's outside the per-turn subtree, so
-  // we read it from `doc` once per capture.
+// Slug → display name. ChatGPT's data-message-model-slug is
+// precise but not user-facing ("gpt-5-5-thinking" instead of
+// "GPT-5.5 Thinking"); these rules turn the slug into something
+// humans recognize. Unknown slugs pass through capitalized so a
+// new variant degrades gracefully.
+//
+// Examples:
+//   gpt-5-5-thinking → GPT-5.5 Thinking
+//   gpt-4o          → GPT-4o
+//   o3-mini         → o3 Mini
+//   gpt-5           → GPT-5
+const formatModelSlug = (slug: string): string => {
+  const trimmed = slug.trim();
+  if (trimmed.length === 0) return slug;
+  // Use a placeholder to protect the dash inside the model number
+  // (e.g. "GPT-5" or "GPT-5.5") from the split-on-dash pass below.
+  const HYPHEN_PLACEHOLDER = '§';
+  let out = trimmed
+    .replace(/^gpt-(\d)-(\d)\b/i, `GPT${HYPHEN_PLACEHOLDER}$1.$2`)
+    .replace(/^gpt-(\d+)\b/i, `GPT${HYPHEN_PLACEHOLDER}$1`)
+    .replace(/^o(\d+)\b/i, `o${HYPHEN_PLACEHOLDER}$1`);
+  out = out
+    .split('-')
+    .map((part, idx) => (idx === 0 ? part : part.charAt(0).toUpperCase() + part.slice(1)))
+    .join(' ');
+  return out.replace(new RegExp(HYPHEN_PLACEHOLDER, 'g'), '-');
+};
+
+const chatgptModelName = (turnNode: Element, doc: Document): string | undefined => {
+  // ChatGPT exposes the actual model on each assistant turn via
+  // `data-message-model-slug`. That's MUCH more reliable than the
+  // top-of-page model picker (which is icon-only with no text in
+  // the current UI) and gives per-turn accuracy when a thread
+  // switches models mid-conversation.
+  const slug = turnNode.getAttribute('data-message-model-slug');
+  if (typeof slug === 'string' && slug.length > 0) {
+    return formatModelSlug(slug);
+  }
+  // Fallback to the picker button text (older UIs / non-message
+  // contexts). Most callers won't reach this.
   const button =
     doc.querySelector('[aria-label="Switch model"]') ??
     doc.querySelector('button[data-testid="model-switcher-dropdown-button"]');
@@ -67,16 +103,22 @@ const chatgptDeepResearchActive = (doc: Document): boolean =>
 const chatgptCitations = (turnNode: Element): readonly CapturedCitation[] => {
   const pills = Array.from(turnNode.querySelectorAll('[data-testid="webpage-citation-pill"]'));
   if (pills.length === 0) return [];
-  return pills.map((pill) => {
+  // Dedup by URL (preferred) or source label. ChatGPT renders a
+  // citation pill at every reference site within a long answer, so
+  // the same source can appear 5+ times — collapsing keeps the
+  // metadata signal-bearing without flooding the consumer.
+  const seen = new Set<string>();
+  const out: CapturedCitation[] = [];
+  for (const pill of pills) {
     const label = text(pill);
-    // The anchor is sometimes the pill's parent (when ChatGPT wraps
-    // the whole pill as a link) and sometimes a descendant (when the
-    // pill itself is the inline span and the link is one of its
-    // children). Cover both.
     const anchor = pill.querySelector('a') ?? pill.closest('a');
     const url = attr(anchor, 'href');
-    return url.length > 0 ? { source: label, url } : { source: label };
-  });
+    const key = url.length > 0 ? url : label;
+    if (key.length === 0 || seen.has(key)) continue;
+    seen.add(key);
+    out.push(url.length > 0 ? { source: label, url } : { source: label });
+  }
+  return out;
 };
 
 const chatgptAttachments = (turnNode: Element): readonly CapturedAttachment[] => {
@@ -98,7 +140,7 @@ const chatgptAttachments = (turnNode: Element): readonly CapturedAttachment[] =>
 const enrichChatgpt = (ctx: EnrichmentContext): TurnEnrichment => {
   const markdownRoot = ctx.turnNode.querySelector('.markdown.prose, .prose, .markdown');
   const markdown = markdownRoot !== null ? domToMarkdown(markdownRoot) : undefined;
-  const modelName = chatgptModelName(ctx.doc);
+  const modelName = chatgptModelName(ctx.turnNode, ctx.doc);
   const attachments = chatgptAttachments(ctx.turnNode);
   const citations = chatgptCitations(ctx.turnNode);
   const isDeepResearch = chatgptDeepResearchActive(ctx.doc) || citations.length >= 3;
@@ -187,7 +229,7 @@ const stripGeminiThinkingPrefix = (
   // block as plain text "Show thinking ..." prefix when the
   // collapsible is closed. Split on the marker so the visible
   // answer doesn't get polluted.
-  const marker = /^\s*Show thinking[\s\S]+?Gemini said\s{0,2}/i;
+  const marker = /^\s{0,4}Show thinking[\s\S]+?Gemini said\s{0,4}/i;
   const match = marker.exec(body);
   if (match === null) return { visible: body };
   const thinking = body
@@ -196,7 +238,14 @@ const stripGeminiThinkingPrefix = (
     .replace(/\s*Gemini said\s*$/i, '')
     .trim();
   const visible = body.slice(match[0].length).trim();
-  return thinking.length > 0 ? { visible, thinking } : { visible };
+  // Reasoning is only meaningful when the collapsible was OPEN at
+  // capture time (yielding actual thinking text). A closed
+  // collapsible just shows "Show thinking" + "Gemini said" with
+  // nothing between, which strips to empty / a stray markdown
+  // marker. Require a sentence-worth of content (>= 30 chars) to
+  // avoid surfacing junk like "##" or "—".
+  const meaningful = thinking.length >= 30 && /[\p{L}\p{N}]/u.test(thinking);
+  return meaningful ? { visible, thinking } : { visible };
 };
 
 const enrichGemini = (ctx: EnrichmentContext): TurnEnrichment => {
