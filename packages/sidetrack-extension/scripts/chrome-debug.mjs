@@ -112,6 +112,12 @@ console.log('');
 const args = [
   `--user-data-dir=${userDataDir}`,
   `--remote-debugging-port=${port}`,
+  // Allow CDP WebSocket connections from any origin so external
+  // automation scripts (Playwright, custom CDP drivers) can attach.
+  // Recent Chrome versions reject ws upgrades from non-default
+  // origins by default; without this flag, /devtools/page/<id>
+  // returns 403 even from localhost.
+  '--remote-allow-origins=*',
   `--disable-extensions-except=${extensionPath}`,
   `--load-extension=${extensionPath}`,
   '--no-first-run',

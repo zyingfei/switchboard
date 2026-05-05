@@ -3248,25 +3248,14 @@ textarea.preview-body:focus {
   }
 }
 .thread-actions {
+  /* Always visible per v2 design — the action strip is part of the
+     card surface, not a hover affordance. Hover-only hiding created
+     a jarring layout shift between cards (one expanded, others
+     short) and left a blank vertical band under "Ungrouped" while
+     the user moved the cursor. */
   gap: 10px;
   padding-top: 4px;
   flex-wrap: wrap;
-  max-height: 0;
-  opacity: 0;
-  overflow: hidden;
-  transition:
-    max-height 140ms ease,
-    opacity 140ms ease,
-    padding-top 140ms ease;
-}
-.thread:hover .thread-actions,
-.thread:focus-within .thread-actions {
-  /* 8+ wrappable buttons (Open Queue Send Review Move Stop Archive
-     Auto-send) need room for two rows on narrow side-panel widths.
-     The earlier 60px cap clipped Move/Stop/Archive/Auto-send. */
-  max-height: 140px;
-  opacity: 1;
-  padding-top: 6px;
 }
 /* When the ⋯ overflow menu is open, switch .thread-actions to
    overflow: visible so the absolute-positioned popup escapes the
