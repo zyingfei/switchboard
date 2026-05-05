@@ -106,6 +106,28 @@ const driveAutoSend = async (
   if (provider === 'codex') {
     return { ok: false, error: 'Auto-send does not support Codex sessions yet.' };
   }
+
+  // ChatGPT's bare / silently redirects logged-in users to their
+  // most-recent /c/<id> chat. If we just type into that composer,
+  // the dispatch's prompt lands as a new turn in an unrelated
+  // existing chat — Sidetrack's auto-link matcher then attaches the
+  // dispatch to the wrong thread, and the entire flow points at a
+  // page that has nothing to do with the requested work.
+  // The page's own "New chat" sidebar link uses Next.js client-side
+  // navigation to reset state without re-redirecting; clicking it
+  // pre-flight is the cleanest reset.
+  if (provider === 'chatgpt' && /^\/c\//u.test(window.location.pathname)) {
+    const newChatLink = document.querySelector<HTMLElement>(
+      'a[data-testid="create-new-chat-button"]',
+    );
+    if (newChatLink !== null) {
+      newChatLink.click();
+      await waitFor(() => window.location.pathname === '/', 5_000, 100);
+      // Compose composer hydration time after the route transition.
+      await sleep(400);
+    }
+  }
+
   // Composer presence — not URL shape — gates auto-send. The new-chat
   // landing page (e.g. https://gemini.google.com/app, the bare ChatGPT
   // root) shows a composer that becomes a thread on submit; the
