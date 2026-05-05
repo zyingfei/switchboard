@@ -241,9 +241,9 @@ export default defineContentScript({
       });
 
     // Live in-page annotation set. Initially populated from the
-     // companion's persisted list on page load; appended to
-     // optimistically when the user saves a new comment so the
-     // margin marker shows up without requiring a page reload.
+    // companion's persisted list on page load; appended to
+    // optimistically when the user saves a new comment so the
+    // margin marker shows up without requiring a page reload.
     const liveAnchors: RestoredAnchor[] = [];
 
     const restoreAnnotations = async (): Promise<void> => {
@@ -272,12 +272,7 @@ export default defineContentScript({
       }
     };
 
-    const addLiveAnnotation = (
-      id: string,
-      range: Range,
-      note?: string,
-      quote?: string,
-    ): void => {
+    const addLiveAnnotation = (id: string, range: Range, note?: string, quote?: string): void => {
       // Optimistic mount: drop in the marker at the user's selection
       // immediately so they get visible feedback that their save took
       // effect. The companion's persisted record syncs on next page
@@ -326,44 +321,23 @@ export default defineContentScript({
       return normalized.slice(start, start + 60);
     };
 
-    // Find the turn element on this page using the captured selector
-    // first, then fall back to a normalized-text search. The fallback
-    // exists because provider chat pages re-render aggressively
-    // (Claude / Gemini Angular, ChatGPT React) and the saved
-    // `sourceSelector` is sometimes a label like "chatgpt heading
-    // fallback" rather than a real CSS selector — when querySelector
-    // returns null we proceed to the text-quote search regardless.
-    const findTurnElementOnPage = (
-      sourceSelector: string | undefined,
-      turnText: string,
+    const queryTurnCandidates = (selector: string): readonly HTMLElement[] | null => {
+      try {
+        return Array.from(document.querySelectorAll(selector)).filter(
+          (node): node is HTMLElement => node instanceof HTMLElement,
+        );
+      } catch {
+        return null;
+      }
+    };
+
+    const findTurnInCandidates = (
+      candidates: readonly HTMLElement[],
+      probe: string,
     ): { readonly element: HTMLElement | null; readonly diagnostic: string } => {
-      const tried: string[] = [];
-      if (sourceSelector !== undefined && sourceSelector.length > 0) {
-        tried.push(`sourceSelector=${sourceSelector}`);
-        try {
-          const direct = document.querySelector(sourceSelector);
-          if (direct instanceof HTMLElement) {
-            return { element: direct, diagnostic: 'matched on sourceSelector' };
-          }
-        } catch {
-          tried.push('sourceSelector threw on querySelector');
-        }
-      }
-      const probe = buildProbe(normalizeForMatch(stripRolePrefix(turnText)));
-      if (probe.length === 0) {
-        return {
-          element: null,
-          diagnostic: `probe empty after strip+normalize; tried=[${tried.join(', ')}]`,
-        };
-      }
-      const turnSelector = turnSelectorForCurrentProvider();
-      tried.push(`turnSelector=${turnSelector ?? 'null'}`);
-      const candidates =
-        turnSelector === null ? [] : Array.from(document.querySelectorAll(turnSelector));
       // First pass: exact equality. Wins on short turns ("test123")
       // where many candidates would also pass `includes`.
       for (const node of candidates) {
-        if (!(node instanceof HTMLElement)) continue;
         if (normalizeForMatch(node.textContent) === probe) {
           return {
             element: node,
@@ -375,13 +349,60 @@ export default defineContentScript({
       // textContent often includes extra UI chrome (timestamps,
       // model labels) so exact equality is too strict.
       for (const node of candidates) {
-        if (!(node instanceof HTMLElement)) continue;
         if (normalizeForMatch(node.textContent).includes(probe)) {
           return {
             element: node,
             diagnostic: `matched on text-quote substring across ${String(candidates.length)} candidates`,
           };
         }
+      }
+      return { element: null, diagnostic: 'no text match' };
+    };
+
+    // Find the turn element on this page using text matching across
+    // the captured selector's candidate set first, then the provider's
+    // broader turn selector. Captured `sourceSelector` values are not
+    // unique anchors — ChatGPT may store a broad selector such as
+    // `main [data-message-author-role]` — so a raw querySelector()
+    // would incorrectly pin every annotation to the first turn.
+    const findTurnElementOnPage = (
+      sourceSelector: string | undefined,
+      turnText: string,
+    ): { readonly element: HTMLElement | null; readonly diagnostic: string } => {
+      const tried: string[] = [];
+      const probe = buildProbe(normalizeForMatch(stripRolePrefix(turnText)));
+      if (probe.length === 0) {
+        return {
+          element: null,
+          diagnostic: `probe empty after strip+normalize; tried=[${tried.join(', ')}]`,
+        };
+      }
+      if (sourceSelector !== undefined && sourceSelector.length > 0) {
+        const sourceCandidates = queryTurnCandidates(sourceSelector);
+        if (sourceCandidates === null) {
+          tried.push(`sourceSelector threw on querySelector (${sourceSelector})`);
+        } else {
+          tried.push(
+            `sourceSelector=${sourceSelector} candidates=${String(sourceCandidates.length)}`,
+          );
+          const sourceMatch = findTurnInCandidates(sourceCandidates, probe);
+          if (sourceMatch.element !== null) {
+            return {
+              element: sourceMatch.element,
+              diagnostic: `${sourceMatch.diagnostic} via sourceSelector`,
+            };
+          }
+        }
+      }
+      const turnSelector = turnSelectorForCurrentProvider();
+      tried.push(`turnSelector=${turnSelector ?? 'null'}`);
+      const candidates = turnSelector === null ? [] : (queryTurnCandidates(turnSelector) ?? []);
+      const turnMatch = findTurnInCandidates(candidates, probe);
+      if (turnMatch.element !== null) {
+        return {
+          element: turnMatch.element,
+          diagnostic: `${turnMatch.diagnostic} via turnSelector`,
+        };
       }
       return {
         element: null,
@@ -391,7 +412,11 @@ export default defineContentScript({
 
     const annotateTurnFromSidepanel = async (
       message: AnnotateTurnMessage,
-    ): Promise<{ readonly ok: boolean; readonly error?: string; readonly annotationId?: string }> => {
+    ): Promise<{
+      readonly ok: boolean;
+      readonly error?: string;
+      readonly annotationId?: string;
+    }> => {
       const lookup = findTurnElementOnPage(message.sourceSelector, message.turnText);
       const target = lookup.element;
       if (target === null) {
@@ -524,7 +549,9 @@ export default defineContentScript({
       const provider = detectProviderFromUrl(window.location.href);
       if (provider === 'unknown') return null;
       const config = providerConfigs[provider];
-      const direct = config.directSources.map((source) => source.selector).filter((s) => s.length > 0);
+      const direct = config.directSources
+        .map((source) => source.selector)
+        .filter((s) => s.length > 0);
       if (direct.length === 0) return null;
       return direct.join(', ');
     };
@@ -626,24 +653,26 @@ export default defineContentScript({
         if (results.length === 0 && !force) return;
         closeDejaVu();
         dejaVuMounted = mountDejaVuPopover({
-          items: results.map((r: RankedItem): DejaVuItem => ({
-            id: r.id,
-            title: r.title ?? `thread ${r.threadId.slice(0, 12)}`,
-            snippet: r.snippet ?? '',
-            score: r.score,
-            relativeWhen: r.capturedAt,
-            // Provider is derived from the matched thread's URL when
-            // we have it (different chat → different provider chip);
-            // we fall back to the current page's provider for legacy
-            // results that don't carry a threadUrl yet.
-            provider: detectProviderFromUrl(r.threadUrl ?? window.location.href),
-            // Jump must go to the MATCHED thread, not the current
-            // page. Setting threadUrl to window.location.href here
-            // was a copy-paste leftover that made every Jump a no-op
-            // (focus-in-side-panel for the page you're already on).
-            ...(r.threadUrl === undefined ? {} : { threadUrl: r.threadUrl }),
-            bacId: r.threadId,
-          })),
+          items: results.map(
+            (r: RankedItem): DejaVuItem => ({
+              id: r.id,
+              title: r.title ?? `thread ${r.threadId.slice(0, 12)}`,
+              snippet: r.snippet ?? '',
+              score: r.score,
+              relativeWhen: r.capturedAt,
+              // Provider is derived from the matched thread's URL when
+              // we have it (different chat → different provider chip);
+              // we fall back to the current page's provider for legacy
+              // results that don't carry a threadUrl yet.
+              provider: detectProviderFromUrl(r.threadUrl ?? window.location.href),
+              // Jump must go to the MATCHED thread, not the current
+              // page. Setting threadUrl to window.location.href here
+              // was a copy-paste leftover that made every Jump a no-op
+              // (focus-in-side-panel for the page you're already on).
+              ...(r.threadUrl === undefined ? {} : { threadUrl: r.threadUrl }),
+              bacId: r.threadId,
+            }),
+          ),
           anchorRect,
           onJump: (item) => {
             if (item.threadUrl !== undefined) {
@@ -718,10 +747,7 @@ export default defineContentScript({
       // to the popover's own listeners (jump / close button).
       const target = event.target;
       if (target instanceof Element) {
-        if (
-          dejaVuMounted !== null &&
-          target.closest('.sidetrack-deja-pop') === null
-        ) {
+        if (dejaVuMounted !== null && target.closest('.sidetrack-deja-pop') === null) {
           closeDejaVu();
         }
         if (

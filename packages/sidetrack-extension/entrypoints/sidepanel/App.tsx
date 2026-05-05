@@ -630,9 +630,7 @@ const App = () => {
       return undefined;
     }
     const targetWorkstreamId = composeWorkstreamOverrideId ?? composeThread.primaryWorkstreamId;
-    return state.workstreams.find(
-      (workstream) => workstream.bac_id === targetWorkstreamId,
-    );
+    return state.workstreams.find((workstream) => workstream.bac_id === targetWorkstreamId);
   }, [composeThread, composeWorkstreamOverrideId, state.workstreams]);
 
   const refresh = async () => {
@@ -687,12 +685,13 @@ const App = () => {
     let cancelled = false;
     const fetchRecall = async (): Promise<void> => {
       try {
-        const response = await fetch(
-          `http://127.0.0.1:${String(portValue)}/v1/system/health`,
-          { headers: { 'x-bac-bridge-key': bridgeKey } },
-        );
+        const response = await fetch(`http://127.0.0.1:${String(portValue)}/v1/system/health`, {
+          headers: { 'x-bac-bridge-key': bridgeKey },
+        });
         if (!response.ok || cancelled) return;
-        const body = (await response.json()) as { readonly data?: { readonly recall?: { readonly status?: unknown } } };
+        const body = (await response.json()) as {
+          readonly data?: { readonly recall?: { readonly status?: unknown } };
+        };
         const status = body.data?.recall?.status;
         if (
           status === 'missing' ||
@@ -949,9 +948,11 @@ const App = () => {
   // half-typed note.
   const [annotateTurnKey, setAnnotateTurnKey] = useState<string | null>(null);
   const [annotateTurnDraft, setAnnotateTurnDraft] = useState('');
-  const [annotateTurnStatus, setAnnotateTurnStatus] = useState<
-    { readonly key: string; readonly tone: 'saving' | 'ok' | 'error'; readonly text: string } | null
-  >(null);
+  const [annotateTurnStatus, setAnnotateTurnStatus] = useState<{
+    readonly key: string;
+    readonly tone: 'saving' | 'ok' | 'error';
+    readonly text: string;
+  } | null>(null);
   // Refs to thread row DOM elements, keyed by bac_id, so the
   // chat-side focus button can scrollIntoView + flash the matching
   // row. Map mutated via the ref callback below.
@@ -974,9 +975,7 @@ const App = () => {
   // even though the registration runs only once.
   const viewModeRef = useRef<'workstream' | 'all'>('workstream');
   const currentWsIdRef = useRef<string | null>(null);
-  const expandBucketForThreadRef = useRef<
-    ((thread: TrackedThread) => Promise<void>) | null
-  >(null);
+  const expandBucketForThreadRef = useRef<((thread: TrackedThread) => Promise<void>) | null>(null);
   const activeTabTrackedThread = useMemo(
     () =>
       state.activeTabUrl === undefined
@@ -1070,13 +1069,7 @@ const App = () => {
     return () => {
       cancelled = true;
     };
-  }, [
-    composeThread,
-    bridgeKey,
-    port,
-    composeScopeSuggestionsByThread,
-    state.workstreams,
-  ]);
+  }, [composeThread, bridgeKey, port, composeScopeSuggestionsByThread, state.workstreams]);
 
   // Pre-fetch turns when the Send-to dropdown opens, so the smart-
   // default packet builder has full chat context cached when the
@@ -1686,11 +1679,7 @@ const App = () => {
     });
   };
 
-  const submitTurnAnnotation = (
-    threadUrl: string,
-    turn: CapturedTurnRecord,
-    key: string,
-  ): void => {
+  const submitTurnAnnotation = (threadUrl: string, turn: CapturedTurnRecord, key: string): void => {
     const note = annotateTurnDraft.trim();
     if (note.length === 0) {
       return;
@@ -1702,9 +1691,7 @@ const App = () => {
           type: messageTypes.annotateTurn,
           threadUrl,
           turnText: turn.text,
-          ...(turn.sourceSelector === undefined
-            ? {}
-            : { sourceSelector: turn.sourceSelector }),
+          ...(turn.sourceSelector === undefined ? {} : { sourceSelector: turn.sourceSelector }),
           note,
           capturedAt: new Date().toISOString(),
         });
@@ -2431,9 +2418,7 @@ const App = () => {
             >
               <span className="thread-autosend-dot" aria-hidden />
               <span className="thread-autosend-label">auto-send</span>
-              <span className="thread-autosend-state">
-                {thread.autoSendEnabled ? 'on' : 'off'}
-              </span>
+              <span className="thread-autosend-state">{thread.autoSendEnabled ? 'on' : 'off'}</span>
             </button>
           ) : null}
         </div>
@@ -2518,8 +2503,7 @@ const App = () => {
                 linkedThreadId === undefined
                   ? undefined
                   : state.threads.find((t) => t.bac_id === linkedThreadId);
-              const targetLabel =
-                TARGET_PROVIDER_LABEL[d.target.provider] ?? d.target.provider;
+              const targetLabel = TARGET_PROVIDER_LABEL[d.target.provider] ?? d.target.provider;
               const destTitle =
                 linkedThread?.title ??
                 (d.target.mode === 'auto-send' ? 'pending — new chat' : 'pending — paste it');
@@ -2542,9 +2526,7 @@ const App = () => {
                   ) : (
                     <span className="thread-dispatched-name muted">{destTitle}</span>
                   )}
-                  <span className="thread-dispatched-when mono">
-                    {formatRelative(d.createdAt)}
-                  </span>
+                  <span className="thread-dispatched-when mono">{formatRelative(d.createdAt)}</span>
                 </li>
               );
             })}
@@ -2582,8 +2564,7 @@ const App = () => {
                 <button
                   type="button"
                   className={
-                    'btn-link thread-action-icon' +
-                    (requiresCompanion ? ' disabled-look' : '')
+                    'btn-link thread-action-icon' + (requiresCompanion ? ' disabled-look' : '')
                   }
                   title={
                     requiresCompanion
@@ -2860,9 +2841,7 @@ const App = () => {
                             event.preventDefault();
                             const fromTransfer = event.dataTransfer.getData('text/plain');
                             const sourceId =
-                              fromTransfer.length > 0
-                                ? fromTransfer
-                                : (draggedQueueItemId ?? '');
+                              fromTransfer.length > 0 ? fromTransfer : (draggedQueueItemId ?? '');
                             setDraggedQueueItemId(null);
                             setDragOverQueueItemId(null);
                             if (sourceId.length === 0 || sourceId === item.bac_id) {
@@ -3050,41 +3029,41 @@ const App = () => {
         <div className="thread-history">
           {historyOpen ? (
             <>
-              {threadNotes.length === 0 ? null : (
-                threadNotes.map((note) => (
-                  <div key={note.bac_id} className="thread-history-item">
-                    <span className="glyph" aria-hidden>
-                      ▍
-                    </span>
-                    <div className="body">{note.text}</div>
-                    <span className="meta">{formatRelative(note.createdAt)}</span>
-                    <div className="actions">
-                      <button
-                        type="button"
-                        className="btn-link"
-                        title="Edit this note"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          beginEditNote(note.bac_id, note.text);
-                        }}
-                      >
-                        Edit
-                      </button>
-                      <button
-                        type="button"
-                        className="btn-link"
-                        title="Delete this note"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          deleteNote(note.bac_id);
-                        }}
-                      >
-                        Delete
-                      </button>
+              {threadNotes.length === 0
+                ? null
+                : threadNotes.map((note) => (
+                    <div key={note.bac_id} className="thread-history-item">
+                      <span className="glyph" aria-hidden>
+                        ▍
+                      </span>
+                      <div className="body">{note.text}</div>
+                      <span className="meta">{formatRelative(note.createdAt)}</span>
+                      <div className="actions">
+                        <button
+                          type="button"
+                          className="btn-link"
+                          title="Edit this note"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            beginEditNote(note.bac_id, note.text);
+                          }}
+                        >
+                          Edit
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-link"
+                          title="Delete this note"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            deleteNote(note.bac_id);
+                          }}
+                        >
+                          Delete
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                ))
-              )}
+                  ))}
               {historyComposeOpen ? (
                 <form
                   className="thread-history-compose"
@@ -3424,19 +3403,17 @@ const App = () => {
       <div className="sp-status">
         <span
           className={
-            'sp-status-pill mono ' +
-            (state.companionStatus === 'vault-error' ? 'err' : 'ok')
+            'sp-status-pill mono ' + (state.companionStatus === 'vault-error' ? 'err' : 'ok')
           }
           title={
             state.companionStatus === 'vault-error'
-              ? 'Vault: companion can\'t reach the configured folder'
+              ? "Vault: companion can't reach the configured folder"
               : 'Vault: synced via companion'
           }
         >
           <span
             className={
-              'sp-status-dot ' +
-              (state.companionStatus === 'vault-error' ? 'red' : 'green')
+              'sp-status-dot ' + (state.companionStatus === 'vault-error' ? 'red' : 'green')
             }
             aria-hidden
           />
@@ -3623,9 +3600,7 @@ const App = () => {
                   title,
                   ...(parentId === null ? {} : { parentId }),
                   privacy: 'shared',
-                  ...(description !== undefined && description.length > 0
-                    ? { description }
-                    : {}),
+                  ...(description !== undefined && description.length > 0 ? { description } : {}),
                 },
               });
             }).then(() => {
@@ -4436,8 +4411,7 @@ const App = () => {
             // form too. Otherwise the user pastes the redacted text,
             // the matcher's needle (unredacted) never substring-hits
             // the captured turn, and the dispatch never links.
-            const displayBody =
-              state.dispatchOriginals[dispatch.bac_id] ?? dispatch.body;
+            const displayBody = state.dispatchOriginals[dispatch.bac_id] ?? dispatch.body;
             const targetLabel =
               TARGET_PROVIDER_LABEL[dispatch.target.provider] ?? dispatch.target.provider;
             const linkedThreadId = state.dispatchLinks[dispatch.bac_id];
@@ -4799,9 +4773,11 @@ interface NeedsOrganizeSuggestionRowProps {
   // semantics). Threaded in so the row shows real names instead of
   // a bac_id slice.
   readonly resolveLabel: (workstreamId: string) => string;
-  readonly onCache: (
-    payload: { readonly workstreamId: string; readonly label: string; readonly confidence: number },
-  ) => void;
+  readonly onCache: (payload: {
+    readonly workstreamId: string;
+    readonly label: string;
+    readonly confidence: number;
+  }) => void;
   readonly onClearCache: () => void;
   readonly onAccept: (workstreamId: string) => void;
   readonly onPickManual: () => void;
@@ -5012,11 +4988,7 @@ interface WorkstreamPickerProps {
   readonly parentForNew: string | null;
   readonly onClose: () => void;
   readonly onSelect: (id: string | null) => void;
-  readonly onCreate: (
-    title: string,
-    parentId: string | null,
-    description?: string,
-  ) => void;
+  readonly onCreate: (title: string, parentId: string | null, description?: string) => void;
 }
 
 function WorkstreamPicker({

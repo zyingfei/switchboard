@@ -658,9 +658,7 @@ const clearReviewOverlays = (root: HTMLElement): void => {
   }
 };
 
-export const mountReviewSelectionChip = (
-  opts: ReviewChipMountOptions,
-): { close: () => void } => {
+export const mountReviewSelectionChip = (opts: ReviewChipMountOptions): { close: () => void } => {
   const root = ensureOverlayInfra();
   clearReviewOverlays(root);
 
@@ -671,8 +669,7 @@ export const mountReviewSelectionChip = (
   const COMMENT_W = 110;
   const DEJA_W = 100;
   const GAP = 6;
-  const totalWidth =
-    opts.onDejaVu !== undefined ? COMMENT_W + GAP + DEJA_W : COMMENT_W;
+  const totalWidth = opts.onDejaVu !== undefined ? COMMENT_W + GAP + DEJA_W : COMMENT_W;
   const viewportWidth = document.documentElement.clientWidth;
   let leftAnchor = Math.max(8, opts.anchorRect.right - 50);
   if (leftAnchor + totalWidth > viewportWidth - 8) {
@@ -834,7 +831,8 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
   if (isEmpty && list !== null) {
     const empty = document.createElement('div');
     empty.className = 'sidetrack-deja-empty';
-    empty.style.cssText = 'padding: 18px 14px; text-align: center; color: var(--ink-3); font-style: italic; font-size: 12px;';
+    empty.style.cssText =
+      'padding: 18px 14px; text-align: center; color: var(--ink-3); font-style: italic; font-size: 12px;';
     empty.textContent = 'No similar prior threads found in your vault.';
     list.appendChild(empty);
   }

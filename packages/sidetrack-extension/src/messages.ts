@@ -545,8 +545,7 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
 
   if (hasType(value, messageTypes.reorderQueueItems)) {
     return (
-      Array.isArray(value.queueItemIds) &&
-      value.queueItemIds.every((id) => typeof id === 'string')
+      Array.isArray(value.queueItemIds) && value.queueItemIds.every((id) => typeof id === 'string')
     );
   }
 
