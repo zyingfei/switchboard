@@ -947,16 +947,26 @@ const routes: readonly RouteDefinition[] = [
       // to "rebuilding" in /v1/system/health, errors are captured).
       // Fall back to the direct rebuilder for legacy callers that
       // didn't inject a lifecycle.
+      //
+      // Critical: do NOT await the rebuild here. The first rebuild
+      // downloads the embedder model (~30MB) and embeds every turn
+      // — that can take minutes. Holding the request open until it
+      // finishes causes Chrome's fetch to time out with "Failed to
+      // fetch" and the user thinks the rebuild errored when it's
+      // actually still chugging along. Returning 202 + the current
+      // status lets the side-panel pill + Health card poll
+      // /v1/system/health to track progress.
       if (context.recallLifecycle !== undefined) {
         context.recallLifecycle.scheduleRebuild('manual');
-        await context.recallLifecycle.waitForRebuild();
         const report = await context.recallLifecycle.report();
         return [
           202,
           {
             data: {
-              indexed: report.entryCount,
+              accepted: true,
               status: report.status,
+              entryCount: report.entryCount,
+              eventTurnCount: report.eventTurnCount,
               lastRebuildAt: report.lastRebuildAt,
               lastError: report.lastError,
             },

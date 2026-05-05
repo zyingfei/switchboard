@@ -109,17 +109,22 @@ export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelPr
   const [isLive, setIsLive] = useState(false);
   type RebuildState =
     | { kind: 'idle' }
-    | { kind: 'running' }
-    | { kind: 'done'; indexed: number }
+    | { kind: 'accepted' }
     | { kind: 'error'; message: string };
   const [rebuildState, setRebuildState] = useState<RebuildState>({ kind: 'idle' });
 
+  // Fire-and-monitor: POST /v1/recall/rebuild returns 202 immediately
+  // (the rebuild itself runs in the background — model download +
+  // embedding can take minutes). The recall index card already
+  // polls /v1/system/health every 5s while status === 'rebuilding',
+  // so the user sees the entry count tick up live without us
+  // holding the fetch open.
   const triggerRebuild = async (): Promise<void> => {
     if (companionPort === undefined || companionPort === null || !bridgeKey) {
       setRebuildState({ kind: 'error', message: 'Companion not configured.' });
       return;
     }
-    setRebuildState({ kind: 'running' });
+    setRebuildState({ kind: 'accepted' });
     try {
       const url = `http://127.0.0.1:${String(companionPort)}/v1/recall/rebuild`;
       const response = await fetch(url, {
@@ -131,15 +136,14 @@ export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelPr
         return;
       }
       const body = (await response.json()) as {
-        readonly data?: { readonly indexed?: number; readonly lastError?: string | null };
+        readonly data?: { readonly lastError?: string | null };
       };
       if (typeof body.data?.lastError === 'string' && body.data.lastError.length > 0) {
         setRebuildState({ kind: 'error', message: body.data.lastError });
         return;
       }
-      setRebuildState({ kind: 'done', indexed: body.data?.indexed ?? 0 });
-      // Eagerly refresh the snapshot so the recall card reflects the
-      // new entryCount + status without waiting for the 30s poll.
+      // Pull a fresh health snapshot so the card flips to "rebuilding"
+      // without waiting for the 30s poll cadence.
       const healthUrl = `http://127.0.0.1:${String(companionPort)}/v1/system/health`;
       const healthResponse = await fetch(healthUrl, {
         headers: { 'x-bac-bridge-key': bridgeKey },
@@ -179,14 +183,17 @@ export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelPr
       }
     };
     void fetchReport();
+    // Poll faster while a rebuild is in flight so the entry count
+    // ticks up live; fall back to 30s once it's settled.
+    const intervalMs = report.recall.status === 'rebuilding' ? 5_000 : 30_000;
     const id = window.setInterval(() => {
       void fetchReport();
-    }, 30_000);
+    }, intervalMs);
     return () => {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [companionPort, bridgeKey]);
+  }, [companionPort, bridgeKey, report.recall.status]);
 
   const queueWarn =
     report.capture.queueDepthHint !== null && report.capture.queueDepthHint > 10;
@@ -312,20 +319,21 @@ export function HealthPanel({ onClose, companionPort, bridgeKey }: HealthPanelPr
         </button>
         <button
           type="button"
-          disabled={rebuildState.kind === 'running' || report.recall.status === 'rebuilding'}
+          disabled={rebuildState.kind === 'accepted' || report.recall.status === 'rebuilding'}
           onClick={() => {
             void triggerRebuild();
           }}
         >
-          {rebuildState.kind === 'running' || report.recall.status === 'rebuilding'
-            ? 'Re-indexing…'
-            : 'Re-index'}
+          {report.recall.status === 'rebuilding'
+            ? `Re-indexing… (${String(report.recall.entryCount)}${
+                report.recall.eventTurnCount !== undefined
+                  ? `/${String(report.recall.eventTurnCount)}`
+                  : ''
+              })`
+            : rebuildState.kind === 'accepted'
+              ? 'Started — watching…'
+              : 'Re-index'}
         </button>
-        {rebuildState.kind === 'done' ? (
-          <span className="muted" style={{ alignSelf: 'center', marginLeft: 6 }}>
-            indexed {String(rebuildState.indexed)}
-          </span>
-        ) : null}
         {rebuildState.kind === 'error' ? (
           <span className="muted" style={{ alignSelf: 'center', marginLeft: 6 }}>
             {rebuildState.message}
