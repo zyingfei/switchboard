@@ -1079,13 +1079,37 @@ const shouldAutoDispatchMcpRequest = (dispatch: DispatchEventRecord): boolean =>
   (dispatch.status === 'sent' || dispatch.status === 'pending' || dispatch.status === 'queued') &&
   MCP_AUTO_DISPATCH_URL[dispatch.target.provider] !== undefined;
 
+// How long an unlinked auto-dispatch can stay marked "started"
+// before we retry. The first attempt may have failed silently
+// (composer didn't mount, content script wasn't injected, the user
+// closed the tab before auto-send drove it). Without retry the
+// dispatch is permanently stuck. 3 minutes is comfortably longer
+// than a worst-case ChatGPT response (~90s) plus capture latency.
+const MCP_DISPATCH_STALE_RETRY_MS = 3 * 60 * 1000;
+
 const openAutoApprovedMcpDispatches = async (
   dispatches: readonly DispatchEventRecord[],
 ): Promise<void> => {
   const alreadyStarted = await readMcpAutoDispatched();
+  const links = await readDispatchLinks();
+  const nowMs = Date.now();
   for (const dispatch of dispatches) {
-    if (!shouldAutoDispatchMcpRequest(dispatch) || alreadyStarted[dispatch.bac_id] !== undefined) {
+    if (!shouldAutoDispatchMcpRequest(dispatch)) {
       continue;
+    }
+    const startedAt = alreadyStarted[dispatch.bac_id];
+    if (startedAt !== undefined) {
+      // Linked → handled, skip.
+      if (links[dispatch.bac_id] !== undefined) continue;
+      // Unlinked: was the first attempt recent enough that we should
+      // wait? If yes, skip; otherwise fall through to retry.
+      const startedMs = Date.parse(startedAt);
+      if (Number.isFinite(startedMs) && nowMs - startedMs < MCP_DISPATCH_STALE_RETRY_MS) {
+        continue;
+      }
+      console.warn(
+        `[mcp.request_dispatch] retrying stuck dispatch ${dispatch.bac_id} (started ${startedAt}, no thread link).`,
+      );
     }
     const url = MCP_AUTO_DISPATCH_URL[dispatch.target.provider];
     if (url === undefined) {
