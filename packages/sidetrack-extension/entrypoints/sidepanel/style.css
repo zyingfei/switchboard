@@ -4227,6 +4227,74 @@ button.btn-link.lineage-name:hover {
   color: var(--signal, #c2410c);
 }
 
+/* Outgoing dispatches surfaced inside the source thread card.
+   Mirrors the lineage row's tone (italic display font, monospace
+   metadata) but uses ↗ to read as "this thread shipped a packet to
+   X" rather than "branched from X". */
+.thread-dispatched-list {
+  list-style: none;
+  margin: 4px 0 0 24px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.thread-dispatched-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  color: var(--ink-3, #7a7269);
+  min-width: 0;
+}
+.thread-dispatched-row .lineage-arrow {
+  color: var(--ink-4, #a39a8c);
+  font-size: 11px;
+  flex: none;
+}
+.thread-dispatched-target {
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  border: 1px solid var(--rule, #d4cdb8);
+  border-radius: 3px;
+  background: var(--paper, #f5efe2);
+  color: var(--ink-2, #4a453d);
+  flex: none;
+}
+.thread-dispatched-name {
+  font-family: var(--display, 'Fraunces', Georgia, serif);
+  font-size: 12px;
+  color: var(--ink-2, #4a453d);
+  font-style: italic;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+button.btn-link.thread-dispatched-name {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+}
+button.btn-link.thread-dispatched-name:hover {
+  color: var(--signal, #c2410c);
+}
+.thread-dispatched-name.muted {
+  color: var(--ink-4, #a39a8c);
+  font-style: italic;
+}
+.thread-dispatched-when {
+  color: var(--ink-4, #a39a8c);
+  font-size: 9.5px;
+  flex: none;
+}
+
 /* =====================================================
    Captures: notes + section action button
    ===================================================== */

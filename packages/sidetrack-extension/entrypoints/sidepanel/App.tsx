@@ -1954,6 +1954,16 @@ const App = () => {
     // list collapsing under them.
     const queueExpanded = queueExpandFor === thread.bac_id;
     const childForks = state.threads.filter((t) => t.parentThreadId === thread.bac_id);
+    // Outgoing dispatches sourced from this thread — the user wants
+    // each source-thread card to surface "this is where I shipped X to
+    // Gemini / Claude / Codex." Cap at the most recent 5 to avoid
+    // crowding the card; the full list still lives in Recent
+    // Dispatches at the section level.
+    const outgoingDispatches = state.recentDispatches
+      .filter((d) => d.sourceThreadId === thread.bac_id && d.status !== 'archived')
+      .slice()
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, 5);
     const parent =
       thread.parentThreadId === undefined
         ? undefined
@@ -2157,6 +2167,46 @@ const App = () => {
               {String(childForks.length)} fork{childForks.length === 1 ? '' : 's'}
             </span>
           </div>
+        ) : null}
+        {outgoingDispatches.length > 0 ? (
+          <ul className="thread-dispatched-list" aria-label="Outgoing dispatches">
+            {outgoingDispatches.map((d) => {
+              const linkedThreadId = state.dispatchLinks[d.bac_id];
+              const linkedThread =
+                linkedThreadId === undefined
+                  ? undefined
+                  : state.threads.find((t) => t.bac_id === linkedThreadId);
+              const targetLabel =
+                TARGET_PROVIDER_LABEL[d.target.provider] ?? d.target.provider;
+              const destTitle =
+                linkedThread?.title ??
+                (d.target.mode === 'auto-send' ? 'pending — new chat' : 'pending — paste it');
+              return (
+                <li key={d.bac_id} className="thread-dispatched-row">
+                  <span className="lineage-arrow">↗</span>
+                  <span className="thread-dispatched-target chip mono">{targetLabel}</span>
+                  {linkedThread !== undefined ? (
+                    <button
+                      type="button"
+                      className="btn-link thread-dispatched-name"
+                      title={`Open destination chat: ${linkedThread.title}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openTabForThread(linkedThread);
+                      }}
+                    >
+                      {destTitle}
+                    </button>
+                  ) : (
+                    <span className="thread-dispatched-name muted">{destTitle}</span>
+                  )}
+                  <span className="thread-dispatched-when mono">
+                    {formatRelative(d.createdAt)}
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
         ) : null}
         <div className="thread-actions row2">
           <button
