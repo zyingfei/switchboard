@@ -334,7 +334,7 @@ export function HealthPanel({
           </div>
           <div className="hp-empty-copy">
             {loadState === 'loading'
-              ? 'Loading companion diagnostics...'
+              ? 'Loading companion diagnostics…'
               : 'Connect the Sidetrack companion to show live capture, recall, and service diagnostics.'}
           </div>
         </div>
@@ -514,7 +514,7 @@ export function HealthPanel({
           }}
         >
           {report?.recall.status === 'rebuilding'
-            ? `Re-indexing... (${String(
+            ? `Re-indexing… (${String(
                 report.recall.rebuildEmbedded ?? report.recall.entryCount ?? 0,
               )}${
                 report.recall.rebuildTotal !== undefined && report.recall.rebuildTotal > 0
@@ -524,7 +524,7 @@ export function HealthPanel({
                     : ''
               })`
             : rebuildState.kind === 'accepted'
-              ? 'Started - watching...'
+              ? 'Started — watching…'
               : 'Re-index'}
         </button>
         {rebuildState.kind === 'error' ? (
