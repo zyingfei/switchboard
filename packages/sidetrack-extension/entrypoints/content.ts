@@ -435,6 +435,7 @@ export default defineContentScript({
             // was a copy-paste leftover that made every Jump a no-op
             // (focus-in-side-panel for the page you're already on).
             ...(r.threadUrl === undefined ? {} : { threadUrl: r.threadUrl }),
+            bacId: r.threadId,
           })),
           anchorRect,
           onJump: (item) => {
@@ -442,6 +443,14 @@ export default defineContentScript({
               void chrome.runtime.sendMessage({
                 type: messageTypes.focusThreadInSidePanel,
                 threadUrl: item.threadUrl,
+                // Pass the matched thread's bac_id + title + last-seen
+                // through to the side panel. Lets the focus handler
+                // render a synthetic card for recall results that
+                // aren't in the local thread cache yet (e.g. captured
+                // on another device, vault-only).
+                ...(item.bacId === undefined ? {} : { bacId: item.bacId }),
+                title: item.title,
+                lastSeenAt: item.relativeWhen,
               });
             }
             closeDejaVu();

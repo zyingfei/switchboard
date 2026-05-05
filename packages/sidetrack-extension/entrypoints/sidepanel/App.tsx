@@ -20,7 +20,7 @@ import {
   type RuntimeResponse,
   type WorkboardRequest,
 } from '../../src/messages';
-import { canonicalThreadUrl } from '../../src/capture/providerDetection';
+import { canonicalThreadUrl, detectProviderFromUrl } from '../../src/capture/providerDetection';
 import {
   CodingAttach,
   AutoSendQueueRow,
@@ -712,12 +712,37 @@ const App = () => {
         // like a no-op.
         const targetCanonical = canonicalThreadUrl(message.threadUrl);
         void (async () => {
-          const threads = stateRef.current.threads;
-          const match = threads.find(
+          let match = stateRef.current.threads.find(
             (thread) =>
               thread.threadUrl === message.threadUrl ||
               canonicalThreadUrl(thread.threadUrl) === targetCanonical,
           );
+          // No local card for this thread (typical for recall hits
+          // sourced from the companion vault that the local cache
+          // never captured). Synthesize one inline from the message
+          // payload so the user can still focus + click into it.
+          if (match === undefined && message.bacId !== undefined) {
+            const synthesized: TrackedThread = {
+              bac_id: message.bacId,
+              provider: detectProviderFromUrl(message.threadUrl),
+              threadUrl: message.threadUrl,
+              title: message.title ?? message.threadUrl,
+              lastSeenAt: message.lastSeenAt ?? new Date().toISOString(),
+              status: 'active',
+              trackingMode: 'manual',
+              tags: [],
+            };
+            setState((current) => ({
+              ...current,
+              threads: [synthesized, ...current.threads],
+            }));
+            // Also push into stateRef so the focus logic below sees it.
+            stateRef.current = {
+              ...stateRef.current,
+              threads: [synthesized, ...stateRef.current.threads],
+            };
+            match = synthesized;
+          }
           if (match === undefined) return;
           // If the matched thread isn't in the active workstream
           // view, fall back to "All threads" so the row renders.

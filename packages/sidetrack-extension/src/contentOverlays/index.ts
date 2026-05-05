@@ -434,6 +434,11 @@ export interface DejaVuItem {
   readonly relativeWhen: string;
   readonly provider?: ProviderId;
   readonly threadUrl?: string;
+  // Full thread bac_id + last-seen timestamp from the recall result.
+  // Plumbed through Jump so the side panel can synthesize a card
+  // for threads that aren't yet in the local thread cache (e.g.
+  // captured on another device, only in the companion's vault).
+  readonly bacId?: string;
 }
 
 interface DejaVuMountOptions {

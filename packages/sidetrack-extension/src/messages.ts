@@ -147,10 +147,18 @@ export const isWorkboardChangedMessage = (value: unknown): value is WorkboardCha
 
 // Broadcast: side panel should scroll to + flash the row whose
 // thread.threadUrl matches. Fired by the background after a
-// content-script focus button click.
+// content-script focus button click. Optional `bacId` / `title` /
+// `lastSeenAt` let the sidebar surface a synthetic card when the
+// requested thread is in the recall index but missing from the
+// local thread cache (e.g. captured on another device, or pruned
+// locally). Without these, the handler can only fall back to the
+// no-op behavior since there's nothing to focus on.
 export interface FocusThreadInSidePanelMessage {
   readonly type: typeof messageTypes.focusThreadInSidePanel;
   readonly threadUrl: string;
+  readonly bacId?: string;
+  readonly title?: string;
+  readonly lastSeenAt?: string;
 }
 
 export const isFocusThreadInSidePanelMessage = (
@@ -158,7 +166,10 @@ export const isFocusThreadInSidePanelMessage = (
 ): value is FocusThreadInSidePanelMessage =>
   isRecord(value) &&
   value.type === messageTypes.focusThreadInSidePanel &&
-  typeof value.threadUrl === 'string';
+  typeof value.threadUrl === 'string' &&
+  (value.bacId === undefined || typeof value.bacId === 'string') &&
+  (value.title === undefined || typeof value.title === 'string') &&
+  (value.lastSeenAt === undefined || typeof value.lastSeenAt === 'string');
 
 export interface ContentRequest {
   readonly type: typeof messageTypes.captureVisibleThread;
