@@ -588,10 +588,12 @@ export function SettingsPanel({
       </div>
 
       <div className="settings-section">
-        <h3 className="settings-section-title">Screen-share-safe mode</h3>
+        <h3 className="settings-section-title">Screen-share-safe mode (also pauses auto-send)</h3>
         <p className="settings-section-lede ai-italic">
-          When on, Sidetrack masks sensitive previews (private workstream titles, packet bodies) in
-          the side panel — useful when you might be screen-sharing.
+          Mirror of the top-bar screenshare toggle. Either source turning ON masks
+          private workstream previews AND pauses the auto-send drain. Setting this here
+          persists to the companion (so it survives extension reload even when no
+          top-bar toggle has been clicked); the top-bar toggle is the quick on/off.
         </p>
         <label className={'switch ' + (draftScreenShareSafe ? 'on' : '')}>
           <input
@@ -604,7 +606,7 @@ export function SettingsPanel({
           />
           <span className="knob" />
           <span className="lbl">
-            Mask previews
+            Mask previews + pause auto-send
             <span className="desc mono">
               {draftScreenShareSafe ? 'on — masking active' : 'off'}
             </span>

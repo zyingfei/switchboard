@@ -2120,6 +2120,38 @@ const App = () => {
                 : workstreamPath(thread.primaryWorkstreamId, state.workstreams)}
             </button>
           ) : null}
+          {/* Auto-send state pill — moved out of .thread-actions
+              (the absolute-positioned action strip at top-right)
+              into the lifecycle row so it stops crowding the icons.
+              Renders inline with stamp + workstream path. */}
+          {queuedCount > 0 ? (
+            <button
+              type="button"
+              className={'thread-autosend' + (thread.autoSendEnabled ? ' on' : '')}
+              aria-pressed={thread.autoSendEnabled === true}
+              title={
+                thread.autoSendEnabled
+                  ? 'Auto-send on — queued items ship into this chat one at a time, waiting for each reply.'
+                  : 'Auto-send off — turn on to drain queued follow-ups into this chat (per-provider opt-in lives in Settings).'
+              }
+              onClick={(e) => {
+                e.stopPropagation();
+                void runAction(() =>
+                  sendRequest({
+                    type: messageTypes.setThreadAutoSend,
+                    threadId: thread.bac_id,
+                    enabled: !thread.autoSendEnabled,
+                  }),
+                );
+              }}
+            >
+              <span className="thread-autosend-dot" aria-hidden />
+              <span className="thread-autosend-label">auto-send</span>
+              <span className="thread-autosend-state">
+                {thread.autoSendEnabled ? 'on' : 'off'}
+              </span>
+            </button>
+          ) : null}
         </div>
         {lifecyclePill?.label === 'Needs organize' && !dismissedSuggestions.has(thread.bac_id) ? (
           <NeedsOrganizeSuggestionRow
@@ -2394,32 +2426,6 @@ const App = () => {
               </>
             );
           })()}
-          {queuedCount > 0 ? (
-            <button
-              type="button"
-              className={'thread-autosend' + (thread.autoSendEnabled ? ' on' : '')}
-              aria-pressed={thread.autoSendEnabled === true}
-              title={
-                thread.autoSendEnabled
-                  ? 'Auto-send on — queued items ship into this chat one at a time, waiting for each reply.'
-                  : 'Auto-send off — turn on to drain queued follow-ups into this chat (per-provider opt-in lives in Settings).'
-              }
-              onClick={(e) => {
-                e.stopPropagation();
-                void runAction(() =>
-                  sendRequest({
-                    type: messageTypes.setThreadAutoSend,
-                    threadId: thread.bac_id,
-                    enabled: !thread.autoSendEnabled,
-                  }),
-                );
-              }}
-            >
-              <span className="thread-autosend-dot" aria-hidden />
-              <span className="thread-autosend-label">auto-send</span>
-              <span className="thread-autosend-state">{thread.autoSendEnabled ? 'on' : 'off'}</span>
-            </button>
-          ) : null}
         </div>
         {sendToOpenFor === thread.bac_id ? (
           <div className="thread-send-to-inline">

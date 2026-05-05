@@ -63,6 +63,7 @@ import {
   saveCompanionSettings,
   saveCollapsedBuckets,
   saveCollapsedSections,
+  readScreenShareMode,
   saveScreenShareMode,
   saveVaultPath,
   reorderLocalQueueItems,
@@ -780,25 +781,38 @@ const runAutoSendDrain = async (threadId: string): Promise<AutoSendDrainOutcome>
     },
     readCompanionConfig: async () => {
       const localSettings = await readSettings();
-      // Per-provider opt-in + screenShareSafeMode live on the companion
-      // when configured. Local-only users don't have a companion to store
-      // those flags, so fall back to "the per-thread toggle is the
-      // consent" — the user explicitly flipped Auto-send: on.
+      // The top-bar screenshare toggle (local screenShareMode) is the
+      // canonical source — UNION it with the companion's settings-only
+      // screenShareSafeMode so the user's expectation that "the
+      // top-bar toggle controls everything" actually holds. Without
+      // this, the user could disable the top-bar toggle and still see
+      // "Screen-share-safe mode is on; auto-send is paused" because
+      // the companion's separate setting was independently true.
+      const localScreenShareOn = await readScreenShareMode();
       if (localSettings.companion.bridgeKey.trim().length === 0) {
-        return DEFAULT_LOCAL_CONFIG;
+        return {
+          ...DEFAULT_LOCAL_CONFIG,
+          screenShareSafeMode:
+            DEFAULT_LOCAL_CONFIG.screenShareSafeMode || localScreenShareOn,
+        };
       }
       try {
         const companionSettings = await createSettingsClient(localSettings.companion).read();
         return {
           autoSendOptIn: companionSettings.autoSendOptIn,
-          screenShareSafeMode: companionSettings.screenShareSafeMode,
+          screenShareSafeMode:
+            companionSettings.screenShareSafeMode || localScreenShareOn,
         };
       } catch (error) {
         console.warn(
           '[autoSend] could not fetch companion settings; falling back to local defaults:',
           error instanceof Error ? error.message : error,
         );
-        return DEFAULT_LOCAL_CONFIG;
+        return {
+          ...DEFAULT_LOCAL_CONFIG,
+          screenShareSafeMode:
+            DEFAULT_LOCAL_CONFIG.screenShareSafeMode || localScreenShareOn,
+        };
       }
     },
     findTabForThread: async (t) => await findTabForThread(t),
@@ -1262,6 +1276,21 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
       !isProviderThreadUrl(request.capture.provider, request.capture.threadUrl)
     ) {
       return { ok: true, state: await buildState('connected') };
+    }
+    // autoTrack gate: when off (default), auto-captures from the
+    // content script must NOT spawn brand-new thread records. The
+    // user's expectation is "manual tracking only" — they explicitly
+    // capture the threads they care about. Refresh-captures for
+    // already-tracked threads still flow through (so existing rows
+    // stay current); new-thread captures are silently dropped.
+    const settings = await readSettings();
+    if (!settings.autoTrack) {
+      const known = (await readThreads()).find(
+        (t) => t.threadUrl === request.capture.threadUrl,
+      );
+      if (known === undefined) {
+        return { ok: true, state: await buildState('connected') };
+      }
     }
     const response = await withCompanionStatus(() => storeCaptureEvent(request.capture), 'capture');
     if (response.ok) {

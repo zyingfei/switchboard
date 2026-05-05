@@ -3140,7 +3140,11 @@ textarea.preview-body:focus {
 }
 .thread {
   position: relative;
-  padding: 6px 10px;
+  /* Right padding reserves space for the absolute-positioned
+     .thread-actions strip at top-right (3 icon-buttons + gaps ~ 120px).
+     Without it, row1 content (title, queued pill, review-draft chip)
+     extends into the action-strip space and overlaps. */
+  padding: 6px 130px 6px 10px;
   border: 1px solid transparent;
   border-radius: var(--rad-m);
   margin-bottom: 2px;
@@ -3373,9 +3377,11 @@ textarea.preview-body:focus {
 }
 .thread-turn-card {
   display: grid;
-  grid-template-columns: 50px 1fr auto;
+  /* "ASSISTANT" at 9.5px + 0.08em letter-spacing + 4px padding needs
+     ~70px; the old 50px column truncated the role chip text. */
+  grid-template-columns: 70px minmax(0, 1fr) auto;
   gap: 6px 8px;
-  align-items: baseline;
+  align-items: start;
   padding: 3px 6px;
   border-radius: var(--rad-s);
   background: var(--paper);
