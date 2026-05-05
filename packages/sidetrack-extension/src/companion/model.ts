@@ -6,13 +6,68 @@ export interface CompanionSettings {
   readonly bridgeKey: string;
 }
 
+export interface CapturedAttachment {
+  // 'image' = inline / response image, 'upload' = attachment the user
+  // dropped into the composer, 'artifact' = Claude artifact, 'tool'
+  // = code-interpreter / tool output. We capture the URL only — the
+  // bytes stay with the provider unless a future phase elects to
+  // mirror them into the vault.
+  readonly kind: 'image' | 'upload' | 'artifact' | 'tool';
+  readonly url?: string;
+  readonly alt?: string;
+  readonly mimeType?: string;
+}
+
+export interface CapturedCitation {
+  // Per-citation surface scraped from the response. Source is the
+  // raw text label the provider shows (e.g. "janestreet.com+1");
+  // url is the destination if we can resolve it from a wrapping
+  // anchor.
+  readonly source: string;
+  readonly url?: string;
+}
+
+export interface CapturedResearchReport {
+  // Marker for an enhanced response — Deep Research (ChatGPT) or the
+  // Gemini Deep Research output. `mode` is the provider's own name
+  // for this surface; `citations` are the inline reference pills.
+  // Sections are optional and only populated when the response had
+  // recognizable structural headings.
+  readonly mode: 'deep-research' | 'gemini-deep-research' | 'unknown';
+  readonly citations?: readonly CapturedCitation[];
+  readonly sections?: readonly string[];
+}
+
 export interface CapturedTurn {
   readonly role: 'user' | 'assistant' | 'system' | 'unknown';
+  // Plain-text body (existing field). Stripped of markdown markers
+  // so recall index search continues to work against natural language.
   readonly text: string;
+  // Pre-existing optional formatted form; kept for back-compat.
   readonly formattedText?: string;
   readonly ordinal: number;
   readonly capturedAt: string;
   readonly sourceSelector?: string;
+  // Phase-1: which model generated THIS turn. For user turns the
+  // model is the one selected in the picker AT submit time (best
+  // effort — providers don't always expose it). For assistant turns
+  // it's the model that produced the response (or the picker label
+  // when no per-turn signal is available).
+  readonly modelName?: string;
+  // Phase-2: GFM markdown converted from the rendered DOM. Preserves
+  // headers, lists, code blocks, links, blockquotes — what the
+  // user actually sees rather than the flattened text body. Stored
+  // alongside `text` so callers can pick depending on need.
+  readonly markdown?: string;
+  // Phase-3: reasoning / thinking trace if the provider exposes one
+  // (Gemini "Show thinking" prefix; Claude reasoning toggle; OpenAI
+  // o-series thoughts when revealed). Not concatenated into `text`
+  // so recall search stays focused on the user-facing answer.
+  readonly reasoning?: string;
+  // Phase-4: attachments + response images.
+  readonly attachments?: readonly CapturedAttachment[];
+  // Phase-5: research report metadata (Deep Research, etc.).
+  readonly researchReport?: CapturedResearchReport;
 }
 
 export interface CaptureWarning {

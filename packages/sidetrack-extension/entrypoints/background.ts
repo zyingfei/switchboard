@@ -293,6 +293,17 @@ const sendToCompanion = async (
   const trackingMode: ThreadUpsert['trackingMode'] =
     event.provider === 'unknown' || !settings.autoTrack ? 'manual' : 'auto';
   const lastTurnRole = event.turns.at(-1)?.role;
+  // Prefer the per-turn modelName the enricher scraped from the
+  // assistant's last response (more accurate than event-level
+  // selectedModel which reflects the picker label at submit time).
+  // Falls back to the event-level value when the enricher didn't
+  // capture one (turn missing or non-assistant role).
+  const lastTurnModel =
+    event.turns
+      .slice()
+      .reverse()
+      .find((turn) => turn.role === 'assistant' && turn.modelName !== undefined)
+      ?.modelName ?? event.selectedModel;
   // Reuse the existing thread's bac_id — the event-result bac_id
   // is the per-event record id, NOT a thread id. Sending it as
   // thread.bac_id was forcing the companion's upsertThread to
@@ -311,6 +322,7 @@ const sendToCompanion = async (
     tabSnapshot: event.tabSnapshot,
     ...parentLink,
     ...(lastTurnRole === undefined ? {} : { lastTurnRole }),
+    ...(lastTurnModel === undefined ? {} : { selectedModel: lastTurnModel }),
   };
   const threadResult = await client.upsertThread(thread);
   // Index EVERY turn of the capture event, not just the last. The

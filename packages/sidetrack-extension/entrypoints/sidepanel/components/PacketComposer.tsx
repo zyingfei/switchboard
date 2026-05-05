@@ -292,59 +292,45 @@ ${ctx}
 
 // Coding-agent packets used to ship a static checklist
 // (Files / Acceptance criteria / Constraints) bolted onto a markdown
-// dump of the captured turns. That copy was lossy — the agent would
-// only see what the user already had in clipboard. The new packet is
-// MCP-aware: it points the agent at the running Sidetrack MCP endpoint
-// first, with the older companion HTTP-with-headers surface as fallback.
-// The tools list tells the agent what to call for live thread context,
-// decisions, and recent dispatches.
+// Lean MCP handoff packet for coding agents (Codex/Claude Code/etc.).
 //
-// The bridge key is rendered inline because the clipboard is local
-// and the companion only listens on 127.0.0.1 — no network exposure.
+// The previous version dumped: thread URL, provider label, full HTTP
+// fallback details, the tools list, a recommended sequence, AND a
+// frozen snapshot of every captured turn. That bloated the prompt
+// past 3KB on a multi-turn thread, leaked the chat URL into anyone
+// the user shared the prompt with, and undermined the whole point
+// of MCP — the agent should pull exactly what it needs over the
+// tool channel, not work from a stale frozen snapshot.
 //
-// Companion port + bridge key are interpolated by the host (App.tsx)
-// when it builds the packet; defaults shown here are illustrative.
+// New shape:
+//   1. Single thread_id (the only handle the agent needs).
+//   2. MCP endpoint URL (ws://… with the bridge token inline so the
+//      agent can connect without follow-up plumbing).
+//   3. The user's ask.
+//
+// Everything else — thread URL, provider, captured turns, tools
+// list, dispatches, annotations — is reachable via MCP. The agent
+// calls `tools/list` to discover what's available, `bac.read_thread_md`
+// to get the body, and so on. Nothing is duplicated in the prompt.
+//
+// `turnsMd` is intentionally NOT used here. It used to provide an
+// "offline fallback" snapshot, but if the companion is unreachable
+// the agent can't act on the thread either way — the fallback was
+// reassuring noise, not useful context.
 const buildCodingAgentPacket = (
   title: string,
   scope: PacketComposerScope,
-  turnsMd: string,
 ): string =>
+  // Even leaner than the previous lean version: drops the 274-char
+  // explanatory paragraph in favor of a one-line breadcrumb. Modern
+  // coding agents (Codex, Claude Code, Cursor) auto-discover MCP
+  // tools via tools/list on connect; the prose was front-loading
+  // a contract the agent never read. Side-by-side review in
+  // sidetrack-mcp/src/e2e/handoff-prompt-trim-review.md.
   `# Coding handoff: ${title}
-
-You are continuing work from a Sidetrack thread. The user's local
-Sidetrack companion is running and exposes a tool surface you can
-call to read live thread context, recent dispatches, and decisions.
-
-## Thread reference
-${threadInfoLine(scope)}
-${scope.sourceThreadId === undefined ? '' : `\nthread_id: ${scope.sourceThreadId}`}
-
-## Companion endpoint
-- MCP primary : ws://127.0.0.1:8721/mcp?token={BRIDGE_KEY}
-- HTTP fallback base url : http://127.0.0.1:{COMPANION_PORT}
-- HTTP fallback auth     : send header  x-bac-bridge-key: {BRIDGE_KEY}
-- HTTP fallback route    : send header  x-sidetrack-mcp-tool: <tool-name>
-
-(The companion runs locally only; the bridge key is local-machine.)
-
-## Tools you can call (read-only)
-- bac.read_thread_md       full markdown of this thread
-- bac.list_dispatches      recent context packets / asks the user shipped
-- bac.recall               vector recall over related threads + decisions
-- bac.read_workstream_md   workstream context if this thread is grouped
-- bac.list_annotations     user-saved highlights with comments
-- bac.list_audit_events    decisions, archives, edits
-
-Recommended sequence on first call: read_thread_md → list_dispatches →
-recall (if you need cross-thread context). Cite the tool name when
-you reference what you pulled so the user can verify.
-
-## Snapshot of the captured turns (offline fallback)
-If the companion is unreachable, work from this snapshot. It's the
-same data bac.read_thread_md would return, just frozen at clipboard
-time.
-
-${turnsMd}
+sidetrack_mcp: ws://127.0.0.1:8721/mcp?token={BRIDGE_KEY}
+sidetrack_thread_id: ${scope.sourceThreadId ?? '(unknown)'}
+(connect → tools/list → bac.read_thread_md)
 
 ## User's ask
 …`;
@@ -376,7 +362,7 @@ const buildBody = (
 ): string => {
   const turnsMd = renderTurnsMarkdown(scope.availableTurns ?? [], includeTurnCount);
   if (kind === 'context_pack') return buildContextPack(title, scope, turnsMd);
-  if (kind === 'coding_agent_packet') return buildCodingAgentPacket(title, scope, turnsMd);
+  if (kind === 'coding_agent_packet') return buildCodingAgentPacket(title, scope);
   if (kind === 'notebook_export') return buildNotebookExport(title, scope, turnsMd);
   return buildResearchPacket(title, template, scope, turnsMd);
 };

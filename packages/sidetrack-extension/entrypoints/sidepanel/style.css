@@ -2583,6 +2583,24 @@ textarea.preview-body:focus {
    ink-on-paper when off, signal-on-paper with a pulsing dot when on.
    The dot is the only colour signal in this row, matching the
    provider-status dots used elsewhere in the side panel. */
+.thread-model-pill {
+  display: inline-flex;
+  align-items: center;
+  border: var(--hair);
+  border-radius: var(--rad-s);
+  padding: 1px 6px 2px;
+  background: var(--paper-light, transparent);
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 14px;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+  flex: 0 0 auto;
+  white-space: nowrap;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .thread-autosend {
   display: inline-flex;
   align-items: center;

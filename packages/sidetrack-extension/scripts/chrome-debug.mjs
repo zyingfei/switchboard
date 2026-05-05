@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // Spawn Chrome for Testing (CfT) directly, with the Sidetrack extension
 // loaded and a remote debugging port open. CfT is Google's automation
-// distribution — it accepts --load-extension, doesn't add
-// --use-mock-keychain on top, and won't get blocked by Google sign-in
-// the way regular Chrome stable + Playwright does.
+// distribution — it accepts --load-extension and avoids Playwright's
+// extra automation flags. Provider passkey sign-in still requires a
+// human with the passkey hardware; see the Codex handoff runbook.
 //
 // Two-terminal usage:
 //
@@ -34,36 +34,57 @@ const idFile = path.join(packageRoot, '.output/cdp-extension-id');
 const expandTilde = (input) =>
   input.startsWith('~') ? path.join(homedir(), input.slice(1).replace(/^[/\\]/, '')) : input;
 
-const userDataDir = expandTilde(
-  process.env.SIDETRACK_USER_DATA_DIR ?? '~/.sidetrack-test-profile',
-);
+const userDataDir = expandTilde(process.env.SIDETRACK_USER_DATA_DIR ?? '~/.sidetrack-test-profile');
 const port = process.env.SIDETRACK_E2E_CDP_PORT ?? '9222';
+
+// Shared CfT install root, in the OS user-cache. One copy serves all
+// worktrees / PoCs / clones, instead of each `npm run e2e:install-cft`
+// dropping a 340 MB tree under `.chrome-for-testing/` per worktree.
+// Override with SIDETRACK_CFT_ROOT.
+const SHARED_CFT_ROOT =
+  process.env.SIDETRACK_CFT_ROOT ??
+  path.join(homedir(), 'Library/Caches/sidetrack/chrome-for-testing');
+
+const findCftBinaryUnder = async (rootWithChromeSubdir) => {
+  try {
+    const platforms = await readdir(rootWithChromeSubdir);
+    for (const platform of platforms) {
+      const candidate = path.join(
+        rootWithChromeSubdir,
+        platform,
+        'chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
+      );
+      if (existsSync(candidate)) return candidate;
+    }
+  } catch {
+    // dir absent — caller falls through.
+  }
+  return null;
+};
 
 // Find Chrome for Testing. Order:
 //   1) SIDETRACK_E2E_CHROME_BIN env var
-//   2) ./.chrome-for-testing/chrome/mac_arm-*/chrome-mac-arm64/Google Chrome for Testing.app
-//      (what `npx @puppeteer/browsers install chrome@stable --path ./.chrome-for-testing` writes)
-//   3) /Applications/Google Chrome for Testing.app
-//   4) Fall back to regular Chrome with a clear warning.
+//   2) ~/Library/Caches/sidetrack/chrome-for-testing/chrome/...  (shared cache)
+//   3) ./.chrome-for-testing/chrome/...                          (legacy per-worktree install)
+//   4) /Applications/Google Chrome for Testing.app
+//   5) Fall back to regular Chrome with a clear warning.
 const findChromeForTesting = async () => {
   if (process.env.SIDETRACK_E2E_CHROME_BIN !== undefined) {
     return { binary: process.env.SIDETRACK_E2E_CHROME_BIN, channel: 'env-override' };
   }
-  const cftRoot = path.join(packageRoot, '.chrome-for-testing/chrome');
-  try {
-    const platforms = await readdir(cftRoot);
-    for (const platform of platforms) {
-      const candidate = path.join(
-        cftRoot,
-        platform,
-        'chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
-      );
-      if (existsSync(candidate)) {
-        return { binary: candidate, channel: 'CfT (local install)' };
-      }
-    }
-  } catch {
-    // No local install yet.
+  const sharedHit = await findCftBinaryUnder(path.join(SHARED_CFT_ROOT, 'chrome'));
+  if (sharedHit !== null) {
+    return { binary: sharedHit, channel: `CfT (shared cache: ${SHARED_CFT_ROOT})` };
+  }
+  const localHit = await findCftBinaryUnder(path.join(packageRoot, '.chrome-for-testing/chrome'));
+  if (localHit !== null) {
+    console.warn(
+      '\n[chrome-debug] NOTE: using legacy per-worktree CfT install at .chrome-for-testing/.\n' +
+        '  Consider migrating to the shared cache to save disk:\n' +
+        '    npm run e2e:install-cft   (now installs to ~/Library/Caches/sidetrack/chrome-for-testing)\n' +
+        '    rm -rf ./.chrome-for-testing\n',
+    );
+    return { binary: localHit, channel: 'CfT (legacy local install)' };
   }
   const systemCft =
     '/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
@@ -76,7 +97,7 @@ const findChromeForTesting = async () => {
       '\n[chrome-debug] WARNING: Chrome for Testing not found. Falling back to ' +
         'regular Chrome stable, but extension loading may fail silently and ' +
         'Google login may be blocked. Install CfT with:\n' +
-        '  npx @puppeteer/browsers install chrome@stable --path ./.chrome-for-testing\n',
+        '  npm run e2e:install-cft\n',
     );
     return { binary: stableChrome, channel: 'Chrome stable (fallback)' };
   }
@@ -152,12 +173,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     await sleep(1_000);
     try {
       const list = await fetch(`http://localhost:${port}/json/list`).then((r) => r.json());
-      const serviceWorkers = list.filter(
-        (t) => t.type === 'service_worker' && (t.url ?? '').startsWith('chrome-extension://'),
+      const sw = list.find(
+        (t) =>
+          t.type === 'service_worker' &&
+          (t.url ?? '').startsWith('chrome-extension://') &&
+          (t.url ?? '').endsWith('/background.js'),
       );
-      const sw =
-        serviceWorkers.find((t) => (t.url ?? '').endsWith('/background.js')) ??
-        serviceWorkers[0];
       if (sw === undefined) continue;
       const match = /^chrome-extension:\/\/([^/]+)\//u.exec(sw.url);
       if (match === null) continue;
