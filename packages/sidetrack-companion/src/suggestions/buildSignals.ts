@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { embed } from '../recall/embedder.js';
 import { readIndex, type IndexFile } from '../recall/indexFile.js';
 import { cosine, meanNormalized } from './centroid.js';
-import { jaccard, normalizeTokens } from './tokens.js';
+import { containment, jaccard, normalizeTokens } from './tokens.js';
 import type { SignalSet } from './score.js';
 
 export interface BuildSignalsWorkstream {
@@ -100,9 +100,18 @@ export const buildSignals = async (
   }
 
   for (const workstream of workstreams) {
-    lexical[workstream.id] = jaccard(
-      threadTokens,
-      normalizeTokens(`${workstream.title} ${workstream.description ?? ''}`),
+    const wsTokens = normalizeTokens(
+      `${workstream.title} ${workstream.description ?? ''}`,
+    );
+    // Lexical = max(jaccard, ws→thread containment). Jaccard
+    // captures bidirectional overlap; the containment term rescues
+    // the common case where the workstream name is concentrated
+    // ("hackernews") and the thread title carries date/summary
+    // noise that drags jaccard down even when the workstream name
+    // is fully represented in the thread tokens.
+    lexical[workstream.id] = Math.max(
+      jaccard(threadTokens, wsTokens),
+      containment(wsTokens, threadTokens),
     );
     const memberIds = new Set(
       threads

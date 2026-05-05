@@ -380,6 +380,15 @@ export const suggestionQuerySchema = z.object({
     .positive()
     .optional()
     .transform((limit) => Math.min(limit ?? 5, 20)),
+  // Per-request threshold override — clamped [0, 1]. Defaults to
+  // SIDETRACK_SUGGEST_THRESHOLD env (or 0.35 if unset). Lets the UI
+  // ask for a lower bar on explicit refresh, and lets debug probes
+  // pass `threshold=0` to see the raw score breakdown.
+  threshold: z.coerce
+    .number()
+    .min(0)
+    .max(1)
+    .optional(),
 });
 
 export const autoUpdateSchema = z.object({

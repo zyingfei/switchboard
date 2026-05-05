@@ -1039,17 +1039,27 @@ const routes: readonly RouteDefinition[] = [
       const url = new URL(request.url ?? '/', 'http://127.0.0.1');
       const query = suggestionQuerySchema.parse({
         limit: url.searchParams.get('limit') ?? undefined,
+        threshold: url.searchParams.get('threshold') ?? undefined,
       });
       const workstreams = await readWorkstreams(vaultRoot);
       const signals = await buildSignals(vaultRoot, match.threadId, workstreams);
-      const threshold = Number.parseFloat(process.env['SIDETRACK_SUGGEST_THRESHOLD'] ?? '0.55');
+      // Threshold precedence: per-request param wins, then env var,
+      // then a permissive default (0.25). The pre-fix value (0.55)
+      // was calibrated for richly-populated workstreams where the
+      // 0.5*vector term dominated; with the cold-start title-
+      // embedding fallback and the asymmetric ws→thread containment
+      // signal, real positive matches typically score 0.25–0.45,
+      // so 0.25 surfaces them without a flood of noise.
+      const envThreshold = Number.parseFloat(process.env['SIDETRACK_SUGGEST_THRESHOLD'] ?? '');
+      const defaultThreshold = Number.isFinite(envThreshold) ? envThreshold : 0.25;
+      const threshold = query.threshold ?? defaultThreshold;
       const suggestions = scoreSuggestions(
         {
           thread: { id: match.threadId },
           workstreams,
           signals,
         },
-        { threshold: Number.isFinite(threshold) ? threshold : 0.55 },
+        { threshold },
       ).slice(0, query.limit);
       return [200, { data: suggestions }];
     },
