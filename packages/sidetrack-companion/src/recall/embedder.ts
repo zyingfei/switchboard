@@ -9,7 +9,17 @@ import { INDEX_DIM } from './indexFile.js';
 // and lower-peak-memory than wasm. The PoC at
 // `poc/recall-vector/src/recall/embedder.ts` validated this and
 // produced the benchmarks in `poc/recall-vector/README.md`.
-export const MODEL_ID = 'onnx-community/all-MiniLM-L6-v2-ONNX';
+//
+// Model is multilingual: `paraphrase-multilingual-MiniLM-L12-v2` was
+// chosen over the English-only `all-MiniLM-L6-v2` so cross-language
+// thread/workstream matching works (a Chinese-titled thread should
+// still cluster with its English-titled workstream peers). The
+// dimensionality stays 384, so the index format is unchanged — the
+// only effect of the swap is that an existing index becomes "stale"
+// per the lifecycle's modelId check, and the next companion start
+// auto-rebuilds against the new model. ~120MB cold-load (vs 30MB
+// for the english-only variant); cached on disk thereafter.
+export const MODEL_ID = 'Xenova/paraphrase-multilingual-MiniLM-L12-v2';
 
 type FeatureExtractor = (
   text: string,

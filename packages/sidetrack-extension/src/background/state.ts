@@ -584,6 +584,7 @@ export const createLocalWorkstream = async (
     privacy: input.privacy ?? 'shared',
     screenShareSensitive: input.screenShareSensitive ?? false,
     updatedAt: timestamp,
+    ...(input.description === undefined ? {} : { description: input.description }),
   };
   const withParent = current.map((candidate) =>
     candidate.bac_id === input.parentId

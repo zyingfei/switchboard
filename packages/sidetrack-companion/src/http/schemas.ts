@@ -122,6 +122,14 @@ export const workstreamCreateSchema = z.object({
   tags: z.array(z.string()).optional(),
   children: z.array(bacIdSchema).optional(),
   checklist: z.array(checklistItemSchema).optional(),
+  // Free-form text the user can curate for the suggester. Surfaces
+  // through buildSignals as `${title} ${description}` for both the
+  // lexical match (token + trigram) and the cold-start vector
+  // centroid embedding. Useful for cross-language hints (e.g. add
+  // English+Chinese keywords on a "travel" workstream so foreign-
+  // language threads get matched without waiting for a multilingual
+  // embedder to bridge the gap on its own).
+  description: z.string().optional(),
 });
 
 export const workstreamUpdateSchema = z.object({
@@ -133,6 +141,7 @@ export const workstreamUpdateSchema = z.object({
   tags: z.array(z.string()).optional(),
   children: z.array(bacIdSchema).optional(),
   checklist: z.array(checklistItemSchema).optional(),
+  description: z.string().optional(),
 });
 
 export const queueCreateSchema = z.object({

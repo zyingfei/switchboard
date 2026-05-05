@@ -80,6 +80,11 @@ export interface WorkstreamNode {
   readonly privacy: PrivacyMode;
   readonly screenShareSensitive?: boolean;
   readonly updatedAt: string;
+  // User-curated free-form description. Flows through to the
+  // companion's suggester (`buildSignals` reads `${title} {description}`)
+  // for both lexical token match and cold-start vector centroid.
+  // Surfaced in the workstream-detail panel as a multi-line field.
+  readonly description?: string;
 }
 
 export interface QueueItem {

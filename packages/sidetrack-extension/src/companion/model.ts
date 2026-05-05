@@ -107,6 +107,12 @@ export interface WorkstreamCreate {
   readonly privacy?: 'private' | 'shared' | 'public';
   readonly screenShareSensitive?: boolean;
   readonly tags?: readonly string[];
+  // Free-form description the user can curate; flows through to the
+  // companion's suggester via buildSignals (lexical match against
+  // thread tokens + cold-start centroid embedding). Useful for
+  // cross-language hints — e.g. add `"travel hotel hiking 旅游 旅行"`
+  // so a Chinese thread gets matched into the english-named ws.
+  readonly description?: string;
 }
 
 export interface ChecklistItem {
@@ -126,6 +132,7 @@ export interface WorkstreamUpdate {
   readonly tags?: readonly string[];
   readonly children?: readonly string[];
   readonly checklist?: readonly ChecklistItem[];
+  readonly description?: string;
 }
 
 export interface QueueCreate {

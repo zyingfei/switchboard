@@ -3468,7 +3468,7 @@ const App = () => {
             setWsPickerOpen(false);
             setWsPickerCreateMode(false);
           }}
-          onCreate={(title, parentId) => {
+          onCreate={(title, parentId, description) => {
             void runAction(async () => {
               return await sendRequest({
                 type: messageTypes.createWorkstream,
@@ -3476,6 +3476,9 @@ const App = () => {
                   title,
                   ...(parentId === null ? {} : { parentId }),
                   privacy: 'shared',
+                  ...(description !== undefined && description.length > 0
+                    ? { description }
+                    : {}),
                 },
               });
             }).then(() => {
@@ -4833,7 +4836,11 @@ interface WorkstreamPickerProps {
   readonly parentForNew: string | null;
   readonly onClose: () => void;
   readonly onSelect: (id: string | null) => void;
-  readonly onCreate: (title: string, parentId: string | null) => void;
+  readonly onCreate: (
+    title: string,
+    parentId: string | null,
+    description?: string,
+  ) => void;
 }
 
 function WorkstreamPicker({
@@ -4849,6 +4856,7 @@ function WorkstreamPicker({
   const [query, setQuery] = useState('');
   const [creating, setCreating] = useState(createMode);
   const [draftTitle, setDraftTitle] = useState('');
+  const [draftDescription, setDraftDescription] = useState('');
 
   const matches = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -4920,8 +4928,9 @@ function WorkstreamPicker({
               if (trimmed.length === 0) {
                 return;
               }
-              onCreate(trimmed, parentForNew);
+              onCreate(trimmed, parentForNew, draftDescription.trim());
               setDraftTitle('');
+              setDraftDescription('');
               setCreating(false);
             }}
           >
@@ -4937,6 +4946,20 @@ function WorkstreamPicker({
                 setDraftTitle(e.target.value);
               }}
             />
+            {/* Optional description — flows into the suggester's
+                lexical match + cold-start centroid, so multi-language
+                or topic-keyword hints land here. Keep it short:
+                "travel hotel hiking 旅游 酒店 徒步" is enough to
+                attract foreign-language threads. */}
+            <textarea
+              className="ws-picker-create-input"
+              placeholder="Description / keywords (optional, helps auto-match — multi-language ok)"
+              value={draftDescription}
+              rows={2}
+              onChange={(e) => {
+                setDraftDescription(e.target.value);
+              }}
+            />
             <button type="submit" className="btn btn-primary">
               Create
             </button>
@@ -4946,6 +4969,7 @@ function WorkstreamPicker({
               onClick={() => {
                 setCreating(false);
                 setDraftTitle('');
+                setDraftDescription('');
               }}
             >
               Cancel
