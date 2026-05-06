@@ -8,6 +8,7 @@ import { embed } from './embedder.js';
 import {
   INDEX_CHUNK_SCHEMA_VERSION,
   INDEX_VERSION,
+  tombstoneByThread,
   upsertEntries,
 } from './indexFile.js';
 import {
@@ -111,7 +112,16 @@ const EMBED_TEXT_CHARS = 4000;
 
 interface IngestSummary {
   readonly indexedChunks: number;
+  // Distinct thread ids tombstoned by recall.tombstone.target events
+  // observed in this ingest pass. The same threadId may produce
+  // multiple stamped entries on disk.
   readonly tombstonedChunks: number;
+  // Number of EXISTING index entries flipped to tombstoned by this
+  // pass. Captures the case where a tombstone arrives long after the
+  // capture it tombstones — without this, `tombstonedChunks` (the
+  // size of the same-pass thread set) doesn't reflect the actual
+  // index update.
+  readonly tombstonedEntries: number;
   readonly processedEvents: Record<string, number>;
 }
 
@@ -204,6 +214,17 @@ export const ingestIncremental = async (
     indexedCount += entries.length;
   }
 
+  // Apply each fresh tombstone to EXISTING index entries — not just
+  // the chunks we just produced. A tombstone that arrives after the
+  // capture it targets must still flip the older entries on disk
+  // before the ingest frontier advances; without this, peer-driven
+  // tombstones get silently consumed.
+  let tombstonedEntries = 0;
+  for (const threadId of tombstonedThreads) {
+    const result = await tombstoneByThread(indexPath(vaultRoot), threadId);
+    tombstonedEntries += result.tombstoned;
+  }
+
   // Compute the new high-water marks per replica from the merged
   // log (NOT just `fresh`) so we capture every event we observed,
   // not just the ones we emitted entries for.
@@ -225,6 +246,7 @@ export const ingestIncremental = async (
   return {
     indexedChunks: indexedCount,
     tombstonedChunks: tombstonedThreads.size,
+    tombstonedEntries,
     processedEvents: nextProcessed,
   };
 };

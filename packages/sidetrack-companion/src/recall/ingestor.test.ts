@@ -122,4 +122,50 @@ describe('ingestor', () => {
     expect(index?.items.length).toBeGreaterThan(0);
     expect(index?.items.every((item) => item.tombstoned === true)).toBe(true);
   });
+
+  it('applies a tombstone that arrives AFTER the capture has already been ingested', async () => {
+    // Regression for the "tombstone consumed but never applied to
+    // existing entries" bug. Sequence:
+    //   1. ingest a capture → entries land tombstoned: false
+    //   2. append a tombstone targeting that thread
+    //   3. ingest again — must flip the existing entries
+    const { createEventLog } = await import('../sync/eventLog.js');
+    const { loadOrCreateReplica } = await import('../sync/replicaId.js');
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+
+    await eventLog.appendClient({
+      clientEventId: 'cap-late',
+      aggregateId: 'thread_late',
+      type: 'capture.recorded',
+      payload: {
+        bac_id: 'thread_late',
+        capturedAt: '2026-05-06T18:00:00.000Z',
+        turns: [{ ordinal: 0, role: 'assistant', text: 'soon to be tombstoned' }],
+      },
+      baseVector: {},
+    });
+    const first = await ingestIncremental(vaultRoot, eventLog);
+    expect(first.indexedChunks).toBeGreaterThan(0);
+    const after1 = await readIndex(join(vaultRoot, '_BAC', 'recall', 'index.bin'));
+    expect(after1?.items.every((item) => item.tombstoned !== true)).toBe(true);
+
+    // Append the tombstone AFTER the first ingest. The frontier
+    // already advanced past the capture event, so a buggy ingestor
+    // would not touch the existing entries here.
+    await eventLog.appendClient({
+      clientEventId: 'tomb-late',
+      aggregateId: 'thread_late',
+      type: 'recall.tombstone.target',
+      payload: { threadId: 'thread_late' },
+      baseVector: {},
+    });
+    const second = await ingestIncremental(vaultRoot, eventLog);
+    // No new chunks (no fresh capture.recorded), but the existing
+    // entries should now be tombstoned.
+    expect(second.indexedChunks).toBe(0);
+    expect(second.tombstonedEntries).toBeGreaterThan(0);
+    const after2 = await readIndex(join(vaultRoot, '_BAC', 'recall', 'index.bin'));
+    expect(after2?.items.every((item) => item.tombstoned === true)).toBe(true);
+  });
 });
