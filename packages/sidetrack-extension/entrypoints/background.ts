@@ -81,6 +81,7 @@ import {
   updateLocalQueueItem,
   updateLocalReminder,
   updateLocalWorkstream,
+  deleteLocalWorkstream,
   upsertLocalThread,
   writeCachedCodingSessions,
   readDispatchOriginals,
@@ -1403,6 +1404,21 @@ const updateWorkstream = async (workstreamId: string, update: WorkstreamUpdate):
   }
 };
 
+const deleteWorkstream = async (workstreamId: string): Promise<void> => {
+  // Companion-first: it owns the cascade decision (refuse on
+  // children, detach threads on disk). Mirror locally on success or
+  // on companion absence so the side panel reflects the state
+  // immediately.
+  if (!(await isCompanionConfigured())) {
+    await deleteLocalWorkstream(workstreamId);
+    return;
+  }
+  const settings = await readSettings();
+  const client = createCompanionClient(settings.companion);
+  await client.deleteWorkstream(workstreamId);
+  await deleteLocalWorkstream(workstreamId);
+};
+
 const bulkUpdateWorkstreamPrivacy = async (
   from: WorkstreamUpdate['privacy'],
   to: WorkstreamUpdate['privacy'],
@@ -1707,6 +1723,13 @@ const handleRequest = async (
   if (request.type === messageTypes.updateWorkstream) {
     return await withCompanionStatus(
       () => updateWorkstream(request.workstreamId, request.update),
+      'workstream',
+    );
+  }
+
+  if (request.type === messageTypes.deleteWorkstream) {
+    return await withCompanionStatus(
+      () => deleteWorkstream(request.workstreamId),
       'workstream',
     );
   }

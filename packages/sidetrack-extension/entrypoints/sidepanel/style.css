@@ -6813,6 +6813,69 @@ pre.diff {
   font-size: 12px;
 }
 
+/* Danger zone — delete affordance lives at the bottom of the
+   detail surface with a faint top rule + warning-tinted action so
+   the destructive action reads as separate from the everyday rename
+   / move. Border tint mirrors the .signal accent token used by the
+   "remove" overflow menu items elsewhere. */
+.ws-detail-danger {
+  border-top: 1px solid var(--rule);
+}
+.ws-detail-delete-trigger {
+  color: var(--signal, #c0392b);
+}
+.ws-detail-delete-trigger:hover {
+  text-decoration: underline;
+}
+.ws-detail-delete-trigger:disabled {
+  color: var(--ink-3);
+  cursor: not-allowed;
+  text-decoration: none;
+}
+.ws-detail-delete-confirm {
+  max-width: 420px;
+}
+.ws-detail-delete-body {
+  padding: 12px 14px;
+  font-size: 13px;
+  color: var(--ink);
+  border-bottom: 1px solid var(--rule-soft);
+}
+.ws-detail-delete-body p {
+  margin: 0 0 8px;
+}
+.ws-detail-delete-impact {
+  margin: 0;
+  padding-left: 16px;
+  font-size: 11.5px;
+  color: var(--ink-2);
+}
+.ws-detail-delete-impact li {
+  margin: 4px 0;
+}
+.ws-detail-delete-error {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: var(--rad-s);
+  background: rgba(192, 57, 43, 0.08);
+  color: var(--signal, #c0392b);
+  font-size: 11.5px;
+}
+.ws-detail-delete-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  padding: 10px 12px;
+}
+.ws-detail-delete-confirm-btn {
+  background: var(--signal, #c0392b);
+  border-color: var(--signal, #c0392b);
+  color: #fff;
+}
+.ws-detail-delete-confirm-btn:hover {
+  filter: brightness(0.95);
+}
+
 /* Thread-row action overflow menu — collapses Queue/Review/Move/Stop/
    Archive behind a ⋯ button, leaving the open + send icons visible.
    The .thread-actions rule above already sets position: absolute, so

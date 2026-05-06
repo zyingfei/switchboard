@@ -2,8 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   createLocalWorkstream,
+  deleteLocalWorkstream,
   readWorkstreams,
   updateLocalWorkstream,
+  upsertLocalThread,
 } from '../../src/background/state';
 
 const installChromeStorageMock = (): void => {
@@ -95,5 +97,46 @@ describe('updateLocalWorkstream — rename / reparent / detach', () => {
     });
     expect(next?.parentId).toBe(parentA.bac_id);
     expect(next?.title).toBe('just-rename');
+  });
+});
+
+describe('deleteLocalWorkstream — record removal + thread detach', () => {
+  beforeEach(() => {
+    installChromeStorageMock();
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('removes the workstream record and drops the id from the parent children', async () => {
+    const parent = await createLocalWorkstream({ title: 'Delete-Parent' });
+    const child = await createLocalWorkstream({ title: 'Delete-Child', parentId: parent.bac_id });
+    await deleteLocalWorkstream(child.bac_id);
+    const all = await readWorkstreams();
+    expect(all.find((w) => w.bac_id === child.bac_id)).toBeUndefined();
+    expect(all.find((w) => w.bac_id === parent.bac_id)?.children ?? []).not.toContain(child.bac_id);
+  });
+
+  it('detaches threads pointing at the deleted workstream — primaryWorkstreamId cleared', async () => {
+    const parent = await createLocalWorkstream({ title: 'Owns-thread' });
+    await upsertLocalThread({
+      bac_id: 'bac_test_thread_attached',
+      provider: 'chatgpt',
+      threadUrl: 'https://chatgpt.com/c/owned',
+      title: 'attached',
+      lastSeenAt: '2026-05-06T18:00:00.000Z',
+      status: 'active',
+      trackingMode: 'auto',
+      tags: [],
+      primaryWorkstreamId: parent.bac_id,
+    });
+    const result = await deleteLocalWorkstream(parent.bac_id);
+    expect(result.detachedThreadIds).toContain('bac_test_thread_attached');
+  });
+
+  it('returns no detached ids when no thread points at the workstream', async () => {
+    const lone = await createLocalWorkstream({ title: 'Lonely' });
+    const result = await deleteLocalWorkstream(lone.bac_id);
+    expect(result.detachedThreadIds).toEqual([]);
   });
 });

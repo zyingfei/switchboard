@@ -606,6 +606,45 @@ export const createLocalWorkstream = async (
   return node;
 };
 
+export const deleteLocalWorkstream = async (
+  workstreamId: string,
+): Promise<{ readonly detachedThreadIds: readonly string[] }> => {
+  const workstreams = await readWorkstreams();
+  const target = workstreams.find((candidate) => candidate.bac_id === workstreamId);
+  if (target === undefined) {
+    return { detachedThreadIds: [] };
+  }
+  const timestamp = new Date().toISOString();
+  const remaining = workstreams
+    .filter((candidate) => candidate.bac_id !== workstreamId)
+    .map((candidate) =>
+      target.parentId !== undefined && candidate.bac_id === target.parentId
+        ? {
+            ...candidate,
+            children: candidate.children.filter((id) => id !== workstreamId),
+            updatedAt: timestamp,
+          }
+        : candidate,
+    );
+  await storageSet({ [WORKSTREAMS_KEY]: remaining });
+
+  // Detach every locally-tracked thread that pointed at this
+  // workstream — they land back in Inbox so the UI doesn't flash
+  // "Workstream not found" rows the next render.
+  const threads = await readThreads();
+  const detachedThreadIds: string[] = [];
+  const updatedThreads = threads.map((thread) => {
+    if (thread.primaryWorkstreamId !== workstreamId) return thread;
+    detachedThreadIds.push(thread.bac_id);
+    const { primaryWorkstreamId: _drop, ...rest } = thread;
+    return { ...rest } as TrackedThread;
+  });
+  if (detachedThreadIds.length > 0) {
+    await storageSet({ [THREADS_KEY]: updatedThreads });
+  }
+  return { detachedThreadIds };
+};
+
 export const updateLocalWorkstream = async (
   workstreamId: string,
   update: WorkstreamUpdate,

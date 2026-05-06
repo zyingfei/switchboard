@@ -63,8 +63,24 @@ export const writeTrust = async (vaultRoot: string, list: readonly Trust[]): Pro
   await writeFile(trustPath(vaultRoot), `${JSON.stringify(serializable, null, 2)}\n`, 'utf8');
 };
 
+// Allow-by-default for workstreams that have never had an explicit
+// trust record persisted. The user originally had to opt every
+// workstream into MCP write tools, which surprised people on a
+// fresh install ("Move to…" silently failing because trust hadn't
+// been toggled). Once a trust record exists for a workstream, its
+// allowed-set is honored as-is — explicit deny still wins.
 export const isAllowed = (
   workstreamId: string,
   tool: WorkstreamWriteTool,
   list: readonly Trust[],
-): boolean => list.find((record) => record.workstreamId === workstreamId)?.allowedTools.has(tool) ?? false;
+): boolean => {
+  const record = list.find((entry) => entry.workstreamId === workstreamId);
+  if (record === undefined) return true;
+  return record.allowedTools.has(tool);
+};
+
+// What the trust GET endpoint should return when no explicit record
+// exists for a workstream. Mirrors the isAllowed default so the side
+// panel renders all toggles ON for a fresh workstream — toggling a
+// tool OFF then writes a deny-list record via PUT.
+export const defaultAllowedTools = (): readonly WorkstreamWriteTool[] => [...workstreamWriteTools];

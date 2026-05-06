@@ -36,6 +36,14 @@ interface WorkstreamDetailPanelProps {
   // null = move to top-level (clear parent). string = re-parent under
   // that workstream's bac_id.
   readonly onMove?: (parentId: string | null) => void;
+  // Delete is destructive: companion refuses if the workstream still
+  // has child workstreams (the side panel surfaces that as an error
+  // pill, not a silent failure). Threads pointing at this workstream
+  // are detached back to Inbox by the writer.
+  readonly onDelete?: () => Promise<void> | void;
+  // Number of threads currently pointing at this workstream — shown
+  // in the confirm copy so the user knows what'll be detached.
+  readonly threadCount?: number;
 }
 
 const collectDescendantIds = (
@@ -67,13 +75,23 @@ export function WorkstreamDetailPanel({
   onTrustChange,
   onRename,
   onMove,
+  onDelete,
+  threadCount,
 }: WorkstreamDetailPanelProps) {
   const renameEnabled = onRename !== undefined && workstream !== undefined;
   const moveEnabled = onMove !== undefined && workstream !== undefined;
+  const deleteEnabled = onDelete !== undefined && workstream !== undefined;
   const [renaming, setRenaming] = useState(false);
   const [draftTitle, setDraftTitle] = useState(workstreamLabel);
   const [movePickerOpen, setMovePickerOpen] = useState(false);
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const renameInputRef = useRef<HTMLInputElement>(null);
+  const childCount = useMemo(() => {
+    if (workstream === undefined) return 0;
+    return workstreams.filter((w) => w.parentId === workstream.bac_id).length;
+  }, [workstream, workstreams]);
 
   useEffect(() => {
     setDraftTitle(workstreamLabel);
@@ -194,6 +212,113 @@ export function WorkstreamDetailPanel({
         <div className="detail-sec-head">MCP write tools · trust</div>
         <TrustToggles entries={trustEntries} onToggle={onTrustChange} />
       </div>
+
+      {deleteEnabled ? (
+        <div className="detail-sec ws-detail-danger">
+          <div className="detail-sec-head">Danger zone</div>
+          <div className="ws-detail-hierarchy">
+            <span className="ws-detail-hierarchy-label">
+              {childCount > 0 ? (
+                <em className="subtle">
+                  Detach {String(childCount)} child group
+                  {childCount === 1 ? '' : 's'} before deleting.
+                </em>
+              ) : (
+                <em className="subtle">
+                  Delete this group; threads inside fall back to Inbox.
+                </em>
+              )}
+            </span>
+            <button
+              type="button"
+              className="btn-link ws-detail-delete-trigger"
+              disabled={childCount > 0}
+              onClick={() => {
+                setDeleteError(null);
+                setDeleteConfirmOpen(true);
+              }}
+            >
+              Delete group
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      {deleteConfirmOpen && deleteEnabled && workstream !== undefined ? (
+        <div
+          className="ws-picker-backdrop"
+          onClick={() => {
+            if (!deleting) setDeleteConfirmOpen(false);
+          }}
+          role="presentation"
+        >
+          <div
+            className="ws-picker ws-detail-delete-confirm"
+            onClick={(e) => {
+              e.stopPropagation();
+            }}
+            role="alertdialog"
+            aria-label="Confirm delete workstream"
+          >
+            <div className="ws-detail-move-head">
+              Delete <span className="mono">{workstream.title}</span>?
+            </div>
+            <div className="ws-detail-delete-body">
+              <p>This is permanent — there's no undo.</p>
+              <ul className="ws-detail-delete-impact mono">
+                <li>Group record + .md sidecar are removed.</li>
+                <li>
+                  {threadCount === undefined || threadCount === 0
+                    ? 'No threads currently point at this group.'
+                    : `${String(threadCount)} thread${
+                        threadCount === 1 ? '' : 's'
+                      } will be detached back to Inbox.`}
+                </li>
+              </ul>
+              {deleteError !== null ? (
+                <div className="ws-detail-delete-error mono" role="alert">
+                  {deleteError}
+                </div>
+              ) : null}
+            </div>
+            <div className="ws-detail-delete-actions">
+              <button
+                type="button"
+                className="btn btn-ghost"
+                disabled={deleting}
+                onClick={() => {
+                  setDeleteConfirmOpen(false);
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn btn-primary ws-detail-delete-confirm-btn"
+                disabled={deleting}
+                onClick={() => {
+                  setDeleting(true);
+                  void Promise.resolve(onDelete?.())
+                    .then(() => {
+                      setDeleteConfirmOpen(false);
+                      onClose();
+                    })
+                    .catch((error: unknown) => {
+                      setDeleteError(
+                        error instanceof Error ? error.message : 'Delete failed.',
+                      );
+                    })
+                    .finally(() => {
+                      setDeleting(false);
+                    });
+                }}
+              >
+                {deleting ? 'Deleting…' : 'Delete group'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {movePickerOpen && moveEnabled && workstream !== undefined ? (
         <div

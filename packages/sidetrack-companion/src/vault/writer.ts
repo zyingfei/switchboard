@@ -73,6 +73,27 @@ export class CodingSessionNotFoundError extends Error {
   }
 }
 
+// A workstream cannot be deleted while it still has child workstreams
+// — promoting / detaching the children is a deliberate user action,
+// not a side effect of deletion. The HTTP layer maps this to 409
+// CONFLICT so the side panel can show the child count and offer an
+// inline "detach all then retry" affordance.
+export class WorkstreamHasChildrenError extends Error {
+  readonly childCount: number;
+  constructor(childCount: number) {
+    super(`Cannot delete workstream — it still has ${String(childCount)} child workstream(s).`);
+    this.name = 'WorkstreamHasChildrenError';
+    this.childCount = childCount;
+  }
+}
+
+export class WorkstreamNotFoundError extends Error {
+  constructor() {
+    super('Workstream not found.');
+    this.name = 'WorkstreamNotFoundError';
+  }
+}
+
 export interface AuditEvent {
   readonly requestId: string;
   readonly route: string;
@@ -122,6 +143,13 @@ export interface VaultWriter {
     input: WorkstreamUpdateInput,
     requestId: string,
   ) => Promise<MutationResult>;
+  readonly deleteWorkstream: (
+    workstreamId: string,
+    requestId: string,
+  ) => Promise<{
+    readonly bac_id: string;
+    readonly detachedThreadIds: readonly string[];
+  }>;
   readonly createQueueItem: (input: QueueCreateInput, requestId: string) => Promise<MutationResult>;
   readonly createReminder: (
     input: ReminderCreateInput,
@@ -927,6 +955,115 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
         timestamp,
       });
       return { bac_id: workstreamId, revision };
+    },
+
+    async deleteWorkstream(workstreamId, requestId) {
+      await ensureVaultPresent();
+      const path = join(bacRoot, 'workstreams', `${workstreamId}.json`);
+      let existing: Record<string, unknown>;
+      try {
+        existing = await readJsonRecord(path);
+      } catch (error) {
+        if (isMissingPathError(error)) {
+          throw new WorkstreamNotFoundError();
+        }
+        throw error;
+      }
+      // Refuse if there are still child workstreams. Asking the user
+      // to detach them first keeps the cascade explicit instead of
+      // silently re-parenting (or worse, deleting) child trees.
+      const children = readStringArray(existing['children']);
+      if (children.length > 0) {
+        await audit({
+          requestId,
+          route: 'deleteWorkstream',
+          outcome: 'failure',
+          bac_id: workstreamId,
+          timestamp: new Date().toISOString(),
+        });
+        throw new WorkstreamHasChildrenError(children.length);
+      }
+      const previousParentId =
+        typeof existing['parentId'] === 'string' ? existing['parentId'] : undefined;
+      const timestamp = new Date().toISOString();
+
+      // Detach every thread that points at this workstream — they
+      // land back in Inbox (primaryWorkstreamId undefined) instead of
+      // becoming orphans pointing at a missing record.
+      const threadsRoot = join(bacRoot, 'threads');
+      const detachedThreadIds: string[] = [];
+      try {
+        const threadFiles = await readdir(threadsRoot);
+        for (const file of threadFiles) {
+          if (!file.endsWith('.json')) continue;
+          const threadPath = join(threadsRoot, file);
+          const thread = await readJsonRecord(threadPath);
+          if (thread['primaryWorkstreamId'] !== workstreamId) continue;
+          const threadBacId = typeof thread['bac_id'] === 'string' ? thread['bac_id'] : null;
+          if (threadBacId === null) continue;
+          const { primaryWorkstreamId: _drop, ...rest } = thread;
+          const detached = {
+            ...rest,
+            bac_id: threadBacId,
+            revision: createRevision(),
+            updatedAt: timestamp,
+          };
+          await writeJson(threadPath, detached);
+          const threadMd = join(threadsRoot, `${threadBacId}.md`);
+          if (!(await readMarkdownLockSentinel(threadMd))) {
+            await writeMarkdownProjection(
+              threadMd,
+              renderThreadMarkdown(detached as ThreadProjectionInput),
+            );
+          }
+          detachedThreadIds.push(threadBacId);
+        }
+      } catch (error) {
+        if (!isMissingPathError(error)) throw error;
+      }
+
+      // Remove self from the parent's children array.
+      if (previousParentId !== undefined) {
+        const parentPath = join(bacRoot, 'workstreams', `${previousParentId}.json`);
+        try {
+          const parent = await readJsonRecord(parentPath);
+          const updatedParent = {
+            ...parent,
+            bac_id: previousParentId,
+            children: readStringArray(parent['children']).filter((id) => id !== workstreamId),
+            revision: createRevision(),
+            updatedAt: timestamp,
+          };
+          await writeJson(parentPath, updatedParent);
+          await writeMarkdownProjection(
+            join(bacRoot, 'workstreams', `${previousParentId}.md`),
+            renderWorkstreamMarkdown(updatedParent),
+          );
+        } catch (error) {
+          if (!isMissingPathError(error)) throw error;
+        }
+      }
+
+      // Tear down the workstream's own JSON + md.
+      try {
+        await unlink(path);
+      } catch (error) {
+        if (!isMissingPathError(error)) throw error;
+      }
+      try {
+        await unlink(join(bacRoot, 'workstreams', `${workstreamId}.md`));
+      } catch (error) {
+        if (!isMissingPathError(error)) throw error;
+      }
+
+      await audit({
+        requestId,
+        route: 'deleteWorkstream',
+        outcome: 'success',
+        bac_id: workstreamId,
+        timestamp,
+      });
+      return { bac_id: workstreamId, detachedThreadIds };
     },
 
     async createQueueItem(input, requestId) {

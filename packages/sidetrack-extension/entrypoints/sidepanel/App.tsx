@@ -5249,6 +5249,20 @@ const App = () => {
                     });
                   });
                 },
+                onDelete: async () => {
+                  // Delete refuses on companion side when there are
+                  // child workstreams. Bubble the failure back to
+                  // the panel so the confirm modal can show the
+                  // error pill instead of silently closing.
+                  await sendRequest({
+                    type: messageTypes.deleteWorkstream,
+                    workstreamId: currentWs.bac_id,
+                  });
+                  setCurrentWs(null);
+                },
+                threadCount: threads.filter(
+                  (t) => t.primaryWorkstreamId === currentWs.bac_id,
+                ).length,
               })}
           linkedNotes={workstreamDetailLinkedNotes}
           trustEntries={workstreamDetailTrust}

@@ -1351,6 +1351,102 @@ describe('companion HTTP server', () => {
     ).resolves.toContain('Sidetrack');
   });
 
+  it('deletes a workstream — detaches threads, removes from parent, refuses with children', async () => {
+    // Tree: parentA → child; sibling parentB. Thread points at child.
+    const make = async (title: string, parentId?: string) => {
+      const r = await jsonFetch(context, `${baseUrl}/v1/workstreams`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+        body: JSON.stringify({ title, ...(parentId === undefined ? {} : { parentId }) }),
+      });
+      return (r.body as { readonly data: { readonly bac_id: string; readonly revision: string } })
+        .data;
+    };
+    const parentA = await make('Delete-Parent-A');
+    const child = await make('Delete-Child', parentA.bac_id);
+    await jsonFetch(context, `${baseUrl}/v1/threads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({
+        bac_id: 'bac_thread_delete_attached',
+        provider: 'gemini',
+        threadUrl: 'https://gemini.google.com/app/delete-thread',
+        title: 'Delete-attached',
+        lastSeenAt: '2026-05-06T18:00:00.000Z',
+        primaryWorkstreamId: child.bac_id,
+      }),
+    });
+
+    const readJson = async (path: string) =>
+      JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+
+    // Refuse: parentA still has child → 409.
+    const refused = await jsonFetch(context, `${baseUrl}/v1/workstreams/${parentA.bac_id}`, {
+      method: 'DELETE',
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect(refused.status).toBe(409);
+
+    // Delete the leaf child — succeeds, returns the detached thread id.
+    const deleted = await jsonFetch(
+      context,
+      `${baseUrl}/v1/workstreams/${child.bac_id}`,
+      { method: 'DELETE', headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+    expect(deleted.status).toBe(200);
+    expect(deleted.body).toMatchObject({
+      data: {
+        bac_id: child.bac_id,
+        detachedThreadIds: ['bac_thread_delete_attached'],
+      },
+    });
+    // Records gone from disk.
+    await expect(
+      readFile(join(vaultPath, '_BAC', 'workstreams', `${child.bac_id}.json`), 'utf8'),
+    ).rejects.toThrow();
+    // Parent's children array no longer references it.
+    const parentJson = (await readJson(
+      join(vaultPath, '_BAC', 'workstreams', `${parentA.bac_id}.json`),
+    )) as { readonly children?: readonly string[] };
+    expect(parentJson.children ?? []).not.toContain(child.bac_id);
+    // Thread detached: primaryWorkstreamId field is gone.
+    const threadJson = (await readJson(
+      join(vaultPath, '_BAC', 'threads', 'bac_thread_delete_attached.json'),
+    )) as { readonly primaryWorkstreamId?: unknown };
+    expect(threadJson.primaryWorkstreamId).toBeUndefined();
+  });
+
+  it('rejects DELETE with 404 for an unknown workstream', async () => {
+    const r = await jsonFetch(context, `${baseUrl}/v1/workstreams/bac_nope_nope_nope`, {
+      method: 'DELETE',
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect(r.status).toBe(404);
+  });
+
+  it('GET /trust returns all write tools by default for an unseen workstream', async () => {
+    const ws = await jsonFetch(context, `${baseUrl}/v1/workstreams`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({ title: 'Trust-default ws' }),
+    });
+    const wsId = (ws.body as { readonly data: { readonly bac_id: string } }).data.bac_id;
+    const trust = await jsonFetch(context, `${baseUrl}/v1/workstreams/${wsId}/trust`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect(trust.status).toBe(200);
+    const tools = (trust.body as {
+      readonly data: { readonly allowedTools: readonly string[] };
+    }).data.allowedTools;
+    // Mirror the workstreamWriteTools constant — every tool is on
+    // by default. PUT can later persist a deny-list.
+    expect(tools).toContain('sidetrack.threads.move');
+    expect(tools).toContain('sidetrack.threads.archive');
+    expect(tools).toContain('sidetrack.threads.unarchive');
+    expect(tools).toContain('sidetrack.queue.create');
+    expect(tools).toContain('sidetrack.workstreams.bump');
+  });
+
   it('renames a workstream and reparents to a new group, then detaches back to top-level', async () => {
     // Build a tiny tree:
     //   parentA (top-level)
@@ -1897,7 +1993,7 @@ describe('companion HTTP server', () => {
     expect(response.bodyText).toContain('data: {"type":"modified"');
   });
 
-  it('manages workstream trust and enforces default-deny for MCP write calls', async () => {
+  it('manages workstream trust — allow-by-default; explicit empty list denies', async () => {
     const workstream = await jsonFetch(context, `${baseUrl}/v1/workstreams`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
@@ -1905,27 +2001,57 @@ describe('companion HTTP server', () => {
     });
     const workstreamId = (workstream.body as { readonly data: { readonly bac_id: string } }).data
       .bac_id;
+    // Fresh workstream — no trust record on disk. The default flips
+    // from deny-by-default to allow-by-default so the MCP write call
+    // succeeds without the user pre-toggling anything.
+    const allowedByDefault = await jsonFetch(
+      context,
+      `${baseUrl}/v1/workstreams/${workstreamId}/bump`,
+      {
+        method: 'POST',
+        headers: {
+          'x-bac-bridge-key': bridgeKey,
+          'x-sidetrack-mcp-tool': 'sidetrack.workstreams.bump',
+        },
+      },
+    );
+    expect(allowedByDefault.status).toBe(200);
+
+    // Persist an explicit empty allow-list to deny everything.
+    const putEmpty = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/trust`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({ allowedTools: [] }),
+    });
+    expect(putEmpty.status).toBe(200);
     const denied = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/bump`, {
       method: 'POST',
-      headers: { 'x-bac-bridge-key': bridgeKey, 'x-sidetrack-mcp-tool': 'sidetrack.workstreams.bump' },
+      headers: {
+        'x-bac-bridge-key': bridgeKey,
+        'x-sidetrack-mcp-tool': 'sidetrack.workstreams.bump',
+      },
     });
-    const putTrust = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/trust`, {
+    expect(denied.status).toBe(403);
+    expect(denied.body).toMatchObject({ code: 'WORKSTREAM_NOT_TRUSTED' });
+
+    // Re-allow only the bump tool.
+    const putAllow = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/trust`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
       body: JSON.stringify({ allowedTools: ['sidetrack.workstreams.bump'] }),
     });
+    expect(putAllow.status).toBe(200);
     const trusted = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/bump`, {
       method: 'POST',
-      headers: { 'x-bac-bridge-key': bridgeKey, 'x-sidetrack-mcp-tool': 'sidetrack.workstreams.bump' },
+      headers: {
+        'x-bac-bridge-key': bridgeKey,
+        'x-sidetrack-mcp-tool': 'sidetrack.workstreams.bump',
+      },
     });
+    expect(trusted.status).toBe(200);
     const getTrust = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/trust`, {
       headers: { 'x-bac-bridge-key': bridgeKey },
     });
-
-    expect(denied.status).toBe(403);
-    expect(denied.body).toMatchObject({ code: 'WORKSTREAM_NOT_TRUSTED' });
-    expect(putTrust.status).toBe(200);
-    expect(trusted.status).toBe(200);
     expect(getTrust.body).toMatchObject({
       data: { workstreamId, allowedTools: ['sidetrack.workstreams.bump'] },
     });
