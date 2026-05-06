@@ -51,11 +51,12 @@ describe('rebuildFromEventLog', () => {
 
     expect(result.indexed).toBe(3);
     expect(index?.modelId).toBe('stub-model');
-    expect(index?.items.map((item) => item.id)).toEqual([
-      'thread_a:0',
-      'thread_a:1',
-      'thread_b:0',
-    ]);
+    // V3: each turn produces one or more chunks; ids encode the
+    // source bac_id + ordinal + content hash.
+    const ids = index?.items.map((item) => item.id) ?? [];
+    expect(ids.every((id) => id.startsWith('chunk:'))).toBe(true);
+    const sourceBacs = new Set(index?.items.map((item) => item.metadata?.sourceBacId));
+    expect(sourceBacs).toEqual(new Set(['thread_a', 'thread_b']));
   });
 
   it('writes an empty index for an empty event log', async () => {
@@ -109,9 +110,21 @@ describe('rebuildFromEventLog', () => {
       eventLog,
     });
     const index = await readIndex(join(vaultRoot, '_BAC', 'recall', 'index.bin'));
+    // V3 rebuild emits one entry per chunk. Both turns are short
+    // single-paragraph captures, so each produces exactly one chunk.
     expect(result.indexed).toBe(2);
-    expect(index?.items.map((item) => item.id)).toEqual(['thread_a:0', 'thread_a:1']);
+    // chunkIds carry the source bac_id + turnOrdinal + paragraph
+    // index + a content hash so they're deterministic across rebuilds.
+    expect(index?.items.map((item) => item.id).every((id) => id.startsWith('chunk:thread_a:'))).toBe(
+      true,
+    );
+    // Per-replica stamp survives the chunk projection — a multi-
+    // replica reader can still merge by (chunkId, replicaId).
     expect(index?.items.every((item) => item.replicaId === replica.replicaId)).toBe(true);
+    // Chunk metadata round-trips through the V3 index.
+    const texts = index?.items.map((item) => item.metadata?.text) ?? [];
+    expect(new Set(texts)).toEqual(new Set(['log first', 'log second']));
+    expect(index?.items.every((item) => item.metadata?.sourceBacId === 'thread_a')).toBe(true);
   });
 
   it('applies recall.tombstone.target events from the merged log', async () => {

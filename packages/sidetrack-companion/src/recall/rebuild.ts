@@ -2,10 +2,11 @@ import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { EventLog } from '../sync/eventLog.js';
+import { chunkTurn, type RecallChunk } from './chunker.js';
 import { embed, MODEL_ID } from './embedder.js';
 import { upsertEntries } from './indexFile.js';
 import { collectLogBacIds, projectRecallFromLog } from './projection.js';
-import type { IndexEntry } from './ranker.js';
+import type { ChunkMetadata, IndexEntry } from './ranker.js';
 
 const isCaptureEventRecord = (
   value: unknown,
@@ -73,7 +74,31 @@ interface RawCaptureItem {
   readonly lamport?: number;
   readonly tombstoned?: boolean;
   readonly sourceBacId?: string;
+  readonly turnOrdinal?: number;
+  readonly markdown?: string;
+  readonly formattedText?: string;
+  readonly role?: 'user' | 'assistant' | 'system' | 'unknown';
+  readonly modelName?: string;
+  readonly provider?: string;
+  readonly threadUrl?: string;
+  readonly title?: string;
 }
+
+const metadataFromChunk = (chunk: RecallChunk): ChunkMetadata => ({
+  sourceBacId: chunk.sourceBacId,
+  ...(chunk.provider === undefined ? {} : { provider: chunk.provider }),
+  ...(chunk.threadUrl === undefined ? {} : { threadUrl: chunk.threadUrl }),
+  ...(chunk.title === undefined ? {} : { title: chunk.title }),
+  ...(chunk.role === undefined ? {} : { role: chunk.role }),
+  turnOrdinal: chunk.turnOrdinal,
+  ...(chunk.modelName === undefined ? {} : { modelName: chunk.modelName }),
+  headingPath: chunk.headingPath,
+  paragraphIndex: chunk.paragraphIndex,
+  charStart: chunk.charStart,
+  charEnd: chunk.charEnd,
+  textHash: chunk.textHash,
+  text: chunk.text,
+});
 
 export const rebuildFromEventLog = async (
   vaultRoot: string,
@@ -91,11 +116,19 @@ export const rebuildFromEventLog = async (
     id: item.id,
     threadId: item.threadId,
     capturedAt: item.capturedAt,
-    text: item.text.slice(0, EMBED_TEXT_CHARS),
+    text: item.text,
     replicaId: item.replicaId,
     lamport: item.lamport,
     tombstoned: item.tombstoned,
     sourceBacId: item.sourceBacId,
+    turnOrdinal: item.turnOrdinal,
+    ...(item.markdown === undefined ? {} : { markdown: item.markdown }),
+    ...(item.formattedText === undefined ? {} : { formattedText: item.formattedText }),
+    ...(item.role === undefined ? {} : { role: item.role }),
+    ...(item.modelName === undefined ? {} : { modelName: item.modelName }),
+    ...(item.provider === undefined ? {} : { provider: item.provider }),
+    ...(item.threadUrl === undefined ? {} : { threadUrl: item.threadUrl }),
+    ...(item.title === undefined ? {} : { title: item.title }),
   }));
 
   // 2. Walk the legacy `_BAC/events/` log. Skip captures whose
@@ -112,11 +145,26 @@ export const rebuildFromEventLog = async (
         if (parsed.bac_id !== undefined && logBacIds.has(parsed.bac_id)) continue;
         for (const turn of parsed.turns) {
           if (typeof turn.text !== 'string' || turn.text.trim().length === 0) continue;
+          const turnRecord = turn as RawCaptureItem & {
+            readonly text: string;
+            readonly markdown?: string;
+            readonly formattedText?: string;
+          };
+          const ordinal = turn.ordinal ?? rawItems.length;
           rawItems.push({
-            id: `${threadId}:${String(turn.ordinal ?? rawItems.length)}`,
+            id: `${threadId}:${String(ordinal)}`,
             threadId,
             capturedAt: turn.capturedAt ?? parsed.capturedAt,
-            text: turn.text.slice(0, EMBED_TEXT_CHARS),
+            text: turn.text,
+            ...(parsed.bac_id === undefined ? {} : { sourceBacId: parsed.bac_id }),
+            turnOrdinal: ordinal,
+            ...(turnRecord.markdown === undefined ? {} : { markdown: turnRecord.markdown }),
+            ...(turnRecord.formattedText === undefined
+              ? {}
+              : { formattedText: turnRecord.formattedText }),
+            ...(turnRecord.role === undefined ? {} : { role: turnRecord.role }),
+            ...(turnRecord.modelName === undefined ? {} : { modelName: turnRecord.modelName }),
+            ...(parsed.threadUrl === undefined ? {} : { threadUrl: parsed.threadUrl }),
           });
         }
       } catch {
@@ -125,23 +173,51 @@ export const rebuildFromEventLog = async (
     }
   }
 
-  const total = rawItems.length;
+  // Chunk every captured turn before embedding. The chunker preserves
+  // heading + code-fence structure and produces deterministic
+  // chunkIds, so a rebuild from the same merged log emits byte-equal
+  // index files (PR #93's deterministic-build invariant).
+  const chunks: { readonly chunk: RecallChunk; readonly raw: RawCaptureItem }[] = [];
+  for (const raw of rawItems) {
+    const sourceBacId = raw.sourceBacId ?? raw.threadId;
+    const produced = chunkTurn({
+      sourceBacId,
+      threadId: raw.threadId,
+      turnOrdinal: raw.turnOrdinal ?? 0,
+      capturedAt: raw.capturedAt,
+      text: raw.text,
+      ...(raw.markdown === undefined ? {} : { markdown: raw.markdown }),
+      ...(raw.formattedText === undefined ? {} : { formattedText: raw.formattedText }),
+      ...(raw.role === undefined ? {} : { role: raw.role }),
+      ...(raw.modelName === undefined ? {} : { modelName: raw.modelName }),
+      ...(raw.provider === undefined ? {} : { provider: raw.provider }),
+      ...(raw.threadUrl === undefined ? {} : { threadUrl: raw.threadUrl }),
+      ...(raw.title === undefined ? {} : { title: raw.title }),
+    });
+    for (const chunk of produced) {
+      chunks.push({ chunk, raw });
+    }
+  }
+
+  const total = chunks.length;
   const entries: IndexEntry[] = [];
   for (let offset = 0; offset < total; offset += EMBED_BATCH_SIZE) {
-    const batch = rawItems.slice(offset, offset + EMBED_BATCH_SIZE);
-    const vectors = await embed(batch.map((item) => item.text));
+    const batch = chunks.slice(offset, offset + EMBED_BATCH_SIZE);
+    const vectors = await embed(batch.map(({ chunk }) => chunk.embedText.slice(0, EMBED_TEXT_CHARS)));
     for (let index = 0; index < batch.length; index += 1) {
       const item = batch[index];
       const embedding = vectors[index];
       if (item === undefined || embedding === undefined) continue;
+      const { chunk, raw } = item;
       entries.push({
-        id: item.id,
-        threadId: item.threadId,
-        capturedAt: item.capturedAt,
+        id: chunk.chunkId,
+        threadId: chunk.threadId,
+        capturedAt: chunk.capturedAt,
         embedding,
-        ...(item.replicaId === undefined ? {} : { replicaId: item.replicaId }),
-        ...(item.lamport === undefined ? {} : { lamport: item.lamport }),
-        ...(item.tombstoned === undefined ? {} : { tombstoned: item.tombstoned }),
+        ...(raw.replicaId === undefined ? {} : { replicaId: raw.replicaId }),
+        ...(raw.lamport === undefined ? {} : { lamport: raw.lamport }),
+        ...(raw.tombstoned === undefined ? {} : { tombstoned: raw.tombstoned }),
+        metadata: metadataFromChunk(chunk),
       });
     }
     options.onProgress?.(entries.length, total);
