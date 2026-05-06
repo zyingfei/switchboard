@@ -62,6 +62,17 @@ export interface HealthReport {
       readonly pct: number;
       readonly tolerance: number;
     };
+    // Track 2: Sidetrack-managed embedding-model cache status. Lets
+    // the side panel surface "model: cached / verified / missing"
+    // without poking inside HF's default cache layout.
+    readonly model?: {
+      readonly id: string;
+      readonly revision: string;
+      readonly cacheDir: string;
+      readonly present: boolean;
+      readonly verified: boolean;
+      readonly offline: boolean;
+    };
   };
   readonly service: { readonly installed: boolean; readonly running: boolean };
   // Identity of the local replica + its Lamport high-water mark.

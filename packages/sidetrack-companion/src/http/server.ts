@@ -18,6 +18,7 @@ import { importSettings } from '../portability/importBundle.js';
 import type { RecallActivityTracker } from '../recall/activity.js';
 import { embed, MODEL_ID } from '../recall/embedder.js';
 import { CAPTURE_RECORDED } from '../recall/events.js';
+import { getModelCacheStatus } from '../recall/modelCache.js';
 import { THREAD_ARCHIVED, THREAD_UNARCHIVED, THREAD_UPSERTED } from '../threads/events.js';
 import { projectThread } from '../threads/projection.js';
 import { WORKSTREAM_UPSERTED } from '../workstreams/events.js';
@@ -986,10 +987,11 @@ const routes: readonly RouteDefinition[] = [
             vaultSizeBytes: () => directorySize(join(vaultRoot, '_BAC')).catch(() => null),
             captureSummary: () => captureHealthSummary(vaultRoot),
             recallSummary: async () => {
-              const [index, info, lifecycleReport] = await Promise.all([
+              const [index, info, lifecycleReport, modelStatus] = await Promise.all([
                 readIndex(indexPath),
                 stat(indexPath).catch(() => undefined),
                 context.recallLifecycle?.report() ?? Promise.resolve(undefined),
+                getModelCacheStatus().catch(() => undefined),
               ]);
               const indexExists = index !== null;
               return {
@@ -1018,6 +1020,18 @@ const routes: readonly RouteDefinition[] = [
                 ...(context.recallActivity === undefined
                   ? {}
                   : { activity: context.recallActivity.report() }),
+                ...(modelStatus === undefined
+                  ? {}
+                  : {
+                      model: {
+                        id: modelStatus.modelId,
+                        revision: modelStatus.revision,
+                        cacheDir: modelStatus.cacheDir,
+                        present: modelStatus.present,
+                        verified: modelStatus.verified,
+                        offline: modelStatus.offline,
+                      },
+                    }),
               };
             },
             serviceStatus: async () => {
