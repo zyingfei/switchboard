@@ -42,7 +42,6 @@ import {
   CodingSessionNotFoundError,
   SettingsRevisionConflictError,
   WorkstreamHasChildrenError,
-  WorkstreamNotFoundError,
   createVaultWriter,
   type VaultWriter,
 } from '../vault/writer.js';
@@ -1992,9 +1991,6 @@ const routes: readonly RouteDefinition[] = [
           },
         ];
       } catch (error) {
-        if (error instanceof WorkstreamNotFoundError) {
-          throw new HttpRouteError(404, 'WORKSTREAM_NOT_FOUND', 'Workstream not found.');
-        }
         if (error instanceof WorkstreamHasChildrenError) {
           throw new HttpRouteError(
             409,

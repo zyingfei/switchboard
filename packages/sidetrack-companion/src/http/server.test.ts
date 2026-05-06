@@ -1416,12 +1416,20 @@ describe('companion HTTP server', () => {
     expect(threadJson.primaryWorkstreamId).toBeUndefined();
   });
 
-  it('rejects DELETE with 404 for an unknown workstream', async () => {
+  it('DELETE is idempotent — succeeds with empty detached list when the workstream is already gone', async () => {
+    // No record exists on disk for this id. The strict 404 path was
+    // unfriendly when the side panel had a workstream in chrome
+    // .storage that never made it to disk; the new path treats the
+    // operation as a no-op success so the caller's "delete this
+    // group" intent is satisfied.
     const r = await jsonFetch(context, `${baseUrl}/v1/workstreams/bac_nope_nope_nope`, {
       method: 'DELETE',
       headers: { 'x-bac-bridge-key': bridgeKey },
     });
-    expect(r.status).toBe(404);
+    expect(r.status).toBe(200);
+    expect(r.body).toMatchObject({
+      data: { bac_id: 'bac_nope_nope_nope', detachedThreadIds: [] },
+    });
   });
 
   it('GET /trust returns all write tools by default for an unseen workstream', async () => {

@@ -965,7 +965,19 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
         existing = await readJsonRecord(path);
       } catch (error) {
         if (isMissingPathError(error)) {
-          throw new WorkstreamNotFoundError();
+          // Idempotent DELETE — if the record is already gone, the
+          // caller's "delete this group" intent is satisfied. The
+          // original strict 404 was unfriendly when the side panel
+          // had a workstream in chrome.storage that never made it
+          // to disk (e.g., created during a brief companion outage).
+          await audit({
+            requestId,
+            route: 'deleteWorkstream',
+            outcome: 'success',
+            bac_id: workstreamId,
+            timestamp: new Date().toISOString(),
+          });
+          return { bac_id: workstreamId, detachedThreadIds: [] };
         }
         throw error;
       }
