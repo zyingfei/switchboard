@@ -1105,8 +1105,28 @@ const MCP_DISPATCH_MAX_PER_TICK = 1;
 // developer's test browser. 30s is an arbitrary "no human-driven
 // scenario should need a faster fan-out" gate.
 const MCP_DISPATCH_GLOBAL_COOLDOWN_MS = 30_000;
+const LAST_MCP_DISPATCH_OPENED_AT_KEY = 'sidetrack.lastMcpDispatchOpenedAt';
+// In-memory single-flight is fine: it only needs to hold during one
+// `openAutoApprovedMcpDispatches` invocation. The cooldown timestamp,
+// in contrast, MUST persist across SW restarts (Chrome MV3 service
+// workers are evicted on idle, sometimes within seconds of the
+// alarm firing) — otherwise three SW restarts in 30s would defeat
+// the cooldown completely.
 let mcpDispatchInFlight = false;
-let lastMcpDispatchOpenedMs = 0;
+
+const readLastMcpDispatchOpenedMs = async (): Promise<number> => {
+  const result = await chrome.storage.local.get({ [LAST_MCP_DISPATCH_OPENED_AT_KEY]: '' });
+  const value = result[LAST_MCP_DISPATCH_OPENED_AT_KEY];
+  if (typeof value !== 'string' || value.length === 0) return 0;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : 0;
+};
+
+const writeLastMcpDispatchOpenedMs = async (ms: number): Promise<void> => {
+  await chrome.storage.local.set({
+    [LAST_MCP_DISPATCH_OPENED_AT_KEY]: new Date(ms).toISOString(),
+  });
+};
 
 const tabAlreadyOpenForDispatch = async (dispatchId: string): Promise<boolean> => {
   const tabs = await readMcpDispatchTabs();
@@ -1135,7 +1155,8 @@ const openAutoApprovedMcpDispatches = async (
   if (mcpDispatchInFlight) {
     return;
   }
-  if (Date.now() - lastMcpDispatchOpenedMs < MCP_DISPATCH_GLOBAL_COOLDOWN_MS) {
+  const lastOpenedMs = await readLastMcpDispatchOpenedMs();
+  if (Date.now() - lastOpenedMs < MCP_DISPATCH_GLOBAL_COOLDOWN_MS) {
     return;
   }
   mcpDispatchInFlight = true;
@@ -1191,7 +1212,7 @@ const openAutoApprovedMcpDispatchesInner = async (
         await writeMcpDispatchTab(created.id, dispatch.bac_id);
         autoSendOnceTabReady(created.id, dispatch.body);
         openedThisTick += 1;
-        lastMcpDispatchOpenedMs = Date.now();
+        await writeLastMcpDispatchOpenedMs(Date.now());
       }
     } catch (error) {
       console.warn(
