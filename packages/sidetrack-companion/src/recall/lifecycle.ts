@@ -76,17 +76,6 @@ export interface RecallStatusReport {
   };
 }
 
-// One captured turn ready to be embedded + appended. The HTTP layer
-// shapes capture events into this list and hands it to the
-// lifecycle's `appendCaptureTurns` so the embedder + index writes go
-// through the lifecycle's mutex (sharing the lane with rebuild).
-export interface CaptureTurnInput {
-  readonly id: string;
-  readonly threadId: string;
-  readonly capturedAt: string;
-  readonly text: string;
-}
-
 export interface RecallLifecycle {
   readonly report: () => Promise<RecallStatusReport>;
   readonly ensureFresh: () => Promise<RecallStatusReport>;
@@ -99,9 +88,6 @@ export interface RecallLifecycle {
   readonly appendEntry: (entry: IndexEntry) => Promise<void>;
   readonly gcEntries: (validIds: ReadonlySet<string>) => Promise<{ readonly removed: number }>;
   readonly tombstoneByThread: (threadId: string) => Promise<{ readonly tombstoned: number }>;
-  readonly appendCaptureTurns: (
-    turns: readonly CaptureTurnInput[],
-  ) => Promise<{ readonly indexed: number }>;
   // Mutex-serialised incremental ingest. Walks the merged event
   // log and projects unprocessed capture.recorded /
   // recall.tombstone.target events into the V3 index. Holding the
@@ -411,48 +397,6 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
       return await tombstoneByThreadRaw(indexPath(), threadId);
     });
 
-  const appendCaptureTurns = (
-    turns: readonly CaptureTurnInput[],
-  ): Promise<{ readonly indexed: number }> =>
-    enqueueWrite(async () => {
-      if (turns.length === 0) return { indexed: 0 };
-      let indexed = 0;
-      const indexedThreadIds: string[] = [];
-      for (let offset = 0; offset < turns.length; offset += AUTO_INDEX_BATCH_SIZE) {
-        const batch = turns.slice(offset, offset + AUTO_INDEX_BATCH_SIZE);
-        const vectors = await embedFn(batch.map((turn) => turn.text));
-        for (let index = 0; index < batch.length; index += 1) {
-          const turn = batch[index];
-          const embedding = vectors[index];
-          if (turn === undefined || embedding === undefined) continue;
-          const seq = opts.replica !== undefined ? await opts.replica.nextSeq() : undefined;
-          const entry: IndexEntry = {
-            id: turn.id,
-            threadId: turn.threadId,
-            capturedAt: turn.capturedAt,
-            embedding,
-            ...(opts.replica !== undefined ? { replicaId: opts.replica.replicaId } : {}),
-            // The IndexEntry persists the per-replica seq under the
-            // legacy `lamport` field name. CRDT-aware readers use
-            // `(replicaId, lamport)` as the dot equivalent.
-            ...(seq !== undefined ? { lamport: seq } : {}),
-          };
-          await appendEntryRaw(indexPath(), entry, currentModelId);
-          indexed += 1;
-          indexedThreadIds.push(turn.threadId);
-        }
-        // Yield between batches so the HTTP server stays responsive
-        // while a large catch-up is running.
-        await new Promise<void>((resolve) => {
-          setImmediate(resolve);
-        });
-      }
-      if (indexed > 0) {
-        opts.activity?.recordIncrementalIndex({ count: indexed, threadIds: indexedThreadIds });
-      }
-      return { indexed };
-    });
-
   return {
     report,
     ensureFresh,
@@ -462,7 +406,6 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
     appendEntry,
     gcEntries,
     tombstoneByThread,
-    appendCaptureTurns,
     ingestIncremental,
   };
 };

@@ -2304,59 +2304,62 @@ const routes: readonly RouteDefinition[] = [
         // legacy `_BAC/events/` write above stays for back-compat
         // (older readers, the existing rebuild path); rebuild dedups
         // by bac_id when both sources hold the same capture.
-        if (context.eventLog !== undefined) {
-          await context.eventLog
-            .appendClient({
-              clientEventId: idempotencyKey,
-              aggregateId: result.bac_id,
-              type: CAPTURE_RECORDED,
-              payload: {
-                bac_id: result.bac_id,
-                ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
-                threadUrl: input.threadUrl,
-                provider: input.provider,
-                capturedAt: input.capturedAt,
-                turns: input.turns.map((turn) => ({
-                  ordinal: turn.ordinal,
-                  role: turn.role,
-                  text: turn.text,
-                  capturedAt: turn.capturedAt,
-                })),
-              },
-              baseVector: {},
-            })
-            .catch(() => undefined);
-        }
-        // Auto-index every turn so /v1/recall/query can find the
-        // capture without waiting for a manual rebuild. The lifecycle
-        // mutex serialises this against any in-flight rebuild.
-        if (context.recallLifecycle !== undefined) {
-          const threadId = result.bac_id;
-          const turns: {
-            readonly id: string;
-            readonly threadId: string;
-            readonly capturedAt: string;
-            readonly text: string;
-          }[] = [];
-          input.turns.forEach((turn) => {
-            if (turn.text.trim().length === 0) return;
-            turns.push({
-              id: `${threadId}:${String(turn.ordinal)}`,
-              threadId,
-              capturedAt: turn.capturedAt,
-              text: turn.text,
-            });
+        //
+        // Carry the richer per-turn fields (markdown / formattedText /
+        // modelName) plus the thread-level metadata (title) through
+        // to the log payload so the chunker has the best possible
+        // source. Without this, the chunker would fall back to plain
+        // text — losing heading structure, lists, and code fences.
+        const eventLogAppended =
+          context.eventLog === undefined
+            ? false
+            : await context.eventLog
+                .appendClient({
+                  clientEventId: idempotencyKey,
+                  aggregateId: result.bac_id,
+                  type: CAPTURE_RECORDED,
+                  payload: {
+                    bac_id: result.bac_id,
+                    ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+                    threadUrl: input.threadUrl,
+                    provider: input.provider,
+                    ...(input.title === undefined ? {} : { title: input.title }),
+                    capturedAt: input.capturedAt,
+                    turns: input.turns.map((turn) => ({
+                      ordinal: turn.ordinal,
+                      role: turn.role,
+                      text: turn.text,
+                      capturedAt: turn.capturedAt,
+                      ...(turn.markdown === undefined ? {} : { markdown: turn.markdown }),
+                      ...(turn.formattedText === undefined
+                        ? {}
+                        : { formattedText: turn.formattedText }),
+                      ...(turn.modelName === undefined ? {} : { modelName: turn.modelName }),
+                    })),
+                  },
+                  baseVector: {},
+                })
+                .then(() => true)
+                .catch(() => false);
+        // Auto-index by routing through the lifecycle's incremental
+        // ingestor — same path the boot-time + manual reingest use.
+        // This means the recall index is always populated by chunk
+        // entries built from the log (the source of truth), not by a
+        // parallel turn-level write that bypasses chunking. The
+        // lifecycle's mutex serialises this against any in-flight
+        // rebuild. Best-effort + non-blocking; if the embedder is
+        // offline the log is still authoritative and the manual
+        // `recall reingest` catches up.
+        if (
+          eventLogAppended &&
+          context.eventLog !== undefined &&
+          context.recallLifecycle !== undefined
+        ) {
+          const lifecycle = context.recallLifecycle;
+          const log = context.eventLog;
+          void lifecycle.ingestIncremental(log).catch(() => {
+            // Best-effort — see comment above.
           });
-          if (turns.length > 0) {
-            // Schedule on the lifecycle mutex but don't block the
-            // POST response — capture latency stays bounded by the
-            // vault write, not the embedder cost.
-            void context.recallLifecycle.appendCaptureTurns(turns).catch(() => {
-              // Auto-index is best-effort; if embedding fails the
-              // event log is still authoritative and a manual rebuild
-              // catches up.
-            });
-          }
         }
         return [201, mutationResponse(result, requestId)];
       });
