@@ -126,6 +126,7 @@ export interface ThreadProjectionInput {
   readonly tags?: readonly string[];
   readonly lastSeenAt?: string;
   readonly lastTurnRole?: string;
+  readonly lastResearchMode?: string;
   readonly parentThreadId?: string;
   readonly updatedAt?: string;
 }
@@ -150,6 +151,7 @@ export const renderThreadMarkdown = (input: ThreadProjectionInput): string => {
     ['workstream', input.primaryWorkstreamId],
     ['parentThread', input.parentThreadId],
     ['lastTurnRole', input.lastTurnRole],
+    ['lastResearchMode', input.lastResearchMode],
     ['lastSeenAt', input.lastSeenAt],
     ['tags', input.tags ?? []],
     ['updatedAt', input.updatedAt],

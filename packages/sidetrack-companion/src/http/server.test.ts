@@ -1351,6 +1351,262 @@ describe('companion HTTP server', () => {
     ).resolves.toContain('Sidetrack');
   });
 
+  it('deletes a workstream — detaches threads, removes from parent, refuses with children', async () => {
+    // Tree: parentA → child; sibling parentB. Thread points at child.
+    const make = async (title: string, parentId?: string) => {
+      const r = await jsonFetch(context, `${baseUrl}/v1/workstreams`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+        body: JSON.stringify({ title, ...(parentId === undefined ? {} : { parentId }) }),
+      });
+      return (r.body as { readonly data: { readonly bac_id: string; readonly revision: string } })
+        .data;
+    };
+    const parentA = await make('Delete-Parent-A');
+    const child = await make('Delete-Child', parentA.bac_id);
+    await jsonFetch(context, `${baseUrl}/v1/threads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({
+        bac_id: 'bac_thread_delete_attached',
+        provider: 'gemini',
+        threadUrl: 'https://gemini.google.com/app/delete-thread',
+        title: 'Delete-attached',
+        lastSeenAt: '2026-05-06T18:00:00.000Z',
+        primaryWorkstreamId: child.bac_id,
+      }),
+    });
+
+    const readJson = async (path: string) =>
+      JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+
+    // Refuse: parentA still has child → 409.
+    const refused = await jsonFetch(context, `${baseUrl}/v1/workstreams/${parentA.bac_id}`, {
+      method: 'DELETE',
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect(refused.status).toBe(409);
+
+    // Delete the leaf child — succeeds, returns the detached thread id.
+    const deleted = await jsonFetch(
+      context,
+      `${baseUrl}/v1/workstreams/${child.bac_id}`,
+      { method: 'DELETE', headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+    expect(deleted.status).toBe(200);
+    expect(deleted.body).toMatchObject({
+      data: {
+        bac_id: child.bac_id,
+        detachedThreadIds: ['bac_thread_delete_attached'],
+      },
+    });
+    // Records gone from disk.
+    await expect(
+      readFile(join(vaultPath, '_BAC', 'workstreams', `${child.bac_id}.json`), 'utf8'),
+    ).rejects.toThrow();
+    // Parent's children array no longer references it.
+    const parentJson = (await readJson(
+      join(vaultPath, '_BAC', 'workstreams', `${parentA.bac_id}.json`),
+    )) as { readonly children?: readonly string[] };
+    expect(parentJson.children ?? []).not.toContain(child.bac_id);
+    // Thread detached: primaryWorkstreamId field is gone.
+    const threadJson = (await readJson(
+      join(vaultPath, '_BAC', 'threads', 'bac_thread_delete_attached.json'),
+    )) as { readonly primaryWorkstreamId?: unknown };
+    expect(threadJson.primaryWorkstreamId).toBeUndefined();
+  });
+
+  it('DELETE is idempotent — succeeds with empty detached list when the workstream is already gone', async () => {
+    // No record exists on disk for this id. The strict 404 path was
+    // unfriendly when the side panel had a workstream in chrome
+    // .storage that never made it to disk; the new path treats the
+    // operation as a no-op success so the caller's "delete this
+    // group" intent is satisfied.
+    const r = await jsonFetch(context, `${baseUrl}/v1/workstreams/bac_nope_nope_nope`, {
+      method: 'DELETE',
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect(r.status).toBe(200);
+    expect(r.body).toMatchObject({
+      data: { bac_id: 'bac_nope_nope_nope', detachedThreadIds: [] },
+    });
+  });
+
+  it('GET /trust returns all write tools by default for an unseen workstream', async () => {
+    const ws = await jsonFetch(context, `${baseUrl}/v1/workstreams`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({ title: 'Trust-default ws' }),
+    });
+    const wsId = (ws.body as { readonly data: { readonly bac_id: string } }).data.bac_id;
+    const trust = await jsonFetch(context, `${baseUrl}/v1/workstreams/${wsId}/trust`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect(trust.status).toBe(200);
+    const tools = (trust.body as {
+      readonly data: { readonly allowedTools: readonly string[] };
+    }).data.allowedTools;
+    // Mirror the workstreamWriteTools constant — every tool is on
+    // by default. PUT can later persist a deny-list.
+    expect(tools).toContain('sidetrack.threads.move');
+    expect(tools).toContain('sidetrack.threads.archive');
+    expect(tools).toContain('sidetrack.threads.unarchive');
+    expect(tools).toContain('sidetrack.queue.create');
+    expect(tools).toContain('sidetrack.workstreams.bump');
+  });
+
+  it('renames a workstream and reparents to a new group, then detaches back to top-level', async () => {
+    // Build a tiny tree:
+    //   parentA (top-level)
+    //   parentB (top-level)
+    //   child   (under parentA initially)
+    const make = async (title: string, parentId?: string) => {
+      const r = await jsonFetch(context, `${baseUrl}/v1/workstreams`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+        body: JSON.stringify({ title, ...(parentId === undefined ? {} : { parentId }) }),
+      });
+      return (r.body as { readonly data: { readonly bac_id: string; readonly revision: string } })
+        .data;
+    };
+    const parentA = await make('Parent A');
+    const parentB = await make('Parent B');
+    const child = await make('Child', parentA.bac_id);
+
+    const readJson = async (id: string) =>
+      JSON.parse(
+        await readFile(join(vaultPath, '_BAC', 'workstreams', `${id}.json`), 'utf8'),
+      ) as {
+        readonly title?: string;
+        readonly parentId?: string;
+        readonly children?: readonly string[];
+      };
+
+    // Rename: title only.
+    const renameResult = await jsonFetch(
+      context,
+      `${baseUrl}/v1/workstreams/${child.bac_id}`,
+      {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+        body: JSON.stringify({ revision: child.revision, title: 'Child renamed' }),
+      },
+    );
+    expect(renameResult.status).toBe(200);
+    let nextRev = (renameResult.body as { readonly data: { readonly revision: string } }).data
+      .revision;
+    expect((await readJson(child.bac_id)).title).toBe('Child renamed');
+
+    // Re-parent: parentA → parentB. Old parent loses the child id;
+    // new parent gains it.
+    const reparentResult = await jsonFetch(
+      context,
+      `${baseUrl}/v1/workstreams/${child.bac_id}`,
+      {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+        body: JSON.stringify({ revision: nextRev, parentId: parentB.bac_id }),
+      },
+    );
+    expect(reparentResult.status).toBe(200);
+    nextRev = (reparentResult.body as { readonly data: { readonly revision: string } }).data
+      .revision;
+    expect((await readJson(child.bac_id)).parentId).toBe(parentB.bac_id);
+    expect((await readJson(parentA.bac_id)).children ?? []).not.toContain(child.bac_id);
+    expect((await readJson(parentB.bac_id)).children ?? []).toContain(child.bac_id);
+
+    // Detach: parentId=null → drop parent, drop self from previous
+    // parent's children. Title is preserved.
+    const detachResult = await jsonFetch(
+      context,
+      `${baseUrl}/v1/workstreams/${child.bac_id}`,
+      {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+        body: JSON.stringify({ revision: nextRev, parentId: null }),
+      },
+    );
+    expect(detachResult.status).toBe(200);
+    const detached = await readJson(child.bac_id);
+    expect(detached.parentId).toBeUndefined();
+    expect(detached.title).toBe('Child renamed');
+    expect((await readJson(parentB.bac_id)).children ?? []).not.toContain(child.bac_id);
+  });
+
+  it('carries lastResearchMode forward when a partial upsert omits it', async () => {
+    const now = '2026-05-06T17:04:43.000Z';
+    // First write stamps deep-research.
+    await jsonFetch(context, `${baseUrl}/v1/threads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({
+        bac_id: 'bac_thread_carry',
+        provider: 'chatgpt',
+        threadUrl: 'https://chatgpt.com/c/carry',
+        title: 'Carry test',
+        lastSeenAt: now,
+        status: 'active',
+        trackingMode: 'auto',
+        lastResearchMode: 'deep-research',
+      }),
+    });
+    // Second write is a state-only upsert — title rename, no
+    // lastResearchMode. Without the writer-side carry-forward the
+    // field would be silently dropped.
+    const partial = await jsonFetch(context, `${baseUrl}/v1/threads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({
+        bac_id: 'bac_thread_carry',
+        provider: 'chatgpt',
+        threadUrl: 'https://chatgpt.com/c/carry',
+        title: 'Carry test (renamed)',
+        lastSeenAt: '2026-05-06T17:10:00.000Z',
+        status: 'active',
+        trackingMode: 'auto',
+      }),
+    });
+    expect(partial.status).toBe(200);
+    const threadJson = JSON.parse(
+      await readFile(join(vaultPath, '_BAC', 'threads', 'bac_thread_carry.json'), 'utf8'),
+    ) as { readonly title?: string; readonly lastResearchMode?: string };
+    expect(threadJson.title).toBe('Carry test (renamed)');
+    expect(threadJson.lastResearchMode).toBe('deep-research');
+    const md = await readFile(
+      join(vaultPath, '_BAC', 'threads', 'bac_thread_carry.md'),
+      'utf8',
+    );
+    expect(md).toContain('lastResearchMode: deep-research');
+  });
+
+  it('persists lastResearchMode on the thread record and renders it in the md sidecar', async () => {
+    const now = '2026-05-06T17:04:43.000Z';
+    const result = await jsonFetch(context, `${baseUrl}/v1/threads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({
+        bac_id: 'bac_thread_research',
+        provider: 'chatgpt',
+        threadUrl: 'https://chatgpt.com/c/research-thread',
+        title: 'Switchboard - Sync Architecture Feedback',
+        lastSeenAt: now,
+        status: 'active',
+        trackingMode: 'auto',
+        lastResearchMode: 'deep-research',
+      }),
+    });
+    expect(result.status).toBe(200);
+    const threadJson = JSON.parse(
+      await readFile(join(vaultPath, '_BAC', 'threads', 'bac_thread_research.json'), 'utf8'),
+    ) as { readonly lastResearchMode?: string };
+    expect(threadJson.lastResearchMode).toBe('deep-research');
+    const md = await readFile(
+      join(vaultPath, '_BAC', 'threads', 'bac_thread_research.md'),
+      'utf8',
+    );
+    expect(md).toContain('lastResearchMode: deep-research');
+  });
+
   it('reads raw thread and workstream markdown with a failure path for missing files', async () => {
     const now = '2026-04-26T21:32:00.000Z';
     await jsonFetch(context, `${baseUrl}/v1/threads`, {
@@ -1745,7 +2001,7 @@ describe('companion HTTP server', () => {
     expect(response.bodyText).toContain('data: {"type":"modified"');
   });
 
-  it('manages workstream trust and enforces default-deny for MCP write calls', async () => {
+  it('manages workstream trust — allow-by-default; explicit empty list denies', async () => {
     const workstream = await jsonFetch(context, `${baseUrl}/v1/workstreams`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
@@ -1753,27 +2009,57 @@ describe('companion HTTP server', () => {
     });
     const workstreamId = (workstream.body as { readonly data: { readonly bac_id: string } }).data
       .bac_id;
+    // Fresh workstream — no trust record on disk. The default flips
+    // from deny-by-default to allow-by-default so the MCP write call
+    // succeeds without the user pre-toggling anything.
+    const allowedByDefault = await jsonFetch(
+      context,
+      `${baseUrl}/v1/workstreams/${workstreamId}/bump`,
+      {
+        method: 'POST',
+        headers: {
+          'x-bac-bridge-key': bridgeKey,
+          'x-sidetrack-mcp-tool': 'sidetrack.workstreams.bump',
+        },
+      },
+    );
+    expect(allowedByDefault.status).toBe(200);
+
+    // Persist an explicit empty allow-list to deny everything.
+    const putEmpty = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/trust`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({ allowedTools: [] }),
+    });
+    expect(putEmpty.status).toBe(200);
     const denied = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/bump`, {
       method: 'POST',
-      headers: { 'x-bac-bridge-key': bridgeKey, 'x-sidetrack-mcp-tool': 'sidetrack.workstreams.bump' },
+      headers: {
+        'x-bac-bridge-key': bridgeKey,
+        'x-sidetrack-mcp-tool': 'sidetrack.workstreams.bump',
+      },
     });
-    const putTrust = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/trust`, {
+    expect(denied.status).toBe(403);
+    expect(denied.body).toMatchObject({ code: 'WORKSTREAM_NOT_TRUSTED' });
+
+    // Re-allow only the bump tool.
+    const putAllow = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/trust`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
       body: JSON.stringify({ allowedTools: ['sidetrack.workstreams.bump'] }),
     });
+    expect(putAllow.status).toBe(200);
     const trusted = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/bump`, {
       method: 'POST',
-      headers: { 'x-bac-bridge-key': bridgeKey, 'x-sidetrack-mcp-tool': 'sidetrack.workstreams.bump' },
+      headers: {
+        'x-bac-bridge-key': bridgeKey,
+        'x-sidetrack-mcp-tool': 'sidetrack.workstreams.bump',
+      },
     });
+    expect(trusted.status).toBe(200);
     const getTrust = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/trust`, {
       headers: { 'x-bac-bridge-key': bridgeKey },
     });
-
-    expect(denied.status).toBe(403);
-    expect(denied.body).toMatchObject({ code: 'WORKSTREAM_NOT_TRUSTED' });
-    expect(putTrust.status).toBe(200);
-    expect(trusted.status).toBe(200);
     expect(getTrust.body).toMatchObject({
       data: { workstreamId, allowedTools: ['sidetrack.workstreams.bump'] },
     });

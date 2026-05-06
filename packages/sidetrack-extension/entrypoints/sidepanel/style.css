@@ -6661,6 +6661,221 @@ pre.diff {
   margin-bottom: 8px;
 }
 
+/* Wizard "Advanced — port" disclosure. Sits below the bridge-key
+   block; default-collapsed so first-run users see the canonical
+   path, opened explicitly when a non-default port is needed. The
+   toggle uses the same .mono micro-button visual as wizard footer
+   chrome so it reads as a peer of the existing wizard controls. */
+.wizard-advanced {
+  margin-top: 12px;
+}
+.wizard-advanced-toggle {
+  background: transparent;
+  border: none;
+  padding: 2px 0;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--ink-3);
+  min-height: 0;
+}
+.wizard-advanced-toggle:hover {
+  color: var(--ink);
+}
+.wizard-advanced-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+.wizard-advanced-row > span:first-child {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-2);
+  min-width: 50px;
+}
+.wizard-advanced-row input {
+  flex: 0 0 100px;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+.wizard-advanced-hint {
+  flex: 1 1 auto;
+  font-size: 10.5px;
+  color: var(--ink-3);
+}
+
+/* SettingsPanel "Companion connection" section status pill. The
+   neutral / amber / green / red states match the wizard's status
+   strip so the visual grammar carries over. */
+.settings-companion-status {
+  margin-right: auto;
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+}
+.settings-companion-status.green {
+  color: var(--ok, #2f7d4a);
+}
+.settings-companion-status.amber {
+  color: var(--warn, #b06a00);
+}
+.settings-companion-status.red {
+  color: var(--signal, #c0392b);
+}
+.settings-companion-status.neutral {
+  color: var(--ink-3);
+}
+
+/* Workstream-detail header — make the title click-to-edit. The
+   button looks identical to the static .detail-head .title until
+   hovered, where a faint pencil hint nudges in from the right.
+   When the user clicks, App.tsx swaps the button for an input. */
+.ws-detail-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: inherit;
+  min-height: 0;
+}
+.ws-detail-title:disabled {
+  cursor: default;
+}
+.ws-detail-rename-hint {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-3);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.ws-detail-title.editable:hover .ws-detail-rename-hint,
+.ws-detail-title.editable:focus-visible .ws-detail-rename-hint {
+  opacity: 0.85;
+}
+.ws-detail-rename-input {
+  font-family: var(--display);
+  font-size: 16px;
+  font-weight: 500;
+  letter-spacing: -0.005em;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: var(--rad-s);
+  padding: 4px 8px;
+  color: var(--ink);
+  min-width: 0;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.ws-detail-rename-input:focus {
+  outline: none;
+  border-color: var(--ink-3);
+}
+
+/* Hierarchy section — current parent line + Move-to action. Mirrors
+   the .inbound-actions row pattern (label + .btn-link) so the action
+   reads as a peer of the surrounding detail-sec controls rather than
+   a primary call-to-action. */
+.ws-detail-hierarchy {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.ws-detail-hierarchy-label {
+  font-size: 13px;
+  color: var(--ink);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ws-detail-move-head {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  padding: 10px 12px 6px;
+  border-bottom: 1px solid var(--rule-soft);
+}
+.ws-detail-move-head .mono {
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--ink);
+}
+.ws-detail-move-empty {
+  padding: 14px 12px;
+  font-size: 12px;
+}
+
+/* Danger zone — delete affordance lives at the bottom of the
+   detail surface with a faint top rule + warning-tinted action so
+   the destructive action reads as separate from the everyday rename
+   / move. Border tint mirrors the .signal accent token used by the
+   "remove" overflow menu items elsewhere. */
+.ws-detail-danger {
+  border-top: 1px solid var(--rule);
+}
+.ws-detail-delete-trigger {
+  color: var(--signal, #c0392b);
+}
+.ws-detail-delete-trigger:hover {
+  text-decoration: underline;
+}
+.ws-detail-delete-trigger:disabled {
+  color: var(--ink-3);
+  cursor: not-allowed;
+  text-decoration: none;
+}
+.ws-detail-delete-confirm {
+  max-width: 420px;
+}
+.ws-detail-delete-body {
+  padding: 12px 14px;
+  font-size: 13px;
+  color: var(--ink);
+  border-bottom: 1px solid var(--rule-soft);
+}
+.ws-detail-delete-body p {
+  margin: 0 0 8px;
+}
+.ws-detail-delete-impact {
+  margin: 0;
+  padding-left: 16px;
+  font-size: 11.5px;
+  color: var(--ink-2);
+}
+.ws-detail-delete-impact li {
+  margin: 4px 0;
+}
+.ws-detail-delete-error {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: var(--rad-s);
+  background: rgba(192, 57, 43, 0.08);
+  color: var(--signal, #c0392b);
+  font-size: 11.5px;
+}
+.ws-detail-delete-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  padding: 10px 12px;
+}
+.ws-detail-delete-confirm-btn {
+  background: var(--signal, #c0392b);
+  border-color: var(--signal, #c0392b);
+  color: #fff;
+}
+.ws-detail-delete-confirm-btn:hover {
+  filter: brightness(0.95);
+}
+
 /* Thread-row action overflow menu — collapses Queue/Review/Move/Stop/
    Archive behind a ⋯ button, leaving the open + send icons visible.
    The .thread-actions rule above already sets position: absolute, so

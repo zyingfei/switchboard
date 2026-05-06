@@ -32,6 +32,11 @@ export interface WizardProps {
   readonly onClose: () => void;
   readonly onFinish: () => void;
   readonly onBridgeKeyChange?: (bridgeKey: string) => void;
+  // Override the loopback port. The default 17373 fits the published
+  // companion CLI, but tests / sandboxes / power users running a
+  // custom port need this hook so they can finish onboarding without
+  // hand-editing chrome.storage.
+  readonly onPortChange?: (port: number) => void;
   readonly onSkip?: () => void;
   readonly onVaultPathChange?: (vaultPath: string) => void;
   readonly vaultPath?: string;
@@ -61,6 +66,7 @@ export function Wizard({
   onClose,
   onFinish,
   onBridgeKeyChange,
+  onPortChange,
   onSkip,
   onVaultPathChange,
   vaultPath = '',
@@ -140,6 +146,7 @@ export function Wizard({
             setBridgeKeyFailure(null);
           }}
           onBridgeKeyChange={onBridgeKeyChange}
+          onPortChange={onPortChange}
           onPingCompanion={onPingCompanion ?? (() => defaultPingCompanion(port))}
           onReadClipboard={onReadClipboard ?? defaultReadClipboard}
           port={port}
@@ -185,6 +192,7 @@ function CompanionStep({
   connectionError,
   onBridgeKeyFailureClear,
   onBridgeKeyChange,
+  onPortChange,
   onPingCompanion,
   onReadClipboard,
   port,
@@ -196,6 +204,7 @@ function CompanionStep({
   readonly connectionError: string | null;
   readonly onBridgeKeyFailureClear: () => void;
   readonly onBridgeKeyChange?: (bridgeKey: string) => void;
+  readonly onPortChange?: (port: number) => void;
   readonly onPingCompanion: () => Promise<CompanionPingResult>;
   readonly onReadClipboard: () => Promise<string>;
   readonly port: number;
@@ -205,6 +214,22 @@ function CompanionStep({
   const bridgeKeyPath = `${commandPath.replace(/\/$/, '')}/_BAC/.config/bridge.key`;
   const [pingState, setPingState] = useState<'idle' | 'testing' | CompanionPingResult>('idle');
   const [clipboardError, setClipboardError] = useState<string | null>(null);
+  // Port edits stay local to this step until the user blurs the
+  // input (or hits Enter); committing on every keystroke would fire
+  // the auto-save debounce + chrome.storage write per character.
+  const [portDraft, setPortDraft] = useState<string>(String(port));
+  useEffect(() => {
+    setPortDraft(String(port));
+  }, [port]);
+  const [showAdvanced, setShowAdvanced] = useState(port !== 17_373);
+  const commitPort = (raw: string): void => {
+    const n = Number.parseInt(raw, 10);
+    if (!Number.isFinite(n) || n <= 0 || n > 65_535) {
+      setPortDraft(String(port));
+      return;
+    }
+    if (n !== port) onPortChange?.(n);
+  };
   const validationError =
     connectionError ??
     (bridgeKeyFailure === null ? null : bridgeKeyValidationCopy[bridgeKeyFailure]);
@@ -318,6 +343,45 @@ function CompanionStep({
           {validationError}
         </div>
       ) : null}
+      <div className="wizard-advanced">
+        <button
+          type="button"
+          className="wizard-advanced-toggle mono"
+          aria-expanded={showAdvanced}
+          onClick={() => {
+            setShowAdvanced((prev) => !prev);
+          }}
+        >
+          {showAdvanced ? '▾' : '▸'} Advanced — port
+        </button>
+        {showAdvanced ? (
+          <label className="wizard-advanced-row">
+            <span>Port</span>
+            <input
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={65535}
+              value={portDraft}
+              onChange={(event) => {
+                setPortDraft(event.target.value);
+              }}
+              onBlur={(event) => {
+                commitPort(event.target.value);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  commitPort(event.currentTarget.value);
+                }
+              }}
+              aria-label="Companion port"
+            />
+            <span className="wizard-advanced-hint mono">
+              default 17373 — change only if your companion was started with --port
+            </span>
+          </label>
+        ) : null}
+      </div>
       <div className="wizard-footnote mono">
         <em>
           The companion runs locally on your machine. The bridge key keeps the vault outside

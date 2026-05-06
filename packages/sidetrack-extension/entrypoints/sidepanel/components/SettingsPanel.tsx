@@ -101,6 +101,14 @@ export interface SettingsPanelProps {
   // those sections degrade to local-only state with TODO logging.
   readonly companionPort?: number | null;
   readonly bridgeKey?: string | null;
+  // Save edits to the loopback connection (port + bridge key). Wires
+  // straight into the App.tsx debounced settings auto-save. Optional
+  // so legacy embeddings of this panel keep working in read-only
+  // mode; when undefined the section renders without input fields.
+  readonly onSaveCompanionConnection?: (next: {
+    readonly port: number;
+    readonly bridgeKey: string;
+  }) => void;
 }
 
 const PROVIDER_LABELS: Record<keyof SettingsValue['autoSendOptIn'], string> = {
@@ -151,6 +159,7 @@ export function SettingsPanel({
   onDensityChange,
   companionPort,
   bridgeKey,
+  onSaveCompanionConnection,
 }: SettingsPanelProps) {
   // Helper for companion-backed sections. Returns null on missing
   // config so callers can fall back gracefully.
@@ -320,6 +329,56 @@ export function SettingsPanel({
     screenShareSafeMode: false,
     revision: '0',
   };
+  // Companion connection drafts. Mirror the wizard pattern: keep the
+  // input local until the user blurs / hits Enter, then commit so the
+  // App-level debounced save isn't fired per keystroke.
+  const [draftCompanionPort, setDraftCompanionPort] = useState<string>(
+    typeof companionPort === 'number' ? String(companionPort) : '',
+  );
+  const [draftBridgeKey, setDraftBridgeKey] = useState<string>(bridgeKey ?? '');
+  useEffect(() => {
+    setDraftCompanionPort(typeof companionPort === 'number' ? String(companionPort) : '');
+  }, [companionPort]);
+  useEffect(() => {
+    setDraftBridgeKey(bridgeKey ?? '');
+  }, [bridgeKey]);
+  const [companionTestState, setCompanionTestState] = useState<
+    'idle' | 'testing' | 'reachable' | 'unauthorized' | 'unreachable'
+  >('idle');
+  const companionConnDirty =
+    Number.parseInt(draftCompanionPort, 10) !== companionPort ||
+    draftBridgeKey !== (bridgeKey ?? '');
+
+  const handleCompanionConnSave = (): void => {
+    const portNum = Number.parseInt(draftCompanionPort, 10);
+    if (!Number.isFinite(portNum) || portNum <= 0 || portNum > 65_535) return;
+    if (draftBridgeKey.trim().length === 0) return;
+    onSaveCompanionConnection?.({ port: portNum, bridgeKey: draftBridgeKey });
+  };
+
+  const handleCompanionTest = async (): Promise<void> => {
+    const portNum = Number.parseInt(draftCompanionPort, 10);
+    if (!Number.isFinite(portNum) || portNum <= 0 || portNum > 65_535) {
+      setCompanionTestState('unreachable');
+      return;
+    }
+    setCompanionTestState('testing');
+    try {
+      const headers: Record<string, string> = {};
+      if (draftBridgeKey.trim().length > 0) {
+        headers['x-bac-bridge-key'] = draftBridgeKey.trim();
+      }
+      const response = await fetch(`http://127.0.0.1:${String(portNum)}/v1/system/health`, {
+        headers,
+      });
+      if (response.ok) setCompanionTestState('reachable');
+      else if (response.status === 401) setCompanionTestState('unauthorized');
+      else setCompanionTestState('unreachable');
+    } catch {
+      setCompanionTestState('unreachable');
+    }
+  };
+
   const [draftAutoSend, setDraftAutoSend] = useState(initial.autoSendOptIn);
   // The Settings UI for screenShareSafeMode was removed (the top-bar
   // toggle is the canonical control), but we keep the draft state
@@ -407,6 +466,101 @@ export function SettingsPanel({
       onClose={onClose}
       footer={footer}
     >
+      {onSaveCompanionConnection !== undefined ? (
+        <div className="settings-section">
+          <h3 className="settings-section-title">Companion connection</h3>
+          <p className="settings-section-lede ai-italic">
+            The side panel reaches the companion over loopback. Default port is{' '}
+            <span className="mono">17373</span>; change it here if you launched the companion
+            with <span className="mono">--port</span> or are pointing at a sandbox vault. Edits
+            save automatically once you blur the field or click Save.
+          </p>
+          <label className="settings-text-row">
+            <span>Port</span>
+            <input
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={65535}
+              className="mono"
+              value={draftCompanionPort}
+              disabled={busy}
+              onChange={(event) => {
+                setDraftCompanionPort(event.target.value);
+                setCompanionTestState('idle');
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  handleCompanionConnSave();
+                }
+              }}
+              aria-label="Companion port"
+            />
+          </label>
+          <label className="settings-text-row">
+            <span>Bridge key</span>
+            <input
+              type="password"
+              autoComplete="off"
+              className="mono"
+              placeholder="Paste from _BAC/.config/bridge.key"
+              value={draftBridgeKey}
+              disabled={busy}
+              onChange={(event) => {
+                setDraftBridgeKey(event.target.value);
+                setCompanionTestState('idle');
+              }}
+              aria-label="Bridge key"
+            />
+          </label>
+          <div className="settings-cta-row">
+            <span
+              className={
+                'mono settings-companion-status ' +
+                (companionTestState === 'reachable'
+                  ? 'green'
+                  : companionTestState === 'testing'
+                    ? 'amber'
+                    : companionTestState === 'unauthorized' ||
+                        companionTestState === 'unreachable'
+                      ? 'red'
+                      : 'neutral')
+              }
+            >
+              {companionTestState === 'reachable'
+                ? '✓ companion responded'
+                : companionTestState === 'testing'
+                  ? 'testing…'
+                  : companionTestState === 'unauthorized'
+                    ? '✗ bridge key rejected (401)'
+                    : companionTestState === 'unreachable'
+                      ? '✗ no response on this port'
+                      : companionConnDirty
+                        ? 'unsaved changes'
+                        : 'idle'}
+            </span>
+            <button
+              type="button"
+              className="btn btn-ghost"
+              disabled={busy || companionTestState === 'testing'}
+              onClick={() => {
+                void handleCompanionTest();
+              }}
+            >
+              Test
+            </button>
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={busy || !companionConnDirty}
+              onClick={handleCompanionConnSave}
+            >
+              Save connection
+            </button>
+          </div>
+        </div>
+      ) : null}
+
       <div className="settings-section">
         <h3 className="settings-section-title">Vault &amp; tracking</h3>
         {companionConfigured ? (

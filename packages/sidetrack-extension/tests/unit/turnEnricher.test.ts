@@ -125,6 +125,59 @@ describe('turnEnricher', () => {
     expect(out.researchReport?.citations?.[0]?.url).toBe('https://a.com/x');
   });
 
+  it('extracts ChatGPT deep-research section headings (H1-H4) into researchReport.sections', () => {
+    seedDoc(
+      `<button aria-label="Deep research, click to remove">Deep research</button>
+       <div data-message-author-role="assistant" id="t">
+         <div class="markdown prose">
+           <p>Preamble.</p>
+           <h2>1. Plugin / extension behavior</h2>
+           <p>…</p>
+           <h2>2. Companion behavior</h2>
+           <p>…</p>
+           <h3>Sub-detail</h3>
+           <h2>1. Plugin / extension behavior</h2>
+           <h2>What this means for sync design</h2>
+         </div>
+       </div>`,
+    );
+    const turnNode = document.getElementById('t');
+    if (turnNode === null) throw new Error('expected #t to mount');
+    const out = enrichTurn({
+      provider: 'chatgpt',
+      turnNode,
+      role: 'assistant',
+      doc: document,
+    });
+    // Dedup keeps each unique heading once, in document order.
+    expect(out.researchReport?.sections).toEqual([
+      '1. Plugin / extension behavior',
+      '2. Companion behavior',
+      'Sub-detail',
+      'What this means for sync design',
+    ]);
+  });
+
+  it('omits researchReport.sections for an ordinary (non-deep-research) chatgpt turn', () => {
+    seedDoc(
+      `<div data-message-author-role="assistant" id="t">
+         <div class="markdown prose">
+           <h2>Some heading</h2>
+           <p>Plain answer.</p>
+         </div>
+       </div>`,
+    );
+    const turnNode = document.getElementById('t');
+    if (turnNode === null) throw new Error('expected #t to mount');
+    const out = enrichTurn({
+      provider: 'chatgpt',
+      turnNode,
+      role: 'assistant',
+      doc: document,
+    });
+    expect(out.researchReport).toBeUndefined();
+  });
+
   it('extracts Claude model name from the dropdown aria-label', () => {
     seedDoc(
       `<button data-testid="model-selector-dropdown" aria-label="Model: Sonnet 4.5">Sonnet 4.5</button>

@@ -558,6 +558,7 @@ export const upsertLocalThread = async (
     lastTurnRole: input.lastTurnRole ?? existing?.lastTurnRole,
     autoSendEnabled: existing?.autoSendEnabled,
     selectedModel: input.selectedModel ?? existing?.selectedModel,
+    lastResearchMode: input.lastResearchMode ?? existing?.lastResearchMode,
   };
   await storageSet({
     [THREADS_KEY]: [
@@ -605,6 +606,45 @@ export const createLocalWorkstream = async (
   return node;
 };
 
+export const deleteLocalWorkstream = async (
+  workstreamId: string,
+): Promise<{ readonly detachedThreadIds: readonly string[] }> => {
+  const workstreams = await readWorkstreams();
+  const target = workstreams.find((candidate) => candidate.bac_id === workstreamId);
+  if (target === undefined) {
+    return { detachedThreadIds: [] };
+  }
+  const timestamp = new Date().toISOString();
+  const remaining = workstreams
+    .filter((candidate) => candidate.bac_id !== workstreamId)
+    .map((candidate) =>
+      target.parentId !== undefined && candidate.bac_id === target.parentId
+        ? {
+            ...candidate,
+            children: candidate.children.filter((id) => id !== workstreamId),
+            updatedAt: timestamp,
+          }
+        : candidate,
+    );
+  await storageSet({ [WORKSTREAMS_KEY]: remaining });
+
+  // Detach every locally-tracked thread that pointed at this
+  // workstream — they land back in Inbox so the UI doesn't flash
+  // "Workstream not found" rows the next render.
+  const threads = await readThreads();
+  const detachedThreadIds: string[] = [];
+  const updatedThreads = threads.map((thread) => {
+    if (thread.primaryWorkstreamId !== workstreamId) return thread;
+    detachedThreadIds.push(thread.bac_id);
+    const { primaryWorkstreamId: _drop, ...rest } = thread;
+    return { ...rest } as TrackedThread;
+  });
+  if (detachedThreadIds.length > 0) {
+    await storageSet({ [THREADS_KEY]: updatedThreads });
+  }
+  return { detachedThreadIds };
+};
+
 export const updateLocalWorkstream = async (
   workstreamId: string,
   update: WorkstreamUpdate,
@@ -613,13 +653,40 @@ export const updateLocalWorkstream = async (
   const current = await readWorkstreams();
   const timestamp = new Date().toISOString();
   let updated: WorkstreamNode | undefined;
+  const previousParentId = current.find((c) => c.bac_id === workstreamId)?.parentId;
+  // null sentinel = detach to top-level. undefined = leave parent
+  // unchanged (default partial-update behavior). String = re-parent.
+  const wantsDetach = update.parentId === null;
+  const wantsReparent = typeof update.parentId === 'string';
+  const nextParentId: string | undefined = wantsDetach
+    ? undefined
+    : wantsReparent
+      ? update.parentId ?? undefined
+      : previousParentId;
   const next = current.map((candidate) => {
     if (candidate.bac_id !== workstreamId) {
+      // When this workstream is detaching or re-parenting we also have
+      // to drop its id from the OLD parent's children array AND add it
+      // to the NEW parent's. The companion writer already does this on
+      // its side; mirror locally so the side panel doesn't show stale
+      // tree state until the next read.
+      const isPreviousParent =
+        previousParentId !== undefined && candidate.bac_id === previousParentId;
+      const isNewParent = wantsReparent && candidate.bac_id === update.parentId;
+      if ((wantsDetach || wantsReparent) && (isPreviousParent || isNewParent)) {
+        const dropped = isPreviousParent
+          ? candidate.children.filter((id) => id !== workstreamId)
+          : candidate.children;
+        const added =
+          isNewParent && !dropped.includes(workstreamId) ? [...dropped, workstreamId] : dropped;
+        return { ...candidate, children: added, updatedAt: timestamp };
+      }
       return candidate;
     }
+    const { parentId: _omitParentId, ...rest } = update;
     updated = {
       ...candidate,
-      ...update,
+      ...rest,
       bac_id: candidate.bac_id,
       revision: result?.revision ?? update.revision,
       children: update.children ?? candidate.children,
@@ -628,6 +695,7 @@ export const updateLocalWorkstream = async (
       privacy: update.privacy ?? candidate.privacy,
       screenShareSensitive: update.screenShareSensitive ?? candidate.screenShareSensitive,
       updatedAt: timestamp,
+      ...(nextParentId === undefined ? { parentId: undefined } : { parentId: nextParentId }),
     };
     return updated;
   });
