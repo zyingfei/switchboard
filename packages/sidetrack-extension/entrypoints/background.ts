@@ -1095,6 +1095,19 @@ const MCP_DISPATCH_STALE_RETRY_MS = 5 * 60 * 1000;
 // dispatches are picked up on the next tick.
 const MCP_DISPATCH_MAX_PER_TICK = 1;
 
+// Minimum gap between any two dispatch tab-opens. Even when the
+// MAX_PER_TICK cap is in force, multiple call sites can invoke
+// openAutoApprovedMcpDispatches in rapid succession (the alarm + the
+// side panel's workboard polling + the codingAttach flow all hit
+// refreshCachedDispatches). Without a cross-call cooldown, three
+// pollers in one second produced one chatgpt + one claude + one
+// gemini tab in one second — exactly the storm that crashed the
+// developer's test browser. 30s is an arbitrary "no human-driven
+// scenario should need a faster fan-out" gate.
+const MCP_DISPATCH_GLOBAL_COOLDOWN_MS = 30_000;
+let mcpDispatchInFlight = false;
+let lastMcpDispatchOpenedMs = 0;
+
 const tabAlreadyOpenForDispatch = async (dispatchId: string): Promise<boolean> => {
   const tabs = await readMcpDispatchTabs();
   for (const [tabIdStr, owner] of Object.entries(tabs)) {
@@ -1114,6 +1127,26 @@ const tabAlreadyOpenForDispatch = async (dispatchId: string): Promise<boolean> =
 };
 
 const openAutoApprovedMcpDispatches = async (
+  dispatches: readonly DispatchEventRecord[],
+): Promise<void> => {
+  // Single in-flight + cooldown gate. The alarm and the side panel
+  // both call into this on overlapping schedules; without these
+  // gates a brief flurry of polls can fan out N tabs in N seconds.
+  if (mcpDispatchInFlight) {
+    return;
+  }
+  if (Date.now() - lastMcpDispatchOpenedMs < MCP_DISPATCH_GLOBAL_COOLDOWN_MS) {
+    return;
+  }
+  mcpDispatchInFlight = true;
+  try {
+    await openAutoApprovedMcpDispatchesInner(dispatches);
+  } finally {
+    mcpDispatchInFlight = false;
+  }
+};
+
+const openAutoApprovedMcpDispatchesInner = async (
   dispatches: readonly DispatchEventRecord[],
 ): Promise<void> => {
   const alreadyStarted = await readMcpAutoDispatched();
@@ -1158,6 +1191,7 @@ const openAutoApprovedMcpDispatches = async (
         await writeMcpDispatchTab(created.id, dispatch.bac_id);
         autoSendOnceTabReady(created.id, dispatch.body);
         openedThisTick += 1;
+        lastMcpDispatchOpenedMs = Date.now();
       }
     } catch (error) {
       console.warn(
