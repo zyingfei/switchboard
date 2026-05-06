@@ -14,6 +14,8 @@ import type {
 import { searchIndex } from '../vault/searchIndex.js';
 import { registerAnnotationTools } from './annotationTools.js';
 import { registerDispatchTools } from './dispatchTools.js';
+import { registerPrompts } from './prompts.js';
+import { registerResources } from './resources.js';
 import { registerSessionTools } from './sessionTools.js';
 
 export type RequestDispatchTargetProvider = 'chatgpt' | 'claude' | 'gemini';
@@ -255,6 +257,8 @@ export const createSidetrackMcpServer = (
   registerDispatchTools(server, reader, companionClient);
   registerSessionTools(server, companionClient);
   registerAnnotationTools(server, companionClient);
+  registerResources(server, reader, companionClient);
+  registerPrompts(server);
 
   server.registerTool(
     'sidetrack.threads.list',
@@ -631,37 +635,10 @@ export const createSidetrackMcpServer = (
     },
   );
 
-  server.registerTool(
-    'sidetrack.threads.read_md',
-    {
-      description: 'Return raw vault Markdown for a tracked thread, capped by the companion.',
-      inputSchema: { bac_id: z.string().min(1) },
-    },
-    async ({ bac_id }) => {
-      if (companionClient?.readThreadMarkdown === undefined) {
-        throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.threads.read_md is unavailable.',
-        );
-      }
-      return asStructuredContent(await companionClient.readThreadMarkdown({ bac_id }));
-    },
-  );
-
-  server.registerTool(
-    'sidetrack.workstreams.read_md',
-    {
-      description: 'Return raw vault Markdown for a workstream root file, capped by the companion.',
-      inputSchema: { bac_id: z.string().min(1) },
-    },
-    async ({ bac_id }) => {
-      if (companionClient?.readWorkstreamMarkdown === undefined) {
-        throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.workstreams.read_md is unavailable.',
-        );
-      }
-      return asStructuredContent(await companionClient.readWorkstreamMarkdown({ bac_id }));
-    },
-  );
+  // sidetrack.threads.read_md and sidetrack.workstreams.read_md were
+  // deleted in Phase 5: the same content is now exposed as MCP
+  // resources at sidetrack://thread/{threadId}/markdown and
+  // sidetrack://workstream/{workstreamId}/context. See resources.ts.
 
   server.registerTool(
     'sidetrack.recall.query',

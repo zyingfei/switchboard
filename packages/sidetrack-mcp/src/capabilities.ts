@@ -23,8 +23,6 @@ export const sidetrackToolNames = [
   'sidetrack.annotations.list',
   'sidetrack.annotations.update',
   'sidetrack.annotations.delete',
-  'sidetrack.threads.read_md',
-  'sidetrack.workstreams.read_md',
   'sidetrack.recall.query',
   'sidetrack.suggestions.workstream',
   'sidetrack.settings.export',
@@ -40,3 +38,29 @@ export type SidetrackToolName = (typeof sidetrackToolNames)[number];
 
 export const isSidetrackToolName = (value: string): value is SidetrackToolName =>
   sidetrackToolNames.some((toolName) => toolName === value);
+
+// MCP prompts (Phase 5). Order matches the registerPrompt() calls in
+// prompts.ts; the tooling-test asserts on it. Three workflows: a
+// 3-line attach prompt, a full demo dispatch+annotate flow, and an
+// annotate-only flow against an already-captured thread.
+export const sidetrackPromptNames = [
+  'sidetrack.session.attach',
+  'sidetrack.demo.dispatch_and_annotate',
+  'sidetrack.thread.annotate',
+] as const;
+
+export type SidetrackPromptName = (typeof sidetrackPromptNames)[number];
+
+// MCP resource templates (Phase 5). Each is a sidetrack:// URI
+// pattern advertised via resources/list. The order mirrors
+// registerResource() calls in resources.ts.
+export const sidetrackResourceTemplates = [
+  'sidetrack://thread/{threadId}',
+  'sidetrack://thread/{threadId}/turns',
+  'sidetrack://thread/{threadId}/annotations',
+  'sidetrack://thread/{threadId}/markdown',
+  'sidetrack://dispatch/{dispatchId}',
+  'sidetrack://workstream/{workstreamId}/context',
+] as const;
+
+export type SidetrackResourceTemplate = (typeof sidetrackResourceTemplates)[number];

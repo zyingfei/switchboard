@@ -309,7 +309,7 @@ const buildLeanHandoff = (threadId: string, mcpEndpoint: string, ask: string): s
     '# Coding handoff: Recall index lifecycle',
     `sidetrack_mcp: ${mcpEndpoint}`,
     `sidetrack_thread_id: ${threadId}`,
-    '(connect → tools/list → sidetrack.threads.read_md)',
+    '(connect → readResource sidetrack://thread/<id>/markdown)',
     '',
     "## User's ask",
     ask,
@@ -422,8 +422,8 @@ describe('codex handoff over MCP', () => {
     expect(prompt).toContain('sidetrack_mcp: http://127.0.0.1:8721/mcp');
     expect(prompt).toContain("## User's ask");
     // Discovery breadcrumb is the only instruction-shaped content;
-    // capable agents need just this to find sidetrack.threads.read_md.
-    expect(prompt).toContain('(connect → tools/list → sidetrack.threads.read_md)');
+    // capable agents read the thread via the resource template.
+    expect(prompt).toContain('(connect → readResource sidetrack://thread/<id>/markdown)');
     // Compact-budget guard: ~225 chars baseline + room for ask.
     expect(prompt.length).toBeLessThan(400);
   });
@@ -449,7 +449,6 @@ describe('codex handoff over MCP', () => {
       const advertised = tools.tools.map((t) => t.name);
       expect(advertised).toEqual(
         expect.arrayContaining([
-          'sidetrack.threads.read_md',
           'sidetrack.dispatches.list',
           'sidetrack.annotations.create_batch',
           'sidetrack.annotations.list',
@@ -457,16 +456,34 @@ describe('codex handoff over MCP', () => {
           'sidetrack.queue.create',
         ]),
       );
+      // Resource templates are advertised separately — the thread
+      // markdown read used to be a tool; in Phase 5 it became a
+      // resource at sidetrack://thread/<id>/markdown.
+      const templates = (await client.listResourceTemplates()).resourceTemplates.map(
+        (entry) => entry.uriTemplate,
+      );
+      expect(templates).toEqual(
+        expect.arrayContaining([
+          'sidetrack://thread/{threadId}',
+          'sidetrack://thread/{threadId}/markdown',
+        ]),
+      );
 
-      // Step 3 — fetch the thread body. This is the agent's first
-      // real "what am I working on?" call.
-      const threadMd = await client.callTool({
-        name: 'sidetrack.threads.read_md',
-        arguments: { bac_id: threadId },
+      // Step 3 — fetch the thread body via the resource. This is the
+      // agent's first "what am I working on?" call.
+      const threadResource = await client.readResource({
+        uri: `sidetrack://thread/${threadId}/markdown`,
       });
-      const threadBody = structured(threadMd) as { readonly markdown?: string };
-      expect(threadBody.markdown).toContain('Recall index lifecycle');
-      expect(threadBody.markdown).toContain('Background indexing per turn');
+      const firstContent = threadResource.contents[0] as unknown;
+      const markdown =
+        typeof firstContent === 'object' &&
+        firstContent !== null &&
+        'text' in firstContent &&
+        typeof (firstContent as { readonly text?: unknown }).text === 'string'
+          ? (firstContent as { readonly text: string }).text
+          : '';
+      expect(markdown).toContain('Recall index lifecycle');
+      expect(markdown).toContain('Background indexing per turn');
 
       // Step 4 — see what's been shipped before, so the agent
       // doesn't repeat earlier work.

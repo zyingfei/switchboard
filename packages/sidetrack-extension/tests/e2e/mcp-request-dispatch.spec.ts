@@ -66,7 +66,7 @@ test.describe('MCP request dispatch (synthetic)', () => {
       expect(prompt).toContain('sidetrack_mcp: http://127.0.0.1:8721/mcp');
       expect(prompt).toContain('sidetrack_mcp_auth: Bearer ');
       expect(prompt).toContain(`sidetrack_workstream_id: ${workstreamId}`);
-      expect(prompt).toContain('sidetrack.dispatch.create');
+      expect(prompt).toContain('sidetrack.session.attach');
       const token = extractAttachToken(prompt);
 
       const activeCompanion = companion;

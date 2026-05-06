@@ -1664,7 +1664,7 @@ const App = () => {
       // front-loading a contract that capable agents auto-discover
       // via tools/list. Side-by-side review:
       // packages/sidetrack-mcp/src/e2e/handoff-prompt-trim-review.md.
-      body = `# Coding handoff: ${thread.title}\nsidetrack_mcp: http://127.0.0.1:8721/mcp\nsidetrack_mcp_auth: Bearer ${keyStr}\nsidetrack_thread_id: ${thread.bac_id}\n(connect → tools/list → sidetrack.threads.read_md)\n\n## User's ask\n…`;
+      body = `# Coding handoff: ${thread.title}\nsidetrack_mcp: http://127.0.0.1:8721/mcp\nsidetrack_mcp_auth: Bearer ${keyStr}\nsidetrack_thread_id: ${thread.bac_id}\n(connect → readResource sidetrack://thread/<id>/markdown)\n\n## User's ask\n…`;
     } else {
       const today = new Date().toISOString().slice(0, 10);
       body = `---\ntitle: ${thread.title}\ncreated: ${today}\nsource: ${thread.threadUrl}\nprovider: ${provider}\n---\n\n# ${thread.title}\n\n${turnsMd}`;

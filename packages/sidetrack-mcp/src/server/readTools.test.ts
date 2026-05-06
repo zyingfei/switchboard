@@ -293,27 +293,11 @@ describe('companion-backed read tools', () => {
     }
   });
 
-  it('returns raw Markdown through sidetrack.threads.read_md and sidetrack.workstreams.read_md', async () => {
-    const companionClient = buildFakeCompanionClient({
-      readThreadMarkdown: vi.fn(() => Promise.resolve({ path: '/vault/_BAC/threads/t.md', content: '# T' })),
-      readWorkstreamMarkdown: vi.fn(() =>
-        Promise.resolve({ path: '/vault/_BAC/workstreams/w.md', content: '# W' }),
-      ),
-    });
-    const client = await startInProcessServer(companionClient);
-    try {
-      await expect(
-        client.callTool({ name: 'sidetrack.threads.read_md', arguments: { bac_id: 'thread_1' } }),
-      ).resolves.toMatchObject({ structuredContent: { content: '# T' } });
-      await expect(
-        client.callTool({ name: 'sidetrack.workstreams.read_md', arguments: { bac_id: 'ws_1' } }),
-      ).resolves.toMatchObject({ structuredContent: { content: '# W' } });
-      expect(companionClient.readThreadMarkdown).toHaveBeenCalledWith({ bac_id: 'thread_1' });
-      expect(companionClient.readWorkstreamMarkdown).toHaveBeenCalledWith({ bac_id: 'ws_1' });
-    } finally {
-      await client.close();
-    }
-  });
+  // sidetrack.threads.read_md and sidetrack.workstreams.read_md were
+  // deleted in Phase 5. The same content is now read via MCP resources
+  // at sidetrack://thread/{threadId}/markdown and
+  // sidetrack://workstream/{workstreamId}/context. See
+  // promptsResources.test.ts for resource coverage.
 
   it('passes completed write tools through to the companion client', async () => {
     const companionClient = buildFakeCompanionClient({

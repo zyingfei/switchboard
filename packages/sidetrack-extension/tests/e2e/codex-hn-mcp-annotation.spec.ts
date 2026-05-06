@@ -265,8 +265,7 @@ test.describe('Codex MCP Hacker News annotation flow (synthetic browser)', () =>
       await sidepanel.locator('select').selectOption(workstream.bac_id);
       await sidepanel.getByRole('button', { name: 'Generate prompt' }).click();
       const prompt = await extractPrompt(sidepanel);
-      expect(prompt).toContain('tools/list -> sidetrack.session.attach');
-      expect(prompt).toContain('sidetrack.dispatch.create');
+      expect(prompt).toContain('sidetrack.session.attach');
       const token = extractAttachToken(prompt);
 
       const activeCompanion = companion;

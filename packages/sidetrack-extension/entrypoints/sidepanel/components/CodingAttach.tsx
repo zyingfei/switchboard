@@ -30,6 +30,13 @@ interface PendingAttach {
   readonly workstreamId?: string;
 }
 
+// Phase 5: collapsed attach prompt. Capable agents auto-discover
+// Sidetrack tools via tools/list and read the workstream context
+// resource via sidetrack://workstream/<id>/context. The prior 18-line
+// flow + verbose instructions front-loaded a contract the agent
+// didn't read; a 3-line core (endpoint + bearer + token) plus an
+// optional workstream resource hint conveys everything modern MCP
+// clients need.
 const buildAgentPrompt = (
   token: string,
   workstreamId: string | undefined,
@@ -37,28 +44,14 @@ const buildAgentPrompt = (
   mcpAuthBearer: string | undefined,
 ): string =>
   [
-    '# Sidetrack coding session',
-    '',
     `sidetrack_mcp: ${mcpEndpoint}`,
     ...(mcpAuthBearer === undefined ? [] : [`sidetrack_mcp_auth: Bearer ${mcpAuthBearer}`]),
     `sidetrack_attach_token: ${token}`,
-    workstreamId === undefined
-      ? 'sidetrack_workstream_id: (none)'
-      : `sidetrack_workstream_id: ${workstreamId}`,
-    'flow: tools/list -> sidetrack.session.attach -> sidetrack.workstreams.get/sidetrack.workstreams.context_pack -> sidetrack.dispatch.create',
+    ...(workstreamId === undefined
+      ? []
+      : [`sidetrack_workstream_id: ${workstreamId}`]),
     '',
-    mcpAuthBearer === undefined
-      ? 'Use the MCP endpoint above (Streamable HTTP).'
-      : 'Use the MCP endpoint above (Streamable HTTP). Send Authorization: Bearer <key> on every request.',
-    'Attach this coding session by calling sidetrack.session.attach with:',
-    `- attachToken: ${token}`,
-    '- tool: <claude_code | codex | cursor | other>',
-    '- cwd, branch, sessionId, name, and optional resumeCommand from your runtime',
-    '',
-    'After attach, fetch Sidetrack context with sidetrack.workstreams.get or sidetrack.workstreams.context_pack.',
-    'When you need Sidetrack to send context to a target AI, call sidetrack.dispatch.create.',
-    'Use sidetrack.queue.create for follow-up work after a target thread exists.',
-    'Do not ask me for them. The token is single-use and expires in 5 minutes.',
+    'Use the Sidetrack MCP server above. Call sidetrack.session.attach with the attach token, then continue with my task using Sidetrack tools when useful.',
   ].join('\n');
 
 export function CodingAttach({

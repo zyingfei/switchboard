@@ -310,8 +310,9 @@ ${ctx}
 //
 // Everything else — thread URL, provider, captured turns, tools
 // list, dispatches, annotations — is reachable via MCP. The agent
-// calls `tools/list` to discover what's available, `sidetrack.threads.read_md`
-// to get the body, and so on. Nothing is duplicated in the prompt.
+// calls `tools/list` to discover what's available and reads the
+// thread body via the `sidetrack://thread/<id>/markdown` resource.
+// Nothing is duplicated in the prompt.
 //
 // `turnsMd` is intentionally NOT used here. It used to provide an
 // "offline fallback" snapshot, but if the companion is unreachable
@@ -331,7 +332,7 @@ const buildCodingAgentPacket = (
 sidetrack_mcp: http://127.0.0.1:8721/mcp
 sidetrack_mcp_auth: Bearer {BRIDGE_KEY}
 sidetrack_thread_id: ${scope.sourceThreadId ?? '(unknown)'}
-(connect → tools/list → sidetrack.threads.read_md)
+(connect → readResource sidetrack://thread/<id>/markdown)
 
 ## User's ask
 …`;
