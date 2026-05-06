@@ -31,6 +31,7 @@ describe('runImportProjectors', () => {
       dot: { replicaId: 'peer-A', seq: 1 },
       deps: {},
       aggregateId: 'thread-x',
+      target: { canonicalUrl: 'https://chat.example.test/thread-x' },
       type: 'review-draft.span.added',
       payload: {
         spanId: 'span-1',
@@ -48,12 +49,10 @@ describe('runImportProjectors', () => {
     const importResult = await eventLog.importPeerEvent(peerEvent);
     expect(importResult.imported).toBe(true);
 
-    await runImportProjectors(
-      { vaultRoot, eventLog, projectionChanges },
-      peerEvent,
-    );
+    await runImportProjectors({ vaultRoot, eventLog, projectionChanges }, peerEvent);
 
     const projection = await readReviewDraft(vaultRoot, 'thread-x');
+    expect(projection?.threadUrl).toBe('https://chat.example.test/thread-x');
     expect(projection?.spans).toHaveLength(1);
     expect(projection?.spans[0]?.spanId).toBe('span-1');
 
@@ -76,7 +75,13 @@ describe('runImportProjectors', () => {
       deps: {},
       aggregateId: 'thread-y',
       type: 'thread.upserted',
-      payload: { bac_id: 'thread-y', provider: 'chatgpt', threadUrl: 'https://x', title: 't', lastSeenAt: '2026-05-06T00:00:00.000Z' },
+      payload: {
+        bac_id: 'thread-y',
+        provider: 'chatgpt',
+        threadUrl: 'https://x',
+        title: 't',
+        lastSeenAt: '2026-05-06T00:00:00.000Z',
+      },
       acceptedAtMs: 1,
     };
     await eventLog.importPeerEvent(event);

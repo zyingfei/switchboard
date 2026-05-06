@@ -70,6 +70,7 @@ export const reviewDraftOutbox = createOutbox<QueuedReviewDraftEvent>({
   // attempts counter caps at maxAttempts so backoff stays bounded;
   // the UI surfaces "n unsynced" until the companion accepts.
   retryExhaustionPolicy: { kind: 'retain' },
+  drainOrder: 'fifo',
   migrate,
 });
 
@@ -84,16 +85,12 @@ export const enqueueReviewDraftEvent = async (
 
 export const readReviewDraftQueue = async (
   storage?: OutboxStorage,
-): Promise<readonly OutboxItem<QueuedReviewDraftEvent>[]> =>
-  await reviewDraftOutbox.read(storage);
+): Promise<readonly OutboxItem<QueuedReviewDraftEvent>[]> => await reviewDraftOutbox.read(storage);
 
-export const readReviewDraftDroppedCount = async (
-  storage?: OutboxStorage,
-): Promise<number> => await reviewDraftOutbox.readDropped(storage);
+export const readReviewDraftDroppedCount = async (storage?: OutboxStorage): Promise<number> =>
+  await reviewDraftOutbox.readDropped(storage);
 
-export const clearReviewDraftQueue = async (
-  storage?: OutboxStorage,
-): Promise<void> => {
+export const clearReviewDraftQueue = async (storage?: OutboxStorage): Promise<void> => {
   await reviewDraftOutbox.clear(storage);
 };
 

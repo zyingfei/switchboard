@@ -161,6 +161,99 @@ describe('generic outbox', () => {
     expect(await outbox.readDropped(storage)).toBe(0);
   });
 
+  it('default drain keeps scanning after an earlier item fails', async () => {
+    const storage = createMemoryStorage();
+    const outbox = makeOutbox();
+    await outbox.enqueue({ threadId: 't', comment: 'first' }, storage);
+    await outbox.enqueue({ threadId: 't', comment: 'second' }, storage);
+
+    const sent: string[] = [];
+    const result = await outbox.drain(
+      (item) => {
+        sent.push(item.payload.comment);
+        if (item.payload.comment === 'first') {
+          return Promise.reject(new Error('offline'));
+        }
+        return Promise.resolve();
+      },
+      storage,
+      new Date('2026-04-26T22:10:00.000Z'),
+      () => 0.5,
+      { ignoreBackoff: true },
+    );
+
+    expect(result).toEqual({ sent: 1, remaining: 1 });
+    expect(sent).toEqual(['first', 'second']);
+    expect((await outbox.read(storage)).map((entry) => entry.payload.comment)).toEqual(['first']);
+  });
+
+  it('fifo drain stops before later items when the head fails', async () => {
+    const storage = createMemoryStorage();
+    const outbox = createOutbox<DemoPayload>({
+      storageKey: 'fifo',
+      droppedKey: 'fifo.dropped',
+      migrate,
+      drainOrder: 'fifo',
+    });
+    await outbox.enqueue({ threadId: 't', comment: 'first' }, storage);
+    await outbox.enqueue({ threadId: 't', comment: 'second' }, storage);
+
+    const sent: string[] = [];
+    const result = await outbox.drain(
+      (item) => {
+        sent.push(item.payload.comment);
+        return Promise.reject(new Error('offline'));
+      },
+      storage,
+      new Date('2026-04-26T22:10:00.000Z'),
+      () => 0.5,
+      { ignoreBackoff: true },
+    );
+
+    const remaining = await outbox.read(storage);
+    expect(result).toEqual({ sent: 0, remaining: 2 });
+    expect(sent).toEqual(['first']);
+    expect(remaining.map((entry) => entry.payload.comment)).toEqual(['first', 'second']);
+    expect(remaining.map((entry) => entry.attempts)).toEqual([1, 0]);
+  });
+
+  it('fifo drain treats a backed-off head as blocking later items', async () => {
+    const storage = createMemoryStorage();
+    const outbox = createOutbox<DemoPayload>({
+      storageKey: 'fifo-backoff',
+      droppedKey: 'fifo-backoff.dropped',
+      migrate,
+      drainOrder: 'fifo',
+    });
+    await outbox.enqueue({ threadId: 't', comment: 'first' }, storage);
+    await outbox.enqueue({ threadId: 't', comment: 'second' }, storage);
+    await outbox.drain(
+      () => Promise.reject(new Error('offline')),
+      storage,
+      new Date('2026-04-26T22:10:00.000Z'),
+      () => 0.5,
+      { ignoreBackoff: true },
+    );
+
+    const sent: string[] = [];
+    const result = await outbox.drain(
+      (item) => {
+        sent.push(item.payload.comment);
+        return Promise.resolve();
+      },
+      storage,
+      new Date('2026-04-26T22:10:01.000Z'),
+      () => 0.5,
+    );
+
+    expect(result).toEqual({ sent: 0, remaining: 2 });
+    expect(sent).toEqual([]);
+    expect((await outbox.read(storage)).map((entry) => entry.payload.comment)).toEqual([
+      'first',
+      'second',
+    ]);
+  });
+
   it('migrates legacy entries that stored the payload under `event`', async () => {
     const storage = createMemoryStorage();
     const outbox = makeOutbox();

@@ -99,10 +99,7 @@ export const maxVector = (a: VersionVector, b: VersionVector): VersionVector => 
 // dots are not "dominated by themselves" — comparing an event to
 // itself returns false, the caller is responsible for excluding the
 // self comparison.
-export const eventDominates = (
-  newer: AcceptedEvent,
-  older: AcceptedEvent,
-): boolean => {
+export const eventDominates = (newer: AcceptedEvent, older: AcceptedEvent): boolean => {
   if (newer.dot.replicaId === older.dot.replicaId && newer.dot.seq === older.dot.seq) {
     return false;
   }
@@ -110,9 +107,7 @@ export const eventDominates = (
 };
 
 // Per-aggregate vector: union of every event's dot.
-export const vectorFromEvents = (
-  events: readonly AcceptedEvent[],
-): VersionVector => {
+export const vectorFromEvents = (events: readonly AcceptedEvent[]): VersionVector => {
   const vector: Record<ReplicaId, number> = {};
   for (const event of events) {
     const previous = vector[event.dot.replicaId] ?? 0;
@@ -142,9 +137,7 @@ export type RegisterProjection<T> =
 // causally observed it. One survivor → resolved; multiple → conflict.
 // The empty input maps to a value-less resolved projection so callers
 // can render "no value yet" without branching on undefined.
-export const mergeRegister = <T>(
-  values: readonly RegisterValue<T>[],
-): RegisterProjection<T> => {
+export const mergeRegister = <T>(values: readonly RegisterValue<T>[]): RegisterProjection<T> => {
   const survivors = values.filter(
     (candidate) =>
       !values.some((other) => other !== candidate && eventDominates(other.event, candidate.event)),
@@ -176,9 +169,7 @@ export const mergeRegister = <T>(
 // pass. Sort by (replicaId, seq) so deterministic builds produce
 // byte-identical output. Causal merge logic does NOT depend on this
 // order — it's only for projection-build determinism.
-export const sortAcceptedEvents = <T>(
-  events: readonly AcceptedEvent<T>[],
-): AcceptedEvent<T>[] =>
+export const sortAcceptedEvents = <T>(events: readonly AcceptedEvent<T>[]): AcceptedEvent<T>[] =>
   [...events].sort((a, b) => {
     if (a.dot.replicaId < b.dot.replicaId) return -1;
     if (a.dot.replicaId > b.dot.replicaId) return 1;
@@ -194,10 +185,10 @@ export const sortAcceptedEvents = <T>(
 // The HLC field is intentionally excluded — it's advisory metadata
 // the same logical event might carry slightly different values for
 // across replays without that constituting a forgery.
-export const canonicalEventBytes = (event: AcceptedEvent<unknown>): Buffer =>
+export const canonicalEventBytes = (event: AcceptedEvent): Buffer =>
   Buffer.from(canonicalEventString(event), 'utf8');
 
-export const canonicalEventString = (event: AcceptedEvent<unknown>): string =>
+export const canonicalEventString = (event: AcceptedEvent): string =>
   JSON.stringify({
     clientEventId: event.clientEventId,
     dot: { replicaId: event.dot.replicaId, seq: event.dot.seq },
@@ -209,12 +200,13 @@ export const canonicalEventString = (event: AcceptedEvent<unknown>): string =>
     acceptedAtMs: event.acceptedAtMs,
   });
 
-const sortedRecord = (
-  record: Readonly<Record<string, number>>,
-): Record<string, number> => {
+const sortedRecord = (record: Readonly<Record<string, number>>): Record<string, number> => {
   const out: Record<string, number> = {};
   for (const key of Object.keys(record).sort()) {
-    out[key] = record[key]!;
+    const value = record[key];
+    if (value !== undefined) {
+      out[key] = value;
+    }
   }
   return out;
 };

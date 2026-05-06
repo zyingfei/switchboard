@@ -294,7 +294,9 @@ const writeReviewDrafts = async (
   await storageSet({ [REVIEW_DRAFTS_KEY]: next });
 };
 
-export type ReviewDraftVectorMap = Readonly<Partial<Record<string, Readonly<Record<string, number>>>>>;
+export type ReviewDraftVectorMap = Readonly<
+  Partial<Record<string, Readonly<Record<string, number>>>>
+>;
 
 export const readReviewDraftVector = async (
   threadId: string,
@@ -375,9 +377,8 @@ export const markReviewDraftEventAccepted = async (
 
 // Diagnostic accessor — used by tests and the side-panel "n unsynced"
 // pill so the user sees which edits are still in flight.
-export const readReviewDraftPending = async (
-  threadId: string,
-): Promise<readonly string[]> => await readPendingClientEventIds(threadId);
+export const readReviewDraftPending = async (threadId: string): Promise<readonly string[]> =>
+  await readPendingClientEventIds(threadId);
 
 // Build a TargetRef carrying conversation-level addressing. Two
 // replicas observing different snapshots of the same chat (e.g. one
@@ -387,7 +388,10 @@ export const readReviewDraftPending = async (
 const conversationIdFromUrl = (rawUrl: string): string | undefined => {
   try {
     const url = new URL(rawUrl);
-    const trailing = url.pathname.split('/').filter((part) => part.length > 0).pop();
+    const trailing = url.pathname
+      .split('/')
+      .filter((part) => part.length > 0)
+      .pop();
     return trailing && trailing.length > 0 ? trailing : undefined;
   } catch {
     return undefined;
@@ -557,7 +561,7 @@ export const updateReviewDraft = async (
       clientEventId: crypto.randomUUID(),
       type: 'review-draft.verdict.set',
       target,
-      payload: { verdict: patch.verdict },
+      payload: { value: patch.verdict },
       clientCreatedAtMs: nowMs,
     });
   }
@@ -630,9 +634,7 @@ export const mirrorRemoteReviewDraft = async (
       : undefined;
 
   const isEmpty =
-    projection.spans.length === 0 &&
-    overallText === undefined &&
-    verdict === undefined;
+    projection.spans.length === 0 && overallText === undefined && verdict === undefined;
 
   if (projection.discarded || (isEmpty && current[projection.threadId] === undefined)) {
     if (current[projection.threadId] !== undefined) {
@@ -718,9 +720,7 @@ export const setReviewDraftSpanComment = async (
   if (existing === undefined) return undefined;
   const next: ReviewDraft = {
     ...existing,
-    spans: existing.spans.map((span) =>
-      span.bac_id === spanId ? { ...span, comment } : span,
-    ),
+    spans: existing.spans.map((span) => (span.bac_id === spanId ? { ...span, comment } : span)),
     updatedAt: new Date().toISOString(),
   };
   await writeReviewDrafts({ ...current, [threadId]: next });
@@ -735,9 +735,7 @@ export const setReviewDraftSpanComment = async (
     type: 'review-draft.comment.set',
     target: buildReviewDraftTarget(
       existing.threadUrl,
-      targetSpan === undefined
-        ? undefined
-        : { anchor: targetSpan.anchor, quote: targetSpan.quote },
+      targetSpan === undefined ? undefined : { anchor: targetSpan.anchor, quote: targetSpan.quote },
     ),
     payload: { spanId, text: comment },
     clientCreatedAtMs: Date.now(),

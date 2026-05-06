@@ -12,17 +12,13 @@ import {
   type WorkstreamWriteTool,
 } from '../auth/workstreamTrust.js';
 import { createDispatchId, createRequestId, createReviewId } from '../domain/ids.js';
-import { pickInstaller, type Installer } from '../install/index.js';
+import { pickInstaller, type Installer, type InstallOptions } from '../install/index.js';
 import { exportSettings } from '../portability/exportBundle.js';
 import { importSettings } from '../portability/importBundle.js';
 import type { RecallActivityTracker } from '../recall/activity.js';
 import { embed, MODEL_ID } from '../recall/embedder.js';
 import { CAPTURE_RECORDED } from '../recall/events.js';
-import {
-  THREAD_ARCHIVED,
-  THREAD_UNARCHIVED,
-  THREAD_UPSERTED,
-} from '../threads/events.js';
+import { THREAD_ARCHIVED, THREAD_UNARCHIVED, THREAD_UPSERTED } from '../threads/events.js';
 import { projectThread } from '../threads/projection.js';
 import { WORKSTREAM_UPSERTED } from '../workstreams/events.js';
 import { projectWorkstream } from '../workstreams/projection.js';
@@ -58,9 +54,7 @@ import type { ReplicaContext } from '../sync/replicaId.js';
 // Strip undefined keys produced by zod's `optional()` so the caller's
 // `exactOptionalPropertyTypes` interfaces accept the value without
 // complaining about `T | undefined` mismatches.
-const compactTargetRef = (
-  raw: Record<string, unknown> | undefined,
-): TargetRef | undefined => {
+const compactTargetRef = (raw: Record<string, unknown> | undefined): TargetRef | undefined => {
   if (raw === undefined) return undefined;
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(raw)) {
@@ -74,11 +68,22 @@ const compactTargetRef = (
 // need a non-null assertion.
 const syncSummaryDeps = (
   replica: ReplicaContext | undefined,
-): { syncSummary?: () => { replicaId: string; seq: number } } =>
+  sync: CompanionHttpConfig['sync'],
+): {
+  syncSummary?: () => {
+    replicaId: string;
+    seq: number;
+    relay?: { mode: 'local' | 'remote'; url: string };
+  };
+} =>
   replica === undefined
     ? {}
     : {
-        syncSummary: () => ({ replicaId: replica.replicaId, seq: replica.peekSeq() }),
+        syncSummary: () => ({
+          replicaId: replica.replicaId,
+          seq: replica.peekSeq(),
+          ...(sync?.relay === undefined ? {} : { relay: sync.relay }),
+        }),
       };
 import { isReviewDraftEvent, projectReviewDraft } from '../review/projection.js';
 import {
@@ -147,6 +152,13 @@ export interface CompanionHttpConfig {
   readonly vaultWriter: VaultWriter;
   readonly vaultRoot?: string;
   readonly serviceInstaller?: Installer;
+  readonly serviceInstallDefaults?: Omit<InstallOptions, 'vaultPath'>;
+  readonly sync?: {
+    readonly relay?: {
+      readonly mode: 'local' | 'remote';
+      readonly url: string;
+    };
+  };
   readonly updateChecker?: () => Promise<UpdateAdvisory>;
   readonly idempotencyStore?: IdempotencyStore;
   readonly allowAutoUpdate?: boolean;
@@ -399,6 +411,24 @@ const requireVaultRoot = (context: CompanionHttpConfig): string => {
     throw new Error('Vault root is unavailable.');
   }
   return context.vaultRoot;
+};
+
+const buildServiceInstallOptions = (context: CompanionHttpConfig): InstallOptions => {
+  const defaults = context.serviceInstallDefaults;
+  return {
+    vaultPath: requireVaultRoot(context),
+    port: defaults?.port ?? 17373,
+    ...(defaults?.companionCommand === undefined
+      ? {}
+      : { companionCommand: defaults.companionCommand }),
+    ...(defaults?.companionBin === undefined ? {} : { companionBin: defaults.companionBin }),
+    ...(defaults?.mcpPort === undefined ? {} : { mcpPort: defaults.mcpPort }),
+    ...(defaults?.mcpBin === undefined ? {} : { mcpBin: defaults.mcpBin }),
+    ...(defaults?.syncRelayLocalPort === undefined
+      ? {}
+      : { syncRelayLocalPort: defaults.syncRelayLocalPort }),
+    ...(defaults?.syncRelay === undefined ? {} : { syncRelay: defaults.syncRelay }),
+  };
 };
 
 const recallIndexPath = (vaultRoot: string): string =>
@@ -692,10 +722,7 @@ const readThreadMetadata = async (
   threadId: string,
 ): Promise<ThreadMetadata | null> => {
   try {
-    const raw = await readFile(
-      join(vaultRoot, '_BAC', 'threads', `${threadId}.json`),
-      'utf8',
-    );
+    const raw = await readFile(join(vaultRoot, '_BAC', 'threads', `${threadId}.json`), 'utf8');
     const parsed = JSON.parse(raw) as {
       readonly bac_id?: unknown;
       readonly title?: unknown;
@@ -795,14 +822,11 @@ const routes: readonly RouteDefinition[] = [
           controller.abort();
         }, 1000);
         try {
-          const probe = await fetch(
-            `http://127.0.0.1:${String(context.mcp.port)}/mcp`,
-            {
-              method: 'GET',
-              headers: { Authorization: `Bearer ${context.mcp.authKey}` },
-              signal: controller.signal,
-            },
-          );
+          const probe = await fetch(`http://127.0.0.1:${String(context.mcp.port)}/mcp`, {
+            method: 'GET',
+            headers: { Authorization: `Bearer ${context.mcp.authKey}` },
+            signal: controller.signal,
+          });
           // 401 means a process is listening but doesn't accept
           // our key — surface as auth_failed so the side panel
           // can prompt the user to regenerate or re-paste.
@@ -880,6 +904,29 @@ const routes: readonly RouteDefinition[] = [
       200,
       { data: await (context.serviceInstaller ?? pickInstaller()).status() },
     ],
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/system\/install-service$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => [
+      200,
+      {
+        data: await (context.serviceInstaller ?? pickInstaller()).install(
+          buildServiceInstallOptions(context),
+        ),
+      },
+    ],
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/system\/uninstall-service$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => {
+      const installer = context.serviceInstaller ?? pickInstaller();
+      await installer.uninstall();
+      return [200, { data: await installer.status() }];
+    },
   },
   {
     method: 'GET',
@@ -977,7 +1024,7 @@ const routes: readonly RouteDefinition[] = [
               const status = await (context.serviceInstaller ?? pickInstaller()).status();
               return { installed: status.installed, running: status.running };
             },
-            ...syncSummaryDeps(context.replica),
+            ...syncSummaryDeps(context.replica, context.sync),
           }),
         },
       ];
@@ -1196,8 +1243,8 @@ const routes: readonly RouteDefinition[] = [
         );
       }
       const merged = await context.eventLog.readMerged();
-      const dispatchEvents = merged.filter((event) =>
-        event.type === DISPATCH_RECORDED || event.type === DISPATCH_LINKED,
+      const dispatchEvents = merged.filter(
+        (event) => event.type === DISPATCH_RECORDED || event.type === DISPATCH_LINKED,
       );
       return [200, { data: projectDispatches(dispatchEvents) }];
     },
@@ -1235,14 +1282,12 @@ const routes: readonly RouteDefinition[] = [
       const dispatchId = match.bacId;
       const url = new URL(request.url ?? '/', 'http://127.0.0.1');
       const rawTimeout = url.searchParams.get('timeoutMs');
-      const requested =
-        rawTimeout === null ? 60_000 : Number.parseInt(rawTimeout, 10);
+      const requested = rawTimeout === null ? 60_000 : Number.parseInt(rawTimeout, 10);
       const timeoutMs =
         Number.isFinite(requested) && requested > 0 ? Math.min(requested, 120_000) : 60_000;
       const vaultRoot = context.vaultRoot;
 
-      const includeTurn =
-        url.searchParams.get('includeLatestAssistantTurn') !== 'false';
+      const includeTurn = url.searchParams.get('includeLatestAssistantTurn') !== 'false';
 
       const buildResponse = async (
         link: Awaited<ReturnType<typeof context.vaultWriter.readLinkForDispatch>>,
@@ -1288,9 +1333,7 @@ const routes: readonly RouteDefinition[] = [
         // Latest assistant turn — read once now so the model doesn't
         // have to make a follow-up call. Best-effort: a missing
         // threadUrl or empty turn list both reduce to "no latestAssistantTurn".
-        let latestAssistantTurn:
-          | { ordinal: number; text: string; capturedAt: string }
-          | undefined;
+        let latestAssistantTurn: { ordinal: number; text: string; capturedAt: string } | undefined;
         if (includeTurn && meta?.threadUrl !== undefined) {
           try {
             const turns = await context.vaultWriter.readRecentTurns({
@@ -1298,9 +1341,7 @@ const routes: readonly RouteDefinition[] = [
               limit: 5,
               role: 'assistant',
             });
-            const latest = turns
-              .slice()
-              .sort((left, right) => right.ordinal - left.ordinal)[0];
+            const latest = turns.slice().sort((left, right) => right.ordinal - left.ordinal)[0];
             if (latest !== undefined) {
               latestAssistantTurn = {
                 ordinal: latest.ordinal,
@@ -1474,9 +1515,7 @@ const routes: readonly RouteDefinition[] = [
       // Preferred path: read from the local monotonic change feed.
       if (context.projectionChanges !== undefined) {
         const result = await context.projectionChanges.readSince(safeSince);
-        const filtered = result.changed.filter(
-          (change) => change.aggregate === 'review-draft',
-        );
+        const filtered = result.changed.filter((change) => change.aggregate === 'review-draft');
         return [
           200,
           {
@@ -1728,9 +1767,7 @@ const routes: readonly RouteDefinition[] = [
           // built against. Defaults to the latest assistant turn —
           // matches the post-dispatch flow where the agent annotates
           // a fresh answer.
-          const sortedAsc = allTurns
-            .slice()
-            .sort((left, right) => left.ordinal - right.ordinal);
+          const sortedAsc = allTurns.slice().sort((left, right) => left.ordinal - right.ordinal);
           const sourceTurn = input.sourceTurn ?? 'assistant_latest';
           let turnText: string;
           if (sourceTurn === 'assistant_all') {
@@ -1773,9 +1810,7 @@ const routes: readonly RouteDefinition[] = [
           const result = buildAnchorFromTerm({
             turnText,
             term: input.term,
-            ...(input.selectionHint === undefined
-              ? {}
-              : { selectionHint: input.selectionHint }),
+            ...(input.selectionHint === undefined ? {} : { selectionHint: input.selectionHint }),
             ...(cleanedPolicy === undefined ? {} : { policy: cleanedPolicy }),
           });
           if (!result.ok) {
@@ -1829,9 +1864,7 @@ const routes: readonly RouteDefinition[] = [
           // model report a final count without summing per-batch
           // createdCount across multiple calls (the only fully
           // accurate way to know "how many annotations exist").
-          const totalForUrl = (
-            await listAnnotations(vaultRoot, { url: annotationUrl })
-          ).length;
+          const totalForUrl = (await listAnnotations(vaultRoot, { url: annotationUrl })).length;
           return [
             201,
             {
@@ -1920,10 +1953,7 @@ const routes: readonly RouteDefinition[] = [
       if (match.annotationId === undefined) {
         throw new Error('Missing annotationId path parameter.');
       }
-      const result = await softDeleteAnnotation(
-        requireVaultRoot(context),
-        match.annotationId,
-      );
+      const result = await softDeleteAnnotation(requireVaultRoot(context), match.annotationId);
       if (context.eventLog !== undefined && context.replica !== undefined) {
         await context.eventLog
           .appendClient({
@@ -2579,9 +2609,7 @@ const routes: readonly RouteDefinition[] = [
               payload: {
                 bac_id: record['bac_id'],
                 title: record['title'],
-                ...(typeof record['parentId'] === 'string'
-                  ? { parentId: record['parentId'] }
-                  : {}),
+                ...(typeof record['parentId'] === 'string' ? { parentId: record['parentId'] } : {}),
                 ...(typeof record['privacy'] === 'string' ? { privacy: record['privacy'] } : {}),
                 ...(Array.isArray(record['tags']) ? { tags: record['tags'] } : {}),
                 ...(typeof record['description'] === 'string'
@@ -2607,10 +2635,7 @@ const routes: readonly RouteDefinition[] = [
         throw new Error('Missing workstreamId path parameter.');
       }
       try {
-        const result = await context.vaultWriter.deleteWorkstream(
-          match.workstreamId,
-          requestId,
-        );
+        const result = await context.vaultWriter.deleteWorkstream(match.workstreamId, requestId);
         return [
           200,
           {

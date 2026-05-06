@@ -14,6 +14,12 @@ export interface TestCompanion {
   readonly close: () => Promise<void>;
 }
 
+export interface StartTestCompanionOptions {
+  readonly syncRelay?: string;
+  readonly syncRelayLocalPort?: number;
+  readonly syncRendezvousSecret?: string;
+}
+
 const packageRoot = path.resolve(fileURLToPath(new URL('../../../', import.meta.url)));
 const companionRoot = path.resolve(packageRoot, '../sidetrack-companion');
 const companionCliPath = path.join(companionRoot, 'dist/cli.js');
@@ -111,17 +117,36 @@ const closeProcess = async (child: CompanionProcess): Promise<void> => {
   }
 };
 
-export const startTestCompanion = async (): Promise<TestCompanion> => {
+export const startTestCompanion = async (
+  options: StartTestCompanionOptions = {},
+): Promise<TestCompanion> => {
   const vaultPath = await mkdtemp(path.join(tmpdir(), 'sidetrack-extension-e2e-vault-'));
   const port = await reservePort();
-  const child = spawn(
-    process.execPath,
-    [companionCliPath, '--vault', vaultPath, '--port', String(port)],
-    {
-      cwd: companionRoot,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    },
-  );
+  const args = [
+    companionCliPath,
+    '--vault',
+    vaultPath,
+    '--port',
+    String(port),
+    ...(options.syncRelayLocalPort === undefined
+      ? []
+      : ['--sync-relay-local', String(options.syncRelayLocalPort)]),
+    ...(options.syncRelay === undefined || options.syncRendezvousSecret === undefined
+      ? []
+      : [
+          '--sync-relay',
+          options.syncRelay,
+          '--sync-rendezvous-secret',
+          options.syncRendezvousSecret,
+        ]),
+    ...(options.syncRelayLocalPort === undefined || options.syncRendezvousSecret === undefined
+      ? []
+      : ['--sync-rendezvous-secret', options.syncRendezvousSecret]),
+  ];
+  const child = spawn(process.execPath, args, {
+    cwd: companionRoot,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
 
   try {
     await waitForListening(child, port);

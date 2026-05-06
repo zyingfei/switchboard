@@ -95,4 +95,35 @@ describe('projection change feed', () => {
     const result = await feed.readSince(0);
     expect(result.changed.map((c) => c.seq)).toEqual([7]);
   });
+
+  it('recovers the next seq from the log when the seq file is stale', async () => {
+    await mkdir(join(vaultRoot, '_BAC', '.sync'), { recursive: true });
+    await writeFile(join(vaultRoot, '_BAC', '.sync', 'projection-changes-seq'), '2\n', 'utf8');
+    await writeFile(
+      join(vaultRoot, '_BAC', '.sync', 'projection-changes.jsonl'),
+      `${JSON.stringify({
+        seq: 9,
+        aggregate: 'review-draft',
+        aggregateId: 't-existing',
+        relPath: '_BAC/review-drafts/t-existing.json',
+        vector: { A: 9 },
+        kind: 'upsert',
+        localWrittenAtMs: 0,
+      })}\n`,
+      'utf8',
+    );
+
+    const feed = createProjectionChangeFeed(vaultRoot);
+    const next = await feed.appendChange({
+      aggregate: 'review-draft',
+      aggregateId: 't-next',
+      relPath: '_BAC/review-drafts/t-next.json',
+      vector: { A: 10 },
+      kind: 'upsert',
+    });
+    const changes = await feed.readSince(8);
+
+    expect(next.seq).toBe(10);
+    expect(changes.changed.map((change) => change.seq)).toEqual([9, 10]);
+  });
 });

@@ -70,6 +70,10 @@ export interface HealthReport {
   readonly sync?: {
     readonly replicaId: string;
     readonly seq: number;
+    readonly relay?: {
+      readonly mode: 'local' | 'remote';
+      readonly url: string;
+    };
   };
 }
 

@@ -1,5 +1,6 @@
 import { dirname, join } from 'node:path';
 
+import { buildCompanionServiceCommand } from './command.js';
 import type {
   ExecPort,
   FilePort,
@@ -17,7 +18,7 @@ const serviceFile = (opts: InstallOptions): string => `[Unit]
 Description=Sidetrack companion
 
 [Service]
-ExecStart=${shellEscape(opts.companionBin ?? process.execPath)} --vault ${shellEscape(opts.vaultPath)} --port ${String(opts.port)}
+ExecStart=${buildCompanionServiceCommand(opts).map(shellEscape).join(' ')}
 Restart=always
 
 [Install]
@@ -44,7 +45,9 @@ export class SystemdInstaller implements Installer {
   }
 
   async uninstall(): Promise<void> {
-    await this.exec.execFile('systemctl', ['--user', 'disable', '--now', UNIT]).catch(() => undefined);
+    await this.exec
+      .execFile('systemctl', ['--user', 'disable', '--now', UNIT])
+      .catch(() => undefined);
     await this.files.rm(this.path);
     await this.exec.execFile('systemctl', ['--user', 'daemon-reload']).catch(() => undefined);
   }

@@ -93,6 +93,31 @@ const isProjectionChange = (value: unknown): value is ProjectionChange => {
   );
 };
 
+const readMaxLoggedSeq = async (path: string): Promise<number> => {
+  let raw: string;
+  try {
+    raw = await readFile(path, 'utf8');
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return 0;
+    throw error;
+  }
+
+  let maxSeq = 0;
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (isProjectionChange(parsed)) {
+        maxSeq = Math.max(maxSeq, parsed.seq);
+      }
+    } catch {
+      // Tolerate malformed lines; readSince does the same.
+    }
+  }
+  return maxSeq;
+};
+
 export const createProjectionChangeFeed = (
   vaultPath: string,
   options: { readonly now?: () => number } = {},
@@ -112,7 +137,11 @@ export const createProjectionChangeFeed = (
 
   const ensureSeqLoaded = async (): Promise<number> => {
     if (cachedSeq !== null) return cachedSeq;
-    cachedSeq = await readSeq(seqPath(vaultPath));
+    const [storedSeq, loggedSeq] = await Promise.all([
+      readSeq(seqPath(vaultPath)),
+      readMaxLoggedSeq(logPath(vaultPath)),
+    ]);
+    cachedSeq = Math.max(storedSeq, loggedSeq);
     return cachedSeq;
   };
 
@@ -166,7 +195,8 @@ export const createProjectionChangeFeed = (
       }
     }
     changes.sort((a, b) => a.seq - b.seq);
-    const cursor = changes.length === 0 ? sinceSeq : changes[changes.length - 1]!.seq;
+    const lastChange = changes.at(-1);
+    const cursor = lastChange === undefined ? sinceSeq : lastChange.seq;
     return { cursor, changed: changes };
   };
 

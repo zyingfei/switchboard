@@ -139,7 +139,8 @@ export const projectReviewDraft = (
       continue;
     }
     if (event.type === 'review-draft.verdict.set') {
-      const value = (event.payload as Record<string, unknown>)['value'];
+      const payload = event.payload as Record<string, unknown>;
+      const value = isVerdict(payload['value']) ? payload['value'] : payload['verdict'];
       if (isVerdict(value)) {
         verdictCandidates.push({ value, event });
       }
@@ -194,8 +195,7 @@ export const projectReviewDraft = (
   const tombstones: string[] = [];
   for (const info of spans.values()) {
     const survivingAdds = info.adds.filter(
-      (add) =>
-        !info.removes.some((remove) => eventDominates(remove, add)) && !isDiscarded(add),
+      (add) => !info.removes.some((remove) => eventDominates(remove, add)) && !isDiscarded(add),
     );
     if (survivingAdds.length === 0) {
       tombstones.push(info.spanId);

@@ -8,6 +8,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ensureBridgeKey } from '../auth/bridgeKey.js';
 import { createRecallActivityTracker } from '../recall/activity.js';
 import { createBucketRegistry } from '../routing/registry.js';
+import { createEventLog } from '../sync/eventLog.js';
+import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
+import { loadOrCreateReplica } from '../sync/replicaId.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { createIdempotencyStore } from './idempotency.js';
 import { handleRequest, type CompanionHttpConfig } from './server.js';
@@ -185,6 +188,62 @@ describe('companion HTTP server', () => {
     expect(result.body).toMatchObject({
       data: { installed: true, running: false, platform: 'linux' },
     });
+  });
+
+  it('installs and uninstalls the startup service through the system routes', async () => {
+    let installedOptions: unknown;
+    let installed = false;
+    context = {
+      ...context,
+      serviceInstallDefaults: {
+        port: 17373,
+        companionCommand: ['/usr/local/bin/node', '/repo/packages/sidetrack-companion/dist/cli.js'],
+        mcpPort: 8721,
+      },
+      serviceInstaller: {
+        install: (opts) => {
+          installedOptions = opts;
+          installed = true;
+          return Promise.resolve({
+            installed: true,
+            running: true,
+            platform: 'darwin',
+            path: '/home/test/Library/LaunchAgents/com.sidetrack.companion.plist',
+          });
+        },
+        uninstall: () => {
+          installed = false;
+          return Promise.resolve();
+        },
+        status: () =>
+          Promise.resolve({
+            installed,
+            running: installed,
+            platform: 'darwin',
+            path: '/home/test/Library/LaunchAgents/com.sidetrack.companion.plist',
+          }),
+      },
+    };
+
+    const install = await jsonFetch(context, `${baseUrl}/v1/system/install-service`, {
+      method: 'POST',
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    const uninstall = await jsonFetch(context, `${baseUrl}/v1/system/uninstall-service`, {
+      method: 'POST',
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+
+    expect(install.status).toBe(200);
+    expect(install.body).toMatchObject({ data: { installed: true, running: true } });
+    expect(installedOptions).toEqual({
+      vaultPath,
+      port: 17373,
+      companionCommand: ['/usr/local/bin/node', '/repo/packages/sidetrack-companion/dist/cli.js'],
+      mcpPort: 8721,
+    });
+    expect(uninstall.status).toBe(200);
+    expect(uninstall.body).toMatchObject({ data: { installed: false, running: false } });
   });
 
   it('reports update advisory through a stubbed checker', async () => {
@@ -617,28 +676,22 @@ describe('companion HTTP server', () => {
     const dispatchId = (recordResponse.body as { readonly data: { readonly bac_id: string } }).data
       .bac_id;
 
-    const link = await jsonFetch(
-      context,
-      `${baseUrl}/v1/dispatches/${dispatchId}/link`,
-      {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-bac-bridge-key': bridgeKey,
-        },
-        body: JSON.stringify({ threadId: 'bac_thread_linked' }),
+    const link = await jsonFetch(context, `${baseUrl}/v1/dispatches/${dispatchId}/link`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': bridgeKey,
       },
-    );
+      body: JSON.stringify({ threadId: 'bac_thread_linked' }),
+    });
     expect(link.status).toBe(200);
     expect(link.body).toMatchObject({
       data: { dispatchId, threadId: 'bac_thread_linked', linkedAt: expect.any(String) },
     });
 
-    const read = await jsonFetch(
-      context,
-      `${baseUrl}/v1/dispatches/${dispatchId}/link`,
-      { headers: { 'x-bac-bridge-key': bridgeKey } },
-    );
+    const read = await jsonFetch(context, `${baseUrl}/v1/dispatches/${dispatchId}/link`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
     expect(read.status).toBe(200);
     expect(read.body).toMatchObject({
       data: { dispatchId, threadId: 'bac_thread_linked' },
@@ -665,11 +718,9 @@ describe('companion HTTP server', () => {
     const dispatchId = (recordResponse.body as { readonly data: { readonly bac_id: string } }).data
       .bac_id;
 
-    const read = await jsonFetch(
-      context,
-      `${baseUrl}/v1/dispatches/${dispatchId}/link`,
-      { headers: { 'x-bac-bridge-key': bridgeKey } },
-    );
+    const read = await jsonFetch(context, `${baseUrl}/v1/dispatches/${dispatchId}/link`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
     expect(read.body).toMatchObject({
       data: { dispatchId, threadId: null, linkedAt: null },
     });
@@ -1235,6 +1286,50 @@ describe('companion HTTP server', () => {
     expect(missingRequired.body).toMatchObject({ code: 'VALIDATION_ERROR' });
     expect(badVerdict.status).toBe(400);
     expect(badVerdict.body).toMatchObject({ code: 'VALIDATION_ERROR' });
+  });
+
+  it('roundtrips extension-shaped review-draft verdict events through the companion', async () => {
+    const replica = await loadOrCreateReplica(vaultPath);
+    context = {
+      ...context,
+      eventLog: createEventLog(vaultPath, replica),
+      projectionChanges: createProjectionChangeFeed(vaultPath),
+    };
+
+    const result = await jsonFetch(
+      context,
+      `${baseUrl}/v1/review-drafts/bac_thread_verdict/events`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'idempotency-key': 'review-draft-verdict-roundtrip',
+          'x-bac-bridge-key': bridgeKey,
+        },
+        body: JSON.stringify({
+          threadUrl: 'https://chat.example.test/c/verdict',
+          events: [
+            {
+              clientEventId: 'local-verdict-1',
+              type: 'review-draft.verdict.set',
+              baseVector: {},
+              payload: { value: 'agree' },
+            },
+          ],
+        }),
+      },
+    );
+
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({
+      data: {
+        projection: {
+          threadId: 'bac_thread_verdict',
+          threadUrl: 'https://chat.example.test/c/verdict',
+          verdict: { status: 'resolved', value: 'agree' },
+        },
+      },
+    });
   });
 
   it('filters review listings by source thread id', async () => {

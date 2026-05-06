@@ -9,16 +9,14 @@ const anchor = (exact: string): ReviewProjectionAnchor => ({
   cssSelector: 'main > p',
 });
 
-const event = (
-  partial: {
-    type: string;
-    replicaId: string;
-    seq: number;
-    deps?: Record<string, number>;
-    payload?: Record<string, unknown>;
-    acceptedAtMs?: number;
-  },
-): AcceptedEvent => ({
+const event = (partial: {
+  type: string;
+  replicaId: string;
+  seq: number;
+  deps?: Record<string, number>;
+  payload?: Record<string, unknown>;
+  acceptedAtMs?: number;
+}): AcceptedEvent => ({
   clientEventId: `${partial.replicaId}.${String(partial.seq)}`,
   dot: { replicaId: partial.replicaId, seq: partial.seq },
   deps: partial.deps ?? {},
@@ -75,10 +73,29 @@ describe('projectReviewDraft', () => {
     ];
     const projection = projectReviewDraft('t', 'url', events);
     expect(projection.spans).toHaveLength(1);
-    expect(projection.spans[0]?.comment).toMatchObject({ status: 'resolved', value: 'second take' });
-    expect(projection.overall).toMatchObject({ status: 'resolved', value: 'overall verdict prose' });
+    expect(projection.spans[0]?.comment).toMatchObject({
+      status: 'resolved',
+      value: 'second take',
+    });
+    expect(projection.overall).toMatchObject({
+      status: 'resolved',
+      value: 'overall verdict prose',
+    });
     expect(projection.verdict).toMatchObject({ status: 'resolved', value: 'agree' });
     expect(projection.vector).toEqual({ A: 4 });
+  });
+
+  it('projects verdict payloads emitted by the extension', () => {
+    const projection = projectReviewDraft('t', 'url', [
+      event({
+        type: 'review-draft.verdict.set',
+        replicaId: 'A',
+        seq: 1,
+        payload: { verdict: 'partial' },
+      }),
+    ]);
+
+    expect(projection.verdict).toMatchObject({ status: 'resolved', value: 'partial' });
   });
 
   it('observed-remove: a remove that depends on the add hides it', () => {
@@ -222,7 +239,7 @@ describe('projectReviewDraft', () => {
     expect(projection.discarded).toBe(false);
   });
 
-  it('vector is the union of every event\'s dot.seq', () => {
+  it("vector is the union of every event's dot.seq", () => {
     const events: AcceptedEvent[] = [
       event({
         type: 'review-draft.span.added',

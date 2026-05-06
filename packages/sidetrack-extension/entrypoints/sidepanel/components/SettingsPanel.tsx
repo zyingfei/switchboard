@@ -135,6 +135,15 @@ const TARGET_LABELS: Record<SettingsTargetProvider, string> = {
   other: 'Other',
 };
 
+interface SyncStatus {
+  readonly replicaId: string;
+  readonly seq: number;
+  readonly relay?: {
+    readonly mode: 'local' | 'remote';
+    readonly url: string;
+  };
+}
+
 export function SettingsPanel({
   settings,
   localPreferences,
@@ -163,10 +172,7 @@ export function SettingsPanel({
 }: SettingsPanelProps) {
   // Helper for companion-backed sections. Returns null on missing
   // config so callers can fall back gracefully.
-  const callCompanion = async (
-    path: string,
-    init?: RequestInit,
-  ): Promise<Response | null> => {
+  const callCompanion = async (path: string, init?: RequestInit): Promise<Response | null> => {
     if (
       companionPort === undefined ||
       companionPort === null ||
@@ -191,6 +197,7 @@ export function SettingsPanel({
   const [importDiff, setImportDiff] = useState<ImportDiff | null>(null);
   const [pendingImportPayload, setPendingImportPayload] = useState<string | null>(null);
   const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
   const [mcpHosts, setMcpHosts] = useState<readonly McpHost[]>([]);
   const [buckets, setBuckets] = useState<readonly VaultBucket[]>([
     {
@@ -222,6 +229,50 @@ export function SettingsPanel({
     }
   };
 
+  const refreshSyncStatus = async (): Promise<void> => {
+    const healthResponse = await callCompanion('/v1/system/health');
+    if (!healthResponse?.ok) {
+      setSyncStatus(null);
+      return;
+    }
+    try {
+      const body = (await healthResponse.json()) as {
+        readonly data?: {
+          readonly sync?: {
+            readonly replicaId?: unknown;
+            readonly seq?: unknown;
+            readonly relay?: {
+              readonly mode?: unknown;
+              readonly url?: unknown;
+            };
+          };
+        };
+      };
+      const sync = body.data?.sync;
+      if (
+        sync === undefined ||
+        typeof sync.replicaId !== 'string' ||
+        typeof sync.seq !== 'number'
+      ) {
+        setSyncStatus(null);
+        return;
+      }
+      const relay: SyncStatus['relay'] =
+        sync.relay !== undefined &&
+        (sync.relay.mode === 'local' || sync.relay.mode === 'remote') &&
+        typeof sync.relay.url === 'string'
+          ? { mode: sync.relay.mode, url: sync.relay.url }
+          : undefined;
+      setSyncStatus({
+        replicaId: sync.replicaId,
+        seq: sync.seq,
+        ...(relay === undefined ? {} : { relay }),
+      });
+    } catch {
+      setSyncStatus(null);
+    }
+  };
+
   // Hydrate MCP-host list from chrome.storage on mount. Falls back to
   // empty list when chrome.storage isn't available (jsdom unit tests).
   useEffect(() => {
@@ -236,9 +287,7 @@ export function SettingsPanel({
             id: server.id,
             url: server.url,
             tokenMasked:
-              server.bearerToken !== undefined
-                ? server.bearerToken.slice(0, 4) + '••••'
-                : '—',
+              server.bearerToken !== undefined ? server.bearerToken.slice(0, 4) + '••••' : '—',
             role: server.transport,
             online: false,
           },
@@ -273,15 +322,15 @@ export function SettingsPanel({
     let cancelled = false;
     void (async () => {
       await refreshServiceStatus();
+      await refreshSyncStatus();
       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled is mutated by the cleanup closure
       if (cancelled) return;
       const bucketsResponse = await callCompanion('/v1/buckets');
       if (bucketsResponse?.ok) {
         try {
           const body: unknown = await bucketsResponse.json();
-          const items = (
-            body as { readonly data?: { readonly items?: readonly unknown[] } }
-          ).data?.items;
+          const items = (body as { readonly data?: { readonly items?: readonly unknown[] } }).data
+            ?.items;
           if (Array.isArray(items) && items.length > 0) {
             const validBuckets = items.flatMap((raw) => {
               if (typeof raw !== 'object' || raw === null) return [];
@@ -471,9 +520,9 @@ export function SettingsPanel({
           <h3 className="settings-section-title">Companion connection</h3>
           <p className="settings-section-lede ai-italic">
             The side panel reaches the companion over loopback. Default port is{' '}
-            <span className="mono">17373</span>; change it here if you launched the companion
-            with <span className="mono">--port</span> or are pointing at a sandbox vault. Edits
-            save automatically once you blur the field or click Save.
+            <span className="mono">17373</span>; change it here if you launched the companion with{' '}
+            <span className="mono">--port</span> or are pointing at a sandbox vault. Edits save
+            automatically once you blur the field or click Save.
           </p>
           <label className="settings-text-row">
             <span>Port</span>
@@ -521,8 +570,7 @@ export function SettingsPanel({
                   ? 'green'
                   : companionTestState === 'testing'
                     ? 'amber'
-                    : companionTestState === 'unauthorized' ||
-                        companionTestState === 'unreachable'
+                    : companionTestState === 'unauthorized' || companionTestState === 'unreachable'
                       ? 'red'
                       : 'neutral')
               }
@@ -566,9 +614,9 @@ export function SettingsPanel({
         {companionConfigured ? (
           <>
             <p className="settings-section-lede ai-italic">
-              The companion is connected and writing to the vault below. Captures, dispatches,
-              and reviews land as Markdown + JSON under <span className="mono">_BAC/</span> so
-              they survive reinstalls and are readable by other tools.
+              The companion is connected and writing to the vault below. Captures, dispatches, and
+              reviews land as Markdown + JSON under <span className="mono">_BAC/</span> so they
+              survive reinstalls and are readable by other tools.
             </p>
             <div className="settings-vault-status">
               <div className="settings-vault-status-row">
@@ -587,9 +635,9 @@ export function SettingsPanel({
               ) : null}
             </div>
             <p className="settings-hint mono">
-              Lost the key? Run <code>cat &lt;bridge key path&gt;</code> in your terminal — the
-              file is the canonical store. The vault path can be edited below for the NEXT
-              companion launch (the running process keeps its current path).
+              Lost the key? Run <code>cat &lt;bridge key path&gt;</code> in your terminal — the file
+              is the canonical store. The vault path can be edited below for the NEXT companion
+              launch (the running process keeps its current path).
             </p>
           </>
         ) : (
@@ -629,19 +677,64 @@ export function SettingsPanel({
         ) : null}
         <p className="settings-section-lede ai-italic">
           Capture mode lives in the side-panel toolbar: the icon between{' '}
-          <span className="mono">+</span> (capture current tab) and{' '}
-          <span className="mono">›_</span> (attach coding session) toggles between{' '}
-          <span className="mono">auto</span> (Sidetrack refreshes every new turn) and{' '}
-          <span className="mono">manual</span> (capture-on-demand per row).
+          <span className="mono">+</span> (capture current tab) and <span className="mono">›_</span>{' '}
+          (attach coding session) toggles between <span className="mono">auto</span> (Sidetrack
+          refreshes every new turn) and <span className="mono">manual</span> (capture-on-demand per
+          row).
         </p>
+      </div>
+
+      <div className="settings-section">
+        <h3 className="settings-section-title">Sync</h3>
+        {companionConfigured ? (
+          <>
+            <div className="settings-vault-status">
+              <div className="settings-vault-status-row">
+                <span className="settings-vault-status-label mono">replica</span>
+                <code className="settings-vault-status-value">
+                  {syncStatus === null ? 'checking…' : syncStatus.replicaId}
+                </code>
+              </div>
+              <div className="settings-vault-status-row">
+                <span className="settings-vault-status-label mono">event seq</span>
+                <code className="settings-vault-status-value">
+                  {syncStatus === null ? '—' : String(syncStatus.seq)}
+                </code>
+              </div>
+              <div className="settings-vault-status-row">
+                <span className="settings-vault-status-label mono">relay</span>
+                <code className="settings-vault-status-value">
+                  {syncStatus?.relay === undefined
+                    ? 'off'
+                    : `${syncStatus.relay.mode}: ${syncStatus.relay.url}`}
+                </code>
+              </div>
+            </div>
+            {syncStatus?.relay === undefined ? (
+              <p className="settings-hint mono">
+                Local alpha: restart the companion with <code>--sync-relay-local 18443</code>.
+                Sidetrack will reuse <code>_BAC/.config/sync-rendezvous.secret</code> for the sync
+                group.
+              </p>
+            ) : (
+              <p className="settings-hint mono">
+                Relay frames are encrypted locally; the relay only routes opaque events.
+              </p>
+            )}
+          </>
+        ) : (
+          <p className="settings-section-lede ai-italic">
+            Sync is available after the side panel is connected to a companion.
+          </p>
+        )}
       </div>
 
       <div className="settings-section">
         <h3 className="settings-section-title">Auto-send per provider</h3>
         <p className="settings-section-lede ai-italic">
           Auto-send opens the AI's tab and types the packet for you. AI providers default to on;
-          turn one off and Sidetrack falls back to copying the packet so you can paste it
-          yourself. Settings live in the vault, not the browser.
+          turn one off and Sidetrack falls back to copying the packet so you can paste it yourself.
+          Settings live in the vault, not the browser.
           {companionConfigured ? null : (
             <>
               {' '}
@@ -733,7 +826,6 @@ export function SettingsPanel({
           </select>
         </label>
       </div>
-
 
       <div className="settings-section">
         <h3 className="settings-section-title">Workstream privacy</h3>
@@ -889,7 +981,9 @@ export function SettingsPanel({
         }}
         onUninstall={() => {
           setServiceInstalled(false);
-          void callCompanion('/v1/system/uninstall-service', { method: 'POST' });
+          void callCompanion('/v1/system/uninstall-service', { method: 'POST' }).then(() =>
+            refreshServiceStatus(),
+          );
         }}
       />
       <ImportExportSection
@@ -1079,9 +1173,7 @@ export function SettingsPanel({
         }}
       />
 
-      {settingsNotice !== null ? (
-        <div className="settings-hint mono">{settingsNotice}</div>
-      ) : null}
+      {settingsNotice !== null ? <div className="settings-hint mono">{settingsNotice}</div> : null}
       {error !== null && error !== undefined ? (
         <div className="settings-error mono">{error}</div>
       ) : null}

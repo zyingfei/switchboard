@@ -41,8 +41,18 @@ export interface CompanionRuntimeOptions {
   // secret receive accepted events.
   readonly relay?: {
     readonly url: string;
+    readonly mode?: 'local' | 'remote';
     // Base64url-encoded shared secret (≥ 16 bytes after decoding).
     readonly rendezvousSecret: string;
+  };
+  // Command prefix to persist when the side panel installs "run on
+  // startup". Local checkout flow uses `node dist/cli.js` here, so no
+  // public npm package is required.
+  readonly service?: {
+    readonly companionCommand?: readonly string[];
+    readonly mcpBin?: string;
+    readonly syncRelay?: string;
+    readonly syncRelayLocalPort?: number;
   };
 }
 
@@ -86,16 +96,22 @@ export const startCompanion = async (
     watcher = undefined;
   }
   const hygieneStatus: { lastIdempotencyGcAt?: string; lastAuditRetentionAt?: string } = {};
-  const idempotencyGc = setInterval(() => {
-    void idempotencyStore.gcExpired?.(new Date()).then(() => {
-      hygieneStatus.lastIdempotencyGcAt = new Date().toISOString();
-    });
-  }, 60 * 60 * 1000);
-  const auditRetention = setInterval(() => {
-    void enforceRetention(options.vaultPath).then(() => {
-      hygieneStatus.lastAuditRetentionAt = new Date().toISOString();
-    });
-  }, 24 * 60 * 60 * 1000);
+  const idempotencyGc = setInterval(
+    () => {
+      void idempotencyStore.gcExpired?.(new Date()).then(() => {
+        hygieneStatus.lastIdempotencyGcAt = new Date().toISOString();
+      });
+    },
+    60 * 60 * 1000,
+  );
+  const auditRetention = setInterval(
+    () => {
+      void enforceRetention(options.vaultPath).then(() => {
+        hygieneStatus.lastAuditRetentionAt = new Date().toISOString();
+      });
+    },
+    24 * 60 * 60 * 1000,
+  );
   const recallActivity = createRecallActivityTracker();
   const baseEventLog = createEventLog(options.vaultPath, replica);
   const projectionChanges = createProjectionChangeFeed(options.vaultPath);
@@ -147,9 +163,7 @@ export const startCompanion = async (
     ) => {
       const accepted = await baseEventLog.appendClient(input);
       if (relayTransport !== null) {
-        void relayTransport
-          .publishEvent(accepted.dot.replicaId, accepted)
-          .catch(() => undefined);
+        void relayTransport.publishEvent(accepted.dot.replicaId, accepted).catch(() => undefined);
       }
       return accepted;
     },
@@ -182,6 +196,28 @@ export const startCompanion = async (
     replica,
     eventLog,
     projectionChanges,
+    serviceInstallDefaults: {
+      port: options.port,
+      ...(options.service?.companionCommand === undefined
+        ? {}
+        : { companionCommand: options.service.companionCommand }),
+      ...(options.mcp === undefined ? {} : { mcpPort: options.mcp.port }),
+      ...(options.service?.mcpBin === undefined ? {} : { mcpBin: options.service.mcpBin }),
+      ...(options.service?.syncRelayLocalPort === undefined
+        ? {}
+        : { syncRelayLocalPort: options.service.syncRelayLocalPort }),
+      ...(options.service?.syncRelay === undefined ? {} : { syncRelay: options.service.syncRelay }),
+    },
+    ...(options.relay === undefined
+      ? {}
+      : {
+          sync: {
+            relay: {
+              url: options.relay.url,
+              mode: options.relay.mode ?? 'remote',
+            },
+          },
+        }),
     ...(options.mcp === undefined ? {} : { mcp: options.mcp }),
     vaultChanges: {
       subscribe(listener) {

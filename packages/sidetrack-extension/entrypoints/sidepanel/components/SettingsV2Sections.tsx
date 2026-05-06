@@ -171,11 +171,13 @@ export function ServiceInstallSection({
               <span className="muted">(Linux)</span>
             </li>
             <li>
-              <code>schtasks /tn SidetrackCompanion</code>{' '}
-              <span className="muted">(Windows)</span>
+              <code>schtasks /tn SidetrackCompanion</code> <span className="muted">(Windows)</span>
             </li>
           </ul>
-          <div className="cc-note">No admin/root required. Removable from Settings.</div>
+          <div className="cc-note">
+            No admin/root required. Uses this local companion checkout and is removable from
+            Settings.
+          </div>
           <div className="cc-actions">
             <button
               type="button"

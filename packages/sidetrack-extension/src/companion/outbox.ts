@@ -55,6 +55,15 @@ export type RetryExhaustionPolicy =
   // because the network was down for a week is unacceptable.
   | { readonly kind: 'retain' };
 
+export type DrainOrder =
+  // Items are independent; continue draining later items when an
+  // earlier one is backed off or fails. Right for telemetry queues.
+  | 'independent'
+  // Items may causally depend on earlier queued items; stop as soon as
+  // the FIFO head cannot be sent this pass. Right for user-authored
+  // review-draft events chained with clientDeps.
+  | 'fifo';
+
 export class OutboxFullError extends Error {
   constructor(
     readonly storageKey: string,
@@ -79,6 +88,7 @@ export interface OutboxConfig<TPayload> {
   readonly jitterRatio?: number;
   readonly overflowPolicy?: OverflowPolicy;
   readonly retryExhaustionPolicy?: RetryExhaustionPolicy;
+  readonly drainOrder?: DrainOrder;
 }
 
 export interface Outbox<TPayload> {
@@ -117,15 +127,20 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 // stack their payload-shape check on top of this — see `queue.ts`.
 export const baseOutboxItemShape = (
   value: unknown,
-): { id: string; queuedAt: string; attempts: number; nextAttemptAt: string; payload: unknown } | null => {
+): {
+  id: string;
+  queuedAt: string;
+  attempts: number;
+  nextAttemptAt: string;
+  payload: unknown;
+} | null => {
   if (!isRecord(value) || typeof value.id !== 'string' || typeof value.queuedAt !== 'string') {
     return null;
   }
   // Legacy entries stored the payload under `event`; new entries use
   // `payload`. Accept either so older queues survive an extension
   // upgrade without the migration silently dropping their work.
-  const payload =
-    'payload' in value ? value.payload : 'event' in value ? value.event : undefined;
+  const payload = 'payload' in value ? value.payload : 'event' in value ? value.event : undefined;
   if (payload === undefined) {
     return null;
   }
@@ -178,6 +193,7 @@ export const createOutbox = <TPayload>(config: OutboxConfig<TPayload>): Outbox<T
 
   const overflowPolicy = config.overflowPolicy ?? { kind: 'drop-oldest' };
   const retryExhaustionPolicy = config.retryExhaustionPolicy ?? { kind: 'drop' };
+  const drainOrder = config.drainOrder ?? 'independent';
 
   const enqueue = async (
     payload: TPayload,
@@ -222,9 +238,16 @@ export const createOutbox = <TPayload>(config: OutboxConfig<TPayload>): Outbox<T
     let changed = false;
     const nextQueue: OutboxItem<TPayload>[] = [];
 
-    for (const item of queue) {
+    for (const [index, item] of queue.entries()) {
+      const preserveRestIfFifo = (): boolean => {
+        if (drainOrder !== 'fifo') return false;
+        nextQueue.push(...queue.slice(index + 1));
+        return true;
+      };
+
       if (opts.ignoreBackoff !== true && Date.parse(item.nextAttemptAt) > now.getTime()) {
         nextQueue.push(item);
+        if (preserveRestIfFifo()) break;
         continue;
       }
       try {
@@ -257,6 +280,7 @@ export const createOutbox = <TPayload>(config: OutboxConfig<TPayload>): Outbox<T
             nextAttemptAt: computeNextAttempt(attempts, now, random),
           });
         }
+        if (preserveRestIfFifo()) break;
       }
     }
 

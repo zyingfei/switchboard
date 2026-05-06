@@ -1,9 +1,12 @@
+import { buildCompanionServiceCommand } from './command.js';
 import type { ExecPort, Installer, InstallOptions, InstallResult, ServiceStatus } from './types.js';
 
 const TASK_NAME = 'SidetrackCompanion';
 
 const command = (opts: InstallOptions): string =>
-  `"${opts.companionBin ?? process.execPath}" --vault "${opts.vaultPath}" --port ${String(opts.port)}`;
+  buildCompanionServiceCommand(opts)
+    .map((arg) => `"${arg.replaceAll('"', '\\"')}"`)
+    .join(' ');
 
 export class SchedulerInstaller implements Installer {
   readonly path = TASK_NAME;

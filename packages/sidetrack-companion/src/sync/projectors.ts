@@ -2,11 +2,7 @@ import type { AcceptedEvent } from './causal.js';
 import type { EventLog } from './eventLog.js';
 import type { ProjectionChangeFeed } from './projectionChanges.js';
 import { isReviewDraftEvent, projectReviewDraft } from '../review/projection.js';
-import {
-  deleteReviewDraft,
-  readReviewDraft,
-  writeReviewDraft,
-} from '../vault/reviewDrafts.js';
+import { deleteReviewDraft, readReviewDraft, writeReviewDraft } from '../vault/reviewDrafts.js';
 
 // Aggregate-projector dispatch for events ingested from peers.
 //
@@ -48,7 +44,7 @@ const projectReviewDraftAfterImport = async (
   const merged = await deps.eventLog.readByAggregate(threadId);
   const reviewEvents = merged.filter((entry) => isReviewDraftEvent(entry));
   const existing = await readReviewDraft(deps.vaultRoot, threadId);
-  const threadUrl = existing?.threadUrl ?? '';
+  const threadUrl = existing?.threadUrl ?? event.target?.canonicalUrl ?? '';
   const projection = projectReviewDraft(threadId, threadUrl, reviewEvents);
   if (projection.discarded) {
     await deleteReviewDraft(deps.vaultRoot, threadId);

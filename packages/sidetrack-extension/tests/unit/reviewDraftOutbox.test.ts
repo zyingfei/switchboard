@@ -115,4 +115,46 @@ describe('review-draft outbox', () => {
     expect(remaining[0]?.payload.event.type).toBe('review-draft.span.removed');
     expect(remaining[0]?.attempts).toBe(1);
   });
+
+  it('drainReviewDraftOutbox preserves FIFO order when an earlier causal dependency fails', async () => {
+    const storage = memoryStorage();
+    await enqueueReviewDraftEvent(
+      't',
+      'url',
+      {
+        clientEventId: 'a',
+        type: 'review-draft.overall.set',
+        baseVector: {},
+        payload: { text: 'A' },
+      },
+      storage,
+    );
+    await enqueueReviewDraftEvent(
+      't',
+      'url',
+      {
+        clientEventId: 'b',
+        type: 'review-draft.overall.set',
+        baseVector: {},
+        clientDeps: ['a'],
+        payload: { text: 'B' },
+      },
+      storage,
+    );
+
+    const seen: string[] = [];
+    const result = await drainReviewDraftOutbox(
+      (queued) => {
+        seen.push(queued.event.clientEventId);
+        return Promise.reject(new Error('companion unavailable'));
+      },
+      { storage, ignoreBackoff: true },
+    );
+
+    const remaining = await readReviewDraftQueue(storage);
+    expect(result).toEqual({ sent: 0, remaining: 2 });
+    expect(seen).toEqual(['a']);
+    expect(remaining.map((entry) => entry.payload.event.clientEventId)).toEqual(['a', 'b']);
+    expect(remaining.map((entry) => entry.attempts)).toEqual([1, 0]);
+  });
 });

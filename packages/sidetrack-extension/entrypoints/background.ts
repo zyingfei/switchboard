@@ -609,9 +609,9 @@ const captureTab = async (): Promise<void> => {
   }
 };
 
-const draftClientFromSettings = (settings: { companion: CompanionSettings }):
-  | ReviewDraftClientConfig
-  | null => {
+const draftClientFromSettings = (settings: {
+  companion: CompanionSettings;
+}): ReviewDraftClientConfig | null => {
   const bridgeKey = settings.companion.bridgeKey.trim();
   if (bridgeKey.length === 0) return null;
   return {
@@ -626,21 +626,16 @@ const drainReviewDraftQueue = async (): Promise<void> => {
   if (config === null) return;
   await drainReviewDraftOutbox(
     async (queued, idempotencyKey) => {
-      const response = await postReviewDraftEvents(
-        config,
-        queued.threadId,
-        [queued.event],
-        { threadUrl: queued.threadUrl, idempotencyKey },
-      );
+      const response = await postReviewDraftEvents(config, queued.threadId, [queued.event], {
+        threadUrl: queued.threadUrl,
+        idempotencyKey,
+      });
       // Companion accepted the event — drop it from the per-thread
       // pending list so subsequent ClientEvents stop chaining `deps`
       // through it. Then mirror the server-stamped projection so the
       // next event's `baseVector` is up to date.
       const state = await import('../src/background/state');
-      await state.markReviewDraftEventAccepted(
-        queued.threadId,
-        queued.event.clientEventId,
-      );
+      await state.markReviewDraftEventAccepted(queued.threadId, queued.event.clientEventId);
       await state.mirrorRemoteReviewDraft({
         threadId: response.projection.threadId,
         threadUrl: response.projection.threadUrl,
@@ -2562,30 +2557,25 @@ export default defineBackground(() => {
   // (review-drafts here, more in future phases) drive the connection
   // open/close lifecycle. The client retries with backoff so a brief
   // companion downtime self-heals on reconnect.
-  const reviewDraftsSse = createVaultChangesClient({
-    resolveCompanion: () => {
-      try {
-        const cached = (globalThis as unknown as {
-          __sidetrackCachedCompanion?: ReviewDraftClientConfig | null;
-        }).__sidetrackCachedCompanion;
-        if (cached === null || cached === undefined) return null;
-        return { url: cached.companionUrl, bridgeKey: cached.bridgeKey };
-      } catch {
-        return null;
-      }
-    },
-  });
-  // Refresh the cache periodically; this is a coarse mechanism that
-  // only fires when there is a subscriber, so it doesn't pin the
-  // service worker awake.
-  const refreshCompanionCache = async (): Promise<void> => {
+  let cachedReviewDraftCompanion: ReviewDraftClientConfig | null = null;
+  const refreshCompanionCache = async (): Promise<ReviewDraftClientConfig | null> => {
     const settings = await readSettings();
-    const cached = draftClientFromSettings(settings);
-    (globalThis as unknown as {
-      __sidetrackCachedCompanion?: ReviewDraftClientConfig | null;
-    }).__sidetrackCachedCompanion = cached;
+    cachedReviewDraftCompanion = draftClientFromSettings(settings);
+    return cachedReviewDraftCompanion;
   };
+  const reviewDraftsSse = createVaultChangesClient({
+    resolveCompanion: () =>
+      cachedReviewDraftCompanion === null
+        ? null
+        : {
+            url: cachedReviewDraftCompanion.companionUrl,
+            bridgeKey: cachedReviewDraftCompanion.bridgeKey,
+          },
+  });
   void refreshCompanionCache();
+  chrome.storage.onChanged.addListener(() => {
+    void refreshCompanionCache();
+  });
   reviewDraftsSse.subscribe({
     prefix: '_BAC/review-drafts/',
     onEvent: (event) => {
@@ -2594,11 +2584,8 @@ export default defineBackground(() => {
       const threadId = match?.groups?.threadId;
       if (threadId === undefined) return;
       void (async () => {
-        await refreshCompanionCache();
-        const cached = (globalThis as unknown as {
-          __sidetrackCachedCompanion?: ReviewDraftClientConfig | null;
-        }).__sidetrackCachedCompanion;
-        if (cached === null || cached === undefined) return;
+        const cached = await refreshCompanionCache();
+        if (cached === null) return;
         if (event.type === 'deleted') {
           const { removeRemoteReviewDraft } = await import('../src/background/state');
           await removeRemoteReviewDraft(threadId);
@@ -2626,17 +2613,14 @@ export default defineBackground(() => {
       })().catch(() => undefined);
     },
     onReconcile: () => {
-      void refreshCompanionCache();
-      void drainReviewDraftQueue().catch(() => undefined);
       // After a reconnect, walk the cursor feed so any peer event
       // that landed while we were disconnected is reflected in the
       // local projection cache. The SSE stream covers events after
       // reconnect; this fills the gap before reconnect.
       void (async () => {
-        const cached = (globalThis as unknown as {
-          __sidetrackCachedCompanion?: ReviewDraftClientConfig | null;
-        }).__sidetrackCachedCompanion;
-        if (cached === null || cached === undefined) return;
+        const cached = await refreshCompanionCache();
+        void drainReviewDraftQueue().catch(() => undefined);
+        if (cached === null) return;
         try {
           const response = await fetchReviewDraftChanges(cached, null);
           for (const change of response.changed) {
