@@ -6661,6 +6661,73 @@ pre.diff {
   margin-bottom: 8px;
 }
 
+/* Wizard "Advanced — port" disclosure. Sits below the bridge-key
+   block; default-collapsed so first-run users see the canonical
+   path, opened explicitly when a non-default port is needed. The
+   toggle uses the same .mono micro-button visual as wizard footer
+   chrome so it reads as a peer of the existing wizard controls. */
+.wizard-advanced {
+  margin-top: 12px;
+}
+.wizard-advanced-toggle {
+  background: transparent;
+  border: none;
+  padding: 2px 0;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--ink-3);
+  min-height: 0;
+}
+.wizard-advanced-toggle:hover {
+  color: var(--ink);
+}
+.wizard-advanced-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+.wizard-advanced-row > span:first-child {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-2);
+  min-width: 50px;
+}
+.wizard-advanced-row input {
+  flex: 0 0 100px;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+.wizard-advanced-hint {
+  flex: 1 1 auto;
+  font-size: 10.5px;
+  color: var(--ink-3);
+}
+
+/* SettingsPanel "Companion connection" section status pill. The
+   neutral / amber / green / red states match the wizard's status
+   strip so the visual grammar carries over. */
+.settings-companion-status {
+  margin-right: auto;
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+}
+.settings-companion-status.green {
+  color: var(--ok, #2f7d4a);
+}
+.settings-companion-status.amber {
+  color: var(--warn, #b06a00);
+}
+.settings-companion-status.red {
+  color: var(--signal, #c0392b);
+}
+.settings-companion-status.neutral {
+  color: var(--ink-3);
+}
+
 /* Workstream-detail header — make the title click-to-edit. The
    button looks identical to the static .detail-head .title until
    hovered, where a faint pencil hint nudges in from the right.

@@ -5012,6 +5012,10 @@ const App = () => {
             setWizardConnectionError(null);
             setBridgeKey(value);
           }}
+          onPortChange={(value) => {
+            setWizardConnectionError(null);
+            setPort(String(value));
+          }}
           onSkip={() => {
             setWizardConnectionError(null);
             void completeSetup(false).catch((setupError: unknown) => {
@@ -5172,6 +5176,14 @@ const App = () => {
           onDensityChange={setDensity}
           companionPort={port.length > 0 ? Number(port) : null}
           bridgeKey={bridgeKey.length > 0 ? bridgeKey : null}
+          onSaveCompanionConnection={(next) => {
+            // Pushing into the local port + bridgeKey state triggers
+            // the existing debounced auto-save effect (App.tsx around
+            // line ~1020) which writes to chrome.storage via the
+            // saveCompanionSettings message. No new wiring needed.
+            setPort(String(next.port));
+            setBridgeKey(next.bridgeKey);
+          }}
         />
       ) : null}
 
