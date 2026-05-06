@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { WorkstreamNode } from '../../../src/workboard';
+import { Icons } from './icons';
 import { Modal } from './Modal';
 import {
   AppearanceSection,
@@ -332,11 +333,7 @@ export function SettingsPanel({
   const [draftTarget, setDraftTarget] = useState<SettingsTargetProvider>(
     initial.defaultDispatchTarget,
   );
-  // autoTrack is no longer surfaced in Settings — tracking mode
-  // is per-thread now (see thread-row overflow menu). The local
-  // preference still lives in storage for migration safety; we
-  // never display or mutate it here.
-  void localPreferences.autoTrack;
+  const [draftAutoTrack, setDraftAutoTrack] = useState(localPreferences.autoTrack);
   const [draftVaultPath, setDraftVaultPath] = useState(localPreferences.vaultPath);
   const [draftNotifyOnQueueComplete, setDraftNotifyOnQueueComplete] = useState(
     localPreferences.notifyOnQueueComplete,
@@ -350,6 +347,7 @@ export function SettingsPanel({
     draftPacketKind !== initial.defaultPacketKind ||
     draftTarget !== initial.defaultDispatchTarget;
   const localDirty =
+    draftAutoTrack !== localPreferences.autoTrack ||
     draftVaultPath.trim() !== localPreferences.vaultPath.trim() ||
     draftNotifyOnQueueComplete !== localPreferences.notifyOnQueueComplete;
   const dirty = companionDirty || localDirty;
@@ -373,6 +371,7 @@ export function SettingsPanel({
     }
     if (localDirty) {
       onSaveLocalPreferences({
+        ...(draftAutoTrack === localPreferences.autoTrack ? {} : { autoTrack: draftAutoTrack }),
         ...(draftVaultPath.trim() === localPreferences.vaultPath.trim()
           ? {}
           : { vaultPath: draftVaultPath.trim() }),
@@ -475,11 +474,44 @@ export function SettingsPanel({
           </div>
         ) : null}
         <p className="settings-section-lede ai-italic">
-          Tracking mode is now per-thread. Open a thread row's overflow menu (⋯) to flip
-          between <span className="mono">auto</span> (Sidetrack refreshes the thread on every
-          new message) and <span className="mono">manual</span> (no auto-refresh — capture on
-          demand using the row's capture button).
+          Capture mode controls whether Sidetrack refreshes detected AI threads as you chat
+          (<span className="mono">auto</span>) or only when you press a thread row's capture
+          button (<span className="mono">manual</span>).
         </p>
+        <div className="capture-mode-segmented" role="radiogroup" aria-label="Capture mode">
+          <button
+            type="button"
+            role="radio"
+            aria-checked={draftAutoTrack}
+            disabled={busy}
+            className={'capture-mode-option' + (draftAutoTrack ? ' active' : '')}
+            onClick={() => {
+              setDraftAutoTrack(true);
+            }}
+          >
+            <span className="icon-12 capture-mode-icon">{Icons.autoCycle}</span>
+            <span className="capture-mode-text">
+              <span className="capture-mode-name">Auto</span>
+              <span className="capture-mode-desc mono">refreshes every new turn</span>
+            </span>
+          </button>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={!draftAutoTrack}
+            disabled={busy}
+            className={'capture-mode-option' + (!draftAutoTrack ? ' active' : '')}
+            onClick={() => {
+              setDraftAutoTrack(false);
+            }}
+          >
+            <span className="icon-12 capture-mode-icon">{Icons.manualTap}</span>
+            <span className="capture-mode-text">
+              <span className="capture-mode-name">Manual</span>
+              <span className="capture-mode-desc mono">capture-on-demand per row</span>
+            </span>
+          </button>
+        </div>
       </div>
 
       <div className="settings-section">

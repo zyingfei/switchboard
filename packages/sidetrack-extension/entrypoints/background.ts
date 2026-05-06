@@ -313,15 +313,18 @@ const sendToCompanion = async (
     event,
     idempotencyKey('capture', `${event.threadUrl}-${event.capturedAt}`),
   );
-  // Tracking mode is per-thread now, no longer keyed off the
-  // global settings.autoTrack toggle (removed in the per-thread
-  // tracking-mode refactor). For brand-new threads:
-  //   - unknown provider → 'manual' (we can't auto-refresh
-  //     anything we don't know how to scrape)
-  //   - known provider   → 'auto'
-  // Existing threads keep whatever mode the user set on them.
+  // Tracking mode follows the GLOBAL settings.autoTrack mode.
+  // When autoTrack=true, known-provider captures default to
+  // 'auto' (Sidetrack auto-refreshes on every new turn). When
+  // autoTrack=false, captures default to 'manual' so the row
+  // exposes a Capture-now button. Unknown providers always
+  // start manual — we can't auto-refresh what we don't know
+  // how to scrape. Existing threads keep their mode (so an
+  // operator can stop a single thread without flipping the
+  // global mode).
   const trackingMode: ThreadUpsert['trackingMode'] =
-    existingThread?.trackingMode ?? (event.provider === 'unknown' ? 'manual' : 'auto');
+    existingThread?.trackingMode ??
+    (event.provider === 'unknown' || !settings.autoTrack ? 'manual' : 'auto');
   const lastTurnRole = event.turns.at(-1)?.role;
   // Prefer the per-turn modelName the enricher scraped from the
   // assistant's last response (more accurate than event-level
@@ -459,10 +462,11 @@ const captureFromContentScript = async (tab: chrome.tabs.Tab): Promise<CaptureEv
 const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
   const allThreads = await readThreads();
   const existing = allThreads.find((t) => t.threadUrl === event.threadUrl);
+  const settings = await readSettings();
   const parentLink = resolveParentFromForkSource(event, allThreads);
-  // Per-thread tracking mode (see storeCaptureEvent above).
   const trackingMode: ThreadUpsert['trackingMode'] =
-    existing?.trackingMode ?? (event.provider === 'unknown' ? 'manual' : 'auto');
+    existing?.trackingMode ??
+    (event.provider === 'unknown' || !settings.autoTrack ? 'manual' : 'auto');
   const lastTurnRole = event.turns.at(-1)?.role;
   const upserted = await upsertLocalThread({
     provider: event.provider,
@@ -1620,27 +1624,28 @@ const handleRequest = async (
     ) {
       return { ok: true, state: await buildState('connected') };
     }
-    // Per-thread tracking-mode gate. Two rules:
-    //   1. Brand-new threads: don't auto-spawn records from a
-    //      content-script capture. The user explicitly captures
-    //      the threads they care about (side-panel "+ Capture"
-    //      or tab-context-menu).
-    //   2. Existing threads in trackingMode='manual' or 'stopped':
-    //      skip the auto-refresh. 'manual' means "capture only
-    //      when I press the row's Capture button"; 'stopped'
-    //      means the user paused tracking entirely.
+    // Auto-capture gate (global + per-thread).
+    //   - Global autoTrack=false: don't spawn brand-new thread
+    //     records from a content-script capture. Refresh-captures
+    //     for already-tracked threads still flow through.
+    //   - autoTrack=true OR an existing thread is matched: still
+    //     skip the refresh when that thread's mode is 'manual' or
+    //     'stopped'. 'manual' means "capture only when I press the
+    //     row's Capture button"; 'stopped' is the paused state.
     // Both rules carve out an exception for MCP-auto-approved
     // dispatch tabs — those represent explicit agent-driven
     // actions and the resulting thread IS the whole point.
+    const settings = await readSettings();
     const dispatchTabs = await readMcpDispatchTabs();
     const isDispatchTab =
       senderTabId !== undefined && dispatchTabs[String(senderTabId)] !== undefined;
     if (!isDispatchTab) {
       const known = (await readThreads()).find((t) => t.threadUrl === request.capture.threadUrl);
       if (known === undefined) {
-        return { ok: true, state: await buildState('connected') };
-      }
-      if (known.trackingMode === 'manual' || known.trackingMode === 'stopped') {
+        if (!settings.autoTrack) {
+          return { ok: true, state: await buildState('connected') };
+        }
+      } else if (known.trackingMode === 'manual' || known.trackingMode === 'stopped') {
         return { ok: true, state: await buildState('connected') };
       }
     }
