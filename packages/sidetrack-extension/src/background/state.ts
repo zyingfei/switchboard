@@ -14,7 +14,7 @@ import type {
 import { readDroppedCount, readQueue } from '../companion/queue';
 import { canonicalThreadUrl, detectProviderFromUrl } from '../capture/providerDetection';
 import type { DispatchEventRecord } from '../dispatch/types';
-import type { TargetRef } from '../review/draftClient';
+import type { ReviewDraftClientEvent, TargetRef } from '../review/draftClient';
 import {
   enqueueReviewDraftEvent,
   readReviewDraftDroppedCount,
@@ -73,6 +73,15 @@ const REVIEW_DRAFTS_KEY = 'sidetrack.reviewDrafts';
 // so the companion can stamp deps faithfully — i.e. so an offline
 // edit doesn't silently claim to have observed peer events.
 const REVIEW_DRAFT_VECTORS_KEY = 'sidetrack.reviewDraftVectors';
+// Per-thread list of ClientEvent ids that have been queued locally
+// but not yet acknowledged by the companion. Each new ClientEvent
+// for the thread gets `clientDeps = [...pending]` so multiple
+// offline edits from the SAME browser chain causally — without this,
+// two offline overall.set events both stamp `deps = baseVector` and
+// end up as conflict candidates against each other when the
+// companion accepts them. Entries are removed when the drainer's
+// POST returns 200/201/409 (i.e. the companion accepted the event).
+const REVIEW_DRAFT_PENDING_KEY = 'sidetrack.reviewDraftPending';
 
 const storageGet = async <TValue>(key: string, fallback: TValue): Promise<TValue> => {
   const result = await chrome.storage.local.get({ [key]: fallback });
@@ -304,6 +313,72 @@ export const writeReviewDraftVector = async (
   });
 };
 
+type PendingMap = Readonly<Partial<Record<string, readonly string[]>>>;
+
+const readPendingClientEventIds = async (threadId: string): Promise<readonly string[]> => {
+  const all = await storageGet<PendingMap>(REVIEW_DRAFT_PENDING_KEY, {});
+  return all[threadId] ?? [];
+};
+
+const writePendingClientEventIds = async (
+  threadId: string,
+  ids: readonly string[],
+): Promise<void> => {
+  const all = await storageGet<PendingMap>(REVIEW_DRAFT_PENDING_KEY, {});
+  if (ids.length === 0) {
+    if (all[threadId] === undefined) return;
+    const { [threadId]: _, ...rest } = all;
+    void _;
+    await storageSet({ [REVIEW_DRAFT_PENDING_KEY]: rest });
+    return;
+  }
+  await storageSet({ [REVIEW_DRAFT_PENDING_KEY]: { ...all, [threadId]: ids } });
+};
+
+// Mint a ClientEvent for a thread, attach a fresh
+// `(baseVector, clientDeps)` pair derived from local state, and push
+// it to the outbox. clientDeps chains every queued-but-not-yet-
+// accepted local event so a sequence of offline edits stays causally
+// linear — without this, two offline overall.set events would both
+// stamp `deps = baseVector` and surface as a self-conflict on
+// acceptance.
+export const enqueueLocalReviewDraftEvent = async (
+  threadId: string,
+  threadUrl: string,
+  partial: Omit<ReviewDraftClientEvent, 'baseVector' | 'clientDeps'> & {
+    readonly target?: TargetRef;
+  },
+): Promise<void> => {
+  const baseVector = await readReviewDraftVector(threadId);
+  const pending = await readPendingClientEventIds(threadId);
+  const event: ReviewDraftClientEvent = {
+    ...partial,
+    baseVector,
+    ...(pending.length > 0 ? { clientDeps: pending } : {}),
+  };
+  await enqueueReviewDraftEvent(threadId, threadUrl, event);
+  await writePendingClientEventIds(threadId, [...pending, partial.clientEventId]);
+};
+
+// Called by the drainer after the companion accepts a ClientEvent
+// (200/201/409). Removes the id from the pending list so subsequent
+// events stop depending on it.
+export const markReviewDraftEventAccepted = async (
+  threadId: string,
+  clientEventId: string,
+): Promise<void> => {
+  const pending = await readPendingClientEventIds(threadId);
+  const next = pending.filter((id) => id !== clientEventId);
+  if (next.length === pending.length) return;
+  await writePendingClientEventIds(threadId, next);
+};
+
+// Diagnostic accessor — used by tests and the side-panel "n unsynced"
+// pill so the user sees which edits are still in flight.
+export const readReviewDraftPending = async (
+  threadId: string,
+): Promise<readonly string[]> => await readPendingClientEventIds(threadId);
+
 // Build a TargetRef carrying conversation-level addressing. Two
 // replicas observing different snapshots of the same chat (e.g. one
 // before regeneration, one after) emit events with different
@@ -374,16 +449,15 @@ export const appendReviewDraftSpan = async (
     updatedAt: span.capturedAt,
   };
   await writeReviewDrafts({ ...current, [threadId]: next });
-  // Mirror the change to the companion via the outbox. The companion
-  // stamps `dot` + `deps` on accept; we ship the version vector the
-  // editor observed as `baseVector` so the companion does NOT
-  // silently bump deps to include peer events the user never saw.
-  const baseVector = await readReviewDraftVector(threadId);
-  await enqueueReviewDraftEvent(threadId, threadUrl, {
+  // Mirror to the companion. The companion stamps `dot` + `deps` on
+  // accept; the helper attaches `baseVector` (observed projection
+  // frontier) and `clientDeps` (other locally-queued events) so a
+  // sequence of offline edits chains causally rather than turning
+  // into self-conflicts on the next sync.
+  await enqueueLocalReviewDraftEvent(threadId, threadUrl, {
     clientEventId: crypto.randomUUID(),
     type: 'review-draft.span.added',
     target: buildReviewDraftTarget(threadUrl, { anchor: newSpan.anchor, quote: newSpan.quote }),
-    baseVector,
     payload: {
       spanId: newSpan.bac_id,
       anchor: newSpan.anchor,
@@ -406,7 +480,6 @@ export const dropReviewDraftSpan = async (
     return undefined;
   }
   const remaining = existing.spans.filter((span) => span.bac_id !== spanId);
-  const baseVector = await readReviewDraftVector(threadId);
   const removeTargetSpan = existing.spans.find((s) => s.bac_id === spanId);
   const removeEvent = {
     clientEventId: crypto.randomUUID(),
@@ -417,7 +490,6 @@ export const dropReviewDraftSpan = async (
         ? undefined
         : { anchor: removeTargetSpan.anchor, quote: removeTargetSpan.quote },
     ),
-    baseVector,
     payload: { spanId },
     clientCreatedAtMs: Date.now(),
   };
@@ -425,7 +497,7 @@ export const dropReviewDraftSpan = async (
     const { [threadId]: _, ...rest } = current;
     void _;
     await writeReviewDrafts(rest);
-    await enqueueReviewDraftEvent(threadId, existing.threadUrl, removeEvent);
+    await enqueueLocalReviewDraftEvent(threadId, existing.threadUrl, removeEvent);
     return undefined;
   }
   const next: ReviewDraft = {
@@ -434,7 +506,7 @@ export const dropReviewDraftSpan = async (
     updatedAt: new Date().toISOString(),
   };
   await writeReviewDrafts({ ...current, [threadId]: next });
-  await enqueueReviewDraftEvent(threadId, existing.threadUrl, removeEvent);
+  await enqueueLocalReviewDraftEvent(threadId, existing.threadUrl, removeEvent);
   return next;
 };
 
@@ -469,25 +541,22 @@ export const updateReviewDraft = async (
     delete (next as { verdict?: ReviewVerdict }).verdict;
   }
   await writeReviewDrafts({ ...current, [threadId]: next });
-  const baseVector = await readReviewDraftVector(threadId);
   const target = buildReviewDraftTarget(existing.threadUrl);
   const nowMs = Date.now();
   if (patch.overall !== undefined) {
-    await enqueueReviewDraftEvent(threadId, existing.threadUrl, {
+    await enqueueLocalReviewDraftEvent(threadId, existing.threadUrl, {
       clientEventId: crypto.randomUUID(),
       type: 'review-draft.overall.set',
       target,
-      baseVector,
       payload: { text: patch.overall },
       clientCreatedAtMs: nowMs,
     });
   }
   if (patch.verdict !== undefined) {
-    await enqueueReviewDraftEvent(threadId, existing.threadUrl, {
+    await enqueueLocalReviewDraftEvent(threadId, existing.threadUrl, {
       clientEventId: crypto.randomUUID(),
       type: 'review-draft.verdict.set',
       target,
-      baseVector,
       payload: { verdict: patch.verdict },
       clientCreatedAtMs: nowMs,
     });
@@ -655,13 +724,13 @@ export const setReviewDraftSpanComment = async (
     updatedAt: new Date().toISOString(),
   };
   await writeReviewDrafts({ ...current, [threadId]: next });
-  // Causal resolution: the new event's `baseVector` covers all
-  // current candidates (because the local vector reflects every
-  // observed projection event), so the next projection collapses
-  // back to `resolved`.
-  const baseVector = await readReviewDraftVector(threadId);
+  // Causal resolution: the helper attaches `baseVector` (covers all
+  // current candidates because the local vector reflects every
+  // observed projection event) AND `clientDeps` (covers any
+  // queued-but-unaccepted local edits), so the next projection
+  // collapses back to `resolved`.
   const targetSpan = existing.spans.find((s) => s.bac_id === spanId);
-  await enqueueReviewDraftEvent(threadId, existing.threadUrl, {
+  await enqueueLocalReviewDraftEvent(threadId, existing.threadUrl, {
     clientEventId: crypto.randomUUID(),
     type: 'review-draft.comment.set',
     target: buildReviewDraftTarget(
@@ -670,7 +739,6 @@ export const setReviewDraftSpanComment = async (
         ? undefined
         : { anchor: targetSpan.anchor, quote: targetSpan.quote },
     ),
-    baseVector,
     payload: { spanId, text: comment },
     clientCreatedAtMs: Date.now(),
   });
@@ -686,17 +754,13 @@ export const discardReviewDraft = async (threadId: string): Promise<void> => {
   const { [threadId]: _, ...rest } = current;
   void _;
   await writeReviewDrafts(rest);
-  {
-    const baseVector = await readReviewDraftVector(threadId);
-    await enqueueReviewDraftEvent(threadId, existing.threadUrl, {
-      clientEventId: crypto.randomUUID(),
-      type: 'review-draft.discarded',
-      target: buildReviewDraftTarget(existing.threadUrl),
-      baseVector,
-      payload: { reason: 'manual' },
-      clientCreatedAtMs: Date.now(),
-    });
-  }
+  await enqueueLocalReviewDraftEvent(threadId, existing.threadUrl, {
+    clientEventId: crypto.randomUUID(),
+    type: 'review-draft.discarded',
+    target: buildReviewDraftTarget(existing.threadUrl),
+    payload: { reason: 'manual' },
+    clientCreatedAtMs: Date.now(),
+  });
   await dropReviewDraftVector(threadId);
 };
 

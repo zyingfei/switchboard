@@ -118,9 +118,30 @@ const wrapPrivateKey = (raw: Buffer) => {
   return createPrivateKey({ key: Buffer.concat([PKCS8_ED25519_HEADER, raw]), format: 'der', type: 'pkcs8' });
 };
 
-// Sign the canonical message:
-//   sha256(replicaId || lamport_be64 || payloadBytes)
-// Receivers reconstruct the same hash from the decrypted frame.
+// Sign / verify the canonical event bytes. The canonical form (see
+// `causal.ts`) covers every field that affects causal correctness —
+// clientEventId, dot, deps, aggregateId, target, type, payload,
+// acceptedAtMs — so a peer that knows the rendezvous secret cannot
+// re-encrypt a tampered event while reusing a captured signature
+// over a narrower scope. Receivers reconstruct the canonical bytes
+// from the decrypted frame and verify against the trusted public
+// key (NOT the key embedded in the frame; see runtime
+// known-replicas wiring).
+
+export const signCanonicalEvent = (
+  privateKey: Buffer,
+  canonicalBytes: Buffer,
+): Buffer => nodeSign(null, canonicalBytes, wrapPrivateKey(privateKey));
+
+export const verifyCanonicalEvent = (
+  publicKey: Buffer,
+  canonicalBytes: Buffer,
+  signature: Buffer,
+): boolean => nodeVerify(null, canonicalBytes, wrapPublicKey(publicKey), signature);
+
+// Legacy narrow-scope sign/verify retained ONLY for the existing
+// crypto-unit tests that exercise raw payloads. New callers must
+// use `signCanonicalEvent` / `verifyCanonicalEvent`.
 const signingPayload = (
   replicaId: string,
   lamport: number,

@@ -43,6 +43,18 @@ export type OverflowPolicy =
   // silently lose user-authored work.
   | { readonly kind: 'reject-when-full' };
 
+// What to do with an item that has exhausted its retry budget. The
+// drain loop applies one of these per outbox.
+export type RetryExhaustionPolicy =
+  // Drop the item silently and bump the dropped counter. Right for
+  // capture telemetry — the next capture has the same data.
+  | { readonly kind: 'drop' }
+  // Keep the item queued forever, capping the per-item attempts at
+  // the configured `maxAttempts` to throttle backoff but never
+  // discarding. Right for user-authored content — losing a comment
+  // because the network was down for a week is unacceptable.
+  | { readonly kind: 'retain' };
+
 export class OutboxFullError extends Error {
   constructor(
     readonly storageKey: string,
@@ -66,6 +78,7 @@ export interface OutboxConfig<TPayload> {
   readonly maxBackoffMs?: number;
   readonly jitterRatio?: number;
   readonly overflowPolicy?: OverflowPolicy;
+  readonly retryExhaustionPolicy?: RetryExhaustionPolicy;
 }
 
 export interface Outbox<TPayload> {
@@ -164,6 +177,7 @@ export const createOutbox = <TPayload>(config: OutboxConfig<TPayload>): Outbox<T
   };
 
   const overflowPolicy = config.overflowPolicy ?? { kind: 'drop-oldest' };
+  const retryExhaustionPolicy = config.retryExhaustionPolicy ?? { kind: 'drop' };
 
   const enqueue = async (
     payload: TPayload,
@@ -221,7 +235,21 @@ export const createOutbox = <TPayload>(config: OutboxConfig<TPayload>): Outbox<T
         const attempts = item.attempts + 1;
         changed = true;
         if (attempts > maxAttempts) {
-          dropped += 1;
+          if (retryExhaustionPolicy.kind === 'drop') {
+            dropped += 1;
+          } else {
+            // 'retain': cap attempts at maxAttempts so backoff stays
+            // bounded (computeNextAttempt clamps to maxBackoffMs at
+            // that point) but the item stays queued forever — losing
+            // user-authored content because the network was down for
+            // a week is not acceptable. UI surfaces it as "n unsynced
+            // (last error …)".
+            nextQueue.push({
+              ...item,
+              attempts: maxAttempts,
+              nextAttemptAt: computeNextAttempt(maxAttempts, now, random),
+            });
+          }
         } else {
           nextQueue.push({
             ...item,

@@ -15,6 +15,9 @@ import {
   type StartedHttpServer,
 } from '../http/server.js';
 import { createEventLog } from '../sync/eventLog.js';
+import { createKnownReplicasStore } from '../sync/knownReplicas.js';
+import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
+import { runImportProjectors } from '../sync/projectors.js';
 import { createRelayTransport, stopRelayTransport } from '../sync/relayTransport.js';
 import { loadOrCreateReplica } from '../sync/replicaId.js';
 import { loadOrCreateReplicaKeyPair } from '../sync/replicaKeyPair.js';
@@ -95,6 +98,7 @@ export const startCompanion = async (
   }, 24 * 60 * 60 * 1000);
   const recallActivity = createRecallActivityTracker();
   const baseEventLog = createEventLog(options.vaultPath, replica);
+  const projectionChanges = createProjectionChangeFeed(options.vaultPath);
 
   // Optional outbound relay transport. When wired, every accepted
   // event is rebroadcast via the relay so peers learn about it
@@ -102,14 +106,34 @@ export const startCompanion = async (
   let relayTransport: LogTransport | null = null;
   if (options.relay !== undefined && options.relay.rendezvousSecret.trim().length > 0) {
     const keyPair = await loadOrCreateReplicaKeyPair(options.vaultPath);
+    const knownReplicas = createKnownReplicasStore(options.vaultPath);
     relayTransport = createRelayTransport({
       relayUrl: options.relay.url,
       rendezvousSecret: Buffer.from(options.relay.rendezvousSecret, 'base64url'),
       localReplicaId: replica.replicaId,
       localKeyPair: keyPair,
+      knownReplicas,
     });
     relayTransport.subscribePeers(new Set(), (_replicaId, event) => {
-      void baseEventLog.importPeerEvent(event).catch(() => undefined);
+      void (async () => {
+        try {
+          const result = await baseEventLog.importPeerEvent(event);
+          if (result.imported) {
+            await runImportProjectors(
+              {
+                vaultRoot: options.vaultPath,
+                eventLog: baseEventLog,
+                projectionChanges,
+              },
+              event,
+            );
+          }
+        } catch {
+          // importPeerEvent surfaces DotCollisionError /
+          // ClientEventIdReuseError; the relay drops the offending
+          // peer and the user gets a side-panel alert (TODO).
+        }
+      })();
     });
   }
 
@@ -157,6 +181,7 @@ export const startCompanion = async (
     recallActivity,
     replica,
     eventLog,
+    projectionChanges,
     ...(options.mcp === undefined ? {} : { mcp: options.mcp }),
     vaultChanges: {
       subscribe(listener) {

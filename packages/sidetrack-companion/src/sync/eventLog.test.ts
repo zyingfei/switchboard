@@ -213,6 +213,80 @@ describe('event log', () => {
     expect(events.map((event) => event.clientEventId)).toEqual(['good']);
   });
 
+  it('importPeerEvent: byte-identical re-delivery is a no-op', async () => {
+    const log = createEventLog(vaultRoot, replica);
+    const peer: AcceptedEvent = {
+      clientEventId: 'p-1',
+      dot: { replicaId: 'peer-A', seq: 1 },
+      deps: {},
+      aggregateId: 'agg',
+      type: 'noop',
+      payload: { x: 1 },
+      acceptedAtMs: 100,
+    };
+    const first = await log.importPeerEvent(peer);
+    const second = await log.importPeerEvent(peer);
+    expect(first.imported).toBe(true);
+    expect(second.imported).toBe(false);
+    const stored = await log.readReplica('peer-A');
+    expect(stored).toHaveLength(1);
+  });
+
+  it('importPeerEvent: same dot + different content throws DotCollisionError', async () => {
+    const { DotCollisionError } = await import('./eventLog.js');
+    const log = createEventLog(vaultRoot, replica);
+    const a: AcceptedEvent = {
+      clientEventId: 'p-a',
+      dot: { replicaId: 'peer-X', seq: 5 },
+      deps: {},
+      aggregateId: 'agg',
+      type: 'noop',
+      payload: { x: 1 },
+      acceptedAtMs: 100,
+    };
+    const b: AcceptedEvent = {
+      ...a,
+      clientEventId: 'p-b', // different clientEventId, same dot
+      payload: { x: 2 },
+    };
+    await log.importPeerEvent(a);
+    await expect(log.importPeerEvent(b)).rejects.toBeInstanceOf(DotCollisionError);
+  });
+
+  it('importPeerEvent: same clientEventId + different dot throws ClientEventIdReuseError', async () => {
+    const { ClientEventIdReuseError } = await import('./eventLog.js');
+    const log = createEventLog(vaultRoot, replica);
+    const a: AcceptedEvent = {
+      clientEventId: 'reused',
+      dot: { replicaId: 'peer-X', seq: 1 },
+      deps: {},
+      aggregateId: 'agg',
+      type: 'noop',
+      payload: {},
+      acceptedAtMs: 100,
+    };
+    const b: AcceptedEvent = {
+      ...a,
+      dot: { replicaId: 'peer-Y', seq: 1 },
+    };
+    await log.importPeerEvent(a);
+    await expect(log.importPeerEvent(b)).rejects.toBeInstanceOf(ClientEventIdReuseError);
+  });
+
+  it('importPeerEvent: refuses to import an event that claims our own replica id', async () => {
+    const log = createEventLog(vaultRoot, replica);
+    const result = await log.importPeerEvent({
+      clientEventId: 'spoof',
+      dot: { replicaId: replica.replicaId, seq: 999 },
+      deps: {},
+      aggregateId: 'agg',
+      type: 'noop',
+      payload: {},
+      acceptedAtMs: 100,
+    });
+    expect(result.imported).toBe(false);
+  });
+
   it('returns empty merged log when _BAC/log/ does not exist yet', async () => {
     const fresh = await mkdtemp(join(tmpdir(), 'sidetrack-event-log-empty-'));
     try {

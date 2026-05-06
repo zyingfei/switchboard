@@ -50,6 +50,7 @@ import { estimateTokens, tokenBudgetWarningThreshold } from '../safety/tokenBudg
 import { buildSignals, type BuildSignalsWorkstream } from '../suggestions/buildSignals.js';
 import { scoreSuggestions } from '../suggestions/score.js';
 import type { EventLog } from '../sync/eventLog.js';
+import type { ProjectionChangeFeed } from '../sync/projectionChanges.js';
 import type { TargetRef } from '../sync/causal.js';
 import type { ReplicaContext } from '../sync/replicaId.js';
 
@@ -78,7 +79,7 @@ const syncSummaryDeps = (
     : {
         syncSummary: () => ({ replicaId: replica.replicaId, seq: replica.peekSeq() }),
       };
-import { projectReviewDraft } from '../review/projection.js';
+import { isReviewDraftEvent, projectReviewDraft } from '../review/projection.js';
 import {
   deleteReviewDraft,
   listReviewDrafts,
@@ -172,6 +173,10 @@ export interface CompanionHttpConfig {
   // Per-replica event log used by the review-draft (and future)
   // CRDT projection routes. When unset those routes return 503.
   readonly eventLog?: EventLog;
+  // Local monotonic projection-change feed. Browsers resume polling
+  // with a numeric `sinceSeq` cursor; the counter never moves
+  // backward and is independent of any host's wall clock.
+  readonly projectionChanges?: ProjectionChangeFeed;
   // Set when the companion is also managing a sidetrack-mcp child.
   // Exposed via /v1/status so the side panel can build attach prompts
   // whose ?token=… matches whatever the running MCP server actually
@@ -1451,9 +1456,10 @@ const routes: readonly RouteDefinition[] = [
   {
     // Cursor-shaped change feed. Browsers poll with ?since=<cursor>
     // and pass back the returned `cursor` on the next call. The
-    // cursor is the stringified max(updatedAtMs) — opaque from the
-    // browser's perspective, monotonic, suitable for resuming a poll
-    // loop without missing events.
+    // cursor is the stringified value of a per-companion monotonic
+    // counter — never a wall-clock timestamp — so a peer with a
+    // skewed clock can't push the cursor "into the future" and hide
+    // subsequent normal-time edits.
     method: 'GET',
     pattern: /^\/v1\/review-drafts\/changes$/,
     authRequired: true,
@@ -1461,14 +1467,35 @@ const routes: readonly RouteDefinition[] = [
       const vaultRoot = requireVaultRoot(context);
       const url = new URL(request.url ?? '/', 'http://127.0.0.1');
       const sinceParam = url.searchParams.get('since') ?? undefined;
-      const sinceMs = sinceParam === undefined ? null : Number.parseInt(sinceParam, 10);
-      const safeSince = sinceMs === null || !Number.isFinite(sinceMs) ? null : sinceMs;
-      const items = await listReviewDrafts(vaultRoot, safeSince);
-      const maxUpdatedAtMs = items.reduce((max, item) => Math.max(max, item.updatedAtMs), safeSince ?? 0);
+      const sinceSeq = sinceParam === undefined ? 0 : Number.parseInt(sinceParam, 10);
+      const safeSince = Number.isFinite(sinceSeq) && sinceSeq >= 0 ? sinceSeq : 0;
+      // Preferred path: read from the local monotonic change feed.
+      if (context.projectionChanges !== undefined) {
+        const result = await context.projectionChanges.readSince(safeSince);
+        const filtered = result.changed.filter(
+          (change) => change.aggregate === 'review-draft',
+        );
+        return [
+          200,
+          {
+            cursor: String(result.cursor),
+            changed: filtered.map((change) => ({
+              threadId: change.aggregateId,
+              vector: change.vector,
+              kind: change.kind,
+              localWrittenAtMs: change.localWrittenAtMs,
+            })),
+          },
+        ];
+      }
+      // Legacy fallback for tests that don't wire a feed: scan the
+      // projection directory. Cursor here is best-effort and may not
+      // be monotonic across hosts; documented as such.
+      const items = await listReviewDrafts(vaultRoot, null);
       return [
         200,
         {
-          cursor: String(maxUpdatedAtMs),
+          cursor: '0',
           changed: items.map((item) => ({
             threadId: item.threadId,
             vector: item.vector,
@@ -1547,19 +1574,78 @@ const routes: readonly RouteDefinition[] = [
         } else {
           await writeReviewDraft(vaultRoot, threadId, projection);
         }
+        await context.projectionChanges
+          ?.appendChange({
+            aggregate: 'review-draft',
+            aggregateId: threadId,
+            relPath: `_BAC/review-drafts/${threadId}.json`,
+            vector: projection.vector,
+            kind: projection.discarded ? 'delete' : 'upsert',
+          })
+          .catch(() => undefined);
         return [200, { data: { accepted, projection } }];
       });
     },
   },
   {
+    // Event-sourced delete. Direct unlink is unsafe in a CRDT
+    // system: prior events still live in the log, so a rebuild (or
+    // a peer that only saw the unaccompanied delete) would
+    // resurrect the draft. Instead the route appends a
+    // `review-draft.discarded` event whose `baseVector` covers
+    // every prior event we've observed; the projection collapses to
+    // the discarded state, and the file delete becomes a side
+    // effect.
     method: 'DELETE',
     pattern: /^\/v1\/review-drafts\/(?<bacId>[A-Za-z0-9_-]+)$/,
     authRequired: true,
-    handle: async (_request, _requestId, match, context) => {
-      if (match.bacId === undefined) {
+    handle: async (request, requestId, match, context) => {
+      const threadId = match.bacId;
+      if (threadId === undefined) {
         throw new Error('Missing threadId path parameter.');
       }
-      await deleteReviewDraft(requireVaultRoot(context), match.bacId);
+      const vaultRoot = requireVaultRoot(context);
+      const eventLog = context.eventLog;
+      if (eventLog === undefined) {
+        // Legacy callers without an eventLog wired (tests) fall back
+        // to the direct unlink so we keep their behaviour.
+        await deleteReviewDraft(vaultRoot, threadId);
+        return [204, undefined];
+      }
+      // Read the current projection so the discard event observes
+      // every prior event for this thread. baseVector === current
+      // projection's vector.
+      const priorEvents = await eventLog.readByAggregate(threadId);
+      const priorReviewEvents = priorEvents.filter((event) => isReviewDraftEvent(event));
+      const priorProjection = projectReviewDraft(threadId, '', priorReviewEvents);
+      await eventLog.appendClient({
+        clientEventId: requestId,
+        aggregateId: threadId,
+        type: 'review-draft.discarded',
+        payload: { reason: 'deleted-via-http' },
+        baseVector: priorProjection.vector,
+      });
+      // Recompute and persist the new projection (collapsed to
+      // discarded). If the projection function returns null we
+      // delete the file; otherwise we write the tombstoned
+      // projection so peers still see the vector advance.
+      const merged = await eventLog.readByAggregate(threadId);
+      const reviewEvents = merged.filter((event) => isReviewDraftEvent(event));
+      const projection = projectReviewDraft(threadId, '', reviewEvents);
+      if (projection.discarded) {
+        await deleteReviewDraft(vaultRoot, threadId);
+      } else {
+        await writeReviewDraft(vaultRoot, threadId, projection);
+      }
+      await context.projectionChanges
+        ?.appendChange({
+          aggregate: 'review-draft',
+          aggregateId: threadId,
+          relPath: `_BAC/review-drafts/${threadId}.json`,
+          vector: projection.vector,
+          kind: projection.discarded ? 'delete' : 'upsert',
+        })
+        .catch(() => undefined);
       return [204, undefined];
     },
   },

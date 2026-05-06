@@ -66,6 +66,10 @@ export const reviewDraftOutbox = createOutbox<QueuedReviewDraftEvent>({
   droppedKey: REVIEW_DRAFT_DROPPED_KEY,
   defaultLimit: REVIEW_DRAFT_QUEUE_LIMIT,
   overflowPolicy: { kind: 'reject-when-full' },
+  // User-authored content: never drop after retry exhaustion. The
+  // attempts counter caps at maxAttempts so backoff stays bounded;
+  // the UI surfaces "n unsynced" until the companion accepts.
+  retryExhaustionPolicy: { kind: 'retain' },
   migrate,
 });
 

@@ -1,6 +1,10 @@
 import { WebSocket as WsWebSocket } from 'ws';
 
-import type { AcceptedEvent } from './causal.js';
+import {
+  type AcceptedEvent,
+  canonicalEventBytes,
+} from './causal.js';
+import type { KnownReplicasStore } from './knownReplicas.js';
 import {
   decodeBytes,
   decodeFrame,
@@ -14,8 +18,8 @@ import {
   openFrame,
   ReplayCache,
   sealFrame,
-  signFrame,
-  verifyFrame,
+  signCanonicalEvent,
+  verifyCanonicalEvent,
   type ReplicaKeyPair,
 } from './relayCrypto.js';
 import type { LogTransport } from './transport.js';
@@ -51,6 +55,13 @@ export interface RelayTransportOptions {
   readonly rendezvousSecret: Buffer;
   readonly localReplicaId: string;
   readonly localKeyPair: ReplicaKeyPair;
+  // Required: the trust store decides which peer replicas may
+  // contribute events. Without it the receive path would have to
+  // accept whatever public key the frame carries, which makes
+  // signatures meaningless against a peer who knows the rendezvous
+  // secret. The store implements TOFU + revocation; pass an in-
+  // memory stub for unit tests.
+  readonly knownReplicas: KnownReplicasStore;
   readonly fetchWebSocket?: (url: string) => WsWebSocket;
   readonly random?: () => number;
   readonly logger?: (level: 'info' | 'warn' | 'error', message: string) => void;
@@ -124,8 +135,6 @@ export const createRelayTransport = (options: RelayTransportOptions): LogTranspo
       log('warn', 'failed to decrypt relay frame; ignoring');
       return;
     }
-    const signature = decodeBytes(frame.signature);
-    const senderPublicKey = decodeBytes(frame.sender_public_key);
     let parsed: AcceptedEvent;
     try {
       parsed = JSON.parse(plaintext.toString('utf8')) as AcceptedEvent;
@@ -137,22 +146,50 @@ export const createRelayTransport = (options: RelayTransportOptions): LogTranspo
       log('warn', 'relay frame replica_id mismatch with payload dot.replicaId');
       return;
     }
-    const ok = verifyFrame(
-      senderPublicKey,
-      parsed.dot.replicaId,
-      parsed.dot.seq,
-      Buffer.from(JSON.stringify(parsed.payload), 'utf8'),
-      signature,
-    );
-    if (!ok) {
-      log('warn', 'relay frame signature did not verify');
-      return;
-    }
-    for (const sub of subscribers) {
-      if (sub.knownReplicas.size === 0 || sub.knownReplicas.has(parsed.dot.replicaId)) {
-        sub.onEvent(parsed.dot.replicaId, parsed);
+    const signature = decodeBytes(frame.signature);
+    void (async () => {
+      // Trust check: the frame's `sender_public_key` is advisory.
+      // The store decides which key we actually trust for this
+      // replica id (TOFU on first sight; reject on key mismatch
+      // afterwards).
+      const decision = await options.knownReplicas.admit(
+        parsed.dot.replicaId,
+        frame.sender_public_key,
+      );
+      if (decision.kind === 'reject-key-mismatch') {
+        log(
+          'warn',
+          `relay frame from ${parsed.dot.replicaId} carries a public key that does not match the stored one; dropping`,
+        );
+        return;
       }
-    }
+      if (decision.kind === 'reject-revoked') {
+        log(
+          'warn',
+          `relay frame from revoked replica ${parsed.dot.replicaId}; dropping`,
+        );
+        return;
+      }
+      // Verify against the TRUSTED key (= what the store has on
+      // record), not the embedded frame key. The two are equal in
+      // the accept branch but the assignment makes the trust source
+      // explicit. The signature scope is the canonical event bytes
+      // — clientEventId, dot, deps, aggregateId, target, type,
+      // payload, acceptedAtMs — so a peer that knows the
+      // rendezvous secret cannot tamper with any of those fields
+      // while keeping the captured signature valid.
+      const trustedPublicKey = decodeBytes(decision.record.publicKey);
+      const ok = verifyCanonicalEvent(trustedPublicKey, canonicalEventBytes(parsed), signature);
+      if (!ok) {
+        log('warn', 'relay frame signature did not verify against the trusted public key');
+        return;
+      }
+      for (const sub of subscribers) {
+        if (sub.knownReplicas.size === 0 || sub.knownReplicas.has(parsed.dot.replicaId)) {
+          sub.onEvent(parsed.dot.replicaId, parsed);
+        }
+      }
+    })().catch(() => undefined);
   };
 
   const handleFrame = (data: WsWebSocket.RawData): void => {
@@ -226,13 +263,12 @@ export const createRelayTransport = (options: RelayTransportOptions): LogTranspo
     if (replicaId !== event.dot.replicaId) {
       throw new Error('publishEvent replicaId must match event.dot.replicaId');
     }
-    const payloadBytes = Buffer.from(JSON.stringify(event.payload), 'utf8');
-    const signature = signFrame(
-      options.localKeyPair.privateKey,
-      event.dot.replicaId,
-      event.dot.seq,
-      payloadBytes,
-    );
+    // Sign over the canonical event bytes (clientEventId, dot, deps,
+    // aggregateId, target, type, payload, acceptedAtMs) so a peer
+    // who knows the rendezvous secret cannot reuse a captured
+    // signature against a tampered event.
+    const canonical = canonicalEventBytes(event);
+    const signature = signCanonicalEvent(options.localKeyPair.privateKey, canonical);
     const sealed = sealFrame(
       rendezvousKey,
       rendezvousId,

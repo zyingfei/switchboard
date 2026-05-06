@@ -614,11 +614,16 @@ const drainReviewDraftQueue = async (): Promise<void> => {
         [queued.event],
         { threadUrl: queued.threadUrl, idempotencyKey },
       );
-      // Mirror the server-stamped projection — including the new
-      // version vector — into chrome.storage so the next ClientEvent
-      // ships an up-to-date `baseVector`.
-      const { mirrorRemoteReviewDraft } = await import('../src/background/state');
-      await mirrorRemoteReviewDraft({
+      // Companion accepted the event — drop it from the per-thread
+      // pending list so subsequent ClientEvents stop chaining `deps`
+      // through it. Then mirror the server-stamped projection so the
+      // next event's `baseVector` is up to date.
+      const state = await import('../src/background/state');
+      await state.markReviewDraftEventAccepted(
+        queued.threadId,
+        queued.event.clientEventId,
+      );
+      await state.mirrorRemoteReviewDraft({
         threadId: response.projection.threadId,
         threadUrl: response.projection.threadUrl,
         vector: response.projection.vector,

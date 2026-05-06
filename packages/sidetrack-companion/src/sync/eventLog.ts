@@ -3,6 +3,8 @@ import { join } from 'node:path';
 
 import {
   type AcceptedEvent,
+  canonicalEventString,
+  type Dot,
   type Hlc,
   maxVector,
   sortAcceptedEvents,
@@ -10,6 +12,35 @@ import {
   type VersionVector,
 } from './causal.js';
 import type { ReplicaContext } from './replicaId.js';
+
+// Errors surfaced when a peer event collides with an existing event
+// under the (replicaId, seq) "dot" identity, or when a clientEventId
+// gets reused under a different dot. Either case suggests a buggy
+// or malicious peer; the runtime quarantines that replica rather
+// than persisting the event.
+export class DotCollisionError extends Error {
+  constructor(
+    readonly dot: Dot,
+    readonly storedClientEventId: string,
+    readonly incomingClientEventId: string,
+  ) {
+    super(
+      `Peer event collides on (${dot.replicaId}, ${String(dot.seq)}): existing clientEventId=${storedClientEventId}, incoming=${incomingClientEventId}`,
+    );
+  }
+}
+
+export class ClientEventIdReuseError extends Error {
+  constructor(
+    readonly clientEventId: string,
+    readonly storedDot: Dot,
+    readonly incomingDot: Dot,
+  ) {
+    super(
+      `clientEventId ${clientEventId} already bound to (${storedDot.replicaId}, ${String(storedDot.seq)}); incoming claims (${incomingDot.replicaId}, ${String(incomingDot.seq)})`,
+    );
+  }
+}
 
 // Per-replica append-only log of AcceptedEvents.
 //
@@ -56,11 +87,23 @@ export interface EventLog {
     aggregateId: string,
   ) => Promise<readonly AcceptedEvent[]>;
   readonly findByClientEventId: (clientEventId: string) => Promise<AcceptedEvent | null>;
+  readonly findByDot: (dot: Dot) => Promise<AcceptedEvent | null>;
   readonly listReplicaIds: () => Promise<readonly string[]>;
   // Persist a peer-authored event under the peer's replica subdir.
   // Used by sync transports (relay, future Syncthing-watcher) to
-  // ingest events from other replicas. Idempotent on
-  // (replicaId, clientEventId) — duplicates are a no-op.
+  // ingest events from other replicas.
+  //
+  // Strict identity rules:
+  //   1. (replicaId, seq) is a globally-unique event identity. Two
+  //      imports with the same dot must be byte-identical or the
+  //      caller throws DotCollisionError (the source replica has
+  //      diverged or is forging events).
+  //   2. clientEventId is a logical identity. Two imports with the
+  //      same clientEventId but different dots throw
+  //      ClientEventIdReuseError (a peer reusing the id under a
+  //      different dot is suspicious).
+  //   3. Byte-identical re-imports (same dot AND same content) are
+  //      no-ops — Syncthing redelivery, relay replay, etc.
   readonly importPeerEvent: (event: AcceptedEvent) => Promise<{ readonly imported: boolean }>;
 }
 
@@ -219,6 +262,15 @@ export const createEventLog = (
     return merged.find((event) => event.clientEventId === clientEventId) ?? null;
   };
 
+  const findByDot = async (dot: Dot): Promise<AcceptedEvent | null> => {
+    const merged = await readMerged();
+    return (
+      merged.find(
+        (event) => event.dot.replicaId === dot.replicaId && event.dot.seq === dot.seq,
+      ) ?? null
+    );
+  };
+
   const appendClient = <TPayload extends Record<string, unknown>>(
     input: AppendInput<TPayload>,
   ): Promise<AcceptedEvent<TPayload>> =>
@@ -261,11 +313,24 @@ export const createEventLog = (
     event: AcceptedEvent,
   ): Promise<{ readonly imported: boolean }> =>
     enqueueAppend(async () => {
+      // Refusing imports under our own replica id keeps the local
+      // shard truthful — only `appendClient` writes there.
       if (event.dot.replicaId === replica.replicaId) {
         return { imported: false } as const;
       }
-      const existing = await findByClientEventId(event.clientEventId);
-      if (existing !== null) return { imported: false } as const;
+      const byDot = await findByDot(event.dot);
+      if (byDot !== null) {
+        if (canonicalEquals(byDot, event)) {
+          return { imported: false } as const;
+        }
+        throw new DotCollisionError(event.dot, byDot.clientEventId, event.clientEventId);
+      }
+      const byClient = await findByClientEventId(event.clientEventId);
+      if (byClient !== null) {
+        // Same clientEventId arriving under a different dot: a peer
+        // is reusing the id under different identities. Reject.
+        throw new ClientEventIdReuseError(event.clientEventId, byClient.dot, event.dot);
+      }
       const dir = replicaLogDir(vaultPath, event.dot.replicaId);
       await mkdir(dir, { recursive: true });
       const at = new Date(event.acceptedAtMs);
@@ -287,10 +352,21 @@ export const createEventLog = (
     readReplica,
     readByAggregate,
     findByClientEventId,
+    findByDot,
     listReplicaIds,
     importPeerEvent,
   };
 };
+
+// Canonical event equality. Two events are "the same fact" iff
+// every field except the cosmetic `hlc` block matches byte-for-byte.
+// Used by importPeerEvent to distinguish a benign re-delivery from a
+// true dot collision. Implementation lives in `causal.ts`
+// (`canonicalEventString`) and is shared with the relay's signing
+// payload so the local equality test and the wire signature scope
+// stay in lockstep.
+const canonicalEquals = (a: AcceptedEvent, b: AcceptedEvent): boolean =>
+  canonicalEventString(a) === canonicalEventString(b);
 
 // Critical correctness rule: deps must reflect the editor's observed
 // state at edit time, NOT the companion's current frontier. Otherwise

@@ -184,3 +184,37 @@ export const sortAcceptedEvents = <T>(
     if (a.dot.replicaId > b.dot.replicaId) return 1;
     return a.dot.seq - b.dot.seq;
   });
+
+// Canonical byte representation of an AcceptedEvent. Used as the
+// signing payload (so a malicious peer with the rendezvous secret
+// cannot re-encrypt a tampered `type` / `aggregateId` / `deps`
+// while keeping the original payload signature valid) AND as the
+// equality key for byte-identical re-delivery detection.
+//
+// The HLC field is intentionally excluded — it's advisory metadata
+// the same logical event might carry slightly different values for
+// across replays without that constituting a forgery.
+export const canonicalEventBytes = (event: AcceptedEvent<unknown>): Buffer =>
+  Buffer.from(canonicalEventString(event), 'utf8');
+
+export const canonicalEventString = (event: AcceptedEvent<unknown>): string =>
+  JSON.stringify({
+    clientEventId: event.clientEventId,
+    dot: { replicaId: event.dot.replicaId, seq: event.dot.seq },
+    deps: sortedRecord(event.deps),
+    aggregateId: event.aggregateId,
+    target: event.target ?? null,
+    type: event.type,
+    payload: event.payload,
+    acceptedAtMs: event.acceptedAtMs,
+  });
+
+const sortedRecord = (
+  record: Readonly<Record<string, number>>,
+): Record<string, number> => {
+  const out: Record<string, number> = {};
+  for (const key of Object.keys(record).sort()) {
+    out[key] = record[key]!;
+  }
+  return out;
+};

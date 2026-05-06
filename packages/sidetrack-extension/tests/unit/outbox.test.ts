@@ -111,7 +111,7 @@ describe('generic outbox', () => {
     expect((await b.read(storage)).map((entry) => entry.payload.comment)).toEqual(['b']);
   });
 
-  it('drops an item after exceeding maxAttempts during drain', async () => {
+  it('drops an item after exceeding maxAttempts during drain (default policy)', async () => {
     const storage = createMemoryStorage();
     const outbox = createOutbox<DemoPayload>({
       storageKey: 'k',
@@ -134,6 +134,31 @@ describe('generic outbox', () => {
     }
     expect(await outbox.read(storage)).toEqual([]);
     expect(await outbox.readDropped(storage)).toBe(1);
+  });
+
+  it('retain policy keeps the item queued after maxAttempts; attempts cap, never drops', async () => {
+    const storage = createMemoryStorage();
+    const outbox = createOutbox<DemoPayload>({
+      storageKey: 'retain',
+      droppedKey: 'retain.dropped',
+      migrate,
+      maxAttempts: 2,
+      retryExhaustionPolicy: { kind: 'retain' },
+    });
+    await outbox.enqueue({ threadId: 't', comment: 'critical' }, storage);
+    for (let i = 0; i < 5; i += 1) {
+      await outbox.drain(
+        () => Promise.reject(new Error('offline')),
+        storage,
+        new Date(`2026-04-26T22:0${String(i)}:00.000Z`),
+        () => 0.5,
+        { ignoreBackoff: true },
+      );
+    }
+    const remaining = await outbox.read(storage);
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0]?.attempts).toBe(2);
+    expect(await outbox.readDropped(storage)).toBe(0);
   });
 
   it('migrates legacy entries that stored the payload under `event`', async () => {
