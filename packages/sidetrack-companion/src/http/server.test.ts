@@ -1885,6 +1885,78 @@ describe('companion HTTP server', () => {
     });
   });
 
+  it('GET /v1/recall/query uses hybrid lexical + vector ranking with chunk metadata', async () => {
+    // Seed two chunk-shaped entries directly so we control which one
+    // wins on lexical vs vector. The mock embedder above sets
+    // vector[i % 384] = 1 for the i-th text, so each query gets a
+    // unit vector along a different axis. Pre-built chunks all share
+    // axis-0 vectors here, making the lexical signal the
+    // distinguisher.
+    const { writeIndex } = await import('../recall/indexFile.js');
+    const { join } = await import('node:path');
+    const indexPath = join(vaultPath, '_BAC', 'recall', 'index.bin');
+    const sharedEmbedding = new Float32Array(384);
+    sharedEmbedding[0] = 1;
+    await writeIndex(
+      indexPath,
+      [
+        {
+          id: 'chunk:thread_a:0:0:111111111111',
+          threadId: 'thread_a',
+          capturedAt: '2026-05-05T01:00:00.000Z',
+          embedding: sharedEmbedding,
+          replicaId: 'local',
+          lamport: 1,
+          tombstoned: false,
+          metadata: {
+            sourceBacId: 'thread_a',
+            turnOrdinal: 0,
+            headingPath: ['Architecture'],
+            paragraphIndex: 0,
+            charStart: 0,
+            charEnd: 80,
+            textHash: 'a'.repeat(64),
+            text: 'Sidetrack uses sidetrack.threads.move to relocate threads.',
+            title: 'Architecture overview',
+          },
+        },
+        {
+          id: 'chunk:thread_b:0:0:222222222222',
+          threadId: 'thread_b',
+          capturedAt: '2026-05-05T01:00:00.000Z',
+          embedding: sharedEmbedding,
+          replicaId: 'local',
+          lamport: 1,
+          tombstoned: false,
+          metadata: {
+            sourceBacId: 'thread_b',
+            turnOrdinal: 0,
+            headingPath: ['Misc'],
+            paragraphIndex: 0,
+            charStart: 0,
+            charEnd: 60,
+            textHash: 'b'.repeat(64),
+            text: 'Unrelated commentary about CSS layout.',
+            title: 'Layout notes',
+          },
+        },
+      ],
+      'test/model',
+    );
+
+    const response = await jsonFetch(
+      context,
+      `${baseUrl}/v1/recall/query?q=${encodeURIComponent('sidetrack.threads.move')}`,
+      { headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+    expect(response.status).toBe(200);
+    const body = response.body as { readonly data: readonly { readonly id: string }[] };
+    expect(body.data.length).toBeGreaterThan(0);
+    // The verbatim-identifier chunk wins via the lexical side of
+    // the RRF fusion even though the vector signal is identical.
+    expect(body.data[0]?.id).toBe('chunk:thread_a:0:0:111111111111');
+  });
+
   it('reports recall activity after incremental indexing', async () => {
     context = {
       ...context,

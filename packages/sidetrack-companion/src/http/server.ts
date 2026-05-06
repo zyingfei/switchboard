@@ -40,7 +40,12 @@ import {
   tombstoneByThread as tombstoneByThreadRaw,
 } from '../recall/indexFile.js';
 import type { RecallLifecycle } from '../recall/lifecycle.js';
-import { rank } from '../recall/ranker.js';
+import {
+  buildLexicalIndex,
+  rank,
+  rankHybrid,
+  type HybridLexicalIndex,
+} from '../recall/ranker.js';
 import { rebuildFromEventLog } from '../recall/rebuild.js';
 import type { BucketRegistry } from '../routing/registry.js';
 import { redact } from '../safety/redaction.js';
@@ -434,6 +439,19 @@ const buildServiceInstallOptions = (context: CompanionHttpConfig): InstallOption
 
 const recallIndexPath = (vaultRoot: string): string =>
   join(vaultRoot, '_BAC', 'recall', 'index.bin');
+
+// Lexical-index cache for /v1/recall/query. Building the MiniSearch
+// index over every chunk on each request is wasteful — it only
+// changes when the on-disk index file changes. Keyed by index path
+// + mtime; a write through upsertEntries / rebuildFromEventLog
+// updates the file mtime and invalidates the cache on the next
+// query.
+interface LexicalCacheEntry {
+  readonly mtimeMs: number;
+  readonly entryCount: number;
+  readonly index: HybridLexicalIndex;
+}
+const lexicalIndexCache = new Map<string, LexicalCacheEntry>();
 
 const readWorkstreamThreadIds = async (
   vaultRoot: string,
@@ -2064,7 +2082,8 @@ const routes: readonly RouteDefinition[] = [
         limit: url.searchParams.get('limit') ?? undefined,
         workstreamId: url.searchParams.get('workstreamId') ?? undefined,
       });
-      const index = await readIndex(recallIndexPath(vaultRoot));
+      const indexFilePath = recallIndexPath(vaultRoot);
+      const index = await readIndex(indexFilePath);
       if (index === null) {
         return [200, { data: [] }];
       }
@@ -2073,12 +2092,59 @@ const routes: readonly RouteDefinition[] = [
         query.workstreamId === undefined
           ? undefined
           : await readWorkstreamThreadIds(vaultRoot, query.workstreamId);
-      const ranked = rank(queryEmbedding ?? new Float32Array(384), index.items, new Date(), {
-        limit: query.limit,
-        ...(threadIds === undefined
-          ? {}
-          : { workstreamMembership: (threadId: string) => threadIds.has(threadId) }),
-      });
+      // Resolve the lexical index from cache. If the on-disk file
+      // mtime + entry count haven't changed, reuse the prior
+      // MiniSearch instance — building it from scratch on every
+      // query is wasteful for large indexes. Falls back to vector-
+      // only ranking when the index has zero entries that carry
+      // chunk metadata (V2 holdovers post-rebuild).
+      const indexStat = await stat(indexFilePath).catch(() => undefined);
+      const indexMtime = indexStat?.mtimeMs ?? 0;
+      const cached = lexicalIndexCache.get(indexFilePath);
+      const lexical: HybridLexicalIndex =
+        cached !== undefined &&
+        cached.mtimeMs === indexMtime &&
+        cached.entryCount === index.items.length
+          ? cached.index
+          : buildLexicalIndex(index.items);
+      if (cached === undefined || cached.mtimeMs !== indexMtime || cached.entryCount !== index.items.length) {
+        lexicalIndexCache.set(indexFilePath, {
+          mtimeMs: indexMtime,
+          entryCount: index.items.length,
+          index: lexical,
+        });
+      }
+      // Hybrid lexical + vector retrieval via RRF. Falls back
+      // gracefully when the index has no chunk-metadata entries
+      // (V2 holdovers): the lexical search side returns no hits,
+      // RRF degenerates to vector ranking, which is what the
+      // pre-V3 behavior already produced.
+      const hybridRanked = rankHybrid(
+        query.q,
+        queryEmbedding ?? new Float32Array(384),
+        index.items,
+        new Date(),
+        {
+          limit: query.limit,
+          lexical,
+          ...(threadIds === undefined
+            ? {}
+            : { workstreamMembership: (threadId: string) => threadIds.has(threadId) }),
+        },
+      );
+      // If hybrid returned nothing AND the index has entries, the
+      // user still expects vector-only behavior (e.g., a query that
+      // matches nothing lexically but is semantically close). Plain
+      // `rank` is the back-compat path for that case.
+      const ranked =
+        hybridRanked.length > 0
+          ? hybridRanked
+          : rank(queryEmbedding ?? new Float32Array(384), index.items, new Date(), {
+              limit: query.limit,
+              ...(threadIds === undefined
+                ? {}
+                : { workstreamMembership: (threadId: string) => threadIds.has(threadId) }),
+            });
       // Enrich each result with the thread title + canonical URL so
       // the side panel can render meaningful labels and the SW proxy
       // can dedup across stale duplicate bac_ids that point at the
