@@ -55,4 +55,45 @@ describe('runCli', () => {
     expect(exitCode).toBe(2);
     expect(streams.stderr.text()).toContain('Missing required --vault <path>.');
   });
+
+  it('models status reports the manifest revision + cache dir without touching the network', async () => {
+    const streams = createStreams();
+    const exitCode = await runCli(['models', 'status', '--models-dir', '/tmp/sb-models-test', '--offline-models'], streams);
+    expect(exitCode).toBe(0);
+    const out = streams.stdout.text();
+    expect(out).toContain('model id');
+    expect(out).toContain('Xenova/multilingual-e5-small');
+    expect(out).toContain('cache dir    /tmp/sb-models-test');
+    expect(out).toContain('present      no');
+  });
+
+  it('models status --json produces machine-readable output', async () => {
+    const streams = createStreams();
+    const exitCode = await runCli(
+      ['models', 'status', '--models-dir', '/tmp/sb-models-test', '--offline-models', '--json'],
+      streams,
+    );
+    expect(exitCode).toBe(0);
+    const parsed = JSON.parse(streams.stdout.text()) as Record<string, unknown>;
+    expect(parsed['modelId']).toBe('Xenova/multilingual-e5-small');
+    expect(parsed['cacheDir']).toBe('/tmp/sb-models-test');
+    expect(parsed['offline']).toBe(true);
+  });
+
+  it('models with no verb prints usage and exits 2', async () => {
+    const streams = createStreams();
+    const exitCode = await runCli(['models'], streams);
+    expect(exitCode).toBe(2);
+    expect(streams.stdout.text()).toContain('Usage: sidetrack-companion models');
+  });
+
+  it('models verify on an empty cache returns 1 with a clear hint', async () => {
+    const streams = createStreams();
+    const exitCode = await runCli(
+      ['models', 'verify', '--models-dir', '/tmp/sb-models-empty', '--offline-models'],
+      streams,
+    );
+    expect(exitCode).toBe(1);
+    expect(streams.stderr.text()).toContain('model not present');
+  });
 });
