@@ -229,5 +229,11 @@ export const rebuildFromEventLog = async (
   }
 
   await upsertEntries(join(vaultRoot, '_BAC', 'recall', 'index.bin'), entries, MODEL_ID);
+  // Write the recall manifest so `recall verify` works after a
+  // lifecycle rebuild — without this the rebuild path's index file
+  // would be valid V3 but the manifest would say "not yet built".
+  // Defer the import to keep the dependency narrow.
+  const { writeRecallManifest } = await import('./ingestor.js');
+  await writeRecallManifest(vaultRoot);
   return { indexed: entries.length };
 };

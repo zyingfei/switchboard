@@ -202,4 +202,29 @@ describe('rebuildFromEventLog', () => {
       await rm(secondRoot, { recursive: true, force: true });
     }
   });
+
+  it('writes the recall manifest after a successful rebuild so `recall verify` works', async () => {
+    await writeFile(
+      join(vaultRoot, '_BAC', 'events', '2026-05-03.jsonl'),
+      JSON.stringify({
+        bac_id: 'thread_manifest',
+        capturedAt: '2026-05-03T00:00:00.000Z',
+        turns: [{ ordinal: 0, text: 'rebuild manifest test' }],
+      }) + '\n',
+      'utf8',
+    );
+    await rebuildFromEventLog(vaultRoot, join(vaultRoot, '_BAC', 'events'));
+    const manifestPath = join(vaultRoot, '_BAC', 'recall', 'manifest.json');
+    const raw = await readFile(manifestPath, 'utf8');
+    const manifest = JSON.parse(raw) as {
+      readonly indexVersion?: number;
+      readonly chunkSchemaVersion?: number;
+      readonly modelId?: string;
+      readonly modelRevision?: string;
+    };
+    expect(manifest.indexVersion).toBeGreaterThanOrEqual(3);
+    expect(manifest.chunkSchemaVersion).toBe(1);
+    expect(typeof manifest.modelId).toBe('string');
+    expect(typeof manifest.modelRevision).toBe('string');
+  });
 });
