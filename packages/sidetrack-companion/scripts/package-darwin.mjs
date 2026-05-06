@@ -1,8 +1,21 @@
 #!/usr/bin/env node
 // Sidetrack-companion macOS-first package builder.
 //
-// Produces a versioned self-contained app directory under
-// dist-packages/sidetrack-darwin-<arch>-<version>/. Layout:
+// Produces a versioned STAGED DISTRIBUTION BUNDLE under
+// dist-packages/sidetrack-darwin-<arch>-<version>/. Not a one-click
+// installer:
+//   * Wrapper scripts shell out to system `node` — embedding Node
+//     would require platform-specific bundling and bumps the
+//     bundle from ~150MB to ~250MB+.
+//   * install.sh copies the bundle into Application Support and
+//     prints (does not run) the launchd registration command. The
+//     user picks their vault path before registering the service.
+// "Staged" because every artifact the runtime needs is in the
+// bundle (companion + mcp dist, node_modules with native ONNX
+// bindings, optional model cache) — what's NOT in the bundle is a
+// system-Node-free runtime + automated launchd registration. Both
+// are deliberate scope boundaries; mention them in the README.
+// Layout:
 //
 //   bin/sidetrack-companion        wrapper script (calls system Node)
 //   bin/sidetrack-mcp              wrapper script
@@ -191,9 +204,16 @@ echo "[sidetrack] removed $DEST"
   await chmod(join(stage, 'uninstall.sh'), 0o755);
 
   // 7. README — explain layout + first-launch.
-  const readme = `# Sidetrack — macOS package (${tag})
+  const readme = `# Sidetrack — macOS staged distribution bundle (${tag})
 
-Self-contained companion + MCP server for Sidetrack ${version}.
+Staged companion + MCP server for Sidetrack ${version}.
+
+This is a **staged distribution bundle**, not a fully self-contained one-click installer:
+
+- The bin wrappers shell out to **system Node**. The bundle does not embed Node — that would balloon the artifact and require platform-specific bundling. \`node\` ≥ 20 must be on \`PATH\` (or installed via Homebrew / nvm) for the wrappers to launch.
+- \`install.sh\` copies the bundle into \`~/Library/Application Support/Sidetrack/companion/${version}/\` and **prints** (does not run) the launchd registration command. You pick the vault path explicitly, then run that command yourself.
+
+What IS in the bundle: signed wrapper scripts (when built with \`--sign\`), companion + MCP dist + node_modules including the ONNX native bindings, optionally a prewarmed embedding-model cache, and install.sh / uninstall.sh helpers.
 
 ## Install
 
