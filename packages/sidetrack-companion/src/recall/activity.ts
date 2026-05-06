@@ -14,7 +14,7 @@ export interface RecallActivityEvent {
   readonly queryLength?: number;
   readonly resultCount?: number;
   readonly threadId?: string;
-  readonly reason?: 'startup' | 'manual' | 'reconnect';
+  readonly reason?: 'startup' | 'manual' | 'reconnect' | 'drift';
   readonly error?: string;
 }
 
@@ -34,7 +34,7 @@ export interface RecallActivityTracker {
     readonly count: number;
     readonly threadIds: readonly string[];
   }) => void;
-  readonly recordRebuildStarted: (reason: 'startup' | 'manual' | 'reconnect') => void;
+  readonly recordRebuildStarted: (reason: 'startup' | 'manual' | 'reconnect' | 'drift') => void;
   readonly recordRebuildFinished: (count: number) => void;
   readonly recordRebuildFailed: (error: string) => void;
   readonly recordQuery: (input: {

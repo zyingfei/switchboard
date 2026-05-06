@@ -30,6 +30,14 @@ import type {
   WorkstreamUpdate,
 } from '../src/companion/model';
 import { drainQueue, enqueueCapture } from '../src/companion/queue';
+import {
+  postReviewDraftEvents,
+  fetchReviewDraft,
+  fetchReviewDraftChanges,
+  type ReviewDraftClientConfig,
+} from '../src/review/draftClient';
+import { drainReviewDraftOutbox } from '../src/review/outbox';
+import { createVaultChangesClient } from '../src/companion/vaultChanges';
 import { createRecallClient } from '../src/companion/recallClient';
 import { buildReviewFollowUpText } from '../src/review/draft';
 import type { ReviewDraft } from '../src/review/types';
@@ -92,6 +100,7 @@ import {
   appendReviewDraftSpan as persistReviewDraftSpan,
   dropReviewDraftSpan,
   updateReviewDraft,
+  setReviewDraftSpanComment,
   discardReviewDraft,
   readReviewDrafts,
   setDispatchArchived,
@@ -582,6 +591,54 @@ const captureTab = async (): Promise<void> => {
   }
 };
 
+const draftClientFromSettings = (settings: { companion: CompanionSettings }):
+  | ReviewDraftClientConfig
+  | null => {
+  const bridgeKey = settings.companion.bridgeKey.trim();
+  if (bridgeKey.length === 0) return null;
+  return {
+    companionUrl: `http://127.0.0.1:${String(settings.companion.port)}`,
+    bridgeKey,
+  };
+};
+
+const drainReviewDraftQueue = async (): Promise<void> => {
+  const settings = await readSettings();
+  const config = draftClientFromSettings(settings);
+  if (config === null) return;
+  await drainReviewDraftOutbox(
+    async (queued, idempotencyKey) => {
+      const response = await postReviewDraftEvents(
+        config,
+        queued.threadId,
+        [queued.event],
+        { threadUrl: queued.threadUrl, idempotencyKey },
+      );
+      // Mirror the server-stamped projection — including the new
+      // version vector — into chrome.storage so the next ClientEvent
+      // ships an up-to-date `baseVector`.
+      const { mirrorRemoteReviewDraft } = await import('../src/background/state');
+      await mirrorRemoteReviewDraft({
+        threadId: response.projection.threadId,
+        threadUrl: response.projection.threadUrl,
+        vector: response.projection.vector,
+        spans: response.projection.spans.map((span) => ({
+          spanId: span.spanId,
+          anchor: span.anchor,
+          quote: span.quote,
+          comment: span.comment,
+          capturedAt: span.capturedAt,
+        })),
+        overall: response.projection.overall,
+        verdict: response.projection.verdict,
+        discarded: response.projection.discarded,
+        updatedAtMs: response.projection.updatedAtMs,
+      });
+    },
+    { ignoreBackoff: true },
+  );
+};
+
 const replayQueuedCaptures = async (): Promise<void> => {
   const settings = await readSettings();
   if (settings.companion.bridgeKey.length === 0) {
@@ -603,6 +660,8 @@ const replayQueuedCaptures = async (): Promise<void> => {
     undefined,
     { ignoreBackoff: true },
   );
+  // Same reconnect signal — drain queued review-draft mutations.
+  await drainReviewDraftQueue().catch(() => undefined);
 };
 
 const isCompanionConfigured = async (): Promise<boolean> => {
@@ -2151,6 +2210,12 @@ const handleRequest = async (
     }, 'mutation');
   }
 
+  if (request.type === messageTypes.setReviewDraftSpanComment) {
+    return await withCompanionStatus(async () => {
+      await setReviewDraftSpanComment(request.threadId, request.spanId, request.comment);
+    }, 'mutation');
+  }
+
   if (request.type === messageTypes.discardReviewDraft) {
     return await withCompanionStatus(async () => {
       await discardReviewDraft(request.threadId);
@@ -2447,6 +2512,116 @@ export default defineBackground(() => {
   );
 
   void replayQueuedCaptures().catch(() => undefined);
+
+  // Long-lived SSE consumer for /v1/vault/changes. Lazy: subscribers
+  // (review-drafts here, more in future phases) drive the connection
+  // open/close lifecycle. The client retries with backoff so a brief
+  // companion downtime self-heals on reconnect.
+  const reviewDraftsSse = createVaultChangesClient({
+    resolveCompanion: () => {
+      try {
+        const cached = (globalThis as unknown as {
+          __sidetrackCachedCompanion?: ReviewDraftClientConfig | null;
+        }).__sidetrackCachedCompanion;
+        if (cached === null || cached === undefined) return null;
+        return { url: cached.companionUrl, bridgeKey: cached.bridgeKey };
+      } catch {
+        return null;
+      }
+    },
+  });
+  // Refresh the cache periodically; this is a coarse mechanism that
+  // only fires when there is a subscriber, so it doesn't pin the
+  // service worker awake.
+  const refreshCompanionCache = async (): Promise<void> => {
+    const settings = await readSettings();
+    const cached = draftClientFromSettings(settings);
+    (globalThis as unknown as {
+      __sidetrackCachedCompanion?: ReviewDraftClientConfig | null;
+    }).__sidetrackCachedCompanion = cached;
+  };
+  void refreshCompanionCache();
+  reviewDraftsSse.subscribe({
+    prefix: '_BAC/review-drafts/',
+    onEvent: (event) => {
+      // relPath shape: `_BAC/review-drafts/<threadId>.json`.
+      const match = /^_BAC\/review-drafts\/(?<threadId>[^/]+?)\.json$/.exec(event.relPath);
+      const threadId = match?.groups?.threadId;
+      if (threadId === undefined) return;
+      void (async () => {
+        await refreshCompanionCache();
+        const cached = (globalThis as unknown as {
+          __sidetrackCachedCompanion?: ReviewDraftClientConfig | null;
+        }).__sidetrackCachedCompanion;
+        if (cached === null || cached === undefined) return;
+        if (event.type === 'deleted') {
+          const { removeRemoteReviewDraft } = await import('../src/background/state');
+          await removeRemoteReviewDraft(threadId);
+          return;
+        }
+        const projection = await fetchReviewDraft(cached, threadId).catch(() => null);
+        if (projection === null) return;
+        const { mirrorRemoteReviewDraft } = await import('../src/background/state');
+        await mirrorRemoteReviewDraft({
+          threadId: projection.threadId,
+          threadUrl: projection.threadUrl,
+          vector: projection.vector,
+          spans: projection.spans.map((span) => ({
+            spanId: span.spanId,
+            anchor: span.anchor,
+            quote: span.quote,
+            comment: span.comment,
+            capturedAt: span.capturedAt,
+          })),
+          overall: projection.overall,
+          verdict: projection.verdict,
+          discarded: projection.discarded,
+          updatedAtMs: projection.updatedAtMs,
+        });
+      })().catch(() => undefined);
+    },
+    onReconcile: () => {
+      void refreshCompanionCache();
+      void drainReviewDraftQueue().catch(() => undefined);
+      // After a reconnect, walk the cursor feed so any peer event
+      // that landed while we were disconnected is reflected in the
+      // local projection cache. The SSE stream covers events after
+      // reconnect; this fills the gap before reconnect.
+      void (async () => {
+        const cached = (globalThis as unknown as {
+          __sidetrackCachedCompanion?: ReviewDraftClientConfig | null;
+        }).__sidetrackCachedCompanion;
+        if (cached === null || cached === undefined) return;
+        try {
+          const response = await fetchReviewDraftChanges(cached, null);
+          for (const change of response.changed) {
+            const projection = await fetchReviewDraft(cached, change.threadId).catch(() => null);
+            if (projection === null) continue;
+            const { mirrorRemoteReviewDraft } = await import('../src/background/state');
+            await mirrorRemoteReviewDraft({
+              threadId: projection.threadId,
+              threadUrl: projection.threadUrl,
+              vector: projection.vector,
+              spans: projection.spans.map((span) => ({
+                spanId: span.spanId,
+                anchor: span.anchor,
+                quote: span.quote,
+                comment: span.comment,
+                capturedAt: span.capturedAt,
+              })),
+              overall: projection.overall,
+              verdict: projection.verdict,
+              discarded: projection.discarded,
+              updatedAtMs: projection.updatedAtMs,
+            });
+          }
+        } catch {
+          // Swallowed — reconnect retry will pick up if companion
+          // settings changed. The SSE loop continues.
+        }
+      })().catch(() => undefined);
+    },
+  });
 
   return { name: 'sidetrack-background' };
 });

@@ -96,6 +96,7 @@ export const messageTypes = {
   appendReviewDraftSpan: 'sidetrack.review.draft.appendSpan',
   dropReviewDraftSpan: 'sidetrack.review.draft.dropSpan',
   updateReviewDraft: 'sidetrack.review.draft.update',
+  setReviewDraftSpanComment: 'sidetrack.review.draft.setSpanComment',
   discardReviewDraft: 'sidetrack.review.draft.discard',
   sendReviewDraftAsFollowUp: 'sidetrack.review.draft.sendAsFollowUp',
   // Recent Dispatches lifecycle: archive hides a row from the default
@@ -377,6 +378,12 @@ export type WorkboardRequest =
       readonly threadId: string;
       readonly overall?: string;
       readonly verdict?: ReviewVerdict;
+    }
+  | {
+      readonly type: typeof messageTypes.setReviewDraftSpanComment;
+      readonly threadId: string;
+      readonly spanId: string;
+      readonly comment: string;
     }
   | {
       readonly type: typeof messageTypes.discardReviewDraft;
@@ -691,6 +698,14 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
 
   if (hasType(value, messageTypes.updateReviewDraft)) {
     return typeof value.threadId === 'string';
+  }
+
+  if (hasType(value, messageTypes.setReviewDraftSpanComment)) {
+    return (
+      typeof value.threadId === 'string' &&
+      typeof value.spanId === 'string' &&
+      typeof value.comment === 'string'
+    );
   }
 
   if (hasType(value, messageTypes.discardReviewDraft)) {

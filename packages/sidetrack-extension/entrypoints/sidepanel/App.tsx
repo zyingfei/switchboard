@@ -2283,6 +2283,21 @@ const App = () => {
     void runAction(() => sendRequest({ type: messageTypes.updateReviewDraft, threadId, ...patch }));
   };
 
+  const setReviewDraftSpanComment = (
+    threadId: string,
+    spanId: string,
+    comment: string,
+  ) => {
+    void runAction(() =>
+      sendRequest({
+        type: messageTypes.setReviewDraftSpanComment,
+        threadId,
+        spanId,
+        comment,
+      }),
+    );
+  };
+
   // Two ways to ship the staged draft. Both bundle into the queue
   // template + clear the draft. Difference is whether the per-thread
   // auto-send chip flips on. Footer expansion state stays put — the
@@ -3028,6 +3043,9 @@ const App = () => {
               }}
               onUpdate={(patch) => {
                 updateInlineReviewDraft(thread.bac_id, patch);
+              }}
+              onSetSpanComment={(spanId, comment) => {
+                setReviewDraftSpanComment(thread.bac_id, spanId, comment);
               }}
               onAddToQueue={() => {
                 addInlineReviewToQueue(thread.bac_id);

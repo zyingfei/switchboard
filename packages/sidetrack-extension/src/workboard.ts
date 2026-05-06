@@ -245,6 +245,11 @@ export interface WorkboardState {
   // the thread row; cleared when the user sends-as-follow-up, saves
   // to vault, or discards.
   readonly reviewDrafts: Readonly<Partial<Record<string, ReviewDraft>>>;
+  // Number of review-draft mutations queued for the companion that
+  // haven't drained yet. Drives the "n unsynced" pill so the user
+  // sees when a comment they made is still local-only.
+  readonly queuedReviewDraftCount: number;
+  readonly droppedReviewDraftCount: number;
   readonly lastError?: string;
   readonly updatedAt: string;
 }
@@ -353,6 +358,8 @@ export const createEmptyWorkboardState = (
   dispatchDiagnostics: [],
   lastDispatchTargetByThread: {},
   reviewDrafts: {},
+  queuedReviewDraftCount: 0,
+  droppedReviewDraftCount: 0,
   updatedAt: new Date().toISOString(),
   ...overrides,
 });

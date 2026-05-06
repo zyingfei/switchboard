@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ensureMcpAuthKey } from './auth/mcpAuthKey.js';
 import { pickInstaller } from './install/index.js';
 import { startCompanion } from './runtime/companion.js';
+import { startRelayServer } from './sync/relayServer.js';
 import { COMPANION_VERSION } from './version.js';
 
 export const companionVersion = COMPANION_VERSION;
@@ -36,6 +37,16 @@ interface ParsedArgs {
   readonly mcpPort?: number;
   readonly mcpAuthKey?: string;
   readonly mcpBin?: string;
+  // Optional cloud relay. When both --sync-relay and
+  // --sync-rendezvous-secret are set, the companion connects to the
+  // relay over WebSocket using end-to-end encrypted frames so peer
+  // replicas can sync without a shared filesystem.
+  readonly syncRelay?: string;
+  readonly syncRendezvousSecret?: string;
+  // Subcommand: `sidetrack-companion relay --port 8443` runs the
+  // bundled relay server (no vault, no companion API).
+  readonly relayMode: boolean;
+  readonly relayPort?: number;
 }
 
 export const renderHelp = (): string =>
@@ -53,6 +64,8 @@ export const renderHelp = (): string =>
     '  sidetrack-companion --vault <path> [--port 17373] [--allow-auto-update]',
     '                      [--mcp-port <port> --mcp-auth-key <key>]',
     '                      [--mcp-bin <path>]',
+    '                      [--sync-relay <wss://...> --sync-rendezvous-secret <base64url>]',
+    '  sidetrack-companion relay [--relay-port 8443]',
     '',
     'Starts the localhost companion API and writes Sidetrack-owned files under _BAC/.',
     '',
@@ -61,6 +74,18 @@ export const renderHelp = (): string =>
     "server shares the companion's lifetime; killing the companion kills it too.",
     'Override the binary path with --mcp-bin if the sibling layout differs',
     '(default: ../sidetrack-mcp/dist/cli.js relative to this CLI).',
+    '',
+    'Sync relay (optional, end-to-end encrypted):',
+    '  --sync-relay <wss://...>          WebSocket URL of a sidetrack relay.',
+    '  --sync-rendezvous-secret <bytes>  Base64url-encoded shared secret.',
+    "                                    Paste the SAME secret into every replica that should",
+    "                                    sync. The relay never sees plaintext — peers decrypt",
+    "                                    via the secret-derived AEAD key locally.",
+    '',
+    'Relay subcommand:',
+    '  sidetrack-companion relay [--relay-port 8443]',
+    '    Run the bundled relay server. Stateless ring-buffer fanout; restart wipes',
+    '    every rendezvous. Front with a TLS reverse proxy for wss:// access.',
   ].join('\n');
 
 const writeLine = (stream: Writable, text: string): void => {
@@ -81,6 +106,9 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
   let mcpPort: number | undefined;
   let mcpAuthKey: string | undefined;
   let mcpBin: string | undefined;
+  let syncRelay: string | undefined;
+  let syncRendezvousSecret: string | undefined;
+  let relayPort: number | undefined;
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -119,6 +147,33 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
       }
       mcpBin = value;
       index += 1;
+      continue;
+    }
+
+    if (arg === '--sync-relay') {
+      const value = argv[index + 1];
+      if (value === undefined || value.length === 0) {
+        throw new Error('--sync-relay requires a non-empty URL.');
+      }
+      syncRelay = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--sync-rendezvous-secret') {
+      const value = argv[index + 1];
+      if (value === undefined || value.length === 0) {
+        throw new Error('--sync-rendezvous-secret requires a non-empty value.');
+      }
+      syncRendezvousSecret = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--relay-port') {
+      relayPort = parsePortArg(argv[index + 1], '--relay-port');
+      index += 1;
+      continue;
     }
   }
 
@@ -129,10 +184,14 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
     uninstallService: argv.includes('--uninstall-service'),
     serviceStatus: argv.includes('--service-status'),
     allowAutoUpdate: argv.includes('--allow-auto-update'),
+    relayMode: argv.includes('relay'),
     port,
     ...(mcpPort === undefined ? {} : { mcpPort }),
     ...(mcpAuthKey === undefined ? {} : { mcpAuthKey }),
     ...(mcpBin === undefined ? {} : { mcpBin }),
+    ...(syncRelay === undefined ? {} : { syncRelay }),
+    ...(syncRendezvousSecret === undefined ? {} : { syncRendezvousSecret }),
+    ...(relayPort === undefined ? {} : { relayPort }),
   };
 
   return vaultPath === undefined ? parsed : { ...parsed, vaultPath };
@@ -204,6 +263,29 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
     return 0;
   }
 
+  if (args.relayMode) {
+    const port = args.relayPort ?? 8443;
+    const relay = await startRelayServer({ port });
+    writeLine(
+      streams.stdout,
+      `sidetrack-relay listening on http://${relay.host}:${String(relay.port)} (use a TLS reverse proxy for wss://)`,
+    );
+    return await new Promise<number>((resolve) => {
+      const shutdown = (signal: string) => {
+        writeLine(streams.stdout, `[relay] received ${signal}, shutting down`);
+        void relay.close().then(() => {
+          resolve(0);
+        });
+      };
+      process.once('SIGINT', () => {
+        shutdown('SIGINT');
+      });
+      process.once('SIGTERM', () => {
+        shutdown('SIGTERM');
+      });
+    });
+  }
+
   if (args.serviceStatus) {
     const status = await pickInstaller().status();
     writeLine(
@@ -260,11 +342,23 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
     ...(args.mcpPort !== undefined && resolvedMcpAuthKey !== undefined
       ? { mcp: { port: args.mcpPort, authKey: resolvedMcpAuthKey } }
       : {}),
+    ...(args.syncRelay !== undefined && args.syncRendezvousSecret !== undefined
+      ? {
+          relay: {
+            url: args.syncRelay,
+            rendezvousSecret: args.syncRendezvousSecret,
+          },
+        }
+      : {}),
   });
 
   writeLine(streams.stdout, `sidetrack-companion listening on ${runtime.url}`);
   writeLine(streams.stdout, `vault           ${runtime.vaultPath}`);
   writeLine(streams.stdout, `bridge key file ${runtime.bridgeKeyPath}`);
+  writeLine(streams.stdout, `replica id      ${runtime.replicaId}${runtime.replicaIdCreated ? ' (new)' : ''}`);
+  if (args.syncRelay !== undefined && args.syncRendezvousSecret !== undefined) {
+    writeLine(streams.stdout, `sync relay      ${args.syncRelay} (e2e-encrypted via rendezvous secret)`);
+  }
   writeLine(streams.stdout, `auto-update     ${args.allowAutoUpdate ? 'enabled' : 'disabled'}`);
   if (runtime.bridgeKeyCreated) {
     // First run for this vault — print the key once so the user can

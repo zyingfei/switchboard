@@ -29,6 +29,18 @@ export interface ReviewDraftSpan {
   readonly capturedAt: string;
 }
 
+// Conflict surface from the companion's causal projection. Each
+// register that came back as `status: 'conflict'` shows its
+// candidate values here so the side panel can render a picker. The
+// user's resolution choice mints a normal ClientEvent — its
+// `baseVector` covers all candidates so the projection collapses
+// back to `resolved` everywhere.
+export interface ReviewDraftConflicts {
+  readonly overall?: { readonly candidates: readonly string[] };
+  readonly verdict?: { readonly candidates: readonly ReviewVerdict[] };
+  readonly comments?: Readonly<Partial<Record<string, { readonly candidates: readonly string[] }>>>;
+}
+
 export interface ReviewDraft {
   readonly threadId: string;
   readonly threadUrl: string;
@@ -36,6 +48,7 @@ export interface ReviewDraft {
   readonly overall?: string;
   readonly verdict?: ReviewVerdict;
   readonly updatedAt: string;
+  readonly conflicts?: ReviewDraftConflicts;
 }
 
 export interface ReviewEventInput {

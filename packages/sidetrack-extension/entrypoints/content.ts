@@ -117,7 +117,7 @@ const driveAutoSend = async (
   // The page's own "New chat" sidebar link uses Next.js client-side
   // navigation to reset state without re-redirecting; clicking it
   // pre-flight is the cleanest reset.
-  if (provider === 'chatgpt' && /^\/c\//u.test(window.location.pathname)) {
+  if (provider === 'chatgpt' && window.location.pathname.startsWith("/c/")) {
     const newChatLink = document.querySelector<HTMLElement>(
       'a[data-testid="create-new-chat-button"]',
     );

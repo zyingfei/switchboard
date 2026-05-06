@@ -52,8 +52,25 @@ export interface HealthReport {
     readonly embedderDevice?: 'cpu' | 'wasm' | 'webgpu' | 'unknown';
     readonly embedderAccelerator?: 'accelerate' | 'mkl' | 'cpu' | 'unknown';
     readonly activity?: RecallActivityReport;
+    // Quantitative coverage metric. `pct` is `1 - liveEntryCount /
+    // eventTurnCount` when the index lags the event log, else 0.
+    // `tolerance` is the threshold at which the lifecycle flips to
+    // 'stale' and schedules a rebuild.
+    readonly drift?: {
+      readonly eventTurnCount: number;
+      readonly entryCount: number;
+      readonly pct: number;
+      readonly tolerance: number;
+    };
   };
   readonly service: { readonly installed: boolean; readonly running: boolean };
+  // Identity of the local replica + its Lamport high-water mark.
+  // Optional so legacy / test call-sites that don't wire a replica
+  // context still produce a valid health report.
+  readonly sync?: {
+    readonly replicaId: string;
+    readonly seq: number;
+  };
 }
 
 export interface HealthDeps {
@@ -65,6 +82,7 @@ export interface HealthDeps {
   readonly captureSummary: () => Promise<HealthReport['capture']>;
   readonly recallSummary: () => Promise<HealthReport['recall']>;
   readonly serviceStatus: () => Promise<HealthReport['service']>;
+  readonly syncSummary?: () => HealthReport['sync'];
 }
 
 // Per-operation timeout. The 250ms cap that lived here originally
@@ -108,11 +126,13 @@ export const collectHealth = async (deps: HealthDeps): Promise<HealthReport> => 
     ),
     withBudget(deps.serviceStatus, { installed: false, running: false }),
   ]);
+  const sync = deps.syncSummary?.();
   return {
     uptimeSec: Math.max(0, Math.floor((now.getTime() - deps.startedAt.getTime()) / 1000)),
     vault: { root: deps.vaultRoot, writable, sizeBytes },
     capture,
     recall,
     service,
+    ...(sync === undefined ? {} : { sync }),
   };
 };
