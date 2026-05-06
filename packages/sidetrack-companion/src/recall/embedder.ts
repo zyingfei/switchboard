@@ -46,6 +46,24 @@ type FeatureExtractor = (
   options: { readonly pooling: 'mean'; readonly normalize: true },
 ) => Promise<{ readonly data: ArrayLike<number> }>;
 
+// Thrown by getEmbedder() when the loader cannot reach a usable
+// model file. Most often this is the offline + empty-cache case
+// (`SIDETRACK_OFFLINE_MODELS=1` / `--offline-models` with no
+// pre-warmed cache), but it also catches transient HF / disk
+// failures so the recall query route can map them to a typed
+// 503 RECALL_MODEL_MISSING instead of a generic 500.
+export class RecallModelMissingError extends Error {
+  readonly code = 'RECALL_MODEL_MISSING' as const;
+  constructor(
+    message: string,
+    readonly offline: boolean,
+    readonly cacheDir: string,
+  ) {
+    super(message);
+    this.name = 'RecallModelMissingError';
+  }
+}
+
 // Identifies which runtime backend the model loaded onto. Surfaced
 // in /v1/system/health.recall.embedderDevice so the side panel can
 // show the user "embedder: cpu (Accelerate)" vs "wasm" — useful
@@ -92,22 +110,23 @@ const log = (message: string): void => {
 export const getEmbedder = async (): Promise<FeatureExtractor> => {
   if (extractorPromise === undefined) {
     const started = performance.now();
+    const offlineAtLoad = isOfflineMode();
+    const cacheDirAtLoad = resolveModelsDir();
     extractorPromise = (async () => {
       const module = await import('@huggingface/transformers');
       const env = (module as { readonly env?: Record<string, unknown> }).env;
       if (env !== undefined) {
-        const offline = isOfflineMode();
         // In offline mode we deny remote fetches; the embedder
         // throws if the cache is empty and the lifecycle reports
         // RECALL_MODEL_MISSING. In normal mode we allow downloads.
-        env['allowRemoteModels'] = !offline;
+        env['allowRemoteModels'] = !offlineAtLoad;
         env['allowLocalModels'] = false;
         env['useFSCache'] = true;
         // Sidetrack-managed model directory. The default still
         // honors HF_HOME / HF_HUB_CACHE if set, but we point
         // transformers.js at the product-owned tree so packaging
         // can prewarm + ship a self-contained app.
-        env['cacheDir'] = resolveModelsDir();
+        env['cacheDir'] = cacheDirAtLoad;
       }
       // `device: 'cpu'` selects onnxruntime-node which on macOS uses
       // Apple Accelerate.
@@ -147,12 +166,46 @@ export const getEmbedder = async (): Promise<FeatureExtractor> => {
           );
         }
       }
+      // No dtype loaded. In offline mode this almost always means
+      // the cache is empty (or partially-warmed for the wrong dtype
+      // set), so surface a typed RecallModelMissingError that the
+      // HTTP layer can map to 503 RECALL_MODEL_MISSING. We also use
+      // it for non-offline failures whose error text suggests the
+      // model is the missing piece — broader than ENOENT because
+      // transformers.js wraps that in a longer message.
+      const joined = errors.join(' | ');
+      const looksLikeModelMissing =
+        offlineAtLoad ||
+        /no such file|ENOENT|Could not locate|failed to fetch|Could not load model|404/i.test(
+          joined,
+        );
+      if (looksLikeModelMissing) {
+        // Reset the cached promise so a later call (e.g. after the
+        // user runs `models ensure` to pre-warm the cache) gets a
+        // fresh attempt instead of replaying the failure forever.
+        extractorPromise = undefined;
+        throw new RecallModelMissingError(
+          `[recall] embedding model ${MODEL_ID} is not available (offline=${String(offlineAtLoad)}, cacheDir=${cacheDirAtLoad}). Tried: ${joined}`,
+          offlineAtLoad,
+          cacheDirAtLoad,
+        );
+      }
       throw new Error(
-        `[recall] could not load ${MODEL_ID} on any dtype. Tried: ${errors.join(' | ')}`,
+        `[recall] could not load ${MODEL_ID} on any dtype. Tried: ${joined}`,
       );
     })();
   }
-  return await extractorPromise;
+  try {
+    return await extractorPromise;
+  } catch (error) {
+    // Same reset — a one-shot failure shouldn't poison every later
+    // call. The retry contract: the next `getEmbedder()` call after
+    // a model-missing failure restarts the loader.
+    if (error instanceof RecallModelMissingError) {
+      extractorPromise = undefined;
+    }
+    throw error;
+  }
 };
 
 const toFloat32 = (data: ArrayLike<number>): Float32Array => {

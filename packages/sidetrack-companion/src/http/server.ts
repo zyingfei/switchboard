@@ -16,7 +16,7 @@ import { pickInstaller, type Installer, type InstallOptions } from '../install/i
 import { exportSettings } from '../portability/exportBundle.js';
 import { importSettings } from '../portability/importBundle.js';
 import type { RecallActivityTracker } from '../recall/activity.js';
-import { embed, MODEL_ID } from '../recall/embedder.js';
+import { embed, MODEL_ID, RecallModelMissingError } from '../recall/embedder.js';
 import { CAPTURE_RECORDED } from '../recall/events.js';
 import { getModelCacheStatus } from '../recall/modelCache.js';
 import { THREAD_ARCHIVED, THREAD_UNARCHIVED, THREAD_UPSERTED } from '../threads/events.js';
@@ -2087,7 +2087,33 @@ const routes: readonly RouteDefinition[] = [
       if (index === null) {
         return [200, { data: [] }];
       }
-      const [queryEmbedding] = await embed([query.q]);
+      // Embedding the query needs the local model. In offline mode
+      // with an empty cache (or any other "we can't load the model"
+      // failure path), the embedder throws RecallModelMissingError —
+      // surface that as a typed 503 so the side panel can show a
+      // distinct "model missing" affordance instead of a generic
+      // "recall failed". Capture continues to work in that state
+      // because POST /v1/events doesn't depend on the embedder.
+      let queryEmbedding: Float32Array | undefined;
+      try {
+        [queryEmbedding] = await embed([query.q]);
+      } catch (error) {
+        if (error instanceof RecallModelMissingError) {
+          return [
+            503,
+            createProblem({
+              title: 'Recall embedding model is not available',
+              status: 503,
+              code: 'RECALL_MODEL_MISSING',
+              correlationId: createRequestId(),
+              detail: error.offline
+                ? `Companion is in offline-models mode and the cache at ${error.cacheDir} does not contain ${MODEL_ID}. Run \`sidetrack-companion models ensure\` (with network access) or disable --offline-models / SIDETRACK_OFFLINE_MODELS.`
+                : `Could not load ${MODEL_ID} from ${error.cacheDir}. Run \`sidetrack-companion models ensure\` to (re)download the model.`,
+            }),
+          ];
+        }
+        throw error;
+      }
       const threadIds =
         query.workstreamId === undefined
           ? undefined

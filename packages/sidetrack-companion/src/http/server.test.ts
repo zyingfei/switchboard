@@ -15,17 +15,46 @@ import { createVaultWriter } from '../vault/writer.js';
 import { createIdempotencyStore } from './idempotency.js';
 import { handleRequest, type CompanionHttpConfig } from './server.js';
 
-vi.mock('../recall/embedder.js', () => ({
-  MODEL_ID: 'test/model',
-  embed: (texts: readonly string[]) =>
-    Promise.resolve(
-      texts.map((_text, index) => {
-        const vector = new Float32Array(384);
-        vector[index % 384] = 1;
-        return vector;
-      }),
-    ),
-}));
+// Embedder mock with a swappable `nextEmbedError` so individual tests
+// can simulate the offline + empty-cache failure mode (the 503
+// RECALL_MODEL_MISSING path) without touching a real model. The
+// factory builds a stand-in for RecallModelMissingError that
+// matches the production class shape — server.ts uses `instanceof`
+// against the import from '../recall/embedder.js', which inside
+// vitest resolves through this mock so the identity matches.
+vi.mock('../recall/embedder.js', () => {
+  class RecallModelMissingError extends Error {
+    readonly code = 'RECALL_MODEL_MISSING' as const;
+    constructor(
+      message: string,
+      readonly offline: boolean,
+      readonly cacheDir: string,
+    ) {
+      super(message);
+      this.name = 'RecallModelMissingError';
+    }
+  }
+  const state: { nextEmbedError: Error | null } = { nextEmbedError: null };
+  return {
+    MODEL_ID: 'test/model',
+    RecallModelMissingError,
+    __embedderState: state,
+    embed: (texts: readonly string[]) => {
+      if (state.nextEmbedError !== null) {
+        const err = state.nextEmbedError;
+        state.nextEmbedError = null;
+        return Promise.reject(err);
+      }
+      return Promise.resolve(
+        texts.map((_text, index) => {
+          const vector = new Float32Array(384);
+          vector[index % 384] = 1;
+          return vector;
+        }),
+      );
+    },
+  };
+});
 
 const jsonFetch = async (
   context: CompanionHttpConfig,
@@ -1955,6 +1984,65 @@ describe('companion HTTP server', () => {
     // The verbatim-identifier chunk wins via the lexical side of
     // the RRF fusion even though the vector signal is identical.
     expect(body.data[0]?.id).toBe('chunk:thread_a:0:0:111111111111');
+  });
+
+  it('GET /v1/recall/query returns 503 RECALL_MODEL_MISSING when the embedder cannot load the model', async () => {
+    // Seed a non-empty index so the route reaches the embed() call
+    // (it short-circuits to data:[] when the index file is missing).
+    const { writeIndex } = await import('../recall/indexFile.js');
+    const { join } = await import('node:path');
+    const seedEmbedding = new Float32Array(384);
+    seedEmbedding[0] = 1;
+    await writeIndex(
+      join(vaultPath, '_BAC', 'recall', 'index.bin'),
+      [
+        {
+          id: 'chunk:thread_seed:0:0:333333333333',
+          threadId: 'thread_seed',
+          capturedAt: '2026-05-05T01:00:00.000Z',
+          embedding: seedEmbedding,
+          replicaId: 'local',
+          lamport: 1,
+          tombstoned: false,
+          metadata: {
+            sourceBacId: 'thread_seed',
+            turnOrdinal: 0,
+            headingPath: [],
+            paragraphIndex: 0,
+            charStart: 0,
+            charEnd: 8,
+            textHash: 'c'.repeat(64),
+            text: 'placeholder',
+            title: 'placeholder',
+          },
+        },
+      ],
+      'test/model',
+    );
+    const embedderModule = (await import('../recall/embedder.js')) as unknown as {
+      readonly RecallModelMissingError: new (
+        message: string,
+        offline: boolean,
+        cacheDir: string,
+      ) => Error;
+      readonly __embedderState: { nextEmbedError: Error | null };
+    };
+    embedderModule.__embedderState.nextEmbedError = new embedderModule.RecallModelMissingError(
+      'cache empty',
+      true,
+      '/tmp/empty-models',
+    );
+    const response = await jsonFetch(context, `${baseUrl}/v1/recall/query?q=anything`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect(response.status).toBe(503);
+    const body = response.body as {
+      readonly code?: string;
+      readonly title?: string;
+      readonly detail?: string;
+    };
+    expect(body.code).toBe('RECALL_MODEL_MISSING');
+    expect(body.detail).toContain('/tmp/empty-models');
   });
 
   it('reports recall activity after incremental indexing', async () => {
