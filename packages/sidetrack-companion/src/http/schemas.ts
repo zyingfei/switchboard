@@ -45,9 +45,13 @@ export const serializedAnchorSchema = z.object({
     prefix: z.string(),
     suffix: z.string(),
   }),
+  // Negative values mean "no position fallback" — the extension's
+  // findAnchor() short-circuits the position branch when start/end
+  // are < 0. Used by MCP-created term-scoped anchors that should
+  // refuse to fall back to a position match if the term moved.
   textPosition: z.object({
-    start: z.number().int().nonnegative(),
-    end: z.number().int().nonnegative(),
+    start: z.number().int(),
+    end: z.number().int(),
   }),
   cssSelector: z.string(),
 });
@@ -267,6 +271,20 @@ export const dispatchEventRecordSchema = dispatchEventSchema.extend({
   tokenEstimate: z.number().int().nonnegative(),
 });
 
+// Persisted record in `_BAC/dispatch-links/<YYYY-MM-DD>.jsonl`.
+// Append-only; later records for the same dispatchId override earlier
+// ones on read. Companion is the authoritative store after Phase 3
+// of the spec-aligned refactor.
+export const dispatchLinkSchema = z.object({
+  dispatchId: bacIdSchema,
+  threadId: bacIdSchema,
+  linkedAt: isoDateTimeSchema,
+});
+
+export const dispatchLinkRequestSchema = z.object({
+  threadId: bacIdSchema,
+});
+
 const providerOptInSchema = z.object({
   chatgpt: z.boolean(),
   claude: z.boolean(),
@@ -372,12 +390,58 @@ export const turnRecordSchema = z.object({
   sourceSelector: z.string().min(1).optional(),
 });
 
-export const annotationCreateSchema = z.object({
+// Two ways to create an annotation:
+//   1. Anchor-form (DOM-driven): the caller serialised a Range and
+//      sends the full anchor. Used by the side panel's per-turn
+//      composer and other in-DOM selection paths.
+//   2. Term-form (intent-driven, Phase 4): the caller provides the
+//      keyword and lets the companion compute the anchor from the
+//      thread's assistant turn body. Used by MCP-side agents — the
+//      agent doesn't have the live DOM, only the markdown turn body
+//      stored on the companion, so making the companion build the
+//      anchor avoids markdown↔DOM offset divergence on the read side.
+const annotationCreateAnchorSchema = z.object({
   url: z.url(),
   pageTitle: z.string().min(1),
   anchor: serializedAnchorSchema,
   note: z.string(),
 });
+
+// Term-form input. Either `threadId` or `url` must be present —
+// threadId is preferred (the companion looks the thread record up
+// and resolves both threadUrl + pageTitle); url is the legacy
+// shortcut for "annotate the page at this URL", used when the
+// caller has no threadId.
+const annotationSourceTurnSchema = z.union([
+  z.literal('assistant_latest'),
+  z.literal('assistant_all'),
+  z.object({ ordinal: z.number().int().nonnegative() }),
+]);
+
+const annotationAnchorPolicySchema = z.object({
+  repeatedTerm: z.enum(['first', 'require_hint']).optional(),
+  shortTermMinLength: z.number().int().positive().max(64).optional(),
+});
+
+const annotationCreateTermSchema = z
+  .object({
+    threadId: z.string().min(1).optional(),
+    url: z.url().optional(),
+    pageTitle: z.string().min(1).optional(),
+    term: z.string().min(1).max(400),
+    selectionHint: z.string().max(512).optional(),
+    sourceTurn: annotationSourceTurnSchema.optional(),
+    anchorPolicy: annotationAnchorPolicySchema.optional(),
+    note: z.string(),
+  })
+  .refine((value) => value.threadId !== undefined || value.url !== undefined, {
+    message: 'Either threadId or url is required when term is present.',
+  });
+
+export const annotationCreateSchema = z.union([
+  annotationCreateAnchorSchema,
+  annotationCreateTermSchema,
+]);
 
 export const annotationListQuerySchema = z.object({
   url: z.url().optional(),
@@ -457,11 +521,11 @@ export const bucketsPutSchema = z.object({
 export const workstreamTrustPutSchema = z.object({
   allowedTools: z.array(
     z.enum([
-      'bac.move_item',
-      'bac.queue_item',
-      'bac.bump_workstream',
-      'bac.archive_thread',
-      'bac.unarchive_thread',
+      'sidetrack.threads.move',
+      'sidetrack.queue.create',
+      'sidetrack.workstreams.bump',
+      'sidetrack.threads.archive',
+      'sidetrack.threads.unarchive',
     ]),
   ),
 });
@@ -476,6 +540,8 @@ export type ReminderUpdateInput = z.infer<typeof reminderUpdateSchema>;
 export type DispatchEventInput = z.infer<typeof dispatchEventSchema>;
 export type DispatchEventRecord = z.infer<typeof dispatchEventRecordSchema>;
 export type DispatchListQuery = z.infer<typeof dispatchListQuerySchema>;
+export type DispatchLinkRecord = z.infer<typeof dispatchLinkSchema>;
+export type DispatchLinkRequest = z.infer<typeof dispatchLinkRequestSchema>;
 export type AuditEventRecord = z.infer<typeof auditEventSchema>;
 export type AuditListQuery = z.infer<typeof auditListQuerySchema>;
 export type SettingsDocument = z.infer<typeof settingsDocumentSchema>;

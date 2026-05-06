@@ -67,13 +67,27 @@ export interface HealthDeps {
   readonly serviceStatus: () => Promise<HealthReport['service']>;
 }
 
-const withBudget = async <T>(operation: () => Promise<T>, fallback: T): Promise<T> =>
+// Per-operation timeout. The 250ms cap that lived here originally
+// was tight enough to silently force `captureSummary` and
+// `recallSummary` into their empty fallbacks on any vault with
+// multi-MB event logs — the UX was "Capture health is empty even
+// though I just captured ten things." /v1/system/health is polled
+// every ~30s, not on the request hot path, so a multi-second
+// budget is the right tradeoff.
+const FAST_OP_BUDGET_MS = 1_000;
+const HEAVY_OP_BUDGET_MS = 5_000;
+
+const withBudget = async <T>(
+  operation: () => Promise<T>,
+  fallback: T,
+  budgetMs: number = FAST_OP_BUDGET_MS,
+): Promise<T> =>
   await Promise.race([
     operation(),
     new Promise<T>((resolve) => {
       setTimeout(() => {
         resolve(fallback);
-      }, 250);
+      }, budgetMs);
     }),
   ]);
 
@@ -81,18 +95,17 @@ export const collectHealth = async (deps: HealthDeps): Promise<HealthReport> => 
   const now = deps.now?.() ?? new Date();
   const [writable, sizeBytes, capture, recall, service] = await Promise.all([
     withBudget(deps.vaultWritable, false),
-    withBudget(deps.vaultSizeBytes, null),
-    withBudget(deps.captureSummary, {
-      lastByProvider: {},
-      queueDepthHint: null,
-      droppedHint: null,
-    }),
-    withBudget(deps.recallSummary, {
-      indexExists: false,
-      entryCount: null,
-      modelId: null,
-      sizeBytes: null,
-    }),
+    withBudget(deps.vaultSizeBytes, null, HEAVY_OP_BUDGET_MS),
+    withBudget(
+      deps.captureSummary,
+      { lastByProvider: {}, queueDepthHint: null, droppedHint: null },
+      HEAVY_OP_BUDGET_MS,
+    ),
+    withBudget(
+      deps.recallSummary,
+      { indexExists: false, entryCount: null, modelId: null, sizeBytes: null },
+      HEAVY_OP_BUDGET_MS,
+    ),
     withBudget(deps.serviceStatus, { installed: false, running: false }),
   ]);
   return {

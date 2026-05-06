@@ -11,6 +11,22 @@ export interface CodingAttachProps {
   readonly workstreams: readonly { readonly bac_id: string; readonly path: string }[];
   readonly companionAvailable: boolean;
   readonly mcpEndpoint?: string;
+  readonly mcpAuthBearer?: string;
+  // Probed status of the companion-managed MCP child. The modal
+  // warns the user before they try to generate a token when the
+  // child is unreachable OR listening with the wrong auth key.
+  readonly mcpHealth?: {
+    readonly reachable: boolean;
+    readonly authAccepted: boolean;
+    readonly status: 'ok' | 'auth_failed' | 'unreachable';
+    readonly checkedAt: string;
+  };
+  // Inputs for the Codex MCP config snippets in the "Configure
+  // agent" section. All optional — when missing, the modal renders
+  // placeholders the user can fill in.
+  readonly vaultRoot?: string;
+  readonly bridgeKey?: string;
+  readonly companionPort?: number;
   readonly onCancel: () => void;
   readonly onAttached: (session: CodingSession) => void;
   readonly onCreateToken: (request: {
@@ -25,37 +41,87 @@ interface PendingAttach {
   readonly workstreamId?: string;
 }
 
+// Phase 5: collapsed attach prompt. Capable agents auto-discover
+// Sidetrack tools via tools/list and read the workstream context
+// resource via sidetrack://workstream/<id>/context. The prior 18-line
+// flow + verbose instructions front-loaded a contract the agent
+// didn't read; a 3-line core (endpoint + bearer + token) plus an
+// optional workstream resource hint conveys everything modern MCP
+// clients need.
 const buildAgentPrompt = (
   token: string,
   workstreamId: string | undefined,
   mcpEndpoint: string,
+  mcpAuthBearer: string | undefined,
 ): string =>
   [
-    '# Sidetrack coding session',
-    '',
     `sidetrack_mcp: ${mcpEndpoint}`,
+    ...(mcpAuthBearer === undefined ? [] : [`sidetrack_mcp_auth: Bearer ${mcpAuthBearer}`]),
     `sidetrack_attach_token: ${token}`,
-    workstreamId === undefined
-      ? 'sidetrack_workstream_id: (none)'
-      : `sidetrack_workstream_id: ${workstreamId}`,
-    'flow: tools/list -> bac.coding_session_register -> bac.workstream/bac.context_pack -> bac.request_dispatch',
+    ...(workstreamId === undefined
+      ? []
+      : [`sidetrack_workstream_id: ${workstreamId}`]),
     '',
-    'Use the MCP endpoint above. Register this coding session by calling bac.coding_session_register with:',
-    `- token: ${token}`,
-    '- tool: <claude_code | codex | cursor | other>',
-    '- cwd, branch, sessionId, name, and optional resumeCommand from your runtime',
-    '',
-    'After registration, fetch Sidetrack context with bac.workstream or bac.context_pack.',
-    'When you need Sidetrack to send context to a target AI, call bac.request_dispatch.',
-    'Use bac.queue_item for follow-up work after a target thread exists.',
-    'Do not ask me for them. The token is single-use and expires in 5 minutes.',
+    'Use the Sidetrack MCP server above. Call sidetrack.session.attach with the attach token, then continue with my task using Sidetrack tools when useful.',
+  ].join('\n');
+
+// Codex MCP config snippets the user can paste into ~/.codex/config.toml.
+// Streamable HTTP is preferred when the companion manages the MCP
+// child (loopback bearer auth + lifecycle linked to companion);
+// stdio is the fallback when the user starts sidetrack-mcp by hand.
+const buildCodexHttpConfigSnippet = (mcpEndpoint: string): string =>
+  [
+    '[mcp_servers.sidetrack]',
+    `url = "${mcpEndpoint}"`,
+    'bearer_token_env_var = "SIDETRACK_MCP_AUTH_KEY"',
+    'startup_timeout_sec = 20',
+    'tool_timeout_sec = 180',
+    'enabled = true',
+  ].join('\n');
+
+// stdio form: TOML doesn't expand ${ENV} inside `args`, so route
+// the call through `sh -lc` and let the shell expand
+// $SIDETRACK_BRIDGE_KEY at process spawn time. Keeps the secret
+// out of the TOML file on disk.
+const buildCodexStdioConfigSnippet = (
+  vaultRoot: string | undefined,
+  companionPort: number,
+): string => {
+  const vaultPath = vaultRoot ?? '<ABS-VAULT-PATH>';
+  const cmd = `node <ABS-PATH>/sidetrack-mcp/dist/cli.js --vault "${vaultPath}" --companion-url "http://127.0.0.1:${String(companionPort)}" --bridge-key "$SIDETRACK_BRIDGE_KEY"`;
+  return [
+    '[mcp_servers.sidetrack]',
+    'command = "sh"',
+    `args = ["-lc", "${cmd.replace(/"/g, '\\"')}"]`,
+    'startup_timeout_sec = 20',
+    'tool_timeout_sec = 180',
+    'enabled = true',
+  ].join('\n');
+};
+
+const buildCodexCliCommand = (
+  vaultRoot: string | undefined,
+  companionPort: number,
+): string =>
+  [
+    'codex mcp add sidetrack \\',
+    '  --env SIDETRACK_BRIDGE_KEY="$SIDETRACK_BRIDGE_KEY" \\',
+    '  -- node <ABS-PATH>/sidetrack-mcp/dist/cli.js \\',
+    `    --vault ${vaultRoot ?? '<ABS-VAULT-PATH>'} \\`,
+    `    --companion-url http://127.0.0.1:${String(companionPort)} \\`,
+    '    --bridge-key "$SIDETRACK_BRIDGE_KEY"',
   ].join('\n');
 
 export function CodingAttach({
   defaultWorkstreamId,
   workstreams,
   companionAvailable,
-  mcpEndpoint = 'ws://127.0.0.1:8721/mcp',
+  mcpEndpoint = 'http://127.0.0.1:8721/mcp',
+  mcpAuthBearer,
+  mcpHealth,
+  vaultRoot,
+  bridgeKey,
+  companionPort = 17_373,
   onCancel,
   onAttached,
   onCreateToken,
@@ -105,7 +171,7 @@ export function CodingAttach({
       try {
         const record = await onCreateToken(workstreamId === '' ? {} : { workstreamId });
         const token = record.token;
-        const prompt = buildAgentPrompt(token, record.workstreamId, mcpEndpoint);
+        const prompt = buildAgentPrompt(token, record.workstreamId, mcpEndpoint, mcpAuthBearer);
         try {
           await navigator.clipboard.writeText(prompt);
           setCopied(true);
@@ -158,7 +224,51 @@ export function CodingAttach({
   };
 
   const promptText =
-    pending === null ? '' : buildAgentPrompt(pending.token, pending.workstreamId, mcpEndpoint);
+    pending === null
+      ? ''
+      : buildAgentPrompt(pending.token, pending.workstreamId, mcpEndpoint, mcpAuthBearer);
+
+  const [snippetCopied, setSnippetCopied] = useState<string | null>(null);
+  const copySnippet = async (key: string, value: string): Promise<void> => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setSnippetCopied(key);
+      setTimeout(() => {
+        setSnippetCopied((current) => (current === key ? null : current));
+      }, 1500);
+    } catch {
+      // Clipboard refused (focus / permissions) — leave the
+      // textarea visible so the user can copy by hand.
+    }
+  };
+
+  const httpSnippet = buildCodexHttpConfigSnippet(mcpEndpoint);
+  const stdioSnippet = buildCodexStdioConfigSnippet(vaultRoot, companionPort);
+  const cliCommand = buildCodexCliCommand(vaultRoot, companionPort);
+  // Long-lived secrets (bridge key, MCP auth key) stay masked by
+  // default to reduce screenshot/screen-share leakage. The reveal
+  // toggle gates the actual values; the copy button reaches the
+  // real value either way.
+  const [revealSecrets, setRevealSecrets] = useState(false);
+  const buildExportEnvBlock = (mask: boolean): string => {
+    if (mcpAuthBearer === undefined && (bridgeKey === undefined || bridgeKey.length === 0)) {
+      return '# Set SIDETRACK_BRIDGE_KEY (and SIDETRACK_MCP_AUTH_KEY for HTTP) in your shell first.';
+    }
+    const display = (raw: string | undefined): string => {
+      if (raw === undefined || raw.length === 0) return '<not set>';
+      if (mask) return raw.length <= 8 ? '••••••••' : `${raw.slice(0, 4)}…${raw.slice(-2)}`;
+      return raw;
+    };
+    return [
+      '# In your shell:',
+      `export SIDETRACK_BRIDGE_KEY=${display(bridgeKey)}`,
+      ...(mcpAuthBearer === undefined
+        ? []
+        : [`export SIDETRACK_MCP_AUTH_KEY=${display(mcpAuthBearer)}`]),
+    ].join('\n');
+  };
+  const exportEnvHintDisplay = buildExportEnvBlock(!revealSecrets);
+  const exportEnvHintCopy = buildExportEnvBlock(false);
 
   return (
     <Modal
@@ -199,6 +309,113 @@ export function CodingAttach({
           Settings, then try again.
         </div>
       ) : null}
+
+      {mcpHealth !== undefined && mcpHealth.status === 'unreachable' ? (
+        <div className="banner warning">
+          Companion-managed MCP server is not responding (last checked{' '}
+          {new Date(mcpHealth.checkedAt).toLocaleTimeString()}). Restart the companion with{' '}
+          <code>--mcp-port</code> or run sidetrack-mcp by hand.
+        </div>
+      ) : null}
+      {mcpHealth !== undefined && mcpHealth.status === 'auth_failed' ? (
+        <div className="banner warning">
+          MCP server is listening but is rejecting our auth key (last checked{' '}
+          {new Date(mcpHealth.checkedAt).toLocaleTimeString()}). The persisted{' '}
+          <code>SIDETRACK_MCP_AUTH_KEY</code> in <code>_BAC/.config/mcp-auth.key</code>{' '}
+          and the value the side panel reads from <code>/v1/status</code> have drifted.
+          Restart the companion to regenerate.
+        </div>
+      ) : null}
+
+      <details className="coding-handoff-config">
+        <summary className="mono">1. Configure Sidetrack MCP in your coding agent</summary>
+        <div className="coding-handoff-config-body">
+          <p className="muted">
+            One-time setup. Streamable HTTP is recommended when the companion manages the MCP
+            child (this side panel reads its auth key from <code>/v1/status</code>). Stdio is
+            the fallback when you start <code>sidetrack-mcp</code> by hand.
+          </p>
+          <div className="coding-handoff-snippet">
+            <div className="coding-handoff-snippet-head mono">
+              <span>Shell env exports {revealSecrets ? '(revealed)' : '(masked)'}</span>
+              <div style={{ display: 'flex', gap: 4 }}>
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  onClick={() => {
+                    setRevealSecrets((current) => !current);
+                  }}
+                >
+                  {revealSecrets ? 'Hide' : 'Reveal'}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  onClick={() => {
+                    void copySnippet('env', exportEnvHintCopy);
+                  }}
+                >
+                  {snippetCopied === 'env' ? 'Copied' : 'Copy'}
+                </button>
+              </div>
+            </div>
+            <pre className="mono coding-handoff-prompt">{exportEnvHintDisplay}</pre>
+          </div>
+
+          <div className="coding-handoff-snippet">
+            <div className="coding-handoff-snippet-head mono">
+              <span>Codex Streamable HTTP — append to ~/.codex/config.toml</span>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={() => {
+                  void copySnippet('http', httpSnippet);
+                }}
+              >
+                {snippetCopied === 'http' ? 'Copied' : 'Copy'}
+              </button>
+            </div>
+            <pre className="mono coding-handoff-prompt">{httpSnippet}</pre>
+          </div>
+
+          <div className="coding-handoff-snippet">
+            <div className="coding-handoff-snippet-head mono">
+              <span>Codex stdio — append to ~/.codex/config.toml</span>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={() => {
+                  void copySnippet('stdio', stdioSnippet);
+                }}
+              >
+                {snippetCopied === 'stdio' ? 'Copied' : 'Copy'}
+              </button>
+            </div>
+            <pre className="mono coding-handoff-prompt">{stdioSnippet}</pre>
+          </div>
+
+          <div className="coding-handoff-snippet">
+            <div className="coding-handoff-snippet-head mono">
+              <span>codex mcp add — single shell command</span>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={() => {
+                  void copySnippet('cli', cliCommand);
+                }}
+              >
+                {snippetCopied === 'cli' ? 'Copied' : 'Copy'}
+              </button>
+            </div>
+            <pre className="mono coding-handoff-prompt">{cliCommand}</pre>
+          </div>
+
+          <p className="muted">
+            Restart Codex if you changed config. After that, generating a token below gives
+            you the one-line attach instruction to paste into the agent — no more boilerplate.
+          </p>
+        </div>
+      </details>
 
       <div className="composer-row">
         <label>Workstream</label>

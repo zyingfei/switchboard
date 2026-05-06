@@ -244,7 +244,8 @@ export function Preview() {
         <CodingAttach
           workstreams={STUB_WORKSTREAMS}
           companionAvailable={true}
-          mcpEndpoint="ws://127.0.0.1:8721/mcp?token=PREVIEW_BRIDGE_KEY"
+          mcpEndpoint="http://127.0.0.1:8721/mcp"
+          mcpAuthBearer="PREVIEW_BRIDGE_KEY"
           onCancel={close}
           onAttached={close}
           onCreateToken={() =>

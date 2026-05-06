@@ -90,25 +90,25 @@ const FIXTURE_LINKED: readonly LinkedNote[] = [
 
 const FIXTURE_TRUST: readonly TrustEntry[] = [
   {
-    tool: 'bac.queue_item',
+    tool: 'sidetrack.queue.create',
     humanLabel: 'queue_item',
     description: 'queue an outbound follow-up to a provider',
     allowed: true,
   },
   {
-    tool: 'bac.move_item',
+    tool: 'sidetrack.threads.move',
     humanLabel: 'move_item',
     description: 'move a tracked thread to this workstream',
     allowed: false,
   },
   {
-    tool: 'bac.bump_workstream',
+    tool: 'sidetrack.workstreams.bump',
     humanLabel: 'bump_workstream',
     description: 'raise priority on a queued ask',
     allowed: false,
   },
   {
-    tool: 'bac.archive_thread',
+    tool: 'sidetrack.threads.archive',
     humanLabel: 'archive_thread',
     description: 'archive a tracked thread',
     allowed: false,

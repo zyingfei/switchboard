@@ -88,17 +88,19 @@ body::before {
   position: relative;
   z-index: 1;
   /* Refined entrance — 200 ms fade so the panel "settles" rather than
-     snapping in. Bypassed under prefers-reduced-motion below. */
+     snapping in. Bypassed under prefers-reduced-motion below.
+     IMPORTANT: opacity-only animation. A `transform` keyframe (even
+     translateY(0)) creates a new containing block for `position:
+     fixed` descendants, which mis-anchors the .modal-backdrop to
+     the workboard's scroll position instead of the viewport. */
   animation: bac-app-settle 200ms ease both;
 }
 @keyframes bac-app-settle {
   from {
     opacity: 0;
-    transform: translateY(2px);
   }
   to {
     opacity: 1;
-    transform: translateY(0);
   }
 }
 @media (prefers-reduced-motion: reduce) {
@@ -742,8 +744,14 @@ button:disabled {
   position: fixed;
   inset: 0;
   background: rgba(27, 25, 22, 0.55);
-  display: grid;
-  place-items: center;
+  /* Flexbox centering — reliable in narrow side-panel viewports
+     where `display: grid; place-items: center` was leaving short
+     modals stuck at the top. The padding gives every modal a
+     visible breathing margin from the side-panel edges. */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
   z-index: 100;
 }
 .modal {
@@ -753,7 +761,9 @@ button:disabled {
   border-radius: var(--rad-l);
   display: flex;
   flex-direction: column;
-  max-height: 90vh;
+  max-height: calc(100vh - 48px);
+  width: 100%;
+  max-width: 100%;
   overflow: hidden;
   box-shadow: 0 14px 36px rgba(27, 25, 22, 0.18);
 }
@@ -2951,6 +2961,54 @@ textarea.preview-body:focus {
 .icon-btn.pulsing {
   animation: icon-btn-pulse 4s ease-in-out infinite;
 }
+/* Wider variant — used for the Auto/Manual capture-mode toggle.
+   Carries an icon + a tiny uppercase mono label so the active mode
+   reads at a glance without a tooltip. The grid layout switches to
+   inline-flex with a small gap. Background/border still match the
+   plain .icon-btn so it sits in the toolbar consistently. */
+.icon-btn.icon-btn-labeled {
+  width: auto;
+  padding: 0 8px 0 7px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.icon-btn-label {
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  line-height: 1;
+  color: inherit;
+}
+
+/* "Include N comments" pill in the packet composer's scope options.
+   Lives next to the turn-count slider; subdued ink-2 colour with a
+   solid signal background when active so the user can tell at a
+   glance whether the inline-review draft will be folded in. */
+.review-include-toggle {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  padding: 2px 8px;
+  border: 1px solid var(--rule, #d4cdb8);
+  border-radius: 99px;
+  background: var(--paper);
+  color: var(--ink-2, #4a453d);
+  cursor: pointer;
+  text-decoration: none;
+}
+.review-include-toggle:hover:not(:disabled) {
+  background: var(--paper-light);
+  border-color: var(--ink-3, #7a7269);
+}
+.review-include-toggle.on {
+  background: var(--signal-bg, #fff7ed);
+  border-color: var(--signal, #c2410c);
+  color: var(--signal, #c2410c);
+}
+.review-include-toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 @keyframes icon-btn-pulse {
   0%,
   30%,
@@ -3354,6 +3412,18 @@ textarea.preview-body:focus {
   line-height: 1.3;
   color: var(--ink-3, #7a7269);
 }
+/* Lifecycle row — same parent-padding compensation the .nx-suggest
+   uses, so the right-cluster (lifecycle pill, model pill, autosend)
+   visually aligns with the row's right edge instead of stranding
+   130px short of it. The .stamp grabs `margin-right: auto` to push
+   everything after it to the right. */
+.thread .row2.row2-lifecycle {
+  flex-wrap: wrap;
+  margin-right: -120px;
+}
+.thread .row2.row2-lifecycle .stamp {
+  margin-right: auto;
+}
 .thread .row2 .dot {
   width: 6px;
   height: 6px;
@@ -3626,6 +3696,10 @@ textarea.preview-body:focus {
   border-radius: 3px;
   padding: 5px 7px;
   outline: none;
+}
+input.thread-turn-annotate-input {
+  resize: none;
+  min-height: 30px;
 }
 .thread-turn-annotate-input:focus {
   border-color: var(--ink-3);
@@ -4851,6 +4925,115 @@ button.btn-link.thread-dispatched-name:hover {
 }
 .signal {
   color: var(--signal, #c2410c);
+}
+.coding-handoff-config {
+  margin: 12px 0;
+  border: 1px solid var(--rule-soft, #e5ddc9);
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: var(--paper, #fdfaf2);
+}
+.coding-handoff-config > summary {
+  cursor: pointer;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-2, #4a4640);
+  list-style: none;
+}
+.coding-handoff-config > summary::-webkit-details-marker {
+  display: none;
+}
+.coding-handoff-config[open] > summary {
+  margin-bottom: 8px;
+}
+.coding-handoff-config-body {
+  display: grid;
+  gap: 12px;
+}
+.coding-handoff-snippet {
+  display: grid;
+  gap: 4px;
+}
+.coding-handoff-snippet-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  font-size: 10.5px;
+  color: var(--ink-3, #7a7269);
+  letter-spacing: 0.04em;
+}
+.coding-handoff-snippet-head .btn {
+  padding: 2px 8px;
+  font-size: 10.5px;
+}
+
+/* Auto / Manual capture-mode segmented control. Replaces the
+   yes/no Auto-track toggle with a 2-up icon+label radio pair so
+   the choice and consequences are visible at a glance. */
+.capture-mode-segmented {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 8px;
+}
+.capture-mode-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--rule-soft, #e5ddc9);
+  border-radius: 8px;
+  background: var(--paper);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.capture-mode-option:hover:not(:disabled) {
+  background: var(--paper-light);
+}
+.capture-mode-option:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.capture-mode-option.active {
+  border-color: var(--ink, #1b1916);
+  background: var(--paper-light);
+  box-shadow: inset 0 0 0 1px var(--ink, #1b1916);
+}
+.capture-mode-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--paper);
+  border: 1px solid var(--rule-soft, #e5ddc9);
+  color: var(--ink-2, #4a4640);
+  flex-shrink: 0;
+}
+.capture-mode-option.active .capture-mode-icon {
+  background: var(--ink, #1b1916);
+  color: var(--paper-light, #fbf7ee);
+  border-color: var(--ink, #1b1916);
+}
+.capture-mode-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.capture-mode-name {
+  font-family: var(--display);
+  font-size: 13px;
+  letter-spacing: -0.005em;
+  color: var(--ink, #1b1916);
+}
+.capture-mode-desc {
+  font-size: 10px;
+  color: var(--ink-3, #7a7269);
+  letter-spacing: 0.04em;
 }
 
 /* ──────────────────────────────────────────────────────────────────
@@ -6286,6 +6469,15 @@ pre.diff {
 /* Workboard Needs-Organize per-row suggestion. */
 .nx-suggest {
   margin-top: 6px;
+  /* The parent .thread reserves 130px of right padding for the
+     absolute-positioned .thread-actions strip (icons in the
+     top-right). Reading rows with no action icon at their vertical
+     slice — like this suggestion box — the reserved space looked
+     like a stranded gap, leaving the dashed border ending ~130px
+     short of the row's right edge. Counter the parent padding here
+     and leave a 10px gutter so the suggestion's right edge aligns
+     with the rest of the thread card. */
+  margin-right: -120px;
   padding: 6px 8px;
   background: var(--paper);
   border: 1px dashed var(--rule);
@@ -6295,6 +6487,8 @@ pre.diff {
   gap: 7px;
   font-family: var(--mono);
   font-size: 10.5px;
+  box-sizing: border-box;
+  flex-wrap: wrap;
 }
 .nx-suggest .lead {
   color: var(--ink-3);

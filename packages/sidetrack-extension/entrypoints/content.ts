@@ -9,6 +9,7 @@ import {
   messageTypes,
   type ContentRequest,
   type ContentResponse,
+  type ListAnnotationsByUrlResponse,
   type RecallQueryResponse,
 } from '../src/messages';
 import {
@@ -106,6 +107,28 @@ const driveAutoSend = async (
   if (provider === 'codex') {
     return { ok: false, error: 'Auto-send does not support Codex sessions yet.' };
   }
+
+  // ChatGPT's bare / silently redirects logged-in users to their
+  // most-recent /c/<id> chat. If we just type into that composer,
+  // the dispatch's prompt lands as a new turn in an unrelated
+  // existing chat — Sidetrack's auto-link matcher then attaches the
+  // dispatch to the wrong thread, and the entire flow points at a
+  // page that has nothing to do with the requested work.
+  // The page's own "New chat" sidebar link uses Next.js client-side
+  // navigation to reset state without re-redirecting; clicking it
+  // pre-flight is the cleanest reset.
+  if (provider === 'chatgpt' && /^\/c\//u.test(window.location.pathname)) {
+    const newChatLink = document.querySelector<HTMLElement>(
+      'a[data-testid="create-new-chat-button"]',
+    );
+    if (newChatLink !== null) {
+      newChatLink.click();
+      await waitFor(() => window.location.pathname === '/', 5_000, 100);
+      // Compose composer hydration time after the route transition.
+      await sleep(400);
+    }
+  }
+
   // Composer presence — not URL shape — gates auto-send. The new-chat
   // landing page (e.g. https://gemini.google.com/app, the bare ChatGPT
   // root) shows a composer that becomes a thread on submit; the
@@ -206,6 +229,7 @@ interface AnnotateTurnMessage {
   readonly threadUrl: string;
   readonly turnText: string;
   readonly sourceSelector?: string;
+  readonly anchorText?: string;
   readonly note: string;
   readonly capturedAt: string;
 }
@@ -220,7 +244,8 @@ const isAnnotateTurnMessage = (value: unknown): value is AnnotateTurnMessage =>
   'turnText' in value &&
   typeof (value as { turnText: unknown }).turnText === 'string' &&
   'note' in value &&
-  typeof (value as { note: unknown }).note === 'string';
+  typeof (value as { note: unknown }).note === 'string' &&
+  (!('anchorText' in value) || typeof (value as { anchorText?: unknown }).anchorText === 'string');
 
 const isContentRequest = (value: unknown): value is ContentRequest =>
   typeof value === 'object' &&
@@ -253,28 +278,83 @@ export default defineContentScript({
     // optimistically when the user saves a new comment so the
     // margin marker shows up without requiring a page reload.
     const liveAnchors: RestoredAnchor[] = [];
+    // Range objects for currently-mounted highlights, keyed by anchor
+    // id. Kept alive across renders so scroll/resize handlers can
+    // re-measure getClientRects() and reposition highlight overlays
+    // without having to re-fetch from the companion.
+    const liveRanges = new Map<string, Range>();
+
+    // Re-entry guard for restoreAnnotations: the function is fired by
+    // page-load timer, captureVisibleThread requests, and mutation
+    // observers. Without a guard, two concurrent calls both splice
+    // and push, racing for last-writer-wins; the guard sequences them
+    // so only the most recent caller's results land in liveAnchors.
+    let restoreSeq = 0;
 
     const restoreAnnotations = async (): Promise<void> => {
+      const mySeq = ++restoreSeq;
       try {
-        const client = await createAnnotationClient();
-        if (client === undefined) {
+        // Production path on real provider pages: the content script's
+        // direct fetch to http://127.0.0.1:<port> hits the companion's
+        // loopback-origin gate (isAllowedOrigin: chrome-extension://
+        // or 127.0.0.1/localhost only) and 403's because Origin is
+        // https://chatgpt.com. We route through the SW (chrome-
+        // extension:// origin is whitelisted) so the read succeeds
+        // on real pages. Same pattern as recallQuery.
+        //
+        // Test path: Playwright's context.route intercepts in-page
+        // fetches but not SW fetches, so the in-process fixture
+        // (mockVaultCompanion) requires the direct path to keep
+        // working. Try direct first; fall back to SW on a non-
+        // success status (403, network error). This way both real
+        // browsers and the existing e2e infrastructure are covered.
+        let annotations: readonly { readonly bac_id: string; readonly url: string; readonly pageTitle: string; readonly note: string; readonly createdAt: string; readonly anchor: import('../src/annotation/anchors').SerializedAnchor }[] = [];
+        try {
+          const client = await createAnnotationClient();
+          if (client !== undefined) {
+            annotations = await client.listAnnotationsForUrl(window.location.href);
+          }
+        } catch {
+          annotations = [];
+        }
+        if (annotations.length === 0) {
+          const response: ListAnnotationsByUrlResponse = await chrome.runtime.sendMessage({
+            type: messageTypes.listAnnotationsByUrl,
+            url: window.location.href,
+          });
+          if (response.ok && response.annotations !== undefined) {
+            annotations = response.annotations;
+          }
+        }
+        if (mySeq !== restoreSeq) {
+          // A newer call superseded this one; abandon results.
           return;
         }
-        const annotations = await client.listAnnotationsForUrl(window.location.href);
+        const nextAnchors: RestoredAnchor[] = [];
+        const nextRanges = new Map<string, Range>();
         for (const annotation of annotations) {
           const range = findAnchor(document.documentElement, annotation.anchor);
           if (range !== null) {
-            liveAnchors.push({
+            nextAnchors.push({
               id: annotation.bac_id,
               rect: range.getBoundingClientRect(),
+              rects: Array.from(range.getClientRects()),
               note: annotation.note,
               quote: range.toString().slice(0, 280),
+              anchor: annotation.anchor,
             });
+            nextRanges.set(annotation.bac_id, range);
           }
         }
-        if (liveAnchors.length > 0) {
-          mountAnnotationOverlay(liveAnchors);
+        if (mySeq !== restoreSeq) {
+          return;
         }
+        liveAnchors.splice(0, liveAnchors.length, ...nextAnchors);
+        liveRanges.clear();
+        for (const [id, range] of nextRanges) {
+          liveRanges.set(id, range);
+        }
+        mountAnnotationOverlay(liveAnchors);
       } catch {
         // Restore is best-effort and must never disturb the host page.
       }
@@ -290,11 +370,71 @@ export default defineContentScript({
       liveAnchors.push({
         id,
         rect: range.getBoundingClientRect(),
+        rects: Array.from(range.getClientRects()),
         ...(note === undefined ? {} : { note }),
         ...(quote === undefined ? {} : { quote }),
       });
+      liveRanges.set(id, range);
       mountAnnotationOverlay(liveAnchors);
     };
+
+    // Re-measure each live range against the current viewport and
+    // re-mount highlights. Cheap (getClientRects() is browser-native)
+    // and runs on scroll + resize so highlights stick to the underlying
+    // text instead of drifting because the overlay root is fixed-positioned.
+    // SPA virtualisers (Gemini drops/re-creates message DOM on viewport
+    // changes) detach the cached Range; when getClientRects() comes
+    // back empty, re-resolve from the SerializedAnchor we cached at
+    // restore time instead of leaving the highlight rect stale.
+    let repositionScheduled = false;
+    const repositionLiveAnnotations = (): void => {
+      if (liveAnchors.length === 0) return;
+      if (repositionScheduled) return;
+      repositionScheduled = true;
+      requestAnimationFrame(() => {
+        repositionScheduled = false;
+        const refreshed: RestoredAnchor[] = [];
+        for (const anchor of liveAnchors) {
+          const range = liveRanges.get(anchor.id);
+          let clientRects: DOMRect[] = [];
+          let live: Range | null = range ?? null;
+          if (live !== null) {
+            try {
+              clientRects = Array.from(live.getClientRects());
+            } catch {
+              clientRects = [];
+            }
+          }
+          if (clientRects.length === 0 && anchor.anchor !== undefined) {
+            try {
+              live = findAnchor(document.documentElement, anchor.anchor);
+              if (live !== null) {
+                clientRects = Array.from(live.getClientRects());
+                liveRanges.set(anchor.id, live);
+              }
+            } catch {
+              live = null;
+            }
+          }
+          if (live === null || clientRects.length === 0) {
+            refreshed.push(anchor);
+            continue;
+          }
+          refreshed.push({
+            ...anchor,
+            rect: live.getBoundingClientRect(),
+            rects: clientRects,
+          });
+        }
+        liveAnchors.splice(0, liveAnchors.length, ...refreshed);
+        mountAnnotationOverlay(liveAnchors);
+      });
+    };
+    window.addEventListener('scroll', repositionLiveAnnotations, {
+      passive: true,
+      capture: true,
+    });
+    window.addEventListener('resize', repositionLiveAnnotations, { passive: true });
 
     // Normalize text for cross-source comparison. Captured turn.text
     // is markdown (** _ ` # etc.) but the live page's textContent has
@@ -440,6 +580,49 @@ export default defineContentScript({
       };
     };
 
+    const textNodesWithin = (root: Node): Text[] => {
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      const nodes: Text[] = [];
+      let current = walker.nextNode();
+      while (current !== null) {
+        nodes.push(current as Text);
+        current = walker.nextNode();
+      }
+      return nodes;
+    };
+
+    const rangeWithinElementByText = (root: HTMLElement, exactText: string): Range | null => {
+      const needle = exactText.trim();
+      if (needle.length === 0) {
+        return null;
+      }
+      const fullText = root.textContent;
+      let start = fullText.indexOf(needle);
+      if (start < 0) {
+        start = fullText.toLocaleLowerCase().indexOf(needle.toLocaleLowerCase());
+      }
+      if (start < 0) {
+        return null;
+      }
+      const end = start + needle.length;
+      const range = document.createRange();
+      let cursor = 0;
+      let started = false;
+      for (const node of textNodesWithin(root)) {
+        const next = cursor + node.data.length;
+        if (!started && start >= cursor && start <= next) {
+          range.setStart(node, start - cursor);
+          started = true;
+        }
+        if (started && end >= cursor && end <= next) {
+          range.setEnd(node, end - cursor);
+          return range;
+        }
+        cursor = next;
+      }
+      return null;
+    };
+
     const annotateTurnFromSidepanel = async (
       message: AnnotateTurnMessage,
     ): Promise<{
@@ -459,16 +642,26 @@ export default defineContentScript({
           error: `Could not locate that turn on the live page (${lookup.diagnostic}). Open devtools to inspect.`,
         };
       }
-      // Range over the entire turn element so the marker pins to the
-      // turn's visual block, not a sub-selection. Using textContent
-      // length keeps the range valid even when the turn contains
-      // mixed inline + block content.
       let range: Range;
       try {
-        range = document.createRange();
-        range.selectNodeContents(target);
+        if (message.anchorText !== undefined && message.anchorText.trim().length > 0) {
+          const keywordRange = rangeWithinElementByText(target, message.anchorText);
+          if (keywordRange === null) {
+            return {
+              ok: false,
+              error: `Could not locate "${message.anchorText.trim()}" inside the matched turn.`,
+            };
+          }
+          range = keywordRange;
+        } else {
+          // Range over the entire turn element so the marker pins to the
+          // turn's visual block when the user did not provide a precise
+          // keyword/quote target.
+          range = document.createRange();
+          range.selectNodeContents(target);
+        }
       } catch {
-        return { ok: false, error: 'Failed to build a Range over the turn element.' };
+        return { ok: false, error: 'Failed to build an annotation range on the live page.' };
       }
       let anchor;
       try {
@@ -484,7 +677,8 @@ export default defineContentScript({
       // popover shows what's actually under the marker (vs the
       // markdown turn body, which has formatting decorations).
       const optimisticId = `local-turn-${String(Date.now())}`;
-      const liveQuote = target.textContent.trim().slice(0, 280);
+      const liveQuote =
+        range.toString().trim().slice(0, 280) || target.textContent.trim().slice(0, 280);
       addLiveAnnotation(optimisticId, range, message.note, liveQuote);
 
       // Best-effort persist via the existing AnnotationClient. The
@@ -791,7 +985,17 @@ export default defineContentScript({
 
     const captureSignature = (capture: ReturnType<typeof createCapture>): string => {
       const lastTurn = capture.turns.at(-1);
-      return `${capture.provider}:${capture.threadUrl}:${String(capture.turns.length)}:${lastTurn?.role ?? ''}:${lastTurn?.text.slice(0, 120) ?? ''}`;
+      // Include the full text length AND the LAST 120 chars (not the
+      // first). Provider configs with mergeAdjacentSameRoleTurns merge
+      // consecutive assistant turns into one — when ChatGPT replies in
+      // multiple [data-message-author-role="assistant"] elements (a
+      // tool-use preamble, a progress note, then the long final
+      // answer), the merged turn's first 120 chars stay anchored to
+      // the short preamble while the body grows by thousands of
+      // chars. Slicing from the head missed every streaming update.
+      // Length + tail catches both grow-by-append and grow-by-prepend.
+      const text = lastTurn?.text ?? '';
+      return `${capture.provider}:${capture.threadUrl}:${String(capture.turns.length)}:${lastTurn?.role ?? ''}:${String(text.length)}:${text.slice(-120)}`;
     };
 
     const sendAutoCapture = () => {
@@ -881,6 +1085,7 @@ export default defineContentScript({
       ) => {
         if (isContentRequest(message)) {
           try {
+            void restoreAnnotations();
             sendResponse({ ok: true, capture: createCapture() });
           } catch (error) {
             sendResponse({
@@ -937,6 +1142,53 @@ export default defineContentScript({
       subtree: true,
       characterData: true,
     });
+
+    // Annotation re-anchor observer. Provider chat shells virtualize
+    // long threads (turns above the viewport leave the DOM until the
+    // user scrolls back). When new turn elements get inserted, any
+    // annotations whose anchor lived in those turns need to be
+    // re-located. We watch the same body subtree the auto-capture
+    // observer does but with a tighter debounce (200ms) so highlights
+    // pop back quickly. The scheduleAutoCapture path uses 2.5s
+    // which is too slow for visual restore UX.
+    let annotationRestoreTimer: number | undefined;
+    const looksLikeTurnElement = (node: Node): boolean => {
+      if (!(node instanceof HTMLElement)) return false;
+      // Match what every provider's directSources select on, plus
+      // the generic data-capture-turn used by the e2e fixture. Cheap
+      // attribute checks; we don't run the full provider selector
+      // here because the observer fires on every DOM change and
+      // querySelectorAll on subtree would be too expensive.
+      if (node.hasAttribute('data-message-author-role')) return true;
+      if (node.hasAttribute('data-capture-turn')) return true;
+      if (node.querySelector('[data-message-author-role], [data-capture-turn]') !== null) {
+        return true;
+      }
+      return false;
+    };
+    const scheduleAnnotationRestore = (): void => {
+      if (liveAnchors.length === 0 && liveRanges.size === 0) {
+        // Cheap exit if there are no annotations to track on this
+        // page yet — the page-load timer will pick them up later.
+        return;
+      }
+      if (annotationRestoreTimer !== undefined) {
+        window.clearTimeout(annotationRestoreTimer);
+      }
+      annotationRestoreTimer = window.setTimeout(() => {
+        void restoreAnnotations();
+      }, 200);
+    };
+    new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        for (const node of mutation.addedNodes) {
+          if (looksLikeTurnElement(node)) {
+            scheduleAnnotationRestore();
+            return;
+          }
+        }
+      }
+    }).observe(document.body, { childList: true, subtree: true });
     // Note: an earlier iteration injected a Shadow-DOM floating
     // "↗ Sidetrack" button into the host page. The user preferred
     // a side-panel-side find icon instead — see

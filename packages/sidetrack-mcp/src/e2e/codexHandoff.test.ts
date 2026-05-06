@@ -3,31 +3,18 @@
  * a lean Sidetrack handoff prompt — `sidetrack_thread_id` + an MCP
  * endpoint — and pulls every piece of context it needs over the
  * tool channel. The test simulates that agent: it parses the prompt,
- * connects an MCP SDK client to the WebSocket transport, and walks
- * the canonical sequence of tool calls.
- *
- * Why this exists:
- *   - The previous handoff packet duplicated thread URL, provider,
- *     full HTTP fallback, tools list, and a frozen turn snapshot
- *     into the prompt. That's redundant — everything is reachable
- *     over MCP — and it leaks the chat URL into anyone the user
- *     shares the prompt with. The new packet ships only the
- *     thread_id + MCP endpoint; this test proves an agent can
- *     fully act on that.
- *   - "Walk the agent flow" is the contract the prompt promises
- *     ("call tools/list to see what's available; bac.read_thread_md
- *     returns the conversation body"). The test asserts each step
- *     of that contract behaves end-to-end.
+ * connects an MCP SDK client, and walks the canonical sequence of
+ * tool calls against the new typed `sidetrack.*` surface.
  *
  * The test is fully automated: no live browser, no live companion
  * binary. It uses an in-memory CompanionWriteClient + an in-memory
  * SidetrackMcpReader against a seeded LiveVaultSnapshot, plus the
- * real WebSocket MCP transport so the wire-level protocol is
+ * real Streamable HTTP MCP transport so the wire-level protocol is
  * exercised.
  */
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { WebSocketClientTransport } from '@modelcontextprotocol/sdk/client/websocket.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -36,9 +23,9 @@ import {
   type SidetrackMcpReader,
 } from '../server/mcpServer.js';
 import {
-  startWebSocketMcpServer,
-  type StartedWebSocketMcpServer,
-} from '../server/websocketServer.js';
+  startStreamableHttpMcpServer,
+  type StartedStreamableHttpMcpServer,
+} from '../server/streamableHttpServer.js';
 import type { CodingSessionRecord, LiveVaultSnapshot } from '../vault/liveVaultReader.js';
 
 // ────────────────── Seed data ──────────────────
@@ -214,6 +201,22 @@ const writeClient: CompanionWriteClient & {
       recordedCalls.push({ tool: 'createQueueItem', input });
       return Promise.resolve({ bac_id: 'bac_queue_followup', revision: 'rev_q_1' });
     },
+    createAnnotation: (input) => {
+      recordedCalls.push({ tool: 'createAnnotation', input });
+      return Promise.resolve({
+        status: 'created' as const,
+        annotationId: 'bac_annotation_term',
+        occurrenceCount: 1,
+        annotation: {
+          bac_id: 'bac_annotation_term',
+          url: input.url,
+          pageTitle: input.pageTitle,
+          term: input.term,
+          note: input.note,
+          createdAt: NOW,
+        },
+      });
+    },
     bumpWorkstream: () => Promise.reject(new Error('not exercised in this test')),
     archiveThread: () => Promise.reject(new Error('not exercised in this test')),
     unarchiveThread: () => Promise.reject(new Error('not exercised in this test')),
@@ -311,7 +314,7 @@ const buildLeanHandoff = (threadId: string, mcpEndpoint: string, ask: string): s
     '# Coding handoff: Recall index lifecycle',
     `sidetrack_mcp: ${mcpEndpoint}`,
     `sidetrack_thread_id: ${threadId}`,
-    '(connect → tools/list → bac.read_thread_md)',
+    '(connect → readResource sidetrack://thread/<id>/markdown)',
     '',
     "## User's ask",
     ask,
@@ -348,7 +351,7 @@ const buildAttachPrompt = (
     `sidetrack_mcp: ${mcpEndpoint}`,
     `sidetrack_attach_token: ${attachToken}`,
     `sidetrack_workstream_id: ${workstreamId}`,
-    'flow: tools/list -> bac.coding_session_register -> bac.workstream/bac.context_pack -> bac.request_dispatch',
+    'flow: tools/list -> sidetrack.session.attach -> sidetrack.workstreams.get/sidetrack.workstreams.context_pack -> sidetrack.dispatch.create',
   ].join('\n');
 
 const parseAttachPrompt = (
@@ -373,7 +376,7 @@ const parseAttachPrompt = (
 
 // ────────────────── Test harness ──────────────────
 
-const startedServers: StartedWebSocketMcpServer[] = [];
+const startedServers: StartedStreamableHttpMcpServer[] = [];
 
 afterEach(async () => {
   await Promise.all(startedServers.splice(0).map((server) => server.close()));
@@ -382,8 +385,8 @@ afterEach(async () => {
   writeClient.recordedCalls.splice(0);
 });
 
-const startServer = async (): Promise<StartedWebSocketMcpServer> => {
-  const started = await startWebSocketMcpServer({
+const startServer = async (): Promise<StartedStreamableHttpMcpServer> => {
+  const started = await startStreamableHttpMcpServer({
     port: 0,
     createServer: () => createSidetrackMcpServer(reader, writeClient),
   });
@@ -408,7 +411,7 @@ describe('codex handoff over MCP', () => {
   it('compact prompt carries only thread_id + mcp endpoint + ask (nothing else)', () => {
     const prompt = buildLeanHandoff(
       TARGET_THREAD_ID,
-      'ws://127.0.0.1:8721/mcp?token=local',
+      'http://127.0.0.1:8721/mcp',
       'Reduce the recall drift to under 10 turns.',
     );
     // Negative assertions: the prompt must not leak provider URL,
@@ -421,11 +424,11 @@ describe('codex handoff over MCP', () => {
     expect(prompt).not.toContain('HTTP fallback');
     // Positive assertions: the agent has exactly what it needs.
     expect(prompt).toContain(`sidetrack_thread_id: ${TARGET_THREAD_ID}`);
-    expect(prompt).toContain('sidetrack_mcp: ws://127.0.0.1:8721/mcp?token=local');
+    expect(prompt).toContain('sidetrack_mcp: http://127.0.0.1:8721/mcp');
     expect(prompt).toContain("## User's ask");
     // Discovery breadcrumb is the only instruction-shaped content;
-    // capable agents need just this to find bac.read_thread_md.
-    expect(prompt).toContain('(connect → tools/list → bac.read_thread_md)');
+    // capable agents read the thread via the resource template.
+    expect(prompt).toContain('(connect → readResource sidetrack://thread/<id>/markdown)');
     // Compact-budget guard: ~225 chars baseline + room for ask.
     expect(prompt.length).toBeLessThan(400);
   });
@@ -444,35 +447,53 @@ describe('codex handoff over MCP', () => {
     expect(ask).toContain('queue a follow-up');
 
     const client = new Client({ name: 'codex-handoff-e2e', version: '0.0.0' });
-    await client.connect(new WebSocketClientTransport(new URL(mcpEndpoint)));
+    await client.connect(new StreamableHTTPClientTransport(new URL(mcpEndpoint)) as unknown as Parameters<typeof client.connect>[0]);
     try {
       // Step 2 — discover available tools (the prompt says to do this).
       const tools = await client.listTools();
       const advertised = tools.tools.map((t) => t.name);
       expect(advertised).toEqual(
         expect.arrayContaining([
-          'bac.read_thread_md',
-          'bac.list_dispatches',
-          'bac.list_annotations',
-          'bac.recall',
-          'bac.queue_item',
+          'sidetrack.dispatches.list',
+          'sidetrack.annotations.create_batch',
+          'sidetrack.annotations.list',
+          'sidetrack.recall.query',
+          'sidetrack.queue.create',
+        ]),
+      );
+      // Resource templates are advertised separately — the thread
+      // markdown read used to be a tool; in Phase 5 it became a
+      // resource at sidetrack://thread/<id>/markdown.
+      const templates = (await client.listResourceTemplates()).resourceTemplates.map(
+        (entry) => entry.uriTemplate,
+      );
+      expect(templates).toEqual(
+        expect.arrayContaining([
+          'sidetrack://thread/{threadId}',
+          'sidetrack://thread/{threadId}/markdown',
         ]),
       );
 
-      // Step 3 — fetch the thread body. This is the agent's first
-      // real "what am I working on?" call.
-      const threadMd = await client.callTool({
-        name: 'bac.read_thread_md',
-        arguments: { bac_id: threadId },
+      // Step 3 — fetch the thread body via the resource. This is the
+      // agent's first "what am I working on?" call.
+      const threadResource = await client.readResource({
+        uri: `sidetrack://thread/${threadId}/markdown`,
       });
-      const threadBody = structured(threadMd) as { readonly markdown?: string };
-      expect(threadBody.markdown).toContain('Recall index lifecycle');
-      expect(threadBody.markdown).toContain('Background indexing per turn');
+      const firstContent = threadResource.contents[0] as unknown;
+      const markdown =
+        typeof firstContent === 'object' &&
+        firstContent !== null &&
+        'text' in firstContent &&
+        typeof (firstContent as { readonly text?: unknown }).text === 'string'
+          ? (firstContent as { readonly text: string }).text
+          : '';
+      expect(markdown).toContain('Recall index lifecycle');
+      expect(markdown).toContain('Background indexing per turn');
 
       // Step 4 — see what's been shipped before, so the agent
       // doesn't repeat earlier work.
       const dispatches = await client.callTool({
-        name: 'bac.list_dispatches',
+        name: 'sidetrack.dispatches.list',
         arguments: { limit: 5 },
       });
       const dispatchData = structured(dispatches) as {
@@ -485,7 +506,7 @@ describe('codex handoff over MCP', () => {
       // the agent's summary respects what the user marked as
       // important. Server returns { data: [...] }.
       const annotations = await client.callTool({
-        name: 'bac.list_annotations',
+        name: 'sidetrack.annotations.list',
         arguments: { url: snapshot.threads[0]?.threadUrl ?? '' },
       });
       const annData = structured(annotations) as {
@@ -497,7 +518,7 @@ describe('codex handoff over MCP', () => {
       // pull cross-thread context if needed. Server returns
       // { data: [...] } where each item has threadId.
       const related = await client.callTool({
-        name: 'bac.recall',
+        name: 'sidetrack.recall.query',
         arguments: { query: 'recall index lifecycle drift', limit: 3 },
       });
       const recallData = structured(related) as {
@@ -509,7 +530,7 @@ describe('codex handoff over MCP', () => {
       // says "I summarised the lifecycle for the user." This is
       // the only write the agent does in this flow.
       const queued = await client.callTool({
-        name: 'bac.queue_item',
+        name: 'sidetrack.queue.create',
         arguments: {
           scope: 'thread',
           targetId: threadId,
@@ -530,28 +551,29 @@ describe('codex handoff over MCP', () => {
     const prompt = buildAttachPrompt('attach_TOKEN_123', started.url, WORKSTREAM_ID);
     expect(prompt).toContain('sidetrack_mcp:');
     expect(prompt).toContain('sidetrack_attach_token: attach_TOKEN_123');
-    expect(prompt).toContain('bac.request_dispatch');
+    expect(prompt).toContain('sidetrack.dispatch.create');
 
     const parsed = parseAttachPrompt(prompt);
     const client = new Client({ name: 'codex-inbound-e2e', version: '0.0.0' });
-    await client.connect(new WebSocketClientTransport(new URL(parsed.mcpEndpoint)));
+    await client.connect(new StreamableHTTPClientTransport(new URL(parsed.mcpEndpoint)) as unknown as Parameters<typeof client.connect>[0]);
     try {
       const tools = await client.listTools();
       expect(tools.tools.map((tool) => tool.name)).toEqual(
         expect.arrayContaining([
-          'bac.coding_session_register',
-          'bac.workstream',
-          'bac.context_pack',
-          'bac.request_dispatch',
-          'bac.list_dispatches',
-          'bac.queue_item',
+          'sidetrack.session.attach',
+          'sidetrack.workstreams.get',
+          'sidetrack.workstreams.context_pack',
+          'sidetrack.dispatch.create',
+          'sidetrack.dispatches.list',
+          'sidetrack.annotations.create_batch',
+          'sidetrack.queue.create',
         ]),
       );
 
       const registered = await client.callTool({
-        name: 'bac.coding_session_register',
+        name: 'sidetrack.session.attach',
         arguments: {
-          token: parsed.attachToken,
+          attachToken: parsed.attachToken,
           tool: 'codex',
           cwd: '/Users/zyingfei/switchboard',
           branch: 'codex/mcp-inbound-dispatch',
@@ -561,14 +583,16 @@ describe('codex handoff over MCP', () => {
         },
       });
       const registeredData = structured(registered) as {
-        readonly bac_id?: string;
+        readonly codingSessionId?: string;
         readonly workstreamId?: string;
+        readonly tool?: string;
       };
-      expect(registeredData.bac_id).toBe(CODEX_SESSION_ID);
+      expect(registeredData.codingSessionId).toBe(CODEX_SESSION_ID);
       expect(registeredData.workstreamId).toBe(WORKSTREAM_ID);
+      expect(registeredData.tool).toBe('codex');
 
       const workstream = await client.callTool({
-        name: 'bac.workstream',
+        name: 'sidetrack.workstreams.get',
         arguments: { id: parsed.workstreamId },
       });
       const workstreamData = structured(workstream) as {
@@ -577,13 +601,13 @@ describe('codex handoff over MCP', () => {
       expect(workstreamData.workstreams?.[0]?.bac_id).toBe(WORKSTREAM_ID);
 
       const contextPack = await client.callTool({
-        name: 'bac.context_pack',
+        name: 'sidetrack.workstreams.context_pack',
         arguments: { workstreamId: parsed.workstreamId },
       });
       expect(JSON.stringify(structured(contextPack))).toContain('Recall infra');
 
       const requested = await client.callTool({
-        name: 'bac.request_dispatch',
+        name: 'sidetrack.dispatch.create',
         arguments: {
           codingSessionId: CODEX_SESSION_ID,
           targetProvider: 'chatgpt',
@@ -597,16 +621,52 @@ describe('codex handoff over MCP', () => {
         targetProvider: 'chatgpt',
         mode: 'auto-send',
         workstreamId: WORKSTREAM_ID,
+        statusResource: `sidetrack://dispatch/${REQUESTED_DISPATCH_ID}`,
       });
 
       const dispatches = await client.callTool({
-        name: 'bac.list_dispatches',
+        name: 'sidetrack.dispatches.list',
         arguments: { limit: 5 },
       });
-      expect(JSON.stringify(structured(dispatches))).toContain(REQUESTED_DISPATCH_ID);
+      // Vault-reader-backed dispatches.list reads from the seeded
+      // snapshot, so the prior "disp_prior" record is what surfaces
+      // (the requested dispatch is recorded via companionClient and
+      // does not flow back through the in-memory reader for this E2E).
+      expect(JSON.stringify(structured(dispatches))).toContain('disp_prior');
+
+      const batch = await client.callTool({
+        name: 'sidetrack.annotations.create_batch',
+        arguments: {
+          threadId: TARGET_THREAD_ID,
+          url: 'https://chatgpt.com/c/target-thread',
+          pageTitle: 'ChatGPT HN analysis',
+          items: [
+            {
+              term: 'WebGPU',
+              note: 'WebGPU: browser GPU compute/rendering API for architect-level context.',
+            },
+          ],
+        },
+      });
+      const batchData = structured(batch) as {
+        readonly items?: readonly {
+          readonly term?: string;
+          readonly status?: string;
+          readonly annotationId?: string;
+        }[];
+        readonly createdCount?: number;
+        readonly anchorFailedCount?: number;
+        readonly attemptedCount?: number;
+      };
+      expect(batchData.attemptedCount).toBe(1);
+      expect(batchData.createdCount).toBe(1);
+      expect(batchData.anchorFailedCount).toBe(0);
+      expect(batchData.items?.[0]?.term).toBe('WebGPU');
+      expect(batchData.items?.[0]?.status).toBe('created');
+      expect(batchData.items?.[0]?.annotationId).toBe('bac_annotation_term');
 
       const queued = await client.callTool({
-        name: 'bac.queue_item',
+        name: 'sidetrack.queue.create',
         arguments: {
           scope: 'workstream',
           targetId: WORKSTREAM_ID,
@@ -618,6 +678,7 @@ describe('codex handoff over MCP', () => {
       expect(writeClient.recordedCalls.map((call) => call.tool)).toEqual([
         'registerCodingSession',
         'requestDispatch',
+        'createAnnotation',
         'createQueueItem',
       ]);
     } finally {

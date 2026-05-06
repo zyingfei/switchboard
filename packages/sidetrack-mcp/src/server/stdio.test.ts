@@ -6,7 +6,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { describe, expect, it } from 'vitest';
 
-import { m1ReadToolNames } from '../capabilities.js';
+import { sidetrackToolNames } from '../capabilities.js';
 
 const packageRoot = fileURLToPath(new URL('../..', import.meta.url));
 const tsxImportPath = fileURLToPath(
@@ -79,17 +79,17 @@ describe('sidetrack MCP stdio server', () => {
     await client.connect(transport);
     try {
       const tools = await client.listTools();
-      expect(tools.tools.map((tool) => tool.name)).toEqual(m1ReadToolNames);
+      expect(tools.tools.map((tool) => tool.name)).toEqual(sidetrackToolNames);
 
       const contextPack = await client.callTool({
-        name: 'bac.context_pack',
+        name: 'sidetrack.workstreams.context_pack',
         arguments: { workstreamId: 'bac_workstream_test' },
       });
       const content = contextPack.content as { readonly type: string; readonly text?: string }[];
       expect(content[0]?.text ?? '').toContain('VM live migration architecture');
 
       const search = await client.callTool({
-        name: 'bac.search',
+        name: 'sidetrack.search',
         arguments: { query: 'migration' },
       });
       const structured = search.structuredContent as {

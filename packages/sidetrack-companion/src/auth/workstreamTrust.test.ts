@@ -19,17 +19,17 @@ describe('workstreamTrust', () => {
   it('defaults to deny when no trust record exists', async () => {
     const trust = await readTrust(vaultRoot);
 
-    expect(isAllowed('bac_ws_1', 'bac.move_item', trust)).toBe(false);
+    expect(isAllowed('bac_ws_1', 'sidetrack.threads.move', trust)).toBe(false);
   });
 
   it('persists allowed write tools and checks membership', async () => {
     await writeTrust(vaultRoot, [
-      { workstreamId: 'bac_ws_1', allowedTools: new Set(['bac.move_item']) },
+      { workstreamId: 'bac_ws_1', allowedTools: new Set(['sidetrack.threads.move']) },
     ]);
 
     const trust = await readTrust(vaultRoot);
 
-    expect(isAllowed('bac_ws_1', 'bac.move_item', trust)).toBe(true);
-    expect(isAllowed('bac_ws_1', 'bac.archive_thread', trust)).toBe(false);
+    expect(isAllowed('bac_ws_1', 'sidetrack.threads.move', trust)).toBe(true);
+    expect(isAllowed('bac_ws_1', 'sidetrack.threads.archive', trust)).toBe(false);
   });
 });

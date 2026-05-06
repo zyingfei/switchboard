@@ -597,6 +597,144 @@ describe('companion HTTP server', () => {
     expect(dispatchLog).not.toContain('owner@example.com');
   });
 
+  it('links a dispatch to a captured thread and reads it back', async () => {
+    const createdAt = '2026-04-26T22:00:00.000Z';
+    const recordResponse = await jsonFetch(context, `${baseUrl}/v1/dispatches`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'dispatch-link-record',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        kind: 'research',
+        target: { provider: 'chatgpt', mode: 'paste' },
+        title: 'Linkable dispatch',
+        body: 'Body to link.',
+        createdAt,
+      }),
+    });
+    const dispatchId = (recordResponse.body as { readonly data: { readonly bac_id: string } }).data
+      .bac_id;
+
+    const link = await jsonFetch(
+      context,
+      `${baseUrl}/v1/dispatches/${dispatchId}/link`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-bac-bridge-key': bridgeKey,
+        },
+        body: JSON.stringify({ threadId: 'bac_thread_linked' }),
+      },
+    );
+    expect(link.status).toBe(200);
+    expect(link.body).toMatchObject({
+      data: { dispatchId, threadId: 'bac_thread_linked', linkedAt: expect.any(String) },
+    });
+
+    const read = await jsonFetch(
+      context,
+      `${baseUrl}/v1/dispatches/${dispatchId}/link`,
+      { headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+    expect(read.status).toBe(200);
+    expect(read.body).toMatchObject({
+      data: { dispatchId, threadId: 'bac_thread_linked' },
+    });
+  });
+
+  it('returns null for an unlinked dispatch and times out await-capture quickly', async () => {
+    const createdAt = '2026-04-26T22:00:00.000Z';
+    const recordResponse = await jsonFetch(context, `${baseUrl}/v1/dispatches`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'dispatch-link-empty',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        kind: 'research',
+        target: { provider: 'chatgpt', mode: 'paste' },
+        title: 'Unlinked dispatch',
+        body: 'Body never linked.',
+        createdAt,
+      }),
+    });
+    const dispatchId = (recordResponse.body as { readonly data: { readonly bac_id: string } }).data
+      .bac_id;
+
+    const read = await jsonFetch(
+      context,
+      `${baseUrl}/v1/dispatches/${dispatchId}/link`,
+      { headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+    expect(read.body).toMatchObject({
+      data: { dispatchId, threadId: null, linkedAt: null },
+    });
+
+    const await1 = await jsonFetch(
+      context,
+      `${baseUrl}/v1/dispatches/${dispatchId}/await-capture?timeoutMs=1500`,
+      { headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+    expect(await1.status).toBe(200);
+    expect(await1.body).toMatchObject({
+      data: { dispatchId, matched: false, reason: 'timeout' },
+    });
+  });
+
+  it('await-capture resolves once the link is written mid-poll', async () => {
+    const createdAt = '2026-04-26T22:00:00.000Z';
+    const recordResponse = await jsonFetch(context, `${baseUrl}/v1/dispatches`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'dispatch-link-midpoll',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        kind: 'research',
+        target: { provider: 'chatgpt', mode: 'paste' },
+        title: 'Mid-poll dispatch',
+        body: 'Body linked mid-poll.',
+        createdAt,
+      }),
+    });
+    const dispatchId = (recordResponse.body as { readonly data: { readonly bac_id: string } }).data
+      .bac_id;
+
+    const awaitPromise = jsonFetch(
+      context,
+      `${baseUrl}/v1/dispatches/${dispatchId}/await-capture?timeoutMs=10000`,
+      { headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+
+    setTimeout(() => {
+      void jsonFetch(context, `${baseUrl}/v1/dispatches/${dispatchId}/link`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-bac-bridge-key': bridgeKey,
+        },
+        body: JSON.stringify({ threadId: 'bac_thread_midpoll' }),
+      });
+    }, 1500);
+
+    const settled = await awaitPromise;
+    expect(settled.status).toBe(200);
+    expect(settled.body).toMatchObject({
+      data: {
+        dispatchId,
+        matched: true,
+        thread: { threadId: 'bac_thread_midpoll' },
+        resources: { thread: 'sidetrack://thread/bac_thread_midpoll' },
+        reason: 'matched',
+      },
+    });
+  });
+
   it('lists audit events with limit and since filters', async () => {
     const createdAt = '2026-04-26T22:00:00.000Z';
     await jsonFetch(context, `${baseUrl}/v1/dispatches`, {
@@ -663,6 +801,143 @@ describe('companion HTTP server', () => {
     expect(list.status).toBe(200);
     expect(list.body).toMatchObject({
       data: [{ url: 'https://example.test/page', note: 'Remember this' }],
+    });
+  });
+
+  it('builds the anchor server-side from a term + assistant turn body', async () => {
+    const capturedAt = '2026-04-26T21:30:00.000Z';
+    const threadUrl = 'https://chatgpt.com/c/term-form-thread';
+    await jsonFetch(context, `${baseUrl}/v1/events`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'capture-term-form-001',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        provider: 'chatgpt',
+        threadUrl,
+        title: 'Architect HN analysis',
+        capturedAt,
+        turns: [
+          {
+            role: 'assistant',
+            text: 'Browser graphics stack: WebGPU gives apps lower-level GPU access without native installs.',
+            ordinal: 0,
+            capturedAt,
+          },
+        ],
+      }),
+    });
+
+    const create = await jsonFetch(context, `${baseUrl}/v1/annotations`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'annotation-term-form-001',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        url: threadUrl,
+        pageTitle: 'Architect HN analysis',
+        term: 'WebGPU',
+        note: 'Browser GPU compute API.',
+      }),
+    });
+    expect(create.status).toBe(201);
+    expect(create.body).toMatchObject({
+      data: {
+        status: 'created',
+        annotationId: expect.stringMatching(/.+/u),
+        occurrenceCount: 1,
+        totalForUrl: 1,
+        annotation: {
+          url: threadUrl,
+          anchor: {
+            textQuote: {
+              exact: 'WebGPU',
+              prefix: 'Browser graphics stack: ',
+            },
+          },
+        },
+      },
+    });
+  });
+
+  it('surfaces a structured anchor_failed result when the term thread has no captured turns', async () => {
+    const create = await jsonFetch(context, `${baseUrl}/v1/annotations`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'annotation-term-form-missing',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        url: 'https://chatgpt.com/c/never-captured',
+        pageTitle: 'Never captured',
+        term: 'WebGPU',
+        note: 'Should fail — no turns.',
+      }),
+    });
+    expect(create.status).toBe(200);
+    expect(create.body).toMatchObject({
+      data: {
+        status: 'anchor_failed',
+        reason: 'no_assistant_turns',
+        occurrenceCount: 0,
+      },
+    });
+  });
+
+  it('returns ambiguous_term_requires_selection_hint with suggestedSelectionHints for repeated terms', async () => {
+    const capturedAt = '2026-04-26T21:30:00.000Z';
+    const threadUrl = 'https://chatgpt.com/c/repeated-term-thread';
+    await jsonFetch(context, `${baseUrl}/v1/events`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'capture-repeated-term-001',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        provider: 'chatgpt',
+        threadUrl,
+        title: 'Repeated terms',
+        capturedAt,
+        turns: [
+          {
+            role: 'assistant',
+            text: 'WebGPU intro. Then WebGPU again here. Finally, WebGPU appears once more.',
+            ordinal: 0,
+            capturedAt,
+          },
+        ],
+      }),
+    });
+
+    const create = await jsonFetch(context, `${baseUrl}/v1/annotations`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'annotation-repeated-term-001',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        url: threadUrl,
+        pageTitle: 'Repeated terms',
+        term: 'WebGPU',
+        note: 'Should require disambiguation.',
+      }),
+    });
+
+    expect(create.status).toBe(200);
+    expect(create.body).toMatchObject({
+      data: {
+        status: 'anchor_failed',
+        reason: 'ambiguous_term_requires_selection_hint',
+        occurrenceCount: 3,
+        suggestedSelectionHints: expect.arrayContaining(['ordinal:1']),
+      },
     });
   });
 
@@ -1480,16 +1755,16 @@ describe('companion HTTP server', () => {
       .bac_id;
     const denied = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/bump`, {
       method: 'POST',
-      headers: { 'x-bac-bridge-key': bridgeKey, 'x-sidetrack-mcp-tool': 'bac.bump_workstream' },
+      headers: { 'x-bac-bridge-key': bridgeKey, 'x-sidetrack-mcp-tool': 'sidetrack.workstreams.bump' },
     });
     const putTrust = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/trust`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
-      body: JSON.stringify({ allowedTools: ['bac.bump_workstream'] }),
+      body: JSON.stringify({ allowedTools: ['sidetrack.workstreams.bump'] }),
     });
     const trusted = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/bump`, {
       method: 'POST',
-      headers: { 'x-bac-bridge-key': bridgeKey, 'x-sidetrack-mcp-tool': 'bac.bump_workstream' },
+      headers: { 'x-bac-bridge-key': bridgeKey, 'x-sidetrack-mcp-tool': 'sidetrack.workstreams.bump' },
     });
     const getTrust = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/trust`, {
       headers: { 'x-bac-bridge-key': bridgeKey },
@@ -1500,7 +1775,7 @@ describe('companion HTTP server', () => {
     expect(putTrust.status).toBe(200);
     expect(trusted.status).toBe(200);
     expect(getTrust.body).toMatchObject({
-      data: { workstreamId, allowedTools: ['bac.bump_workstream'] },
+      data: { workstreamId, allowedTools: ['sidetrack.workstreams.bump'] },
     });
   });
 

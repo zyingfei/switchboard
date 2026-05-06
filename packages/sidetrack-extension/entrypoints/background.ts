@@ -38,11 +38,13 @@ import {
   isRuntimeRequest,
   messageTypes,
   type AnnotateTurnResponse,
+  type ListAnnotationsByUrlResponse,
   type PublishAnnotationToChatResponse,
   type RecallQueryResponse,
   type RuntimeRequest,
   type RuntimeResponse,
 } from '../src/messages';
+import { createAnnotationClient } from '../src/annotation/client';
 import type { TrackedThread, WorkboardState } from '../src/workboard';
 import {
   buildWorkboardState,
@@ -157,6 +159,23 @@ const tryAutoLinkCapturedThread = async (
     return;
   }
   await writeDispatchLink(result.dispatchId, threadId);
+  // Forward the link into the companion vault (Phase 3). The local
+  // chrome.storage map keeps rendering Recent Dispatches without a
+  // round trip; the companion is the source of truth for cross-process
+  // consumers (MCP `sidetrack.dispatch.await_capture`, side-panel
+  // mirrors). Failures are non-fatal so a flaky companion can't break
+  // capture.
+  try {
+    const settings = await readSettings();
+    if (settings.companion.bridgeKey.trim().length > 0) {
+      await createDispatchClient(settings.companion).linkDispatchToThread(
+        result.dispatchId,
+        threadId,
+      );
+    }
+  } catch {
+    // best-effort
+  }
 };
 
 // Compare canonical forms so SPA URL drift on the active tab
@@ -294,8 +313,18 @@ const sendToCompanion = async (
     event,
     idempotencyKey('capture', `${event.threadUrl}-${event.capturedAt}`),
   );
+  // Tracking mode follows the GLOBAL settings.autoTrack mode.
+  // When autoTrack=true, known-provider captures default to
+  // 'auto' (Sidetrack auto-refreshes on every new turn). When
+  // autoTrack=false, captures default to 'manual' so the row
+  // exposes a Capture-now button. Unknown providers always
+  // start manual — we can't auto-refresh what we don't know
+  // how to scrape. Existing threads keep their mode (so an
+  // operator can stop a single thread without flipping the
+  // global mode).
   const trackingMode: ThreadUpsert['trackingMode'] =
-    event.provider === 'unknown' || !settings.autoTrack ? 'manual' : 'auto';
+    existingThread?.trackingMode ??
+    (event.provider === 'unknown' || !settings.autoTrack ? 'manual' : 'auto');
   const lastTurnRole = event.turns.at(-1)?.role;
   // Prefer the per-turn modelName the enricher scraped from the
   // assistant's last response (more accurate than event-level
@@ -436,7 +465,8 @@ const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
   const settings = await readSettings();
   const parentLink = resolveParentFromForkSource(event, allThreads);
   const trackingMode: ThreadUpsert['trackingMode'] =
-    event.provider === 'unknown' || !settings.autoTrack ? 'manual' : 'auto';
+    existing?.trackingMode ??
+    (event.provider === 'unknown' || !settings.autoTrack ? 'manual' : 'auto');
   const lastTurnRole = event.turns.at(-1)?.role;
   const upserted = await upsertLocalThread({
     provider: event.provider,
@@ -692,6 +722,17 @@ const ensureContentScriptInTab = async (
 // quickly but their composer/Stop button lights up later. The
 // content-script driver has its own per-item timeout (90s) which
 // covers the AI's reply window.
+const delay = (ms: number): Promise<void> =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+const isAutoSendResult = (
+  value: unknown,
+): value is { readonly ok: boolean; readonly error?: string } =>
+  typeof value === 'object' &&
+  value !== null &&
+  'ok' in value &&
+  typeof (value as { readonly ok?: unknown }).ok === 'boolean';
+
 const autoSendOnceTabReady = (tabId: number, body: string): void => {
   let cleared = false;
   const fire = (): void => {
@@ -703,18 +744,36 @@ const autoSendOnceTabReady = (tabId: number, body: string): void => {
     void (async () => {
       // Small extra delay so SPA shells finish hydrating their
       // composer (Quill / ProseMirror / Tiptap) before we type.
-      await new Promise<void>((resolve) => setTimeout(resolve, 1500));
-      const dispatch = await sendToContentScriptWithRecovery(tabId, {
-        type: messageTypes.autoSendItem,
-        text: body,
-        perItemTimeoutMs: 90_000,
-      });
-      if (!dispatch.ok) {
+      await delay(1500);
+      const deadline = Date.now() + 45_000;
+      let lastSendError = 'unknown';
+      for (;;) {
+        const dispatch = await sendToContentScriptWithRecovery(tabId, {
+          type: messageTypes.autoSendItem,
+          text: body,
+          perItemTimeoutMs: 90_000,
+        });
+        if (!dispatch.ok) {
+          lastSendError = dispatch.error ?? 'content script transport failed';
+        } else if (isAutoSendResult(dispatch.data)) {
+          if (dispatch.data.ok) {
+            break;
+          }
+          lastSendError = dispatch.data.error ?? 'provider auto-send failed';
+        } else {
+          lastSendError = 'content script returned an unexpected auto-send response';
+        }
+        if (Date.now() >= deadline) {
+          console.warn('[dispatchAutoSendInNewTab] content-script send failed:', lastSendError);
+          return;
+        }
+        await delay(750);
+      }
+      if (lastSendError !== 'unknown') {
         console.warn(
-          '[dispatchAutoSendInNewTab] content-script send failed:',
-          dispatch.error ?? 'unknown',
+          '[dispatchAutoSendInNewTab] content-script send recovered after:',
+          lastSendError,
         );
-        return;
       }
       // Auto-capture the destination chat after auto-send completes.
       // Without this, the freshly-created chat at /app/<id> is never
@@ -826,6 +885,7 @@ const quoteForChat = (input: string): string =>
 const buildAnnotationChatMessage = (input: {
   readonly turnText: string;
   readonly turnRole: string;
+  readonly anchorText?: string;
   readonly note: string;
   readonly capturedAt: string;
 }): string => {
@@ -835,6 +895,9 @@ const buildAnnotationChatMessage = (input: {
     '',
     quoteForChat(quote.length > 0 ? quote : '(turn text unavailable)'),
     '',
+    ...(input.anchorText === undefined || input.anchorText.trim().length === 0
+      ? []
+      : ['Keyword / quote:', input.anchorText.trim(), '']),
     'Annotation:',
     input.note.trim(),
     '',
@@ -1026,6 +1089,14 @@ const buildState = async (
   };
 };
 
+// Per-provider URL the auto-approved MCP dispatch flow opens to seed
+// a fresh thread. ChatGPT's bare / lands on a clean composer that
+// pushState's to /c/<id> on submit (the agent's body becomes the
+// first user turn). If the user has been redirected to an existing
+// chat, the content-script driver clicks the
+// data-testid="create-new-chat-button" sidebar link first to reset.
+// Probed against live chatgpt.com 2026-05; the data-testid is
+// long-standing and consistent across signed-in views.
 const MCP_AUTO_DISPATCH_URL: Partial<Record<DispatchEventRecord['target']['provider'], string>> = {
   chatgpt: 'https://chatgpt.com/',
   claude: 'https://claude.ai/new',
@@ -1038,13 +1109,127 @@ const shouldAutoDispatchMcpRequest = (dispatch: DispatchEventRecord): boolean =>
   (dispatch.status === 'sent' || dispatch.status === 'pending' || dispatch.status === 'queued') &&
   MCP_AUTO_DISPATCH_URL[dispatch.target.provider] !== undefined;
 
+// How long an unlinked auto-dispatch can stay marked "started"
+// before we retry. Generous: 5 minutes covers a slow ChatGPT
+// response, the capture round-trip, and a margin for the
+// tryAutoLinkCapturedThread match window (which itself runs only
+// when a new capture event lands). We'd rather wait too long than
+// open the same chat tab repeatedly and hammer the user's account.
+const MCP_DISPATCH_STALE_RETRY_MS = 5 * 60 * 1000;
+
+// Hard ceiling on tabs the alarm opens per tick. Even if multiple
+// dispatches are eligible at once, fan out one at a time. Avoids the
+// "alarm fires, two stuck dispatches retry simultaneously, two tabs
+// pop, ChatGPT auto-send runs in parallel against the same account"
+// failure mode that crashed the user's test browser. The remaining
+// dispatches are picked up on the next tick.
+const MCP_DISPATCH_MAX_PER_TICK = 1;
+
+// Minimum gap between any two dispatch tab-opens. Even when the
+// MAX_PER_TICK cap is in force, multiple call sites can invoke
+// openAutoApprovedMcpDispatches in rapid succession (the alarm + the
+// side panel's workboard polling + the codingAttach flow all hit
+// refreshCachedDispatches). Without a cross-call cooldown, three
+// pollers in one second produced one chatgpt + one claude + one
+// gemini tab in one second — exactly the storm that crashed the
+// developer's test browser. 30s is an arbitrary "no human-driven
+// scenario should need a faster fan-out" gate.
+const MCP_DISPATCH_GLOBAL_COOLDOWN_MS = 30_000;
+const LAST_MCP_DISPATCH_OPENED_AT_KEY = 'sidetrack.lastMcpDispatchOpenedAt';
+// In-memory single-flight is fine: it only needs to hold during one
+// `openAutoApprovedMcpDispatches` invocation. The cooldown timestamp,
+// in contrast, MUST persist across SW restarts (Chrome MV3 service
+// workers are evicted on idle, sometimes within seconds of the
+// alarm firing) — otherwise three SW restarts in 30s would defeat
+// the cooldown completely.
+let mcpDispatchInFlight = false;
+
+const readLastMcpDispatchOpenedMs = async (): Promise<number> => {
+  const result = await chrome.storage.local.get({ [LAST_MCP_DISPATCH_OPENED_AT_KEY]: '' });
+  const value = result[LAST_MCP_DISPATCH_OPENED_AT_KEY];
+  if (typeof value !== 'string' || value.length === 0) return 0;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : 0;
+};
+
+const writeLastMcpDispatchOpenedMs = async (ms: number): Promise<void> => {
+  await chrome.storage.local.set({
+    [LAST_MCP_DISPATCH_OPENED_AT_KEY]: new Date(ms).toISOString(),
+  });
+};
+
+const tabAlreadyOpenForDispatch = async (dispatchId: string): Promise<boolean> => {
+  const tabs = await readMcpDispatchTabs();
+  for (const [tabIdStr, owner] of Object.entries(tabs)) {
+    if (owner !== dispatchId) continue;
+    const tabId = Number.parseInt(tabIdStr, 10);
+    if (!Number.isInteger(tabId)) continue;
+    try {
+      await chrome.tabs.get(tabId);
+      return true; // tab still exists
+    } catch {
+      // Stale entry — tab was closed without firing onRemoved.
+      // Drop it so a future retry can proceed.
+      await dropMcpDispatchTab(tabId);
+    }
+  }
+  return false;
+};
+
 const openAutoApprovedMcpDispatches = async (
   dispatches: readonly DispatchEventRecord[],
 ): Promise<void> => {
+  // Single in-flight + cooldown gate. The alarm and the side panel
+  // both call into this on overlapping schedules; without these
+  // gates a brief flurry of polls can fan out N tabs in N seconds.
+  if (mcpDispatchInFlight) {
+    return;
+  }
+  const lastOpenedMs = await readLastMcpDispatchOpenedMs();
+  if (Date.now() - lastOpenedMs < MCP_DISPATCH_GLOBAL_COOLDOWN_MS) {
+    return;
+  }
+  mcpDispatchInFlight = true;
+  try {
+    await openAutoApprovedMcpDispatchesInner(dispatches);
+  } finally {
+    mcpDispatchInFlight = false;
+  }
+};
+
+const openAutoApprovedMcpDispatchesInner = async (
+  dispatches: readonly DispatchEventRecord[],
+): Promise<void> => {
   const alreadyStarted = await readMcpAutoDispatched();
+  const links = await readDispatchLinks();
+  const nowMs = Date.now();
+  let openedThisTick = 0;
   for (const dispatch of dispatches) {
-    if (!shouldAutoDispatchMcpRequest(dispatch) || alreadyStarted[dispatch.bac_id] !== undefined) {
+    if (openedThisTick >= MCP_DISPATCH_MAX_PER_TICK) break;
+    if (!shouldAutoDispatchMcpRequest(dispatch)) {
       continue;
+    }
+    // Defense against tab-spawn explosions: if a tab is already
+    // associated with this dispatch (whether the auto-send is still
+    // in flight or the user just hasn't closed it), don't open
+    // another. The existing tab is either making progress or was
+    // abandoned — either way, doubling up doesn't help.
+    if (await tabAlreadyOpenForDispatch(dispatch.bac_id)) {
+      continue;
+    }
+    const startedAt = alreadyStarted[dispatch.bac_id];
+    if (startedAt !== undefined) {
+      // Linked → handled, skip.
+      if (links[dispatch.bac_id] !== undefined) continue;
+      // Unlinked: was the first attempt recent enough that we should
+      // wait? If yes, skip; otherwise fall through to retry.
+      const startedMs = Date.parse(startedAt);
+      if (Number.isFinite(startedMs) && nowMs - startedMs < MCP_DISPATCH_STALE_RETRY_MS) {
+        continue;
+      }
+      console.warn(
+        `[mcp.request_dispatch] retrying stuck dispatch ${dispatch.bac_id} (started ${startedAt}, no thread link).`,
+      );
     }
     const url = MCP_AUTO_DISPATCH_URL[dispatch.target.provider];
     if (url === undefined) {
@@ -1054,7 +1239,10 @@ const openAutoApprovedMcpDispatches = async (
     try {
       const created = await chrome.tabs.create({ url, active: true });
       if (typeof created.id === 'number') {
+        await writeMcpDispatchTab(created.id, dispatch.bac_id);
         autoSendOnceTabReady(created.id, dispatch.body);
+        openedThisTick += 1;
+        await writeLastMcpDispatchOpenedMs(Date.now());
       }
     } catch (error) {
       console.warn(
@@ -1371,7 +1559,39 @@ const updateReminder = async (
   }
 };
 
-const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> => {
+// Tabs opened by the auto-approved MCP dispatch flow. The first
+// auto-capture that arrives from one of these tabs bypasses the
+// autoTrack gate (the dispatch is an explicit user/agent action;
+// requiring the user to manually flip auto-track defeats the point).
+// Entries are removed once the resulting thread is tracked, so a
+// later un-dispatched capture from the same tab can't piggy-back.
+const MCP_DISPATCH_TABS_KEY = 'sidetrack.mcpDispatchTabs';
+
+const readMcpDispatchTabs = async (): Promise<Readonly<Partial<Record<string, string>>>> => {
+  const result = await chrome.storage.local.get({ [MCP_DISPATCH_TABS_KEY]: {} });
+  const value = result[MCP_DISPATCH_TABS_KEY];
+  return typeof value === 'object' && value !== null
+    ? (value as Readonly<Partial<Record<string, string>>>)
+    : {};
+};
+
+const writeMcpDispatchTab = async (tabId: number, dispatchId: string): Promise<void> => {
+  const current = { ...(await readMcpDispatchTabs()) };
+  current[String(tabId)] = dispatchId;
+  await chrome.storage.local.set({ [MCP_DISPATCH_TABS_KEY]: current });
+};
+
+const dropMcpDispatchTab = async (tabId: number): Promise<void> => {
+  const current = { ...(await readMcpDispatchTabs()) };
+  if (current[String(tabId)] === undefined) return;
+  delete current[String(tabId)];
+  await chrome.storage.local.set({ [MCP_DISPATCH_TABS_KEY]: current });
+};
+
+const handleRequest = async (
+  request: RuntimeRequest,
+  senderTabId?: number,
+): Promise<RuntimeResponse> => {
   if (request.type === messageTypes.selectorCanary) {
     // Drop canary reports for non-chat URLs on a known provider host
     // (claude.ai/code, chatgpt.com landing, etc.) — they trivially fail
@@ -1404,22 +1624,37 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
     ) {
       return { ok: true, state: await buildState('connected') };
     }
-    // autoTrack gate: when off (default), auto-captures from the
-    // content script must NOT spawn brand-new thread records. The
-    // user's expectation is "manual tracking only" — they explicitly
-    // capture the threads they care about. Refresh-captures for
-    // already-tracked threads still flow through (so existing rows
-    // stay current); new-thread captures are silently dropped.
+    // Auto-capture gate (global + per-thread).
+    //   - Global autoTrack=false: don't spawn brand-new thread
+    //     records from a content-script capture. Refresh-captures
+    //     for already-tracked threads still flow through.
+    //   - autoTrack=true OR an existing thread is matched: still
+    //     skip the refresh when that thread's mode is 'manual' or
+    //     'stopped'. 'manual' means "capture only when I press the
+    //     row's Capture button"; 'stopped' is the paused state.
+    // Both rules carve out an exception for MCP-auto-approved
+    // dispatch tabs — those represent explicit agent-driven
+    // actions and the resulting thread IS the whole point.
     const settings = await readSettings();
-    if (!settings.autoTrack) {
+    const dispatchTabs = await readMcpDispatchTabs();
+    const isDispatchTab =
+      senderTabId !== undefined && dispatchTabs[String(senderTabId)] !== undefined;
+    if (!isDispatchTab) {
       const known = (await readThreads()).find((t) => t.threadUrl === request.capture.threadUrl);
       if (known === undefined) {
+        if (!settings.autoTrack) {
+          return { ok: true, state: await buildState('connected') };
+        }
+      } else if (known.trackingMode === 'manual' || known.trackingMode === 'stopped') {
         return { ok: true, state: await buildState('connected') };
       }
     }
     const response = await withCompanionStatus(() => storeCaptureEvent(request.capture), 'capture');
     if (response.ok) {
       void notifyCaptureSuccess(request.capture);
+      if (isDispatchTab && senderTabId !== undefined) {
+        await dropMcpDispatchTab(senderTabId);
+      }
     }
     return response;
   }
@@ -1614,6 +1849,7 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
           ...(request.sourceSelector === undefined
             ? {}
             : { sourceSelector: request.sourceSelector }),
+          ...(request.anchorText === undefined ? {} : { anchorText: request.anchorText }),
           note: request.note,
           capturedAt: request.capturedAt,
         });
@@ -1640,6 +1876,30 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
     return (await buildAnnotateResponse()) as unknown as RuntimeResponse;
   }
 
+  if (request.type === messageTypes.listAnnotationsByUrl) {
+    // Content scripts on https://chatgpt.com hit the companion's
+    // loopback-only origin gate (403 LOOPBACK_ONLY). The SW's
+    // chrome-extension:// origin is on the allowlist, so we proxy
+    // the read here and return a plain JSON envelope. Tunneled
+    // through RuntimeResponse the same way recallQuery does.
+    const buildListResponse = async (): Promise<ListAnnotationsByUrlResponse> => {
+      try {
+        const client = await createAnnotationClient();
+        if (client === undefined) {
+          return { ok: false, error: 'Companion not configured.' };
+        }
+        const annotations = await client.listAnnotationsForUrl(request.url);
+        return { ok: true, annotations };
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : 'listAnnotationsByUrl failed.',
+        };
+      }
+    };
+    return (await buildListResponse()) as unknown as RuntimeResponse;
+  }
+
   if (request.type === messageTypes.publishAnnotationToChat) {
     // Side-panel publish action for a turn annotation. This deliberately
     // reuses the existing provider auto-send driver instead of adding
@@ -1659,6 +1919,7 @@ const handleRequest = async (request: RuntimeRequest): Promise<RuntimeResponse> 
           text: buildAnnotationChatMessage({
             turnText: request.turnText,
             turnRole: request.turnRole,
+            ...(request.anchorText === undefined ? {} : { anchorText: request.anchorText }),
             note: request.note,
             capturedAt: request.capturedAt,
           }),
@@ -2044,6 +2305,24 @@ export default defineBackground(() => {
   // sendToCompanion bug (every capture reissued a thread bac_id;
   // reminders accumulated against orphans). Idempotent — runs on
   // every service-worker boot, no-op when storage is already clean.
+  const DISPATCH_POLL_ALARM = 'sidetrack.dispatch.poll';
+  // 1-minute cadence: Chrome's MV3 minimum. Latency from
+  // bac.request_dispatch to the chat tab opening is bounded by this
+  // alarm in the worst case (no side panel open, no incoming
+  // workboard request). Earlier this was 5 min in an effort to be
+  // conservative — but the 30s cooldown gate, single-flight mutex,
+  // and MAX_PER_TICK=1 already cap the blast radius of a
+  // misconfigured retry loop. Slow polling didn't reduce risk; it
+  // just made the autonomous flow feel broken. Idempotent: same
+  // alarm name replaces any existing.
+  const ensureDispatchPollAlarm = async (): Promise<void> => {
+    try {
+      await chrome.alarms.create(DISPATCH_POLL_ALARM, { periodInMinutes: 1 });
+    } catch (error) {
+      console.warn('[dispatch.poll] alarm create failed:', error);
+    }
+  };
+
   const pruneOrphanRemindersAndLinks = async (): Promise<void> => {
     try {
       const knownThreadIds = new Set((await readThreads()).map((t) => t.bac_id));
@@ -2063,6 +2342,7 @@ export default defineBackground(() => {
   chrome.runtime.onInstalled.addListener((details) => {
     void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => undefined);
     void pruneOrphanRemindersAndLinks();
+    void ensureDispatchPollAlarm();
     // Heal pre-existing tabs after an install/update/reload so the
     // user doesn't have to refresh each chat tab manually. The first
     // install case is harmless: matching tabs that already had no
@@ -2082,10 +2362,34 @@ export default defineBackground(() => {
   chrome.runtime.onStartup.addListener(() => {
     void pruneOrphanRemindersAndLinks();
     void reinjectContentScriptIntoOpenTabs();
+    void ensureDispatchPollAlarm();
   });
+
+  // Periodic background poll for new MCP-auto-approved dispatches.
+  // Without this, refreshCachedDispatches only fires when the side
+  // panel makes a workboard request — meaning agent-initiated
+  // dispatches sit unconsumed if the side panel is closed. Chrome's
+  // alarm minimum is 1 minute, so the worst-case latency from
+  // bac.request_dispatch to "tab opens" is ~1 minute. The alarm is
+  // additive; explicit side-panel actions still trigger immediately.
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name !== DISPATCH_POLL_ALARM) return;
+    void (async () => {
+      try {
+        if (!(await isCompanionConfigured())) return;
+        await refreshCachedDispatches();
+      } catch (error) {
+        console.warn('[dispatch.poll] failed:', error);
+      }
+    })();
+  });
+  void ensureDispatchPollAlarm();
 
   chrome.tabs.onRemoved.addListener((tabId) => {
     void markClosedTabRestorable(tabId).catch(() => undefined);
+    // Clean up MCP-dispatch markers on tab close so the storage map
+    // doesn't accumulate dead entries.
+    void dropMcpDispatchTab(tabId).catch(() => undefined);
   });
 
   // Whenever the user activates a different tab or a tab's URL
@@ -2121,12 +2425,12 @@ export default defineBackground(() => {
   });
 
   chrome.runtime.onMessage.addListener(
-    (message: unknown, _sender, sendResponse: (response: RuntimeResponse) => void) => {
+    (message: unknown, sender, sendResponse: (response: RuntimeResponse) => void) => {
       if (!isRuntimeRequest(message)) {
         return undefined;
       }
 
-      void handleRequest(message)
+      void handleRequest(message, sender.tab?.id)
         .then(sendResponse)
         .catch(async (error: unknown) => {
           sendResponse({

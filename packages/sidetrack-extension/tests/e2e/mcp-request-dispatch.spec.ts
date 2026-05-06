@@ -63,9 +63,10 @@ test.describe('MCP request dispatch (synthetic)', () => {
       await sidepanel.locator('select').selectOption(workstreamId);
       await sidepanel.getByRole('button', { name: 'Generate prompt' }).click();
       const prompt = await extractPrompt(sidepanel);
-      expect(prompt).toContain('sidetrack_mcp: ws://127.0.0.1:8721/mcp?token=');
+      expect(prompt).toContain('sidetrack_mcp: http://127.0.0.1:8721/mcp');
+      expect(prompt).toContain('sidetrack_mcp_auth: Bearer ');
       expect(prompt).toContain(`sidetrack_workstream_id: ${workstreamId}`);
-      expect(prompt).toContain('bac.request_dispatch');
+      expect(prompt).toContain('sidetrack.session.attach');
       const token = extractAttachToken(prompt);
 
       const activeCompanion = companion;
@@ -111,18 +112,18 @@ test.describe('MCP request dispatch (synthetic)', () => {
         },
       });
 
-      const registered = (await mcp.callTool('bac.coding_session_register', {
-        token,
+      const registered = (await mcp.callTool('sidetrack.session.attach', {
+        attachToken: token,
         tool: 'codex',
         cwd: '/Users/zyingfei/switchboard',
         branch: 'codex/mcp-inbound-dispatch',
         sessionId: 'mcp-request-dispatch-synthetic',
         name: 'codex · request dispatch',
-      })) as { readonly structuredContent?: { readonly bac_id?: string } };
-      const codingSessionId = registered.structuredContent?.bac_id;
+      })) as { readonly structuredContent?: { readonly codingSessionId?: string } };
+      const codingSessionId = registered.structuredContent?.codingSessionId;
       expect(codingSessionId).toBeTruthy();
 
-      const requested = (await mcp.callTool('bac.request_dispatch', {
+      const requested = (await mcp.callTool('sidetrack.dispatch.create', {
         codingSessionId,
         targetProvider: 'chatgpt',
         title: 'Synthetic inbound dispatch',

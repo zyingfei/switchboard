@@ -143,6 +143,22 @@ export const Icons = {
       <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
     </svg>
   ),
+  // Tracking-mode pair. `autoCycle` is a closed-loop arrow
+  // (Sidetrack keeps refreshing on every new turn). `manualTap`
+  // is a finger-tap (capture only when the user clicks).
+  autoCycle: (
+    <svg viewBox="0 0 24 24" {...sw}>
+      <path d="M21 12a9 9 0 1 1-3-6.7" />
+      <path d="M21 4v5h-5" />
+    </svg>
+  ),
+  manualTap: (
+    <svg viewBox="0 0 24 24" {...sw}>
+      <path d="M9 11V5a2 2 0 0 1 4 0v7" />
+      <path d="M13 8h2.5a2.5 2.5 0 0 1 0 5H13" />
+      <path d="M8 12.5 6.5 14a3 3 0 0 0 .8 5h7.2a4 4 0 0 0 4-4v-3" />
+    </svg>
+  ),
 } satisfies Record<string, ReactElement>;
 
 export type IconName = keyof typeof Icons;

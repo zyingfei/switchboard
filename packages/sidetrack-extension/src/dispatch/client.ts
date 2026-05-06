@@ -85,6 +85,10 @@ export interface DispatchClient {
     readonly limit?: number;
     readonly since?: string;
   }) => Promise<readonly DispatchEventRecord[]>;
+  readonly linkDispatchToThread: (
+    dispatchId: string,
+    threadId: string,
+  ) => Promise<void>;
 }
 
 export class HttpDispatchClient implements DispatchClient {
@@ -118,6 +122,19 @@ export class HttpDispatchClient implements DispatchClient {
     const query = params.toString();
     const path = query.length > 0 ? `/dispatches?${query}` : '/dispatches';
     return parseListResponse(await this.request(path, { method: 'GET' }));
+  }
+
+  // Phase 3: forward the local match into the companion's link table.
+  // Idempotent on (dispatchId, threadId); a second call with the same
+  // pair is a no-op. Failures are non-fatal — the local chrome.storage
+  // map still renders the dispatch as Linked even if this round-trips
+  // fails (companion is authoritative on read but the extension
+  // writes both stores).
+  async linkDispatchToThread(dispatchId: string, threadId: string): Promise<void> {
+    await this.request(`/dispatches/${encodeURIComponent(dispatchId)}/link`, {
+      method: 'POST',
+      body: JSON.stringify({ threadId }),
+    });
   }
 
   private async request(path: string, init: RequestInit): Promise<unknown> {

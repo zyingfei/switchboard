@@ -441,31 +441,31 @@ const App = () => {
   >([]);
   const [workstreamDetailTrust, setWorkstreamDetailTrust] = useState<readonly TrustEntry[]>([
     {
-      tool: 'bac.queue_item',
+      tool: 'sidetrack.queue.create',
       humanLabel: 'queue_item',
       description: 'queue an outbound follow-up to a provider',
       allowed: true,
     },
     {
-      tool: 'bac.move_item',
+      tool: 'sidetrack.threads.move',
       humanLabel: 'move_item',
       description: 'move a tracked thread to this workstream',
       allowed: false,
     },
     {
-      tool: 'bac.bump_workstream',
+      tool: 'sidetrack.workstreams.bump',
       humanLabel: 'bump_workstream',
       description: 'raise priority on a queued ask',
       allowed: false,
     },
     {
-      tool: 'bac.archive_thread',
+      tool: 'sidetrack.threads.archive',
       humanLabel: 'archive_thread',
       description: 'archive a tracked thread',
       allowed: false,
     },
     {
-      tool: 'bac.unarchive_thread',
+      tool: 'sidetrack.threads.unarchive',
       humanLabel: 'unarchive_thread',
       description: 'restore an archived thread',
       allowed: false,
@@ -602,6 +602,26 @@ const App = () => {
   const [recallStatus, setRecallStatus] = useState<
     'missing' | 'stale' | 'empty' | 'rebuilding' | 'ready' | null
   >(null);
+
+  // MCP Streamable HTTP info exposed by the companion's /v1/status
+  // when the companion is also managing the sidetrack-mcp child.
+  // Side-panel attach prompts use this to embed the *real* auth key
+  // the MCP server is accepting, instead of the user's bridge key
+  // (which is a different secret and only worked previously by
+  // accident when the user manually started MCP with
+  // --mcp-auth-key=<bridge>).
+  const [mcpInfo, setMcpInfo] = useState<{
+    readonly url: string;
+    readonly port: number;
+    readonly authKey: string;
+    readonly health?: {
+      readonly reachable: boolean;
+      readonly authAccepted: boolean;
+      readonly status: 'ok' | 'auth_failed' | 'unreachable';
+      readonly checkedAt: string;
+    };
+  } | null>(null);
+  const [vaultRoot, setVaultRoot] = useState<string | null>(null);
 
   const threads = useMemo(() => visibleThreads(state.threads), [state.threads]);
   // Stable string that mutates whenever the workstream graph or any
@@ -752,6 +772,100 @@ const App = () => {
       window.clearInterval(handle);
     };
   }, [state.companionStatus, bridgeKey, state.settings.companion.port, recallStatus]);
+
+  // Fetch /v1/status to discover the companion-managed Streamable
+  // HTTP MCP server (port + auth key). Only present when the user
+  // starts the companion with --mcp-port. Refreshed when companion
+  // reconnects; a stale-but-non-zero value still works because the
+  // auth key is persisted on disk and stable across companion
+  // restarts.
+  useEffect(() => {
+    if (state.companionStatus !== 'connected' || bridgeKey.trim().length === 0) {
+      setMcpInfo(null);
+      setVaultRoot(null);
+      return undefined;
+    }
+    const portValue = state.settings.companion.port;
+    let cancelled = false;
+    const fetchMcp = async (): Promise<void> => {
+      try {
+        const response = await fetch(`http://127.0.0.1:${String(portValue)}/v1/status`, {
+          headers: { 'x-bac-bridge-key': bridgeKey },
+        });
+        if (!response.ok || cancelled) return;
+        const body = (await response.json()) as {
+          readonly data?: {
+            readonly vaultRoot?: unknown;
+            readonly mcp?: {
+              readonly url?: unknown;
+              readonly port?: unknown;
+              readonly authKey?: unknown;
+              readonly health?: {
+                readonly reachable?: unknown;
+                readonly authAccepted?: unknown;
+                readonly status?: unknown;
+                readonly checkedAt?: unknown;
+              };
+            };
+          };
+        };
+        const data = body.data;
+        if (typeof data?.vaultRoot === 'string' && data.vaultRoot.length > 0) {
+          setVaultRoot(data.vaultRoot);
+        } else {
+          setVaultRoot(null);
+        }
+        const mcp = data?.mcp;
+        if (
+          mcp !== undefined &&
+          typeof mcp.url === 'string' &&
+          typeof mcp.port === 'number' &&
+          typeof mcp.authKey === 'string'
+        ) {
+          const healthRaw = mcp.health;
+          let health:
+            | {
+                readonly reachable: boolean;
+                readonly authAccepted: boolean;
+                readonly status: 'ok' | 'auth_failed' | 'unreachable';
+                readonly checkedAt: string;
+              }
+            | undefined;
+          if (
+            healthRaw !== undefined &&
+            typeof healthRaw.reachable === 'boolean' &&
+            typeof healthRaw.authAccepted === 'boolean' &&
+            (healthRaw.status === 'ok' ||
+              healthRaw.status === 'auth_failed' ||
+              healthRaw.status === 'unreachable') &&
+            typeof healthRaw.checkedAt === 'string'
+          ) {
+            health = {
+              reachable: healthRaw.reachable,
+              authAccepted: healthRaw.authAccepted,
+              status: healthRaw.status,
+              checkedAt: healthRaw.checkedAt,
+            };
+          }
+          setMcpInfo({
+            url: mcp.url,
+            port: mcp.port,
+            authKey: mcp.authKey,
+            ...(health === undefined ? {} : { health }),
+          });
+        } else {
+          setMcpInfo(null);
+        }
+      } catch {
+        // Companion unreachable mid-poll — keep last known value;
+        // CodingAttach gracefully falls back to the bridge-key URL.
+      }
+    };
+    void fetchMcp();
+    return () => {
+      cancelled = true;
+    };
+  }, [state.companionStatus, bridgeKey, state.settings.companion.port]);
 
   useEffect(() => {
     const runtimeMessages = chrome.runtime.onMessage;
@@ -981,6 +1095,7 @@ const App = () => {
   // half-typed note.
   const [annotateTurnKey, setAnnotateTurnKey] = useState<string | null>(null);
   const [annotateTurnDraft, setAnnotateTurnDraft] = useState('');
+  const [annotateTurnAnchorText, setAnnotateTurnAnchorText] = useState('');
   const [annotateTurnStatus, setAnnotateTurnStatus] = useState<{
     readonly key: string;
     readonly tone: 'saving' | 'ok' | 'error';
@@ -1600,7 +1715,7 @@ const App = () => {
       // front-loading a contract that capable agents auto-discover
       // via tools/list. Side-by-side review:
       // packages/sidetrack-mcp/src/e2e/handoff-prompt-trim-review.md.
-      body = `# Coding handoff: ${thread.title}\nsidetrack_mcp: ws://127.0.0.1:8721/mcp?token=${keyStr}\nsidetrack_thread_id: ${thread.bac_id}\n(connect → tools/list → bac.read_thread_md)\n\n## User's ask\n…`;
+      body = `# Coding handoff: ${thread.title}\nsidetrack_mcp: http://127.0.0.1:8721/mcp\nsidetrack_mcp_auth: Bearer ${keyStr}\nsidetrack_thread_id: ${thread.bac_id}\n(connect → readResource sidetrack://thread/<id>/markdown)\n\n## User's ask\n…`;
     } else {
       const today = new Date().toISOString().slice(0, 10);
       body = `---\ntitle: ${thread.title}\ncreated: ${today}\nsource: ${thread.threadUrl}\nprovider: ${provider}\n---\n\n# ${thread.title}\n\n${turnsMd}`;
@@ -1793,6 +1908,7 @@ const App = () => {
     publishToChat = false,
   ): void => {
     const note = annotateTurnDraft.trim();
+    const anchorText = annotateTurnAnchorText.trim();
     if (note.length === 0) {
       return;
     }
@@ -1811,6 +1927,7 @@ const App = () => {
           threadUrl,
           turnText: turn.text,
           ...(turn.sourceSelector === undefined ? {} : { sourceSelector: turn.sourceSelector }),
+          ...(anchorText.length === 0 ? {} : { anchorText }),
           note,
           capturedAt,
         });
@@ -1829,6 +1946,7 @@ const App = () => {
               threadUrl,
               turnText: turn.text,
               turnRole: turn.role,
+              ...(anchorText.length === 0 ? {} : { anchorText }),
               note,
               capturedAt,
             },
@@ -1845,6 +1963,7 @@ const App = () => {
           }
         }
         setAnnotateTurnDraft('');
+        setAnnotateTurnAnchorText('');
         setAnnotateTurnKey(null);
         // Surface a soft success line so the user can confirm the
         // marker landed even though the side panel doesn't show the
@@ -1853,10 +1972,15 @@ const App = () => {
         // but the in-page marker still mounted.
         setAnnotateTurnStatus({
           key,
-          tone: response.error === undefined ? 'ok' : 'error',
+          tone: response.error === undefined || publishToChat ? 'ok' : 'error',
           text:
-            response.error ??
-            (publishToChat ? 'marker placed and published to chat' : 'marker placed on live page'),
+            response.error === undefined
+              ? publishToChat
+                ? 'marker placed and published to chat'
+                : 'marker placed on live page'
+              : publishToChat
+                ? `marker placed and published to chat; ${response.error}`
+                : response.error,
         });
         if (!publishToChat) {
           window.setTimeout(() => {
@@ -2692,6 +2816,27 @@ const App = () => {
               {Icons.arrowR}
             </span>
           </button>
+          {thread.trackingMode === 'manual' ? (
+            <button
+              type="button"
+              className="btn-link thread-action-icon"
+              title="Capture this thread now (manual mode — no auto-refresh)"
+              aria-label="Capture this thread now"
+              onClick={(e) => {
+                e.stopPropagation();
+                void (async () => {
+                  await openTabForThread(thread);
+                  await runAction(() =>
+                    sendRequest({ type: messageTypes.captureCurrentTab }),
+                  );
+                })();
+              }}
+            >
+              <span className="icon-12" aria-hidden>
+                {Icons.manualTap}
+              </span>
+            </button>
+          ) : null}
           {(() => {
             const requiresCompanion =
               state.companionStatus !== 'connected' || bridgeKey.length === 0;
@@ -3113,10 +3258,12 @@ const App = () => {
                         if (annotateOpen) {
                           setAnnotateTurnKey(null);
                           setAnnotateTurnDraft('');
+                          setAnnotateTurnAnchorText('');
                           return;
                         }
                         setAnnotateTurnKey(turnKey);
                         setAnnotateTurnDraft('');
+                        setAnnotateTurnAnchorText('');
                         setAnnotateTurnStatus(null);
                       }}
                     >
@@ -3133,6 +3280,15 @@ const App = () => {
                           submitTurnAnnotation(thread.threadUrl, turn, turnKey);
                         }}
                       >
+                        <input
+                          className="thread-turn-annotate-input"
+                          aria-label="Keyword or quote to highlight"
+                          placeholder="Keyword / quote to highlight (optional)"
+                          value={annotateTurnAnchorText}
+                          onChange={(e) => {
+                            setAnnotateTurnAnchorText(e.target.value);
+                          }}
+                        />
                         <textarea
                           className="thread-turn-annotate-input"
                           rows={2}
@@ -3437,6 +3593,10 @@ const App = () => {
             type="button"
             aria-label="Find active tab in side panel"
           >
+            {/* Crosshair / locator. Visually distinct from the
+                magnifier in "Search indexed threads" — this one
+                tells you where the active tab IS, not searches
+                for something to find. */}
             <svg
               viewBox="0 0 24 24"
               fill="none"
@@ -3445,8 +3605,12 @@ const App = () => {
               strokeLinecap="round"
               strokeLinejoin="round"
             >
-              <circle cx="11" cy="11" r="7" />
-              <line x1="21" y1="21" x2="16.65" y2="16.65" />
+              <circle cx="12" cy="12" r="9" />
+              <circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none" />
+              <line x1="12" y1="2" x2="12" y2="5.5" />
+              <line x1="12" y1="18.5" x2="12" y2="22" />
+              <line x1="2" y1="12" x2="5.5" y2="12" />
+              <line x1="18.5" y1="12" x2="22" y2="12" />
             </svg>
           </button>
           <button
@@ -3461,26 +3625,70 @@ const App = () => {
           >
             <span style={{ display: 'inline-flex', width: 14, height: 14 }}>{Icons.search}</span>
           </button>
+          {/* Capture-current-tab (+) is only useful when capture mode
+              is Manual. When mode is Auto, Sidetrack refreshes
+              detected threads automatically and the user has nothing
+              to do here, so we hide the button to declutter the
+              toolbar. */}
+          {state.settings.autoTrack ? null : (
+            <button
+              className="icon-btn"
+              title="Capture / track the current tab — adds it to your side panel as a tracked thread"
+              onClick={() => {
+                void runAction(() => sendRequest({ type: messageTypes.captureCurrentTab }));
+              }}
+              type="button"
+              aria-label="Capture current tab"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.6"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M12 5v14" />
+                <path d="M5 12h14" />
+              </svg>
+            </button>
+          )}
+          {/* Capture-mode toggle (global). The icon glyph + a small
+              uppercase mono label show the current mode at a glance:
+              ↻ AUTO  — Sidetrack refreshes detected threads on every
+                        new turn
+              ✋ MANUAL — refreshes only when the user clicks a row's
+                          Capture button
+              Click cycles. Tooltip says what the click will do. */}
           <button
-            className="icon-btn"
-            title="Capture / track the current tab — adds it to your side panel as a tracked thread"
+            className={'icon-btn icon-btn-labeled' + (state.settings.autoTrack ? ' on' : '')}
+            title={
+              state.settings.autoTrack
+                ? 'Capture mode: Auto — refreshes every new turn. Click to switch to Manual.'
+                : 'Capture mode: Manual — capture-on-demand per row. Click to switch to Auto.'
+            }
             onClick={() => {
-              void runAction(() => sendRequest({ type: messageTypes.captureCurrentTab }));
+              void runAction(() =>
+                sendRequest({
+                  type: messageTypes.saveLocalPreferences,
+                  preferences: { autoTrack: !state.settings.autoTrack },
+                }),
+              );
             }}
             type="button"
-            aria-label="Capture current tab"
+            aria-label={
+              state.settings.autoTrack
+                ? 'Capture mode is Auto — switch to Manual'
+                : 'Capture mode is Manual — switch to Auto'
+            }
+            aria-pressed={state.settings.autoTrack}
           >
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.6"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M12 5v14" />
-              <path d="M5 12h14" />
-            </svg>
+            <span style={{ display: 'inline-flex', width: 14, height: 14 }}>
+              {state.settings.autoTrack ? Icons.autoCycle : Icons.manualTap}
+            </span>
+            <span className="icon-btn-label mono">
+              {state.settings.autoTrack ? 'auto' : 'manual'}
+            </span>
           </button>
           <button
             className="icon-btn"
@@ -4378,6 +4586,14 @@ const App = () => {
               capturedAt: t.capturedAt,
             })),
             ...(composeWorkstream !== undefined ? { workstreamId: composeWorkstream.bac_id } : {}),
+            // Surface any staged inline-review draft so the composer
+            // can offer an "Include N comments" toggle in the scope
+            // options. The toggle defaults to ON when there's at least
+            // one span; user can untoggle to dispatch without the
+            // commentary.
+            ...(state.reviewDrafts[composeThread.bac_id] !== undefined
+              ? { reviewDraft: state.reviewDrafts[composeThread.bac_id] }
+              : {}),
           }}
           scopeSuggestions={composeScopeSuggestionsByThread.get(composeThread.bac_id) ?? []}
           onScopeChange={(workstreamId) => {
@@ -4815,11 +5031,22 @@ const App = () => {
           {...(selectedWorkstream !== '' ? { defaultWorkstreamId: selectedWorkstream } : {})}
           workstreams={workstreamOptions}
           companionAvailable={state.companionStatus === 'connected'}
-          mcpEndpoint={
-            bridgeKey.length === 0
-              ? 'ws://127.0.0.1:8721/mcp'
-              : `ws://127.0.0.1:8721/mcp?token=${encodeURIComponent(bridgeKey)}`
-          }
+          mcpEndpoint={(() => {
+            // Prefer the companion-managed MCP info from /v1/status —
+            // its authKey is what the running MCP server actually
+            // accepts. Fall back to the loopback default when the
+            // companion isn't managing MCP (older setup where the
+            // user starts sidetrack-mcp by hand).
+            if (mcpInfo !== null) {
+              return mcpInfo.url;
+            }
+            return 'http://127.0.0.1:8721/mcp';
+          })()}
+          mcpAuthBearer={mcpInfo?.authKey ?? (bridgeKey.length === 0 ? undefined : bridgeKey)}
+          {...(mcpInfo?.health === undefined ? {} : { mcpHealth: mcpInfo.health })}
+          {...(vaultRoot === null ? {} : { vaultRoot })}
+          {...(bridgeKey.length === 0 ? {} : { bridgeKey })}
+          companionPort={state.settings.companion.port}
           onCancel={() => {
             setCodingAttachOpen(false);
           }}

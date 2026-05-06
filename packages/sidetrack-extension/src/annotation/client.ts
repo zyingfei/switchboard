@@ -11,6 +11,7 @@ export interface Annotation {
 }
 
 const SETTINGS_KEY = 'sidetrack.settings';
+const WORKBOARD_STATE_MESSAGE = 'sidetrack.workboard.state';
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;
@@ -27,9 +28,7 @@ const parseProblemMessage = (value: unknown): string | undefined => {
       : undefined;
 };
 
-const readCompanionSettings = async (): Promise<CompanionSettings | undefined> => {
-  const result = await chrome.storage.local.get({ [SETTINGS_KEY]: undefined });
-  const settings = result[SETTINGS_KEY];
+const parseCompanionSettings = (settings: unknown): CompanionSettings | undefined => {
   if (!isRecord(settings) || !isRecord(settings.companion)) {
     return undefined;
   }
@@ -41,6 +40,32 @@ const readCompanionSettings = async (): Promise<CompanionSettings | undefined> =
     return undefined;
   }
   return { port: companion.port, bridgeKey: companion.bridgeKey };
+};
+
+const readCompanionSettingsFromBackground = async (): Promise<CompanionSettings | undefined> => {
+  const response = (await chrome.runtime
+    .sendMessage({ type: WORKBOARD_STATE_MESSAGE })
+    .catch(() => undefined)) as unknown;
+  if (!isRecord(response) || response.ok !== true || !isRecord(response.state)) {
+    return undefined;
+  }
+  return parseCompanionSettings(response.state.settings);
+};
+
+const readCompanionSettings = async (): Promise<CompanionSettings | undefined> => {
+  // chrome.storage.local.get({ key: undefined }) is a Chrome API
+  // footgun: when the default value is `undefined`, the key is
+  // dropped from the returned record entirely — the call returns
+  // {} even when the key exists in storage. The string form
+  // (or array form) doesn't have this issue. Until this fix,
+  // every call to createAnnotationClient from any extension
+  // context silently returned undefined, which is why annotation
+  // restore on real provider pages produced zero highlights and
+  // the listAnnotationsByUrl SW route reported "Companion not
+  // configured" even with valid settings present.
+  const result = await chrome.storage.local.get(SETTINGS_KEY);
+  const fromStorage = parseCompanionSettings(result[SETTINGS_KEY]);
+  return fromStorage ?? (await readCompanionSettingsFromBackground());
 };
 
 class AnnotationClient {

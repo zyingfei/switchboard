@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Modal } from './Modal';
 import { Icons } from './icons';
 import { ScopeSuggestions, type ScopeSuggestion } from './ScopeSuggestions';
+import { buildReviewFollowUpText } from '../../../src/review/draft';
+import type { ReviewDraft } from '../../../src/review/types';
 
 export type PacketKind =
   | 'context_pack'
@@ -62,6 +64,11 @@ export interface PacketComposerScope {
   // Recent turns from the source thread, oldest → newest. The composer's
   // "Include last N turns" picker walks from the end of this list.
   readonly availableTurns?: readonly PacketComposerTurn[];
+  // Inline-review draft staged on the source thread (selection-anchored
+  // comments + optional overall note + verdict). The composer surfaces
+  // a toggle when this is set with at least one span: the user can
+  // include the comments in the dispatched body or skip them entirely.
+  readonly reviewDraft?: ReviewDraft;
 }
 
 export interface PacketComposerProps {
@@ -304,14 +311,15 @@ ${ctx}
 //
 // New shape:
 //   1. Single thread_id (the only handle the agent needs).
-//   2. MCP endpoint URL (ws://… with the bridge token inline so the
-//      agent can connect without follow-up plumbing).
+//   2. MCP endpoint URL (Streamable HTTP) plus a bearer line so the
+//      agent can connect without follow-up plumbing.
 //   3. The user's ask.
 //
 // Everything else — thread URL, provider, captured turns, tools
 // list, dispatches, annotations — is reachable via MCP. The agent
-// calls `tools/list` to discover what's available, `bac.read_thread_md`
-// to get the body, and so on. Nothing is duplicated in the prompt.
+// calls `tools/list` to discover what's available and reads the
+// thread body via the `sidetrack://thread/<id>/markdown` resource.
+// Nothing is duplicated in the prompt.
 //
 // `turnsMd` is intentionally NOT used here. It used to provide an
 // "offline fallback" snapshot, but if the companion is unreachable
@@ -328,9 +336,10 @@ const buildCodingAgentPacket = (
   // a contract the agent never read. Side-by-side review in
   // sidetrack-mcp/src/e2e/handoff-prompt-trim-review.md.
   `# Coding handoff: ${title}
-sidetrack_mcp: ws://127.0.0.1:8721/mcp?token={BRIDGE_KEY}
+sidetrack_mcp: http://127.0.0.1:8721/mcp
+sidetrack_mcp_auth: Bearer {BRIDGE_KEY}
 sidetrack_thread_id: ${scope.sourceThreadId ?? '(unknown)'}
-(connect → tools/list → bac.read_thread_md)
+(connect → readResource sidetrack://thread/<id>/markdown)
 
 ## User's ask
 …`;
@@ -359,12 +368,23 @@ const buildBody = (
   scope: PacketComposerScope,
   title: string,
   includeTurnCount: number,
+  includeReviewDraft: boolean,
 ): string => {
   const turnsMd = renderTurnsMarkdown(scope.availableTurns ?? [], includeTurnCount);
-  if (kind === 'context_pack') return buildContextPack(title, scope, turnsMd);
-  if (kind === 'coding_agent_packet') return buildCodingAgentPacket(title, scope);
-  if (kind === 'notebook_export') return buildNotebookExport(title, scope, turnsMd);
-  return buildResearchPacket(title, template, scope, turnsMd);
+  let body: string;
+  if (kind === 'context_pack') body = buildContextPack(title, scope, turnsMd);
+  else if (kind === 'coding_agent_packet') body = buildCodingAgentPacket(title, scope);
+  else if (kind === 'notebook_export') body = buildNotebookExport(title, scope, turnsMd);
+  else body = buildResearchPacket(title, template, scope, turnsMd);
+  if (
+    includeReviewDraft &&
+    scope.reviewDraft !== undefined &&
+    (scope.reviewDraft.spans.length > 0 ||
+      (scope.reviewDraft.overall !== undefined && scope.reviewDraft.overall.trim().length > 0))
+  ) {
+    body = `${body.replace(/\s+$/u, '')}\n\n---\n\n## My comments on the captured turns\n\n${buildReviewFollowUpText(scope.reviewDraft)}\n`;
+  }
+  return body;
 };
 
 // Quick char/4 heuristic for the live composer count. The
@@ -415,10 +435,28 @@ export function PacketComposer({
   const [includeTurnCount, setIncludeTurnCount] = useState(Math.min(maxTurns, 4));
   // Stop auto-rebuilding the body once the user has hand-edited it.
   const [bodyManuallyEdited, setBodyManuallyEdited] = useState(defaultBody !== undefined);
+  // Inline-review draft inclusion. Defaults to ON whenever the scope
+  // ships a draft with at least one span / overall note, so the user
+  // sees their comments folded into the body without an extra click;
+  // they can untoggle to omit. The toggle is hidden when there's no
+  // draft to include.
+  const reviewDraft = scope.reviewDraft;
+  const hasReviewDraft =
+    reviewDraft !== undefined &&
+    (reviewDraft.spans.length > 0 ||
+      (reviewDraft.overall !== undefined && reviewDraft.overall.trim().length > 0));
+  const [includeReviewDraft, setIncludeReviewDraft] = useState(hasReviewDraft);
   const [body, setBody] = useState(
     defaultBody ??
       (maxTurns > 0
-        ? buildBody(defaultKind, defaultTemplate, scope, initialTitle, Math.min(maxTurns, 4))
+        ? buildBody(
+            defaultKind,
+            defaultTemplate,
+            scope,
+            initialTitle,
+            Math.min(maxTurns, 4),
+            hasReviewDraft,
+          )
         : FALLBACK_BODY),
   );
 
@@ -439,7 +477,16 @@ export function PacketComposer({
   const bodyTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   useEffect(() => {
     if (bodyManuallyEdited) return;
-    setBody(buildBody(kind, template, scope, title.trim() || initialTitle, includeTurnCount));
+    setBody(
+      buildBody(
+        kind,
+        template,
+        scope,
+        title.trim() || initialTitle,
+        includeTurnCount,
+        includeReviewDraft,
+      ),
+    );
     // Reset scroll to the top of the textarea so the user sees the
     // beginning of the regenerated template, not whatever line their
     // previous body was scrolled to. Without this, switching from
@@ -448,7 +495,23 @@ export function PacketComposer({
     if (bodyTextareaRef.current !== null) {
       bodyTextareaRef.current.scrollTop = 0;
     }
-  }, [bodyManuallyEdited, kind, template, title, initialTitle, includeTurnCount, scope, scopeKey]);
+    // IMPORTANT: do NOT add `scope` itself to the deps array — its
+    // identity churns every render of the parent (the parent
+    // builds a new scope object inline) and we'd re-run this effect
+    // on every keystroke, hijacking the textarea scroll position.
+    // `scopeKey` is the flattened-fields proxy that keeps the
+    // effect dependent on the meaningful changes only.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    bodyManuallyEdited,
+    kind,
+    template,
+    title,
+    initialTitle,
+    includeTurnCount,
+    includeReviewDraft,
+    scopeKey,
+  ]);
 
   const tokenEstimate = useMemo(() => estimateTokens(body), [body]);
   const tokenPct = Math.round((tokenEstimate / tokenLimit) * 100);
@@ -596,6 +659,26 @@ export function PacketComposer({
                 {maxTurns === 1 ? '' : 's'}
               </span>
             </label>
+            {hasReviewDraft ? (
+              <button
+                type="button"
+                className={'btn-link mono review-include-toggle' + (includeReviewDraft ? ' on' : '')}
+                aria-pressed={includeReviewDraft}
+                title={
+                  includeReviewDraft
+                    ? 'Remove the inline-review comments from the dispatched body'
+                    : 'Append the inline-review comments to the dispatched body'
+                }
+                onClick={() => {
+                  setIncludeReviewDraft((current) => !current);
+                }}
+                disabled={bodyManuallyEdited}
+              >
+                {includeReviewDraft ? '✓ ' : ''}
+                Include {String(reviewDraft?.spans.length ?? 0)} comment
+                {(reviewDraft?.spans.length ?? 0) === 1 ? '' : 's'}
+              </button>
+            ) : null}
             {bodyManuallyEdited ? (
               <button
                 type="button"

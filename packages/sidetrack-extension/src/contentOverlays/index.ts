@@ -1,3 +1,4 @@
+import type { SerializedAnchor } from '../annotation/anchors';
 import type { ProviderId } from '../companion/model';
 import { formatRelative } from '../util/time';
 
@@ -65,6 +66,19 @@ const OVERLAY_CSS = `
 }
 .sidetrack-ann-margin .dot {
   width: 6px; height: 6px; border-radius: 50%; background: var(--signal);
+}
+.sidetrack-ann-highlight {
+  position: fixed;
+  border-radius: 4px;
+  background: rgba(254, 215, 170, 0.55);
+  box-shadow: inset 0 0 0 1px rgba(194, 65, 12, 0.38);
+  mix-blend-mode: multiply;
+  pointer-events: auto;
+  cursor: pointer;
+}
+.sidetrack-ann-highlight:hover {
+  background: rgba(254, 215, 170, 0.78);
+  box-shadow: inset 0 0 0 1px rgba(194, 65, 12, 0.62);
 }
 .sidetrack-ann-hint {
   position: fixed;
@@ -377,6 +391,17 @@ const OVERLAY_CSS = `
   width: 7px; height: 7px; border-radius: 50%; background: var(--signal);
 }
 .sidetrack-ann-pop .head .meta { margin-left: auto; color: var(--ink-3); }
+.sidetrack-ann-pop .head .nav {
+  display: inline-flex; gap: 2px; margin-right: 4px;
+}
+.sidetrack-ann-pop .head .nav button {
+  background: transparent; color: var(--ink-2); border: none; cursor: pointer;
+  padding: 0 6px; font-size: 14px; line-height: 1; font-family: var(--mono);
+}
+.sidetrack-ann-pop .head .nav button:hover:not(:disabled) { color: var(--ink); }
+.sidetrack-ann-pop .head .nav button:disabled {
+  color: var(--ink-3); opacity: 0.4; cursor: default;
+}
 .sidetrack-ann-pop .head .close {
   background: transparent; color: var(--ink-3); border: none; cursor: pointer;
   padding: 0 4px; font-size: 14px; line-height: 1;
@@ -433,7 +458,9 @@ const ensureOverlayInfra = (): HTMLElement => {
 };
 
 const clearAnnotationMarkers = (root: HTMLElement): void => {
-  for (const node of root.querySelectorAll('.sidetrack-ann-margin, .sidetrack-ann-hint')) {
+  for (const node of root.querySelectorAll(
+    '.sidetrack-ann-highlight, .sidetrack-ann-margin, .sidetrack-ann-hint',
+  )) {
     node.remove();
   }
 };
@@ -441,18 +468,53 @@ const clearAnnotationMarkers = (root: HTMLElement): void => {
 export interface RestoredAnchor {
   readonly id: string;
   readonly rect: DOMRect;
+  readonly rects?: readonly DOMRect[];
   // Note + quote enable click-to-reveal on the margin marker. Both
   // are optional so the legacy code paths that mount markers
   // without note context (e.g. transient session-only markers
   // before the persist call returns) still render.
   readonly note?: string;
   readonly quote?: string;
+  // Original SerializedAnchor — when present, the resize / scroll
+  // reposition path can re-resolve it against the live DOM if the
+  // cached Range got detached by SPA virtualization (Gemini's
+  // message virtualizer drops + re-creates DOM nodes on viewport
+  // changes, leaving cached Ranges with empty client rects).
+  readonly anchor?: SerializedAnchor;
 }
 
-// Mount per-anchor margin markers and a single bottom hint. Idempotent:
-// re-calling clears any prior overlays first. Each marker is clickable —
-// a popover anchored near the dot reveals the note + quoted turn
-// excerpt; a second click on the dot or the popover's close dismisses.
+// Cluster anchors that fall on the same line into one margin marker
+// so a row with N annotations renders one dot with `${N}` instead of
+// N stacked dots all stamped "1". Bucket size tracks line-height
+// (24px is enough granularity to merge adjacent annotations on the
+// same paragraph line, while still separating consecutive lines).
+const ROW_BUCKET_PX = 24;
+
+const clusterAnchorsByRow = (
+  anchors: readonly RestoredAnchor[],
+): readonly (readonly RestoredAnchor[])[] => {
+  const buckets = new Map<number, RestoredAnchor[]>();
+  for (const anchor of anchors) {
+    const key = Math.floor((anchor.rect.top + window.scrollY) / ROW_BUCKET_PX);
+    const list = buckets.get(key) ?? [];
+    list.push(anchor);
+    buckets.set(key, list);
+  }
+  // Sort within each cluster by horizontal position so ‹ / › walks
+  // through them left-to-right matching the reading order.
+  for (const list of buckets.values()) {
+    list.sort((left, right) => left.rect.left - right.rect.left);
+  }
+  return [...buckets.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([, list]) => list);
+};
+
+// Mount per-anchor highlights + per-row margin markers + a single
+// bottom hint. Idempotent: re-calling clears any prior overlays
+// first. Each marker is clickable — a paginated popover anchored
+// near the dot cycles through every annotation that lives on that
+// row; a second click on the dot or the popover's close dismisses.
 export const mountAnnotationOverlay = (anchors: readonly RestoredAnchor[]): void => {
   if (anchors.length === 0) return;
   const root = ensureOverlayInfra();
@@ -462,37 +524,98 @@ export const mountAnnotationOverlay = (anchors: readonly RestoredAnchor[]): void
     document.documentElement.clientHeight,
     1,
   );
+
+  const clusters = clusterAnchorsByRow(anchors);
+  // Lookup: anchor.id → its cluster + index within that cluster.
+  // Used by both the gutter marker (opens at index 0) and the inline
+  // highlight click handler (opens at the clicked term's index).
+  const clusterIndexById = new Map<
+    string,
+    { readonly cluster: readonly RestoredAnchor[]; readonly index: number }
+  >();
+  for (const cluster of clusters) {
+    cluster.forEach((anchor, index) => {
+      clusterIndexById.set(anchor.id, { cluster, index });
+    });
+  }
+
+  const togglePopover = (
+    cluster: readonly RestoredAnchor[],
+    initialCursor: number,
+    rect: DOMRect,
+  ): void => {
+    const head = cluster[0];
+    if (head === undefined) return;
+    const existing = root.querySelector<HTMLElement>(
+      `.sidetrack-ann-pop[data-cluster-id="${CSS.escape(head.id)}"]`,
+    );
+    if (existing !== null) {
+      existing.remove();
+      return;
+    }
+    mountAnnotationNotePopover({
+      anchors: cluster,
+      anchorRect: rect,
+      initialCursor,
+    });
+  };
+
+  // Highlights still mount per-anchor so each individual term lights
+  // up on the page; the marker collation only affects the gutter
+  // dot/popover. Each highlight is now clickable and opens the same
+  // popover as the gutter dot, with the cursor on the clicked term.
   for (const anchor of anchors) {
+    const highlightRects = anchor.rects ?? [anchor.rect];
+    for (const [index, rect] of highlightRects.entries()) {
+      if (rect.width <= 0 || rect.height <= 0) {
+        continue;
+      }
+      const highlight = document.createElement('div');
+      highlight.className = 'sidetrack-ann-highlight';
+      highlight.dataset.annId = anchor.id;
+      highlight.dataset.annRect = String(index);
+      if (anchor.quote !== undefined && anchor.quote.length > 0) {
+        highlight.title = anchor.quote;
+      }
+      highlight.style.left = `${String(Math.round(rect.left))}px`;
+      highlight.style.top = `${String(Math.round(rect.top))}px`;
+      highlight.style.width = `${String(Math.round(rect.width))}px`;
+      highlight.style.height = `${String(Math.round(rect.height))}px`;
+      highlight.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const entry = clusterIndexById.get(anchor.id);
+        if (entry === undefined) return;
+        togglePopover(entry.cluster, entry.index, highlight.getBoundingClientRect());
+      });
+      root.appendChild(highlight);
+    }
+  }
+
+  for (const cluster of clusters) {
+    const head = cluster[0];
+    if (head === undefined) continue;
     const marker = document.createElement('div');
     marker.className = 'sidetrack-ann-margin';
-    const rectTop = anchor.rect.top + window.scrollY;
+    marker.dataset.clusterId = head.id;
+    const rectTop = head.rect.top + window.scrollY;
     const topPercent = Math.max(2, Math.min(96, (rectTop / docHeight) * 100));
     marker.style.top = `${String(topPercent)}%`;
     marker.title =
-      anchor.note !== undefined && anchor.note.length > 0
-        ? `Click to read · ${anchor.note.slice(0, 60)}${anchor.note.length > 60 ? '…' : ''}`
-        : `Annotation ${anchor.id}`;
-    marker.innerHTML = '<span class="dot"></span><span>1</span>';
+      cluster.length === 1
+        ? head.note !== undefined && head.note.length > 0
+          ? `Click to read · ${head.note.slice(0, 60)}${head.note.length > 60 ? '…' : ''}`
+          : `Annotation ${head.id}`
+        : `${String(cluster.length)} annotations on this line — click to browse`;
+    marker.innerHTML = `<span class="dot"></span><span>${String(cluster.length)}</span>`;
     marker.addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
-      // Toggle: clicking the same dot a second time dismisses.
-      const existing = root.querySelector<HTMLElement>(
-        `.sidetrack-ann-pop[data-ann-id="${CSS.escape(anchor.id)}"]`,
-      );
-      if (existing !== null) {
-        existing.remove();
-        return;
-      }
-      mountAnnotationNotePopover({
-        anchorId: anchor.id,
-        anchorRect: marker.getBoundingClientRect(),
-        note: anchor.note ?? '(no note attached)',
-        quote: anchor.quote,
-      });
+      togglePopover(cluster, 0, marker.getBoundingClientRect());
     });
     root.appendChild(marker);
   }
+
   const hint = document.createElement('div');
   hint.className = 'sidetrack-ann-hint';
   hint.innerHTML = `
@@ -507,10 +630,13 @@ export const mountAnnotationOverlay = (anchors: readonly RestoredAnchor[]): void
 };
 
 interface AnnotationNotePopoverOptions {
-  readonly anchorId: string;
+  readonly anchors: readonly RestoredAnchor[];
   readonly anchorRect: DOMRect;
-  readonly note: string;
-  readonly quote?: string;
+  // Index within `anchors` to land on first. Defaults to 0; the
+  // highlight click path passes the anchor's index inside its
+  // cluster so the popover opens on the term the user actually
+  // clicked, not the leftmost one.
+  readonly initialCursor?: number;
 }
 
 const ANN_POP_WIDTH = 320;
@@ -521,8 +647,10 @@ const clearAnnotationPopovers = (root: HTMLElement): void => {
   }
 };
 
-// Read-only popover for an existing annotation marker. Position:
-// to the left of the marker (markers sit in the right gutter), with
+// Read-only popover for an annotation cluster (one row → one
+// popover). When the cluster has >1 anchors, ‹ / › buttons cycle
+// through the entries in left-to-right reading order. Position: to
+// the left of the marker (markers sit in the right gutter), with
 // vertical clamp so it stays inside the viewport. Click outside or
 // the close button dismisses.
 export const mountAnnotationNotePopover = (
@@ -530,30 +658,102 @@ export const mountAnnotationNotePopover = (
 ): { close: () => void } => {
   const root = ensureOverlayInfra();
   clearAnnotationPopovers(root);
+  if (opts.anchors.length === 0) {
+    return { close: () => undefined };
+  }
   const pop = document.createElement('div');
   pop.className = 'sidetrack-ann-pop';
-  pop.dataset.annId = opts.anchorId;
+  const head = opts.anchors[0];
+  if (head !== undefined) {
+    pop.dataset.clusterId = head.id;
+  }
+  const multi = opts.anchors.length > 1;
   pop.innerHTML = `
     <div class="head">
       <span class="dot"></span>
       <span>annotation</span>
       <span class="meta"></span>
+      ${multi ? '<span class="nav"><button type="button" class="prev" aria-label="Previous">‹</button><button type="button" class="next" aria-label="Next">›</button></span>' : ''}
       <button type="button" class="close" aria-label="Dismiss">×</button>
     </div>
-    ${opts.quote === undefined || opts.quote.length === 0 ? '' : '<div class="quote"></div>'}
+    <div class="quote"></div>
     <div class="note"></div>
   `;
-  // setText keeps the host page's HTML out of the popover — note
-  // and quote come from a captured turn body and from the user's
-  // own input, both treated as untrusted text.
-  if (opts.quote !== undefined && opts.quote.length > 0) {
-    const quoteEl = pop.querySelector<HTMLElement>('.quote');
-    if (quoteEl !== null) quoteEl.textContent = opts.quote;
-  }
+  let cursor = Math.min(
+    Math.max(opts.initialCursor ?? 0, 0),
+    opts.anchors.length - 1,
+  );
+  const quoteEl = pop.querySelector<HTMLElement>('.quote');
   const noteEl = pop.querySelector<HTMLElement>('.note');
-  if (noteEl !== null) noteEl.textContent = opts.note;
+  const metaEl = pop.querySelector<HTMLElement>('.meta');
+  const prevBtn = pop.querySelector<HTMLButtonElement>('.prev');
+  const nextBtn = pop.querySelector<HTMLButtonElement>('.next');
+
+  const render = (): void => {
+    const current = opts.anchors[cursor];
+    if (current === undefined) return;
+    if (metaEl !== null) {
+      metaEl.textContent = multi
+        ? `${String(cursor + 1)} / ${String(opts.anchors.length)}`
+        : '';
+    }
+    if (quoteEl !== null) {
+      if (current.quote !== undefined && current.quote.length > 0) {
+        // setText keeps the host page's HTML out of the popover —
+        // both fields come from untrusted captured turn / user
+        // input.
+        quoteEl.textContent = current.quote;
+        quoteEl.style.display = '';
+      } else {
+        quoteEl.textContent = '';
+        quoteEl.style.display = 'none';
+      }
+    }
+    if (noteEl !== null) {
+      noteEl.textContent =
+        current.note !== undefined && current.note.length > 0
+          ? current.note
+          : '(no note attached)';
+    }
+    if (prevBtn !== null) prevBtn.disabled = cursor === 0;
+    if (nextBtn !== null) nextBtn.disabled = cursor === opts.anchors.length - 1;
+  };
+  render();
+
+  prevBtn?.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (cursor > 0) {
+      cursor -= 1;
+      render();
+    }
+  });
+  nextBtn?.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (cursor < opts.anchors.length - 1) {
+      cursor += 1;
+      render();
+    }
+  });
   pop.querySelector<HTMLButtonElement>('.close')?.addEventListener('click', () => {
     pop.remove();
+  });
+  // Left/right arrow keys also walk the cluster while the popover
+  // is open. Listener lives on the popover so it doesn't fight
+  // arrow-key navigation elsewhere on the page.
+  pop.tabIndex = -1;
+  pop.addEventListener('keydown', (event) => {
+    if (!multi) return;
+    if (event.key === 'ArrowLeft' && cursor > 0) {
+      event.preventDefault();
+      cursor -= 1;
+      render();
+    } else if (event.key === 'ArrowRight' && cursor < opts.anchors.length - 1) {
+      event.preventDefault();
+      cursor += 1;
+      render();
+    }
   });
 
   // Left of the marker: marker is in the right gutter, popover slides
@@ -568,6 +768,9 @@ export const mountAnnotationNotePopover = (
   pop.style.left = `${String(Math.round(left))}px`;
   pop.style.top = `${String(Math.round(Math.min(opts.anchorRect.top, viewportH - 80)))}px`;
   root.appendChild(pop);
+  if (multi) {
+    pop.focus();
+  }
 
   const onDocClick = (event: MouseEvent): void => {
     const target = event.target;
@@ -666,9 +869,13 @@ export const mountReviewSelectionChip = (opts: ReviewChipMountOptions): { close:
   // clamped to viewport. Two independent absolute-positioned chips —
   // simpler than a wrapper div with flex (the wrapper version was
   // dropping the + Comment button on some renders, see prior bug).
-  const COMMENT_W = 110;
-  const DEJA_W = 100;
-  const GAP = 6;
+  // Widths are calibrated to the rendered chip (mono 10.5px label +
+  // 12px display glyph + 4px×2 padding + 5px inner gap → ~80px). The
+  // constants used to over-allocate by ~30px each, leaving a stranded
+  // visual gap between the two chips even though GAP was small.
+  const COMMENT_W = 84;
+  const DEJA_W = 84;
+  const GAP = 4;
   const totalWidth = opts.onDejaVu !== undefined ? COMMENT_W + GAP + DEJA_W : COMMENT_W;
   const viewportWidth = document.documentElement.clientWidth;
   let leftAnchor = Math.max(8, opts.anchorRect.right - 50);

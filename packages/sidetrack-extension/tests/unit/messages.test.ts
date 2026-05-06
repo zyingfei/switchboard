@@ -10,7 +10,21 @@ describe('runtime message validation', () => {
         threadUrl: 'https://chatgpt.com/c/thread',
         turnText: 'Assistant turn text',
         turnRole: 'assistant',
+        anchorText: 'Assistant',
         note: 'Publish this annotation',
+        capturedAt: '2026-05-05T00:00:00.000Z',
+      }),
+    ).toBe(true);
+  });
+
+  it('accepts keyword-targeted annotateTurn requests', () => {
+    expect(
+      isRuntimeRequest({
+        type: messageTypes.annotateTurn,
+        threadUrl: 'https://chatgpt.com/c/thread',
+        turnText: 'Assistant turn text mentioning WebGPU',
+        anchorText: 'WebGPU',
+        note: 'WebGPU is the browser GPU API surface.',
         capturedAt: '2026-05-05T00:00:00.000Z',
       }),
     ).toBe(true);

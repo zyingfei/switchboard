@@ -107,11 +107,37 @@ export const serializeAnchor = (range: Range): SerializedAnchor => {
   };
 };
 
+// Normalize a string for cross-source matching. Markdown bodies (e.g.
+// from bac.turns) carry decorations the live DOM textContent doesn't
+// have: `**bold**`, `_italic_`, ``code``, `> quote`, `# heading`, and
+// — most aggressively — paragraph breaks materialize as `\n\n` in
+// markdown but as nothing in textContent (because the DOM uses
+// block-element boundaries, not literal newlines, and textContent
+// concatenates without inserting whitespace).
+//
+// We strip the markdown punctuation, drop ALL whitespace (so the
+// `\n\n` paragraph separators in MCP-saved anchors don't have to
+// match the live DOM's zero-width block boundary), and lowercase
+// everything. This makes the comparison structural rather than
+// presentational. Risk: false positives like "thecat" matching
+// "the cat" — acceptable for our 32-char anchor windows where
+// surrounding 30+ chars provide plenty of disambiguation.
+const stripMarkdownFormatting = (input: string): string =>
+  input
+    .replace(/[*_`~#>]/g, '')
+    .replace(/\\([*_`~#>])/g, '$1')
+    .replace(/\s+/g, '')
+    .toLowerCase();
+
 export const findAnchor = (root: HTMLElement, anchor: SerializedAnchor): Range | null => {
   try {
     const fullText = root.textContent;
     const exact = anchor.textQuote.exact;
     if (exact.length > 0) {
+      const expectedPrefixRaw = anchor.textQuote.prefix;
+      const expectedSuffixRaw = anchor.textQuote.suffix;
+      const expectedPrefixNorm = stripMarkdownFormatting(expectedPrefixRaw);
+      const expectedSuffixNorm = stripMarkdownFormatting(expectedSuffixRaw);
       let from = 0;
       while (from <= fullText.length) {
         const index = fullText.indexOf(exact, from);
@@ -120,10 +146,18 @@ export const findAnchor = (root: HTMLElement, anchor: SerializedAnchor): Range |
         }
         const prefix = fullText.slice(Math.max(0, index - CONTEXT_CHARS), index);
         const suffix = fullText.slice(index + exact.length, index + exact.length + CONTEXT_CHARS);
+        // Try raw match first (fast path for browser-created anchors
+        // where prefix/suffix already came from textContent). Fall
+        // back to a markdown-normalized comparison so MCP-created
+        // anchors from rendered markdown bodies still re-anchor.
         const prefixOk =
-          anchor.textQuote.prefix.length === 0 || prefix.endsWith(anchor.textQuote.prefix);
+          expectedPrefixRaw.length === 0 ||
+          prefix.endsWith(expectedPrefixRaw) ||
+          stripMarkdownFormatting(prefix).endsWith(expectedPrefixNorm);
         const suffixOk =
-          anchor.textQuote.suffix.length === 0 || suffix.startsWith(anchor.textQuote.suffix);
+          expectedSuffixRaw.length === 0 ||
+          suffix.startsWith(expectedSuffixRaw) ||
+          stripMarkdownFormatting(suffix).startsWith(expectedSuffixNorm);
         if (prefixOk && suffixOk) {
           return rangeAtTextOffsets(root, index, index + exact.length);
         }
@@ -131,20 +165,24 @@ export const findAnchor = (root: HTMLElement, anchor: SerializedAnchor): Range |
       }
     }
 
-    const positionRange = rangeAtTextOffsets(
-      root,
-      anchor.textPosition.start,
-      anchor.textPosition.end,
-    );
-    if (positionRange !== null) {
-      return positionRange;
+    if (anchor.textPosition.start >= 0 && anchor.textPosition.end >= 0) {
+      const positionRange = rangeAtTextOffsets(
+        root,
+        anchor.textPosition.start,
+        anchor.textPosition.end,
+      );
+      if (positionRange !== null) {
+        return positionRange;
+      }
     }
 
-    const element = root.querySelector(anchor.cssSelector);
-    if (element !== null) {
-      const fallback = rangeAtTextOffsets(element, 0, element.textContent.length);
-      if (fallback !== null) {
-        return fallback;
+    if (anchor.cssSelector.length > 0) {
+      const element = root.querySelector(anchor.cssSelector);
+      if (element !== null) {
+        const fallback = rangeAtTextOffsets(element, 0, element.textContent.length);
+        if (fallback !== null) {
+          return fallback;
+        }
       }
     }
     return null;

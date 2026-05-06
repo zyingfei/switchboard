@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { access, readFile, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
+import { buildAnchorFromTerm } from '../annotation/anchorBuilder.js';
 import { isBridgeKeyAccepted, rotateBridgeKey } from '../auth/bridgeKey.js';
 import {
   isAllowed,
@@ -55,6 +56,7 @@ import {
   codingSessionListQuerySchema,
   codingSessionRegisterSchema,
   dispatchEventSchema,
+  dispatchLinkRequestSchema,
   dispatchListQuerySchema,
   queueCreateSchema,
   reminderCreateSchema,
@@ -100,6 +102,11 @@ export interface CompanionHttpConfig {
   // background-rebuild affordance.
   readonly recallLifecycle?: RecallLifecycle;
   readonly recallActivity?: RecallActivityTracker;
+  // Set when the companion is also managing a sidetrack-mcp child.
+  // Exposed via /v1/status so the side panel can build attach prompts
+  // whose ?token=… matches whatever the running MCP server actually
+  // accepts — without the user copying keys between two terminals.
+  readonly mcp?: { readonly port: number; readonly authKey: string };
 }
 
 export interface StartedHttpServer {
@@ -193,13 +200,35 @@ const mutationResponse = (
   },
 });
 
+// Optional allow-list of specific Sidetrack extension ids. When the
+// env var is set (production deploy), only the listed
+// chrome-extension://<id> origins pass; when unset, every
+// chrome-extension:// origin is accepted (dev mode — the unpacked
+// extension's auto-generated id changes on each load). Comma-
+// separated values, case-sensitive, no scheme prefix:
+//   SIDETRACK_ALLOWED_EXTENSION_IDS=abcdef…,123456…
+const allowedExtensionIds = ((): readonly string[] => {
+  const raw = process.env['SIDETRACK_ALLOWED_EXTENSION_IDS'];
+  if (raw === undefined || raw.trim().length === 0) {
+    return [];
+  }
+  return raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+})();
+
 const isAllowedOrigin = (origin: string | undefined): boolean => {
   if (origin === undefined) {
     return true;
   }
 
   if (origin.startsWith('chrome-extension://')) {
-    return true;
+    if (allowedExtensionIds.length === 0) {
+      return true;
+    }
+    const id = origin.slice('chrome-extension://'.length);
+    return allowedExtensionIds.includes(id);
   }
 
   try {
@@ -231,10 +260,21 @@ const runIdempotent = async (
   route: string,
   key: string,
   operation: () => Promise<readonly [number, unknown]>,
+  // Optional validator for the cached response body. When the
+  // underlying record the cache refers to no longer exists in the
+  // vault (e.g. the operator purged a dispatch JSONL line), the
+  // 24h-TTL'd idempotency entry would otherwise serve a dead
+  // reference forever — the agent's retry would receive a record-id
+  // that no other read endpoint can find. validateReplay returns
+  // false in that case so we fall through to the fresh-create path
+  // and overwrite the cache with a new, valid response.
+  validateReplay?: (cached: unknown) => Promise<boolean>,
 ): Promise<readonly [number, unknown]> => {
   const replay = await context.idempotencyStore?.read(route, key);
   if (replay !== undefined) {
-    return [replay.status, replay.body];
+    if (validateReplay === undefined || (await validateReplay(replay.body))) {
+      return [replay.status, replay.body];
+    }
   }
 
   const [status, body] = await operation();
@@ -385,11 +425,11 @@ const mcpToolHeader = (request: IncomingMessage): WorkstreamWriteTool | undefine
   }
   return (
     [
-      'bac.move_item',
-      'bac.queue_item',
-      'bac.bump_workstream',
-      'bac.archive_thread',
-      'bac.unarchive_thread',
+      'sidetrack.threads.move',
+      'sidetrack.queue.create',
+      'sidetrack.workstreams.bump',
+      'sidetrack.threads.archive',
+      'sidetrack.threads.unarchive',
     ] as const
   ).find((tool) => tool === value);
 };
@@ -560,6 +600,45 @@ const readThreadWorkstreamId = async (
   }
 };
 
+interface ThreadMetadata {
+  readonly bac_id: string;
+  readonly title?: string;
+  readonly threadUrl?: string;
+  readonly provider?: string;
+}
+
+// Cheap thread-record fetch for await-capture enrichment. Returns
+// just the fields the MCP outputSchema needs; full reads go through
+// the live vault reader.
+const readThreadMetadata = async (
+  vaultRoot: string,
+  threadId: string,
+): Promise<ThreadMetadata | null> => {
+  try {
+    const raw = await readFile(
+      join(vaultRoot, '_BAC', 'threads', `${threadId}.json`),
+      'utf8',
+    );
+    const parsed = JSON.parse(raw) as {
+      readonly bac_id?: unknown;
+      readonly title?: unknown;
+      readonly threadUrl?: unknown;
+      readonly provider?: unknown;
+    };
+    if (typeof parsed.bac_id !== 'string') {
+      return null;
+    }
+    return {
+      bac_id: parsed.bac_id,
+      ...(typeof parsed.title === 'string' ? { title: parsed.title } : {}),
+      ...(typeof parsed.threadUrl === 'string' ? { threadUrl: parsed.threadUrl } : {}),
+      ...(typeof parsed.provider === 'string' ? { provider: parsed.provider } : {}),
+    };
+  } catch {
+    return null;
+  }
+};
+
 const objectRecord = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -611,10 +690,104 @@ const routes: readonly RouteDefinition[] = [
     method: 'GET',
     pattern: /^\/v1\/status$/,
     authRequired: true,
-    handle: async (_request, requestId, _match, context) => [
-      200,
-      { data: { companion: 'running', vault: await context.vaultWriter.status(), requestId } },
-    ],
+    handle: async (_request, requestId, _match, context) => {
+      // When the companion manages an MCP child, probe its /mcp
+      // endpoint so the side panel knows whether restart/config
+      // changes succeeded. Distinguishes three states the user
+      // cares about:
+      //   reachable=false                    — process not listening
+      //   reachable=true, authAccepted=false — listening but our
+      //                                        auth key is stale
+      //   reachable=true, authAccepted=true  — fully healthy
+      // Probe is a TCP-cheap GET with a 1s timeout — slow enough
+      // to detect a wedged process, fast enough to not stall
+      // /v1/status during normal polling.
+      let mcpHealth:
+        | {
+            reachable: boolean;
+            authAccepted: boolean;
+            status: 'ok' | 'auth_failed' | 'unreachable';
+            checkedAt: string;
+            detail?: string;
+          }
+        | undefined;
+      if (context.mcp !== undefined) {
+        const checkedAt = new Date().toISOString();
+        const controller = new AbortController();
+        const timer = setTimeout(() => {
+          controller.abort();
+        }, 1000);
+        try {
+          const probe = await fetch(
+            `http://127.0.0.1:${String(context.mcp.port)}/mcp`,
+            {
+              method: 'GET',
+              headers: { Authorization: `Bearer ${context.mcp.authKey}` },
+              signal: controller.signal,
+            },
+          );
+          // 401 means a process is listening but doesn't accept
+          // our key — surface as auth_failed so the side panel
+          // can prompt the user to regenerate or re-paste.
+          // Anything else that completed the round-trip counts as
+          // ok; the MCP server returns 400 or 405 for the bare
+          // GET, which still proves auth was accepted.
+          if (probe.status === 401 || probe.status === 403) {
+            mcpHealth = {
+              reachable: true,
+              authAccepted: false,
+              status: 'auth_failed',
+              checkedAt,
+              detail: `http ${String(probe.status)}`,
+            };
+          } else {
+            mcpHealth = {
+              reachable: true,
+              authAccepted: true,
+              status: 'ok',
+              checkedAt,
+              detail: `http ${String(probe.status)}`,
+            };
+          }
+        } catch (error) {
+          mcpHealth = {
+            reachable: false,
+            authAccepted: false,
+            status: 'unreachable',
+            checkedAt,
+            detail: error instanceof Error ? error.message : String(error),
+          };
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+      return [
+        200,
+        {
+          data: {
+            companion: 'running',
+            vault: await context.vaultWriter.status(),
+            // P1-review: vaultRoot lets the side panel build Codex
+            // MCP config snippets without asking the user to paste
+            // the absolute vault path. Only included when the
+            // companion was started with one (test mode passes
+            // undefined).
+            ...(context.vaultRoot === undefined ? {} : { vaultRoot: context.vaultRoot }),
+            ...(context.mcp === undefined
+              ? {}
+              : {
+                  mcp: {
+                    port: context.mcp.port,
+                    authKey: context.mcp.authKey,
+                    url: `http://127.0.0.1:${String(context.mcp.port)}/mcp`,
+                    ...(mcpHealth === undefined ? {} : { health: mcpHealth }),
+                  },
+                }),
+            requestId,
+          },
+        },
+      ];
+    },
   },
   {
     method: 'GET',
@@ -811,38 +984,62 @@ const routes: readonly RouteDefinition[] = [
     authRequired: true,
     handle: async (request, requestId, _match, context) => {
       const idempotencyKey = requireIdempotencyKey(request);
-      return await runIdempotent(context, 'recordDispatch', idempotencyKey, async () => {
-        const input = dispatchEventSchema.parse(await readBody(request));
-        const writer = await writerForBucket(context, {
-          provider: input.target.provider,
-          ...(input.workstreamId === undefined ? {} : { workstreamId: input.workstreamId }),
-        });
-        const redaction = redact(input.body);
-        const tokenEstimate = estimateTokens(redaction.output);
-        const result = await writer.writeDispatchEvent(
-          {
-            ...input,
-            bac_id: input.bac_id ?? createDispatchId(),
-            body: redaction.output,
-            createdAt: input.createdAt ?? new Date().toISOString(),
-            redactionSummary: {
-              matched: redaction.matched,
-              categories: [...redaction.categories],
+      return await runIdempotent(
+        context,
+        'recordDispatch',
+        idempotencyKey,
+        async () => {
+          const input = dispatchEventSchema.parse(await readBody(request));
+          const writer = await writerForBucket(context, {
+            provider: input.target.provider,
+            ...(input.workstreamId === undefined ? {} : { workstreamId: input.workstreamId }),
+          });
+          const redaction = redact(input.body);
+          const tokenEstimate = estimateTokens(redaction.output);
+          const result = await writer.writeDispatchEvent(
+            {
+              ...input,
+              bac_id: input.bac_id ?? createDispatchId(),
+              body: redaction.output,
+              createdAt: input.createdAt ?? new Date().toISOString(),
+              redactionSummary: {
+                matched: redaction.matched,
+                categories: [...redaction.categories],
+              },
+              tokenEstimate,
             },
-            tokenEstimate,
-          },
-          requestId,
-        );
-        return [
-          201,
-          {
-            data: result,
-            ...(tokenEstimate > tokenBudgetWarningThreshold
-              ? { warnings: ['token-budget-exceeded'] }
-              : {}),
-          },
-        ];
-      });
+            requestId,
+          );
+          return [
+            201,
+            {
+              data: result,
+              ...(tokenEstimate > tokenBudgetWarningThreshold
+                ? { warnings: ['token-budget-exceeded'] }
+                : {}),
+            },
+          ];
+        },
+        async (cached) => {
+          // Self-heal dead idempotent references: the 24h cache TTL
+          // outlives the underlying JSONL record when an operator
+          // purges, prunes, or retention-rotates it. If the cached
+          // dispatch's bac_id is no longer in the vault, the agent
+          // should get a fresh dispatch (and the cache overwrite
+          // updates the entry to the new id).
+          const cachedRecord = cached as { readonly data?: { readonly bac_id?: unknown } };
+          const bacId = cachedRecord.data?.bac_id;
+          if (typeof bacId !== 'string' || bacId.length === 0) {
+            return false;
+          }
+          // readDispatchEvents reads the most-recent 100 days of
+          // dispatch JSONL files, which is more than the 24h cache
+          // TTL covers. If the dispatch is anywhere in that window,
+          // the cached response is still valid.
+          const events = await context.vaultWriter.readDispatchEvents({ limit: 1000 });
+          return events.some((event) => event.bac_id === bacId);
+        },
+      );
     },
   },
   {
@@ -856,6 +1053,189 @@ const routes: readonly RouteDefinition[] = [
         since: url.searchParams.get('since') ?? undefined,
       });
       return [200, { data: await context.vaultWriter.readDispatchEvents(query) }];
+    },
+  },
+  {
+    // Dispatch ↔ thread link table (Phase 3 of the spec-aligned
+    // refactor). Replaces the extension-only chrome.storage map.
+    // Idempotent on (dispatchId, threadId) pair: re-linking to the
+    // same thread is a no-op; re-linking to a different thread
+    // appends a new row and the latest one wins on read.
+    method: 'POST',
+    pattern: /^\/v1\/dispatches\/(?<bacId>[A-Za-z0-9_-]+)\/link$/,
+    authRequired: true,
+    handle: async (request, requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing dispatch bacId path parameter.');
+      }
+      const body = dispatchLinkRequestSchema.parse(await readBody(request));
+      const record = await context.vaultWriter.linkDispatchToThread(
+        { dispatchId: match.bacId, threadId: body.threadId },
+        requestId,
+      );
+      return [200, { data: record }];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/dispatches\/(?<bacId>[A-Za-z0-9_-]+)\/link$/,
+    authRequired: true,
+    handle: async (_request, _requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing dispatch bacId path parameter.');
+      }
+      const link = await context.vaultWriter.readLinkForDispatch(match.bacId);
+      return [
+        200,
+        {
+          data: link ?? { dispatchId: match.bacId, threadId: null, linkedAt: null },
+        },
+      ];
+    },
+  },
+  {
+    // Long-poll for dispatch capture. Resolves when the link table
+    // has a record for this dispatchId, or after timeoutMs (default
+    // 60s, capped at 120s). Subscribes to vaultChanges if available
+    // so the wait is event-driven; falls back to a 1s polling loop
+    // when no watcher is wired.
+    method: 'GET',
+    pattern: /^\/v1\/dispatches\/(?<bacId>[A-Za-z0-9_-]+)\/await-capture$/,
+    authRequired: true,
+    handle: async (request, _requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing dispatch bacId path parameter.');
+      }
+      const dispatchId = match.bacId;
+      const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+      const rawTimeout = url.searchParams.get('timeoutMs');
+      const requested =
+        rawTimeout === null ? 60_000 : Number.parseInt(rawTimeout, 10);
+      const timeoutMs =
+        Number.isFinite(requested) && requested > 0 ? Math.min(requested, 120_000) : 60_000;
+      const vaultRoot = context.vaultRoot;
+
+      const includeTurn =
+        url.searchParams.get('includeLatestAssistantTurn') !== 'false';
+
+      const buildResponse = async (
+        link: Awaited<ReturnType<typeof context.vaultWriter.readLinkForDispatch>>,
+      ) => {
+        if (link === null) {
+          return {
+            dispatchId,
+            matched: false,
+            reason: 'timeout' as const,
+          };
+        }
+        const meta =
+          vaultRoot === undefined ? null : await readThreadMetadata(vaultRoot, link.threadId);
+        // Phase-5-review: always surface `thread.threadId` plus a
+        // `resources` URI map so the model can navigate without
+        // remembering URI templates from prompt boilerplate.
+        // threadUrl/title/provider attach when the thread record is
+        // present in the vault; missing ones drop quietly so a thread
+        // captured-but-not-yet-flushed still produces a useful payload.
+        // Sanitize provider: the captured-thread schema accepts a
+        // wider enum (`unknown`, `codex`, …) than the dispatch
+        // target enum (chatgpt | claude | gemini). The MCP
+        // await_capture outputSchema only declares the dispatch
+        // target enum, so anything outside that set drops out
+        // rather than surfacing as a schema-violating value.
+        const dispatchTargetProviders = ['chatgpt', 'claude', 'gemini'] as const;
+        const sanitizedProvider = dispatchTargetProviders.find(
+          (candidate) => candidate === meta?.provider,
+        );
+        const thread = {
+          threadId: link.threadId,
+          ...(meta?.threadUrl === undefined ? {} : { threadUrl: meta.threadUrl }),
+          ...(meta?.title === undefined ? {} : { title: meta.title }),
+          ...(sanitizedProvider === undefined ? {} : { provider: sanitizedProvider }),
+        };
+        const resources = {
+          dispatch: `sidetrack://dispatch/${dispatchId}`,
+          thread: `sidetrack://thread/${link.threadId}`,
+          turns: `sidetrack://thread/${link.threadId}/turns`,
+          markdown: `sidetrack://thread/${link.threadId}/markdown`,
+          annotations: `sidetrack://thread/${link.threadId}/annotations`,
+        };
+        // Latest assistant turn — read once now so the model doesn't
+        // have to make a follow-up call. Best-effort: a missing
+        // threadUrl or empty turn list both reduce to "no latestAssistantTurn".
+        let latestAssistantTurn:
+          | { ordinal: number; text: string; capturedAt: string }
+          | undefined;
+        if (includeTurn && meta?.threadUrl !== undefined) {
+          try {
+            const turns = await context.vaultWriter.readRecentTurns({
+              threadUrl: meta.threadUrl,
+              limit: 5,
+              role: 'assistant',
+            });
+            const latest = turns
+              .slice()
+              .sort((left, right) => right.ordinal - left.ordinal)[0];
+            if (latest !== undefined) {
+              latestAssistantTurn = {
+                ordinal: latest.ordinal,
+                text: latest.text,
+                capturedAt: latest.capturedAt,
+              };
+            }
+          } catch {
+            // best-effort
+          }
+        }
+        return {
+          dispatchId,
+          matched: true,
+          linkedAt: link.linkedAt,
+          thread,
+          resources,
+          ...(latestAssistantTurn === undefined ? {} : { latestAssistantTurn }),
+          reason: 'matched' as const,
+        };
+      };
+
+      const initial = await context.vaultWriter.readLinkForDispatch(dispatchId);
+      if (initial !== null) {
+        return [200, { data: await buildResponse(initial) }];
+      }
+
+      const result = await new Promise<
+        Awaited<ReturnType<typeof context.vaultWriter.readLinkForDispatch>>
+      >((resolve) => {
+        const timer = setTimeout(() => {
+          unsubscribe();
+          clearInterval(poll);
+          resolve(null);
+        }, timeoutMs);
+        const poll = setInterval(() => {
+          void context.vaultWriter.readLinkForDispatch(dispatchId).then((link) => {
+            if (link !== null) {
+              clearTimeout(timer);
+              clearInterval(poll);
+              unsubscribe();
+              resolve(link);
+            }
+          });
+        }, 1000);
+        const unsubscribe =
+          context.vaultChanges?.subscribe((event) => {
+            if (event.relPath.startsWith('_BAC/dispatch-links/')) {
+              void context.vaultWriter.readLinkForDispatch(dispatchId).then((link) => {
+                if (link !== null) {
+                  clearTimeout(timer);
+                  clearInterval(poll);
+                  unsubscribe();
+                  resolve(link);
+                }
+              });
+            }
+          }) ?? (() => undefined);
+      });
+
+      return [200, { data: await buildResponse(result) }];
     },
   },
   {
@@ -944,6 +1324,173 @@ const routes: readonly RouteDefinition[] = [
       const idempotencyKey = requireIdempotencyKey(request);
       return await runIdempotent(context, 'createAnnotation', idempotencyKey, async () => {
         const input = annotationCreateSchema.parse(await readBody(request));
+        // Term-form (Phase 4): companion fetches the thread's assistant
+        // turns and builds the anchor server-side. Anchor-form (DOM-
+        // driven): caller already serialised the anchor; pass through
+        // unchanged.
+        if ('term' in input) {
+          // Resolve threadUrl + pageTitle from the thread record when
+          // the caller passed `threadId`. This is the path
+          // sidetrack.dispatch.await_capture flows into — agents pass
+          // threadId, the companion looks up everything else.
+          let threadUrl: string | undefined = input.url;
+          let pageTitle: string | undefined = input.pageTitle;
+          if (input.threadId !== undefined) {
+            const meta = await readThreadMetadata(vaultRoot, input.threadId);
+            if (meta === null) {
+              return [
+                200,
+                {
+                  data: {
+                    status: 'anchor_failed' as const,
+                    reason: 'thread_not_found' as const,
+                    message: `Thread ${input.threadId} not found in the vault.`,
+                    occurrenceCount: 0,
+                  },
+                },
+              ];
+            }
+            threadUrl = meta.threadUrl ?? threadUrl;
+            pageTitle = pageTitle ?? meta.title;
+          }
+          if (threadUrl === undefined) {
+            return [
+              200,
+              {
+                data: {
+                  status: 'validation_failed' as const,
+                  reason: 'thread_url_unresolved' as const,
+                  message: 'No threadUrl could be resolved from threadId / url.',
+                  occurrenceCount: 0,
+                },
+              },
+            ];
+          }
+          if (pageTitle === undefined) {
+            pageTitle = threadUrl;
+          }
+          const allTurns = await context.vaultWriter.readRecentTurns({
+            threadUrl,
+            limit: 50,
+            role: 'assistant',
+          });
+          if (allTurns.length === 0) {
+            return [
+              200,
+              {
+                data: {
+                  status: 'anchor_failed' as const,
+                  reason: 'no_assistant_turns' as const,
+                  message: `No assistant turns found for ${threadUrl}; capture the thread first.`,
+                  occurrenceCount: 0,
+                },
+              },
+            ];
+          }
+          // sourceTurn selects which captured turn the anchor is
+          // built against. Defaults to the latest assistant turn —
+          // matches the post-dispatch flow where the agent annotates
+          // a fresh answer.
+          const sortedAsc = allTurns
+            .slice()
+            .sort((left, right) => left.ordinal - right.ordinal);
+          const sourceTurn = input.sourceTurn ?? 'assistant_latest';
+          let turnText: string;
+          if (sourceTurn === 'assistant_all') {
+            turnText = sortedAsc.map((turn) => turn.text).join('\n\n');
+          } else if (sourceTurn === 'assistant_latest') {
+            const last = sortedAsc[sortedAsc.length - 1];
+            turnText = last?.text ?? '';
+          } else {
+            const picked = sortedAsc.find((turn) => turn.ordinal === sourceTurn.ordinal);
+            if (picked === undefined) {
+              return [
+                200,
+                {
+                  data: {
+                    status: 'validation_failed' as const,
+                    reason: 'invalid_ordinal' as const,
+                    message: `Thread has no assistant turn at ordinal ${String(sourceTurn.ordinal)}.`,
+                    occurrenceCount: 0,
+                  },
+                },
+              ];
+            }
+            turnText = picked.text;
+          }
+          // anchorPolicy fields can each be undefined under
+          // exactOptionalPropertyTypes; strip undefined before
+          // passing down. Defaults live in buildAnchorFromTerm.
+          const policy = input.anchorPolicy;
+          const cleanedPolicy =
+            policy === undefined
+              ? undefined
+              : {
+                  ...(policy.repeatedTerm === undefined
+                    ? {}
+                    : { repeatedTerm: policy.repeatedTerm }),
+                  ...(policy.shortTermMinLength === undefined
+                    ? {}
+                    : { shortTermMinLength: policy.shortTermMinLength }),
+                };
+          const result = buildAnchorFromTerm({
+            turnText,
+            term: input.term,
+            ...(input.selectionHint === undefined
+              ? {}
+              : { selectionHint: input.selectionHint }),
+            ...(cleanedPolicy === undefined ? {} : { policy: cleanedPolicy }),
+          });
+          if (!result.ok) {
+            // Structured failure — surfaced as 200 + a `data` block
+            // the MCP create_batch tool maps to a per-item retry-able
+            // status. Throwing 400 forces the agent to handle a
+            // protocol-level error; structured returns let the model
+            // self-correct against the same envelope shape as a
+            // success.
+            return [
+              200,
+              {
+                data: {
+                  status: 'anchor_failed' as const,
+                  reason: result.reason,
+                  message: result.message,
+                  occurrenceCount: result.occurrenceCount,
+                  ...(result.suggestedSelectionHints === undefined
+                    ? {}
+                    : { suggestedSelectionHints: [...result.suggestedSelectionHints] }),
+                },
+              },
+            ];
+          }
+          const annotationUrl = input.url ?? threadUrl;
+          const created = await writeAnnotation(vaultRoot, {
+            url: annotationUrl,
+            pageTitle,
+            anchor: result.anchor,
+            note: input.note,
+          });
+          // totalForThread/totalForUrl: total non-deleted
+          // annotations now associated with this URL. Lets the
+          // model report a final count without summing per-batch
+          // createdCount across multiple calls (the only fully
+          // accurate way to know "how many annotations exist").
+          const totalForUrl = (
+            await listAnnotations(vaultRoot, { url: annotationUrl })
+          ).length;
+          return [
+            201,
+            {
+              data: {
+                status: 'created' as const,
+                annotationId: created.bac_id,
+                occurrenceCount: result.occurrenceCount,
+                annotation: created,
+                totalForUrl,
+              },
+            },
+          ];
+        }
         return [201, { data: await writeAnnotation(vaultRoot, input) }];
       });
     },
@@ -1241,7 +1788,7 @@ const routes: readonly RouteDefinition[] = [
     handle: async (request, requestId, _match, context) => {
       const input = await parseThreadUpsertBody(requireVaultRoot(context), await readBody(request));
       const tool = mcpToolHeader(request);
-      if (tool === 'bac.move_item') {
+      if (tool === 'sidetrack.threads.move') {
         await requireWorkstreamTrust(context, input.primaryWorkstreamId, tool);
       }
       const result = await context.vaultWriter.upsertThread(input, requestId);
@@ -1268,11 +1815,11 @@ const routes: readonly RouteDefinition[] = [
         throw new Error('Missing bacId path parameter.');
       }
       const vaultRoot = requireVaultRoot(context);
-      if (mcpToolHeader(_request) === 'bac.archive_thread') {
+      if (mcpToolHeader(_request) === 'sidetrack.threads.archive') {
         await requireWorkstreamTrust(
           context,
           await readThreadWorkstreamId(vaultRoot, match.bacId),
-          'bac.archive_thread',
+          'sidetrack.threads.archive',
         );
       }
       const result = await context.vaultWriter.archiveThread(match.bacId, requestId);
@@ -1296,11 +1843,11 @@ const routes: readonly RouteDefinition[] = [
       if (match.bacId === undefined) {
         throw new Error('Missing bacId path parameter.');
       }
-      if (mcpToolHeader(_request) === 'bac.unarchive_thread') {
+      if (mcpToolHeader(_request) === 'sidetrack.threads.unarchive') {
         await requireWorkstreamTrust(
           context,
           await readThreadWorkstreamId(requireVaultRoot(context), match.bacId),
-          'bac.unarchive_thread',
+          'sidetrack.threads.unarchive',
         );
       }
       const result = await context.vaultWriter.unarchiveThread(match.bacId, requestId);
@@ -1384,8 +1931,8 @@ const routes: readonly RouteDefinition[] = [
       if (match.bacId === undefined) {
         throw new Error('Missing bacId path parameter.');
       }
-      if (mcpToolHeader(_request) === 'bac.bump_workstream') {
-        await requireWorkstreamTrust(context, match.bacId, 'bac.bump_workstream');
+      if (mcpToolHeader(_request) === 'sidetrack.workstreams.bump') {
+        await requireWorkstreamTrust(context, match.bacId, 'sidetrack.workstreams.bump');
       }
       return [
         200,
@@ -1437,7 +1984,7 @@ const routes: readonly RouteDefinition[] = [
       return await runIdempotent(context, 'createQueueItem', idempotencyKey, async () => {
         const input = queueCreateSchema.parse(await readBody(request));
         const tool = mcpToolHeader(request);
-        if (tool === 'bac.queue_item' && input.scope === 'workstream') {
+        if (tool === 'sidetrack.queue.create' && input.scope === 'workstream') {
           await requireWorkstreamTrust(context, input.targetId, tool);
         }
         const result = await context.vaultWriter.createQueueItem(input, requestId);

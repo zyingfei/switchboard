@@ -332,7 +332,10 @@ export function SettingsPanel({
   const [draftTarget, setDraftTarget] = useState<SettingsTargetProvider>(
     initial.defaultDispatchTarget,
   );
-  const [draftAutoTrack, setDraftAutoTrack] = useState(localPreferences.autoTrack);
+  // Capture mode (autoTrack) lives in the side-panel toolbar now;
+  // Settings only describes it. Unused-locals reference here is
+  // intentional so removing the prop later is a single-spot edit.
+  void localPreferences.autoTrack;
   const [draftVaultPath, setDraftVaultPath] = useState(localPreferences.vaultPath);
   const [draftNotifyOnQueueComplete, setDraftNotifyOnQueueComplete] = useState(
     localPreferences.notifyOnQueueComplete,
@@ -346,7 +349,6 @@ export function SettingsPanel({
     draftPacketKind !== initial.defaultPacketKind ||
     draftTarget !== initial.defaultDispatchTarget;
   const localDirty =
-    draftAutoTrack !== localPreferences.autoTrack ||
     draftVaultPath.trim() !== localPreferences.vaultPath.trim() ||
     draftNotifyOnQueueComplete !== localPreferences.notifyOnQueueComplete;
   const dirty = companionDirty || localDirty;
@@ -370,7 +372,6 @@ export function SettingsPanel({
     }
     if (localDirty) {
       onSaveLocalPreferences({
-        ...(draftAutoTrack === localPreferences.autoTrack ? {} : { autoTrack: draftAutoTrack }),
         ...(draftVaultPath.trim() === localPreferences.vaultPath.trim()
           ? {}
           : { vaultPath: draftVaultPath.trim() }),
@@ -472,25 +473,13 @@ export function SettingsPanel({
             </button>
           </div>
         ) : null}
-        <label className={'switch ' + (draftAutoTrack ? 'on' : '')}>
-          <input
-            type="checkbox"
-            checked={draftAutoTrack}
-            disabled={busy}
-            onChange={() => {
-              setDraftAutoTrack(!draftAutoTrack);
-            }}
-          />
-          <span className="knob" />
-          <span className="lbl">
-            Auto-track detected AI threads
-            <span className="desc mono">
-              {draftAutoTrack
-                ? 'on — every detected thread is tracked'
-                : 'off — manual tracking only (default)'}
-            </span>
-          </span>
-        </label>
+        <p className="settings-section-lede ai-italic">
+          Capture mode lives in the side-panel toolbar: the icon between{' '}
+          <span className="mono">+</span> (capture current tab) and{' '}
+          <span className="mono">›_</span> (attach coding session) toggles between{' '}
+          <span className="mono">auto</span> (Sidetrack refreshes every new turn) and{' '}
+          <span className="mono">manual</span> (capture-on-demand per row).
+        </p>
       </div>
 
       <div className="settings-section">

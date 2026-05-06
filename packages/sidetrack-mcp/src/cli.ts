@@ -4,9 +4,12 @@ import type { Writable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
-import { m1ReadToolNames } from './capabilities.js';
+import { sidetrackToolNames } from './capabilities.js';
 import { createSidetrackMcpServer, type CompanionWriteClient } from './server/mcpServer.js';
-import { sidetrackMcpWebSocketPort, startWebSocketMcpServer } from './server/websocketServer.js';
+import {
+  sidetrackMcpHttpPort,
+  startStreamableHttpMcpServer,
+} from './server/streamableHttpServer.js';
 import { LiveVaultReader } from './vault/liveVaultReader.js';
 
 export const mcpVersion = '0.0.0';
@@ -20,7 +23,7 @@ interface ParsedArgs {
   readonly help: boolean;
   readonly version: boolean;
   readonly listTools: boolean;
-  readonly transport: 'stdio' | 'websocket';
+  readonly transport: 'stdio' | 'streamable-http';
   readonly vaultPath?: string;
   readonly companionUrl?: string;
   readonly bridgeKey?: string;
@@ -42,11 +45,11 @@ export const renderHelp = (): string =>
     '  sidetrack-mcp --version',
     '  sidetrack-mcp --list-tools',
     '  sidetrack-mcp --vault <path> [--companion-url <url> --bridge-key <key>]',
-    '  sidetrack-mcp --transport websocket --vault <path> [--port 8721]',
+    '  sidetrack-mcp --transport streamable-http --vault <path> [--port 8721]',
     '                [--companion-url <url> --bridge-key <key>] [--mcp-auth-key <key>]',
     '',
-    'WebSocket endpoint defaults to ws://127.0.0.1:8721/mcp. When an auth key',
-    'is configured, connect with ?token=<key> or Sec-WebSocket-Protocol: bearer.<key>.',
+    'Streamable HTTP endpoint defaults to http://127.0.0.1:8721/mcp. When an',
+    'auth key is configured, send Authorization: Bearer <key> on every request.',
   ].join('\n');
 
 const writeLine = (stream: Writable, text: string): void => {
@@ -58,9 +61,9 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
   let companionUrl: string | undefined;
   let bridgeKey: string | undefined;
   let mcpAuthKey: string | undefined;
-  let transport: 'stdio' | 'websocket' = 'stdio';
+  let transport: 'stdio' | 'streamable-http' = 'stdio';
   let host = '127.0.0.1';
-  let port = sidetrackMcpWebSocketPort;
+  let port = sidetrackMcpHttpPort;
 
   for (let index = 0; index < argv.length; index += 1) {
     if (argv[index] === '--vault') {
@@ -68,8 +71,8 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
       index += 1;
     } else if (argv[index] === '--transport') {
       const rawTransport = argv[index + 1];
-      if (rawTransport !== 'stdio' && rawTransport !== 'websocket') {
-        throw new Error('--transport must be either stdio or websocket.');
+      if (rawTransport !== 'stdio' && rawTransport !== 'streamable-http') {
+        throw new Error('--transport must be either stdio or streamable-http.');
       }
       transport = rawTransport;
       index += 1;
@@ -274,7 +277,7 @@ const createCompanionWriteClient = (
           },
         },
         {
-          'x-sidetrack-mcp-tool': 'bac.request_dispatch',
+          'x-sidetrack-mcp-tool': 'sidetrack.dispatch.create',
           'idempotency-key': idempotencyKey(
             'mcp-dispatch',
             [
@@ -314,7 +317,7 @@ const createCompanionWriteClient = (
       };
       const body = await post<{
         readonly data?: { readonly bac_id?: string; readonly revision?: string };
-      }>('/v1/threads', upsert, { 'x-sidetrack-mcp-tool': 'bac.move_item' });
+      }>('/v1/threads', upsert, { 'x-sidetrack-mcp-tool': 'sidetrack.threads.move' });
       if (typeof body.data?.bac_id !== 'string' || typeof body.data.revision !== 'string') {
         throw new Error('Companion did not return bac_id + revision for the moved thread.');
       }
@@ -324,7 +327,7 @@ const createCompanionWriteClient = (
       const body = await post<{
         readonly data?: { readonly bac_id?: string; readonly revision?: string };
       }>('/v1/queue', input, {
-        'x-sidetrack-mcp-tool': 'bac.queue_item',
+        'x-sidetrack-mcp-tool': 'sidetrack.queue.create',
         'idempotency-key': idempotencyKey(
           'mcp-queue',
           `${input.scope}-${input.targetId ?? 'global'}-${input.text}`,
@@ -335,6 +338,110 @@ const createCompanionWriteClient = (
       }
       return { bac_id: body.data.bac_id, revision: body.data.revision };
     },
+    async createAnnotation(input) {
+      const requestBody = {
+        ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+        ...(input.url === undefined ? {} : { url: input.url }),
+        ...(input.pageTitle === undefined ? {} : { pageTitle: input.pageTitle }),
+        term: input.term,
+        note: input.note,
+        ...(input.selectionHint === undefined
+          ? {}
+          : { selectionHint: input.selectionHint }),
+        ...(input.sourceTurn === undefined ? {} : { sourceTurn: input.sourceTurn }),
+        ...(input.anchorPolicy === undefined ? {} : { anchorPolicy: input.anchorPolicy }),
+      };
+      const sourceTurnKey =
+        input.sourceTurn === undefined
+          ? ''
+          : typeof input.sourceTurn === 'string'
+            ? input.sourceTurn
+            : `ordinal:${String(input.sourceTurn.ordinal)}`;
+      // anchorPolicy is part of the request semantics — a retry
+      // with policy={repeatedTerm:'first'} should NOT replay the
+      // cached anchor_failed result the prior policy generated.
+      // Serialise stably so equivalent policies hash the same.
+      const policy = input.anchorPolicy;
+      const policyKey =
+        policy === undefined
+          ? ''
+          : `${policy.repeatedTerm ?? ''}:${String(policy.shortTermMinLength ?? '')}`;
+      const body = await post<{ readonly data?: Record<string, unknown> }>(
+        '/v1/annotations',
+        requestBody,
+        {
+          'x-sidetrack-mcp-tool': 'sidetrack.annotations.create',
+          'idempotency-key': idempotencyKey(
+            'mcp-annotation',
+            [
+              input.threadId ?? input.url ?? '',
+              input.term,
+              input.selectionHint ?? '',
+              sourceTurnKey,
+              policyKey,
+              input.note,
+            ].join('-'),
+          ),
+        },
+      );
+      const data = body.data ?? {};
+      const status = data['status'];
+      if (status === 'created') {
+        const annotationId = data['annotationId'];
+        const occurrenceCount = data['occurrenceCount'];
+        const annotation = data['annotation'];
+        const totalForUrl = data['totalForUrl'];
+        if (typeof annotationId !== 'string') {
+          throw new Error('Companion create_annotation response missing annotationId.');
+        }
+        return {
+          status: 'created' as const,
+          annotationId,
+          occurrenceCount: typeof occurrenceCount === 'number' ? occurrenceCount : 1,
+          annotation:
+            typeof annotation === 'object' && annotation !== null
+              ? (annotation as Record<string, unknown>)
+              : {},
+          ...(typeof totalForUrl === 'number' ? { totalForUrl } : {}),
+        };
+      }
+      if (status === 'anchor_failed' || status === 'validation_failed') {
+        const reason = data['reason'];
+        const allowedReasons = [
+          'term_not_found',
+          'short_term_requires_selection_hint',
+          'ambiguous_term_requires_selection_hint',
+          'invalid_ordinal',
+          'selection_hint_no_match',
+          'thread_not_found',
+          'thread_url_unresolved',
+          'no_assistant_turns',
+        ] as const;
+        const reasonValue = allowedReasons.find((candidate) => candidate === reason);
+        if (reasonValue === undefined) {
+          throw new Error(
+            `Companion create_annotation returned unrecognised reason: ${String(reason)}`,
+          );
+        }
+        const suggestedRaw = data['suggestedSelectionHints'];
+        return {
+          status,
+          reason: reasonValue,
+          message: typeof data['message'] === 'string' ? (data['message'] as string) : '',
+          occurrenceCount:
+            typeof data['occurrenceCount'] === 'number'
+              ? (data['occurrenceCount'] as number)
+              : 0,
+          ...(Array.isArray(suggestedRaw) &&
+          suggestedRaw.every((entry) => typeof entry === 'string')
+            ? { suggestedSelectionHints: suggestedRaw as readonly string[] }
+            : {}),
+        };
+      }
+      throw new Error(
+        `Companion create_annotation returned unrecognised status: ${String(status)}`,
+      );
+    },
     async bumpWorkstream(input) {
       const body = await post<{
         readonly data?: { readonly bac_id?: string; readonly revision?: string };
@@ -342,7 +449,7 @@ const createCompanionWriteClient = (
         `/v1/workstreams/${encodeURIComponent(input.bac_id)}/bump`,
         {},
         {
-          'x-sidetrack-mcp-tool': 'bac.bump_workstream',
+          'x-sidetrack-mcp-tool': 'sidetrack.workstreams.bump',
         },
       );
       if (typeof body.data?.bac_id !== 'string' || typeof body.data.revision !== 'string') {
@@ -357,7 +464,7 @@ const createCompanionWriteClient = (
         `/v1/threads/${encodeURIComponent(input.bac_id)}/archive`,
         {},
         {
-          'x-sidetrack-mcp-tool': 'bac.archive_thread',
+          'x-sidetrack-mcp-tool': 'sidetrack.threads.archive',
         },
       );
       if (typeof body.data?.bac_id !== 'string' || typeof body.data.revision !== 'string') {
@@ -372,7 +479,7 @@ const createCompanionWriteClient = (
         `/v1/threads/${encodeURIComponent(input.bac_id)}/unarchive`,
         {},
         {
-          'x-sidetrack-mcp-tool': 'bac.unarchive_thread',
+          'x-sidetrack-mcp-tool': 'sidetrack.threads.unarchive',
         },
       );
       if (typeof body.data?.bac_id !== 'string' || typeof body.data.revision !== 'string') {
@@ -476,6 +583,47 @@ const createCompanionWriteClient = (
       }
       return (body as { readonly items: readonly unknown[] }).items;
     },
+    async awaitCaptureForDispatch(input) {
+      const url = new URL(
+        `${base}/v1/dispatches/${encodeURIComponent(input.dispatchId)}/await-capture`,
+      );
+      if (input.timeoutMs !== undefined) {
+        url.searchParams.set('timeoutMs', String(input.timeoutMs));
+      }
+      if (input.includeLatestAssistantTurn === false) {
+        url.searchParams.set('includeLatestAssistantTurn', 'false');
+      }
+      // Server caps at 120s; use a fetch timeout slightly above that
+      // so a slow companion respond never produces an aborted-fetch
+      // error before the server-side timeout fires.
+      const fetchTimeoutMs = Math.min(125_000, (input.timeoutMs ?? 60_000) + 5_000);
+      const controller = new AbortController();
+      const timer = setTimeout(() => {
+        controller.abort();
+      }, fetchTimeoutMs);
+      try {
+        const response = await fetch(url, {
+          method: 'GET',
+          headers: { 'x-bac-bridge-key': bridgeKey },
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          const detail = await response.text().catch(() => '');
+          throw new Error(
+            `Companion await-capture failed (${String(response.status)}): ${detail}`,
+          );
+        }
+        const body = (await response.json()) as { readonly data?: unknown };
+        if (typeof body.data !== 'object' || body.data === null || Array.isArray(body.data)) {
+          throw new Error('Companion await-capture response missing data object.');
+        }
+        return body.data as Awaited<
+          ReturnType<NonNullable<CompanionWriteClient['awaitCaptureForDispatch']>>
+        >;
+      } finally {
+        clearTimeout(timer);
+      }
+    },
   };
 };
 
@@ -488,7 +636,7 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
   }
 
   if (args.listTools) {
-    writeLine(streams.stdout, m1ReadToolNames.join('\n'));
+    writeLine(streams.stdout, sidetrackToolNames.join('\n'));
     return 0;
   }
 
@@ -520,15 +668,15 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
   const createServer = () =>
     createSidetrackMcpServer(new LiveVaultReader(vaultPath), companionClient);
 
-  if (args.transport === 'websocket') {
+  if (args.transport === 'streamable-http') {
     const authKey = args.mcpAuthKey ?? args.bridgeKey;
-    const started = await startWebSocketMcpServer({
+    const started = await startStreamableHttpMcpServer({
       host: args.host,
       port: args.port,
       ...(authKey === undefined ? {} : { authKey }),
       createServer,
     });
-    writeLine(streams.stderr, `sidetrack-mcp websocket listening on ${started.url}`);
+    writeLine(streams.stderr, `sidetrack-mcp streamable-http listening on ${started.url}`);
     return 0;
   }
 
