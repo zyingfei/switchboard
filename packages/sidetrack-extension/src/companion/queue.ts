@@ -26,7 +26,15 @@ import type { CaptureEvent } from './model';
 
 const QUEUE_KEY = 'sidetrack.captureQueue';
 const DROPPED_KEY = 'sidetrack.captureQueue.droppedCount';
+// Retry-exhausted explicit captures land here instead of being
+// silently dropped. The side panel surfaces them in the
+// QueueRejectionBanner with a Retry action that re-enqueues them
+// as fresh explicit captures. Passive captures continue dropping
+// silently into droppedCount.
+const FAILED_KEY = 'sidetrack.captureQueue.failed';
+const FAILED_LIMIT = 200;
 export const QUEUE_LIMIT = 1_000;
+const MAX_ATTEMPTS = 12;
 
 export type CaptureIntent = 'explicit' | 'passive';
 
@@ -182,19 +190,122 @@ export const enqueueCapture = async (
   };
 };
 
+// Failed-capture storage record. We keep enough context for the
+// side panel to render a meaningful "n unsynced after 12 retries"
+// pill and for a Retry action to re-enqueue the original event.
+export interface FailedCapture {
+  readonly id: string;
+  readonly queuedAt: string;
+  readonly failedAt: string;
+  readonly event: CaptureEvent;
+  readonly lastErrorMessage?: string;
+}
+
+const isFailedRecord = (raw: unknown): raw is FailedCapture => {
+  if (!isRecord(raw)) return false;
+  return (
+    typeof raw['id'] === 'string' &&
+    typeof raw['queuedAt'] === 'string' &&
+    typeof raw['failedAt'] === 'string' &&
+    isRecord(raw['event'])
+  );
+};
+
+export const readFailedCaptures = async (
+  storage: StoragePort = chromeStoragePort,
+): Promise<readonly FailedCapture[]> => {
+  const raw = await storage.get<unknown>(FAILED_KEY, []);
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(isFailedRecord);
+};
+
+const writeFailedCaptures = async (
+  storage: StoragePort,
+  list: readonly FailedCapture[],
+): Promise<void> => {
+  // Keep the last FAILED_LIMIT entries so a long-running outage
+  // doesn't blow up chrome.storage; the explicit-capture invariant
+  // is "no silent drop", and the user-visible banner records the
+  // earliest dropped timestamp when we trim.
+  const trimmed = list.length > FAILED_LIMIT ? list.slice(list.length - FAILED_LIMIT) : list;
+  await storage.set({ [FAILED_KEY]: trimmed });
+};
+
+export const clearFailedCaptures = async (
+  storage: StoragePort = chromeStoragePort,
+): Promise<void> => {
+  await storage.set({ [FAILED_KEY]: [] });
+};
+
+export const retryFailedCaptures = async (
+  storage: StoragePort = chromeStoragePort,
+): Promise<{ readonly requeued: number }> => {
+  const failed = await readFailedCaptures(storage);
+  if (failed.length === 0) return { requeued: 0 };
+  await clearFailedCaptures(storage);
+  let requeued = 0;
+  for (const record of failed) {
+    const result = await enqueueCapture(record.event, storage, QUEUE_LIMIT, 'explicit');
+    if (result.accepted) requeued += 1;
+    else {
+      // The queue is full of explicit items again — keep the rest
+      // in the failed list rather than losing them.
+      const stillFailed = failed.slice(failed.indexOf(record));
+      const now = new Date().toISOString();
+      await writeFailedCaptures(
+        storage,
+        stillFailed.map((r) => ({ ...r, failedAt: now })),
+      );
+      break;
+    }
+  }
+  return { requeued };
+};
+
 export const drainQueue = async (
   send: (event: CaptureEvent) => Promise<void>,
   storage: StoragePort = chromeStoragePort,
   now: Date = new Date(),
   random: () => number = Math.random,
   opts: DrainOptions = {},
-): Promise<DrainResult> =>
-  await captureOutbox.drain(
+): Promise<DrainResult> => {
+  // Accumulate explicit captures that exhaust their retry budget
+  // during this drain pass. They get persisted to the failed-queue
+  // AFTER drain so a kill-9 mid-flight doesn't leave duplicate
+  // entries (the failed-queue write is idempotent on item id).
+  const newlyFailed: FailedCapture[] = [];
+  const result = await captureOutbox.drain(
     async (item) => {
-      await send(item.payload.event);
+      try {
+        await send(item.payload.event);
+      } catch (error) {
+        // The outbox bumps attempts AFTER our throw, so attempts
+        // here is the count of PRIOR failures. The next bump turns
+        // attempts into MAX_ATTEMPTS+1 and the outbox drops the
+        // item. Snapshot it now so the failed-queue records it
+        // before the drop.
+        if (item.attempts >= MAX_ATTEMPTS && item.payload.intent === 'explicit') {
+          newlyFailed.push({
+            id: item.id,
+            queuedAt: item.queuedAt,
+            failedAt: now.toISOString(),
+            event: item.payload.event,
+            ...(error instanceof Error ? { lastErrorMessage: error.message.slice(0, 200) } : {}),
+          });
+        }
+        throw error;
+      }
     },
     storage,
     now,
     random,
     opts,
   );
+  if (newlyFailed.length > 0) {
+    const existing = await readFailedCaptures(storage);
+    const existingIds = new Set(existing.map((e) => e.id));
+    const merged = [...existing, ...newlyFailed.filter((f) => !existingIds.has(f.id))];
+    await writeFailedCaptures(storage, merged);
+  }
+  return result;
+};

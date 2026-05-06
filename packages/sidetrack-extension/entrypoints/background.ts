@@ -1798,6 +1798,20 @@ const handleRequest = async (
     return await withCompanionStatus(captureTab, 'capture');
   }
 
+  if (request.type === messageTypes.retryFailedCaptures) {
+    return await withCompanionStatus(async () => {
+      const { retryFailedCaptures } = await import('../src/companion/queue');
+      await retryFailedCaptures();
+      // Clear the latest rejection signal — the user has acknowledged
+      // the banner. Banner re-shows if the next drain produces fresh
+      // failures or rejections.
+      await chrome.storage.local.remove('sidetrack.captureQueue.lastRejection');
+      // Drain immediately so the user sees the banner clear instead
+      // of waiting for the next workboard tick.
+      await replayQueuedCaptures();
+    }, 'capture');
+  }
+
   if (request.type === messageTypes.createWorkstream) {
     return await withCompanionStatus(() => createWorkstream(request.workstream), 'workstream');
   }

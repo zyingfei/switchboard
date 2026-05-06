@@ -11,7 +11,7 @@ import type {
   WorkstreamCreate,
   WorkstreamUpdate,
 } from '../companion/model';
-import { readDroppedCount, readQueue } from '../companion/queue';
+import { readDroppedCount, readFailedCaptures, readQueue } from '../companion/queue';
 import { canonicalThreadUrl, detectProviderFromUrl } from '../capture/providerDetection';
 import type { DispatchEventRecord } from '../dispatch/types';
 import type { ReviewDraftClientEvent, TargetRef } from '../review/draftClient';
@@ -1391,10 +1391,17 @@ export const buildWorkboardState = async (
   lastError?: string,
 ): Promise<WorkboardState> => {
   const vaultPath = await readVaultPath();
+  const failedList = await readFailedCaptures();
+  const lastRejection = (await storageGet<{ readonly at?: string } | null>(
+    'sidetrack.captureQueue.lastRejection',
+    null,
+  )) as { readonly at?: string } | null;
   return createEmptyWorkboardState({
     companionStatus,
     queuedCaptureCount: (await readQueue()).length,
     droppedCaptureCount: await readDroppedCount(),
+    ...(failedList.length === 0 ? {} : { failedCaptureCount: failedList.length }),
+    ...(lastRejection?.at === undefined ? {} : { lastQueueRejectionAt: lastRejection.at }),
     settings: await readSettings(),
     screenShareMode: await readScreenShareMode(),
     threads: await readThreads(),

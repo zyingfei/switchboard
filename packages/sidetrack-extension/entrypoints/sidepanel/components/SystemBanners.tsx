@@ -5,6 +5,7 @@ import { Icons } from './icons';
 export type SystemState =
   | 'capture_success'
   | 'captures_queued'
+  | 'captures_failed'
   | 'companion_disconnected'
   | 'vault_unreachable'
   | 'provider_broken'
@@ -34,6 +35,12 @@ const STATE_CONFIG: Record<
     tone: 'amber',
     icon: 'alert',
     titleFn: (detail) => 'Captures queued' + (detail !== undefined ? ` · ${detail}` : ''),
+  },
+  captures_failed: {
+    tone: 'red',
+    icon: 'alert',
+    titleFn: (detail) =>
+      'Explicit captures failed after retries' + (detail !== undefined ? ` · ${detail}` : ''),
   },
   companion_disconnected: {
     tone: 'red',
@@ -90,9 +97,19 @@ export interface SystemBannersStackProps {
   readonly screenShareActive?: boolean;
   readonly injectionDetected?: boolean;
   readonly queuedCount?: number;
+  // Number of EXPLICIT captures that exhausted retries while the
+  // companion was offline (or failed for some other reason). The
+  // banner surfaces the count + a Retry action that re-enqueues
+  // each failed item as a fresh explicit capture.
+  readonly failedCount?: number;
+  // Most recent reject-on-full-explicit event. The banner shows it
+  // alongside failedCount so the user understands "I clicked +
+  // Capture three times and the third one bounced".
+  readonly lastRejectionAt?: string;
   readonly onRetryCompanion?: () => void;
   readonly onRePickVault?: () => void;
   readonly onQueueDiagnostic?: () => void;
+  readonly onRetryFailedCaptures?: () => void;
 }
 
 export function SystemBannersStack({
@@ -105,9 +122,12 @@ export function SystemBannersStack({
   screenShareActive = false,
   injectionDetected = false,
   queuedCount,
+  failedCount,
+  lastRejectionAt,
   onRetryCompanion,
   onRePickVault,
   onQueueDiagnostic,
+  onRetryFailedCaptures,
 }: SystemBannersStackProps) {
   const banners: ReactElement[] = [];
   if (captureSuccessHost !== undefined) {
@@ -142,6 +162,22 @@ export function SystemBannersStack({
         key="capture-queue"
         state="captures_queued"
         detail={`${String(queuedCount)} pending`}
+      />,
+    );
+  }
+  if (failedCount !== undefined && failedCount > 0) {
+    const rejectionSuffix =
+      lastRejectionAt !== undefined ? ` · last reject: ${lastRejectionAt.slice(11, 16)} UTC` : '';
+    banners.push(
+      <SystemBanner
+        key="capture-failed"
+        state="captures_failed"
+        detail={`${String(failedCount)} unsynced${rejectionSuffix}`}
+        action={
+          onRetryFailedCaptures !== undefined
+            ? { label: 'Retry', onClick: onRetryFailedCaptures }
+            : undefined
+        }
       />,
     );
   }

@@ -2369,6 +2369,7 @@ const App = () => {
     vaultUnreachable ||
     providerHealth !== undefined ||
     state.queuedCaptureCount > 0 ||
+    (state.failedCaptureCount ?? 0) > 0 ||
     captureToastHost !== null;
 
   // Current workstream id; null = "not set / Inbox" (special).
@@ -4184,6 +4185,10 @@ const App = () => {
             providerHealth={providerHealth ? 'degraded' : 'ok'}
             providerHealthDetail={providerHealth?.warning}
             queuedCount={state.queuedCaptureCount}
+            failedCount={state.failedCaptureCount ?? 0}
+            {...(state.lastQueueRejectionAt === undefined
+              ? {}
+              : { lastRejectionAt: state.lastQueueRejectionAt })}
             onQueueDiagnostic={() => {
               void refresh();
             }}
@@ -4192,6 +4197,11 @@ const App = () => {
             }}
             onRetryCompanion={() => {
               setWizardOpen(true);
+            }}
+            onRetryFailedCaptures={() => {
+              void runAction(async () =>
+                sendRequest({ type: messageTypes.retryFailedCaptures }),
+              );
             }}
           />
         </div>
