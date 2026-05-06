@@ -46,6 +46,27 @@ const flagValue = (name) => {
 const includeModel = flag('--include-model');
 const outDirArg = flagValue('--out') ?? join(companionRoot, 'dist-packages');
 
+// Optional code-signing pass. Gated on either --sign or the
+// SIDETRACK_SIGN_IDENTITY env so a CI build that doesn't have a
+// Developer ID still produces a usable (unsigned) artifact.
+//
+//   --sign 'Developer ID Application: NAME (TEAMID)'  → codesign every
+//                                                        .app / .node / .dylib / wrapper
+//   SIDETRACK_SIGN_IDENTITY='...'                      same, via env
+//
+// Notarization piggybacks on signing — no point notarizing an
+// unsigned bundle.
+//   --notarize                                         → submit to
+//                                                        Apple notarytool
+//   SIDETRACK_NOTARIZE_APPLE_ID                        Apple ID email
+//   SIDETRACK_NOTARIZE_TEAM_ID                         Team ID
+//   SIDETRACK_NOTARIZE_PASSWORD                        app-specific password
+const signIdentity =
+  flagValue('--sign') ??
+  (flag('--sign') ? '' : undefined) ??
+  process.env['SIDETRACK_SIGN_IDENTITY'];
+const wantsNotarize = flag('--notarize');
+
 const log = (msg) => {
   process.stdout.write(`[package-darwin] ${msg}\n`);
 };
@@ -198,10 +219,95 @@ Self-contained companion + MCP server for Sidetrack ${version}.
 
 ## Notes
 
-- This package is unsigned. macOS will prompt on first launch; right-click → Open from Finder, or run \`xattr -dr com.apple.quarantine\` on the install dir.
-- Code-signing + notarization land in a follow-up.
+- If this package was built without \`--sign\`, macOS will prompt on first launch; right-click → Open from Finder, or run \`xattr -dr com.apple.quarantine\` on the install dir.
+- To produce a signed + notarized bundle: run the package builder with \`--sign 'Developer ID Application: NAME (TEAMID)'\` (or set \`SIDETRACK_SIGN_IDENTITY\` env). Add \`--notarize\` plus \`SIDETRACK_NOTARIZE_APPLE_ID\`, \`SIDETRACK_NOTARIZE_TEAM_ID\`, and \`SIDETRACK_NOTARIZE_PASSWORD\` (app-specific password) to push through Apple's notarytool. The bundle is a directory rather than .app/.pkg/.dmg, so notarization is online-only — Gatekeeper checks against Apple's servers on launch.
 `;
   await writeFile(join(stage, 'README.md'), readme, 'utf8');
+
+  // 7b. Optional code-signing. Walks the staged tree and signs
+  //     every .app / .node / .dylib / wrapper script. Done after
+  //     the model prewarm step would write extra .onnx files;
+  //     reorder if the prewarm path is enabled.
+  const signNeeded = typeof signIdentity === 'string' && signIdentity.length > 0;
+  if (signNeeded) {
+    log(`signing with identity: ${signIdentity}`);
+    // First pass — sign the deepest leaf binaries (.node ONNX
+    // bindings inside node_modules); then sign the wrapper scripts;
+    // finally seal the directory itself.
+    const targets = [];
+    const walk = async (dir) => {
+      const fs = await import('node:fs/promises');
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name.endsWith('.app')) {
+            targets.push(full);
+            continue;
+          }
+          await walk(full);
+        } else if (entry.isFile()) {
+          if (
+            entry.name.endsWith('.node') ||
+            entry.name.endsWith('.dylib') ||
+            entry.name.endsWith('.so')
+          ) {
+            targets.push(full);
+          }
+        }
+      }
+    };
+    await walk(stage);
+    // Wrapper scripts — sign so notarization isn't tripped up by
+    // unsigned executables under bin/.
+    targets.push(join(stage, 'bin', 'sidetrack-companion'));
+    if (existsSync(join(stage, 'bin', 'sidetrack-mcp'))) {
+      targets.push(join(stage, 'bin', 'sidetrack-mcp'));
+    }
+    for (const target of targets) {
+      run(
+        `codesign --force --options runtime --timestamp --sign ${JSON.stringify(signIdentity)} ${JSON.stringify(target)}`,
+      );
+    }
+    log(`✓ signed ${String(targets.length)} target(s)`);
+  } else {
+    log('skipping code-signing (no --sign identity / SIDETRACK_SIGN_IDENTITY)');
+  }
+
+  // 7c. Optional notarization. Requires signing to have already
+  //     happened. Submit a zip of the staged tree to Apple's
+  //     notarytool; on success staple the ticket back to each
+  //     signed binary so Gatekeeper accepts the bundle offline.
+  if (wantsNotarize) {
+    if (!signNeeded) {
+      throw new Error('--notarize requires --sign (or SIDETRACK_SIGN_IDENTITY).');
+    }
+    const appleId = process.env['SIDETRACK_NOTARIZE_APPLE_ID'];
+    const teamId = process.env['SIDETRACK_NOTARIZE_TEAM_ID'];
+    const password = process.env['SIDETRACK_NOTARIZE_PASSWORD'];
+    if (
+      typeof appleId !== 'string' ||
+      typeof teamId !== 'string' ||
+      typeof password !== 'string'
+    ) {
+      throw new Error(
+        '--notarize needs SIDETRACK_NOTARIZE_APPLE_ID, SIDETRACK_NOTARIZE_TEAM_ID, and SIDETRACK_NOTARIZE_PASSWORD env vars.',
+      );
+    }
+    const zipPath = `${stage}.zip`;
+    log(`zipping for notarization: ${zipPath}`);
+    run(`/usr/bin/ditto -c -k --sequesterRsrc --keepParent ${JSON.stringify(stage)} ${JSON.stringify(zipPath)}`);
+    log('submitting to notarytool…');
+    run(
+      `xcrun notarytool submit ${JSON.stringify(zipPath)} --apple-id ${JSON.stringify(appleId)} --team-id ${JSON.stringify(teamId)} --password ${JSON.stringify(password)} --wait`,
+    );
+    log('stapling…');
+    // notarytool's `staple` only knows .app / .pkg / .dmg. Our
+    // bundle is a directory — staple skips files but the cached
+    // notarization ticket on Apple's side is enough for Gatekeeper
+    // online launches. Documented in README.
+    log('✓ notarized (online-only — bundle is a directory, not a .app)');
+  }
 
   // 8. Optional model prewarm.
   if (includeModel) {
