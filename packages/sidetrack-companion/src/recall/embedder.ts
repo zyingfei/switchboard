@@ -32,8 +32,14 @@ import { INDEX_DIM } from './indexFile.js';
 // Suffixing the identity (e.g. with the prefix variant) means a
 // change to embedding behavior triggers an auto-rebuild even
 // though the underlying HF model didn't change.
-const HF_MODEL = 'Xenova/multilingual-e5-small';
-export const MODEL_ID = `${HF_MODEL}#prefix-query-v1`;
+import { isOfflineMode, resolveModelsDir } from './modelCache.js';
+import { RECALL_MODEL, RECALL_MODEL_ID } from './modelManifest.js';
+
+const HF_MODEL = RECALL_MODEL.modelId;
+// Identity string the lifecycle compares against the on-disk index.
+// Bumping `RECALL_MODEL.revision` in modelManifest.ts marks every
+// existing entry stale and triggers a background rebuild.
+export const MODEL_ID = RECALL_MODEL_ID;
 
 type FeatureExtractor = (
   text: string,
@@ -90,11 +96,18 @@ export const getEmbedder = async (): Promise<FeatureExtractor> => {
       const module = await import('@huggingface/transformers');
       const env = (module as { readonly env?: Record<string, unknown> }).env;
       if (env !== undefined) {
-        env['allowRemoteModels'] = true;
+        const offline = isOfflineMode();
+        // In offline mode we deny remote fetches; the embedder
+        // throws if the cache is empty and the lifecycle reports
+        // RECALL_MODEL_MISSING. In normal mode we allow downloads.
+        env['allowRemoteModels'] = !offline;
         env['allowLocalModels'] = false;
-        // Cache to disk under the user's HF cache dir so we only pay
-        // the model download once across companion restarts.
         env['useFSCache'] = true;
+        // Sidetrack-managed model directory. The default still
+        // honors HF_HOME / HF_HUB_CACHE if set, but we point
+        // transformers.js at the product-owned tree so packaging
+        // can prewarm + ship a self-contained app.
+        env['cacheDir'] = resolveModelsDir();
       }
       // `device: 'cpu'` selects onnxruntime-node which on macOS uses
       // Apple Accelerate.

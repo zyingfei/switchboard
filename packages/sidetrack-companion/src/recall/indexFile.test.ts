@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -99,9 +99,14 @@ describe('recall index file', () => {
     expect((await readIndex(path))?.items.map((item) => item.id)).toEqual(['keep']);
   });
 
-  it('writes the V2 header with schema capabilities', async () => {
-    expect(INDEX_VERSION).toBe(2);
-    expect(INDEX_SCHEMA_CAPABILITIES).toEqual(['tombstones', 'replica-id', 'lamport-clock']);
+  it('writes the V3 header with schema capabilities + chunk-metadata flag', async () => {
+    expect(INDEX_VERSION).toBe(3);
+    expect(INDEX_SCHEMA_CAPABILITIES).toEqual([
+      'tombstones',
+      'replica-id',
+      'lamport-clock',
+      'chunk-metadata',
+    ]);
     const path = join(root, 'index.bin');
     const embedding = new Float32Array(INDEX_DIM);
     await writeIndex(
@@ -110,7 +115,82 @@ describe('recall index file', () => {
       'model',
     );
     const read = await readIndex(path);
-    expect(read?.schemaCapabilities).toEqual(['tombstones', 'replica-id', 'lamport-clock']);
+    expect(read?.schemaCapabilities).toEqual([
+      'tombstones',
+      'replica-id',
+      'lamport-clock',
+      'chunk-metadata',
+    ]);
+  });
+
+  it('round-trips chunk metadata + modelRevision in the V3 header', async () => {
+    const path = join(root, 'index.bin');
+    const embedding = new Float32Array(INDEX_DIM);
+    embedding[0] = 1;
+    await writeIndex(
+      path,
+      [
+        {
+          id: 'chunk:bac_test:0:0:abcdef012345',
+          threadId: 'thread_test',
+          capturedAt: '2026-05-06T18:00:00.000Z',
+          embedding,
+          replicaId: 'replica-A',
+          lamport: 7,
+          tombstoned: false,
+          metadata: {
+            sourceBacId: 'bac_test',
+            provider: 'chatgpt',
+            threadUrl: 'https://chatgpt.com/c/test',
+            title: 'Switchboard',
+            role: 'assistant',
+            turnOrdinal: 0,
+            modelName: 'gpt-5-thinking',
+            headingPath: ['1. Plugin / extension behavior'],
+            paragraphIndex: 0,
+            charStart: 0,
+            charEnd: 200,
+            textHash: 'a'.repeat(64),
+            text: 'chunk body content',
+          },
+        },
+      ],
+      'model',
+      { modelRevision: 'rev-deadbeef' },
+    );
+    const read = await readIndex(path);
+    expect(read?.modelRevision).toBe('rev-deadbeef');
+    expect(read?.chunkSchemaVersion).toBe(1);
+    const entry = read?.items[0];
+    expect(entry?.metadata?.headingPath).toEqual(['1. Plugin / extension behavior']);
+    expect(entry?.metadata?.text).toBe('chunk body content');
+    expect(entry?.metadata?.title).toBe('Switchboard');
+  });
+
+  it('returns null for a V2-magic file (forces lifecycle to rebuild into V3)', async () => {
+    const path = join(root, 'index.bin');
+    // Hand-write a V2-shaped file by patching the header version.
+    const embedding = new Float32Array(INDEX_DIM);
+    await writeIndex(
+      path,
+      [{ id: 'a', threadId: 'thread', capturedAt: '2026-05-03T00:00:00.000Z', embedding }],
+      'model',
+    );
+    const buffer = await readFile(path);
+    const headerLength = buffer.readUInt32LE(0);
+    const header = JSON.parse(buffer.subarray(4, 4 + headerLength).toString('utf8')) as Record<
+      string,
+      unknown
+    >;
+    header['version'] = 2;
+    const newHeaderBytes = Buffer.from(JSON.stringify(header), 'utf8');
+    const newHeaderLen = Buffer.alloc(4);
+    newHeaderLen.writeUInt32LE(newHeaderBytes.length, 0);
+    await writeFile(
+      path,
+      Buffer.concat([newHeaderLen, newHeaderBytes, buffer.subarray(4 + headerLength)]),
+    );
+    expect(await readIndex(path)).toBeNull();
   });
 
   it('round-trips replicaId, lamport, and tombstoned fields', async () => {

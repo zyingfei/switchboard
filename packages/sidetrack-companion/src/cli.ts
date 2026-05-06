@@ -8,6 +8,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { ensureMcpAuthKey } from './auth/mcpAuthKey.js';
 import { pickInstaller } from './install/index.js';
+import { getModelCacheStatus, resolveModelsDir } from './recall/modelCache.js';
+import { RECALL_MODEL } from './recall/modelManifest.js';
 import { startCompanion } from './runtime/companion.js';
 import { ensureRendezvousSecret } from './sync/rendezvousSecret.js';
 import { startRelayServer, type StartedRelayServer } from './sync/relayServer.js';
@@ -94,6 +96,24 @@ export const renderHelp = (): string =>
     '  sidetrack-companion relay [--relay-port 8443]',
     '    Run the bundled relay server. Stateless ring-buffer fanout; restart wipes',
     '    every rendezvous. Front with a TLS reverse proxy for wss:// access.',
+    '',
+    'Models subcommand (recall embedding model):',
+    '  sidetrack-companion models status [--models-dir <path>] [--json]',
+    '  sidetrack-companion models ensure [--models-dir <path>]',
+    '  sidetrack-companion models verify [--models-dir <path>]',
+    '    Manage the local embedding-model cache. The default cache lives at',
+    '    ~/Library/Application Support/Sidetrack/models on macOS,',
+    '    ~/.local/share/sidetrack/models on Linux,',
+    "    %LOCALAPPDATA%/Sidetrack/models on Windows. Override with --models-dir or",
+    '    SIDETRACK_MODELS_DIR. Set SIDETRACK_OFFLINE_MODELS=1 to disable downloads.',
+    '',
+    'Recall subcommand (index lifecycle):',
+    '  sidetrack-companion recall status --vault <path> [--json]',
+    '  sidetrack-companion recall reingest --vault <path>',
+    '  sidetrack-companion recall verify --vault <path>',
+    '    The recall index is a rebuildable cache. `reingest` walks the merged',
+    '    event log and projects unprocessed capture events into chunk entries',
+    '    without touching raw _BAC/log/ data.',
   ].join('\n');
 
 const writeLine = (stream: Writable, text: string): void => {
@@ -285,7 +305,220 @@ const relayUrl = (relay: StartedRelayServer): string => `ws://${relay.host}:${St
 const syncRequested = (args: ParsedArgs): boolean =>
   args.syncRelay !== undefined || args.syncRelayLocalPort !== undefined;
 
+// Argument lookup for sub-command modes. Avoids re-running the
+// flag-driven parser when we only need a couple of override values.
+const findArgValue = (argv: readonly string[], name: string): string | undefined => {
+  for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index] === name) return argv[index + 1];
+    const eq = argv[index]?.startsWith(`${name}=`) === true ? argv[index] : undefined;
+    if (eq !== undefined) return eq.slice(name.length + 1);
+  }
+  return undefined;
+};
+
+const runModelsSubcommand = async (
+  argv: readonly string[],
+  streams: CliStreams,
+): Promise<number> => {
+  // argv[0] is 'models'; argv[1] is the verb.
+  const verb = argv[1];
+  if (verb === undefined || verb === 'help' || verb === '--help') {
+    writeLine(
+      streams.stdout,
+      'Usage: sidetrack-companion models {status|ensure|verify} [--models-dir <path>] [--json]',
+    );
+    return verb === undefined ? 2 : 0;
+  }
+  const modelsDirArg = findArgValue(argv, '--models-dir');
+  const json = argv.includes('--json');
+  const offline = argv.includes('--offline-models');
+  const opts = {
+    ...(modelsDirArg === undefined ? {} : { modelsDir: modelsDirArg }),
+    ...(offline ? { offline: true } : {}),
+  };
+  const cacheDir = resolveModelsDir(opts);
+
+  if (verb === 'status') {
+    const status = await getModelCacheStatus(opts);
+    if (json) {
+      writeLine(streams.stdout, JSON.stringify(status, null, 2));
+      return 0;
+    }
+    writeLine(streams.stdout, `model id     ${status.modelId}`);
+    writeLine(streams.stdout, `revision     ${status.revision}`);
+    writeLine(streams.stdout, `cache dir    ${status.cacheDir}`);
+    writeLine(streams.stdout, `present      ${status.present ? 'yes' : 'no'}`);
+    writeLine(streams.stdout, `verified     ${status.verified ? 'yes' : 'no (revision unpinned)'}`);
+    writeLine(streams.stdout, `offline      ${status.offline ? 'yes' : 'no'}`);
+    return 0;
+  }
+
+  if (verb === 'ensure') {
+    if (offline) {
+      writeLine(
+        streams.stderr,
+        'models ensure cannot run with --offline-models / SIDETRACK_OFFLINE_MODELS=1; remove the offline flag and retry.',
+      );
+      return 1;
+    }
+    writeLine(streams.stdout, `Ensuring ${RECALL_MODEL.modelId} into ${cacheDir} …`);
+    // The download is driven by the embedder's lazy load on first
+    // call. Trigger it deterministically here by routing the
+    // transformers cache to the requested dir and asking for one
+    // embedding. Use a process-local env override so we don't
+    // mutate the running config.
+    process.env['SIDETRACK_MODELS_DIR'] = cacheDir;
+    const { embed } = await import('./recall/embedder.js');
+    await embed(['warmup']);
+    const post = await getModelCacheStatus({ ...opts, modelsDir: cacheDir });
+    writeLine(streams.stdout, post.present ? 'ok — model cached' : 'WARN — embedder ran but cache check still missing');
+    return post.present ? 0 : 1;
+  }
+
+  if (verb === 'verify') {
+    const status = await getModelCacheStatus(opts);
+    if (!status.present) {
+      writeLine(streams.stderr, 'verify: model not present in cache. Run `models ensure` first.');
+      return 1;
+    }
+    if (status.verified) {
+      writeLine(streams.stdout, 'verify: ok (checksum match)');
+      return 0;
+    }
+    writeLine(
+      streams.stdout,
+      'verify: present but unverified — manifest revision is not yet pinned to a sha. Falling back to presence-only check.',
+    );
+    return 0;
+  }
+
+  writeLine(streams.stderr, `unknown models verb: ${verb}`);
+  writeLine(streams.stderr, 'try: status | ensure | verify');
+  return 2;
+};
+
+const runRecallSubcommand = async (
+  argv: readonly string[],
+  streams: CliStreams,
+): Promise<number> => {
+  const verb = argv[1];
+  if (verb === undefined || verb === 'help' || verb === '--help') {
+    writeLine(
+      streams.stdout,
+      'Usage: sidetrack-companion recall {status|reingest|verify} --vault <path> [--json]',
+    );
+    return verb === undefined ? 2 : 0;
+  }
+  const vaultPath = findArgValue(argv, '--vault');
+  if (vaultPath === undefined || vaultPath.length === 0) {
+    writeLine(streams.stderr, '--vault <path> is required for the recall sub-command.');
+    return 2;
+  }
+  const json = argv.includes('--json');
+
+  // Lazy imports so `models` runs (and all the help/version paths)
+  // don't pull in the full eventLog + indexFile + embedder graph.
+  const { readIngestState, readRecallManifest, ingestIncremental } = await import(
+    './recall/ingestor.js'
+  );
+  const { readIndex } = await import('./recall/indexFile.js');
+  const { createEventLog } = await import('./sync/eventLog.js');
+  const { loadOrCreateReplica } = await import('./sync/replicaId.js');
+
+  if (verb === 'status') {
+    const [manifest, state, index] = await Promise.all([
+      readRecallManifest(vaultPath),
+      readIngestState(vaultPath),
+      readIndex(`${vaultPath}/_BAC/recall/index.bin`),
+    ]);
+    const status = {
+      manifest,
+      ingestState: state,
+      index: index === null ? null : { entryCount: index.items.length, modelId: index.modelId },
+    };
+    if (json) {
+      writeLine(streams.stdout, JSON.stringify(status, null, 2));
+      return 0;
+    }
+    writeLine(
+      streams.stdout,
+      `manifest      ${manifest === null ? '(none — run `recall reingest`)' : `${manifest.modelId} rev=${manifest.modelRevision} v${String(manifest.indexVersion)}`}`,
+    );
+    writeLine(
+      streams.stdout,
+      `index         ${index === null ? '(none)' : `${String(index.items.length)} entries (${index.modelId})`}`,
+    );
+    writeLine(
+      streams.stdout,
+      `frontier      ${
+        Object.keys(state.processedEvents).length === 0
+          ? '(nothing ingested yet)'
+          : Object.entries(state.processedEvents)
+              .map(([k, v]) => `${k}@${String(v)}`)
+              .join(' ')
+      }`,
+    );
+    if (state.lastIncrementalIngestAt !== undefined) {
+      writeLine(streams.stdout, `last ingest   ${state.lastIncrementalIngestAt}`);
+    }
+    return 0;
+  }
+
+  if (verb === 'reingest') {
+    const replica = await loadOrCreateReplica(vaultPath);
+    const eventLog = createEventLog(vaultPath, replica);
+    writeLine(streams.stdout, `reingesting from event log into ${vaultPath}/_BAC/recall/ …`);
+    const result = await ingestIncremental(vaultPath, eventLog);
+    writeLine(
+      streams.stdout,
+      `ok — indexed ${String(result.indexedChunks)} chunks, ${String(result.tombstonedChunks)} tombstoned`,
+    );
+    return 0;
+  }
+
+  if (verb === 'verify') {
+    const [manifest, index] = await Promise.all([
+      readRecallManifest(vaultPath),
+      readIndex(`${vaultPath}/_BAC/recall/index.bin`),
+    ]);
+    if (manifest === null) {
+      writeLine(streams.stderr, 'verify: no manifest. Run `recall reingest` first.');
+      return 1;
+    }
+    if (index === null) {
+      writeLine(streams.stderr, 'verify: no index file on disk.');
+      return 1;
+    }
+    if (manifest.modelId !== index.modelId.split('#')[0]) {
+      writeLine(
+        streams.stderr,
+        `verify: model mismatch — manifest=${manifest.modelId} index=${index.modelId}`,
+      );
+      return 1;
+    }
+    writeLine(
+      streams.stdout,
+      `verify: ok — manifest matches index (${String(index.items.length)} entries, ${manifest.modelId})`,
+    );
+    return 0;
+  }
+
+  writeLine(streams.stderr, `unknown recall verb: ${verb}`);
+  writeLine(streams.stderr, 'try: status | reingest | verify');
+  return 2;
+};
+
 export const runCli = async (argv: readonly string[], streams: CliStreams): Promise<number> => {
+  // Sub-command dispatch happens BEFORE the flag-driven parser so a
+  // verb like `models` doesn't get interpreted as a positional vault
+  // path. Existing flag-only invocations are unaffected.
+  if (argv[0] === 'models') {
+    return await runModelsSubcommand(argv, streams);
+  }
+  if (argv[0] === 'recall') {
+    return await runRecallSubcommand(argv, streams);
+  }
+
   const args = parseArgs(argv);
 
   if (args.version) {

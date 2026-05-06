@@ -181,6 +181,21 @@ export const startCompanion = async (
   // Don't block startup on the rebuild — health endpoint will report
   // status: 'rebuilding' until the background task completes.
   void recallLifecycle.ensureFresh();
+  // Catch the recall index up to the latest event-log frontier on
+  // boot. The ingestor is idempotent and resumes from the persisted
+  // ingest-state, so a kill-9 between captures is safe. Best-effort:
+  // if the embedder is offline (model missing) or the log is empty
+  // this is a no-op. Runs after lifecycle.ensureFresh() so a rebuild
+  // doesn't race with incremental upserts.
+  void (async () => {
+    try {
+      const { ingestIncremental } = await import('../recall/ingestor.js');
+      await ingestIncremental(options.vaultPath, baseEventLog);
+    } catch {
+      // Ingestor errors are non-fatal — the manual `recall reingest`
+      // CLI verb + lifecycle stale-check rebuilds remain available.
+    }
+  })();
   const server = createCompanionHttpServer({
     bridgeKey: ensured.key,
     vaultWriter,

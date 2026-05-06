@@ -216,6 +216,12 @@ export interface WorkboardState {
   readonly vaultPath?: string;
   readonly queuedCaptureCount: number;
   readonly droppedCaptureCount: number;
+  // V3 no-data-loss surfaces. failedCaptureCount is explicit
+  // captures that exhausted retries. lastQueueRejectionAt is set
+  // when an explicit capture was rejected because the queue was
+  // fully explicit. Both feed the side-panel banner.
+  readonly failedCaptureCount?: number;
+  readonly lastQueueRejectionAt?: string;
   readonly settings: UiSettings;
   readonly screenShareMode: boolean;
   readonly activeTabUrl?: string;
