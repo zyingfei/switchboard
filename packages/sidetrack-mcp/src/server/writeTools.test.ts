@@ -38,10 +38,15 @@ const buildFakeWriteClient = (
   ),
   createAnnotation: vi.fn(() =>
     Promise.resolve({
-      bac_id: 'bac_annotation_fake',
-      url: 'https://chatgpt.com/c/thread',
-      pageTitle: 'ChatGPT',
-      note: 'Architect note',
+      status: 'created' as const,
+      annotationId: 'bac_annotation_fake',
+      occurrenceCount: 1,
+      annotation: {
+        bac_id: 'bac_annotation_fake',
+        url: 'https://chatgpt.com/c/thread',
+        pageTitle: 'ChatGPT',
+        note: 'Architect note',
+      },
     }),
   ),
   requestDispatch: vi.fn(() =>
@@ -278,11 +283,16 @@ describe('sidetrack.annotations.create_batch', () => {
       createAnnotation: vi.fn((input) => {
         counter += 1;
         return Promise.resolve({
-          bac_id: `bac_annotation_${String(counter)}`,
-          url: input.url,
-          pageTitle: input.pageTitle,
-          term: input.term,
-          note: input.note,
+          status: 'created' as const,
+          annotationId: `bac_annotation_${String(counter)}`,
+          occurrenceCount: 1,
+          annotation: {
+            bac_id: `bac_annotation_${String(counter)}`,
+            url: input.url,
+            pageTitle: input.pageTitle,
+            term: input.term,
+            note: input.note,
+          },
         });
       }),
     });
@@ -291,8 +301,7 @@ describe('sidetrack.annotations.create_batch', () => {
       const result = await client.callTool({
         name: 'sidetrack.annotations.create_batch',
         arguments: {
-          url: 'https://chatgpt.com/c/thread',
-          pageTitle: 'HN',
+          threadId: 'bac_thread_target',
           items: [
             { term: 'WebGPU', note: 'WebGPU defines browser GPU compute and rendering.' },
             {
@@ -305,22 +314,24 @@ describe('sidetrack.annotations.create_batch', () => {
       });
       expect(writeClient.createAnnotation).toHaveBeenCalledTimes(2);
       expect(writeClient.createAnnotation).toHaveBeenNthCalledWith(2, {
-        url: 'https://chatgpt.com/c/thread',
-        pageTitle: 'HN',
+        threadId: 'bac_thread_target',
         term: 'eBPF',
         note: 'eBPF runs verified bytecode in the kernel.',
         selectionHint: 'kernel without rebuild — namely',
       });
       const structured = result.structuredContent as Record<string, unknown>;
-      expect(structured['countForThread']).toBe(2);
-      const annotations = structured['annotations'] as readonly Record<string, unknown>[];
-      expect(annotations).toHaveLength(2);
-      expect(annotations[0]).toMatchObject({
+      expect(structured['threadId']).toBe('bac_thread_target');
+      expect(structured['attemptedCount']).toBe(2);
+      expect(structured['createdCount']).toBe(2);
+      expect(structured['anchorFailedCount']).toBe(0);
+      const items = structured['items'] as readonly Record<string, unknown>[];
+      expect(items).toHaveLength(2);
+      expect(items[0]).toMatchObject({
         term: 'WebGPU',
         status: 'created',
         annotationId: 'bac_annotation_1',
       });
-      expect(annotations[1]).toMatchObject({
+      expect(items[1]).toMatchObject({
         term: 'eBPF',
         status: 'created',
         annotationId: 'bac_annotation_2',
@@ -330,25 +341,32 @@ describe('sidetrack.annotations.create_batch', () => {
     }
   });
 
-  it('surfaces server-side anchor build failures as per-item failures', async () => {
-    // Phase 4: short-term / no-match / hint-no-match etc are all
-    // raised by the companion's anchorBuilder. The MCP tool never
-    // pre-validates — it forwards each item, and the companion
-    // returns 400 on a per-call basis, which the tool maps to
-    // status:'failed' so the rest of the batch keeps going.
+  it('surfaces structured anchor_failed reasons with suggestedSelectionHints', async () => {
+    // The companion now returns structured per-item failures; the
+    // tool maps anchor_failed → status:'anchor_failed' and exposes
+    // the suggested selection hints so the model can retry once.
     const writeClient = buildFakeWriteClient({
       createAnnotation: vi.fn((input) => {
-        if (input.term === 'AI') {
-          return Promise.reject(
-            new Error("Term 'AI' is shorter than 6 chars; provide selectionHint."),
-          );
+        if (input.term === 'WebGPU' && input.selectionHint === undefined) {
+          return Promise.resolve({
+            status: 'anchor_failed' as const,
+            reason: 'ambiguous_term_requires_selection_hint' as const,
+            message: "Term 'WebGPU' appears 3 times; provide selectionHint.",
+            occurrenceCount: 3,
+            suggestedSelectionHints: ['ordinal:1', 'ordinal:2', 'ordinal:3'] as const,
+          });
         }
         return Promise.resolve({
-          bac_id: 'bac_annotation_ok',
-          url: input.url,
-          pageTitle: input.pageTitle,
-          term: input.term,
-          note: input.note,
+          status: 'created' as const,
+          annotationId: 'bac_annotation_ok',
+          occurrenceCount: 1,
+          annotation: {
+            bac_id: 'bac_annotation_ok',
+            url: input.url,
+            pageTitle: input.pageTitle,
+            term: input.term,
+            note: input.note,
+          },
         });
       }),
     });
@@ -357,24 +375,27 @@ describe('sidetrack.annotations.create_batch', () => {
       const result = await client.callTool({
         name: 'sidetrack.annotations.create_batch',
         arguments: {
-          url: 'https://chatgpt.com/c/thread',
-          pageTitle: 'HN',
+          threadId: 'bac_thread_target',
           items: [
-            { term: 'AI', note: 'Too generic without context.' },
-            { term: 'WebGPU', note: 'Defines browser GPU access.' },
+            { term: 'WebGPU', note: 'Repeated; should require hint.' },
+            { term: 'eBPF', note: 'Single occurrence; should succeed.' },
           ],
         },
       });
       expect(writeClient.createAnnotation).toHaveBeenCalledTimes(2);
-      const annotations = (result.structuredContent as Record<string, unknown>)[
-        'annotations'
-      ] as readonly Record<string, unknown>[];
-      expect(annotations[0]).toMatchObject({
-        term: 'AI',
-        status: 'failed',
-      });
-      expect(annotations[1]).toMatchObject({
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured['createdCount']).toBe(1);
+      expect(structured['anchorFailedCount']).toBe(1);
+      const items = structured['items'] as readonly Record<string, unknown>[];
+      expect(items[0]).toMatchObject({
         term: 'WebGPU',
+        status: 'anchor_failed',
+        reason: 'ambiguous_term_requires_selection_hint',
+        occurrenceCount: 3,
+        suggestedSelectionHints: ['ordinal:1', 'ordinal:2', 'ordinal:3'],
+      });
+      expect(items[1]).toMatchObject({
+        term: 'eBPF',
         status: 'created',
       });
     } finally {
@@ -552,11 +573,25 @@ describe('sidetrack.dispatch.await_capture', () => {
         Promise.resolve({
           dispatchId: 'bac_dispatch_pending',
           matched: true,
-          threadId: 'bac_thread_linked',
-          threadUrl: 'https://chatgpt.com/c/linked',
-          title: 'Captured chat',
-          provider: 'chatgpt' as const,
           linkedAt: '2026-05-05T12:00:00.000Z',
+          thread: {
+            threadId: 'bac_thread_linked',
+            threadUrl: 'https://chatgpt.com/c/linked',
+            title: 'Captured chat',
+            provider: 'chatgpt' as const,
+          },
+          resources: {
+            dispatch: 'sidetrack://dispatch/bac_dispatch_pending',
+            thread: 'sidetrack://thread/bac_thread_linked',
+            turns: 'sidetrack://thread/bac_thread_linked/turns',
+            markdown: 'sidetrack://thread/bac_thread_linked/markdown',
+            annotations: 'sidetrack://thread/bac_thread_linked/annotations',
+          },
+          latestAssistantTurn: {
+            ordinal: 0,
+            text: 'Captured assistant body.',
+            capturedAt: '2026-05-05T12:00:00.000Z',
+          },
           reason: 'matched' as const,
         }),
       ),
@@ -574,10 +609,21 @@ describe('sidetrack.dispatch.await_capture', () => {
       expect(result.structuredContent).toMatchObject({
         dispatchId: 'bac_dispatch_pending',
         matched: true,
-        threadId: 'bac_thread_linked',
-        threadUrl: 'https://chatgpt.com/c/linked',
-        title: 'Captured chat',
-        provider: 'chatgpt',
+        linkedAt: '2026-05-05T12:00:00.000Z',
+        thread: {
+          threadId: 'bac_thread_linked',
+          threadUrl: 'https://chatgpt.com/c/linked',
+          title: 'Captured chat',
+          provider: 'chatgpt',
+        },
+        resources: {
+          turns: 'sidetrack://thread/bac_thread_linked/turns',
+          markdown: 'sidetrack://thread/bac_thread_linked/markdown',
+        },
+        latestAssistantTurn: {
+          ordinal: 0,
+          text: 'Captured assistant body.',
+        },
         reason: 'matched',
       });
     } finally {

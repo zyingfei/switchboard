@@ -204,12 +204,17 @@ const writeClient: CompanionWriteClient & {
     createAnnotation: (input) => {
       recordedCalls.push({ tool: 'createAnnotation', input });
       return Promise.resolve({
-        bac_id: 'bac_annotation_term',
-        url: input.url,
-        pageTitle: input.pageTitle,
-        term: input.term,
-        note: input.note,
-        createdAt: NOW,
+        status: 'created' as const,
+        annotationId: 'bac_annotation_term',
+        occurrenceCount: 1,
+        annotation: {
+          bac_id: 'bac_annotation_term',
+          url: input.url,
+          pageTitle: input.pageTitle,
+          term: input.term,
+          note: input.note,
+          createdAt: NOW,
+        },
       });
     },
     bumpWorkstream: () => Promise.reject(new Error('not exercised in this test')),
@@ -632,30 +637,33 @@ describe('codex handoff over MCP', () => {
       const batch = await client.callTool({
         name: 'sidetrack.annotations.create_batch',
         arguments: {
+          threadId: TARGET_THREAD_ID,
           url: 'https://chatgpt.com/c/target-thread',
           pageTitle: 'ChatGPT HN analysis',
           items: [
             {
               term: 'WebGPU',
-              prefix: 'Top tech keywords: ',
-              suffix: ' - browser GPU access for modern apps.',
               note: 'WebGPU: browser GPU compute/rendering API for architect-level context.',
             },
           ],
         },
       });
       const batchData = structured(batch) as {
-        readonly annotations?: readonly {
+        readonly items?: readonly {
           readonly term?: string;
           readonly status?: string;
           readonly annotationId?: string;
         }[];
-        readonly countForThread?: number;
+        readonly createdCount?: number;
+        readonly anchorFailedCount?: number;
+        readonly attemptedCount?: number;
       };
-      expect(batchData.countForThread).toBe(1);
-      expect(batchData.annotations?.[0]?.term).toBe('WebGPU');
-      expect(batchData.annotations?.[0]?.status).toBe('created');
-      expect(batchData.annotations?.[0]?.annotationId).toBe('bac_annotation_term');
+      expect(batchData.attemptedCount).toBe(1);
+      expect(batchData.createdCount).toBe(1);
+      expect(batchData.anchorFailedCount).toBe(0);
+      expect(batchData.items?.[0]?.term).toBe('WebGPU');
+      expect(batchData.items?.[0]?.status).toBe('created');
+      expect(batchData.items?.[0]?.annotationId).toBe('bac_annotation_term');
 
       const queued = await client.callTool({
         name: 'sidetrack.queue.create',

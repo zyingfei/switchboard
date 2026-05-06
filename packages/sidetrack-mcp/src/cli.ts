@@ -339,24 +339,93 @@ const createCompanionWriteClient = (
       return { bac_id: body.data.bac_id, revision: body.data.revision };
     },
     async createAnnotation(input) {
+      const requestBody = {
+        ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+        ...(input.url === undefined ? {} : { url: input.url }),
+        ...(input.pageTitle === undefined ? {} : { pageTitle: input.pageTitle }),
+        term: input.term,
+        note: input.note,
+        ...(input.selectionHint === undefined
+          ? {}
+          : { selectionHint: input.selectionHint }),
+        ...(input.sourceTurn === undefined ? {} : { sourceTurn: input.sourceTurn }),
+        ...(input.anchorPolicy === undefined ? {} : { anchorPolicy: input.anchorPolicy }),
+      };
+      const sourceTurnKey =
+        input.sourceTurn === undefined
+          ? ''
+          : typeof input.sourceTurn === 'string'
+            ? input.sourceTurn
+            : `ordinal:${String(input.sourceTurn.ordinal)}`;
       const body = await post<{ readonly data?: Record<string, unknown> }>(
         '/v1/annotations',
-        input,
+        requestBody,
         {
           'x-sidetrack-mcp-tool': 'sidetrack.annotations.create',
           'idempotency-key': idempotencyKey(
             'mcp-annotation',
             [
-              input.url,
-              input.pageTitle,
+              input.threadId ?? input.url ?? '',
               input.term,
               input.selectionHint ?? '',
+              sourceTurnKey,
               input.note,
             ].join('-'),
           ),
         },
       );
-      return body.data ?? {};
+      const data = body.data ?? {};
+      const status = data['status'];
+      if (status === 'created') {
+        const annotationId = data['annotationId'];
+        const occurrenceCount = data['occurrenceCount'];
+        const annotation = data['annotation'];
+        if (typeof annotationId !== 'string') {
+          throw new Error('Companion create_annotation response missing annotationId.');
+        }
+        return {
+          status: 'created' as const,
+          annotationId,
+          occurrenceCount: typeof occurrenceCount === 'number' ? occurrenceCount : 1,
+          annotation:
+            typeof annotation === 'object' && annotation !== null
+              ? (annotation as Record<string, unknown>)
+              : {},
+        };
+      }
+      if (status === 'anchor_failed' || status === 'validation_failed') {
+        const reason = data['reason'];
+        const allowedReasons = [
+          'term_not_found',
+          'short_term_requires_selection_hint',
+          'ambiguous_term_requires_selection_hint',
+          'invalid_ordinal',
+          'selection_hint_no_match',
+        ] as const;
+        const reasonValue = allowedReasons.find((candidate) => candidate === reason);
+        if (reasonValue === undefined) {
+          throw new Error(
+            `Companion create_annotation returned unrecognised reason: ${String(reason)}`,
+          );
+        }
+        const suggestedRaw = data['suggestedSelectionHints'];
+        return {
+          status,
+          reason: reasonValue,
+          message: typeof data['message'] === 'string' ? (data['message'] as string) : '',
+          occurrenceCount:
+            typeof data['occurrenceCount'] === 'number'
+              ? (data['occurrenceCount'] as number)
+              : 0,
+          ...(Array.isArray(suggestedRaw) &&
+          suggestedRaw.every((entry) => typeof entry === 'string')
+            ? { suggestedSelectionHints: suggestedRaw as readonly string[] }
+            : {}),
+        };
+      }
+      throw new Error(
+        `Companion create_annotation returned unrecognised status: ${String(status)}`,
+      );
     },
     async bumpWorkstream(input) {
       const body = await post<{
@@ -505,6 +574,9 @@ const createCompanionWriteClient = (
       );
       if (input.timeoutMs !== undefined) {
         url.searchParams.set('timeoutMs', String(input.timeoutMs));
+      }
+      if (input.includeLatestAssistantTurn === false) {
+        url.searchParams.set('includeLatestAssistantTurn', 'false');
       }
       // Server caps at 120s; use a fetch timeout slightly above that
       // so a slow companion respond never produces an aborted-fetch

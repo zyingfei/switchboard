@@ -725,7 +725,13 @@ describe('companion HTTP server', () => {
     const settled = await awaitPromise;
     expect(settled.status).toBe(200);
     expect(settled.body).toMatchObject({
-      data: { dispatchId, matched: true, threadId: 'bac_thread_midpoll', reason: 'matched' },
+      data: {
+        dispatchId,
+        matched: true,
+        thread: { threadId: 'bac_thread_midpoll' },
+        resources: { thread: 'sidetrack://thread/bac_thread_midpoll' },
+        reason: 'matched',
+      },
     });
   });
 
@@ -841,18 +847,23 @@ describe('companion HTTP server', () => {
     expect(create.status).toBe(201);
     expect(create.body).toMatchObject({
       data: {
-        url: threadUrl,
-        anchor: {
-          textQuote: {
-            exact: 'WebGPU',
-            prefix: 'Browser graphics stack: ',
+        status: 'created',
+        annotationId: expect.stringMatching(/.+/u),
+        occurrenceCount: 1,
+        annotation: {
+          url: threadUrl,
+          anchor: {
+            textQuote: {
+              exact: 'WebGPU',
+              prefix: 'Browser graphics stack: ',
+            },
           },
         },
       },
     });
   });
 
-  it('returns 400 when the term form references a thread with no captured turns', async () => {
+  it('surfaces a structured anchor_failed result when the term thread has no captured turns', async () => {
     const create = await jsonFetch(context, `${baseUrl}/v1/annotations`, {
       method: 'POST',
       headers: {
@@ -867,8 +878,66 @@ describe('companion HTTP server', () => {
         note: 'Should fail — no turns.',
       }),
     });
-    expect(create.status).toBe(404);
-    expect(create.body).toMatchObject({ code: 'NO_ASSISTANT_TURNS' });
+    expect(create.status).toBe(200);
+    expect(create.body).toMatchObject({
+      data: {
+        status: 'anchor_failed',
+        reason: 'term_not_found',
+        occurrenceCount: 0,
+      },
+    });
+  });
+
+  it('returns ambiguous_term_requires_selection_hint with suggestedSelectionHints for repeated terms', async () => {
+    const capturedAt = '2026-04-26T21:30:00.000Z';
+    const threadUrl = 'https://chatgpt.com/c/repeated-term-thread';
+    await jsonFetch(context, `${baseUrl}/v1/events`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'capture-repeated-term-001',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        provider: 'chatgpt',
+        threadUrl,
+        title: 'Repeated terms',
+        capturedAt,
+        turns: [
+          {
+            role: 'assistant',
+            text: 'WebGPU intro. Then WebGPU again here. Finally, WebGPU appears once more.',
+            ordinal: 0,
+            capturedAt,
+          },
+        ],
+      }),
+    });
+
+    const create = await jsonFetch(context, `${baseUrl}/v1/annotations`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'annotation-repeated-term-001',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        url: threadUrl,
+        pageTitle: 'Repeated terms',
+        term: 'WebGPU',
+        note: 'Should require disambiguation.',
+      }),
+    });
+
+    expect(create.status).toBe(200);
+    expect(create.body).toMatchObject({
+      data: {
+        status: 'anchor_failed',
+        reason: 'ambiguous_term_requires_selection_hint',
+        occurrenceCount: 3,
+        suggestedSelectionHints: expect.arrayContaining(['ordinal:1']),
+      },
+    });
   });
 
   it('updates and soft-deletes annotations through HTTP', async () => {

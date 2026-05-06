@@ -309,36 +309,66 @@ test.describe('Codex MCP Hacker News annotation flow (synthetic browser)', () =>
             };
           },
           async createAnnotation(input) {
-            // Phase 4: the MCP CompanionWriteClient.createAnnotation
-            // contract is term-form. Mirror the real companion route:
-            // fetch the thread's assistant turns and build the anchor
-            // server-side before writing.
-            const threadUrl = input.threadUrl ?? input.url;
+            // The MCP CompanionWriteClient.createAnnotation contract
+            // is term-form + structured per-call result. Mirror the
+            // real companion route: fetch turns, build the anchor,
+            // then return either status:'created' or
+            // status:'anchor_failed' with a reason the create_batch
+            // tool maps to per-item statuses.
+            const threadUrl = input.url;
+            if (threadUrl === undefined) {
+              return {
+                status: 'validation_failed' as const,
+                reason: 'term_not_found' as const,
+                message: 'In-process MCP requires url for term-form annotations.',
+                occurrenceCount: 0,
+              };
+            }
             const turns = await activeCompanion.writer.readRecentTurns({
               threadUrl,
               limit: 50,
               role: 'assistant',
             });
             if (turns.length === 0) {
-              throw new Error(`No assistant turns found for ${threadUrl}.`);
+              return {
+                status: 'anchor_failed' as const,
+                reason: 'term_not_found' as const,
+                message: `No assistant turns found for ${threadUrl}.`,
+                occurrenceCount: 0,
+              };
             }
             const turnText = turns
               .slice()
               .sort((left, right) => left.ordinal - right.ordinal)
               .map((turn) => turn.text)
               .join('\n\n');
-            const anchor = buildAnchorFromTerm({
+            const anchorResult = buildAnchorFromTerm({
               turnText,
               term: input.term,
               ...(input.selectionHint === undefined ? {} : { selectionHint: input.selectionHint }),
             });
+            if (!anchorResult.ok) {
+              return {
+                status: 'anchor_failed' as const,
+                reason: anchorResult.reason,
+                message: anchorResult.message,
+                occurrenceCount: anchorResult.occurrenceCount,
+                ...(anchorResult.suggestedSelectionHints === undefined
+                  ? {}
+                  : { suggestedSelectionHints: anchorResult.suggestedSelectionHints }),
+              };
+            }
+            const created = await writeAnnotation(activeCompanion.vaultPath, {
+              url: threadUrl,
+              pageTitle: input.pageTitle ?? threadUrl,
+              anchor: anchorResult.anchor,
+              note: input.note,
+            });
             return {
-              ...(await writeAnnotation(activeCompanion.vaultPath, {
-                url: input.url,
-                pageTitle: input.pageTitle,
-                anchor,
-                note: input.note,
-              })),
+              status: 'created' as const,
+              annotationId: created.bac_id,
+              occurrenceCount: anchorResult.occurrenceCount,
+              annotation: created as unknown as Record<string, unknown>,
             };
           },
           async listAnnotations(input) {

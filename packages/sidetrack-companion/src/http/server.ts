@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { access, readFile, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { AnchorBuilderError, buildAnchorFromTerm } from '../annotation/anchorBuilder.js';
+import { buildAnchorFromTerm } from '../annotation/anchorBuilder.js';
 import { isBridgeKeyAccepted, rotateBridgeKey } from '../auth/bridgeKey.js';
 import {
   isAllowed,
@@ -1014,6 +1014,9 @@ const routes: readonly RouteDefinition[] = [
         Number.isFinite(requested) && requested > 0 ? Math.min(requested, 120_000) : 60_000;
       const vaultRoot = context.vaultRoot;
 
+      const includeTurn =
+        url.searchParams.get('includeLatestAssistantTurn') !== 'false';
+
       const buildResponse = async (
         link: Awaited<ReturnType<typeof context.vaultWriter.readLinkForDispatch>>,
       ) => {
@@ -1026,14 +1029,59 @@ const routes: readonly RouteDefinition[] = [
         }
         const meta =
           vaultRoot === undefined ? null : await readThreadMetadata(vaultRoot, link.threadId);
-        return {
-          dispatchId,
-          matched: true,
+        // Phase-5-review: always surface `thread.threadId` plus a
+        // `resources` URI map so the model can navigate without
+        // remembering URI templates from prompt boilerplate.
+        // threadUrl/title/provider attach when the thread record is
+        // present in the vault; missing ones drop quietly so a thread
+        // captured-but-not-yet-flushed still produces a useful payload.
+        const thread = {
           threadId: link.threadId,
-          linkedAt: link.linkedAt,
           ...(meta?.threadUrl === undefined ? {} : { threadUrl: meta.threadUrl }),
           ...(meta?.title === undefined ? {} : { title: meta.title }),
           ...(meta?.provider === undefined ? {} : { provider: meta.provider }),
+        };
+        const resources = {
+          dispatch: `sidetrack://dispatch/${dispatchId}`,
+          thread: `sidetrack://thread/${link.threadId}`,
+          turns: `sidetrack://thread/${link.threadId}/turns`,
+          markdown: `sidetrack://thread/${link.threadId}/markdown`,
+          annotations: `sidetrack://thread/${link.threadId}/annotations`,
+        };
+        // Latest assistant turn — read once now so the model doesn't
+        // have to make a follow-up call. Best-effort: a missing
+        // threadUrl or empty turn list both reduce to "no latestAssistantTurn".
+        let latestAssistantTurn:
+          | { ordinal: number; text: string; capturedAt: string }
+          | undefined;
+        if (includeTurn && meta?.threadUrl !== undefined) {
+          try {
+            const turns = await context.vaultWriter.readRecentTurns({
+              threadUrl: meta.threadUrl,
+              limit: 5,
+              role: 'assistant',
+            });
+            const latest = turns
+              .slice()
+              .sort((left, right) => right.ordinal - left.ordinal)[0];
+            if (latest !== undefined) {
+              latestAssistantTurn = {
+                ordinal: latest.ordinal,
+                text: latest.text,
+                capturedAt: latest.capturedAt,
+              };
+            }
+          } catch {
+            // best-effort
+          }
+        }
+        return {
+          dispatchId,
+          matched: true,
+          linkedAt: link.linkedAt,
+          thread,
+          resources,
+          ...(latestAssistantTurn === undefined ? {} : { latestAssistantTurn }),
           reason: 'matched' as const,
         };
       };
@@ -1170,52 +1218,155 @@ const routes: readonly RouteDefinition[] = [
         // driven): caller already serialised the anchor; pass through
         // unchanged.
         if ('term' in input) {
-          const threadUrl = input.threadUrl ?? input.url;
-          const turns = await context.vaultWriter.readRecentTurns({
+          // Resolve threadUrl + pageTitle from the thread record when
+          // the caller passed `threadId`. This is the path
+          // sidetrack.dispatch.await_capture flows into — agents pass
+          // threadId, the companion looks up everything else.
+          let threadUrl: string | undefined = input.url;
+          let pageTitle: string | undefined = input.pageTitle;
+          if (input.threadId !== undefined) {
+            const meta = await readThreadMetadata(vaultRoot, input.threadId);
+            if (meta === null) {
+              return [
+                200,
+                {
+                  data: {
+                    status: 'anchor_failed' as const,
+                    reason: 'term_not_found' as const,
+                    message: `Thread ${input.threadId} not found in the vault.`,
+                    occurrenceCount: 0,
+                  },
+                },
+              ];
+            }
+            threadUrl = meta.threadUrl ?? threadUrl;
+            pageTitle = pageTitle ?? meta.title;
+          }
+          if (threadUrl === undefined) {
+            return [
+              200,
+              {
+                data: {
+                  status: 'validation_failed' as const,
+                  reason: 'term_not_found' as const,
+                  message: 'No threadUrl could be resolved from threadId / url.',
+                  occurrenceCount: 0,
+                },
+              },
+            ];
+          }
+          if (pageTitle === undefined) {
+            pageTitle = threadUrl;
+          }
+          const allTurns = await context.vaultWriter.readRecentTurns({
             threadUrl,
             limit: 50,
             role: 'assistant',
           });
-          if (turns.length === 0) {
-            throw new HttpRouteError(
-              404,
-              'NO_ASSISTANT_TURNS',
-              'Thread has no captured assistant turns.',
-              `No assistant turns found for ${threadUrl}; capture the thread first.`,
-            );
+          if (allTurns.length === 0) {
+            return [
+              200,
+              {
+                data: {
+                  status: 'anchor_failed' as const,
+                  reason: 'term_not_found' as const,
+                  message: `No assistant turns found for ${threadUrl}; capture the thread first.`,
+                  occurrenceCount: 0,
+                },
+              },
+            ];
           }
-          const turnText = turns
+          // sourceTurn selects which captured turn the anchor is
+          // built against. Defaults to the latest assistant turn —
+          // matches the post-dispatch flow where the agent annotates
+          // a fresh answer.
+          const sortedAsc = allTurns
             .slice()
-            .sort((left, right) => left.ordinal - right.ordinal)
-            .map((turn) => turn.text)
-            .join('\n\n');
-          let anchor;
-          try {
-            anchor = buildAnchorFromTerm({
-              turnText,
-              term: input.term,
-              ...(input.selectionHint === undefined ? {} : { selectionHint: input.selectionHint }),
-            });
-          } catch (error) {
-            if (error instanceof AnchorBuilderError) {
-              throw new HttpRouteError(
-                400,
-                error.reason.toUpperCase().replace(/-/g, '_'),
-                'Anchor build failed.',
-                error.message,
-              );
+            .sort((left, right) => left.ordinal - right.ordinal);
+          const sourceTurn = input.sourceTurn ?? 'assistant_latest';
+          let turnText: string;
+          if (sourceTurn === 'assistant_all') {
+            turnText = sortedAsc.map((turn) => turn.text).join('\n\n');
+          } else if (sourceTurn === 'assistant_latest') {
+            const last = sortedAsc[sortedAsc.length - 1];
+            turnText = last?.text ?? '';
+          } else {
+            const picked = sortedAsc.find((turn) => turn.ordinal === sourceTurn.ordinal);
+            if (picked === undefined) {
+              return [
+                200,
+                {
+                  data: {
+                    status: 'validation_failed' as const,
+                    reason: 'invalid_ordinal' as const,
+                    message: `Thread has no assistant turn at ordinal ${String(sourceTurn.ordinal)}.`,
+                    occurrenceCount: 0,
+                  },
+                },
+              ];
             }
-            throw error;
+            turnText = picked.text;
           }
+          // anchorPolicy fields can each be undefined under
+          // exactOptionalPropertyTypes; strip undefined before
+          // passing down. Defaults live in buildAnchorFromTerm.
+          const policy = input.anchorPolicy;
+          const cleanedPolicy =
+            policy === undefined
+              ? undefined
+              : {
+                  ...(policy.repeatedTerm === undefined
+                    ? {}
+                    : { repeatedTerm: policy.repeatedTerm }),
+                  ...(policy.shortTermMinLength === undefined
+                    ? {}
+                    : { shortTermMinLength: policy.shortTermMinLength }),
+                };
+          const result = buildAnchorFromTerm({
+            turnText,
+            term: input.term,
+            ...(input.selectionHint === undefined
+              ? {}
+              : { selectionHint: input.selectionHint }),
+            ...(cleanedPolicy === undefined ? {} : { policy: cleanedPolicy }),
+          });
+          if (!result.ok) {
+            // Structured failure — surfaced as 200 + a `data` block
+            // the MCP create_batch tool maps to a per-item retry-able
+            // status. Throwing 400 forces the agent to handle a
+            // protocol-level error; structured returns let the model
+            // self-correct against the same envelope shape as a
+            // success.
+            return [
+              200,
+              {
+                data: {
+                  status: 'anchor_failed' as const,
+                  reason: result.reason,
+                  message: result.message,
+                  occurrenceCount: result.occurrenceCount,
+                  ...(result.suggestedSelectionHints === undefined
+                    ? {}
+                    : { suggestedSelectionHints: [...result.suggestedSelectionHints] }),
+                },
+              },
+            ];
+          }
+          const created = await writeAnnotation(vaultRoot, {
+            url: input.url ?? threadUrl,
+            pageTitle,
+            anchor: result.anchor,
+            note: input.note,
+          });
           return [
             201,
             {
-              data: await writeAnnotation(vaultRoot, {
-                url: input.url,
-                pageTitle: input.pageTitle,
-                anchor,
-                note: input.note,
-              }),
+              data: {
+                status: 'created' as const,
+                annotationId: created.bac_id,
+                occurrenceCount: result.occurrenceCount,
+                annotation: created,
+              },
             },
           ];
         }

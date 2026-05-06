@@ -3,10 +3,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { BrowserContext, Route } from '@playwright/test';
 
-import {
-  AnchorBuilderError,
-  buildAnchorFromTerm,
-} from '../../../../sidetrack-companion/src/annotation/anchorBuilder.js';
+import { buildAnchorFromTerm } from '../../../../sidetrack-companion/src/annotation/anchorBuilder.js';
 import { ensureBridgeKey } from '../../../../sidetrack-companion/src/auth/bridgeKey.js';
 import {
   CodingAttachTokenInvalidError,
@@ -196,18 +193,36 @@ export const createMockVaultCompanion = async (port = 17373): Promise<MockVaultC
       if (route.request().method() === 'POST' && url.pathname === '/v1/annotations') {
         const input = annotationCreateSchema.parse(readJsonBody(route));
         if ('term' in input) {
-          // Phase 4: term-form. Mirror the real route — fetch the
-          // assistant turns from the mock vault, build the anchor,
-          // then writeAnnotation with the materialised anchor shape.
-          const threadUrl = input.threadUrl ?? input.url;
+          // Term-form: mirror the real route — fetch the assistant
+          // turns from the mock vault, build the anchor, then
+          // writeAnnotation with the materialised anchor shape.
+          // Returns structured per-call status (created /
+          // anchor_failed) the same way the production route does.
+          const threadUrl = input.url;
+          if (threadUrl === undefined) {
+            await fulfillJson(route, 200, {
+              data: {
+                status: 'validation_failed',
+                reason: 'term_not_found',
+                message: 'mockVaultCompanion requires url for term-form annotations.',
+                occurrenceCount: 0,
+              },
+            });
+            return;
+          }
           const turns = await writer.readRecentTurns({
             threadUrl,
             limit: 50,
             role: 'assistant',
           });
           if (turns.length === 0) {
-            await fulfillJson(route, 404, {
-              error: 'No assistant turns found for the provided URL.',
+            await fulfillJson(route, 200, {
+              data: {
+                status: 'anchor_failed',
+                reason: 'term_not_found',
+                message: `No assistant turns found for ${threadUrl}.`,
+                occurrenceCount: 0,
+              },
             });
             return;
           }
@@ -216,27 +231,39 @@ export const createMockVaultCompanion = async (port = 17373): Promise<MockVaultC
             .sort((left, right) => left.ordinal - right.ordinal)
             .map((turn) => turn.text)
             .join('\n\n');
-          let anchor;
-          try {
-            anchor = buildAnchorFromTerm({
-              turnText,
-              term: input.term,
-              ...(input.selectionHint === undefined ? {} : { selectionHint: input.selectionHint }),
+          const anchorResult = buildAnchorFromTerm({
+            turnText,
+            term: input.term,
+            ...(input.selectionHint === undefined ? {} : { selectionHint: input.selectionHint }),
+          });
+          if (!anchorResult.ok) {
+            await fulfillJson(route, 200, {
+              data: {
+                status: 'anchor_failed',
+                reason: anchorResult.reason,
+                message: anchorResult.message,
+                occurrenceCount: anchorResult.occurrenceCount,
+                ...(anchorResult.suggestedSelectionHints === undefined
+                  ? {}
+                  : { suggestedSelectionHints: [...anchorResult.suggestedSelectionHints] }),
+              },
             });
-          } catch (error) {
-            if (error instanceof AnchorBuilderError) {
-              await fulfillJson(route, 400, { error: error.message });
-              return;
-            }
-            throw error;
+            return;
           }
-          const result = await writeAnnotation(vaultPath, {
-            url: input.url,
-            pageTitle: input.pageTitle,
-            anchor,
+          const created = await writeAnnotation(vaultPath, {
+            url: threadUrl,
+            pageTitle: input.pageTitle ?? threadUrl,
+            anchor: anchorResult.anchor,
             note: input.note,
           });
-          await fulfillJson(route, 201, { data: result });
+          await fulfillJson(route, 201, {
+            data: {
+              status: 'created',
+              annotationId: created.bac_id,
+              occurrenceCount: anchorResult.occurrenceCount,
+              annotation: created,
+            },
+          });
           return;
         }
         const result = await writeAnnotation(vaultPath, input);

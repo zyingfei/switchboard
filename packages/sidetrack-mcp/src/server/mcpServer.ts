@@ -87,20 +87,53 @@ export interface CompanionWriteClient {
     readonly scope: 'thread' | 'workstream' | 'global';
     readonly targetId?: string;
   }) => Promise<{ readonly bac_id: string; readonly revision: string }>;
-  // Term-form annotation create. Phase 4 of the spec-aligned refactor:
-  // the agent provides intent (term + optional selectionHint) and the
-  // companion builds the anchor from the thread's stored turn text,
-  // mirroring how the in-DOM extension paths already work and avoiding
-  // markdown↔DOM offset divergence on the read side.
+  // Term-form annotation create. The agent provides intent
+  // (term + optional selectionHint) and the companion builds the
+  // anchor from the thread's stored turn text, mirroring how the
+  // in-DOM extension paths already work and avoiding markdown↔DOM
+  // offset divergence on the read side.
+  //
+  // Contract (post-PR-92-review):
+  //   - threadId-first. url/pageTitle are optional shortcuts the
+  //     companion fills in from the thread record.
+  //   - Returns a structured result: created → annotationId, anchor
+  //     failures → reason + suggestedSelectionHints. Per-batch retry
+  //     logic lives in the create_batch tool.
   readonly createAnnotation?: (input: {
-    readonly url: string;
-    readonly pageTitle: string;
     readonly term: string;
     readonly note: string;
     readonly threadId?: string;
-    readonly threadUrl?: string;
+    readonly url?: string;
+    readonly pageTitle?: string;
     readonly selectionHint?: string;
-  }) => Promise<Record<string, unknown>>;
+    readonly sourceTurn?:
+      | 'assistant_latest'
+      | 'assistant_all'
+      | { readonly ordinal: number };
+    readonly anchorPolicy?: {
+      readonly repeatedTerm?: 'first' | 'require_hint';
+      readonly shortTermMinLength?: number;
+    };
+  }) => Promise<
+    | {
+        readonly status: 'created';
+        readonly annotationId: string;
+        readonly occurrenceCount: number;
+        readonly annotation: Record<string, unknown>;
+      }
+    | {
+        readonly status: 'anchor_failed' | 'validation_failed';
+        readonly reason:
+          | 'term_not_found'
+          | 'short_term_requires_selection_hint'
+          | 'ambiguous_term_requires_selection_hint'
+          | 'invalid_ordinal'
+          | 'selection_hint_no_match';
+        readonly message: string;
+        readonly occurrenceCount: number;
+        readonly suggestedSelectionHints?: readonly string[];
+      }
+  >;
   readonly updateAnnotation?: (input: {
     readonly bac_id: string;
     readonly note: string;
@@ -155,17 +188,37 @@ export interface CompanionWriteClient {
   // `GET /v1/dispatches/:bacId/await-capture` endpoint; resolves
   // when the link table has a record, or returns matched=false when
   // the timeout expires.
+  //
+  // P0-review update (Phase-5 follow-up): the companion now returns
+  // a structured `thread` block, a `resources` URI map, and the
+  // latest assistant turn so the agent can stop polling /v1/turns
+  // after capture.
   readonly awaitCaptureForDispatch?: (input: {
     readonly dispatchId: string;
     readonly timeoutMs?: number;
+    readonly includeLatestAssistantTurn?: boolean;
   }) => Promise<{
     readonly dispatchId: string;
     readonly matched: boolean;
-    readonly threadId?: string;
-    readonly threadUrl?: string;
-    readonly title?: string;
-    readonly provider?: 'chatgpt' | 'claude' | 'gemini';
     readonly linkedAt?: string;
+    readonly thread?: {
+      readonly threadId: string;
+      readonly threadUrl?: string;
+      readonly title?: string;
+      readonly provider?: 'chatgpt' | 'claude' | 'gemini';
+    };
+    readonly resources?: {
+      readonly dispatch: string;
+      readonly thread: string;
+      readonly turns: string;
+      readonly markdown: string;
+      readonly annotations: string;
+    };
+    readonly latestAssistantTurn?: {
+      readonly ordinal: number;
+      readonly text: string;
+      readonly capturedAt: string;
+    };
     readonly reason?: 'matched' | 'timeout';
   }>;
 }

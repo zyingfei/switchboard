@@ -1,12 +1,15 @@
-// Batch annotation tool. Single typed batch that takes one URL +
-// pageTitle and a list of {term, note, selectionHint?} items.
-// Returns per-item status so partial failures surface cleanly.
+// Batch annotation tool. Thread-first, intent-driven: the agent
+// supplies the captured threadId and a list of {term, note,
+// selectionHint?} items. The companion looks up the thread record,
+// fetches the assistant-turn body, builds the anchor, and writes
+// the annotation — the agent never computes offsets, prefix/suffix
+// windows, or DOM positions.
 //
-// Phase 4 contract (current): items carry intent only — term + optional
-// selectionHint. The companion builds the anchor server-side from the
-// thread's stored assistant-turn body, so the agent never does offset
-// arithmetic. selectionHint disambiguates between multiple occurrences
-// (either an `ordinal:N` form or a preceding-fragment).
+// Failure surface is structured: each item returns a status from
+// {created, anchor_failed, validation_failed, failed}. anchor_failed
+// items also carry a `reason` enum and `suggestedSelectionHints` so
+// the model can retry once with a disambiguating hint without any
+// prompt-side procedural knowledge.
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
@@ -21,29 +24,58 @@ const annotationItemShape = z.object({
     .trim()
     .min(1)
     .max(400)
-    .describe('Exact term or short quote to highlight on the page.'),
-  note: z.string().max(5000).describe('Annotation note to show in Sidetrack.'),
+    .describe(
+      'Exact visible term from the captured assistant turn. Prefer precise multi-word phrases over generic single words.',
+    ),
+  note: z.string().max(5000).describe('Annotation note to display in Sidetrack.'),
   selectionHint: z
     .string()
     .max(512)
     .optional()
     .describe(
-      "Optional disambiguator. Either 'ordinal:N' (1-based) to pick the Nth occurrence, or a preceding-text fragment whose tail matches the context immediately before the term.",
+      "Optional disambiguator. Use 'ordinal:N' (1-based) for the Nth occurrence, or a short preceding-text fragment. Required only when the tool reports short/repeated-term failure.",
     ),
 });
 
-const annotationStatusEnum = z.enum(['created', 'rejected', 'failed']);
+const sourceTurnShape = z.union([
+  z.literal('assistant_latest'),
+  z.literal('assistant_all'),
+  z.object({ ordinal: z.number().int().nonnegative() }),
+]);
+
+const anchorFailureReasonEnum = z.enum([
+  'term_not_found',
+  'short_term_requires_selection_hint',
+  'ambiguous_term_requires_selection_hint',
+  'invalid_ordinal',
+  'selection_hint_no_match',
+]);
+
+const annotationStatusEnum = z.enum([
+  'created',
+  'anchor_failed',
+  'validation_failed',
+  'failed',
+]);
 
 const batchOutputShape = {
-  annotations: z.array(
+  threadId: z.string().optional(),
+  url: z.string().optional(),
+  attemptedCount: z.number().int(),
+  createdCount: z.number().int(),
+  anchorFailedCount: z.number().int(),
+  failedCount: z.number().int(),
+  items: z.array(
     z.object({
       term: z.string(),
       status: annotationStatusEnum,
       annotationId: z.string().optional(),
-      error: z.string().optional(),
+      reason: anchorFailureReasonEnum.optional(),
+      message: z.string().optional(),
+      occurrenceCount: z.number().int().optional(),
+      suggestedSelectionHints: z.array(z.string()).optional(),
     }),
   ),
-  countForThread: z.number().int(),
   createdAt: z.iso.datetime(),
 };
 
@@ -55,10 +87,31 @@ export const registerAnnotationTools = (
     'sidetrack.annotations.create_batch',
     {
       description:
-        'Persist 1..20 term-scoped annotations against a single page URL. Each item is a (term, note, optional selectionHint). The companion looks up the thread by URL, fetches the assistant-turn body, builds the anchor, and writes the annotation — the agent never computes offsets. Returns a per-item status array so partial failures surface cleanly.',
+        'Create 1..20 annotations on a captured Sidetrack thread from semantic intent (exact visible term + note). The companion looks up the thread, picks the source turn, builds the anchor, and writes the annotation. The model must not compute offsets, prefix/suffix, or CSS selectors. Per-item statuses include retry-able anchor_failed reasons with suggestedSelectionHints — retry once with one of those hints when the reason is short_term_requires_selection_hint or ambiguous_term_requires_selection_hint.',
       inputSchema: {
-        url: z.url().describe('Exact page URL where the annotations should restore.'),
-        pageTitle: z.string().min(1).describe('Current page title.'),
+        threadId: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            'Captured Sidetrack thread bac_id (returned by sidetrack.dispatch.await_capture as thread.threadId). Preferred over url. When provided, the companion resolves url/pageTitle from the thread record.',
+          ),
+        url: z
+          .url()
+          .optional()
+          .describe(
+            'Page URL where annotations restore. Optional when threadId is supplied. Required when threadId is omitted (legacy URL-driven path).',
+          ),
+        pageTitle: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Optional page title shown in Sidetrack. Resolved from threadId if absent.'),
+        sourceTurn: sourceTurnShape
+          .optional()
+          .describe(
+            "Which captured turn is the anchor source. Defaults to 'assistant_latest'. Pass 'assistant_all' to span every assistant turn or {ordinal:N} for a specific one.",
+          ),
         items: z
           .array(annotationItemShape)
           .min(1)
@@ -67,43 +120,73 @@ export const registerAnnotationTools = (
       },
       outputSchema: batchOutputShape,
     },
-    async ({ url, pageTitle, items }) => {
+    async ({ threadId, url, pageTitle, sourceTurn, items }) => {
       if (companionClient?.createAnnotation === undefined) {
         throw new Error(
           'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.annotations.create_batch is unavailable.',
         );
       }
+      if (threadId === undefined && url === undefined) {
+        throw new Error(
+          'sidetrack.annotations.create_batch requires either threadId or url.',
+        );
+      }
       const createAnnotation = companionClient.createAnnotation;
-      const results: z.infer<typeof batchOutputShape.annotations>[number][] = [];
+      const results: z.infer<typeof batchOutputShape.items>[number][] = [];
       for (const item of items) {
         const trimmedTerm = item.term.trim();
         try {
-          const created = await createAnnotation({
-            url,
-            pageTitle,
+          const result = await createAnnotation({
+            ...(threadId === undefined ? {} : { threadId }),
+            ...(url === undefined ? {} : { url }),
+            ...(pageTitle === undefined ? {} : { pageTitle }),
             term: trimmedTerm,
             note: item.note,
             ...(item.selectionHint === undefined ? {} : { selectionHint: item.selectionHint }),
+            ...(sourceTurn === undefined ? {} : { sourceTurn }),
           });
-          const rawId = created['bac_id'];
-          const annotationId = typeof rawId === 'string' ? rawId : '';
-          results.push({
-            term: trimmedTerm,
-            status: 'created',
-            annotationId,
-          });
+          if (result.status === 'created') {
+            results.push({
+              term: trimmedTerm,
+              status: 'created',
+              annotationId: result.annotationId,
+              occurrenceCount: result.occurrenceCount,
+            });
+          } else {
+            results.push({
+              term: trimmedTerm,
+              status: result.status,
+              reason: result.reason,
+              message: result.message,
+              occurrenceCount: result.occurrenceCount,
+              ...(result.suggestedSelectionHints === undefined
+                ? {}
+                : { suggestedSelectionHints: [...result.suggestedSelectionHints] }),
+            });
+          }
         } catch (error) {
           results.push({
             term: trimmedTerm,
             status: 'failed',
-            error: error instanceof Error ? error.message : String(error),
+            message: error instanceof Error ? error.message : String(error),
           });
         }
       }
-      const successes = results.filter((entry) => entry.status === 'created').length;
+      const createdCount = results.filter((entry) => entry.status === 'created').length;
+      const anchorFailedCount = results.filter(
+        (entry) => entry.status === 'anchor_failed',
+      ).length;
+      const failedCount = results.filter(
+        (entry) => entry.status === 'failed' || entry.status === 'validation_failed',
+      ).length;
       const structured: z.infer<z.ZodObject<typeof batchOutputShape>> = {
-        annotations: results,
-        countForThread: successes,
+        ...(threadId === undefined ? {} : { threadId }),
+        ...(url === undefined ? {} : { url }),
+        attemptedCount: items.length,
+        createdCount,
+        anchorFailedCount,
+        failedCount,
+        items: results,
         createdAt: new Date().toISOString(),
       };
       return {

@@ -407,19 +407,36 @@ const annotationCreateAnchorSchema = z.object({
   note: z.string(),
 });
 
-const annotationCreateTermSchema = z.object({
-  url: z.url(),
-  pageTitle: z.string().min(1),
-  term: z.string().min(1).max(400),
-  // Optional — when omitted, the companion uses the request `url` as
-  // the thread URL for the turn-text lookup. ChatGPT, Claude, and
-  // Gemini all serve thread pages on stable URLs that already match
-  // the canonical threadUrl, so this is the typical case.
-  threadId: z.string().min(1).optional(),
-  threadUrl: z.url().optional(),
-  selectionHint: z.string().max(512).optional(),
-  note: z.string(),
+// Term-form input. Either `threadId` or `url` must be present —
+// threadId is preferred (the companion looks the thread record up
+// and resolves both threadUrl + pageTitle); url is the legacy
+// shortcut for "annotate the page at this URL", used when the
+// caller has no threadId.
+const annotationSourceTurnSchema = z.union([
+  z.literal('assistant_latest'),
+  z.literal('assistant_all'),
+  z.object({ ordinal: z.number().int().nonnegative() }),
+]);
+
+const annotationAnchorPolicySchema = z.object({
+  repeatedTerm: z.enum(['first', 'require_hint']).optional(),
+  shortTermMinLength: z.number().int().positive().max(64).optional(),
 });
+
+const annotationCreateTermSchema = z
+  .object({
+    threadId: z.string().min(1).optional(),
+    url: z.url().optional(),
+    pageTitle: z.string().min(1).optional(),
+    term: z.string().min(1).max(400),
+    selectionHint: z.string().max(512).optional(),
+    sourceTurn: annotationSourceTurnSchema.optional(),
+    anchorPolicy: annotationAnchorPolicySchema.optional(),
+    note: z.string(),
+  })
+  .refine((value) => value.threadId !== undefined || value.url !== undefined, {
+    message: 'Either threadId or url is required when term is present.',
+  });
 
 export const annotationCreateSchema = z.union([
   annotationCreateAnchorSchema,

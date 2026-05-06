@@ -1,20 +1,16 @@
-// Typed dispatch tool surface introduced in the MCP-spec alignment
-// refactor. Replaces the ad-hoc `bac.request_dispatch` flow with two
-// focused, event-oriented tools:
+// Typed dispatch tool surface. Two focused, event-oriented tools:
 //
-//   sidetrack.dispatch.create      — write the dispatch event; returns
-//                                    a dispatchId + resource URIs.
+//   sidetrack.dispatch.create       — write the dispatch event; returns
+//                                     a dispatchId + resource URIs.
 //   sidetrack.dispatch.await_capture — block (or long-poll) until the
-//                                    captured ChatGPT/Claude/Gemini
-//                                    thread is linked to that dispatch.
-//
-// The second tool is a stub in this commit. Phase 3 of the refactor
-// ports the dispatchId↔threadId matcher from the extension's
-// chrome.storage into the companion vault and wires the long-poll
-// against `GET /v1/dispatches/:bacId/await-capture`. Until then,
-// await_capture returns `matched: false, reason: 'unsupported-in-phase-1'`
-// and instructs the caller to fall back to `sidetrack.threads.list`
-// time-filtering — same fallback the legacy demo prompt used.
+//                                     captured ChatGPT/Claude/Gemini
+//                                     thread is linked to that dispatch.
+//                                     Returns the captured thread,
+//                                     resource URIs for follow-up
+//                                     reads, and the latest assistant
+//                                     turn so the agent can act on
+//                                     content without a polling
+//                                     runbook.
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
@@ -32,8 +28,6 @@ const dispatchCreateOutputShape = {
   targetProvider: targetProviderSchema,
   mode: dispatchModeSchema,
   workstreamId: z.string().optional(),
-  // Resource URIs the agent can subscribe to once Phase 5 lands. Surfaced
-  // here so prompts written today reference the right names tomorrow.
   statusResource: z.string(),
   threadResource: z.string().optional(),
 };
@@ -41,25 +35,41 @@ const dispatchCreateOutputShape = {
 const awaitCaptureOutputShape = {
   dispatchId: z.string(),
   matched: z.boolean(),
-  threadId: z.string().optional(),
-  threadUrl: z.url().optional(),
-  title: z.string().optional(),
-  provider: targetProviderSchema.optional(),
-  reason: z
-    .enum([
-      'matched',
-      'timeout',
-      'no-prefix-match',
-      'tiny-prefix',
-      'window-expired',
-      'provider-mismatch',
-      'already-linked',
-      // Sentinel returned by the Phase-1 stub so callers can detect that
-      // server-side correlation is not yet available and fall back to
-      // `sidetrack.threads.list` time-filtered polling.
-      'unsupported-in-phase-1',
-    ])
+  linkedAt: z.iso.datetime().optional(),
+  // Captured thread identity. Use `thread.threadId` as the input to
+  // `sidetrack.annotations.create_batch` and the resource URIs.
+  thread: z
+    .object({
+      threadId: z.string(),
+      threadUrl: z.url().optional(),
+      title: z.string().optional(),
+      provider: targetProviderSchema.optional(),
+    })
     .optional(),
+  // Pre-built MCP resource URIs for the linked thread + dispatch.
+  // The agent should follow these instead of constructing URI templates
+  // from boilerplate prompt knowledge.
+  resources: z
+    .object({
+      dispatch: z.string(),
+      thread: z.string(),
+      turns: z.string(),
+      markdown: z.string(),
+      annotations: z.string(),
+    })
+    .optional(),
+  // Latest assistant turn from the linked thread, included by default
+  // so the agent can read the answer without an extra
+  // `sidetrack.threads.turns` round trip. Pass
+  // `includeLatestAssistantTurn: false` to suppress.
+  latestAssistantTurn: z
+    .object({
+      ordinal: z.number().int(),
+      text: z.string(),
+      capturedAt: z.iso.datetime(),
+    })
+    .optional(),
+  reason: z.enum(['matched', 'timeout']).optional(),
 };
 
 export const registerDispatchTools = (
@@ -145,7 +155,7 @@ export const registerDispatchTools = (
     'sidetrack.dispatch.await_capture',
     {
       description:
-        "Block until the dispatch's chat tab has been auto-opened, auto-sent, and captured. Returns the linked thread when matched, or a reason code (timeout) when the deadline hits. Backed by the companion's link table at `_BAC/dispatch-links/<date>.jsonl`.",
+        "Wait for a dispatch to be linked to a captured thread. Use this immediately after sidetrack.dispatch.create when the user expects the target AI's response to be read or annotated. Returns thread identity, resource URIs the agent can readResource, and the latest assistant turn so no follow-up turn fetch is needed.",
       inputSchema: {
         dispatchId: z
           .string()
@@ -158,10 +168,16 @@ export const registerDispatchTools = (
           .max(120_000)
           .optional()
           .describe('Long-poll timeout in milliseconds. Default 60_000, capped at 120_000.'),
+        includeLatestAssistantTurn: z
+          .boolean()
+          .optional()
+          .describe(
+            'When true (default), the response includes latestAssistantTurn so the agent can act on the captured answer immediately. Set false to skip the read.',
+          ),
       },
       outputSchema: awaitCaptureOutputShape,
     },
-    async ({ dispatchId, timeoutMs }) => {
+    async ({ dispatchId, timeoutMs, includeLatestAssistantTurn }) => {
       if (companionClient?.awaitCaptureForDispatch === undefined) {
         throw new Error(
           'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.dispatch.await_capture is unavailable.',
@@ -170,14 +186,19 @@ export const registerDispatchTools = (
       const result = await companionClient.awaitCaptureForDispatch({
         dispatchId,
         ...(timeoutMs === undefined ? {} : { timeoutMs }),
+        ...(includeLatestAssistantTurn === undefined
+          ? {}
+          : { includeLatestAssistantTurn }),
       });
       const structured: z.infer<z.ZodObject<typeof awaitCaptureOutputShape>> = {
         dispatchId: result.dispatchId,
         matched: result.matched,
-        ...(result.threadId === undefined ? {} : { threadId: result.threadId }),
-        ...(result.threadUrl === undefined ? {} : { threadUrl: result.threadUrl }),
-        ...(result.title === undefined ? {} : { title: result.title }),
-        ...(result.provider === undefined ? {} : { provider: result.provider }),
+        ...(result.linkedAt === undefined ? {} : { linkedAt: result.linkedAt }),
+        ...(result.thread === undefined ? {} : { thread: result.thread }),
+        ...(result.resources === undefined ? {} : { resources: result.resources }),
+        ...(result.latestAssistantTurn === undefined
+          ? {}
+          : { latestAssistantTurn: result.latestAssistantTurn }),
         ...(result.reason === undefined ? {} : { reason: result.reason }),
       };
       return {

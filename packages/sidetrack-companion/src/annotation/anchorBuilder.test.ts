@@ -1,13 +1,22 @@
 import { describe, expect, it } from 'vitest';
 
-import { AnchorBuilderError, buildAnchorFromTerm } from './anchorBuilder.js';
+import { buildAnchorFromTerm } from './anchorBuilder.js';
+
+const requireOk = (
+  result: ReturnType<typeof buildAnchorFromTerm>,
+): Extract<ReturnType<typeof buildAnchorFromTerm>, { ok: true }> => {
+  if (!result.ok) {
+    throw new Error(`expected ok result, got ${result.reason}: ${result.message}`);
+  }
+  return result;
+};
 
 describe('buildAnchorFromTerm', () => {
   it('returns 32-char prefix + suffix windows around the first occurrence', () => {
     const turnText =
       'Browser graphics stack: WebGPU gives apps lower-level GPU access without native installs.';
-    const anchor = buildAnchorFromTerm({ turnText, term: 'WebGPU' });
-    expect(anchor).toMatchObject({
+    const result = requireOk(buildAnchorFromTerm({ turnText, term: 'WebGPU' }));
+    expect(result.anchor).toMatchObject({
       textQuote: {
         exact: 'WebGPU',
         prefix: 'Browser graphics stack: ',
@@ -16,92 +25,140 @@ describe('buildAnchorFromTerm', () => {
       textPosition: { start: -1, end: -1 },
       cssSelector: '',
     });
-    expect(anchor.textQuote.suffix.length).toBe(32);
+    expect(result.anchor.textQuote.suffix.length).toBe(32);
+    expect(result.occurrenceCount).toBe(1);
   });
 
   it('selects a later occurrence when ordinal:N is set', () => {
     const turnText =
       'WebGPU is the first WebGPU mention. Then the second WebGPU shows up at the end.';
-    const first = buildAnchorFromTerm({ turnText, term: 'WebGPU' });
-    expect(turnText.slice(0, turnText.indexOf('WebGPU') + 6)).toBe('WebGPU');
-    const third = buildAnchorFromTerm({
-      turnText,
-      term: 'WebGPU',
-      selectionHint: 'ordinal:3',
-    });
-    expect(third.textQuote.suffix.length).toBeGreaterThan(0);
-    expect(first.textQuote.prefix).toBe('');
-    expect(third.textQuote.prefix).toContain('the second ');
+    const third = requireOk(
+      buildAnchorFromTerm({
+        turnText,
+        term: 'WebGPU',
+        selectionHint: 'ordinal:3',
+      }),
+    );
+    expect(third.anchor.textQuote.suffix.length).toBeGreaterThan(0);
+    expect(third.anchor.textQuote.prefix).toContain('the second ');
+    expect(third.occurrenceCount).toBe(3);
   });
 
-  it('rejects an out-of-range ordinal', () => {
-    expect(() =>
+  it('returns ambiguous_term_requires_selection_hint by default for repeated terms', () => {
+    const result = buildAnchorFromTerm({
+      turnText: 'WebGPU and WebGPU and one more WebGPU mention.',
+      term: 'WebGPU',
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe('ambiguous_term_requires_selection_hint');
+      expect(result.occurrenceCount).toBe(3);
+      expect(result.suggestedSelectionHints).toBeDefined();
+      expect(result.suggestedSelectionHints?.[0]).toBe('ordinal:1');
+    }
+  });
+
+  it('honours repeatedTerm:first when the caller opts in', () => {
+    const result = requireOk(
       buildAnchorFromTerm({
-        turnText: 'WebGPU appears only once.',
+        turnText: 'WebGPU and WebGPU again.',
         term: 'WebGPU',
-        selectionHint: 'ordinal:5',
+        policy: { repeatedTerm: 'first' },
       }),
-    ).toThrow(AnchorBuilderError);
+    );
+    expect(result.anchor.textQuote.prefix).toBe('');
+  });
+
+  it('returns invalid_ordinal for an out-of-range ordinal', () => {
+    const result = buildAnchorFromTerm({
+      turnText: 'WebGPU appears only once.',
+      term: 'WebGPU',
+      selectionHint: 'ordinal:5',
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe('invalid_ordinal');
+    }
   });
 
   it('selects the occurrence whose preceding context ends with the hint fragment', () => {
     const turnText =
       'Section 1 — Architecture: WebGPU. Section 2 — Performance: WebGPU. Section 3 — Security: WebGPU.';
-    const anchor = buildAnchorFromTerm({
-      turnText,
+    const result = requireOk(
+      buildAnchorFromTerm({
+        turnText,
+        term: 'WebGPU',
+        selectionHint: 'Performance:',
+      }),
+    );
+    expect(result.anchor.textQuote.prefix).toContain('Performance:');
+  });
+
+  it('returns selection_hint_no_match when the preceding fragment is absent', () => {
+    const result = buildAnchorFromTerm({
+      turnText: 'Just one WebGPU mention.',
       term: 'WebGPU',
-      selectionHint: 'Performance:',
+      selectionHint: 'totally different fragment',
     });
-    expect(anchor.textQuote.prefix).toContain('Performance:');
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe('selection_hint_no_match');
+    }
   });
 
-  it('throws hint-no-match when the preceding fragment is absent', () => {
-    expect(() =>
-      buildAnchorFromTerm({
-        turnText: 'Just one WebGPU mention.',
-        term: 'WebGPU',
-        selectionHint: 'totally different fragment',
-      }),
-    ).toThrow(AnchorBuilderError);
-  });
-
-  it('throws term-not-found when the keyword is absent', () => {
-    expect(() =>
-      buildAnchorFromTerm({
-        turnText: 'Body without the keyword.',
-        term: 'WebGPU',
-      }),
-    ).toThrow(AnchorBuilderError);
+  it('returns term_not_found when the keyword is absent', () => {
+    const result = buildAnchorFromTerm({
+      turnText: 'Body without the keyword.',
+      term: 'WebGPU',
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe('term_not_found');
+    }
   });
 
   it('rejects short terms without a hint', () => {
-    expect(() =>
-      buildAnchorFromTerm({
-        turnText: 'AI is referenced in this turn body.',
-        term: 'AI',
-      }),
-    ).toThrow(AnchorBuilderError);
+    const result = buildAnchorFromTerm({
+      turnText: 'AI is referenced in this turn body.',
+      term: 'AI',
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe('short_term_requires_selection_hint');
+    }
   });
 
   it('accepts short terms when a preceding-fragment hint is provided', () => {
-    // selectionHint matches the preceding context of the THIRD occurrence
-    // ("…the topic is "). Without the hint, the matcher would (a) reject
-    // for being shorter than the safety floor, and (b) pick the first
-    // occurrence anyway.
-    const anchor = buildAnchorFromTerm({
-      turnText:
-        'AI in research and AI in production diverge. The topic is AI safety today.',
-      term: 'AI',
-      selectionHint: 'topic is',
-    });
-    expect(anchor.textQuote.prefix).toContain('topic is');
+    const result = requireOk(
+      buildAnchorFromTerm({
+        turnText:
+          'AI in research and AI in production diverge. The topic is AI safety today.',
+        term: 'AI',
+        selectionHint: 'topic is',
+      }),
+    );
+    expect(result.anchor.textQuote.prefix).toContain('topic is');
   });
 
   it('preserves multibyte characters in the windows', () => {
     const turnText =
       'café architecture stack: WebGPU shines for résumé-fast operations.';
-    const anchor = buildAnchorFromTerm({ turnText, term: 'WebGPU' });
-    expect(anchor.textQuote.prefix).toContain('café');
-    expect(anchor.textQuote.suffix).toContain('résumé');
+    const result = requireOk(buildAnchorFromTerm({ turnText, term: 'WebGPU' }));
+    expect(result.anchor.textQuote.prefix).toContain('café');
+    expect(result.anchor.textQuote.suffix).toContain('résumé');
+  });
+
+  it('exposes a list of suggested selection hints when ambiguous', () => {
+    const result = buildAnchorFromTerm({
+      turnText: 'leaf node, then the leaf in the index, then the leaf again.',
+      term: 'leaf',
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.suggestedSelectionHints).toBeDefined();
+      expect(result.suggestedSelectionHints?.length ?? 0).toBeGreaterThan(0);
+      // ordinal hints come first, preceding fragments after.
+      expect(result.suggestedSelectionHints?.[0]).toBe('ordinal:1');
+    }
   });
 });
