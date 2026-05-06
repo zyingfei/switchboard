@@ -357,6 +357,15 @@ const createCompanionWriteClient = (
           : typeof input.sourceTurn === 'string'
             ? input.sourceTurn
             : `ordinal:${String(input.sourceTurn.ordinal)}`;
+      // anchorPolicy is part of the request semantics — a retry
+      // with policy={repeatedTerm:'first'} should NOT replay the
+      // cached anchor_failed result the prior policy generated.
+      // Serialise stably so equivalent policies hash the same.
+      const policy = input.anchorPolicy;
+      const policyKey =
+        policy === undefined
+          ? ''
+          : `${policy.repeatedTerm ?? ''}:${String(policy.shortTermMinLength ?? '')}`;
       const body = await post<{ readonly data?: Record<string, unknown> }>(
         '/v1/annotations',
         requestBody,
@@ -369,6 +378,7 @@ const createCompanionWriteClient = (
               input.term,
               input.selectionHint ?? '',
               sourceTurnKey,
+              policyKey,
               input.note,
             ].join('-'),
           ),
@@ -380,6 +390,7 @@ const createCompanionWriteClient = (
         const annotationId = data['annotationId'];
         const occurrenceCount = data['occurrenceCount'];
         const annotation = data['annotation'];
+        const totalForUrl = data['totalForUrl'];
         if (typeof annotationId !== 'string') {
           throw new Error('Companion create_annotation response missing annotationId.');
         }
@@ -391,6 +402,7 @@ const createCompanionWriteClient = (
             typeof annotation === 'object' && annotation !== null
               ? (annotation as Record<string, unknown>)
               : {},
+          ...(typeof totalForUrl === 'number' ? { totalForUrl } : {}),
         };
       }
       if (status === 'anchor_failed' || status === 'validation_failed') {
@@ -401,6 +413,9 @@ const createCompanionWriteClient = (
           'ambiguous_term_requires_selection_hint',
           'invalid_ordinal',
           'selection_hint_no_match',
+          'thread_not_found',
+          'thread_url_unresolved',
+          'no_assistant_turns',
         ] as const;
         const reasonValue = allowedReasons.find((candidate) => candidate === reason);
         if (reasonValue === undefined) {

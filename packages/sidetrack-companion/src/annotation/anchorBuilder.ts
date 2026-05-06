@@ -56,7 +56,14 @@ export type AnchorBuilderFailureReason =
   | 'short_term_requires_selection_hint'
   | 'ambiguous_term_requires_selection_hint'
   | 'invalid_ordinal'
-  | 'selection_hint_no_match';
+  | 'selection_hint_no_match'
+  // Source-resolution failures — the build never got far enough to
+  // hit term-matching. Surfaced by the route, not by this module
+  // directly, but kept in the union so the route + tool layers
+  // share one shape.
+  | 'thread_not_found'
+  | 'thread_url_unresolved'
+  | 'no_assistant_turns';
 
 export interface AnchorBuilderInput {
   readonly turnText: string;

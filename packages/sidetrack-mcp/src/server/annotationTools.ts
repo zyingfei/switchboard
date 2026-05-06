@@ -49,6 +49,11 @@ const anchorFailureReasonEnum = z.enum([
   'ambiguous_term_requires_selection_hint',
   'invalid_ordinal',
   'selection_hint_no_match',
+  // Source-resolution failures — distinguish "retry with hint"
+  // from "the captured thread or its turns are missing".
+  'thread_not_found',
+  'thread_url_unresolved',
+  'no_assistant_turns',
 ]);
 
 const annotationStatusEnum = z.enum([
@@ -65,6 +70,12 @@ const batchOutputShape = {
   createdCount: z.number().int(),
   anchorFailedCount: z.number().int(),
   failedCount: z.number().int(),
+  // Total non-deleted annotations now associated with the URL.
+  // Lets the agent answer "how many annotations exist?" without
+  // summing per-batch createdCount across multiple calls.
+  // Populated from the last successful create's totalForUrl (which
+  // is recomputed from the vault on each create).
+  totalForUrl: z.number().int().optional(),
   items: z.array(
     z.object({
       term: z.string(),
@@ -133,6 +144,7 @@ export const registerAnnotationTools = (
       }
       const createAnnotation = companionClient.createAnnotation;
       const results: z.infer<typeof batchOutputShape.items>[number][] = [];
+      let lastTotalForUrl: number | undefined;
       for (const item of items) {
         const trimmedTerm = item.term.trim();
         try {
@@ -146,6 +158,9 @@ export const registerAnnotationTools = (
             ...(sourceTurn === undefined ? {} : { sourceTurn }),
           });
           if (result.status === 'created') {
+            if (result.totalForUrl !== undefined) {
+              lastTotalForUrl = result.totalForUrl;
+            }
             results.push({
               term: trimmedTerm,
               status: 'created',
@@ -186,6 +201,7 @@ export const registerAnnotationTools = (
         createdCount,
         anchorFailedCount,
         failedCount,
+        ...(lastTotalForUrl === undefined ? {} : { totalForUrl: lastTotalForUrl }),
         items: results,
         createdAt: new Date().toISOString(),
       };

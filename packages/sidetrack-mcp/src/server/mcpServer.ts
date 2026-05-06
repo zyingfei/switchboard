@@ -120,6 +120,7 @@ export interface CompanionWriteClient {
         readonly annotationId: string;
         readonly occurrenceCount: number;
         readonly annotation: Record<string, unknown>;
+        readonly totalForUrl?: number;
       }
     | {
         readonly status: 'anchor_failed' | 'validation_failed';
@@ -128,7 +129,10 @@ export interface CompanionWriteClient {
           | 'short_term_requires_selection_hint'
           | 'ambiguous_term_requires_selection_hint'
           | 'invalid_ordinal'
-          | 'selection_hint_no_match';
+          | 'selection_hint_no_match'
+          | 'thread_not_found'
+          | 'thread_url_unresolved'
+          | 'no_assistant_turns';
         readonly message: string;
         readonly occurrenceCount: number;
         readonly suggestedSelectionHints?: readonly string[];

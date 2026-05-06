@@ -39,7 +39,7 @@ export type SidetrackToolName = (typeof sidetrackToolNames)[number];
 export const isSidetrackToolName = (value: string): value is SidetrackToolName =>
   sidetrackToolNames.some((toolName) => toolName === value);
 
-// MCP prompts (Phase 5). Order matches the registerPrompt() calls in
+// MCP prompts. Order matches the registerPrompt() calls in
 // prompts.ts; the tooling-test asserts on it. Three workflows: a
 // 3-line attach prompt, a full demo dispatch+annotate flow, and an
 // annotate-only flow against an already-captured thread.
@@ -51,8 +51,8 @@ export const sidetrackPromptNames = [
 
 export type SidetrackPromptName = (typeof sidetrackPromptNames)[number];
 
-// MCP resource templates (Phase 5). Each is a sidetrack:// URI
-// pattern advertised via resources/list. The order mirrors
+// MCP resource templates. Each is a sidetrack:// URI pattern
+// advertised via resources/list. The order mirrors
 // registerResource() calls in resources.ts.
 export const sidetrackResourceTemplates = [
   'sidetrack://thread/{threadId}',

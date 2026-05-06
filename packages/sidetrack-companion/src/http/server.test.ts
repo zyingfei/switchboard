@@ -850,6 +850,7 @@ describe('companion HTTP server', () => {
         status: 'created',
         annotationId: expect.stringMatching(/.+/u),
         occurrenceCount: 1,
+        totalForUrl: 1,
         annotation: {
           url: threadUrl,
           anchor: {
@@ -882,7 +883,7 @@ describe('companion HTTP server', () => {
     expect(create.body).toMatchObject({
       data: {
         status: 'anchor_failed',
-        reason: 'term_not_found',
+        reason: 'no_assistant_turns',
         occurrenceCount: 0,
       },
     });

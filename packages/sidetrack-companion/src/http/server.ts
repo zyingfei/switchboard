@@ -1136,11 +1136,21 @@ const routes: readonly RouteDefinition[] = [
         // threadUrl/title/provider attach when the thread record is
         // present in the vault; missing ones drop quietly so a thread
         // captured-but-not-yet-flushed still produces a useful payload.
+        // Sanitize provider: the captured-thread schema accepts a
+        // wider enum (`unknown`, `codex`, …) than the dispatch
+        // target enum (chatgpt | claude | gemini). The MCP
+        // await_capture outputSchema only declares the dispatch
+        // target enum, so anything outside that set drops out
+        // rather than surfacing as a schema-violating value.
+        const dispatchTargetProviders = ['chatgpt', 'claude', 'gemini'] as const;
+        const sanitizedProvider = dispatchTargetProviders.find(
+          (candidate) => candidate === meta?.provider,
+        );
         const thread = {
           threadId: link.threadId,
           ...(meta?.threadUrl === undefined ? {} : { threadUrl: meta.threadUrl }),
           ...(meta?.title === undefined ? {} : { title: meta.title }),
-          ...(meta?.provider === undefined ? {} : { provider: meta.provider }),
+          ...(sanitizedProvider === undefined ? {} : { provider: sanitizedProvider }),
         };
         const resources = {
           dispatch: `sidetrack://dispatch/${dispatchId}`,
@@ -1333,7 +1343,7 @@ const routes: readonly RouteDefinition[] = [
                 {
                   data: {
                     status: 'anchor_failed' as const,
-                    reason: 'term_not_found' as const,
+                    reason: 'thread_not_found' as const,
                     message: `Thread ${input.threadId} not found in the vault.`,
                     occurrenceCount: 0,
                   },
@@ -1349,7 +1359,7 @@ const routes: readonly RouteDefinition[] = [
               {
                 data: {
                   status: 'validation_failed' as const,
-                  reason: 'term_not_found' as const,
+                  reason: 'thread_url_unresolved' as const,
                   message: 'No threadUrl could be resolved from threadId / url.',
                   occurrenceCount: 0,
                 },
@@ -1370,7 +1380,7 @@ const routes: readonly RouteDefinition[] = [
               {
                 data: {
                   status: 'anchor_failed' as const,
-                  reason: 'term_not_found' as const,
+                  reason: 'no_assistant_turns' as const,
                   message: `No assistant turns found for ${threadUrl}; capture the thread first.`,
                   occurrenceCount: 0,
                 },
@@ -1453,12 +1463,21 @@ const routes: readonly RouteDefinition[] = [
               },
             ];
           }
+          const annotationUrl = input.url ?? threadUrl;
           const created = await writeAnnotation(vaultRoot, {
-            url: input.url ?? threadUrl,
+            url: annotationUrl,
             pageTitle,
             anchor: result.anchor,
             note: input.note,
           });
+          // totalForThread/totalForUrl: total non-deleted
+          // annotations now associated with this URL. Lets the
+          // model report a final count without summing per-batch
+          // createdCount across multiple calls (the only fully
+          // accurate way to know "how many annotations exist").
+          const totalForUrl = (
+            await listAnnotations(vaultRoot, { url: annotationUrl })
+          ).length;
           return [
             201,
             {
@@ -1467,6 +1486,7 @@ const routes: readonly RouteDefinition[] = [
                 annotationId: created.bac_id,
                 occurrenceCount: result.occurrenceCount,
                 annotation: created,
+                totalForUrl,
               },
             },
           ];
