@@ -2816,6 +2816,27 @@ const App = () => {
               {Icons.arrowR}
             </span>
           </button>
+          {thread.trackingMode === 'manual' ? (
+            <button
+              type="button"
+              className="btn-link thread-action-icon"
+              title="Capture this thread now (manual mode — no auto-refresh)"
+              aria-label="Capture this thread now"
+              onClick={(e) => {
+                e.stopPropagation();
+                void (async () => {
+                  await openTabForThread(thread);
+                  await runAction(() =>
+                    sendRequest({ type: messageTypes.captureCurrentTab }),
+                  );
+                })();
+              }}
+            >
+              <span className="icon-12" aria-hidden>
+                {Icons.manualTap}
+              </span>
+            </button>
+          ) : null}
           {(() => {
             const requiresCompanion =
               state.companionStatus !== 'connected' || bridgeKey.length === 0;
@@ -2942,17 +2963,46 @@ const App = () => {
                           Resume tracking
                         </button>
                       ) : (
-                        <button
-                          type="button"
-                          role="menuitem"
-                          className="warn"
-                          onClick={() => {
-                            setActionMenuOpenFor(null);
-                            updateTracking(thread.bac_id, 'stopped');
-                          }}
-                        >
-                          Stop tracking
-                        </button>
+                        <>
+                          {thread.trackingMode !== 'auto' &&
+                          thread.provider !== 'unknown' ? (
+                            <button
+                              type="button"
+                              role="menuitem"
+                              onClick={() => {
+                                setActionMenuOpenFor(null);
+                                updateTracking(thread.bac_id, 'auto');
+                              }}
+                            >
+                              <span className="icon-12 mr-1">{Icons.autoCycle}</span>
+                              Auto-capture
+                            </button>
+                          ) : null}
+                          {thread.trackingMode !== 'manual' ? (
+                            <button
+                              type="button"
+                              role="menuitem"
+                              onClick={() => {
+                                setActionMenuOpenFor(null);
+                                updateTracking(thread.bac_id, 'manual');
+                              }}
+                            >
+                              <span className="icon-12 mr-1">{Icons.manualTap}</span>
+                              Manual capture
+                            </button>
+                          ) : null}
+                          <button
+                            type="button"
+                            role="menuitem"
+                            className="warn"
+                            onClick={() => {
+                              setActionMenuOpenFor(null);
+                              updateTracking(thread.bac_id, 'stopped');
+                            }}
+                          >
+                            Stop tracking
+                          </button>
+                        </>
                       )}
                       <button
                         type="button"

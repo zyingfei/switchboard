@@ -313,8 +313,15 @@ const sendToCompanion = async (
     event,
     idempotencyKey('capture', `${event.threadUrl}-${event.capturedAt}`),
   );
+  // Tracking mode is per-thread now, no longer keyed off the
+  // global settings.autoTrack toggle (removed in the per-thread
+  // tracking-mode refactor). For brand-new threads:
+  //   - unknown provider → 'manual' (we can't auto-refresh
+  //     anything we don't know how to scrape)
+  //   - known provider   → 'auto'
+  // Existing threads keep whatever mode the user set on them.
   const trackingMode: ThreadUpsert['trackingMode'] =
-    event.provider === 'unknown' || !settings.autoTrack ? 'manual' : 'auto';
+    existingThread?.trackingMode ?? (event.provider === 'unknown' ? 'manual' : 'auto');
   const lastTurnRole = event.turns.at(-1)?.role;
   // Prefer the per-turn modelName the enricher scraped from the
   // assistant's last response (more accurate than event-level
@@ -452,10 +459,10 @@ const captureFromContentScript = async (tab: chrome.tabs.Tab): Promise<CaptureEv
 const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
   const allThreads = await readThreads();
   const existing = allThreads.find((t) => t.threadUrl === event.threadUrl);
-  const settings = await readSettings();
   const parentLink = resolveParentFromForkSource(event, allThreads);
+  // Per-thread tracking mode (see storeCaptureEvent above).
   const trackingMode: ThreadUpsert['trackingMode'] =
-    event.provider === 'unknown' || !settings.autoTrack ? 'manual' : 'auto';
+    existing?.trackingMode ?? (event.provider === 'unknown' ? 'manual' : 'auto');
   const lastTurnRole = event.turns.at(-1)?.role;
   const upserted = await upsertLocalThread({
     provider: event.provider,
@@ -1613,27 +1620,27 @@ const handleRequest = async (
     ) {
       return { ok: true, state: await buildState('connected') };
     }
-    // autoTrack gate: when off (default), auto-captures from the
-    // content script must NOT spawn brand-new thread records. The
-    // user's expectation is "manual tracking only" — they explicitly
-    // capture the threads they care about. Refresh-captures for
-    // already-tracked threads still flow through (so existing rows
-    // stay current); new-thread captures are silently dropped.
-    //
-    // Exception: tabs opened by the MCP-auto-approved dispatch flow.
-    // Those represent an explicit agent-driven action — the user
-    // (via the agent) asked Sidetrack to send a prompt to ChatGPT,
-    // and the resulting thread is the whole point. Skip the gate
-    // when sender.tab.id is in mcpDispatchTabs, then drop the
-    // marker so any later non-dispatch capture from the same tab
-    // re-enters the gate.
-    const settings = await readSettings();
+    // Per-thread tracking-mode gate. Two rules:
+    //   1. Brand-new threads: don't auto-spawn records from a
+    //      content-script capture. The user explicitly captures
+    //      the threads they care about (side-panel "+ Capture"
+    //      or tab-context-menu).
+    //   2. Existing threads in trackingMode='manual' or 'stopped':
+    //      skip the auto-refresh. 'manual' means "capture only
+    //      when I press the row's Capture button"; 'stopped'
+    //      means the user paused tracking entirely.
+    // Both rules carve out an exception for MCP-auto-approved
+    // dispatch tabs — those represent explicit agent-driven
+    // actions and the resulting thread IS the whole point.
     const dispatchTabs = await readMcpDispatchTabs();
     const isDispatchTab =
       senderTabId !== undefined && dispatchTabs[String(senderTabId)] !== undefined;
-    if (!settings.autoTrack && !isDispatchTab) {
+    if (!isDispatchTab) {
       const known = (await readThreads()).find((t) => t.threadUrl === request.capture.threadUrl);
       if (known === undefined) {
+        return { ok: true, state: await buildState('connected') };
+      }
+      if (known.trackingMode === 'manual' || known.trackingMode === 'stopped') {
         return { ok: true, state: await buildState('connected') };
       }
     }

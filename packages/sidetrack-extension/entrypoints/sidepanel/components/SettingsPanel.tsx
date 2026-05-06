@@ -332,7 +332,11 @@ export function SettingsPanel({
   const [draftTarget, setDraftTarget] = useState<SettingsTargetProvider>(
     initial.defaultDispatchTarget,
   );
-  const [draftAutoTrack, setDraftAutoTrack] = useState(localPreferences.autoTrack);
+  // autoTrack is no longer surfaced in Settings — tracking mode
+  // is per-thread now (see thread-row overflow menu). The local
+  // preference still lives in storage for migration safety; we
+  // never display or mutate it here.
+  void localPreferences.autoTrack;
   const [draftVaultPath, setDraftVaultPath] = useState(localPreferences.vaultPath);
   const [draftNotifyOnQueueComplete, setDraftNotifyOnQueueComplete] = useState(
     localPreferences.notifyOnQueueComplete,
@@ -346,7 +350,6 @@ export function SettingsPanel({
     draftPacketKind !== initial.defaultPacketKind ||
     draftTarget !== initial.defaultDispatchTarget;
   const localDirty =
-    draftAutoTrack !== localPreferences.autoTrack ||
     draftVaultPath.trim() !== localPreferences.vaultPath.trim() ||
     draftNotifyOnQueueComplete !== localPreferences.notifyOnQueueComplete;
   const dirty = companionDirty || localDirty;
@@ -370,7 +373,6 @@ export function SettingsPanel({
     }
     if (localDirty) {
       onSaveLocalPreferences({
-        ...(draftAutoTrack === localPreferences.autoTrack ? {} : { autoTrack: draftAutoTrack }),
         ...(draftVaultPath.trim() === localPreferences.vaultPath.trim()
           ? {}
           : { vaultPath: draftVaultPath.trim() }),
@@ -472,25 +474,12 @@ export function SettingsPanel({
             </button>
           </div>
         ) : null}
-        <label className={'switch ' + (draftAutoTrack ? 'on' : '')}>
-          <input
-            type="checkbox"
-            checked={draftAutoTrack}
-            disabled={busy}
-            onChange={() => {
-              setDraftAutoTrack(!draftAutoTrack);
-            }}
-          />
-          <span className="knob" />
-          <span className="lbl">
-            Auto-track detected AI threads
-            <span className="desc mono">
-              {draftAutoTrack
-                ? 'on — every detected thread is tracked'
-                : 'off — manual tracking only (default)'}
-            </span>
-          </span>
-        </label>
+        <p className="settings-section-lede ai-italic">
+          Tracking mode is now per-thread. Open a thread row's overflow menu (⋯) to flip
+          between <span className="mono">auto</span> (Sidetrack refreshes the thread on every
+          new message) and <span className="mono">manual</span> (no auto-refresh — capture on
+          demand using the row's capture button).
+        </p>
       </div>
 
       <div className="settings-section">
