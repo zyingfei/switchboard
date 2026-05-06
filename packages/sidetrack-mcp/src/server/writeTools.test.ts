@@ -509,18 +509,53 @@ describe('sidetrack.dispatch.create', () => {
 });
 
 describe('sidetrack.dispatch.await_capture', () => {
-  it('returns the Phase-1 stub sentinel until server-side correlation lands in Phase 3', async () => {
+  it('reports unavailable when no companion client is wired', async () => {
     const client = await startInProcessServer();
     try {
       const result = await client.callTool({
         name: 'sidetrack.dispatch.await_capture',
         arguments: { dispatchId: 'bac_dispatch_pending' },
       });
-      expect(result.isError).not.toBe(true);
-      expect(result.structuredContent).toEqual({
+      expect(result.isError).toBe(true);
+      expect(errorText(result)).toMatch(/sidetrack\.dispatch\.await_capture is unavailable/);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('forwards to companion awaitCaptureForDispatch and surfaces the matched payload', async () => {
+    const writeClient = buildFakeWriteClient({
+      awaitCaptureForDispatch: vi.fn(() =>
+        Promise.resolve({
+          dispatchId: 'bac_dispatch_pending',
+          matched: true,
+          threadId: 'bac_thread_linked',
+          threadUrl: 'https://chatgpt.com/c/linked',
+          title: 'Captured chat',
+          provider: 'chatgpt' as const,
+          linkedAt: '2026-05-05T12:00:00.000Z',
+          reason: 'matched' as const,
+        }),
+      ),
+    });
+    const client = await startInProcessServer(writeClient);
+    try {
+      const result = await client.callTool({
+        name: 'sidetrack.dispatch.await_capture',
+        arguments: { dispatchId: 'bac_dispatch_pending', timeoutMs: 5000 },
+      });
+      expect(writeClient.awaitCaptureForDispatch).toHaveBeenCalledWith({
         dispatchId: 'bac_dispatch_pending',
-        matched: false,
-        reason: 'unsupported-in-phase-1',
+        timeoutMs: 5000,
+      });
+      expect(result.structuredContent).toMatchObject({
+        dispatchId: 'bac_dispatch_pending',
+        matched: true,
+        threadId: 'bac_thread_linked',
+        threadUrl: 'https://chatgpt.com/c/linked',
+        title: 'Captured chat',
+        provider: 'chatgpt',
+        reason: 'matched',
       });
     } finally {
       await client.close();

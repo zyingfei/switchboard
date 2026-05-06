@@ -271,6 +271,20 @@ export const dispatchEventRecordSchema = dispatchEventSchema.extend({
   tokenEstimate: z.number().int().nonnegative(),
 });
 
+// Persisted record in `_BAC/dispatch-links/<YYYY-MM-DD>.jsonl`.
+// Append-only; later records for the same dispatchId override earlier
+// ones on read. Companion is the authoritative store after Phase 3
+// of the spec-aligned refactor.
+export const dispatchLinkSchema = z.object({
+  dispatchId: bacIdSchema,
+  threadId: bacIdSchema,
+  linkedAt: isoDateTimeSchema,
+});
+
+export const dispatchLinkRequestSchema = z.object({
+  threadId: bacIdSchema,
+});
+
 const providerOptInSchema = z.object({
   chatgpt: z.boolean(),
   claude: z.boolean(),
@@ -480,6 +494,8 @@ export type ReminderUpdateInput = z.infer<typeof reminderUpdateSchema>;
 export type DispatchEventInput = z.infer<typeof dispatchEventSchema>;
 export type DispatchEventRecord = z.infer<typeof dispatchEventRecordSchema>;
 export type DispatchListQuery = z.infer<typeof dispatchListQuerySchema>;
+export type DispatchLinkRecord = z.infer<typeof dispatchLinkSchema>;
+export type DispatchLinkRequest = z.infer<typeof dispatchLinkRequestSchema>;
 export type AuditEventRecord = z.infer<typeof auditEventSchema>;
 export type AuditListQuery = z.infer<typeof auditListQuerySchema>;
 export type SettingsDocument = z.infer<typeof settingsDocumentSchema>;

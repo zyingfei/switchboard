@@ -141,6 +141,23 @@ export interface CompanionWriteClient {
   }) => Promise<readonly unknown[]>;
   readonly exportSettings?: () => Promise<Record<string, unknown>>;
   readonly systemUpdateCheck?: () => Promise<Record<string, unknown>>;
+  // Phase 3 dispatch correlation. Long-poll on the companion's
+  // `GET /v1/dispatches/:bacId/await-capture` endpoint; resolves
+  // when the link table has a record, or returns matched=false when
+  // the timeout expires.
+  readonly awaitCaptureForDispatch?: (input: {
+    readonly dispatchId: string;
+    readonly timeoutMs?: number;
+  }) => Promise<{
+    readonly dispatchId: string;
+    readonly matched: boolean;
+    readonly threadId?: string;
+    readonly threadUrl?: string;
+    readonly title?: string;
+    readonly provider?: 'chatgpt' | 'claude' | 'gemini';
+    readonly linkedAt?: string;
+    readonly reason?: 'matched' | 'timeout';
+  }>;
 }
 
 export interface SidetrackMcpReader {

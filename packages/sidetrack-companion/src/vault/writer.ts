@@ -17,6 +17,7 @@ import {
   codingAttachTokenSchema,
   codingSessionSchema,
   dispatchEventRecordSchema,
+  dispatchLinkSchema,
   reviewEventRecordSchema,
   settingsDocumentSchema,
 } from '../http/schemas.js';
@@ -30,6 +31,7 @@ import type {
   CodingSessionRecord,
   CodingSessionRegisterInput,
   DispatchEventRecord,
+  DispatchLinkRecord,
   DispatchListQuery,
   QueueCreateInput,
   ReminderCreateInput,
@@ -93,6 +95,12 @@ export interface VaultWriter {
   readonly readDispatchEvents: (
     query: DispatchListQuery,
   ) => Promise<readonly DispatchEventRecord[]>;
+  readonly linkDispatchToThread: (
+    input: { readonly dispatchId: string; readonly threadId: string },
+    requestId: string,
+  ) => Promise<DispatchLinkRecord>;
+  readonly readLinkForDispatch: (dispatchId: string) => Promise<DispatchLinkRecord | null>;
+  readonly readLinksForThread: (threadId: string) => Promise<readonly DispatchLinkRecord[]>;
   readonly readAuditEvents: (query: AuditListQuery) => Promise<readonly AuditEventRecord[]>;
   readonly writeReviewEvent: (
     input: ReviewEvent,
@@ -260,6 +268,50 @@ const readDispatchFile = async (path: string): Promise<readonly DispatchEventRec
     .split('\n')
     .map(parseDispatchLine)
     .filter((event): event is DispatchEventRecord => event !== undefined);
+};
+
+const parseDispatchLinkLine = (line: string): DispatchLinkRecord | undefined => {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    const result = dispatchLinkSchema.safeParse(parsed);
+    return result.success ? result.data : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const readDispatchLinkFile = async (path: string): Promise<readonly DispatchLinkRecord[]> => {
+  const raw = await readFile(path, 'utf8');
+  return raw
+    .split('\n')
+    .map(parseDispatchLinkLine)
+    .filter((entry): entry is DispatchLinkRecord => entry !== undefined);
+};
+
+// Walk every dispatch-links/<date>.jsonl file, newest first. Used by
+// the link readers — the table is small (one entry per dispatch) and
+// pruning happens out-of-band, so a simple linear scan is fine.
+const readAllDispatchLinks = async (
+  bacRoot: string,
+): Promise<readonly DispatchLinkRecord[]> => {
+  const linkRoot = join(bacRoot, 'dispatch-links');
+  let names: string[];
+  try {
+    names = await readdir(linkRoot);
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      return [];
+    }
+    throw error;
+  }
+  const files = names.filter((name) => /^\d{4}-\d{2}-\d{2}\.jsonl$/u.test(name)).sort();
+  return (
+    await Promise.all(files.map((name) => readDispatchLinkFile(join(linkRoot, name))))
+  ).flat();
 };
 
 const parseAuditLine = (line: string): AuditEventRecord | undefined => {
@@ -465,6 +517,61 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
         timestamp,
       });
       return { bac_id: input.bac_id, status: 'recorded' };
+    },
+
+    async linkDispatchToThread(input, requestId) {
+      await ensureVaultPresent();
+      const linkedAt = new Date().toISOString();
+      const existingLinks = await readAllDispatchLinks(bacRoot);
+      const existing = existingLinks
+        .filter((entry) => entry.dispatchId === input.dispatchId)
+        .sort((a, b) => b.linkedAt.localeCompare(a.linkedAt))[0];
+      // Idempotent: same (dispatchId, threadId) pair returns the
+      // existing record without appending another row. Re-linking
+      // to a different thread appends a new row — readLinkForDispatch
+      // resolves to the latest entry, so the move is observable.
+      if (existing !== undefined && existing.threadId === input.threadId) {
+        await audit({
+          requestId,
+          route: 'linkDispatch',
+          outcome: 'success',
+          bac_id: input.dispatchId,
+          timestamp: linkedAt,
+        });
+        return existing;
+      }
+      const record: DispatchLinkRecord = {
+        dispatchId: input.dispatchId,
+        threadId: input.threadId,
+        linkedAt,
+      };
+      await appendJsonLine(
+        join(bacRoot, 'dispatch-links', `${dateStamp(new Date(linkedAt))}.jsonl`),
+        record,
+      );
+      await audit({
+        requestId,
+        route: 'linkDispatch',
+        outcome: 'success',
+        bac_id: input.dispatchId,
+        timestamp: linkedAt,
+      });
+      return record;
+    },
+
+    async readLinkForDispatch(dispatchId) {
+      await ensureVaultPresent();
+      const links = await readAllDispatchLinks(bacRoot);
+      const matches = links
+        .filter((entry) => entry.dispatchId === dispatchId)
+        .sort((a, b) => b.linkedAt.localeCompare(a.linkedAt));
+      return matches[0] ?? null;
+    },
+
+    async readLinksForThread(threadId) {
+      await ensureVaultPresent();
+      const links = await readAllDispatchLinks(bacRoot);
+      return links.filter((entry) => entry.threadId === threadId);
     },
 
     async readDispatchEvents(query) {

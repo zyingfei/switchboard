@@ -159,6 +159,23 @@ const tryAutoLinkCapturedThread = async (
     return;
   }
   await writeDispatchLink(result.dispatchId, threadId);
+  // Forward the link into the companion vault (Phase 3). The local
+  // chrome.storage map keeps rendering Recent Dispatches without a
+  // round trip; the companion is the source of truth for cross-process
+  // consumers (MCP `sidetrack.dispatch.await_capture`, side-panel
+  // mirrors). Failures are non-fatal so a flaky companion can't break
+  // capture.
+  try {
+    const settings = await readSettings();
+    if (settings.companion.bridgeKey.trim().length > 0) {
+      await createDispatchClient(settings.companion).linkDispatchToThread(
+        result.dispatchId,
+        threadId,
+      );
+    }
+  } catch {
+    // best-effort
+  }
 };
 
 // Compare canonical forms so SPA URL drift on the active tab

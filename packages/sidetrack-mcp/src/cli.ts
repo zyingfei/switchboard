@@ -500,6 +500,44 @@ const createCompanionWriteClient = (
       }
       return (body as { readonly items: readonly unknown[] }).items;
     },
+    async awaitCaptureForDispatch(input) {
+      const url = new URL(
+        `${base}/v1/dispatches/${encodeURIComponent(input.dispatchId)}/await-capture`,
+      );
+      if (input.timeoutMs !== undefined) {
+        url.searchParams.set('timeoutMs', String(input.timeoutMs));
+      }
+      // Server caps at 120s; use a fetch timeout slightly above that
+      // so a slow companion respond never produces an aborted-fetch
+      // error before the server-side timeout fires.
+      const fetchTimeoutMs = Math.min(125_000, (input.timeoutMs ?? 60_000) + 5_000);
+      const controller = new AbortController();
+      const timer = setTimeout(() => {
+        controller.abort();
+      }, fetchTimeoutMs);
+      try {
+        const response = await fetch(url, {
+          method: 'GET',
+          headers: { 'x-bac-bridge-key': bridgeKey },
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          const detail = await response.text().catch(() => '');
+          throw new Error(
+            `Companion await-capture failed (${String(response.status)}): ${detail}`,
+          );
+        }
+        const body = (await response.json()) as { readonly data?: unknown };
+        if (typeof body.data !== 'object' || body.data === null || Array.isArray(body.data)) {
+          throw new Error('Companion await-capture response missing data object.');
+        }
+        return body.data as Awaited<
+          ReturnType<NonNullable<CompanionWriteClient['awaitCaptureForDispatch']>>
+        >;
+      } finally {
+        clearTimeout(timer);
+      }
+    },
   };
 };
 

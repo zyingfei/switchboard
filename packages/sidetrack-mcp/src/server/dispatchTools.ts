@@ -145,7 +145,7 @@ export const registerDispatchTools = (
     'sidetrack.dispatch.await_capture',
     {
       description:
-        "Block until the dispatch's chat tab has been auto-opened, auto-sent, and captured. Returns the linked thread when matched, or a reason code when the timeout hits. NOTE: Phase 1 returns 'unsupported-in-phase-1' — Phase 3 wires the long-poll against the companion link table. In the meantime, fall back to `sidetrack.threads.list` filtered by capturedAt > the dispatch creation time.",
+        "Block until the dispatch's chat tab has been auto-opened, auto-sent, and captured. Returns the linked thread when matched, or a reason code (timeout) when the deadline hits. Backed by the companion's link table at `_BAC/dispatch-links/<date>.jsonl`.",
       inputSchema: {
         dispatchId: z
           .string()
@@ -161,13 +161,24 @@ export const registerDispatchTools = (
       },
       outputSchema: awaitCaptureOutputShape,
     },
-    async ({ dispatchId }) => {
-      // Phase 1 stub. Phase 3 replaces this with a real call to
-      // companion `GET /v1/dispatches/:bacId/await-capture`.
-      const structured: z.infer<z.ZodObject<typeof awaitCaptureOutputShape>> = {
+    async ({ dispatchId, timeoutMs }) => {
+      if (companionClient?.awaitCaptureForDispatch === undefined) {
+        throw new Error(
+          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.dispatch.await_capture is unavailable.',
+        );
+      }
+      const result = await companionClient.awaitCaptureForDispatch({
         dispatchId,
-        matched: false,
-        reason: 'unsupported-in-phase-1',
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      });
+      const structured: z.infer<z.ZodObject<typeof awaitCaptureOutputShape>> = {
+        dispatchId: result.dispatchId,
+        matched: result.matched,
+        ...(result.threadId === undefined ? {} : { threadId: result.threadId }),
+        ...(result.threadUrl === undefined ? {} : { threadUrl: result.threadUrl }),
+        ...(result.title === undefined ? {} : { title: result.title }),
+        ...(result.provider === undefined ? {} : { provider: result.provider }),
+        ...(result.reason === undefined ? {} : { reason: result.reason }),
       };
       return {
         content: [{ type: 'text' as const, text: `${JSON.stringify(structured, null, 2)}\n` }],

@@ -55,6 +55,7 @@ import {
   codingSessionListQuerySchema,
   codingSessionRegisterSchema,
   dispatchEventSchema,
+  dispatchLinkRequestSchema,
   dispatchListQuerySchema,
   queueCreateSchema,
   reminderCreateSchema,
@@ -576,6 +577,45 @@ const readThreadWorkstreamId = async (
   }
 };
 
+interface ThreadMetadata {
+  readonly bac_id: string;
+  readonly title?: string;
+  readonly threadUrl?: string;
+  readonly provider?: string;
+}
+
+// Cheap thread-record fetch for await-capture enrichment. Returns
+// just the fields the MCP outputSchema needs; full reads go through
+// the live vault reader.
+const readThreadMetadata = async (
+  vaultRoot: string,
+  threadId: string,
+): Promise<ThreadMetadata | null> => {
+  try {
+    const raw = await readFile(
+      join(vaultRoot, '_BAC', 'threads', `${threadId}.json`),
+      'utf8',
+    );
+    const parsed = JSON.parse(raw) as {
+      readonly bac_id?: unknown;
+      readonly title?: unknown;
+      readonly threadUrl?: unknown;
+      readonly provider?: unknown;
+    };
+    if (typeof parsed.bac_id !== 'string') {
+      return null;
+    }
+    return {
+      bac_id: parsed.bac_id,
+      ...(typeof parsed.title === 'string' ? { title: parsed.title } : {}),
+      ...(typeof parsed.threadUrl === 'string' ? { threadUrl: parsed.threadUrl } : {}),
+      ...(typeof parsed.provider === 'string' ? { provider: parsed.provider } : {}),
+    };
+  } catch {
+    return null;
+  }
+};
+
 const objectRecord = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -911,6 +951,131 @@ const routes: readonly RouteDefinition[] = [
         since: url.searchParams.get('since') ?? undefined,
       });
       return [200, { data: await context.vaultWriter.readDispatchEvents(query) }];
+    },
+  },
+  {
+    // Dispatch ↔ thread link table (Phase 3 of the spec-aligned
+    // refactor). Replaces the extension-only chrome.storage map.
+    // Idempotent on (dispatchId, threadId) pair: re-linking to the
+    // same thread is a no-op; re-linking to a different thread
+    // appends a new row and the latest one wins on read.
+    method: 'POST',
+    pattern: /^\/v1\/dispatches\/(?<bacId>[A-Za-z0-9_-]+)\/link$/,
+    authRequired: true,
+    handle: async (request, requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing dispatch bacId path parameter.');
+      }
+      const body = dispatchLinkRequestSchema.parse(await readBody(request));
+      const record = await context.vaultWriter.linkDispatchToThread(
+        { dispatchId: match.bacId, threadId: body.threadId },
+        requestId,
+      );
+      return [200, { data: record }];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/dispatches\/(?<bacId>[A-Za-z0-9_-]+)\/link$/,
+    authRequired: true,
+    handle: async (_request, _requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing dispatch bacId path parameter.');
+      }
+      const link = await context.vaultWriter.readLinkForDispatch(match.bacId);
+      return [
+        200,
+        {
+          data: link ?? { dispatchId: match.bacId, threadId: null, linkedAt: null },
+        },
+      ];
+    },
+  },
+  {
+    // Long-poll for dispatch capture. Resolves when the link table
+    // has a record for this dispatchId, or after timeoutMs (default
+    // 60s, capped at 120s). Subscribes to vaultChanges if available
+    // so the wait is event-driven; falls back to a 1s polling loop
+    // when no watcher is wired.
+    method: 'GET',
+    pattern: /^\/v1\/dispatches\/(?<bacId>[A-Za-z0-9_-]+)\/await-capture$/,
+    authRequired: true,
+    handle: async (request, _requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing dispatch bacId path parameter.');
+      }
+      const dispatchId = match.bacId;
+      const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+      const rawTimeout = url.searchParams.get('timeoutMs');
+      const requested =
+        rawTimeout === null ? 60_000 : Number.parseInt(rawTimeout, 10);
+      const timeoutMs =
+        Number.isFinite(requested) && requested > 0 ? Math.min(requested, 120_000) : 60_000;
+      const vaultRoot = context.vaultRoot;
+
+      const buildResponse = async (
+        link: Awaited<ReturnType<typeof context.vaultWriter.readLinkForDispatch>>,
+      ) => {
+        if (link === null) {
+          return {
+            dispatchId,
+            matched: false,
+            reason: 'timeout' as const,
+          };
+        }
+        const meta =
+          vaultRoot === undefined ? null : await readThreadMetadata(vaultRoot, link.threadId);
+        return {
+          dispatchId,
+          matched: true,
+          threadId: link.threadId,
+          linkedAt: link.linkedAt,
+          ...(meta?.threadUrl === undefined ? {} : { threadUrl: meta.threadUrl }),
+          ...(meta?.title === undefined ? {} : { title: meta.title }),
+          ...(meta?.provider === undefined ? {} : { provider: meta.provider }),
+          reason: 'matched' as const,
+        };
+      };
+
+      const initial = await context.vaultWriter.readLinkForDispatch(dispatchId);
+      if (initial !== null) {
+        return [200, { data: await buildResponse(initial) }];
+      }
+
+      const result = await new Promise<
+        Awaited<ReturnType<typeof context.vaultWriter.readLinkForDispatch>>
+      >((resolve) => {
+        const timer = setTimeout(() => {
+          unsubscribe();
+          clearInterval(poll);
+          resolve(null);
+        }, timeoutMs);
+        const poll = setInterval(() => {
+          void context.vaultWriter.readLinkForDispatch(dispatchId).then((link) => {
+            if (link !== null) {
+              clearTimeout(timer);
+              clearInterval(poll);
+              unsubscribe();
+              resolve(link);
+            }
+          });
+        }, 1000);
+        const unsubscribe =
+          context.vaultChanges?.subscribe((event) => {
+            if (event.relPath.startsWith('_BAC/dispatch-links/')) {
+              void context.vaultWriter.readLinkForDispatch(dispatchId).then((link) => {
+                if (link !== null) {
+                  clearTimeout(timer);
+                  clearInterval(poll);
+                  unsubscribe();
+                  resolve(link);
+                }
+              });
+            }
+          }) ?? (() => undefined);
+      });
+
+      return [200, { data: await buildResponse(result) }];
     },
   },
   {
