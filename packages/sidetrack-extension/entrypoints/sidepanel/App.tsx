@@ -3646,6 +3646,39 @@ const App = () => {
               <path d="M5 12h14" />
             </svg>
           </button>
+          {/* Capture-mode toggle (global). Single icon-button cycles
+              between auto (↻ — Sidetrack refreshes detected threads on
+              every new turn) and manual (✋ — refreshes only when the
+              user clicks a row's Capture button). The active mode is
+              both the rendered glyph and the title text, so hover
+              tells you what clicking will do. */}
+          <button
+            className={'icon-btn' + (state.settings.autoTrack ? ' on' : '')}
+            title={
+              state.settings.autoTrack
+                ? 'Capture mode: Auto — refreshes every new turn. Click to switch to Manual.'
+                : 'Capture mode: Manual — capture-on-demand per row. Click to switch to Auto.'
+            }
+            onClick={() => {
+              void runAction(() =>
+                sendRequest({
+                  type: messageTypes.saveLocalPreferences,
+                  preferences: { autoTrack: !state.settings.autoTrack },
+                }),
+              );
+            }}
+            type="button"
+            aria-label={
+              state.settings.autoTrack
+                ? 'Capture mode is Auto — switch to Manual'
+                : 'Capture mode is Manual — switch to Auto'
+            }
+            aria-pressed={state.settings.autoTrack}
+          >
+            <span style={{ display: 'inline-flex', width: 14, height: 14 }}>
+              {state.settings.autoTrack ? Icons.autoCycle : Icons.manualTap}
+            </span>
+          </button>
           <button
             className="icon-btn"
             title={
