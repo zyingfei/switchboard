@@ -126,6 +126,30 @@ const chatgptCitations = (turnNode: Element): readonly CapturedCitation[] => {
   return out;
 };
 
+// Pull section headings from the rendered answer body. ChatGPT's
+// long-form deep-research outputs are heavily H2-structured ("1.
+// Plugin / extension behavior", "2. Companion behavior", …) but the
+// schema's `sections` field stayed empty before this — meaning the
+// vault saw the body as a single text blob with no structural index
+// anyone could outline against. Dedup + length-cap so a freak heading
+// (e.g. accidental H1 wrapper) can't blow up the payload.
+const chatgptSections = (turnNode: Element): readonly string[] => {
+  const root = turnNode.querySelector('.markdown.prose, .prose, .markdown');
+  if (root === null) return [];
+  const headings = Array.from(root.querySelectorAll('h1, h2, h3, h4'));
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const h of headings) {
+    const t = text(h);
+    if (t.length === 0 || t.length > 200) continue;
+    if (seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+    if (out.length >= 24) break;
+  }
+  return out;
+};
+
 const chatgptAttachments = (turnNode: Element): readonly CapturedAttachment[] => {
   const imgs = Array.from(turnNode.querySelectorAll('img')).filter((img) => {
     const src = attr(img, 'src');
@@ -157,11 +181,13 @@ const enrichChatgpt = (ctx: EnrichmentContext): TurnEnrichment => {
   ).length;
   const citations = chatgptCitations(ctx.turnNode);
   const isDeepResearch = chatgptDeepResearchActive(ctx.doc) || rawPillCount >= 3;
+  const sections = isDeepResearch ? chatgptSections(ctx.turnNode) : [];
   const researchReport: CapturedResearchReport | undefined =
     ctx.role === 'assistant' && isDeepResearch
       ? {
           mode: 'deep-research',
           ...(citations.length > 0 ? { citations } : {}),
+          ...(sections.length > 0 ? { sections } : {}),
         }
       : undefined;
   return {
