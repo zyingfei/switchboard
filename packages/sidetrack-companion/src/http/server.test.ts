@@ -798,6 +798,79 @@ describe('companion HTTP server', () => {
     });
   });
 
+  it('builds the anchor server-side from a term + assistant turn body', async () => {
+    const capturedAt = '2026-04-26T21:30:00.000Z';
+    const threadUrl = 'https://chatgpt.com/c/term-form-thread';
+    await jsonFetch(context, `${baseUrl}/v1/events`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'capture-term-form-001',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        provider: 'chatgpt',
+        threadUrl,
+        title: 'Architect HN analysis',
+        capturedAt,
+        turns: [
+          {
+            role: 'assistant',
+            text: 'Browser graphics stack: WebGPU gives apps lower-level GPU access without native installs.',
+            ordinal: 0,
+            capturedAt,
+          },
+        ],
+      }),
+    });
+
+    const create = await jsonFetch(context, `${baseUrl}/v1/annotations`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'annotation-term-form-001',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        url: threadUrl,
+        pageTitle: 'Architect HN analysis',
+        term: 'WebGPU',
+        note: 'Browser GPU compute API.',
+      }),
+    });
+    expect(create.status).toBe(201);
+    expect(create.body).toMatchObject({
+      data: {
+        url: threadUrl,
+        anchor: {
+          textQuote: {
+            exact: 'WebGPU',
+            prefix: 'Browser graphics stack: ',
+          },
+        },
+      },
+    });
+  });
+
+  it('returns 400 when the term form references a thread with no captured turns', async () => {
+    const create = await jsonFetch(context, `${baseUrl}/v1/annotations`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'annotation-term-form-missing',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        url: 'https://chatgpt.com/c/never-captured',
+        pageTitle: 'Never captured',
+        term: 'WebGPU',
+        note: 'Should fail — no turns.',
+      }),
+    });
+    expect(create.status).toBe(404);
+    expect(create.body).toMatchObject({ code: 'NO_ASSISTANT_TURNS' });
+  });
+
   it('updates and soft-deletes annotations through HTTP', async () => {
     const anchor = {
       textQuote: { exact: 'hello', prefix: '', suffix: '' },

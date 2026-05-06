@@ -275,13 +275,14 @@ describe('sidetrack.annotations.create_batch', () => {
   it('persists each item in order, surfaces per-item status', async () => {
     let counter = 0;
     const writeClient = buildFakeWriteClient({
-      createAnnotation: vi.fn(() => {
+      createAnnotation: vi.fn((input) => {
         counter += 1;
         return Promise.resolve({
           bac_id: `bac_annotation_${String(counter)}`,
-          url: 'https://chatgpt.com/c/thread',
-          pageTitle: 'HN',
-          note: 'note',
+          url: input.url,
+          pageTitle: input.pageTitle,
+          term: input.term,
+          note: input.note,
         });
       }),
     });
@@ -293,22 +294,23 @@ describe('sidetrack.annotations.create_batch', () => {
           url: 'https://chatgpt.com/c/thread',
           pageTitle: 'HN',
           items: [
-            {
-              term: 'WebGPU',
-              prefix: 'l than N websites each bundling ',
-              suffix: '/WASM inference stacks, ONNX Run',
-              note: 'WebGPU defines browser GPU compute and rendering.',
-            },
+            { term: 'WebGPU', note: 'WebGPU defines browser GPU compute and rendering.' },
             {
               term: 'eBPF',
-              prefix: 'kernel without rebuild — namely ',
-              suffix: ' programs verified before load',
+              selectionHint: 'kernel without rebuild — namely',
               note: 'eBPF runs verified bytecode in the kernel.',
             },
           ],
         },
       });
       expect(writeClient.createAnnotation).toHaveBeenCalledTimes(2);
+      expect(writeClient.createAnnotation).toHaveBeenNthCalledWith(2, {
+        url: 'https://chatgpt.com/c/thread',
+        pageTitle: 'HN',
+        term: 'eBPF',
+        note: 'eBPF runs verified bytecode in the kernel.',
+        selectionHint: 'kernel without rebuild — namely',
+      });
       const structured = result.structuredContent as Record<string, unknown>;
       expect(structured['countForThread']).toBe(2);
       const annotations = structured['annotations'] as readonly Record<string, unknown>[];
@@ -328,8 +330,28 @@ describe('sidetrack.annotations.create_batch', () => {
     }
   });
 
-  it('rejects short terms without context per-item, but lets the rest of the batch succeed', async () => {
-    const writeClient = buildFakeWriteClient();
+  it('surfaces server-side anchor build failures as per-item failures', async () => {
+    // Phase 4: short-term / no-match / hint-no-match etc are all
+    // raised by the companion's anchorBuilder. The MCP tool never
+    // pre-validates — it forwards each item, and the companion
+    // returns 400 on a per-call basis, which the tool maps to
+    // status:'failed' so the rest of the batch keeps going.
+    const writeClient = buildFakeWriteClient({
+      createAnnotation: vi.fn((input) => {
+        if (input.term === 'AI') {
+          return Promise.reject(
+            new Error("Term 'AI' is shorter than 6 chars; provide selectionHint."),
+          );
+        }
+        return Promise.resolve({
+          bac_id: 'bac_annotation_ok',
+          url: input.url,
+          pageTitle: input.pageTitle,
+          term: input.term,
+          note: input.note,
+        });
+      }),
+    });
     const client = await startInProcessServer(writeClient);
     try {
       const result = await client.callTool({
@@ -339,21 +361,22 @@ describe('sidetrack.annotations.create_batch', () => {
           pageTitle: 'HN',
           items: [
             { term: 'AI', note: 'Too generic without context.' },
-            {
-              term: 'WebGPU',
-              prefix: 'each bundling ',
-              suffix: '/WASM inference',
-              note: 'Defines browser GPU access.',
-            },
+            { term: 'WebGPU', note: 'Defines browser GPU access.' },
           ],
         },
       });
-      expect(writeClient.createAnnotation).toHaveBeenCalledTimes(1);
+      expect(writeClient.createAnnotation).toHaveBeenCalledTimes(2);
       const annotations = (result.structuredContent as Record<string, unknown>)[
         'annotations'
       ] as readonly Record<string, unknown>[];
-      expect(annotations[0]).toMatchObject({ term: 'AI', status: 'rejected' });
-      expect(annotations[1]).toMatchObject({ term: 'WebGPU', status: 'created' });
+      expect(annotations[0]).toMatchObject({
+        term: 'AI',
+        status: 'failed',
+      });
+      expect(annotations[1]).toMatchObject({
+        term: 'WebGPU',
+        status: 'created',
+      });
     } finally {
       await client.close();
     }

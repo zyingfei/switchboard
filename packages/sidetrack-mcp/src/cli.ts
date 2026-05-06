@@ -349,9 +349,8 @@ const createCompanionWriteClient = (
             [
               input.url,
               input.pageTitle,
-              input.anchor.textQuote.exact,
-              input.anchor.textQuote.prefix,
-              input.anchor.textQuote.suffix,
+              input.term,
+              input.selectionHint ?? '',
               input.note,
             ].join('-'),
           ),

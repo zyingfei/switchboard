@@ -1,5 +1,6 @@
 import { expect, test, type BrowserContext, type Page, type Route } from '@playwright/test';
 
+import { buildAnchorFromTerm } from '../../../sidetrack-companion/src/annotation/anchorBuilder.js';
 import {
   listAnnotations as listStoredAnnotations,
   writeAnnotation,
@@ -309,7 +310,37 @@ test.describe('Codex MCP Hacker News annotation flow (synthetic browser)', () =>
             };
           },
           async createAnnotation(input) {
-            return { ...(await writeAnnotation(activeCompanion.vaultPath, input)) };
+            // Phase 4: the MCP CompanionWriteClient.createAnnotation
+            // contract is term-form. Mirror the real companion route:
+            // fetch the thread's assistant turns and build the anchor
+            // server-side before writing.
+            const threadUrl = input.threadUrl ?? input.url;
+            const turns = await activeCompanion.writer.readRecentTurns({
+              threadUrl,
+              limit: 50,
+              role: 'assistant',
+            });
+            if (turns.length === 0) {
+              throw new Error(`No assistant turns found for ${threadUrl}.`);
+            }
+            const turnText = turns
+              .slice()
+              .sort((left, right) => left.ordinal - right.ordinal)
+              .map((turn) => turn.text)
+              .join('\n\n');
+            const anchor = buildAnchorFromTerm({
+              turnText,
+              term: input.term,
+              ...(input.selectionHint === undefined ? {} : { selectionHint: input.selectionHint }),
+            });
+            return {
+              ...(await writeAnnotation(activeCompanion.vaultPath, {
+                url: input.url,
+                pageTitle: input.pageTitle,
+                anchor,
+                note: input.note,
+              })),
+            };
           },
           async listAnnotations(input) {
             const annotations = await listStoredAnnotations(activeCompanion.vaultPath, {
@@ -414,15 +445,15 @@ test.describe('Codex MCP Hacker News annotation flow (synthetic browser)', () =>
       const linkedThreadId = links[dispatchId];
       expect(linkedThreadId).toBeTruthy();
 
-      const batchItems = termAnnotations.map((annotation) => {
-        const context = contextForTerm(assistantText, annotation.term);
-        return {
-          term: annotation.term,
-          prefix: context.prefix,
-          suffix: context.suffix,
-          note: annotation.note,
-        };
-      });
+      // Phase 4: agent passes intent only (term + note + optional
+      // selectionHint). The companion's anchor builder fetches the
+      // thread's assistant turns from the vault and computes the
+      // prefix/suffix windows server-side.
+      void contextForTerm; // kept above for any test debugging needs
+      const batchItems = termAnnotations.map((annotation) => ({
+        term: annotation.term,
+        note: annotation.note,
+      }));
       await mcp.callTool('sidetrack.annotations.create_batch', {
         url: finalUrl,
         pageTitle,

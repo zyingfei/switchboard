@@ -3,6 +3,10 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { BrowserContext, Route } from '@playwright/test';
 
+import {
+  AnchorBuilderError,
+  buildAnchorFromTerm,
+} from '../../../../sidetrack-companion/src/annotation/anchorBuilder.js';
 import { ensureBridgeKey } from '../../../../sidetrack-companion/src/auth/bridgeKey.js';
 import {
   CodingAttachTokenInvalidError,
@@ -191,6 +195,50 @@ export const createMockVaultCompanion = async (port = 17373): Promise<MockVaultC
 
       if (route.request().method() === 'POST' && url.pathname === '/v1/annotations') {
         const input = annotationCreateSchema.parse(readJsonBody(route));
+        if ('term' in input) {
+          // Phase 4: term-form. Mirror the real route — fetch the
+          // assistant turns from the mock vault, build the anchor,
+          // then writeAnnotation with the materialised anchor shape.
+          const threadUrl = input.threadUrl ?? input.url;
+          const turns = await writer.readRecentTurns({
+            threadUrl,
+            limit: 50,
+            role: 'assistant',
+          });
+          if (turns.length === 0) {
+            await fulfillJson(route, 404, {
+              error: 'No assistant turns found for the provided URL.',
+            });
+            return;
+          }
+          const turnText = turns
+            .slice()
+            .sort((left, right) => left.ordinal - right.ordinal)
+            .map((turn) => turn.text)
+            .join('\n\n');
+          let anchor;
+          try {
+            anchor = buildAnchorFromTerm({
+              turnText,
+              term: input.term,
+              ...(input.selectionHint === undefined ? {} : { selectionHint: input.selectionHint }),
+            });
+          } catch (error) {
+            if (error instanceof AnchorBuilderError) {
+              await fulfillJson(route, 400, { error: error.message });
+              return;
+            }
+            throw error;
+          }
+          const result = await writeAnnotation(vaultPath, {
+            url: input.url,
+            pageTitle: input.pageTitle,
+            anchor,
+            note: input.note,
+          });
+          await fulfillJson(route, 201, { data: result });
+          return;
+        }
         const result = await writeAnnotation(vaultPath, input);
         await fulfillJson(route, 201, { data: result });
         return;

@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { access, readFile, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
+import { AnchorBuilderError, buildAnchorFromTerm } from '../annotation/anchorBuilder.js';
 import { isBridgeKeyAccepted, rotateBridgeKey } from '../auth/bridgeKey.js';
 import {
   isAllowed,
@@ -1164,6 +1165,60 @@ const routes: readonly RouteDefinition[] = [
       const idempotencyKey = requireIdempotencyKey(request);
       return await runIdempotent(context, 'createAnnotation', idempotencyKey, async () => {
         const input = annotationCreateSchema.parse(await readBody(request));
+        // Term-form (Phase 4): companion fetches the thread's assistant
+        // turns and builds the anchor server-side. Anchor-form (DOM-
+        // driven): caller already serialised the anchor; pass through
+        // unchanged.
+        if ('term' in input) {
+          const threadUrl = input.threadUrl ?? input.url;
+          const turns = await context.vaultWriter.readRecentTurns({
+            threadUrl,
+            limit: 50,
+            role: 'assistant',
+          });
+          if (turns.length === 0) {
+            throw new HttpRouteError(
+              404,
+              'NO_ASSISTANT_TURNS',
+              'Thread has no captured assistant turns.',
+              `No assistant turns found for ${threadUrl}; capture the thread first.`,
+            );
+          }
+          const turnText = turns
+            .slice()
+            .sort((left, right) => left.ordinal - right.ordinal)
+            .map((turn) => turn.text)
+            .join('\n\n');
+          let anchor;
+          try {
+            anchor = buildAnchorFromTerm({
+              turnText,
+              term: input.term,
+              ...(input.selectionHint === undefined ? {} : { selectionHint: input.selectionHint }),
+            });
+          } catch (error) {
+            if (error instanceof AnchorBuilderError) {
+              throw new HttpRouteError(
+                400,
+                error.reason.toUpperCase().replace(/-/g, '_'),
+                'Anchor build failed.',
+                error.message,
+              );
+            }
+            throw error;
+          }
+          return [
+            201,
+            {
+              data: await writeAnnotation(vaultRoot, {
+                url: input.url,
+                pageTitle: input.pageTitle,
+                anchor,
+                note: input.note,
+              }),
+            },
+          ];
+        }
         return [201, { data: await writeAnnotation(vaultRoot, input) }];
       });
     },

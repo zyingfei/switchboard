@@ -390,12 +390,41 @@ export const turnRecordSchema = z.object({
   sourceSelector: z.string().min(1).optional(),
 });
 
-export const annotationCreateSchema = z.object({
+// Two ways to create an annotation:
+//   1. Anchor-form (DOM-driven): the caller serialised a Range and
+//      sends the full anchor. Used by the side panel's per-turn
+//      composer and other in-DOM selection paths.
+//   2. Term-form (intent-driven, Phase 4): the caller provides the
+//      keyword and lets the companion compute the anchor from the
+//      thread's assistant turn body. Used by MCP-side agents — the
+//      agent doesn't have the live DOM, only the markdown turn body
+//      stored on the companion, so making the companion build the
+//      anchor avoids markdown↔DOM offset divergence on the read side.
+const annotationCreateAnchorSchema = z.object({
   url: z.url(),
   pageTitle: z.string().min(1),
   anchor: serializedAnchorSchema,
   note: z.string(),
 });
+
+const annotationCreateTermSchema = z.object({
+  url: z.url(),
+  pageTitle: z.string().min(1),
+  term: z.string().min(1).max(400),
+  // Optional — when omitted, the companion uses the request `url` as
+  // the thread URL for the turn-text lookup. ChatGPT, Claude, and
+  // Gemini all serve thread pages on stable URLs that already match
+  // the canonical threadUrl, so this is the typical case.
+  threadId: z.string().min(1).optional(),
+  threadUrl: z.url().optional(),
+  selectionHint: z.string().max(512).optional(),
+  note: z.string(),
+});
+
+export const annotationCreateSchema = z.union([
+  annotationCreateAnchorSchema,
+  annotationCreateTermSchema,
+]);
 
 export const annotationListQuerySchema = z.object({
   url: z.url().optional(),

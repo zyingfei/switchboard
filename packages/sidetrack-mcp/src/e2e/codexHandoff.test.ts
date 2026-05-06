@@ -207,7 +207,7 @@ const writeClient: CompanionWriteClient & {
         bac_id: 'bac_annotation_term',
         url: input.url,
         pageTitle: input.pageTitle,
-        anchor: input.anchor,
+        term: input.term,
         note: input.note,
         createdAt: NOW,
       });

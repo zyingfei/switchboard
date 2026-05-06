@@ -85,11 +85,19 @@ export interface CompanionWriteClient {
     readonly scope: 'thread' | 'workstream' | 'global';
     readonly targetId?: string;
   }) => Promise<{ readonly bac_id: string; readonly revision: string }>;
+  // Term-form annotation create. Phase 4 of the spec-aligned refactor:
+  // the agent provides intent (term + optional selectionHint) and the
+  // companion builds the anchor from the thread's stored turn text,
+  // mirroring how the in-DOM extension paths already work and avoiding
+  // markdown↔DOM offset divergence on the read side.
   readonly createAnnotation?: (input: {
     readonly url: string;
     readonly pageTitle: string;
-    readonly anchor: SerializedAnchor;
+    readonly term: string;
     readonly note: string;
+    readonly threadId?: string;
+    readonly threadUrl?: string;
+    readonly selectionHint?: string;
   }) => Promise<Record<string, unknown>>;
   readonly updateAnnotation?: (input: {
     readonly bac_id: string;
