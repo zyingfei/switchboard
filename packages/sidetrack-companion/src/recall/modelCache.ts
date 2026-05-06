@@ -1,4 +1,4 @@
-import { access, readdir } from 'node:fs/promises';
+import { access, readdir, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import process from 'node:process';
@@ -97,6 +97,47 @@ const exists = async (path: string): Promise<boolean> => {
   }
 };
 
+// Look for the cached HF revision token. transformers.js writes a
+// `<modelDir>/refs/main` (or similarly-named ref file) containing
+// the commit sha when it pulls the model. Probing for the exact
+// path is brittle across HF / transformers.js versions, so we walk
+// looking for ANY 40-char hex blob and treat it as a candidate
+// revision marker.
+const findCachedRevision = async (root: string): Promise<string | null> => {
+  const stack: string[] = [root];
+  while (stack.length > 0) {
+    const dir = stack.pop();
+    if (dir === undefined) return null;
+    let entries: string[];
+    try {
+      entries = await readdir(dir);
+    } catch {
+      continue;
+    }
+    for (const name of entries) {
+      const full = join(dir, name);
+      // Common patterns: 'refs/main', 'refs/<branch>', files named
+      // '<sha>.json' / '<sha>'. Also pick up any small text file
+      // whose CONTENT is a 40-char hex string.
+      if (/^[0-9a-f]{40}$/i.test(name)) return name.toLowerCase();
+      if (name === 'main' || /^refs?$/.test(name) === false) {
+        // Cheap probe: read short files only.
+        try {
+          const buf = await readFile(full, { encoding: 'utf8' });
+          const trimmed = buf.trim();
+          if (/^[0-9a-f]{40}$/i.test(trimmed)) return trimmed.toLowerCase();
+        } catch {
+          // Not a regular file or not readable; fall through.
+        }
+      }
+      if (!name.includes('.') && !name.endsWith('.onnx')) {
+        stack.push(full);
+      }
+    }
+  }
+  return null;
+};
+
 const findOnnxFile = async (root: string): Promise<string | null> => {
   const stack: string[] = [root];
   while (stack.length > 0) {
@@ -134,16 +175,21 @@ export const getModelCacheStatus = async (
   const present = await exists(dir).then(async (ok) =>
     ok ? (await findOnnxFile(dir)) !== null : false,
   );
+  // When the cache holds a HF refs token whose sha matches the
+  // pinned manifest revision, mark the model verified. Mismatch (or
+  // absent token) → verified: false, which the side panel surfaces
+  // as "model present but not pinned-sha-verified" so the user
+  // knows whether a re-fetch is needed after a manifest bump.
+  const cachedRevision = present ? await findCachedRevision(dir) : null;
+  const verified =
+    cachedRevision !== null &&
+    cachedRevision.toLowerCase() === RECALL_MODEL.revision.toLowerCase();
   return {
     modelId: RECALL_MODEL.modelId,
     revision: RECALL_MODEL.revision,
     cacheDir,
     present,
-    // The manifest doesn't yet pin a real sha so verification is
-    // presence-only. When the revision lands, this becomes a real
-    // checksum compare; until then we surface false honestly so
-    // the side panel can flag the unpinned model.
-    verified: false,
+    verified,
     offline,
   };
 };

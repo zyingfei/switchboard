@@ -20,11 +20,13 @@ export interface RecallModelManifest {
 
 export const RECALL_MODEL: RecallModelManifest = {
   modelId: 'Xenova/multilingual-e5-small',
-  // TODO: pin exact HF commit sha once a stable release is selected.
-  // Until then the manifest carries a synthetic identifier that's
-  // still distinct from "unset" so the lifecycle's stale check can
-  // detect a future swap.
-  revision: 'unpinned-2026-05',
+  // Pinned HF commit sha (https://huggingface.co/api/models/
+  // Xenova/multilingual-e5-small as of 2025-07-22). Bumping this
+  // value invalidates every existing index entry through the
+  // lifecycle stale-check (MODEL_ID embeds the revision). Refresh
+  // by re-running `curl https://huggingface.co/api/models/
+  // Xenova/multilingual-e5-small | jq .sha` and updating below.
+  revision: '761b726dd34fb83930e26aab4e9ac3899aa1fa78',
   embeddingDim: 384,
   dtypePreference: ['q8', 'fp16', 'fp32'],
   inputPrefix: 'query: ',

@@ -99,5 +99,30 @@ describe('modelCache', () => {
       const status = await getModelCacheStatus({ modelsDir: cacheDir });
       expect(status.present).toBe(true);
     });
+
+    it('verifies the cached sha when refs/main matches the manifest revision', async () => {
+      const [org, repo] = RECALL_MODEL.modelId.split('/');
+      const modelTree = join(cacheDir, org!, repo!);
+      await mkdir(join(modelTree, 'onnx'), { recursive: true });
+      await writeFile(join(modelTree, 'onnx', 'model_quantized.onnx'), 'fake-onnx');
+      // Drop a refs/main token containing the pinned sha.
+      await mkdir(join(modelTree, 'refs'), { recursive: true });
+      await writeFile(join(modelTree, 'refs', 'main'), `${RECALL_MODEL.revision}\n`);
+      const status = await getModelCacheStatus({ modelsDir: cacheDir });
+      expect(status.present).toBe(true);
+      expect(status.verified).toBe(true);
+    });
+
+    it('reports verified:false when the cached sha differs from the manifest revision', async () => {
+      const [org, repo] = RECALL_MODEL.modelId.split('/');
+      const modelTree = join(cacheDir, org!, repo!);
+      await mkdir(join(modelTree, 'onnx'), { recursive: true });
+      await writeFile(join(modelTree, 'onnx', 'model_quantized.onnx'), 'fake-onnx');
+      await mkdir(join(modelTree, 'refs'), { recursive: true });
+      await writeFile(join(modelTree, 'refs', 'main'), 'a'.repeat(40));
+      const status = await getModelCacheStatus({ modelsDir: cacheDir });
+      expect(status.present).toBe(true);
+      expect(status.verified).toBe(false);
+    });
   });
 });
