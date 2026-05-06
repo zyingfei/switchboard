@@ -180,20 +180,29 @@ export const startCompanion = async (
   });
   // Don't block startup on the rebuild — health endpoint will report
   // status: 'rebuilding' until the background task completes.
-  void recallLifecycle.ensureFresh();
-  // Catch the recall index up to the latest event-log frontier on
-  // boot. The ingestor is idempotent and resumes from the persisted
-  // ingest-state, so a kill-9 between captures is safe. Best-effort:
-  // if the embedder is offline (model missing) or the log is empty
-  // this is a no-op. Runs after lifecycle.ensureFresh() so a rebuild
-  // doesn't race with incremental upserts.
+  // The fresh-check + incremental ingest BOTH run through the
+  // lifecycle's single-writer mutex, so they serialize against each
+  // other and against any subsequent appendEntry / tombstone /
+  // gcEntries call. ensureFresh schedules a rebuild ONLY when the
+  // index is stale (model swap, schema bump, drift, missing); the
+  // common case where the index is already ready is a noop and the
+  // ingest runs immediately.
   void (async () => {
     try {
-      const { ingestIncremental } = await import('../recall/ingestor.js');
-      await ingestIncremental(options.vaultPath, baseEventLog);
+      await recallLifecycle.ensureFresh();
+      // Wait for any rebuild ensureFresh kicked off — otherwise the
+      // ingestor's enqueueWrite would queue behind the rebuild's
+      // batches anyway, but holding the await here makes the order
+      // explicit + lets us bail cleanly if rebuild errors.
+      await recallLifecycle.waitForRebuild();
+      // Ingest goes through the lifecycle's mutex via
+      // lifecycle.ingestIncremental — never call ingestor directly
+      // from runtime code, that would bypass the single-writer
+      // invariant.
+      await recallLifecycle.ingestIncremental(baseEventLog);
     } catch {
-      // Ingestor errors are non-fatal — the manual `recall reingest`
-      // CLI verb + lifecycle stale-check rebuilds remain available.
+      // Errors are non-fatal — the manual `recall reingest` CLI
+      // verb + lifecycle stale-check rebuilds remain available.
     }
   })();
   const server = createCompanionHttpServer({

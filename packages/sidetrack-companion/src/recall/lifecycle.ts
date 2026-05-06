@@ -102,6 +102,18 @@ export interface RecallLifecycle {
   readonly appendCaptureTurns: (
     turns: readonly CaptureTurnInput[],
   ) => Promise<{ readonly indexed: number }>;
+  // Mutex-serialised incremental ingest. Walks the merged event
+  // log and projects unprocessed capture.recorded /
+  // recall.tombstone.target events into the V3 index. Holding the
+  // single-writer mutex for the whole run prevents a concurrent
+  // rebuild or appendEntry from corrupting the index file.
+  readonly ingestIncremental: (
+    eventLog: import('../sync/eventLog.js').EventLog,
+  ) => Promise<{
+    readonly indexedChunks: number;
+    readonly tombstonedChunks: number;
+    readonly tombstonedEntries: number;
+  }>;
 }
 
 export interface CreateRecallLifecycleOptions {
@@ -360,6 +372,21 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
   ): Promise<{ readonly removed: number }> =>
     enqueueWrite(async () => await gcEntriesRaw(indexPath(), validIds));
 
+  const ingestIncremental = (
+    eventLog: import('../sync/eventLog.js').EventLog,
+  ): Promise<{
+    readonly indexedChunks: number;
+    readonly tombstonedChunks: number;
+    readonly tombstonedEntries: number;
+  }> =>
+    enqueueWrite(async () => {
+      // Lazy import keeps the lifecycle module's dependency graph
+      // narrow — the ingestor pulls in the chunker + manifest paths
+      // which are heavy.
+      const { ingestIncremental: ingest } = await import('./ingestor.js');
+      return await ingest(opts.vaultRoot, eventLog);
+    });
+
   const tombstoneByThread = (
     threadId: string,
   ): Promise<{ readonly tombstoned: number }> =>
@@ -436,5 +463,6 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
     gcEntries,
     tombstoneByThread,
     appendCaptureTurns,
+    ingestIncremental,
   };
 };
