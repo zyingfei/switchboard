@@ -1351,6 +1351,52 @@ describe('companion HTTP server', () => {
     ).resolves.toContain('Sidetrack');
   });
 
+  it('carries lastResearchMode forward when a partial upsert omits it', async () => {
+    const now = '2026-05-06T17:04:43.000Z';
+    // First write stamps deep-research.
+    await jsonFetch(context, `${baseUrl}/v1/threads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({
+        bac_id: 'bac_thread_carry',
+        provider: 'chatgpt',
+        threadUrl: 'https://chatgpt.com/c/carry',
+        title: 'Carry test',
+        lastSeenAt: now,
+        status: 'active',
+        trackingMode: 'auto',
+        lastResearchMode: 'deep-research',
+      }),
+    });
+    // Second write is a state-only upsert — title rename, no
+    // lastResearchMode. Without the writer-side carry-forward the
+    // field would be silently dropped.
+    const partial = await jsonFetch(context, `${baseUrl}/v1/threads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({
+        bac_id: 'bac_thread_carry',
+        provider: 'chatgpt',
+        threadUrl: 'https://chatgpt.com/c/carry',
+        title: 'Carry test (renamed)',
+        lastSeenAt: '2026-05-06T17:10:00.000Z',
+        status: 'active',
+        trackingMode: 'auto',
+      }),
+    });
+    expect(partial.status).toBe(200);
+    const threadJson = JSON.parse(
+      await readFile(join(vaultPath, '_BAC', 'threads', 'bac_thread_carry.json'), 'utf8'),
+    ) as { readonly title?: string; readonly lastResearchMode?: string };
+    expect(threadJson.title).toBe('Carry test (renamed)');
+    expect(threadJson.lastResearchMode).toBe('deep-research');
+    const md = await readFile(
+      join(vaultPath, '_BAC', 'threads', 'bac_thread_carry.md'),
+      'utf8',
+    );
+    expect(md).toContain('lastResearchMode: deep-research');
+  });
+
   it('persists lastResearchMode on the thread record and renders it in the md sidecar', async () => {
     const now = '2026-05-06T17:04:43.000Z';
     const result = await jsonFetch(context, `${baseUrl}/v1/threads`, {

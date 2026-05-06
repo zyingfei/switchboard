@@ -739,6 +739,23 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
         typeof existingThread?.['primaryWorkstreamId'] === 'string'
           ? existingThread['primaryWorkstreamId']
           : undefined;
+      // Carry forward the previous `lastResearchMode` when the input
+      // omits it. Partial upserts (move-thread, tracking toggle, tab
+      // closed → restorable) only set the fields they care about; if
+      // we wrote `{...input}` straight to disk we'd silently strip
+      // the deep-research chip every time the user did anything other
+      // than re-capture. The extension carries the field across local
+      // upserts the same way (state.ts:upsertLocalThread).
+      const previousResearchMode =
+        existingThread?.['lastResearchMode'] === 'deep-research' ||
+        existingThread?.['lastResearchMode'] === 'gemini-deep-research' ||
+        existingThread?.['lastResearchMode'] === 'unknown'
+          ? (existingThread['lastResearchMode'] as
+              | 'deep-research'
+              | 'gemini-deep-research'
+              | 'unknown')
+          : undefined;
+      const carriedResearchMode = input.lastResearchMode ?? previousResearchMode;
       const thread = {
         ...input,
         bac_id,
@@ -746,6 +763,7 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
         updatedAt: timestamp,
         tags: input.tags ?? [],
         status: input.status ?? 'tracked',
+        ...(carriedResearchMode === undefined ? {} : { lastResearchMode: carriedResearchMode }),
       };
       const promotedForFirstTime =
         existingThread !== undefined &&
