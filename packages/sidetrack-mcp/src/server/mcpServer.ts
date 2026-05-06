@@ -12,6 +12,7 @@ import type {
   TurnsReadResult,
 } from '../vault/liveVaultReader.js';
 import { searchIndex } from '../vault/searchIndex.js';
+import { registerDispatchTools } from './dispatchTools.js';
 
 export type RequestDispatchTargetProvider = 'chatgpt' | 'claude' | 'gemini';
 export type RequestDispatchMode = 'paste' | 'auto-send';
@@ -259,6 +260,12 @@ export const createSidetrackMcpServer = (
     name: 'sidetrack-mcp',
     version: '0.0.0',
   });
+
+  // Typed dispatch tool surface — registered first so it shows ahead
+  // of the legacy bac.* equivalents in tools/list. The legacy entries
+  // remain registered through this commit for compatibility; later
+  // sub-commits in Phase 1 delete bac.request_dispatch.
+  registerDispatchTools(server, reader, companionClient);
 
   server.registerTool(
     'bac.recent_threads',

@@ -1,8 +1,18 @@
-// Renamed from m1ReadToolNames now that write tools (move_item,
-// queue_item) live in the same set. Order matches the
-// server.registerTool() calls in mcpServer.ts so that a `tools/list`
-// response matches this list verbatim — the stdio test asserts on it.
+// Order matches the server.registerTool() calls in mcpServer.ts so
+// that a `tools/list` response matches this list verbatim — the
+// stdio test asserts on it.
+//
+// Sub-commits within the spec-alignment refactor land in passes:
+//   1.1 (this commit)  — sidetrack.dispatch.{create,await_capture} added
+//                        ahead of the legacy `bac.*` entries.
+//   1.2 / 1.3          — sidetrack.session.attach + sidetrack.annotations.create_batch.
+//   1.4                — mass rename of the remaining `bac.*` to
+//                        `sidetrack.*` and deletion of the now-superseded
+//                        request_dispatch / coding_session_register /
+//                        create_annotation entries.
 export const sidetrackToolNames = [
+  'sidetrack.dispatch.create',
+  'sidetrack.dispatch.await_capture',
   'bac.recent_threads',
   'bac.workstream',
   'bac.context_pack',

@@ -327,6 +327,111 @@ describe('bac.request_dispatch', () => {
   });
 });
 
+describe('sidetrack.dispatch.create', () => {
+  it('mirrors bac.request_dispatch behavior under the typed name', async () => {
+    const writeClient = buildFakeWriteClient();
+    const reader: SidetrackMcpReader = {
+      ...fakeReader,
+      readCodingSessions: () => Promise.resolve([attachedSession()]),
+    };
+    const client = await startInProcessServer(writeClient, reader);
+    try {
+      const result = await client.callTool({
+        name: 'sidetrack.dispatch.create',
+        arguments: {
+          codingSessionId: 'bac_session_attached',
+          targetProvider: 'chatgpt',
+          title: 'Ask ChatGPT',
+          body: 'Please review this context.',
+        },
+      });
+      expect(writeClient.requestDispatch).toHaveBeenCalledWith({
+        codingSessionId: 'bac_session_attached',
+        targetProvider: 'chatgpt',
+        title: 'Ask ChatGPT',
+        body: 'Please review this context.',
+        mode: 'auto-send',
+        workstreamId: 'bac_ws_attached',
+      });
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({
+        dispatchId: 'bac_dispatch_fake',
+        approval: 'auto-approved',
+        status: 'recorded',
+        targetProvider: 'chatgpt',
+        mode: 'auto-send',
+        workstreamId: 'bac_ws_attached',
+      });
+      // Resource URI surfaced for Phase-5 consumers; today it's just a
+      // stable string the agent can store and re-read after Phase 3
+      // fills in the link.
+      expect(structured['statusResource']).toBe('sidetrack://dispatch/bac_dispatch_fake');
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('rejects calls for sessions that are not attached', async () => {
+    const writeClient = buildFakeWriteClient();
+    const client = await startInProcessServer(writeClient);
+    try {
+      const result = await client.callTool({
+        name: 'sidetrack.dispatch.create',
+        arguments: {
+          codingSessionId: 'bac_session_missing',
+          targetProvider: 'chatgpt',
+          title: 'Ask ChatGPT',
+          body: 'Please review this context.',
+        },
+      });
+      expect(result.isError).toBe(true);
+      expect(errorText(result)).toMatch(/requires an attached coding session/);
+      expect(writeClient.requestDispatch).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('reports unavailable when no companion client is wired', async () => {
+    const client = await startInProcessServer();
+    try {
+      const result = await client.callTool({
+        name: 'sidetrack.dispatch.create',
+        arguments: {
+          codingSessionId: 'bac_session_attached',
+          targetProvider: 'chatgpt',
+          title: 'Ask ChatGPT',
+          body: 'Please review this context.',
+        },
+      });
+      expect(result.isError).toBe(true);
+      expect(errorText(result)).toMatch(/sidetrack\.dispatch\.create is unavailable/);
+    } finally {
+      await client.close();
+    }
+  });
+});
+
+describe('sidetrack.dispatch.await_capture', () => {
+  it('returns the Phase-1 stub sentinel until server-side correlation lands in Phase 3', async () => {
+    const client = await startInProcessServer();
+    try {
+      const result = await client.callTool({
+        name: 'sidetrack.dispatch.await_capture',
+        arguments: { dispatchId: 'bac_dispatch_pending' },
+      });
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toEqual({
+        dispatchId: 'bac_dispatch_pending',
+        matched: false,
+        reason: 'unsupported-in-phase-1',
+      });
+    } finally {
+      await client.close();
+    }
+  });
+});
+
 describe('bac.create_annotation', () => {
   it('reports unavailable when no companion client is wired', async () => {
     const client = await startInProcessServer();
