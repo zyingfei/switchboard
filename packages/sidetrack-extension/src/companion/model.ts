@@ -187,7 +187,10 @@ export interface ChecklistItem {
 export interface WorkstreamUpdate {
   readonly revision: string;
   readonly title?: string;
-  readonly parentId?: string;
+  // string = re-parent under that workstream's bac_id.
+  // null   = detach to top-level (clear the previous parent).
+  // undefined = leave parent unchanged (default partial-update behavior).
+  readonly parentId?: string | null;
   readonly privacy?: 'private' | 'shared' | 'public';
   readonly screenShareSensitive?: boolean;
   readonly tags?: readonly string[];

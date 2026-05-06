@@ -851,20 +851,38 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
         typeof existing['parentId'] === 'string' ? existing['parentId'] : undefined;
       const revision = createRevision();
       const timestamp = new Date().toISOString();
-      const updated = {
+      // Three branches for parentId:
+      //   null      → detach (drop parentId from record).
+      //   string    → re-parent under that workstream.
+      //   undefined → leave parent unchanged.
+      // Spread `...input` would persist a literal `parentId: null` on
+      // disk; strip it out and re-set explicitly so the JSON stays
+      // clean.
+      const wantsDetach = input.parentId === null;
+      const wantsReparent = typeof input.parentId === 'string';
+      const { parentId: _omitParentId, ...inputWithoutParent } = input;
+      const updated: Record<string, unknown> = {
         ...existing,
-        ...input,
+        ...inputWithoutParent,
         bac_id: workstreamId,
         revision,
         updatedAt: timestamp,
       };
+      if (wantsDetach) {
+        delete updated['parentId'];
+      } else if (wantsReparent) {
+        updated['parentId'] = input.parentId;
+      }
 
       await writeJson(path, updated);
       await writeMarkdownProjection(
         join(bacRoot, 'workstreams', `${workstreamId}.md`),
         renderWorkstreamMarkdown(updated as unknown as WorkstreamProjectionInput),
       );
-      if (input.parentId !== undefined && input.parentId !== previousParentId) {
+      const parentChanged =
+        (wantsDetach && previousParentId !== undefined) ||
+        (wantsReparent && input.parentId !== previousParentId);
+      if (parentChanged) {
         if (previousParentId !== undefined) {
           const previousParentPath = join(bacRoot, 'workstreams', `${previousParentId}.json`);
           const previousParent = await readJsonRecord(previousParentPath);
@@ -883,21 +901,23 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
             renderWorkstreamMarkdown(updatedPrev),
           );
         }
-        const nextParentId = input.parentId;
-        const nextParentPath = join(bacRoot, 'workstreams', `${nextParentId}.json`);
-        const nextParent = await readJsonRecord(nextParentPath);
-        const updatedNext = {
-          ...nextParent,
-          bac_id: nextParentId,
-          children: [...new Set([...readStringArray(nextParent['children']), workstreamId])],
-          revision: createRevision(),
-          updatedAt: timestamp,
-        };
-        await writeJson(nextParentPath, updatedNext);
-        await writeMarkdownProjection(
-          join(bacRoot, 'workstreams', `${nextParentId}.md`),
-          renderWorkstreamMarkdown(updatedNext),
-        );
+        if (wantsReparent) {
+          const nextParentId = input.parentId as string;
+          const nextParentPath = join(bacRoot, 'workstreams', `${nextParentId}.json`);
+          const nextParent = await readJsonRecord(nextParentPath);
+          const updatedNext = {
+            ...nextParent,
+            bac_id: nextParentId,
+            children: [...new Set([...readStringArray(nextParent['children']), workstreamId])],
+            revision: createRevision(),
+            updatedAt: timestamp,
+          };
+          await writeJson(nextParentPath, updatedNext);
+          await writeMarkdownProjection(
+            join(bacRoot, 'workstreams', `${nextParentId}.md`),
+            renderWorkstreamMarkdown(updatedNext),
+          );
+        }
       }
       await audit({
         requestId,

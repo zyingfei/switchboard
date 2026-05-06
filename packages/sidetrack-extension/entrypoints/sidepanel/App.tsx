@@ -5197,7 +5197,47 @@ const App = () => {
 
       {workstreamDetailOpen ? (
         <WorkstreamDetailPanel
-          workstreamLabel={currentWsLabel}
+          workstreamLabel={currentWs?.title ?? currentWsLabel}
+          {...(currentWs === null
+            ? {}
+            : {
+                workstream: {
+                  bac_id: currentWs.bac_id,
+                  title: currentWs.title,
+                  ...(currentWs.parentId === undefined ? {} : { parentId: currentWs.parentId }),
+                },
+                workstreams: state.workstreams.map((w) => ({
+                  bac_id: w.bac_id,
+                  title: w.title,
+                  ...(w.parentId === undefined ? {} : { parentId: w.parentId }),
+                })),
+                onRename: (nextTitle: string) => {
+                  void runAction(async () => {
+                    return await sendRequest({
+                      type: messageTypes.updateWorkstream,
+                      workstreamId: currentWs.bac_id,
+                      update: { revision: currentWs.revision, title: nextTitle },
+                    });
+                  });
+                },
+                onMove: (parentId: string | null) => {
+                  void runAction(async () => {
+                    return await sendRequest({
+                      type: messageTypes.updateWorkstream,
+                      workstreamId: currentWs.bac_id,
+                      update: {
+                        revision: currentWs.revision,
+                        // null sentinel = detach to top-level. The
+                        // companion writer treats null as "remove
+                        // parentId from the record + drop self from
+                        // the previous parent's children". When
+                        // parentId is a string, normal re-parent.
+                        parentId: parentId ?? null,
+                      },
+                    });
+                  });
+                },
+              })}
           linkedNotes={workstreamDetailLinkedNotes}
           trustEntries={workstreamDetailTrust}
           onClose={() => {

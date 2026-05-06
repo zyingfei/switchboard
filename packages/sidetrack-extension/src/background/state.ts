@@ -614,13 +614,40 @@ export const updateLocalWorkstream = async (
   const current = await readWorkstreams();
   const timestamp = new Date().toISOString();
   let updated: WorkstreamNode | undefined;
+  const previousParentId = current.find((c) => c.bac_id === workstreamId)?.parentId;
+  // null sentinel = detach to top-level. undefined = leave parent
+  // unchanged (default partial-update behavior). String = re-parent.
+  const wantsDetach = update.parentId === null;
+  const wantsReparent = typeof update.parentId === 'string';
+  const nextParentId: string | undefined = wantsDetach
+    ? undefined
+    : wantsReparent
+      ? update.parentId ?? undefined
+      : previousParentId;
   const next = current.map((candidate) => {
     if (candidate.bac_id !== workstreamId) {
+      // When this workstream is detaching or re-parenting we also have
+      // to drop its id from the OLD parent's children array AND add it
+      // to the NEW parent's. The companion writer already does this on
+      // its side; mirror locally so the side panel doesn't show stale
+      // tree state until the next read.
+      const isPreviousParent =
+        previousParentId !== undefined && candidate.bac_id === previousParentId;
+      const isNewParent = wantsReparent && candidate.bac_id === update.parentId;
+      if ((wantsDetach || wantsReparent) && (isPreviousParent || isNewParent)) {
+        const dropped = isPreviousParent
+          ? candidate.children.filter((id) => id !== workstreamId)
+          : candidate.children;
+        const added =
+          isNewParent && !dropped.includes(workstreamId) ? [...dropped, workstreamId] : dropped;
+        return { ...candidate, children: added, updatedAt: timestamp };
+      }
       return candidate;
     }
+    const { parentId: _omitParentId, ...rest } = update;
     updated = {
       ...candidate,
-      ...update,
+      ...rest,
       bac_id: candidate.bac_id,
       revision: result?.revision ?? update.revision,
       children: update.children ?? candidate.children,
@@ -629,6 +656,7 @@ export const updateLocalWorkstream = async (
       privacy: update.privacy ?? candidate.privacy,
       screenShareSensitive: update.screenShareSensitive ?? candidate.screenShareSensitive,
       updatedAt: timestamp,
+      ...(nextParentId === undefined ? { parentId: undefined } : { parentId: nextParentId }),
     };
     return updated;
   });

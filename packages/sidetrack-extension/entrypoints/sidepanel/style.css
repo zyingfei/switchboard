@@ -6661,6 +6661,91 @@ pre.diff {
   margin-bottom: 8px;
 }
 
+/* Workstream-detail header — make the title click-to-edit. The
+   button looks identical to the static .detail-head .title until
+   hovered, where a faint pencil hint nudges in from the right.
+   When the user clicks, App.tsx swaps the button for an input. */
+.ws-detail-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: inherit;
+  min-height: 0;
+}
+.ws-detail-title:disabled {
+  cursor: default;
+}
+.ws-detail-rename-hint {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-3);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.ws-detail-title.editable:hover .ws-detail-rename-hint,
+.ws-detail-title.editable:focus-visible .ws-detail-rename-hint {
+  opacity: 0.85;
+}
+.ws-detail-rename-input {
+  font-family: var(--display);
+  font-size: 16px;
+  font-weight: 500;
+  letter-spacing: -0.005em;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: var(--rad-s);
+  padding: 4px 8px;
+  color: var(--ink);
+  min-width: 0;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.ws-detail-rename-input:focus {
+  outline: none;
+  border-color: var(--ink-3);
+}
+
+/* Hierarchy section — current parent line + Move-to action. Mirrors
+   the .inbound-actions row pattern (label + .btn-link) so the action
+   reads as a peer of the surrounding detail-sec controls rather than
+   a primary call-to-action. */
+.ws-detail-hierarchy {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.ws-detail-hierarchy-label {
+  font-size: 13px;
+  color: var(--ink);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ws-detail-move-head {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  padding: 10px 12px 6px;
+  border-bottom: 1px solid var(--rule-soft);
+}
+.ws-detail-move-head .mono {
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--ink);
+}
+.ws-detail-move-empty {
+  padding: 14px 12px;
+  font-size: 12px;
+}
+
 /* Thread-row action overflow menu — collapses Queue/Review/Move/Stop/
    Archive behind a ⋯ button, leaving the open + send icons visible.
    The .thread-actions rule above already sets position: absolute, so

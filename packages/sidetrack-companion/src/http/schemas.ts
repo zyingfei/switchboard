@@ -176,7 +176,12 @@ export const workstreamCreateSchema = z.object({
 export const workstreamUpdateSchema = z.object({
   revision: z.string().min(1),
   title: z.string().min(1).optional(),
-  parentId: bacIdSchema.optional(),
+  // string = re-parent under that bac_id.
+  // null   = detach to top-level (writer drops the parentId field
+  //          from the record and removes self from the previous
+  //          parent's children).
+  // omitted = leave parent unchanged.
+  parentId: bacIdSchema.nullable().optional(),
   privacy: z.enum(['private', 'shared', 'public']).optional(),
   screenShareSensitive: z.boolean().optional(),
   tags: z.array(z.string()).optional(),

@@ -1351,6 +1351,84 @@ describe('companion HTTP server', () => {
     ).resolves.toContain('Sidetrack');
   });
 
+  it('renames a workstream and reparents to a new group, then detaches back to top-level', async () => {
+    // Build a tiny tree:
+    //   parentA (top-level)
+    //   parentB (top-level)
+    //   child   (under parentA initially)
+    const make = async (title: string, parentId?: string) => {
+      const r = await jsonFetch(context, `${baseUrl}/v1/workstreams`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+        body: JSON.stringify({ title, ...(parentId === undefined ? {} : { parentId }) }),
+      });
+      return (r.body as { readonly data: { readonly bac_id: string; readonly revision: string } })
+        .data;
+    };
+    const parentA = await make('Parent A');
+    const parentB = await make('Parent B');
+    const child = await make('Child', parentA.bac_id);
+
+    const readJson = async (id: string) =>
+      JSON.parse(
+        await readFile(join(vaultPath, '_BAC', 'workstreams', `${id}.json`), 'utf8'),
+      ) as {
+        readonly title?: string;
+        readonly parentId?: string;
+        readonly children?: readonly string[];
+      };
+
+    // Rename: title only.
+    const renameResult = await jsonFetch(
+      context,
+      `${baseUrl}/v1/workstreams/${child.bac_id}`,
+      {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+        body: JSON.stringify({ revision: child.revision, title: 'Child renamed' }),
+      },
+    );
+    expect(renameResult.status).toBe(200);
+    let nextRev = (renameResult.body as { readonly data: { readonly revision: string } }).data
+      .revision;
+    expect((await readJson(child.bac_id)).title).toBe('Child renamed');
+
+    // Re-parent: parentA → parentB. Old parent loses the child id;
+    // new parent gains it.
+    const reparentResult = await jsonFetch(
+      context,
+      `${baseUrl}/v1/workstreams/${child.bac_id}`,
+      {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+        body: JSON.stringify({ revision: nextRev, parentId: parentB.bac_id }),
+      },
+    );
+    expect(reparentResult.status).toBe(200);
+    nextRev = (reparentResult.body as { readonly data: { readonly revision: string } }).data
+      .revision;
+    expect((await readJson(child.bac_id)).parentId).toBe(parentB.bac_id);
+    expect((await readJson(parentA.bac_id)).children ?? []).not.toContain(child.bac_id);
+    expect((await readJson(parentB.bac_id)).children ?? []).toContain(child.bac_id);
+
+    // Detach: parentId=null → drop parent, drop self from previous
+    // parent's children. Title is preserved.
+    const detachResult = await jsonFetch(
+      context,
+      `${baseUrl}/v1/workstreams/${child.bac_id}`,
+      {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+        body: JSON.stringify({ revision: nextRev, parentId: null }),
+      },
+    );
+    expect(detachResult.status).toBe(200);
+    const detached = await readJson(child.bac_id);
+    expect(detached.parentId).toBeUndefined();
+    expect(detached.title).toBe('Child renamed');
+    expect((await readJson(parentB.bac_id)).children ?? []).not.toContain(child.bac_id);
+  });
+
   it('carries lastResearchMode forward when a partial upsert omits it', async () => {
     const now = '2026-05-06T17:04:43.000Z';
     // First write stamps deep-research.
