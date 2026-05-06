@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { buildAnchorFromTerm } from '../annotation/anchorBuilder.js';
 import { isBridgeKeyAccepted, rotateBridgeKey } from '../auth/bridgeKey.js';
 import {
+  defaultAllowedTools,
   isAllowed,
   readTrust,
   writeTrust,
@@ -101,6 +102,7 @@ import {
   CodingAttachTokenInvalidError,
   CodingSessionNotFoundError,
   SettingsRevisionConflictError,
+  WorkstreamHasChildrenError,
   createVaultWriter,
   type VaultWriter,
 } from '../vault/writer.js';
@@ -2490,7 +2492,12 @@ const routes: readonly RouteDefinition[] = [
         {
           data: {
             workstreamId: match.workstreamId,
-            allowedTools: record === undefined ? [] : [...record.allowedTools],
+            // Fresh workstreams (no explicit record on disk) default
+            // to allowing every write tool — matches isAllowed's
+            // allow-by-default semantic so the side panel renders
+            // all toggles ON before the user has touched the section.
+            allowedTools:
+              record === undefined ? [...defaultAllowedTools()] : [...record.allowedTools],
           },
         },
       ];
@@ -2589,6 +2596,41 @@ const routes: readonly RouteDefinition[] = [
         }
       }
       return [200, mutationResponse(result, requestId)];
+    },
+  },
+  {
+    method: 'DELETE',
+    pattern: /^\/v1\/workstreams\/(?<workstreamId>[A-Za-z0-9_-]+)$/,
+    authRequired: true,
+    handle: async (_request, requestId, match, context) => {
+      if (match.workstreamId === undefined) {
+        throw new Error('Missing workstreamId path parameter.');
+      }
+      try {
+        const result = await context.vaultWriter.deleteWorkstream(
+          match.workstreamId,
+          requestId,
+        );
+        return [
+          200,
+          {
+            data: {
+              bac_id: result.bac_id,
+              detachedThreadIds: result.detachedThreadIds,
+            },
+            requestId,
+          },
+        ];
+      } catch (error) {
+        if (error instanceof WorkstreamHasChildrenError) {
+          throw new HttpRouteError(
+            409,
+            'WORKSTREAM_HAS_CHILDREN',
+            `Cannot delete — ${String(error.childCount)} child workstream(s) remain. Detach or delete children first.`,
+          );
+        }
+        throw error;
+      }
     },
   },
   {

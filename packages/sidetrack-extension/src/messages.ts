@@ -32,6 +32,7 @@ export const messageTypes = {
   captureCurrentTab: 'sidetrack.capture.current-tab',
   createWorkstream: 'sidetrack.workstream.create',
   updateWorkstream: 'sidetrack.workstream.update',
+  deleteWorkstream: 'sidetrack.workstream.delete',
   bulkUpdateWorkstreamPrivacy: 'sidetrack.workstream.privacy.bulkUpdate',
   moveThread: 'sidetrack.thread.move',
   updateThreadTracking: 'sidetrack.thread.tracking.update',
@@ -240,6 +241,10 @@ export type WorkboardRequest =
       readonly type: typeof messageTypes.updateWorkstream;
       readonly workstreamId: string;
       readonly update: WorkstreamUpdate;
+    }
+  | {
+      readonly type: typeof messageTypes.deleteWorkstream;
+      readonly workstreamId: string;
     }
   | {
       readonly type: typeof messageTypes.bulkUpdateWorkstreamPrivacy;
@@ -541,6 +546,10 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
 
   if (hasType(value, messageTypes.updateWorkstream)) {
     return typeof value.workstreamId === 'string' && isRecord(value.update);
+  }
+
+  if (hasType(value, messageTypes.deleteWorkstream)) {
+    return typeof value.workstreamId === 'string';
   }
 
   if (hasType(value, messageTypes.bulkUpdateWorkstreamPrivacy)) {

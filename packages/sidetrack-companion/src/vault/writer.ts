@@ -73,6 +73,27 @@ export class CodingSessionNotFoundError extends Error {
   }
 }
 
+// A workstream cannot be deleted while it still has child workstreams
+// — promoting / detaching the children is a deliberate user action,
+// not a side effect of deletion. The HTTP layer maps this to 409
+// CONFLICT so the side panel can show the child count and offer an
+// inline "detach all then retry" affordance.
+export class WorkstreamHasChildrenError extends Error {
+  readonly childCount: number;
+  constructor(childCount: number) {
+    super(`Cannot delete workstream — it still has ${String(childCount)} child workstream(s).`);
+    this.name = 'WorkstreamHasChildrenError';
+    this.childCount = childCount;
+  }
+}
+
+export class WorkstreamNotFoundError extends Error {
+  constructor() {
+    super('Workstream not found.');
+    this.name = 'WorkstreamNotFoundError';
+  }
+}
+
 export interface AuditEvent {
   readonly requestId: string;
   readonly route: string;
@@ -122,6 +143,13 @@ export interface VaultWriter {
     input: WorkstreamUpdateInput,
     requestId: string,
   ) => Promise<MutationResult>;
+  readonly deleteWorkstream: (
+    workstreamId: string,
+    requestId: string,
+  ) => Promise<{
+    readonly bac_id: string;
+    readonly detachedThreadIds: readonly string[];
+  }>;
   readonly createQueueItem: (input: QueueCreateInput, requestId: string) => Promise<MutationResult>;
   readonly createReminder: (
     input: ReminderCreateInput,
@@ -739,6 +767,23 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
         typeof existingThread?.['primaryWorkstreamId'] === 'string'
           ? existingThread['primaryWorkstreamId']
           : undefined;
+      // Carry forward the previous `lastResearchMode` when the input
+      // omits it. Partial upserts (move-thread, tracking toggle, tab
+      // closed → restorable) only set the fields they care about; if
+      // we wrote `{...input}` straight to disk we'd silently strip
+      // the deep-research chip every time the user did anything other
+      // than re-capture. The extension carries the field across local
+      // upserts the same way (state.ts:upsertLocalThread).
+      const previousResearchMode =
+        existingThread?.['lastResearchMode'] === 'deep-research' ||
+        existingThread?.['lastResearchMode'] === 'gemini-deep-research' ||
+        existingThread?.['lastResearchMode'] === 'unknown'
+          ? (existingThread['lastResearchMode'] as
+              | 'deep-research'
+              | 'gemini-deep-research'
+              | 'unknown')
+          : undefined;
+      const carriedResearchMode = input.lastResearchMode ?? previousResearchMode;
       const thread = {
         ...input,
         bac_id,
@@ -746,6 +791,7 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
         updatedAt: timestamp,
         tags: input.tags ?? [],
         status: input.status ?? 'tracked',
+        ...(carriedResearchMode === undefined ? {} : { lastResearchMode: carriedResearchMode }),
       };
       const promotedForFirstTime =
         existingThread !== undefined &&
@@ -833,20 +879,38 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
         typeof existing['parentId'] === 'string' ? existing['parentId'] : undefined;
       const revision = createRevision();
       const timestamp = new Date().toISOString();
-      const updated = {
+      // Three branches for parentId:
+      //   null      → detach (drop parentId from record).
+      //   string    → re-parent under that workstream.
+      //   undefined → leave parent unchanged.
+      // Spread `...input` would persist a literal `parentId: null` on
+      // disk; strip it out and re-set explicitly so the JSON stays
+      // clean.
+      const wantsDetach = input.parentId === null;
+      const wantsReparent = typeof input.parentId === 'string';
+      const { parentId: _omitParentId, ...inputWithoutParent } = input;
+      const updated: Record<string, unknown> = {
         ...existing,
-        ...input,
+        ...inputWithoutParent,
         bac_id: workstreamId,
         revision,
         updatedAt: timestamp,
       };
+      if (wantsDetach) {
+        delete updated['parentId'];
+      } else if (wantsReparent) {
+        updated['parentId'] = input.parentId;
+      }
 
       await writeJson(path, updated);
       await writeMarkdownProjection(
         join(bacRoot, 'workstreams', `${workstreamId}.md`),
         renderWorkstreamMarkdown(updated as unknown as WorkstreamProjectionInput),
       );
-      if (input.parentId !== undefined && input.parentId !== previousParentId) {
+      const parentChanged =
+        (wantsDetach && previousParentId !== undefined) ||
+        (wantsReparent && input.parentId !== previousParentId);
+      if (parentChanged) {
         if (previousParentId !== undefined) {
           const previousParentPath = join(bacRoot, 'workstreams', `${previousParentId}.json`);
           const previousParent = await readJsonRecord(previousParentPath);
@@ -865,21 +929,23 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
             renderWorkstreamMarkdown(updatedPrev),
           );
         }
-        const nextParentId = input.parentId;
-        const nextParentPath = join(bacRoot, 'workstreams', `${nextParentId}.json`);
-        const nextParent = await readJsonRecord(nextParentPath);
-        const updatedNext = {
-          ...nextParent,
-          bac_id: nextParentId,
-          children: [...new Set([...readStringArray(nextParent['children']), workstreamId])],
-          revision: createRevision(),
-          updatedAt: timestamp,
-        };
-        await writeJson(nextParentPath, updatedNext);
-        await writeMarkdownProjection(
-          join(bacRoot, 'workstreams', `${nextParentId}.md`),
-          renderWorkstreamMarkdown(updatedNext),
-        );
+        if (wantsReparent) {
+          const nextParentId = input.parentId as string;
+          const nextParentPath = join(bacRoot, 'workstreams', `${nextParentId}.json`);
+          const nextParent = await readJsonRecord(nextParentPath);
+          const updatedNext = {
+            ...nextParent,
+            bac_id: nextParentId,
+            children: [...new Set([...readStringArray(nextParent['children']), workstreamId])],
+            revision: createRevision(),
+            updatedAt: timestamp,
+          };
+          await writeJson(nextParentPath, updatedNext);
+          await writeMarkdownProjection(
+            join(bacRoot, 'workstreams', `${nextParentId}.md`),
+            renderWorkstreamMarkdown(updatedNext),
+          );
+        }
       }
       await audit({
         requestId,
@@ -889,6 +955,127 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
         timestamp,
       });
       return { bac_id: workstreamId, revision };
+    },
+
+    async deleteWorkstream(workstreamId, requestId) {
+      await ensureVaultPresent();
+      const path = join(bacRoot, 'workstreams', `${workstreamId}.json`);
+      let existing: Record<string, unknown>;
+      try {
+        existing = await readJsonRecord(path);
+      } catch (error) {
+        if (isMissingPathError(error)) {
+          // Idempotent DELETE — if the record is already gone, the
+          // caller's "delete this group" intent is satisfied. The
+          // original strict 404 was unfriendly when the side panel
+          // had a workstream in chrome.storage that never made it
+          // to disk (e.g., created during a brief companion outage).
+          await audit({
+            requestId,
+            route: 'deleteWorkstream',
+            outcome: 'success',
+            bac_id: workstreamId,
+            timestamp: new Date().toISOString(),
+          });
+          return { bac_id: workstreamId, detachedThreadIds: [] };
+        }
+        throw error;
+      }
+      // Refuse if there are still child workstreams. Asking the user
+      // to detach them first keeps the cascade explicit instead of
+      // silently re-parenting (or worse, deleting) child trees.
+      const children = readStringArray(existing['children']);
+      if (children.length > 0) {
+        await audit({
+          requestId,
+          route: 'deleteWorkstream',
+          outcome: 'failure',
+          bac_id: workstreamId,
+          timestamp: new Date().toISOString(),
+        });
+        throw new WorkstreamHasChildrenError(children.length);
+      }
+      const previousParentId =
+        typeof existing['parentId'] === 'string' ? existing['parentId'] : undefined;
+      const timestamp = new Date().toISOString();
+
+      // Detach every thread that points at this workstream — they
+      // land back in Inbox (primaryWorkstreamId undefined) instead of
+      // becoming orphans pointing at a missing record.
+      const threadsRoot = join(bacRoot, 'threads');
+      const detachedThreadIds: string[] = [];
+      try {
+        const threadFiles = await readdir(threadsRoot);
+        for (const file of threadFiles) {
+          if (!file.endsWith('.json')) continue;
+          const threadPath = join(threadsRoot, file);
+          const thread = await readJsonRecord(threadPath);
+          if (thread['primaryWorkstreamId'] !== workstreamId) continue;
+          const threadBacId = typeof thread['bac_id'] === 'string' ? thread['bac_id'] : null;
+          if (threadBacId === null) continue;
+          const { primaryWorkstreamId: _drop, ...rest } = thread;
+          const detached = {
+            ...rest,
+            bac_id: threadBacId,
+            revision: createRevision(),
+            updatedAt: timestamp,
+          };
+          await writeJson(threadPath, detached);
+          const threadMd = join(threadsRoot, `${threadBacId}.md`);
+          if (!(await readMarkdownLockSentinel(threadMd))) {
+            await writeMarkdownProjection(
+              threadMd,
+              renderThreadMarkdown(detached as ThreadProjectionInput),
+            );
+          }
+          detachedThreadIds.push(threadBacId);
+        }
+      } catch (error) {
+        if (!isMissingPathError(error)) throw error;
+      }
+
+      // Remove self from the parent's children array.
+      if (previousParentId !== undefined) {
+        const parentPath = join(bacRoot, 'workstreams', `${previousParentId}.json`);
+        try {
+          const parent = await readJsonRecord(parentPath);
+          const updatedParent = {
+            ...parent,
+            bac_id: previousParentId,
+            children: readStringArray(parent['children']).filter((id) => id !== workstreamId),
+            revision: createRevision(),
+            updatedAt: timestamp,
+          };
+          await writeJson(parentPath, updatedParent);
+          await writeMarkdownProjection(
+            join(bacRoot, 'workstreams', `${previousParentId}.md`),
+            renderWorkstreamMarkdown(updatedParent),
+          );
+        } catch (error) {
+          if (!isMissingPathError(error)) throw error;
+        }
+      }
+
+      // Tear down the workstream's own JSON + md.
+      try {
+        await unlink(path);
+      } catch (error) {
+        if (!isMissingPathError(error)) throw error;
+      }
+      try {
+        await unlink(join(bacRoot, 'workstreams', `${workstreamId}.md`));
+      } catch (error) {
+        if (!isMissingPathError(error)) throw error;
+      }
+
+      await audit({
+        requestId,
+        route: 'deleteWorkstream',
+        outcome: 'success',
+        bac_id: workstreamId,
+        timestamp,
+      });
+      return { bac_id: workstreamId, detachedThreadIds };
     },
 
     async createQueueItem(input, requestId) {

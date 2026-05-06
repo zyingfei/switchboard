@@ -24,6 +24,9 @@ export interface CompanionClient {
     workstreamId: string,
     update: WorkstreamUpdate,
   ) => Promise<MutationResult>;
+  readonly deleteWorkstream: (
+    workstreamId: string,
+  ) => Promise<{ readonly bac_id: string; readonly detachedThreadIds: readonly string[] }>;
   readonly createQueueItem: (item: QueueCreate, idempotencyKey: string) => Promise<MutationResult>;
   readonly createReminder: (reminder: ReminderCreate) => Promise<MutationResult>;
   readonly updateReminder: (
@@ -162,6 +165,29 @@ export class HttpCompanionClient implements CompanionClient {
         body: JSON.stringify(update),
       }),
     );
+  }
+
+  async deleteWorkstream(
+    workstreamId: string,
+  ): Promise<{ readonly bac_id: string; readonly detachedThreadIds: readonly string[] }> {
+    const raw = await this.request(`/workstreams/${encodeURIComponent(workstreamId)}`, {
+      method: 'DELETE',
+    });
+    const body = raw as {
+      readonly data?: {
+        readonly bac_id?: unknown;
+        readonly detachedThreadIds?: unknown;
+      };
+    };
+    const bacId = body.data?.bac_id;
+    const detached = body.data?.detachedThreadIds;
+    if (typeof bacId !== 'string' || !Array.isArray(detached)) {
+      throw new Error('Companion delete-workstream response was malformed.');
+    }
+    return {
+      bac_id: bacId,
+      detachedThreadIds: detached.filter((id): id is string => typeof id === 'string'),
+    };
   }
 
   async createQueueItem(item: QueueCreate, idempotencyKey: string): Promise<MutationResult> {

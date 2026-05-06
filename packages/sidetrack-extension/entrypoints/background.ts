@@ -89,6 +89,7 @@ import {
   updateLocalQueueItem,
   updateLocalReminder,
   updateLocalWorkstream,
+  deleteLocalWorkstream,
   upsertLocalThread,
   writeCachedCodingSessions,
   readDispatchOriginals,
@@ -346,6 +347,16 @@ const sendToCompanion = async (
       .reverse()
       .find((turn) => turn.role === 'assistant' && turn.modelName !== undefined)?.modelName ??
     event.selectedModel;
+  // Most recent assistant turn that flagged a research surface
+  // (Deep Research on ChatGPT, Gemini Deep Research). The enricher
+  // attaches `researchReport.mode` per-turn; here we hoist it to
+  // the thread record so list views + the md sidecar can show
+  // "Deep Research" without re-walking captured turns.
+  const lastResearchMode = event.turns
+    .slice()
+    .reverse()
+    .find((turn) => turn.role === 'assistant' && turn.researchReport !== undefined)
+    ?.researchReport?.mode;
   // Reuse the existing thread's bac_id — the event-result bac_id
   // is the per-event record id, NOT a thread id. Sending it as
   // thread.bac_id was forcing the companion's upsertThread to
@@ -365,6 +376,7 @@ const sendToCompanion = async (
     ...parentLink,
     ...(lastTurnRole === undefined ? {} : { lastTurnRole }),
     ...(lastTurnModel === undefined ? {} : { selectedModel: lastTurnModel }),
+    ...(lastResearchMode === undefined ? {} : { lastResearchMode }),
   };
   const threadResult = await client.upsertThread(thread);
   // Index EVERY turn of the capture event, not just the last. The
@@ -477,6 +489,11 @@ const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
     existing?.trackingMode ??
     (event.provider === 'unknown' || !settings.autoTrack ? 'manual' : 'auto');
   const lastTurnRole = event.turns.at(-1)?.role;
+  const lastResearchMode = event.turns
+    .slice()
+    .reverse()
+    .find((turn) => turn.role === 'assistant' && turn.researchReport !== undefined)
+    ?.researchReport?.mode;
   const upserted = await upsertLocalThread({
     provider: event.provider,
     threadId: event.threadId,
@@ -490,6 +507,7 @@ const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
     ...parentLink,
     ...(lastTurnRole === undefined ? {} : { lastTurnRole }),
     ...(event.selectedModel === undefined ? {} : { selectedModel: event.selectedModel }),
+    ...(lastResearchMode === undefined ? {} : { lastResearchMode }),
   });
   // Auto-resolve queued follow-ups whose text appears in the captured user
   // turns — same logic as sendToCompanion but for the local-only path.
@@ -1450,6 +1468,21 @@ const updateWorkstream = async (workstreamId: string, update: WorkstreamUpdate):
   }
 };
 
+const deleteWorkstream = async (workstreamId: string): Promise<void> => {
+  // Companion-first: it owns the cascade decision (refuse on
+  // children, detach threads on disk). Mirror locally on success or
+  // on companion absence so the side panel reflects the state
+  // immediately.
+  if (!(await isCompanionConfigured())) {
+    await deleteLocalWorkstream(workstreamId);
+    return;
+  }
+  const settings = await readSettings();
+  const client = createCompanionClient(settings.companion);
+  await client.deleteWorkstream(workstreamId);
+  await deleteLocalWorkstream(workstreamId);
+};
+
 const bulkUpdateWorkstreamPrivacy = async (
   from: WorkstreamUpdate['privacy'],
   to: WorkstreamUpdate['privacy'],
@@ -1754,6 +1787,13 @@ const handleRequest = async (
   if (request.type === messageTypes.updateWorkstream) {
     return await withCompanionStatus(
       () => updateWorkstream(request.workstreamId, request.update),
+      'workstream',
+    );
+  }
+
+  if (request.type === messageTypes.deleteWorkstream) {
+    return await withCompanionStatus(
+      () => deleteWorkstream(request.workstreamId),
       'workstream',
     );
   }

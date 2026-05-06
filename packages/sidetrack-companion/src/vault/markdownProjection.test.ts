@@ -133,6 +133,20 @@ describe('renderThreadMarkdown', () => {
     expect(md).not.toContain('url:');
     expect(md).not.toContain('status:');
     expect(md).not.toContain('workstream:');
+    expect(md).not.toContain('lastResearchMode:');
+  });
+
+  it('renders lastResearchMode in the frontmatter when set', () => {
+    const md = renderThreadMarkdown({
+      bac_id: 'bac_t',
+      revision: 'rev',
+      provider: 'chatgpt',
+      threadUrl: 'https://chatgpt.com/c/abc',
+      title: 'Switchboard',
+      status: 'active',
+      lastResearchMode: 'deep-research',
+    });
+    expect(md).toContain('lastResearchMode: deep-research');
   });
 });
 
