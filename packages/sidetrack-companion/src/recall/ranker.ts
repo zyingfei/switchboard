@@ -1,3 +1,23 @@
+// Recall V3 chunk metadata. Stored as a length-prefixed UTF-8 JSON
+// blob per entry on disk so the ranker + query response can return
+// rich per-chunk context (heading breadcrumb, source thread,
+// snippet) without re-reading the source event log.
+export interface ChunkMetadata {
+  readonly sourceBacId: string;
+  readonly provider?: string;
+  readonly threadUrl?: string;
+  readonly title?: string;
+  readonly role?: 'user' | 'assistant' | 'system' | 'unknown';
+  readonly turnOrdinal: number;
+  readonly modelName?: string;
+  readonly headingPath: readonly string[];
+  readonly paragraphIndex: number;
+  readonly charStart: number;
+  readonly charEnd: number;
+  readonly textHash: string;
+  readonly text: string;
+}
+
 export interface IndexEntry {
   readonly id: string;
   readonly threadId: string;
@@ -22,6 +42,11 @@ export interface IndexEntry {
   readonly replicaId?: string;
   readonly lamport?: number;
   readonly tombstoned?: boolean;
+  // Recall V3: per-chunk metadata. Optional on the type so legacy
+  // callers / V2 fixtures keep compiling; the V3 writer always
+  // persists a populated ChunkMetadata so query results can carry
+  // headingPath, title, etc. without an extra event-log read.
+  readonly metadata?: ChunkMetadata;
 }
 
 export interface RankedItem {
