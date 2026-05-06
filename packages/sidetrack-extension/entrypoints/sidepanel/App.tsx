@@ -614,7 +614,12 @@ const App = () => {
     readonly url: string;
     readonly port: number;
     readonly authKey: string;
-    readonly health?: { readonly reachable: boolean; readonly checkedAt: string };
+    readonly health?: {
+      readonly reachable: boolean;
+      readonly authAccepted: boolean;
+      readonly status: 'ok' | 'auth_failed' | 'unreachable';
+      readonly checkedAt: string;
+    };
   } | null>(null);
   const [vaultRoot, setVaultRoot] = useState<string | null>(null);
 
@@ -797,6 +802,8 @@ const App = () => {
               readonly authKey?: unknown;
               readonly health?: {
                 readonly reachable?: unknown;
+                readonly authAccepted?: unknown;
+                readonly status?: unknown;
                 readonly checkedAt?: unknown;
               };
             };
@@ -816,12 +823,30 @@ const App = () => {
           typeof mcp.authKey === 'string'
         ) {
           const healthRaw = mcp.health;
-          const health =
+          let health:
+            | {
+                readonly reachable: boolean;
+                readonly authAccepted: boolean;
+                readonly status: 'ok' | 'auth_failed' | 'unreachable';
+                readonly checkedAt: string;
+              }
+            | undefined;
+          if (
             healthRaw !== undefined &&
             typeof healthRaw.reachable === 'boolean' &&
+            typeof healthRaw.authAccepted === 'boolean' &&
+            (healthRaw.status === 'ok' ||
+              healthRaw.status === 'auth_failed' ||
+              healthRaw.status === 'unreachable') &&
             typeof healthRaw.checkedAt === 'string'
-              ? { reachable: healthRaw.reachable, checkedAt: healthRaw.checkedAt }
-              : undefined;
+          ) {
+            health = {
+              reachable: healthRaw.reachable,
+              authAccepted: healthRaw.authAccepted,
+              status: healthRaw.status,
+              checkedAt: healthRaw.checkedAt,
+            };
+          }
           setMcpInfo({
             url: mcp.url,
             port: mcp.port,

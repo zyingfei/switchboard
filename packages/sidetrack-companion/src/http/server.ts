@@ -691,13 +691,26 @@ const routes: readonly RouteDefinition[] = [
     pattern: /^\/v1\/status$/,
     authRequired: true,
     handle: async (_request, requestId, _match, context) => {
-      // P1-review: when the companion manages an MCP child, also
-      // probe its /mcp endpoint so the side panel knows whether
-      // restart/config changes succeeded. Probe is a TCP-cheap
-      // HEAD/OPTIONS-style fetch with a 1s timeout — slow enough
+      // When the companion manages an MCP child, probe its /mcp
+      // endpoint so the side panel knows whether restart/config
+      // changes succeeded. Distinguishes three states the user
+      // cares about:
+      //   reachable=false                    — process not listening
+      //   reachable=true, authAccepted=false — listening but our
+      //                                        auth key is stale
+      //   reachable=true, authAccepted=true  — fully healthy
+      // Probe is a TCP-cheap GET with a 1s timeout — slow enough
       // to detect a wedged process, fast enough to not stall
       // /v1/status during normal polling.
-      let mcpHealth: { reachable: boolean; checkedAt: string; detail?: string } | undefined;
+      let mcpHealth:
+        | {
+            reachable: boolean;
+            authAccepted: boolean;
+            status: 'ok' | 'auth_failed' | 'unreachable';
+            checkedAt: string;
+            detail?: string;
+          }
+        | undefined;
       if (context.mcp !== undefined) {
         const checkedAt = new Date().toISOString();
         const controller = new AbortController();
@@ -713,13 +726,34 @@ const routes: readonly RouteDefinition[] = [
               signal: controller.signal,
             },
           );
-          // 401/405 still means a process is listening + answering
-          // HTTP. Anything that completes the round-trip counts as
-          // reachable; only network/timeout errors mark unreachable.
-          mcpHealth = { reachable: true, checkedAt, detail: `http ${String(probe.status)}` };
+          // 401 means a process is listening but doesn't accept
+          // our key — surface as auth_failed so the side panel
+          // can prompt the user to regenerate or re-paste.
+          // Anything else that completed the round-trip counts as
+          // ok; the MCP server returns 400 or 405 for the bare
+          // GET, which still proves auth was accepted.
+          if (probe.status === 401 || probe.status === 403) {
+            mcpHealth = {
+              reachable: true,
+              authAccepted: false,
+              status: 'auth_failed',
+              checkedAt,
+              detail: `http ${String(probe.status)}`,
+            };
+          } else {
+            mcpHealth = {
+              reachable: true,
+              authAccepted: true,
+              status: 'ok',
+              checkedAt,
+              detail: `http ${String(probe.status)}`,
+            };
+          }
         } catch (error) {
           mcpHealth = {
             reachable: false,
+            authAccepted: false,
+            status: 'unreachable',
             checkedAt,
             detail: error instanceof Error ? error.message : String(error),
           };

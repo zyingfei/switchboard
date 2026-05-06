@@ -12,10 +12,15 @@ export interface CodingAttachProps {
   readonly companionAvailable: boolean;
   readonly mcpEndpoint?: string;
   readonly mcpAuthBearer?: string;
-  // Probed status of the companion-managed MCP child. When the
-  // child is unreachable, the modal warns the user before they
-  // try to generate a token.
-  readonly mcpHealth?: { readonly reachable: boolean; readonly checkedAt: string };
+  // Probed status of the companion-managed MCP child. The modal
+  // warns the user before they try to generate a token when the
+  // child is unreachable OR listening with the wrong auth key.
+  readonly mcpHealth?: {
+    readonly reachable: boolean;
+    readonly authAccepted: boolean;
+    readonly status: 'ok' | 'auth_failed' | 'unreachable';
+    readonly checkedAt: string;
+  };
   // Inputs for the Codex MCP config snippets in the "Configure
   // agent" section. All optional — when missing, the modal renders
   // placeholders the user can fill in.
@@ -74,23 +79,25 @@ const buildCodexHttpConfigSnippet = (mcpEndpoint: string): string =>
     'enabled = true',
   ].join('\n');
 
+// stdio form: TOML doesn't expand ${ENV} inside `args`, so route
+// the call through `sh -lc` and let the shell expand
+// $SIDETRACK_BRIDGE_KEY at process spawn time. Keeps the secret
+// out of the TOML file on disk.
 const buildCodexStdioConfigSnippet = (
   vaultRoot: string | undefined,
   companionPort: number,
-): string =>
-  [
+): string => {
+  const vaultPath = vaultRoot ?? '<ABS-VAULT-PATH>';
+  const cmd = `node <ABS-PATH>/sidetrack-mcp/dist/cli.js --vault "${vaultPath}" --companion-url "http://127.0.0.1:${String(companionPort)}" --bridge-key "$SIDETRACK_BRIDGE_KEY"`;
+  return [
     '[mcp_servers.sidetrack]',
-    'command = "node"',
-    'args = [',
-    '  "<ABS-PATH>/sidetrack-mcp/dist/cli.js",',
-    `  "--vault", "${vaultRoot ?? '<ABS-VAULT-PATH>'}",`,
-    `  "--companion-url", "http://127.0.0.1:${String(companionPort)}",`,
-    '  "--bridge-key", "${SIDETRACK_BRIDGE_KEY}"',
-    ']',
+    'command = "sh"',
+    `args = ["-lc", "${cmd.replace(/"/g, '\\"')}"]`,
     'startup_timeout_sec = 20',
     'tool_timeout_sec = 180',
     'enabled = true',
   ].join('\n');
+};
 
 const buildCodexCliCommand = (
   vaultRoot: string | undefined,
@@ -238,10 +245,30 @@ export function CodingAttach({
   const httpSnippet = buildCodexHttpConfigSnippet(mcpEndpoint);
   const stdioSnippet = buildCodexStdioConfigSnippet(vaultRoot, companionPort);
   const cliCommand = buildCodexCliCommand(vaultRoot, companionPort);
-  const exportEnvHint =
-    mcpAuthBearer === undefined
-      ? '# Set SIDETRACK_BRIDGE_KEY in your shell first.'
-      : `# In your shell:\nexport SIDETRACK_BRIDGE_KEY=${bridgeKey ?? '<bridge-key>'}\nexport SIDETRACK_MCP_AUTH_KEY=${mcpAuthBearer}`;
+  // Long-lived secrets (bridge key, MCP auth key) stay masked by
+  // default to reduce screenshot/screen-share leakage. The reveal
+  // toggle gates the actual values; the copy button reaches the
+  // real value either way.
+  const [revealSecrets, setRevealSecrets] = useState(false);
+  const buildExportEnvBlock = (mask: boolean): string => {
+    if (mcpAuthBearer === undefined && (bridgeKey === undefined || bridgeKey.length === 0)) {
+      return '# Set SIDETRACK_BRIDGE_KEY (and SIDETRACK_MCP_AUTH_KEY for HTTP) in your shell first.';
+    }
+    const display = (raw: string | undefined): string => {
+      if (raw === undefined || raw.length === 0) return '<not set>';
+      if (mask) return raw.length <= 8 ? '••••••••' : `${raw.slice(0, 4)}…${raw.slice(-2)}`;
+      return raw;
+    };
+    return [
+      '# In your shell:',
+      `export SIDETRACK_BRIDGE_KEY=${display(bridgeKey)}`,
+      ...(mcpAuthBearer === undefined
+        ? []
+        : [`export SIDETRACK_MCP_AUTH_KEY=${display(mcpAuthBearer)}`]),
+    ].join('\n');
+  };
+  const exportEnvHintDisplay = buildExportEnvBlock(!revealSecrets);
+  const exportEnvHintCopy = buildExportEnvBlock(false);
 
   return (
     <Modal
@@ -283,11 +310,20 @@ export function CodingAttach({
         </div>
       ) : null}
 
-      {mcpHealth !== undefined && !mcpHealth.reachable ? (
+      {mcpHealth !== undefined && mcpHealth.status === 'unreachable' ? (
         <div className="banner warning">
           Companion-managed MCP server is not responding (last checked{' '}
           {new Date(mcpHealth.checkedAt).toLocaleTimeString()}). Restart the companion with{' '}
           <code>--mcp-port</code> or run sidetrack-mcp by hand.
+        </div>
+      ) : null}
+      {mcpHealth !== undefined && mcpHealth.status === 'auth_failed' ? (
+        <div className="banner warning">
+          MCP server is listening but is rejecting our auth key (last checked{' '}
+          {new Date(mcpHealth.checkedAt).toLocaleTimeString()}). The persisted{' '}
+          <code>SIDETRACK_MCP_AUTH_KEY</code> in <code>_BAC/.config/mcp-auth.key</code>{' '}
+          and the value the side panel reads from <code>/v1/status</code> have drifted.
+          Restart the companion to regenerate.
         </div>
       ) : null}
 
@@ -299,7 +335,32 @@ export function CodingAttach({
             child (this side panel reads its auth key from <code>/v1/status</code>). Stdio is
             the fallback when you start <code>sidetrack-mcp</code> by hand.
           </p>
-          <pre className="mono coding-handoff-prompt">{exportEnvHint}</pre>
+          <div className="coding-handoff-snippet">
+            <div className="coding-handoff-snippet-head mono">
+              <span>Shell env exports {revealSecrets ? '(revealed)' : '(masked)'}</span>
+              <div style={{ display: 'flex', gap: 4 }}>
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  onClick={() => {
+                    setRevealSecrets((current) => !current);
+                  }}
+                >
+                  {revealSecrets ? 'Hide' : 'Reveal'}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  onClick={() => {
+                    void copySnippet('env', exportEnvHintCopy);
+                  }}
+                >
+                  {snippetCopied === 'env' ? 'Copied' : 'Copy'}
+                </button>
+              </div>
+            </div>
+            <pre className="mono coding-handoff-prompt">{exportEnvHintDisplay}</pre>
+          </div>
 
           <div className="coding-handoff-snippet">
             <div className="coding-handoff-snippet-head mono">
