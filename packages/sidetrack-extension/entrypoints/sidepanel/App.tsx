@@ -3625,35 +3625,43 @@ const App = () => {
           >
             <span style={{ display: 'inline-flex', width: 14, height: 14 }}>{Icons.search}</span>
           </button>
-          <button
-            className="icon-btn"
-            title="Capture / track the current tab — adds it to your side panel as a tracked thread"
-            onClick={() => {
-              void runAction(() => sendRequest({ type: messageTypes.captureCurrentTab }));
-            }}
-            type="button"
-            aria-label="Capture current tab"
-          >
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.6"
-              strokeLinecap="round"
-              strokeLinejoin="round"
+          {/* Capture-current-tab (+) is only useful when capture mode
+              is Manual. When mode is Auto, Sidetrack refreshes
+              detected threads automatically and the user has nothing
+              to do here, so we hide the button to declutter the
+              toolbar. */}
+          {state.settings.autoTrack ? null : (
+            <button
+              className="icon-btn"
+              title="Capture / track the current tab — adds it to your side panel as a tracked thread"
+              onClick={() => {
+                void runAction(() => sendRequest({ type: messageTypes.captureCurrentTab }));
+              }}
+              type="button"
+              aria-label="Capture current tab"
             >
-              <path d="M12 5v14" />
-              <path d="M5 12h14" />
-            </svg>
-          </button>
-          {/* Capture-mode toggle (global). Single icon-button cycles
-              between auto (↻ — Sidetrack refreshes detected threads on
-              every new turn) and manual (✋ — refreshes only when the
-              user clicks a row's Capture button). The active mode is
-              both the rendered glyph and the title text, so hover
-              tells you what clicking will do. */}
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.6"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M12 5v14" />
+                <path d="M5 12h14" />
+              </svg>
+            </button>
+          )}
+          {/* Capture-mode toggle (global). The icon glyph + a small
+              uppercase mono label show the current mode at a glance:
+              ↻ AUTO  — Sidetrack refreshes detected threads on every
+                        new turn
+              ✋ MANUAL — refreshes only when the user clicks a row's
+                          Capture button
+              Click cycles. Tooltip says what the click will do. */}
           <button
-            className={'icon-btn' + (state.settings.autoTrack ? ' on' : '')}
+            className={'icon-btn icon-btn-labeled' + (state.settings.autoTrack ? ' on' : '')}
             title={
               state.settings.autoTrack
                 ? 'Capture mode: Auto — refreshes every new turn. Click to switch to Manual.'
@@ -3677,6 +3685,9 @@ const App = () => {
           >
             <span style={{ display: 'inline-flex', width: 14, height: 14 }}>
               {state.settings.autoTrack ? Icons.autoCycle : Icons.manualTap}
+            </span>
+            <span className="icon-btn-label mono">
+              {state.settings.autoTrack ? 'auto' : 'manual'}
             </span>
           </button>
           <button
