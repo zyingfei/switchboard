@@ -327,6 +327,113 @@ describe('bac.request_dispatch', () => {
   });
 });
 
+describe('sidetrack.annotations.create_batch', () => {
+  it('reports unavailable when no companion client is wired', async () => {
+    const client = await startInProcessServer();
+    try {
+      const result = await client.callTool({
+        name: 'sidetrack.annotations.create_batch',
+        arguments: {
+          url: 'https://chatgpt.com/c/thread',
+          pageTitle: 'ChatGPT',
+          items: [{ term: 'WebGPU', note: 'GPU API.' }],
+        },
+      });
+      expect(result.isError).toBe(true);
+      expect(errorText(result)).toMatch(/sidetrack\.annotations\.create_batch is unavailable/);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('persists each item in order, surfaces per-item status', async () => {
+    let counter = 0;
+    const writeClient = buildFakeWriteClient({
+      createAnnotation: vi.fn(() => {
+        counter += 1;
+        return Promise.resolve({
+          bac_id: `bac_annotation_${String(counter)}`,
+          url: 'https://chatgpt.com/c/thread',
+          pageTitle: 'HN',
+          note: 'note',
+        });
+      }),
+    });
+    const client = await startInProcessServer(writeClient);
+    try {
+      const result = await client.callTool({
+        name: 'sidetrack.annotations.create_batch',
+        arguments: {
+          url: 'https://chatgpt.com/c/thread',
+          pageTitle: 'HN',
+          items: [
+            {
+              term: 'WebGPU',
+              prefix: 'l than N websites each bundling ',
+              suffix: '/WASM inference stacks, ONNX Run',
+              note: 'WebGPU defines browser GPU compute and rendering.',
+            },
+            {
+              term: 'eBPF',
+              prefix: 'kernel without rebuild — namely ',
+              suffix: ' programs verified before load',
+              note: 'eBPF runs verified bytecode in the kernel.',
+            },
+          ],
+        },
+      });
+      expect(writeClient.createAnnotation).toHaveBeenCalledTimes(2);
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured['countForThread']).toBe(2);
+      const annotations = structured['annotations'] as readonly Record<string, unknown>[];
+      expect(annotations).toHaveLength(2);
+      expect(annotations[0]).toMatchObject({
+        term: 'WebGPU',
+        status: 'created',
+        annotationId: 'bac_annotation_1',
+      });
+      expect(annotations[1]).toMatchObject({
+        term: 'eBPF',
+        status: 'created',
+        annotationId: 'bac_annotation_2',
+      });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('rejects short terms without context per-item, but lets the rest of the batch succeed', async () => {
+    const writeClient = buildFakeWriteClient();
+    const client = await startInProcessServer(writeClient);
+    try {
+      const result = await client.callTool({
+        name: 'sidetrack.annotations.create_batch',
+        arguments: {
+          url: 'https://chatgpt.com/c/thread',
+          pageTitle: 'HN',
+          items: [
+            { term: 'AI', note: 'Too generic without context.' },
+            {
+              term: 'WebGPU',
+              prefix: 'each bundling ',
+              suffix: '/WASM inference',
+              note: 'Defines browser GPU access.',
+            },
+          ],
+        },
+      });
+      expect(writeClient.createAnnotation).toHaveBeenCalledTimes(1);
+      const annotations = (result.structuredContent as Record<string, unknown>)[
+        'annotations'
+      ] as readonly Record<string, unknown>[];
+      expect(annotations[0]).toMatchObject({ term: 'AI', status: 'rejected' });
+      expect(annotations[1]).toMatchObject({ term: 'WebGPU', status: 'created' });
+    } finally {
+      await client.close();
+    }
+  });
+});
+
 describe('sidetrack.session.attach', () => {
   it('reports unavailable when no companion client is wired', async () => {
     const client = await startInProcessServer();

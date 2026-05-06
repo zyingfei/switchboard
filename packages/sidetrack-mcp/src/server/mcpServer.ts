@@ -12,6 +12,7 @@ import type {
   TurnsReadResult,
 } from '../vault/liveVaultReader.js';
 import { searchIndex } from '../vault/searchIndex.js';
+import { registerAnnotationTools } from './annotationTools.js';
 import { registerDispatchTools } from './dispatchTools.js';
 import { registerSessionTools } from './sessionTools.js';
 
@@ -268,6 +269,7 @@ export const createSidetrackMcpServer = (
   // sub-commits in Phase 1 delete bac.request_dispatch.
   registerDispatchTools(server, reader, companionClient);
   registerSessionTools(server, companionClient);
+  registerAnnotationTools(server, companionClient);
 
   server.registerTool(
     'bac.recent_threads',

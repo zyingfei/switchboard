@@ -14,6 +14,7 @@ export const sidetrackToolNames = [
   'sidetrack.dispatch.create',
   'sidetrack.dispatch.await_capture',
   'sidetrack.session.attach',
+  'sidetrack.annotations.create_batch',
   'bac.recent_threads',
   'bac.workstream',
   'bac.context_pack',
