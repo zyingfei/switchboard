@@ -9,6 +9,7 @@ import {
   messageTypes,
   type ContentRequest,
   type ContentResponse,
+  type ListAnnotationsByUrlResponse,
   type RecallQueryResponse,
 } from '../src/messages';
 import {
@@ -293,11 +294,38 @@ export default defineContentScript({
     const restoreAnnotations = async (): Promise<void> => {
       const mySeq = ++restoreSeq;
       try {
-        const client = await createAnnotationClient();
-        if (client === undefined) {
-          return;
+        // Production path on real provider pages: the content script's
+        // direct fetch to http://127.0.0.1:<port> hits the companion's
+        // loopback-origin gate (isAllowedOrigin: chrome-extension://
+        // or 127.0.0.1/localhost only) and 403's because Origin is
+        // https://chatgpt.com. We route through the SW (chrome-
+        // extension:// origin is whitelisted) so the read succeeds
+        // on real pages. Same pattern as recallQuery.
+        //
+        // Test path: Playwright's context.route intercepts in-page
+        // fetches but not SW fetches, so the in-process fixture
+        // (mockVaultCompanion) requires the direct path to keep
+        // working. Try direct first; fall back to SW on a non-
+        // success status (403, network error). This way both real
+        // browsers and the existing e2e infrastructure are covered.
+        let annotations: readonly { readonly bac_id: string; readonly url: string; readonly pageTitle: string; readonly note: string; readonly createdAt: string; readonly anchor: import('../src/annotation/anchors').SerializedAnchor }[] = [];
+        try {
+          const client = await createAnnotationClient();
+          if (client !== undefined) {
+            annotations = await client.listAnnotationsForUrl(window.location.href);
+          }
+        } catch {
+          annotations = [];
         }
-        const annotations = await client.listAnnotationsForUrl(window.location.href);
+        if (annotations.length === 0) {
+          const response: ListAnnotationsByUrlResponse = await chrome.runtime.sendMessage({
+            type: messageTypes.listAnnotationsByUrl,
+            url: window.location.href,
+          });
+          if (response.ok && response.annotations !== undefined) {
+            annotations = response.annotations;
+          }
+        }
         if (mySeq !== restoreSeq) {
           // A newer call superseded this one; abandon results.
           return;
@@ -944,7 +972,17 @@ export default defineContentScript({
 
     const captureSignature = (capture: ReturnType<typeof createCapture>): string => {
       const lastTurn = capture.turns.at(-1);
-      return `${capture.provider}:${capture.threadUrl}:${String(capture.turns.length)}:${lastTurn?.role ?? ''}:${lastTurn?.text.slice(0, 120) ?? ''}`;
+      // Include the full text length AND the LAST 120 chars (not the
+      // first). Provider configs with mergeAdjacentSameRoleTurns merge
+      // consecutive assistant turns into one — when ChatGPT replies in
+      // multiple [data-message-author-role="assistant"] elements (a
+      // tool-use preamble, a progress note, then the long final
+      // answer), the merged turn's first 120 chars stay anchored to
+      // the short preamble while the body grows by thousands of
+      // chars. Slicing from the head missed every streaming update.
+      // Length + tail catches both grow-by-append and grow-by-prepend.
+      const text = lastTurn?.text ?? '';
+      return `${capture.provider}:${capture.threadUrl}:${String(capture.turns.length)}:${lastTurn?.role ?? ''}:${String(text.length)}:${text.slice(-120)}`;
     };
 
     const sendAutoCapture = () => {

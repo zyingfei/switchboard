@@ -38,11 +38,13 @@ import {
   isRuntimeRequest,
   messageTypes,
   type AnnotateTurnResponse,
+  type ListAnnotationsByUrlResponse,
   type PublishAnnotationToChatResponse,
   type RecallQueryResponse,
   type RuntimeRequest,
   type RuntimeResponse,
 } from '../src/messages';
+import { createAnnotationClient } from '../src/annotation/client';
 import type { TrackedThread, WorkboardState } from '../src/workboard';
 import {
   buildWorkboardState,
@@ -1845,6 +1847,30 @@ const handleRequest = async (
     return (await buildAnnotateResponse()) as unknown as RuntimeResponse;
   }
 
+  if (request.type === messageTypes.listAnnotationsByUrl) {
+    // Content scripts on https://chatgpt.com hit the companion's
+    // loopback-only origin gate (403 LOOPBACK_ONLY). The SW's
+    // chrome-extension:// origin is on the allowlist, so we proxy
+    // the read here and return a plain JSON envelope. Tunneled
+    // through RuntimeResponse the same way recallQuery does.
+    const buildListResponse = async (): Promise<ListAnnotationsByUrlResponse> => {
+      try {
+        const client = await createAnnotationClient();
+        if (client === undefined) {
+          return { ok: false, error: 'Companion not configured.' };
+        }
+        const annotations = await client.listAnnotationsForUrl(request.url);
+        return { ok: true, annotations };
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : 'listAnnotationsByUrl failed.',
+        };
+      }
+    };
+    return (await buildListResponse()) as unknown as RuntimeResponse;
+  }
+
   if (request.type === messageTypes.publishAnnotationToChat) {
     // Side-panel publish action for a turn annotation. This deliberately
     // reuses the existing provider auto-send driver instead of adding
@@ -2251,19 +2277,18 @@ export default defineBackground(() => {
   // reminders accumulated against orphans). Idempotent — runs on
   // every service-worker boot, no-op when storage is already clean.
   const DISPATCH_POLL_ALARM = 'sidetrack.dispatch.poll';
-  // 5-minute cadence is intentional: the alarm only matters when the
-  // user has the side panel closed AND an MCP-auto-approved dispatch
-  // is sitting unconsumed. Faster polling produces zero benefit (the
-  // open-tab budget is 1 per tick) and triples the cost of any
-  // misconfiguration (e.g. a stuck dispatch retrying every minute
-  // sent four extra prompts to the user's ChatGPT account before we
-  // realised the auto-link was matching the wrong thread).
-  // Idempotent: chrome.alarms.create with the same name replaces any
-  // existing alarm of that name. Safe to call from onInstalled,
-  // onStartup, and on every SW boot.
+  // 1-minute cadence: Chrome's MV3 minimum. Latency from
+  // bac.request_dispatch to the chat tab opening is bounded by this
+  // alarm in the worst case (no side panel open, no incoming
+  // workboard request). Earlier this was 5 min in an effort to be
+  // conservative — but the 30s cooldown gate, single-flight mutex,
+  // and MAX_PER_TICK=1 already cap the blast radius of a
+  // misconfigured retry loop. Slow polling didn't reduce risk; it
+  // just made the autonomous flow feel broken. Idempotent: same
+  // alarm name replaces any existing.
   const ensureDispatchPollAlarm = async (): Promise<void> => {
     try {
-      await chrome.alarms.create(DISPATCH_POLL_ALARM, { periodInMinutes: 5 });
+      await chrome.alarms.create(DISPATCH_POLL_ALARM, { periodInMinutes: 1 });
     } catch (error) {
       console.warn('[dispatch.poll] alarm create failed:', error);
     }

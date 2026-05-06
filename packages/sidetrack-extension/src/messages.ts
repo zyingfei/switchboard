@@ -127,6 +127,16 @@ export const messageTypes = {
   // canonical threadUrl, focuses it for user-visible behavior, then
   // relays to the existing content-script autoSendItem driver.
   publishAnnotationToChat: 'sidetrack.annotation.publishToChat',
+  // Content scripts on https://chatgpt.com (or other provider hosts)
+  // can't fetch the local companion directly — the companion's
+  // loopback-origin gate (isAllowedOrigin in http/server.ts) returns
+  // 403 LOOPBACK_ONLY for non-extension, non-localhost origins. Same
+  // constraint as recallQuery. The SW (origin chrome-extension://) is
+  // on the allowlist, so the content script proxies annotation reads
+  // through here. Fixes silent-failure restoreAnnotations on real
+  // provider pages — the previous direct fetch always 403'd, so no
+  // annotations ever rehydrated for users in the wild.
+  listAnnotationsByUrl: 'sidetrack.annotation.listByUrl',
 } as const;
 
 export interface SelectorCanaryReport {
@@ -423,6 +433,10 @@ export type WorkboardRequest =
       readonly anchorText?: string;
       readonly note: string;
       readonly capturedAt: string;
+    }
+  | {
+      readonly type: typeof messageTypes.listAnnotationsByUrl;
+      readonly url: string;
     };
 
 export type RuntimeRequest =
@@ -728,6 +742,10 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
     );
   }
 
+  if (hasType(value, messageTypes.listAnnotationsByUrl)) {
+    return typeof value.url === 'string';
+  }
+
   return false;
 };
 
@@ -747,6 +765,19 @@ export interface AnnotateTurnResponse {
 export interface PublishAnnotationToChatResponse {
   readonly ok: boolean;
   readonly error?: string;
+}
+
+export interface ListAnnotationsByUrlResponse {
+  readonly ok: boolean;
+  readonly error?: string;
+  readonly annotations?: readonly {
+    readonly bac_id: string;
+    readonly url: string;
+    readonly pageTitle: string;
+    readonly note: string;
+    readonly createdAt: string;
+    readonly anchor: SerializedAnchor;
+  }[];
 }
 
 export const isRuntimeResponse = (value: unknown): value is RuntimeResponse => {

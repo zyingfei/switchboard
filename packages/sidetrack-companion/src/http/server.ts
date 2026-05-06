@@ -236,10 +236,21 @@ const runIdempotent = async (
   route: string,
   key: string,
   operation: () => Promise<readonly [number, unknown]>,
+  // Optional validator for the cached response body. When the
+  // underlying record the cache refers to no longer exists in the
+  // vault (e.g. the operator purged a dispatch JSONL line), the
+  // 24h-TTL'd idempotency entry would otherwise serve a dead
+  // reference forever — the agent's retry would receive a record-id
+  // that no other read endpoint can find. validateReplay returns
+  // false in that case so we fall through to the fresh-create path
+  // and overwrite the cache with a new, valid response.
+  validateReplay?: (cached: unknown) => Promise<boolean>,
 ): Promise<readonly [number, unknown]> => {
   const replay = await context.idempotencyStore?.read(route, key);
   if (replay !== undefined) {
-    return [replay.status, replay.body];
+    if (validateReplay === undefined || (await validateReplay(replay.body))) {
+      return [replay.status, replay.body];
+    }
   }
 
   const [status, body] = await operation();
@@ -831,38 +842,62 @@ const routes: readonly RouteDefinition[] = [
     authRequired: true,
     handle: async (request, requestId, _match, context) => {
       const idempotencyKey = requireIdempotencyKey(request);
-      return await runIdempotent(context, 'recordDispatch', idempotencyKey, async () => {
-        const input = dispatchEventSchema.parse(await readBody(request));
-        const writer = await writerForBucket(context, {
-          provider: input.target.provider,
-          ...(input.workstreamId === undefined ? {} : { workstreamId: input.workstreamId }),
-        });
-        const redaction = redact(input.body);
-        const tokenEstimate = estimateTokens(redaction.output);
-        const result = await writer.writeDispatchEvent(
-          {
-            ...input,
-            bac_id: input.bac_id ?? createDispatchId(),
-            body: redaction.output,
-            createdAt: input.createdAt ?? new Date().toISOString(),
-            redactionSummary: {
-              matched: redaction.matched,
-              categories: [...redaction.categories],
+      return await runIdempotent(
+        context,
+        'recordDispatch',
+        idempotencyKey,
+        async () => {
+          const input = dispatchEventSchema.parse(await readBody(request));
+          const writer = await writerForBucket(context, {
+            provider: input.target.provider,
+            ...(input.workstreamId === undefined ? {} : { workstreamId: input.workstreamId }),
+          });
+          const redaction = redact(input.body);
+          const tokenEstimate = estimateTokens(redaction.output);
+          const result = await writer.writeDispatchEvent(
+            {
+              ...input,
+              bac_id: input.bac_id ?? createDispatchId(),
+              body: redaction.output,
+              createdAt: input.createdAt ?? new Date().toISOString(),
+              redactionSummary: {
+                matched: redaction.matched,
+                categories: [...redaction.categories],
+              },
+              tokenEstimate,
             },
-            tokenEstimate,
-          },
-          requestId,
-        );
-        return [
-          201,
-          {
-            data: result,
-            ...(tokenEstimate > tokenBudgetWarningThreshold
-              ? { warnings: ['token-budget-exceeded'] }
-              : {}),
-          },
-        ];
-      });
+            requestId,
+          );
+          return [
+            201,
+            {
+              data: result,
+              ...(tokenEstimate > tokenBudgetWarningThreshold
+                ? { warnings: ['token-budget-exceeded'] }
+                : {}),
+            },
+          ];
+        },
+        async (cached) => {
+          // Self-heal dead idempotent references: the 24h cache TTL
+          // outlives the underlying JSONL record when an operator
+          // purges, prunes, or retention-rotates it. If the cached
+          // dispatch's bac_id is no longer in the vault, the agent
+          // should get a fresh dispatch (and the cache overwrite
+          // updates the entry to the new id).
+          const cachedRecord = cached as { readonly data?: { readonly bac_id?: unknown } };
+          const bacId = cachedRecord.data?.bac_id;
+          if (typeof bacId !== 'string' || bacId.length === 0) {
+            return false;
+          }
+          // readDispatchEvents reads the most-recent 100 days of
+          // dispatch JSONL files, which is more than the 24h cache
+          // TTL covers. If the dispatch is anywhere in that window,
+          // the cached response is still valid.
+          const events = await context.vaultWriter.readDispatchEvents({ limit: 1000 });
+          return events.some((event) => event.bac_id === bacId);
+        },
+      );
     },
   },
   {

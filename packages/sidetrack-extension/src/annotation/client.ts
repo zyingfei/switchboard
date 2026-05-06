@@ -53,7 +53,17 @@ const readCompanionSettingsFromBackground = async (): Promise<CompanionSettings 
 };
 
 const readCompanionSettings = async (): Promise<CompanionSettings | undefined> => {
-  const result = await chrome.storage.local.get({ [SETTINGS_KEY]: undefined });
+  // chrome.storage.local.get({ key: undefined }) is a Chrome API
+  // footgun: when the default value is `undefined`, the key is
+  // dropped from the returned record entirely — the call returns
+  // {} even when the key exists in storage. The string form
+  // (or array form) doesn't have this issue. Until this fix,
+  // every call to createAnnotationClient from any extension
+  // context silently returned undefined, which is why annotation
+  // restore on real provider pages produced zero highlights and
+  // the listAnnotationsByUrl SW route reported "Companion not
+  // configured" even with valid settings present.
+  const result = await chrome.storage.local.get(SETTINGS_KEY);
   const fromStorage = parseCompanionSettings(result[SETTINGS_KEY]);
   return fromStorage ?? (await readCompanionSettingsFromBackground());
 };
