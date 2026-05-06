@@ -121,16 +121,24 @@ export const getEmbedder = async (): Promise<FeatureExtractor> => {
       // instead. The first one that loads sticks.
       const dtypeCandidates: readonly string[] = ['q8', 'fp16', 'fp32'];
       const errors: string[] = [];
+      // Pin the HF revision at load time so the runtime artifact
+      // matches what the manifest claims. transformers.js accepts
+      // `revision` (sha or branch) and uses it both for download and
+      // the on-disk cache key — without this, `MODEL_ID` would say
+      // "rev=761b…" but the loader would fetch whatever HEAD on the
+      // default branch resolves to.
+      const revision = RECALL_MODEL.revision;
       for (const dtype of dtypeCandidates) {
         try {
           const pipe = (await module.pipeline('feature-extraction', HF_MODEL, {
             device: 'cpu',
             dtype,
+            revision,
           } as Parameters<typeof module.pipeline>[2])) as unknown as FeatureExtractor;
           resolvedDevice = 'cpu';
           resolvedAccelerator = detectAccelerator();
           log(
-            `[recall] loaded embedding model ${MODEL_ID} (cpu/${resolvedAccelerator}/${dtype}) in ${String(Math.round(performance.now() - started))}ms`,
+            `[recall] loaded embedding model ${MODEL_ID} (cpu/${resolvedAccelerator}/${dtype}/rev=${revision.slice(0, 7)}) in ${String(Math.round(performance.now() - started))}ms`,
           );
           return pipe;
         } catch (error) {

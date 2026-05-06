@@ -54,6 +54,13 @@ interface ParsedArgs {
   // bundled relay server (no vault, no companion API).
   readonly relayMode: boolean;
   readonly relayPort?: number;
+  // Recall embedding-model cache controls. Override the default
+  // platform model directory or refuse remote downloads. Both also
+  // accept env (SIDETRACK_MODELS_DIR / SIDETRACK_OFFLINE_MODELS) so
+  // launchd plists can stick the values on the process env without
+  // reissuing the install command.
+  readonly modelsDir?: string;
+  readonly offlineModels?: boolean;
 }
 
 export const renderHelp = (): string =>
@@ -72,6 +79,7 @@ export const renderHelp = (): string =>
     '  sidetrack-companion --vault <path> [--port 17373] [--allow-auto-update]',
     '                      [--mcp-port <port> [--mcp-auth-key <key>]]',
     '                      [--mcp-bin <path>]',
+    '                      [--models-dir <path>] [--offline-models]',
     '                      [--sync-relay <wss://...>]',
     '                      [--sync-relay-local [port]] [--sync-rendezvous-secret <base64url>]',
     '  sidetrack-companion relay [--relay-port 8443]',
@@ -84,6 +92,16 @@ export const renderHelp = (): string =>
     'If --mcp-auth-key is omitted, a persistent key is created under _BAC/.config.',
     'Override the binary path with --mcp-bin if the sibling layout differs',
     '(default: ../sidetrack-mcp/dist/cli.js relative to this CLI).',
+    '',
+    'Recall embedding-model cache:',
+    '  --models-dir <path>      Override the model cache directory (also reads',
+    '                           SIDETRACK_MODELS_DIR). Default: platform-specific',
+    '                           (~/Library/Application Support/Sidetrack/models on macOS,',
+    '                           ~/.local/share/sidetrack/models on Linux,',
+    '                           %LOCALAPPDATA%/Sidetrack/models on Windows).',
+    '  --offline-models         Refuse remote downloads (also reads',
+    '                           SIDETRACK_OFFLINE_MODELS=1). Recall queries 503 with',
+    '                           code RECALL_MODEL_MISSING when the cache is empty.',
     '',
     'Sync relay (optional, end-to-end encrypted):',
     '  --sync-relay <wss://...>          WebSocket URL of a sidetrack relay.',
@@ -139,6 +157,7 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
   let mcpPort: number | undefined;
   let mcpAuthKey: string | undefined;
   let mcpBin: string | undefined;
+  let modelsDir: string | undefined;
   let syncRelay: string | undefined;
   let syncRendezvousSecret: string | undefined;
   let syncRelayLocalPort: number | undefined;
@@ -219,6 +238,16 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
       index += 1;
       continue;
     }
+
+    if (arg === '--models-dir') {
+      const value = argv[index + 1];
+      if (value === undefined || value.length === 0) {
+        throw new Error('--models-dir requires a non-empty path.');
+      }
+      modelsDir = value;
+      index += 1;
+      continue;
+    }
   }
 
   const parsed: ParsedArgs = {
@@ -229,6 +258,7 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
     serviceStatus: argv.includes('--service-status'),
     allowAutoUpdate: argv.includes('--allow-auto-update'),
     relayMode: argv.includes('relay'),
+    offlineModels: argv.includes('--offline-models'),
     port,
     ...(mcpPort === undefined ? {} : { mcpPort }),
     ...(mcpAuthKey === undefined ? {} : { mcpAuthKey }),
@@ -237,6 +267,7 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
     ...(syncRendezvousSecret === undefined ? {} : { syncRendezvousSecret }),
     ...(syncRelayLocalPort === undefined ? {} : { syncRelayLocalPort }),
     ...(relayPort === undefined ? {} : { relayPort }),
+    ...(modelsDir === undefined ? {} : { modelsDir }),
   };
 
   return vaultPath === undefined ? parsed : { ...parsed, vaultPath };
@@ -382,12 +413,15 @@ const runModelsSubcommand = async (
       return 1;
     }
     if (status.verified) {
-      writeLine(streams.stdout, 'verify: ok (checksum match)');
+      writeLine(
+        streams.stdout,
+        'verify: ok (cached refs/<branch> revision matches the manifest sha)',
+      );
       return 0;
     }
     writeLine(
       streams.stdout,
-      'verify: present but unverified — manifest revision is not yet pinned to a sha. Falling back to presence-only check.',
+      'verify: present but no revision marker matched. The cache may have been populated by an older companion version (no refs/main file written) or by a different revision. Run `models ensure` to refetch against the pinned revision.',
     );
     return 0;
   }
@@ -581,6 +615,18 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
   if (args.syncRelay !== undefined && args.syncRelayLocalPort !== undefined) {
     writeLine(streams.stderr, 'Use either --sync-relay or --sync-relay-local, not both.');
     return 2;
+  }
+
+  // Surface --models-dir / --offline-models as process env so the
+  // lazily-instantiated embedder + modelCache pick them up without
+  // a config-passing rewrite. Only set when explicit flags are
+  // present; if they're not we leave any pre-existing env alone so
+  // a launchd-installed plist can still pin the values.
+  if (args.modelsDir !== undefined) {
+    process.env['SIDETRACK_MODELS_DIR'] = args.modelsDir;
+  }
+  if (args.offlineModels) {
+    process.env['SIDETRACK_OFFLINE_MODELS'] = '1';
   }
 
   if (args.installService) {
