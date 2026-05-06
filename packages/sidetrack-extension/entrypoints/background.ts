@@ -522,7 +522,10 @@ const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
   await recordSelectorCanary(event);
 };
 
-const storeCaptureEvent = async (event: CaptureEvent): Promise<void> => {
+const storeCaptureEvent = async (
+  event: CaptureEvent,
+  intent: 'explicit' | 'passive' = 'passive',
+): Promise<void> => {
   if (!(await isCompanionConfigured())) {
     await storeCaptureEventLocal(event);
     return;
@@ -530,7 +533,24 @@ const storeCaptureEvent = async (event: CaptureEvent): Promise<void> => {
   try {
     await sendToCompanion(event);
   } catch {
-    await enqueueCapture(event);
+    // No-data-loss policy: explicit captures get protective queue
+    // handling (drop-passive on overflow, reject when fully
+    // explicit). Passive captures keep drop-oldest semantics.
+    const result = await enqueueCapture(event, undefined, undefined, intent);
+    if (!result.accepted) {
+      // The side panel surfaces this via lastQueueRejection in
+      // workboard state; we still write the event into local
+      // chrome.storage so the UI can show the optimistic span/turn,
+      // but the user gets a clear "queue full — companion offline"
+      // banner.
+      await chrome.storage.local.set({
+        'sidetrack.captureQueue.lastRejection': {
+          reason: result.reason,
+          at: new Date().toISOString(),
+          threadUrl: event.threadUrl,
+        },
+      });
+    }
     await storeCaptureEventLocal(event);
   }
 };
@@ -578,7 +598,10 @@ const captureTab = async (): Promise<void> => {
     tabSnapshot: snapshotFromTab(tab, baseCapture.capturedAt),
   };
 
-  await storeCaptureEvent(event);
+  // Explicit gesture — captureTab is wired to the + Capture button.
+  // Drop-on-overflow becomes reject-on-overflow with a banner in
+  // the side panel.
+  await storeCaptureEvent(event, 'explicit');
 
   // Explicit captureCurrentTab means the user is actively looking at
   // this thread — any pending "Unread reply" reminders for it are

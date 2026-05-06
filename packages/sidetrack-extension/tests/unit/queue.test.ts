@@ -159,4 +159,68 @@ describe('capture queue', () => {
     expect(await readQueue(storage)).toEqual([]);
     expect(await readDroppedCount(storage)).toBe(1);
   });
+
+  describe('intent-tagged overflow', () => {
+    it('passive captures keep drop-oldest semantics (back-compat)', async () => {
+      const storage = createMemoryStorage();
+      await enqueueCapture(event('https://e.test/1'), storage, 2, 'passive');
+      await enqueueCapture(event('https://e.test/2'), storage, 2, 'passive');
+      const r = await enqueueCapture(event('https://e.test/3'), storage, 2, 'passive');
+      expect(r.accepted).toBe(true);
+      expect(r.evicted).toBe(1);
+      const queue = await readQueue(storage);
+      expect(queue.every((q) => q.intent === 'passive')).toBe(true);
+    });
+
+    it('explicit capture evicts the oldest passive item when the queue is full of passives', async () => {
+      const storage = createMemoryStorage();
+      await enqueueCapture(event('https://e.test/p1'), storage, 2, 'passive');
+      await enqueueCapture(event('https://e.test/p2'), storage, 2, 'passive');
+      const r = await enqueueCapture(event('https://e.test/explicit'), storage, 2, 'explicit');
+      expect(r.accepted).toBe(true);
+      expect(r.evicted).toBe(1);
+      const queue = await readQueue(storage);
+      // The newest item is explicit; one passive remains.
+      const explicitCount = queue.filter((q) => q.intent === 'explicit').length;
+      const passiveCount = queue.filter((q) => q.intent === 'passive').length;
+      expect(explicitCount).toBe(1);
+      expect(passiveCount).toBe(1);
+      // The oldest passive (p1) should have been evicted.
+      expect(queue.map((q) => q.event.threadUrl)).not.toContain('https://e.test/p1');
+    });
+
+    it('rejects an explicit capture when the queue is fully explicit', async () => {
+      const storage = createMemoryStorage();
+      await enqueueCapture(event('https://e.test/x1'), storage, 2, 'explicit');
+      await enqueueCapture(event('https://e.test/x2'), storage, 2, 'explicit');
+      const r = await enqueueCapture(event('https://e.test/x3'), storage, 2, 'explicit');
+      expect(r.accepted).toBe(false);
+      expect(r.reason).toBe('queue-full-explicit');
+      const queue = await readQueue(storage);
+      // Original two explicit captures stay intact; the rejected
+      // payload is NOT on the queue.
+      expect(queue.map((q) => q.event.threadUrl)).toEqual([
+        'https://e.test/x1',
+        'https://e.test/x2',
+      ]);
+    });
+
+    it('drainQueue still sends the wire CaptureEvent shape for both intents', async () => {
+      const storage = createMemoryStorage();
+      await enqueueCapture(event('https://e.test/p'), storage, 5, 'passive');
+      await enqueueCapture(event('https://e.test/x'), storage, 5, 'explicit');
+      const sent: string[] = [];
+      const result = await drainQueue(
+        async (e: CaptureEvent) => {
+          sent.push(e.threadUrl);
+        },
+        storage,
+        new Date('2030-01-01T00:00:00.000Z'),
+        () => 0.5,
+        { ignoreBackoff: true },
+      );
+      expect(result.sent).toBe(2);
+      expect(sent.sort()).toEqual(['https://e.test/p', 'https://e.test/x']);
+    });
+  });
 });
