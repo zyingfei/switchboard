@@ -1480,16 +1480,16 @@ describe('companion HTTP server', () => {
       .bac_id;
     const denied = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/bump`, {
       method: 'POST',
-      headers: { 'x-bac-bridge-key': bridgeKey, 'x-sidetrack-mcp-tool': 'bac.bump_workstream' },
+      headers: { 'x-bac-bridge-key': bridgeKey, 'x-sidetrack-mcp-tool': 'sidetrack.workstreams.bump' },
     });
     const putTrust = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/trust`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
-      body: JSON.stringify({ allowedTools: ['bac.bump_workstream'] }),
+      body: JSON.stringify({ allowedTools: ['sidetrack.workstreams.bump'] }),
     });
     const trusted = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/bump`, {
       method: 'POST',
-      headers: { 'x-bac-bridge-key': bridgeKey, 'x-sidetrack-mcp-tool': 'bac.bump_workstream' },
+      headers: { 'x-bac-bridge-key': bridgeKey, 'x-sidetrack-mcp-tool': 'sidetrack.workstreams.bump' },
     });
     const getTrust = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/trust`, {
       headers: { 'x-bac-bridge-key': bridgeKey },
@@ -1500,7 +1500,7 @@ describe('companion HTTP server', () => {
     expect(putTrust.status).toBe(200);
     expect(trusted.status).toBe(200);
     expect(getTrust.body).toMatchObject({
-      data: { workstreamId, allowedTools: ['bac.bump_workstream'] },
+      data: { workstreamId, allowedTools: ['sidetrack.workstreams.bump'] },
     });
   });
 

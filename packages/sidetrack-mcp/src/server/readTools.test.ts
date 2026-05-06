@@ -58,59 +58,25 @@ const errorText = (result: unknown): string => {
 };
 
 describe('companion-backed read tools', () => {
-  it('reports bac.list_dispatches unavailable when no companion read client is wired', async () => {
+  // bac.list_dispatches was deleted in Phase 1.4 — sidetrack.dispatches.list
+  // (vault-reader-backed) is the canonical replacement and has its own
+  // coverage in this file.
+
+  it('reports sidetrack.audit.list unavailable when no companion read client is wired', async () => {
     const client = await startInProcessServer();
     try {
       const result = await client.callTool({
-        name: 'bac.list_dispatches',
+        name: 'sidetrack.audit.list',
         arguments: { limit: 5 },
       });
       expect(result.isError).toBe(true);
-      expect(errorText(result)).toMatch(/bac\.list_dispatches is unavailable/);
+      expect(errorText(result)).toMatch(/sidetrack\.audit\.list is unavailable/);
     } finally {
       await client.close();
     }
   });
 
-  it('passes limit and since through for bac.list_dispatches', async () => {
-    const companionClient = buildFakeCompanionClient({
-      listDispatches: vi.fn(() =>
-        Promise.resolve([{ bac_id: 'disp_1', createdAt: '2026-04-26T22:00:00.000Z' }]),
-      ),
-    });
-    const client = await startInProcessServer(companionClient);
-    try {
-      const result = await client.callTool({
-        name: 'bac.list_dispatches',
-        arguments: { limit: 10, since: '2026-04-26T00:00:00.000Z' },
-      });
-      expect(companionClient.listDispatches).toHaveBeenCalledWith({
-        limit: 10,
-        since: '2026-04-26T00:00:00.000Z',
-      });
-      expect(result.structuredContent).toEqual({
-        data: [{ bac_id: 'disp_1', createdAt: '2026-04-26T22:00:00.000Z' }],
-      });
-    } finally {
-      await client.close();
-    }
-  });
-
-  it('reports bac.list_audit_events unavailable when no companion read client is wired', async () => {
-    const client = await startInProcessServer();
-    try {
-      const result = await client.callTool({
-        name: 'bac.list_audit_events',
-        arguments: { limit: 5 },
-      });
-      expect(result.isError).toBe(true);
-      expect(errorText(result)).toMatch(/bac\.list_audit_events is unavailable/);
-    } finally {
-      await client.close();
-    }
-  });
-
-  it('passes limit and since through for bac.list_audit_events', async () => {
+  it('passes limit and since through for sidetrack.audit.list', async () => {
     const companionClient = buildFakeCompanionClient({
       listAuditEvents: vi.fn(() =>
         Promise.resolve([{ route: 'recordDispatch', timestamp: '2026-04-26T22:00:00.000Z' }]),
@@ -119,7 +85,7 @@ describe('companion-backed read tools', () => {
     const client = await startInProcessServer(companionClient);
     try {
       const result = await client.callTool({
-        name: 'bac.list_audit_events',
+        name: 'sidetrack.audit.list',
         arguments: { limit: 7, since: '2026-04-26T00:00:00.000Z' },
       });
       expect(companionClient.listAuditEvents).toHaveBeenCalledWith({
@@ -134,21 +100,21 @@ describe('companion-backed read tools', () => {
     }
   });
 
-  it('reports bac.list_workstream_notes unavailable when no companion read client is wired', async () => {
+  it('reports sidetrack.workstreams.notes unavailable when no companion read client is wired', async () => {
     const client = await startInProcessServer();
     try {
       const result = await client.callTool({
-        name: 'bac.list_workstream_notes',
+        name: 'sidetrack.workstreams.notes',
         arguments: { workstreamId: 'bac_ws_1' },
       });
       expect(result.isError).toBe(true);
-      expect(errorText(result)).toMatch(/bac\.list_workstream_notes is unavailable/);
+      expect(errorText(result)).toMatch(/sidetrack\.workstreams\.notes is unavailable/);
     } finally {
       await client.close();
     }
   });
 
-  it('passes workstreamId through for bac.list_workstream_notes', async () => {
+  it('passes workstreamId through for sidetrack.workstreams.notes', async () => {
     const companionClient = buildFakeCompanionClient({
       listWorkstreamNotes: vi.fn(() =>
         Promise.resolve([{ workstreamId: 'bac_ws_1', notePath: 'note.md' }]),
@@ -157,7 +123,7 @@ describe('companion-backed read tools', () => {
     const client = await startInProcessServer(companionClient);
     try {
       const result = await client.callTool({
-        name: 'bac.list_workstream_notes',
+        name: 'sidetrack.workstreams.notes',
         arguments: { workstreamId: 'bac_ws_1' },
       });
       expect(companionClient.listWorkstreamNotes).toHaveBeenCalledWith({
@@ -171,21 +137,21 @@ describe('companion-backed read tools', () => {
     }
   });
 
-  it('reports bac.list_annotations unavailable when no companion read client is wired', async () => {
+  it('reports sidetrack.annotations.list unavailable when no companion read client is wired', async () => {
     const client = await startInProcessServer();
     try {
       const result = await client.callTool({
-        name: 'bac.list_annotations',
+        name: 'sidetrack.annotations.list',
         arguments: { url: 'https://example.test/page' },
       });
       expect(result.isError).toBe(true);
-      expect(errorText(result)).toMatch(/bac\.list_annotations is unavailable/);
+      expect(errorText(result)).toMatch(/sidetrack\.annotations\.list is unavailable/);
     } finally {
       await client.close();
     }
   });
 
-  it('passes url and limit through for bac.list_annotations', async () => {
+  it('passes url and limit through for sidetrack.annotations.list', async () => {
     const companionClient = buildFakeCompanionClient({
       listAnnotations: vi.fn(() =>
         Promise.resolve([{ bac_id: 'bac_ann_1', url: 'https://example.test/page' }]),
@@ -194,7 +160,7 @@ describe('companion-backed read tools', () => {
     const client = await startInProcessServer(companionClient);
     try {
       const result = await client.callTool({
-        name: 'bac.list_annotations',
+        name: 'sidetrack.annotations.list',
         arguments: { url: 'https://example.test/page', limit: 3 },
       });
       expect(companionClient.listAnnotations).toHaveBeenCalledWith({
@@ -209,28 +175,28 @@ describe('companion-backed read tools', () => {
     }
   });
 
-  it('reports bac.recall unavailable when no companion read client is wired', async () => {
+  it('reports sidetrack.recall.query unavailable when no companion read client is wired', async () => {
     const client = await startInProcessServer();
     try {
       const result = await client.callTool({
-        name: 'bac.recall',
+        name: 'sidetrack.recall.query',
         arguments: { query: 'migration plans' },
       });
       expect(result.isError).toBe(true);
-      expect(errorText(result)).toMatch(/bac\.recall is unavailable/);
+      expect(errorText(result)).toMatch(/sidetrack\.recall\.query is unavailable/);
     } finally {
       await client.close();
     }
   });
 
-  it('passes query options through for bac.recall', async () => {
+  it('passes query options through for sidetrack.recall.query', async () => {
     const companionClient = buildFakeCompanionClient({
       recall: vi.fn(() => Promise.resolve([{ id: 'turn_1', score: 0.9 }])),
     });
     const client = await startInProcessServer(companionClient);
     try {
       const result = await client.callTool({
-        name: 'bac.recall',
+        name: 'sidetrack.recall.query',
         arguments: { query: 'migration plans', limit: 5, workstreamId: 'bac_ws_1' },
       });
       expect(companionClient.recall).toHaveBeenCalledWith({
@@ -244,14 +210,14 @@ describe('companion-backed read tools', () => {
     }
   });
 
-  it('passes thread options through for bac.suggest_workstream', async () => {
+  it('passes thread options through for sidetrack.suggestions.workstream', async () => {
     const companionClient = buildFakeCompanionClient({
       suggestWorkstream: vi.fn(() => Promise.resolve([{ workstreamId: 'bac_ws_1', score: 0.8 }])),
     });
     const client = await startInProcessServer(companionClient);
     try {
       const result = await client.callTool({
-        name: 'bac.suggest_workstream',
+        name: 'sidetrack.suggestions.workstream',
         arguments: { threadId: 'bac_thread_1', limit: 2 },
       });
       expect(companionClient.suggestWorkstream).toHaveBeenCalledWith({
@@ -266,7 +232,7 @@ describe('companion-backed read tools', () => {
     }
   });
 
-  it('returns portable settings export via bac.export_settings', async () => {
+  it('returns portable settings export via sidetrack.settings.export', async () => {
     const companionClient = buildFakeCompanionClient({
       exportSettings: vi.fn(() =>
         Promise.resolve({
@@ -280,7 +246,7 @@ describe('companion-backed read tools', () => {
     });
     const client = await startInProcessServer(companionClient);
     try {
-      const result = await client.callTool({ name: 'bac.export_settings', arguments: {} });
+      const result = await client.callTool({ name: 'sidetrack.settings.export', arguments: {} });
       expect(companionClient.exportSettings).toHaveBeenCalled();
       expect(result.structuredContent).toMatchObject({ schemaVersion: 1 });
     } finally {
@@ -288,7 +254,7 @@ describe('companion-backed read tools', () => {
     }
   });
 
-  it('returns update advisory via bac.system_update_check', async () => {
+  it('returns update advisory via sidetrack.system.update_check', async () => {
     const companionClient = buildFakeCompanionClient({
       systemUpdateCheck: vi.fn(() =>
         Promise.resolve({ current: '0.0.0', latest: '0.1.0', behind: true }),
@@ -296,7 +262,7 @@ describe('companion-backed read tools', () => {
     });
     const client = await startInProcessServer(companionClient);
     try {
-      const result = await client.callTool({ name: 'bac.system_update_check', arguments: {} });
+      const result = await client.callTool({ name: 'sidetrack.system.update_check', arguments: {} });
       expect(companionClient.systemUpdateCheck).toHaveBeenCalled();
       expect(result.structuredContent).toMatchObject({ latest: '0.1.0', behind: true });
     } finally {
@@ -313,12 +279,12 @@ describe('companion-backed read tools', () => {
     try {
       await expect(
         client.callTool({
-          name: 'bac.update_annotation',
+          name: 'sidetrack.annotations.update',
           arguments: { bac_id: 'ann_1', note: 'new' },
         }),
       ).resolves.toMatchObject({ structuredContent: { bac_id: 'ann_1', note: 'new' } });
       await expect(
-        client.callTool({ name: 'bac.delete_annotation', arguments: { bac_id: 'ann_1' } }),
+        client.callTool({ name: 'sidetrack.annotations.delete', arguments: { bac_id: 'ann_1' } }),
       ).resolves.toMatchObject({ structuredContent: { bac_id: 'ann_1', deletedAt: 'now' } });
       expect(companionClient.updateAnnotation).toHaveBeenCalledWith({ bac_id: 'ann_1', note: 'new' });
       expect(companionClient.deleteAnnotation).toHaveBeenCalledWith({ bac_id: 'ann_1' });
@@ -327,7 +293,7 @@ describe('companion-backed read tools', () => {
     }
   });
 
-  it('returns raw Markdown through bac.read_thread_md and bac.read_workstream_md', async () => {
+  it('returns raw Markdown through sidetrack.threads.read_md and sidetrack.workstreams.read_md', async () => {
     const companionClient = buildFakeCompanionClient({
       readThreadMarkdown: vi.fn(() => Promise.resolve({ path: '/vault/_BAC/threads/t.md', content: '# T' })),
       readWorkstreamMarkdown: vi.fn(() =>
@@ -337,10 +303,10 @@ describe('companion-backed read tools', () => {
     const client = await startInProcessServer(companionClient);
     try {
       await expect(
-        client.callTool({ name: 'bac.read_thread_md', arguments: { bac_id: 'thread_1' } }),
+        client.callTool({ name: 'sidetrack.threads.read_md', arguments: { bac_id: 'thread_1' } }),
       ).resolves.toMatchObject({ structuredContent: { content: '# T' } });
       await expect(
-        client.callTool({ name: 'bac.read_workstream_md', arguments: { bac_id: 'ws_1' } }),
+        client.callTool({ name: 'sidetrack.workstreams.read_md', arguments: { bac_id: 'ws_1' } }),
       ).resolves.toMatchObject({ structuredContent: { content: '# W' } });
       expect(companionClient.readThreadMarkdown).toHaveBeenCalledWith({ bac_id: 'thread_1' });
       expect(companionClient.readWorkstreamMarkdown).toHaveBeenCalledWith({ bac_id: 'ws_1' });
@@ -357,9 +323,9 @@ describe('companion-backed read tools', () => {
     });
     const client = await startInProcessServer(companionClient);
     try {
-      await client.callTool({ name: 'bac.bump_workstream', arguments: { bac_id: 'ws_1' } });
-      await client.callTool({ name: 'bac.archive_thread', arguments: { bac_id: 'thread_1' } });
-      await client.callTool({ name: 'bac.unarchive_thread', arguments: { bac_id: 'thread_1' } });
+      await client.callTool({ name: 'sidetrack.workstreams.bump', arguments: { bac_id: 'ws_1' } });
+      await client.callTool({ name: 'sidetrack.threads.archive', arguments: { bac_id: 'thread_1' } });
+      await client.callTool({ name: 'sidetrack.threads.unarchive', arguments: { bac_id: 'thread_1' } });
       expect(companionClient.bumpWorkstream).toHaveBeenCalledWith({ bac_id: 'ws_1' });
       expect(companionClient.archiveThread).toHaveBeenCalledWith({ bac_id: 'thread_1' });
       expect(companionClient.unarchiveThread).toHaveBeenCalledWith({ bac_id: 'thread_1' });
@@ -375,10 +341,10 @@ describe('companion-backed read tools', () => {
     });
     const client = await startInProcessServer(companionClient);
     try {
-      await expect(client.callTool({ name: 'bac.list_buckets', arguments: {} })).resolves.toMatchObject({
+      await expect(client.callTool({ name: 'sidetrack.buckets.list', arguments: {} })).resolves.toMatchObject({
         structuredContent: { items: [{ id: 'default' }] },
       });
-      await expect(client.callTool({ name: 'bac.system_health', arguments: {} })).resolves.toMatchObject({
+      await expect(client.callTool({ name: 'sidetrack.system.health', arguments: {} })).resolves.toMatchObject({
         structuredContent: { uptimeSec: 1 },
       });
     } finally {

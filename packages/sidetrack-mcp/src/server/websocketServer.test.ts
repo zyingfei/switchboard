@@ -75,10 +75,10 @@ describe('WebSocket MCP server transport', () => {
 
     try {
       const tools = await client.listTools();
-      expect(tools.tools.some((tool) => tool.name === 'bac.recent_threads')).toBe(true);
+      expect(tools.tools.some((tool) => tool.name === 'sidetrack.threads.list')).toBe(true);
 
       const result = await client.callTool({
-        name: 'bac.recent_threads',
+        name: 'sidetrack.threads.list',
         arguments: { limit: 1 },
       });
       expect(result.structuredContent).toMatchObject({
@@ -125,7 +125,7 @@ describe('WebSocket MCP server transport', () => {
 
     try {
       await expect(client.listTools()).resolves.toMatchObject({
-        tools: expect.arrayContaining([expect.objectContaining({ name: 'bac.recent_threads' })]),
+        tools: expect.arrayContaining([expect.objectContaining({ name: 'sidetrack.threads.list' })]),
       });
     } finally {
       await client.close();

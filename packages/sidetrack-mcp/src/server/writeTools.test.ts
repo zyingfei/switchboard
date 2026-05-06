@@ -84,16 +84,16 @@ const errorText = (result: unknown): string => {
   return typeof first.text === 'string' ? first.text : '';
 };
 
-describe('bac.move_item', () => {
+describe('sidetrack.threads.move', () => {
   it('reports unavailable when no companion client is wired', async () => {
     const client = await startInProcessServer();
     try {
       const result = await client.callTool({
-        name: 'bac.move_item',
+        name: 'sidetrack.threads.move',
         arguments: { threadId: 'bac_thread_test', workstreamId: 'bac_ws_a' },
       });
       expect(result.isError).toBe(true);
-      expect(errorText(result)).toMatch(/bac\.move_item is unavailable/);
+      expect(errorText(result)).toMatch(/sidetrack\.threads\.move is unavailable/);
     } finally {
       await client.close();
     }
@@ -104,7 +104,7 @@ describe('bac.move_item', () => {
     const client = await startInProcessServer(writeClient);
     try {
       const result = await client.callTool({
-        name: 'bac.move_item',
+        name: 'sidetrack.threads.move',
         arguments: { threadId: 'bac_thread_T', workstreamId: 'bac_ws_X' },
       });
       expect(writeClient.moveThread).toHaveBeenCalledWith({
@@ -123,7 +123,7 @@ describe('bac.move_item', () => {
     const client = await startInProcessServer(writeClient);
     try {
       await client.callTool({
-        name: 'bac.move_item',
+        name: 'sidetrack.threads.move',
         arguments: { threadId: 'bac_thread_T', workstreamId: '' },
       });
       // The empty-string convention is "park at top level" — we should
@@ -139,7 +139,7 @@ describe('bac.move_item', () => {
     const client = await startInProcessServer(writeClient);
     try {
       await client.callTool({
-        name: 'bac.move_item',
+        name: 'sidetrack.threads.move',
         arguments: { threadId: 'bac_thread_T' },
       });
       expect(writeClient.moveThread).toHaveBeenCalledWith({ threadId: 'bac_thread_T' });
@@ -163,16 +163,16 @@ const attachedSession = (overrides: Partial<CodingSessionRecord> = {}): CodingSe
   ...overrides,
 });
 
-describe('bac.queue_item', () => {
+describe('sidetrack.queue.create', () => {
   it('reports unavailable when no companion client is wired', async () => {
     const client = await startInProcessServer();
     try {
       const result = await client.callTool({
-        name: 'bac.queue_item',
+        name: 'sidetrack.queue.create',
         arguments: { text: 'follow up Q', scope: 'global' },
       });
       expect(result.isError).toBe(true);
-      expect(errorText(result)).toMatch(/bac\.queue_item is unavailable/);
+      expect(errorText(result)).toMatch(/sidetrack\.queue\.create is unavailable/);
     } finally {
       await client.close();
     }
@@ -183,7 +183,7 @@ describe('bac.queue_item', () => {
     const client = await startInProcessServer(writeClient);
     try {
       const result = await client.callTool({
-        name: 'bac.queue_item',
+        name: 'sidetrack.queue.create',
         arguments: { text: 'q', scope: 'thread' },
       });
       expect(result.isError).toBe(true);
@@ -199,7 +199,7 @@ describe('bac.queue_item', () => {
     const client = await startInProcessServer(writeClient);
     try {
       const result = await client.callTool({
-        name: 'bac.queue_item',
+        name: 'sidetrack.queue.create',
         arguments: { text: 'q', scope: 'workstream' },
       });
       expect(result.isError).toBe(true);
@@ -214,7 +214,7 @@ describe('bac.queue_item', () => {
     const client = await startInProcessServer(writeClient);
     try {
       await client.callTool({
-        name: 'bac.queue_item',
+        name: 'sidetrack.queue.create',
         arguments: { text: 'global q', scope: 'global', targetId: 'bac_should_be_ignored' },
       });
       expect(writeClient.createQueueItem).toHaveBeenCalledWith({
@@ -231,7 +231,7 @@ describe('bac.queue_item', () => {
     const client = await startInProcessServer(writeClient);
     try {
       const result = await client.callTool({
-        name: 'bac.queue_item',
+        name: 'sidetrack.queue.create',
         arguments: { text: 'thread q', scope: 'thread', targetId: 'bac_thread_T' },
       });
       expect(writeClient.createQueueItem).toHaveBeenCalledWith({
@@ -247,85 +247,11 @@ describe('bac.queue_item', () => {
   });
 });
 
-describe('bac.request_dispatch', () => {
-  it('reports unavailable when no companion client is wired', async () => {
-    const client = await startInProcessServer();
-    try {
-      const result = await client.callTool({
-        name: 'bac.request_dispatch',
-        arguments: {
-          codingSessionId: 'bac_session_attached',
-          targetProvider: 'chatgpt',
-          title: 'Ask ChatGPT',
-          body: 'Please review this context.',
-        },
-      });
-      expect(result.isError).toBe(true);
-      expect(errorText(result)).toMatch(/bac\.request_dispatch is unavailable/);
-    } finally {
-      await client.close();
-    }
-  });
-
-  it('rejects calls for sessions that are not attached', async () => {
-    const writeClient = buildFakeWriteClient();
-    const client = await startInProcessServer(writeClient);
-    try {
-      const result = await client.callTool({
-        name: 'bac.request_dispatch',
-        arguments: {
-          codingSessionId: 'bac_session_missing',
-          targetProvider: 'chatgpt',
-          title: 'Ask ChatGPT',
-          body: 'Please review this context.',
-        },
-      });
-      expect(result.isError).toBe(true);
-      expect(errorText(result)).toMatch(/requires an attached coding session/);
-      expect(writeClient.requestDispatch).not.toHaveBeenCalled();
-    } finally {
-      await client.close();
-    }
-  });
-
-  it('auto-approves and records dispatch requests for attached sessions', async () => {
-    const writeClient = buildFakeWriteClient();
-    const reader: SidetrackMcpReader = {
-      ...fakeReader,
-      readCodingSessions: () => Promise.resolve([attachedSession()]),
-    };
-    const client = await startInProcessServer(writeClient, reader);
-    try {
-      const result = await client.callTool({
-        name: 'bac.request_dispatch',
-        arguments: {
-          codingSessionId: 'bac_session_attached',
-          targetProvider: 'chatgpt',
-          title: 'Ask ChatGPT',
-          body: 'Please review this context.',
-        },
-      });
-      expect(writeClient.requestDispatch).toHaveBeenCalledWith({
-        codingSessionId: 'bac_session_attached',
-        targetProvider: 'chatgpt',
-        title: 'Ask ChatGPT',
-        body: 'Please review this context.',
-        mode: 'auto-send',
-        workstreamId: 'bac_ws_attached',
-      });
-      expect(result.structuredContent).toMatchObject({
-        dispatchId: 'bac_dispatch_fake',
-        approval: 'auto-approved',
-        status: 'recorded',
-        targetProvider: 'chatgpt',
-        mode: 'auto-send',
-        workstreamId: 'bac_ws_attached',
-      });
-    } finally {
-      await client.close();
-    }
-  });
-});
+// `bac.request_dispatch` was removed in Phase 1.4a; the typed
+// replacement `sidetrack.dispatch.create` is covered above.
+// `bac.request_dispatch` was deleted in Phase 1.4a. The typed
+// replacement `sidetrack.dispatch.create` is covered below in its own
+// describe block.
 
 describe('sidetrack.annotations.create_batch', () => {
   it('reports unavailable when no companion client is wired', async () => {
@@ -602,106 +528,6 @@ describe('sidetrack.dispatch.await_capture', () => {
   });
 });
 
-describe('bac.create_annotation', () => {
-  it('reports unavailable when no companion client is wired', async () => {
-    const client = await startInProcessServer();
-    try {
-      const result = await client.callTool({
-        name: 'bac.create_annotation',
-        arguments: {
-          url: 'https://chatgpt.com/c/thread',
-          pageTitle: 'ChatGPT',
-          term: 'WebGPU',
-          note: 'GPU API context for architects.',
-        },
-      });
-      expect(result.isError).toBe(true);
-      expect(errorText(result)).toMatch(/bac\.create_annotation is unavailable/);
-    } finally {
-      await client.close();
-    }
-  });
-
-  it('builds a term-scoped TextQuote anchor with prefix and suffix context', async () => {
-    const writeClient = buildFakeWriteClient();
-    const client = await startInProcessServer(writeClient);
-    try {
-      const result = await client.callTool({
-        name: 'bac.create_annotation',
-        arguments: {
-          url: 'https://chatgpt.com/c/thread',
-          pageTitle: 'HN analysis',
-          term: 'WebGPU',
-          prefix: 'Long section context before the keyword: browser graphics and compute through ',
-          suffix: ' gives web apps lower-level GPU access without native application installs.',
-          note: 'WebGPU: browser GPU compute/rendering API for modern app architectures.',
-        },
-      });
-
-      expect(writeClient.createAnnotation).toHaveBeenCalledWith({
-        url: 'https://chatgpt.com/c/thread',
-        pageTitle: 'HN analysis',
-        anchor: {
-          textQuote: {
-            exact: 'WebGPU',
-            prefix: 'er graphics and compute through ',
-            suffix: ' gives web apps lower-level GPU ',
-          },
-          textPosition: { start: -1, end: -1 },
-          cssSelector: '',
-        },
-        note: 'WebGPU: browser GPU compute/rendering API for modern app architectures.',
-      });
-      const structured = result.structuredContent as {
-        readonly annotation?: { readonly bac_id?: string };
-        readonly term?: string;
-      };
-      expect(structured.annotation?.bac_id).toBe('bac_annotation_fake');
-      expect(structured.term).toBe('WebGPU');
-    } finally {
-      await client.close();
-    }
-  });
-
-  it('rejects short terms when neither prefix nor suffix is provided', async () => {
-    const writeClient = buildFakeWriteClient();
-    const client = await startInProcessServer(writeClient);
-    try {
-      const result = await client.callTool({
-        name: 'bac.create_annotation',
-        arguments: {
-          url: 'https://chatgpt.com/c/thread',
-          pageTitle: 'ChatGPT',
-          term: 'AI',
-          note: 'Too generic without context.',
-        },
-      });
-      expect(result.isError).toBe(true);
-      expect(errorText(result)).toMatch(/shorter than \d+ chars; provide prefix or suffix/);
-      expect(writeClient.createAnnotation).not.toHaveBeenCalled();
-    } finally {
-      await client.close();
-    }
-  });
-
-  it('accepts short terms when prefix or suffix is provided', async () => {
-    const writeClient = buildFakeWriteClient();
-    const client = await startInProcessServer(writeClient);
-    try {
-      const result = await client.callTool({
-        name: 'bac.create_annotation',
-        arguments: {
-          url: 'https://chatgpt.com/c/thread',
-          pageTitle: 'ChatGPT',
-          term: 'AI',
-          suffix: ' models trained on architecture docs',
-          note: 'AI here means LLM, not the broader field.',
-        },
-      });
-      expect(result.isError).not.toBe(true);
-      expect(writeClient.createAnnotation).toHaveBeenCalledTimes(1);
-    } finally {
-      await client.close();
-    }
-  });
-});
+// `bac.create_annotation` was deleted in Phase 1.4a. The typed
+// replacement `sidetrack.annotations.create_batch` (covered above)
+// supersedes both single-create and the four-call-per-page pattern.

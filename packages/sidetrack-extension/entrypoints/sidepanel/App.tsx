@@ -441,31 +441,31 @@ const App = () => {
   >([]);
   const [workstreamDetailTrust, setWorkstreamDetailTrust] = useState<readonly TrustEntry[]>([
     {
-      tool: 'bac.queue_item',
+      tool: 'sidetrack.queue.create',
       humanLabel: 'queue_item',
       description: 'queue an outbound follow-up to a provider',
       allowed: true,
     },
     {
-      tool: 'bac.move_item',
+      tool: 'sidetrack.threads.move',
       humanLabel: 'move_item',
       description: 'move a tracked thread to this workstream',
       allowed: false,
     },
     {
-      tool: 'bac.bump_workstream',
+      tool: 'sidetrack.workstreams.bump',
       humanLabel: 'bump_workstream',
       description: 'raise priority on a queued ask',
       allowed: false,
     },
     {
-      tool: 'bac.archive_thread',
+      tool: 'sidetrack.threads.archive',
       humanLabel: 'archive_thread',
       description: 'archive a tracked thread',
       allowed: false,
     },
     {
-      tool: 'bac.unarchive_thread',
+      tool: 'sidetrack.threads.unarchive',
       humanLabel: 'unarchive_thread',
       description: 'restore an archived thread',
       allowed: false,
@@ -1662,7 +1662,7 @@ const App = () => {
       // front-loading a contract that capable agents auto-discover
       // via tools/list. Side-by-side review:
       // packages/sidetrack-mcp/src/e2e/handoff-prompt-trim-review.md.
-      body = `# Coding handoff: ${thread.title}\nsidetrack_mcp: ws://127.0.0.1:8721/mcp?token=${keyStr}\nsidetrack_thread_id: ${thread.bac_id}\n(connect → tools/list → bac.read_thread_md)\n\n## User's ask\n…`;
+      body = `# Coding handoff: ${thread.title}\nsidetrack_mcp: ws://127.0.0.1:8721/mcp?token=${keyStr}\nsidetrack_thread_id: ${thread.bac_id}\n(connect → tools/list → sidetrack.threads.read_md)\n\n## User's ask\n…`;
     } else {
       const today = new Date().toISOString().slice(0, 10);
       body = `---\ntitle: ${thread.title}\ncreated: ${today}\nsource: ${thread.threadUrl}\nprovider: ${provider}\n---\n\n# ${thread.title}\n\n${turnsMd}`;

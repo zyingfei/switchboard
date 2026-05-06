@@ -264,8 +264,8 @@ test.describe('Codex MCP Hacker News annotation flow (synthetic browser)', () =>
       await sidepanel.locator('select').selectOption(workstream.bac_id);
       await sidepanel.getByRole('button', { name: 'Generate prompt' }).click();
       const prompt = await extractPrompt(sidepanel);
-      expect(prompt).toContain('tools/list -> bac.coding_session_register');
-      expect(prompt).toContain('bac.request_dispatch');
+      expect(prompt).toContain('tools/list -> sidetrack.session.attach');
+      expect(prompt).toContain('sidetrack.dispatch.create');
       const token = extractAttachToken(prompt);
 
       const activeCompanion = companion;
@@ -325,35 +325,35 @@ test.describe('Codex MCP Hacker News annotation flow (synthetic browser)', () =>
 
       expect(await mcp.listTools()).toEqual(
         expect.arrayContaining([
-          'bac.coding_session_register',
-          'bac.request_dispatch',
-          'bac.create_annotation',
-          'bac.list_annotations',
+          'sidetrack.session.attach',
+          'sidetrack.dispatch.create',
+          'sidetrack.annotations.create_batch',
+          'sidetrack.annotations.list',
         ]),
       );
 
-      const registered = (await mcp.callTool('bac.coding_session_register', {
-        token,
+      const registered = (await mcp.callTool('sidetrack.session.attach', {
+        attachToken: token,
         tool: 'codex',
         cwd: '/Users/zyingfei/switchboard',
         branch: 'codex/visual-keyword-annotation-e2e',
         sessionId: 'hn-mcp-annotation-browser',
         name: 'codex - HN MCP annotation e2e',
-      })) as { readonly structuredContent?: { readonly bac_id?: string } };
-      const codingSessionId = registered.structuredContent?.bac_id;
+      })) as { readonly structuredContent?: { readonly codingSessionId?: string } };
+      const codingSessionId = registered.structuredContent?.codingSessionId;
       expect(codingSessionId).toBeTruthy();
 
-      const workstreamData = (await mcp.callTool('bac.workstream', {
+      const workstreamData = (await mcp.callTool('sidetrack.workstreams.get', {
         id: workstream.bac_id,
       })) as { readonly structuredContent?: unknown };
       expect(JSON.stringify(workstreamData.structuredContent)).toContain('HN MCP annotation e2e');
 
-      const contextPack = (await mcp.callTool('bac.context_pack', {
+      const contextPack = (await mcp.callTool('sidetrack.workstreams.context_pack', {
         workstreamId: workstream.bac_id,
       })) as { readonly structuredContent?: unknown };
       expect(JSON.stringify(contextPack.structuredContent)).toContain('HN MCP annotation e2e');
 
-      const requested = (await mcp.callTool('bac.request_dispatch', {
+      const requested = (await mcp.callTool('sidetrack.dispatch.create', {
         codingSessionId,
         targetProvider: 'chatgpt',
         title: 'HN top article full analysis',
@@ -414,25 +414,28 @@ test.describe('Codex MCP Hacker News annotation flow (synthetic browser)', () =>
       const linkedThreadId = links[dispatchId];
       expect(linkedThreadId).toBeTruthy();
 
-      for (const annotation of termAnnotations) {
+      const batchItems = termAnnotations.map((annotation) => {
         const context = contextForTerm(assistantText, annotation.term);
-        await mcp.callTool('bac.create_annotation', {
-          url: finalUrl,
-          pageTitle,
+        return {
           term: annotation.term,
           prefix: context.prefix,
           suffix: context.suffix,
           note: annotation.note,
-        });
-      }
+        };
+      });
+      await mcp.callTool('sidetrack.annotations.create_batch', {
+        url: finalUrl,
+        pageTitle,
+        items: batchItems,
+      });
 
-      const listed = (await mcp.callTool('bac.list_annotations', {
+      const listed = (await mcp.callTool('sidetrack.annotations.list', {
         url: finalUrl,
         limit: 10,
       })) as { readonly structuredContent?: { readonly data?: readonly unknown[] } };
       expect(listed.structuredContent?.data).toHaveLength(termAnnotations.length);
 
-      await mcp.callTool('bac.queue_item', {
+      await mcp.callTool('sidetrack.queue.create', {
         scope: 'thread',
         targetId: linkedThreadId,
         text: 'Follow up on the annotated HN analysis thread and check whether the WebGPU/WASM tradeoffs need a deeper security note.',

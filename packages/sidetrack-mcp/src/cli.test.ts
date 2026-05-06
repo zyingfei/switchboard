@@ -1,7 +1,7 @@
 import { Writable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 
-import { m1ReadToolNames } from './capabilities.js';
+import { sidetrackToolNames } from './capabilities.js';
 import { mcpVersion, runCli } from './cli.js';
 
 class MemoryWritable extends Writable {
@@ -43,7 +43,7 @@ describe('runCli', () => {
     const exitCode = await runCli(['--list-tools'], streams);
 
     expect(exitCode).toBe(0);
-    expect(streams.stdout.text().trim().split('\n')).toEqual(m1ReadToolNames);
+    expect(streams.stdout.text().trim().split('\n')).toEqual(sidetrackToolNames);
   });
 
   it('rejects startup without a vault path', async () => {

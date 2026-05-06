@@ -461,11 +461,11 @@ export const bucketsPutSchema = z.object({
 export const workstreamTrustPutSchema = z.object({
   allowedTools: z.array(
     z.enum([
-      'bac.move_item',
-      'bac.queue_item',
-      'bac.bump_workstream',
-      'bac.archive_thread',
-      'bac.unarchive_thread',
+      'sidetrack.threads.move',
+      'sidetrack.queue.create',
+      'sidetrack.workstreams.bump',
+      'sidetrack.threads.archive',
+      'sidetrack.threads.unarchive',
     ]),
   ),
 });

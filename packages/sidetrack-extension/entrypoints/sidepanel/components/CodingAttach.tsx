@@ -38,16 +38,16 @@ const buildAgentPrompt = (
     workstreamId === undefined
       ? 'sidetrack_workstream_id: (none)'
       : `sidetrack_workstream_id: ${workstreamId}`,
-    'flow: tools/list -> bac.coding_session_register -> bac.workstream/bac.context_pack -> bac.request_dispatch',
+    'flow: tools/list -> sidetrack.session.attach -> sidetrack.workstreams.get/sidetrack.workstreams.context_pack -> sidetrack.dispatch.create',
     '',
-    'Use the MCP endpoint above. Register this coding session by calling bac.coding_session_register with:',
-    `- token: ${token}`,
+    'Use the MCP endpoint above. Attach this coding session by calling sidetrack.session.attach with:',
+    `- attachToken: ${token}`,
     '- tool: <claude_code | codex | cursor | other>',
     '- cwd, branch, sessionId, name, and optional resumeCommand from your runtime',
     '',
-    'After registration, fetch Sidetrack context with bac.workstream or bac.context_pack.',
-    'When you need Sidetrack to send context to a target AI, call bac.request_dispatch.',
-    'Use bac.queue_item for follow-up work after a target thread exists.',
+    'After attach, fetch Sidetrack context with sidetrack.workstreams.get or sidetrack.workstreams.context_pack.',
+    'When you need Sidetrack to send context to a target AI, call sidetrack.dispatch.create.',
+    'Use sidetrack.queue.create for follow-up work after a target thread exists.',
     'Do not ask me for them. The token is single-use and expires in 5 minutes.',
   ].join('\n');
 

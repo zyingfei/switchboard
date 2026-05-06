@@ -155,50 +155,10 @@ export interface SidetrackMcpReader {
 }
 
 const toolText = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`;
-const TERM_CONTEXT_CHARS = 32;
-// Minimum term length below which prefix or suffix is required, to
-// avoid highlighting the wrong occurrence on a page where the term
-// repeats. Picked to clear common short tokens (~5 chars) like
-// "node", "code", "AI" while still allowing real terms like "WebGPU".
-const TERM_MIN_LEN_WITHOUT_CONTEXT = 6;
 
 const asStructuredContent = (value: Record<string, unknown>) => ({
   content: [{ type: 'text' as const, text: toolText(value) }],
   structuredContent: value,
-});
-
-const termContextPrefix = (prefix: string | undefined): string => {
-  if (prefix === undefined) {
-    return '';
-  }
-  return prefix.slice(Math.max(0, prefix.length - TERM_CONTEXT_CHARS));
-};
-
-const termContextSuffix = (suffix: string | undefined): string => {
-  if (suffix === undefined) {
-    return '';
-  }
-  return suffix.slice(0, TERM_CONTEXT_CHARS);
-};
-
-const buildTermAnchor = (input: {
-  readonly term: string;
-  readonly prefix?: string;
-  readonly suffix?: string;
-}): SerializedAnchor => ({
-  textQuote: {
-    exact: input.term,
-    prefix: termContextPrefix(input.prefix),
-    suffix: termContextSuffix(input.suffix),
-  },
-  // MCP-created annotations are intentionally quote-bound. Out-of-band
-  // poison values (MAX_SAFE_INTEGER, magic selectors) misrepresent
-  // intent and risk matching unrelated DOM. Empty cssSelector + an
-  // out-of-range textPosition mean "term-quote only"; the extension's
-  // findAnchor() short-circuits both fallbacks when they are empty
-  // or unsatisfiable.
-  textPosition: { start: -1, end: -1 },
-  cssSelector: '',
 });
 
 const buildContextPack = (
@@ -272,7 +232,7 @@ export const createSidetrackMcpServer = (
   registerAnnotationTools(server, companionClient);
 
   server.registerTool(
-    'bac.recent_threads',
+    'sidetrack.threads.list',
     {
       description: 'Return tracked threads sorted by lastSeenAt from the live Sidetrack vault.',
       inputSchema: { limit: z.number().int().positive().optional() },
@@ -287,7 +247,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.workstream',
+    'sidetrack.workstreams.get',
     {
       description:
         'Return a workstream subtree plus tracked items, queued asks, and checklist data.',
@@ -311,7 +271,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.context_pack',
+    'sidetrack.workstreams.context_pack',
     {
       description: 'Return a minimal Markdown Context Pack for the selected workstream.',
       inputSchema: {
@@ -330,7 +290,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.search',
+    'sidetrack.search',
     {
       description: 'Run lexical search over tracked items, queued asks, and reminders.',
       inputSchema: { query: z.string().min(1) },
@@ -345,7 +305,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.queued_items',
+    'sidetrack.queue.list',
     {
       description: 'Return queued follow-ups from the live vault.',
       inputSchema: { scope: z.string().optional() },
@@ -363,7 +323,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.inbound_reminders',
+    'sidetrack.reminders.list',
     {
       description: 'Return inbound reminders from the live vault.',
       inputSchema: { since: z.string().optional() },
@@ -381,7 +341,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.coding_sessions',
+    'sidetrack.sessions.list',
     {
       description:
         'Return coding sessions registered by coding agents (Claude Code / Codex / Cursor). Filterable by workstreamId and status.',
@@ -402,121 +362,11 @@ export const createSidetrackMcpServer = (
     },
   );
 
-  server.registerTool(
-    'bac.coding_session_register',
-    {
-      description:
-        "Register the current coding agent's session against a Sidetrack workstream. Call this once at the start of a coding session. The user provides the attach token; auto-detect cwd, branch, sessionId, and a short display name from your runtime — do not ask the user for those.",
-      inputSchema: {
-        token: z
-          .string()
-          .min(8)
-          .max(64)
-          .describe('One-time attach token, supplied by the Sidetrack side panel.'),
-        tool: z.enum(['claude_code', 'codex', 'cursor', 'other']),
-        cwd: z.string().min(1).describe('Absolute working directory.'),
-        branch: z.string().min(1).describe('Current git branch.'),
-        sessionId: z.string().min(1).describe('Stable agent-side session identifier.'),
-        name: z.string().min(1).describe('Short display name (e.g. "claude-code · feat/queue").'),
-        resumeCommand: z
-          .string()
-          .min(1)
-          .optional()
-          .describe('Shell command that resumes this agent session.'),
-      },
-    },
-    async ({ token, tool, cwd, branch, sessionId, name, resumeCommand }) => {
-      if (companionClient === undefined) {
-        throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.coding_session_register is unavailable.',
-        );
-      }
-      const result = await companionClient.registerCodingSession({
-        token,
-        tool,
-        cwd,
-        branch,
-        sessionId,
-        name,
-        ...(resumeCommand === undefined ? {} : { resumeCommand }),
-      });
-      return asStructuredContent({
-        bac_id: result.bac_id,
-        ...(result.workstreamId === undefined ? {} : { workstreamId: result.workstreamId }),
-        session: result,
-        registeredAt: new Date().toISOString(),
-      });
-    },
-  );
-
-  server.registerTool(
-    'bac.request_dispatch',
-    {
-      description:
-        'Ask Sidetrack to dispatch a packet from this attached coding session to a target AI. The request is auto-approved for now and recorded through the normal dispatch ledger.',
-      inputSchema: {
-        codingSessionId: z
-          .string()
-          .min(1)
-          .describe('bac_id returned by bac.coding_session_register.'),
-        targetProvider: z
-          .enum(['chatgpt', 'claude', 'gemini'])
-          .describe('Target AI provider that should receive the packet.'),
-        title: z.string().min(1).describe('Short dispatch title shown in Recent dispatches.'),
-        body: z.string().min(1).max(20000).describe('Packet body to send to the target AI.'),
-        workstreamId: z
-          .string()
-          .optional()
-          .describe('Workstream bac_id. Defaults to the registered session workstream.'),
-        sourceThreadId: z.string().optional().describe('Optional source thread bac_id.'),
-        mode: z
-          .enum(['paste', 'auto-send'])
-          .optional()
-          .describe("Dispatch mode. Defaults to 'auto-send'."),
-      },
-    },
-    async ({
-      codingSessionId,
-      targetProvider,
-      title,
-      body,
-      workstreamId,
-      sourceThreadId,
-      mode,
-    }) => {
-      if (companionClient?.requestDispatch === undefined) {
-        throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.request_dispatch is unavailable.',
-        );
-      }
-      const sessions = await reader.readCodingSessions({ status: 'attached' });
-      const session = sessions.find((candidate) => candidate.bac_id === codingSessionId);
-      if (session === undefined) {
-        throw new Error(
-          `bac.request_dispatch requires an attached coding session; '${codingSessionId}' is not attached.`,
-        );
-      }
-      const resolvedWorkstreamId = workstreamId ?? session.workstreamId;
-      const result = await companionClient.requestDispatch({
-        codingSessionId,
-        targetProvider,
-        title,
-        body,
-        mode: mode ?? 'auto-send',
-        ...(resolvedWorkstreamId === undefined ? {} : { workstreamId: resolvedWorkstreamId }),
-        ...(sourceThreadId === undefined ? {} : { sourceThreadId }),
-      });
-      return asStructuredContent({
-        dispatchId: result.dispatchId,
-        approval: result.approval,
-        status: result.status,
-        requestedAt: result.requestedAt,
-        targetProvider,
-        mode: mode ?? 'auto-send',
-        ...(resolvedWorkstreamId === undefined ? {} : { workstreamId: resolvedWorkstreamId }),
-      });
-    },
-  );
+  // Note: the legacy `bac.coding_session_register` and `bac.request_dispatch`
+  // tool registrations were deleted in Phase 1.4a of the spec-alignment
+  // refactor. Their typed replacements `sidetrack.session.attach` and
+  // `sidetrack.dispatch.{create,await_capture}` are registered above by
+  // registerSessionTools / registerDispatchTools.
 
   // Write tools — let an attached coding agent move a thread into a
   // workstream and park a follow-up question. Both wrap existing
@@ -525,7 +375,7 @@ export const createSidetrackMcpServer = (
   // The companion enforces auth via x-bac-bridge-key; per-workstream
   // trust UI is intentionally deferred.
   server.registerTool(
-    'bac.move_item',
+    'sidetrack.threads.move',
     {
       description:
         'Move a tracked thread into a workstream. Pass workstreamId="" (empty string) to clear the assignment and park the thread back at the top level. Returns the updated thread bac_id + revision.',
@@ -540,7 +390,7 @@ export const createSidetrackMcpServer = (
     async ({ threadId, workstreamId }) => {
       if (companionClient?.moveThread === undefined) {
         throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.move_item is unavailable.',
+          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.threads.move is unavailable.',
         );
       }
       const target =
@@ -558,7 +408,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.queue_item',
+    'sidetrack.queue.create',
     {
       description:
         "Park a follow-up question for the user. Scope determines where it lands: 'thread' (set targetId to a thread bac_id), 'workstream' (set targetId to a workstream bac_id), or 'global' (no target). Returns the queue item bac_id.",
@@ -578,12 +428,12 @@ export const createSidetrackMcpServer = (
     async ({ text, scope, targetId }) => {
       if (companionClient?.createQueueItem === undefined) {
         throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.queue_item is unavailable.',
+          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.queue.create is unavailable.',
         );
       }
       if (scope !== 'global' && (targetId === undefined || targetId.length === 0)) {
         throw new Error(
-          `bac.queue_item requires targetId when scope='${scope}'. Pass the thread or workstream bac_id, or use scope='global'.`,
+          `sidetrack.queue.create requires targetId when scope='${scope}'. Pass the thread or workstream bac_id, or use scope='global'.`,
         );
       }
       const result = await companionClient.createQueueItem({
@@ -600,7 +450,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.bump_workstream',
+    'sidetrack.workstreams.bump',
     {
       description: 'Mark a workstream as recently active by updating lastBumpedAt.',
       inputSchema: { bac_id: z.string().min(1) },
@@ -608,7 +458,7 @@ export const createSidetrackMcpServer = (
     async ({ bac_id }) => {
       if (companionClient?.bumpWorkstream === undefined) {
         throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.bump_workstream is unavailable.',
+          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.workstreams.bump is unavailable.',
         );
       }
       return asStructuredContent(await companionClient.bumpWorkstream({ bac_id }));
@@ -616,7 +466,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.archive_thread',
+    'sidetrack.threads.archive',
     {
       description: 'Soft-archive a tracked thread. Idempotent.',
       inputSchema: { bac_id: z.string().min(1) },
@@ -624,7 +474,7 @@ export const createSidetrackMcpServer = (
     async ({ bac_id }) => {
       if (companionClient?.archiveThread === undefined) {
         throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.archive_thread is unavailable.',
+          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.threads.archive is unavailable.',
         );
       }
       return asStructuredContent(await companionClient.archiveThread({ bac_id }));
@@ -632,7 +482,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.unarchive_thread',
+    'sidetrack.threads.unarchive',
     {
       description: 'Clear a thread soft-archive marker. Idempotent.',
       inputSchema: { bac_id: z.string().min(1) },
@@ -640,38 +490,20 @@ export const createSidetrackMcpServer = (
     async ({ bac_id }) => {
       if (companionClient?.unarchiveThread === undefined) {
         throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.unarchive_thread is unavailable.',
+          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.threads.unarchive is unavailable.',
         );
       }
       return asStructuredContent(await companionClient.unarchiveThread({ bac_id }));
     },
   );
 
-  server.registerTool(
-    'bac.list_dispatches',
-    {
-      description: 'Return recent dispatch events through the bridge-authenticated companion API.',
-      inputSchema: {
-        limit: z.number().int().positive().max(100).optional(),
-        since: z.iso.datetime().optional(),
-      },
-    },
-    async ({ limit, since }) => {
-      if (companionClient?.listDispatches === undefined) {
-        throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.list_dispatches is unavailable.',
-        );
-      }
-      const data = await companionClient.listDispatches({
-        ...(limit === undefined ? {} : { limit }),
-        ...(since === undefined ? {} : { since }),
-      });
-      return asStructuredContent({ data: [...data] });
-    },
-  );
+  // bac.list_dispatches deleted in Phase 1.4: it duplicated the
+  // vault-reader-backed sidetrack.dispatches.list (registered below).
+  // The HTTP-shim version offered nothing beyond what the local vault
+  // reader already provides.
 
   server.registerTool(
-    'bac.list_audit_events',
+    'sidetrack.audit.list',
     {
       description: 'Return recent companion audit events through the companion API.',
       inputSchema: {
@@ -682,7 +514,7 @@ export const createSidetrackMcpServer = (
     async ({ limit, since }) => {
       if (companionClient?.listAuditEvents === undefined) {
         throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.list_audit_events is unavailable.',
+          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.audit.list is unavailable.',
         );
       }
       const data = await companionClient.listAuditEvents({
@@ -694,7 +526,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.list_workstream_notes',
+    'sidetrack.workstreams.notes',
     {
       description: 'Return human-authored markdown notes whose frontmatter links to a workstream.',
       inputSchema: {
@@ -704,7 +536,7 @@ export const createSidetrackMcpServer = (
     async ({ workstreamId }) => {
       if (companionClient?.listWorkstreamNotes === undefined) {
         throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.list_workstream_notes is unavailable.',
+          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.workstreams.notes is unavailable.',
         );
       }
       const items = await companionClient.listWorkstreamNotes({ workstreamId });
@@ -712,77 +544,14 @@ export const createSidetrackMcpServer = (
     },
   );
 
-  server.registerTool(
-    'bac.create_annotation',
-    {
-      description:
-        'Persist a term-scoped web annotation. Use prefix/suffix from the surrounding text when the term appears multiple times on the page.',
-      inputSchema: {
-        url: z.url().describe('Exact page URL where the annotation should be restored.'),
-        pageTitle: z.string().min(1).describe('Current page title.'),
-        term: z
-          .string()
-          .trim()
-          .min(1)
-          .max(400)
-          .describe('Exact term or short quote to highlight on the page.'),
-        note: z.string().max(5000).describe('Annotation note to show in Sidetrack.'),
-        prefix: z
-          .string()
-          .max(512)
-          .optional()
-          .describe(
-            'Optional text immediately before the target term. Used to disambiguate repeated terms.',
-          ),
-        suffix: z
-          .string()
-          .max(512)
-          .optional()
-          .describe(
-            'Optional text immediately after the target term. Used to disambiguate repeated terms.',
-          ),
-      },
-    },
-    async ({ url, pageTitle, term, note, prefix, suffix }) => {
-      if (companionClient?.createAnnotation === undefined) {
-        throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.create_annotation is unavailable.',
-        );
-      }
-      // Short terms collide on common pages — "node" or "AI" hits a
-      // dozen unrelated occurrences. Refuse without context so the
-      // agent has to provide prefix/suffix that pins to the right
-      // sentence. Anything ≥ TERM_MIN_LEN_WITHOUT_CONTEXT is allowed
-      // unconditionally; the agent is trusted to be specific.
-      const trimmedTerm = term.trim();
-      const hasContext =
-        (prefix !== undefined && prefix.trim().length > 0) ||
-        (suffix !== undefined && suffix.trim().length > 0);
-      if (trimmedTerm.length < TERM_MIN_LEN_WITHOUT_CONTEXT && !hasContext) {
-        throw new Error(
-          `bac.create_annotation: term "${trimmedTerm}" is shorter than ${String(TERM_MIN_LEN_WITHOUT_CONTEXT)} chars; provide prefix or suffix from the surrounding sentence so the highlight pins to the intended occurrence.`,
-        );
-      }
-      const annotation = await companionClient.createAnnotation({
-        url,
-        pageTitle,
-        anchor: buildTermAnchor({
-          term,
-          ...(prefix === undefined ? {} : { prefix }),
-          ...(suffix === undefined ? {} : { suffix }),
-        }),
-        note,
-      });
-      return asStructuredContent({
-        annotation,
-        term,
-        createdAt: new Date().toISOString(),
-      });
-    },
-  );
+  // Note: the legacy `bac.create_annotation` tool registration was
+  // deleted in Phase 1.4a. The typed replacement is
+  // `sidetrack.annotations.create_batch` (registered above by
+  // registerAnnotationTools), which accepts 1..20 items in a single
+  // call and surfaces per-item status for partial-failure handling.
 
   server.registerTool(
-    'bac.list_annotations',
+    'sidetrack.annotations.list',
     {
       description: 'Return persisted web annotations, optionally filtered by URL.',
       inputSchema: {
@@ -793,7 +562,7 @@ export const createSidetrackMcpServer = (
     async ({ url, limit }) => {
       if (companionClient?.listAnnotations === undefined) {
         throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.list_annotations is unavailable.',
+          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.annotations.list is unavailable.',
         );
       }
       const data = await companionClient.listAnnotations({
@@ -805,7 +574,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.update_annotation',
+    'sidetrack.annotations.update',
     {
       description:
         'Update an annotation note while preserving the previous note in revision history.',
@@ -814,7 +583,7 @@ export const createSidetrackMcpServer = (
     async ({ bac_id, note }) => {
       if (companionClient?.updateAnnotation === undefined) {
         throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.update_annotation is unavailable.',
+          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.annotations.update is unavailable.',
         );
       }
       return asStructuredContent(await companionClient.updateAnnotation({ bac_id, note }));
@@ -822,7 +591,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.delete_annotation',
+    'sidetrack.annotations.delete',
     {
       description: 'Soft-delete an annotation. Idempotent; history is preserved.',
       inputSchema: { bac_id: z.string().min(1) },
@@ -830,7 +599,7 @@ export const createSidetrackMcpServer = (
     async ({ bac_id }) => {
       if (companionClient?.deleteAnnotation === undefined) {
         throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.delete_annotation is unavailable.',
+          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.annotations.delete is unavailable.',
         );
       }
       return asStructuredContent(await companionClient.deleteAnnotation({ bac_id }));
@@ -838,7 +607,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.read_thread_md',
+    'sidetrack.threads.read_md',
     {
       description: 'Return raw vault Markdown for a tracked thread, capped by the companion.',
       inputSchema: { bac_id: z.string().min(1) },
@@ -846,7 +615,7 @@ export const createSidetrackMcpServer = (
     async ({ bac_id }) => {
       if (companionClient?.readThreadMarkdown === undefined) {
         throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.read_thread_md is unavailable.',
+          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.threads.read_md is unavailable.',
         );
       }
       return asStructuredContent(await companionClient.readThreadMarkdown({ bac_id }));
@@ -854,7 +623,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.read_workstream_md',
+    'sidetrack.workstreams.read_md',
     {
       description: 'Return raw vault Markdown for a workstream root file, capped by the companion.',
       inputSchema: { bac_id: z.string().min(1) },
@@ -862,7 +631,7 @@ export const createSidetrackMcpServer = (
     async ({ bac_id }) => {
       if (companionClient?.readWorkstreamMarkdown === undefined) {
         throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.read_workstream_md is unavailable.',
+          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.workstreams.read_md is unavailable.',
         );
       }
       return asStructuredContent(await companionClient.readWorkstreamMarkdown({ bac_id }));
@@ -870,7 +639,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.recall',
+    'sidetrack.recall.query',
     {
       description: 'Run companion-backed vector recall over captured turns.',
       inputSchema: {
@@ -882,7 +651,7 @@ export const createSidetrackMcpServer = (
     async ({ query, limit, workstreamId }) => {
       if (companionClient?.recall === undefined) {
         throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.recall is unavailable.',
+          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.recall.query is unavailable.',
         );
       }
       const data = await companionClient.recall({
@@ -895,7 +664,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.suggest_workstream',
+    'sidetrack.suggestions.workstream',
     {
       description: 'Score likely workstreams for a tracked thread without auto-applying.',
       inputSchema: {
@@ -906,7 +675,7 @@ export const createSidetrackMcpServer = (
     async ({ threadId, limit }) => {
       if (companionClient?.suggestWorkstream === undefined) {
         throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.suggest_workstream is unavailable.',
+          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.suggestions.workstream is unavailable.',
         );
       }
       const data = await companionClient.suggestWorkstream({
@@ -918,7 +687,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.export_settings',
+    'sidetrack.settings.export',
     {
       description: 'Export portable Sidetrack settings and workstream metadata.',
       inputSchema: {},
@@ -926,7 +695,7 @@ export const createSidetrackMcpServer = (
     async () => {
       if (companionClient?.exportSettings === undefined) {
         throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.export_settings is unavailable.',
+          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.settings.export is unavailable.',
         );
       }
       return asStructuredContent(await companionClient.exportSettings());
@@ -934,7 +703,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.system_update_check',
+    'sidetrack.system.update_check',
     {
       description: 'Return read-only companion version update advisory.',
       inputSchema: {},
@@ -942,7 +711,7 @@ export const createSidetrackMcpServer = (
     async () => {
       if (companionClient?.systemUpdateCheck === undefined) {
         throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.system_update_check is unavailable.',
+          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.system.update_check is unavailable.',
         );
       }
       return asStructuredContent(await companionClient.systemUpdateCheck());
@@ -950,7 +719,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.list_buckets',
+    'sidetrack.buckets.list',
     {
       description: 'List companion multi-vault routing buckets. Read-only.',
       inputSchema: {},
@@ -958,7 +727,7 @@ export const createSidetrackMcpServer = (
     async () => {
       if (companionClient?.listBuckets === undefined) {
         throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.list_buckets is unavailable.',
+          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.buckets.list is unavailable.',
         );
       }
       return asStructuredContent({ items: [...(await companionClient.listBuckets())] });
@@ -966,7 +735,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.system_health',
+    'sidetrack.system.health',
     {
       description: 'Return best-effort companion health metrics for diagnostics.',
       inputSchema: {},
@@ -974,7 +743,7 @@ export const createSidetrackMcpServer = (
     async () => {
       if (companionClient?.systemHealth === undefined) {
         throw new Error(
-          'sidetrack-mcp was started without --companion-url / --bridge-key; bac.system_health is unavailable.',
+          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.system.health is unavailable.',
         );
       }
       return asStructuredContent(await companionClient.systemHealth());
@@ -986,7 +755,7 @@ export const createSidetrackMcpServer = (
   // a user-mediated surface rather than agent invocation.
 
   server.registerTool(
-    'bac.dispatches',
+    'sidetrack.dispatches.list',
     {
       description: 'Return recent dispatch events from the live Sidetrack vault dispatch ledger.',
       inputSchema: {
@@ -1011,7 +780,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.reviews',
+    'sidetrack.reviews.list',
     {
       description: 'Return recent review events from the live Sidetrack vault review ledger.',
       inputSchema: {
@@ -1036,7 +805,7 @@ export const createSidetrackMcpServer = (
   );
 
   server.registerTool(
-    'bac.turns',
+    'sidetrack.threads.turns',
     {
       description:
         'Return the most-recent captured assistant/user turns for a thread, by threadUrl, deduped by ordinal.',

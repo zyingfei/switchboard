@@ -4,7 +4,7 @@ import type { Writable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
-import { m1ReadToolNames } from './capabilities.js';
+import { sidetrackToolNames } from './capabilities.js';
 import { createSidetrackMcpServer, type CompanionWriteClient } from './server/mcpServer.js';
 import { sidetrackMcpWebSocketPort, startWebSocketMcpServer } from './server/websocketServer.js';
 import { LiveVaultReader } from './vault/liveVaultReader.js';
@@ -274,7 +274,7 @@ const createCompanionWriteClient = (
           },
         },
         {
-          'x-sidetrack-mcp-tool': 'bac.request_dispatch',
+          'x-sidetrack-mcp-tool': 'sidetrack.dispatch.create',
           'idempotency-key': idempotencyKey(
             'mcp-dispatch',
             [
@@ -314,7 +314,7 @@ const createCompanionWriteClient = (
       };
       const body = await post<{
         readonly data?: { readonly bac_id?: string; readonly revision?: string };
-      }>('/v1/threads', upsert, { 'x-sidetrack-mcp-tool': 'bac.move_item' });
+      }>('/v1/threads', upsert, { 'x-sidetrack-mcp-tool': 'sidetrack.threads.move' });
       if (typeof body.data?.bac_id !== 'string' || typeof body.data.revision !== 'string') {
         throw new Error('Companion did not return bac_id + revision for the moved thread.');
       }
@@ -324,7 +324,7 @@ const createCompanionWriteClient = (
       const body = await post<{
         readonly data?: { readonly bac_id?: string; readonly revision?: string };
       }>('/v1/queue', input, {
-        'x-sidetrack-mcp-tool': 'bac.queue_item',
+        'x-sidetrack-mcp-tool': 'sidetrack.queue.create',
         'idempotency-key': idempotencyKey(
           'mcp-queue',
           `${input.scope}-${input.targetId ?? 'global'}-${input.text}`,
@@ -340,7 +340,7 @@ const createCompanionWriteClient = (
         '/v1/annotations',
         input,
         {
-          'x-sidetrack-mcp-tool': 'bac.create_annotation',
+          'x-sidetrack-mcp-tool': 'sidetrack.annotations.create',
           'idempotency-key': idempotencyKey(
             'mcp-annotation',
             [
@@ -363,7 +363,7 @@ const createCompanionWriteClient = (
         `/v1/workstreams/${encodeURIComponent(input.bac_id)}/bump`,
         {},
         {
-          'x-sidetrack-mcp-tool': 'bac.bump_workstream',
+          'x-sidetrack-mcp-tool': 'sidetrack.workstreams.bump',
         },
       );
       if (typeof body.data?.bac_id !== 'string' || typeof body.data.revision !== 'string') {
@@ -378,7 +378,7 @@ const createCompanionWriteClient = (
         `/v1/threads/${encodeURIComponent(input.bac_id)}/archive`,
         {},
         {
-          'x-sidetrack-mcp-tool': 'bac.archive_thread',
+          'x-sidetrack-mcp-tool': 'sidetrack.threads.archive',
         },
       );
       if (typeof body.data?.bac_id !== 'string' || typeof body.data.revision !== 'string') {
@@ -393,7 +393,7 @@ const createCompanionWriteClient = (
         `/v1/threads/${encodeURIComponent(input.bac_id)}/unarchive`,
         {},
         {
-          'x-sidetrack-mcp-tool': 'bac.unarchive_thread',
+          'x-sidetrack-mcp-tool': 'sidetrack.threads.unarchive',
         },
       );
       if (typeof body.data?.bac_id !== 'string' || typeof body.data.revision !== 'string') {
@@ -509,7 +509,7 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
   }
 
   if (args.listTools) {
-    writeLine(streams.stdout, m1ReadToolNames.join('\n'));
+    writeLine(streams.stdout, sidetrackToolNames.join('\n'));
     return 0;
   }
 

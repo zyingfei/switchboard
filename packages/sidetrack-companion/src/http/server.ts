@@ -401,11 +401,11 @@ const mcpToolHeader = (request: IncomingMessage): WorkstreamWriteTool | undefine
   }
   return (
     [
-      'bac.move_item',
-      'bac.queue_item',
-      'bac.bump_workstream',
-      'bac.archive_thread',
-      'bac.unarchive_thread',
+      'sidetrack.threads.move',
+      'sidetrack.queue.create',
+      'sidetrack.workstreams.bump',
+      'sidetrack.threads.archive',
+      'sidetrack.threads.unarchive',
     ] as const
   ).find((tool) => tool === value);
 };
@@ -1296,7 +1296,7 @@ const routes: readonly RouteDefinition[] = [
     handle: async (request, requestId, _match, context) => {
       const input = await parseThreadUpsertBody(requireVaultRoot(context), await readBody(request));
       const tool = mcpToolHeader(request);
-      if (tool === 'bac.move_item') {
+      if (tool === 'sidetrack.threads.move') {
         await requireWorkstreamTrust(context, input.primaryWorkstreamId, tool);
       }
       const result = await context.vaultWriter.upsertThread(input, requestId);
@@ -1323,11 +1323,11 @@ const routes: readonly RouteDefinition[] = [
         throw new Error('Missing bacId path parameter.');
       }
       const vaultRoot = requireVaultRoot(context);
-      if (mcpToolHeader(_request) === 'bac.archive_thread') {
+      if (mcpToolHeader(_request) === 'sidetrack.threads.archive') {
         await requireWorkstreamTrust(
           context,
           await readThreadWorkstreamId(vaultRoot, match.bacId),
-          'bac.archive_thread',
+          'sidetrack.threads.archive',
         );
       }
       const result = await context.vaultWriter.archiveThread(match.bacId, requestId);
@@ -1351,11 +1351,11 @@ const routes: readonly RouteDefinition[] = [
       if (match.bacId === undefined) {
         throw new Error('Missing bacId path parameter.');
       }
-      if (mcpToolHeader(_request) === 'bac.unarchive_thread') {
+      if (mcpToolHeader(_request) === 'sidetrack.threads.unarchive') {
         await requireWorkstreamTrust(
           context,
           await readThreadWorkstreamId(requireVaultRoot(context), match.bacId),
-          'bac.unarchive_thread',
+          'sidetrack.threads.unarchive',
         );
       }
       const result = await context.vaultWriter.unarchiveThread(match.bacId, requestId);
@@ -1439,8 +1439,8 @@ const routes: readonly RouteDefinition[] = [
       if (match.bacId === undefined) {
         throw new Error('Missing bacId path parameter.');
       }
-      if (mcpToolHeader(_request) === 'bac.bump_workstream') {
-        await requireWorkstreamTrust(context, match.bacId, 'bac.bump_workstream');
+      if (mcpToolHeader(_request) === 'sidetrack.workstreams.bump') {
+        await requireWorkstreamTrust(context, match.bacId, 'sidetrack.workstreams.bump');
       }
       return [
         200,
@@ -1492,7 +1492,7 @@ const routes: readonly RouteDefinition[] = [
       return await runIdempotent(context, 'createQueueItem', idempotencyKey, async () => {
         const input = queueCreateSchema.parse(await readBody(request));
         const tool = mcpToolHeader(request);
-        if (tool === 'bac.queue_item' && input.scope === 'workstream') {
+        if (tool === 'sidetrack.queue.create' && input.scope === 'workstream') {
           await requireWorkstreamTrust(context, input.targetId, tool);
         }
         const result = await context.vaultWriter.createQueueItem(input, requestId);

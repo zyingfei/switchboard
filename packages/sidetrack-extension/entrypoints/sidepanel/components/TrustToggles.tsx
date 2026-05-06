@@ -9,11 +9,11 @@ import { Icons } from './icons';
 // and writes back on each toggle.
 
 export type TrustTool =
-  | 'bac.move_item'
-  | 'bac.queue_item'
-  | 'bac.bump_workstream'
-  | 'bac.archive_thread'
-  | 'bac.unarchive_thread';
+  | 'sidetrack.threads.move'
+  | 'sidetrack.queue.create'
+  | 'sidetrack.workstreams.bump'
+  | 'sidetrack.threads.archive'
+  | 'sidetrack.threads.unarchive';
 
 export interface TrustEntry {
   readonly tool: TrustTool;

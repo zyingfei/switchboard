@@ -131,8 +131,8 @@ test.describe('live coding attach (logged-in profile)', () => {
         },
       });
 
-      const registerResult = (await mcp.callTool('bac.coding_session_register', {
-        token,
+      const registerResult = (await mcp.callTool('sidetrack.session.attach', {
+        attachToken: token,
         tool: 'codex',
         cwd: '/Users/yingfei/Documents/playground/browser-ai-companion',
         branch: 'ux/design-tokens-and-extended-live-tests',
@@ -141,10 +141,10 @@ test.describe('live coding attach (logged-in profile)', () => {
         resumeCommand: 'codex resume live-coding-attach',
       })) as {
         readonly isError?: boolean;
-        readonly structuredContent?: { readonly bac_id?: string };
+        readonly structuredContent?: { readonly codingSessionId?: string };
       };
       expect(registerResult.isError).not.toBe(true);
-      expect(registerResult.structuredContent?.bac_id).toBeTruthy();
+      expect(registerResult.structuredContent?.codingSessionId).toBeTruthy();
 
       // Force a workboard refresh so the side panel's cached
       // codingSessions includes the freshly-registered MCP session.
@@ -158,7 +158,7 @@ test.describe('live coding attach (logged-in profile)', () => {
         sidepanel.locator('.coding-session-row .name', { hasText: 'codex · live' }),
       ).toBeVisible({ timeout: 10_000 });
 
-      const workstreamResult = (await mcp.callTool('bac.workstream', {
+      const workstreamResult = (await mcp.callTool('sidetrack.workstreams.get', {
         id: workstream?.bac_id,
       })) as {
         readonly isError?: boolean;
