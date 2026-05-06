@@ -550,6 +550,69 @@ describe('sidetrack.dispatch.create', () => {
       await client.close();
     }
   });
+
+  it('prepends a captureProfile formatting block to the body', async () => {
+    const writeClient = buildFakeWriteClient();
+    const reader: SidetrackMcpReader = {
+      ...fakeReader,
+      readCodingSessions: () => Promise.resolve([attachedSession()]),
+    };
+    const client = await startInProcessServer(writeClient, reader);
+    try {
+      await client.callTool({
+        name: 'sidetrack.dispatch.create',
+        arguments: {
+          codingSessionId: 'bac_session_attached',
+          targetProvider: 'gemini',
+          title: 'B+ tree deep dive',
+          body: 'Please explain B+ trees from first principles.',
+          captureProfile: 'annotation_friendly',
+        },
+      });
+      expect(writeClient.requestDispatch).toHaveBeenCalledTimes(1);
+      const call = (writeClient.requestDispatch as unknown as { mock: { calls: unknown[][] } })
+        .mock.calls[0]?.[0] as { readonly body: string };
+      // Profile-derived formatting prefix is at the top; the
+      // user's intent stays verbatim below it.
+      expect(call.body).toMatch(/respond in plain text/i);
+      expect(call.body).toMatch(/ASCII for diagrams/i);
+      expect(call.body).toContain('Please explain B+ trees from first principles.');
+      // Order matters — the user's message should be the LAST line
+      // so target-AI attention bias still favours intent over
+      // formatting.
+      expect(call.body.indexOf('Please explain B+ trees')).toBeGreaterThan(
+        call.body.indexOf('respond in plain text'),
+      );
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('emits a resource_link content block for the dispatch record', async () => {
+    const writeClient = buildFakeWriteClient();
+    const reader: SidetrackMcpReader = {
+      ...fakeReader,
+      readCodingSessions: () => Promise.resolve([attachedSession()]),
+    };
+    const client = await startInProcessServer(writeClient, reader);
+    try {
+      const result = await client.callTool({
+        name: 'sidetrack.dispatch.create',
+        arguments: {
+          codingSessionId: 'bac_session_attached',
+          targetProvider: 'chatgpt',
+          title: 'Ask ChatGPT',
+          body: 'Please review this context.',
+        },
+      });
+      const blocks = result.content as readonly { readonly type: string; readonly uri?: string }[];
+      const link = blocks.find((block) => block.type === 'resource_link');
+      expect(link).toBeDefined();
+      expect(link?.uri).toBe('sidetrack://dispatch/bac_dispatch_fake');
+    } finally {
+      await client.close();
+    }
+  });
 });
 
 describe('sidetrack.dispatch.await_capture', () => {
