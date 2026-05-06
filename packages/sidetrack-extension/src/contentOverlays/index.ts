@@ -869,9 +869,13 @@ export const mountReviewSelectionChip = (opts: ReviewChipMountOptions): { close:
   // clamped to viewport. Two independent absolute-positioned chips —
   // simpler than a wrapper div with flex (the wrapper version was
   // dropping the + Comment button on some renders, see prior bug).
-  const COMMENT_W = 110;
-  const DEJA_W = 100;
-  const GAP = 6;
+  // Widths are calibrated to the rendered chip (mono 10.5px label +
+  // 12px display glyph + 4px×2 padding + 5px inner gap → ~80px). The
+  // constants used to over-allocate by ~30px each, leaving a stranded
+  // visual gap between the two chips even though GAP was small.
+  const COMMENT_W = 84;
+  const DEJA_W = 84;
+  const GAP = 4;
   const totalWidth = opts.onDejaVu !== undefined ? COMMENT_W + GAP + DEJA_W : COMMENT_W;
   const viewportWidth = document.documentElement.clientWidth;
   let leftAnchor = Math.max(8, opts.anchorRect.right - 50);
