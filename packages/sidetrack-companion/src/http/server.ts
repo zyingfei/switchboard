@@ -668,25 +668,70 @@ const routes: readonly RouteDefinition[] = [
     method: 'GET',
     pattern: /^\/v1\/status$/,
     authRequired: true,
-    handle: async (_request, requestId, _match, context) => [
-      200,
-      {
-        data: {
-          companion: 'running',
-          vault: await context.vaultWriter.status(),
-          ...(context.mcp === undefined
-            ? {}
-            : {
-                mcp: {
-                  port: context.mcp.port,
-                  authKey: context.mcp.authKey,
-                  url: `http://127.0.0.1:${String(context.mcp.port)}/mcp`,
-                },
-              }),
-          requestId,
+    handle: async (_request, requestId, _match, context) => {
+      // P1-review: when the companion manages an MCP child, also
+      // probe its /mcp endpoint so the side panel knows whether
+      // restart/config changes succeeded. Probe is a TCP-cheap
+      // HEAD/OPTIONS-style fetch with a 1s timeout — slow enough
+      // to detect a wedged process, fast enough to not stall
+      // /v1/status during normal polling.
+      let mcpHealth: { reachable: boolean; checkedAt: string; detail?: string } | undefined;
+      if (context.mcp !== undefined) {
+        const checkedAt = new Date().toISOString();
+        const controller = new AbortController();
+        const timer = setTimeout(() => {
+          controller.abort();
+        }, 1000);
+        try {
+          const probe = await fetch(
+            `http://127.0.0.1:${String(context.mcp.port)}/mcp`,
+            {
+              method: 'GET',
+              headers: { Authorization: `Bearer ${context.mcp.authKey}` },
+              signal: controller.signal,
+            },
+          );
+          // 401/405 still means a process is listening + answering
+          // HTTP. Anything that completes the round-trip counts as
+          // reachable; only network/timeout errors mark unreachable.
+          mcpHealth = { reachable: true, checkedAt, detail: `http ${String(probe.status)}` };
+        } catch (error) {
+          mcpHealth = {
+            reachable: false,
+            checkedAt,
+            detail: error instanceof Error ? error.message : String(error),
+          };
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+      return [
+        200,
+        {
+          data: {
+            companion: 'running',
+            vault: await context.vaultWriter.status(),
+            // P1-review: vaultRoot lets the side panel build Codex
+            // MCP config snippets without asking the user to paste
+            // the absolute vault path. Only included when the
+            // companion was started with one (test mode passes
+            // undefined).
+            ...(context.vaultRoot === undefined ? {} : { vaultRoot: context.vaultRoot }),
+            ...(context.mcp === undefined
+              ? {}
+              : {
+                  mcp: {
+                    port: context.mcp.port,
+                    authKey: context.mcp.authKey,
+                    url: `http://127.0.0.1:${String(context.mcp.port)}/mcp`,
+                    ...(mcpHealth === undefined ? {} : { health: mcpHealth }),
+                  },
+                }),
+            requestId,
+          },
         },
-      },
-    ],
+      ];
+    },
   },
   {
     method: 'GET',

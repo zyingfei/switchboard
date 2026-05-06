@@ -4856,6 +4856,48 @@ button.btn-link.thread-dispatched-name:hover {
 .signal {
   color: var(--signal, #c2410c);
 }
+.coding-handoff-config {
+  margin: 12px 0;
+  border: 1px solid var(--rule-soft, #e5ddc9);
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: var(--paper, #fdfaf2);
+}
+.coding-handoff-config > summary {
+  cursor: pointer;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-2, #4a4640);
+  list-style: none;
+}
+.coding-handoff-config > summary::-webkit-details-marker {
+  display: none;
+}
+.coding-handoff-config[open] > summary {
+  margin-bottom: 8px;
+}
+.coding-handoff-config-body {
+  display: grid;
+  gap: 12px;
+}
+.coding-handoff-snippet {
+  display: grid;
+  gap: 4px;
+}
+.coding-handoff-snippet-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  font-size: 10.5px;
+  color: var(--ink-3, #7a7269);
+  letter-spacing: 0.04em;
+}
+.coding-handoff-snippet-head .btn {
+  padding: 2px 8px;
+  font-size: 10.5px;
+}
 
 /* ──────────────────────────────────────────────────────────────────
    v2 design pass — dark mode + density + new surfaces

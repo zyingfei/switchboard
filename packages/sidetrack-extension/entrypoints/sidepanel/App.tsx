@@ -614,7 +614,9 @@ const App = () => {
     readonly url: string;
     readonly port: number;
     readonly authKey: string;
+    readonly health?: { readonly reachable: boolean; readonly checkedAt: string };
   } | null>(null);
+  const [vaultRoot, setVaultRoot] = useState<string | null>(null);
 
   const threads = useMemo(() => visibleThreads(state.threads), [state.threads]);
   // Stable string that mutates whenever the workstream graph or any
@@ -775,6 +777,7 @@ const App = () => {
   useEffect(() => {
     if (state.companionStatus !== 'connected' || bridgeKey.trim().length === 0) {
       setMcpInfo(null);
+      setVaultRoot(null);
       return undefined;
     }
     const portValue = state.settings.companion.port;
@@ -787,21 +790,44 @@ const App = () => {
         if (!response.ok || cancelled) return;
         const body = (await response.json()) as {
           readonly data?: {
+            readonly vaultRoot?: unknown;
             readonly mcp?: {
               readonly url?: unknown;
               readonly port?: unknown;
               readonly authKey?: unknown;
+              readonly health?: {
+                readonly reachable?: unknown;
+                readonly checkedAt?: unknown;
+              };
             };
           };
         };
-        const mcp = body.data?.mcp;
+        const data = body.data;
+        if (typeof data?.vaultRoot === 'string' && data.vaultRoot.length > 0) {
+          setVaultRoot(data.vaultRoot);
+        } else {
+          setVaultRoot(null);
+        }
+        const mcp = data?.mcp;
         if (
           mcp !== undefined &&
           typeof mcp.url === 'string' &&
           typeof mcp.port === 'number' &&
           typeof mcp.authKey === 'string'
         ) {
-          setMcpInfo({ url: mcp.url, port: mcp.port, authKey: mcp.authKey });
+          const healthRaw = mcp.health;
+          const health =
+            healthRaw !== undefined &&
+            typeof healthRaw.reachable === 'boolean' &&
+            typeof healthRaw.checkedAt === 'string'
+              ? { reachable: healthRaw.reachable, checkedAt: healthRaw.checkedAt }
+              : undefined;
+          setMcpInfo({
+            url: mcp.url,
+            port: mcp.port,
+            authKey: mcp.authKey,
+            ...(health === undefined ? {} : { health }),
+          });
         } else {
           setMcpInfo(null);
         }
@@ -4919,6 +4945,10 @@ const App = () => {
             return 'http://127.0.0.1:8721/mcp';
           })()}
           mcpAuthBearer={mcpInfo?.authKey ?? (bridgeKey.length === 0 ? undefined : bridgeKey)}
+          {...(mcpInfo?.health === undefined ? {} : { mcpHealth: mcpInfo.health })}
+          {...(vaultRoot === null ? {} : { vaultRoot })}
+          {...(bridgeKey.length === 0 ? {} : { bridgeKey })}
+          companionPort={state.settings.companion.port}
           onCancel={() => {
             setCodingAttachOpen(false);
           }}
