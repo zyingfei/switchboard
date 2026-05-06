@@ -13,6 +13,7 @@
 export const sidetrackToolNames = [
   'sidetrack.dispatch.create',
   'sidetrack.dispatch.await_capture',
+  'sidetrack.session.attach',
   'bac.recent_threads',
   'bac.workstream',
   'bac.context_pack',

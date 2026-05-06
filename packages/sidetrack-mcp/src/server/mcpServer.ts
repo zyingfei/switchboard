@@ -13,6 +13,7 @@ import type {
 } from '../vault/liveVaultReader.js';
 import { searchIndex } from '../vault/searchIndex.js';
 import { registerDispatchTools } from './dispatchTools.js';
+import { registerSessionTools } from './sessionTools.js';
 
 export type RequestDispatchTargetProvider = 'chatgpt' | 'claude' | 'gemini';
 export type RequestDispatchMode = 'paste' | 'auto-send';
@@ -266,6 +267,7 @@ export const createSidetrackMcpServer = (
   // remain registered through this commit for compatibility; later
   // sub-commits in Phase 1 delete bac.request_dispatch.
   registerDispatchTools(server, reader, companionClient);
+  registerSessionTools(server, companionClient);
 
   server.registerTool(
     'bac.recent_threads',

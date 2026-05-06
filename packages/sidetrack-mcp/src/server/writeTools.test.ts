@@ -327,6 +327,69 @@ describe('bac.request_dispatch', () => {
   });
 });
 
+describe('sidetrack.session.attach', () => {
+  it('reports unavailable when no companion client is wired', async () => {
+    const client = await startInProcessServer();
+    try {
+      const result = await client.callTool({
+        name: 'sidetrack.session.attach',
+        arguments: {
+          attachToken: 'tok_abcdefgh',
+          tool: 'codex',
+          cwd: '/repo',
+          branch: 'main',
+          sessionId: 'sess-1',
+          name: 'codex · main',
+        },
+      });
+      expect(result.isError).toBe(true);
+      expect(errorText(result)).toMatch(/sidetrack\.session\.attach is unavailable/);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('forwards attach token + runtime metadata to the companion writer', async () => {
+    const writeClient = buildFakeWriteClient({
+      registerCodingSession: vi.fn(() =>
+        Promise.resolve({ bac_id: 'bac_session_typed', workstreamId: 'bac_ws_typed' }),
+      ),
+    });
+    const client = await startInProcessServer(writeClient);
+    try {
+      const result = await client.callTool({
+        name: 'sidetrack.session.attach',
+        arguments: {
+          attachToken: 'tok_abcdefgh',
+          tool: 'codex',
+          cwd: '/Users/me/repo',
+          branch: 'main',
+          sessionId: 'sess-7',
+          name: 'codex · main',
+          resumeCommand: 'codex resume sess-7',
+        },
+      });
+      expect(writeClient.registerCodingSession).toHaveBeenCalledWith({
+        token: 'tok_abcdefgh',
+        tool: 'codex',
+        cwd: '/Users/me/repo',
+        branch: 'main',
+        sessionId: 'sess-7',
+        name: 'codex · main',
+        resumeCommand: 'codex resume sess-7',
+      });
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({
+        codingSessionId: 'bac_session_typed',
+        workstreamId: 'bac_ws_typed',
+        tool: 'codex',
+      });
+    } finally {
+      await client.close();
+    }
+  });
+});
+
 describe('sidetrack.dispatch.create', () => {
   it('mirrors bac.request_dispatch behavior under the typed name', async () => {
     const writeClient = buildFakeWriteClient();
