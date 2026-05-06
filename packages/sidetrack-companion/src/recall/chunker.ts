@@ -161,6 +161,46 @@ const splitLongParagraph = (text: string): readonly string[] => {
   });
 };
 
+// Split an over-long fenced code block at LINE boundaries instead
+// of truncating. Each chunk's first line is the opening fence
+// `\`\`\`<lang>`; the lang is preserved so an embedder / lexical
+// reader still sees structurally-coherent code. Each chunk's last
+// line is the closing `\`\`\``. The total content covered across
+// chunks is the full fence body — no silent drops.
+const splitLongFence = (text: string): readonly string[] => {
+  if (text.length <= HARD_CAP_CHARS) return [text];
+  const lines = text.split('\n');
+  // Detect the opening fence line so we can reproduce it on each
+  // continuation chunk (preserves the language hint for syntax-
+  // aware readers + makes each chunk a valid markdown fence).
+  const openFence = lines[0] ?? '```';
+  const closeFence = '```';
+  // Strip the actual closing fence — we'll re-emit it on the last
+  // chunk. If there's no trailing fence (malformed input) we still
+  // close every chunk so downstream readers don't see open fences.
+  const lastIdx = lines.length - 1;
+  const hasClosing = /^```/.test(lines[lastIdx] ?? '');
+  const bodyLines = lines.slice(1, hasClosing ? lastIdx : lines.length);
+
+  const out: string[] = [];
+  let buf: string[] = [];
+  let bufChars = openFence.length + closeFence.length + 2;
+  for (const line of bodyLines) {
+    const lineChars = line.length + 1;
+    if (bufChars + lineChars > HARD_CAP_CHARS && buf.length > 0) {
+      out.push([openFence, ...buf, closeFence].join('\n'));
+      buf = [];
+      bufChars = openFence.length + closeFence.length + 2;
+    }
+    buf.push(line);
+    bufChars += lineChars;
+  }
+  if (buf.length > 0) {
+    out.push([openFence, ...buf, closeFence].join('\n'));
+  }
+  return out;
+};
+
 // The breadcrumb is a sparse stack indexed by heading level. Seeing
 // an Hn heading replaces entries at level n and drops everything
 // deeper, then appends the new heading at level n. This mirrors how
@@ -257,11 +297,15 @@ export const chunkTurn = (input: RecallChunkInput): readonly RecallChunk[] => {
     }
     // Code fences are kept intact — emit as their own chunk if they'd
     // overflow the buffer; otherwise they may stay buffered with
-    // surrounding paragraphs.
+    // surrounding paragraphs. Long fences (> HARD_CAP_CHARS) split
+    // at LINE boundaries into multiple chunks rather than truncating
+    // — recall search must not silently drop searchable content.
     if (block.kind === 'fence' && block.text.length >= MIN_CHUNK_CHARS) {
       flush();
       const parts =
-        block.text.length > HARD_CAP_CHARS ? [block.text.slice(0, HARD_CAP_CHARS)] : [block.text];
+        block.text.length > HARD_CAP_CHARS
+          ? splitLongFence(block.text)
+          : [block.text];
       for (const part of parts) {
         const idx = paragraphIndex;
         paragraphIndex += 1;

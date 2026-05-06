@@ -81,6 +81,26 @@ Some prose after the code.`;
     }
   });
 
+  it('splits an over-long fenced code block into multiple chunks at line boundaries (no truncation)', () => {
+    // Single fence with ~6 KB of body — well over HARD_CAP_CHARS.
+    const lines = Array.from({ length: 200 }, (_, i) => `// line ${String(i)} ${'x'.repeat(20)}`);
+    const fence = ['```ts', ...lines, '```'].join('\n');
+    const chunks = chunkTurn(baseInput({ markdown: fence }));
+    expect(chunks.length).toBeGreaterThan(1);
+    // Every chunk is a valid fence — opens with ```ts (lang
+    // preserved) and ends with the closing ``` so downstream
+    // readers see structurally-coherent code.
+    for (const chunk of chunks) {
+      expect(chunk.text.match(/```/g)?.length).toBe(2);
+      expect(chunk.text.startsWith('```ts')).toBe(true);
+    }
+    // No body line is silently dropped: every original `// line N`
+    // appears in at least one chunk.
+    const concatenated = chunks.map((c) => c.text).join('\n');
+    expect(concatenated).toContain('// line 0 ');
+    expect(concatenated).toContain('// line 199 ');
+  });
+
   it('drops empty / whitespace-only inputs', () => {
     expect(chunkTurn(baseInput({ text: '' }))).toEqual([]);
     expect(chunkTurn(baseInput({ text: '   \n\n   ' }))).toEqual([]);
