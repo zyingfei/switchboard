@@ -558,6 +558,7 @@ export const upsertLocalThread = async (
     lastTurnRole: input.lastTurnRole ?? existing?.lastTurnRole,
     autoSendEnabled: existing?.autoSendEnabled,
     selectedModel: input.selectedModel ?? existing?.selectedModel,
+    lastResearchMode: input.lastResearchMode ?? existing?.lastResearchMode,
   };
   await storageSet({
     [THREADS_KEY]: [

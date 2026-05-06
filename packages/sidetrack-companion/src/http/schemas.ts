@@ -147,6 +147,12 @@ export const threadUpsertSchema = z.object({
   tags: z.array(z.string()).optional(),
   trackingMode: z.enum(['auto', 'manual', 'stopped', 'removed']).optional(),
   tabSnapshot: tabSnapshotSchema.optional(),
+  // Surface of the most recent assistant turn — `deep-research` /
+  // `gemini-deep-research` flag the long-form research surface so
+  // the side panel and md sidecar can show "Deep Research" rather
+  // than just "active". Sourced from the per-turn `researchReport`
+  // enrichment; absent for ordinary threads.
+  lastResearchMode: z.enum(['deep-research', 'gemini-deep-research', 'unknown']).optional(),
 });
 
 export const workstreamCreateSchema = z.object({

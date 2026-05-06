@@ -139,6 +139,12 @@ export interface ThreadUpsert {
   readonly parentTitle?: string;
   readonly lastTurnRole?: 'user' | 'assistant' | 'system' | 'unknown';
   readonly selectedModel?: string;
+  // Mode of the most recent assistant turn that carried a research
+  // surface (Deep Research on ChatGPT, Gemini Deep Research). Bubbled
+  // up from the per-turn `researchReport.mode` enrichment so the
+  // tracked-thread record + md sidecar can render the active mode
+  // without re-walking captured turns.
+  readonly lastResearchMode?: 'deep-research' | 'gemini-deep-research' | 'unknown';
 }
 
 export interface CaptureNoteCreate {

@@ -67,6 +67,12 @@ export interface TrackedThread {
   // from. Provider-specific scraping; absent means we couldn't read
   // the picker (icon-only buttons, dynamic loading, etc).
   readonly selectedModel?: string;
+  // Mode of the most recent assistant turn's research surface (Deep
+  // Research on ChatGPT, Gemini Deep Research). Sourced from the
+  // per-turn `researchReport.mode` enrichment on the most recent
+  // assistant turn at capture time. Drives the side-panel mode chip
+  // and the markdown sidecar frontmatter; absent for ordinary threads.
+  readonly lastResearchMode?: 'deep-research' | 'gemini-deep-research' | 'unknown';
 }
 
 export interface WorkstreamNode {

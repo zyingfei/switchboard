@@ -1351,6 +1351,34 @@ describe('companion HTTP server', () => {
     ).resolves.toContain('Sidetrack');
   });
 
+  it('persists lastResearchMode on the thread record and renders it in the md sidecar', async () => {
+    const now = '2026-05-06T17:04:43.000Z';
+    const result = await jsonFetch(context, `${baseUrl}/v1/threads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({
+        bac_id: 'bac_thread_research',
+        provider: 'chatgpt',
+        threadUrl: 'https://chatgpt.com/c/research-thread',
+        title: 'Switchboard - Sync Architecture Feedback',
+        lastSeenAt: now,
+        status: 'active',
+        trackingMode: 'auto',
+        lastResearchMode: 'deep-research',
+      }),
+    });
+    expect(result.status).toBe(200);
+    const threadJson = JSON.parse(
+      await readFile(join(vaultPath, '_BAC', 'threads', 'bac_thread_research.json'), 'utf8'),
+    ) as { readonly lastResearchMode?: string };
+    expect(threadJson.lastResearchMode).toBe('deep-research');
+    const md = await readFile(
+      join(vaultPath, '_BAC', 'threads', 'bac_thread_research.md'),
+      'utf8',
+    );
+    expect(md).toContain('lastResearchMode: deep-research');
+  });
+
   it('reads raw thread and workstream markdown with a failure path for missing files', async () => {
     const now = '2026-04-26T21:32:00.000Z';
     await jsonFetch(context, `${baseUrl}/v1/threads`, {
