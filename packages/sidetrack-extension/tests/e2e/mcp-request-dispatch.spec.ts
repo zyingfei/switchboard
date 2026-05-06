@@ -63,7 +63,8 @@ test.describe('MCP request dispatch (synthetic)', () => {
       await sidepanel.locator('select').selectOption(workstreamId);
       await sidepanel.getByRole('button', { name: 'Generate prompt' }).click();
       const prompt = await extractPrompt(sidepanel);
-      expect(prompt).toContain('sidetrack_mcp: ws://127.0.0.1:8721/mcp?token=');
+      expect(prompt).toContain('sidetrack_mcp: http://127.0.0.1:8721/mcp');
+      expect(prompt).toContain('sidetrack_mcp_auth: Bearer ');
       expect(prompt).toContain(`sidetrack_workstream_id: ${workstreamId}`);
       expect(prompt).toContain('sidetrack.dispatch.create');
       const token = extractAttachToken(prompt);

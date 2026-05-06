@@ -27,9 +27,9 @@ interface ParsedArgs {
   readonly allowAutoUpdate: boolean;
   readonly vaultPath?: string;
   readonly port: number;
-  // Optional companion-managed MCP WebSocket subprocess. When both
-  // --mcp-port and --mcp-auth-key are set, the companion spawns the
-  // sibling sidetrack-mcp CLI after its own HTTP server is up,
+  // Optional companion-managed Streamable HTTP MCP subprocess. When
+  // both --mcp-port and --mcp-auth-key are set, the companion spawns
+  // the sibling sidetrack-mcp CLI after its own HTTP server is up,
   // wires it to this companion's URL + bridge key, and tears it
   // down on parent exit. Lets the user run a single command instead
   // of two coordinated terminals.
@@ -57,8 +57,8 @@ export const renderHelp = (): string =>
     'Starts the localhost companion API and writes Sidetrack-owned files under _BAC/.',
     '',
     'When --mcp-port and --mcp-auth-key are both set, the companion also spawns',
-    'the sibling sidetrack-mcp WebSocket server pointed at itself. The MCP server',
-    "shares the companion's lifetime; killing the companion kills it too.",
+    'the sibling sidetrack-mcp Streamable HTTP server pointed at itself. The MCP',
+    "server shares the companion's lifetime; killing the companion kills it too.",
     'Override the binary path with --mcp-bin if the sibling layout differs',
     '(default: ../sidetrack-mcp/dist/cli.js relative to this CLI).',
   ].join('\n');
@@ -154,7 +154,7 @@ const spawnMcpServer = (input: {
   const args = [
     input.mcpBin,
     '--transport',
-    'websocket',
+    'streamable-http',
     '--vault',
     input.vaultPath,
     '--port',
@@ -310,7 +310,7 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
     });
     writeLine(
       streams.stdout,
-      `mcp websocket  ws://127.0.0.1:${String(args.mcpPort)}/mcp (managed by companion)`,
+      `mcp http       http://127.0.0.1:${String(args.mcpPort)}/mcp (managed by companion)`,
     );
     if (mcpAuthKeyPath !== undefined) {
       const keyOrigin = mcpAuthKeyCreated ? 'generated' : 'reused';

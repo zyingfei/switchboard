@@ -11,6 +11,11 @@ export interface CodingAttachProps {
   readonly workstreams: readonly { readonly bac_id: string; readonly path: string }[];
   readonly companionAvailable: boolean;
   readonly mcpEndpoint?: string;
+  // Optional bearer key for the Streamable HTTP MCP server. When set,
+  // the agent prompt instructs the agent to send
+  // `Authorization: Bearer <key>` on every MCP request. Loopback-only
+  // companions can leave this undefined and rely on the loopback gate.
+  readonly mcpAuthBearer?: string;
   readonly onCancel: () => void;
   readonly onAttached: (session: CodingSession) => void;
   readonly onCreateToken: (request: {
@@ -29,18 +34,23 @@ const buildAgentPrompt = (
   token: string,
   workstreamId: string | undefined,
   mcpEndpoint: string,
+  mcpAuthBearer: string | undefined,
 ): string =>
   [
     '# Sidetrack coding session',
     '',
     `sidetrack_mcp: ${mcpEndpoint}`,
+    ...(mcpAuthBearer === undefined ? [] : [`sidetrack_mcp_auth: Bearer ${mcpAuthBearer}`]),
     `sidetrack_attach_token: ${token}`,
     workstreamId === undefined
       ? 'sidetrack_workstream_id: (none)'
       : `sidetrack_workstream_id: ${workstreamId}`,
     'flow: tools/list -> sidetrack.session.attach -> sidetrack.workstreams.get/sidetrack.workstreams.context_pack -> sidetrack.dispatch.create',
     '',
-    'Use the MCP endpoint above. Attach this coding session by calling sidetrack.session.attach with:',
+    mcpAuthBearer === undefined
+      ? 'Use the MCP endpoint above (Streamable HTTP).'
+      : 'Use the MCP endpoint above (Streamable HTTP). Send Authorization: Bearer <key> on every request.',
+    'Attach this coding session by calling sidetrack.session.attach with:',
     `- attachToken: ${token}`,
     '- tool: <claude_code | codex | cursor | other>',
     '- cwd, branch, sessionId, name, and optional resumeCommand from your runtime',
@@ -55,7 +65,8 @@ export function CodingAttach({
   defaultWorkstreamId,
   workstreams,
   companionAvailable,
-  mcpEndpoint = 'ws://127.0.0.1:8721/mcp',
+  mcpEndpoint = 'http://127.0.0.1:8721/mcp',
+  mcpAuthBearer,
   onCancel,
   onAttached,
   onCreateToken,
@@ -105,7 +116,7 @@ export function CodingAttach({
       try {
         const record = await onCreateToken(workstreamId === '' ? {} : { workstreamId });
         const token = record.token;
-        const prompt = buildAgentPrompt(token, record.workstreamId, mcpEndpoint);
+        const prompt = buildAgentPrompt(token, record.workstreamId, mcpEndpoint, mcpAuthBearer);
         try {
           await navigator.clipboard.writeText(prompt);
           setCopied(true);
@@ -158,7 +169,9 @@ export function CodingAttach({
   };
 
   const promptText =
-    pending === null ? '' : buildAgentPrompt(pending.token, pending.workstreamId, mcpEndpoint);
+    pending === null
+      ? ''
+      : buildAgentPrompt(pending.token, pending.workstreamId, mcpEndpoint, mcpAuthBearer);
 
   return (
     <Modal

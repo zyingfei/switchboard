@@ -603,12 +603,13 @@ const App = () => {
     'missing' | 'stale' | 'empty' | 'rebuilding' | 'ready' | null
   >(null);
 
-  // MCP WebSocket info exposed by the companion's /v1/status when the
-  // companion is also managing the sidetrack-mcp child. Side-panel
-  // attach prompts use this to embed the *real* auth key the MCP
-  // server is accepting, instead of the user's bridge key (which is
-  // a different secret and only worked previously by accident when
-  // the user manually started MCP with --mcp-auth-key=<bridge>).
+  // MCP Streamable HTTP info exposed by the companion's /v1/status
+  // when the companion is also managing the sidetrack-mcp child.
+  // Side-panel attach prompts use this to embed the *real* auth key
+  // the MCP server is accepting, instead of the user's bridge key
+  // (which is a different secret and only worked previously by
+  // accident when the user manually started MCP with
+  // --mcp-auth-key=<bridge>).
   const [mcpInfo, setMcpInfo] = useState<{
     readonly url: string;
     readonly port: number;
@@ -765,11 +766,12 @@ const App = () => {
     };
   }, [state.companionStatus, bridgeKey, state.settings.companion.port, recallStatus]);
 
-  // Fetch /v1/status to discover the companion-managed MCP WebSocket
-  // server (port + auth key). Only present when the user starts the
-  // companion with --mcp-port. Refreshed when companion reconnects;
-  // a stale-but-non-zero value still works because the auth key is
-  // persisted on disk and stable across companion restarts.
+  // Fetch /v1/status to discover the companion-managed Streamable
+  // HTTP MCP server (port + auth key). Only present when the user
+  // starts the companion with --mcp-port. Refreshed when companion
+  // reconnects; a stale-but-non-zero value still works because the
+  // auth key is persisted on disk and stable across companion
+  // restarts.
   useEffect(() => {
     if (state.companionStatus !== 'connected' || bridgeKey.trim().length === 0) {
       setMcpInfo(null);
@@ -1662,7 +1664,7 @@ const App = () => {
       // front-loading a contract that capable agents auto-discover
       // via tools/list. Side-by-side review:
       // packages/sidetrack-mcp/src/e2e/handoff-prompt-trim-review.md.
-      body = `# Coding handoff: ${thread.title}\nsidetrack_mcp: ws://127.0.0.1:8721/mcp?token=${keyStr}\nsidetrack_thread_id: ${thread.bac_id}\n(connect → tools/list → sidetrack.threads.read_md)\n\n## User's ask\n…`;
+      body = `# Coding handoff: ${thread.title}\nsidetrack_mcp: http://127.0.0.1:8721/mcp\nsidetrack_mcp_auth: Bearer ${keyStr}\nsidetrack_thread_id: ${thread.bac_id}\n(connect → tools/list → sidetrack.threads.read_md)\n\n## User's ask\n…`;
     } else {
       const today = new Date().toISOString().slice(0, 10);
       body = `---\ntitle: ${thread.title}\ncreated: ${today}\nsource: ${thread.threadUrl}\nprovider: ${provider}\n---\n\n# ${thread.title}\n\n${turnsMd}`;
@@ -4900,17 +4902,15 @@ const App = () => {
           mcpEndpoint={(() => {
             // Prefer the companion-managed MCP info from /v1/status —
             // its authKey is what the running MCP server actually
-            // accepts. Fall back to the legacy bridge-key URL only
-            // when the companion isn't managing MCP (older setup
-            // where the user starts sidetrack-mcp by hand).
+            // accepts. Fall back to the loopback default when the
+            // companion isn't managing MCP (older setup where the
+            // user starts sidetrack-mcp by hand).
             if (mcpInfo !== null) {
-              return `${mcpInfo.url}?token=${encodeURIComponent(mcpInfo.authKey)}`;
+              return mcpInfo.url;
             }
-            if (bridgeKey.length === 0) {
-              return 'ws://127.0.0.1:8721/mcp';
-            }
-            return `ws://127.0.0.1:8721/mcp?token=${encodeURIComponent(bridgeKey)}`;
+            return 'http://127.0.0.1:8721/mcp';
           })()}
+          mcpAuthBearer={mcpInfo?.authKey ?? (bridgeKey.length === 0 ? undefined : bridgeKey)}
           onCancel={() => {
             setCodingAttachOpen(false);
           }}

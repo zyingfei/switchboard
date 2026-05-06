@@ -639,7 +639,7 @@ const routes: readonly RouteDefinition[] = [
                 mcp: {
                   port: context.mcp.port,
                   authKey: context.mcp.authKey,
-                  url: `ws://127.0.0.1:${String(context.mcp.port)}/mcp`,
+                  url: `http://127.0.0.1:${String(context.mcp.port)}/mcp`,
                 },
               }),
           requestId,

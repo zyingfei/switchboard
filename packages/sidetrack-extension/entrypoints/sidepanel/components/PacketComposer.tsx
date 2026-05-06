@@ -304,8 +304,8 @@ ${ctx}
 //
 // New shape:
 //   1. Single thread_id (the only handle the agent needs).
-//   2. MCP endpoint URL (ws://… with the bridge token inline so the
-//      agent can connect without follow-up plumbing).
+//   2. MCP endpoint URL (Streamable HTTP) plus a bearer line so the
+//      agent can connect without follow-up plumbing.
 //   3. The user's ask.
 //
 // Everything else — thread URL, provider, captured turns, tools
@@ -328,7 +328,8 @@ const buildCodingAgentPacket = (
   // a contract the agent never read. Side-by-side review in
   // sidetrack-mcp/src/e2e/handoff-prompt-trim-review.md.
   `# Coding handoff: ${title}
-sidetrack_mcp: ws://127.0.0.1:8721/mcp?token={BRIDGE_KEY}
+sidetrack_mcp: http://127.0.0.1:8721/mcp
+sidetrack_mcp_auth: Bearer {BRIDGE_KEY}
 sidetrack_thread_id: ${scope.sourceThreadId ?? '(unknown)'}
 (connect → tools/list → sidetrack.threads.read_md)
 

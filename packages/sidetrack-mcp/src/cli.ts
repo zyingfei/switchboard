@@ -6,7 +6,10 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 
 import { sidetrackToolNames } from './capabilities.js';
 import { createSidetrackMcpServer, type CompanionWriteClient } from './server/mcpServer.js';
-import { sidetrackMcpWebSocketPort, startWebSocketMcpServer } from './server/websocketServer.js';
+import {
+  sidetrackMcpHttpPort,
+  startStreamableHttpMcpServer,
+} from './server/streamableHttpServer.js';
 import { LiveVaultReader } from './vault/liveVaultReader.js';
 
 export const mcpVersion = '0.0.0';
@@ -20,7 +23,7 @@ interface ParsedArgs {
   readonly help: boolean;
   readonly version: boolean;
   readonly listTools: boolean;
-  readonly transport: 'stdio' | 'websocket';
+  readonly transport: 'stdio' | 'streamable-http';
   readonly vaultPath?: string;
   readonly companionUrl?: string;
   readonly bridgeKey?: string;
@@ -42,11 +45,11 @@ export const renderHelp = (): string =>
     '  sidetrack-mcp --version',
     '  sidetrack-mcp --list-tools',
     '  sidetrack-mcp --vault <path> [--companion-url <url> --bridge-key <key>]',
-    '  sidetrack-mcp --transport websocket --vault <path> [--port 8721]',
+    '  sidetrack-mcp --transport streamable-http --vault <path> [--port 8721]',
     '                [--companion-url <url> --bridge-key <key>] [--mcp-auth-key <key>]',
     '',
-    'WebSocket endpoint defaults to ws://127.0.0.1:8721/mcp. When an auth key',
-    'is configured, connect with ?token=<key> or Sec-WebSocket-Protocol: bearer.<key>.',
+    'Streamable HTTP endpoint defaults to http://127.0.0.1:8721/mcp. When an',
+    'auth key is configured, send Authorization: Bearer <key> on every request.',
   ].join('\n');
 
 const writeLine = (stream: Writable, text: string): void => {
@@ -58,9 +61,9 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
   let companionUrl: string | undefined;
   let bridgeKey: string | undefined;
   let mcpAuthKey: string | undefined;
-  let transport: 'stdio' | 'websocket' = 'stdio';
+  let transport: 'stdio' | 'streamable-http' = 'stdio';
   let host = '127.0.0.1';
-  let port = sidetrackMcpWebSocketPort;
+  let port = sidetrackMcpHttpPort;
 
   for (let index = 0; index < argv.length; index += 1) {
     if (argv[index] === '--vault') {
@@ -68,8 +71,8 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
       index += 1;
     } else if (argv[index] === '--transport') {
       const rawTransport = argv[index + 1];
-      if (rawTransport !== 'stdio' && rawTransport !== 'websocket') {
-        throw new Error('--transport must be either stdio or websocket.');
+      if (rawTransport !== 'stdio' && rawTransport !== 'streamable-http') {
+        throw new Error('--transport must be either stdio or streamable-http.');
       }
       transport = rawTransport;
       index += 1;
@@ -541,15 +544,15 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
   const createServer = () =>
     createSidetrackMcpServer(new LiveVaultReader(vaultPath), companionClient);
 
-  if (args.transport === 'websocket') {
+  if (args.transport === 'streamable-http') {
     const authKey = args.mcpAuthKey ?? args.bridgeKey;
-    const started = await startWebSocketMcpServer({
+    const started = await startStreamableHttpMcpServer({
       host: args.host,
       port: args.port,
       ...(authKey === undefined ? {} : { authKey }),
       createServer,
     });
-    writeLine(streams.stderr, `sidetrack-mcp websocket listening on ${started.url}`);
+    writeLine(streams.stderr, `sidetrack-mcp streamable-http listening on ${started.url}`);
     return 0;
   }
 

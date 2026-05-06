@@ -57,7 +57,7 @@ describe('runCli', () => {
 
   it('rejects an unsupported transport', async () => {
     await expect(runCli(['--transport', 'sse'], createStreams())).rejects.toThrow(
-      '--transport must be either stdio or websocket.',
+      '--transport must be either stdio or streamable-http.',
     );
   });
 });

@@ -9,12 +9,12 @@
  * The test is fully automated: no live browser, no live companion
  * binary. It uses an in-memory CompanionWriteClient + an in-memory
  * SidetrackMcpReader against a seeded LiveVaultSnapshot, plus the
- * real WebSocket MCP transport so the wire-level protocol is
+ * real Streamable HTTP MCP transport so the wire-level protocol is
  * exercised.
  */
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { WebSocketClientTransport } from '@modelcontextprotocol/sdk/client/websocket.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -23,9 +23,9 @@ import {
   type SidetrackMcpReader,
 } from '../server/mcpServer.js';
 import {
-  startWebSocketMcpServer,
-  type StartedWebSocketMcpServer,
-} from '../server/websocketServer.js';
+  startStreamableHttpMcpServer,
+  type StartedStreamableHttpMcpServer,
+} from '../server/streamableHttpServer.js';
 import type { CodingSessionRecord, LiveVaultSnapshot } from '../vault/liveVaultReader.js';
 
 // ────────────────── Seed data ──────────────────
@@ -371,7 +371,7 @@ const parseAttachPrompt = (
 
 // ────────────────── Test harness ──────────────────
 
-const startedServers: StartedWebSocketMcpServer[] = [];
+const startedServers: StartedStreamableHttpMcpServer[] = [];
 
 afterEach(async () => {
   await Promise.all(startedServers.splice(0).map((server) => server.close()));
@@ -380,8 +380,8 @@ afterEach(async () => {
   writeClient.recordedCalls.splice(0);
 });
 
-const startServer = async (): Promise<StartedWebSocketMcpServer> => {
-  const started = await startWebSocketMcpServer({
+const startServer = async (): Promise<StartedStreamableHttpMcpServer> => {
+  const started = await startStreamableHttpMcpServer({
     port: 0,
     createServer: () => createSidetrackMcpServer(reader, writeClient),
   });
@@ -406,7 +406,7 @@ describe('codex handoff over MCP', () => {
   it('compact prompt carries only thread_id + mcp endpoint + ask (nothing else)', () => {
     const prompt = buildLeanHandoff(
       TARGET_THREAD_ID,
-      'ws://127.0.0.1:8721/mcp?token=local',
+      'http://127.0.0.1:8721/mcp',
       'Reduce the recall drift to under 10 turns.',
     );
     // Negative assertions: the prompt must not leak provider URL,
@@ -419,7 +419,7 @@ describe('codex handoff over MCP', () => {
     expect(prompt).not.toContain('HTTP fallback');
     // Positive assertions: the agent has exactly what it needs.
     expect(prompt).toContain(`sidetrack_thread_id: ${TARGET_THREAD_ID}`);
-    expect(prompt).toContain('sidetrack_mcp: ws://127.0.0.1:8721/mcp?token=local');
+    expect(prompt).toContain('sidetrack_mcp: http://127.0.0.1:8721/mcp');
     expect(prompt).toContain("## User's ask");
     // Discovery breadcrumb is the only instruction-shaped content;
     // capable agents need just this to find sidetrack.threads.read_md.
@@ -442,7 +442,7 @@ describe('codex handoff over MCP', () => {
     expect(ask).toContain('queue a follow-up');
 
     const client = new Client({ name: 'codex-handoff-e2e', version: '0.0.0' });
-    await client.connect(new WebSocketClientTransport(new URL(mcpEndpoint)));
+    await client.connect(new StreamableHTTPClientTransport(new URL(mcpEndpoint)) as unknown as Parameters<typeof client.connect>[0]);
     try {
       // Step 2 — discover available tools (the prompt says to do this).
       const tools = await client.listTools();
@@ -533,7 +533,7 @@ describe('codex handoff over MCP', () => {
 
     const parsed = parseAttachPrompt(prompt);
     const client = new Client({ name: 'codex-inbound-e2e', version: '0.0.0' });
-    await client.connect(new WebSocketClientTransport(new URL(parsed.mcpEndpoint)));
+    await client.connect(new StreamableHTTPClientTransport(new URL(parsed.mcpEndpoint)) as unknown as Parameters<typeof client.connect>[0]);
     try {
       const tools = await client.listTools();
       expect(tools.tools.map((tool) => tool.name)).toEqual(
