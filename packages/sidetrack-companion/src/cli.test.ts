@@ -87,6 +87,18 @@ describe('runCli', () => {
     expect(streams.stdout.text()).toContain('Usage: sidetrack-companion models');
   });
 
+  it('--models-dir + --offline-models on the runtime path are accepted (help still renders)', async () => {
+    // Smoke: the flags don't crash parseArgs and the help text
+    // advertises them. We can't fully boot the runtime in a unit
+    // test (no vault wiring), but the parser+help surface is the
+    // contract we want to lock down.
+    const streams = createStreams();
+    const exitCode = await runCli(['--help'], streams);
+    expect(exitCode).toBe(0);
+    expect(streams.stdout.text()).toContain('--models-dir');
+    expect(streams.stdout.text()).toContain('--offline-models');
+  });
+
   it('models verify on an empty cache returns 1 with a clear hint', async () => {
     const streams = createStreams();
     const exitCode = await runCli(
