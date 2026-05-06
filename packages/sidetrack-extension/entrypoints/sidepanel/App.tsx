@@ -4586,6 +4586,14 @@ const App = () => {
               capturedAt: t.capturedAt,
             })),
             ...(composeWorkstream !== undefined ? { workstreamId: composeWorkstream.bac_id } : {}),
+            // Surface any staged inline-review draft so the composer
+            // can offer an "Include N comments" toggle in the scope
+            // options. The toggle defaults to ON when there's at least
+            // one span; user can untoggle to dispatch without the
+            // commentary.
+            ...(state.reviewDrafts[composeThread.bac_id] !== undefined
+              ? { reviewDraft: state.reviewDrafts[composeThread.bac_id] }
+              : {}),
           }}
           scopeSuggestions={composeScopeSuggestionsByThread.get(composeThread.bac_id) ?? []}
           onScopeChange={(workstreamId) => {

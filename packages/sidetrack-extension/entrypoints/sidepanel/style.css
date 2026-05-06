@@ -2980,6 +2980,35 @@ textarea.preview-body:focus {
   line-height: 1;
   color: inherit;
 }
+
+/* "Include N comments" pill in the packet composer's scope options.
+   Lives next to the turn-count slider; subdued ink-2 colour with a
+   solid signal background when active so the user can tell at a
+   glance whether the inline-review draft will be folded in. */
+.review-include-toggle {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  padding: 2px 8px;
+  border: 1px solid var(--rule, #d4cdb8);
+  border-radius: 99px;
+  background: var(--paper);
+  color: var(--ink-2, #4a453d);
+  cursor: pointer;
+  text-decoration: none;
+}
+.review-include-toggle:hover:not(:disabled) {
+  background: var(--paper-light);
+  border-color: var(--ink-3, #7a7269);
+}
+.review-include-toggle.on {
+  background: var(--signal-bg, #fff7ed);
+  border-color: var(--signal, #c2410c);
+  color: var(--signal, #c2410c);
+}
+.review-include-toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 @keyframes icon-btn-pulse {
   0%,
   30%,
