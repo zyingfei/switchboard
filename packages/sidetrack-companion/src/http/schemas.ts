@@ -381,6 +381,60 @@ export const reviewListQuerySchema = z.object({
   threadId: bacIdSchema.optional(),
 });
 
+const reviewDraftEventTypeSchema = z.enum([
+  'review-draft.span.added',
+  'review-draft.span.removed',
+  'review-draft.comment.set',
+  'review-draft.overall.set',
+  'review-draft.verdict.set',
+  'review-draft.discarded',
+]);
+
+const versionVectorSchema = z.record(z.string(), z.number().int().nonnegative());
+
+// Conversation-level addressing for events that touch chat content.
+// Two replicas observing different snapshots of the same thread can
+// emit events with different `messageId` / `quoteHash` so the
+// projection layer can decide whether they're "the same fact" or
+// distinct. All fields are optional; clients fill what they have.
+export const targetRefSchema = z
+  .object({
+    provider: z.string().min(1).optional(),
+    canonicalUrl: z.url().optional(),
+    conversationId: z.string().min(1).optional(),
+    messageId: z.string().min(1).optional(),
+    turnOrdinal: z.number().int().nonnegative().optional(),
+    role: z.enum(['user', 'assistant', 'system']).optional(),
+    quoteHash: z.string().min(1).optional(),
+    anchorFingerprint: z.string().min(1).optional(),
+    sourceSnapshotHash: z.string().min(1).optional(),
+  })
+  .strict();
+
+// Browser-shaped client event: carries the projection vector the
+// editor observed (`baseVector`) plus optional `clientDeps` so a
+// batch can express "this edit depends on this earlier edit in the
+// same POST." The companion stamps `dot`, `deps`, and `acceptedAtMs`
+// on accept.
+export const reviewDraftClientEventSchema = z.object({
+  clientEventId: z.string().min(1),
+  type: reviewDraftEventTypeSchema,
+  payload: z.record(z.string(), z.unknown()).optional(),
+  target: targetRefSchema.optional(),
+  baseVector: versionVectorSchema.optional(),
+  clientDeps: z.array(z.string().min(1)).optional(),
+  clientCreatedAtMs: z.number().int().nonnegative().optional(),
+});
+
+export const reviewDraftEventBatchSchema = z.object({
+  threadUrl: z.url().optional(),
+  events: z.array(reviewDraftClientEventSchema).min(1).max(64),
+});
+
+export const reviewDraftListQuerySchema = z.object({
+  since: z.coerce.number().int().nonnegative().optional(),
+});
+
 export const turnsQuerySchema = z.object({
   threadUrl: z.url(),
   limit: z.coerce

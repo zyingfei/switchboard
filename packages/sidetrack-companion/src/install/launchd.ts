@@ -1,6 +1,14 @@
 import { dirname, join } from 'node:path';
 
-import type { ExecPort, FilePort, Installer, InstallOptions, InstallResult, ServiceStatus } from './types.js';
+import { buildCompanionServiceCommand } from './command.js';
+import type {
+  ExecPort,
+  FilePort,
+  Installer,
+  InstallOptions,
+  InstallResult,
+  ServiceStatus,
+} from './types.js';
 
 const LABEL = 'com.sidetrack.companion';
 
@@ -19,11 +27,9 @@ const plist = (opts: InstallOptions): string => `<?xml version="1.0" encoding="U
   <key>Label</key><string>${LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${xmlEscape(opts.companionBin ?? process.execPath)}</string>
-    <string>--vault</string>
-    <string>${xmlEscape(opts.vaultPath)}</string>
-    <string>--port</string>
-    <string>${String(opts.port)}</string>
+${buildCompanionServiceCommand(opts)
+  .map((arg) => `    <string>${xmlEscape(arg)}</string>`)
+  .join('\n')}
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -45,13 +51,21 @@ export class LaunchdInstaller implements Installer {
   async install(opts: InstallOptions): Promise<InstallResult> {
     await this.files.mkdir(dirname(this.path));
     await this.files.writeFile(this.path, plist(opts));
-    await this.exec.execFile('launchctl', ['bootout', `gui/${String(process.getuid?.() ?? 0)}`, this.path]).catch(() => undefined);
-    await this.exec.execFile('launchctl', ['bootstrap', `gui/${String(process.getuid?.() ?? 0)}`, this.path]);
+    await this.exec
+      .execFile('launchctl', ['bootout', `gui/${String(process.getuid?.() ?? 0)}`, this.path])
+      .catch(() => undefined);
+    await this.exec.execFile('launchctl', [
+      'bootstrap',
+      `gui/${String(process.getuid?.() ?? 0)}`,
+      this.path,
+    ]);
     return { platform: 'darwin', path: this.path, installed: true, running: true };
   }
 
   async uninstall(): Promise<void> {
-    await this.exec.execFile('launchctl', ['bootout', `gui/${String(process.getuid?.() ?? 0)}`, this.path]).catch(() => undefined);
+    await this.exec
+      .execFile('launchctl', ['bootout', `gui/${String(process.getuid?.() ?? 0)}`, this.path])
+      .catch(() => undefined);
     await this.files.rm(this.path);
   }
 

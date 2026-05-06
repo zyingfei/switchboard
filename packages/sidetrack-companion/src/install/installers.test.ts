@@ -61,6 +61,31 @@ describe('service installers', () => {
     expect(files.removed).toContain(result.path);
   });
 
+  it('launchd installs the local node checkout command with managed MCP when requested', async () => {
+    const files = fakeFiles();
+    const exec = fakeExec();
+    const installer = pickInstaller('darwin', { homeDir: '/home/test', files, exec });
+
+    const result = await installer.install({
+      vaultPath: '/Users/test/Sidetrack vault',
+      port: 17373,
+      companionCommand: ['/usr/local/bin/node', '/repo/packages/sidetrack-companion/dist/cli.js'],
+      mcpPort: 8721,
+      syncRelayLocalPort: 18443,
+    });
+
+    const body = files.writes.get(result.path) ?? '';
+    expect(body).toContain('<string>/usr/local/bin/node</string>');
+    expect(body).toContain('<string>/repo/packages/sidetrack-companion/dist/cli.js</string>');
+    expect(body).toContain('<string>--vault</string>');
+    expect(body).toContain('<string>/Users/test/Sidetrack vault</string>');
+    expect(body).toContain('<string>--mcp-port</string>');
+    expect(body).toContain('<string>8721</string>');
+    expect(body).toContain('<string>--sync-relay-local</string>');
+    expect(body).toContain('<string>18443</string>');
+    expect(body).not.toContain('sync-rendezvous');
+  });
+
   it('installs and uninstalls systemd user service idempotently', async () => {
     const files = fakeFiles();
     const exec = fakeExec();

@@ -12,8 +12,14 @@ import type {
   WorkstreamUpdate,
 } from '../companion/model';
 import { readDroppedCount, readQueue } from '../companion/queue';
-import { canonicalThreadUrl } from '../capture/providerDetection';
+import { canonicalThreadUrl, detectProviderFromUrl } from '../capture/providerDetection';
 import type { DispatchEventRecord } from '../dispatch/types';
+import type { ReviewDraftClientEvent, TargetRef } from '../review/draftClient';
+import {
+  enqueueReviewDraftEvent,
+  readReviewDraftDroppedCount,
+  readReviewDraftQueue,
+} from '../review/outbox';
 import type { ReviewDraft, ReviewDraftSpan, ReviewVerdict } from '../review/types';
 import {
   createEmptyWorkboardState,
@@ -62,6 +68,20 @@ const SCREEN_SHARE_MODE_KEY = 'sidetrack.screenShareMode';
 // schema. The vault is written via the existing /v1/reviews endpoint
 // only when the user explicitly saves or sends-as-follow-up.
 const REVIEW_DRAFTS_KEY = 'sidetrack.reviewDrafts';
+// Per-thread version vector (the projection frontier the browser has
+// observed). Attached to every outgoing ClientEvent as `baseVector`
+// so the companion can stamp deps faithfully — i.e. so an offline
+// edit doesn't silently claim to have observed peer events.
+const REVIEW_DRAFT_VECTORS_KEY = 'sidetrack.reviewDraftVectors';
+// Per-thread list of ClientEvent ids that have been queued locally
+// but not yet acknowledged by the companion. Each new ClientEvent
+// for the thread gets `clientDeps = [...pending]` so multiple
+// offline edits from the SAME browser chain causally — without this,
+// two offline overall.set events both stamp `deps = baseVector` and
+// end up as conflict candidates against each other when the
+// companion accepts them. Entries are removed when the drainer's
+// POST returns 200/201/409 (i.e. the companion accepted the event).
+const REVIEW_DRAFT_PENDING_KEY = 'sidetrack.reviewDraftPending';
 
 const storageGet = async <TValue>(key: string, fallback: TValue): Promise<TValue> => {
   const result = await chrome.storage.local.get({ [key]: fallback });
@@ -274,6 +294,148 @@ const writeReviewDrafts = async (
   await storageSet({ [REVIEW_DRAFTS_KEY]: next });
 };
 
+export type ReviewDraftVectorMap = Readonly<
+  Partial<Record<string, Readonly<Record<string, number>>>>
+>;
+
+export const readReviewDraftVector = async (
+  threadId: string,
+): Promise<Readonly<Record<string, number>>> => {
+  const all = await storageGet<ReviewDraftVectorMap>(REVIEW_DRAFT_VECTORS_KEY, {});
+  return all[threadId] ?? {};
+};
+
+export const writeReviewDraftVector = async (
+  threadId: string,
+  vector: Readonly<Record<string, number>>,
+): Promise<void> => {
+  const all = await storageGet<ReviewDraftVectorMap>(REVIEW_DRAFT_VECTORS_KEY, {});
+  await storageSet({
+    [REVIEW_DRAFT_VECTORS_KEY]: { ...all, [threadId]: vector },
+  });
+};
+
+type PendingMap = Readonly<Partial<Record<string, readonly string[]>>>;
+
+const readPendingClientEventIds = async (threadId: string): Promise<readonly string[]> => {
+  const all = await storageGet<PendingMap>(REVIEW_DRAFT_PENDING_KEY, {});
+  return all[threadId] ?? [];
+};
+
+const writePendingClientEventIds = async (
+  threadId: string,
+  ids: readonly string[],
+): Promise<void> => {
+  const all = await storageGet<PendingMap>(REVIEW_DRAFT_PENDING_KEY, {});
+  if (ids.length === 0) {
+    if (all[threadId] === undefined) return;
+    const { [threadId]: _, ...rest } = all;
+    void _;
+    await storageSet({ [REVIEW_DRAFT_PENDING_KEY]: rest });
+    return;
+  }
+  await storageSet({ [REVIEW_DRAFT_PENDING_KEY]: { ...all, [threadId]: ids } });
+};
+
+// Mint a ClientEvent for a thread, attach a fresh
+// `(baseVector, clientDeps)` pair derived from local state, and push
+// it to the outbox. clientDeps chains every queued-but-not-yet-
+// accepted local event so a sequence of offline edits stays causally
+// linear — without this, two offline overall.set events would both
+// stamp `deps = baseVector` and surface as a self-conflict on
+// acceptance.
+export const enqueueLocalReviewDraftEvent = async (
+  threadId: string,
+  threadUrl: string,
+  partial: Omit<ReviewDraftClientEvent, 'baseVector' | 'clientDeps'> & {
+    readonly target?: TargetRef;
+  },
+): Promise<void> => {
+  const baseVector = await readReviewDraftVector(threadId);
+  const pending = await readPendingClientEventIds(threadId);
+  const event: ReviewDraftClientEvent = {
+    ...partial,
+    baseVector,
+    ...(pending.length > 0 ? { clientDeps: pending } : {}),
+  };
+  await enqueueReviewDraftEvent(threadId, threadUrl, event);
+  await writePendingClientEventIds(threadId, [...pending, partial.clientEventId]);
+};
+
+// Called by the drainer after the companion accepts a ClientEvent
+// (200/201/409). Removes the id from the pending list so subsequent
+// events stop depending on it.
+export const markReviewDraftEventAccepted = async (
+  threadId: string,
+  clientEventId: string,
+): Promise<void> => {
+  const pending = await readPendingClientEventIds(threadId);
+  const next = pending.filter((id) => id !== clientEventId);
+  if (next.length === pending.length) return;
+  await writePendingClientEventIds(threadId, next);
+};
+
+// Diagnostic accessor — used by tests and the side-panel "n unsynced"
+// pill so the user sees which edits are still in flight.
+export const readReviewDraftPending = async (threadId: string): Promise<readonly string[]> =>
+  await readPendingClientEventIds(threadId);
+
+// Build a TargetRef carrying conversation-level addressing. Two
+// replicas observing different snapshots of the same chat (e.g. one
+// before regeneration, one after) emit events with different
+// `quoteHash` so peers can decide whether they're "the same fact"
+// rather than overwriting.
+const conversationIdFromUrl = (rawUrl: string): string | undefined => {
+  try {
+    const url = new URL(rawUrl);
+    const trailing = url.pathname
+      .split('/')
+      .filter((part) => part.length > 0)
+      .pop();
+    return trailing && trailing.length > 0 ? trailing : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const fnv1aHash = (text: string): string => {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = (hash + ((hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24))) >>> 0;
+  }
+  return hash.toString(16).padStart(8, '0');
+};
+
+export const buildReviewDraftTarget = (
+  threadUrl: string,
+  span?: { readonly anchor: ReviewDraftSpan['anchor']; readonly quote: string },
+): TargetRef => {
+  const provider = detectProviderFromUrl(threadUrl);
+  const conversationId = conversationIdFromUrl(threadUrl);
+  return {
+    ...(provider !== 'unknown' ? { provider } : {}),
+    canonicalUrl: threadUrl,
+    ...(conversationId === undefined ? {} : { conversationId }),
+    ...(span === undefined
+      ? {}
+      : {
+          quoteHash: fnv1aHash(span.quote),
+          anchorFingerprint: fnv1aHash(
+            `${span.anchor.cssSelector}|${String(span.anchor.textPosition.start)}-${String(span.anchor.textPosition.end)}|${span.anchor.textQuote.exact}`,
+          ),
+        }),
+  };
+};
+
+const dropReviewDraftVector = async (threadId: string): Promise<void> => {
+  const all = await storageGet<ReviewDraftVectorMap>(REVIEW_DRAFT_VECTORS_KEY, {});
+  if (all[threadId] === undefined) return;
+  const { [threadId]: _, ...rest } = all;
+  void _;
+  await storageSet({ [REVIEW_DRAFT_VECTORS_KEY]: rest });
+};
+
 export const appendReviewDraftSpan = async (
   threadId: string,
   threadUrl: string,
@@ -291,6 +453,24 @@ export const appendReviewDraftSpan = async (
     updatedAt: span.capturedAt,
   };
   await writeReviewDrafts({ ...current, [threadId]: next });
+  // Mirror to the companion. The companion stamps `dot` + `deps` on
+  // accept; the helper attaches `baseVector` (observed projection
+  // frontier) and `clientDeps` (other locally-queued events) so a
+  // sequence of offline edits chains causally rather than turning
+  // into self-conflicts on the next sync.
+  await enqueueLocalReviewDraftEvent(threadId, threadUrl, {
+    clientEventId: crypto.randomUUID(),
+    type: 'review-draft.span.added',
+    target: buildReviewDraftTarget(threadUrl, { anchor: newSpan.anchor, quote: newSpan.quote }),
+    payload: {
+      spanId: newSpan.bac_id,
+      anchor: newSpan.anchor,
+      quote: newSpan.quote,
+      comment: newSpan.comment,
+      capturedAt: newSpan.capturedAt,
+    },
+    clientCreatedAtMs: Date.now(),
+  });
   return next;
 };
 
@@ -304,10 +484,24 @@ export const dropReviewDraftSpan = async (
     return undefined;
   }
   const remaining = existing.spans.filter((span) => span.bac_id !== spanId);
+  const removeTargetSpan = existing.spans.find((s) => s.bac_id === spanId);
+  const removeEvent = {
+    clientEventId: crypto.randomUUID(),
+    type: 'review-draft.span.removed' as const,
+    target: buildReviewDraftTarget(
+      existing.threadUrl,
+      removeTargetSpan === undefined
+        ? undefined
+        : { anchor: removeTargetSpan.anchor, quote: removeTargetSpan.quote },
+    ),
+    payload: { spanId },
+    clientCreatedAtMs: Date.now(),
+  };
   if (remaining.length === 0 && existing.overall === undefined && existing.verdict === undefined) {
     const { [threadId]: _, ...rest } = current;
     void _;
     await writeReviewDrafts(rest);
+    await enqueueLocalReviewDraftEvent(threadId, existing.threadUrl, removeEvent);
     return undefined;
   }
   const next: ReviewDraft = {
@@ -316,6 +510,7 @@ export const dropReviewDraftSpan = async (
     updatedAt: new Date().toISOString(),
   };
   await writeReviewDrafts({ ...current, [threadId]: next });
+  await enqueueLocalReviewDraftEvent(threadId, existing.threadUrl, removeEvent);
   return next;
 };
 
@@ -350,17 +545,221 @@ export const updateReviewDraft = async (
     delete (next as { verdict?: ReviewVerdict }).verdict;
   }
   await writeReviewDrafts({ ...current, [threadId]: next });
+  const target = buildReviewDraftTarget(existing.threadUrl);
+  const nowMs = Date.now();
+  if (patch.overall !== undefined) {
+    await enqueueLocalReviewDraftEvent(threadId, existing.threadUrl, {
+      clientEventId: crypto.randomUUID(),
+      type: 'review-draft.overall.set',
+      target,
+      payload: { text: patch.overall },
+      clientCreatedAtMs: nowMs,
+    });
+  }
+  if (patch.verdict !== undefined) {
+    await enqueueLocalReviewDraftEvent(threadId, existing.threadUrl, {
+      clientEventId: crypto.randomUUID(),
+      type: 'review-draft.verdict.set',
+      target,
+      payload: { value: patch.verdict },
+      clientCreatedAtMs: nowMs,
+    });
+  }
   return next;
 };
 
-export const discardReviewDraft = async (threadId: string): Promise<void> => {
+// Mirror a companion-side review-draft projection back into local
+// chrome.storage so the side panel sees peer edits without a manual
+// refresh. The companion's projection uses causal registers — for
+// scalar fields we collapse a `resolved` register to its value, and
+// for `conflict` registers we pick the lexicographically-first
+// candidate so the legacy UI can still render text. (A follow-up PR
+// adds a real conflict picker.) The full projection's `vector` is
+// persisted separately so the next ClientEvent ships the right
+// `baseVector`.
+export interface RemoteRegister<T> {
+  readonly status: 'resolved' | 'conflict';
+  readonly value?: T;
+  readonly candidates?: readonly { readonly value: T }[];
+}
+
+export interface RemoteReviewDraftSpan {
+  readonly spanId: string;
+  readonly anchor: ReviewDraftSpan['anchor'];
+  readonly quote: string;
+  readonly comment: RemoteRegister<string>;
+  readonly capturedAt: string;
+}
+
+export interface RemoteReviewDraftProjection {
+  readonly threadId: string;
+  readonly threadUrl: string;
+  readonly vector: Readonly<Record<string, number>>;
+  readonly spans: readonly RemoteReviewDraftSpan[];
+  readonly overall: RemoteRegister<string>;
+  readonly verdict: RemoteRegister<string>;
+  readonly discarded: boolean;
+  readonly updatedAtMs: number;
+}
+
+const collapseRegister = <T>(register: RemoteRegister<T>): T | undefined => {
+  if (register.status === 'resolved') return register.value;
+  const candidates = register.candidates ?? [];
+  return candidates.length > 0 ? candidates[0].value : undefined;
+};
+
+const conflictCandidates = <T>(register: RemoteRegister<T>): readonly T[] =>
+  register.status === 'conflict'
+    ? (register.candidates ?? []).map((candidate) => candidate.value)
+    : [];
+
+export const mirrorRemoteReviewDraft = async (
+  projection: RemoteReviewDraftProjection,
+): Promise<void> => {
+  // The vector is authoritative for `baseVector` on subsequent local
+  // edits — persist it even if the projection itself is "empty" so
+  // future deps stamp correctly.
+  await writeReviewDraftVector(projection.threadId, projection.vector);
+
+  const current = await readReviewDrafts();
+  const overallText = collapseRegister(projection.overall);
+  const verdictRaw = collapseRegister(projection.verdict);
+  const verdict =
+    verdictRaw === 'agree' ||
+    verdictRaw === 'disagree' ||
+    verdictRaw === 'partial' ||
+    verdictRaw === 'needs_source' ||
+    verdictRaw === 'open'
+      ? verdictRaw
+      : undefined;
+
+  const isEmpty =
+    projection.spans.length === 0 && overallText === undefined && verdict === undefined;
+
+  if (projection.discarded || (isEmpty && current[projection.threadId] === undefined)) {
+    if (current[projection.threadId] !== undefined) {
+      const { [projection.threadId]: _, ...rest } = current;
+      void _;
+      await writeReviewDrafts(rest);
+    }
+    return;
+  }
+  if (isEmpty) {
+    const { [projection.threadId]: _, ...rest } = current;
+    void _;
+    await writeReviewDrafts(rest);
+    return;
+  }
+
+  // Per-span comment conflicts. An entry only lands here if the
+  // companion's register is in `conflict` state, so the side panel
+  // can render a picker per span without scanning all spans.
+  const commentConflicts: Record<string, { candidates: readonly string[] }> = {};
+  for (const span of projection.spans) {
+    const candidates = conflictCandidates(span.comment);
+    if (candidates.length > 1) {
+      commentConflicts[span.spanId] = { candidates };
+    }
+  }
+  const overallConflict = conflictCandidates(projection.overall);
+  const verdictConflictRaw = conflictCandidates(projection.verdict);
+  const verdictConflict: readonly ReviewVerdict[] = verdictConflictRaw.filter(
+    (v): v is ReviewVerdict =>
+      v === 'agree' || v === 'disagree' || v === 'partial' || v === 'needs_source' || v === 'open',
+  );
+
+  const conflicts =
+    overallConflict.length > 1 ||
+    verdictConflict.length > 1 ||
+    Object.keys(commentConflicts).length > 0
+      ? {
+          ...(overallConflict.length > 1 ? { overall: { candidates: overallConflict } } : {}),
+          ...(verdictConflict.length > 1 ? { verdict: { candidates: verdictConflict } } : {}),
+          ...(Object.keys(commentConflicts).length > 0 ? { comments: commentConflicts } : {}),
+        }
+      : undefined;
+
+  const next: ReviewDraft = {
+    threadId: projection.threadId,
+    threadUrl: projection.threadUrl,
+    spans: projection.spans.map((span) => ({
+      bac_id: span.spanId,
+      threadUrl: projection.threadUrl,
+      anchor: span.anchor,
+      quote: span.quote,
+      comment: collapseRegister(span.comment) ?? '',
+      capturedAt: span.capturedAt,
+    })),
+    ...(overallText === undefined ? {} : { overall: overallText }),
+    ...(verdict === undefined ? {} : { verdict }),
+    updatedAt: new Date(projection.updatedAtMs).toISOString(),
+    ...(conflicts === undefined ? {} : { conflicts }),
+  };
+  await writeReviewDrafts({ ...current, [projection.threadId]: next });
+};
+
+export const removeRemoteReviewDraft = async (threadId: string): Promise<void> => {
   const current = await readReviewDrafts();
   if (current[threadId] === undefined) {
+    await dropReviewDraftVector(threadId);
     return;
   }
   const { [threadId]: _, ...rest } = current;
   void _;
   await writeReviewDrafts(rest);
+  await dropReviewDraftVector(threadId);
+};
+
+export const setReviewDraftSpanComment = async (
+  threadId: string,
+  spanId: string,
+  comment: string,
+): Promise<ReviewDraft | undefined> => {
+  const current = await readReviewDrafts();
+  const existing = current[threadId];
+  if (existing === undefined) return undefined;
+  const next: ReviewDraft = {
+    ...existing,
+    spans: existing.spans.map((span) => (span.bac_id === spanId ? { ...span, comment } : span)),
+    updatedAt: new Date().toISOString(),
+  };
+  await writeReviewDrafts({ ...current, [threadId]: next });
+  // Causal resolution: the helper attaches `baseVector` (covers all
+  // current candidates because the local vector reflects every
+  // observed projection event) AND `clientDeps` (covers any
+  // queued-but-unaccepted local edits), so the next projection
+  // collapses back to `resolved`.
+  const targetSpan = existing.spans.find((s) => s.bac_id === spanId);
+  await enqueueLocalReviewDraftEvent(threadId, existing.threadUrl, {
+    clientEventId: crypto.randomUUID(),
+    type: 'review-draft.comment.set',
+    target: buildReviewDraftTarget(
+      existing.threadUrl,
+      targetSpan === undefined ? undefined : { anchor: targetSpan.anchor, quote: targetSpan.quote },
+    ),
+    payload: { spanId, text: comment },
+    clientCreatedAtMs: Date.now(),
+  });
+  return next;
+};
+
+export const discardReviewDraft = async (threadId: string): Promise<void> => {
+  const current = await readReviewDrafts();
+  const existing = current[threadId];
+  if (existing === undefined) {
+    return;
+  }
+  const { [threadId]: _, ...rest } = current;
+  void _;
+  await writeReviewDrafts(rest);
+  await enqueueLocalReviewDraftEvent(threadId, existing.threadUrl, {
+    clientEventId: crypto.randomUUID(),
+    type: 'review-draft.discarded',
+    target: buildReviewDraftTarget(existing.threadUrl),
+    payload: { reason: 'manual' },
+    clientCreatedAtMs: Date.now(),
+  });
+  await dropReviewDraftVector(threadId);
 };
 
 // Drop entries for dispatches that have aged out of recentDispatches.
@@ -1011,6 +1410,8 @@ export const buildWorkboardState = async (
     dispatchOriginals: await readDispatchOriginals(),
     lastDispatchTargetByThread: await readLastDispatchTargetByThread(),
     reviewDrafts: await readReviewDrafts(),
+    queuedReviewDraftCount: (await readReviewDraftQueue()).length,
+    droppedReviewDraftCount: await readReviewDraftDroppedCount(),
     collapsedSections: await storageGet<WorkboardState['collapsedSections']>(
       COLLAPSED_SECTIONS_KEY,
       [],

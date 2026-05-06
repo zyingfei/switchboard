@@ -558,7 +558,7 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
       // existing record without appending another row. Re-linking
       // to a different thread appends a new row — readLinkForDispatch
       // resolves to the latest entry, so the move is observable.
-      if (existing !== undefined && existing.threadId === input.threadId) {
+      if (existing?.threadId === input.threadId) {
         await audit({
           requestId,
           route: 'linkDispatch',

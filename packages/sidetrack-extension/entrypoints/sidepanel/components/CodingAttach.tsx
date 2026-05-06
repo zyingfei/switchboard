@@ -310,14 +310,14 @@ export function CodingAttach({
         </div>
       ) : null}
 
-      {mcpHealth !== undefined && mcpHealth.status === 'unreachable' ? (
+      {mcpHealth?.status === 'unreachable' ? (
         <div className="banner warning">
           Companion-managed MCP server is not responding (last checked{' '}
           {new Date(mcpHealth.checkedAt).toLocaleTimeString()}). Restart the companion with{' '}
           <code>--mcp-port</code> or run sidetrack-mcp by hand.
         </div>
       ) : null}
-      {mcpHealth !== undefined && mcpHealth.status === 'auth_failed' ? (
+      {mcpHealth?.status === 'auth_failed' ? (
         <div className="banner warning">
           MCP server is listening but is rejecting our auth key (last checked{' '}
           {new Date(mcpHealth.checkedAt).toLocaleTimeString()}). The persisted{' '}

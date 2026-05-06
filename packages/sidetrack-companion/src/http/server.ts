@@ -12,12 +12,32 @@ import {
   type WorkstreamWriteTool,
 } from '../auth/workstreamTrust.js';
 import { createDispatchId, createRequestId, createReviewId } from '../domain/ids.js';
-import { pickInstaller, type Installer } from '../install/index.js';
+import { pickInstaller, type Installer, type InstallOptions } from '../install/index.js';
 import { exportSettings } from '../portability/exportBundle.js';
 import { importSettings } from '../portability/importBundle.js';
 import type { RecallActivityTracker } from '../recall/activity.js';
 import { embed, MODEL_ID } from '../recall/embedder.js';
-import { appendEntry, gcEntries, readIndex, tombstoneByThread } from '../recall/indexFile.js';
+import { CAPTURE_RECORDED } from '../recall/events.js';
+import { THREAD_ARCHIVED, THREAD_UNARCHIVED, THREAD_UPSERTED } from '../threads/events.js';
+import { projectThread } from '../threads/projection.js';
+import { WORKSTREAM_UPSERTED } from '../workstreams/events.js';
+import { projectWorkstream } from '../workstreams/projection.js';
+import { QUEUE_CREATED } from '../queue/events.js';
+import { projectQueueItem } from '../queue/projection.js';
+import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../dispatches/events.js';
+import { projectDispatches } from '../dispatches/projection.js';
+import {
+  ANNOTATION_CREATED,
+  ANNOTATION_DELETED,
+  ANNOTATION_NOTE_SET,
+} from '../annotations/events.js';
+import { projectAnnotations } from '../annotations/projection.js';
+import {
+  appendEntry as appendEntryRaw,
+  gcEntries as gcEntriesRaw,
+  readIndex,
+  tombstoneByThread as tombstoneByThreadRaw,
+} from '../recall/indexFile.js';
 import type { RecallLifecycle } from '../recall/lifecycle.js';
 import { rank } from '../recall/ranker.js';
 import { rebuildFromEventLog } from '../recall/rebuild.js';
@@ -26,6 +46,52 @@ import { redact } from '../safety/redaction.js';
 import { estimateTokens, tokenBudgetWarningThreshold } from '../safety/tokenBudget.js';
 import { buildSignals, type BuildSignalsWorkstream } from '../suggestions/buildSignals.js';
 import { scoreSuggestions } from '../suggestions/score.js';
+import type { EventLog } from '../sync/eventLog.js';
+import type { ProjectionChangeFeed } from '../sync/projectionChanges.js';
+import type { TargetRef } from '../sync/causal.js';
+import type { ReplicaContext } from '../sync/replicaId.js';
+
+// Strip undefined keys produced by zod's `optional()` so the caller's
+// `exactOptionalPropertyTypes` interfaces accept the value without
+// complaining about `T | undefined` mismatches.
+const compactTargetRef = (raw: Record<string, unknown> | undefined): TargetRef | undefined => {
+  if (raw === undefined) return undefined;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
+};
+
+// Spread-helper for the optional sync summary in /v1/system/health.
+// Captures the replica context once so the inner closure doesn't
+// need a non-null assertion.
+const syncSummaryDeps = (
+  replica: ReplicaContext | undefined,
+  sync: CompanionHttpConfig['sync'],
+): {
+  syncSummary?: () => {
+    replicaId: string;
+    seq: number;
+    relay?: { mode: 'local' | 'remote'; url: string };
+  };
+} =>
+  replica === undefined
+    ? {}
+    : {
+        syncSummary: () => ({
+          replicaId: replica.replicaId,
+          seq: replica.peekSeq(),
+          ...(sync?.relay === undefined ? {} : { relay: sync.relay }),
+        }),
+      };
+import { isReviewDraftEvent, projectReviewDraft } from '../review/projection.js';
+import {
+  deleteReviewDraft,
+  listReviewDrafts,
+  readReviewDraft,
+  writeReviewDraft,
+} from '../vault/reviewDrafts.js';
 import { runAutoUpdate } from '../system/autoUpdate.js';
 import { collectHealth, type CaptureWarningHealth, type HealthReport } from '../system/health.js';
 import { checkLatestVersion, type UpdateAdvisory } from '../system/versionCheck.js';
@@ -66,6 +132,8 @@ import {
   recallIndexSchema,
   recallGcSchema,
   recallQuerySchema,
+  reviewDraftEventBatchSchema,
+  reviewDraftListQuerySchema,
   reviewEventSchema,
   reviewListQuerySchema,
   settingsPatchSchema,
@@ -84,6 +152,13 @@ export interface CompanionHttpConfig {
   readonly vaultWriter: VaultWriter;
   readonly vaultRoot?: string;
   readonly serviceInstaller?: Installer;
+  readonly serviceInstallDefaults?: Omit<InstallOptions, 'vaultPath'>;
+  readonly sync?: {
+    readonly relay?: {
+      readonly mode: 'local' | 'remote';
+      readonly url: string;
+    };
+  };
   readonly updateChecker?: () => Promise<UpdateAdvisory>;
   readonly idempotencyStore?: IdempotencyStore;
   readonly allowAutoUpdate?: boolean;
@@ -104,6 +179,18 @@ export interface CompanionHttpConfig {
   // background-rebuild affordance.
   readonly recallLifecycle?: RecallLifecycle;
   readonly recallActivity?: RecallActivityTracker;
+  // Local replica identity + Lamport allocator used to stamp every
+  // server-accepted event with `(replicaId, lamport)`. Optional so
+  // legacy tests that build the HTTP server in isolation continue to
+  // work; production startup always wires it in `runtime/companion.ts`.
+  readonly replica?: ReplicaContext;
+  // Per-replica event log used by the review-draft (and future)
+  // CRDT projection routes. When unset those routes return 503.
+  readonly eventLog?: EventLog;
+  // Local monotonic projection-change feed. Browsers resume polling
+  // with a numeric `sinceSeq` cursor; the counter never moves
+  // backward and is independent of any host's wall clock.
+  readonly projectionChanges?: ProjectionChangeFeed;
   // Set when the companion is also managing a sidetrack-mcp child.
   // Exposed via /v1/status so the side panel can build attach prompts
   // whose ?token=… matches whatever the running MCP server actually
@@ -324,6 +411,24 @@ const requireVaultRoot = (context: CompanionHttpConfig): string => {
     throw new Error('Vault root is unavailable.');
   }
   return context.vaultRoot;
+};
+
+const buildServiceInstallOptions = (context: CompanionHttpConfig): InstallOptions => {
+  const defaults = context.serviceInstallDefaults;
+  return {
+    vaultPath: requireVaultRoot(context),
+    port: defaults?.port ?? 17373,
+    ...(defaults?.companionCommand === undefined
+      ? {}
+      : { companionCommand: defaults.companionCommand }),
+    ...(defaults?.companionBin === undefined ? {} : { companionBin: defaults.companionBin }),
+    ...(defaults?.mcpPort === undefined ? {} : { mcpPort: defaults.mcpPort }),
+    ...(defaults?.mcpBin === undefined ? {} : { mcpBin: defaults.mcpBin }),
+    ...(defaults?.syncRelayLocalPort === undefined
+      ? {}
+      : { syncRelayLocalPort: defaults.syncRelayLocalPort }),
+    ...(defaults?.syncRelay === undefined ? {} : { syncRelay: defaults.syncRelay }),
+  };
 };
 
 const recallIndexPath = (vaultRoot: string): string =>
@@ -617,10 +722,7 @@ const readThreadMetadata = async (
   threadId: string,
 ): Promise<ThreadMetadata | null> => {
   try {
-    const raw = await readFile(
-      join(vaultRoot, '_BAC', 'threads', `${threadId}.json`),
-      'utf8',
-    );
+    const raw = await readFile(join(vaultRoot, '_BAC', 'threads', `${threadId}.json`), 'utf8');
     const parsed = JSON.parse(raw) as {
       readonly bac_id?: unknown;
       readonly title?: unknown;
@@ -720,14 +822,11 @@ const routes: readonly RouteDefinition[] = [
           controller.abort();
         }, 1000);
         try {
-          const probe = await fetch(
-            `http://127.0.0.1:${String(context.mcp.port)}/mcp`,
-            {
-              method: 'GET',
-              headers: { Authorization: `Bearer ${context.mcp.authKey}` },
-              signal: controller.signal,
-            },
-          );
+          const probe = await fetch(`http://127.0.0.1:${String(context.mcp.port)}/mcp`, {
+            method: 'GET',
+            headers: { Authorization: `Bearer ${context.mcp.authKey}` },
+            signal: controller.signal,
+          });
           // 401 means a process is listening but doesn't accept
           // our key — surface as auth_failed so the side panel
           // can prompt the user to regenerate or re-paste.
@@ -805,6 +904,29 @@ const routes: readonly RouteDefinition[] = [
       200,
       { data: await (context.serviceInstaller ?? pickInstaller()).status() },
     ],
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/system\/install-service$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => [
+      200,
+      {
+        data: await (context.serviceInstaller ?? pickInstaller()).install(
+          buildServiceInstallOptions(context),
+        ),
+      },
+    ],
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/system\/uninstall-service$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => {
+      const installer = context.serviceInstaller ?? pickInstaller();
+      await installer.uninstall();
+      return [200, { data: await installer.status() }];
+    },
   },
   {
     method: 'GET',
@@ -891,6 +1013,7 @@ const routes: readonly RouteDefinition[] = [
                       rebuildTotal: lifecycleReport.rebuildTotal,
                       embedderDevice: lifecycleReport.embedderDevice,
                       embedderAccelerator: lifecycleReport.embedderAccelerator,
+                      drift: lifecycleReport.drift,
                     }),
                 ...(context.recallActivity === undefined
                   ? {}
@@ -901,6 +1024,7 @@ const routes: readonly RouteDefinition[] = [
               const status = await (context.serviceInstaller ?? pickInstaller()).status();
               return { installed: status.installed, running: status.running };
             },
+            ...syncSummaryDeps(context.replica, context.sync),
           }),
         },
       ];
@@ -998,20 +1122,37 @@ const routes: readonly RouteDefinition[] = [
           });
           const redaction = redact(input.body);
           const tokenEstimate = estimateTokens(redaction.output);
-          const result = await writer.writeDispatchEvent(
-            {
-              ...input,
-              bac_id: input.bac_id ?? createDispatchId(),
-              body: redaction.output,
-              createdAt: input.createdAt ?? new Date().toISOString(),
-              redactionSummary: {
-                matched: redaction.matched,
-                categories: [...redaction.categories],
-              },
-              tokenEstimate,
+          const dispatchEvent = {
+            ...input,
+            bac_id: input.bac_id ?? createDispatchId(),
+            body: redaction.output,
+            createdAt: input.createdAt ?? new Date().toISOString(),
+            redactionSummary: {
+              matched: redaction.matched,
+              categories: [...redaction.categories],
             },
-            requestId,
-          );
+            tokenEstimate,
+          };
+          const result = await writer.writeDispatchEvent(dispatchEvent, requestId);
+          if (context.eventLog !== undefined) {
+            await context.eventLog
+              .appendClient({
+                clientEventId: idempotencyKey,
+                aggregateId: dispatchEvent.bac_id,
+                type: DISPATCH_RECORDED,
+                payload: {
+                  bac_id: dispatchEvent.bac_id,
+                  target: { provider: dispatchEvent.target.provider },
+                  ...(dispatchEvent.workstreamId === undefined
+                    ? {}
+                    : { workstreamId: dispatchEvent.workstreamId }),
+                  createdAt: dispatchEvent.createdAt,
+                  body: dispatchEvent.body,
+                },
+                baseVector: {},
+              })
+              .catch(() => undefined);
+          }
           return [
             201,
             {
@@ -1075,7 +1216,37 @@ const routes: readonly RouteDefinition[] = [
         { dispatchId: match.bacId, threadId: body.threadId },
         requestId,
       );
+      if (context.eventLog !== undefined) {
+        await context.eventLog
+          .appendClient({
+            clientEventId: requestId,
+            aggregateId: match.bacId,
+            type: DISPATCH_LINKED,
+            payload: { dispatchId: match.bacId, threadId: body.threadId },
+            baseVector: {},
+          })
+          .catch(() => undefined);
+      }
       return [200, { data: record }];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/dispatches\/projection$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const merged = await context.eventLog.readMerged();
+      const dispatchEvents = merged.filter(
+        (event) => event.type === DISPATCH_RECORDED || event.type === DISPATCH_LINKED,
+      );
+      return [200, { data: projectDispatches(dispatchEvents) }];
     },
   },
   {
@@ -1111,14 +1282,12 @@ const routes: readonly RouteDefinition[] = [
       const dispatchId = match.bacId;
       const url = new URL(request.url ?? '/', 'http://127.0.0.1');
       const rawTimeout = url.searchParams.get('timeoutMs');
-      const requested =
-        rawTimeout === null ? 60_000 : Number.parseInt(rawTimeout, 10);
+      const requested = rawTimeout === null ? 60_000 : Number.parseInt(rawTimeout, 10);
       const timeoutMs =
         Number.isFinite(requested) && requested > 0 ? Math.min(requested, 120_000) : 60_000;
       const vaultRoot = context.vaultRoot;
 
-      const includeTurn =
-        url.searchParams.get('includeLatestAssistantTurn') !== 'false';
+      const includeTurn = url.searchParams.get('includeLatestAssistantTurn') !== 'false';
 
       const buildResponse = async (
         link: Awaited<ReturnType<typeof context.vaultWriter.readLinkForDispatch>>,
@@ -1164,9 +1333,7 @@ const routes: readonly RouteDefinition[] = [
         // Latest assistant turn — read once now so the model doesn't
         // have to make a follow-up call. Best-effort: a missing
         // threadUrl or empty turn list both reduce to "no latestAssistantTurn".
-        let latestAssistantTurn:
-          | { ordinal: number; text: string; capturedAt: string }
-          | undefined;
+        let latestAssistantTurn: { ordinal: number; text: string; capturedAt: string } | undefined;
         if (includeTurn && meta?.threadUrl !== undefined) {
           try {
             const turns = await context.vaultWriter.readRecentTurns({
@@ -1174,9 +1341,7 @@ const routes: readonly RouteDefinition[] = [
               limit: 5,
               role: 'assistant',
             });
-            const latest = turns
-              .slice()
-              .sort((left, right) => right.ordinal - left.ordinal)[0];
+            const latest = turns.slice().sort((left, right) => right.ordinal - left.ordinal)[0];
             if (latest !== undefined) {
               latestAssistantTurn = {
                 ordinal: latest.ordinal,
@@ -1315,6 +1480,217 @@ const routes: readonly RouteDefinition[] = [
     },
   },
   {
+    // Review-draft summary listing. Returns items newer than ?since
+    // (ms epoch). Browsers use this for cold-start reconciliation
+    // when the SSE stream isn't connected.
+    method: 'GET',
+    pattern: /^\/v1\/review-drafts$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+      const query = reviewDraftListQuerySchema.parse({
+        since: url.searchParams.get('since') ?? undefined,
+      });
+      const items = await listReviewDrafts(vaultRoot, query.since ?? null);
+      return [200, { items }];
+    },
+  },
+  {
+    // Cursor-shaped change feed. Browsers poll with ?since=<cursor>
+    // and pass back the returned `cursor` on the next call. The
+    // cursor is the stringified value of a per-companion monotonic
+    // counter — never a wall-clock timestamp — so a peer with a
+    // skewed clock can't push the cursor "into the future" and hide
+    // subsequent normal-time edits.
+    method: 'GET',
+    pattern: /^\/v1\/review-drafts\/changes$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+      const sinceParam = url.searchParams.get('since') ?? undefined;
+      const sinceSeq = sinceParam === undefined ? 0 : Number.parseInt(sinceParam, 10);
+      const safeSince = Number.isFinite(sinceSeq) && sinceSeq >= 0 ? sinceSeq : 0;
+      // Preferred path: read from the local monotonic change feed.
+      if (context.projectionChanges !== undefined) {
+        const result = await context.projectionChanges.readSince(safeSince);
+        const filtered = result.changed.filter((change) => change.aggregate === 'review-draft');
+        return [
+          200,
+          {
+            cursor: String(result.cursor),
+            changed: filtered.map((change) => ({
+              threadId: change.aggregateId,
+              vector: change.vector,
+              kind: change.kind,
+              localWrittenAtMs: change.localWrittenAtMs,
+            })),
+          },
+        ];
+      }
+      // Legacy fallback for tests that don't wire a feed: scan the
+      // projection directory. Cursor here is best-effort and may not
+      // be monotonic across hosts; documented as such.
+      const items = await listReviewDrafts(vaultRoot, null);
+      return [
+        200,
+        {
+          cursor: '0',
+          changed: items.map((item) => ({
+            threadId: item.threadId,
+            vector: item.vector,
+            updatedAtMs: item.updatedAtMs,
+          })),
+        },
+      ];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/review-drafts\/(?<bacId>[A-Za-z0-9_-]+)$/,
+    authRequired: true,
+    handle: async (_request, _requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing threadId path parameter.');
+      }
+      const vaultRoot = requireVaultRoot(context);
+      const projection = await readReviewDraft(vaultRoot, match.bacId);
+      if (projection === null) {
+        throw new HttpRouteError(404, 'NOT_FOUND', 'Review draft not found.');
+      }
+      return [200, { data: projection }];
+    },
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/review-drafts\/(?<bacId>[A-Za-z0-9_-]+)\/events$/,
+    authRequired: true,
+    handle: async (request, _requestId, match, context) => {
+      const threadId = match.bacId;
+      if (threadId === undefined) {
+        throw new Error('Missing threadId path parameter.');
+      }
+      const vaultRoot = requireVaultRoot(context);
+      const eventLog = context.eventLog;
+      if (eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const idempotencyKey = requireIdempotencyKey(request);
+      return await runIdempotent(context, 'reviewDraftEvent', idempotencyKey, async () => {
+        const body = await readBody(request);
+        const input = reviewDraftEventBatchSchema.parse(body);
+        // Stamp each event with the URL threadId as the aggregateId so
+        // the projection layer can fetch by aggregate. Clients don't
+        // repeat threadId in every payload; they pass it once via the
+        // path parameter.
+        const accepted = [];
+        for (const incoming of input.events) {
+          const target = compactTargetRef(incoming.target);
+          const event = await eventLog.appendClient({
+            clientEventId: incoming.clientEventId,
+            aggregateId: threadId,
+            type: incoming.type,
+            payload: incoming.payload ?? {},
+            baseVector: incoming.baseVector ?? {},
+            ...(incoming.clientDeps === undefined ? {} : { clientDeps: incoming.clientDeps }),
+            ...(target === undefined ? {} : { target }),
+          });
+          accepted.push(event);
+        }
+        // Recompute the projection from the merged log so concurrent
+        // peer events are reflected too. Phase D may hoist this onto
+        // a background projector; for M2 the recompute cost is tiny
+        // (one thread's events).
+        const reviewEvents = await eventLog.readByAggregate(threadId);
+        const threadUrl =
+          input.threadUrl ?? (await readReviewDraft(vaultRoot, threadId))?.threadUrl ?? '';
+        const projection = projectReviewDraft(threadId, threadUrl, reviewEvents);
+        if (projection.discarded) {
+          await deleteReviewDraft(vaultRoot, threadId);
+        } else {
+          await writeReviewDraft(vaultRoot, threadId, projection);
+        }
+        await context.projectionChanges
+          ?.appendChange({
+            aggregate: 'review-draft',
+            aggregateId: threadId,
+            relPath: `_BAC/review-drafts/${threadId}.json`,
+            vector: projection.vector,
+            kind: projection.discarded ? 'delete' : 'upsert',
+          })
+          .catch(() => undefined);
+        return [200, { data: { accepted, projection } }];
+      });
+    },
+  },
+  {
+    // Event-sourced delete. Direct unlink is unsafe in a CRDT
+    // system: prior events still live in the log, so a rebuild (or
+    // a peer that only saw the unaccompanied delete) would
+    // resurrect the draft. Instead the route appends a
+    // `review-draft.discarded` event whose `baseVector` covers
+    // every prior event we've observed; the projection collapses to
+    // the discarded state, and the file delete becomes a side
+    // effect.
+    method: 'DELETE',
+    pattern: /^\/v1\/review-drafts\/(?<bacId>[A-Za-z0-9_-]+)$/,
+    authRequired: true,
+    handle: async (request, requestId, match, context) => {
+      const threadId = match.bacId;
+      if (threadId === undefined) {
+        throw new Error('Missing threadId path parameter.');
+      }
+      const vaultRoot = requireVaultRoot(context);
+      const eventLog = context.eventLog;
+      if (eventLog === undefined) {
+        // Legacy callers without an eventLog wired (tests) fall back
+        // to the direct unlink so we keep their behaviour.
+        await deleteReviewDraft(vaultRoot, threadId);
+        return [204, undefined];
+      }
+      // Read the current projection so the discard event observes
+      // every prior event for this thread. baseVector === current
+      // projection's vector.
+      const priorEvents = await eventLog.readByAggregate(threadId);
+      const priorReviewEvents = priorEvents.filter((event) => isReviewDraftEvent(event));
+      const priorProjection = projectReviewDraft(threadId, '', priorReviewEvents);
+      await eventLog.appendClient({
+        clientEventId: requestId,
+        aggregateId: threadId,
+        type: 'review-draft.discarded',
+        payload: { reason: 'deleted-via-http' },
+        baseVector: priorProjection.vector,
+      });
+      // Recompute and persist the new projection (collapsed to
+      // discarded). If the projection function returns null we
+      // delete the file; otherwise we write the tombstoned
+      // projection so peers still see the vector advance.
+      const merged = await eventLog.readByAggregate(threadId);
+      const reviewEvents = merged.filter((event) => isReviewDraftEvent(event));
+      const projection = projectReviewDraft(threadId, '', reviewEvents);
+      if (projection.discarded) {
+        await deleteReviewDraft(vaultRoot, threadId);
+      } else {
+        await writeReviewDraft(vaultRoot, threadId, projection);
+      }
+      await context.projectionChanges
+        ?.appendChange({
+          aggregate: 'review-draft',
+          aggregateId: threadId,
+          relPath: `_BAC/review-drafts/${threadId}.json`,
+          vector: projection.vector,
+          kind: projection.discarded ? 'delete' : 'upsert',
+        })
+        .catch(() => undefined);
+      return [204, undefined];
+    },
+  },
+  {
     method: 'POST',
     pattern: /^\/v1\/annotations$/,
     authRequired: true,
@@ -1368,9 +1744,7 @@ const routes: readonly RouteDefinition[] = [
               },
             ];
           }
-          if (pageTitle === undefined) {
-            pageTitle = threadUrl;
-          }
+          pageTitle ??= threadUrl;
           const allTurns = await context.vaultWriter.readRecentTurns({
             threadUrl,
             limit: 50,
@@ -1393,9 +1767,7 @@ const routes: readonly RouteDefinition[] = [
           // built against. Defaults to the latest assistant turn —
           // matches the post-dispatch flow where the agent annotates
           // a fresh answer.
-          const sortedAsc = allTurns
-            .slice()
-            .sort((left, right) => left.ordinal - right.ordinal);
+          const sortedAsc = allTurns.slice().sort((left, right) => left.ordinal - right.ordinal);
           const sourceTurn = input.sourceTurn ?? 'assistant_latest';
           let turnText: string;
           if (sourceTurn === 'assistant_all') {
@@ -1438,9 +1810,7 @@ const routes: readonly RouteDefinition[] = [
           const result = buildAnchorFromTerm({
             turnText,
             term: input.term,
-            ...(input.selectionHint === undefined
-              ? {}
-              : { selectionHint: input.selectionHint }),
+            ...(input.selectionHint === undefined ? {} : { selectionHint: input.selectionHint }),
             ...(cleanedPolicy === undefined ? {} : { policy: cleanedPolicy }),
           });
           if (!result.ok) {
@@ -1472,14 +1842,29 @@ const routes: readonly RouteDefinition[] = [
             anchor: result.anchor,
             note: input.note,
           });
+          if (context.eventLog !== undefined) {
+            await context.eventLog
+              .appendClient({
+                clientEventId: `${idempotencyKey}.term`,
+                aggregateId: created.bac_id,
+                type: ANNOTATION_CREATED,
+                payload: {
+                  bac_id: created.bac_id,
+                  url: annotationUrl,
+                  anchor: result.anchor,
+                  note: input.note,
+                  pageTitle,
+                },
+                baseVector: {},
+              })
+              .catch(() => undefined);
+          }
           // totalForThread/totalForUrl: total non-deleted
           // annotations now associated with this URL. Lets the
           // model report a final count without summing per-batch
           // createdCount across multiple calls (the only fully
           // accurate way to know "how many annotations exist").
-          const totalForUrl = (
-            await listAnnotations(vaultRoot, { url: annotationUrl })
-          ).length;
+          const totalForUrl = (await listAnnotations(vaultRoot, { url: annotationUrl })).length;
           return [
             201,
             {
@@ -1493,7 +1878,25 @@ const routes: readonly RouteDefinition[] = [
             },
           ];
         }
-        return [201, { data: await writeAnnotation(vaultRoot, input) }];
+        const result = await writeAnnotation(vaultRoot, input);
+        if (context.eventLog !== undefined) {
+          await context.eventLog
+            .appendClient({
+              clientEventId: idempotencyKey,
+              aggregateId: result.bac_id,
+              type: ANNOTATION_CREATED,
+              payload: {
+                bac_id: result.bac_id,
+                url: input.url,
+                anchor: input.anchor,
+                note: input.note,
+                pageTitle: input.pageTitle,
+              },
+              baseVector: {},
+            })
+            .catch(() => undefined);
+        }
+        return [201, { data: result }];
       });
     },
   },
@@ -1522,29 +1925,69 @@ const routes: readonly RouteDefinition[] = [
     method: 'PATCH',
     pattern: /^\/v1\/annotations\/(?<annotationId>[A-Za-z0-9_-]+)$/,
     authRequired: true,
-    handle: async (request, _requestId, match, context) => {
+    handle: async (request, requestId, match, context) => {
       if (match.annotationId === undefined) {
         throw new Error('Missing annotationId path parameter.');
       }
       const input = annotationUpdateSchema.parse(await readBody(request));
-      return [
-        200,
-        { data: await updateAnnotation(requireVaultRoot(context), match.annotationId, input) },
-      ];
+      const updated = await updateAnnotation(requireVaultRoot(context), match.annotationId, input);
+      if (context.eventLog !== undefined && typeof input.note === 'string') {
+        await context.eventLog
+          .appendClient({
+            clientEventId: requestId,
+            aggregateId: match.annotationId,
+            type: ANNOTATION_NOTE_SET,
+            payload: { bac_id: match.annotationId, note: input.note },
+            baseVector: {},
+          })
+          .catch(() => undefined);
+      }
+      return [200, { data: updated }];
     },
   },
   {
     method: 'DELETE',
     pattern: /^\/v1\/annotations\/(?<annotationId>[A-Za-z0-9_-]+)$/,
     authRequired: true,
-    handle: async (_request, _requestId, match, context) => {
+    handle: async (_request, requestId, match, context) => {
       if (match.annotationId === undefined) {
         throw new Error('Missing annotationId path parameter.');
       }
-      return [
-        200,
-        { data: await softDeleteAnnotation(requireVaultRoot(context), match.annotationId) },
-      ];
+      const result = await softDeleteAnnotation(requireVaultRoot(context), match.annotationId);
+      if (context.eventLog !== undefined && context.replica !== undefined) {
+        await context.eventLog
+          .appendClient({
+            clientEventId: `annotation-delete:${context.replica.replicaId}:${match.annotationId}:${requestId}`,
+            aggregateId: match.annotationId,
+            type: ANNOTATION_DELETED,
+            payload: { bac_id: match.annotationId },
+            baseVector: {},
+          })
+          .catch(() => undefined);
+      }
+      return [200, { data: result }];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/annotations\/projection$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const merged = await context.eventLog.readMerged();
+      const annotationEvents = merged.filter(
+        (event) =>
+          event.type === ANNOTATION_CREATED ||
+          event.type === ANNOTATION_NOTE_SET ||
+          event.type === ANNOTATION_DELETED,
+      );
+      return [200, { data: projectAnnotations(annotationEvents) }];
     },
   },
   {
@@ -1560,20 +2003,20 @@ const routes: readonly RouteDefinition[] = [
       for (let index = 0; index < input.items.length; index += 1) {
         const item = input.items[index];
         const embedding = vectors[index];
-        if (item !== undefined && embedding !== undefined) {
-          await appendEntry(
-            recallIndexPath(vaultRoot),
-            {
-              id: item.id,
-              threadId: item.threadId,
-              capturedAt: item.capturedAt,
-              embedding,
-            },
-            MODEL_ID,
-          );
-          indexed += 1;
-          indexedThreadIds.push(item.threadId);
+        if (item === undefined || embedding === undefined) continue;
+        const entry = {
+          id: item.id,
+          threadId: item.threadId,
+          capturedAt: item.capturedAt,
+          embedding,
+        };
+        if (context.recallLifecycle !== undefined) {
+          await context.recallLifecycle.appendEntry(entry);
+        } else {
+          await appendEntryRaw(recallIndexPath(vaultRoot), entry, MODEL_ID);
         }
+        indexed += 1;
+        indexedThreadIds.push(item.threadId);
       }
       context.recallActivity?.recordIncrementalIndex({
         count: indexed,
@@ -1714,15 +2157,12 @@ const routes: readonly RouteDefinition[] = [
     authRequired: true,
     handle: async (request, _requestId, _match, context) => {
       const input = recallGcSchema.parse(await readBody(request));
-      return [
-        200,
-        {
-          data: await gcEntries(
-            recallIndexPath(requireVaultRoot(context)),
-            new Set(input.validIds),
-          ),
-        },
-      ];
+      const validIds = new Set(input.validIds);
+      const data =
+        context.recallLifecycle !== undefined
+          ? await context.recallLifecycle.gcEntries(validIds)
+          : await gcEntriesRaw(recallIndexPath(requireVaultRoot(context)), validIds);
+      return [200, { data }];
     },
   },
   {
@@ -1779,6 +2219,65 @@ const routes: readonly RouteDefinition[] = [
           url: input.threadUrl,
         });
         const result = await writer.writeCaptureEvent(input, requestId);
+        // Mirror the capture as a `capture.recorded` AcceptedEvent
+        // in the per-replica log so peers see it via sync. The
+        // legacy `_BAC/events/` write above stays for back-compat
+        // (older readers, the existing rebuild path); rebuild dedups
+        // by bac_id when both sources hold the same capture.
+        if (context.eventLog !== undefined) {
+          await context.eventLog
+            .appendClient({
+              clientEventId: idempotencyKey,
+              aggregateId: result.bac_id,
+              type: CAPTURE_RECORDED,
+              payload: {
+                bac_id: result.bac_id,
+                ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+                threadUrl: input.threadUrl,
+                provider: input.provider,
+                capturedAt: input.capturedAt,
+                turns: input.turns.map((turn) => ({
+                  ordinal: turn.ordinal,
+                  role: turn.role,
+                  text: turn.text,
+                  capturedAt: turn.capturedAt,
+                })),
+              },
+              baseVector: {},
+            })
+            .catch(() => undefined);
+        }
+        // Auto-index every turn so /v1/recall/query can find the
+        // capture without waiting for a manual rebuild. The lifecycle
+        // mutex serialises this against any in-flight rebuild.
+        if (context.recallLifecycle !== undefined) {
+          const threadId = result.bac_id;
+          const turns: {
+            readonly id: string;
+            readonly threadId: string;
+            readonly capturedAt: string;
+            readonly text: string;
+          }[] = [];
+          input.turns.forEach((turn) => {
+            if (turn.text.trim().length === 0) return;
+            turns.push({
+              id: `${threadId}:${String(turn.ordinal)}`,
+              threadId,
+              capturedAt: turn.capturedAt,
+              text: turn.text,
+            });
+          });
+          if (turns.length > 0) {
+            // Schedule on the lifecycle mutex but don't block the
+            // POST response — capture latency stays bounded by the
+            // vault write, not the embedder cost.
+            void context.recallLifecycle.appendCaptureTurns(turns).catch(() => {
+              // Auto-index is best-effort; if embedding fails the
+              // event log is still authoritative and a manual rebuild
+              // catches up.
+            });
+          }
+        }
         return [201, mutationResponse(result, requestId)];
       });
     },
@@ -1794,7 +2293,59 @@ const routes: readonly RouteDefinition[] = [
         await requireWorkstreamTrust(context, input.primaryWorkstreamId, tool);
       }
       const result = await context.vaultWriter.upsertThread(input, requestId);
+      // Mirror the upsert as a `thread.upserted` AcceptedEvent so
+      // peers see thread state via sync. The legacy thread.json
+      // write above is the immediate read source for callers that
+      // don't yet consume the projection.
+      if (context.eventLog !== undefined) {
+        await context.eventLog
+          .appendClient({
+            clientEventId: requestId,
+            aggregateId: result.bac_id,
+            type: THREAD_UPSERTED,
+            payload: {
+              bac_id: result.bac_id,
+              provider: input.provider,
+              threadUrl: input.threadUrl,
+              title: input.title,
+              lastSeenAt: input.lastSeenAt,
+              ...(input.status === undefined ? {} : { status: input.status }),
+              ...(input.primaryWorkstreamId === undefined
+                ? {}
+                : { primaryWorkstreamId: input.primaryWorkstreamId }),
+              ...(input.tags === undefined ? {} : { tags: input.tags }),
+              ...(input.trackingMode === undefined ? {} : { trackingMode: input.trackingMode }),
+            },
+            baseVector: {},
+          })
+          .catch(() => undefined);
+      }
       return [200, mutationResponse(result, requestId)];
+    },
+  },
+  {
+    // Read the causal projection for a thread. Optional: existing
+    // callers continue to read `_BAC/threads/<bac_id>.json` via
+    // markdown / list endpoints. This endpoint exposes register
+    // status + conflict candidates so a side panel can render a
+    // picker for two replicas that touched the same thread.
+    method: 'GET',
+    pattern: /^\/v1\/threads\/(?<bacId>[A-Za-z0-9_-]+)\/projection$/,
+    authRequired: true,
+    handle: async (_request, _requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing bacId path parameter.');
+      }
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const events = await context.eventLog.readByAggregate(match.bacId);
+      const projection = projectThread(match.bacId, events);
+      return [200, { data: projection }];
     },
   },
   {
@@ -1825,13 +2376,33 @@ const routes: readonly RouteDefinition[] = [
         );
       }
       const result = await context.vaultWriter.archiveThread(match.bacId, requestId);
+      // Mirror as a thread.archived event so peers see the status
+      // change via sync. clientEventId is deterministic per
+      // (replica, thread) so a duplicate archive call collapses on
+      // the eventLog's idempotency check.
+      if (context.eventLog !== undefined && context.replica !== undefined) {
+        await context.eventLog
+          .appendClient({
+            clientEventId: `thread-archive:${context.replica.replicaId}:${match.bacId}`,
+            aggregateId: match.bacId,
+            type: THREAD_ARCHIVED,
+            payload: { bac_id: match.bacId },
+            baseVector: {},
+          })
+          .catch(() => undefined);
+      }
       // Tombstone every recall index entry for this thread so
       // /v1/recall/query stops returning rows from archived threads.
       // OR-Set semantics: rows stay on disk with tombstoned=true; a
       // future replica merging an older un-archived write won't
       // resurrect them. Best-effort — a missing index file is a
       // benign no-op (tombstoneByThread returns 0).
-      await tombstoneByThread(recallIndexPath(vaultRoot), match.bacId).catch(() => {
+      const lifecycle = context.recallLifecycle;
+      const tombstoneByThread =
+        lifecycle === undefined
+          ? (threadId: string) => tombstoneByThreadRaw(recallIndexPath(vaultRoot), threadId)
+          : (threadId: string) => lifecycle.tombstoneByThread(threadId);
+      await tombstoneByThread(match.bacId).catch(() => {
         /* index optional; archive succeeds regardless */
       });
       return [200, mutationResponse(result, requestId)];
@@ -1853,11 +2424,21 @@ const routes: readonly RouteDefinition[] = [
         );
       }
       const result = await context.vaultWriter.unarchiveThread(match.bacId, requestId);
-      // We deliberately do NOT clear the tombstones on unarchive —
-      // an OR-Set tombstone is permanent (creating a fresh write
-      // with a higher lamport is the right way to bring an entry
-      // back). The lifecycle's incremental indexer will write fresh
-      // (untombstoned) rows for any new captures on this thread.
+      if (context.eventLog !== undefined && context.replica !== undefined) {
+        await context.eventLog
+          .appendClient({
+            clientEventId: `thread-unarchive:${context.replica.replicaId}:${match.bacId}:${requestId}`,
+            aggregateId: match.bacId,
+            type: THREAD_UNARCHIVED,
+            payload: { bac_id: match.bacId },
+            baseVector: {},
+          })
+          .catch(() => undefined);
+      }
+      // We deliberately do NOT clear the recall-index tombstones on
+      // unarchive — an OR-Set tombstone is permanent (the lifecycle's
+      // incremental indexer will write fresh, untombstoned rows for
+      // any new captures on this thread).
       return [200, mutationResponse(result, requestId)];
     },
   },
@@ -1868,7 +2449,50 @@ const routes: readonly RouteDefinition[] = [
     handle: async (request, requestId, _match, context) => {
       const input = workstreamCreateSchema.parse(await readBody(request));
       const result = await context.vaultWriter.createWorkstream(input, requestId);
+      if (context.eventLog !== undefined) {
+        await context.eventLog
+          .appendClient({
+            clientEventId: requestId,
+            aggregateId: result.bac_id,
+            type: WORKSTREAM_UPSERTED,
+            payload: {
+              bac_id: result.bac_id,
+              title: input.title,
+              ...(input.parentId === undefined ? {} : { parentId: input.parentId }),
+              ...(input.privacy === undefined ? {} : { privacy: input.privacy }),
+              ...(input.screenShareSensitive === undefined
+                ? {}
+                : { screenShareSensitive: input.screenShareSensitive }),
+              ...(input.tags === undefined ? {} : { tags: input.tags }),
+              ...(input.children === undefined ? {} : { children: input.children }),
+              ...(input.checklist === undefined ? {} : { checklist: input.checklist }),
+              ...(input.description === undefined ? {} : { description: input.description }),
+            },
+            baseVector: {},
+          })
+          .catch(() => undefined);
+      }
       return [201, mutationResponse(result, requestId)];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/workstreams\/(?<bacId>[A-Za-z0-9_-]+)\/projection$/,
+    authRequired: true,
+    handle: async (_request, _requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing bacId path parameter.');
+      }
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const events = await context.eventLog.readByAggregate(match.bacId);
+      const projection = projectWorkstream(match.bacId, events);
+      return [200, { data: projection }];
     },
   },
   {
@@ -1964,6 +2588,41 @@ const routes: readonly RouteDefinition[] = [
         input,
         requestId,
       );
+      // PATCH semantics: the input is a delta. Re-read the full
+      // record after the vault write so the emitted event carries a
+      // complete snapshot. Per-field registers (a finer CRDT) are
+      // documented as future work; for now a full-snapshot register
+      // matches the existing vault semantics.
+      if (context.eventLog !== undefined) {
+        const vaultRoot = requireVaultRoot(context);
+        try {
+          const raw = await readFile(
+            join(vaultRoot, '_BAC', 'workstreams', `${match.workstreamId}.json`),
+            'utf8',
+          );
+          const record = JSON.parse(raw) as Record<string, unknown>;
+          if (typeof record['bac_id'] === 'string' && typeof record['title'] === 'string') {
+            await context.eventLog.appendClient({
+              clientEventId: requestId,
+              aggregateId: match.workstreamId,
+              type: WORKSTREAM_UPSERTED,
+              payload: {
+                bac_id: record['bac_id'],
+                title: record['title'],
+                ...(typeof record['parentId'] === 'string' ? { parentId: record['parentId'] } : {}),
+                ...(typeof record['privacy'] === 'string' ? { privacy: record['privacy'] } : {}),
+                ...(Array.isArray(record['tags']) ? { tags: record['tags'] } : {}),
+                ...(typeof record['description'] === 'string'
+                  ? { description: record['description'] }
+                  : {}),
+              },
+              baseVector: {},
+            });
+          }
+        } catch {
+          // Best effort — the vault write succeeded regardless.
+        }
+      }
       return [200, mutationResponse(result, requestId)];
     },
   },
@@ -1976,10 +2635,7 @@ const routes: readonly RouteDefinition[] = [
         throw new Error('Missing workstreamId path parameter.');
       }
       try {
-        const result = await context.vaultWriter.deleteWorkstream(
-          match.workstreamId,
-          requestId,
-        );
+        const result = await context.vaultWriter.deleteWorkstream(match.workstreamId, requestId);
         return [
           200,
           {
@@ -2030,8 +2686,44 @@ const routes: readonly RouteDefinition[] = [
           await requireWorkstreamTrust(context, input.targetId, tool);
         }
         const result = await context.vaultWriter.createQueueItem(input, requestId);
+        if (context.eventLog !== undefined) {
+          await context.eventLog
+            .appendClient({
+              clientEventId: idempotencyKey,
+              aggregateId: result.bac_id,
+              type: QUEUE_CREATED,
+              payload: {
+                bac_id: result.bac_id,
+                text: input.text,
+                scope: input.scope,
+                ...(input.targetId === undefined ? {} : { targetId: input.targetId }),
+                ...(input.status === undefined ? {} : { status: input.status }),
+              },
+              baseVector: {},
+            })
+            .catch(() => undefined);
+        }
         return [201, mutationResponse(result, requestId)];
       });
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/queue\/(?<bacId>[A-Za-z0-9_-]+)\/projection$/,
+    authRequired: true,
+    handle: async (_request, _requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing bacId path parameter.');
+      }
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const events = await context.eventLog.readByAggregate(match.bacId);
+      return [200, { data: projectQueueItem(match.bacId, events) }];
     },
   },
   {
