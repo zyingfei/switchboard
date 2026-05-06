@@ -1,12 +1,16 @@
-// Phase 5: workflow prompts. Three callable prompts that emit the
-// canonical Sidetrack agent flows so MCP clients (Claude desktop,
-// Cursor, Codex) can pick them by name and pass arguments instead
-// of having the user paste boilerplate from the side panel.
+// Workflow prompts. Three callable prompts that emit the canonical
+// Sidetrack agent flows so MCP clients (Claude desktop, Cursor,
+// Codex) can pick them by name and pass arguments instead of having
+// the user paste boilerplate from the side panel.
 //
-// Each prompt returns a single user-role message — agents handle the
-// content as if the user typed it. Keeping them argument-driven lets
-// prompts ride the MCP server's lifecycle (no UI roundtrips, no
-// out-of-band copy/paste).
+// PR-92 review correction: these prompts are *intent-level*. They
+// describe what the user wants and let the agent discover the
+// workflow from tool schemas, descriptions, and structured outputs.
+// The earlier numbered runbooks ("1. Call dispatch.create. 2. Call
+// await_capture…") reintroduced the prompt-as-workflow-engine
+// pattern these prompts were meant to retire — see commit
+// 8abbe70 for the matching tool-side cleanup that makes the
+// workflow self-discoverable.
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
@@ -81,30 +85,18 @@ export const registerPrompts = (server: McpServer): void => {
       },
     },
     ({ targetProvider, taskBody, annotationCount, audience }) => {
-      const count = annotationCount ?? '4';
+      // Intent-level: describe the user goal. The Sidetrack tools
+      // (dispatch.create, await_capture, annotations.create_batch)
+      // self-document the rest through their descriptions, output
+      // schemas, and resource_link content blocks.
       const audienceText = audience ?? '10+ year software architects';
+      const countText = annotationCount === undefined ? 'useful' : `~${annotationCount}`;
       const lines = [
-        '# Sidetrack dispatch + annotate',
+        `Use Sidetrack to dispatch this task to ${targetProvider}, then annotate ${countText} terms on the captured response that ${audienceText} would benefit from understanding.`,
         '',
-        '1. Call sidetrack.dispatch.create with:',
-        `   - targetProvider: ${targetProvider}`,
-        '   - title: short task title',
-        '   - body:',
+        'Task to dispatch:',
         '',
         taskBody,
-        '',
-        '2. Call sidetrack.dispatch.await_capture with the dispatchId from step 1.',
-        '   This blocks until the chat tab finishes capturing.',
-        '',
-        `3. From the captured thread, identify the top ${count} terms a ${audienceText}`,
-        '   would benefit from understanding. Avoid extremely-common terms.',
-        '',
-        '4. Call sidetrack.annotations.create_batch with:',
-        '   - url: the captured threadUrl from step 2',
-        '   - pageTitle: the captured title',
-        `   - items: the ${count} {term, note} entries (let the companion build anchors)`,
-        '',
-        '5. Confirm: tell me the dispatchId, the linked threadId, and the term list.',
       ];
       return userMessage(lines.join('\n'));
     },
@@ -129,16 +121,7 @@ export const registerPrompts = (server: McpServer): void => {
     ({ threadUrl, audience }) => {
       const audienceText = audience ?? '10+ year software architects';
       const lines = [
-        '# Sidetrack annotate-only',
-        '',
-        `1. Read the thread at ${threadUrl} via sidetrack://thread/<id>/markdown`,
-        '   (find the threadId via sidetrack.threads.list filtered by URL).',
-        '',
-        `2. Identify 3-5 terms a ${audienceText} would benefit from understanding.`,
-        '',
-        '3. Call sidetrack.annotations.create_batch with:',
-        `   - url: ${threadUrl}`,
-        '   - items: {term, note} entries (let the companion build anchors)',
+        `Annotate the Sidetrack-captured thread at ${threadUrl} for ${audienceText}: pick terms or phrases that warrant a brief explanation, and pin them via Sidetrack annotation tools.`,
       ];
       return userMessage(lines.join('\n'));
     },

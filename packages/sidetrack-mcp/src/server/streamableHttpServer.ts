@@ -59,9 +59,29 @@ const readJsonBody = async (request: IncomingMessage): Promise<unknown> => {
   return JSON.parse(raw) as unknown;
 };
 
+// Optional production allow-list of Sidetrack extension ids. Same
+// semantics as the companion's gate (server.ts): when SIDETRACK_
+// ALLOWED_EXTENSION_IDS is set, only the listed
+// chrome-extension://<id> origins pass; when unset, every
+// chrome-extension:// origin is accepted (dev mode).
+const allowedExtensionIds = ((): readonly string[] => {
+  const raw = process.env['SIDETRACK_ALLOWED_EXTENSION_IDS'];
+  if (raw === undefined || raw.trim().length === 0) {
+    return [];
+  }
+  return raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+})();
+
 const isLoopbackOrigin = (origin: string): boolean => {
   if (origin.startsWith('chrome-extension://')) {
-    return true;
+    if (allowedExtensionIds.length === 0) {
+      return true;
+    }
+    const id = origin.slice('chrome-extension://'.length);
+    return allowedExtensionIds.includes(id);
   }
   try {
     const parsed = new URL(origin);

@@ -200,13 +200,35 @@ const mutationResponse = (
   },
 });
 
+// Optional allow-list of specific Sidetrack extension ids. When the
+// env var is set (production deploy), only the listed
+// chrome-extension://<id> origins pass; when unset, every
+// chrome-extension:// origin is accepted (dev mode — the unpacked
+// extension's auto-generated id changes on each load). Comma-
+// separated values, case-sensitive, no scheme prefix:
+//   SIDETRACK_ALLOWED_EXTENSION_IDS=abcdef…,123456…
+const allowedExtensionIds = ((): readonly string[] => {
+  const raw = process.env['SIDETRACK_ALLOWED_EXTENSION_IDS'];
+  if (raw === undefined || raw.trim().length === 0) {
+    return [];
+  }
+  return raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+})();
+
 const isAllowedOrigin = (origin: string | undefined): boolean => {
   if (origin === undefined) {
     return true;
   }
 
   if (origin.startsWith('chrome-extension://')) {
-    return true;
+    if (allowedExtensionIds.length === 0) {
+      return true;
+    }
+    const id = origin.slice('chrome-extension://'.length);
+    return allowedExtensionIds.includes(id);
   }
 
   try {

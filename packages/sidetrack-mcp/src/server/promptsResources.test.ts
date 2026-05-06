@@ -151,11 +151,14 @@ describe('Sidetrack MCP prompts', () => {
         },
       });
       const text = (result.messages[0]?.content as { readonly text?: string })?.text ?? '';
-      expect(text).toContain('targetProvider: chatgpt');
+      // Intent-level prompt: it names the goal and the provider but
+      // delegates workflow steps to the tool surface itself. We
+      // assert on intent + provider + verbatim task body, not on
+      // any specific tool-call sequence.
+      expect(text).toContain('chatgpt');
       expect(text).toContain('Summarise the latest HN top article in 5 sections.');
-      expect(text).toContain('sidetrack.dispatch.create');
-      expect(text).toContain('sidetrack.dispatch.await_capture');
-      expect(text).toContain('sidetrack.annotations.create_batch');
+      expect(text).toMatch(/Sidetrack/);
+      expect(text).not.toContain('1. Call sidetrack');
     } finally {
       await client.close();
     }
