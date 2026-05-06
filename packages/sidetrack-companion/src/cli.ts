@@ -499,15 +499,46 @@ const runRecallSubcommand = async (
   }
 
   if (verb === 'reingest') {
-    const replica = await loadOrCreateReplica(vaultPath);
-    const eventLog = createEventLog(vaultPath, replica);
-    writeLine(streams.stdout, `reingesting from event log into ${vaultPath}/_BAC/recall/ …`);
-    const result = await ingestIncremental(vaultPath, eventLog);
-    writeLine(
-      streams.stdout,
-      `ok — indexed ${String(result.indexedChunks)} chunks, ${String(result.tombstonedChunks)} tombstoned`,
+    // `reingest` is a writer — it walks the merged event log and
+    // upserts chunks into `_BAC/recall/index.bin`. A running companion
+    // holds the recall process-lock for the same reason (single
+    // writer per vault). If we let two writers run concurrently they
+    // race the atomic-rename pattern and the binary index can
+    // tear / drift. Take the lock; refuse if another live PID owns
+    // it.
+    const { acquireRecallProcessLock, RecallLockHeldError } = await import(
+      './recall/recovery.js'
     );
-    return 0;
+    let recallLock;
+    try {
+      recallLock = await acquireRecallProcessLock(vaultPath);
+    } catch (error) {
+      if (error instanceof RecallLockHeldError) {
+        writeLine(
+          streams.stderr,
+          `reingest: refusing — companion (pid ${String(error.pid)}) is already writing the recall index for ${vaultPath}.`,
+        );
+        writeLine(
+          streams.stderr,
+          'Stop the companion (or wait for it to exit) and re-run, or hit POST /v1/recall/reingest on the running companion instead.',
+        );
+        return 1;
+      }
+      throw error;
+    }
+    try {
+      const replica = await loadOrCreateReplica(vaultPath);
+      const eventLog = createEventLog(vaultPath, replica);
+      writeLine(streams.stdout, `reingesting from event log into ${vaultPath}/_BAC/recall/ …`);
+      const result = await ingestIncremental(vaultPath, eventLog);
+      writeLine(
+        streams.stdout,
+        `ok — indexed ${String(result.indexedChunks)} chunks, ${String(result.tombstonedChunks)} tombstoned`,
+      );
+      return 0;
+    } finally {
+      await recallLock.release();
+    }
   }
 
   if (verb === 'verify') {

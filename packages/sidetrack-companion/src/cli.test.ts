@@ -1,3 +1,6 @@
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Writable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 
@@ -107,5 +110,27 @@ describe('runCli', () => {
     );
     expect(exitCode).toBe(1);
     expect(streams.stderr.text()).toContain('model not present');
+  });
+
+  it('recall reingest refuses when the recall process-lock is held by a live foreign PID', async () => {
+    // A running companion holds `_BAC/recall/.lock` for the same
+    // single-writer reason that `recall reingest` does — letting them
+    // race the index file would tear the binary. Same trick as the
+    // recovery unit test: write the parent shell's PID into the lock
+    // (it's alive and isn't us) and check the CLI refuses.
+    const parentPid = process.ppid;
+    if (!Number.isFinite(parentPid) || parentPid <= 0) return;
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'recall-reingest-locked-'));
+    try {
+      await mkdir(join(vaultRoot, '_BAC', 'recall'), { recursive: true });
+      await writeFile(join(vaultRoot, '_BAC', 'recall', '.lock'), `${String(parentPid)}\n`, 'utf8');
+      const streams = createStreams();
+      const exitCode = await runCli(['recall', 'reingest', '--vault', vaultRoot], streams);
+      expect(exitCode).toBe(1);
+      expect(streams.stderr.text()).toContain('refusing');
+      expect(streams.stderr.text()).toContain(String(parentPid));
+    } finally {
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
   });
 });
