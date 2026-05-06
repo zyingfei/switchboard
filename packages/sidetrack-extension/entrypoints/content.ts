@@ -341,6 +341,7 @@ export default defineContentScript({
               rects: Array.from(range.getClientRects()),
               note: annotation.note,
               quote: range.toString().slice(0, 280),
+              anchor: annotation.anchor,
             });
             nextRanges.set(annotation.bac_id, range);
           }
@@ -381,9 +382,10 @@ export default defineContentScript({
     // re-mount highlights. Cheap (getClientRects() is browser-native)
     // and runs on scroll + resize so highlights stick to the underlying
     // text instead of drifting because the overlay root is fixed-positioned.
-    // Detached ranges (text removed by SPA virtualization) drop their
-    // highlight rects but keep the margin pill at its prior position
-    // until restoreAnnotations re-anchors them.
+    // SPA virtualisers (Gemini drops/re-creates message DOM on viewport
+    // changes) detach the cached Range; when getClientRects() comes
+    // back empty, re-resolve from the SerializedAnchor we cached at
+    // restore time instead of leaving the highlight rect stale.
     let repositionScheduled = false;
     const repositionLiveAnnotations = (): void => {
       if (liveAnchors.length === 0) return;
@@ -394,24 +396,35 @@ export default defineContentScript({
         const refreshed: RestoredAnchor[] = [];
         for (const anchor of liveAnchors) {
           const range = liveRanges.get(anchor.id);
-          if (range === undefined) {
+          let clientRects: DOMRect[] = [];
+          let live: Range | null = range ?? null;
+          if (live !== null) {
+            try {
+              clientRects = Array.from(live.getClientRects());
+            } catch {
+              clientRects = [];
+            }
+          }
+          if (clientRects.length === 0 && anchor.anchor !== undefined) {
+            try {
+              live = findAnchor(document.documentElement, anchor.anchor);
+              if (live !== null) {
+                clientRects = Array.from(live.getClientRects());
+                liveRanges.set(anchor.id, live);
+              }
+            } catch {
+              live = null;
+            }
+          }
+          if (live === null || clientRects.length === 0) {
             refreshed.push(anchor);
             continue;
           }
-          try {
-            const clientRects = Array.from(range.getClientRects());
-            if (clientRects.length === 0) {
-              refreshed.push(anchor);
-              continue;
-            }
-            refreshed.push({
-              ...anchor,
-              rect: range.getBoundingClientRect(),
-              rects: clientRects,
-            });
-          } catch {
-            refreshed.push(anchor);
-          }
+          refreshed.push({
+            ...anchor,
+            rect: live.getBoundingClientRect(),
+            rects: clientRects,
+          });
         }
         liveAnchors.splice(0, liveAnchors.length, ...refreshed);
         mountAnnotationOverlay(liveAnchors);

@@ -3521,6 +3521,10 @@ const App = () => {
             type="button"
             aria-label="Find active tab in side panel"
           >
+            {/* Crosshair / locator. Visually distinct from the
+                magnifier in "Search indexed threads" — this one
+                tells you where the active tab IS, not searches
+                for something to find. */}
             <svg
               viewBox="0 0 24 24"
               fill="none"
@@ -3529,8 +3533,12 @@ const App = () => {
               strokeLinecap="round"
               strokeLinejoin="round"
             >
-              <circle cx="11" cy="11" r="7" />
-              <line x1="21" y1="21" x2="16.65" y2="16.65" />
+              <circle cx="12" cy="12" r="9" />
+              <circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none" />
+              <line x1="12" y1="2" x2="12" y2="5.5" />
+              <line x1="12" y1="18.5" x2="12" y2="22" />
+              <line x1="2" y1="12" x2="5.5" y2="12" />
+              <line x1="18.5" y1="12" x2="22" y2="12" />
             </svg>
           </button>
           <button
