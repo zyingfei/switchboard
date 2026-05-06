@@ -1,12 +1,12 @@
 import { Icons } from './icons';
 
-// Per-workstream MCP write-tool trust toggles. Default-deny — coding
-// agents calling write tools (move/queue/bump/archive/unarchive) on
-// this workstream get NOT_TRUSTED unless explicitly allowed.
+// Per-workstream MCP write-tool trust toggles. Default-allow —
+// fresh workstreams have no record on disk so every tool is on
+// until the user toggles one off (writing a deny-list record via
+// PUT). Once a record exists, its allow-list is honored as-is.
 //
-// Backed by GET/PUT /v1/workstreams/{id}/trust (PR #78 Track W). When
-// PR #78 lands, the parent fetches the current Trust record on mount
-// and writes back on each toggle.
+// Backed by GET/PUT /v1/workstreams/{id}/trust. The parent fetches
+// on detail-panel open and writes back on each toggle.
 
 export type TrustTool =
   | 'sidetrack.threads.move'
@@ -33,9 +33,9 @@ export function TrustToggles({ entries, onToggle }: TrustTogglesProps) {
       <div className="trust-head">
         <span className="lock">{Icons.lock}</span>
         <div>
-          <div className="t1">MCP write tools — default deny</div>
+          <div className="t1">MCP write tools — default allow</div>
           <div className="t2">
-            Tools not on this list refuse with <code>NOT_TRUSTED</code>.
+            Toggle one off to deny just that tool with <code>NOT_TRUSTED</code>.
           </div>
         </div>
       </div>

@@ -439,6 +439,9 @@ const App = () => {
   const [workstreamDetailLinkedNotes, setWorkstreamDetailLinkedNotes] = useState<
     readonly LinkedNote[]
   >([]);
+  // Mount-time defaults — match the companion's allow-by-default
+  // trust semantic so the UI doesn't lie about state before the
+  // panel-open hydration fires GET /v1/workstreams/{id}/trust.
   const [workstreamDetailTrust, setWorkstreamDetailTrust] = useState<readonly TrustEntry[]>([
     {
       tool: 'sidetrack.queue.create',
@@ -450,25 +453,25 @@ const App = () => {
       tool: 'sidetrack.threads.move',
       humanLabel: 'move_item',
       description: 'move a tracked thread to this workstream',
-      allowed: false,
+      allowed: true,
     },
     {
       tool: 'sidetrack.workstreams.bump',
       humanLabel: 'bump_workstream',
       description: 'raise priority on a queued ask',
-      allowed: false,
+      allowed: true,
     },
     {
       tool: 'sidetrack.threads.archive',
       humanLabel: 'archive_thread',
       description: 'archive a tracked thread',
-      allowed: false,
+      allowed: true,
     },
     {
       tool: 'sidetrack.threads.unarchive',
       humanLabel: 'unarchive_thread',
       description: 'restore an archived thread',
-      allowed: false,
+      allowed: true,
     },
   ]);
   const [pendingCodingOffers, setPendingCodingOffers] = useState<readonly OfferRecord[]>([]);
@@ -3881,6 +3884,35 @@ const App = () => {
               ? undefined
               : () => {
                   setWorkstreamDetailOpen(true);
+                  // Hydrate trust state from the companion. Without
+                  // this the panel showed its hard-coded useState
+                  // defaults (mostly deny), which after the
+                  // allow-by-default companion change painted the
+                  // wrong story. Best-effort: on companion absence
+                  // or fetch failure we fall back to the in-memory
+                  // state, which we now seed all-allowed at mount.
+                  if (port.length > 0 && bridgeKey.length > 0) {
+                    void (async () => {
+                      try {
+                        const url = `http://127.0.0.1:${port}/v1/workstreams/${currentWsId}/trust`;
+                        const response = await fetch(url, {
+                          headers: { 'x-bac-bridge-key': bridgeKey },
+                        });
+                        if (!response.ok) return;
+                        const body = (await response.json()) as {
+                          readonly data?: { readonly allowedTools?: readonly string[] };
+                        };
+                        const allowed = new Set(body.data?.allowedTools ?? []);
+                        setWorkstreamDetailTrust((prev) =>
+                          prev.map((entry) => ({ ...entry, allowed: allowed.has(entry.tool) })),
+                        );
+                      } catch {
+                        // Leave state as-is; the in-memory defaults
+                        // already match the companion's allow-by-
+                        // default semantic for unseen workstreams.
+                      }
+                    })();
+                  }
                   // Fire-and-forget linked-notes fetch when companion is
                   // configured. Empty list is a fine fallback.
                   if (port.length > 0 && bridgeKey.length > 0) {
