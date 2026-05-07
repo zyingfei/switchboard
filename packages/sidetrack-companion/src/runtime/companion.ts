@@ -22,6 +22,7 @@ import { createProjectionMaterializer } from '../sync/contract/projectionMateria
 import { createRecallMaterializer } from '../sync/contract/recallMaterializer.js';
 import { createSyncContractRunner } from '../sync/contract/runner.js';
 import { createExtractionStore } from '../recall/extraction/store.js';
+import { createEmbeddingCache } from '../recall/embeddingCache.js';
 import { reprojectOnVersionMismatch } from '../sync/reproject.js';
 import { startAntiEntropyTask } from '../sync/antiEntropy.js';
 import {
@@ -330,6 +331,10 @@ export const startCompanion = async (
       // L2-G10 when extraction revisions change.
       extractionStore,
       indexPath: `${options.vaultPath}/_BAC/recall/index.bin`,
+      // L2-G2 — embedding cache. Metadata-only extractor upgrades
+      // reuse vectors keyed by embedTextHash; the embedder is only
+      // invoked for chunks whose text actually changed.
+      embeddingCache: createEmbeddingCache(options.vaultPath),
     }),
   );
   // Don't block startup on the rebuild — health endpoint will report

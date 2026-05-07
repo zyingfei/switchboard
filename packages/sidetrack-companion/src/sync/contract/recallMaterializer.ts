@@ -1,10 +1,12 @@
 import type { RecallActivityTracker } from '../../recall/activity.js';
 import { chunkTurn } from '../../recall/chunker.js';
 import { embed } from '../../recall/embedder.js';
+import type { EmbeddingCache } from '../../recall/embeddingCache.js';
 import { replaceEntriesForSourceUnit } from '../../recall/indexFile.js';
 import type { RecallLifecycle } from '../../recall/lifecycle.js';
 import type { ExtractionStore } from '../../recall/extraction/store.js';
 import { MODEL_ID } from '../../recall/embedder.js';
+import { RECALL_MODEL } from '../../recall/modelManifest.js';
 import type { IndexEntry } from '../../recall/ranker.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
@@ -48,6 +50,12 @@ export interface CreateRecallMaterializerDeps {
   // materializer can call replaceEntriesForSourceUnit. Defaults
   // to <vaultRoot>/_BAC/recall/index.bin in production wiring.
   readonly indexPath?: string;
+  // Lane 2 / L2-G2: optional embedding cache. When provided, the
+  // reconcile path checks the cache first by `embedTextHash`. If
+  // the chunk text is unchanged (metadata-only extractor upgrade),
+  // the cache returns the prior vector and the embedder is NOT
+  // called for that chunk. When absent, behavior is unchanged.
+  readonly embeddingCache?: EmbeddingCache;
 }
 
 export const createRecallMaterializer = (
@@ -139,7 +147,57 @@ export const createRecallMaterializer = (
           ...(turn.formattedText === undefined ? {} : { formattedText: turn.formattedText }),
         });
         if (chunks.length === 0) continue;
-        const vectors = await embed(chunks.map((c) => c.text));
+        // L2-G2: cache check by embedTextHash. Chunks whose text
+        // (and therefore textHash) are unchanged across a metadata-
+        // only extractor upgrade hit the cache and skip the
+        // embedder. Per-chunk granularity so a partial overlap
+        // (e.g., one paragraph changed in a 5-paragraph turn) only
+        // re-embeds the changed paragraph.
+        const cacheHits: (Float32Array | null)[] = [];
+        const toEmbed: { index: number; text: string; hash: string }[] = [];
+        for (let i = 0; i < chunks.length; i += 1) {
+          const chunk = chunks[i]!;
+          const cached =
+            deps.embeddingCache === undefined
+              ? null
+              : await deps.embeddingCache.get({
+                  modelId: MODEL_ID,
+                  modelRevision: RECALL_MODEL.revision,
+                  embedTextHash: chunk.textHash,
+                });
+          cacheHits.push(cached);
+          if (cached === null) {
+            toEmbed.push({ index: i, text: chunk.text, hash: chunk.textHash });
+          }
+        }
+        const freshVectors =
+          toEmbed.length === 0 ? [] : await embed(toEmbed.map((t) => t.text));
+        const vectors: Float32Array[] = [];
+        let fresh = 0;
+        for (let i = 0; i < chunks.length; i += 1) {
+          const cached = cacheHits[i];
+          if (cached !== null && cached !== undefined) {
+            vectors.push(cached);
+          } else {
+            const vec = freshVectors[fresh] ?? new Float32Array(384);
+            vectors.push(vec);
+            // Store in the cache for future reuse.
+            if (deps.embeddingCache !== undefined) {
+              const entry = toEmbed[fresh];
+              if (entry !== undefined) {
+                await deps.embeddingCache.put(
+                  {
+                    modelId: MODEL_ID,
+                    modelRevision: RECALL_MODEL.revision,
+                    embedTextHash: entry.hash,
+                  },
+                  vec,
+                );
+              }
+            }
+            fresh += 1;
+          }
+        }
         for (let i = 0; i < chunks.length; i += 1) {
           const chunk = chunks[i]!;
           const vector = vectors[i] ?? new Float32Array(384);
