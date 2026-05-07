@@ -55,8 +55,10 @@ index), and C (audit JSONL) all from one event.
 
 **Timeline:** mainly Class F (plugin-tier active window of recent
 observations). The companion-side projection of timeline entries is
-Class A. Optional later: Class B if a recall-style index over
-timeline becomes useful.
+Class B (derived cache — a deterministic daily reduction over
+events; no per-record concurrent-edit semantics, so it isn't
+Class A). Optional later: a Class B recall-style semantic index
+if needed.
 
 ## 2. Define the event type(s)
 
@@ -361,18 +363,19 @@ Applying the recipe to timeline (full design in
 [`timeline.md`](timeline.md)):
 
 1. **Class.** Plugin-tier active window is Class F. Companion-side
-   projection of entries is Class A.
+   projection of entries is Class B (derived cache).
 2. **Event.** `browser.timeline.observed`. Payload covers
    activate/update/complete/close transitions; URL +
    canonical URL + title + provider; tabId/windowId hashes
    (privacy: hashed, not raw).
 3. **Registry entry.** Two surfaces:
    `plugin-timeline-active-window` (F, recovery `spool-drain`) and
-   `timeline-projection` (A, materializer `projection` or `timeline`,
+   `timeline-projection` (B, materializer `timeline`,
    freshness 30_000 ms, recovery `replay-event-log`).
-4. **Companion materializer.** Either reuse `projection` or add a
-   dedicated `timeline` materializer that writes daily-bucketed
-   projection files at `_BAC/timeline/projections/<YYYY-MM-DD>.json`.
+4. **Companion materializer.** Dedicated `timeline` materializer
+   that writes daily-bucketed projection files at
+   `_BAC/timeline/projections/<YYYY-MM-DD>.json`. Registered in
+   `KNOWN_MATERIALIZERS`.
 5. **Plugin materializer.** New `timelinePluginMaterializer`. Active
    set capped per `activeSetCount.timeline`. Passive intent (default).
    Spool overflow → drop-by-policy with health counter.

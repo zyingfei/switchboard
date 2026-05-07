@@ -7,8 +7,9 @@ questions like "what ChatGPT thread was I looking at last Tuesday
 afternoon?" without digging through browser history.
 
 This is the **first real future surface** that exercises Class F +
-the contract extension path. It proves the architecture is open for
-new high-volume passive surfaces without any contract changes.
+Class B + the contract extension path. It proves the architecture is
+open for new high-volume passive surfaces without any contract
+changes.
 
 Read [`sync-contract-v1.md`](sync-contract-v1.md),
 [`plugin-edge-storage.md`](plugin-edge-storage.md), and
