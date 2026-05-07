@@ -690,11 +690,28 @@ const App = () => {
   }, [composeThread, composeWorkstreamOverrideId, state.workstreams]);
 
   const refresh = async () => {
-    const next = await sendRequest({ type: messageTypes.getWorkboardState });
+    // Use sendRequestRaw so we can consume state from `ok:false`
+    // responses too. getWorkboardState returns ok:false +
+    // state.companionStatus='disconnected' when the companion is
+    // unreachable; throwing there means the side panel discards
+    // the disconnected state and the user keeps seeing a stale
+    // "connected" UI. Refresh is a poll, not an action — it
+    // should reflect whatever state the background has.
+    const response = (await chrome.runtime.sendMessage({
+      type: messageTypes.getWorkboardState,
+    })) as unknown;
+    if (!isRuntimeResponse(response)) {
+      throw new Error('Sidetrack background returned an invalid response.');
+    }
+    if (!response.ok && response.state === undefined) {
+      // No state to consume — surface the error and bail.
+      throw new Error(response.error);
+    }
+    const next = response.ok ? response.state : response.state!;
     setState(next);
     setBridgeKey(next.settings.companion.bridgeKey);
     setPort(String(next.settings.companion.port));
-    setError(next.lastError ?? null);
+    setError(next.lastError ?? (response.ok ? null : response.error ?? null));
     if (next.vaultPath !== undefined) {
       setVaultPath(next.vaultPath);
     }

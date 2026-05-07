@@ -1427,6 +1427,15 @@ const withCompanionStatus = async (
     }
     return { ok: true, state };
   } catch (error) {
+    // The side panel needs to learn about a transition to
+    // disconnected (or vault-error) the same way it learns about
+    // a successful capture. Without this broadcast, the user
+    // takes an action while offline, the optimistic local write
+    // happens, and the UI silently lies "connected" until the
+    // 15s periodic poll at sidepanel/App.tsx:723 catches up.
+    if (work !== undefined && reason !== undefined) {
+      void broadcastWorkboardChanged(reason);
+    }
     return {
       ok: false,
       error: error instanceof Error ? error.message : 'Sidetrack background action failed.',
