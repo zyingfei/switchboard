@@ -18,6 +18,8 @@ import { createEventLog } from '../sync/eventLog.js';
 import { createKnownReplicasStore } from '../sync/knownReplicas.js';
 import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
 import { createExtractionMaterializer } from '../sync/contract/extractionMaterializer.js';
+import { createTimelineMaterializer } from '../sync/contract/timelineMaterializer.js';
+import { createTimelineStore } from '../timeline/projection.js';
 import { createProjectionMaterializer } from '../sync/contract/projectionMaterializer.js';
 import { createRecallMaterializer } from '../sync/contract/recallMaterializer.js';
 import { createSyncContractRunner } from '../sync/contract/runner.js';
@@ -183,6 +185,18 @@ export const startCompanion = async (
   syncContractRunner.register(
     createExtractionMaterializer({
       store: extractionStore,
+      eventLog: baseEventLog,
+    }),
+  );
+  // First future surface — Class B timeline projection. Reduces
+  // browser.timeline.observed events into daily-bucketed projection
+  // files at _BAC/timeline/projections/<YYYY-MM-DD>.json. Pure
+  // reduction over the event log; deterministic; replay-recoverable
+  // via catchUp.
+  const timelineStore = createTimelineStore(options.vaultPath);
+  syncContractRunner.register(
+    createTimelineMaterializer({
+      store: timelineStore,
       eventLog: baseEventLog,
     }),
   );
@@ -383,6 +397,18 @@ export const startCompanion = async (
     eventLog,
     projectionChanges,
     syncMaterializerHealth: () => syncContractRunner.health(),
+    // Class F edge-event import path: plugin-originated events (e.g.
+    // browser.timeline.observed) ship with their edge dot allocated;
+    // we import + dispatch through the runner so timeline / future
+    // passive surfaces converge symmetrically with relay peer events.
+    importEdgeEvent: async (event) => {
+      const result = await baseEventLog.importPeerEvent(event);
+      if (result.imported) {
+        syncContractRunner.onAcceptedEvent(event, { origin: 'peer' });
+      }
+      return { imported: result.imported };
+    },
+    timelineStore,
     serviceInstallDefaults: {
       port: options.port,
       ...(options.service?.companionCommand === undefined

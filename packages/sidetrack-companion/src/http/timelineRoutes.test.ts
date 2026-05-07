@@ -1,0 +1,201 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+import { createVaultWriter } from '../vault/writer.js';
+import { createIdempotencyStore } from './idempotency.js';
+import { createEventLog } from '../sync/eventLog.js';
+import { loadOrCreateReplica } from '../sync/replicaId.js';
+import { createSyncContractRunner } from '../sync/contract/runner.js';
+import { createTimelineMaterializer } from '../sync/contract/timelineMaterializer.js';
+import { createTimelineStore } from '../timeline/projection.js';
+import {
+  BROWSER_TIMELINE_OBSERVED,
+  type BrowserTimelineObservedPayload,
+} from '../timeline/events.js';
+import type { AcceptedEvent } from '../sync/causal.js';
+import { createCompanionHttpServer, startHttpServer } from './server.js';
+
+// Black-box: spin up the companion HTTP server with the timeline
+// routes wired and exercise POST /v1/timeline/events + GET /v1/timeline.
+
+const buildEvent = (input: {
+  edgeReplicaId: string;
+  seq: number;
+  payload: BrowserTimelineObservedPayload;
+}): AcceptedEvent => ({
+  clientEventId: input.payload.eventId,
+  dot: { replicaId: input.edgeReplicaId, seq: input.seq },
+  deps: {},
+  aggregateId: input.payload.observedAt.slice(0, 10),
+  type: BROWSER_TIMELINE_OBSERVED,
+  payload: input.payload,
+  acceptedAtMs: Date.parse(input.payload.observedAt),
+});
+
+const observe = (overrides: Partial<BrowserTimelineObservedPayload> & { observedAt: string; url: string }):
+  BrowserTimelineObservedPayload => ({
+  eventId: overrides.eventId ?? `evt-${overrides.observedAt}-${overrides.url}`,
+  observedAt: overrides.observedAt,
+  url: overrides.url,
+  transition: overrides.transition ?? 'activated',
+  ...(overrides.canonicalUrl === undefined ? {} : { canonicalUrl: overrides.canonicalUrl }),
+  ...(overrides.title === undefined ? {} : { title: overrides.title }),
+  ...(overrides.provider === undefined ? {} : { provider: overrides.provider }),
+});
+
+describe('timeline HTTP routes', () => {
+  let vaultRoot: string;
+  let serverUrl: string;
+  let close: (() => Promise<void>) | null = null;
+
+  const BRIDGE = 'test-bridge-key';
+
+  beforeEach(async () => {
+    vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-timeline-http-'));
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const store = createTimelineStore(vaultRoot);
+    const runner = createSyncContractRunner();
+    runner.register(createTimelineMaterializer({ store, eventLog }));
+    const idempotencyStore = createIdempotencyStore(vaultRoot);
+    const server = createCompanionHttpServer({
+      bridgeKey: BRIDGE,
+      vaultWriter: createVaultWriter(vaultRoot),
+      vaultRoot,
+      idempotencyStore,
+      replica,
+      eventLog,
+      timelineStore: store,
+      importEdgeEvent: async (event) => {
+        const result = await eventLog.importPeerEvent(event);
+        if (result.imported) runner.onAcceptedEvent(event, { origin: 'peer' });
+        return { imported: result.imported };
+      },
+      syncMaterializerHealth: () => runner.health(),
+    });
+    const started = await startHttpServer(server, 0);
+    serverUrl = started.url;
+    close = started.close;
+  });
+
+  afterEach(async () => {
+    if (close !== null) await close();
+    close = null;
+    await rm(vaultRoot, { recursive: true, force: true });
+  });
+
+  const post = async (path: string, body: unknown): Promise<{ status: number; data: unknown }> => {
+    const res = await fetch(`${serverUrl}${path}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': BRIDGE,
+      },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, data: await res.json() };
+  };
+
+  const get = async (path: string): Promise<{ status: number; data: unknown }> => {
+    const res = await fetch(`${serverUrl}${path}`, {
+      headers: { 'x-bac-bridge-key': BRIDGE },
+    });
+    return { status: res.status, data: await res.json() };
+  };
+
+  it('POST /v1/timeline/events imports edge events and GET /v1/timeline returns them', async () => {
+    const events = [
+      buildEvent({
+        edgeReplicaId: 'edge_test',
+        seq: 1,
+        payload: observe({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a', title: 'A' }),
+      }),
+      buildEvent({
+        edgeReplicaId: 'edge_test',
+        seq: 2,
+        payload: observe({ observedAt: '2026-05-07T11:00:00.000Z', url: 'https://x/b', canonicalUrl: 'https://x/b', title: 'B' }),
+      }),
+    ];
+    const post1 = await post('/v1/timeline/events', { events });
+    expect(post1.status).toBe(200);
+    const data = post1.data as { data: { imported: { replicaId: string; seq: number }[] } };
+    expect(data.data.imported).toHaveLength(2);
+
+    // Give the materializer a tick to drain.
+    await new Promise((r) => setTimeout(r, 50));
+
+    const got = await get('/v1/timeline');
+    expect(got.status).toBe(200);
+    const body = got.data as { data: { scope: string; items: { id: string }[]; entryCount: number } };
+    expect(body.data.scope).toBe('companion-extended');
+    expect(body.data.entryCount).toBeGreaterThanOrEqual(2);
+    const ids = body.data.items.map((e) => e.id);
+    expect(ids).toContain('https://x/a');
+    expect(ids).toContain('https://x/b');
+  });
+
+  it('POST /v1/timeline/events is idempotent — same edge dot re-imports as no-op', async () => {
+    const event = buildEvent({
+      edgeReplicaId: 'edge_test',
+      seq: 1,
+      payload: observe({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a' }),
+    });
+    const r1 = await post('/v1/timeline/events', { events: [event] });
+    expect(r1.status).toBe(200);
+    expect((r1.data as { data: { imported: unknown[] } }).data.imported).toHaveLength(1);
+
+    const r2 = await post('/v1/timeline/events', { events: [event] });
+    expect(r2.status).toBe(200);
+    const body2 = r2.data as { data: { imported: unknown[]; skipped: { reason: string }[] } };
+    expect(body2.data.imported).toHaveLength(0);
+    expect(body2.data.skipped).toHaveLength(1);
+    expect(body2.data.skipped[0]?.reason).toBe('already-imported');
+  });
+
+  it('GET /v1/timeline filters by `q` substring', async () => {
+    const events = [
+      buildEvent({
+        edgeReplicaId: 'edge_test',
+        seq: 1,
+        payload: observe({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://chat.example.com/abc', canonicalUrl: 'https://chat.example.com/abc', title: 'Recipe planning' }),
+      }),
+      buildEvent({
+        edgeReplicaId: 'edge_test',
+        seq: 2,
+        payload: observe({ observedAt: '2026-05-07T11:00:00.000Z', url: 'https://github.com/repo', canonicalUrl: 'https://github.com/repo', title: 'GitHub' }),
+      }),
+    ];
+    await post('/v1/timeline/events', { events });
+    await new Promise((r) => setTimeout(r, 50));
+    const got = await get('/v1/timeline?q=recipe');
+    const body = got.data as { data: { items: { title?: string }[] } };
+    expect(body.data.items.map((e) => e.title)).toEqual(['Recipe planning']);
+  });
+
+  it('GET /v1/timeline filters by `since` and `until` dates', async () => {
+    const events = [
+      buildEvent({
+        edgeReplicaId: 'edge_test',
+        seq: 1,
+        payload: observe({ observedAt: '2026-05-06T10:00:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a' }),
+      }),
+      buildEvent({
+        edgeReplicaId: 'edge_test',
+        seq: 2,
+        payload: observe({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/b', canonicalUrl: 'https://x/b' }),
+      }),
+      buildEvent({
+        edgeReplicaId: 'edge_test',
+        seq: 3,
+        payload: observe({ observedAt: '2026-05-08T10:00:00.000Z', url: 'https://x/c', canonicalUrl: 'https://x/c' }),
+      }),
+    ];
+    await post('/v1/timeline/events', { events });
+    await new Promise((r) => setTimeout(r, 50));
+    const got = await get('/v1/timeline?since=2026-05-07&until=2026-05-07');
+    const body = got.data as { data: { items: { id: string; date: string }[] } };
+    expect(body.data.items.map((e) => e.date)).toEqual(['2026-05-07']);
+  });
+});

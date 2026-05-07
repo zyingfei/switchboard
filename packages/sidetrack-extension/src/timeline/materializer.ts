@@ -121,7 +121,7 @@ export const createDefaultTimelineDrainHook = (
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        authorization: `Bearer ${deps.bridgeKey}`,
+        'x-bac-bridge-key': deps.bridgeKey,
       },
       body,
     });

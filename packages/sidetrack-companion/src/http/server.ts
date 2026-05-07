@@ -303,6 +303,19 @@ export interface CompanionHttpConfig {
   // whose ?token=… matches whatever the running MCP server actually
   // accepts — without the user copying keys between two terminals.
   readonly mcp?: { readonly port: number; readonly authKey: string };
+  // Sync Contract v1 / Class F — edge-event import path for plugin-
+  // originated events whose dot is allocated by the edge replica
+  // (timeline observations + future passive surfaces). Closes over
+  // both `eventLog.importPeerEvent` AND `runner.onAcceptedEvent` so
+  // the runner sees every accepted edge event symmetrically with
+  // relay-imported peer events. Optional so legacy tests work; when
+  // unset the timeline events route returns 503.
+  readonly importEdgeEvent?: (
+    event: import('../sync/causal.js').AcceptedEvent,
+  ) => Promise<{ imported: boolean }>;
+  // Optional timeline projection store, exposing read access for
+  // the GET /v1/timeline route. When unset that route returns 503.
+  readonly timelineStore?: import('../timeline/projection.js').TimelineStore;
 }
 
 export interface StartedHttpServer {
@@ -3106,6 +3119,138 @@ const routes: readonly RouteDefinition[] = [
         requestId,
       );
       return [200, { data: result }];
+    },
+  },
+  // Sync Contract v1 — timeline (Class F + Class B) routes.
+  //
+  // POST /v1/timeline/events — imports plugin-originated edge events
+  // (browser.timeline.observed). The plugin allocates the edge dot;
+  // the companion does NOT restamp. importEdgeEvent runs the
+  // accepted event through the contract runner so the timeline
+  // materializer rebuilds the affected day projection.
+  //
+  // GET /v1/timeline — returns the daily-bucketed projection. Range
+  // filtered by `since` / `until` (UTC ISO timestamps); plain
+  // substring filter on `q` (matches title or url). Always returns
+  // a ScopedResult-shaped envelope with `scope: 'companion-extended'`.
+  {
+    method: 'POST',
+    pattern: /^\/v1\/timeline\/events$/u,
+    authRequired: true,
+    handle: async (request, requestId, _match, context) => {
+      if (context.importEdgeEvent === undefined) {
+        throw new HttpRouteError(
+          503,
+          'TIMELINE_NOT_WIRED',
+          'Timeline import is not configured.',
+        );
+      }
+      const body = (await readBody(request)) as { events?: unknown };
+      if (body === null || typeof body !== 'object' || !Array.isArray(body.events)) {
+        throw new HttpRouteError(
+          400,
+          'INVALID_REQUEST',
+          'Body must be { events: AcceptedEvent[] }.',
+        );
+      }
+      const imported: { replicaId: string; seq: number }[] = [];
+      const skipped: { replicaId: string; seq: number; reason: string }[] = [];
+      for (const candidate of body.events) {
+        if (
+          candidate === null ||
+          typeof candidate !== 'object' ||
+          typeof (candidate as { type?: unknown }).type !== 'string' ||
+          typeof (candidate as { dot?: unknown }).dot !== 'object' ||
+          (candidate as { dot?: { replicaId?: unknown } }).dot === null
+        ) {
+          continue;
+        }
+        const event = candidate as import('../sync/causal.js').AcceptedEvent;
+        try {
+          const result = await context.importEdgeEvent(event);
+          if (result.imported) {
+            imported.push({ replicaId: event.dot.replicaId, seq: event.dot.seq });
+          } else {
+            skipped.push({
+              replicaId: event.dot.replicaId,
+              seq: event.dot.seq,
+              reason: 'already-imported',
+            });
+          }
+        } catch (err) {
+          skipped.push({
+            replicaId: event.dot.replicaId,
+            seq: event.dot.seq,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      void requestId;
+      return [200, { data: { imported, skipped } }];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/timeline(?:\?.*)?$/u,
+    authRequired: true,
+    handle: async (request, requestId, _match, context) => {
+      if (context.timelineStore === undefined) {
+        throw new HttpRouteError(
+          503,
+          'TIMELINE_NOT_WIRED',
+          'Timeline projection is not configured.',
+        );
+      }
+      const url = new URL(request.url ?? '/v1/timeline', 'http://internal');
+      const since = url.searchParams.get('since') ?? undefined;
+      const until = url.searchParams.get('until') ?? undefined;
+      const q = (url.searchParams.get('q') ?? '').trim().toLowerCase();
+      const limitRaw = Number.parseInt(url.searchParams.get('limit') ?? '100', 10);
+      const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 1000) : 100;
+
+      const days = await context.timelineStore.listDays();
+      const inRange = days.filter((d) => {
+        if (since !== undefined && d < since.slice(0, 10)) return false;
+        if (until !== undefined && d > until.slice(0, 10)) return false;
+        return true;
+      });
+      const items: Array<{
+        readonly date: string;
+        readonly id: string;
+        readonly firstSeenAt: string;
+        readonly lastSeenAt: string;
+        readonly url: string;
+        readonly canonicalUrl?: string;
+        readonly title?: string;
+        readonly provider?: string;
+        readonly visitCount: number;
+      }> = [];
+      // Walk newest-day first so we hit the limit on recent
+      // entries.
+      for (const date of [...inRange].reverse()) {
+        const day = await context.timelineStore.readDay(date);
+        if (day === null) continue;
+        for (const entry of day.entries) {
+          if (q.length > 0) {
+            const hay = `${entry.title ?? ''} ${entry.url}`.toLowerCase();
+            if (!hay.includes(q)) continue;
+          }
+          items.push({ date, ...entry });
+          if (items.length >= limit) break;
+        }
+        if (items.length >= limit) break;
+      }
+      void requestId;
+      return [
+        200,
+        {
+          data: {
+            scope: 'companion-extended',
+            items,
+            entryCount: items.length,
+          },
+        },
+      ];
     },
   },
 ];
