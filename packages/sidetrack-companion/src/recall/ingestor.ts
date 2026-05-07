@@ -139,13 +139,37 @@ export const ingestIncremental = async (
     return event.dot.seq > lastSeq;
   });
 
-  // Tombstone targets first, since the latest threadId tombstone
-  // applies to every chunk we produce in this same pass.
+  // Tombstones are MONOTONIC over the merged log. A tombstone
+  // emitted in a prior incremental pass (already past the
+  // frontier) must still tombstone any capture that arrives later
+  // for the same thread — otherwise a delayed peer capture
+  // arriving after the thread was already deleted would land as
+  // a LIVE chunk in this pass while a full rebuild would
+  // tombstone it. To stay rebuild-equivalent, the per-chunk
+  // tombstone check below uses EVERY tombstone in the merged log,
+  // not just `fresh`. (Reviewer-flagged divergence bug.)
+  //
+  // We keep TWO sets:
+  //   - `tombstonedThreads` (full merged-log scan): the per-chunk
+  //     tombstone flag at insert time uses this. Captures for a
+  //     previously-tombstoned thread land tombstoned no matter
+  //     when they arrive.
+  //   - `freshTombstones`: only the tombstones that JUST landed in
+  //     this pass. We run tombstoneByThread for these to flip
+  //     existing index entries; older tombstones already applied
+  //     their sweep in prior passes, so re-running them would
+  //     just be wasted I/O (no correctness impact, but pointless).
   const tombstonedThreads = new Set<string>();
-  for (const event of fresh) {
+  for (const event of merged) {
     if (event.type !== RECALL_TOMBSTONE_TARGET) continue;
     if (!isRecallTombstonePayload(event.payload)) continue;
     tombstonedThreads.add(event.payload.threadId);
+  }
+  const freshTombstones = new Set<string>();
+  for (const event of fresh) {
+    if (event.type !== RECALL_TOMBSTONE_TARGET) continue;
+    if (!isRecallTombstonePayload(event.payload)) continue;
+    freshTombstones.add(event.payload.threadId);
   }
 
   // Chunk every fresh capture.recorded event.
@@ -214,13 +238,17 @@ export const ingestIncremental = async (
     indexedCount += entries.length;
   }
 
-  // Apply each fresh tombstone to EXISTING index entries — not just
+  // Apply fresh tombstones to EXISTING index entries — not just
   // the chunks we just produced. A tombstone that arrives after the
   // capture it targets must still flip the older entries on disk
   // before the ingest frontier advances; without this, peer-driven
   // tombstones get silently consumed.
+  //
+  // We only sweep `freshTombstones` here (not the full
+  // tombstonedThreads set). Older tombstones already swept in
+  // prior passes; re-sweeping is harmless but wasteful.
   let tombstonedEntries = 0;
-  for (const threadId of tombstonedThreads) {
+  for (const threadId of freshTombstones) {
     const result = await tombstoneByThread(indexPath(vaultRoot), threadId);
     tombstonedEntries += result.tombstoned;
   }
@@ -245,7 +273,7 @@ export const ingestIncremental = async (
 
   return {
     indexedChunks: indexedCount,
-    tombstonedChunks: tombstonedThreads.size,
+    tombstonedChunks: freshTombstones.size,
     tombstonedEntries,
     processedEvents: nextProcessed,
   };

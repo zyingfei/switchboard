@@ -355,4 +355,57 @@ describe('ingestor', () => {
     const after2 = await readIndex(join(vaultRoot, '_BAC', 'recall', 'index.bin'));
     expect(after2?.items.every((item) => item.tombstoned === true)).toBe(true);
   });
+
+  it('reviewer-flagged: incremental tombstone honored for delayed captures landing AFTER a tombstone (rebuild equivalence)', async () => {
+    // Reviewer scenario: the tombstone is processed FIRST.
+    // The frontier advances past it. THEN a delayed peer capture
+    // for the same thread arrives. Incremental ingest must still
+    // mark the new chunks as tombstoned — otherwise it diverges
+    // from full rebuild semantics.
+    const { createEventLog } = await import('../sync/eventLog.js');
+    const { loadOrCreateReplica } = await import('../sync/replicaId.js');
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+
+    // 1. Tombstone arrives first.
+    await eventLog.appendClient({
+      clientEventId: 'tomb-first',
+      aggregateId: 'thread_delayed',
+      type: 'recall.tombstone.target',
+      payload: { threadId: 'thread_delayed' },
+      baseVector: {},
+    });
+    const first = await ingestIncremental(vaultRoot, eventLog);
+    expect(first.indexedChunks).toBe(0);
+
+    // 2. A peer-imported capture for the same thread arrives later.
+    await eventLog.importPeerEvent({
+      clientEventId: 'cap-late',
+      dot: { replicaId: 'peer-X', seq: 1 },
+      deps: {},
+      aggregateId: 'thread_delayed',
+      type: 'capture.recorded',
+      payload: {
+        bac_id: 'thread_delayed',
+        capturedAt: '2026-05-06T19:00:00.000Z',
+        turns: [{ ordinal: 0, role: 'assistant', text: 'should land tombstoned, not live' }],
+      },
+      acceptedAtMs: Date.now(),
+    });
+
+    // 3. Incremental ingest. The new chunks must be tombstoned —
+    // they're for a thread that was previously deleted. A buggy
+    // implementation would only consider FRESH tombstones and
+    // index this capture as live.
+    const second = await ingestIncremental(vaultRoot, eventLog);
+    expect(second.indexedChunks).toBeGreaterThan(0);
+    const index = await readIndex(join(vaultRoot, '_BAC', 'recall', 'index.bin'));
+    const peerChunks =
+      index?.items.filter((item) => item.threadId === 'thread_delayed') ?? [];
+    expect(peerChunks.length).toBeGreaterThan(0);
+    expect(
+      peerChunks.every((item) => item.tombstoned === true),
+      'delayed-capture chunks must inherit the prior tombstone (rebuild equivalence)',
+    ).toBe(true);
+  });
 });
