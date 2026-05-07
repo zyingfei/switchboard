@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { AcceptedEvent, VersionVector } from './causal.js';
@@ -100,7 +100,19 @@ const writeProjection = async (
   const dir = join(deps.vaultRoot, ...params.relDir.split('/'));
   await mkdir(dir, { recursive: true });
   const out = join(dir, `${params.aggregateId}.json`);
-  await writeFile(out, JSON.stringify(params.body, null, 2), 'utf8');
+  if (params.kind === 'delete') {
+    // Symmetric with vault/writer.ts's local-action delete path,
+    // which unlinks the per-aggregate JSON. Without unlink here a
+    // peer that observes a delete keeps a tombstoned projection
+    // file on disk while the deleter has none — the two replicas'
+    // _BAC/<aggregate>/ listings diverge even though the logical
+    // state matches. Best-effort unlink (file may already be gone
+    // on the deleter side, or a concurrent local writer may have
+    // beat us to it).
+    await unlink(out).catch(() => undefined);
+  } else {
+    await writeFile(out, JSON.stringify(params.body, null, 2), 'utf8');
+  }
   await deps.projectionChanges
     ?.appendChange({
       aggregate: params.aggregate,

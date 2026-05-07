@@ -225,30 +225,28 @@ export const startCompanion = async (
     });
   }
 
-  // Decorate the eventLog with an after-accept hook that:
-  //   1. Runs runImportProjectors so the LOCAL write path produces
-  //      the same on-disk projection file as the peer-import path.
-  //      Invariant A — single write path: every projection file is
-  //      written via the registry projector. vault/writer.ts may
-  //      still write markdown sidecars / audit entries / lock
-  //      sentinels (local-action concerns) but the per-aggregate
-  //      JSON projection file is the projector's responsibility.
-  //   2. Publishes via the relay so peers learn about the event
-  //      without a shared filesystem.
+  // Decorate the eventLog with an after-accept publish hook so
+  // outbound events fan out via the relay without each callsite
+  // having to know about them.
+  //
+  // Invariant A note: an earlier iteration also ran
+  // runImportProjectors here so the LOCAL appendClient path
+  // produced the same on-disk file as the peer-import path. That
+  // turned out to clobber vault/writer.ts's flat-shape per-aggregate
+  // JSON (which legacy readers like parseThreadUpsertBody and
+  // deleteWorkstream depend on) with the projector's
+  // projection-shape (`{record: RegisterProjection, vector, ...}`).
+  // The projector still runs on peer imports — that path is safe
+  // because vault/writer.ts isn't called there. The
+  // single-write-path goal needs a separate fix: either teach the
+  // projector to emit the flat shape or move the projection to a
+  // distinct path. Tracked as a follow-up.
   const eventLog = {
     ...baseEventLog,
     appendClient: async <T extends Record<string, unknown>>(
       input: Parameters<typeof baseEventLog.appendClient<T>>[0],
     ) => {
       const accepted = await baseEventLog.appendClient(input);
-      // Run the projector locally so the projection file is written
-      // by the same code path that handles peer imports. Best-effort
-      // — projection writes are non-critical and the worst case is
-      // a stale file that the next event refreshes.
-      await runImportProjectors(
-        { vaultRoot: options.vaultPath, eventLog: baseEventLog, projectionChanges },
-        accepted,
-      ).catch(() => undefined);
       if (relayTransport !== null) {
         void relayTransport.publishEvent(accepted.dot.replicaId, accepted).catch(() => undefined);
       }
