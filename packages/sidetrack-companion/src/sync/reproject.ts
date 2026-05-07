@@ -99,7 +99,9 @@ export const reprojectOnVersionMismatch = async (
       {
         vaultRoot: deps.vaultRoot,
         eventLog: deps.eventLog,
-        projectionChanges: deps.projectionChanges,
+        ...(deps.projectionChanges === undefined
+          ? {}
+          : { projectionChanges: deps.projectionChanges }),
       },
       event,
     ).catch(() => undefined);

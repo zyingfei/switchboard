@@ -19,6 +19,7 @@ import { createKnownReplicasStore } from '../sync/knownReplicas.js';
 import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
 import { runImportProjectors } from '../sync/projectors.js';
 import { reprojectOnVersionMismatch } from '../sync/reproject.js';
+import { startAntiEntropyTask } from '../sync/antiEntropy.js';
 import {
   createRelayTransport,
   getRelayTransportStatus,
@@ -169,6 +170,19 @@ export const startCompanion = async (
     eventLog: baseEventLog,
     projectionChanges,
   }).catch(() => undefined);
+
+  // Periodic anti-entropy. Walks the merged log every 30 min and
+  // re-runs the projector for every aggregate's latest event. Repairs
+  // drift from dropped relay events or partial-write recovery without
+  // waiting for the next user-driven event on that aggregate. Refer
+  // to sync/antiEntropy.ts for the rationale (Cassandra-style read-
+  // repair pattern).
+  const antiEntropy = startAntiEntropyTask({
+    vaultRoot: options.vaultPath,
+    eventLog: baseEventLog,
+    projectionChanges,
+  });
+  teardown.push(() => antiEntropy.stop());
 
   // Optional outbound relay transport. When wired, every accepted
   // event is rebroadcast via the relay so peers learn about it
