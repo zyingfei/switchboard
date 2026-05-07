@@ -127,7 +127,7 @@ describe('timeline day bucketing', () => {
     expect(grouped.get('2026-05-08')?.length).toBe(1);
   });
 
-  it('buildDayProjection returns deterministic shape', () => {
+  it('buildDayProjection returns deterministic shape with updatedAt = max(observedAt)', () => {
     const payloads = [
       observe({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/a' }),
       observe({ observedAt: '2026-05-07T11:00:00.000Z', url: 'https://x/b' }),
@@ -136,7 +136,25 @@ describe('timeline day bucketing', () => {
     expect(projection.date).toBe('2026-05-07');
     expect(projection.entryCount).toBe(2);
     expect(projection.entries).toHaveLength(2);
-    expect(projection.updatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    // Reviewer F5: updatedAt is derived from payloads, not wall
+    // clock. Same payloads → same updatedAt → same bytes.
+    expect(projection.updatedAt).toBe('2026-05-07T11:00:00.000Z');
+  });
+
+  it('buildDayProjection is byte-deterministic across calls (no wall-clock drift)', () => {
+    const payloads = [
+      observe({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/a' }),
+      observe({ observedAt: '2026-05-07T11:00:00.000Z', url: 'https://x/b' }),
+    ];
+    const a = buildDayProjection('2026-05-07', payloads);
+    const b = buildDayProjection('2026-05-07', payloads);
+    expect(JSON.stringify(a)).toBe(JSON.stringify(b));
+  });
+
+  it('buildDayProjection with empty payloads falls back to start-of-day', () => {
+    const p = buildDayProjection('2026-05-07', []);
+    expect(p.entryCount).toBe(0);
+    expect(p.updatedAt).toBe('2026-05-07T00:00:00.000Z');
   });
 });
 

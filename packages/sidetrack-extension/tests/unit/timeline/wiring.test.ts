@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { resetTimelineMaterializerStateForTests, setTimelineDrainHook } from '../../../src/timeline/materializer';
-import { initializeTimelineWiring, resetTimelineWiringForTests } from '../../../src/timeline/wiring';
+import {
+  initializeTimelineWiring,
+  resetTimelineWiringForTests,
+  setTimelineEnabled,
+  TIMELINE_ENABLED_KEY,
+} from '../../../src/timeline/wiring';
 
 // Smoke test: the wiring init registers listeners + alarm without
 // throwing, and the chrome.tabs.onActivated → observer.observe →
@@ -9,14 +14,14 @@ import { initializeTimelineWiring, resetTimelineWiringForTests } from '../../../
 // APIs.
 
 interface ListenerStore {
-  onActivated: (info: chrome.tabs.TabActiveInfo) => void;
+  onActivated: (info: { tabId: number; windowId: number }) => void;
   onUpdated: (
     tabId: number,
-    info: chrome.tabs.TabChangeInfo,
-    tab: chrome.tabs.Tab,
+    info: { url?: string; title?: string; status?: string },
+    tab: { id?: number; url?: string; title?: string; windowId?: number },
   ) => void;
-  onRemoved: (tabId: number, info: chrome.tabs.TabRemoveInfo) => void;
-  onAlarm: (alarm: chrome.alarms.Alarm) => void;
+  onRemoved: (tabId: number, info: { windowId: number; isWindowClosing: boolean }) => void;
+  onAlarm: (alarm: { name: string; scheduledTime: number }) => void;
 }
 
 const stubChrome = (): {
@@ -81,11 +86,15 @@ const stubChrome = (): {
 
 describe('timeline wiring', () => {
   let env: ReturnType<typeof stubChrome>;
-  beforeEach(() => {
+  beforeEach(async () => {
     env = stubChrome();
     resetTimelineMaterializerStateForTests();
     resetTimelineWiringForTests();
     setTimelineDrainHook(null);
+    // The gate defaults to OFF; tests that exercise the wiring
+    // explicitly enable it. Tests that check the default-off
+    // behavior simply skip this line.
+    await setTimelineEnabled(true);
   });
   afterEach(() => {
     env.reset();
@@ -139,6 +148,29 @@ describe('timeline wiring', () => {
     ];
     expect(Array.isArray(spool)).toBe(true);
     expect((spool as unknown[]).length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('default OFF — gate disabled means NO listeners or alarm registered', async () => {
+    // Reset and explicitly disable to assert the default-off
+    // posture. No setTimelineEnabled(true) call this time.
+    await setTimelineEnabled(false);
+    resetTimelineWiringForTests();
+    // Re-stub to clear out the listener-mock counters from the
+    // beforeEach init that ran with the gate enabled.
+    env.reset();
+    delete (globalThis as unknown as { chrome?: unknown }).chrome;
+    env = stubChrome();
+    await setTimelineEnabled(false);
+
+    await initializeTimelineWiring({ readCompanion: async () => null });
+    const c = (globalThis as unknown as {
+      chrome: {
+        tabs: { onActivated: { addListener: { mock: { calls: unknown[] } } } };
+        alarms: { create: { mock: { calls: unknown[] } } };
+      };
+    }).chrome;
+    expect(c.tabs.onActivated.addListener.mock.calls.length).toBe(0);
+    expect(c.alarms.create.mock.calls.length).toBe(0);
   });
 
   it('chrome.alarms.onAlarm filtered by name; non-timeline alarm is no-op', async () => {

@@ -78,9 +78,15 @@ export const createTimelineMaterializer = (
         lastError = null;
       } catch (err) {
         lastError = err instanceof Error ? err.message : String(err);
-        // Drop straight out of the loop — leave dirtyDays as the
-        // events that arrived since we cleared it. Next event or
-        // next catchUp retries.
+        // Reviewer-flagged: re-add the failed days to dirtyDays
+        // so the next event / catchUp / alarm retries them. The
+        // PRIOR behavior was to silently drop the snapshot on
+        // failure, which left projections stale until a future
+        // unrelated event happened to mark the same day dirty.
+        // We `return` (instead of `continue`) to break out of the
+        // drain loop — preventing tight-retry. Status is `failed`
+        // until the next attempt succeeds.
+        for (const day of snapshot) dirtyDays.add(day);
         return;
       }
     }

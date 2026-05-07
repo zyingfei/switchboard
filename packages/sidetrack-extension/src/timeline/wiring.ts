@@ -11,26 +11,70 @@ import { createTimelineObserver, type TimelineObserver } from './observer';
 import type { BrowserTimelineObservedPayload, TimelineProvider } from './events';
 
 // Sync Contract v1 / Class F — bind chrome.tabs APIs to the timeline
-// observer + materializer. This is the production wiring referenced
-// in `docs/timeline.md`. Out of scope for the initial timeline PR;
-// landed here as the natural follow-up that brings the feature from
-// "callable" to "actually running."
+// observer + materializer. Production wiring referenced in
+// `docs/timeline.md`.
 //
 // Responsibilities:
+//   - Check the timeline-enabled gate (default OFF; reviewer-flagged
+//     privacy posture). When the gate is off, NO listeners are
+//     registered, NO alarm is scheduled, NO observations land in the
+//     spool.
 //   - Allocate the edge replica id once on init (idempotent).
 //   - Build a TimelineObserver with synchronous hashes + the
 //     existing canonicalThreadUrl + detectProviderFromUrl.
-//   - Bridge chrome.tabs.onActivated / onUpdated / onRemoved /
-//     chrome.windows.onFocusChanged into observer.observe / .close.
+//   - Bridge chrome.tabs.onActivated / onUpdated / onRemoved into
+//     observer.observe / .close.
 //   - Schedule a periodic drain via chrome.alarms.
 //   - Update setCompanionReachableForTimeline based on drain results.
 //
-// The init function is idempotent: calling it twice is a no-op
-// because chrome.alarms.create with the same name replaces the
-// previous one and the listener registry uses a guard flag.
+// The init function is idempotent on the gate value: calling it
+// twice while disabled is a no-op; calling it twice while enabled
+// is a no-op because chrome.alarms.create with the same name
+// replaces the previous one and the listener registry uses a guard.
 
 const DRAIN_ALARM = 'sidetrack.timeline.drain';
 const DRAIN_PERIOD_MIN = 1; // every minute when companion reachable
+
+// Settings key for the timeline enable gate. Default is OFF — the
+// user (or an external setting writer) must explicitly opt in
+// before browser activity is observed. This is the privacy gate
+// the reviewer flagged: passive history capture must not silently
+// turn on just because the contract can support it.
+export const TIMELINE_ENABLED_KEY = 'sidetrack.timeline.enabled';
+
+interface TimelineEnabledStorage {
+  readonly get: (key: string) => Promise<Record<string, unknown>>;
+  readonly set: (entries: Record<string, unknown>) => Promise<void>;
+}
+
+const getStorage = (): TimelineEnabledStorage => {
+  const c = (globalThis as unknown as { chrome?: { storage?: { local?: TimelineEnabledStorage } } }).chrome;
+  const local = c?.storage?.local;
+  if (local === undefined) throw new Error('chrome.storage.local is unavailable');
+  return local;
+};
+
+// Read the gate. Defaults to false on missing / non-boolean values.
+export const isTimelineEnabled = async (): Promise<boolean> => {
+  try {
+    const got = await getStorage().get(TIMELINE_ENABLED_KEY);
+    return got[TIMELINE_ENABLED_KEY] === true;
+  } catch {
+    return false;
+  }
+};
+
+// Set the gate. Returns the new value. Used by the side panel /
+// future settings UI to toggle the feature on or off. When toggled
+// off after a session has been running, the in-memory observer is
+// not torn down — but chrome.alarms.clear cancels the scheduled
+// drain and no new observations are observed because the listener
+// closure consults the gate before each emit. Callers should
+// reload the SW to fully reset state.
+export const setTimelineEnabled = async (enabled: boolean): Promise<boolean> => {
+  await getStorage().set({ [TIMELINE_ENABLED_KEY]: enabled });
+  return enabled;
+};
 
 let initialized = false;
 
@@ -121,6 +165,14 @@ const tryDrain = async (deps: InitDeps): Promise<{ uploaded: number; remaining: 
 
 export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> => {
   if (initialized) return;
+  // Gate first — if the user hasn't opted in, register nothing.
+  // This keeps timeline default-OFF as a privacy posture: no
+  // chrome.tabs listeners, no chrome.alarms drain, no observations
+  // ever reach the spool. The user can flip the gate via
+  // setTimelineEnabled (called from a side-panel toggle in a
+  // future iteration); reloading the SW after enabling is what
+  // actually wires it up.
+  if (!(await isTimelineEnabled())) return;
   initialized = true;
 
   const replica = await loadOrCreateEdgeReplica();

@@ -174,6 +174,72 @@ describe('timeline HTTP routes', () => {
     expect(body.data.items.map((e) => e.title)).toEqual(['Recipe planning']);
   });
 
+  it('POST rejects events with non-timeline type or invalid payload', async () => {
+    const goodEvent = buildEvent({
+      edgeReplicaId: 'edge_test',
+      seq: 1,
+      payload: observe({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a' }),
+    });
+    const wrongType = {
+      clientEventId: 'wrong-type',
+      dot: { replicaId: 'edge_test', seq: 99 },
+      deps: {},
+      aggregateId: 'thread-1',
+      type: 'thread.upserted',
+      payload: { ignored: true },
+      acceptedAtMs: 0,
+    };
+    const malformedPayload = {
+      clientEventId: 'malformed',
+      dot: { replicaId: 'edge_test', seq: 100 },
+      deps: {},
+      aggregateId: 'day-2026-05-07',
+      type: BROWSER_TIMELINE_OBSERVED,
+      payload: { not_a_real: 'payload' },
+      acceptedAtMs: 0,
+    };
+    const result = await post('/v1/timeline/events', {
+      events: [goodEvent, wrongType, malformedPayload],
+    });
+    expect(result.status).toBe(200);
+    const body = result.data as {
+      data: {
+        imported: { replicaId: string; seq: number }[];
+        skipped: { replicaId: string; seq: number; reason: string }[];
+      };
+    };
+    expect(body.data.imported).toHaveLength(1);
+    expect(body.data.imported[0]?.seq).toBe(1);
+    const reasons = body.data.skipped.map((s) => s.reason).sort();
+    expect(reasons).toEqual(['invalid-event-type', 'invalid-payload']);
+    // Let the materializer drain finish before afterEach rms the
+    // vault — otherwise rm races a putDay write.
+    await new Promise((r) => setTimeout(r, 50));
+  });
+
+  it('GET /v1/timeline applies exact same-day partial-range filtering (reviewer F6)', async () => {
+    // Two events on the same day — one before the cut-off, one
+    // after. since= timestamp should exclude the earlier one even
+    // though it lives in the same daily bucket file.
+    const events = [
+      buildEvent({
+        edgeReplicaId: 'edge_partial',
+        seq: 1,
+        payload: observe({ observedAt: '2026-05-07T09:00:00.000Z', url: 'https://x/morning', canonicalUrl: 'https://x/morning' }),
+      }),
+      buildEvent({
+        edgeReplicaId: 'edge_partial',
+        seq: 2,
+        payload: observe({ observedAt: '2026-05-07T15:00:00.000Z', url: 'https://x/afternoon', canonicalUrl: 'https://x/afternoon' }),
+      }),
+    ];
+    await post('/v1/timeline/events', { events });
+    await new Promise((r) => setTimeout(r, 50));
+    const got = await get('/v1/timeline?since=2026-05-07T12:00:00.000Z');
+    const body = got.data as { data: { items: { id: string }[] } };
+    expect(body.data.items.map((e) => e.id)).toEqual(['https://x/afternoon']);
+  });
+
   it('GET /v1/timeline filters by `since` and `until` dates', async () => {
     const events = [
       buildEvent({

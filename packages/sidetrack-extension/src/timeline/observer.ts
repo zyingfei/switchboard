@@ -3,6 +3,7 @@ import type {
   TimelineProvider,
   TimelineTransition,
 } from './events';
+import { sanitizeTimelineUrl } from './sanitize';
 
 // Sync Contract v1 / Class F — passive timeline observer.
 //
@@ -103,14 +104,24 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
     const observedAt = now.toISOString();
     const tabIdHash = deps.hashTabId(input.tabId, input.windowId);
     const windowIdHash = deps.hashWindowId(input.windowId);
-    const canonicalUrl = deps.canonicalize?.(input.url);
-    const provider = deps.providerOf?.(canonicalUrl ?? input.url);
+    // Reviewer-flagged: sanitize the raw URL BEFORE it enters the
+    // payload OR the in-memory state. Strips fragments + sensitive
+    // query params (token / code / state / session / key / secret /
+    // password / auth / sig / signature / ...). Also sanitize the
+    // canonical form — canonicalThreadUrl is a no-op for non-
+    // provider URLs, so without this layer auth tokens in
+    // arbitrary URLs would still ship to the companion.
+    const sanitizedUrl = sanitizeTimelineUrl(input.url);
+    const rawCanonical = deps.canonicalize?.(input.url);
+    const canonicalUrl =
+      rawCanonical === undefined ? undefined : sanitizeTimelineUrl(rawCanonical);
+    const provider = deps.providerOf?.(canonicalUrl ?? sanitizedUrl);
     const existing = byTab.get(tabIdHash);
 
     const isSameUrl = (() => {
       if (existing === undefined) return false;
       const left = existing.canonicalUrl ?? existing.url;
-      const right = canonicalUrl ?? input.url;
+      const right = canonicalUrl ?? sanitizedUrl;
       return left === right;
     })();
 
@@ -129,11 +140,11 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
         eventId: mintEventId({
           tabIdHash,
           ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
-          url: input.url,
+          url: sanitizedUrl,
           observedAt,
         }),
         observedAt,
-        url: input.url,
+        url: sanitizedUrl,
         ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
         ...(input.title === undefined ? {} : { title: input.title }),
         ...(provider === undefined ? {} : { provider }),
@@ -145,7 +156,7 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
       byTab.set(tabIdHash, {
         tabIdHash,
         windowIdHash,
-        url: input.url,
+        url: sanitizedUrl,
         ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
         ...(provider === undefined ? {} : { provider }),
         ...(input.title === undefined ? {} : { title: input.title }),
@@ -161,11 +172,11 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
       eventId: mintEventId({
         tabIdHash,
         ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
-        url: input.url,
+        url: sanitizedUrl,
         observedAt,
       }),
       observedAt,
-      url: input.url,
+      url: sanitizedUrl,
       ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
       ...(input.title === undefined ? {} : { title: input.title }),
       ...(provider === undefined ? {} : { provider }),
@@ -177,7 +188,7 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
     byTab.set(tabIdHash, {
       tabIdHash,
       windowIdHash,
-      url: input.url,
+      url: sanitizedUrl,
       ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
       ...(provider === undefined ? {} : { provider }),
       ...(input.title === undefined ? {} : { title: input.title }),

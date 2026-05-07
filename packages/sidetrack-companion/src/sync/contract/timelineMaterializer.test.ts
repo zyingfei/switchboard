@@ -170,6 +170,61 @@ describe('timelineMaterializer (Class B)', () => {
     expect(second.health().status).toBe('healthy');
   });
 
+  it('drain failure re-adds dirty days for next-trigger retry (no silent drop)', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    // Inject a store whose putDay rejects on the first call but
+    // succeeds on subsequent ones. Reviewer F7: failed days must
+    // come back into the dirty set so a future trigger retries
+    // them — without that, the projection would be stale until
+    // some unrelated event flipped the same day dirty again.
+    let calls = 0;
+    const store = {
+      putDay: async (day: import('../../timeline/projection.js').TimelineDayProjection) => {
+        calls += 1;
+        if (calls === 1) throw new Error('disk full');
+        // Subsequent calls succeed silently — the test asserts via
+        // the materializer's pending state.
+        void day;
+      },
+      readDay: async () => null,
+      listDays: async () => [],
+    };
+    const m = createTimelineMaterializer({ store, eventLog });
+
+    const event = buildEvent({
+      seq: 1,
+      payload: payload({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a' }),
+    });
+    await eventLog.importPeerEvent(event);
+    m.onAccepted(event, { origin: 'peer' });
+    // Wait for the in-flight drain attempt to finish (it'll fail).
+    await new Promise((r) => setTimeout(r, 30));
+
+    // After the failure, the day MUST still be flagged so a future
+    // trigger picks it up. Health reports 'failed' with the error.
+    expect(m.health().status).toBe('failed');
+    expect(m.health().pending).toBe(true);
+    expect(m.health().lastError).toContain('disk full');
+
+    // Trigger another event — this re-fires drain, which now sees
+    // BOTH the previously-failed day AND the new event's day in
+    // dirtyDays. The store's putDay succeeds this time.
+    const event2 = buildEvent({
+      seq: 2,
+      payload: payload({ observedAt: '2026-05-07T11:00:00.000Z', url: 'https://x/b', canonicalUrl: 'https://x/b' }),
+    });
+    await eventLog.importPeerEvent(event2);
+    m.onAccepted(event2, { origin: 'peer' });
+    await m.awaitIdle();
+
+    // putDay was called: once for the failed first attempt + at
+    // least once for the recovered drain.
+    expect(calls).toBeGreaterThanOrEqual(2);
+    expect(m.health().status).toBe('healthy');
+    expect(m.health().pending).toBe(false);
+  });
+
   it('non-timeline events are no-ops', async () => {
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);

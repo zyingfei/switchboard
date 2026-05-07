@@ -238,15 +238,30 @@ export const createTimelineStore = (vaultRoot: string): TimelineStore => {
 
 // Build a TimelineDayProjection from a list of payloads for one day.
 // Pulled out so both the materializer and tests can call it.
+//
+// Reviewer-flagged: `updatedAt` is the MAX `observedAt` across the
+// payloads, NOT wall-clock new Date(). The same input log produces
+// the same projection bytes on every replica + every replay,
+// matching the docs claim that timeline projections are
+// deterministic from the event log. (Wall-clock write time isn't a
+// useful field for a deterministic projection — if anyone needs the
+// last write time of the file, they can stat() it.)
 export const buildDayProjection = (
   date: string,
   payloads: readonly BrowserTimelineObservedPayload[],
 ): TimelineDayProjection => {
   const entries = reduceTimelineEvents(payloads);
+  let maxObservedAt = '';
+  for (const p of payloads) {
+    if (p.observedAt > maxObservedAt) maxObservedAt = p.observedAt;
+  }
   return {
     date,
     entries,
-    updatedAt: new Date().toISOString(),
+    // Empty payloads: fall back to the date bucket itself so the
+    // field is present and ordering-stable. In practice the
+    // materializer never builds a projection from an empty list.
+    updatedAt: maxObservedAt.length > 0 ? maxObservedAt : `${date}T00:00:00.000Z`,
     entryCount: entries.length,
   };
 };

@@ -5,6 +5,10 @@ import { join } from 'node:path';
 import { buildAnchorFromTerm } from '../annotation/anchorBuilder.js';
 import { isBridgeKeyAccepted, rotateBridgeKey } from '../auth/bridgeKey.js';
 import {
+  BROWSER_TIMELINE_OBSERVED,
+  isBrowserTimelineObservedPayload,
+} from '../timeline/events.js';
+import {
   defaultAllowedTools,
   isAllowed,
   readTrust,
@@ -3166,6 +3170,27 @@ const routes: readonly RouteDefinition[] = [
           continue;
         }
         const event = candidate as import('../sync/causal.js').AcceptedEvent;
+        // Reviewer-flagged: this endpoint is timeline-only. Reject
+        // any event whose type is not browser.timeline.observed OR
+        // whose payload fails the runtime predicate. Keeps the
+        // route narrow — a future generic `/v1/edge/events` router
+        // would be a separate route.
+        if (event.type !== BROWSER_TIMELINE_OBSERVED) {
+          skipped.push({
+            replicaId: event.dot.replicaId,
+            seq: event.dot.seq,
+            reason: 'invalid-event-type',
+          });
+          continue;
+        }
+        if (!isBrowserTimelineObservedPayload(event.payload)) {
+          skipped.push({
+            replicaId: event.dot.replicaId,
+            seq: event.dot.seq,
+            reason: 'invalid-payload',
+          });
+          continue;
+        }
         try {
           const result = await context.importEdgeEvent(event);
           if (result.imported) {
@@ -3202,13 +3227,25 @@ const routes: readonly RouteDefinition[] = [
         );
       }
       const url = new URL(request.url ?? '/v1/timeline', 'http://internal');
-      const since = url.searchParams.get('since') ?? undefined;
-      const until = url.searchParams.get('until') ?? undefined;
+      const sinceRaw = url.searchParams.get('since') ?? undefined;
+      const untilRaw = url.searchParams.get('until') ?? undefined;
+      // Normalize date-only inputs (YYYY-MM-DD) to ISO timestamps:
+      // since=date → start-of-day; until=date → end-of-day. Without
+      // this, an entry's full ISO timestamp would lex-compare
+      // greater than the bare date prefix and get excluded
+      // incorrectly. With explicit ISO inputs we leave the value
+      // alone — "exact" filtering at the timestamp level.
+      const isDateOnly = (s: string): boolean => /^\d{4}-\d{2}-\d{2}$/.test(s);
+      const since =
+        sinceRaw === undefined ? undefined : isDateOnly(sinceRaw) ? `${sinceRaw}T00:00:00.000Z` : sinceRaw;
+      const until =
+        untilRaw === undefined ? undefined : isDateOnly(untilRaw) ? `${untilRaw}T23:59:59.999Z` : untilRaw;
       const q = (url.searchParams.get('q') ?? '').trim().toLowerCase();
       const limitRaw = Number.parseInt(url.searchParams.get('limit') ?? '100', 10);
       const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 1000) : 100;
 
       const days = await context.timelineStore.listDays();
+      // Day-bucket coarse filter — picks files we need to open.
       const inRange = days.filter((d) => {
         if (since !== undefined && d < since.slice(0, 10)) return false;
         if (until !== undefined && d > until.slice(0, 10)) return false;
@@ -3225,12 +3262,28 @@ const routes: readonly RouteDefinition[] = [
         readonly provider?: string;
         readonly visitCount: number;
       }> = [];
+      // Reviewer F6: also apply EXACT timestamp filtering. The
+      // day-bucket filter above is only a coarse pass that picks
+      // which files to open. An entry on the boundary day might
+      // straddle the requested range — we include it if its
+      // [firstSeenAt, lastSeenAt] window overlaps [since, until].
+      // Without this, since=2026-05-07T12:00:00Z would still
+      // return entries from 09:00 the same day.
+      const overlapsRange = (entry: {
+        firstSeenAt: string;
+        lastSeenAt: string;
+      }): boolean => {
+        if (since !== undefined && entry.lastSeenAt < since) return false;
+        if (until !== undefined && entry.firstSeenAt > until) return false;
+        return true;
+      };
       // Walk newest-day first so we hit the limit on recent
       // entries.
       for (const date of [...inRange].reverse()) {
         const day = await context.timelineStore.readDay(date);
         if (day === null) continue;
         for (const entry of day.entries) {
+          if (!overlapsRange(entry)) continue;
           if (q.length > 0) {
             const hay = `${entry.title ?? ''} ${entry.url}`.toLowerCase();
             if (!hay.includes(q)) continue;

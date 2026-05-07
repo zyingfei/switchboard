@@ -128,8 +128,30 @@ export const createDefaultTimelineDrainHook = (
     if (!res.ok) {
       throw new Error(`timeline drain HTTP ${res.status}`);
     }
-    const json = (await res.json()) as { imported?: { replicaId: string; seq: number }[] };
-    return { uploaded: json.imported ?? [] };
+    // Reviewer-flagged: a re-drain after a lost POST response (or
+    // a re-import via archive) makes the companion return
+    // skipped[reason='already-imported']. Those edge dots ARE
+    // present on the companion — the spool entry is safe to
+    // remove. Treating them as acked is what makes the drain
+    // contract honestly idempotent. Anything else in `skipped`
+    // (invalid-event-type / invalid-payload / arbitrary error) is
+    // NOT safe to remove — the entry stays spooled for either
+    // operator inspection or a future schema migration.
+    const json = (await res.json()) as {
+      data?: {
+        imported?: { replicaId: string; seq: number }[];
+        skipped?: { replicaId: string; seq: number; reason: string }[];
+      };
+      // Tolerate the older non-envelope shape some test fixtures use.
+      imported?: { replicaId: string; seq: number }[];
+      skipped?: { replicaId: string; seq: number; reason: string }[];
+    };
+    const imported = json.data?.imported ?? json.imported ?? [];
+    const skipped = json.data?.skipped ?? json.skipped ?? [];
+    const alreadyImported = skipped
+      .filter((s) => s.reason === 'already-imported')
+      .map((s) => ({ replicaId: s.replicaId, seq: s.seq }));
+    return { uploaded: [...imported, ...alreadyImported] };
   };
 };
 

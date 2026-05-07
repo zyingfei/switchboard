@@ -116,4 +116,41 @@ describe('TimelineObserver — coalesce + debounce', () => {
       'tab_1_1|https://x/a|2026-05-07T10:00:00.000Z',
     );
   });
+
+  it('sanitizes raw URL — strips fragment and sensitive query params', () => {
+    const { emitted, observer } = setup();
+    observer.observe({
+      tabId: 1,
+      windowId: 1,
+      url: 'https://example.com/callback?code=abc&state=xyz#hash',
+      transition: 'activated',
+    });
+    // Synthetic canonicalize in setup() strips ?... already, so for
+    // this URL canonicalUrl is 'https://example.com/callback' and
+    // url is the sanitized form (which also collapses to that).
+    expect(emitted[0]?.url).toBe('https://example.com/callback');
+    expect(emitted[0]?.canonicalUrl).toBe('https://example.com/callback');
+  });
+
+  it('sanitizes URL even when canonicalize returns undefined', () => {
+    // Set up a fresh observer with no canonicalize hook so the
+    // sanitizer's responsibility for url= is tested in isolation.
+    const emitted: BrowserTimelineObservedPayload[] = [];
+    const now = new Date('2026-05-07T10:00:00.000Z');
+    const observer = createTimelineObserver({
+      clock: () => now,
+      emit: (p) => emitted.push(p),
+      hashTabId: () => 'tab_h',
+      hashWindowId: () => 'win_h',
+      // No canonicalize at all — canonicalUrl will be undefined.
+    });
+    observer.observe({
+      tabId: 1,
+      windowId: 1,
+      url: 'https://nopr0v1der.com/?password=secret&q=hi',
+      transition: 'activated',
+    });
+    expect(emitted[0]?.url).toBe('https://nopr0v1der.com/?q=hi');
+    expect(emitted[0]?.canonicalUrl).toBeUndefined();
+  });
 });

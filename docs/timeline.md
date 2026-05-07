@@ -131,7 +131,7 @@ TimelineObserver
                             │
                             ▼  spoolDrainer (when companion reachable)
                             │
-                            POST /v1/events (browser.timeline.observed)
+                            POST /v1/timeline/events (browser.timeline.observed)
                             │
                             ▼
                     companion eventLog.importPeerEvent  ← edge dot preserved
@@ -366,7 +366,8 @@ Code (added by the timeline PR — see commit list):
 - `packages/sidetrack-companion/src/timeline/projection.ts` — daily
   bucket reducer + on-disk store.
 - `packages/sidetrack-companion/src/sync/contract/timelineMaterializer.ts`
-  — Class A materializer.
+  — Class B materializer (deterministic daily reduction; not an
+  aggregate projection).
 - `packages/sidetrack-extension/src/timeline/events.ts` — plugin-side
   event constants.
 - `packages/sidetrack-extension/src/timeline/observer.ts` — chrome
