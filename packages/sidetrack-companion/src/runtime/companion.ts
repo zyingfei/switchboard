@@ -70,6 +70,32 @@ export interface CompanionRuntime {
 export const startCompanion = async (
   options: CompanionRuntimeOptions,
 ): Promise<CompanionRuntime> => {
+  // Teardown stack: every side-effecting setup step (lock, intervals,
+  // watcher, relay transport) registers a rollback here. If startup
+  // throws partway through (most often `await startHttpServer`
+  // rejecting with EADDRINUSE on a busy port), the catch block runs
+  // these in reverse so we don't leak the recall lock or strand
+  // setInterval handles in the event loop. Without this, the
+  // process would set exitCode=1 and then linger forever — both
+  // because the event loop kept running on the unreleased
+  // intervals, and because the lock file would still point at the
+  // now-zombie pid, blocking every subsequent launch on the
+  // recovery's stale-pid takeover path.
+  const teardown: (() => Promise<void> | void)[] = [];
+  const runTeardown = async (): Promise<void> => {
+    while (teardown.length > 0) {
+      const fn = teardown.pop();
+      if (fn === undefined) continue;
+      try {
+        await fn();
+      } catch {
+        // Continue tearing down — one failed step shouldn't block
+        // the rest. Lock release is the most important; it runs
+        // last (registered first).
+      }
+    }
+  };
+  try {
   const ensured = await ensureBridgeKey(options.vaultPath);
   const replica = await loadOrCreateReplica(options.vaultPath);
   // Refuse startup if another live process owns the recall index
@@ -77,6 +103,7 @@ export const startCompanion = async (
   // The lock takeover for stale (PID-dead) entries happens inside
   // acquireRecallProcessLock; we only error out for live races.
   const recallLock: RecallProcessLock = await acquireRecallProcessLock(options.vaultPath);
+  teardown.push(() => recallLock.release());
   // Sweep stale `.index.bin.<rev>.tmp` files from a prior crash.
   // Idempotent; runs every startup.
   await cleanupOrphanIndexTmpFiles(options.vaultPath);
@@ -95,6 +122,10 @@ export const startCompanion = async (
   } catch {
     watcher = undefined;
   }
+  if (watcher !== undefined) {
+    const w = watcher;
+    teardown.push(() => w.close());
+  }
   const hygieneStatus: { lastIdempotencyGcAt?: string; lastAuditRetentionAt?: string } = {};
   const idempotencyGc = setInterval(
     () => {
@@ -104,6 +135,7 @@ export const startCompanion = async (
     },
     60 * 60 * 1000,
   );
+  teardown.push(() => clearInterval(idempotencyGc));
   const auditRetention = setInterval(
     () => {
       void enforceRetention(options.vaultPath).then(() => {
@@ -112,6 +144,7 @@ export const startCompanion = async (
     },
     24 * 60 * 60 * 1000,
   );
+  teardown.push(() => clearInterval(auditRetention));
   const recallActivity = createRecallActivityTracker();
   const baseEventLog = createEventLog(options.vaultPath, replica);
   const projectionChanges = createProjectionChangeFeed(options.vaultPath);
@@ -130,6 +163,10 @@ export const startCompanion = async (
       localKeyPair: keyPair,
       knownReplicas,
     });
+    {
+      const t = relayTransport;
+      teardown.push(() => stopRelayTransport(t));
+    }
     relayTransport.subscribePeers(new Set(), (_replicaId, event) => {
       void (async () => {
         try {
@@ -276,4 +313,15 @@ export const startCompanion = async (
       await recallLock.release();
     },
   };
+  } catch (error) {
+    // Startup failed partway through. Roll back every side-effect
+    // we registered so the process can actually exit. Without this,
+    // setInterval handles + the recall lock would strand the
+    // process despite cli.ts setting exitCode=1 — the event loop
+    // would never drain and the lock file would still point at our
+    // pid, blocking the next launch on the recovery's stale-pid
+    // takeover path.
+    await runTeardown();
+    throw error;
+  }
 };
