@@ -182,19 +182,29 @@ export const dispatchesHealthSnapshot = async (): Promise<PluginMaterializerHeal
   );
 };
 
-// All four plugin-tier materializers as a registry. Side-panel
-// health rendering iterates over this; future PluginMaterializer
-// additions (browser-timeline) just append to this list.
-export const PLUGIN_MATERIALIZERS = [
-  threadsPluginMaterializer,
-  workstreamsPluginMaterializer,
-  queueItemsPluginMaterializer,
-  dispatchesPluginMaterializer,
-] as const;
+// All plugin-tier materializers as a registry. Side-panel health
+// rendering iterates over this; new PluginMaterializer additions
+// (browser-timeline; future surfaces) just append to this list.
+//
+// Note: the timeline materializer's PluginMaterializer<TItem> uses
+// its own item shape (ActiveTimelineObservation), so it can't share
+// the projection-shape mirror tuple. We declare it as `unknown`-typed
+// at the registry boundary so the side panel can iterate uniformly
+// over health() without needing every TItem at this site.
+import { timelinePluginMaterializer, timelineHealthSnapshot } from '../timeline/materializer';
+
+export const PLUGIN_MATERIALIZERS: readonly PluginMaterializer<unknown>[] = [
+  threadsPluginMaterializer as unknown as PluginMaterializer<unknown>,
+  workstreamsPluginMaterializer as unknown as PluginMaterializer<unknown>,
+  queueItemsPluginMaterializer as unknown as PluginMaterializer<unknown>,
+  dispatchesPluginMaterializer as unknown as PluginMaterializer<unknown>,
+  timelinePluginMaterializer as unknown as PluginMaterializer<unknown>,
+];
 
 export const PLUGIN_HEALTH_SNAPSHOTS: readonly (() => Promise<PluginMaterializerHealth>)[] = [
   threadsHealthSnapshot,
   workstreamsHealthSnapshot,
   queueItemsHealthSnapshot,
   dispatchesHealthSnapshot,
+  timelineHealthSnapshot,
 ];

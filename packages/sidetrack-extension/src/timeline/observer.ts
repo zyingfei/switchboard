@@ -1,0 +1,214 @@
+import type {
+  BrowserTimelineObservedPayload,
+  TimelineProvider,
+  TimelineTransition,
+} from './events';
+
+// Sync Contract v1 / Class F — passive timeline observer.
+//
+// Listens for tab activation / navigation observations and emits
+// `browser.timeline.observed` payloads with debounce + coalescing.
+//
+// Coalescing rules (from docs/timeline.md):
+//   1. Same (tabIdHash, canonicalUrl) within `coalesceWindowMs` →
+//      no emission. Title updates merge in-memory.
+//   2. Same tabIdHash, new canonicalUrl → emit (navigation).
+//   3. New tabIdHash → emit.
+//   4. Title-only change → no emission.
+//   5. Tab close → emit `transition: 'closed'` for the last URL of
+//      that tab.
+//
+// The observer is decoupled from chrome.tabs so tests can drive it
+// with synthetic observations. The chrome wiring lives next to
+// background.ts and bridges chrome.tabs events into observer.observe.
+
+export interface TimelineObserverDeps {
+  // Wall-clock for now() + debounce decisions. Inject for tests.
+  readonly clock: () => Date;
+  // Emits the payload. The plugin materializer's admitLocal is the
+  // typical sink. Errors are caller's concern.
+  readonly emit: (payload: BrowserTimelineObservedPayload) => void;
+  // Hashes (tabId, windowId, edgeReplicaId) → opaque string.
+  // Companion never sees raw tabId.
+  readonly hashTabId: (tabId: number, windowId: number) => string;
+  readonly hashWindowId: (windowId: number) => string;
+  // Optional canonicalizer; receives the raw URL and may return a
+  // canonical form (provider URL with query/fragment stripped).
+  // Default: identity.
+  readonly canonicalize?: (url: string) => string | undefined;
+  // Optional provider classifier; default: undefined.
+  readonly providerOf?: (url: string) => TimelineProvider | undefined;
+  // Window during which a duplicate (tabIdHash, canonicalUrl) is
+  // suppressed. Default: 30 s.
+  readonly coalesceWindowMs?: number;
+  // Stable per-emission id minter. Default: combine tabIdHash +
+  // canonicalUrl + observedAt.
+  readonly mintEventId?: (input: {
+    tabIdHash: string;
+    canonicalUrl?: string;
+    url: string;
+    observedAt: string;
+  }) => string;
+}
+
+export interface ObserveInput {
+  readonly tabId: number;
+  readonly windowId: number;
+  readonly url: string;
+  readonly title?: string;
+  readonly transition: TimelineTransition;
+}
+
+export interface CloseInput {
+  readonly tabId: number;
+  readonly windowId: number;
+}
+
+interface TabState {
+  readonly tabIdHash: string;
+  readonly windowIdHash: string;
+  readonly url: string;
+  readonly canonicalUrl?: string;
+  readonly provider?: TimelineProvider;
+  readonly title?: string;
+  readonly lastEmittedAt: number; // ms epoch
+}
+
+export interface TimelineObserver {
+  readonly observe: (input: ObserveInput) => void;
+  readonly close: (input: CloseInput) => void;
+}
+
+const defaultMintEventId = (input: {
+  tabIdHash: string;
+  canonicalUrl?: string;
+  url: string;
+  observedAt: string;
+}): string => {
+  const key = `${input.tabIdHash}|${input.canonicalUrl ?? input.url}|${input.observedAt}`;
+  return `tl_${key}`;
+};
+
+export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObserver => {
+  const coalesceWindowMs = deps.coalesceWindowMs ?? 30_000;
+  const mintEventId = deps.mintEventId ?? defaultMintEventId;
+  // Per-tab-hash state. Key is tabIdHash so a closed tab's state is
+  // dropped when the next observation comes in (we don't grow this
+  // unbounded). For passive intent + bounded tabs per browser, the
+  // table stays small.
+  const byTab = new Map<string, TabState>();
+
+  const observe = (input: ObserveInput): void => {
+    const now = deps.clock();
+    const observedAt = now.toISOString();
+    const tabIdHash = deps.hashTabId(input.tabId, input.windowId);
+    const windowIdHash = deps.hashWindowId(input.windowId);
+    const canonicalUrl = deps.canonicalize?.(input.url);
+    const provider = deps.providerOf?.(canonicalUrl ?? input.url);
+    const existing = byTab.get(tabIdHash);
+
+    const isSameUrl = (() => {
+      if (existing === undefined) return false;
+      const left = existing.canonicalUrl ?? existing.url;
+      const right = canonicalUrl ?? input.url;
+      return left === right;
+    })();
+
+    if (isSameUrl && existing !== undefined) {
+      // Coalesce within the window — no emission.
+      const elapsed = now.getTime() - existing.lastEmittedAt;
+      if (elapsed < coalesceWindowMs) {
+        // Title-only update merges in-memory.
+        if (input.title !== undefined && input.title !== existing.title) {
+          byTab.set(tabIdHash, { ...existing, title: input.title });
+        }
+        return;
+      }
+      // Outside the window — emit a refresh observation as 'updated'.
+      const payload: BrowserTimelineObservedPayload = {
+        eventId: mintEventId({
+          tabIdHash,
+          ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
+          url: input.url,
+          observedAt,
+        }),
+        observedAt,
+        url: input.url,
+        ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
+        ...(input.title === undefined ? {} : { title: input.title }),
+        ...(provider === undefined ? {} : { provider }),
+        transition: 'updated',
+        tabIdHash,
+        windowIdHash,
+      };
+      deps.emit(payload);
+      byTab.set(tabIdHash, {
+        tabIdHash,
+        windowIdHash,
+        url: input.url,
+        ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
+        ...(provider === undefined ? {} : { provider }),
+        ...(input.title === undefined ? {} : { title: input.title }),
+        lastEmittedAt: now.getTime(),
+      });
+      return;
+    }
+
+    // New tab OR navigation to a new canonicalUrl — emit.
+    const transition: TimelineTransition =
+      existing === undefined ? input.transition : 'updated';
+    const payload: BrowserTimelineObservedPayload = {
+      eventId: mintEventId({
+        tabIdHash,
+        ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
+        url: input.url,
+        observedAt,
+      }),
+      observedAt,
+      url: input.url,
+      ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
+      ...(input.title === undefined ? {} : { title: input.title }),
+      ...(provider === undefined ? {} : { provider }),
+      transition,
+      tabIdHash,
+      windowIdHash,
+    };
+    deps.emit(payload);
+    byTab.set(tabIdHash, {
+      tabIdHash,
+      windowIdHash,
+      url: input.url,
+      ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
+      ...(provider === undefined ? {} : { provider }),
+      ...(input.title === undefined ? {} : { title: input.title }),
+      lastEmittedAt: now.getTime(),
+    });
+  };
+
+  const close = (input: CloseInput): void => {
+    const tabIdHash = deps.hashTabId(input.tabId, input.windowId);
+    const existing = byTab.get(tabIdHash);
+    if (existing === undefined) return;
+    const observedAt = deps.clock().toISOString();
+    const payload: BrowserTimelineObservedPayload = {
+      eventId: defaultMintEventId({
+        tabIdHash,
+        ...(existing.canonicalUrl === undefined ? {} : { canonicalUrl: existing.canonicalUrl }),
+        url: existing.url,
+        observedAt,
+      }),
+      observedAt,
+      url: existing.url,
+      ...(existing.canonicalUrl === undefined ? {} : { canonicalUrl: existing.canonicalUrl }),
+      ...(existing.title === undefined ? {} : { title: existing.title }),
+      ...(existing.provider === undefined ? {} : { provider: existing.provider }),
+      transition: 'closed',
+      tabIdHash,
+      windowIdHash: existing.windowIdHash,
+    };
+    deps.emit(payload);
+    byTab.delete(tabIdHash);
+  };
+
+  return { observe, close };
+};
