@@ -2375,6 +2375,19 @@ const App = () => {
   // is unreachable.
   const companionDisconnected =
     !localOnlyMode && (bridgeKey.trim().length === 0 || state.companionStatus === 'disconnected');
+  // Relay banner is gated on the companion being reachable —
+  // if companion is down we already show that, no point also
+  // claiming peer-sync is paused (it definitionally is). Only
+  // surface relay-down when we have a live status block AND
+  // it reports !connected.
+  const relayConfigured = state.relayHealth !== undefined;
+  const relayDown =
+    relayConfigured && !companionDisconnected && state.relayHealth?.connected === false;
+  const relayStatusForBanner: 'up' | 'down' | 'unconfigured' = !relayConfigured
+    ? 'unconfigured'
+    : relayDown
+      ? 'down'
+      : 'up';
   const vaultUnreachable = state.companionStatus === 'vault-error';
   const providerHealth = state.selectorHealth.find((entry) => entry.latestStatus !== 'ok');
   const workstreamOptions = useMemo(
@@ -2383,6 +2396,7 @@ const App = () => {
   );
   const hasSystemBanners =
     companionDisconnected ||
+    relayDown ||
     vaultUnreachable ||
     providerHealth !== undefined ||
     state.queuedCaptureCount > 0 ||
@@ -4198,6 +4212,7 @@ const App = () => {
             captureSuccessHost={captureToastHost ?? undefined}
             companionActionLabel="Open setup"
             companionStatus={companionDisconnected ? 'down' : 'running'}
+            relayStatus={relayStatusForBanner}
             vaultStatus={vaultUnreachable ? 'unreachable' : 'connected'}
             providerHealth={providerHealth ? 'degraded' : 'ok'}
             providerHealthDetail={providerHealth?.warning}

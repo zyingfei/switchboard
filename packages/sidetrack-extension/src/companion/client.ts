@@ -74,6 +74,7 @@ const parseStatus = (value: unknown): CompanionStatus => {
     readonly companion?: unknown;
     readonly vault?: unknown;
     readonly requestId?: unknown;
+    readonly sync?: unknown;
   };
 
   if (statusData.companion !== 'running') {
@@ -90,7 +91,37 @@ const parseStatus = (value: unknown): CompanionStatus => {
     throw new Error('Companion status response missing requestId.');
   }
 
-  return { companion: 'running', vault, requestId };
+  // Optional sync.relay block (companion only emits it when it
+  // was started with --sync-relay or --sync-relay-local). Parse
+  // defensively — a malformed relay block should NOT make the
+  // whole status call fail; the extension just won't surface a
+  // relay-down banner.
+  const syncIn = statusData.sync;
+  let sync: CompanionStatus['sync'] | undefined;
+  if (isRecord(syncIn) && isRecord(syncIn.relay)) {
+    const r = syncIn.relay as Record<string, unknown>;
+    sync = {
+      relay: {
+        url: typeof r.url === 'string' ? r.url : '',
+        mode: r.mode === 'local' || r.mode === 'remote' ? r.mode : 'remote',
+        ...(typeof r.connected === 'boolean' ? { connected: r.connected } : {}),
+        ...(typeof r.lastConnectedAtMs === 'number'
+          ? { lastConnectedAtMs: r.lastConnectedAtMs }
+          : {}),
+        ...(typeof r.lastDisconnectedAtMs === 'number'
+          ? { lastDisconnectedAtMs: r.lastDisconnectedAtMs }
+          : {}),
+        ...(typeof r.consecutiveFailures === 'number'
+          ? { consecutiveFailures: r.consecutiveFailures }
+          : {}),
+        ...(typeof r.pendingPublishes === 'number'
+          ? { pendingPublishes: r.pendingPublishes }
+          : {}),
+      },
+    };
+  }
+
+  return { companion: 'running', vault, requestId, ...(sync === undefined ? {} : { sync }) };
 };
 
 const parseMutationResult = (value: unknown): MutationResult => {

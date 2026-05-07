@@ -18,7 +18,11 @@ import { createEventLog } from '../sync/eventLog.js';
 import { createKnownReplicasStore } from '../sync/knownReplicas.js';
 import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
 import { runImportProjectors } from '../sync/projectors.js';
-import { createRelayTransport, stopRelayTransport } from '../sync/relayTransport.js';
+import {
+  createRelayTransport,
+  getRelayTransportStatus,
+  stopRelayTransport,
+} from '../sync/relayTransport.js';
 import { loadOrCreateReplica } from '../sync/replicaId.js';
 import { loadOrCreateReplicaKeyPair } from '../sync/replicaKeyPair.js';
 import type { LogTransport } from '../sync/transport.js';
@@ -277,6 +281,12 @@ export const startCompanion = async (
               url: options.relay.url,
               mode: options.relay.mode ?? 'remote',
             },
+            // Health endpoint reads the live transport state on
+            // every request so the side panel can flip the
+            // relay-down banner the moment the relay drops. Null
+            // when the transport hasn't been wired (offline tests).
+            getRelayStatus: () =>
+              relayTransport === null ? null : getRelayTransportStatus(relayTransport),
           },
         }),
     ...(options.mcp === undefined ? {} : { mcp: options.mcp }),

@@ -7,6 +7,7 @@ export type SystemState =
   | 'captures_queued'
   | 'captures_failed'
   | 'companion_disconnected'
+  | 'relay_disconnected'
   | 'vault_unreachable'
   | 'provider_broken'
   | 'screen_share_active'
@@ -46,6 +47,16 @@ const STATE_CONFIG: Record<
     tone: 'red',
     icon: 'alert',
     titleFn: (detail) => 'Companion: disconnected' + (detail !== undefined ? ` · ${detail}` : ''),
+  },
+  relay_disconnected: {
+    // Amber, NOT red — local captures still succeed, only
+    // cross-device sync is paused. A red banner here would
+    // misrepresent severity (companion-disconnected is more
+    // severe; user can't even capture).
+    tone: 'amber',
+    icon: 'alert',
+    titleFn: (detail) =>
+      'Peer sync paused' + (detail !== undefined ? ` · ${detail}` : ' · local captures still work'),
   },
   vault_unreachable: {
     tone: 'amber',
@@ -91,6 +102,10 @@ export interface SystemBannersStackProps {
   readonly captureSuccessHost?: string;
   readonly companionActionLabel?: string;
   readonly companionStatus?: 'running' | 'slow' | 'down';
+  // Live relay connectivity. 'unconfigured' = no --sync-relay, no
+  // banner. 'up' = connected, no banner. 'down' = configured but
+  // not currently connected → relay_disconnected banner.
+  readonly relayStatus?: 'unconfigured' | 'up' | 'down';
   readonly vaultStatus?: 'connected' | 'unreachable';
   readonly providerHealth?: 'ok' | 'degraded';
   readonly providerHealthDetail?: string;
@@ -116,6 +131,7 @@ export function SystemBannersStack({
   captureSuccessHost,
   companionActionLabel = 'Retry',
   companionStatus = 'running',
+  relayStatus = 'unconfigured',
   vaultStatus = 'connected',
   providerHealth = 'ok',
   providerHealthDetail,
@@ -145,6 +161,12 @@ export function SystemBannersStack({
         }
       />,
     );
+  }
+  // Relay-disconnected banner is independent of companion-down.
+  // Both can stack: companion-down (red) + relay-paused (amber)
+  // composes correctly because each owns a distinct tone+title.
+  if (relayStatus === 'down') {
+    banners.push(<SystemBanner key="relay" state="relay_disconnected" />);
   }
   if (vaultStatus === 'unreachable') {
     banners.push(

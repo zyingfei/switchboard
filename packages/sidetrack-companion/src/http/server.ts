@@ -79,17 +79,54 @@ const syncSummaryDeps = (
   syncSummary?: () => {
     replicaId: string;
     seq: number;
-    relay?: { mode: 'local' | 'remote'; url: string };
+    relay?: {
+      readonly mode: 'local' | 'remote';
+      readonly url: string;
+      readonly connected?: boolean;
+      readonly lastConnectedAtMs?: number;
+      readonly lastDisconnectedAtMs?: number;
+      readonly consecutiveFailures?: number;
+      readonly pendingPublishes?: number;
+    };
   };
 } =>
   replica === undefined
     ? {}
     : {
-        syncSummary: () => ({
-          replicaId: replica.replicaId,
-          seq: replica.peekSeq(),
-          ...(sync?.relay === undefined ? {} : { relay: sync.relay }),
-        }),
+        syncSummary: () => {
+          // Splice live transport status into the relay block so
+          // the side panel can render relay_disconnected without
+          // hitting a separate endpoint. Only present when both
+          // (a) relay is configured AND (b) the runtime exposed
+          // a getRelayStatus closure (production wiring does;
+          // tests that pass --sync-relay-local without a live
+          // transport may not).
+          const relayBase = sync?.relay;
+          if (relayBase === undefined) {
+            return { replicaId: replica.replicaId, seq: replica.peekSeq() };
+          }
+          const live = sync?.getRelayStatus?.() ?? null;
+          return {
+            replicaId: replica.replicaId,
+            seq: replica.peekSeq(),
+            relay: {
+              ...relayBase,
+              ...(live === null
+                ? {}
+                : {
+                    connected: live.connected,
+                    consecutiveFailures: live.consecutiveFailures,
+                    pendingPublishes: live.pendingPublishes,
+                    ...(live.lastConnectedAtMs === undefined
+                      ? {}
+                      : { lastConnectedAtMs: live.lastConnectedAtMs }),
+                    ...(live.lastDisconnectedAtMs === undefined
+                      ? {}
+                      : { lastDisconnectedAtMs: live.lastDisconnectedAtMs }),
+                  }),
+            },
+          };
+        },
       };
 import { isReviewDraftEvent, projectReviewDraft } from '../review/projection.js';
 import {
@@ -164,6 +201,19 @@ export interface CompanionHttpConfig {
       readonly mode: 'local' | 'remote';
       readonly url: string;
     };
+    // Per-request status getter exposing the relay transport's
+    // current connection state. Health reads this so the side
+    // panel can distinguish "companion up, peer sync paused"
+    // from "companion up, sync healthy" — the user-perceptible
+    // signal for T6.7.b. Returns null when the runtime has no
+    // outbound transport wired (no --sync-relay/--sync-relay-local).
+    readonly getRelayStatus?: () => {
+      readonly connected: boolean;
+      readonly lastConnectedAtMs?: number;
+      readonly lastDisconnectedAtMs?: number;
+      readonly consecutiveFailures: number;
+      readonly pendingPublishes: number;
+    } | null;
   };
   readonly updateChecker?: () => Promise<UpdateAdvisory>;
   readonly idempotencyStore?: IdempotencyStore;
@@ -881,6 +931,33 @@ const routes: readonly RouteDefinition[] = [
           clearTimeout(timer);
         }
       }
+      // Live relay status for the side panel banner. Only present
+      // when the companion was started with --sync-relay/-local
+      // AND the runtime exposed a getRelayStatus closure. Routed
+      // through /v1/status (not /v1/system/health) because the
+      // extension polls /v1/status on every reachability check;
+      // adding it there means the relay-down banner can flip the
+      // moment the WS dies, with no extra HTTP round-trip.
+      const relayLive = context.sync?.getRelayStatus?.() ?? null;
+      const relayBlock =
+        context.sync?.relay === undefined
+          ? undefined
+          : {
+              ...context.sync.relay,
+              ...(relayLive === null
+                ? {}
+                : {
+                    connected: relayLive.connected,
+                    consecutiveFailures: relayLive.consecutiveFailures,
+                    pendingPublishes: relayLive.pendingPublishes,
+                    ...(relayLive.lastConnectedAtMs === undefined
+                      ? {}
+                      : { lastConnectedAtMs: relayLive.lastConnectedAtMs }),
+                    ...(relayLive.lastDisconnectedAtMs === undefined
+                      ? {}
+                      : { lastDisconnectedAtMs: relayLive.lastDisconnectedAtMs }),
+                  }),
+            };
       return [
         200,
         {
@@ -903,6 +980,7 @@ const routes: readonly RouteDefinition[] = [
                     ...(mcpHealth === undefined ? {} : { health: mcpHealth }),
                   },
                 }),
+            ...(relayBlock === undefined ? {} : { sync: { relay: relayBlock } }),
             requestId,
           },
         },

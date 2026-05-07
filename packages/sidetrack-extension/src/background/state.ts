@@ -1389,6 +1389,7 @@ export const recordSelectorCanary = async (event: CaptureEvent): Promise<void> =
 export const buildWorkboardState = async (
   companionStatus: WorkboardState['companionStatus'],
   lastError?: string,
+  relayHealth?: WorkboardState['relayHealth'],
 ): Promise<WorkboardState> => {
   const vaultPath = await readVaultPath();
   const failedList = await readFailedCaptures();
@@ -1400,6 +1401,7 @@ export const buildWorkboardState = async (
     companionStatus,
     queuedCaptureCount: (await readQueue()).length,
     droppedCaptureCount: await readDroppedCount(),
+    ...(relayHealth === undefined ? {} : { relayHealth }),
     ...(failedList.length === 0 ? {} : { failedCaptureCount: failedList.length }),
     ...(lastRejection?.at === undefined ? {} : { lastQueueRejectionAt: lastRejection.at }),
     settings: await readSettings(),

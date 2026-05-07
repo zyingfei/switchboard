@@ -211,11 +211,28 @@ export interface CodingSession {
   readonly status: 'attached' | 'detached';
 }
 
+// Live relay (peer-sync) state. Companion exposes this in
+// /v1/status.sync.relay when it was started with --sync-relay or
+// --sync-relay-local. Used by the side panel's SystemBannersStack
+// to render a relay_disconnected banner that's distinct from
+// companion_disconnected — local captures still succeed when the
+// relay is down, but cross-device sync is silently paused.
+export interface RelayHealth {
+  readonly url: string;
+  readonly mode: 'local' | 'remote';
+  readonly connected?: boolean;
+  readonly lastConnectedAtMs?: number;
+  readonly lastDisconnectedAtMs?: number;
+  readonly consecutiveFailures?: number;
+  readonly pendingPublishes?: number;
+}
+
 export interface WorkboardState {
   readonly companionStatus: CompanionStatus;
   readonly vaultPath?: string;
   readonly queuedCaptureCount: number;
   readonly droppedCaptureCount: number;
+  readonly relayHealth?: RelayHealth;
   // V3 no-data-loss surfaces. failedCaptureCount is explicit
   // captures that exhausted retries. lastQueueRejectionAt is set
   // when an explicit capture was rejected because the queue was

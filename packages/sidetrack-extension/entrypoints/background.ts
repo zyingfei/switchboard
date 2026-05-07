@@ -21,6 +21,7 @@ import { createSettingsClient } from '../src/settings/client';
 import type {
   CaptureEvent,
   CompanionSettings,
+  CompanionStatus,
   CodingAttachTokenCreate,
   CodingAttachTokenRecord,
   QueueCreate,
@@ -747,12 +748,26 @@ const verifyCompanionSettingsBeforeSave = async (
   return normalized;
 };
 
+// Cached relay status from the most recent /v1/status response.
+// buildWorkboardState reads this to surface the relay-disconnected
+// banner — without caching, every state read would need a separate
+// HTTP round-trip. Reset to null when settings change so a stale
+// "connected" banner doesn't survive a companion swap.
+let cachedRelayStatus: NonNullable<CompanionStatus['sync']>['relay'] | null = null;
+
+export const peekCachedRelayStatus = (): typeof cachedRelayStatus => cachedRelayStatus;
+
 const assertCompanionReachable = async (): Promise<'connected' | 'vault-error' | 'local-only'> => {
   const settings = await readSettings();
   if (settings.companion.bridgeKey.length === 0) {
+    cachedRelayStatus = null;
     return 'local-only';
   }
   const status = await createCompanionClient(settings.companion).status();
+  // Capture the live relay block (if any) so the workboard-state
+  // builder can route a relay-disconnected banner without a
+  // second round-trip.
+  cachedRelayStatus = status.sync?.relay ?? null;
   return status.vault === 'connected' ? 'connected' : 'vault-error';
 };
 
@@ -1182,8 +1197,13 @@ const buildState = async (
   lastError?: string,
 ): Promise<WorkboardState> => {
   const tab = await activeTab();
+  // Pull the cached relay status set by the most recent
+  // assertCompanionReachable. Always fresh on a polling refresh
+  // because withCompanionStatus calls assertCompanionReachable
+  // before invoking buildState.
+  const relayHealth = cachedRelayStatus ?? undefined;
   return {
-    ...(await buildWorkboardState(companionStatus, lastError)),
+    ...(await buildWorkboardState(companionStatus, lastError, relayHealth)),
     ...(tab?.url === undefined ? {} : { activeTabUrl: tab.url }),
     currentTab: await currentTabThread(),
   };

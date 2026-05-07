@@ -39,6 +39,7 @@ export const expectNoThreadRow = async (page: Page, title: string): Promise<void
 
 export type BannerKind =
   | 'companion-disconnected'
+  | 'relay-disconnected'
   | 'captures-queued'
   | 'captures-failed'
   | 'vault-unreachable'
@@ -46,6 +47,7 @@ export type BannerKind =
 
 const BANNER_TITLE_PREFIX: Record<BannerKind, string> = {
   'companion-disconnected': 'Companion: disconnected',
+  'relay-disconnected': 'Peer sync paused',
   'captures-queued': 'Captures queued',
   'captures-failed': 'Explicit captures failed after retries',
   'vault-unreachable': 'Vault: error',
