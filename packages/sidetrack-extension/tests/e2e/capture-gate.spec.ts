@@ -6,7 +6,13 @@ import { expect, test } from '@playwright/test';
 
 import { messageTypes } from '../../src/messages';
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
-import { THREADS_KEY, WORKSTREAMS_KEY, assertOk, seedAndOpenSidepanel } from './helpers/sidepanel';
+import {
+  SETTINGS_KEY,
+  THREADS_KEY,
+  WORKSTREAMS_KEY,
+  assertOk,
+  seedAndOpenSidepanel,
+} from './helpers/sidepanel';
 
 const now = '2026-04-29T12:00:00.000Z';
 
@@ -27,6 +33,17 @@ test.describe('capture gate (synthetic)', () => {
     try {
       runtime = await launchExtensionRuntime({ forceLocalProfile: true });
       const page = await seedAndOpenSidepanel(runtime, {
+        // autoTrack: true so the URL-shape gate at background.ts:
+        // ~1736 (isProviderThreadUrl) is what we're actually
+        // testing, not the unseeded-thread + autoTrack=false drop
+        // at ~1758. The latter is a SEPARATE gate covered by
+        // tracking-mode.spec.ts.
+        [SETTINGS_KEY]: {
+          companion: { port: 17_373, bridgeKey: '' },
+          autoTrack: true,
+          siteToggles: { chatgpt: true, claude: true, gemini: true, codex: true },
+          notifyOnQueueComplete: false,
+        },
         [WORKSTREAMS_KEY]: [ws('bac_ws_gate', 'Capture gate suite')],
         [THREADS_KEY]: [],
       });

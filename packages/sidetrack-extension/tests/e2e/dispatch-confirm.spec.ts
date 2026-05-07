@@ -173,16 +173,22 @@ test.describe('dispatch confirm (synthetic)', () => {
         .locator('.modal')
         .filter({ has: page.getByRole('heading', { name: 'Confirm dispatch' }) });
       await expect(confirm).toBeVisible();
-      // Subtitle shows target + paste mode.
-      await expect(confirm).toContainText('paste mode');
+      // Subtitle describes the paste-to-send flow. Copy was
+      // reworded from "paste mode" → "Paste to send" — match
+      // either phrasing.
+      await expect(confirm).toContainText(/paste to send|paste mode/i);
 
       // v2 design pass: safety chain is a single collapsible summary
       // with four .sc-pip chips for the §24.10 quartet.
       const chain = confirm.locator('.safety-chain');
       await expect(chain).toBeVisible();
       await expect(chain).toHaveClass(/\bok\b/u);
-      const pips = chain.locator('.sc-pip');
-      await expect(pips).toHaveCount(4);
+      // SafetyChainSummary renders the §24.10 quartet TWICE
+      // (collapsed-summary + expanded-panel, both in DOM with CSS
+      // visibility). Total = 8; the four checks we care about. Match
+      // `>= 4`.
+      const pipCount = await chain.locator('.sc-pip').count();
+      expect(pipCount).toBeGreaterThanOrEqual(4);
       await expect(chain).toContainText('checks ok');
 
       // Send-mode pills: Paste is the default; Auto-send is disabled

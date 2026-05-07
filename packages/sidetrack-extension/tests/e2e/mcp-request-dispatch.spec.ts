@@ -21,8 +21,20 @@ const workstream = {
   updatedAt: '2026-05-05T12:00:00.000Z',
 };
 
-const extractPrompt = async (page: Page): Promise<string> =>
-  (await page.locator('.coding-handoff-prompt').textContent()) ?? '';
+// The attach UI now renders multiple `.coding-handoff-prompt`
+// blocks (shell + several MCP-config variants + the generated
+// prompt). The generated prompt block — the one that contains
+// `sidetrack_attach_token:` — renders only after "Generate prompt"
+// resolves. Wait for that token-bearing block before extracting,
+// then concatenate everything.
+const extractPrompt = async (page: Page): Promise<string> => {
+  await page
+    .locator('.coding-handoff-prompt')
+    .filter({ hasText: 'sidetrack_attach_token:' })
+    .waitFor({ timeout: 15_000 });
+  const blocks = await page.locator('.coding-handoff-prompt').allTextContents();
+  return blocks.join('\n');
+};
 
 const extractAttachToken = (prompt: string): string => {
   const match = /sidetrack_attach_token:\s*([A-Za-z0-9_-]+)/u.exec(prompt);

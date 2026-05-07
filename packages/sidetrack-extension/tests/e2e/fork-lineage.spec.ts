@@ -5,6 +5,7 @@ import { startProviderFixtureServer, type FixtureServer } from './helpers/fixtur
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
 
 const SETUP_KEY = 'sidetrack:setupCompleted';
+const SETTINGS_KEY = 'sidetrack.settings';
 const THREADS_KEY = 'sidetrack.threads';
 const WORKSTREAMS_KEY = 'sidetrack.workstreams';
 
@@ -39,6 +40,14 @@ test('fork lineage: a captured thread linked to a tracked parent renders the "â†
 
     await runtime.seedStorage(seederPage, {
       [SETUP_KEY]: true,
+      // autoTrack: true so the unseeded child thread the test
+      // captures below isn't silently dropped at the autoCapture
+      // gate.
+      [SETTINGS_KEY]: {
+        companion: { port: 17_373, bridgeKey: '' },
+        autoTrack: true,
+        siteToggles: { chatgpt: true, claude: true, gemini: true, codex: true },
+      },
       [WORKSTREAMS_KEY]: [
         {
           bac_id: 'bac_ws_research',

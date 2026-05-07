@@ -202,7 +202,11 @@ test.describe('vault bind / unbind (real companion)', () => {
         [SETUP_KEY]: true,
         [SETTINGS_KEY]: {
           companion: { port: companion.port, bridgeKey: companion.bridgeKey },
-          autoTrack: false,
+          // autoTrack: true so the autoCapture gate at
+          // background.ts:~1758 forwards an unseeded thread into
+          // storeCaptureEvent. Otherwise the synthetic capture
+          // silently drops and no event file lands.
+          autoTrack: true,
           siteToggles: { chatgpt: true, claude: true, gemini: true },
         },
       });
@@ -240,12 +244,27 @@ test.describe('vault bind / unbind (real companion)', () => {
           : false,
       ).toBe(true);
 
-      // Vault filesystem now has at least one event line containing the
-      // capture's title — proves the POST hit the real companion and the
-      // vault writer persisted it.
-      const eventsDir = path.join(companion.vaultPath, '_BAC/events');
-      const files = await readdir(eventsDir);
-      expect(files.length).toBeGreaterThan(0);
+      // Vault filesystem now has at least one event line containing
+      // the capture's title — proves the POST hit the real companion
+      // and the vault writer persisted it. Post-PR-#93 vaults write
+      // the per-replica log under `_BAC/log/<replicaId>/`. The legacy
+      // `_BAC/events/` dir is still populated for back-compat — fall
+      // back to it if the per-replica path is empty.
+      const logRoot = path.join(companion.vaultPath, '_BAC/log');
+      const replicaDirs = await readdir(logRoot).catch(() => [] as readonly string[]);
+      let totalEventFiles = 0;
+      for (const replicaDir of replicaDirs) {
+        const files = await readdir(path.join(logRoot, replicaDir)).catch(
+          () => [] as readonly string[],
+        );
+        totalEventFiles += files.length;
+      }
+      if (totalEventFiles === 0) {
+        const legacyDir = path.join(companion.vaultPath, '_BAC/events');
+        const files = await readdir(legacyDir).catch(() => [] as readonly string[]);
+        totalEventFiles = files.length;
+      }
+      expect(totalEventFiles).toBeGreaterThan(0);
     } finally {
       await runtime?.close();
       await companion?.close();

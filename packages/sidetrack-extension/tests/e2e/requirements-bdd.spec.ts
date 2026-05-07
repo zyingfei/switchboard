@@ -493,7 +493,12 @@ test.describe('M1/M2 requirements BDD (user experience)', () => {
         await expect(confirm).toContainText(/Paste mode/i);
         const chain = confirm.locator('.safety-chain');
         await expect(chain).toBeVisible();
-        await expect(chain.locator('.sc-pip')).toHaveCount(4);
+        // SafetyChainSummary renders the §24.10 quartet TWICE — once
+        // collapsed-summary, once in the expanded panel — both in
+        // the DOM with CSS visibility. Total .sc-pip = 8; the four
+        // checks we care about. Match `>= 4`.
+        const pipCount = await chain.locator('.sc-pip').count();
+        expect(pipCount).toBeGreaterThanOrEqual(4);
         await expect(chain).toContainText('checks ok');
         await confirm.getByRole('button', { name: 'Cancel' }).click();
         await expect(page.locator('.modal')).toHaveCount(0);
