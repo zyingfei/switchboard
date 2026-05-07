@@ -2045,6 +2045,44 @@ describe('companion HTTP server', () => {
     expect(body.detail).toContain('/tmp/empty-models');
   });
 
+  it('GET /v1/recall/query short-circuits to data:[] for an empty index without calling the embedder', async () => {
+    // Fresh vault: lifecycle wrote an empty index file at startup,
+    // so the route does NOT take the index===null short-circuit.
+    // The behaviour we want is: when there are zero entries to rank,
+    // skip the embed() call entirely. Without that branch this same
+    // request would 503 in offline+empty-cache mode (see prior test)
+    // — which would be a misleading affordance for a brand-new vault.
+    const { writeIndex } = await import('../recall/indexFile.js');
+    const { join } = await import('node:path');
+    await writeIndex(join(vaultPath, '_BAC', 'recall', 'index.bin'), [], 'test/model');
+    const embedderModule = (await import('../recall/embedder.js')) as unknown as {
+      readonly RecallModelMissingError: new (
+        message: string,
+        offline: boolean,
+        cacheDir: string,
+      ) => Error;
+      readonly __embedderState: { nextEmbedError: Error | null };
+    };
+    // Arm the embedder with a model-missing error so the assertion
+    // would fail with 503 if the route tried to embed. The
+    // short-circuit must skip past it.
+    embedderModule.__embedderState.nextEmbedError = new embedderModule.RecallModelMissingError(
+      'cache empty',
+      true,
+      '/tmp/empty-models',
+    );
+    const response = await jsonFetch(context, `${baseUrl}/v1/recall/query?q=hello`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ data: [] });
+    // The error we armed should still be loaded for the next call —
+    // the short-circuit must not have consumed it.
+    expect(embedderModule.__embedderState.nextEmbedError).not.toBeNull();
+    // Clear it so later tests aren't affected.
+    embedderModule.__embedderState.nextEmbedError = null;
+  });
+
   it('reports recall activity after incremental indexing', async () => {
     context = {
       ...context,

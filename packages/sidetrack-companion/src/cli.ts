@@ -379,7 +379,18 @@ const runModelsSubcommand = async (
     writeLine(streams.stdout, `revision     ${status.revision}`);
     writeLine(streams.stdout, `cache dir    ${status.cacheDir}`);
     writeLine(streams.stdout, `present      ${status.present ? 'yes' : 'no'}`);
-    writeLine(streams.stdout, `verified     ${status.verified ? 'yes' : 'no (revision unpinned)'}`);
+    // `verified` means the cached refs/<branch> token matches the
+    // pinned manifest sha. False splits two ways: model isn't on
+    // disk at all (run `models ensure`), or it IS on disk but the
+    // cached revision doesn't match (cache populated by an older
+    // companion version, or the manifest moved). Distinguish so the
+    // user knows whether to ensure or re-ensure.
+    const verifiedReason = status.verified
+      ? 'yes'
+      : status.present
+        ? 'no (cached revision does not match pinned sha)'
+        : 'no (model not present)';
+    writeLine(streams.stdout, `verified     ${verifiedReason}`);
     writeLine(streams.stdout, `offline      ${status.offline ? 'yes' : 'no'}`);
     return 0;
   }
@@ -770,6 +781,10 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
     );
   }
 
+  // Track an optional MCP child + close hook on a single object so
+  // there's exactly one shutdown path regardless of which optional
+  // sidecars are wired (mcp / local relay / neither).
+  let mcpChild: ReturnType<typeof spawnMcpServer> | undefined;
   const closeAll = async (): Promise<void> => {
     await runtime.close();
     await localRelay?.close();
@@ -785,7 +800,7 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
       await closeAll();
       return 1;
     }
-    const child = spawnMcpServer({
+    mcpChild = spawnMcpServer({
       mcpBin,
       mcpPort: args.mcpPort,
       mcpAuthKey: resolvedMcpAuthKey,
@@ -811,32 +826,28 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
         'mcp auth key   provided via --mcp-auth-key (skip the side-panel prompt regen if you change it).',
       );
     }
-    const shutdown = (signal: NodeJS.Signals): void => {
-      child.kill(signal);
-      void closeAll().finally(() => {
-        process.exit(0);
-      });
-    };
-    process.once('SIGINT', () => {
-      shutdown('SIGINT');
-    });
-    process.once('SIGTERM', () => {
-      shutdown('SIGTERM');
-    });
-  } else if (localRelay !== undefined) {
-    const shutdown = (signal: NodeJS.Signals): void => {
-      writeLine(streams.stdout, `[sync relay] received ${signal}, shutting down`);
-      void closeAll().finally(() => {
-        process.exit(0);
-      });
-    };
-    process.once('SIGINT', () => {
-      shutdown('SIGINT');
-    });
-    process.once('SIGTERM', () => {
-      shutdown('SIGTERM');
-    });
   }
+
+  // Always wire SIGINT/SIGTERM. Without this the bare-runtime case
+  // (no --mcp-port, no --sync-relay-local) had no handler at all,
+  // so `kill` left `_BAC/recall/.lock` pointing at the now-dead pid
+  // and stranded the next-launch on the recovery path's stale-pid
+  // takeover. closeAll() releases the lock via runtime.close().
+  const shutdown = (signal: NodeJS.Signals): void => {
+    if (mcpChild !== undefined) mcpChild.kill(signal);
+    if (localRelay !== undefined) {
+      writeLine(streams.stdout, `[sync relay] received ${signal}, shutting down`);
+    }
+    void closeAll().finally(() => {
+      process.exit(0);
+    });
+  };
+  process.once('SIGINT', () => {
+    shutdown('SIGINT');
+  });
+  process.once('SIGTERM', () => {
+    shutdown('SIGTERM');
+  });
   return 0;
 };
 

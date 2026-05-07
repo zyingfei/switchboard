@@ -68,6 +68,12 @@ describe('runCli', () => {
     expect(out).toContain('Xenova/multilingual-e5-small');
     expect(out).toContain('cache dir    /tmp/sb-models-test');
     expect(out).toContain('present      no');
+    // Verified line should reflect the actual cause. With no model
+    // on disk it must say "model not present", NOT the legacy
+    // "revision unpinned" string that survived the manifest-pinning
+    // commit.
+    expect(out).toContain('verified     no (model not present)');
+    expect(out).not.toContain('revision unpinned');
   });
 
   it('models status --json produces machine-readable output', async () => {

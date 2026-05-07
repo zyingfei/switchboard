@@ -2087,6 +2087,15 @@ const routes: readonly RouteDefinition[] = [
       if (index === null) {
         return [200, { data: [] }];
       }
+      // Short-circuit when the index is empty. The lifecycle's first
+      // background rebuild creates an empty index file on a fresh
+      // vault, so `index !== null` doesn't imply there's anything to
+      // search. Without this branch we'd burn an embedder load (and
+      // surface a misleading 503 RECALL_MODEL_MISSING in offline +
+      // empty-cache mode) for a query that has nothing to rank.
+      if (index.items.length === 0) {
+        return [200, { data: [] }];
+      }
       // Embedding the query needs the local model. In offline mode
       // with an empty cache (or any other "we can't load the model"
       // failure path), the embedder throws RecallModelMissingError —
@@ -2383,8 +2392,25 @@ const routes: readonly RouteDefinition[] = [
         ) {
           const lifecycle = context.recallLifecycle;
           const log = context.eventLog;
-          void lifecycle.ingestIncremental(log).catch(() => {
-            // Best-effort — see comment above.
+          const activity = context.recallActivity;
+          void lifecycle.ingestIncremental(log).catch((error: unknown) => {
+            // Surface the failure so the operator can tell the
+            // capture-time projection is stalled. The event itself
+            // is durably appended; a later `recall reingest` (after
+            // `models ensure`) will catch up. Without this, the
+            // failure was silent — the only signal was that recall
+            // queries returned 503 RECALL_MODEL_MISSING and the
+            // ingestor frontier never advanced.
+            const code =
+              error !== null && typeof error === 'object' && 'code' in error
+                ? String((error as { code: unknown }).code)
+                : 'unknown';
+            const message = error instanceof Error ? error.message : String(error);
+            // eslint-disable-next-line no-console
+            console.warn(
+              `[recall] post-capture ingestIncremental failed (${code}): ${message.slice(0, 200)}`,
+            );
+            activity?.recordIngestFailed(`${code}: ${message.slice(0, 200)}`);
           });
         }
         return [201, mutationResponse(result, requestId)];
