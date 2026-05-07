@@ -86,6 +86,11 @@ export const messageTypes = {
   codingAttachListOffers: 'sidetrack.codingAttach.listOffers',
   codingAttachMarkStatus: 'sidetrack.codingAttach.markStatus',
   saveLocalPreferences: 'sidetrack.preferences.local.save',
+  // Side panel asks the background to retry every explicit capture
+  // that exhausted its retry budget while the companion was offline.
+  // Drains failed-queue → re-enqueue as fresh explicit → trigger
+  // drain. The banner reads failedCaptureCount from WorkboardState.
+  retryFailedCaptures: 'sidetrack.capture.failed.retry',
   createCaptureNote: 'sidetrack.capture.note.create',
   updateCaptureNote: 'sidetrack.capture.note.update',
   deleteCaptureNote: 'sidetrack.capture.note.delete',
@@ -232,6 +237,9 @@ export type WorkboardRequest =
     }
   | {
       readonly type: typeof messageTypes.captureCurrentTab;
+    }
+  | {
+      readonly type: typeof messageTypes.retryFailedCaptures;
     }
   | {
       readonly type: typeof messageTypes.createWorkstream;
@@ -509,7 +517,8 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
 
   if (
     hasType(value, messageTypes.getWorkboardState) ||
-    hasType(value, messageTypes.captureCurrentTab)
+    hasType(value, messageTypes.captureCurrentTab) ||
+    hasType(value, messageTypes.retryFailedCaptures)
   ) {
     return true;
   }

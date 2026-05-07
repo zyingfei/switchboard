@@ -1,22 +1,46 @@
-import type { AcceptedEvent } from './causal.js';
+import { mkdir, unlink, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+
+import type { AcceptedEvent, VersionVector } from './causal.js';
 import type { EventLog } from './eventLog.js';
-import type { ProjectionChangeFeed } from './projectionChanges.js';
+import type { ProjectionChangeFeed, ProjectionChangeKind } from './projectionChanges.js';
 import { isReviewDraftEvent, projectReviewDraft } from '../review/projection.js';
 import { deleteReviewDraft, readReviewDraft, writeReviewDraft } from '../vault/reviewDrafts.js';
+import {
+  THREAD_ARCHIVED,
+  THREAD_DELETED,
+  THREAD_UNARCHIVED,
+  THREAD_UPSERTED,
+} from '../threads/events.js';
+import { projectThread } from '../threads/projection.js';
+import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../workstreams/events.js';
+import { projectWorkstream } from '../workstreams/projection.js';
+import {
+  ANNOTATION_CREATED,
+  ANNOTATION_DELETED,
+  ANNOTATION_NOTE_SET,
+} from '../annotations/events.js';
+import { projectAnnotations } from '../annotations/projection.js';
+import { QUEUE_CREATED, QUEUE_STATUS_SET } from '../queue/events.js';
+import { projectQueueItem } from '../queue/projection.js';
+import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../dispatches/events.js';
+import { projectDispatches } from '../dispatches/projection.js';
 
 // Aggregate-projector dispatch for events ingested from peers.
 //
 // `importPeerEvent` only persists the event under the peer's
-// per-replica log shard. The browser watches `_BAC/review-drafts/`
-// and aggregate projection files — NOT `_BAC/log/` — so without an
-// explicit projector pass, peer events would land on disk but the
-// extension would never see them until a route happened to recompute
-// the projection. This module closes that loop.
+// per-replica log shard. The browser watches `_BAC/<aggregate>/`
+// projection files — NOT `_BAC/log/` — so without an explicit
+// projector pass, peer events would land on disk but the extension
+// would never see them until a route happened to recompute the
+// projection. This module closes that loop.
 //
-// Today it dispatches review-draft events; capture/tombstone/threads
-// projections are computed on-demand via `/v1/.../projection` so the
-// file-based feed isn't load-bearing for them. Adding more projectors
-// here is a matter of mapping the event type to a recompute function.
+// Invariant B (registry coverage): every event type the system
+// emits MUST have a registered projector entry. Adding a new event
+// type without registering its projector is a sync bug — the
+// coverage test in projectors.test.ts asserts every emitted event
+// type appears in PROJECTOR_REGISTRY (or is a review-draft event,
+// which has its own predicate-based dispatch below).
 
 export interface RunImportProjectorsDeps {
   readonly vaultRoot: string;
@@ -24,22 +48,186 @@ export interface RunImportProjectorsDeps {
   readonly projectionChanges?: ProjectionChangeFeed;
 }
 
+interface ProjectorEntry {
+  readonly aggregate: string;
+  readonly project: (deps: RunImportProjectorsDeps, event: AcceptedEvent) => Promise<void>;
+}
+
+const PROJECTOR_REGISTRY: Record<string, ProjectorEntry> = {
+  [THREAD_UPSERTED]: { aggregate: 'thread', project: projectThreadAfterImport },
+  [THREAD_ARCHIVED]: { aggregate: 'thread', project: projectThreadAfterImport },
+  [THREAD_UNARCHIVED]: { aggregate: 'thread', project: projectThreadAfterImport },
+  [THREAD_DELETED]: { aggregate: 'thread', project: projectThreadAfterImport },
+  [WORKSTREAM_UPSERTED]: { aggregate: 'workstream', project: projectWorkstreamAfterImport },
+  [WORKSTREAM_DELETED]: { aggregate: 'workstream', project: projectWorkstreamAfterImport },
+  [ANNOTATION_CREATED]: { aggregate: 'annotation', project: projectAnnotationAfterImport },
+  [ANNOTATION_NOTE_SET]: { aggregate: 'annotation', project: projectAnnotationAfterImport },
+  [ANNOTATION_DELETED]: { aggregate: 'annotation', project: projectAnnotationAfterImport },
+  [QUEUE_CREATED]: { aggregate: 'queue', project: projectQueueItemAfterImport },
+  [QUEUE_STATUS_SET]: { aggregate: 'queue', project: projectQueueItemAfterImport },
+  [DISPATCH_RECORDED]: { aggregate: 'dispatch', project: projectDispatchAfterImport },
+  [DISPATCH_LINKED]: { aggregate: 'dispatch', project: projectDispatchAfterImport },
+};
+
+export const PROJECTED_EVENT_TYPES: readonly string[] = Object.keys(PROJECTOR_REGISTRY);
+
 export const runImportProjectors = async (
   deps: RunImportProjectorsDeps,
   event: AcceptedEvent,
 ): Promise<void> => {
   if (isReviewDraftEvent(event)) {
     await projectReviewDraftAfterImport(deps, event);
+    return;
   }
-  // Threads, workstreams, queue, dispatches, annotations are read
-  // on-demand via `/v1/.../projection`; nothing to do here. Recall
-  // tombstones land in the index via the next rebuild.
+  const entry = PROJECTOR_REGISTRY[event.type];
+  if (entry === undefined) return;
+  await entry.project(deps, event);
 };
 
-const projectReviewDraftAfterImport = async (
+interface WriteProjectionParams {
+  readonly aggregate: string;
+  readonly aggregateId: string;
+  readonly relDir: string;
+  readonly body: unknown;
+  readonly vector: VersionVector;
+  readonly kind: ProjectionChangeKind;
+}
+
+const writeProjection = async (
+  deps: RunImportProjectorsDeps,
+  params: WriteProjectionParams,
+): Promise<void> => {
+  const dir = join(deps.vaultRoot, ...params.relDir.split('/'));
+  await mkdir(dir, { recursive: true });
+  const out = join(dir, `${params.aggregateId}.json`);
+  if (params.kind === 'delete') {
+    // Symmetric with vault/writer.ts's local-action delete path,
+    // which unlinks the per-aggregate JSON. Without unlink here a
+    // peer that observes a delete keeps a tombstoned projection
+    // file on disk while the deleter has none — the two replicas'
+    // _BAC/<aggregate>/ listings diverge even though the logical
+    // state matches. Best-effort unlink (file may already be gone
+    // on the deleter side, or a concurrent local writer may have
+    // beat us to it).
+    await unlink(out).catch(() => undefined);
+  } else {
+    await writeFile(out, JSON.stringify(params.body, null, 2), 'utf8');
+  }
+  await deps.projectionChanges
+    ?.appendChange({
+      aggregate: params.aggregate,
+      aggregateId: params.aggregateId,
+      relPath: `${params.relDir}/${params.aggregateId}.json`,
+      vector: params.vector,
+      kind: params.kind,
+    })
+    .catch(() => undefined);
+};
+
+async function projectThreadAfterImport(
   deps: RunImportProjectorsDeps,
   event: AcceptedEvent,
-): Promise<void> => {
+): Promise<void> {
+  const bacId = event.aggregateId;
+  if (typeof bacId !== 'string' || bacId.length === 0) return;
+  const merged = await deps.eventLog.readByAggregate(bacId);
+  const projection = projectThread(bacId, merged);
+  await writeProjection(deps, {
+    aggregate: 'thread',
+    aggregateId: bacId,
+    relDir: '_BAC/threads/projections',
+    body: projection,
+    vector: projection.vector,
+    kind: projection.deleted ? 'delete' : 'upsert',
+  });
+}
+
+async function projectWorkstreamAfterImport(
+  deps: RunImportProjectorsDeps,
+  event: AcceptedEvent,
+): Promise<void> {
+  const bacId = event.aggregateId;
+  if (typeof bacId !== 'string' || bacId.length === 0) return;
+  const merged = await deps.eventLog.readByAggregate(bacId);
+  const projection = projectWorkstream(bacId, merged);
+  await writeProjection(deps, {
+    aggregate: 'workstream',
+    aggregateId: bacId,
+    relDir: '_BAC/workstreams/projections',
+    body: projection,
+    vector: projection.vector,
+    kind: projection.deleted ? 'delete' : 'upsert',
+  });
+}
+
+async function projectAnnotationAfterImport(
+  deps: RunImportProjectorsDeps,
+  event: AcceptedEvent,
+): Promise<void> {
+  const bacId = event.aggregateId;
+  if (typeof bacId !== 'string' || bacId.length === 0) return;
+  const merged = await deps.eventLog.readByAggregate(bacId);
+  const projection = projectAnnotations(merged);
+  const entry = projection.entries.find((candidate) => candidate.bac_id === bacId);
+  if (entry === undefined) return;
+  await writeProjection(deps, {
+    aggregate: 'annotation',
+    aggregateId: bacId,
+    relDir: '_BAC/annotations/projections',
+    body: { entry, vector: projection.vector, updatedAtMs: projection.updatedAtMs },
+    vector: projection.vector,
+    kind: entry.deleted ? 'delete' : 'upsert',
+  });
+}
+
+async function projectQueueItemAfterImport(
+  deps: RunImportProjectorsDeps,
+  event: AcceptedEvent,
+): Promise<void> {
+  const bacId = event.aggregateId;
+  if (typeof bacId !== 'string' || bacId.length === 0) return;
+  const merged = await deps.eventLog.readByAggregate(bacId);
+  const projection = projectQueueItem(bacId, merged);
+  await writeProjection(deps, {
+    aggregate: 'queue',
+    aggregateId: bacId,
+    relDir: '_BAC/queue/projections',
+    body: projection,
+    vector: projection.vector,
+    kind: 'upsert',
+  });
+}
+
+async function projectDispatchAfterImport(
+  deps: RunImportProjectorsDeps,
+  event: AcceptedEvent,
+): Promise<void> {
+  const bacId = event.aggregateId;
+  if (typeof bacId !== 'string' || bacId.length === 0) return;
+  const merged = await deps.eventLog.readByAggregate(bacId);
+  const projection = projectDispatches(merged);
+  const recorded = projection.entries.find((candidate) => candidate.bac_id === bacId);
+  const link = projection.links.find((candidate) => candidate.dispatchId === bacId);
+  if (recorded === undefined && link === undefined) return;
+  await writeProjection(deps, {
+    aggregate: 'dispatch',
+    aggregateId: bacId,
+    relDir: '_BAC/dispatches/projections',
+    body: {
+      ...(recorded === undefined ? {} : { entry: recorded }),
+      ...(link === undefined ? {} : { link }),
+      vector: projection.vector,
+      updatedAtMs: projection.updatedAtMs,
+    },
+    vector: projection.vector,
+    kind: 'upsert',
+  });
+}
+
+async function projectReviewDraftAfterImport(
+  deps: RunImportProjectorsDeps,
+  event: AcceptedEvent,
+): Promise<void> {
   const threadId = event.aggregateId;
   const merged = await deps.eventLog.readByAggregate(threadId);
   const reviewEvents = merged.filter((entry) => isReviewDraftEvent(entry));
@@ -60,4 +248,4 @@ const projectReviewDraftAfterImport = async (
       kind: projection.discarded ? 'delete' : 'upsert',
     })
     .catch(() => undefined);
-};
+}

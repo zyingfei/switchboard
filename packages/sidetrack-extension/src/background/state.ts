@@ -2,6 +2,7 @@ import type {
   CaptureEvent,
   CaptureNoteCreate,
   CaptureNoteUpdate,
+  ChecklistItem,
   CompanionSettings,
   QueueCreate,
   QueueUpdate,
@@ -11,7 +12,7 @@ import type {
   WorkstreamCreate,
   WorkstreamUpdate,
 } from '../companion/model';
-import { readDroppedCount, readQueue } from '../companion/queue';
+import { readDroppedCount, readFailedCaptures, readQueue } from '../companion/queue';
 import { canonicalThreadUrl, detectProviderFromUrl } from '../capture/providerDetection';
 import type { DispatchEventRecord } from '../dispatch/types';
 import type { ReviewDraftClientEvent, TargetRef } from '../review/draftClient';
@@ -710,6 +711,241 @@ export const removeRemoteReviewDraft = async (threadId: string): Promise<void> =
   await dropReviewDraftVector(threadId);
 };
 
+// Remote-thread projection landed via /v1/threads/<id>/projection.
+// The companion's projection has shape { record: register, status:
+// register, deleted, vector }; we collapse the registers (taking
+// the first candidate on conflict for now — same simplification
+// review-drafts uses, see line 575) and merge into the local
+// `sidetrack.threads` array. Used by F9's vault-changes SSE
+// subscription so a peer's capture lands in the second browser's
+// side panel without a manual reload.
+export interface RemoteThreadRecord {
+  readonly bac_id: string;
+  readonly provider: string;
+  readonly threadUrl: string;
+  readonly title: string;
+  readonly lastSeenAt: string;
+  readonly tags: readonly string[];
+  readonly primaryWorkstreamId?: string;
+  readonly trackingMode?: TrackedThread['trackingMode'];
+}
+
+export interface RemoteThreadProjection {
+  readonly bac_id: string;
+  readonly record: RemoteRegister<RemoteThreadRecord>;
+  readonly status: RemoteRegister<TrackedThread['status']>;
+  readonly deleted: boolean;
+}
+
+export const mirrorRemoteThread = async (
+  projection: RemoteThreadProjection,
+): Promise<void> => {
+  const current = await readThreads();
+  // Tombstone path — a peer's delete event whose deps cover every
+  // local upsert collapses the record register to undefined AND
+  // sets `deleted: true`. Drop the local row.
+  if (projection.deleted) {
+    const next = current.filter((t) => t.bac_id !== projection.bac_id);
+    if (next.length !== current.length) {
+      await storageSet({ [THREADS_KEY]: next });
+    }
+    return;
+  }
+  const record = collapseRegister(projection.record);
+  const status = collapseRegister(projection.status);
+  if (record === undefined) {
+    // No live upsert — projection is empty for this thread.
+    // Don't fabricate a row.
+    return;
+  }
+  // Merge: replace any existing row with the same bac_id, append
+  // otherwise. Preserve fields the projection doesn't carry
+  // (e.g., lastTurnRole) on the existing row when the same id
+  // is being updated; the companion's projection is authoritative
+  // for everything it returns, but a partial mirror shouldn't
+  // wipe local-only fields.
+  const existing = current.find((t) => t.bac_id === projection.bac_id);
+  const next: TrackedThread = {
+    ...(existing ?? {}),
+    bac_id: record.bac_id,
+    provider: record.provider as TrackedThread['provider'],
+    threadUrl: record.threadUrl,
+    title: record.title,
+    lastSeenAt: record.lastSeenAt,
+    status: status ?? existing?.status ?? 'active',
+    trackingMode: record.trackingMode ?? existing?.trackingMode ?? 'manual',
+    tags: [...(record.tags ?? [])],
+    ...(record.primaryWorkstreamId === undefined
+      ? {}
+      : { primaryWorkstreamId: record.primaryWorkstreamId }),
+  };
+  const merged =
+    existing === undefined
+      ? [next, ...current]
+      : current.map((t) => (t.bac_id === projection.bac_id ? next : t));
+  await storageSet({ [THREADS_KEY]: merged });
+};
+
+// F10 — peer-imported workstream projection. Same shape as
+// mirrorRemoteThread: collapse the record register, merge into
+// chrome.storage `sidetrack.workstreams`. Without this, a thread
+// move into a peer-created workstream lands on the receiver's
+// thread row with a primaryWorkstreamId the local extension has
+// never heard of, so the side panel renders the row under
+// "Ungrouped" instead of the workstream the user intended.
+export interface RemoteWorkstreamRecord {
+  readonly bac_id: string;
+  readonly title: string;
+  readonly parentId?: string;
+  readonly privacy?: WorkstreamNode['privacy'];
+  readonly screenShareSensitive?: boolean;
+  readonly tags: readonly string[];
+  readonly children: readonly string[];
+  readonly checklist: readonly ChecklistItem[];
+  readonly description?: string;
+}
+
+export interface RemoteWorkstreamProjection {
+  readonly bac_id: string;
+  readonly record: RemoteRegister<RemoteWorkstreamRecord>;
+  readonly deleted: boolean;
+}
+
+export const mirrorRemoteWorkstream = async (
+  projection: RemoteWorkstreamProjection,
+): Promise<void> => {
+  const current = await readWorkstreams();
+  if (projection.deleted) {
+    const next = current.filter((w) => w.bac_id !== projection.bac_id);
+    if (next.length !== current.length) {
+      await storageSet({ [WORKSTREAMS_KEY]: next });
+    }
+    return;
+  }
+  const record = collapseRegister(projection.record);
+  if (record === undefined) return;
+  const existing = current.find((w) => w.bac_id === projection.bac_id);
+  const next: WorkstreamNode = {
+    // Locally-only fields (revision, updatedAt) come from existing
+    // when present; otherwise stamp a synthetic value so the type
+    // is satisfied. The companion's projection doesn't expose
+    // revision (it's a vault writer concern) but the side panel
+    // needs SOME value.
+    revision: existing?.revision ?? `peer-${record.bac_id}`,
+    updatedAt: existing?.updatedAt ?? new Date().toISOString(),
+    bac_id: record.bac_id,
+    title: record.title,
+    children: [...(record.children ?? [])],
+    tags: [...(record.tags ?? [])],
+    checklist: [...(record.checklist ?? [])],
+    privacy: record.privacy ?? existing?.privacy ?? 'shared',
+    ...(record.parentId === undefined ? {} : { parentId: record.parentId }),
+    ...(record.screenShareSensitive === undefined
+      ? {}
+      : { screenShareSensitive: record.screenShareSensitive }),
+    ...(record.description === undefined ? {} : { description: record.description }),
+  };
+  const merged =
+    existing === undefined
+      ? [next, ...current]
+      : current.map((w) => (w.bac_id === projection.bac_id ? next : w));
+  await storageSet({ [WORKSTREAMS_KEY]: merged });
+};
+
+// F14 — peer-imported queue projection. The queue is an explicit
+// surface (status pending/done/dismissed), so we mirror the full
+// row into chrome.storage `sidetrack.queueItems`. Same shape as
+// mirrorRemoteThread/Workstream: collapse the status register,
+// merge by bac_id.
+export interface RemoteQueueItemProjection {
+  readonly bac_id: string;
+  readonly base?: {
+    readonly text: string;
+    readonly scope: 'thread' | 'workstream' | 'global';
+    readonly targetId?: string;
+  };
+  readonly status: RemoteRegister<QueueItem['status']>;
+}
+
+export const mirrorRemoteQueueItem = async (
+  projection: RemoteQueueItemProjection,
+): Promise<void> => {
+  const current = await readQueueItems();
+  if (projection.base === undefined) return;
+  const status = collapseRegister(projection.status) ?? 'pending';
+  const existing = current.find((q) => q.bac_id === projection.bac_id);
+  const next: QueueItem = {
+    ...(existing ?? {}),
+    bac_id: projection.bac_id,
+    text: projection.base.text,
+    scope: projection.base.scope,
+    status,
+    createdAt: existing?.createdAt ?? new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    ...(projection.base.targetId === undefined ? {} : { targetId: projection.base.targetId }),
+  };
+  const merged =
+    existing === undefined
+      ? [next, ...current]
+      : current.map((q) => (q.bac_id === projection.bac_id ? next : q));
+  await storageSet({ [QUEUE_ITEMS_KEY]: merged });
+};
+
+// F15 — peer-imported dispatch projection. Mirrored into
+// `sidetrack.recentDispatches`. The companion's projection holds
+// the redacted body (PII / API keys → [category]); we accept that
+// as the visible body when peer-mirroring (the unredacted
+// clipboard contents are local-only by design).
+export interface RemoteDispatchProjection {
+  readonly bac_id: string;
+  readonly entry?: {
+    readonly bac_id: string;
+    readonly target: { readonly provider: string };
+    readonly workstreamId?: string;
+    readonly createdAt: string;
+    readonly body: string;
+  };
+  readonly link?: {
+    readonly dispatchId: string;
+    readonly threadId?: string;
+  };
+}
+
+export const mirrorRemoteDispatch = async (
+  projection: RemoteDispatchProjection,
+): Promise<void> => {
+  const entry = projection.entry;
+  if (entry !== undefined) {
+    const current = await readCachedDispatches();
+    const existing = current.find((d) => d.bac_id === entry.bac_id);
+    const provider = entry.target.provider as DispatchEventRecord['target']['provider'];
+    const next: DispatchEventRecord = {
+      bac_id: entry.bac_id,
+      kind: existing?.kind ?? 'other',
+      target: existing?.target ?? { provider, mode: 'paste' },
+      title: existing?.title ?? '',
+      body: entry.body,
+      createdAt: entry.createdAt,
+      redactionSummary: existing?.redactionSummary ?? { matched: 0, categories: [] },
+      tokenEstimate: existing?.tokenEstimate ?? 0,
+      status: existing?.status ?? 'sent',
+      ...(entry.workstreamId === undefined ? {} : { workstreamId: entry.workstreamId }),
+      ...(existing?.sourceThreadId === undefined ? {} : { sourceThreadId: existing.sourceThreadId }),
+      ...(existing?.mcpRequest === undefined ? {} : { mcpRequest: existing.mcpRequest }),
+    };
+    const merged =
+      existing === undefined
+        ? [next, ...current].slice(0, 50)
+        : current.map((d) => (d.bac_id === entry.bac_id ? next : d));
+    await storageSet({ [RECENT_DISPATCHES_KEY]: merged });
+  }
+  if (projection.link?.threadId !== undefined) {
+    const links = await readDispatchLinks();
+    const nextLinks = { ...links, [projection.link.dispatchId]: projection.link.threadId };
+    await storageSet({ [DISPATCH_LINKS_KEY]: nextLinks });
+  }
+};
+
 export const setReviewDraftSpanComment = async (
   threadId: string,
   spanId: string,
@@ -1389,12 +1625,21 @@ export const recordSelectorCanary = async (event: CaptureEvent): Promise<void> =
 export const buildWorkboardState = async (
   companionStatus: WorkboardState['companionStatus'],
   lastError?: string,
+  relayHealth?: WorkboardState['relayHealth'],
 ): Promise<WorkboardState> => {
   const vaultPath = await readVaultPath();
+  const failedList = await readFailedCaptures();
+  const lastRejection = (await storageGet<{ readonly at?: string } | null>(
+    'sidetrack.captureQueue.lastRejection',
+    null,
+  )) as { readonly at?: string } | null;
   return createEmptyWorkboardState({
     companionStatus,
     queuedCaptureCount: (await readQueue()).length,
     droppedCaptureCount: await readDroppedCount(),
+    ...(relayHealth === undefined ? {} : { relayHealth }),
+    ...(failedList.length === 0 ? {} : { failedCaptureCount: failedList.length }),
+    ...(lastRejection?.at === undefined ? {} : { lastQueueRejectionAt: lastRejection.at }),
     settings: await readSettings(),
     screenShareMode: await readScreenShareMode(),
     threads: await readThreads(),

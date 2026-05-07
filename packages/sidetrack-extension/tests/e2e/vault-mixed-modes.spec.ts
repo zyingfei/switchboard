@@ -44,9 +44,14 @@ const turns = [
   { role: 'assistant' as const, text: 'queue offline, drain online', ordinal: 1, capturedAt: now },
 ] as const;
 
+// autoTrack: true so the autoCapture handler's "unseeded thread +
+// autoTrack=false → silent drop" gate (background.ts:~1758)
+// doesn't preempt the local/queue/HTTP-attempt assertions this
+// suite is here to cover. The autoTrack-gate behavior has its
+// own coverage in tracking-mode.spec.ts.
 const connectedSettings = {
   companion: { port, bridgeKey },
-  autoTrack: false,
+  autoTrack: true,
   siteToggles: { chatgpt: true, claude: true, gemini: true },
 };
 
@@ -144,8 +149,15 @@ test.describe('vault mixed modes (synthetic)', () => {
       const state: CompanionMock = { reachable: true, appendEventCalls: 0 };
       await attachToggleableMock(runtime.context, state);
 
-      // No SETTINGS_KEY seeded → companion is local-only (bridgeKey empty).
+      // companion local-only: bridgeKey is empty so isCompanionConfigured
+      // returns false. autoTrack: true so the autoCapture gate at
+      // background.ts:~1758 falls through for unseeded threads.
       const page = await seedAndOpenSidepanel(runtime, {
+        [SETTINGS_KEY]: {
+          companion: { port: 17_373, bridgeKey: '' },
+          autoTrack: true,
+          siteToggles: { chatgpt: true, claude: true, gemini: true, codex: true },
+        },
         [WORKSTREAMS_KEY]: [ws('bac_ws_local', 'Local-only suite')],
         [THREADS_KEY]: [],
       });
@@ -212,15 +224,20 @@ test.describe('vault mixed modes (synthetic)', () => {
       });
 
       // Local thread + queue both updated even though the UI didn't refresh.
+      // Queue item shape (post-PR-#96 intent flag): each row is
+      // {id, payload: {event, intent}, attempts, ...}. Older
+      // shape was {event} flat; readers must reach into payload.
       const offlineState = await page.evaluate(
         async (keys) => {
           const all = await chrome.storage.local.get(keys);
           const threads = (all['sidetrack.threads'] ?? []) as { title: string }[];
-          const queue = (all['sidetrack.captureQueue'] ?? []) as { event: { title?: string } }[];
+          const queue = (all['sidetrack.captureQueue'] ?? []) as {
+            payload?: { event?: { title?: string } };
+          }[];
           return {
             threadTitles: threads.map((t) => t.title),
             queueLength: queue.length,
-            queueTitles: queue.map((q) => q.event.title ?? '(none)'),
+            queueTitles: queue.map((q) => q.payload?.event?.title ?? '(none)'),
           };
         },
         ['sidetrack.threads', 'sidetrack.captureQueue'],

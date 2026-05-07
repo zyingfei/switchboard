@@ -14,7 +14,11 @@ import {
   seedAndOpenSidepanel,
 } from './helpers/sidepanel';
 
-const now = '2026-04-29T12:00:00.000Z';
+// Use the test runtime's current clock so the thread's lastSeenAt
+// stays inside the STALE_AFTER_MS window (7 days). A pinned date
+// passed that threshold and the lifecycle pill flipped to "stale"
+// (gray dot) instead of the expected "green" (AI replied last).
+const now = new Date().toISOString();
 const threadId = 'bac_thread_dismiss';
 const threadUrl = 'https://gemini.google.com/app/dismiss-reminder-thread';
 

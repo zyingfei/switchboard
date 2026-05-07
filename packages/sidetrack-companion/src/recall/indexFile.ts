@@ -2,40 +2,52 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 
 import { createRevision } from '../domain/ids.js';
-import type { IndexEntry } from './ranker.js';
+import type { ChunkMetadata, IndexEntry } from './ranker.js';
 
-// Binary format V2:
+// Binary format V3:
 //   u32 headerLength, UTF-8 JSON header
-//     { magic, version, dim, count, modelId,
-//       schemaCapabilities: ['tombstones', 'replica-id', 'lamport-clock'] }
+//     { magic, version, dim, count, modelId, modelRevision,
+//       chunkSchemaVersion,
+//       schemaCapabilities: ['tombstones', 'replica-id', 'lamport-clock', 'chunk-metadata'] }
 //   repeated count records:
-//     u32 idLength + id UTF-8
+//     u32 idLength + id UTF-8                       (chunkId)
 //     u32 threadIdLength + threadId UTF-8
 //     u32 capturedAtLength + capturedAt UTF-8
-//     u32 replicaIdLength + replicaId UTF-8       (V2; '' = default 'local')
-//     u32 lamport (little-endian)                  (V2; 0 = unset)
-//     u8 tombstoned (0 or 1)                       (V2)
+//     u32 replicaIdLength + replicaId UTF-8         ('' = default 'local')
+//     u32 lamport (little-endian)                   (0 = unset)
+//     u8 tombstoned (0 or 1)
+//     u32 metadataLength + metadata UTF-8 JSON      (V3; '' = no metadata)
 //     dim * float32 little-endian embedding values
 //
 // The index is a rebuildable cache under _BAC/recall; corruption returns null.
 //
-// CRDT readiness: the new replicaId / lamport / tombstoned fields are
-// not exercised by the single-replica reader (the lifecycle keeps one
-// companion writing per vault). They're persisted on disk so a future
-// reader can merge two index files via OR-Set semantics:
-//   - union entries by (id, replicaId)
-//   - keep max-lamport per (id, replicaId)
-//   - drop the result if the latest entry is tombstoned
-// V1 indexes auto-rebuild as V2 via the existing lifecycle stale-check.
+// V1 / V2 indexes return null from the reader so the lifecycle's
+// stale-check rebuilds them into V3 — same auto-upgrade pattern as
+// V1 → V2. The CRDT-readiness fields (replicaId / lamport /
+// tombstoned) carry forward unchanged; V3's only addition is the
+// per-entry chunk metadata blob (heading breadcrumb, source title,
+// snippet, etc.) so query results can be returned without an extra
+// event-log read.
 
 const MAGIC = 'SIDETRACK_RECALL_INDEX';
-const VERSION = 2;
+const VERSION = 3;
+const CHUNK_SCHEMA_VERSION = 1;
 const DIM = 384;
 const DEFAULT_REPLICA = 'local';
-const SCHEMA_CAPABILITIES: readonly string[] = ['tombstones', 'replica-id', 'lamport-clock'];
+const SCHEMA_CAPABILITIES: readonly string[] = [
+  'tombstones',
+  'replica-id',
+  'lamport-clock',
+  'chunk-metadata',
+];
 
 export interface IndexFile {
   readonly modelId: string;
+  // V3: pinned model revision so a HF revision change marks the
+  // index stale. Optional in the type for forward-compat with future
+  // header bumps that might restructure model identity.
+  readonly modelRevision?: string;
+  readonly chunkSchemaVersion?: number;
   readonly items: readonly IndexEntry[];
   // Echoed from the on-disk header so callers (the lifecycle, tests)
   // can detect schema-capability changes without re-reading the file.
@@ -76,13 +88,16 @@ export const readIndex = async (path: string): Promise<IndexFile | null> => {
       readonly dim?: unknown;
       readonly count?: unknown;
       readonly modelId?: unknown;
+      readonly modelRevision?: unknown;
+      readonly chunkSchemaVersion?: unknown;
       readonly schemaCapabilities?: unknown;
     };
     cursor.offset += headerLength;
-    // V1 files come back as null so the lifecycle's stale-check can
-    // trigger an auto-rebuild into the V2 format. We deliberately do
-    // not attempt a backward-compat read of V1 — the rebuild path is
-    // cheap, deterministic, and produces a cleaner CRDT-ready file.
+    // V1 / V2 files come back as null so the lifecycle's stale-check
+    // triggers an auto-rebuild into the V3 format. We deliberately
+    // do not attempt a backward-compat read of older versions — the
+    // rebuild path is cheap, deterministic, and produces a cleaner
+    // chunk-metadata-aware file.
     if (
       header.magic !== MAGIC ||
       header.version !== VERSION ||
@@ -102,6 +117,15 @@ export const readIndex = async (path: string): Promise<IndexFile | null> => {
       cursor.offset += 4;
       const tombstoned = buffer.readUInt8(cursor.offset) === 1;
       cursor.offset += 1;
+      const metadataRaw = readString(buffer, cursor);
+      let metadata: ChunkMetadata | undefined;
+      if (metadataRaw.length > 0) {
+        try {
+          metadata = JSON.parse(metadataRaw) as ChunkMetadata;
+        } catch {
+          metadata = undefined;
+        }
+      }
       const embedding = new Float32Array(DIM);
       for (let dim = 0; dim < DIM; dim += 1) {
         embedding[dim] = buffer.readFloatLE(cursor.offset);
@@ -115,12 +139,23 @@ export const readIndex = async (path: string): Promise<IndexFile | null> => {
         replicaId: replicaIdRaw.length > 0 ? replicaIdRaw : DEFAULT_REPLICA,
         lamport,
         tombstoned,
+        ...(metadata === undefined ? {} : { metadata }),
       });
     }
     const capabilities = Array.isArray(header.schemaCapabilities)
       ? header.schemaCapabilities.filter((v): v is string => typeof v === 'string')
       : SCHEMA_CAPABILITIES;
-    return { modelId: header.modelId, items, schemaCapabilities: capabilities };
+    return {
+      modelId: header.modelId,
+      ...(typeof header.modelRevision === 'string'
+        ? { modelRevision: header.modelRevision }
+        : {}),
+      ...(typeof header.chunkSchemaVersion === 'number'
+        ? { chunkSchemaVersion: header.chunkSchemaVersion }
+        : {}),
+      items,
+      schemaCapabilities: capabilities,
+    };
   } catch {
     return null;
   }
@@ -149,10 +184,29 @@ const sortEntriesCanonically = (items: readonly IndexEntry[]): IndexEntry[] => {
   });
 };
 
+export interface WriteIndexOptions {
+  readonly modelRevision?: string;
+}
+
+// Stable JSON encoding for chunk metadata so byte-equal output holds
+// across rebuilds. Keys are sorted; arrays preserve order.
+const stableJsonStringify = (value: unknown): string => {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableJsonStringify).join(',')}]`;
+  const keys = Object.keys(value as Record<string, unknown>).sort();
+  return `{${keys
+    .map((k) => `${JSON.stringify(k)}:${stableJsonStringify((value as Record<string, unknown>)[k])}`)
+    .join(',')}}`;
+};
+
+const encodeMetadata = (metadata: ChunkMetadata | undefined): Buffer =>
+  encodeString(metadata === undefined ? '' : stableJsonStringify(metadata));
+
 export const writeIndex = async (
   path: string,
   items: readonly IndexEntry[],
   modelId: string,
+  options: WriteIndexOptions = {},
 ): Promise<void> => {
   const sorted = sortEntriesCanonically(items);
   const headerBytes = Buffer.from(
@@ -162,6 +216,8 @@ export const writeIndex = async (
       dim: DIM,
       count: sorted.length,
       modelId,
+      ...(options.modelRevision === undefined ? {} : { modelRevision: options.modelRevision }),
+      chunkSchemaVersion: CHUNK_SCHEMA_VERSION,
       schemaCapabilities: SCHEMA_CAPABILITIES,
     }),
     'utf8',
@@ -185,6 +241,7 @@ export const writeIndex = async (
       replicaIdBytes,
       lamportBytes,
       tombstoneByte,
+      encodeMetadata(item.metadata),
       embedding,
     ]);
   });
@@ -198,8 +255,9 @@ export const appendEntry = async (
   path: string,
   entry: IndexEntry,
   modelId: string,
+  options: WriteIndexOptions = {},
 ): Promise<void> => {
-  await upsertEntries(path, [entry], modelId);
+  await upsertEntries(path, [entry], modelId, options);
 };
 
 // CRDT-aware merge: for any (id, replicaId) pair, the entry with the
@@ -219,6 +277,7 @@ export const upsertEntries = async (
   path: string,
   entries: readonly IndexEntry[],
   modelId: string,
+  options: WriteIndexOptions = {},
 ): Promise<{ readonly added: number; readonly replaced: number }> => {
   const existing = await readIndex(path);
   // Bucket by (id, replicaId) so a write from another replica with
@@ -255,8 +314,83 @@ export const upsertEntries = async (
     }
     byKey.set(key, prior === undefined ? stamped : winnerOf(prior, stamped));
   }
-  await writeIndex(path, [...byKey.values()], modelId);
+  // Preserve the existing modelRevision unless the caller overrides
+  // it, so an incremental upsert doesn't accidentally clear the
+  // revision pin from the header.
+  const revision =
+    options.modelRevision ?? existing?.modelRevision ?? undefined;
+  await writeIndex(
+    path,
+    [...byKey.values()],
+    modelId,
+    revision === undefined ? {} : { modelRevision: revision },
+  );
   return { added, replaced };
+};
+
+// Sync Contract v1 / Class E — source-scoped replace primitive.
+//
+// Replaces every index entry tagged with the given `sourceUnitId`
+// (regardless of whether it belongs to the named extraction
+// revision) with the caller's `entries` set. Atomic via the same
+// .tmp + rename pattern as writeIndex. Unrelated source units are
+// untouched — that's the "no full rebuild" path for ordinary
+// extractor upgrades.
+//
+// Recall materializer's reaction to "extraction store reports
+// latestExtractionRevision != indexedExtractionRevision for sourceUnitId X":
+//   1. Read active extraction revision content.
+//   2. Run chunker.
+//   3. Build IndexEntry[] with metadata.sourceUnitId = X +
+//      metadata.extractionRevisionId = newRevisionId.
+//   4. replaceEntriesForSourceUnit(path, X, newRevisionId, entries).
+//
+// Returns counts so health surfaces can report progress + the test
+// suite can assert "old chunks gone, new chunks in." A missing
+// index file means the index is fresh; we just write entries.
+export const replaceEntriesForSourceUnit = async (
+  path: string,
+  input: {
+    readonly sourceUnitId: string;
+    readonly extractionRevisionId: string;
+    readonly entries: readonly IndexEntry[];
+  },
+  modelId: string,
+  options: WriteIndexOptions = {},
+): Promise<{ readonly removed: number; readonly inserted: number }> => {
+  const existing = await readIndex(path);
+  const priorItems = existing?.items ?? [];
+  // Drop every prior entry tagged with this sourceUnitId — regardless
+  // of the prior extraction revision. That's the contract: the caller
+  // declares "this revision is now active for this source unit" and
+  // the index converges to that statement.
+  const survived = priorItems.filter(
+    (item) => item.metadata?.sourceUnitId !== input.sourceUnitId,
+  );
+  const removed = priorItems.length - survived.length;
+  // Tag the incoming entries with the revision id so a future replace
+  // can identify them. Caller can populate the rest of the metadata
+  // (text, headingPath, …); we only enforce the two identity fields.
+  const tagged: IndexEntry[] = input.entries.map((entry) => ({
+    ...entry,
+    metadata:
+      entry.metadata === undefined
+        ? undefined
+        : {
+            ...entry.metadata,
+            sourceUnitId: input.sourceUnitId,
+            extractionRevisionId: input.extractionRevisionId,
+          },
+  })) as IndexEntry[];
+  const next = [...survived, ...tagged];
+  const revision = options.modelRevision ?? existing?.modelRevision ?? undefined;
+  await writeIndex(
+    path,
+    next,
+    modelId,
+    revision === undefined ? {} : { modelRevision: revision },
+  );
+  return { removed, inserted: tagged.length };
 };
 
 export const gcEntries = async (
@@ -268,7 +402,12 @@ export const gcEntries = async (
     return { removed: 0 };
   }
   const kept = existing.items.filter((item) => validIds.has(item.id));
-  await writeIndex(path, kept, existing.modelId);
+  await writeIndex(
+    path,
+    kept,
+    existing.modelId,
+    existing.modelRevision === undefined ? {} : { modelRevision: existing.modelRevision },
+  );
   return { removed: existing.items.length - kept.length };
 };
 
@@ -300,11 +439,17 @@ export const tombstoneByThread = async (
     nextLamport += 1;
     return stamped;
   });
-  await writeIndex(path, updated, existing.modelId);
+  await writeIndex(
+    path,
+    updated,
+    existing.modelId,
+    existing.modelRevision === undefined ? {} : { modelRevision: existing.modelRevision },
+  );
   return { tombstoned: count };
 };
 
 export const INDEX_DIM = DIM;
 export const INDEX_VERSION = VERSION;
+export const INDEX_CHUNK_SCHEMA_VERSION = CHUNK_SCHEMA_VERSION;
 export const INDEX_SCHEMA_CAPABILITIES = SCHEMA_CAPABILITIES;
 export const INDEX_DEFAULT_REPLICA = DEFAULT_REPLICA;

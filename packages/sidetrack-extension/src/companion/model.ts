@@ -251,6 +251,20 @@ export interface CompanionStatus {
   readonly companion: 'running';
   readonly vault: 'connected' | 'unreachable';
   readonly requestId: string;
+  // Live relay-transport state (only present when the companion
+  // was started with --sync-relay/-local). Drives the side panel's
+  // relay-disconnected banner separate from companion-disconnected.
+  readonly sync?: {
+    readonly relay: {
+      readonly url: string;
+      readonly mode: 'local' | 'remote';
+      readonly connected?: boolean;
+      readonly lastConnectedAtMs?: number;
+      readonly lastDisconnectedAtMs?: number;
+      readonly consecutiveFailures?: number;
+      readonly pendingPublishes?: number;
+    };
+  };
 }
 
 export interface MutationResult {

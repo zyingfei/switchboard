@@ -1,5 +1,6 @@
 export type RecallActivityKind =
   | 'incremental-index'
+  | 'ingest-failed'
   | 'rebuild-started'
   | 'rebuild-finished'
   | 'rebuild-failed'
@@ -37,6 +38,7 @@ export interface RecallActivityTracker {
   readonly recordRebuildStarted: (reason: 'startup' | 'manual' | 'reconnect' | 'drift') => void;
   readonly recordRebuildFinished: (count: number) => void;
   readonly recordRebuildFailed: (error: string) => void;
+  readonly recordIngestFailed: (error: string) => void;
   readonly recordQuery: (input: {
     readonly queryLength: number;
     readonly resultCount: number;
@@ -105,6 +107,17 @@ export const createRecallActivityTracker = (
     },
     recordRebuildFailed(error) {
       push({ kind: 'rebuild-failed', error });
+    },
+    recordIngestFailed(error) {
+      // Capture-time projection failed (most often the offline +
+      // empty-cache path triggering RecallModelMissingError). The
+      // event is durably appended either way; the operator just
+      // needs visibility that the cache is stale and a manual
+      // `recall reingest` will be needed once the model is
+      // available. Pushed onto `recent` rather than promoted to a
+      // dedicated lastIngestError field — health consumers should
+      // already be inspecting `recent` for diagnostic context.
+      push({ kind: 'ingest-failed', error });
     },
     recordQuery(input) {
       lastRecallQueryAt = now().toISOString();

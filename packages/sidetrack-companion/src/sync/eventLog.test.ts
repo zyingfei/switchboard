@@ -119,6 +119,45 @@ describe('event log', () => {
     expect(accepted.deps).toEqual({});
   });
 
+  it('F11 — no explicit baseVector → deps default to the union of prior events for the same aggregate', async () => {
+    // Server-side handlers (POST /v1/threads, POST /v1/workstreams,
+    // …) used to pass `baseVector: {}` on every emit. That made
+    // every register write causally concurrent with every prior
+    // write to the same record — e.g. the user moved a thread, the
+    // event was emitted, but the projection had N candidates with
+    // the move buried among reverts and the receiver picked the
+    // wrong one. Defaulting an unset baseVector to the aggregate's
+    // prior frontier makes a sequential write actually dominate.
+    const log = createEventLog(vaultRoot, replica);
+    const first = await log.appendClient({
+      clientEventId: 'mv-1',
+      aggregateId: 'thread-mv',
+      type: 'thread.upserted',
+      payload: { bac_id: 'thread-mv', primaryWorkstreamId: 'ws-A' },
+      baseVector: {},
+    });
+    // No baseVector on the next append — should auto-resolve to
+    // {<replica>: <first.dot.seq>} so the second event causally
+    // dominates the first.
+    const second = await log.appendClient({
+      clientEventId: 'mv-2',
+      aggregateId: 'thread-mv',
+      type: 'thread.upserted',
+      payload: { bac_id: 'thread-mv', primaryWorkstreamId: 'ws-B' },
+    });
+    expect(second.deps[first.dot.replicaId]).toBe(first.dot.seq);
+    // Events for OTHER aggregates don't leak into the deps —
+    // a brand-new aggregate's first emit should still have empty
+    // deps.
+    const otherFirst = await log.appendClient({
+      clientEventId: 'other-1',
+      aggregateId: 'thread-other',
+      type: 'thread.upserted',
+      payload: { bac_id: 'thread-other' },
+    });
+    expect(otherFirst.deps).toEqual({});
+  });
+
   it('resolves clientDeps within the same batch into deps', async () => {
     const log = createEventLog(vaultRoot, replica);
     const first = await log.appendClient({

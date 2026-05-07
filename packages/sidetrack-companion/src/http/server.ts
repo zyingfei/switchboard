@@ -16,11 +16,12 @@ import { pickInstaller, type Installer, type InstallOptions } from '../install/i
 import { exportSettings } from '../portability/exportBundle.js';
 import { importSettings } from '../portability/importBundle.js';
 import type { RecallActivityTracker } from '../recall/activity.js';
-import { embed, MODEL_ID } from '../recall/embedder.js';
+import { embed, MODEL_ID, RecallModelMissingError } from '../recall/embedder.js';
 import { CAPTURE_RECORDED } from '../recall/events.js';
+import { getModelCacheStatus } from '../recall/modelCache.js';
 import { THREAD_ARCHIVED, THREAD_UNARCHIVED, THREAD_UPSERTED } from '../threads/events.js';
 import { projectThread } from '../threads/projection.js';
-import { WORKSTREAM_UPSERTED } from '../workstreams/events.js';
+import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../workstreams/events.js';
 import { projectWorkstream } from '../workstreams/projection.js';
 import { QUEUE_CREATED } from '../queue/events.js';
 import { projectQueueItem } from '../queue/projection.js';
@@ -39,7 +40,12 @@ import {
   tombstoneByThread as tombstoneByThreadRaw,
 } from '../recall/indexFile.js';
 import type { RecallLifecycle } from '../recall/lifecycle.js';
-import { rank } from '../recall/ranker.js';
+import {
+  buildLexicalIndex,
+  rank,
+  rankHybrid,
+  type HybridLexicalIndex,
+} from '../recall/ranker.js';
 import { rebuildFromEventLog } from '../recall/rebuild.js';
 import type { BucketRegistry } from '../routing/registry.js';
 import { redact } from '../safety/redaction.js';
@@ -48,7 +54,7 @@ import { buildSignals, type BuildSignalsWorkstream } from '../suggestions/buildS
 import { scoreSuggestions } from '../suggestions/score.js';
 import type { EventLog } from '../sync/eventLog.js';
 import type { ProjectionChangeFeed } from '../sync/projectionChanges.js';
-import type { TargetRef } from '../sync/causal.js';
+import { vectorFromEvents, type TargetRef, type VersionVector } from '../sync/causal.js';
 import type { ReplicaContext } from '../sync/replicaId.js';
 
 // Strip undefined keys produced by zod's `optional()` so the caller's
@@ -69,22 +75,97 @@ const compactTargetRef = (raw: Record<string, unknown> | undefined): TargetRef |
 const syncSummaryDeps = (
   replica: ReplicaContext | undefined,
   sync: CompanionHttpConfig['sync'],
+  syncMaterializerHealth?: CompanionHttpConfig['syncMaterializerHealth'],
 ): {
   syncSummary?: () => {
     replicaId: string;
     seq: number;
-    relay?: { mode: 'local' | 'remote'; url: string };
+    relay?: {
+      readonly mode: 'local' | 'remote';
+      readonly url: string;
+      readonly connected?: boolean;
+      readonly lastConnectedAtMs?: number;
+      readonly lastDisconnectedAtMs?: number;
+      readonly consecutiveFailures?: number;
+      readonly pendingPublishes?: number;
+    };
+    materializers?: Record<
+      string,
+      {
+        readonly status: 'healthy' | 'degraded' | 'failed';
+        readonly lastSuccessAt: string | null;
+        readonly lastError: string | null;
+        readonly pending: boolean;
+      }
+    >;
   };
 } =>
   replica === undefined
     ? {}
     : {
-        syncSummary: () => ({
-          replicaId: replica.replicaId,
-          seq: replica.peekSeq(),
-          ...(sync?.relay === undefined ? {} : { relay: sync.relay }),
-        }),
+        syncSummary: () => {
+          // Splice live transport status into the relay block so
+          // the side panel can render relay_disconnected without
+          // hitting a separate endpoint. Only present when both
+          // (a) relay is configured AND (b) the runtime exposed
+          // a getRelayStatus closure (production wiring does;
+          // tests that pass --sync-relay-local without a live
+          // transport may not).
+          const relayBase = sync?.relay;
+          const materializers = syncMaterializerHealth?.();
+          const materializersBlock =
+            materializers === undefined || Object.keys(materializers).length === 0
+              ? {}
+              : { materializers };
+          if (relayBase === undefined) {
+            return {
+              replicaId: replica.replicaId,
+              seq: replica.peekSeq(),
+              ...materializersBlock,
+            };
+          }
+          const live = sync?.getRelayStatus?.() ?? null;
+          return {
+            replicaId: replica.replicaId,
+            seq: replica.peekSeq(),
+            relay: {
+              ...relayBase,
+              ...(live === null
+                ? {}
+                : {
+                    connected: live.connected,
+                    consecutiveFailures: live.consecutiveFailures,
+                    pendingPublishes: live.pendingPublishes,
+                    ...(live.lastConnectedAtMs === undefined
+                      ? {}
+                      : { lastConnectedAtMs: live.lastConnectedAtMs }),
+                    ...(live.lastDisconnectedAtMs === undefined
+                      ? {}
+                      : { lastDisconnectedAtMs: live.lastDisconnectedAtMs }),
+                  }),
+            },
+            ...materializersBlock,
+          };
+        },
       };
+// Stamps an outgoing event's baseVector to cover every prior event
+// for the same aggregate. Without this every emit lands with
+// baseVector:{} → every register/OR-Set candidate becomes
+// causally concurrent with every prior write, mergeRegister
+// returns `conflict` with N candidates, and the receiver picks
+// the wrong one. This is the bug F11 closes.
+//
+// The vector is *only* over events that actually exist on this
+// replica's merged log. That's correct: causal ordering is "what
+// have I observed?" and all the local replica has observed is its
+// merged log. For peer-imported events the deps were already on
+// the wire.
+const baseVectorForAggregate = async (
+  eventLog: EventLog,
+  aggregateId: string,
+): Promise<VersionVector> =>
+  vectorFromEvents(await eventLog.readByAggregate(aggregateId));
+
 import { isReviewDraftEvent, projectReviewDraft } from '../review/projection.js';
 import {
   deleteReviewDraft,
@@ -158,6 +239,19 @@ export interface CompanionHttpConfig {
       readonly mode: 'local' | 'remote';
       readonly url: string;
     };
+    // Per-request status getter exposing the relay transport's
+    // current connection state. Health reads this so the side
+    // panel can distinguish "companion up, peer sync paused"
+    // from "companion up, sync healthy" — the user-perceptible
+    // signal for T6.7.b. Returns null when the runtime has no
+    // outbound transport wired (no --sync-relay/--sync-relay-local).
+    readonly getRelayStatus?: () => {
+      readonly connected: boolean;
+      readonly lastConnectedAtMs?: number;
+      readonly lastDisconnectedAtMs?: number;
+      readonly consecutiveFailures: number;
+      readonly pendingPublishes: number;
+    } | null;
   };
   readonly updateChecker?: () => Promise<UpdateAdvisory>;
   readonly idempotencyStore?: IdempotencyStore;
@@ -187,6 +281,19 @@ export interface CompanionHttpConfig {
   // Per-replica event log used by the review-draft (and future)
   // CRDT projection routes. When unset those routes return 503.
   readonly eventLog?: EventLog;
+  // Sync Contract v1: per-materializer health source. /v1/system/health
+  // surfaces this under `sync.materializers` so the side panel +
+  // operator can see when a materializer is degraded or failed even
+  // though the event log appears converged. Gate L1-G9.
+  readonly syncMaterializerHealth?: () => Record<
+    string,
+    {
+      readonly status: 'healthy' | 'degraded' | 'failed';
+      readonly lastSuccessAt: string | null;
+      readonly lastError: string | null;
+      readonly pending: boolean;
+    }
+  >;
   // Local monotonic projection-change feed. Browsers resume polling
   // with a numeric `sinceSeq` cursor; the counter never moves
   // backward and is independent of any host's wall clock.
@@ -433,6 +540,19 @@ const buildServiceInstallOptions = (context: CompanionHttpConfig): InstallOption
 
 const recallIndexPath = (vaultRoot: string): string =>
   join(vaultRoot, '_BAC', 'recall', 'index.bin');
+
+// Lexical-index cache for /v1/recall/query. Building the MiniSearch
+// index over every chunk on each request is wasteful — it only
+// changes when the on-disk index file changes. Keyed by index path
+// + mtime; a write through upsertEntries / rebuildFromEventLog
+// updates the file mtime and invalidates the cache on the next
+// query.
+interface LexicalCacheEntry {
+  readonly mtimeMs: number;
+  readonly entryCount: number;
+  readonly index: HybridLexicalIndex;
+}
+const lexicalIndexCache = new Map<string, LexicalCacheEntry>();
 
 const readWorkstreamThreadIds = async (
   vaultRoot: string,
@@ -862,6 +982,33 @@ const routes: readonly RouteDefinition[] = [
           clearTimeout(timer);
         }
       }
+      // Live relay status for the side panel banner. Only present
+      // when the companion was started with --sync-relay/-local
+      // AND the runtime exposed a getRelayStatus closure. Routed
+      // through /v1/status (not /v1/system/health) because the
+      // extension polls /v1/status on every reachability check;
+      // adding it there means the relay-down banner can flip the
+      // moment the WS dies, with no extra HTTP round-trip.
+      const relayLive = context.sync?.getRelayStatus?.() ?? null;
+      const relayBlock =
+        context.sync?.relay === undefined
+          ? undefined
+          : {
+              ...context.sync.relay,
+              ...(relayLive === null
+                ? {}
+                : {
+                    connected: relayLive.connected,
+                    consecutiveFailures: relayLive.consecutiveFailures,
+                    pendingPublishes: relayLive.pendingPublishes,
+                    ...(relayLive.lastConnectedAtMs === undefined
+                      ? {}
+                      : { lastConnectedAtMs: relayLive.lastConnectedAtMs }),
+                    ...(relayLive.lastDisconnectedAtMs === undefined
+                      ? {}
+                      : { lastDisconnectedAtMs: relayLive.lastDisconnectedAtMs }),
+                  }),
+            };
       return [
         200,
         {
@@ -884,6 +1031,7 @@ const routes: readonly RouteDefinition[] = [
                     ...(mcpHealth === undefined ? {} : { health: mcpHealth }),
                   },
                 }),
+            ...(relayBlock === undefined ? {} : { sync: { relay: relayBlock } }),
             requestId,
           },
         },
@@ -986,10 +1134,11 @@ const routes: readonly RouteDefinition[] = [
             vaultSizeBytes: () => directorySize(join(vaultRoot, '_BAC')).catch(() => null),
             captureSummary: () => captureHealthSummary(vaultRoot),
             recallSummary: async () => {
-              const [index, info, lifecycleReport] = await Promise.all([
+              const [index, info, lifecycleReport, modelStatus] = await Promise.all([
                 readIndex(indexPath),
                 stat(indexPath).catch(() => undefined),
                 context.recallLifecycle?.report() ?? Promise.resolve(undefined),
+                getModelCacheStatus().catch(() => undefined),
               ]);
               const indexExists = index !== null;
               return {
@@ -1018,13 +1167,25 @@ const routes: readonly RouteDefinition[] = [
                 ...(context.recallActivity === undefined
                   ? {}
                   : { activity: context.recallActivity.report() }),
+                ...(modelStatus === undefined
+                  ? {}
+                  : {
+                      model: {
+                        id: modelStatus.modelId,
+                        revision: modelStatus.revision,
+                        cacheDir: modelStatus.cacheDir,
+                        present: modelStatus.present,
+                        verified: modelStatus.verified,
+                        offline: modelStatus.offline,
+                      },
+                    }),
               };
             },
             serviceStatus: async () => {
               const status = await (context.serviceInstaller ?? pickInstaller()).status();
               return { installed: status.installed, running: status.running };
             },
-            ...syncSummaryDeps(context.replica, context.sync),
+            ...syncSummaryDeps(context.replica, context.sync, context.syncMaterializerHealth),
           }),
         },
       ];
@@ -1136,7 +1297,7 @@ const routes: readonly RouteDefinition[] = [
           const result = await writer.writeDispatchEvent(dispatchEvent, requestId);
           if (context.eventLog !== undefined) {
             await context.eventLog
-              .appendClient({
+              .appendServerObserved({
                 clientEventId: idempotencyKey,
                 aggregateId: dispatchEvent.bac_id,
                 type: DISPATCH_RECORDED,
@@ -1149,8 +1310,7 @@ const routes: readonly RouteDefinition[] = [
                   createdAt: dispatchEvent.createdAt,
                   body: dispatchEvent.body,
                 },
-                baseVector: {},
-              })
+                  })
               .catch(() => undefined);
           }
           return [
@@ -1218,12 +1378,11 @@ const routes: readonly RouteDefinition[] = [
       );
       if (context.eventLog !== undefined) {
         await context.eventLog
-          .appendClient({
+          .appendServerObserved({
             clientEventId: requestId,
             aggregateId: match.bacId,
             type: DISPATCH_LINKED,
             payload: { dispatchId: match.bacId, threadId: body.threadId },
-            baseVector: {},
           })
           .catch(() => undefined);
       }
@@ -1591,7 +1750,10 @@ const routes: readonly RouteDefinition[] = [
         const accepted = [];
         for (const incoming of input.events) {
           const target = compactTargetRef(incoming.target);
-          const event = await eventLog.appendClient({
+          // Browser-driven: the editor's `baseVector` is what they
+          // observed. Empty `{}` is legal — means the editor saw
+          // no prior events. Companion does NOT replace it.
+          const event = await eventLog.appendClientObserved({
             clientEventId: incoming.clientEventId,
             aggregateId: threadId,
             type: incoming.type,
@@ -1653,18 +1815,16 @@ const routes: readonly RouteDefinition[] = [
         await deleteReviewDraft(vaultRoot, threadId);
         return [204, undefined];
       }
-      // Read the current projection so the discard event observes
-      // every prior event for this thread. baseVector === current
-      // projection's vector.
-      const priorEvents = await eventLog.readByAggregate(threadId);
-      const priorReviewEvents = priorEvents.filter((event) => isReviewDraftEvent(event));
-      const priorProjection = projectReviewDraft(threadId, '', priorReviewEvents);
-      await eventLog.appendClient({
+      // Invariant C: omit baseVector. The eventLog auto-resolves
+      // deps from the aggregate's prior events, which equals the
+      // current review-draft projection's vector — so the discard
+      // event still causally dominates every prior review-draft
+      // event for this thread.
+      await eventLog.appendServerObserved({
         clientEventId: requestId,
         aggregateId: threadId,
         type: 'review-draft.discarded',
         payload: { reason: 'deleted-via-http' },
-        baseVector: priorProjection.vector,
       });
       // Recompute and persist the new projection (collapsed to
       // discarded). If the projection function returns null we
@@ -1844,7 +2004,7 @@ const routes: readonly RouteDefinition[] = [
           });
           if (context.eventLog !== undefined) {
             await context.eventLog
-              .appendClient({
+              .appendServerObserved({
                 clientEventId: `${idempotencyKey}.term`,
                 aggregateId: created.bac_id,
                 type: ANNOTATION_CREATED,
@@ -1855,8 +2015,7 @@ const routes: readonly RouteDefinition[] = [
                   note: input.note,
                   pageTitle,
                 },
-                baseVector: {},
-              })
+                  })
               .catch(() => undefined);
           }
           // totalForThread/totalForUrl: total non-deleted
@@ -1881,7 +2040,7 @@ const routes: readonly RouteDefinition[] = [
         const result = await writeAnnotation(vaultRoot, input);
         if (context.eventLog !== undefined) {
           await context.eventLog
-            .appendClient({
+            .appendServerObserved({
               clientEventId: idempotencyKey,
               aggregateId: result.bac_id,
               type: ANNOTATION_CREATED,
@@ -1892,8 +2051,7 @@ const routes: readonly RouteDefinition[] = [
                 note: input.note,
                 pageTitle: input.pageTitle,
               },
-              baseVector: {},
-            })
+              })
             .catch(() => undefined);
         }
         return [201, { data: result }];
@@ -1933,12 +2091,11 @@ const routes: readonly RouteDefinition[] = [
       const updated = await updateAnnotation(requireVaultRoot(context), match.annotationId, input);
       if (context.eventLog !== undefined && typeof input.note === 'string') {
         await context.eventLog
-          .appendClient({
+          .appendServerObserved({
             clientEventId: requestId,
             aggregateId: match.annotationId,
             type: ANNOTATION_NOTE_SET,
             payload: { bac_id: match.annotationId, note: input.note },
-            baseVector: {},
           })
           .catch(() => undefined);
       }
@@ -1956,12 +2113,11 @@ const routes: readonly RouteDefinition[] = [
       const result = await softDeleteAnnotation(requireVaultRoot(context), match.annotationId);
       if (context.eventLog !== undefined && context.replica !== undefined) {
         await context.eventLog
-          .appendClient({
+          .appendServerObserved({
             clientEventId: `annotation-delete:${context.replica.replicaId}:${match.annotationId}:${requestId}`,
             aggregateId: match.annotationId,
             type: ANNOTATION_DELETED,
             payload: { bac_id: match.annotationId },
-            baseVector: {},
           })
           .catch(() => undefined);
       }
@@ -1988,6 +2144,72 @@ const routes: readonly RouteDefinition[] = [
           event.type === ANNOTATION_DELETED,
       );
       return [200, { data: projectAnnotations(annotationEvents) }];
+    },
+  },
+  {
+    // Per-annotation projection. F13 — extension's SSE subscriber
+    // hits this when `_BAC/annotations/<bac_id>.json` changes.
+    method: 'GET',
+    pattern: /^\/v1\/annotations\/(?<bacId>[A-Za-z0-9_-]+)\/projection$/,
+    authRequired: true,
+    handle: async (_request, _requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing bacId path parameter.');
+      }
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const merged = await context.eventLog.readByAggregate(match.bacId);
+      const projection = projectAnnotations(merged);
+      const entry = projection.entries.find((row) => row.bac_id === match.bacId);
+      return [
+        200,
+        {
+          data: {
+            ...(entry === undefined ? {} : { entry }),
+            vector: projection.vector,
+            updatedAtMs: projection.updatedAtMs,
+          },
+        },
+      ];
+    },
+  },
+  {
+    // Per-dispatch projection. F15 — extension's SSE subscriber
+    // hits this when `_BAC/dispatches/<bac_id>.json` changes.
+    method: 'GET',
+    pattern: /^\/v1\/dispatches\/(?<bacId>[A-Za-z0-9_-]+)\/projection$/,
+    authRequired: true,
+    handle: async (_request, _requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing bacId path parameter.');
+      }
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const merged = await context.eventLog.readByAggregate(match.bacId);
+      const projection = projectDispatches(merged);
+      const entry = projection.entries.find((row) => row.bac_id === match.bacId);
+      const link = projection.links.find((row) => row.dispatchId === match.bacId);
+      return [
+        200,
+        {
+          data: {
+            ...(entry === undefined ? {} : { entry }),
+            ...(link === undefined ? {} : { link }),
+            vector: projection.vector,
+            updatedAtMs: projection.updatedAtMs,
+          },
+        },
+      ];
     },
   },
   {
@@ -2050,21 +2272,104 @@ const routes: readonly RouteDefinition[] = [
         limit: url.searchParams.get('limit') ?? undefined,
         workstreamId: url.searchParams.get('workstreamId') ?? undefined,
       });
-      const index = await readIndex(recallIndexPath(vaultRoot));
+      const indexFilePath = recallIndexPath(vaultRoot);
+      const index = await readIndex(indexFilePath);
       if (index === null) {
         return [200, { data: [] }];
       }
-      const [queryEmbedding] = await embed([query.q]);
+      // Short-circuit when the index is empty. The lifecycle's first
+      // background rebuild creates an empty index file on a fresh
+      // vault, so `index !== null` doesn't imply there's anything to
+      // search. Without this branch we'd burn an embedder load (and
+      // surface a misleading 503 RECALL_MODEL_MISSING in offline +
+      // empty-cache mode) for a query that has nothing to rank.
+      if (index.items.length === 0) {
+        return [200, { data: [] }];
+      }
+      // Embedding the query needs the local model. In offline mode
+      // with an empty cache (or any other "we can't load the model"
+      // failure path), the embedder throws RecallModelMissingError —
+      // surface that as a typed 503 so the side panel can show a
+      // distinct "model missing" affordance instead of a generic
+      // "recall failed". Capture continues to work in that state
+      // because POST /v1/events doesn't depend on the embedder.
+      let queryEmbedding: Float32Array | undefined;
+      try {
+        [queryEmbedding] = await embed([query.q]);
+      } catch (error) {
+        if (error instanceof RecallModelMissingError) {
+          return [
+            503,
+            createProblem({
+              title: 'Recall embedding model is not available',
+              status: 503,
+              code: 'RECALL_MODEL_MISSING',
+              correlationId: createRequestId(),
+              detail: error.offline
+                ? `Companion is in offline-models mode and the cache at ${error.cacheDir} does not contain ${MODEL_ID}. Run \`sidetrack-companion models ensure\` (with network access) or disable --offline-models / SIDETRACK_OFFLINE_MODELS.`
+                : `Could not load ${MODEL_ID} from ${error.cacheDir}. Run \`sidetrack-companion models ensure\` to (re)download the model.`,
+            }),
+          ];
+        }
+        throw error;
+      }
       const threadIds =
         query.workstreamId === undefined
           ? undefined
           : await readWorkstreamThreadIds(vaultRoot, query.workstreamId);
-      const ranked = rank(queryEmbedding ?? new Float32Array(384), index.items, new Date(), {
-        limit: query.limit,
-        ...(threadIds === undefined
-          ? {}
-          : { workstreamMembership: (threadId: string) => threadIds.has(threadId) }),
-      });
+      // Resolve the lexical index from cache. If the on-disk file
+      // mtime + entry count haven't changed, reuse the prior
+      // MiniSearch instance — building it from scratch on every
+      // query is wasteful for large indexes. Falls back to vector-
+      // only ranking when the index has zero entries that carry
+      // chunk metadata (V2 holdovers post-rebuild).
+      const indexStat = await stat(indexFilePath).catch(() => undefined);
+      const indexMtime = indexStat?.mtimeMs ?? 0;
+      const cached = lexicalIndexCache.get(indexFilePath);
+      const lexical: HybridLexicalIndex =
+        cached !== undefined &&
+        cached.mtimeMs === indexMtime &&
+        cached.entryCount === index.items.length
+          ? cached.index
+          : buildLexicalIndex(index.items);
+      if (cached === undefined || cached.mtimeMs !== indexMtime || cached.entryCount !== index.items.length) {
+        lexicalIndexCache.set(indexFilePath, {
+          mtimeMs: indexMtime,
+          entryCount: index.items.length,
+          index: lexical,
+        });
+      }
+      // Hybrid lexical + vector retrieval via RRF. Falls back
+      // gracefully when the index has no chunk-metadata entries
+      // (V2 holdovers): the lexical search side returns no hits,
+      // RRF degenerates to vector ranking, which is what the
+      // pre-V3 behavior already produced.
+      const hybridRanked = rankHybrid(
+        query.q,
+        queryEmbedding ?? new Float32Array(384),
+        index.items,
+        new Date(),
+        {
+          limit: query.limit,
+          lexical,
+          ...(threadIds === undefined
+            ? {}
+            : { workstreamMembership: (threadId: string) => threadIds.has(threadId) }),
+        },
+      );
+      // If hybrid returned nothing AND the index has entries, the
+      // user still expects vector-only behavior (e.g., a query that
+      // matches nothing lexically but is semantically close). Plain
+      // `rank` is the back-compat path for that case.
+      const ranked =
+        hybridRanked.length > 0
+          ? hybridRanked
+          : rank(queryEmbedding ?? new Float32Array(384), index.items, new Date(), {
+              limit: query.limit,
+              ...(threadIds === undefined
+                ? {}
+                : { workstreamMembership: (threadId: string) => threadIds.has(threadId) }),
+            });
       // Enrich each result with the thread title + canonical URL so
       // the side panel can render meaningful labels and the SW proxy
       // can dedup across stale duplicate bac_ids that point at the
@@ -2224,60 +2529,56 @@ const routes: readonly RouteDefinition[] = [
         // legacy `_BAC/events/` write above stays for back-compat
         // (older readers, the existing rebuild path); rebuild dedups
         // by bac_id when both sources hold the same capture.
-        if (context.eventLog !== undefined) {
-          await context.eventLog
-            .appendClient({
-              clientEventId: idempotencyKey,
-              aggregateId: result.bac_id,
-              type: CAPTURE_RECORDED,
-              payload: {
-                bac_id: result.bac_id,
-                ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
-                threadUrl: input.threadUrl,
-                provider: input.provider,
-                capturedAt: input.capturedAt,
-                turns: input.turns.map((turn) => ({
-                  ordinal: turn.ordinal,
-                  role: turn.role,
-                  text: turn.text,
-                  capturedAt: turn.capturedAt,
-                })),
-              },
-              baseVector: {},
-            })
-            .catch(() => undefined);
-        }
-        // Auto-index every turn so /v1/recall/query can find the
-        // capture without waiting for a manual rebuild. The lifecycle
-        // mutex serialises this against any in-flight rebuild.
-        if (context.recallLifecycle !== undefined) {
-          const threadId = result.bac_id;
-          const turns: {
-            readonly id: string;
-            readonly threadId: string;
-            readonly capturedAt: string;
-            readonly text: string;
-          }[] = [];
-          input.turns.forEach((turn) => {
-            if (turn.text.trim().length === 0) return;
-            turns.push({
-              id: `${threadId}:${String(turn.ordinal)}`,
-              threadId,
-              capturedAt: turn.capturedAt,
-              text: turn.text,
-            });
-          });
-          if (turns.length > 0) {
-            // Schedule on the lifecycle mutex but don't block the
-            // POST response — capture latency stays bounded by the
-            // vault write, not the embedder cost.
-            void context.recallLifecycle.appendCaptureTurns(turns).catch(() => {
-              // Auto-index is best-effort; if embedding fails the
-              // event log is still authoritative and a manual rebuild
-              // catches up.
-            });
-          }
-        }
+        //
+        // Carry the richer per-turn fields (markdown / formattedText /
+        // modelName) plus the thread-level metadata (title) through
+        // to the log payload so the chunker has the best possible
+        // source. Without this, the chunker would fall back to plain
+        // text — losing heading structure, lists, and code fences.
+        const eventLogAppended =
+          context.eventLog === undefined
+            ? false
+            : await context.eventLog
+                .appendServerObserved({
+                  clientEventId: idempotencyKey,
+                  aggregateId: result.bac_id,
+                  type: CAPTURE_RECORDED,
+                  payload: {
+                    bac_id: result.bac_id,
+                    ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+                    threadUrl: input.threadUrl,
+                    provider: input.provider,
+                    ...(input.title === undefined ? {} : { title: input.title }),
+                    capturedAt: input.capturedAt,
+                    turns: input.turns.map((turn) => ({
+                      ordinal: turn.ordinal,
+                      role: turn.role,
+                      text: turn.text,
+                      capturedAt: turn.capturedAt,
+                      ...(turn.markdown === undefined ? {} : { markdown: turn.markdown }),
+                      ...(turn.formattedText === undefined
+                        ? {}
+                        : { formattedText: turn.formattedText }),
+                      ...(turn.modelName === undefined ? {} : { modelName: turn.modelName }),
+                    })),
+                  },
+                      })
+                .then(() => true)
+                .catch(() => false);
+        void eventLogAppended;
+        // Recall ingest is owned by the contract runner →
+        // recallMaterializer path. `appendServerObserved` already
+        // routes the accepted event through
+        // `onLocalAccepted` → `syncContractRunner.onAcceptedEvent({
+        // origin: 'local' })`, which fires the recall materializer's
+        // onAccepted → coalesced ingest drain. Failures are recorded
+        // via the materializer's `recallActivity.recordIngestFailed`.
+        // Reviewer-flagged: do NOT also schedule
+        // `lifecycle.ingestIncremental` here — that was the pre-
+        // contract fast path and now duplicates work, weakening the
+        // single-dispatch contract. The boot-time `catchUpAll` and
+        // manual `recall reingest` cover the case where the embedder
+        // was offline at capture time.
         return [201, mutationResponse(result, requestId)];
       });
     },
@@ -2299,7 +2600,7 @@ const routes: readonly RouteDefinition[] = [
       // don't yet consume the projection.
       if (context.eventLog !== undefined) {
         await context.eventLog
-          .appendClient({
+          .appendServerObserved({
             clientEventId: requestId,
             aggregateId: result.bac_id,
             type: THREAD_UPSERTED,
@@ -2316,7 +2617,6 @@ const routes: readonly RouteDefinition[] = [
               ...(input.tags === undefined ? {} : { tags: input.tags }),
               ...(input.trackingMode === undefined ? {} : { trackingMode: input.trackingMode }),
             },
-            baseVector: {},
           })
           .catch(() => undefined);
       }
@@ -2382,12 +2682,11 @@ const routes: readonly RouteDefinition[] = [
       // the eventLog's idempotency check.
       if (context.eventLog !== undefined && context.replica !== undefined) {
         await context.eventLog
-          .appendClient({
+          .appendServerObserved({
             clientEventId: `thread-archive:${context.replica.replicaId}:${match.bacId}`,
             aggregateId: match.bacId,
             type: THREAD_ARCHIVED,
             payload: { bac_id: match.bacId },
-            baseVector: {},
           })
           .catch(() => undefined);
       }
@@ -2426,12 +2725,11 @@ const routes: readonly RouteDefinition[] = [
       const result = await context.vaultWriter.unarchiveThread(match.bacId, requestId);
       if (context.eventLog !== undefined && context.replica !== undefined) {
         await context.eventLog
-          .appendClient({
+          .appendServerObserved({
             clientEventId: `thread-unarchive:${context.replica.replicaId}:${match.bacId}:${requestId}`,
             aggregateId: match.bacId,
             type: THREAD_UNARCHIVED,
             payload: { bac_id: match.bacId },
-            baseVector: {},
           })
           .catch(() => undefined);
       }
@@ -2451,7 +2749,7 @@ const routes: readonly RouteDefinition[] = [
       const result = await context.vaultWriter.createWorkstream(input, requestId);
       if (context.eventLog !== undefined) {
         await context.eventLog
-          .appendClient({
+          .appendServerObserved({
             clientEventId: requestId,
             aggregateId: result.bac_id,
             type: WORKSTREAM_UPSERTED,
@@ -2468,7 +2766,6 @@ const routes: readonly RouteDefinition[] = [
               ...(input.checklist === undefined ? {} : { checklist: input.checklist }),
               ...(input.description === undefined ? {} : { description: input.description }),
             },
-            baseVector: {},
           })
           .catch(() => undefined);
       }
@@ -2602,7 +2899,7 @@ const routes: readonly RouteDefinition[] = [
           );
           const record = JSON.parse(raw) as Record<string, unknown>;
           if (typeof record['bac_id'] === 'string' && typeof record['title'] === 'string') {
-            await context.eventLog.appendClient({
+            await context.eventLog.appendServerObserved({
               clientEventId: requestId,
               aggregateId: match.workstreamId,
               type: WORKSTREAM_UPSERTED,
@@ -2616,8 +2913,7 @@ const routes: readonly RouteDefinition[] = [
                   ? { description: record['description'] }
                   : {}),
               },
-              baseVector: {},
-            });
+              });
           }
         } catch {
           // Best effort — the vault write succeeded regardless.
@@ -2636,6 +2932,22 @@ const routes: readonly RouteDefinition[] = [
       }
       try {
         const result = await context.vaultWriter.deleteWorkstream(match.workstreamId, requestId);
+        // F12 — emit workstream.deleted so peers learn of the
+        // deletion. Without this, the local file is removed but the
+        // event log is silent; the peer's mirror keeps the row
+        // forever and any thread the user moved to this workstream
+        // (which DID emit a thread.upserted with the new ws-id)
+        // points at a dangling reference on the peer.
+        if (context.eventLog !== undefined) {
+          await context.eventLog
+            .appendServerObserved({
+              clientEventId: requestId,
+              aggregateId: result.bac_id,
+              type: WORKSTREAM_DELETED,
+              payload: { bac_id: result.bac_id },
+            })
+            .catch(() => undefined);
+        }
         return [
           200,
           {
@@ -2688,7 +3000,7 @@ const routes: readonly RouteDefinition[] = [
         const result = await context.vaultWriter.createQueueItem(input, requestId);
         if (context.eventLog !== undefined) {
           await context.eventLog
-            .appendClient({
+            .appendServerObserved({
               clientEventId: idempotencyKey,
               aggregateId: result.bac_id,
               type: QUEUE_CREATED,
@@ -2699,8 +3011,7 @@ const routes: readonly RouteDefinition[] = [
                 ...(input.targetId === undefined ? {} : { targetId: input.targetId }),
                 ...(input.status === undefined ? {} : { status: input.status }),
               },
-              baseVector: {},
-            })
+              })
             .catch(() => undefined);
         }
         return [201, mutationResponse(result, requestId)];

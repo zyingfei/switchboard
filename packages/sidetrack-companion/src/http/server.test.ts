@@ -15,17 +15,46 @@ import { createVaultWriter } from '../vault/writer.js';
 import { createIdempotencyStore } from './idempotency.js';
 import { handleRequest, type CompanionHttpConfig } from './server.js';
 
-vi.mock('../recall/embedder.js', () => ({
-  MODEL_ID: 'test/model',
-  embed: (texts: readonly string[]) =>
-    Promise.resolve(
-      texts.map((_text, index) => {
-        const vector = new Float32Array(384);
-        vector[index % 384] = 1;
-        return vector;
-      }),
-    ),
-}));
+// Embedder mock with a swappable `nextEmbedError` so individual tests
+// can simulate the offline + empty-cache failure mode (the 503
+// RECALL_MODEL_MISSING path) without touching a real model. The
+// factory builds a stand-in for RecallModelMissingError that
+// matches the production class shape — server.ts uses `instanceof`
+// against the import from '../recall/embedder.js', which inside
+// vitest resolves through this mock so the identity matches.
+vi.mock('../recall/embedder.js', () => {
+  class RecallModelMissingError extends Error {
+    readonly code = 'RECALL_MODEL_MISSING' as const;
+    constructor(
+      message: string,
+      readonly offline: boolean,
+      readonly cacheDir: string,
+    ) {
+      super(message);
+      this.name = 'RecallModelMissingError';
+    }
+  }
+  const state: { nextEmbedError: Error | null } = { nextEmbedError: null };
+  return {
+    MODEL_ID: 'test/model',
+    RecallModelMissingError,
+    __embedderState: state,
+    embed: (texts: readonly string[]) => {
+      if (state.nextEmbedError !== null) {
+        const err = state.nextEmbedError;
+        state.nextEmbedError = null;
+        return Promise.reject(err);
+      }
+      return Promise.resolve(
+        texts.map((_text, index) => {
+          const vector = new Float32Array(384);
+          vector[index % 384] = 1;
+          return vector;
+        }),
+      );
+    },
+  };
+});
 
 const jsonFetch = async (
   context: CompanionHttpConfig,
@@ -1883,6 +1912,175 @@ describe('companion HTTP server', () => {
     expect(hygiene.body).toMatchObject({
       data: { lastIdempotencyGcAt: '2026-05-03T00:00:00.000Z' },
     });
+  });
+
+  it('GET /v1/recall/query uses hybrid lexical + vector ranking with chunk metadata', async () => {
+    // Seed two chunk-shaped entries directly so we control which one
+    // wins on lexical vs vector. The mock embedder above sets
+    // vector[i % 384] = 1 for the i-th text, so each query gets a
+    // unit vector along a different axis. Pre-built chunks all share
+    // axis-0 vectors here, making the lexical signal the
+    // distinguisher.
+    const { writeIndex } = await import('../recall/indexFile.js');
+    const { join } = await import('node:path');
+    const indexPath = join(vaultPath, '_BAC', 'recall', 'index.bin');
+    const sharedEmbedding = new Float32Array(384);
+    sharedEmbedding[0] = 1;
+    await writeIndex(
+      indexPath,
+      [
+        {
+          id: 'chunk:thread_a:0:0:111111111111',
+          threadId: 'thread_a',
+          capturedAt: '2026-05-05T01:00:00.000Z',
+          embedding: sharedEmbedding,
+          replicaId: 'local',
+          lamport: 1,
+          tombstoned: false,
+          metadata: {
+            sourceBacId: 'thread_a',
+            turnOrdinal: 0,
+            headingPath: ['Architecture'],
+            paragraphIndex: 0,
+            charStart: 0,
+            charEnd: 80,
+            textHash: 'a'.repeat(64),
+            text: 'Sidetrack uses sidetrack.threads.move to relocate threads.',
+            title: 'Architecture overview',
+          },
+        },
+        {
+          id: 'chunk:thread_b:0:0:222222222222',
+          threadId: 'thread_b',
+          capturedAt: '2026-05-05T01:00:00.000Z',
+          embedding: sharedEmbedding,
+          replicaId: 'local',
+          lamport: 1,
+          tombstoned: false,
+          metadata: {
+            sourceBacId: 'thread_b',
+            turnOrdinal: 0,
+            headingPath: ['Misc'],
+            paragraphIndex: 0,
+            charStart: 0,
+            charEnd: 60,
+            textHash: 'b'.repeat(64),
+            text: 'Unrelated commentary about CSS layout.',
+            title: 'Layout notes',
+          },
+        },
+      ],
+      'test/model',
+    );
+
+    const response = await jsonFetch(
+      context,
+      `${baseUrl}/v1/recall/query?q=${encodeURIComponent('sidetrack.threads.move')}`,
+      { headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+    expect(response.status).toBe(200);
+    const body = response.body as { readonly data: readonly { readonly id: string }[] };
+    expect(body.data.length).toBeGreaterThan(0);
+    // The verbatim-identifier chunk wins via the lexical side of
+    // the RRF fusion even though the vector signal is identical.
+    expect(body.data[0]?.id).toBe('chunk:thread_a:0:0:111111111111');
+  });
+
+  it('GET /v1/recall/query returns 503 RECALL_MODEL_MISSING when the embedder cannot load the model', async () => {
+    // Seed a non-empty index so the route reaches the embed() call
+    // (it short-circuits to data:[] when the index file is missing).
+    const { writeIndex } = await import('../recall/indexFile.js');
+    const { join } = await import('node:path');
+    const seedEmbedding = new Float32Array(384);
+    seedEmbedding[0] = 1;
+    await writeIndex(
+      join(vaultPath, '_BAC', 'recall', 'index.bin'),
+      [
+        {
+          id: 'chunk:thread_seed:0:0:333333333333',
+          threadId: 'thread_seed',
+          capturedAt: '2026-05-05T01:00:00.000Z',
+          embedding: seedEmbedding,
+          replicaId: 'local',
+          lamport: 1,
+          tombstoned: false,
+          metadata: {
+            sourceBacId: 'thread_seed',
+            turnOrdinal: 0,
+            headingPath: [],
+            paragraphIndex: 0,
+            charStart: 0,
+            charEnd: 8,
+            textHash: 'c'.repeat(64),
+            text: 'placeholder',
+            title: 'placeholder',
+          },
+        },
+      ],
+      'test/model',
+    );
+    const embedderModule = (await import('../recall/embedder.js')) as unknown as {
+      readonly RecallModelMissingError: new (
+        message: string,
+        offline: boolean,
+        cacheDir: string,
+      ) => Error;
+      readonly __embedderState: { nextEmbedError: Error | null };
+    };
+    embedderModule.__embedderState.nextEmbedError = new embedderModule.RecallModelMissingError(
+      'cache empty',
+      true,
+      '/tmp/empty-models',
+    );
+    const response = await jsonFetch(context, `${baseUrl}/v1/recall/query?q=anything`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect(response.status).toBe(503);
+    const body = response.body as {
+      readonly code?: string;
+      readonly title?: string;
+      readonly detail?: string;
+    };
+    expect(body.code).toBe('RECALL_MODEL_MISSING');
+    expect(body.detail).toContain('/tmp/empty-models');
+  });
+
+  it('GET /v1/recall/query short-circuits to data:[] for an empty index without calling the embedder', async () => {
+    // Fresh vault: lifecycle wrote an empty index file at startup,
+    // so the route does NOT take the index===null short-circuit.
+    // The behaviour we want is: when there are zero entries to rank,
+    // skip the embed() call entirely. Without that branch this same
+    // request would 503 in offline+empty-cache mode (see prior test)
+    // — which would be a misleading affordance for a brand-new vault.
+    const { writeIndex } = await import('../recall/indexFile.js');
+    const { join } = await import('node:path');
+    await writeIndex(join(vaultPath, '_BAC', 'recall', 'index.bin'), [], 'test/model');
+    const embedderModule = (await import('../recall/embedder.js')) as unknown as {
+      readonly RecallModelMissingError: new (
+        message: string,
+        offline: boolean,
+        cacheDir: string,
+      ) => Error;
+      readonly __embedderState: { nextEmbedError: Error | null };
+    };
+    // Arm the embedder with a model-missing error so the assertion
+    // would fail with 503 if the route tried to embed. The
+    // short-circuit must skip past it.
+    embedderModule.__embedderState.nextEmbedError = new embedderModule.RecallModelMissingError(
+      'cache empty',
+      true,
+      '/tmp/empty-models',
+    );
+    const response = await jsonFetch(context, `${baseUrl}/v1/recall/query?q=hello`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ data: [] });
+    // The error we armed should still be loaded for the next call —
+    // the short-circuit must not have consumed it.
+    expect(embedderModule.__embedderState.nextEmbedError).not.toBeNull();
+    // Clear it so later tests aren't affected.
+    embedderModule.__embedderState.nextEmbedError = null;
   });
 
   it('reports recall activity after incremental indexing', async () => {

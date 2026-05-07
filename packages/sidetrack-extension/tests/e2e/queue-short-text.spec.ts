@@ -38,7 +38,10 @@ const thread = {
   title: 'Queue short-text test',
   lastSeenAt: now,
   status: 'active',
-  trackingMode: 'manual',
+  // 'auto' so the autoCapture gate at background.ts:~1763
+  // doesn't silently drop the synthetic capture this test sends
+  // to verify queue auto-resolve. 'manual' is its own gate.
+  trackingMode: 'auto',
   primaryWorkstreamId: wsId,
   tags: [] as string[],
   lastTurnRole: 'assistant',

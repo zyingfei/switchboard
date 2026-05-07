@@ -12,6 +12,10 @@ import {
 // embedder to produce IndexEntry rows; multi-replica sync stamps
 // `(replicaId, lamport)` from the dot so peers' captures coexist as
 // distinct entries.
+//
+// Recall V3 enriches each input with the source-thread + per-turn
+// metadata the chunker needs to produce headingPath-aware chunks.
+// All new fields are optional so legacy callers keep compiling.
 export interface RecallProjectionInput {
   readonly id: string;
   readonly threadId: string;
@@ -23,6 +27,14 @@ export interface RecallProjectionInput {
   // The bac_id of the source capture event. Used to dedupe against
   // legacy `_BAC/events/` entries during the migration window.
   readonly sourceBacId: string;
+  readonly turnOrdinal: number;
+  readonly markdown?: string;
+  readonly formattedText?: string;
+  readonly role?: 'user' | 'assistant' | 'system' | 'unknown';
+  readonly modelName?: string;
+  readonly provider?: string;
+  readonly threadUrl?: string;
+  readonly title?: string;
 }
 
 // Walk the merged log and emit one input per surviving turn.
@@ -69,6 +81,14 @@ export const projectRecallFromLog = (
         lamport: event.dot.seq,
         tombstoned: tombstonedThreads.has(threadId),
         sourceBacId: payload.bac_id,
+        turnOrdinal: ordinal,
+        ...(turn.markdown === undefined ? {} : { markdown: turn.markdown }),
+        ...(turn.formattedText === undefined ? {} : { formattedText: turn.formattedText }),
+        ...(turn.role === undefined ? {} : { role: turn.role }),
+        ...(turn.modelName === undefined ? {} : { modelName: turn.modelName }),
+        ...(payload.provider === undefined ? {} : { provider: payload.provider }),
+        ...(payload.threadUrl === undefined ? {} : { threadUrl: payload.threadUrl }),
+        ...(payload.title === undefined ? {} : { title: payload.title }),
       });
     }
   }

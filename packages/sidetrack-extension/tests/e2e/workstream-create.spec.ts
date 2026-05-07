@@ -34,7 +34,9 @@ test.describe('workstream creation (synthetic)', () => {
       // Existing workstream renders as a row. The create form is open
       // because we entered via the "+" path (createMode=true).
       await expect(picker.getByText('Existing workstream')).toBeVisible();
-      const createInput = picker.locator('.ws-picker-create-input');
+      // The picker now renders 2 create-input slots (top + nested
+       // sub-workstream). Pick the first; both submit the same way.
+      const createInput = picker.locator('.ws-picker-create-input').first();
       await expect(createInput).toBeVisible();
 
       // Fill out + submit (Enter key submits the form).

@@ -10,6 +10,7 @@ import {
   sortAcceptedEvents,
   type TargetRef,
   type VersionVector,
+  vectorFromEvents,
 } from './causal.js';
 import type { ReplicaContext } from './replicaId.js';
 
@@ -58,26 +59,96 @@ export class ClientEventIdReuseError extends Error {
 //      that would falsely claim the editor observed peer events they
 //      never saw) plus any resolved clientDeps, and appends to disk.
 
+// Sync Contract v1 — see ~/.claude/plans/kind-prancing-river.md.
+//
+// Two named append APIs replace the historical `appendClient`:
+//
+//   appendClientObserved — browser-driven events. baseVector is
+//   REQUIRED. Empty `{}` is legal and means "the browser observed
+//   nothing." Companion never substitutes its current frontier.
+//
+//   appendServerObserved — server-driven mutations (archive, delete,
+//   recall tombstone, dispatch.linked, capture.extraction.produced
+//   from a local re-extract). System stamps deps from the
+//   aggregate's frontier. Caller asserts they ARE the latest
+//   server-observed state.
+//
+// The internal `appendClient` accepts a `baseVector?` and is the
+// shared implementation. New code must call one of the named APIs.
+
+export interface AppendInputObserved<TPayload extends Record<string, unknown> = Record<string, unknown>> {
+  readonly clientEventId: string;
+  readonly aggregateId: string;
+  readonly type: string;
+  readonly payload: TPayload;
+  // REQUIRED. May be `{}` — that's a legitimate "browser observed
+  // nothing" state. Companion does NOT replace it with the
+  // aggregate's current frontier. A stale outbox event with `{}`
+  // landing after peer events drained is accepted as concurrent;
+  // it does not dominate. (Gate L1-G7.)
+  readonly baseVector: VersionVector;
+  readonly clientDeps?: readonly string[];
+  readonly target?: TargetRef;
+  readonly hlc?: Hlc;
+}
+
+export interface AppendInputServerObserved<TPayload extends Record<string, unknown> = Record<string, unknown>> {
+  readonly clientEventId: string;
+  readonly aggregateId: string;
+  readonly type: string;
+  readonly payload: TPayload;
+  // baseVector deliberately absent. The system stamps deps from the
+  // aggregate's prior events. The caller is asserting that they ARE
+  // the latest server-observed state (no other concurrent server
+  // edits to the same aggregate). Use this for archive, delete,
+  // recall tombstone, dispatch link, etc.
+  readonly clientDeps?: readonly string[];
+  readonly target?: TargetRef;
+  readonly hlc?: Hlc;
+}
+
+/**
+ * @internal Shared backing type for the two named APIs. Test code
+ * may call `appendClient` directly (with optional baseVector) for
+ * legacy concurrency simulations; production code must use
+ * `appendClientObserved` or `appendServerObserved`.
+ */
 export interface AppendInput<TPayload extends Record<string, unknown> = Record<string, unknown>> {
   readonly clientEventId: string;
   readonly aggregateId: string;
   readonly type: string;
   readonly payload: TPayload;
-  // Optional. The companion uses `clientEvent.baseVector` directly
-  // to stamp `deps`. If absent, treated as the empty vector — which
-  // means "the user observed nothing" (rare; only for first-write
-  // bootstraps).
+  // Optional — when omitted, the system auto-resolves from the
+  // aggregate's frontier (server-observed semantic). When present,
+  // deps are stamped exactly from this vector + resolved
+  // clientDeps; never replaced.
   readonly baseVector?: VersionVector;
-  // Optional dependency on other client events that haven't been
-  // accepted yet — e.g. a comment.set that depends on a span.added
-  // batched in the same POST. The companion resolves these to dots
-  // at acceptance time and folds them into deps.
   readonly clientDeps?: readonly string[];
   readonly target?: TargetRef;
   readonly hlc?: Hlc;
 }
 
 export interface EventLog {
+  /**
+   * Browser-driven event append. baseVector REQUIRED, may be `{}`.
+   * See Sync Contract v1 / `AppendInputObserved`.
+   */
+  readonly appendClientObserved: <TPayload extends Record<string, unknown>>(
+    input: AppendInputObserved<TPayload>,
+  ) => Promise<AcceptedEvent<TPayload>>;
+  /**
+   * Server-driven event append. System stamps deps from the
+   * aggregate's prior events. See `AppendInputServerObserved`.
+   */
+  readonly appendServerObserved: <TPayload extends Record<string, unknown>>(
+    input: AppendInputServerObserved<TPayload>,
+  ) => Promise<AcceptedEvent<TPayload>>;
+  /**
+   * @internal Shared implementation behind the two named APIs.
+   * Test code may use this directly for legacy concurrency
+   * simulations. Production code must use `appendClientObserved`
+   * or `appendServerObserved`.
+   */
   readonly appendClient: <TPayload extends Record<string, unknown>>(
     input: AppendInput<TPayload>,
   ) => Promise<AcceptedEvent<TPayload>>;
@@ -346,8 +417,39 @@ export const createEventLog = (
       return { imported: true } as const;
     });
 
+  // Named APIs — production code uses these.
+  const appendClientObserved = <TPayload extends Record<string, unknown>>(
+    input: AppendInputObserved<TPayload>,
+  ): Promise<AcceptedEvent<TPayload>> =>
+    appendClient<TPayload>({
+      clientEventId: input.clientEventId,
+      aggregateId: input.aggregateId,
+      type: input.type,
+      payload: input.payload,
+      baseVector: input.baseVector,
+      ...(input.clientDeps === undefined ? {} : { clientDeps: input.clientDeps }),
+      ...(input.target === undefined ? {} : { target: input.target }),
+      ...(input.hlc === undefined ? {} : { hlc: input.hlc }),
+    });
+
+  const appendServerObserved = <TPayload extends Record<string, unknown>>(
+    input: AppendInputServerObserved<TPayload>,
+  ): Promise<AcceptedEvent<TPayload>> =>
+    appendClient<TPayload>({
+      clientEventId: input.clientEventId,
+      aggregateId: input.aggregateId,
+      type: input.type,
+      payload: input.payload,
+      // baseVector deliberately absent → auto-resolve from frontier.
+      ...(input.clientDeps === undefined ? {} : { clientDeps: input.clientDeps }),
+      ...(input.target === undefined ? {} : { target: input.target }),
+      ...(input.hlc === undefined ? {} : { hlc: input.hlc }),
+    });
+
   return {
     appendClient,
+    appendClientObserved,
+    appendServerObserved,
     readMerged,
     readReplica,
     readByAggregate,
@@ -382,7 +484,35 @@ const computeDepsFromInput = <TPayload extends Record<string, unknown>>(
   input: AppendInput<TPayload>,
   merged: readonly AcceptedEvent[],
 ): VersionVector => {
-  let deps: VersionVector = input.baseVector ?? {};
+  // Sync Contract v1: two semantics, expressed by presence of
+  // `baseVector`:
+  //
+  //   - Browser-observed (appendClientObserved): baseVector is
+  //     present (possibly `{}`). Deps stamped EXACTLY from
+  //     baseVector. Empty `{}` means "browser observed nothing"
+  //     and is a legitimate state — a stale outbox arriving after
+  //     peer events drained is accepted as concurrent (does not
+  //     dominate). The companion does NOT replace the explicit
+  //     vector with its own frontier.
+  //
+  //   - Server-observed (appendServerObserved): baseVector is
+  //     omitted. Deps stamped from the union of every prior event
+  //     for the SAME aggregate. The caller asserts they ARE the
+  //     latest server-observed state.
+  //
+  // Tests that simulate concurrent first-writes call this method
+  // (or appendClient) with `baseVector: {}` directly — that's
+  // the legitimate empty-observation case. There is no escape
+  // hatch field; empty is just a legal arg.
+  const explicit = input.baseVector;
+  let deps: VersionVector;
+  if (explicit !== undefined) {
+    deps = explicit;
+  } else {
+    deps = vectorFromEvents(
+      merged.filter((event) => event.aggregateId === input.aggregateId),
+    );
+  }
   if (input.clientDeps !== undefined && input.clientDeps.length > 0) {
     const byClientId = new Map<string, AcceptedEvent>();
     for (const event of merged) byClientId.set(event.clientEventId, event);

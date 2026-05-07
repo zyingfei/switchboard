@@ -61,7 +61,11 @@ test('queue auto-detect: a queued follow-up flips to done after the user types i
           title: 'NYC Day Plan',
           lastSeenAt: now,
           status: 'active',
-          trackingMode: 'manual',
+          // 'auto' so the autoCapture gate at background.ts:~1763
+          // forwards into storeCaptureEvent. 'manual' would
+          // silently drop, defeating the queue-flip-to-done
+          // assertion this test is here for.
+          trackingMode: 'auto',
           primaryWorkstreamId: 'bac_ws_nyc',
           tags: [],
         },

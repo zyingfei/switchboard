@@ -5,7 +5,9 @@ import { Icons } from './icons';
 export type SystemState =
   | 'capture_success'
   | 'captures_queued'
+  | 'captures_failed'
   | 'companion_disconnected'
+  | 'relay_disconnected'
   | 'vault_unreachable'
   | 'provider_broken'
   | 'screen_share_active'
@@ -35,10 +37,26 @@ const STATE_CONFIG: Record<
     icon: 'alert',
     titleFn: (detail) => 'Captures queued' + (detail !== undefined ? ` · ${detail}` : ''),
   },
+  captures_failed: {
+    tone: 'red',
+    icon: 'alert',
+    titleFn: (detail) =>
+      'Explicit captures failed after retries' + (detail !== undefined ? ` · ${detail}` : ''),
+  },
   companion_disconnected: {
     tone: 'red',
     icon: 'alert',
     titleFn: (detail) => 'Companion: disconnected' + (detail !== undefined ? ` · ${detail}` : ''),
+  },
+  relay_disconnected: {
+    // Amber, NOT red — local captures still succeed, only
+    // cross-device sync is paused. A red banner here would
+    // misrepresent severity (companion-disconnected is more
+    // severe; user can't even capture).
+    tone: 'amber',
+    icon: 'alert',
+    titleFn: (detail) =>
+      'Peer sync paused' + (detail !== undefined ? ` · ${detail}` : ' · local captures still work'),
   },
   vault_unreachable: {
     tone: 'amber',
@@ -84,30 +102,48 @@ export interface SystemBannersStackProps {
   readonly captureSuccessHost?: string;
   readonly companionActionLabel?: string;
   readonly companionStatus?: 'running' | 'slow' | 'down';
+  // Live relay connectivity. 'unconfigured' = no --sync-relay, no
+  // banner. 'up' = connected, no banner. 'down' = configured but
+  // not currently connected → relay_disconnected banner.
+  readonly relayStatus?: 'unconfigured' | 'up' | 'down';
   readonly vaultStatus?: 'connected' | 'unreachable';
   readonly providerHealth?: 'ok' | 'degraded';
   readonly providerHealthDetail?: string;
   readonly screenShareActive?: boolean;
   readonly injectionDetected?: boolean;
   readonly queuedCount?: number;
+  // Number of EXPLICIT captures that exhausted retries while the
+  // companion was offline (or failed for some other reason). The
+  // banner surfaces the count + a Retry action that re-enqueues
+  // each failed item as a fresh explicit capture.
+  readonly failedCount?: number;
+  // Most recent reject-on-full-explicit event. The banner shows it
+  // alongside failedCount so the user understands "I clicked +
+  // Capture three times and the third one bounced".
+  readonly lastRejectionAt?: string;
   readonly onRetryCompanion?: () => void;
   readonly onRePickVault?: () => void;
   readonly onQueueDiagnostic?: () => void;
+  readonly onRetryFailedCaptures?: () => void;
 }
 
 export function SystemBannersStack({
   captureSuccessHost,
   companionActionLabel = 'Retry',
   companionStatus = 'running',
+  relayStatus = 'unconfigured',
   vaultStatus = 'connected',
   providerHealth = 'ok',
   providerHealthDetail,
   screenShareActive = false,
   injectionDetected = false,
   queuedCount,
+  failedCount,
+  lastRejectionAt,
   onRetryCompanion,
   onRePickVault,
   onQueueDiagnostic,
+  onRetryFailedCaptures,
 }: SystemBannersStackProps) {
   const banners: ReactElement[] = [];
   if (captureSuccessHost !== undefined) {
@@ -126,6 +162,12 @@ export function SystemBannersStack({
       />,
     );
   }
+  // Relay-disconnected banner is independent of companion-down.
+  // Both can stack: companion-down (red) + relay-paused (amber)
+  // composes correctly because each owns a distinct tone+title.
+  if (relayStatus === 'down') {
+    banners.push(<SystemBanner key="relay" state="relay_disconnected" />);
+  }
   if (vaultStatus === 'unreachable') {
     banners.push(
       <SystemBanner
@@ -142,6 +184,22 @@ export function SystemBannersStack({
         key="capture-queue"
         state="captures_queued"
         detail={`${String(queuedCount)} pending`}
+      />,
+    );
+  }
+  if (failedCount !== undefined && failedCount > 0) {
+    const rejectionSuffix =
+      lastRejectionAt !== undefined ? ` · last reject: ${lastRejectionAt.slice(11, 16)} UTC` : '';
+    banners.push(
+      <SystemBanner
+        key="capture-failed"
+        state="captures_failed"
+        detail={`${String(failedCount)} unsynced${rejectionSuffix}`}
+        action={
+          onRetryFailedCaptures !== undefined
+            ? { label: 'Retry', onClick: onRetryFailedCaptures }
+            : undefined
+        }
       />,
     );
   }

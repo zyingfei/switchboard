@@ -32,13 +32,37 @@ import { INDEX_DIM } from './indexFile.js';
 // Suffixing the identity (e.g. with the prefix variant) means a
 // change to embedding behavior triggers an auto-rebuild even
 // though the underlying HF model didn't change.
-const HF_MODEL = 'Xenova/multilingual-e5-small';
-export const MODEL_ID = `${HF_MODEL}#prefix-query-v1`;
+import { isOfflineMode, resolveModelsDir } from './modelCache.js';
+import { RECALL_MODEL, RECALL_MODEL_ID } from './modelManifest.js';
+
+const HF_MODEL = RECALL_MODEL.modelId;
+// Identity string the lifecycle compares against the on-disk index.
+// Bumping `RECALL_MODEL.revision` in modelManifest.ts marks every
+// existing entry stale and triggers a background rebuild.
+export const MODEL_ID = RECALL_MODEL_ID;
 
 type FeatureExtractor = (
   text: string,
   options: { readonly pooling: 'mean'; readonly normalize: true },
 ) => Promise<{ readonly data: ArrayLike<number> }>;
+
+// Thrown by getEmbedder() when the loader cannot reach a usable
+// model file. Most often this is the offline + empty-cache case
+// (`SIDETRACK_OFFLINE_MODELS=1` / `--offline-models` with no
+// pre-warmed cache), but it also catches transient HF / disk
+// failures so the recall query route can map them to a typed
+// 503 RECALL_MODEL_MISSING instead of a generic 500.
+export class RecallModelMissingError extends Error {
+  readonly code = 'RECALL_MODEL_MISSING' as const;
+  constructor(
+    message: string,
+    readonly offline: boolean,
+    readonly cacheDir: string,
+  ) {
+    super(message);
+    this.name = 'RecallModelMissingError';
+  }
+}
 
 // Identifies which runtime backend the model loaded onto. Surfaced
 // in /v1/system/health.recall.embedderDevice so the side panel can
@@ -86,15 +110,23 @@ const log = (message: string): void => {
 export const getEmbedder = async (): Promise<FeatureExtractor> => {
   if (extractorPromise === undefined) {
     const started = performance.now();
+    const offlineAtLoad = isOfflineMode();
+    const cacheDirAtLoad = resolveModelsDir();
     extractorPromise = (async () => {
       const module = await import('@huggingface/transformers');
       const env = (module as { readonly env?: Record<string, unknown> }).env;
       if (env !== undefined) {
-        env['allowRemoteModels'] = true;
+        // In offline mode we deny remote fetches; the embedder
+        // throws if the cache is empty and the lifecycle reports
+        // RECALL_MODEL_MISSING. In normal mode we allow downloads.
+        env['allowRemoteModels'] = !offlineAtLoad;
         env['allowLocalModels'] = false;
-        // Cache to disk under the user's HF cache dir so we only pay
-        // the model download once across companion restarts.
         env['useFSCache'] = true;
+        // Sidetrack-managed model directory. The default still
+        // honors HF_HOME / HF_HUB_CACHE if set, but we point
+        // transformers.js at the product-owned tree so packaging
+        // can prewarm + ship a self-contained app.
+        env['cacheDir'] = cacheDirAtLoad;
       }
       // `device: 'cpu'` selects onnxruntime-node which on macOS uses
       // Apple Accelerate.
@@ -108,16 +140,24 @@ export const getEmbedder = async (): Promise<FeatureExtractor> => {
       // instead. The first one that loads sticks.
       const dtypeCandidates: readonly string[] = ['q8', 'fp16', 'fp32'];
       const errors: string[] = [];
+      // Pin the HF revision at load time so the runtime artifact
+      // matches what the manifest claims. transformers.js accepts
+      // `revision` (sha or branch) and uses it both for download and
+      // the on-disk cache key — without this, `MODEL_ID` would say
+      // "rev=761b…" but the loader would fetch whatever HEAD on the
+      // default branch resolves to.
+      const revision = RECALL_MODEL.revision;
       for (const dtype of dtypeCandidates) {
         try {
           const pipe = (await module.pipeline('feature-extraction', HF_MODEL, {
             device: 'cpu',
             dtype,
+            revision,
           } as Parameters<typeof module.pipeline>[2])) as unknown as FeatureExtractor;
           resolvedDevice = 'cpu';
           resolvedAccelerator = detectAccelerator();
           log(
-            `[recall] loaded embedding model ${MODEL_ID} (cpu/${resolvedAccelerator}/${dtype}) in ${String(Math.round(performance.now() - started))}ms`,
+            `[recall] loaded embedding model ${MODEL_ID} (cpu/${resolvedAccelerator}/${dtype}/rev=${revision.slice(0, 7)}) in ${String(Math.round(performance.now() - started))}ms`,
           );
           return pipe;
         } catch (error) {
@@ -126,12 +166,46 @@ export const getEmbedder = async (): Promise<FeatureExtractor> => {
           );
         }
       }
+      // No dtype loaded. In offline mode this almost always means
+      // the cache is empty (or partially-warmed for the wrong dtype
+      // set), so surface a typed RecallModelMissingError that the
+      // HTTP layer can map to 503 RECALL_MODEL_MISSING. We also use
+      // it for non-offline failures whose error text suggests the
+      // model is the missing piece — broader than ENOENT because
+      // transformers.js wraps that in a longer message.
+      const joined = errors.join(' | ');
+      const looksLikeModelMissing =
+        offlineAtLoad ||
+        /no such file|ENOENT|Could not locate|failed to fetch|Could not load model|404/i.test(
+          joined,
+        );
+      if (looksLikeModelMissing) {
+        // Reset the cached promise so a later call (e.g. after the
+        // user runs `models ensure` to pre-warm the cache) gets a
+        // fresh attempt instead of replaying the failure forever.
+        extractorPromise = undefined;
+        throw new RecallModelMissingError(
+          `[recall] embedding model ${MODEL_ID} is not available (offline=${String(offlineAtLoad)}, cacheDir=${cacheDirAtLoad}). Tried: ${joined}`,
+          offlineAtLoad,
+          cacheDirAtLoad,
+        );
+      }
       throw new Error(
-        `[recall] could not load ${MODEL_ID} on any dtype. Tried: ${errors.join(' | ')}`,
+        `[recall] could not load ${MODEL_ID} on any dtype. Tried: ${joined}`,
       );
     })();
   }
-  return await extractorPromise;
+  try {
+    return await extractorPromise;
+  } catch (error) {
+    // Same reset — a one-shot failure shouldn't poison every later
+    // call. The retry contract: the next `getEmbedder()` call after
+    // a model-missing failure restarts the loader.
+    if (error instanceof RecallModelMissingError) {
+      extractorPromise = undefined;
+    }
+    throw error;
+  }
 };
 
 const toFloat32 = (data: ArrayLike<number>): Float32Array => {
@@ -167,9 +241,45 @@ const E5_PREFIX = 'query: ';
 // largest single turn (~1.5MB for our 4000-char cap). The chunked
 // rebuilder still calls `embed` with batches, so we get the natural
 // yield-between-batches behavior for the HTTP server's sake.
+// Test-only deterministic embedder. Activated when the env var
+// `SIDETRACK_TEST_EMBEDDER=1` is set (the playwright fixture sets
+// this on the spawned companion). Avoids loading the 100+MB HF
+// model in CI / local test runs while still giving recall a real
+// vector to index — the lexical (MiniSearch) side of the hybrid
+// ranker carries the test signal; vectors are deterministic so
+// the index file is still byte-stable across reruns.
+const isTestEmbedderEnabled = (): boolean =>
+  typeof process !== 'undefined' && process.env?.['SIDETRACK_TEST_EMBEDDER'] === '1';
+
+const testEmbed = (text: string): Float32Array => {
+  // Deterministic: hash the text into the 384-dim vector. Not
+  // semantically meaningful — that's fine, the e2e uses lexical
+  // matches. Same input → same output → byte-stable index files.
+  const v = new Float32Array(384);
+  let h = 2166136261; // FNV-1a seed
+  for (let i = 0; i < text.length; i += 1) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  for (let i = 0; i < 384; i += 1) {
+    h = Math.imul(h ^ (h >>> 13), 16777619);
+    v[i] = ((h >>> 0) / 0xffffffff) * 2 - 1;
+  }
+  // L2 normalize (e5 outputs are normalized; tests rely on cosine
+  // similarity behaving sanely).
+  let norm = 0;
+  for (let i = 0; i < 384; i += 1) norm += (v[i] ?? 0) * (v[i] ?? 0);
+  const inv = 1 / Math.sqrt(norm);
+  for (let i = 0; i < 384; i += 1) v[i] = (v[i] ?? 0) * inv;
+  return v;
+};
+
 export const embed = async (texts: readonly string[]): Promise<readonly Float32Array[]> => {
   if (texts.length === 0) {
     return [];
+  }
+  if (isTestEmbedderEnabled()) {
+    return texts.map(testEmbed);
   }
   const extractor = await getEmbedder();
   const vectors: Float32Array[] = [];

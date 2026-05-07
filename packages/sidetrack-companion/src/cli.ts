@@ -8,6 +8,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { ensureMcpAuthKey } from './auth/mcpAuthKey.js';
 import { pickInstaller } from './install/index.js';
+import { getModelCacheStatus, resolveModelsDir } from './recall/modelCache.js';
+import { RECALL_MODEL } from './recall/modelManifest.js';
 import { startCompanion } from './runtime/companion.js';
 import { ensureRendezvousSecret } from './sync/rendezvousSecret.js';
 import { startRelayServer, type StartedRelayServer } from './sync/relayServer.js';
@@ -52,6 +54,13 @@ interface ParsedArgs {
   // bundled relay server (no vault, no companion API).
   readonly relayMode: boolean;
   readonly relayPort?: number;
+  // Recall embedding-model cache controls. Override the default
+  // platform model directory or refuse remote downloads. Both also
+  // accept env (SIDETRACK_MODELS_DIR / SIDETRACK_OFFLINE_MODELS) so
+  // launchd plists can stick the values on the process env without
+  // reissuing the install command.
+  readonly modelsDir?: string;
+  readonly offlineModels?: boolean;
 }
 
 export const renderHelp = (): string =>
@@ -70,6 +79,7 @@ export const renderHelp = (): string =>
     '  sidetrack-companion --vault <path> [--port 17373] [--allow-auto-update]',
     '                      [--mcp-port <port> [--mcp-auth-key <key>]]',
     '                      [--mcp-bin <path>]',
+    '                      [--models-dir <path>] [--offline-models]',
     '                      [--sync-relay <wss://...>]',
     '                      [--sync-relay-local [port]] [--sync-rendezvous-secret <base64url>]',
     '  sidetrack-companion relay [--relay-port 8443]',
@@ -83,6 +93,16 @@ export const renderHelp = (): string =>
     'Override the binary path with --mcp-bin if the sibling layout differs',
     '(default: ../sidetrack-mcp/dist/cli.js relative to this CLI).',
     '',
+    'Recall embedding-model cache:',
+    '  --models-dir <path>      Override the model cache directory (also reads',
+    '                           SIDETRACK_MODELS_DIR). Default: platform-specific',
+    '                           (~/Library/Application Support/Sidetrack/models on macOS,',
+    '                           ~/.local/share/sidetrack/models on Linux,',
+    '                           %LOCALAPPDATA%/Sidetrack/models on Windows).',
+    '  --offline-models         Refuse remote downloads (also reads',
+    '                           SIDETRACK_OFFLINE_MODELS=1). Recall queries 503 with',
+    '                           code RECALL_MODEL_MISSING when the cache is empty.',
+    '',
     'Sync relay (optional, end-to-end encrypted):',
     '  --sync-relay <wss://...>          WebSocket URL of a sidetrack relay.',
     '  --sync-relay-local [port]         Start a local relay in this companion process.',
@@ -94,6 +114,24 @@ export const renderHelp = (): string =>
     '  sidetrack-companion relay [--relay-port 8443]',
     '    Run the bundled relay server. Stateless ring-buffer fanout; restart wipes',
     '    every rendezvous. Front with a TLS reverse proxy for wss:// access.',
+    '',
+    'Models subcommand (recall embedding model):',
+    '  sidetrack-companion models status [--models-dir <path>] [--json]',
+    '  sidetrack-companion models ensure [--models-dir <path>]',
+    '  sidetrack-companion models verify [--models-dir <path>]',
+    '    Manage the local embedding-model cache. The default cache lives at',
+    '    ~/Library/Application Support/Sidetrack/models on macOS,',
+    '    ~/.local/share/sidetrack/models on Linux,',
+    "    %LOCALAPPDATA%/Sidetrack/models on Windows. Override with --models-dir or",
+    '    SIDETRACK_MODELS_DIR. Set SIDETRACK_OFFLINE_MODELS=1 to disable downloads.',
+    '',
+    'Recall subcommand (index lifecycle):',
+    '  sidetrack-companion recall status --vault <path> [--json]',
+    '  sidetrack-companion recall reingest --vault <path>',
+    '  sidetrack-companion recall verify --vault <path>',
+    '    The recall index is a rebuildable cache. `reingest` walks the merged',
+    '    event log and projects unprocessed capture events into chunk entries',
+    '    without touching raw _BAC/log/ data.',
   ].join('\n');
 
 const writeLine = (stream: Writable, text: string): void => {
@@ -119,6 +157,7 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
   let mcpPort: number | undefined;
   let mcpAuthKey: string | undefined;
   let mcpBin: string | undefined;
+  let modelsDir: string | undefined;
   let syncRelay: string | undefined;
   let syncRendezvousSecret: string | undefined;
   let syncRelayLocalPort: number | undefined;
@@ -199,6 +238,16 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
       index += 1;
       continue;
     }
+
+    if (arg === '--models-dir') {
+      const value = argv[index + 1];
+      if (value === undefined || value.length === 0) {
+        throw new Error('--models-dir requires a non-empty path.');
+      }
+      modelsDir = value;
+      index += 1;
+      continue;
+    }
   }
 
   const parsed: ParsedArgs = {
@@ -209,6 +258,7 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
     serviceStatus: argv.includes('--service-status'),
     allowAutoUpdate: argv.includes('--allow-auto-update'),
     relayMode: argv.includes('relay'),
+    offlineModels: argv.includes('--offline-models'),
     port,
     ...(mcpPort === undefined ? {} : { mcpPort }),
     ...(mcpAuthKey === undefined ? {} : { mcpAuthKey }),
@@ -217,6 +267,7 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
     ...(syncRendezvousSecret === undefined ? {} : { syncRendezvousSecret }),
     ...(syncRelayLocalPort === undefined ? {} : { syncRelayLocalPort }),
     ...(relayPort === undefined ? {} : { relayPort }),
+    ...(modelsDir === undefined ? {} : { modelsDir }),
   };
 
   return vaultPath === undefined ? parsed : { ...parsed, vaultPath };
@@ -285,7 +336,344 @@ const relayUrl = (relay: StartedRelayServer): string => `ws://${relay.host}:${St
 const syncRequested = (args: ParsedArgs): boolean =>
   args.syncRelay !== undefined || args.syncRelayLocalPort !== undefined;
 
+// Argument lookup for sub-command modes. Avoids re-running the
+// flag-driven parser when we only need a couple of override values.
+const findArgValue = (argv: readonly string[], name: string): string | undefined => {
+  for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index] === name) return argv[index + 1];
+    const eq = argv[index]?.startsWith(`${name}=`) === true ? argv[index] : undefined;
+    if (eq !== undefined) return eq.slice(name.length + 1);
+  }
+  return undefined;
+};
+
+const runModelsSubcommand = async (
+  argv: readonly string[],
+  streams: CliStreams,
+): Promise<number> => {
+  // argv[0] is 'models'; argv[1] is the verb.
+  const verb = argv[1];
+  if (verb === undefined || verb === 'help' || verb === '--help') {
+    writeLine(
+      streams.stdout,
+      'Usage: sidetrack-companion models {status|ensure|verify} [--models-dir <path>] [--json]',
+    );
+    return verb === undefined ? 2 : 0;
+  }
+  const modelsDirArg = findArgValue(argv, '--models-dir');
+  const json = argv.includes('--json');
+  const offline = argv.includes('--offline-models');
+  const opts = {
+    ...(modelsDirArg === undefined ? {} : { modelsDir: modelsDirArg }),
+    ...(offline ? { offline: true } : {}),
+  };
+  const cacheDir = resolveModelsDir(opts);
+
+  if (verb === 'status') {
+    const status = await getModelCacheStatus(opts);
+    if (json) {
+      writeLine(streams.stdout, JSON.stringify(status, null, 2));
+      return 0;
+    }
+    writeLine(streams.stdout, `model id     ${status.modelId}`);
+    writeLine(streams.stdout, `revision     ${status.revision}`);
+    writeLine(streams.stdout, `cache dir    ${status.cacheDir}`);
+    writeLine(streams.stdout, `present      ${status.present ? 'yes' : 'no'}`);
+    // `verified` means the cached refs/<branch> token matches the
+    // pinned manifest sha. False splits two ways: model isn't on
+    // disk at all (run `models ensure`), or it IS on disk but the
+    // cached revision doesn't match (cache populated by an older
+    // companion version, or the manifest moved). Distinguish so the
+    // user knows whether to ensure or re-ensure.
+    const verifiedReason = status.verified
+      ? 'yes'
+      : status.present
+        ? 'no (cached revision does not match pinned sha)'
+        : 'no (model not present)';
+    writeLine(streams.stdout, `verified     ${verifiedReason}`);
+    writeLine(streams.stdout, `offline      ${status.offline ? 'yes' : 'no'}`);
+    return 0;
+  }
+
+  if (verb === 'ensure') {
+    if (offline) {
+      writeLine(
+        streams.stderr,
+        'models ensure cannot run with --offline-models / SIDETRACK_OFFLINE_MODELS=1; remove the offline flag and retry.',
+      );
+      return 1;
+    }
+    writeLine(streams.stdout, `Ensuring ${RECALL_MODEL.modelId} into ${cacheDir} …`);
+    // The download is driven by the embedder's lazy load on first
+    // call. Trigger it deterministically here by routing the
+    // transformers cache to the requested dir and asking for one
+    // embedding. Use a process-local env override so we don't
+    // mutate the running config.
+    process.env['SIDETRACK_MODELS_DIR'] = cacheDir;
+    const { embed } = await import('./recall/embedder.js');
+    await embed(['warmup']);
+    const post = await getModelCacheStatus({ ...opts, modelsDir: cacheDir });
+    writeLine(streams.stdout, post.present ? 'ok — model cached' : 'WARN — embedder ran but cache check still missing');
+    return post.present ? 0 : 1;
+  }
+
+  if (verb === 'verify') {
+    const status = await getModelCacheStatus(opts);
+    if (!status.present) {
+      writeLine(streams.stderr, 'verify: model not present in cache. Run `models ensure` first.');
+      return 1;
+    }
+    if (status.verified) {
+      writeLine(
+        streams.stdout,
+        'verify: ok (cached refs/<branch> revision matches the manifest sha)',
+      );
+      return 0;
+    }
+    writeLine(
+      streams.stdout,
+      'verify: present but no revision marker matched. The cache may have been populated by an older companion version (no refs/main file written) or by a different revision. Run `models ensure` to refetch against the pinned revision.',
+    );
+    return 0;
+  }
+
+  writeLine(streams.stderr, `unknown models verb: ${verb}`);
+  writeLine(streams.stderr, 'try: status | ensure | verify');
+  return 2;
+};
+
+const runRecallSubcommand = async (
+  argv: readonly string[],
+  streams: CliStreams,
+): Promise<number> => {
+  const verb = argv[1];
+  if (verb === undefined || verb === 'help' || verb === '--help') {
+    writeLine(
+      streams.stdout,
+      'Usage: sidetrack-companion recall {status|reingest|verify} --vault <path> [--json]',
+    );
+    return verb === undefined ? 2 : 0;
+  }
+  const vaultPath = findArgValue(argv, '--vault');
+  if (vaultPath === undefined || vaultPath.length === 0) {
+    writeLine(streams.stderr, '--vault <path> is required for the recall sub-command.');
+    return 2;
+  }
+  const json = argv.includes('--json');
+
+  // Lazy imports so `models` runs (and all the help/version paths)
+  // don't pull in the full eventLog + indexFile + embedder graph.
+  const { readIngestState, readRecallManifest, ingestIncremental } = await import(
+    './recall/ingestor.js'
+  );
+  const { readIndex } = await import('./recall/indexFile.js');
+  const { createEventLog } = await import('./sync/eventLog.js');
+  const { loadOrCreateReplica } = await import('./sync/replicaId.js');
+
+  if (verb === 'status') {
+    const [manifest, state, index] = await Promise.all([
+      readRecallManifest(vaultPath),
+      readIngestState(vaultPath),
+      readIndex(`${vaultPath}/_BAC/recall/index.bin`),
+    ]);
+    const status = {
+      manifest,
+      ingestState: state,
+      index: index === null ? null : { entryCount: index.items.length, modelId: index.modelId },
+    };
+    if (json) {
+      writeLine(streams.stdout, JSON.stringify(status, null, 2));
+      return 0;
+    }
+    writeLine(
+      streams.stdout,
+      `manifest      ${manifest === null ? '(none — run `recall reingest`)' : `${manifest.modelId} rev=${manifest.modelRevision} v${String(manifest.indexVersion)}`}`,
+    );
+    writeLine(
+      streams.stdout,
+      `index         ${index === null ? '(none)' : `${String(index.items.length)} entries (${index.modelId})`}`,
+    );
+    writeLine(
+      streams.stdout,
+      `frontier      ${
+        Object.keys(state.processedEvents).length === 0
+          ? '(nothing ingested yet)'
+          : Object.entries(state.processedEvents)
+              .map(([k, v]) => `${k}@${String(v)}`)
+              .join(' ')
+      }`,
+    );
+    if (state.lastIncrementalIngestAt !== undefined) {
+      writeLine(streams.stdout, `last ingest   ${state.lastIncrementalIngestAt}`);
+    }
+    return 0;
+  }
+
+  if (verb === 'reingest') {
+    // `reingest` is a writer — it walks the merged event log and
+    // upserts chunks into `_BAC/recall/index.bin`. A running companion
+    // holds the recall process-lock for the same reason (single
+    // writer per vault). If we let two writers run concurrently they
+    // race the atomic-rename pattern and the binary index can
+    // tear / drift. Take the lock; refuse if another live PID owns
+    // it.
+    const { acquireRecallProcessLock, RecallLockHeldError } = await import(
+      './recall/recovery.js'
+    );
+    let recallLock;
+    try {
+      recallLock = await acquireRecallProcessLock(vaultPath);
+    } catch (error) {
+      if (error instanceof RecallLockHeldError) {
+        writeLine(
+          streams.stderr,
+          `reingest: refusing — companion (pid ${String(error.pid)}) is already writing the recall index for ${vaultPath}.`,
+        );
+        writeLine(
+          streams.stderr,
+          'Stop the companion (or wait for it to exit) and re-run, or hit POST /v1/recall/reingest on the running companion instead.',
+        );
+        return 1;
+      }
+      throw error;
+    }
+    try {
+      const replica = await loadOrCreateReplica(vaultPath);
+      const eventLog = createEventLog(vaultPath, replica);
+      writeLine(streams.stdout, `reingesting from event log into ${vaultPath}/_BAC/recall/ …`);
+      const result = await ingestIncremental(vaultPath, eventLog);
+      writeLine(
+        streams.stdout,
+        `ok — indexed ${String(result.indexedChunks)} chunks, ${String(result.tombstonedChunks)} tombstoned`,
+      );
+      return 0;
+    } finally {
+      await recallLock.release();
+    }
+  }
+
+  if (verb === 'verify') {
+    const [manifest, index] = await Promise.all([
+      readRecallManifest(vaultPath),
+      readIndex(`${vaultPath}/_BAC/recall/index.bin`),
+    ]);
+    if (manifest === null) {
+      writeLine(streams.stderr, 'verify: no manifest. Run `recall reingest` first.');
+      return 1;
+    }
+    if (index === null) {
+      writeLine(streams.stderr, 'verify: no index file on disk.');
+      return 1;
+    }
+    if (manifest.modelId !== index.modelId.split('#')[0]) {
+      writeLine(
+        streams.stderr,
+        `verify: model mismatch — manifest=${manifest.modelId} index=${index.modelId}`,
+      );
+      return 1;
+    }
+    writeLine(
+      streams.stdout,
+      `verify: ok — manifest matches index (${String(index.items.length)} entries, ${manifest.modelId})`,
+    );
+    return 0;
+  }
+
+  writeLine(streams.stderr, `unknown recall verb: ${verb}`);
+  writeLine(streams.stderr, 'try: status | reingest | verify');
+  return 2;
+};
+
+// Sync Contract v1 / Class F — companion `ingest --import <archive>`
+// CLI verb. Imports an archive pack of edge-origin events into the
+// companion's event log. Idempotent on edge dot — same archive
+// imported twice produces no duplicates; same archive imported by
+// two different companions deduplicates at the relay level (both
+// will publish; receiving peer dedupes on dot).
+//
+// Lane 3 stage 4. The archive pack format is JSONL of AcceptedEvent
+// objects with edge-origin dots. Each event is fed through
+// importPeerEvent (which already handles dot collisions + idempotency).
+const runIngestSubcommand = async (
+  argv: readonly string[],
+  streams: CliStreams,
+): Promise<number> => {
+  const verb = argv[1];
+  if (verb === undefined || verb === 'help' || verb === '--help') {
+    writeLine(
+      streams.stdout,
+      'Sync Contract v1 / Class F archive import.',
+    );
+    writeLine(streams.stdout, '');
+    writeLine(streams.stdout, 'Usage:');
+    writeLine(
+      streams.stdout,
+      '  sidetrack-companion ingest --import <archive.jsonl> --vault <path>',
+    );
+    return verb === undefined ? 2 : 0;
+  }
+  if (verb !== '--import') {
+    writeLine(streams.stderr, `unknown ingest verb: ${verb}`);
+    writeLine(streams.stderr, 'try: --import <archive.jsonl>');
+    return 2;
+  }
+  const archivePath = argv[2];
+  if (archivePath === undefined) {
+    writeLine(streams.stderr, '--import requires a path argument.');
+    return 2;
+  }
+  const vaultIdx = argv.indexOf('--vault');
+  const vaultPath = vaultIdx === -1 ? undefined : argv[vaultIdx + 1];
+  if (vaultPath === undefined) {
+    writeLine(streams.stderr, '--vault <path> is required for ingest --import.');
+    return 2;
+  }
+  // Lazy imports — keeps CLI startup fast for unrelated verbs.
+  const { readFile } = await import('node:fs/promises');
+  const { createEventLog } = await import('./sync/eventLog.js');
+  const { loadOrCreateReplica } = await import('./sync/replicaId.js');
+  const replica = await loadOrCreateReplica(vaultPath);
+  const eventLog = createEventLog(vaultPath, replica);
+  const text = await readFile(archivePath, 'utf8');
+  const lines = text.split('\n').filter((l) => l.trim().length > 0);
+  let imported = 0;
+  let skipped = 0;
+  let errors = 0;
+  for (const line of lines) {
+    try {
+      const event = JSON.parse(line);
+      const result = await eventLog.importPeerEvent(event);
+      if (result.imported) imported += 1;
+      else skipped += 1;
+    } catch (err) {
+      errors += 1;
+      writeLine(
+        streams.stderr,
+        `[ingest] error: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  writeLine(
+    streams.stdout,
+    `ingest: imported=${String(imported)} skipped=${String(skipped)} errors=${String(errors)} total=${String(lines.length)}`,
+  );
+  return errors > 0 ? 1 : 0;
+};
+
 export const runCli = async (argv: readonly string[], streams: CliStreams): Promise<number> => {
+  // Sub-command dispatch happens BEFORE the flag-driven parser so a
+  // verb like `models` doesn't get interpreted as a positional vault
+  // path. Existing flag-only invocations are unaffected.
+  if (argv[0] === 'models') {
+    return await runModelsSubcommand(argv, streams);
+  }
+  if (argv[0] === 'recall') {
+    return await runRecallSubcommand(argv, streams);
+  }
+  if (argv[0] === 'ingest') {
+    return await runIngestSubcommand(argv, streams);
+  }
+
   const args = parseArgs(argv);
 
   if (args.version) {
@@ -348,6 +736,18 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
   if (args.syncRelay !== undefined && args.syncRelayLocalPort !== undefined) {
     writeLine(streams.stderr, 'Use either --sync-relay or --sync-relay-local, not both.');
     return 2;
+  }
+
+  // Surface --models-dir / --offline-models as process env so the
+  // lazily-instantiated embedder + modelCache pick them up without
+  // a config-passing rewrite. Only set when explicit flags are
+  // present; if they're not we leave any pre-existing env alone so
+  // a launchd-installed plist can still pin the values.
+  if (args.modelsDir !== undefined) {
+    process.env['SIDETRACK_MODELS_DIR'] = args.modelsDir;
+  }
+  if (args.offlineModels) {
+    process.env['SIDETRACK_OFFLINE_MODELS'] = '1';
   }
 
   if (args.installService) {
@@ -460,6 +860,10 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
     );
   }
 
+  // Track an optional MCP child + close hook on a single object so
+  // there's exactly one shutdown path regardless of which optional
+  // sidecars are wired (mcp / local relay / neither).
+  let mcpChild: ReturnType<typeof spawnMcpServer> | undefined;
   const closeAll = async (): Promise<void> => {
     await runtime.close();
     await localRelay?.close();
@@ -475,7 +879,7 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
       await closeAll();
       return 1;
     }
-    const child = spawnMcpServer({
+    mcpChild = spawnMcpServer({
       mcpBin,
       mcpPort: args.mcpPort,
       mcpAuthKey: resolvedMcpAuthKey,
@@ -501,32 +905,28 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
         'mcp auth key   provided via --mcp-auth-key (skip the side-panel prompt regen if you change it).',
       );
     }
-    const shutdown = (signal: NodeJS.Signals): void => {
-      child.kill(signal);
-      void closeAll().finally(() => {
-        process.exit(0);
-      });
-    };
-    process.once('SIGINT', () => {
-      shutdown('SIGINT');
-    });
-    process.once('SIGTERM', () => {
-      shutdown('SIGTERM');
-    });
-  } else if (localRelay !== undefined) {
-    const shutdown = (signal: NodeJS.Signals): void => {
-      writeLine(streams.stdout, `[sync relay] received ${signal}, shutting down`);
-      void closeAll().finally(() => {
-        process.exit(0);
-      });
-    };
-    process.once('SIGINT', () => {
-      shutdown('SIGINT');
-    });
-    process.once('SIGTERM', () => {
-      shutdown('SIGTERM');
-    });
   }
+
+  // Always wire SIGINT/SIGTERM. Without this the bare-runtime case
+  // (no --mcp-port, no --sync-relay-local) had no handler at all,
+  // so `kill` left `_BAC/recall/.lock` pointing at the now-dead pid
+  // and stranded the next-launch on the recovery path's stale-pid
+  // takeover. closeAll() releases the lock via runtime.close().
+  const shutdown = (signal: NodeJS.Signals): void => {
+    if (mcpChild !== undefined) mcpChild.kill(signal);
+    if (localRelay !== undefined) {
+      writeLine(streams.stdout, `[sync relay] received ${signal}, shutting down`);
+    }
+    void closeAll().finally(() => {
+      process.exit(0);
+    });
+  };
+  process.once('SIGINT', () => {
+    shutdown('SIGINT');
+  });
+  process.once('SIGTERM', () => {
+    shutdown('SIGTERM');
+  });
   return 0;
 };
 

@@ -11,7 +11,17 @@ export interface TestCompanion {
   readonly bridgeKey: string;
   readonly port: number;
   readonly vaultPath: string;
+  // Hard close: kill process AND remove vault. Use in finally{} for
+  // teardown.
   readonly close: () => Promise<void>;
+  // Soft stop: kill process, KEEP vault on disk (and the bridge key
+  // file, replicaId, recall index, event log). Pair with restart()
+  // for offline-then-reconnect tests.
+  readonly stop: () => Promise<void>;
+  // Respawn the companion against the same vault on the same port +
+  // sync settings. Bridge key + replicaId are preserved (read from
+  // vault). Returns when the new process is listening.
+  readonly restart: () => Promise<void>;
 }
 
 export interface StartTestCompanionOptions {
@@ -143,30 +153,94 @@ export const startTestCompanion = async (
       ? []
       : ['--sync-rendezvous-secret', options.syncRendezvousSecret]),
   ];
-  const child = spawn(process.execPath, args, {
-    cwd: companionRoot,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
 
-  try {
-    await waitForListening(child, port);
-    const bridgeKey = await readFile(path.join(vaultPath, '_BAC/.config/bridge.key'), 'utf8');
+  // Mutable handle for the current child process. stop()/restart()
+  // swap this out so the test can drive offline → online cycles
+  // against the same vault. Same-port + same-vault means the
+  // extension's settings keep working without a re-seed.
+  let child: CompanionProcess | null = null;
 
-    return {
-      bridgeKey: bridgeKey.trim(),
-      port,
-      vaultPath,
-      async close() {
-        try {
-          await closeProcess(child);
-        } finally {
-          await rm(vaultPath, { recursive: true, force: true });
-        }
+  const spawnNow = async (): Promise<void> => {
+    const next = spawn(process.execPath, args, {
+      cwd: companionRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        // Sync Contract v1 / L1-G2 + L1-G3 e2e fixture: enable the
+        // deterministic test embedder so the spawned companion can
+        // build a recall index without loading the 100+MB HF
+        // multilingual-e5-small model. Same hook is used in
+        // companion-side unit tests via vi.mock; the env-var path
+        // is what the spawned subprocess sees.
+        SIDETRACK_TEST_EMBEDDER: '1',
       },
-    };
+    });
+    try {
+      await waitForListening(next, port);
+    } catch (error) {
+      await closeProcess(next);
+      throw error;
+    }
+    // After listening, drain stdout/stderr so the pipes don't fill
+    // and stall the child. Stderr is forwarded so test failures
+    // surface companion errors; stdout is silenced (the build's
+    // own [recall] / [relay] info logs would drown out test
+    // output otherwise — set DEBUG_COMP=1 to re-enable).
+    const debugComp = process.env['DEBUG_COMP'] === '1';
+    next.stdout.on('data', (chunk: Buffer) => {
+      if (!debugComp) return;
+      const text = chunk.toString('utf8').trimEnd();
+      if (text.length > 0) {
+        // eslint-disable-next-line no-console
+        console.log(`[comp:${String(port)}] ${text}`);
+      }
+    });
+    next.stderr.on('data', (chunk: Buffer) => {
+      const text = chunk.toString('utf8').trimEnd();
+      if (text.length > 0) {
+        // eslint-disable-next-line no-console
+        console.warn(`[comp:${String(port)}] ${text}`);
+      }
+    });
+    child = next;
+  };
+
+  await spawnNow();
+  let bridgeKey: string;
+  try {
+    bridgeKey = (
+      await readFile(path.join(vaultPath, '_BAC/.config/bridge.key'), 'utf8')
+    ).trim();
   } catch (error) {
-    await closeProcess(child);
+    if (child !== null) await closeProcess(child);
     await rm(vaultPath, { recursive: true, force: true });
     throw error;
   }
+
+  return {
+    bridgeKey,
+    port,
+    vaultPath,
+    async close() {
+      try {
+        if (child !== null) await closeProcess(child);
+      } finally {
+        await rm(vaultPath, { recursive: true, force: true });
+      }
+    },
+    async stop() {
+      if (child !== null) {
+        await closeProcess(child);
+        child = null;
+      }
+    },
+    async restart() {
+      // No-op if the previous stop() already cleaned up; otherwise
+      // SIGTERM the existing child first so we don't double-bind the
+      // port. spawnNow() reads the same args + vault.
+      if (child !== null) await closeProcess(child);
+      child = null;
+      await spawnNow();
+    },
+  };
 };

@@ -76,17 +76,6 @@ export interface RecallStatusReport {
   };
 }
 
-// One captured turn ready to be embedded + appended. The HTTP layer
-// shapes capture events into this list and hands it to the
-// lifecycle's `appendCaptureTurns` so the embedder + index writes go
-// through the lifecycle's mutex (sharing the lane with rebuild).
-export interface CaptureTurnInput {
-  readonly id: string;
-  readonly threadId: string;
-  readonly capturedAt: string;
-  readonly text: string;
-}
-
 export interface RecallLifecycle {
   readonly report: () => Promise<RecallStatusReport>;
   readonly ensureFresh: () => Promise<RecallStatusReport>;
@@ -99,9 +88,18 @@ export interface RecallLifecycle {
   readonly appendEntry: (entry: IndexEntry) => Promise<void>;
   readonly gcEntries: (validIds: ReadonlySet<string>) => Promise<{ readonly removed: number }>;
   readonly tombstoneByThread: (threadId: string) => Promise<{ readonly tombstoned: number }>;
-  readonly appendCaptureTurns: (
-    turns: readonly CaptureTurnInput[],
-  ) => Promise<{ readonly indexed: number }>;
+  // Mutex-serialised incremental ingest. Walks the merged event
+  // log and projects unprocessed capture.recorded /
+  // recall.tombstone.target events into the V3 index. Holding the
+  // single-writer mutex for the whole run prevents a concurrent
+  // rebuild or appendEntry from corrupting the index file.
+  readonly ingestIncremental: (
+    eventLog: import('../sync/eventLog.js').EventLog,
+  ) => Promise<{
+    readonly indexedChunks: number;
+    readonly tombstonedChunks: number;
+    readonly tombstonedEntries: number;
+  }>;
 }
 
 export interface CreateRecallLifecycleOptions {
@@ -160,10 +158,43 @@ const indexPathFor = (vaultRoot: string): string => join(vaultRoot, '_BAC', 'rec
 
 const eventLogPathFor = (vaultRoot: string): string => join(vaultRoot, '_BAC', 'events');
 
-const countTurnsInEventLog = async (vaultRoot: string): Promise<number> => {
+const countTurnsInEventLog = async (
+  vaultRoot: string,
+  eventLog: EventLog | undefined,
+): Promise<number> => {
+  // Sources, in priority order:
+  //   1. The per-replica log under `_BAC/log/<replicaId>/*.jsonl`.
+  //      This is where every post-PR-#93 capture lives — including
+  //      events synced from peers via the relay. We MUST count this
+  //      or drift detection is blind to cross-replica captures and
+  //      auto-rebuilds never fire after a sync.
+  //   2. The legacy `_BAC/events/*.jsonl` file. Pre-PR-#93 vaults
+  //      have only this; post-#93 vaults still write a back-compat
+  //      copy of the local replica's captures here. We dedupe by
+  //      bac_id so we don't double-count a local capture that was
+  //      written through both paths.
+  let total = 0;
+  const seenBacIds = new Set<string>();
+  if (eventLog !== undefined) {
+    const accepted = await eventLog.readMerged();
+    for (const event of accepted) {
+      if (event.type !== 'capture.recorded') continue;
+      const payload = event.payload as { readonly bac_id?: unknown; readonly turns?: unknown };
+      if (typeof payload.bac_id === 'string') {
+        seenBacIds.add(payload.bac_id);
+      }
+      if (!Array.isArray(payload.turns)) continue;
+      for (const rawTurn of payload.turns) {
+        if (typeof rawTurn !== 'object' || rawTurn === null) continue;
+        const text = (rawTurn as { readonly text?: unknown }).text;
+        if (typeof text === 'string' && text.trim().length > 0) {
+          total += 1;
+        }
+      }
+    }
+  }
   const eventDir = eventLogPathFor(vaultRoot);
   const files = await readdir(eventDir).catch(() => [] as readonly string[]);
-  let total = 0;
   for (const file of files) {
     if (!file.endsWith('.jsonl')) continue;
     const raw = await readFile(join(eventDir, file), 'utf8').catch(() => '');
@@ -173,6 +204,12 @@ const countTurnsInEventLog = async (vaultRoot: string): Promise<number> => {
       try {
         const parsed: unknown = JSON.parse(trimmed);
         if (typeof parsed !== 'object' || parsed === null) continue;
+        const bacId = (parsed as { readonly bac_id?: unknown }).bac_id;
+        if (typeof bacId === 'string' && seenBacIds.has(bacId)) {
+          // Already accounted for via the per-replica log walk
+          // above; skip so we don't double-count.
+          continue;
+        }
         const turns = (parsed as { readonly turns?: unknown }).turns;
         if (!Array.isArray(turns)) continue;
         for (const rawTurn of turns) {
@@ -234,7 +271,7 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
   const report = async (): Promise<RecallStatusReport> => {
     const [index, eventTurnCount] = await Promise.all([
       readIndex(indexPathFor(opts.vaultRoot)),
-      countTurnsInEventLog(opts.vaultRoot),
+      countTurnsInEventLog(opts.vaultRoot, opts.eventLog),
     ]);
     // Tombstoned rows are still on disk (OR-Set semantics) but the
     // user's mental model is "deleted." Drift compares the live
@@ -360,6 +397,21 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
   ): Promise<{ readonly removed: number }> =>
     enqueueWrite(async () => await gcEntriesRaw(indexPath(), validIds));
 
+  const ingestIncremental = (
+    eventLog: import('../sync/eventLog.js').EventLog,
+  ): Promise<{
+    readonly indexedChunks: number;
+    readonly tombstonedChunks: number;
+    readonly tombstonedEntries: number;
+  }> =>
+    enqueueWrite(async () => {
+      // Lazy import keeps the lifecycle module's dependency graph
+      // narrow — the ingestor pulls in the chunker + manifest paths
+      // which are heavy.
+      const { ingestIncremental: ingest } = await import('./ingestor.js');
+      return await ingest(opts.vaultRoot, eventLog);
+    });
+
   const tombstoneByThread = (
     threadId: string,
   ): Promise<{ readonly tombstoned: number }> =>
@@ -371,59 +423,20 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
       // event. Best-effort; if the eventLog isn't wired (legacy
       // tests), we still mutate the index locally.
       if (opts.eventLog !== undefined && opts.replica !== undefined) {
+        // Invariant C: do not pass an explicit baseVector. The
+        // eventLog auto-resolves deps from this aggregate's prior
+        // events, so concurrent tombstones from two replicas still
+        // dominate any pre-tombstone projection.
         await opts.eventLog
-          .appendClient({
+          .appendServerObserved({
             clientEventId: `recall-tombstone:${opts.replica.replicaId}:${threadId}`,
             aggregateId: threadId,
             type: RECALL_TOMBSTONE_TARGET,
             payload: { threadId },
-            baseVector: {},
           })
           .catch(() => undefined);
       }
       return await tombstoneByThreadRaw(indexPath(), threadId);
-    });
-
-  const appendCaptureTurns = (
-    turns: readonly CaptureTurnInput[],
-  ): Promise<{ readonly indexed: number }> =>
-    enqueueWrite(async () => {
-      if (turns.length === 0) return { indexed: 0 };
-      let indexed = 0;
-      const indexedThreadIds: string[] = [];
-      for (let offset = 0; offset < turns.length; offset += AUTO_INDEX_BATCH_SIZE) {
-        const batch = turns.slice(offset, offset + AUTO_INDEX_BATCH_SIZE);
-        const vectors = await embedFn(batch.map((turn) => turn.text));
-        for (let index = 0; index < batch.length; index += 1) {
-          const turn = batch[index];
-          const embedding = vectors[index];
-          if (turn === undefined || embedding === undefined) continue;
-          const seq = opts.replica !== undefined ? await opts.replica.nextSeq() : undefined;
-          const entry: IndexEntry = {
-            id: turn.id,
-            threadId: turn.threadId,
-            capturedAt: turn.capturedAt,
-            embedding,
-            ...(opts.replica !== undefined ? { replicaId: opts.replica.replicaId } : {}),
-            // The IndexEntry persists the per-replica seq under the
-            // legacy `lamport` field name. CRDT-aware readers use
-            // `(replicaId, lamport)` as the dot equivalent.
-            ...(seq !== undefined ? { lamport: seq } : {}),
-          };
-          await appendEntryRaw(indexPath(), entry, currentModelId);
-          indexed += 1;
-          indexedThreadIds.push(turn.threadId);
-        }
-        // Yield between batches so the HTTP server stays responsive
-        // while a large catch-up is running.
-        await new Promise<void>((resolve) => {
-          setImmediate(resolve);
-        });
-      }
-      if (indexed > 0) {
-        opts.activity?.recordIncrementalIndex({ count: indexed, threadIds: indexedThreadIds });
-      }
-      return { indexed };
     });
 
   return {
@@ -435,6 +448,6 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
     appendEntry,
     gcEntries,
     tombstoneByThread,
-    appendCaptureTurns,
+    ingestIncremental,
   };
 };

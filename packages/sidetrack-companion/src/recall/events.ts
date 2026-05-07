@@ -18,6 +18,12 @@ export interface CaptureTurnInputShape {
   readonly role?: 'user' | 'assistant' | 'system' | 'unknown';
   readonly text: string;
   readonly capturedAt?: string;
+  // Recall V3: optional richer rendering fields. The chunker prefers
+  // markdown → formattedText → text; these flow through unchanged
+  // when the capture event carried them.
+  readonly markdown?: string;
+  readonly formattedText?: string;
+  readonly modelName?: string;
 }
 
 export interface CaptureRecordedPayload {
@@ -25,6 +31,7 @@ export interface CaptureRecordedPayload {
   readonly threadId?: string;
   readonly threadUrl?: string;
   readonly provider?: string;
+  readonly title?: string;
   readonly capturedAt: string;
   readonly turns: readonly CaptureTurnInputShape[];
 }

@@ -4,7 +4,11 @@ import { embed, getEmbedder, MODEL_ID } from './embedder.js';
 
 describe('embedder module', () => {
   it('exports the expected lazy embedder interface', () => {
-    expect(MODEL_ID).toBe('Xenova/multilingual-e5-small#prefix-query-v1');
+    // V3: identity string includes the manifest revision so a sha
+    // bump marks the index stale through lifecycle's check.
+    expect(MODEL_ID).toContain('Xenova/multilingual-e5-small');
+    expect(MODEL_ID).toContain('rev=');
+    expect(MODEL_ID).toContain('prefix-query-v1');
     expect(typeof getEmbedder).toBe('function');
     expect(typeof embed).toBe('function');
   });

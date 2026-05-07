@@ -200,6 +200,63 @@ describe('recall lifecycle', () => {
     }
   });
 
+  it('drift counter walks the per-replica log so cross-replica peer-synced events count toward eventTurnCount', async () => {
+    // Pre-PR-#93 captures live in `_BAC/events/`. Post-PR-#93 captures
+    // (especially peer-synced events) live ONLY under
+    // `_BAC/log/<replicaId>/`. countTurnsInEventLog used to read just
+    // the legacy path, so a vault that received 10 peer-synced
+    // captures would report eventTurnCount=0, drift=0, "ready" — and
+    // never auto-rebuild even though the index covers nothing the
+    // peer sent. This test guards against regression.
+    const root = await mkdtemp(join(tmpdir(), 'recall-lifecycle-peer-drift-'));
+    try {
+      const { createEventLog } = await import('../sync/eventLog.js');
+      const { loadOrCreateReplica } = await import('../sync/replicaId.js');
+      const replica = await loadOrCreateReplica(root);
+      const eventLog = createEventLog(root, replica);
+      // Simulate a peer-synced capture by importing a foreign-replica
+      // event under a different replicaId. importPeerEvent is the
+      // exact code path the relay client takes when relaying a peer
+      // event into our log.
+      await eventLog.importPeerEvent({
+        clientEventId: 'peer-evt-1',
+        dot: { replicaId: 'remote-replica-aaaaaa', seq: 1 },
+        deps: {},
+        aggregateId: 'thread_remote',
+        type: 'capture.recorded',
+        payload: {
+          bac_id: 'thread_remote',
+          capturedAt: '2026-05-04T00:00:00.000Z',
+          turns: [
+            { ordinal: 0, role: 'user', text: 'peer turn 1' },
+            { ordinal: 1, role: 'assistant', text: 'peer turn 2' },
+          ],
+        },
+        acceptedAtMs: 1_780_000_000_000,
+      });
+      const indexPath = join(root, '_BAC', 'recall', 'index.bin');
+      // Empty index: should drift hard against the 2 peer turns.
+      await writeIndex(indexPath, [], 'fresh/model');
+      const lifecycle = createRecallLifecycle({
+        vaultRoot: root,
+        companionVersion: '0.0.0-test',
+        currentModelId: 'fresh/model',
+        rebuilder: () => Promise.resolve({ indexed: 0 }),
+        eventLog,
+        log: () => undefined,
+        warn: () => undefined,
+      });
+      const report = await lifecycle.report();
+      expect(report.eventTurnCount).toBe(2);
+      // The drift status flips to 'stale' because entryCount=0 with
+      // eventTurnCount > 0 — the same condition that triggers an
+      // auto-rebuild on the actual lifecycle.
+      expect(report.status).toBe('stale');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('does not flag drift when entry count meets or exceeds the event log', async () => {
     const root = await mkdtemp(join(tmpdir(), 'recall-lifecycle-no-drift-'));
     try {
@@ -236,57 +293,35 @@ describe('recall lifecycle', () => {
     }
   });
 
-  it('appendCaptureTurns embeds + writes turns through the mutex with replica stamping', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'recall-lifecycle-auto-index-'));
+  it('appendEntry writes through the mutex (back-compat low-level path used by POST /v1/recall/index)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'recall-lifecycle-append-'));
     try {
-      const embedCalls: string[][] = [];
-      const fakeEmbedder = (texts: readonly string[]): Promise<readonly Float32Array[]> => {
-        embedCalls.push([...texts]);
-        return Promise.resolve(
-          texts.map((_, i) => {
-            const v = new Float32Array(FAKE_DIM);
-            v[i % FAKE_DIM] = 1;
-            return v;
-          }),
-        );
-      };
-      let nextSeqValue = 100;
       const lifecycle = createRecallLifecycle({
         vaultRoot: root,
         companionVersion: '0.0.0-test',
         currentModelId: 'fresh/model',
         rebuilder: () => Promise.resolve({ indexed: 0 }),
-        embedder: fakeEmbedder,
-        replica: {
-          replicaId: 'replica-A',
-          nextSeq: () => {
-            const value = nextSeqValue;
-            nextSeqValue += 1;
-            return Promise.resolve(value);
-          },
-        },
+        embedder: () => Promise.resolve([]),
         log: () => undefined,
         warn: () => undefined,
       });
-      const result = await lifecycle.appendCaptureTurns([
-        { id: 'thread1:0', threadId: 'thread1', capturedAt: '2026-05-04T00:00:00.000Z', text: 'a' },
-        { id: 'thread1:1', threadId: 'thread1', capturedAt: '2026-05-04T00:00:01.000Z', text: 'b' },
-      ]);
-      expect(result.indexed).toBe(2);
-      expect(embedCalls).toEqual([['a', 'b']]);
-
-      const indexPath = join(root, '_BAC', 'recall', 'index.bin');
+      const embedding = new Float32Array(FAKE_DIM);
+      embedding[0] = 1;
+      await lifecycle.appendEntry({
+        id: 'thread1:0',
+        threadId: 'thread1',
+        capturedAt: '2026-05-04T00:00:00.000Z',
+        embedding,
+      });
       const { readIndex } = await import('./indexFile.js');
-      const indexFile = await readIndex(indexPath);
-      expect(indexFile?.items.map((item) => item.id)).toEqual(['thread1:0', 'thread1:1']);
-      expect(indexFile?.items.map((item) => item.replicaId)).toEqual(['replica-A', 'replica-A']);
-      expect(indexFile?.items.map((item) => item.lamport)).toEqual([100, 101]);
+      const indexFile = await readIndex(join(root, '_BAC', 'recall', 'index.bin'));
+      expect(indexFile?.items.map((item) => item.id)).toEqual(['thread1:0']);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  it('serialises rebuild and appendCaptureTurns so concurrent calls cannot interleave', async () => {
+  it('serialises rebuild and appendEntry so concurrent calls cannot interleave', async () => {
     const root = await mkdtemp(join(tmpdir(), 'recall-lifecycle-mutex-'));
     try {
       const events: string[] = [];
@@ -296,34 +331,39 @@ describe('recall lifecycle', () => {
         events.push('rebuild:end');
         return { indexed: 0 };
       };
-      const fakeEmbedder = async (texts: readonly string[]): Promise<readonly Float32Array[]> => {
-        events.push(`embed:start(${String(texts.length)})`);
-        await new Promise((resolve) => setTimeout(resolve, 5));
-        events.push('embed:end');
-        return texts.map(() => new Float32Array(FAKE_DIM));
-      };
       const lifecycle = createRecallLifecycle({
         vaultRoot: root,
         companionVersion: '0.0.0-test',
         currentModelId: 'fresh/model',
         rebuilder: slowRebuilder,
-        embedder: fakeEmbedder,
+        embedder: () => Promise.resolve([]),
         log: () => undefined,
         warn: () => undefined,
       });
       lifecycle.scheduleRebuild('manual');
-      const appendPromise = lifecycle.appendCaptureTurns([
-        { id: 't:0', threadId: 't', capturedAt: '2026-05-04T00:00:00.000Z', text: 'x' },
-      ]);
+      const embedding = new Float32Array(FAKE_DIM);
+      embedding[0] = 1;
+      const appendPromise = (async () => {
+        events.push('append:queued');
+        await lifecycle.appendEntry({
+          id: 't:0',
+          threadId: 't',
+          capturedAt: '2026-05-04T00:00:00.000Z',
+          embedding,
+        });
+        events.push('append:done');
+      })();
       await lifecycle.waitForRebuild();
       await appendPromise;
 
       const rebuildEnd = events.indexOf('rebuild:end');
-      const embedStart = events.findIndex((event) => event.startsWith('embed:start'));
-      // Mutex invariant: the embed-driven append cannot start before
-      // the rebuild finishes.
+      const appendDone = events.indexOf('append:done');
+      // Mutex invariant: appendEntry waits for the rebuild to
+      // finish before its own write commits. Even though both got
+      // scheduled near-concurrently, the enqueueWrite lane forces
+      // FIFO ordering.
       expect(rebuildEnd).toBeGreaterThan(-1);
-      expect(embedStart).toBeGreaterThan(rebuildEnd);
+      expect(appendDone).toBeGreaterThan(rebuildEnd);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

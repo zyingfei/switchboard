@@ -3,6 +3,7 @@ import { expect, test } from '@playwright/test';
 import { messageTypes } from '../../src/messages';
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
 import {
+  SETTINGS_KEY,
   THREADS_KEY,
   WORKSTREAMS_KEY,
   assertOk,
@@ -19,6 +20,14 @@ test.describe('fork lineage (synthetic)', () => {
       const parentUrl = 'https://claude.ai/chat/parent-synthetic';
       const childUrl = 'https://claude.ai/chat/child-synthetic';
       const page = await seedAndOpenSidepanel(runtime, {
+        // autoTrack: true so the autoCapture gate at
+        // background.ts:~1758 forwards an unseeded child thread
+        // through to storeCaptureEvent. Default false would drop.
+        [SETTINGS_KEY]: {
+          companion: { port: 17_373, bridgeKey: '' },
+          autoTrack: true,
+          siteToggles: { chatgpt: true, claude: true, gemini: true, codex: true },
+        },
         [WORKSTREAMS_KEY]: [
           {
             bac_id: 'ws_research',

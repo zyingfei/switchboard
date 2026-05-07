@@ -236,4 +236,105 @@ describe('two-replica review-draft simulation', () => {
     expect(eventDominates(aEdit as AcceptedEvent, bEdit as AcceptedEvent)).toBe(false);
     expect(eventDominates(bEdit as AcceptedEvent, aEdit as AcceptedEvent)).toBe(false);
   });
+
+  it('T2.5 — concurrent append-only captures from both replicas survive a partition + rejoin', async () => {
+    // Append-only events (capture.recorded) are NOT subject to
+    // mergeRegister or OR-Set semantics — they're a linearizable
+    // union. This test proves: if A captures while partitioned
+    // from B, and B captures while partitioned from A (each
+    // with empty deps because neither has seen the other),
+    // after sync both replicas have BOTH events with their
+    // distinct dots intact. Nothing collapses. Nothing dedupes.
+    const captureA = await A.log.appendClient({
+      clientEventId: 'capture-on-A',
+      aggregateId: 'thread_capture_a',
+      type: 'capture.recorded',
+      payload: {
+        bac_id: 'thread_capture_a',
+        capturedAt: '2026-05-07T09:00:00.000Z',
+        turns: [{ ordinal: 0, role: 'user', text: 'A side capture' }],
+      },
+      baseVector: {},
+    });
+    const captureB = await B.log.appendClient({
+      clientEventId: 'capture-on-B',
+      aggregateId: 'thread_capture_b',
+      type: 'capture.recorded',
+      payload: {
+        bac_id: 'thread_capture_b',
+        capturedAt: '2026-05-07T09:00:01.000Z',
+        turns: [{ ordinal: 0, role: 'user', text: 'B side capture' }],
+      },
+      baseVector: {},
+    });
+
+    // Partition + rejoin.
+    await syncLogs(A, B);
+    await syncLogs(B, A);
+
+    // Both replicas' merged logs contain both events keyed by
+    // their original dots (no re-stamping).
+    const mergedFromA = (await A.log.readMerged()).filter(
+      (e) => e.type === 'capture.recorded',
+    );
+    const mergedFromB = (await B.log.readMerged()).filter(
+      (e) => e.type === 'capture.recorded',
+    );
+    const dotsA = mergedFromA
+      .map((e) => `${e.dot.replicaId}:${String(e.dot.seq)}`)
+      .sort();
+    const dotsB = mergedFromB
+      .map((e) => `${e.dot.replicaId}:${String(e.dot.seq)}`)
+      .sort();
+    expect(dotsA).toEqual(dotsB);
+    expect(dotsA.length).toBe(2);
+    // Neither dominates the other — concurrent append-only.
+    expect(eventDominates(captureA as AcceptedEvent, captureB as AcceptedEvent)).toBe(false);
+    expect(eventDominates(captureB as AcceptedEvent, captureA as AcceptedEvent)).toBe(false);
+    // Distinct aggregateIds + clientEventIds — neither replica
+    // can confuse them via dedupe.
+    const aggregates = new Set(mergedFromA.map((e) => e.aggregateId));
+    expect(aggregates).toEqual(new Set(['thread_capture_a', 'thread_capture_b']));
+  });
+
+  it('T2.6 — multi-field concurrent edits: A overall, B verdict — both slots resolve independently after sync', async () => {
+    // Different register slots on the same aggregate are
+    // independent: A editing `overall` does NOT conflict with B
+    // editing `verdict`. Both projections collapse to resolved
+    // values after sync, on both replicas.
+    await A.log.appendClient({
+      clientEventId: 'a-overall',
+      aggregateId: 'thread_multi',
+      type: 'review-draft.overall.set',
+      payload: { text: 'A side overall' },
+      baseVector: {},
+    });
+    await B.log.appendClient({
+      clientEventId: 'b-verdict',
+      aggregateId: 'thread_multi',
+      type: 'review-draft.verdict.set',
+      payload: { value: 'partial' },
+      baseVector: {},
+    });
+
+    await syncLogs(A, B);
+    await syncLogs(B, A);
+
+    // Project on each side — both slots resolved, both values
+    // present, no conflict in either field.
+    const projectionA = projectReviewDraft(
+      'thread_multi',
+      '',
+      await A.log.readByAggregate('thread_multi'),
+    );
+    const projectionB = projectReviewDraft(
+      'thread_multi',
+      '',
+      await B.log.readByAggregate('thread_multi'),
+    );
+    expect(projectionA.overall).toMatchObject({ status: 'resolved', value: 'A side overall' });
+    expect(projectionA.verdict).toMatchObject({ status: 'resolved', value: 'partial' });
+    expect(projectionB.overall).toMatchObject({ status: 'resolved', value: 'A side overall' });
+    expect(projectionB.verdict).toMatchObject({ status: 'resolved', value: 'partial' });
+  });
 });

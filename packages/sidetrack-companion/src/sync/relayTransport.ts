@@ -87,6 +87,12 @@ export const createRelayTransport = (options: RelayTransportOptions): LogTranspo
   let consecutiveFailures = 0;
   let stopped = false;
   let subscribed = false;
+  // Health surface: track when we last had an OPEN socket so the
+  // companion's /v1/system/health can distinguish "connected
+  // recently" from "never connected" without reaching into ws
+  // internals. Updated on the on('open') hook below.
+  let lastConnectedAtMs: number | null = null;
+  let lastDisconnectedAtMs: number | null = null;
 
   const ws = (): WsWebSocket => {
     if (options.fetchWebSocket !== undefined) return options.fetchWebSocket(options.relayUrl);
@@ -232,6 +238,7 @@ export const createRelayTransport = (options: RelayTransportOptions): LogTranspo
       socket = next;
       next.on('open', () => {
         consecutiveFailures = 0;
+        lastConnectedAtMs = Date.now();
         try {
           next.send(encodeFrame({ kind: 'HELLO', protocol_version: PROTOCOL_VERSION }));
         } catch {
@@ -242,6 +249,7 @@ export const createRelayTransport = (options: RelayTransportOptions): LogTranspo
       next.on('close', () => {
         if (stopped) return;
         consecutiveFailures += 1;
+        lastDisconnectedAtMs = Date.now();
         socket = null;
         subscribed = false;
         connecting = false;
@@ -312,7 +320,36 @@ export const createRelayTransport = (options: RelayTransportOptions): LogTranspo
   // Expose stop for runtime shutdown wiring.
   Object.defineProperty(publishEvent, 'stop', { value: stop });
 
+  // Health surface for /v1/system/health.sync. The runtime reads
+  // this each request, so it's a snapshot — `connected` is "the
+  // socket is currently OPEN," not "we've ever connected." Use
+  // lastConnectedAtMs for the "we WERE connected" affordance.
+  const getStatus = (): RelayTransportStatus => ({
+    connected: socket?.readyState === WsWebSocket.OPEN,
+    consecutiveFailures,
+    pendingPublishes: pendingPublishes.length,
+    ...(lastConnectedAtMs === null ? {} : { lastConnectedAtMs }),
+    ...(lastDisconnectedAtMs === null ? {} : { lastDisconnectedAtMs }),
+  });
+  Object.defineProperty(publishEvent, 'getStatus', { value: getStatus });
+
   return { publishEvent, subscribePeers };
+};
+
+export interface RelayTransportStatus {
+  readonly connected: boolean;
+  readonly lastConnectedAtMs?: number;
+  readonly lastDisconnectedAtMs?: number;
+  readonly consecutiveFailures: number;
+  readonly pendingPublishes: number;
+}
+
+export const getRelayTransportStatus = (
+  transport: LogTransport,
+): RelayTransportStatus | null => {
+  const get = (transport.publishEvent as unknown as { getStatus?: () => RelayTransportStatus })
+    .getStatus;
+  return typeof get === 'function' ? get() : null;
 };
 
 export const stopRelayTransport = (transport: LogTransport): void => {

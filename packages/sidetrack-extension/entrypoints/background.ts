@@ -21,6 +21,7 @@ import { createSettingsClient } from '../src/settings/client';
 import type {
   CaptureEvent,
   CompanionSettings,
+  CompanionStatus,
   CodingAttachTokenCreate,
   CodingAttachTokenRecord,
   QueueCreate,
@@ -270,6 +271,8 @@ const broadcastWorkboardChanged = async (
     | 'queue'
     | 'workstream'
     | 'thread'
+    | 'annotation'
+    | 'dispatch'
     | 'settings',
 ): Promise<void> => {
   await chrome.runtime
@@ -540,7 +543,10 @@ const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
   await recordSelectorCanary(event);
 };
 
-const storeCaptureEvent = async (event: CaptureEvent): Promise<void> => {
+const storeCaptureEvent = async (
+  event: CaptureEvent,
+  intent: 'explicit' | 'passive' = 'passive',
+): Promise<void> => {
   if (!(await isCompanionConfigured())) {
     await storeCaptureEventLocal(event);
     return;
@@ -548,7 +554,24 @@ const storeCaptureEvent = async (event: CaptureEvent): Promise<void> => {
   try {
     await sendToCompanion(event);
   } catch {
-    await enqueueCapture(event);
+    // No-data-loss policy: explicit captures get protective queue
+    // handling (drop-passive on overflow, reject when fully
+    // explicit). Passive captures keep drop-oldest semantics.
+    const result = await enqueueCapture(event, undefined, undefined, intent);
+    if (!result.accepted) {
+      // The side panel surfaces this via lastQueueRejection in
+      // workboard state; we still write the event into local
+      // chrome.storage so the UI can show the optimistic span/turn,
+      // but the user gets a clear "queue full — companion offline"
+      // banner.
+      await chrome.storage.local.set({
+        'sidetrack.captureQueue.lastRejection': {
+          reason: result.reason,
+          at: new Date().toISOString(),
+          threadUrl: event.threadUrl,
+        },
+      });
+    }
     await storeCaptureEventLocal(event);
   }
 };
@@ -596,7 +619,10 @@ const captureTab = async (): Promise<void> => {
     tabSnapshot: snapshotFromTab(tab, baseCapture.capturedAt),
   };
 
-  await storeCaptureEvent(event);
+  // Explicit gesture — captureTab is wired to the + Capture button.
+  // Drop-on-overflow becomes reject-on-overflow with a banner in
+  // the side panel.
+  await storeCaptureEvent(event, 'explicit');
 
   // Explicit captureCurrentTab means the user is actively looking at
   // this thread — any pending "Unread reply" reminders for it are
@@ -724,12 +750,26 @@ const verifyCompanionSettingsBeforeSave = async (
   return normalized;
 };
 
+// Cached relay status from the most recent /v1/status response.
+// buildWorkboardState reads this to surface the relay-disconnected
+// banner — without caching, every state read would need a separate
+// HTTP round-trip. Reset to null when settings change so a stale
+// "connected" banner doesn't survive a companion swap.
+let cachedRelayStatus: NonNullable<CompanionStatus['sync']>['relay'] | null = null;
+
+export const peekCachedRelayStatus = (): typeof cachedRelayStatus => cachedRelayStatus;
+
 const assertCompanionReachable = async (): Promise<'connected' | 'vault-error' | 'local-only'> => {
   const settings = await readSettings();
   if (settings.companion.bridgeKey.length === 0) {
+    cachedRelayStatus = null;
     return 'local-only';
   }
   const status = await createCompanionClient(settings.companion).status();
+  // Capture the live relay block (if any) so the workboard-state
+  // builder can route a relay-disconnected banner without a
+  // second round-trip.
+  cachedRelayStatus = status.sync?.relay ?? null;
   return status.vault === 'connected' ? 'connected' : 'vault-error';
 };
 
@@ -1159,8 +1199,13 @@ const buildState = async (
   lastError?: string,
 ): Promise<WorkboardState> => {
   const tab = await activeTab();
+  // Pull the cached relay status set by the most recent
+  // assertCompanionReachable. Always fresh on a polling refresh
+  // because withCompanionStatus calls assertCompanionReachable
+  // before invoking buildState.
+  const relayHealth = cachedRelayStatus ?? undefined;
   return {
-    ...(await buildWorkboardState(companionStatus, lastError)),
+    ...(await buildWorkboardState(companionStatus, lastError, relayHealth)),
     ...(tab?.url === undefined ? {} : { activeTabUrl: tab.url }),
     currentTab: await currentTabThread(),
   };
@@ -1375,10 +1420,23 @@ const refreshCachedDispatches = async (): Promise<void> => {
         .filter((d) => d.status === 'replied' || d.status === 'archived')
         .map((d) => [d.bac_id, d.status]),
     );
-    const merged = dispatches.map((d) => {
-      const override = localOverrides.get(d.bac_id);
-      return override === undefined ? d : { ...d, status: override };
-    });
+    // F15 — peer-mirrored dispatches arrive via the
+    // `_BAC/dispatches/` SSE subscription and land in
+    // recentDispatches via mirrorRemoteDispatch. Companion's GET
+    // /v1/dispatches sources from the LOCAL JSONL writer only, so
+    // peer dispatches aren't in `dispatches` here. Without this
+    // merge the periodic poll would clobber every peer-mirrored
+    // entry on every refresh; we union by bac_id so peer entries
+    // survive.
+    const remoteIds = new Set(dispatches.map((d) => d.bac_id));
+    const peerOnly = local.filter((d) => !remoteIds.has(d.bac_id));
+    const merged = [
+      ...dispatches.map((d) => {
+        const override = localOverrides.get(d.bac_id);
+        return override === undefined ? d : { ...d, status: override };
+      }),
+      ...peerOnly,
+    ];
     await writeCachedDispatches(merged);
     await openAutoApprovedMcpDispatches(merged);
   } catch {
@@ -1404,6 +1462,15 @@ const withCompanionStatus = async (
     }
     return { ok: true, state };
   } catch (error) {
+    // The side panel needs to learn about a transition to
+    // disconnected (or vault-error) the same way it learns about
+    // a successful capture. Without this broadcast, the user
+    // takes an action while offline, the optimistic local write
+    // happens, and the UI silently lies "connected" until the
+    // 15s periodic poll at sidepanel/App.tsx:723 catches up.
+    if (work !== undefined && reason !== undefined) {
+      void broadcastWorkboardChanged(reason);
+    }
     return {
       ok: false,
       error: error instanceof Error ? error.message : 'Sidetrack background action failed.',
@@ -1773,6 +1840,20 @@ const handleRequest = async (
 
   if (request.type === messageTypes.captureCurrentTab) {
     return await withCompanionStatus(captureTab, 'capture');
+  }
+
+  if (request.type === messageTypes.retryFailedCaptures) {
+    return await withCompanionStatus(async () => {
+      const { retryFailedCaptures } = await import('../src/companion/queue');
+      await retryFailedCaptures();
+      // Clear the latest rejection signal — the user has acknowledged
+      // the banner. Banner re-shows if the next drain produces fresh
+      // failures or rejections.
+      await chrome.storage.local.remove('sidetrack.captureQueue.lastRejection');
+      // Drain immediately so the user sees the banner clear instead
+      // of waiting for the next workboard tick.
+      await replayQueuedCaptures();
+    }, 'capture');
   }
 
   if (request.type === messageTypes.createWorkstream) {
@@ -2576,6 +2657,274 @@ export default defineBackground(() => {
   chrome.storage.onChanged.addListener(() => {
     void refreshCompanionCache();
   });
+  // F9 — thread state SSE subscription. Same vaultChangesClient
+  // is reused for both prefixes (its dispatch filters by prefix
+  // client-side at vaultChanges.ts:128); no second connection.
+  // Drives cross-browser real-time propagation: a peer's
+  // capture.recorded → projector updates threads.json → vault-
+  // changes SSE fires → mirrorRemoteThread updates the local
+  // chrome.storage.sidetrack.threads → side panel re-renders via
+  // its existing chrome.runtime.onMessage listener (the SSE
+  // event itself doesn't trigger a refresh, so the next periodic
+  // poll picks up the storage change). Without this, T6.1 fails.
+  const fetchThreadProjection = async (
+    cfg: { url: string; bridgeKey: string },
+    bacId: string,
+  ): Promise<{
+    bac_id: string;
+    record: import('../src/background/state').RemoteThreadProjection['record'];
+    status: import('../src/background/state').RemoteThreadProjection['status'];
+    deleted: boolean;
+  } | null> => {
+    try {
+      const r = await fetch(
+        `${cfg.url.replace(/\/$/, '')}/v1/threads/${encodeURIComponent(bacId)}/projection`,
+        { headers: { 'x-bac-bridge-key': cfg.bridgeKey } },
+      );
+      if (!r.ok) return null;
+      const body = (await r.json()) as { data?: unknown };
+      if (typeof body.data !== 'object' || body.data === null) return null;
+      const d = body.data as {
+        bac_id?: unknown;
+        record?: unknown;
+        status?: unknown;
+        deleted?: unknown;
+      };
+      if (typeof d.bac_id !== 'string') return null;
+      return {
+        bac_id: d.bac_id,
+        record: d.record as import('../src/background/state').RemoteThreadProjection['record'],
+        status: d.status as import('../src/background/state').RemoteThreadProjection['status'],
+        deleted: d.deleted === true,
+      };
+    } catch {
+      return null;
+    }
+  };
+  reviewDraftsSse.subscribe({
+    prefix: '_BAC/threads/projections/',
+    onEvent: (event) => {
+      // relPath shape: `_BAC/threads/<bac_id>.json`.
+      const m = /^_BAC\/threads\/projections\/(?<id>[^/]+?)\.json$/.exec(event.relPath);
+      const bacId = m?.groups?.id;
+      if (bacId === undefined) return;
+      void (async () => {
+        const cached = await refreshCompanionCache();
+        if (cached === null) return;
+        const cfg = { url: cached.companionUrl, bridgeKey: cached.bridgeKey };
+        const projection = await fetchThreadProjection(cfg, bacId);
+        if (projection === null) return;
+        const { mirrorRemoteThread } = await import('../src/background/state');
+        await mirrorRemoteThread(projection);
+        // Broadcast so any open side panel refreshes its state
+        // and renders the new thread row immediately. Without
+        // this, the storage write happens but the side panel
+        // doesn't re-read until the 15 s periodic poll.
+        void broadcastWorkboardChanged('thread');
+      })().catch(() => undefined);
+    },
+  });
+
+  // F10 — workstream state SSE subscription. Same pattern as F9
+  // for threads. A peer creating a workstream + moving threads
+  // into it triggers `_BAC/workstreams/<id>.json` writes via the
+  // companion's import projector; without this subscription the
+  // moved thread lands with a primaryWorkstreamId the local
+  // extension's chrome.storage doesn't know, so the side panel
+  // renders the row under "Ungrouped" instead of the workstream.
+  const fetchWorkstreamProjection = async (
+    cfg: { url: string; bridgeKey: string },
+    bacId: string,
+  ): Promise<{
+    bac_id: string;
+    record: import('../src/background/state').RemoteWorkstreamProjection['record'];
+    deleted: boolean;
+  } | null> => {
+    try {
+      const r = await fetch(
+        `${cfg.url.replace(/\/$/, '')}/v1/workstreams/${encodeURIComponent(bacId)}/projection`,
+        { headers: { 'x-bac-bridge-key': cfg.bridgeKey } },
+      );
+      if (!r.ok) return null;
+      const body = (await r.json()) as { data?: unknown };
+      if (typeof body.data !== 'object' || body.data === null) return null;
+      const d = body.data as { bac_id?: unknown; record?: unknown; deleted?: unknown };
+      if (typeof d.bac_id !== 'string') return null;
+      return {
+        bac_id: d.bac_id,
+        record:
+          d.record as import('../src/background/state').RemoteWorkstreamProjection['record'],
+        deleted: d.deleted === true,
+      };
+    } catch {
+      return null;
+    }
+  };
+  reviewDraftsSse.subscribe({
+    prefix: '_BAC/workstreams/projections/',
+    onEvent: (event) => {
+      const m = /^_BAC\/workstreams\/projections\/(?<id>[^/]+?)\.json$/.exec(event.relPath);
+      const bacId = m?.groups?.id;
+      if (bacId === undefined) return;
+      void (async () => {
+        const cached = await refreshCompanionCache();
+        if (cached === null) return;
+        const cfg = { url: cached.companionUrl, bridgeKey: cached.bridgeKey };
+        const projection = await fetchWorkstreamProjection(cfg, bacId);
+        if (projection === null) return;
+        const { mirrorRemoteWorkstream } = await import('../src/background/state');
+        await mirrorRemoteWorkstream(projection);
+        void broadcastWorkboardChanged('workstream');
+      })().catch(() => undefined);
+    },
+  });
+
+  // F13 — annotation state SSE subscription. A peer's
+  // annotation.{created,noteSet,deleted} → projector writes
+  // `_BAC/annotations/<id>.json` → SSE fires here. We don't
+  // mirror into chrome.storage (annotations don't live there;
+  // the content script fetches them on page load via
+  // listAnnotationsByUrl). Instead, we forward a refresh signal
+  // to all matching tabs so any open AnnotationOverlay re-fetches
+  // and re-renders without a page reload.
+  const fetchAnnotationProjection = async (
+    cfg: { url: string; bridgeKey: string },
+    bacId: string,
+  ): Promise<{ entry?: { url?: string; deleted?: boolean } } | null> => {
+    try {
+      const r = await fetch(
+        `${cfg.url.replace(/\/$/, '')}/v1/annotations/${encodeURIComponent(bacId)}/projection`,
+        { headers: { 'x-bac-bridge-key': cfg.bridgeKey } },
+      );
+      if (!r.ok) return null;
+      const body = (await r.json()) as { data?: unknown };
+      if (typeof body.data !== 'object' || body.data === null) return null;
+      return body.data as { entry?: { url?: string; deleted?: boolean } };
+    } catch {
+      return null;
+    }
+  };
+  reviewDraftsSse.subscribe({
+    prefix: '_BAC/annotations/projections/',
+    onEvent: (event) => {
+      const m = /^_BAC\/annotations\/projections\/(?<id>[^/]+?)\.json$/.exec(event.relPath);
+      const bacId = m?.groups?.id;
+      if (bacId === undefined) return;
+      void (async () => {
+        const cached = await refreshCompanionCache();
+        if (cached === null) return;
+        const cfg = { url: cached.companionUrl, bridgeKey: cached.bridgeKey };
+        const projection = await fetchAnnotationProjection(cfg, bacId);
+        const url = projection?.entry?.url;
+        if (typeof url !== 'string' || url.length === 0) return;
+        // Tell every tab whose URL matches the annotation's URL
+        // to re-fetch its annotation set. The content script
+        // listens on a known message type and calls
+        // restoreAnnotations() which re-mounts the overlay.
+        try {
+          const tabs = await chrome.tabs.query({ url });
+          for (const tab of tabs) {
+            if (typeof tab.id !== 'number') continue;
+            chrome.tabs
+              .sendMessage(tab.id, { type: 'sidetrack.annotation.refresh' })
+              .catch(() => undefined);
+          }
+        } catch {
+          // chrome.tabs.query rejects on invalid URL patterns; ignore.
+        }
+        void broadcastWorkboardChanged('annotation');
+      })().catch(() => undefined);
+    },
+  });
+
+  // F14 — queue state SSE subscription. Per-id projection writes
+  // `_BAC/queue/<id>.json`. mirrorRemoteQueueItem updates
+  // `sidetrack.queueItems`; broadcastWorkboardChanged forces the
+  // side panel to re-read.
+  const fetchQueueProjection = async (
+    cfg: { url: string; bridgeKey: string },
+    bacId: string,
+  ): Promise<import('../src/background/state').RemoteQueueItemProjection | null> => {
+    try {
+      const r = await fetch(
+        `${cfg.url.replace(/\/$/, '')}/v1/queue/${encodeURIComponent(bacId)}/projection`,
+        { headers: { 'x-bac-bridge-key': cfg.bridgeKey } },
+      );
+      if (!r.ok) return null;
+      const body = (await r.json()) as { data?: unknown };
+      if (typeof body.data !== 'object' || body.data === null) return null;
+      return body.data as import('../src/background/state').RemoteQueueItemProjection;
+    } catch {
+      return null;
+    }
+  };
+  reviewDraftsSse.subscribe({
+    prefix: '_BAC/queue/projections/',
+    onEvent: (event) => {
+      const m = /^_BAC\/queue\/projections\/(?<id>[^/]+?)\.json$/.exec(event.relPath);
+      const bacId = m?.groups?.id;
+      if (bacId === undefined) return;
+      void (async () => {
+        const cached = await refreshCompanionCache();
+        if (cached === null) return;
+        const cfg = { url: cached.companionUrl, bridgeKey: cached.bridgeKey };
+        const projection = await fetchQueueProjection(cfg, bacId);
+        if (projection === null) return;
+        const { mirrorRemoteQueueItem } = await import('../src/background/state');
+        await mirrorRemoteQueueItem(projection);
+        void broadcastWorkboardChanged('queue');
+      })().catch(() => undefined);
+    },
+  });
+
+  // F15 — dispatch state SSE subscription. Per-id projection writes
+  // `_BAC/dispatches/<id>.json`. mirrorRemoteDispatch updates the
+  // `sidetrack.recentDispatches` cache + dispatch link map.
+  const fetchDispatchProjection = async (
+    cfg: { url: string; bridgeKey: string },
+    bacId: string,
+  ): Promise<import('../src/background/state').RemoteDispatchProjection | null> => {
+    try {
+      const r = await fetch(
+        `${cfg.url.replace(/\/$/, '')}/v1/dispatches/${encodeURIComponent(bacId)}/projection`,
+        { headers: { 'x-bac-bridge-key': cfg.bridgeKey } },
+      );
+      if (!r.ok) return null;
+      const body = (await r.json()) as { data?: unknown };
+      if (typeof body.data !== 'object' || body.data === null) return null;
+      const d = body.data as { entry?: unknown; link?: unknown };
+      return {
+        bac_id: bacId,
+        ...(d.entry === undefined
+          ? {}
+          : { entry: d.entry as import('../src/background/state').RemoteDispatchProjection['entry'] }),
+        ...(d.link === undefined
+          ? {}
+          : { link: d.link as import('../src/background/state').RemoteDispatchProjection['link'] }),
+      };
+    } catch {
+      return null;
+    }
+  };
+  reviewDraftsSse.subscribe({
+    prefix: '_BAC/dispatches/projections/',
+    onEvent: (event) => {
+      const m = /^_BAC\/dispatches\/projections\/(?<id>[^/]+?)\.json$/.exec(event.relPath);
+      const bacId = m?.groups?.id;
+      if (bacId === undefined) return;
+      void (async () => {
+        const cached = await refreshCompanionCache();
+        if (cached === null) return;
+        const cfg = { url: cached.companionUrl, bridgeKey: cached.bridgeKey };
+        const projection = await fetchDispatchProjection(cfg, bacId);
+        if (projection === null) return;
+        const { mirrorRemoteDispatch } = await import('../src/background/state');
+        await mirrorRemoteDispatch(projection);
+        void broadcastWorkboardChanged('dispatch');
+      })().catch(() => undefined);
+    },
+  });
+
   reviewDraftsSse.subscribe({
     prefix: '_BAC/review-drafts/',
     onEvent: (event) => {

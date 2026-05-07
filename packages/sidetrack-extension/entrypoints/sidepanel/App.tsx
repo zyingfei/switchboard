@@ -690,11 +690,28 @@ const App = () => {
   }, [composeThread, composeWorkstreamOverrideId, state.workstreams]);
 
   const refresh = async () => {
-    const next = await sendRequest({ type: messageTypes.getWorkboardState });
+    // Use sendRequestRaw so we can consume state from `ok:false`
+    // responses too. getWorkboardState returns ok:false +
+    // state.companionStatus='disconnected' when the companion is
+    // unreachable; throwing there means the side panel discards
+    // the disconnected state and the user keeps seeing a stale
+    // "connected" UI. Refresh is a poll, not an action — it
+    // should reflect whatever state the background has.
+    const response = (await chrome.runtime.sendMessage({
+      type: messageTypes.getWorkboardState,
+    })) as unknown;
+    if (!isRuntimeResponse(response)) {
+      throw new Error('Sidetrack background returned an invalid response.');
+    }
+    if (!response.ok && response.state === undefined) {
+      // No state to consume — surface the error and bail.
+      throw new Error(response.error);
+    }
+    const next = response.ok ? response.state : response.state!;
     setState(next);
     setBridgeKey(next.settings.companion.bridgeKey);
     setPort(String(next.settings.companion.port));
-    setError(next.lastError ?? null);
+    setError(next.lastError ?? (response.ok ? null : response.error ?? null));
     if (next.vaultPath !== undefined) {
       setVaultPath(next.vaultPath);
     }
@@ -2358,6 +2375,19 @@ const App = () => {
   // is unreachable.
   const companionDisconnected =
     !localOnlyMode && (bridgeKey.trim().length === 0 || state.companionStatus === 'disconnected');
+  // Relay banner is gated on the companion being reachable —
+  // if companion is down we already show that, no point also
+  // claiming peer-sync is paused (it definitionally is). Only
+  // surface relay-down when we have a live status block AND
+  // it reports !connected.
+  const relayConfigured = state.relayHealth !== undefined;
+  const relayDown =
+    relayConfigured && !companionDisconnected && state.relayHealth?.connected === false;
+  const relayStatusForBanner: 'up' | 'down' | 'unconfigured' = !relayConfigured
+    ? 'unconfigured'
+    : relayDown
+      ? 'down'
+      : 'up';
   const vaultUnreachable = state.companionStatus === 'vault-error';
   const providerHealth = state.selectorHealth.find((entry) => entry.latestStatus !== 'ok');
   const workstreamOptions = useMemo(
@@ -2366,9 +2396,11 @@ const App = () => {
   );
   const hasSystemBanners =
     companionDisconnected ||
+    relayDown ||
     vaultUnreachable ||
     providerHealth !== undefined ||
     state.queuedCaptureCount > 0 ||
+    (state.failedCaptureCount ?? 0) > 0 ||
     captureToastHost !== null;
 
   // Current workstream id; null = "not set / Inbox" (special).
@@ -4180,10 +4212,15 @@ const App = () => {
             captureSuccessHost={captureToastHost ?? undefined}
             companionActionLabel="Open setup"
             companionStatus={companionDisconnected ? 'down' : 'running'}
+            relayStatus={relayStatusForBanner}
             vaultStatus={vaultUnreachable ? 'unreachable' : 'connected'}
             providerHealth={providerHealth ? 'degraded' : 'ok'}
             providerHealthDetail={providerHealth?.warning}
             queuedCount={state.queuedCaptureCount}
+            failedCount={state.failedCaptureCount ?? 0}
+            {...(state.lastQueueRejectionAt === undefined
+              ? {}
+              : { lastRejectionAt: state.lastQueueRejectionAt })}
             onQueueDiagnostic={() => {
               void refresh();
             }}
@@ -4192,6 +4229,11 @@ const App = () => {
             }}
             onRetryCompanion={() => {
               setWizardOpen(true);
+            }}
+            onRetryFailedCaptures={() => {
+              void runAction(async () =>
+                sendRequest({ type: messageTypes.retryFailedCaptures }),
+              );
             }}
           />
         </div>

@@ -2,11 +2,14 @@ import { describe, expect, it } from 'vitest';
 
 import type { CaptureEvent } from '../../src/companion/model';
 import {
+  clearFailedCaptures,
   computeNextAttempt,
   drainQueue,
   enqueueCapture,
   readDroppedCount,
+  readFailedCaptures,
   readQueue,
+  retryFailedCaptures,
   type StoragePort,
 } from '../../src/companion/queue';
 
@@ -158,5 +161,158 @@ describe('capture queue', () => {
     expect(result).toEqual({ sent: 0, remaining: 0 });
     expect(await readQueue(storage)).toEqual([]);
     expect(await readDroppedCount(storage)).toBe(1);
+  });
+
+  describe('intent-tagged overflow', () => {
+    it('passive captures keep drop-oldest semantics (back-compat)', async () => {
+      const storage = createMemoryStorage();
+      await enqueueCapture(event('https://e.test/1'), storage, 2, 'passive');
+      await enqueueCapture(event('https://e.test/2'), storage, 2, 'passive');
+      const r = await enqueueCapture(event('https://e.test/3'), storage, 2, 'passive');
+      expect(r.accepted).toBe(true);
+      expect(r.evicted).toBe(1);
+      const queue = await readQueue(storage);
+      expect(queue.every((q) => q.intent === 'passive')).toBe(true);
+    });
+
+    it('explicit capture evicts the oldest passive item when the queue is full of passives', async () => {
+      const storage = createMemoryStorage();
+      await enqueueCapture(event('https://e.test/p1'), storage, 2, 'passive');
+      await enqueueCapture(event('https://e.test/p2'), storage, 2, 'passive');
+      const r = await enqueueCapture(event('https://e.test/explicit'), storage, 2, 'explicit');
+      expect(r.accepted).toBe(true);
+      expect(r.evicted).toBe(1);
+      const queue = await readQueue(storage);
+      // The newest item is explicit; one passive remains.
+      const explicitCount = queue.filter((q) => q.intent === 'explicit').length;
+      const passiveCount = queue.filter((q) => q.intent === 'passive').length;
+      expect(explicitCount).toBe(1);
+      expect(passiveCount).toBe(1);
+      // The oldest passive (p1) should have been evicted.
+      expect(queue.map((q) => q.event.threadUrl)).not.toContain('https://e.test/p1');
+    });
+
+    it('rejects an explicit capture when the queue is fully explicit', async () => {
+      const storage = createMemoryStorage();
+      await enqueueCapture(event('https://e.test/x1'), storage, 2, 'explicit');
+      await enqueueCapture(event('https://e.test/x2'), storage, 2, 'explicit');
+      const r = await enqueueCapture(event('https://e.test/x3'), storage, 2, 'explicit');
+      expect(r.accepted).toBe(false);
+      expect(r.reason).toBe('queue-full-explicit');
+      const queue = await readQueue(storage);
+      // Original two explicit captures stay intact; the rejected
+      // payload is NOT on the queue.
+      expect(queue.map((q) => q.event.threadUrl)).toEqual([
+        'https://e.test/x1',
+        'https://e.test/x2',
+      ]);
+    });
+
+    it('drainQueue still sends the wire CaptureEvent shape for both intents', async () => {
+      const storage = createMemoryStorage();
+      await enqueueCapture(event('https://e.test/p'), storage, 5, 'passive');
+      await enqueueCapture(event('https://e.test/x'), storage, 5, 'explicit');
+      const sent: string[] = [];
+      const result = await drainQueue(
+        async (e: CaptureEvent) => {
+          sent.push(e.threadUrl);
+        },
+        storage,
+        new Date('2030-01-01T00:00:00.000Z'),
+        () => 0.5,
+        { ignoreBackoff: true },
+      );
+      expect(result.sent).toBe(2);
+      expect(sent.sort()).toEqual(['https://e.test/p', 'https://e.test/x']);
+    });
+  });
+
+  describe('failed-queue persistence', () => {
+    it('moves explicit captures into the failed queue after retry exhaustion', async () => {
+      const storage = createMemoryStorage();
+      await enqueueCapture(event('https://e.test/explicit-fail'), storage, 5, 'explicit');
+      // Drive 13 drains so the same item exhausts its retry budget.
+      // ignoreBackoff:true makes every drain attempt the item.
+      for (let i = 0; i < 13; i += 1) {
+        const baseTime = Date.parse('2026-04-26T21:30:00.000Z');
+        await drainQueue(
+          async () => {
+            throw new Error('still offline');
+          },
+          storage,
+          new Date(baseTime + i * 1000),
+          () => 0.5,
+          { ignoreBackoff: true },
+        );
+      }
+      const queueAfter = await readQueue(storage);
+      expect(queueAfter).toEqual([]);
+      const failed = await readFailedCaptures(storage);
+      expect(failed.length).toBe(1);
+      expect(failed[0]?.event.threadUrl).toBe('https://e.test/explicit-fail');
+      expect(failed[0]?.lastErrorMessage).toContain('still offline');
+    });
+
+    it('passive captures still drop silently — they do NOT land in the failed queue', async () => {
+      const storage = createMemoryStorage();
+      await enqueueCapture(event('https://e.test/passive-fail'), storage, 5, 'passive');
+      for (let i = 0; i < 13; i += 1) {
+        const baseTime = Date.parse('2026-04-26T21:30:00.000Z');
+        await drainQueue(
+          async () => {
+            throw new Error('still offline');
+          },
+          storage,
+          new Date(baseTime + i * 1000),
+          () => 0.5,
+          { ignoreBackoff: true },
+        );
+      }
+      expect(await readQueue(storage)).toEqual([]);
+      expect(await readFailedCaptures(storage)).toEqual([]);
+      expect(await readDroppedCount(storage)).toBe(1);
+    });
+
+    it('retryFailedCaptures re-enqueues failed items as fresh explicit captures and clears the failed queue', async () => {
+      const storage = createMemoryStorage();
+      await enqueueCapture(event('https://e.test/retry'), storage, 5, 'explicit');
+      for (let i = 0; i < 13; i += 1) {
+        await drainQueue(
+          async () => {
+            throw new Error('offline');
+          },
+          storage,
+          new Date(Date.parse('2026-04-26T21:30:00.000Z') + i * 1000),
+          () => 0.5,
+          { ignoreBackoff: true },
+        );
+      }
+      expect((await readFailedCaptures(storage)).length).toBe(1);
+      const result = await retryFailedCaptures(storage);
+      expect(result.requeued).toBe(1);
+      expect(await readFailedCaptures(storage)).toEqual([]);
+      const queue = await readQueue(storage);
+      expect(queue.length).toBe(1);
+      expect(queue[0]?.intent).toBe('explicit');
+    });
+
+    it('clearFailedCaptures wipes the persisted list', async () => {
+      const storage = createMemoryStorage();
+      await enqueueCapture(event('https://e.test/clear'), storage, 5, 'explicit');
+      for (let i = 0; i < 13; i += 1) {
+        await drainQueue(
+          async () => {
+            throw new Error('offline');
+          },
+          storage,
+          new Date(Date.parse('2026-04-26T21:30:00.000Z') + i * 1000),
+          () => 0.5,
+          { ignoreBackoff: true },
+        );
+      }
+      expect((await readFailedCaptures(storage)).length).toBe(1);
+      await clearFailedCaptures(storage);
+      expect(await readFailedCaptures(storage)).toEqual([]);
+    });
   });
 });
