@@ -2113,6 +2113,72 @@ const routes: readonly RouteDefinition[] = [
     },
   },
   {
+    // Per-annotation projection. F13 — extension's SSE subscriber
+    // hits this when `_BAC/annotations/<bac_id>.json` changes.
+    method: 'GET',
+    pattern: /^\/v1\/annotations\/(?<bacId>[A-Za-z0-9_-]+)\/projection$/,
+    authRequired: true,
+    handle: async (_request, _requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing bacId path parameter.');
+      }
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const merged = await context.eventLog.readByAggregate(match.bacId);
+      const projection = projectAnnotations(merged);
+      const entry = projection.entries.find((row) => row.bac_id === match.bacId);
+      return [
+        200,
+        {
+          data: {
+            ...(entry === undefined ? {} : { entry }),
+            vector: projection.vector,
+            updatedAtMs: projection.updatedAtMs,
+          },
+        },
+      ];
+    },
+  },
+  {
+    // Per-dispatch projection. F15 — extension's SSE subscriber
+    // hits this when `_BAC/dispatches/<bac_id>.json` changes.
+    method: 'GET',
+    pattern: /^\/v1\/dispatches\/(?<bacId>[A-Za-z0-9_-]+)\/projection$/,
+    authRequired: true,
+    handle: async (_request, _requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing bacId path parameter.');
+      }
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const merged = await context.eventLog.readByAggregate(match.bacId);
+      const projection = projectDispatches(merged);
+      const entry = projection.entries.find((row) => row.bac_id === match.bacId);
+      const link = projection.links.find((row) => row.dispatchId === match.bacId);
+      return [
+        200,
+        {
+          data: {
+            ...(entry === undefined ? {} : { entry }),
+            ...(link === undefined ? {} : { link }),
+            vector: projection.vector,
+            updatedAtMs: projection.updatedAtMs,
+          },
+        },
+      ];
+    },
+  },
+  {
     method: 'POST',
     pattern: /^\/v1\/recall\/index$/,
     authRequired: true,

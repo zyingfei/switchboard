@@ -852,6 +852,100 @@ export const mirrorRemoteWorkstream = async (
   await storageSet({ [WORKSTREAMS_KEY]: merged });
 };
 
+// F14 — peer-imported queue projection. The queue is an explicit
+// surface (status pending/done/dismissed), so we mirror the full
+// row into chrome.storage `sidetrack.queueItems`. Same shape as
+// mirrorRemoteThread/Workstream: collapse the status register,
+// merge by bac_id.
+export interface RemoteQueueItemProjection {
+  readonly bac_id: string;
+  readonly base?: {
+    readonly text: string;
+    readonly scope: 'thread' | 'workstream' | 'global';
+    readonly targetId?: string;
+  };
+  readonly status: RemoteRegister<QueueItem['status']>;
+}
+
+export const mirrorRemoteQueueItem = async (
+  projection: RemoteQueueItemProjection,
+): Promise<void> => {
+  const current = await readQueueItems();
+  if (projection.base === undefined) return;
+  const status = collapseRegister(projection.status) ?? 'pending';
+  const existing = current.find((q) => q.bac_id === projection.bac_id);
+  const next: QueueItem = {
+    ...(existing ?? {}),
+    bac_id: projection.bac_id,
+    text: projection.base.text,
+    scope: projection.base.scope,
+    status,
+    createdAt: existing?.createdAt ?? new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    ...(projection.base.targetId === undefined ? {} : { targetId: projection.base.targetId }),
+  };
+  const merged =
+    existing === undefined
+      ? [next, ...current]
+      : current.map((q) => (q.bac_id === projection.bac_id ? next : q));
+  await storageSet({ [QUEUE_ITEMS_KEY]: merged });
+};
+
+// F15 — peer-imported dispatch projection. Mirrored into
+// `sidetrack.recentDispatches`. The companion's projection holds
+// the redacted body (PII / API keys → [category]); we accept that
+// as the visible body when peer-mirroring (the unredacted
+// clipboard contents are local-only by design).
+export interface RemoteDispatchProjection {
+  readonly bac_id: string;
+  readonly entry?: {
+    readonly bac_id: string;
+    readonly target: { readonly provider: string };
+    readonly workstreamId?: string;
+    readonly createdAt: string;
+    readonly body: string;
+  };
+  readonly link?: {
+    readonly dispatchId: string;
+    readonly threadId?: string;
+  };
+}
+
+export const mirrorRemoteDispatch = async (
+  projection: RemoteDispatchProjection,
+): Promise<void> => {
+  const entry = projection.entry;
+  if (entry !== undefined) {
+    const current = await readCachedDispatches();
+    const existing = current.find((d) => d.bac_id === entry.bac_id);
+    const provider = entry.target.provider as DispatchEventRecord['target']['provider'];
+    const next: DispatchEventRecord = {
+      bac_id: entry.bac_id,
+      kind: existing?.kind ?? 'other',
+      target: existing?.target ?? { provider, mode: 'paste' },
+      title: existing?.title ?? '',
+      body: entry.body,
+      createdAt: entry.createdAt,
+      redactionSummary: existing?.redactionSummary ?? { matched: 0, categories: [] },
+      tokenEstimate: existing?.tokenEstimate ?? 0,
+      status: existing?.status ?? 'sent',
+      ...(entry.workstreamId === undefined ? {} : { workstreamId: entry.workstreamId }),
+      ...(existing?.sourceThreadId === undefined ? {} : { sourceThreadId: existing.sourceThreadId }),
+      ...(existing?.mcpRequest === undefined ? {} : { mcpRequest: existing.mcpRequest }),
+    };
+    const merged =
+      existing === undefined
+        ? [next, ...current].slice(0, 50)
+        : current.map((d) => (d.bac_id === entry.bac_id ? next : d));
+    await storageSet({ [RECENT_DISPATCHES_KEY]: merged });
+  }
+  if (projection.link?.threadId !== undefined) {
+    const links = await readDispatchLinks();
+    const nextLinks = { ...links, [projection.link.dispatchId]: projection.link.threadId };
+    await storageSet({ [DISPATCH_LINKS_KEY]: nextLinks });
+  }
+};
+
 export const setReviewDraftSpanComment = async (
   threadId: string,
   spanId: string,

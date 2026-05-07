@@ -271,6 +271,8 @@ const broadcastWorkboardChanged = async (
     | 'queue'
     | 'workstream'
     | 'thread'
+    | 'annotation'
+    | 'dispatch'
     | 'settings',
 ): Promise<void> => {
   await chrome.runtime
@@ -2760,6 +2762,152 @@ export default defineBackground(() => {
         const { mirrorRemoteWorkstream } = await import('../src/background/state');
         await mirrorRemoteWorkstream(projection);
         void broadcastWorkboardChanged('workstream');
+      })().catch(() => undefined);
+    },
+  });
+
+  // F13 — annotation state SSE subscription. A peer's
+  // annotation.{created,noteSet,deleted} → projector writes
+  // `_BAC/annotations/<id>.json` → SSE fires here. We don't
+  // mirror into chrome.storage (annotations don't live there;
+  // the content script fetches them on page load via
+  // listAnnotationsByUrl). Instead, we forward a refresh signal
+  // to all matching tabs so any open AnnotationOverlay re-fetches
+  // and re-renders without a page reload.
+  const fetchAnnotationProjection = async (
+    cfg: { url: string; bridgeKey: string },
+    bacId: string,
+  ): Promise<{ entry?: { url?: string; deleted?: boolean } } | null> => {
+    try {
+      const r = await fetch(
+        `${cfg.url.replace(/\/$/, '')}/v1/annotations/${encodeURIComponent(bacId)}/projection`,
+        { headers: { 'x-bac-bridge-key': cfg.bridgeKey } },
+      );
+      if (!r.ok) return null;
+      const body = (await r.json()) as { data?: unknown };
+      if (typeof body.data !== 'object' || body.data === null) return null;
+      return body.data as { entry?: { url?: string; deleted?: boolean } };
+    } catch {
+      return null;
+    }
+  };
+  reviewDraftsSse.subscribe({
+    prefix: '_BAC/annotations/',
+    onEvent: (event) => {
+      const m = /^_BAC\/annotations\/(?<id>[^/]+?)\.json$/.exec(event.relPath);
+      const bacId = m?.groups?.id;
+      if (bacId === undefined) return;
+      void (async () => {
+        const cached = await refreshCompanionCache();
+        if (cached === null) return;
+        const cfg = { url: cached.companionUrl, bridgeKey: cached.bridgeKey };
+        const projection = await fetchAnnotationProjection(cfg, bacId);
+        const url = projection?.entry?.url;
+        if (typeof url !== 'string' || url.length === 0) return;
+        // Tell every tab whose URL matches the annotation's URL
+        // to re-fetch its annotation set. The content script
+        // listens on a known message type and calls
+        // restoreAnnotations() which re-mounts the overlay.
+        try {
+          const tabs = await chrome.tabs.query({ url });
+          for (const tab of tabs) {
+            if (typeof tab.id !== 'number') continue;
+            chrome.tabs
+              .sendMessage(tab.id, { type: 'sidetrack.annotation.refresh' })
+              .catch(() => undefined);
+          }
+        } catch {
+          // chrome.tabs.query rejects on invalid URL patterns; ignore.
+        }
+        void broadcastWorkboardChanged('annotation');
+      })().catch(() => undefined);
+    },
+  });
+
+  // F14 — queue state SSE subscription. Per-id projection writes
+  // `_BAC/queue/<id>.json`. mirrorRemoteQueueItem updates
+  // `sidetrack.queueItems`; broadcastWorkboardChanged forces the
+  // side panel to re-read.
+  const fetchQueueProjection = async (
+    cfg: { url: string; bridgeKey: string },
+    bacId: string,
+  ): Promise<import('../src/background/state').RemoteQueueItemProjection | null> => {
+    try {
+      const r = await fetch(
+        `${cfg.url.replace(/\/$/, '')}/v1/queue/${encodeURIComponent(bacId)}/projection`,
+        { headers: { 'x-bac-bridge-key': cfg.bridgeKey } },
+      );
+      if (!r.ok) return null;
+      const body = (await r.json()) as { data?: unknown };
+      if (typeof body.data !== 'object' || body.data === null) return null;
+      return body.data as import('../src/background/state').RemoteQueueItemProjection;
+    } catch {
+      return null;
+    }
+  };
+  reviewDraftsSse.subscribe({
+    prefix: '_BAC/queue/',
+    onEvent: (event) => {
+      const m = /^_BAC\/queue\/(?<id>[^/]+?)\.json$/.exec(event.relPath);
+      const bacId = m?.groups?.id;
+      if (bacId === undefined) return;
+      void (async () => {
+        const cached = await refreshCompanionCache();
+        if (cached === null) return;
+        const cfg = { url: cached.companionUrl, bridgeKey: cached.bridgeKey };
+        const projection = await fetchQueueProjection(cfg, bacId);
+        if (projection === null) return;
+        const { mirrorRemoteQueueItem } = await import('../src/background/state');
+        await mirrorRemoteQueueItem(projection);
+        void broadcastWorkboardChanged('queue');
+      })().catch(() => undefined);
+    },
+  });
+
+  // F15 — dispatch state SSE subscription. Per-id projection writes
+  // `_BAC/dispatches/<id>.json`. mirrorRemoteDispatch updates the
+  // `sidetrack.recentDispatches` cache + dispatch link map.
+  const fetchDispatchProjection = async (
+    cfg: { url: string; bridgeKey: string },
+    bacId: string,
+  ): Promise<import('../src/background/state').RemoteDispatchProjection | null> => {
+    try {
+      const r = await fetch(
+        `${cfg.url.replace(/\/$/, '')}/v1/dispatches/${encodeURIComponent(bacId)}/projection`,
+        { headers: { 'x-bac-bridge-key': cfg.bridgeKey } },
+      );
+      if (!r.ok) return null;
+      const body = (await r.json()) as { data?: unknown };
+      if (typeof body.data !== 'object' || body.data === null) return null;
+      const d = body.data as { entry?: unknown; link?: unknown };
+      return {
+        bac_id: bacId,
+        ...(d.entry === undefined
+          ? {}
+          : { entry: d.entry as import('../src/background/state').RemoteDispatchProjection['entry'] }),
+        ...(d.link === undefined
+          ? {}
+          : { link: d.link as import('../src/background/state').RemoteDispatchProjection['link'] }),
+      };
+    } catch {
+      return null;
+    }
+  };
+  reviewDraftsSse.subscribe({
+    prefix: '_BAC/dispatches/',
+    onEvent: (event) => {
+      const m = /^_BAC\/dispatches\/(?<id>[^/]+?)\.json$/.exec(event.relPath);
+      const bacId = m?.groups?.id;
+      if (bacId === undefined) return;
+      void (async () => {
+        const cached = await refreshCompanionCache();
+        if (cached === null) return;
+        const cfg = { url: cached.companionUrl, bridgeKey: cached.bridgeKey };
+        const projection = await fetchDispatchProjection(cfg, bacId);
+        if (projection === null) return;
+        const { mirrorRemoteDispatch } = await import('../src/background/state');
+        await mirrorRemoteDispatch(projection);
+        void broadcastWorkboardChanged('dispatch');
       })().catch(() => undefined);
     },
   });

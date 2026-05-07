@@ -1083,6 +1083,20 @@ export default defineContentScript({
             | { readonly ok: boolean; readonly error?: string; readonly annotationId?: string },
         ) => void,
       ) => {
+        // F13 — peer annotation arrived. The background's SSE
+        // subscription on `_BAC/annotations/` broadcasts this to
+        // every tab whose URL matches the annotation's url. We
+        // re-fetch the full set and re-mount the overlay so the
+        // new annotation appears without a page reload.
+        if (
+          typeof message === 'object' &&
+          message !== null &&
+          (message as { type?: unknown }).type === 'sidetrack.annotation.refresh'
+        ) {
+          void restoreAnnotations();
+          sendResponse({ ok: true });
+          return true;
+        }
         if (isContentRequest(message)) {
           try {
             void restoreAnnotations();
