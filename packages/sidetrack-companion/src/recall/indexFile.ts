@@ -328,6 +328,71 @@ export const upsertEntries = async (
   return { added, replaced };
 };
 
+// Sync Contract v1 / Class E — source-scoped replace primitive.
+//
+// Replaces every index entry tagged with the given `sourceUnitId`
+// (regardless of whether it belongs to the named extraction
+// revision) with the caller's `entries` set. Atomic via the same
+// .tmp + rename pattern as writeIndex. Unrelated source units are
+// untouched — that's the "no full rebuild" path for ordinary
+// extractor upgrades.
+//
+// Recall materializer's reaction to "extraction store reports
+// latestExtractionRevision != indexedExtractionRevision for sourceUnitId X":
+//   1. Read active extraction revision content.
+//   2. Run chunker.
+//   3. Build IndexEntry[] with metadata.sourceUnitId = X +
+//      metadata.extractionRevisionId = newRevisionId.
+//   4. replaceEntriesForSourceUnit(path, X, newRevisionId, entries).
+//
+// Returns counts so health surfaces can report progress + the test
+// suite can assert "old chunks gone, new chunks in." A missing
+// index file means the index is fresh; we just write entries.
+export const replaceEntriesForSourceUnit = async (
+  path: string,
+  input: {
+    readonly sourceUnitId: string;
+    readonly extractionRevisionId: string;
+    readonly entries: readonly IndexEntry[];
+  },
+  modelId: string,
+  options: WriteIndexOptions = {},
+): Promise<{ readonly removed: number; readonly inserted: number }> => {
+  const existing = await readIndex(path);
+  const priorItems = existing?.items ?? [];
+  // Drop every prior entry tagged with this sourceUnitId — regardless
+  // of the prior extraction revision. That's the contract: the caller
+  // declares "this revision is now active for this source unit" and
+  // the index converges to that statement.
+  const survived = priorItems.filter(
+    (item) => item.metadata?.sourceUnitId !== input.sourceUnitId,
+  );
+  const removed = priorItems.length - survived.length;
+  // Tag the incoming entries with the revision id so a future replace
+  // can identify them. Caller can populate the rest of the metadata
+  // (text, headingPath, …); we only enforce the two identity fields.
+  const tagged: IndexEntry[] = input.entries.map((entry) => ({
+    ...entry,
+    metadata:
+      entry.metadata === undefined
+        ? undefined
+        : {
+            ...entry.metadata,
+            sourceUnitId: input.sourceUnitId,
+            extractionRevisionId: input.extractionRevisionId,
+          },
+  })) as IndexEntry[];
+  const next = [...survived, ...tagged];
+  const revision = options.modelRevision ?? existing?.modelRevision ?? undefined;
+  await writeIndex(
+    path,
+    next,
+    modelId,
+    revision === undefined ? {} : { modelRevision: revision },
+  );
+  return { removed, inserted: tagged.length };
+};
+
 export const gcEntries = async (
   path: string,
   validIds: ReadonlySet<string>,

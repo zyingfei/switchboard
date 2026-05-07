@@ -2,6 +2,15 @@
 // blob per entry on disk so the ranker + query response can return
 // rich per-chunk context (heading breadcrumb, source thread,
 // snippet) without re-reading the source event log.
+//
+// Lane 2 extension (Sync Contract v1 / Class E): the metadata blob
+// gains source-unit identity + extraction-revision provenance so
+// recall can be a CONSUMER of versioned extraction revisions
+// (replaceEntriesForSourceUnit), not the owner of extraction
+// semantics. Fields are optional so legacy V3 entries (Lane 1 era)
+// continue to deserialize. A reader that finds them missing treats
+// the entry as `extractor='legacy', extractorVersion='0.0.0'` —
+// any newer revision dominates by the active-revision policy.
 export interface ChunkMetadata {
   readonly sourceBacId: string;
   readonly provider?: string;
@@ -16,6 +25,17 @@ export interface ChunkMetadata {
   readonly charEnd: number;
   readonly textHash: string;
   readonly text: string;
+  // Class E provenance (Lane 2). Optional for forward-compat with
+  // Lane 1 indexes that don't carry these. The active-revision
+  // policy treats missing fields as the lowest possible precedence.
+  readonly sourceUnitId?: string;
+  readonly extractionRevisionId?: string;
+  readonly extractorId?: string;
+  readonly extractorVersion?: string;
+  readonly extractionSchemaVersion?: number;
+  readonly inputHash?: string;
+  readonly outputHash?: string;
+  readonly chunkerVersion?: string;
 }
 
 export interface IndexEntry {
