@@ -255,19 +255,38 @@ export const startCompanion = async (
   // continues to write the flat path for legacy readers
   // (parseThreadUpsertBody, deleteWorkstream). Path decoupling is
   // L1.S3; this stage wires the runner.
+  const onLocalAccepted = (accepted: { dot: { replicaId: string } }) => {
+    // Sync Contract v1: local accepted event enters the runner.
+    // Runner dispatches to projection materializer (and recall +
+    // future materializers). Local + peer symmetric (gate L1-G10).
+    syncContractRunner.onAcceptedEvent(accepted as never, { origin: 'local' });
+    if (relayTransport !== null) {
+      void relayTransport
+        .publishEvent(accepted.dot.replicaId, accepted as never)
+        .catch(() => undefined);
+    }
+  };
   const eventLog = {
     ...baseEventLog,
     appendClient: async <T extends Record<string, unknown>>(
       input: Parameters<typeof baseEventLog.appendClient<T>>[0],
     ) => {
       const accepted = await baseEventLog.appendClient(input);
-      // Sync Contract v1: local accepted event enters the runner.
-      // Runner dispatches to projection materializer (and recall +
-      // future materializers). Local + peer symmetric (L1-G10).
-      syncContractRunner.onAcceptedEvent(accepted, { origin: 'local' });
-      if (relayTransport !== null) {
-        void relayTransport.publishEvent(accepted.dot.replicaId, accepted).catch(() => undefined);
-      }
+      onLocalAccepted(accepted);
+      return accepted;
+    },
+    appendClientObserved: async <T extends Record<string, unknown>>(
+      input: Parameters<typeof baseEventLog.appendClientObserved<T>>[0],
+    ) => {
+      const accepted = await baseEventLog.appendClientObserved(input);
+      onLocalAccepted(accepted);
+      return accepted;
+    },
+    appendServerObserved: async <T extends Record<string, unknown>>(
+      input: Parameters<typeof baseEventLog.appendServerObserved<T>>[0],
+    ) => {
+      const accepted = await baseEventLog.appendServerObserved(input);
+      onLocalAccepted(accepted);
       return accepted;
     },
   };

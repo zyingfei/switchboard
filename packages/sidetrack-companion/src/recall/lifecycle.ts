@@ -428,7 +428,7 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
         // events, so concurrent tombstones from two replicas still
         // dominate any pre-tombstone projection.
         await opts.eventLog
-          .appendClient({
+          .appendServerObserved({
             clientEventId: `recall-tombstone:${opts.replica.replicaId}:${threadId}`,
             aggregateId: threadId,
             type: RECALL_TOMBSTONE_TARGET,

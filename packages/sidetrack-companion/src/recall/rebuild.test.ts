@@ -93,7 +93,7 @@ describe('rebuildFromEventLog', () => {
           { ordinal: 1, text: 'log second' },
         ],
       },
-      baseVector: {}, allowEmptyBaseVector: true,
+      baseVector: {},
     });
     // Same capture in the legacy file — must be skipped.
     await writeFile(
@@ -141,14 +141,14 @@ describe('rebuildFromEventLog', () => {
         capturedAt: '2026-05-03T00:00:00.000Z',
         turns: [{ ordinal: 0, text: 'goodbye' }],
       },
-      baseVector: {}, allowEmptyBaseVector: true,
+      baseVector: {},
     });
     await eventLog.appendClient({
       clientEventId: 'tomb-x',
       aggregateId: 'thread_x',
       type: 'recall.tombstone.target',
       payload: { threadId: 'thread_x' },
-      baseVector: {}, allowEmptyBaseVector: true,
+      baseVector: {},
     });
     await rebuildFromEventLog(vaultRoot, join(vaultRoot, '_BAC', 'events'), { eventLog });
     const index = await readIndex(join(vaultRoot, '_BAC', 'recall', 'index.bin'));

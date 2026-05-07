@@ -59,42 +59,96 @@ export class ClientEventIdReuseError extends Error {
 //      that would falsely claim the editor observed peer events they
 //      never saw) plus any resolved clientDeps, and appends to disk.
 
+// Sync Contract v1 — see ~/.claude/plans/kind-prancing-river.md.
+//
+// Two named append APIs replace the historical `appendClient`:
+//
+//   appendClientObserved — browser-driven events. baseVector is
+//   REQUIRED. Empty `{}` is legal and means "the browser observed
+//   nothing." Companion never substitutes its current frontier.
+//
+//   appendServerObserved — server-driven mutations (archive, delete,
+//   recall tombstone, dispatch.linked, capture.extraction.produced
+//   from a local re-extract). System stamps deps from the
+//   aggregate's frontier. Caller asserts they ARE the latest
+//   server-observed state.
+//
+// The internal `appendClient` accepts a `baseVector?` and is the
+// shared implementation. New code must call one of the named APIs.
+
+export interface AppendInputObserved<TPayload extends Record<string, unknown> = Record<string, unknown>> {
+  readonly clientEventId: string;
+  readonly aggregateId: string;
+  readonly type: string;
+  readonly payload: TPayload;
+  // REQUIRED. May be `{}` — that's a legitimate "browser observed
+  // nothing" state. Companion does NOT replace it with the
+  // aggregate's current frontier. A stale outbox event with `{}`
+  // landing after peer events drained is accepted as concurrent;
+  // it does not dominate. (Gate L1-G7.)
+  readonly baseVector: VersionVector;
+  readonly clientDeps?: readonly string[];
+  readonly target?: TargetRef;
+  readonly hlc?: Hlc;
+}
+
+export interface AppendInputServerObserved<TPayload extends Record<string, unknown> = Record<string, unknown>> {
+  readonly clientEventId: string;
+  readonly aggregateId: string;
+  readonly type: string;
+  readonly payload: TPayload;
+  // baseVector deliberately absent. The system stamps deps from the
+  // aggregate's prior events. The caller is asserting that they ARE
+  // the latest server-observed state (no other concurrent server
+  // edits to the same aggregate). Use this for archive, delete,
+  // recall tombstone, dispatch link, etc.
+  readonly clientDeps?: readonly string[];
+  readonly target?: TargetRef;
+  readonly hlc?: Hlc;
+}
+
+/**
+ * @internal Shared backing type for the two named APIs. Test code
+ * may call `appendClient` directly (with optional baseVector) for
+ * legacy concurrency simulations; production code must use
+ * `appendClientObserved` or `appendServerObserved`.
+ */
 export interface AppendInput<TPayload extends Record<string, unknown> = Record<string, unknown>> {
   readonly clientEventId: string;
   readonly aggregateId: string;
   readonly type: string;
   readonly payload: TPayload;
-  /**
-   * @internal — production handlers should OMIT this field.
-   *
-   * The companion uses `ClientEvent.baseVector` directly when
-   * forwarding from the network (the editor's observed vector). For
-   * server-side appends, omitting baseVector makes the eventLog
-   * auto-resolve deps from the aggregate's prior events — which is
-   * what F11 was patched to do.
-   *
-   * Invariant C: passing `baseVector: {}` for an aggregate with
-   * prior events is a sync bug and is rejected at runtime unless
-   * `allowEmptyBaseVector: true` is also set (test-only escape
-   * hatch).
-   */
+  // Optional — when omitted, the system auto-resolves from the
+  // aggregate's frontier (server-observed semantic). When present,
+  // deps are stamped exactly from this vector + resolved
+  // clientDeps; never replaced.
   readonly baseVector?: VersionVector;
-  /**
-   * @internal — test escape hatch for `baseVector: {}` when prior
-   * events exist (used to simulate concurrent first-writes from
-   * two replicas). Production code must never set this.
-   */
-  readonly allowEmptyBaseVector?: boolean;
-  // Optional dependency on other client events that haven't been
-  // accepted yet — e.g. a comment.set that depends on a span.added
-  // batched in the same POST. The companion resolves these to dots
-  // at acceptance time and folds them into deps.
   readonly clientDeps?: readonly string[];
   readonly target?: TargetRef;
   readonly hlc?: Hlc;
 }
 
 export interface EventLog {
+  /**
+   * Browser-driven event append. baseVector REQUIRED, may be `{}`.
+   * See Sync Contract v1 / `AppendInputObserved`.
+   */
+  readonly appendClientObserved: <TPayload extends Record<string, unknown>>(
+    input: AppendInputObserved<TPayload>,
+  ) => Promise<AcceptedEvent<TPayload>>;
+  /**
+   * Server-driven event append. System stamps deps from the
+   * aggregate's prior events. See `AppendInputServerObserved`.
+   */
+  readonly appendServerObserved: <TPayload extends Record<string, unknown>>(
+    input: AppendInputServerObserved<TPayload>,
+  ) => Promise<AcceptedEvent<TPayload>>;
+  /**
+   * @internal Shared implementation behind the two named APIs.
+   * Test code may use this directly for legacy concurrency
+   * simulations. Production code must use `appendClientObserved`
+   * or `appendServerObserved`.
+   */
   readonly appendClient: <TPayload extends Record<string, unknown>>(
     input: AppendInput<TPayload>,
   ) => Promise<AcceptedEvent<TPayload>>;
@@ -363,8 +417,39 @@ export const createEventLog = (
       return { imported: true } as const;
     });
 
+  // Named APIs — production code uses these.
+  const appendClientObserved = <TPayload extends Record<string, unknown>>(
+    input: AppendInputObserved<TPayload>,
+  ): Promise<AcceptedEvent<TPayload>> =>
+    appendClient<TPayload>({
+      clientEventId: input.clientEventId,
+      aggregateId: input.aggregateId,
+      type: input.type,
+      payload: input.payload,
+      baseVector: input.baseVector,
+      ...(input.clientDeps === undefined ? {} : { clientDeps: input.clientDeps }),
+      ...(input.target === undefined ? {} : { target: input.target }),
+      ...(input.hlc === undefined ? {} : { hlc: input.hlc }),
+    });
+
+  const appendServerObserved = <TPayload extends Record<string, unknown>>(
+    input: AppendInputServerObserved<TPayload>,
+  ): Promise<AcceptedEvent<TPayload>> =>
+    appendClient<TPayload>({
+      clientEventId: input.clientEventId,
+      aggregateId: input.aggregateId,
+      type: input.type,
+      payload: input.payload,
+      // baseVector deliberately absent → auto-resolve from frontier.
+      ...(input.clientDeps === undefined ? {} : { clientDeps: input.clientDeps }),
+      ...(input.target === undefined ? {} : { target: input.target }),
+      ...(input.hlc === undefined ? {} : { hlc: input.hlc }),
+    });
+
   return {
     appendClient,
+    appendClientObserved,
+    appendServerObserved,
     readMerged,
     readReplica,
     readByAggregate,
@@ -399,46 +484,29 @@ const computeDepsFromInput = <TPayload extends Record<string, unknown>>(
   input: AppendInput<TPayload>,
   merged: readonly AcceptedEvent[],
 ): VersionVector => {
-  // F11 — when the caller doesn't pass an explicit baseVector,
-  // default to the union of every prior event for the SAME
-  // aggregate. Without this, every server-side appendClient call
-  // (POST /v1/threads, POST /v1/workstreams, status PATCHes, …)
-  // landed with deps:{}, which made every register/OR-Set
-  // candidate causally concurrent with every other write to the
-  // same record. mergeRegister returned conflict-with-N-candidates
-  // and the receiver picked the first (oldest) candidate — so the
-  // user moved a thread, the move event was emitted, but the
-  // projection still showed the original. Defaulting to the
-  // aggregate's prior frontier makes a sequential write actually
-  // dominate. Callers that want the legacy behavior (rare; some
-  // tests intentionally simulate a "first write" or a concurrent
-  // edit) keep passing `baseVector: {}` explicitly.
+  // Sync Contract v1: two semantics, expressed by presence of
+  // `baseVector`:
+  //
+  //   - Browser-observed (appendClientObserved): baseVector is
+  //     present (possibly `{}`). Deps stamped EXACTLY from
+  //     baseVector. Empty `{}` means "browser observed nothing"
+  //     and is a legitimate state — a stale outbox arriving after
+  //     peer events drained is accepted as concurrent (does not
+  //     dominate). The companion does NOT replace the explicit
+  //     vector with its own frontier.
+  //
+  //   - Server-observed (appendServerObserved): baseVector is
+  //     omitted. Deps stamped from the union of every prior event
+  //     for the SAME aggregate. The caller asserts they ARE the
+  //     latest server-observed state.
+  //
+  // Tests that simulate concurrent first-writes call this method
+  // (or appendClient) with `baseVector: {}` directly — that's
+  // the legitimate empty-observation case. There is no escape
+  // hatch field; empty is just a legal arg.
   const explicit = input.baseVector;
   let deps: VersionVector;
   if (explicit !== undefined) {
-    // Invariant C guard: a caller passing `baseVector: {}` for an
-    // aggregate that already has prior events is the F11 footgun
-    // — every register/OR-Set candidate becomes causally
-    // concurrent and the projection picks an arbitrary winner. We
-    // refuse this combination so the bug surfaces at write time.
-    // Tests that legitimately simulate stale writes (concurrent
-    // first-writes from two replicas) opt in with
-    // `allowEmptyBaseVector: true`.
-    const isExplicitlyEmpty = Object.keys(explicit).length === 0;
-    if (isExplicitlyEmpty && input.allowEmptyBaseVector !== true) {
-      const priorForAggregate = merged.filter(
-        (event) => event.aggregateId === input.aggregateId,
-      );
-      if (priorForAggregate.length > 0) {
-        throw new Error(
-          `appendClient: refusing baseVector:{} for aggregate "${input.aggregateId}" ` +
-            `which already has ${priorForAggregate.length} prior events. ` +
-            `Omit baseVector to auto-resolve from the aggregate's frontier (the production ` +
-            `default), or pass allowEmptyBaseVector:true if this is a test simulating ` +
-            `concurrent stale writes.`,
-        );
-      }
-    }
     deps = explicit;
   } else {
     deps = vectorFromEvents(

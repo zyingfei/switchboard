@@ -1297,7 +1297,7 @@ const routes: readonly RouteDefinition[] = [
           const result = await writer.writeDispatchEvent(dispatchEvent, requestId);
           if (context.eventLog !== undefined) {
             await context.eventLog
-              .appendClient({
+              .appendServerObserved({
                 clientEventId: idempotencyKey,
                 aggregateId: dispatchEvent.bac_id,
                 type: DISPATCH_RECORDED,
@@ -1378,7 +1378,7 @@ const routes: readonly RouteDefinition[] = [
       );
       if (context.eventLog !== undefined) {
         await context.eventLog
-          .appendClient({
+          .appendServerObserved({
             clientEventId: requestId,
             aggregateId: match.bacId,
             type: DISPATCH_LINKED,
@@ -1750,7 +1750,10 @@ const routes: readonly RouteDefinition[] = [
         const accepted = [];
         for (const incoming of input.events) {
           const target = compactTargetRef(incoming.target);
-          const event = await eventLog.appendClient({
+          // Browser-driven: the editor's `baseVector` is what they
+          // observed. Empty `{}` is legal — means the editor saw
+          // no prior events. Companion does NOT replace it.
+          const event = await eventLog.appendClientObserved({
             clientEventId: incoming.clientEventId,
             aggregateId: threadId,
             type: incoming.type,
@@ -1817,7 +1820,7 @@ const routes: readonly RouteDefinition[] = [
       // current review-draft projection's vector — so the discard
       // event still causally dominates every prior review-draft
       // event for this thread.
-      await eventLog.appendClient({
+      await eventLog.appendServerObserved({
         clientEventId: requestId,
         aggregateId: threadId,
         type: 'review-draft.discarded',
@@ -2001,7 +2004,7 @@ const routes: readonly RouteDefinition[] = [
           });
           if (context.eventLog !== undefined) {
             await context.eventLog
-              .appendClient({
+              .appendServerObserved({
                 clientEventId: `${idempotencyKey}.term`,
                 aggregateId: created.bac_id,
                 type: ANNOTATION_CREATED,
@@ -2037,7 +2040,7 @@ const routes: readonly RouteDefinition[] = [
         const result = await writeAnnotation(vaultRoot, input);
         if (context.eventLog !== undefined) {
           await context.eventLog
-            .appendClient({
+            .appendServerObserved({
               clientEventId: idempotencyKey,
               aggregateId: result.bac_id,
               type: ANNOTATION_CREATED,
@@ -2088,7 +2091,7 @@ const routes: readonly RouteDefinition[] = [
       const updated = await updateAnnotation(requireVaultRoot(context), match.annotationId, input);
       if (context.eventLog !== undefined && typeof input.note === 'string') {
         await context.eventLog
-          .appendClient({
+          .appendServerObserved({
             clientEventId: requestId,
             aggregateId: match.annotationId,
             type: ANNOTATION_NOTE_SET,
@@ -2110,7 +2113,7 @@ const routes: readonly RouteDefinition[] = [
       const result = await softDeleteAnnotation(requireVaultRoot(context), match.annotationId);
       if (context.eventLog !== undefined && context.replica !== undefined) {
         await context.eventLog
-          .appendClient({
+          .appendServerObserved({
             clientEventId: `annotation-delete:${context.replica.replicaId}:${match.annotationId}:${requestId}`,
             aggregateId: match.annotationId,
             type: ANNOTATION_DELETED,
@@ -2536,7 +2539,7 @@ const routes: readonly RouteDefinition[] = [
           context.eventLog === undefined
             ? false
             : await context.eventLog
-                .appendClient({
+                .appendServerObserved({
                   clientEventId: idempotencyKey,
                   aggregateId: result.bac_id,
                   type: CAPTURE_RECORDED,
@@ -2620,7 +2623,7 @@ const routes: readonly RouteDefinition[] = [
       // don't yet consume the projection.
       if (context.eventLog !== undefined) {
         await context.eventLog
-          .appendClient({
+          .appendServerObserved({
             clientEventId: requestId,
             aggregateId: result.bac_id,
             type: THREAD_UPSERTED,
@@ -2702,7 +2705,7 @@ const routes: readonly RouteDefinition[] = [
       // the eventLog's idempotency check.
       if (context.eventLog !== undefined && context.replica !== undefined) {
         await context.eventLog
-          .appendClient({
+          .appendServerObserved({
             clientEventId: `thread-archive:${context.replica.replicaId}:${match.bacId}`,
             aggregateId: match.bacId,
             type: THREAD_ARCHIVED,
@@ -2745,7 +2748,7 @@ const routes: readonly RouteDefinition[] = [
       const result = await context.vaultWriter.unarchiveThread(match.bacId, requestId);
       if (context.eventLog !== undefined && context.replica !== undefined) {
         await context.eventLog
-          .appendClient({
+          .appendServerObserved({
             clientEventId: `thread-unarchive:${context.replica.replicaId}:${match.bacId}:${requestId}`,
             aggregateId: match.bacId,
             type: THREAD_UNARCHIVED,
@@ -2769,7 +2772,7 @@ const routes: readonly RouteDefinition[] = [
       const result = await context.vaultWriter.createWorkstream(input, requestId);
       if (context.eventLog !== undefined) {
         await context.eventLog
-          .appendClient({
+          .appendServerObserved({
             clientEventId: requestId,
             aggregateId: result.bac_id,
             type: WORKSTREAM_UPSERTED,
@@ -2919,7 +2922,7 @@ const routes: readonly RouteDefinition[] = [
           );
           const record = JSON.parse(raw) as Record<string, unknown>;
           if (typeof record['bac_id'] === 'string' && typeof record['title'] === 'string') {
-            await context.eventLog.appendClient({
+            await context.eventLog.appendServerObserved({
               clientEventId: requestId,
               aggregateId: match.workstreamId,
               type: WORKSTREAM_UPSERTED,
@@ -2960,7 +2963,7 @@ const routes: readonly RouteDefinition[] = [
         // points at a dangling reference on the peer.
         if (context.eventLog !== undefined) {
           await context.eventLog
-            .appendClient({
+            .appendServerObserved({
               clientEventId: requestId,
               aggregateId: result.bac_id,
               type: WORKSTREAM_DELETED,
@@ -3020,7 +3023,7 @@ const routes: readonly RouteDefinition[] = [
         const result = await context.vaultWriter.createQueueItem(input, requestId);
         if (context.eventLog !== undefined) {
           await context.eventLog
-            .appendClient({
+            .appendServerObserved({
               clientEventId: idempotencyKey,
               aggregateId: result.bac_id,
               type: QUEUE_CREATED,

@@ -29,7 +29,7 @@ describe('event log', () => {
       aggregateId: 'thread-1',
       type: 'review-draft.span.added',
       payload: { spanId: 's-1' },
-      baseVector: {}, allowEmptyBaseVector: true,
+      baseVector: {},
     });
 
     expect(event.dot.replicaId).toBe(replica.replicaId);
@@ -55,7 +55,7 @@ describe('event log', () => {
       aggregateId: 'thread-1',
       type: 'review-draft.span.added',
       payload: { spanId: 's-1' },
-      baseVector: {}, allowEmptyBaseVector: true,
+      baseVector: {},
     });
     nowMs += 5_000;
     const second = await log.appendClient({
@@ -82,7 +82,7 @@ describe('event log', () => {
           aggregateId: 'agg',
           type: 'noop',
           payload: {},
-          baseVector: {}, allowEmptyBaseVector: true,
+          baseVector: {},
         }),
       ),
     );
@@ -114,7 +114,7 @@ describe('event log', () => {
       aggregateId: 'thread-1',
       type: 'review-draft.comment.set',
       payload: { spanId: 's-1', text: 'edited offline' },
-      baseVector: {}, allowEmptyBaseVector: true,
+      baseVector: {},
     });
     expect(accepted.deps).toEqual({});
   });
@@ -134,7 +134,7 @@ describe('event log', () => {
       aggregateId: 'thread-mv',
       type: 'thread.upserted',
       payload: { bac_id: 'thread-mv', primaryWorkstreamId: 'ws-A' },
-      baseVector: {}, allowEmptyBaseVector: true,
+      baseVector: {},
     });
     // No baseVector on the next append — should auto-resolve to
     // {<replica>: <first.dot.seq>} so the second event causally
@@ -165,14 +165,14 @@ describe('event log', () => {
       aggregateId: 'thread-1',
       type: 'review-draft.span.added',
       payload: { spanId: 's-1' },
-      baseVector: {}, allowEmptyBaseVector: true,
+      baseVector: {},
     });
     const second = await log.appendClient({
       clientEventId: 'second',
       aggregateId: 'thread-1',
       type: 'review-draft.comment.set',
       payload: { spanId: 's-1', text: 'hi' },
-      baseVector: {}, allowEmptyBaseVector: true,
+      baseVector: {},
       clientDeps: ['first'],
     });
     expect(second.deps[first.dot.replicaId]).toBe(first.dot.seq);
@@ -185,21 +185,21 @@ describe('event log', () => {
       aggregateId: 't1',
       type: 'noop',
       payload: {},
-      baseVector: {}, allowEmptyBaseVector: true,
+      baseVector: {},
     });
     await log.appendClient({
       clientEventId: 'b',
       aggregateId: 't2',
       type: 'noop',
       payload: {},
-      baseVector: {}, allowEmptyBaseVector: true,
+      baseVector: {},
     });
     await log.appendClient({
       clientEventId: 'c',
       aggregateId: 't1',
       type: 'noop',
       payload: {},
-      baseVector: {}, allowEmptyBaseVector: true,
+      baseVector: {},
     });
     expect((await log.readByAggregate('t1')).map((e) => e.clientEventId)).toEqual(['a', 'c']);
     expect((await log.readByAggregate('t2')).map((e) => e.clientEventId)).toEqual(['b']);
@@ -215,7 +215,7 @@ describe('event log', () => {
       aggregateId: 'a',
       type: 'noop',
       payload: {},
-      baseVector: {}, allowEmptyBaseVector: true,
+      baseVector: {},
     });
     const log2 = createEventLog(vaultRoot, replica, {
       now: () => new Date('2026-05-06T00:00:00.001Z'),
@@ -225,7 +225,7 @@ describe('event log', () => {
       aggregateId: 'a',
       type: 'noop',
       payload: {},
-      baseVector: {}, allowEmptyBaseVector: true,
+      baseVector: {},
     });
     const files = await readdir(join(vaultRoot, '_BAC', 'log', replica.replicaId));
     expect(files.sort()).toEqual(['2026-05-05.jsonl', '2026-05-06.jsonl']);
@@ -240,7 +240,7 @@ describe('event log', () => {
       aggregateId: 'a',
       type: 'noop',
       payload: {},
-      baseVector: {}, allowEmptyBaseVector: true,
+      baseVector: {},
     });
     const path = join(vaultRoot, '_BAC', 'log', replica.replicaId, '2026-05-05.jsonl');
     await writeFile(

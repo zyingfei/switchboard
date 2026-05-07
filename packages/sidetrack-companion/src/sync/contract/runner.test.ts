@@ -27,6 +27,8 @@ const stubEvent = (type: string): AcceptedEvent => ({
 
 const stubLog = (): EventLog => ({
   appendClient: vi.fn() as unknown as EventLog['appendClient'],
+  appendClientObserved: vi.fn() as unknown as EventLog['appendClientObserved'],
+  appendServerObserved: vi.fn() as unknown as EventLog['appendServerObserved'],
   readMerged: vi.fn(async () => []),
   readReplica: vi.fn(async () => []),
   readByAggregate: vi.fn(async () => []),
