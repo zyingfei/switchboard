@@ -39,6 +39,7 @@ import {
   THREAD_UNARCHIVED,
   THREAD_UPSERTED,
 } from '../../threads/events.js';
+import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
 import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
 
 export type StateClass =
@@ -86,6 +87,7 @@ export const KNOWN_MATERIALIZERS: ReadonlySet<string> = new Set<string>([
   'projection',
   'recall',
   'extraction',
+  'timeline',
 ]);
 
 const projectionEntry = (eventType: string, surface: string): ContractEntry => ({
@@ -254,6 +256,32 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
         materializer: 'recall',
         peerFreshnessMs: 30_000,
         recovery: 'source-scoped-reextract',
+      },
+    ],
+  },
+  // First future surface — proves the contract is open. Two
+  // surfaces per browser.timeline.observed event:
+  //   1. plugin-timeline-active-window — Class F (plugin-tier
+  //      bounded). Recovery is spool-drain when companion comes
+  //      back online.
+  //   2. timeline-projection — Class B (derived-cache; daily
+  //      reduction over events, not a per-aggregate LWW). Owned by
+  //      the dedicated 'timeline' materializer.
+  {
+    eventType: BROWSER_TIMELINE_OBSERVED,
+    surfaces: [
+      {
+        surface: 'plugin-timeline-active-window',
+        class: 'plugin-tier-bounded',
+        peerFreshnessMs: 1_000,
+        recovery: 'spool-drain',
+      },
+      {
+        surface: 'timeline-projection',
+        class: 'derived-cache',
+        materializer: 'timeline',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
       },
     ],
   },

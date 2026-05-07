@@ -58,7 +58,13 @@ describe('plugin-tier mirror materializers (Class F adoption)', () => {
 
   it('PLUGIN_MATERIALIZERS registry contains every Class F surface', () => {
     const names = PLUGIN_MATERIALIZERS.map((m) => m.name).sort();
-    expect(names).toEqual(['dispatches', 'queue', 'threads', 'workstreams']);
+    expect(names).toEqual([
+      'dispatches',
+      'queue',
+      'threads',
+      'timeline',
+      'workstreams',
+    ]);
   });
 
   it('static health() returns a healthy shape for an empty active set', () => {

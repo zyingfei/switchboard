@@ -5,6 +5,11 @@ import { join } from 'node:path';
 import { buildAnchorFromTerm } from '../annotation/anchorBuilder.js';
 import { isBridgeKeyAccepted, rotateBridgeKey } from '../auth/bridgeKey.js';
 import {
+  BROWSER_TIMELINE_OBSERVED,
+  isBrowserTimelineObservedPayload,
+} from '../timeline/events.js';
+import { sanitizeTimelinePayload } from '../timeline/sanitize.js';
+import {
   defaultAllowedTools,
   isAllowed,
   readTrust,
@@ -303,6 +308,19 @@ export interface CompanionHttpConfig {
   // whose ?token=… matches whatever the running MCP server actually
   // accepts — without the user copying keys between two terminals.
   readonly mcp?: { readonly port: number; readonly authKey: string };
+  // Sync Contract v1 / Class F — edge-event import path for plugin-
+  // originated events whose dot is allocated by the edge replica
+  // (timeline observations + future passive surfaces). Closes over
+  // both `eventLog.importPeerEvent` AND `runner.onAcceptedEvent` so
+  // the runner sees every accepted edge event symmetrically with
+  // relay-imported peer events. Optional so legacy tests work; when
+  // unset the timeline events route returns 503.
+  readonly importEdgeEvent?: (
+    event: import('../sync/causal.js').AcceptedEvent,
+  ) => Promise<{ imported: boolean }>;
+  // Optional timeline projection store, exposing read access for
+  // the GET /v1/timeline route. When unset that route returns 503.
+  readonly timelineStore?: import('../timeline/projection.js').TimelineStore;
 }
 
 export interface StartedHttpServer {
@@ -3106,6 +3124,201 @@ const routes: readonly RouteDefinition[] = [
         requestId,
       );
       return [200, { data: result }];
+    },
+  },
+  // Sync Contract v1 — timeline (Class F + Class B) routes.
+  //
+  // POST /v1/timeline/events — imports plugin-originated edge events
+  // (browser.timeline.observed). The plugin allocates the edge dot;
+  // the companion does NOT restamp. importEdgeEvent runs the
+  // accepted event through the contract runner so the timeline
+  // materializer rebuilds the affected day projection.
+  //
+  // GET /v1/timeline — returns the daily-bucketed projection. Range
+  // filtered by `since` / `until` (UTC ISO timestamps); plain
+  // substring filter on `q` (matches title or url). Always returns
+  // a ScopedResult-shaped envelope with `scope: 'companion-extended'`.
+  {
+    method: 'POST',
+    pattern: /^\/v1\/timeline\/events$/u,
+    authRequired: true,
+    handle: async (request, requestId, _match, context) => {
+      if (context.importEdgeEvent === undefined) {
+        throw new HttpRouteError(
+          503,
+          'TIMELINE_NOT_WIRED',
+          'Timeline import is not configured.',
+        );
+      }
+      const body = (await readBody(request)) as { events?: unknown };
+      if (body === null || typeof body !== 'object' || !Array.isArray(body.events)) {
+        throw new HttpRouteError(
+          400,
+          'INVALID_REQUEST',
+          'Body must be { events: AcceptedEvent[] }.',
+        );
+      }
+      const imported: { replicaId: string; seq: number }[] = [];
+      const skipped: { replicaId: string; seq: number; reason: string }[] = [];
+      for (const candidate of body.events) {
+        if (
+          candidate === null ||
+          typeof candidate !== 'object' ||
+          typeof (candidate as { type?: unknown }).type !== 'string' ||
+          typeof (candidate as { dot?: unknown }).dot !== 'object' ||
+          (candidate as { dot?: { replicaId?: unknown } }).dot === null
+        ) {
+          continue;
+        }
+        const event = candidate as import('../sync/causal.js').AcceptedEvent;
+        // Reviewer-flagged: this endpoint is timeline-only. Reject
+        // any event whose type is not browser.timeline.observed OR
+        // whose payload fails the runtime predicate. Keeps the
+        // route narrow — a future generic `/v1/edge/events` router
+        // would be a separate route.
+        if (event.type !== BROWSER_TIMELINE_OBSERVED) {
+          skipped.push({
+            replicaId: event.dot.replicaId,
+            seq: event.dot.seq,
+            reason: 'invalid-event-type',
+          });
+          continue;
+        }
+        if (!isBrowserTimelineObservedPayload(event.payload)) {
+          skipped.push({
+            replicaId: event.dot.replicaId,
+            seq: event.dot.seq,
+            reason: 'invalid-payload',
+          });
+          continue;
+        }
+        // Reviewer-flagged defense-in-depth: sanitize URLs BEFORE
+        // the event is appended. The plugin observer already
+        // sanitizes outgoing URLs, but this route accepts events
+        // from any caller with the bridge key (older plugin builds,
+        // archive-import path, …). Once the event lands in the
+        // immutable log we can't strip auth tokens out — this is
+        // the last opportunity. We construct a new event with the
+        // sanitized payload (preserving the edge dot + clientEventId
+        // so importPeerEvent dedupe still works).
+        const sanitizedPayload = sanitizeTimelinePayload(event.payload);
+        const sanitizedEvent =
+          sanitizedPayload === event.payload
+            ? event
+            : { ...event, payload: sanitizedPayload };
+        try {
+          const result = await context.importEdgeEvent(sanitizedEvent);
+          if (result.imported) {
+            imported.push({ replicaId: event.dot.replicaId, seq: event.dot.seq });
+          } else {
+            skipped.push({
+              replicaId: event.dot.replicaId,
+              seq: event.dot.seq,
+              reason: 'already-imported',
+            });
+          }
+        } catch (err) {
+          skipped.push({
+            replicaId: event.dot.replicaId,
+            seq: event.dot.seq,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      void requestId;
+      return [200, { data: { imported, skipped } }];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/timeline(?:\?.*)?$/u,
+    authRequired: true,
+    handle: async (request, requestId, _match, context) => {
+      if (context.timelineStore === undefined) {
+        throw new HttpRouteError(
+          503,
+          'TIMELINE_NOT_WIRED',
+          'Timeline projection is not configured.',
+        );
+      }
+      const url = new URL(request.url ?? '/v1/timeline', 'http://internal');
+      const sinceRaw = url.searchParams.get('since') ?? undefined;
+      const untilRaw = url.searchParams.get('until') ?? undefined;
+      // Normalize date-only inputs (YYYY-MM-DD) to ISO timestamps:
+      // since=date → start-of-day; until=date → end-of-day. Without
+      // this, an entry's full ISO timestamp would lex-compare
+      // greater than the bare date prefix and get excluded
+      // incorrectly. With explicit ISO inputs we leave the value
+      // alone — "exact" filtering at the timestamp level.
+      const isDateOnly = (s: string): boolean => /^\d{4}-\d{2}-\d{2}$/.test(s);
+      const since =
+        sinceRaw === undefined ? undefined : isDateOnly(sinceRaw) ? `${sinceRaw}T00:00:00.000Z` : sinceRaw;
+      const until =
+        untilRaw === undefined ? undefined : isDateOnly(untilRaw) ? `${untilRaw}T23:59:59.999Z` : untilRaw;
+      const q = (url.searchParams.get('q') ?? '').trim().toLowerCase();
+      const limitRaw = Number.parseInt(url.searchParams.get('limit') ?? '100', 10);
+      const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 1000) : 100;
+
+      const days = await context.timelineStore.listDays();
+      // Day-bucket coarse filter — picks files we need to open.
+      const inRange = days.filter((d) => {
+        if (since !== undefined && d < since.slice(0, 10)) return false;
+        if (until !== undefined && d > until.slice(0, 10)) return false;
+        return true;
+      });
+      const items: Array<{
+        readonly date: string;
+        readonly id: string;
+        readonly firstSeenAt: string;
+        readonly lastSeenAt: string;
+        readonly url: string;
+        readonly canonicalUrl?: string;
+        readonly title?: string;
+        readonly provider?: string;
+        readonly visitCount: number;
+      }> = [];
+      // Reviewer F6: also apply EXACT timestamp filtering. The
+      // day-bucket filter above is only a coarse pass that picks
+      // which files to open. An entry on the boundary day might
+      // straddle the requested range — we include it if its
+      // [firstSeenAt, lastSeenAt] window overlaps [since, until].
+      // Without this, since=2026-05-07T12:00:00Z would still
+      // return entries from 09:00 the same day.
+      const overlapsRange = (entry: {
+        firstSeenAt: string;
+        lastSeenAt: string;
+      }): boolean => {
+        if (since !== undefined && entry.lastSeenAt < since) return false;
+        if (until !== undefined && entry.firstSeenAt > until) return false;
+        return true;
+      };
+      // Walk newest-day first so we hit the limit on recent
+      // entries.
+      for (const date of [...inRange].reverse()) {
+        const day = await context.timelineStore.readDay(date);
+        if (day === null) continue;
+        for (const entry of day.entries) {
+          if (!overlapsRange(entry)) continue;
+          if (q.length > 0) {
+            const hay = `${entry.title ?? ''} ${entry.url}`.toLowerCase();
+            if (!hay.includes(q)) continue;
+          }
+          items.push({ date, ...entry });
+          if (items.length >= limit) break;
+        }
+        if (items.length >= limit) break;
+      }
+      void requestId;
+      return [
+        200,
+        {
+          data: {
+            scope: 'companion-extended',
+            items,
+            entryCount: items.length,
+          },
+        },
+      ];
     },
   },
 ];
