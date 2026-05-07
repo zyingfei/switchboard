@@ -324,6 +324,12 @@ export const startCompanion = async (
       recallLifecycle,
       recallActivity,
       eventLog: baseEventLog,
+      // Lane 2: recall consumer reads the extraction store on
+      // catchUp and source-replaces stale entries via
+      // replaceEntriesForSourceUnit. Closes gates L2-G1 +
+      // L2-G10 when extraction revisions change.
+      extractionStore,
+      indexPath: `${options.vaultPath}/_BAC/recall/index.bin`,
     }),
   );
   // Don't block startup on the rebuild — health endpoint will report

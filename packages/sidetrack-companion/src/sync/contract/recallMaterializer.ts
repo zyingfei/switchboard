@@ -1,5 +1,11 @@
 import type { RecallActivityTracker } from '../../recall/activity.js';
+import { chunkTurn } from '../../recall/chunker.js';
+import { embed } from '../../recall/embedder.js';
+import { replaceEntriesForSourceUnit } from '../../recall/indexFile.js';
 import type { RecallLifecycle } from '../../recall/lifecycle.js';
+import type { ExtractionStore } from '../../recall/extraction/store.js';
+import { MODEL_ID } from '../../recall/embedder.js';
+import type { IndexEntry } from '../../recall/ranker.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
 import { eventTypesForMaterializer } from './registry.js';
@@ -31,6 +37,17 @@ export interface CreateRecallMaterializerDeps {
   readonly recallLifecycle: RecallLifecycle;
   readonly recallActivity: RecallActivityTracker;
   readonly eventLog: EventLog;
+  // Lane 2: optional extraction store. When provided, the
+  // materializer's catchUp scans for sources where
+  // latestExtractionRevision != indexedExtractionRevision and runs
+  // source-scoped replace via replaceEntriesForSourceUnit. When
+  // absent, the materializer behaves as Lane 1 (replays via
+  // ingestIncremental over the merged event log).
+  readonly extractionStore?: ExtractionStore;
+  // Index file path. Required when extractionStore is set so the
+  // materializer can call replaceEntriesForSourceUnit. Defaults
+  // to <vaultRoot>/_BAC/recall/index.bin in production wiring.
+  readonly indexPath?: string;
 }
 
 export const createRecallMaterializer = (
@@ -87,23 +104,112 @@ export const createRecallMaterializer = (
     requestIngest();
   };
 
+  // Lane 2: scan extraction store for stale sources (where
+  // latestExtractionRevision != indexedExtractionRevision) and
+  // source-replace each. Pure function of the durable extraction
+  // store state — never relies on a notification callback. This is
+  // gate L2-G10's correctness invariant (callback-independent
+  // recovery) AND gate L2-G1's behavior (newer extraction → recall
+  // returns active only).
+  const reconcileExtractionStaleSources = async (): Promise<void> => {
+    const store = deps.extractionStore;
+    const indexPath = deps.indexPath;
+    if (store === undefined || indexPath === undefined) return;
+    const stale = await store.listStaleSources();
+    for (const sourceState of stale) {
+      const revision = await store.readRevision(sourceState.latestExtractionRevision);
+      if (revision === null) continue;
+      const entries: IndexEntry[] = [];
+      // Build chunks from the active extraction revision content.
+      // One per turn × paragraph (chunker handles paragraph splits).
+      for (const turn of revision.content.turns) {
+        const chunks = chunkTurn({
+          sourceBacId: revision.sourceBacId,
+          threadId: revision.sourceBacId,
+          ...(revision.content.threadUrl === undefined
+            ? {}
+            : { threadUrl: revision.content.threadUrl }),
+          ...(revision.content.title === undefined ? {} : { title: revision.content.title }),
+          role: turn.role,
+          turnOrdinal: turn.ordinal,
+          ...(turn.modelName === undefined ? {} : { modelName: turn.modelName }),
+          capturedAt: revision.content.capturedAt,
+          text: turn.text,
+          ...(turn.markdown === undefined ? {} : { markdown: turn.markdown }),
+          ...(turn.formattedText === undefined ? {} : { formattedText: turn.formattedText }),
+        });
+        if (chunks.length === 0) continue;
+        const vectors = await embed(chunks.map((c) => c.text));
+        for (let i = 0; i < chunks.length; i += 1) {
+          const chunk = chunks[i]!;
+          const vector = vectors[i] ?? new Float32Array(384);
+          entries.push({
+            id: chunk.chunkId,
+            threadId: chunk.threadId,
+            capturedAt: chunk.capturedAt,
+            embedding: vector,
+            tombstoned: false,
+            metadata: {
+              sourceBacId: chunk.sourceBacId,
+              ...(chunk.provider === undefined ? {} : { provider: chunk.provider }),
+              ...(chunk.threadUrl === undefined ? {} : { threadUrl: chunk.threadUrl }),
+              ...(chunk.title === undefined ? {} : { title: chunk.title }),
+              ...(chunk.role === undefined ? {} : { role: chunk.role }),
+              turnOrdinal: chunk.turnOrdinal,
+              ...(chunk.modelName === undefined ? {} : { modelName: chunk.modelName }),
+              headingPath: chunk.headingPath,
+              paragraphIndex: chunk.paragraphIndex,
+              charStart: chunk.charStart,
+              charEnd: chunk.charEnd,
+              textHash: chunk.textHash,
+              text: chunk.text,
+              sourceUnitId: revision.sourceUnitId,
+              extractionRevisionId: revision.extractionRevisionId,
+              extractorId: revision.extractorId,
+              extractorVersion: revision.extractorVersion,
+              extractionSchemaVersion: revision.extractionSchemaVersion,
+              inputHash: revision.inputHash,
+              outputHash: revision.outputHash,
+              chunkerVersion: revision.chunkerVersion,
+            },
+          });
+        }
+      }
+      await replaceEntriesForSourceUnit(
+        indexPath,
+        {
+          sourceUnitId: revision.sourceUnitId,
+          extractionRevisionId: revision.extractionRevisionId,
+          entries,
+        },
+        MODEL_ID,
+      );
+      await store.markIndexed(revision.sourceUnitId, revision.extractionRevisionId);
+    }
+  };
+
   const catchUp: Materializer['catchUp'] = async (_eventLog) => {
     void _eventLog; // bound at construction; runner-arg ignored
+    // First: replay the merged log via ingestIncremental for any
+    // legacy capture events not yet ingested.
     requestIngest();
-    // AWAIT drain — startup tests assert "contract restored," not
-    // "kicked off."
     while (running) {
       await new Promise((r) => setTimeout(r, 5));
     }
-    // If dirty was set during the wait but didn't trigger a new IIFE
-    // (because the prior IIFE was still alive when the request came
-    // in), kick one more round so the contract really is caught up
-    // before catchUp resolves.
     if (dirty) {
       requestIngest();
       while (running) {
         await new Promise((r) => setTimeout(r, 5));
       }
+    }
+    // Second: scan extraction store for stale sources and
+    // source-replace. Idempotent — markIndexed flips status to
+    // 'current' so subsequent passes are noops until a new
+    // extraction revision flips it back to 'stale'.
+    try {
+      await reconcileExtractionStaleSources();
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
     }
   };
 
