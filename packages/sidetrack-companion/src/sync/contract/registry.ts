@@ -31,6 +31,7 @@ import {
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
 import { QUEUE_CREATED, QUEUE_STATUS_SET } from '../../queue/events.js';
 import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from '../../recall/events.js';
+import { CAPTURE_EXTRACTION_PRODUCED } from '../../recall/extraction/events.js';
 import { REVIEW_DRAFT_EVENT_TYPES } from '../../review/projection.js';
 import {
   THREAD_ARCHIVED,
@@ -84,7 +85,7 @@ export interface ContractEntry {
 export const KNOWN_MATERIALIZERS: ReadonlySet<string> = new Set<string>([
   'projection',
   'recall',
-  // 'extraction',         // Lane 2 — uncomment when extractionMaterializer ships
+  'extraction',
 ]);
 
 const projectionEntry = (eventType: string, surface: string): ContractEntry => ({
@@ -224,6 +225,35 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
         materializer: 'recall',
         peerFreshnessMs: 30_000,
         recovery: 'replay-event-log',
+      },
+    ],
+  },
+  // Lane 2 / L2.S6 — capture.extraction.produced. A replica
+  // announces a fresher extraction revision for an existing
+  // sourceUnitId. Class E surface owned by 'extraction'
+  // materializer (writes the revision + flips source state).
+  // Class B surface owned by 'recall' materializer (consumes
+  // active extraction revisions; source-scoped replace via
+  // replaceEntriesForSourceUnit). Note: 'extraction' is not yet
+  // in KNOWN_MATERIALIZERS — Lane 2 stage 6 wires the
+  // extractionMaterializer; this entry is registered now so the
+  // coverage test enforces that gap.
+  {
+    eventType: CAPTURE_EXTRACTION_PRODUCED,
+    surfaces: [
+      {
+        surface: 'extraction-revisions',
+        class: 'extraction-revision',
+        materializer: 'extraction',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+      {
+        surface: 'recall-index',
+        class: 'derived-cache',
+        materializer: 'recall',
+        peerFreshnessMs: 30_000,
+        recovery: 'source-scoped-reextract',
       },
     ],
   },

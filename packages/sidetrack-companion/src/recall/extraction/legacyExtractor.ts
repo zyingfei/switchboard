@@ -67,7 +67,7 @@ export const wrapCaptureAsLegacyRevisions = (
     const textHash = sha256(text).slice(0, 16);
     const sourceUnitId = sourceUnitIdFor({
       provider: payload.provider ?? 'unknown',
-      canonicalUrl: payload.threadUrl,
+      ...(payload.threadUrl === undefined ? {} : { canonicalUrl: payload.threadUrl }),
       role,
       turnOrdinal: ordinal,
       sourceSnapshotHash: textHash,

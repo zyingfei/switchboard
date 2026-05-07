@@ -17,9 +17,11 @@ import {
 import { createEventLog } from '../sync/eventLog.js';
 import { createKnownReplicasStore } from '../sync/knownReplicas.js';
 import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
+import { createExtractionMaterializer } from '../sync/contract/extractionMaterializer.js';
 import { createProjectionMaterializer } from '../sync/contract/projectionMaterializer.js';
 import { createRecallMaterializer } from '../sync/contract/recallMaterializer.js';
 import { createSyncContractRunner } from '../sync/contract/runner.js';
+import { createExtractionStore } from '../recall/extraction/store.js';
 import { reprojectOnVersionMismatch } from '../sync/reproject.js';
 import { startAntiEntropyTask } from '../sync/antiEntropy.js';
 import {
@@ -170,6 +172,17 @@ export const startCompanion = async (
       vaultRoot: options.vaultPath,
       eventLog: baseEventLog,
       projectionChanges,
+    }),
+  );
+  // Lane 2 / Class E — extraction materializer wraps capture.recorded
+  // as legacy extraction revisions and consumes capture.extraction.
+  // produced peer events. Recall is a downstream consumer of the
+  // extraction store via its own catchUp.
+  const extractionStore = createExtractionStore(options.vaultPath);
+  syncContractRunner.register(
+    createExtractionMaterializer({
+      store: extractionStore,
+      eventLog: baseEventLog,
     }),
   );
 
