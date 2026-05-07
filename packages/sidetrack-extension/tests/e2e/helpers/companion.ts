@@ -164,6 +164,16 @@ export const startTestCompanion = async (
     const next = spawn(process.execPath, args, {
       cwd: companionRoot,
       stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        // Sync Contract v1 / L1-G2 + L1-G3 e2e fixture: enable the
+        // deterministic test embedder so the spawned companion can
+        // build a recall index without loading the 100+MB HF
+        // multilingual-e5-small model. Same hook is used in
+        // companion-side unit tests via vi.mock; the env-var path
+        // is what the spawned subprocess sees.
+        SIDETRACK_TEST_EMBEDDER: '1',
+      },
     });
     try {
       await waitForListening(next, port);
@@ -171,6 +181,27 @@ export const startTestCompanion = async (
       await closeProcess(next);
       throw error;
     }
+    // After listening, drain stdout/stderr so the pipes don't fill
+    // and stall the child. Stderr is forwarded so test failures
+    // surface companion errors; stdout is silenced (the build's
+    // own [recall] / [relay] info logs would drown out test
+    // output otherwise — set DEBUG_COMP=1 to re-enable).
+    const debugComp = process.env['DEBUG_COMP'] === '1';
+    next.stdout.on('data', (chunk: Buffer) => {
+      if (!debugComp) return;
+      const text = chunk.toString('utf8').trimEnd();
+      if (text.length > 0) {
+        // eslint-disable-next-line no-console
+        console.log(`[comp:${String(port)}] ${text}`);
+      }
+    });
+    next.stderr.on('data', (chunk: Buffer) => {
+      const text = chunk.toString('utf8').trimEnd();
+      if (text.length > 0) {
+        // eslint-disable-next-line no-console
+        console.warn(`[comp:${String(port)}] ${text}`);
+      }
+    });
     child = next;
   };
 

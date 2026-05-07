@@ -241,9 +241,45 @@ const E5_PREFIX = 'query: ';
 // largest single turn (~1.5MB for our 4000-char cap). The chunked
 // rebuilder still calls `embed` with batches, so we get the natural
 // yield-between-batches behavior for the HTTP server's sake.
+// Test-only deterministic embedder. Activated when the env var
+// `SIDETRACK_TEST_EMBEDDER=1` is set (the playwright fixture sets
+// this on the spawned companion). Avoids loading the 100+MB HF
+// model in CI / local test runs while still giving recall a real
+// vector to index — the lexical (MiniSearch) side of the hybrid
+// ranker carries the test signal; vectors are deterministic so
+// the index file is still byte-stable across reruns.
+const isTestEmbedderEnabled = (): boolean =>
+  typeof process !== 'undefined' && process.env?.['SIDETRACK_TEST_EMBEDDER'] === '1';
+
+const testEmbed = (text: string): Float32Array => {
+  // Deterministic: hash the text into the 384-dim vector. Not
+  // semantically meaningful — that's fine, the e2e uses lexical
+  // matches. Same input → same output → byte-stable index files.
+  const v = new Float32Array(384);
+  let h = 2166136261; // FNV-1a seed
+  for (let i = 0; i < text.length; i += 1) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  for (let i = 0; i < 384; i += 1) {
+    h = Math.imul(h ^ (h >>> 13), 16777619);
+    v[i] = ((h >>> 0) / 0xffffffff) * 2 - 1;
+  }
+  // L2 normalize (e5 outputs are normalized; tests rely on cosine
+  // similarity behaving sanely).
+  let norm = 0;
+  for (let i = 0; i < 384; i += 1) norm += (v[i] ?? 0) * (v[i] ?? 0);
+  const inv = 1 / Math.sqrt(norm);
+  for (let i = 0; i < 384; i += 1) v[i] = (v[i] ?? 0) * inv;
+  return v;
+};
+
 export const embed = async (texts: readonly string[]): Promise<readonly Float32Array[]> => {
   if (texts.length === 0) {
     return [];
+  }
+  if (isTestEmbedderEnabled()) {
+    return texts.map(testEmbed);
   }
   const extractor = await getEmbedder();
   const vectors: Float32Array[] = [];
