@@ -158,10 +158,43 @@ const indexPathFor = (vaultRoot: string): string => join(vaultRoot, '_BAC', 'rec
 
 const eventLogPathFor = (vaultRoot: string): string => join(vaultRoot, '_BAC', 'events');
 
-const countTurnsInEventLog = async (vaultRoot: string): Promise<number> => {
+const countTurnsInEventLog = async (
+  vaultRoot: string,
+  eventLog: EventLog | undefined,
+): Promise<number> => {
+  // Sources, in priority order:
+  //   1. The per-replica log under `_BAC/log/<replicaId>/*.jsonl`.
+  //      This is where every post-PR-#93 capture lives — including
+  //      events synced from peers via the relay. We MUST count this
+  //      or drift detection is blind to cross-replica captures and
+  //      auto-rebuilds never fire after a sync.
+  //   2. The legacy `_BAC/events/*.jsonl` file. Pre-PR-#93 vaults
+  //      have only this; post-#93 vaults still write a back-compat
+  //      copy of the local replica's captures here. We dedupe by
+  //      bac_id so we don't double-count a local capture that was
+  //      written through both paths.
+  let total = 0;
+  const seenBacIds = new Set<string>();
+  if (eventLog !== undefined) {
+    const accepted = await eventLog.readMerged();
+    for (const event of accepted) {
+      if (event.type !== 'capture.recorded') continue;
+      const payload = event.payload as { readonly bac_id?: unknown; readonly turns?: unknown };
+      if (typeof payload.bac_id === 'string') {
+        seenBacIds.add(payload.bac_id);
+      }
+      if (!Array.isArray(payload.turns)) continue;
+      for (const rawTurn of payload.turns) {
+        if (typeof rawTurn !== 'object' || rawTurn === null) continue;
+        const text = (rawTurn as { readonly text?: unknown }).text;
+        if (typeof text === 'string' && text.trim().length > 0) {
+          total += 1;
+        }
+      }
+    }
+  }
   const eventDir = eventLogPathFor(vaultRoot);
   const files = await readdir(eventDir).catch(() => [] as readonly string[]);
-  let total = 0;
   for (const file of files) {
     if (!file.endsWith('.jsonl')) continue;
     const raw = await readFile(join(eventDir, file), 'utf8').catch(() => '');
@@ -171,6 +204,12 @@ const countTurnsInEventLog = async (vaultRoot: string): Promise<number> => {
       try {
         const parsed: unknown = JSON.parse(trimmed);
         if (typeof parsed !== 'object' || parsed === null) continue;
+        const bacId = (parsed as { readonly bac_id?: unknown }).bac_id;
+        if (typeof bacId === 'string' && seenBacIds.has(bacId)) {
+          // Already accounted for via the per-replica log walk
+          // above; skip so we don't double-count.
+          continue;
+        }
         const turns = (parsed as { readonly turns?: unknown }).turns;
         if (!Array.isArray(turns)) continue;
         for (const rawTurn of turns) {
@@ -232,7 +271,7 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
   const report = async (): Promise<RecallStatusReport> => {
     const [index, eventTurnCount] = await Promise.all([
       readIndex(indexPathFor(opts.vaultRoot)),
-      countTurnsInEventLog(opts.vaultRoot),
+      countTurnsInEventLog(opts.vaultRoot, opts.eventLog),
     ]);
     // Tombstoned rows are still on disk (OR-Set semantics) but the
     // user's mental model is "deleted." Drift compares the live

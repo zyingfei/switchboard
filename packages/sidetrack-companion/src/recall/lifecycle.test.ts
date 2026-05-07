@@ -200,6 +200,63 @@ describe('recall lifecycle', () => {
     }
   });
 
+  it('drift counter walks the per-replica log so cross-replica peer-synced events count toward eventTurnCount', async () => {
+    // Pre-PR-#93 captures live in `_BAC/events/`. Post-PR-#93 captures
+    // (especially peer-synced events) live ONLY under
+    // `_BAC/log/<replicaId>/`. countTurnsInEventLog used to read just
+    // the legacy path, so a vault that received 10 peer-synced
+    // captures would report eventTurnCount=0, drift=0, "ready" — and
+    // never auto-rebuild even though the index covers nothing the
+    // peer sent. This test guards against regression.
+    const root = await mkdtemp(join(tmpdir(), 'recall-lifecycle-peer-drift-'));
+    try {
+      const { createEventLog } = await import('../sync/eventLog.js');
+      const { loadOrCreateReplica } = await import('../sync/replicaId.js');
+      const replica = await loadOrCreateReplica(root);
+      const eventLog = createEventLog(root, replica);
+      // Simulate a peer-synced capture by importing a foreign-replica
+      // event under a different replicaId. importPeerEvent is the
+      // exact code path the relay client takes when relaying a peer
+      // event into our log.
+      await eventLog.importPeerEvent({
+        clientEventId: 'peer-evt-1',
+        dot: { replicaId: 'remote-replica-aaaaaa', seq: 1 },
+        deps: {},
+        aggregateId: 'thread_remote',
+        type: 'capture.recorded',
+        payload: {
+          bac_id: 'thread_remote',
+          capturedAt: '2026-05-04T00:00:00.000Z',
+          turns: [
+            { ordinal: 0, role: 'user', text: 'peer turn 1' },
+            { ordinal: 1, role: 'assistant', text: 'peer turn 2' },
+          ],
+        },
+        acceptedAtMs: 1_780_000_000_000,
+      });
+      const indexPath = join(root, '_BAC', 'recall', 'index.bin');
+      // Empty index: should drift hard against the 2 peer turns.
+      await writeIndex(indexPath, [], 'fresh/model');
+      const lifecycle = createRecallLifecycle({
+        vaultRoot: root,
+        companionVersion: '0.0.0-test',
+        currentModelId: 'fresh/model',
+        rebuilder: () => Promise.resolve({ indexed: 0 }),
+        eventLog,
+        log: () => undefined,
+        warn: () => undefined,
+      });
+      const report = await lifecycle.report();
+      expect(report.eventTurnCount).toBe(2);
+      // The drift status flips to 'stale' because entryCount=0 with
+      // eventTurnCount > 0 — the same condition that triggers an
+      // auto-rebuild on the actual lifecycle.
+      expect(report.status).toBe('stale');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('does not flag drift when entry count meets or exceeds the event log', async () => {
     const root = await mkdtemp(join(tmpdir(), 'recall-lifecycle-no-drift-'));
     try {
