@@ -194,15 +194,30 @@ export const startCompanion = async (
     });
   }
 
-  // Decorate the eventLog with an after-accept publish hook so
-  // outbound events fan out via the relay (and any future transports
-  // wired up here) without each callsite having to know about them.
+  // Decorate the eventLog with an after-accept hook that:
+  //   1. Runs runImportProjectors so the LOCAL write path produces
+  //      the same on-disk projection file as the peer-import path.
+  //      Invariant A — single write path: every projection file is
+  //      written via the registry projector. vault/writer.ts may
+  //      still write markdown sidecars / audit entries / lock
+  //      sentinels (local-action concerns) but the per-aggregate
+  //      JSON projection file is the projector's responsibility.
+  //   2. Publishes via the relay so peers learn about the event
+  //      without a shared filesystem.
   const eventLog = {
     ...baseEventLog,
     appendClient: async <T extends Record<string, unknown>>(
       input: Parameters<typeof baseEventLog.appendClient<T>>[0],
     ) => {
       const accepted = await baseEventLog.appendClient(input);
+      // Run the projector locally so the projection file is written
+      // by the same code path that handles peer imports. Best-effort
+      // — projection writes are non-critical and the worst case is
+      // a stale file that the next event refreshes.
+      await runImportProjectors(
+        { vaultRoot: options.vaultPath, eventLog: baseEventLog, projectionChanges },
+        accepted,
+      ).catch(() => undefined);
       if (relayTransport !== null) {
         void relayTransport.publishEvent(accepted.dot.replicaId, accepted).catch(() => undefined);
       }
