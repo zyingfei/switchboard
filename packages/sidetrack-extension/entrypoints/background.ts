@@ -38,6 +38,7 @@ import {
   type ReviewDraftClientConfig,
 } from '../src/review/draftClient';
 import { drainReviewDraftOutbox } from '../src/review/outbox';
+import { initializeTimelineWiring } from '../src/timeline/wiring';
 import { createVaultChangesClient } from '../src/companion/vaultChanges';
 import { createRecallClient } from '../src/companion/recallClient';
 import { buildReviewFollowUpText } from '../src/review/draft';
@@ -2608,6 +2609,21 @@ export default defineBackground(() => {
       return;
     }
     dismissAndBroadcast();
+  });
+
+  // Sync Contract v1 / Class F — bind chrome.tabs to the timeline
+  // observer + materializer + drainer. Idempotent on repeated boots
+  // (chrome.alarms.create replaces; the wiring guards init).
+  void initializeTimelineWiring({
+    readCompanion: async () => {
+      const settings = await readSettings();
+      const port = settings.companion.port;
+      const bridgeKey = settings.companion.bridgeKey.trim();
+      if (typeof port !== 'number' || port <= 0 || bridgeKey.length === 0) return null;
+      return { url: `http://127.0.0.1:${String(port)}`, bridgeKey };
+    },
+  }).catch((error: unknown) => {
+    console.warn('[timeline] init failed:', error);
   });
 
   chrome.runtime.onMessage.addListener(
