@@ -17,7 +17,9 @@ import {
 import { createEventLog } from '../sync/eventLog.js';
 import { createKnownReplicasStore } from '../sync/knownReplicas.js';
 import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
-import { runImportProjectors } from '../sync/projectors.js';
+import { createProjectionMaterializer } from '../sync/contract/projectionMaterializer.js';
+import { createRecallMaterializer } from '../sync/contract/recallMaterializer.js';
+import { createSyncContractRunner } from '../sync/contract/runner.js';
 import { reprojectOnVersionMismatch } from '../sync/reproject.js';
 import { startAntiEntropyTask } from '../sync/antiEntropy.js';
 import {
@@ -155,6 +157,21 @@ export const startCompanion = async (
   const baseEventLog = createEventLog(options.vaultPath, replica);
   const projectionChanges = createProjectionChangeFeed(options.vaultPath);
 
+  // Sync Contract v1 — runner. Single dispatch point for every
+  // accepted event (local OR peer). Materializers register below
+  // (projection always; recall after recallLifecycle exists). The
+  // relay subscriber + the local appendClient decorator both call
+  // `runner.onAcceptedEvent` so source-vs-peer asymmetry is
+  // structurally impossible (gate L1-G10). See plan
+  // (~/.claude/plans/kind-prancing-river.md), Lane 1.
+  const syncContractRunner = createSyncContractRunner();
+  syncContractRunner.register(
+    createProjectionMaterializer({
+      vaultRoot: options.vaultPath,
+      projectionChanges,
+    }),
+  );
+
   // Reproject on startup if the projector logic has changed since
   // the last run. Writes a `_BAC/.projector-version` sentinel so
   // subsequent startups are no-ops. Recovers from:
@@ -207,14 +224,13 @@ export const startCompanion = async (
         try {
           const result = await baseEventLog.importPeerEvent(event);
           if (result.imported) {
-            await runImportProjectors(
-              {
-                vaultRoot: options.vaultPath,
-                eventLog: baseEventLog,
-                projectionChanges,
-              },
-              event,
-            );
+            // Sync Contract v1: hand to the runner. The projection
+            // materializer dispatches into runImportProjectors; the
+            // recall materializer schedules a coalesced ingest. No
+            // direct runImportProjectors call here — the runner is
+            // the single dispatch point for both local and peer
+            // accepted events (gate L1-G10).
+            syncContractRunner.onAcceptedEvent(event, { origin: 'peer' });
           }
         } catch {
           // importPeerEvent surfaces DotCollisionError /
@@ -225,28 +241,30 @@ export const startCompanion = async (
     });
   }
 
-  // Decorate the eventLog with an after-accept publish hook so
-  // outbound events fan out via the relay without each callsite
-  // having to know about them.
+  // Decorate the eventLog with an after-accept hook that:
+  //   1. Hands the accepted event to the contract runner with
+  //      `origin: 'local'`. The runner dispatches to materializers,
+  //      symmetrically with the peer-import path. This is gate
+  //      L1-G10 — local accepted events enter the same contract.
+  //   2. Publishes via the relay so peers learn about the event
+  //      without a shared filesystem.
   //
-  // Invariant A note: an earlier iteration also ran
-  // runImportProjectors here so the LOCAL appendClient path
-  // produced the same on-disk file as the peer-import path. That
-  // turned out to clobber vault/writer.ts's flat-shape per-aggregate
-  // JSON (which legacy readers like parseThreadUpsertBody and
-  // deleteWorkstream depend on) with the projector's
-  // projection-shape (`{record: RegisterProjection, vector, ...}`).
-  // The projector still runs on peer imports — that path is safe
-  // because vault/writer.ts isn't called there. The
-  // single-write-path goal needs a separate fix: either teach the
-  // projector to emit the flat shape or move the projection to a
-  // distinct path. Tracked as a follow-up.
+  // Note on flat-shape vs projection-shape (L1.S3 follow-up): the
+  // projection materializer writes the projection envelope to the
+  // _BAC/<aggregate>/projections/ subpath while vault/writer.ts
+  // continues to write the flat path for legacy readers
+  // (parseThreadUpsertBody, deleteWorkstream). Path decoupling is
+  // L1.S3; this stage wires the runner.
   const eventLog = {
     ...baseEventLog,
     appendClient: async <T extends Record<string, unknown>>(
       input: Parameters<typeof baseEventLog.appendClient<T>>[0],
     ) => {
       const accepted = await baseEventLog.appendClient(input);
+      // Sync Contract v1: local accepted event enters the runner.
+      // Runner dispatches to projection materializer (and recall +
+      // future materializers). Local + peer symmetric (L1-G10).
+      syncContractRunner.onAcceptedEvent(accepted, { origin: 'local' });
       if (relayTransport !== null) {
         void relayTransport.publishEvent(accepted.dot.replicaId, accepted).catch(() => undefined);
       }
@@ -263,6 +281,17 @@ export const startCompanion = async (
     },
     eventLog,
   });
+
+  // Recall materializer registers AFTER recallLifecycle exists. Uses
+  // the dirty-bit coalesced scheduler so a burst of capture events
+  // (e.g., reconnect backlog) creates exactly one in-flight ingest
+  // worker (gate L1-G6).
+  syncContractRunner.register(
+    createRecallMaterializer({
+      recallLifecycle,
+      recallActivity,
+    }),
+  );
   // Don't block startup on the rebuild — health endpoint will report
   // status: 'rebuilding' until the background task completes.
   // The fresh-check + incremental ingest BOTH run through the
@@ -280,11 +309,14 @@ export const startCompanion = async (
       // batches anyway, but holding the await here makes the order
       // explicit + lets us bail cleanly if rebuild errors.
       await recallLifecycle.waitForRebuild();
-      // Ingest goes through the lifecycle's mutex via
-      // lifecycle.ingestIncremental — never call ingestor directly
-      // from runtime code, that would bypass the single-writer
-      // invariant.
-      await recallLifecycle.ingestIncremental(baseEventLog);
+      // Sync Contract v1: catchUp every materializer over the
+      // merged event log. Replaces the prior direct
+      // ingestIncremental call — the recall materializer's catchUp
+      // hands through to the same lifecycle.ingestIncremental, but
+      // the projection materializer now ALSO catches up here so
+      // any peer events that landed before startup get projected.
+      // AWAITS each materializer's drain (gate L1-G4).
+      await syncContractRunner.catchUpAll(baseEventLog);
     } catch {
       // Errors are non-fatal — the manual `recall reingest` CLI
       // verb + lifecycle stale-check rebuilds remain available.
@@ -305,6 +337,7 @@ export const startCompanion = async (
     replica,
     eventLog,
     projectionChanges,
+    syncMaterializerHealth: () => syncContractRunner.health(),
     serviceInstallDefaults: {
       port: options.port,
       ...(options.service?.companionCommand === undefined

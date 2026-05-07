@@ -75,6 +75,7 @@ const compactTargetRef = (raw: Record<string, unknown> | undefined): TargetRef |
 const syncSummaryDeps = (
   replica: ReplicaContext | undefined,
   sync: CompanionHttpConfig['sync'],
+  syncMaterializerHealth?: CompanionHttpConfig['syncMaterializerHealth'],
 ): {
   syncSummary?: () => {
     replicaId: string;
@@ -88,6 +89,15 @@ const syncSummaryDeps = (
       readonly consecutiveFailures?: number;
       readonly pendingPublishes?: number;
     };
+    materializers?: Record<
+      string,
+      {
+        readonly status: 'healthy' | 'degraded' | 'failed';
+        readonly lastSuccessAt: string | null;
+        readonly lastError: string | null;
+        readonly pending: boolean;
+      }
+    >;
   };
 } =>
   replica === undefined
@@ -102,8 +112,17 @@ const syncSummaryDeps = (
           // tests that pass --sync-relay-local without a live
           // transport may not).
           const relayBase = sync?.relay;
+          const materializers = syncMaterializerHealth?.();
+          const materializersBlock =
+            materializers === undefined || Object.keys(materializers).length === 0
+              ? {}
+              : { materializers };
           if (relayBase === undefined) {
-            return { replicaId: replica.replicaId, seq: replica.peekSeq() };
+            return {
+              replicaId: replica.replicaId,
+              seq: replica.peekSeq(),
+              ...materializersBlock,
+            };
           }
           const live = sync?.getRelayStatus?.() ?? null;
           return {
@@ -125,6 +144,7 @@ const syncSummaryDeps = (
                       : { lastDisconnectedAtMs: live.lastDisconnectedAtMs }),
                   }),
             },
+            ...materializersBlock,
           };
         },
       };
@@ -261,6 +281,19 @@ export interface CompanionHttpConfig {
   // Per-replica event log used by the review-draft (and future)
   // CRDT projection routes. When unset those routes return 503.
   readonly eventLog?: EventLog;
+  // Sync Contract v1: per-materializer health source. /v1/system/health
+  // surfaces this under `sync.materializers` so the side panel +
+  // operator can see when a materializer is degraded or failed even
+  // though the event log appears converged. Gate L1-G9.
+  readonly syncMaterializerHealth?: () => Record<
+    string,
+    {
+      readonly status: 'healthy' | 'degraded' | 'failed';
+      readonly lastSuccessAt: string | null;
+      readonly lastError: string | null;
+      readonly pending: boolean;
+    }
+  >;
   // Local monotonic projection-change feed. Browsers resume polling
   // with a numeric `sinceSeq` cursor; the counter never moves
   // backward and is independent of any host's wall clock.
@@ -1152,7 +1185,7 @@ const routes: readonly RouteDefinition[] = [
               const status = await (context.serviceInstaller ?? pickInstaller()).status();
               return { installed: status.installed, running: status.running };
             },
-            ...syncSummaryDeps(context.replica, context.sync),
+            ...syncSummaryDeps(context.replica, context.sync, context.syncMaterializerHealth),
           }),
         },
       ];

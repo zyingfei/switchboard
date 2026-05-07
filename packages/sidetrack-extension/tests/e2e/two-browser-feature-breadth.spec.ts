@@ -180,7 +180,7 @@ test.describe('two-browser feature-breadth — every aggregate, bidirectional', 
       expect(typeof wsRevision).toBe('string');
       expect(typeof wsId).toBe('string');
 
-      await waitForVaultFile(companionB.vaultPath, '_BAC/workstreams', `${wsId!}.json`);
+      await waitForVaultFile(companionB.vaultPath, '_BAC/workstreams/projections', `${wsId!}.json`);
       await waitForStorage(
         pageB,
         'workstream visible on B',
@@ -209,7 +209,7 @@ test.describe('two-browser feature-breadth — every aggregate, bidirectional', 
       const threadId = threadCreated.data?.bac_id;
       expect(typeof threadId).toBe('string');
 
-      await waitForVaultFile(companionB.vaultPath, '_BAC/threads', `${threadId!}.json`);
+      await waitForVaultFile(companionB.vaultPath, '_BAC/threads/projections', `${threadId!}.json`);
       await waitForStorage(
         pageB,
         'thread visible on B',
@@ -279,7 +279,7 @@ test.describe('two-browser feature-breadth — every aggregate, bidirectional', 
       const queueId = queueResponse.data?.bac_id;
       expect(typeof queueId).toBe('string');
 
-      await waitForVaultFile(companionB.vaultPath, '_BAC/queue', `${queueId!}.json`);
+      await waitForVaultFile(companionB.vaultPath, '_BAC/queue/projections', `${queueId!}.json`);
       await waitForStorage(
         pageB,
         'queue item visible on B',
@@ -312,7 +312,7 @@ test.describe('two-browser feature-breadth — every aggregate, bidirectional', 
       );
 
       // A's vault gets the dispatch projection.
-      await waitForVaultFile(companionA.vaultPath, '_BAC/dispatches', `${dispatchId!}.json`);
+      await waitForVaultFile(companionA.vaultPath, '_BAC/dispatches/projections', `${dispatchId!}.json`);
       // A's chrome.storage gets the dispatch entry.
       await waitForStorage(
         pageA,
@@ -356,14 +356,20 @@ test.describe('two-browser feature-breadth — every aggregate, bidirectional', 
 
       await waitForVaultFile(
         companionB.vaultPath,
-        '_BAC/annotations',
+        '_BAC/annotations/projections',
         `${annotationId!}.json`,
       );
       // The projection on B has the right URL.
       const annotationProjection = await readJson<{
         entry?: { url?: string; note?: { value?: string } };
       }>(
-        path.join(companionB.vaultPath, '_BAC', 'annotations', `${annotationId!}.json`),
+        path.join(
+          companionB.vaultPath,
+          '_BAC',
+          'annotations',
+          'projections',
+          `${annotationId!}.json`,
+        ),
       );
       expect(annotationProjection?.entry?.url).toBe('https://example.test/research-paper');
       await stepPause();

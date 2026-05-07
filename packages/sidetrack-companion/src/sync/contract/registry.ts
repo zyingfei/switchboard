@@ -75,10 +75,15 @@ export interface ContractEntry {
 // Materializers wired in Lane 1 (S2). Lane 2 adds 'extraction'.
 // Future surfaces (context-pack, obsidian, mcp, summary, browser-timeline)
 // register additional materializer names here as they land.
+//
+// Note on annotation-overlay: the in-page overlay refresh is owned by
+// the extension's SSE subscriber (F13 path) — that's plugin-tier,
+// not a companion-side materializer. The annotation-projection
+// surface (companion-side, Class A) IS owned by the projection
+// materializer here.
 export const KNOWN_MATERIALIZERS: ReadonlySet<string> = new Set<string>([
   'projection',
   'recall',
-  'annotation-overlay',
   // 'extraction',         // Lane 2 — uncomment when extractionMaterializer ships
 ]);
 
@@ -125,9 +130,13 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
         recovery: 'replay-event-log',
       },
       {
+        // The in-page overlay refresh is owned by the extension's
+        // SSE subscriber on the annotation-projection prefix; no
+        // companion-side materializer is registered. Marking the
+        // surface as plugin-tier-bounded keeps the registry honest
+        // about ownership.
         surface: 'annotation-overlay',
-        class: 'aggregate-projection',
-        materializer: 'annotation-overlay',
+        class: 'plugin-tier-bounded',
         peerFreshnessMs: 5_000,
         recovery: 'on-demand-rebuild',
       },
@@ -144,9 +153,13 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
         recovery: 'replay-event-log',
       },
       {
+        // The in-page overlay refresh is owned by the extension's
+        // SSE subscriber on the annotation-projection prefix; no
+        // companion-side materializer is registered. Marking the
+        // surface as plugin-tier-bounded keeps the registry honest
+        // about ownership.
         surface: 'annotation-overlay',
-        class: 'aggregate-projection',
-        materializer: 'annotation-overlay',
+        class: 'plugin-tier-bounded',
         peerFreshnessMs: 5_000,
         recovery: 'on-demand-rebuild',
       },
@@ -163,9 +176,13 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
         recovery: 'replay-event-log',
       },
       {
+        // The in-page overlay refresh is owned by the extension's
+        // SSE subscriber on the annotation-projection prefix; no
+        // companion-side materializer is registered. Marking the
+        // surface as plugin-tier-bounded keeps the registry honest
+        // about ownership.
         surface: 'annotation-overlay',
-        class: 'aggregate-projection',
-        materializer: 'annotation-overlay',
+        class: 'plugin-tier-bounded',
         peerFreshnessMs: 5_000,
         recovery: 'on-demand-rebuild',
       },

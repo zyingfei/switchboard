@@ -48,7 +48,7 @@ interface MatrixCase {
 const cases: readonly MatrixCase[] = [
   {
     name: 'thread',
-    relDir: '_BAC/threads',
+    relDir: '_BAC/threads/projections',
     aggregateId: 'th-1',
     first: () => ({
       aggregateId: 'th-1',
@@ -69,7 +69,7 @@ const cases: readonly MatrixCase[] = [
   },
   {
     name: 'workstream',
-    relDir: '_BAC/workstreams',
+    relDir: '_BAC/workstreams/projections',
     aggregateId: 'ws-1',
     first: () => ({
       aggregateId: 'ws-1',
@@ -84,7 +84,7 @@ const cases: readonly MatrixCase[] = [
   },
   {
     name: 'annotation',
-    relDir: '_BAC/annotations',
+    relDir: '_BAC/annotations/projections',
     aggregateId: 'ann-1',
     first: () => ({
       aggregateId: 'ann-1',
@@ -108,7 +108,7 @@ const cases: readonly MatrixCase[] = [
   },
   {
     name: 'queue',
-    relDir: '_BAC/queue',
+    relDir: '_BAC/queue/projections',
     aggregateId: 'q-1',
     first: () => ({
       aggregateId: 'q-1',
@@ -123,7 +123,7 @@ const cases: readonly MatrixCase[] = [
   },
   {
     name: 'dispatch',
-    relDir: '_BAC/dispatches',
+    relDir: '_BAC/dispatches/projections',
     aggregateId: 'd-1',
     first: () => ({
       aggregateId: 'd-1',

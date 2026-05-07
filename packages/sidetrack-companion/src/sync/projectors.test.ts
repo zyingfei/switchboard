@@ -79,7 +79,7 @@ describe('runImportProjectors', () => {
     });
   });
 
-  it('imported thread.upserted writes _BAC/threads/<id>.json + appends a projection change (F9)', async () => {
+  it('imported thread.upserted writes _BAC/threads/projections/<id>.json + appends a projection change (F9)', async () => {
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
     const projectionChanges = createProjectionChangeFeed(vaultRoot);
@@ -102,25 +102,25 @@ describe('runImportProjectors', () => {
     await runImportProjectors({ vaultRoot, eventLog, projectionChanges }, event);
     const changes = await projectionChanges.readSince(0);
     // F9 (thread import projector): we DO project thread events
-    // now so _BAC/threads/<id>.json fires the vault-changes SSE
+    // now so _BAC/threads/projections/<id>.json fires the vault-changes SSE
     // for the receiving extension.
     expect(changes.changed).toHaveLength(1);
     expect(changes.changed[0]).toMatchObject({
       aggregate: 'thread',
       aggregateId: 'thread-y',
-      relPath: '_BAC/threads/thread-y.json',
+      relPath: '_BAC/threads/projections/thread-y.json',
       kind: 'upsert',
     });
     // The file is on disk and parses as the projection record.
     const { readFile } = await import('node:fs/promises');
     const written = JSON.parse(
-      await readFile(`${vaultRoot}/_BAC/threads/thread-y.json`, 'utf8'),
+      await readFile(`${vaultRoot}/_BAC/threads/projections/thread-y.json`, 'utf8'),
     ) as { bac_id: string; record: { value?: { title?: string } } };
     expect(written.bac_id).toBe('thread-y');
     expect(written.record.value?.title).toBe('t');
   });
 
-  it('F13 — imported annotation.created writes _BAC/annotations/<id>.json + projection-change row', async () => {
+  it('F13 — imported annotation.created writes _BAC/annotations/projections/<id>.json + projection-change row', async () => {
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
     const projectionChanges = createProjectionChangeFeed(vaultRoot);
@@ -149,12 +149,12 @@ describe('runImportProjectors', () => {
     expect(changes.changed[0]).toMatchObject({
       aggregate: 'annotation',
       aggregateId: 'ann-1',
-      relPath: '_BAC/annotations/ann-1.json',
+      relPath: '_BAC/annotations/projections/ann-1.json',
       kind: 'upsert',
     });
     const { readFile } = await import('node:fs/promises');
     const written = JSON.parse(
-      await readFile(`${vaultRoot}/_BAC/annotations/ann-1.json`, 'utf8'),
+      await readFile(`${vaultRoot}/_BAC/annotations/projections/ann-1.json`, 'utf8'),
     ) as { entry: { bac_id: string; url: string; deleted: boolean } };
     expect(written.entry.bac_id).toBe('ann-1');
     expect(written.entry.url).toBe('https://example.test/page');
@@ -200,7 +200,7 @@ describe('runImportProjectors', () => {
     expect(changes.changed.map((row) => row.kind)).toEqual(['upsert', 'delete']);
   });
 
-  it('F14 — imported queue.created writes _BAC/queue/<id>.json + projection-change row', async () => {
+  it('F14 — imported queue.created writes _BAC/queue/projections/<id>.json + projection-change row', async () => {
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
     const projectionChanges = createProjectionChangeFeed(vaultRoot);
@@ -220,19 +220,19 @@ describe('runImportProjectors', () => {
     expect(changes.changed[0]).toMatchObject({
       aggregate: 'queue',
       aggregateId: 'q-1',
-      relPath: '_BAC/queue/q-1.json',
+      relPath: '_BAC/queue/projections/q-1.json',
       kind: 'upsert',
     });
     const { readFile } = await import('node:fs/promises');
     const written = JSON.parse(
-      await readFile(`${vaultRoot}/_BAC/queue/q-1.json`, 'utf8'),
+      await readFile(`${vaultRoot}/_BAC/queue/projections/q-1.json`, 'utf8'),
     ) as { bac_id: string; base?: { text: string; scope: string } };
     expect(written.bac_id).toBe('q-1');
     expect(written.base?.text).toBe('follow up');
     expect(written.base?.scope).toBe('global');
   });
 
-  it('F15 — imported dispatch.recorded writes _BAC/dispatches/<id>.json + projection-change row', async () => {
+  it('F15 — imported dispatch.recorded writes _BAC/dispatches/projections/<id>.json + projection-change row', async () => {
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
     const projectionChanges = createProjectionChangeFeed(vaultRoot);
@@ -257,12 +257,12 @@ describe('runImportProjectors', () => {
     expect(changes.changed[0]).toMatchObject({
       aggregate: 'dispatch',
       aggregateId: 'd-1',
-      relPath: '_BAC/dispatches/d-1.json',
+      relPath: '_BAC/dispatches/projections/d-1.json',
       kind: 'upsert',
     });
     const { readFile } = await import('node:fs/promises');
     const written = JSON.parse(
-      await readFile(`${vaultRoot}/_BAC/dispatches/d-1.json`, 'utf8'),
+      await readFile(`${vaultRoot}/_BAC/dispatches/projections/d-1.json`, 'utf8'),
     ) as { entry?: { bac_id: string; body: string } };
     expect(written.entry?.bac_id).toBe('d-1');
     expect(written.entry?.body).toBe('redacted body');
@@ -301,7 +301,7 @@ describe('runImportProjectors', () => {
     await runImportProjectors({ vaultRoot, eventLog, projectionChanges }, linked);
     const { readFile } = await import('node:fs/promises');
     const written = JSON.parse(
-      await readFile(`${vaultRoot}/_BAC/dispatches/d-2.json`, 'utf8'),
+      await readFile(`${vaultRoot}/_BAC/dispatches/projections/d-2.json`, 'utf8'),
     ) as { entry?: { bac_id: string }; link?: { dispatchId: string; threadId?: string } };
     expect(written.entry?.bac_id).toBe('d-2');
     expect(written.link?.dispatchId).toBe('d-2');
@@ -334,7 +334,7 @@ describe('runImportProjectors', () => {
     expect(extra, `unexpected projectors for: ${extra.join(', ')}`).toEqual([]);
   });
 
-  it('F10 — imported workstream.upserted writes _BAC/workstreams/<id>.json + projection-change row', async () => {
+  it('F10 — imported workstream.upserted writes _BAC/workstreams/projections/<id>.json + projection-change row', async () => {
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
     const projectionChanges = createProjectionChangeFeed(vaultRoot);
@@ -354,12 +354,12 @@ describe('runImportProjectors', () => {
     expect(changes.changed[0]).toMatchObject({
       aggregate: 'workstream',
       aggregateId: 'ws-1',
-      relPath: '_BAC/workstreams/ws-1.json',
+      relPath: '_BAC/workstreams/projections/ws-1.json',
       kind: 'upsert',
     });
     const { readFile } = await import('node:fs/promises');
     const written = JSON.parse(
-      await readFile(`${vaultRoot}/_BAC/workstreams/ws-1.json`, 'utf8'),
+      await readFile(`${vaultRoot}/_BAC/workstreams/projections/ws-1.json`, 'utf8'),
     ) as { bac_id: string; record: { value?: { title?: string } } };
     expect(written.bac_id).toBe('ws-1');
     expect(written.record.value?.title).toBe('testsync');

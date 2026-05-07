@@ -50,13 +50,13 @@ describe('startAntiEntropyTask', () => {
       // Initial scan writes the projection.
       const count = await handle.scanNow();
       expect(count).toBe(1);
-      const before = await readFile(`${vaultRoot}/_BAC/threads/t-1.json`, 'utf8');
+      const before = await readFile(`${vaultRoot}/_BAC/threads/projections/t-1.json`, 'utf8');
       expect(before.length).toBeGreaterThan(0);
       // Simulate drift: delete the projection file.
-      await unlink(`${vaultRoot}/_BAC/threads/t-1.json`);
+      await unlink(`${vaultRoot}/_BAC/threads/projections/t-1.json`);
       // Anti-entropy rewrites it.
       await handle.scanNow();
-      const after = await readFile(`${vaultRoot}/_BAC/threads/t-1.json`, 'utf8');
+      const after = await readFile(`${vaultRoot}/_BAC/threads/projections/t-1.json`, 'utf8');
       expect(after).toBe(before);
     } finally {
       handle.stop();

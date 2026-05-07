@@ -135,7 +135,7 @@ async function projectThreadAfterImport(
   await writeProjection(deps, {
     aggregate: 'thread',
     aggregateId: bacId,
-    relDir: '_BAC/threads',
+    relDir: '_BAC/threads/projections',
     body: projection,
     vector: projection.vector,
     kind: projection.deleted ? 'delete' : 'upsert',
@@ -153,7 +153,7 @@ async function projectWorkstreamAfterImport(
   await writeProjection(deps, {
     aggregate: 'workstream',
     aggregateId: bacId,
-    relDir: '_BAC/workstreams',
+    relDir: '_BAC/workstreams/projections',
     body: projection,
     vector: projection.vector,
     kind: projection.deleted ? 'delete' : 'upsert',
@@ -173,7 +173,7 @@ async function projectAnnotationAfterImport(
   await writeProjection(deps, {
     aggregate: 'annotation',
     aggregateId: bacId,
-    relDir: '_BAC/annotations',
+    relDir: '_BAC/annotations/projections',
     body: { entry, vector: projection.vector, updatedAtMs: projection.updatedAtMs },
     vector: projection.vector,
     kind: entry.deleted ? 'delete' : 'upsert',
@@ -191,7 +191,7 @@ async function projectQueueItemAfterImport(
   await writeProjection(deps, {
     aggregate: 'queue',
     aggregateId: bacId,
-    relDir: '_BAC/queue',
+    relDir: '_BAC/queue/projections',
     body: projection,
     vector: projection.vector,
     kind: 'upsert',
@@ -212,7 +212,7 @@ async function projectDispatchAfterImport(
   await writeProjection(deps, {
     aggregate: 'dispatch',
     aggregateId: bacId,
-    relDir: '_BAC/dispatches',
+    relDir: '_BAC/dispatches/projections',
     body: {
       ...(recorded === undefined ? {} : { entry: recorded }),
       ...(link === undefined ? {} : { link }),

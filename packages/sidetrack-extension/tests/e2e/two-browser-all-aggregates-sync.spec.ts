@@ -162,11 +162,12 @@ test.describe('two-browser headless sync — all aggregates', () => {
         tags: [],
       });
 
-      // Companion B's vault grows a _BAC/threads/<id>.json.
+      // Companion B's vault grows a _BAC/threads/projections/<id>.json
+      // (Lane 1 path-decoupling).
       const threadFiles = async (): Promise<readonly string[]> =>
-        await readdir(path.join(companionB.vaultPath, '_BAC', 'threads')).catch(
-          () => [] as readonly string[],
-        );
+        await readdir(
+          path.join(companionB.vaultPath, '_BAC', 'threads', 'projections'),
+        ).catch(() => [] as readonly string[]);
       await expect
         .poll(async () => (await threadFiles()).length, {
           timeout: 30_000,
@@ -239,7 +240,7 @@ test.describe('two-browser headless sync — all aggregates', () => {
       const wsId = wsResponse.data?.bac_id;
       expect(typeof wsId).toBe('string');
 
-      await waitForVaultFile(companionB.vaultPath, '_BAC/workstreams', `${wsId!}.json`);
+      await waitForVaultFile(companionB.vaultPath, '_BAC/workstreams/projections', `${wsId!}.json`);
 
       // B's chrome.storage gets the workstream row.
       await expect
@@ -279,7 +280,7 @@ test.describe('two-browser headless sync — all aggregates', () => {
       const queueId = queueResponse.data?.bac_id;
       expect(typeof queueId).toBe('string');
 
-      await waitForVaultFile(companionB.vaultPath, '_BAC/queue', `${queueId!}.json`);
+      await waitForVaultFile(companionB.vaultPath, '_BAC/queue/projections', `${queueId!}.json`);
 
       await expect
         .poll(
@@ -319,7 +320,7 @@ test.describe('two-browser headless sync — all aggregates', () => {
 
       await waitForVaultFile(
         companionB.vaultPath,
-        '_BAC/annotations',
+        '_BAC/annotations/projections',
         `${annotationId!}.json`,
       );
 
@@ -368,7 +369,7 @@ test.describe('two-browser headless sync — all aggregates', () => {
       const dispatchId = dispatchResponse.data?.bac_id;
       expect(typeof dispatchId).toBe('string');
 
-      await waitForVaultFile(companionB.vaultPath, '_BAC/dispatches', `${dispatchId!}.json`);
+      await waitForVaultFile(companionB.vaultPath, '_BAC/dispatches/projections', `${dispatchId!}.json`);
 
       // Sanity: companion B's per-id projection endpoint returns the
       // entry. If this fails, the SSE subscriber's fetchDispatchProjection

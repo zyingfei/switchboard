@@ -85,6 +85,19 @@ export interface HealthReport {
       readonly mode: 'local' | 'remote';
       readonly url: string;
     };
+    // Sync Contract v1: per-materializer health so degraded
+    // derivations are observable, not silent. Each entry is the
+    // output of a registered Materializer's health() method. Gate
+    // L1-G9 — materializer failure is visible here, not buried.
+    readonly materializers?: Record<
+      string,
+      {
+        readonly status: 'healthy' | 'degraded' | 'failed';
+        readonly lastSuccessAt: string | null;
+        readonly lastError: string | null;
+        readonly pending: boolean;
+      }
+    >;
   };
 }
 

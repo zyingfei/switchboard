@@ -2702,10 +2702,10 @@ export default defineBackground(() => {
     }
   };
   reviewDraftsSse.subscribe({
-    prefix: '_BAC/threads/',
+    prefix: '_BAC/threads/projections/',
     onEvent: (event) => {
       // relPath shape: `_BAC/threads/<bac_id>.json`.
-      const m = /^_BAC\/threads\/(?<id>[^/]+?)\.json$/.exec(event.relPath);
+      const m = /^_BAC\/threads\/projections\/(?<id>[^/]+?)\.json$/.exec(event.relPath);
       const bacId = m?.groups?.id;
       if (bacId === undefined) return;
       void (async () => {
@@ -2761,9 +2761,9 @@ export default defineBackground(() => {
     }
   };
   reviewDraftsSse.subscribe({
-    prefix: '_BAC/workstreams/',
+    prefix: '_BAC/workstreams/projections/',
     onEvent: (event) => {
-      const m = /^_BAC\/workstreams\/(?<id>[^/]+?)\.json$/.exec(event.relPath);
+      const m = /^_BAC\/workstreams\/projections\/(?<id>[^/]+?)\.json$/.exec(event.relPath);
       const bacId = m?.groups?.id;
       if (bacId === undefined) return;
       void (async () => {
@@ -2805,9 +2805,9 @@ export default defineBackground(() => {
     }
   };
   reviewDraftsSse.subscribe({
-    prefix: '_BAC/annotations/',
+    prefix: '_BAC/annotations/projections/',
     onEvent: (event) => {
-      const m = /^_BAC\/annotations\/(?<id>[^/]+?)\.json$/.exec(event.relPath);
+      const m = /^_BAC\/annotations\/projections\/(?<id>[^/]+?)\.json$/.exec(event.relPath);
       const bacId = m?.groups?.id;
       if (bacId === undefined) return;
       void (async () => {
@@ -2859,9 +2859,9 @@ export default defineBackground(() => {
     }
   };
   reviewDraftsSse.subscribe({
-    prefix: '_BAC/queue/',
+    prefix: '_BAC/queue/projections/',
     onEvent: (event) => {
-      const m = /^_BAC\/queue\/(?<id>[^/]+?)\.json$/.exec(event.relPath);
+      const m = /^_BAC\/queue\/projections\/(?<id>[^/]+?)\.json$/.exec(event.relPath);
       const bacId = m?.groups?.id;
       if (bacId === undefined) return;
       void (async () => {
@@ -2907,9 +2907,9 @@ export default defineBackground(() => {
     }
   };
   reviewDraftsSse.subscribe({
-    prefix: '_BAC/dispatches/',
+    prefix: '_BAC/dispatches/projections/',
     onEvent: (event) => {
-      const m = /^_BAC\/dispatches\/(?<id>[^/]+?)\.json$/.exec(event.relPath);
+      const m = /^_BAC\/dispatches\/projections\/(?<id>[^/]+?)\.json$/.exec(event.relPath);
       const bacId = m?.groups?.id;
       if (bacId === undefined) return;
       void (async () => {

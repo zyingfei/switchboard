@@ -60,8 +60,8 @@ describe('reprojectOnVersionMismatch', () => {
     expect(result.currentVersion).toBe(PROJECTOR_VERSION);
     expect(result.aggregateCount).toBe(2);
     // Both aggregate projection files exist.
-    const threadProjection = await readFile(`${vaultRoot}/_BAC/threads/t-1.json`, 'utf8');
-    const workstreamProjection = await readFile(`${vaultRoot}/_BAC/workstreams/ws-1.json`, 'utf8');
+    const threadProjection = await readFile(`${vaultRoot}/_BAC/threads/projections/t-1.json`, 'utf8');
+    const workstreamProjection = await readFile(`${vaultRoot}/_BAC/workstreams/projections/ws-1.json`, 'utf8');
     expect(threadProjection.length).toBeGreaterThan(0);
     expect(workstreamProjection.length).toBeGreaterThan(0);
     // Version sentinel landed on disk.
@@ -123,10 +123,10 @@ describe('reprojectOnVersionMismatch', () => {
     // either a vault touched by an older companion OR a user wiping
     // the projection cache by hand.
     await unlink(`${vaultRoot}/_BAC/.projector-version`);
-    await unlink(`${vaultRoot}/_BAC/threads/t-1.json`);
+    await unlink(`${vaultRoot}/_BAC/threads/projections/t-1.json`);
     const result = await reprojectOnVersionMismatch({ vaultRoot, eventLog, projectionChanges });
     expect(result.ranReproject).toBe(true);
-    const threadProjection = await readFile(`${vaultRoot}/_BAC/threads/t-1.json`, 'utf8');
+    const threadProjection = await readFile(`${vaultRoot}/_BAC/threads/projections/t-1.json`, 'utf8');
     expect(threadProjection.length).toBeGreaterThan(0);
   });
 });
