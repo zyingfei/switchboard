@@ -30,6 +30,7 @@ import { eventTypesForMaterializer } from './registry.js';
 export interface CreateRecallMaterializerDeps {
   readonly recallLifecycle: RecallLifecycle;
   readonly recallActivity: RecallActivityTracker;
+  readonly eventLog: EventLog;
 }
 
 export const createRecallMaterializer = (
@@ -41,20 +42,12 @@ export const createRecallMaterializer = (
   let running = false;
   let lastSuccessAt: string | null = null;
   let lastError: string | null = null;
-  // Bound on first onAccepted or catchUp; closures capture it.
-  let boundEventLog: EventLog | null = null;
 
   const drain = async (): Promise<void> => {
     while (dirty) {
       dirty = false;
-      const eventLog = boundEventLog;
-      if (eventLog === null) {
-        // Nothing to drain to; an upcoming catchUp will set the log
-        // and re-trigger.
-        return;
-      }
       try {
-        await deps.recallLifecycle.ingestIncremental(eventLog);
+        await deps.recallLifecycle.ingestIncremental(deps.eventLog);
         lastSuccessAt = new Date().toISOString();
         lastError = null;
       } catch (err) {
@@ -65,9 +58,13 @@ export const createRecallMaterializer = (
         const message = err instanceof Error ? err.message : String(err);
         lastError = `${code}: ${message.slice(0, 200)}`;
         deps.recallActivity.recordIngestFailed(lastError);
-        // Don't loop — the failure may be persistent (model missing).
-        // Next event arrival OR next startup will retry.
-        return;
+        // Don't `return` — fall through to the while check. If
+        // another request came in mid-flight (dirty=true), the
+        // outer loop iterates and retries (rate-bounded by
+        // incoming event rate; each new event triggers at most one
+        // retry). If dirty=false, the loop exits naturally and we
+        // wait for the next event. Without falling through, we'd
+        // orphan dirty=true and awaitIdle would spin forever.
       }
     }
   };
@@ -90,13 +87,23 @@ export const createRecallMaterializer = (
     requestIngest();
   };
 
-  const catchUp: Materializer['catchUp'] = async (eventLog) => {
-    boundEventLog = eventLog;
+  const catchUp: Materializer['catchUp'] = async (_eventLog) => {
+    void _eventLog; // bound at construction; runner-arg ignored
     requestIngest();
     // AWAIT drain — startup tests assert "contract restored," not
     // "kicked off."
     while (running) {
       await new Promise((r) => setTimeout(r, 5));
+    }
+    // If dirty was set during the wait but didn't trigger a new IIFE
+    // (because the prior IIFE was still alive when the request came
+    // in), kick one more round so the contract really is caught up
+    // before catchUp resolves.
+    if (dirty) {
+      requestIngest();
+      while (running) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
     }
   };
 

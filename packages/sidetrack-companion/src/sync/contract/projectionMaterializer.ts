@@ -30,6 +30,7 @@ import { eventTypesForMaterializer } from './registry.js';
 
 export interface CreateProjectionMaterializerDeps {
   readonly vaultRoot: string;
+  readonly eventLog: EventLog;
   readonly projectionChanges?: ProjectionChangeFeed;
 }
 
@@ -66,25 +67,14 @@ export const createProjectionMaterializer = (
     }
   };
 
-  // Hold a reference to the eventLog the runner provided most recently
-  // via onAccepted-side schedule. The runner calls onAccepted with the
-  // event but not the log; we get the log via the registered runtime
-  // closure — the projection materializer is created with a single
-  // bound log per process. We capture it lazily via the first
-  // catchUp-style call.
-  let boundEventLog: EventLog | null = null;
-
+  // EventLog is bound at construction time (single log per process).
+  // No "boundEventLog === null" race — onAccepted always has the
+  // log available.
   const onAccepted: Materializer['onAccepted'] = (event) => {
-    if (boundEventLog === null) {
-      // Best-effort: a missed onAccepted (no log bound yet) is
-      // recovered by the next catchUp from startup or reconnect.
-      return;
-    }
-    void runOne(event, boundEventLog);
+    void runOne(event, deps.eventLog);
   };
 
   const catchUp: Materializer['catchUp'] = async (eventLog) => {
-    boundEventLog = eventLog;
     pending = true;
     try {
       const merged = await eventLog.readMerged();

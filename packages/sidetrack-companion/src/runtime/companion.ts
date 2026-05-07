@@ -168,6 +168,7 @@ export const startCompanion = async (
   syncContractRunner.register(
     createProjectionMaterializer({
       vaultRoot: options.vaultPath,
+      eventLog: baseEventLog,
       projectionChanges,
     }),
   );
@@ -309,6 +310,7 @@ export const startCompanion = async (
     createRecallMaterializer({
       recallLifecycle,
       recallActivity,
+      eventLog: baseEventLog,
     }),
   );
   // Don't block startup on the rebuild — health endpoint will report
