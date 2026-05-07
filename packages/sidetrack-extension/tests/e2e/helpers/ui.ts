@@ -77,42 +77,58 @@ export const readBannerCount = async (page: Page, kind: BannerKind): Promise<num
   return m ? Number.parseInt(m[1] ?? '0', 10) : null;
 };
 
-// ---- conflict UI (for T6.4) ----
+// ---- conflict UI (for T6.4 / T6.5) ----
 //
-// At plan time there is NO conflict-rendering UI in
-// entrypoints/sidepanel/. This matcher is the contract the side
-// panel must satisfy when conflict surfaces ship — it looks for
-// either an explicit `.conflict` styling on a draft slot, or an
-// element labelled with both candidate values + an `aria-label`
-// containing "conflict".
+// Review-draft register conflicts (overall / verdict / per-span
+// comment) render through the ConflictBanner subtree in
+// entrypoints/sidepanel/components/ReviewDraftFooter.tsx. Markup:
+//
+//   <div className="review-draft-conflict mono">
+//     <span className="review-draft-conflict-label">
+//       Verdict has 2 versions:
+//     </span>
+//     <button className="btn-link review-draft-conflict-pick"
+//             title="agree">Use "agree"</button>
+//     <button className="btn-link review-draft-conflict-pick"
+//             title="partial">Use "partial"</button>
+//   </div>
+//
+// We disambiguate the per-slot banner by the leading label text
+// ("Verdict" / "Overall" / "Comment") because the markup itself
+// doesn't carry a slot-id attribute.
 
-export const conflictForSlot = (page: Page, slotName: 'verdict' | 'overall' | 'comment'): Locator =>
-  page.locator(`[data-conflict-slot="${slotName}"]`);
+export type ConflictSlot = 'verdict' | 'overall' | 'comment';
 
-export const expectConflictUi = async (
-  page: Page,
-  slotName: 'verdict' | 'overall' | 'comment',
-): Promise<void> => {
-  await expect(conflictForSlot(page, slotName)).toHaveCount(1, { timeout: 10_000 });
+const CONFLICT_LABEL: Record<ConflictSlot, string> = {
+  verdict: 'Verdict',
+  overall: 'Overall',
+  comment: 'Comment',
 };
 
-export const expectResolvedValue = async (
+export const conflictForSlot = (page: Page, slot: ConflictSlot): Locator =>
+  page.locator('.review-draft-conflict').filter({
+    has: page.locator('.review-draft-conflict-label', { hasText: CONFLICT_LABEL[slot] }),
+  });
+
+export const expectConflictUi = async (page: Page, slot: ConflictSlot): Promise<void> => {
+  await expect(conflictForSlot(page, slot)).toHaveCount(1, { timeout: 10_000 });
+};
+
+export const expectNoConflictUi = async (page: Page, slot: ConflictSlot): Promise<void> => {
+  await expect(conflictForSlot(page, slot)).toHaveCount(0, { timeout: 10_000 });
+};
+
+// Click the "Use <value>" pick button for a specific candidate.
+// Matches the button's title attribute, which carries the raw
+// candidate value (the visible label is truncated to 80 chars).
+export const pickConflictCandidate = async (
   page: Page,
-  slotName: 'verdict' | 'overall' | 'comment',
+  slot: ConflictSlot,
   value: string,
 ): Promise<void> => {
-  // After resolution, the conflict marker is gone AND the slot
-  // shows the chosen value.
-  await expectNoConflict(page, slotName);
-  // Slot value is rendered inside `[data-slot="<name>"]`. Match the
-  // contract; tests will fail loudly if the slot markup ships
-  // differently and we'll pin the actual selector here.
-  await expect(page.locator(`[data-slot="${slotName}"]`)).toContainText(value, { timeout: 10_000 });
-};
-
-const expectNoConflict = async (
-  page: Page,
-  slotName: 'verdict' | 'overall' | 'comment',
-): Promise<void> => {
-  await expect(conflictForSlot(page, slotName)).toHaveCount(0, { timeout: 10_000 });
+  await conflictForSlot(page, slot)
+    .locator('button.review-draft-conflict-pick', { hasText: `Use "` })
+    .filter({ has: page.locator(`[title="${value}"]`) })
+    .first()
+    .click();
 };

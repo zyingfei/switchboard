@@ -8,6 +8,11 @@ export interface ExtensionRuntime {
   readonly context: BrowserContext;
   readonly extensionId: string;
   readonly extensionPath: string;
+  // Resolved profile dir actually in use. Tests that exercise
+  // SW-restart-with-storage-survival need this so the second
+  // launchExtensionRuntime({ userDataDir }) can target the same
+  // dir and pick up the chrome.storage written by the first run.
+  readonly userDataDir: string;
   readonly sendRuntimeMessage: (senderPage: Page, message: unknown) => Promise<unknown>;
   readonly seedStorage: (senderPage: Page, values: Record<string, unknown>) => Promise<void>;
   readonly close: () => Promise<void>;
@@ -152,6 +157,11 @@ const attachOverCdp = async (cdpUrl: string): Promise<ExtensionRuntime> => {
     context,
     extensionId,
     extensionPath,
+    // CDP attach path: profile is owned by an external Chrome
+    // process (typically the live login profile). Empty string
+    // signals "not under our control" so SW-restart tests skip
+    // this path.
+    userDataDir: '',
     async sendRuntimeMessage(senderPage: Page, message: unknown) {
       return await senderPage.evaluate(async (runtimeMessage) => {
         const response = (await chrome.runtime.sendMessage(runtimeMessage)) as unknown;
@@ -177,6 +187,13 @@ export interface LaunchOptions {
   // is set. Synthetic specs use this so they don't write into the user's
   // real Chrome profile when running mixed with live specs.
   readonly forceLocalProfile?: boolean;
+  // Reuse a specific user-data dir instead of creating a new tmpdir.
+  // Tests that exercise SW restart / browser-restart-with-storage
+  // pre-create a dir, run launchExtensionRuntime() against it, close,
+  // then launch() again with the same dir to assert chrome.storage
+  // survives. Caller is responsible for rm()'ing the dir afterwards
+  // — `close()` does NOT delete it when this option is set.
+  readonly userDataDir?: string;
 }
 
 export const launchExtensionRuntime = async (
@@ -192,11 +209,19 @@ export const launchExtensionRuntime = async (
   // gemini.google.com survive across runs. When unset, every run gets a
   // fresh tmpdir profile that's wiped on close.
   const persistentDir = process.env.SIDETRACK_USER_DATA_DIR;
+  const callerDir = options.userDataDir;
   const userDataDir =
-    persistentDir !== undefined && persistentDir.length > 0
-      ? (await mkdir(persistentDir, { recursive: true }), persistentDir)
-      : await mkdtemp(path.join(tmpdir(), 'sidetrack-extension-e2e-profile-'));
-  const cleanupOnClose = persistentDir === undefined || persistentDir.length === 0;
+    callerDir !== undefined && callerDir.length > 0
+      ? (await mkdir(callerDir, { recursive: true }), callerDir)
+      : persistentDir !== undefined && persistentDir.length > 0
+        ? (await mkdir(persistentDir, { recursive: true }), persistentDir)
+        : await mkdtemp(path.join(tmpdir(), 'sidetrack-extension-e2e-profile-'));
+  // Caller-supplied dirs are managed by the caller (so they can do
+  // close → re-launch). Env-supplied long-lived profiles persist
+  // across runs. Only the auto-mkdtemp path cleans up on close.
+  const cleanupOnClose =
+    (callerDir === undefined || callerDir.length === 0) &&
+    (persistentDir === undefined || persistentDir.length === 0);
   const headless = process.env.SIDETRACK_E2E_HEADLESS !== '0';
   // Use Chrome stable when a persistent profile is requested (the
   // login-test-profile script uses Chrome to bypass Google's OAuth
@@ -242,6 +267,7 @@ export const launchExtensionRuntime = async (
     context,
     extensionId,
     extensionPath,
+    userDataDir,
     async sendRuntimeMessage(senderPage: Page, message: unknown) {
       return await senderPage.evaluate(async (runtimeMessage) => {
         const response = (await chrome.runtime.sendMessage(runtimeMessage)) as unknown;
