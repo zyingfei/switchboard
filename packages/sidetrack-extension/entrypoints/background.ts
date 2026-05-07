@@ -1420,10 +1420,23 @@ const refreshCachedDispatches = async (): Promise<void> => {
         .filter((d) => d.status === 'replied' || d.status === 'archived')
         .map((d) => [d.bac_id, d.status]),
     );
-    const merged = dispatches.map((d) => {
-      const override = localOverrides.get(d.bac_id);
-      return override === undefined ? d : { ...d, status: override };
-    });
+    // F15 — peer-mirrored dispatches arrive via the
+    // `_BAC/dispatches/` SSE subscription and land in
+    // recentDispatches via mirrorRemoteDispatch. Companion's GET
+    // /v1/dispatches sources from the LOCAL JSONL writer only, so
+    // peer dispatches aren't in `dispatches` here. Without this
+    // merge the periodic poll would clobber every peer-mirrored
+    // entry on every refresh; we union by bac_id so peer entries
+    // survive.
+    const remoteIds = new Set(dispatches.map((d) => d.bac_id));
+    const peerOnly = local.filter((d) => !remoteIds.has(d.bac_id));
+    const merged = [
+      ...dispatches.map((d) => {
+        const override = localOverrides.get(d.bac_id);
+        return override === undefined ? d : { ...d, status: override };
+      }),
+      ...peerOnly,
+    ];
     await writeCachedDispatches(merged);
     await openAutoApprovedMcpDispatches(merged);
   } catch {
