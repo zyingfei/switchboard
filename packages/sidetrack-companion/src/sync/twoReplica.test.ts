@@ -84,14 +84,14 @@ describe('two-replica review-draft simulation', () => {
       aggregateId: 't',
       type: 'review-draft.span.added',
       payload: { spanId: 's-1', anchor: anchor('hello'), quote: 'hello', comment: 'A note' },
-      baseVector: {},
+      baseVector: {}, allowEmptyBaseVector: true,
     });
     await B.log.appendClient({
       clientEventId: 'span-add-B',
       aggregateId: 't',
       type: 'review-draft.span.added',
       payload: { spanId: 's-1', anchor: anchor('hello'), quote: 'hello', comment: 'B note' },
-      baseVector: {},
+      baseVector: {}, allowEmptyBaseVector: true,
     });
 
     await A.log.appendClient({
@@ -99,14 +99,14 @@ describe('two-replica review-draft simulation', () => {
       aggregateId: 't',
       type: 'review-draft.overall.set',
       payload: { text: 'A summary' },
-      baseVector: {},
+      baseVector: {}, allowEmptyBaseVector: true,
     });
     await B.log.appendClient({
       clientEventId: 'overall-B',
       aggregateId: 't',
       type: 'review-draft.overall.set',
       payload: { text: 'B summary' },
-      baseVector: {},
+      baseVector: {}, allowEmptyBaseVector: true,
     });
 
     // Sync both directions so each side sees both replicas' shards.
@@ -132,7 +132,7 @@ describe('two-replica review-draft simulation', () => {
       aggregateId: 't',
       type: 'review-draft.span.added',
       payload: { spanId: 's-1', anchor: anchor('q'), quote: 'q', comment: '' },
-      baseVector: {},
+      baseVector: {}, allowEmptyBaseVector: true,
     });
     await syncLogs(A, B);
     // A and B both edit the comment concurrently.
@@ -196,7 +196,7 @@ describe('two-replica review-draft simulation', () => {
       aggregateId: 't',
       type: 'review-draft.span.added',
       payload: { spanId: 's-1', anchor: anchor('q'), quote: 'q' },
-      baseVector: {},
+      baseVector: {}, allowEmptyBaseVector: true,
     });
     await syncLogs(A, B);
     const aBase = (await A.log.readByAggregate('t')).reduce<Record<string, number>>((vec, e) => {
@@ -254,7 +254,7 @@ describe('two-replica review-draft simulation', () => {
         capturedAt: '2026-05-07T09:00:00.000Z',
         turns: [{ ordinal: 0, role: 'user', text: 'A side capture' }],
       },
-      baseVector: {},
+      baseVector: {}, allowEmptyBaseVector: true,
     });
     const captureB = await B.log.appendClient({
       clientEventId: 'capture-on-B',
@@ -265,7 +265,7 @@ describe('two-replica review-draft simulation', () => {
         capturedAt: '2026-05-07T09:00:01.000Z',
         turns: [{ ordinal: 0, role: 'user', text: 'B side capture' }],
       },
-      baseVector: {},
+      baseVector: {}, allowEmptyBaseVector: true,
     });
 
     // Partition + rejoin.
@@ -307,14 +307,14 @@ describe('two-replica review-draft simulation', () => {
       aggregateId: 'thread_multi',
       type: 'review-draft.overall.set',
       payload: { text: 'A side overall' },
-      baseVector: {},
+      baseVector: {}, allowEmptyBaseVector: true,
     });
     await B.log.appendClient({
       clientEventId: 'b-verdict',
       aggregateId: 'thread_multi',
       type: 'review-draft.verdict.set',
       payload: { value: 'partial' },
-      baseVector: {},
+      baseVector: {}, allowEmptyBaseVector: true,
     });
 
     await syncLogs(A, B);

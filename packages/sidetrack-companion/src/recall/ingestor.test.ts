@@ -45,7 +45,7 @@ describe('ingestor', () => {
         capturedAt: '2026-05-06T18:00:00.000Z',
         turns: [{ ordinal: 0, role: 'assistant', text: 'Hello world from chunk one.' }],
       },
-      baseVector: {},
+      baseVector: {}, allowEmptyBaseVector: true,
     });
 
     const summary = await ingestIncremental(vaultRoot, eventLog);
@@ -79,7 +79,7 @@ describe('ingestor', () => {
         capturedAt: '2026-05-06T18:00:00.000Z',
         turns: [{ ordinal: 0, role: 'assistant', text: 'one and only' }],
       },
-      baseVector: {},
+      baseVector: {}, allowEmptyBaseVector: true,
     });
 
     const first = await ingestIncremental(vaultRoot, eventLog);
@@ -107,14 +107,14 @@ describe('ingestor', () => {
         capturedAt: '2026-05-06T18:00:00.000Z',
         turns: [{ ordinal: 0, role: 'assistant', text: 'soon to be tombstoned' }],
       },
-      baseVector: {},
+      baseVector: {}, allowEmptyBaseVector: true,
     });
     await eventLog.appendClient({
       clientEventId: 'tomb-1',
       aggregateId: 'thread_tomb',
       type: 'recall.tombstone.target',
       payload: { threadId: 'thread_tomb' },
-      baseVector: {},
+      baseVector: {}, allowEmptyBaseVector: true,
     });
 
     await ingestIncremental(vaultRoot, eventLog);
@@ -330,7 +330,7 @@ describe('ingestor', () => {
         capturedAt: '2026-05-06T18:00:00.000Z',
         turns: [{ ordinal: 0, role: 'assistant', text: 'soon to be tombstoned' }],
       },
-      baseVector: {},
+      baseVector: {}, allowEmptyBaseVector: true,
     });
     const first = await ingestIncremental(vaultRoot, eventLog);
     expect(first.indexedChunks).toBeGreaterThan(0);
@@ -345,7 +345,7 @@ describe('ingestor', () => {
       aggregateId: 'thread_late',
       type: 'recall.tombstone.target',
       payload: { threadId: 'thread_late' },
-      baseVector: {},
+      baseVector: {}, allowEmptyBaseVector: true,
     });
     const second = await ingestIncremental(vaultRoot, eventLog);
     // No new chunks (no fresh capture.recorded), but the existing

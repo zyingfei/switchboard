@@ -1341,7 +1341,7 @@ describe('companion HTTP server', () => {
             {
               clientEventId: 'local-verdict-1',
               type: 'review-draft.verdict.set',
-              baseVector: {},
+              baseVector: {}, allowEmptyBaseVector: true,
               payload: { value: 'agree' },
             },
           ],

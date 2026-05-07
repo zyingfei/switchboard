@@ -423,13 +423,16 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
       // event. Best-effort; if the eventLog isn't wired (legacy
       // tests), we still mutate the index locally.
       if (opts.eventLog !== undefined && opts.replica !== undefined) {
+        // Invariant C: do not pass an explicit baseVector. The
+        // eventLog auto-resolves deps from this aggregate's prior
+        // events, so concurrent tombstones from two replicas still
+        // dominate any pre-tombstone projection.
         await opts.eventLog
           .appendClient({
             clientEventId: `recall-tombstone:${opts.replica.replicaId}:${threadId}`,
             aggregateId: threadId,
             type: RECALL_TOMBSTONE_TARGET,
             payload: { threadId },
-            baseVector: {},
           })
           .catch(() => undefined);
       }

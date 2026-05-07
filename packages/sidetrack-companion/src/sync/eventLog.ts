@@ -64,11 +64,27 @@ export interface AppendInput<TPayload extends Record<string, unknown> = Record<s
   readonly aggregateId: string;
   readonly type: string;
   readonly payload: TPayload;
-  // Optional. The companion uses `clientEvent.baseVector` directly
-  // to stamp `deps`. If absent, treated as the empty vector — which
-  // means "the user observed nothing" (rare; only for first-write
-  // bootstraps).
+  /**
+   * @internal — production handlers should OMIT this field.
+   *
+   * The companion uses `ClientEvent.baseVector` directly when
+   * forwarding from the network (the editor's observed vector). For
+   * server-side appends, omitting baseVector makes the eventLog
+   * auto-resolve deps from the aggregate's prior events — which is
+   * what F11 was patched to do.
+   *
+   * Invariant C: passing `baseVector: {}` for an aggregate with
+   * prior events is a sync bug and is rejected at runtime unless
+   * `allowEmptyBaseVector: true` is also set (test-only escape
+   * hatch).
+   */
   readonly baseVector?: VersionVector;
+  /**
+   * @internal — test escape hatch for `baseVector: {}` when prior
+   * events exist (used to simulate concurrent first-writes from
+   * two replicas). Production code must never set this.
+   */
+  readonly allowEmptyBaseVector?: boolean;
   // Optional dependency on other client events that haven't been
   // accepted yet — e.g. a comment.set that depends on a span.added
   // batched in the same POST. The companion resolves these to dots
@@ -400,6 +416,29 @@ const computeDepsFromInput = <TPayload extends Record<string, unknown>>(
   const explicit = input.baseVector;
   let deps: VersionVector;
   if (explicit !== undefined) {
+    // Invariant C guard: a caller passing `baseVector: {}` for an
+    // aggregate that already has prior events is the F11 footgun
+    // — every register/OR-Set candidate becomes causally
+    // concurrent and the projection picks an arbitrary winner. We
+    // refuse this combination so the bug surfaces at write time.
+    // Tests that legitimately simulate stale writes (concurrent
+    // first-writes from two replicas) opt in with
+    // `allowEmptyBaseVector: true`.
+    const isExplicitlyEmpty = Object.keys(explicit).length === 0;
+    if (isExplicitlyEmpty && input.allowEmptyBaseVector !== true) {
+      const priorForAggregate = merged.filter(
+        (event) => event.aggregateId === input.aggregateId,
+      );
+      if (priorForAggregate.length > 0) {
+        throw new Error(
+          `appendClient: refusing baseVector:{} for aggregate "${input.aggregateId}" ` +
+            `which already has ${priorForAggregate.length} prior events. ` +
+            `Omit baseVector to auto-resolve from the aggregate's frontier (the production ` +
+            `default), or pass allowEmptyBaseVector:true if this is a test simulating ` +
+            `concurrent stale writes.`,
+        );
+      }
+    }
     deps = explicit;
   } else {
     deps = vectorFromEvents(

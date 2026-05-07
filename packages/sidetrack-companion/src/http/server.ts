@@ -1779,18 +1779,16 @@ const routes: readonly RouteDefinition[] = [
         await deleteReviewDraft(vaultRoot, threadId);
         return [204, undefined];
       }
-      // Read the current projection so the discard event observes
-      // every prior event for this thread. baseVector === current
-      // projection's vector.
-      const priorEvents = await eventLog.readByAggregate(threadId);
-      const priorReviewEvents = priorEvents.filter((event) => isReviewDraftEvent(event));
-      const priorProjection = projectReviewDraft(threadId, '', priorReviewEvents);
+      // Invariant C: omit baseVector. The eventLog auto-resolves
+      // deps from the aggregate's prior events, which equals the
+      // current review-draft projection's vector — so the discard
+      // event still causally dominates every prior review-draft
+      // event for this thread.
       await eventLog.appendClient({
         clientEventId: requestId,
         aggregateId: threadId,
         type: 'review-draft.discarded',
         payload: { reason: 'deleted-via-http' },
-        baseVector: priorProjection.vector,
       });
       // Recompute and persist the new projection (collapsed to
       // discarded). If the projection function returns null we
