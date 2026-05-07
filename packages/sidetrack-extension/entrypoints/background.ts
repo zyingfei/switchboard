@@ -2710,6 +2710,60 @@ export default defineBackground(() => {
     },
   });
 
+  // F10 — workstream state SSE subscription. Same pattern as F9
+  // for threads. A peer creating a workstream + moving threads
+  // into it triggers `_BAC/workstreams/<id>.json` writes via the
+  // companion's import projector; without this subscription the
+  // moved thread lands with a primaryWorkstreamId the local
+  // extension's chrome.storage doesn't know, so the side panel
+  // renders the row under "Ungrouped" instead of the workstream.
+  const fetchWorkstreamProjection = async (
+    cfg: { url: string; bridgeKey: string },
+    bacId: string,
+  ): Promise<{
+    bac_id: string;
+    record: import('../src/background/state').RemoteWorkstreamProjection['record'];
+    deleted: boolean;
+  } | null> => {
+    try {
+      const r = await fetch(
+        `${cfg.url.replace(/\/$/, '')}/v1/workstreams/${encodeURIComponent(bacId)}/projection`,
+        { headers: { 'x-bac-bridge-key': cfg.bridgeKey } },
+      );
+      if (!r.ok) return null;
+      const body = (await r.json()) as { data?: unknown };
+      if (typeof body.data !== 'object' || body.data === null) return null;
+      const d = body.data as { bac_id?: unknown; record?: unknown; deleted?: unknown };
+      if (typeof d.bac_id !== 'string') return null;
+      return {
+        bac_id: d.bac_id,
+        record:
+          d.record as import('../src/background/state').RemoteWorkstreamProjection['record'],
+        deleted: d.deleted === true,
+      };
+    } catch {
+      return null;
+    }
+  };
+  reviewDraftsSse.subscribe({
+    prefix: '_BAC/workstreams/',
+    onEvent: (event) => {
+      const m = /^_BAC\/workstreams\/(?<id>[^/]+?)\.json$/.exec(event.relPath);
+      const bacId = m?.groups?.id;
+      if (bacId === undefined) return;
+      void (async () => {
+        const cached = await refreshCompanionCache();
+        if (cached === null) return;
+        const cfg = { url: cached.companionUrl, bridgeKey: cached.bridgeKey };
+        const projection = await fetchWorkstreamProjection(cfg, bacId);
+        if (projection === null) return;
+        const { mirrorRemoteWorkstream } = await import('../src/background/state');
+        await mirrorRemoteWorkstream(projection);
+        void broadcastWorkboardChanged('workstream');
+      })().catch(() => undefined);
+    },
+  });
+
   reviewDraftsSse.subscribe({
     prefix: '_BAC/review-drafts/',
     onEvent: (event) => {

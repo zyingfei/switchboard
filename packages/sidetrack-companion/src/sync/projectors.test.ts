@@ -106,7 +106,7 @@ describe('runImportProjectors', () => {
     expect(written.record.value?.title).toBe('t');
   });
 
-  it('imported workstream events are still ignored (still on-demand)', async () => {
+  it('F10 — imported workstream.upserted writes _BAC/workstreams/<id>.json + projection-change row', async () => {
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
     const projectionChanges = createProjectionChangeFeed(vaultRoot);
@@ -116,12 +116,24 @@ describe('runImportProjectors', () => {
       deps: {},
       aggregateId: 'ws-1',
       type: 'workstream.upserted',
-      payload: { bac_id: 'ws-1', title: 'ws' },
+      payload: { bac_id: 'ws-1', title: 'testsync' },
       acceptedAtMs: 1,
     };
     await eventLog.importPeerEvent(event);
     await runImportProjectors({ vaultRoot, eventLog, projectionChanges }, event);
     const changes = await projectionChanges.readSince(0);
-    expect(changes.changed).toHaveLength(0);
+    expect(changes.changed).toHaveLength(1);
+    expect(changes.changed[0]).toMatchObject({
+      aggregate: 'workstream',
+      aggregateId: 'ws-1',
+      relPath: '_BAC/workstreams/ws-1.json',
+      kind: 'upsert',
+    });
+    const { readFile } = await import('node:fs/promises');
+    const written = JSON.parse(
+      await readFile(`${vaultRoot}/_BAC/workstreams/ws-1.json`, 'utf8'),
+    ) as { bac_id: string; record: { value?: { title?: string } } };
+    expect(written.bac_id).toBe('ws-1');
+    expect(written.record.value?.title).toBe('testsync');
   });
 });

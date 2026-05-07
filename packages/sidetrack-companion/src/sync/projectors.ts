@@ -13,6 +13,8 @@ import {
   THREAD_UPSERTED,
 } from '../threads/events.js';
 import { projectThread } from '../threads/projection.js';
+import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../workstreams/events.js';
+import { projectWorkstream } from '../workstreams/projection.js';
 
 // Aggregate-projector dispatch for events ingested from peers.
 //
@@ -61,8 +63,12 @@ export const runImportProjectors = async (
     await projectThreadAfterImport(deps, event);
     return;
   }
-  // Workstreams, queue, dispatches, annotations are read on-demand
-  // via `/v1/.../projection`; nothing to do here. Recall tombstones
+  if (event.type === WORKSTREAM_UPSERTED || event.type === WORKSTREAM_DELETED) {
+    await projectWorkstreamAfterImport(deps, event);
+    return;
+  }
+  // Queue, dispatches, annotations are read on-demand via
+  // `/v1/.../projection`; nothing to do here. Recall tombstones
   // land in the index via the next rebuild.
 };
 
@@ -92,6 +98,35 @@ const projectThreadAfterImport = async (
       aggregate: 'thread',
       aggregateId: bacId,
       relPath: `_BAC/threads/${bacId}.json`,
+      vector: projection.vector,
+      kind: projection.deleted ? 'delete' : 'upsert',
+    })
+    .catch(() => undefined);
+};
+
+const projectWorkstreamAfterImport = async (
+  deps: RunImportProjectorsDeps,
+  event: AcceptedEvent,
+): Promise<void> => {
+  const bacId = event.aggregateId;
+  if (typeof bacId !== 'string' || bacId.length === 0) return;
+  const merged = await deps.eventLog.readByAggregate(bacId);
+  const projection = projectWorkstream(bacId, merged);
+  // Same shape as F9's thread import: write the projection record
+  // to disk so the vault-changes SSE fires for receivers
+  // subscribed to `_BAC/workstreams/`. Without this, a peer
+  // creating a workstream + moving a thread into it leaves the
+  // other side rendering the moved thread under "Ungrouped"
+  // because it has no record of the workstream id.
+  const dir = join(deps.vaultRoot, '_BAC', 'workstreams');
+  await mkdir(dir, { recursive: true });
+  const out = `${dir}/${bacId}.json`;
+  await writeFile(out, JSON.stringify(projection, null, 2), 'utf8');
+  await deps.projectionChanges
+    ?.appendChange({
+      aggregate: 'workstream',
+      aggregateId: bacId,
+      relPath: `_BAC/workstreams/${bacId}.json`,
       vector: projection.vector,
       kind: projection.deleted ? 'delete' : 'upsert',
     })

@@ -2,6 +2,7 @@ import type {
   CaptureEvent,
   CaptureNoteCreate,
   CaptureNoteUpdate,
+  ChecklistItem,
   CompanionSettings,
   QueueCreate,
   QueueUpdate,
@@ -783,6 +784,72 @@ export const mirrorRemoteThread = async (
       ? [next, ...current]
       : current.map((t) => (t.bac_id === projection.bac_id ? next : t));
   await storageSet({ [THREADS_KEY]: merged });
+};
+
+// F10 — peer-imported workstream projection. Same shape as
+// mirrorRemoteThread: collapse the record register, merge into
+// chrome.storage `sidetrack.workstreams`. Without this, a thread
+// move into a peer-created workstream lands on the receiver's
+// thread row with a primaryWorkstreamId the local extension has
+// never heard of, so the side panel renders the row under
+// "Ungrouped" instead of the workstream the user intended.
+export interface RemoteWorkstreamRecord {
+  readonly bac_id: string;
+  readonly title: string;
+  readonly parentId?: string;
+  readonly privacy?: WorkstreamNode['privacy'];
+  readonly screenShareSensitive?: boolean;
+  readonly tags: readonly string[];
+  readonly children: readonly string[];
+  readonly checklist: readonly ChecklistItem[];
+  readonly description?: string;
+}
+
+export interface RemoteWorkstreamProjection {
+  readonly bac_id: string;
+  readonly record: RemoteRegister<RemoteWorkstreamRecord>;
+  readonly deleted: boolean;
+}
+
+export const mirrorRemoteWorkstream = async (
+  projection: RemoteWorkstreamProjection,
+): Promise<void> => {
+  const current = await readWorkstreams();
+  if (projection.deleted) {
+    const next = current.filter((w) => w.bac_id !== projection.bac_id);
+    if (next.length !== current.length) {
+      await storageSet({ [WORKSTREAMS_KEY]: next });
+    }
+    return;
+  }
+  const record = collapseRegister(projection.record);
+  if (record === undefined) return;
+  const existing = current.find((w) => w.bac_id === projection.bac_id);
+  const next: WorkstreamNode = {
+    // Locally-only fields (revision, updatedAt) come from existing
+    // when present; otherwise stamp a synthetic value so the type
+    // is satisfied. The companion's projection doesn't expose
+    // revision (it's a vault writer concern) but the side panel
+    // needs SOME value.
+    revision: existing?.revision ?? `peer-${record.bac_id}`,
+    updatedAt: existing?.updatedAt ?? new Date().toISOString(),
+    bac_id: record.bac_id,
+    title: record.title,
+    children: [...(record.children ?? [])],
+    tags: [...(record.tags ?? [])],
+    checklist: [...(record.checklist ?? [])],
+    privacy: record.privacy ?? existing?.privacy ?? 'shared',
+    ...(record.parentId === undefined ? {} : { parentId: record.parentId }),
+    ...(record.screenShareSensitive === undefined
+      ? {}
+      : { screenShareSensitive: record.screenShareSensitive }),
+    ...(record.description === undefined ? {} : { description: record.description }),
+  };
+  const merged =
+    existing === undefined
+      ? [next, ...current]
+      : current.map((w) => (w.bac_id === projection.bac_id ? next : w));
+  await storageSet({ [WORKSTREAMS_KEY]: merged });
 };
 
 export const setReviewDraftSpanComment = async (
