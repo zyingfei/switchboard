@@ -21,7 +21,7 @@ import { CAPTURE_RECORDED } from '../recall/events.js';
 import { getModelCacheStatus } from '../recall/modelCache.js';
 import { THREAD_ARCHIVED, THREAD_UNARCHIVED, THREAD_UPSERTED } from '../threads/events.js';
 import { projectThread } from '../threads/projection.js';
-import { WORKSTREAM_UPSERTED } from '../workstreams/events.js';
+import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../workstreams/events.js';
 import { projectWorkstream } from '../workstreams/projection.js';
 import { QUEUE_CREATED } from '../queue/events.js';
 import { projectQueueItem } from '../queue/projection.js';
@@ -2855,6 +2855,22 @@ const routes: readonly RouteDefinition[] = [
       }
       try {
         const result = await context.vaultWriter.deleteWorkstream(match.workstreamId, requestId);
+        // F12 — emit workstream.deleted so peers learn of the
+        // deletion. Without this, the local file is removed but the
+        // event log is silent; the peer's mirror keeps the row
+        // forever and any thread the user moved to this workstream
+        // (which DID emit a thread.upserted with the new ws-id)
+        // points at a dangling reference on the peer.
+        if (context.eventLog !== undefined) {
+          await context.eventLog
+            .appendClient({
+              clientEventId: requestId,
+              aggregateId: result.bac_id,
+              type: WORKSTREAM_DELETED,
+              payload: { bac_id: result.bac_id },
+            })
+            .catch(() => undefined);
+        }
         return [
           200,
           {
