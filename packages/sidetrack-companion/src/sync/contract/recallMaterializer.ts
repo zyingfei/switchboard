@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import type { RecallActivityTracker } from '../../recall/activity.js';
 import { chunkTurn } from '../../recall/chunker.js';
 import { embed } from '../../recall/embedder.js';
@@ -147,31 +149,34 @@ export const createRecallMaterializer = (
           ...(turn.formattedText === undefined ? {} : { formattedText: turn.formattedText }),
         });
         if (chunks.length === 0) continue;
-        // L2-G2: cache check by embedTextHash. Chunks whose text
-        // (and therefore textHash) are unchanged across a metadata-
-        // only extractor upgrade hit the cache and skip the
-        // embedder. Per-chunk granularity so a partial overlap
-        // (e.g., one paragraph changed in a 5-paragraph turn) only
-        // re-embeds the changed paragraph.
+        // L2-G2: cache check by `embedTextHash`. CRITICAL: hash the
+        // chunk's `embedText` (heading-breadcrumb prefixed input
+        // the embedder ACTUALLY sees), NOT the raw `chunk.text` /
+        // `chunk.textHash`. A heading rename or chunker breadcrumb
+        // change would otherwise reuse a stale vector even though
+        // the embedding input changed. (Reviewer-flagged bug.)
+        const embedTextHashOf = (s: string): string =>
+          createHash('sha256').update(s).digest('hex').slice(0, 32);
         const cacheHits: (Float32Array | null)[] = [];
-        const toEmbed: { index: number; text: string; hash: string }[] = [];
+        const toEmbed: { index: number; embedText: string; hash: string }[] = [];
         for (let i = 0; i < chunks.length; i += 1) {
           const chunk = chunks[i]!;
+          const hash = embedTextHashOf(chunk.embedText);
           const cached =
             deps.embeddingCache === undefined
               ? null
               : await deps.embeddingCache.get({
                   modelId: MODEL_ID,
                   modelRevision: RECALL_MODEL.revision,
-                  embedTextHash: chunk.textHash,
+                  embedTextHash: hash,
                 });
           cacheHits.push(cached);
           if (cached === null) {
-            toEmbed.push({ index: i, text: chunk.text, hash: chunk.textHash });
+            toEmbed.push({ index: i, embedText: chunk.embedText, hash });
           }
         }
         const freshVectors =
-          toEmbed.length === 0 ? [] : await embed(toEmbed.map((t) => t.text));
+          toEmbed.length === 0 ? [] : await embed(toEmbed.map((t) => t.embedText));
         const vectors: Float32Array[] = [];
         let fresh = 0;
         for (let i = 0; i < chunks.length; i += 1) {

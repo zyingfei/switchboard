@@ -437,10 +437,15 @@ export const startCompanion = async (
       if (relayTransport !== null) stopRelayTransport(relayTransport);
       await watcher?.close();
       await started.close();
-      // Wait for in-flight rebuild + auto-index to complete before
-      // releasing the lock — that way another companion starting
-      // immediately after us doesn't race with a still-running
-      // background write.
+      // Drain the contract runner FIRST — extraction/projection/recall
+      // materializers may still be processing accepted events.
+      // Without this drain, a recall materializer ingest could be
+      // mid-write when we release the lock, and the next companion
+      // starting up would race the still-running background write.
+      // Reviewer-flagged ordering.
+      await syncContractRunner.awaitIdle();
+      // Then wait for any rebuild that those materializers (or a
+      // direct path) kicked off.
       await recallLifecycle.waitForRebuild();
       await recallLock.release();
     },

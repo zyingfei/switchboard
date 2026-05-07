@@ -88,12 +88,21 @@ export interface ExtractionSourceState {
   readonly latestExtractionRevision: string;
   readonly indexedExtractionRevision?: string;
   readonly status: 'current' | 'stale';
-  // Compact history for provenance / debugging. Bounded to last N
-  // revisions to keep file size reasonable.
+  // Compact history for provenance + active-revision policy
+  // input. Bounded to last N revisions to keep file size
+  // reasonable. Each entry carries the full set of fields the
+  // policy needs (schema version + producer dot) so we don't
+  // have to load every revision file just to pick a winner.
+  // Fields beyond `createdAt` are optional for forward-compat
+  // with state files written before this expansion (treated as
+  // schemaVersion=0 / no producer dot — policy falls back to
+  // semver + capability-score tie-break).
   readonly history: readonly {
     readonly extractionRevisionId: string;
     readonly extractorId: string;
     readonly extractorVersion: string;
     readonly createdAt: string;
+    readonly extractionSchemaVersion?: number;
+    readonly producerDot?: { readonly replicaId: string; readonly seq: number };
   }[];
 }

@@ -48,34 +48,74 @@ export const createExtractionMaterializer = (
   let pending = false;
   let lastSuccessAt: string | null = null;
   let lastError: string | null = null;
+  // Per-source serialization: read-modify-write on
+  // ExtractionSourceState is racy if two events for the same
+  // sourceUnitId run concurrently (one would overwrite the
+  // other's history append). We chain promises per sourceUnitId
+  // so updates serialize within a source while different
+  // sources still run in parallel. Reviewer-flagged.
+  const perSourceQueue = new Map<string, Promise<void>>();
+  let inFlight = 0;
+  const incInFlight = (): void => {
+    inFlight += 1;
+    pending = true;
+  };
+  const decInFlight = (): void => {
+    inFlight -= 1;
+    if (inFlight <= 0) pending = false;
+  };
+  const serializeBySource = async (
+    sourceUnitId: string,
+    work: () => Promise<void>,
+  ): Promise<void> => {
+    const prior = perSourceQueue.get(sourceUnitId) ?? Promise.resolve();
+    const next = prior.catch(() => undefined).then(work);
+    perSourceQueue.set(sourceUnitId, next);
+    try {
+      await next;
+    } finally {
+      // Drop the queue head when this is the most recent task.
+      // A later enqueue may have already replaced it; in that
+      // case we leave the chain alone.
+      if (perSourceQueue.get(sourceUnitId) === next) {
+        perSourceQueue.delete(sourceUnitId);
+      }
+    }
+  };
 
   const ingestRevision = async (revision: ExtractionRevision): Promise<void> => {
     await deps.store.putRevision(revision);
     const existing = await deps.store.readSourceState(revision.sourceUnitId);
     const history = existing?.history ?? [];
+    // History entry carries the full set of fields
+    // selectActiveRevision needs (schema version + producer dot).
+    // Older state files may have entries without these — the
+    // policy treats missing schema version as 0 (lowest
+    // precedence) and missing producer dot as "tie undefined."
     const historyEntry = {
       extractionRevisionId: revision.extractionRevisionId,
       extractorId: revision.extractorId,
       extractorVersion: revision.extractorVersion,
       createdAt: revision.createdAt,
+      extractionSchemaVersion: revision.extractionSchemaVersion,
+      producerDot: revision.producerDot,
     };
     const dedupedHistory = history.some(
       (h) => h.extractionRevisionId === revision.extractionRevisionId,
     )
       ? history
       : [...history, historyEntry].slice(-20); // bound history to 20 entries
-    // Build candidate list: every revision in history. Each carries
-    // extractor + version + schema. The active-revision policy
-    // picks one.
+    // Build candidate list: every revision in history with full
+    // policy inputs (schema version + producer dot). Reviewer-
+    // flagged: previously this defaulted schema to 1 and dropped
+    // producer dot, which made the policy's tie-break path
+    // unreachable for revisions other than the one being ingested.
     const candidates = dedupedHistory.map((h) => ({
       extractionRevisionId: h.extractionRevisionId,
       extractorId: h.extractorId,
       extractorVersion: h.extractorVersion,
-      // History rows lack schema version + producer dot; we look
-      // them up on the revision file when needed. For the policy
-      // pass, schema version defaults to 1 (legacy floor); a future
-      // enhancement could enrich history with these fields.
-      extractionSchemaVersion: 1,
+      extractionSchemaVersion: h.extractionSchemaVersion ?? 0,
+      ...(h.producerDot === undefined ? {} : { producerDot: h.producerDot }),
     }));
     // The latest revision is the most recent in history; the policy
     // may pick an older one if it's superseded by a later
@@ -100,69 +140,95 @@ export const createExtractionMaterializer = (
     await deps.store.putSourceState(next);
   };
 
-  const handleEvent = async (event: AcceptedEvent): Promise<void> => {
-    pending = true;
+  // Process one revision under the per-source serialization
+  // queue. Each ingest is read-modify-write on the source state
+  // file; without serialization, two concurrent events for the
+  // same sourceUnitId would race and lose history entries.
+  const handleRevision = async (revision: ExtractionRevision): Promise<void> => {
+    incInFlight();
     try {
-      if (event.type === CAPTURE_RECORDED) {
-        const revisions = wrapCaptureAsLegacyRevisions(event);
-        for (const revision of revisions) {
+      await serializeBySource(revision.sourceUnitId, async () => {
+        try {
           await ingestRevision(revision);
+          lastSuccessAt = new Date().toISOString();
+          lastError = null;
+        } catch (err) {
+          lastError = err instanceof Error ? err.message : String(err);
         }
-      } else if (
-        event.type === CAPTURE_EXTRACTION_PRODUCED &&
-        isCaptureExtractionProducedPayload(event.payload)
-      ) {
-        const payload = event.payload;
-        const revision: ExtractionRevision = {
-          extractionRevisionId: payload.extractionRevisionId,
-          sourceUnitId: payload.sourceUnitId,
-          sourceBacId: payload.sourceBacId,
-          extractorId: payload.extractorId,
-          extractorVersion: payload.extractorVersion,
-          extractionSchemaVersion: payload.extractionSchemaVersion,
-          inputHash: payload.inputHash,
-          outputHash: payload.outputHash,
-          chunkerVersion: payload.chunkerVersion,
-          createdAt: payload.content.capturedAt,
-          producerReplicaId: event.dot.replicaId,
-          producerDot: { replicaId: event.dot.replicaId, seq: event.dot.seq },
-          content: payload.content,
-        };
-        await ingestRevision(revision);
-      }
-      lastSuccessAt = new Date().toISOString();
-      lastError = null;
-    } catch (err) {
-      lastError = err instanceof Error ? err.message : String(err);
+      });
     } finally {
-      pending = false;
+      decInFlight();
+    }
+  };
+
+  const handleEvent = async (event: AcceptedEvent): Promise<void> => {
+    if (event.type === CAPTURE_RECORDED) {
+      const revisions = wrapCaptureAsLegacyRevisions(event);
+      // Each turn is its own sourceUnitId so different turns of
+      // the same capture serialize independently.
+      await Promise.all(revisions.map((rev) => handleRevision(rev)));
+    } else if (
+      event.type === CAPTURE_EXTRACTION_PRODUCED &&
+      isCaptureExtractionProducedPayload(event.payload)
+    ) {
+      const payload = event.payload;
+      const revision: ExtractionRevision = {
+        extractionRevisionId: payload.extractionRevisionId,
+        sourceUnitId: payload.sourceUnitId,
+        sourceBacId: payload.sourceBacId,
+        extractorId: payload.extractorId,
+        extractorVersion: payload.extractorVersion,
+        extractionSchemaVersion: payload.extractionSchemaVersion,
+        inputHash: payload.inputHash,
+        outputHash: payload.outputHash,
+        chunkerVersion: payload.chunkerVersion,
+        createdAt: payload.content.capturedAt,
+        producerReplicaId: event.dot.replicaId,
+        producerDot: { replicaId: event.dot.replicaId, seq: event.dot.seq },
+        content: payload.content,
+      };
+      await handleRevision(revision);
     }
   };
 
   const onAccepted: Materializer['onAccepted'] = (event) => {
+    // Fire-and-forget at the runner level; the per-source queue
+    // serializes within. inFlight tracks the outstanding work so
+    // awaitIdle can wait for the queue to drain.
     void handleEvent(event);
   };
 
   const catchUp: Materializer['catchUp'] = async (eventLog) => {
-    pending = true;
+    incInFlight();
     try {
       const merged = await eventLog.readMerged();
-      for (const event of merged) {
-        if (handles.has(event.type)) {
-          await handleEvent(event);
-        }
-      }
+      // Schedule every event through handleEvent → per-source
+      // serialization. AWAIT all of them so catchUp resolves only
+      // after the queue is drained — same AWAIT-drain rule as the
+      // runner's catchUpAll. Different sourceUnitIds run in
+      // parallel; same-source events serialize via the queue.
+      await Promise.all(
+        merged.filter((e) => handles.has(e.type)).map((e) => handleEvent(e)),
+      );
       lastSuccessAt = new Date().toISOString();
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err);
     } finally {
-      pending = false;
+      decInFlight();
     }
   };
 
   const awaitIdle: Materializer['awaitIdle'] = async () => {
-    while (pending) {
-      await new Promise((r) => setTimeout(r, 5));
+    // Wait for in-flight work AND every per-source queue to drain.
+    while (pending || perSourceQueue.size > 0) {
+      // Snapshot the queues, await them all, then re-check —
+      // drains scheduled while we awaited may still be pending.
+      const snapshot = [...perSourceQueue.values()];
+      if (snapshot.length > 0) {
+        await Promise.all(snapshot.map((p) => p.catch(() => undefined)));
+      } else {
+        await new Promise((r) => setTimeout(r, 5));
+      }
     }
   };
 

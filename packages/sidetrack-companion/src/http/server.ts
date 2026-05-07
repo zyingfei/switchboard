@@ -2565,43 +2565,20 @@ const routes: readonly RouteDefinition[] = [
                       })
                 .then(() => true)
                 .catch(() => false);
-        // Auto-index by routing through the lifecycle's incremental
-        // ingestor — same path the boot-time + manual reingest use.
-        // This means the recall index is always populated by chunk
-        // entries built from the log (the source of truth), not by a
-        // parallel turn-level write that bypasses chunking. The
-        // lifecycle's mutex serialises this against any in-flight
-        // rebuild. Best-effort + non-blocking; if the embedder is
-        // offline the log is still authoritative and the manual
-        // `recall reingest` catches up.
-        if (
-          eventLogAppended &&
-          context.eventLog !== undefined &&
-          context.recallLifecycle !== undefined
-        ) {
-          const lifecycle = context.recallLifecycle;
-          const log = context.eventLog;
-          const activity = context.recallActivity;
-          void lifecycle.ingestIncremental(log).catch((error: unknown) => {
-            // Surface the failure so the operator can tell the
-            // capture-time projection is stalled. The event itself
-            // is durably appended; a later `recall reingest` (after
-            // `models ensure`) will catch up. Without this, the
-            // failure was silent — the only signal was that recall
-            // queries returned 503 RECALL_MODEL_MISSING and the
-            // ingestor frontier never advanced.
-            const code =
-              error !== null && typeof error === 'object' && 'code' in error
-                ? String((error as { code: unknown }).code)
-                : 'unknown';
-            const message = error instanceof Error ? error.message : String(error);
-            // eslint-disable-next-line no-console
-            console.warn(
-              `[recall] post-capture ingestIncremental failed (${code}): ${message.slice(0, 200)}`,
-            );
-            activity?.recordIngestFailed(`${code}: ${message.slice(0, 200)}`);
-          });
-        }
+        void eventLogAppended;
+        // Recall ingest is owned by the contract runner →
+        // recallMaterializer path. `appendServerObserved` already
+        // routes the accepted event through
+        // `onLocalAccepted` → `syncContractRunner.onAcceptedEvent({
+        // origin: 'local' })`, which fires the recall materializer's
+        // onAccepted → coalesced ingest drain. Failures are recorded
+        // via the materializer's `recallActivity.recordIngestFailed`.
+        // Reviewer-flagged: do NOT also schedule
+        // `lifecycle.ingestIncremental` here — that was the pre-
+        // contract fast path and now duplicates work, weakening the
+        // single-dispatch contract. The boot-time `catchUpAll` and
+        // manual `recall reingest` cover the case where the embedder
+        // was offline at capture time.
         return [201, mutationResponse(result, requestId)];
       });
     },
