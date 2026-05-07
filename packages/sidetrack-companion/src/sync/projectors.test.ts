@@ -65,7 +65,7 @@ describe('runImportProjectors', () => {
     });
   });
 
-  it('non-review-draft events are ignored (handled on-demand)', async () => {
+  it('imported thread.upserted writes _BAC/threads/<id>.json + appends a projection change (F9)', async () => {
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
     const projectionChanges = createProjectionChangeFeed(vaultRoot);
@@ -82,6 +82,41 @@ describe('runImportProjectors', () => {
         title: 't',
         lastSeenAt: '2026-05-06T00:00:00.000Z',
       },
+      acceptedAtMs: 1,
+    };
+    await eventLog.importPeerEvent(event);
+    await runImportProjectors({ vaultRoot, eventLog, projectionChanges }, event);
+    const changes = await projectionChanges.readSince(0);
+    // F9 (thread import projector): we DO project thread events
+    // now so _BAC/threads/<id>.json fires the vault-changes SSE
+    // for the receiving extension.
+    expect(changes.changed).toHaveLength(1);
+    expect(changes.changed[0]).toMatchObject({
+      aggregate: 'thread',
+      aggregateId: 'thread-y',
+      relPath: '_BAC/threads/thread-y.json',
+      kind: 'upsert',
+    });
+    // The file is on disk and parses as the projection record.
+    const { readFile } = await import('node:fs/promises');
+    const written = JSON.parse(
+      await readFile(`${vaultRoot}/_BAC/threads/thread-y.json`, 'utf8'),
+    ) as { bac_id: string; record: { value?: { title?: string } } };
+    expect(written.bac_id).toBe('thread-y');
+    expect(written.record.value?.title).toBe('t');
+  });
+
+  it('imported workstream events are still ignored (still on-demand)', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const projectionChanges = createProjectionChangeFeed(vaultRoot);
+    const event: AcceptedEvent = {
+      clientEventId: 'peer-3',
+      dot: { replicaId: 'peer-C', seq: 1 },
+      deps: {},
+      aggregateId: 'ws-1',
+      type: 'workstream.upserted',
+      payload: { bac_id: 'ws-1', title: 'ws' },
       acceptedAtMs: 1,
     };
     await eventLog.importPeerEvent(event);

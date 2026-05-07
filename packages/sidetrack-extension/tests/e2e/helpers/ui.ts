@@ -16,10 +16,16 @@ export const ThreadRowNameSelector = '.thread .name';
 // ---- thread rows ----
 
 export const threadRowFor = (page: Page, title: string): Locator =>
-  page.locator(ThreadRowSelector).filter({ has: page.locator('.name', { hasText: title }) });
+  // `.name` is a generic class used outside thread rows too. Scope
+  // to descendants of `.thread` and match by exact title.
+  page.locator(ThreadRowSelector).filter({ hasText: title });
 
-export const expectThreadRowVisible = async (page: Page, title: string): Promise<void> => {
-  await expect(threadRowFor(page, title)).toHaveCount(1, { timeout: 10_000 });
+export const expectThreadRowVisible = async (
+  page: Page,
+  title: string,
+  options: { timeout?: number } = {},
+): Promise<void> => {
+  await expect(threadRowFor(page, title)).toHaveCount(1, { timeout: options.timeout ?? 10_000 });
 };
 
 export const expectNoThreadRow = async (page: Page, title: string): Promise<void> => {

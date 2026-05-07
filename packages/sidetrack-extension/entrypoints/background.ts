@@ -2642,6 +2642,74 @@ export default defineBackground(() => {
   chrome.storage.onChanged.addListener(() => {
     void refreshCompanionCache();
   });
+  // F9 — thread state SSE subscription. Same vaultChangesClient
+  // is reused for both prefixes (its dispatch filters by prefix
+  // client-side at vaultChanges.ts:128); no second connection.
+  // Drives cross-browser real-time propagation: a peer's
+  // capture.recorded → projector updates threads.json → vault-
+  // changes SSE fires → mirrorRemoteThread updates the local
+  // chrome.storage.sidetrack.threads → side panel re-renders via
+  // its existing chrome.runtime.onMessage listener (the SSE
+  // event itself doesn't trigger a refresh, so the next periodic
+  // poll picks up the storage change). Without this, T6.1 fails.
+  const fetchThreadProjection = async (
+    cfg: { url: string; bridgeKey: string },
+    bacId: string,
+  ): Promise<{
+    bac_id: string;
+    record: import('../src/background/state').RemoteThreadProjection['record'];
+    status: import('../src/background/state').RemoteThreadProjection['status'];
+    deleted: boolean;
+  } | null> => {
+    try {
+      const r = await fetch(
+        `${cfg.url.replace(/\/$/, '')}/v1/threads/${encodeURIComponent(bacId)}/projection`,
+        { headers: { 'x-bac-bridge-key': cfg.bridgeKey } },
+      );
+      if (!r.ok) return null;
+      const body = (await r.json()) as { data?: unknown };
+      if (typeof body.data !== 'object' || body.data === null) return null;
+      const d = body.data as {
+        bac_id?: unknown;
+        record?: unknown;
+        status?: unknown;
+        deleted?: unknown;
+      };
+      if (typeof d.bac_id !== 'string') return null;
+      return {
+        bac_id: d.bac_id,
+        record: d.record as import('../src/background/state').RemoteThreadProjection['record'],
+        status: d.status as import('../src/background/state').RemoteThreadProjection['status'],
+        deleted: d.deleted === true,
+      };
+    } catch {
+      return null;
+    }
+  };
+  reviewDraftsSse.subscribe({
+    prefix: '_BAC/threads/',
+    onEvent: (event) => {
+      // relPath shape: `_BAC/threads/<bac_id>.json`.
+      const m = /^_BAC\/threads\/(?<id>[^/]+?)\.json$/.exec(event.relPath);
+      const bacId = m?.groups?.id;
+      if (bacId === undefined) return;
+      void (async () => {
+        const cached = await refreshCompanionCache();
+        if (cached === null) return;
+        const cfg = { url: cached.companionUrl, bridgeKey: cached.bridgeKey };
+        const projection = await fetchThreadProjection(cfg, bacId);
+        if (projection === null) return;
+        const { mirrorRemoteThread } = await import('../src/background/state');
+        await mirrorRemoteThread(projection);
+        // Broadcast so any open side panel refreshes its state
+        // and renders the new thread row immediately. Without
+        // this, the storage write happens but the side panel
+        // doesn't re-read until the 15 s periodic poll.
+        void broadcastWorkboardChanged('thread');
+      })().catch(() => undefined);
+    },
+  });
+
   reviewDraftsSse.subscribe({
     prefix: '_BAC/review-drafts/',
     onEvent: (event) => {

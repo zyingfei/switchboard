@@ -710,6 +710,81 @@ export const removeRemoteReviewDraft = async (threadId: string): Promise<void> =
   await dropReviewDraftVector(threadId);
 };
 
+// Remote-thread projection landed via /v1/threads/<id>/projection.
+// The companion's projection has shape { record: register, status:
+// register, deleted, vector }; we collapse the registers (taking
+// the first candidate on conflict for now — same simplification
+// review-drafts uses, see line 575) and merge into the local
+// `sidetrack.threads` array. Used by F9's vault-changes SSE
+// subscription so a peer's capture lands in the second browser's
+// side panel without a manual reload.
+export interface RemoteThreadRecord {
+  readonly bac_id: string;
+  readonly provider: string;
+  readonly threadUrl: string;
+  readonly title: string;
+  readonly lastSeenAt: string;
+  readonly tags: readonly string[];
+  readonly primaryWorkstreamId?: string;
+  readonly trackingMode?: TrackedThread['trackingMode'];
+}
+
+export interface RemoteThreadProjection {
+  readonly bac_id: string;
+  readonly record: RemoteRegister<RemoteThreadRecord>;
+  readonly status: RemoteRegister<TrackedThread['status']>;
+  readonly deleted: boolean;
+}
+
+export const mirrorRemoteThread = async (
+  projection: RemoteThreadProjection,
+): Promise<void> => {
+  const current = await readThreads();
+  // Tombstone path — a peer's delete event whose deps cover every
+  // local upsert collapses the record register to undefined AND
+  // sets `deleted: true`. Drop the local row.
+  if (projection.deleted) {
+    const next = current.filter((t) => t.bac_id !== projection.bac_id);
+    if (next.length !== current.length) {
+      await storageSet({ [THREADS_KEY]: next });
+    }
+    return;
+  }
+  const record = collapseRegister(projection.record);
+  const status = collapseRegister(projection.status);
+  if (record === undefined) {
+    // No live upsert — projection is empty for this thread.
+    // Don't fabricate a row.
+    return;
+  }
+  // Merge: replace any existing row with the same bac_id, append
+  // otherwise. Preserve fields the projection doesn't carry
+  // (e.g., lastTurnRole) on the existing row when the same id
+  // is being updated; the companion's projection is authoritative
+  // for everything it returns, but a partial mirror shouldn't
+  // wipe local-only fields.
+  const existing = current.find((t) => t.bac_id === projection.bac_id);
+  const next: TrackedThread = {
+    ...(existing ?? {}),
+    bac_id: record.bac_id,
+    provider: record.provider as TrackedThread['provider'],
+    threadUrl: record.threadUrl,
+    title: record.title,
+    lastSeenAt: record.lastSeenAt,
+    status: status ?? existing?.status ?? 'active',
+    trackingMode: record.trackingMode ?? existing?.trackingMode ?? 'manual',
+    tags: [...(record.tags ?? [])],
+    ...(record.primaryWorkstreamId === undefined
+      ? {}
+      : { primaryWorkstreamId: record.primaryWorkstreamId }),
+  };
+  const merged =
+    existing === undefined
+      ? [next, ...current]
+      : current.map((t) => (t.bac_id === projection.bac_id ? next : t));
+  await storageSet({ [THREADS_KEY]: merged });
+};
+
 export const setReviewDraftSpanComment = async (
   threadId: string,
   spanId: string,
