@@ -115,6 +115,19 @@ describe('timeline day bucketing', () => {
     expect(dayBucketFor('')).toBe('1970-01-01');
   });
 
+  it('strict-validates the date prefix (reviewer RV6)', () => {
+    // Loose prefixes that the OLD check accepted now fall back.
+    expect(dayBucketFor('abcd-fg-ij...')).toBe('1970-01-01');
+    expect(dayBucketFor('20XX-YY-ZZ...')).toBe('1970-01-01');
+    // Out-of-range month/day fall back too.
+    expect(dayBucketFor('2026-13-99T...')).toBe('1970-01-01');
+    expect(dayBucketFor('2026-00-15T...')).toBe('1970-01-01');
+    expect(dayBucketFor('2026-05-32T...')).toBe('1970-01-01');
+    // Valid ISO prefixes still pass.
+    expect(dayBucketFor('2026-05-07T10:00:00Z')).toBe('2026-05-07');
+    expect(dayBucketFor('1999-12-31')).toBe('1999-12-31');
+  });
+
   it('groups payloads by day', () => {
     const payloads = [
       observe({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/a' }),

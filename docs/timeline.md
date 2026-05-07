@@ -64,10 +64,28 @@ Timeline is **passive** by default in the Class F admit-policy sense:
 - Companion never sees raw tab/window IDs. Only the hashed forms
   scoped by `edgeReplicaId`.
 
-If an explicit user toggle to disable timeline ever ships, default is
-**off** until consent is given. (For this initial PR the toggle is
-out of scope; the feature is enabled, but bounded and privacy-careful
-by default.)
+**Default is OFF.** Timeline does NOT observe browser activity until
+the gate flips. The gate lives in `chrome.storage.local` under the
+key `sidetrack.timeline.enabled` and starts unset (treated as
+`false`). When off, `initializeTimelineWiring` registers no tab
+listeners and schedules no drain alarm — observations do not enter
+the spool, the companion endpoint is never called.
+
+To enable the feature today (settings UI is a follow-up):
+
+```js
+// In an extension page or background console
+await chrome.storage.local.set({ 'sidetrack.timeline.enabled': true });
+// Reload the extension or restart the service worker so
+// initializeTimelineWiring re-runs against the new gate value.
+```
+
+The companion-side gate is independent: even with the plugin
+disabled, archive imports or other clients with the bridge key can
+still post timeline events to `POST /v1/timeline/events`. The
+companion sanitizes URLs at the boundary regardless of source
+(reviewer-flagged defense-in-depth), so the projection cannot leak
+auth tokens even from a misbehaving caller.
 
 ## Storage budgets
 
@@ -352,7 +370,8 @@ Explicitly NOT in this PR:
 - User-tunable budget UI.
 - File-export archive trigger via chrome.downloads (inherits
   whatever Class F provides; no timeline-specific export wiring).
-- An explicit on/off toggle (default-on; toggle is a follow-up).
+- A side-panel UI to toggle the gate (today, the gate is flipped
+  via `chrome.storage.local` directly; UI surface is a follow-up).
 
 The architecture leaves room for these. The point of this PR is to
 prove the contract is open without changing it.

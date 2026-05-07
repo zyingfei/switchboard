@@ -111,6 +111,20 @@ else                                  → DROP (dropped-passive-by-policy)
   dropped by policy. The drop is recorded in `droppedPassiveCount`
   so the operator can see degradation.
 
+**Budget enforcement caveat.** The `PluginBudgetGuard` enforces budgets
+by **count** — `activeSetCount` and `maxExplicitPending` /
+`maxPassivePending`. The byte-level budgets (`activeSetBytes`,
+`spoolBytes`, `archiveExportTriggerBytes`) are declared in
+`PluginBudgets` but not currently enforced — the guard does not weigh
+entries by size. With the conservative count caps (timeline:
+1000 spool entries × ~2 KB ≈ 2 MB), staying under chrome.storage's
+10 MB ceiling is comfortable in practice, but a misbehaving caller
+that ships 10 KB URLs (max URL size in the timeline payload predicate
+is 4 KB, so this requires a different surface) could in principle
+push closer to the limit. A future iteration may add per-entry size
+attribution; today, the count caps + per-field length bounds in
+event-type predicates are the operative gate.
+
 ## Edge replica identity (single-identity model)
 
 The plugin has a stable `edgeReplicaId`, generated once on first run

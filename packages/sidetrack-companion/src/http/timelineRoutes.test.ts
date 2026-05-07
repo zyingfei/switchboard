@@ -217,6 +217,40 @@ describe('timeline HTTP routes', () => {
     await new Promise((r) => setTimeout(r, 50));
   });
 
+  it('POST /v1/timeline/events sanitizes raw URLs at the import boundary (reviewer RV1)', async () => {
+    // Defense-in-depth: even if a caller bypasses the plugin
+    // observer's sanitizer (older build, archive replay, malicious
+    // POSTer with the bridge key), the route must strip auth tokens
+    // BEFORE the event lands in the immutable log.
+    const dirty = buildEvent({
+      edgeReplicaId: 'edge_dirty',
+      seq: 1,
+      payload: observe({
+        observedAt: '2026-05-07T10:00:00.000Z',
+        url: 'https://example.com/callback?code=secret123&state=xyz#frag',
+        canonicalUrl: 'https://example.com/callback?session_id=abc',
+      }),
+    });
+    const r = await post('/v1/timeline/events', { events: [dirty] });
+    expect(r.status).toBe(200);
+    expect((r.data as { data: { imported: unknown[] } }).data.imported).toHaveLength(1);
+
+    await new Promise((res) => setTimeout(res, 50));
+    const view = await get('/v1/timeline');
+    const items = (view.data as { data: { items: { url: string; canonicalUrl?: string }[] } }).data.items;
+    expect(items).toHaveLength(1);
+    // Auth tokens MUST NOT be present in the projection.
+    const serialized = JSON.stringify(items);
+    expect(serialized).not.toMatch(/secret123/);
+    expect(serialized).not.toMatch(/code=/);
+    expect(serialized).not.toMatch(/state=xyz/);
+    expect(serialized).not.toMatch(/session_id=/);
+    expect(serialized).not.toMatch(/#frag/);
+    // The clean URL prefix is preserved.
+    expect(items[0]?.url).toBe('https://example.com/callback');
+    expect(items[0]?.canonicalUrl).toBe('https://example.com/callback');
+  });
+
   it('GET /v1/timeline applies exact same-day partial-range filtering (reviewer F6)', async () => {
     // Two events on the same day — one before the cut-off, one
     // after. since= timestamp should exclude the earlier one even

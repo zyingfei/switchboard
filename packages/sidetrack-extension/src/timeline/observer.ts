@@ -5,6 +5,15 @@ import type {
 } from './events';
 import { sanitizeTimelineUrl } from './sanitize';
 
+// Reviewer-flagged: bound URL/title sizes at the observer so a
+// pathological tab (10 MB chrome:// URL, etc.) can't push the
+// companion's payload predicate to reject after the spool has
+// already paid the cost of admit + edge dot allocation. Matches the
+// companion-side limits in `packages/sidetrack-companion/src/
+// timeline/events.ts`.
+const URL_MAX_LENGTH = 4096;
+const TITLE_MAX_LENGTH = 1024;
+
 // Sync Contract v1 / Class F — passive timeline observer.
 //
 // Listens for tab activation / navigation observations and emits
@@ -22,6 +31,18 @@ import { sanitizeTimelineUrl } from './sanitize';
 // The observer is decoupled from chrome.tabs so tests can drive it
 // with synthetic observations. The chrome wiring lives next to
 // background.ts and bridges chrome.tabs events into observer.observe.
+//
+// SW-restart behavior (reviewer-flagged): the `byTab` map is
+// in-memory only. After a service-worker restart (Chrome cycles
+// MV3 SWs aggressively), the map is empty — so the next
+// chrome.tabs event for a tab that was already in steady state
+// looks "new" and emits `transition: 'activated'`. This is mildly
+// noisy under heavy SW recycling but harmless: each emission goes
+// through the standard coalesce + spool admit path, the daily
+// projection reduces them by canonicalUrl, and visitCount
+// represents observations not unique sessions. If a future
+// iteration cares about precise session boundaries, persist
+// `byTab` in chrome.storage on each emit.
 
 export interface TimelineObserverDeps {
   // Wall-clock for now() + debounce decisions. Inject for tests.
@@ -100,6 +121,16 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
   const byTab = new Map<string, TabState>();
 
   const observe = (input: ObserveInput): void => {
+    // Bound URL + title before doing any other work. An oversized
+    // input is dropped silently (passive intent — same posture as
+    // the budget guard's `dropped-passive-by-policy`).
+    if (input.url.length > URL_MAX_LENGTH) return;
+    const boundedTitle =
+      input.title === undefined
+        ? undefined
+        : input.title.length > TITLE_MAX_LENGTH
+          ? input.title.slice(0, TITLE_MAX_LENGTH)
+          : input.title;
     const now = deps.clock();
     const observedAt = now.toISOString();
     const tabIdHash = deps.hashTabId(input.tabId, input.windowId);
@@ -130,8 +161,8 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
       const elapsed = now.getTime() - existing.lastEmittedAt;
       if (elapsed < coalesceWindowMs) {
         // Title-only update merges in-memory.
-        if (input.title !== undefined && input.title !== existing.title) {
-          byTab.set(tabIdHash, { ...existing, title: input.title });
+        if (boundedTitle !== undefined && boundedTitle !== existing.title) {
+          byTab.set(tabIdHash, { ...existing, title: boundedTitle });
         }
         return;
       }
@@ -146,7 +177,7 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
         observedAt,
         url: sanitizedUrl,
         ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
-        ...(input.title === undefined ? {} : { title: input.title }),
+        ...(boundedTitle === undefined ? {} : { title: boundedTitle }),
         ...(provider === undefined ? {} : { provider }),
         transition: 'updated',
         tabIdHash,
@@ -159,7 +190,7 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
         url: sanitizedUrl,
         ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
         ...(provider === undefined ? {} : { provider }),
-        ...(input.title === undefined ? {} : { title: input.title }),
+        ...(boundedTitle === undefined ? {} : { title: boundedTitle }),
         lastEmittedAt: now.getTime(),
       });
       return;
@@ -178,7 +209,7 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
       observedAt,
       url: sanitizedUrl,
       ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
-      ...(input.title === undefined ? {} : { title: input.title }),
+      ...(boundedTitle === undefined ? {} : { title: boundedTitle }),
       ...(provider === undefined ? {} : { provider }),
       transition,
       tabIdHash,
@@ -191,7 +222,7 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
       url: sanitizedUrl,
       ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
       ...(provider === undefined ? {} : { provider }),
-      ...(input.title === undefined ? {} : { title: input.title }),
+      ...(boundedTitle === undefined ? {} : { title: boundedTitle }),
       lastEmittedAt: now.getTime(),
     });
   };

@@ -207,15 +207,18 @@ describe('timelineMaterializer (Class B)', () => {
     expect(m.health().pending).toBe(true);
     expect(m.health().lastError).toContain('disk full');
 
-    // Trigger another event — this re-fires drain, which now sees
-    // BOTH the previously-failed day AND the new event's day in
-    // dirtyDays. The store's putDay succeeds this time.
+    // Recovery happens via catchUp (the documented "always-retry"
+    // path). onAccepted is gated by FAILURE_COOLDOWN_MS so a busy
+    // event stream doesn't tight-loop on persistent failures —
+    // catchUp bypasses that gate. Fires a fresh merged-log scan
+    // which sees the second event's day in dirtyDays AND the
+    // first day still flagged from the recovery path.
     const event2 = buildEvent({
       seq: 2,
       payload: payload({ observedAt: '2026-05-07T11:00:00.000Z', url: 'https://x/b', canonicalUrl: 'https://x/b' }),
     });
     await eventLog.importPeerEvent(event2);
-    m.onAccepted(event2, { origin: 'peer' });
+    await m.catchUp(eventLog);
     await m.awaitIdle();
 
     // putDay was called: once for the failed first attempt + at

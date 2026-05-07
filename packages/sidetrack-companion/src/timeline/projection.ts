@@ -59,14 +59,25 @@ const TRANSITIONS_INCREMENTING_VISIT_COUNT: ReadonlySet<TimelineTransition> = ne
 
 // Day bucket for a payload. UTC; format YYYY-MM-DD. Anchors the
 // projection file path AND the aggregateId for the registry entry.
+//
+// Reviewer-flagged: validate the prefix strictly. The previous
+// loose check (length>=10 && '-' at positions 4 and 7) accepted
+// inputs like "abcd-fg-ij..." and produced synthetic "days." A
+// proper \d{4}-\d{2}-\d{2} regex tightens the input domain so a
+// malformed `observedAt` falls back to the epoch bucket rather than
+// creating arbitrarily-named projection files.
+const DAY_PREFIX_RE = /^(\d{4})-(\d{2})-(\d{2})/u;
+
 export const dayBucketFor = (observedAt: string): string => {
-  // observedAt is already ISO; slicing the date prefix is enough for
-  // the YYYY-MM-DD bucket. Falling back to the epoch keeps the
-  // reducer total even on malformed input.
-  if (observedAt.length >= 10 && observedAt.charAt(4) === '-' && observedAt.charAt(7) === '-') {
-    return observedAt.slice(0, 10);
-  }
-  return '1970-01-01';
+  const match = DAY_PREFIX_RE.exec(observedAt);
+  if (match === null) return '1970-01-01';
+  // Sanity-check the month/day ranges so 2026-13-99 doesn't
+  // become a "valid" bucket. Year 0 is technically possible but
+  // not worth special-casing.
+  const month = Number.parseInt(match[2] ?? '0', 10);
+  const day = Number.parseInt(match[3] ?? '0', 10);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return '1970-01-01';
+  return observedAt.slice(0, 10);
 };
 
 // Stable per-day entry id derived from the canonicalUrl (or url if

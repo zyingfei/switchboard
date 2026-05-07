@@ -52,24 +52,44 @@ const isTransition = (value: unknown): value is TimelineTransition =>
   value === 'completed' ||
   value === 'closed';
 
+// Reviewer-flagged DoS bound: cap URL / title fields so a malformed
+// or malicious payload can't bloat the projection file. Real URLs
+// rarely exceed 2 KB; 4 KB leaves headroom. Titles cap a bit lower.
+export const TIMELINE_URL_MAX_LENGTH = 4096;
+export const TIMELINE_TITLE_MAX_LENGTH = 1024;
+export const TIMELINE_HASH_MAX_LENGTH = 64;
+export const TIMELINE_EVENT_ID_MAX_LENGTH = 256;
+
 export const isBrowserTimelineObservedPayload = (
   value: unknown,
 ): value is BrowserTimelineObservedPayload => {
   if (!isRecord(value)) return false;
-  if (typeof value['eventId'] !== 'string') return false;
-  if (typeof value['observedAt'] !== 'string') return false;
-  if (typeof value['url'] !== 'string') return false;
+  if (typeof value['eventId'] !== 'string' || (value['eventId'] as string).length > TIMELINE_EVENT_ID_MAX_LENGTH) {
+    return false;
+  }
+  if (typeof value['observedAt'] !== 'string' || (value['observedAt'] as string).length > 64) {
+    return false;
+  }
+  if (typeof value['url'] !== 'string' || (value['url'] as string).length > TIMELINE_URL_MAX_LENGTH) {
+    return false;
+  }
   if (!isTransition(value['transition'])) return false;
-  if (value['canonicalUrl'] !== undefined && typeof value['canonicalUrl'] !== 'string') {
-    return false;
+  if (value['canonicalUrl'] !== undefined) {
+    if (typeof value['canonicalUrl'] !== 'string') return false;
+    if ((value['canonicalUrl'] as string).length > TIMELINE_URL_MAX_LENGTH) return false;
   }
-  if (value['title'] !== undefined && typeof value['title'] !== 'string') return false;
+  if (value['title'] !== undefined) {
+    if (typeof value['title'] !== 'string') return false;
+    if ((value['title'] as string).length > TIMELINE_TITLE_MAX_LENGTH) return false;
+  }
   if (value['provider'] !== undefined && !isProvider(value['provider'])) return false;
-  if (value['tabIdHash'] !== undefined && typeof value['tabIdHash'] !== 'string') {
-    return false;
+  if (value['tabIdHash'] !== undefined) {
+    if (typeof value['tabIdHash'] !== 'string') return false;
+    if ((value['tabIdHash'] as string).length > TIMELINE_HASH_MAX_LENGTH) return false;
   }
-  if (value['windowIdHash'] !== undefined && typeof value['windowIdHash'] !== 'string') {
-    return false;
+  if (value['windowIdHash'] !== undefined) {
+    if (typeof value['windowIdHash'] !== 'string') return false;
+    if ((value['windowIdHash'] as string).length > TIMELINE_HASH_MAX_LENGTH) return false;
   }
   return true;
 };

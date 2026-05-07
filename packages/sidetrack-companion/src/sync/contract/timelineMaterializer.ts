@@ -39,6 +39,14 @@ export interface CreateTimelineMaterializerDeps {
   readonly eventLog: EventLog;
 }
 
+// Reviewer-flagged: persistent rebuildDay failures (e.g. disk full)
+// would tight-loop because every onAccepted re-triggers drain. We
+// add a small backoff window after a failure: if the last drain
+// attempt failed within FAILURE_COOLDOWN_MS, requestDrain is a
+// no-op (the day is already in dirtyDays from the failure path; a
+// later catchUp / alarm / event after the cooldown will retry).
+const FAILURE_COOLDOWN_MS = 5_000;
+
 export const createTimelineMaterializer = (
   deps: CreateTimelineMaterializerDeps,
 ): Materializer => {
@@ -47,6 +55,10 @@ export const createTimelineMaterializer = (
   let running = false;
   let lastSuccessAt: string | null = null;
   let lastError: string | null = null;
+  // Wall-clock ms of the most recent drain failure; used by
+  // requestDrain to skip retries within FAILURE_COOLDOWN_MS so a
+  // persistent failure doesn't tight-loop with the event stream.
+  let lastFailureAtMs: number = 0;
   // Days touched since the last drain. Set semantics — rebuild
   // each one once. catchUp clears this and rebuilds everything
   // observed in the merged log.
@@ -78,14 +90,11 @@ export const createTimelineMaterializer = (
         lastError = null;
       } catch (err) {
         lastError = err instanceof Error ? err.message : String(err);
-        // Reviewer-flagged: re-add the failed days to dirtyDays
-        // so the next event / catchUp / alarm retries them. The
-        // PRIOR behavior was to silently drop the snapshot on
-        // failure, which left projections stale until a future
-        // unrelated event happened to mark the same day dirty.
-        // We `return` (instead of `continue`) to break out of the
-        // drain loop — preventing tight-retry. Status is `failed`
-        // until the next attempt succeeds.
+        lastFailureAtMs = Date.now();
+        // Re-add failed days for next-trigger retry; exit drain
+        // loop to avoid tight-retry. Combined with the
+        // FAILURE_COOLDOWN_MS gate in requestDrain, persistent
+        // failures don't burn CPU on every incoming event.
         for (const day of snapshot) dirtyDays.add(day);
         return;
       }
@@ -96,6 +105,13 @@ export const createTimelineMaterializer = (
     dirtyDays.add(date);
     pending = true;
     if (running) return;
+    // Reviewer-flagged backoff: skip starting a new drain if a
+    // recent failure is still within the cooldown window. The day
+    // stays in dirtyDays; an event/catchUp/alarm after the
+    // cooldown picks it up. catchUp explicitly bypasses this gate
+    // (its caller is willing to drive the retry).
+    const sinceFailureMs = Date.now() - lastFailureAtMs;
+    if (lastError !== null && sinceFailureMs < FAILURE_COOLDOWN_MS) return;
     running = true;
     void (async () => {
       try {

@@ -175,6 +175,34 @@ describe('timeline plugin materializer (Class F)', () => {
     expect(timelinePluginMaterializer.health().lastError).toContain('network down');
   });
 
+  it('drain partial-success rolls un-acked entries back to spooled (self-review fix)', async () => {
+    await (globalThis as unknown as {
+      chrome: { storage: { local: { set: (e: Record<string, unknown>) => Promise<void> } } };
+    }).chrome.storage.local.set({
+      [EDGE_KEY]: { edgeReplicaId: 'edge_test', nextSeq: 1 },
+    });
+    await timelinePluginMaterializer.admitLocal(
+      observationFromPayload(buildPayload({ eventId: 'a' })),
+      'passive',
+    );
+    await timelinePluginMaterializer.admitLocal(
+      observationFromPayload(buildPayload({ eventId: 'b' })),
+      'passive',
+    );
+    // Companion acks the FIRST dot but not the second — partial
+    // upload (e.g., server interrupted between events).
+    setTimelineDrainHook(async (entries) => ({
+      uploaded: entries.length > 0 && entries[0] !== undefined ? [entries[0].edgeDot] : [],
+    }));
+    const result = await timelinePluginMaterializer.drainSpoolToCompanion();
+    expect(result.uploaded).toBe(1);
+    const spool = await readSpool('timeline');
+    // Acked entry is gone; un-acked entry returned to 'spooled'
+    // (NOT stuck in 'pending-send' forever).
+    expect(spool).toHaveLength(1);
+    expect(spool[0]?.state).toBe('spooled');
+  });
+
   it('drain idempotency: second drain over the same entries is a no-op once acked', async () => {
     await (globalThis as unknown as {
       chrome: { storage: { local: { set: (e: Record<string, unknown>) => Promise<void> } } };

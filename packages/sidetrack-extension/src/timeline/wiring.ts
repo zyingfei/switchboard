@@ -2,9 +2,11 @@ import { canonicalThreadUrl, detectProviderFromUrl } from '../capture/providerDe
 import { loadOrCreateEdgeReplica, type EdgeReplica } from '../sync/edgeReplicaId';
 import {
   createDefaultTimelineDrainHook,
+  createDefaultTimelineFetchHook,
   observationFromPayload,
   setCompanionReachableForTimeline,
   setTimelineDrainHook,
+  setTimelineFetchHook,
   timelinePluginMaterializer,
 } from './materializer';
 import { createTimelineObserver, type TimelineObserver } from './observer';
@@ -145,10 +147,20 @@ const tryDrain = async (deps: InitDeps): Promise<{ uploaded: number; remaining: 
   if (companion === null || companion.url.trim().length === 0) {
     setCompanionReachableForTimeline(false);
     setTimelineDrainHook(null);
+    setTimelineFetchHook(null);
     return { uploaded: 0, remaining: 0 };
   }
+  // Wire BOTH hooks once we have companion config — drain (POST)
+  // and fetch (GET). The drainer uses POST /v1/timeline/events;
+  // the fetcher uses GET /v1/timeline. Both honor the bridge key.
   setTimelineDrainHook(
     createDefaultTimelineDrainHook({
+      companionUrl: companion.url,
+      bridgeKey: companion.bridgeKey,
+    }),
+  );
+  setTimelineFetchHook(
+    createDefaultTimelineFetchHook({
       companionUrl: companion.url,
       bridgeKey: companion.bridgeKey,
     }),

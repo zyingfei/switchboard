@@ -46,6 +46,10 @@ export interface PluginMaterializerHealth {
   // Counts of items in terminal states for observability.
   readonly failedExplicitCount: number;
   readonly droppedPassiveCount: number;
+  // Most recent admit-local timestamp. Optional; surfaces from
+  // surfaces that admit observations (e.g. timeline). Useful for
+  // "is this surface still firing?" debugging.
+  readonly lastObservedAt?: string | null;
 }
 
 export interface ExtendedQuery {

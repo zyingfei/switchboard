@@ -132,6 +132,29 @@ describe('TimelineObserver — coalesce + debounce', () => {
     expect(emitted[0]?.canonicalUrl).toBe('https://example.com/callback');
   });
 
+  it('drops oversized URL silently (passive intent, no allocation)', () => {
+    const { emitted, observer } = setup();
+    const huge = 'https://x.com/?q=' + 'a'.repeat(5000);
+    observer.observe({ tabId: 1, windowId: 1, url: huge, transition: 'activated' });
+    // No emission — exceeded URL_MAX_LENGTH (4096).
+    expect(emitted).toHaveLength(0);
+  });
+
+  it('truncates oversized title rather than dropping the observation', () => {
+    const { emitted, observer } = setup();
+    const longTitle = 'T'.repeat(2000);
+    observer.observe({
+      tabId: 1,
+      windowId: 1,
+      url: 'https://x/a',
+      title: longTitle,
+      transition: 'activated',
+    });
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]?.title).toBeDefined();
+    expect((emitted[0]?.title ?? '').length).toBeLessThanOrEqual(1024);
+  });
+
   it('sanitizes URL even when canonicalize returns undefined', () => {
     // Set up a fresh observer with no canonicalize hook so the
     // sanitizer's responsibility for url= is tested in isolation.

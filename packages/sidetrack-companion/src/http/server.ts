@@ -8,6 +8,7 @@ import {
   BROWSER_TIMELINE_OBSERVED,
   isBrowserTimelineObservedPayload,
 } from '../timeline/events.js';
+import { sanitizeTimelinePayload } from '../timeline/sanitize.js';
 import {
   defaultAllowedTools,
   isAllowed,
@@ -3191,8 +3192,22 @@ const routes: readonly RouteDefinition[] = [
           });
           continue;
         }
+        // Reviewer-flagged defense-in-depth: sanitize URLs BEFORE
+        // the event is appended. The plugin observer already
+        // sanitizes outgoing URLs, but this route accepts events
+        // from any caller with the bridge key (older plugin builds,
+        // archive-import path, …). Once the event lands in the
+        // immutable log we can't strip auth tokens out — this is
+        // the last opportunity. We construct a new event with the
+        // sanitized payload (preserving the edge dot + clientEventId
+        // so importPeerEvent dedupe still works).
+        const sanitizedPayload = sanitizeTimelinePayload(event.payload);
+        const sanitizedEvent =
+          sanitizedPayload === event.payload
+            ? event
+            : { ...event, payload: sanitizedPayload };
         try {
-          const result = await context.importEdgeEvent(event);
+          const result = await context.importEdgeEvent(sanitizedEvent);
           if (result.imported) {
             imported.push({ replicaId: event.dot.replicaId, seq: event.dot.seq });
           } else {

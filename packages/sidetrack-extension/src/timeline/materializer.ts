@@ -22,6 +22,7 @@ import {
   BROWSER_TIMELINE_OBSERVED,
   type ActiveTimelineObservation,
   type BrowserTimelineObservedPayload,
+  type TimelineProvider,
 } from './events';
 
 // Sync Contract v1 / Class F — timeline plugin materializer.
@@ -46,21 +47,6 @@ const SURFACE = 'timeline';
 const ACTIVE_BUDGET =
   DEFAULT_PLUGIN_BUDGETS.activeSetCount[SURFACE] ?? 200;
 
-// Storage key for the timeline projection mirror (companion-driven
-// shape; minimal until the side panel renders timeline).
-const MIRROR_STORAGE_KEY = 'sidetrack.timeline.projection';
-
-interface ChromeStorageLike {
-  readonly get: (key: string) => Promise<Record<string, unknown>>;
-  readonly set: (entries: Record<string, unknown>) => Promise<void>;
-}
-
-const getChromeStorage = (): ChromeStorageLike => {
-  const c = (globalThis as unknown as { chrome?: { storage?: { local?: ChromeStorageLike } } }).chrome;
-  const local = c?.storage?.local;
-  if (local === undefined) throw new Error('chrome.storage.local is unavailable');
-  return local;
-};
 
 // State tracked in module memory for health reporting. The spool +
 // chrome.storage are the durable truth; counters are derived.
@@ -79,6 +65,70 @@ interface DrainCompanionDeps {
   readonly companionUrl: string;
   readonly bridgeKey: string;
 }
+
+// Hook for the companion-extended fetch path. Production wiring sets
+// it via setTimelineFetchHook; tests inject a synthetic. Returns the
+// raw companion response body shape so the materializer can map its
+// TimelineEntry rows into the plugin's ActiveTimelineObservation
+// view (lossy — visitCount + firstSeenAt are dropped because the
+// PluginMaterializer<T> generic constrains both admit and fetch to
+// the same TItem; revisiting the generic would touch every existing
+// materializer, so we live with the synthesis for now).
+interface CompanionTimelineEntry {
+  readonly id: string;
+  readonly date: string;
+  readonly firstSeenAt: string;
+  readonly lastSeenAt: string;
+  readonly url: string;
+  readonly canonicalUrl?: string;
+  readonly title?: string;
+  readonly provider?: TimelineProvider;
+  readonly visitCount: number;
+}
+
+let fetchHook:
+  | ((query: ExtendedQuery) => Promise<{
+      readonly scope: 'companion-extended';
+      readonly items: readonly CompanionTimelineEntry[];
+    }>)
+  | null = null;
+
+export const setTimelineFetchHook = (
+  hook:
+    | ((query: ExtendedQuery) => Promise<{
+        readonly scope: 'companion-extended';
+        readonly items: readonly CompanionTimelineEntry[];
+      }>)
+    | null,
+): void => {
+  fetchHook = hook;
+};
+
+export const createDefaultTimelineFetchHook = (
+  deps: DrainCompanionDeps,
+): ((query: ExtendedQuery) => Promise<{
+  readonly scope: 'companion-extended';
+  readonly items: readonly CompanionTimelineEntry[];
+}>) => {
+  return async (query) => {
+    const params = new URLSearchParams();
+    if (query.q !== undefined && query.q.length > 0) params.set('q', query.q);
+    if (query.limit !== undefined && query.limit > 0) {
+      params.set('limit', String(query.limit));
+    }
+    const search = params.toString();
+    const url = `${deps.companionUrl.replace(/\/$/u, '')}/v1/timeline${search.length > 0 ? `?${search}` : ''}`;
+    const res = await fetch(url, {
+      headers: { 'x-bac-bridge-key': deps.bridgeKey },
+    });
+    if (!res.ok) throw new Error(`timeline fetch HTTP ${String(res.status)}`);
+    const json = (await res.json()) as {
+      data?: { scope?: string; items?: readonly CompanionTimelineEntry[] };
+    };
+    const items = json.data?.items ?? [];
+    return { scope: 'companion-extended', items };
+  };
+};
 
 // Hook for tests + production wiring. The default is a fetch wrapper
 // against the companion's /v1/timeline/events endpoint.
@@ -192,39 +242,62 @@ const admitLocal = async (
   return decision;
 };
 
-// mirrorFromCompanion: store the projection in chrome.storage so the
-// side panel can render it uniformly. The wire shape mirrors
-// TimelineDayProjection from the companion.
+// mirrorFromCompanion: timeline is NOT SSE-mirrored in this PR.
+//
+// Reviewer-flagged: the previous implementation pretended to "mirror
+// from companion" but actually stored the plugin's own observation
+// shape in chrome.storage — false-pretense behavior on the SSE path.
+// Honest stance: timeline doesn't have an SSE delivery channel yet.
+// Side-panel reads of older history go through fetchExtended →
+// GET /v1/timeline (the companion projection is the source of truth).
+//
+// We satisfy the PluginMaterializer interface with an explicit no-op
+// + a single `void item` so future plumbing (a real SSE-driven
+// mirror, or a side-panel render layer) has an obvious slot to wire
+// into. Calling this method does NOT corrupt any local state — that
+// was the bug.
 const mirrorFromCompanion = async (item: ActiveTimelineObservation): Promise<void> => {
-  // For the minimal first cut, the side panel doesn't render
-  // companion-projected timeline yet; we store the most recent
-  // observation as a per-day cache to keep the interface alive.
-  const existing = (
-    await getChromeStorage().get(MIRROR_STORAGE_KEY)
-  )[MIRROR_STORAGE_KEY];
-  const list = Array.isArray(existing)
-    ? (existing as ActiveTimelineObservation[])
-    : [];
-  // Dedupe by eventId and cap at active budget.
-  const next = [
-    item,
-    ...list.filter((e) => e.payload.eventId !== item.payload.eventId),
-  ].slice(0, ACTIVE_BUDGET);
-  await getChromeStorage().set({ [MIRROR_STORAGE_KEY]: next });
+  void item;
 };
 
+// Reviewer-flagged: fetchExtended actually queries the companion's
+// GET /v1/timeline endpoint when reachable. The companion returns
+// reduced TimelineEntry rows; we synthesize lossy
+// ActiveTimelineObservation views (visitCount + firstSeenAt are
+// dropped) so the PluginMaterializer<ActiveTimelineObservation>
+// generic stays consistent. Side-panel renderers that need
+// visitCount can fetch the raw companion JSON via a future
+// fetchExtendedRaw or by changing the generic.
 const fetchExtended = async (
-  _query: ExtendedQuery,
+  query: ExtendedQuery,
 ): Promise<ExtendedResult<ActiveTimelineObservation>> => {
-  // Companion-extended timeline query is wired in B3 (HTTP endpoint
-  // + extension HTTP client). Until then, return Mode P scope.
-  if (!companionReachable) {
+  if (!companionReachable || fetchHook === null) {
     return buildScopedResult<ActiveTimelineObservation>(
       'plugin-active-only-companion-unreachable',
       [],
     );
   }
-  return buildScopedResult<ActiveTimelineObservation>('plugin-active', []);
+  try {
+    const result = await fetchHook(query);
+    const items: ActiveTimelineObservation[] = result.items.map((entry) => ({
+      payload: {
+        eventId: entry.id,
+        observedAt: entry.lastSeenAt,
+        url: entry.url,
+        transition: 'updated' as const,
+        ...(entry.canonicalUrl === undefined ? {} : { canonicalUrl: entry.canonicalUrl }),
+        ...(entry.title === undefined ? {} : { title: entry.title }),
+        ...(entry.provider === undefined ? {} : { provider: entry.provider }),
+      },
+    }));
+    return buildScopedResult<ActiveTimelineObservation>(result.scope, items);
+  } catch (err) {
+    lastError = err instanceof Error ? err.message : String(err);
+    return buildScopedResult<ActiveTimelineObservation>(
+      'plugin-active-only-companion-unreachable',
+      [],
+    );
+  }
 };
 
 const drainSpoolToCompanion = async (): Promise<{
@@ -249,6 +322,15 @@ const drainSpoolToCompanion = async (): Promise<{
     await spoolTransition(SURFACE, entry.edgeDot, 'pending-send');
   }
   let uploaded = 0;
+  // Track which dots came back as acked so the rollback step
+  // doesn't re-spool them. Self-review caught: a SUCCESSFUL drain
+  // with partial uploads (e.g., companion accepted N of M) was
+  // leaving the un-acked entries stuck in 'pending-send' forever
+  // because the rollback only ran in the catch path. The
+  // success-with-leftovers case is now handled too.
+  const ackedKey = (dot: SpoolEntry['edgeDot']): string =>
+    `${dot.replicaId}|${String(dot.seq)}`;
+  const ackedSet = new Set<string>();
   try {
     const result = await drainHook(drainable);
     for (const dot of result.uploaded) {
@@ -257,25 +339,28 @@ const drainSpoolToCompanion = async (): Promise<{
       // the companion has acked it — it lives in the companion event
       // log + projection now.
       await spoolRemove(SURFACE, dot);
+      ackedSet.add(ackedKey(dot));
       uploaded += 1;
     }
     lastReconcileAt = new Date().toISOString();
     lastError = null;
   } catch (err) {
     lastError = err instanceof Error ? err.message : String(err);
-    // Roll the unsent entries back to 'spooled' so a later drain
-    // retries them. The acked ones stay evicted-after-ack.
-    for (const entry of drainable) {
-      const fresh = await readSpool(SURFACE);
-      const stillPending = fresh.find(
-        (e) =>
-          e.edgeDot.replicaId === entry.edgeDot.replicaId &&
-          e.edgeDot.seq === entry.edgeDot.seq &&
-          e.state === 'pending-send',
-      );
-      if (stillPending !== undefined) {
-        await spoolTransition(SURFACE, entry.edgeDot, 'spooled');
-      }
+  }
+  // Rollback path runs in BOTH success and failure cases — every
+  // entry we transitioned to 'pending-send' that did NOT get acked
+  // must return to 'spooled' so a later drain retries it.
+  for (const entry of drainable) {
+    if (ackedSet.has(ackedKey(entry.edgeDot))) continue;
+    const fresh = await readSpool(SURFACE);
+    const stillPending = fresh.find(
+      (e) =>
+        e.edgeDot.replicaId === entry.edgeDot.replicaId &&
+        e.edgeDot.seq === entry.edgeDot.seq &&
+        e.state === 'pending-send',
+    );
+    if (stillPending !== undefined) {
+      await spoolTransition(SURFACE, entry.edgeDot, 'spooled');
     }
   }
   const remaining = (await readSpool(SURFACE)).filter(
@@ -307,6 +392,7 @@ const health = (): PluginMaterializerHealth => {
     lastError,
     failedExplicitCount: metrics.failedExplicit,
     droppedPassiveCount: metrics.droppedPassive,
+    lastObservedAt,
   };
 };
 
@@ -352,5 +438,3 @@ export const resetTimelineMaterializerStateForTests = (): void => {
 export const observationFromPayload = (
   payload: BrowserTimelineObservedPayload,
 ): ActiveTimelineObservation => ({ payload });
-
-export const __TIMELINE_LAST_OBSERVED_AT_FOR_TESTS = (): string | null => lastObservedAt;
