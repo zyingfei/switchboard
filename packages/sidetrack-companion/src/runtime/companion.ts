@@ -18,6 +18,7 @@ import { createEventLog } from '../sync/eventLog.js';
 import { createKnownReplicasStore } from '../sync/knownReplicas.js';
 import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
 import { runImportProjectors } from '../sync/projectors.js';
+import { reprojectOnVersionMismatch } from '../sync/reproject.js';
 import {
   createRelayTransport,
   getRelayTransportStatus,
@@ -152,6 +153,22 @@ export const startCompanion = async (
   const recallActivity = createRecallActivityTracker();
   const baseEventLog = createEventLog(options.vaultPath, replica);
   const projectionChanges = createProjectionChangeFeed(options.vaultPath);
+
+  // Reproject on startup if the projector logic has changed since
+  // the last run. Writes a `_BAC/.projector-version` sentinel so
+  // subsequent startups are no-ops. Recovers from:
+  //   - an upgrade where a projector's output shape changed.
+  //   - a vault that was last touched by an older companion that
+  //     didn't write the version file.
+  //   - a manually-deleted projection file (the next event for
+  //     that aggregate would re-create it anyway, but reproject
+  //     fixes it without waiting for activity).
+  // Best-effort — startup proceeds even if reproject errors out.
+  await reprojectOnVersionMismatch({
+    vaultRoot: options.vaultPath,
+    eventLog: baseEventLog,
+    projectionChanges,
+  }).catch(() => undefined);
 
   // Optional outbound relay transport. When wired, every accepted
   // event is rebroadcast via the relay so peers learn about it
