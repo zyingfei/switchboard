@@ -119,16 +119,17 @@ export const expectNoConflictUi = async (page: Page, slot: ConflictSlot): Promis
 };
 
 // Click the "Use <value>" pick button for a specific candidate.
-// Matches the button's title attribute, which carries the raw
-// candidate value (the visible label is truncated to 80 chars).
+// Matches the button's title attribute, which carries the
+// renderValue output. For overall + comment slots this is the raw
+// string value; for verdict it's the VERDICT_LABELS-mapped label
+// ("Agree" / "Partial" / etc., not "agree" / "partial").
 export const pickConflictCandidate = async (
   page: Page,
   slot: ConflictSlot,
-  value: string,
+  candidateTitle: string,
 ): Promise<void> => {
   await conflictForSlot(page, slot)
-    .locator('button.review-draft-conflict-pick', { hasText: `Use "` })
-    .filter({ has: page.locator(`[title="${value}"]`) })
+    .locator(`button.review-draft-conflict-pick[title="${candidateTitle}"]`)
     .first()
     .click();
 };
