@@ -118,6 +118,52 @@ describe('runCli', () => {
     expect(streams.stderr.text()).toContain('model not present');
   });
 
+  it('ingest --import imports edge-origin events idempotently (gate L3-G7)', async () => {
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-ingest-test-'));
+    try {
+      // Two valid edge-origin AcceptedEvents serialized as JSONL.
+      // Sync Contract v1 / Class F: edge dot is canonical identity;
+      // re-importing the same archive twice produces no duplicates.
+      const archivePath = join(vaultRoot, 'archive.jsonl');
+      const events = [
+        {
+          clientEventId: 'ed-1',
+          dot: { replicaId: 'edge_test_abc', seq: 1 },
+          deps: {},
+          aggregateId: 'th-imported',
+          type: 'thread.upserted',
+          payload: {
+            bac_id: 'th-imported',
+            provider: 'chatgpt',
+            threadUrl: 'https://x',
+            title: 'Imported',
+            lastSeenAt: '2026-05-07T00:00:00.000Z',
+          },
+          acceptedAtMs: 1,
+        },
+      ];
+      await writeFile(archivePath, events.map((e) => JSON.stringify(e)).join('\n'), 'utf8');
+      const streams1 = createStreams();
+      const exit1 = await runCli(
+        ['ingest', '--import', archivePath, '--vault', vaultRoot],
+        streams1,
+      );
+      expect(exit1).toBe(0);
+      expect(streams1.stdout.text()).toContain('imported=1');
+      // Second import: same edge dots → all skipped (idempotent).
+      const streams2 = createStreams();
+      const exit2 = await runCli(
+        ['ingest', '--import', archivePath, '--vault', vaultRoot],
+        streams2,
+      );
+      expect(exit2).toBe(0);
+      expect(streams2.stdout.text()).toContain('imported=0');
+      expect(streams2.stdout.text()).toContain('skipped=1');
+    } finally {
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
+  });
+
   it('recall reingest refuses when the recall process-lock is held by a live foreign PID', async () => {
     // A running companion holds `_BAC/recall/.lock` for the same
     // single-writer reason that `recall reingest` does — letting them

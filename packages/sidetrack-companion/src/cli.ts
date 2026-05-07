@@ -584,6 +584,82 @@ const runRecallSubcommand = async (
   return 2;
 };
 
+// Sync Contract v1 / Class F — companion `ingest --import <archive>`
+// CLI verb. Imports an archive pack of edge-origin events into the
+// companion's event log. Idempotent on edge dot — same archive
+// imported twice produces no duplicates; same archive imported by
+// two different companions deduplicates at the relay level (both
+// will publish; receiving peer dedupes on dot).
+//
+// Lane 3 stage 4. The archive pack format is JSONL of AcceptedEvent
+// objects with edge-origin dots. Each event is fed through
+// importPeerEvent (which already handles dot collisions + idempotency).
+const runIngestSubcommand = async (
+  argv: readonly string[],
+  streams: CliStreams,
+): Promise<number> => {
+  const verb = argv[1];
+  if (verb === undefined || verb === 'help' || verb === '--help') {
+    writeLine(
+      streams.stdout,
+      'Sync Contract v1 / Class F archive import.',
+    );
+    writeLine(streams.stdout, '');
+    writeLine(streams.stdout, 'Usage:');
+    writeLine(
+      streams.stdout,
+      '  sidetrack-companion ingest --import <archive.jsonl> --vault <path>',
+    );
+    return verb === undefined ? 2 : 0;
+  }
+  if (verb !== '--import') {
+    writeLine(streams.stderr, `unknown ingest verb: ${verb}`);
+    writeLine(streams.stderr, 'try: --import <archive.jsonl>');
+    return 2;
+  }
+  const archivePath = argv[2];
+  if (archivePath === undefined) {
+    writeLine(streams.stderr, '--import requires a path argument.');
+    return 2;
+  }
+  const vaultIdx = argv.indexOf('--vault');
+  const vaultPath = vaultIdx === -1 ? undefined : argv[vaultIdx + 1];
+  if (vaultPath === undefined) {
+    writeLine(streams.stderr, '--vault <path> is required for ingest --import.');
+    return 2;
+  }
+  // Lazy imports — keeps CLI startup fast for unrelated verbs.
+  const { readFile } = await import('node:fs/promises');
+  const { createEventLog } = await import('./sync/eventLog.js');
+  const { loadOrCreateReplica } = await import('./sync/replicaId.js');
+  const replica = await loadOrCreateReplica(vaultPath);
+  const eventLog = createEventLog(vaultPath, replica);
+  const text = await readFile(archivePath, 'utf8');
+  const lines = text.split('\n').filter((l) => l.trim().length > 0);
+  let imported = 0;
+  let skipped = 0;
+  let errors = 0;
+  for (const line of lines) {
+    try {
+      const event = JSON.parse(line);
+      const result = await eventLog.importPeerEvent(event);
+      if (result.imported) imported += 1;
+      else skipped += 1;
+    } catch (err) {
+      errors += 1;
+      writeLine(
+        streams.stderr,
+        `[ingest] error: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  writeLine(
+    streams.stdout,
+    `ingest: imported=${String(imported)} skipped=${String(skipped)} errors=${String(errors)} total=${String(lines.length)}`,
+  );
+  return errors > 0 ? 1 : 0;
+};
+
 export const runCli = async (argv: readonly string[], streams: CliStreams): Promise<number> => {
   // Sub-command dispatch happens BEFORE the flag-driven parser so a
   // verb like `models` doesn't get interpreted as a positional vault
@@ -593,6 +669,9 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
   }
   if (argv[0] === 'recall') {
     return await runRecallSubcommand(argv, streams);
+  }
+  if (argv[0] === 'ingest') {
+    return await runIngestSubcommand(argv, streams);
   }
 
   const args = parseArgs(argv);
