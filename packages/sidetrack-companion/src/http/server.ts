@@ -54,7 +54,7 @@ import { buildSignals, type BuildSignalsWorkstream } from '../suggestions/buildS
 import { scoreSuggestions } from '../suggestions/score.js';
 import type { EventLog } from '../sync/eventLog.js';
 import type { ProjectionChangeFeed } from '../sync/projectionChanges.js';
-import type { TargetRef } from '../sync/causal.js';
+import { vectorFromEvents, type TargetRef, type VersionVector } from '../sync/causal.js';
 import type { ReplicaContext } from '../sync/replicaId.js';
 
 // Strip undefined keys produced by zod's `optional()` so the caller's
@@ -128,6 +128,24 @@ const syncSummaryDeps = (
           };
         },
       };
+// Stamps an outgoing event's baseVector to cover every prior event
+// for the same aggregate. Without this every emit lands with
+// baseVector:{} → every register/OR-Set candidate becomes
+// causally concurrent with every prior write, mergeRegister
+// returns `conflict` with N candidates, and the receiver picks
+// the wrong one. This is the bug F11 closes.
+//
+// The vector is *only* over events that actually exist on this
+// replica's merged log. That's correct: causal ordering is "what
+// have I observed?" and all the local replica has observed is its
+// merged log. For peer-imported events the deps were already on
+// the wire.
+const baseVectorForAggregate = async (
+  eventLog: EventLog,
+  aggregateId: string,
+): Promise<VersionVector> =>
+  vectorFromEvents(await eventLog.readByAggregate(aggregateId));
+
 import { isReviewDraftEvent, projectReviewDraft } from '../review/projection.js';
 import {
   deleteReviewDraft,
@@ -1259,8 +1277,7 @@ const routes: readonly RouteDefinition[] = [
                   createdAt: dispatchEvent.createdAt,
                   body: dispatchEvent.body,
                 },
-                baseVector: {},
-              })
+                  })
               .catch(() => undefined);
           }
           return [
@@ -1333,7 +1350,6 @@ const routes: readonly RouteDefinition[] = [
             aggregateId: match.bacId,
             type: DISPATCH_LINKED,
             payload: { dispatchId: match.bacId, threadId: body.threadId },
-            baseVector: {},
           })
           .catch(() => undefined);
       }
@@ -1965,8 +1981,7 @@ const routes: readonly RouteDefinition[] = [
                   note: input.note,
                   pageTitle,
                 },
-                baseVector: {},
-              })
+                  })
               .catch(() => undefined);
           }
           // totalForThread/totalForUrl: total non-deleted
@@ -2002,8 +2017,7 @@ const routes: readonly RouteDefinition[] = [
                 note: input.note,
                 pageTitle: input.pageTitle,
               },
-              baseVector: {},
-            })
+              })
             .catch(() => undefined);
         }
         return [201, { data: result }];
@@ -2048,7 +2062,6 @@ const routes: readonly RouteDefinition[] = [
             aggregateId: match.annotationId,
             type: ANNOTATION_NOTE_SET,
             payload: { bac_id: match.annotationId, note: input.note },
-            baseVector: {},
           })
           .catch(() => undefined);
       }
@@ -2071,7 +2084,6 @@ const routes: readonly RouteDefinition[] = [
             aggregateId: match.annotationId,
             type: ANNOTATION_DELETED,
             payload: { bac_id: match.annotationId },
-            baseVector: {},
           })
           .catch(() => undefined);
       }
@@ -2450,8 +2462,7 @@ const routes: readonly RouteDefinition[] = [
                       ...(turn.modelName === undefined ? {} : { modelName: turn.modelName }),
                     })),
                   },
-                  baseVector: {},
-                })
+                      })
                 .then(() => true)
                 .catch(() => false);
         // Auto-index by routing through the lifecycle's incremental
@@ -2529,7 +2540,6 @@ const routes: readonly RouteDefinition[] = [
               ...(input.tags === undefined ? {} : { tags: input.tags }),
               ...(input.trackingMode === undefined ? {} : { trackingMode: input.trackingMode }),
             },
-            baseVector: {},
           })
           .catch(() => undefined);
       }
@@ -2600,7 +2610,6 @@ const routes: readonly RouteDefinition[] = [
             aggregateId: match.bacId,
             type: THREAD_ARCHIVED,
             payload: { bac_id: match.bacId },
-            baseVector: {},
           })
           .catch(() => undefined);
       }
@@ -2644,7 +2653,6 @@ const routes: readonly RouteDefinition[] = [
             aggregateId: match.bacId,
             type: THREAD_UNARCHIVED,
             payload: { bac_id: match.bacId },
-            baseVector: {},
           })
           .catch(() => undefined);
       }
@@ -2681,7 +2689,6 @@ const routes: readonly RouteDefinition[] = [
               ...(input.checklist === undefined ? {} : { checklist: input.checklist }),
               ...(input.description === undefined ? {} : { description: input.description }),
             },
-            baseVector: {},
           })
           .catch(() => undefined);
       }
@@ -2829,8 +2836,7 @@ const routes: readonly RouteDefinition[] = [
                   ? { description: record['description'] }
                   : {}),
               },
-              baseVector: {},
-            });
+              });
           }
         } catch {
           // Best effort — the vault write succeeded regardless.
@@ -2912,8 +2918,7 @@ const routes: readonly RouteDefinition[] = [
                 ...(input.targetId === undefined ? {} : { targetId: input.targetId }),
                 ...(input.status === undefined ? {} : { status: input.status }),
               },
-              baseVector: {},
-            })
+              })
             .catch(() => undefined);
         }
         return [201, mutationResponse(result, requestId)];

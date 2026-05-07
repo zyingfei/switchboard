@@ -10,6 +10,7 @@ import {
   sortAcceptedEvents,
   type TargetRef,
   type VersionVector,
+  vectorFromEvents,
 } from './causal.js';
 import type { ReplicaContext } from './replicaId.js';
 
@@ -382,7 +383,29 @@ const computeDepsFromInput = <TPayload extends Record<string, unknown>>(
   input: AppendInput<TPayload>,
   merged: readonly AcceptedEvent[],
 ): VersionVector => {
-  let deps: VersionVector = input.baseVector ?? {};
+  // F11 — when the caller doesn't pass an explicit baseVector,
+  // default to the union of every prior event for the SAME
+  // aggregate. Without this, every server-side appendClient call
+  // (POST /v1/threads, POST /v1/workstreams, status PATCHes, …)
+  // landed with deps:{}, which made every register/OR-Set
+  // candidate causally concurrent with every other write to the
+  // same record. mergeRegister returned conflict-with-N-candidates
+  // and the receiver picked the first (oldest) candidate — so the
+  // user moved a thread, the move event was emitted, but the
+  // projection still showed the original. Defaulting to the
+  // aggregate's prior frontier makes a sequential write actually
+  // dominate. Callers that want the legacy behavior (rare; some
+  // tests intentionally simulate a "first write" or a concurrent
+  // edit) keep passing `baseVector: {}` explicitly.
+  const explicit = input.baseVector;
+  let deps: VersionVector;
+  if (explicit !== undefined) {
+    deps = explicit;
+  } else {
+    deps = vectorFromEvents(
+      merged.filter((event) => event.aggregateId === input.aggregateId),
+    );
+  }
   if (input.clientDeps !== undefined && input.clientDeps.length > 0) {
     const byClientId = new Map<string, AcceptedEvent>();
     for (const event of merged) byClientId.set(event.clientEventId, event);
