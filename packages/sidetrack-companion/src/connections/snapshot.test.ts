@@ -798,6 +798,147 @@ describe('connections — content-derived edges', () => {
     expect(ids).not.toContain(nodeIdFor('thread', 'capture_evt_001'));
   });
 
+  it('thread_text_mentions_search_query fires when chat text contains a tracked search visit query', () => {
+    // Search visit with query "Linux crypto subsystem" + a chat
+    // whose user turn mentions the same phrase verbatim. The chat
+    // never pastes the search URL — only the topic text.
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: [
+        {
+          id: 'https://www.google.com/search?q=Linux+crypto+subsystem',
+          firstSeenAt: '2026-05-07T09:00:00.000Z',
+          lastSeenAt: '2026-05-07T09:05:00.000Z',
+          url: 'https://www.google.com/search?q=Linux+crypto+subsystem',
+          canonicalUrl: 'https://www.google.com/search?q=Linux+crypto+subsystem',
+          visitCount: 1,
+        },
+      ],
+      updatedAt: '2026-05-07T09:05:00.000Z',
+      entryCount: 1,
+    };
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        timelineDays: [day],
+        events: [
+          buildEvent({
+            seq: 1,
+            type: CAPTURE_RECORDED,
+            payload: {
+              bac_id: 'thread_a',
+              threadId: 'thread_a',
+              capturedAt: '2026-05-07T10:00:00.000Z',
+              turns: [
+                {
+                  ordinal: 0,
+                  role: 'user',
+                  text: 'explain the Linux crypto subsystem angle on this CVE',
+                },
+              ],
+            },
+          }),
+        ],
+      }),
+    );
+    const edge = snap.edges.find((e) => e.kind === 'thread_text_mentions_search_query');
+    expect(edge, 'search-query edge expected').toBeDefined();
+    expect(edge?.fromNodeId).toBe(nodeIdFor('thread', 'thread_a'));
+    expect(edge?.toNodeId).toBe(
+      nodeIdFor('timeline-visit', 'https://www.google.com/search?q=Linux+crypto+subsystem'),
+    );
+    // The visit node carries the searchQuery metadata.
+    const visitNode = snap.nodes.find((n) => n.kind === 'timeline-visit');
+    expect(visitNode?.metadata['searchQuery']).toBe('linux crypto subsystem');
+  });
+
+  it('thread_text_mentions_search_query is whole-word, case-insensitive', () => {
+    const buildSnap = (chatText: string) => {
+      const day: TimelineDayProjection = {
+        date: '2026-05-07',
+        entries: [
+          {
+            id: 'https://example.com/search?q=react',
+            firstSeenAt: '2026-05-07T09:00:00.000Z',
+            lastSeenAt: '2026-05-07T09:05:00.000Z',
+            url: 'https://example.com/search?q=react',
+            canonicalUrl: 'https://example.com/search?q=react',
+            visitCount: 1,
+          },
+        ],
+        updatedAt: '2026-05-07T09:05:00.000Z',
+        entryCount: 1,
+      };
+      return buildConnectionsSnapshot(
+        emptyInput({
+          timelineDays: [day],
+          events: [
+            buildEvent({
+              seq: 1,
+              type: CAPTURE_RECORDED,
+              payload: {
+                bac_id: 'thread_a',
+                threadId: 'thread_a',
+                capturedAt: '2026-05-07T10:00:00.000Z',
+                turns: [{ ordinal: 0, role: 'user', text: chatText }],
+              },
+            }),
+          ],
+        }),
+      );
+    };
+    // "react" too short (3 chars) — actually 5 chars, should match
+    const matching = buildSnap('I love using REACT for this');
+    expect(
+      matching.edges.some((e) => e.kind === 'thread_text_mentions_search_query'),
+      'case-insensitive whole-word match',
+    ).toBe(true);
+    // Substring "reactivity" must NOT match the whole word "react"
+    const nonMatching = buildSnap('I care about reactivity in Vue.');
+    expect(
+      nonMatching.edges.some((e) => e.kind === 'thread_text_mentions_search_query'),
+      'must require whole-word boundary',
+    ).toBe(false);
+  });
+
+  it('thread_text_mentions_search_query skips queries shorter than 4 chars (noise floor)', () => {
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: [
+        {
+          id: 'https://www.google.com/search?q=ai',
+          firstSeenAt: '2026-05-07T09:00:00.000Z',
+          lastSeenAt: '2026-05-07T09:05:00.000Z',
+          url: 'https://www.google.com/search?q=ai',
+          canonicalUrl: 'https://www.google.com/search?q=ai',
+          visitCount: 1,
+        },
+      ],
+      updatedAt: '2026-05-07T09:05:00.000Z',
+      entryCount: 1,
+    };
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        timelineDays: [day],
+        events: [
+          buildEvent({
+            seq: 1,
+            type: CAPTURE_RECORDED,
+            payload: {
+              bac_id: 'thread_a',
+              threadId: 'thread_a',
+              capturedAt: '2026-05-07T10:00:00.000Z',
+              turns: [{ ordinal: 0, role: 'user', text: 'I work on AI tooling' }],
+            },
+          }),
+        ],
+      }),
+    );
+    expect(
+      snap.edges.some((e) => e.kind === 'thread_text_mentions_search_query'),
+      'short queries should not connect everything',
+    ).toBe(false);
+  });
+
   it('determinism: same fixture in two event orders produces byte-identical snapshots', () => {
     const events: AcceptedEvent[] = [
       buildEvent({

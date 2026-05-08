@@ -505,7 +505,7 @@ const buildEvents = (): readonly AcceptedEvent[] => {
           {
             ordinal: 0,
             role: 'user',
-            text: `i'm reading ${URL_HN_COPYFAIL} plus the ${URL_XINT_BLOG} writeup. NVD says ${URL_NVD_CVE}. explain the socket angle.`,
+            text: `i'm reading ${URL_HN_COPYFAIL} plus the ${URL_XINT_BLOG} writeup. NVD says ${URL_NVD_CVE}. explain the linux copy_file_range CVE socket angle.`,
           },
           {
             ordinal: 1,

@@ -169,7 +169,16 @@ export const createConnectionsMaterializer = (
   };
 
   const awaitIdle: Materializer['awaitIdle'] = async () => {
-    while (running || dirty) {
+    // "Idle" = no in-flight drain AND no pending retry that the
+    // failure-cooldown gate isn't currently blocking. After a failed
+    // drain the materializer leaves dirty=true so the NEXT trigger
+    // retries; if no further trigger arrives, dirty stays true
+    // forever and a naive `while (running || dirty)` would spin
+    // forever even though work is permanently parked. Treat a
+    // sustained failure (lastError !== null AND no in-flight drain)
+    // as idle — callers checking `health()` see `status: 'failed'`
+    // and can act on it.
+    while (running || (dirty && lastError === null)) {
       await new Promise((r) => setTimeout(r, 5));
     }
   };

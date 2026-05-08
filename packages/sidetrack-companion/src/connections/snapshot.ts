@@ -17,6 +17,7 @@ import {
   isThreadUpsertedPayload,
 } from '../threads/events.js';
 import type { TimelineDayProjection } from '../timeline/projection.js';
+import { detectSearchUrl } from '../timeline/sanitize.js';
 import {
   WORKSTREAM_UPSERTED,
   isWorkstreamUpsertedPayload,
@@ -43,7 +44,7 @@ export type { ConnectionsSnapshot } from './types.js';
 // records. Same input → byte-equivalent output across replays and
 // replicas. No wall-clock, no inference, no time-proximity edges.
 //
-// Edge set (16 emitted, 17 declared):
+// Edge set (17 emitted, 18 declared):
 //   thread_in_workstream                 thread.primaryWorkstreamId
 //   workstream_parent_of                 workstream.parentId
 //   dispatch_from_thread                 dispatch record sourceThreadId
@@ -59,6 +60,8 @@ export type { ConnectionsSnapshot } from './types.js';
 //   dispatch_references_url              URL in dispatch.recorded body
 //   annotation_references_url            URL in annotation.created note
 //   thread_quotes_thread                 ≥40-char substring across capture turns
+//   thread_text_mentions_search_query    captured text contains a search-URL
+//                                         visit's query (whole-word match)
 //
 // `annotation_targets_workstream` is declared in the edge-kind union
 // for completeness but not yet emitted (workstream-anchored
@@ -692,6 +695,13 @@ export const buildConnectionsSnapshot = (
     trackObservedAt(day.updatedAt);
     for (const entry of day.entries) {
       const visitKey = stripFragmentAndTrailingSlash(entry.canonicalUrl ?? entry.url);
+      // Extract the search query from search-shaped URLs so pass 6
+      // can deterministically match it against captured turn text /
+      // dispatch bodies / annotation notes. Host-agnostic detection
+      // — see timeline/sanitize.ts:detectSearchUrl.
+      const searchInfo = detectSearchUrl(entry.canonicalUrl ?? entry.url);
+      const searchQuery =
+        searchInfo === null ? undefined : searchInfo.query.trim().toLowerCase();
       upsertNode(nodes, {
         kind: 'timeline-visit',
         key: visitKey,
@@ -703,6 +713,7 @@ export const buildConnectionsSnapshot = (
           title: entry.title,
           provider: entry.provider,
           visitCount: entry.visitCount,
+          ...(searchQuery === undefined ? {} : { searchQuery }),
         },
       });
       const threadId = threadIdByUrl.get(visitKey);
@@ -973,6 +984,117 @@ export const buildConnectionsSnapshot = (
         },
         confidence: 'deterministic',
       });
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Pass 6 — search-query content match. For each timeline-visit node
+  // with a `metadata.searchQuery` (set in pass 3 from generic search-
+  // URL detection), scan every CAPTURE_RECORDED turn / DISPATCH_RECORDED
+  // body / ANNOTATION_CREATED note. Emit `thread_text_mentions_search_query`
+  // when the query appears as a whole-word substring (case-insensitive).
+  // Closes the "I searched X and asked the AI about X without pasting
+  // the URL" gap.
+  //
+  // Min query length 4 chars to avoid noisy matches from common short
+  // queries like "ai" or "ml" that would connect everywhere.
+  // -------------------------------------------------------------------
+  const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  interface SearchVisitInfo {
+    readonly visitNodeId: string;
+    readonly query: string; // lowercased + trimmed
+    readonly observedAt: string;
+  }
+  const searchVisits: SearchVisitInfo[] = [];
+  for (const node of nodes.values()) {
+    if (node.kind !== 'timeline-visit') continue;
+    const q = node.metadata['searchQuery'];
+    if (typeof q !== 'string' || q.trim().length < 4) continue;
+    searchVisits.push({
+      visitNodeId: node.id,
+      query: q.trim().toLowerCase(),
+      observedAt: node.lastSeenAt ?? '',
+    });
+  }
+  if (searchVisits.length > 0) {
+    // Pre-compile a regex per query (whole-word match,
+    // case-insensitive). Reused across every event scan.
+    const compiledQueries = searchVisits.map((sv) => ({
+      ...sv,
+      regex: new RegExp(`\\b${escapeRegex(sv.query)}\\b`, 'iu'),
+    }));
+    const matchTextAgainstQueries = (
+      fromNodeId: string,
+      text: string,
+      observedAt: string,
+      eventType: string,
+      replicaId: string | undefined,
+      seq: number | undefined,
+    ): void => {
+      if (text.length === 0) return;
+      for (const cq of compiledQueries) {
+        if (!cq.regex.test(text)) continue;
+        upsertEdge(edges, {
+          kind: 'thread_text_mentions_search_query',
+          fromNodeId,
+          toNodeId: cq.visitNodeId,
+          observedAt: observedAt > cq.observedAt ? observedAt : cq.observedAt,
+          producedBy: {
+            source: 'event-log',
+            eventType,
+            ...(replicaId === undefined || seq === undefined
+              ? {}
+              : { dot: { replicaId, seq } }),
+          },
+          confidence: 'deterministic',
+        });
+      }
+    };
+    for (const event of input.events) {
+      const observedAtIso = new Date(event.acceptedAtMs).toISOString();
+      const replicaId = event.dot.replicaId;
+      const seq = event.dot.seq;
+      if (event.type === CAPTURE_RECORDED && isCaptureRecordedPayload(event.payload)) {
+        const p = event.payload;
+        const threadKey = p.threadId ?? p.bac_id;
+        const threadNodeId = nodeIdFor('thread', threadKey);
+        for (const turn of p.turns ?? []) {
+          for (const source of [turn.text, turn.markdown, turn.formattedText]) {
+            if (typeof source !== 'string' || source.length === 0) continue;
+            matchTextAgainstQueries(
+              threadNodeId,
+              source,
+              observedAtIso,
+              CAPTURE_RECORDED,
+              replicaId,
+              seq,
+            );
+          }
+        }
+      } else if (event.type === DISPATCH_RECORDED && isDispatchRecordedPayload(event.payload)) {
+        const p = event.payload;
+        matchTextAgainstQueries(
+          nodeIdFor('dispatch', p.bac_id),
+          p.body,
+          observedAtIso,
+          DISPATCH_RECORDED,
+          replicaId,
+          seq,
+        );
+      } else if (
+        event.type === ANNOTATION_CREATED &&
+        isAnnotationCreatedPayload(event.payload)
+      ) {
+        const p = event.payload;
+        matchTextAgainstQueries(
+          nodeIdFor('annotation', p.bac_id),
+          p.note,
+          observedAtIso,
+          ANNOTATION_CREATED,
+          replicaId,
+          seq,
+        );
+      }
     }
   }
 

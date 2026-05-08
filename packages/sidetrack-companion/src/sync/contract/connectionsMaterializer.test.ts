@@ -201,6 +201,69 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     expect(m.health().status).toBe('healthy');
   });
 
+  it('awaitIdle does not hang when a drain has parked the materializer in a failed state', async () => {
+    // Regression for the dirty=true-after-failure trap. After a
+    // failed drain the materializer leaves dirty=true so the next
+    // trigger retries; if no further trigger arrives, dirty stays
+    // true forever and the failure cooldown blocks the SW-level
+    // retry. A naive `while (running || dirty)` loop in awaitIdle
+    // would wait forever even though work is permanently parked.
+    // Updated awaitIdle treats lastError !== null + no in-flight
+    // drain as idle so callers can fall through to health() and
+    // surface 'failed' rather than hang.
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = {
+      putCurrent: async (
+        snapshot: import('../../connections/snapshot.js').ConnectionsSnapshot,
+      ) => {
+        void snapshot;
+        throw new Error('disk wedged');
+      },
+      readCurrent: async () => null,
+      putDay: async () => undefined,
+      readDay: async () => null,
+      listDays: async () => [],
+    };
+    const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store });
+
+    const event = buildEvent({
+      seq: 1,
+      type: THREAD_UPSERTED,
+      payload: {
+        bac_id: 'thread_a',
+        provider: 'chatgpt',
+        threadUrl: 'https://x/a',
+        title: 'A',
+        lastSeenAt: '2026-05-07T10:00:00.000Z',
+        tags: [],
+      },
+    });
+    await eventLog.importPeerEvent(event);
+    m.onAccepted(event, { origin: 'peer' });
+
+    // awaitIdle must resolve within a reasonable bound — the bug
+    // would have it spin forever at 5 ms intervals waiting for
+    // dirty to clear (which never happens without another trigger
+    // because the failure cooldown blocks retries).
+    const start = Date.now();
+    await Promise.race([
+      m.awaitIdle(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('awaitIdle hung past 1s')), 1_000),
+      ),
+    ]);
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeLessThan(1_000);
+
+    // health() reports the failure so callers know not to trust
+    // the snapshot.
+    const health = m.health();
+    expect(health.status).toBe('failed');
+    expect(health.lastError).toContain('disk wedged');
+  });
+
   it('handles set covers expected event types', async () => {
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);

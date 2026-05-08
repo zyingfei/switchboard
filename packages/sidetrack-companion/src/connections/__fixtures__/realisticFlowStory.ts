@@ -314,7 +314,7 @@ const buildEvents = (): readonly AcceptedEvent[] => {
         {
           ordinal: 0,
           role: 'user',
-          text: `i'm reading ${URL_A_HN} about copy-fail. main writeup is ${URL_A_BLOG}. PoC at ${URL_A_GITHUB_POC}. explain the crypto subsystem angle.`,
+          text: `i'm reading ${URL_A_HN} about copy-fail. main writeup is ${URL_A_BLOG}. PoC at ${URL_A_GITHUB_POC}. explain the Linux crypto subsystem angle.`,
           capturedAt: '2026-05-07T10:15:00.000Z',
         },
         {

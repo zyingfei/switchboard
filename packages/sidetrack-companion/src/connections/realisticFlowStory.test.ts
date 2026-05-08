@@ -102,13 +102,19 @@ describe('connections — realistic two-flow narration (CVE + Switchboard)', () 
     for (const id of REALISTIC_FLOW_A_NODES.threads) expect(ids.has(id)).toBe(false);
   });
 
-  it('Google search visit anchor surfaces zero connections (ambient gap)', () => {
+  it('Google search visit anchor — search-query closure connects it to the ChatGPT thread', () => {
+    // BEFORE the search-query closure: this anchor returned zero
+    // edges because the search URL was never pasted into the chat
+    // and was uniquely-keyed by tracking params (sca_esv, sxsrf,
+    // etc.). AFTER: the chat user turn says "Linux crypto subsystem"
+    // verbatim, the visit's metadata.searchQuery extracts the same
+    // string, and pass 6 emits thread_text_mentions_search_query
+    // even though the user never pasted the URL.
     const sub = subgraphForNode(snap, REALISTIC_FLOW_A_NODES.visits.googleSearch, 1);
-    // The anchor itself is included; everything else is empty since
-    // the search URL was never pasted into a chat. This is the
-    // "ambient browsing not connected" case.
-    expect(sub.nodes.map((n) => n.id)).toEqual([REALISTIC_FLOW_A_NODES.visits.googleSearch]);
-    expect(sub.edges.length).toBe(0);
+    const ids = new Set(sub.nodes.map((n) => n.id));
+    expect(ids.has(REALISTIC_FLOW_A_NODES.visits.googleSearch)).toBe(true);
+    expect(ids.has(REALISTIC_FLOW_A_NODES.threads[0])).toBe(true);
+    expect(sub.edges.some((e) => e.kind === 'thread_text_mentions_search_query')).toBe(true);
   });
 
   it('YouTube visit anchor surfaces zero connections (ambient gap)', () => {

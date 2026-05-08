@@ -167,6 +167,21 @@
         }
       },
       {
+        "id": "timeline-visit:https://www.google.com/search?q=linux+copy_file_range+CVE",
+        "kind": "timeline-visit",
+        "label": "Google: linux copy_file_range CVE",
+        "firstSeenAt": "2026-05-07T09:08:00.000Z",
+        "lastSeenAt": "2026-05-07T09:08:00.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "canonicalUrl": "https://www.google.com/search?q=linux+copy_file_range+CVE",
+          "searchQuery": "linux copy_file_range cve",
+          "title": "Google: linux copy_file_range CVE",
+          "url": "https://www.google.com/search?q=linux+copy_file_range+CVE",
+          "visitCount": 1
+        }
+      },
+      {
         "id": "timeline-visit:https://xint.io/blog/copy-fail-linux-distributions",
         "kind": "timeline-visit",
         "label": "copy-fail across linux distros",
@@ -447,6 +462,22 @@
         "confidence": "deterministic"
       },
       {
+        "id": "edge:thread_text_mentions_search_query:thread:t_cve_claude:timeline-visit:https://www.google.com/search?q=linux+copy_file_range+CVE",
+        "kind": "thread_text_mentions_search_query",
+        "fromNodeId": "thread:t_cve_claude",
+        "toNodeId": "timeline-visit:https://www.google.com/search?q=linux+copy_file_range+CVE",
+        "observedAt": "2026-05-07T09:18:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "capture.recorded",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 17
+          }
+        },
+        "confidence": "deterministic"
+      },
+      {
         "id": "edge:timeline_same_url_as_thread:timeline-visit:https://chatgpt.com/c/cve_review:thread:t_cve_chatgpt",
         "kind": "timeline_same_url_as_thread",
         "fromNodeId": "timeline-visit:https://chatgpt.com/c/cve_review",
@@ -482,7 +513,7 @@
       }
     ],
     "updatedAt": "2026-05-07T09:42:00.000Z",
-    "nodeCount": 14,
-    "edgeCount": 19
+    "nodeCount": 15,
+    "edgeCount": 20
   }
 }

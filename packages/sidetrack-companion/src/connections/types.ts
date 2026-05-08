@@ -90,7 +90,12 @@ export type ConnectionEdgeKind =
   | 'annotation_references_url'
   // Cross-thread substring quote (one captured turn contains a
   // ≥40-char substring of another captured turn's text).
-  | 'thread_quotes_thread';
+  | 'thread_quotes_thread'
+  // Search-query content match: a thread / dispatch / annotation
+  // text contains the search query embedded in a tracked search-URL
+  // visit (whole-word, case-insensitive). Closes the "I searched X
+  // and asked the AI about X without pasting the URL" gap.
+  | 'thread_text_mentions_search_query';
 
 export type ConnectionEdgeSource =
   | 'event-log'
