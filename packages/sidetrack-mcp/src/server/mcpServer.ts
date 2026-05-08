@@ -236,6 +236,14 @@ export interface SidetrackMcpReader {
   readonly readDispatches: (options?: DispatchReadOptions) => Promise<DispatchReadResult>;
   readonly readReviews: (options?: ReviewReadOptions) => Promise<ReviewReadResult>;
   readonly readTurns: (options: TurnsReadOptions) => Promise<TurnsReadResult>;
+  // Companion-projected Connections graph snapshot. Returns null
+  // when the materializer hasn't run (no `_BAC/connections/current.json`
+  // file yet); the connections tools surface that as
+  // `note: 'No connections snapshot yet — the materializer has not run.'`.
+  // Optional so older reader stubs (e.g. test fixtures) keep
+  // working — when omitted, connections tools behave as if there's
+  // no snapshot.
+  readonly readConnectionsSnapshot?: () => Promise<unknown | null>;
 }
 
 const toolText = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`;
@@ -884,6 +892,234 @@ export const createSidetrackMcpServer = (
         data: result.data,
         ...(result.cursor === undefined ? {} : { cursor: result.cursor }),
       });
+    },
+  );
+
+  // ---------------------------------------------------------------
+  // Connections — read-only evidence-graph queries.
+  //
+  // The companion's Class B `connections` materializer projects a
+  // deterministic graph snapshot at _BAC/connections/current.json.
+  // These tools read it directly from the vault. No writes, no
+  // recommendations, no LLM inference — they expose the same edges
+  // already visible at GET /v1/connections.
+  //
+  // Local subgraph + path expansion runs in-process here so the
+  // tools work offline (vault-only mode); when the materializer
+  // hasn't run yet, every tool returns an empty / not-found result
+  // honestly.
+  // ---------------------------------------------------------------
+
+  // Local helpers — kept simple and isolated to this scope. The
+  // companion has the canonical `subgraphForNode` + `findPath`
+  // implementations; we mirror them here against the snapshot
+  // shape (loose typing because the snapshot is unknown JSON from
+  // the vault).
+  const readSnapshotOrNull = async (): Promise<{
+    nodes: { id: string; [k: string]: unknown }[];
+    edges: { id: string; fromNodeId: string; toNodeId: string; [k: string]: unknown }[];
+    [k: string]: unknown;
+  } | null> => {
+    if (reader.readConnectionsSnapshot === undefined) return null;
+    const raw = await reader.readConnectionsSnapshot();
+    if (raw === null || typeof raw !== 'object') return null;
+    const obj = raw as { nodes?: unknown; edges?: unknown };
+    if (!Array.isArray(obj.nodes) || !Array.isArray(obj.edges)) return null;
+    return raw as never;
+  };
+
+  server.registerTool(
+    'sidetrack.connections.snapshot',
+    {
+      description:
+        'Return the companion-projected Connections graph snapshot. Read-only; deterministic; no inference.',
+      inputSchema: {
+        workstreamId: z.string().optional(),
+        nodeKind: z.string().optional(),
+        edgeKind: z.string().optional(),
+      },
+    },
+    async ({ workstreamId, nodeKind, edgeKind }) => {
+      const snap = await readSnapshotOrNull();
+      if (snap === null) {
+        return asStructuredContent({
+          scope: 'companion-extended',
+          snapshot: { nodes: [], edges: [], nodeCount: 0, edgeCount: 0, updatedAt: '1970-01-01T00:00:00.000Z', scope: {} },
+          note: 'No connections snapshot yet — the materializer has not run.',
+        });
+      }
+      let nodes = snap.nodes;
+      let edges = snap.edges;
+      if (workstreamId !== undefined) {
+        const wsId = `workstream:${workstreamId}`;
+        const keep = new Set<string>([wsId]);
+        for (const n of nodes) {
+          const meta = (n as { metadata?: { workstreamId?: string } }).metadata;
+          if (meta?.workstreamId === workstreamId) keep.add(n.id);
+        }
+        for (const e of edges) {
+          if (keep.has(e.fromNodeId)) keep.add(e.toNodeId);
+          if (keep.has(e.toNodeId)) keep.add(e.fromNodeId);
+        }
+        nodes = nodes.filter((n) => keep.has(n.id));
+        edges = edges.filter((e) => keep.has(e.fromNodeId) && keep.has(e.toNodeId));
+      }
+      if (nodeKind !== undefined) {
+        nodes = nodes.filter((n) => (n as { kind?: string }).kind === nodeKind);
+        const kept = new Set(nodes.map((n) => n.id));
+        edges = edges.filter((e) => kept.has(e.fromNodeId) && kept.has(e.toNodeId));
+      }
+      if (edgeKind !== undefined) {
+        edges = edges.filter((e) => (e as { kind?: string }).kind === edgeKind);
+      }
+      return asStructuredContent({
+        scope: 'companion-extended',
+        snapshot: {
+          ...snap,
+          nodes,
+          edges,
+          nodeCount: nodes.length,
+          edgeCount: edges.length,
+        },
+      });
+    },
+  );
+
+  server.registerTool(
+    'sidetrack.connections.neighbors',
+    {
+      description: 'Return the BFS subgraph around an anchor node (default 1 hop, max 4).',
+      inputSchema: {
+        nodeId: z.string().min(1),
+        hops: z.number().int().min(0).max(4).optional(),
+      },
+    },
+    async ({ nodeId, hops }) => {
+      const snap = await readSnapshotOrNull();
+      if (snap === null) {
+        return asStructuredContent({
+          scope: 'companion-extended',
+          snapshot: { nodes: [], edges: [], nodeCount: 0, edgeCount: 0, updatedAt: '1970-01-01T00:00:00.000Z', scope: { nodeId, hops: hops ?? 1 } },
+          note: 'No connections snapshot yet.',
+        });
+      }
+      const limit = Math.min(Math.max(hops ?? 1, 0), 4);
+      const visited = new Set<string>([nodeId]);
+      let frontier = new Set<string>([nodeId]);
+      const keptEdges = new Map<string, (typeof snap.edges)[number]>();
+      for (let h = 0; h < limit; h += 1) {
+        const next = new Set<string>();
+        for (const e of snap.edges) {
+          if (frontier.has(e.fromNodeId) && !visited.has(e.toNodeId)) {
+            keptEdges.set(e.id, e);
+            next.add(e.toNodeId);
+          }
+          if (frontier.has(e.toNodeId) && !visited.has(e.fromNodeId)) {
+            keptEdges.set(e.id, e);
+            next.add(e.fromNodeId);
+          }
+          if (visited.has(e.fromNodeId) && visited.has(e.toNodeId)) {
+            keptEdges.set(e.id, e);
+          }
+        }
+        for (const id of next) visited.add(id);
+        frontier = next;
+        if (frontier.size === 0) break;
+      }
+      const nodeMap = new Map(snap.nodes.map((n) => [n.id, n] as const));
+      const subNodes = [...visited]
+        .map((id) => nodeMap.get(id))
+        .filter((n): n is NonNullable<typeof n> => n !== undefined)
+        .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+      const subEdges = [...keptEdges.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+      return asStructuredContent({
+        scope: 'companion-extended',
+        snapshot: {
+          scope: { nodeId, hops: limit },
+          nodes: subNodes,
+          edges: subEdges,
+          updatedAt: (snap as { updatedAt?: string }).updatedAt ?? '1970-01-01T00:00:00.000Z',
+          nodeCount: subNodes.length,
+          edgeCount: subEdges.length,
+        },
+      });
+    },
+  );
+
+  server.registerTool(
+    'sidetrack.connections.edge',
+    {
+      description: 'Return a single edge with its provenance (which event/store produced it).',
+      inputSchema: { edgeId: z.string().min(1) },
+    },
+    async ({ edgeId }) => {
+      const snap = await readSnapshotOrNull();
+      if (snap === null) {
+        return asStructuredContent({ found: false, reason: 'no-snapshot' });
+      }
+      const edge = snap.edges.find((e) => e.id === edgeId);
+      if (edge === undefined) {
+        return asStructuredContent({ found: false, reason: 'edge-not-found' });
+      }
+      return asStructuredContent({ found: true, edge });
+    },
+  );
+
+  server.registerTool(
+    'sidetrack.connections.find_path',
+    {
+      description: 'BFS over undirected edges; returns the first path between two nodes or {found:false}.',
+      inputSchema: {
+        fromNodeId: z.string().min(1),
+        toNodeId: z.string().min(1),
+        maxHops: z.number().int().min(1).max(8).optional(),
+      },
+    },
+    async ({ fromNodeId, toNodeId, maxHops }) => {
+      const snap = await readSnapshotOrNull();
+      if (snap === null) return asStructuredContent({ found: false });
+      const limit = Math.min(Math.max(maxHops ?? 4, 1), 8);
+      if (fromNodeId === toNodeId) {
+        const node = snap.nodes.find((n) => n.id === fromNodeId);
+        if (node !== undefined) return asStructuredContent({ found: true, nodes: [node], edges: [] });
+        return asStructuredContent({ found: false });
+      }
+      const adjacency = new Map<string, (typeof snap.edges)[number][]>();
+      for (const e of snap.edges) {
+        const a = adjacency.get(e.fromNodeId) ?? [];
+        a.push(e);
+        adjacency.set(e.fromNodeId, a);
+        const b = adjacency.get(e.toNodeId) ?? [];
+        b.push(e);
+        adjacency.set(e.toNodeId, b);
+      }
+      const queue: { id: string; pathNodes: string[]; pathEdges: typeof snap.edges }[] = [
+        { id: fromNodeId, pathNodes: [fromNodeId], pathEdges: [] as typeof snap.edges },
+      ];
+      const visited = new Set<string>([fromNodeId]);
+      while (queue.length > 0) {
+        const { id, pathNodes, pathEdges } = queue.shift()!;
+        if (pathEdges.length >= limit) continue;
+        for (const e of adjacency.get(id) ?? []) {
+          const other = e.fromNodeId === id ? e.toNodeId : e.fromNodeId;
+          if (visited.has(other)) continue;
+          visited.add(other);
+          const nextNodes = [...pathNodes, other];
+          const nextEdges = [...pathEdges, e];
+          if (other === toNodeId) {
+            const nodeMap = new Map(snap.nodes.map((n) => [n.id, n] as const));
+            return asStructuredContent({
+              found: true,
+              nodes: nextNodes
+                .map((nid) => nodeMap.get(nid))
+                .filter((n): n is NonNullable<typeof n> => n !== undefined),
+              edges: nextEdges,
+            });
+          }
+          queue.push({ id: other, pathNodes: nextNodes, pathEdges: nextEdges });
+        }
+      }
+      return asStructuredContent({ found: false });
     },
   );
 

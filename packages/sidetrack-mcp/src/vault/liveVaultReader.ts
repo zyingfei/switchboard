@@ -318,6 +318,21 @@ const readReviewFile = async (path: string): Promise<ReviewEvent[]> => {
 export class LiveVaultReader {
   constructor(private readonly vaultPath: string) {}
 
+  // Companion-projected Connections graph snapshot. Returns null
+  // when the materializer hasn't run yet (no current.json file).
+  // The shape mirrors `ConnectionsSnapshot` from the companion's
+  // connections module — kept loose here so the MCP package
+  // doesn't need to import companion types.
+  async readConnectionsSnapshot(): Promise<unknown | null> {
+    try {
+      const path = ensureInsideRoot(this.vaultPath, '_BAC/connections/current.json');
+      const raw = await readFile(path, 'utf8');
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
   async readSnapshot(): Promise<LiveVaultSnapshot> {
     const [threads, workstreams, queueItems, reminders, events] = await Promise.all([
       readJsonDirectory(this.vaultPath, '_BAC/threads', threadSchema),
