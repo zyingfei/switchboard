@@ -1,0 +1,18 @@
+{
+  "topic": {
+    "id": "topic:solo",
+    "label": "Solo topic",
+    "cohesion": 0.5,
+    "memberCount": 1
+  },
+  "threads": [],
+  "dispatches": [],
+  "snippets": [],
+  "userNotes": [
+    {
+      "id": "note:declarative",
+      "authoredBy": "user",
+      "text": "This note is declarative only."
+    }
+  ]
+}
