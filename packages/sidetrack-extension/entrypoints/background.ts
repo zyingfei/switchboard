@@ -41,8 +41,28 @@ import { drainReviewDraftOutbox } from '../src/review/outbox';
 import {
   initializeTimelineWiring,
   resetTimelineWiringForTests,
+  TIMELINE_ENABLED_KEY,
+  TIMELINE_PRIVACY_GATE,
   triggerTimelineDrain,
 } from '../src/timeline/wiring';
+import {
+  createTabOpenerStore,
+  registerTabLifecycleListeners,
+} from '../src/background/listeners/tabs';
+import { registerDefaultWebNavigationListeners } from '../src/background/listeners/web-navigation';
+import { IndexedDbEventBuffer } from '../src/background/storage/indexeddb-event-buffer';
+import {
+  createEngagementCache,
+  isEngagementIntervalMessage,
+  type EngagementIntervalObservedPayload,
+  type EngagementSessionAggregatedPayload,
+} from '../src/background/state/engagementCache';
+import {
+  isSelectionLineageMessage,
+  type SelectionCopiedPayload,
+  type SelectionPastedPayload,
+} from '../src/content/engagement/copy-paste';
+import { allocateNextSeq, loadOrCreateEdgeReplica } from '../src/sync/edgeReplicaId';
 import { createVaultChangesClient } from '../src/companion/vaultChanges';
 import { createRecallClient } from '../src/companion/recallClient';
 import { buildReviewFollowUpText } from '../src/review/draft';
@@ -256,6 +276,195 @@ const hostFromUrl = (url: string): string => {
   } catch {
     return 'current tab';
   }
+};
+
+const PRIVACY_GATE_FLIPPED = 'privacy.gate.flipped';
+const PRIVACY_PERMISSION_GRANTED = 'privacy.permission.granted';
+const PRIVACY_PERMISSION_REVOKED = 'privacy.permission.revoked';
+const TIMELINE_HOST_PERMISSION = 'timeline.hostAccess';
+const TIMELINE_HOST_PERMISSION_SCOPE = { origins: ['https://*/*', 'http://*/*'] } as const;
+const ENGAGEMENT_PRIVACY_GATE = 'engagement';
+const ENGAGEMENT_CONTENT_SCRIPT_ID = 'sidetrack-engagement';
+const ENGAGEMENT_CONTENT_SCRIPT_FILE = 'engagement.js';
+const ENGAGEMENT_HOST_ORIGINS = ['https://*/*', 'http://*/*'];
+
+interface PrivacyProjectionPayload {
+  readonly gateStates?: Record<string, 'open' | 'closed'>;
+  readonly gateEventCount?: number;
+}
+
+const isObjectRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const readTimelineCompanionConfig = async (): Promise<{ url: string; bridgeKey: string } | null> => {
+  const settings = await readSettings();
+  const port = settings.companion.port;
+  const bridgeKey = settings.companion.bridgeKey.trim();
+  if (typeof port !== 'number' || port <= 0 || bridgeKey.length === 0) return null;
+  return { url: `http://127.0.0.1:${String(port)}`, bridgeKey };
+};
+
+const companionJson = async (
+  path: string,
+  init: RequestInit = {},
+): Promise<unknown> => {
+  const config = await readTimelineCompanionConfig();
+  if (config === null) throw new Error('companion not configured');
+  const headers = new Headers(init.headers);
+  headers.set('content-type', 'application/json');
+  headers.set('x-bac-bridge-key', config.bridgeKey);
+  const response = await fetch(`${config.url}${path}`, { ...init, headers });
+  const body = (await response.json()) as unknown;
+  if (!response.ok) {
+    const message = isObjectRecord(body) && typeof body['title'] === 'string'
+      ? body['title']
+      : `companion HTTP ${String(response.status)}`;
+    throw new Error(message);
+  }
+  return body;
+};
+
+const readPrivacyProjection = async (): Promise<PrivacyProjectionPayload> => {
+  const body = await companionJson('/v1/privacy/projection', { method: 'GET' });
+  const data = isObjectRecord(body) ? body['data'] : undefined;
+  if (!isObjectRecord(data)) return {};
+  const gateStates = isObjectRecord(data['gateStates']) ? data['gateStates'] : undefined;
+  return {
+    ...(gateStates === undefined ? {} : { gateStates: gateStates as Record<string, 'open' | 'closed'> }),
+    ...(typeof data['gateEventCount'] === 'number' ? { gateEventCount: data['gateEventCount'] } : {}),
+  };
+};
+
+const isTimelinePrivacyGateOpen = async (): Promise<boolean> => {
+  try {
+    const projection = await readPrivacyProjection();
+    return projection.gateStates?.[TIMELINE_PRIVACY_GATE] === 'open';
+  } catch {
+    return false;
+  }
+};
+
+const isEngagementPrivacyGateOpen = async (): Promise<boolean> => {
+  try {
+    const projection = await readPrivacyProjection();
+    return projection.gateStates?.[ENGAGEMENT_PRIVACY_GATE] === 'open';
+  } catch {
+    return false;
+  }
+};
+
+const hasEngagementHostPermission = async (): Promise<boolean> => {
+  try {
+    return await new Promise<boolean>((resolve) => {
+      chrome.permissions.contains({ origins: [...ENGAGEMENT_HOST_ORIGINS] }, (granted) => {
+        resolve(Boolean(granted));
+      });
+    });
+  } catch {
+    return false;
+  }
+};
+
+const syncEngagementContentScriptRegistration = async (): Promise<void> => {
+  const shouldRegister = (await isEngagementPrivacyGateOpen()) && (await hasEngagementHostPermission());
+  const registered = await chrome.scripting.getRegisteredContentScripts({
+    ids: [ENGAGEMENT_CONTENT_SCRIPT_ID],
+  });
+  const alreadyRegistered = registered.length > 0;
+  if (shouldRegister && !alreadyRegistered) {
+    await chrome.scripting.registerContentScripts([
+      {
+        id: ENGAGEMENT_CONTENT_SCRIPT_ID,
+        matches: [...ENGAGEMENT_HOST_ORIGINS],
+        js: [ENGAGEMENT_CONTENT_SCRIPT_FILE],
+        runAt: 'document_idle',
+        persistAcrossSessions: true,
+      },
+    ]);
+    return;
+  }
+  if (!shouldRegister && alreadyRegistered) {
+    await chrome.scripting.unregisterContentScripts({ ids: [ENGAGEMENT_CONTENT_SCRIPT_ID] });
+  }
+};
+
+const appendPrivacyEvent = async (
+  type: string,
+  payload: Record<string, unknown>,
+  idempotencySuffix: string,
+): Promise<void> => {
+  await companionJson('/v1/privacy/events', {
+    method: 'POST',
+    headers: { 'idempotency-key': idempotencyKey('privacy', idempotencySuffix) },
+    body: JSON.stringify({ type, payload }),
+  });
+};
+
+const readLegacyTimelineEnabled = async (): Promise<boolean | undefined> => {
+  try {
+    const got = await chrome.storage.local.get(TIMELINE_ENABLED_KEY);
+    const value = got[TIMELINE_ENABLED_KEY];
+    return typeof value === 'boolean' ? value : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const bootstrapTimelinePrivacyGate = async (): Promise<void> => {
+  const legacyTimelineEnabled = await readLegacyTimelineEnabled();
+  if (legacyTimelineEnabled === undefined) return;
+  const projection = await readPrivacyProjection();
+  if (projection.gateStates?.[TIMELINE_PRIVACY_GATE] !== undefined) return;
+  await appendPrivacyEvent(
+    PRIVACY_GATE_FLIPPED,
+    {
+      gate: TIMELINE_PRIVACY_GATE,
+      state: legacyTimelineEnabled ? 'open' : 'closed',
+      actor: 'system',
+      reason: 'migration-shim',
+      payloadVersion: 1,
+    },
+    `migration-${TIMELINE_PRIVACY_GATE}`,
+  );
+};
+
+const setTimelinePrivacyGate = async (enabled: boolean): Promise<void> => {
+  await appendPrivacyEvent(
+    PRIVACY_GATE_FLIPPED,
+    {
+      gate: TIMELINE_PRIVACY_GATE,
+      state: enabled ? 'open' : 'closed',
+      actor: 'user',
+      reason: 'user-toggle',
+      payloadVersion: 1,
+    },
+    `${TIMELINE_PRIVACY_GATE}-${enabled ? 'open' : 'closed'}-${String(Date.now())}`,
+  );
+};
+
+const recordTimelinePermissionGranted = async (): Promise<void> => {
+  await appendPrivacyEvent(
+    PRIVACY_PERMISSION_GRANTED,
+    {
+      permission: TIMELINE_HOST_PERMISSION,
+      scope: TIMELINE_HOST_PERMISSION_SCOPE,
+      payloadVersion: 1,
+    },
+    `${TIMELINE_HOST_PERMISSION}-granted-${String(Date.now())}`,
+  );
+};
+
+const recordTimelinePermissionRevoked = async (): Promise<void> => {
+  await appendPrivacyEvent(
+    PRIVACY_PERMISSION_REVOKED,
+    {
+      permission: TIMELINE_HOST_PERMISSION,
+      scope: TIMELINE_HOST_PERMISSION_SCOPE,
+      retroactiveMask: false,
+      payloadVersion: 1,
+    },
+    `${TIMELINE_HOST_PERMISSION}-revoked-${String(Date.now())}`,
+  );
 };
 
 const notifyCaptureSuccess = async (event: CaptureEvent): Promise<void> => {
@@ -2491,6 +2700,92 @@ const detectCodingAttachForTab = async (tabId: number, url: string): Promise<voi
 };
 
 export default defineBackground(() => {
+  const tabOpenerStore = createTabOpenerStore();
+  registerTabLifecycleListeners(chrome.tabs, tabOpenerStore);
+  registerDefaultWebNavigationListeners(tabOpenerStore);
+
+  const engagementEventBuffer = new IndexedDbEventBuffer();
+  let engagementRuntimePromise:
+    | Promise<{
+        readonly edgeReplicaId: string;
+        readonly cache: ReturnType<typeof createEngagementCache>;
+      }>
+    | null = null;
+  const engagementRuntime = async (): Promise<{
+    readonly edgeReplicaId: string;
+    readonly cache: ReturnType<typeof createEngagementCache>;
+  }> => {
+    if (engagementRuntimePromise !== null) return engagementRuntimePromise;
+    engagementRuntimePromise = (async () => {
+      const replica = await loadOrCreateEdgeReplica();
+      return {
+        edgeReplicaId: replica.edgeReplicaId,
+        cache: createEngagementCache({ sessionId: `session:${replica.edgeReplicaId}` }),
+      };
+    })();
+    return engagementRuntimePromise;
+  };
+
+  const appendEngagementEvents = async (
+    payloads: readonly {
+      readonly streamName: 'engagement.interval.observed' | 'engagement.session.aggregated';
+      readonly payload: EngagementIntervalObservedPayload | EngagementSessionAggregatedPayload;
+    }[],
+  ): Promise<void> => {
+    if (payloads.length === 0) return;
+    const allocated = await allocateNextSeq(payloads.length);
+    const observedAt = new Date().toISOString();
+    await engagementEventBuffer.appendMany(
+      payloads.map((event, index) => ({
+        streamName: event.streamName,
+        lamport: allocated.fromSeq + index,
+        replicaId: allocated.edgeReplicaId,
+        payload: event.payload,
+        observedAt,
+      })),
+    );
+  };
+
+  const handleEngagementInterval = async (message: unknown, tabId: number | undefined): Promise<void> => {
+    if (tabId === undefined || !isEngagementIntervalMessage(message)) return;
+    const runtime = await engagementRuntime();
+    const merged = runtime.cache.mergeInterval(tabId, message);
+    const payloads: {
+      readonly streamName: 'engagement.interval.observed' | 'engagement.session.aggregated';
+      readonly payload: EngagementIntervalObservedPayload | EngagementSessionAggregatedPayload;
+    }[] = [{ streamName: 'engagement.interval.observed', payload: merged.interval }];
+    if (message.final) {
+      payloads.push({ streamName: 'engagement.session.aggregated', payload: merged.aggregate });
+    }
+    await appendEngagementEvents(payloads);
+  };
+
+  const finalizeEngagementForTab = async (tabId: number): Promise<void> => {
+    const runtime = await engagementRuntime();
+    const finalized = runtime.cache.finalizeTab(tabId, Date.now());
+    if (finalized === null) return;
+    await appendEngagementEvents([
+      { streamName: 'engagement.interval.observed', payload: finalized.interval },
+      { streamName: 'engagement.session.aggregated', payload: finalized.aggregate },
+    ]);
+  };
+
+  const handleSelectionLineage = async (message: unknown): Promise<void> => {
+    if (!isSelectionLineageMessage(message)) return;
+    const allocated = await allocateNextSeq(1);
+    const streamName =
+      message.type === 'sidetrack.selection.copied' ? 'selection.copied' : 'selection.pasted';
+    await engagementEventBuffer.appendMany([
+      {
+        streamName,
+        lamport: allocated.fromSeq,
+        replicaId: allocated.edgeReplicaId,
+        payload: message.payload as SelectionCopiedPayload | SelectionPastedPayload,
+        observedAt: new Date().toISOString(),
+      },
+    ]);
+  };
+
   // Drop reminders bound to thread bac_ids that no longer exist.
   // Cleanup pass for the historical mess caused by the pre-fix
   // sendToCompanion bug (every capture reissued a thread bac_id;
@@ -2534,6 +2829,7 @@ export default defineBackground(() => {
     void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => undefined);
     void pruneOrphanRemindersAndLinks();
     void ensureDispatchPollAlarm();
+    void syncEngagementContentScriptRegistration().catch(() => undefined);
     // Heal pre-existing tabs after an install/update/reload so the
     // user doesn't have to refresh each chat tab manually. The first
     // install case is harmless: matching tabs that already had no
@@ -2554,6 +2850,31 @@ export default defineBackground(() => {
     void pruneOrphanRemindersAndLinks();
     void reinjectContentScriptIntoOpenTabs();
     void ensureDispatchPollAlarm();
+    void syncEngagementContentScriptRegistration().catch(() => undefined);
+  });
+  void syncEngagementContentScriptRegistration().catch(() => undefined);
+
+  chrome.permissions.onAdded.addListener(() => {
+    void syncEngagementContentScriptRegistration().catch(() => undefined);
+  });
+  chrome.permissions.onRemoved.addListener(() => {
+    void syncEngagementContentScriptRegistration().catch(() => undefined);
+  });
+  chrome.idle.onStateChanged.addListener((state) => {
+    void (async () => {
+      const tabs = await chrome.tabs.query({ url: [...ENGAGEMENT_HOST_ORIGINS] });
+      await Promise.all(
+        tabs.map(async (tab) => {
+          if (typeof tab.id !== 'number') return;
+          await chrome.tabs
+            .sendMessage(tab.id, {
+              type: 'sidetrack.engagement.idle',
+              idle: state !== 'active',
+            })
+            .catch(() => undefined);
+        }),
+      );
+    })().catch(() => undefined);
   });
 
   // Periodic background poll for new MCP-auto-approved dispatches.
@@ -2581,6 +2902,7 @@ export default defineBackground(() => {
     // Clean up MCP-dispatch markers on tab close so the storage map
     // doesn't accumulate dead entries.
     void dropMcpDispatchTab(tabId).catch(() => undefined);
+    void finalizeEngagementForTab(tabId).catch(() => undefined);
   });
 
   // Whenever the user activates a different tab or a tab's URL
@@ -2618,15 +2940,13 @@ export default defineBackground(() => {
   // Sync Contract v1 / Class F — bind chrome.tabs to the timeline
   // observer + materializer + drainer. Idempotent on repeated boots
   // (chrome.alarms.create replaces; the wiring guards init).
-  void initializeTimelineWiring({
-    readCompanion: async () => {
-      const settings = await readSettings();
-      const port = settings.companion.port;
-      const bridgeKey = settings.companion.bridgeKey.trim();
-      if (typeof port !== 'number' || port <= 0 || bridgeKey.length === 0) return null;
-      return { url: `http://127.0.0.1:${String(port)}`, bridgeKey };
-    },
-  }).catch((error: unknown) => {
+  void (async () => {
+    await bootstrapTimelinePrivacyGate().catch(() => undefined);
+    await initializeTimelineWiring({
+      readCompanion: readTimelineCompanionConfig,
+      readTimelineGateState: isTimelinePrivacyGateOpen,
+    });
+  })().catch((error: unknown) => {
     console.warn('[timeline] init failed:', error);
   });
 
@@ -2694,26 +3014,150 @@ export default defineBackground(() => {
 
   chrome.runtime.onMessage.addListener(
     (message: unknown, sender, sendResponse: (response: RuntimeResponse) => void) => {
-      // Re-init timeline wiring. After flipping
-      // sidetrack.timeline.enabled = true at runtime, the gate-check
-      // at SW boot has already returned early; this message resets
-      // the init guard and re-runs initializeTimelineWiring so the
-      // chrome.tabs listeners actually register without a SW reload.
+      if (isSelectionLineageMessage(message)) {
+        void handleSelectionLineage(message)
+          .then(() => {
+            sendResponse({ ok: true } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'selection lineage failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+
+      if (isEngagementIntervalMessage(message)) {
+        void handleEngagementInterval(message, sender.tab?.id)
+          .then(() => {
+            sendResponse({ ok: true } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'engagement interval failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.privacy.gateChanged'
+      ) {
+        void syncEngagementContentScriptRegistration()
+          .then(() => {
+            sendResponse({ ok: true } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error:
+                error instanceof Error
+                  ? error.message
+                  : 'engagement registration refresh failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.timeline.privacy.get'
+      ) {
+        void isTimelinePrivacyGateOpen()
+          .then((enabled) => {
+            sendResponse({ ok: true, enabled } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'privacy gate read failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.timeline.privacy.set'
+      ) {
+        const enabled = (message as { enabled?: unknown }).enabled === true;
+        void (async () => {
+          await setTimelinePrivacyGate(enabled);
+          resetTimelineWiringForTests();
+          await initializeTimelineWiring({
+            readCompanion: readTimelineCompanionConfig,
+            readTimelineGateState: isTimelinePrivacyGateOpen,
+          });
+        })()
+          .then(() => {
+            sendResponse({ ok: true, enabled } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'privacy gate write failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.timeline.permission.granted'
+      ) {
+        void recordTimelinePermissionGranted()
+          .then(() => {
+            sendResponse({ ok: true } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'permission grant event failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.timeline.permission.revoked'
+      ) {
+        void recordTimelinePermissionRevoked()
+          .then(() => {
+            sendResponse({ ok: true } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'permission revoke event failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+
+      // Re-init timeline wiring. After a legacy sidetrack.timeline.enabled
+      // seed or a privacy.gate.flipped write, this resets the init guard
+      // and re-runs initializeTimelineWiring so chrome.tabs listeners
+      // register without a SW reload.
       if (
         message !== null &&
         typeof message === 'object' &&
         (message as { type?: unknown }).type === 'sidetrack.timeline.reinit'
       ) {
         void (async () => {
+          await bootstrapTimelinePrivacyGate().catch(() => undefined);
           resetTimelineWiringForTests();
           await initializeTimelineWiring({
-            readCompanion: async () => {
-              const settings = await readSettings();
-              const port = settings.companion.port;
-              const bridgeKey = settings.companion.bridgeKey.trim();
-              if (typeof port !== 'number' || port <= 0 || bridgeKey.length === 0) return null;
-              return { url: `http://127.0.0.1:${String(port)}`, bridgeKey };
-            },
+            readCompanion: readTimelineCompanionConfig,
+            readTimelineGateState: isTimelinePrivacyGateOpen,
           });
         })()
           .then(() => {

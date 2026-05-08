@@ -2,11 +2,14 @@ import { describe, expect, it } from 'vitest';
 
 import { ANNOTATION_CREATED } from '../annotations/events.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../dispatches/events.js';
+import { NAVIGATION_COMMITTED, type NavigationCommittedPayload } from '../navigation/events.js';
 import { QUEUE_CREATED } from '../queue/events.js';
 import { CAPTURE_RECORDED } from '../recall/events.js';
+import { SELECTION_COPIED, SELECTION_PASTED } from '../snippets/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { THREAD_UPSERTED } from '../threads/events.js';
 import type { TimelineDayProjection } from '../timeline/projection.js';
+import type { TopicRevision } from '../producers/topic-revision.js';
 import { WORKSTREAM_UPSERTED } from '../workstreams/events.js';
 import {
   buildConnectionsSnapshot,
@@ -14,7 +17,7 @@ import {
   subgraphForNode,
   type ConnectionsInput,
 } from './snapshot.js';
-import { edgeIdFor, nodeIdFor } from './types.js';
+import { edgeIdFor, nodeIdFor, type ConnectionEdgeProducedBy } from './types.js';
 
 // Reducer tests pinning the Given/Then acceptance table from
 // /Users/yingfei/.claude/plans/kind-prancing-river.md plus the
@@ -32,6 +35,23 @@ const emptyInput = (overrides: Partial<ConnectionsInput> = {}): ConnectionsInput
   ...overrides,
 });
 
+describe('connections — producedBy provenance variants', () => {
+  it('accepts existing event/store provenance plus new revision producers', () => {
+    const variants: readonly ConnectionEdgeProducedBy[] = [
+      { source: 'event-log', eventType: THREAD_UPSERTED, dot: { replicaId: 'replica-A', seq: 1 } },
+      { source: 'workboard-state', recordId: 'thread_a' },
+      { source: 'timeline-projection' },
+      { source: 'visit-similarity', revisionId: 'visit-resembles:v1:cosine' },
+      { source: 'topic-clusterer', revisionId: 'topic-cluster:v1:union-find' },
+      { source: 'engagement-classifier', revisionId: 'engagement-class:v1:rules' },
+      { source: 'snippet-lineage', revisionId: 'snippet-lineage:v1:hash' },
+      { source: 'cross-replica' },
+    ];
+
+    expect(variants.map((variant) => variant.source)).toContain('cross-replica');
+  });
+});
+
 const buildEvent = (input: {
   seq: number;
   type: string;
@@ -47,6 +67,29 @@ const buildEvent = (input: {
   type: input.type,
   payload: input.payload,
   acceptedAtMs: input.acceptedAtMs ?? Date.parse('2026-05-07T10:00:00.000Z') + input.seq * 1000,
+});
+
+const navigationCommittedPayload = (input: {
+  readonly replicaId: string;
+  readonly seq: number;
+  readonly canonicalUrl: string;
+  readonly commitAt: string;
+}): NavigationCommittedPayload => ({
+  payloadVersion: 1,
+  visitId: `visit-${input.replicaId}-${String(input.seq)}`,
+  url: input.canonicalUrl,
+  canonicalUrl: input.canonicalUrl,
+  documentId: `doc-${input.replicaId}-${String(input.seq)}`,
+  parentDocumentId: null,
+  tabSessionIdHash: `tab-${input.replicaId}`,
+  windowSessionIdHash: `window-${input.replicaId}`,
+  openerVisitId: null,
+  previousVisitId: null,
+  navigationSequence: input.seq,
+  transitionType: 'link',
+  transitionQualifiers: [],
+  commitTimestamp: Date.parse(input.commitAt),
+  dimensions: { provenance: { source: 'test' } },
 });
 
 describe('connections — snapshot reducer (Given/Then)', () => {
@@ -78,7 +121,7 @@ describe('connections — snapshot reducer (Given/Then)', () => {
     );
     expect(edge).toBeDefined();
     expect(edge?.kind).toBe('thread_in_workstream');
-    expect(edge?.confidence).toBe('explicit');
+    expect(edge?.confidence).toBe('asserted');
     expect(edge?.producedBy.source).toBe('event-log');
   });
 
@@ -254,7 +297,7 @@ describe('connections — snapshot reducer (Given/Then)', () => {
     );
     const edge = snap.edges.find((e) => e.kind === 'timeline_same_url_as_thread');
     expect(edge).toBeDefined();
-    expect(edge?.confidence).toBe('deterministic');
+    expect(edge?.confidence).toBe('inferred');
     expect(edge?.producedBy.source).toBe('timeline-projection');
   });
 
@@ -288,7 +331,7 @@ describe('connections — snapshot reducer (Given/Then)', () => {
     );
     const edge = snap.edges.find((e) => e.kind === 'annotation_targets_thread');
     expect(edge).toBeDefined();
-    expect(edge?.confidence).toBe('deterministic');
+    expect(edge?.confidence).toBe('observed');
   });
 });
 
@@ -339,7 +382,7 @@ describe('connections — content-derived edges', () => {
     expect(edge).toBeDefined();
     expect(edge?.fromNodeId).toBe(nodeIdFor('thread', 'thread_a'));
     expect(edge?.toNodeId).toBe(nodeIdFor('timeline-visit', 'https://copy.fail/exploit'));
-    expect(edge?.confidence).toBe('deterministic');
+    expect(edge?.confidence).toBe('observed');
     expect(edge?.producedBy.eventType).toBe(CAPTURE_RECORDED);
   });
 
@@ -939,6 +982,74 @@ describe('connections — content-derived edges', () => {
     ).toBe(false);
   });
 
+  it('Pass 7 emits visit_resembles_visit edges from the active similarity revision', () => {
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: [
+        {
+          id: 'https://example.test/a',
+          firstSeenAt: '2026-05-07T09:00:00.000Z',
+          lastSeenAt: '2026-05-07T09:05:00.000Z',
+          url: 'https://example.test/a',
+          canonicalUrl: 'https://example.test/a',
+          title: 'A',
+          provider: 'generic',
+          visitCount: 1,
+        },
+        {
+          id: 'https://example.test/b',
+          firstSeenAt: '2026-05-07T09:10:00.000Z',
+          lastSeenAt: '2026-05-07T09:15:00.000Z',
+          url: 'https://example.test/b',
+          canonicalUrl: 'https://example.test/b',
+          title: 'B',
+          provider: 'generic',
+          visitCount: 1,
+        },
+      ],
+      updatedAt: '2026-05-07T09:15:00.000Z',
+      entryCount: 2,
+    };
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        timelineDays: [day],
+        visitSimilarity: {
+          revisionId: 'visit-sim-rev-1',
+          modelId: 'Xenova/multilingual-e5-small',
+          modelRevision: 'model-rev',
+          featureSchemaVersion: 1,
+          threshold: 0.85,
+          edges: [
+            {
+              fromVisitKey: 'https://example.test/a',
+              toVisitKey: 'https://example.test/b',
+              cosine: 0.91,
+            },
+            {
+              fromVisitKey: 'https://example.test/a',
+              toVisitKey: 'https://example.test/missing',
+              cosine: 0.99,
+            },
+          ],
+          producedAt: 1_777_777_777_000,
+        },
+      }),
+    );
+
+    const edge = snap.edges.find((candidate) => candidate.kind === 'visit_resembles_visit');
+    expect(edge).toBeDefined();
+    expect(edge?.fromNodeId).toBe(nodeIdFor('timeline-visit', 'https://example.test/a'));
+    expect(edge?.toNodeId).toBe(nodeIdFor('timeline-visit', 'https://example.test/b'));
+    expect(edge?.observedAt).toBe('2026-05-07T09:15:00.000Z');
+    expect(edge?.confidence).toBe('inferred');
+    expect(edge?.family).toBe('urlmatch');
+    expect(edge?.producedBy).toEqual({
+      source: 'visit-similarity',
+      revisionId: 'visit-sim-rev-1',
+    });
+    expect(snap.edges.filter((candidate) => candidate.kind === 'visit_resembles_visit')).toHaveLength(1);
+  });
+
   it('visit_in_workstream fires when the timeline entry carries a workstreamId (active-workstream attribution)', () => {
     // Active-workstream attribution: the observer stamps
     // workstreamId on visits when the user has a workstream
@@ -974,7 +1085,7 @@ describe('connections — content-derived edges', () => {
     expect(visitEdges.length).toBe(1);
     expect(visitEdges[0]?.fromNodeId).toBe(nodeIdFor('timeline-visit', 'https://copy.fail'));
     expect(visitEdges[0]?.toNodeId).toBe(nodeIdFor('workstream', 'ws_security'));
-    expect(visitEdges[0]?.confidence).toBe('explicit');
+    expect(visitEdges[0]?.confidence).toBe('inferred');
     expect(visitEdges[0]?.producedBy.source).toBe('timeline-projection');
     // The visit-node metadata also carries the workstreamId.
     const taggedVisit = snap.nodes.find(
@@ -1027,6 +1138,116 @@ describe('connections — content-derived edges', () => {
     expect(
       ids.has(nodeIdFor('timeline-visit', 'https://www.youtube.com/watch?v=rY44ViY45q8')),
     ).toBe(true);
+  });
+
+  it('Pass 8 emits topic nodes, membership, workstream, and lineage edges', () => {
+    const topicRevision: TopicRevision = {
+      revisionId: 'topic-rev-1',
+      visitSimilarityRevisionId: 'visit-sim-1',
+      cosineThreshold: 0.85,
+      algorithmVersion: 'union-find:v1',
+      topics: [
+        {
+          topicId: 'topic:abc123',
+          memberCanonicalUrls: [
+            'https://topic.test/a',
+            'https://topic.test/b',
+            'https://topic.test/c',
+            'https://topic.test/d',
+          ],
+          metadata: {
+            memberCount: 4,
+            dominantWorkstreamId: 'ws_topic',
+            representativeTitles: ['Topic A', 'Topic B'],
+            firstObservedAt: '2026-05-07T09:00:00.000Z',
+            lastObservedAt: '2026-05-07T12:00:00.000Z',
+            cohesion: 0.91,
+          },
+        },
+      ],
+      lineage: [
+        {
+          fromTopicId: 'topic:old',
+          toTopicId: 'topic:abc123',
+          kind: 'merge',
+          observedAt: '2026-05-07T12:00:00.000Z',
+        },
+      ],
+      producedAt: Date.parse('2026-05-07T12:00:00.000Z'),
+    };
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: [
+        {
+          id: 'https://topic.test/a',
+          firstSeenAt: '2026-05-07T09:00:00.000Z',
+          lastSeenAt: '2026-05-07T10:00:00.000Z',
+          url: 'https://topic.test/a',
+          canonicalUrl: 'https://topic.test/a',
+          title: 'Topic A',
+          visitCount: 1,
+          workstreamId: 'ws_topic',
+        },
+        {
+          id: 'https://topic.test/b',
+          firstSeenAt: '2026-05-07T09:10:00.000Z',
+          lastSeenAt: '2026-05-07T10:10:00.000Z',
+          url: 'https://topic.test/b',
+          canonicalUrl: 'https://topic.test/b',
+          title: 'Topic B',
+          visitCount: 1,
+          workstreamId: 'ws_topic',
+        },
+        {
+          id: 'https://topic.test/c',
+          firstSeenAt: '2026-05-07T09:20:00.000Z',
+          lastSeenAt: '2026-05-07T10:20:00.000Z',
+          url: 'https://topic.test/c',
+          canonicalUrl: 'https://topic.test/c',
+          title: 'Topic C',
+          visitCount: 1,
+          workstreamId: 'ws_topic',
+        },
+        {
+          id: 'https://topic.test/d',
+          firstSeenAt: '2026-05-07T09:30:00.000Z',
+          lastSeenAt: '2026-05-07T10:30:00.000Z',
+          url: 'https://topic.test/d',
+          canonicalUrl: 'https://topic.test/d',
+          title: 'Topic D',
+          visitCount: 1,
+          workstreamId: 'ws_other',
+        },
+      ],
+      updatedAt: '2026-05-07T10:30:00.000Z',
+      entryCount: 4,
+    };
+
+    const snap = buildConnectionsSnapshot(
+      emptyInput({ timelineDays: [day], topicRevision }),
+    );
+    const topicNodeId = nodeIdFor('topic', 'topic:abc123');
+    const topicNode = snap.nodes.find((node) => node.id === topicNodeId);
+
+    expect(topicNode?.label).toBe('Topic A');
+    expect(topicNode?.metadata['cohesion']).toBe(0.91);
+    expect(snap.edges.filter((edge) => edge.kind === 'visit_in_topic')).toHaveLength(4);
+    expect(
+      snap.edges.find(
+        (edge) =>
+          edge.kind === 'topic_in_workstream' &&
+          edge.fromNodeId === topicNodeId &&
+          edge.toNodeId === nodeIdFor('workstream', 'ws_topic'),
+      ),
+    ).toBeDefined();
+    const lineage = snap.edges.find((edge) => edge.kind === 'topic.lineage');
+    expect(lineage?.fromNodeId).toBe(nodeIdFor('topic', 'topic:old'));
+    expect(lineage?.toNodeId).toBe(topicNodeId);
+    expect(lineage?.metadata?.['lineageKind']).toBe('merge');
+    expect(lineage?.producedBy).toEqual({
+      source: 'topic-clusterer',
+      revisionId: 'topic-rev-1',
+    });
   });
 
   it('determinism: same fixture in two event orders produces byte-identical snapshots', () => {
@@ -1174,6 +1395,81 @@ describe('connections — determinism + cross-replica', () => {
     expect([...threadNode!.originReplicaIds].sort()).toEqual(['replica-desktop', 'replica-laptop']);
   });
 
+  it('Pass 9 emits visit_observed_on_replica edges and replica nodes from navigation.committed', () => {
+    const url = 'https://example.com/shared';
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        events: [
+          buildEvent({
+            seq: 1,
+            replicaId: 'replica-A',
+            type: NAVIGATION_COMMITTED,
+            payload: navigationCommittedPayload({
+              replicaId: 'replica-A',
+              seq: 1,
+              canonicalUrl: url,
+              commitAt: '2026-05-07T09:00:00.000Z',
+            }),
+            acceptedAtMs: Date.parse('2026-05-07T09:00:01.000Z'),
+          }),
+          buildEvent({
+            seq: 2,
+            replicaId: 'replica-A',
+            type: NAVIGATION_COMMITTED,
+            payload: navigationCommittedPayload({
+              replicaId: 'replica-A',
+              seq: 2,
+              canonicalUrl: 'https://example.com/only-a',
+              commitAt: '2026-05-07T09:30:00.000Z',
+            }),
+            acceptedAtMs: Date.parse('2026-05-07T09:30:01.000Z'),
+          }),
+          buildEvent({
+            seq: 1,
+            replicaId: 'replica-B',
+            type: NAVIGATION_COMMITTED,
+            payload: navigationCommittedPayload({
+              replicaId: 'replica-B',
+              seq: 1,
+              canonicalUrl: url,
+              commitAt: '2026-05-07T10:00:00.000Z',
+            }),
+            acceptedAtMs: Date.parse('2026-05-07T10:00:01.000Z'),
+          }),
+        ],
+      }),
+    );
+
+    const crossReplicaEdges = snap.edges.filter(
+      (edge) => edge.kind === 'visit_observed_on_replica',
+    );
+    expect(crossReplicaEdges).toHaveLength(2);
+    expect(crossReplicaEdges.map((edge) => `${edge.fromNodeId}->${edge.toNodeId}`)).toEqual([
+      `${nodeIdFor('timeline-visit', url)}->${nodeIdFor('replica', 'replica-A')}`,
+      `${nodeIdFor('timeline-visit', url)}->${nodeIdFor('replica', 'replica-B')}`,
+    ]);
+    expect(crossReplicaEdges.every((edge) => edge.confidence === 'observed')).toBe(true);
+    expect(crossReplicaEdges.every((edge) => edge.producedBy.source === 'cross-replica')).toBe(
+      true,
+    );
+
+    const replicaA = snap.nodes.find((node) => node.id === nodeIdFor('replica', 'replica-A'));
+    expect(replicaA?.kind).toBe('replica');
+    expect(replicaA?.metadata).toEqual({
+      firstSeenAt: '2026-05-07T09:00:00.000Z',
+      lastSeenAt: '2026-05-07T09:30:00.000Z',
+      replicaId: 'replica-A',
+    });
+    expect(replicaA?.firstSeenAt).toBe('2026-05-07T09:00:00.000Z');
+    expect(replicaA?.lastSeenAt).toBe('2026-05-07T09:30:00.000Z');
+    expect(snap.nodes.find((node) => node.id === nodeIdFor('timeline-visit', url))).toBeDefined();
+    expect(
+      snap.edges.some(
+        (edge) => edge.fromNodeId === nodeIdFor('timeline-visit', 'https://example.com/only-a'),
+      ),
+    ).toBe(false);
+  });
+
   it('updatedAt is max observedAt, never wall-clock', () => {
     const snap = buildConnectionsSnapshot(
       emptyInput({
@@ -1204,6 +1500,53 @@ describe('connections — determinism + cross-replica', () => {
     expect(snap.nodeCount).toBe(0);
     expect(snap.edgeCount).toBe(0);
     expect(snap.updatedAt).toBe('1970-01-01T00:00:00.000Z');
+  });
+
+  it('Pass 10 emits snippet lineage edges from copy/paste fixtures', () => {
+    const copied = {
+      payloadVersion: 1,
+      visitId: 'visit:source',
+      selectionHash: 'abcdef1234567890abcdef1234567890',
+      simhash64: 'AAAAAAAAAAA=',
+      charCount: 20,
+      lineCount: 1,
+      contentKindHint: 'prose',
+      rawTextStored: false,
+    };
+    const pasted = {
+      payloadVersion: 1,
+      destinationKind: 'thread',
+      selectionHash: copied.selectionHash,
+      simhash64: copied.simhash64,
+      charCount: 20,
+      rawTextStored: false,
+    };
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        events: [
+          buildEvent({ seq: 1, type: SELECTION_COPIED, payload: copied }),
+          buildEvent({
+            seq: 2,
+            type: SELECTION_PASTED,
+            payload: { ...pasted, destinationId: 'thread_a' },
+          }),
+          buildEvent({
+            seq: 3,
+            type: SELECTION_PASTED,
+            payload: { ...pasted, destinationId: 'thread_b' },
+          }),
+        ],
+      }),
+    );
+    expect(snap.nodes.find((node) => node.kind === 'snippet')).toBeDefined();
+    expect(snap.edges.find((edge) => edge.kind === 'snippet_copied_from_visit')).toBeDefined();
+    expect(snap.edges.filter((edge) => edge.kind === 'snippet_pasted_into_thread')).toHaveLength(2);
+    expect(snap.edges.filter((edge) => edge.kind === 'snippet_reused_across_threads')).toHaveLength(2);
+    expect(
+      snap.edges.every((edge) =>
+        edge.kind.startsWith('snippet_') ? edge.producedBy.source === 'snippet-lineage' : true,
+      ),
+    ).toBe(true);
   });
 });
 

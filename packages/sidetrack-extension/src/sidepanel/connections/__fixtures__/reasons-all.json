@@ -1,0 +1,72 @@
+[
+  {
+    "code": "SAME_THREAD",
+    "threadId": "thread:a",
+    "threadName": "Tax flow",
+    "expected": "Same thread: Tax flow"
+  },
+  {
+    "code": "SAME_TOPIC",
+    "topicId": "topic:a",
+    "cohesion": 0.9123,
+    "expected": "Same topic (cohesion 0.91)"
+  },
+  {
+    "code": "COSINE_ABOVE_THRESHOLD",
+    "cosine": 0.913,
+    "threshold": 0.85,
+    "expected": "Title similarity 0.91 >= 0.85"
+  },
+  {
+    "code": "OPENER_CHAIN",
+    "depth": 2,
+    "viaTabSessionIdHash": "tab-a",
+    "expected": "Opened from another visit (2 hops)"
+  },
+  {
+    "code": "PREVIOUS_VISIT_IN_TAB_SESSION",
+    "tabSessionIdHash": "tab-a",
+    "expected": "Previous visit in the same tab session"
+  },
+  {
+    "code": "TRANSITION_TYPE",
+    "transitionType": "link",
+    "expected": "Navigation transition: link"
+  },
+  {
+    "code": "TRANSITION_QUALIFIER",
+    "qualifier": "forward_back",
+    "expected": "Navigation qualifier: forward_back"
+  },
+  {
+    "code": "COPIED_FROM",
+    "snippetId": "snippet:a",
+    "expected": "Snippet copied from this page"
+  },
+  {
+    "code": "PASTED_INTO",
+    "snippetId": "snippet:a",
+    "destinationKind": "thread",
+    "expected": "Pasted into thread"
+  },
+  {
+    "code": "OBSERVED_ON_OTHER_REPLICA",
+    "replicaId": "replica-b",
+    "expected": "Also observed on replica replica-b"
+  },
+  {
+    "code": "LEXICAL_OVERLAP",
+    "topTokens": ["sidetrack", "workstream", "browser", "agent"],
+    "expected": "Shared terms: sidetrack, workstream, browser"
+  },
+  {
+    "code": "LINK_OUT_FROM",
+    "otherVisitId": "timeline-visit:https://example.test/b",
+    "expected": "This page links to that one"
+  },
+  {
+    "code": "LINK_IN_TO",
+    "otherVisitId": "timeline-visit:https://example.test/a",
+    "expected": "That page links to this one"
+  }
+]

@@ -26,6 +26,8 @@ export interface BrowserTimelineObservedPayload {
   // observation time. Companion-side TimelineEntry + connections-
   // graph carry this through and emit `visit_in_workstream`.
   readonly workstreamId?: string;
+  readonly payloadVersion?: number;
+  readonly dimensions?: Record<string, unknown>;
 }
 
 // Plugin-tier minimal shape: the side panel's local active window

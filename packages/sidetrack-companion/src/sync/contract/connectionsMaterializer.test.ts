@@ -1,10 +1,12 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { createConnectionsStore } from '../../connections/snapshot.js';
+import type { VisitSimilarityEmbedder } from '../../connections/visitSimilarity.js';
 import { THREAD_UPSERTED } from '../../threads/events.js';
+import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
 import { createTimelineStore } from '../../timeline/projection.js';
 import type { AcceptedEvent } from '../causal.js';
 import { createEventLog } from '../eventLog.js';
@@ -24,6 +26,28 @@ const buildEvent = (input: {
   payload: input.payload,
   acceptedAtMs: Date.parse('2026-05-07T10:00:00.000Z') + input.seq * 1000,
 });
+
+const unit = (values: readonly number[]): Float32Array => {
+  const norm = Math.sqrt(values.reduce((sum, value) => sum + value * value, 0));
+  return Float32Array.from(values.map((value) => value / norm));
+};
+
+const keyFromEmbeddingText = (text: string): string => {
+  const corpus = text.replace(/^(?:passage|query):\s+/u, '');
+  return corpus.split(/\s+/u)[0] ?? '';
+};
+
+const embedFromVectors = (
+  vectors: ReadonlyMap<string, Float32Array>,
+): VisitSimilarityEmbedder => async (texts) =>
+  texts.map((text) => {
+    const key = keyFromEmbeddingText(text);
+    const vector = vectors.get(key);
+    if (vector === undefined) {
+      throw new Error(`missing vector for ${key}`);
+    }
+    return vector;
+  });
 
 describe('connectionsMaterializer (Class B, consumer-only)', () => {
   let vaultRoot: string;
@@ -66,6 +90,77 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     expect(ids).toContain('thread:thread_a');
     expect(ids).toContain('workstream:ws_x');
     expect(snap!.edges.find((e) => e.kind === 'thread_in_workstream')).toBeDefined();
+    expect(m.health().status).toBe('healthy');
+  });
+
+  it('runs visitSimilarity before snapshot and persists the active revision', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+    const embed = embedFromVectors(
+      new Map<string, Float32Array>([
+        ['visit-alpha', unit([1, 0])],
+        ['visit-bravo', unit([1, 0])],
+      ]),
+    );
+    const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store, embed });
+
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 1,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: {
+          eventId: 'timeline-alpha',
+          observedAt: '2026-05-07T10:00:00.000Z',
+          url: 'https://example.test/alpha',
+          canonicalUrl: 'https://example.test/alpha',
+          title: 'visit-alpha',
+          provider: 'generic',
+          transition: 'activated',
+          payloadVersion: 1,
+          dimensions: { engagement: { focusedWindowMs: 10_000 } },
+        },
+      }),
+    );
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 2,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: {
+          eventId: 'timeline-bravo',
+          observedAt: '2026-05-07T10:05:00.000Z',
+          url: 'https://example.test/bravo',
+          canonicalUrl: 'https://example.test/bravo',
+          title: 'visit-bravo',
+          provider: 'generic',
+          transition: 'activated',
+          payloadVersion: 1,
+          dimensions: { engagement: { focusedWindowMs: 10_000 } },
+        },
+      }),
+    );
+
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+
+    const snap = await store.readCurrent();
+    expect(snap).not.toBeNull();
+    const edge = snap?.edges.find((candidate) => candidate.kind === 'visit_resembles_visit');
+    expect(edge).toBeDefined();
+    expect(edge?.fromNodeId).toBe('timeline-visit:https://example.test/alpha');
+    expect(edge?.toNodeId).toBe('timeline-visit:https://example.test/bravo');
+    expect(edge?.confidence).toBe('inferred');
+    expect(edge?.producedBy.source).toBe('visit-similarity');
+    const revisionId =
+      edge?.producedBy.source === 'visit-similarity' ? edge.producedBy.revisionId : undefined;
+    expect(revisionId).toMatch(/^[a-f0-9]{16}$/u);
+    if (revisionId === undefined) throw new Error('missing visit-similarity revision id');
+    const revisionRaw = await readFile(
+      join(vaultRoot, '_BAC', 'connections', 'visit-similarity', `${revisionId}.json`),
+      'utf8',
+    );
+    expect(revisionRaw).toContain(`"revisionId": "${revisionId}"`);
     expect(m.health().status).toBe('healthy');
   });
 

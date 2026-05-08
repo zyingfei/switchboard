@@ -9,8 +9,18 @@ import {
   isDispatchRecordedPayload,
 } from '../dispatches/events.js';
 import { createRevision } from '../domain/ids.js';
+import {
+  buildCrossReplicaMaterialization,
+  replicaIdFromNodeId,
+  type CrossReplicaMaterialization,
+} from '../materializers/cross-replica.js';
+import {
+  DEFAULT_TOPIC_WORKSTREAM_SHARE_THRESHOLD,
+  type TopicRevision,
+} from '../producers/topic-revision.js';
 import { QUEUE_CREATED, isQueueCreatedPayload } from '../queue/events.js';
 import { CAPTURE_RECORDED, isCaptureRecordedPayload } from '../recall/events.js';
+import { projectSnippetLineage } from '../snippets/projection.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import {
   THREAD_UPSERTED,
@@ -22,6 +32,7 @@ import {
   WORKSTREAM_UPSERTED,
   isWorkstreamUpsertedPayload,
 } from '../workstreams/events.js';
+import type { EngagementClassRevision } from './engagementClassifier.js';
 import { findThreadQuotes, type ThreadText } from './quoteIndex.js';
 import {
   edgeIdFor,
@@ -33,6 +44,7 @@ import {
   type ConnectionNodeMetadata,
   type ConnectionsSnapshot,
   type ConnectionsSnapshotScope,
+  type VisitSimilarityRevision,
 } from './types.js';
 import { extractUrlsFromText } from './urlExtractor.js';
 
@@ -44,7 +56,7 @@ export type { ConnectionsSnapshot } from './types.js';
 // records. Same input → byte-equivalent output across replays and
 // replicas. No wall-clock, no inference, no time-proximity edges.
 //
-// Edge set (18 emitted, 19 declared):
+// Edge set:
 //   thread_in_workstream                 thread.primaryWorkstreamId
 //   workstream_parent_of                 workstream.parentId
 //   dispatch_from_thread                 dispatch record sourceThreadId
@@ -62,9 +74,18 @@ export type { ConnectionsSnapshot } from './types.js';
 //   thread_quotes_thread                 ≥40-char substring across capture turns
 //   thread_text_mentions_search_query    captured text contains a search-URL
 //                                         visit's query (whole-word match)
+//   visit_resembles_visit                deterministic visit similarity
+//                                        revision over title/host/path
 //   visit_in_workstream                   timeline observer stamped a
 //                                         workstreamId on the visit (active
 //                                         workstream attribution)
+//   visit_in_topic                         topic-clusterer membership edge
+//   topic_in_workstream                    topic-clusterer dominant
+//                                         workstream edge (>=75% members)
+//   topic.lineage                          topic split/merge revision edge
+//   snippet_copied_from_visit             hash-only copy/paste lineage
+//   snippet_pasted_into_<dest>            paste destination edge
+//   snippet_reused_across_threads         same snippet pasted into >=2 threads
 //
 // `annotation_targets_workstream` is declared in the edge-kind union
 // for completeness but not yet emitted (workstream-anchored
@@ -146,6 +167,11 @@ export interface ConnectionsInput {
   readonly reminders: readonly ReminderVaultRecord[];
   readonly codingSessions: readonly CodingSessionVaultRecord[];
   readonly timelineDays: readonly TimelineDayProjection[];
+  readonly visitSimilarity?: VisitSimilarityRevision;
+  readonly topicRevision?: TopicRevision;
+  readonly topicWorkstreamShareThreshold?: number;
+  readonly crossReplica?: CrossReplicaMaterialization;
+  readonly engagementClassRevision?: EngagementClassRevision;
   readonly scope?: ConnectionsSnapshotScope;
 }
 
@@ -261,6 +287,11 @@ const stripFragmentAndTrailingSlash = (url: string): string =>
 // Pass 5: cross-thread substring quotes — emit thread_quotes_thread
 //         edges when one captured turn contains a contiguous ≥40-char
 //         substring of another's.
+// Pass 6: search-query content match.
+// Pass 7: injected visit-similarity revision emits visit_resembles_visit.
+// Pass 8: topic-clusterer active revision — emit topic nodes,
+//         visit_in_topic / topic_in_workstream membership edges, and
+//         topic.lineage split/merge edges.
 // ---------------------------------------------------------------------------
 
 export const buildConnectionsSnapshot = (
@@ -331,7 +362,7 @@ export const buildConnectionsSnapshot = (
             eventType: THREAD_UPSERTED,
             dot: { replicaId, seq: event.dot.seq },
           },
-          confidence: 'explicit',
+          confidence: 'asserted',
         });
       }
       continue;
@@ -367,7 +398,7 @@ export const buildConnectionsSnapshot = (
             eventType: WORKSTREAM_UPSERTED,
             dot: { replicaId, seq: event.dot.seq },
           },
-          confidence: 'explicit',
+          confidence: 'asserted',
         });
       }
       continue;
@@ -402,7 +433,7 @@ export const buildConnectionsSnapshot = (
           eventType: DISPATCH_LINKED,
           dot: { replicaId, seq: event.dot.seq },
         },
-        confidence: 'explicit',
+        confidence: 'observed',
       });
       continue;
     }
@@ -436,7 +467,7 @@ export const buildConnectionsSnapshot = (
             toNodeId: nodeIdFor('thread', p.targetId),
             observedAt: observedAtIso,
             producedBy: { source: 'event-log', eventType: QUEUE_CREATED, dot: { replicaId, seq: event.dot.seq } },
-            confidence: 'explicit',
+            confidence: 'asserted',
           });
         } else if (p.scope === 'workstream') {
           upsertNode(nodes, {
@@ -452,7 +483,7 @@ export const buildConnectionsSnapshot = (
             toNodeId: nodeIdFor('workstream', p.targetId),
             observedAt: observedAtIso,
             producedBy: { source: 'event-log', eventType: QUEUE_CREATED, dot: { replicaId, seq: event.dot.seq } },
-            confidence: 'explicit',
+            confidence: 'asserted',
           });
         }
       }
@@ -513,7 +544,7 @@ export const buildConnectionsSnapshot = (
         toNodeId: nodeIdFor('workstream', t.primaryWorkstreamId),
         observedAt: t.lastSeenAt ?? '',
         producedBy: { source: 'workboard-state', recordId: t.bac_id },
-        confidence: 'explicit',
+        confidence: 'asserted',
       });
     }
   }
@@ -537,7 +568,7 @@ export const buildConnectionsSnapshot = (
           toNodeId: nodeIdFor('workstream', childId),
           observedAt: '',  // vault record without observedAt; sentinel sorts first
           producedBy: { source: 'workboard-state', recordId: w.bac_id },
-          confidence: 'explicit',
+          confidence: 'asserted',
         });
       }
     }
@@ -563,7 +594,7 @@ export const buildConnectionsSnapshot = (
         toNodeId: nodeIdFor('dispatch', d.bac_id),
         observedAt: d.createdAt ?? '',
         producedBy: { source: 'workboard-state', recordId: d.bac_id },
-        confidence: 'explicit',
+        confidence: 'asserted',
       });
     }
     if (typeof d.workstreamId === 'string' && d.workstreamId.length > 0) {
@@ -574,7 +605,7 @@ export const buildConnectionsSnapshot = (
         toNodeId: nodeIdFor('workstream', d.workstreamId),
         observedAt: d.createdAt ?? '',
         producedBy: { source: 'workboard-state', recordId: d.bac_id },
-        confidence: 'explicit',
+        confidence: 'asserted',
       });
     }
     if (typeof d.mcpRequest?.codingSessionId === 'string') {
@@ -585,7 +616,7 @@ export const buildConnectionsSnapshot = (
         toNodeId: nodeIdFor('coding-session', d.mcpRequest.codingSessionId),
         observedAt: d.createdAt ?? '',
         producedBy: { source: 'workboard-state', recordId: d.bac_id },
-        confidence: 'explicit',
+        confidence: 'asserted',
       });
     }
   }
@@ -612,7 +643,7 @@ export const buildConnectionsSnapshot = (
         toNodeId: nodeIdFor('thread', tid),
         observedAt: q.createdAt ?? '',
         producedBy: { source: 'workboard-state', recordId: q.bac_id },
-        confidence: 'explicit',
+        confidence: 'asserted',
       });
     }
     if (typeof wid === 'string' && wid.length > 0) {
@@ -623,7 +654,7 @@ export const buildConnectionsSnapshot = (
         toNodeId: nodeIdFor('workstream', wid),
         observedAt: q.createdAt ?? '',
         producedBy: { source: 'workboard-state', recordId: q.bac_id },
-        confidence: 'explicit',
+        confidence: 'asserted',
       });
     }
   }
@@ -648,7 +679,7 @@ export const buildConnectionsSnapshot = (
       toNodeId: nodeIdFor('thread', r.threadId),
       observedAt: r.detectedAt ?? '',
       producedBy: { source: 'reminder-store', recordId: reminderId },
-      confidence: 'explicit',
+      confidence: 'asserted',
     });
   }
   for (const c of input.codingSessions) {
@@ -674,7 +705,7 @@ export const buildConnectionsSnapshot = (
         toNodeId: nodeIdFor('workstream', c.workstreamId),
         observedAt: c.attachedAt ?? '',
         producedBy: { source: 'coding-session-store', recordId: c.bac_id },
-        confidence: 'explicit',
+        confidence: 'asserted',
       });
     }
   }
@@ -687,6 +718,7 @@ export const buildConnectionsSnapshot = (
   // Build URL → thread id map. canonicalUrl preferred; fall back to
   // threadUrl (with fragment + trailing-slash normalization).
   const threadIdByUrl = new Map<string, string>();
+  const visitObservedAtByKey = new Map<string, string>();
   for (const t of input.threads) {
     const candidate = t.canonicalUrl ?? t.threadUrl;
     if (typeof candidate !== 'string' || candidate.length === 0) continue;
@@ -694,10 +726,25 @@ export const buildConnectionsSnapshot = (
   }
   // Add timeline visit nodes; emit timeline_same_url_as_thread edges
   // when there's a thread match.
+  const engagementClassByCanonicalUrl = new Map<
+    string,
+    EngagementClassRevision['classifications'][number]
+  >();
+  for (const classification of input.engagementClassRevision?.classifications ?? []) {
+    engagementClassByCanonicalUrl.set(
+      stripFragmentAndTrailingSlash(classification.canonicalUrl),
+      classification,
+    );
+  }
+
   for (const day of input.timelineDays) {
     trackObservedAt(day.updatedAt);
     for (const entry of day.entries) {
       const visitKey = stripFragmentAndTrailingSlash(entry.canonicalUrl ?? entry.url);
+      const priorVisitObservedAt = visitObservedAtByKey.get(visitKey);
+      if (priorVisitObservedAt === undefined || entry.lastSeenAt > priorVisitObservedAt) {
+        visitObservedAtByKey.set(visitKey, entry.lastSeenAt);
+      }
       // Extract the search query from search-shaped URLs so pass 6
       // can deterministically match it against captured turn text /
       // dispatch bodies / annotation notes. Host-agnostic detection
@@ -705,6 +752,7 @@ export const buildConnectionsSnapshot = (
       const searchInfo = detectSearchUrl(entry.canonicalUrl ?? entry.url);
       const searchQuery =
         searchInfo === null ? undefined : searchInfo.query.trim().toLowerCase();
+      const engagementClass = engagementClassByCanonicalUrl.get(visitKey);
       upsertNode(nodes, {
         kind: 'timeline-visit',
         key: visitKey,
@@ -717,6 +765,9 @@ export const buildConnectionsSnapshot = (
           provider: entry.provider,
           visitCount: entry.visitCount,
           ...(searchQuery === undefined ? {} : { searchQuery }),
+          ...(engagementClass === undefined
+            ? {}
+            : { engagement: { class: engagementClass.class } }),
           ...(entry.workstreamId === undefined ? {} : { workstreamId: entry.workstreamId }),
         },
       });
@@ -737,7 +788,7 @@ export const buildConnectionsSnapshot = (
           toNodeId: nodeIdFor('workstream', entry.workstreamId),
           observedAt: entry.lastSeenAt,
           producedBy: { source: 'timeline-projection' },
-          confidence: 'explicit',
+          confidence: 'inferred',
         });
       }
       const threadId = threadIdByUrl.get(visitKey);
@@ -749,7 +800,7 @@ export const buildConnectionsSnapshot = (
           toNodeId: nodeIdFor('thread', threadId),
           observedAt: entry.lastSeenAt,
           producedBy: { source: 'timeline-projection' },
-          confidence: 'deterministic',
+          confidence: 'inferred',
         });
       }
     }
@@ -773,7 +824,7 @@ export const buildConnectionsSnapshot = (
         eventType: ANNOTATION_CREATED,
         dot: { replicaId: event.dot.replicaId, seq: event.dot.seq },
       },
-      confidence: 'deterministic',
+      confidence: 'observed',
     });
   }
 
@@ -826,7 +877,7 @@ export const buildConnectionsSnapshot = (
         eventType: input.eventType,
         dot: { replicaId: input.replicaId, seq: input.seq },
       },
-      confidence: 'deterministic',
+      confidence: 'observed',
     });
   };
 
@@ -907,7 +958,7 @@ export const buildConnectionsSnapshot = (
             eventType: DISPATCH_RECORDED,
             dot: { replicaId, seq },
           },
-          confidence: 'explicit',
+          confidence: 'observed',
         });
       }
       if (typeof p.workstreamId === 'string' && p.workstreamId.length > 0) {
@@ -926,7 +977,7 @@ export const buildConnectionsSnapshot = (
             eventType: DISPATCH_RECORDED,
             dot: { replicaId, seq },
           },
-          confidence: 'explicit',
+          confidence: 'observed',
         });
       }
       if (
@@ -948,7 +999,7 @@ export const buildConnectionsSnapshot = (
             eventType: DISPATCH_RECORDED,
             dot: { replicaId, seq },
           },
-          confidence: 'explicit',
+          confidence: 'observed',
         });
       }
       for (const url of extractUrlsFromText(p.body)) {
@@ -1084,7 +1135,7 @@ export const buildConnectionsSnapshot = (
             ? {}
             : { dot: { replicaId: fromDot.replicaId, seq: fromDot.seq } }),
         },
-        confidence: 'deterministic',
+        confidence: 'inferred',
       });
     }
   }
@@ -1148,7 +1199,7 @@ export const buildConnectionsSnapshot = (
               ? {}
               : { dot: { replicaId, seq } }),
           },
-          confidence: 'deterministic',
+          confidence: 'inferred',
         });
       }
     };
@@ -1197,6 +1248,319 @@ export const buildConnectionsSnapshot = (
           seq,
         );
       }
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Pass 7 — visit similarity. The producer owns cosine computation
+  // and revision identity; this reducer only materializes valid
+  // edges whose endpoints are present in the timeline projection.
+  // -------------------------------------------------------------------
+  if (input.visitSimilarity !== undefined) {
+    for (const similarityEdge of input.visitSimilarity.edges) {
+      if (
+        similarityEdge.fromVisitKey === similarityEdge.toVisitKey ||
+        similarityEdge.fromVisitKey.length === 0 ||
+        similarityEdge.toVisitKey.length === 0 ||
+        !Number.isFinite(similarityEdge.cosine) ||
+        similarityEdge.cosine < input.visitSimilarity.threshold
+      ) {
+        continue;
+      }
+      const fromObservedAt = visitObservedAtByKey.get(similarityEdge.fromVisitKey);
+      const toObservedAt = visitObservedAtByKey.get(similarityEdge.toVisitKey);
+      if (fromObservedAt === undefined || toObservedAt === undefined) continue;
+      const observedAt = fromObservedAt > toObservedAt ? fromObservedAt : toObservedAt;
+      trackObservedAt(observedAt);
+      upsertEdge(edges, {
+        kind: 'visit_resembles_visit',
+        fromNodeId: nodeIdFor('timeline-visit', similarityEdge.fromVisitKey),
+        toNodeId: nodeIdFor('timeline-visit', similarityEdge.toVisitKey),
+        observedAt,
+        producedBy: {
+          source: 'visit-similarity',
+          revisionId: input.visitSimilarity.revisionId,
+        },
+        confidence: 'inferred',
+        family: 'urlmatch',
+      });
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Pass 8 — topic-clusterer active revision. The topic revision is a
+  // Class E artifact produced outside this reducer; the reducer only
+  // projects its deterministic nodes and edges into the Connections
+  // graph. Singleton topic components are already suppressed from
+  // revision.topics, but lineage can still point at singleton
+  // content-derived topic ids.
+  // -------------------------------------------------------------------
+  if (input.topicRevision !== undefined) {
+    const topicRevision = input.topicRevision;
+    const topicProducedBy = {
+      source: 'topic-clusterer',
+      revisionId: topicRevision.revisionId,
+    } as const;
+    const workstreamShareThreshold =
+      input.topicWorkstreamShareThreshold ?? DEFAULT_TOPIC_WORKSTREAM_SHARE_THRESHOLD;
+
+    const visitWorkstreamIdFor = (canonicalUrl: string): string | undefined => {
+      const node = nodes.get(nodeIdFor('timeline-visit', canonicalUrl));
+      const value = node?.metadata['workstreamId'];
+      return typeof value === 'string' && value.length > 0 ? value : undefined;
+    };
+
+    for (const topic of [...topicRevision.topics].sort((a, b) =>
+      a.topicId < b.topicId ? -1 : a.topicId > b.topicId ? 1 : 0,
+    )) {
+      const topicNode = upsertNode(nodes, {
+        kind: 'topic',
+        key: topic.topicId,
+        label: topic.metadata.representativeTitles[0] ?? topic.topicId,
+        observedAt: topic.metadata.lastObservedAt,
+        metadata: { ...topic.metadata },
+      });
+      topicNode.firstSeenAt = topic.metadata.firstObservedAt;
+      topicNode.lastSeenAt = topic.metadata.lastObservedAt;
+      trackObservedAt(topic.metadata.lastObservedAt);
+
+      for (const memberCanonicalUrl of topic.memberCanonicalUrls) {
+        upsertNode(nodes, {
+          kind: 'timeline-visit',
+          key: memberCanonicalUrl,
+          label: memberCanonicalUrl,
+          observedAt: topic.metadata.lastObservedAt,
+          metadata: {
+            canonicalUrl: memberCanonicalUrl,
+          },
+        });
+        upsertEdge(edges, {
+          kind: 'visit_in_topic',
+          fromNodeId: nodeIdFor('timeline-visit', memberCanonicalUrl),
+          toNodeId: nodeIdFor('topic', topic.topicId),
+          observedAt: topic.metadata.lastObservedAt,
+          producedBy: topicProducedBy,
+          confidence: 'inferred',
+        });
+      }
+
+      if (topic.metadata.dominantWorkstreamId !== undefined) {
+        let dominantCount = 0;
+        for (const memberCanonicalUrl of topic.memberCanonicalUrls) {
+          if (visitWorkstreamIdFor(memberCanonicalUrl) === topic.metadata.dominantWorkstreamId) {
+            dominantCount += 1;
+          }
+        }
+        const share =
+          topic.memberCanonicalUrls.length === 0
+            ? 0
+            : dominantCount / topic.memberCanonicalUrls.length;
+        if (share >= workstreamShareThreshold) {
+          upsertNode(nodes, {
+            kind: 'workstream',
+            key: topic.metadata.dominantWorkstreamId,
+            label: topic.metadata.dominantWorkstreamId,
+          });
+          upsertEdge(edges, {
+            kind: 'topic_in_workstream',
+            fromNodeId: nodeIdFor('topic', topic.topicId),
+            toNodeId: nodeIdFor('workstream', topic.metadata.dominantWorkstreamId),
+            observedAt: topic.metadata.lastObservedAt,
+            producedBy: topicProducedBy,
+            confidence: 'inferred',
+          });
+        }
+      }
+    }
+
+    for (const lineage of topicRevision.lineage) {
+      trackObservedAt(lineage.observedAt);
+      upsertEdge(edges, {
+        kind: 'topic.lineage',
+        fromNodeId: nodeIdFor('topic', lineage.fromTopicId),
+        toNodeId: nodeIdFor('topic', lineage.toTopicId),
+        observedAt: lineage.observedAt,
+        producedBy: topicProducedBy,
+        confidence: 'observed',
+        metadata: { lineageKind: lineage.kind },
+      });
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Pass 9 — cross-replica visit evidence. Navigation commits from
+  // the merged log are reduced into one edge per shared
+  // (canonicalUrl, replicaId) pair. Replica nodes exist only as
+  // graph endpoints for this observed evidence.
+  // -------------------------------------------------------------------
+  const crossReplica = input.crossReplica ?? buildCrossReplicaMaterialization(input.events);
+  const replicaSummaryById = new Map(
+    crossReplica.replicas.map((replica) => [replica.replicaId, replica] as const),
+  );
+  const timelineVisitPrefix = 'timeline-visit:';
+  for (const edge of crossReplica.edges) {
+    const replicaId = replicaIdFromNodeId(edge.toNodeId);
+    if (replicaId === null) continue;
+    if (!edge.fromNodeId.startsWith(timelineVisitPrefix)) continue;
+
+    const visitKey = edge.fromNodeId.slice(timelineVisitPrefix.length);
+    if (visitKey.length === 0) continue;
+
+    const replicaSummary = replicaSummaryById.get(replicaId);
+    const replicaFirstSeenAt = replicaSummary?.firstSeenAt ?? edge.observedAt;
+    const replicaLastSeenAt = replicaSummary?.lastSeenAt ?? edge.observedAt;
+    trackObservedAt(edge.observedAt);
+    trackObservedAt(replicaLastSeenAt);
+
+    const existingVisitNode = nodes.get(edge.fromNodeId);
+    upsertNode(nodes, {
+      kind: 'timeline-visit',
+      key: visitKey,
+      label: existingVisitNode?.label ?? visitKey,
+      observedAt: edge.observedAt,
+      replicaId,
+      metadata: {
+        canonicalUrl: visitKey,
+      },
+    });
+    upsertNode(nodes, {
+      kind: 'replica',
+      key: replicaId,
+      label: replicaId,
+      observedAt: replicaFirstSeenAt,
+      replicaId,
+      metadata: {
+        replicaId,
+        firstSeenAt: replicaFirstSeenAt,
+        lastSeenAt: replicaLastSeenAt,
+      },
+    });
+    if (replicaLastSeenAt !== replicaFirstSeenAt) {
+      upsertNode(nodes, {
+        kind: 'replica',
+        key: replicaId,
+        label: replicaId,
+        observedAt: replicaLastSeenAt,
+        replicaId,
+      });
+    }
+    upsertEdge(edges, {
+      kind: edge.kind,
+      fromNodeId: edge.fromNodeId,
+      toNodeId: edge.toNodeId,
+      observedAt: edge.observedAt,
+      producedBy: edge.producedBy,
+      confidence: edge.confidence,
+      family: 'urlmatch',
+    });
+  }
+
+  // -------------------------------------------------------------------
+  // Pass 10 — hash-only snippet lineage. The projection matches
+  // selection.pasted to selection.copied within a 24-hour window by
+  // exact SHA-256 hash or SimHash64 Hamming <= 3. No raw text enters
+  // this reducer.
+  // -------------------------------------------------------------------
+  const snippetRevisionId = 'snippet-lineage:v1:hash';
+  const lineages = projectSnippetLineage(input.events).lineages;
+  const threadDestinationsBySnippet = new Map<string, Set<string>>();
+  const pastedAtBySnippetThread = new Map<string, string>();
+
+  const edgeKindForDestination = (kind: string): ConnectionEdgeKind | null => {
+    if (kind === 'thread') return 'snippet_pasted_into_thread';
+    if (kind === 'dispatch') return 'snippet_pasted_into_dispatch';
+    if (kind === 'search') return 'snippet_pasted_into_search';
+    if (kind === 'note') return 'snippet_pasted_into_note';
+    if (kind === 'capture') return 'snippet_pasted_into_capture';
+    return null;
+  };
+  const nodeKindForDestination = (kind: string): ConnectionNodeKind | null => {
+    if (kind === 'thread') return 'thread';
+    if (kind === 'dispatch') return 'dispatch';
+    if (kind === 'search') return 'timeline-visit';
+    if (kind === 'note') return 'annotation';
+    if (kind === 'capture') return 'annotation';
+    return null;
+  };
+
+  for (const lineage of lineages) {
+    const observedAt = new Date(lineage.pastedAtMs).toISOString();
+    trackObservedAt(observedAt);
+    upsertNode(nodes, {
+      kind: 'snippet',
+      key: lineage.snippetId,
+      label: lineage.snippetId,
+      observedAt,
+      replicaId: lineage.pasteDot.replicaId,
+      metadata: {
+        charHashPrefix: lineage.selectionHash.slice(0, 12),
+        match: lineage.match,
+      },
+    });
+    upsertNode(nodes, {
+      kind: 'timeline-visit',
+      key: lineage.copiedVisitId,
+      label: lineage.copiedVisitId,
+      observedAt: new Date(lineage.copiedAtMs).toISOString(),
+      replicaId: lineage.copyDot.replicaId,
+    });
+    upsertEdge(edges, {
+      kind: 'snippet_copied_from_visit',
+      fromNodeId: nodeIdFor('snippet', lineage.snippetId),
+      toNodeId: nodeIdFor('timeline-visit', lineage.copiedVisitId),
+      observedAt: new Date(lineage.copiedAtMs).toISOString(),
+      producedBy: {
+        source: 'snippet-lineage',
+        revisionId: snippetRevisionId,
+      },
+      confidence: 'observed',
+    });
+
+    const destinationNodeKind = nodeKindForDestination(lineage.destinationKind);
+    const destinationEdgeKind = edgeKindForDestination(lineage.destinationKind);
+    if (destinationNodeKind !== null && destinationEdgeKind !== null) {
+      upsertNode(nodes, {
+        kind: destinationNodeKind,
+        key: lineage.destinationId,
+        label: lineage.destinationId,
+        observedAt,
+        replicaId: lineage.pasteDot.replicaId,
+      });
+      upsertEdge(edges, {
+        kind: destinationEdgeKind,
+        fromNodeId: nodeIdFor('snippet', lineage.snippetId),
+        toNodeId: nodeIdFor(destinationNodeKind, lineage.destinationId),
+        observedAt,
+        producedBy: {
+          source: 'snippet-lineage',
+          revisionId: snippetRevisionId,
+        },
+        confidence: 'observed',
+      });
+    }
+
+    if (lineage.destinationKind === 'thread') {
+      const set = threadDestinationsBySnippet.get(lineage.snippetId) ?? new Set<string>();
+      set.add(lineage.destinationId);
+      threadDestinationsBySnippet.set(lineage.snippetId, set);
+      pastedAtBySnippetThread.set(`${lineage.snippetId}|${lineage.destinationId}`, observedAt);
+    }
+  }
+
+  for (const [snippetId, threadIds] of threadDestinationsBySnippet) {
+    if (threadIds.size < 2) continue;
+    for (const threadId of [...threadIds].sort()) {
+      upsertEdge(edges, {
+        kind: 'snippet_reused_across_threads',
+        fromNodeId: nodeIdFor('snippet', snippetId),
+        toNodeId: nodeIdFor('thread', threadId),
+        observedAt: pastedAtBySnippetThread.get(`${snippetId}|${threadId}`) ?? '',
+        producedBy: {
+          source: 'snippet-lineage',
+          revisionId: snippetRevisionId,
+        },
+        confidence: 'inferred',
+      });
     }
   }
 

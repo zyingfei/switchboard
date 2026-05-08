@@ -1,0 +1,43 @@
+{
+  "visits": [
+    {
+      "canonicalUrl": "https://example.test/a",
+      "title": "Topic A",
+      "focusedWindowMs": 10000,
+      "firstObservedAt": "2026-05-08T10:00:00.000Z",
+      "lastObservedAt": "2026-05-08T11:00:00.000Z"
+    },
+    {
+      "canonicalUrl": "https://example.test/b",
+      "title": "Topic B",
+      "focusedWindowMs": 10000,
+      "firstObservedAt": "2026-05-08T10:00:00.000Z",
+      "lastObservedAt": "2026-05-08T11:00:00.000Z"
+    },
+    {
+      "canonicalUrl": "https://example.test/c",
+      "title": "Topic C",
+      "focusedWindowMs": 10000,
+      "firstObservedAt": "2026-05-08T10:00:00.000Z",
+      "lastObservedAt": "2026-05-08T11:00:00.000Z"
+    }
+  ],
+  "visitSimilarity": {
+    "revisionId": "fixture-topic-user-assertion",
+    "edges": [
+      {
+        "fromVisitKey": "https://example.test/a",
+        "toVisitKey": "https://example.test/b",
+        "cosine": 0.4
+      }
+    ]
+  },
+  "userAssertedRelations": [
+    {
+      "kind": "in_thread",
+      "fromVisitKey": "https://example.test/b",
+      "toVisitKey": "https://example.test/a"
+    }
+  ],
+  "expectedMemberGroups": [["https://example.test/a", "https://example.test/b"]]
+}

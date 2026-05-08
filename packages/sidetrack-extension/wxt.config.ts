@@ -50,10 +50,13 @@ export default defineConfig({
     permissions: [
       'activeTab',
       'alarms',
+      'idle',
       'sidePanel',
       'storage',
+      'unlimitedStorage',
       'scripting',
       'notifications',
+      'webNavigation',
       // Phase 4 — read tab URL/title across all tabs so the timeline
       // observer can see ambient browsing (HN, blog posts, search,
       // GitHub, YouTube, …). Production observation stays gated by

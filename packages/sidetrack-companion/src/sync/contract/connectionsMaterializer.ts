@@ -3,6 +3,7 @@ import {
   ANNOTATION_DELETED,
   ANNOTATION_NOTE_SET,
 } from '../../annotations/events.js';
+import { buildEngagementClassRevision } from '../../connections/engagementClassifier.js';
 import { readVaultStores } from '../../connections/loader.js';
 import {
   buildConnectionsSnapshot,
@@ -10,31 +11,55 @@ import {
 } from '../../connections/snapshot.js';
 import type { ConnectionsStore } from '../../connections/snapshot.js';
 import {
-  buildDayProjection,
-  collectTimelinePayloads,
-  groupByDay,
-  type TimelineDayProjection,
-} from '../../timeline/projection.js';
+  buildTopicRevision,
+  type TopicVisit,
+} from '../../connections/topicClusterer.js';
 import {
-  BROWSER_TIMELINE_OBSERVED,
-  isBrowserTimelineObservedPayload,
-} from '../../timeline/events.js';
-import type { AcceptedEvent } from '../causal.js';
+  buildVisitSimilarity,
+  type VisitSimilarityEmbedder,
+} from '../../connections/visitSimilarity.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
+import { ENGAGEMENT_SESSION_AGGREGATED } from '../../engagement/events.js';
+import { NAVIGATION_COMMITTED } from '../../navigation/events.js';
+import {
+  buildEngagementClassifierInputs,
+  createEngagementClassRevisionStore,
+  type EngagementClassRevisionStore,
+} from '../../producers/engagement-class-revision.js';
+import {
+  createTopicRevisionStore,
+  type TopicRevisionStore,
+} from '../../producers/topic-revision.js';
+import { writeVisitSimilarityRevision } from '../../producers/visit-resembles-revision.js';
 import { QUEUE_CREATED, QUEUE_STATUS_SET } from '../../queue/events.js';
 import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from '../../recall/events.js';
 import { CAPTURE_EXTRACTION_PRODUCED } from '../../recall/extraction/events.js';
+import { embed as defaultEmbed } from '../../recall/embedder.js';
+import { SELECTION_COPIED, SELECTION_PASTED } from '../../snippets/events.js';
 import {
   THREAD_ARCHIVED,
   THREAD_DELETED,
   THREAD_UNARCHIVED,
   THREAD_UPSERTED,
 } from '../../threads/events.js';
-import type { TimelineStore } from '../../timeline/projection.js';
+import {
+  BROWSER_TIMELINE_OBSERVED,
+  type BrowserTimelineObservedPayload,
+  isBrowserTimelineObservedPayload,
+} from '../../timeline/events.js';
+import {
+  buildDayProjection,
+  collectTimelinePayloads,
+  entryIdFor,
+  groupByDay,
+  type TimelineDayProjection,
+  type TimelineStore,
+} from '../../timeline/projection.js';
 import {
   WORKSTREAM_DELETED,
   WORKSTREAM_UPSERTED,
 } from '../../workstreams/events.js';
+import type { AcceptedEvent } from '../causal.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
 
@@ -81,13 +106,17 @@ const HANDLES: ReadonlySet<string> = new Set<string>([
   CAPTURE_RECORDED,
   CAPTURE_EXTRACTION_PRODUCED,
   RECALL_TOMBSTONE_TARGET,
+  NAVIGATION_COMMITTED,
+  ENGAGEMENT_SESSION_AGGREGATED,
+  SELECTION_COPIED,
+  SELECTION_PASTED,
   // Timeline observations indirectly contribute (timeline visits
   // become nodes; same canonicalUrl produces edges to threads).
   // Including the event type here keeps freshness bound to the
   // arrival of the underlying observation, even though the
   // materializer reads the daily projection rather than the
   // event payload directly.
-  'browser.timeline.observed',
+  BROWSER_TIMELINE_OBSERVED,
 ]);
 
 export interface CreateConnectionsMaterializerDeps {
@@ -95,17 +124,73 @@ export interface CreateConnectionsMaterializerDeps {
   readonly eventLog: EventLog;
   readonly timelineStore: TimelineStore;
   readonly store: ConnectionsStore;
+  readonly embed?: VisitSimilarityEmbedder;
+  readonly topicRevisionStore?: TopicRevisionStore;
+  readonly engagementClassStore?: EngagementClassRevisionStore;
 }
 
 export const createConnectionsMaterializer = (
   deps: CreateConnectionsMaterializerDeps,
 ): Materializer => {
+  const topicRevisionStore =
+    deps.topicRevisionStore ?? createTopicRevisionStore(deps.vaultRoot);
+  const engagementClassStore =
+    deps.engagementClassStore ?? createEngagementClassRevisionStore(deps.vaultRoot);
   let pending = false;
   let running = false;
   let dirty = false;
   let lastSuccessAt: string | null = null;
   let lastError: string | null = null;
   let lastFailureAtMs = 0;
+
+  type TimelineEntryWithDimensions = TimelineDayProjection['entries'][number] & {
+    readonly dimensions?: unknown;
+  };
+  type TimelineDayProjectionWithDimensions = Omit<TimelineDayProjection, 'entries'> & {
+    readonly entries: readonly TimelineEntryWithDimensions[];
+  };
+
+  const isRecord = (value: unknown): value is Record<string, unknown> =>
+    typeof value === 'object' && value !== null && !Array.isArray(value);
+
+  const focusedWindowMsFromPayload = (
+    payload: BrowserTimelineObservedPayload,
+  ): number | undefined => {
+    if (!isRecord(payload.dimensions)) return undefined;
+    const engagement = payload.dimensions['engagement'];
+    if (!isRecord(engagement)) return undefined;
+    const focused = engagement['focusedWindowMs'];
+    if (typeof focused !== 'number' || !Number.isFinite(focused) || focused < 0) {
+      return undefined;
+    }
+    return focused;
+  };
+
+  const focusedWindowMsFromEntry = (entry: TimelineEntryWithDimensions): number => {
+    if (!isRecord(entry.dimensions)) return 0;
+    const engagement = entry.dimensions['engagement'];
+    if (!isRecord(engagement)) return 0;
+    const focused = engagement['focusedWindowMs'];
+    if (typeof focused !== 'number' || !Number.isFinite(focused) || focused < 0) {
+      return 0;
+    }
+    return focused;
+  };
+
+  const stripFragmentAndTrailingSlash = (url: string): string =>
+    url.replace(/#.*$/u, '').replace(/\/+$/u, '');
+
+  const topicVisitFromEntry = (entry: TimelineEntryWithDimensions): TopicVisit => {
+    const canonicalUrl = stripFragmentAndTrailingSlash(entry.canonicalUrl ?? entry.url);
+    return {
+      canonicalUrl,
+      ...(entry.title === undefined ? {} : { title: entry.title }),
+      focusedWindowMs: focusedWindowMsFromEntry(entry),
+      firstObservedAt: entry.firstSeenAt,
+      lastObservedAt: entry.lastSeenAt,
+      ...(entry.workstreamId === undefined ? {} : { workstreamId: entry.workstreamId }),
+    };
+  };
 
   // Build the per-day timeline projection in-memory directly from the
   // merged event log instead of reading the timelineStore. The
@@ -117,7 +202,7 @@ export const createConnectionsMaterializer = (
   // cross-replica, where peer events arrive in bursts).
   const buildTimelineDays = (
     merged: readonly AcceptedEvent[],
-  ): readonly TimelineDayProjection[] => {
+  ): readonly TimelineDayProjectionWithDimensions[] => {
     const payloads = collectTimelinePayloads(
       merged.filter(
         (e) =>
@@ -126,21 +211,112 @@ export const createConnectionsMaterializer = (
       ),
     );
     const grouped = groupByDay(payloads);
-    const out: TimelineDayProjection[] = [];
+    const out: TimelineDayProjectionWithDimensions[] = [];
     for (const [date, dayPayloads] of grouped) {
-      out.push(buildDayProjection(date, dayPayloads));
+      const focusedByEntryId = new Map<string, number>();
+      for (const payload of dayPayloads) {
+        const focusedWindowMs = focusedWindowMsFromPayload(payload);
+        if (focusedWindowMs === undefined) continue;
+        const entryId = entryIdFor(payload);
+        focusedByEntryId.set(
+          entryId,
+          Math.max(focusedByEntryId.get(entryId) ?? 0, focusedWindowMs),
+        );
+      }
+      const projection = buildDayProjection(date, dayPayloads);
+      const entries: TimelineEntryWithDimensions[] = projection.entries.map((entry) => {
+        const focusedWindowMs = focusedByEntryId.get(entry.id);
+        if (focusedWindowMs === undefined) return entry;
+        return {
+          ...entry,
+          dimensions: { engagement: { focusedWindowMs } },
+        };
+      });
+      out.push({ ...projection, entries });
     }
     return out;
   };
 
+  const dimensionsWithFocusedWindowMs = (
+    entry: TimelineEntryWithDimensions,
+    focusedWindowMs: number,
+  ): Record<string, unknown> => {
+    const dimensions = isRecord(entry.dimensions) ? entry.dimensions : {};
+    const engagement = isRecord(dimensions['engagement']) ? dimensions['engagement'] : {};
+    return {
+      ...dimensions,
+      engagement: {
+        ...engagement,
+        focusedWindowMs,
+      },
+    };
+  };
+
+  const enrichTimelineDaysWithEngagement = (
+    days: readonly TimelineDayProjectionWithDimensions[],
+    engagementInputs: ReturnType<typeof buildEngagementClassifierInputs>,
+  ): readonly TimelineDayProjectionWithDimensions[] => {
+    const focusedByCanonicalUrl = new Map<string, number>();
+    for (const input of engagementInputs) {
+      const canonicalUrl = stripFragmentAndTrailingSlash(input.canonicalUrl);
+      focusedByCanonicalUrl.set(
+        canonicalUrl,
+        Math.max(
+          focusedByCanonicalUrl.get(canonicalUrl) ?? 0,
+          input.engagement.focusedWindowMs,
+        ),
+      );
+    }
+
+    return days.map((day) => ({
+      ...day,
+      entries: day.entries.map((entry): TimelineEntryWithDimensions => {
+        const canonicalUrl = stripFragmentAndTrailingSlash(entry.canonicalUrl ?? entry.url);
+        const focusedWindowMs = Math.max(
+          focusedWindowMsFromEntry(entry),
+          focusedByCanonicalUrl.get(canonicalUrl) ?? 0,
+        );
+        if (focusedWindowMs <= 0) return entry;
+        return {
+          ...entry,
+          dimensions: dimensionsWithFocusedWindowMs(entry, focusedWindowMs),
+        };
+      }),
+    }));
+  };
+
+  const maxAcceptedAtMs = (events: readonly AcceptedEvent[]): number =>
+    events.reduce((max, event) => Math.max(max, event.acceptedAtMs), 0);
+
   const buildAndWrite = async (): Promise<void> => {
     const merged = await deps.eventLog.readMerged();
     const vault = await readVaultStores(deps.vaultRoot);
-    const timelineDays = buildTimelineDays(merged);
+    const rawTimelineDays = buildTimelineDays(merged);
+    const engagementInputs = buildEngagementClassifierInputs(merged, rawTimelineDays);
+    const engagementClassRevision = buildEngagementClassRevision(engagementInputs, {
+      producedAt: maxAcceptedAtMs(merged),
+    });
+    await engagementClassStore.putRevision(engagementClassRevision);
+    const timelineDays = enrichTimelineDaysWithEngagement(rawTimelineDays, engagementInputs);
+    const visitSimilarity = await buildVisitSimilarity(
+      timelineDays.flatMap((day) => day.entries),
+      deps.embed ?? defaultEmbed,
+    );
+    await writeVisitSimilarityRevision(deps.vaultRoot, visitSimilarity);
+    const previousTopicRevision = await topicRevisionStore.readActiveRevision();
+    const topicRevision = await buildTopicRevision({
+      visits: timelineDays.flatMap((day) => day.entries.map(topicVisitFromEntry)),
+      visitSimilarity,
+      ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
+    });
+    await topicRevisionStore.putActiveRevision(topicRevision);
     const input: ConnectionsInput = {
       events: merged,
       ...vault,
       timelineDays,
+      visitSimilarity,
+      topicRevision,
+      engagementClassRevision,
     };
     const snapshot = buildConnectionsSnapshot(input);
     await deps.store.putCurrent(snapshot);

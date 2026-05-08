@@ -29,10 +29,21 @@ import {
   ANNOTATION_NOTE_SET,
 } from '../../annotations/events.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
+import {
+  ENGAGEMENT_INTERVAL_OBSERVED,
+  ENGAGEMENT_SESSION_AGGREGATED,
+} from '../../engagement/events.js';
+import {
+  PRIVACY_GATE_FLIPPED,
+  PRIVACY_PERMISSION_GRANTED,
+  PRIVACY_PERMISSION_REVOKED,
+} from '../../privacy/events.js';
+import { NAVIGATION_COMMITTED } from '../../navigation/events.js';
 import { QUEUE_CREATED, QUEUE_STATUS_SET } from '../../queue/events.js';
 import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from '../../recall/events.js';
 import { CAPTURE_EXTRACTION_PRODUCED } from '../../recall/extraction/events.js';
 import { REVIEW_DRAFT_EVENT_TYPES } from '../../review/projection.js';
+import { SELECTION_COPIED, SELECTION_PASTED } from '../../snippets/events.js';
 import {
   THREAD_ARCHIVED,
   THREAD_DELETED,
@@ -71,6 +82,8 @@ export interface SurfaceContract {
 
 export interface ContractEntry {
   readonly eventType: string;
+  readonly currentPayloadVersion?: number;
+  readonly allowedDimensions?: readonly string[];
   readonly surfaces: readonly SurfaceContract[];
 }
 
@@ -101,6 +114,7 @@ export const KNOWN_MATERIALIZERS: ReadonlySet<string> = new Set<string>([
 
 const projectionEntry = (eventType: string, surface: string): ContractEntry => ({
   eventType,
+  currentPayloadVersion: 1,
   surfaces: [
     {
       surface,
@@ -116,6 +130,14 @@ const reviewDraftEntries: readonly ContractEntry[] = REVIEW_DRAFT_EVENT_TYPES.ma
   (eventType) => projectionEntry(eventType, 'review-draft-projection'),
 );
 
+const engagementClassProjectionSurface: SurfaceContract = {
+  surface: 'engagement-class-projection',
+  class: 'extraction-revision',
+  materializer: 'connections',
+  peerFreshnessMs: 30_000,
+  recovery: 'replay-event-log',
+};
+
 export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   // Class A — aggregate projections.
   projectionEntry(THREAD_UPSERTED, 'thread-projection'),
@@ -128,11 +150,15 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   projectionEntry(QUEUE_STATUS_SET, 'queue-projection'),
   projectionEntry(DISPATCH_RECORDED, 'dispatch-projection'),
   projectionEntry(DISPATCH_LINKED, 'dispatch-projection'),
+  projectionEntry(PRIVACY_GATE_FLIPPED, 'privacy-projection'),
+  projectionEntry(PRIVACY_PERMISSION_GRANTED, 'privacy-projection'),
+  projectionEntry(PRIVACY_PERMISSION_REVOKED, 'privacy-projection'),
   // Annotation events fan out to TWO surfaces: the projection (Class A,
   // SSE-mirrored) AND the in-page overlay refresh (Class A, dispatched
   // via runtime message to tabs viewing the annotated URL).
   {
     eventType: ANNOTATION_CREATED,
+    currentPayloadVersion: 1,
     surfaces: [
       {
         surface: 'annotation-projection',
@@ -156,6 +182,7 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   },
   {
     eventType: ANNOTATION_NOTE_SET,
+    currentPayloadVersion: 1,
     surfaces: [
       {
         surface: 'annotation-projection',
@@ -179,6 +206,7 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   },
   {
     eventType: ANNOTATION_DELETED,
+    currentPayloadVersion: 1,
     surfaces: [
       {
         surface: 'annotation-projection',
@@ -212,6 +240,7 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   // KNOWN_MATERIALIZERS).
   {
     eventType: CAPTURE_RECORDED,
+    currentPayloadVersion: 1,
     surfaces: [
       {
         surface: 'recall-index',
@@ -229,6 +258,7 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   },
   {
     eventType: RECALL_TOMBSTONE_TARGET,
+    currentPayloadVersion: 1,
     surfaces: [
       {
         surface: 'recall-index',
@@ -251,6 +281,7 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   // coverage test enforces that gap.
   {
     eventType: CAPTURE_EXTRACTION_PRODUCED,
+    currentPayloadVersion: 1,
     surfaces: [
       {
         surface: 'extraction-revisions',
@@ -277,7 +308,93 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   //      reduction over events, not a per-aggregate LWW). Owned by
   //      the dedicated 'timeline' materializer.
   {
+    eventType: NAVIGATION_COMMITTED,
+    currentPayloadVersion: 1,
+    allowedDimensions: ['provenance'],
+    surfaces: [
+      {
+        surface: 'plugin-navigation-committed',
+        class: 'plugin-tier-bounded',
+        peerFreshnessMs: 1_000,
+        recovery: 'spool-drain',
+      },
+      {
+        surface: 'connections-causal-spine',
+        class: 'derived-cache',
+        materializer: 'connections',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+    ],
+  },
+  {
+    eventType: ENGAGEMENT_INTERVAL_OBSERVED,
+    currentPayloadVersion: 1,
+    allowedDimensions: ['engagement'],
+    surfaces: [
+      {
+        surface: 'plugin-engagement-intervals',
+        class: 'plugin-tier-bounded',
+        peerFreshnessMs: 1_000,
+        recovery: 'spool-drain',
+      },
+      {
+        surface: 'engagement-session-projection',
+        class: 'derived-cache',
+        materializer: 'connections',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+    ],
+  },
+  {
+    eventType: ENGAGEMENT_SESSION_AGGREGATED,
+    currentPayloadVersion: 1,
+    allowedDimensions: ['engagement'],
+    surfaces: [
+      {
+        surface: 'engagement-session-projection',
+        class: 'derived-cache',
+        materializer: 'connections',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+      engagementClassProjectionSurface,
+    ],
+  },
+  {
+    eventType: SELECTION_COPIED,
+    currentPayloadVersion: 1,
+    allowedDimensions: [],
+    surfaces: [
+      {
+        surface: 'snippet-lineage',
+        class: 'derived-cache',
+        materializer: 'connections',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+      engagementClassProjectionSurface,
+    ],
+  },
+  {
+    eventType: SELECTION_PASTED,
+    currentPayloadVersion: 1,
+    allowedDimensions: [],
+    surfaces: [
+      {
+        surface: 'snippet-lineage',
+        class: 'derived-cache',
+        materializer: 'connections',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+      engagementClassProjectionSurface,
+    ],
+  },
+  {
     eventType: BROWSER_TIMELINE_OBSERVED,
+    currentPayloadVersion: 1,
     surfaces: [
       {
         surface: 'plugin-timeline-active-window',

@@ -24,7 +24,10 @@ export type ConnectionNodeKind =
   | 'inbound-reminder'
   | 'coding-session'
   | 'timeline-visit'
-  | 'annotation';
+  | 'annotation'
+  | 'snippet'
+  | 'topic'
+  | 'replica';
 
 export interface ConnectionNode {
   // Namespaced ids: `kind:bac_id` (or `timeline-visit:<canonicalUrl>`).
@@ -96,12 +99,27 @@ export type ConnectionEdgeKind =
   // visit (whole-word, case-insensitive). Closes the "I searched X
   // and asked the AI about X without pasting the URL" gap.
   | 'thread_text_mentions_search_query'
+  // Content-similarity match between browser visits. Produced by
+  // the visit-similarity Class E revision over the existing recall
+  // embedding model.
+  | 'visit_resembles_visit'
   // Active-workstream attribution: the timeline observer stamped the
   // user's currently-focused workstream id onto the visit. Closes
   // the "ambient browsing" gap — pages the user looked at while
   // working in a workstream attach to that workstream even when no
   // chat / dispatch / annotation references them.
-  | 'visit_in_workstream';
+  | 'visit_in_workstream'
+  | 'visit_in_topic'
+  | 'topic_in_workstream'
+  | 'topic.lineage'
+  | 'snippet_copied_from_visit'
+  | 'snippet_pasted_into_thread'
+  | 'snippet_pasted_into_dispatch'
+  | 'snippet_pasted_into_search'
+  | 'snippet_pasted_into_note'
+  | 'snippet_pasted_into_capture'
+  | 'snippet_reused_across_threads'
+  | 'visit_observed_on_replica';
 
 export type ConnectionEdgeSource =
   | 'event-log'
@@ -112,6 +130,37 @@ export type ConnectionEdgeSource =
   | 'annotation-store'
   | 'reminder-store';
 
+type ConnectionEdgeDot = { readonly replicaId: string; readonly seq: number };
+
+type RevisionProducedBySource =
+  | 'visit-similarity'
+  | 'topic-clusterer'
+  | 'engagement-classifier'
+  | 'snippet-lineage';
+
+export type ConnectionEdgeProducedBy =
+  | {
+      readonly source: ConnectionEdgeSource;
+      readonly eventType?: string;
+      readonly dot?: ConnectionEdgeDot;
+      readonly recordId?: string;
+      readonly revisionId?: never;
+    }
+  | {
+      readonly source: RevisionProducedBySource;
+      readonly revisionId: string;
+      readonly eventType?: never;
+      readonly dot?: never;
+      readonly recordId?: never;
+    }
+  | {
+      readonly source: 'cross-replica';
+      readonly eventType?: never;
+      readonly dot?: never;
+      readonly recordId?: never;
+      readonly revisionId?: never;
+    };
+
 export interface ConnectionEdge {
   // Deterministic id: `edge:<kind>:<from>:<to>`. Same edge across
   // re-runs gets the same id, so dedup is trivial and the snapshot
@@ -121,18 +170,34 @@ export interface ConnectionEdge {
   readonly fromNodeId: string;
   readonly toNodeId: string;
   readonly observedAt: string;
-  readonly producedBy: {
-    readonly source: ConnectionEdgeSource;
-    readonly eventType?: string;
-    readonly dot?: { readonly replicaId: string; readonly seq: number };
-    readonly recordId?: string;
-  };
-  // 'explicit' = the source surfaces this edge directly (e.g.
-  //   thread.primaryWorkstreamId, dispatch.sourceThreadId).
-  // 'deterministic' = derived from a deterministic match (e.g.
-  //   canonicalUrl join between timeline visit and thread).
-  // P3 may add 'suggested' for embedding-similarity inferred edges.
-  readonly confidence: 'explicit' | 'deterministic';
+  readonly producedBy: ConnectionEdgeProducedBy;
+  // 'asserted' = user-entered or user-authored state surfaced directly.
+  // 'observed' = event/telemetry-derived fact observed by the system.
+  // 'inferred' = deterministic algorithmic joins / similarity-style links.
+  readonly confidence: 'asserted' | 'observed' | 'inferred';
+  readonly family?: 'contain' | 'flow' | 'defer' | 'urlmatch';
+  readonly metadata?: ConnectionEdgeMetadata;
+}
+
+export interface ConnectionEdgeMetadata {
+  readonly lineageKind?: 'split' | 'merge';
+  readonly [key: string]: unknown;
+}
+
+export interface VisitSimilarityEdge {
+  readonly fromVisitKey: string;
+  readonly toVisitKey: string;
+  readonly cosine: number;
+}
+
+export interface VisitSimilarityRevision {
+  readonly revisionId: string;
+  readonly modelId: 'Xenova/multilingual-e5-small';
+  readonly modelRevision: string;
+  readonly featureSchemaVersion: number;
+  readonly threshold: number;
+  readonly edges: readonly VisitSimilarityEdge[];
+  readonly producedAt: number;
 }
 
 export interface ConnectionsSnapshotScope {

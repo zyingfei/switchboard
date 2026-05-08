@@ -1,0 +1,98 @@
+{
+  "visits": [
+    {
+      "canonicalUrl": "https://example.test/a",
+      "title": "Topic A",
+      "focusedWindowMs": 10000,
+      "firstObservedAt": "2026-05-08T10:00:00.000Z",
+      "lastObservedAt": "2026-05-08T11:00:00.000Z"
+    },
+    {
+      "canonicalUrl": "https://example.test/b",
+      "title": "Topic B",
+      "focusedWindowMs": 10000,
+      "firstObservedAt": "2026-05-08T10:00:00.000Z",
+      "lastObservedAt": "2026-05-08T11:00:00.000Z"
+    },
+    {
+      "canonicalUrl": "https://example.test/c",
+      "title": "Topic C",
+      "focusedWindowMs": 10000,
+      "firstObservedAt": "2026-05-08T10:00:00.000Z",
+      "lastObservedAt": "2026-05-08T11:00:00.000Z"
+    },
+    {
+      "canonicalUrl": "https://example.test/d",
+      "title": "Topic D",
+      "focusedWindowMs": 10000,
+      "firstObservedAt": "2026-05-08T10:00:00.000Z",
+      "lastObservedAt": "2026-05-08T11:00:00.000Z"
+    },
+    {
+      "canonicalUrl": "https://example.test/e",
+      "title": "Topic E",
+      "focusedWindowMs": 10000,
+      "firstObservedAt": "2026-05-08T10:00:00.000Z",
+      "lastObservedAt": "2026-05-08T11:00:00.000Z"
+    },
+    {
+      "canonicalUrl": "https://example.test/f",
+      "title": "Topic F",
+      "focusedWindowMs": 10000,
+      "firstObservedAt": "2026-05-08T10:00:00.000Z",
+      "lastObservedAt": "2026-05-08T11:00:00.000Z"
+    }
+  ],
+  "previousVisitSimilarity": {
+    "revisionId": "fixture-topic-merge-previous",
+    "edges": [
+      {
+        "fromVisitKey": "https://example.test/a",
+        "toVisitKey": "https://example.test/b",
+        "cosine": 0.91
+      },
+      {
+        "fromVisitKey": "https://example.test/b",
+        "toVisitKey": "https://example.test/c",
+        "cosine": 0.91
+      },
+      {
+        "fromVisitKey": "https://example.test/d",
+        "toVisitKey": "https://example.test/e",
+        "cosine": 0.91
+      }
+    ]
+  },
+  "currentVisitSimilarity": {
+    "revisionId": "fixture-topic-merge-current",
+    "edges": [
+      {
+        "fromVisitKey": "https://example.test/a",
+        "toVisitKey": "https://example.test/b",
+        "cosine": 0.91
+      },
+      {
+        "fromVisitKey": "https://example.test/b",
+        "toVisitKey": "https://example.test/c",
+        "cosine": 0.91
+      },
+      {
+        "fromVisitKey": "https://example.test/c",
+        "toVisitKey": "https://example.test/f",
+        "cosine": 0.91
+      },
+      {
+        "fromVisitKey": "https://example.test/f",
+        "toVisitKey": "https://example.test/d",
+        "cosine": 0.91
+      },
+      {
+        "fromVisitKey": "https://example.test/d",
+        "toVisitKey": "https://example.test/e",
+        "cosine": 0.91
+      }
+    ]
+  },
+  "expectedCurrentTopicCount": 1,
+  "expectedLineageKinds": ["merge", "merge"]
+}

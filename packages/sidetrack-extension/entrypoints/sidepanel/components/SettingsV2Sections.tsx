@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react';
 
 import { formatRelative } from '../../../src/util/time';
 import { Icons } from './icons';
-import { TIMELINE_ENABLED_KEY } from '../../../src/timeline/wiring';
 
 // Settings v2 — section components for the SettingsPanel. Each is
 // self-contained and accepts pre-shaped props so the parent owns
@@ -131,6 +130,30 @@ export function AppearanceSection({
 
 const TIMELINE_OPTIONAL_ORIGINS = ['https://*/*', 'http://*/*'] as const;
 
+const readTimelinePrivacyGate = async (): Promise<boolean> => {
+  const response = (await chrome.runtime.sendMessage({
+    type: 'sidetrack.timeline.privacy.get',
+  })) as { readonly ok?: boolean; readonly enabled?: unknown; readonly error?: string };
+  if (response.ok !== true) throw new Error(response.error ?? 'privacy gate read failed');
+  return response.enabled === true;
+};
+
+const writeTimelinePrivacyGate = async (enabled: boolean): Promise<void> => {
+  const response = (await chrome.runtime.sendMessage({
+    type: 'sidetrack.timeline.privacy.set',
+    enabled,
+  })) as { readonly ok?: boolean; readonly error?: string };
+  if (response.ok !== true) throw new Error(response.error ?? 'privacy gate write failed');
+};
+
+const recordTimelinePermissionEvent = async (type: string): Promise<void> => {
+  const response = (await chrome.runtime.sendMessage({ type })) as {
+    readonly ok?: boolean;
+    readonly error?: string;
+  };
+  if (response.ok !== true) throw new Error(response.error ?? 'privacy permission event failed');
+};
+
 const readChromePermissionsContains = async (): Promise<boolean> => {
   try {
     return await new Promise<boolean>((resolve) => {
@@ -152,17 +175,17 @@ export function TimelineSection() {
   const [busy, setBusy] = useState<boolean>(false);
   const [notice, setNotice] = useState<string | null>(null);
 
-  // Hydrate gate + permission state on mount. The gate read is async via
-  // chrome.storage.local; the permission read is async via
-  // chrome.permissions.contains.
+  // Hydrate gate + permission state on mount. The gate read goes
+  // through the background privacy projection bridge; the permission
+  // read is async via chrome.permissions.contains.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
-        const got = await chrome.storage.local.get(TIMELINE_ENABLED_KEY);
-        if (!cancelled) setEnabled(got[TIMELINE_ENABLED_KEY] === true);
+        const gateOpen = await readTimelinePrivacyGate();
+        if (!cancelled) setEnabled(gateOpen);
       } catch {
-        // chrome.storage missing in a test harness — leave default false.
+        // Companion / chrome missing in a test harness — leave default false.
       }
       const granted = await readChromePermissionsContains();
       if (!cancelled) setHasPermission(granted);
@@ -176,19 +199,8 @@ export function TimelineSection() {
     setBusy(true);
     setNotice(null);
     try {
-      await chrome.storage.local.set({ [TIMELINE_ENABLED_KEY]: next });
+      await writeTimelinePrivacyGate(next);
       setEnabled(next);
-      // Tell the SW to (re-)init wiring so the gate flip takes effect
-      // without a reload. The handler is idempotent — flipping off
-      // can leave the listener registered (no observation lands while
-      // the gate is false; the wiring's emit closure consults the gate
-      // each time).
-      try {
-        await chrome.runtime.sendMessage({ type: 'sidetrack.timeline.reinit' });
-      } catch {
-        // SW may be dormant; the next event-driven boot picks up the
-        // gate. Not blocking.
-      }
       setNotice(
         next
           ? 'Timeline observation enabled. URL + title for every navigation will land in the timeline projection.'
@@ -216,6 +228,9 @@ export function TimelineSection() {
         );
       });
       setHasPermission(granted);
+      if (granted) {
+        await recordTimelinePermissionEvent('sidetrack.timeline.permission.granted').catch(() => undefined);
+      }
       setNotice(
         granted
           ? 'Deeper page access granted. Future Sidetrack features (content extraction, in-page actions) will use this — URL/title observation already worked without it.'
@@ -243,6 +258,9 @@ export function TimelineSection() {
         );
       });
       if (removed) setHasPermission(false);
+      if (removed) {
+        await recordTimelinePermissionEvent('sidetrack.timeline.permission.revoked').catch(() => undefined);
+      }
       setNotice(
         removed
           ? 'Deeper page access revoked. Timeline observation still records URL + title.'

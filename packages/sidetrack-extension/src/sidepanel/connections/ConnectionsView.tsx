@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type ReactElement } from 'react';
 
+import { ContextPackComposer } from './ContextPackComposer';
 import { fetchConnectionsEdge, fetchConnectionsNeighbors } from './client';
 import {
   EDGE_KINDS,
@@ -9,6 +10,18 @@ import {
   contentDerivedHint,
   type EdgeFamily,
 } from './edgeKinds';
+import {
+  FlowPathView,
+  type CrossReplicaEdge,
+  type NavigationEdge,
+  type TimelineVisit,
+} from './FlowPathView';
+import {
+  FocusView,
+  type EngagementClass,
+  type TopicNode,
+  type TopicVisit,
+} from './FocusView';
 import { CloseIcon, KindIcons, SearchIcon } from './icons';
 import { computeOrbitalLayout, type OrbitalLayoutResult } from './orbitalLayout';
 import { computeTimelineRail, type TimelineRailData } from './timelineWindows';
@@ -18,6 +31,8 @@ import type {
   ConnectionNodeKind,
   ConnectionsScopedResult,
 } from './types';
+import { WhyRelatedPanel } from './WhyRelatedPanel';
+import type { Reason } from './why-related/reasons';
 
 // Connections side-panel view — Concept A (linked panels) + Concept B
 // (orbital graph) ports of the Claude Design switchboard bundle.
@@ -47,11 +62,186 @@ type Props = {
   readonly recentAnchors?: readonly ConnectionsViewRecentAnchor[];
 };
 
-type SubMode = 'linked' | 'orbital';
+type SubMode = 'linked' | 'orbital' | 'flow' | 'focus' | 'context';
 
 const KIND_RANK = new Map<ConnectionNodeKind, number>(
   NODE_KIND_GROUP_ORDER.map((k, i) => [k, i] as const),
 );
+
+const edgeConfidenceClass = (confidence: ConnectionEdge['confidence']): string => {
+  return confidence === 'inferred' ? 'confidence-inferred' : '';
+};
+
+const metadataString = (
+  metadata: Record<string, unknown>,
+  keys: readonly string[],
+): string | undefined => {
+  for (const key of keys) {
+    const value = metadata[key];
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return undefined;
+};
+
+const metadataNumber = (
+  metadata: Record<string, unknown>,
+  key: string,
+  fallback: number,
+): number => {
+  const value = metadata[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+};
+
+const isEngagementClass = (value: unknown): value is EngagementClass =>
+  value === 'parked_background' ||
+  value === 'glanced' ||
+  value === 'skimmed' ||
+  value === 'engaged_read' ||
+  value === 'worked_on_reference' ||
+  value === 'source_extracted' ||
+  value === 'execution_source';
+
+const engagementClassForNode = (node: ConnectionNode): EngagementClass | undefined => {
+  const engagement = node.metadata['engagement'];
+  if (typeof engagement !== 'object' || engagement === null || Array.isArray(engagement)) {
+    return undefined;
+  }
+  const value = (engagement as Record<string, unknown>)['class'];
+  return isEngagementClass(value) ? value : undefined;
+};
+
+const deriveFlowVisits = (nodes: readonly ConnectionNode[]): readonly TimelineVisit[] =>
+  nodes
+    .filter((node) => node.kind === 'timeline-visit')
+    .map((node) => ({
+      id: node.id,
+      label: node.label,
+      commitTimestamp:
+        node.lastSeenAt ??
+        metadataString(node.metadata, ['commitTimestamp', 'lastSeenAt', 'observedAt']) ??
+        '1970-01-01T00:00:00.000Z',
+      tabSessionIdHash:
+        metadataString(node.metadata, ['tabSessionIdHash', 'tabIdHash']) ?? 'unknown-tab',
+      ...(engagementClassForNode(node) === undefined
+        ? {}
+        : { engagementClass: engagementClassForNode(node) }),
+    }));
+
+const deriveNavigationEdges = (edges: readonly ConnectionEdge[]): readonly NavigationEdge[] =>
+  edges
+    .filter((edge) => edge.kind === 'previous_visit_in_tab_session' || edge.kind === 'opener_visit')
+    .map((edge) => ({
+      id: edge.id,
+      fromVisitId: edge.fromNodeId,
+      toVisitId: edge.toNodeId,
+      kind: edge.kind === 'opener_visit' ? 'openerVisitId' : 'previousVisitId',
+    }));
+
+const deriveCrossReplicaEdges = (edges: readonly ConnectionEdge[]): readonly CrossReplicaEdge[] =>
+  edges
+    .filter((edge) => edge.kind === 'visit_observed_on_replica')
+    .map((edge) => ({
+      id: edge.id,
+      fromVisitId: edge.fromNodeId,
+      replicaId: edge.toNodeId.replace(/^replica:/u, ''),
+    }));
+
+const deriveFocusData = (
+  nodes: readonly ConnectionNode[],
+  edges: readonly ConnectionEdge[],
+): {
+  readonly topics: readonly TopicNode[];
+  readonly visitsByTopic: Record<string, readonly TopicVisit[]>;
+  readonly engagementClassesByVisit: Record<string, EngagementClass>;
+} => {
+  const nodeById = new Map(nodes.map((node) => [node.id, node] as const));
+  const topics: TopicNode[] = nodes
+    .filter((node) => node.kind === 'topic')
+    .map((node) => ({
+      id: node.id,
+      label: node.label,
+      memberCount: metadataNumber(node.metadata, 'memberCount', 0),
+      cohesion: metadataNumber(node.metadata, 'cohesion', 0),
+      ...(metadataString(node.metadata, ['dominantWorkstreamId']) === undefined
+        ? {}
+        : { dominantWorkstreamId: metadataString(node.metadata, ['dominantWorkstreamId']) }),
+    }));
+  const visitsByTopic: Record<string, TopicVisit[]> = {};
+  const engagementClassesByVisit: Record<string, EngagementClass> = {};
+  for (const node of nodes) {
+    const engagementClass = engagementClassForNode(node);
+    if (node.kind === 'timeline-visit' && engagementClass !== undefined) {
+      engagementClassesByVisit[node.id] = engagementClass;
+    }
+  }
+  for (const edge of edges) {
+    if (edge.kind !== 'visit_in_topic') continue;
+    const visit = nodeById.get(edge.fromNodeId);
+    if (visit === undefined) continue;
+    const list = visitsByTopic[edge.toNodeId] ?? [];
+    visitsByTopic[edge.toNodeId] = [
+      ...list,
+      {
+        id: visit.id,
+        label: visit.label,
+        focusedWindowMs: metadataNumber(visit.metadata, 'focusedWindowMs', 0),
+      },
+    ];
+  }
+  return { topics, visitsByTopic, engagementClassesByVisit };
+};
+
+const reasonsForVisit = (
+  nodes: readonly ConnectionNode[],
+  edges: readonly ConnectionEdge[],
+  visitId: string,
+): readonly Reason[] => {
+  const nodeById = new Map(nodes.map((node) => [node.id, node] as const));
+  const reasons: Reason[] = [];
+  for (const edge of edges) {
+    if (edge.fromNodeId !== visitId && edge.toNodeId !== visitId) continue;
+    if (edge.kind === 'timeline_same_url_as_thread') {
+      const thread = nodeById.get(edge.fromNodeId === visitId ? edge.toNodeId : edge.fromNodeId);
+      reasons.push({
+        code: 'SAME_THREAD',
+        threadId: thread?.id ?? 'thread:unknown',
+        threadName: thread?.label ?? 'Unknown thread',
+      });
+    } else if (edge.kind === 'visit_resembles_visit') {
+      reasons.push({ code: 'COSINE_ABOVE_THRESHOLD', cosine: 0.85, threshold: 0.85 });
+    } else if (edge.kind === 'visit_in_topic') {
+      const topic = nodeById.get(edge.toNodeId);
+      reasons.push({
+        code: 'SAME_TOPIC',
+        topicId: edge.toNodeId,
+        cohesion: topic === undefined ? 0 : metadataNumber(topic.metadata, 'cohesion', 0),
+      });
+    } else if (edge.kind === 'visit_observed_on_replica') {
+      reasons.push({
+        code: 'OBSERVED_ON_OTHER_REPLICA',
+        replicaId: edge.toNodeId.replace(/^replica:/u, ''),
+      });
+    } else if (edge.kind === 'snippet_copied_from_visit') {
+      reasons.push({ code: 'COPIED_FROM', snippetId: edge.fromNodeId });
+    } else if (edge.kind.startsWith('snippet_pasted_into_')) {
+      reasons.push({
+        code: 'PASTED_INTO',
+        snippetId: edge.fromNodeId,
+        destinationKind: edge.kind.replace(/^snippet_pasted_into_/u, ''),
+      });
+    } else if (edge.kind === 'thread_text_mentions_search_query') {
+      const visit = nodeById.get(visitId);
+      const query = metadataString(visit?.metadata ?? {}, ['searchQuery']);
+      reasons.push({
+        code: 'LEXICAL_OVERLAP',
+        topTokens: query === undefined ? [visit?.label ?? visitId] : query.split(/\s+/u),
+      });
+    }
+  }
+  return reasons.length > 0
+    ? reasons
+    : [{ code: 'LEXICAL_OVERLAP', topTokens: [nodeById.get(visitId)?.label ?? visitId] }];
+};
 
 const groupByKind = (
   nodes: readonly ConnectionNode[],
@@ -87,6 +277,8 @@ export const ConnectionsView = ({
   const [loading, setLoading] = useState<boolean>(false);
   const [selectedEdge, setSelectedEdge] = useState<ConnectionEdge | null>(null);
   const [edgeDetail, setEdgeDetail] = useState<ConnectionEdge | null>(null);
+  const [whyVisitId, setWhyVisitId] = useState<string | null>(null);
+  const [whyAssertedOnly, setWhyAssertedOnly] = useState<boolean>(false);
 
   useEffect(() => {
     if (anchor.trim().length === 0) {
@@ -141,10 +333,23 @@ export const ConnectionsView = ({
     const value = (next ?? draftAnchor).trim();
     if (next !== undefined) setDraftAnchor(value);
     setSelectedEdge(null);
+    setWhyVisitId(null);
     setAnchor(value);
   };
 
   const totalEdges = result?.snapshot.edgeCount ?? 0;
+  const focusData = useMemo(
+    () =>
+      result === null
+        ? { topics: [], visitsByTopic: {}, engagementClassesByVisit: {} }
+        : deriveFocusData(result.snapshot.nodes, result.snapshot.edges),
+    [result],
+  );
+  const contextWorkstreamId = useMemo(() => {
+    if (anchor.startsWith('workstream:')) return anchor.replace(/^workstream:/u, '');
+    const workstream = result?.snapshot.nodes.find((node) => node.kind === 'workstream');
+    return workstream?.id.replace(/^workstream:/u, '') ?? anchor;
+  }, [anchor, result]);
 
   return (
     <div className="cx-shell-host bac-connections-view" data-testid="connections-view">
@@ -179,6 +384,36 @@ export const ConnectionsView = ({
           data-testid="connections-mode-orbital"
         >
           Orbital
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={subMode === 'flow'}
+          className={'cx-mode' + (subMode === 'flow' ? ' is-active' : '')}
+          onClick={() => setSubMode('flow')}
+          data-testid="connections-mode-flow"
+        >
+          Flow Path
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={subMode === 'focus'}
+          className={'cx-mode' + (subMode === 'focus' ? ' is-active' : '')}
+          onClick={() => setSubMode('focus')}
+          data-testid="connections-mode-focus"
+        >
+          Focus
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={subMode === 'context'}
+          className={'cx-mode' + (subMode === 'context' ? ' is-active' : '')}
+          onClick={() => setSubMode('context')}
+          data-testid="connections-mode-context"
+        >
+          Context Pack
         </button>
       </div>
       {timeline !== null ? <TimelineRail data={timeline} /> : null}
@@ -274,13 +509,39 @@ export const ConnectionsView = ({
                 selectedEdge={selectedEdge}
                 onSelectEdge={(e) => setSelectedEdge(e)}
               />
-            ) : (
+            ) : subMode === 'orbital' ? (
               <ConnectionsOrbitalCenter
                 result={result}
                 anchorId={anchor}
                 hops={hops}
                 selectedEdge={selectedEdge}
                 onSelectEdge={(e) => setSelectedEdge(e)}
+              />
+            ) : subMode === 'flow' ? (
+              <FlowPathView
+                visits={deriveFlowVisits(result.snapshot.nodes)}
+                navigationEdges={deriveNavigationEdges(result.snapshot.edges)}
+                crossReplicaEdges={deriveCrossReplicaEdges(result.snapshot.edges)}
+                onNodeClick={(visitId) => {
+                  setSelectedEdge(null);
+                  setWhyVisitId(visitId);
+                }}
+              />
+            ) : subMode === 'focus' ? (
+              <FocusView
+                topics={focusData.topics}
+                visitsByTopic={focusData.visitsByTopic}
+                engagementClassesByVisit={focusData.engagementClassesByVisit}
+                onTopicClick={(topicId) => {
+                  setAnchor(topicId);
+                  setDraftAnchor(topicId);
+                }}
+                onVisitClick={(visitId) => setWhyVisitId(visitId)}
+              />
+            ) : (
+              <ContextPackComposer
+                workstreamId={contextWorkstreamId}
+                onClose={() => setSubMode('linked')}
               />
             )
           ) : (
@@ -298,7 +559,15 @@ export const ConnectionsView = ({
         </main>
         <aside className="cx-col-r" style={{ overflow: 'auto' }}>
           <div className="cx-section" style={{ borderBottom: 0, padding: 14 }}>
-            {edgeDetail !== null ? (
+            {whyVisitId !== null && result !== null ? (
+              <WhyRelatedPanel
+                fromVisitId={whyVisitId}
+                reasons={reasonsForVisit(result.snapshot.nodes, result.snapshot.edges, whyVisitId)}
+                showOnlyUserAsserted={whyAssertedOnly}
+                onToggleAssertedOnly={() => setWhyAssertedOnly((value) => !value)}
+                onClose={() => setWhyVisitId(null)}
+              />
+            ) : edgeDetail !== null ? (
               <ProvenanceCard
                 edge={edgeDetail}
                 allNodes={result?.snapshot.nodes ?? []}
@@ -410,7 +679,7 @@ const ConnectionsLinkedCenter = ({
                 className={`cx-edgelabel ${isSelected ? 'is-selected' : ''}`}
                 style={{ cursor: 'pointer', justifyContent: 'flex-start', padding: '4px 8px' }}
               >
-                <span className={`cx-edge fam-${fam}`} aria-hidden>
+                <span className={`cx-edge fam-${fam} ${edgeConfidenceClass(edge.confidence)}`.trim()} aria-hidden>
                   <span className="cx-edge-line" />
                 </span>
                 <span style={{ color: 'var(--ink)' }}>{edge.kind}</span>
@@ -509,7 +778,7 @@ const ConnectionsOrbitalCenter = ({
             const pt = layout.positions.get(edge.toNodeId)!;
             const isSel = selectedEdge?.id === edge.id;
             const isDim = selectedEdge !== null && !isSel;
-            const cls = ['edge', `fam-${fam}`, isSel && 'is-selected', isDim && 'is-dim']
+            const cls = ['edge', `fam-${fam}`, edgeConfidenceClass(edge.confidence), isSel && 'is-selected', isDim && 'is-dim']
               .filter(Boolean)
               .join(' ');
             return <line key={edge.id} className={cls} x1={ps.x} y1={ps.y} x2={pt.x} y2={pt.y} />;
@@ -557,7 +826,7 @@ const ConnectionsOrbitalCenter = ({
               data-testid={`edge-${edge.id}`}
               style={{ cursor: 'pointer' }}
             >
-              <span className={`cx-edge fam-${fam}`} aria-hidden>
+              <span className={`cx-edge fam-${fam} ${edgeConfidenceClass(edge.confidence)}`.trim()} aria-hidden>
                 <span className="cx-edge-line" />
               </span>
               <span>{meta?.label ?? edge.kind}</span>
@@ -789,11 +1058,7 @@ const ProvenanceCard = ({
     <aside className="cx-prov" data-testid="edge-provenance">
       <header className="cx-prov-head">
         <span className="cx-prov-kind">{edge.kind}</span>
-        {edge.confidence === 'deterministic' || edge.confidence === 'explicit' ? (
-          <span className="cx-stamp deterministic">Deterministic</span>
-        ) : (
-          <span className="cx-stamp">{edge.confidence}</span>
-        )}
+        <span className="cx-stamp">{edge.confidence}</span>
         <span className="cx-grow" />
         <button
           type="button"
@@ -820,7 +1085,7 @@ const ProvenanceCard = ({
           <span className="cx-mono cx-dim">{edge.fromNodeId}</span>
         )}
         <div className="cx-prov-arrow">
-          <span className={`cx-edge fam-${family}`} aria-hidden>
+          <span className={`cx-edge fam-${family} ${edgeConfidenceClass(edge.confidence)}`.trim()} aria-hidden>
             <span className="cx-edge-line" />
           </span>
           <span style={{ fontSize: 9, letterSpacing: '0.06em', textTransform: 'uppercase' }}>

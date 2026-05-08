@@ -3,8 +3,9 @@ import type { ConnectionNodeKind } from './types';
 // Edge kind / family / type metadata, ported from
 // switchboard/project/connections-shared.jsx and extended with the
 // 4 new content-derived edges (`*_references_url`,
-// `thread_quotes_thread`) which fold into the `urlmatch` family —
-// they share the deterministic dotted-line semantic of "URL match".
+// `thread_quotes_thread`) which fold into the `urlmatch` family.
+// Confidence comes from the edge payload itself, so inferred links
+// can render with a weaker dashed treatment independent of family.
 
 export type EdgeFamily = 'contain' | 'flow' | 'defer' | 'urlmatch';
 
@@ -106,11 +107,74 @@ export const EDGE_KINDS: Record<string, EdgeKindMetadata> = {
     description:
       'Captured turn / dispatch body / annotation note contains the search query embedded in a tracked search-URL visit (whole-word, case-insensitive).',
   },
+  visit_resembles_visit: {
+    family: 'urlmatch',
+    label: 'resembles',
+    description:
+      'Visit-similarity revision linked these browser visits by title, host, and path corpus embedding.',
+  },
+  visit_observed_on_replica: {
+    family: 'urlmatch',
+    label: 'observed on',
+    description: 'The same canonical visit was observed on more than one replica.',
+  },
   visit_in_workstream: {
     family: 'contain',
     label: 'in workstream',
     description:
       "Timeline observer stamped the user's currently-focused workstream id onto this visit at observation time (active-workstream attribution).",
+  },
+  visit_in_topic: {
+    family: 'contain',
+    label: 'in topic',
+    description: 'Topic clusterer assigned this visit to a deterministic topic component.',
+  },
+  topic_in_workstream: {
+    family: 'contain',
+    label: 'in workstream',
+    description:
+      'At least 75% of topic members share this workstream attribution.',
+  },
+  'topic.lineage': {
+    family: 'flow',
+    label: 'succeeded by',
+    description:
+      'Topic clusterer observed a deterministic topic id split or merge between revisions.',
+  },
+  snippet_copied_from_visit: {
+    family: 'flow',
+    label: 'copied from',
+    description: 'Hash-only snippet lineage connected a copied selection to its source visit.',
+  },
+  snippet_pasted_into_thread: {
+    family: 'flow',
+    label: 'pasted into',
+    description: 'Hash-only snippet lineage observed this snippet pasted into a thread.',
+  },
+  snippet_pasted_into_dispatch: {
+    family: 'flow',
+    label: 'pasted into',
+    description: 'Hash-only snippet lineage observed this snippet pasted into a dispatch.',
+  },
+  snippet_pasted_into_search: {
+    family: 'flow',
+    label: 'pasted into',
+    description: 'Hash-only snippet lineage observed this snippet pasted into a search visit.',
+  },
+  snippet_pasted_into_note: {
+    family: 'flow',
+    label: 'pasted into',
+    description: 'Hash-only snippet lineage observed this snippet pasted into a note.',
+  },
+  snippet_pasted_into_capture: {
+    family: 'flow',
+    label: 'pasted into',
+    description: 'Hash-only snippet lineage observed this snippet pasted into a capture.',
+  },
+  snippet_reused_across_threads: {
+    family: 'flow',
+    label: 'reused in',
+    description: 'The same hash-only snippet was pasted into two or more threads.',
   },
 };
 
@@ -136,6 +200,9 @@ export const NODE_KIND_DISPLAY: Record<
   'coding-session': { label: 'Coding session', tintClass: 'cx-type-coding' },
   'timeline-visit': { label: 'Browser visit', tintClass: 'cx-type-visit' },
   annotation: { label: 'Annotation', tintClass: 'cx-type-annotation' },
+  snippet: { label: 'Snippet', tintClass: 'cx-type-snippet' },
+  topic: { label: 'Topic', tintClass: 'cx-type-topic' },
+  replica: { label: 'Replica', tintClass: 'cx-type-replica' },
 };
 
 // Display order for kind groups in the linked-panels center column.
@@ -147,6 +214,9 @@ export const NODE_KIND_GROUP_ORDER: readonly ConnectionNodeKind[] = [
   'dispatch',
   'coding-session',
   'timeline-visit',
+  'topic',
+  'snippet',
+  'replica',
   'annotation',
   'queue-item',
   'inbound-reminder',
@@ -160,6 +230,9 @@ export const contentDerivedHint = (kind: string): string | null => {
   if (kind.endsWith('_references_url')) return 'via captured text';
   if (kind === 'thread_quotes_thread') return 'quoted in turn';
   if (kind === 'thread_text_mentions_search_query') return 'via search query match';
+  if (kind === 'visit_resembles_visit') return 'via similarity';
+  if (kind === 'visit_observed_on_replica') return 'via replica evidence';
   if (kind === 'visit_in_workstream') return 'via active workstream';
+  if (kind.startsWith('snippet_')) return 'via copy/paste';
   return null;
 };

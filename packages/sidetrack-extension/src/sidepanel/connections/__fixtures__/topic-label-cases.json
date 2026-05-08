@@ -1,0 +1,47 @@
+[
+  {
+    "name": "top-by-focus",
+    "cohesion": 0.91,
+    "members": [
+      { "canonicalUrl": "https://example.test/a", "title": "A", "focusedWindowMs": 5000 },
+      { "canonicalUrl": "https://example.test/b", "title": "B", "focusedWindowMs": 10000 },
+      { "canonicalUrl": "https://example.test/c", "title": "C", "focusedWindowMs": 7500 }
+    ],
+    "expectedLabel": "B",
+    "expectedTooltip": "cohesion=0.91 · members=3"
+  },
+  {
+    "name": "tie-break-url",
+    "cohesion": 0.8,
+    "members": [
+      {
+        "canonicalUrl": "https://example.test/z",
+        "title": "Zed",
+        "focusedWindowMs": 10000
+      },
+      {
+        "canonicalUrl": "https://example.test/a",
+        "title": "Alpha",
+        "focusedWindowMs": 10000
+      }
+    ],
+    "expectedLabel": "Alpha",
+    "expectedTooltip": "cohesion=0.80 · members=2"
+  },
+  {
+    "name": "empty-title-fallback",
+    "cohesion": 0.7,
+    "members": [
+      { "canonicalUrl": "https://example.test/a", "title": "", "focusedWindowMs": 10000 }
+    ],
+    "expectedLabel": "https://example.test/a",
+    "expectedTooltip": "cohesion=0.70 · members=1"
+  },
+  {
+    "name": "empty-topic-fallback",
+    "cohesion": 0,
+    "members": [],
+    "expectedLabel": "(untitled topic)",
+    "expectedTooltip": "cohesion=0.00 · members=0"
+  }
+]

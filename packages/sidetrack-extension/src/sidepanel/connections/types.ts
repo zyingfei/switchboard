@@ -11,7 +11,10 @@ export type ConnectionNodeKind =
   | 'inbound-reminder'
   | 'coding-session'
   | 'timeline-visit'
-  | 'annotation';
+  | 'annotation'
+  | 'snippet'
+  | 'topic'
+  | 'replica';
 
 export interface ConnectionNode {
   readonly id: string;
@@ -35,7 +38,7 @@ export interface ConnectionEdge {
     readonly dot?: { readonly replicaId: string; readonly seq: number };
     readonly recordId?: string;
   };
-  readonly confidence: 'explicit' | 'deterministic' | 'suggested';
+  readonly confidence: 'asserted' | 'observed' | 'inferred';
 }
 
 export interface ConnectionsSnapshot {

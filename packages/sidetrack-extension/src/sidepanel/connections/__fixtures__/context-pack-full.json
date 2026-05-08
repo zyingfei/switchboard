@@ -1,0 +1,41 @@
+{
+  "topic": {
+    "id": "topic:alpha",
+    "label": "Sidetrack work graph",
+    "cohesion": 0.91,
+    "memberCount": 4
+  },
+  "threads": [
+    {
+      "id": "thread:a",
+      "title": "Work graph design",
+      "url": "https://chatgpt.com/c/a"
+    }
+  ],
+  "dispatches": [{ "id": "dispatch:a", "title": "Implement reducer", "status": "sent" }],
+  "snippets": [
+    {
+      "id": "snippet:a",
+      "rawTextStored": false,
+      "hash": "hash-a"
+    },
+    {
+      "id": "snippet:b",
+      "rawTextStored": true,
+      "text": "This is the exact source snippet that should be truncated after eighty characters when rendered into the context pack.",
+      "hash": "hash-b"
+    }
+  ],
+  "userNotes": [
+    {
+      "id": "note:a",
+      "authoredBy": "user",
+      "text": "What should the pack include?\nShip deterministic labels.\nCan this run without a network call?"
+    },
+    {
+      "id": "note:b",
+      "authoredBy": "assistant",
+      "text": "Should not be extracted?"
+    }
+  ]
+}

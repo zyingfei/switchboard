@@ -1,0 +1,75 @@
+{
+  "visits": [
+    {
+      "canonicalUrl": "https://example.test/a",
+      "title": "Topic A",
+      "focusedWindowMs": 10000,
+      "firstObservedAt": "2026-05-08T10:00:00.000Z",
+      "lastObservedAt": "2026-05-08T11:00:00.000Z"
+    },
+    {
+      "canonicalUrl": "https://example.test/b",
+      "title": "Topic B",
+      "focusedWindowMs": 10000,
+      "firstObservedAt": "2026-05-08T10:00:00.000Z",
+      "lastObservedAt": "2026-05-08T11:00:00.000Z"
+    },
+    {
+      "canonicalUrl": "https://example.test/c",
+      "title": "Topic C",
+      "focusedWindowMs": 10000,
+      "firstObservedAt": "2026-05-08T10:00:00.000Z",
+      "lastObservedAt": "2026-05-08T11:00:00.000Z"
+    },
+    {
+      "canonicalUrl": "https://example.test/d",
+      "title": "Topic D",
+      "focusedWindowMs": 10000,
+      "firstObservedAt": "2026-05-08T10:00:00.000Z",
+      "lastObservedAt": "2026-05-08T11:00:00.000Z"
+    },
+    {
+      "canonicalUrl": "https://example.test/e",
+      "title": "Topic E",
+      "focusedWindowMs": 10000,
+      "firstObservedAt": "2026-05-08T10:00:00.000Z",
+      "lastObservedAt": "2026-05-08T11:00:00.000Z"
+    },
+    {
+      "canonicalUrl": "https://example.test/f",
+      "title": "Topic F",
+      "focusedWindowMs": 10000,
+      "firstObservedAt": "2026-05-08T10:00:00.000Z",
+      "lastObservedAt": "2026-05-08T11:00:00.000Z"
+    }
+  ],
+  "visitSimilarity": {
+    "revisionId": "fixture-topic-basic",
+    "edges": [
+      {
+        "fromVisitKey": "https://example.test/a",
+        "toVisitKey": "https://example.test/b",
+        "cosine": 0.9
+      },
+      {
+        "fromVisitKey": "https://example.test/b",
+        "toVisitKey": "https://example.test/c",
+        "cosine": 0.9
+      },
+      {
+        "fromVisitKey": "https://example.test/d",
+        "toVisitKey": "https://example.test/e",
+        "cosine": 0.9
+      },
+      {
+        "fromVisitKey": "https://example.test/e",
+        "toVisitKey": "https://example.test/f",
+        "cosine": 0.9
+      }
+    ]
+  },
+  "expectedMemberGroups": [
+    ["https://example.test/a", "https://example.test/b", "https://example.test/c"],
+    ["https://example.test/d", "https://example.test/e", "https://example.test/f"]
+  ]
+}
