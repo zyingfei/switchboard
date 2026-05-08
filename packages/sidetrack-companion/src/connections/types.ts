@@ -25,7 +25,8 @@ export type ConnectionNodeKind =
   | 'coding-session'
   | 'timeline-visit'
   | 'annotation'
-  | 'snippet';
+  | 'snippet'
+  | 'topic';
 
 export interface ConnectionNode {
   // Namespaced ids: `kind:bac_id` (or `timeline-visit:<canonicalUrl>`).
@@ -107,6 +108,9 @@ export type ConnectionEdgeKind =
   // working in a workstream attach to that workstream even when no
   // chat / dispatch / annotation references them.
   | 'visit_in_workstream'
+  | 'visit_in_topic'
+  | 'topic_in_workstream'
+  | 'topic.lineage'
   | 'snippet_copied_from_visit'
   | 'snippet_pasted_into_thread'
   | 'snippet_pasted_into_dispatch'
@@ -170,6 +174,12 @@ export interface ConnectionEdge {
   // 'inferred' = deterministic algorithmic joins / similarity-style links.
   readonly confidence: 'asserted' | 'observed' | 'inferred';
   readonly family?: 'contain' | 'flow' | 'defer' | 'urlmatch';
+  readonly metadata?: ConnectionEdgeMetadata;
+}
+
+export interface ConnectionEdgeMetadata {
+  readonly lineageKind?: 'split' | 'merge';
+  readonly [key: string]: unknown;
 }
 
 export interface VisitSimilarityEdge {

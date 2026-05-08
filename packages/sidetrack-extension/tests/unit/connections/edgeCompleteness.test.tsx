@@ -34,6 +34,9 @@ const COMPANION_EMITTED_KINDS: readonly string[] = [
   'dispatch_references_url',
   'annotation_references_url',
   'thread_quotes_thread',
+  'visit_in_topic',
+  'topic_in_workstream',
+  'topic.lineage',
 ];
 
 const NODE_KIND_FOR_PREFIX: Record<string, string> = {
@@ -71,14 +74,25 @@ const EDGE_FIXTURES: ReadonlyArray<{
   { kind: 'dispatch_references_url', from: { id: 'dispatch:d_codex', kind: 'dispatch' }, to: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' } },
   { kind: 'annotation_references_url', from: { id: 'annotation:a1', kind: 'annotation' }, to: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' } },
   { kind: 'thread_quotes_thread', from: { id: 'thread:t_chatgpt', kind: 'thread' }, to: { id: 'thread:t_anchor', kind: 'thread' } },
+  { kind: 'visit_in_topic', from: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' }, to: { id: 'topic:topic:abc123', kind: 'topic' } },
+  { kind: 'topic_in_workstream', from: { id: 'topic:topic:abc123', kind: 'topic' }, to: { id: 'workstream:ws_research', kind: 'workstream' } },
+  { kind: 'topic.lineage', from: { id: 'topic:topic:old', kind: 'topic' }, to: { id: 'topic:topic:abc123', kind: 'topic' } },
 ];
 
 const confidenceForKind = (kind: string): 'asserted' | 'observed' | 'inferred' => {
-  if (kind === 'timeline_same_url_as_thread' || kind === 'thread_quotes_thread') return 'inferred';
+  if (
+    kind === 'timeline_same_url_as_thread' ||
+    kind === 'thread_quotes_thread' ||
+    kind === 'visit_in_topic' ||
+    kind === 'topic_in_workstream'
+  ) {
+    return 'inferred';
+  }
   if (
     kind === 'dispatch_reply_landed_in_thread' ||
     kind === 'annotation_targets_thread' ||
-    kind.endsWith('_references_url')
+    kind.endsWith('_references_url') ||
+    kind === 'topic.lineage'
   ) {
     return 'observed';
   }

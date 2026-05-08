@@ -8,6 +8,7 @@ import { SELECTION_COPIED, SELECTION_PASTED } from '../snippets/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { THREAD_UPSERTED } from '../threads/events.js';
 import type { TimelineDayProjection } from '../timeline/projection.js';
+import type { TopicRevision } from '../producers/topic-revision.js';
 import { WORKSTREAM_UPSERTED } from '../workstreams/events.js';
 import {
   buildConnectionsSnapshot,
@@ -1113,6 +1114,116 @@ describe('connections — content-derived edges', () => {
     expect(
       ids.has(nodeIdFor('timeline-visit', 'https://www.youtube.com/watch?v=rY44ViY45q8')),
     ).toBe(true);
+  });
+
+  it('Pass 8 emits topic nodes, membership, workstream, and lineage edges', () => {
+    const topicRevision: TopicRevision = {
+      revisionId: 'topic-rev-1',
+      visitSimilarityRevisionId: 'visit-sim-1',
+      cosineThreshold: 0.85,
+      algorithmVersion: 'union-find:v1',
+      topics: [
+        {
+          topicId: 'topic:abc123',
+          memberCanonicalUrls: [
+            'https://topic.test/a',
+            'https://topic.test/b',
+            'https://topic.test/c',
+            'https://topic.test/d',
+          ],
+          metadata: {
+            memberCount: 4,
+            dominantWorkstreamId: 'ws_topic',
+            representativeTitles: ['Topic A', 'Topic B'],
+            firstObservedAt: '2026-05-07T09:00:00.000Z',
+            lastObservedAt: '2026-05-07T12:00:00.000Z',
+            cohesion: 0.91,
+          },
+        },
+      ],
+      lineage: [
+        {
+          fromTopicId: 'topic:old',
+          toTopicId: 'topic:abc123',
+          kind: 'merge',
+          observedAt: '2026-05-07T12:00:00.000Z',
+        },
+      ],
+      producedAt: Date.parse('2026-05-07T12:00:00.000Z'),
+    };
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: [
+        {
+          id: 'https://topic.test/a',
+          firstSeenAt: '2026-05-07T09:00:00.000Z',
+          lastSeenAt: '2026-05-07T10:00:00.000Z',
+          url: 'https://topic.test/a',
+          canonicalUrl: 'https://topic.test/a',
+          title: 'Topic A',
+          visitCount: 1,
+          workstreamId: 'ws_topic',
+        },
+        {
+          id: 'https://topic.test/b',
+          firstSeenAt: '2026-05-07T09:10:00.000Z',
+          lastSeenAt: '2026-05-07T10:10:00.000Z',
+          url: 'https://topic.test/b',
+          canonicalUrl: 'https://topic.test/b',
+          title: 'Topic B',
+          visitCount: 1,
+          workstreamId: 'ws_topic',
+        },
+        {
+          id: 'https://topic.test/c',
+          firstSeenAt: '2026-05-07T09:20:00.000Z',
+          lastSeenAt: '2026-05-07T10:20:00.000Z',
+          url: 'https://topic.test/c',
+          canonicalUrl: 'https://topic.test/c',
+          title: 'Topic C',
+          visitCount: 1,
+          workstreamId: 'ws_topic',
+        },
+        {
+          id: 'https://topic.test/d',
+          firstSeenAt: '2026-05-07T09:30:00.000Z',
+          lastSeenAt: '2026-05-07T10:30:00.000Z',
+          url: 'https://topic.test/d',
+          canonicalUrl: 'https://topic.test/d',
+          title: 'Topic D',
+          visitCount: 1,
+          workstreamId: 'ws_other',
+        },
+      ],
+      updatedAt: '2026-05-07T10:30:00.000Z',
+      entryCount: 4,
+    };
+
+    const snap = buildConnectionsSnapshot(
+      emptyInput({ timelineDays: [day], topicRevision }),
+    );
+    const topicNodeId = nodeIdFor('topic', 'topic:abc123');
+    const topicNode = snap.nodes.find((node) => node.id === topicNodeId);
+
+    expect(topicNode?.label).toBe('Topic A');
+    expect(topicNode?.metadata['cohesion']).toBe(0.91);
+    expect(snap.edges.filter((edge) => edge.kind === 'visit_in_topic')).toHaveLength(4);
+    expect(
+      snap.edges.find(
+        (edge) =>
+          edge.kind === 'topic_in_workstream' &&
+          edge.fromNodeId === topicNodeId &&
+          edge.toNodeId === nodeIdFor('workstream', 'ws_topic'),
+      ),
+    ).toBeDefined();
+    const lineage = snap.edges.find((edge) => edge.kind === 'topic.lineage');
+    expect(lineage?.fromNodeId).toBe(nodeIdFor('topic', 'topic:old'));
+    expect(lineage?.toNodeId).toBe(topicNodeId);
+    expect(lineage?.metadata?.['lineageKind']).toBe('merge');
+    expect(lineage?.producedBy).toEqual({
+      source: 'topic-clusterer',
+      revisionId: 'topic-rev-1',
+    });
   });
 
   it('determinism: same fixture in two event orders produces byte-identical snapshots', () => {

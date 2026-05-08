@@ -9,6 +9,10 @@ import {
   isDispatchRecordedPayload,
 } from '../dispatches/events.js';
 import { createRevision } from '../domain/ids.js';
+import {
+  DEFAULT_TOPIC_WORKSTREAM_SHARE_THRESHOLD,
+  type TopicRevision,
+} from '../producers/topic-revision.js';
 import { QUEUE_CREATED, isQueueCreatedPayload } from '../queue/events.js';
 import { CAPTURE_RECORDED, isCaptureRecordedPayload } from '../recall/events.js';
 import { projectSnippetLineage } from '../snippets/projection.js';
@@ -69,6 +73,10 @@ export type { ConnectionsSnapshot } from './types.js';
 //   visit_in_workstream                   timeline observer stamped a
 //                                         workstreamId on the visit (active
 //                                         workstream attribution)
+//   visit_in_topic                         topic-clusterer membership edge
+//   topic_in_workstream                    topic-clusterer dominant
+//                                         workstream edge (>=75% members)
+//   topic.lineage                          topic split/merge revision edge
 //   snippet_copied_from_visit             hash-only copy/paste lineage
 //   snippet_pasted_into_<dest>            paste destination edge
 //   snippet_reused_across_threads         same snippet pasted into >=2 threads
@@ -154,6 +162,8 @@ export interface ConnectionsInput {
   readonly codingSessions: readonly CodingSessionVaultRecord[];
   readonly timelineDays: readonly TimelineDayProjection[];
   readonly visitSimilarity?: VisitSimilarityRevision;
+  readonly topicRevision?: TopicRevision;
+  readonly topicWorkstreamShareThreshold?: number;
   readonly scope?: ConnectionsSnapshotScope;
 }
 
@@ -271,6 +281,9 @@ const stripFragmentAndTrailingSlash = (url: string): string =>
 //         substring of another's.
 // Pass 6: search-query content match.
 // Pass 7: injected visit-similarity revision emits visit_resembles_visit.
+// Pass 8: topic-clusterer active revision — emit topic nodes,
+//         visit_in_topic / topic_in_workstream membership edges, and
+//         topic.lineage split/merge edges.
 // ---------------------------------------------------------------------------
 
 export const buildConnectionsSnapshot = (
@@ -1247,6 +1260,106 @@ export const buildConnectionsSnapshot = (
         },
         confidence: 'inferred',
         family: 'urlmatch',
+      });
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Pass 8 — topic-clusterer active revision. The topic revision is a
+  // Class E artifact produced outside this reducer; the reducer only
+  // projects its deterministic nodes and edges into the Connections
+  // graph. Singleton topic components are already suppressed from
+  // revision.topics, but lineage can still point at singleton
+  // content-derived topic ids.
+  // -------------------------------------------------------------------
+  if (input.topicRevision !== undefined) {
+    const topicRevision = input.topicRevision;
+    const topicProducedBy = {
+      source: 'topic-clusterer',
+      revisionId: topicRevision.revisionId,
+    } as const;
+    const workstreamShareThreshold =
+      input.topicWorkstreamShareThreshold ?? DEFAULT_TOPIC_WORKSTREAM_SHARE_THRESHOLD;
+
+    const visitWorkstreamIdFor = (canonicalUrl: string): string | undefined => {
+      const node = nodes.get(nodeIdFor('timeline-visit', canonicalUrl));
+      const value = node?.metadata['workstreamId'];
+      return typeof value === 'string' && value.length > 0 ? value : undefined;
+    };
+
+    for (const topic of [...topicRevision.topics].sort((a, b) =>
+      a.topicId < b.topicId ? -1 : a.topicId > b.topicId ? 1 : 0,
+    )) {
+      const topicNode = upsertNode(nodes, {
+        kind: 'topic',
+        key: topic.topicId,
+        label: topic.metadata.representativeTitles[0] ?? topic.topicId,
+        observedAt: topic.metadata.lastObservedAt,
+        metadata: { ...topic.metadata },
+      });
+      topicNode.firstSeenAt = topic.metadata.firstObservedAt;
+      topicNode.lastSeenAt = topic.metadata.lastObservedAt;
+      trackObservedAt(topic.metadata.lastObservedAt);
+
+      for (const memberCanonicalUrl of topic.memberCanonicalUrls) {
+        upsertNode(nodes, {
+          kind: 'timeline-visit',
+          key: memberCanonicalUrl,
+          label: memberCanonicalUrl,
+          observedAt: topic.metadata.lastObservedAt,
+          metadata: {
+            canonicalUrl: memberCanonicalUrl,
+          },
+        });
+        upsertEdge(edges, {
+          kind: 'visit_in_topic',
+          fromNodeId: nodeIdFor('timeline-visit', memberCanonicalUrl),
+          toNodeId: nodeIdFor('topic', topic.topicId),
+          observedAt: topic.metadata.lastObservedAt,
+          producedBy: topicProducedBy,
+          confidence: 'inferred',
+        });
+      }
+
+      if (topic.metadata.dominantWorkstreamId !== undefined) {
+        let dominantCount = 0;
+        for (const memberCanonicalUrl of topic.memberCanonicalUrls) {
+          if (visitWorkstreamIdFor(memberCanonicalUrl) === topic.metadata.dominantWorkstreamId) {
+            dominantCount += 1;
+          }
+        }
+        const share =
+          topic.memberCanonicalUrls.length === 0
+            ? 0
+            : dominantCount / topic.memberCanonicalUrls.length;
+        if (share >= workstreamShareThreshold) {
+          upsertNode(nodes, {
+            kind: 'workstream',
+            key: topic.metadata.dominantWorkstreamId,
+            label: topic.metadata.dominantWorkstreamId,
+          });
+          upsertEdge(edges, {
+            kind: 'topic_in_workstream',
+            fromNodeId: nodeIdFor('topic', topic.topicId),
+            toNodeId: nodeIdFor('workstream', topic.metadata.dominantWorkstreamId),
+            observedAt: topic.metadata.lastObservedAt,
+            producedBy: topicProducedBy,
+            confidence: 'inferred',
+          });
+        }
+      }
+    }
+
+    for (const lineage of topicRevision.lineage) {
+      trackObservedAt(lineage.observedAt);
+      upsertEdge(edges, {
+        kind: 'topic.lineage',
+        fromNodeId: nodeIdFor('topic', lineage.fromTopicId),
+        toNodeId: nodeIdFor('topic', lineage.toTopicId),
+        observedAt: lineage.observedAt,
+        producedBy: topicProducedBy,
+        confidence: 'observed',
+        metadata: { lineageKind: lineage.kind },
       });
     }
   }

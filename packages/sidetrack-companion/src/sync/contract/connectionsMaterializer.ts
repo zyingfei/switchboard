@@ -9,9 +9,17 @@ import {
   type ConnectionsInput,
 } from '../../connections/snapshot.js';
 import {
+  buildTopicRevision,
+  type TopicVisit,
+} from '../../connections/topicClusterer.js';
+import {
   buildVisitSimilarity,
   type VisitSimilarityEmbedder,
 } from '../../connections/visitSimilarity.js';
+import {
+  createTopicRevisionStore,
+  type TopicRevisionStore,
+} from '../../producers/topic-revision.js';
 import { writeVisitSimilarityRevision } from '../../producers/visit-resembles-revision.js';
 import { embed as defaultEmbed } from '../../recall/embedder.js';
 import type { ConnectionsStore } from '../../connections/snapshot.js';
@@ -104,11 +112,14 @@ export interface CreateConnectionsMaterializerDeps {
   readonly timelineStore: TimelineStore;
   readonly store: ConnectionsStore;
   readonly embed?: VisitSimilarityEmbedder;
+  readonly topicRevisionStore?: TopicRevisionStore;
 }
 
 export const createConnectionsMaterializer = (
   deps: CreateConnectionsMaterializerDeps,
 ): Materializer => {
+  const topicRevisionStore =
+    deps.topicRevisionStore ?? createTopicRevisionStore(deps.vaultRoot);
   let pending = false;
   let running = false;
   let dirty = false;
@@ -137,6 +148,32 @@ export const createConnectionsMaterializer = (
       return undefined;
     }
     return focused;
+  };
+
+  const focusedWindowMsFromEntry = (entry: TimelineEntryWithDimensions): number => {
+    if (!isRecord(entry.dimensions)) return 0;
+    const engagement = entry.dimensions['engagement'];
+    if (!isRecord(engagement)) return 0;
+    const focused = engagement['focusedWindowMs'];
+    if (typeof focused !== 'number' || !Number.isFinite(focused) || focused < 0) {
+      return 0;
+    }
+    return focused;
+  };
+
+  const stripFragmentAndTrailingSlash = (url: string): string =>
+    url.replace(/#.*$/u, '').replace(/\/+$/u, '');
+
+  const topicVisitFromEntry = (entry: TimelineEntryWithDimensions): TopicVisit => {
+    const canonicalUrl = stripFragmentAndTrailingSlash(entry.canonicalUrl ?? entry.url);
+    return {
+      canonicalUrl,
+      ...(entry.title === undefined ? {} : { title: entry.title }),
+      focusedWindowMs: focusedWindowMsFromEntry(entry),
+      firstObservedAt: entry.firstSeenAt,
+      lastObservedAt: entry.lastSeenAt,
+      ...(entry.workstreamId === undefined ? {} : { workstreamId: entry.workstreamId }),
+    };
   };
 
   // Build the per-day timeline projection in-memory directly from the
@@ -193,11 +230,19 @@ export const createConnectionsMaterializer = (
       deps.embed ?? defaultEmbed,
     );
     await writeVisitSimilarityRevision(deps.vaultRoot, visitSimilarity);
+    const previousTopicRevision = await topicRevisionStore.readActiveRevision();
+    const topicRevision = await buildTopicRevision({
+      visits: timelineDays.flatMap((day) => day.entries.map(topicVisitFromEntry)),
+      visitSimilarity,
+      ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
+    });
+    await topicRevisionStore.putActiveRevision(topicRevision);
     const input: ConnectionsInput = {
       events: merged,
       ...vault,
       timelineDays,
       visitSimilarity,
+      topicRevision,
     };
     const snapshot = buildConnectionsSnapshot(input);
     await deps.store.putCurrent(snapshot);

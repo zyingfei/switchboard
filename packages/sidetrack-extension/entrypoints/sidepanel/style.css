@@ -6978,6 +6978,8 @@ pre.diff {
 .cx-type-coding       { --tint: #e2e6d7; --line: #3f5530; }
 .cx-type-visit        { --tint: #e1e2dd; --line: #4f5a4a; }
 .cx-type-annotation   { --tint: #efe9d7; --line: #7a6a4f; }
+.cx-type-snippet      { --tint: #e6dde5; --line: #624d60; }
+.cx-type-topic        { --tint: #e5ded0; --line: #6d604f; }
 
 /* node chip */
 .cx-node {

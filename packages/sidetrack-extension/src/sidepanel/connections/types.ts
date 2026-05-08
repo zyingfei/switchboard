@@ -11,7 +11,9 @@ export type ConnectionNodeKind =
   | 'inbound-reminder'
   | 'coding-session'
   | 'timeline-visit'
-  | 'annotation';
+  | 'annotation'
+  | 'snippet'
+  | 'topic';
 
 export interface ConnectionNode {
   readonly id: string;
