@@ -3,6 +3,7 @@ import {
   DEFAULT_TOPIC_ENGAGEMENT_GATE_MS,
   TOPIC_ALGORITHM_VERSION,
   createTopicRevisionId,
+  type TopicAlgorithmVersion,
   type TopicLineage,
   type TopicNodeMetadata,
   type TopicRevision,
@@ -42,6 +43,7 @@ export interface UserAssertedVisitRelation {
 export interface BuildTopicRevisionOptions {
   readonly cosineThreshold?: number;
   readonly engagementGateMs?: number;
+  readonly algorithmVersion?: TopicAlgorithmVersion;
   readonly producedAt?: number;
 }
 
@@ -62,9 +64,7 @@ const compareString = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 
 
 const roundMetric = (value: number): number => Number(value.toFixed(6));
 
-const sortedVisitsByCanonical = (
-  visits: readonly TopicVisit[],
-): readonly TopicVisit[] => {
+const sortedVisitsByCanonical = (visits: readonly TopicVisit[]): readonly TopicVisit[] => {
   const byCanonical = new Map<string, TopicVisit>();
   for (const visit of [...visits].sort((a, b) => compareString(a.canonicalUrl, b.canonicalUrl))) {
     if (visit.canonicalUrl.length === 0) continue;
@@ -97,8 +97,7 @@ const sortedVisitsByCanonical = (
   return [...byCanonical.values()];
 };
 
-const pairKey = (a: string, b: string): string =>
-  a < b ? `${a}\u0000${b}` : `${b}\u0000${a}`;
+const pairKey = (a: string, b: string): string => (a < b ? `${a}\u0000${b}` : `${b}\u0000${a}`);
 
 const buildMetadata = (
   members: readonly string[],
@@ -106,7 +105,9 @@ const buildMetadata = (
   similarityEdges: readonly VisitSimilarityEdge[],
   cosineThreshold: number,
 ): TopicNodeMetadata => {
-  const visits = members.map((member) => visitsByCanonical.get(member)).filter((visit) => visit !== undefined);
+  const visits = members
+    .map((member) => visitsByCanonical.get(member))
+    .filter((visit) => visit !== undefined);
   const memberSet = new Set(members);
   const workstreamCounts = new Map<string, number>();
   for (const visit of visits) {
@@ -131,12 +132,9 @@ const buildMetadata = (
       return title === undefined || title.length === 0 ? visit.canonicalUrl : title;
     });
 
-  const firstObservedAt = visits
-    .map((visit) => visit.firstObservedAt)
-    .sort(compareString)[0] ?? '';
-  const lastObservedAt = visits
-    .map((visit) => visit.lastObservedAt)
-    .sort((a, b) => compareString(b, a))[0] ?? '';
+  const firstObservedAt = visits.map((visit) => visit.firstObservedAt).sort(compareString)[0] ?? '';
+  const lastObservedAt =
+    visits.map((visit) => visit.lastObservedAt).sort((a, b) => compareString(b, a))[0] ?? '';
 
   const cosinesByPair = new Map<string, number>();
   for (const edge of similarityEdges) {
@@ -196,7 +194,9 @@ const computeLineage = async (
     lineage.push(edge);
   };
 
-  for (const previousTopic of [...previousRevision.topics].sort((a, b) => compareString(a.topicId, b.topicId))) {
+  for (const previousTopic of [...previousRevision.topics].sort((a, b) =>
+    compareString(a.topicId, b.topicId),
+  )) {
     const currentIds = new Set<string>();
     for (const member of previousTopic.memberCanonicalUrls) {
       const currentTopicId = currentTopicIdByMember.get(member);
@@ -213,7 +213,9 @@ const computeLineage = async (
     }
   }
 
-  for (const currentComponent of [...currentComponents].sort((a, b) => compareString(a.topicId, b.topicId))) {
+  for (const currentComponent of [...currentComponents].sort((a, b) =>
+    compareString(a.topicId, b.topicId),
+  )) {
     const previousIds = new Set<string>();
     for (const member of currentComponent.memberCanonicalUrls) {
       const containingPreviousTopics = previousTopicIdsByMember.get(member);
@@ -245,6 +247,7 @@ export const buildTopicRevision = async (
 ): Promise<TopicRevision> => {
   const cosineThreshold = input.options?.cosineThreshold ?? DEFAULT_TOPIC_COSINE_THRESHOLD;
   const engagementGateMs = input.options?.engagementGateMs ?? DEFAULT_TOPIC_ENGAGEMENT_GATE_MS;
+  const algorithmVersion = input.options?.algorithmVersion ?? TOPIC_ALGORITHM_VERSION;
   const producedAt = input.options?.producedAt ?? Date.now();
   const observedAt = new Date(producedAt).toISOString();
 
@@ -274,7 +277,10 @@ export const buildTopicRevision = async (
   for (const key of [...eligibleVisitKeys].sort(compareString)) uf.add(key);
 
   for (const relation of input.userAssertedRelations ?? []) {
-    if (!eligibleVisitKeys.has(relation.fromVisitKey) || !eligibleVisitKeys.has(relation.toVisitKey)) {
+    if (
+      !eligibleVisitKeys.has(relation.fromVisitKey) ||
+      !eligibleVisitKeys.has(relation.toVisitKey)
+    ) {
       continue;
     }
     uf.union(relation.fromVisitKey, relation.toVisitKey);
@@ -318,14 +324,14 @@ export const buildTopicRevision = async (
   const revisionId = await createTopicRevisionId({
     visitSimilarityRevisionId: input.visitSimilarity.revisionId,
     cosineThreshold,
-    algorithmVersion: TOPIC_ALGORITHM_VERSION,
+    algorithmVersion,
   });
 
   return {
     revisionId,
     visitSimilarityRevisionId: input.visitSimilarity.revisionId,
     cosineThreshold,
-    algorithmVersion: TOPIC_ALGORITHM_VERSION,
+    algorithmVersion,
     topics,
     lineage,
     producedAt,

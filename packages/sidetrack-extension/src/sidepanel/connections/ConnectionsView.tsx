@@ -1,7 +1,17 @@
 import { useEffect, useMemo, useState, type ReactElement } from 'react';
 
 import { ContextPackComposer } from './ContextPackComposer';
-import { fetchConnectionsEdge, fetchConnectionsNeighbors } from './client';
+import {
+  feedbackRelationKindForEdgeKind,
+  fetchConnectionsEdge,
+  fetchConnectionsNeighbors,
+  postUserEngagementRelabeled,
+  postUserFlowConfirmed,
+  postUserFlowRejected,
+  postUserSnippetPromoted,
+  postUserTopicRenamed,
+  type UserFlowRelationKind,
+} from './client';
 import {
   EDGE_KINDS,
   FAMILIES,
@@ -17,6 +27,7 @@ import {
   type TimelineVisit,
 } from './FlowPathView';
 import {
+  ENGAGEMENT_CLASSES,
   FocusView,
   type EngagementClass,
   type TopicNode,
@@ -31,6 +42,7 @@ import type {
   ConnectionNodeKind,
   ConnectionsScopedResult,
 } from './types';
+import { FeedbackButtons, type FeedbackChoice } from '../feedback/FeedbackButtons';
 import { WhyRelatedPanel } from './WhyRelatedPanel';
 import type { Reason } from './why-related/reasons';
 
@@ -92,14 +104,40 @@ const metadataNumber = (
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 };
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const rankerContributionFromUnknown = (
+  value: unknown,
+): { readonly feature: string; readonly weight: number } | null => {
+  if (!isRecord(value)) return null;
+  const feature = value.feature;
+  const weight = value.weight;
+  if (typeof feature !== 'string' || feature.length === 0) return null;
+  if (typeof weight !== 'number' || !Number.isFinite(weight)) return null;
+  return { feature, weight };
+};
+
+const rankerReasonForEdge = (edge: ConnectionEdge): Reason | null => {
+  if (edge.kind !== 'closest_visit' || edge.metadata === undefined) return null;
+  const rawContributions = edge.metadata.topContributions;
+  const topContributions = Array.isArray(rawContributions)
+    ? rawContributions
+        .map(rankerContributionFromUnknown)
+        .filter(
+          (contribution): contribution is { readonly feature: string; readonly weight: number } =>
+            contribution !== null,
+        )
+    : [];
+  return {
+    code: 'RANKER_SCORE',
+    score: metadataNumber(edge.metadata, 'score', 0),
+    topContributions,
+  };
+};
+
 const isEngagementClass = (value: unknown): value is EngagementClass =>
-  value === 'parked_background' ||
-  value === 'glanced' ||
-  value === 'skimmed' ||
-  value === 'engaged_read' ||
-  value === 'worked_on_reference' ||
-  value === 'source_extracted' ||
-  value === 'execution_source';
+  typeof value === 'string' && (ENGAGEMENT_CLASSES as readonly string[]).includes(value);
 
 const engagementClassForNode = (node: ConnectionNode): EngagementClass | undefined => {
   const engagement = node.metadata['engagement'];
@@ -209,6 +247,9 @@ const reasonsForVisit = (
       });
     } else if (edge.kind === 'visit_resembles_visit') {
       reasons.push({ code: 'COSINE_ABOVE_THRESHOLD', cosine: 0.85, threshold: 0.85 });
+    } else if (edge.kind === 'closest_visit') {
+      const reason = rankerReasonForEdge(edge);
+      if (reason !== null) reasons.push(reason);
     } else if (edge.kind === 'visit_in_topic') {
       const topic = nodeById.get(edge.toNodeId);
       reasons.push({
@@ -241,6 +282,36 @@ const reasonsForVisit = (
   return reasons.length > 0
     ? reasons
     : [{ code: 'LEXICAL_OVERLAP', topTokens: [nodeById.get(visitId)?.label ?? visitId] }];
+};
+
+const edgeConnects = (edge: ConnectionEdge, leftId: string, rightId: string): boolean =>
+  (edge.fromNodeId === leftId && edge.toNodeId === rightId) ||
+  (edge.fromNodeId === rightId && edge.toNodeId === leftId);
+
+const findFeedbackEdge = (
+  edges: readonly ConnectionEdge[],
+  leftId: string,
+  rightId: string,
+): ConnectionEdge | null =>
+  edges.find(
+    (edge) =>
+      edgeConnects(edge, leftId, rightId) && feedbackRelationKindForEdgeKind(edge.kind) !== null,
+  ) ?? null;
+
+const snippetSourceVisitId = (node: ConnectionNode, edge: ConnectionEdge | null): string | null => {
+  if (node.kind !== 'snippet' || edge === null) return null;
+  if (edge.kind === 'snippet_copied_from_visit' && edge.fromNodeId === node.id) {
+    return edge.toNodeId;
+  }
+  return null;
+};
+
+const requireFeedbackRelationKind = (edge: ConnectionEdge): UserFlowRelationKind => {
+  const relationKind = feedbackRelationKindForEdgeKind(edge.kind);
+  if (relationKind === null) {
+    throw new Error(`Unsupported feedback edge kind: ${edge.kind}`);
+  }
+  return relationKind;
 };
 
 const groupByKind = (
@@ -337,7 +408,116 @@ export const ConnectionsView = ({
     setAnchor(value);
   };
 
+  const replaceNodeLabel = (nodeId: string, label: string): void => {
+    setResult((current) => {
+      if (current === null) return null;
+      return {
+        ...current,
+        snapshot: {
+          ...current.snapshot,
+          nodes: current.snapshot.nodes.map((node) =>
+            node.id === nodeId ? { ...node, label } : node,
+          ),
+        },
+      };
+    });
+  };
+
+  const replaceNodeEngagementClass = (nodeId: string, engagementClass: EngagementClass): void => {
+    setResult((current) => {
+      if (current === null) return null;
+      return {
+        ...current,
+        snapshot: {
+          ...current.snapshot,
+          nodes: current.snapshot.nodes.map((node) => {
+            if (node.id !== nodeId) return node;
+            const currentEngagement = node.metadata['engagement'];
+            const engagement =
+              typeof currentEngagement === 'object' &&
+              currentEngagement !== null &&
+              !Array.isArray(currentEngagement)
+                ? currentEngagement
+                : {};
+            return {
+              ...node,
+              metadata: {
+                ...node.metadata,
+                engagement: { ...engagement, class: engagementClass },
+              },
+            };
+          }),
+        },
+      };
+    });
+  };
+
+  const submitFlowFeedback = async (
+    edge: ConnectionEdge,
+    choice: FeedbackChoice,
+  ): Promise<void> => {
+    const relationKind = requireFeedbackRelationKind(edge);
+    const response =
+      choice === 'confirm'
+        ? await postUserFlowConfirmed({
+            relationKind,
+            fromId: edge.fromNodeId,
+            toId: edge.toNodeId,
+          })
+        : await postUserFlowRejected({
+            relationKind,
+            fromId: edge.fromNodeId,
+            toId: edge.toNodeId,
+            reason: 'not-related',
+          });
+    if (!response.ok) {
+      throw new Error(response.error ?? 'feedback failed');
+    }
+  };
+
+  const submitTopicRename = async (input: {
+    readonly topicId: string;
+    readonly previousName: string;
+    readonly newName: string;
+  }): Promise<void> => {
+    const response = await postUserTopicRenamed(input);
+    if (!response.ok) {
+      throw new Error(response.error ?? 'topic rename feedback failed');
+    }
+    replaceNodeLabel(input.topicId, input.newName);
+  };
+
+  const submitEngagementRelabel = async (input: {
+    readonly visitId: string;
+    readonly fromClass: EngagementClass;
+    readonly toClass: EngagementClass;
+  }): Promise<void> => {
+    const response = await postUserEngagementRelabeled(input);
+    if (!response.ok) {
+      throw new Error(response.error ?? 'engagement relabel feedback failed');
+    }
+    replaceNodeEngagementClass(input.visitId, input.toClass);
+  };
+
+  const submitSnippetPromotion = async (input: {
+    readonly snippetId: string;
+    readonly sourceVisitId: string;
+  }): Promise<void> => {
+    const response = await postUserSnippetPromoted({
+      snippetId: input.snippetId,
+      targetId: input.sourceVisitId,
+      sourceVisitId: input.sourceVisitId,
+    });
+    if (!response.ok) {
+      throw new Error(response.error ?? 'snippet promotion feedback failed');
+    }
+  };
+
   const totalEdges = result?.snapshot.edgeCount ?? 0;
+  const whyFeedbackEdge = useMemo(() => {
+    if (result === null || whyVisitId === null) return null;
+    return findFeedbackEdge(result.snapshot.edges, anchor, whyVisitId);
+  }, [result, anchor, whyVisitId]);
   const focusData = useMemo(
     () =>
       result === null
@@ -422,7 +602,10 @@ export const ConnectionsView = ({
           <div className="cx-section">
             <h4>Anchor</h4>
             <label className="cx-input">
-              <span aria-hidden style={{ color: 'var(--ink-3)', display: 'grid', placeItems: 'center' }}>
+              <span
+                aria-hidden
+                style={{ color: 'var(--ink-3)', display: 'grid', placeItems: 'center' }}
+              >
                 {SearchIcon}
               </span>
               <input
@@ -451,10 +634,21 @@ export const ConnectionsView = ({
                     onClick={() => submitAnchor(r.id)}
                     data-testid={`recent-anchor-${r.id}`}
                   >
-                    <span className={`cx-node-icon ${NODE_KIND_DISPLAY[r.kind].tintClass}`} aria-hidden>
+                    <span
+                      className={`cx-node-icon ${NODE_KIND_DISPLAY[r.kind].tintClass}`}
+                      aria-hidden
+                    >
                       {KindIcons[r.kind]}
                     </span>
-                    <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    <span
+                      style={{
+                        flex: 1,
+                        minWidth: 0,
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
                       {r.label}
                     </span>
                     <span className="cx-recent-meta">{NODE_KIND_DISPLAY[r.kind].label}</span>
@@ -491,7 +685,11 @@ export const ConnectionsView = ({
         </aside>
         <main className="cx-col-c" style={{ overflow: 'auto' }}>
           {loading ? (
-            <div className="cx-mono cx-dim" data-testid="connections-loading" style={{ padding: 16 }}>
+            <div
+              className="cx-mono cx-dim"
+              data-testid="connections-loading"
+              style={{ padding: 16 }}
+            >
               Loading…
             </div>
           ) : null}
@@ -508,6 +706,7 @@ export const ConnectionsView = ({
                 anchorId={anchor}
                 selectedEdge={selectedEdge}
                 onSelectEdge={(e) => setSelectedEdge(e)}
+                onPromoteSnippet={submitSnippetPromotion}
               />
             ) : subMode === 'orbital' ? (
               <ConnectionsOrbitalCenter
@@ -532,6 +731,8 @@ export const ConnectionsView = ({
                 topics={focusData.topics}
                 visitsByTopic={focusData.visitsByTopic}
                 engagementClassesByVisit={focusData.engagementClassesByVisit}
+                onTopicRename={submitTopicRename}
+                onEngagementRelabel={submitEngagementRelabel}
                 onTopicClick={(topicId) => {
                   setAnchor(topicId);
                   setDraftAnchor(topicId);
@@ -564,6 +765,14 @@ export const ConnectionsView = ({
                 fromVisitId={whyVisitId}
                 reasons={reasonsForVisit(result.snapshot.nodes, result.snapshot.edges, whyVisitId)}
                 showOnlyUserAsserted={whyAssertedOnly}
+                feedback={
+                  whyFeedbackEdge === null
+                    ? undefined
+                    : {
+                        label: 'relation',
+                        onFeedback: (choice) => submitFlowFeedback(whyFeedbackEdge, choice),
+                      }
+                }
                 onToggleAssertedOnly={() => setWhyAssertedOnly((value) => !value)}
                 onClose={() => setWhyVisitId(null)}
               />
@@ -571,6 +780,7 @@ export const ConnectionsView = ({
               <ProvenanceCard
                 edge={edgeDetail}
                 allNodes={result?.snapshot.nodes ?? []}
+                onFlowFeedback={(edge, choice) => submitFlowFeedback(edge, choice)}
                 onClose={() => setSelectedEdge(null)}
               />
             ) : (
@@ -588,11 +798,16 @@ const ConnectionsLinkedCenter = ({
   anchorId,
   selectedEdge,
   onSelectEdge,
+  onPromoteSnippet,
 }: {
   readonly result: ConnectionsScopedResult;
   readonly anchorId: string;
   readonly selectedEdge: ConnectionEdge | null;
   readonly onSelectEdge: (edge: ConnectionEdge) => void;
+  readonly onPromoteSnippet: (input: {
+    readonly snippetId: string;
+    readonly sourceVisitId: string;
+  }) => Promise<void>;
 }): ReactElement => {
   if (result.scope === 'plugin-active-only-companion-unreachable') {
     return (
@@ -652,6 +867,7 @@ const ConnectionsLinkedCenter = ({
                     edge={edge ?? null}
                     direction={edge?.fromNodeId === anchorId ? 'out' : 'in'}
                     selected={selectedEdge?.id === edge?.id && edge !== undefined}
+                    onPromoteSnippet={onPromoteSnippet}
                     onClick={() => {
                       if (edge !== undefined) onSelectEdge(edge);
                     }}
@@ -679,15 +895,15 @@ const ConnectionsLinkedCenter = ({
                 className={`cx-edgelabel ${isSelected ? 'is-selected' : ''}`}
                 style={{ cursor: 'pointer', justifyContent: 'flex-start', padding: '4px 8px' }}
               >
-                <span className={`cx-edge fam-${fam} ${edgeConfidenceClass(edge.confidence)}`.trim()} aria-hidden>
+                <span
+                  className={`cx-edge fam-${fam} ${edgeConfidenceClass(edge.confidence)}`.trim()}
+                  aria-hidden
+                >
                   <span className="cx-edge-line" />
                 </span>
                 <span style={{ color: 'var(--ink)' }}>{edge.kind}</span>
                 {hint !== null ? (
-                  <span
-                    className="bac-connections-edge-hint"
-                    data-testid={`edge-hint-${edge.id}`}
-                  >
+                  <span className="bac-connections-edge-hint" data-testid={`edge-hint-${edge.id}`}>
                     {hint}
                   </span>
                 ) : null}
@@ -741,28 +957,37 @@ const ConnectionsOrbitalCenter = ({
   for (const n of result.snapshot.nodes) nodeById.set(n.id, n);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }} data-testid="connections-orbital">
+    <div
+      style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}
+      data-testid="connections-orbital"
+    >
       <div className="cx-orbit" style={{ minHeight: ORBIT_H }}>
-        <div
-          className="cx-orbit-ring"
-          style={{ width: layout.r1 * 2, height: layout.r1 * 2 }}
-        />
+        <div className="cx-orbit-ring" style={{ width: layout.r1 * 2, height: layout.r1 * 2 }} />
         {hops >= 2 ? (
-          <div
-            className="cx-orbit-ring"
-            style={{ width: layout.r2 * 2, height: layout.r2 * 2 }}
-          />
+          <div className="cx-orbit-ring" style={{ width: layout.r2 * 2, height: layout.r2 * 2 }} />
         ) : null}
-        <div className="cx-orbit-sector-label" style={{ left: '50%', top: 12, transform: 'translateX(-50%)' }}>
+        <div
+          className="cx-orbit-sector-label"
+          style={{ left: '50%', top: 12, transform: 'translateX(-50%)' }}
+        >
           ↑ Containment
         </div>
-        <div className="cx-orbit-sector-label" style={{ right: 12, top: '50%', transform: 'translateY(-50%)' }}>
+        <div
+          className="cx-orbit-sector-label"
+          style={{ right: 12, top: '50%', transform: 'translateY(-50%)' }}
+        >
           Flow →
         </div>
-        <div className="cx-orbit-sector-label" style={{ left: '50%', bottom: 12, transform: 'translateX(-50%)' }}>
+        <div
+          className="cx-orbit-sector-label"
+          style={{ left: '50%', bottom: 12, transform: 'translateX(-50%)' }}
+        >
           ↓ Queue · Reminder
         </div>
-        <div className="cx-orbit-sector-label" style={{ left: 12, top: '50%', transform: 'translateY(-50%)' }}>
+        <div
+          className="cx-orbit-sector-label"
+          style={{ left: 12, top: '50%', transform: 'translateY(-50%)' }}
+        >
           ← URL match
         </div>
         <svg
@@ -778,7 +1003,13 @@ const ConnectionsOrbitalCenter = ({
             const pt = layout.positions.get(edge.toNodeId)!;
             const isSel = selectedEdge?.id === edge.id;
             const isDim = selectedEdge !== null && !isSel;
-            const cls = ['edge', `fam-${fam}`, edgeConfidenceClass(edge.confidence), isSel && 'is-selected', isDim && 'is-dim']
+            const cls = [
+              'edge',
+              `fam-${fam}`,
+              edgeConfidenceClass(edge.confidence),
+              isSel && 'is-selected',
+              isDim && 'is-dim',
+            ]
               .filter(Boolean)
               .join(' ');
             return <line key={edge.id} className={cls} x1={ps.x} y1={ps.y} x2={pt.x} y2={pt.y} />;
@@ -791,14 +1022,15 @@ const ConnectionsOrbitalCenter = ({
           const isDim =
             selectedEdge !== null &&
             !isAnchor &&
-            !(
-              selectedEdge.fromNodeId === p.id || selectedEdge.toNodeId === p.id
-            );
+            !(selectedEdge.fromNodeId === p.id || selectedEdge.toNodeId === p.id);
           return (
             <div
               key={p.id}
               className="cx-orbit-node"
-              style={{ left: `${String((p.x / ORBIT_W) * 100)}%`, top: `${String((p.y / ORBIT_H) * 100)}%` }}
+              style={{
+                left: `${String((p.x / ORBIT_W) * 100)}%`,
+                top: `${String((p.y / ORBIT_H) * 100)}%`,
+              }}
               data-testid={`orbit-node-${p.id}`}
             >
               <NodeChip
@@ -826,15 +1058,15 @@ const ConnectionsOrbitalCenter = ({
               data-testid={`edge-${edge.id}`}
               style={{ cursor: 'pointer' }}
             >
-              <span className={`cx-edge fam-${fam} ${edgeConfidenceClass(edge.confidence)}`.trim()} aria-hidden>
+              <span
+                className={`cx-edge fam-${fam} ${edgeConfidenceClass(edge.confidence)}`.trim()}
+                aria-hidden
+              >
                 <span className="cx-edge-line" />
               </span>
               <span>{meta?.label ?? edge.kind}</span>
               {hint !== null ? (
-                <span
-                  className="bac-connections-edge-hint"
-                  data-testid={`edge-hint-${edge.id}`}
-                >
+                <span className="bac-connections-edge-hint" data-testid={`edge-hint-${edge.id}`}>
                   {hint}
                 </span>
               ) : null}
@@ -938,46 +1170,100 @@ const NodeRow = ({
   edge,
   direction,
   selected,
+  onPromoteSnippet,
   onClick,
 }: {
   readonly node: ConnectionNode;
   readonly edge: ConnectionEdge | null;
   readonly direction: 'in' | 'out';
   readonly selected: boolean;
+  readonly onPromoteSnippet?: (input: {
+    readonly snippetId: string;
+    readonly sourceVisitId: string;
+  }) => Promise<void>;
   readonly onClick: () => void;
 }): ReactElement => {
+  const [promoting, setPromoting] = useState<boolean>(false);
+  const [promoteStatus, setPromoteStatus] = useState<'saved' | 'error' | null>(null);
   const display = NODE_KIND_DISPLAY[node.kind];
   const meta = edge !== null ? EDGE_KINDS[edge.kind] : null;
   const cls = `cx-row ${display.tintClass} ${selected ? 'is-selected' : ''}`;
+  const sourceVisitId = snippetSourceVisitId(node, edge);
+  const canPromote =
+    onPromoteSnippet !== undefined && node.kind === 'snippet' && sourceVisitId !== null;
+  const promote = (): void => {
+    if (!canPromote || sourceVisitId === null) return;
+    setPromoting(true);
+    setPromoteStatus(null);
+    void onPromoteSnippet({ snippetId: node.id, sourceVisitId })
+      .then(() => {
+        setPromoteStatus('saved');
+      })
+      .catch(() => {
+        setPromoteStatus('error');
+      })
+      .finally(() => {
+        setPromoting(false);
+      });
+  };
   return (
-    <button type="button" className={cls} onClick={onClick} data-testid={`node-${node.id}`}>
-      <span className={`cx-node-icon ${display.tintClass}`} aria-hidden>
-        {KindIcons[node.kind]}
-      </span>
-      <span className="cx-row-body">
-        <span className="cx-row-title">{node.label}</span>
-        <span className="cx-row-meta">
-          <span>{display.label}</span>
-          {node.lastSeenAt !== undefined ? (
-            <>
-              <span>·</span>
-              <span>{node.lastSeenAt.slice(0, 10)}</span>
-            </>
-          ) : null}
-          {node.originReplicaIds.length > 0 ? (
-            <>
-              <span>·</span>
-              <ReplicaDots replicaIds={node.originReplicaIds} />
-            </>
-          ) : null}
+    <div className={cls} data-testid={`node-${node.id}`}>
+      <button
+        type="button"
+        onClick={onClick}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 9,
+          flex: 1,
+          minWidth: 0,
+          minHeight: 0,
+          padding: 0,
+          border: 0,
+          background: 'transparent',
+          color: 'inherit',
+          textAlign: 'left',
+        }}
+      >
+        <span className={`cx-node-icon ${display.tintClass}`} aria-hidden>
+          {KindIcons[node.kind]}
         </span>
-      </span>
-      {meta !== null ? (
-        <span className="cx-row-edge">
-          {direction === 'out' ? `→ ${meta.label}` : meta.label}
+        <span className="cx-row-body">
+          <span className="cx-row-title">{node.label}</span>
+          <span className="cx-row-meta">
+            <span>{display.label}</span>
+            {node.lastSeenAt !== undefined ? (
+              <>
+                <span>·</span>
+                <span>{node.lastSeenAt.slice(0, 10)}</span>
+              </>
+            ) : null}
+            {node.originReplicaIds.length > 0 ? (
+              <>
+                <span>·</span>
+                <ReplicaDots replicaIds={node.originReplicaIds} />
+              </>
+            ) : null}
+          </span>
         </span>
+        {meta !== null ? (
+          <span className="cx-row-edge">
+            {direction === 'out' ? `→ ${meta.label}` : meta.label}
+          </span>
+        ) : null}
+      </button>
+      {canPromote ? (
+        <button
+          type="button"
+          className="cx-focus-expand"
+          disabled={promoting}
+          onClick={promote}
+          data-testid={`snippet-promote-${node.id}`}
+        >
+          {promoteStatus === 'saved' ? 'Promoted' : promoteStatus === 'error' ? 'Retry' : 'Promote'}
+        </button>
       ) : null}
-    </button>
+    </div>
   );
 };
 
@@ -1021,11 +1307,7 @@ const FamilyLegend = (): ReactElement => (
   </div>
 );
 
-const ReplicaDots = ({
-  replicaIds,
-}: {
-  readonly replicaIds: readonly string[];
-}): ReactElement => {
+const ReplicaDots = ({ replicaIds }: { readonly replicaIds: readonly string[] }): ReactElement => {
   const count = replicaIds.length;
   return (
     <span
@@ -1043,10 +1325,12 @@ const ReplicaDots = ({
 const ProvenanceCard = ({
   edge,
   allNodes,
+  onFlowFeedback,
   onClose,
 }: {
   readonly edge: ConnectionEdge;
   readonly allNodes: readonly ConnectionNode[];
+  readonly onFlowFeedback: (edge: ConnectionEdge, choice: FeedbackChoice) => Promise<void>;
   readonly onClose: () => void;
 }): ReactElement => {
   const meta = EDGE_KINDS[edge.kind];
@@ -1054,6 +1338,7 @@ const ProvenanceCard = ({
   const fromNode = allNodes.find((n) => n.id === edge.fromNodeId);
   const toNode = allNodes.find((n) => n.id === edge.toNodeId);
   const reason = meta?.description ?? edge.kind;
+  const supportsFlowFeedback = feedbackRelationKindForEdgeKind(edge.kind) !== null;
   return (
     <aside className="cx-prov" data-testid="edge-provenance">
       <header className="cx-prov-head">
@@ -1085,7 +1370,10 @@ const ProvenanceCard = ({
           <span className="cx-mono cx-dim">{edge.fromNodeId}</span>
         )}
         <div className="cx-prov-arrow">
-          <span className={`cx-edge fam-${family} ${edgeConfidenceClass(edge.confidence)}`.trim()} aria-hidden>
+          <span
+            className={`cx-edge fam-${family} ${edgeConfidenceClass(edge.confidence)}`.trim()}
+            aria-hidden
+          >
             <span className="cx-edge-line" />
           </span>
           <span style={{ fontSize: 9, letterSpacing: '0.06em', textTransform: 'uppercase' }}>
@@ -1101,6 +1389,17 @@ const ProvenanceCard = ({
       <div className="cx-prov-reason">
         Reason: <code>{reason}</code>
       </div>
+      {supportsFlowFeedback ? (
+        <div style={{ paddingTop: 10 }}>
+          <FeedbackButtons
+            label="relation"
+            onFeedback={async (choice) => {
+              await onFlowFeedback(edge, choice);
+              return { ok: true };
+            }}
+          />
+        </div>
+      ) : null}
       <dl className="cx-prov-rows">
         <ProvRow label="Edge kind" value={edge.kind} mono />
         <ProvRow label="Family" value={FAMILIES[family].label} />
@@ -1149,11 +1448,7 @@ const ProvRow = ({
   </div>
 );
 
-const ProvenanceEmpty = ({
-  anchor,
-}: {
-  readonly anchor: ConnectionNode | null;
-}): ReactElement => (
+const ProvenanceEmpty = ({ anchor }: { readonly anchor: ConnectionNode | null }): ReactElement => (
   <div>
     <div
       style={{

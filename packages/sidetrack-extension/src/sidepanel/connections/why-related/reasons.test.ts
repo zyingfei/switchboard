@@ -19,6 +19,7 @@ const codeFor = (reason: Reason): Reason['code'] => {
     case 'COPIED_FROM':
     case 'PASTED_INTO':
     case 'OBSERVED_ON_OTHER_REPLICA':
+    case 'RANKER_SCORE':
     case 'LEXICAL_OVERLAP':
     case 'LINK_OUT_FROM':
     case 'LINK_IN_TO':

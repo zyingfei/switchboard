@@ -1,15 +1,18 @@
 import { describe, expect, it } from 'vitest';
 
 import { ANNOTATION_CREATED } from '../annotations/events.js';
+import { CONTINUATION_CLASSIFIER_REVISION_ID } from '../continuation/classifier.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../dispatches/events.js';
 import { NAVIGATION_COMMITTED, type NavigationCommittedPayload } from '../navigation/events.js';
 import { QUEUE_CREATED } from '../queue/events.js';
+import { FEATURE_SCHEMA_VERSION, type CandidatePairFeatures } from '../ranker/feature-schema.js';
 import { CAPTURE_RECORDED } from '../recall/events.js';
 import { SELECTION_COPIED, SELECTION_PASTED } from '../snippets/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { THREAD_UPSERTED } from '../threads/events.js';
 import type { TimelineDayProjection } from '../timeline/projection.js';
-import type { TopicRevision } from '../producers/topic-revision.js';
+import { TOPIC_UNION_FIND_REVISION_KEY, type TopicRevision } from '../producers/topic-revision.js';
+import { VISUAL_FINGERPRINT_OBSERVED } from '../visual/events.js';
 import { WORKSTREAM_UPSERTED } from '../workstreams/events.js';
 import {
   buildConnectionsSnapshot,
@@ -45,10 +48,14 @@ describe('connections — producedBy provenance variants', () => {
       { source: 'topic-clusterer', revisionId: 'topic-cluster:v1:union-find' },
       { source: 'engagement-classifier', revisionId: 'engagement-class:v1:rules' },
       { source: 'snippet-lineage', revisionId: 'snippet-lineage:v1:hash' },
+      { source: 'continuation-classifier', revisionId: 'continuation-classifier:v1' },
+      { source: 'ranker', revisionId: 'ranker-rev-1' },
       { source: 'cross-replica' },
     ];
 
     expect(variants.map((variant) => variant.source)).toContain('cross-replica');
+    expect(variants.map((variant) => variant.source)).toContain('continuation-classifier');
+    expect(variants.map((variant) => variant.source)).toContain('ranker');
   });
 });
 
@@ -92,6 +99,30 @@ const navigationCommittedPayload = (input: {
   dimensions: { provenance: { source: 'test' } },
 });
 
+const rankerContributionsFor = (
+  score: number,
+): Readonly<Record<keyof CandidatePairFeatures, number>> => ({
+  schemaVersion: 0,
+  same_workstream: score * 0.5,
+  opener_chain_depth: 0,
+  in_navigation_chain: 0,
+  same_canonical_url: 0,
+  same_host: 0,
+  same_repo: 0,
+  same_search_query: 0,
+  same_copied_snippet_count: 0,
+  shared_title_tokens: score * 0.25,
+  shared_path_tokens: 0,
+  cosine_similarity: 0,
+  recency_score_from: 0,
+  recency_score_to: -0.1,
+  engagement_class_match: 0,
+  return_count_from: 0,
+  return_count_to: 0,
+  user_asserted_in_thread: 0,
+  user_asserted_in_workstream: 0,
+});
+
 describe('connections — snapshot reducer (Given/Then)', () => {
   it('thread.upserted with primaryWorkstreamId yields thread+workstream nodes and a thread_in_workstream edge', () => {
     const snap = buildConnectionsSnapshot(
@@ -117,7 +148,13 @@ describe('connections — snapshot reducer (Given/Then)', () => {
     expect(ids).toContain(nodeIdFor('thread', 'thread_a'));
     expect(ids).toContain(nodeIdFor('workstream', 'ws_tax'));
     const edge = snap.edges.find(
-      (e) => e.id === edgeIdFor('thread_in_workstream', nodeIdFor('thread', 'thread_a'), nodeIdFor('workstream', 'ws_tax')),
+      (e) =>
+        e.id ===
+        edgeIdFor(
+          'thread_in_workstream',
+          nodeIdFor('thread', 'thread_a'),
+          nodeIdFor('workstream', 'ws_tax'),
+        ),
     );
     expect(edge).toBeDefined();
     expect(edge?.kind).toBe('thread_in_workstream');
@@ -529,9 +566,7 @@ describe('connections — content-derived edges', () => {
             payload: {
               bac_id: 'thread_a',
               capturedAt: '2026-05-07T10:00:00.000Z',
-              turns: [
-                { ordinal: 0, role: 'user', text: 'see https://copy.fail/exploit' },
-              ],
+              turns: [{ ordinal: 0, role: 'user', text: 'see https://copy.fail/exploit' }],
             },
           }),
           buildEvent({
@@ -541,9 +576,7 @@ describe('connections — content-derived edges', () => {
             payload: {
               bac_id: 'thread_a',
               capturedAt: '2026-05-07T10:00:00.000Z',
-              turns: [
-                { ordinal: 0, role: 'user', text: 'see https://copy.fail/exploit' },
-              ],
+              turns: [{ ordinal: 0, role: 'user', text: 'see https://copy.fail/exploit' }],
             },
           }),
         ],
@@ -575,8 +608,7 @@ describe('connections — content-derived edges', () => {
     const CHATGPT_THREAD_URL = 'https://chatgpt.com/c/def';
     // 50 chars — ten 40-char shingles after concat overlap, well
     // above the 4-shingle contiguous-run threshold.
-    const SHARED_CODE_BLOCK =
-      'function calculateTaxOwed(income, year) { return';
+    const SHARED_CODE_BLOCK = 'function calculateTaxOwed(income, year) { return';
 
     const day: TimelineDayProjection = {
       date: '2026-05-07',
@@ -1047,7 +1079,87 @@ describe('connections — content-derived edges', () => {
       source: 'visit-similarity',
       revisionId: 'visit-sim-rev-1',
     });
-    expect(snap.edges.filter((candidate) => candidate.kind === 'visit_resembles_visit')).toHaveLength(1);
+    expect(
+      snap.edges.filter((candidate) => candidate.kind === 'visit_resembles_visit'),
+    ).toHaveLength(1);
+  });
+
+  it('Pass 12 emits closest_visit top-K edges with score and feature contributions', () => {
+    const urls = [
+      'https://ranker.test/a',
+      'https://ranker.test/b',
+      'https://ranker.test/c',
+      'https://ranker.test/d',
+      'https://ranker.test/e',
+    ] as const;
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: urls.map((url, index) => ({
+        id: url,
+        firstSeenAt: `2026-05-07T09:${String(index).padStart(2, '0')}:00.000Z`,
+        lastSeenAt: `2026-05-07T09:${String(index).padStart(2, '0')}:30.000Z`,
+        url,
+        canonicalUrl: url,
+        title: `Ranker fixture ${String(index)}`,
+        provider: 'generic',
+        visitCount: 1,
+        workstreamId: 'ws-ranker',
+      })),
+      updatedAt: '2026-05-07T09:04:30.000Z',
+      entryCount: urls.length,
+    };
+    const scoreByToVisit = new Map<string, number>([
+      ['https://ranker.test/b', 0.91],
+      ['https://ranker.test/c', 0.62],
+      ['https://ranker.test/d', 0.44],
+      ['https://ranker.test/e', 0.29],
+    ]);
+
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        timelineDays: [day],
+        closestVisitRanker: {
+          revisionId: 'ranker-rev-1',
+          threshold: 0.3,
+          topK: 2,
+          predict: (_features, candidate) => {
+            const score = scoreByToVisit.get(candidate.toVisitId) ?? 0.1;
+            return { score, contributions: rankerContributionsFor(score) };
+          },
+        },
+      }),
+    );
+
+    const fromA = snap.edges.filter(
+      (edge) =>
+        edge.kind === 'closest_visit' &&
+        edge.fromNodeId === nodeIdFor('timeline-visit', 'https://ranker.test/a'),
+    );
+    expect(fromA.map((edge) => edge.toNodeId)).toEqual([
+      nodeIdFor('timeline-visit', 'https://ranker.test/b'),
+      nodeIdFor('timeline-visit', 'https://ranker.test/c'),
+    ]);
+    expect(fromA[0]).toMatchObject({
+      observedAt: '2026-05-07T09:01:30.000Z',
+      producedBy: { source: 'ranker', revisionId: 'ranker-rev-1' },
+      confidence: 'inferred',
+      family: 'urlmatch',
+      metadata: {
+        score: 0.91,
+        featureSchemaVersion: FEATURE_SCHEMA_VERSION,
+        topContributions: [
+          { feature: 'same_workstream', weight: 0.455 },
+          { feature: 'shared_title_tokens', weight: 0.2275 },
+          { feature: 'recency_score_to', weight: -0.1 },
+        ],
+      },
+    });
+    expect(fromA.some((edge) => edge.toNodeId === nodeIdFor('timeline-visit', urls[3]))).toBe(
+      false,
+    );
+    expect(fromA.some((edge) => edge.toNodeId === nodeIdFor('timeline-visit', urls[4]))).toBe(
+      false,
+    );
   });
 
   it('visit_in_workstream fires when the timeline entry carries a workstreamId (active-workstream attribution)', () => {
@@ -1094,8 +1206,7 @@ describe('connections — content-derived edges', () => {
     expect(taggedVisit?.metadata['workstreamId']).toBe('ws_security');
     // The untagged visit has no metadata.workstreamId.
     const orphanVisit = snap.nodes.find(
-      (n) =>
-        n.id === nodeIdFor('timeline-visit', 'https://www.youtube.com/watch?v=rY44ViY45q8'),
+      (n) => n.id === nodeIdFor('timeline-visit', 'https://www.youtube.com/watch?v=rY44ViY45q8'),
     );
     expect(orphanVisit?.metadata['workstreamId']).toBeUndefined();
   });
@@ -1145,7 +1256,7 @@ describe('connections — content-derived edges', () => {
       revisionId: 'topic-rev-1',
       visitSimilarityRevisionId: 'visit-sim-1',
       cosineThreshold: 0.85,
-      algorithmVersion: 'union-find:v1',
+      algorithmVersion: TOPIC_UNION_FIND_REVISION_KEY,
       topics: [
         {
           topicId: 'topic:abc123',
@@ -1223,9 +1334,7 @@ describe('connections — content-derived edges', () => {
       entryCount: 4,
     };
 
-    const snap = buildConnectionsSnapshot(
-      emptyInput({ timelineDays: [day], topicRevision }),
-    );
+    const snap = buildConnectionsSnapshot(emptyInput({ timelineDays: [day], topicRevision }));
     const topicNodeId = nodeIdFor('topic', 'topic:abc123');
     const topicNode = snap.nodes.find((node) => node.id === topicNodeId);
 
@@ -1248,6 +1357,46 @@ describe('connections — content-derived edges', () => {
       source: 'topic-clusterer',
       revisionId: 'topic-rev-1',
     });
+  });
+
+  it('Pass 13 emits visit_in_template edges for visits sharing a DOM skeleton hash', () => {
+    const domHash = 'd'.repeat(64);
+    const events = ['visit-a', 'visit-b', 'visit-c'].map((visitId, index) =>
+      buildEvent({
+        seq: index + 1,
+        type: VISUAL_FINGERPRINT_OBSERVED,
+        payload: {
+          payloadVersion: 1,
+          visitId,
+          domHash,
+          observedAt: `2026-05-07T10:0${String(index)}:00.000Z`,
+        },
+      }),
+    );
+
+    const snap = buildConnectionsSnapshot(emptyInput({ events }));
+    const templateNodeId = nodeIdFor('template', domHash);
+
+    expect(snap.nodes.filter((node) => node.id === templateNodeId)).toHaveLength(1);
+    expect(
+      snap.edges
+        .filter((edge) => edge.kind === 'visit_in_template')
+        .map((edge) => [edge.fromNodeId, edge.toNodeId]),
+    ).toEqual([
+      [nodeIdFor('timeline-visit', 'visit-a'), templateNodeId],
+      [nodeIdFor('timeline-visit', 'visit-b'), templateNodeId],
+      [nodeIdFor('timeline-visit', 'visit-c'), templateNodeId],
+    ]);
+    expect(
+      snap.edges
+        .filter((edge) => edge.kind === 'visit_in_template')
+        .every(
+          (edge) =>
+            edge.confidence === 'observed' &&
+            edge.family === 'urlmatch' &&
+            edge.producedBy.source === 'event-log',
+        ),
+    ).toBe(true);
   });
 
   it('determinism: same fixture in two event orders produces byte-identical snapshots', () => {
@@ -1280,9 +1429,7 @@ describe('connections — content-derived edges', () => {
         payload: {
           bac_id: 'thread_b',
           capturedAt: '2026-05-07T11:00:00.000Z',
-          turns: [
-            { ordinal: 0, role: 'user', text: `please review: ${QUOTED_BLOCK} 0;` },
-          ],
+          turns: [{ ordinal: 0, role: 'user', text: `please review: ${QUOTED_BLOCK} 0;` }],
         },
       }),
     ];
@@ -1348,7 +1495,9 @@ describe('connections — determinism + cross-replica', () => {
       }),
     ];
     const fwd = JSON.stringify(buildConnectionsSnapshot(emptyInput({ events })));
-    const rev = JSON.stringify(buildConnectionsSnapshot(emptyInput({ events: [...events].reverse() })));
+    const rev = JSON.stringify(
+      buildConnectionsSnapshot(emptyInput({ events: [...events].reverse() })),
+    );
     const shuffled = JSON.stringify(
       buildConnectionsSnapshot(emptyInput({ events: [events[2]!, events[0]!, events[1]!] })),
     );
@@ -1470,6 +1619,105 @@ describe('connections — determinism + cross-replica', () => {
     ).toBe(false);
   });
 
+  it('Pass 11 emits visit_continues_visit for high-confidence cross-replica handoffs', () => {
+    const url = 'https://example.com/shared';
+    const sourceVisitId = 'visit-replica-A-1';
+    const continuedVisitId = 'visit-replica-B-2';
+    const copied = {
+      payloadVersion: 1,
+      selectionHash: 'abcdef1234567890abcdef1234567890',
+      simhash64: 'AAAAAAAAAAA=',
+      charCount: 64,
+      lineCount: 3,
+      contentKindHint: 'code-block',
+      rawTextStored: false,
+    };
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      updatedAt: '2026-05-07T10:30:00.000Z',
+      entryCount: 1,
+      entries: [
+        {
+          id: url,
+          firstSeenAt: '2026-05-07T10:00:00.000Z',
+          lastSeenAt: '2026-05-07T10:25:00.000Z',
+          url,
+          canonicalUrl: url,
+          title: 'Shared research',
+          provider: 'generic',
+          visitCount: 2,
+          workstreamId: 'ws-research',
+        },
+      ],
+    };
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        timelineDays: [day],
+        events: [
+          buildEvent({
+            seq: 1,
+            replicaId: 'replica-A',
+            type: NAVIGATION_COMMITTED,
+            payload: navigationCommittedPayload({
+              replicaId: 'replica-A',
+              seq: 1,
+              canonicalUrl: url,
+              commitAt: '2026-05-07T10:00:00.000Z',
+            }),
+            acceptedAtMs: Date.parse('2026-05-07T10:00:01.000Z'),
+          }),
+          buildEvent({
+            seq: 2,
+            replicaId: 'replica-B',
+            type: NAVIGATION_COMMITTED,
+            payload: navigationCommittedPayload({
+              replicaId: 'replica-B',
+              seq: 2,
+              canonicalUrl: url,
+              commitAt: '2026-05-07T10:25:00.000Z',
+            }),
+            acceptedAtMs: Date.parse('2026-05-07T10:25:01.000Z'),
+          }),
+          buildEvent({
+            seq: 3,
+            type: SELECTION_COPIED,
+            payload: { ...copied, visitId: sourceVisitId },
+          }),
+          buildEvent({
+            seq: 4,
+            type: SELECTION_COPIED,
+            payload: { ...copied, visitId: continuedVisitId },
+          }),
+        ],
+      }),
+    );
+
+    const edge = snap.edges.find((candidate) => candidate.kind === 'visit_continues_visit');
+    expect(edge).toBeDefined();
+    expect(edge?.fromNodeId).toBe(nodeIdFor('timeline-visit', sourceVisitId));
+    expect(edge?.toNodeId).toBe(nodeIdFor('timeline-visit', continuedVisitId));
+    expect(edge?.confidence).toBe('inferred');
+    expect(edge?.family).toBe('flow');
+    expect(edge?.producedBy).toEqual({
+      source: 'continuation-classifier',
+      revisionId: CONTINUATION_CLASSIFIER_REVISION_ID,
+    });
+    expect(edge?.metadata).toMatchObject({
+      canonicalUrl: url,
+      fromReplicaId: 'replica-A',
+      toReplicaId: 'replica-B',
+      sameWorkstream: 1,
+      copyPasteLineageContinuity: 1,
+    });
+    expect(typeof edge?.metadata?.['score']).toBe('number');
+    expect(
+      snap.nodes.find((node) => node.id === nodeIdFor('timeline-visit', sourceVisitId)),
+    ).toBeDefined();
+    expect(
+      snap.nodes.find((node) => node.id === nodeIdFor('timeline-visit', continuedVisitId)),
+    ).toBeDefined();
+  });
+
   it('updatedAt is max observedAt, never wall-clock', () => {
     const snap = buildConnectionsSnapshot(
       emptyInput({
@@ -1541,7 +1789,9 @@ describe('connections — determinism + cross-replica', () => {
     expect(snap.nodes.find((node) => node.kind === 'snippet')).toBeDefined();
     expect(snap.edges.find((edge) => edge.kind === 'snippet_copied_from_visit')).toBeDefined();
     expect(snap.edges.filter((edge) => edge.kind === 'snippet_pasted_into_thread')).toHaveLength(2);
-    expect(snap.edges.filter((edge) => edge.kind === 'snippet_reused_across_threads')).toHaveLength(2);
+    expect(snap.edges.filter((edge) => edge.kind === 'snippet_reused_across_threads')).toHaveLength(
+      2,
+    );
     expect(
       snap.edges.every((edge) =>
         edge.kind.startsWith('snippet_') ? edge.producedBy.source === 'snippet-lineage' : true,

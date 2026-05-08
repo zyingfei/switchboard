@@ -113,6 +113,12 @@ export const EDGE_KINDS: Record<string, EdgeKindMetadata> = {
     description:
       'Visit-similarity revision linked these browser visits by title, host, and path corpus embedding.',
   },
+  closest_visit: {
+    family: 'urlmatch',
+    label: 'closest visit',
+    description:
+      'Learned ranker linked these visits and attached score plus top feature contributions.',
+  },
   visit_observed_on_replica: {
     family: 'urlmatch',
     label: 'observed on',
@@ -132,8 +138,7 @@ export const EDGE_KINDS: Record<string, EdgeKindMetadata> = {
   topic_in_workstream: {
     family: 'contain',
     label: 'in workstream',
-    description:
-      'At least 75% of topic members share this workstream attribution.',
+    description: 'At least 75% of topic members share this workstream attribution.',
   },
   'topic.lineage': {
     family: 'flow',
@@ -178,7 +183,10 @@ export const EDGE_KINDS: Record<string, EdgeKindMetadata> = {
   },
 };
 
-export const FAMILIES: Record<EdgeFamily, { readonly label: string; readonly description: string }> = {
+export const FAMILIES: Record<
+  EdgeFamily,
+  { readonly label: string; readonly description: string }
+> = {
   contain: { label: 'Containment', description: 'Hierarchy / membership' },
   flow: { label: 'Dispatch flow', description: 'Causal action' },
   defer: { label: 'Queue · Reminder', description: 'Deferred targeting' },

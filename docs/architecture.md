@@ -196,6 +196,105 @@ is in IndexedDB or `chrome.storage.local`. `chrome.alarms` (minimum
 per-stream version. SW boot runs forward-only migrations on version
 drift; idempotent on re-run.
 
+## Model registry (Stage 2/3 — Class E revision policy)
+
+Stage 2/3 introduces multiple ML-derived artifacts on top of the deterministic
+Stage 1 surfaces. They all share one revision policy via Class E.
+
+### Revision artifact kinds
+
+| Producer | Class E key | Inputs | Output edges/nodes |
+|---|---|---|---|
+| Visit similarity | `visit-resembles:v1:cosine` | merged event log + recall index V3 + `multilingual-e5-small` | `visit_resembles_visit` (Pass 7) |
+| Topic clusterer (Union-Find) | `topic-revision:v1:union-find` | similarity edges + user-asserted edges | `topic` nodes + `visit_in_topic` + `topic_in_workstream` (Pass 8) |
+| Topic clusterer (HDBSCAN) | `topic-revision:v2:hdbscan` | same | same — alternative clusterer; user pins which revision the UI surfaces |
+| Engagement classifier (rules) | `engagement-class:v1:rules` | engagement aggregates + snippet lineage | `engagement.class` metadata on visit nodes (Pass 3) |
+| Cross-replica continuation (LightGBM) | `continuation-classifier:v1:lightgbm` | `visit_observed_on_replica` + Stage 2 features | `visit_continues_visit` (Pass 11) |
+| Closest-visit ranker (LightGBM/LambdaMART) | `closest-visit:v1:lightgbm-lambdamart` | candidate-gen + feature-extraction + feedback-projection | `closest_visit` (Pass 12) with per-feature contributions |
+
+Future revisions add a new key (e.g., `closest-visit:v2:learned-from-feedback`)
+without touching prior revisions. Old revisions stay queryable for audit.
+
+### Revision id (deterministic)
+
+```
+revisionId = sha256(
+  producer-key + ':' +
+  feature-schema-version + ':' +
+  model-fingerprint + ':' +
+  input-state-hash
+).slice(0, 16)
+```
+
+Two replicas with the same merged event log + same model produce the same
+revisionId. Different replicas with different model versions produce
+different revisionIds — the `producedBy: { source, revisionId }` provenance
+on every edge makes both observable.
+
+### Active revision selection
+
+The companion exposes one **active** revision per producer-key namespace.
+The default-active is the latest `revisionId` written for that key; the user
+can pin a specific revision via the side-panel Producer Pin UI (S27).
+Pinning is local to the user-replica (stored in `chrome.storage.local`).
+
+### Retention
+
+Old revision artifacts live under
+`_BAC/connections/<producer>/<revisionId>.json`. The existing
+`auditRetention.ts` policy applies: keep the active revision + the
+most-recent N inactive revisions per producer-key (default N=5). Older
+revisions GC-collected on a daily alarm.
+
+### Retraining loop (Stage 3 — S25)
+
+Feedback projection (S24) aggregates `user.organized.item`,
+`user.engagement.relabeled`, `user.flow.{confirmed,rejected}`,
+`user.topic.renamed`, `user.snippet.promoted` into a training-label dataset.
+
+S25's retrain loop watches the projection's `trainingDatasetHash` and
+triggers a re-train when the hash delta exceeds a threshold (default: 50
+new labels). A new `closest-visit:v1:lightgbm-lambdamart` revision is
+produced; the companion-side `LoadedClosestVisitRanker` lifecycle reloads
+the model on the next snapshot drain.
+
+The user sees: "Ranker v3 (learned from 142 corrections)" in the side panel;
+clicking the pin freezes the surfaced ranker to the user's preferred
+revision while letting the system continue accumulating new revisions for
+audit.
+
+### Debug-pack export (Stage 2 — S22)
+
+MCP tool `sidetrack.debug.explainRanking({ from, to })` returns:
+
+```ts
+{
+  features: CandidatePairFeatures;           // computed live for the pair
+  modelVersion: string;
+  revisionId: string;
+  score: number;
+  contributions: ReadonlyArray<{ feature: string; weight: number }>;
+  sortedReasonCodes: ReadonlyArray<{ code: string; payload: object }>;
+}
+```
+
+Every score reproducible from `(event log + revisionId)`. This is what
+makes the ranker auditable.
+
+### Hardware-neutrality preserved through Stage 2/3
+
+Every Stage 2/3 producer runs on CPU:
+
+- LightGBM via `wlearn-lightgbm` Node binding (pre-built binaries; no
+  compiler toolchain needed on the user's machine).
+- HDBSCAN via in-house pure-TS implementation.
+- ANN index via `usearch` (pre-built binaries).
+- Embeddings via the existing WASM-backed `multilingual-e5-small`.
+
+No GPU dependency; no Apple Silicon assumption; no external API calls.
+Stage 1's "no inference requires GPU / Apple-Silicon hardware" guarantee
+extends through Stage 2/3 unchanged.
+
 ## Reused production components (load-bearing)
 
 Stage 1 must not duplicate or wrap these:

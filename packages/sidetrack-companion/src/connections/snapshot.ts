@@ -3,6 +3,10 @@ import { join } from 'node:path';
 
 import { ANNOTATION_CREATED, isAnnotationCreatedPayload } from '../annotations/events.js';
 import {
+  classifyCrossReplicaContinuations,
+  continuationEdgeForPrediction,
+} from '../continuation/classifier.js';
+import {
   DISPATCH_LINKED,
   DISPATCH_RECORDED,
   isDispatchLinkedPayload,
@@ -20,18 +24,18 @@ import {
 } from '../producers/topic-revision.js';
 import { QUEUE_CREATED, isQueueCreatedPayload } from '../queue/events.js';
 import { CAPTURE_RECORDED, isCaptureRecordedPayload } from '../recall/events.js';
+import { generateCandidates } from '../ranker/candidates.js';
+import { FEATURE_SCHEMA_VERSION, type CandidatePairFeatures } from '../ranker/feature-schema.js';
+import { extractFeatures } from '../ranker/features.js';
+import type { Candidate } from '../ranker/types.js';
 import { projectSnippetLineage } from '../snippets/projection.js';
 import type { AcceptedEvent } from '../sync/causal.js';
-import {
-  THREAD_UPSERTED,
-  isThreadUpsertedPayload,
-} from '../threads/events.js';
+import { THREAD_UPSERTED, isThreadUpsertedPayload } from '../threads/events.js';
 import type { TimelineDayProjection } from '../timeline/projection.js';
 import { detectSearchUrl } from '../timeline/sanitize.js';
-import {
-  WORKSTREAM_UPSERTED,
-  isWorkstreamUpsertedPayload,
-} from '../workstreams/events.js';
+import { VISUAL_FINGERPRINT_OBSERVED } from '../visual/events.js';
+import { projectVisualFingerprints } from '../visual/projection.js';
+import { WORKSTREAM_UPSERTED, isWorkstreamUpsertedPayload } from '../workstreams/events.js';
 import type { EngagementClassRevision } from './engagementClassifier.js';
 import { findThreadQuotes, type ThreadText } from './quoteIndex.js';
 import {
@@ -86,6 +90,12 @@ export type { ConnectionsSnapshot } from './types.js';
 //   snippet_copied_from_visit             hash-only copy/paste lineage
 //   snippet_pasted_into_<dest>            paste destination edge
 //   snippet_reused_across_threads         same snippet pasted into >=2 threads
+//   visit_continues_visit                 inferred cross-replica
+//                                         continuation handoff
+//   closest_visit                         learned ranker top-K visit
+//                                         relation with feature
+//                                         contributions
+//   visit_in_template                     DOM-skeleton hash grouping
 //
 // `annotation_targets_workstream` is declared in the edge-kind union
 // for completeness but not yet emitted (workstream-anchored
@@ -172,7 +182,23 @@ export interface ConnectionsInput {
   readonly topicWorkstreamShareThreshold?: number;
   readonly crossReplica?: CrossReplicaMaterialization;
   readonly engagementClassRevision?: EngagementClassRevision;
+  readonly closestVisitRanker?: ClosestVisitRanker;
   readonly scope?: ConnectionsSnapshotScope;
+}
+
+export interface ClosestVisitRankerPrediction {
+  readonly score: number;
+  readonly contributions: Readonly<Record<keyof CandidatePairFeatures, number>>;
+}
+
+export interface ClosestVisitRanker {
+  readonly revisionId: string;
+  readonly threshold?: number;
+  readonly topK?: number;
+  readonly predict: (
+    features: CandidatePairFeatures,
+    candidate: Candidate,
+  ) => ClosestVisitRankerPrediction;
 }
 
 // Internal accumulator for nodes — allows merging origin replica
@@ -271,8 +297,62 @@ const upsertEdge = (
   }
 };
 
+const snapshotFromAccumulators = (
+  scope: ConnectionsSnapshotScope | undefined,
+  nodes: ReadonlyMap<string, AccumNode>,
+  edges: ReadonlyMap<string, ConnectionEdge>,
+  maxObservedAt: string,
+): ConnectionsSnapshot => {
+  const finalNodes: ConnectionNode[] = [];
+  for (const node of nodes.values()) {
+    finalNodes.push({
+      id: node.id,
+      kind: node.kind,
+      label: node.label,
+      ...(node.firstSeenAt === undefined ? {} : { firstSeenAt: node.firstSeenAt }),
+      ...(node.lastSeenAt === undefined ? {} : { lastSeenAt: node.lastSeenAt }),
+      originReplicaIds: [...node.originReplicaIds].sort(),
+      metadata: compactMetadata(node.metadata),
+    });
+  }
+
+  const sortedNodes = sortAlphaById(finalNodes);
+  const sortedEdges = sortAlphaById([...edges.values()]);
+  return {
+    scope: scope ?? {},
+    nodes: sortedNodes,
+    edges: sortedEdges,
+    updatedAt: maxObservedAt.length > 0 ? maxObservedAt : '1970-01-01T00:00:00.000Z',
+    nodeCount: sortedNodes.length,
+    edgeCount: sortedEdges.length,
+  };
+};
+
 const stripFragmentAndTrailingSlash = (url: string): string =>
   url.replace(/#.*$/u, '').replace(/\/+$/u, '');
+
+const TIMELINE_VISIT_NODE_PREFIX = 'timeline-visit:';
+
+const visitKeyFromNodeOrRaw = (value: string): string =>
+  value.startsWith(TIMELINE_VISIT_NODE_PREFIX)
+    ? value.slice(TIMELINE_VISIT_NODE_PREFIX.length)
+    : stripFragmentAndTrailingSlash(value);
+
+const roundRankerMetric = (value: number): number => Number(value.toFixed(6));
+
+const topClosestVisitContributions = (
+  contributions: Readonly<Record<keyof CandidatePairFeatures, number>>,
+  limit: number,
+): readonly { readonly feature: string; readonly weight: number }[] =>
+  (Object.entries(contributions) as readonly [keyof CandidatePairFeatures, number][])
+    .filter(
+      ([feature, weight]) => feature !== 'schemaVersion' && Number.isFinite(weight) && weight !== 0,
+    )
+    .sort(
+      (left, right) => Math.abs(right[1]) - Math.abs(left[1]) || left[0].localeCompare(right[0]),
+    )
+    .slice(0, Math.max(0, Math.floor(limit)))
+    .map(([feature, weight]) => ({ feature, weight: roundRankerMetric(weight) }));
 
 // ---------------------------------------------------------------------------
 // Pass 1: walk events, populate nodes + emit event-derived edges.
@@ -292,11 +372,14 @@ const stripFragmentAndTrailingSlash = (url: string): string =>
 // Pass 8: topic-clusterer active revision — emit topic nodes,
 //         visit_in_topic / topic_in_workstream membership edges, and
 //         topic.lineage split/merge edges.
+// Pass 9: cross-replica visit evidence.
+// Pass 10: hash-only snippet lineage.
+// Pass 11: cross-replica continuation classifier.
+// Pass 12: learned closest_visit ranker edge emission.
+// Pass 13: DOM-skeleton template grouping.
 // ---------------------------------------------------------------------------
 
-export const buildConnectionsSnapshot = (
-  input: ConnectionsInput,
-): ConnectionsSnapshot => {
+export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSnapshot => {
   const nodes = new Map<string, AccumNode>();
   const edges = new Map<string, ConnectionEdge>();
   let maxObservedAt = '';
@@ -334,9 +417,7 @@ export const buildConnectionsSnapshot = (
           provider: p.provider,
           url: p.threadUrl,
           title: p.title,
-          ...(p.primaryWorkstreamId === undefined
-            ? {}
-            : { workstreamId: p.primaryWorkstreamId }),
+          ...(p.primaryWorkstreamId === undefined ? {} : { workstreamId: p.primaryWorkstreamId }),
         },
       });
       if (p.primaryWorkstreamId !== undefined) {
@@ -466,7 +547,11 @@ export const buildConnectionsSnapshot = (
             fromNodeId: nodeIdFor('queue-item', p.bac_id),
             toNodeId: nodeIdFor('thread', p.targetId),
             observedAt: observedAtIso,
-            producedBy: { source: 'event-log', eventType: QUEUE_CREATED, dot: { replicaId, seq: event.dot.seq } },
+            producedBy: {
+              source: 'event-log',
+              eventType: QUEUE_CREATED,
+              dot: { replicaId, seq: event.dot.seq },
+            },
             confidence: 'asserted',
           });
         } else if (p.scope === 'workstream') {
@@ -482,7 +567,11 @@ export const buildConnectionsSnapshot = (
             fromNodeId: nodeIdFor('queue-item', p.bac_id),
             toNodeId: nodeIdFor('workstream', p.targetId),
             observedAt: observedAtIso,
-            producedBy: { source: 'event-log', eventType: QUEUE_CREATED, dot: { replicaId, seq: event.dot.seq } },
+            producedBy: {
+              source: 'event-log',
+              eventType: QUEUE_CREATED,
+              dot: { replicaId, seq: event.dot.seq },
+            },
             confidence: 'asserted',
           });
         }
@@ -523,7 +612,7 @@ export const buildConnectionsSnapshot = (
       metadata: {
         ...(t.provider === undefined ? {} : { provider: t.provider }),
         ...(t.threadUrl === undefined ? {} : { url: t.threadUrl }),
-        ...(t.canonicalUrl ?? t.threadUrl ? { canonicalUrl: t.canonicalUrl ?? t.threadUrl } : {}),
+        ...((t.canonicalUrl ?? t.threadUrl) ? { canonicalUrl: t.canonicalUrl ?? t.threadUrl } : {}),
         ...(t.title === undefined ? {} : { title: t.title }),
       },
     });
@@ -566,7 +655,7 @@ export const buildConnectionsSnapshot = (
           kind: 'workstream_parent_of',
           fromNodeId: nodeIdFor('workstream', w.bac_id),
           toNodeId: nodeIdFor('workstream', childId),
-          observedAt: '',  // vault record without observedAt; sentinel sorts first
+          observedAt: '', // vault record without observedAt; sentinel sorts first
           producedBy: { source: 'workboard-state', recordId: w.bac_id },
           confidence: 'asserted',
         });
@@ -609,7 +698,11 @@ export const buildConnectionsSnapshot = (
       });
     }
     if (typeof d.mcpRequest?.codingSessionId === 'string') {
-      upsertNode(nodes, { kind: 'coding-session', key: d.mcpRequest.codingSessionId, label: d.mcpRequest.codingSessionId });
+      upsertNode(nodes, {
+        kind: 'coding-session',
+        key: d.mcpRequest.codingSessionId,
+        label: d.mcpRequest.codingSessionId,
+      });
       upsertEdge(edges, {
         kind: 'dispatch_requested_coding_session',
         fromNodeId: nodeIdFor('dispatch', d.bac_id),
@@ -750,8 +843,7 @@ export const buildConnectionsSnapshot = (
       // dispatch bodies / annotation notes. Host-agnostic detection
       // — see timeline/sanitize.ts:detectSearchUrl.
       const searchInfo = detectSearchUrl(entry.canonicalUrl ?? entry.url);
-      const searchQuery =
-        searchInfo === null ? undefined : searchInfo.query.trim().toLowerCase();
+      const searchQuery = searchInfo === null ? undefined : searchInfo.query.trim().toLowerCase();
       const engagementClass = engagementClassByCanonicalUrl.get(visitKey);
       upsertNode(nodes, {
         kind: 'timeline-visit',
@@ -980,10 +1072,7 @@ export const buildConnectionsSnapshot = (
           confidence: 'observed',
         });
       }
-      if (
-        p.mcpRequest !== undefined &&
-        typeof p.mcpRequest.codingSessionId === 'string'
-      ) {
+      if (p.mcpRequest !== undefined && typeof p.mcpRequest.codingSessionId === 'string') {
         upsertNode(nodes, {
           kind: 'coding-session',
           key: p.mcpRequest.codingSessionId,
@@ -1195,9 +1284,7 @@ export const buildConnectionsSnapshot = (
           producedBy: {
             source: 'event-log',
             eventType,
-            ...(replicaId === undefined || seq === undefined
-              ? {}
-              : { dot: { replicaId, seq } }),
+            ...(replicaId === undefined || seq === undefined ? {} : { dot: { replicaId, seq } }),
           },
           confidence: 'inferred',
         });
@@ -1234,10 +1321,7 @@ export const buildConnectionsSnapshot = (
           replicaId,
           seq,
         );
-      } else if (
-        event.type === ANNOTATION_CREATED &&
-        isAnnotationCreatedPayload(event.payload)
-      ) {
+      } else if (event.type === ANNOTATION_CREATED && isAnnotationCreatedPayload(event.payload)) {
         const p = event.payload;
         matchTextAgainstQueries(
           nodeIdFor('annotation', p.bac_id),
@@ -1565,35 +1649,201 @@ export const buildConnectionsSnapshot = (
   }
 
   // -------------------------------------------------------------------
-  // Materialize: convert accumulators to deterministic snapshot.
+  // Pass 11 — cross-replica continuation classifier. Candidate pairs
+  // are limited to URLs already evidenced by visit_observed_on_replica;
+  // the classifier then uses the S18 feature extractor plus
+  // continuation-specific timing and copy/paste signals.
   // -------------------------------------------------------------------
-  const finalNodes: ConnectionNode[] = [];
-  for (const node of nodes.values()) {
-    finalNodes.push({
-      id: node.id,
-      kind: node.kind,
-      label: node.label,
-      ...(node.firstSeenAt === undefined ? {} : { firstSeenAt: node.firstSeenAt }),
-      ...(node.lastSeenAt === undefined ? {} : { lastSeenAt: node.lastSeenAt }),
-      originReplicaIds: [...node.originReplicaIds].sort(),
-      metadata: compactMetadata(node.metadata),
+  const continuationPredictions = classifyCrossReplicaContinuations({
+    merged: input.events,
+    snapshot: snapshotFromAccumulators(input.scope, nodes, edges, maxObservedAt),
+  });
+  for (const prediction of continuationPredictions) {
+    trackObservedAt(prediction.fromObservedAt);
+    trackObservedAt(prediction.toObservedAt);
+    upsertNode(nodes, {
+      kind: 'timeline-visit',
+      key: prediction.fromVisitId,
+      label: prediction.fromUrl,
+      observedAt: prediction.fromObservedAt,
+      replicaId: prediction.fromReplicaId,
+      metadata: {
+        url: prediction.fromUrl,
+        canonicalUrl: prediction.canonicalUrl,
+        replicaId: prediction.fromReplicaId,
+      },
+    });
+    upsertNode(nodes, {
+      kind: 'timeline-visit',
+      key: prediction.toVisitId,
+      label: prediction.toUrl,
+      observedAt: prediction.toObservedAt,
+      replicaId: prediction.toReplicaId,
+      metadata: {
+        url: prediction.toUrl,
+        canonicalUrl: prediction.canonicalUrl,
+        replicaId: prediction.toReplicaId,
+      },
+    });
+    const edge = continuationEdgeForPrediction(prediction);
+    upsertEdge(edges, {
+      kind: edge.kind,
+      fromNodeId: edge.fromNodeId,
+      toNodeId: edge.toNodeId,
+      observedAt: edge.observedAt,
+      producedBy: edge.producedBy,
+      confidence: edge.confidence,
+      family: edge.family,
+      ...(edge.metadata === undefined ? {} : { metadata: edge.metadata }),
     });
   }
 
-  const sortedNodes = sortAlphaById(finalNodes);
-  const sortedEdges = sortAlphaById([...edges.values()]);
+  // -------------------------------------------------------------------
+  // Pass 12 — closest_visit ranker edge emission. Candidate
+  // generation and feature extraction are deterministic; the active
+  // ranker scorer is injected by the materializer after loading the
+  // Class E revision.
+  // -------------------------------------------------------------------
+  if (input.closestVisitRanker !== undefined) {
+    const ranker = input.closestVisitRanker;
+    const threshold = ranker.threshold ?? 0.3;
+    const topK = Math.max(0, Math.floor(ranker.topK ?? 5));
+    const baseSnapshot = snapshotFromAccumulators(input.scope, nodes, edges, maxObservedAt);
+    const baseNodeById = new Map(baseSnapshot.nodes.map((node) => [node.id, node] as const));
+    const visitKeys = [
+      ...new Set(
+        baseSnapshot.nodes
+          .filter((node) => node.kind === 'timeline-visit')
+          .map((node) => visitKeyFromNodeOrRaw(node.id))
+          .filter((visitKey) => visitKey.length > 0),
+      ),
+    ].sort();
+    const merged = [...input.events];
 
-  const updatedAt =
-    maxObservedAt.length > 0 ? maxObservedAt : '1970-01-01T00:00:00.000Z';
+    const observedAtForVisit = (visitKey: string): string => {
+      const node = baseNodeById.get(nodeIdFor('timeline-visit', visitKey));
+      return node?.lastSeenAt ?? node?.firstSeenAt ?? visitObservedAtByKey.get(visitKey) ?? '';
+    };
 
-  return {
-    scope: input.scope ?? {},
-    nodes: sortedNodes,
-    edges: sortedEdges,
-    updatedAt,
-    nodeCount: sortedNodes.length,
-    edgeCount: sortedEdges.length,
-  };
+    for (const fromVisitKey of visitKeys) {
+      if (topK === 0) break;
+      const scoredCandidates = generateCandidates(fromVisitKey, {
+        merged,
+        existingEdges: [...baseSnapshot.edges],
+      })
+        .map((candidate) => {
+          const toVisitKey = visitKeyFromNodeOrRaw(candidate.toVisitId);
+          if (!baseNodeById.has(nodeIdFor('timeline-visit', toVisitKey))) return null;
+          const features = extractFeatures(candidate, {
+            merged,
+            snapshot: baseSnapshot,
+          });
+          const prediction = ranker.predict(features, candidate);
+          if (!Number.isFinite(prediction.score) || prediction.score < threshold) {
+            return null;
+          }
+          return {
+            candidate,
+            toVisitKey,
+            score: roundRankerMetric(prediction.score),
+            topContributions: topClosestVisitContributions(prediction.contributions, 3),
+          };
+        })
+        .filter(
+          (
+            candidate,
+          ): candidate is {
+            readonly candidate: Candidate;
+            readonly toVisitKey: string;
+            readonly score: number;
+            readonly topContributions: readonly {
+              readonly feature: string;
+              readonly weight: number;
+            }[];
+          } => candidate !== null,
+        )
+        .sort(
+          (left, right) =>
+            right.score - left.score ||
+            left.toVisitKey.localeCompare(right.toVisitKey) ||
+            left.candidate.generatedAt - right.candidate.generatedAt,
+        )
+        .slice(0, topK);
+
+      for (const scored of scoredCandidates) {
+        const fromObservedAt = observedAtForVisit(fromVisitKey);
+        const toObservedAt = observedAtForVisit(scored.toVisitKey);
+        const observedAt = fromObservedAt > toObservedAt ? fromObservedAt : toObservedAt;
+        trackObservedAt(observedAt);
+        upsertEdge(edges, {
+          kind: 'closest_visit',
+          fromNodeId: nodeIdFor('timeline-visit', fromVisitKey),
+          toNodeId: nodeIdFor('timeline-visit', scored.toVisitKey),
+          observedAt,
+          producedBy: {
+            source: 'ranker',
+            revisionId: ranker.revisionId,
+          },
+          confidence: 'inferred',
+          family: 'urlmatch',
+          metadata: {
+            score: scored.score,
+            featureSchemaVersion: FEATURE_SCHEMA_VERSION,
+            topContributions: scored.topContributions,
+          },
+        });
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Pass 13 — DOM-skeleton template grouping. Visual fingerprint
+  // events carry only a SHA-256 hash of the canonical tag tree plus
+  // boolean class/id presence. The reducer groups visits by that hash
+  // without reading page text, attributes, screenshots, or pixels.
+  // -------------------------------------------------------------------
+  const visualFingerprints = projectVisualFingerprints(input.events);
+  for (const fingerprint of visualFingerprints.fingerprints) {
+    trackObservedAt(fingerprint.observedAt);
+    upsertNode(nodes, {
+      kind: 'timeline-visit',
+      key: fingerprint.visitId,
+      label: fingerprint.visitId,
+      observedAt: fingerprint.observedAt,
+      replicaId: fingerprint.replicaId,
+      metadata: {
+        canonicalUrl: fingerprint.visitId,
+      },
+    });
+    upsertNode(nodes, {
+      kind: 'template',
+      key: fingerprint.domHash,
+      label: `template:${fingerprint.domHash.slice(0, 12)}`,
+      observedAt: fingerprint.observedAt,
+      replicaId: fingerprint.replicaId,
+      metadata: {
+        domHash: fingerprint.domHash,
+      },
+    });
+    upsertEdge(edges, {
+      kind: 'visit_in_template',
+      fromNodeId: nodeIdFor('timeline-visit', fingerprint.visitId),
+      toNodeId: nodeIdFor('template', fingerprint.domHash),
+      observedAt: fingerprint.observedAt,
+      producedBy: {
+        source: 'event-log',
+        eventType: VISUAL_FINGERPRINT_OBSERVED,
+        dot: { replicaId: fingerprint.replicaId, seq: fingerprint.seq },
+      },
+      confidence: 'observed',
+      family: 'urlmatch',
+    });
+  }
+
+  // -------------------------------------------------------------------
+  // Materialize: convert accumulators to deterministic snapshot.
+  // -------------------------------------------------------------------
+  return snapshotFromAccumulators(input.scope, nodes, edges, maxObservedAt);
 };
 
 // ---------------------------------------------------------------------------
@@ -1720,7 +1970,9 @@ export const findPath = (
   fromNodeId: string,
   toNodeId: string,
   maxHops = 4,
-): { found: true; nodes: readonly ConnectionNode[]; edges: readonly ConnectionEdge[] } | { found: false } => {
+):
+  | { found: true; nodes: readonly ConnectionNode[]; edges: readonly ConnectionEdge[] }
+  | { found: false } => {
   if (fromNodeId === toNodeId) {
     const node = snapshot.nodes.find((n) => n.id === fromNodeId);
     if (node !== undefined) return { found: true, nodes: [node], edges: [] };
@@ -1753,7 +2005,9 @@ export const findPath = (
         const nodeMap = new Map(snapshot.nodes.map((n) => [n.id, n] as const));
         return {
           found: true,
-          nodes: nextNodes.map((id) => nodeMap.get(id)).filter((n): n is ConnectionNode => n !== undefined),
+          nodes: nextNodes
+            .map((id) => nodeMap.get(id))
+            .filter((n): n is ConnectionNode => n !== undefined),
           edges: nextEdges,
         };
       }

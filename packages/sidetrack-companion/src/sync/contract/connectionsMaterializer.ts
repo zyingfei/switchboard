@@ -7,19 +7,30 @@ import { buildEngagementClassRevision } from '../../connections/engagementClassi
 import { readVaultStores } from '../../connections/loader.js';
 import {
   buildConnectionsSnapshot,
+  type ClosestVisitRanker,
   type ConnectionsInput,
 } from '../../connections/snapshot.js';
 import type { ConnectionsStore } from '../../connections/snapshot.js';
 import {
   buildTopicRevision,
+  type BuildTopicRevisionInput,
   type TopicVisit,
 } from '../../connections/topicClusterer.js';
+import { buildHdbscanTopicRevision } from '../../connections/hdbscanClusterer.js';
 import {
   buildVisitSimilarity,
   type VisitSimilarityEmbedder,
 } from '../../connections/visitSimilarity.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
 import { ENGAGEMENT_SESSION_AGGREGATED } from '../../engagement/events.js';
+import {
+  USER_ENGAGEMENT_RELABELED,
+  USER_FLOW_CONFIRMED,
+  USER_FLOW_REJECTED,
+  USER_ORGANIZED_ITEM,
+  USER_SNIPPET_PROMOTED,
+  USER_TOPIC_RENAMED,
+} from '../../feedback/events.js';
 import { NAVIGATION_COMMITTED } from '../../navigation/events.js';
 import {
   buildEngagementClassifierInputs,
@@ -27,9 +38,19 @@ import {
   type EngagementClassRevisionStore,
 } from '../../producers/engagement-class-revision.js';
 import {
+  readActiveClosestVisitRankerRevisionManifest,
+  readClosestVisitRankerRevision,
+} from '../../producers/closest-visit-revision.js';
+import {
+  TOPIC_HDBSCAN_REVISION_KEY,
+  TOPIC_UNION_FIND_REVISION_KEY,
   createTopicRevisionStore,
+  type TopicAlgorithmVersion,
+  type TopicRevision,
   type TopicRevisionStore,
 } from '../../producers/topic-revision.js';
+import { loadRankerModel, predictRanker, type LightGBMModel } from '../../ranker/predict.js';
+import { maybeRetrainClosestVisitRanker, type RankerRetrainer } from '../../ranker/retrain.js';
 import { writeVisitSimilarityRevision } from '../../producers/visit-resembles-revision.js';
 import { QUEUE_CREATED, QUEUE_STATUS_SET } from '../../queue/events.js';
 import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from '../../recall/events.js';
@@ -55,10 +76,8 @@ import {
   type TimelineDayProjection,
   type TimelineStore,
 } from '../../timeline/projection.js';
-import {
-  WORKSTREAM_DELETED,
-  WORKSTREAM_UPSERTED,
-} from '../../workstreams/events.js';
+import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
+import { VISUAL_FINGERPRINT_OBSERVED } from '../../visual/events.js';
 import type { AcceptedEvent } from '../causal.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
@@ -108,6 +127,12 @@ const HANDLES: ReadonlySet<string> = new Set<string>([
   RECALL_TOMBSTONE_TARGET,
   NAVIGATION_COMMITTED,
   ENGAGEMENT_SESSION_AGGREGATED,
+  USER_ENGAGEMENT_RELABELED,
+  USER_FLOW_CONFIRMED,
+  USER_FLOW_REJECTED,
+  USER_ORGANIZED_ITEM,
+  USER_SNIPPET_PROMOTED,
+  USER_TOPIC_RENAMED,
   SELECTION_COPIED,
   SELECTION_PASTED,
   // Timeline observations indirectly contribute (timeline visits
@@ -117,6 +142,7 @@ const HANDLES: ReadonlySet<string> = new Set<string>([
   // materializer reads the daily projection rather than the
   // event payload directly.
   BROWSER_TIMELINE_OBSERVED,
+  VISUAL_FINGERPRINT_OBSERVED,
 ]);
 
 export interface CreateConnectionsMaterializerDeps {
@@ -125,17 +151,39 @@ export interface CreateConnectionsMaterializerDeps {
   readonly timelineStore: TimelineStore;
   readonly store: ConnectionsStore;
   readonly embed?: VisitSimilarityEmbedder;
+  readonly topicRevisionAlgorithm?: TopicAlgorithmVersion;
   readonly topicRevisionStore?: TopicRevisionStore;
   readonly engagementClassStore?: EngagementClassRevisionStore;
+  readonly rankerRetrainer?: RankerRetrainer;
 }
+
+type TopicRevisionBuilder = (input: BuildTopicRevisionInput) => Promise<TopicRevision>;
+
+interface LoadedClosestVisitRanker {
+  readonly ranker: ClosestVisitRanker;
+  readonly model: LightGBMModel;
+}
+
+const topicRevisionBuilderFor = (algorithm: TopicAlgorithmVersion): TopicRevisionBuilder => {
+  switch (algorithm) {
+    case TOPIC_UNION_FIND_REVISION_KEY:
+      return buildTopicRevision;
+    case TOPIC_HDBSCAN_REVISION_KEY:
+      return buildHdbscanTopicRevision;
+  }
+};
 
 export const createConnectionsMaterializer = (
   deps: CreateConnectionsMaterializerDeps,
 ): Materializer => {
-  const topicRevisionStore =
-    deps.topicRevisionStore ?? createTopicRevisionStore(deps.vaultRoot);
+  const topicRevisionStore = deps.topicRevisionStore ?? createTopicRevisionStore(deps.vaultRoot);
+  const topicRevisionAlgorithm = deps.topicRevisionAlgorithm ?? TOPIC_UNION_FIND_REVISION_KEY;
+  const buildSelectedTopicRevision = topicRevisionBuilderFor(topicRevisionAlgorithm);
   const engagementClassStore =
     deps.engagementClassStore ?? createEngagementClassRevisionStore(deps.vaultRoot);
+  const rankerRetrainer =
+    deps.rankerRetrainer ??
+    ((context) => maybeRetrainClosestVisitRanker({ vaultRoot: deps.vaultRoot, ...context }));
   let pending = false;
   let running = false;
   let dirty = false;
@@ -205,9 +253,7 @@ export const createConnectionsMaterializer = (
   ): readonly TimelineDayProjectionWithDimensions[] => {
     const payloads = collectTimelinePayloads(
       merged.filter(
-        (e) =>
-          e.type === BROWSER_TIMELINE_OBSERVED &&
-          isBrowserTimelineObservedPayload(e.payload),
+        (e) => e.type === BROWSER_TIMELINE_OBSERVED && isBrowserTimelineObservedPayload(e.payload),
       ),
     );
     const grouped = groupByDay(payloads);
@@ -261,10 +307,7 @@ export const createConnectionsMaterializer = (
       const canonicalUrl = stripFragmentAndTrailingSlash(input.canonicalUrl);
       focusedByCanonicalUrl.set(
         canonicalUrl,
-        Math.max(
-          focusedByCanonicalUrl.get(canonicalUrl) ?? 0,
-          input.engagement.focusedWindowMs,
-        ),
+        Math.max(focusedByCanonicalUrl.get(canonicalUrl) ?? 0, input.engagement.focusedWindowMs),
       );
     }
 
@@ -288,6 +331,25 @@ export const createConnectionsMaterializer = (
   const maxAcceptedAtMs = (events: readonly AcceptedEvent[]): number =>
     events.reduce((max, event) => Math.max(max, event.acceptedAtMs), 0);
 
+  const loadClosestVisitRanker = async (): Promise<LoadedClosestVisitRanker | null> => {
+    const manifest = await readActiveClosestVisitRankerRevisionManifest(deps.vaultRoot);
+    if (manifest === null) return null;
+    const revision = await readClosestVisitRankerRevision(deps.vaultRoot, manifest.revisionId);
+    if (revision === null) return null;
+    try {
+      const model = await loadRankerModel(revision);
+      return {
+        model,
+        ranker: {
+          revisionId: model.revisionId,
+          predict: (features) => predictRanker(features, model),
+        },
+      };
+    } catch {
+      return null;
+    }
+  };
+
   const buildAndWrite = async (): Promise<void> => {
     const merged = await deps.eventLog.readMerged();
     const vault = await readVaultStores(deps.vaultRoot);
@@ -304,7 +366,7 @@ export const createConnectionsMaterializer = (
     );
     await writeVisitSimilarityRevision(deps.vaultRoot, visitSimilarity);
     const previousTopicRevision = await topicRevisionStore.readActiveRevision();
-    const topicRevision = await buildTopicRevision({
+    const topicRevision = await buildSelectedTopicRevision({
       visits: timelineDays.flatMap((day) => day.entries.map(topicVisitFromEntry)),
       visitSimilarity,
       ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
@@ -318,8 +380,23 @@ export const createConnectionsMaterializer = (
       topicRevision,
       engagementClassRevision,
     };
-    const snapshot = buildConnectionsSnapshot(input);
-    await deps.store.putCurrent(snapshot);
+    const baseSnapshot = buildConnectionsSnapshot(input);
+    await rankerRetrainer({ merged, snapshot: baseSnapshot });
+    const closestVisitRanker = await loadClosestVisitRanker();
+    if (closestVisitRanker === null) {
+      await deps.store.putCurrent(baseSnapshot);
+      return;
+    }
+
+    try {
+      const snapshot = buildConnectionsSnapshot({
+        ...input,
+        closestVisitRanker: closestVisitRanker.ranker,
+      });
+      await deps.store.putCurrent(snapshot);
+    } finally {
+      closestVisitRanker.model.dispose();
+    }
   };
 
   const drain = async (): Promise<void> => {
@@ -359,7 +436,7 @@ export const createConnectionsMaterializer = (
     })();
   };
 
-  const onAccepted: Materializer['onAccepted'] = (event, _ctx) => {
+  const onAccepted: Materializer['onAccepted'] = (event) => {
     if (!HANDLES.has(event.type)) return;
     requestDrain();
   };

@@ -46,6 +46,20 @@ import {
   PRIVACY_PERMISSION_GRANTED,
   PRIVACY_PERMISSION_REVOKED,
 } from '../privacy/events.js';
+import {
+  USER_ENGAGEMENT_RELABELED,
+  USER_FLOW_CONFIRMED,
+  USER_FLOW_REJECTED,
+  USER_ORGANIZED_ITEM,
+  USER_SNIPPET_PROMOTED,
+  USER_TOPIC_RENAMED,
+  isUserEngagementRelabeledPayload,
+  isUserFlowConfirmedPayload,
+  isUserFlowRejectedPayload,
+  isUserOrganizedItemPayload,
+  isUserSnippetPromotedPayload,
+  isUserTopicRenamedPayload,
+} from '../feedback/events.js';
 import { projectPrivacy } from '../privacy/projection.js';
 import {
   appendEntry as appendEntryRaw,
@@ -923,6 +937,56 @@ const isPrivacyPayloadForType = (
 const privacyEventsFrom = (events: readonly import('../sync/causal.js').AcceptedEvent[]) =>
   events.filter((event) => isPrivacyEventType(event.type));
 
+const isFeedbackEventType = (
+  value: unknown,
+): value is
+  | typeof USER_ORGANIZED_ITEM
+  | typeof USER_ENGAGEMENT_RELABELED
+  | typeof USER_FLOW_CONFIRMED
+  | typeof USER_FLOW_REJECTED
+  | typeof USER_TOPIC_RENAMED
+  | typeof USER_SNIPPET_PROMOTED =>
+  value === USER_ORGANIZED_ITEM ||
+  value === USER_ENGAGEMENT_RELABELED ||
+  value === USER_FLOW_CONFIRMED ||
+  value === USER_FLOW_REJECTED ||
+  value === USER_TOPIC_RENAMED ||
+  value === USER_SNIPPET_PROMOTED;
+
+const isFeedbackPayloadForType = (
+  type: string,
+  payload: unknown,
+): payload is Record<string, unknown> => {
+  if (type === USER_ORGANIZED_ITEM) return isUserOrganizedItemPayload(payload);
+  if (type === USER_ENGAGEMENT_RELABELED) return isUserEngagementRelabeledPayload(payload);
+  if (type === USER_FLOW_CONFIRMED) return isUserFlowConfirmedPayload(payload);
+  if (type === USER_FLOW_REJECTED) return isUserFlowRejectedPayload(payload);
+  if (type === USER_TOPIC_RENAMED) return isUserTopicRenamedPayload(payload);
+  if (type === USER_SNIPPET_PROMOTED) return isUserSnippetPromotedPayload(payload);
+  return false;
+};
+
+const aggregateIdForFeedbackEvent = (type: string, payload: Record<string, unknown>): string => {
+  if (type === USER_ORGANIZED_ITEM) {
+    return `feedback:${String(payload['itemKind'])}:${String(payload['itemId'])}`;
+  }
+  if (type === USER_ENGAGEMENT_RELABELED) {
+    return `feedback:engagement:${String(payload['visitId'])}`;
+  }
+  if (type === USER_FLOW_CONFIRMED || type === USER_FLOW_REJECTED) {
+    return `feedback:flow:${String(payload['relationKind'])}:${String(payload['fromId'])}:${String(
+      payload['toId'],
+    )}`;
+  }
+  if (type === USER_TOPIC_RENAMED) {
+    return `feedback:topic:${String(payload['topicId'])}`;
+  }
+  if (type === USER_SNIPPET_PROMOTED) {
+    return `feedback:snippet:${String(payload['snippetId'])}`;
+  }
+  return 'feedback:unknown';
+};
+
 const parseThreadUpsertBody = async (vaultRoot: string, body: unknown) => {
   const full = threadUpsertSchema.safeParse(body);
   if (full.success) {
@@ -1156,6 +1220,44 @@ const routes: readonly RouteDefinition[] = [
             },
           },
         ];
+      });
+    },
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/feedback\/events$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const eventLog = context.eventLog;
+      const idempotencyKey = requireIdempotencyKey(request);
+      return await runIdempotent(context, 'feedbackEvent', idempotencyKey, async () => {
+        const body = objectRecord(await readBody(request));
+        const type = body?.['type'];
+        const payload = body?.['payload'];
+        if (!isFeedbackEventType(type) || !isFeedbackPayloadForType(type, payload)) {
+          throw new HttpRouteError(
+            400,
+            'VALIDATION_ERROR',
+            'Validation failed.',
+            'Body must be a valid feedback event envelope.',
+          );
+        }
+        const aggregateId = aggregateIdForFeedbackEvent(type, payload);
+        const accepted = await eventLog.appendClient({
+          clientEventId: idempotencyKey,
+          aggregateId,
+          type,
+          payload,
+          baseVector: await baseVectorForAggregate(eventLog, aggregateId),
+        });
+        return [201, { data: { accepted } }];
       });
     },
   },

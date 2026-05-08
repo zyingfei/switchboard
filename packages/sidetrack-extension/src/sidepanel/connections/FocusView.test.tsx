@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 import { FocusView } from './FocusView';
@@ -78,5 +78,62 @@ describe('FocusView', () => {
     fireEvent.click(screen.getByTestId('focus-visit-visit:a'));
     expect(onTopicClick).toHaveBeenCalledWith('topic:a');
     expect(onVisitClick).toHaveBeenCalledWith('visit:a');
+  });
+
+  it('fires inline topic rename feedback', async () => {
+    const onTopicRename = vi.fn(() => Promise.resolve());
+    render(
+      <FocusView
+        topics={[{ id: 'topic:a', label: 'Alpha', memberCount: 1, cohesion: 0.91 }]}
+        visitsByTopic={{}}
+        engagementClassesByVisit={{}}
+        onTopicRename={onTopicRename}
+        onTopicClick={() => undefined}
+        onVisitClick={() => undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('focus-topic-rename-topic:a'));
+    fireEvent.change(screen.getByTestId('focus-topic-rename-input-topic:a'), {
+      target: { value: 'Renamed alpha' },
+    });
+    fireEvent.click(screen.getByTestId('focus-topic-rename-save-topic:a'));
+
+    await waitFor(() => {
+      expect(onTopicRename).toHaveBeenCalledWith({
+        topicId: 'topic:a',
+        previousName: 'Alpha',
+        newName: 'Renamed alpha',
+      });
+    });
+  });
+
+  it('fires per-visit engagement relabel feedback', async () => {
+    const onEngagementRelabel = vi.fn(() => Promise.resolve());
+    render(
+      <FocusView
+        topics={[{ id: 'topic:a', label: 'Alpha', memberCount: 1, cohesion: 0.91 }]}
+        visitsByTopic={{
+          'topic:a': [{ id: 'visit:a', label: 'A', focusedWindowMs: 10_000 }],
+        }}
+        engagementClassesByVisit={{ 'visit:a': 'skimmed' }}
+        onEngagementRelabel={onEngagementRelabel}
+        onTopicClick={() => undefined}
+        onVisitClick={() => undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('focus-expand-topic:a'));
+    fireEvent.change(screen.getByTestId('focus-visit-engagement-visit:a'), {
+      target: { value: 'worked_on_reference' },
+    });
+
+    await waitFor(() => {
+      expect(onEngagementRelabel).toHaveBeenCalledWith({
+        visitId: 'visit:a',
+        fromClass: 'skimmed',
+        toClass: 'worked_on_reference',
+      });
+    });
   });
 });

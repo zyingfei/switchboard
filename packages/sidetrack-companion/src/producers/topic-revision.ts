@@ -7,9 +7,16 @@ import { createRevision } from '../domain/ids.js';
 export const DEFAULT_TOPIC_COSINE_THRESHOLD = 0.85;
 export const DEFAULT_TOPIC_ENGAGEMENT_GATE_MS = 5_000;
 export const DEFAULT_TOPIC_WORKSTREAM_SHARE_THRESHOLD = 0.75;
-export const TOPIC_ALGORITHM_VERSION = 'union-find:v1' as const;
+export const TOPIC_UNION_FIND_REVISION_KEY = 'topic-revision:v1:union-find' as const;
+export const TOPIC_HDBSCAN_REVISION_KEY = 'topic-revision:v2:hdbscan' as const;
+export const TOPIC_ALGORITHM_VERSION = TOPIC_UNION_FIND_REVISION_KEY;
 
-export type TopicAlgorithmVersion = typeof TOPIC_ALGORITHM_VERSION;
+export const TOPIC_REVISION_KEYS = [
+  TOPIC_UNION_FIND_REVISION_KEY,
+  TOPIC_HDBSCAN_REVISION_KEY,
+] as const;
+
+export type TopicAlgorithmVersion = (typeof TOPIC_REVISION_KEYS)[number];
 export type TopicLineageKind = 'split' | 'merge';
 
 export interface TopicNodeMetadata {
@@ -50,9 +57,7 @@ export interface TopicRevisionIdInput {
   readonly algorithmVersion?: TopicAlgorithmVersion;
 }
 
-export const createTopicRevisionId = async (
-  input: TopicRevisionIdInput,
-): Promise<string> =>
+export const createTopicRevisionId = async (input: TopicRevisionIdInput): Promise<string> =>
   sha256Base64UrlPrefix(
     [
       input.visitSimilarityRevisionId,
@@ -69,6 +74,9 @@ const isStringArray = (value: unknown): value is readonly string[] =>
 
 const isTopicLineageKind = (value: unknown): value is TopicLineageKind =>
   value === 'split' || value === 'merge';
+
+const isTopicAlgorithmVersion = (value: unknown): value is TopicAlgorithmVersion =>
+  TOPIC_REVISION_KEYS.some((candidate) => candidate === value);
 
 const isTopicNodeMetadata = (value: unknown): value is TopicNodeMetadata => {
   if (!isRecord(value)) return false;
@@ -110,7 +118,7 @@ export const parseTopicRevision = (value: unknown): TopicRevision | null => {
     typeof value['visitSimilarityRevisionId'] !== 'string' ||
     typeof value['cosineThreshold'] !== 'number' ||
     !Number.isFinite(value['cosineThreshold']) ||
-    value['algorithmVersion'] !== TOPIC_ALGORITHM_VERSION ||
+    !isTopicAlgorithmVersion(value['algorithmVersion']) ||
     !Array.isArray(value['topics']) ||
     !value['topics'].every(isTopicRevisionTopic) ||
     !Array.isArray(value['lineage']) ||

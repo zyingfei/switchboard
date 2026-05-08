@@ -33,6 +33,7 @@ import {
   ENGAGEMENT_INTERVAL_OBSERVED,
   ENGAGEMENT_SESSION_AGGREGATED,
 } from '../../engagement/events.js';
+import { FEEDBACK_EVENT_TYPES } from '../../feedback/events.js';
 import {
   PRIVACY_GATE_FLIPPED,
   PRIVACY_PERMISSION_GRANTED,
@@ -51,6 +52,7 @@ import {
   THREAD_UPSERTED,
 } from '../../threads/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
+import { VISUAL_FINGERPRINT_OBSERVED } from '../../visual/events.js';
 import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
 
 export type StateClass =
@@ -62,6 +64,7 @@ export type StateClass =
   | 'plugin-tier-bounded'; // F (companion side declares the partner surface; the actual storage is plugin-tier)
 
 export type RecoveryMode =
+  | 'class-A'
   | 'replay-event-log'
   | 'source-scoped-reextract'
   | 'on-demand-rebuild'
@@ -126,9 +129,31 @@ const projectionEntry = (eventType: string, surface: string): ContractEntry => (
   ],
 });
 
-const reviewDraftEntries: readonly ContractEntry[] = REVIEW_DRAFT_EVENT_TYPES.map(
-  (eventType) => projectionEntry(eventType, 'review-draft-projection'),
+const reviewDraftEntries: readonly ContractEntry[] = REVIEW_DRAFT_EVENT_TYPES.map((eventType) =>
+  projectionEntry(eventType, 'review-draft-projection'),
 );
+
+const feedbackActionEntries: readonly ContractEntry[] = FEEDBACK_EVENT_TYPES.map((eventType) => ({
+  eventType,
+  currentPayloadVersion: 1,
+  allowedDimensions: [],
+  surfaces: [
+    {
+      surface: 'feedback-action-projection',
+      class: 'aggregate-projection',
+      materializer: 'projection',
+      peerFreshnessMs: 5_000,
+      recovery: 'class-A',
+    },
+    {
+      surface: 'feedback-projection',
+      class: 'derived-cache',
+      materializer: 'projection',
+      peerFreshnessMs: 30_000,
+      recovery: 'replay-event-log',
+    },
+  ],
+}));
 
 const engagementClassProjectionSurface: SurfaceContract = {
   surface: 'engagement-class-projection',
@@ -153,6 +178,7 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   projectionEntry(PRIVACY_GATE_FLIPPED, 'privacy-projection'),
   projectionEntry(PRIVACY_PERMISSION_GRANTED, 'privacy-projection'),
   projectionEntry(PRIVACY_PERMISSION_REVOKED, 'privacy-projection'),
+  ...feedbackActionEntries,
   // Annotation events fan out to TWO surfaces: the projection (Class A,
   // SSE-mirrored) AND the in-page overlay refresh (Class A, dispatched
   // via runtime message to tabs viewing the annotated URL).
@@ -411,6 +437,26 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
       },
     ],
   },
+  {
+    eventType: VISUAL_FINGERPRINT_OBSERVED,
+    currentPayloadVersion: 1,
+    allowedDimensions: [],
+    surfaces: [
+      {
+        surface: 'plugin-visual-fingerprint',
+        class: 'plugin-tier-bounded',
+        peerFreshnessMs: 1_000,
+        recovery: 'spool-drain',
+      },
+      {
+        surface: 'connections-template-projection',
+        class: 'derived-cache',
+        materializer: 'connections',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+    ],
+  },
 ];
 
 // Set of every event type that has a registry entry. Used by tests
@@ -420,9 +466,7 @@ export const REGISTERED_EVENT_TYPES: ReadonlySet<string> = new Set(
 );
 
 // All registry entries that route to the given materializer.
-export const entriesForMaterializer = (
-  name: string,
-): readonly ContractEntry[] =>
+export const entriesForMaterializer = (name: string): readonly ContractEntry[] =>
   CONTRACT_REGISTRY.filter((entry) =>
     entry.surfaces.some((surface) => surface.materializer === name),
   );
