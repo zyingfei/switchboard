@@ -18,6 +18,8 @@ import { createEventLog } from '../sync/eventLog.js';
 import { createKnownReplicasStore } from '../sync/knownReplicas.js';
 import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
 import { createExtractionMaterializer } from '../sync/contract/extractionMaterializer.js';
+import { createConnectionsMaterializer } from '../sync/contract/connectionsMaterializer.js';
+import { createConnectionsStore } from '../connections/snapshot.js';
 import { createTimelineMaterializer } from '../sync/contract/timelineMaterializer.js';
 import { createTimelineStore } from '../timeline/projection.js';
 import { createProjectionMaterializer } from '../sync/contract/projectionMaterializer.js';
@@ -198,6 +200,20 @@ export const startCompanion = async (
     createTimelineMaterializer({
       store: timelineStore,
       eventLog: baseEventLog,
+    }),
+  );
+  // Class B Connections — consumer-only materializer that joins
+  // existing aggregates into an evidence graph. Same dirty-bit +
+  // failure-cooldown pattern as timeline. Reads vault stores
+  // (threads, workstreams, dispatches, queue, reminders, coding
+  // sessions) + timeline daily projections at snapshot time.
+  const connectionsStore = createConnectionsStore(options.vaultPath);
+  syncContractRunner.register(
+    createConnectionsMaterializer({
+      vaultRoot: options.vaultPath,
+      eventLog: baseEventLog,
+      timelineStore,
+      store: connectionsStore,
     }),
   );
 
