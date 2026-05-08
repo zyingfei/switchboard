@@ -151,6 +151,10 @@ export type ConnectionEdgeProducedBy =
       readonly dot?: ConnectionEdgeDot;
       readonly recordId?: string;
       readonly revisionId?: never;
+      readonly collector_id?: never;
+      readonly event_type?: never;
+      readonly payload_version?: never;
+      readonly run_id?: never;
     }
   | {
       readonly source: RevisionProducedBySource;
@@ -158,9 +162,34 @@ export type ConnectionEdgeProducedBy =
       readonly eventType?: never;
       readonly dot?: never;
       readonly recordId?: never;
+      readonly collector_id?: never;
+      readonly event_type?: never;
+      readonly payload_version?: never;
+      readonly run_id?: never;
     }
   | {
       readonly source: 'cross-replica';
+      readonly eventType?: never;
+      readonly dot?: never;
+      readonly recordId?: never;
+      readonly revisionId?: never;
+      readonly collector_id?: never;
+      readonly event_type?: never;
+      readonly payload_version?: never;
+      readonly run_id?: never;
+    }
+  // Lock 3 (Stage 4) — collector-derived edges. Carries the tagged
+  // tuple identity (collector_id, event_type, payload_version) plus
+  // the run id of the collector execution that emitted the source
+  // line. Class A events resulting from this collector record use
+  // the existing producedBy.ruleId convention with
+  // "${collector_id}:${event_type}".
+  | {
+      readonly source: 'collector';
+      readonly collector_id: string;
+      readonly event_type: string;
+      readonly payload_version: number;
+      readonly run_id: string;
       readonly eventType?: never;
       readonly dot?: never;
       readonly recordId?: never;
