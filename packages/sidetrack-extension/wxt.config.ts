@@ -52,6 +52,7 @@ export default defineConfig({
       'alarms',
       'sidePanel',
       'storage',
+      'unlimitedStorage',
       'scripting',
       'notifications',
       // Phase 4 — read tab URL/title across all tabs so the timeline

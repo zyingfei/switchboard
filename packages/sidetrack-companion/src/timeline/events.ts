@@ -44,10 +44,17 @@ export interface BrowserTimelineObservedPayload {
   // observed without an active workstream stay orphan, exactly the
   // same as before this field existed.
   readonly workstreamId?: string;
+  readonly payloadVersion?: number;
+  readonly dimensions?: Record<string, unknown>;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;
+
+const hasValidPayloadExtensionFields = (value: Record<string, unknown>): boolean =>
+  (value['payloadVersion'] === undefined ||
+    (typeof value['payloadVersion'] === 'number' && value['payloadVersion'] >= 1)) &&
+  (value['dimensions'] === undefined || isRecord(value['dimensions']));
 
 const isProvider = (value: unknown): value is TimelineProvider =>
   value === 'chatgpt' ||
@@ -100,6 +107,7 @@ export const isBrowserTimelineObservedPayload = (
     if (typeof value['windowIdHash'] !== 'string') return false;
     if ((value['windowIdHash'] as string).length > TIMELINE_HASH_MAX_LENGTH) return false;
   }
+  if (!hasValidPayloadExtensionFields(value)) return false;
   if (value['workstreamId'] !== undefined) {
     if (typeof value['workstreamId'] !== 'string') return false;
     // Same shape constraint as bac-id elsewhere (alnum + hyphen +

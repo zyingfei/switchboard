@@ -73,6 +73,18 @@ const EDGE_FIXTURES: ReadonlyArray<{
   { kind: 'thread_quotes_thread', from: { id: 'thread:t_chatgpt', kind: 'thread' }, to: { id: 'thread:t_anchor', kind: 'thread' } },
 ];
 
+const confidenceForKind = (kind: string): 'asserted' | 'observed' | 'inferred' => {
+  if (kind === 'timeline_same_url_as_thread' || kind === 'thread_quotes_thread') return 'inferred';
+  if (
+    kind === 'dispatch_reply_landed_in_thread' ||
+    kind === 'annotation_targets_thread' ||
+    kind.endsWith('_references_url')
+  ) {
+    return 'observed';
+  }
+  return 'asserted';
+};
+
 const buildFullSnapshot = () => {
   const nodeById = new Map<string, { id: string; kind: string; label: string; originReplicaIds: string[]; metadata: Record<string, unknown>; lastSeenAt?: string }>();
   for (const e of EDGE_FIXTURES) {
@@ -104,7 +116,7 @@ const buildFullSnapshot = () => {
             dot: { replicaId: 'replica-A', seq: i + 1 },
           }
         : { source: 'event-log', eventType: 'thread.upserted', dot: { replicaId: 'replica-A', seq: i + 1 } },
-    confidence: 'deterministic' as const,
+    confidence: confidenceForKind(e.kind),
   }));
   const nodes = [...nodeById.values()];
   return {

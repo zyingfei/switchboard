@@ -112,18 +112,36 @@ export type ConnectionEdgeSource =
   | 'annotation-store'
   | 'reminder-store';
 
+type ConnectionEdgeDot = { readonly replicaId: string; readonly seq: number };
+
+type RevisionProducedBySource =
+  | 'visit-similarity'
+  | 'topic-clusterer'
+  | 'engagement-classifier'
+  | 'snippet-lineage';
+
 export type ConnectionEdgeProducedBy =
   | {
       readonly source: ConnectionEdgeSource;
       readonly eventType?: string;
-      readonly dot?: { readonly replicaId: string; readonly seq: number };
+      readonly dot?: ConnectionEdgeDot;
       readonly recordId?: string;
+      readonly revisionId?: never;
     }
-  | { readonly source: 'visit-similarity'; readonly revisionId: string }
-  | { readonly source: 'topic-clusterer'; readonly revisionId: string }
-  | { readonly source: 'engagement-classifier'; readonly revisionId: string }
-  | { readonly source: 'snippet-lineage'; readonly revisionId: string }
-  | { readonly source: 'cross-replica' };
+  | {
+      readonly source: RevisionProducedBySource;
+      readonly revisionId: string;
+      readonly eventType?: never;
+      readonly dot?: never;
+      readonly recordId?: never;
+    }
+  | {
+      readonly source: 'cross-replica';
+      readonly eventType?: never;
+      readonly dot?: never;
+      readonly recordId?: never;
+      readonly revisionId?: never;
+    };
 
 export interface ConnectionEdge {
   // Deterministic id: `edge:<kind>:<from>:<to>`. Same edge across
@@ -135,12 +153,10 @@ export interface ConnectionEdge {
   readonly toNodeId: string;
   readonly observedAt: string;
   readonly producedBy: ConnectionEdgeProducedBy;
-  // 'explicit' = the source surfaces this edge directly (e.g.
-  //   thread.primaryWorkstreamId, dispatch.sourceThreadId).
-  // 'deterministic' = derived from a deterministic match (e.g.
-  //   canonicalUrl join between timeline visit and thread).
-  // P3 may add 'suggested' for embedding-similarity inferred edges.
-  readonly confidence: 'explicit' | 'deterministic';
+  // 'asserted' = user-entered or user-authored state surfaced directly.
+  // 'observed' = event/telemetry-derived fact observed by the system.
+  // 'inferred' = deterministic algorithmic joins / similarity-style links.
+  readonly confidence: 'asserted' | 'observed' | 'inferred';
 }
 
 export interface ConnectionsSnapshotScope {

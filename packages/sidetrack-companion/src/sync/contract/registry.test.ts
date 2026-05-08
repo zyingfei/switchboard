@@ -155,6 +155,16 @@ describe('sync contract registry', () => {
     expect(wrong, `local-only without reason: ${JSON.stringify(wrong)}`).toEqual([]);
   });
 
+
+  it('every registry entry stamps currentPayloadVersion >= 1', () => {
+    const invalid = CONTRACT_REGISTRY.filter(
+      (entry) =>
+        typeof entry.currentPayloadVersion !== 'number' || entry.currentPayloadVersion < 1,
+    ).map(
+      (entry) => entry.eventType,
+    );
+    expect(invalid, `entries with invalid currentPayloadVersion: ${invalid.join(', ')}`).toEqual([]);
+  });
   it('no entry has an empty surfaces[]', () => {
     const empty = CONTRACT_REGISTRY.filter((entry) => entry.surfaces.length === 0).map(
       (entry) => entry.eventType,

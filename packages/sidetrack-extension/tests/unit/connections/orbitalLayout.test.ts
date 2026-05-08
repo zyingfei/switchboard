@@ -16,7 +16,7 @@ const mkEdge = (input: {
   toNodeId: input.toNodeId,
   observedAt: input.observedAt ?? '2026-05-14T10:00:00.000Z',
   producedBy: { source: 'event-log' },
-  confidence: 'deterministic',
+  confidence: 'asserted',
 });
 
 const mkSnap = (overrides: Partial<ConnectionsSnapshot> = {}): ConnectionsSnapshot => ({
