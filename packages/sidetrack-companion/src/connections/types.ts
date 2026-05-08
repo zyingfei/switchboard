@@ -112,6 +112,37 @@ export type ConnectionEdgeSource =
   | 'annotation-store'
   | 'reminder-store';
 
+type ConnectionEdgeDot = { readonly replicaId: string; readonly seq: number };
+
+type RevisionProducedBySource =
+  | 'visit-similarity'
+  | 'topic-clusterer'
+  | 'engagement-classifier'
+  | 'snippet-lineage';
+
+export type ConnectionEdgeProducedBy =
+  | {
+      readonly source: ConnectionEdgeSource;
+      readonly eventType?: string;
+      readonly dot?: ConnectionEdgeDot;
+      readonly recordId?: string;
+      readonly revisionId?: never;
+    }
+  | {
+      readonly source: RevisionProducedBySource;
+      readonly revisionId: string;
+      readonly eventType?: never;
+      readonly dot?: never;
+      readonly recordId?: never;
+    }
+  | {
+      readonly source: 'cross-replica';
+      readonly eventType?: never;
+      readonly dot?: never;
+      readonly recordId?: never;
+      readonly revisionId?: never;
+    };
+
 export interface ConnectionEdge {
   // Deterministic id: `edge:<kind>:<from>:<to>`. Same edge across
   // re-runs gets the same id, so dedup is trivial and the snapshot
@@ -121,12 +152,7 @@ export interface ConnectionEdge {
   readonly fromNodeId: string;
   readonly toNodeId: string;
   readonly observedAt: string;
-  readonly producedBy: {
-    readonly source: ConnectionEdgeSource;
-    readonly eventType?: string;
-    readonly dot?: { readonly replicaId: string; readonly seq: number };
-    readonly recordId?: string;
-  };
+  readonly producedBy: ConnectionEdgeProducedBy;
   // 'asserted' = user-entered or user-authored state surfaced directly.
   // 'observed' = event/telemetry-derived fact observed by the system.
   // 'inferred' = deterministic algorithmic joins / similarity-style links.

@@ -14,7 +14,7 @@ import {
   subgraphForNode,
   type ConnectionsInput,
 } from './snapshot.js';
-import { edgeIdFor, nodeIdFor } from './types.js';
+import { edgeIdFor, nodeIdFor, type ConnectionEdgeProducedBy } from './types.js';
 
 // Reducer tests pinning the Given/Then acceptance table from
 // /Users/yingfei/.claude/plans/kind-prancing-river.md plus the
@@ -30,6 +30,23 @@ const emptyInput = (overrides: Partial<ConnectionsInput> = {}): ConnectionsInput
   codingSessions: [],
   timelineDays: [],
   ...overrides,
+});
+
+describe('connections — producedBy provenance variants', () => {
+  it('accepts existing event/store provenance plus new revision producers', () => {
+    const variants: readonly ConnectionEdgeProducedBy[] = [
+      { source: 'event-log', eventType: THREAD_UPSERTED, dot: { replicaId: 'replica-A', seq: 1 } },
+      { source: 'workboard-state', recordId: 'thread_a' },
+      { source: 'timeline-projection' },
+      { source: 'visit-similarity', revisionId: 'visit-resembles:v1:cosine' },
+      { source: 'topic-clusterer', revisionId: 'topic-cluster:v1:union-find' },
+      { source: 'engagement-classifier', revisionId: 'engagement-class:v1:rules' },
+      { source: 'snippet-lineage', revisionId: 'snippet-lineage:v1:hash' },
+      { source: 'cross-replica' },
+    ];
+
+    expect(variants.map((variant) => variant.source)).toContain('cross-replica');
+  });
 });
 
 const buildEvent = (input: {
