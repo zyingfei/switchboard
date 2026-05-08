@@ -7050,7 +7050,7 @@ pre.diff {
 }
 .cx-edge.fam-defer    .cx-edge-line { border-top-style: dashed; }
 .cx-edge.fam-urlmatch .cx-edge-line { border-top-style: dotted; border-top-width: 2px; }
-.cx-edge.confidence-inferred .cx-edge-line { stroke-dasharray: 4 2; opacity: 0.7; border-top-style: dashed; }
+.cx-edge.confidence-inferred .cx-edge-line { border-top-style: dashed; opacity: 0.7; }
 
 /* edge label as standalone pill (between nodes) */
 .cx-edgelabel {
@@ -7385,6 +7385,7 @@ pre.diff {
 .cx-orbit-svg .edge.fam-flow     { stroke-dasharray: none; }
 .cx-orbit-svg .edge.fam-defer    { stroke-dasharray: 6 4; }
 .cx-orbit-svg .edge.fam-urlmatch { stroke-dasharray: 1.5 3; stroke-width: 1.5; }
+.cx-orbit-svg .edge.confidence-inferred { stroke-dasharray: 4 2; opacity: 0.7; }
 .cx-orbit-svg .edge.is-selected  { stroke: var(--signal); stroke-width: 2; }
 .cx-orbit-svg .edge.is-dim       { stroke: var(--rule); }
 .cx-orbit-node {

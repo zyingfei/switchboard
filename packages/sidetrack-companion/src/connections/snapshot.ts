@@ -331,7 +331,7 @@ export const buildConnectionsSnapshot = (
             eventType: THREAD_UPSERTED,
             dot: { replicaId, seq: event.dot.seq },
           },
-          confidence: 'observed',
+          confidence: 'asserted',
         });
       }
       continue;
@@ -367,7 +367,7 @@ export const buildConnectionsSnapshot = (
             eventType: WORKSTREAM_UPSERTED,
             dot: { replicaId, seq: event.dot.seq },
           },
-          confidence: 'observed',
+          confidence: 'asserted',
         });
       }
       continue;
@@ -436,7 +436,7 @@ export const buildConnectionsSnapshot = (
             toNodeId: nodeIdFor('thread', p.targetId),
             observedAt: observedAtIso,
             producedBy: { source: 'event-log', eventType: QUEUE_CREATED, dot: { replicaId, seq: event.dot.seq } },
-            confidence: 'observed',
+            confidence: 'asserted',
           });
         } else if (p.scope === 'workstream') {
           upsertNode(nodes, {
@@ -452,7 +452,7 @@ export const buildConnectionsSnapshot = (
             toNodeId: nodeIdFor('workstream', p.targetId),
             observedAt: observedAtIso,
             producedBy: { source: 'event-log', eventType: QUEUE_CREATED, dot: { replicaId, seq: event.dot.seq } },
-            confidence: 'observed',
+            confidence: 'asserted',
           });
         }
       }
@@ -737,7 +737,7 @@ export const buildConnectionsSnapshot = (
           toNodeId: nodeIdFor('workstream', entry.workstreamId),
           observedAt: entry.lastSeenAt,
           producedBy: { source: 'timeline-projection' },
-          confidence: 'observed',
+          confidence: 'inferred',
         });
       }
       const threadId = threadIdByUrl.get(visitKey);
@@ -773,7 +773,7 @@ export const buildConnectionsSnapshot = (
         eventType: ANNOTATION_CREATED,
         dot: { replicaId: event.dot.replicaId, seq: event.dot.seq },
       },
-      confidence: 'inferred',
+      confidence: 'observed',
     });
   }
 
@@ -826,7 +826,7 @@ export const buildConnectionsSnapshot = (
         eventType: input.eventType,
         dot: { replicaId: input.replicaId, seq: input.seq },
       },
-      confidence: 'inferred',
+      confidence: 'observed',
     });
   };
 

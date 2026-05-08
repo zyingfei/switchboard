@@ -514,7 +514,7 @@ const ConnectionsOrbitalCenter = ({
             const pt = layout.positions.get(edge.toNodeId)!;
             const isSel = selectedEdge?.id === edge.id;
             const isDim = selectedEdge !== null && !isSel;
-            const cls = ['edge', `fam-${fam}`, isSel && 'is-selected', isDim && 'is-dim']
+            const cls = ['edge', `fam-${fam}`, edgeConfidenceClass(edge.confidence), isSel && 'is-selected', isDim && 'is-dim']
               .filter(Boolean)
               .join(' ');
             return <line key={edge.id} className={cls} x1={ps.x} y1={ps.y} x2={pt.x} y2={pt.y} />;
@@ -744,7 +744,7 @@ const FamilyLegend = (): ReactElement => (
       const f = FAMILIES[fam];
       return (
         <div key={fam} className="cx-legend-row">
-          <span className={`cx-edge fam-${fam} ${edgeConfidenceClass(edge.confidence)}`.trim()} aria-hidden>
+          <span className={`cx-edge fam-${fam}`} aria-hidden>
             <span className="cx-edge-line" />
           </span>
           <span style={{ display: 'flex', flexDirection: 'column' }}>

@@ -41,7 +41,7 @@ const buildSnapshot = () => ({
         toNodeId: 'workstream:ws_x',
         observedAt: '2026-05-07T10:00:00.000Z',
         producedBy: { source: 'event-log', eventType: 'thread.upserted' },
-        confidence: 'explicit',
+        confidence: 'asserted',
       },
     ],
     updatedAt: '2026-05-07T10:00:00.000Z',
@@ -120,7 +120,7 @@ describe('ConnectionsView — engineering scaffold', () => {
       toNodeId: 'workstream:ws_x',
       observedAt: '2026-05-07T10:00:00.000Z',
       producedBy: { source: 'event-log', eventType: 'thread.upserted' },
-      confidence: 'explicit',
+      confidence: 'asserted',
     };
     setConnectionsClientTransportForTests(async (msg) => {
       const m = msg as { type: string };
@@ -193,7 +193,7 @@ describe('ConnectionsView — engineering scaffold', () => {
                   toNodeId: 'timeline-visit:https://copy.fail/exploit',
                   observedAt: '2026-05-07T10:00:00.000Z',
                   producedBy: { source: 'event-log', eventType: 'capture.recorded' },
-                  confidence: 'deterministic',
+                  confidence: 'observed',
                 },
               ],
               updatedAt: '2026-05-07T10:00:00.000Z',
@@ -246,7 +246,7 @@ describe('ConnectionsView — engineering scaffold', () => {
               toNodeId: 'workstream:ws_x',
               observedAt: '2026-05-14T09:00:00.000Z',
               producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 1 } },
-              confidence: 'explicit',
+              confidence: 'asserted',
             },
           ],
           updatedAt: '2026-05-14T09:45:00.000Z',
@@ -295,7 +295,7 @@ describe('ConnectionsView — engineering scaffold', () => {
               toNodeId: 'workstream:ws_x',
               observedAt: '2026-05-14T09:00:00.000Z',
               producedBy: { source: 'event-log' },
-              confidence: 'explicit',
+              confidence: 'asserted',
             },
           ],
           updatedAt: '2026-05-14T09:00:00.000Z',
@@ -376,7 +376,7 @@ describe('ConnectionsView — engineering scaffold', () => {
         recordId: '8f0e2a1b3c4d',
         dot: { replicaId: 'replica-A', seq: 5 },
       },
-      confidence: 'deterministic',
+      confidence: 'inferred',
     };
     setConnectionsClientTransportForTests(async (msg) => {
       const m = msg as { type: string };
