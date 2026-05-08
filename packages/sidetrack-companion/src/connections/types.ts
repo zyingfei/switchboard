@@ -24,7 +24,8 @@ export type ConnectionNodeKind =
   | 'inbound-reminder'
   | 'coding-session'
   | 'timeline-visit'
-  | 'annotation';
+  | 'annotation'
+  | 'snippet';
 
 export interface ConnectionNode {
   // Namespaced ids: `kind:bac_id` (or `timeline-visit:<canonicalUrl>`).
@@ -101,7 +102,14 @@ export type ConnectionEdgeKind =
   // the "ambient browsing" gap — pages the user looked at while
   // working in a workstream attach to that workstream even when no
   // chat / dispatch / annotation references them.
-  | 'visit_in_workstream';
+  | 'visit_in_workstream'
+  | 'snippet_copied_from_visit'
+  | 'snippet_pasted_into_thread'
+  | 'snippet_pasted_into_dispatch'
+  | 'snippet_pasted_into_search'
+  | 'snippet_pasted_into_note'
+  | 'snippet_pasted_into_capture'
+  | 'snippet_reused_across_threads';
 
 export type ConnectionEdgeSource =
   | 'event-log'

@@ -43,6 +43,7 @@ import { QUEUE_CREATED, QUEUE_STATUS_SET } from '../../queue/events.js';
 import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from '../../recall/events.js';
 import { CAPTURE_EXTRACTION_PRODUCED } from '../../recall/extraction/events.js';
 import { REVIEW_DRAFT_EVENT_TYPES } from '../../review/projection.js';
+import { SELECTION_COPIED, SELECTION_PASTED } from '../../snippets/events.js';
 import {
   THREAD_ARCHIVED,
   THREAD_DELETED,
@@ -345,6 +346,34 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
     surfaces: [
       {
         surface: 'engagement-session-projection',
+        class: 'derived-cache',
+        materializer: 'connections',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+    ],
+  },
+  {
+    eventType: SELECTION_COPIED,
+    currentPayloadVersion: 1,
+    allowedDimensions: [],
+    surfaces: [
+      {
+        surface: 'snippet-lineage',
+        class: 'derived-cache',
+        materializer: 'connections',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+    ],
+  },
+  {
+    eventType: SELECTION_PASTED,
+    currentPayloadVersion: 1,
+    allowedDimensions: [],
+    surfaces: [
+      {
+        surface: 'snippet-lineage',
         class: 'derived-cache',
         materializer: 'connections',
         peerFreshnessMs: 30_000,
