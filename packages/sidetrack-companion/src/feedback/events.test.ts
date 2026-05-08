@@ -148,12 +148,18 @@ describe('feedback event registry entries', () => {
       expect(entry, `missing registry entry for ${eventType}`).toBeDefined();
       expect(entry?.currentPayloadVersion).toBe(1);
       expect(entry?.allowedDimensions).toEqual([]);
-      expect(entry?.surfaces).toHaveLength(1);
+      expect(entry?.surfaces).toHaveLength(2);
       expect(entry?.surfaces[0]).toMatchObject({
         surface: 'feedback-action-projection',
         class: 'aggregate-projection',
         materializer: 'projection',
         recovery: 'class-A',
+      });
+      expect(entry?.surfaces[1]).toMatchObject({
+        surface: 'feedback-projection',
+        class: 'derived-cache',
+        materializer: 'projection',
+        recovery: 'replay-event-log',
       });
     }
   });
