@@ -26,18 +26,21 @@ export interface ConnectionNode {
   readonly metadata: Record<string, unknown>;
 }
 
+export type ConnectionEdgeProducedBy = {
+  readonly source: string;
+  readonly eventType?: string;
+  readonly dot?: { readonly replicaId: string; readonly seq: number };
+  readonly recordId?: string;
+  readonly revisionId?: string;
+};
+
 export interface ConnectionEdge {
   readonly id: string;
   readonly kind: string;
   readonly fromNodeId: string;
   readonly toNodeId: string;
   readonly observedAt: string;
-  readonly producedBy: {
-    readonly source: string;
-    readonly eventType?: string;
-    readonly dot?: { readonly replicaId: string; readonly seq: number };
-    readonly recordId?: string;
-  };
+  readonly producedBy: ConnectionEdgeProducedBy;
   readonly confidence: 'asserted' | 'observed' | 'inferred';
   readonly metadata?: Record<string, unknown>;
 }
