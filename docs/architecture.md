@@ -338,11 +338,79 @@ Stage 1 must not duplicate or wrap these:
 | Future | HDBSCAN / centroid-stable clustering | Topic id churn from Union-Find becomes a measured user complaint |
 | Future | Visual fingerprinting / DOM / screenshot pHash | Need for visual revisitation that text embeddings do not solve |
 
+## Stage 4 — pluggable collector framework
+
+Stage 4 introduces a shape into which any new behavioral signal source
+(coding agents, shells, git, GitHub, future IDE / calendar / meeting
+collectors) can be slotted without modifying the companion, the plugin,
+or the relay.
+
+**The shape.** Collectors are user-managed OS processes (the companion
+never spawns or supervises them). Each collector tails one source and
+appends `CollectorEvent` JSONL into
+`<vault>/_BAC/inbox/<collector_id>/<YYYY-MM-DD>.jsonl` using temp-file-
+then-rename atomic writes. The companion tails the inbox via
+`node:fs.watch` (200 ms debounce + 60 s rescan as drop-recovery).
+
+**Single choke point.** `materializeCollectorLine(rawLine, ctx)` is the
+only path collector data takes into Class A. It looks up a materializer
+by the tagged tuple `(collector_id, event_type, payload_version)`, runs
+the upcaster chain (linear per-tuple), validates with Zod, calls the
+materializer's `toClassA`, and appends through the existing
+`eventLog.appendServerObserved`. Returns one of `promoted | quarantined |
+deduped | dropped`. Tests assert no other code path reaches Class A
+from a collector source.
+
+**No new Class.** Inboxes are Class C-equivalent (local-only, never
+synced between replicas). Promoted events are Class A and follow the
+existing Class A → Class B / E pipeline unchanged. The audit log gains
+new `route` values namespaced `collector:<verb>` (line-read,
+line-promoted, line-quarantined, manifest-loaded, etc.) — no schema
+migration.
+
+**Lock 5 (NEW).** Three independent SemVer streams: `payload_version`
+(per-tuple, monotone integer, on the wire), `manifest_schema` (per spine
+release, monotone integer), `companion_framework_version` (per companion
+release, SemVer; **separate** from `COMPANION_VERSION`). Borrowed from
+Zed's `wasm_api_version` × `schema_version` × extension `version` split.
+
+**FORWARD_TRANSITIVE compatibility.** Producers (collectors) may upgrade
+first. Consumers (companion materializer) MUST tolerate older payloads
+indefinitely. Companion at framework version Y MUST accept any
+`payload_version ∈ [1, max_known_to_Y]` and MUST quarantine
+`payload_version > max_known_to_Y` (never crash, never silently drop).
+Quarantined lines replay-on-startup at the next companion boot — once a
+materializer registry catches up, lines move from quarantine to Class A
+with their *original* `emitted_at` timestamp.
+
+**Trust boundary.** Filesystem permissions on `_BAC/inbox/<id>/` (mode
+0700, user-only). No bridge key, no auth token, no RPC. Capabilities
+declared in the manifest (`reads-paths` / `reads-env` / `reads-network`)
+become Class A `privacy.permission.*` events with
+`permission: "collector.<id>.<capability>"`; the materializer reads
+gate state on every line and quarantines on denial. Sensitive collectors
+ship `default-enabled = false` (shell history, anything that may capture
+secrets) — the user must affirmatively grant via the side panel.
+
+For the structural argument and the "what we steal / what we reject"
+analysis across observability collectors (OTel, Fluent Bit, Vector,
+Prometheus, Datadog), IDE plugins (VS Code, Obsidian, JetBrains, Zed),
+and local-first sync engines (Automerge / Cambria / Jazz / Triplit /
+ElectricSQL), see
+[`docs/proposals/stage-4-collector-framework.md`](proposals/stage-4-collector-framework.md)
+and
+[`design/stage-4-collector-framework/compass-source.md`](../design/stage-4-collector-framework/compass-source.md).
+For the "write your own collector" guide, see
+[`docs/adding-a-collector.md`](adding-a-collector.md).
+
 ## The most important design principle
 
 > **Facts are event-sourced. Interpretations are versioned. Suggestions
 > are explainable. User organization is authoritative. No inference
-> requires GPU / Apple-Silicon hardware.**
+> requires GPU / Apple-Silicon hardware. The framework is the
+> deliverable; collectors are conformance tests.**
 
-Every Stage 2-3 PR must preserve this. Every line of code in the Stage
-1 implementation is what makes it preservable.
+Every Stage 2+ PR must preserve this. Every line of code in the Stage 1
+implementation is what makes it preservable. Stage 4 added the
+collector framework half of this same shape: external signal sources
+slot in via the framework's contract, never via direct system PRs.
