@@ -62,6 +62,12 @@ import {
   type SelectionCopiedPayload,
   type SelectionPastedPayload,
 } from '../src/content/engagement/copy-paste';
+import {
+  VISUAL_FINGERPRINT_OBSERVED,
+  VISUAL_FINGERPRINT_PRIVACY_GET,
+  isVisualFingerprintObservedMessage,
+  type VisualFingerprintObservedPayload,
+} from '../src/content/visual/dom-hash';
 import { allocateNextSeq, loadOrCreateEdgeReplica } from '../src/sync/edgeReplicaId';
 import { createVaultChangesClient } from '../src/companion/vaultChanges';
 import { createRecallClient } from '../src/companion/recallClient';
@@ -287,6 +293,10 @@ const ENGAGEMENT_PRIVACY_GATE = 'engagement';
 const ENGAGEMENT_CONTENT_SCRIPT_ID = 'sidetrack-engagement';
 const ENGAGEMENT_CONTENT_SCRIPT_FILE = 'engagement.js';
 const ENGAGEMENT_HOST_ORIGINS = ['https://*/*', 'http://*/*'];
+const VISUAL_FINGERPRINT_PRIVACY_GATE = 'visual.fingerprint';
+const VISUAL_FINGERPRINT_CONTENT_SCRIPT_ID = 'sidetrack-visual-fingerprint';
+const VISUAL_FINGERPRINT_CONTENT_SCRIPT_FILE = 'visual-fingerprint.js';
+const VISUAL_FINGERPRINT_HOST_ORIGINS = ['https://*/*', 'http://*/*'];
 
 interface PrivacyProjectionPayload {
   readonly gateStates?: Record<string, 'open' | 'closed'>;
@@ -353,6 +363,15 @@ const isEngagementPrivacyGateOpen = async (): Promise<boolean> => {
   }
 };
 
+const isVisualFingerprintPrivacyGateOpen = async (): Promise<boolean> => {
+  try {
+    const projection = await readPrivacyProjection();
+    return projection.gateStates?.[VISUAL_FINGERPRINT_PRIVACY_GATE] === 'open';
+  } catch {
+    return false;
+  }
+};
+
 const hasEngagementHostPermission = async (): Promise<boolean> => {
   try {
     return await new Promise<boolean>((resolve) => {
@@ -386,6 +405,38 @@ const syncEngagementContentScriptRegistration = async (): Promise<void> => {
   if (!shouldRegister && alreadyRegistered) {
     await chrome.scripting.unregisterContentScripts({ ids: [ENGAGEMENT_CONTENT_SCRIPT_ID] });
   }
+};
+
+const syncVisualFingerprintContentScriptRegistration = async (): Promise<void> => {
+  const shouldRegister = await isVisualFingerprintPrivacyGateOpen();
+  const registered = await chrome.scripting.getRegisteredContentScripts({
+    ids: [VISUAL_FINGERPRINT_CONTENT_SCRIPT_ID],
+  });
+  const alreadyRegistered = registered.length > 0;
+  if (shouldRegister && !alreadyRegistered) {
+    await chrome.scripting.registerContentScripts([
+      {
+        id: VISUAL_FINGERPRINT_CONTENT_SCRIPT_ID,
+        matches: [...VISUAL_FINGERPRINT_HOST_ORIGINS],
+        js: [VISUAL_FINGERPRINT_CONTENT_SCRIPT_FILE],
+        runAt: 'document_idle',
+        persistAcrossSessions: true,
+      },
+    ]);
+    return;
+  }
+  if (!shouldRegister && alreadyRegistered) {
+    await chrome.scripting.unregisterContentScripts({
+      ids: [VISUAL_FINGERPRINT_CONTENT_SCRIPT_ID],
+    });
+  }
+};
+
+const syncPrivacyGatedContentScriptRegistrations = async (): Promise<void> => {
+  await Promise.all([
+    syncEngagementContentScriptRegistration(),
+    syncVisualFingerprintContentScriptRegistration(),
+  ]);
 };
 
 const appendPrivacyEvent = async (
@@ -2786,6 +2837,21 @@ export default defineBackground(() => {
     ]);
   };
 
+  const handleVisualFingerprintObserved = async (message: unknown): Promise<void> => {
+    if (!isVisualFingerprintObservedMessage(message)) return;
+    if (!(await isVisualFingerprintPrivacyGateOpen())) return;
+    const allocated = await allocateNextSeq(1);
+    await engagementEventBuffer.appendMany([
+      {
+        streamName: VISUAL_FINGERPRINT_OBSERVED,
+        lamport: allocated.fromSeq,
+        replicaId: allocated.edgeReplicaId,
+        payload: message.payload as VisualFingerprintObservedPayload,
+        observedAt: message.payload.observedAt,
+      },
+    ]);
+  };
+
   // Drop reminders bound to thread bac_ids that no longer exist.
   // Cleanup pass for the historical mess caused by the pre-fix
   // sendToCompanion bug (every capture reissued a thread bac_id;
@@ -2829,7 +2895,7 @@ export default defineBackground(() => {
     void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => undefined);
     void pruneOrphanRemindersAndLinks();
     void ensureDispatchPollAlarm();
-    void syncEngagementContentScriptRegistration().catch(() => undefined);
+    void syncPrivacyGatedContentScriptRegistrations().catch(() => undefined);
     // Heal pre-existing tabs after an install/update/reload so the
     // user doesn't have to refresh each chat tab manually. The first
     // install case is harmless: matching tabs that already had no
@@ -2850,15 +2916,15 @@ export default defineBackground(() => {
     void pruneOrphanRemindersAndLinks();
     void reinjectContentScriptIntoOpenTabs();
     void ensureDispatchPollAlarm();
-    void syncEngagementContentScriptRegistration().catch(() => undefined);
+    void syncPrivacyGatedContentScriptRegistrations().catch(() => undefined);
   });
-  void syncEngagementContentScriptRegistration().catch(() => undefined);
+  void syncPrivacyGatedContentScriptRegistrations().catch(() => undefined);
 
   chrome.permissions.onAdded.addListener(() => {
-    void syncEngagementContentScriptRegistration().catch(() => undefined);
+    void syncPrivacyGatedContentScriptRegistrations().catch(() => undefined);
   });
   chrome.permissions.onRemoved.addListener(() => {
-    void syncEngagementContentScriptRegistration().catch(() => undefined);
+    void syncPrivacyGatedContentScriptRegistrations().catch(() => undefined);
   });
   chrome.idle.onStateChanged.addListener((state) => {
     void (async () => {
@@ -3014,6 +3080,20 @@ export default defineBackground(() => {
 
   chrome.runtime.onMessage.addListener(
     (message: unknown, sender, sendResponse: (response: RuntimeResponse) => void) => {
+      if (isVisualFingerprintObservedMessage(message)) {
+        void handleVisualFingerprintObserved(message)
+          .then(() => {
+            sendResponse({ ok: true } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'visual fingerprint failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+
       if (isSelectionLineageMessage(message)) {
         void handleSelectionLineage(message)
           .then(() => {
@@ -3047,7 +3127,7 @@ export default defineBackground(() => {
         typeof message === 'object' &&
         (message as { type?: unknown }).type === 'sidetrack.privacy.gateChanged'
       ) {
-        void syncEngagementContentScriptRegistration()
+        void syncPrivacyGatedContentScriptRegistrations()
           .then(() => {
             sendResponse({ ok: true } as unknown as RuntimeResponse);
           })
@@ -3057,7 +3137,26 @@ export default defineBackground(() => {
               error:
                 error instanceof Error
                   ? error.message
-                  : 'engagement registration refresh failed',
+                  : 'privacy-gated registration refresh failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === VISUAL_FINGERPRINT_PRIVACY_GET
+      ) {
+        void isVisualFingerprintPrivacyGateOpen()
+          .then((enabled) => {
+            sendResponse({ ok: true, enabled } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error:
+                error instanceof Error ? error.message : 'visual privacy gate read failed',
             } as unknown as RuntimeResponse);
           });
         return true;

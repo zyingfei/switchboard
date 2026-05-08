@@ -59,6 +59,7 @@ import {
   WORKSTREAM_DELETED,
   WORKSTREAM_UPSERTED,
 } from '../../workstreams/events.js';
+import { VISUAL_FINGERPRINT_OBSERVED } from '../../visual/events.js';
 import type { AcceptedEvent } from '../causal.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
@@ -117,6 +118,7 @@ const HANDLES: ReadonlySet<string> = new Set<string>([
   // materializer reads the daily projection rather than the
   // event payload directly.
   BROWSER_TIMELINE_OBSERVED,
+  VISUAL_FINGERPRINT_OBSERVED,
 ]);
 
 export interface CreateConnectionsMaterializerDeps {

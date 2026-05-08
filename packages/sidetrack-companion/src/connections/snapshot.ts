@@ -28,6 +28,8 @@ import {
 } from '../threads/events.js';
 import type { TimelineDayProjection } from '../timeline/projection.js';
 import { detectSearchUrl } from '../timeline/sanitize.js';
+import { VISUAL_FINGERPRINT_OBSERVED } from '../visual/events.js';
+import { projectVisualFingerprints } from '../visual/projection.js';
 import {
   WORKSTREAM_UPSERTED,
   isWorkstreamUpsertedPayload,
@@ -86,6 +88,7 @@ export type { ConnectionsSnapshot } from './types.js';
 //   snippet_copied_from_visit             hash-only copy/paste lineage
 //   snippet_pasted_into_<dest>            paste destination edge
 //   snippet_reused_across_threads         same snippet pasted into >=2 threads
+//   visit_in_template                     DOM-skeleton hash grouping
 //
 // `annotation_targets_workstream` is declared in the edge-kind union
 // for completeness but not yet emitted (workstream-anchored
@@ -292,6 +295,9 @@ const stripFragmentAndTrailingSlash = (url: string): string =>
 // Pass 8: topic-clusterer active revision — emit topic nodes,
 //         visit_in_topic / topic_in_workstream membership edges, and
 //         topic.lineage split/merge edges.
+// Pass 9: cross-replica visit evidence.
+// Pass 10: hash-only snippet lineage.
+// Pass 11: DOM-skeleton template grouping.
 // ---------------------------------------------------------------------------
 
 export const buildConnectionsSnapshot = (
@@ -1562,6 +1568,50 @@ export const buildConnectionsSnapshot = (
         confidence: 'inferred',
       });
     }
+  }
+
+  // -------------------------------------------------------------------
+  // Pass 11 — DOM-skeleton template grouping. Visual fingerprint
+  // events carry only a SHA-256 hash of the canonical tag tree plus
+  // boolean class/id presence. The reducer groups visits by that hash
+  // without reading page text, attributes, screenshots, or pixels.
+  // -------------------------------------------------------------------
+  const visualFingerprints = projectVisualFingerprints(input.events);
+  for (const fingerprint of visualFingerprints.fingerprints) {
+    trackObservedAt(fingerprint.observedAt);
+    upsertNode(nodes, {
+      kind: 'timeline-visit',
+      key: fingerprint.visitId,
+      label: fingerprint.visitId,
+      observedAt: fingerprint.observedAt,
+      replicaId: fingerprint.replicaId,
+      metadata: {
+        canonicalUrl: fingerprint.visitId,
+      },
+    });
+    upsertNode(nodes, {
+      kind: 'template',
+      key: fingerprint.domHash,
+      label: `template:${fingerprint.domHash.slice(0, 12)}`,
+      observedAt: fingerprint.observedAt,
+      replicaId: fingerprint.replicaId,
+      metadata: {
+        domHash: fingerprint.domHash,
+      },
+    });
+    upsertEdge(edges, {
+      kind: 'visit_in_template',
+      fromNodeId: nodeIdFor('timeline-visit', fingerprint.visitId),
+      toNodeId: nodeIdFor('template', fingerprint.domHash),
+      observedAt: fingerprint.observedAt,
+      producedBy: {
+        source: 'event-log',
+        eventType: VISUAL_FINGERPRINT_OBSERVED,
+        dot: { replicaId: fingerprint.replicaId, seq: fingerprint.seq },
+      },
+      confidence: 'observed',
+      family: 'urlmatch',
+    });
   }
 
   // -------------------------------------------------------------------

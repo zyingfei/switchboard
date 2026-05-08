@@ -10,6 +10,7 @@ import type { AcceptedEvent } from '../sync/causal.js';
 import { THREAD_UPSERTED } from '../threads/events.js';
 import type { TimelineDayProjection } from '../timeline/projection.js';
 import type { TopicRevision } from '../producers/topic-revision.js';
+import { VISUAL_FINGERPRINT_OBSERVED } from '../visual/events.js';
 import { WORKSTREAM_UPSERTED } from '../workstreams/events.js';
 import {
   buildConnectionsSnapshot,
@@ -1248,6 +1249,46 @@ describe('connections — content-derived edges', () => {
       source: 'topic-clusterer',
       revisionId: 'topic-rev-1',
     });
+  });
+
+  it('Pass 11 emits visit_in_template edges for visits sharing a DOM skeleton hash', () => {
+    const domHash = 'd'.repeat(64);
+    const events = ['visit-a', 'visit-b', 'visit-c'].map((visitId, index) =>
+      buildEvent({
+        seq: index + 1,
+        type: VISUAL_FINGERPRINT_OBSERVED,
+        payload: {
+          payloadVersion: 1,
+          visitId,
+          domHash,
+          observedAt: `2026-05-07T10:0${String(index)}:00.000Z`,
+        },
+      }),
+    );
+
+    const snap = buildConnectionsSnapshot(emptyInput({ events }));
+    const templateNodeId = nodeIdFor('template', domHash);
+
+    expect(snap.nodes.filter((node) => node.id === templateNodeId)).toHaveLength(1);
+    expect(
+      snap.edges
+        .filter((edge) => edge.kind === 'visit_in_template')
+        .map((edge) => [edge.fromNodeId, edge.toNodeId]),
+    ).toEqual([
+      [nodeIdFor('timeline-visit', 'visit-a'), templateNodeId],
+      [nodeIdFor('timeline-visit', 'visit-b'), templateNodeId],
+      [nodeIdFor('timeline-visit', 'visit-c'), templateNodeId],
+    ]);
+    expect(
+      snap.edges
+        .filter((edge) => edge.kind === 'visit_in_template')
+        .every(
+          (edge) =>
+            edge.confidence === 'observed' &&
+            edge.family === 'urlmatch' &&
+            edge.producedBy.source === 'event-log',
+        ),
+    ).toBe(true);
   });
 
   it('determinism: same fixture in two event orders produces byte-identical snapshots', () => {
