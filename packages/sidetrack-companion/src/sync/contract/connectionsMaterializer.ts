@@ -23,6 +23,14 @@ import {
 } from '../../connections/visitSimilarity.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
 import { ENGAGEMENT_SESSION_AGGREGATED } from '../../engagement/events.js';
+import {
+  USER_ENGAGEMENT_RELABELED,
+  USER_FLOW_CONFIRMED,
+  USER_FLOW_REJECTED,
+  USER_ORGANIZED_ITEM,
+  USER_SNIPPET_PROMOTED,
+  USER_TOPIC_RENAMED,
+} from '../../feedback/events.js';
 import { NAVIGATION_COMMITTED } from '../../navigation/events.js';
 import {
   buildEngagementClassifierInputs,
@@ -42,6 +50,7 @@ import {
   type TopicRevisionStore,
 } from '../../producers/topic-revision.js';
 import { loadRankerModel, predictRanker, type LightGBMModel } from '../../ranker/predict.js';
+import { maybeRetrainClosestVisitRanker, type RankerRetrainer } from '../../ranker/retrain.js';
 import { writeVisitSimilarityRevision } from '../../producers/visit-resembles-revision.js';
 import { QUEUE_CREATED, QUEUE_STATUS_SET } from '../../queue/events.js';
 import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from '../../recall/events.js';
@@ -118,6 +127,12 @@ const HANDLES: ReadonlySet<string> = new Set<string>([
   RECALL_TOMBSTONE_TARGET,
   NAVIGATION_COMMITTED,
   ENGAGEMENT_SESSION_AGGREGATED,
+  USER_ENGAGEMENT_RELABELED,
+  USER_FLOW_CONFIRMED,
+  USER_FLOW_REJECTED,
+  USER_ORGANIZED_ITEM,
+  USER_SNIPPET_PROMOTED,
+  USER_TOPIC_RENAMED,
   SELECTION_COPIED,
   SELECTION_PASTED,
   // Timeline observations indirectly contribute (timeline visits
@@ -139,6 +154,7 @@ export interface CreateConnectionsMaterializerDeps {
   readonly topicRevisionAlgorithm?: TopicAlgorithmVersion;
   readonly topicRevisionStore?: TopicRevisionStore;
   readonly engagementClassStore?: EngagementClassRevisionStore;
+  readonly rankerRetrainer?: RankerRetrainer;
 }
 
 type TopicRevisionBuilder = (input: BuildTopicRevisionInput) => Promise<TopicRevision>;
@@ -165,6 +181,9 @@ export const createConnectionsMaterializer = (
   const buildSelectedTopicRevision = topicRevisionBuilderFor(topicRevisionAlgorithm);
   const engagementClassStore =
     deps.engagementClassStore ?? createEngagementClassRevisionStore(deps.vaultRoot);
+  const rankerRetrainer =
+    deps.rankerRetrainer ??
+    ((context) => maybeRetrainClosestVisitRanker({ vaultRoot: deps.vaultRoot, ...context }));
   let pending = false;
   let running = false;
   let dirty = false;
@@ -361,15 +380,22 @@ export const createConnectionsMaterializer = (
       topicRevision,
       engagementClassRevision,
     };
+    const baseSnapshot = buildConnectionsSnapshot(input);
+    await rankerRetrainer({ merged, snapshot: baseSnapshot });
     const closestVisitRanker = await loadClosestVisitRanker();
+    if (closestVisitRanker === null) {
+      await deps.store.putCurrent(baseSnapshot);
+      return;
+    }
+
     try {
       const snapshot = buildConnectionsSnapshot({
         ...input,
-        ...(closestVisitRanker === null ? {} : { closestVisitRanker: closestVisitRanker.ranker }),
+        closestVisitRanker: closestVisitRanker.ranker,
       });
       await deps.store.putCurrent(snapshot);
     } finally {
-      closestVisitRanker?.model.dispose();
+      closestVisitRanker.model.dispose();
     }
   };
 
@@ -410,7 +436,7 @@ export const createConnectionsMaterializer = (
     })();
   };
 
-  const onAccepted: Materializer['onAccepted'] = (event, _ctx) => {
+  const onAccepted: Materializer['onAccepted'] = (event) => {
     if (!HANDLES.has(event.type)) return;
     requestDrain();
   };

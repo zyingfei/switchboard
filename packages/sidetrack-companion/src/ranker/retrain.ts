@@ -1,0 +1,567 @@
+import { createHash } from 'node:crypto';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+
+import type { ConnectionsSnapshot } from '../connections/types.js';
+import {
+  type FeedbackProjection,
+  type FeedbackTrainingLabel,
+  projectFeedback,
+} from '../feedback/projection.js';
+import { writeActiveClosestVisitRankerRevision } from '../producers/closest-visit-revision.js';
+import type { AcceptedEvent } from '../sync/causal.js';
+import { CANDIDATE_SOURCES, generateCandidates } from './candidates.js';
+import { extractFeatures } from './features.js';
+import { randomUnrelated } from './negatives.js';
+import {
+  trainRankerRevision,
+  type RankerRevision,
+  type RankerTrainingCandidate,
+  type TrainRankerInput,
+  type TrainRankerOptions,
+} from './train.js';
+import type { Candidate, CandidateSource } from './types.js';
+
+export const DEFAULT_RANKER_RETRAIN_LABEL_THRESHOLD = 50;
+export const DEFAULT_RANDOM_NEGATIVES_PER_POSITIVE_FROM = 5;
+export const RANKER_RETRAIN_STATE_SCHEMA_VERSION = 1;
+
+const RANKER_RETRAIN_STATE_RELATIVE_PATH = '_BAC/connections/closest-visit/retrain-state.json';
+const TIMELINE_VISIT_PREFIX = 'timeline-visit:';
+
+export interface RankerTrainingLabelDatasetFingerprint {
+  readonly hash: string;
+  readonly labelCount: number;
+  readonly positiveLabelCount: number;
+  readonly negativeLabelCount: number;
+}
+
+export interface RankerRetrainState {
+  readonly schemaVersion: typeof RANKER_RETRAIN_STATE_SCHEMA_VERSION;
+  readonly lastTrainedLabelDatasetHash: string;
+  readonly lastTrainedLabelCount: number;
+  readonly lastTrainedPositiveLabelCount: number;
+  readonly lastTrainedNegativeLabelCount: number;
+  readonly activeRevisionId: string;
+  readonly rankerTrainingDatasetHash: string;
+  readonly updatedAt: number;
+}
+
+export type RankerRetrainSkipReason =
+  | 'no-labels'
+  | 'unchanged'
+  | 'below-threshold'
+  | 'no-training-candidates';
+
+export type RankerRetrainPlan =
+  | {
+      readonly action: 'train';
+      readonly fingerprint: RankerTrainingLabelDatasetFingerprint;
+      readonly newLabelCount: number;
+    }
+  | {
+      readonly action: 'skip';
+      readonly reason: Exclude<RankerRetrainSkipReason, 'no-training-candidates'>;
+      readonly fingerprint: RankerTrainingLabelDatasetFingerprint;
+      readonly newLabelCount: number;
+    };
+
+export type RankerRetrainResult =
+  | {
+      readonly status: 'trained';
+      readonly revisionId: string;
+      readonly fingerprint: RankerTrainingLabelDatasetFingerprint;
+      readonly newLabelCount: number;
+      readonly candidateCount: number;
+    }
+  | {
+      readonly status: 'skipped';
+      readonly reason: RankerRetrainSkipReason;
+      readonly fingerprint: RankerTrainingLabelDatasetFingerprint;
+      readonly newLabelCount: number;
+      readonly candidateCount?: number;
+    }
+  | {
+      readonly status: 'failed';
+      readonly error: string;
+      readonly fingerprint: RankerTrainingLabelDatasetFingerprint;
+      readonly newLabelCount: number;
+      readonly candidateCount: number;
+    };
+
+export interface RankerRetrainContext {
+  readonly merged: readonly AcceptedEvent[];
+  readonly snapshot: ConnectionsSnapshot;
+}
+
+export type RankerRetrainer = (context: RankerRetrainContext) => Promise<RankerRetrainResult>;
+
+export type TrainRankerRevisionFn = (input: TrainRankerInput) => Promise<RankerRevision>;
+export type WriteActiveRankerRevisionFn = (
+  vaultRoot: string,
+  revision: RankerRevision,
+) => Promise<void>;
+
+export interface PlanRankerRetrainInput {
+  readonly fingerprint: RankerTrainingLabelDatasetFingerprint;
+  readonly state: RankerRetrainState | null;
+  readonly threshold?: number | undefined;
+}
+
+export interface BuildRankerTrainingCandidatesInput {
+  readonly feedback: FeedbackProjection;
+  readonly merged: readonly AcceptedEvent[];
+  readonly snapshot: ConnectionsSnapshot;
+  readonly randomNegativeCandidatesPerPositive?: number | undefined;
+}
+
+export interface MaybeRetrainClosestVisitRankerInput extends RankerRetrainContext {
+  readonly vaultRoot: string;
+  readonly threshold?: number | undefined;
+  readonly randomNegativeCandidatesPerPositive?: number | undefined;
+  readonly trainOptions?: TrainRankerOptions | undefined;
+  readonly train?: TrainRankerRevisionFn | undefined;
+  readonly writeActiveRevision?: WriteActiveRankerRevisionFn | undefined;
+  readonly readState?: ((vaultRoot: string) => Promise<RankerRetrainState | null>) | undefined;
+  readonly writeState?:
+    | ((vaultRoot: string, state: RankerRetrainState) => Promise<void>)
+    | undefined;
+}
+
+const sourceOrder = new Map<CandidateSource, number>(
+  CANDIDATE_SOURCES.map((source, index) => [source, index]),
+);
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const compareText = (left: string, right: string): number =>
+  left < right ? -1 : left > right ? 1 : 0;
+
+const sha256Hex = (value: string | Uint8Array): string =>
+  createHash('sha256').update(value).digest('hex');
+
+const parseTimestamp = (value: string | undefined): number | null => {
+  if (value === undefined) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const maxFinite = (current: number, candidate: number | null): number =>
+  candidate === null || candidate <= current ? current : candidate;
+
+const isHex64 = (value: unknown): value is string =>
+  typeof value === 'string' && /^[a-f0-9]{64}$/u.test(value);
+
+const isNonNegativeInteger = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isInteger(value) && value >= 0;
+
+const isRankerRetrainState = (value: unknown): value is RankerRetrainState => {
+  if (!isRecord(value)) return false;
+  return (
+    value['schemaVersion'] === RANKER_RETRAIN_STATE_SCHEMA_VERSION &&
+    isHex64(value['lastTrainedLabelDatasetHash']) &&
+    isNonNegativeInteger(value['lastTrainedLabelCount']) &&
+    isNonNegativeInteger(value['lastTrainedPositiveLabelCount']) &&
+    isNonNegativeInteger(value['lastTrainedNegativeLabelCount']) &&
+    typeof value['activeRevisionId'] === 'string' &&
+    value['activeRevisionId'].length > 0 &&
+    isHex64(value['rankerTrainingDatasetHash']) &&
+    typeof value['updatedAt'] === 'number' &&
+    Number.isFinite(value['updatedAt'])
+  );
+};
+
+const normalizedThreshold = (threshold: number | undefined): number =>
+  Math.max(1, Math.floor(threshold ?? DEFAULT_RANKER_RETRAIN_LABEL_THRESHOLD));
+
+const normalizedRandomNegativeCount = (count: number | undefined): number =>
+  Math.max(0, Math.floor(count ?? DEFAULT_RANDOM_NEGATIVES_PER_POSITIVE_FROM));
+
+const labelKey = (label: FeedbackTrainingLabel): string => `${label.fromId}\u0000${label.toId}`;
+
+const sortedLabelRows = (
+  kind: 'positive' | 'negative',
+  labels: readonly FeedbackTrainingLabel[],
+): readonly {
+  readonly kind: 'positive' | 'negative';
+  readonly fromId: string;
+  readonly toId: string;
+  readonly weight: number;
+}[] =>
+  labels
+    .map((label) => ({
+      kind,
+      fromId: label.fromId,
+      toId: label.toId,
+      weight: label.weight,
+    }))
+    .sort(
+      (left, right) =>
+        compareText(left.kind, right.kind) ||
+        compareText(left.fromId, right.fromId) ||
+        compareText(left.toId, right.toId) ||
+        left.weight - right.weight,
+    );
+
+export const fingerprintFeedbackTrainingLabels = (
+  feedback: FeedbackProjection,
+): RankerTrainingLabelDatasetFingerprint => {
+  const positive = sortedLabelRows('positive', feedback.positiveLabels);
+  const negative = sortedLabelRows('negative', feedback.negativeLabels);
+  const body = JSON.stringify({
+    schemaVersion: feedback.schemaVersion,
+    labels: [...positive, ...negative],
+  });
+  return {
+    hash: sha256Hex(body),
+    labelCount: positive.length + negative.length,
+    positiveLabelCount: positive.length,
+    negativeLabelCount: negative.length,
+  };
+};
+
+export const planRankerRetrain = ({
+  fingerprint,
+  state,
+  threshold,
+}: PlanRankerRetrainInput): RankerRetrainPlan => {
+  if (fingerprint.labelCount === 0) {
+    return { action: 'skip', reason: 'no-labels', fingerprint, newLabelCount: 0 };
+  }
+
+  if (state?.lastTrainedLabelDatasetHash === fingerprint.hash) {
+    return { action: 'skip', reason: 'unchanged', fingerprint, newLabelCount: 0 };
+  }
+
+  const previousLabelCount = state?.lastTrainedLabelCount ?? 0;
+  const newLabelCount = Math.max(0, fingerprint.labelCount - previousLabelCount);
+  if (newLabelCount < normalizedThreshold(threshold)) {
+    return { action: 'skip', reason: 'below-threshold', fingerprint, newLabelCount };
+  }
+
+  return { action: 'train', fingerprint, newLabelCount };
+};
+
+export const rankerRetrainStatePath = (vaultRoot: string): string =>
+  join(vaultRoot, RANKER_RETRAIN_STATE_RELATIVE_PATH);
+
+const writeAtomic = async (path: string, body: string): Promise<void> => {
+  await mkdir(dirname(path), { recursive: true });
+  const tmp = `${path}.${String(process.pid)}.tmp`;
+  await writeFile(tmp, body, 'utf8');
+  await rename(tmp, path);
+};
+
+export const readRankerRetrainState = async (
+  vaultRoot: string,
+): Promise<RankerRetrainState | null> => {
+  try {
+    const parsed = JSON.parse(await readFile(rankerRetrainStatePath(vaultRoot), 'utf8')) as unknown;
+    return isRankerRetrainState(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+export const writeRankerRetrainState = async (
+  vaultRoot: string,
+  state: RankerRetrainState,
+): Promise<void> => {
+  await writeAtomic(rankerRetrainStatePath(vaultRoot), `${JSON.stringify(state, null, 2)}\n`);
+};
+
+const visitKeyFromNodeOrRaw = (value: string): string =>
+  value.startsWith(TIMELINE_VISIT_PREFIX) ? value.slice(TIMELINE_VISIT_PREFIX.length) : value;
+
+const timelineVisitKeys = (snapshot: ConnectionsSnapshot): readonly string[] =>
+  [
+    ...new Set(
+      snapshot.nodes
+        .filter((node) => node.kind === 'timeline-visit')
+        .map((node) => visitKeyFromNodeOrRaw(node.id))
+        .filter((visitKey) => visitKey.length > 0),
+    ),
+  ].sort(compareText);
+
+const pairKeyForCandidate = (candidate: Candidate): string =>
+  `${candidate.fromVisitId}\u0000${candidate.toVisitId}`;
+
+const sourceSort = (left: CandidateSource, right: CandidateSource): number =>
+  (sourceOrder.get(left) ?? 0) - (sourceOrder.get(right) ?? 0) || compareText(left, right);
+
+const mergeSources = (
+  left: readonly CandidateSource[],
+  right: readonly CandidateSource[],
+): readonly CandidateSource[] => [...new Set([...left, ...right])].sort(sourceSort);
+
+const putCandidate = (candidates: Map<string, Candidate>, candidate: Candidate): void => {
+  const key = pairKeyForCandidate(candidate);
+  const existing = candidates.get(key);
+  if (existing === undefined) {
+    candidates.set(key, {
+      ...candidate,
+      sources: mergeSources([], candidate.sources),
+    });
+    return;
+  }
+  candidates.set(key, {
+    ...existing,
+    sources: mergeSources(existing.sources, candidate.sources),
+    generatedAt: Math.max(existing.generatedAt, candidate.generatedAt),
+  });
+};
+
+const candidateResolvesToTimelineVisits = (
+  candidate: Candidate,
+  visitKeys: ReadonlySet<string>,
+): boolean =>
+  visitKeys.has(visitKeyFromNodeOrRaw(candidate.fromVisitId)) &&
+  visitKeys.has(visitKeyFromNodeOrRaw(candidate.toVisitId)) &&
+  visitKeyFromNodeOrRaw(candidate.fromVisitId) !== visitKeyFromNodeOrRaw(candidate.toVisitId);
+
+const maxObservedAt = (merged: readonly AcceptedEvent[], snapshot: ConnectionsSnapshot): number => {
+  let generatedAt = parseTimestamp(snapshot.updatedAt) ?? 0;
+  for (const event of merged) {
+    if (Number.isFinite(event.acceptedAtMs)) {
+      generatedAt = Math.max(generatedAt, event.acceptedAtMs);
+    }
+  }
+  for (const edge of snapshot.edges) {
+    generatedAt = maxFinite(generatedAt, parseTimestamp(edge.observedAt));
+  }
+  return generatedAt;
+};
+
+const addFeedbackLabelCandidates = (
+  candidates: Map<string, Candidate>,
+  labels: readonly FeedbackTrainingLabel[],
+  source: CandidateSource,
+  generatedAt: number,
+  visitKeys: ReadonlySet<string>,
+): void => {
+  for (const label of labels) {
+    const candidate = {
+      fromVisitId: label.fromId,
+      toVisitId: label.toId,
+      sources: [source],
+      generatedAt,
+    } satisfies Candidate;
+    if (candidateResolvesToTimelineVisits(candidate, visitKeys))
+      putCandidate(candidates, candidate);
+  }
+};
+
+const positiveLabelFromIds = (
+  feedback: FeedbackProjection,
+  visitKeys: ReadonlySet<string>,
+): readonly string[] =>
+  [
+    ...new Set(
+      feedback.positiveLabels
+        .filter((label) => visitKeys.has(visitKeyFromNodeOrRaw(label.fromId)))
+        .map((label) => label.fromId),
+    ),
+  ].sort(compareText);
+
+const blockedLabelPairsByFrom = (
+  feedback: FeedbackProjection,
+): ReadonlyMap<string, ReadonlySet<string>> => {
+  const byFrom = new Map<string, Set<string>>();
+  for (const label of [...feedback.positiveLabels, ...feedback.negativeLabels]) {
+    let set = byFrom.get(label.fromId);
+    if (set === undefined) {
+      set = new Set<string>();
+      byFrom.set(label.fromId, set);
+    }
+    set.add(labelKey(label));
+  }
+  return byFrom;
+};
+
+const addRandomNegativeCandidates = (
+  candidates: Map<string, Candidate>,
+  input: BuildRankerTrainingCandidatesInput,
+  visitKeysList: readonly string[],
+  visitKeys: ReadonlySet<string>,
+  generatedAt: number,
+): void => {
+  const count = normalizedRandomNegativeCount(input.randomNegativeCandidatesPerPositive);
+  if (count === 0) return;
+
+  const blockedByFrom = blockedLabelPairsByFrom(input.feedback);
+  for (const fromVisitId of positiveLabelFromIds(input.feedback, visitKeys)) {
+    const blocked = blockedByFrom.get(fromVisitId) ?? new Set<string>();
+    const sampleBudget = count + blocked.size;
+    const sampled = randomUnrelated(
+      fromVisitId,
+      visitKeysList,
+      sampleBudget,
+      `${fromVisitId}:${fingerprintFeedbackTrainingLabels(input.feedback).hash}`,
+      {
+        existingEdges: input.snapshot.edges,
+        generatedAt,
+      },
+    ).filter((candidate) => !blocked.has(pairKeyForCandidate(candidate)));
+
+    for (const candidate of sampled.slice(0, count)) {
+      if (candidateResolvesToTimelineVisits(candidate, visitKeys)) {
+        putCandidate(candidates, candidate);
+      }
+    }
+  }
+};
+
+export const buildRankerTrainingCandidates = ({
+  feedback,
+  merged,
+  snapshot,
+  randomNegativeCandidatesPerPositive,
+}: BuildRankerTrainingCandidatesInput): readonly RankerTrainingCandidate[] => {
+  const visitKeysList = timelineVisitKeys(snapshot);
+  const visitKeys = new Set(visitKeysList);
+  if (visitKeys.size === 0) return [];
+
+  const candidates = new Map<string, Candidate>();
+  const generatedAt = maxObservedAt(merged, snapshot);
+  const context = { merged: [...merged], existingEdges: [...snapshot.edges] };
+
+  for (const fromVisitId of visitKeysList) {
+    for (const candidate of generateCandidates(fromVisitId, context)) {
+      if (candidateResolvesToTimelineVisits(candidate, visitKeys)) {
+        putCandidate(candidates, candidate);
+      }
+    }
+  }
+
+  addFeedbackLabelCandidates(
+    candidates,
+    feedback.positiveLabels,
+    'same_workstream',
+    generatedAt,
+    visitKeys,
+  );
+  addFeedbackLabelCandidates(
+    candidates,
+    feedback.negativeLabels,
+    'recently_skipped',
+    generatedAt,
+    visitKeys,
+  );
+  addRandomNegativeCandidates(
+    candidates,
+    {
+      feedback,
+      merged,
+      snapshot,
+      ...(randomNegativeCandidatesPerPositive === undefined
+        ? {}
+        : { randomNegativeCandidatesPerPositive }),
+    },
+    visitKeysList,
+    visitKeys,
+    generatedAt,
+  );
+
+  return [...candidates.values()]
+    .sort(
+      (left, right) =>
+        compareText(left.fromVisitId, right.fromVisitId) ||
+        compareText(left.toVisitId, right.toVisitId),
+    )
+    .map((candidate) => ({
+      candidate,
+      features: extractFeatures(candidate, { merged: [...merged], snapshot }),
+    }));
+};
+
+const stateFromRevision = (
+  fingerprint: RankerTrainingLabelDatasetFingerprint,
+  revision: RankerRevision,
+): RankerRetrainState => ({
+  schemaVersion: RANKER_RETRAIN_STATE_SCHEMA_VERSION,
+  lastTrainedLabelDatasetHash: fingerprint.hash,
+  lastTrainedLabelCount: fingerprint.labelCount,
+  lastTrainedPositiveLabelCount: fingerprint.positiveLabelCount,
+  lastTrainedNegativeLabelCount: fingerprint.negativeLabelCount,
+  activeRevisionId: revision.revisionId,
+  rankerTrainingDatasetHash: revision.trainingDatasetHash,
+  updatedAt: revision.trainedAt,
+});
+
+const errorMessage = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
+
+export const maybeRetrainClosestVisitRanker = async ({
+  vaultRoot,
+  merged,
+  snapshot,
+  threshold,
+  randomNegativeCandidatesPerPositive,
+  trainOptions,
+  train = trainRankerRevision,
+  writeActiveRevision = writeActiveClosestVisitRankerRevision,
+  readState = readRankerRetrainState,
+  writeState = writeRankerRetrainState,
+}: MaybeRetrainClosestVisitRankerInput): Promise<RankerRetrainResult> => {
+  const feedback = projectFeedback(merged);
+  const fingerprint = fingerprintFeedbackTrainingLabels(feedback);
+  const state = await readState(vaultRoot);
+  const plan = planRankerRetrain({
+    fingerprint,
+    state,
+    ...(threshold === undefined ? {} : { threshold }),
+  });
+
+  if (plan.action === 'skip') {
+    return {
+      status: 'skipped',
+      reason: plan.reason,
+      fingerprint,
+      newLabelCount: plan.newLabelCount,
+    };
+  }
+
+  const candidates = buildRankerTrainingCandidates({
+    feedback,
+    merged,
+    snapshot,
+    ...(randomNegativeCandidatesPerPositive === undefined
+      ? {}
+      : { randomNegativeCandidatesPerPositive }),
+  });
+  if (candidates.length === 0) {
+    return {
+      status: 'skipped',
+      reason: 'no-training-candidates',
+      fingerprint,
+      newLabelCount: plan.newLabelCount,
+      candidateCount: 0,
+    };
+  }
+
+  try {
+    const revision = await train({
+      feedback,
+      candidates,
+      ...(trainOptions === undefined ? {} : { options: trainOptions }),
+    });
+    await writeActiveRevision(vaultRoot, revision);
+    await writeState(vaultRoot, stateFromRevision(fingerprint, revision));
+    return {
+      status: 'trained',
+      revisionId: revision.revisionId,
+      fingerprint,
+      newLabelCount: plan.newLabelCount,
+      candidateCount: candidates.length,
+    };
+  } catch (error) {
+    return {
+      status: 'failed',
+      error: errorMessage(error),
+      fingerprint,
+      newLabelCount: plan.newLabelCount,
+      candidateCount: candidates.length,
+    };
+  }
+};
