@@ -1,6 +1,8 @@
 import { messageTypes } from '../../messages';
 import type { ContextPackInput } from './contextPack';
+import { topicLabel, type TopicLabelResult } from './topicLabel';
 import type { ConnectionEdge, ConnectionsScopedResult } from './types';
+import type { Reason } from './why-related/reasons';
 
 // Side-panel client for the Connections HTTP routes. Background.ts
 // proxies to the companion (via the bridge key + port settings)
@@ -86,6 +88,15 @@ const textFromMetadata = (
   return undefined;
 };
 
+const numberFromMetadata = (
+  metadata: Record<string, unknown>,
+  key: string,
+  fallback: number,
+): number => {
+  const value = metadata[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+};
+
 export const contextPackInputFromConnections = (
   result: ConnectionsScopedResult,
   workstreamId: string,
@@ -153,6 +164,77 @@ export const contextPackInputFromConnections = (
   };
 };
 
+export const topicLabelFromConnections = (
+  result: ConnectionsScopedResult,
+  topicId: string,
+): TopicLabelResult => {
+  const nodeById = new Map(result.snapshot.nodes.map((node) => [node.id, node] as const));
+  const topicNode = nodeById.get(topicId);
+  const members = result.snapshot.edges
+    .filter((edge) => edge.kind === 'visit_in_topic' && edge.toNodeId === topicId)
+    .map((edge) => nodeById.get(edge.fromNodeId))
+    .filter((node) => node !== undefined)
+    .map((node) => ({
+      canonicalUrl: textFromMetadata(node.metadata, ['canonicalUrl', 'url']) ?? node.id,
+      title: node.label,
+      focusedWindowMs: numberFromMetadata(node.metadata, 'focusedWindowMs', 0),
+    }));
+  const label = topicLabel({
+    members,
+    cohesion: topicNode === undefined ? 0 : numberFromMetadata(topicNode.metadata, 'cohesion', 0),
+  });
+  return topicNode === undefined || members.length > 0
+    ? label
+    : {
+        label: topicNode.label,
+        tooltip: `cohesion=${numberFromMetadata(topicNode.metadata, 'cohesion', 0).toFixed(
+          2,
+        )} · members=${String(numberFromMetadata(topicNode.metadata, 'memberCount', 0))}`,
+      };
+};
+
+export const whyRelatedReasonsFromConnections = (
+  result: ConnectionsScopedResult,
+  visitId: string,
+): readonly Reason[] => {
+  const nodeById = new Map(result.snapshot.nodes.map((node) => [node.id, node] as const));
+  const reasons: Reason[] = [];
+  for (const edge of result.snapshot.edges) {
+    if (edge.fromNodeId !== visitId && edge.toNodeId !== visitId) continue;
+    if (edge.kind === 'timeline_same_url_as_thread') {
+      const thread = nodeById.get(edge.fromNodeId === visitId ? edge.toNodeId : edge.fromNodeId);
+      reasons.push({
+        code: 'SAME_THREAD',
+        threadId: thread?.id ?? 'thread:unknown',
+        threadName: thread?.label ?? 'Unknown thread',
+      });
+    } else if (edge.kind === 'visit_in_topic') {
+      const topic = nodeById.get(edge.toNodeId);
+      reasons.push({
+        code: 'SAME_TOPIC',
+        topicId: edge.toNodeId,
+        cohesion: topic === undefined ? 0 : numberFromMetadata(topic.metadata, 'cohesion', 0),
+      });
+    } else if (edge.kind === 'visit_resembles_visit') {
+      reasons.push({ code: 'COSINE_ABOVE_THRESHOLD', cosine: 0.85, threshold: 0.85 });
+    } else if (edge.kind === 'visit_observed_on_replica') {
+      reasons.push({
+        code: 'OBSERVED_ON_OTHER_REPLICA',
+        replicaId: edge.toNodeId.replace(/^replica:/u, ''),
+      });
+    } else if (edge.kind === 'snippet_copied_from_visit') {
+      reasons.push({ code: 'COPIED_FROM', snippetId: edge.fromNodeId });
+    } else if (edge.kind.startsWith('snippet_pasted_into_')) {
+      reasons.push({
+        code: 'PASTED_INTO',
+        snippetId: edge.fromNodeId,
+        destinationKind: edge.kind.replace(/^snippet_pasted_into_/u, ''),
+      });
+    }
+  }
+  return reasons;
+};
+
 export const fetchConnectionsContextPackInput = async (
   workstreamId: string,
 ): Promise<ConnectionsClientResponse<ContextPackInput>> => {
@@ -164,4 +246,24 @@ export const fetchConnectionsContextPackInput = async (
     ok: true,
     data: contextPackInputFromConnections(response.data, workstreamId),
   };
+};
+
+export const fetchConnectionsTopicLabel = async (
+  topicId: string,
+): Promise<ConnectionsClientResponse<TopicLabelResult>> => {
+  const response = await fetchConnectionsNeighbors({ nodeId: topicId, hops: 1 });
+  if (!response.ok || response.data === undefined) {
+    return { ok: false, error: response.error ?? 'connections label unavailable' };
+  }
+  return { ok: true, data: topicLabelFromConnections(response.data, topicId) };
+};
+
+export const fetchConnectionsWhyRelated = async (input: {
+  readonly fromVisitId: string;
+}): Promise<ConnectionsClientResponse<readonly Reason[]>> => {
+  const response = await fetchConnectionsNeighbors({ nodeId: input.fromVisitId, hops: 1 });
+  if (!response.ok || response.data === undefined) {
+    return { ok: false, error: response.error ?? 'why-related unavailable' };
+  }
+  return { ok: true, data: whyRelatedReasonsFromConnections(response.data, input.fromVisitId) };
 };
