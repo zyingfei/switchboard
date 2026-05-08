@@ -1,9 +1,11 @@
 # Sidetrack — Stage 2/3 (work graph: ranker + feedback + future)
 
-> **Status: planning.** This doc opens the next major iteration on the
-> behavioral work graph after Stage 1 ([PR #99](https://github.com/zyingfei/switchboard/pull/99)
-> merged at `7c42a570`). Scope is not yet locked — see the candidate
-> task list below; the lead will refine it after user input.
+> **Status: scope locked, briefs being authored.** This doc opens the
+> next major iteration on the behavioral work graph after Stage 1
+> ([PR #99](https://github.com/zyingfei/switchboard/pull/99) merged at
+> `7c42a570`). Scope was confirmed by the user on 2026-05-08; detailed
+> sub-task briefs land in
+> `docs/proposals/work-graph-stage2-3-briefs.md` next.
 
 ## Northern star (carried forward from Stage 1)
 
@@ -40,16 +42,18 @@ Pulled from the deferred roadmap in
 - [ ] 🟢 **S26.** Side-panel UI affordances for capturing feedback (move/merge/split/rename/promote/ignore).
 - [ ] 🟢 **S27.** Producer-pin UI: "this ranker version learned from N corrections" surface; user can pin a specific producer revision for stability.
 
-### Future stages — pending user direction
+### Future stages — locked scope (per user direction 2026-05-08)
 
-- [ ] 🟡 **F1.** Optional cloud-LLM enhancement (user supplies own API key) for label / Why Related / Context Pack prose. Slots in via the Class E revision pattern as `*-revision:v2:cloud-llm`. Existing deterministic surfaces remain available as fallback.
-- [ ] 🟡 **F2.** Cross-replica continuation classifier — the *inference* edge atop `visit_observed_on_replica`. LightGBM over (engagement, provenance, lineage, recency) features.
-- [ ] 🟡 **F3.** Selection-API based visual fingerprinting (gated): screenshot pHash + DOM hash for visual revisitation that text embeddings don't solve.
-- [ ] 🟡 **F4.** ANN indexes (USearch/hnswlib/Faiss) — only when cosine over flat float32 stops being interactive on the user's own corpus.
-- [ ] 🟡 **F5.** HDBSCAN / centroid-stable clustering replacing Union-Find when topic-id churn becomes a measured user complaint.
+- [ ] 🔵 **F1 deferred.** Optional cloud-LLM enhancement — NOT in this PR. Stays a future PR; the Class E revision pattern from Stage 1 makes it purely additive.
+- [ ] 🟢 **F2.** Cross-replica continuation classifier — the *inference* edge atop `visit_observed_on_replica`. LightGBM over (engagement, provenance, lineage, recency) features.
+- [ ] 🟢 **F3-partial.** DOM-skeleton hash only (no screenshots, no pHash). Captures structural template recognition + DOM-duplicate detection. Privacy-gated (separate `visual.fingerprint` gate).
+- [ ] 🟢 **F4.** ANN indexes (USearch/hnswlib/Faiss). Wraps existing recall index V3 access path; no migration of the binary format.
+- [ ] 🟢 **F5.** HDBSCAN / centroid-stable clustering. Alternative to Union-Find for `topic` formation; consumer of the existing `visit_resembles_visit` edges.
 
 ### Explicitly deferred (not in this PR even with user direction)
 
+- [ ] 🔵 F1 cloud-LLM — separate future PR.
+- [ ] 🔵 F3 screenshot pHash — separate future PR (only DOM hash here).
 - [ ] 🔵 Federated learning across users (privacy-preserving; needs DP primitives).
 - [ ] 🔵 Mobile companion (out of MV3 scope).
 
@@ -68,10 +72,38 @@ Pulled from the deferred roadmap in
 - Lead reviews each subtask commit; if a fix is needed, lead lands a new commit (no amend).
 - Lead resolves any merge conflicts at integration time.
 
-## Open scope questions for user
+## Wave structure (parallelization plan)
 
-1. **Which 🟡 candidate items go into this PR?** F1–F5 are independently includable.
-2. **Stage 2's ranker — start with LightGBM or graduate from simpler logistic regression first?**
-3. **Stage 3's first-class feedback signals — the listed five (move/merge/split/rename/promote) the right set, or extend?**
+**Wave A** (foundational, all independent):
+- S17 candidate-generation framework
+- S23 feedback event types + registry
+- F3-partial DOM hash content script + event type
+- F4 ANN index integration (wraps existing recall index)
+- F5 HDBSCAN clusterer (alternative to Union-Find for topics)
 
-These are answered before lead authors sub-task briefs. Once scope is locked, the lead refines this doc + the PR body's checkbox list and Codex starts pulling.
+**Wave B** (depends on Wave A foundations):
+- S18 feature engineering / extraction layer
+- S19 negative-candidate producer
+- S24 feedback projection (Class B)
+- F2 cross-replica continuation classifier (depends on Stage 2 features pipeline)
+
+**Wave C** (depends on Wave B):
+- S20 LightGBM/LambdaMART ranker
+- S21 closest_visit edge emission with per-feature contribution
+- S22 debug-pack MCP tool
+- S25 ranker retraining loop (depends on S24 + S20)
+- S26 side-panel feedback-capture UI
+
+**Wave D** (sequential, lead-led):
+- L1 Stage 2/3 e2e suite
+- L2 update architecture.md (model registry concepts)
+- S27 producer-pin UI (depends on S25 + S26)
+
+## Scope decisions (locked 2026-05-08)
+
+| Decision | Resolution |
+|---|---|
+| Future-stage items in PR scope | F2 + F3-partial + F4 + F5 (F1 cloud-LLM deferred) |
+| Ranker tier | LightGBM/XGBoost LambdaMART direct (S20) |
+| Feedback signal set | Five listed: user.organized.item / .engagement.relabeled / .flow.confirmed/.rejected / .topic.renamed / .snippet.promoted |
+| F3 scope | DOM-skeleton hash only; no screenshot pHash, no captureVisibleTab |
