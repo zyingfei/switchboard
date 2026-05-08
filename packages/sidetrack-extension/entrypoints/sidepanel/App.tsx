@@ -2417,6 +2417,29 @@ const App = () => {
   useEffect(() => {
     currentWsIdRef.current = currentWsId;
   }, [currentWsId]);
+  // Phase 4: persist the user's currently-focused workstream id so
+  // the timeline observer (running in the background SW) can stamp
+  // it onto every browser.timeline.observed event for active-
+  // workstream attribution. Stored under
+  // sidetrack.activeWorkstreamId; the observer caches the value off
+  // chrome.storage.onChanged.
+  useEffect(() => {
+    void (async () => {
+      try {
+        if (currentWsId === null) {
+          await chrome.storage.local.remove('sidetrack.activeWorkstreamId');
+        } else {
+          await chrome.storage.local.set({
+            'sidetrack.activeWorkstreamId': currentWsId,
+          });
+        }
+      } catch {
+        // chrome.storage may be unavailable in some test harnesses
+        // — ignore; the observer just doesn't tag visits in that
+        // case.
+      }
+    })();
+  }, [currentWsId]);
   const currentWs =
     currentWsId === null ? null : (state.workstreams.find((w) => w.bac_id === currentWsId) ?? null);
   const currentWsLabel =

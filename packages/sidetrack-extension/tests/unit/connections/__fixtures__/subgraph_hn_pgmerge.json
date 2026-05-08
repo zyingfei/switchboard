@@ -181,7 +181,8 @@
           "canonicalUrl": "https://github.com/sidetrack-co/sidetrack/pull/98",
           "title": "sidetrack/sidetrack PR #98",
           "url": "https://github.com/sidetrack-co/sidetrack/pull/98",
-          "visitCount": 1
+          "visitCount": 1,
+          "workstreamId": "ws_sidetrack"
         }
       },
       {

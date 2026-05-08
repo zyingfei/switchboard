@@ -106,6 +106,12 @@ export const EDGE_KINDS: Record<string, EdgeKindMetadata> = {
     description:
       'Captured turn / dispatch body / annotation note contains the search query embedded in a tracked search-URL visit (whole-word, case-insensitive).',
   },
+  visit_in_workstream: {
+    family: 'contain',
+    label: 'in workstream',
+    description:
+      "Timeline observer stamped the user's currently-focused workstream id onto this visit at observation time (active-workstream attribution).",
+  },
 };
 
 export const FAMILIES: Record<EdgeFamily, { readonly label: string; readonly description: string }> = {
@@ -154,5 +160,6 @@ export const contentDerivedHint = (kind: string): string | null => {
   if (kind.endsWith('_references_url')) return 'via captured text';
   if (kind === 'thread_quotes_thread') return 'quoted in turn';
   if (kind === 'thread_text_mentions_search_query') return 'via search query match';
+  if (kind === 'visit_in_workstream') return 'via active workstream';
   return null;
 };

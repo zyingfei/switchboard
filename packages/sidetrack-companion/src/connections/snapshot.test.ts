@@ -939,6 +939,96 @@ describe('connections — content-derived edges', () => {
     ).toBe(false);
   });
 
+  it('visit_in_workstream fires when the timeline entry carries a workstreamId (active-workstream attribution)', () => {
+    // Active-workstream attribution: the observer stamps
+    // workstreamId on visits when the user has a workstream
+    // focused. Two visits — one with workstreamId, one without.
+    // Only the tagged one emits visit_in_workstream.
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: [
+        {
+          id: 'https://copy.fail/',
+          firstSeenAt: '2026-05-07T10:00:00.000Z',
+          lastSeenAt: '2026-05-07T10:00:30.000Z',
+          url: 'https://copy.fail/',
+          canonicalUrl: 'https://copy.fail/',
+          visitCount: 1,
+          workstreamId: 'ws_security',
+        },
+        {
+          id: 'https://www.youtube.com/watch?v=rY44ViY45q8',
+          firstSeenAt: '2026-05-07T10:01:00.000Z',
+          lastSeenAt: '2026-05-07T10:30:00.000Z',
+          url: 'https://www.youtube.com/watch?v=rY44ViY45q8',
+          canonicalUrl: 'https://www.youtube.com/watch?v=rY44ViY45q8',
+          visitCount: 1,
+          // intentionally no workstreamId — stays orphan
+        },
+      ],
+      updatedAt: '2026-05-07T10:30:00.000Z',
+      entryCount: 2,
+    };
+    const snap = buildConnectionsSnapshot(emptyInput({ timelineDays: [day] }));
+    const visitEdges = snap.edges.filter((e) => e.kind === 'visit_in_workstream');
+    expect(visitEdges.length).toBe(1);
+    expect(visitEdges[0]?.fromNodeId).toBe(nodeIdFor('timeline-visit', 'https://copy.fail'));
+    expect(visitEdges[0]?.toNodeId).toBe(nodeIdFor('workstream', 'ws_security'));
+    expect(visitEdges[0]?.confidence).toBe('explicit');
+    expect(visitEdges[0]?.producedBy.source).toBe('timeline-projection');
+    // The visit-node metadata also carries the workstreamId.
+    const taggedVisit = snap.nodes.find(
+      (n) => n.id === nodeIdFor('timeline-visit', 'https://copy.fail'),
+    );
+    expect(taggedVisit?.metadata['workstreamId']).toBe('ws_security');
+    // The untagged visit has no metadata.workstreamId.
+    const orphanVisit = snap.nodes.find(
+      (n) =>
+        n.id === nodeIdFor('timeline-visit', 'https://www.youtube.com/watch?v=rY44ViY45q8'),
+    );
+    expect(orphanVisit?.metadata['workstreamId']).toBeUndefined();
+  });
+
+  it('visit_in_workstream subgraph: anchored on workstream reaches every tagged ambient visit', () => {
+    // The acceptance-criteria scenario: visits to copy.fail/ and
+    // YouTube (ambient — no chat / dispatch / annotation references
+    // them) attach to the workstream when the active-workstream
+    // observer tagged them. Anchoring on the workstream reaches
+    // both via 1-hop visit_in_workstream edges.
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: [
+        {
+          id: 'https://copy.fail/',
+          firstSeenAt: '2026-05-07T10:00:00.000Z',
+          lastSeenAt: '2026-05-07T10:00:30.000Z',
+          url: 'https://copy.fail/',
+          canonicalUrl: 'https://copy.fail/',
+          visitCount: 1,
+          workstreamId: 'ws_security',
+        },
+        {
+          id: 'https://www.youtube.com/watch?v=rY44ViY45q8',
+          firstSeenAt: '2026-05-07T10:30:00.000Z',
+          lastSeenAt: '2026-05-07T10:35:00.000Z',
+          url: 'https://www.youtube.com/watch?v=rY44ViY45q8',
+          canonicalUrl: 'https://www.youtube.com/watch?v=rY44ViY45q8',
+          visitCount: 1,
+          workstreamId: 'ws_security',
+        },
+      ],
+      updatedAt: '2026-05-07T10:35:00.000Z',
+      entryCount: 2,
+    };
+    const snap = buildConnectionsSnapshot(emptyInput({ timelineDays: [day] }));
+    const sub = subgraphForNode(snap, nodeIdFor('workstream', 'ws_security'), 1);
+    const ids = new Set(sub.nodes.map((n) => n.id));
+    expect(ids.has(nodeIdFor('timeline-visit', 'https://copy.fail'))).toBe(true);
+    expect(
+      ids.has(nodeIdFor('timeline-visit', 'https://www.youtube.com/watch?v=rY44ViY45q8')),
+    ).toBe(true);
+  });
+
   it('determinism: same fixture in two event orders produces byte-identical snapshots', () => {
     const events: AcceptedEvent[] = [
       buildEvent({

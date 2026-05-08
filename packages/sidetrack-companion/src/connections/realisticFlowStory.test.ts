@@ -117,10 +117,28 @@ describe('connections — realistic two-flow narration (CVE + Switchboard)', () 
     expect(sub.edges.some((e) => e.kind === 'thread_text_mentions_search_query')).toBe(true);
   });
 
-  it('YouTube visit anchor surfaces zero connections (ambient gap)', () => {
+  it('YouTube visit anchor — active-workstream attribution attaches it to ws_realistic_switchboard', () => {
+    // Phase 4 closure: YouTube was opened as a background tab while
+    // the user was working in Flow B. The observer stamped the
+    // active workstream on the visit, so even though no chat ever
+    // mentions it, the visit attaches to ws_realistic_switchboard
+    // via visit_in_workstream.
     const sub = subgraphForNode(snap, REALISTIC_FLOW_B_NODES.visits.youtube, 1);
-    expect(sub.nodes.map((n) => n.id)).toEqual([REALISTIC_FLOW_B_NODES.visits.youtube]);
-    expect(sub.edges.length).toBe(0);
+    const ids = new Set(sub.nodes.map((n) => n.id));
+    expect(ids.has(REALISTIC_FLOW_B_NODES.visits.youtube)).toBe(true);
+    expect(ids.has(REALISTIC_FLOW_B_NODES.workstream)).toBe(true);
+    expect(sub.edges.some((e) => e.kind === 'visit_in_workstream')).toBe(true);
+  });
+
+  it('copy.fail homepage anchor — active-workstream attribution attaches it to ws_realistic_cve', () => {
+    // Phase 4 closure: the copy.fail homepage was browsed mid-CVE-
+    // research while the user was in ws_realistic_cve. Never pasted
+    // into a chat. Attaches via visit_in_workstream.
+    const sub = subgraphForNode(snap, REALISTIC_FLOW_A_NODES.visits.copyFail, 1);
+    const ids = new Set(sub.nodes.map((n) => n.id));
+    expect(ids.has(REALISTIC_FLOW_A_NODES.visits.copyFail)).toBe(true);
+    expect(ids.has(REALISTIC_FLOW_A_NODES.workstream)).toBe(true);
+    expect(sub.edges.some((e) => e.kind === 'visit_in_workstream')).toBe(true);
   });
 
   it('HN visit anchor surfaces zero connections — until the user pastes it (which Flow A does)', () => {

@@ -149,7 +149,8 @@
           "canonicalUrl": "https://news.ycombinator.com/item?id=42_copyfail",
           "title": "HN: copy-fail breaks distros",
           "url": "https://news.ycombinator.com/item?id=42_copyfail",
-          "visitCount": 1
+          "visitCount": 1,
+          "workstreamId": "ws_security"
         }
       },
       {
@@ -500,6 +501,17 @@
         "confidence": "deterministic"
       },
       {
+        "id": "edge:visit_in_workstream:timeline-visit:https://news.ycombinator.com/item?id=42_copyfail:workstream:ws_security",
+        "kind": "visit_in_workstream",
+        "fromNodeId": "timeline-visit:https://news.ycombinator.com/item?id=42_copyfail",
+        "toNodeId": "workstream:ws_security",
+        "observedAt": "2026-05-07T09:00:00.000Z",
+        "producedBy": {
+          "source": "timeline-projection"
+        },
+        "confidence": "explicit"
+      },
+      {
         "id": "edge:workstream_parent_of:workstream:ws_research:workstream:ws_security",
         "kind": "workstream_parent_of",
         "fromNodeId": "workstream:ws_research",
@@ -514,6 +526,6 @@
     ],
     "updatedAt": "2026-05-07T09:42:00.000Z",
     "nodeCount": 15,
-    "edgeCount": 20
+    "edgeCount": 21
   }
 }

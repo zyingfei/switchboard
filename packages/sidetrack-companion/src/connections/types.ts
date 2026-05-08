@@ -95,7 +95,13 @@ export type ConnectionEdgeKind =
   // text contains the search query embedded in a tracked search-URL
   // visit (whole-word, case-insensitive). Closes the "I searched X
   // and asked the AI about X without pasting the URL" gap.
-  | 'thread_text_mentions_search_query';
+  | 'thread_text_mentions_search_query'
+  // Active-workstream attribution: the timeline observer stamped the
+  // user's currently-focused workstream id onto the visit. Closes
+  // the "ambient browsing" gap — pages the user looked at while
+  // working in a workstream attach to that workstream even when no
+  // chat / dispatch / annotation references them.
+  | 'visit_in_workstream';
 
 export type ConnectionEdgeSource =
   | 'event-log'

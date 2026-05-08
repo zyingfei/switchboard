@@ -226,7 +226,7 @@ const seedAnnotation = async (
 
 const seedTimelineVisits = async (
   comp: TestCompanion,
-  visits: ReadonlyArray<{ url: string; observedAt: string; title: string }>,
+  visits: ReadonlyArray<{ url: string; observedAt: string; title: string; workstreamId?: string }>,
 ): Promise<void> => {
   // /v1/timeline/events expects full AcceptedEvent shapes. Synthesize
   // a deterministic replicaId + monotonic seq per visit so the
@@ -246,6 +246,10 @@ const seedTimelineVisits = async (
         title: v.title,
         observedAt: v.observedAt,
         transition: 'activated',
+        // Phase 4 — active-workstream attribution. Tagged visits
+        // emit visit_in_workstream so ambient browsing attaches to
+        // the focused flow without needing the URL pasted.
+        ...(v.workstreamId === undefined ? {} : { workstreamId: v.workstreamId }),
       },
       acceptedAtMs: Date.parse(v.observedAt),
     })),
@@ -484,9 +488,12 @@ const seedAllFlows = async (comp: TestCompanion): Promise<SeedResult> => {
   });
 
   // Timeline visits — last to ensure visit nodes exist when the
-  // reducer's pass 4 looks them up.
+  // reducer's pass 4 looks them up. Phase 4: HN_COPYFAIL is tagged
+  // with the active workstream so visit_in_workstream is exercised
+  // through the live HTTP path. Ambient cross-flow URLs left
+  // untagged so the per-anchor separation assertions still hold.
   await seedTimelineVisits(comp, [
-    { url: URL_HN_COPYFAIL, observedAt: '2026-05-07T09:00:00.000Z', title: 'HN: copy-fail breaks distros' },
+    { url: URL_HN_COPYFAIL, observedAt: '2026-05-07T09:00:00.000Z', title: 'HN: copy-fail breaks distros', workstreamId: wsSecurityId },
     { url: URL_GH_PR, observedAt: '2026-05-07T09:05:00.000Z', title: 'sidetrack/sidetrack PR #98' },
     { url: URL_XINT_BLOG, observedAt: '2026-05-07T09:05:30.000Z', title: 'copy-fail across linux distros' },
     { url: URL_GOOGLE_CVE, observedAt: '2026-05-07T09:08:00.000Z', title: 'Google: linux copy_file_range CVE' },
@@ -653,8 +660,27 @@ test.describe('connections — multi-flow HTTP integration', () => {
       'dispatch_references_url',
       'annotation_references_url',
       'thread_quotes_thread',
+      'visit_in_workstream',
     ];
     const missing = expected.filter((k) => !kinds.has(k));
     expect(missing).toEqual([]);
+  });
+
+  test('visit_in_workstream: a tagged ambient visit attaches to its workstream subgraph', async () => {
+    if (companion === null || seed === null) throw new Error('companion not started');
+    const wsId = seed.wsSecurityId;
+    // The HN_COPYFAIL visit was seeded with workstreamId=wsSecurityId
+    // — anchored on ws_security at hops=2, the visit must appear in
+    // the subgraph (it's reachable directly via visit_in_workstream).
+    const data = await fetchNeighbors(companion, `workstream:${wsId}`, 2);
+    const ids = new Set(data.snapshot.nodes.map((n) => n.id));
+    expect(ids.has(`timeline-visit:${URL_HN_COPYFAIL}`)).toBe(true);
+    const edge = data.snapshot.edges.find(
+      (e) =>
+        e.kind === 'visit_in_workstream' &&
+        e.fromNodeId === `timeline-visit:${URL_HN_COPYFAIL}` &&
+        e.toNodeId === `workstream:${wsId}`,
+    );
+    expect(edge, 'visit_in_workstream edge expected through HTTP layer').toBeDefined();
   });
 });

@@ -71,6 +71,15 @@ export interface TimelineObserverDeps {
     url: string;
     observedAt: string;
   }) => string;
+  // Phase 4 active-workstream attribution. When the user has a
+  // workstream focused in the side panel, this returns its bac_id
+  // so the observer can stamp it on every emitted event payload;
+  // returns null/undefined when no workstream is focused (the
+  // visit stays unattributed). Synchronous so the emit hot path
+  // doesn't await — the caller is expected to maintain a cached
+  // copy of `chrome.storage.local['sidetrack.activeWorkstreamId']`
+  // and refresh it via `chrome.storage.onChanged`.
+  readonly getActiveWorkstreamId?: () => string | null | undefined;
 }
 
 export interface ObserveInput {
@@ -119,6 +128,18 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
   // unbounded). For passive intent + bounded tabs per browser, the
   // table stays small.
   const byTab = new Map<string, TabState>();
+
+  // Resolve the user's currently-focused workstream (Phase 4). Sync
+  // resolution: callers cache the value off `chrome.storage.onChanged`
+  // so the emit hot path doesn't await. Returns `undefined` when no
+  // workstream is focused — the visit then stays unattributed,
+  // exactly the behavior before this hook existed.
+  const resolveWorkstreamId = (): string | undefined => {
+    if (deps.getActiveWorkstreamId === undefined) return undefined;
+    const v = deps.getActiveWorkstreamId();
+    if (typeof v !== 'string' || v.length === 0) return undefined;
+    return v;
+  };
 
   const observe = (input: ObserveInput): void => {
     // Bound URL + title before doing any other work. An oversized
@@ -182,6 +203,9 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
         transition: 'updated',
         tabIdHash,
         windowIdHash,
+        ...(resolveWorkstreamId() === undefined
+          ? {}
+          : { workstreamId: resolveWorkstreamId()! }),
       };
       deps.emit(payload);
       byTab.set(tabIdHash, {
@@ -214,6 +238,9 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
       transition,
       tabIdHash,
       windowIdHash,
+      ...(resolveWorkstreamId() === undefined
+        ? {}
+        : { workstreamId: resolveWorkstreamId()! }),
     };
     deps.emit(payload);
     byTab.set(tabIdHash, {
@@ -247,6 +274,9 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
       transition: 'closed',
       tabIdHash,
       windowIdHash: existing.windowIdHash,
+      ...(resolveWorkstreamId() === undefined
+        ? {}
+        : { workstreamId: resolveWorkstreamId()! }),
     };
     deps.emit(payload);
     byTab.delete(tabIdHash);

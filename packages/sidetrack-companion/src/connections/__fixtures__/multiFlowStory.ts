@@ -305,13 +305,28 @@ const reminders: readonly ReminderVaultRecord[] = [
 // Timeline day projection — every visit lands here.
 // ---------------------------------------------------------------------------
 
-const timelineEntries = [
-  { url: URL_HN_COPYFAIL, time: '2026-05-07T09:00:00.000Z', title: 'HN: copy-fail breaks distros' },
-  { url: URL_GH_PR, time: '2026-05-07T09:05:00.000Z', title: 'sidetrack/sidetrack PR #98' },
+// Visits carry workstreamId when the user has the corresponding flow's
+// workstream focused at observation time (Phase 4 active-workstream
+// attribution). One visit per flow is intentionally tagged so the
+// multi-flow integration test exercises visit_in_workstream alongside
+// the other 17 emitted edge kinds; the rest stay untagged so the
+// fixture remains representative of mixed ambient + focused browsing.
+const timelineEntries: ReadonlyArray<{
+  url: string;
+  time: string;
+  title: string;
+  workstreamId?: string;
+}> = [
+  { url: URL_HN_COPYFAIL, time: '2026-05-07T09:00:00.000Z', title: 'HN: copy-fail breaks distros', workstreamId: WS_SECURITY },
+  { url: URL_GH_PR, time: '2026-05-07T09:05:00.000Z', title: 'sidetrack/sidetrack PR #98', workstreamId: WS_SIDETRACK },
   { url: URL_XINT_BLOG, time: '2026-05-07T09:05:30.000Z', title: 'copy-fail across linux distros' },
   { url: URL_GOOGLE_CVE, time: '2026-05-07T09:08:00.000Z', title: 'Google: linux copy_file_range CVE' },
   { url: URL_KERNEL_DOC, time: '2026-05-07T09:10:00.000Z', title: 'man copy_file_range(2)' },
   { url: URL_GH_BRAINSTORM, time: '2026-05-07T09:11:00.000Z', title: 'BRAINSTORM.md' },
+  // HN_PGMERGE is the intentional cross-flow URL coincidence (both
+  // Flow B and Flow C reference it). Leaving it untagged so the
+  // "no cross-flow leakage" assertion holds; visit_in_workstream is
+  // exercised on the flow-exclusive HN_COPYFAIL / GH_PR visits.
   { url: URL_HN_PGMERGE, time: '2026-05-07T09:12:00.000Z', title: 'HN: postgres MERGE pitfalls' },
   { url: URL_NVD_CVE, time: '2026-05-07T09:14:00.000Z', title: 'NVD CVE-2024-12345' },
   { url: URL_PG_BLOG, time: '2026-05-07T09:15:00.000Z', title: 'MERGE pitfalls (blog)' },
@@ -331,7 +346,14 @@ const timelineEntries = [
 const buildDay = (): TimelineDayProjection => {
   const byUrl = new Map<
     string,
-    { firstSeenAt: string; lastSeenAt: string; title?: string; visitCount: number }
+    {
+      firstSeenAt: string;
+      lastSeenAt: string;
+      title?: string;
+      visitCount: number;
+      workstreamId?: string;
+      workstreamObservedAt?: string;
+    }
   >();
   for (const e of timelineEntries) {
     const existing = byUrl.get(e.url);
@@ -341,11 +363,23 @@ const buildDay = (): TimelineDayProjection => {
         lastSeenAt: e.time,
         title: e.title,
         visitCount: 1,
+        ...(e.workstreamId === undefined
+          ? {}
+          : { workstreamId: e.workstreamId, workstreamObservedAt: e.time }),
       });
     } else {
       existing.lastSeenAt = e.time > existing.lastSeenAt ? e.time : existing.lastSeenAt;
       existing.firstSeenAt = e.time < existing.firstSeenAt ? e.time : existing.firstSeenAt;
       existing.visitCount += 1;
+      if (e.workstreamId !== undefined && e.workstreamId.length > 0) {
+        if (
+          existing.workstreamObservedAt === undefined ||
+          e.time >= existing.workstreamObservedAt
+        ) {
+          existing.workstreamId = e.workstreamId;
+          existing.workstreamObservedAt = e.time;
+        }
+      }
     }
   }
   const entries = [...byUrl.entries()].map(([url, agg]) => ({
@@ -355,6 +389,7 @@ const buildDay = (): TimelineDayProjection => {
     url,
     canonicalUrl: url,
     ...(agg.title === undefined ? {} : { title: agg.title }),
+    ...(agg.workstreamId === undefined ? {} : { workstreamId: agg.workstreamId }),
     visitCount: agg.visitCount,
   }));
   return {

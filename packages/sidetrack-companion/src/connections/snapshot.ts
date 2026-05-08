@@ -44,7 +44,7 @@ export type { ConnectionsSnapshot } from './types.js';
 // records. Same input → byte-equivalent output across replays and
 // replicas. No wall-clock, no inference, no time-proximity edges.
 //
-// Edge set (17 emitted, 18 declared):
+// Edge set (18 emitted, 19 declared):
 //   thread_in_workstream                 thread.primaryWorkstreamId
 //   workstream_parent_of                 workstream.parentId
 //   dispatch_from_thread                 dispatch record sourceThreadId
@@ -62,6 +62,9 @@ export type { ConnectionsSnapshot } from './types.js';
 //   thread_quotes_thread                 ≥40-char substring across capture turns
 //   thread_text_mentions_search_query    captured text contains a search-URL
 //                                         visit's query (whole-word match)
+//   visit_in_workstream                   timeline observer stamped a
+//                                         workstreamId on the visit (active
+//                                         workstream attribution)
 //
 // `annotation_targets_workstream` is declared in the edge-kind union
 // for completeness but not yet emitted (workstream-anchored
@@ -714,8 +717,29 @@ export const buildConnectionsSnapshot = (
           provider: entry.provider,
           visitCount: entry.visitCount,
           ...(searchQuery === undefined ? {} : { searchQuery }),
+          ...(entry.workstreamId === undefined ? {} : { workstreamId: entry.workstreamId }),
         },
       });
+      // Active-workstream attribution edge: emit when the timeline
+      // entry carries a workstreamId stamped by the side-panel
+      // observer at observation time. Lazy-create the workstream
+      // node so the edge endpoint is valid even if WORKSTREAM_UPSERTED
+      // hasn't been replayed yet.
+      if (typeof entry.workstreamId === 'string' && entry.workstreamId.length > 0) {
+        upsertNode(nodes, {
+          kind: 'workstream',
+          key: entry.workstreamId,
+          label: entry.workstreamId,
+        });
+        upsertEdge(edges, {
+          kind: 'visit_in_workstream',
+          fromNodeId: nodeIdFor('timeline-visit', visitKey),
+          toNodeId: nodeIdFor('workstream', entry.workstreamId),
+          observedAt: entry.lastSeenAt,
+          producedBy: { source: 'timeline-projection' },
+          confidence: 'explicit',
+        });
+      }
       const threadId = threadIdByUrl.get(visitKey);
       if (threadId !== undefined) {
         upsertNode(nodes, { kind: 'thread', key: threadId, label: threadId });

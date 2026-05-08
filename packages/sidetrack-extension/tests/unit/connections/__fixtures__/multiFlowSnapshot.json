@@ -392,7 +392,8 @@
         "canonicalUrl": "https://github.com/sidetrack-co/sidetrack/pull/98",
         "title": "sidetrack/sidetrack PR #98",
         "url": "https://github.com/sidetrack-co/sidetrack/pull/98",
-        "visitCount": 1
+        "visitCount": 1,
+        "workstreamId": "ws_sidetrack"
       }
     },
     {
@@ -420,7 +421,8 @@
         "canonicalUrl": "https://news.ycombinator.com/item?id=42_copyfail",
         "title": "HN: copy-fail breaks distros",
         "url": "https://news.ycombinator.com/item?id=42_copyfail",
-        "visitCount": 1
+        "visitCount": 1,
+        "workstreamId": "ws_security"
       }
     },
     {
@@ -1249,6 +1251,28 @@
       "confidence": "deterministic"
     },
     {
+      "id": "edge:visit_in_workstream:timeline-visit:https://github.com/sidetrack-co/sidetrack/pull/98:workstream:ws_sidetrack",
+      "kind": "visit_in_workstream",
+      "fromNodeId": "timeline-visit:https://github.com/sidetrack-co/sidetrack/pull/98",
+      "toNodeId": "workstream:ws_sidetrack",
+      "observedAt": "2026-05-07T09:05:00.000Z",
+      "producedBy": {
+        "source": "timeline-projection"
+      },
+      "confidence": "explicit"
+    },
+    {
+      "id": "edge:visit_in_workstream:timeline-visit:https://news.ycombinator.com/item?id=42_copyfail:workstream:ws_security",
+      "kind": "visit_in_workstream",
+      "fromNodeId": "timeline-visit:https://news.ycombinator.com/item?id=42_copyfail",
+      "toNodeId": "workstream:ws_security",
+      "observedAt": "2026-05-07T09:00:00.000Z",
+      "producedBy": {
+        "source": "timeline-projection"
+      },
+      "confidence": "explicit"
+    },
+    {
       "id": "edge:workstream_parent_of:workstream:ws_research:workstream:ws_security",
       "kind": "workstream_parent_of",
       "fromNodeId": "workstream:ws_research",
@@ -1263,5 +1287,5 @@
   ],
   "updatedAt": "2026-05-07T09:42:00.000Z",
   "nodeCount": 38,
-  "edgeCount": 49
+  "edgeCount": 51
 }

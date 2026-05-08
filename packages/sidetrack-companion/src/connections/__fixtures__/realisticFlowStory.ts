@@ -181,27 +181,43 @@ const codingSessions: readonly CodingSessionVaultRecord[] = [
 // that the user did NOT necessarily paste into a chat.
 // ---------------------------------------------------------------------------
 
-const visits = [
-  { url: URL_A_HN, time: '2026-05-07T10:00:00.000Z', title: 'HN: copy-fail Linux CVE' },
-  { url: URL_B_GH_REPO, time: '2026-05-07T10:02:00.000Z', title: 'switchboard GitHub' },
-  { url: URL_A_BLOG, time: '2026-05-07T10:05:00.000Z', title: 'copy-fail across linux distros' },
-  { url: URL_B_GH_PRS, time: '2026-05-07T10:07:00.000Z', title: 'switchboard PRs' },
-  { url: URL_A_GOOGLE_SEARCH, time: '2026-05-07T10:08:00.000Z', title: 'Google: Linux crypto subsystem' },
-  { url: URL_A_CHATGPT, time: '2026-05-07T10:10:00.000Z', title: 'ChatGPT — CVE chat' },
-  { url: URL_B_CHATGPT_1, time: '2026-05-07T10:20:00.000Z', title: 'ChatGPT — Switchboard sync' },
-  { url: URL_A_BLOG, time: '2026-05-07T10:22:00.000Z', title: 'copy-fail (re-read)' },
-  { url: URL_A_COPY_FAIL, time: '2026-05-07T10:25:00.000Z', title: 'copy.fail home' },
-  { url: URL_A_GITHUB_POC, time: '2026-05-07T10:28:00.000Z', title: 'copy_fail_exp.py' },
-  { url: URL_B_YOUTUBE, time: '2026-05-07T10:30:00.000Z', title: 'YouTube — bg' },
-  { url: URL_B_CHATGPT_2, time: '2026-05-07T10:35:00.000Z', title: 'ChatGPT — Switchboard PRs' },
-  { url: URL_A_CODING_THREAD, time: '2026-05-07T10:42:00.000Z', title: 'Claude — coding agent' },
-  { url: URL_B_GEMINI, time: '2026-05-07T10:50:00.000Z', title: 'Gemini — analysis' },
+// Phase 4 — visits carry workstreamId when the side-panel observer
+// has a workstream focused at observation time. The user is in
+// Flow A's workstream (ws_realistic_cve) for the CVE-related visits
+// and Flow B's workstream (ws_realistic_switchboard) for the
+// Switchboard-related ones. The truly ambient ones — copy.fail
+// homepage browsed mid-CVE-research, YouTube as a background tab
+// during Switchboard project review — pick up the workstream of
+// the user's then-active flow even though they're never pasted
+// into a chat. That's what closes the ambient-browsing gap.
+const visits: ReadonlyArray<{ url: string; time: string; title: string; workstreamId?: string }> = [
+  { url: URL_A_HN, time: '2026-05-07T10:00:00.000Z', title: 'HN: copy-fail Linux CVE', workstreamId: WS_A_CVE },
+  { url: URL_B_GH_REPO, time: '2026-05-07T10:02:00.000Z', title: 'switchboard GitHub', workstreamId: WS_B_SWITCHBOARD },
+  { url: URL_A_BLOG, time: '2026-05-07T10:05:00.000Z', title: 'copy-fail across linux distros', workstreamId: WS_A_CVE },
+  { url: URL_B_GH_PRS, time: '2026-05-07T10:07:00.000Z', title: 'switchboard PRs', workstreamId: WS_B_SWITCHBOARD },
+  { url: URL_A_GOOGLE_SEARCH, time: '2026-05-07T10:08:00.000Z', title: 'Google: Linux crypto subsystem', workstreamId: WS_A_CVE },
+  { url: URL_A_CHATGPT, time: '2026-05-07T10:10:00.000Z', title: 'ChatGPT — CVE chat', workstreamId: WS_A_CVE },
+  { url: URL_B_CHATGPT_1, time: '2026-05-07T10:20:00.000Z', title: 'ChatGPT — Switchboard sync', workstreamId: WS_B_SWITCHBOARD },
+  { url: URL_A_BLOG, time: '2026-05-07T10:22:00.000Z', title: 'copy-fail (re-read)', workstreamId: WS_A_CVE },
+  { url: URL_A_COPY_FAIL, time: '2026-05-07T10:25:00.000Z', title: 'copy.fail home', workstreamId: WS_A_CVE },
+  { url: URL_A_GITHUB_POC, time: '2026-05-07T10:28:00.000Z', title: 'copy_fail_exp.py', workstreamId: WS_A_CVE },
+  { url: URL_B_YOUTUBE, time: '2026-05-07T10:30:00.000Z', title: 'YouTube — bg', workstreamId: WS_B_SWITCHBOARD },
+  { url: URL_B_CHATGPT_2, time: '2026-05-07T10:35:00.000Z', title: 'ChatGPT — Switchboard PRs', workstreamId: WS_B_SWITCHBOARD },
+  { url: URL_A_CODING_THREAD, time: '2026-05-07T10:42:00.000Z', title: 'Claude — coding agent', workstreamId: WS_A_CVE },
+  { url: URL_B_GEMINI, time: '2026-05-07T10:50:00.000Z', title: 'Gemini — analysis', workstreamId: WS_B_SWITCHBOARD },
 ];
 
 const buildDay = (): TimelineDayProjection => {
   const byUrl = new Map<
     string,
-    { firstSeenAt: string; lastSeenAt: string; title: string; visitCount: number }
+    {
+      firstSeenAt: string;
+      lastSeenAt: string;
+      title: string;
+      visitCount: number;
+      workstreamId?: string;
+      workstreamObservedAt?: string;
+    }
   >();
   for (const e of visits) {
     const existing = byUrl.get(e.url);
@@ -211,11 +227,25 @@ const buildDay = (): TimelineDayProjection => {
         lastSeenAt: e.time,
         title: e.title,
         visitCount: 1,
+        ...(e.workstreamId === undefined
+          ? {}
+          : { workstreamId: e.workstreamId, workstreamObservedAt: e.time }),
       });
     } else {
       existing.lastSeenAt = e.time > existing.lastSeenAt ? e.time : existing.lastSeenAt;
       existing.firstSeenAt = e.time < existing.firstSeenAt ? e.time : existing.firstSeenAt;
       existing.visitCount += 1;
+      // LWW workstreamId — most recent observation wins, mirroring
+      // the production projection reducer's semantics.
+      if (e.workstreamId !== undefined && e.workstreamId.length > 0) {
+        if (
+          existing.workstreamObservedAt === undefined ||
+          e.time >= existing.workstreamObservedAt
+        ) {
+          existing.workstreamId = e.workstreamId;
+          existing.workstreamObservedAt = e.time;
+        }
+      }
     }
   }
   return {
@@ -228,6 +258,7 @@ const buildDay = (): TimelineDayProjection => {
       canonicalUrl: url,
       title: agg.title,
       visitCount: agg.visitCount,
+      ...(agg.workstreamId === undefined ? {} : { workstreamId: agg.workstreamId }),
     })),
     updatedAt: '2026-05-07T10:55:00.000Z',
     entryCount: byUrl.size,
@@ -489,7 +520,8 @@ export const REALISTIC_FLOW_A_NODES = {
     blog: nodeIdFor('timeline-visit', URL_A_BLOG),
     googleSearch: nodeIdFor('timeline-visit', URL_A_GOOGLE_SEARCH),
     chatgpt: nodeIdFor('timeline-visit', URL_A_CHATGPT),
-    copyFail: nodeIdFor('timeline-visit', URL_A_COPY_FAIL),
+    // visit-id strips trailing slash, so 'https://copy.fail/' → 'https://copy.fail'
+    copyFail: nodeIdFor('timeline-visit', URL_A_COPY_FAIL.replace(/\/+$/u, '')),
     githubPoC: nodeIdFor('timeline-visit', URL_A_GITHUB_POC),
     codingThread: nodeIdFor('timeline-visit', URL_A_CODING_THREAD),
   },

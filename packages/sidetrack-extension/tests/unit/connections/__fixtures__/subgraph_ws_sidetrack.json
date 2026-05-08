@@ -120,7 +120,8 @@
           "canonicalUrl": "https://github.com/sidetrack-co/sidetrack/pull/98",
           "title": "sidetrack/sidetrack PR #98",
           "url": "https://github.com/sidetrack-co/sidetrack/pull/98",
-          "visitCount": 1
+          "visitCount": 1,
+          "workstreamId": "ws_sidetrack"
         }
       },
       {
@@ -351,10 +352,21 @@
           "source": "timeline-projection"
         },
         "confidence": "deterministic"
+      },
+      {
+        "id": "edge:visit_in_workstream:timeline-visit:https://github.com/sidetrack-co/sidetrack/pull/98:workstream:ws_sidetrack",
+        "kind": "visit_in_workstream",
+        "fromNodeId": "timeline-visit:https://github.com/sidetrack-co/sidetrack/pull/98",
+        "toNodeId": "workstream:ws_sidetrack",
+        "observedAt": "2026-05-07T09:05:00.000Z",
+        "producedBy": {
+          "source": "timeline-projection"
+        },
+        "confidence": "explicit"
       }
     ],
     "updatedAt": "2026-05-07T09:42:00.000Z",
     "nodeCount": 10,
-    "edgeCount": 14
+    "edgeCount": 15
   }
 }

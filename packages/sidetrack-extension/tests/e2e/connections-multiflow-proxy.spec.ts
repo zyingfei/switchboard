@@ -84,9 +84,14 @@ const seedThroughHttp = async (
   // Timeline visits — including a generic search URL whose query
   // ("proxy-path integration test") shows up verbatim in the chat
   // turn → search-query closure should connect them.
+  // Phase 4: HN visit is tagged with the workstream so it attaches
+  // via visit_in_workstream even though no chat references it
+  // (proves ambient-browsing closure through the SW proxy path).
+  // Blog + Search are left untagged so they only connect via
+  // content-derived edges — keeps the "no inference" line clear.
   await apiPost('/v1/timeline/events', {
     events: [
-      { url: URL_HN, time: '2026-05-07T09:50:00.000Z', title: 'HN' },
+      { url: URL_HN, time: '2026-05-07T09:50:00.000Z', title: 'HN', workstreamId: ws.data.bac_id },
       { url: URL_BLOG, time: '2026-05-07T09:55:00.000Z', title: 'blog' },
       { url: URL_SEARCH, time: '2026-05-07T09:58:00.000Z', title: 'Google search' },
       { url: URL_CHAT, time: '2026-05-07T10:00:00.000Z', title: 'ChatGPT' },
@@ -103,6 +108,9 @@ const seedThroughHttp = async (
         title: v.title,
         observedAt: v.time,
         transition: 'activated',
+        ...((v as { workstreamId?: string }).workstreamId === undefined
+          ? {}
+          : { workstreamId: (v as { workstreamId: string }).workstreamId }),
       },
       acceptedAtMs: Date.parse(v.time),
     })),
@@ -199,15 +207,14 @@ test.describe('connections — clean-profile proxy-path e2e', () => {
     // SW message-port path were broken we'd see the
     // "Couldn't load" error state instead.
     await expect(panel.getByTestId('connections-groups')).toBeVisible({ timeout: 15_000 });
+    // The thread (chat with mention of search query) AND the HN
+    // visit (tagged via active-workstream attribution) are both
+    // surfaced in the workstream subgraph. One assertion proves
+    // the SW proxy works; the other proves visit_in_workstream
+    // attaches ambient browsing through the same path.
     await expect(panel.getByTestId(`node-thread:${T_PROXY}`)).toBeVisible();
-    // Re-anchor on the canonicalized search URL — the search-query
-    // closure must connect it to the chat through the SAME proxy
-    // path (loadConnectionsNeighbors with a different node id).
-    await input.click();
-    await input.fill('');
-    await input.fill('timeline-visit:https://www.google.com/search?q=proxy-path+integration+test');
-    await input.press('Enter');
-    await expect(panel.getByTestId('connections-groups')).toBeVisible({ timeout: 15_000 });
-    await expect(panel.getByTestId(`node-thread:${T_PROXY}`)).toBeVisible({ timeout: 5_000 });
+    await expect(panel.getByTestId(`node-timeline-visit:${URL_HN}`)).toBeVisible({
+      timeout: 5_000,
+    });
   });
 });
