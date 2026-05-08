@@ -1,0 +1,531 @@
+{
+  "scope": "companion-extended",
+  "snapshot": {
+    "scope": {
+      "nodeId": "workstream:ws_security",
+      "hops": 2
+    },
+    "nodes": [
+      {
+        "id": "annotation:a_cve_thread",
+        "kind": "annotation",
+        "label": "check assistant assumed AF_UNIX abstract namespace",
+        "firstSeenAt": "2026-05-07T09:35:45.000Z",
+        "lastSeenAt": "2026-05-07T09:35:45.000Z",
+        "originReplicaIds": [
+          "replica-mac"
+        ],
+        "metadata": {
+          "title": "Claude — CVE chat",
+          "url": "https://claude.ai/chat/cve_thread"
+        }
+      },
+      {
+        "id": "coding-session:cs_cve_vm",
+        "kind": "coding-session",
+        "label": "cs_cve_vm",
+        "firstSeenAt": "2026-05-07T09:42:00.000Z",
+        "lastSeenAt": "2026-05-07T09:42:00.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "provider": "codex",
+          "sourcePath": "/work/cve-repro",
+          "status": "attached",
+          "title": "cve-vm"
+        }
+      },
+      {
+        "id": "dispatch:d_cve_codex",
+        "kind": "dispatch",
+        "label": "Codex — Python repro for CVE-2024-12345",
+        "firstSeenAt": "2026-05-07T09:22:00.000Z",
+        "lastSeenAt": "2026-05-07T09:33:00.000Z",
+        "originReplicaIds": [
+          "replica-mac"
+        ],
+        "metadata": {
+          "provider": "codex",
+          "status": "sent",
+          "title": "Codex — Python repro for CVE-2024-12345"
+        }
+      },
+      {
+        "id": "inbound-reminder:r_cve_t",
+        "kind": "inbound-reminder",
+        "label": "t_cve_claude",
+        "firstSeenAt": "2026-05-07T09:42:00.000Z",
+        "lastSeenAt": "2026-05-07T09:42:00.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "provider": "claude",
+          "status": "new",
+          "threadId": "t_cve_claude"
+        }
+      },
+      {
+        "id": "queue-item:q_cve_ws",
+        "kind": "queue-item",
+        "label": "test repro on Ubuntu 22 + 24",
+        "firstSeenAt": "2026-05-07T09:38:00.000Z",
+        "lastSeenAt": "2026-05-07T09:38:00.000Z",
+        "originReplicaIds": [
+          "replica-mac"
+        ],
+        "metadata": {
+          "status": "pending",
+          "title": "test repro on Ubuntu 22 + 24"
+        }
+      },
+      {
+        "id": "thread:t_cve_chatgpt",
+        "kind": "thread",
+        "label": "ChatGPT — review CVE repro",
+        "firstSeenAt": "2026-05-07T09:30:00.000Z",
+        "lastSeenAt": "2026-05-07T09:33:00.000Z",
+        "originReplicaIds": [
+          "replica-mac"
+        ],
+        "metadata": {
+          "canonicalUrl": "https://chatgpt.com/c/cve_review",
+          "provider": "chatgpt",
+          "title": "ChatGPT — review CVE repro",
+          "url": "https://chatgpt.com/c/cve_review",
+          "workstreamId": "ws_security"
+        }
+      },
+      {
+        "id": "thread:t_cve_claude",
+        "kind": "thread",
+        "label": "Claude — copy_file_range CVE",
+        "firstSeenAt": "2026-05-07T09:18:00.000Z",
+        "lastSeenAt": "2026-05-07T09:18:00.000Z",
+        "originReplicaIds": [
+          "replica-mac"
+        ],
+        "metadata": {
+          "canonicalUrl": "https://claude.ai/chat/cve_thread",
+          "provider": "claude",
+          "title": "Claude — copy_file_range CVE",
+          "url": "https://claude.ai/chat/cve_thread",
+          "workstreamId": "ws_security"
+        }
+      },
+      {
+        "id": "timeline-visit:https://chatgpt.com/c/cve_review",
+        "kind": "timeline-visit",
+        "label": "ChatGPT — cve review",
+        "firstSeenAt": "2026-05-07T09:29:00.000Z",
+        "lastSeenAt": "2026-05-07T09:29:00.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "canonicalUrl": "https://chatgpt.com/c/cve_review",
+          "title": "ChatGPT — cve review",
+          "url": "https://chatgpt.com/c/cve_review",
+          "visitCount": 1
+        }
+      },
+      {
+        "id": "timeline-visit:https://claude.ai/chat/cve_thread",
+        "kind": "timeline-visit",
+        "label": "Claude — CVE chat",
+        "firstSeenAt": "2026-05-07T09:18:00.000Z",
+        "lastSeenAt": "2026-05-07T09:18:00.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "canonicalUrl": "https://claude.ai/chat/cve_thread",
+          "title": "Claude — CVE chat",
+          "url": "https://claude.ai/chat/cve_thread",
+          "visitCount": 1
+        }
+      },
+      {
+        "id": "timeline-visit:https://news.ycombinator.com/item?id=42_copyfail",
+        "kind": "timeline-visit",
+        "label": "HN: copy-fail breaks distros",
+        "firstSeenAt": "2026-05-07T09:00:00.000Z",
+        "lastSeenAt": "2026-05-07T09:00:00.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "canonicalUrl": "https://news.ycombinator.com/item?id=42_copyfail",
+          "title": "HN: copy-fail breaks distros",
+          "url": "https://news.ycombinator.com/item?id=42_copyfail",
+          "visitCount": 1,
+          "workstreamId": "ws_security"
+        }
+      },
+      {
+        "id": "timeline-visit:https://nvd.nist.gov/vuln/detail/CVE-2024-12345",
+        "kind": "timeline-visit",
+        "label": "NVD CVE-2024-12345",
+        "firstSeenAt": "2026-05-07T09:14:00.000Z",
+        "lastSeenAt": "2026-05-07T09:14:00.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "canonicalUrl": "https://nvd.nist.gov/vuln/detail/CVE-2024-12345",
+          "title": "NVD CVE-2024-12345",
+          "url": "https://nvd.nist.gov/vuln/detail/CVE-2024-12345",
+          "visitCount": 1
+        }
+      },
+      {
+        "id": "timeline-visit:https://www.google.com/search?q=linux+copy_file_range+CVE",
+        "kind": "timeline-visit",
+        "label": "Google: linux copy_file_range CVE",
+        "firstSeenAt": "2026-05-07T09:08:00.000Z",
+        "lastSeenAt": "2026-05-07T09:08:00.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "canonicalUrl": "https://www.google.com/search?q=linux+copy_file_range+CVE",
+          "searchQuery": "linux copy_file_range cve",
+          "title": "Google: linux copy_file_range CVE",
+          "url": "https://www.google.com/search?q=linux+copy_file_range+CVE",
+          "visitCount": 1
+        }
+      },
+      {
+        "id": "timeline-visit:https://xint.io/blog/copy-fail-linux-distributions",
+        "kind": "timeline-visit",
+        "label": "copy-fail across linux distros",
+        "firstSeenAt": "2026-05-07T09:05:30.000Z",
+        "lastSeenAt": "2026-05-07T09:05:30.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "canonicalUrl": "https://xint.io/blog/copy-fail-linux-distributions",
+          "title": "copy-fail across linux distros",
+          "url": "https://xint.io/blog/copy-fail-linux-distributions",
+          "visitCount": 1
+        }
+      },
+      {
+        "id": "workstream:ws_research",
+        "kind": "workstream",
+        "label": "ws_research",
+        "firstSeenAt": "2026-05-07T08:55:00.000Z",
+        "lastSeenAt": "2026-05-07T08:56:00.000Z",
+        "originReplicaIds": [
+          "replica-mac"
+        ],
+        "metadata": {
+          "title": "Research"
+        }
+      },
+      {
+        "id": "workstream:ws_security",
+        "kind": "workstream",
+        "label": "Security · Linux CVE",
+        "firstSeenAt": "2026-05-07T08:56:00.000Z",
+        "lastSeenAt": "2026-05-07T09:38:00.000Z",
+        "originReplicaIds": [
+          "replica-mac"
+        ],
+        "metadata": {
+          "title": "Security · Linux CVE"
+        }
+      }
+    ],
+    "edges": [
+      {
+        "id": "edge:annotation_targets_thread:annotation:a_cve_thread:thread:t_cve_claude",
+        "kind": "annotation_targets_thread",
+        "fromNodeId": "annotation:a_cve_thread",
+        "toNodeId": "thread:t_cve_claude",
+        "observedAt": "2026-05-07T09:35:45.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "annotation.created",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 41
+          }
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:coding_session_in_workstream:coding-session:cs_cve_vm:workstream:ws_security",
+        "kind": "coding_session_in_workstream",
+        "fromNodeId": "coding-session:cs_cve_vm",
+        "toNodeId": "workstream:ws_security",
+        "observedAt": "2026-05-07T09:25:00.000Z",
+        "producedBy": {
+          "source": "coding-session-store",
+          "recordId": "cs_cve_vm"
+        },
+        "confidence": "explicit"
+      },
+      {
+        "id": "edge:dispatch_from_thread:thread:t_cve_claude:dispatch:d_cve_codex",
+        "kind": "dispatch_from_thread",
+        "fromNodeId": "thread:t_cve_claude",
+        "toNodeId": "dispatch:d_cve_codex",
+        "observedAt": "2026-05-07T09:22:00.000Z",
+        "producedBy": {
+          "source": "workboard-state",
+          "recordId": "d_cve_codex"
+        },
+        "confidence": "explicit"
+      },
+      {
+        "id": "edge:dispatch_in_workstream:dispatch:d_cve_codex:workstream:ws_security",
+        "kind": "dispatch_in_workstream",
+        "fromNodeId": "dispatch:d_cve_codex",
+        "toNodeId": "workstream:ws_security",
+        "observedAt": "2026-05-07T09:22:00.000Z",
+        "producedBy": {
+          "source": "workboard-state",
+          "recordId": "d_cve_codex"
+        },
+        "confidence": "explicit"
+      },
+      {
+        "id": "edge:dispatch_references_url:dispatch:d_cve_codex:timeline-visit:https://nvd.nist.gov/vuln/detail/CVE-2024-12345",
+        "kind": "dispatch_references_url",
+        "fromNodeId": "dispatch:d_cve_codex",
+        "toNodeId": "timeline-visit:https://nvd.nist.gov/vuln/detail/CVE-2024-12345",
+        "observedAt": "2026-05-07T09:22:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "dispatch.recorded",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 22
+          }
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:dispatch_reply_landed_in_thread:dispatch:d_cve_codex:thread:t_cve_chatgpt",
+        "kind": "dispatch_reply_landed_in_thread",
+        "fromNodeId": "dispatch:d_cve_codex",
+        "toNodeId": "thread:t_cve_chatgpt",
+        "observedAt": "2026-05-07T09:33:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "dispatch.linked",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 37
+          }
+        },
+        "confidence": "explicit"
+      },
+      {
+        "id": "edge:dispatch_requested_coding_session:dispatch:d_cve_codex:coding-session:cs_cve_vm",
+        "kind": "dispatch_requested_coding_session",
+        "fromNodeId": "dispatch:d_cve_codex",
+        "toNodeId": "coding-session:cs_cve_vm",
+        "observedAt": "2026-05-07T09:22:00.000Z",
+        "producedBy": {
+          "source": "workboard-state",
+          "recordId": "d_cve_codex"
+        },
+        "confidence": "explicit"
+      },
+      {
+        "id": "edge:queue_targets_workstream:queue-item:q_cve_ws:workstream:ws_security",
+        "kind": "queue_targets_workstream",
+        "fromNodeId": "queue-item:q_cve_ws",
+        "toNodeId": "workstream:ws_security",
+        "observedAt": "2026-05-07T09:38:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "queue.created",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 43
+          }
+        },
+        "confidence": "explicit"
+      },
+      {
+        "id": "edge:reminder_for_thread:inbound-reminder:r_cve_t:thread:t_cve_claude",
+        "kind": "reminder_for_thread",
+        "fromNodeId": "inbound-reminder:r_cve_t",
+        "toNodeId": "thread:t_cve_claude",
+        "observedAt": "2026-05-07T09:42:00.000Z",
+        "producedBy": {
+          "source": "reminder-store",
+          "recordId": "r_cve_t"
+        },
+        "confidence": "explicit"
+      },
+      {
+        "id": "edge:thread_in_workstream:thread:t_cve_chatgpt:workstream:ws_security",
+        "kind": "thread_in_workstream",
+        "fromNodeId": "thread:t_cve_chatgpt",
+        "toNodeId": "workstream:ws_security",
+        "observedAt": "2026-05-07T09:30:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "thread.upserted",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 31
+          }
+        },
+        "confidence": "explicit"
+      },
+      {
+        "id": "edge:thread_in_workstream:thread:t_cve_claude:workstream:ws_security",
+        "kind": "thread_in_workstream",
+        "fromNodeId": "thread:t_cve_claude",
+        "toNodeId": "workstream:ws_security",
+        "observedAt": "2026-05-07T09:18:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "thread.upserted",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 16
+          }
+        },
+        "confidence": "explicit"
+      },
+      {
+        "id": "edge:thread_quotes_thread:thread:t_cve_chatgpt:thread:t_cve_claude",
+        "kind": "thread_quotes_thread",
+        "fromNodeId": "thread:t_cve_chatgpt",
+        "toNodeId": "thread:t_cve_claude",
+        "observedAt": "2026-05-07T09:30:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "capture.recorded",
+          "recordId": "0015980bb4c7",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 32
+          }
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:thread_quotes_thread:thread:t_cve_claude:thread:t_cve_chatgpt",
+        "kind": "thread_quotes_thread",
+        "fromNodeId": "thread:t_cve_claude",
+        "toNodeId": "thread:t_cve_chatgpt",
+        "observedAt": "2026-05-07T09:30:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "capture.recorded",
+          "recordId": "0015980bb4c7",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 17
+          }
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:thread_references_url:thread:t_cve_claude:timeline-visit:https://news.ycombinator.com/item?id=42_copyfail",
+        "kind": "thread_references_url",
+        "fromNodeId": "thread:t_cve_claude",
+        "toNodeId": "timeline-visit:https://news.ycombinator.com/item?id=42_copyfail",
+        "observedAt": "2026-05-07T09:18:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "capture.recorded",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 17
+          }
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:thread_references_url:thread:t_cve_claude:timeline-visit:https://nvd.nist.gov/vuln/detail/CVE-2024-12345",
+        "kind": "thread_references_url",
+        "fromNodeId": "thread:t_cve_claude",
+        "toNodeId": "timeline-visit:https://nvd.nist.gov/vuln/detail/CVE-2024-12345",
+        "observedAt": "2026-05-07T09:18:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "capture.recorded",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 17
+          }
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:thread_references_url:thread:t_cve_claude:timeline-visit:https://xint.io/blog/copy-fail-linux-distributions",
+        "kind": "thread_references_url",
+        "fromNodeId": "thread:t_cve_claude",
+        "toNodeId": "timeline-visit:https://xint.io/blog/copy-fail-linux-distributions",
+        "observedAt": "2026-05-07T09:18:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "capture.recorded",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 17
+          }
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:thread_text_mentions_search_query:thread:t_cve_claude:timeline-visit:https://www.google.com/search?q=linux+copy_file_range+CVE",
+        "kind": "thread_text_mentions_search_query",
+        "fromNodeId": "thread:t_cve_claude",
+        "toNodeId": "timeline-visit:https://www.google.com/search?q=linux+copy_file_range+CVE",
+        "observedAt": "2026-05-07T09:18:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "capture.recorded",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 17
+          }
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:timeline_same_url_as_thread:timeline-visit:https://chatgpt.com/c/cve_review:thread:t_cve_chatgpt",
+        "kind": "timeline_same_url_as_thread",
+        "fromNodeId": "timeline-visit:https://chatgpt.com/c/cve_review",
+        "toNodeId": "thread:t_cve_chatgpt",
+        "observedAt": "2026-05-07T09:29:00.000Z",
+        "producedBy": {
+          "source": "timeline-projection"
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:timeline_same_url_as_thread:timeline-visit:https://claude.ai/chat/cve_thread:thread:t_cve_claude",
+        "kind": "timeline_same_url_as_thread",
+        "fromNodeId": "timeline-visit:https://claude.ai/chat/cve_thread",
+        "toNodeId": "thread:t_cve_claude",
+        "observedAt": "2026-05-07T09:18:00.000Z",
+        "producedBy": {
+          "source": "timeline-projection"
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:visit_in_workstream:timeline-visit:https://news.ycombinator.com/item?id=42_copyfail:workstream:ws_security",
+        "kind": "visit_in_workstream",
+        "fromNodeId": "timeline-visit:https://news.ycombinator.com/item?id=42_copyfail",
+        "toNodeId": "workstream:ws_security",
+        "observedAt": "2026-05-07T09:00:00.000Z",
+        "producedBy": {
+          "source": "timeline-projection"
+        },
+        "confidence": "explicit"
+      },
+      {
+        "id": "edge:workstream_parent_of:workstream:ws_research:workstream:ws_security",
+        "kind": "workstream_parent_of",
+        "fromNodeId": "workstream:ws_research",
+        "toNodeId": "workstream:ws_security",
+        "observedAt": "",
+        "producedBy": {
+          "source": "workboard-state",
+          "recordId": "ws_research"
+        },
+        "confidence": "explicit"
+      }
+    ],
+    "updatedAt": "2026-05-07T09:42:00.000Z",
+    "nodeCount": 15,
+    "edgeCount": 21
+  }
+}

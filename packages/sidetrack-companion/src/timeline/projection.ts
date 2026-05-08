@@ -43,6 +43,12 @@ export interface TimelineEntry {
   readonly title?: string;
   readonly provider?: TimelineProvider;
   readonly visitCount: number;
+  // Active-workstream attribution (Phase 4). Set by the side-panel
+  // observer when the user has a workstream focused at observation
+  // time. Last-write-wins by `observedAt` — a URL revisited under a
+  // different workstream rebinds. Optional — visits observed without
+  // a focused workstream stay unattributed.
+  readonly workstreamId?: string;
 }
 
 export interface TimelineDayProjection {
@@ -106,6 +112,8 @@ export const reduceTimelineEvents = (
     visitCount: number;
     titleObservedAt?: string;
     providerObservedAt?: string;
+    workstreamId?: string;
+    workstreamObservedAt?: string;
   }>();
   for (const event of events) {
     const id = entryIdFor(event);
@@ -123,6 +131,9 @@ export const reduceTimelineEvents = (
         ...(event.provider === undefined
           ? {}
           : { provider: event.provider, providerObservedAt: event.observedAt }),
+        ...(event.workstreamId === undefined
+          ? {}
+          : { workstreamId: event.workstreamId, workstreamObservedAt: event.observedAt }),
         visitCount: incrementsVisit ? 1 : 0,
       });
       continue;
@@ -142,6 +153,18 @@ export const reduceTimelineEvents = (
         existing.providerObservedAt = event.observedAt;
       }
     }
+    // workstreamId: last-write-wins. Tracks "what flow was the user
+    // in when they observed this URL". A URL revisited under a
+    // different workstream rebinds.
+    if (event.workstreamId !== undefined && event.workstreamId.length > 0) {
+      if (
+        existing.workstreamObservedAt === undefined ||
+        event.observedAt >= existing.workstreamObservedAt
+      ) {
+        existing.workstreamId = event.workstreamId;
+        existing.workstreamObservedAt = event.observedAt;
+      }
+    }
     if (incrementsVisit) existing.visitCount += 1;
     byEntry.set(id, existing);
   }
@@ -155,6 +178,7 @@ export const reduceTimelineEvents = (
       ...(agg.canonicalUrl === undefined ? {} : { canonicalUrl: agg.canonicalUrl }),
       ...(agg.title === undefined ? {} : { title: agg.title }),
       ...(agg.provider === undefined ? {} : { provider: agg.provider }),
+      ...(agg.workstreamId === undefined ? {} : { workstreamId: agg.workstreamId }),
       visitCount: agg.visitCount,
     });
   }

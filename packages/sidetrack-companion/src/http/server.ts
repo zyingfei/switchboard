@@ -321,6 +321,9 @@ export interface CompanionHttpConfig {
   // Optional timeline projection store, exposing read access for
   // the GET /v1/timeline route. When unset that route returns 503.
   readonly timelineStore?: import('../timeline/projection.js').TimelineStore;
+  // Connections graph snapshot store. When unset, GET /v1/connections
+  // and its sibling routes return 503.
+  readonly connectionsStore?: import('../connections/snapshot.js').ConnectionsStore;
 }
 
 export interface StartedHttpServer {
@@ -339,6 +342,8 @@ interface RouteMatch {
   readonly threadId?: string;
   readonly annotationId?: string;
   readonly bacId?: string;
+  readonly connectionsNodeId?: string;
+  readonly connectionsEdgeId?: string;
 }
 
 interface RouteDefinition {
@@ -1327,6 +1332,26 @@ const routes: readonly RouteDefinition[] = [
                     : { workstreamId: dispatchEvent.workstreamId }),
                   createdAt: dispatchEvent.createdAt,
                   body: dispatchEvent.body,
+                  // Phase 4 cross-replica fix: include the
+                  // structural attribution so peer companions can
+                  // emit dispatch_from_thread /
+                  // dispatch_in_workstream /
+                  // dispatch_requested_coding_session from the
+                  // event log alone — the dispatch JSONL is per-
+                  // replica and doesn't sync.
+                  ...(dispatchEvent.sourceThreadId === undefined
+                    ? {}
+                    : { sourceThreadId: dispatchEvent.sourceThreadId }),
+                  ...(dispatchEvent.mcpRequest === undefined
+                    ? {}
+                    : {
+                        mcpRequest: {
+                          codingSessionId: dispatchEvent.mcpRequest.codingSessionId,
+                        },
+                      }),
+                  ...(dispatchEvent.title === undefined
+                    ? {}
+                    : { title: dispatchEvent.title }),
                 },
                   })
               .catch(() => undefined);
@@ -3319,6 +3344,181 @@ const routes: readonly RouteDefinition[] = [
           },
         },
       ];
+    },
+  },
+  // Sync Contract v1 — Connections (Class B evidence graph) routes.
+  //
+  // GET /v1/connections                            full snapshot or
+  //                                                workstream-scoped
+  //                                                subgraph
+  // GET /v1/connections/nodes/<id>/neighbors?hops= subgraph around an anchor
+  // GET /v1/connections/edges/<id>                 edge + producing event
+  // GET /v1/connections/path?fromNodeId=...        BFS path between two nodes
+  //
+  // All bridge-key authenticated. ScopedResult-shaped envelope so
+  // the side panel + MCP can render partial-data states honestly.
+  {
+    method: 'GET',
+    pattern: /^\/v1\/connections(?:\?.*)?$/u,
+    authRequired: true,
+    handle: async (request, requestId, _match, context) => {
+      void requestId;
+      if (context.connectionsStore === undefined) {
+        throw new HttpRouteError(503, 'CONNECTIONS_NOT_WIRED', 'Connections is not configured.');
+      }
+      const url = new URL(request.url ?? '/v1/connections', 'http://internal');
+      const workstreamId = url.searchParams.get('workstreamId') ?? undefined;
+      const nodeKind = url.searchParams.get('nodeKind') ?? undefined;
+      const edgeKind = url.searchParams.get('edgeKind') ?? undefined;
+      const provider = url.searchParams.get('provider') ?? undefined;
+      const originReplicaId = url.searchParams.get('originReplicaId') ?? undefined;
+
+      const snap = await context.connectionsStore.readCurrent();
+      if (snap === null) {
+        // Materializer hasn't run yet — return an empty scoped
+        // envelope so callers don't have to special-case 404.
+        return [
+          200,
+          {
+            data: {
+              scope: 'companion-extended',
+              snapshot: {
+                scope: {},
+                nodes: [],
+                edges: [],
+                updatedAt: '1970-01-01T00:00:00.000Z',
+                nodeCount: 0,
+                edgeCount: 0,
+              },
+            },
+          },
+        ];
+      }
+      // Coarse filters — honoured by simple matchers. workstreamId
+      // narrows to nodes either matching the ws id directly or
+      // having metadata.workstreamId pointing to it; edges between
+      // selected nodes survive.
+      let nodes = snap.nodes;
+      let edges = snap.edges;
+      if (workstreamId !== undefined) {
+        const wsNodeId = `workstream:${workstreamId}`;
+        const keepNodeIds = new Set<string>([wsNodeId]);
+        for (const n of nodes) {
+          if (n.metadata['workstreamId'] === workstreamId) keepNodeIds.add(n.id);
+        }
+        // Pull in edge endpoints reachable from the kept set in one
+        // hop so the projection is comprehensible.
+        for (const e of edges) {
+          if (keepNodeIds.has(e.fromNodeId)) keepNodeIds.add(e.toNodeId);
+          if (keepNodeIds.has(e.toNodeId)) keepNodeIds.add(e.fromNodeId);
+        }
+        nodes = nodes.filter((n) => keepNodeIds.has(n.id));
+        edges = edges.filter(
+          (e) => keepNodeIds.has(e.fromNodeId) && keepNodeIds.has(e.toNodeId),
+        );
+      }
+      if (nodeKind !== undefined) {
+        nodes = nodes.filter((n) => n.kind === nodeKind);
+        const kept = new Set(nodes.map((n) => n.id));
+        edges = edges.filter((e) => kept.has(e.fromNodeId) && kept.has(e.toNodeId));
+      }
+      if (edgeKind !== undefined) {
+        edges = edges.filter((e) => e.kind === edgeKind);
+      }
+      if (provider !== undefined) {
+        nodes = nodes.filter((n) => n.metadata['provider'] === provider);
+        const kept = new Set(nodes.map((n) => n.id));
+        edges = edges.filter((e) => kept.has(e.fromNodeId) && kept.has(e.toNodeId));
+      }
+      if (originReplicaId !== undefined) {
+        nodes = nodes.filter((n) => n.originReplicaIds.includes(originReplicaId));
+        const kept = new Set(nodes.map((n) => n.id));
+        edges = edges.filter((e) => kept.has(e.fromNodeId) && kept.has(e.toNodeId));
+      }
+      return [
+        200,
+        {
+          data: {
+            scope: 'companion-extended',
+            snapshot: {
+              scope: { ...(workstreamId === undefined ? {} : { workstreamId }) },
+              nodes,
+              edges,
+              updatedAt: snap.updatedAt,
+              nodeCount: nodes.length,
+              edgeCount: edges.length,
+            },
+          },
+        },
+      ];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/connections\/nodes\/(?<connectionsNodeId>[^/?]+)\/neighbors(?:\?.*)?$/u,
+    authRequired: true,
+    handle: async (request, _requestId, match, context) => {
+      if (context.connectionsStore === undefined) {
+        throw new HttpRouteError(503, 'CONNECTIONS_NOT_WIRED', 'Connections is not configured.');
+      }
+      // Path params are URI-encoded (we accept the whole node id
+      // as the URL segment); decode and validate length.
+      const nodeId = decodeURIComponent(match.connectionsNodeId ?? '');
+      const url = new URL(request.url ?? '/v1/connections', 'http://internal');
+      const hopsRaw = Number.parseInt(url.searchParams.get('hops') ?? '1', 10);
+      const hops = Number.isFinite(hopsRaw) && hopsRaw >= 0 ? Math.min(hopsRaw, 4) : 1;
+      const snap = await context.connectionsStore.readCurrent();
+      if (snap === null) {
+        return [200, { data: { scope: 'companion-extended', snapshot: { scope: { nodeId, hops }, nodes: [], edges: [], updatedAt: '1970-01-01T00:00:00.000Z', nodeCount: 0, edgeCount: 0 } } }];
+      }
+      const { subgraphForNode } = await import('../connections/snapshot.js');
+      const sub = subgraphForNode(snap, nodeId, hops);
+      return [200, { data: { scope: 'companion-extended', snapshot: sub } }];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/connections\/edges\/(?<connectionsEdgeId>[^/?]+)(?:\?.*)?$/u,
+    authRequired: true,
+    handle: async (_request, _requestId, match, context) => {
+      if (context.connectionsStore === undefined) {
+        throw new HttpRouteError(503, 'CONNECTIONS_NOT_WIRED', 'Connections is not configured.');
+      }
+      const edgeId = decodeURIComponent(match.connectionsEdgeId ?? '');
+      const snap = await context.connectionsStore.readCurrent();
+      if (snap === null) {
+        throw new HttpRouteError(404, 'EDGE_NOT_FOUND', 'No connections snapshot yet.');
+      }
+      const edge = snap.edges.find((e) => e.id === edgeId);
+      if (edge === undefined) {
+        throw new HttpRouteError(404, 'EDGE_NOT_FOUND', 'Edge not found.');
+      }
+      return [200, { data: { edge } }];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/connections\/path(?:\?.*)?$/u,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      if (context.connectionsStore === undefined) {
+        throw new HttpRouteError(503, 'CONNECTIONS_NOT_WIRED', 'Connections is not configured.');
+      }
+      const url = new URL(request.url ?? '/v1/connections/path', 'http://internal');
+      const fromNodeId = url.searchParams.get('fromNodeId') ?? '';
+      const toNodeId = url.searchParams.get('toNodeId') ?? '';
+      const maxHopsRaw = Number.parseInt(url.searchParams.get('maxHops') ?? '4', 10);
+      const maxHops = Number.isFinite(maxHopsRaw) && maxHopsRaw > 0 ? Math.min(maxHopsRaw, 8) : 4;
+      if (fromNodeId.length === 0 || toNodeId.length === 0) {
+        throw new HttpRouteError(400, 'INVALID_REQUEST', 'fromNodeId and toNodeId are required.');
+      }
+      const snap = await context.connectionsStore.readCurrent();
+      if (snap === null) {
+        return [200, { data: { found: false } }];
+      }
+      const { findPath } = await import('../connections/snapshot.js');
+      const result = findPath(snap, fromNodeId, toNodeId, maxHops);
+      return [200, { data: result }];
     },
   },
 ];

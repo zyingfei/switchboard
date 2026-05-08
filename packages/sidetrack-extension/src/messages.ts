@@ -29,6 +29,12 @@ export const messageTypes = {
   selectorCanary: 'sidetrack.capture.selector-canary',
   getWorkboardState: 'sidetrack.workboard.state',
   saveCompanionSettings: 'sidetrack.settings.companion.save',
+  // Connections graph fetches — proxied to the companion's
+  // /v1/connections endpoint by background.ts, with a 30 s TTL
+  // cache so the side panel can poll cheaply.
+  loadConnectionsSnapshot: 'sidetrack.connections.snapshot',
+  loadConnectionsNeighbors: 'sidetrack.connections.neighbors',
+  loadConnectionsEdge: 'sidetrack.connections.edge',
   captureCurrentTab: 'sidetrack.capture.current-tab',
   createWorkstream: 'sidetrack.workstream.create',
   updateWorkstream: 'sidetrack.workstream.update',

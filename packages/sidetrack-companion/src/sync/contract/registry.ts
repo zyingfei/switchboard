@@ -83,11 +83,20 @@ export interface ContractEntry {
 // not a companion-side materializer. The annotation-projection
 // surface (companion-side, Class A) IS owned by the projection
 // materializer here.
+// Note on consumer-only materializers: `recall`, `extraction`, and
+// (from the Connections feature) `connections` consume across many
+// event-type owners and don't appear as `surfaces[].materializer`
+// on every event they care about. The registry-coverage gate
+// (registry.test.ts) checks that every `surface.materializer`
+// value IS in this set — but does NOT require the inverse. So
+// adding a name here is sufficient to register a consumer-only
+// materializer.
 export const KNOWN_MATERIALIZERS: ReadonlySet<string> = new Set<string>([
   'projection',
   'recall',
   'extraction',
   'timeline',
+  'connections',
 ]);
 
 const projectionEntry = (eventType: string, surface: string): ContractEntry => ({

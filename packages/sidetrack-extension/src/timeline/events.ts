@@ -21,6 +21,11 @@ export interface BrowserTimelineObservedPayload {
   readonly transition: TimelineTransition;
   readonly tabIdHash?: string;
   readonly windowIdHash?: string;
+  // Phase 4 — Active-workstream attribution. Set by the observer
+  // when the user has a workstream focused in the side panel at
+  // observation time. Companion-side TimelineEntry + connections-
+  // graph carry this through and emit `visit_in_workstream`.
+  readonly workstreamId?: string;
 }
 
 // Plugin-tier minimal shape: the side panel's local active window

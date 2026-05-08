@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import { formatRelative } from '../../../src/util/time';
 import { Icons } from './icons';
+import { TIMELINE_ENABLED_KEY } from '../../../src/timeline/wiring';
 
 // Settings v2 — section components for the SettingsPanel. Each is
 // self-contained and accepts pre-shaped props so the parent owns
@@ -104,6 +105,230 @@ export function AppearanceSection({
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Timeline observation — Settings → Timeline.
+//
+// Two independent controls:
+//   1. The privacy gate (chrome.storage.local['sidetrack.timeline.enabled']).
+//      Default OFF; flipping ON also fires the 'sidetrack.timeline.reinit'
+//      runtime message so the SW's chrome.tabs listeners register without a
+//      reload. Once on, the manifest's `tabs` permission is enough to
+//      observe URL + title for every navigation — chat-provider AND
+//      ambient pages.
+//   2. The optional-host-permission grant. The manifest declares
+//      optional_host_permissions: ['https://*/*', 'http://*/*']. URL +
+//      title observation does NOT need this grant — the `tabs` permission
+//      already covers it. The grant exists for future passes that need
+//      deeper page access (content extraction, in-page actions). The
+//      button calls chrome.permissions.request from a user-gesture
+//      context so the grant is available when those features land,
+//      without forcing the user back through Settings later.
+// ─────────────────────────────────────────────────────────────────────
+
+const TIMELINE_OPTIONAL_ORIGINS = ['https://*/*', 'http://*/*'] as const;
+
+const readChromePermissionsContains = async (): Promise<boolean> => {
+  try {
+    return await new Promise<boolean>((resolve) => {
+      chrome.permissions.contains(
+        { origins: [...TIMELINE_OPTIONAL_ORIGINS] },
+        (granted) => {
+          resolve(Boolean(granted));
+        },
+      );
+    });
+  } catch {
+    return false;
+  }
+};
+
+export function TimelineSection() {
+  const [enabled, setEnabled] = useState<boolean>(false);
+  const [hasPermission, setHasPermission] = useState<boolean>(false);
+  const [busy, setBusy] = useState<boolean>(false);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  // Hydrate gate + permission state on mount. The gate read is async via
+  // chrome.storage.local; the permission read is async via
+  // chrome.permissions.contains.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const got = await chrome.storage.local.get(TIMELINE_ENABLED_KEY);
+        if (!cancelled) setEnabled(got[TIMELINE_ENABLED_KEY] === true);
+      } catch {
+        // chrome.storage missing in a test harness — leave default false.
+      }
+      const granted = await readChromePermissionsContains();
+      if (!cancelled) setHasPermission(granted);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleToggleEnabled = async (next: boolean): Promise<void> => {
+    setBusy(true);
+    setNotice(null);
+    try {
+      await chrome.storage.local.set({ [TIMELINE_ENABLED_KEY]: next });
+      setEnabled(next);
+      // Tell the SW to (re-)init wiring so the gate flip takes effect
+      // without a reload. The handler is idempotent — flipping off
+      // can leave the listener registered (no observation lands while
+      // the gate is false; the wiring's emit closure consults the gate
+      // each time).
+      try {
+        await chrome.runtime.sendMessage({ type: 'sidetrack.timeline.reinit' });
+      } catch {
+        // SW may be dormant; the next event-driven boot picks up the
+        // gate. Not blocking.
+      }
+      setNotice(
+        next
+          ? 'Timeline observation enabled. URL + title for every navigation will land in the timeline projection.'
+          : 'Timeline observation disabled.',
+      );
+    } catch (error) {
+      setNotice(
+        `Could not save timeline setting: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleGrantPermission = async (): Promise<void> => {
+    setBusy(true);
+    setNotice(null);
+    try {
+      const granted = await new Promise<boolean>((resolve) => {
+        chrome.permissions.request(
+          { origins: [...TIMELINE_OPTIONAL_ORIGINS] },
+          (g) => {
+            resolve(Boolean(g));
+          },
+        );
+      });
+      setHasPermission(granted);
+      setNotice(
+        granted
+          ? 'Deeper page access granted. Future Sidetrack features (content extraction, in-page actions) will use this — URL/title observation already worked without it.'
+          : 'Permission was not granted. Timeline observation continues to work for URL + title; the grant is only needed for deeper page features.',
+      );
+    } catch (error) {
+      setNotice(
+        `Permission request failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleRevokePermission = async (): Promise<void> => {
+    setBusy(true);
+    setNotice(null);
+    try {
+      const removed = await new Promise<boolean>((resolve) => {
+        chrome.permissions.remove(
+          { origins: [...TIMELINE_OPTIONAL_ORIGINS] },
+          (r) => {
+            resolve(Boolean(r));
+          },
+        );
+      });
+      if (removed) setHasPermission(false);
+      setNotice(
+        removed
+          ? 'Deeper page access revoked. Timeline observation still records URL + title.'
+          : 'Could not revoke; you may need to use chrome://extensions to remove host access.',
+      );
+    } catch (error) {
+      setNotice(
+        `Permission removal failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="settings-sec-v2" id="sec-timeline" data-testid="settings-timeline-section">
+      <div className="sec-h">Timeline observation</div>
+      <p className="settings-section-lede ai-italic">
+        When enabled, Sidetrack observes URL + title for every browser tab
+        navigation and attributes each one to the active workstream — no
+        page contents are captured. Default OFF, opt-in.
+      </p>
+      <label className={'switch ' + (enabled ? 'on' : '')}>
+        <input
+          type="checkbox"
+          checked={enabled}
+          disabled={busy}
+          data-testid="settings-timeline-toggle"
+          onChange={() => {
+            void handleToggleEnabled(!enabled);
+          }}
+        />
+        <span className="knob" />
+        <span className="lbl">
+          Observe browser activity
+          <span className="desc mono">
+            {enabled
+              ? 'on — recording URL + title for every navigation'
+              : 'off — no tab activity is recorded'}
+          </span>
+        </span>
+      </label>
+      <div className="settings-cta-row" style={{ marginTop: 8 }}>
+        <span className="mono" data-testid="settings-timeline-permission-status">
+          {hasPermission ? '✓ deeper page access granted' : 'deeper page access not granted (optional)'}
+        </span>
+        {hasPermission ? (
+          <button
+            type="button"
+            className="btn btn-ghost"
+            disabled={busy}
+            data-testid="settings-timeline-revoke-permission"
+            onClick={() => {
+              void handleRevokePermission();
+            }}
+          >
+            Revoke
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="btn btn-primary"
+            disabled={busy}
+            data-testid="settings-timeline-grant-permission"
+            onClick={() => {
+              void handleGrantPermission();
+            }}
+          >
+            Allow deeper page access…
+          </button>
+        )}
+      </div>
+      {notice !== null ? (
+        <div className="settings-hint mono" data-testid="settings-timeline-notice">
+          {notice}
+        </div>
+      ) : null}
+      <p className="settings-hint mono">
+        URL + title observation works as soon as the toggle is on (the
+        manifest's <code>tabs</code> permission covers it). Deeper access
+        is optional — it lets future Sidetrack features (content
+        extraction, in-page actions) work on ambient pages too. Active
+        workstream is set by selecting one in the workboard; observed
+        visits attach via <code>visit_in_workstream</code> in the
+        Connections graph.
+      </p>
     </div>
   );
 }

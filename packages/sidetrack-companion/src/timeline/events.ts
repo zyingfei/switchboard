@@ -35,6 +35,15 @@ export interface BrowserTimelineObservedPayload {
   readonly transition: TimelineTransition;
   readonly tabIdHash?: string;
   readonly windowIdHash?: string;
+  // Active-workstream attribution (Phase 4). When the user has a
+  // workstream focused in the side panel at observation time, the
+  // observer stamps this on the event so the connections graph can
+  // emit `visit_in_workstream` and ambient browsing (search /
+  // YouTube / generic doc pages) attaches to the right flow without
+  // needing the URL to be pasted into a chat. Optional — visits
+  // observed without an active workstream stay orphan, exactly the
+  // same as before this field existed.
+  readonly workstreamId?: string;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -90,6 +99,16 @@ export const isBrowserTimelineObservedPayload = (
   if (value['windowIdHash'] !== undefined) {
     if (typeof value['windowIdHash'] !== 'string') return false;
     if ((value['windowIdHash'] as string).length > TIMELINE_HASH_MAX_LENGTH) return false;
+  }
+  if (value['workstreamId'] !== undefined) {
+    if (typeof value['workstreamId'] !== 'string') return false;
+    // Same shape constraint as bac-id elsewhere (alnum + hyphen +
+    // underscore, bounded length). Defensive check at the import
+    // boundary; the side-panel sets this from chrome.storage so a
+    // stolen bridge key shouldn't be able to inject arbitrary text.
+    if ((value['workstreamId'] as string).length === 0) return false;
+    if ((value['workstreamId'] as string).length > 128) return false;
+    if (!/^[A-Za-z0-9_-]+$/u.test(value['workstreamId'] as string)) return false;
   }
   return true;
 };

@@ -1,0 +1,372 @@
+{
+  "scope": "companion-extended",
+  "snapshot": {
+    "scope": {
+      "nodeId": "workstream:ws_sidetrack",
+      "hops": 2
+    },
+    "nodes": [
+      {
+        "id": "coding-session:cs_sb_refactor",
+        "kind": "coding-session",
+        "label": "sidetrack-refactor",
+        "firstSeenAt": "2026-05-07T09:42:00.000Z",
+        "lastSeenAt": "2026-05-07T09:42:00.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "provider": "claude_code",
+          "sourcePath": "/work/sidetrack",
+          "status": "attached",
+          "title": "sidetrack-refactor"
+        }
+      },
+      {
+        "id": "dispatch:d_sb_refactor",
+        "kind": "dispatch",
+        "label": "Claude Code — refactor reducer pass-2",
+        "firstSeenAt": "2026-05-07T09:24:00.000Z",
+        "lastSeenAt": "2026-05-07T09:24:00.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "provider": "claude_code",
+          "status": "sent",
+          "title": "Claude Code — refactor reducer pass-2"
+        }
+      },
+      {
+        "id": "thread:t_sb_chatgpt",
+        "kind": "thread",
+        "label": "ChatGPT — review reducer code",
+        "firstSeenAt": "2026-05-07T09:31:00.000Z",
+        "lastSeenAt": "2026-05-07T09:31:00.000Z",
+        "originReplicaIds": [
+          "replica-mac"
+        ],
+        "metadata": {
+          "canonicalUrl": "https://chatgpt.com/c/sb_review",
+          "provider": "chatgpt",
+          "title": "ChatGPT — review reducer code",
+          "url": "https://chatgpt.com/c/sb_review",
+          "workstreamId": "ws_sidetrack"
+        }
+      },
+      {
+        "id": "thread:t_sb_claude",
+        "kind": "thread",
+        "label": "Claude — m2 dispatch design review",
+        "firstSeenAt": "2026-05-07T09:19:00.000Z",
+        "lastSeenAt": "2026-05-07T09:19:00.000Z",
+        "originReplicaIds": [
+          "replica-mac"
+        ],
+        "metadata": {
+          "canonicalUrl": "https://claude.ai/chat/sb_thread",
+          "provider": "claude",
+          "title": "Claude — m2 dispatch design review",
+          "url": "https://claude.ai/chat/sb_thread",
+          "workstreamId": "ws_sidetrack"
+        }
+      },
+      {
+        "id": "timeline-visit:https://chatgpt.com/c/sb_review",
+        "kind": "timeline-visit",
+        "label": "ChatGPT — sb review",
+        "firstSeenAt": "2026-05-07T09:30:30.000Z",
+        "lastSeenAt": "2026-05-07T09:30:30.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "canonicalUrl": "https://chatgpt.com/c/sb_review",
+          "title": "ChatGPT — sb review",
+          "url": "https://chatgpt.com/c/sb_review",
+          "visitCount": 1
+        }
+      },
+      {
+        "id": "timeline-visit:https://claude.ai/chat/sb_thread",
+        "kind": "timeline-visit",
+        "label": "Claude — sb chat",
+        "firstSeenAt": "2026-05-07T09:18:30.000Z",
+        "lastSeenAt": "2026-05-07T09:18:30.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "canonicalUrl": "https://claude.ai/chat/sb_thread",
+          "title": "Claude — sb chat",
+          "url": "https://claude.ai/chat/sb_thread",
+          "visitCount": 1
+        }
+      },
+      {
+        "id": "timeline-visit:https://github.com/sidetrack-co/sidetrack/blob/main/BRAINSTORM.md",
+        "kind": "timeline-visit",
+        "label": "BRAINSTORM.md",
+        "firstSeenAt": "2026-05-07T09:11:00.000Z",
+        "lastSeenAt": "2026-05-07T09:11:00.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "canonicalUrl": "https://github.com/sidetrack-co/sidetrack/blob/main/BRAINSTORM.md",
+          "title": "BRAINSTORM.md",
+          "url": "https://github.com/sidetrack-co/sidetrack/blob/main/BRAINSTORM.md",
+          "visitCount": 1
+        }
+      },
+      {
+        "id": "timeline-visit:https://github.com/sidetrack-co/sidetrack/pull/98",
+        "kind": "timeline-visit",
+        "label": "sidetrack/sidetrack PR #98",
+        "firstSeenAt": "2026-05-07T09:05:00.000Z",
+        "lastSeenAt": "2026-05-07T09:05:00.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "canonicalUrl": "https://github.com/sidetrack-co/sidetrack/pull/98",
+          "title": "sidetrack/sidetrack PR #98",
+          "url": "https://github.com/sidetrack-co/sidetrack/pull/98",
+          "visitCount": 1,
+          "workstreamId": "ws_sidetrack"
+        }
+      },
+      {
+        "id": "timeline-visit:https://news.ycombinator.com/item?id=42_pgmerge",
+        "kind": "timeline-visit",
+        "label": "HN: postgres MERGE pitfalls",
+        "firstSeenAt": "2026-05-07T09:16:00.000Z",
+        "lastSeenAt": "2026-05-07T09:16:00.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "canonicalUrl": "https://news.ycombinator.com/item?id=42_pgmerge",
+          "title": "HN: postgres MERGE pitfalls",
+          "url": "https://news.ycombinator.com/item?id=42_pgmerge",
+          "visitCount": 2
+        }
+      },
+      {
+        "id": "workstream:ws_sidetrack",
+        "kind": "workstream",
+        "label": "Sidetrack · project review",
+        "firstSeenAt": "2026-05-07T08:58:00.000Z",
+        "lastSeenAt": "2026-05-07T09:31:00.000Z",
+        "originReplicaIds": [
+          "replica-mac"
+        ],
+        "metadata": {
+          "title": "Sidetrack · project review"
+        }
+      }
+    ],
+    "edges": [
+      {
+        "id": "edge:coding_session_in_workstream:coding-session:cs_sb_refactor:workstream:ws_sidetrack",
+        "kind": "coding_session_in_workstream",
+        "fromNodeId": "coding-session:cs_sb_refactor",
+        "toNodeId": "workstream:ws_sidetrack",
+        "observedAt": "2026-05-07T09:27:00.000Z",
+        "producedBy": {
+          "source": "coding-session-store",
+          "recordId": "cs_sb_refactor"
+        },
+        "confidence": "explicit"
+      },
+      {
+        "id": "edge:dispatch_from_thread:thread:t_sb_claude:dispatch:d_sb_refactor",
+        "kind": "dispatch_from_thread",
+        "fromNodeId": "thread:t_sb_claude",
+        "toNodeId": "dispatch:d_sb_refactor",
+        "observedAt": "2026-05-07T09:24:00.000Z",
+        "producedBy": {
+          "source": "workboard-state",
+          "recordId": "d_sb_refactor"
+        },
+        "confidence": "explicit"
+      },
+      {
+        "id": "edge:dispatch_in_workstream:dispatch:d_sb_refactor:workstream:ws_sidetrack",
+        "kind": "dispatch_in_workstream",
+        "fromNodeId": "dispatch:d_sb_refactor",
+        "toNodeId": "workstream:ws_sidetrack",
+        "observedAt": "2026-05-07T09:24:00.000Z",
+        "producedBy": {
+          "source": "workboard-state",
+          "recordId": "d_sb_refactor"
+        },
+        "confidence": "explicit"
+      },
+      {
+        "id": "edge:dispatch_references_url:dispatch:d_sb_refactor:timeline-visit:https://github.com/sidetrack-co/sidetrack/blob/main/BRAINSTORM.md",
+        "kind": "dispatch_references_url",
+        "fromNodeId": "dispatch:d_sb_refactor",
+        "toNodeId": "timeline-visit:https://github.com/sidetrack-co/sidetrack/blob/main/BRAINSTORM.md",
+        "observedAt": "2026-05-07T09:24:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "dispatch.recorded",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 24
+          }
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:dispatch_requested_coding_session:dispatch:d_sb_refactor:coding-session:cs_sb_refactor",
+        "kind": "dispatch_requested_coding_session",
+        "fromNodeId": "dispatch:d_sb_refactor",
+        "toNodeId": "coding-session:cs_sb_refactor",
+        "observedAt": "2026-05-07T09:24:00.000Z",
+        "producedBy": {
+          "source": "workboard-state",
+          "recordId": "d_sb_refactor"
+        },
+        "confidence": "explicit"
+      },
+      {
+        "id": "edge:thread_in_workstream:thread:t_sb_chatgpt:workstream:ws_sidetrack",
+        "kind": "thread_in_workstream",
+        "fromNodeId": "thread:t_sb_chatgpt",
+        "toNodeId": "workstream:ws_sidetrack",
+        "observedAt": "2026-05-07T09:31:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "thread.upserted",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 34
+          }
+        },
+        "confidence": "explicit"
+      },
+      {
+        "id": "edge:thread_in_workstream:thread:t_sb_claude:workstream:ws_sidetrack",
+        "kind": "thread_in_workstream",
+        "fromNodeId": "thread:t_sb_claude",
+        "toNodeId": "workstream:ws_sidetrack",
+        "observedAt": "2026-05-07T09:19:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "thread.upserted",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 19
+          }
+        },
+        "confidence": "explicit"
+      },
+      {
+        "id": "edge:thread_quotes_thread:thread:t_sb_chatgpt:thread:t_sb_claude",
+        "kind": "thread_quotes_thread",
+        "fromNodeId": "thread:t_sb_chatgpt",
+        "toNodeId": "thread:t_sb_claude",
+        "observedAt": "2026-05-07T09:31:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "capture.recorded",
+          "recordId": "0642a110e5c1",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 35
+          }
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:thread_quotes_thread:thread:t_sb_claude:thread:t_sb_chatgpt",
+        "kind": "thread_quotes_thread",
+        "fromNodeId": "thread:t_sb_claude",
+        "toNodeId": "thread:t_sb_chatgpt",
+        "observedAt": "2026-05-07T09:31:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "capture.recorded",
+          "recordId": "0642a110e5c1",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 20
+          }
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:thread_references_url:thread:t_sb_claude:timeline-visit:https://github.com/sidetrack-co/sidetrack/blob/main/BRAINSTORM.md",
+        "kind": "thread_references_url",
+        "fromNodeId": "thread:t_sb_claude",
+        "toNodeId": "timeline-visit:https://github.com/sidetrack-co/sidetrack/blob/main/BRAINSTORM.md",
+        "observedAt": "2026-05-07T09:19:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "capture.recorded",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 20
+          }
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:thread_references_url:thread:t_sb_claude:timeline-visit:https://github.com/sidetrack-co/sidetrack/pull/98",
+        "kind": "thread_references_url",
+        "fromNodeId": "thread:t_sb_claude",
+        "toNodeId": "timeline-visit:https://github.com/sidetrack-co/sidetrack/pull/98",
+        "observedAt": "2026-05-07T09:19:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "capture.recorded",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 20
+          }
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:thread_references_url:thread:t_sb_claude:timeline-visit:https://news.ycombinator.com/item?id=42_pgmerge",
+        "kind": "thread_references_url",
+        "fromNodeId": "thread:t_sb_claude",
+        "toNodeId": "timeline-visit:https://news.ycombinator.com/item?id=42_pgmerge",
+        "observedAt": "2026-05-07T09:19:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "capture.recorded",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 20
+          }
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:timeline_same_url_as_thread:timeline-visit:https://chatgpt.com/c/sb_review:thread:t_sb_chatgpt",
+        "kind": "timeline_same_url_as_thread",
+        "fromNodeId": "timeline-visit:https://chatgpt.com/c/sb_review",
+        "toNodeId": "thread:t_sb_chatgpt",
+        "observedAt": "2026-05-07T09:30:30.000Z",
+        "producedBy": {
+          "source": "timeline-projection"
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:timeline_same_url_as_thread:timeline-visit:https://claude.ai/chat/sb_thread:thread:t_sb_claude",
+        "kind": "timeline_same_url_as_thread",
+        "fromNodeId": "timeline-visit:https://claude.ai/chat/sb_thread",
+        "toNodeId": "thread:t_sb_claude",
+        "observedAt": "2026-05-07T09:18:30.000Z",
+        "producedBy": {
+          "source": "timeline-projection"
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:visit_in_workstream:timeline-visit:https://github.com/sidetrack-co/sidetrack/pull/98:workstream:ws_sidetrack",
+        "kind": "visit_in_workstream",
+        "fromNodeId": "timeline-visit:https://github.com/sidetrack-co/sidetrack/pull/98",
+        "toNodeId": "workstream:ws_sidetrack",
+        "observedAt": "2026-05-07T09:05:00.000Z",
+        "producedBy": {
+          "source": "timeline-projection"
+        },
+        "confidence": "explicit"
+      }
+    ],
+    "updatedAt": "2026-05-07T09:42:00.000Z",
+    "nodeCount": 10,
+    "edgeCount": 15
+  }
+}

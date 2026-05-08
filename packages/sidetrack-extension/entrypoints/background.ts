@@ -38,7 +38,11 @@ import {
   type ReviewDraftClientConfig,
 } from '../src/review/draftClient';
 import { drainReviewDraftOutbox } from '../src/review/outbox';
-import { initializeTimelineWiring } from '../src/timeline/wiring';
+import {
+  initializeTimelineWiring,
+  resetTimelineWiringForTests,
+  triggerTimelineDrain,
+} from '../src/timeline/wiring';
 import { createVaultChangesClient } from '../src/companion/vaultChanges';
 import { createRecallClient } from '../src/companion/recallClient';
 import { buildReviewFollowUpText } from '../src/review/draft';
@@ -2626,8 +2630,148 @@ export default defineBackground(() => {
     console.warn('[timeline] init failed:', error);
   });
 
+  // Connections graph messages — proxied to /v1/connections* with
+  // a 30 s TTL cache. Sits BEFORE the main RuntimeRequest handler
+  // because these messages have a different response shape and
+  // shouldn't go through buildState() / WorkboardState.
+  const connectionsCache = new Map<string, { value: unknown; expiresAtMs: number }>();
+  const CONNECTIONS_CACHE_TTL_MS = 30_000;
+
+  const fetchConnectionsHttp = async (path: string): Promise<{ ok: boolean; data?: unknown; error?: string }> => {
+    const settings = await readSettings();
+    const port = settings.companion.port;
+    const bridgeKey = settings.companion.bridgeKey.trim();
+    if (typeof port !== 'number' || port <= 0 || bridgeKey.length === 0) {
+      return { ok: false, error: 'companion not configured' };
+    }
+    try {
+      const res = await fetch(`http://127.0.0.1:${String(port)}${path}`, {
+        headers: { 'x-bac-bridge-key': bridgeKey },
+      });
+      if (!res.ok) {
+        return { ok: false, error: `connections HTTP ${String(res.status)}` };
+      }
+      const body = (await res.json()) as { data?: unknown };
+      return { ok: true, data: body.data };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  };
+
+  const handleConnectionsMessage = async (
+    message: Record<string, unknown>,
+  ): Promise<{ ok: boolean; data?: unknown; error?: string } | null> => {
+    const cacheKey = JSON.stringify(message);
+    const now = Date.now();
+    const cached = connectionsCache.get(cacheKey);
+    if (cached !== undefined && cached.expiresAtMs > now) {
+      return cached.value as { ok: boolean; data?: unknown };
+    }
+    let result: { ok: boolean; data?: unknown; error?: string } | null = null;
+    if (message['type'] === messageTypes.loadConnectionsSnapshot) {
+      const filters = (message['filters'] as Record<string, string> | undefined) ?? {};
+      const params = new URLSearchParams();
+      if (typeof filters['workstreamId'] === 'string') params.set('workstreamId', filters['workstreamId']);
+      if (typeof filters['nodeKind'] === 'string') params.set('nodeKind', filters['nodeKind']);
+      if (typeof filters['edgeKind'] === 'string') params.set('edgeKind', filters['edgeKind']);
+      const search = params.toString();
+      result = await fetchConnectionsHttp(`/v1/connections${search.length > 0 ? `?${search}` : ''}`);
+    } else if (message['type'] === messageTypes.loadConnectionsNeighbors) {
+      const nodeId = String(message['nodeId'] ?? '');
+      const hops = typeof message['hops'] === 'number' ? message['hops'] : 1;
+      result = await fetchConnectionsHttp(
+        `/v1/connections/nodes/${encodeURIComponent(nodeId)}/neighbors?hops=${String(hops)}`,
+      );
+    } else if (message['type'] === messageTypes.loadConnectionsEdge) {
+      const edgeId = String(message['edgeId'] ?? '');
+      result = await fetchConnectionsHttp(`/v1/connections/edges/${encodeURIComponent(edgeId)}`);
+    }
+    if (result !== null) {
+      connectionsCache.set(cacheKey, { value: result, expiresAtMs: now + CONNECTIONS_CACHE_TTL_MS });
+    }
+    return result;
+  };
+
   chrome.runtime.onMessage.addListener(
     (message: unknown, sender, sendResponse: (response: RuntimeResponse) => void) => {
+      // Re-init timeline wiring. After flipping
+      // sidetrack.timeline.enabled = true at runtime, the gate-check
+      // at SW boot has already returned early; this message resets
+      // the init guard and re-runs initializeTimelineWiring so the
+      // chrome.tabs listeners actually register without a SW reload.
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.timeline.reinit'
+      ) {
+        void (async () => {
+          resetTimelineWiringForTests();
+          await initializeTimelineWiring({
+            readCompanion: async () => {
+              const settings = await readSettings();
+              const port = settings.companion.port;
+              const bridgeKey = settings.companion.bridgeKey.trim();
+              if (typeof port !== 'number' || port <= 0 || bridgeKey.length === 0) return null;
+              return { url: `http://127.0.0.1:${String(port)}`, bridgeKey };
+            },
+          });
+        })()
+          .then(() => {
+            sendResponse({ ok: true } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'reinit failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+      // Force-drain the timeline spool. Used by e2e tests + the
+      // side-panel "drain now" affordance. No-op when timeline wiring
+      // hasn't initialized (gate off or pre-boot).
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.timeline.force-drain'
+      ) {
+        void triggerTimelineDrain()
+          .then((result) => {
+            sendResponse({ ok: true, drain: result } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'force-drain failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+      // Try the connections handler first — it has its own response shape.
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        'type' in message &&
+        ((message as { type?: unknown }).type === messageTypes.loadConnectionsSnapshot ||
+          (message as { type?: unknown }).type === messageTypes.loadConnectionsNeighbors ||
+          (message as { type?: unknown }).type === messageTypes.loadConnectionsEdge)
+      ) {
+        void handleConnectionsMessage(message as Record<string, unknown>)
+          .then((result) => {
+            // Cast: the connections response shape is intentionally
+            // different from RuntimeResponse; the side-panel client
+            // re-casts on receipt.
+            sendResponse(result as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'Connections request failed.',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+
       if (!isRuntimeRequest(message)) {
         return undefined;
       }

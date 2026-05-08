@@ -32,6 +32,11 @@ export const sidetrackToolNames = [
   'sidetrack.dispatches.list',
   'sidetrack.reviews.list',
   'sidetrack.threads.turns',
+  // Connections — read-only graph queries (Class B evidence layer).
+  'sidetrack.connections.snapshot',
+  'sidetrack.connections.neighbors',
+  'sidetrack.connections.edge',
+  'sidetrack.connections.find_path',
 ] as const;
 
 export type SidetrackToolName = (typeof sidetrackToolNames)[number];

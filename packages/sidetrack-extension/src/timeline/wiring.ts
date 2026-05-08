@@ -44,6 +44,13 @@ const DRAIN_PERIOD_MIN = 1; // every minute when companion reachable
 // turn on just because the contract can support it.
 export const TIMELINE_ENABLED_KEY = 'sidetrack.timeline.enabled';
 
+// Settings key for the user's currently-focused workstream. When
+// set, the timeline observer stamps it onto every browser.timeline.
+// observed event so the connections graph can attribute ambient
+// browsing to the right flow without requiring a paste / annotation.
+// Phase 4 — Active-workstream attribution.
+export const ACTIVE_WORKSTREAM_KEY = 'sidetrack.activeWorkstreamId';
+
 interface TimelineEnabledStorage {
   readonly get: (key: string) => Promise<Record<string, unknown>>;
   readonly set: (entries: Record<string, unknown>) => Promise<void>;
@@ -96,6 +103,43 @@ const fnv1a64 = (input: string): string => {
   return h.toString(16).padStart(16, '0');
 };
 
+// Cached active workstream id read from chrome.storage. The
+// observer's emit hot path needs a synchronous resolver; we read
+// once at boot, then refresh on chrome.storage.onChanged. Set to
+// undefined when no workstream is focused.
+let cachedActiveWorkstreamId: string | undefined;
+
+const refreshActiveWorkstreamCache = async (): Promise<void> => {
+  try {
+    const got = await getStorage().get(ACTIVE_WORKSTREAM_KEY);
+    const v = got[ACTIVE_WORKSTREAM_KEY];
+    cachedActiveWorkstreamId = typeof v === 'string' && v.length > 0 ? v : undefined;
+  } catch {
+    cachedActiveWorkstreamId = undefined;
+  }
+};
+
+const startActiveWorkstreamCache = (): void => {
+  void refreshActiveWorkstreamCache();
+  const c = (globalThis as unknown as {
+    chrome?: {
+      storage?: {
+        onChanged?: {
+          addListener: (
+            listener: (changes: Record<string, { newValue?: unknown }>) => void,
+          ) => void;
+        };
+      };
+    };
+  }).chrome;
+  c?.storage?.onChanged?.addListener((changes) => {
+    if (Object.prototype.hasOwnProperty.call(changes, ACTIVE_WORKSTREAM_KEY)) {
+      const v = changes[ACTIVE_WORKSTREAM_KEY]?.newValue;
+      cachedActiveWorkstreamId = typeof v === 'string' && v.length > 0 ? v : undefined;
+    }
+  });
+};
+
 const buildObserver = (replica: EdgeReplica): TimelineObserver => {
   const salt = replica.edgeReplicaId;
   return createTimelineObserver({
@@ -107,6 +151,7 @@ const buildObserver = (replica: EdgeReplica): TimelineObserver => {
         .admitLocal(observationFromPayload(payload), 'passive')
         .catch(() => undefined);
     },
+    getActiveWorkstreamId: () => cachedActiveWorkstreamId,
     hashTabId: (tabId, windowId) =>
       fnv1a64(`${salt}|tab|${String(tabId)}|${String(windowId)}`).slice(0, 16),
     hashWindowId: (windowId) =>
@@ -142,6 +187,10 @@ interface InitDeps {
   readonly readCompanion: () => Promise<{ url: string; bridgeKey: string } | null>;
 }
 
+// Captured at init() so external triggerTimelineDrain() can run the
+// same drain path (used by tests + a side-panel "drain now" path).
+let capturedInitDeps: InitDeps | null = null;
+
 const tryDrain = async (deps: InitDeps): Promise<{ uploaded: number; remaining: number }> => {
   const companion = await deps.readCompanion();
   if (companion === null || companion.url.trim().length === 0) {
@@ -175,6 +224,19 @@ const tryDrain = async (deps: InitDeps): Promise<{ uploaded: number; remaining: 
   }
 };
 
+// External trigger — runs the same try-drain path that the periodic
+// alarm runs. Returns { uploaded, remaining } when wiring has been
+// initialized; resolves to a zero-effect result otherwise (init
+// hasn't run because the timeline gate is off, or the SW just
+// booted and hasn't initialized yet).
+export const triggerTimelineDrain = async (): Promise<{
+  uploaded: number;
+  remaining: number;
+}> => {
+  if (capturedInitDeps === null) return { uploaded: 0, remaining: 0 };
+  return await tryDrain(capturedInitDeps);
+};
+
 export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> => {
   if (initialized) return;
   // Gate first — if the user hasn't opted in, register nothing.
@@ -186,6 +248,13 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
   // actually wires it up.
   if (!(await isTimelineEnabled())) return;
   initialized = true;
+  capturedInitDeps = deps;
+
+  // Phase 4: keep the active-workstream-id cache hot before the
+  // observer starts emitting. Reads chrome.storage once, then
+  // listens for chrome.storage.onChanged so subsequent panel
+  // updates take effect on the next emit.
+  startActiveWorkstreamCache();
 
   const replica = await loadOrCreateEdgeReplica();
   const observer = buildObserver(replica);
