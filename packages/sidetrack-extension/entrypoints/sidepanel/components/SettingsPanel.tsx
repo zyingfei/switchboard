@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { WorkstreamNode } from '../../../src/workboard';
+import { CollectorsSection } from './CollectorsSection';
+import type { CollectorStatus } from './CollectorsSection';
 import { Modal } from './Modal';
 import {
   AppearanceSection,
@@ -102,6 +104,8 @@ export interface SettingsPanelProps {
   // those sections degrade to local-only state with TODO logging.
   readonly companionPort?: number | null;
   readonly bridgeKey?: string | null;
+  readonly collectors?: readonly CollectorStatus[];
+  readonly onCollectorReplay?: (id: string) => Promise<void>;
   // Save edits to the loopback connection (port + bridge key). Wires
   // straight into the App.tsx debounced settings auto-save. Optional
   // so legacy embeddings of this panel keep working in read-only
@@ -169,6 +173,8 @@ export function SettingsPanel({
   onDensityChange,
   companionPort,
   bridgeKey,
+  collectors = [],
+  onCollectorReplay = async () => undefined,
   onSaveCompanionConnection,
 }: SettingsPanelProps) {
   // Helper for companion-backed sections. Returns null on missing
@@ -1130,6 +1136,7 @@ export function SettingsPanel({
             .catch(() => undefined);
         }}
       />
+      <CollectorsSection collectors={collectors} onReplay={onCollectorReplay} />
       <BucketsSection
         buckets={buckets}
         onRemove={(id) => {
