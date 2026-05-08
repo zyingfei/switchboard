@@ -34,9 +34,20 @@ const COMPANION_EMITTED_KINDS: readonly string[] = [
   'dispatch_references_url',
   'annotation_references_url',
   'thread_quotes_thread',
+  'thread_text_mentions_search_query',
+  'visit_resembles_visit',
+  'visit_in_workstream',
   'visit_in_topic',
   'topic_in_workstream',
   'topic.lineage',
+  'snippet_copied_from_visit',
+  'snippet_pasted_into_thread',
+  'snippet_pasted_into_dispatch',
+  'snippet_pasted_into_search',
+  'snippet_pasted_into_note',
+  'snippet_pasted_into_capture',
+  'snippet_reused_across_threads',
+  'visit_observed_on_replica',
 ];
 
 const NODE_KIND_FOR_PREFIX: Record<string, string> = {
@@ -48,6 +59,9 @@ const NODE_KIND_FOR_PREFIX: Record<string, string> = {
   'coding-session': 'coding-session',
   'timeline-visit': 'timeline-visit',
   annotation: 'annotation',
+  snippet: 'snippet',
+  topic: 'topic',
+  replica: 'replica',
 };
 
 // Per edge kind: synthetic from/to node ids + node kinds. Picks
@@ -74,17 +88,32 @@ const EDGE_FIXTURES: ReadonlyArray<{
   { kind: 'dispatch_references_url', from: { id: 'dispatch:d_codex', kind: 'dispatch' }, to: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' } },
   { kind: 'annotation_references_url', from: { id: 'annotation:a1', kind: 'annotation' }, to: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' } },
   { kind: 'thread_quotes_thread', from: { id: 'thread:t_chatgpt', kind: 'thread' }, to: { id: 'thread:t_anchor', kind: 'thread' } },
+  { kind: 'thread_text_mentions_search_query', from: { id: 'thread:t_anchor', kind: 'thread' }, to: { id: 'timeline-visit:https://www.google.com/search?q=copy+fail', kind: 'timeline-visit' } },
+  { kind: 'visit_resembles_visit', from: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' }, to: { id: 'timeline-visit:https://example.com/related', kind: 'timeline-visit' } },
+  { kind: 'visit_in_workstream', from: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' }, to: { id: 'workstream:ws_research', kind: 'workstream' } },
   { kind: 'visit_in_topic', from: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' }, to: { id: 'topic:topic:abc123', kind: 'topic' } },
   { kind: 'topic_in_workstream', from: { id: 'topic:topic:abc123', kind: 'topic' }, to: { id: 'workstream:ws_research', kind: 'workstream' } },
   { kind: 'topic.lineage', from: { id: 'topic:topic:old', kind: 'topic' }, to: { id: 'topic:topic:abc123', kind: 'topic' } },
+  { kind: 'snippet_copied_from_visit', from: { id: 'snippet:s1', kind: 'snippet' }, to: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' } },
+  { kind: 'snippet_pasted_into_thread', from: { id: 'snippet:s1', kind: 'snippet' }, to: { id: 'thread:t_anchor', kind: 'thread' } },
+  { kind: 'snippet_pasted_into_dispatch', from: { id: 'snippet:s1', kind: 'snippet' }, to: { id: 'dispatch:d_codex', kind: 'dispatch' } },
+  { kind: 'snippet_pasted_into_search', from: { id: 'snippet:s1', kind: 'snippet' }, to: { id: 'timeline-visit:https://www.google.com/search?q=copy+fail', kind: 'timeline-visit' } },
+  { kind: 'snippet_pasted_into_note', from: { id: 'snippet:s1', kind: 'snippet' }, to: { id: 'annotation:a1', kind: 'annotation' } },
+  { kind: 'snippet_pasted_into_capture', from: { id: 'snippet:s1', kind: 'snippet' }, to: { id: 'annotation:capture1', kind: 'annotation' } },
+  { kind: 'snippet_reused_across_threads', from: { id: 'snippet:s1', kind: 'snippet' }, to: { id: 'thread:t_chatgpt', kind: 'thread' } },
+  { kind: 'visit_observed_on_replica', from: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' }, to: { id: 'replica:replica-A', kind: 'replica' } },
 ];
 
 const confidenceForKind = (kind: string): 'asserted' | 'observed' | 'inferred' => {
   if (
     kind === 'timeline_same_url_as_thread' ||
     kind === 'thread_quotes_thread' ||
+    kind === 'thread_text_mentions_search_query' ||
+    kind === 'visit_resembles_visit' ||
+    kind === 'visit_in_workstream' ||
     kind === 'visit_in_topic' ||
-    kind === 'topic_in_workstream'
+    kind === 'topic_in_workstream' ||
+    kind === 'snippet_reused_across_threads'
   ) {
     return 'inferred';
   }
@@ -92,7 +121,9 @@ const confidenceForKind = (kind: string): 'asserted' | 'observed' | 'inferred' =
     kind === 'dispatch_reply_landed_in_thread' ||
     kind === 'annotation_targets_thread' ||
     kind.endsWith('_references_url') ||
-    kind === 'topic.lineage'
+    kind === 'topic.lineage' ||
+    kind.startsWith('snippet_') ||
+    kind === 'visit_observed_on_replica'
   ) {
     return 'observed';
   }
@@ -157,14 +188,25 @@ describe('connections — edge metadata completeness', () => {
     }
   });
 
-  it('content-derived hints fire only for *_references_url and thread_quotes_thread', () => {
+  it('content-derived hints cover URL, similarity, workstream, replica, and snippet edges', () => {
     const hinted = COMPANION_EMITTED_KINDS.filter((k) => contentDerivedHint(k) !== null).sort();
     expect(hinted).toEqual(
       [
         'annotation_references_url',
         'dispatch_references_url',
+        'snippet_copied_from_visit',
+        'snippet_pasted_into_capture',
+        'snippet_pasted_into_dispatch',
+        'snippet_pasted_into_note',
+        'snippet_pasted_into_search',
+        'snippet_pasted_into_thread',
+        'snippet_reused_across_threads',
         'thread_quotes_thread',
+        'thread_text_mentions_search_query',
         'thread_references_url',
+        'visit_in_workstream',
+        'visit_observed_on_replica',
+        'visit_resembles_visit',
       ].sort(),
     );
   });

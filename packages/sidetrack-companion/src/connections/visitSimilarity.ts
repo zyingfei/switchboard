@@ -303,16 +303,18 @@ export const buildVisitSimilarity = async (
     const queryVector = queryVectors[sourceIndex];
     if (queryVector === undefined) continue;
     const candidateEntries = indexEntries.filter((entry) => entry.id !== source.visitKey);
-    const ranked = rankHybrid(
-      source.corpus,
-      queryVector,
-      candidateEntries,
-      new Date(source.lastSeenAt),
-      {
-        limit: topK,
-        lexical: buildLexicalIndex(candidateEntries),
-      },
-    ).sort((left, right) => {
+    const ranked = [
+      ...rankHybrid(
+        source.corpus,
+        queryVector,
+        candidateEntries,
+        new Date(source.lastSeenAt),
+        {
+          limit: topK,
+          lexical: buildLexicalIndex(candidateEntries),
+        },
+      ),
+    ].sort((left, right) => {
       if (right.similarity !== left.similarity) return right.similarity - left.similarity;
       return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
     });

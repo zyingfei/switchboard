@@ -682,7 +682,7 @@ on any outbound LLM-shaped request (`*ollama*`, `*openai*`, `*anthropic*`,
 | 3 | Supervised feedback loop on user accepts/rejects; producer-versioned Class E revisions | Stage 2 in production with telemetry |
 | Future | Optional cloud-LLM enhancement (user supplies their own API key) for label, Why Related, and Context Pack *prose* surfaces | Class E revision pattern from Stage 1 makes this purely additive — existing deterministic surfaces remain available as fallback |
 | Future | Cross-replica continuation classifier (the *inference* edge atop `visit_observed_on_replica`) | Ground-truth dataset + Stage 2 ranker |
-| Future | ANN indexes (USearch / hnswlib / Faiss) | Cosine retrieval over flat float32 stops being interactive on the user's own corpus |
+| Future | Dedicated ANN indexes | Cosine retrieval over flat float32 stops being interactive on the user's own corpus |
 | Future | HDBSCAN / centroid-stable clustering | Topic id churn from Union-Find becomes a measured user complaint |
 | Future | Visual fingerprinting / DOM / screenshot pHash | Need for visual revisitation that text embeddings do not solve |
 
@@ -833,7 +833,7 @@ Stage 1 must not duplicate or wrap these production components.
    pinned model revision, chunk schema version, schema capabilities, per-entry
    metadata, replica id, Lamport, tombstones, deterministic canonical ordering,
    source-scoped replacement. Stage 1 inserts visit embeddings through this path.
-   Do not introduce `sqlite-vec`, `hnswlib`, USearch, or Faiss.
+   Do not introduce additional vector-store or ANN packages.
 3. **MiniSearch + cosine + RRF hybrid retrieval.** With title/heading/text field
    weights and dotted-identifier tokenization. Stage 1 uses this for the candidate
    set in 1.C and for the `LEXICAL_OVERLAP` reason in 1.I. Keep the existing fixed
@@ -870,11 +870,11 @@ Stage 1 must not duplicate or wrap these production components.
 - Debug-pack MCP tool.
 - Visual fingerprinting / DOM hash / screenshot perceptual hash.
 - HDBSCAN, Leiden, or other centroid-stable clustering.
-- SQLite FTS5, sqlite-vec, DuckDB feature store.
+- Additional SQL/vector feature-store packages.
 - Cross-replica continuation classifier (the inference edge atop 1.E).
 - **Local LLM inference of any kind** — Ollama, llama.cpp, MLX runtime, Llama 3.2,
   Qwen 2.5, Phi, Gemma, SmolLM, EmbeddingGemma 300M, Nomic Embed v2.
-- New ANN libraries (USearch, hnswlib, Faiss).
+- New ANN libraries.
 - New embedding models (bge, Nomic, EmbeddingGemma) — keep the existing
   `multilingual-e5-small`.
 - Optional cloud-LLM prose enhancement (deferred; the Class E revision pattern in
@@ -1423,9 +1423,7 @@ cd packages/sidetrack-companion
 SIDETRACK_TEST_EMBEDDER=1 ./node_modules/.bin/vitest run src/connections/visitSimilarity.test.ts \
   src/sync/contract/connectionsMaterializer.test.ts                              # all green
 ./node_modules/.bin/tsc --noEmit -p tsconfig.json                                # silent
-git diff --name-only main..HEAD | xargs grep -l 'sqlite-vec\|hnswlib\|usearch\|faiss\|@xenova/bge\|nomic-embed' 2>/dev/null
-                                                                                 # 0 matches
-git diff main..HEAD -- packages/sidetrack-companion/package.json                 # no new deps in dependencies
+git diff main..HEAD -- packages/sidetrack-companion/package.json                 # no new vector/ANN/embedding deps
 git diff main..HEAD -- packages/sidetrack-extension/package.json                 # no new deps
 ```
 

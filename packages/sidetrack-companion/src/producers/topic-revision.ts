@@ -120,7 +120,15 @@ export const parseTopicRevision = (value: unknown): TopicRevision | null => {
   ) {
     return null;
   }
-  return value;
+  return {
+    revisionId: value['revisionId'],
+    visitSimilarityRevisionId: value['visitSimilarityRevisionId'],
+    cosineThreshold: value['cosineThreshold'],
+    algorithmVersion: value['algorithmVersion'],
+    topics: value['topics'],
+    lineage: value['lineage'],
+    producedAt: value['producedAt'],
+  };
 };
 
 export interface TopicRevisionStore {

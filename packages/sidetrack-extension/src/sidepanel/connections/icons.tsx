@@ -67,6 +67,31 @@ export const KindIcons: Record<ConnectionNodeKind, ReactElement> = {
       <path d="M7 17h5" />
     </svg>
   ),
+  snippet: (
+    <svg {...baseProps}>
+      <path d="M7 5h10a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z" />
+      <path d="M9 9h6" />
+      <path d="M9 13h4" />
+      <path d="M15 15l2 2" />
+    </svg>
+  ),
+  topic: (
+    <svg {...baseProps}>
+      <circle cx="12" cy="6" r="3" />
+      <circle cx="6" cy="17" r="3" />
+      <circle cx="18" cy="17" r="3" />
+      <path d="M10.6 8.7 7.4 14.3" />
+      <path d="M13.4 8.7 16.6 14.3" />
+      <path d="M9 17h6" />
+    </svg>
+  ),
+  replica: (
+    <svg {...baseProps}>
+      <path d="M7 6c0-1.7 2.2-3 5-3s5 1.3 5 3-2.2 3-5 3-5-1.3-5-3z" />
+      <path d="M7 6v6c0 1.7 2.2 3 5 3s5-1.3 5-3V6" />
+      <path d="M7 12v6c0 1.7 2.2 3 5 3s5-1.3 5-3v-6" />
+    </svg>
+  ),
 };
 
 export const SearchIcon = (
