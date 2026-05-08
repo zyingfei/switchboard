@@ -121,6 +121,7 @@ export type ConnectionEdgeKind =
   | 'snippet_pasted_into_capture'
   | 'snippet_reused_across_threads'
   | 'visit_observed_on_replica'
+  | 'visit_continues_visit'
   | 'visit_in_template';
 
 export type ConnectionEdgeSource =
@@ -138,7 +139,8 @@ type RevisionProducedBySource =
   | 'visit-similarity'
   | 'topic-clusterer'
   | 'engagement-classifier'
-  | 'snippet-lineage';
+  | 'snippet-lineage'
+  | 'continuation-classifier';
 
 export type ConnectionEdgeProducedBy =
   | {
