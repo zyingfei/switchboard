@@ -41,6 +41,8 @@ import { drainReviewDraftOutbox } from '../src/review/outbox';
 import {
   initializeTimelineWiring,
   resetTimelineWiringForTests,
+  TIMELINE_ENABLED_KEY,
+  TIMELINE_PRIVACY_GATE,
   triggerTimelineDrain,
 } from '../src/timeline/wiring';
 import { createVaultChangesClient } from '../src/companion/vaultChanges';
@@ -256,6 +258,147 @@ const hostFromUrl = (url: string): string => {
   } catch {
     return 'current tab';
   }
+};
+
+const PRIVACY_GATE_FLIPPED = 'privacy.gate.flipped';
+const PRIVACY_PERMISSION_GRANTED = 'privacy.permission.granted';
+const PRIVACY_PERMISSION_REVOKED = 'privacy.permission.revoked';
+const TIMELINE_HOST_PERMISSION = 'timeline.hostAccess';
+const TIMELINE_HOST_PERMISSION_SCOPE = { origins: ['https://*/*', 'http://*/*'] } as const;
+
+interface PrivacyProjectionPayload {
+  readonly gateStates?: Record<string, 'open' | 'closed'>;
+  readonly gateEventCount?: number;
+}
+
+const isObjectRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const readTimelineCompanionConfig = async (): Promise<{ url: string; bridgeKey: string } | null> => {
+  const settings = await readSettings();
+  const port = settings.companion.port;
+  const bridgeKey = settings.companion.bridgeKey.trim();
+  if (typeof port !== 'number' || port <= 0 || bridgeKey.length === 0) return null;
+  return { url: `http://127.0.0.1:${String(port)}`, bridgeKey };
+};
+
+const companionJson = async (
+  path: string,
+  init: RequestInit = {},
+): Promise<unknown> => {
+  const config = await readTimelineCompanionConfig();
+  if (config === null) throw new Error('companion not configured');
+  const headers = new Headers(init.headers);
+  headers.set('content-type', 'application/json');
+  headers.set('x-bac-bridge-key', config.bridgeKey);
+  const response = await fetch(`${config.url}${path}`, { ...init, headers });
+  const body = (await response.json()) as unknown;
+  if (!response.ok) {
+    const message = isObjectRecord(body) && typeof body['title'] === 'string'
+      ? body['title']
+      : `companion HTTP ${String(response.status)}`;
+    throw new Error(message);
+  }
+  return body;
+};
+
+const readPrivacyProjection = async (): Promise<PrivacyProjectionPayload> => {
+  const body = await companionJson('/v1/privacy/projection', { method: 'GET' });
+  const data = isObjectRecord(body) ? body['data'] : undefined;
+  if (!isObjectRecord(data)) return {};
+  const gateStates = isObjectRecord(data['gateStates']) ? data['gateStates'] : undefined;
+  return {
+    ...(gateStates === undefined ? {} : { gateStates: gateStates as Record<string, 'open' | 'closed'> }),
+    ...(typeof data['gateEventCount'] === 'number' ? { gateEventCount: data['gateEventCount'] } : {}),
+  };
+};
+
+const isTimelinePrivacyGateOpen = async (): Promise<boolean> => {
+  try {
+    const projection = await readPrivacyProjection();
+    return projection.gateStates?.[TIMELINE_PRIVACY_GATE] === 'open';
+  } catch {
+    return false;
+  }
+};
+
+const appendPrivacyEvent = async (
+  type: string,
+  payload: Record<string, unknown>,
+  idempotencySuffix: string,
+): Promise<void> => {
+  await companionJson('/v1/privacy/events', {
+    method: 'POST',
+    headers: { 'idempotency-key': idempotencyKey('privacy', idempotencySuffix) },
+    body: JSON.stringify({ type, payload }),
+  });
+};
+
+const readLegacyTimelineEnabled = async (): Promise<boolean | undefined> => {
+  try {
+    const got = await chrome.storage.local.get(TIMELINE_ENABLED_KEY);
+    const value = got[TIMELINE_ENABLED_KEY];
+    return typeof value === 'boolean' ? value : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const bootstrapTimelinePrivacyGate = async (): Promise<void> => {
+  const legacyTimelineEnabled = await readLegacyTimelineEnabled();
+  if (legacyTimelineEnabled === undefined) return;
+  const projection = await readPrivacyProjection();
+  if (projection.gateStates?.[TIMELINE_PRIVACY_GATE] !== undefined) return;
+  await appendPrivacyEvent(
+    PRIVACY_GATE_FLIPPED,
+    {
+      gate: TIMELINE_PRIVACY_GATE,
+      state: legacyTimelineEnabled ? 'open' : 'closed',
+      actor: 'system',
+      reason: 'migration-shim',
+      payloadVersion: 1,
+    },
+    `migration-${TIMELINE_PRIVACY_GATE}`,
+  );
+};
+
+const setTimelinePrivacyGate = async (enabled: boolean): Promise<void> => {
+  await appendPrivacyEvent(
+    PRIVACY_GATE_FLIPPED,
+    {
+      gate: TIMELINE_PRIVACY_GATE,
+      state: enabled ? 'open' : 'closed',
+      actor: 'user',
+      reason: 'user-toggle',
+      payloadVersion: 1,
+    },
+    `${TIMELINE_PRIVACY_GATE}-${enabled ? 'open' : 'closed'}-${String(Date.now())}`,
+  );
+};
+
+const recordTimelinePermissionGranted = async (): Promise<void> => {
+  await appendPrivacyEvent(
+    PRIVACY_PERMISSION_GRANTED,
+    {
+      permission: TIMELINE_HOST_PERMISSION,
+      scope: TIMELINE_HOST_PERMISSION_SCOPE,
+      payloadVersion: 1,
+    },
+    `${TIMELINE_HOST_PERMISSION}-granted-${String(Date.now())}`,
+  );
+};
+
+const recordTimelinePermissionRevoked = async (): Promise<void> => {
+  await appendPrivacyEvent(
+    PRIVACY_PERMISSION_REVOKED,
+    {
+      permission: TIMELINE_HOST_PERMISSION,
+      scope: TIMELINE_HOST_PERMISSION_SCOPE,
+      retroactiveMask: false,
+      payloadVersion: 1,
+    },
+    `${TIMELINE_HOST_PERMISSION}-revoked-${String(Date.now())}`,
+  );
 };
 
 const notifyCaptureSuccess = async (event: CaptureEvent): Promise<void> => {
@@ -2618,15 +2761,13 @@ export default defineBackground(() => {
   // Sync Contract v1 / Class F — bind chrome.tabs to the timeline
   // observer + materializer + drainer. Idempotent on repeated boots
   // (chrome.alarms.create replaces; the wiring guards init).
-  void initializeTimelineWiring({
-    readCompanion: async () => {
-      const settings = await readSettings();
-      const port = settings.companion.port;
-      const bridgeKey = settings.companion.bridgeKey.trim();
-      if (typeof port !== 'number' || port <= 0 || bridgeKey.length === 0) return null;
-      return { url: `http://127.0.0.1:${String(port)}`, bridgeKey };
-    },
-  }).catch((error: unknown) => {
+  void (async () => {
+    await bootstrapTimelinePrivacyGate().catch(() => undefined);
+    await initializeTimelineWiring({
+      readCompanion: readTimelineCompanionConfig,
+      readTimelineGateState: isTimelinePrivacyGateOpen,
+    });
+  })().catch((error: unknown) => {
     console.warn('[timeline] init failed:', error);
   });
 
@@ -2694,26 +2835,101 @@ export default defineBackground(() => {
 
   chrome.runtime.onMessage.addListener(
     (message: unknown, sender, sendResponse: (response: RuntimeResponse) => void) => {
-      // Re-init timeline wiring. After flipping
-      // sidetrack.timeline.enabled = true at runtime, the gate-check
-      // at SW boot has already returned early; this message resets
-      // the init guard and re-runs initializeTimelineWiring so the
-      // chrome.tabs listeners actually register without a SW reload.
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.timeline.privacy.get'
+      ) {
+        void isTimelinePrivacyGateOpen()
+          .then((enabled) => {
+            sendResponse({ ok: true, enabled } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'privacy gate read failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.timeline.privacy.set'
+      ) {
+        const enabled = (message as { enabled?: unknown }).enabled === true;
+        void (async () => {
+          await setTimelinePrivacyGate(enabled);
+          resetTimelineWiringForTests();
+          await initializeTimelineWiring({
+            readCompanion: readTimelineCompanionConfig,
+            readTimelineGateState: isTimelinePrivacyGateOpen,
+          });
+        })()
+          .then(() => {
+            sendResponse({ ok: true, enabled } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'privacy gate write failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.timeline.permission.granted'
+      ) {
+        void recordTimelinePermissionGranted()
+          .then(() => {
+            sendResponse({ ok: true } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'permission grant event failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.timeline.permission.revoked'
+      ) {
+        void recordTimelinePermissionRevoked()
+          .then(() => {
+            sendResponse({ ok: true } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'permission revoke event failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+
+      // Re-init timeline wiring. After a legacy sidetrack.timeline.enabled
+      // seed or a privacy.gate.flipped write, this resets the init guard
+      // and re-runs initializeTimelineWiring so chrome.tabs listeners
+      // register without a SW reload.
       if (
         message !== null &&
         typeof message === 'object' &&
         (message as { type?: unknown }).type === 'sidetrack.timeline.reinit'
       ) {
         void (async () => {
+          await bootstrapTimelinePrivacyGate().catch(() => undefined);
           resetTimelineWiringForTests();
           await initializeTimelineWiring({
-            readCompanion: async () => {
-              const settings = await readSettings();
-              const port = settings.companion.port;
-              const bridgeKey = settings.companion.bridgeKey.trim();
-              if (typeof port !== 'number' || port <= 0 || bridgeKey.length === 0) return null;
-              return { url: `http://127.0.0.1:${String(port)}`, bridgeKey };
-            },
+            readCompanion: readTimelineCompanionConfig,
+            readTimelineGateState: isTimelinePrivacyGateOpen,
           });
         })()
           .then(() => {

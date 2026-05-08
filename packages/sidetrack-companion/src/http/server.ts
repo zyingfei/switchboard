@@ -39,6 +39,15 @@ import {
 } from '../annotations/events.js';
 import { projectAnnotations } from '../annotations/projection.js';
 import {
+  isPrivacyGateFlippedPayload,
+  isPrivacyPermissionGrantedPayload,
+  isPrivacyPermissionRevokedPayload,
+  PRIVACY_GATE_FLIPPED,
+  PRIVACY_PERMISSION_GRANTED,
+  PRIVACY_PERMISSION_REVOKED,
+} from '../privacy/events.js';
+import { projectPrivacy } from '../privacy/projection.js';
+import {
   appendEntry as appendEntryRaw,
   gcEntries as gcEntriesRaw,
   readIndex,
@@ -891,6 +900,29 @@ const objectRecord = (value: unknown): Record<string, unknown> | undefined =>
     ? (value as Record<string, unknown>)
     : undefined;
 
+const PRIVACY_AGGREGATE_ID = 'privacy';
+
+const isPrivacyEventType = (value: unknown): value is
+  | typeof PRIVACY_GATE_FLIPPED
+  | typeof PRIVACY_PERMISSION_GRANTED
+  | typeof PRIVACY_PERMISSION_REVOKED =>
+  value === PRIVACY_GATE_FLIPPED ||
+  value === PRIVACY_PERMISSION_GRANTED ||
+  value === PRIVACY_PERMISSION_REVOKED;
+
+const isPrivacyPayloadForType = (
+  type: string,
+  payload: unknown,
+): payload is Record<string, unknown> => {
+  if (type === PRIVACY_GATE_FLIPPED) return isPrivacyGateFlippedPayload(payload);
+  if (type === PRIVACY_PERMISSION_GRANTED) return isPrivacyPermissionGrantedPayload(payload);
+  if (type === PRIVACY_PERMISSION_REVOKED) return isPrivacyPermissionRevokedPayload(payload);
+  return false;
+};
+
+const privacyEventsFrom = (events: readonly import('../sync/causal.js').AcceptedEvent[]) =>
+  events.filter((event) => isPrivacyEventType(event.type));
+
 const parseThreadUpsertBody = async (vaultRoot: string, body: unknown) => {
   const full = threadUpsertSchema.safeParse(body);
   if (full.success) {
@@ -1066,6 +1098,66 @@ const routes: readonly RouteDefinition[] = [
     pattern: /^\/v1\/vault\/changes$/,
     authRequired: true,
     handle: () => Promise.resolve([500, { data: { error: 'stream route was not intercepted' } }]),
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/privacy\/projection$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      return [200, { data: projectPrivacy(privacyEventsFrom(await context.eventLog.readMerged())) }];
+    },
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/privacy\/events$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const eventLog = context.eventLog;
+      const idempotencyKey = requireIdempotencyKey(request);
+      return await runIdempotent(context, 'privacyEvent', idempotencyKey, async () => {
+        const body = objectRecord(await readBody(request));
+        const type = body?.['type'];
+        const payload = body?.['payload'];
+        if (!isPrivacyEventType(type) || !isPrivacyPayloadForType(type, payload)) {
+          throw new HttpRouteError(
+            400,
+            'VALIDATION_ERROR',
+            'Validation failed.',
+            'Body must be a valid privacy event envelope.',
+          );
+        }
+        const accepted = await eventLog.appendClient({
+          clientEventId: idempotencyKey,
+          aggregateId: PRIVACY_AGGREGATE_ID,
+          type,
+          payload,
+          baseVector: await baseVectorForAggregate(eventLog, PRIVACY_AGGREGATE_ID),
+        });
+        return [
+          201,
+          {
+            data: {
+              accepted,
+              projection: projectPrivacy(privacyEventsFrom(await eventLog.readMerged())),
+            },
+          },
+        ];
+      });
+    },
   },
   {
     method: 'GET',
