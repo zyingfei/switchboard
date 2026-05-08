@@ -130,6 +130,14 @@ const reviewDraftEntries: readonly ContractEntry[] = REVIEW_DRAFT_EVENT_TYPES.ma
   (eventType) => projectionEntry(eventType, 'review-draft-projection'),
 );
 
+const engagementClassProjectionSurface: SurfaceContract = {
+  surface: 'engagement-class-projection',
+  class: 'extraction-revision',
+  materializer: 'connections',
+  peerFreshnessMs: 30_000,
+  recovery: 'replay-event-log',
+};
+
 export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   // Class A — aggregate projections.
   projectionEntry(THREAD_UPSERTED, 'thread-projection'),
@@ -351,6 +359,7 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
         peerFreshnessMs: 30_000,
         recovery: 'replay-event-log',
       },
+      engagementClassProjectionSurface,
     ],
   },
   {
@@ -365,6 +374,7 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
         peerFreshnessMs: 30_000,
         recovery: 'replay-event-log',
       },
+      engagementClassProjectionSurface,
     ],
   },
   {
@@ -379,6 +389,7 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
         peerFreshnessMs: 30_000,
         recovery: 'replay-event-log',
       },
+      engagementClassProjectionSurface,
     ],
   },
   {

@@ -32,6 +32,7 @@ import {
   WORKSTREAM_UPSERTED,
   isWorkstreamUpsertedPayload,
 } from '../workstreams/events.js';
+import type { EngagementClassRevision } from './engagementClassifier.js';
 import { findThreadQuotes, type ThreadText } from './quoteIndex.js';
 import {
   edgeIdFor,
@@ -170,6 +171,7 @@ export interface ConnectionsInput {
   readonly topicRevision?: TopicRevision;
   readonly topicWorkstreamShareThreshold?: number;
   readonly crossReplica?: CrossReplicaMaterialization;
+  readonly engagementClassRevision?: EngagementClassRevision;
   readonly scope?: ConnectionsSnapshotScope;
 }
 
@@ -724,6 +726,17 @@ export const buildConnectionsSnapshot = (
   }
   // Add timeline visit nodes; emit timeline_same_url_as_thread edges
   // when there's a thread match.
+  const engagementClassByCanonicalUrl = new Map<
+    string,
+    EngagementClassRevision['classifications'][number]
+  >();
+  for (const classification of input.engagementClassRevision?.classifications ?? []) {
+    engagementClassByCanonicalUrl.set(
+      stripFragmentAndTrailingSlash(classification.canonicalUrl),
+      classification,
+    );
+  }
+
   for (const day of input.timelineDays) {
     trackObservedAt(day.updatedAt);
     for (const entry of day.entries) {
@@ -739,6 +752,7 @@ export const buildConnectionsSnapshot = (
       const searchInfo = detectSearchUrl(entry.canonicalUrl ?? entry.url);
       const searchQuery =
         searchInfo === null ? undefined : searchInfo.query.trim().toLowerCase();
+      const engagementClass = engagementClassByCanonicalUrl.get(visitKey);
       upsertNode(nodes, {
         kind: 'timeline-visit',
         key: visitKey,
@@ -751,6 +765,9 @@ export const buildConnectionsSnapshot = (
           provider: entry.provider,
           visitCount: entry.visitCount,
           ...(searchQuery === undefined ? {} : { searchQuery }),
+          ...(engagementClass === undefined
+            ? {}
+            : { engagement: { class: engagementClass.class } }),
           ...(entry.workstreamId === undefined ? {} : { workstreamId: entry.workstreamId }),
         },
       });
