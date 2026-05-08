@@ -45,6 +45,11 @@ import {
   TIMELINE_PRIVACY_GATE,
   triggerTimelineDrain,
 } from '../src/timeline/wiring';
+import {
+  createTabOpenerStore,
+  registerTabLifecycleListeners,
+} from '../src/background/listeners/tabs';
+import { registerDefaultWebNavigationListeners } from '../src/background/listeners/web-navigation';
 import { createVaultChangesClient } from '../src/companion/vaultChanges';
 import { createRecallClient } from '../src/companion/recallClient';
 import { buildReviewFollowUpText } from '../src/review/draft';
@@ -2634,6 +2639,10 @@ const detectCodingAttachForTab = async (tabId: number, url: string): Promise<voi
 };
 
 export default defineBackground(() => {
+  const tabOpenerStore = createTabOpenerStore();
+  registerTabLifecycleListeners(chrome.tabs, tabOpenerStore);
+  registerDefaultWebNavigationListeners(tabOpenerStore);
+
   // Drop reminders bound to thread bac_ids that no longer exist.
   // Cleanup pass for the historical mess caused by the pre-fix
   // sendToCompanion bug (every capture reissued a thread bac_id;
