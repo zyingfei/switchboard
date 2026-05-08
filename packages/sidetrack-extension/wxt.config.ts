@@ -50,6 +50,7 @@ export default defineConfig({
     permissions: [
       'activeTab',
       'alarms',
+      'idle',
       'sidePanel',
       'storage',
       'unlimitedStorage',

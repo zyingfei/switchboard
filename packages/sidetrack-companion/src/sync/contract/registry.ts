@@ -30,6 +30,10 @@ import {
 } from '../../annotations/events.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
 import {
+  ENGAGEMENT_INTERVAL_OBSERVED,
+  ENGAGEMENT_SESSION_AGGREGATED,
+} from '../../engagement/events.js';
+import {
   PRIVACY_GATE_FLIPPED,
   PRIVACY_PERMISSION_GRANTED,
   PRIVACY_PERMISSION_REVOKED,
@@ -307,6 +311,40 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
       },
       {
         surface: 'connections-causal-spine',
+        class: 'derived-cache',
+        materializer: 'connections',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+    ],
+  },
+  {
+    eventType: ENGAGEMENT_INTERVAL_OBSERVED,
+    currentPayloadVersion: 1,
+    allowedDimensions: ['engagement'],
+    surfaces: [
+      {
+        surface: 'plugin-engagement-intervals',
+        class: 'plugin-tier-bounded',
+        peerFreshnessMs: 1_000,
+        recovery: 'spool-drain',
+      },
+      {
+        surface: 'engagement-session-projection',
+        class: 'derived-cache',
+        materializer: 'connections',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+    ],
+  },
+  {
+    eventType: ENGAGEMENT_SESSION_AGGREGATED,
+    currentPayloadVersion: 1,
+    allowedDimensions: ['engagement'],
+    surfaces: [
+      {
+        surface: 'engagement-session-projection',
         class: 'derived-cache',
         materializer: 'connections',
         peerFreshnessMs: 30_000,
