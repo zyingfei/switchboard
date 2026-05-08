@@ -32,21 +32,30 @@ export interface WorkstreamUpsertedPayload {
   readonly children?: readonly string[];
   readonly checklist?: readonly WorkstreamChecklistItem[];
   readonly description?: string;
+  readonly payloadVersion?: number;
+  readonly dimensions?: Record<string, unknown>;
 }
 
 export interface WorkstreamDeletedPayload {
   readonly bac_id: string;
+  readonly payloadVersion?: number;
+  readonly dimensions?: Record<string, unknown>;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;
 
+const hasValidPayloadExtensionFields = (value: Record<string, unknown>): boolean =>
+  (value['payloadVersion'] === undefined ||
+    (typeof value['payloadVersion'] === 'number' && value['payloadVersion'] >= 1)) &&
+  (value['dimensions'] === undefined || isRecord(value['dimensions']));
+
 export const isWorkstreamUpsertedPayload = (
   value: unknown,
 ): value is WorkstreamUpsertedPayload =>
-  isRecord(value) && typeof value['bac_id'] === 'string' && typeof value['title'] === 'string';
+  isRecord(value) && typeof value['bac_id'] === 'string' && typeof value['title'] === 'string' && hasValidPayloadExtensionFields(value);
 
 export const isWorkstreamDeletedPayload = (
   value: unknown,
 ): value is WorkstreamDeletedPayload =>
-  isRecord(value) && typeof value['bac_id'] === 'string';
+  isRecord(value) && typeof value['bac_id'] === 'string' && hasValidPayloadExtensionFields(value);

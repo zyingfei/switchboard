@@ -29,15 +29,24 @@ export interface DispatchRecordedPayload {
   // Optional title — useful as a label fallback in the connections
   // graph when peer companions don't have the local JSONL.
   readonly title?: string;
+  readonly payloadVersion?: number;
+  readonly dimensions?: Record<string, unknown>;
 }
 
 export interface DispatchLinkedPayload {
   readonly dispatchId: string;
   readonly threadId: string;
+  readonly payloadVersion?: number;
+  readonly dimensions?: Record<string, unknown>;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;
+
+const hasValidPayloadExtensionFields = (value: Record<string, unknown>): boolean =>
+  (value['payloadVersion'] === undefined ||
+    (typeof value['payloadVersion'] === 'number' && value['payloadVersion'] >= 1)) &&
+  (value['dimensions'] === undefined || isRecord(value['dimensions']));
 
 export const isDispatchRecordedPayload = (
   value: unknown,
@@ -49,7 +58,8 @@ export const isDispatchRecordedPayload = (
     typeof value['createdAt'] === 'string' &&
     typeof value['body'] === 'string' &&
     isRecord(target) &&
-    typeof target['provider'] === 'string'
+    typeof target['provider'] === 'string' &&
+    hasValidPayloadExtensionFields(value)
   );
 };
 
@@ -58,4 +68,4 @@ export const isDispatchLinkedPayload = (
 ): value is DispatchLinkedPayload =>
   isRecord(value) &&
   typeof value['dispatchId'] === 'string' &&
-  typeof value['threadId'] === 'string';
+  typeof value['threadId'] === 'string' && hasValidPayloadExtensionFields(value);

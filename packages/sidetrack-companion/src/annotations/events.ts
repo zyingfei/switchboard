@@ -29,19 +29,30 @@ export interface AnnotationCreatedPayload {
   readonly anchor: SerializedAnchor;
   readonly note: string;
   readonly pageTitle?: string;
+  readonly payloadVersion?: number;
+  readonly dimensions?: Record<string, unknown>;
 }
 
 export interface AnnotationNoteSetPayload {
   readonly bac_id: string;
   readonly note: string;
+  readonly payloadVersion?: number;
+  readonly dimensions?: Record<string, unknown>;
 }
 
 export interface AnnotationDeletedPayload {
   readonly bac_id: string;
+  readonly payloadVersion?: number;
+  readonly dimensions?: Record<string, unknown>;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;
+
+const hasValidPayloadExtensionFields = (value: Record<string, unknown>): boolean =>
+  (value['payloadVersion'] === undefined ||
+    (typeof value['payloadVersion'] === 'number' && value['payloadVersion'] >= 1)) &&
+  (value['dimensions'] === undefined || isRecord(value['dimensions']));
 
 const isAnchor = (value: unknown): value is SerializedAnchor => {
   if (!isRecord(value)) return false;
@@ -66,14 +77,15 @@ export const isAnnotationCreatedPayload = (
   typeof value['bac_id'] === 'string' &&
   typeof value['url'] === 'string' &&
   typeof value['note'] === 'string' &&
-  isAnchor(value['anchor']);
+  isAnchor(value['anchor']) &&
+  hasValidPayloadExtensionFields(value);
 
 export const isAnnotationNoteSetPayload = (
   value: unknown,
 ): value is AnnotationNoteSetPayload =>
-  isRecord(value) && typeof value['bac_id'] === 'string' && typeof value['note'] === 'string';
+  isRecord(value) && typeof value['bac_id'] === 'string' && typeof value['note'] === 'string' && hasValidPayloadExtensionFields(value);
 
 export const isAnnotationDeletedPayload = (
   value: unknown,
 ): value is AnnotationDeletedPayload =>
-  isRecord(value) && typeof value['bac_id'] === 'string';
+  isRecord(value) && typeof value['bac_id'] === 'string' && hasValidPayloadExtensionFields(value);
