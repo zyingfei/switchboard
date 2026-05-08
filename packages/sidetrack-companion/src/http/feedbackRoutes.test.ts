@@ -85,6 +85,36 @@ describe('feedback HTTP routes', () => {
     ]);
   });
 
+  it('returns the feedback projection with training labels', async () => {
+    await post(
+      {
+        type: USER_FLOW_CONFIRMED,
+        payload: {
+          payloadVersion: 1,
+          relationKind: 'closest_visit',
+          fromId: 'timeline-visit:a',
+          toId: 'timeline-visit:b',
+        },
+      },
+      'feedback-projection-route-test',
+    );
+
+    const response = await fetch(`${serverUrl}/v1/feedback/projection`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      data: {
+        positiveLabels: { fromId: string; toId: string; weight: number }[];
+        negativeLabels: { fromId: string; toId: string; weight: number }[];
+      };
+    };
+    expect(body.data.positiveLabels).toEqual([
+      { fromId: 'timeline-visit:a', toId: 'timeline-visit:b', weight: 1 },
+    ]);
+    expect(body.data.negativeLabels).toEqual([]);
+  });
+
   it('rejects malformed feedback event payloads', async () => {
     const result = await post(
       {

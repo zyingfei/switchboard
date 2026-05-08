@@ -1,0 +1,20 @@
+{
+  "positivePairs": [
+    ["pg_merge_a", "pg_merge_b"],
+    ["pg_merge_a", "pg_merge_c"],
+    ["pg_merge_b", "pg_merge_c"],
+    ["k8s_eviction_a", "k8s_eviction_b"]
+  ],
+  "negativePairs": [["pg_merge_a", "negative_invoice"]],
+  "expectedTopics": [
+    { "cluster": "postgres", "minimumMembers": 3 },
+    { "cluster": "kubernetes", "minimumMembers": 2 }
+  ],
+  "expectedContinuationPairs": [
+    ["visit_pg_merge_a_replica_a", "visit_pg_merge_a_replica_b"]
+  ],
+  "expectedFeedbackEffect": {
+    "rejectedPair": ["pg_merge_a", "pg_merge_b"],
+    "expected": "score-decreases-or-edge-disappears"
+  }
+}

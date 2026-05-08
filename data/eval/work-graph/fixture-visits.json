@@ -1,0 +1,47 @@
+{
+  "workstreamId": "wg_eval_ws",
+  "visits": [
+    {
+      "key": "pg_merge_a",
+      "url": "https://eval.sidetrack.local/postgres/sidetrack_eval_postgres/merge-a",
+      "title": "sidetrack_eval_postgres merge concurrency write skew",
+      "cluster": "postgres",
+      "focusedWindowMs": 14000
+    },
+    {
+      "key": "pg_merge_b",
+      "url": "https://eval.sidetrack.local/postgres/sidetrack_eval_postgres/merge-b",
+      "title": "sidetrack_eval_postgres merge lock ordering diagnostics",
+      "cluster": "postgres",
+      "focusedWindowMs": 13500
+    },
+    {
+      "key": "pg_merge_c",
+      "url": "https://eval.sidetrack.local/postgres/sidetrack_eval_postgres/merge-c",
+      "title": "sidetrack_eval_postgres merge retry plan",
+      "cluster": "postgres",
+      "focusedWindowMs": 12500
+    },
+    {
+      "key": "k8s_eviction_a",
+      "url": "https://eval.sidetrack.local/kubernetes/sidetrack_eval_kubernetes/eviction-a",
+      "title": "sidetrack_eval_kubernetes pod eviction pressure",
+      "cluster": "kubernetes",
+      "focusedWindowMs": 11000
+    },
+    {
+      "key": "k8s_eviction_b",
+      "url": "https://eval.sidetrack.local/kubernetes/sidetrack_eval_kubernetes/eviction-b",
+      "title": "sidetrack_eval_kubernetes pod restart budget",
+      "cluster": "kubernetes",
+      "focusedWindowMs": 10500
+    },
+    {
+      "key": "negative_invoice",
+      "url": "https://eval.sidetrack.local/accounting/sidetrack_eval_negative/invoice-aging",
+      "title": "sidetrack_eval_negative invoice aging reconciliation",
+      "cluster": "negative",
+      "focusedWindowMs": 9500
+    }
+  ]
+}

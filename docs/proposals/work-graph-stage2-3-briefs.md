@@ -406,8 +406,11 @@ export type FeedbackProjection = {
 - Features (same schema as S18 plus device-continuation-specific):
   same workstream, time-since-prior-visit, engagement-class match,
   copy/paste lineage continuity.
-- LightGBM binary classifier (re-uses the S20 LightGBM training infra).
-- Edge emitted at score ≥ 0.7 (calibrated from a held-out fixture).
+- Deterministic v1 classifier: weighted feature scorer over same
+  canonical URL, same workstream, engagement-class match, time
+  proximity, copy/paste continuity, and cosine similarity.
+- Edge emitted at score ≥ 0.7. A learned LightGBM continuation
+  revision can replace this later under a new revision id.
 
 ---
 

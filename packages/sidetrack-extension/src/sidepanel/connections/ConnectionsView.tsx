@@ -43,6 +43,7 @@ import type {
   ConnectionsScopedResult,
 } from './types';
 import { FeedbackButtons, type FeedbackChoice } from '../feedback/FeedbackButtons';
+import { ProducerPin } from './ProducerPin';
 import { WhyRelatedPanel } from './WhyRelatedPanel';
 import type { Reason } from './why-related/reasons';
 
@@ -298,6 +299,18 @@ const findFeedbackEdge = (
       edgeConnects(edge, leftId, rightId) && feedbackRelationKindForEdgeKind(edge.kind) !== null,
   ) ?? null;
 
+const hasRevisionProducer = (edge: ConnectionEdge): boolean =>
+  'revisionId' in edge.producedBy &&
+  typeof edge.producedBy.revisionId === 'string' &&
+  edge.producedBy.revisionId.length > 0;
+
+const findRevisionEdgeForVisit = (
+  edges: readonly ConnectionEdge[],
+  visitId: string,
+): ConnectionEdge | null =>
+  edges.find((edge) => hasRevisionProducer(edge) && (edge.fromNodeId === visitId || edge.toNodeId === visitId)) ??
+  null;
+
 const snippetSourceVisitId = (node: ConnectionNode, edge: ConnectionEdge | null): string | null => {
   if (node.kind !== 'snippet' || edge === null) return null;
   if (edge.kind === 'snippet_copied_from_visit' && edge.fromNodeId === node.id) {
@@ -406,6 +419,11 @@ export const ConnectionsView = ({
     setSelectedEdge(null);
     setWhyVisitId(null);
     setAnchor(value);
+  };
+
+  const selectEdge = (edge: ConnectionEdge): void => {
+    setWhyVisitId(null);
+    setSelectedEdge(edge);
   };
 
   const replaceNodeLabel = (nodeId: string, label: string): void => {
@@ -518,6 +536,10 @@ export const ConnectionsView = ({
     if (result === null || whyVisitId === null) return null;
     return findFeedbackEdge(result.snapshot.edges, anchor, whyVisitId);
   }, [result, anchor, whyVisitId]);
+  const whyRevisionEdge = useMemo(() => {
+    if (result === null || whyVisitId === null) return null;
+    return findRevisionEdgeForVisit(result.snapshot.edges, whyVisitId);
+  }, [result, whyVisitId]);
   const focusData = useMemo(
     () =>
       result === null
@@ -705,7 +727,7 @@ export const ConnectionsView = ({
                 result={result}
                 anchorId={anchor}
                 selectedEdge={selectedEdge}
-                onSelectEdge={(e) => setSelectedEdge(e)}
+                onSelectEdge={selectEdge}
                 onPromoteSnippet={submitSnippetPromotion}
               />
             ) : subMode === 'orbital' ? (
@@ -714,7 +736,7 @@ export const ConnectionsView = ({
                 anchorId={anchor}
                 hops={hops}
                 selectedEdge={selectedEdge}
-                onSelectEdge={(e) => setSelectedEdge(e)}
+                onSelectEdge={selectEdge}
               />
             ) : subMode === 'flow' ? (
               <FlowPathView
@@ -773,6 +795,8 @@ export const ConnectionsView = ({
                         onFeedback: (choice) => submitFlowFeedback(whyFeedbackEdge, choice),
                       }
                 }
+                producedBy={whyRevisionEdge?.producedBy}
+                producerLabel={whyRevisionEdge?.kind}
                 onToggleAssertedOnly={() => setWhyAssertedOnly((value) => !value)}
                 onClose={() => setWhyVisitId(null)}
               />
@@ -1389,6 +1413,9 @@ const ProvenanceCard = ({
       <div className="cx-prov-reason">
         Reason: <code>{reason}</code>
       </div>
+      {hasRevisionProducer(edge) ? (
+        <ProducerPin producedBy={edge.producedBy} producerLabel={edge.kind} />
+      ) : null}
       {supportsFlowFeedback ? (
         <div style={{ paddingTop: 10 }}>
           <FeedbackButtons

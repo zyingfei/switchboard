@@ -60,6 +60,7 @@ import {
   isUserSnippetPromotedPayload,
   isUserTopicRenamedPayload,
 } from '../feedback/events.js';
+import { projectFeedback } from '../feedback/projection.js';
 import { projectPrivacy } from '../privacy/projection.js';
 import {
   appendEntry as appendEntryRaw,
@@ -203,7 +204,9 @@ import {
 } from '../vault/reviewDrafts.js';
 import { runAutoUpdate } from '../system/autoUpdate.js';
 import { collectHealth, type CaptureWarningHealth, type HealthReport } from '../system/health.js';
+import { collectWorkGraphHealth } from '../system/workGraphHealth.js';
 import { checkLatestVersion, type UpdateAdvisory } from '../system/versionCheck.js';
+import { maybeRetrainClosestVisitRanker } from '../ranker/retrain.js';
 import {
   listAnnotations,
   softDeleteAnnotation,
@@ -347,6 +350,10 @@ export interface CompanionHttpConfig {
   // Connections graph snapshot store. When unset, GET /v1/connections
   // and its sibling routes return 503.
   readonly connectionsStore?: import('../connections/snapshot.js').ConnectionsStore;
+  // Optional synchronous refresh hook for operator-triggered model
+  // changes such as forced ranker retraining. Runtime wiring points
+  // this at the connections materializer catchUp path.
+  readonly refreshConnections?: () => Promise<void>;
 }
 
 export interface StartedHttpServer {
@@ -914,6 +921,22 @@ const objectRecord = (value: unknown): Record<string, unknown> | undefined =>
     ? (value as Record<string, unknown>)
     : undefined;
 
+const optionalFiniteNumber = (
+  value: unknown,
+  fieldName: string,
+): number | undefined => {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new HttpRouteError(
+      400,
+      'VALIDATION_ERROR',
+      'Validation failed.',
+      `${fieldName} must be a finite number when provided.`,
+    );
+  }
+  return value;
+};
+
 const PRIVACY_AGGREGATE_ID = 'privacy';
 
 const isPrivacyEventType = (value: unknown): value is
@@ -1263,6 +1286,21 @@ const routes: readonly RouteDefinition[] = [
   },
   {
     method: 'GET',
+    pattern: /^\/v1\/feedback\/projection$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      return [200, { data: projectFeedback(await context.eventLog.readMerged()) }];
+    },
+  },
+  {
+    method: 'GET',
     pattern: /^\/v1\/system\/service-status$/,
     authRequired: true,
     handle: async (_request, _requestId, _match, context) => [
@@ -1402,6 +1440,11 @@ const routes: readonly RouteDefinition[] = [
               const status = await (context.serviceInstaller ?? pickInstaller()).status();
               return { installed: status.installed, running: status.running };
             },
+            workGraphSummary: () =>
+              collectWorkGraphHealth({
+                vaultRoot,
+                ...(context.eventLog === undefined ? {} : { eventLog: context.eventLog }),
+              }),
             ...syncSummaryDeps(context.replica, context.sync, context.syncMaterializerHealth),
           }),
         },
@@ -3538,6 +3581,55 @@ const routes: readonly RouteDefinition[] = [
           },
         },
       ];
+    },
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/connections\/ranker\/retrain$/u,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      if (context.connectionsStore === undefined) {
+        throw new HttpRouteError(503, 'CONNECTIONS_NOT_WIRED', 'Connections is not configured.');
+      }
+      const vaultRoot = requireVaultRoot(context);
+      const body = objectRecord(await readBody(request)) ?? {};
+      const force = body['force'] === true;
+      const threshold =
+        optionalFiniteNumber(body['threshold'], 'threshold') ?? (force ? 1 : undefined);
+      const randomNegativeCandidatesPerPositive = optionalFiniteNumber(
+        body['randomNegativeCandidatesPerPositive'],
+        'randomNegativeCandidatesPerPositive',
+      );
+      const trainNumRound = optionalFiniteNumber(body['numRound'], 'numRound');
+      const snapshot = await context.connectionsStore.readCurrent();
+      if (snapshot === null) {
+        throw new HttpRouteError(
+          409,
+          'CONNECTIONS_SNAPSHOT_MISSING',
+          'Connections snapshot is not ready.',
+        );
+      }
+      const result = await maybeRetrainClosestVisitRanker({
+        vaultRoot,
+        merged: await context.eventLog.readMerged(),
+        snapshot,
+        ...(threshold === undefined ? {} : { threshold }),
+        ...(randomNegativeCandidatesPerPositive === undefined
+          ? {}
+          : { randomNegativeCandidatesPerPositive }),
+        ...(trainNumRound === undefined ? {} : { trainOptions: { numRound: trainNumRound } }),
+      });
+      if (result.status === 'trained') {
+        await context.refreshConnections?.();
+      }
+      return [200, { data: result }];
     },
   },
   // Sync Contract v1 — Connections (Class B evidence graph) routes.

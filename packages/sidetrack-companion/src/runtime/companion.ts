@@ -208,14 +208,13 @@ export const startCompanion = async (
   // (threads, workstreams, dispatches, queue, reminders, coding
   // sessions) + timeline daily projections at snapshot time.
   const connectionsStore = createConnectionsStore(options.vaultPath);
-  syncContractRunner.register(
-    createConnectionsMaterializer({
-      vaultRoot: options.vaultPath,
-      eventLog: baseEventLog,
-      timelineStore,
-      store: connectionsStore,
-    }),
-  );
+  const connectionsMaterializer = createConnectionsMaterializer({
+    vaultRoot: options.vaultPath,
+    eventLog: baseEventLog,
+    timelineStore,
+    store: connectionsStore,
+  });
+  syncContractRunner.register(connectionsMaterializer);
 
   // Reproject on startup if the projector logic has changed since
   // the last run. Writes a `_BAC/.projector-version` sentinel so
@@ -445,6 +444,10 @@ export const startCompanion = async (
     },
     timelineStore,
     connectionsStore,
+    refreshConnections: async () => {
+      await connectionsMaterializer.catchUp(baseEventLog);
+      await connectionsMaterializer.awaitIdle();
+    },
     serviceInstallDefaults: {
       port: options.port,
       ...(options.service?.companionCommand === undefined

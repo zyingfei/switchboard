@@ -13,6 +13,34 @@ describe('embedder module', () => {
     expect(typeof embed).toBe('function');
   });
 
+  it('gives eval cluster tokens predictable deterministic neighborhoods', async () => {
+    const prior = process.env['SIDETRACK_TEST_EMBEDDER'];
+    process.env['SIDETRACK_TEST_EMBEDDER'] = '1';
+    try {
+      const [pgA, pgB, negative] = await embed([
+        'query: sidetrack_eval_postgres merge write skew',
+        'passage: sidetrack_eval_postgres merge lock ordering',
+        'passage: sidetrack_eval_negative invoice aging',
+      ]);
+      const cosine = (left: Float32Array, right: Float32Array): number =>
+        left.reduce((sum, value, index) => sum + value * (right[index] ?? 0), 0);
+      expect(pgA).toBeDefined();
+      expect(pgB).toBeDefined();
+      expect(negative).toBeDefined();
+      if (pgA === undefined || pgB === undefined || negative === undefined) {
+        throw new Error('Expected deterministic test vectors.');
+      }
+      expect(cosine(pgA, pgB)).toBeGreaterThan(0.95);
+      expect(cosine(pgA, negative)).toBeLessThan(0.2);
+    } finally {
+      if (prior === undefined) {
+        delete process.env['SIDETRACK_TEST_EMBEDDER'];
+      } else {
+        process.env['SIDETRACK_TEST_EMBEDDER'] = prior;
+      }
+    }
+  });
+
   it.skipIf(process.env['SIDETRACK_RUN_EMBEDDER_TESTS'] !== 'true')(
     'embeds text as a normalized 384-dim vector',
     async () => {

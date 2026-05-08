@@ -1,4 +1,5 @@
 import type { RecallActivityReport } from '../recall/activity.js';
+import type { WorkGraphHealthReport } from './workGraphHealth.js';
 
 export interface CaptureProviderHealth {
   readonly provider: string;
@@ -75,6 +76,7 @@ export interface HealthReport {
     };
   };
   readonly service: { readonly installed: boolean; readonly running: boolean };
+  readonly workGraph?: WorkGraphHealthReport;
   // Identity of the local replica + its Lamport high-water mark.
   // Optional so legacy / test call-sites that don't wire a replica
   // context still produce a valid health report.
@@ -111,6 +113,7 @@ export interface HealthDeps {
   readonly recallSummary: () => Promise<HealthReport['recall']>;
   readonly serviceStatus: () => Promise<HealthReport['service']>;
   readonly syncSummary?: () => HealthReport['sync'];
+  readonly workGraphSummary?: () => Promise<WorkGraphHealthReport>;
 }
 
 // Per-operation timeout. The 250ms cap that lived here originally
@@ -139,7 +142,7 @@ const withBudget = async <T>(
 
 export const collectHealth = async (deps: HealthDeps): Promise<HealthReport> => {
   const now = deps.now?.() ?? new Date();
-  const [writable, sizeBytes, capture, recall, service] = await Promise.all([
+  const [writable, sizeBytes, capture, recall, service, workGraph] = await Promise.all([
     withBudget(deps.vaultWritable, false),
     withBudget(deps.vaultSizeBytes, null, HEAVY_OP_BUDGET_MS),
     withBudget(
@@ -153,6 +156,9 @@ export const collectHealth = async (deps: HealthDeps): Promise<HealthReport> => 
       HEAVY_OP_BUDGET_MS,
     ),
     withBudget(deps.serviceStatus, { installed: false, running: false }),
+    deps.workGraphSummary === undefined
+      ? Promise.resolve(undefined)
+      : withBudget(deps.workGraphSummary, undefined, HEAVY_OP_BUDGET_MS),
   ]);
   const sync = deps.syncSummary?.();
   return {
@@ -161,6 +167,7 @@ export const collectHealth = async (deps: HealthDeps): Promise<HealthReport> => 
     capture,
     recall,
     service,
+    ...(workGraph === undefined ? {} : { workGraph }),
     ...(sync === undefined ? {} : { sync }),
   };
 };

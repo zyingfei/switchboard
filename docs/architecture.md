@@ -209,7 +209,7 @@ Stage 1 surfaces. They all share one revision policy via Class E.
 | Topic clusterer (Union-Find) | `topic-revision:v1:union-find` | similarity edges + user-asserted edges | `topic` nodes + `visit_in_topic` + `topic_in_workstream` (Pass 8) |
 | Topic clusterer (HDBSCAN) | `topic-revision:v2:hdbscan` | same | same — alternative clusterer; user pins which revision the UI surfaces |
 | Engagement classifier (rules) | `engagement-class:v1:rules` | engagement aggregates + snippet lineage | `engagement.class` metadata on visit nodes (Pass 3) |
-| Cross-replica continuation (LightGBM) | `continuation-classifier:v1:lightgbm` | `visit_observed_on_replica` + Stage 2 features | `visit_continues_visit` (Pass 11) |
+| Cross-replica continuation (deterministic scorer) | `continuation-classifier:v1:deterministic` | `visit_observed_on_replica` + Stage 2 features | `visit_continues_visit` (Pass 11) |
 | Closest-visit ranker (LightGBM/LambdaMART) | `closest-visit:v1:lightgbm-lambdamart` | candidate-gen + feature-extraction + feedback-projection | `closest_visit` (Pass 12) with per-feature contributions |
 
 Future revisions add a new key (e.g., `closest-visit:v2:learned-from-feedback`)

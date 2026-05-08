@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -22,6 +22,7 @@ export interface TestCompanion {
   // sync settings. Bridge key + replicaId are preserved (read from
   // vault). Returns when the new process is listening.
   readonly restart: () => Promise<void>;
+  readonly ingestEvents: (events: readonly unknown[]) => Promise<void>;
 }
 
 export interface StartTestCompanionOptions {
@@ -125,6 +126,38 @@ const closeProcess = async (child: CompanionProcess): Promise<void> => {
     child.kill('SIGKILL');
     await once(child, 'exit');
   }
+};
+
+const runCli = async (args: readonly string[]): Promise<void> => {
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(process.execPath, [companionCliPath, ...args], {
+      cwd: companionRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        SIDETRACK_TEST_EMBEDDER: '1',
+      },
+    });
+    let output = '';
+    child.stdout.on('data', (chunk: Buffer) => {
+      output += chunk.toString('utf8');
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      output += chunk.toString('utf8');
+    });
+    child.once('error', reject);
+    child.once('exit', (code, signal) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(
+        new Error(
+          `Companion CLI failed: code=${String(code)} signal=${String(signal)} output=${output}`,
+        ),
+      );
+    });
+  });
 };
 
 export const startTestCompanion = async (
@@ -240,6 +273,25 @@ export const startTestCompanion = async (
       // port. spawnNow() reads the same args + vault.
       if (child !== null) await closeProcess(child);
       child = null;
+      await spawnNow();
+    },
+    async ingestEvents(events) {
+      if (child !== null) {
+        await closeProcess(child);
+        child = null;
+      }
+      const dir = await mkdtemp(path.join(tmpdir(), 'sidetrack-extension-e2e-ingest-'));
+      const archivePath = path.join(dir, 'events.jsonl');
+      try {
+        await writeFile(
+          archivePath,
+          events.map((event) => JSON.stringify(event)).join('\n') + '\n',
+          'utf8',
+        );
+        await runCli(['ingest', '--import', archivePath, '--vault', vaultPath]);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
       await spawnNow();
     },
   };

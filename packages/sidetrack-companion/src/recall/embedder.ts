@@ -249,21 +249,51 @@ const E5_PREFIX = 'query: ';
 // ranker carries the test signal; vectors are deterministic so
 // the index file is still byte-stable across reruns.
 const isTestEmbedderEnabled = (): boolean =>
-  typeof process !== 'undefined' && process.env?.['SIDETRACK_TEST_EMBEDDER'] === '1';
+  typeof process !== 'undefined' && process.env['SIDETRACK_TEST_EMBEDDER'] === '1';
 
-const testEmbed = (text: string): Float32Array => {
-  // Deterministic: hash the text into the 384-dim vector. Not
-  // semantically meaningful — that's fine, the e2e uses lexical
-  // matches. Same input → same output → byte-stable index files.
-  const v = new Float32Array(384);
-  let h = 2166136261; // FNV-1a seed
-  for (let i = 0; i < text.length; i += 1) {
-    h ^= text.charCodeAt(i);
+const normalizeTestText = (text: string): string =>
+  text.replace(/^(query|passage):\s*/iu, '').toLowerCase();
+
+const testTokens = (text: string): readonly string[] =>
+  normalizeTestText(text)
+    .split(/[^a-z0-9_:-]+/u)
+    .map((token) => token.trim())
+    .filter((token) => token.length > 0);
+
+const hashToken = (token: string): number => {
+  let h = 2166136261;
+  for (let index = 0; index < token.length; index += 1) {
+    h ^= token.charCodeAt(index);
     h = Math.imul(h, 16777619);
   }
-  for (let i = 0; i < 384; i += 1) {
-    h = Math.imul(h ^ (h >>> 13), 16777619);
-    v[i] = ((h >>> 0) / 0xffffffff) * 2 - 1;
+  return h >>> 0;
+};
+
+const testEvalClusterIndex = (token: string): number | null => {
+  if (token === 'sidetrack_eval_postgres') return 0;
+  if (token === 'sidetrack_eval_kubernetes') return 1;
+  if (token === 'sidetrack_eval_negative') return 2;
+  return null;
+};
+
+const testEmbed = (text: string): Float32Array => {
+  // Deterministic test vectors with a small semantic affordance:
+  // `sidetrack_eval_*` tokens map to fixed axes so the work-graph
+  // eval pack can create predictable cosine neighborhoods. All other
+  // tokens add low-weight hashed dimensions to keep same input → same
+  // output without making arbitrary titles accidentally semantic.
+  const v = new Float32Array(384);
+  const tokens = testTokens(text);
+  for (const token of tokens.length === 0 ? ['empty'] : tokens) {
+    const clusterIndex = testEvalClusterIndex(token);
+    if (clusterIndex !== null) {
+      v[clusterIndex] = (v[clusterIndex] ?? 0) + 8;
+      continue;
+    }
+    const hash = hashToken(token);
+    const index = 16 + (hash % (384 - 16));
+    const sign = (hash & 1) === 0 ? 1 : -1;
+    v[index] = (v[index] ?? 0) + sign * 0.25;
   }
   // L2 normalize (e5 outputs are normalized; tests rely on cosine
   // similarity behaving sanely).
