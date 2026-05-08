@@ -50,6 +50,105 @@ context (e.g. summarization of a page), it goes through the
 extraction layer (Class E) on a per-page-visit basis with explicit
 user consent — not through timeline.
 
+## Stage 1 MVP — additional dimensions
+
+The Stage 1 work graph
+(`docs/proposals/work-graph-stage1-mvp.md`) extends the timeline payload
+through the `payloadVersion` + `dimensions` extension slot (Lock 2). All
+new fields are additive; old data continues to project as `undefined`
+for the new keys.
+
+### `dimensions.engagement` (1.A)
+
+Counts and durations only. Captured by a content script that registers
+dynamically only when (a) the timeline gate is open AND (b) optional
+host-permission has been granted.
+
+```
+focusedWindowMs   number   ms tab visible AND window OS-foreground
+visibleMs         number   ms document.visibilityState === 'visible'
+activeMs          number   ms within visibleMs while not idle
+idleMs            number   complement of activeMs within visibleMs
+foregroundBursts  number   count of hidden→visible transitions
+returnCount       number   count of returns to same canonical URL
+scrollEvents      number   throttled scroll listener counter (max 1 Hz)
+maxScrollRatio    number   (scrollY + clientH) / scrollH, monotone in [0,1]
+copyCount         number   `copy` event counter
+pasteCount        number   `paste` event counter
+```
+
+The content script never reads `event.key`, `event.target.value`, or
+clipboard contents past the SHA-256 hashing step. Listeners are
+counters and timers only.
+
+### `dimensions.provenance` (1.B)
+
+Captured at the SW level via `chrome.tabs.onCreated` (opener) and
+`chrome.webNavigation.onCommitted` (transition type).
+
+```
+openerVisitId        string | null
+                     resolved from openerTabId IF opener tab still
+                     exists at the moment of capture; null otherwise.
+                     Never invented.
+previousVisitId      string | null
+                     last visit on the same tabSessionIdHash; fallback
+                     when opener is gone.
+transitionType       'link' | 'typed' | 'auto_bookmark' |
+                     'auto_subframe' | 'manual_subframe' | 'generated' |
+                     'start_page' | 'form_submit' | 'reload' |
+                     'keyword' | 'keyword_generated'
+transitionQualifiers Subset of {'client_redirect', 'server_redirect',
+                                 'forward_back', 'from_address_bar'}
+```
+
+`webNavigation` timestamps are internally consistent only; they are NOT
+commensurate with `Date.now()` from inside content scripts. All duration
+math stays within a single source.
+
+### `selection.copied` / `selection.pasted` (Stage 1.H — separate event types)
+
+Hash-only lineage. Selection text is hashed client-side via
+`crypto.subtle.digest('SHA-256', ...)` immediately; the raw text never
+crosses the synchronous boundary into a longer-lived variable. Stored
+fields:
+
+```
+selectionHash    string  SHA-256 of normalized selection
+simhash64        string  base64 of 64-bit SimHash for fuzzy match
+charCount        number
+lineCount        number
+contentKindHint  'code-block' | 'prose' | 'url' | 'mixed'
+rawTextStored    false   contract assertion; predicate rejects true
+```
+
+Lineage matching: a `selection.pasted` is linked to the most-recent
+`selection.copied` whose `selectionHash` matches exactly OR whose
+`simhash64` is within Hamming-≤3, within a 24-hour window.
+
+Raw text capture requires a separate explicit privacy gate flip
+(`privacy.gate.flipped({ gate: 'snippet.rawText', state: 'open' })`)
+or an explicit user "promote to source" action. Sidetrack does not
+poll the system clipboard.
+
+### Privacy gate is now a Class A fact
+
+Stage 1 replaces `chrome.storage.local['sidetrack.timeline.enabled']`
+with replicated Class A events:
+
+```
+privacy.gate.flipped       { gate, state, actor, reason? }
+privacy.permission.granted { permission, scope }
+privacy.permission.revoked { permission, scope, retroactiveMask }
+```
+
+The chrome.storage flag remains as a fast-path cache hydrated from
+the projection on SW boot, but the **truth** is on the event log so
+revoking on Replica α propagates to β through the relay. Retroactive
+masking is derived-view masking (reducer excludes events whose
+`observedAt` falls in a `closed` window) — events stay in the log;
+they are not destructively deleted.
+
 ## Privacy posture
 
 Timeline is **passive** by default in the Class F admit-policy sense:

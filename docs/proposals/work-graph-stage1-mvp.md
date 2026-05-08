@@ -1,5 +1,12 @@
 # Sidetrack — Stage 1 MVP (Consolidated, LLM-Free, Hardware-Neutral)
 
+> **Status: implemented.** Stage 1 lands across PR #99 and successor PRs on
+> `feat/work-graph-mvp`. Sub-tasks S1–S16 complete. The canonical evergreen
+> architecture summary is at [`docs/architecture.md`](../architecture.md);
+> the timeline-specific privacy + dimensions documentation is at
+> [`docs/timeline.md`](../timeline.md). This proposal is preserved for
+> historical context and reviewer reference.
+
 > **Design principle (re-stated).** Facts are event-sourced. Interpretations are
 > versioned. Suggestions are explainable. User organization is authoritative.
 > **No inference requires GPU / Apple-Silicon hardware.**
