@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@huggingface/transformers": "^3.8.1",
+    "@iarna/toml": "^2.2.5",
     "@wlearn/lightgbm": "^0.1.0",
     "gpt-tokenizer": "^3.4.0",
     "minisearch": "^7.2.0",
