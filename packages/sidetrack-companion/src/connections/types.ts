@@ -112,6 +112,19 @@ export type ConnectionEdgeSource =
   | 'annotation-store'
   | 'reminder-store';
 
+export type ConnectionEdgeProducedBy =
+  | {
+      readonly source: ConnectionEdgeSource;
+      readonly eventType?: string;
+      readonly dot?: { readonly replicaId: string; readonly seq: number };
+      readonly recordId?: string;
+    }
+  | { readonly source: 'visit-similarity'; readonly revisionId: string }
+  | { readonly source: 'topic-clusterer'; readonly revisionId: string }
+  | { readonly source: 'engagement-classifier'; readonly revisionId: string }
+  | { readonly source: 'snippet-lineage'; readonly revisionId: string }
+  | { readonly source: 'cross-replica' };
+
 export interface ConnectionEdge {
   // Deterministic id: `edge:<kind>:<from>:<to>`. Same edge across
   // re-runs gets the same id, so dedup is trivial and the snapshot
@@ -121,12 +134,7 @@ export interface ConnectionEdge {
   readonly fromNodeId: string;
   readonly toNodeId: string;
   readonly observedAt: string;
-  readonly producedBy: {
-    readonly source: ConnectionEdgeSource;
-    readonly eventType?: string;
-    readonly dot?: { readonly replicaId: string; readonly seq: number };
-    readonly recordId?: string;
-  };
+  readonly producedBy: ConnectionEdgeProducedBy;
   // 'explicit' = the source surfaces this edge directly (e.g.
   //   thread.primaryWorkstreamId, dispatch.sourceThreadId).
   // 'deterministic' = derived from a deterministic match (e.g.
