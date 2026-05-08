@@ -113,6 +113,7 @@ export const KNOWN_MATERIALIZERS: ReadonlySet<string> = new Set<string>([
   'extraction',
   'timeline',
   'connections',
+  'collector',
 ]);
 
 const projectionEntry = (eventType: string, surface: string): ContractEntry => ({
