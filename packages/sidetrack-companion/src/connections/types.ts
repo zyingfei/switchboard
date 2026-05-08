@@ -82,7 +82,15 @@ export type ConnectionEdgeKind =
   // Cross-cutting joins
   | 'timeline_same_url_as_thread'
   | 'annotation_targets_thread'
-  | 'annotation_targets_workstream';
+  | 'annotation_targets_workstream'
+  // Content-derived references (URLs found in captured turn text /
+  // dispatch body / annotation note that match a timeline visit).
+  | 'thread_references_url'
+  | 'dispatch_references_url'
+  | 'annotation_references_url'
+  // Cross-thread substring quote (one captured turn contains a
+  // ≥40-char substring of another captured turn's text).
+  | 'thread_quotes_thread';
 
 export type ConnectionEdgeSource =
   | 'event-log'

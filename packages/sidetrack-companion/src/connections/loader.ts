@@ -13,17 +13,21 @@ import type {
 
 // Lightweight on-disk readers for the connections materializer.
 //
-// The companion vault layout (mirroring what the MCP server's
-// LiveVaultReader walks) is the source of truth for everything
+// The companion vault layout is the source of truth for everything
 // except the merged event log and timeline projections, which the
 // materializer already has via its EventLog + TimelineStore deps.
 //
 //   _BAC/threads/<id>.json
 //   _BAC/workstreams/<id>.json
-//   _BAC/dispatches/<id>.json
+//   _BAC/dispatches/<YYYY-MM-DD>.jsonl   ← append-only daily JSONL
 //   _BAC/queue/<id>.json
 //   _BAC/reminders/<id>.json
 //   _BAC/coding/sessions/<id>.json
+//
+// Dispatches are the only kind written as JSONL (append-only event
+// records), so we walk all daily files and dedup by bac_id (last
+// row per id wins). Without this, dispatches written through the
+// HTTP route never surface in the connections snapshot.
 //
 // We treat the on-disk records as authoritative when they exist;
 // the materializer's reducer merges them with event-derived nodes.
@@ -52,6 +56,45 @@ const readJsonDirectory = async <T>(rootPath: string, relative: string): Promise
   return out;
 };
 
+const readDispatchJsonlDirectory = async (
+  rootPath: string,
+  relative: string,
+): Promise<readonly DispatchVaultRecord[]> => {
+  const dir = join(rootPath, relative);
+  let entries: string[];
+  try {
+    entries = (await readdir(dir, { withFileTypes: true }))
+      .filter(
+        (entry) =>
+          entry.isFile() && /^\d{4}-\d{2}-\d{2}\.jsonl$/u.test(entry.name),
+      )
+      .map((entry) => entry.name);
+  } catch {
+    return [];
+  }
+  const byId = new Map<string, DispatchVaultRecord>();
+  for (const name of entries.sort()) {
+    let raw: string;
+    try {
+      raw = await readFile(join(dir, name), 'utf8');
+    } catch {
+      continue;
+    }
+    for (const line of raw.split('\n')) {
+      if (line.length === 0) continue;
+      try {
+        const record = JSON.parse(line) as DispatchVaultRecord;
+        if (typeof record.bac_id === 'string' && record.bac_id.length > 0) {
+          byId.set(record.bac_id, record);
+        }
+      } catch {
+        // malformed line — skip
+      }
+    }
+  }
+  return [...byId.values()];
+};
+
 export interface VaultReadResult {
   readonly threads: readonly ThreadVaultRecord[];
   readonly workstreams: readonly WorkstreamVaultRecord[];
@@ -66,7 +109,7 @@ export const readVaultStores = async (vaultRoot: string): Promise<VaultReadResul
     await Promise.all([
       readJsonDirectory<ThreadVaultRecord>(vaultRoot, '_BAC/threads'),
       readJsonDirectory<WorkstreamVaultRecord>(vaultRoot, '_BAC/workstreams'),
-      readJsonDirectory<DispatchVaultRecord>(vaultRoot, '_BAC/dispatches'),
+      readDispatchJsonlDirectory(vaultRoot, '_BAC/dispatches'),
       readJsonDirectory<QueueVaultRecord>(vaultRoot, '_BAC/queue'),
       readJsonDirectory<ReminderVaultRecord>(vaultRoot, '_BAC/reminders'),
       readJsonDirectory<CodingSessionVaultRecord>(vaultRoot, '_BAC/coding/sessions'),

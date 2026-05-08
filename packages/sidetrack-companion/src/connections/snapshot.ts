@@ -2,9 +2,15 @@ import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { ANNOTATION_CREATED, isAnnotationCreatedPayload } from '../annotations/events.js';
-import { DISPATCH_LINKED, isDispatchLinkedPayload } from '../dispatches/events.js';
+import {
+  DISPATCH_LINKED,
+  DISPATCH_RECORDED,
+  isDispatchLinkedPayload,
+  isDispatchRecordedPayload,
+} from '../dispatches/events.js';
 import { createRevision } from '../domain/ids.js';
 import { QUEUE_CREATED, isQueueCreatedPayload } from '../queue/events.js';
+import { CAPTURE_RECORDED, isCaptureRecordedPayload } from '../recall/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import {
   THREAD_UPSERTED,
@@ -15,6 +21,7 @@ import {
   WORKSTREAM_UPSERTED,
   isWorkstreamUpsertedPayload,
 } from '../workstreams/events.js';
+import { findThreadQuotes, type ThreadText } from './quoteIndex.js';
 import {
   edgeIdFor,
   nodeIdFor,
@@ -26,6 +33,7 @@ import {
   type ConnectionsSnapshot,
   type ConnectionsSnapshotScope,
 } from './types.js';
+import { extractUrlsFromText } from './urlExtractor.js';
 
 export type { ConnectionsSnapshot } from './types.js';
 
@@ -35,7 +43,7 @@ export type { ConnectionsSnapshot } from './types.js';
 // records. Same input → byte-equivalent output across replays and
 // replicas. No wall-clock, no inference, no time-proximity edges.
 //
-// MVP edge set (12 deterministic edges):
+// Edge set (16 emitted, 17 declared):
 //   thread_in_workstream                 thread.primaryWorkstreamId
 //   workstream_parent_of                 workstream.parentId
 //   dispatch_from_thread                 dispatch record sourceThreadId
@@ -47,6 +55,14 @@ export type { ConnectionsSnapshot } from './types.js';
 //   coding_session_in_workstream         coding session workstreamId
 //   timeline_same_url_as_thread          canonical-URL match
 //   annotation_targets_thread            annotation URL matches thread URL
+//   thread_references_url                URL in capture.recorded turn text
+//   dispatch_references_url              URL in dispatch.recorded body
+//   annotation_references_url            URL in annotation.created note
+//   thread_quotes_thread                 ≥40-char substring across capture turns
+//
+// `annotation_targets_workstream` is declared in the edge-kind union
+// for completeness but not yet emitted (workstream-anchored
+// annotations land in a follow-up PR).
 
 // Minimal record shapes pulled from the companion vault. Defined
 // locally so this module doesn't depend on the HTTP schema package.
@@ -232,6 +248,13 @@ const stripFragmentAndTrailingSlash = (url: string): string =>
 //         vault-derived edges.
 // Pass 3: cross-cutting joins (timeline ↔ thread URL, annotation ↔
 //         thread URL).
+// Pass 4: content-derived URL refs — extract URLs from
+//         capture.recorded turn text / dispatch.recorded body /
+//         annotation.created note; emit *_references_url edges when
+//         the URL matches a timeline-visit canonical key.
+// Pass 5: cross-thread substring quotes — emit thread_quotes_thread
+//         edges when one captured turn contains a contiguous ≥40-char
+//         substring of another's.
 // ---------------------------------------------------------------------------
 
 export const buildConnectionsSnapshot = (
@@ -467,6 +490,26 @@ export const buildConnectionsSnapshot = (
         ...(t.title === undefined ? {} : { title: t.title }),
       },
     });
+    // The thread vault record is the projection source-of-truth for
+    // current primaryWorkstreamId. Emit `thread_in_workstream` from
+    // here as well as from THREAD_UPSERTED events — otherwise a
+    // partial-log scenario (catchup, archive-import) would be missing
+    // the membership edge whenever the upsert event has scrolled out.
+    if (typeof t.primaryWorkstreamId === 'string' && t.primaryWorkstreamId.length > 0) {
+      upsertNode(nodes, {
+        kind: 'workstream',
+        key: t.primaryWorkstreamId,
+        label: t.primaryWorkstreamId,
+      });
+      upsertEdge(edges, {
+        kind: 'thread_in_workstream',
+        fromNodeId: nodeIdFor('thread', t.bac_id),
+        toNodeId: nodeIdFor('workstream', t.primaryWorkstreamId),
+        observedAt: t.lastSeenAt ?? '',
+        producedBy: { source: 'workboard-state', recordId: t.bac_id },
+        confidence: 'explicit',
+      });
+    }
   }
   for (const w of input.workstreams) {
     upsertNode(nodes, {
@@ -697,6 +740,240 @@ export const buildConnectionsSnapshot = (
       },
       confidence: 'deterministic',
     });
+  }
+
+  // -------------------------------------------------------------------
+  // Pass 4 — content-derived URL refs. For each event whose payload
+  // carries free text that may include URLs (capture turns, dispatch
+  // bodies, annotation notes), pull URLs through the same canonical-
+  // form pipeline timeline visits use, then emit a *_references_url
+  // edge whenever the URL matches an existing timeline-visit node.
+  //
+  // Skip on no-match — no phantom visit nodes (same posture as
+  // timeline_same_url_as_thread).
+  // -------------------------------------------------------------------
+  const visitIdByCanonical = new Map<string, string>();
+  for (const node of nodes.values()) {
+    if (node.kind !== 'timeline-visit') continue;
+    // Visit node keys are the canonical URL (post-strip) by
+    // construction in pass 3. Re-derive from metadata defensively in
+    // case future code paths add timeline-visit nodes elsewhere.
+    const canonicalUrl =
+      (typeof node.metadata['canonicalUrl'] === 'string'
+        ? (node.metadata['canonicalUrl'] as string)
+        : undefined) ??
+      (typeof node.metadata['url'] === 'string' ? (node.metadata['url'] as string) : undefined);
+    const key =
+      canonicalUrl !== undefined
+        ? stripFragmentAndTrailingSlash(canonicalUrl)
+        : node.id.slice('timeline-visit:'.length);
+    visitIdByCanonical.set(key, node.id);
+  }
+
+  const emitUrlRefEdge = (input: {
+    fromNodeId: string;
+    canonicalUrl: string;
+    observedAt: string;
+    kind: 'thread_references_url' | 'dispatch_references_url' | 'annotation_references_url';
+    eventType: string;
+    replicaId: string;
+    seq: number;
+  }): void => {
+    const visitId = visitIdByCanonical.get(input.canonicalUrl);
+    if (visitId === undefined) return;
+    upsertEdge(edges, {
+      kind: input.kind,
+      fromNodeId: input.fromNodeId,
+      toNodeId: visitId,
+      observedAt: input.observedAt,
+      producedBy: {
+        source: 'event-log',
+        eventType: input.eventType,
+        dot: { replicaId: input.replicaId, seq: input.seq },
+      },
+      confidence: 'deterministic',
+    });
+  };
+
+  for (const event of input.events) {
+    const observedAtIso = new Date(event.acceptedAtMs).toISOString();
+    const replicaId = event.dot.replicaId;
+    const seq = event.dot.seq;
+
+    if (event.type === CAPTURE_RECORDED && isCaptureRecordedPayload(event.payload)) {
+      const p = event.payload;
+      // The capture event's `bac_id` is the per-capture event id;
+      // `threadId` is the thread aggregate id when the producer
+      // knows it. Prefer threadId so URL-ref edges and quote edges
+      // attribute to the actual thread node — falling back to
+      // `bac_id` keeps unit-test fixtures (which use `bac_id` as
+      // the thread id) working.
+      const threadKey = p.threadId ?? p.bac_id;
+      upsertNode(nodes, { kind: 'thread', key: threadKey, label: p.title ?? threadKey });
+      const threadNodeId = nodeIdFor('thread', threadKey);
+      const seenForThisEvent = new Set<string>();
+      for (const turn of p.turns ?? []) {
+        const sources: (string | undefined)[] = [turn.text, turn.markdown, turn.formattedText];
+        for (const source of sources) {
+          if (typeof source !== 'string' || source.length === 0) continue;
+          for (const url of extractUrlsFromText(source)) {
+            if (seenForThisEvent.has(url)) continue;
+            seenForThisEvent.add(url);
+            emitUrlRefEdge({
+              fromNodeId: threadNodeId,
+              canonicalUrl: url,
+              observedAt: observedAtIso,
+              kind: 'thread_references_url',
+              eventType: CAPTURE_RECORDED,
+              replicaId,
+              seq,
+            });
+          }
+        }
+      }
+      continue;
+    }
+
+    if (event.type === DISPATCH_RECORDED && isDispatchRecordedPayload(event.payload)) {
+      const p = event.payload;
+      upsertNode(nodes, { kind: 'dispatch', key: p.bac_id, label: p.bac_id });
+      const dispatchNodeId = nodeIdFor('dispatch', p.bac_id);
+      for (const url of extractUrlsFromText(p.body)) {
+        emitUrlRefEdge({
+          fromNodeId: dispatchNodeId,
+          canonicalUrl: url,
+          observedAt: observedAtIso,
+          kind: 'dispatch_references_url',
+          eventType: DISPATCH_RECORDED,
+          replicaId,
+          seq,
+        });
+      }
+      continue;
+    }
+
+    if (event.type === ANNOTATION_CREATED && isAnnotationCreatedPayload(event.payload)) {
+      const p = event.payload;
+      // Annotation node was already upserted in pass 1; reuse its id.
+      const annotationNodeId = nodeIdFor('annotation', p.bac_id);
+      for (const url of extractUrlsFromText(p.note)) {
+        emitUrlRefEdge({
+          fromNodeId: annotationNodeId,
+          canonicalUrl: url,
+          observedAt: observedAtIso,
+          kind: 'annotation_references_url',
+          eventType: ANNOTATION_CREATED,
+          replicaId,
+          seq,
+        });
+      }
+      continue;
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Pass 5 — cross-thread substring quotes. Group capture.recorded
+  // events by threadId, sort each group by (acceptedAtMs, replicaId,
+  // seq) for order-independent concatenation, then run the deterministic
+  // shingle index. Emit thread_quotes_thread edges per qualifying pair.
+  // -------------------------------------------------------------------
+  interface CaptureGroupEntry {
+    readonly text: string;
+    readonly acceptedAtMs: number;
+    readonly observedAt: string;
+    readonly replicaId: string;
+    readonly seq: number;
+  }
+  const captureByThread = new Map<string, CaptureGroupEntry[]>();
+  for (const event of input.events) {
+    if (event.type !== CAPTURE_RECORDED) continue;
+    if (!isCaptureRecordedPayload(event.payload)) continue;
+    const p = event.payload;
+    const parts: string[] = [];
+    for (const turn of p.turns ?? []) {
+      if (typeof turn.text === 'string' && turn.text.length > 0) parts.push(turn.text);
+      if (typeof turn.markdown === 'string' && turn.markdown.length > 0) parts.push(turn.markdown);
+      if (typeof turn.formattedText === 'string' && turn.formattedText.length > 0)
+        parts.push(turn.formattedText);
+    }
+    if (parts.length === 0) continue;
+    // Group by the actual thread id (with bac_id fallback for the
+    // unit-test convention).
+    const threadKey = p.threadId ?? p.bac_id;
+    const list = captureByThread.get(threadKey);
+    const entry: CaptureGroupEntry = {
+      text: parts.join('\n'),
+      acceptedAtMs: event.acceptedAtMs,
+      observedAt: new Date(event.acceptedAtMs).toISOString(),
+      replicaId: event.dot.replicaId,
+      seq: event.dot.seq,
+    };
+    if (list === undefined) {
+      captureByThread.set(threadKey, [entry]);
+    } else {
+      list.push(entry);
+    }
+  }
+
+  const threadTexts: ThreadText[] = [];
+  // Track the latest observation + a representative dot per thread,
+  // so the emitted edge's observedAt is order-independent and the
+  // producedBy dot is deterministic.
+  const threadLatest = new Map<
+    string,
+    { readonly observedAt: string; readonly replicaId: string; readonly seq: number }
+  >();
+  // Sort threads by id for deterministic threadTexts iteration order.
+  const sortedThreadIds = [...captureByThread.keys()].sort();
+  for (const threadId of sortedThreadIds) {
+    const entries = captureByThread.get(threadId)!;
+    entries.sort((a, b) => {
+      if (a.acceptedAtMs !== b.acceptedAtMs) return a.acceptedAtMs - b.acceptedAtMs;
+      if (a.replicaId !== b.replicaId) return a.replicaId < b.replicaId ? -1 : 1;
+      return a.seq - b.seq;
+    });
+    threadTexts.push({ threadId, text: entries.map((e) => e.text).join('\n') });
+    const last = entries[entries.length - 1]!;
+    threadLatest.set(threadId, {
+      observedAt: last.observedAt,
+      replicaId: last.replicaId,
+      seq: last.seq,
+    });
+  }
+
+  if (threadTexts.length >= 2) {
+    const quoteMatches = findThreadQuotes(threadTexts);
+    for (const match of quoteMatches) {
+      // Lazy-create both endpoint thread nodes.
+      upsertNode(nodes, { kind: 'thread', key: match.fromThreadId, label: match.fromThreadId });
+      upsertNode(nodes, { kind: 'thread', key: match.toThreadId, label: match.toThreadId });
+      const fromLatest = threadLatest.get(match.fromThreadId);
+      const toLatest = threadLatest.get(match.toThreadId);
+      const observedAt =
+        fromLatest === undefined || toLatest === undefined
+          ? ''
+          : fromLatest.observedAt > toLatest.observedAt
+            ? fromLatest.observedAt
+            : toLatest.observedAt;
+      // Pick the "from" thread's dot for provenance — that's the
+      // thread whose capture event surfaced the quote.
+      const fromDot = fromLatest ?? toLatest;
+      upsertEdge(edges, {
+        kind: 'thread_quotes_thread',
+        fromNodeId: nodeIdFor('thread', match.fromThreadId),
+        toNodeId: nodeIdFor('thread', match.toThreadId),
+        observedAt,
+        producedBy: {
+          source: 'event-log',
+          eventType: CAPTURE_RECORDED,
+          recordId: match.recordIdHashPrefix,
+          ...(fromDot === undefined
+            ? {}
+            : { dot: { replicaId: fromDot.replicaId, seq: fromDot.seq } }),
+        },
+        confidence: 'deterministic',
+      });
+    }
   }
 
   // -------------------------------------------------------------------
