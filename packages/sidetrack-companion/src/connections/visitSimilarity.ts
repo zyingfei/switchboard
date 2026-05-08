@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 
+import { buildAnnIndex } from '../recall/ann-index.js';
 import { RECALL_MODEL } from '../recall/modelManifest.js';
 import {
   buildLexicalIndex,
@@ -296,6 +297,10 @@ export const buildVisitSimilarity = async (
   const passageVectors = embedded.slice(0, passageTexts.length);
   const queryVectors = embedded.slice(passageTexts.length);
   const indexEntries = indexEntriesForVisits(eligible, passageVectors);
+  const vectorIndex = await buildAnnIndex({
+    revisionId,
+    items: indexEntries,
+  });
   const edges: VisitSimilarityEdge[] = [];
 
   for (let sourceIndex = 0; sourceIndex < eligible.length; sourceIndex += 1) {
@@ -312,6 +317,8 @@ export const buildVisitSimilarity = async (
         {
           limit: topK,
           lexical: buildLexicalIndex(candidateEntries),
+          vectorIndex,
+          excludeIds: new Set<string>([source.visitKey]),
         },
       ),
     ].sort((left, right) => {
