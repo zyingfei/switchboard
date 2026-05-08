@@ -353,6 +353,25 @@ describe('live side-panel App wiring', () => {
         workstreamId: 'bac_workstream_sibling',
       });
     });
+    await waitFor(() => {
+      expect(sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: messageTypes.postConnectionsFeedbackEvent,
+          event: {
+            type: 'user.organized.item',
+            payload: {
+              payloadVersion: 1,
+              itemKind: 'thread',
+              itemId: 'bac_thread_test',
+              action: 'move',
+              fromContainer: 'bac_workstream_root',
+              toContainer: 'bac_workstream_sibling',
+            },
+          },
+          clientEventId: expect.stringMatching(/^feedback-user\.organized\.item-/u),
+        }),
+      );
+    });
   });
 
   it('routes drag/drop across workstream pills through the moveThread message', async () => {

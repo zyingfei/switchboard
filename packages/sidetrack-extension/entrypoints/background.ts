@@ -3044,9 +3044,36 @@ export default defineBackground(() => {
     }
   };
 
+  const postConnectionsFeedbackHttp = async (
+    event: unknown,
+    clientEventId: string,
+  ): Promise<{ ok: boolean; data?: unknown; error?: string }> => {
+    try {
+      const body = await companionJson('/v1/feedback/events', {
+        method: 'POST',
+        headers: { 'idempotency-key': idempotencyKey('feedback', clientEventId) },
+        body: JSON.stringify(event),
+      });
+      return { ok: true, data: isObjectRecord(body) ? body['data'] : undefined };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  };
+
   const handleConnectionsMessage = async (
     message: Record<string, unknown>,
   ): Promise<{ ok: boolean; data?: unknown; error?: string } | null> => {
+    if (message['type'] === messageTypes.postConnectionsFeedbackEvent) {
+      const event = message['event'];
+      const clientEventId =
+        typeof message['clientEventId'] === 'string' && message['clientEventId'].length > 0
+          ? message['clientEventId']
+          : `feedback-${String(Date.now())}`;
+      const result = await postConnectionsFeedbackHttp(event, clientEventId);
+      if (result.ok) connectionsCache.clear();
+      return result;
+    }
+
     const cacheKey = JSON.stringify(message);
     const now = Date.now();
     const cached = connectionsCache.get(cacheKey);
@@ -3297,7 +3324,8 @@ export default defineBackground(() => {
         'type' in message &&
         ((message as { type?: unknown }).type === messageTypes.loadConnectionsSnapshot ||
           (message as { type?: unknown }).type === messageTypes.loadConnectionsNeighbors ||
-          (message as { type?: unknown }).type === messageTypes.loadConnectionsEdge)
+          (message as { type?: unknown }).type === messageTypes.loadConnectionsEdge ||
+          (message as { type?: unknown }).type === messageTypes.postConnectionsFeedbackEvent)
       ) {
         void handleConnectionsMessage(message as Record<string, unknown>)
           .then((result) => {
