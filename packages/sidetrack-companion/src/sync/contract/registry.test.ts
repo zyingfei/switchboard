@@ -156,11 +156,14 @@ describe('sync contract registry', () => {
   });
 
 
-  it('every registry entry stamps currentPayloadVersion', () => {
-    const missing = CONTRACT_REGISTRY.filter((entry) => entry.currentPayloadVersion === undefined).map(
+  it('every registry entry stamps currentPayloadVersion >= 1', () => {
+    const invalid = CONTRACT_REGISTRY.filter(
+      (entry) =>
+        typeof entry.currentPayloadVersion !== 'number' || entry.currentPayloadVersion < 1,
+    ).map(
       (entry) => entry.eventType,
     );
-    expect(missing, `entries missing currentPayloadVersion: ${missing.join(', ')}`).toEqual([]);
+    expect(invalid, `entries with invalid currentPayloadVersion: ${invalid.join(', ')}`).toEqual([]);
   });
   it('no entry has an empty surfaces[]', () => {
     const empty = CONTRACT_REGISTRY.filter((entry) => entry.surfaces.length === 0).map(

@@ -44,9 +44,17 @@ export interface RecallTombstonePayload {
   readonly dimensions?: Record<string, unknown>;
 }
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null;
+
+const hasValidPayloadExtensionFields = (value: Record<string, unknown>): boolean =>
+  (value['payloadVersion'] === undefined ||
+    (typeof value['payloadVersion'] === 'number' && value['payloadVersion'] >= 1)) &&
+  (value['dimensions'] === undefined || isRecord(value['dimensions']));
+
 export const isCaptureRecordedPayload = (value: unknown): value is CaptureRecordedPayload => {
-  if (typeof value !== 'object' || value === null) return false;
-  const v = value as Record<string, unknown>;
+  if (!isRecord(value)) return false;
+  const v = value;
   if (typeof v['bac_id'] !== 'string') return false;
   if (typeof v['capturedAt'] !== 'string') return false;
   if (!Array.isArray(v['turns'])) return false;
@@ -54,7 +62,6 @@ export const isCaptureRecordedPayload = (value: unknown): value is CaptureRecord
 };
 
 export const isRecallTombstonePayload = (value: unknown): value is RecallTombstonePayload => {
-  if (typeof value !== 'object' || value === null) return false;
-  const v = value as Record<string, unknown>;
-  return typeof v['threadId'] === 'string';
+  if (!isRecord(value)) return false;
+  return typeof value['threadId'] === 'string' && hasValidPayloadExtensionFields(value);
 };
