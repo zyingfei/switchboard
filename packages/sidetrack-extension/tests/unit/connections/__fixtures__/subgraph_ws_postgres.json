@@ -1,0 +1,352 @@
+{
+  "scope": "companion-extended",
+  "snapshot": {
+    "scope": {
+      "nodeId": "workstream:ws_postgres",
+      "hops": 2
+    },
+    "nodes": [
+      {
+        "id": "dispatch:d_pg_codex",
+        "kind": "dispatch",
+        "label": "Codex — refactor migration to ON CONFLICT",
+        "firstSeenAt": "2026-05-07T09:32:00.000Z",
+        "lastSeenAt": "2026-05-07T09:32:00.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "provider": "codex",
+          "status": "sent",
+          "title": "Codex — refactor migration to ON CONFLICT"
+        }
+      },
+      {
+        "id": "queue-item:q_pg_t",
+        "kind": "queue-item",
+        "label": "document MERGE isolation pitfall",
+        "firstSeenAt": "2026-05-07T09:35:00.000Z",
+        "lastSeenAt": "2026-05-07T09:35:00.000Z",
+        "originReplicaIds": [
+          "replica-mac"
+        ],
+        "metadata": {
+          "status": "pending",
+          "title": "document MERGE isolation pitfall"
+        }
+      },
+      {
+        "id": "thread:t_pg_chatgpt",
+        "kind": "thread",
+        "label": "ChatGPT — review SQL plan",
+        "firstSeenAt": "2026-05-07T09:28:00.000Z",
+        "lastSeenAt": "2026-05-07T09:28:00.000Z",
+        "originReplicaIds": [
+          "replica-mac"
+        ],
+        "metadata": {
+          "canonicalUrl": "https://chatgpt.com/c/pg_review",
+          "provider": "chatgpt",
+          "title": "ChatGPT — review SQL plan",
+          "url": "https://chatgpt.com/c/pg_review",
+          "workstreamId": "ws_postgres"
+        }
+      },
+      {
+        "id": "thread:t_pg_claude",
+        "kind": "thread",
+        "label": "Claude — MERGE vs UPSERT",
+        "firstSeenAt": "2026-05-07T09:24:00.000Z",
+        "lastSeenAt": "2026-05-07T09:35:00.000Z",
+        "originReplicaIds": [
+          "replica-mac"
+        ],
+        "metadata": {
+          "canonicalUrl": "https://claude.ai/chat/pg_thread",
+          "provider": "claude",
+          "title": "Claude — MERGE vs UPSERT",
+          "url": "https://claude.ai/chat/pg_thread",
+          "workstreamId": "ws_postgres"
+        }
+      },
+      {
+        "id": "timeline-visit:https://blog.example.com/merge-pitfalls",
+        "kind": "timeline-visit",
+        "label": "MERGE pitfalls (blog)",
+        "firstSeenAt": "2026-05-07T09:15:00.000Z",
+        "lastSeenAt": "2026-05-07T09:15:00.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "canonicalUrl": "https://blog.example.com/merge-pitfalls",
+          "title": "MERGE pitfalls (blog)",
+          "url": "https://blog.example.com/merge-pitfalls",
+          "visitCount": 1
+        }
+      },
+      {
+        "id": "timeline-visit:https://chatgpt.com/c/pg_review",
+        "kind": "timeline-visit",
+        "label": "ChatGPT — pg review",
+        "firstSeenAt": "2026-05-07T09:27:00.000Z",
+        "lastSeenAt": "2026-05-07T09:27:00.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "canonicalUrl": "https://chatgpt.com/c/pg_review",
+          "title": "ChatGPT — pg review",
+          "url": "https://chatgpt.com/c/pg_review",
+          "visitCount": 1
+        }
+      },
+      {
+        "id": "timeline-visit:https://claude.ai/chat/pg_thread",
+        "kind": "timeline-visit",
+        "label": "Claude — pg chat",
+        "firstSeenAt": "2026-05-07T09:23:00.000Z",
+        "lastSeenAt": "2026-05-07T09:23:00.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "canonicalUrl": "https://claude.ai/chat/pg_thread",
+          "title": "Claude — pg chat",
+          "url": "https://claude.ai/chat/pg_thread",
+          "visitCount": 1
+        }
+      },
+      {
+        "id": "timeline-visit:https://news.ycombinator.com/item?id=42_pgmerge",
+        "kind": "timeline-visit",
+        "label": "HN: postgres MERGE pitfalls",
+        "firstSeenAt": "2026-05-07T09:16:00.000Z",
+        "lastSeenAt": "2026-05-07T09:16:00.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "canonicalUrl": "https://news.ycombinator.com/item?id=42_pgmerge",
+          "title": "HN: postgres MERGE pitfalls",
+          "url": "https://news.ycombinator.com/item?id=42_pgmerge",
+          "visitCount": 2
+        }
+      },
+      {
+        "id": "timeline-visit:https://www.postgresql.org/docs/current/sql-merge.html",
+        "kind": "timeline-visit",
+        "label": "PostgreSQL: MERGE",
+        "firstSeenAt": "2026-05-07T09:20:00.000Z",
+        "lastSeenAt": "2026-05-07T09:20:00.000Z",
+        "originReplicaIds": [],
+        "metadata": {
+          "canonicalUrl": "https://www.postgresql.org/docs/current/sql-merge.html",
+          "title": "PostgreSQL: MERGE",
+          "url": "https://www.postgresql.org/docs/current/sql-merge.html",
+          "visitCount": 1
+        }
+      },
+      {
+        "id": "workstream:ws_postgres",
+        "kind": "workstream",
+        "label": "Postgres · MERGE semantics",
+        "firstSeenAt": "2026-05-07T08:57:00.000Z",
+        "lastSeenAt": "2026-05-07T09:28:00.000Z",
+        "originReplicaIds": [
+          "replica-mac"
+        ],
+        "metadata": {
+          "title": "Postgres · MERGE semantics"
+        }
+      }
+    ],
+    "edges": [
+      {
+        "id": "edge:dispatch_from_thread:thread:t_pg_claude:dispatch:d_pg_codex",
+        "kind": "dispatch_from_thread",
+        "fromNodeId": "thread:t_pg_claude",
+        "toNodeId": "dispatch:d_pg_codex",
+        "observedAt": "2026-05-07T09:32:00.000Z",
+        "producedBy": {
+          "source": "workboard-state",
+          "recordId": "d_pg_codex"
+        },
+        "confidence": "explicit"
+      },
+      {
+        "id": "edge:dispatch_in_workstream:dispatch:d_pg_codex:workstream:ws_postgres",
+        "kind": "dispatch_in_workstream",
+        "fromNodeId": "dispatch:d_pg_codex",
+        "toNodeId": "workstream:ws_postgres",
+        "observedAt": "2026-05-07T09:32:00.000Z",
+        "producedBy": {
+          "source": "workboard-state",
+          "recordId": "d_pg_codex"
+        },
+        "confidence": "explicit"
+      },
+      {
+        "id": "edge:dispatch_references_url:dispatch:d_pg_codex:timeline-visit:https://blog.example.com/merge-pitfalls",
+        "kind": "dispatch_references_url",
+        "fromNodeId": "dispatch:d_pg_codex",
+        "toNodeId": "timeline-visit:https://blog.example.com/merge-pitfalls",
+        "observedAt": "2026-05-07T09:32:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "dispatch.recorded",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 36
+          }
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:queue_targets_thread:queue-item:q_pg_t:thread:t_pg_claude",
+        "kind": "queue_targets_thread",
+        "fromNodeId": "queue-item:q_pg_t",
+        "toNodeId": "thread:t_pg_claude",
+        "observedAt": "2026-05-07T09:35:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "queue.created",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 39
+          }
+        },
+        "confidence": "explicit"
+      },
+      {
+        "id": "edge:thread_in_workstream:thread:t_pg_chatgpt:workstream:ws_postgres",
+        "kind": "thread_in_workstream",
+        "fromNodeId": "thread:t_pg_chatgpt",
+        "toNodeId": "workstream:ws_postgres",
+        "observedAt": "2026-05-07T09:28:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "thread.upserted",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 28
+          }
+        },
+        "confidence": "explicit"
+      },
+      {
+        "id": "edge:thread_in_workstream:thread:t_pg_claude:workstream:ws_postgres",
+        "kind": "thread_in_workstream",
+        "fromNodeId": "thread:t_pg_claude",
+        "toNodeId": "workstream:ws_postgres",
+        "observedAt": "2026-05-07T09:24:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "thread.upserted",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 25
+          }
+        },
+        "confidence": "explicit"
+      },
+      {
+        "id": "edge:thread_quotes_thread:thread:t_pg_chatgpt:thread:t_pg_claude",
+        "kind": "thread_quotes_thread",
+        "fromNodeId": "thread:t_pg_chatgpt",
+        "toNodeId": "thread:t_pg_claude",
+        "observedAt": "2026-05-07T09:28:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "capture.recorded",
+          "recordId": "051c39b38a5a",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 29
+          }
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:thread_quotes_thread:thread:t_pg_claude:thread:t_pg_chatgpt",
+        "kind": "thread_quotes_thread",
+        "fromNodeId": "thread:t_pg_claude",
+        "toNodeId": "thread:t_pg_chatgpt",
+        "observedAt": "2026-05-07T09:28:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "capture.recorded",
+          "recordId": "051c39b38a5a",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 26
+          }
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:thread_references_url:thread:t_pg_claude:timeline-visit:https://blog.example.com/merge-pitfalls",
+        "kind": "thread_references_url",
+        "fromNodeId": "thread:t_pg_claude",
+        "toNodeId": "timeline-visit:https://blog.example.com/merge-pitfalls",
+        "observedAt": "2026-05-07T09:24:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "capture.recorded",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 26
+          }
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:thread_references_url:thread:t_pg_claude:timeline-visit:https://news.ycombinator.com/item?id=42_pgmerge",
+        "kind": "thread_references_url",
+        "fromNodeId": "thread:t_pg_claude",
+        "toNodeId": "timeline-visit:https://news.ycombinator.com/item?id=42_pgmerge",
+        "observedAt": "2026-05-07T09:24:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "capture.recorded",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 26
+          }
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:thread_references_url:thread:t_pg_claude:timeline-visit:https://www.postgresql.org/docs/current/sql-merge.html",
+        "kind": "thread_references_url",
+        "fromNodeId": "thread:t_pg_claude",
+        "toNodeId": "timeline-visit:https://www.postgresql.org/docs/current/sql-merge.html",
+        "observedAt": "2026-05-07T09:24:00.000Z",
+        "producedBy": {
+          "source": "event-log",
+          "eventType": "capture.recorded",
+          "dot": {
+            "replicaId": "replica-mac",
+            "seq": 26
+          }
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:timeline_same_url_as_thread:timeline-visit:https://chatgpt.com/c/pg_review:thread:t_pg_chatgpt",
+        "kind": "timeline_same_url_as_thread",
+        "fromNodeId": "timeline-visit:https://chatgpt.com/c/pg_review",
+        "toNodeId": "thread:t_pg_chatgpt",
+        "observedAt": "2026-05-07T09:27:00.000Z",
+        "producedBy": {
+          "source": "timeline-projection"
+        },
+        "confidence": "deterministic"
+      },
+      {
+        "id": "edge:timeline_same_url_as_thread:timeline-visit:https://claude.ai/chat/pg_thread:thread:t_pg_claude",
+        "kind": "timeline_same_url_as_thread",
+        "fromNodeId": "timeline-visit:https://claude.ai/chat/pg_thread",
+        "toNodeId": "thread:t_pg_claude",
+        "observedAt": "2026-05-07T09:23:00.000Z",
+        "producedBy": {
+          "source": "timeline-projection"
+        },
+        "confidence": "deterministic"
+      }
+    ],
+    "updatedAt": "2026-05-07T09:42:00.000Z",
+    "nodeCount": 10,
+    "edgeCount": 13
+  }
+}

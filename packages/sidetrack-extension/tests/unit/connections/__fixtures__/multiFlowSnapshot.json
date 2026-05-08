@@ -1,0 +1,1250 @@
+{
+  "scope": {},
+  "nodes": [
+    {
+      "id": "annotation:a_cve_kernel",
+      "kind": "annotation",
+      "label": "the unsafe path is here. cross-ref https://nvd.nist.gov/vuln/detail/CVE-2024-123",
+      "firstSeenAt": "2026-05-07T09:35:30.000Z",
+      "lastSeenAt": "2026-05-07T09:35:30.000Z",
+      "originReplicaIds": [
+        "replica-mac"
+      ],
+      "metadata": {
+        "title": "man copy_file_range",
+        "url": "https://kernel.org/doc/man-pages/online/copy_file_range.2.html"
+      }
+    },
+    {
+      "id": "annotation:a_cve_thread",
+      "kind": "annotation",
+      "label": "check assistant assumed AF_UNIX abstract namespace",
+      "firstSeenAt": "2026-05-07T09:35:45.000Z",
+      "lastSeenAt": "2026-05-07T09:35:45.000Z",
+      "originReplicaIds": [
+        "replica-mac"
+      ],
+      "metadata": {
+        "title": "Claude — CVE chat",
+        "url": "https://claude.ai/chat/cve_thread"
+      }
+    },
+    {
+      "id": "annotation:a_pg_doc",
+      "kind": "annotation",
+      "label": "note: see https://blog.example.com/merge-pitfalls for the failure mode.",
+      "firstSeenAt": "2026-05-07T09:36:00.000Z",
+      "lastSeenAt": "2026-05-07T09:36:00.000Z",
+      "originReplicaIds": [
+        "replica-mac"
+      ],
+      "metadata": {
+        "title": "PostgreSQL: MERGE",
+        "url": "https://www.postgresql.org/docs/current/sql-merge.html"
+      }
+    },
+    {
+      "id": "annotation:a_sb_brainstorm",
+      "kind": "annotation",
+      "label": "needs §27 cross-ref to BRAINSTORM",
+      "firstSeenAt": "2026-05-07T09:35:00.000Z",
+      "lastSeenAt": "2026-05-07T09:35:00.000Z",
+      "originReplicaIds": [
+        "replica-mac"
+      ],
+      "metadata": {
+        "title": "BRAINSTORM.md",
+        "url": "https://github.com/sidetrack-co/sidetrack/blob/main/BRAINSTORM.md"
+      }
+    },
+    {
+      "id": "coding-session:cs_cve_vm",
+      "kind": "coding-session",
+      "label": "cs_cve_vm",
+      "firstSeenAt": "2026-05-07T09:42:00.000Z",
+      "lastSeenAt": "2026-05-07T09:42:00.000Z",
+      "originReplicaIds": [],
+      "metadata": {
+        "provider": "codex",
+        "sourcePath": "/work/cve-repro",
+        "status": "attached",
+        "title": "cve-vm"
+      }
+    },
+    {
+      "id": "coding-session:cs_sb_refactor",
+      "kind": "coding-session",
+      "label": "sidetrack-refactor",
+      "firstSeenAt": "2026-05-07T09:42:00.000Z",
+      "lastSeenAt": "2026-05-07T09:42:00.000Z",
+      "originReplicaIds": [],
+      "metadata": {
+        "provider": "claude_code",
+        "sourcePath": "/work/sidetrack",
+        "status": "attached",
+        "title": "sidetrack-refactor"
+      }
+    },
+    {
+      "id": "dispatch:d_cve_codex",
+      "kind": "dispatch",
+      "label": "Codex — Python repro for CVE-2024-12345",
+      "firstSeenAt": "2026-05-07T09:22:00.000Z",
+      "lastSeenAt": "2026-05-07T09:33:00.000Z",
+      "originReplicaIds": [
+        "replica-mac"
+      ],
+      "metadata": {
+        "provider": "codex",
+        "status": "sent",
+        "title": "Codex — Python repro for CVE-2024-12345"
+      }
+    },
+    {
+      "id": "dispatch:d_pg_codex",
+      "kind": "dispatch",
+      "label": "Codex — refactor migration to ON CONFLICT",
+      "firstSeenAt": "2026-05-07T09:32:00.000Z",
+      "lastSeenAt": "2026-05-07T09:32:00.000Z",
+      "originReplicaIds": [],
+      "metadata": {
+        "provider": "codex",
+        "status": "sent",
+        "title": "Codex — refactor migration to ON CONFLICT"
+      }
+    },
+    {
+      "id": "dispatch:d_sb_refactor",
+      "kind": "dispatch",
+      "label": "Claude Code — refactor reducer pass-2",
+      "firstSeenAt": "2026-05-07T09:24:00.000Z",
+      "lastSeenAt": "2026-05-07T09:24:00.000Z",
+      "originReplicaIds": [],
+      "metadata": {
+        "provider": "claude_code",
+        "status": "sent",
+        "title": "Claude Code — refactor reducer pass-2"
+      }
+    },
+    {
+      "id": "inbound-reminder:r_cve_t",
+      "kind": "inbound-reminder",
+      "label": "t_cve_claude",
+      "firstSeenAt": "2026-05-07T09:42:00.000Z",
+      "lastSeenAt": "2026-05-07T09:42:00.000Z",
+      "originReplicaIds": [],
+      "metadata": {
+        "provider": "claude",
+        "status": "new",
+        "threadId": "t_cve_claude"
+      }
+    },
+    {
+      "id": "queue-item:q_cve_ws",
+      "kind": "queue-item",
+      "label": "test repro on Ubuntu 22 + 24",
+      "firstSeenAt": "2026-05-07T09:38:00.000Z",
+      "lastSeenAt": "2026-05-07T09:38:00.000Z",
+      "originReplicaIds": [
+        "replica-mac"
+      ],
+      "metadata": {
+        "status": "pending",
+        "title": "test repro on Ubuntu 22 + 24"
+      }
+    },
+    {
+      "id": "queue-item:q_pg_t",
+      "kind": "queue-item",
+      "label": "document MERGE isolation pitfall",
+      "firstSeenAt": "2026-05-07T09:35:00.000Z",
+      "lastSeenAt": "2026-05-07T09:35:00.000Z",
+      "originReplicaIds": [
+        "replica-mac"
+      ],
+      "metadata": {
+        "status": "pending",
+        "title": "document MERGE isolation pitfall"
+      }
+    },
+    {
+      "id": "thread:t_cve_chatgpt",
+      "kind": "thread",
+      "label": "ChatGPT — review CVE repro",
+      "firstSeenAt": "2026-05-07T09:30:00.000Z",
+      "lastSeenAt": "2026-05-07T09:33:00.000Z",
+      "originReplicaIds": [
+        "replica-mac"
+      ],
+      "metadata": {
+        "canonicalUrl": "https://chatgpt.com/c/cve_review",
+        "provider": "chatgpt",
+        "title": "ChatGPT — review CVE repro",
+        "url": "https://chatgpt.com/c/cve_review",
+        "workstreamId": "ws_security"
+      }
+    },
+    {
+      "id": "thread:t_cve_claude",
+      "kind": "thread",
+      "label": "Claude — copy_file_range CVE",
+      "firstSeenAt": "2026-05-07T09:18:00.000Z",
+      "lastSeenAt": "2026-05-07T09:18:00.000Z",
+      "originReplicaIds": [
+        "replica-mac"
+      ],
+      "metadata": {
+        "canonicalUrl": "https://claude.ai/chat/cve_thread",
+        "provider": "claude",
+        "title": "Claude — copy_file_range CVE",
+        "url": "https://claude.ai/chat/cve_thread",
+        "workstreamId": "ws_security"
+      }
+    },
+    {
+      "id": "thread:t_pg_chatgpt",
+      "kind": "thread",
+      "label": "ChatGPT — review SQL plan",
+      "firstSeenAt": "2026-05-07T09:28:00.000Z",
+      "lastSeenAt": "2026-05-07T09:28:00.000Z",
+      "originReplicaIds": [
+        "replica-mac"
+      ],
+      "metadata": {
+        "canonicalUrl": "https://chatgpt.com/c/pg_review",
+        "provider": "chatgpt",
+        "title": "ChatGPT — review SQL plan",
+        "url": "https://chatgpt.com/c/pg_review",
+        "workstreamId": "ws_postgres"
+      }
+    },
+    {
+      "id": "thread:t_pg_claude",
+      "kind": "thread",
+      "label": "Claude — MERGE vs UPSERT",
+      "firstSeenAt": "2026-05-07T09:24:00.000Z",
+      "lastSeenAt": "2026-05-07T09:35:00.000Z",
+      "originReplicaIds": [
+        "replica-mac"
+      ],
+      "metadata": {
+        "canonicalUrl": "https://claude.ai/chat/pg_thread",
+        "provider": "claude",
+        "title": "Claude — MERGE vs UPSERT",
+        "url": "https://claude.ai/chat/pg_thread",
+        "workstreamId": "ws_postgres"
+      }
+    },
+    {
+      "id": "thread:t_sb_chatgpt",
+      "kind": "thread",
+      "label": "ChatGPT — review reducer code",
+      "firstSeenAt": "2026-05-07T09:31:00.000Z",
+      "lastSeenAt": "2026-05-07T09:31:00.000Z",
+      "originReplicaIds": [
+        "replica-mac"
+      ],
+      "metadata": {
+        "canonicalUrl": "https://chatgpt.com/c/sb_review",
+        "provider": "chatgpt",
+        "title": "ChatGPT — review reducer code",
+        "url": "https://chatgpt.com/c/sb_review",
+        "workstreamId": "ws_sidetrack"
+      }
+    },
+    {
+      "id": "thread:t_sb_claude",
+      "kind": "thread",
+      "label": "Claude — m2 dispatch design review",
+      "firstSeenAt": "2026-05-07T09:19:00.000Z",
+      "lastSeenAt": "2026-05-07T09:19:00.000Z",
+      "originReplicaIds": [
+        "replica-mac"
+      ],
+      "metadata": {
+        "canonicalUrl": "https://claude.ai/chat/sb_thread",
+        "provider": "claude",
+        "title": "Claude — m2 dispatch design review",
+        "url": "https://claude.ai/chat/sb_thread",
+        "workstreamId": "ws_sidetrack"
+      }
+    },
+    {
+      "id": "timeline-visit:https://blog.example.com/merge-pitfalls",
+      "kind": "timeline-visit",
+      "label": "MERGE pitfalls (blog)",
+      "firstSeenAt": "2026-05-07T09:15:00.000Z",
+      "lastSeenAt": "2026-05-07T09:15:00.000Z",
+      "originReplicaIds": [],
+      "metadata": {
+        "canonicalUrl": "https://blog.example.com/merge-pitfalls",
+        "title": "MERGE pitfalls (blog)",
+        "url": "https://blog.example.com/merge-pitfalls",
+        "visitCount": 1
+      }
+    },
+    {
+      "id": "timeline-visit:https://chatgpt.com/c/cve_review",
+      "kind": "timeline-visit",
+      "label": "ChatGPT — cve review",
+      "firstSeenAt": "2026-05-07T09:29:00.000Z",
+      "lastSeenAt": "2026-05-07T09:29:00.000Z",
+      "originReplicaIds": [],
+      "metadata": {
+        "canonicalUrl": "https://chatgpt.com/c/cve_review",
+        "title": "ChatGPT — cve review",
+        "url": "https://chatgpt.com/c/cve_review",
+        "visitCount": 1
+      }
+    },
+    {
+      "id": "timeline-visit:https://chatgpt.com/c/pg_review",
+      "kind": "timeline-visit",
+      "label": "ChatGPT — pg review",
+      "firstSeenAt": "2026-05-07T09:27:00.000Z",
+      "lastSeenAt": "2026-05-07T09:27:00.000Z",
+      "originReplicaIds": [],
+      "metadata": {
+        "canonicalUrl": "https://chatgpt.com/c/pg_review",
+        "title": "ChatGPT — pg review",
+        "url": "https://chatgpt.com/c/pg_review",
+        "visitCount": 1
+      }
+    },
+    {
+      "id": "timeline-visit:https://chatgpt.com/c/sb_review",
+      "kind": "timeline-visit",
+      "label": "ChatGPT — sb review",
+      "firstSeenAt": "2026-05-07T09:30:30.000Z",
+      "lastSeenAt": "2026-05-07T09:30:30.000Z",
+      "originReplicaIds": [],
+      "metadata": {
+        "canonicalUrl": "https://chatgpt.com/c/sb_review",
+        "title": "ChatGPT — sb review",
+        "url": "https://chatgpt.com/c/sb_review",
+        "visitCount": 1
+      }
+    },
+    {
+      "id": "timeline-visit:https://claude.ai/chat/cve_thread",
+      "kind": "timeline-visit",
+      "label": "Claude — CVE chat",
+      "firstSeenAt": "2026-05-07T09:18:00.000Z",
+      "lastSeenAt": "2026-05-07T09:18:00.000Z",
+      "originReplicaIds": [],
+      "metadata": {
+        "canonicalUrl": "https://claude.ai/chat/cve_thread",
+        "title": "Claude — CVE chat",
+        "url": "https://claude.ai/chat/cve_thread",
+        "visitCount": 1
+      }
+    },
+    {
+      "id": "timeline-visit:https://claude.ai/chat/pg_thread",
+      "kind": "timeline-visit",
+      "label": "Claude — pg chat",
+      "firstSeenAt": "2026-05-07T09:23:00.000Z",
+      "lastSeenAt": "2026-05-07T09:23:00.000Z",
+      "originReplicaIds": [],
+      "metadata": {
+        "canonicalUrl": "https://claude.ai/chat/pg_thread",
+        "title": "Claude — pg chat",
+        "url": "https://claude.ai/chat/pg_thread",
+        "visitCount": 1
+      }
+    },
+    {
+      "id": "timeline-visit:https://claude.ai/chat/sb_thread",
+      "kind": "timeline-visit",
+      "label": "Claude — sb chat",
+      "firstSeenAt": "2026-05-07T09:18:30.000Z",
+      "lastSeenAt": "2026-05-07T09:18:30.000Z",
+      "originReplicaIds": [],
+      "metadata": {
+        "canonicalUrl": "https://claude.ai/chat/sb_thread",
+        "title": "Claude — sb chat",
+        "url": "https://claude.ai/chat/sb_thread",
+        "visitCount": 1
+      }
+    },
+    {
+      "id": "timeline-visit:https://github.com/sidetrack-co/sidetrack/blob/main/BRAINSTORM.md",
+      "kind": "timeline-visit",
+      "label": "BRAINSTORM.md",
+      "firstSeenAt": "2026-05-07T09:11:00.000Z",
+      "lastSeenAt": "2026-05-07T09:11:00.000Z",
+      "originReplicaIds": [],
+      "metadata": {
+        "canonicalUrl": "https://github.com/sidetrack-co/sidetrack/blob/main/BRAINSTORM.md",
+        "title": "BRAINSTORM.md",
+        "url": "https://github.com/sidetrack-co/sidetrack/blob/main/BRAINSTORM.md",
+        "visitCount": 1
+      }
+    },
+    {
+      "id": "timeline-visit:https://github.com/sidetrack-co/sidetrack/pull/98",
+      "kind": "timeline-visit",
+      "label": "sidetrack/sidetrack PR #98",
+      "firstSeenAt": "2026-05-07T09:05:00.000Z",
+      "lastSeenAt": "2026-05-07T09:05:00.000Z",
+      "originReplicaIds": [],
+      "metadata": {
+        "canonicalUrl": "https://github.com/sidetrack-co/sidetrack/pull/98",
+        "title": "sidetrack/sidetrack PR #98",
+        "url": "https://github.com/sidetrack-co/sidetrack/pull/98",
+        "visitCount": 1
+      }
+    },
+    {
+      "id": "timeline-visit:https://kernel.org/doc/man-pages/online/copy_file_range.2.html",
+      "kind": "timeline-visit",
+      "label": "man copy_file_range(2)",
+      "firstSeenAt": "2026-05-07T09:10:00.000Z",
+      "lastSeenAt": "2026-05-07T09:10:00.000Z",
+      "originReplicaIds": [],
+      "metadata": {
+        "canonicalUrl": "https://kernel.org/doc/man-pages/online/copy_file_range.2.html",
+        "title": "man copy_file_range(2)",
+        "url": "https://kernel.org/doc/man-pages/online/copy_file_range.2.html",
+        "visitCount": 1
+      }
+    },
+    {
+      "id": "timeline-visit:https://news.ycombinator.com/item?id=42_copyfail",
+      "kind": "timeline-visit",
+      "label": "HN: copy-fail breaks distros",
+      "firstSeenAt": "2026-05-07T09:00:00.000Z",
+      "lastSeenAt": "2026-05-07T09:00:00.000Z",
+      "originReplicaIds": [],
+      "metadata": {
+        "canonicalUrl": "https://news.ycombinator.com/item?id=42_copyfail",
+        "title": "HN: copy-fail breaks distros",
+        "url": "https://news.ycombinator.com/item?id=42_copyfail",
+        "visitCount": 1
+      }
+    },
+    {
+      "id": "timeline-visit:https://news.ycombinator.com/item?id=42_pgmerge",
+      "kind": "timeline-visit",
+      "label": "HN: postgres MERGE pitfalls",
+      "firstSeenAt": "2026-05-07T09:16:00.000Z",
+      "lastSeenAt": "2026-05-07T09:16:00.000Z",
+      "originReplicaIds": [],
+      "metadata": {
+        "canonicalUrl": "https://news.ycombinator.com/item?id=42_pgmerge",
+        "title": "HN: postgres MERGE pitfalls",
+        "url": "https://news.ycombinator.com/item?id=42_pgmerge",
+        "visitCount": 2
+      }
+    },
+    {
+      "id": "timeline-visit:https://nvd.nist.gov/vuln/detail/CVE-2024-12345",
+      "kind": "timeline-visit",
+      "label": "NVD CVE-2024-12345",
+      "firstSeenAt": "2026-05-07T09:14:00.000Z",
+      "lastSeenAt": "2026-05-07T09:14:00.000Z",
+      "originReplicaIds": [],
+      "metadata": {
+        "canonicalUrl": "https://nvd.nist.gov/vuln/detail/CVE-2024-12345",
+        "title": "NVD CVE-2024-12345",
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2024-12345",
+        "visitCount": 1
+      }
+    },
+    {
+      "id": "timeline-visit:https://www.google.com/search?q=linux+copy_file_range+CVE",
+      "kind": "timeline-visit",
+      "label": "Google: linux copy_file_range CVE",
+      "firstSeenAt": "2026-05-07T09:08:00.000Z",
+      "lastSeenAt": "2026-05-07T09:08:00.000Z",
+      "originReplicaIds": [],
+      "metadata": {
+        "canonicalUrl": "https://www.google.com/search?q=linux+copy_file_range+CVE",
+        "title": "Google: linux copy_file_range CVE",
+        "url": "https://www.google.com/search?q=linux+copy_file_range+CVE",
+        "visitCount": 1
+      }
+    },
+    {
+      "id": "timeline-visit:https://www.postgresql.org/docs/current/sql-merge.html",
+      "kind": "timeline-visit",
+      "label": "PostgreSQL: MERGE",
+      "firstSeenAt": "2026-05-07T09:20:00.000Z",
+      "lastSeenAt": "2026-05-07T09:20:00.000Z",
+      "originReplicaIds": [],
+      "metadata": {
+        "canonicalUrl": "https://www.postgresql.org/docs/current/sql-merge.html",
+        "title": "PostgreSQL: MERGE",
+        "url": "https://www.postgresql.org/docs/current/sql-merge.html",
+        "visitCount": 1
+      }
+    },
+    {
+      "id": "timeline-visit:https://xint.io/blog/copy-fail-linux-distributions",
+      "kind": "timeline-visit",
+      "label": "copy-fail across linux distros",
+      "firstSeenAt": "2026-05-07T09:05:30.000Z",
+      "lastSeenAt": "2026-05-07T09:05:30.000Z",
+      "originReplicaIds": [],
+      "metadata": {
+        "canonicalUrl": "https://xint.io/blog/copy-fail-linux-distributions",
+        "title": "copy-fail across linux distros",
+        "url": "https://xint.io/blog/copy-fail-linux-distributions",
+        "visitCount": 1
+      }
+    },
+    {
+      "id": "workstream:ws_postgres",
+      "kind": "workstream",
+      "label": "Postgres · MERGE semantics",
+      "firstSeenAt": "2026-05-07T08:57:00.000Z",
+      "lastSeenAt": "2026-05-07T09:28:00.000Z",
+      "originReplicaIds": [
+        "replica-mac"
+      ],
+      "metadata": {
+        "title": "Postgres · MERGE semantics"
+      }
+    },
+    {
+      "id": "workstream:ws_research",
+      "kind": "workstream",
+      "label": "ws_research",
+      "firstSeenAt": "2026-05-07T08:55:00.000Z",
+      "lastSeenAt": "2026-05-07T08:56:00.000Z",
+      "originReplicaIds": [
+        "replica-mac"
+      ],
+      "metadata": {
+        "title": "Research"
+      }
+    },
+    {
+      "id": "workstream:ws_security",
+      "kind": "workstream",
+      "label": "Security · Linux CVE",
+      "firstSeenAt": "2026-05-07T08:56:00.000Z",
+      "lastSeenAt": "2026-05-07T09:38:00.000Z",
+      "originReplicaIds": [
+        "replica-mac"
+      ],
+      "metadata": {
+        "title": "Security · Linux CVE"
+      }
+    },
+    {
+      "id": "workstream:ws_sidetrack",
+      "kind": "workstream",
+      "label": "Sidetrack · project review",
+      "firstSeenAt": "2026-05-07T08:58:00.000Z",
+      "lastSeenAt": "2026-05-07T09:31:00.000Z",
+      "originReplicaIds": [
+        "replica-mac"
+      ],
+      "metadata": {
+        "title": "Sidetrack · project review"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "edge:annotation_references_url:annotation:a_cve_kernel:timeline-visit:https://nvd.nist.gov/vuln/detail/CVE-2024-12345",
+      "kind": "annotation_references_url",
+      "fromNodeId": "annotation:a_cve_kernel",
+      "toNodeId": "timeline-visit:https://nvd.nist.gov/vuln/detail/CVE-2024-12345",
+      "observedAt": "2026-05-07T09:35:30.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "annotation.created",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 40
+        }
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:annotation_references_url:annotation:a_pg_doc:timeline-visit:https://blog.example.com/merge-pitfalls",
+      "kind": "annotation_references_url",
+      "fromNodeId": "annotation:a_pg_doc",
+      "toNodeId": "timeline-visit:https://blog.example.com/merge-pitfalls",
+      "observedAt": "2026-05-07T09:36:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "annotation.created",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 42
+        }
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:annotation_targets_thread:annotation:a_cve_thread:thread:t_cve_claude",
+      "kind": "annotation_targets_thread",
+      "fromNodeId": "annotation:a_cve_thread",
+      "toNodeId": "thread:t_cve_claude",
+      "observedAt": "2026-05-07T09:35:45.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "annotation.created",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 41
+        }
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:coding_session_in_workstream:coding-session:cs_cve_vm:workstream:ws_security",
+      "kind": "coding_session_in_workstream",
+      "fromNodeId": "coding-session:cs_cve_vm",
+      "toNodeId": "workstream:ws_security",
+      "observedAt": "2026-05-07T09:25:00.000Z",
+      "producedBy": {
+        "source": "coding-session-store",
+        "recordId": "cs_cve_vm"
+      },
+      "confidence": "explicit"
+    },
+    {
+      "id": "edge:coding_session_in_workstream:coding-session:cs_sb_refactor:workstream:ws_sidetrack",
+      "kind": "coding_session_in_workstream",
+      "fromNodeId": "coding-session:cs_sb_refactor",
+      "toNodeId": "workstream:ws_sidetrack",
+      "observedAt": "2026-05-07T09:27:00.000Z",
+      "producedBy": {
+        "source": "coding-session-store",
+        "recordId": "cs_sb_refactor"
+      },
+      "confidence": "explicit"
+    },
+    {
+      "id": "edge:dispatch_from_thread:thread:t_cve_claude:dispatch:d_cve_codex",
+      "kind": "dispatch_from_thread",
+      "fromNodeId": "thread:t_cve_claude",
+      "toNodeId": "dispatch:d_cve_codex",
+      "observedAt": "2026-05-07T09:22:00.000Z",
+      "producedBy": {
+        "source": "workboard-state",
+        "recordId": "d_cve_codex"
+      },
+      "confidence": "explicit"
+    },
+    {
+      "id": "edge:dispatch_from_thread:thread:t_pg_claude:dispatch:d_pg_codex",
+      "kind": "dispatch_from_thread",
+      "fromNodeId": "thread:t_pg_claude",
+      "toNodeId": "dispatch:d_pg_codex",
+      "observedAt": "2026-05-07T09:32:00.000Z",
+      "producedBy": {
+        "source": "workboard-state",
+        "recordId": "d_pg_codex"
+      },
+      "confidence": "explicit"
+    },
+    {
+      "id": "edge:dispatch_from_thread:thread:t_sb_claude:dispatch:d_sb_refactor",
+      "kind": "dispatch_from_thread",
+      "fromNodeId": "thread:t_sb_claude",
+      "toNodeId": "dispatch:d_sb_refactor",
+      "observedAt": "2026-05-07T09:24:00.000Z",
+      "producedBy": {
+        "source": "workboard-state",
+        "recordId": "d_sb_refactor"
+      },
+      "confidence": "explicit"
+    },
+    {
+      "id": "edge:dispatch_in_workstream:dispatch:d_cve_codex:workstream:ws_security",
+      "kind": "dispatch_in_workstream",
+      "fromNodeId": "dispatch:d_cve_codex",
+      "toNodeId": "workstream:ws_security",
+      "observedAt": "2026-05-07T09:22:00.000Z",
+      "producedBy": {
+        "source": "workboard-state",
+        "recordId": "d_cve_codex"
+      },
+      "confidence": "explicit"
+    },
+    {
+      "id": "edge:dispatch_in_workstream:dispatch:d_pg_codex:workstream:ws_postgres",
+      "kind": "dispatch_in_workstream",
+      "fromNodeId": "dispatch:d_pg_codex",
+      "toNodeId": "workstream:ws_postgres",
+      "observedAt": "2026-05-07T09:32:00.000Z",
+      "producedBy": {
+        "source": "workboard-state",
+        "recordId": "d_pg_codex"
+      },
+      "confidence": "explicit"
+    },
+    {
+      "id": "edge:dispatch_in_workstream:dispatch:d_sb_refactor:workstream:ws_sidetrack",
+      "kind": "dispatch_in_workstream",
+      "fromNodeId": "dispatch:d_sb_refactor",
+      "toNodeId": "workstream:ws_sidetrack",
+      "observedAt": "2026-05-07T09:24:00.000Z",
+      "producedBy": {
+        "source": "workboard-state",
+        "recordId": "d_sb_refactor"
+      },
+      "confidence": "explicit"
+    },
+    {
+      "id": "edge:dispatch_references_url:dispatch:d_cve_codex:timeline-visit:https://nvd.nist.gov/vuln/detail/CVE-2024-12345",
+      "kind": "dispatch_references_url",
+      "fromNodeId": "dispatch:d_cve_codex",
+      "toNodeId": "timeline-visit:https://nvd.nist.gov/vuln/detail/CVE-2024-12345",
+      "observedAt": "2026-05-07T09:22:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "dispatch.recorded",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 22
+        }
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:dispatch_references_url:dispatch:d_pg_codex:timeline-visit:https://blog.example.com/merge-pitfalls",
+      "kind": "dispatch_references_url",
+      "fromNodeId": "dispatch:d_pg_codex",
+      "toNodeId": "timeline-visit:https://blog.example.com/merge-pitfalls",
+      "observedAt": "2026-05-07T09:32:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "dispatch.recorded",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 36
+        }
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:dispatch_references_url:dispatch:d_sb_refactor:timeline-visit:https://github.com/sidetrack-co/sidetrack/blob/main/BRAINSTORM.md",
+      "kind": "dispatch_references_url",
+      "fromNodeId": "dispatch:d_sb_refactor",
+      "toNodeId": "timeline-visit:https://github.com/sidetrack-co/sidetrack/blob/main/BRAINSTORM.md",
+      "observedAt": "2026-05-07T09:24:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "dispatch.recorded",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 24
+        }
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:dispatch_reply_landed_in_thread:dispatch:d_cve_codex:thread:t_cve_chatgpt",
+      "kind": "dispatch_reply_landed_in_thread",
+      "fromNodeId": "dispatch:d_cve_codex",
+      "toNodeId": "thread:t_cve_chatgpt",
+      "observedAt": "2026-05-07T09:33:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "dispatch.linked",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 37
+        }
+      },
+      "confidence": "explicit"
+    },
+    {
+      "id": "edge:dispatch_requested_coding_session:dispatch:d_cve_codex:coding-session:cs_cve_vm",
+      "kind": "dispatch_requested_coding_session",
+      "fromNodeId": "dispatch:d_cve_codex",
+      "toNodeId": "coding-session:cs_cve_vm",
+      "observedAt": "2026-05-07T09:22:00.000Z",
+      "producedBy": {
+        "source": "workboard-state",
+        "recordId": "d_cve_codex"
+      },
+      "confidence": "explicit"
+    },
+    {
+      "id": "edge:dispatch_requested_coding_session:dispatch:d_sb_refactor:coding-session:cs_sb_refactor",
+      "kind": "dispatch_requested_coding_session",
+      "fromNodeId": "dispatch:d_sb_refactor",
+      "toNodeId": "coding-session:cs_sb_refactor",
+      "observedAt": "2026-05-07T09:24:00.000Z",
+      "producedBy": {
+        "source": "workboard-state",
+        "recordId": "d_sb_refactor"
+      },
+      "confidence": "explicit"
+    },
+    {
+      "id": "edge:queue_targets_thread:queue-item:q_pg_t:thread:t_pg_claude",
+      "kind": "queue_targets_thread",
+      "fromNodeId": "queue-item:q_pg_t",
+      "toNodeId": "thread:t_pg_claude",
+      "observedAt": "2026-05-07T09:35:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "queue.created",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 39
+        }
+      },
+      "confidence": "explicit"
+    },
+    {
+      "id": "edge:queue_targets_workstream:queue-item:q_cve_ws:workstream:ws_security",
+      "kind": "queue_targets_workstream",
+      "fromNodeId": "queue-item:q_cve_ws",
+      "toNodeId": "workstream:ws_security",
+      "observedAt": "2026-05-07T09:38:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "queue.created",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 43
+        }
+      },
+      "confidence": "explicit"
+    },
+    {
+      "id": "edge:reminder_for_thread:inbound-reminder:r_cve_t:thread:t_cve_claude",
+      "kind": "reminder_for_thread",
+      "fromNodeId": "inbound-reminder:r_cve_t",
+      "toNodeId": "thread:t_cve_claude",
+      "observedAt": "2026-05-07T09:42:00.000Z",
+      "producedBy": {
+        "source": "reminder-store",
+        "recordId": "r_cve_t"
+      },
+      "confidence": "explicit"
+    },
+    {
+      "id": "edge:thread_in_workstream:thread:t_cve_chatgpt:workstream:ws_security",
+      "kind": "thread_in_workstream",
+      "fromNodeId": "thread:t_cve_chatgpt",
+      "toNodeId": "workstream:ws_security",
+      "observedAt": "2026-05-07T09:30:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "thread.upserted",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 31
+        }
+      },
+      "confidence": "explicit"
+    },
+    {
+      "id": "edge:thread_in_workstream:thread:t_cve_claude:workstream:ws_security",
+      "kind": "thread_in_workstream",
+      "fromNodeId": "thread:t_cve_claude",
+      "toNodeId": "workstream:ws_security",
+      "observedAt": "2026-05-07T09:18:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "thread.upserted",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 16
+        }
+      },
+      "confidence": "explicit"
+    },
+    {
+      "id": "edge:thread_in_workstream:thread:t_pg_chatgpt:workstream:ws_postgres",
+      "kind": "thread_in_workstream",
+      "fromNodeId": "thread:t_pg_chatgpt",
+      "toNodeId": "workstream:ws_postgres",
+      "observedAt": "2026-05-07T09:28:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "thread.upserted",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 28
+        }
+      },
+      "confidence": "explicit"
+    },
+    {
+      "id": "edge:thread_in_workstream:thread:t_pg_claude:workstream:ws_postgres",
+      "kind": "thread_in_workstream",
+      "fromNodeId": "thread:t_pg_claude",
+      "toNodeId": "workstream:ws_postgres",
+      "observedAt": "2026-05-07T09:24:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "thread.upserted",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 25
+        }
+      },
+      "confidence": "explicit"
+    },
+    {
+      "id": "edge:thread_in_workstream:thread:t_sb_chatgpt:workstream:ws_sidetrack",
+      "kind": "thread_in_workstream",
+      "fromNodeId": "thread:t_sb_chatgpt",
+      "toNodeId": "workstream:ws_sidetrack",
+      "observedAt": "2026-05-07T09:31:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "thread.upserted",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 34
+        }
+      },
+      "confidence": "explicit"
+    },
+    {
+      "id": "edge:thread_in_workstream:thread:t_sb_claude:workstream:ws_sidetrack",
+      "kind": "thread_in_workstream",
+      "fromNodeId": "thread:t_sb_claude",
+      "toNodeId": "workstream:ws_sidetrack",
+      "observedAt": "2026-05-07T09:19:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "thread.upserted",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 19
+        }
+      },
+      "confidence": "explicit"
+    },
+    {
+      "id": "edge:thread_quotes_thread:thread:t_cve_chatgpt:thread:t_cve_claude",
+      "kind": "thread_quotes_thread",
+      "fromNodeId": "thread:t_cve_chatgpt",
+      "toNodeId": "thread:t_cve_claude",
+      "observedAt": "2026-05-07T09:30:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "capture.recorded",
+        "recordId": "0015980bb4c7",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 32
+        }
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:thread_quotes_thread:thread:t_cve_claude:thread:t_cve_chatgpt",
+      "kind": "thread_quotes_thread",
+      "fromNodeId": "thread:t_cve_claude",
+      "toNodeId": "thread:t_cve_chatgpt",
+      "observedAt": "2026-05-07T09:30:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "capture.recorded",
+        "recordId": "0015980bb4c7",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 17
+        }
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:thread_quotes_thread:thread:t_pg_chatgpt:thread:t_pg_claude",
+      "kind": "thread_quotes_thread",
+      "fromNodeId": "thread:t_pg_chatgpt",
+      "toNodeId": "thread:t_pg_claude",
+      "observedAt": "2026-05-07T09:28:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "capture.recorded",
+        "recordId": "051c39b38a5a",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 29
+        }
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:thread_quotes_thread:thread:t_pg_claude:thread:t_pg_chatgpt",
+      "kind": "thread_quotes_thread",
+      "fromNodeId": "thread:t_pg_claude",
+      "toNodeId": "thread:t_pg_chatgpt",
+      "observedAt": "2026-05-07T09:28:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "capture.recorded",
+        "recordId": "051c39b38a5a",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 26
+        }
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:thread_quotes_thread:thread:t_sb_chatgpt:thread:t_sb_claude",
+      "kind": "thread_quotes_thread",
+      "fromNodeId": "thread:t_sb_chatgpt",
+      "toNodeId": "thread:t_sb_claude",
+      "observedAt": "2026-05-07T09:31:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "capture.recorded",
+        "recordId": "0642a110e5c1",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 35
+        }
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:thread_quotes_thread:thread:t_sb_claude:thread:t_sb_chatgpt",
+      "kind": "thread_quotes_thread",
+      "fromNodeId": "thread:t_sb_claude",
+      "toNodeId": "thread:t_sb_chatgpt",
+      "observedAt": "2026-05-07T09:31:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "capture.recorded",
+        "recordId": "0642a110e5c1",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 20
+        }
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:thread_references_url:thread:t_cve_claude:timeline-visit:https://news.ycombinator.com/item?id=42_copyfail",
+      "kind": "thread_references_url",
+      "fromNodeId": "thread:t_cve_claude",
+      "toNodeId": "timeline-visit:https://news.ycombinator.com/item?id=42_copyfail",
+      "observedAt": "2026-05-07T09:18:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "capture.recorded",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 17
+        }
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:thread_references_url:thread:t_cve_claude:timeline-visit:https://nvd.nist.gov/vuln/detail/CVE-2024-12345",
+      "kind": "thread_references_url",
+      "fromNodeId": "thread:t_cve_claude",
+      "toNodeId": "timeline-visit:https://nvd.nist.gov/vuln/detail/CVE-2024-12345",
+      "observedAt": "2026-05-07T09:18:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "capture.recorded",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 17
+        }
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:thread_references_url:thread:t_cve_claude:timeline-visit:https://xint.io/blog/copy-fail-linux-distributions",
+      "kind": "thread_references_url",
+      "fromNodeId": "thread:t_cve_claude",
+      "toNodeId": "timeline-visit:https://xint.io/blog/copy-fail-linux-distributions",
+      "observedAt": "2026-05-07T09:18:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "capture.recorded",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 17
+        }
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:thread_references_url:thread:t_pg_claude:timeline-visit:https://blog.example.com/merge-pitfalls",
+      "kind": "thread_references_url",
+      "fromNodeId": "thread:t_pg_claude",
+      "toNodeId": "timeline-visit:https://blog.example.com/merge-pitfalls",
+      "observedAt": "2026-05-07T09:24:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "capture.recorded",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 26
+        }
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:thread_references_url:thread:t_pg_claude:timeline-visit:https://news.ycombinator.com/item?id=42_pgmerge",
+      "kind": "thread_references_url",
+      "fromNodeId": "thread:t_pg_claude",
+      "toNodeId": "timeline-visit:https://news.ycombinator.com/item?id=42_pgmerge",
+      "observedAt": "2026-05-07T09:24:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "capture.recorded",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 26
+        }
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:thread_references_url:thread:t_pg_claude:timeline-visit:https://www.postgresql.org/docs/current/sql-merge.html",
+      "kind": "thread_references_url",
+      "fromNodeId": "thread:t_pg_claude",
+      "toNodeId": "timeline-visit:https://www.postgresql.org/docs/current/sql-merge.html",
+      "observedAt": "2026-05-07T09:24:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "capture.recorded",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 26
+        }
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:thread_references_url:thread:t_sb_claude:timeline-visit:https://github.com/sidetrack-co/sidetrack/blob/main/BRAINSTORM.md",
+      "kind": "thread_references_url",
+      "fromNodeId": "thread:t_sb_claude",
+      "toNodeId": "timeline-visit:https://github.com/sidetrack-co/sidetrack/blob/main/BRAINSTORM.md",
+      "observedAt": "2026-05-07T09:19:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "capture.recorded",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 20
+        }
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:thread_references_url:thread:t_sb_claude:timeline-visit:https://github.com/sidetrack-co/sidetrack/pull/98",
+      "kind": "thread_references_url",
+      "fromNodeId": "thread:t_sb_claude",
+      "toNodeId": "timeline-visit:https://github.com/sidetrack-co/sidetrack/pull/98",
+      "observedAt": "2026-05-07T09:19:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "capture.recorded",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 20
+        }
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:thread_references_url:thread:t_sb_claude:timeline-visit:https://news.ycombinator.com/item?id=42_pgmerge",
+      "kind": "thread_references_url",
+      "fromNodeId": "thread:t_sb_claude",
+      "toNodeId": "timeline-visit:https://news.ycombinator.com/item?id=42_pgmerge",
+      "observedAt": "2026-05-07T09:19:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "capture.recorded",
+        "dot": {
+          "replicaId": "replica-mac",
+          "seq": 20
+        }
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:timeline_same_url_as_thread:timeline-visit:https://chatgpt.com/c/cve_review:thread:t_cve_chatgpt",
+      "kind": "timeline_same_url_as_thread",
+      "fromNodeId": "timeline-visit:https://chatgpt.com/c/cve_review",
+      "toNodeId": "thread:t_cve_chatgpt",
+      "observedAt": "2026-05-07T09:29:00.000Z",
+      "producedBy": {
+        "source": "timeline-projection"
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:timeline_same_url_as_thread:timeline-visit:https://chatgpt.com/c/pg_review:thread:t_pg_chatgpt",
+      "kind": "timeline_same_url_as_thread",
+      "fromNodeId": "timeline-visit:https://chatgpt.com/c/pg_review",
+      "toNodeId": "thread:t_pg_chatgpt",
+      "observedAt": "2026-05-07T09:27:00.000Z",
+      "producedBy": {
+        "source": "timeline-projection"
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:timeline_same_url_as_thread:timeline-visit:https://chatgpt.com/c/sb_review:thread:t_sb_chatgpt",
+      "kind": "timeline_same_url_as_thread",
+      "fromNodeId": "timeline-visit:https://chatgpt.com/c/sb_review",
+      "toNodeId": "thread:t_sb_chatgpt",
+      "observedAt": "2026-05-07T09:30:30.000Z",
+      "producedBy": {
+        "source": "timeline-projection"
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:timeline_same_url_as_thread:timeline-visit:https://claude.ai/chat/cve_thread:thread:t_cve_claude",
+      "kind": "timeline_same_url_as_thread",
+      "fromNodeId": "timeline-visit:https://claude.ai/chat/cve_thread",
+      "toNodeId": "thread:t_cve_claude",
+      "observedAt": "2026-05-07T09:18:00.000Z",
+      "producedBy": {
+        "source": "timeline-projection"
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:timeline_same_url_as_thread:timeline-visit:https://claude.ai/chat/pg_thread:thread:t_pg_claude",
+      "kind": "timeline_same_url_as_thread",
+      "fromNodeId": "timeline-visit:https://claude.ai/chat/pg_thread",
+      "toNodeId": "thread:t_pg_claude",
+      "observedAt": "2026-05-07T09:23:00.000Z",
+      "producedBy": {
+        "source": "timeline-projection"
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:timeline_same_url_as_thread:timeline-visit:https://claude.ai/chat/sb_thread:thread:t_sb_claude",
+      "kind": "timeline_same_url_as_thread",
+      "fromNodeId": "timeline-visit:https://claude.ai/chat/sb_thread",
+      "toNodeId": "thread:t_sb_claude",
+      "observedAt": "2026-05-07T09:18:30.000Z",
+      "producedBy": {
+        "source": "timeline-projection"
+      },
+      "confidence": "deterministic"
+    },
+    {
+      "id": "edge:workstream_parent_of:workstream:ws_research:workstream:ws_security",
+      "kind": "workstream_parent_of",
+      "fromNodeId": "workstream:ws_research",
+      "toNodeId": "workstream:ws_security",
+      "observedAt": "",
+      "producedBy": {
+        "source": "workboard-state",
+        "recordId": "ws_research"
+      },
+      "confidence": "explicit"
+    }
+  ],
+  "updatedAt": "2026-05-07T09:42:00.000Z",
+  "nodeCount": 38,
+  "edgeCount": 48
+}
