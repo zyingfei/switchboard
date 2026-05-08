@@ -413,16 +413,35 @@ export const startCompanion = async (
     eventLog,
     projectionChanges,
     syncMaterializerHealth: () => syncContractRunner.health(),
-    // Class F edge-event import path: plugin-originated events (e.g.
-    // browser.timeline.observed) ship with their edge dot allocated;
-    // we import + dispatch through the runner so timeline / future
-    // passive surfaces converge symmetrically with relay peer events.
+    // Class F edge-event import path: plugin-originated events
+    // (e.g. browser.timeline.observed) arrive pre-shaped with an
+    // edge dot allocated by the plugin. Earlier turns relayed those
+    // edge events as-is, but the relay enforces an IDENTITY_MISMATCH
+    // check (publish.replica_id must match the transport's subscribed
+    // replica_id) so cross-replica timeline sync was silently failing
+    // — peer companions never observed timeline visits.
+    //
+    // Phase 4 fix: re-stamp under the companion's MAIN replica via
+    // appendClientObserved. The plugin's clientEventId still gates
+    // dedupe (appendClient line ~349 short-circuits if the
+    // clientEventId already exists), so re-deliveries from the same
+    // plugin remain idempotent. The decorated eventLog's
+    // onLocalAccepted then publishes via the relay under the main
+    // replica id, which IS what the relay subscription is bound to,
+    // so peer companions correctly receive the event.
     importEdgeEvent: async (event) => {
-      const result = await baseEventLog.importPeerEvent(event);
-      if (result.imported) {
-        syncContractRunner.onAcceptedEvent(event, { origin: 'peer' });
+      const existing = await baseEventLog.findByClientEventId(event.clientEventId);
+      if (existing !== null) {
+        return { imported: false };
       }
-      return { imported: result.imported };
+      await eventLog.appendClientObserved({
+        clientEventId: event.clientEventId,
+        aggregateId: event.aggregateId,
+        type: event.type,
+        payload: event.payload as Record<string, unknown>,
+        baseVector: {},
+      });
+      return { imported: true };
     },
     timelineStore,
     connectionsStore,

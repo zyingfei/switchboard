@@ -1332,6 +1332,26 @@ const routes: readonly RouteDefinition[] = [
                     : { workstreamId: dispatchEvent.workstreamId }),
                   createdAt: dispatchEvent.createdAt,
                   body: dispatchEvent.body,
+                  // Phase 4 cross-replica fix: include the
+                  // structural attribution so peer companions can
+                  // emit dispatch_from_thread /
+                  // dispatch_in_workstream /
+                  // dispatch_requested_coding_session from the
+                  // event log alone — the dispatch JSONL is per-
+                  // replica and doesn't sync.
+                  ...(dispatchEvent.sourceThreadId === undefined
+                    ? {}
+                    : { sourceThreadId: dispatchEvent.sourceThreadId }),
+                  ...(dispatchEvent.mcpRequest === undefined
+                    ? {}
+                    : {
+                        mcpRequest: {
+                          codingSessionId: dispatchEvent.mcpRequest.codingSessionId,
+                        },
+                      }),
+                  ...(dispatchEvent.title === undefined
+                    ? {}
+                    : { title: dispatchEvent.title }),
                 },
                   })
               .catch(() => undefined);

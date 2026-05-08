@@ -19,6 +19,16 @@ export interface DispatchRecordedPayload {
   // We mirror the redacted body here, never the unredacted clipboard
   // contents — the redaction step happens before this event lands.
   readonly body: string;
+  // Phase 4 cross-replica fix: include the structural attribution
+  // (sourceThreadId, mcpRequest) so peer companions can emit
+  // dispatch_from_thread / dispatch_in_workstream /
+  // dispatch_requested_coding_session from the event log alone —
+  // the dispatch JSONL stays per-replica and doesn't sync.
+  readonly sourceThreadId?: string;
+  readonly mcpRequest?: { readonly codingSessionId: string };
+  // Optional title — useful as a label fallback in the connections
+  // graph when peer companions don't have the local JSONL.
+  readonly title?: string;
 }
 
 export interface DispatchLinkedPayload {

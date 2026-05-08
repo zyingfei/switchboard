@@ -3,12 +3,23 @@ import {
   ANNOTATION_DELETED,
   ANNOTATION_NOTE_SET,
 } from '../../annotations/events.js';
-import { readAllTimelineDays, readVaultStores } from '../../connections/loader.js';
+import { readVaultStores } from '../../connections/loader.js';
 import {
   buildConnectionsSnapshot,
   type ConnectionsInput,
 } from '../../connections/snapshot.js';
 import type { ConnectionsStore } from '../../connections/snapshot.js';
+import {
+  buildDayProjection,
+  collectTimelinePayloads,
+  groupByDay,
+  type TimelineDayProjection,
+} from '../../timeline/projection.js';
+import {
+  BROWSER_TIMELINE_OBSERVED,
+  isBrowserTimelineObservedPayload,
+} from '../../timeline/events.js';
+import type { AcceptedEvent } from '../causal.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
 import { QUEUE_CREATED, QUEUE_STATUS_SET } from '../../queue/events.js';
 import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from '../../recall/events.js';
@@ -96,10 +107,36 @@ export const createConnectionsMaterializer = (
   let lastError: string | null = null;
   let lastFailureAtMs = 0;
 
+  // Build the per-day timeline projection in-memory directly from the
+  // merged event log instead of reading the timelineStore. The
+  // timeline materializer also writes the same projection to disk
+  // (for GET /v1/timeline) but its drain runs concurrently with this
+  // materializer's drain — reading the disk-backed store would race
+  // and produce stale or partial connections snapshots when the
+  // timeline materializer hasn't finished yet (most visible
+  // cross-replica, where peer events arrive in bursts).
+  const buildTimelineDays = (
+    merged: readonly AcceptedEvent[],
+  ): readonly TimelineDayProjection[] => {
+    const payloads = collectTimelinePayloads(
+      merged.filter(
+        (e) =>
+          e.type === BROWSER_TIMELINE_OBSERVED &&
+          isBrowserTimelineObservedPayload(e.payload),
+      ),
+    );
+    const grouped = groupByDay(payloads);
+    const out: TimelineDayProjection[] = [];
+    for (const [date, dayPayloads] of grouped) {
+      out.push(buildDayProjection(date, dayPayloads));
+    }
+    return out;
+  };
+
   const buildAndWrite = async (): Promise<void> => {
     const merged = await deps.eventLog.readMerged();
     const vault = await readVaultStores(deps.vaultRoot);
-    const timelineDays = await readAllTimelineDays(deps.timelineStore);
+    const timelineDays = buildTimelineDays(merged);
     const input: ConnectionsInput = {
       events: merged,
       ...vault,

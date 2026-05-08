@@ -871,8 +871,86 @@ export const buildConnectionsSnapshot = (
 
     if (event.type === DISPATCH_RECORDED && isDispatchRecordedPayload(event.payload)) {
       const p = event.payload;
-      upsertNode(nodes, { kind: 'dispatch', key: p.bac_id, label: p.bac_id });
+      upsertNode(nodes, {
+        kind: 'dispatch',
+        key: p.bac_id,
+        label: p.title ?? p.bac_id,
+        observedAt: p.createdAt,
+        metadata: {
+          ...(p.target.provider === undefined ? {} : { provider: p.target.provider }),
+          ...(p.title === undefined ? {} : { title: p.title }),
+        },
+      });
       const dispatchNodeId = nodeIdFor('dispatch', p.bac_id);
+      // Phase 4 cross-replica fix: emit the structural dispatch
+      // edges from the event payload too. Vault pass 2 already
+      // emits these from the local JSONL — this pass handles the
+      // case where the dispatch event arrived via the relay (peer
+      // companion) so the JSONL stays on the originating replica.
+      // The same edge id (kind:from:to) means upsertEdge dedups;
+      // both passes producing the same edge is a no-op when both
+      // run, and the event-derived path is the only emitter when
+      // only the relay-imported event is available.
+      if (typeof p.sourceThreadId === 'string' && p.sourceThreadId.length > 0) {
+        upsertNode(nodes, {
+          kind: 'thread',
+          key: p.sourceThreadId,
+          label: p.sourceThreadId,
+        });
+        upsertEdge(edges, {
+          kind: 'dispatch_from_thread',
+          fromNodeId: nodeIdFor('thread', p.sourceThreadId),
+          toNodeId: dispatchNodeId,
+          observedAt: p.createdAt,
+          producedBy: {
+            source: 'event-log',
+            eventType: DISPATCH_RECORDED,
+            dot: { replicaId, seq },
+          },
+          confidence: 'explicit',
+        });
+      }
+      if (typeof p.workstreamId === 'string' && p.workstreamId.length > 0) {
+        upsertNode(nodes, {
+          kind: 'workstream',
+          key: p.workstreamId,
+          label: p.workstreamId,
+        });
+        upsertEdge(edges, {
+          kind: 'dispatch_in_workstream',
+          fromNodeId: dispatchNodeId,
+          toNodeId: nodeIdFor('workstream', p.workstreamId),
+          observedAt: p.createdAt,
+          producedBy: {
+            source: 'event-log',
+            eventType: DISPATCH_RECORDED,
+            dot: { replicaId, seq },
+          },
+          confidence: 'explicit',
+        });
+      }
+      if (
+        p.mcpRequest !== undefined &&
+        typeof p.mcpRequest.codingSessionId === 'string'
+      ) {
+        upsertNode(nodes, {
+          kind: 'coding-session',
+          key: p.mcpRequest.codingSessionId,
+          label: p.mcpRequest.codingSessionId,
+        });
+        upsertEdge(edges, {
+          kind: 'dispatch_requested_coding_session',
+          fromNodeId: dispatchNodeId,
+          toNodeId: nodeIdFor('coding-session', p.mcpRequest.codingSessionId),
+          observedAt: p.createdAt,
+          producedBy: {
+            source: 'event-log',
+            eventType: DISPATCH_RECORDED,
+            dot: { replicaId, seq },
+          },
+          confidence: 'explicit',
+        });
+      }
       for (const url of extractUrlsFromText(p.body)) {
         emitUrlRefEdge({
           fromNodeId: dispatchNodeId,

@@ -187,6 +187,10 @@ interface InitDeps {
   readonly readCompanion: () => Promise<{ url: string; bridgeKey: string } | null>;
 }
 
+// Captured at init() so external triggerTimelineDrain() can run the
+// same drain path (used by tests + a side-panel "drain now" path).
+let capturedInitDeps: InitDeps | null = null;
+
 const tryDrain = async (deps: InitDeps): Promise<{ uploaded: number; remaining: number }> => {
   const companion = await deps.readCompanion();
   if (companion === null || companion.url.trim().length === 0) {
@@ -220,6 +224,19 @@ const tryDrain = async (deps: InitDeps): Promise<{ uploaded: number; remaining: 
   }
 };
 
+// External trigger — runs the same try-drain path that the periodic
+// alarm runs. Returns { uploaded, remaining } when wiring has been
+// initialized; resolves to a zero-effect result otherwise (init
+// hasn't run because the timeline gate is off, or the SW just
+// booted and hasn't initialized yet).
+export const triggerTimelineDrain = async (): Promise<{
+  uploaded: number;
+  remaining: number;
+}> => {
+  if (capturedInitDeps === null) return { uploaded: 0, remaining: 0 };
+  return await tryDrain(capturedInitDeps);
+};
+
 export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> => {
   if (initialized) return;
   // Gate first — if the user hasn't opted in, register nothing.
@@ -231,6 +248,7 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
   // actually wires it up.
   if (!(await isTimelineEnabled())) return;
   initialized = true;
+  capturedInitDeps = deps;
 
   // Phase 4: keep the active-workstream-id cache hot before the
   // observer starts emitting. Reads chrome.storage once, then

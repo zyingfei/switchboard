@@ -47,7 +47,20 @@ export default defineConfig({
   manifest: {
     name: 'Sidetrack',
     description: 'Local-first browser AI work tracker.',
-    permissions: ['activeTab', 'alarms', 'sidePanel', 'storage', 'scripting', 'notifications'],
+    permissions: [
+      'activeTab',
+      'alarms',
+      'sidePanel',
+      'storage',
+      'scripting',
+      'notifications',
+      // Phase 4 — read tab URL/title across all tabs so the timeline
+      // observer can see ambient browsing (HN, blog posts, search,
+      // GitHub, YouTube, …). Production observation stays gated by
+      // sidetrack.timeline.enabled (default OFF, opt-in only); this
+      // permission only widens what's READABLE if the user enables.
+      'tabs',
+    ],
     host_permissions: [
       'https://chatgpt.com/*',
       'https://chat.openai.com/*',

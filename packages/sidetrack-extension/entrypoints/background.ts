@@ -38,7 +38,7 @@ import {
   type ReviewDraftClientConfig,
 } from '../src/review/draftClient';
 import { drainReviewDraftOutbox } from '../src/review/outbox';
-import { initializeTimelineWiring } from '../src/timeline/wiring';
+import { initializeTimelineWiring, triggerTimelineDrain } from '../src/timeline/wiring';
 import { createVaultChangesClient } from '../src/companion/vaultChanges';
 import { createRecallClient } from '../src/companion/recallClient';
 import { buildReviewFollowUpText } from '../src/review/draft';
@@ -2690,6 +2690,62 @@ export default defineBackground(() => {
 
   chrome.runtime.onMessage.addListener(
     (message: unknown, sender, sendResponse: (response: RuntimeResponse) => void) => {
+      // Re-init timeline wiring. After flipping
+      // sidetrack.timeline.enabled = true at runtime, the gate-check
+      // at SW boot has already returned early; this message resets
+      // the init guard and re-runs initializeTimelineWiring so the
+      // chrome.tabs listeners actually register without a SW reload.
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.timeline.reinit'
+      ) {
+        void (async () => {
+          const { resetTimelineWiringForTests, initializeTimelineWiring } = await import(
+            '../src/timeline/wiring'
+          );
+          resetTimelineWiringForTests();
+          await initializeTimelineWiring({
+            readCompanion: async () => {
+              const settings = await readSettings();
+              const port = settings.companion.port;
+              const bridgeKey = settings.companion.bridgeKey.trim();
+              if (typeof port !== 'number' || port <= 0 || bridgeKey.length === 0) return null;
+              return { url: `http://127.0.0.1:${String(port)}`, bridgeKey };
+            },
+          });
+        })()
+          .then(() => {
+            sendResponse({ ok: true } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'reinit failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+      // Force-drain the timeline spool. Used by e2e tests + the
+      // side-panel "drain now" affordance. No-op when timeline wiring
+      // hasn't initialized (gate off or pre-boot).
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.timeline.force-drain'
+      ) {
+        void triggerTimelineDrain()
+          .then((result) => {
+            sendResponse({ ok: true, drain: result } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'force-drain failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
       // Try the connections handler first — it has its own response shape.
       if (
         message !== null &&

@@ -107,6 +107,11 @@ const seedFlowOnA = async (
     sourceThreadId: T_XR,
     body: `let's reproduce the issue from ${URL_HN}.`,
     createdAt: '2026-05-07T10:05:00.000Z',
+    mcpRequest: {
+      codingSessionId: 'cs_cross_replica',
+      approval: 'auto-approved',
+      requestedAt: '2026-05-07T10:05:00.000Z',
+    },
   });
   // Timeline visits — chat + a referenced URL + an AMBIENT one
   // (URL_AMBIENT) tagged with workstreamId. The ambient visit is
@@ -209,16 +214,18 @@ test.describe('connections — two-browser cross-replica sync', () => {
     // Seed the realistic flow on A.
     seedA = await seedFlowOnA(companionA);
 
-    // Wait for B to receive event-log aggregates that sync through
-    // the relay (workstream + thread). The dispatch node also lazy-
-    // creates from DISPATCH_RECORDED in pass 4, so it appears on B.
-    // (Timeline visits today flow through importEdgeEvent rather
-    // than the per-replica eventLog and don't currently ferry
-    // through the relay — separate sync gap, documented as a
-    // follow-up. The test covers what DOES sync.)
+    // Wait for B to receive every synced aggregate. With the Phase
+    // 4 relay-publish fix in importEdgeEvent, timeline visits now
+    // ferry through the relay too — including ambient ones tagged
+    // via active-workstream attribution.
     await waitForCompanionToContain(companionB, `workstream:${seedA.wsId}`);
     await waitForCompanionToContain(companionB, `thread:${T_XR}`);
     await waitForCompanionToContain(companionB, `dispatch:${D_XR}`);
+    await waitForCompanionToContain(companionB, `timeline-visit:${URL_HN}`);
+    await waitForCompanionToContain(
+      companionB,
+      `timeline-visit:${URL_AMBIENT.replace(/\/+$/u, '')}`,
+    );
 
     // Configure each browser to talk to its own companion.
     const openPanel = async (
@@ -266,36 +273,44 @@ test.describe('connections — two-browser cross-replica sync', () => {
     seedA = null;
   });
 
-  test('Browser B side panel renders the workstream + thread subgraph after relay sync', async () => {
+  test('Browser B side panel renders the same workstream subgraph + ambient visits + dispatch edges', async () => {
     if (panelB === null || seedA === null) throw new Error('beforeAll did not run');
+    const wsId = seedA.wsId;
     const input = panelB.getByTestId('connections-anchor-input');
     await input.click();
-    await input.fill(`workstream:${seedA.wsId}`);
+    await input.fill(`workstream:${wsId}`);
     await input.press('Enter');
     await expect(panelB.getByTestId('connections-groups')).toBeVisible({ timeout: 30_000 });
-    // The thread arrived through the relay's event-log sync and
-    // rendered on B's side panel through the SW proxy.
+    // Direct neighbors at hops=1 from the workstream — must include
+    // the thread (event-derived) AND the tagged ambient timeline
+    // visits (visit_in_workstream, Phase 4) AND the dispatch
+    // (dispatch_in_workstream emitted from DISPATCH_RECORDED, Phase 4
+    // cross-replica fix).
     await expect(panelB.getByTestId(`node-thread:${T_XR}`)).toBeVisible();
-    // Dispatch + timeline-visit reachability are verified at the
-    // snapshot envelope level — the dispatch node lazy-creates from
-    // DISPATCH_RECORDED in pass 4 (1-hop direct edges
-    // dispatch_from_thread / dispatch_in_workstream are vault-only
-    // today and don't sync; documented gap). Timeline visits
-    // currently flow through importEdgeEvent and don't ferry
-    // through the relay; separate sync gap, also documented.
-    const wsId = seedA.wsId;
+    await expect(panelB.getByTestId(`node-dispatch:${D_XR}`)).toBeVisible();
+    await expect(panelB.getByTestId(`node-timeline-visit:${URL_HN}`)).toBeVisible();
+    await expect(
+      panelB.getByTestId(`node-timeline-visit:${URL_AMBIENT.replace(/\/+$/u, '')}`),
+    ).toBeVisible();
+    // Snapshot-level checks that the structural edges all came
+    // across the relay event log (no JSONL on B).
     if (companionB === null) throw new Error('companion B not started');
     const all = (await apiGet(companionB, '/v1/connections')) as ConnectionsEnvelope;
-    const ids = new Set(all.data.snapshot.nodes.map((n) => n.id));
-    expect(ids.has(`workstream:${wsId}`)).toBe(true);
-    expect(ids.has(`thread:${T_XR}`)).toBe(true);
-    expect(ids.has(`dispatch:${D_XR}`)).toBe(true);
-    // thread_in_workstream came across the relay (event-derived).
+    const edgeKindsPresent = new Set(all.data.snapshot.edges.map((e) => e.kind));
+    expect(edgeKindsPresent.has('thread_in_workstream')).toBe(true);
+    expect(edgeKindsPresent.has('dispatch_from_thread')).toBe(true);
+    expect(edgeKindsPresent.has('dispatch_in_workstream')).toBe(true);
+    expect(edgeKindsPresent.has('dispatch_requested_coding_session')).toBe(true);
+    expect(edgeKindsPresent.has('visit_in_workstream')).toBe(true);
+    // Specifically: visit_in_workstream from the AMBIENT (never-
+    // referenced) URL_AMBIENT visit to the workstream — this is the
+    // load-bearing assertion for Phase 4 ambient-browsing closure
+    // across the relay.
     expect(
       all.data.snapshot.edges.some(
         (e) =>
-          e.kind === 'thread_in_workstream' &&
-          e.fromNodeId === `thread:${T_XR}` &&
+          e.kind === 'visit_in_workstream' &&
+          e.fromNodeId === `timeline-visit:${URL_AMBIENT.replace(/\/+$/u, '')}` &&
           e.toNodeId === `workstream:${wsId}`,
       ),
     ).toBe(true);
