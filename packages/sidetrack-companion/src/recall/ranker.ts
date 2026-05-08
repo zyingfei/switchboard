@@ -85,6 +85,8 @@ export interface RankedItem {
   readonly why?: readonly string[];
 }
 
+import type { AnnVectorIndex } from './ann-index.js';
+
 const clampLimit = (limit: number | undefined): number => Math.min(Math.max(limit ?? 10, 1), 50);
 
 const cosine = (left: Float32Array, right: Float32Array): number => {
@@ -121,17 +123,34 @@ export const rank = (
   opts: {
     readonly limit?: number;
     readonly workstreamMembership?: (threadId: string) => boolean;
+    readonly vectorIndex?: AnnVectorIndex;
   } = {},
-): readonly RankedItem[] =>
-  items
-    // OR-Set tombstone filter — single-replica reader treats a
-    // tombstoned entry as deleted. The future multi-replica reader
-    // will resolve tombstones at merge time before this point.
-    .filter((item) => item.tombstoned !== true)
-    .filter((item) => opts.workstreamMembership?.(item.threadId) ?? true)
-    .map((item) => {
-      const similarity = cosine(queryEmbedding, item.embedding);
+): readonly RankedItem[] => {
+  const vectorRows =
+    opts.vectorIndex?.query(queryEmbedding, {
+      ...(opts.limit === undefined ? {} : { limit: opts.limit }),
+      ...(opts.workstreamMembership === undefined
+        ? {}
+        : { workstreamMembership: opts.workstreamMembership }),
+    }) ??
+    items
+      // OR-Set tombstone filter — single-replica reader treats a
+      // tombstoned entry as deleted. The future multi-replica reader
+      // will resolve tombstones at merge time before this point.
+      .filter((item) => item.tombstoned !== true)
+      .filter((item) => opts.workstreamMembership?.(item.threadId) ?? true)
+      .map((item) => ({
+        item,
+        similarity: cosine(queryEmbedding, item.embedding),
+      }))
+      .sort((left, right) => right.similarity - left.similarity)
+      .slice(0, clampLimit(opts.limit));
+
+  return vectorRows
+    .map((row) => {
+      const item = row.item;
       const freshness = freshnessDecay(item.capturedAt, now);
+      const similarity = row.similarity;
       return {
         id: item.id,
         threadId: item.threadId,
@@ -143,6 +162,7 @@ export const rank = (
     })
     .sort((left, right) => right.score - left.score)
     .slice(0, clampLimit(opts.limit));
+};
 
 // ───────────────────── Hybrid lexical + vector fusion ─────────────────────
 //
@@ -253,6 +273,10 @@ const buildSnippet = (text: string, query: string, maxChars = 220): string => {
 export interface HybridRankOptions {
   readonly limit?: number;
   readonly workstreamMembership?: (threadId: string) => boolean;
+  readonly excludeIds?: ReadonlySet<string>;
+  // Optional ANN vector backend. When absent, rankHybrid keeps the
+  // original deterministic flat scan.
+  readonly vectorIndex?: AnnVectorIndex;
   // Caller-provided lexical index. Built once per (indexFile,
   // modelId) pair; rebuilt only when the on-disk index changes.
   readonly lexical: HybridLexicalIndex;
@@ -268,15 +292,23 @@ export const rankHybrid = (
   // 1. Vector list — same as plain rank() but capped to the fusion
   //    window and stripped of the freshness multiplier (freshness is
   //    layered back as an additive boost after fusion).
-  const vectorList = items
-    .filter((item) => item.tombstoned !== true)
-    .filter((item) => opts.workstreamMembership?.(item.threadId) ?? true)
-    .map((item) => ({
-      item,
-      similarity: cosine(queryEmbedding, item.embedding),
-    }))
-    .sort((a, b) => b.similarity - a.similarity)
-    .slice(0, FUSION_WINDOW);
+  const vectorList =
+    opts.vectorIndex?.query(queryEmbedding, {
+      limit: FUSION_WINDOW,
+      ...(opts.excludeIds === undefined ? {} : { excludeIds: opts.excludeIds }),
+      ...(opts.workstreamMembership === undefined
+        ? {}
+        : { workstreamMembership: opts.workstreamMembership }),
+    }) ??
+    items
+      .filter((item) => item.tombstoned !== true)
+      .filter((item) => opts.workstreamMembership?.(item.threadId) ?? true)
+      .map((item) => ({
+        item,
+        similarity: cosine(queryEmbedding, item.embedding),
+      }))
+      .sort((a, b) => b.similarity - a.similarity)
+      .slice(0, FUSION_WINDOW);
 
   // 2. Lexical list from minisearch over the live chunks.
   const lexResults: SearchResult[] = opts.lexical.mini
