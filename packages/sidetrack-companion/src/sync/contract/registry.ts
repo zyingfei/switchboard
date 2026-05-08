@@ -29,6 +29,11 @@ import {
   ANNOTATION_NOTE_SET,
 } from '../../annotations/events.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
+import {
+  PRIVACY_GATE_FLIPPED,
+  PRIVACY_PERMISSION_GRANTED,
+  PRIVACY_PERMISSION_REVOKED,
+} from '../../privacy/events.js';
 import { QUEUE_CREATED, QUEUE_STATUS_SET } from '../../queue/events.js';
 import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from '../../recall/events.js';
 import { CAPTURE_EXTRACTION_PRODUCED } from '../../recall/extraction/events.js';
@@ -130,6 +135,9 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   projectionEntry(QUEUE_STATUS_SET, 'queue-projection'),
   projectionEntry(DISPATCH_RECORDED, 'dispatch-projection'),
   projectionEntry(DISPATCH_LINKED, 'dispatch-projection'),
+  projectionEntry(PRIVACY_GATE_FLIPPED, 'privacy-projection'),
+  projectionEntry(PRIVACY_PERMISSION_GRANTED, 'privacy-projection'),
+  projectionEntry(PRIVACY_PERMISSION_REVOKED, 'privacy-projection'),
   // Annotation events fan out to TWO surfaces: the projection (Class A,
   // SSE-mirrored) AND the in-page overlay refresh (Class A, dispatched
   // via runtime message to tabs viewing the annotated URL).

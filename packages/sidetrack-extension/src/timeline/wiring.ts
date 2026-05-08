@@ -37,12 +37,12 @@ import type { BrowserTimelineObservedPayload, TimelineProvider } from './events'
 const DRAIN_ALARM = 'sidetrack.timeline.drain';
 const DRAIN_PERIOD_MIN = 1; // every minute when companion reachable
 
-// Settings key for the timeline enable gate. Default is OFF — the
-// user (or an external setting writer) must explicitly opt in
-// before browser activity is observed. This is the privacy gate
-// the reviewer flagged: passive history capture must not silently
-// turn on just because the contract can support it.
+// Legacy settings key for the timeline enable gate. Stage 1 migrates
+// this into the Class A privacy event stream, but the key stays for
+// bootstrapping existing installs and tests that simulate the legacy
+// flag.
 export const TIMELINE_ENABLED_KEY = 'sidetrack.timeline.enabled';
+export const TIMELINE_PRIVACY_GATE = 'timeline';
 
 // Settings key for the user's currently-focused workstream. When
 // set, the timeline observer stamps it onto every browser.timeline.
@@ -185,6 +185,9 @@ interface InitDeps {
   // Lookup the current companion config for the drainer. Returning
   // null disables drain (and flags companion unreachable).
   readonly readCompanion: () => Promise<{ url: string; bridgeKey: string } | null>;
+  // Production reads the Class A privacy projection. Tests may omit it
+  // and fall back to the legacy storage gate helper above.
+  readonly readTimelineGateState?: () => Promise<boolean>;
 }
 
 // Captured at init() so external triggerTimelineDrain() can run the
@@ -239,14 +242,10 @@ export const triggerTimelineDrain = async (): Promise<{
 
 export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> => {
   if (initialized) return;
-  // Gate first — if the user hasn't opted in, register nothing.
-  // This keeps timeline default-OFF as a privacy posture: no
-  // chrome.tabs listeners, no chrome.alarms drain, no observations
-  // ever reach the spool. The user can flip the gate via
-  // setTimelineEnabled (called from a side-panel toggle in a
-  // future iteration); reloading the SW after enabling is what
-  // actually wires it up.
-  if (!(await isTimelineEnabled())) return;
+  const readTimelineGateState = deps.readTimelineGateState ?? isTimelineEnabled;
+  // Gate first — if the user hasn't opted in via the privacy
+  // projection, register nothing.
+  if (!(await readTimelineGateState())) return;
   initialized = true;
   capturedInitDeps = deps;
 
@@ -265,6 +264,7 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
   chrome.tabs.onActivated.addListener((info) => {
     void (async () => {
       try {
+        if (!(await readTimelineGateState())) return;
         const tab = await chrome.tabs.get(info.tabId);
         if (typeof tab.url !== 'string' || tab.url.length === 0) return;
         observer.observe({
@@ -284,23 +284,29 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
   // title changes. We only emit on URL changes (the observer's
   // coalesce drops repeated identical-canonical observations).
   chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-    if (changeInfo.url === undefined && changeInfo.status !== 'complete') return;
-    const url = tab.url ?? changeInfo.url;
-    if (typeof url !== 'string' || url.length === 0) return;
-    if (typeof tab.windowId !== 'number') return;
-    observer.observe({
-      tabId,
-      windowId: tab.windowId,
-      url,
-      ...(typeof tab.title === 'string' ? { title: tab.title } : {}),
-      transition: changeInfo.status === 'complete' ? 'completed' : 'updated',
-    });
+    void (async () => {
+      if (!(await readTimelineGateState())) return;
+      if (changeInfo.url === undefined && changeInfo.status !== 'complete') return;
+      const url = tab.url ?? changeInfo.url;
+      if (typeof url !== 'string' || url.length === 0) return;
+      if (typeof tab.windowId !== 'number') return;
+      observer.observe({
+        tabId,
+        windowId: tab.windowId,
+        url,
+        ...(typeof tab.title === 'string' ? { title: tab.title } : {}),
+        transition: changeInfo.status === 'complete' ? 'completed' : 'updated',
+      });
+    })();
   });
 
   // chrome.tabs.onRemoved: emit a closed transition so timeline
   // sessions have a clean tail.
   chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
-    observer.close({ tabId, windowId: removeInfo.windowId });
+    void (async () => {
+      if (!(await readTimelineGateState())) return;
+      observer.close({ tabId, windowId: removeInfo.windowId });
+    })();
   });
 
   // Periodic drain via chrome.alarms (1-minute cadence; same minimum
