@@ -1,0 +1,79 @@
+{
+  "visits": [
+    {
+      "canonicalUrl": "https://example.test/a",
+      "title": "Topic A",
+      "focusedWindowMs": 10000,
+      "firstObservedAt": "2026-05-08T10:00:00.000Z",
+      "lastObservedAt": "2026-05-08T11:00:00.000Z"
+    },
+    {
+      "canonicalUrl": "https://example.test/b",
+      "title": "Topic B",
+      "focusedWindowMs": 10000,
+      "firstObservedAt": "2026-05-08T10:00:00.000Z",
+      "lastObservedAt": "2026-05-08T11:00:00.000Z"
+    },
+    {
+      "canonicalUrl": "https://example.test/c",
+      "title": "Topic C",
+      "focusedWindowMs": 10000,
+      "firstObservedAt": "2026-05-08T10:00:00.000Z",
+      "lastObservedAt": "2026-05-08T11:00:00.000Z"
+    },
+    {
+      "canonicalUrl": "https://example.test/d",
+      "title": "Topic D",
+      "focusedWindowMs": 10000,
+      "firstObservedAt": "2026-05-08T10:00:00.000Z",
+      "lastObservedAt": "2026-05-08T11:00:00.000Z"
+    }
+  ],
+  "previousVisitSimilarity": {
+    "revisionId": "fixture-topic-split-previous",
+    "edges": [
+      {
+        "fromVisitKey": "https://example.test/a",
+        "toVisitKey": "https://example.test/b",
+        "cosine": 0.91
+      },
+      {
+        "fromVisitKey": "https://example.test/b",
+        "toVisitKey": "https://example.test/c",
+        "cosine": 0.91
+      },
+      {
+        "fromVisitKey": "https://example.test/c",
+        "toVisitKey": "https://example.test/d",
+        "cosine": 0.91
+      }
+    ]
+  },
+  "currentVisitSimilarity": {
+    "revisionId": "fixture-topic-split-current",
+    "edges": [
+      {
+        "fromVisitKey": "https://example.test/a",
+        "toVisitKey": "https://example.test/b",
+        "cosine": 0.91
+      },
+      {
+        "fromVisitKey": "https://example.test/b",
+        "toVisitKey": "https://example.test/c",
+        "cosine": 0.91
+      },
+      {
+        "fromVisitKey": "https://example.test/a",
+        "toVisitKey": "https://example.test/c",
+        "cosine": 0.91
+      },
+      {
+        "fromVisitKey": "https://example.test/c",
+        "toVisitKey": "https://example.test/d",
+        "cosine": 0.84
+      }
+    ]
+  },
+  "expectedCurrentTopicCount": 1,
+  "expectedLineageKinds": ["split", "split"]
+}

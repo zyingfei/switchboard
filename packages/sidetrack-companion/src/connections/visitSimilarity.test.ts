@@ -1,3 +1,5 @@
+import { readFile } from 'node:fs/promises';
+
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { buildConnectionsSnapshot } from './snapshot.js';
@@ -45,21 +47,89 @@ const keyFromEmbeddingText = (text: string): string => {
   return corpus.split(/\s+/u)[0] ?? '';
 };
 
-const embedFromVectors = (
-  vectors: ReadonlyMap<string, Float32Array>,
-): VisitSimilarityEmbedder => async (texts) =>
-  texts.map((text) => {
-    const key = keyFromEmbeddingText(text);
-    const vector = vectors.get(key);
-    if (vector === undefined) {
-      throw new Error(`missing vector for ${key}`);
-    }
-    return vector;
-  });
+const embedFromVectors =
+  (vectors: ReadonlyMap<string, Float32Array>): VisitSimilarityEmbedder =>
+  async (texts) =>
+    texts.map((text) => {
+      const key = keyFromEmbeddingText(text);
+      const vector = vectors.get(key);
+      if (vector === undefined) {
+        throw new Error(`missing vector for ${key}`);
+      }
+      return vector;
+    });
 
 const withoutProducedAt = (revision: Awaited<ReturnType<typeof buildVisitSimilarity>>) => {
   const { producedAt: _producedAt, ...rest } = revision;
   return rest;
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const isFiniteNumber = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value);
+
+interface VisitSimilarityFixture {
+  readonly entries: readonly VisitSimilarityEntry[];
+  readonly vectors: ReadonlyMap<string, Float32Array>;
+  readonly expectedEdges: readonly {
+    readonly fromVisitKey: string;
+    readonly toVisitKey: string;
+    readonly cosine: number;
+  }[];
+}
+
+const readVisitSimilarityFixture = async (filename: string): Promise<VisitSimilarityFixture> => {
+  const raw = await readFile(new URL(`./__fixtures__/${filename}`, import.meta.url), 'utf8');
+  const parsed: unknown = JSON.parse(raw);
+  if (!isRecord(parsed) || !Array.isArray(parsed['entries']) || !isRecord(parsed['vectors'])) {
+    throw new Error(`invalid visit similarity fixture: ${filename}`);
+  }
+
+  const entries = parsed['entries'].map((entry): VisitSimilarityEntry => {
+    if (!isRecord(entry) || typeof entry['key'] !== 'string') {
+      throw new Error(`invalid visit similarity entry in ${filename}`);
+    }
+    const focusedWindowMs = entry['focusedWindowMs'];
+    const lastSeenAt = entry['lastSeenAt'];
+    return visit(entry['key'], {
+      ...(isFiniteNumber(focusedWindowMs) ? { focusedWindowMs } : {}),
+      ...(typeof lastSeenAt === 'string' ? { lastSeenAt } : {}),
+    });
+  });
+
+  const vectors = new Map<string, Float32Array>();
+  for (const [key, rawVector] of Object.entries(parsed['vectors'])) {
+    if (!Array.isArray(rawVector) || !rawVector.every(isFiniteNumber)) {
+      throw new Error(`invalid vector for ${key} in ${filename}`);
+    }
+    vectors.set(key, unit(rawVector));
+  }
+
+  const expectedEdges = parsed['expectedEdges'];
+  if (!Array.isArray(expectedEdges)) {
+    throw new Error(`invalid expected edges in ${filename}`);
+  }
+  return {
+    entries,
+    vectors,
+    expectedEdges: expectedEdges.map((edge) => {
+      if (
+        !isRecord(edge) ||
+        typeof edge['fromVisitKey'] !== 'string' ||
+        typeof edge['toVisitKey'] !== 'string' ||
+        !isFiniteNumber(edge['cosine'])
+      ) {
+        throw new Error(`invalid expected edge in ${filename}`);
+      }
+      return {
+        fromVisitKey: edge['fromVisitKey'],
+        toVisitKey: edge['toVisitKey'],
+        cosine: edge['cosine'],
+      };
+    }),
+  };
 };
 
 afterEach(() => {
@@ -67,6 +137,22 @@ afterEach(() => {
 });
 
 describe('buildVisitSimilarity', () => {
+  it('matches the documented basic fixture', async () => {
+    const fixture = await readVisitSimilarityFixture('visitSimilarity-basic.json');
+
+    const revision = await buildVisitSimilarity(fixture.entries, embedFromVectors(fixture.vectors));
+
+    expect(revision.edges).toEqual(fixture.expectedEdges);
+  });
+
+  it('matches the documented engagement-gate fixture', async () => {
+    const fixture = await readVisitSimilarityFixture('visitSimilarity-engagement-gate.json');
+
+    const revision = await buildVisitSimilarity(fixture.entries, embedFromVectors(fixture.vectors));
+
+    expect(revision.edges).toEqual(fixture.expectedEdges);
+  });
+
   it('is deterministic for the same input excluding producedAt', async () => {
     const entries = [visit('alpha'), visit('bravo'), visit('charlie')];
     const vectors = new Map<string, Float32Array>([
@@ -163,7 +249,9 @@ describe('buildVisitSimilarity', () => {
 
     expect(revision.edges).toEqual([]);
     expect(warn).toHaveBeenCalledWith(
-      expect.stringContaining('[materializer-error] visit-similarity embed failed: model cache empty'),
+      expect.stringContaining(
+        '[materializer-error] visit-similarity embed failed: model cache empty',
+      ),
     );
 
     const snapshot = buildConnectionsSnapshot({
@@ -184,7 +272,9 @@ describe('buildVisitSimilarity', () => {
       ],
       visitSimilarity: revision,
     });
-    expect(snapshot.nodes.map((node) => node.id)).toContain('timeline-visit:https://example.test/alpha');
+    expect(snapshot.nodes.map((node) => node.id)).toContain(
+      'timeline-visit:https://example.test/alpha',
+    );
     expect(snapshot.edges.find((edge) => edge.kind === 'visit_resembles_visit')).toBeUndefined();
   });
 
@@ -195,8 +285,7 @@ describe('buildVisitSimilarity', () => {
     for (let index = 1; index <= 60; index += 1) {
       const key = `b-${String(index).padStart(2, '0')}`;
       candidates.push(visit(key));
-      const cosine =
-        index <= 50 ? 0.99 - index * 0.001 : index === 51 ? 0.9 : 0.2;
+      const cosine = index <= 50 ? 0.99 - index * 0.001 : index === 51 ? 0.9 : 0.2;
       vectors.set(`visit-${key}`, vectorAtCosine(cosine));
     }
 
@@ -224,15 +313,10 @@ describe('buildVisitSimilarity', () => {
 
   it('uses passage and query prefixes for embedded corpus strings', async () => {
     const seen: string[] = [];
-    await buildVisitSimilarity(
-      [visit('alpha'), visit('bravo')],
-      async (texts) => {
-        seen.push(...texts);
-        return texts.map((text) =>
-          text.includes('visit-alpha') ? unit([1, 0]) : unit([1, 0]),
-        );
-      },
-    );
+    await buildVisitSimilarity([visit('alpha'), visit('bravo')], async (texts) => {
+      seen.push(...texts);
+      return texts.map((text) => (text.includes('visit-alpha') ? unit([1, 0]) : unit([1, 0])));
+    });
 
     expect(seen.filter((text) => text.startsWith('passage: '))).toHaveLength(2);
     expect(seen.filter((text) => text.startsWith('query: '))).toHaveLength(2);

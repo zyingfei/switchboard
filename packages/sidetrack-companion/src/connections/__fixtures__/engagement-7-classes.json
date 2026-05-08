@@ -1,0 +1,130 @@
+{
+  "cases": [
+    {
+      "name": "parked_background",
+      "input": { "engagement": { "focusedWindowMs": 1500, "activeMs": 500 } },
+      "expectedClass": "parked_background"
+    },
+    {
+      "name": "parked_background_boundary",
+      "input": { "engagement": { "focusedWindowMs": 2500, "activeMs": 1500 } },
+      "notClass": "parked_background"
+    },
+    {
+      "name": "glanced",
+      "input": { "engagement": { "activeMs": 4500, "maxScrollRatio": 0.1, "copyCount": 0 } },
+      "expectedClass": "glanced"
+    },
+    {
+      "name": "glanced_boundary",
+      "input": { "engagement": { "activeMs": 5500, "maxScrollRatio": 0.1, "copyCount": 0 } },
+      "notClass": "glanced"
+    },
+    {
+      "name": "skimmed",
+      "input": {
+        "engagement": {
+          "activeMs": 10000,
+          "maxScrollRatio": 0.3,
+          "scrollEvents": 5,
+          "copyCount": 0
+        }
+      },
+      "expectedClass": "skimmed"
+    },
+    {
+      "name": "skimmed_boundary",
+      "input": {
+        "engagement": {
+          "activeMs": 10000,
+          "maxScrollRatio": 0.3,
+          "scrollEvents": 5,
+          "copyCount": 1
+        }
+      },
+      "notClass": "skimmed"
+    },
+    {
+      "name": "engaged_read",
+      "input": {
+        "engagement": { "activeMs": 35000, "maxScrollRatio": 0.5, "returnCount": 2, "copyCount": 0 }
+      },
+      "expectedClass": "engaged_read"
+    },
+    {
+      "name": "engaged_read_boundary",
+      "input": {
+        "engagement": { "activeMs": 29000, "maxScrollRatio": 0.5, "returnCount": 2, "copyCount": 0 }
+      },
+      "notClass": "engaged_read"
+    },
+    {
+      "name": "worked_on_reference",
+      "input": {
+        "engagement": { "activeMs": 35000, "maxScrollRatio": 0.5, "copyCount": 2, "returnCount": 2 }
+      },
+      "expectedClass": "worked_on_reference"
+    },
+    {
+      "name": "worked_on_reference_boundary",
+      "input": {
+        "engagement": { "activeMs": 35000, "maxScrollRatio": 0.5, "copyCount": 0, "returnCount": 2 }
+      },
+      "notClass": "worked_on_reference"
+    },
+    {
+      "name": "source_extracted",
+      "input": {
+        "engagement": {
+          "activeMs": 35000,
+          "maxScrollRatio": 0.5,
+          "copyCount": 2,
+          "returnCount": 2
+        },
+        "hasDownstreamPasteLineage": true
+      },
+      "expectedClass": "source_extracted"
+    },
+    {
+      "name": "source_extracted_boundary",
+      "input": {
+        "engagement": {
+          "activeMs": 35000,
+          "maxScrollRatio": 0.5,
+          "copyCount": 2,
+          "returnCount": 2
+        },
+        "hasDownstreamPasteLineage": false
+      },
+      "notClass": "source_extracted"
+    },
+    {
+      "name": "execution_source",
+      "input": {
+        "engagement": {
+          "activeMs": 35000,
+          "maxScrollRatio": 0.5,
+          "copyCount": 3,
+          "returnCount": 2
+        },
+        "hasDownstreamPasteLineage": true,
+        "distinctPasteDestinationKinds": 2
+      },
+      "expectedClass": "execution_source"
+    },
+    {
+      "name": "execution_source_boundary",
+      "input": {
+        "engagement": {
+          "activeMs": 35000,
+          "maxScrollRatio": 0.5,
+          "copyCount": 3,
+          "returnCount": 2
+        },
+        "hasDownstreamPasteLineage": true,
+        "distinctPasteDestinationKinds": 1
+      },
+      "notClass": "execution_source"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "entries": [
+    { "key": "alpha", "focusedWindowMs": 10000 },
+    { "key": "bravo", "focusedWindowMs": 4999 },
+    { "key": "charlie", "focusedWindowMs": 5000 }
+  ],
+  "vectors": {
+    "visit-alpha": [1, 0],
+    "visit-bravo": [1, 0],
+    "visit-charlie": [1, 0]
+  },
+  "expectedEdges": [
+    {
+      "fromVisitKey": "https://example.test/alpha",
+      "toVisitKey": "https://example.test/charlie",
+      "cosine": 1
+    }
+  ]
+}

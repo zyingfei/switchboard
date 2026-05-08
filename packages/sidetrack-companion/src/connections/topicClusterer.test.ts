@@ -1,9 +1,13 @@
+import { readFile } from 'node:fs/promises';
+
 import { describe, expect, it } from 'vitest';
 
 import {
   buildTopicRevision,
+  type UserAssertedVisitRelation,
   type TopicVisit,
   type VisitSimilarityEdge,
+  type VisitSimilarityRevisionInput,
 } from './topicClusterer.js';
 import { topicId } from './topicId.js';
 
@@ -30,7 +34,264 @@ const edge = (fromVisitKey: string, toVisitKey: string, cosine: number): VisitSi
 const urls = (suffixes: readonly string[]): readonly string[] =>
   suffixes.map((suffix) => `https://example.test/${suffix}`);
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const isFiniteNumber = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value);
+
+type TopicLineageKind = 'split' | 'merge';
+
+interface TopicFixture {
+  readonly visits: readonly TopicVisit[];
+  readonly visitSimilarity?: VisitSimilarityRevisionInput;
+  readonly previousVisitSimilarity?: VisitSimilarityRevisionInput;
+  readonly currentVisitSimilarity?: VisitSimilarityRevisionInput;
+  readonly userAssertedRelations?: readonly UserAssertedVisitRelation[];
+  readonly expectedMemberGroups?: readonly (readonly string[])[];
+  readonly expectedCurrentTopicCount?: number;
+  readonly expectedLineageKinds?: readonly TopicLineageKind[];
+}
+
+const parseFixtureVisit = (value: unknown, filename: string): TopicVisit => {
+  if (
+    !isRecord(value) ||
+    typeof value['canonicalUrl'] !== 'string' ||
+    !isFiniteNumber(value['focusedWindowMs']) ||
+    typeof value['firstObservedAt'] !== 'string' ||
+    typeof value['lastObservedAt'] !== 'string'
+  ) {
+    throw new Error(`invalid topic visit in ${filename}`);
+  }
+  const title = value['title'];
+  const workstreamId = value['workstreamId'];
+  return {
+    canonicalUrl: value['canonicalUrl'],
+    ...(typeof title === 'string' ? { title } : {}),
+    focusedWindowMs: value['focusedWindowMs'],
+    firstObservedAt: value['firstObservedAt'],
+    lastObservedAt: value['lastObservedAt'],
+    ...(typeof workstreamId === 'string' ? { workstreamId } : {}),
+  };
+};
+
+const parseSimilarityEdge = (value: unknown, filename: string): VisitSimilarityEdge => {
+  if (
+    !isRecord(value) ||
+    typeof value['fromVisitKey'] !== 'string' ||
+    typeof value['toVisitKey'] !== 'string' ||
+    !isFiniteNumber(value['cosine'])
+  ) {
+    throw new Error(`invalid topic similarity edge in ${filename}`);
+  }
+  return {
+    fromVisitKey: value['fromVisitKey'],
+    toVisitKey: value['toVisitKey'],
+    cosine: value['cosine'],
+  };
+};
+
+const parseVisitSimilarity = (
+  value: unknown,
+  filename: string,
+): VisitSimilarityRevisionInput | undefined => {
+  if (value === undefined) return undefined;
+  if (
+    !isRecord(value) ||
+    typeof value['revisionId'] !== 'string' ||
+    !Array.isArray(value['edges'])
+  ) {
+    throw new Error(`invalid topic similarity revision in ${filename}`);
+  }
+  return {
+    revisionId: value['revisionId'],
+    edges: value['edges'].map((edgeValue) => parseSimilarityEdge(edgeValue, filename)),
+  };
+};
+
+const parseUserAssertedRelations = (
+  value: unknown,
+  filename: string,
+): readonly UserAssertedVisitRelation[] | undefined => {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    throw new Error(`invalid topic user relations in ${filename}`);
+  }
+  return value.map((relation): UserAssertedVisitRelation => {
+    if (
+      !isRecord(relation) ||
+      (relation['kind'] !== 'in_thread' && relation['kind'] !== 'in_workstream') ||
+      typeof relation['fromVisitKey'] !== 'string' ||
+      typeof relation['toVisitKey'] !== 'string'
+    ) {
+      throw new Error(`invalid topic user relation in ${filename}`);
+    }
+    return {
+      kind: relation['kind'],
+      fromVisitKey: relation['fromVisitKey'],
+      toVisitKey: relation['toVisitKey'],
+    };
+  });
+};
+
+const parseExpectedMemberGroups = (
+  value: unknown,
+  filename: string,
+): readonly (readonly string[])[] | undefined => {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    throw new Error(`invalid topic expected member groups in ${filename}`);
+  }
+  const groups: string[][] = [];
+  for (const group of value) {
+    if (!Array.isArray(group) || !group.every((member) => typeof member === 'string')) {
+      throw new Error(`invalid topic expected member group in ${filename}`);
+    }
+    groups.push([...group].sort());
+  }
+  return groups;
+};
+
+const parseExpectedLineageKinds = (
+  value: unknown,
+  filename: string,
+): readonly TopicLineageKind[] | undefined => {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    throw new Error(`invalid topic expected lineage kinds in ${filename}`);
+  }
+  return value.map((kind) => {
+    if (kind !== 'split' && kind !== 'merge') {
+      throw new Error(`invalid topic expected lineage kind in ${filename}`);
+    }
+    return kind;
+  });
+};
+
+const readTopicFixture = async (filename: string): Promise<TopicFixture> => {
+  const raw = await readFile(new URL(`./__fixtures__/${filename}`, import.meta.url), 'utf8');
+  const parsed: unknown = JSON.parse(raw);
+  if (!isRecord(parsed) || !Array.isArray(parsed['visits'])) {
+    throw new Error(`invalid topic fixture: ${filename}`);
+  }
+  const expectedCurrentTopicCount = parsed['expectedCurrentTopicCount'];
+  const visitSimilarity = parseVisitSimilarity(parsed['visitSimilarity'], filename);
+  const previousVisitSimilarity = parseVisitSimilarity(parsed['previousVisitSimilarity'], filename);
+  const currentVisitSimilarity = parseVisitSimilarity(parsed['currentVisitSimilarity'], filename);
+  const userAssertedRelations = parseUserAssertedRelations(
+    parsed['userAssertedRelations'],
+    filename,
+  );
+  const expectedMemberGroups = parseExpectedMemberGroups(parsed['expectedMemberGroups'], filename);
+  const expectedLineageKinds = parseExpectedLineageKinds(parsed['expectedLineageKinds'], filename);
+  return {
+    visits: parsed['visits'].map((visitValue) => parseFixtureVisit(visitValue, filename)),
+    ...(visitSimilarity === undefined ? {} : { visitSimilarity }),
+    ...(previousVisitSimilarity === undefined ? {} : { previousVisitSimilarity }),
+    ...(currentVisitSimilarity === undefined ? {} : { currentVisitSimilarity }),
+    ...(userAssertedRelations === undefined ? {} : { userAssertedRelations }),
+    ...(expectedMemberGroups === undefined ? {} : { expectedMemberGroups }),
+    ...(isFiniteNumber(expectedCurrentTopicCount) ? { expectedCurrentTopicCount } : {}),
+    ...(expectedLineageKinds === undefined ? {} : { expectedLineageKinds }),
+  };
+};
+
+const topicMemberGroups = (
+  revision: Awaited<ReturnType<typeof buildTopicRevision>>,
+): readonly (readonly string[])[] =>
+  revision.topics
+    .map((topic) => [...topic.memberCanonicalUrls].sort())
+    .sort((left, right) => (left.join('\u0000') < right.join('\u0000') ? -1 : 1));
+
+const requireTopicSimilarity = (
+  fixture: TopicFixture,
+  field: 'visitSimilarity' | 'previousVisitSimilarity' | 'currentVisitSimilarity',
+): VisitSimilarityRevisionInput => {
+  const value = fixture[field];
+  if (value === undefined) {
+    throw new Error(`missing ${field} in topic fixture`);
+  }
+  return value;
+};
+
+const requireExpectedTopicCount = (fixture: TopicFixture): number => {
+  if (fixture.expectedCurrentTopicCount === undefined) {
+    throw new Error('missing expected topic count in topic fixture');
+  }
+  return fixture.expectedCurrentTopicCount;
+};
+
 describe('buildTopicRevision', () => {
+  it('matches the documented topic-basic fixture', async () => {
+    const fixture = await readTopicFixture('topic-basic.json');
+
+    const revision = await buildTopicRevision({
+      visits: fixture.visits,
+      visitSimilarity: requireTopicSimilarity(fixture, 'visitSimilarity'),
+      options: { producedAt },
+    });
+
+    expect(topicMemberGroups(revision)).toEqual(fixture.expectedMemberGroups);
+  });
+
+  it('matches the documented topic-user-assertion fixture', async () => {
+    const fixture = await readTopicFixture('topic-user-assertion.json');
+
+    const input = {
+      visits: fixture.visits,
+      visitSimilarity: requireTopicSimilarity(fixture, 'visitSimilarity'),
+      options: { producedAt },
+      ...(fixture.userAssertedRelations === undefined
+        ? {}
+        : { userAssertedRelations: fixture.userAssertedRelations }),
+    };
+    const revision = await buildTopicRevision(input);
+
+    expect(topicMemberGroups(revision)).toEqual(fixture.expectedMemberGroups);
+  });
+
+  it('matches the documented topic-lineage split fixture', async () => {
+    const fixture = await readTopicFixture('topic-lineage-split.json');
+    const previous = await buildTopicRevision({
+      visits: fixture.visits,
+      visitSimilarity: requireTopicSimilarity(fixture, 'previousVisitSimilarity'),
+      options: { producedAt: producedAt - 1_000 },
+    });
+
+    const current = await buildTopicRevision({
+      visits: fixture.visits,
+      visitSimilarity: requireTopicSimilarity(fixture, 'currentVisitSimilarity'),
+      previousRevision: previous,
+      options: { producedAt },
+    });
+
+    expect(current.topics).toHaveLength(requireExpectedTopicCount(fixture));
+    expect(current.lineage.map((lineage) => lineage.kind).sort()).toEqual(
+      fixture.expectedLineageKinds,
+    );
+  });
+
+  it('matches the documented topic-lineage merge fixture', async () => {
+    const fixture = await readTopicFixture('topic-lineage-merge.json');
+    const previous = await buildTopicRevision({
+      visits: fixture.visits,
+      visitSimilarity: requireTopicSimilarity(fixture, 'previousVisitSimilarity'),
+      options: { producedAt: producedAt - 1_000 },
+    });
+
+    const current = await buildTopicRevision({
+      visits: fixture.visits,
+      visitSimilarity: requireTopicSimilarity(fixture, 'currentVisitSimilarity'),
+      previousRevision: previous,
+      options: { producedAt },
+    });
+
+    expect(current.topics).toHaveLength(requireExpectedTopicCount(fixture));
+    expect(current.lineage.map((lineage) => lineage.kind).sort()).toEqual(
+      fixture.expectedLineageKinds,
+    );
+  });
+
   it('clusters only cosine edges at or above the threshold', async () => {
     const [a, b, c] = urls(['a', 'b', 'c']);
     const visits = [visit(a!), visit(b!), visit(c!)];
@@ -108,11 +369,7 @@ describe('buildTopicRevision', () => {
       visits,
       visitSimilarity: {
         revisionId: 'sim-previous-split',
-        edges: [
-          edge(a!, b!, 0.91),
-          edge(b!, c!, 0.91),
-          edge(c!, d!, 0.91),
-        ],
+        edges: [edge(a!, b!, 0.91), edge(b!, c!, 0.91), edge(c!, d!, 0.91)],
       },
       options: { producedAt: producedAt - 1_000 },
     });
@@ -123,12 +380,7 @@ describe('buildTopicRevision', () => {
       visits,
       visitSimilarity: {
         revisionId: 'sim-current-split',
-        edges: [
-          edge(a!, b!, 0.91),
-          edge(b!, c!, 0.91),
-          edge(a!, c!, 0.91),
-          edge(c!, d!, 0.84),
-        ],
+        edges: [edge(a!, b!, 0.91), edge(b!, c!, 0.91), edge(a!, c!, 0.91), edge(c!, d!, 0.84)],
       },
       previousRevision: previous,
       options: { producedAt },
