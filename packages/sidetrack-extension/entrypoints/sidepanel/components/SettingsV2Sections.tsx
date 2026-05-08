@@ -112,18 +112,21 @@ export function AppearanceSection({
 // ─────────────────────────────────────────────────────────────────────
 // Timeline observation — Settings → Timeline.
 //
-// Two coupled controls:
+// Two independent controls:
 //   1. The privacy gate (chrome.storage.local['sidetrack.timeline.enabled']).
 //      Default OFF; flipping ON also fires the 'sidetrack.timeline.reinit'
 //      runtime message so the SW's chrome.tabs listeners register without a
-//      reload.
-//   2. The host-permission grant. The manifest declares
-//      optional_host_permissions: ['https://*/*', 'http://*/*']; without
-//      that grant the timeline observer can read URLs only for chat-
-//      provider hosts (host_permissions). Granting the optional pair lets
-//      ambient browsing (HN / blog / search / GitHub / video) participate
-//      in active-workstream attribution. The button calls
-//      chrome.permissions.request from a user-gesture context.
+//      reload. Once on, the manifest's `tabs` permission is enough to
+//      observe URL + title for every navigation — chat-provider AND
+//      ambient pages.
+//   2. The optional-host-permission grant. The manifest declares
+//      optional_host_permissions: ['https://*/*', 'http://*/*']. URL +
+//      title observation does NOT need this grant — the `tabs` permission
+//      already covers it. The grant exists for future passes that need
+//      deeper page access (content extraction, in-page actions). The
+//      button calls chrome.permissions.request from a user-gesture
+//      context so the grant is available when those features land,
+//      without forcing the user back through Settings later.
 // ─────────────────────────────────────────────────────────────────────
 
 const TIMELINE_OPTIONAL_ORIGINS = ['https://*/*', 'http://*/*'] as const;
@@ -188,9 +191,7 @@ export function TimelineSection() {
       }
       setNotice(
         next
-          ? hasPermission
-            ? 'Timeline observation enabled.'
-            : 'Timeline enabled. Grant URL access below to observe ambient pages.'
+          ? 'Timeline observation enabled. URL + title for every navigation will land in the timeline projection.'
           : 'Timeline observation disabled.',
       );
     } catch (error) {
@@ -217,8 +218,8 @@ export function TimelineSection() {
       setHasPermission(granted);
       setNotice(
         granted
-          ? 'URL access granted — ambient pages will be observed when timeline is enabled.'
-          : 'Permission was not granted; the observer can still see chat-provider hosts.',
+          ? 'Deeper page access granted. Future Sidetrack features (content extraction, in-page actions) will use this — URL/title observation already worked without it.'
+          : 'Permission was not granted. Timeline observation continues to work for URL + title; the grant is only needed for deeper page features.',
       );
     } catch (error) {
       setNotice(
@@ -244,7 +245,7 @@ export function TimelineSection() {
       if (removed) setHasPermission(false);
       setNotice(
         removed
-          ? 'URL access revoked. Ambient pages will no longer be observed.'
+          ? 'Deeper page access revoked. Timeline observation still records URL + title.'
           : 'Could not revoke; you may need to use chrome://extensions to remove host access.',
       );
     } catch (error) {
@@ -260,9 +261,9 @@ export function TimelineSection() {
     <div className="settings-sec-v2" id="sec-timeline" data-testid="settings-timeline-section">
       <div className="sec-h">Timeline observation</div>
       <p className="settings-section-lede ai-italic">
-        When enabled, Sidetrack observes the URLs you visit and attributes
-        them to the active workstream — no captures, just titles + URLs in
-        the local timeline projection. Default OFF, opt-in.
+        When enabled, Sidetrack observes URL + title for every browser tab
+        navigation and attributes each one to the active workstream — no
+        page contents are captured. Default OFF, opt-in.
       </p>
       <label className={'switch ' + (enabled ? 'on' : '')}>
         <input
@@ -279,16 +280,14 @@ export function TimelineSection() {
           Observe browser activity
           <span className="desc mono">
             {enabled
-              ? hasPermission
-                ? 'on — observing chat + ambient pages'
-                : 'on — observing chat-provider pages only (grant URL access for ambient)'
+              ? 'on — recording URL + title for every navigation'
               : 'off — no tab activity is recorded'}
           </span>
         </span>
       </label>
       <div className="settings-cta-row" style={{ marginTop: 8 }}>
         <span className="mono" data-testid="settings-timeline-permission-status">
-          {hasPermission ? '✓ URL access granted' : 'URL access not granted'}
+          {hasPermission ? '✓ deeper page access granted' : 'deeper page access not granted (optional)'}
         </span>
         {hasPermission ? (
           <button
@@ -300,7 +299,7 @@ export function TimelineSection() {
               void handleRevokePermission();
             }}
           >
-            Revoke URL access
+            Revoke
           </button>
         ) : (
           <button
@@ -312,7 +311,7 @@ export function TimelineSection() {
               void handleGrantPermission();
             }}
           >
-            Grant URL access…
+            Allow deeper page access…
           </button>
         )}
       </div>
@@ -322,9 +321,13 @@ export function TimelineSection() {
         </div>
       ) : null}
       <p className="settings-hint mono">
-        Active workstream is set by selecting one in the workboard;
-        observed visits will attach to it via{' '}
-        <code>visit_in_workstream</code> in the Connections graph.
+        URL + title observation works as soon as the toggle is on (the
+        manifest's <code>tabs</code> permission covers it). Deeper access
+        is optional — it lets future Sidetrack features (content
+        extraction, in-page actions) work on ambient pages too. Active
+        workstream is set by selecting one in the workboard; observed
+        visits attach via <code>visit_in_workstream</code> in the
+        Connections graph.
       </p>
     </div>
   );
