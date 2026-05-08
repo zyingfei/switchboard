@@ -35,7 +35,7 @@ export interface ConnectionEdge {
     readonly dot?: { readonly replicaId: string; readonly seq: number };
     readonly recordId?: string;
   };
-  readonly confidence: 'explicit' | 'deterministic' | 'suggested';
+  readonly confidence: 'asserted' | 'observed' | 'inferred';
 }
 
 export interface ConnectionsSnapshot {

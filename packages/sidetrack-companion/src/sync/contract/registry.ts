@@ -76,6 +76,7 @@ export interface SurfaceContract {
 
 export interface ContractEntry {
   readonly eventType: string;
+  readonly currentPayloadVersion?: number;
   readonly surfaces: readonly SurfaceContract[];
 }
 
@@ -106,6 +107,7 @@ export const KNOWN_MATERIALIZERS: ReadonlySet<string> = new Set<string>([
 
 const projectionEntry = (eventType: string, surface: string): ContractEntry => ({
   eventType,
+  currentPayloadVersion: 1,
   surfaces: [
     {
       surface,
@@ -141,6 +143,7 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   // via runtime message to tabs viewing the annotated URL).
   {
     eventType: ANNOTATION_CREATED,
+    currentPayloadVersion: 1,
     surfaces: [
       {
         surface: 'annotation-projection',
@@ -164,6 +167,7 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   },
   {
     eventType: ANNOTATION_NOTE_SET,
+    currentPayloadVersion: 1,
     surfaces: [
       {
         surface: 'annotation-projection',
@@ -187,6 +191,7 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   },
   {
     eventType: ANNOTATION_DELETED,
+    currentPayloadVersion: 1,
     surfaces: [
       {
         surface: 'annotation-projection',
@@ -220,6 +225,7 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   // KNOWN_MATERIALIZERS).
   {
     eventType: CAPTURE_RECORDED,
+    currentPayloadVersion: 1,
     surfaces: [
       {
         surface: 'recall-index',
@@ -237,6 +243,7 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   },
   {
     eventType: RECALL_TOMBSTONE_TARGET,
+    currentPayloadVersion: 1,
     surfaces: [
       {
         surface: 'recall-index',
@@ -259,6 +266,7 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   // coverage test enforces that gap.
   {
     eventType: CAPTURE_EXTRACTION_PRODUCED,
+    currentPayloadVersion: 1,
     surfaces: [
       {
         surface: 'extraction-revisions',
@@ -286,6 +294,7 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   //      the dedicated 'timeline' materializer.
   {
     eventType: BROWSER_TIMELINE_OBSERVED,
+    currentPayloadVersion: 1,
     surfaces: [
       {
         surface: 'plugin-timeline-active-window',

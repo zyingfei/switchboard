@@ -53,22 +53,35 @@ export interface ThreadUpsertedPayload {
   readonly primaryWorkstreamId?: string;
   readonly tags?: readonly string[];
   readonly trackingMode?: ThreadTrackingMode;
+  readonly payloadVersion?: number;
+  readonly dimensions?: Record<string, unknown>;
 }
 
 export interface ThreadArchivedPayload {
   readonly bac_id: string;
+  readonly payloadVersion?: number;
+  readonly dimensions?: Record<string, unknown>;
 }
 
 export interface ThreadUnarchivedPayload {
   readonly bac_id: string;
+  readonly payloadVersion?: number;
+  readonly dimensions?: Record<string, unknown>;
 }
 
 export interface ThreadDeletedPayload {
   readonly bac_id: string;
+  readonly payloadVersion?: number;
+  readonly dimensions?: Record<string, unknown>;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;
+
+const hasValidPayloadExtensionFields = (value: Record<string, unknown>): boolean =>
+  (value['payloadVersion'] === undefined ||
+    (typeof value['payloadVersion'] === 'number' && value['payloadVersion'] >= 1)) &&
+  (value['dimensions'] === undefined || isRecord(value['dimensions']));
 
 export const isThreadUpsertedPayload = (
   value: unknown,
@@ -79,11 +92,12 @@ export const isThreadUpsertedPayload = (
     typeof value['provider'] === 'string' &&
     typeof value['threadUrl'] === 'string' &&
     typeof value['title'] === 'string' &&
-    typeof value['lastSeenAt'] === 'string'
+    typeof value['lastSeenAt'] === 'string' &&
+    hasValidPayloadExtensionFields(value)
   );
 };
 
 export const isThreadStatusPayload = (
   value: unknown,
 ): value is ThreadArchivedPayload =>
-  isRecord(value) && typeof value['bac_id'] === 'string';
+  isRecord(value) && typeof value['bac_id'] === 'string' && hasValidPayloadExtensionFields(value);
