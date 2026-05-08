@@ -23,15 +23,24 @@ export interface QueueCreatedPayload {
   readonly scope: QueueScope;
   readonly targetId?: string;
   readonly status?: QueueStatus;
+  readonly payloadVersion?: number;
+  readonly dimensions?: Record<string, unknown>;
 }
 
 export interface QueueStatusSetPayload {
   readonly bac_id: string;
   readonly status: QueueStatus;
+  readonly payloadVersion?: number;
+  readonly dimensions?: Record<string, unknown>;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;
+
+const hasValidPayloadExtensionFields = (value: Record<string, unknown>): boolean =>
+  (value['payloadVersion'] === undefined ||
+    (typeof value['payloadVersion'] === 'number' && value['payloadVersion'] >= 1)) &&
+  (value['dimensions'] === undefined || isRecord(value['dimensions']));
 
 export const isQueueCreatedPayload = (
   value: unknown,
@@ -39,11 +48,13 @@ export const isQueueCreatedPayload = (
   isRecord(value) &&
   typeof value['bac_id'] === 'string' &&
   typeof value['text'] === 'string' &&
-  typeof value['scope'] === 'string';
+  typeof value['scope'] === 'string' &&
+  hasValidPayloadExtensionFields(value);
 
 export const isQueueStatusSetPayload = (
   value: unknown,
 ): value is QueueStatusSetPayload =>
   isRecord(value) &&
   typeof value['bac_id'] === 'string' &&
-  (value['status'] === 'pending' || value['status'] === 'done' || value['status'] === 'dismissed');
+  (value['status'] === 'pending' || value['status'] === 'done' || value['status'] === 'dismissed') &&
+  hasValidPayloadExtensionFields(value);

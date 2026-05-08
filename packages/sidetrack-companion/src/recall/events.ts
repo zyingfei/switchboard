@@ -34,10 +34,14 @@ export interface CaptureRecordedPayload {
   readonly title?: string;
   readonly capturedAt: string;
   readonly turns: readonly CaptureTurnInputShape[];
+  readonly payloadVersion?: number;
+  readonly dimensions?: Record<string, unknown>;
 }
 
 export interface RecallTombstonePayload {
   readonly threadId: string;
+  readonly payloadVersion?: number;
+  readonly dimensions?: Record<string, unknown>;
 }
 
 export const isCaptureRecordedPayload = (value: unknown): value is CaptureRecordedPayload => {
@@ -46,7 +50,7 @@ export const isCaptureRecordedPayload = (value: unknown): value is CaptureRecord
   if (typeof v['bac_id'] !== 'string') return false;
   if (typeof v['capturedAt'] !== 'string') return false;
   if (!Array.isArray(v['turns'])) return false;
-  return true;
+  return hasValidPayloadExtensionFields(v);
 };
 
 export const isRecallTombstonePayload = (value: unknown): value is RecallTombstonePayload => {
