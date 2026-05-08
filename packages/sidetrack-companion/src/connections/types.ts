@@ -103,6 +103,7 @@ export type ConnectionEdgeKind =
   // Content-similarity match between browser visits. Produced by
   // the visit-similarity Class E revision over the existing recall
   // embedding model.
+  | 'closest_visit'
   | 'visit_resembles_visit'
   // Active-workstream attribution: the timeline observer stamped the
   // user's currently-focused workstream id onto the visit. Closes
@@ -140,7 +141,8 @@ type RevisionProducedBySource =
   | 'topic-clusterer'
   | 'engagement-classifier'
   | 'snippet-lineage'
-  | 'continuation-classifier';
+  | 'continuation-classifier'
+  | 'ranker';
 
 export type ConnectionEdgeProducedBy =
   | {
@@ -225,11 +227,7 @@ export interface ConnectionsSnapshot {
 
 // Helper id minters — exported so the materializer / tests / HTTP
 // routes can build ids without re-implementing the convention.
-export const nodeIdFor = (kind: ConnectionNodeKind, key: string): string =>
-  `${kind}:${key}`;
+export const nodeIdFor = (kind: ConnectionNodeKind, key: string): string => `${kind}:${key}`;
 
-export const edgeIdFor = (
-  kind: ConnectionEdgeKind,
-  fromNodeId: string,
-  toNodeId: string,
-): string => `edge:${kind}:${fromNodeId}:${toNodeId}`;
+export const edgeIdFor = (kind: ConnectionEdgeKind, fromNodeId: string, toNodeId: string): string =>
+  `edge:${kind}:${fromNodeId}:${toNodeId}`;

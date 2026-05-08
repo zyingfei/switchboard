@@ -8,7 +8,7 @@ const reasons = reasonsFixture as readonly (Reason & { readonly expected: string
 
 describe('renderReason', () => {
   it('renders every reason code exactly', () => {
-    expect(reasons).toHaveLength(13);
+    expect(reasons).toHaveLength(14);
     for (const reason of reasons) {
       expect(renderReason(reason), reason.code).toBe(reason.expected);
     }

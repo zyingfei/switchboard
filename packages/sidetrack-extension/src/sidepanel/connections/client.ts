@@ -277,6 +277,38 @@ const numberFromMetadata = (
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 };
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const rankerContributionFromUnknown = (
+  value: unknown,
+): { readonly feature: string; readonly weight: number } | null => {
+  if (!isRecord(value)) return null;
+  const feature = value.feature;
+  const weight = value.weight;
+  if (typeof feature !== 'string' || feature.length === 0) return null;
+  if (typeof weight !== 'number' || !Number.isFinite(weight)) return null;
+  return { feature, weight };
+};
+
+const rankerReasonForEdge = (edge: ConnectionEdge): Reason | null => {
+  if (edge.kind !== 'closest_visit' || edge.metadata === undefined) return null;
+  const rawContributions = edge.metadata.topContributions;
+  const topContributions = Array.isArray(rawContributions)
+    ? rawContributions
+        .map(rankerContributionFromUnknown)
+        .filter(
+          (contribution): contribution is { readonly feature: string; readonly weight: number } =>
+            contribution !== null,
+        )
+    : [];
+  return {
+    code: 'RANKER_SCORE',
+    score: numberFromMetadata(edge.metadata, 'score', 0),
+    topContributions,
+  };
+};
+
 export const contextPackInputFromConnections = (
   result: ConnectionsScopedResult,
   workstreamId: string,
@@ -397,6 +429,9 @@ export const whyRelatedReasonsFromConnections = (
       });
     } else if (edge.kind === 'visit_resembles_visit') {
       reasons.push({ code: 'COSINE_ABOVE_THRESHOLD', cosine: 0.85, threshold: 0.85 });
+    } else if (edge.kind === 'closest_visit') {
+      const reason = rankerReasonForEdge(edge);
+      if (reason !== null) reasons.push(reason);
     } else if (edge.kind === 'visit_observed_on_replica') {
       reasons.push({
         code: 'OBSERVED_ON_OTHER_REPLICA',

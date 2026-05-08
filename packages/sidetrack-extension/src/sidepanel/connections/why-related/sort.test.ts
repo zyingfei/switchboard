@@ -20,6 +20,7 @@ describe('sortReasons', () => {
       'TRANSITION_TYPE',
       'OBSERVED_ON_OTHER_REPLICA',
       'SAME_TOPIC',
+      'RANKER_SCORE',
       'COSINE_ABOVE_THRESHOLD',
       'LINK_IN_TO',
       'LINK_OUT_FROM',

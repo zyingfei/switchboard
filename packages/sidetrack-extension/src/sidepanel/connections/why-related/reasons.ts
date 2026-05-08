@@ -9,6 +9,7 @@ export const REASON_CODES = [
   'COPIED_FROM',
   'PASTED_INTO',
   'OBSERVED_ON_OTHER_REPLICA',
+  'RANKER_SCORE',
   'LEXICAL_OVERLAP',
   'LINK_OUT_FROM',
   'LINK_IN_TO',
@@ -40,6 +41,14 @@ export type Reason =
       readonly destinationKind: string;
     }
   | { readonly code: 'OBSERVED_ON_OTHER_REPLICA'; readonly replicaId: string }
+  | {
+      readonly code: 'RANKER_SCORE';
+      readonly score: number;
+      readonly topContributions: readonly {
+        readonly feature: string;
+        readonly weight: number;
+      }[];
+    }
   | { readonly code: 'LEXICAL_OVERLAP'; readonly topTokens: readonly string[] }
   | { readonly code: 'LINK_OUT_FROM'; readonly otherVisitId: string }
   | { readonly code: 'LINK_IN_TO'; readonly otherVisitId: string };
@@ -64,6 +73,7 @@ export const reasonConfidence = (reason: Reason): ReasonConfidence => {
       return 'observed';
     case 'SAME_TOPIC':
     case 'COSINE_ABOVE_THRESHOLD':
+    case 'RANKER_SCORE':
     case 'LEXICAL_OVERLAP':
       return 'inferred';
   }

@@ -5,7 +5,11 @@ import {
 } from '../../annotations/events.js';
 import { buildEngagementClassRevision } from '../../connections/engagementClassifier.js';
 import { readVaultStores } from '../../connections/loader.js';
-import { buildConnectionsSnapshot, type ConnectionsInput } from '../../connections/snapshot.js';
+import {
+  buildConnectionsSnapshot,
+  type ClosestVisitRanker,
+  type ConnectionsInput,
+} from '../../connections/snapshot.js';
 import type { ConnectionsStore } from '../../connections/snapshot.js';
 import {
   buildTopicRevision,
@@ -26,6 +30,10 @@ import {
   type EngagementClassRevisionStore,
 } from '../../producers/engagement-class-revision.js';
 import {
+  readActiveClosestVisitRankerRevisionManifest,
+  readClosestVisitRankerRevision,
+} from '../../producers/closest-visit-revision.js';
+import {
   TOPIC_HDBSCAN_REVISION_KEY,
   TOPIC_UNION_FIND_REVISION_KEY,
   createTopicRevisionStore,
@@ -33,6 +41,7 @@ import {
   type TopicRevision,
   type TopicRevisionStore,
 } from '../../producers/topic-revision.js';
+import { loadRankerModel, predictRanker, type LightGBMModel } from '../../ranker/predict.js';
 import { writeVisitSimilarityRevision } from '../../producers/visit-resembles-revision.js';
 import { QUEUE_CREATED, QUEUE_STATUS_SET } from '../../queue/events.js';
 import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from '../../recall/events.js';
@@ -133,6 +142,11 @@ export interface CreateConnectionsMaterializerDeps {
 }
 
 type TopicRevisionBuilder = (input: BuildTopicRevisionInput) => Promise<TopicRevision>;
+
+interface LoadedClosestVisitRanker {
+  readonly ranker: ClosestVisitRanker;
+  readonly model: LightGBMModel;
+}
 
 const topicRevisionBuilderFor = (algorithm: TopicAlgorithmVersion): TopicRevisionBuilder => {
   switch (algorithm) {
@@ -298,6 +312,25 @@ export const createConnectionsMaterializer = (
   const maxAcceptedAtMs = (events: readonly AcceptedEvent[]): number =>
     events.reduce((max, event) => Math.max(max, event.acceptedAtMs), 0);
 
+  const loadClosestVisitRanker = async (): Promise<LoadedClosestVisitRanker | null> => {
+    const manifest = await readActiveClosestVisitRankerRevisionManifest(deps.vaultRoot);
+    if (manifest === null) return null;
+    const revision = await readClosestVisitRankerRevision(deps.vaultRoot, manifest.revisionId);
+    if (revision === null) return null;
+    try {
+      const model = await loadRankerModel(revision);
+      return {
+        model,
+        ranker: {
+          revisionId: model.revisionId,
+          predict: (features) => predictRanker(features, model),
+        },
+      };
+    } catch {
+      return null;
+    }
+  };
+
   const buildAndWrite = async (): Promise<void> => {
     const merged = await deps.eventLog.readMerged();
     const vault = await readVaultStores(deps.vaultRoot);
@@ -328,8 +361,16 @@ export const createConnectionsMaterializer = (
       topicRevision,
       engagementClassRevision,
     };
-    const snapshot = buildConnectionsSnapshot(input);
-    await deps.store.putCurrent(snapshot);
+    const closestVisitRanker = await loadClosestVisitRanker();
+    try {
+      const snapshot = buildConnectionsSnapshot({
+        ...input,
+        ...(closestVisitRanker === null ? {} : { closestVisitRanker: closestVisitRanker.ranker }),
+      });
+      await deps.store.putCurrent(snapshot);
+    } finally {
+      closestVisitRanker?.model.dispose();
+    }
   };
 
   const drain = async (): Promise<void> => {
