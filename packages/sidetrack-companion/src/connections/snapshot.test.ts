@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { ANNOTATION_CREATED } from '../annotations/events.js';
+import { CONTINUATION_CLASSIFIER_REVISION_ID } from '../continuation/classifier.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../dispatches/events.js';
 import { NAVIGATION_COMMITTED, type NavigationCommittedPayload } from '../navigation/events.js';
 import { QUEUE_CREATED } from '../queue/events.js';
@@ -46,10 +47,12 @@ describe('connections — producedBy provenance variants', () => {
       { source: 'topic-clusterer', revisionId: 'topic-cluster:v1:union-find' },
       { source: 'engagement-classifier', revisionId: 'engagement-class:v1:rules' },
       { source: 'snippet-lineage', revisionId: 'snippet-lineage:v1:hash' },
+      { source: 'continuation-classifier', revisionId: 'continuation-classifier:v1' },
       { source: 'cross-replica' },
     ];
 
     expect(variants.map((variant) => variant.source)).toContain('cross-replica');
+    expect(variants.map((variant) => variant.source)).toContain('continuation-classifier');
   });
 });
 
@@ -1509,6 +1512,105 @@ describe('connections — determinism + cross-replica', () => {
         (edge) => edge.fromNodeId === nodeIdFor('timeline-visit', 'https://example.com/only-a'),
       ),
     ).toBe(false);
+  });
+
+  it('Pass 11 emits visit_continues_visit for high-confidence cross-replica handoffs', () => {
+    const url = 'https://example.com/shared';
+    const sourceVisitId = 'visit-replica-A-1';
+    const continuedVisitId = 'visit-replica-B-2';
+    const copied = {
+      payloadVersion: 1,
+      selectionHash: 'abcdef1234567890abcdef1234567890',
+      simhash64: 'AAAAAAAAAAA=',
+      charCount: 64,
+      lineCount: 3,
+      contentKindHint: 'code-block',
+      rawTextStored: false,
+    };
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      updatedAt: '2026-05-07T10:30:00.000Z',
+      entryCount: 1,
+      entries: [
+        {
+          id: url,
+          firstSeenAt: '2026-05-07T10:00:00.000Z',
+          lastSeenAt: '2026-05-07T10:25:00.000Z',
+          url,
+          canonicalUrl: url,
+          title: 'Shared research',
+          provider: 'generic',
+          visitCount: 2,
+          workstreamId: 'ws-research',
+        },
+      ],
+    };
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        timelineDays: [day],
+        events: [
+          buildEvent({
+            seq: 1,
+            replicaId: 'replica-A',
+            type: NAVIGATION_COMMITTED,
+            payload: navigationCommittedPayload({
+              replicaId: 'replica-A',
+              seq: 1,
+              canonicalUrl: url,
+              commitAt: '2026-05-07T10:00:00.000Z',
+            }),
+            acceptedAtMs: Date.parse('2026-05-07T10:00:01.000Z'),
+          }),
+          buildEvent({
+            seq: 2,
+            replicaId: 'replica-B',
+            type: NAVIGATION_COMMITTED,
+            payload: navigationCommittedPayload({
+              replicaId: 'replica-B',
+              seq: 2,
+              canonicalUrl: url,
+              commitAt: '2026-05-07T10:25:00.000Z',
+            }),
+            acceptedAtMs: Date.parse('2026-05-07T10:25:01.000Z'),
+          }),
+          buildEvent({
+            seq: 3,
+            type: SELECTION_COPIED,
+            payload: { ...copied, visitId: sourceVisitId },
+          }),
+          buildEvent({
+            seq: 4,
+            type: SELECTION_COPIED,
+            payload: { ...copied, visitId: continuedVisitId },
+          }),
+        ],
+      }),
+    );
+
+    const edge = snap.edges.find((candidate) => candidate.kind === 'visit_continues_visit');
+    expect(edge).toBeDefined();
+    expect(edge?.fromNodeId).toBe(nodeIdFor('timeline-visit', sourceVisitId));
+    expect(edge?.toNodeId).toBe(nodeIdFor('timeline-visit', continuedVisitId));
+    expect(edge?.confidence).toBe('inferred');
+    expect(edge?.family).toBe('flow');
+    expect(edge?.producedBy).toEqual({
+      source: 'continuation-classifier',
+      revisionId: CONTINUATION_CLASSIFIER_REVISION_ID,
+    });
+    expect(edge?.metadata).toMatchObject({
+      canonicalUrl: url,
+      fromReplicaId: 'replica-A',
+      toReplicaId: 'replica-B',
+      sameWorkstream: 1,
+      copyPasteLineageContinuity: 1,
+    });
+    expect(typeof edge?.metadata?.['score']).toBe('number');
+    expect(
+      snap.nodes.find((node) => node.id === nodeIdFor('timeline-visit', sourceVisitId)),
+    ).toBeDefined();
+    expect(
+      snap.nodes.find((node) => node.id === nodeIdFor('timeline-visit', continuedVisitId)),
+    ).toBeDefined();
   });
 
   it('updatedAt is max observedAt, never wall-clock', () => {

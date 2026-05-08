@@ -3,6 +3,10 @@ import { join } from 'node:path';
 
 import { ANNOTATION_CREATED, isAnnotationCreatedPayload } from '../annotations/events.js';
 import {
+  classifyCrossReplicaContinuations,
+  continuationEdgeForPrediction,
+} from '../continuation/classifier.js';
+import {
   DISPATCH_LINKED,
   DISPATCH_RECORDED,
   isDispatchLinkedPayload,
@@ -88,6 +92,8 @@ export type { ConnectionsSnapshot } from './types.js';
 //   snippet_copied_from_visit             hash-only copy/paste lineage
 //   snippet_pasted_into_<dest>            paste destination edge
 //   snippet_reused_across_threads         same snippet pasted into >=2 threads
+//   visit_continues_visit                 inferred cross-replica
+//                                         continuation handoff
 //   visit_in_template                     DOM-skeleton hash grouping
 //
 // `annotation_targets_workstream` is declared in the edge-kind union
@@ -274,6 +280,37 @@ const upsertEdge = (
   }
 };
 
+const snapshotFromAccumulators = (
+  scope: ConnectionsSnapshotScope | undefined,
+  nodes: ReadonlyMap<string, AccumNode>,
+  edges: ReadonlyMap<string, ConnectionEdge>,
+  maxObservedAt: string,
+): ConnectionsSnapshot => {
+  const finalNodes: ConnectionNode[] = [];
+  for (const node of nodes.values()) {
+    finalNodes.push({
+      id: node.id,
+      kind: node.kind,
+      label: node.label,
+      ...(node.firstSeenAt === undefined ? {} : { firstSeenAt: node.firstSeenAt }),
+      ...(node.lastSeenAt === undefined ? {} : { lastSeenAt: node.lastSeenAt }),
+      originReplicaIds: [...node.originReplicaIds].sort(),
+      metadata: compactMetadata(node.metadata),
+    });
+  }
+
+  const sortedNodes = sortAlphaById(finalNodes);
+  const sortedEdges = sortAlphaById([...edges.values()]);
+  return {
+    scope: scope ?? {},
+    nodes: sortedNodes,
+    edges: sortedEdges,
+    updatedAt: maxObservedAt.length > 0 ? maxObservedAt : '1970-01-01T00:00:00.000Z',
+    nodeCount: sortedNodes.length,
+    edgeCount: sortedEdges.length,
+  };
+};
+
 const stripFragmentAndTrailingSlash = (url: string): string =>
   url.replace(/#.*$/u, '').replace(/\/+$/u, '');
 
@@ -297,7 +334,8 @@ const stripFragmentAndTrailingSlash = (url: string): string =>
 //         topic.lineage split/merge edges.
 // Pass 9: cross-replica visit evidence.
 // Pass 10: hash-only snippet lineage.
-// Pass 11: DOM-skeleton template grouping.
+// Pass 11: cross-replica continuation classifier.
+// Pass 12: DOM-skeleton template grouping.
 // ---------------------------------------------------------------------------
 
 export const buildConnectionsSnapshot = (
@@ -1571,7 +1609,57 @@ export const buildConnectionsSnapshot = (
   }
 
   // -------------------------------------------------------------------
-  // Pass 11 — DOM-skeleton template grouping. Visual fingerprint
+  // Pass 11 — cross-replica continuation classifier. Candidate pairs
+  // are limited to URLs already evidenced by visit_observed_on_replica;
+  // the classifier then uses the S18 feature extractor plus
+  // continuation-specific timing and copy/paste signals.
+  // -------------------------------------------------------------------
+  const continuationPredictions = classifyCrossReplicaContinuations({
+    merged: input.events,
+    snapshot: snapshotFromAccumulators(input.scope, nodes, edges, maxObservedAt),
+  });
+  for (const prediction of continuationPredictions) {
+    trackObservedAt(prediction.fromObservedAt);
+    trackObservedAt(prediction.toObservedAt);
+    upsertNode(nodes, {
+      kind: 'timeline-visit',
+      key: prediction.fromVisitId,
+      label: prediction.fromUrl,
+      observedAt: prediction.fromObservedAt,
+      replicaId: prediction.fromReplicaId,
+      metadata: {
+        url: prediction.fromUrl,
+        canonicalUrl: prediction.canonicalUrl,
+        replicaId: prediction.fromReplicaId,
+      },
+    });
+    upsertNode(nodes, {
+      kind: 'timeline-visit',
+      key: prediction.toVisitId,
+      label: prediction.toUrl,
+      observedAt: prediction.toObservedAt,
+      replicaId: prediction.toReplicaId,
+      metadata: {
+        url: prediction.toUrl,
+        canonicalUrl: prediction.canonicalUrl,
+        replicaId: prediction.toReplicaId,
+      },
+    });
+    const edge = continuationEdgeForPrediction(prediction);
+    upsertEdge(edges, {
+      kind: edge.kind,
+      fromNodeId: edge.fromNodeId,
+      toNodeId: edge.toNodeId,
+      observedAt: edge.observedAt,
+      producedBy: edge.producedBy,
+      confidence: edge.confidence,
+      family: edge.family,
+      ...(edge.metadata === undefined ? {} : { metadata: edge.metadata }),
+    });
+  }
+
+  // -------------------------------------------------------------------
+  // Pass 12 — DOM-skeleton template grouping. Visual fingerprint
   // events carry only a SHA-256 hash of the canonical tag tree plus
   // boolean class/id presence. The reducer groups visits by that hash
   // without reading page text, attributes, screenshots, or pixels.
@@ -1617,33 +1705,7 @@ export const buildConnectionsSnapshot = (
   // -------------------------------------------------------------------
   // Materialize: convert accumulators to deterministic snapshot.
   // -------------------------------------------------------------------
-  const finalNodes: ConnectionNode[] = [];
-  for (const node of nodes.values()) {
-    finalNodes.push({
-      id: node.id,
-      kind: node.kind,
-      label: node.label,
-      ...(node.firstSeenAt === undefined ? {} : { firstSeenAt: node.firstSeenAt }),
-      ...(node.lastSeenAt === undefined ? {} : { lastSeenAt: node.lastSeenAt }),
-      originReplicaIds: [...node.originReplicaIds].sort(),
-      metadata: compactMetadata(node.metadata),
-    });
-  }
-
-  const sortedNodes = sortAlphaById(finalNodes);
-  const sortedEdges = sortAlphaById([...edges.values()]);
-
-  const updatedAt =
-    maxObservedAt.length > 0 ? maxObservedAt : '1970-01-01T00:00:00.000Z';
-
-  return {
-    scope: input.scope ?? {},
-    nodes: sortedNodes,
-    edges: sortedEdges,
-    updatedAt,
-    nodeCount: sortedNodes.length,
-    edgeCount: sortedEdges.length,
-  };
+  return snapshotFromAccumulators(input.scope, nodes, edges, maxObservedAt);
 };
 
 // ---------------------------------------------------------------------------
