@@ -30,6 +30,10 @@ import {
 } from '../../annotations/events.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
 import {
+  ENGAGEMENT_INTERVAL_OBSERVED,
+  ENGAGEMENT_SESSION_AGGREGATED,
+} from '../../engagement/events.js';
+import {
   PRIVACY_GATE_FLIPPED,
   PRIVACY_PERMISSION_GRANTED,
   PRIVACY_PERMISSION_REVOKED,
@@ -77,6 +81,7 @@ export interface SurfaceContract {
 export interface ContractEntry {
   readonly eventType: string;
   readonly currentPayloadVersion?: number;
+  readonly allowedDimensions?: readonly string[];
   readonly surfaces: readonly SurfaceContract[];
 }
 
@@ -292,6 +297,40 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   //   2. timeline-projection — Class B (derived-cache; daily
   //      reduction over events, not a per-aggregate LWW). Owned by
   //      the dedicated 'timeline' materializer.
+  {
+    eventType: ENGAGEMENT_INTERVAL_OBSERVED,
+    currentPayloadVersion: 1,
+    allowedDimensions: ['engagement'],
+    surfaces: [
+      {
+        surface: 'plugin-engagement-intervals',
+        class: 'plugin-tier-bounded',
+        peerFreshnessMs: 1_000,
+        recovery: 'spool-drain',
+      },
+      {
+        surface: 'engagement-session-projection',
+        class: 'derived-cache',
+        materializer: 'connections',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+    ],
+  },
+  {
+    eventType: ENGAGEMENT_SESSION_AGGREGATED,
+    currentPayloadVersion: 1,
+    allowedDimensions: ['engagement'],
+    surfaces: [
+      {
+        surface: 'engagement-session-projection',
+        class: 'derived-cache',
+        materializer: 'connections',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+    ],
+  },
   {
     eventType: BROWSER_TIMELINE_OBSERVED,
     currentPayloadVersion: 1,

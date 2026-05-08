@@ -45,6 +45,14 @@ import {
   TIMELINE_PRIVACY_GATE,
   triggerTimelineDrain,
 } from '../src/timeline/wiring';
+import { IndexedDbEventBuffer } from '../src/background/storage/indexeddb-event-buffer';
+import {
+  createEngagementCache,
+  isEngagementIntervalMessage,
+  type EngagementIntervalObservedPayload,
+  type EngagementSessionAggregatedPayload,
+} from '../src/background/state/engagementCache';
+import { allocateNextSeq, loadOrCreateEdgeReplica } from '../src/sync/edgeReplicaId';
 import { createVaultChangesClient } from '../src/companion/vaultChanges';
 import { createRecallClient } from '../src/companion/recallClient';
 import { buildReviewFollowUpText } from '../src/review/draft';
@@ -265,6 +273,10 @@ const PRIVACY_PERMISSION_GRANTED = 'privacy.permission.granted';
 const PRIVACY_PERMISSION_REVOKED = 'privacy.permission.revoked';
 const TIMELINE_HOST_PERMISSION = 'timeline.hostAccess';
 const TIMELINE_HOST_PERMISSION_SCOPE = { origins: ['https://*/*', 'http://*/*'] } as const;
+const ENGAGEMENT_PRIVACY_GATE = 'engagement';
+const ENGAGEMENT_CONTENT_SCRIPT_ID = 'sidetrack-engagement';
+const ENGAGEMENT_CONTENT_SCRIPT_FILE = 'engagement.js';
+const ENGAGEMENT_HOST_ORIGINS = ['https://*/*', 'http://*/*'];
 
 interface PrivacyProjectionPayload {
   readonly gateStates?: Record<string, 'open' | 'closed'>;
@@ -319,6 +331,50 @@ const isTimelinePrivacyGateOpen = async (): Promise<boolean> => {
     return projection.gateStates?.[TIMELINE_PRIVACY_GATE] === 'open';
   } catch {
     return false;
+  }
+};
+
+const isEngagementPrivacyGateOpen = async (): Promise<boolean> => {
+  try {
+    const projection = await readPrivacyProjection();
+    return projection.gateStates?.[ENGAGEMENT_PRIVACY_GATE] === 'open';
+  } catch {
+    return false;
+  }
+};
+
+const hasEngagementHostPermission = async (): Promise<boolean> => {
+  try {
+    return await new Promise<boolean>((resolve) => {
+      chrome.permissions.contains({ origins: [...ENGAGEMENT_HOST_ORIGINS] }, (granted) => {
+        resolve(Boolean(granted));
+      });
+    });
+  } catch {
+    return false;
+  }
+};
+
+const syncEngagementContentScriptRegistration = async (): Promise<void> => {
+  const shouldRegister = (await isEngagementPrivacyGateOpen()) && (await hasEngagementHostPermission());
+  const registered = await chrome.scripting.getRegisteredContentScripts({
+    ids: [ENGAGEMENT_CONTENT_SCRIPT_ID],
+  });
+  const alreadyRegistered = registered.length > 0;
+  if (shouldRegister && !alreadyRegistered) {
+    await chrome.scripting.registerContentScripts([
+      {
+        id: ENGAGEMENT_CONTENT_SCRIPT_ID,
+        matches: [...ENGAGEMENT_HOST_ORIGINS],
+        js: [ENGAGEMENT_CONTENT_SCRIPT_FILE],
+        runAt: 'document_idle',
+        persistAcrossSessions: true,
+      },
+    ]);
+    return;
+  }
+  if (!shouldRegister && alreadyRegistered) {
+    await chrome.scripting.unregisterContentScripts({ ids: [ENGAGEMENT_CONTENT_SCRIPT_ID] });
   }
 };
 
@@ -2634,6 +2690,72 @@ const detectCodingAttachForTab = async (tabId: number, url: string): Promise<voi
 };
 
 export default defineBackground(() => {
+  const engagementEventBuffer = new IndexedDbEventBuffer();
+  let engagementRuntimePromise:
+    | Promise<{
+        readonly edgeReplicaId: string;
+        readonly cache: ReturnType<typeof createEngagementCache>;
+      }>
+    | null = null;
+  const engagementRuntime = async (): Promise<{
+    readonly edgeReplicaId: string;
+    readonly cache: ReturnType<typeof createEngagementCache>;
+  }> => {
+    if (engagementRuntimePromise !== null) return engagementRuntimePromise;
+    engagementRuntimePromise = (async () => {
+      const replica = await loadOrCreateEdgeReplica();
+      return {
+        edgeReplicaId: replica.edgeReplicaId,
+        cache: createEngagementCache({ sessionId: `session:${replica.edgeReplicaId}` }),
+      };
+    })();
+    return engagementRuntimePromise;
+  };
+
+  const appendEngagementEvents = async (
+    payloads: readonly {
+      readonly streamName: 'engagement.interval.observed' | 'engagement.session.aggregated';
+      readonly payload: EngagementIntervalObservedPayload | EngagementSessionAggregatedPayload;
+    }[],
+  ): Promise<void> => {
+    if (payloads.length === 0) return;
+    const allocated = await allocateNextSeq(payloads.length);
+    const observedAt = new Date().toISOString();
+    await engagementEventBuffer.appendMany(
+      payloads.map((event, index) => ({
+        streamName: event.streamName,
+        lamport: allocated.fromSeq + index,
+        replicaId: allocated.edgeReplicaId,
+        payload: event.payload,
+        observedAt,
+      })),
+    );
+  };
+
+  const handleEngagementInterval = async (message: unknown, tabId: number | undefined): Promise<void> => {
+    if (tabId === undefined || !isEngagementIntervalMessage(message)) return;
+    const runtime = await engagementRuntime();
+    const merged = runtime.cache.mergeInterval(tabId, message);
+    const payloads: {
+      readonly streamName: 'engagement.interval.observed' | 'engagement.session.aggregated';
+      readonly payload: EngagementIntervalObservedPayload | EngagementSessionAggregatedPayload;
+    }[] = [{ streamName: 'engagement.interval.observed', payload: merged.interval }];
+    if (message.final) {
+      payloads.push({ streamName: 'engagement.session.aggregated', payload: merged.aggregate });
+    }
+    await appendEngagementEvents(payloads);
+  };
+
+  const finalizeEngagementForTab = async (tabId: number): Promise<void> => {
+    const runtime = await engagementRuntime();
+    const finalized = runtime.cache.finalizeTab(tabId, Date.now());
+    if (finalized === null) return;
+    await appendEngagementEvents([
+      { streamName: 'engagement.interval.observed', payload: finalized.interval },
+      { streamName: 'engagement.session.aggregated', payload: finalized.aggregate },
+    ]);
+  };
+
   // Drop reminders bound to thread bac_ids that no longer exist.
   // Cleanup pass for the historical mess caused by the pre-fix
   // sendToCompanion bug (every capture reissued a thread bac_id;
@@ -2677,6 +2799,7 @@ export default defineBackground(() => {
     void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => undefined);
     void pruneOrphanRemindersAndLinks();
     void ensureDispatchPollAlarm();
+    void syncEngagementContentScriptRegistration().catch(() => undefined);
     // Heal pre-existing tabs after an install/update/reload so the
     // user doesn't have to refresh each chat tab manually. The first
     // install case is harmless: matching tabs that already had no
@@ -2697,6 +2820,31 @@ export default defineBackground(() => {
     void pruneOrphanRemindersAndLinks();
     void reinjectContentScriptIntoOpenTabs();
     void ensureDispatchPollAlarm();
+    void syncEngagementContentScriptRegistration().catch(() => undefined);
+  });
+  void syncEngagementContentScriptRegistration().catch(() => undefined);
+
+  chrome.permissions.onAdded.addListener(() => {
+    void syncEngagementContentScriptRegistration().catch(() => undefined);
+  });
+  chrome.permissions.onRemoved.addListener(() => {
+    void syncEngagementContentScriptRegistration().catch(() => undefined);
+  });
+  chrome.idle.onStateChanged.addListener((state) => {
+    void (async () => {
+      const tabs = await chrome.tabs.query({ url: [...ENGAGEMENT_HOST_ORIGINS] });
+      await Promise.all(
+        tabs.map(async (tab) => {
+          if (typeof tab.id !== 'number') return;
+          await chrome.tabs
+            .sendMessage(tab.id, {
+              type: 'sidetrack.engagement.idle',
+              idle: state !== 'active',
+            })
+            .catch(() => undefined);
+        }),
+      );
+    })().catch(() => undefined);
   });
 
   // Periodic background poll for new MCP-auto-approved dispatches.
@@ -2724,6 +2872,7 @@ export default defineBackground(() => {
     // Clean up MCP-dispatch markers on tab close so the storage map
     // doesn't accumulate dead entries.
     void dropMcpDispatchTab(tabId).catch(() => undefined);
+    void finalizeEngagementForTab(tabId).catch(() => undefined);
   });
 
   // Whenever the user activates a different tab or a tab's URL
@@ -2835,6 +2984,41 @@ export default defineBackground(() => {
 
   chrome.runtime.onMessage.addListener(
     (message: unknown, sender, sendResponse: (response: RuntimeResponse) => void) => {
+      if (isEngagementIntervalMessage(message)) {
+        void handleEngagementInterval(message, sender.tab?.id)
+          .then(() => {
+            sendResponse({ ok: true } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'engagement interval failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.privacy.gateChanged'
+      ) {
+        void syncEngagementContentScriptRegistration()
+          .then(() => {
+            sendResponse({ ok: true } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error:
+                error instanceof Error
+                  ? error.message
+                  : 'engagement registration refresh failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+
       if (
         message !== null &&
         typeof message === 'object' &&
