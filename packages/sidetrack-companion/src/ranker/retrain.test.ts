@@ -1,10 +1,19 @@
-import { describe, expect, it } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
+import { afterEach, describe, expect, it } from 'vitest';
+
+import { createConnectionsStore } from '../connections/snapshot.js';
 import type { ConnectionsSnapshot } from '../connections/types.js';
 import { nodeIdFor } from '../connections/types.js';
 import { USER_FLOW_CONFIRMED } from '../feedback/events.js';
 import type { FeedbackProjection, FeedbackTrainingLabel } from '../feedback/projection.js';
 import type { AcceptedEvent } from '../sync/causal.js';
+import { createConnectionsMaterializer } from '../sync/contract/connectionsMaterializer.js';
+import { createEventLog } from '../sync/eventLog.js';
+import { loadOrCreateReplica } from '../sync/replicaId.js';
+import { createTimelineStore } from '../timeline/projection.js';
 import { FEATURE_SCHEMA_VERSION } from './feature-schema.js';
 import {
   buildRankerTrainingCandidates,
@@ -19,6 +28,11 @@ import { RANKER_MODEL_VERSION, type RankerRevision, type TrainRankerInput } from
 
 const observedAt = '2026-05-08T12:00:00.000Z';
 const observedAtMs = Date.parse(observedAt);
+const tempRoots: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
 
 const label = (fromId: string, toId: string, weight = 1): FeedbackTrainingLabel => ({
   fromId,
@@ -220,5 +234,46 @@ describe('ranker retraining loop', () => {
       activeRevisionId: 'revision-s25',
       rankerTrainingDatasetHash: '1'.repeat(64),
     });
+  });
+
+  it('connections materializer schedules retrain checks for feedback events', async () => {
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-ranker-retrain-mat-'));
+    tempRoots.push(vaultRoot);
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+    let retrainCalls = 0;
+    let mergedEventCount = 0;
+    const materializer = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store,
+      rankerRetrainer: ({ merged }) => {
+        retrainCalls += 1;
+        mergedEventCount = merged.length;
+        return Promise.resolve({
+          status: 'skipped',
+          reason: 'below-threshold',
+          fingerprint: {
+            hash: '0'.repeat(64),
+            labelCount: 1,
+            positiveLabelCount: 1,
+            negativeLabelCount: 0,
+          },
+          newLabelCount: 1,
+        });
+      },
+    });
+    const event = feedbackEvent(1, 'https://example.test/a', 'https://example.test/b');
+
+    await eventLog.importPeerEvent(event);
+    materializer.onAccepted(event, { origin: 'peer' });
+    await materializer.awaitIdle();
+
+    expect(materializer.handles.has(USER_FLOW_CONFIRMED)).toBe(true);
+    expect(retrainCalls).toBe(1);
+    expect(mergedEventCount).toBe(1);
   });
 });
