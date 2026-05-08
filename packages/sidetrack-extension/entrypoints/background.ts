@@ -38,7 +38,11 @@ import {
   type ReviewDraftClientConfig,
 } from '../src/review/draftClient';
 import { drainReviewDraftOutbox } from '../src/review/outbox';
-import { initializeTimelineWiring, triggerTimelineDrain } from '../src/timeline/wiring';
+import {
+  initializeTimelineWiring,
+  resetTimelineWiringForTests,
+  triggerTimelineDrain,
+} from '../src/timeline/wiring';
 import { createVaultChangesClient } from '../src/companion/vaultChanges';
 import { createRecallClient } from '../src/companion/recallClient';
 import { buildReviewFollowUpText } from '../src/review/draft';
@@ -2701,9 +2705,6 @@ export default defineBackground(() => {
         (message as { type?: unknown }).type === 'sidetrack.timeline.reinit'
       ) {
         void (async () => {
-          const { resetTimelineWiringForTests, initializeTimelineWiring } = await import(
-            '../src/timeline/wiring'
-          );
           resetTimelineWiringForTests();
           await initializeTimelineWiring({
             readCompanion: async () => {

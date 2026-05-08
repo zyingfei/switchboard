@@ -7,6 +7,7 @@ import {
   ImportExportSection,
   McpHostsSection,
   ServiceInstallSection,
+  TimelineSection,
 } from './SettingsV2Sections';
 import type {
   DensityMode,
@@ -966,6 +967,7 @@ export function SettingsPanel({
           onDensityChange={onDensityChange}
         />
       ) : null}
+      <TimelineSection />
       <ServiceInstallSection
         installed={serviceInstalled}
         running={serviceRunning}
