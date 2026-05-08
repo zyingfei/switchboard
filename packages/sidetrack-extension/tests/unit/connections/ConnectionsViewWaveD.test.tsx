@@ -73,15 +73,15 @@ const buildWaveDSnapshot = () => ({
 
 describe('ConnectionsView — Wave D modes', () => {
   beforeEach(() => {
-    setConnectionsClientTransportForTests(async (message) => {
+    setConnectionsClientTransportForTests((message) => {
       const typed = message as { readonly type?: string };
       if (typed.type === messageTypes.loadConnectionsNeighbors) {
-        return { ok: true, data: buildWaveDSnapshot() };
+        return Promise.resolve({ ok: true, data: buildWaveDSnapshot() });
       }
       if (typed.type === messageTypes.loadConnectionsSnapshot) {
-        return { ok: true, data: buildWaveDSnapshot() };
+        return Promise.resolve({ ok: true, data: buildWaveDSnapshot() });
       }
-      return { ok: false, error: 'unexpected message' };
+      return Promise.resolve({ ok: false, error: 'unexpected message' });
     });
   });
 
@@ -107,5 +107,52 @@ describe('ConnectionsView — Wave D modes', () => {
 
     fireEvent.click(screen.getByTestId('connections-mode-context'));
     expect(screen.getByTestId('context-pack-composer')).toBeDefined();
+  });
+
+  it('posts engagement relabel feedback from Focus mode', async () => {
+    const sent: unknown[] = [];
+    setConnectionsClientTransportForTests((message) => {
+      sent.push(message);
+      const typed = message as { readonly type?: string };
+      if (typed.type === messageTypes.loadConnectionsNeighbors) {
+        return Promise.resolve({ ok: true, data: buildWaveDSnapshot() });
+      }
+      if (typed.type === messageTypes.postConnectionsFeedbackEvent) {
+        return Promise.resolve({
+          ok: true,
+          data: { accepted: { dot: { replicaId: 'local', seq: 1 } } },
+        });
+      }
+      return Promise.resolve({ ok: false, error: 'unexpected message' });
+    });
+
+    render(<ConnectionsView initialAnchor="workstream:ws_a" />);
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-mode-focus')).not.toBeNull();
+    });
+    fireEvent.click(screen.getByTestId('connections-mode-focus'));
+    fireEvent.click(screen.getByTestId('focus-expand-topic:topic_a'));
+    fireEvent.change(
+      screen.getByTestId('focus-visit-engagement-timeline-visit:https://example.test/a'),
+      { target: { value: 'worked_on_reference' } },
+    );
+
+    await waitFor(() => {
+      expect(sent).toContainEqual(
+        expect.objectContaining({
+          type: messageTypes.postConnectionsFeedbackEvent,
+          event: {
+            type: 'user.engagement.relabeled',
+            payload: {
+              payloadVersion: 1,
+              visitId: 'timeline-visit:https://example.test/a',
+              fromClass: 'engaged_read',
+              toClass: 'worked_on_reference',
+            },
+          },
+        }),
+      );
+    });
   });
 });

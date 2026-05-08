@@ -83,6 +83,12 @@ import { formatRelative } from '../../src/util/time';
 import { createSuggestionsClient } from '../../src/companion/suggestionsClient';
 import { listPendingOffers, markStatus, type OfferRecord } from '../../src/codingAttach/state';
 import { ConnectionsView } from '../../src/sidepanel/connections/ConnectionsView';
+import {
+  USER_ORGANIZED_ITEM,
+  feedbackClientEventId,
+  type FeedbackEventEnvelope,
+  type UserOrganizedItemPayload,
+} from '../../src/sidepanel/connections/client';
 import './style.css';
 
 const TARGET_PROVIDER_LABEL: Record<string, string> = {
@@ -1406,15 +1412,51 @@ const App = () => {
     setWizardOpen(false);
   };
 
+  const recordOrganizedItemFeedback = async (
+    payload: Omit<UserOrganizedItemPayload, 'payloadVersion'>,
+  ): Promise<void> => {
+    const event: FeedbackEventEnvelope = {
+      type: USER_ORGANIZED_ITEM,
+      payload: { payloadVersion: 1, ...payload },
+    };
+    try {
+      const response = (await chrome.runtime.sendMessage({
+        type: messageTypes.postConnectionsFeedbackEvent,
+        event,
+        clientEventId: feedbackClientEventId(event),
+      })) as unknown;
+      if (isRecord(response) && response.ok === false) {
+        console.warn(
+          '[feedback] user.organized.item failed:',
+          typeof response.error === 'string' ? response.error : 'unknown error',
+        );
+      }
+    } catch (error) {
+      console.warn('[feedback] user.organized.item failed:', error);
+    }
+  };
+
   const moveThreadToWorkstream = async (
     threadId: string,
     workstreamId: string,
-  ): Promise<WorkboardState> =>
-    await sendRequest({
+  ): Promise<WorkboardState> => {
+    const thread = state.threads.find((candidate) => candidate.bac_id === threadId);
+    const next = await sendRequest({
       type: messageTypes.moveThread,
       threadId,
       workstreamId,
     });
+    await recordOrganizedItemFeedback({
+      itemKind: 'thread',
+      itemId: threadId,
+      action: 'move',
+      ...(thread?.primaryWorkstreamId === undefined
+        ? {}
+        : { fromContainer: thread.primaryWorkstreamId }),
+      toContainer: workstreamId,
+    });
+    return next;
+  };
 
   const handleMoveTarget = (target: WorkstreamOption | { readonly create: string }) => {
     const threadId = moveThreadId;
@@ -5373,16 +5415,23 @@ const App = () => {
                 })),
                 onRename: (nextTitle: string) => {
                   void runAction(async () => {
-                    return await sendRequest({
+                    const next = await sendRequest({
                       type: messageTypes.updateWorkstream,
                       workstreamId: currentWs.bac_id,
                       update: { revision: currentWs.revision, title: nextTitle },
                     });
+                    await recordOrganizedItemFeedback({
+                      itemKind: 'workstream',
+                      itemId: currentWs.bac_id,
+                      action: 'rename',
+                      details: { rename: nextTitle },
+                    });
+                    return next;
                   });
                 },
                 onMove: (parentId: string | null) => {
                   void runAction(async () => {
-                    return await sendRequest({
+                    const next = await sendRequest({
                       type: messageTypes.updateWorkstream,
                       workstreamId: currentWs.bac_id,
                       update: {
@@ -5395,6 +5444,16 @@ const App = () => {
                         parentId: parentId ?? null,
                       },
                     });
+                    await recordOrganizedItemFeedback({
+                      itemKind: 'workstream',
+                      itemId: currentWs.bac_id,
+                      action: 'move',
+                      ...(currentWs.parentId === undefined
+                        ? {}
+                        : { fromContainer: currentWs.parentId }),
+                      ...(parentId === null ? {} : { toContainer: parentId }),
+                    });
+                    return next;
                   });
                 },
                 onDelete: async () => {

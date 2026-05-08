@@ -4,10 +4,17 @@ import {
   contextPackInputFromConnections,
   fetchConnectionsTopicLabel,
   fetchConnectionsWhyRelated,
+  postUserEngagementRelabeled,
+  postUserFlowConfirmed,
+  postUserFlowRejected,
+  postUserOrganizedItem,
+  postUserSnippetPromoted,
+  postUserTopicRenamed,
   setConnectionsClientTransportForTests,
   topicLabelFromConnections,
   whyRelatedReasonsFromConnections,
 } from './client';
+import { messageTypes } from '../../messages';
 import type { ConnectionsScopedResult } from './types';
 
 const result: ConnectionsScopedResult = {
@@ -102,7 +109,7 @@ describe('connections client helpers', () => {
   });
 
   it('uses the existing runtime message proxy for topic label and why-related reads', async () => {
-    setConnectionsClientTransportForTests(async () => ({ ok: true, data: result }));
+    setConnectionsClientTransportForTests(() => Promise.resolve({ ok: true, data: result }));
 
     await expect(fetchConnectionsTopicLabel('topic:alpha')).resolves.toEqual({
       ok: true,
@@ -117,5 +124,136 @@ describe('connections client helpers', () => {
         { code: 'OBSERVED_ON_OTHER_REPLICA', replicaId: 'mac' },
       ],
     });
+  });
+
+  it('posts S23 feedback events through the runtime companion proxy', async () => {
+    const sent: unknown[] = [];
+    setConnectionsClientTransportForTests((message) => {
+      sent.push(message);
+      return Promise.resolve({
+        ok: true,
+        data: { accepted: { dot: { replicaId: 'local', seq: 1 } } },
+      });
+    });
+
+    await postUserFlowConfirmed({
+      relationKind: 'visit_resembles_visit',
+      fromId: 'visit:a',
+      toId: 'visit:b',
+    });
+    await postUserFlowRejected({
+      relationKind: 'closest_visit',
+      fromId: 'visit:a',
+      toId: 'visit:c',
+      reason: 'not-related',
+    });
+    await postUserEngagementRelabeled({
+      visitId: 'visit:a',
+      fromClass: 'skimmed',
+      toClass: 'worked_on_reference',
+    });
+    await postUserTopicRenamed({
+      topicId: 'topic:alpha',
+      previousName: 'Old alpha',
+      newName: 'New alpha',
+    });
+    await postUserSnippetPromoted({
+      snippetId: 'snippet:1',
+      targetId: 'visit:a',
+      sourceVisitId: 'visit:a',
+    });
+    await postUserOrganizedItem({
+      itemKind: 'thread',
+      itemId: 'thread:1',
+      action: 'move',
+      fromContainer: 'workstream:old',
+      toContainer: 'workstream:new',
+    });
+
+    expect(sent).toEqual([
+      expect.objectContaining({
+        type: messageTypes.postConnectionsFeedbackEvent,
+        event: {
+          type: 'user.flow.confirmed',
+          payload: {
+            payloadVersion: 1,
+            relationKind: 'visit_resembles_visit',
+            fromId: 'visit:a',
+            toId: 'visit:b',
+          },
+        },
+        clientEventId: expect.stringMatching(/^feedback-user\.flow\.confirmed-/u),
+      }),
+      expect.objectContaining({
+        type: messageTypes.postConnectionsFeedbackEvent,
+        event: {
+          type: 'user.flow.rejected',
+          payload: {
+            payloadVersion: 1,
+            relationKind: 'closest_visit',
+            fromId: 'visit:a',
+            toId: 'visit:c',
+            reason: 'not-related',
+          },
+        },
+        clientEventId: expect.stringMatching(/^feedback-user\.flow\.rejected-/u),
+      }),
+      expect.objectContaining({
+        type: messageTypes.postConnectionsFeedbackEvent,
+        event: {
+          type: 'user.engagement.relabeled',
+          payload: {
+            payloadVersion: 1,
+            visitId: 'visit:a',
+            fromClass: 'skimmed',
+            toClass: 'worked_on_reference',
+          },
+        },
+        clientEventId: expect.stringMatching(/^feedback-user\.engagement\.relabeled-/u),
+      }),
+      expect.objectContaining({
+        type: messageTypes.postConnectionsFeedbackEvent,
+        event: {
+          type: 'user.topic.renamed',
+          payload: {
+            payloadVersion: 1,
+            topicId: 'topic:alpha',
+            previousName: 'Old alpha',
+            newName: 'New alpha',
+            source: 'inline',
+          },
+        },
+        clientEventId: expect.stringMatching(/^feedback-user\.topic\.renamed-/u),
+      }),
+      expect.objectContaining({
+        type: messageTypes.postConnectionsFeedbackEvent,
+        event: {
+          type: 'user.snippet.promoted',
+          payload: {
+            payloadVersion: 1,
+            snippetId: 'snippet:1',
+            targetKind: 'source',
+            targetId: 'visit:a',
+            sourceVisitId: 'visit:a',
+          },
+        },
+        clientEventId: expect.stringMatching(/^feedback-user\.snippet\.promoted-/u),
+      }),
+      expect.objectContaining({
+        type: messageTypes.postConnectionsFeedbackEvent,
+        event: {
+          type: 'user.organized.item',
+          payload: {
+            payloadVersion: 1,
+            itemKind: 'thread',
+            itemId: 'thread:1',
+            action: 'move',
+            fromContainer: 'workstream:old',
+            toContainer: 'workstream:new',
+          },
+        },
+        clientEventId: expect.stringMatching(/^feedback-user\.organized\.item-/u),
+      }),
+    ]);
   });
 });

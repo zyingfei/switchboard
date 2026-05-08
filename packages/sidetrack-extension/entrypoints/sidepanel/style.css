@@ -7426,8 +7426,7 @@ pre.diff {
   margin-top: 10px;
 }
 .cx-focus-visit {
-  display: grid;
-  grid-template-columns: auto 1fr auto;
+  display: flex;
   align-items: center;
   gap: 8px;
   border: 1px solid var(--rule-soft);
@@ -7436,6 +7435,34 @@ pre.diff {
   color: var(--ink);
   padding: 6px 8px;
   text-align: left;
+}
+.cx-focus-visit-main {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  text-align: left;
+}
+.cx-focus-visit-main span:nth-child(2) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cx-focus-visit-select {
+  min-width: 84px;
+  max-width: 112px;
+  border: 1px solid var(--rule);
+  border-radius: var(--rad-s);
+  background: var(--paper-light);
+  color: var(--ink);
+  font: 10.5px var(--mono);
+  padding: 4px 6px;
 }
 .cx-engagement-dot {
   width: 8px;

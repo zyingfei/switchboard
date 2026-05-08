@@ -1,0 +1,67 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`FeedbackButtons > renders the compact confirm/reject controls 1`] = `
+<DocumentFragment>
+  <div
+    data-testid="feedback-buttons"
+    style="display: flex; align-items: center; gap: 6px; min-width: 0;"
+  >
+    <button
+      aria-label="Confirm connection"
+      aria-pressed="false"
+      class="cx-icon-button"
+      data-testid="feedback-confirm"
+      title="Confirm connection"
+      type="button"
+    >
+      <svg
+        aria-hidden="true"
+        fill="none"
+        stroke="currentColor"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        stroke-width="1.8"
+        viewBox="0 0 24 24"
+      >
+        <path
+          d="M7 10v10"
+        />
+        <path
+          d="M7 10 12 3c.8-1 2.4-.5 2.4.8V8h4.2c1.5 0 2.5 1.4 2.1 2.8l-1.6 6.5c-.3 1-1.2 1.7-2.2 1.7H10c-1.7 0-3-1.3-3-3v-6z"
+        />
+        <path
+          d="M3 10h4v10H3z"
+        />
+      </svg>
+    </button>
+    <button
+      aria-label="Reject connection"
+      aria-pressed="false"
+      class="cx-icon-button"
+      data-testid="feedback-reject"
+      title="Reject connection"
+      type="button"
+    >
+      <svg
+        aria-hidden="true"
+        fill="none"
+        stroke="currentColor"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        stroke-width="1.8"
+        viewBox="0 0 24 24"
+      >
+        <path
+          d="M7 14V4"
+        />
+        <path
+          d="m7 14 5 7c.8 1 2.4.5 2.4-.8V16h4.2c1.5 0 2.5-1.4 2.1-2.8l-1.6-6.5c-.3-1-1.2-1.7-2.2-1.7H10C8.3 5 7 6.3 7 8v6z"
+        />
+        <path
+          d="M3 4h4v10H3z"
+        />
+      </svg>
+    </button>
+  </div>
+</DocumentFragment>
+`;

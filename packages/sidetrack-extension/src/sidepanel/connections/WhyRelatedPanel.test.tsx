@@ -39,4 +39,22 @@ describe('WhyRelatedPanel', () => {
     fireEvent.click(screen.getByTestId('why-related-toggle'));
     expect(onToggle).toHaveBeenCalledTimes(1);
   });
+
+  it('renders relation feedback controls when an edge can be labeled', () => {
+    const onFeedback = vi.fn();
+    render(
+      <WhyRelatedPanel
+        fromVisitId="visit:a"
+        toVisitId="visit:b"
+        reasons={reasons.slice(0, 1)}
+        showOnlyUserAsserted={false}
+        feedback={{ onFeedback }}
+        onToggleAssertedOnly={() => undefined}
+        onClose={() => undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('feedback-confirm'));
+    expect(onFeedback).toHaveBeenCalledWith('confirm');
+  });
 });

@@ -1,8 +1,14 @@
 import type { ReactElement } from 'react';
 
+import { FeedbackButtons, type FeedbackChoice } from '../feedback/FeedbackButtons';
 import { reasonConfidence, type Reason } from './why-related/reasons';
 import { renderReason } from './why-related/render';
 import { sortReasons } from './why-related/sort';
+
+export interface WhyRelatedFeedback {
+  readonly label?: string;
+  readonly onFeedback: (choice: FeedbackChoice) => Promise<void> | void;
+}
 
 export interface WhyRelatedPanelProps {
   readonly fromVisitId: string;
@@ -10,6 +16,7 @@ export interface WhyRelatedPanelProps {
   readonly toTopicId?: string;
   readonly reasons: readonly Reason[];
   readonly showOnlyUserAsserted: boolean;
+  readonly feedback?: WhyRelatedFeedback;
   readonly onToggleAssertedOnly: () => void;
   readonly onClose: () => void;
 }
@@ -20,6 +27,7 @@ export const WhyRelatedPanel = ({
   toTopicId,
   reasons,
   showOnlyUserAsserted,
+  feedback,
   onToggleAssertedOnly,
   onClose,
 }: WhyRelatedPanelProps): ReactElement => {
@@ -50,6 +58,15 @@ export const WhyRelatedPanel = ({
       >
         Show only user-asserted
       </button>
+      {feedback === undefined ? null : (
+        <FeedbackButtons
+          label={feedback.label ?? 'relation'}
+          onFeedback={async (choice) => {
+            await feedback.onFeedback(choice);
+            return { ok: true };
+          }}
+        />
+      )}
       <ul className="cx-why-list">
         {visibleReasons.map((reason) => (
           <li key={JSON.stringify(reason)} data-testid={`why-reason-${reason.code}`}>

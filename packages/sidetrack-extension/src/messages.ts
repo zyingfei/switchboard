@@ -35,6 +35,7 @@ export const messageTypes = {
   loadConnectionsSnapshot: 'sidetrack.connections.snapshot',
   loadConnectionsNeighbors: 'sidetrack.connections.neighbors',
   loadConnectionsEdge: 'sidetrack.connections.edge',
+  postConnectionsFeedbackEvent: 'sidetrack.connections.feedback-event',
   captureCurrentTab: 'sidetrack.capture.current-tab',
   createWorkstream: 'sidetrack.workstream.create',
   updateWorkstream: 'sidetrack.workstream.update',
