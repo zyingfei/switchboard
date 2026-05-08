@@ -97,6 +97,10 @@ export type ConnectionEdgeKind =
   // visit (whole-word, case-insensitive). Closes the "I searched X
   // and asked the AI about X without pasting the URL" gap.
   | 'thread_text_mentions_search_query'
+  // Content-similarity match between browser visits. Produced by
+  // the visit-similarity Class E revision over the existing recall
+  // embedding model.
+  | 'visit_resembles_visit'
   // Active-workstream attribution: the timeline observer stamped the
   // user's currently-focused workstream id onto the visit. Closes
   // the "ambient browsing" gap — pages the user looked at while
@@ -165,6 +169,23 @@ export interface ConnectionEdge {
   // 'observed' = event/telemetry-derived fact observed by the system.
   // 'inferred' = deterministic algorithmic joins / similarity-style links.
   readonly confidence: 'asserted' | 'observed' | 'inferred';
+  readonly family?: 'contain' | 'flow' | 'defer' | 'urlmatch';
+}
+
+export interface VisitSimilarityEdge {
+  readonly fromVisitKey: string;
+  readonly toVisitKey: string;
+  readonly cosine: number;
+}
+
+export interface VisitSimilarityRevision {
+  readonly revisionId: string;
+  readonly modelId: 'Xenova/multilingual-e5-small';
+  readonly modelRevision: string;
+  readonly featureSchemaVersion: number;
+  readonly threshold: number;
+  readonly edges: readonly VisitSimilarityEdge[];
+  readonly producedAt: number;
 }
 
 export interface ConnectionsSnapshotScope {

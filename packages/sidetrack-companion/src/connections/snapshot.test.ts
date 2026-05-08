@@ -957,6 +957,74 @@ describe('connections — content-derived edges', () => {
     ).toBe(false);
   });
 
+  it('Pass 7 emits visit_resembles_visit edges from the active similarity revision', () => {
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: [
+        {
+          id: 'https://example.test/a',
+          firstSeenAt: '2026-05-07T09:00:00.000Z',
+          lastSeenAt: '2026-05-07T09:05:00.000Z',
+          url: 'https://example.test/a',
+          canonicalUrl: 'https://example.test/a',
+          title: 'A',
+          provider: 'generic',
+          visitCount: 1,
+        },
+        {
+          id: 'https://example.test/b',
+          firstSeenAt: '2026-05-07T09:10:00.000Z',
+          lastSeenAt: '2026-05-07T09:15:00.000Z',
+          url: 'https://example.test/b',
+          canonicalUrl: 'https://example.test/b',
+          title: 'B',
+          provider: 'generic',
+          visitCount: 1,
+        },
+      ],
+      updatedAt: '2026-05-07T09:15:00.000Z',
+      entryCount: 2,
+    };
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        timelineDays: [day],
+        visitSimilarity: {
+          revisionId: 'visit-sim-rev-1',
+          modelId: 'Xenova/multilingual-e5-small',
+          modelRevision: 'model-rev',
+          featureSchemaVersion: 1,
+          threshold: 0.85,
+          edges: [
+            {
+              fromVisitKey: 'https://example.test/a',
+              toVisitKey: 'https://example.test/b',
+              cosine: 0.91,
+            },
+            {
+              fromVisitKey: 'https://example.test/a',
+              toVisitKey: 'https://example.test/missing',
+              cosine: 0.99,
+            },
+          ],
+          producedAt: 1_777_777_777_000,
+        },
+      }),
+    );
+
+    const edge = snap.edges.find((candidate) => candidate.kind === 'visit_resembles_visit');
+    expect(edge).toBeDefined();
+    expect(edge?.fromNodeId).toBe(nodeIdFor('timeline-visit', 'https://example.test/a'));
+    expect(edge?.toNodeId).toBe(nodeIdFor('timeline-visit', 'https://example.test/b'));
+    expect(edge?.observedAt).toBe('2026-05-07T09:15:00.000Z');
+    expect(edge?.confidence).toBe('inferred');
+    expect(edge?.family).toBe('urlmatch');
+    expect(edge?.producedBy).toEqual({
+      source: 'visit-similarity',
+      revisionId: 'visit-sim-rev-1',
+    });
+    expect(snap.edges.filter((candidate) => candidate.kind === 'visit_resembles_visit')).toHaveLength(1);
+  });
+
   it('visit_in_workstream fires when the timeline entry carries a workstreamId (active-workstream attribution)', () => {
     // Active-workstream attribution: the observer stamps
     // workstreamId on visits when the user has a workstream

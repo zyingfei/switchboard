@@ -8,15 +8,23 @@ import {
   buildConnectionsSnapshot,
   type ConnectionsInput,
 } from '../../connections/snapshot.js';
+import {
+  buildVisitSimilarity,
+  type VisitSimilarityEmbedder,
+} from '../../connections/visitSimilarity.js';
+import { writeVisitSimilarityRevision } from '../../producers/visit-resembles-revision.js';
+import { embed as defaultEmbed } from '../../recall/embedder.js';
 import type { ConnectionsStore } from '../../connections/snapshot.js';
 import {
   buildDayProjection,
   collectTimelinePayloads,
+  entryIdFor,
   groupByDay,
   type TimelineDayProjection,
 } from '../../timeline/projection.js';
 import {
   BROWSER_TIMELINE_OBSERVED,
+  type BrowserTimelineObservedPayload,
   isBrowserTimelineObservedPayload,
 } from '../../timeline/events.js';
 import type { AcceptedEvent } from '../causal.js';
@@ -95,6 +103,7 @@ export interface CreateConnectionsMaterializerDeps {
   readonly eventLog: EventLog;
   readonly timelineStore: TimelineStore;
   readonly store: ConnectionsStore;
+  readonly embed?: VisitSimilarityEmbedder;
 }
 
 export const createConnectionsMaterializer = (
@@ -107,6 +116,29 @@ export const createConnectionsMaterializer = (
   let lastError: string | null = null;
   let lastFailureAtMs = 0;
 
+  type TimelineEntryWithDimensions = TimelineDayProjection['entries'][number] & {
+    readonly dimensions?: unknown;
+  };
+  type TimelineDayProjectionWithDimensions = Omit<TimelineDayProjection, 'entries'> & {
+    readonly entries: readonly TimelineEntryWithDimensions[];
+  };
+
+  const isRecord = (value: unknown): value is Record<string, unknown> =>
+    typeof value === 'object' && value !== null && !Array.isArray(value);
+
+  const focusedWindowMsFromPayload = (
+    payload: BrowserTimelineObservedPayload,
+  ): number | undefined => {
+    if (!isRecord(payload.dimensions)) return undefined;
+    const engagement = payload.dimensions['engagement'];
+    if (!isRecord(engagement)) return undefined;
+    const focused = engagement['focusedWindowMs'];
+    if (typeof focused !== 'number' || !Number.isFinite(focused) || focused < 0) {
+      return undefined;
+    }
+    return focused;
+  };
+
   // Build the per-day timeline projection in-memory directly from the
   // merged event log instead of reading the timelineStore. The
   // timeline materializer also writes the same projection to disk
@@ -117,7 +149,7 @@ export const createConnectionsMaterializer = (
   // cross-replica, where peer events arrive in bursts).
   const buildTimelineDays = (
     merged: readonly AcceptedEvent[],
-  ): readonly TimelineDayProjection[] => {
+  ): readonly TimelineDayProjectionWithDimensions[] => {
     const payloads = collectTimelinePayloads(
       merged.filter(
         (e) =>
@@ -126,9 +158,28 @@ export const createConnectionsMaterializer = (
       ),
     );
     const grouped = groupByDay(payloads);
-    const out: TimelineDayProjection[] = [];
+    const out: TimelineDayProjectionWithDimensions[] = [];
     for (const [date, dayPayloads] of grouped) {
-      out.push(buildDayProjection(date, dayPayloads));
+      const focusedByEntryId = new Map<string, number>();
+      for (const payload of dayPayloads) {
+        const focusedWindowMs = focusedWindowMsFromPayload(payload);
+        if (focusedWindowMs === undefined) continue;
+        const entryId = entryIdFor(payload);
+        focusedByEntryId.set(
+          entryId,
+          Math.max(focusedByEntryId.get(entryId) ?? 0, focusedWindowMs),
+        );
+      }
+      const projection = buildDayProjection(date, dayPayloads);
+      const entries: TimelineEntryWithDimensions[] = projection.entries.map((entry) => {
+        const focusedWindowMs = focusedByEntryId.get(entry.id);
+        if (focusedWindowMs === undefined) return entry;
+        return {
+          ...entry,
+          dimensions: { engagement: { focusedWindowMs } },
+        };
+      });
+      out.push({ ...projection, entries });
     }
     return out;
   };
@@ -137,10 +188,16 @@ export const createConnectionsMaterializer = (
     const merged = await deps.eventLog.readMerged();
     const vault = await readVaultStores(deps.vaultRoot);
     const timelineDays = buildTimelineDays(merged);
+    const visitSimilarity = await buildVisitSimilarity(
+      timelineDays.flatMap((day) => day.entries),
+      deps.embed ?? defaultEmbed,
+    );
+    await writeVisitSimilarityRevision(deps.vaultRoot, visitSimilarity);
     const input: ConnectionsInput = {
       events: merged,
       ...vault,
       timelineDays,
+      visitSimilarity,
     };
     const snapshot = buildConnectionsSnapshot(input);
     await deps.store.putCurrent(snapshot);

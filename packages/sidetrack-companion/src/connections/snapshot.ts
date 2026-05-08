@@ -34,6 +34,7 @@ import {
   type ConnectionNodeMetadata,
   type ConnectionsSnapshot,
   type ConnectionsSnapshotScope,
+  type VisitSimilarityRevision,
 } from './types.js';
 import { extractUrlsFromText } from './urlExtractor.js';
 
@@ -45,7 +46,7 @@ export type { ConnectionsSnapshot } from './types.js';
 // records. Same input → byte-equivalent output across replays and
 // replicas. No wall-clock, no inference, no time-proximity edges.
 //
-// Edge set (18 emitted, 19 declared):
+// Edge set:
 //   thread_in_workstream                 thread.primaryWorkstreamId
 //   workstream_parent_of                 workstream.parentId
 //   dispatch_from_thread                 dispatch record sourceThreadId
@@ -63,6 +64,8 @@ export type { ConnectionsSnapshot } from './types.js';
 //   thread_quotes_thread                 ≥40-char substring across capture turns
 //   thread_text_mentions_search_query    captured text contains a search-URL
 //                                         visit's query (whole-word match)
+//   visit_resembles_visit                deterministic visit similarity
+//                                        revision over title/host/path
 //   visit_in_workstream                   timeline observer stamped a
 //                                         workstreamId on the visit (active
 //                                         workstream attribution)
@@ -150,6 +153,7 @@ export interface ConnectionsInput {
   readonly reminders: readonly ReminderVaultRecord[];
   readonly codingSessions: readonly CodingSessionVaultRecord[];
   readonly timelineDays: readonly TimelineDayProjection[];
+  readonly visitSimilarity?: VisitSimilarityRevision;
   readonly scope?: ConnectionsSnapshotScope;
 }
 
@@ -265,6 +269,8 @@ const stripFragmentAndTrailingSlash = (url: string): string =>
 // Pass 5: cross-thread substring quotes — emit thread_quotes_thread
 //         edges when one captured turn contains a contiguous ≥40-char
 //         substring of another's.
+// Pass 6: search-query content match.
+// Pass 7: injected visit-similarity revision emits visit_resembles_visit.
 // ---------------------------------------------------------------------------
 
 export const buildConnectionsSnapshot = (
@@ -691,6 +697,7 @@ export const buildConnectionsSnapshot = (
   // Build URL → thread id map. canonicalUrl preferred; fall back to
   // threadUrl (with fragment + trailing-slash normalization).
   const threadIdByUrl = new Map<string, string>();
+  const visitObservedAtByKey = new Map<string, string>();
   for (const t of input.threads) {
     const candidate = t.canonicalUrl ?? t.threadUrl;
     if (typeof candidate !== 'string' || candidate.length === 0) continue;
@@ -702,6 +709,10 @@ export const buildConnectionsSnapshot = (
     trackObservedAt(day.updatedAt);
     for (const entry of day.entries) {
       const visitKey = stripFragmentAndTrailingSlash(entry.canonicalUrl ?? entry.url);
+      const priorVisitObservedAt = visitObservedAtByKey.get(visitKey);
+      if (priorVisitObservedAt === undefined || entry.lastSeenAt > priorVisitObservedAt) {
+        visitObservedAtByKey.set(visitKey, entry.lastSeenAt);
+      }
       // Extract the search query from search-shaped URLs so pass 6
       // can deterministically match it against captured turn text /
       // dispatch bodies / annotation notes. Host-agnostic detection
@@ -1201,6 +1212,42 @@ export const buildConnectionsSnapshot = (
           seq,
         );
       }
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Pass 7 — visit similarity. The producer owns cosine computation
+  // and revision identity; this reducer only materializes valid
+  // edges whose endpoints are present in the timeline projection.
+  // -------------------------------------------------------------------
+  if (input.visitSimilarity !== undefined) {
+    for (const similarityEdge of input.visitSimilarity.edges) {
+      if (
+        similarityEdge.fromVisitKey === similarityEdge.toVisitKey ||
+        similarityEdge.fromVisitKey.length === 0 ||
+        similarityEdge.toVisitKey.length === 0 ||
+        !Number.isFinite(similarityEdge.cosine) ||
+        similarityEdge.cosine < input.visitSimilarity.threshold
+      ) {
+        continue;
+      }
+      const fromObservedAt = visitObservedAtByKey.get(similarityEdge.fromVisitKey);
+      const toObservedAt = visitObservedAtByKey.get(similarityEdge.toVisitKey);
+      if (fromObservedAt === undefined || toObservedAt === undefined) continue;
+      const observedAt = fromObservedAt > toObservedAt ? fromObservedAt : toObservedAt;
+      trackObservedAt(observedAt);
+      upsertEdge(edges, {
+        kind: 'visit_resembles_visit',
+        fromNodeId: nodeIdFor('timeline-visit', similarityEdge.fromVisitKey),
+        toNodeId: nodeIdFor('timeline-visit', similarityEdge.toVisitKey),
+        observedAt,
+        producedBy: {
+          source: 'visit-similarity',
+          revisionId: input.visitSimilarity.revisionId,
+        },
+        confidence: 'inferred',
+        family: 'urlmatch',
+      });
     }
   }
 
