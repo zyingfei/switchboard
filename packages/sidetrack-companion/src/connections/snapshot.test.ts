@@ -5,6 +5,7 @@ import { CONTINUATION_CLASSIFIER_REVISION_ID } from '../continuation/classifier.
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../dispatches/events.js';
 import { NAVIGATION_COMMITTED, type NavigationCommittedPayload } from '../navigation/events.js';
 import { QUEUE_CREATED } from '../queue/events.js';
+import { FEATURE_SCHEMA_VERSION, type CandidatePairFeatures } from '../ranker/feature-schema.js';
 import { CAPTURE_RECORDED } from '../recall/events.js';
 import { SELECTION_COPIED, SELECTION_PASTED } from '../snippets/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
@@ -48,11 +49,13 @@ describe('connections — producedBy provenance variants', () => {
       { source: 'engagement-classifier', revisionId: 'engagement-class:v1:rules' },
       { source: 'snippet-lineage', revisionId: 'snippet-lineage:v1:hash' },
       { source: 'continuation-classifier', revisionId: 'continuation-classifier:v1' },
+      { source: 'ranker', revisionId: 'ranker-rev-1' },
       { source: 'cross-replica' },
     ];
 
     expect(variants.map((variant) => variant.source)).toContain('cross-replica');
     expect(variants.map((variant) => variant.source)).toContain('continuation-classifier');
+    expect(variants.map((variant) => variant.source)).toContain('ranker');
   });
 });
 
@@ -94,6 +97,30 @@ const navigationCommittedPayload = (input: {
   transitionQualifiers: [],
   commitTimestamp: Date.parse(input.commitAt),
   dimensions: { provenance: { source: 'test' } },
+});
+
+const rankerContributionsFor = (
+  score: number,
+): Readonly<Record<keyof CandidatePairFeatures, number>> => ({
+  schemaVersion: 0,
+  same_workstream: score * 0.5,
+  opener_chain_depth: 0,
+  in_navigation_chain: 0,
+  same_canonical_url: 0,
+  same_host: 0,
+  same_repo: 0,
+  same_search_query: 0,
+  same_copied_snippet_count: 0,
+  shared_title_tokens: score * 0.25,
+  shared_path_tokens: 0,
+  cosine_similarity: 0,
+  recency_score_from: 0,
+  recency_score_to: -0.1,
+  engagement_class_match: 0,
+  return_count_from: 0,
+  return_count_to: 0,
+  user_asserted_in_thread: 0,
+  user_asserted_in_workstream: 0,
 });
 
 describe('connections — snapshot reducer (Given/Then)', () => {
@@ -1057,6 +1084,84 @@ describe('connections — content-derived edges', () => {
     ).toHaveLength(1);
   });
 
+  it('Pass 12 emits closest_visit top-K edges with score and feature contributions', () => {
+    const urls = [
+      'https://ranker.test/a',
+      'https://ranker.test/b',
+      'https://ranker.test/c',
+      'https://ranker.test/d',
+      'https://ranker.test/e',
+    ] as const;
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: urls.map((url, index) => ({
+        id: url,
+        firstSeenAt: `2026-05-07T09:${String(index).padStart(2, '0')}:00.000Z`,
+        lastSeenAt: `2026-05-07T09:${String(index).padStart(2, '0')}:30.000Z`,
+        url,
+        canonicalUrl: url,
+        title: `Ranker fixture ${String(index)}`,
+        provider: 'generic',
+        visitCount: 1,
+        workstreamId: 'ws-ranker',
+      })),
+      updatedAt: '2026-05-07T09:04:30.000Z',
+      entryCount: urls.length,
+    };
+    const scoreByToVisit = new Map<string, number>([
+      ['https://ranker.test/b', 0.91],
+      ['https://ranker.test/c', 0.62],
+      ['https://ranker.test/d', 0.44],
+      ['https://ranker.test/e', 0.29],
+    ]);
+
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        timelineDays: [day],
+        closestVisitRanker: {
+          revisionId: 'ranker-rev-1',
+          threshold: 0.3,
+          topK: 2,
+          predict: (_features, candidate) => {
+            const score = scoreByToVisit.get(candidate.toVisitId) ?? 0.1;
+            return { score, contributions: rankerContributionsFor(score) };
+          },
+        },
+      }),
+    );
+
+    const fromA = snap.edges.filter(
+      (edge) =>
+        edge.kind === 'closest_visit' &&
+        edge.fromNodeId === nodeIdFor('timeline-visit', 'https://ranker.test/a'),
+    );
+    expect(fromA.map((edge) => edge.toNodeId)).toEqual([
+      nodeIdFor('timeline-visit', 'https://ranker.test/b'),
+      nodeIdFor('timeline-visit', 'https://ranker.test/c'),
+    ]);
+    expect(fromA[0]).toMatchObject({
+      observedAt: '2026-05-07T09:01:30.000Z',
+      producedBy: { source: 'ranker', revisionId: 'ranker-rev-1' },
+      confidence: 'inferred',
+      family: 'urlmatch',
+      metadata: {
+        score: 0.91,
+        featureSchemaVersion: FEATURE_SCHEMA_VERSION,
+        topContributions: [
+          { feature: 'same_workstream', weight: 0.455 },
+          { feature: 'shared_title_tokens', weight: 0.2275 },
+          { feature: 'recency_score_to', weight: -0.1 },
+        ],
+      },
+    });
+    expect(fromA.some((edge) => edge.toNodeId === nodeIdFor('timeline-visit', urls[3]))).toBe(
+      false,
+    );
+    expect(fromA.some((edge) => edge.toNodeId === nodeIdFor('timeline-visit', urls[4]))).toBe(
+      false,
+    );
+  });
+
   it('visit_in_workstream fires when the timeline entry carries a workstreamId (active-workstream attribution)', () => {
     // Active-workstream attribution: the observer stamps
     // workstreamId on visits when the user has a workstream
@@ -1254,7 +1359,7 @@ describe('connections — content-derived edges', () => {
     });
   });
 
-  it('Pass 11 emits visit_in_template edges for visits sharing a DOM skeleton hash', () => {
+  it('Pass 13 emits visit_in_template edges for visits sharing a DOM skeleton hash', () => {
     const domHash = 'd'.repeat(64);
     const events = ['visit-a', 'visit-b', 'visit-c'].map((visitId, index) =>
       buildEvent({

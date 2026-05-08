@@ -10,10 +10,11 @@ export const REASON_PRIORITY: Record<ReasonCode, number> = {
   TRANSITION_QUALIFIER: 4,
   OBSERVED_ON_OTHER_REPLICA: 5,
   SAME_TOPIC: 6,
-  COSINE_ABOVE_THRESHOLD: 7,
-  LINK_OUT_FROM: 8,
-  LINK_IN_TO: 8,
-  LEXICAL_OVERLAP: 9,
+  RANKER_SCORE: 7,
+  COSINE_ABOVE_THRESHOLD: 8,
+  LINK_OUT_FROM: 9,
+  LINK_IN_TO: 9,
+  LEXICAL_OVERLAP: 10,
 };
 
 const stablePayload = (reason: Reason): string => JSON.stringify(reason);

@@ -24,6 +24,20 @@ export const renderReason = (reason: Reason): string => {
       return `Pasted into ${reason.destinationKind}`;
     case 'OBSERVED_ON_OTHER_REPLICA':
       return `Also observed on replica ${reason.replicaId}`;
+    case 'RANKER_SCORE': {
+      const contributions = reason.topContributions
+        .slice(0, 3)
+        .map(
+          (contribution) =>
+            `${contribution.feature} ${
+              contribution.weight >= 0 ? '+' : ''
+            }${contribution.weight.toFixed(2)}`,
+        )
+        .join(', ');
+      return contributions.length === 0
+        ? `Ranker score ${reason.score.toFixed(2)}`
+        : `Ranker score ${reason.score.toFixed(2)}: ${contributions}`;
+    }
     case 'LEXICAL_OVERLAP':
       return `Shared terms: ${reason.topTokens.slice(0, 3).join(', ')}`;
     case 'LINK_OUT_FROM':

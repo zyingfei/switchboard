@@ -39,6 +39,7 @@ export interface ConnectionEdge {
     readonly recordId?: string;
   };
   readonly confidence: 'asserted' | 'observed' | 'inferred';
+  readonly metadata?: Record<string, unknown>;
 }
 
 export interface ConnectionsSnapshot {
@@ -51,7 +52,10 @@ export interface ConnectionsSnapshot {
 }
 
 export interface ConnectionsScopedResult {
-  readonly scope: 'plugin-active' | 'companion-extended' | 'plugin-active-only-companion-unreachable';
+  readonly scope:
+    | 'plugin-active'
+    | 'companion-extended'
+    | 'plugin-active-only-companion-unreachable';
   readonly snapshot: ConnectionsSnapshot;
   readonly note?: string;
 }

@@ -55,6 +55,16 @@
     "expected": "Also observed on replica replica-b"
   },
   {
+    "code": "RANKER_SCORE",
+    "score": 0.913,
+    "topContributions": [
+      { "feature": "same_workstream", "weight": 0.42 },
+      { "feature": "shared_title_tokens", "weight": 0.31 },
+      { "feature": "recency_score_to", "weight": -0.09 }
+    ],
+    "expected": "Ranker score 0.91: same_workstream +0.42, shared_title_tokens +0.31, recency_score_to -0.09"
+  },
+  {
     "code": "LEXICAL_OVERLAP",
     "topTokens": ["sidetrack", "workstream", "browser", "agent"],
     "expected": "Shared terms: sidetrack, workstream, browser"
