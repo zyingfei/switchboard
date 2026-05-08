@@ -11,6 +11,7 @@ import {
 import { createRevision } from '../domain/ids.js';
 import { QUEUE_CREATED, isQueueCreatedPayload } from '../queue/events.js';
 import { CAPTURE_RECORDED, isCaptureRecordedPayload } from '../recall/events.js';
+import { projectSnippetLineage } from '../snippets/projection.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import {
   THREAD_UPSERTED,
@@ -65,6 +66,9 @@ export type { ConnectionsSnapshot } from './types.js';
 //   visit_in_workstream                   timeline observer stamped a
 //                                         workstreamId on the visit (active
 //                                         workstream attribution)
+//   snippet_copied_from_visit             hash-only copy/paste lineage
+//   snippet_pasted_into_<dest>            paste destination edge
+//   snippet_reused_across_threads         same snippet pasted into >=2 threads
 //
 // `annotation_targets_workstream` is declared in the edge-kind union
 // for completeness but not yet emitted (workstream-anchored
@@ -1197,6 +1201,115 @@ export const buildConnectionsSnapshot = (
           seq,
         );
       }
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Pass 10 — hash-only snippet lineage. The projection matches
+  // selection.pasted to selection.copied within a 24-hour window by
+  // exact SHA-256 hash or SimHash64 Hamming <= 3. No raw text enters
+  // this reducer.
+  // -------------------------------------------------------------------
+  const snippetRevisionId = 'snippet-lineage:v1:hash';
+  const lineages = projectSnippetLineage(input.events).lineages;
+  const threadDestinationsBySnippet = new Map<string, Set<string>>();
+  const pastedAtBySnippetThread = new Map<string, string>();
+
+  const edgeKindForDestination = (kind: string): ConnectionEdgeKind | null => {
+    if (kind === 'thread') return 'snippet_pasted_into_thread';
+    if (kind === 'dispatch') return 'snippet_pasted_into_dispatch';
+    if (kind === 'search') return 'snippet_pasted_into_search';
+    if (kind === 'note') return 'snippet_pasted_into_note';
+    if (kind === 'capture') return 'snippet_pasted_into_capture';
+    return null;
+  };
+  const nodeKindForDestination = (kind: string): ConnectionNodeKind | null => {
+    if (kind === 'thread') return 'thread';
+    if (kind === 'dispatch') return 'dispatch';
+    if (kind === 'search') return 'timeline-visit';
+    if (kind === 'note') return 'annotation';
+    if (kind === 'capture') return 'annotation';
+    return null;
+  };
+
+  for (const lineage of lineages) {
+    const observedAt = new Date(lineage.pastedAtMs).toISOString();
+    trackObservedAt(observedAt);
+    upsertNode(nodes, {
+      kind: 'snippet',
+      key: lineage.snippetId,
+      label: lineage.snippetId,
+      observedAt,
+      replicaId: lineage.pasteDot.replicaId,
+      metadata: {
+        charHashPrefix: lineage.selectionHash.slice(0, 12),
+        match: lineage.match,
+      },
+    });
+    upsertNode(nodes, {
+      kind: 'timeline-visit',
+      key: lineage.copiedVisitId,
+      label: lineage.copiedVisitId,
+      observedAt: new Date(lineage.copiedAtMs).toISOString(),
+      replicaId: lineage.copyDot.replicaId,
+    });
+    upsertEdge(edges, {
+      kind: 'snippet_copied_from_visit',
+      fromNodeId: nodeIdFor('snippet', lineage.snippetId),
+      toNodeId: nodeIdFor('timeline-visit', lineage.copiedVisitId),
+      observedAt: new Date(lineage.copiedAtMs).toISOString(),
+      producedBy: {
+        source: 'snippet-lineage',
+        revisionId: snippetRevisionId,
+      },
+      confidence: 'observed',
+    });
+
+    const destinationNodeKind = nodeKindForDestination(lineage.destinationKind);
+    const destinationEdgeKind = edgeKindForDestination(lineage.destinationKind);
+    if (destinationNodeKind !== null && destinationEdgeKind !== null) {
+      upsertNode(nodes, {
+        kind: destinationNodeKind,
+        key: lineage.destinationId,
+        label: lineage.destinationId,
+        observedAt,
+        replicaId: lineage.pasteDot.replicaId,
+      });
+      upsertEdge(edges, {
+        kind: destinationEdgeKind,
+        fromNodeId: nodeIdFor('snippet', lineage.snippetId),
+        toNodeId: nodeIdFor(destinationNodeKind, lineage.destinationId),
+        observedAt,
+        producedBy: {
+          source: 'snippet-lineage',
+          revisionId: snippetRevisionId,
+        },
+        confidence: 'observed',
+      });
+    }
+
+    if (lineage.destinationKind === 'thread') {
+      const set = threadDestinationsBySnippet.get(lineage.snippetId) ?? new Set<string>();
+      set.add(lineage.destinationId);
+      threadDestinationsBySnippet.set(lineage.snippetId, set);
+      pastedAtBySnippetThread.set(`${lineage.snippetId}|${lineage.destinationId}`, observedAt);
+    }
+  }
+
+  for (const [snippetId, threadIds] of threadDestinationsBySnippet) {
+    if (threadIds.size < 2) continue;
+    for (const threadId of [...threadIds].sort()) {
+      upsertEdge(edges, {
+        kind: 'snippet_reused_across_threads',
+        fromNodeId: nodeIdFor('snippet', snippetId),
+        toNodeId: nodeIdFor('thread', threadId),
+        observedAt: pastedAtBySnippetThread.get(`${snippetId}|${threadId}`) ?? '',
+        producedBy: {
+          source: 'snippet-lineage',
+          revisionId: snippetRevisionId,
+        },
+        confidence: 'inferred',
+      });
     }
   }
 

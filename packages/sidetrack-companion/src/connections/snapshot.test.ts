@@ -4,6 +4,7 @@ import { ANNOTATION_CREATED } from '../annotations/events.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../dispatches/events.js';
 import { QUEUE_CREATED } from '../queue/events.js';
 import { CAPTURE_RECORDED } from '../recall/events.js';
+import { SELECTION_COPIED, SELECTION_PASTED } from '../snippets/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { THREAD_UPSERTED } from '../threads/events.js';
 import type { TimelineDayProjection } from '../timeline/projection.js';
@@ -1221,6 +1222,53 @@ describe('connections — determinism + cross-replica', () => {
     expect(snap.nodeCount).toBe(0);
     expect(snap.edgeCount).toBe(0);
     expect(snap.updatedAt).toBe('1970-01-01T00:00:00.000Z');
+  });
+
+  it('Pass 10 emits snippet lineage edges from copy/paste fixtures', () => {
+    const copied = {
+      payloadVersion: 1,
+      visitId: 'visit:source',
+      selectionHash: 'abcdef1234567890abcdef1234567890',
+      simhash64: 'AAAAAAAAAAA=',
+      charCount: 20,
+      lineCount: 1,
+      contentKindHint: 'prose',
+      rawTextStored: false,
+    };
+    const pasted = {
+      payloadVersion: 1,
+      destinationKind: 'thread',
+      selectionHash: copied.selectionHash,
+      simhash64: copied.simhash64,
+      charCount: 20,
+      rawTextStored: false,
+    };
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        events: [
+          buildEvent({ seq: 1, type: SELECTION_COPIED, payload: copied }),
+          buildEvent({
+            seq: 2,
+            type: SELECTION_PASTED,
+            payload: { ...pasted, destinationId: 'thread_a' },
+          }),
+          buildEvent({
+            seq: 3,
+            type: SELECTION_PASTED,
+            payload: { ...pasted, destinationId: 'thread_b' },
+          }),
+        ],
+      }),
+    );
+    expect(snap.nodes.find((node) => node.kind === 'snippet')).toBeDefined();
+    expect(snap.edges.find((edge) => edge.kind === 'snippet_copied_from_visit')).toBeDefined();
+    expect(snap.edges.filter((edge) => edge.kind === 'snippet_pasted_into_thread')).toHaveLength(2);
+    expect(snap.edges.filter((edge) => edge.kind === 'snippet_reused_across_threads')).toHaveLength(2);
+    expect(
+      snap.edges.every((edge) =>
+        edge.kind.startsWith('snippet_') ? edge.producedBy.source === 'snippet-lineage' : true,
+      ),
+    ).toBe(true);
   });
 });
 

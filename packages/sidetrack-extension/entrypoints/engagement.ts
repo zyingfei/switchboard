@@ -1,6 +1,7 @@
 import { defineContentScript } from 'wxt/utils/define-content-script';
 
 import { createEngagementAggregator } from '../src/content/engagement/aggregator';
+import { attachCopyPasteLineage } from '../src/content/engagement/copy-paste';
 import { scrollRatioForDocument, throttle } from '../src/content/engagement/scroll';
 import {
   engagementVisitIdForLocation,
@@ -12,8 +13,9 @@ import { safeSendRuntimeMessage } from '../src/content/inject';
 const SUB_EMIT_MS = 30_000;
 
 export const startEngagementTracking = (): void => {
+  const visitId = engagementVisitIdForLocation(window.location);
   const aggregator = createEngagementAggregator({
-    visitId: engagementVisitIdForLocation(window.location),
+    visitId,
     now: () => Date.now(),
     visible: isDocumentVisible(document),
     focused: isWindowFocused(document),
@@ -49,6 +51,12 @@ export const startEngagementTracking = (): void => {
   });
   document.addEventListener('paste', () => {
     aggregator.recordPaste();
+  });
+  attachCopyPasteLineage({
+    visitId,
+    send: safeSendRuntimeMessage,
+    location: window.location,
+    selection: () => window.getSelection(),
   });
   window.addEventListener('pagehide', () => {
     emit(true);

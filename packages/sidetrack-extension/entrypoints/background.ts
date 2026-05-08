@@ -52,6 +52,11 @@ import {
   type EngagementIntervalObservedPayload,
   type EngagementSessionAggregatedPayload,
 } from '../src/background/state/engagementCache';
+import {
+  isSelectionLineageMessage,
+  type SelectionCopiedPayload,
+  type SelectionPastedPayload,
+} from '../src/content/engagement/copy-paste';
 import { allocateNextSeq, loadOrCreateEdgeReplica } from '../src/sync/edgeReplicaId';
 import { createVaultChangesClient } from '../src/companion/vaultChanges';
 import { createRecallClient } from '../src/companion/recallClient';
@@ -2756,6 +2761,22 @@ export default defineBackground(() => {
     ]);
   };
 
+  const handleSelectionLineage = async (message: unknown): Promise<void> => {
+    if (!isSelectionLineageMessage(message)) return;
+    const allocated = await allocateNextSeq(1);
+    const streamName =
+      message.type === 'sidetrack.selection.copied' ? 'selection.copied' : 'selection.pasted';
+    await engagementEventBuffer.appendMany([
+      {
+        streamName,
+        lamport: allocated.fromSeq,
+        replicaId: allocated.edgeReplicaId,
+        payload: message.payload as SelectionCopiedPayload | SelectionPastedPayload,
+        observedAt: new Date().toISOString(),
+      },
+    ]);
+  };
+
   // Drop reminders bound to thread bac_ids that no longer exist.
   // Cleanup pass for the historical mess caused by the pre-fix
   // sendToCompanion bug (every capture reissued a thread bac_id;
@@ -2984,6 +3005,20 @@ export default defineBackground(() => {
 
   chrome.runtime.onMessage.addListener(
     (message: unknown, sender, sendResponse: (response: RuntimeResponse) => void) => {
+      if (isSelectionLineageMessage(message)) {
+        void handleSelectionLineage(message)
+          .then(() => {
+            sendResponse({ ok: true } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'selection lineage failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+
       if (isEngagementIntervalMessage(message)) {
         void handleEngagementInterval(message, sender.tab?.id)
           .then(() => {
