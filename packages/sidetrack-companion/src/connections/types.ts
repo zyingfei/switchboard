@@ -127,12 +127,10 @@ export interface ConnectionEdge {
     readonly dot?: { readonly replicaId: string; readonly seq: number };
     readonly recordId?: string;
   };
-  // 'explicit' = the source surfaces this edge directly (e.g.
-  //   thread.primaryWorkstreamId, dispatch.sourceThreadId).
-  // 'deterministic' = derived from a deterministic match (e.g.
-  //   canonicalUrl join between timeline visit and thread).
-  // P3 may add 'suggested' for embedding-similarity inferred edges.
-  readonly confidence: 'explicit' | 'deterministic';
+  // 'asserted' = user-entered or user-authored state surfaced directly.
+  // 'observed' = event/telemetry-derived fact observed by the system.
+  // 'inferred' = deterministic algorithmic joins / similarity-style links.
+  readonly confidence: 'asserted' | 'observed' | 'inferred';
 }
 
 export interface ConnectionsSnapshotScope {

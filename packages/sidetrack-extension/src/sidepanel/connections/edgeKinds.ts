@@ -3,8 +3,9 @@ import type { ConnectionNodeKind } from './types';
 // Edge kind / family / type metadata, ported from
 // switchboard/project/connections-shared.jsx and extended with the
 // 4 new content-derived edges (`*_references_url`,
-// `thread_quotes_thread`) which fold into the `urlmatch` family —
-// they share the deterministic dotted-line semantic of "URL match".
+// `thread_quotes_thread`) which fold into the `urlmatch` family.
+// Confidence comes from the edge payload itself, so inferred links
+// can render with a weaker dashed treatment independent of family.
 
 export type EdgeFamily = 'contain' | 'flow' | 'defer' | 'urlmatch';
 
