@@ -7050,6 +7050,7 @@ pre.diff {
 }
 .cx-edge.fam-defer    .cx-edge-line { border-top-style: dashed; }
 .cx-edge.fam-urlmatch .cx-edge-line { border-top-style: dotted; border-top-width: 2px; }
+.cx-edge.confidence-inferred .cx-edge-line { stroke-dasharray: 4 2; opacity: 0.7; border-top-style: dashed; }
 
 /* edge label as standalone pill (between nodes) */
 .cx-edgelabel {

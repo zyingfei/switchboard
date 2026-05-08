@@ -331,7 +331,7 @@ export const buildConnectionsSnapshot = (
             eventType: THREAD_UPSERTED,
             dot: { replicaId, seq: event.dot.seq },
           },
-          confidence: 'explicit',
+          confidence: 'observed',
         });
       }
       continue;
@@ -367,7 +367,7 @@ export const buildConnectionsSnapshot = (
             eventType: WORKSTREAM_UPSERTED,
             dot: { replicaId, seq: event.dot.seq },
           },
-          confidence: 'explicit',
+          confidence: 'observed',
         });
       }
       continue;
@@ -402,7 +402,7 @@ export const buildConnectionsSnapshot = (
           eventType: DISPATCH_LINKED,
           dot: { replicaId, seq: event.dot.seq },
         },
-        confidence: 'explicit',
+        confidence: 'observed',
       });
       continue;
     }
@@ -436,7 +436,7 @@ export const buildConnectionsSnapshot = (
             toNodeId: nodeIdFor('thread', p.targetId),
             observedAt: observedAtIso,
             producedBy: { source: 'event-log', eventType: QUEUE_CREATED, dot: { replicaId, seq: event.dot.seq } },
-            confidence: 'explicit',
+            confidence: 'observed',
           });
         } else if (p.scope === 'workstream') {
           upsertNode(nodes, {
@@ -452,7 +452,7 @@ export const buildConnectionsSnapshot = (
             toNodeId: nodeIdFor('workstream', p.targetId),
             observedAt: observedAtIso,
             producedBy: { source: 'event-log', eventType: QUEUE_CREATED, dot: { replicaId, seq: event.dot.seq } },
-            confidence: 'explicit',
+            confidence: 'observed',
           });
         }
       }
@@ -513,7 +513,7 @@ export const buildConnectionsSnapshot = (
         toNodeId: nodeIdFor('workstream', t.primaryWorkstreamId),
         observedAt: t.lastSeenAt ?? '',
         producedBy: { source: 'workboard-state', recordId: t.bac_id },
-        confidence: 'explicit',
+        confidence: 'asserted',
       });
     }
   }
@@ -537,7 +537,7 @@ export const buildConnectionsSnapshot = (
           toNodeId: nodeIdFor('workstream', childId),
           observedAt: '',  // vault record without observedAt; sentinel sorts first
           producedBy: { source: 'workboard-state', recordId: w.bac_id },
-          confidence: 'explicit',
+          confidence: 'asserted',
         });
       }
     }
@@ -563,7 +563,7 @@ export const buildConnectionsSnapshot = (
         toNodeId: nodeIdFor('dispatch', d.bac_id),
         observedAt: d.createdAt ?? '',
         producedBy: { source: 'workboard-state', recordId: d.bac_id },
-        confidence: 'explicit',
+        confidence: 'asserted',
       });
     }
     if (typeof d.workstreamId === 'string' && d.workstreamId.length > 0) {
@@ -574,7 +574,7 @@ export const buildConnectionsSnapshot = (
         toNodeId: nodeIdFor('workstream', d.workstreamId),
         observedAt: d.createdAt ?? '',
         producedBy: { source: 'workboard-state', recordId: d.bac_id },
-        confidence: 'explicit',
+        confidence: 'asserted',
       });
     }
     if (typeof d.mcpRequest?.codingSessionId === 'string') {
@@ -585,7 +585,7 @@ export const buildConnectionsSnapshot = (
         toNodeId: nodeIdFor('coding-session', d.mcpRequest.codingSessionId),
         observedAt: d.createdAt ?? '',
         producedBy: { source: 'workboard-state', recordId: d.bac_id },
-        confidence: 'explicit',
+        confidence: 'asserted',
       });
     }
   }
@@ -612,7 +612,7 @@ export const buildConnectionsSnapshot = (
         toNodeId: nodeIdFor('thread', tid),
         observedAt: q.createdAt ?? '',
         producedBy: { source: 'workboard-state', recordId: q.bac_id },
-        confidence: 'explicit',
+        confidence: 'asserted',
       });
     }
     if (typeof wid === 'string' && wid.length > 0) {
@@ -623,7 +623,7 @@ export const buildConnectionsSnapshot = (
         toNodeId: nodeIdFor('workstream', wid),
         observedAt: q.createdAt ?? '',
         producedBy: { source: 'workboard-state', recordId: q.bac_id },
-        confidence: 'explicit',
+        confidence: 'asserted',
       });
     }
   }
@@ -648,7 +648,7 @@ export const buildConnectionsSnapshot = (
       toNodeId: nodeIdFor('thread', r.threadId),
       observedAt: r.detectedAt ?? '',
       producedBy: { source: 'reminder-store', recordId: reminderId },
-      confidence: 'explicit',
+      confidence: 'asserted',
     });
   }
   for (const c of input.codingSessions) {
@@ -674,7 +674,7 @@ export const buildConnectionsSnapshot = (
         toNodeId: nodeIdFor('workstream', c.workstreamId),
         observedAt: c.attachedAt ?? '',
         producedBy: { source: 'coding-session-store', recordId: c.bac_id },
-        confidence: 'explicit',
+        confidence: 'asserted',
       });
     }
   }
@@ -737,7 +737,7 @@ export const buildConnectionsSnapshot = (
           toNodeId: nodeIdFor('workstream', entry.workstreamId),
           observedAt: entry.lastSeenAt,
           producedBy: { source: 'timeline-projection' },
-          confidence: 'explicit',
+          confidence: 'observed',
         });
       }
       const threadId = threadIdByUrl.get(visitKey);
@@ -749,7 +749,7 @@ export const buildConnectionsSnapshot = (
           toNodeId: nodeIdFor('thread', threadId),
           observedAt: entry.lastSeenAt,
           producedBy: { source: 'timeline-projection' },
-          confidence: 'deterministic',
+          confidence: 'inferred',
         });
       }
     }
@@ -773,7 +773,7 @@ export const buildConnectionsSnapshot = (
         eventType: ANNOTATION_CREATED,
         dot: { replicaId: event.dot.replicaId, seq: event.dot.seq },
       },
-      confidence: 'deterministic',
+      confidence: 'inferred',
     });
   }
 
@@ -826,7 +826,7 @@ export const buildConnectionsSnapshot = (
         eventType: input.eventType,
         dot: { replicaId: input.replicaId, seq: input.seq },
       },
-      confidence: 'deterministic',
+      confidence: 'inferred',
     });
   };
 
@@ -907,7 +907,7 @@ export const buildConnectionsSnapshot = (
             eventType: DISPATCH_RECORDED,
             dot: { replicaId, seq },
           },
-          confidence: 'explicit',
+          confidence: 'observed',
         });
       }
       if (typeof p.workstreamId === 'string' && p.workstreamId.length > 0) {
@@ -926,7 +926,7 @@ export const buildConnectionsSnapshot = (
             eventType: DISPATCH_RECORDED,
             dot: { replicaId, seq },
           },
-          confidence: 'explicit',
+          confidence: 'observed',
         });
       }
       if (
@@ -948,7 +948,7 @@ export const buildConnectionsSnapshot = (
             eventType: DISPATCH_RECORDED,
             dot: { replicaId, seq },
           },
-          confidence: 'explicit',
+          confidence: 'observed',
         });
       }
       for (const url of extractUrlsFromText(p.body)) {
@@ -1084,7 +1084,7 @@ export const buildConnectionsSnapshot = (
             ? {}
             : { dot: { replicaId: fromDot.replicaId, seq: fromDot.seq } }),
         },
-        confidence: 'deterministic',
+        confidence: 'inferred',
       });
     }
   }
@@ -1148,7 +1148,7 @@ export const buildConnectionsSnapshot = (
               ? {}
               : { dot: { replicaId, seq } }),
           },
-          confidence: 'deterministic',
+          confidence: 'inferred',
         });
       }
     };
