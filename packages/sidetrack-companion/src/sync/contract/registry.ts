@@ -34,6 +34,7 @@ import {
   PRIVACY_PERMISSION_GRANTED,
   PRIVACY_PERMISSION_REVOKED,
 } from '../../privacy/events.js';
+import { NAVIGATION_COMMITTED } from '../../navigation/events.js';
 import { QUEUE_CREATED, QUEUE_STATUS_SET } from '../../queue/events.js';
 import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from '../../recall/events.js';
 import { CAPTURE_EXTRACTION_PRODUCED } from '../../recall/extraction/events.js';
@@ -77,6 +78,7 @@ export interface SurfaceContract {
 export interface ContractEntry {
   readonly eventType: string;
   readonly currentPayloadVersion?: number;
+  readonly allowedDimensions?: readonly string[];
   readonly surfaces: readonly SurfaceContract[];
 }
 
@@ -292,6 +294,26 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   //   2. timeline-projection — Class B (derived-cache; daily
   //      reduction over events, not a per-aggregate LWW). Owned by
   //      the dedicated 'timeline' materializer.
+  {
+    eventType: NAVIGATION_COMMITTED,
+    currentPayloadVersion: 1,
+    allowedDimensions: ['provenance'],
+    surfaces: [
+      {
+        surface: 'plugin-navigation-committed',
+        class: 'plugin-tier-bounded',
+        peerFreshnessMs: 1_000,
+        recovery: 'spool-drain',
+      },
+      {
+        surface: 'connections-causal-spine',
+        class: 'derived-cache',
+        materializer: 'connections',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+    ],
+  },
   {
     eventType: BROWSER_TIMELINE_OBSERVED,
     currentPayloadVersion: 1,
