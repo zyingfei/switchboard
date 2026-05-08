@@ -17,6 +17,19 @@ Each production PR should include:
 - Observability fields and example logs for new operations.
 - Security notes for data access, permissions, secrets, authz, and user consent.
 
+### Multi-sub-task stage PRs (Codex + lead collaboration)
+
+For PRs that ship a multi-sub-task stage through the Codex-and-lead
+collaboration model — e.g., the Stage 1 MVP (PR #99), Stage 2/3 work graph
+(PR #105), and any future Stage N+ PRs — use the template at
+[`docs/templates/codex-lead-stage-pr.md`](docs/templates/codex-lead-stage-pr.md).
+
+The template carries both the PR-body skeleton (Wave structure, Codex-pull
+checklist, test plan) AND the operational protocol (poll-before-write,
+`/tmp` staging for context-saving, push-then-mark, lead integration
+cadence, status-comment shape). Adopt as-is for new stage PRs; clone +
+adjust for sub-task counts and waves.
+
 ## Code review rubric
 
 Review by asking:
