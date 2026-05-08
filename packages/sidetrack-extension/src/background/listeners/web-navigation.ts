@@ -78,6 +78,11 @@ export interface NavigationListenerDeps {
   readonly now: () => Date;
 }
 
+interface NavigationSessionStorage {
+  readonly get: (key: string) => Promise<Record<string, unknown>>;
+  readonly set: (entries: Record<string, unknown>) => Promise<void>;
+}
+
 interface TabNavigationState {
   readonly lastVisitId: string;
   readonly navigationSequence: number;
@@ -103,6 +108,8 @@ const TRANSITION_QUALIFIERS: ReadonlySet<string> = new Set([
   'forward_back',
   'from_address_bar',
 ]);
+
+const BROWSER_SESSION_START_KEY = 'sidetrack.navigation.browserSessionStartMs';
 
 const isTransitionType = (value: unknown): value is NavigationTransitionType =>
   typeof value === 'string' && TRANSITION_TYPES.has(value);
@@ -287,6 +294,25 @@ export const registerWebNavigationListeners = (deps: NavigationListenerDeps): vo
   });
 };
 
+const navigationSessionStorage = (): NavigationSessionStorage => {
+  const c = chrome as typeof chrome & {
+    readonly storage: typeof chrome.storage & { readonly session?: NavigationSessionStorage };
+  };
+  return c.storage.session ?? chrome.storage.local;
+};
+
+export const loadOrCreateBrowserSessionStartMs = async (): Promise<number> => {
+  const storage = navigationSessionStorage();
+  const got = await storage.get(BROWSER_SESSION_START_KEY);
+  const existing = got[BROWSER_SESSION_START_KEY];
+  if (typeof existing === 'number' && Number.isFinite(existing) && existing > 0) {
+    return existing;
+  }
+  const fresh = Date.now();
+  await storage.set({ [BROWSER_SESSION_START_KEY]: fresh });
+  return fresh;
+};
+
 export const registerDefaultWebNavigationListeners = (
   tabOpenerStore: TabOpenerStore,
 ): void => {
@@ -297,13 +323,16 @@ export const registerDefaultWebNavigationListeners = (
   const listener = async (): Promise<ReturnType<typeof createWebNavigationListener>> => {
     if (listenerPromise !== null) return listenerPromise;
     listenerPromise = (async () => {
-      const replica = await loadOrCreateEdgeReplica();
+      const [replica, browserSessionStartMs] = await Promise.all([
+        loadOrCreateEdgeReplica(),
+        loadOrCreateBrowserSessionStartMs(),
+      ]);
       return createWebNavigationListener({
         webNavigation,
         tabs: chrome.tabs as TabsLookupApi,
         tabOpenerStore,
         eventBuffer: new IndexedDbEventBuffer(),
-        browserSessionStartMs: Date.now(),
+        browserSessionStartMs,
         edgeReplicaId: replica.edgeReplicaId,
         allocateSeq: allocateNextSeq,
         now: () => new Date(),

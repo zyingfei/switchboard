@@ -1,15 +1,21 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { InMemoryEventBuffer } from '../storage/in-memory-event-buffer';
 import { saltedFnv1a32Hex } from '../../graph/fnv1a';
 import { createTabOpenerStore } from './tabs';
 import {
   createWebNavigationListener,
+  loadOrCreateBrowserSessionStartMs,
   NAVIGATION_COMMITTED,
   type NavigationCommittedPayload,
   type TabsLookupApi,
   type WebNavigationApi,
 } from './web-navigation';
+
+afterEach(() => {
+  vi.useRealTimers();
+  delete (globalThis as unknown as { chrome?: unknown }).chrome;
+});
 
 const makeDeps = (tabs: Map<number, { readonly windowId: number }>) => {
   const buffer = new InMemoryEventBuffer();
@@ -164,5 +170,33 @@ describe('webNavigation committed listener', () => {
     const latest = emitted.at(-1);
     expect(latest?.previousVisitId).toBe('visit_existing');
     expect(latest?.navigationSequence).toBe(4);
+  });
+
+  it('persists browser session start across service-worker restarts', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-08T10:00:00.000Z'));
+    const store: Record<string, unknown> = {};
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      storage: {
+        session: {
+          get: vi.fn((key: string) => Promise.resolve({ [key]: store[key] })),
+          set: vi.fn((entries: Record<string, unknown>) => {
+            Object.assign(store, entries);
+            return Promise.resolve();
+          }),
+        },
+        local: {
+          get: vi.fn(),
+          set: vi.fn(),
+        },
+      },
+    };
+
+    const first = await loadOrCreateBrowserSessionStartMs();
+    vi.setSystemTime(new Date('2026-05-08T11:00:00.000Z'));
+    const second = await loadOrCreateBrowserSessionStartMs();
+
+    expect(first).toBe(Date.parse('2026-05-08T10:00:00.000Z'));
+    expect(second).toBe(first);
   });
 });
