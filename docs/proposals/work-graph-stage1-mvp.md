@@ -52,10 +52,101 @@ of this plan.
 Inferred edges render with a dashed CSS stroke (`stroke-dasharray: 4 2`). Enforced in
 the renderer, not by content, so it cannot be bypassed.
 
+**Compatibility with old snapshots.** Pre-Stage-1 snapshots in
+`_BAC/connections/current.json` carry the legacy enum `'explicit' | 'deterministic'`.
+These are NOT mutated on disk. A reader-side normalizer is the migration:
+
+```ts
+const normalizeConfidence = (raw: string): 'asserted' | 'observed' | 'inferred' => {
+  switch (raw) {
+    case 'asserted':
+    case 'observed':
+    case 'inferred':
+      return raw;
+    case 'explicit':
+      return 'asserted';   // user-asserted facts mapped to the new "user said so"
+    case 'deterministic':
+      return 'observed';   // event-derived non-inferential mapped to "directly captured"
+    default:
+      return 'observed';   // safe default for forward-compat with future producers
+  }
+};
+```
+
+Applied at three boundaries:
+
+1. **Side-panel reader** (`ConnectionsView.tsx`) — every `edge.confidence` read passes
+   through `normalizeConfidence` before CSS class selection.
+2. **MCP `connections.snapshot.read` response** — the JSON-schema for `confidence` is
+   a union of old + new values with the old marked as `deprecated`. The server emits
+   the new enum directly when it built the snapshot itself; it normalizes on read
+   when the snapshot pre-dates Stage 1.
+3. **Reducer rebuild** — when the connections materializer re-runs over the merged
+   event log, it writes the new enum directly. The next snapshot supersedes the old.
+   No event-log mutation; just a derived-cache rebuild.
+
+Test fixture: a `_BAC/connections/legacy.json` checked in under
+`packages/sidetrack-companion/src/connections/__fixtures__/`. The snapshot test loads
+it through the reader, asserts the side panel renders correctly without crashing on
+the old enum, and asserts the MCP response validates against the new schema.
+
 **Lock 2 — `payloadVersion` + `dimensions` extension slot.** Every Class F event and
 every replayable Class B/D/E artifact has `payloadVersion: number` (monotone) and
 `dimensions: Record<string, unknown>` (open extension). New behavior fields are
 *added through `dimensions`*, never via positional schema mutation.
+
+**Dimensions safety (cannot become a raw-content / PII side channel).** The open
+extension slot is bounded at three layers:
+
+1. **Hard size cap.** `JSON.stringify(dimensions)` MUST be ≤ 4 KB at the producer.
+   The runtime predicate
+   (`isBrowserTimelineObservedPayload`, `isSelectionCopiedPayload`, etc.) rejects any
+   payload that exceeds the cap; the event spool drops the over-cap event, increments
+   a `storage.dimensions.oversize` counter, and records the offending event-type +
+   producer in the storage health surface.
+2. **Allowed-dimension manifest per event family.** Each `ContractEntry` declares an
+   `allowedDimensions: readonly string[]` whitelist. Unknown keys are stripped at
+   ingest (HTTP route + `importPeerEvent` + relay subscriber path all share one
+   `sanitizeDimensions(payload, entry.allowedDimensions)` helper). Stripped keys are
+   not relayed; replicas converge on the whitelisted shape.
+3. **Redaction at ingest.** Before `sanitizeDimensions` runs, every string value in
+   `dimensions` is checked against three regex patterns:
+   - email: `/[^\s@]+@[^\s@]+\.[^\s@]+/`
+   - long token: `/[A-Za-z0-9_\-]{40,}/` (catches API keys, JWTs, OAuth tokens)
+   - card-like: `/\b(?:\d[ -]?){13,16}\b`
+   When matched, the value is replaced with `'[redacted]'` and a sibling list
+   `dimensions._redacted: ['<key>', ...]` records which keys were touched. The
+   redaction list itself is whitelisted in every `allowedDimensions`.
+
+**Per-family preserve / drop policy:**
+
+| Event family | Preserves dimensions? | Notes |
+|---|---|---|
+| `browser.timeline.observed` | YES | `engagement`, `provenance` keys whitelisted |
+| `engagement.interval.observed` | YES | dimension is the entire payload contract |
+| `engagement.session.aggregated` | YES | aggregate dimensions from raw stream |
+| `selection.copied` | YES | hash-only schema; rawText forbidden via redaction |
+| `selection.pasted` | YES | hash-only schema |
+| `navigation.committed` | YES | `transitionType`, `transitionQualifiers`, `provenance` |
+| `privacy.gate.flipped` | NO (drop on ingest) | gate state must not carry side data |
+| `privacy.permission.granted` | NO | permission scope only, no extension |
+| `privacy.permission.revoked` | NO | same |
+| `workstream.upserted` | NO | canonical user fact; fixed schema |
+| `thread.upserted` | NO | canonical; fixed schema |
+| `dispatch.recorded` | NO (already extended by Phase 4 fixed fields) | |
+| `annotation.created` | NO | canonical user fact |
+| `queue.created` / `.status_set` | NO | fixed schema |
+| `capture.recorded` | NO | recall pipeline owns its own per-turn schema |
+
+The "NO" rows have `allowedDimensions: []` in their registry entry; the sanitizer
+returns `dimensions: undefined` for those events, so they ferry through the relay
+without any `dimensions` field at all.
+
+**Replay safety.** When a reducer reads an event with a `dimensions.<key>` that the
+current code doesn't recognize (e.g., a future Stage-2 producer's events on a
+Stage-1 reducer), it treats it as `undefined` — never throws, never short-circuits
+the event. The `allowedDimensions` whitelist is the registry-level policy; reducers
+are forgiving readers.
 
 **Lock 3 — `producedBy` provenance on every Class B edge eligible to be derived.**
 Every derived edge records
@@ -68,6 +159,58 @@ timeline, not flags in a settings store. The events are `privacy.gate.flipped`,
 the event stream so revoking on Replica α propagates to β through Sync Contract
 Class A delivery, including retroactive masking of any derived artifact whose
 `inputs[]` reference a now-forbidden source.
+
+**Conflict resolution under offline divergence.** Two replicas may flip the same
+gate while offline. When their event logs merge:
+
+- Last-write-wins by `(observedAt, replicaId)` — higher `observedAt` wins; ties
+  resolved by lexicographically lower `replicaId`. Both replicas, replaying the
+  same merged log, converge on the same final state.
+- The projection function over the gate-event stream is a pure reducer. No
+  coordination service is required.
+- For monitoring, the projection emits a `privacy.gate.conflicts: number` health
+  metric counting LWW-resolved-against events; a UI affordance can warn the user
+  when their explicit revoke was overridden by a later open from another replica.
+
+**What gates block:**
+
+- **Edge observation (extension side).** The content script and event listeners
+  consult the gate's projected state at observation time. `closed` ⇒ no new
+  events emitted to the spool. This is the cheapest and most consistent block.
+  Gate-projection state lives in `chrome.storage.local` as a fast-path cache
+  hydrated from the projection on SW boot + `runtime.onMessage` notifications
+  when the projection updates.
+- **Companion materialization (companion side).** Materializers respect the gate
+  timeline at projection time. Observations whose `observedAt` falls in a window
+  when the gate was `closed` are EXCLUDED from derived caches. This catches both
+  events that slipped through (e.g., observation block fired late) and events
+  that arrived from a peer replica (the peer's local block was off when ours was
+  on, but our projection still masks).
+- **Both, with different scopes.** Observation block prevents NEW data within the
+  current replica. Materialization block hides EXISTING data within a window
+  across all replicas.
+
+**Retroactive masking is derived-view masking, not destructive event deletion.**
+
+- Old events stay in the event log (Class C audit + Class F observed). They are
+  immutable.
+- The reducer projection respects the gate timeline and excludes events whose
+  `observedAt` falls in a `closed` window from derived caches.
+- If the user later flips back to `open`, those events become visible again in the
+  derived caches. That's the correct semantics for "mask, not delete."
+- HARD deletion would be a separate `privacy.event.tombstoned` event type (out of
+  scope for Stage 1; flagged for a future privacy follow-up).
+
+**Cross-replica privacy revoke e2e (1.K-A).** The e2e suite asserts the round-trip:
+
+1. Browser A flips `privacy.gate.flipped({ gate: 'engagement', state: 'closed' })`.
+2. Relay carries the event to Browser B within the Class B freshness budget (30 s).
+3. Browser B's projection masks engagement-class artifacts in any window post-flip.
+4. Browser B's side panel re-renders with the new mask applied.
+5. Browser A flips back to `open`; Browser B sees masked engagement artifacts
+   become visible again.
+6. The e2e asserts: same merged event log on both replicas → same projection →
+   same UI state.
 
 ## Stage 1 — Sub-sections
 
@@ -270,6 +413,72 @@ at the top of the service worker. No state lives in module globals between worke
 restarts; everything that must survive is in IndexedDB or `chrome.storage.local`.
 `chrome.alarms` (minimum 1-minute period) drives periodic flush of in-memory event
 batches that haven't yet hit the size threshold.
+
+**Backpressure & quota failure.**
+
+- `navigator.storage.estimate()` is polled every flush cycle. At ≥ 80 % of quota
+  the buffer emits `storage.quota.warning` (Class A health event); at ≥ 95 % it
+  switches into "drop-oldest" mode for the affected stream and emits
+  `storage.quota.exceeded`.
+- `IndexedDB.put` `QuotaExceededError` is caught: the failed transaction is
+  retried after evicting the oldest 10 % of records in the offending stream.
+  Persistent failure (3 retries) escalates to `storage.quota.fatal`, which
+  surfaces in side panel as a non-dismissable banner: "Sidetrack storage is full
+  — clear storage in Settings, or events will be dropped."
+- Drop-oldest is per-stream, never global, so a high-volume `engagement.interval.observed`
+  burst cannot starve `selection.copied` retention.
+
+**Per-stream retention.**
+
+| Stream | Rolling window | Reason |
+|---|---|---|
+| `navigation.committed` | 90 days | Causal spine; Stage-2 ranker needs history |
+| `engagement.interval.observed` | 30 days | High-volume; aggregates persist longer |
+| `engagement.session.aggregated` | indefinite | Already aggregated; ~KB/session |
+| `selection.copied` / `selection.pasted` | 90 days | Low volume; load-bearing for lineage |
+| `privacy.gate.flipped` / `permission.*` | indefinite | Privacy timeline must be replayable |
+| `storage.*` (health / quota events) | 30 days | Operational noise |
+
+A daily `chrome.alarms` job evicts records older than the per-stream window. Eviction
+is cursor-based (`getAllRecords` with key range below the cutoff lamport) and is
+batched ≤ 1 000 records / transaction.
+
+**Health surface.**
+
+- `storage.health` is a Class B projection over `storage.*` events + a live snapshot:
+  per-stream record count, oldest record age, latest flush lag, last error code,
+  current quota %.
+- Side panel exposes a "Storage" diagnostic section (under Settings → Diagnostics)
+  rendering the projection.
+- MCP tool `sidetrack.system.storageHealth()` returns the same projection for
+  programmatic access.
+
+**Week-offline behavior (companion unreachable for 7 days).**
+
+- The buffer fills toward retention caps with the user's normal browsing volume.
+  At default budgets, 7 days of typical browsing fits comfortably under the 30-day
+  engagement-interval cap and 90-day causal-spine cap.
+- Cross-replica sync via the relay continues to work for events that haven't been
+  GCed — the relay does not depend on companion reachability.
+- On reconnect, the flush-scheduler drains accumulated events in batches of ≤ 100.
+  At 10 events/s typical, a week's backlog drains in minutes.
+- If the buffer hits drop-oldest during the offline window, dropped events are
+  permanently lost from this replica (peer replicas may still have them via the
+  relay; cross-replica re-import on reconnect is the recovery path).
+
+**IndexedDB schema versioning + migration.**
+
+- Object-store keys carry a version prefix: `<streamName>:v<n>:<lamport>:<replicaId>`.
+- An additional `_schema` object store records `{ streamName: string, version: number,
+  schemaHash: string, migratedAt: number }` per stream.
+- On every SW boot, a migration step compares each stream's stored version against
+  the `CURRENT_STORE_VERSION` constant for that stream. If older, a registered
+  migration function runs (forward-only; each migration is `(oldRecord) => newRecord`
+  applied via cursor).
+- Migration tests boot a synthetic IDB at `v1`, run the `v1 → v2` migration, and
+  assert: every old record is readable in the new shape, no data loss, schema-store
+  reflects the new version.
+- Migration is idempotent: re-running over an already-migrated store is a no-op.
 
 ### 1.G Engagement classification — deterministic ruleset, no learned model
 
@@ -673,17 +882,38 @@ Stage 1 must not duplicate or wrap these production components.
   with the user's own API key, additively, without touching the deterministic
   surfaces).
 
+## Implementation PR shape
+
+This planning doc lands in **PR #99 as plan-only**. Once reviewers approve the plan,
+PR #99 is **merged with one commit** (the planning doc on `feat/work-graph-mvp`).
+
+**Wave A and beyond ship in a separate, fresh PR** off `main` after PR #99 merges.
+Reasons:
+
+- Clean planning history. PR #99 is a doc; the next PR is code. Reviewers can
+  re-load context cheaply.
+- Bisect cleanliness. A code-only PR has commit-by-commit `git bisect run` value.
+- Faster Codex onboarding. Codex worktrees fork from a stable base (the merged
+  plan), not from a moving plan-and-code branch.
+
+**Each subtask lands as an independent commit** on the implementation PR. No
+subtask squashes another's commits. The PR title for the implementation PR will
+be something like `Stage 1 MVP — work graph (Wave A: locks + storage)`, with
+follow-up PRs per wave if the implementation PR grows beyond ~3 000 lines.
+
+If the lead's review on a Codex-delivered subtask uncovers a small fix, the fix
+lands as a *new* commit on the same branch, not by amending the Codex commit.
+
 ## Work split — major tasks vs Codex subtasks
 
-This PR is large by line count but the work cleanly partitions. The lead (Claude
-Code, this session) holds **planning, integration, cross-cutting design, e2e spec
-authorship, and PR-body writing**. Codex handles **deterministic, well-scoped code
-additions** in parallel batches.
+The lead (Claude Code, this session) holds **planning, integration, cross-cutting
+design, e2e spec authorship, PR-body writing, and review**. Codex handles
+**deterministic, well-scoped code additions** in parallel batches.
 
-The pattern: lead authors a self-contained subtask brief (file paths + interfaces +
+Pattern: lead authors a self-contained subtask brief (file paths + interfaces +
 test requirements + acceptance criteria); user spins Codex with that brief; Codex
-delivers; lead integrates and reviews. Multiple subtasks run in parallel when their
-dependencies allow.
+delivers; lead integrates and reviews. Multiple subtasks run in parallel when
+their dependencies allow.
 
 ### Subtask dependency graph
 
@@ -788,110 +1018,595 @@ spins Codex; user notifies lead on completion; lead integrates.
 - Acceptance: 10 k-event drive-test passes; in-memory adapter passes the same
   contract tests as the IndexedDB adapter.
 
+### Wave B — depends on Wave A
+
 **S6 — webNavigation listeners + canonical URL + FNV-1a** (1.B).
-- Files: `packages/sidetrack-extension/src/background/listeners/web-navigation.ts`,
-  `packages/sidetrack-extension/src/background/listeners/tabs.ts`,
-  `packages/sidetrack-extension/src/graph/canonical-url.ts`,
-  `packages/sidetrack-extension/src/graph/fnv1a.ts`,
-  `packages/sidetrack-extension/wxt.config.ts` (manifest add `webNavigation`).
-- Wire `chrome.webNavigation.onCommitted` → `navigation.committed` Class F event.
-- `tabs.onCreated` opener resolution with explicit `null` fallback when opener gone.
-- FNV-1a 32-bit for `tabSessionIdHash` / `windowSessionIdHash`.
-- Canonical URL normalizer (utm / fbclid / gclid / srsltid / lowercase host /
-  default port / fragment drop).
-- Acceptance: causal-spine scenario in 1.K passes against this listener stack.
+
+*Worktree branch:* `codex/stage1-s6-webnavigation` off `feat/work-graph-mvp` (after Wave A merges).
+
+*Depends on:* S2 (`payloadVersion` + `dimensions`), S5 (IDB buffer for the new event stream).
+
+*Files (NEW unless noted):*
+- `packages/sidetrack-extension/src/background/listeners/web-navigation.ts`
+- `packages/sidetrack-extension/src/background/listeners/tabs.ts`
+- `packages/sidetrack-extension/src/graph/canonical-url.ts`
+- `packages/sidetrack-extension/src/graph/fnv1a.ts`
+- `packages/sidetrack-extension/src/graph/canonical-url.test.ts`
+- `packages/sidetrack-extension/src/graph/fnv1a.test.ts`
+- `packages/sidetrack-extension/wxt.config.ts` (modify — add `webNavigation` to permissions)
+- `packages/sidetrack-extension/entrypoints/background.ts` (modify — register listeners at top level)
+- `packages/sidetrack-companion/src/sync/contract/registry.ts` (modify — register `navigation.committed` event type with `currentPayloadVersion: 1`, `allowedDimensions: ['provenance']`)
+
+*Schemas:*
+
+```ts
+// navigation.committed event type
+type NavigationCommittedPayload = {
+  payloadVersion: 1;
+  visitId: string;                              // canonicalUrl + commitTimestamp + replicaId
+  url: string;
+  canonicalUrl: string;
+  documentId: string;
+  parentDocumentId: string | null;
+  tabSessionIdHash: string;                     // FNV-1a-32 of (tabId, browserSessionStart), salted
+  windowSessionIdHash: string;                  // FNV-1a-32 of (windowId, browserSessionStart), salted
+  openerVisitId: string | null;                 // null when openerTabId absent or opener gone
+  previousVisitId: string | null;               // last visit on same tabSessionIdHash
+  navigationSequence: number;                   // monotone within tabSessionIdHash
+  transitionType: TransitionType;
+  transitionQualifiers: TransitionQualifier[];
+  commitTimestamp: number;
+  dimensions?: { provenance?: Record<string, unknown> };
+};
+```
+
+*Change shape:*
+- Wire `chrome.webNavigation.onCommitted` (top-frame only — filter `details.frameId === 0`).
+- Wire `chrome.tabs.onCreated` to capture `openerTabId` synchronously; maintain a SW
+  in-memory `tabId → lastVisitId` cache hydrated lazily from the IDB stream on SW
+  boot (the cache is a fast path, IDB is the source of truth).
+- Resolve opener: when present, look up the opener's most recent
+  `navigation.committed` for the matching tab; emit `openerVisitId`. When opener is
+  absent or the tab is gone, emit `null` and rely on `previousVisitId` along the
+  same `tabSessionIdHash`.
+- Canonical URL normalizer strips: `utm_*`, `fbclid`, `gclid`, `srsltid`, `mc_cid`,
+  `mc_eid`, `_ga`, `_gid`. Lowercases scheme + host. Removes default port (`:80`,
+  `:443`). Drops fragment.
+- FNV-1a 32-bit hash function. Salted with the existing `edgeReplicaId` so peers
+  can't collide-spoof. Pure function; no global state.
+- All listeners register at the top level of the SW module per MV3 discipline.
+
+*Tests required:*
+- `canonical-url.test.ts` — 30+ canonical-URL pairs covering each tracking-param,
+  case-folding, port-stripping, fragment-dropping rule.
+- `fnv1a.test.ts` — known-vector tests; collision check across 10 k synthetic inputs.
+- `web-navigation.test.ts` — fixture-based test with simulated webNavigation events;
+  asserts `openerVisitId` is `null` when opener was force-closed before the new tab
+  emits its first navigation.
+- `tabs.test.ts` — `onCreated` opener resolution; closed-opener fallback.
+
+*Acceptance:*
+- `vitest run` green; `wxt build` clean.
+- Manifest declares `"webNavigation"` (verified by `cat .output/chrome-mv3/manifest.json`).
+- `navigation.committed` events flow into the IDB buffer (S5) within 100 ms of
+  `onCommitted` firing.
+- Causal-spine e2e scenario (1.K-1) passes against this listener stack: address-bar
+  type → `transitionType: 'typed'`; click link → `openerVisitId` populated; force-
+  close opener → `openerVisitId: null`, `previousVisitId` populated.
+
+---
 
 **S7 — Engagement content script (1.A) + dynamic registration**.
-- Files: `packages/sidetrack-extension/src/content/engagement/{visibility,scroll}.ts`,
-  `packages/sidetrack-extension/src/content/inject.ts`, runtime-message handler.
-- Counts + durations only; no event payloads, no clipboard polling.
-- Periodic 30 s sub-emit + final emit on `visibilitychange` / `pagehide` /
-  `beforeunload`.
-- SW per-tab cache with `chrome.tabs.onRemoved` derivation for crash-safety.
-- Dynamic registration via `chrome.scripting.registerContentScripts` gated on
-  privacy projection (depends on S4).
-- Acceptance: engagement-classification scenario in 1.K passes; privacy-revocation
-  scenario passes.
 
-**S8 — Copy/paste content script + simhash + 24h matching** (1.H).
-- Files: `packages/sidetrack-extension/src/content/engagement/copy-paste.ts`,
-  `packages/sidetrack-extension/src/graph/simhash64.ts`,
-  `packages/sidetrack-companion/src/snippets/{events,projection}.ts` (NEW).
-- `selection.copied` / `selection.pasted` event types per § 1.H.
-- SHA-256 selectionHash; 64-bit SimHash; selection normalization (whitespace
-  collapse, chrome strip, timestamp drop).
-- Reducer: 24-hour window, exact hash match OR Hamming-≤3 simhash match.
-- Edge emission: `snippet_copied_from_visit`, `snippet_pasted_into_*`,
-  `snippet_reused_across_threads`.
-- Acceptance: snippet-lineage scenario in 1.K passes; raw text never appears in
-  persisted record (`grep` assertion).
+*Worktree branch:* `codex/stage1-s7-engagement-script`.
+
+*Depends on:* S2 (dimensions slot), S4 (privacy projection — gate state lookup),
+S5 (IDB buffer for `engagement.interval.observed`).
+
+*Files (NEW unless noted):*
+- `packages/sidetrack-extension/src/content/engagement/visibility.ts`
+- `packages/sidetrack-extension/src/content/engagement/scroll.ts`
+- `packages/sidetrack-extension/src/content/engagement/aggregator.ts`
+- `packages/sidetrack-extension/src/content/inject.ts` (NEW or modify if exists)
+- `packages/sidetrack-extension/entrypoints/engagement.ts` (NEW — content script entry)
+- `packages/sidetrack-extension/entrypoints/background.ts` (modify — `chrome.scripting.registerContentScripts` gated on privacy projection + `chrome.runtime.onMessage` handler for engagement-summary postbacks)
+- `packages/sidetrack-extension/src/background/state/engagementCache.ts` (NEW — per-tab running totals, crash-safe)
+- `packages/sidetrack-companion/src/sync/contract/registry.ts` (modify — register `engagement.interval.observed` and `engagement.session.aggregated` with `allowedDimensions: ['engagement']`)
+
+*Schemas:*
+
+```ts
+type EngagementIntervalObservedPayload = {
+  payloadVersion: 1;
+  visitId: string;                          // links to navigation.committed
+  intervalStart: number;
+  intervalEnd: number;
+  dimensions: {
+    engagement: {
+      activeMs: number;
+      visibleMs: number;
+      focusedWindowMs: number;
+      idleMs: number;
+      foregroundBursts: number;
+      returnCount: number;
+      scrollEvents: number;
+      maxScrollRatio: number;               // 0..1, monotonically non-decreasing within visit
+      copyCount: number;
+      pasteCount: number;
+    };
+  };
+};
+
+type EngagementSessionAggregatedPayload = {
+  payloadVersion: 1;
+  visitId: string;
+  sessionId: string;                        // browserSessionStart hash
+  dimensions: {
+    engagement: EngagementIntervalObservedPayload['dimensions']['engagement'];
+  };
+};
+```
+
+*Change shape:*
+- Content script registers dynamically via `chrome.scripting.registerContentScripts`
+  ONLY when both: privacy projection has `engagement` gate `'open'` AND host
+  permission has been granted. SW reads the privacy projection on boot + subscribes
+  to `chrome.runtime.onMessage` for `'sidetrack.privacy.gateChanged'` events to
+  re-register / unregister.
+- Content script captures counts + durations only. Listeners:
+  - `document.addEventListener('visibilitychange', ...)` for visible / hidden flips.
+  - `window.addEventListener('focus' / 'blur', ...)` for window-focus changes.
+  - `document.addEventListener('scroll', throttled1Hz, { passive: true })` for
+    scrollEvents counter + maxScrollRatio computation.
+  - `chrome.idle.onStateChanged` (extension-side) for idle-threshold gating.
+  - `document.addEventListener('copy' / 'paste', ...)` for copyCount / pasteCount
+    (S8 will extend this listener; for S7, just maintain the count).
+- Periodic 30 s sub-emit: `chrome.runtime.sendMessage` carries the running totals
+  to the SW; SW merges into `engagementCache[tabId]`.
+- Final emit on `visibilitychange` (hidden) / `pagehide` / `beforeunload`: same
+  shape; SW marks the interval as final.
+- SW per-tab cache survives content-script crashes: when `chrome.tabs.onRemoved`
+  fires, SW emits the cached totals as the final
+  `engagement.interval.observed`.
+
+*Tests required:*
+- `aggregator.test.ts` — pure-function tests for the running-totals merge.
+- `engagementCache.test.ts` — SW-side cache survives simulated crashes.
+- Integration test that drives a JSDOM-mocked content script through visibility +
+  scroll + copy events and asserts the emitted payload shape.
+
+*Acceptance:*
+- `vitest run` green; `wxt build` clean.
+- Privacy posture grep passes:
+  `grep -rn 'event.key\|event.target.value\|getRangeAt\|clipboard.readText' packages/sidetrack-extension/entrypoints/engagement.ts` returns 0 matches.
+- Engagement-classification e2e scenario (1.K-2) passes: 3 pages with distinct
+  engagement profiles produce distinct `engagement.session.aggregated` records
+  with the expected counter values.
+- Privacy-revocation scenario (1.K-5) passes: gate flip to `closed` causes
+  `chrome.scripting.unregisterContentScripts` to fire; no further engagement events
+  are emitted.
+
+---
+
+**S8 — Copy/paste content script + simhash + 24-hour matching** (1.H).
+
+*Worktree branch:* `codex/stage1-s8-copy-paste-lineage`.
+
+*Depends on:* S2, S4, S5, S7 (extends the same content script — engagement registers
+the listener; S8 extends with hashing + emit).
+
+*Files (NEW unless noted):*
+- `packages/sidetrack-extension/src/content/engagement/copy-paste.ts` (NEW)
+- `packages/sidetrack-extension/src/graph/simhash64.ts` (NEW)
+- `packages/sidetrack-extension/src/graph/simhash64.test.ts`
+- `packages/sidetrack-extension/src/graph/normalize-selection.ts` (NEW — whitespace collapse, header/footer strip, timestamp drop)
+- `packages/sidetrack-companion/src/snippets/events.ts` (NEW)
+- `packages/sidetrack-companion/src/snippets/projection.ts` (NEW)
+- `packages/sidetrack-companion/src/snippets/projection.test.ts`
+- `packages/sidetrack-companion/src/sync/contract/registry.ts` (modify — register `selection.copied` / `selection.pasted` with `allowedDimensions: []` and explicit `rawTextStored: false` redaction in the predicate)
+- `packages/sidetrack-companion/src/connections/types.ts` (modify — add `'snippet'` `ConnectionNodeKind`)
+- `packages/sidetrack-companion/src/connections/snapshot.ts` (modify — Pass 10 emits snippet edges from snippets projection)
+
+*Schemas:*
+
+```ts
+type SelectionCopiedPayload = {
+  payloadVersion: 1;
+  visitId: string;
+  selectionHash: string;                    // SHA-256 of normalized text
+  simhash64: string;                        // base64 of 64-bit SimHash
+  charCount: number;
+  lineCount: number;
+  contentKindHint: 'code-block' | 'prose' | 'url' | 'mixed';
+  rawTextStored: false;                     // contract assertion; predicate rejects true
+};
+
+type SelectionPastedPayload = {
+  payloadVersion: 1;
+  destinationKind: 'thread' | 'dispatch' | 'search' | 'note' | 'capture';
+  destinationId: string;
+  selectionHash: string;
+  simhash64: string;
+  charCount: number;
+  rawTextStored: false;
+};
+```
+
+*Change shape:*
+- Content script extends the existing `copy` / `paste` listeners from S7 to capture
+  the selection text via `window.getSelection().toString()` (or
+  `event.clipboardData.getData('text/plain')` on paste). Hash IMMEDIATELY via
+  `crypto.subtle.digest('SHA-256', ...)`; never assign the raw text to a variable
+  whose lifetime exceeds the local synchronous block.
+- Normalize selection before hashing: collapse whitespace, drop heuristic UI chrome
+  (regex `^[A-Za-z\s]+\n=+\n` for markdown headers, `^\s*(?:#|\/\/|>)` line strips),
+  drop pure timestamp lines (`/^\s*\d{4}-\d{2}-\d{2}/`).
+- 64-bit SimHash via the standard 128-token rolling-hash construction over the
+  normalized text. Pure function; deterministic; tested.
+- Companion-side `snippets/projection.ts`: pure reducer over merged event log.
+  For each `selection.pasted`, look back 24 hours for `selection.copied` events
+  with matching `selectionHash` (exact) OR `simhash64` Hamming-≤3. Emit a
+  `snippet` node + edges.
+- New connections-snapshot Pass 10 reads the snippets projection + emits:
+  `snippet_copied_from_visit` (`confidence: 'observed'`),
+  `snippet_pasted_into_<dest>` (`confidence: 'observed'`),
+  `snippet_reused_across_threads` (`confidence: 'inferred'`, when same `snippet_id`
+  appears in ≥ 2 thread destinations).
+
+*Tests required:*
+- `simhash64.test.ts` — known-vector tests; Hamming distance computation; 1 000-pair
+  paraphrase test asserting most pairs land in the < 5 Hamming band.
+- `normalize-selection.test.ts` — whitespace, header strip, timestamp drop, Unicode.
+- `snippets/projection.test.ts` — exact-hash match, fuzzy match within 24 h, no
+  match across 24-h window.
+- `connections/snapshot.test.ts` — Pass 10 emission with synthetic copy/paste fixtures.
+
+*Acceptance:*
+- `vitest run` green.
+- Privacy posture grep:
+  `grep -rn 'rawText\|\.toString()\|clipboardData' packages/sidetrack-extension/src/content/engagement/copy-paste.ts` shows that ALL string handling is followed by an immediate `crypto.subtle.digest` call within the same synchronous block.
+- `selection.copied` and `selection.pasted` predicates REJECT any payload with
+  `rawTextStored: true` (defense in depth).
+- Snippet-lineage e2e scenario (1.K-3) passes: copy from one visit → paste into
+  thread → connections snapshot has `snippet_copied_from_visit` +
+  `snippet_pasted_into_thread` edges.
+
+---
+
+### Wave C — depends on Wave B
 
 **S9 — `visit_resembles_visit` producer** (1.C).
-- Files: `packages/sidetrack-extension/src/graph/visit-resembles.ts`,
-  `packages/sidetrack-companion/src/producers/visit-resembles-revision.ts` (NEW),
-  unit tests.
-- Reuses existing recall embedder + binary recall index V3.
-- Top-K=50 candidates via existing hybrid retrieval; cosine ≥ 0.85 cutoff.
-- Class E revision artifact `visit-resembles:v1:cosine`.
-- Acceptance: topic-formation scenario in 1.K finds expected similarity edges; no
-  new vector store added (manifest grep).
+
+*Worktree branch:* `codex/stage1-s9-visit-resembles`.
+
+*Depends on:* S3 (`producedBy` union extension), S6 (`navigation.committed` events
+exist in the merged log).
+
+*Files (NEW unless noted):*
+- `packages/sidetrack-companion/src/connections/visitSimilarity.ts` (NEW)
+- `packages/sidetrack-companion/src/connections/visitSimilarity.test.ts`
+- `packages/sidetrack-companion/src/producers/visit-resembles-revision.ts` (NEW)
+- `packages/sidetrack-companion/src/sync/contract/connectionsMaterializer.ts` (modify — thread `embed` dep + revision-id manager; call `buildVisitSimilarity` before `buildConnectionsSnapshot`)
+- `packages/sidetrack-companion/src/connections/snapshot.ts` (modify — Pass 7 emits `visit_resembles_visit` from injected similarity input)
+
+*Reuse pointers (load-bearing — do NOT duplicate):*
+- `embed()` from `packages/sidetrack-companion/src/recall/embedder.ts`.
+- Binary recall index V3 at `_BAC/recall/index.bin`.
+- MiniSearch hybrid retrieval (already in production).
+
+*Change shape:*
+- `buildVisitSimilarity(entries, embed)` — pure function. Extracts a "visit corpus
+  string" of `<title> + <hostname> + <URL path tokens>` per visit. Embeds with the
+  `passage:` prefix discipline. Inserts into the recall index V3 with
+  `modelId: 'Xenova/multilingual-e5-small'`, the pinned HF revision, the chunk
+  schema version. **No new vector store; no new ANN library; no new embedding
+  model.**
+- For each visit `v`, retrieve top-K=50 candidates via the existing hybrid
+  retrieval. Among those, emit `visit_resembles_visit(v → u)` when cosine on the
+  `query:`-prefixed embedding of `v` vs the index entry for `u` exceeds `T_sim`
+  (default 0.85; exposed as a developer-build setting persisted in
+  `chrome.storage.local`).
+- Engagement gate: emit only when both endpoints have
+  `dimensions.engagement.focusedWindowMs > 5000` (drops noisy hover-and-leave).
+- Output: deterministically-sorted `{ fromVisitKey, toVisitKey, cosine }` triples.
+  Sort by `(fromVisitKey, toVisitKey)` lexically.
+- Persistence: Class E revision at `_BAC/connections/visit-similarity/<revisionId>.json`.
+  `revisionId = sha256(model fingerprint + feature schema version + sorted input visit
+  IDs).slice(0, 16)`. Old revisions GCed via the existing audit-retention pattern.
+- Pass 7 in `snapshot.ts`: emit `visit_resembles_visit` edges with
+  `confidence: 'inferred'`, `producedBy: { source: 'visit-similarity', revisionId }`,
+  `family: 'urlmatch'`.
+- Failure mode: if `embed()` throws (`RecallModelMissingError` etc.), the similarity
+  step no-ops; the snapshot still builds with every other edge intact. Materializer
+  health surfaces `lastError`.
+
+*Tests required:*
+- `visitSimilarity.test.ts` — deterministic ordering across re-runs of the same input;
+  threshold gate behavior (cosine just below / above 0.85); engagement gate
+  (focusedMs < 5000 → no edge).
+- Integration test in `connectionsMaterializer.test.ts` — embed dep injected as a
+  deterministic stub; full pipeline runs; snapshot has expected edges.
+
+*Acceptance:*
+- `vitest run` green.
+- No new vector store added: `git diff` of `package.json` adds zero new deps;
+  `grep -rn 'sqlite-vec\|hnswlib\|usearch\|faiss\|@xenova/bge\|nomic-embed' packages/`
+  returns 0 matches.
+- Topic-formation e2e scenario (1.K-3) finds expected similarity edges.
+
+---
 
 **S10 — Union-Find topic clusterer + `topic.lineage`** (1.D).
-- Files: `packages/sidetrack-extension/src/graph/union-find.ts`,
-  `packages/sidetrack-extension/src/graph/topic-id.ts`,
-  `packages/sidetrack-companion/src/producers/topic-revision.ts` (NEW), unit tests.
-- Path-compressed Union-Find.
-- Content-derived `topic_id = "topic:" + sha256(sorted_canonical_urls).slice(0,16)`.
-- User `in_thread` overrides cosine-only membership.
-- `topic.lineage` Class B edge on split/merge with `succeededBy` pointers.
-- Acceptance: topic-id reproduced byte-identically by independent replica given
-  the same membership.
+
+*Worktree branch:* `codex/stage1-s10-topic-clusterer`.
+
+*Depends on:* S9 (`visit_resembles_visit` edges + similarity revision exist).
+
+*Files (NEW unless noted):*
+- `packages/sidetrack-companion/src/connections/topicClusterer.ts` (NEW)
+- `packages/sidetrack-companion/src/connections/topicClusterer.test.ts`
+- `packages/sidetrack-companion/src/connections/unionFind.ts` (NEW — path-compressed disjoint-set)
+- `packages/sidetrack-companion/src/connections/unionFind.test.ts`
+- `packages/sidetrack-companion/src/connections/topicId.ts` (NEW — content-derived id)
+- `packages/sidetrack-companion/src/producers/topic-revision.ts` (NEW)
+- `packages/sidetrack-companion/src/connections/types.ts` (modify — add `'topic'` `ConnectionNodeKind`, `'visit_in_topic'`, `'topic_in_workstream'`, `'topic.lineage'` edge kinds)
+- `packages/sidetrack-companion/src/connections/snapshot.ts` (modify — Pass 8)
+- `packages/sidetrack-extension/src/sidepanel/connections/edgeKinds.ts` (modify — register new kinds + 8th paper-warm tint)
+
+*Change shape:*
+- Path-compressed Union-Find with rank heuristic. O(α(n)) per union; deterministic
+  iteration order over `add` insertions.
+- `topicId(members) = "topic:" + sha256(members.sort().join("\n")).slice(0, 16)` —
+  members sorted by canonical URL ascending. Two replicas with the same membership
+  produce the same id.
+- User-asserted edges (`in_thread`, `in_workstream` if present) override
+  cosine-only membership: `uf.union(v, u)` runs for those FIRST, then for cosine
+  edges. User-asserted always wins.
+- `topic.lineage` edge: when a component splits (one visit removed, two former
+  components remain) or merges (a new edge bridges two clusters), emit
+  `topic.lineage(oldTopicId → newTopicId, kind: 'split' | 'merge')` in the
+  `contain` family with `confidence: 'observed'`. The old topic id stays
+  addressable via this edge (tombstone with `succeededBy` pointer).
+- Topic node metadata:
+  - `memberCount: number`
+  - `dominantWorkstreamId?: string` (argmax workstream by member count)
+  - `representativeTitles: readonly string[]` (top-N by `focusedWindowMs`, capped 5)
+  - `firstObservedAt: string`, `lastObservedAt: string`
+  - `cohesion: number` (mean cosine over edges within the component, 0..1)
+- Pass 8 in `snapshot.ts`: emit `topic` nodes (singleton clusters of 1 visit are
+  skipped — noise), `visit_in_topic` edges (`confidence: 'inferred'`,
+  `producedBy: { source: 'topic-clusterer', revisionId }`), and
+  `topic_in_workstream` (when ≥ 75 % of members share a `workstreamId`).
+- Persistence: Class E revision at `_BAC/connections/topics/<revisionId>.json`.
+
+*Tests required:*
+- `unionFind.test.ts` — classic disjoint-set tests; deterministic iteration.
+- `topicId.test.ts` — same membership → same id (byte-identical across two
+  independent runs with different input order).
+- `topicClusterer.test.ts` — cosine threshold; user-asserted override; split/merge
+  produces `topic.lineage`; cohesion metric correctness.
+
+*Acceptance:*
+- `vitest run` green.
+- `topic_id` byte-identically reproduced by an independent replica given the
+  same membership (cross-replica determinism test).
+- Topic-formation e2e scenario (1.K-3) shows topic node with expected
+  representative titles.
+
+---
 
 **S11 — `visit_observed_on_replica` producer** (1.E).
-- Files: `packages/sidetrack-companion/src/materializers/cross-replica.ts` (NEW),
-  unit tests.
-- Pure reducer over merged event log: same canonical URL on multiple replicas →
-  evidence edge with `confidence: 'observed'`.
-- Acceptance: cross-replica scenario in 1.K passes.
+
+*Worktree branch:* `codex/stage1-s11-cross-replica-evidence`.
+
+*Depends on:* S6 (`navigation.committed` events exist on multiple replicas).
+
+*Files (NEW unless noted):*
+- `packages/sidetrack-companion/src/materializers/cross-replica.ts` (NEW)
+- `packages/sidetrack-companion/src/materializers/cross-replica.test.ts`
+- `packages/sidetrack-companion/src/connections/snapshot.ts` (modify — Pass 9)
+- `packages/sidetrack-companion/src/connections/types.ts` (modify — add `'visit_observed_on_replica'` edge kind)
+
+*Change shape:*
+- Pure reducer over the merged event log. For each pair of `navigation.committed`
+  events with the same `canonicalUrl` and DIFFERENT `dot.replicaId`, emit
+  `visit_observed_on_replica(visit_a, replicaId_b)` with `confidence: 'observed'`,
+  `producedBy: { source: 'cross-replica' }` (no revisionId; deterministic Class B
+  evidence — every replica with the same merged log produces the same edge).
+- Family: `urlmatch` (content match, not navigation).
+- Emit ONE edge per `(visit, replicaId)` pair, even if the same replica observed
+  the URL at multiple times — first-observed-at wins for the edge timestamp.
+- Pass 9 in `snapshot.ts`.
+
+*Tests required:*
+- `cross-replica.test.ts` — multi-replica fixture: 2 replicas observe the same
+  canonicalUrl; assert exactly one edge per `(visit, replicaId)` pair, with
+  `confidence: 'observed'` and `producedBy.source: 'cross-replica'`.
+
+*Acceptance:*
+- Cross-replica e2e scenario (1.K-4) passes: simulate a second replica observing
+  the same canonical URL via the relay; assert `visit_observed_on_replica` is
+  emitted; Flow Path renders a dashed cross-replica edge.
+
+---
 
 **S12 — Engagement classifier ruleset** (1.G).
-- Files: `packages/sidetrack-extension/src/graph/engagement-class.ts`,
-  `packages/sidetrack-companion/src/producers/engagement-class-revision.ts` (NEW),
-  unit tests.
-- Pure reducer per § 1.G rule table.
-- Class E revision `engagement-class:v1:rules`.
-- Acceptance: 7-class boundary tests pass; revision id stable.
+
+*Worktree branch:* `codex/stage1-s12-engagement-classifier`.
+
+*Depends on:* S7 (engagement events), S8 (lineage matches for `source_extracted`
+and `execution_source`).
+
+*Files (NEW unless noted):*
+- `packages/sidetrack-companion/src/connections/engagementClassifier.ts` (NEW)
+- `packages/sidetrack-companion/src/connections/engagementClassifier.test.ts`
+- `packages/sidetrack-companion/src/producers/engagement-class-revision.ts` (NEW)
+- `packages/sidetrack-companion/src/sync/contract/connectionsMaterializer.ts` (modify — thread classifier into the pipeline)
+- `packages/sidetrack-companion/src/connections/snapshot.ts` (modify — emit
+  `engagement.class` on `timeline-visit` node metadata)
+
+*Change shape:*
+- Pure deterministic reducer per the 7-class table in § 1.G. Input: an
+  `engagement.session.aggregated` payload + the snippets projection (for
+  `source_extracted` / `execution_source`).
+- Output: a Class E revision keyed `engagement-class:v1:rules`.
+  `revisionId = sha256('engagement-class:v1:rules' + sorted-rule-table-hash).slice(0, 16)`.
+  The rule table is the source of truth; the revision id changes only when the
+  rules change.
+- Visit nodes get `metadata.engagement.class = '...'` from the active revision.
+  Side panel "Focus View" tab groups by class.
+- Future learned classifier ships under `engagement-class:v2:learned` with
+  matching `revisionId` discipline; consumers pin which producer's output they
+  surface.
+
+*Tests required:*
+- `engagementClassifier.test.ts` — 7-class boundary tests (one fixture per class
+  + one fixture that just-misses each boundary); revision-id stability across
+  runs.
+
+*Acceptance:*
+- `vitest run` green.
+- Engagement-classification e2e scenario (1.K-2) passes: 3 pages with distinct
+  engagement profiles produce the expected `parked_background`, `skimmed`,
+  `engaged_read` classes.
+
+---
+
+### Wave D — depends on Wave C
 
 **S13 — Deterministic templates** (1.I).
-- Files: `packages/sidetrack-extension/src/ui/why-related/{reasons.ts,sort.ts}`
-  (NEW), `packages/sidetrack-extension/src/ui/context-pack/compose.ts` (NEW),
-  topic-label helper, unit tests.
-- `Reason` union per § 1.I; fixed-priority sort.
-- Topic-label = top member by `focusedWindowMs`.
-- Context Pack = pure Markdown reducer; "Open Questions" extracted only.
-- Acceptance: byte-deterministic outputs on the same inputs (run-to-run); no
-  network calls.
+
+*Worktree branch:* `codex/stage1-s13-deterministic-templates`.
+
+*Depends on:* S10 (topic nodes), S11 (cross-replica edges), S12 (engagement classes).
+
+*Files (NEW unless noted):*
+- `packages/sidetrack-extension/src/sidepanel/connections/why-related/reasons.ts` (NEW — Reason union per § 1.I)
+- `packages/sidetrack-extension/src/sidepanel/connections/why-related/sort.ts` (NEW — fixed reason-code priority)
+- `packages/sidetrack-extension/src/sidepanel/connections/why-related/render.ts` (NEW — pure switch over `Reason.code`)
+- `packages/sidetrack-extension/src/sidepanel/connections/why-related/render.test.ts`
+- `packages/sidetrack-extension/src/sidepanel/connections/topicLabel.ts` (NEW — pure function)
+- `packages/sidetrack-extension/src/sidepanel/connections/topicLabel.test.ts`
+- `packages/sidetrack-extension/src/sidepanel/connections/contextPack.ts` (NEW — pure Markdown reducer)
+- `packages/sidetrack-extension/src/sidepanel/connections/contextPack.test.ts`
+
+*Change shape:*
+- `Reason` union type per § 1.I (12 codes from `SAME_THREAD` to `LINK_OUT_FROM`).
+- Renderer: pure switch over `code` emitting parallel-structured bullets. Sort by
+  fixed priority — user-asserted relations first, behavioral facts second,
+  similarity third, lexical overlap last.
+- Topic-label = top member by `focusedWindowMs` (ties broken by canonical URL
+  ascending).
+- Context Pack = pure Markdown reducer over (topic, threads, dispatches,
+  snippets, user notes). "Open Questions" extracted line-by-line from
+  user-authored notes (line ending in `?`, length ≥ 8, ≤ 200 chars). Section
+  omitted when no extractable question exists.
+- All functions are PURE (no I/O; no `Date.now()` — caller passes a clock).
+  Byte-deterministic outputs on the same inputs.
+
+*Tests required:*
+- `reasons.test.ts`, `sort.test.ts`, `render.test.ts` — fixture-based; assert
+  byte-identical output across re-runs.
+- `topicLabel.test.ts` — tie-breaking by canonical URL.
+- `contextPack.test.ts` — Markdown structure stability; "Open Questions"
+  extraction edge cases (no questions → omit; multi-line question → take last
+  line).
+
+*Acceptance:*
+- `vitest run` green.
+- Determinism-of-explanations e2e scenario (1.K-7) passes: same fixture, two runs,
+  byte-identical reason-code output.
+- No outbound network calls (asserted by test-suite-wide network mock).
+
+---
 
 **S14 — UI surfaces** (1.J).
-- Files: `packages/sidetrack-extension/src/sidepanel/connections/{FlowPathView,FocusView,WhyRelatedPanel,ContextPackComposer}.tsx`
-  (NEW), `connectionsClient.ts` extension.
-- All four surfaces render deterministically; no LLM endpoints; no outbound
-  network calls for inference.
-- Network-mock test: any outbound `*ollama*` / `*openai*` / `*completions*`
-  request fails the build.
-- Acceptance: all four surfaces visible in the e2e (1.K).
 
-**S15 — Browser e2e** (1.K). **Lead-authored.**
-- File: `packages/sidetrack-extension/tests/e2e/connections-mvp-user-story.spec.ts`
-  (NEW).
-- 7 scenarios per § 1.K.
-- Network-mock asserts no outbound LLM-shaped requests.
+*Worktree branch:* `codex/stage1-s14-ui-surfaces`.
 
-**S16 — Documentation.** **Lead-authored.**
-- Files: `docs/timeline.md`, `docs/architecture.md` (NEW or extend).
-- Document the engagement / provenance / lineage privacy posture.
-- Document the two-tier edge model + Class A-F roles.
-- Document the C6 IndexedDB decision.
+*Depends on:* S13 (templates), S1 (confidence enum + dashed CSS).
+
+*Files (NEW unless noted):*
+- `packages/sidetrack-extension/src/sidepanel/connections/FlowPathView.tsx` (NEW)
+- `packages/sidetrack-extension/src/sidepanel/connections/FocusView.tsx` (NEW)
+- `packages/sidetrack-extension/src/sidepanel/connections/WhyRelatedPanel.tsx` (NEW)
+- `packages/sidetrack-extension/src/sidepanel/connections/ContextPackComposer.tsx` (NEW)
+- `packages/sidetrack-extension/src/sidepanel/connections/ConnectionsView.tsx` (modify — tab routing)
+- `packages/sidetrack-extension/src/sidepanel/connections/connectionsClient.ts` (modify — read endpoints for label / why-related / context-pack)
+- `packages/sidetrack-extension/entrypoints/sidepanel/style.css` (modify — Flow Path linear-timeline layout, Focus View card grid, topic + snippet tints)
+- Component-level tests for each new view (render snapshot tests).
+
+*Change shape:*
+- Flow Path tab: directed temporal view over `navigation.committed` grouped by
+  `tabSessionIdHash`. Edges drawn from `previousVisitId` (solid) and
+  `openerVisitId` (solid). Cross-replica continuations from
+  `visit_observed_on_replica` render dashed (Lock 1). Hover reveals engagement
+  class. Click opens Why Related panel for that node.
+- Focus View tab: topic-centric. Topic nodes first-class; visits inside a topic
+  ordered by `focusedWindowMs`. Topics with user-asserted threads/dispatches/
+  snippets visually weighted higher. Top member's title is the topic label.
+- Why Related panel: opens on edge click. Renders the Reason list (S13).
+  Toggle "Show only user-asserted" filters out `confidence: 'inferred'` reasons.
+- Context Pack composer: per-workstream button; renders Markdown (S13);
+  copy-to-clipboard with explicit visual confirmation. Never opens a network
+  connection.
+- Network-mock: a global Playwright `context.route()` rule fails any outbound
+  request matching `*ollama*`, `*openai*`, `*anthropic*`, `*claude*`,
+  `*completions*` patterns. The unit test suite installs the same mock via fetch
+  spy.
+
+*Tests required:*
+- Component snapshot tests for each new view.
+- Network-mock test: render any of the four surfaces with a mock fetch that
+  fails on LLM-shaped URLs; assert no failure occurs (= no calls made).
+
+*Acceptance:*
+- `vitest run` green; `wxt build` clean.
+- All four surfaces visible in the e2e (1.K).
+- Lighthouse pass (no broken accessibility) on each surface.
+
+---
+
+### Wave E — sequential, lead-authored
+
+**S15 — Browser e2e (`connections-mvp-user-story.spec.ts`)** (1.K).
+
+*Branch:* lands directly on `feat/work-graph-mvp` (or successor implementation
+branch) authored by lead.
+
+*Depends on:* all of S1–S14.
+
+*Files (NEW):*
+- `packages/sidetrack-extension/tests/e2e/connections-mvp-user-story.spec.ts`
+- `packages/sidetrack-extension/tests/e2e/helpers/network-mock.ts` (NEW — shared LLM-network-block helper)
+
+*Scope:* the seven scenarios in § 1.K, plus the cross-replica privacy revoke
+sub-scenario (1.K-A). Network-mock asserts no outbound LLM-shaped requests
+across all scenarios.
+
+*Acceptance:*
+- The full e2e passes against the deterministic test embedder.
+- Existing connections e2e suite (`connections-multiflow.spec.ts`,
+  `connections-real-tabs.spec.ts`, `connections-user-path.spec.ts`,
+  `connections-cross-replica-browser.spec.ts`) continues to pass (regression).
+
+---
+
+**S16 — Documentation**.
+
+*Branch:* same as S15.
+
+*Files:*
+- `docs/timeline.md` (modify) — engagement (counts + durations only) +
+  provenance dimensions; explicit "no event.key, no event.target reads" privacy
+  claim; copy/paste hash-only posture.
+- `docs/architecture.md` (NEW) — the two-tier edge model; Class A–F roles in the
+  work graph; the IndexedDB decision; the privacy projection; roadmap stages.
+- `docs/proposals/work-graph-stage1-mvp.md` — mark as "implemented" with a link
+  back to the implementation PR(s).
+
+*Acceptance:*
+- Docs reviewed; links resolve; no stale fixtures referenced.
 
 ### Codex hand-off protocol
 
