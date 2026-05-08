@@ -53,6 +53,11 @@ const KIND_RANK = new Map<ConnectionNodeKind, number>(
   NODE_KIND_GROUP_ORDER.map((k, i) => [k, i] as const),
 );
 
+const edgeConfidenceClass = (confidence: ConnectionEdge['confidence']): string => {
+  return confidence === 'inferred' ? 'confidence-inferred' : '';
+};
+
+
 const groupByKind = (
   nodes: readonly ConnectionNode[],
 ): Map<ConnectionNodeKind, ConnectionNode[]> => {
@@ -410,7 +415,7 @@ const ConnectionsLinkedCenter = ({
                 className={`cx-edgelabel ${isSelected ? 'is-selected' : ''}`}
                 style={{ cursor: 'pointer', justifyContent: 'flex-start', padding: '4px 8px' }}
               >
-                <span className={`cx-edge fam-${fam}`} aria-hidden>
+                <span className={`cx-edge fam-${fam} ${edgeConfidenceClass(edge.confidence)}`.trim()} aria-hidden>
                   <span className="cx-edge-line" />
                 </span>
                 <span style={{ color: 'var(--ink)' }}>{edge.kind}</span>
@@ -509,7 +514,7 @@ const ConnectionsOrbitalCenter = ({
             const pt = layout.positions.get(edge.toNodeId)!;
             const isSel = selectedEdge?.id === edge.id;
             const isDim = selectedEdge !== null && !isSel;
-            const cls = ['edge', `fam-${fam}`, isSel && 'is-selected', isDim && 'is-dim']
+            const cls = ['edge', `fam-${fam}`, edgeConfidenceClass(edge.confidence), isSel && 'is-selected', isDim && 'is-dim']
               .filter(Boolean)
               .join(' ');
             return <line key={edge.id} className={cls} x1={ps.x} y1={ps.y} x2={pt.x} y2={pt.y} />;
@@ -557,7 +562,7 @@ const ConnectionsOrbitalCenter = ({
               data-testid={`edge-${edge.id}`}
               style={{ cursor: 'pointer' }}
             >
-              <span className={`cx-edge fam-${fam}`} aria-hidden>
+              <span className={`cx-edge fam-${fam} ${edgeConfidenceClass(edge.confidence)}`.trim()} aria-hidden>
                 <span className="cx-edge-line" />
               </span>
               <span>{meta?.label ?? edge.kind}</span>
@@ -789,11 +794,7 @@ const ProvenanceCard = ({
     <aside className="cx-prov" data-testid="edge-provenance">
       <header className="cx-prov-head">
         <span className="cx-prov-kind">{edge.kind}</span>
-        {edge.confidence === 'deterministic' || edge.confidence === 'explicit' ? (
-          <span className="cx-stamp deterministic">Deterministic</span>
-        ) : (
-          <span className="cx-stamp">{edge.confidence}</span>
-        )}
+        <span className="cx-stamp">{edge.confidence}</span>
         <span className="cx-grow" />
         <button
           type="button"
@@ -820,7 +821,7 @@ const ProvenanceCard = ({
           <span className="cx-mono cx-dim">{edge.fromNodeId}</span>
         )}
         <div className="cx-prov-arrow">
-          <span className={`cx-edge fam-${family}`} aria-hidden>
+          <span className={`cx-edge fam-${family} ${edgeConfidenceClass(edge.confidence)}`.trim()} aria-hidden>
             <span className="cx-edge-line" />
           </span>
           <span style={{ fontSize: 9, letterSpacing: '0.06em', textTransform: 'uppercase' }}>

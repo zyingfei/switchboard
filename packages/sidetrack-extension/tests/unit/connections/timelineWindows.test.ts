@@ -30,7 +30,7 @@ describe('connections — computeTimelineRail', () => {
           toNodeId: 'workstream:w1',
           observedAt: '2026-05-14T09:10:00.000Z',
           producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 1 } },
-          confidence: 'explicit',
+          confidence: 'asserted',
         },
         {
           id: 'e2',
@@ -39,7 +39,7 @@ describe('connections — computeTimelineRail', () => {
           toNodeId: 'workstream:w1',
           observedAt: '2026-05-14T09:25:00.000Z',
           producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 2 } },
-          confidence: 'explicit',
+          confidence: 'asserted',
         },
       ],
     });
@@ -63,7 +63,7 @@ describe('connections — computeTimelineRail', () => {
           toNodeId: 'workstream:w1',
           observedAt: '2026-05-14T09:00:00.000Z',
           producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 1 } },
-          confidence: 'explicit',
+          confidence: 'asserted',
         },
         {
           id: 'e2',
@@ -72,7 +72,7 @@ describe('connections — computeTimelineRail', () => {
           toNodeId: 'workstream:w1',
           observedAt: '2026-05-14T11:00:00.000Z',
           producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 2 } },
-          confidence: 'explicit',
+          confidence: 'asserted',
         },
       ],
     });
@@ -90,7 +90,7 @@ describe('connections — computeTimelineRail', () => {
           toNodeId: 'workstream:w1',
           observedAt: '2026-05-14T09:00:00.000Z',
           producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 1 } },
-          confidence: 'explicit',
+          confidence: 'asserted',
         },
         {
           id: 'e2',
@@ -99,7 +99,7 @@ describe('connections — computeTimelineRail', () => {
           toNodeId: 'workstream:w1',
           observedAt: '2026-05-14T10:30:00.000Z',
           producedBy: { source: 'event-log', dot: { replicaId: 'pc', seq: 5 } },
-          confidence: 'explicit',
+          confidence: 'asserted',
         },
       ],
     });
@@ -118,7 +118,7 @@ describe('connections — computeTimelineRail', () => {
           toNodeId: 'workstream:w1',
           observedAt: '2026-05-14T09:00:00.000Z',
           producedBy: { source: 'workboard-state' },
-          confidence: 'explicit',
+          confidence: 'asserted',
         },
       ],
     });
@@ -134,7 +134,7 @@ describe('connections — computeTimelineRail', () => {
         toNodeId: 'workstream:w1',
         observedAt: '2026-05-13T15:00:00.000Z',
         producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 1 } },
-        confidence: 'explicit',
+        confidence: 'asserted',
       },
     ];
     const dayB: ConnectionsSnapshot['edges'] = [
@@ -145,7 +145,7 @@ describe('connections — computeTimelineRail', () => {
         toNodeId: 'workstream:w1',
         observedAt: '2026-05-14T09:00:00.000Z',
         producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 2 } },
-        confidence: 'explicit',
+        confidence: 'asserted',
       },
       {
         id: 'eB2',
@@ -154,7 +154,7 @@ describe('connections — computeTimelineRail', () => {
         toNodeId: 'workstream:w1',
         observedAt: '2026-05-14T10:00:00.000Z',
         producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 3 } },
-        confidence: 'explicit',
+        confidence: 'asserted',
       },
     ];
     const snap = baseSnap({ edges: [...dayA, ...dayB] });
@@ -198,7 +198,7 @@ describe('connections — computeTimelineRail', () => {
           toNodeId: 'workstream:w1',
           observedAt: '2026-05-14T09:00:00.000Z',
           producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 1 } },
-          confidence: 'explicit',
+          confidence: 'asserted',
         },
       ],
     });

@@ -78,7 +78,7 @@ describe('connections — snapshot reducer (Given/Then)', () => {
     );
     expect(edge).toBeDefined();
     expect(edge?.kind).toBe('thread_in_workstream');
-    expect(edge?.confidence).toBe('explicit');
+    expect(edge?.confidence).toBe('asserted');
     expect(edge?.producedBy.source).toBe('event-log');
   });
 
@@ -254,7 +254,7 @@ describe('connections — snapshot reducer (Given/Then)', () => {
     );
     const edge = snap.edges.find((e) => e.kind === 'timeline_same_url_as_thread');
     expect(edge).toBeDefined();
-    expect(edge?.confidence).toBe('deterministic');
+    expect(edge?.confidence).toBe('inferred');
     expect(edge?.producedBy.source).toBe('timeline-projection');
   });
 
@@ -288,7 +288,7 @@ describe('connections — snapshot reducer (Given/Then)', () => {
     );
     const edge = snap.edges.find((e) => e.kind === 'annotation_targets_thread');
     expect(edge).toBeDefined();
-    expect(edge?.confidence).toBe('deterministic');
+    expect(edge?.confidence).toBe('observed');
   });
 });
 
@@ -339,7 +339,7 @@ describe('connections — content-derived edges', () => {
     expect(edge).toBeDefined();
     expect(edge?.fromNodeId).toBe(nodeIdFor('thread', 'thread_a'));
     expect(edge?.toNodeId).toBe(nodeIdFor('timeline-visit', 'https://copy.fail/exploit'));
-    expect(edge?.confidence).toBe('deterministic');
+    expect(edge?.confidence).toBe('observed');
     expect(edge?.producedBy.eventType).toBe(CAPTURE_RECORDED);
   });
 
@@ -974,7 +974,7 @@ describe('connections — content-derived edges', () => {
     expect(visitEdges.length).toBe(1);
     expect(visitEdges[0]?.fromNodeId).toBe(nodeIdFor('timeline-visit', 'https://copy.fail'));
     expect(visitEdges[0]?.toNodeId).toBe(nodeIdFor('workstream', 'ws_security'));
-    expect(visitEdges[0]?.confidence).toBe('explicit');
+    expect(visitEdges[0]?.confidence).toBe('inferred');
     expect(visitEdges[0]?.producedBy.source).toBe('timeline-projection');
     // The visit-node metadata also carries the workstreamId.
     const taggedVisit = snap.nodes.find(
