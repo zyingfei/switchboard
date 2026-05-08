@@ -5,15 +5,14 @@ import {
 } from '../../annotations/events.js';
 import { buildEngagementClassRevision } from '../../connections/engagementClassifier.js';
 import { readVaultStores } from '../../connections/loader.js';
-import {
-  buildConnectionsSnapshot,
-  type ConnectionsInput,
-} from '../../connections/snapshot.js';
+import { buildConnectionsSnapshot, type ConnectionsInput } from '../../connections/snapshot.js';
 import type { ConnectionsStore } from '../../connections/snapshot.js';
 import {
   buildTopicRevision,
+  type BuildTopicRevisionInput,
   type TopicVisit,
 } from '../../connections/topicClusterer.js';
+import { buildHdbscanTopicRevision } from '../../connections/hdbscanClusterer.js';
 import {
   buildVisitSimilarity,
   type VisitSimilarityEmbedder,
@@ -27,7 +26,11 @@ import {
   type EngagementClassRevisionStore,
 } from '../../producers/engagement-class-revision.js';
 import {
+  TOPIC_HDBSCAN_REVISION_KEY,
+  TOPIC_UNION_FIND_REVISION_KEY,
   createTopicRevisionStore,
+  type TopicAlgorithmVersion,
+  type TopicRevision,
   type TopicRevisionStore,
 } from '../../producers/topic-revision.js';
 import { writeVisitSimilarityRevision } from '../../producers/visit-resembles-revision.js';
@@ -55,10 +58,7 @@ import {
   type TimelineDayProjection,
   type TimelineStore,
 } from '../../timeline/projection.js';
-import {
-  WORKSTREAM_DELETED,
-  WORKSTREAM_UPSERTED,
-} from '../../workstreams/events.js';
+import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
 import { VISUAL_FINGERPRINT_OBSERVED } from '../../visual/events.js';
 import type { AcceptedEvent } from '../causal.js';
 import type { EventLog } from '../eventLog.js';
@@ -127,15 +127,28 @@ export interface CreateConnectionsMaterializerDeps {
   readonly timelineStore: TimelineStore;
   readonly store: ConnectionsStore;
   readonly embed?: VisitSimilarityEmbedder;
+  readonly topicRevisionAlgorithm?: TopicAlgorithmVersion;
   readonly topicRevisionStore?: TopicRevisionStore;
   readonly engagementClassStore?: EngagementClassRevisionStore;
 }
 
+type TopicRevisionBuilder = (input: BuildTopicRevisionInput) => Promise<TopicRevision>;
+
+const topicRevisionBuilderFor = (algorithm: TopicAlgorithmVersion): TopicRevisionBuilder => {
+  switch (algorithm) {
+    case TOPIC_UNION_FIND_REVISION_KEY:
+      return buildTopicRevision;
+    case TOPIC_HDBSCAN_REVISION_KEY:
+      return buildHdbscanTopicRevision;
+  }
+};
+
 export const createConnectionsMaterializer = (
   deps: CreateConnectionsMaterializerDeps,
 ): Materializer => {
-  const topicRevisionStore =
-    deps.topicRevisionStore ?? createTopicRevisionStore(deps.vaultRoot);
+  const topicRevisionStore = deps.topicRevisionStore ?? createTopicRevisionStore(deps.vaultRoot);
+  const topicRevisionAlgorithm = deps.topicRevisionAlgorithm ?? TOPIC_UNION_FIND_REVISION_KEY;
+  const buildSelectedTopicRevision = topicRevisionBuilderFor(topicRevisionAlgorithm);
   const engagementClassStore =
     deps.engagementClassStore ?? createEngagementClassRevisionStore(deps.vaultRoot);
   let pending = false;
@@ -207,9 +220,7 @@ export const createConnectionsMaterializer = (
   ): readonly TimelineDayProjectionWithDimensions[] => {
     const payloads = collectTimelinePayloads(
       merged.filter(
-        (e) =>
-          e.type === BROWSER_TIMELINE_OBSERVED &&
-          isBrowserTimelineObservedPayload(e.payload),
+        (e) => e.type === BROWSER_TIMELINE_OBSERVED && isBrowserTimelineObservedPayload(e.payload),
       ),
     );
     const grouped = groupByDay(payloads);
@@ -263,10 +274,7 @@ export const createConnectionsMaterializer = (
       const canonicalUrl = stripFragmentAndTrailingSlash(input.canonicalUrl);
       focusedByCanonicalUrl.set(
         canonicalUrl,
-        Math.max(
-          focusedByCanonicalUrl.get(canonicalUrl) ?? 0,
-          input.engagement.focusedWindowMs,
-        ),
+        Math.max(focusedByCanonicalUrl.get(canonicalUrl) ?? 0, input.engagement.focusedWindowMs),
       );
     }
 
@@ -306,7 +314,7 @@ export const createConnectionsMaterializer = (
     );
     await writeVisitSimilarityRevision(deps.vaultRoot, visitSimilarity);
     const previousTopicRevision = await topicRevisionStore.readActiveRevision();
-    const topicRevision = await buildTopicRevision({
+    const topicRevision = await buildSelectedTopicRevision({
       visits: timelineDays.flatMap((day) => day.entries.map(topicVisitFromEntry)),
       visitSimilarity,
       ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),

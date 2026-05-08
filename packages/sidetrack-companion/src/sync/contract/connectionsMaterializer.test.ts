@@ -8,16 +8,17 @@ import type { VisitSimilarityEmbedder } from '../../connections/visitSimilarity.
 import { THREAD_UPSERTED } from '../../threads/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
 import { createTimelineStore } from '../../timeline/projection.js';
+import {
+  TOPIC_HDBSCAN_REVISION_KEY,
+  TOPIC_UNION_FIND_REVISION_KEY,
+  createTopicRevisionStore,
+} from '../../producers/topic-revision.js';
 import type { AcceptedEvent } from '../causal.js';
 import { createEventLog } from '../eventLog.js';
 import { loadOrCreateReplica } from '../replicaId.js';
 import { createConnectionsMaterializer } from './connectionsMaterializer.js';
 
-const buildEvent = (input: {
-  seq: number;
-  type: string;
-  payload: unknown;
-}): AcceptedEvent => ({
+const buildEvent = (input: { seq: number; type: string; payload: unknown }): AcceptedEvent => ({
   clientEventId: `evt-${String(input.seq)}`,
   dot: { replicaId: 'replica-A', seq: input.seq },
   deps: {},
@@ -37,17 +38,17 @@ const keyFromEmbeddingText = (text: string): string => {
   return corpus.split(/\s+/u)[0] ?? '';
 };
 
-const embedFromVectors = (
-  vectors: ReadonlyMap<string, Float32Array>,
-): VisitSimilarityEmbedder => async (texts) =>
-  texts.map((text) => {
-    const key = keyFromEmbeddingText(text);
-    const vector = vectors.get(key);
-    if (vector === undefined) {
-      throw new Error(`missing vector for ${key}`);
-    }
-    return vector;
-  });
+const embedFromVectors =
+  (vectors: ReadonlyMap<string, Float32Array>): VisitSimilarityEmbedder =>
+  async (texts) =>
+    texts.map((text) => {
+      const key = keyFromEmbeddingText(text);
+      const vector = vectors.get(key);
+      if (vector === undefined) {
+        throw new Error(`missing vector for ${key}`);
+      }
+      return vector;
+    });
 
 describe('connectionsMaterializer (Class B, consumer-only)', () => {
   let vaultRoot: string;
@@ -161,6 +162,71 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
       'utf8',
     );
     expect(revisionRaw).toContain(`"revisionId": "${revisionId}"`);
+    const topicRevision = await createTopicRevisionStore(vaultRoot).readActiveRevision();
+    expect(topicRevision?.algorithmVersion).toBe(TOPIC_UNION_FIND_REVISION_KEY);
+    expect(m.health().status).toBe('healthy');
+  });
+
+  it('can select the HDBSCAN topic revision builder by revision key', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+    const embed = embedFromVectors(
+      new Map<string, Float32Array>([
+        ['visit-alpha', unit([1, 0])],
+        ['visit-bravo', unit([1, 0])],
+      ]),
+    );
+    const m = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store,
+      embed,
+      topicRevisionAlgorithm: TOPIC_HDBSCAN_REVISION_KEY,
+    });
+
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 1,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: {
+          eventId: 'timeline-alpha',
+          observedAt: '2026-05-07T10:00:00.000Z',
+          url: 'https://example.test/alpha',
+          canonicalUrl: 'https://example.test/alpha',
+          title: 'visit-alpha',
+          provider: 'generic',
+          transition: 'activated',
+          payloadVersion: 1,
+          dimensions: { engagement: { focusedWindowMs: 10_000 } },
+        },
+      }),
+    );
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 2,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: {
+          eventId: 'timeline-bravo',
+          observedAt: '2026-05-07T10:05:00.000Z',
+          url: 'https://example.test/bravo',
+          canonicalUrl: 'https://example.test/bravo',
+          title: 'visit-bravo',
+          provider: 'generic',
+          transition: 'activated',
+          payloadVersion: 1,
+          dimensions: { engagement: { focusedWindowMs: 10_000 } },
+        },
+      }),
+    );
+
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+
+    const topicRevision = await createTopicRevisionStore(vaultRoot).readActiveRevision();
+    expect(topicRevision?.algorithmVersion).toBe(TOPIC_HDBSCAN_REVISION_KEY);
     expect(m.health().status).toBe('healthy');
   });
 
@@ -310,9 +376,7 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     const eventLog = createEventLog(vaultRoot, replica);
     const timelineStore = createTimelineStore(vaultRoot);
     const store = {
-      putCurrent: async (
-        snapshot: import('../../connections/snapshot.js').ConnectionsSnapshot,
-      ) => {
+      putCurrent: async (snapshot: import('../../connections/snapshot.js').ConnectionsSnapshot) => {
         void snapshot;
         throw new Error('disk wedged');
       },

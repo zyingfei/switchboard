@@ -9,7 +9,7 @@ import { SELECTION_COPIED, SELECTION_PASTED } from '../snippets/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { THREAD_UPSERTED } from '../threads/events.js';
 import type { TimelineDayProjection } from '../timeline/projection.js';
-import type { TopicRevision } from '../producers/topic-revision.js';
+import { TOPIC_UNION_FIND_REVISION_KEY, type TopicRevision } from '../producers/topic-revision.js';
 import { VISUAL_FINGERPRINT_OBSERVED } from '../visual/events.js';
 import { WORKSTREAM_UPSERTED } from '../workstreams/events.js';
 import {
@@ -118,7 +118,13 @@ describe('connections — snapshot reducer (Given/Then)', () => {
     expect(ids).toContain(nodeIdFor('thread', 'thread_a'));
     expect(ids).toContain(nodeIdFor('workstream', 'ws_tax'));
     const edge = snap.edges.find(
-      (e) => e.id === edgeIdFor('thread_in_workstream', nodeIdFor('thread', 'thread_a'), nodeIdFor('workstream', 'ws_tax')),
+      (e) =>
+        e.id ===
+        edgeIdFor(
+          'thread_in_workstream',
+          nodeIdFor('thread', 'thread_a'),
+          nodeIdFor('workstream', 'ws_tax'),
+        ),
     );
     expect(edge).toBeDefined();
     expect(edge?.kind).toBe('thread_in_workstream');
@@ -530,9 +536,7 @@ describe('connections — content-derived edges', () => {
             payload: {
               bac_id: 'thread_a',
               capturedAt: '2026-05-07T10:00:00.000Z',
-              turns: [
-                { ordinal: 0, role: 'user', text: 'see https://copy.fail/exploit' },
-              ],
+              turns: [{ ordinal: 0, role: 'user', text: 'see https://copy.fail/exploit' }],
             },
           }),
           buildEvent({
@@ -542,9 +546,7 @@ describe('connections — content-derived edges', () => {
             payload: {
               bac_id: 'thread_a',
               capturedAt: '2026-05-07T10:00:00.000Z',
-              turns: [
-                { ordinal: 0, role: 'user', text: 'see https://copy.fail/exploit' },
-              ],
+              turns: [{ ordinal: 0, role: 'user', text: 'see https://copy.fail/exploit' }],
             },
           }),
         ],
@@ -576,8 +578,7 @@ describe('connections — content-derived edges', () => {
     const CHATGPT_THREAD_URL = 'https://chatgpt.com/c/def';
     // 50 chars — ten 40-char shingles after concat overlap, well
     // above the 4-shingle contiguous-run threshold.
-    const SHARED_CODE_BLOCK =
-      'function calculateTaxOwed(income, year) { return';
+    const SHARED_CODE_BLOCK = 'function calculateTaxOwed(income, year) { return';
 
     const day: TimelineDayProjection = {
       date: '2026-05-07',
@@ -1048,7 +1049,9 @@ describe('connections — content-derived edges', () => {
       source: 'visit-similarity',
       revisionId: 'visit-sim-rev-1',
     });
-    expect(snap.edges.filter((candidate) => candidate.kind === 'visit_resembles_visit')).toHaveLength(1);
+    expect(
+      snap.edges.filter((candidate) => candidate.kind === 'visit_resembles_visit'),
+    ).toHaveLength(1);
   });
 
   it('visit_in_workstream fires when the timeline entry carries a workstreamId (active-workstream attribution)', () => {
@@ -1095,8 +1098,7 @@ describe('connections — content-derived edges', () => {
     expect(taggedVisit?.metadata['workstreamId']).toBe('ws_security');
     // The untagged visit has no metadata.workstreamId.
     const orphanVisit = snap.nodes.find(
-      (n) =>
-        n.id === nodeIdFor('timeline-visit', 'https://www.youtube.com/watch?v=rY44ViY45q8'),
+      (n) => n.id === nodeIdFor('timeline-visit', 'https://www.youtube.com/watch?v=rY44ViY45q8'),
     );
     expect(orphanVisit?.metadata['workstreamId']).toBeUndefined();
   });
@@ -1146,7 +1148,7 @@ describe('connections — content-derived edges', () => {
       revisionId: 'topic-rev-1',
       visitSimilarityRevisionId: 'visit-sim-1',
       cosineThreshold: 0.85,
-      algorithmVersion: 'union-find:v1',
+      algorithmVersion: TOPIC_UNION_FIND_REVISION_KEY,
       topics: [
         {
           topicId: 'topic:abc123',
@@ -1224,9 +1226,7 @@ describe('connections — content-derived edges', () => {
       entryCount: 4,
     };
 
-    const snap = buildConnectionsSnapshot(
-      emptyInput({ timelineDays: [day], topicRevision }),
-    );
+    const snap = buildConnectionsSnapshot(emptyInput({ timelineDays: [day], topicRevision }));
     const topicNodeId = nodeIdFor('topic', 'topic:abc123');
     const topicNode = snap.nodes.find((node) => node.id === topicNodeId);
 
@@ -1321,9 +1321,7 @@ describe('connections — content-derived edges', () => {
         payload: {
           bac_id: 'thread_b',
           capturedAt: '2026-05-07T11:00:00.000Z',
-          turns: [
-            { ordinal: 0, role: 'user', text: `please review: ${QUOTED_BLOCK} 0;` },
-          ],
+          turns: [{ ordinal: 0, role: 'user', text: `please review: ${QUOTED_BLOCK} 0;` }],
         },
       }),
     ];
@@ -1389,7 +1387,9 @@ describe('connections — determinism + cross-replica', () => {
       }),
     ];
     const fwd = JSON.stringify(buildConnectionsSnapshot(emptyInput({ events })));
-    const rev = JSON.stringify(buildConnectionsSnapshot(emptyInput({ events: [...events].reverse() })));
+    const rev = JSON.stringify(
+      buildConnectionsSnapshot(emptyInput({ events: [...events].reverse() })),
+    );
     const shuffled = JSON.stringify(
       buildConnectionsSnapshot(emptyInput({ events: [events[2]!, events[0]!, events[1]!] })),
     );
@@ -1582,7 +1582,9 @@ describe('connections — determinism + cross-replica', () => {
     expect(snap.nodes.find((node) => node.kind === 'snippet')).toBeDefined();
     expect(snap.edges.find((edge) => edge.kind === 'snippet_copied_from_visit')).toBeDefined();
     expect(snap.edges.filter((edge) => edge.kind === 'snippet_pasted_into_thread')).toHaveLength(2);
-    expect(snap.edges.filter((edge) => edge.kind === 'snippet_reused_across_threads')).toHaveLength(2);
+    expect(snap.edges.filter((edge) => edge.kind === 'snippet_reused_across_threads')).toHaveLength(
+      2,
+    );
     expect(
       snap.edges.every((edge) =>
         edge.kind.startsWith('snippet_') ? edge.producedBy.source === 'snippet-lineage' : true,
