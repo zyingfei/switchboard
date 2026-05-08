@@ -82,6 +82,7 @@ import { deriveLifecycle } from '../../src/sidepanel/lifecycle';
 import { formatRelative } from '../../src/util/time';
 import { createSuggestionsClient } from '../../src/companion/suggestionsClient';
 import { listPendingOffers, markStatus, type OfferRecord } from '../../src/codingAttach/state';
+import { ConnectionsView } from '../../src/sidepanel/connections/ConnectionsView';
 import './style.css';
 
 const TARGET_PROVIDER_LABEL: Record<string, string> = {
@@ -382,7 +383,7 @@ const App = () => {
   const [expandedWorkstreamId, setExpandedWorkstreamId] = useState<string | null>(null);
   const [wsPickerOpen, setWsPickerOpen] = useState(false);
   const [wsPickerCreateMode, setWsPickerCreateMode] = useState(false);
-  const [viewMode, setViewMode] = useState<'workstream' | 'all'>('workstream');
+  const [viewMode, setViewMode] = useState<'workstream' | 'all' | 'connections'>('workstream');
   const [queueDraft, setQueueDraft] = useState('');
   const [queueExpandFor, setQueueExpandFor] = useState<string | null>(null);
   // Set briefly after the user opens compose-at-end via the row's
@@ -1141,7 +1142,7 @@ const App = () => {
   // the All-Threads bucket containing a given thread. Each is mirrored
   // through a ref so the listener always reads the latest values
   // even though the registration runs only once.
-  const viewModeRef = useRef<'workstream' | 'all'>('workstream');
+  const viewModeRef = useRef<'workstream' | 'all' | 'connections'>('workstream');
   const currentWsIdRef = useRef<string | null>(null);
   const expandBucketForThreadRef = useRef<((thread: TrackedThread) => Promise<void>) | null>(null);
   const activeTabTrackedThread = useMemo(
@@ -3617,6 +3618,18 @@ const App = () => {
               {state.threads.length}
             </span>
           </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === 'connections'}
+            aria-label="Connections"
+            className={'view-tab' + (viewMode === 'connections' ? ' on' : '')}
+            onClick={() => {
+              setViewMode('connections');
+            }}
+          >
+            Connections
+          </button>
         </div>
         <div className="app-actions">
           <button
@@ -4241,7 +4254,27 @@ const App = () => {
 
       {error ? <div className="banner danger">{error}</div> : null}
 
-      {viewMode === 'workstream' ? (
+      {viewMode === 'connections' ? (
+        <ConnectionsView
+          recentAnchors={[
+            ...[...state.threads]
+              .sort((a, b) => (a.lastSeenAt < b.lastSeenAt ? 1 : -1))
+              .slice(0, 6)
+              .map((t) => ({
+                id: `thread:${t.bac_id}`,
+                kind: 'thread' as const,
+                label: t.title || t.threadUrl,
+              })),
+            ...[...state.workstreams]
+              .slice(0, 3)
+              .map((w) => ({
+                id: `workstream:${w.bac_id}`,
+                kind: 'workstream' as const,
+                label: w.title || w.bac_id,
+              })),
+          ]}
+        />
+      ) : viewMode === 'workstream' ? (
         <>
           <div className="sec-head">
             <span>Open threads</span>
