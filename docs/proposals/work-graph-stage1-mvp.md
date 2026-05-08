@@ -1275,6 +1275,32 @@ type SelectionPastedPayload = {
 
 ### Wave C — depends on Wave B
 
+**Convergence note.** Four Wave C subtasks all touch the same two integration files:
+
+- `packages/sidetrack-companion/src/sync/contract/connectionsMaterializer.ts` — the
+  pipeline that runs producers in order. S9, S12 thread new dependencies in; S10
+  depends on S9's output; S11 is independent.
+- `packages/sidetrack-companion/src/connections/snapshot.ts` — pass numbers 7
+  (S9 visit similarity), 8 (S10 topics), 9 (S11 cross-replica), and the engagement
+  metadata stamp (S12). The pass numbering must NOT collide.
+- `packages/sidetrack-companion/src/connections/types.ts` — S10 adds the `'topic'`
+  node kind, three edge kinds; S11 adds one edge kind. Same union, two PRs.
+
+**Lead's integration plan:** Wave C subtasks run in parallel Codex worktrees. Each
+PR's diff against `connectionsMaterializer.ts`, `snapshot.ts`, and `types.ts` will
+likely conflict at merge time. The lead resolves merge conflicts in those three
+files at integration time using the canonical pass numbering (Pass 7=S9, Pass 8=S10,
+Pass 9=S11, plus S12's metadata stamp inside Pass 3 where timeline-visit nodes are
+emitted). Subtasks are otherwise self-contained: no Codex job edits another's
+producer/test files.
+
+**Recommended Codex parallelism:** all four can run simultaneously. S10 reads S9's
+similarity output via `ConnectionsInput.visitSimilarity` (a new field). If S10 lands
+before S9, S10's tests use a fixture-injected similarity input; integration becomes
+green only after S9 lands. Same posture as how S3 was authored ahead of S6 in Wave B.
+
+---
+
 **S9 — `visit_resembles_visit` producer** (1.C).
 
 *Worktree branch:* `codex/stage1-s9-visit-resembles`.
@@ -1290,29 +1316,68 @@ exist in the merged log).
 - `packages/sidetrack-companion/src/connections/snapshot.ts` (modify — Pass 7 emits `visit_resembles_visit` from injected similarity input)
 
 *Reuse pointers (load-bearing — do NOT duplicate):*
-- `embed()` from `packages/sidetrack-companion/src/recall/embedder.ts`.
-- Binary recall index V3 at `_BAC/recall/index.bin`.
-- MiniSearch hybrid retrieval (already in production).
+- `embed()` from `packages/sidetrack-companion/src/recall/embedder.ts:55+` — pinned
+  `Xenova/multilingual-e5-small`, 384-dim, q8/fp16/fp32 cascade, deterministic test
+  embedder via `SIDETRACK_TEST_EMBEDDER=1`.
+- Binary recall index V3 at `_BAC/recall/index.bin` (writer:
+  `packages/sidetrack-companion/src/recall/indexWriter.ts`; reader:
+  `packages/sidetrack-companion/src/recall/ranker.ts`). Schema fields: `modelId`,
+  pinned revision, chunk schema version, schema capabilities, per-entry metadata,
+  replica id, Lamport, tombstones, deterministic canonical ordering, source-scoped
+  replacement.
+- MiniSearch hybrid retrieval at `packages/sidetrack-companion/src/recall/ranker.ts`
+  (`rankHybrid`). Existing fixed `lexical*0.3 + vector*0.5 + link*0.2` convex
+  combination at threshold 0.55. Title/heading/text field weights and dotted-
+  identifier tokenization already implemented.
+- `RecallModelMissingError` typed error pattern at
+  `packages/sidetrack-companion/src/recall/embedder.ts:55-65` — failure-cooldown
+  analog for the visit-similarity step's no-op-on-error semantics.
+- `auditRetention.ts` retention pattern for old Class E revisions.
+
+*Schemas:*
+
+```ts
+// New ConnectionsInput field consumed by snapshot.ts Pass 7.
+type VisitSimilarityEdge = {
+  fromVisitKey: string;       // canonical URL of visit A
+  toVisitKey: string;         // canonical URL of visit B
+  cosine: number;             // 0..1
+};
+
+type VisitSimilarityRevision = {
+  revisionId: string;         // sha256(modelFingerprint + featureSchemaVersion + inputVisitIdsSorted).slice(0, 16)
+  modelId: 'Xenova/multilingual-e5-small';
+  modelRevision: string;      // pinned HF commit hash
+  featureSchemaVersion: number;
+  threshold: number;          // T_sim, default 0.85
+  edges: readonly VisitSimilarityEdge[];
+  producedAt: number;
+};
+
+// Pure function signature.
+type BuildVisitSimilarity = (
+  entries: readonly TimelineEntry[],
+  embed: (texts: readonly string[]) => Promise<readonly Float32Array[]>,
+  options?: { threshold?: number; topK?: number; engagementGateMs?: number },
+) => Promise<VisitSimilarityRevision>;
+```
 
 *Change shape:*
 - `buildVisitSimilarity(entries, embed)` — pure function. Extracts a "visit corpus
   string" of `<title> + <hostname> + <URL path tokens>` per visit. Embeds with the
-  `passage:` prefix discipline. Inserts into the recall index V3 with
-  `modelId: 'Xenova/multilingual-e5-small'`, the pinned HF revision, the chunk
-  schema version. **No new vector store; no new ANN library; no new embedding
-  model.**
-- For each visit `v`, retrieve top-K=50 candidates via the existing hybrid
-  retrieval. Among those, emit `visit_resembles_visit(v → u)` when cosine on the
-  `query:`-prefixed embedding of `v` vs the index entry for `u` exceeds `T_sim`
-  (default 0.85; exposed as a developer-build setting persisted in
-  `chrome.storage.local`).
+  `passage:` prefix discipline. Inserts into the recall index V3 with the recall
+  pipeline's existing `insertEntry` API. **No new vector store; no new ANN library;
+  no new embedding model.**
+- For each visit `v`, retrieve top-K=50 candidates via `rankHybrid` (existing).
+  Among those, emit `visit_resembles_visit(v → u)` when cosine on the `query:`-
+  prefixed embedding of `v` vs the index entry for `u` exceeds `T_sim` (default
+  0.85; exposed as a developer-build setting persisted in `chrome.storage.local`).
 - Engagement gate: emit only when both endpoints have
   `dimensions.engagement.focusedWindowMs > 5000` (drops noisy hover-and-leave).
-- Output: deterministically-sorted `{ fromVisitKey, toVisitKey, cosine }` triples.
-  Sort by `(fromVisitKey, toVisitKey)` lexically.
+- Output: deterministically-sorted edges. Sort by `(fromVisitKey, toVisitKey)`
+  lexically. Tie-break ties on cosine by lexical order.
 - Persistence: Class E revision at `_BAC/connections/visit-similarity/<revisionId>.json`.
-  `revisionId = sha256(model fingerprint + feature schema version + sorted input visit
-  IDs).slice(0, 16)`. Old revisions GCed via the existing audit-retention pattern.
+  Old revisions GCed via the existing audit-retention pattern.
 - Pass 7 in `snapshot.ts`: emit `visit_resembles_visit` edges with
   `confidence: 'inferred'`, `producedBy: { source: 'visit-similarity', revisionId }`,
   `family: 'urlmatch'`.
@@ -1320,19 +1385,49 @@ exist in the merged log).
   step no-ops; the snapshot still builds with every other edge intact. Materializer
   health surfaces `lastError`.
 
-*Tests required:*
-- `visitSimilarity.test.ts` — deterministic ordering across re-runs of the same input;
-  threshold gate behavior (cosine just below / above 0.85); engagement gate
-  (focusedMs < 5000 → no edge).
-- Integration test in `connectionsMaterializer.test.ts` — embed dep injected as a
-  deterministic stub; full pipeline runs; snapshot has expected edges.
+*Test scenarios (`visitSimilarity.test.ts`):*
+
+- **Determinism — same input, byte-identical output.** Build twice with the same
+  fixture; `JSON.stringify` of the revision (excluding `producedAt`) is identical.
+- **Determinism — order-insensitive.** Permute the input `entries` array; assert
+  output edges are byte-identical.
+- **Threshold gate — boundary.** Two visits with cosine 0.849 → no edge. Cosine
+  0.851 → edge.
+- **Engagement gate — both endpoints.** A→B with A.focusedWindowMs=10000,
+  B.focusedWindowMs=4999 → no edge. Both ≥ 5000 → edge.
+- **Failure handling — embed throws.** Mock `embed` to throw; assert
+  `buildVisitSimilarity` returns an empty-edge revision and emits a
+  `materializer-error` log line; downstream snapshot still builds.
+- **Top-K cutoff — does not emit edges below top-50.** Construct fixture with 60
+  visits where rank 51 has cosine ≥ 0.85; assert that edge is NOT emitted.
+
+*Test scenarios (`connectionsMaterializer.test.ts` integration):*
+
+- **Pipeline runs visitSimilarity → snapshot end-to-end.** Inject deterministic
+  test embedder; assert snapshot contains `visit_resembles_visit` edges with the
+  expected `revisionId`.
+
+*Fixtures:*
+
+- `packages/sidetrack-companion/src/connections/__fixtures__/visitSimilarity-basic.json`
+  — 5 visits, 2 of which share most of the title token set (high cosine), 3
+  unrelated. Expected: 1 similarity edge.
+- `packages/sidetrack-companion/src/connections/__fixtures__/visitSimilarity-engagement-gate.json`
+  — 3 visits with varying focusedWindowMs straddling the 5000 ms gate. Expected:
+  1 edge (the pair where both pass the gate).
 
 *Acceptance:*
-- `vitest run` green.
-- No new vector store added: `git diff` of `package.json` adds zero new deps;
-  `grep -rn 'sqlite-vec\|hnswlib\|usearch\|faiss\|@xenova/bge\|nomic-embed' packages/`
-  returns 0 matches.
-- Topic-formation e2e scenario (1.K-3) finds expected similarity edges.
+
+```sh
+cd packages/sidetrack-companion
+SIDETRACK_TEST_EMBEDDER=1 ./node_modules/.bin/vitest run src/connections/visitSimilarity.test.ts \
+  src/sync/contract/connectionsMaterializer.test.ts                              # all green
+./node_modules/.bin/tsc --noEmit -p tsconfig.json                                # silent
+git diff --name-only main..HEAD | xargs grep -l 'sqlite-vec\|hnswlib\|usearch\|faiss\|@xenova/bge\|nomic-embed' 2>/dev/null
+                                                                                 # 0 matches
+git diff main..HEAD -- packages/sidetrack-companion/package.json                 # no new deps in dependencies
+git diff main..HEAD -- packages/sidetrack-extension/package.json                 # no new deps
+```
 
 ---
 
@@ -1340,58 +1435,158 @@ exist in the merged log).
 
 *Worktree branch:* `codex/stage1-s10-topic-clusterer`.
 
-*Depends on:* S9 (`visit_resembles_visit` edges + similarity revision exist).
+*Depends on:* S9 (`visit_resembles_visit` edges + similarity revision exist). Can
+run in parallel with S9 if S10 uses a fixture-injected similarity input for tests;
+integration becomes green when S9 lands.
 
 *Files (NEW unless noted):*
-- `packages/sidetrack-companion/src/connections/topicClusterer.ts` (NEW)
-- `packages/sidetrack-companion/src/connections/topicClusterer.test.ts`
 - `packages/sidetrack-companion/src/connections/unionFind.ts` (NEW — path-compressed disjoint-set)
 - `packages/sidetrack-companion/src/connections/unionFind.test.ts`
 - `packages/sidetrack-companion/src/connections/topicId.ts` (NEW — content-derived id)
+- `packages/sidetrack-companion/src/connections/topicId.test.ts`
+- `packages/sidetrack-companion/src/connections/topicClusterer.ts` (NEW — clusterer + topic.lineage)
+- `packages/sidetrack-companion/src/connections/topicClusterer.test.ts`
 - `packages/sidetrack-companion/src/producers/topic-revision.ts` (NEW)
 - `packages/sidetrack-companion/src/connections/types.ts` (modify — add `'topic'` `ConnectionNodeKind`, `'visit_in_topic'`, `'topic_in_workstream'`, `'topic.lineage'` edge kinds)
 - `packages/sidetrack-companion/src/connections/snapshot.ts` (modify — Pass 8)
 - `packages/sidetrack-extension/src/sidepanel/connections/edgeKinds.ts` (modify — register new kinds + 8th paper-warm tint)
 
-*Change shape:*
-- Path-compressed Union-Find with rank heuristic. O(α(n)) per union; deterministic
-  iteration order over `add` insertions.
-- `topicId(members) = "topic:" + sha256(members.sort().join("\n")).slice(0, 16)` —
-  members sorted by canonical URL ascending. Two replicas with the same membership
-  produce the same id.
-- User-asserted edges (`in_thread`, `in_workstream` if present) override
-  cosine-only membership: `uf.union(v, u)` runs for those FIRST, then for cosine
-  edges. User-asserted always wins.
-- `topic.lineage` edge: when a component splits (one visit removed, two former
-  components remain) or merges (a new edge bridges two clusters), emit
-  `topic.lineage(oldTopicId → newTopicId, kind: 'split' | 'merge')` in the
-  `contain` family with `confidence: 'observed'`. The old topic id stays
-  addressable via this edge (tombstone with `succeededBy` pointer).
-- Topic node metadata:
-  - `memberCount: number`
-  - `dominantWorkstreamId?: string` (argmax workstream by member count)
-  - `representativeTitles: readonly string[]` (top-N by `focusedWindowMs`, capped 5)
-  - `firstObservedAt: string`, `lastObservedAt: string`
-  - `cohesion: number` (mean cosine over edges within the component, 0..1)
-- Pass 8 in `snapshot.ts`: emit `topic` nodes (singleton clusters of 1 visit are
-  skipped — noise), `visit_in_topic` edges (`confidence: 'inferred'`,
-  `producedBy: { source: 'topic-clusterer', revisionId }`), and
-  `topic_in_workstream` (when ≥ 75 % of members share a `workstreamId`).
-- Persistence: Class E revision at `_BAC/connections/topics/<revisionId>.json`.
+*Reuse pointers:*
+- `auditRetention.ts` retention pattern for old Class E revisions.
+- `Web Crypto API` (`crypto.subtle.digest('SHA-256', ...)`) — already in use in
+  the recall pipeline; do not introduce a new hash dep.
 
-*Tests required:*
-- `unionFind.test.ts` — classic disjoint-set tests; deterministic iteration.
-- `topicId.test.ts` — same membership → same id (byte-identical across two
-  independent runs with different input order).
-- `topicClusterer.test.ts` — cosine threshold; user-asserted override; split/merge
-  produces `topic.lineage`; cohesion metric correctness.
+*Schemas:*
+
+```ts
+// New ConnectionNodeKind value: 'topic'
+type TopicNodeMetadata = {
+  memberCount: number;
+  dominantWorkstreamId?: string;            // argmax workstream by member count; absent if no member has one
+  representativeTitles: readonly string[];   // top-N by focusedWindowMs, capped at 5
+  firstObservedAt: string;                   // ISO; min(member.firstObservedAt)
+  lastObservedAt: string;                    // ISO; max(member.lastObservedAt)
+  cohesion: number;                          // 0..1; mean cosine over the cluster's similarity edges
+};
+
+// New edge kinds:
+//   visit_in_topic       (visit → topic)              confidence: 'inferred'
+//   topic_in_workstream  (topic → workstream)         confidence: 'inferred'
+//   topic.lineage        (topic_old → topic_new)      confidence: 'observed', kind: 'split' | 'merge'
+
+type TopicRevision = {
+  revisionId: string;     // sha256(visit-similarity revisionId + cosineThreshold + clustering algo version).slice(0, 16)
+  visitSimilarityRevisionId: string;
+  cosineThreshold: number;       // for membership, default 0.85 (matches S9)
+  algorithmVersion: 'union-find:v1';
+  topics: readonly {
+    topicId: string;             // "topic:" + sha256(members.sort().join("\n")).slice(0, 16)
+    memberCanonicalUrls: readonly string[];     // sorted ascending
+    metadata: TopicNodeMetadata;
+  }[];
+  lineage: readonly {
+    fromTopicId: string;
+    toTopicId: string;
+    kind: 'split' | 'merge';
+    observedAt: string;          // ISO
+  }[];
+  producedAt: number;
+};
+```
+
+*Change shape:*
+- Path-compressed Union-Find with rank heuristic in `unionFind.ts`. O(α(n)) per
+  union; deterministic iteration order over insertion sequence; expose
+  `add(key)`, `union(a, b)`, `find(key)`, `members(componentRoot): readonly string[]`,
+  `components(): readonly { root: string; members: readonly string[] }[]`.
+- `topicId(members)` in `topicId.ts`. Content-derived: members sorted by canonical
+  URL ascending, joined by `"\n"`, SHA-256, base64-url, sliced to 16 chars,
+  prefixed `"topic:"`. Two replicas with the same membership produce the same id.
+- `topicClusterer.ts`:
+  1. Initialize Union-Find with all visit canonical URLs that have any similarity
+     edge AND focusedWindowMs > 5000.
+  2. Apply USER-ASSERTED edges first: any `in_thread` or `in_workstream` relation
+     where both endpoints are visits. `uf.union(a, b)`.
+  3. Apply COSINE edges: every `visit_resembles_visit` from S9 with cosine ≥ 0.85.
+     `uf.union(a, b)`.
+  4. For each component with `members.length ≥ 2`, compute `topicId`, gather
+     metadata, emit a topic.
+  5. Compute `topic.lineage` by diffing the previous revision's components
+     against the current revision's. A previous component that's now split into
+     two emits `kind: 'split'` from old → each new. A merge emits
+     `kind: 'merge'` from each old → new.
+- Pass 8 in `snapshot.ts`: read the active topic revision; for each topic, emit:
+  - `topic` node with `metadata` from the revision.
+  - `visit_in_topic` edges from each member visit to the topic
+    (`confidence: 'inferred'`, `producedBy: { source: 'topic-clusterer', revisionId }`).
+  - `topic_in_workstream` when ≥ 75 % of members share a `workstreamId`. Threshold
+    exposed as a setting.
+  - `topic.lineage` edges from the revision's `lineage` array
+    (`confidence: 'observed'`, `producedBy: { source: 'topic-clusterer', revisionId }`).
+- Persistence: Class E revision at `_BAC/connections/topics/<revisionId>.json`.
+  Old revisions GCed via auditRetention.
+
+*Test scenarios:*
+
+`unionFind.test.ts`:
+- Classic disjoint-set property tests (find, union, path compression).
+- Deterministic iteration: insertion order A, B, C → `components()` returns the
+  same root assignment as B, A, C in the SAME insertion sequence (the test verifies
+  determinism for a fixed sequence).
+- Path compression preserves component identity across deep find chains.
+
+`topicId.test.ts`:
+- Same membership → same id, regardless of input order. Permute member array,
+  hash matches.
+- Different membership → different id (delete one member, expect different id).
+
+`topicClusterer.test.ts`:
+- **Cosine threshold.** Cluster with all edges at cosine 0.84 → no topic. All
+  edges at 0.86 → 1 topic with all 3 members.
+- **User-asserted override.** 3 visits, no cosine edges, but 1 `in_thread` edge
+  between two of them → 1 topic of 2 members.
+- **Engagement gate.** A visit with focusedWindowMs=4000 is excluded from
+  Union-Find inputs even if it has high-cosine edges.
+- **Singleton suppression.** A 1-visit "cluster" emits no topic.
+- **`topic.lineage` split.** Previous revision: topic X of 4 members. Current:
+  one member's similarity edges have decayed below threshold; topic X splits
+  into topic Y (3 members) and topic Z (1 member). Emit `topic.lineage(X, Y,
+  kind: 'split')` AND `topic.lineage(X, Z, kind: 'split')`. (Z is a singleton
+  so topic Z is NOT emitted but the lineage edge still records the split.)
+- **`topic.lineage` merge.** Previous revision: topics X (3 members) + Y
+  (2 members). Current: a new visit bridges them via similarity. Emit topic
+  Z = X ∪ Y ∪ {bridge} and `topic.lineage(X, Z, kind: 'merge')`,
+  `topic.lineage(Y, Z, kind: 'merge')`.
+- **Cohesion metric.** A topic with 3 members and 3 cosine edges of values 0.85,
+  0.90, 0.95 → cohesion = 0.90.
+- **Determinism.** Build twice with the same input + same prior revision; output
+  byte-identical (excluding `producedAt`).
+
+*Fixtures:*
+
+- `packages/sidetrack-companion/src/connections/__fixtures__/topic-basic.json` —
+  6 visits forming 2 clusters (3 visits each).
+- `packages/sidetrack-companion/src/connections/__fixtures__/topic-user-assertion.json`
+  — Visits with weak cosine but strong user `in_thread` edges.
+- `packages/sidetrack-companion/src/connections/__fixtures__/topic-lineage-split.json`
+  — Previous revision + current revision pair demonstrating a split.
+- `packages/sidetrack-companion/src/connections/__fixtures__/topic-lineage-merge.json`
+  — Same for a merge.
 
 *Acceptance:*
-- `vitest run` green.
-- `topic_id` byte-identically reproduced by an independent replica given the
-  same membership (cross-replica determinism test).
-- Topic-formation e2e scenario (1.K-3) shows topic node with expected
-  representative titles.
+
+```sh
+cd packages/sidetrack-companion
+./node_modules/.bin/vitest run src/connections/unionFind.test.ts \
+  src/connections/topicId.test.ts src/connections/topicClusterer.test.ts          # all green
+./node_modules/.bin/tsc --noEmit -p tsconfig.json                                 # silent
+
+# Cross-replica id determinism check (mock 2 replicas with the same membership)
+./node_modules/.bin/vitest run src/connections/topicId.test.ts -t 'cross-replica' # green
+
+cd packages/sidetrack-extension
+./node_modules/.bin/wxt build                                                     # bundle clean
+```
 
 ---
 
@@ -1399,7 +1594,9 @@ exist in the merged log).
 
 *Worktree branch:* `codex/stage1-s11-cross-replica-evidence`.
 
-*Depends on:* S6 (`navigation.committed` events exist on multiple replicas).
+*Depends on:* S6 (`navigation.committed` events exist on multiple replicas). Can
+run in parallel with S9 / S10 / S12 — its inputs are pure event-log reads, no
+producer dependency.
 
 *Files (NEW unless noted):*
 - `packages/sidetrack-companion/src/materializers/cross-replica.ts` (NEW)
@@ -1407,26 +1604,89 @@ exist in the merged log).
 - `packages/sidetrack-companion/src/connections/snapshot.ts` (modify — Pass 9)
 - `packages/sidetrack-companion/src/connections/types.ts` (modify — add `'visit_observed_on_replica'` edge kind)
 
+*Reuse pointers:*
+- `eventLog.readMerged()` from `packages/sidetrack-companion/src/sync/eventLog.ts`
+  — gives the merged event stream (already used by `connectionsMaterializer.ts`).
+- `BROWSER_TIMELINE_OBSERVED` constant if S6 routes timeline events through that;
+  otherwise the new `'navigation.committed'` constant from S6's registration.
+
+*Schemas:*
+
+```ts
+// New ConnectionEdgeKind value: 'visit_observed_on_replica'
+// Edge shape:
+{
+  kind: 'visit_observed_on_replica',
+  fromNodeId: 'timeline-visit:<canonical-url>',
+  toNodeId: 'replica:<replica-id>',     // NEW node kind 'replica' (10th)
+  confidence: 'observed',
+  producedBy: { source: 'cross-replica' },
+  observedAt: '<iso>',                  // first-observed-at on that replica
+  family: 'urlmatch'
+}
+
+// Pure reducer signature.
+type BuildCrossReplicaEdges = (
+  merged: readonly AcceptedEvent[],
+) => readonly CrossReplicaEdge[];
+```
+
 *Change shape:*
-- Pure reducer over the merged event log. For each pair of `navigation.committed`
-  events with the same `canonicalUrl` and DIFFERENT `dot.replicaId`, emit
-  `visit_observed_on_replica(visit_a, replicaId_b)` with `confidence: 'observed'`,
-  `producedBy: { source: 'cross-replica' }` (no revisionId; deterministic Class B
-  evidence — every replica with the same merged log produces the same edge).
+- Pure reducer over the merged event log. Filter `navigation.committed` events
+  (or whichever Class F event-type carries the canonical URL — verify against
+  S6's actual event-type constant).
+- Group by `canonicalUrl`. For each group, emit `visit_observed_on_replica` for
+  every distinct `dot.replicaId` other than the first-observing one. The edge's
+  source is the canonical visit (`timeline-visit:<canonicalUrl>`); the target is
+  a `replica:<replicaId>` node.
+- New `'replica'` `ConnectionNodeKind` (10th) — minimal node, `metadata: { replicaId, firstSeenAt, lastSeenAt }`.
+  Replica nodes don't get a paper-warm tint or special UI treatment in Stage 1
+  (deferred to Stage 2 cross-device-continuation classifier work); they exist as
+  a graph endpoint so the edge has somewhere to point.
+- `confidence: 'observed'`, `producedBy: { source: 'cross-replica' }`. NO
+  revisionId (deterministic Class B evidence — every replica with the same merged
+  log produces the same edge, so revision tracking is meaningless).
 - Family: `urlmatch` (content match, not navigation).
-- Emit ONE edge per `(visit, replicaId)` pair, even if the same replica observed
-  the URL at multiple times — first-observed-at wins for the edge timestamp.
+- Emit ONE edge per `(canonicalUrl, replicaId)` pair, even if the same replica
+  observed the URL multiple times — first-observed-at on that replica wins for
+  the edge timestamp.
+- Sort emission deterministically: edges sorted by `(fromNodeId, toNodeId)`
+  lexically.
 - Pass 9 in `snapshot.ts`.
 
-*Tests required:*
-- `cross-replica.test.ts` — multi-replica fixture: 2 replicas observe the same
-  canonicalUrl; assert exactly one edge per `(visit, replicaId)` pair, with
-  `confidence: 'observed'` and `producedBy.source: 'cross-replica'`.
+*Test scenarios (`cross-replica.test.ts`):*
+
+- **Single replica.** Fixture with all events from one replicaId → no cross-replica
+  edges emitted.
+- **Two replicas, same URL.** Fixture: replica A observes `https://example.com/x`
+  at T1; replica B observes the same URL at T2. Emit:
+  - `visit_observed_on_replica('timeline-visit:https://example.com/x' → 'replica:A', observedAt: T1)`
+  - `visit_observed_on_replica('timeline-visit:https://example.com/x' → 'replica:B', observedAt: T2)`
+- **One replica observed many times.** Fixture: replica A observes URL at T1,
+  T2, T3. Emit ONE edge with `observedAt: T1` (first-observed-at wins).
+- **Three replicas, partially-overlapping URLs.** Replica A: {url1, url2}.
+  Replica B: {url1, url3}. Replica C: {url2, url3}. Emit edges:
+  - url1 → A (T_A1), B (T_B1)
+  - url2 → A (T_A2), C (T_C2)
+  - url3 → B (T_B3), C (T_C3)
+- **Determinism.** Build twice; output byte-identical.
+
+*Fixtures:*
+
+- `packages/sidetrack-companion/src/materializers/__fixtures__/cross-replica-basic.json`
+  — 2 replicas, 3 shared URLs, 2 unshared.
 
 *Acceptance:*
-- Cross-replica e2e scenario (1.K-4) passes: simulate a second replica observing
-  the same canonical URL via the relay; assert `visit_observed_on_replica` is
-  emitted; Flow Path renders a dashed cross-replica edge.
+
+```sh
+cd packages/sidetrack-companion
+./node_modules/.bin/vitest run src/materializers/cross-replica.test.ts            # green
+./node_modules/.bin/tsc --noEmit -p tsconfig.json                                  # silent
+```
+
+Cross-replica e2e scenario (1.K-4) passes: simulate a second replica observing the
+same canonical URL via the relay; assert `visit_observed_on_replica` is emitted on
+both replicas; Flow Path renders a dashed cross-replica edge.
 
 ---
 
@@ -1434,8 +1694,9 @@ exist in the merged log).
 
 *Worktree branch:* `codex/stage1-s12-engagement-classifier`.
 
-*Depends on:* S7 (engagement events), S8 (lineage matches for `source_extracted`
-and `execution_source`).
+*Depends on:* S7 (`engagement.session.aggregated` events), S8 (snippets projection
+for `source_extracted` and `execution_source`). Can run in parallel with S9 / S10
+/ S11 — it touches a different code path.
 
 *Files (NEW unless noted):*
 - `packages/sidetrack-companion/src/connections/engagementClassifier.ts` (NEW)
@@ -1443,32 +1704,144 @@ and `execution_source`).
 - `packages/sidetrack-companion/src/producers/engagement-class-revision.ts` (NEW)
 - `packages/sidetrack-companion/src/sync/contract/connectionsMaterializer.ts` (modify — thread classifier into the pipeline)
 - `packages/sidetrack-companion/src/connections/snapshot.ts` (modify — emit
-  `engagement.class` on `timeline-visit` node metadata)
+  `engagement.class` on `timeline-visit` node metadata in Pass 3 where timeline
+  visits are emitted)
+- `packages/sidetrack-companion/src/sync/contract/registry.ts` (modify — register
+  `engagement-class-projection` as a Class E projection surface)
+
+*Reuse pointers:*
+- `auditRetention.ts` retention pattern.
+- `Web Crypto API` for the rule-table hash (already used in recall pipeline).
+
+*Schemas:*
+
+```ts
+// 7-class enum
+type EngagementClass =
+  | 'parked_background'
+  | 'glanced'
+  | 'skimmed'
+  | 'engaged_read'
+  | 'worked_on_reference'
+  | 'source_extracted'
+  | 'execution_source';
+
+// Input shape (synthesized from S7 + S8 outputs by the materializer)
+type EngagementClassifierInput = {
+  visitId: string;
+  canonicalUrl: string;
+  engagement: {
+    activeMs: number;
+    visibleMs: number;
+    focusedWindowMs: number;
+    idleMs: number;
+    foregroundBursts: number;
+    returnCount: number;
+    scrollEvents: number;
+    maxScrollRatio: number;
+    copyCount: number;
+    pasteCount: number;
+  };
+  // From the snippets projection (S8). True if any selection.copied from this
+  // visit appears as selection.pasted into a thread/dispatch/note/capture.
+  hasDownstreamPasteLineage: boolean;
+  // From the snippets projection. Distinct destination kinds across pastes.
+  distinctPasteDestinationKinds: number;
+};
+
+type EngagementClassRevision = {
+  revisionId: string;       // sha256('engagement-class:v1:rules' + sortedRuleTableHash).slice(0, 16)
+  producerKey: 'engagement-class:v1:rules';
+  ruleTableHash: string;    // sha256 of the canonical-form rule table (sorted rules)
+  classifications: readonly {
+    visitId: string;
+    canonicalUrl: string;
+    class: EngagementClass;
+  }[];
+  producedAt: number;
+};
+
+// Pure function signature
+type ClassifyEngagement = (
+  input: EngagementClassifierInput,
+) => EngagementClass;
+```
 
 *Change shape:*
-- Pure deterministic reducer per the 7-class table in § 1.G. Input: an
-  `engagement.session.aggregated` payload + the snippets projection (for
-  `source_extracted` / `execution_source`).
+- Pure deterministic reducer per the 7-class table in § 1.G. Input: per-visit
+  engagement aggregates + per-visit snippet-lineage flags.
+- Rule application order matters (lower-numbered classes are checked first; first
+  match wins). Order is the table order in § 1.G:
+  1. `parked_background`
+  2. `glanced`
+  3. `skimmed`
+  4. `engaged_read`
+  5. `worked_on_reference`
+  6. `source_extracted`
+  7. `execution_source`
+- However, classes 5/6/7 are STRICTLY MORE SPECIFIC than classes 3/4 (they
+  require additional facts), so the implementation runs the most-specific check
+  first and falls back. The Codex implementation should:
+  - Check `execution_source` first.
+  - Fall through to `source_extracted`.
+  - Fall through to `worked_on_reference`.
+  - Fall through to `engaged_read`.
+  - Fall through to `skimmed`.
+  - Fall through to `glanced`.
+  - Default to `parked_background`.
 - Output: a Class E revision keyed `engagement-class:v1:rules`.
-  `revisionId = sha256('engagement-class:v1:rules' + sorted-rule-table-hash).slice(0, 16)`.
-  The rule table is the source of truth; the revision id changes only when the
-  rules change.
+  `revisionId = sha256('engagement-class:v1:rules' + ruleTableHash).slice(0, 16)`.
+  `ruleTableHash` is the SHA-256 of the rule table serialized in canonical form
+  (sorted by class name, with all numeric thresholds). The revision id changes
+  ONLY when the rule table changes.
 - Visit nodes get `metadata.engagement.class = '...'` from the active revision.
   Side panel "Focus View" tab groups by class.
+- Persistence: Class E revision at `_BAC/connections/engagement-class/<revisionId>.json`.
 - Future learned classifier ships under `engagement-class:v2:learned` with
   matching `revisionId` discipline; consumers pin which producer's output they
   surface.
 
-*Tests required:*
-- `engagementClassifier.test.ts` — 7-class boundary tests (one fixture per class
-  + one fixture that just-misses each boundary); revision-id stability across
-  runs.
+*Test scenarios (`engagementClassifier.test.ts`):*
+
+- **Class boundary — `parked_background`.** `focusedWindowMs=1500, activeMs=500`
+  → `parked_background`. `focusedWindowMs=2500, activeMs=1500` → NOT
+  `parked_background` (falls through).
+- **Class boundary — `glanced`.** `activeMs=4500, maxScrollRatio=0.10, copyCount=0`
+  → `glanced`. `activeMs=5500` → falls through.
+- **Class boundary — `skimmed`.** `activeMs=10000, maxScrollRatio=0.30,
+  scrollEvents=5, copyCount=0` → `skimmed`. `copyCount=1` → falls through.
+- **Class boundary — `engaged_read`.** `activeMs=35000, maxScrollRatio=0.50,
+  returnCount=2` → `engaged_read`. `copyCount=0` → stays at `engaged_read`.
+- **Class boundary — `worked_on_reference`.** `engaged_read` profile + `copyCount=2`
+  + `returnCount=2` → `worked_on_reference`.
+- **Class boundary — `source_extracted`.** `worked_on_reference` profile +
+  `hasDownstreamPasteLineage=true` → `source_extracted`.
+- **Class boundary — `execution_source`.** `source_extracted` profile + `copyCount=3`
+  + `distinctPasteDestinationKinds=2` → `execution_source`.
+- **Determinism — same input → same output.** Single fixture, run 100 times,
+  every run produces the same class.
+- **Revision id stability — unchanged rule table → unchanged revisionId.** Boot
+  the classifier twice; assert `revisionId` matches.
+- **Revision id changes on rule-table mutation.** Modify a threshold;
+  `revisionId` differs.
+
+*Fixtures:*
+
+- `packages/sidetrack-companion/src/connections/__fixtures__/engagement-7-classes.json`
+  — One fixture per class plus one boundary-case fixture per class (14 total).
 
 *Acceptance:*
-- `vitest run` green.
-- Engagement-classification e2e scenario (1.K-2) passes: 3 pages with distinct
-  engagement profiles produce the expected `parked_background`, `skimmed`,
-  `engaged_read` classes.
+
+```sh
+cd packages/sidetrack-companion
+./node_modules/.bin/vitest run src/connections/engagementClassifier.test.ts        # green
+./node_modules/.bin/tsc --noEmit -p tsconfig.json                                  # silent
+./node_modules/.bin/vitest run src/connections/engagementClassifier.test.ts -t 'determinism'  # 100 iterations green
+```
+
+Engagement-classification e2e scenario (1.K-2) passes: 3 pages with distinct
+engagement profiles produce the expected `parked_background`, `skimmed`,
+`engaged_read` classes.
 
 ---
 
@@ -1478,7 +1851,9 @@ and `execution_source`).
 
 *Worktree branch:* `codex/stage1-s13-deterministic-templates`.
 
-*Depends on:* S10 (topic nodes), S11 (cross-replica edges), S12 (engagement classes).
+*Depends on:* S10 (topic nodes), S11 (cross-replica edges), S12 (engagement
+classes). All three need to land before S13 can integrate; S13 can be authored
+against fixtures of those outputs in parallel with Wave C if Codex prefers.
 
 *Files (NEW unless noted):*
 - `packages/sidetrack-extension/src/sidepanel/connections/why-related/reasons.ts` (NEW — Reason union per § 1.I)
@@ -1490,33 +1865,157 @@ and `execution_source`).
 - `packages/sidetrack-extension/src/sidepanel/connections/contextPack.ts` (NEW — pure Markdown reducer)
 - `packages/sidetrack-extension/src/sidepanel/connections/contextPack.test.ts`
 
+*Reuse pointers:*
+- Existing `ConnectionsSnapshot`, `ConnectionEdge`, `ConnectionNode` types from
+  `packages/sidetrack-companion/src/connections/types.ts` (re-imported by the
+  extension via the existing `connectionsClient`).
+- The new `EngagementClass` enum from S12.
+- The new `TopicNodeMetadata` shape from S10.
+- The existing markdown utilities under `packages/sidetrack-extension/src/util/`
+  if any (Codex should grep — do not introduce a new markdown lib).
+
+*Schemas:*
+
+```ts
+// reasons.ts — full union per § 1.I (12 variants total).
+export type Reason =
+  | { code: 'SAME_THREAD'; threadId: string; threadName: string }
+  | { code: 'SAME_TOPIC'; topicId: string; cohesion: number }
+  | { code: 'COSINE_ABOVE_THRESHOLD'; cosine: number; threshold: number }
+  | { code: 'OPENER_CHAIN'; depth: number; viaTabSessionIdHash: string }
+  | { code: 'PREVIOUS_VISIT_IN_TAB_SESSION'; tabSessionIdHash: string }
+  | { code: 'TRANSITION_TYPE'; transitionType: string }
+  | { code: 'TRANSITION_QUALIFIER'; qualifier: string }
+  | { code: 'COPIED_FROM'; snippetId: string }
+  | { code: 'PASTED_INTO'; snippetId: string; destinationKind: string }
+  | { code: 'OBSERVED_ON_OTHER_REPLICA'; replicaId: string }
+  | { code: 'LEXICAL_OVERLAP'; topTokens: readonly string[] }
+  | { code: 'LINK_OUT_FROM' | 'LINK_IN_TO'; otherVisitId: string };
+
+// sort.ts — priority order (low number = render first).
+export const REASON_PRIORITY: Record<Reason['code'], number> = {
+  SAME_THREAD: 1,
+  COPIED_FROM: 2, PASTED_INTO: 2,
+  OPENER_CHAIN: 3, PREVIOUS_VISIT_IN_TAB_SESSION: 3,
+  TRANSITION_TYPE: 4, TRANSITION_QUALIFIER: 4,
+  OBSERVED_ON_OTHER_REPLICA: 5,
+  SAME_TOPIC: 6,
+  COSINE_ABOVE_THRESHOLD: 7,
+  LINK_OUT_FROM: 8, LINK_IN_TO: 8,
+  LEXICAL_OVERLAP: 9,
+};
+
+// render.ts
+export const renderReason = (r: Reason): string => {
+  switch (r.code) {
+    case 'SAME_THREAD': return `Same thread: ${r.threadName}`;
+    case 'SAME_TOPIC': return `Same topic (cohesion ${r.cohesion.toFixed(2)})`;
+    case 'COSINE_ABOVE_THRESHOLD': return `Title similarity ${r.cosine.toFixed(2)} ≥ ${r.threshold.toFixed(2)}`;
+    case 'OPENER_CHAIN': return `Opened from another visit (${r.depth} hop${r.depth === 1 ? '' : 's'})`;
+    case 'PREVIOUS_VISIT_IN_TAB_SESSION': return `Previous visit in the same tab session`;
+    case 'TRANSITION_TYPE': return `Navigation transition: ${r.transitionType}`;
+    case 'TRANSITION_QUALIFIER': return `Navigation qualifier: ${r.qualifier}`;
+    case 'COPIED_FROM': return `Snippet copied from this page`;
+    case 'PASTED_INTO': return `Pasted into ${r.destinationKind}`;
+    case 'OBSERVED_ON_OTHER_REPLICA': return `Also observed on replica ${r.replicaId}`;
+    case 'LEXICAL_OVERLAP': return `Shared terms: ${r.topTokens.slice(0, 3).join(', ')}`;
+    case 'LINK_OUT_FROM': return `This page links to that one`;
+    case 'LINK_IN_TO': return `That page links to this one`;
+  }
+};
+
+// topicLabel.ts
+export const topicLabel = (t: { members: readonly { canonicalUrl: string; title: string; focusedWindowMs: number }[]; cohesion: number }): { label: string; tooltip: string } => {
+  const top = t.members.slice().sort(
+    (a, b) => b.focusedWindowMs - a.focusedWindowMs || a.canonicalUrl.localeCompare(b.canonicalUrl)
+  )[0];
+  return {
+    label: top?.title || top?.canonicalUrl || '(untitled topic)',
+    tooltip: `cohesion=${t.cohesion.toFixed(2)} · members=${t.members.length}`,
+  };
+};
+```
+
 *Change shape:*
-- `Reason` union type per § 1.I (12 codes from `SAME_THREAD` to `LINK_OUT_FROM`).
-- Renderer: pure switch over `code` emitting parallel-structured bullets. Sort by
-  fixed priority — user-asserted relations first, behavioral facts second,
-  similarity third, lexical overlap last.
-- Topic-label = top member by `focusedWindowMs` (ties broken by canonical URL
-  ascending).
-- Context Pack = pure Markdown reducer over (topic, threads, dispatches,
-  snippets, user notes). "Open Questions" extracted line-by-line from
-  user-authored notes (line ending in `?`, length ≥ 8, ≤ 200 chars). Section
+- `Reason` union type per the schema above. 13 codes total. Two of those codes
+  (`LINK_OUT_FROM`, `LINK_IN_TO`) share a discriminant — Codex should expand into
+  separate const arms for clarity.
+- Renderer: pure switch over `code` emitting parallel-structured bullets. The
+  string output is locale-independent (English; future locale work uses an i18n
+  layer that's NOT in Stage 1 scope).
+- Sort: `Reason[]` → sorted by `REASON_PRIORITY[r.code]` ascending; ties broken
+  by stringified payload lexically.
+- Topic label = top member by `focusedWindowMs` (ties broken by canonical URL
+  ascending). Tooltip carries cohesion + memberCount.
+- Context Pack = pure Markdown reducer over `(topic, threads, dispatches,
+  snippets, userNotes)`. Sections per § 1.I; "Open Questions" extracted from
+  user-authored notes only (regex `/.*\?\s*$/u`, length 8..200 chars). Section
   omitted when no extractable question exists.
 - All functions are PURE (no I/O; no `Date.now()` — caller passes a clock).
   Byte-deterministic outputs on the same inputs.
 
-*Tests required:*
-- `reasons.test.ts`, `sort.test.ts`, `render.test.ts` — fixture-based; assert
-  byte-identical output across re-runs.
-- `topicLabel.test.ts` — tie-breaking by canonical URL.
-- `contextPack.test.ts` — Markdown structure stability; "Open Questions"
-  extraction edge cases (no questions → omit; multi-line question → take last
-  line).
+*Test scenarios:*
+
+`reasons.test.ts` — type-only test that the union exhaustively covers every
+producer-emitted reason; relies on `never` exhaustiveness check.
+
+`sort.test.ts`:
+- **Priority order.** Mixed `Reason[]` with one of each kind; assert sorted
+  output matches the priority table above.
+- **Tie-break stability.** Two `COSINE_ABOVE_THRESHOLD` reasons with different
+  payloads → sorted by stringified payload lexically.
+
+`render.test.ts`:
+- **Every code renders.** One fixture per code (13 total); assert exact string
+  output. This is the byte-determinism guard.
+- **Locale-stable.** Two runs of the same fixture; `JSON.stringify` of the
+  rendered output is identical.
+
+`topicLabel.test.ts`:
+- **Top-by-focusedWindowMs.** 3 members with focusedWindowMs 5000 / 10000 / 7500
+  → label = title of the 10000 member.
+- **Tie-break by canonical URL ascending.** Two members with focusedWindowMs
+  10000 → label = title of the lexically-lower canonical URL.
+- **Empty title fallback.** Top member's title is empty string → label = its
+  canonicalUrl.
+- **Empty topic fallback.** No members → label = `'(untitled topic)'`.
+
+`contextPack.test.ts`:
+- **All sections rendered.** Fixture with topic + threads + dispatches +
+  snippets + 2 user-authored open questions → Markdown contains all 5 sections.
+- **Empty-section omission.** Fixture with no dispatches → "Dispatches" section
+  is absent from output.
+- **Open Questions extraction.** User note containing 5 lines, 2 ending in `?`
+  → both extracted. Note containing only declarative text → "Open Questions"
+  section absent.
+- **Snippet hash-only.** Snippet with `rawTextStored: false` renders as
+  `"(hashed)"`; snippet with `rawTextStored: true` renders the first 80 chars.
+- **Determinism.** Same input twice → byte-identical Markdown.
+
+*Fixtures:*
+
+- `packages/sidetrack-extension/src/sidepanel/connections/__fixtures__/reasons-all.json`
+  — One fixture per `Reason.code` (13 total).
+- `packages/sidetrack-extension/src/sidepanel/connections/__fixtures__/topic-label-cases.json`
+  — Top-by-focus, tie-break, empty fallbacks.
+- `packages/sidetrack-extension/src/sidepanel/connections/__fixtures__/context-pack-full.json`
+  — Full-content fixture for the Context Pack reducer.
+- `packages/sidetrack-extension/src/sidepanel/connections/__fixtures__/context-pack-omit-sections.json`
+  — Fixture with intentionally empty sections.
 
 *Acceptance:*
-- `vitest run` green.
-- Determinism-of-explanations e2e scenario (1.K-7) passes: same fixture, two runs,
-  byte-identical reason-code output.
-- No outbound network calls (asserted by test-suite-wide network mock).
+
+```sh
+cd packages/sidetrack-extension
+./node_modules/.bin/vitest run src/sidepanel/connections/why-related/ \
+  src/sidepanel/connections/topicLabel.test.ts \
+  src/sidepanel/connections/contextPack.test.ts                                    # all green
+./node_modules/.bin/tsc --noEmit -p tsconfig.json                                  # silent
+```
+
+Determinism-of-explanations e2e scenario (1.K-7) passes: same fixture, two runs,
+byte-identical reason-code output. No outbound network calls (asserted by
+test-suite-wide network mock).
 
 ---
 
@@ -1524,46 +2023,149 @@ and `execution_source`).
 
 *Worktree branch:* `codex/stage1-s14-ui-surfaces`.
 
-*Depends on:* S13 (templates), S1 (confidence enum + dashed CSS).
+*Depends on:* S13 (templates), S1 (confidence enum + dashed CSS), S10 (topic
+nodes), S11 (cross-replica edges), S12 (engagement classes). Most depended-on
+subtask in the plan; runs near-last.
 
 *Files (NEW unless noted):*
 - `packages/sidetrack-extension/src/sidepanel/connections/FlowPathView.tsx` (NEW)
+- `packages/sidetrack-extension/src/sidepanel/connections/FlowPathView.test.tsx` (NEW)
 - `packages/sidetrack-extension/src/sidepanel/connections/FocusView.tsx` (NEW)
+- `packages/sidetrack-extension/src/sidepanel/connections/FocusView.test.tsx` (NEW)
 - `packages/sidetrack-extension/src/sidepanel/connections/WhyRelatedPanel.tsx` (NEW)
+- `packages/sidetrack-extension/src/sidepanel/connections/WhyRelatedPanel.test.tsx` (NEW)
 - `packages/sidetrack-extension/src/sidepanel/connections/ContextPackComposer.tsx` (NEW)
+- `packages/sidetrack-extension/src/sidepanel/connections/ContextPackComposer.test.tsx` (NEW)
 - `packages/sidetrack-extension/src/sidepanel/connections/ConnectionsView.tsx` (modify — tab routing)
-- `packages/sidetrack-extension/src/sidepanel/connections/connectionsClient.ts` (modify — read endpoints for label / why-related / context-pack)
+- `packages/sidetrack-extension/src/sidepanel/connections/connectionsClient.ts` (modify — read endpoints for label / why-related / context-pack via the existing chrome.runtime message-proxy pattern)
 - `packages/sidetrack-extension/entrypoints/sidepanel/style.css` (modify — Flow Path linear-timeline layout, Focus View card grid, topic + snippet tints)
-- Component-level tests for each new view (render snapshot tests).
+- `packages/sidetrack-extension/tests/unit/connections/network-mock.test.ts` (NEW — assert no LLM-shaped fetch calls)
+
+*Reuse pointers:*
+- `ConnectionsView.tsx` existing structure — keep as the entry point, add tabs
+  for the four new sub-views.
+- `connectionsClient.ts` existing message-proxy pattern (chrome.runtime
+  sendMessage / response handling) — extend to add 3 new endpoints, do not
+  introduce direct `fetch()` calls from the side panel.
+- Existing `paper-warm` 8-tint palette in `style.css` for node-kind tints — S10
+  already added the 8th tint for `topic`; this brief adds the 9th for `snippet`.
+- Existing tab-switching pattern in the side panel (workstream / Connections
+  tabs) — mirror that pattern for the 4 sub-tabs inside Connections.
+
+*Component contracts:*
+
+```tsx
+// FlowPathView.tsx
+type FlowPathViewProps = {
+  visits: readonly TimelineVisit[];
+  navigationEdges: readonly NavigationEdge[];   // previousVisitId / openerVisitId edges
+  crossReplicaEdges: readonly CrossReplicaEdge[];
+  onNodeClick: (visitId: string) => void;       // opens WhyRelatedPanel
+};
+
+// FocusView.tsx
+type FocusViewProps = {
+  topics: readonly TopicNode[];
+  visitsByTopic: Record<string, readonly TimelineVisit[]>;
+  engagementClassesByVisit: Record<string, EngagementClass>;
+  onTopicClick: (topicId: string) => void;
+  onVisitClick: (visitId: string) => void;
+};
+
+// WhyRelatedPanel.tsx
+type WhyRelatedPanelProps = {
+  fromVisitId: string;
+  toVisitId?: string;            // when comparing pair
+  toTopicId?: string;            // when comparing visit-to-topic
+  reasons: readonly Reason[];    // pre-sorted by S13's sort.ts
+  showOnlyUserAsserted: boolean;
+  onToggleAssertedOnly: () => void;
+  onClose: () => void;
+};
+
+// ContextPackComposer.tsx
+type ContextPackComposerProps = {
+  workstreamId: string;
+  // The composer fetches the topic + threads + dispatches + snippets via
+  // connectionsClient and runs the S13 contextPack reducer locally.
+  onClose: () => void;
+};
+```
 
 *Change shape:*
-- Flow Path tab: directed temporal view over `navigation.committed` grouped by
-  `tabSessionIdHash`. Edges drawn from `previousVisitId` (solid) and
-  `openerVisitId` (solid). Cross-replica continuations from
-  `visit_observed_on_replica` render dashed (Lock 1). Hover reveals engagement
-  class. Click opens Why Related panel for that node.
-- Focus View tab: topic-centric. Topic nodes first-class; visits inside a topic
-  ordered by `focusedWindowMs`. Topics with user-asserted threads/dispatches/
-  snippets visually weighted higher. Top member's title is the topic label.
-- Why Related panel: opens on edge click. Renders the Reason list (S13).
-  Toggle "Show only user-asserted" filters out `confidence: 'inferred'` reasons.
-- Context Pack composer: per-workstream button; renders Markdown (S13);
-  copy-to-clipboard with explicit visual confirmation. Never opens a network
+- Flow Path tab: directed temporal view. Layout: linear, left-to-right by
+  `commitTimestamp`, grouped vertically by `tabSessionIdHash`. Edges drawn from
+  `previousVisitId` (solid) and `openerVisitId` (solid). Cross-replica
+  continuations from `visit_observed_on_replica` render dashed (S1's
+  `.confidence-inferred` class — but wait: cross-replica edges have
+  `confidence: 'observed'`, NOT `'inferred'`. They render dashed by a separate
+  CSS class `.cx-edge-cross-replica` to distinguish from inference dashing).
+  Hover reveals engagement class via tooltip. Click opens WhyRelatedPanel.
+- Focus View tab: topic-centric. Topic cards in a responsive grid; each card
+  shows representative title, member count, cohesion bar, dominant workstream
+  chip if present, and an expand button revealing member visits ordered by
+  `focusedWindowMs`. Visits inside a card show their engagement class as a
+  colored dot.
+- Why Related panel: side-drawer that opens on edge or visit-pair click. Renders
+  the Reason list from S13. Toggle "Show only user-asserted" filters out reasons
+  with `confidence: 'inferred'`.
+- Context Pack composer: per-workstream button labeled "Compose Context Pack".
+  On click, gathers the workstream's topic / threads / dispatches / snippets via
+  `connectionsClient`, runs the S13 contextPack reducer, displays the resulting
+  Markdown in a modal with a "Copy to clipboard" button. Never opens a network
   connection.
-- Network-mock: a global Playwright `context.route()` rule fails any outbound
-  request matching `*ollama*`, `*openai*`, `*anthropic*`, `*claude*`,
-  `*completions*` patterns. The unit test suite installs the same mock via fetch
-  spy.
+- Network-mock: a Playwright `context.route()` rule in the e2e fails any outbound
+  request matching `*ollama*`, `*openai*`, `*anthropic*`, `*claude*.ai`,
+  `*completions*`, `api.openai.com`, `api.anthropic.com` patterns. The unit
+  suite mirrors via a global `vi.spyOn(globalThis, 'fetch')` that throws on
+  matching URLs.
 
-*Tests required:*
-- Component snapshot tests for each new view.
-- Network-mock test: render any of the four surfaces with a mock fetch that
-  fails on LLM-shaped URLs; assert no failure occurs (= no calls made).
+*Test scenarios:*
+
+`FlowPathView.test.tsx`:
+- **Renders all visits.** Fixture with 6 visits across 2 tab sessions; assert
+  6 visit nodes + 4 navigation edges (3 within each tab session) render.
+- **Cross-replica edges dashed.** Fixture with one cross-replica edge; assert
+  the edge has `.cx-edge-cross-replica` class.
+- **Click handler.** Click a visit; assert `onNodeClick` fires with the visit id.
+
+`FocusView.test.tsx`:
+- **Topics grouped.** Fixture with 2 topics + 4 visits; assert 2 cards rendered.
+- **Engagement class dots.** Each visit shows the right colored dot for its class.
+- **Workstream-asserted weighting.** Topic with a `topic_in_workstream` edge
+  renders with a "Workstream" chip on the card.
+
+`WhyRelatedPanel.test.tsx`:
+- **All Reason kinds render.** Fixture with one of each Reason → all 13 bullets
+  visible.
+- **Toggle filters inferred.** Mixed Reason list; toggle on → only
+  user-asserted-priority reasons remain.
+
+`ContextPackComposer.test.tsx`:
+- **Composes Markdown.** Stubbed connectionsClient returns a fixture; assert
+  Markdown matches the S13 reducer output.
+- **Copy-to-clipboard.** Mock `navigator.clipboard.writeText`; click "Copy";
+  assert the mock was called with the Markdown.
+- **No network calls.** With the network-mock active, render the composer +
+  copy → no fetch firings on LLM-shaped URLs.
+
+`network-mock.test.ts`:
+- **Suite-wide.** Render any combination of the four surfaces; assert
+  `globalThis.fetch` is never called with an LLM-shaped URL.
 
 *Acceptance:*
-- `vitest run` green; `wxt build` clean.
-- All four surfaces visible in the e2e (1.K).
-- Lighthouse pass (no broken accessibility) on each surface.
+
+```sh
+cd packages/sidetrack-extension
+./node_modules/.bin/vitest run src/sidepanel/connections/                          # all green
+./node_modules/.bin/vitest run tests/unit/connections/network-mock.test.ts         # green
+./node_modules/.bin/tsc --noEmit -p tsconfig.json                                  # silent
+./node_modules/.bin/wxt build                                                      # bundle clean
+```
+
+All four surfaces visible in the e2e (1.K). Lighthouse axe-core run on each
+surface returns 0 critical accessibility issues (manual verification step;
+documented in S15's e2e checklist).
 
 ---
 
