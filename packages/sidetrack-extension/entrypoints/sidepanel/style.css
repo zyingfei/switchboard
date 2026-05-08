@@ -6980,6 +6980,7 @@ pre.diff {
 .cx-type-annotation   { --tint: #efe9d7; --line: #7a6a4f; }
 .cx-type-snippet      { --tint: #e6dde5; --line: #624d60; }
 .cx-type-topic        { --tint: #e5ded0; --line: #6d604f; }
+.cx-type-replica      { --tint: #d9e4e8; --line: #3e6470; }
 
 /* node chip */
 .cx-node {

@@ -13,7 +13,8 @@ export type ConnectionNodeKind =
   | 'timeline-visit'
   | 'annotation'
   | 'snippet'
-  | 'topic';
+  | 'topic'
+  | 'replica';
 
 export interface ConnectionNode {
   readonly id: string;

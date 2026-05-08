@@ -10,6 +10,11 @@ import {
 } from '../dispatches/events.js';
 import { createRevision } from '../domain/ids.js';
 import {
+  buildCrossReplicaMaterialization,
+  replicaIdFromNodeId,
+  type CrossReplicaMaterialization,
+} from '../materializers/cross-replica.js';
+import {
   DEFAULT_TOPIC_WORKSTREAM_SHARE_THRESHOLD,
   type TopicRevision,
 } from '../producers/topic-revision.js';
@@ -164,6 +169,7 @@ export interface ConnectionsInput {
   readonly visitSimilarity?: VisitSimilarityRevision;
   readonly topicRevision?: TopicRevision;
   readonly topicWorkstreamShareThreshold?: number;
+  readonly crossReplica?: CrossReplicaMaterialization;
   readonly scope?: ConnectionsSnapshotScope;
 }
 
@@ -1362,6 +1368,74 @@ export const buildConnectionsSnapshot = (
         metadata: { lineageKind: lineage.kind },
       });
     }
+  }
+
+  // -------------------------------------------------------------------
+  // Pass 9 — cross-replica visit evidence. Navigation commits from
+  // the merged log are reduced into one edge per shared
+  // (canonicalUrl, replicaId) pair. Replica nodes exist only as
+  // graph endpoints for this observed evidence.
+  // -------------------------------------------------------------------
+  const crossReplica = input.crossReplica ?? buildCrossReplicaMaterialization(input.events);
+  const replicaSummaryById = new Map(
+    crossReplica.replicas.map((replica) => [replica.replicaId, replica] as const),
+  );
+  const timelineVisitPrefix = 'timeline-visit:';
+  for (const edge of crossReplica.edges) {
+    const replicaId = replicaIdFromNodeId(edge.toNodeId);
+    if (replicaId === null) continue;
+    if (!edge.fromNodeId.startsWith(timelineVisitPrefix)) continue;
+
+    const visitKey = edge.fromNodeId.slice(timelineVisitPrefix.length);
+    if (visitKey.length === 0) continue;
+
+    const replicaSummary = replicaSummaryById.get(replicaId);
+    const replicaFirstSeenAt = replicaSummary?.firstSeenAt ?? edge.observedAt;
+    const replicaLastSeenAt = replicaSummary?.lastSeenAt ?? edge.observedAt;
+    trackObservedAt(edge.observedAt);
+    trackObservedAt(replicaLastSeenAt);
+
+    const existingVisitNode = nodes.get(edge.fromNodeId);
+    upsertNode(nodes, {
+      kind: 'timeline-visit',
+      key: visitKey,
+      label: existingVisitNode?.label ?? visitKey,
+      observedAt: edge.observedAt,
+      replicaId,
+      metadata: {
+        canonicalUrl: visitKey,
+      },
+    });
+    upsertNode(nodes, {
+      kind: 'replica',
+      key: replicaId,
+      label: replicaId,
+      observedAt: replicaFirstSeenAt,
+      replicaId,
+      metadata: {
+        replicaId,
+        firstSeenAt: replicaFirstSeenAt,
+        lastSeenAt: replicaLastSeenAt,
+      },
+    });
+    if (replicaLastSeenAt !== replicaFirstSeenAt) {
+      upsertNode(nodes, {
+        kind: 'replica',
+        key: replicaId,
+        label: replicaId,
+        observedAt: replicaLastSeenAt,
+        replicaId,
+      });
+    }
+    upsertEdge(edges, {
+      kind: edge.kind,
+      fromNodeId: edge.fromNodeId,
+      toNodeId: edge.toNodeId,
+      observedAt: edge.observedAt,
+      producedBy: edge.producedBy,
+      confidence: edge.confidence,
+      family: 'urlmatch',
+    });
   }
 
   // -------------------------------------------------------------------

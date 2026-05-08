@@ -113,6 +113,11 @@ export const EDGE_KINDS: Record<string, EdgeKindMetadata> = {
     description:
       'Visit-similarity revision linked these browser visits by title, host, and path corpus embedding.',
   },
+  visit_observed_on_replica: {
+    family: 'urlmatch',
+    label: 'observed on',
+    description: 'The same canonical visit was observed on more than one replica.',
+  },
   visit_in_workstream: {
     family: 'contain',
     label: 'in workstream',
@@ -197,6 +202,7 @@ export const NODE_KIND_DISPLAY: Record<
   annotation: { label: 'Annotation', tintClass: 'cx-type-annotation' },
   snippet: { label: 'Snippet', tintClass: 'cx-type-snippet' },
   topic: { label: 'Topic', tintClass: 'cx-type-topic' },
+  replica: { label: 'Replica', tintClass: 'cx-type-replica' },
 };
 
 // Display order for kind groups in the linked-panels center column.
@@ -210,6 +216,7 @@ export const NODE_KIND_GROUP_ORDER: readonly ConnectionNodeKind[] = [
   'timeline-visit',
   'topic',
   'snippet',
+  'replica',
   'annotation',
   'queue-item',
   'inbound-reminder',
@@ -224,6 +231,7 @@ export const contentDerivedHint = (kind: string): string | null => {
   if (kind === 'thread_quotes_thread') return 'quoted in turn';
   if (kind === 'thread_text_mentions_search_query') return 'via search query match';
   if (kind === 'visit_resembles_visit') return 'via similarity';
+  if (kind === 'visit_observed_on_replica') return 'via replica evidence';
   if (kind === 'visit_in_workstream') return 'via active workstream';
   if (kind.startsWith('snippet_')) return 'via copy/paste';
   return null;

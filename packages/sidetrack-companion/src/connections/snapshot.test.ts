@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { ANNOTATION_CREATED } from '../annotations/events.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../dispatches/events.js';
+import { NAVIGATION_COMMITTED, type NavigationCommittedPayload } from '../navigation/events.js';
 import { QUEUE_CREATED } from '../queue/events.js';
 import { CAPTURE_RECORDED } from '../recall/events.js';
 import { SELECTION_COPIED, SELECTION_PASTED } from '../snippets/events.js';
@@ -66,6 +67,29 @@ const buildEvent = (input: {
   type: input.type,
   payload: input.payload,
   acceptedAtMs: input.acceptedAtMs ?? Date.parse('2026-05-07T10:00:00.000Z') + input.seq * 1000,
+});
+
+const navigationCommittedPayload = (input: {
+  readonly replicaId: string;
+  readonly seq: number;
+  readonly canonicalUrl: string;
+  readonly commitAt: string;
+}): NavigationCommittedPayload => ({
+  payloadVersion: 1,
+  visitId: `visit-${input.replicaId}-${String(input.seq)}`,
+  url: input.canonicalUrl,
+  canonicalUrl: input.canonicalUrl,
+  documentId: `doc-${input.replicaId}-${String(input.seq)}`,
+  parentDocumentId: null,
+  tabSessionIdHash: `tab-${input.replicaId}`,
+  windowSessionIdHash: `window-${input.replicaId}`,
+  openerVisitId: null,
+  previousVisitId: null,
+  navigationSequence: input.seq,
+  transitionType: 'link',
+  transitionQualifiers: [],
+  commitTimestamp: Date.parse(input.commitAt),
+  dimensions: { provenance: { source: 'test' } },
 });
 
 describe('connections — snapshot reducer (Given/Then)', () => {
@@ -1369,6 +1393,81 @@ describe('connections — determinism + cross-replica', () => {
     expect(threadNode).toBeDefined();
     expect(threadNode!.originReplicaIds.length).toBe(2);
     expect([...threadNode!.originReplicaIds].sort()).toEqual(['replica-desktop', 'replica-laptop']);
+  });
+
+  it('Pass 9 emits visit_observed_on_replica edges and replica nodes from navigation.committed', () => {
+    const url = 'https://example.com/shared';
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        events: [
+          buildEvent({
+            seq: 1,
+            replicaId: 'replica-A',
+            type: NAVIGATION_COMMITTED,
+            payload: navigationCommittedPayload({
+              replicaId: 'replica-A',
+              seq: 1,
+              canonicalUrl: url,
+              commitAt: '2026-05-07T09:00:00.000Z',
+            }),
+            acceptedAtMs: Date.parse('2026-05-07T09:00:01.000Z'),
+          }),
+          buildEvent({
+            seq: 2,
+            replicaId: 'replica-A',
+            type: NAVIGATION_COMMITTED,
+            payload: navigationCommittedPayload({
+              replicaId: 'replica-A',
+              seq: 2,
+              canonicalUrl: 'https://example.com/only-a',
+              commitAt: '2026-05-07T09:30:00.000Z',
+            }),
+            acceptedAtMs: Date.parse('2026-05-07T09:30:01.000Z'),
+          }),
+          buildEvent({
+            seq: 1,
+            replicaId: 'replica-B',
+            type: NAVIGATION_COMMITTED,
+            payload: navigationCommittedPayload({
+              replicaId: 'replica-B',
+              seq: 1,
+              canonicalUrl: url,
+              commitAt: '2026-05-07T10:00:00.000Z',
+            }),
+            acceptedAtMs: Date.parse('2026-05-07T10:00:01.000Z'),
+          }),
+        ],
+      }),
+    );
+
+    const crossReplicaEdges = snap.edges.filter(
+      (edge) => edge.kind === 'visit_observed_on_replica',
+    );
+    expect(crossReplicaEdges).toHaveLength(2);
+    expect(crossReplicaEdges.map((edge) => `${edge.fromNodeId}->${edge.toNodeId}`)).toEqual([
+      `${nodeIdFor('timeline-visit', url)}->${nodeIdFor('replica', 'replica-A')}`,
+      `${nodeIdFor('timeline-visit', url)}->${nodeIdFor('replica', 'replica-B')}`,
+    ]);
+    expect(crossReplicaEdges.every((edge) => edge.confidence === 'observed')).toBe(true);
+    expect(crossReplicaEdges.every((edge) => edge.producedBy.source === 'cross-replica')).toBe(
+      true,
+    );
+
+    const replicaA = snap.nodes.find((node) => node.id === nodeIdFor('replica', 'replica-A'));
+    expect(replicaA?.kind).toBe('replica');
+    expect(replicaA?.metadata).toEqual({
+      firstSeenAt: '2026-05-07T09:00:00.000Z',
+      lastSeenAt: '2026-05-07T09:30:00.000Z',
+      replicaId: 'replica-A',
+    });
+    expect(replicaA?.firstSeenAt).toBe('2026-05-07T09:00:00.000Z');
+    expect(replicaA?.lastSeenAt).toBe('2026-05-07T09:30:00.000Z');
+    expect(snap.nodes.find((node) => node.id === nodeIdFor('timeline-visit', url))).toBeDefined();
+    expect(
+      snap.edges.some(
+        (edge) => edge.fromNodeId === nodeIdFor('timeline-visit', 'https://example.com/only-a'),
+      ),
+    ).toBe(false);
   });
 
   it('updatedAt is max observedAt, never wall-clock', () => {

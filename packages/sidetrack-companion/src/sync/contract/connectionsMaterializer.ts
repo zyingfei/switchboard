@@ -30,6 +30,7 @@ import {
   groupByDay,
   type TimelineDayProjection,
 } from '../../timeline/projection.js';
+import { NAVIGATION_COMMITTED } from '../../navigation/events.js';
 import {
   BROWSER_TIMELINE_OBSERVED,
   type BrowserTimelineObservedPayload,
@@ -104,6 +105,8 @@ const HANDLES: ReadonlySet<string> = new Set<string>([
   // materializer reads the daily projection rather than the
   // event payload directly.
   'browser.timeline.observed',
+  // Navigation commits drive the cross-replica visit evidence pass.
+  NAVIGATION_COMMITTED,
 ]);
 
 export interface CreateConnectionsMaterializerDeps {
