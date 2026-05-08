@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
+
+import { writeFileAtomic } from '../vault/atomic.js';
 
 // Per-replica identity + per-replica monotonic seq.
 //
@@ -30,12 +32,6 @@ const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 
 const ensureConfigDir = async (vaultPath: string): Promise<void> => {
   await mkdir(join(vaultPath, '_BAC', '.config'), { recursive: true });
-};
-
-const writeAtomic = async (path: string, body: string): Promise<void> => {
-  const tmp = `${path}.${String(process.pid)}.${String(Date.now())}.tmp`;
-  await writeFile(tmp, body, { encoding: 'utf8', mode: 0o600 });
-  await rename(tmp, path);
 };
 
 const readReplicaIdFile = async (path: string): Promise<string | null> => {
@@ -90,7 +86,7 @@ export const loadOrCreateReplica = async (vaultPath: string): Promise<ReplicaCon
   let created: boolean;
   if (existingId === null) {
     replicaId = randomUUID();
-    await writeAtomic(idPath, `${replicaId}\n`);
+    await writeFileAtomic(idPath, `${replicaId}\n`);
     created = true;
   } else {
     replicaId = existingId;
@@ -106,7 +102,7 @@ export const loadOrCreateReplica = async (vaultPath: string): Promise<ReplicaCon
   ]);
   let highWaterMark = Math.max(seqFromCanonical, seqFromLegacy);
   if (seqFromLegacy > 0 && seqFromCanonical < seqFromLegacy) {
-    await writeAtomic(seqPath, `${String(highWaterMark)}\n`);
+    await writeFileAtomic(seqPath, `${String(highWaterMark)}\n`);
   }
   if (seqFromLegacy > 0) {
     await unlink(legacyPath).catch(() => undefined);
@@ -115,7 +111,7 @@ export const loadOrCreateReplica = async (vaultPath: string): Promise<ReplicaCon
   let chain: Promise<unknown> = Promise.resolve();
 
   const persist = async (value: number): Promise<void> => {
-    await writeAtomic(seqPath, `${String(value)}\n`);
+    await writeFileAtomic(seqPath, `${String(value)}\n`);
   };
 
   const enqueue = <T>(task: () => Promise<T>): Promise<T> => {
