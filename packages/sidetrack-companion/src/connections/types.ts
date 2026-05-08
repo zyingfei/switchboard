@@ -27,7 +27,8 @@ export type ConnectionNodeKind =
   | 'annotation'
   | 'snippet'
   | 'topic'
-  | 'replica';
+  | 'replica'
+  | 'template';
 
 export interface ConnectionNode {
   // Namespaced ids: `kind:bac_id` (or `timeline-visit:<canonicalUrl>`).
@@ -119,7 +120,8 @@ export type ConnectionEdgeKind =
   | 'snippet_pasted_into_note'
   | 'snippet_pasted_into_capture'
   | 'snippet_reused_across_threads'
-  | 'visit_observed_on_replica';
+  | 'visit_observed_on_replica'
+  | 'visit_in_template';
 
 export type ConnectionEdgeSource =
   | 'event-log'

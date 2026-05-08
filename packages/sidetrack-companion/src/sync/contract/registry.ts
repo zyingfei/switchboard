@@ -52,6 +52,7 @@ import {
   THREAD_UPSERTED,
 } from '../../threads/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
+import { VISUAL_FINGERPRINT_OBSERVED } from '../../visual/events.js';
 import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
 
 export type StateClass =
@@ -424,6 +425,26 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
         surface: 'timeline-projection',
         class: 'derived-cache',
         materializer: 'timeline',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+    ],
+  },
+  {
+    eventType: VISUAL_FINGERPRINT_OBSERVED,
+    currentPayloadVersion: 1,
+    allowedDimensions: [],
+    surfaces: [
+      {
+        surface: 'plugin-visual-fingerprint',
+        class: 'plugin-tier-bounded',
+        peerFreshnessMs: 1_000,
+        recovery: 'spool-drain',
+      },
+      {
+        surface: 'connections-template-projection',
+        class: 'derived-cache',
+        materializer: 'connections',
         peerFreshnessMs: 30_000,
         recovery: 'replay-event-log',
       },

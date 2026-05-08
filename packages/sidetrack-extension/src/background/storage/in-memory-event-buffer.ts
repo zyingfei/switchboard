@@ -4,6 +4,7 @@ export const EVENT_STREAMS = [
   'selection.pasted',
   'navigation.committed',
   'engagement.session.aggregated',
+  'visual.fingerprint.observed',
 ] as const;
 
 export type EventStreamName = (typeof EVENT_STREAMS)[number];
