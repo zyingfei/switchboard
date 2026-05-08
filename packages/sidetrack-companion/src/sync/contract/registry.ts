@@ -145,6 +145,13 @@ const feedbackActionEntries: readonly ContractEntry[] = FEEDBACK_EVENT_TYPES.map
       peerFreshnessMs: 5_000,
       recovery: 'class-A',
     },
+    {
+      surface: 'feedback-projection',
+      class: 'derived-cache',
+      materializer: 'projection',
+      peerFreshnessMs: 30_000,
+      recovery: 'replay-event-log',
+    },
   ],
 }));
 
