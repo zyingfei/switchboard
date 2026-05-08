@@ -425,6 +425,7 @@ export const startCompanion = async (
       return { imported: result.imported };
     },
     timelineStore,
+    connectionsStore,
     serviceInstallDefaults: {
       port: options.port,
       ...(options.service?.companionCommand === undefined

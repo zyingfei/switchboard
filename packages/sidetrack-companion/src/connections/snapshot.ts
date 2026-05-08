@@ -27,6 +27,8 @@ import {
   type ConnectionsSnapshotScope,
 } from './types.js';
 
+export type { ConnectionsSnapshot } from './types.js';
+
 // Sync Contract v1 / Class B — Connections snapshot reducer.
 //
 // Pure function over the merged event log + companion vault
