@@ -71,6 +71,7 @@ const WORKFLOW: readonly MinimalWorkflowStep[] = [
 
 const REPLAY_PACK_PATH = process.env['SIDETRACK_REPLAY_PACK'];
 const REPLAY_REPORT_DIR = process.env['SIDETRACK_REPLAY_REPORT_DIR'];
+const STRICT_OFFLINE = process.env['SIDETRACK_REPLAY_STRICT_OFFLINE'] === '1';
 
 const settingsFor = (companion: TestCompanion) => ({
   companion: { port: companion.port, bridgeKey: companion.bridgeKey },
@@ -187,7 +188,9 @@ test.describe('manual T1 Wave 2a one-browser record/replay', () => {
     replayCompanion = await startTestCompanion();
     replayRuntime = await launchExtensionRuntime({ forceLocalProfile: true });
     const { panel: replayPanel } = await seedTimelineRuntime(replayRuntime, replayCompanion);
-    const routeTracker = await installRouteStubsForPack(replayRuntime.context, input.pack);
+    const routeTracker = await installRouteStubsForPack(replayRuntime.context, input.pack, {
+      strictOffline: STRICT_OFFLINE,
+    });
     const pageReplay = await driveReplayFromPack({
       runtime: replayRuntime,
       senderPage: replayPanel,
@@ -207,6 +210,7 @@ test.describe('manual T1 Wave 2a one-browser record/replay', () => {
       drain,
       timeline: surfaces.timeline,
       connections: surfaces.connections,
+      strictOffline: STRICT_OFFLINE,
     });
     const writtenReport = await writeReplayReport(path.dirname(input.packPath), report, {
       ...(REPLAY_REPORT_DIR === undefined ? {} : { reportDir: REPLAY_REPORT_DIR }),
@@ -231,7 +235,9 @@ test.describe('manual T1 Wave 2a one-browser record/replay', () => {
 
     recordCompanion = await startTestCompanion();
     recordRuntime = await launchExtensionRuntime({ forceLocalProfile: true });
-    await installRouteStubsForWorkflow(recordRuntime.context, WORKFLOW);
+    await installRouteStubsForWorkflow(recordRuntime.context, WORKFLOW, {
+      strictOffline: STRICT_OFFLINE,
+    });
     const { panel: recordPanel } = await seedTimelineRuntime(recordRuntime, recordCompanion);
     const storageBeforeRecording = await readChromeStorageSnapshot(recordPanel);
 
@@ -256,7 +262,9 @@ test.describe('manual T1 Wave 2a one-browser record/replay', () => {
     replayCompanion = await startTestCompanion();
     replayRuntime = await launchExtensionRuntime({ forceLocalProfile: true });
     const { panel: replayPanel } = await seedTimelineRuntime(replayRuntime, replayCompanion);
-    const routeTracker = await installRouteStubsForPack(replayRuntime.context, draftPack);
+    const routeTracker = await installRouteStubsForPack(replayRuntime.context, draftPack, {
+      strictOffline: STRICT_OFFLINE,
+    });
     const pageReplay = await driveReplayFromPack({
       runtime: replayRuntime,
       senderPage: replayPanel,
@@ -276,6 +284,7 @@ test.describe('manual T1 Wave 2a one-browser record/replay', () => {
       drain,
       timeline: surfaces.timeline,
       connections: surfaces.connections,
+      strictOffline: STRICT_OFFLINE,
     });
     const writtenReport = await writeReplayReport(writtenPack.packDir, report);
 

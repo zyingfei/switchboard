@@ -84,6 +84,7 @@ const HOLD_RELEASE_MS =
     : Number.parseInt(process.env['SIDETRACK_REPLAY_HOLD_MS'], 10);
 const REPLAY_PACK_PATH = process.env['SIDETRACK_REPLAY_PACK'];
 const REPLAY_REPORT_DIR = process.env['SIDETRACK_REPLAY_REPORT_DIR'];
+const STRICT_OFFLINE = process.env['SIDETRACK_REPLAY_STRICT_OFFLINE'] === '1';
 
 const routeKeyFor = (input: string): string => {
   const url = new URL(input);
@@ -102,6 +103,10 @@ const installRecordingRoutes = async (context: BrowserContext): Promise<void> =>
   await context.route(/^https?:\/\//u, async (route) => {
     const step = stubs.get(routeKeyFor(route.request().url()));
     if (step === undefined) {
+      if (STRICT_OFFLINE) {
+        await route.abort('blockedbyclient');
+        return;
+      }
       await route.fallback();
       return;
     }
@@ -263,8 +268,12 @@ test.describe('manual T1 Wave 2b two-browser relay record/replay', () => {
       seededWorkstreamId,
     );
 
-    const routeTracker = await installRouteStubsForPack(replayRuntimeA.context, input.pack);
-    await installRouteStubsForPack(replayRuntimeB.context, input.pack);
+    const routeTracker = await installRouteStubsForPack(replayRuntimeA.context, input.pack, {
+      strictOffline: STRICT_OFFLINE,
+    });
+    await installRouteStubsForPack(replayRuntimeB.context, input.pack, {
+      strictOffline: STRICT_OFFLINE,
+    });
     const pageReplay = await driveTwoBrowserReplayFromPack({
       runtimeA: replayRuntimeA,
       senderPageA: replayPanelA,
@@ -292,6 +301,7 @@ test.describe('manual T1 Wave 2b two-browser relay record/replay', () => {
       timeline: surfacesOnB.timeline,
       connections: surfacesOnB.connections,
       ...(heldUrls === undefined ? {} : { heldUrls }),
+      strictOffline: STRICT_OFFLINE,
     });
     const writtenReport = await writeReplayReport(path.dirname(input.packPath), report, {
       ...(REPLAY_REPORT_DIR === undefined ? {} : { reportDir: REPLAY_REPORT_DIR }),
@@ -444,8 +454,12 @@ test.describe('manual T1 Wave 2b two-browser relay record/replay', () => {
       activeWorkstreamId,
     );
 
-    const routeTracker = await installRouteStubsForPack(replayRuntimeA.context, pack);
-    await installRouteStubsForPack(replayRuntimeB.context, pack);
+    const routeTracker = await installRouteStubsForPack(replayRuntimeA.context, pack, {
+      strictOffline: STRICT_OFFLINE,
+    });
+    await installRouteStubsForPack(replayRuntimeB.context, pack, {
+      strictOffline: STRICT_OFFLINE,
+    });
     const pageReplay = await driveTwoBrowserReplayFromPack({
       runtimeA: replayRuntimeA,
       senderPageA: replayPanelA,
@@ -482,6 +496,7 @@ test.describe('manual T1 Wave 2b two-browser relay record/replay', () => {
       timeline: surfacesOnB.timeline,
       connections: surfacesOnB.connections,
       ...(heldUrls === undefined ? {} : { heldUrls }),
+      strictOffline: STRICT_OFFLINE,
     });
     const writtenReport = await writeReplayReport(writtenPack.packDir, report);
     expect(report.status).toBe('pass');

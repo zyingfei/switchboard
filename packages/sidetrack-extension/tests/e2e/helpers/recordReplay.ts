@@ -155,6 +155,11 @@ export interface RouteStubTracker {
   readonly expectedCanonicalUrls: readonly string[];
   readonly hitCounts: () => ReadonlyMap<string, number>;
   readonly fulfilledBodies: () => ReadonlyMap<string, string>;
+  readonly abortedCount: () => number;
+}
+
+export interface RouteStubOptions {
+  readonly strictOffline?: boolean;
 }
 
 interface RouteStub {
@@ -210,6 +215,10 @@ export interface ReplayEvaluationReport {
     readonly enabled: boolean;
     readonly reachable: boolean;
     readonly urls: readonly string[];
+  };
+  readonly strictOffline?: {
+    readonly enabled: boolean;
+    readonly abortedCount: number;
   };
 }
 
@@ -824,6 +833,7 @@ const routeKeyFor = (input: string): string => {
 export const installRouteStubsForPack = async (
   context: BrowserContext,
   pack: SessionPack,
+  options: RouteStubOptions = {},
 ): Promise<RouteStubTracker> => {
   const stubs: RouteStub[] = [];
   for (const browser of pack.browsers) {
@@ -841,12 +851,13 @@ export const installRouteStubsForPack = async (
       });
     }
   }
-  return await installRouteStubs(context, stubs);
+  return await installRouteStubs(context, stubs, options);
 };
 
 export const installRouteStubsForWorkflow = async (
   context: BrowserContext,
   workflow: readonly MinimalWorkflowStep[],
+  options: RouteStubOptions = {},
 ): Promise<RouteStubTracker> =>
   await installRouteStubs(
     context,
@@ -858,12 +869,15 @@ export const installRouteStubsForWorkflow = async (
         title: step.title,
       };
     }),
+    options,
   );
 
 const installRouteStubs = async (
   context: BrowserContext,
   routeStubs: readonly RouteStub[],
+  options: RouteStubOptions = {},
 ): Promise<RouteStubTracker> => {
+  const strictOffline = options.strictOffline === true;
   const stubs = new Map<
     string,
     { readonly canonicalUrl: string; readonly title: string; readonly body?: string }
@@ -877,10 +891,16 @@ const installRouteStubs = async (
   }
   const hits = new Map<string, number>();
   const fulfilledBodies = new Map<string, string>();
+  let aborted = 0;
   await context.route(/^https?:\/\//u, async (route) => {
     const requestUrl = sanitizeTimelineUrl(route.request().url());
     const stub = stubs.get(routeKeyFor(requestUrl));
     if (stub === undefined) {
+      if (strictOffline) {
+        aborted += 1;
+        await route.abort('blockedbyclient');
+        return;
+      }
       await route.fallback();
       return;
     }
@@ -903,6 +923,7 @@ const installRouteStubs = async (
     ].sort(),
     hitCounts: () => new Map(hits),
     fulfilledBodies: () => new Map(fulfilledBodies),
+    abortedCount: () => aborted,
   };
 };
 
@@ -1239,6 +1260,7 @@ export const evaluateOneBrowserReplay = (input: {
   readonly timeline: TimelineEnvelope;
   readonly connections: ConnectionsEnvelope;
   readonly heldUrls?: readonly string[];
+  readonly strictOffline?: boolean;
 }): ReplayEvaluationReport => {
   const expectedCanonicals = expectedCanonicalUrls(input.pack);
   const timelineCanonicals = canonicalUrlsFromTimeline(input.timeline);
@@ -1357,6 +1379,14 @@ export const evaluateOneBrowserReplay = (input: {
             urls: input.heldUrls,
           },
         }),
+    ...(input.strictOffline === undefined
+      ? {}
+      : {
+          strictOffline: {
+            enabled: input.strictOffline,
+            abortedCount: input.routeTracker.abortedCount(),
+          },
+        }),
   };
 };
 
@@ -1418,6 +1448,14 @@ export const renderReplayMarkdown = (report: ReplayEvaluationReport): string => 
     report.heldUrls === undefined
       ? ''
       : `\n\n## Hold URLs\n\n- Reachable: ${report.heldUrls.reachable ? 'yes' : 'no'}\n${report.heldUrls.urls.map((url) => `- ${url}`).join('\n')}`;
+  const strictOfflineBlock =
+    report.strictOffline === undefined
+      ? ''
+      : `\n\n## Strict offline replay\n\n- Mode: ${report.strictOffline.enabled ? 'enabled' : 'disabled'}\n- Aborted unstubbed requests: ${String(report.strictOffline.abortedCount)}\n${
+          report.strictOffline.enabled
+            ? '- All non-recorded URLs were blocked (route.abort) so replay never reached the network.'
+            : '- Unstubbed requests were allowed to fall back to the network.'
+        }`;
   const detourBlock =
     detourRows.length === 0
       ? '\n\n## Detours\n\nNo detours detected.'
@@ -1458,7 +1496,7 @@ ${report.recordedCanonicalUrls.map((url) => `- ${url}`).join('\n')}
 ## Timeline Canonical URLs
 
 ${report.timelineCanonicalUrls.map((url) => `- ${url}`).join('\n')}
-${heldBlock}
+${heldBlock}${strictOfflineBlock}
 ${detailBlocks.length > 0 ? `\n\n## Details\n\n${detailBlocks}` : ''}
 `;
 };
