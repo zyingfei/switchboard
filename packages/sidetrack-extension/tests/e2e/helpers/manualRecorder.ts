@@ -322,11 +322,11 @@ export class ManualRecorder {
         window.addEventListener(
           'copy',
           () => {
-            const selection = normalize(window.getSelection()?.toString() ?? '', 800);
+            const selection = window.getSelection()?.toString() ?? '';
             post({
               kind: 'copy',
               selection: options.recordTextValues ? selection : undefined,
-              selectionLength: selection?.length ?? 0,
+              selectionLength: selection.length,
             });
           },
           true,
@@ -334,11 +334,11 @@ export class ManualRecorder {
         window.addEventListener(
           'paste',
           (event) => {
-            const text = normalize(event.clipboardData?.getData('text/plain') ?? '', 800);
+            const text = event.clipboardData?.getData('text/plain') ?? '';
             post({
               kind: 'paste',
               text: options.recordTextValues ? text : undefined,
-              textLength: text?.length ?? 0,
+              textLength: text.length,
               target: describeTarget(event.target),
             });
           },
