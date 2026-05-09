@@ -28,9 +28,11 @@ import {
   createSessionPackFromManualRecorder,
   driveTwoBrowserReplayFromPack,
   evaluateOneBrowserReplay,
+  firstBrowser,
   forceDrainTimeline,
   installRouteStubsForPack,
   readChromeStorageSnapshot,
+  readSessionPack,
   readSidetrackVersion,
   recordedCanonicalUrls,
   redactHtmlForSessionPack,
@@ -39,6 +41,8 @@ import {
   waitForReplaySurfaces,
   writeReplayReport,
   writeSessionPack,
+  type CaptureLevel,
+  type SessionPack,
 } from './helpers/recordReplay';
 import { startTestRelay, type TestRelay } from './helpers/relay';
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
@@ -78,6 +82,8 @@ const HOLD_RELEASE_MS =
   process.env['SIDETRACK_REPLAY_HOLD_MS'] === undefined
     ? null
     : Number.parseInt(process.env['SIDETRACK_REPLAY_HOLD_MS'], 10);
+const REPLAY_PACK_PATH = process.env['SIDETRACK_REPLAY_PACK'];
+const REPLAY_REPORT_DIR = process.env['SIDETRACK_REPLAY_REPORT_DIR'];
 
 const routeKeyFor = (input: string): string => {
   const url = new URL(input);
@@ -177,11 +183,6 @@ test.describe('manual T1 Wave 2b two-browser relay record/replay', () => {
     process.env['SIDETRACK_E2E_SKIP_LIVE_BROWSERS'] === '1',
     'set SIDETRACK_E2E_SKIP_LIVE_BROWSERS=1 to skip when CfT is unavailable',
   );
-  test.skip(
-    process.env['SIDETRACK_CAPTURE_LEVEL'] !== 'html' &&
-      process.env['SIDETRACK_RECORD_CAPTURE_LEVEL'] !== 'html',
-    'set SIDETRACK_CAPTURE_LEVEL=html to opt in to Wave 2b HTML capture',
-  );
   test.setTimeout(HOLD_REQUESTED ? 0 : 300_000);
 
   let recordRelay: TestRelay | null = null;
@@ -218,9 +219,106 @@ test.describe('manual T1 Wave 2b two-browser relay record/replay', () => {
     recordRelay = null;
   });
 
+  const recorderOptions = (captureLevel: CaptureLevel) => ({
+    captureScreenshots: false,
+    captureTextSnapshots: false,
+    captureHtmlSnapshots: captureLevel !== 'minimal',
+    recordTextValues: captureLevel === 'html+paste',
+    transformHtmlSnapshot: ({ html }: { readonly html: string }) => {
+      const redacted = redactHtmlForSessionPack(html);
+      return {
+        html: redacted.htmlRedacted,
+        redactionCounts: redacted.redactionCounts,
+      };
+    },
+  });
+
+  const replayPack = async (input: {
+    readonly pack: SessionPack;
+    readonly packPath: string;
+  }): Promise<void> => {
+    expect(input.pack.mode.browsers).toBe(2);
+    replayRelay = await startTestRelay({});
+    const replaySecret = generateRendezvousSecret().toString('base64url');
+    replayCompanionA = await startTestCompanion({
+      syncRelay: replayRelay.url,
+      syncRendezvousSecret: replaySecret,
+    });
+    replayCompanionB = await startTestCompanion({
+      syncRelay: replayRelay.url,
+      syncRendezvousSecret: replaySecret,
+    });
+    replayRuntimeA = await launchExtensionRuntime({ forceLocalProfile: true });
+    replayRuntimeB = await launchExtensionRuntime({ forceLocalProfile: true });
+    const activeWorkstreamId = firstBrowser(input.pack).activeWorkstreamId;
+    const seededWorkstreamId = activeWorkstreamId ?? 'ws_t1_replay';
+    const replayPanelA = await seedTimelineRuntime(
+      replayRuntimeA,
+      replayCompanionA,
+      seededWorkstreamId,
+    );
+    const replayPanelB = await seedTimelineRuntime(
+      replayRuntimeB,
+      replayCompanionB,
+      seededWorkstreamId,
+    );
+
+    const routeTracker = await installRouteStubsForPack(replayRuntimeA.context, input.pack);
+    await installRouteStubsForPack(replayRuntimeB.context, input.pack);
+    const pageReplay = await driveTwoBrowserReplayFromPack({
+      runtimeA: replayRuntimeA,
+      senderPageA: replayPanelA,
+      runtimeB: replayRuntimeB,
+      senderPageB: replayPanelB,
+      pack: input.pack,
+    });
+    const expectedUrls = recordedCanonicalUrls(input.pack);
+    const drain = await forceDrainTimeline(replayRuntimeA, replayPanelA, expectedUrls.length);
+    const surfacesOnB = await waitForReplaySurfaces({
+      companion: replayCompanionB,
+      expectedCanonicalUrls: expectedUrls,
+      activeWorkstreamId,
+      timeoutMs: 60_000,
+    });
+    if (activeWorkstreamId !== null) {
+      await openConnectionsOnBrowserB(replayPanelB, activeWorkstreamId, expectedUrls);
+    }
+    const heldUrls = HOLD_REQUESTED ? [replayPanelA.url(), replayPanelB.url()] : undefined;
+    const report = evaluateOneBrowserReplay({
+      pack: input.pack,
+      routeTracker,
+      pageReplay,
+      drain,
+      timeline: surfacesOnB.timeline,
+      connections: surfacesOnB.connections,
+      ...(heldUrls === undefined ? {} : { heldUrls }),
+    });
+    const writtenReport = await writeReplayReport(path.dirname(input.packPath), report, {
+      ...(REPLAY_REPORT_DIR === undefined ? {} : { reportDir: REPLAY_REPORT_DIR }),
+    });
+    // eslint-disable-next-line no-console
+    console.log(`[sidetrack-test] report: ${writtenReport.markdownPath}`);
+    // eslint-disable-next-line no-console
+    console.log(`[sidetrack-test] report-json: ${writtenReport.jsonPath}`);
+    expect(report.status).toBe('pass');
+    if (HOLD_REQUESTED) {
+      expect(report.heldUrls?.reachable).toBe(true);
+      // eslint-disable-next-line no-console
+      console.log(`[record-replay-2b] hold urls: ${heldUrls?.join(', ') ?? ''}`);
+      await waitForHoldRelease();
+    }
+  };
+
   test('manual html pack replays through Browser B Connections over relay', async ({}, testInfo) => {
     expect(testInfo.project.name).toBe('manual');
-    expect(resolveCaptureLevel()).toBe('html');
+    if (REPLAY_PACK_PATH !== undefined) {
+      await replayPack({
+        pack: await readSessionPack(REPLAY_PACK_PATH),
+        packPath: REPLAY_PACK_PATH,
+      });
+      return;
+    }
+    const captureLevel = resolveCaptureLevel();
 
     const sessionsRoot = resolveTestSessionsDir();
     await mkdir(sessionsRoot, { recursive: true });
@@ -240,30 +338,16 @@ test.describe('manual T1 Wave 2b two-browser relay record/replay', () => {
     recordRuntimeA = await launchExtensionRuntime({ forceLocalProfile: true });
     recordRuntimeB = await launchExtensionRuntime({ forceLocalProfile: true });
 
-    const recorderA = new ManualRecorder(recordRuntimeA.context, path.join(artifactDir, 'A'), {
-      captureScreenshots: false,
-      captureTextSnapshots: false,
-      recordTextValues: false,
-      transformHtmlSnapshot: ({ html }) => {
-        const redacted = redactHtmlForSessionPack(html);
-        return {
-          html: redacted.htmlRedacted,
-          redactionCounts: redacted.redactionCounts,
-        };
-      },
-    });
-    const recorderB = new ManualRecorder(recordRuntimeB.context, path.join(artifactDir, 'B'), {
-      captureScreenshots: false,
-      captureTextSnapshots: false,
-      recordTextValues: false,
-      transformHtmlSnapshot: ({ html }) => {
-        const redacted = redactHtmlForSessionPack(html);
-        return {
-          html: redacted.htmlRedacted,
-          redactionCounts: redacted.redactionCounts,
-        };
-      },
-    });
+    const recorderA = new ManualRecorder(
+      recordRuntimeA.context,
+      path.join(artifactDir, 'A'),
+      recorderOptions(captureLevel),
+    );
+    const recorderB = new ManualRecorder(
+      recordRuntimeB.context,
+      path.join(artifactDir, 'B'),
+      recorderOptions(captureLevel),
+    );
     await recorderA.install();
     await recorderB.install();
     await installRecordingRoutes(recordRuntimeA.context);
@@ -300,7 +384,7 @@ test.describe('manual T1 Wave 2b two-browser relay record/replay', () => {
 
     const sidetrackVersion = await readSidetrackVersion();
     const pack = createSessionPackFromManualRecorder({
-      captureLevel: 'html',
+      captureLevel,
       sidetrackVersion,
       browsers: [
         {
@@ -321,17 +405,19 @@ test.describe('manual T1 Wave 2b two-browser relay record/replay', () => {
     assertNoDisallowedStorageValues(pack, storageB);
     assertPackPrivacy(pack);
 
-    const sourceSnapshot = Object.values(browserByLabel(pack, 'A').snapshots).find((snapshot) =>
-      Object.hasOwn(snapshot.redactionCounts, 'email'),
-    );
-    expect(sourceSnapshot).toBeDefined();
-    expect(sourceSnapshot?.redactionCounts['email']).toBeGreaterThan(0);
-    expect(sourceSnapshot?.redactionCounts['openai-key']).toBeGreaterThan(0);
-    expect(sourceSnapshot?.htmlRedacted).toContain('[email]');
-    expect(sourceSnapshot?.htmlRedacted).toContain('[openai-key]');
-    expect(sourceSnapshot?.htmlRedacted).toContain('Follow-up plan survives replay.');
-    expect(sourceSnapshot?.htmlRedacted).not.toContain(SECRET_EMAIL);
-    expect(sourceSnapshot?.htmlRedacted).not.toContain(SECRET_KEY);
+    if (captureLevel !== 'minimal') {
+      const sourceSnapshot = Object.values(browserByLabel(pack, 'A').snapshots).find((snapshot) =>
+        Object.hasOwn(snapshot.redactionCounts, 'email'),
+      );
+      expect(sourceSnapshot).toBeDefined();
+      expect(sourceSnapshot?.redactionCounts['email']).toBeGreaterThan(0);
+      expect(sourceSnapshot?.redactionCounts['openai-key']).toBeGreaterThan(0);
+      expect(sourceSnapshot?.htmlRedacted).toContain('[email]');
+      expect(sourceSnapshot?.htmlRedacted).toContain('[openai-key]');
+      expect(sourceSnapshot?.htmlRedacted).toContain('Follow-up plan survives replay.');
+      expect(sourceSnapshot?.htmlRedacted).not.toContain(SECRET_EMAIL);
+      expect(sourceSnapshot?.htmlRedacted).not.toContain(SECRET_KEY);
+    }
 
     const writtenPack = await writeSessionPack(pack);
 
@@ -377,13 +463,15 @@ test.describe('manual T1 Wave 2b two-browser relay record/replay', () => {
     });
 
     await openConnectionsOnBrowserB(replayPanelB, activeWorkstreamId, expectedUrls);
-    const fulfilledHtml = [...routeTracker.fulfilledBodies().values()].find((body) =>
-      body.includes('[email]'),
-    );
-    expect(fulfilledHtml).toBeDefined();
-    expect(fulfilledHtml).toContain('Follow-up plan survives replay.');
-    expect(fulfilledHtml).not.toContain(SECRET_EMAIL);
-    expect(fulfilledHtml).not.toContain(SECRET_KEY);
+    if (captureLevel !== 'minimal') {
+      const fulfilledHtml = [...routeTracker.fulfilledBodies().values()].find((body) =>
+        body.includes('[email]'),
+      );
+      expect(fulfilledHtml).toBeDefined();
+      expect(fulfilledHtml).toContain('Follow-up plan survives replay.');
+      expect(fulfilledHtml).not.toContain(SECRET_EMAIL);
+      expect(fulfilledHtml).not.toContain(SECRET_KEY);
+    }
 
     const heldUrls = HOLD_REQUESTED ? [replayPanelA.url(), replayPanelB.url()] : undefined;
     const report = evaluateOneBrowserReplay({
@@ -405,6 +493,10 @@ test.describe('manual T1 Wave 2b two-browser relay record/replay', () => {
     console.log(`[record-replay-2b] pack: ${writtenPack.packPath}`);
     // eslint-disable-next-line no-console
     console.log(`[record-replay-2b] report: ${writtenReport.markdownPath}`);
+    // eslint-disable-next-line no-console
+    console.log(`[sidetrack-test] pack: ${writtenPack.packPath}`);
+    // eslint-disable-next-line no-console
+    console.log(`[sidetrack-test] report: ${writtenReport.markdownPath}`);
 
     if (HOLD_REQUESTED) {
       // eslint-disable-next-line no-console
