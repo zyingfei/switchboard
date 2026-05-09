@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { ensureBridgeKey } from '../auth/bridgeKey.js';
 import { createIdempotencyStore } from '../http/idempotency.js';
@@ -462,18 +462,30 @@ export const startCompanion = async (
       vaultRoot: options.vaultPath,
       companionFrameworkVersion: COLLECTOR_FRAMEWORK_VERSION,
       vaultMajor: 1,
-      appendClassA: async (event, ruleId) => {
+      appendClassA: async (event, ruleId, line) => {
         const e = event as {
           type?: string;
           payloadVersion?: number;
           emittedAt?: string;
           producedBy?: { runId?: string };
         };
-        // Idempotent clientEventId: ruleId + emittedAt + runId is
-        // unique per (collector run, source line). A retried promote
-        // (e.g. replay-on-startup of a previously-promoted line) is
-        // short-circuited by appendClient's clientEventId dedupe.
-        const clientEventId = `collector:${ruleId}:${e.emittedAt ?? ''}:${e.producedBy?.runId ?? ''}`;
+        // Idempotent clientEventId — Patch 2 (post-review):
+        // PRIMARY key is the collector's source_record_id when it
+        // declares one. That's the only stable id across collector
+        // restarts and across replay-on-startup. Falls back to a
+        // synthetic id for collectors that don't carry a source
+        // record id; the synthetic includes runId + emittedAt + a
+        // short hash of the event type so two distinct events from
+        // the same collector run (same emittedAt is possible — the
+        // collector might batch ticks within a millisecond) get
+        // distinct ids.
+        const clientEventId = (() => {
+          if (line.source_record_id !== undefined && line.source_record_id.length > 0) {
+            return `collector:${ruleId}:${line.source_record_id}`;
+          }
+          const fallback = `${ruleId}:${e.emittedAt ?? ''}:${e.producedBy?.runId ?? ''}:${e.type ?? ''}`;
+          return `collector:${fallback}:${createHash('sha256').update(fallback, 'utf8').digest('hex').slice(0, 16)}`;
+        })();
         await eventLog.appendServerObserved({
           clientEventId,
           aggregateId: ruleId,
@@ -538,7 +550,26 @@ export const startCompanion = async (
     allowAutoUpdate: options.allowAutoUpdate ?? false,
     startedAt: new Date(),
     bucketRegistry: createBucketRegistry(options.vaultPath),
-    ...(collectorFramework === null ? {} : { collectorFramework }),
+    ...(collectorFramework === null
+      ? {}
+      : {
+          collectorFramework: {
+            loadedCollectors: collectorFramework.loadedCollectors,
+            quarantineCountFor: collectorFramework.quarantineCountFor,
+            replayCollector: collectorFramework.replayCollector,
+            // Patch 1 (post-review): expose gate resolver + last-
+            // promoted-at on the HTTP context so the route handler
+            // populates capability_gates and last_promoted_at fields.
+            resolveGate: (collectorId, capability) =>
+              gateStateForCollector(
+                cachedPrivacyProjection,
+                collectorId,
+                capability as CollectorCapability,
+                true,
+              ),
+            lastPromotedAtFor: collectorFramework.lastPromotedAtFor,
+          },
+        }),
     hygieneStatus,
     recallLifecycle,
     recallActivity,

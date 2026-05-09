@@ -45,6 +45,7 @@ import {
 } from '../../version.js';
 import { type CollectorCapability, type GateState } from './capabilityGates.js';
 import { enforceQuarantineRetention } from './quarantineRetention.js';
+import type { CollectorEvent } from './types.js';
 
 export interface CollectorFrameworkHandle {
   readonly registry: MaterializerRegistry;
@@ -55,6 +56,7 @@ export interface CollectorFrameworkHandle {
     readonly stillQuarantined: number;
   }>;
   readonly quarantineCountFor: (collectorId: string) => Promise<number>;
+  readonly lastPromotedAtFor: (collectorId: string) => string | null;
   readonly waitIdle: () => Promise<void>;
   readonly close: () => Promise<void>;
 }
@@ -66,8 +68,16 @@ interface BootOpts {
   readonly vaultMajor?: number;
   // Class A append. When materializeCollectorLine resolves with
   // `kind: 'promoted'`, the runtime invokes this with each emitted
-  // event in order plus the producedBy.ruleId.
-  readonly appendClassA?: (event: unknown, ruleId: string) => Promise<void>;
+  // event in order plus the producedBy.ruleId AND the original
+  // CollectorEvent line. The caller uses the line's
+  // `source_record_id` to derive an idempotent clientEventId so a
+  // re-promotion of the same source line short-circuits at the
+  // event log's clientEventId dedupe.
+  readonly appendClassA?: (
+    event: unknown,
+    ruleId: string,
+    line: CollectorEvent,
+  ) => Promise<void>;
   // Audit log adapter (decoupled from vault/writer for testability).
   readonly auditRoute?: (route: string, subject: string) => Promise<void>;
   // Privacy gate read — synchronous. The caller maintains a cached
@@ -97,7 +107,11 @@ interface BootOpts {
 }
 
 const noopAudit = async (_route: string, _subject: string): Promise<void> => {};
-const noopAppendClassA = async (_event: unknown, _ruleId: string): Promise<void> => {};
+const noopAppendClassA = async (
+  _event: unknown,
+  _ruleId: string,
+  _line: CollectorEvent,
+): Promise<void> => {};
 const noopReadPromoted = async (): Promise<null> => null;
 const defaultResolveGate = (): GateState => 'granted';
 
@@ -166,14 +180,21 @@ export const bootCollectorFramework = async (
     isAlreadyPromoted: readPromoted,
     onPromote: async (line, events, ruleId) => {
       for (const event of events) {
-        await appendClassA(event, ruleId);
+        await appendClassA(event, ruleId, line);
       }
+      lastPromotedAt.set(line.collector_id, new Date().toISOString());
       await auditRoute(
         'collector:line-promoted',
         `${line.collector_id}:${line.event_type}`,
       );
     },
   };
+
+  // Per-collector last-promote timestamp. Surfaced via the framework
+  // handle so HTTP /v1/collectors can include it in the response.
+  // Best-effort: persisted only in memory; resets on companion
+  // restart.
+  const lastPromotedAt = new Map<string, string>();
 
   // 4. Per-collector tail loops, started lazily as manifests load.
   const tails: Map<string, TailHandle> = new Map();
@@ -249,20 +270,16 @@ export const bootCollectorFramework = async (
     registry,
     loadedCollectors: () => discovery?.loadedCollectors() ?? [],
     replayCollector: async (collectorId) => {
-      // Replay only entries for the requested collector.
+      // Replay only entries for the requested collector. Patch 4
+      // (post-review): the global-scan behavior was confusing — now
+      // strictly filtered to `collectorId` so the route response
+      // accurately reflects "this collector's queue drained."
       const result = await replayQuarantine({
         vaultRoot: opts.vaultRoot,
         ctx,
-        auditRoute: async (route, subject) => {
-          // Tag replay audits so they're distinguishable from boot.
-          await auditRoute(route, subject);
-        },
+        auditRoute,
+        collectorIdFilter: collectorId,
       });
-      // Note: replayQuarantine currently scans all collectors. A
-      // future refinement may scope to one — the ReplayResult is
-      // global today. Caller treats counts as approximate when
-      // multiple collectors are quarantined.
-      void collectorId;
       return {
         scanned: result.scanned,
         promoted: result.promoted,
@@ -273,6 +290,7 @@ export const bootCollectorFramework = async (
       const entries = await quarantineWriter.readAllForCollector(collectorId);
       return entries.length;
     },
+    lastPromotedAtFor: (collectorId) => lastPromotedAt.get(collectorId) ?? null,
     waitIdle: async () => {
       await Promise.all([...tails.values()].map((t) => t.waitIdle()));
     },

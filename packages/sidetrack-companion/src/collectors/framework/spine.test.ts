@@ -42,6 +42,7 @@ import type { CollectorEvent } from './types.js';
 interface CapturedClassA {
   readonly event: unknown;
   readonly ruleId: string;
+  readonly line: CollectorEvent;
 }
 
 interface CapturedAudit {
@@ -87,8 +88,8 @@ const bootHarness = async (
   const audits: CapturedAudit[] = [];
   const framework = await bootCollectorFramework({
     vaultRoot,
-    appendClassA: async (event: unknown, ruleId: string) => {
-      classA.push({ event, ruleId });
+    appendClassA: async (event: unknown, ruleId: string, line) => {
+      classA.push({ event, ruleId, line });
     },
     auditRoute: async (route: string, subject: string) => {
       audits.push({ route, subject });
@@ -384,6 +385,73 @@ describe('Stage 4 spine — compass §2.G structural tests', () => {
       expect(
         quarantine.some((q) => q.reason === 'materializer-validation-failed'),
       ).toBe(true);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('Patch 2: two lines with identical emitted_at + runId but distinct source_record_id both promote', async () => {
+    // Drives the source_record_id-first idempotency rule: a
+    // collector batching two events within the same millisecond +
+    // same run must still produce two distinct Class A entries.
+    // Earlier signature (event, ruleId) only had emittedAt + runId
+    // to derive a clientEventId — those collide here. The new
+    // (event, ruleId, line) signature uses line.source_record_id as
+    // the primary key.
+    const fixture = await setupFixtureVault(
+      new Map([[TEST_TICK_COLLECTOR_ID, {}]]),
+    );
+    cleanup = fixture.cleanup;
+    const harness = await bootHarness(fixture.vaultRoot);
+    try {
+      // Hand-write a JSONL file with two lines that share
+      // emitted_at AND collector_run_id but differ in source_record_id.
+      // The fixture writer emits monotonically-incrementing
+      // emitted_at values so we bypass it.
+      const inboxFile = join(
+        fixture.vaultRoot,
+        '_BAC',
+        'inbox',
+        TEST_TICK_COLLECTOR_ID,
+        `${new Date().toISOString().slice(0, 10)}.jsonl`,
+      );
+      await mkdir(join(inboxFile, '..'), { recursive: true });
+      const sharedEmittedAt = new Date('2026-05-08T12:00:00.000Z').toISOString();
+      const sharedRunId = 'shared-run-id-01';
+      const lineA = JSON.stringify({
+        collector_id: TEST_TICK_COLLECTOR_ID,
+        event_type: 'tick',
+        payload_version: 1,
+        emitted_at: sharedEmittedAt,
+        collector_version: '0.1.0',
+        collector_run_id: sharedRunId,
+        source_record_id: `${sharedRunId}:00000000`,
+        payload: { tick_index: 0 },
+      });
+      const lineB = JSON.stringify({
+        collector_id: TEST_TICK_COLLECTOR_ID,
+        event_type: 'tick',
+        payload_version: 1,
+        emitted_at: sharedEmittedAt,
+        collector_version: '0.1.0',
+        collector_run_id: sharedRunId,
+        source_record_id: `${sharedRunId}:00000001`,
+        payload: { tick_index: 1 },
+      });
+      await writeFile(inboxFile, `${lineA}\n${lineB}\n`, 'utf8');
+
+      await harness.framework.waitIdle();
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      await harness.framework.waitIdle();
+
+      // Both lines must have surfaced in classA.
+      expect(harness.classA).toHaveLength(2);
+      // Source record ids on the captured line objects must differ.
+      const sourceIds = harness.classA.map((c) => c.line.source_record_id);
+      expect(new Set(sourceIds).size).toBe(2);
+      // 0 quarantines.
+      const quarantine = await readQuarantineFiles(fixture.vaultRoot);
+      expect(quarantine).toHaveLength(0);
     } finally {
       await harness.close();
     }

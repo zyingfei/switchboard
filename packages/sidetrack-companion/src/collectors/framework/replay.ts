@@ -36,6 +36,11 @@ interface ReplayOpts {
   readonly vaultRoot: string;
   readonly ctx: PromoteContext;
   readonly auditRoute: (route: string, subject: string) => Promise<void>;
+  // When set, replay only scans the named collector's quarantine
+  // files. Compass-doc original behavior was global; the framework
+  // handle's replayCollector(id) sets this so the HTTP response
+  // accurately scopes to the requested collector.
+  readonly collectorIdFilter?: string;
 }
 
 const readJsonLines = async (path: string): Promise<readonly QuarantineEntryOnDisk[]> => {
@@ -101,6 +106,13 @@ export const replayQuarantine = async (opts: ReplayOpts): Promise<ReplayResult> 
 
     for (const fname of collectorFiles) {
       if (!fname.endsWith('.jsonl')) continue;
+      const collectorIdFromFile = fname.replace(/\.jsonl$/u, '');
+      if (
+        opts.collectorIdFilter !== undefined &&
+        collectorIdFromFile !== opts.collectorIdFilter
+      ) {
+        continue;
+      }
       const path = join(dateDir, fname);
       const entries = await readJsonLines(path);
       const remaining: QuarantineEntryOnDisk[] = [];

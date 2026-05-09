@@ -2290,8 +2290,8 @@ describe('companion HTTP server', () => {
               manifest_schema: 1,
               emits: [{ event_type: 'tick', payload_version: 1, stability: 'beta' as const }],
               capabilities: {
-                'reads-paths': [],
-                'reads-env': [],
+                'reads-paths': ['/tmp/test-tick-source'],
+                'reads-env': ['TEST_TICK_HOME'],
                 'reads-network': false,
                 'default-enabled': true,
               },
@@ -2305,6 +2305,14 @@ describe('companion HTTP server', () => {
           promoted: 0,
           stillQuarantined: 0,
         }),
+        // Patch 1: per-(collector, capability) gate state surfaced in
+        // capability_gates. resolveGate is invoked once per declared
+        // capability — we route 'reads-paths' to 'granted' and
+        // 'reads-env' to 'pending' to verify both branches reach
+        // the response shape.
+        resolveGate: (_id, capability) =>
+          capability === 'reads-paths' ? 'granted' : 'pending',
+        lastPromotedAtFor: () => '2026-05-08T18:30:00.000Z',
       },
     };
     const result = await jsonFetch(context, `${baseUrl}/v1/collectors`, {
@@ -2319,8 +2327,57 @@ describe('companion HTTP server', () => {
           version: '0.1.0',
           status: 'loaded',
           quarantine_count: 0,
+          // Patch 1 assertions: capability_gates only includes
+          // capabilities the collector actually declared (no
+          // 'reads-network' key here because the manifest's
+          // reads-network is false), and last_promoted_at is the
+          // string the framework returned.
+          capability_gates: {
+            'reads-paths': 'granted',
+            'reads-env': 'pending',
+          },
+          last_promoted_at: '2026-05-08T18:30:00.000Z',
         },
       ],
+    });
+  });
+
+  it('GET /v1/collectors returns last_promoted_at: null when framework has not promoted yet', async () => {
+    context = {
+      ...context,
+      collectorFramework: {
+        loadedCollectors: () => [
+          {
+            manifest: {
+              id: 'sidetrack.test-tick',
+              name: 'Test Tick',
+              version: '0.1.0',
+              manifest_schema: 1,
+              emits: [{ event_type: 'tick', payload_version: 1, stability: 'beta' as const }],
+              capabilities: {
+                'reads-paths': [],
+                'reads-env': [],
+                'reads-network': false,
+                'default-enabled': true,
+              },
+            },
+            status: 'loaded' as const,
+          },
+        ],
+        quarantineCountFor: async () => 0,
+        replayCollector: async () => ({ scanned: 0, promoted: 0, stillQuarantined: 0 }),
+        // No resolveGate / no lastPromotedAtFor — the route handler
+        // must degrade to last_promoted_at: null and capability_gates: {}.
+      },
+    };
+    const result = await jsonFetch(context, `${baseUrl}/v1/collectors`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect(result.status).toBe(200);
+    const body = result.body as { collectors: ReadonlyArray<Record<string, unknown>> };
+    expect(body.collectors[0]).toMatchObject({
+      capability_gates: {},
+      last_promoted_at: null,
     });
   });
 

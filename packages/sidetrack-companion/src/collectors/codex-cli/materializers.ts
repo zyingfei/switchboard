@@ -24,11 +24,17 @@ import {
 
 export const CODEX_CLI_COLLECTOR_ID = 'sidetrack.codex-cli' as const;
 
-// Class A event types produced. Both new for Stage 4; ContractEntry
-// rows added in src/sync/contract/registry.ts as part of L1 / S15
-// integration.
-export const CODING_SESSION_STARTED = 'coding.session.started' as const;
-export const CODING_SESSION_TURN_OBSERVED = 'coding.session.turn.observed' as const;
+// Class A event types produced. Canonical definitions live in
+// src/coding/events.ts so the registry-coverage test finds them via
+// the events.ts walker.
+export {
+  CODING_SESSION_STARTED,
+  CODING_SESSION_TURN_OBSERVED,
+} from '../../coding/events.js';
+import {
+  CODING_SESSION_STARTED,
+  CODING_SESSION_TURN_OBSERVED,
+} from '../../coding/events.js';
 
 // ─── payload schemas (wire) ────────────────────────────────────────
 

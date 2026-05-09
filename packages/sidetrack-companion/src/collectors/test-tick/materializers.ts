@@ -18,10 +18,12 @@ import {
 
 export const TEST_TICK_COLLECTOR_ID = 'sidetrack.test-tick' as const;
 
-// Class A event type produced when a tick promotes. Must be
-// registered in sync/contract/registry.ts (a future S16 integration
-// step adds the ContractEntry row).
-export const CODING_TICK_OBSERVED = 'coding.tick.observed' as const;
+// Class A event type produced when a tick promotes. Canonical
+// definition lives in src/coding/events.ts so the registry-coverage
+// test (sync/contract/registry.test.ts) finds it via the events.ts
+// walker.
+export { CODING_TICK_OBSERVED } from '../../coding/events.js';
+import { CODING_TICK_OBSERVED } from '../../coding/events.js';
 
 // ─── payload schemas ───────────────────────────────────────────────
 

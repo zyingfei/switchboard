@@ -306,6 +306,15 @@ export interface CompanionHttpConfig {
       readonly promoted: number;
       readonly stillQuarantined: number;
     }>;
+    // Per-(collector_id, capability) gate state. Used by the GET
+    // /v1/collectors route to surface granted/revoked/pending state
+    // alongside each capability declaration. The capability arg is
+    // 'reads-paths' | 'reads-env' | 'reads-network'.
+    readonly resolveGate?: (
+      collectorId: string,
+      capability: 'reads-paths' | 'reads-env' | 'reads-network',
+    ) => 'granted' | 'revoked' | 'pending';
+    readonly lastPromotedAtFor?: (collectorId: string) => string | null;
   };
   readonly vaultChanges?: {
     readonly subscribe: (listener: (event: VaultChangeEvent) => void) => () => void;
@@ -1532,8 +1541,39 @@ const routes: readonly RouteDefinition[] = [
             rejectedReason?: string;
           };
           const id = e.manifest.id;
-          const quarantineCount =
-            await context.collectorFramework!.quarantineCountFor(id);
+          const fw = context.collectorFramework!;
+          const quarantineCount = await fw.quarantineCountFor(id);
+          const resolveGate = fw.resolveGate;
+          const lastPromotedAtFor = fw.lastPromotedAtFor;
+          // capability_gates: per-(collector_id, capability) gate
+          // state. Only includes capabilities the collector actually
+          // declared — declaring no `reads-paths` paths means no
+          // 'reads-paths' key appears here. When the framework
+          // doesn't expose a resolver, we surface 'pending' so the
+          // UI can show a neutral state rather than a misleading
+          // 'granted'.
+          const capabilityGates: Record<string, 'granted' | 'revoked' | 'pending'> = {};
+          if (
+            e.manifest.capabilities['reads-paths'] !== undefined &&
+            e.manifest.capabilities['reads-paths'].length > 0
+          ) {
+            capabilityGates['reads-paths'] = resolveGate
+              ? resolveGate(id, 'reads-paths')
+              : 'pending';
+          }
+          if (
+            e.manifest.capabilities['reads-env'] !== undefined &&
+            e.manifest.capabilities['reads-env'].length > 0
+          ) {
+            capabilityGates['reads-env'] = resolveGate
+              ? resolveGate(id, 'reads-env')
+              : 'pending';
+          }
+          if (e.manifest.capabilities['reads-network'] === true) {
+            capabilityGates['reads-network'] = resolveGate
+              ? resolveGate(id, 'reads-network')
+              : 'pending';
+          }
           return {
             collector_id: id,
             name: e.manifest.name,
@@ -1550,7 +1590,9 @@ const routes: readonly RouteDefinition[] = [
               reads_network: e.manifest.capabilities['reads-network'] ?? false,
               default_enabled: e.manifest.capabilities['default-enabled'] ?? true,
             },
+            capability_gates: capabilityGates,
             quarantine_count: quarantineCount,
+            last_promoted_at: lastPromotedAtFor ? lastPromotedAtFor(id) : null,
           };
         }),
       );
