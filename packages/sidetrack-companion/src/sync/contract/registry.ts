@@ -28,6 +28,11 @@ import {
   ANNOTATION_DELETED,
   ANNOTATION_NOTE_SET,
 } from '../../annotations/events.js';
+import {
+  CODING_SESSION_STARTED,
+  CODING_SESSION_TURN_OBSERVED,
+  CODING_TICK_OBSERVED,
+} from '../../coding/events.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
 import {
   ENGAGEMENT_INTERVAL_OBSERVED,
@@ -113,6 +118,7 @@ export const KNOWN_MATERIALIZERS: ReadonlySet<string> = new Set<string>([
   'extraction',
   'timeline',
   'connections',
+  'collector',
 ]);
 
 const projectionEntry = (eventType: string, surface: string): ContractEntry => ({
@@ -452,6 +458,57 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
         surface: 'connections-template-projection',
         class: 'derived-cache',
         materializer: 'connections',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+    ],
+  },
+  // Stage 4 — collector-derived Class A event types. Promoted by the
+  // pluggable collector framework (test-tick + Codex CLI + Claude
+  // Code in this PR; Stage 4.1 adds shell + git + github). The
+  // discriminator between source collectors is `producedBy.ruleId`
+  // = `${collector_id}:${event_type}` (Lock 3). The 'collector'
+  // materializer name is in KNOWN_MATERIALIZERS and represents the
+  // promotion path; the framework's `materializeCollectorLine` is
+  // the choke point that creates these events. The 'connections'
+  // materializer's catchUp loop tolerates unknown event types so
+  // collector events flow through without explicit case handling
+  // until a downstream consumer (coding-session timeline,
+  // contributors graph, …) lands.
+  {
+    eventType: CODING_TICK_OBSERVED,
+    currentPayloadVersion: 1,
+    surfaces: [
+      {
+        surface: 'collector-promoted-class-a',
+        class: 'derived-cache',
+        materializer: 'collector',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+    ],
+  },
+  {
+    eventType: CODING_SESSION_STARTED,
+    currentPayloadVersion: 1,
+    surfaces: [
+      {
+        surface: 'collector-promoted-class-a',
+        class: 'derived-cache',
+        materializer: 'collector',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+    ],
+  },
+  {
+    eventType: CODING_SESSION_TURN_OBSERVED,
+    currentPayloadVersion: 1,
+    surfaces: [
+      {
+        surface: 'collector-promoted-class-a',
+        class: 'derived-cache',
+        materializer: 'collector',
         peerFreshnessMs: 30_000,
         recovery: 'replay-event-log',
       },

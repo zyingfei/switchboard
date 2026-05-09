@@ -1,8 +1,28 @@
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+
 import { ensureBridgeKey } from '../auth/bridgeKey.js';
 import { createIdempotencyStore } from '../http/idempotency.js';
 import { pickInstaller } from '../install/index.js';
 import { createRecallActivityTracker } from '../recall/activity.js';
 import { createRecallLifecycle } from '../recall/lifecycle.js';
+import {
+  bootCollectorFramework,
+  type CollectorFrameworkHandle,
+} from '../collectors/framework/runtime.js';
+import {
+  gateStateForCollector,
+  type CollectorCapability,
+} from '../collectors/framework/capabilityGates.js';
+import { COLLECTOR_FRAMEWORK_VERSION } from '../version.js';
+import { projectPrivacy, type PrivacyProjection } from '../privacy/projection.js';
+import {
+  PRIVACY_GATE_FLIPPED,
+  PRIVACY_PERMISSION_GRANTED,
+  PRIVACY_PERMISSION_REVOKED,
+} from '../privacy/events.js';
+import type { AcceptedEvent } from '../sync/causal.js';
 import {
   acquireRecallProcessLock,
   cleanupOrphanIndexTmpFiles,
@@ -309,6 +329,9 @@ export const startCompanion = async (
         .publishEvent(accepted.dot.replicaId, accepted as never)
         .catch(() => undefined);
     }
+    // Stage 4: privacy events refresh the cached projection so
+    // collector capability gates see the new state on next promote.
+    onPrivacyEventAccepted(accepted as AcceptedEvent);
   };
   const eventLog = {
     ...baseEventLog,
@@ -366,6 +389,145 @@ export const startCompanion = async (
       embeddingCache: createEmbeddingCache(options.vaultPath),
     }),
   );
+  // ─── Collector framework (Stage 4) ──────────────────────────────
+  // Wired BEFORE the HTTP server starts so the GET /v1/collectors and
+  // POST /v1/collectors/{id}/replay routes have a live framework
+  // handle to query. Best-effort: if boot throws (corrupt manifest,
+  // FS issue, etc.) we log + continue without it; HTTP routes return
+  // 503 in that case.
+  let collectorFramework: CollectorFrameworkHandle | null = null;
+  let cachedPrivacyProjection: PrivacyProjection = projectPrivacy([]);
+  const refreshPrivacyProjectionFromLog = async (): Promise<void> => {
+    try {
+      const all = await baseEventLog.readMerged();
+      cachedPrivacyProjection = projectPrivacy(
+        all.filter(
+          (e) =>
+            e.type === PRIVACY_GATE_FLIPPED ||
+            e.type === PRIVACY_PERMISSION_GRANTED ||
+            e.type === PRIVACY_PERMISSION_REVOKED,
+        ),
+      );
+    } catch {
+      // Initial empty projection is the safe default.
+    }
+  };
+  const onPrivacyEventAccepted = (event: AcceptedEvent): void => {
+    if (
+      event.type === PRIVACY_GATE_FLIPPED ||
+      event.type === PRIVACY_PERMISSION_GRANTED ||
+      event.type === PRIVACY_PERMISSION_REVOKED
+    ) {
+      // Async refresh; collector promotions read the CACHED projection
+      // synchronously, so a brief stale window is acceptable. The
+      // alternative (synchronous refresh) would block every privacy
+      // event accept on a full event-log read.
+      void refreshPrivacyProjectionFromLog();
+    }
+  };
+  await refreshPrivacyProjectionFromLog();
+
+  const appendCollectorAudit = async (
+    route: string,
+    subject: string,
+  ): Promise<void> => {
+    const now = new Date();
+    const datePath = join(
+      options.vaultPath,
+      '_BAC',
+      'audit',
+      `${now.toISOString().slice(0, 10)}.jsonl`,
+    );
+    try {
+      await mkdir(join(datePath, '..'), { recursive: true });
+      const entry = {
+        requestId: `collector:${randomUUID()}`,
+        route,
+        outcome: 'success' as const,
+        bac_id: subject,
+        timestamp: now.toISOString(),
+      };
+      await writeFile(datePath, `${JSON.stringify(entry)}\n`, {
+        encoding: 'utf8',
+        flag: 'a',
+      });
+    } catch {
+      // Audit-write failures are non-fatal — the collector framework
+      // does not depend on audit success.
+    }
+  };
+
+  try {
+    collectorFramework = await bootCollectorFramework({
+      vaultRoot: options.vaultPath,
+      companionFrameworkVersion: COLLECTOR_FRAMEWORK_VERSION,
+      vaultMajor: 1,
+      appendClassA: async (event, ruleId, line) => {
+        // Idempotent clientEventId — Patch 2 (post-review):
+        // PRIMARY key is the collector's source_record_id when it
+        // declares one. That's the only stable id across collector
+        // restarts and across replay-on-startup.
+        //
+        // Final-review fix: when source_record_id is absent, hash
+        // the FULL CollectorEvent line (envelope + payload +
+        // dimensions). The earlier fallback hashed only
+        // (ruleId + emittedAt + runId + type) — but two lines with
+        // identical envelope-metadata can carry different payloads,
+        // and we need them to promote independently. Hashing the
+        // full line (via stable JSON serialization of the envelope's
+        // canonical fields) covers payload + dimensions so distinct
+        // lines always produce distinct ids, while a true re-promote
+        // of the SAME bytes still short-circuits at the event log's
+        // clientEventId dedupe.
+        const clientEventId = (() => {
+          if (line.source_record_id !== undefined && line.source_record_id.length > 0) {
+            return `collector:${ruleId}:${line.source_record_id}`;
+          }
+          const lineDigest = createHash('sha256')
+            .update(
+              JSON.stringify({
+                collector_id: line.collector_id,
+                event_type: line.event_type,
+                payload_version: line.payload_version,
+                emitted_at: line.emitted_at,
+                collector_version: line.collector_version,
+                collector_run_id: line.collector_run_id,
+                payload: line.payload,
+                dimensions: line.dimensions,
+              }),
+              'utf8',
+            )
+            .digest('hex')
+            .slice(0, 24);
+          return `collector:${ruleId}:fallback:${lineDigest}`;
+        })();
+        const eventTypeForLog =
+          (event as { type?: string }).type ?? 'collector.unknown';
+        await eventLog.appendServerObserved({
+          clientEventId,
+          aggregateId: ruleId,
+          type: eventTypeForLog,
+          payload: event as Record<string, unknown>,
+        });
+      },
+      auditRoute: appendCollectorAudit,
+      resolveGate: (collectorId, capability, defaultEnabled) =>
+        gateStateForCollector(
+          cachedPrivacyProjection,
+          collectorId,
+          capability as CollectorCapability,
+          defaultEnabled,
+        ),
+    });
+    {
+      const handle = collectorFramework;
+      teardown.push(() => handle.close());
+    }
+  } catch {
+    collectorFramework = null;
+  }
+  // ────────────────────────────────────────────────────────────────
+
   // Don't block startup on the rebuild — health endpoint will report
   // status: 'rebuilding' until the background task completes.
   // The fresh-check + incremental ingest BOTH run through the
@@ -405,6 +567,26 @@ export const startCompanion = async (
     allowAutoUpdate: options.allowAutoUpdate ?? false,
     startedAt: new Date(),
     bucketRegistry: createBucketRegistry(options.vaultPath),
+    ...(collectorFramework === null
+      ? {}
+      : {
+          collectorFramework: {
+            loadedCollectors: collectorFramework.loadedCollectors,
+            quarantineCountFor: collectorFramework.quarantineCountFor,
+            replayCollector: collectorFramework.replayCollector,
+            // Patch 1 (post-review): expose gate resolver + last-
+            // promoted-at on the HTTP context so the route handler
+            // populates capability_gates and last_promoted_at fields.
+            resolveGate: (collectorId, capability) =>
+              gateStateForCollector(
+                cachedPrivacyProjection,
+                collectorId,
+                capability as CollectorCapability,
+                true,
+              ),
+            lastPromotedAtFor: collectorFramework.lastPromotedAtFor,
+          },
+        }),
     hygieneStatus,
     recallLifecycle,
     recallActivity,

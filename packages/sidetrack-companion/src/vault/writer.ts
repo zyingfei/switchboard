@@ -1,6 +1,6 @@
-import { access, mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
-import { basename, dirname, join } from 'node:path';
+import { join } from 'node:path';
 
 import { createBacId, createRevision } from '../domain/ids.js';
 import {
@@ -21,6 +21,7 @@ import {
   reviewEventRecordSchema,
   settingsDocumentSchema,
 } from '../http/schemas.js';
+import { writeJsonAtomic } from './atomic.js';
 import type {
   AuditEventRecord,
   AuditListQuery,
@@ -211,14 +212,6 @@ const writeMarkdownProjection = async (path: string, body: string): Promise<void
     // Vault write failures are surfaced via audit elsewhere; the
     // markdown sidecar is non-critical, do not fail the upsert.
   }
-};
-
-const writeJsonAtomic = async (path: string, value: unknown): Promise<void> => {
-  const directory = dirname(path);
-  await mkdir(directory, { recursive: true });
-  const tempPath = join(directory, `.${basename(path)}.${createRevision()}.tmp`);
-  await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  await rename(tempPath, path);
 };
 
 const appendJsonLine = async (path: string, value: unknown): Promise<void> => {
