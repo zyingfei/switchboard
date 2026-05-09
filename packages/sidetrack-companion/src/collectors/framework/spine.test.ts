@@ -457,6 +457,109 @@ describe('Stage 4 spine — compass §2.G structural tests', () => {
     }
   });
 
+  it('Patch 2 fallback: two lines WITHOUT source_record_id, identical envelope, distinct payload → both promote', async () => {
+    // Earlier the fallback clientEventId hashed only
+    // (ruleId + emittedAt + runId + type). Two lines sharing the
+    // entire envelope but carrying distinct payloads collided to
+    // the same id and only one would promote. The fix hashes the
+    // FULL CollectorEvent line (envelope + payload + dimensions),
+    // so distinct payloads always produce distinct ids.
+    //
+    // bootHarness here uses the capture adapter (not production
+    // eventLog) — so we register a custom appendClassA that mirrors
+    // the production formula and asserts the fallback ids differ.
+    const fixture = await setupFixtureVault(
+      new Map([[TEST_TICK_COLLECTOR_ID, {}]]),
+    );
+    cleanup = fixture.cleanup;
+    const { createHash } = await import('node:crypto');
+    const fallbackClientEventId = (ruleId: string, line: CollectorEvent): string => {
+      if (line.source_record_id !== undefined && line.source_record_id.length > 0) {
+        return `collector:${ruleId}:${line.source_record_id}`;
+      }
+      const lineDigest = createHash('sha256')
+        .update(
+          JSON.stringify({
+            collector_id: line.collector_id,
+            event_type: line.event_type,
+            payload_version: line.payload_version,
+            emitted_at: line.emitted_at,
+            collector_version: line.collector_version,
+            collector_run_id: line.collector_run_id,
+            payload: line.payload,
+            dimensions: line.dimensions,
+          }),
+          'utf8',
+        )
+        .digest('hex')
+        .slice(0, 24);
+      return `collector:${ruleId}:fallback:${lineDigest}`;
+    };
+
+    const fallbackIds = new Set<string>();
+    let collisionCount = 0;
+    const capturedClassA: CapturedClassA[] = [];
+    const harness = await bootHarness(fixture.vaultRoot, {
+      appendClassA: async (event: unknown, ruleId: string, line: CollectorEvent) => {
+        const id = fallbackClientEventId(ruleId, line);
+        if (fallbackIds.has(id)) {
+          collisionCount += 1;
+        }
+        fallbackIds.add(id);
+        capturedClassA.push({ event, ruleId, line });
+      },
+    });
+    try {
+      const inboxFile = join(
+        fixture.vaultRoot,
+        '_BAC',
+        'inbox',
+        TEST_TICK_COLLECTOR_ID,
+        `${new Date().toISOString().slice(0, 10)}.jsonl`,
+      );
+      await mkdir(join(inboxFile, '..'), { recursive: true });
+      const sharedEmittedAt = new Date('2026-05-08T12:30:00.000Z').toISOString();
+      const sharedRunId = 'no-source-record-run';
+      // Two lines: NO source_record_id, identical envelope, distinct payload.
+      const lineA = JSON.stringify({
+        collector_id: TEST_TICK_COLLECTOR_ID,
+        event_type: 'tick',
+        payload_version: 1,
+        emitted_at: sharedEmittedAt,
+        collector_version: '0.1.0',
+        collector_run_id: sharedRunId,
+        payload: { tick_index: 100, message: 'first' },
+      });
+      const lineB = JSON.stringify({
+        collector_id: TEST_TICK_COLLECTOR_ID,
+        event_type: 'tick',
+        payload_version: 1,
+        emitted_at: sharedEmittedAt,
+        collector_version: '0.1.0',
+        collector_run_id: sharedRunId,
+        payload: { tick_index: 101, message: 'second' },
+      });
+      await writeFile(inboxFile, `${lineA}\n${lineB}\n`, 'utf8');
+
+      await harness.framework.waitIdle();
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      await harness.framework.waitIdle();
+
+      // Both lines must promote.
+      expect(capturedClassA).toHaveLength(2);
+      // The fallback clientEventIds must differ (no collisions).
+      expect(fallbackIds.size).toBe(2);
+      expect(collisionCount).toBe(0);
+      // Sanity: distinct payloads landed.
+      const payloads = capturedClassA.map(
+        (c) => (c.line.payload as { tick_index?: number }).tick_index,
+      );
+      expect(new Set(payloads)).toEqual(new Set([100, 101]));
+    } finally {
+      await harness.close();
+    }
+  });
+
   it('Blocker 3: discovery boots empty, then manifest+inbox dropped post-boot → tail starts and promotes', async () => {
     const vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-stage4-spine-'));
     cleanup = () => rm(vaultRoot, { recursive: true, force: true });

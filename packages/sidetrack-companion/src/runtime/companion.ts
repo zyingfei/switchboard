@@ -463,33 +463,50 @@ export const startCompanion = async (
       companionFrameworkVersion: COLLECTOR_FRAMEWORK_VERSION,
       vaultMajor: 1,
       appendClassA: async (event, ruleId, line) => {
-        const e = event as {
-          type?: string;
-          payloadVersion?: number;
-          emittedAt?: string;
-          producedBy?: { runId?: string };
-        };
         // Idempotent clientEventId — Patch 2 (post-review):
         // PRIMARY key is the collector's source_record_id when it
         // declares one. That's the only stable id across collector
-        // restarts and across replay-on-startup. Falls back to a
-        // synthetic id for collectors that don't carry a source
-        // record id; the synthetic includes runId + emittedAt + a
-        // short hash of the event type so two distinct events from
-        // the same collector run (same emittedAt is possible — the
-        // collector might batch ticks within a millisecond) get
-        // distinct ids.
+        // restarts and across replay-on-startup.
+        //
+        // Final-review fix: when source_record_id is absent, hash
+        // the FULL CollectorEvent line (envelope + payload +
+        // dimensions). The earlier fallback hashed only
+        // (ruleId + emittedAt + runId + type) — but two lines with
+        // identical envelope-metadata can carry different payloads,
+        // and we need them to promote independently. Hashing the
+        // full line (via stable JSON serialization of the envelope's
+        // canonical fields) covers payload + dimensions so distinct
+        // lines always produce distinct ids, while a true re-promote
+        // of the SAME bytes still short-circuits at the event log's
+        // clientEventId dedupe.
         const clientEventId = (() => {
           if (line.source_record_id !== undefined && line.source_record_id.length > 0) {
             return `collector:${ruleId}:${line.source_record_id}`;
           }
-          const fallback = `${ruleId}:${e.emittedAt ?? ''}:${e.producedBy?.runId ?? ''}:${e.type ?? ''}`;
-          return `collector:${fallback}:${createHash('sha256').update(fallback, 'utf8').digest('hex').slice(0, 16)}`;
+          const lineDigest = createHash('sha256')
+            .update(
+              JSON.stringify({
+                collector_id: line.collector_id,
+                event_type: line.event_type,
+                payload_version: line.payload_version,
+                emitted_at: line.emitted_at,
+                collector_version: line.collector_version,
+                collector_run_id: line.collector_run_id,
+                payload: line.payload,
+                dimensions: line.dimensions,
+              }),
+              'utf8',
+            )
+            .digest('hex')
+            .slice(0, 24);
+          return `collector:${ruleId}:fallback:${lineDigest}`;
         })();
+        const eventTypeForLog =
+          (event as { type?: string }).type ?? 'collector.unknown';
         await eventLog.appendServerObserved({
           clientEventId,
           aggregateId: ruleId,
-          type: e.type ?? 'collector.unknown',
+          type: eventTypeForLog,
           payload: event as Record<string, unknown>,
         });
       },
