@@ -4321,6 +4321,11 @@ const App = () => {
 
       {viewMode === 'connections' ? (
         <ConnectionsView
+          {...(currentWsId === null ? {} : { initialAnchor: `workstream:${currentWsId}` })}
+          workstreamAnchors={state.workstreams.map((w) => ({
+            id: `workstream:${w.bac_id}`,
+            label: workstreamPath(w.bac_id, state.workstreams),
+          }))}
           recentAnchors={[
             ...[...state.threads]
               .sort((a, b) => (a.lastSeenAt < b.lastSeenAt ? 1 : -1))

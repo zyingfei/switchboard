@@ -70,9 +70,16 @@ export interface ConnectionsViewRecentAnchor {
   readonly meta?: string;
 }
 
+export interface ConnectionsViewWorkstreamAnchor {
+  readonly id: string;
+  readonly label: string;
+  readonly meta?: string;
+}
+
 type Props = {
   readonly initialAnchor?: string;
   readonly recentAnchors?: readonly ConnectionsViewRecentAnchor[];
+  readonly workstreamAnchors?: readonly ConnectionsViewWorkstreamAnchor[];
 };
 
 type SubMode = 'linked' | 'orbital' | 'flow' | 'focus' | 'context';
@@ -84,6 +91,9 @@ const KIND_RANK = new Map<ConnectionNodeKind, number>(
 const edgeConfidenceClass = (confidence: ConnectionEdge['confidence']): string => {
   return confidence === 'inferred' ? 'confidence-inferred' : '';
 };
+
+const normalizeWorkstreamAnchorId = (id: string): string =>
+  id.startsWith('workstream:') ? id : `workstream:${id}`;
 
 const metadataString = (
   metadata: Record<string, unknown>,
@@ -382,6 +392,7 @@ const sortGroupKeys = (kinds: readonly ConnectionNodeKind[]): ConnectionNodeKind
 export const ConnectionsView = ({
   initialAnchor = '',
   recentAnchors = [],
+  workstreamAnchors = [],
 }: Props): ReactElement => {
   const [anchor, setAnchor] = useState<string>(initialAnchor);
   const [draftAnchor, setDraftAnchor] = useState<string>(initialAnchor);
@@ -445,6 +456,40 @@ export const ConnectionsView = ({
     return computeTimelineRail(result.snapshot, anchor);
   }, [result, anchor]);
 
+  const workstreamOptions = useMemo<readonly ConnectionsViewWorkstreamAnchor[]>(() => {
+    const byId = new Map<string, ConnectionsViewWorkstreamAnchor>();
+    const add = (input: ConnectionsViewWorkstreamAnchor): void => {
+      const id = normalizeWorkstreamAnchorId(input.id);
+      if (byId.has(id)) return;
+      byId.set(id, { ...input, id });
+    };
+    for (const input of workstreamAnchors) add(input);
+    for (const recent of recentAnchors) {
+      if (recent.kind === 'workstream') {
+        add({
+          id: recent.id,
+          label: recent.label,
+          ...(recent.meta === undefined ? {} : { meta: recent.meta }),
+        });
+      }
+    }
+    for (const node of result?.snapshot.nodes ?? []) {
+      if (node.kind !== 'workstream') continue;
+      add({
+        id: node.id,
+        label: node.label.trim().length > 0 ? node.label : shortNodeId(node.id),
+        ...(node.lastSeenAt === undefined ? {} : { meta: node.lastSeenAt.slice(0, 10) }),
+      });
+    }
+    if (anchor.startsWith('workstream:')) {
+      add({
+        id: anchor,
+        label: anchorNode?.label ?? shortNodeId(anchor),
+      });
+    }
+    return [...byId.values()].sort((left, right) => left.label.localeCompare(right.label));
+  }, [anchor, anchorNode, recentAnchors, result, workstreamAnchors]);
+
   const submitAnchor = (next?: string): void => {
     const value = (next ?? draftAnchor).trim();
     if (next !== undefined) setDraftAnchor(value);
@@ -452,6 +497,8 @@ export const ConnectionsView = ({
     setWhyVisitId(null);
     setAnchor(value);
   };
+
+  const selectedWorkstreamAnchor = anchor.startsWith('workstream:') ? anchor : '';
 
   const useNodeAsAnchor = (nodeId: string): void => {
     setSelectedEdge(null);
@@ -661,27 +708,58 @@ export const ConnectionsView = ({
       <div className="cx-cols">
         <aside className="cx-col-l">
           <div className="cx-section">
-            <h4>Anchor</h4>
-            <label className="cx-input">
-              <span
-                aria-hidden
-                style={{ color: 'var(--ink-3)', display: 'grid', placeItems: 'center' }}
-              >
-                {SearchIcon}
-              </span>
-              <input
-                type="text"
-                placeholder="thread:bac_…  workstream:bac_…"
-                value={draftAnchor}
-                onChange={(e) => setDraftAnchor(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') submitAnchor();
+            <h4>Workstream</h4>
+            <label className="cx-select">
+              <span className="cx-select-label">Show connections around</span>
+              <select
+                value={selectedWorkstreamAnchor}
+                onChange={(event) => {
+                  if (event.currentTarget.value.length > 0) submitAnchor(event.currentTarget.value);
                 }}
-                onBlur={() => submitAnchor()}
-                aria-label="Connections anchor"
-                data-testid="connections-anchor-input"
-              />
+                aria-label="Connections workstream"
+                data-testid="connections-workstream-select"
+                disabled={workstreamOptions.length === 0}
+              >
+                <option value="">
+                  {workstreamOptions.length === 0 ? 'No workstreams in view' : 'Choose workstream'}
+                </option>
+                {workstreamOptions.map((workstream) => (
+                  <option key={workstream.id} value={workstream.id}>
+                    {workstream.label}
+                    {workstream.meta === undefined ? '' : ` · ${workstream.meta}`}
+                  </option>
+                ))}
+              </select>
             </label>
+            <details
+              className="cx-advanced-anchor"
+              data-testid="connections-advanced-anchor"
+              open={workstreamOptions.length === 0 || !anchor.startsWith('workstream:')}
+            >
+              <summary data-testid="connections-advanced-anchor-summary">
+                Advanced node anchor
+              </summary>
+              <label className="cx-input">
+                <span
+                  aria-hidden
+                  style={{ color: 'var(--ink-3)', display: 'grid', placeItems: 'center' }}
+                >
+                  {SearchIcon}
+                </span>
+                <input
+                  type="text"
+                  placeholder="thread:bac_...  visit:https://..."
+                  value={draftAnchor}
+                  onChange={(e) => setDraftAnchor(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') submitAnchor();
+                  }}
+                  onBlur={() => submitAnchor()}
+                  aria-label="Connections anchor"
+                  data-testid="connections-anchor-input"
+                />
+              </label>
+            </details>
           </div>
           {recentAnchors.length > 0 ? (
             <div className="cx-section" data-testid="connections-recent-anchors">

@@ -387,10 +387,23 @@ const clickVisibleEdge = async (panel: Page, edge: ConnectionEdge): Promise<void
 };
 
 const setConnectionsAnchor = async (panel: Page, anchorId: string, hops = '2'): Promise<void> => {
-  const input = panel.getByTestId('connections-anchor-input');
-  await input.click();
-  await input.fill(anchorId);
-  await input.press('Enter');
+  const select = panel.getByTestId('connections-workstream-select');
+  const canUseWorkstreamSelect =
+    anchorId.startsWith('workstream:') &&
+    (await select.locator(`option[value="${anchorId}"]`).count()) > 0;
+  if (canUseWorkstreamSelect) {
+    await select.selectOption(anchorId);
+  } else {
+    const advanced = panel.getByTestId('connections-advanced-anchor');
+    const advancedOpen = await advanced.evaluate(
+      (node) => node instanceof HTMLDetailsElement && node.open,
+    );
+    if (!advancedOpen) await panel.getByTestId('connections-advanced-anchor-summary').click();
+    const input = panel.getByTestId('connections-anchor-input');
+    await input.click();
+    await input.fill(anchorId);
+    await input.press('Enter');
+  }
   await panel.getByTestId('connections-hops-select').selectOption(hops);
   await expect(panel.getByTestId('connections-groups')).toBeVisible({ timeout: 30_000 });
 };

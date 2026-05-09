@@ -101,6 +101,35 @@ describe('ConnectionsView — engineering scaffold', () => {
     expect(screen.getByText('Tax flow → Tax automation')).toBeDefined();
   });
 
+  it('uses a workstream selector as the primary anchor control', async () => {
+    const requestedNodeIds: string[] = [];
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string; nodeId?: string };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        requestedNodeIds.push(m.nodeId ?? '');
+        return { ok: true, data: buildSnapshot() };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+    render(
+      <ConnectionsView
+        workstreamAnchors={[
+          { id: 'workstream:ws_x', label: 'Tax automation' },
+          { id: 'workstream:ws_y', label: 'Research queue' },
+        ]}
+      />,
+    );
+
+    const selector = screen.getByTestId('connections-workstream-select') as HTMLSelectElement;
+    expect(selector.value).toBe('');
+    fireEvent.change(selector, { target: { value: 'workstream:ws_x' } });
+
+    await waitFor(() => {
+      expect(requestedNodeIds).toContain('workstream:ws_x');
+    });
+    expect(selector.value).toBe('workstream:ws_x');
+  });
+
   it('can re-anchor from a visible neighbor row', async () => {
     const requestedNodeIds: string[] = [];
     setConnectionsClientTransportForTests(async (msg) => {
@@ -160,7 +189,7 @@ describe('ConnectionsView — engineering scaffold', () => {
     await waitFor(() => {
       expect(requestedNodeIds).toContain('workstream:ws_x');
     });
-    expect((screen.getByLabelText('Connections anchor') as HTMLInputElement).value).toBe(
+    expect((screen.getByTestId('connections-workstream-select') as HTMLSelectElement).value).toBe(
       'workstream:ws_x',
     );
   });
