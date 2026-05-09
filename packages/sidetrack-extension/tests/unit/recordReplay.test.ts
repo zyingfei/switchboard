@@ -117,10 +117,14 @@ const connectionsFor = (
   },
 });
 
-const stubRouteTracker = (urls: readonly string[]): RouteStubTracker => ({
+const stubRouteTracker = (
+  urls: readonly string[],
+  options: { readonly abortedCount?: number } = {},
+): RouteStubTracker => ({
   expectedCanonicalUrls: urls,
   hitCounts: () => new Map(urls.map((url) => [url, 1])),
   fulfilledBodies: () => new Map(),
+  abortedCount: () => options.abortedCount ?? 0,
 });
 
 const warningPack = (): SessionPack => {
@@ -683,6 +687,53 @@ describe('T1 record/replay session pack helpers', () => {
     expect(markdown.startsWith('| Score | Value | Color | Rationale |')).toBe(true);
     expect(JSON.parse(JSON.stringify(report))).toHaveProperty('scores');
     expect(repeatedReport.scores).toEqual(report.scores);
+  });
+
+  it('surfaces strict-offline state and aborted-request count in the report and markdown', () => {
+    const pack = basePack();
+    const urls = recordedCanonicalUrls(pack);
+    const connections = connectionsFor(urls, [
+      {
+        kind: 'visit_in_workstream',
+        fromNodeId: visitNodeId('https://example.test/a'),
+        toNodeId: 'workstream:ws_t1',
+      },
+    ]);
+    const baseInput = {
+      pack,
+      pageReplay: { succeededCanonicalUrls: urls, failures: [] },
+      drain: { ok: true, uploaded: urls.length, remaining: 0 },
+      timeline: timelineFor(pack),
+      connections,
+    } as const;
+
+    const offReport = evaluateOneBrowserReplay({
+      ...baseInput,
+      routeTracker: stubRouteTracker(urls, { abortedCount: 0 }),
+    });
+    expect(offReport.strictOffline).toBeUndefined();
+
+    const onReport = evaluateOneBrowserReplay({
+      ...baseInput,
+      routeTracker: stubRouteTracker(urls, { abortedCount: 17 }),
+      strictOffline: true,
+    });
+    expect(onReport.strictOffline).toEqual({ enabled: true, abortedCount: 17 });
+
+    const disabledReport = evaluateOneBrowserReplay({
+      ...baseInput,
+      routeTracker: stubRouteTracker(urls, { abortedCount: 0 }),
+      strictOffline: false,
+    });
+    expect(disabledReport.strictOffline).toEqual({ enabled: false, abortedCount: 0 });
+
+    const markdown = renderReplayMarkdown(onReport);
+    expect(markdown).toContain('## Strict offline replay');
+    expect(markdown).toContain('Mode: enabled');
+    expect(markdown).toContain('Aborted unstubbed requests: 17');
+
+    const offMarkdown = renderReplayMarkdown(offReport);
+    expect(offMarkdown).not.toContain('## Strict offline replay');
   });
 
   it('writes local-only pack.json under the selected session root', async () => {

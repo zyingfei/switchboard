@@ -14,11 +14,16 @@ const TWO_BROWSER_SPEC = 'tests/e2e/record-replay-two-browser.manual.spec.ts';
 const CAPTURE_LEVELS = new Set(['minimal', 'html', 'html+paste']);
 
 const usage = `Usage:
-  sidetrack-test record [--browsers 1|2] [--capture-level minimal|html|html+paste]
-  sidetrack-test replay <pack> [--hold] [--report-dir <path>]
+  sidetrack-test record [--browsers 1|2] [--capture-level minimal|html|html+paste] [--strict-offline]
+  sidetrack-test replay <pack> [--hold] [--report-dir <path>] [--strict-offline]
   sidetrack-test report <run>
   sidetrack-test list
   sidetrack-test inspect <pack>
+
+Flags:
+  --strict-offline   Block any HTTP request that does not match a recorded
+                     navigation; report counts the aborted requests. Equivalent
+                     to setting SIDETRACK_REPLAY_STRICT_OFFLINE=1.
 `;
 
 const fail = (message, code = 1) => {
@@ -150,6 +155,7 @@ const selectedEnv = (env) => {
     'SIDETRACK_REPLAY_PACK',
     'SIDETRACK_REPLAY_HOLD',
     'SIDETRACK_REPLAY_REPORT_DIR',
+    'SIDETRACK_REPLAY_STRICT_OFFLINE',
     'SIDETRACK_E2E_MANUAL',
   ];
   return Object.fromEntries(
@@ -227,7 +233,7 @@ const spawnPlaywright = async (specPath, env, mode) => {
 };
 
 const commandRecord = async (args) => {
-  const { positional, options } = parseOptions(args);
+  const { positional, options } = parseOptions(args, new Set(['strict-offline']));
   if (positional.length > 0) throw new Error('record does not accept positional arguments.');
   const browsersRaw = options.get('browsers') ?? '1';
   const browsers = Number.parseInt(browsersRaw, 10);
@@ -236,6 +242,8 @@ const commandRecord = async (args) => {
   if (!CAPTURE_LEVELS.has(captureLevel)) {
     throw new Error('--capture-level must be minimal, html, or html+paste.');
   }
+  const strictOffline =
+    options.has('strict-offline') || process.env.SIDETRACK_REPLAY_STRICT_OFFLINE === '1';
   const sessionsDir = resolveSessionsDir();
   const env = {
     ...process.env,
@@ -243,12 +251,13 @@ const commandRecord = async (args) => {
     SIDETRACK_TEST_SESSIONS_DIR: sessionsDir,
     SIDETRACK_CAPTURE_LEVEL: captureLevel,
     SIDETRACK_RECORD_CAPTURE_LEVEL: captureLevel,
+    ...(strictOffline ? { SIDETRACK_REPLAY_STRICT_OFFLINE: '1' } : {}),
   };
   return await spawnPlaywright(browsers === 1 ? ONE_BROWSER_SPEC : TWO_BROWSER_SPEC, env, 'record');
 };
 
 const commandReplay = async (args) => {
-  const { positional, options } = parseOptions(args, new Set(['hold']));
+  const { positional, options } = parseOptions(args, new Set(['hold', 'strict-offline']));
   if (positional.length !== 1) throw new Error('replay requires exactly one pack path.');
   const sessionsDir = resolveSessionsDir();
   const packPath = await resolvePackPath(positional[0], sessionsDir);
@@ -258,6 +267,8 @@ const commandReplay = async (args) => {
     reportDirRaw === undefined
       ? undefined
       : assertInsideSessions(reportDirRaw, sessionsDir, 'report directory');
+  const strictOffline =
+    options.has('strict-offline') || process.env.SIDETRACK_REPLAY_STRICT_OFFLINE === '1';
   const env = {
     ...process.env,
     SIDETRACK_E2E_MANUAL: '1',
@@ -267,6 +278,7 @@ const commandReplay = async (args) => {
     SIDETRACK_REPLAY_PACK: packPath,
     ...(options.has('hold') ? { SIDETRACK_REPLAY_HOLD: '1' } : {}),
     ...(reportDir === undefined ? {} : { SIDETRACK_REPLAY_REPORT_DIR: reportDir }),
+    ...(strictOffline ? { SIDETRACK_REPLAY_STRICT_OFFLINE: '1' } : {}),
   };
   return await spawnPlaywright(
     pack.mode.browsers === 1 ? ONE_BROWSER_SPEC : TWO_BROWSER_SPEC,
