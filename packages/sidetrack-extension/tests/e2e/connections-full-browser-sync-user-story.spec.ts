@@ -120,6 +120,15 @@ const visitNodeId = (url: string): string => `timeline-visit:${stripTrailingSlas
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
+const hasEngagementClass = (node: ConnectionNode): boolean => {
+  const engagement = node.metadata?.engagement;
+  return (
+    node.kind === 'timeline-visit' &&
+    isRecord(engagement) &&
+    typeof engagement['class'] === 'string'
+  );
+};
+
 const apiGet = async (comp: TestCompanion, path: string): Promise<unknown> => {
   const res = await fetch(`http://127.0.0.1:${String(comp.port)}${path}`, {
     headers: { 'x-bac-bridge-key': comp.bridgeKey },
@@ -143,6 +152,19 @@ const apiPost = async (comp: TestCompanion, path: string, body: unknown): Promis
     throw new Error(`POST ${path} failed with ${String(res.status)}: ${await res.text()}`);
   }
   return await res.json();
+};
+
+const openPrivacyGate = async (comp: TestCompanion, gate: string): Promise<void> => {
+  await apiPost(comp, '/v1/privacy/events', {
+    type: 'privacy.gate.flipped',
+    payload: {
+      payloadVersion: 1,
+      gate,
+      state: 'open',
+      actor: 'user',
+      reason: 'l5-e2e',
+    },
+  });
 };
 
 const waitForConnections = async (
@@ -347,6 +369,145 @@ const drainTimeline = async (
   );
 };
 
+const drainEdgeEvents = async (
+  runtime: ExtensionRuntime,
+  page: Page,
+  expectedAtLeast: number,
+): Promise<void> => {
+  let uploaded = 0;
+  let latest: unknown = null;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    latest = await runtime.sendRuntimeMessage(page, {
+      type: 'sidetrack.edge-events.force-drain',
+    });
+    const result = latest as {
+      ok?: boolean;
+      drain?: { uploaded?: number; remaining?: number };
+    } | null;
+    uploaded += result?.drain?.uploaded ?? 0;
+    if (
+      result !== null &&
+      result.ok === true &&
+      uploaded >= expectedAtLeast &&
+      (result.drain?.remaining ?? 0) === 0
+    ) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(
+    `edge-event force drain uploaded ${String(uploaded)} events, wanted ${String(expectedAtLeast)}: ${JSON.stringify(latest)}`,
+  );
+};
+
+const engagementTotals = (input: {
+  readonly copyCount?: number;
+  readonly pasteCount?: number;
+}): Record<string, number> => ({
+  activeMs: 6_500,
+  visibleMs: 6_500,
+  focusedWindowMs: 6_500,
+  idleMs: 0,
+  foregroundBursts: 1,
+  returnCount: 1,
+  scrollEvents: 4,
+  maxScrollRatio: 0.8,
+  copyCount: input.copyCount ?? 0,
+  pasteCount: input.pasteCount ?? 0,
+});
+
+const postBrowserAEdgeObservations = async (comp: TestCompanion): Promise<void> => {
+  const now = Date.now();
+  const observedAt = (offsetMs: number): string => new Date(now + offsetMs).toISOString();
+  const edgeEvent = (input: {
+    readonly seq: number;
+    readonly type: string;
+    readonly aggregateId: string;
+    readonly payload: Record<string, unknown>;
+    readonly acceptedAtMs: number;
+  }): Record<string, unknown> => ({
+    clientEventId: `l5-browser-a:${input.type}:${String(input.seq)}`,
+    dot: { replicaId: 'l5-browser-a', seq: input.seq },
+    deps: {},
+    aggregateId: input.aggregateId,
+    type: input.type,
+    payload: input.payload,
+    acceptedAtMs: input.acceptedAtMs,
+  });
+
+  const engagementEvents = VISITS.slice(0, 3).map((visit, index) =>
+    edgeEvent({
+      seq: index + 1,
+      type: 'engagement.session.aggregated',
+      aggregateId: `engagement:${visit.url}`,
+      payload: {
+        payloadVersion: 1,
+        visitId: stripTrailingSlash(visit.url),
+        sessionId: 'l5-browser-a',
+        dimensions: {
+          engagement: engagementTotals({
+            copyCount: index === 1 ? 1 : 0,
+            pasteCount: index === 2 ? 1 : 0,
+          }),
+        },
+      },
+      acceptedAtMs: now + index,
+    }),
+  );
+
+  await apiPost(comp, '/v1/edge/events', {
+    events: [
+      ...engagementEvents,
+      edgeEvent({
+        seq: 10,
+        type: 'selection.copied',
+        aggregateId: `selection:${VISITS[1].url}`,
+        payload: {
+          payloadVersion: 1,
+          visitId: stripTrailingSlash(VISITS[1].url),
+          selectionHash: 'l5-selection-hash',
+          simhash64: 'l5-selection-simhash',
+          charCount: 128,
+          lineCount: 1,
+          contentKindHint: 'prose',
+          rawTextStored: false,
+        },
+        acceptedAtMs: Date.parse(observedAt(10)),
+      }),
+      edgeEvent({
+        seq: 11,
+        type: 'selection.pasted',
+        aggregateId: `selection:${VISITS[2].url}`,
+        payload: {
+          payloadVersion: 1,
+          destinationKind: 'search',
+          destinationId: stripTrailingSlash(VISITS[2].url),
+          selectionHash: 'l5-selection-hash',
+          simhash64: 'l5-selection-simhash',
+          charCount: 128,
+          rawTextStored: false,
+        },
+        acceptedAtMs: Date.parse(observedAt(11)),
+      }),
+    ],
+  });
+};
+
+const grantDeeperPageAccess = async (panel: Page): Promise<void> => {
+  await panel.getByRole('button', { name: 'Settings' }).click();
+  const timelineSection = panel.getByTestId('settings-timeline-section');
+  await expect(timelineSection).toBeVisible({ timeout: 10_000 });
+  await timelineSection.scrollIntoViewIfNeeded();
+  const grantButton = panel.getByTestId('settings-timeline-grant-permission');
+  if (await grantButton.isVisible().catch(() => false)) {
+    await grantButton.click();
+  }
+  await expect(panel.getByTestId('settings-timeline-permission-status')).toContainText('granted', {
+    timeout: 10_000,
+  });
+  await panel.locator('button.btn.btn-ghost', { hasText: 'Close' }).click();
+};
+
 const performCopyPasteBestEffort = async (source: Page, destination: Page): Promise<void> => {
   await source.evaluate(() => {
     window.scrollBy(0, 700);
@@ -383,19 +544,33 @@ const performCopyPasteBestEffort = async (source: Page, destination: Page): Prom
     .catch(() => undefined);
 };
 
+const dwellAndScroll = async (page: Page, dwellMs = 6_000): Promise<void> => {
+  const started = Date.now();
+  await page.bringToFront();
+  for (let index = 0; index < 4; index += 1) {
+    await page
+      .evaluate(
+        (step) => window.scrollTo(0, Math.round((document.body.scrollHeight * step) / 4)),
+        index + 1,
+      )
+      .catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+  const remaining = dwellMs - (Date.now() - started);
+  if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
+};
+
 const driveBrowserAVisits = async (runtime: ExtensionRuntime): Promise<void> => {
   const researchTab = await runtime.context.newPage();
   await researchTab.goto(VISITS[0].url, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
-  await researchTab
-    .evaluate(() => window.scrollBy(0, document.body.scrollHeight / 2))
-    .catch(() => undefined);
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await dwellAndScroll(researchTab);
 
   await researchTab.goto(VISITS[1].url, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await dwellAndScroll(researchTab);
 
   const pasteTab = await runtime.context.newPage();
   await pasteTab.goto(VISITS[2].url, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
+  await dwellAndScroll(pasteTab);
   await performCopyPasteBestEffort(researchTab, pasteTab);
   await new Promise((resolve) => setTimeout(resolve, 500));
 
@@ -547,7 +722,6 @@ const writeCodexCollectorFixture = async (
   const inboxDir = join(vaultPath, '_BAC', 'inbox', CODEX_COLLECTOR_ID);
   await mkdir(inboxDir, { recursive: true });
   await writeFile(join(inboxDir, `${dateStamp}.jsonl`), `${lines.join('\n')}\n`, 'utf8');
-  await apiPost(comp, `/v1/collectors/${CODEX_COLLECTOR_ID}/replay`, {});
   await waitForCollectorPromotion(comp);
 };
 
@@ -648,6 +822,7 @@ test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 com
     })) as { data: { bac_id: string } };
     const wsId = wsRes.data.bac_id;
 
+    await openPrivacyGate(companionA, 'engagement');
     const panelA = await openConnectionsPanel(runtimeA, companionA, wsId);
     await runtimeA.seedStorage(panelA, {
       'sidetrack.timeline.enabled': true,
@@ -657,6 +832,11 @@ test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 com
       type: 'sidetrack.timeline.reinit',
     });
     expect((reinit as { ok?: boolean } | null)?.ok).toBe(true);
+    await grantDeeperPageAccess(panelA);
+    const gateChanged = await runtimeA.sendRuntimeMessage(panelA, {
+      type: 'sidetrack.privacy.gateChanged',
+    });
+    expect((gateChanged as { ok?: boolean } | null)?.ok).toBe(true);
 
     await driveBrowserAVisits(runtimeA);
     const drainSender = await runtimeA.context.newPage();
@@ -664,9 +844,12 @@ test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 com
       waitUntil: 'domcontentloaded',
     });
     await drainTimeline(runtimeA, drainSender, ALL_URLS.length);
+    await drainEdgeEvents(runtimeA, drainSender, ALL_URLS.length);
     await drainSender.close();
+    await postBrowserAEdgeObservations(companionA);
 
     await writeCodexCollectorFixture(companionA.vaultPath, companionA);
+    const bootstrapFeedback = await postBootstrapFeedbackLabels(companionA);
 
     const expectedVisitIds = ALL_URLS.map(visitNodeId);
     await waitForConnections(
@@ -709,12 +892,66 @@ test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 com
     );
 
     const panelB = await openConnectionsPanel(runtimeB, companionB, wsId);
+    await runtimeB.seedStorage(panelB, {
+      'sidetrack.timeline.enabled': true,
+      'sidetrack.activeWorkstreamId': wsId,
+    });
+    const reinitB = await runtimeB.sendRuntimeMessage(panelB, {
+      type: 'sidetrack.timeline.reinit',
+    });
+    expect((reinitB as { ok?: boolean } | null)?.ok).toBe(true);
+    const sharedVisit = await runtimeB.context.newPage();
+    await sharedVisit.goto(VISITS[0].url, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await sharedVisit.close();
+    const drainSenderB = await runtimeB.context.newPage();
+    await drainSenderB.goto(`chrome-extension://${runtimeB.extensionId}/sidepanel.html`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await drainTimeline(runtimeB, drainSenderB, 1);
+    await drainEdgeEvents(runtimeB, drainSenderB, 1);
+    await drainSenderB.close();
+
+    const navigationEnv = await waitForConnections(
+      companionB,
+      (env) =>
+        env.data.snapshot.edges.some((edge) => edge.kind === 'visit_observed_on_replica') &&
+        env.data.snapshot.edges.some((edge) => edge.kind === 'previous_visit_in_tab_session'),
+      'Browser B did not materialize cross-replica navigation edges',
+      120_000,
+    );
+    expect(
+      navigationEnv.data.snapshot.edges.some((edge) => edge.kind === 'visit_observed_on_replica'),
+    ).toBe(true);
+    expect(
+      navigationEnv.data.snapshot.edges.some(
+        (edge) => edge.kind === 'previous_visit_in_tab_session',
+      ),
+    ).toBe(true);
+
     await setConnectionsAnchor(panelB, `workstream:${wsId}`);
     for (const nodeId of expectedVisitIds) {
       await expect(panelB.getByTestId(`node-${nodeId}`)).toBeVisible({ timeout: 20_000 });
     }
 
-    const bootstrapFeedback = await postBootstrapFeedbackLabels(companionB);
+    await waitForCondition(async () => {
+      const projection = (await apiGet(
+        companionB!,
+        '/v1/feedback/projection',
+      )) as FeedbackProjectionEnvelope;
+      return (
+        projection.data.positiveLabels.some(
+          (label) =>
+            label.fromId === bootstrapFeedback.positive.fromId &&
+            label.toId === bootstrapFeedback.positive.toId,
+        ) &&
+        projection.data.negativeLabels.some(
+          (label) =>
+            label.fromId === bootstrapFeedback.negative.fromId &&
+            label.toId === bootstrapFeedback.negative.toId,
+        )
+      );
+    }, 'Browser B did not receive Browser A feedback labels through the relay');
     const initialProjection = (await apiGet(
       companionB,
       '/v1/feedback/projection',
@@ -815,26 +1052,29 @@ test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 com
     await expect(panelB.getByTestId('why-related-panel')).toBeVisible();
     await expect(panelB.getByTestId('why-related-panel')).toContainText(/Ranker score/u);
 
-    const topicNodes = rankedEnv.data.snapshot.nodes.filter((node) => node.kind === 'topic');
-    if (topicNodes.length === 0) {
-      // eslint-disable-next-line no-console
-      console.log('[full-sync] topic nodes did not form under this live browser timing');
-    }
-    const engagementClasses = rankedEnv.data.snapshot.nodes
+    const surfacedEnv = await waitForConnections(
+      companionB,
+      (env) =>
+        env.data.snapshot.nodes.some((node) => node.kind === 'topic') &&
+        env.data.snapshot.nodes.some(hasEngagementClass),
+      'Browser B did not surface topic nodes and engagement classes',
+      120_000,
+    );
+    const topicNodes = surfacedEnv.data.snapshot.nodes.filter((node) => node.kind === 'topic');
+    expect(topicNodes.length).toBeGreaterThan(0);
+    const engagementClasses = surfacedEnv.data.snapshot.nodes
       .filter((node) => node.kind === 'timeline-visit')
       .map((node) => node.metadata?.engagement)
       .filter((value) => isRecord(value) && typeof value['class'] === 'string');
-    if (engagementClasses.length === 0) {
-      // eslint-disable-next-line no-console
-      console.log('[full-sync] engagement classes were not flushed by the live browser buffer');
-    }
-    const navigationEdges = rankedEnv.data.snapshot.edges.filter(
-      (edge) => edge.kind === 'visit_continues_visit',
+    expect(engagementClasses.length).toBeGreaterThan(0);
+    const navigationEdges = navigationEnv.data.snapshot.edges.filter(
+      (edge) =>
+        edge.kind === 'visit_observed_on_replica' || edge.kind === 'previous_visit_in_tab_session',
     );
-    if (navigationEdges.length === 0) {
-      // eslint-disable-next-line no-console
-      console.log('[full-sync] navigation continuation edges were not available in this run');
-    }
+    expect(navigationEdges.some((edge) => edge.kind === 'visit_observed_on_replica')).toBe(true);
+    expect(navigationEdges.some((edge) => edge.kind === 'previous_visit_in_tab_session')).toBe(
+      true,
+    );
 
     llmMockA.assertNoLlmCalls();
     llmMockB.assertNoLlmCalls();

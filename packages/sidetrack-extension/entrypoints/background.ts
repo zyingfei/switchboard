@@ -51,6 +51,7 @@ import {
 } from '../src/background/listeners/tabs';
 import { registerDefaultWebNavigationListeners } from '../src/background/listeners/web-navigation';
 import { IndexedDbEventBuffer } from '../src/background/storage/indexeddb-event-buffer';
+import type { BufferedEvent } from '../src/background/storage/in-memory-event-buffer';
 import {
   createEngagementCache,
   isEngagementIntervalMessage,
@@ -306,7 +307,10 @@ interface PrivacyProjectionPayload {
 const isObjectRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
-const readTimelineCompanionConfig = async (): Promise<{ url: string; bridgeKey: string } | null> => {
+const readTimelineCompanionConfig = async (): Promise<{
+  url: string;
+  bridgeKey: string;
+} | null> => {
   const settings = await readSettings();
   const port = settings.companion.port;
   const bridgeKey = settings.companion.bridgeKey.trim();
@@ -314,10 +318,7 @@ const readTimelineCompanionConfig = async (): Promise<{ url: string; bridgeKey: 
   return { url: `http://127.0.0.1:${String(port)}`, bridgeKey };
 };
 
-const companionJson = async (
-  path: string,
-  init: RequestInit = {},
-): Promise<unknown> => {
+const companionJson = async (path: string, init: RequestInit = {}): Promise<unknown> => {
   const config = await readTimelineCompanionConfig();
   if (config === null) throw new Error('companion not configured');
   const headers = new Headers(init.headers);
@@ -326,9 +327,10 @@ const companionJson = async (
   const response = await fetch(`${config.url}${path}`, { ...init, headers });
   const body = (await response.json()) as unknown;
   if (!response.ok) {
-    const message = isObjectRecord(body) && typeof body['title'] === 'string'
-      ? body['title']
-      : `companion HTTP ${String(response.status)}`;
+    const message =
+      isObjectRecord(body) && typeof body['title'] === 'string'
+        ? body['title']
+        : `companion HTTP ${String(response.status)}`;
     throw new Error(message);
   }
   return body;
@@ -340,8 +342,12 @@ const readPrivacyProjection = async (): Promise<PrivacyProjectionPayload> => {
   if (!isObjectRecord(data)) return {};
   const gateStates = isObjectRecord(data['gateStates']) ? data['gateStates'] : undefined;
   return {
-    ...(gateStates === undefined ? {} : { gateStates: gateStates as Record<string, 'open' | 'closed'> }),
-    ...(typeof data['gateEventCount'] === 'number' ? { gateEventCount: data['gateEventCount'] } : {}),
+    ...(gateStates === undefined
+      ? {}
+      : { gateStates: gateStates as Record<string, 'open' | 'closed'> }),
+    ...(typeof data['gateEventCount'] === 'number'
+      ? { gateEventCount: data['gateEventCount'] }
+      : {}),
   };
 };
 
@@ -385,7 +391,8 @@ const hasEngagementHostPermission = async (): Promise<boolean> => {
 };
 
 const syncEngagementContentScriptRegistration = async (): Promise<void> => {
-  const shouldRegister = (await isEngagementPrivacyGateOpen()) && (await hasEngagementHostPermission());
+  const shouldRegister =
+    (await isEngagementPrivacyGateOpen()) && (await hasEngagementHostPermission());
   const registered = await chrome.scripting.getRegisteredContentScripts({
     ids: [ENGAGEMENT_CONTENT_SCRIPT_ID],
   });
@@ -2133,10 +2140,7 @@ const handleRequest = async (
   }
 
   if (request.type === messageTypes.deleteWorkstream) {
-    return await withCompanionStatus(
-      () => deleteWorkstream(request.workstreamId),
-      'workstream',
-    );
+    return await withCompanionStatus(() => deleteWorkstream(request.workstreamId), 'workstream');
   }
 
   if (request.type === messageTypes.bulkUpdateWorkstreamPrivacy) {
@@ -2756,12 +2760,10 @@ export default defineBackground(() => {
   registerDefaultWebNavigationListeners(tabOpenerStore);
 
   const engagementEventBuffer = new IndexedDbEventBuffer();
-  let engagementRuntimePromise:
-    | Promise<{
-        readonly edgeReplicaId: string;
-        readonly cache: ReturnType<typeof createEngagementCache>;
-      }>
-    | null = null;
+  let engagementRuntimePromise: Promise<{
+    readonly edgeReplicaId: string;
+    readonly cache: ReturnType<typeof createEngagementCache>;
+  }> | null = null;
   const engagementRuntime = async (): Promise<{
     readonly edgeReplicaId: string;
     readonly cache: ReturnType<typeof createEngagementCache>;
@@ -2797,7 +2799,10 @@ export default defineBackground(() => {
     );
   };
 
-  const handleEngagementInterval = async (message: unknown, tabId: number | undefined): Promise<void> => {
+  const handleEngagementInterval = async (
+    message: unknown,
+    tabId: number | undefined,
+  ): Promise<void> => {
     if (tabId === undefined || !isEngagementIntervalMessage(message)) return;
     const runtime = await engagementRuntime();
     const merged = runtime.cache.mergeInterval(tabId, message);
@@ -2850,6 +2855,82 @@ export default defineBackground(() => {
         observedAt: message.payload.observedAt,
       },
     ]);
+  };
+
+  const aggregateIdForBufferedEdgeEvent = (event: BufferedEvent): string => {
+    const payload =
+      typeof event.payload === 'object' && event.payload !== null && !Array.isArray(event.payload)
+        ? (event.payload as Record<string, unknown>)
+        : {};
+    const visitId = payload['visitId'];
+    if (typeof visitId === 'string' && visitId.length > 0) {
+      return `${event.streamName}:${visitId}`;
+    }
+    const canonicalUrl = payload['canonicalUrl'];
+    if (typeof canonicalUrl === 'string' && canonicalUrl.length > 0) {
+      return `${event.streamName}:${canonicalUrl}`;
+    }
+    const selectionHash = payload['selectionHash'];
+    if (typeof selectionHash === 'string' && selectionHash.length > 0) {
+      return `${event.streamName}:${selectionHash}`;
+    }
+    return `${event.streamName}:${event.observedAt.slice(0, 10)}`;
+  };
+
+  const drainBufferedEdgeEvents = async (): Promise<{
+    readonly uploaded: number;
+    readonly remaining: number;
+    readonly skipped: number;
+  }> => {
+    const companion = await readTimelineCompanionConfig();
+    if (companion === null || companion.url.trim().length === 0) {
+      return { uploaded: 0, remaining: await engagementEventBuffer.count(), skipped: 0 };
+    }
+
+    const batch = await engagementEventBuffer.peek(100);
+    if (batch.length === 0) return { uploaded: 0, remaining: 0, skipped: 0 };
+    const events = batch.map((event) => ({
+      clientEventId: `edge:${event.streamName}:${event.replicaId}:${String(event.lamport)}`,
+      dot: { replicaId: event.replicaId, seq: event.lamport },
+      deps: {},
+      aggregateId: aggregateIdForBufferedEdgeEvent(event),
+      type: event.streamName,
+      payload: event.payload,
+      acceptedAtMs: Date.parse(event.observedAt) || Date.now(),
+    }));
+
+    const res = await fetch(`${companion.url.replace(/\/$/u, '')}/v1/edge/events`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': companion.bridgeKey,
+      },
+      body: JSON.stringify({ events }),
+    });
+    if (!res.ok) {
+      throw new Error(`edge-event drain HTTP ${String(res.status)}`);
+    }
+    const json = (await res.json()) as {
+      data?: {
+        imported?: { readonly replicaId: string; readonly seq: number }[];
+        skipped?: { readonly replicaId: string; readonly seq: number; readonly reason: string }[];
+      };
+    };
+    const imported = json.data?.imported ?? [];
+    const skipped = json.data?.skipped ?? [];
+    const acked = new Set<string>(
+      [...imported, ...skipped.filter((event) => event.reason === 'already-imported')].map(
+        (event) => `${event.replicaId}:${String(event.seq)}`,
+      ),
+    );
+    const deleted = await engagementEventBuffer.deleteMany(
+      batch.filter((event) => acked.has(`${event.replicaId}:${String(event.lamport)}`)),
+    );
+    return {
+      uploaded: deleted,
+      remaining: await engagementEventBuffer.count(),
+      skipped: skipped.length,
+    };
   };
 
   // Drop reminders bound to thread bac_ids that no longer exist.
@@ -3023,7 +3104,9 @@ export default defineBackground(() => {
   const connectionsCache = new Map<string, { value: unknown; expiresAtMs: number }>();
   const CONNECTIONS_CACHE_TTL_MS = 30_000;
 
-  const fetchConnectionsHttp = async (path: string): Promise<{ ok: boolean; data?: unknown; error?: string }> => {
+  const fetchConnectionsHttp = async (
+    path: string,
+  ): Promise<{ ok: boolean; data?: unknown; error?: string }> => {
     const settings = await readSettings();
     const port = settings.companion.port;
     const bridgeKey = settings.companion.bridgeKey.trim();
@@ -3084,11 +3167,14 @@ export default defineBackground(() => {
     if (message['type'] === messageTypes.loadConnectionsSnapshot) {
       const filters = (message['filters'] as Record<string, string> | undefined) ?? {};
       const params = new URLSearchParams();
-      if (typeof filters['workstreamId'] === 'string') params.set('workstreamId', filters['workstreamId']);
+      if (typeof filters['workstreamId'] === 'string')
+        params.set('workstreamId', filters['workstreamId']);
       if (typeof filters['nodeKind'] === 'string') params.set('nodeKind', filters['nodeKind']);
       if (typeof filters['edgeKind'] === 'string') params.set('edgeKind', filters['edgeKind']);
       const search = params.toString();
-      result = await fetchConnectionsHttp(`/v1/connections${search.length > 0 ? `?${search}` : ''}`);
+      result = await fetchConnectionsHttp(
+        `/v1/connections${search.length > 0 ? `?${search}` : ''}`,
+      );
     } else if (message['type'] === messageTypes.loadConnectionsNeighbors) {
       const nodeId = String(message['nodeId'] ?? '');
       const hops = typeof message['hops'] === 'number' ? message['hops'] : 1;
@@ -3100,7 +3186,10 @@ export default defineBackground(() => {
       result = await fetchConnectionsHttp(`/v1/connections/edges/${encodeURIComponent(edgeId)}`);
     }
     if (result !== null) {
-      connectionsCache.set(cacheKey, { value: result, expiresAtMs: now + CONNECTIONS_CACHE_TTL_MS });
+      connectionsCache.set(cacheKey, {
+        value: result,
+        expiresAtMs: now + CONNECTIONS_CACHE_TTL_MS,
+      });
     }
     return result;
   };
@@ -3182,8 +3271,7 @@ export default defineBackground(() => {
           .catch((error: unknown) => {
             sendResponse({
               ok: false,
-              error:
-                error instanceof Error ? error.message : 'visual privacy gate read failed',
+              error: error instanceof Error ? error.message : 'visual privacy gate read failed',
             } as unknown as RuntimeResponse);
           });
         return true;
@@ -3313,6 +3401,23 @@ export default defineBackground(() => {
             sendResponse({
               ok: false,
               error: error instanceof Error ? error.message : 'force-drain failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.edge-events.force-drain'
+      ) {
+        void drainBufferedEdgeEvents()
+          .then((result) => {
+            sendResponse({ ok: true, drain: result } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'edge-event drain failed',
             } as unknown as RuntimeResponse);
           });
         return true;
@@ -3483,8 +3588,7 @@ export default defineBackground(() => {
       if (typeof d.bac_id !== 'string') return null;
       return {
         bac_id: d.bac_id,
-        record:
-          d.record as import('../src/background/state').RemoteWorkstreamProjection['record'],
+        record: d.record as import('../src/background/state').RemoteWorkstreamProjection['record'],
         deleted: d.deleted === true,
       };
     } catch {
@@ -3628,7 +3732,9 @@ export default defineBackground(() => {
         bac_id: bacId,
         ...(d.entry === undefined
           ? {}
-          : { entry: d.entry as import('../src/background/state').RemoteDispatchProjection['entry'] }),
+          : {
+              entry: d.entry as import('../src/background/state').RemoteDispatchProjection['entry'],
+            }),
         ...(d.link === undefined
           ? {}
           : { link: d.link as import('../src/background/state').RemoteDispatchProjection['link'] }),
