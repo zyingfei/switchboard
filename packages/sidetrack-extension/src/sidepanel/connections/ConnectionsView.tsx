@@ -308,8 +308,10 @@ const findRevisionEdgeForVisit = (
   edges: readonly ConnectionEdge[],
   visitId: string,
 ): ConnectionEdge | null =>
-  edges.find((edge) => hasRevisionProducer(edge) && (edge.fromNodeId === visitId || edge.toNodeId === visitId)) ??
-  null;
+  edges.find(
+    (edge) =>
+      hasRevisionProducer(edge) && (edge.fromNodeId === visitId || edge.toNodeId === visitId),
+  ) ?? null;
 
 const snippetSourceVisitId = (node: ConnectionNode, edge: ConnectionEdge | null): string | null => {
   if (node.kind !== 'snippet' || edge === null) return null;
@@ -393,6 +395,7 @@ export const ConnectionsView = ({
       setEdgeDetail(null);
       return;
     }
+    setEdgeDetail(null);
     let cancelled = false;
     fetchConnectionsEdge(selectedEdge.id).then((r) => {
       if (cancelled) return;
@@ -1364,7 +1367,7 @@ const ProvenanceCard = ({
   const reason = meta?.description ?? edge.kind;
   const supportsFlowFeedback = feedbackRelationKindForEdgeKind(edge.kind) !== null;
   return (
-    <aside className="cx-prov" data-testid="edge-provenance">
+    <aside className="cx-prov" data-testid="edge-provenance" data-edge-id={edge.id}>
       <header className="cx-prov-head">
         <span className="cx-prov-kind">{edge.kind}</span>
         <span className="cx-stamp">{edge.confidence}</span>
@@ -1419,6 +1422,7 @@ const ProvenanceCard = ({
       {supportsFlowFeedback ? (
         <div style={{ paddingTop: 10 }}>
           <FeedbackButtons
+            key={edge.id}
             label="relation"
             onFeedback={async (choice) => {
               await onFlowFeedback(edge, choice);

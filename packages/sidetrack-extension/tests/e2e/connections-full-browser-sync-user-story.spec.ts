@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { expect, test, type Page } from '@playwright/test';
 
 import { generateRendezvousSecret } from '../../../sidetrack-companion/src/sync/relayCrypto';
+import { canonicalThreadUrl } from '../../src/capture/providerDetection';
 import { startTestCompanion, type TestCompanion } from './helpers/companion';
 import { installLlmNetworkMock, type LlmNetworkMock } from './helpers/llm-network-mock';
 import { startTestRelay, type TestRelay } from './helpers/relay';
@@ -12,46 +13,108 @@ import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime
 import { SETTINGS_KEY, SETUP_KEY } from './helpers/sidepanel';
 
 const CODEX_COLLECTOR_ID = 'sidetrack.codex-cli';
+const DISPATCH_SNIPPET =
+  'copy.fail CVE-2026-31431 Linux crypto subsystem repro notes for VM validation';
 
-const VISITS = [
-  {
-    url: 'http://localhost/sidetrack-eval/postgres/sidetrack_eval_postgres/merge-a',
-    title: 'sidetrack_eval_postgres merge concurrency write skew',
-    body: 'sidetrack_eval_postgres merge concurrency write skew with row locking notes',
-  },
-  {
-    url: 'http://localhost/sidetrack-eval/postgres/sidetrack_eval_postgres/merge-b',
-    title: 'sidetrack_eval_postgres merge lock ordering diagnostics',
-    body: 'sidetrack_eval_postgres lock ordering diagnostics and retry analysis',
-  },
-  {
-    url: 'http://localhost/sidetrack-eval/postgres/sidetrack_eval_postgres/merge-c',
-    title: 'sidetrack_eval_postgres merge retry plan',
-    body: 'sidetrack_eval_postgres retry plan for serializable transactions',
-  },
-  {
-    url: 'http://localhost/sidetrack-eval/kubernetes/sidetrack_eval_kubernetes/eviction-a',
-    title: 'sidetrack_eval_kubernetes pod eviction pressure',
-    body: 'sidetrack_eval_kubernetes pod eviction pressure and scheduler diagnostics',
-  },
-  {
-    url: 'http://localhost/sidetrack-eval/kubernetes/sidetrack_eval_kubernetes/eviction-b',
-    title: 'sidetrack_eval_kubernetes pod restart budget',
-    body: 'sidetrack_eval_kubernetes restart budget and disruption planning',
-  },
-  {
-    url: 'http://localhost/sidetrack-eval/accounting/sidetrack_eval_negative/invoice-aging',
-    title: 'sidetrack_eval_negative invoice aging reconciliation',
-    body: 'sidetrack_eval_negative invoice aging reconciliation unrelated accounting work',
-  },
-  {
-    url: 'http://localhost/sidetrack-copy-fail/',
-    title: 'copy.fail ambient clipboard research',
-    body: 'Ambient browser visit while the workstream stays focused in Sidetrack.',
-  },
-] as const;
+type FlowKey = 'security' | 'switchboard';
 
+interface VisitFixture {
+  readonly url: string;
+  readonly title: string;
+  readonly body: string;
+  readonly flow: FlowKey;
+}
+
+const SECURITY_VISITS = [
+  {
+    url: 'https://news.ycombinator.com/item?id=47952181',
+    title: 'HN discussion: copy-fail Linux distributions',
+    body: 'HN thread collecting copy.fail Linux distro impact and exploit discussion.',
+    flow: 'security',
+  },
+  {
+    url: 'https://xint.io/blog/copy-fail-linux-distributions',
+    title: 'copy-fail across Linux distributions',
+    body: 'copy.fail Linux distributions analysis for the crypto subsystem failure mode.',
+    flow: 'security',
+  },
+  {
+    url: 'https://www.google.com/search?q=Linux+crypto+subsystem',
+    title: 'Google search: Linux crypto subsystem',
+    body: 'Search results for Linux crypto subsystem references relevant to copy.fail.',
+    flow: 'security',
+  },
+  {
+    url: 'https://chatgpt.com/c/69fb9815-41f8-8329-a790-edfa4b914dfd',
+    title: 'ChatGPT analysis: copy-fail research thread',
+    body: 'ChatGPT thread analyzing copy.fail Linux crypto subsystem impact.',
+    flow: 'security',
+  },
+  {
+    url: 'https://copy.fail/',
+    title: 'copy.fail vulnerability landing page',
+    body: DISPATCH_SNIPPET,
+    flow: 'security',
+  },
+  {
+    url: 'https://github.com/theori-io/copy-fail-CVE-2026-31431/blob/main/copy_fail_exp.py',
+    title: 'copy_fail_exp.py coding-agent VM target',
+    body: 'GitHub exploit file page with a coding-agent input for VM validation.',
+    flow: 'security',
+  },
+] as const satisfies readonly VisitFixture[];
+
+const SWITCHBOARD_VISITS = [
+  {
+    url: 'https://github.com/zyingfei/switchboard',
+    title: 'Switchboard repository',
+    body: 'Switchboard repository review for Sidetrack PR follow-up.',
+    flow: 'switchboard',
+  },
+  {
+    url: 'https://github.com/zyingfei/switchboard/pulls',
+    title: 'Switchboard pull requests',
+    body: 'Open Switchboard pull requests for Stage 4 review.',
+    flow: 'switchboard',
+  },
+  {
+    url: 'https://chatgpt.com/g/g-p-69ec077b42948191a1fd309d64a860ae-switchboard/c/69fd259a-83b0-8326-a4d9-c4c1b76a5986',
+    title: 'ChatGPT Switchboard project analysis',
+    body: 'ChatGPT project thread reviewing Switchboard PR status and requirements.',
+    flow: 'switchboard',
+  },
+  {
+    url: 'https://chatgpt.com/g/g-p-69ec077b42948191a1fd309d64a860ae/c/69fcb926-3a98-8328-bbe4-baee4da7fbef',
+    title: 'ChatGPT sibling analysis thread',
+    body: 'Second ChatGPT thread running alongside the Switchboard PR review.',
+    flow: 'switchboard',
+  },
+  {
+    url: 'https://www.youtube.com/watch?v=rY44ViY45q8',
+    title: 'YouTube ambient Switchboard context',
+    body: 'Ambient YouTube analysis opened while the Switchboard workstream stays active.',
+    flow: 'switchboard',
+  },
+  {
+    url: 'https://gemini.google.com/app/7a97310e824ccad4?hl=en-US',
+    title: 'Gemini Switchboard analysis',
+    body: 'Gemini analysis running in parallel with the Switchboard PR review.',
+    flow: 'switchboard',
+  },
+] as const satisfies readonly VisitFixture[];
+
+const VISITS = [...SECURITY_VISITS, ...SWITCHBOARD_VISITS] as const;
 const ALL_URLS = VISITS.map((visit) => visit.url);
+const REAL_STORY_HOST_PERMISSIONS = [
+  'https://news.ycombinator.com/*',
+  'https://xint.io/*',
+  'https://www.google.com/*',
+  'https://chatgpt.com/*',
+  'https://github.com/*',
+  'https://copy.fail/*',
+  'https://www.youtube.com/*',
+  'https://gemini.google.com/*',
+] as const;
 
 interface ConnectionNode {
   readonly id: string;
@@ -116,6 +179,8 @@ interface CollectorsEnvelope {
 const stripTrailingSlash = (url: string): string => url.replace(/\/+$/u, '');
 
 const visitNodeId = (url: string): string => `timeline-visit:${stripTrailingSlash(url)}`;
+
+const graphVisitNodeId = (url: string): string => visitNodeId(canonicalThreadUrl(url));
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -213,6 +278,38 @@ const feedbackCapableEdges = (env: ConnectionsEnvelope): readonly ConnectionEdge
       edge.kind === 'visit_continues_visit',
   );
 
+const hasVisitWorkstreamAttribution = (
+  env: ConnectionsEnvelope,
+  visit: VisitFixture,
+  workstreamId: string,
+): boolean => {
+  const nodeId = graphVisitNodeId(visit.url);
+  const node = env.data.snapshot.nodes.find((candidate) => candidate.id === nodeId);
+  return (
+    node?.metadata?.workstreamId === workstreamId &&
+    env.data.snapshot.edges.some(
+      (edge) =>
+        edge.kind === 'visit_in_workstream' &&
+        edge.fromNodeId === nodeId &&
+        edge.toNodeId === `workstream:${workstreamId}`,
+    )
+  );
+};
+
+const hasStoryWorkstreamAttribution = (
+  env: ConnectionsEnvelope,
+  input: {
+    readonly securityWorkstreamId: string;
+    readonly switchboardWorkstreamId: string;
+  },
+): boolean =>
+  SECURITY_VISITS.every((visit) =>
+    hasVisitWorkstreamAttribution(env, visit, input.securityWorkstreamId),
+  ) &&
+  SWITCHBOARD_VISITS.every((visit) =>
+    hasVisitWorkstreamAttribution(env, visit, input.switchboardWorkstreamId),
+  );
+
 const postFlowFeedback = async (
   comp: TestCompanion,
   input: {
@@ -241,20 +338,20 @@ const postBootstrapFeedbackLabels = async (
   readonly negative: { readonly fromId: string; readonly toId: string };
 }> => {
   const positive = {
-    fromId: visitNodeId(VISITS[0].url),
-    toId: visitNodeId(VISITS[1].url),
+    fromId: graphVisitNodeId(SECURITY_VISITS[0].url),
+    toId: graphVisitNodeId(SECURITY_VISITS[1].url),
   };
   const secondPositive = {
-    fromId: visitNodeId(VISITS[0].url),
-    toId: visitNodeId(VISITS[2].url),
+    fromId: graphVisitNodeId(SECURITY_VISITS[0].url),
+    toId: graphVisitNodeId(SECURITY_VISITS[2].url),
   };
   const negative = {
-    fromId: visitNodeId(VISITS[0].url),
-    toId: visitNodeId(VISITS[6].url),
+    fromId: graphVisitNodeId(SECURITY_VISITS[0].url),
+    toId: graphVisitNodeId(SWITCHBOARD_VISITS[4].url),
   };
   const secondNegative = {
-    fromId: visitNodeId(VISITS[0].url),
-    toId: visitNodeId(VISITS[5].url),
+    fromId: graphVisitNodeId(SECURITY_VISITS[0].url),
+    toId: graphVisitNodeId(SWITCHBOARD_VISITS[5].url),
   };
   for (const pair of [positive, secondPositive]) {
     await postFlowFeedback(comp, {
@@ -277,6 +374,9 @@ const clickVisibleEdge = async (panel: Page, edge: ConnectionEdge): Promise<void
   const row = panel.getByTestId(`edge-${edge.id}`);
   await expect(row).toBeVisible({ timeout: 10_000 });
   await row.click();
+  await expect(panel.getByTestId('edge-provenance')).toHaveAttribute('data-edge-id', edge.id, {
+    timeout: 10_000,
+  });
 };
 
 const setConnectionsAnchor = async (panel: Page, anchorId: string, hops = '2'): Promise<void> => {
@@ -337,6 +437,10 @@ const installVisitRoutes = async (runtime: ExtensionRuntime): Promise<void> => {
               <h1>${visit.title}</h1>
               <p id="copy-source">${visit.body}</p>
               <textarea id="paste-target" aria-label="Paste target"></textarea>
+              <textarea id="coding-agent-input" aria-label="Coding agent prompt"></textarea>
+              <a href="https://github.com/theori-io/copy-fail-CVE-2026-31431/blob/main/copy_fail_exp.py">
+                copy_fail_exp.py
+              </a>
               <div style="height: 1800px"></div>
             </main>
           </body>
@@ -359,13 +463,13 @@ const drainTimeline = async (
       ok?: boolean;
       drain?: { uploaded?: number; remaining?: number };
     } | null;
-    if (result !== null && result.ok === true && (result.drain?.uploaded ?? 0) >= expectedAtLeast) {
+    if (result !== null && result.ok === true && (result.drain?.remaining ?? 0) === 0) {
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   throw new Error(
-    `timeline force drain did not upload ${String(expectedAtLeast)} visits: ${JSON.stringify(latest)}`,
+    `timeline force drain did not settle after expecting ${String(expectedAtLeast)} visits: ${JSON.stringify(latest)}`,
   );
 };
 
@@ -428,6 +532,17 @@ const grantDeeperPageAccess = async (panel: Page): Promise<void> => {
   await panel.locator('button.btn.btn-ghost', { hasText: 'Close' }).click();
 };
 
+const setActiveWorkstream = async (
+  runtime: ExtensionRuntime,
+  panel: Page,
+  workstreamId: string,
+): Promise<void> => {
+  await runtime.seedStorage(panel, {
+    'sidetrack.activeWorkstreamId': workstreamId,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 250));
+};
+
 const ensureEngagementRuntimeOnPage = async (panel: Page, page: Page): Promise<void> => {
   const targetUrl = stripTrailingSlash(page.url());
   const result = await panel.evaluate(
@@ -470,7 +585,7 @@ const ensureEngagementRuntimeOnPage = async (panel: Page, page: Page): Promise<v
   await new Promise((resolve) => setTimeout(resolve, result.injected ? 250 : 50));
 };
 
-const performCopyPasteBestEffort = async (source: Page, destination: Page): Promise<void> => {
+const performCopyPasteBestEffort = async (source: Page, destination: Page): Promise<string> => {
   await source.evaluate(() => {
     window.scrollBy(0, 700);
     const sourceNode = document.querySelector('#copy-source');
@@ -491,21 +606,27 @@ const performCopyPasteBestEffort = async (source: Page, destination: Page): Prom
     .catch(() => undefined);
   await source
     .evaluate(async () => {
-      await navigator.clipboard?.writeText('sidetrack L5 copied snippet').catch(() => undefined);
+      await navigator.clipboard
+        ?.writeText('copy.fail CVE-2026-31431 Linux crypto subsystem repro notes for VM validation')
+        .catch(() => undefined);
     })
     .catch(() => undefined);
 
-  const target = destination.locator('#paste-target');
+  const target = destination.locator('#coding-agent-input, #paste-target').first();
   await target.click().catch(() => undefined);
   await destination.keyboard
     .press(process.platform === 'darwin' ? 'Meta+V' : 'Control+V')
     .catch(() => undefined);
   await destination
     .evaluate(() => {
-      const target = document.querySelector('#paste-target');
+      const target =
+        document.querySelector('#coding-agent-input') ?? document.querySelector('#paste-target');
       if (!(target instanceof HTMLTextAreaElement)) return;
       const data = new DataTransfer();
-      data.setData('text/plain', 'sidetrack L5 copied snippet');
+      data.setData(
+        'text/plain',
+        'copy.fail CVE-2026-31431 Linux crypto subsystem repro notes for VM validation',
+      );
       target.dispatchEvent(
         new ClipboardEvent('paste', {
           bubbles: true,
@@ -513,10 +634,18 @@ const performCopyPasteBestEffort = async (source: Page, destination: Page): Prom
           clipboardData: data,
         }),
       );
-      target.value = `${target.value} sidetrack L5 copied snippet`;
+      target.value =
+        `${target.value} copy.fail CVE-2026-31431 Linux crypto subsystem repro notes for VM validation`.trim();
       target.dispatchEvent(new Event('input', { bubbles: true }));
     })
     .catch(() => undefined);
+  const pasted = await destination
+    .locator('#coding-agent-input, #paste-target')
+    .first()
+    .inputValue()
+    .catch(() => '');
+  expect(pasted).toContain('copy.fail CVE-2026-31431');
+  return DISPATCH_SNIPPET;
 };
 
 const finalizeEngagementObservation = async (panel: Page, page: Page): Promise<void> => {
@@ -560,38 +689,139 @@ const dwellAndScroll = async (page: Page, dwellMs = 6_000): Promise<void> => {
   if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
 };
 
-const driveBrowserAVisits = async (runtime: ExtensionRuntime, panel: Page): Promise<void> => {
-  const researchTab = await runtime.context.newPage();
-  await researchTab.goto(VISITS[0].url, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
-  await ensureEngagementRuntimeOnPage(panel, researchTab);
-  await dwellAndScroll(researchTab);
-  await finalizeEngagementObservation(panel, researchTab);
+const visitInWorkstream = async (
+  runtime: ExtensionRuntime,
+  panel: Page,
+  page: Page,
+  visit: VisitFixture,
+  workstreamId: string,
+  dwellMs = 1_500,
+): Promise<void> => {
+  await setActiveWorkstream(runtime, panel, workstreamId);
+  await page.goto(visit.url, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
+  await ensureEngagementRuntimeOnPage(panel, page);
+  await dwellAndScroll(page, dwellMs);
+  await finalizeEngagementObservation(panel, page);
+};
 
-  await researchTab.goto(VISITS[1].url, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
-  await ensureEngagementRuntimeOnPage(panel, researchTab);
-  await dwellAndScroll(researchTab);
+const driveBrowserAVisits = async (
+  runtime: ExtensionRuntime,
+  panel: Page,
+  input: {
+    readonly securityWorkstreamId: string;
+    readonly switchboardWorkstreamId: string;
+  },
+): Promise<{ readonly dispatchSnippet: string }> => {
+  const securityTab = await runtime.context.newPage();
+  const switchboardTab = await runtime.context.newPage();
+  const copyFailTab = await runtime.context.newPage();
+  const codingAgentTab = await runtime.context.newPage();
+  const youtubeTab = await runtime.context.newPage();
+  const geminiTab = await runtime.context.newPage();
 
-  const pasteTab = await runtime.context.newPage();
-  await pasteTab.goto(VISITS[2].url, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
-  await ensureEngagementRuntimeOnPage(panel, pasteTab);
-  await dwellAndScroll(pasteTab);
-  await performCopyPasteBestEffort(researchTab, pasteTab);
-  await finalizeEngagementObservation(panel, researchTab);
-  await finalizeEngagementObservation(panel, pasteTab);
+  await visitInWorkstream(
+    runtime,
+    panel,
+    securityTab,
+    SECURITY_VISITS[0],
+    input.securityWorkstreamId,
+    6_000,
+  );
+  await visitInWorkstream(
+    runtime,
+    panel,
+    switchboardTab,
+    SWITCHBOARD_VISITS[0],
+    input.switchboardWorkstreamId,
+    6_000,
+  );
+  await visitInWorkstream(
+    runtime,
+    panel,
+    securityTab,
+    SECURITY_VISITS[1],
+    input.securityWorkstreamId,
+    6_000,
+  );
+  await visitInWorkstream(
+    runtime,
+    panel,
+    switchboardTab,
+    SWITCHBOARD_VISITS[1],
+    input.switchboardWorkstreamId,
+    6_000,
+  );
+  await visitInWorkstream(
+    runtime,
+    panel,
+    securityTab,
+    SECURITY_VISITS[2],
+    input.securityWorkstreamId,
+    6_000,
+  );
+  await visitInWorkstream(
+    runtime,
+    panel,
+    switchboardTab,
+    SWITCHBOARD_VISITS[2],
+    input.switchboardWorkstreamId,
+    6_000,
+  );
+  await visitInWorkstream(
+    runtime,
+    panel,
+    securityTab,
+    SECURITY_VISITS[3],
+    input.securityWorkstreamId,
+    6_000,
+  );
+  await visitInWorkstream(
+    runtime,
+    panel,
+    switchboardTab,
+    SWITCHBOARD_VISITS[3],
+    input.switchboardWorkstreamId,
+    6_000,
+  );
+
+  await visitInWorkstream(
+    runtime,
+    panel,
+    copyFailTab,
+    SECURITY_VISITS[4],
+    input.securityWorkstreamId,
+    6_000,
+  );
+  await visitInWorkstream(
+    runtime,
+    panel,
+    codingAgentTab,
+    SECURITY_VISITS[5],
+    input.securityWorkstreamId,
+    6_000,
+  );
+  const dispatchSnippet = await performCopyPasteBestEffort(copyFailTab, codingAgentTab);
+  await finalizeEngagementObservation(panel, copyFailTab);
+  await finalizeEngagementObservation(panel, codingAgentTab);
+
+  await visitInWorkstream(
+    runtime,
+    panel,
+    youtubeTab,
+    SWITCHBOARD_VISITS[4],
+    input.switchboardWorkstreamId,
+    6_000,
+  );
+  await visitInWorkstream(
+    runtime,
+    panel,
+    geminiTab,
+    SWITCHBOARD_VISITS[5],
+    input.switchboardWorkstreamId,
+    6_000,
+  );
   await new Promise((resolve) => setTimeout(resolve, 500));
-
-  await pasteTab.close();
-  await researchTab.close();
-
-  for (const visit of VISITS.slice(3)) {
-    const page = await runtime.context.newPage();
-    await page.goto(visit.url, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
-    await ensureEngagementRuntimeOnPage(panel, page);
-    await page.evaluate(() => window.scrollBy(0, 500)).catch(() => undefined);
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    await finalizeEngagementObservation(panel, page);
-    await page.close();
-  }
+  return { dispatchSnippet };
 };
 
 const collectorManifest = (): string => `id = "${CODEX_COLLECTOR_ID}"
@@ -632,6 +862,7 @@ const collectorLine = (input: {
   readonly runId: string;
   readonly sourceRecordId: string;
   readonly payload: Record<string, unknown>;
+  readonly dimensions?: Record<string, unknown>;
 }): string =>
   JSON.stringify({
     collector_id: CODEX_COLLECTOR_ID,
@@ -642,6 +873,7 @@ const collectorLine = (input: {
     collector_run_id: input.runId,
     source_record_id: input.sourceRecordId,
     payload: input.payload,
+    ...(input.dimensions === undefined ? {} : { dimensions: input.dimensions }),
   });
 
 const waitForCollectorLoaded = async (comp: TestCompanion): Promise<void> => {
@@ -669,6 +901,10 @@ const waitForCollectorPromotion = async (comp: TestCompanion): Promise<void> => 
 const writeCodexCollectorFixture = async (
   vaultPath: string,
   comp: TestCompanion,
+  input: {
+    readonly dispatchId: string;
+    readonly codingSessionId: string;
+  },
 ): Promise<void> => {
   const manifestDir = join(vaultPath, '_BAC', 'collectors', CODEX_COLLECTOR_ID);
   await mkdir(manifestDir, { recursive: true });
@@ -678,7 +914,11 @@ const writeCodexCollectorFixture = async (
   const now = Date.now();
   const iso = (offsetMs: number): string => new Date(now + offsetMs).toISOString();
   const runId = `run-${randomUUID()}`;
-  const sessions = ['codex-l5-alpha', 'codex-l5-beta'] as const;
+  const sessions = [input.codingSessionId, 'codex-l5-switchboard-review'] as const;
+  const dimensions = {
+    dispatchId: input.dispatchId,
+    codingSessionId: input.codingSessionId,
+  };
   const lines = [
     collectorLine({
       eventType: 'session_started',
@@ -691,6 +931,7 @@ const writeCodexCollectorFixture = async (
         cwd: '/repo/browser-ai-companion',
         model: 'gpt-5-codex',
       },
+      ...(sessions[0] === input.codingSessionId ? { dimensions } : {}),
     }),
     collectorLine({
       eventType: 'session_started',
@@ -717,11 +958,18 @@ const writeCodexCollectorFixture = async (
           started_at: iso(-30_000 + turn * 2_000),
           completed_at: iso(-29_000 + turn * 2_000),
           model: 'gpt-5-codex',
-          prompt_text: `Implement L5 full browser sync step ${String(turn)}`,
-          response_text: `Completed L5 full browser sync step ${String(turn)}`,
+          prompt_text:
+            sessionId === input.codingSessionId
+              ? `Use copy_fail_exp.py in a VM for dispatch ${input.dispatchId}`
+              : `Review Switchboard PR state for L5 full browser sync step ${String(turn)}`,
+          response_text:
+            sessionId === input.codingSessionId
+              ? `Started VM validation for dispatch ${input.dispatchId}`
+              : `Completed Switchboard PR review step ${String(turn)}`,
           tool_call_count: 2,
           exec_command_count: 1,
         },
+        ...(sessionId === input.codingSessionId ? { dimensions } : {}),
       });
     }),
   ];
@@ -779,6 +1027,61 @@ const hasCodingTurn = async (vaultPath: string): Promise<boolean> => {
   });
 };
 
+const hasCodingTurnForSession = async (
+  vaultPath: string,
+  input: {
+    readonly codingSessionId: string;
+    readonly dispatchId: string;
+  },
+): Promise<boolean> => {
+  const events = await readJsonlLogEvents(vaultPath);
+  return events.some((event) => {
+    const payload = event['payload'];
+    if (!isRecord(payload) || payload['type'] !== 'coding.session.turn.observed') {
+      return false;
+    }
+    const dimensions = payload['dimensions'];
+    return (
+      payload['sessionId'] === input.codingSessionId &&
+      isRecord(dimensions) &&
+      dimensions['dispatchId'] === input.dispatchId &&
+      dimensions['codingSessionId'] === input.codingSessionId
+    );
+  });
+};
+
+const createCodingDispatch = async (
+  comp: TestCompanion,
+  input: {
+    readonly workstreamId: string;
+    readonly codingSessionId: string;
+    readonly snippet: string;
+  },
+): Promise<string> => {
+  const createdAt = new Date().toISOString();
+  const response = (await apiPost(comp, '/v1/dispatches', {
+    kind: 'coding',
+    target: { provider: 'codex', mode: 'paste' },
+    workstreamId: input.workstreamId,
+    title: 'Use copy_fail_exp.py in VM',
+    body:
+      `${input.snippet}\n\n` +
+      'Use https://github.com/theori-io/copy-fail-CVE-2026-31431/blob/main/copy_fail_exp.py ' +
+      'to validate the copy.fail Linux crypto subsystem issue in an isolated VM.',
+    createdAt,
+    mcpRequest: {
+      codingSessionId: input.codingSessionId,
+      approval: 'auto-approved',
+      requestedAt: createdAt,
+    },
+  })) as { readonly data?: { readonly bac_id?: unknown } };
+  const dispatchId = response.data?.bac_id;
+  if (typeof dispatchId !== 'string' || dispatchId.length === 0) {
+    throw new Error(`Dispatch response did not include bac_id: ${JSON.stringify(response)}`);
+  }
+  return dispatchId;
+};
+
 test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 composed)', () => {
   test.skip(
     process.env['SIDETRACK_E2E_SKIP_LIVE_BROWSERS'] === '1',
@@ -818,23 +1121,34 @@ test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 com
       syncRelay: relay.url,
       syncRendezvousSecret: secret,
     });
-    runtimeA = await launchExtensionRuntime({ forceLocalProfile: true });
-    runtimeB = await launchExtensionRuntime({ forceLocalProfile: true });
+    runtimeA = await launchExtensionRuntime({
+      forceLocalProfile: true,
+      extraHostPermissions: REAL_STORY_HOST_PERMISSIONS,
+    });
+    runtimeB = await launchExtensionRuntime({
+      forceLocalProfile: true,
+      extraHostPermissions: REAL_STORY_HOST_PERMISSIONS,
+    });
     llmMockA = await installLlmNetworkMock(runtimeA.context);
     llmMockB = await installLlmNetworkMock(runtimeB.context);
     await installVisitRoutes(runtimeA);
     await installVisitRoutes(runtimeB);
 
-    const wsRes = (await apiPost(companionA, '/v1/workstreams', {
-      title: 'Full sync research',
+    const wsSecurityRes = (await apiPost(companionA, '/v1/workstreams', {
+      title: 'Copy-fail Linux security research',
     })) as { data: { bac_id: string } };
-    const wsId = wsRes.data.bac_id;
+    const wsSwitchboardRes = (await apiPost(companionA, '/v1/workstreams', {
+      title: 'Switchboard PR review',
+    })) as { data: { bac_id: string } };
+    const wsSecurityId = wsSecurityRes.data.bac_id;
+    const wsSwitchboardId = wsSwitchboardRes.data.bac_id;
+    const codingSessionId = `cs_copyfail_vm_${randomUUID().replaceAll('-', '').slice(0, 16)}`;
 
     await openPrivacyGate(companionA, 'engagement');
-    const panelA = await openConnectionsPanel(runtimeA, companionA, wsId);
+    const panelA = await openConnectionsPanel(runtimeA, companionA, wsSecurityId);
     await runtimeA.seedStorage(panelA, {
       'sidetrack.timeline.enabled': true,
-      'sidetrack.activeWorkstreamId': wsId,
+      'sidetrack.activeWorkstreamId': wsSecurityId,
     });
     const reinit = await runtimeA.sendRuntimeMessage(panelA, {
       type: 'sidetrack.timeline.reinit',
@@ -846,7 +1160,10 @@ test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 com
     });
     expect((gateChanged as { ok?: boolean } | null)?.ok).toBe(true);
 
-    await driveBrowserAVisits(runtimeA, panelA);
+    const browserAFlow = await driveBrowserAVisits(runtimeA, panelA, {
+      securityWorkstreamId: wsSecurityId,
+      switchboardWorkstreamId: wsSwitchboardId,
+    });
     const drainSender = await runtimeA.context.newPage();
     await drainSender.goto(`chrome-extension://${runtimeA.extensionId}/sidepanel.html`, {
       waitUntil: 'domcontentloaded',
@@ -857,10 +1174,18 @@ test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 com
     });
     await drainSender.close();
 
-    await writeCodexCollectorFixture(companionA.vaultPath, companionA);
+    const dispatchId = await createCodingDispatch(companionA, {
+      workstreamId: wsSecurityId,
+      codingSessionId,
+      snippet: browserAFlow.dispatchSnippet,
+    });
+    await writeCodexCollectorFixture(companionA.vaultPath, companionA, {
+      dispatchId,
+      codingSessionId,
+    });
     const bootstrapFeedback = await postBootstrapFeedbackLabels(companionA);
 
-    const expectedVisitIds = ALL_URLS.map(visitNodeId);
+    const expectedVisitIds = ALL_URLS.map(graphVisitNodeId);
     await waitForConnections(
       companionA,
       (env) => {
@@ -874,43 +1199,99 @@ test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 com
       companionB,
       (env) => {
         const ids = new Set(env.data.snapshot.nodes.map((node) => node.id));
-        return ids.has(`workstream:${wsId}`) && expectedVisitIds.every((id) => ids.has(id));
+        return (
+          ids.has(`workstream:${wsSecurityId}`) &&
+          ids.has(`workstream:${wsSwitchboardId}`) &&
+          expectedVisitIds.every((id) => ids.has(id)) &&
+          hasStoryWorkstreamAttribution(env, {
+            securityWorkstreamId: wsSecurityId,
+            switchboardWorkstreamId: wsSwitchboardId,
+          })
+        );
       },
-      'Browser B did not receive Browser A visits through the relay',
+      'Browser B did not receive Browser A visits with expected workstream attribution through the relay',
       120_000,
     );
 
-    for (const nodeId of expectedVisitIds) {
-      const node = syncedEnv.data.snapshot.nodes.find((candidate) => candidate.id === nodeId);
-      expect(node, nodeId).toBeDefined();
-      expect(node?.metadata?.workstreamId).toBe(wsId);
-      expect(
-        syncedEnv.data.snapshot.edges.some(
-          (edge) =>
-            edge.kind === 'visit_in_workstream' &&
-            edge.fromNodeId === nodeId &&
-            edge.toNodeId === `workstream:${wsId}`,
-        ),
-      ).toBe(true);
+    for (const { workstreamId, visits } of [
+      { workstreamId: wsSecurityId, visits: SECURITY_VISITS },
+      { workstreamId: wsSwitchboardId, visits: SWITCHBOARD_VISITS },
+    ] as const) {
+      for (const visit of visits) {
+        const nodeId = graphVisitNodeId(visit.url);
+        const node = syncedEnv.data.snapshot.nodes.find((candidate) => candidate.id === nodeId);
+        expect(node, `${nodeId} in ${visit.flow}`).toBeDefined();
+        expect(node?.metadata?.workstreamId, `${visit.url} in ${visit.flow}`).toBe(workstreamId);
+        expect(
+          syncedEnv.data.snapshot.edges.some(
+            (edge) =>
+              edge.kind === 'visit_in_workstream' &&
+              edge.fromNodeId === nodeId &&
+              edge.toNodeId === `workstream:${workstreamId}`,
+          ),
+        ).toBe(true);
+      }
     }
 
     await waitForCondition(
-      async () => hasCodingTurn(companionB!.vaultPath),
-      'Browser B vault log did not receive collector-promoted coding turns',
+      async () =>
+        (await hasCodingTurn(companionB!.vaultPath)) &&
+        (await hasCodingTurnForSession(companionB!.vaultPath, {
+          codingSessionId,
+          dispatchId,
+        })),
+      'Browser B vault log did not receive collector-promoted coding turns tied to the dispatch session',
       120_000,
     );
 
-    const panelB = await openConnectionsPanel(runtimeB, companionB, wsId);
+    const dispatchEnv = await waitForConnections(
+      companionB,
+      (env) =>
+        env.data.snapshot.edges.some(
+          (edge) =>
+            edge.kind === 'dispatch_in_workstream' &&
+            edge.fromNodeId === `dispatch:${dispatchId}` &&
+            edge.toNodeId === `workstream:${wsSecurityId}`,
+        ) &&
+        env.data.snapshot.edges.some(
+          (edge) =>
+            edge.kind === 'dispatch_requested_coding_session' &&
+            edge.fromNodeId === `dispatch:${dispatchId}` &&
+            edge.toNodeId === `coding-session:${codingSessionId}`,
+        ),
+      'Browser B did not receive dispatch forward edges through the relay',
+      120_000,
+    );
+    expect(
+      dispatchEnv.data.snapshot.edges.some(
+        (edge) =>
+          edge.kind === 'dispatch_in_workstream' &&
+          edge.fromNodeId === `dispatch:${dispatchId}` &&
+          edge.toNodeId === `workstream:${wsSecurityId}`,
+      ),
+    ).toBe(true);
+    expect(
+      dispatchEnv.data.snapshot.edges.some(
+        (edge) =>
+          edge.kind === 'dispatch_requested_coding_session' &&
+          edge.fromNodeId === `dispatch:${dispatchId}` &&
+          edge.toNodeId === `coding-session:${codingSessionId}`,
+      ),
+    ).toBe(true);
+
+    const panelB = await openConnectionsPanel(runtimeB, companionB, wsSecurityId);
     await runtimeB.seedStorage(panelB, {
       'sidetrack.timeline.enabled': true,
-      'sidetrack.activeWorkstreamId': wsId,
+      'sidetrack.activeWorkstreamId': wsSecurityId,
     });
     const reinitB = await runtimeB.sendRuntimeMessage(panelB, {
       type: 'sidetrack.timeline.reinit',
     });
     expect((reinitB as { ok?: boolean } | null)?.ok).toBe(true);
     const sharedVisit = await runtimeB.context.newPage();
-    await sharedVisit.goto(VISITS[0].url, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
+    await sharedVisit
+      .goto(SECURITY_VISITS[0].url, { waitUntil: 'domcontentloaded' })
+      .catch(() => undefined);
     await new Promise((resolve) => setTimeout(resolve, 500));
     await sharedVisit.close();
     const drainSenderB = await runtimeB.context.newPage();
@@ -938,9 +1319,17 @@ test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 com
       ),
     ).toBe(true);
 
-    await setConnectionsAnchor(panelB, `workstream:${wsId}`);
-    for (const nodeId of expectedVisitIds) {
-      await expect(panelB.getByTestId(`node-${nodeId}`)).toBeVisible({ timeout: 20_000 });
+    await setConnectionsAnchor(panelB, `workstream:${wsSecurityId}`);
+    for (const visit of SECURITY_VISITS) {
+      await expect(panelB.getByTestId(`node-${graphVisitNodeId(visit.url)}`)).toBeVisible({
+        timeout: 20_000,
+      });
+    }
+    await setConnectionsAnchor(panelB, `workstream:${wsSwitchboardId}`, '3');
+    for (const visit of SWITCHBOARD_VISITS) {
+      await expect(panelB.getByTestId(`node-${graphVisitNodeId(visit.url)}`)).toBeVisible({
+        timeout: 20_000,
+      });
     }
 
     await waitForCondition(async () => {
@@ -1015,7 +1404,7 @@ test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 com
     expect(rankerEdge, 'ranker closest_visit edge').toBeDefined();
     if (rankerEdge === undefined) throw new Error('Missing ranker edge');
 
-    await setConnectionsAnchor(panelB, `workstream:${wsId}`, '4');
+    await setConnectionsAnchor(panelB, `workstream:${wsSecurityId}`, '4');
     await clickVisibleEdge(panelB, rankerEdge);
     await expect(panelB.getByTestId('edge-provenance')).toBeVisible({ timeout: 10_000 });
     await expect(panelB.getByTestId('producer-pin-ranker')).toBeVisible();
@@ -1035,7 +1424,7 @@ test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 com
     const uiRejectEdge =
       rankerEdges.find((edge) => !edgeConnects(edge, rankerEdge.fromNodeId, rankerEdge.toNodeId)) ??
       rankerEdge;
-    await setConnectionsAnchor(panelB, `workstream:${wsId}`, '4');
+    await setConnectionsAnchor(panelB, `workstream:${wsSecurityId}`, '4');
     await clickVisibleEdge(panelB, uiRejectEdge);
     await panelB.getByTestId('edge-provenance').getByTestId('feedback-reject').click();
     await expect(panelB.getByTestId('edge-provenance').getByTestId('feedback-saved')).toBeVisible();

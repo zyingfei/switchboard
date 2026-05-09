@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -53,7 +53,7 @@ const waitForExtensionWorker = async (context: BrowserContext): Promise<Worker> 
   // --load-extension MV3 workers, but the worker DOES eventually
   // appear in context.serviceWorkers().
   const eventWait = context.waitForEvent('serviceworker', {
-    timeout: 45_000,
+    timeout: 0,
     predicate: (worker) => worker.url().startsWith('chrome-extension://'),
   });
   const pollWait = (async (): Promise<Worker> => {
@@ -194,7 +194,33 @@ export interface LaunchOptions {
   // survives. Caller is responsible for rm()'ing the dir afterwards
   // — `close()` does NOT delete it when this option is set.
   readonly userDataDir?: string;
+  // Test-only host-permission widening. Some e2e stories need
+  // chrome.scripting.executeScript on real-shaped public domains, but
+  // production keeps those hosts optional. The local-launch path copies
+  // the built extension into a temp dir and amends manifest.json before
+  // Chrome loads it.
+  readonly extraHostPermissions?: readonly string[];
 }
+
+const extensionPathWithExtraHostPermissions = async (
+  baseExtensionPath: string,
+  extraHostPermissions: readonly string[] | undefined,
+): Promise<{ readonly extensionPath: string; readonly cleanupPath?: string }> => {
+  if (extraHostPermissions === undefined || extraHostPermissions.length === 0) {
+    return { extensionPath: baseExtensionPath };
+  }
+  const tempRoot = await mkdtemp(path.join(tmpdir(), 'sidetrack-extension-e2e-hosts-'));
+  const extensionPath = path.join(tempRoot, 'chrome-mv3');
+  await cp(baseExtensionPath, extensionPath, { recursive: true });
+  const manifestPath = path.join(extensionPath, 'manifest.json');
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>;
+  const existing = Array.isArray(manifest['host_permissions'])
+    ? manifest['host_permissions'].filter((value): value is string => typeof value === 'string')
+    : [];
+  manifest['host_permissions'] = [...new Set([...existing, ...extraHostPermissions])];
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+  return { extensionPath, cleanupPath: tempRoot };
+};
 
 export const launchExtensionRuntime = async (
   options: LaunchOptions = {},
@@ -203,7 +229,11 @@ export const launchExtensionRuntime = async (
   if (cdpUrl !== undefined && cdpUrl.length > 0 && options.forceLocalProfile !== true) {
     return await attachOverCdp(cdpUrl);
   }
-  const extensionPath = readExtensionPath();
+  const extensionForLaunch = await extensionPathWithExtraHostPermissions(
+    readExtensionPath(),
+    options.extraHostPermissions,
+  );
+  const extensionPath = extensionForLaunch.extensionPath;
   // SIDETRACK_USER_DATA_DIR lets the dev pin a long-lived profile (e.g.
   // ~/.sidetrack-test-profile) so logins to chatgpt.com / claude.ai /
   // gemini.google.com survive across runs. When unset, every run gets a
@@ -285,6 +315,9 @@ export const launchExtensionRuntime = async (
       } finally {
         if (cleanupOnClose) {
           await rm(userDataDir, { recursive: true, force: true });
+        }
+        if (extensionForLaunch.cleanupPath !== undefined) {
+          await rm(extensionForLaunch.cleanupPath, { recursive: true, force: true });
         }
       }
     },

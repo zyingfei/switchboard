@@ -95,6 +95,9 @@ const clickVisibleEdge = async (panel: Page, edge: SnapshotEdge): Promise<void> 
   const row = panel.getByTestId(`edge-${edge.id}`);
   await expect(row).toBeVisible({ timeout: 10_000 });
   await row.click();
+  await expect(panel.getByTestId('edge-provenance')).toHaveAttribute('data-edge-id', edge.id, {
+    timeout: 10_000,
+  });
 };
 
 interface FeedbackProjectionEnvelope {
@@ -145,11 +148,7 @@ const apiGet = async (comp: TestCompanion, path: string): Promise<unknown> => {
   return await res.json();
 };
 
-const apiPost = async (
-  comp: TestCompanion,
-  path: string,
-  body: unknown,
-): Promise<unknown> => {
+const apiPost = async (comp: TestCompanion, path: string, body: unknown): Promise<unknown> => {
   const res = await fetch(`http://127.0.0.1:${String(comp.port)}${path}`, {
     method: 'POST',
     headers: {
@@ -306,7 +305,9 @@ test.describe('Stage 2/3 user story (feedback + producer pin)', () => {
     await anchor.press('Enter');
     await expect(panel.getByTestId('connections-groups')).toBeVisible({ timeout: 30_000 });
 
-    const rejectedFromId = nodeIdForVisitKey(WORK_GRAPH_EVAL_EXPECTED.feedbackEffect.rejectedPair[0]);
+    const rejectedFromId = nodeIdForVisitKey(
+      WORK_GRAPH_EVAL_EXPECTED.feedbackEffect.rejectedPair[0],
+    );
     const rejectedToId = nodeIdForVisitKey(WORK_GRAPH_EVAL_EXPECTED.feedbackEffect.rejectedPair[1]);
     const confirmedFromId = nodeIdForVisitKey('pg_merge_a');
     const confirmedToId = nodeIdForVisitKey('pg_merge_c');
