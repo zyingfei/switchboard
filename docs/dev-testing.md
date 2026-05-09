@@ -40,12 +40,66 @@ SIDETRACK_E2E_HEADLESS=1 npm run e2e
 Set `SIDETRACK_E2E_HEADLESS=0` to watch the runs in a real Chromium
 window. Useful when debugging selectors.
 
+## Headed L5 full-browser sync story
+
+Use this when validating PR #110 style work: two extension browsers,
+two companions, the relay, real-shaped external URLs, two workstreams,
+Browser A activity, and Browser B Connections review.
+
+Build both artifacts first. The spec launches the compiled companion
+CLI and the built MV3 extension from `.output/chrome-mv3`.
+
+```bash
+npm --prefix packages/sidetrack-companion run build
+npm --prefix packages/sidetrack-extension run build
+```
+
+Run the headed story from the repo root:
+
+```bash
+SIDETRACK_E2E_HOLD_OPEN=1 \
+SIDETRACK_E2E_HEADLESS=0 \
+SIDETRACK_E2E_BROWSER=chromium \
+npm --prefix packages/sidetrack-extension exec -- \
+  playwright test connections-full-browser-sync-user-story --headed --workers=1
+```
+
+Important details:
+
+- Use `SIDETRACK_E2E_BROWSER=chromium` for this story. This launches
+  Playwright's Chrome for Testing build and reliably registers the MV3
+  service worker. `SIDETRACK_E2E_BROWSER=chrome` can open a visible
+  window but may fail with `Extension service worker never appeared`.
+- Keep the command in a foreground terminal. Detached `nohup` runs are
+  hard to inspect and can exit before you notice launch failures.
+- Look for **Google Chrome for Testing** windows, not your everyday
+  Chrome profile.
+- `SIDETRACK_E2E_HOLD_OPEN=1` parks the test after it has reached
+  Browser B's Connections panel. The runner prints the extension URL,
+  companion URL, and both workstream ids. Press `Ctrl-C` in the runner
+  when inspection is done.
+- The story uses real-domain route stubs for HN, xint.io, Google,
+  ChatGPT, GitHub, copy.fail, YouTube, and Gemini. No provider login is
+  required for this L5 spec.
+
+If no headed windows appear, confirm the runner is really using Chrome
+for Testing:
+
+```bash
+pgrep -fl "Google Chrome for Testing|connections-full-browser-sync-user-story"
+```
+
+If the process list shows `Google Chrome for Testing` with
+`--load-extension=.../chrome-mv3` and two
+`sidetrack-extension-e2e-profile-*` profile dirs, the headed browsers
+are open but may be behind other windows or on another macOS Space.
+
 ## Driving the side panel from a spec
 
 ### 1. Launch the runtime
 
 ```ts
-import { launchExtensionRuntime } from './helpers/runtime';
+import { launchExtensionRuntime } from "./helpers/runtime";
 const runtime = await launchExtensionRuntime();
 ```
 
@@ -62,15 +116,22 @@ let the workboard mount directly:
 
 ```ts
 const seederPage = await runtime.context.newPage();
-await seederPage.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
-  waitUntil: 'domcontentloaded',
-});
+await seederPage.goto(
+  `chrome-extension://${runtime.extensionId}/sidepanel.html`,
+  {
+    waitUntil: "domcontentloaded",
+  },
+);
 await runtime.seedStorage(seederPage, {
-  'sidetrack:setupCompleted': true,
-  'sidetrack.threads': [/* ... */],
-  'sidetrack.queueItems': [/* ... */],
+  "sidetrack:setupCompleted": true,
+  "sidetrack.threads": [
+    /* ... */
+  ],
+  "sidetrack.queueItems": [
+    /* ... */
+  ],
 });
-await seederPage.reload({ waitUntil: 'domcontentloaded' });
+await seederPage.reload({ waitUntil: "domcontentloaded" });
 ```
 
 Storage keys are defined in `src/background/state.ts`.
@@ -88,7 +149,7 @@ running against the real providers (with a logged-in persistent
 profile):
 
 ```ts
-await providerPage.goto('https://chatgpt.com/c/abc-123');
+await providerPage.goto("https://chatgpt.com/c/abc-123");
 await providerPage.bringToFront();
 await runtime.sendRuntimeMessage(seederPage, {
   type: messageTypes.captureCurrentTab,
@@ -102,13 +163,13 @@ or when you want deterministic turn data:
 await runtime.sendRuntimeMessage(seederPage, {
   type: messageTypes.autoCapture,
   capture: {
-    provider: 'chatgpt',
-    threadUrl: '...',
-    title: '...',
+    provider: "chatgpt",
+    threadUrl: "...",
+    title: "...",
     capturedAt: new Date().toISOString(),
     turns: [
-      { role: 'user', text: '...', ordinal: 0, capturedAt: '...' },
-      { role: 'assistant', text: '...', ordinal: 1, capturedAt: '...' },
+      { role: "user", text: "...", ordinal: 0, capturedAt: "..." },
+      { role: "assistant", text: "...", ordinal: 1, capturedAt: "..." },
     ],
   },
 });
@@ -143,8 +204,8 @@ gemini.google.com. Log in to each one. Close the window when done —
 your cookies stay in the profile dir.
 
 > **Why Chrome stable, not Chromium?** Google's OAuth flow refuses
-> Playwright's Chromium build with *"This browser or app may not be
-> secure"*. Real Chrome is accepted. The login script defaults to
+> Playwright's Chromium build with _"This browser or app may not be
+> secure"_. Real Chrome is accepted. The login script defaults to
 > `channel: 'chrome'`. If you don't have Chrome installed,
 > `SIDETRACK_E2E_BROWSER=chromium npm run e2e:login` falls back —
 > but Gemini login won't work and ChatGPT-via-Google-SSO won't
@@ -291,7 +352,7 @@ surviving last turn was a user turn.
 The persistence loop:
 
 - `tests/unit/extractors.test.ts` — added `preserves distinct turns at
-  different positions even when text matches`, which builds a
+different positions even when text matches`, which builds a
   ChatGPT-shaped DOM with two identical assistant `OK` replies and
   asserts all four turns survive.
 - `src/capture/extractors.ts` — replaced `dedupeAndFinalizeTurns` with
@@ -306,11 +367,11 @@ The persistence loop:
 Things the live runs revealed about each provider that future specs
 should respect:
 
-| Provider | Composer selector | Submit |
-|----------|-------------------|--------|
-| ChatGPT  | `div#prompt-textarea[role="textbox"]` (ProseMirror) | `Enter` |
-| Claude   | `div[data-testid="chat-input"][role="textbox"]` (Tiptap) | `Enter` |
-| Gemini   | `rich-textarea div.ql-editor[role="textbox"]` (Quill) | **Click `button[aria-label*="Send message" i]`** — `Enter` inserts a newline |
+| Provider | Composer selector                                        | Submit                                                                       |
+| -------- | -------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| ChatGPT  | `div#prompt-textarea[role="textbox"]` (ProseMirror)      | `Enter`                                                                      |
+| Claude   | `div[data-testid="chat-input"][role="textbox"]` (Tiptap) | `Enter`                                                                      |
+| Gemini   | `rich-textarea div.ql-editor[role="textbox"]` (Quill)    | **Click `button[aria-label*="Send message" i]`** — `Enter` inserts a newline |
 
 For all three: empty ProseMirror/Tiptap/Quill editors render with
 zero box-height, so Playwright's "visible" check rejects them. Use

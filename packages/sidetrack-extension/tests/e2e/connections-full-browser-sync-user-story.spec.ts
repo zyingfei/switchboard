@@ -121,6 +121,7 @@ const REAL_STORY_HOST_PERMISSIONS = [
   'https://www.youtube.com/*',
   'https://gemini.google.com/*',
 ] as const;
+const HOLD_OPEN_ON_CONNECTIONS = process.env['SIDETRACK_E2E_HOLD_OPEN'] === '1';
 
 interface ConnectionNode {
   readonly id: string;
@@ -471,6 +472,44 @@ const expectWorkstreamSelectorOptions = async (
       { timeout: 30_000 },
     );
   }
+};
+
+const holdOpenOnConnectionsView = async ({
+  panel,
+  runtime,
+  companion,
+  securityWorkstreamId,
+  switchboardWorkstreamId,
+}: {
+  readonly panel: Page;
+  readonly runtime: ExtensionRuntime;
+  readonly companion: TestCompanion;
+  readonly securityWorkstreamId: string;
+  readonly switchboardWorkstreamId: string;
+}): Promise<void> => {
+  if (!HOLD_OPEN_ON_CONNECTIONS) return;
+
+  await panel.getByTestId('connections-mode-linked').click();
+  await setConnectionsAnchor(panel, `workstream:${switchboardWorkstreamId}`, '4');
+  await expect(panel.getByTestId('connections-groups')).toBeVisible({ timeout: 30_000 });
+  await panel.bringToFront();
+
+  console.log('[sidetrack hold-open] Browser B Connections panel is open.');
+  console.log(
+    `[sidetrack hold-open] Extension: chrome-extension://${runtime.extensionId}/sidepanel.html`,
+  );
+  console.log(`[sidetrack hold-open] Companion: http://127.0.0.1:${companion.port}`);
+  console.log(`[sidetrack hold-open] Security workstream: workstream:${securityWorkstreamId}`);
+  console.log(
+    `[sidetrack hold-open] Switchboard workstream: workstream:${switchboardWorkstreamId}`,
+  );
+  console.log(
+    '[sidetrack hold-open] Press Ctrl+C on the Playwright runner when inspection is done.',
+  );
+
+  await new Promise<void>(() => {
+    setInterval(() => undefined, 60_000);
+  });
 };
 
 const openConnectionsPanel = async (
@@ -1544,7 +1583,7 @@ test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 com
     process.env['SIDETRACK_E2E_SKIP_LIVE_BROWSERS'] === '1',
     'set SIDETRACK_E2E_SKIP_LIVE_BROWSERS=1 to skip when CfT is unavailable',
   );
-  test.setTimeout(600_000);
+  test.setTimeout(HOLD_OPEN_ON_CONNECTIONS ? 0 : 600_000);
 
   let relay: TestRelay | null = null;
   let companionA: TestCompanion | null = null;
@@ -1555,6 +1594,7 @@ test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 com
   let llmMockB: LlmNetworkMock | null = null;
 
   test.afterAll(async () => {
+    if (HOLD_OPEN_ON_CONNECTIONS) return;
     if (runtimeA !== null) await runtimeA.close();
     if (runtimeB !== null) await runtimeB.close();
     if (companionA !== null) await companionA.close();
@@ -1949,5 +1989,12 @@ test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 com
 
     llmMockA.assertNoLlmCalls();
     llmMockB.assertNoLlmCalls();
+    await holdOpenOnConnectionsView({
+      panel: panelB,
+      runtime: runtimeB,
+      companion: companionB,
+      securityWorkstreamId: wsSecurityId,
+      switchboardWorkstreamId: wsSwitchboardId,
+    });
   });
 });
