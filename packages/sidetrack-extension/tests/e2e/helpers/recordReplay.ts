@@ -8,8 +8,10 @@ import path from 'node:path';
 
 import type { BrowserContext, Page } from '@playwright/test';
 
+import { redact } from '../../../../sidetrack-companion/src/safety/redaction';
 import { sanitizeTimelineUrl } from '../../../src/timeline/sanitize';
 import type { TestCompanion } from './companion';
+import type { ManualEvent, ManualSnapshotFile } from './manualRecorder';
 import type { ExtensionRuntime } from './runtime';
 
 export const SESSION_PACK_SCHEMA_VERSION = 1;
@@ -149,12 +151,14 @@ export interface ConnectionsEnvelope {
 export interface RouteStubTracker {
   readonly expectedCanonicalUrls: readonly string[];
   readonly hitCounts: () => ReadonlyMap<string, number>;
+  readonly fulfilledBodies: () => ReadonlyMap<string, string>;
 }
 
 interface RouteStub {
   readonly url: string;
   readonly canonicalUrl: string;
   readonly title: string;
+  readonly body?: string;
 }
 
 export interface PageReplayResult {
@@ -194,12 +198,24 @@ export interface ReplayEvaluationReport {
   readonly replayedCanonicalUrls: readonly string[];
   readonly timelineCanonicalUrls: readonly string[];
   readonly connectionNodeIds: readonly string[];
+  readonly heldUrls?: {
+    readonly enabled: boolean;
+    readonly reachable: boolean;
+    readonly urls: readonly string[];
+  };
 }
 
 export interface WrittenReplayReport {
   readonly runDir: string;
   readonly markdownPath: string;
   readonly jsonPath: string;
+}
+
+export interface ManualRecorderPackInput {
+  readonly events: readonly ManualEvent[];
+  readonly snapshots: readonly ManualSnapshotFile[];
+  readonly label: BrowserLabel;
+  readonly activeWorkstreamId: string | null;
 }
 
 const CROCKFORD32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
@@ -277,8 +293,12 @@ export const resolveCaptureLevel = (env: NodeJS.ProcessEnv = process.env): Captu
   const raw = env['SIDETRACK_CAPTURE_LEVEL'] ?? env['SIDETRACK_RECORD_CAPTURE_LEVEL'];
   if (raw === undefined || raw.length === 0) return 'minimal';
   if (raw === 'minimal') return 'minimal';
+  if (raw === 'html') return 'html';
+  if (raw === 'html+paste') {
+    throw new Error('captureLevel="html+paste" is reserved for Wave 2c.');
+  }
   throw new Error(
-    `Wave 2a supports only captureLevel="minimal"; ${raw} is reserved for later slices.`,
+    `Unsupported SIDETRACK_CAPTURE_LEVEL ${raw}; supported in Wave 2b: minimal, html.`,
   );
 };
 
@@ -309,6 +329,14 @@ export const firstBrowser = (pack: SessionPack): SessionPackBrowser => {
     throw new Error(`Session pack ${pack.sessionId} has no browsers.`);
   }
   return pack.browsers[0];
+};
+
+export const browserByLabel = (pack: SessionPack, label: BrowserLabel): SessionPackBrowser => {
+  const browser = pack.browsers.find((candidate) => candidate.label === label);
+  if (browser === undefined) {
+    throw new Error(`Session pack ${pack.sessionId} has no Browser ${label}.`);
+  }
+  return browser;
 };
 
 export const createMinimalOneBrowserPack = async (input: {
@@ -392,6 +420,194 @@ export const createMinimalOneBrowserPack = async (input: {
   return pack;
 };
 
+export const redactHtmlForSessionPack = (
+  html: string,
+): { readonly htmlRedacted: string; readonly redactionCounts: Record<string, number> } => {
+  const result = redact(html);
+  const redactionCounts: Record<string, number> = {};
+  for (const category of result.categories) {
+    const marker = `[${category}]`;
+    const count = result.output.split(marker).length - 1;
+    redactionCounts[category] = count > 0 ? count : result.matched;
+  }
+  return { htmlRedacted: result.output, redactionCounts };
+};
+
+export const createSessionPackFromManualRecorder = (input: {
+  readonly browsers: readonly ManualRecorderPackInput[];
+  readonly captureLevel: CaptureLevel;
+  readonly sidetrackVersion: string;
+  readonly sessionId?: string;
+  readonly recordedAt?: string;
+}): SessionPack => {
+  if (input.captureLevel === 'html+paste') {
+    throw new Error('Manual recorder SessionPack conversion for html+paste lands in Wave 2c.');
+  }
+  if (input.browsers.length !== 1 && input.browsers.length !== 2) {
+    throw new Error('SessionPack conversion expects one or two browsers.');
+  }
+  const labels = new Set(input.browsers.map((browser) => browser.label));
+  if (labels.size !== input.browsers.length) {
+    throw new Error('SessionPack browser labels must be unique.');
+  }
+  const sessionId = input.sessionId ?? createSessionId();
+  const recordedAt = input.recordedAt ?? new Date().toISOString();
+  const browsers = input.browsers.map((browserInput) =>
+    convertManualBrowserEvents({
+      sessionId,
+      captureLevel: input.captureLevel,
+      ...browserInput,
+    }),
+  );
+  const pack: SessionPack = {
+    schemaVersion: SESSION_PACK_SCHEMA_VERSION,
+    sessionId,
+    recordedAt,
+    sidetrackVersion: input.sidetrackVersion,
+    mode: { browsers: input.browsers.length === 1 ? 1 : 2, captureLevel: input.captureLevel },
+    browsers,
+    expectations: {
+      expectedCanonicalUrls: recordedCanonicalUrls({
+        schemaVersion: SESSION_PACK_SCHEMA_VERSION,
+        sessionId,
+        recordedAt,
+        sidetrackVersion: input.sidetrackVersion,
+        mode: { browsers: input.browsers.length === 1 ? 1 : 2, captureLevel: input.captureLevel },
+        browsers,
+      }),
+      expectedEdges: [],
+      knownDetours: [],
+    },
+  };
+  assertPackPrivacy(pack);
+  return pack;
+};
+
+const convertManualBrowserEvents = (input: {
+  readonly sessionId: string;
+  readonly captureLevel: CaptureLevel;
+  readonly events: readonly ManualEvent[];
+  readonly snapshots: readonly ManualSnapshotFile[];
+  readonly label: BrowserLabel;
+  readonly activeWorkstreamId: string | null;
+}): SessionPackBrowser => {
+  const sortedEvents = [...input.events].sort((left, right) => isoMs(left.at) - isoMs(right.at));
+  const startedAtMs =
+    sortedEvents.length === 0
+      ? Date.now()
+      : Math.min(...sortedEvents.map((event) => isoMs(event.at)));
+  const tabHashes = new Map<string, string>();
+  const tabHashFor = (pageId: string): string => {
+    const existing = tabHashes.get(pageId);
+    if (existing !== undefined) return existing;
+    const tabHash = shortHash(`${input.sessionId}:${input.label}:${pageId}`);
+    tabHashes.set(pageId, tabHash);
+    return tabHash;
+  };
+  const events: SessionEvent[] = [];
+  if (input.activeWorkstreamId !== null) {
+    events.push({ kind: 'workstreamSwitch', atMs: 0, workstreamId: input.activeWorkstreamId });
+  }
+  for (const event of sortedEvents) {
+    const atMs = Math.max(0, isoMs(event.at) - startedAtMs);
+    if (event.kind === 'sidetrack-storage-changed') {
+      const workstreamId = event.payload?.['activeWorkstreamId'];
+      if (typeof workstreamId === 'string' && workstreamId.length > 0) {
+        events.push({ kind: 'workstreamSwitch', atMs, workstreamId });
+      }
+      continue;
+    }
+    if (event.pageId === undefined) continue;
+    const tabIdHash = tabHashFor(event.pageId);
+    if (event.kind === 'page-opened') {
+      events.push({ kind: 'tabOpen', atMs, tabIdHash });
+      continue;
+    }
+    if (event.kind === 'page-closed') {
+      events.push({ kind: 'tabClose', atMs, tabIdHash });
+      continue;
+    }
+    if (event.kind === 'window-focus') {
+      events.push({ kind: 'focus', atMs, tabIdHash });
+      continue;
+    }
+    if (event.kind === 'window-blur') {
+      events.push({ kind: 'blur', atMs, tabIdHash });
+      continue;
+    }
+    if (event.kind === 'navigation') {
+      const url = manualEventUrl(event);
+      if (url === null || !isReplayScopedUrl(url)) continue;
+      const canonicalUrl = stripTrailingSlash(sanitizeTimelineUrl(url));
+      events.push({
+        kind: 'navigation',
+        atMs,
+        tabIdHash,
+        url: canonicalUrl,
+        canonicalUrl,
+        title: titleForManualNavigation(event, input.snapshots) ?? canonicalUrl,
+        transition: 'updated',
+      });
+    }
+  }
+  return {
+    label: input.label,
+    activeWorkstreamId: input.activeWorkstreamId,
+    events,
+    snapshots: input.captureLevel === 'html' ? snapshotsFromManualFiles(input.snapshots) : {},
+  };
+};
+
+const snapshotsFromManualFiles = (
+  snapshots: readonly ManualSnapshotFile[],
+): Record<string, HtmlSnapshot> => {
+  const output: Record<string, HtmlSnapshot> = {};
+  for (const snapshot of snapshots) {
+    if (!isReplayScopedUrl(snapshot.url)) continue;
+    const canonicalUrl = stripTrailingSlash(sanitizeTimelineUrl(snapshot.url));
+    const redacted =
+      snapshot.redactionCounts === undefined
+        ? redactHtmlForSessionPack(snapshot.html)
+        : { htmlRedacted: snapshot.html, redactionCounts: snapshot.redactionCounts };
+    output[canonicalUrl] = {
+      capturedAt: snapshot.capturedAt,
+      title: snapshot.title,
+      htmlRedacted: redacted.htmlRedacted,
+      redactionCounts: redacted.redactionCounts,
+    };
+  }
+  return output;
+};
+
+const titleForManualNavigation = (
+  event: ManualEvent,
+  snapshots: readonly ManualSnapshotFile[],
+): string | null => {
+  if (typeof event.title === 'string' && event.title.length > 0) return event.title;
+  const url = manualEventUrl(event);
+  const samePageSnapshots = snapshots
+    .filter(
+      (snapshot) =>
+        snapshot.pageId === event.pageId &&
+        (url === null || stripTrailingSlash(snapshot.url) === stripTrailingSlash(url)),
+    )
+    .sort((left, right) => isoMs(left.capturedAt) - isoMs(right.capturedAt));
+  const latest = samePageSnapshots.at(-1);
+  if (latest !== undefined && latest.title.length > 0) return latest.title;
+  return null;
+};
+
+const manualEventUrl = (event: ManualEvent): string | null => {
+  if (typeof event.pageUrl === 'string' && event.pageUrl.length > 0) return event.pageUrl;
+  const payloadUrl = event.payload?.['url'];
+  return typeof payloadUrl === 'string' && payloadUrl.length > 0 ? payloadUrl : null;
+};
+
+const isoMs = (input: string): number => {
+  const value = Date.parse(input);
+  return Number.isFinite(value) ? value : 0;
+};
+
 const comparableStorageStrings = (value: unknown): readonly string[] => {
   if (typeof value === 'string') return value.length >= 8 ? [value] : [];
   if (Array.isArray(value)) return value.flatMap((item) => comparableStorageStrings(item));
@@ -426,9 +642,6 @@ export const assertNoDisallowedStorageValues = (
 };
 
 export const assertPackPrivacy = (pack: SessionPack): void => {
-  if (pack.mode.captureLevel !== 'minimal') {
-    throw new Error(`Wave 2a recorder must default to captureLevel="minimal".`);
-  }
   const json = JSON.stringify(pack);
   const denied: readonly { readonly name: string; readonly pattern: RegExp }[] = [
     { name: 'authorization header', pattern: /\bauthorization\s*:/iu },
@@ -447,17 +660,23 @@ export const assertPackPrivacy = (pack: SessionPack): void => {
   }
   for (const browser of pack.browsers) {
     const snapshots = Object.values(browser.snapshots);
-    if (snapshots.length > 0) {
-      throw new Error('Wave 2a minimal packs must not contain HTML snapshots.');
+    if (pack.mode.captureLevel === 'minimal' && snapshots.length > 0) {
+      throw new Error('Minimal packs must not contain HTML snapshots.');
     }
     for (const snapshot of snapshots) {
+      if (pack.mode.captureLevel === 'minimal') {
+        throw new Error('Minimal packs must not contain HTML snapshots.');
+      }
       if (!isNumberRecord(snapshot.redactionCounts)) {
         throw new Error(`HTML snapshot for ${snapshot.title} is missing redactionCounts.`);
       }
     }
     for (const event of browser.events) {
-      if (event.kind === 'copy' || event.kind === 'paste') {
-        throw new Error('Wave 2a minimal packs must not contain copy/paste content.');
+      if (
+        (event.kind === 'copy' || event.kind === 'paste') &&
+        pack.mode.captureLevel !== 'html+paste'
+      ) {
+        throw new Error('Only html+paste packs may contain copy/paste content.');
       }
     }
   }
@@ -498,10 +717,15 @@ export const installRouteStubsForPack = async (
   for (const browser of pack.browsers) {
     for (const event of browser.events) {
       if (event.kind !== 'navigation') continue;
+      const canonicalUrl = stripTrailingSlash(event.canonicalUrl);
+      const snapshot: HtmlSnapshot | undefined = Object.hasOwn(browser.snapshots, canonicalUrl)
+        ? browser.snapshots[canonicalUrl]
+        : undefined;
       stubs.push({
         url: event.url,
-        canonicalUrl: stripTrailingSlash(event.canonicalUrl),
+        canonicalUrl,
         title: event.title,
+        ...(snapshot === undefined ? {} : { body: snapshot.htmlRedacted }),
       });
     }
   }
@@ -528,14 +752,19 @@ const installRouteStubs = async (
   context: BrowserContext,
   routeStubs: readonly RouteStub[],
 ): Promise<RouteStubTracker> => {
-  const stubs = new Map<string, { readonly canonicalUrl: string; readonly title: string }>();
+  const stubs = new Map<
+    string,
+    { readonly canonicalUrl: string; readonly title: string; readonly body?: string }
+  >();
   for (const stub of routeStubs) {
     stubs.set(routeKeyFor(stub.url), {
       canonicalUrl: stub.canonicalUrl,
       title: stub.title,
+      ...(stub.body === undefined ? {} : { body: stub.body }),
     });
   }
   const hits = new Map<string, number>();
+  const fulfilledBodies = new Map<string, string>();
   await context.route(/^https?:\/\//u, async (route) => {
     const requestUrl = sanitizeTimelineUrl(route.request().url());
     const stub = stubs.get(routeKeyFor(requestUrl));
@@ -544,12 +773,16 @@ const installRouteStubs = async (
       return;
     }
     hits.set(stub.canonicalUrl, (hits.get(stub.canonicalUrl) ?? 0) + 1);
+    const body =
+      stub.body ??
+      `<!doctype html><title>${escapeHtml(stub.title)}</title><body><h1>${escapeHtml(
+        stub.title,
+      )}</h1><p>${escapeHtml(stub.canonicalUrl)}</p></body>`;
+    fulfilledBodies.set(stub.canonicalUrl, body);
     await route.fulfill({
       status: 200,
       contentType: 'text/html',
-      body: `<!doctype html><title>${escapeHtml(stub.title)}</title><body><h1>${escapeHtml(
-        stub.title,
-      )}</h1><p>${escapeHtml(stub.canonicalUrl)}</p></body>`,
+      body,
     });
   });
   return {
@@ -557,6 +790,7 @@ const installRouteStubs = async (
       ...new Set([...stubs.values()].map((stub) => stub.canonicalUrl)),
     ].sort(),
     hitCounts: () => new Map(hits),
+    fulfilledBodies: () => new Map(fulfilledBodies),
   };
 };
 
@@ -565,7 +799,16 @@ export const driveReplayFromPack = async (input: {
   readonly senderPage: Page;
   readonly pack: SessionPack;
 }): Promise<PageReplayResult> => {
-  const browser = firstBrowser(input.pack);
+  return await driveReplayBrowserFromPack({ ...input, label: firstBrowser(input.pack).label });
+};
+
+export const driveReplayBrowserFromPack = async (input: {
+  readonly runtime: ExtensionRuntime;
+  readonly senderPage: Page;
+  readonly pack: SessionPack;
+  readonly label: BrowserLabel;
+}): Promise<PageReplayResult> => {
+  const browser = browserByLabel(input.pack, input.label);
   if (browser.activeWorkstreamId !== null) {
     await input.runtime.seedStorage(input.senderPage, {
       [ACTIVE_WORKSTREAM_STORAGE_KEY]: browser.activeWorkstreamId,
@@ -636,6 +879,35 @@ export const driveReplayFromPack = async (input: {
   };
 };
 
+export const driveTwoBrowserReplayFromPack = async (input: {
+  readonly runtimeA: ExtensionRuntime;
+  readonly senderPageA: Page;
+  readonly runtimeB: ExtensionRuntime;
+  readonly senderPageB: Page;
+  readonly pack: SessionPack;
+}): Promise<PageReplayResult> => {
+  const replayA = await driveReplayBrowserFromPack({
+    runtime: input.runtimeA,
+    senderPage: input.senderPageA,
+    pack: input.pack,
+    label: 'A',
+  });
+  const replayB = input.pack.browsers.some((browser) => browser.label === 'B')
+    ? await driveReplayBrowserFromPack({
+        runtime: input.runtimeB,
+        senderPage: input.senderPageB,
+        pack: input.pack,
+        label: 'B',
+      })
+    : { succeededCanonicalUrls: [], failures: [] };
+  return {
+    succeededCanonicalUrls: [
+      ...new Set([...replayA.succeededCanonicalUrls, ...replayB.succeededCanonicalUrls]),
+    ].sort(),
+    failures: [...replayA.failures, ...replayB.failures],
+  };
+};
+
 export const forceDrainTimeline = async (
   runtime: ExtensionRuntime,
   senderPage: Page,
@@ -665,6 +937,26 @@ export const companionGet = async (
   });
   if (!response.ok) {
     throw new Error(`GET ${requestPath} -> ${String(response.status)}: ${await response.text()}`);
+  }
+  return await response.json();
+};
+
+export const companionPost = async (
+  companion: TestCompanion,
+  requestPath: string,
+  body: unknown,
+): Promise<unknown> => {
+  const response = await fetch(`http://127.0.0.1:${String(companion.port)}${requestPath}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-bac-bridge-key': companion.bridgeKey,
+      'Idempotency-Key': `rr-${createRunId()}`,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new Error(`POST ${requestPath} -> ${String(response.status)}: ${await response.text()}`);
   }
   return await response.json();
 };
@@ -710,6 +1002,7 @@ export const evaluateOneBrowserReplay = (input: {
   readonly drain: TimelineDrainResult;
   readonly timeline: TimelineEnvelope;
   readonly connections: ConnectionsEnvelope;
+  readonly heldUrls?: readonly string[];
 }): ReplayEvaluationReport => {
   const expectedCanonicals = expectedCanonicalUrls(input.pack);
   const timelineCanonicals = canonicalUrlsFromTimeline(input.timeline);
@@ -802,6 +1095,15 @@ export const evaluateOneBrowserReplay = (input: {
     replayedCanonicalUrls: input.pageReplay.succeededCanonicalUrls,
     timelineCanonicalUrls: timelineCanonicals,
     connectionNodeIds,
+    ...(input.heldUrls === undefined
+      ? {}
+      : {
+          heldUrls: {
+            enabled: input.heldUrls.length > 0,
+            reachable: input.heldUrls.every((url) => url.length > 0),
+            urls: input.heldUrls,
+          },
+        }),
   };
 };
 
@@ -828,6 +1130,10 @@ export const renderReplayMarkdown = (report: ReplayEvaluationReport): string => 
       (layer) => `### ${layer.layer}\n${layer.details.map((detail) => `- ${detail}`).join('\n')}`,
     )
     .join('\n\n');
+  const heldBlock =
+    report.heldUrls === undefined
+      ? ''
+      : `\n\n## Hold URLs\n\n- Reachable: ${report.heldUrls.reachable ? 'yes' : 'no'}\n${report.heldUrls.urls.map((url) => `- ${url}`).join('\n')}`;
   return `# Sidetrack Record/Replay Evaluation
 
 - Session: ${report.sessionId}
@@ -847,6 +1153,7 @@ ${report.recordedCanonicalUrls.map((url) => `- ${url}`).join('\n')}
 ## Timeline Canonical URLs
 
 ${report.timelineCanonicalUrls.map((url) => `- ${url}`).join('\n')}
+${heldBlock}
 ${detailBlocks.length > 0 ? `\n\n## Details\n\n${detailBlocks}` : ''}
 `;
 };

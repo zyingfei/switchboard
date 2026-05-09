@@ -8,9 +8,11 @@ import {
   ACTIVE_WORKSTREAM_STORAGE_KEY,
   assertNoDisallowedStorageValues,
   assertPackPrivacy,
+  createSessionPackFromManualRecorder,
   createRunId,
   createSessionId,
   recordedCanonicalUrls,
+  redactHtmlForSessionPack,
   resolveCaptureLevel,
   resolveTestSessionsDir,
   sha256Hex,
@@ -52,10 +54,13 @@ const basePack = (): SessionPack => ({
 });
 
 describe('T1 record/replay session pack helpers', () => {
-  it('defaults captureLevel to minimal and rejects richer Wave 2 modes in 2a', () => {
+  it('defaults captureLevel to minimal, accepts Wave 2b html, and keeps html+paste reserved', () => {
     expect(resolveCaptureLevel({})).toBe('minimal');
     expect(resolveCaptureLevel({ SIDETRACK_CAPTURE_LEVEL: 'minimal' })).toBe('minimal');
-    expect(() => resolveCaptureLevel({ SIDETRACK_CAPTURE_LEVEL: 'html' })).toThrow(/Wave 2a/u);
+    expect(resolveCaptureLevel({ SIDETRACK_CAPTURE_LEVEL: 'html' })).toBe('html');
+    expect(() => resolveCaptureLevel({ SIDETRACK_CAPTURE_LEVEL: 'html+paste' })).toThrow(
+      /Wave 2c/u,
+    );
   });
 
   it('uses ~/.sidetrack/test-sessions unless the env override is set', () => {
@@ -120,6 +125,99 @@ describe('T1 record/replay session pack helpers', () => {
         ],
       });
     }).toThrow(/copy\/paste/u);
+  });
+
+  it('redacts html snapshots and permits them only for html capture', () => {
+    const redacted = redactHtmlForSessionPack(
+      `Email owner@example.com and use sk-${'A'.repeat(40)}.`,
+    );
+    expect(redacted.htmlRedacted).toContain('[email]');
+    expect(redacted.htmlRedacted).toContain('[openai-key]');
+    expect(redacted.redactionCounts.email).toBe(1);
+    expect(redacted.redactionCounts['openai-key']).toBe(1);
+
+    const pack = basePack();
+    const browser = pack.browsers[0];
+    const htmlPack: SessionPack = {
+      ...pack,
+      mode: { browsers: 1, captureLevel: 'html' },
+      browsers: [
+        {
+          ...browser,
+          snapshots: {
+            'https://example.test/a': {
+              capturedAt: '2026-05-09T12:00:00.000Z',
+              title: 'Example',
+              htmlRedacted: redacted.htmlRedacted,
+              redactionCounts: redacted.redactionCounts,
+            },
+          },
+        },
+      ],
+    };
+    expect(() => {
+      assertPackPrivacy(htmlPack);
+    }).not.toThrow();
+    expect(() => {
+      assertPackPrivacy({
+        ...htmlPack,
+        mode: { browsers: 1, captureLevel: 'minimal' },
+      });
+    }).toThrow(/Minimal/u);
+  });
+
+  it('converts shared ManualRecorder events and redacted snapshots to SessionPack v1', () => {
+    const pack = createSessionPackFromManualRecorder({
+      captureLevel: 'html',
+      sidetrackVersion: 'test',
+      sessionId: 'ses_01HX0000000000000000000000',
+      recordedAt: '2026-05-09T12:00:00.000Z',
+      browsers: [
+        {
+          label: 'A',
+          activeWorkstreamId: 'ws_t1',
+          events: [
+            {
+              at: '2026-05-09T12:00:00.000Z',
+              kind: 'page-opened',
+              pageId: 'p01',
+              pageUrl: 'about:blank',
+            },
+            {
+              at: '2026-05-09T12:00:00.100Z',
+              kind: 'navigation',
+              pageId: 'p01',
+              pageUrl: 'https://example.test/a?token=secret',
+            },
+            {
+              at: '2026-05-09T12:00:00.200Z',
+              kind: 'sidetrack-storage-changed',
+              payload: { activeWorkstreamId: 'ws_t1' },
+            },
+          ],
+          snapshots: [
+            {
+              capturedAt: '2026-05-09T12:00:00.150Z',
+              pageId: 'p01',
+              reason: 'navigation',
+              url: 'https://example.test/a?token=secret',
+              title: 'Example',
+              html: '<main>owner@example.com</main>',
+            },
+          ],
+        },
+        {
+          label: 'B',
+          activeWorkstreamId: 'ws_t1',
+          events: [],
+          snapshots: [],
+        },
+      ],
+    });
+    expect(pack.mode).toEqual({ browsers: 2, captureLevel: 'html' });
+    expect(recordedCanonicalUrls(pack)).toEqual(['https://example.test/a']);
+    const snapshot = pack.browsers[0].snapshots['https://example.test/a'];
+    expect(snapshot.htmlRedacted).toContain('[email]');
   });
 
   it('writes local-only pack.json under the selected session root', async () => {
