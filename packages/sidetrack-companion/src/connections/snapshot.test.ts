@@ -81,6 +81,8 @@ const navigationCommittedPayload = (input: {
   readonly seq: number;
   readonly canonicalUrl: string;
   readonly commitAt: string;
+  readonly previousVisitId?: string | null;
+  readonly openerVisitId?: string | null;
 }): NavigationCommittedPayload => ({
   payloadVersion: 1,
   visitId: `visit-${input.replicaId}-${String(input.seq)}`,
@@ -90,8 +92,8 @@ const navigationCommittedPayload = (input: {
   parentDocumentId: null,
   tabSessionIdHash: `tab-${input.replicaId}`,
   windowSessionIdHash: `window-${input.replicaId}`,
-  openerVisitId: null,
-  previousVisitId: null,
+  openerVisitId: input.openerVisitId ?? null,
+  previousVisitId: input.previousVisitId ?? null,
   navigationSequence: input.seq,
   transitionType: 'link',
   transitionQualifiers: [],
@@ -1617,6 +1619,71 @@ describe('connections — determinism + cross-replica', () => {
         (edge) => edge.fromNodeId === nodeIdFor('timeline-visit', 'https://example.com/only-a'),
       ),
     ).toBe(false);
+  });
+
+  it('Pass 9 emits same-tab and opener navigation spine edges from navigation.committed', () => {
+    const root = 'https://example.com/root';
+    const next = 'https://example.com/next';
+    const opened = 'https://example.com/opened';
+    const rootPayload = navigationCommittedPayload({
+      replicaId: 'replica-A',
+      seq: 1,
+      canonicalUrl: root,
+      commitAt: '2026-05-07T09:00:00.000Z',
+    });
+    const nextPayload = navigationCommittedPayload({
+      replicaId: 'replica-A',
+      seq: 2,
+      canonicalUrl: next,
+      commitAt: '2026-05-07T09:01:00.000Z',
+      previousVisitId: rootPayload.visitId,
+    });
+    const openedPayload = navigationCommittedPayload({
+      replicaId: 'replica-A',
+      seq: 3,
+      canonicalUrl: opened,
+      commitAt: '2026-05-07T09:02:00.000Z',
+      openerVisitId: rootPayload.visitId,
+    });
+
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        events: [
+          buildEvent({ seq: 1, type: NAVIGATION_COMMITTED, payload: rootPayload }),
+          buildEvent({ seq: 2, type: NAVIGATION_COMMITTED, payload: nextPayload }),
+          buildEvent({ seq: 3, type: NAVIGATION_COMMITTED, payload: openedPayload }),
+        ],
+      }),
+    );
+
+    const previous = snap.edges.find((edge) => edge.kind === 'previous_visit_in_tab_session');
+    expect(previous).toMatchObject({
+      fromNodeId: nodeIdFor('timeline-visit', root),
+      toNodeId: nodeIdFor('timeline-visit', next),
+      confidence: 'observed',
+      producedBy: {
+        source: 'event-log',
+        eventType: NAVIGATION_COMMITTED,
+        dot: { replicaId: 'replica-A', seq: 2 },
+      },
+    });
+    expect(previous?.metadata).toMatchObject({
+      currentVisitId: nextPayload.visitId,
+      navigationSequence: 2,
+      tabSessionIdHash: 'tab-replica-A',
+    });
+
+    const opener = snap.edges.find((edge) => edge.kind === 'opener_visit');
+    expect(opener).toMatchObject({
+      fromNodeId: nodeIdFor('timeline-visit', root),
+      toNodeId: nodeIdFor('timeline-visit', opened),
+      confidence: 'observed',
+      producedBy: {
+        source: 'event-log',
+        eventType: NAVIGATION_COMMITTED,
+        dot: { replicaId: 'replica-A', seq: 3 },
+      },
+    });
   });
 
   it('Pass 11 emits visit_continues_visit for high-confidence cross-replica handoffs', () => {

@@ -19,6 +19,7 @@
     "e2e:verify": "node scripts/verify-extension-build.mjs",
     "e2e:login": "npm run build && node scripts/login-test-profile.mjs",
     "e2e:chrome-debug": "npm run build && node scripts/chrome-debug.mjs",
+    "e2e:manual-l5-recorder": "npm run build && npm run e2e:prepare-companion && npm run e2e:verify && SIDETRACK_E2E_HEADLESS=0 playwright test tests/e2e/manual-l5-recorder.spec.ts --headed --timeout 0",
     "e2e:install-cft": "node scripts/install-cft.mjs",
     "e2e:gc-cft": "node scripts/gc-cft.mjs",
     "e2e:pair": "node scripts/pair-extension.mjs",

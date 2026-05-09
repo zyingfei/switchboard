@@ -57,7 +57,8 @@ interface TimelineEnabledStorage {
 }
 
 const getStorage = (): TimelineEnabledStorage => {
-  const c = (globalThis as unknown as { chrome?: { storage?: { local?: TimelineEnabledStorage } } }).chrome;
+  const c = (globalThis as unknown as { chrome?: { storage?: { local?: TimelineEnabledStorage } } })
+    .chrome;
   const local = c?.storage?.local;
   if (local === undefined) throw new Error('chrome.storage.local is unavailable');
   return local;
@@ -119,19 +120,21 @@ const refreshActiveWorkstreamCache = async (): Promise<void> => {
   }
 };
 
-const startActiveWorkstreamCache = (): void => {
-  void refreshActiveWorkstreamCache();
-  const c = (globalThis as unknown as {
-    chrome?: {
-      storage?: {
-        onChanged?: {
-          addListener: (
-            listener: (changes: Record<string, { newValue?: unknown }>) => void,
-          ) => void;
+const startActiveWorkstreamCache = async (): Promise<void> => {
+  await refreshActiveWorkstreamCache();
+  const c = (
+    globalThis as unknown as {
+      chrome?: {
+        storage?: {
+          onChanged?: {
+            addListener: (
+              listener: (changes: Record<string, { newValue?: unknown }>) => void,
+            ) => void;
+          };
         };
       };
-    };
-  }).chrome;
+    }
+  ).chrome;
   c?.storage?.onChanged?.addListener((changes) => {
     if (Object.prototype.hasOwnProperty.call(changes, ACTIVE_WORKSTREAM_KEY)) {
       const v = changes[ACTIVE_WORKSTREAM_KEY]?.newValue;
@@ -154,8 +157,7 @@ const buildObserver = (replica: EdgeReplica): TimelineObserver => {
     getActiveWorkstreamId: () => cachedActiveWorkstreamId,
     hashTabId: (tabId, windowId) =>
       fnv1a64(`${salt}|tab|${String(tabId)}|${String(windowId)}`).slice(0, 16),
-    hashWindowId: (windowId) =>
-      fnv1a64(`${salt}|win|${String(windowId)}`).slice(0, 16),
+    hashWindowId: (windowId) => fnv1a64(`${salt}|win|${String(windowId)}`).slice(0, 16),
     canonicalize: (url) => {
       try {
         return canonicalThreadUrl(url);
@@ -253,7 +255,7 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
   // observer starts emitting. Reads chrome.storage once, then
   // listens for chrome.storage.onChanged so subsequent panel
   // updates take effect on the next emit.
-  startActiveWorkstreamCache();
+  await startActiveWorkstreamCache();
 
   const replica = await loadOrCreateEdgeReplica();
   const observer = buildObserver(replica);

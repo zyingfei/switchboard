@@ -3,7 +3,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { ConnectionsView } from '../../../src/sidepanel/connections/ConnectionsView';
 import { setConnectionsClientTransportForTests } from '../../../src/sidepanel/connections/client';
-import { EDGE_KINDS, FAMILIES, contentDerivedHint } from '../../../src/sidepanel/connections/edgeKinds';
+import {
+  EDGE_KINDS,
+  FAMILIES,
+  contentDerivedHint,
+} from '../../../src/sidepanel/connections/edgeKinds';
 import { messageTypes } from '../../../src/messages';
 
 // Plugin-level "every edge kind works" test. Builds a synthetic
@@ -37,6 +41,8 @@ const COMPANION_EMITTED_KINDS: readonly string[] = [
   'thread_text_mentions_search_query',
   'visit_resembles_visit',
   'visit_in_workstream',
+  'previous_visit_in_tab_session',
+  'opener_visit',
   'visit_in_topic',
   'topic_in_workstream',
   'topic.lineage',
@@ -72,36 +78,166 @@ const EDGE_FIXTURES: ReadonlyArray<{
   readonly from: { id: string; kind: string };
   readonly to: { id: string; kind: string };
 }> = [
-  { kind: 'thread_in_workstream', from: { id: 'thread:t_anchor', kind: 'thread' }, to: { id: 'workstream:ws_research', kind: 'workstream' } },
-  { kind: 'workstream_parent_of', from: { id: 'workstream:ws_root', kind: 'workstream' }, to: { id: 'workstream:ws_research', kind: 'workstream' } },
-  { kind: 'dispatch_from_thread', from: { id: 'thread:t_anchor', kind: 'thread' }, to: { id: 'dispatch:d_codex', kind: 'dispatch' } },
-  { kind: 'dispatch_in_workstream', from: { id: 'dispatch:d_codex', kind: 'dispatch' }, to: { id: 'workstream:ws_research', kind: 'workstream' } },
-  { kind: 'dispatch_reply_landed_in_thread', from: { id: 'dispatch:d_codex', kind: 'dispatch' }, to: { id: 'thread:t_chatgpt', kind: 'thread' } },
-  { kind: 'dispatch_requested_coding_session', from: { id: 'dispatch:d_codex', kind: 'dispatch' }, to: { id: 'coding-session:cs_tax', kind: 'coding-session' } },
-  { kind: 'queue_targets_thread', from: { id: 'queue-item:q1', kind: 'queue-item' }, to: { id: 'thread:t_anchor', kind: 'thread' } },
-  { kind: 'queue_targets_workstream', from: { id: 'queue-item:q2', kind: 'queue-item' }, to: { id: 'workstream:ws_research', kind: 'workstream' } },
-  { kind: 'reminder_for_thread', from: { id: 'inbound-reminder:r1', kind: 'inbound-reminder' }, to: { id: 'thread:t_anchor', kind: 'thread' } },
-  { kind: 'coding_session_in_workstream', from: { id: 'coding-session:cs_tax', kind: 'coding-session' }, to: { id: 'workstream:ws_research', kind: 'workstream' } },
-  { kind: 'timeline_same_url_as_thread', from: { id: 'timeline-visit:https://copy.fail/exploit', kind: 'timeline-visit' }, to: { id: 'thread:t_anchor', kind: 'thread' } },
-  { kind: 'annotation_targets_thread', from: { id: 'annotation:a1', kind: 'annotation' }, to: { id: 'thread:t_anchor', kind: 'thread' } },
-  { kind: 'thread_references_url', from: { id: 'thread:t_anchor', kind: 'thread' }, to: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' } },
-  { kind: 'dispatch_references_url', from: { id: 'dispatch:d_codex', kind: 'dispatch' }, to: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' } },
-  { kind: 'annotation_references_url', from: { id: 'annotation:a1', kind: 'annotation' }, to: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' } },
-  { kind: 'thread_quotes_thread', from: { id: 'thread:t_chatgpt', kind: 'thread' }, to: { id: 'thread:t_anchor', kind: 'thread' } },
-  { kind: 'thread_text_mentions_search_query', from: { id: 'thread:t_anchor', kind: 'thread' }, to: { id: 'timeline-visit:https://www.google.com/search?q=copy+fail', kind: 'timeline-visit' } },
-  { kind: 'visit_resembles_visit', from: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' }, to: { id: 'timeline-visit:https://example.com/related', kind: 'timeline-visit' } },
-  { kind: 'visit_in_workstream', from: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' }, to: { id: 'workstream:ws_research', kind: 'workstream' } },
-  { kind: 'visit_in_topic', from: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' }, to: { id: 'topic:topic:abc123', kind: 'topic' } },
-  { kind: 'topic_in_workstream', from: { id: 'topic:topic:abc123', kind: 'topic' }, to: { id: 'workstream:ws_research', kind: 'workstream' } },
-  { kind: 'topic.lineage', from: { id: 'topic:topic:old', kind: 'topic' }, to: { id: 'topic:topic:abc123', kind: 'topic' } },
-  { kind: 'snippet_copied_from_visit', from: { id: 'snippet:s1', kind: 'snippet' }, to: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' } },
-  { kind: 'snippet_pasted_into_thread', from: { id: 'snippet:s1', kind: 'snippet' }, to: { id: 'thread:t_anchor', kind: 'thread' } },
-  { kind: 'snippet_pasted_into_dispatch', from: { id: 'snippet:s1', kind: 'snippet' }, to: { id: 'dispatch:d_codex', kind: 'dispatch' } },
-  { kind: 'snippet_pasted_into_search', from: { id: 'snippet:s1', kind: 'snippet' }, to: { id: 'timeline-visit:https://www.google.com/search?q=copy+fail', kind: 'timeline-visit' } },
-  { kind: 'snippet_pasted_into_note', from: { id: 'snippet:s1', kind: 'snippet' }, to: { id: 'annotation:a1', kind: 'annotation' } },
-  { kind: 'snippet_pasted_into_capture', from: { id: 'snippet:s1', kind: 'snippet' }, to: { id: 'annotation:capture1', kind: 'annotation' } },
-  { kind: 'snippet_reused_across_threads', from: { id: 'snippet:s1', kind: 'snippet' }, to: { id: 'thread:t_chatgpt', kind: 'thread' } },
-  { kind: 'visit_observed_on_replica', from: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' }, to: { id: 'replica:replica-A', kind: 'replica' } },
+  {
+    kind: 'thread_in_workstream',
+    from: { id: 'thread:t_anchor', kind: 'thread' },
+    to: { id: 'workstream:ws_research', kind: 'workstream' },
+  },
+  {
+    kind: 'workstream_parent_of',
+    from: { id: 'workstream:ws_root', kind: 'workstream' },
+    to: { id: 'workstream:ws_research', kind: 'workstream' },
+  },
+  {
+    kind: 'dispatch_from_thread',
+    from: { id: 'thread:t_anchor', kind: 'thread' },
+    to: { id: 'dispatch:d_codex', kind: 'dispatch' },
+  },
+  {
+    kind: 'dispatch_in_workstream',
+    from: { id: 'dispatch:d_codex', kind: 'dispatch' },
+    to: { id: 'workstream:ws_research', kind: 'workstream' },
+  },
+  {
+    kind: 'dispatch_reply_landed_in_thread',
+    from: { id: 'dispatch:d_codex', kind: 'dispatch' },
+    to: { id: 'thread:t_chatgpt', kind: 'thread' },
+  },
+  {
+    kind: 'dispatch_requested_coding_session',
+    from: { id: 'dispatch:d_codex', kind: 'dispatch' },
+    to: { id: 'coding-session:cs_tax', kind: 'coding-session' },
+  },
+  {
+    kind: 'queue_targets_thread',
+    from: { id: 'queue-item:q1', kind: 'queue-item' },
+    to: { id: 'thread:t_anchor', kind: 'thread' },
+  },
+  {
+    kind: 'queue_targets_workstream',
+    from: { id: 'queue-item:q2', kind: 'queue-item' },
+    to: { id: 'workstream:ws_research', kind: 'workstream' },
+  },
+  {
+    kind: 'reminder_for_thread',
+    from: { id: 'inbound-reminder:r1', kind: 'inbound-reminder' },
+    to: { id: 'thread:t_anchor', kind: 'thread' },
+  },
+  {
+    kind: 'coding_session_in_workstream',
+    from: { id: 'coding-session:cs_tax', kind: 'coding-session' },
+    to: { id: 'workstream:ws_research', kind: 'workstream' },
+  },
+  {
+    kind: 'timeline_same_url_as_thread',
+    from: { id: 'timeline-visit:https://copy.fail/exploit', kind: 'timeline-visit' },
+    to: { id: 'thread:t_anchor', kind: 'thread' },
+  },
+  {
+    kind: 'annotation_targets_thread',
+    from: { id: 'annotation:a1', kind: 'annotation' },
+    to: { id: 'thread:t_anchor', kind: 'thread' },
+  },
+  {
+    kind: 'thread_references_url',
+    from: { id: 'thread:t_anchor', kind: 'thread' },
+    to: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' },
+  },
+  {
+    kind: 'dispatch_references_url',
+    from: { id: 'dispatch:d_codex', kind: 'dispatch' },
+    to: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' },
+  },
+  {
+    kind: 'annotation_references_url',
+    from: { id: 'annotation:a1', kind: 'annotation' },
+    to: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' },
+  },
+  {
+    kind: 'thread_quotes_thread',
+    from: { id: 'thread:t_chatgpt', kind: 'thread' },
+    to: { id: 'thread:t_anchor', kind: 'thread' },
+  },
+  {
+    kind: 'thread_text_mentions_search_query',
+    from: { id: 'thread:t_anchor', kind: 'thread' },
+    to: { id: 'timeline-visit:https://www.google.com/search?q=copy+fail', kind: 'timeline-visit' },
+  },
+  {
+    kind: 'visit_resembles_visit',
+    from: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' },
+    to: { id: 'timeline-visit:https://example.com/related', kind: 'timeline-visit' },
+  },
+  {
+    kind: 'visit_in_workstream',
+    from: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' },
+    to: { id: 'workstream:ws_research', kind: 'workstream' },
+  },
+  {
+    kind: 'previous_visit_in_tab_session',
+    from: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' },
+    to: { id: 'timeline-visit:https://example.com/next', kind: 'timeline-visit' },
+  },
+  {
+    kind: 'opener_visit',
+    from: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' },
+    to: { id: 'timeline-visit:https://example.com/opened', kind: 'timeline-visit' },
+  },
+  {
+    kind: 'visit_in_topic',
+    from: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' },
+    to: { id: 'topic:topic:abc123', kind: 'topic' },
+  },
+  {
+    kind: 'topic_in_workstream',
+    from: { id: 'topic:topic:abc123', kind: 'topic' },
+    to: { id: 'workstream:ws_research', kind: 'workstream' },
+  },
+  {
+    kind: 'topic.lineage',
+    from: { id: 'topic:topic:old', kind: 'topic' },
+    to: { id: 'topic:topic:abc123', kind: 'topic' },
+  },
+  {
+    kind: 'snippet_copied_from_visit',
+    from: { id: 'snippet:s1', kind: 'snippet' },
+    to: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' },
+  },
+  {
+    kind: 'snippet_pasted_into_thread',
+    from: { id: 'snippet:s1', kind: 'snippet' },
+    to: { id: 'thread:t_anchor', kind: 'thread' },
+  },
+  {
+    kind: 'snippet_pasted_into_dispatch',
+    from: { id: 'snippet:s1', kind: 'snippet' },
+    to: { id: 'dispatch:d_codex', kind: 'dispatch' },
+  },
+  {
+    kind: 'snippet_pasted_into_search',
+    from: { id: 'snippet:s1', kind: 'snippet' },
+    to: { id: 'timeline-visit:https://www.google.com/search?q=copy+fail', kind: 'timeline-visit' },
+  },
+  {
+    kind: 'snippet_pasted_into_note',
+    from: { id: 'snippet:s1', kind: 'snippet' },
+    to: { id: 'annotation:a1', kind: 'annotation' },
+  },
+  {
+    kind: 'snippet_pasted_into_capture',
+    from: { id: 'snippet:s1', kind: 'snippet' },
+    to: { id: 'annotation:capture1', kind: 'annotation' },
+  },
+  {
+    kind: 'snippet_reused_across_threads',
+    from: { id: 'snippet:s1', kind: 'snippet' },
+    to: { id: 'thread:t_chatgpt', kind: 'thread' },
+  },
+  {
+    kind: 'visit_observed_on_replica',
+    from: { id: 'timeline-visit:https://news.ycombinator.com/x', kind: 'timeline-visit' },
+    to: { id: 'replica:replica-A', kind: 'replica' },
+  },
 ];
 
 const confidenceForKind = (kind: string): 'asserted' | 'observed' | 'inferred' => {
@@ -121,6 +257,8 @@ const confidenceForKind = (kind: string): 'asserted' | 'observed' | 'inferred' =
     kind === 'dispatch_reply_landed_in_thread' ||
     kind === 'annotation_targets_thread' ||
     kind.endsWith('_references_url') ||
+    kind === 'previous_visit_in_tab_session' ||
+    kind === 'opener_visit' ||
     kind === 'topic.lineage' ||
     kind.startsWith('snippet_') ||
     kind === 'visit_observed_on_replica'
@@ -131,7 +269,17 @@ const confidenceForKind = (kind: string): 'asserted' | 'observed' | 'inferred' =
 };
 
 const buildFullSnapshot = () => {
-  const nodeById = new Map<string, { id: string; kind: string; label: string; originReplicaIds: string[]; metadata: Record<string, unknown>; lastSeenAt?: string }>();
+  const nodeById = new Map<
+    string,
+    {
+      id: string;
+      kind: string;
+      label: string;
+      originReplicaIds: string[];
+      metadata: Record<string, unknown>;
+      lastSeenAt?: string;
+    }
+  >();
   for (const e of EDGE_FIXTURES) {
     for (const ep of [e.from, e.to]) {
       if (!nodeById.has(ep.id)) {
@@ -160,7 +308,11 @@ const buildFullSnapshot = () => {
             recordId: 'a1b2c3d4e5f6',
             dot: { replicaId: 'replica-A', seq: i + 1 },
           }
-        : { source: 'event-log', eventType: 'thread.upserted', dot: { replicaId: 'replica-A', seq: i + 1 } },
+        : {
+            source: 'event-log',
+            eventType: 'thread.upserted',
+            dot: { replicaId: 'replica-A', seq: i + 1 },
+          },
     confidence: confidenceForKind(e.kind),
   }));
   const nodes = [...nodeById.values()];
@@ -194,6 +346,8 @@ describe('connections — edge metadata completeness', () => {
       [
         'annotation_references_url',
         'dispatch_references_url',
+        'opener_visit',
+        'previous_visit_in_tab_session',
         'snippet_copied_from_visit',
         'snippet_pasted_into_capture',
         'snippet_pasted_into_dispatch',
@@ -241,10 +395,7 @@ describe('connections — full-snapshot render covers every emitted edge kind', 
       const matchingEdges = EDGE_FIXTURES.filter((f) => f.kind === kind);
       for (const f of matchingEdges) {
         const id = `edge:${f.kind}:${f.from.id}:${f.to.id}`;
-        expect(
-          screen.queryByTestId(`edge-${id}`),
-          `edge button missing for ${id}`,
-        ).not.toBeNull();
+        expect(screen.queryByTestId(`edge-${id}`), `edge button missing for ${id}`).not.toBeNull();
       }
     }
   });
@@ -301,7 +452,12 @@ describe('connections — full-snapshot render covers every emitted edge kind', 
     });
     // Sample one edge per family rather than all 16 — the render
     // path is identical for each kind, only metadata changes.
-    const samples = ['thread_in_workstream', 'dispatch_from_thread', 'queue_targets_thread', 'thread_quotes_thread'];
+    const samples = [
+      'thread_in_workstream',
+      'dispatch_from_thread',
+      'queue_targets_thread',
+      'thread_quotes_thread',
+    ];
     for (const kind of samples) {
       const fixture = EDGE_FIXTURES.find((f) => f.kind === kind);
       expect(fixture).toBeDefined();

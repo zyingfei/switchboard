@@ -130,6 +130,17 @@ export const EDGE_KINDS: Record<string, EdgeKindMetadata> = {
     description:
       "Timeline observer stamped the user's currently-focused workstream id onto this visit at observation time (active-workstream attribution).",
   },
+  previous_visit_in_tab_session: {
+    family: 'flow',
+    label: 'previous visit',
+    description:
+      'Chrome navigation evidence connected consecutive top-level visits in the same tab session.',
+  },
+  opener_visit: {
+    family: 'flow',
+    label: 'opened from',
+    description: 'Chrome navigation evidence connected a new tab visit to the opener tab visit.',
+  },
   visit_in_topic: {
     family: 'contain',
     label: 'in topic',
@@ -241,6 +252,9 @@ export const contentDerivedHint = (kind: string): string | null => {
   if (kind === 'visit_resembles_visit') return 'via similarity';
   if (kind === 'visit_observed_on_replica') return 'via replica evidence';
   if (kind === 'visit_in_workstream') return 'via active workstream';
+  if (kind === 'previous_visit_in_tab_session' || kind === 'opener_visit') {
+    return 'via navigation';
+  }
   if (kind.startsWith('snippet_')) return 'via copy/paste';
   return null;
 };

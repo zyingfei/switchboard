@@ -1475,6 +1475,50 @@ describe('companion HTTP server', () => {
     ).resolves.toContain('Sidetrack');
   });
 
+  it('lists workstream projections for plugin mirror catch-up', async () => {
+    const projectionDir = join(vaultPath, '_BAC', 'workstreams', 'projections');
+    await mkdir(projectionDir, { recursive: true });
+    await writeFile(
+      join(projectionDir, 'bac_ws_projection.json'),
+      `${JSON.stringify({
+        bac_id: 'bac_ws_projection',
+        record: {
+          status: 'resolved',
+          value: {
+            bac_id: 'bac_ws_projection',
+            title: 'Peer-created workstream',
+            tags: ['sync'],
+            children: [],
+            checklist: [],
+            privacy: 'shared',
+          },
+        },
+        deleted: false,
+        vector: { replica_a: 1 },
+        updatedAtMs: 123,
+      })}\n`,
+      'utf8',
+    );
+
+    const response = await jsonFetch(context, `${baseUrl}/v1/workstreams/projections`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      data: [
+        {
+          bac_id: 'bac_ws_projection',
+          record: {
+            status: 'resolved',
+            value: { title: 'Peer-created workstream' },
+          },
+          deleted: false,
+        },
+      ],
+    });
+  });
+
   it('deletes a workstream — detaches threads, removes from parent, refuses with children', async () => {
     // Tree: parentA → child; sibling parentB. Thread points at child.
     const make = async (title: string, parentId?: string) => {
@@ -1512,11 +1556,10 @@ describe('companion HTTP server', () => {
     expect(refused.status).toBe(409);
 
     // Delete the leaf child — succeeds, returns the detached thread id.
-    const deleted = await jsonFetch(
-      context,
-      `${baseUrl}/v1/workstreams/${child.bac_id}`,
-      { method: 'DELETE', headers: { 'x-bac-bridge-key': bridgeKey } },
-    );
+    const deleted = await jsonFetch(context, `${baseUrl}/v1/workstreams/${child.bac_id}`, {
+      method: 'DELETE',
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
     expect(deleted.status).toBe(200);
     expect(deleted.body).toMatchObject({
       data: {
@@ -1567,9 +1610,11 @@ describe('companion HTTP server', () => {
       headers: { 'x-bac-bridge-key': bridgeKey },
     });
     expect(trust.status).toBe(200);
-    const tools = (trust.body as {
-      readonly data: { readonly allowedTools: readonly string[] };
-    }).data.allowedTools;
+    const tools = (
+      trust.body as {
+        readonly data: { readonly allowedTools: readonly string[] };
+      }
+    ).data.allowedTools;
     // Mirror the workstreamWriteTools constant — every tool is on
     // by default. PUT can later persist a deny-list.
     expect(tools).toContain('sidetrack.threads.move');
@@ -1598,24 +1643,18 @@ describe('companion HTTP server', () => {
     const child = await make('Child', parentA.bac_id);
 
     const readJson = async (id: string) =>
-      JSON.parse(
-        await readFile(join(vaultPath, '_BAC', 'workstreams', `${id}.json`), 'utf8'),
-      ) as {
+      JSON.parse(await readFile(join(vaultPath, '_BAC', 'workstreams', `${id}.json`), 'utf8')) as {
         readonly title?: string;
         readonly parentId?: string;
         readonly children?: readonly string[];
       };
 
     // Rename: title only.
-    const renameResult = await jsonFetch(
-      context,
-      `${baseUrl}/v1/workstreams/${child.bac_id}`,
-      {
-        method: 'PATCH',
-        headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
-        body: JSON.stringify({ revision: child.revision, title: 'Child renamed' }),
-      },
-    );
+    const renameResult = await jsonFetch(context, `${baseUrl}/v1/workstreams/${child.bac_id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({ revision: child.revision, title: 'Child renamed' }),
+    });
     expect(renameResult.status).toBe(200);
     let nextRev = (renameResult.body as { readonly data: { readonly revision: string } }).data
       .revision;
@@ -1623,15 +1662,11 @@ describe('companion HTTP server', () => {
 
     // Re-parent: parentA → parentB. Old parent loses the child id;
     // new parent gains it.
-    const reparentResult = await jsonFetch(
-      context,
-      `${baseUrl}/v1/workstreams/${child.bac_id}`,
-      {
-        method: 'PATCH',
-        headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
-        body: JSON.stringify({ revision: nextRev, parentId: parentB.bac_id }),
-      },
-    );
+    const reparentResult = await jsonFetch(context, `${baseUrl}/v1/workstreams/${child.bac_id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({ revision: nextRev, parentId: parentB.bac_id }),
+    });
     expect(reparentResult.status).toBe(200);
     nextRev = (reparentResult.body as { readonly data: { readonly revision: string } }).data
       .revision;
@@ -1641,15 +1676,11 @@ describe('companion HTTP server', () => {
 
     // Detach: parentId=null → drop parent, drop self from previous
     // parent's children. Title is preserved.
-    const detachResult = await jsonFetch(
-      context,
-      `${baseUrl}/v1/workstreams/${child.bac_id}`,
-      {
-        method: 'PATCH',
-        headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
-        body: JSON.stringify({ revision: nextRev, parentId: null }),
-      },
-    );
+    const detachResult = await jsonFetch(context, `${baseUrl}/v1/workstreams/${child.bac_id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({ revision: nextRev, parentId: null }),
+    });
     expect(detachResult.status).toBe(200);
     const detached = await readJson(child.bac_id);
     expect(detached.parentId).toBeUndefined();
@@ -1696,10 +1727,7 @@ describe('companion HTTP server', () => {
     ) as { readonly title?: string; readonly lastResearchMode?: string };
     expect(threadJson.title).toBe('Carry test (renamed)');
     expect(threadJson.lastResearchMode).toBe('deep-research');
-    const md = await readFile(
-      join(vaultPath, '_BAC', 'threads', 'bac_thread_carry.md'),
-      'utf8',
-    );
+    const md = await readFile(join(vaultPath, '_BAC', 'threads', 'bac_thread_carry.md'), 'utf8');
     expect(md).toContain('lastResearchMode: deep-research');
   });
 
@@ -1724,10 +1752,7 @@ describe('companion HTTP server', () => {
       await readFile(join(vaultPath, '_BAC', 'threads', 'bac_thread_research.json'), 'utf8'),
     ) as { readonly lastResearchMode?: string };
     expect(threadJson.lastResearchMode).toBe('deep-research');
-    const md = await readFile(
-      join(vaultPath, '_BAC', 'threads', 'bac_thread_research.md'),
-      'utf8',
-    );
+    const md = await readFile(join(vaultPath, '_BAC', 'threads', 'bac_thread_research.md'), 'utf8');
     expect(md).toContain('lastResearchMode: deep-research');
   });
 
@@ -2310,8 +2335,7 @@ describe('companion HTTP server', () => {
         // capability — we route 'reads-paths' to 'granted' and
         // 'reads-env' to 'pending' to verify both branches reach
         // the response shape.
-        resolveGate: (_id, capability) =>
-          capability === 'reads-paths' ? 'granted' : 'pending',
+        resolveGate: (_id, capability) => (capability === 'reads-paths' ? 'granted' : 'pending'),
         lastPromotedAtFor: () => '2026-05-08T18:30:00.000Z',
       },
     };
@@ -2394,14 +2418,10 @@ describe('companion HTTP server', () => {
         },
       },
     };
-    const result = await jsonFetch(
-      context,
-      `${baseUrl}/v1/collectors/sidetrack.test-tick/replay`,
-      {
-        method: 'POST',
-        headers: { 'x-bac-bridge-key': bridgeKey },
-      },
-    );
+    const result = await jsonFetch(context, `${baseUrl}/v1/collectors/sidetrack.test-tick/replay`, {
+      method: 'POST',
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
     expect(result.status).toBe(200);
     expect(result.body).toMatchObject({
       collector_id: 'sidetrack.test-tick',

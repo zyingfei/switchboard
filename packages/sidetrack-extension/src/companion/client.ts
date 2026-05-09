@@ -10,6 +10,8 @@ import type {
   ReminderCreate,
   ReminderUpdate,
   ThreadUpsert,
+  WorkstreamProjection,
+  WorkstreamProjectionRecord,
   WorkstreamCreate,
   WorkstreamUpdate,
 } from './model';
@@ -20,6 +22,7 @@ export interface CompanionClient {
   readonly appendEvent: (event: CaptureEvent, idempotencyKey: string) => Promise<MutationResult>;
   readonly upsertThread: (thread: ThreadUpsert) => Promise<MutationResult>;
   readonly createWorkstream: (workstream: WorkstreamCreate) => Promise<MutationResult>;
+  readonly listWorkstreamProjections: () => Promise<readonly WorkstreamProjection[]>;
   readonly updateWorkstream: (
     workstreamId: string,
     update: WorkstreamUpdate,
@@ -114,9 +117,7 @@ const parseStatus = (value: unknown): CompanionStatus => {
         ...(typeof r.consecutiveFailures === 'number'
           ? { consecutiveFailures: r.consecutiveFailures }
           : {}),
-        ...(typeof r.pendingPublishes === 'number'
-          ? { pendingPublishes: r.pendingPublishes }
-          : {}),
+        ...(typeof r.pendingPublishes === 'number' ? { pendingPublishes: r.pendingPublishes } : {}),
       },
     };
   }
@@ -148,6 +149,102 @@ const parseMutationResult = (value: unknown): MutationResult => {
   }
 
   return { bac_id: bacId, revision, requestId };
+};
+
+const parseStringArray = (value: unknown): readonly string[] => {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === 'string');
+};
+
+const parseChecklist = (value: unknown): WorkstreamProjectionRecord['checklist'] => {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!isRecord(item)) return [];
+    const id = item.id;
+    const text = item.text;
+    const checked = item.checked;
+    const createdAt = item.createdAt;
+    const updatedAt = item.updatedAt;
+    if (
+      typeof id !== 'string' ||
+      typeof text !== 'string' ||
+      typeof checked !== 'boolean' ||
+      typeof createdAt !== 'string' ||
+      typeof updatedAt !== 'string'
+    ) {
+      return [];
+    }
+    return [{ id, text, checked, createdAt, updatedAt }];
+  });
+};
+
+const parsePrivacy = (value: unknown): WorkstreamProjectionRecord['privacy'] | undefined =>
+  value === 'private' || value === 'shared' || value === 'public' ? value : undefined;
+
+const parseWorkstreamProjectionRecord = (value: unknown): WorkstreamProjectionRecord => {
+  if (!isRecord(value)) {
+    throw new Error('Workstream projection record was not an object.');
+  }
+  const bacId = value.bac_id;
+  const title = value.title;
+  if (typeof bacId !== 'string' || typeof title !== 'string') {
+    throw new Error('Workstream projection record missing bac_id/title.');
+  }
+  const parentId = value.parentId;
+  const privacy = parsePrivacy(value.privacy);
+  const screenShareSensitive = value.screenShareSensitive;
+  const description = value.description;
+  return {
+    bac_id: bacId,
+    title,
+    ...(typeof parentId === 'string' ? { parentId } : {}),
+    ...(privacy === undefined ? {} : { privacy }),
+    ...(typeof screenShareSensitive === 'boolean' ? { screenShareSensitive } : {}),
+    tags: parseStringArray(value.tags),
+    children: parseStringArray(value.children),
+    checklist: parseChecklist(value.checklist),
+    ...(typeof description === 'string' ? { description } : {}),
+  };
+};
+
+const parseWorkstreamProjectionRegister = (value: unknown): WorkstreamProjection['record'] => {
+  if (!isRecord(value)) {
+    throw new Error('Workstream projection register was not an object.');
+  }
+  if (value.status === 'resolved') {
+    return value.value === undefined
+      ? { status: 'resolved' }
+      : { status: 'resolved', value: parseWorkstreamProjectionRecord(value.value) };
+  }
+  if (value.status === 'conflict') {
+    const candidates = Array.isArray(value.candidates)
+      ? value.candidates.flatMap((candidate) =>
+          isRecord(candidate) ? [{ value: parseWorkstreamProjectionRecord(candidate.value) }] : [],
+        )
+      : [];
+    return { status: 'conflict', candidates };
+  }
+  throw new Error('Workstream projection register status was invalid.');
+};
+
+const parseWorkstreamProjections = (value: unknown): readonly WorkstreamProjection[] => {
+  if (!isRecord(value) || !Array.isArray(value.data)) {
+    throw new Error('Workstream projections response missing data array.');
+  }
+  return value.data.map((item) => {
+    if (!isRecord(item)) {
+      throw new Error('Workstream projection was not an object.');
+    }
+    const bacId = item.bac_id;
+    if (typeof bacId !== 'string') {
+      throw new Error('Workstream projection missing bac_id.');
+    }
+    return {
+      bac_id: bacId,
+      record: parseWorkstreamProjectionRegister(item.record),
+      deleted: item.deleted === true,
+    };
+  });
 };
 
 export class HttpCompanionClient implements CompanionClient {
@@ -185,6 +282,14 @@ export class HttpCompanionClient implements CompanionClient {
       await this.request('/workstreams', {
         method: 'POST',
         body: JSON.stringify(workstream),
+      }),
+    );
+  }
+
+  async listWorkstreamProjections(): Promise<readonly WorkstreamProjection[]> {
+    return parseWorkstreamProjections(
+      await this.request('/workstreams/projections', {
+        method: 'GET',
       }),
     );
   }

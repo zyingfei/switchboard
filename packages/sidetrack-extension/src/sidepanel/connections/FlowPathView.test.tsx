@@ -62,6 +62,9 @@ describe('FlowPathView', () => {
 
     expect(screen.getAllByTestId(/^flow-visit-/u)).toHaveLength(6);
     expect(screen.getAllByTestId(/^flow-nav-edge-/u)).toHaveLength(4);
+    expect(screen.getByText('Tab 1')).toBeDefined();
+    expect(screen.getByText('Tab 2')).toBeDefined();
+    expect(screen.getByTestId('flow-nav-edge-e1').textContent).toContain('Visit 1 -> Visit 2');
   });
 
   it('renders cross-replica edges dashed', () => {

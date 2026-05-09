@@ -19,6 +19,11 @@ import {
   type CrossReplicaMaterialization,
 } from '../materializers/cross-replica.js';
 import {
+  NAVIGATION_COMMITTED,
+  isNavigationCommittedPayload,
+  type NavigationCommittedPayload,
+} from '../navigation/events.js';
+import {
   DEFAULT_TOPIC_WORKSTREAM_SHARE_THRESHOLD,
   type TopicRevision,
 } from '../producers/topic-revision.js';
@@ -83,6 +88,10 @@ export type { ConnectionsSnapshot } from './types.js';
 //   visit_in_workstream                   timeline observer stamped a
 //                                         workstreamId on the visit (active
 //                                         workstream attribution)
+//   previous_visit_in_tab_session         chrome.webNavigation same-tab
+//                                         sequence evidence
+//   opener_visit                          chrome.webNavigation opener tab
+//                                         evidence
 //   visit_in_topic                         topic-clusterer membership edge
 //   topic_in_workstream                    topic-clusterer dominant
 //                                         workstream edge (>=75% members)
@@ -895,6 +904,113 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
           confidence: 'inferred',
         });
       }
+    }
+  }
+
+  const navigationByVisitId = new Map<
+    string,
+    {
+      readonly canonicalUrl: string;
+      readonly observedAt: string;
+      readonly payload: NavigationCommittedPayload;
+      readonly event: AcceptedEvent;
+    }
+  >();
+  for (const event of input.events) {
+    if (event.type !== NAVIGATION_COMMITTED) continue;
+    if (!isNavigationCommittedPayload(event.payload)) continue;
+    const canonicalUrl = stripFragmentAndTrailingSlash(event.payload.canonicalUrl);
+    if (canonicalUrl.length === 0) continue;
+    const observedAt = new Date(event.payload.commitTimestamp);
+    if (!Number.isFinite(observedAt.getTime())) continue;
+    navigationByVisitId.set(event.payload.visitId, {
+      canonicalUrl,
+      observedAt: observedAt.toISOString(),
+      payload: event.payload,
+      event,
+    });
+  }
+
+  const visitNodeIdForNavigationVisit = (visitId: string): string => {
+    const navigation = navigationByVisitId.get(visitId);
+    return nodeIdFor('timeline-visit', navigation?.canonicalUrl ?? visitId);
+  };
+
+  const ensureNavigationVisitNode = (visitId: string): void => {
+    const navigation = navigationByVisitId.get(visitId);
+    if (navigation === undefined) {
+      upsertNode(nodes, { kind: 'timeline-visit', key: visitId, label: visitId });
+      return;
+    }
+    upsertNode(nodes, {
+      kind: 'timeline-visit',
+      key: navigation.canonicalUrl,
+      label: navigation.payload.url,
+      observedAt: navigation.observedAt,
+      replicaId: navigation.event.dot.replicaId,
+      metadata: {
+        url: navigation.payload.url,
+        canonicalUrl: navigation.canonicalUrl,
+        tabSessionIdHash: navigation.payload.tabSessionIdHash,
+        windowSessionIdHash: navigation.payload.windowSessionIdHash,
+        navigationSequence: navigation.payload.navigationSequence,
+      },
+    });
+  };
+
+  const emitNavigationEdge = (input: {
+    readonly kind: 'previous_visit_in_tab_session' | 'opener_visit';
+    readonly fromVisitId: string;
+    readonly toVisitId: string;
+    readonly current: {
+      readonly observedAt: string;
+      readonly payload: NavigationCommittedPayload;
+      readonly event: AcceptedEvent;
+    };
+  }): void => {
+    ensureNavigationVisitNode(input.fromVisitId);
+    ensureNavigationVisitNode(input.toVisitId);
+    const fromNodeId = visitNodeIdForNavigationVisit(input.fromVisitId);
+    const toNodeId = visitNodeIdForNavigationVisit(input.toVisitId);
+    if (fromNodeId === toNodeId) return;
+    upsertEdge(edges, {
+      kind: input.kind,
+      fromNodeId,
+      toNodeId,
+      observedAt: input.current.observedAt,
+      producedBy: {
+        source: 'event-log',
+        eventType: NAVIGATION_COMMITTED,
+        dot: {
+          replicaId: input.current.event.dot.replicaId,
+          seq: input.current.event.dot.seq,
+        },
+      },
+      confidence: 'observed',
+      metadata: {
+        currentVisitId: input.current.payload.visitId,
+        tabSessionIdHash: input.current.payload.tabSessionIdHash,
+        navigationSequence: input.current.payload.navigationSequence,
+      },
+    });
+  };
+
+  for (const current of navigationByVisitId.values()) {
+    if (current.payload.previousVisitId !== null) {
+      emitNavigationEdge({
+        kind: 'previous_visit_in_tab_session',
+        fromVisitId: current.payload.previousVisitId,
+        toVisitId: current.payload.visitId,
+        current,
+      });
+    }
+    if (current.payload.openerVisitId !== null) {
+      emitNavigationEdge({
+        kind: 'opener_visit',
+        fromVisitId: current.payload.openerVisitId,
+        toVisitId: current.payload.visitId,
+        current,
+      });
     }
   }
   // Annotations → thread (URL match).

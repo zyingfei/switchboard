@@ -111,6 +111,8 @@ export type ConnectionEdgeKind =
   // working in a workstream attach to that workstream even when no
   // chat / dispatch / annotation references them.
   | 'visit_in_workstream'
+  | 'previous_visit_in_tab_session'
+  | 'opener_visit'
   | 'visit_in_topic'
   | 'topic_in_workstream'
   | 'topic.lineage'
