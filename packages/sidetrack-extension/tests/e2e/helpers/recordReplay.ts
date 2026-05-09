@@ -143,6 +143,9 @@ export interface ConnectionsEnvelope {
         readonly kind: string;
         readonly fromNodeId: string;
         readonly toNodeId: string;
+        readonly confidence?: string;
+        readonly producedBy?: Record<string, unknown>;
+        readonly metadata?: Record<string, unknown>;
       }[];
     };
   };
@@ -192,7 +195,12 @@ export interface ReplayEvaluationReport {
   readonly sessionId: string;
   readonly generatedAt: string;
   readonly status: 'pass' | 'fail';
+  readonly advisoryColor: ScoreColor;
   readonly captureLevel: CaptureLevel;
+  readonly scores: GraphQualityScores;
+  readonly detours: readonly DetourFinding[];
+  readonly detourAssertions: readonly DetourAssertion[];
+  readonly qualitativeWarnings: readonly QualitativeWarning[];
   readonly layers: readonly ReplayLayerReport[];
   readonly recordedCanonicalUrls: readonly string[];
   readonly replayedCanonicalUrls: readonly string[];
@@ -216,6 +224,91 @@ export interface ManualRecorderPackInput {
   readonly snapshots: readonly ManualSnapshotFile[];
   readonly label: BrowserLabel;
   readonly activeWorkstreamId: string | null;
+}
+
+export type DetourKind =
+  | 'cloudflare-challenge'
+  | 'login-wall'
+  | 'sso-redirect'
+  | 'consent-page'
+  | 'provider-interstitial'
+  | 'not-found-403-404'
+  | 'provider-unavailable';
+
+export interface DetourFinding {
+  readonly kind: DetourKind;
+  readonly canonicalUrl: string;
+  readonly title: string;
+  readonly reason: string;
+}
+
+export type DetourAssertionKind =
+  | 'detour-topic-pollution'
+  | 'detour-strong-similarity-anchor'
+  | 'detour-canonical-preserved'
+  | 'detour-listed-in-report';
+
+export interface DetourAssertion {
+  readonly kind: DetourAssertionKind;
+  readonly status: 'pass' | 'fail';
+  readonly summary: string;
+  readonly details: readonly string[];
+}
+
+export type QualitativeWarningKind =
+  | 'many-pages-same-workstream-after-long-idle'
+  | 'detour-became-topic-source'
+  | 'copy-paste-without-dispatch'
+  | 'ambient-page-attached-to-wrong-workstream'
+  | 'duplicate-canonical-visit-nodes'
+  | 'expected-tab-lineage-missing';
+
+export interface QualitativeWarning {
+  readonly kind: QualitativeWarningKind;
+  readonly message: string;
+  readonly canonicalUrls: readonly string[];
+}
+
+export type GraphQualityScoreName =
+  | 'topic-purity'
+  | 'ambient-containment'
+  | 'causal-coherence'
+  | 'search-result-chat-continuity'
+  | 'false-similarity-rate'
+  | 'ranking-plausibility';
+
+export type ScoreColor = 'green' | 'yellow' | 'red';
+
+export interface GraphQualityScore {
+  readonly score: number;
+  readonly color: ScoreColor;
+  readonly rationale: string;
+}
+
+export type GraphQualityScores = Record<GraphQualityScoreName, GraphQualityScore>;
+
+export interface ReplayQualityAnalysis {
+  readonly advisoryColor: ScoreColor;
+  readonly detours: readonly DetourFinding[];
+  readonly detourAssertions: readonly DetourAssertion[];
+  readonly qualitativeWarnings: readonly QualitativeWarning[];
+  readonly scores: GraphQualityScores;
+}
+
+interface NavigationRecord {
+  readonly browserLabel: BrowserLabel;
+  readonly event: Extract<SessionEvent, { readonly kind: 'navigation' }>;
+  readonly workstreamId: string | null;
+}
+
+interface ClipboardEventRecord {
+  readonly browserLabel: BrowserLabel;
+  readonly event: Extract<SessionEvent, { readonly kind: 'copy' | 'paste' }>;
+}
+
+interface ClipboardPair {
+  readonly copy: ClipboardEventRecord;
+  readonly paste: ClipboardEventRecord;
 }
 
 const CROCKFORD32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
@@ -294,11 +387,9 @@ export const resolveCaptureLevel = (env: NodeJS.ProcessEnv = process.env): Captu
   if (raw === undefined || raw.length === 0) return 'minimal';
   if (raw === 'minimal') return 'minimal';
   if (raw === 'html') return 'html';
-  if (raw === 'html+paste') {
-    throw new Error('captureLevel="html+paste" is reserved for Wave 2c.');
-  }
+  if (raw === 'html+paste') return 'html+paste';
   throw new Error(
-    `Unsupported SIDETRACK_CAPTURE_LEVEL ${raw}; supported in Wave 2b: minimal, html.`,
+    `Unsupported SIDETRACK_CAPTURE_LEVEL ${raw}; supported: minimal, html, html+paste.`,
   );
 };
 
@@ -440,9 +531,6 @@ export const createSessionPackFromManualRecorder = (input: {
   readonly sessionId?: string;
   readonly recordedAt?: string;
 }): SessionPack => {
-  if (input.captureLevel === 'html+paste') {
-    throw new Error('Manual recorder SessionPack conversion for html+paste lands in Wave 2c.');
-  }
   if (input.browsers.length !== 1 && input.browsers.length !== 2) {
     throw new Error('SessionPack conversion expects one or two browsers.');
   }
@@ -535,6 +623,18 @@ const convertManualBrowserEvents = (input: {
       events.push({ kind: 'blur', atMs, tabIdHash });
       continue;
     }
+    if ((event.kind === 'copy' || event.kind === 'paste') && input.captureLevel === 'html+paste') {
+      const content = manualClipboardContent(event);
+      events.push({
+        kind: event.kind,
+        atMs,
+        tabIdHash,
+        contentHash: sha256Hex(content),
+        length: Buffer.byteLength(content, 'utf8'),
+        content,
+      });
+      continue;
+    }
     if (event.kind === 'navigation') {
       const url = manualEventUrl(event);
       if (url === null || !isReplayScopedUrl(url)) continue;
@@ -554,7 +654,10 @@ const convertManualBrowserEvents = (input: {
     label: input.label,
     activeWorkstreamId: input.activeWorkstreamId,
     events,
-    snapshots: input.captureLevel === 'html' ? snapshotsFromManualFiles(input.snapshots) : {},
+    snapshots:
+      input.captureLevel === 'html' || input.captureLevel === 'html+paste'
+        ? snapshotsFromManualFiles(input.snapshots)
+        : {},
   };
 };
 
@@ -601,6 +704,15 @@ const manualEventUrl = (event: ManualEvent): string | null => {
   if (typeof event.pageUrl === 'string' && event.pageUrl.length > 0) return event.pageUrl;
   const payloadUrl = event.payload?.['url'];
   return typeof payloadUrl === 'string' && payloadUrl.length > 0 ? payloadUrl : null;
+};
+
+const manualClipboardContent = (event: ManualEvent): string => {
+  if (event.kind === 'copy') {
+    const selection = event.payload?.['selection'];
+    return typeof selection === 'string' ? selection : '';
+  }
+  const text = event.payload?.['text'];
+  return typeof text === 'string' ? text : '';
 };
 
 const isoMs = (input: string): number => {
@@ -995,6 +1107,130 @@ export const waitForReplaySurfaces = async (input: {
   return { timeline: lastTimeline, connections: lastConnections };
 };
 
+export const classifyDetour = (input: {
+  readonly url: string;
+  readonly title?: string;
+}): DetourFinding | null => {
+  const canonicalUrl = stripTrailingSlash(sanitizeTimelineUrl(input.url));
+  const url = canonicalUrl.toLowerCase();
+  const title = (input.title ?? '').toLowerCase();
+  const finding = (kind: DetourKind, reason: string): DetourFinding => ({
+    kind,
+    canonicalUrl,
+    title: input.title ?? canonicalUrl,
+    reason,
+  });
+
+  if (
+    url.includes('/cdn-cgi/challenge') ||
+    title.includes('just a moment') ||
+    title.includes('attention required') ||
+    title.includes('checking your browser') ||
+    title.includes('cloudflare')
+  ) {
+    return finding('cloudflare-challenge', 'Cloudflare challenge URL/title heuristic matched.');
+  }
+  if (
+    url.includes('/sso') ||
+    url.includes('saml') ||
+    url.includes('openid') ||
+    url.includes('oauth') ||
+    title.includes('single sign-on') ||
+    title.includes('sso redirect')
+  ) {
+    return finding('sso-redirect', 'SSO/OAuth redirect URL/title heuristic matched.');
+  }
+  if (
+    url.includes('/consent') ||
+    url.includes('consent.') ||
+    title.includes('consent') ||
+    title.includes('before you continue') ||
+    title.includes('privacy choices') ||
+    title.includes('cookies')
+  ) {
+    return finding('consent-page', 'Consent/privacy interstitial URL/title heuristic matched.');
+  }
+  if (
+    (url.includes('youtube.com') || url.includes('gemini.google.com')) &&
+    (title.includes('sign in') ||
+      title.includes('continue') ||
+      title.includes('interstitial') ||
+      title.includes('age') ||
+      title.includes('unusual traffic'))
+  ) {
+    return finding('provider-interstitial', 'Provider-specific interstitial heuristic matched.');
+  }
+  if (
+    title.includes('404') ||
+    title.includes('403') ||
+    title.includes('not found') ||
+    title.includes('forbidden') ||
+    title.includes('access denied') ||
+    url.includes('/404') ||
+    url.includes('/403')
+  ) {
+    return finding('not-found-403-404', '403/404/not-found URL/title heuristic matched.');
+  }
+  if (
+    title.includes('service unavailable') ||
+    title.includes('temporarily unavailable') ||
+    title.includes('over capacity') ||
+    title.includes('rate limit') ||
+    title.includes('provider unavailable') ||
+    url.includes('unavailable') ||
+    url.includes('rate-limit')
+  ) {
+    return finding('provider-unavailable', 'Provider unavailable URL/title heuristic matched.');
+  }
+  if (
+    url.includes('/login') ||
+    url.includes('/signin') ||
+    url.includes('accounts.') ||
+    title.includes('log in') ||
+    title.includes('login') ||
+    title.includes('sign in') ||
+    title.includes('authentication required')
+  ) {
+    return finding('login-wall', 'Login wall URL/title heuristic matched.');
+  }
+  return null;
+};
+
+export const analyzeReplayQuality = (input: {
+  readonly pack: SessionPack;
+  readonly timeline: TimelineEnvelope;
+  readonly connections: ConnectionsEnvelope;
+}): ReplayQualityAnalysis => {
+  const navigationRecords = navigationRecordsForPack(input.pack);
+  const detours = detoursForNavigationRecords(navigationRecords);
+  const detourAssertions = buildDetourAssertions({
+    pack: input.pack,
+    connections: input.connections,
+    navigationRecords,
+    detours,
+  });
+  const qualitativeWarnings = buildQualitativeWarnings({
+    pack: input.pack,
+    connections: input.connections,
+    navigationRecords,
+    detours,
+  });
+  const scores = buildGraphQualityScores({
+    pack: input.pack,
+    timeline: input.timeline,
+    connections: input.connections,
+    navigationRecords,
+    detours,
+  });
+  const scoreColors = Object.values(scores).map((score) => score.color);
+  const advisoryColor: ScoreColor = scoreColors.includes('red')
+    ? 'red'
+    : scoreColors.includes('yellow') || qualitativeWarnings.length > 0
+      ? 'yellow'
+      : 'green';
+  return { advisoryColor, detours, detourAssertions, qualitativeWarnings, scores };
+};
+
 export const evaluateOneBrowserReplay = (input: {
   readonly pack: SessionPack;
   readonly routeTracker: RouteStubTracker;
@@ -1007,6 +1243,11 @@ export const evaluateOneBrowserReplay = (input: {
   const expectedCanonicals = expectedCanonicalUrls(input.pack);
   const timelineCanonicals = canonicalUrlsFromTimeline(input.timeline);
   const connectionNodeIds = input.connections.data.snapshot.nodes.map((node) => node.id).sort();
+  const quality = analyzeReplayQuality({
+    pack: input.pack,
+    timeline: input.timeline,
+    connections: input.connections,
+  });
   const hitCounts = input.routeTracker.hitCounts();
   const routeMisses = expectedCanonicals.filter((url) => (hitCounts.get(url) ?? 0) === 0);
   const graphMissingNodes = expectedCanonicals
@@ -1034,6 +1275,9 @@ export const evaluateOneBrowserReplay = (input: {
           edge.fromNodeId === expected.from &&
           edge.toNodeId === expected.to,
       ),
+  );
+  const failedDetourAssertions = quality.detourAssertions.filter(
+    (assertion) => assertion.status === 'fail',
   );
 
   const layers: ReplayLayerReport[] = [
@@ -1072,14 +1316,18 @@ export const evaluateOneBrowserReplay = (input: {
     layerReport(
       'evaluation-expectations',
       missingExpectedEdges.length === 0 &&
+        failedDetourAssertions.length === 0 &&
         sameStringSet(
           expectedCanonicalUrls(input.pack),
           input.pack.expectations?.expectedCanonicalUrls ?? expectedCanonicals,
         ),
       'pack expectations matched replay outputs',
-      missingExpectedEdges.map(
-        (edge) => `missing expected edge ${edge.kind} ${edge.from} -> ${edge.to}`,
-      ),
+      [
+        ...missingExpectedEdges.map(
+          (edge) => `missing expected edge ${edge.kind} ${edge.from} -> ${edge.to}`,
+        ),
+        ...failedDetourAssertions.flatMap((assertion) => assertion.details),
+      ],
     ),
   ];
 
@@ -1089,7 +1337,12 @@ export const evaluateOneBrowserReplay = (input: {
     sessionId: input.pack.sessionId,
     generatedAt: new Date().toISOString(),
     status: layers.every((layer) => layer.status === 'pass') ? 'pass' : 'fail',
+    advisoryColor: quality.advisoryColor,
     captureLevel: input.pack.mode.captureLevel,
+    scores: quality.scores,
+    detours: quality.detours,
+    detourAssertions: quality.detourAssertions,
+    qualitativeWarnings: quality.qualitativeWarnings,
     layers,
     recordedCanonicalUrls: expectedCanonicals,
     replayedCanonicalUrls: input.pageReplay.succeededCanonicalUrls,
@@ -1121,8 +1374,35 @@ export const writeReplayReport = async (
 };
 
 export const renderReplayMarkdown = (report: ReplayEvaluationReport): string => {
+  const scoreRows = Object.entries(report.scores)
+    .map(
+      ([name, score]) =>
+        `| ${markdownCell(name)} | ${score.score.toFixed(4)} | ${score.color.toUpperCase()} | ${markdownCell(score.rationale)} |`,
+    )
+    .join('\n');
   const layerRows = report.layers
-    .map((layer) => `| ${layer.layer} | ${layer.status.toUpperCase()} | ${layer.summary} |`)
+    .map(
+      (layer) =>
+        `| ${markdownCell(layer.layer)} | ${layer.status.toUpperCase()} | ${markdownCell(layer.summary)} |`,
+    )
+    .join('\n');
+  const assertionRows = report.detourAssertions
+    .map(
+      (assertion) =>
+        `| ${markdownCell(assertion.kind)} | ${assertion.status.toUpperCase()} | ${markdownCell(assertion.summary)} |`,
+    )
+    .join('\n');
+  const detourRows = report.detours
+    .map(
+      (detour) =>
+        `| ${markdownCell(detour.kind)} | ${markdownCell(detour.canonicalUrl)} | ${markdownCell(detour.reason)} |`,
+    )
+    .join('\n');
+  const warningRows = report.qualitativeWarnings
+    .map(
+      (warning) =>
+        `| ${markdownCell(warning.kind)} | ${markdownCell(warning.message)} | ${markdownCell(warning.canonicalUrls.join(', '))} |`,
+    )
     .join('\n');
   const detailBlocks = report.layers
     .filter((layer) => layer.details.length > 0)
@@ -1134,17 +1414,38 @@ export const renderReplayMarkdown = (report: ReplayEvaluationReport): string => 
     report.heldUrls === undefined
       ? ''
       : `\n\n## Hold URLs\n\n- Reachable: ${report.heldUrls.reachable ? 'yes' : 'no'}\n${report.heldUrls.urls.map((url) => `- ${url}`).join('\n')}`;
-  return `# Sidetrack Record/Replay Evaluation
+  const detourBlock =
+    detourRows.length === 0
+      ? '\n\n## Detours\n\nNo detours detected.'
+      : `\n\n## Detours\n\n| Kind | Canonical URL | Reason |\n|---|---|---|\n${detourRows}`;
+  const warningBlock =
+    warningRows.length === 0
+      ? '\n\n## Qualitative Warnings\n\nNo qualitative warnings.'
+      : `\n\n## Qualitative Warnings\n\n| Warning | Message | Canonical URLs |\n|---|---|---|\n${warningRows}`;
+  return `| Score | Value | Color | Rationale |
+|---|---:|---|---|
+${scoreRows}
+
+# Sidetrack Record/Replay Evaluation
 
 - Session: ${report.sessionId}
 - Run: ${report.runId}
 - Generated: ${report.generatedAt}
 - Overall: ${report.status.toUpperCase()}
+- Advisory color: ${report.advisoryColor.toUpperCase()}
 - Capture level: ${report.captureLevel}
 
 | Layer | Status | Summary |
 |---|---|---|
 ${layerRows}
+
+## Detour Assertions
+
+| Assertion | Status | Summary |
+|---|---|---|
+${assertionRows}
+${detourBlock}
+${warningBlock}
 
 ## Recorded Canonical URLs
 
@@ -1158,6 +1459,8 @@ ${detailBlocks.length > 0 ? `\n\n## Details\n\n${detailBlocks}` : ''}
 `;
 };
 
+const markdownCell = (input: string): string => input.replace(/\s+/gu, ' ').replaceAll('|', '\\|');
+
 const layerReport = (
   layer: ReplayLayerName,
   passed: boolean,
@@ -1169,6 +1472,630 @@ const layerReport = (
   summary,
   details,
 });
+
+const navigationRecordsForPack = (pack: SessionPack): readonly NavigationRecord[] => {
+  const records: NavigationRecord[] = [];
+  for (const browser of pack.browsers) {
+    let activeWorkstreamId = browser.activeWorkstreamId;
+    for (const event of [...browser.events].sort((left, right) => left.atMs - right.atMs)) {
+      if (event.kind === 'workstreamSwitch') {
+        activeWorkstreamId = event.workstreamId;
+        continue;
+      }
+      if (event.kind === 'navigation') {
+        records.push({ browserLabel: browser.label, event, workstreamId: activeWorkstreamId });
+      }
+    }
+  }
+  return records;
+};
+
+const detoursForNavigationRecords = (
+  navigationRecords: readonly NavigationRecord[],
+): readonly DetourFinding[] => {
+  const byCanonical = new Map<string, DetourFinding>();
+  for (const record of navigationRecords) {
+    const finding = classifyDetour({
+      url: record.event.canonicalUrl,
+      title: record.event.title,
+    });
+    if (finding !== null && !byCanonical.has(finding.canonicalUrl)) {
+      byCanonical.set(finding.canonicalUrl, finding);
+    }
+  }
+  return [...byCanonical.values()].sort((left, right) =>
+    left.canonicalUrl.localeCompare(right.canonicalUrl),
+  );
+};
+
+const buildDetourAssertions = (input: {
+  readonly pack: SessionPack;
+  readonly connections: ConnectionsEnvelope;
+  readonly navigationRecords: readonly NavigationRecord[];
+  readonly detours: readonly DetourFinding[];
+}): readonly DetourAssertion[] => {
+  const topicPolluters = input.detours.filter((detour) =>
+    isTopicSource(visitNodeId(detour.canonicalUrl), input.connections),
+  );
+  const strongSimilarityAnchors = input.detours.filter((detour) =>
+    isStrongSimilarityAnchor(visitNodeId(detour.canonicalUrl), input.connections),
+  );
+  const detourCanonicals = new Set(input.detours.map((detour) => detour.canonicalUrl));
+  const canonicalReplacementFailures = input.navigationRecords.filter((record) => {
+    const canonicalUrl = stripTrailingSlash(record.event.canonicalUrl);
+    if (!detourCanonicals.has(canonicalUrl)) return false;
+    return !input.navigationRecords.some(
+      (candidate) =>
+        candidate.browserLabel === record.browserLabel &&
+        candidate.event.tabIdHash === record.event.tabIdHash &&
+        stripTrailingSlash(candidate.event.canonicalUrl) !== canonicalUrl &&
+        !detourCanonicals.has(stripTrailingSlash(candidate.event.canonicalUrl)),
+    );
+  });
+  return [
+    detourAssertion(
+      'detour-topic-pollution',
+      topicPolluters.length === 0,
+      'Detours did not become topic sources.',
+      topicPolluters.map((detour) => `${detour.kind} polluted topics: ${detour.canonicalUrl}`),
+    ),
+    detourAssertion(
+      'detour-strong-similarity-anchor',
+      strongSimilarityAnchors.length === 0,
+      'Detours did not become strong similarity anchors.',
+      strongSimilarityAnchors.map(
+        (detour) => `${detour.kind} was a strong similarity anchor: ${detour.canonicalUrl}`,
+      ),
+    ),
+    detourAssertion(
+      'detour-canonical-preserved',
+      canonicalReplacementFailures.length === 0,
+      'Original target canonical URLs were preserved alongside detours.',
+      canonicalReplacementFailures.map(
+        (record) =>
+          `detour replaced the only recorded target in tab ${record.event.tabIdHash}: ${record.event.canonicalUrl}`,
+      ),
+    ),
+    detourAssertion(
+      'detour-listed-in-report',
+      true,
+      `${String(input.detours.length)} observed detour(s) listed in the report.`,
+      [],
+    ),
+  ];
+};
+
+const detourAssertion = (
+  kind: DetourAssertionKind,
+  passed: boolean,
+  summary: string,
+  details: readonly string[],
+): DetourAssertion => ({ kind, status: passed ? 'pass' : 'fail', summary, details });
+
+const buildQualitativeWarnings = (input: {
+  readonly pack: SessionPack;
+  readonly connections: ConnectionsEnvelope;
+  readonly navigationRecords: readonly NavigationRecord[];
+  readonly detours: readonly DetourFinding[];
+}): readonly QualitativeWarning[] => {
+  const warnings: QualitativeWarning[] = [];
+  const longIdle = longIdleWarning(input.navigationRecords);
+  if (longIdle !== null) warnings.push(longIdle);
+  const topicDetours = input.detours.filter((detour) =>
+    isTopicSource(visitNodeId(detour.canonicalUrl), input.connections),
+  );
+  if (topicDetours.length > 0) {
+    warnings.push({
+      kind: 'detour-became-topic-source',
+      message: 'A Cloudflare/login/detour page became a topic source.',
+      canonicalUrls: topicDetours.map((detour) => detour.canonicalUrl),
+    });
+  }
+  const hasClipboard = input.pack.browsers.some((browser) =>
+    browser.events.some((event) => event.kind === 'copy' || event.kind === 'paste'),
+  );
+  if (hasClipboard && !hasDispatchOrCodingEdge(input.pack, input.connections)) {
+    warnings.push({
+      kind: 'copy-paste-without-dispatch',
+      message: 'Copy/paste was observed without a following dispatch or coding-session edge.',
+      canonicalUrls: [],
+    });
+  }
+  const ambientAttached = input.navigationRecords.filter((record) => {
+    if (!isAmbientVisit(record.event)) return false;
+    return graphWorkstreamForNavigation(record, input.connections) !== null;
+  });
+  if (ambientAttached.length > 0) {
+    warnings.push({
+      kind: 'ambient-page-attached-to-wrong-workstream',
+      message: 'An ambient page was attached to a focused workstream.',
+      canonicalUrls: uniqueSorted(ambientAttached.map((record) => record.event.canonicalUrl)),
+    });
+  }
+  const duplicateCanonicals = duplicateCanonicalUrls(input.navigationRecords);
+  if (duplicateCanonicals.length > 0) {
+    warnings.push({
+      kind: 'duplicate-canonical-visit-nodes',
+      message: 'A single canonical URL produced multiple visit records.',
+      canonicalUrls: duplicateCanonicals,
+    });
+  }
+  const missingLineage = missingTabLineageCanonicals(input.navigationRecords, input.connections);
+  if (missingLineage.length > 0) {
+    warnings.push({
+      kind: 'expected-tab-lineage-missing',
+      message: 'Expected same-tab or opener lineage was missing from Connections.',
+      canonicalUrls: missingLineage,
+    });
+  }
+  return warnings;
+};
+
+const buildGraphQualityScores = (input: {
+  readonly pack: SessionPack;
+  readonly timeline: TimelineEnvelope;
+  readonly connections: ConnectionsEnvelope;
+  readonly navigationRecords: readonly NavigationRecord[];
+  readonly detours: readonly DetourFinding[];
+}): GraphQualityScores => ({
+  'topic-purity': topicPurityScore(input.navigationRecords, input.detours, input.connections),
+  'ambient-containment': ambientContainmentScore(input.navigationRecords, input.connections),
+  'causal-coherence': causalCoherenceScore(input.pack, input.connections),
+  'search-result-chat-continuity': searchResultChatContinuityScore(
+    input.navigationRecords,
+    input.connections,
+  ),
+  'false-similarity-rate': falseSimilarityRateScore(input.connections),
+  'ranking-plausibility': rankingPlausibilityScore(input.connections),
+});
+
+const topicPurityScore = (
+  navigationRecords: readonly NavigationRecord[],
+  detours: readonly DetourFinding[],
+  connections: ConnectionsEnvelope,
+): GraphQualityScore => {
+  const detourCanonicals = new Set(detours.map((detour) => detour.canonicalUrl));
+  const topicRecords = navigationRecords.filter(
+    (record) => graphWorkstreamForNavigation(record, connections) !== null,
+  );
+  if (topicRecords.length === 0) {
+    return graphScore(1, 'No workstream topic pages were present.');
+  }
+  const clean = topicRecords.filter((record) => {
+    const canonicalUrl = stripTrailingSlash(record.event.canonicalUrl);
+    return !detourCanonicals.has(canonicalUrl) && !isAmbientVisit(record.event);
+  });
+  return graphScore(
+    clean.length / topicRecords.length,
+    `${String(clean.length)} of ${String(topicRecords.length)} workstream-assigned page(s) were non-detour and non-ambient.`,
+  );
+};
+
+const ambientContainmentScore = (
+  navigationRecords: readonly NavigationRecord[],
+  connections: ConnectionsEnvelope,
+): GraphQualityScore => {
+  const ambient = navigationRecords.filter((record) => isAmbientVisit(record.event));
+  if (ambient.length === 0) {
+    return graphScore(1, 'No ambient pages were recorded.');
+  }
+  const contained = ambient.filter(
+    (record) => graphWorkstreamForNavigation(record, connections) === null,
+  );
+  return graphScore(
+    contained.length / ambient.length,
+    `${String(contained.length)} of ${String(ambient.length)} ambient page(s) were kept out of focused workstreams.`,
+  );
+};
+
+const causalCoherenceScore = (
+  pack: SessionPack,
+  connections: ConnectionsEnvelope,
+): GraphQualityScore => {
+  const pairs = clipboardPairs(pack);
+  if (pairs.length === 0) {
+    return graphScore(1, 'No copy/paste pairs were recorded.');
+  }
+  const coherent = pairs.filter((pair) => {
+    const source = nearestNavigationForClipboard(pack, pair.copy);
+    const destination = nearestNavigationForClipboard(pack, pair.paste);
+    if (source === null || destination === null) return false;
+    return hasCausalVisitConnection(
+      visitNodeId(source.event.canonicalUrl),
+      visitNodeId(destination.event.canonicalUrl),
+      connections,
+    );
+  });
+  return graphScore(
+    coherent.length / pairs.length,
+    `${String(coherent.length)} of ${String(pairs.length)} copy/paste pair(s) had a causal graph connection.`,
+  );
+};
+
+const searchResultChatContinuityScore = (
+  navigationRecords: readonly NavigationRecord[],
+  connections: ConnectionsEnvelope,
+): GraphQualityScore => {
+  const triples = searchResultChatTriples(navigationRecords);
+  if (triples.length === 0) {
+    return graphScore(1, 'No search-result-chat triples were recorded.');
+  }
+  const connected = triples.filter(
+    (triple) =>
+      graphHasPath(
+        visitNodeId(triple.search.event.canonicalUrl),
+        visitNodeId(triple.result.event.canonicalUrl),
+        connections,
+      ) &&
+      graphHasPath(
+        visitNodeId(triple.result.event.canonicalUrl),
+        visitNodeId(triple.chat.event.canonicalUrl),
+        connections,
+      ),
+  );
+  return graphScore(
+    connected.length / triples.length,
+    `${String(connected.length)} of ${String(triples.length)} search-result-chat triple(s) stayed connected.`,
+  );
+};
+
+const falseSimilarityRateScore = (connections: ConnectionsEnvelope): GraphQualityScore => {
+  const similarityEdges = connections.data.snapshot.edges.filter(
+    (edge) => isSimilarityEdgeKind(edge.kind) && edgeScore(edge) >= 0.7,
+  );
+  if (similarityEdges.length === 0) {
+    return graphScore(0, 'No similarity edges were present.', true);
+  }
+  const falseEdges = similarityEdges.filter((edge) => {
+    const left = workstreamForNode(edge.fromNodeId, connections);
+    const right = workstreamForNode(edge.toNodeId, connections);
+    return left !== null && right !== null && left !== right;
+  });
+  const rate = falseEdges.length / similarityEdges.length;
+  return graphScore(
+    rate,
+    `${String(falseEdges.length)} of ${String(similarityEdges.length)} strong similarity edge(s) crossed workstreams.`,
+    true,
+  );
+};
+
+const rankingPlausibilityScore = (connections: ConnectionsEnvelope): GraphQualityScore => {
+  const rankerEdges = connections.data.snapshot.edges.filter(
+    (edge) => edge.kind === 'closest_visit',
+  );
+  if (rankerEdges.length === 0) {
+    return graphScore(1, 'No closest_visit ranker edges were present.');
+  }
+  const plausible = rankerEdges.filter((edge) => {
+    const left = workstreamForNode(edge.fromNodeId, connections);
+    const right = workstreamForNode(edge.toNodeId, connections);
+    return left !== null && right !== null && left === right;
+  });
+  return graphScore(
+    plausible.length / rankerEdges.length,
+    `${String(plausible.length)} of ${String(rankerEdges.length)} ranker candidate(s) shared a workstream with the anchor.`,
+  );
+};
+
+const graphScore = (raw: number, rationale: string, lowerIsBetter = false): GraphQualityScore => {
+  const score = Math.max(0, Math.min(1, Number(raw.toFixed(4))));
+  return { score, color: scoreColor(score, lowerIsBetter), rationale };
+};
+
+const scoreColor = (score: number, lowerIsBetter: boolean): ScoreColor => {
+  if (lowerIsBetter) {
+    if (score <= 0.1) return 'green';
+    if (score <= 0.25) return 'yellow';
+    return 'red';
+  }
+  if (score >= 0.85) return 'green';
+  if (score >= 0.65) return 'yellow';
+  return 'red';
+};
+
+const longIdleWarning = (
+  navigationRecords: readonly NavigationRecord[],
+): QualitativeWarning | null => {
+  const sorted = [...navigationRecords].sort((left, right) => left.event.atMs - right.event.atMs);
+  for (let index = 1; index < sorted.length; index += 1) {
+    const current = sorted[index];
+    const previous = sorted[index - 1];
+    if (current.event.atMs - previous.event.atMs < 30 * 60 * 1000) continue;
+    const workstreamId = current.workstreamId;
+    if (workstreamId === null) continue;
+    const afterIdle = sorted
+      .slice(index)
+      .filter((record) => record.workstreamId === workstreamId)
+      .slice(0, 3);
+    if (afterIdle.length >= 3) {
+      return {
+        kind: 'many-pages-same-workstream-after-long-idle',
+        message: 'Many pages were assigned to the same workstream after a long idle gap.',
+        canonicalUrls: afterIdle.map((record) => record.event.canonicalUrl),
+      };
+    }
+  }
+  return null;
+};
+
+const hasDispatchOrCodingEdge = (pack: SessionPack, connections: ConnectionsEnvelope): boolean => {
+  if (
+    pack.browsers.some((browser) =>
+      browser.events.some((event) => event.kind === 'dispatch' || event.kind === 'feedback'),
+    )
+  ) {
+    return true;
+  }
+  return connections.data.snapshot.edges.some(
+    (edge) =>
+      edge.kind.includes('dispatch') ||
+      edge.kind.includes('coding_session') ||
+      edge.kind.includes('snippet'),
+  );
+};
+
+const duplicateCanonicalUrls = (
+  navigationRecords: readonly NavigationRecord[],
+): readonly string[] => {
+  const counts = new Map<string, Set<string>>();
+  for (const record of navigationRecords) {
+    const canonicalUrl = stripTrailingSlash(record.event.canonicalUrl);
+    const tabIds = counts.get(canonicalUrl) ?? new Set<string>();
+    tabIds.add(record.event.tabIdHash);
+    counts.set(canonicalUrl, tabIds);
+  }
+  return [...counts.entries()]
+    .filter(([, tabIds]) => tabIds.size > 1)
+    .map(([canonicalUrl]) => canonicalUrl)
+    .sort();
+};
+
+const missingTabLineageCanonicals = (
+  navigationRecords: readonly NavigationRecord[],
+  connections: ConnectionsEnvelope,
+): readonly string[] => {
+  const missing: string[] = [];
+  const byBrowserTab = new Map<string, NavigationRecord[]>();
+  for (const record of navigationRecords) {
+    const key = `${record.browserLabel}:${record.event.tabIdHash}`;
+    const records = byBrowserTab.get(key) ?? [];
+    records.push(record);
+    byBrowserTab.set(key, records);
+  }
+  for (const records of byBrowserTab.values()) {
+    const sorted = [...records].sort((left, right) => left.event.atMs - right.event.atMs);
+    for (let index = 1; index < sorted.length; index += 1) {
+      const previous = sorted[index - 1];
+      const current = sorted[index];
+      if (
+        !hasEdgeBetween(
+          visitNodeId(previous.event.canonicalUrl),
+          visitNodeId(current.event.canonicalUrl),
+          connections,
+          ['previous_visit_in_tab_session', 'same_tab_navigation', 'opener_visit'],
+        )
+      ) {
+        missing.push(current.event.canonicalUrl);
+      }
+    }
+  }
+  return uniqueSorted(missing);
+};
+
+const clipboardPairs = (pack: SessionPack): readonly ClipboardPair[] => {
+  const copies: ClipboardEventRecord[] = [];
+  const pastes: ClipboardEventRecord[] = [];
+  for (const browser of pack.browsers) {
+    for (const event of browser.events) {
+      if (event.kind === 'copy') copies.push({ browserLabel: browser.label, event });
+      if (event.kind === 'paste') pastes.push({ browserLabel: browser.label, event });
+    }
+  }
+  const pairs: ClipboardPair[] = [];
+  for (const copy of copies) {
+    const paste = pastes.find(
+      (candidate) =>
+        candidate.event.contentHash === copy.event.contentHash &&
+        candidate.event.atMs >= copy.event.atMs,
+    );
+    if (paste !== undefined) pairs.push({ copy, paste });
+  }
+  return pairs;
+};
+
+const nearestNavigationForClipboard = (
+  pack: SessionPack,
+  clipboard: {
+    readonly browserLabel: BrowserLabel;
+    readonly event: Extract<SessionEvent, { readonly kind: 'copy' | 'paste' }>;
+  },
+): NavigationRecord | null => {
+  const records = navigationRecordsForPack(pack).filter(
+    (record) =>
+      record.browserLabel === clipboard.browserLabel &&
+      record.event.tabIdHash === clipboard.event.tabIdHash &&
+      record.event.atMs <= clipboard.event.atMs,
+  );
+  return records.sort((left, right) => right.event.atMs - left.event.atMs)[0] ?? null;
+};
+
+const searchResultChatTriples = (
+  navigationRecords: readonly NavigationRecord[],
+): readonly {
+  readonly search: NavigationRecord;
+  readonly result: NavigationRecord;
+  readonly chat: NavigationRecord;
+}[] => {
+  const sorted = [...navigationRecords].sort((left, right) => left.event.atMs - right.event.atMs);
+  const triples: { search: NavigationRecord; result: NavigationRecord; chat: NavigationRecord }[] =
+    [];
+  for (const search of sorted.filter((record) => isSearchVisit(record.event))) {
+    const result = sorted.find(
+      (candidate) =>
+        candidate.event.atMs > search.event.atMs &&
+        candidate.workstreamId === search.workstreamId &&
+        !isSearchVisit(candidate.event) &&
+        !isChatVisit(candidate.event),
+    );
+    if (result === undefined) continue;
+    const chat = sorted.find(
+      (candidate) =>
+        candidate.event.atMs > result.event.atMs &&
+        candidate.workstreamId === search.workstreamId &&
+        isChatVisit(candidate.event),
+    );
+    if (chat !== undefined) triples.push({ search, result, chat });
+  }
+  return triples;
+};
+
+const isTopicSource = (nodeId: string, connections: ConnectionsEnvelope): boolean => {
+  const node = connections.data.snapshot.nodes.find((candidate) => candidate.id === nodeId);
+  if (node?.metadata?.['topicSource'] === true) return true;
+  return connections.data.snapshot.edges.some(
+    (edge) =>
+      edge.kind.includes('topic') && (edge.fromNodeId === nodeId || edge.toNodeId === nodeId),
+  );
+};
+
+const isStrongSimilarityAnchor = (nodeId: string, connections: ConnectionsEnvelope): boolean =>
+  connections.data.snapshot.edges.some(
+    (edge) =>
+      isSimilarityEdgeKind(edge.kind) &&
+      (edge.fromNodeId === nodeId || edge.toNodeId === nodeId) &&
+      edgeScore(edge) >= 0.7,
+  );
+
+const hasCausalVisitConnection = (
+  leftNodeId: string,
+  rightNodeId: string,
+  connections: ConnectionsEnvelope,
+): boolean =>
+  hasEdgeBetween(leftNodeId, rightNodeId, connections, [
+    'previous_visit_in_tab_session',
+    'same_tab_navigation',
+    'opener_visit',
+    'visit_continues_visit',
+    'snippet_copied_from_visit',
+    'snippet_pasted_into_thread',
+    'dispatch_in_workstream',
+    'dispatch_requested_coding_session',
+    'coding_session_in_workstream',
+  ]) || graphHasPath(leftNodeId, rightNodeId, connections);
+
+const graphHasPath = (
+  fromNodeId: string,
+  toNodeId: string,
+  connections: ConnectionsEnvelope,
+): boolean => {
+  if (fromNodeId === toNodeId) return true;
+  const adjacency = new Map<string, Set<string>>();
+  for (const edge of connections.data.snapshot.edges) {
+    const from = adjacency.get(edge.fromNodeId) ?? new Set<string>();
+    from.add(edge.toNodeId);
+    adjacency.set(edge.fromNodeId, from);
+    const to = adjacency.get(edge.toNodeId) ?? new Set<string>();
+    to.add(edge.fromNodeId);
+    adjacency.set(edge.toNodeId, to);
+  }
+  const visited = new Set<string>([fromNodeId]);
+  const queue = [fromNodeId];
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (current === undefined) break;
+    for (const next of adjacency.get(current) ?? []) {
+      if (next === toNodeId) return true;
+      if (visited.has(next)) continue;
+      visited.add(next);
+      queue.push(next);
+    }
+  }
+  return false;
+};
+
+const hasEdgeBetween = (
+  leftNodeId: string,
+  rightNodeId: string,
+  connections: ConnectionsEnvelope,
+  kinds: readonly string[],
+): boolean =>
+  connections.data.snapshot.edges.some(
+    (edge) =>
+      kinds.includes(edge.kind) &&
+      ((edge.fromNodeId === leftNodeId && edge.toNodeId === rightNodeId) ||
+        (edge.fromNodeId === rightNodeId && edge.toNodeId === leftNodeId)),
+  );
+
+const graphWorkstreamForNavigation = (
+  record: NavigationRecord,
+  connections: ConnectionsEnvelope,
+): string | null => workstreamForNode(visitNodeId(record.event.canonicalUrl), connections);
+
+const workstreamForNode = (nodeId: string, connections: ConnectionsEnvelope): string | null => {
+  const node = connections.data.snapshot.nodes.find((candidate) => candidate.id === nodeId);
+  const metadataWorkstreamId = node?.metadata?.['workstreamId'];
+  if (typeof metadataWorkstreamId === 'string' && metadataWorkstreamId.length > 0) {
+    return metadataWorkstreamId;
+  }
+  const edge = connections.data.snapshot.edges.find(
+    (candidate) =>
+      candidate.kind === 'visit_in_workstream' &&
+      candidate.fromNodeId === nodeId &&
+      candidate.toNodeId.startsWith('workstream:'),
+  );
+  return edge === undefined ? null : edge.toNodeId.replace(/^workstream:/u, '');
+};
+
+const isSimilarityEdgeKind = (kind: string): boolean =>
+  kind === 'visit_resembles_visit' || kind === 'closest_visit';
+
+const edgeScore = (edge: ConnectionsEnvelope['data']['snapshot']['edges'][number]): number => {
+  const metadataScore = edge.metadata?.['score'];
+  if (typeof metadataScore === 'number') return metadataScore;
+  const metadataClosest = edge.metadata?.['closest_visit'];
+  if (typeof metadataClosest === 'number') return metadataClosest;
+  return edge.kind === 'closest_visit' || edge.kind === 'visit_resembles_visit' ? 1 : 0;
+};
+
+const isAmbientVisit = (event: Extract<SessionEvent, { readonly kind: 'navigation' }>): boolean => {
+  const haystack = `${event.canonicalUrl} ${event.title}`.toLowerCase();
+  return (
+    haystack.includes('youtube.com') ||
+    haystack.includes('youtu.be') ||
+    haystack.includes('spotify.com') ||
+    haystack.includes('music') ||
+    haystack.includes('soundcloud.com') ||
+    haystack.includes('netflix.com') ||
+    haystack.includes('twitch.tv')
+  );
+};
+
+const isSearchVisit = (event: Extract<SessionEvent, { readonly kind: 'navigation' }>): boolean => {
+  const haystack = `${event.canonicalUrl} ${event.title}`.toLowerCase();
+  return (
+    haystack.includes('google.com/search') ||
+    haystack.includes('bing.com/search') ||
+    haystack.includes('duckduckgo.com') ||
+    haystack.includes('search?q=') ||
+    haystack.includes(' search ')
+  );
+};
+
+const isChatVisit = (event: Extract<SessionEvent, { readonly kind: 'navigation' }>): boolean => {
+  const haystack = `${event.canonicalUrl} ${event.title}`.toLowerCase();
+  return (
+    haystack.includes('chatgpt.com') ||
+    haystack.includes('claude.ai') ||
+    haystack.includes('gemini.google.com') ||
+    haystack.includes('coding agent') ||
+    haystack.includes('chat thread')
+  );
+};
+
+const visitNodeId = (canonicalUrl: string): string =>
+  `timeline-visit:${stripTrailingSlash(canonicalUrl)}`;
+
+const uniqueSorted = (values: readonly string[]): readonly string[] => [...new Set(values)].sort();
 
 const expectedCanonicalUrls = (pack: SessionPack): readonly string[] => {
   const base = pack.expectations?.expectedCanonicalUrls ?? recordedCanonicalUrls(pack);
@@ -1293,10 +2220,16 @@ const parseConnectionsEnvelope = (value: unknown): ConnectionsEnvelope => {
         }),
         edges: edgeValues.map((edgeValue) => {
           const edge = readRecord(edgeValue, 'connection edge');
+          const confidence = optionalString(edge, 'confidence');
+          const producedBy = isRecord(edge['producedBy']) ? edge['producedBy'] : undefined;
+          const metadata = isRecord(edge['metadata']) ? edge['metadata'] : undefined;
           return {
             kind: readString(edge, 'kind'),
             fromNodeId: readString(edge, 'fromNodeId'),
             toNodeId: readString(edge, 'toNodeId'),
+            ...(confidence === undefined ? {} : { confidence }),
+            ...(producedBy === undefined ? {} : { producedBy }),
+            ...(metadata === undefined ? {} : { metadata }),
           };
         }),
       },
