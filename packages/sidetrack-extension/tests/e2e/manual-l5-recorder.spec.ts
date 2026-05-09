@@ -8,16 +8,17 @@
 //   1. first Enter: stop recording, drain Sidetrack, write artifacts
 //   2. second Enter: close browsers and companion processes
 
-import { createHash, randomUUID } from 'node:crypto';
-import { appendFile, mkdir, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, mkdtemp, readdir, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { expect, test, type BrowserContext, type Frame, type Page } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 
 import { generateRendezvousSecret } from '../../../sidetrack-companion/src/sync/relayCrypto';
 import { startTestCompanion, type TestCompanion } from './helpers/companion';
+import { ManualRecorder } from './helpers/manualRecorder';
 import { startTestRelay, type TestRelay } from './helpers/relay';
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
 import { SETTINGS_KEY, SETUP_KEY } from './helpers/sidepanel';
@@ -29,16 +30,6 @@ interface VisitLink {
   readonly title: string;
   readonly url: string;
   readonly note: string;
-}
-
-interface ManualEvent {
-  readonly at: string;
-  readonly kind: string;
-  readonly pageId?: string;
-  readonly frameUrl?: string;
-  readonly pageUrl?: string;
-  readonly title?: string;
-  readonly payload?: Record<string, unknown>;
 }
 
 interface ConnectionsEnvelope {
@@ -57,12 +48,6 @@ interface ConnectionsEnvelope {
       }[];
     };
   };
-}
-
-interface BindingSourceLike {
-  readonly context: BrowserContext;
-  readonly page: Page;
-  readonly frame: Frame;
 }
 
 const packageRoot = path.resolve(fileURLToPath(new URL('../../../', import.meta.url)));
@@ -152,30 +137,17 @@ const expandTilde = (input: string): string =>
 
 const isoStamp = (): string => new Date().toISOString().replace(/[:.]/gu, '-');
 
-const excerpt = (input: unknown, max = 240): string | undefined => {
-  if (typeof input !== 'string') return undefined;
-  const normalized = input.replace(/\s+/gu, ' ').trim();
-  if (normalized.length === 0) return undefined;
-  return normalized.length > max ? `${normalized.slice(0, max)}...` : normalized;
-};
-
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
-
-const safeName = (input: string): string => {
-  const cleaned = input
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/gu, '-')
-    .replace(/^-+|-+$/gu, '');
-  return cleaned.length === 0 ? 'page' : cleaned.slice(0, 72);
-};
 
 const waitForEnter = async (label: string): Promise<void> => {
   // eslint-disable-next-line no-console
   console.log(label);
   process.stdin.resume();
   await new Promise<void>((resolve) => {
-    process.stdin.once('data', () => resolve());
+    process.stdin.once('data', () => {
+      resolve();
+    });
   });
 };
 
@@ -188,14 +160,18 @@ const withTimeout = async <T>(
     task,
     new Promise<{ readonly timeout: true; readonly label: string; readonly timeoutMs: number }>(
       (resolve) => {
-        setTimeout(() => resolve({ timeout: true, label, timeoutMs }), timeoutMs);
+        setTimeout(() => {
+          resolve({ timeout: true, label, timeoutMs });
+        }, timeoutMs);
       },
     ),
   ]);
 
 const apiGet = async (comp: TestCompanion, requestPath: string): Promise<unknown> => {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10_000);
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, 10_000);
   try {
     const res = await fetch(`http://127.0.0.1:${String(comp.port)}${requestPath}`, {
       headers: { 'x-bac-bridge-key': comp.bridgeKey },
@@ -215,7 +191,9 @@ const apiPost = async (
   body: unknown,
 ): Promise<unknown> => {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10_000);
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, 10_000);
   try {
     const res = await fetch(`http://127.0.0.1:${String(comp.port)}${requestPath}`, {
       method: 'POST',
@@ -399,388 +377,6 @@ const createLaunchpad = async (
   return `file://${launchpadPath}`;
 };
 
-class ManualRecorder {
-  private readonly context: BrowserContext;
-  private readonly artifactsDir: string;
-  private readonly eventsPath: string;
-  private readonly pagesDir: string;
-  private readonly pageIds = new WeakMap<Page, string>();
-  private readonly snapshotTimers = new WeakMap<Page, NodeJS.Timeout>();
-  private nextPageId = 1;
-
-  constructor(context: BrowserContext, artifactsDir: string) {
-    this.context = context;
-    this.artifactsDir = artifactsDir;
-    this.eventsPath = path.join(artifactsDir, 'events.jsonl');
-    this.pagesDir = path.join(artifactsDir, 'pages');
-  }
-
-  async install(): Promise<void> {
-    await mkdir(this.pagesDir, { recursive: true });
-    await this.context.exposeBinding(
-      'sidetrackManualEvent',
-      async (source: BindingSourceLike, payload: unknown) => {
-        const normalized = isRecord(payload) ? payload : { value: payload };
-        await this.record({
-          kind: typeof normalized['kind'] === 'string' ? normalized['kind'] : 'browser-event',
-          pageId: this.pageId(source.page),
-          frameUrl: source.frame.url(),
-          pageUrl: source.page.url(),
-          title: await source.page.title().catch(() => undefined),
-          payload: normalized,
-        });
-        const eventKind = typeof normalized['kind'] === 'string' ? normalized['kind'] : '';
-        if (
-          eventKind === 'click' ||
-          eventKind === 'auxclick' ||
-          eventKind === 'paste' ||
-          eventKind === 'copy' ||
-          eventKind === 'input'
-        ) {
-          this.scheduleSnapshot(source.page, eventKind);
-        }
-      },
-    );
-    await this.context.addInitScript(() => {
-      type ManualWindow = Window & {
-        sidetrackManualEvent?: (payload: Record<string, unknown>) => Promise<void>;
-      };
-      const win = window as ManualWindow;
-      const normalize = (value: string | null | undefined, max = 240): string | undefined => {
-        const text = value?.replace(/\s+/gu, ' ').trim();
-        if (text === undefined || text.length === 0) return undefined;
-        return text.length > max ? `${text.slice(0, max)}...` : text;
-      };
-      const cssPath = (element: Element): string => {
-        const parts: string[] = [];
-        let current: Element | null = element;
-        while (current !== null && parts.length < 5) {
-          const tag = current.tagName.toLowerCase();
-          const id = current.id.length > 0 ? `#${current.id}` : '';
-          const cls =
-            current.classList.length > 0
-              ? `.${Array.from(current.classList).slice(0, 3).join('.')}`
-              : '';
-          parts.unshift(`${tag}${id}${cls}`);
-          current = current.parentElement;
-        }
-        return parts.join(' > ');
-      };
-      const describeTarget = (target: EventTarget | null): Record<string, unknown> => {
-        if (!(target instanceof Element)) return {};
-        const input = target instanceof HTMLInputElement ? target : null;
-        const editable = target.closest('[contenteditable="true"]');
-        const anchor = target.closest('a[href]');
-        return {
-          tagName: target.tagName.toLowerCase(),
-          selector: cssPath(target),
-          role: target.getAttribute('role') ?? undefined,
-          ariaLabel: target.getAttribute('aria-label') ?? undefined,
-          href: anchor instanceof HTMLAnchorElement ? anchor.href : undefined,
-          text: normalize(target.textContent),
-          inputType: input?.type,
-          inputName: input?.name,
-          inputPlaceholder: input?.placeholder,
-          editable: editable !== null,
-        };
-      };
-      const post = (payload: Record<string, unknown>): void => {
-        void win
-          .sidetrackManualEvent?.({
-            ...payload,
-            href: window.location.href,
-            documentTitle: document.title,
-            visibilityState: document.visibilityState,
-            scrollX: window.scrollX,
-            scrollY: window.scrollY,
-          })
-          .catch(() => undefined);
-      };
-      window.addEventListener(
-        'click',
-        (event) => {
-          post({
-            kind: 'click',
-            button: event.button,
-            metaKey: event.metaKey,
-            ctrlKey: event.ctrlKey,
-            shiftKey: event.shiftKey,
-            altKey: event.altKey,
-            clientX: event.clientX,
-            clientY: event.clientY,
-            target: describeTarget(event.target),
-          });
-        },
-        true,
-      );
-      window.addEventListener(
-        'auxclick',
-        (event) => {
-          post({
-            kind: 'auxclick',
-            button: event.button,
-            metaKey: event.metaKey,
-            ctrlKey: event.ctrlKey,
-            shiftKey: event.shiftKey,
-            altKey: event.altKey,
-            clientX: event.clientX,
-            clientY: event.clientY,
-            target: describeTarget(event.target),
-          });
-        },
-        true,
-      );
-      window.addEventListener(
-        'copy',
-        () => {
-          post({
-            kind: 'copy',
-            selection: normalize(window.getSelection()?.toString() ?? '', 800),
-          });
-        },
-        true,
-      );
-      window.addEventListener(
-        'paste',
-        (event) => {
-          post({
-            kind: 'paste',
-            text: normalize(event.clipboardData?.getData('text/plain') ?? '', 800),
-            target: describeTarget(event.target),
-          });
-        },
-        true,
-      );
-      window.addEventListener(
-        'input',
-        (event) => {
-          const target = event.target;
-          let value: string | undefined;
-          if (target instanceof HTMLTextAreaElement) value = target.value;
-          if (target instanceof HTMLInputElement && target.type !== 'password')
-            value = target.value;
-          post({
-            kind: 'input',
-            valueLength: value?.length,
-            value: normalize(value, 400),
-            target: describeTarget(target),
-          });
-        },
-        true,
-      );
-      window.addEventListener('focus', () => post({ kind: 'window-focus' }), true);
-      window.addEventListener('blur', () => post({ kind: 'window-blur' }), true);
-      document.addEventListener('visibilitychange', () =>
-        post({ kind: 'visibilitychange', state: document.visibilityState }),
-      );
-      let scrollTimer: number | undefined;
-      window.addEventListener(
-        'scroll',
-        () => {
-          if (scrollTimer !== undefined) window.clearTimeout(scrollTimer);
-          scrollTimer = window.setTimeout(() => post({ kind: 'scroll' }), 350);
-        },
-        { passive: true, capture: true },
-      );
-      if (typeof chrome !== 'undefined' && chrome.storage?.onChanged !== undefined) {
-        chrome.storage.onChanged.addListener((changes) => {
-          const keys = Object.keys(changes).filter((key) => key.startsWith('sidetrack'));
-          if (keys.length === 0) return;
-          post({
-            kind: 'sidetrack-storage-changed',
-            keys,
-            activeWorkstreamId:
-              changes['sidetrack.activeWorkstreamId']?.newValue ??
-              changes['sidetrack.activeWorkstreamId']?.oldValue,
-          });
-        });
-      }
-    });
-    this.context.on('page', (page) => this.attachPage(page));
-    for (const page of this.context.pages()) this.attachPage(page);
-  }
-
-  private pageId(page: Page): string {
-    const existing = this.pageIds.get(page);
-    if (existing !== undefined) return existing;
-    const id = `p${String(this.nextPageId).padStart(2, '0')}`;
-    this.nextPageId += 1;
-    this.pageIds.set(page, id);
-    return id;
-  }
-
-  private attachPage(page: Page): void {
-    const pageId = this.pageId(page);
-    void this.record({ kind: 'page-opened', pageId, pageUrl: page.url() });
-    page.on('framenavigated', (frame) => {
-      if (frame !== page.mainFrame()) return;
-      void this.record({
-        kind: 'navigation',
-        pageId,
-        pageUrl: frame.url(),
-        title: undefined,
-        payload: { url: frame.url() },
-      });
-      this.scheduleSnapshot(page, 'navigation');
-    });
-    page.on('domcontentloaded', () => {
-      void this.record({
-        kind: 'domcontentloaded',
-        pageId,
-        pageUrl: page.url(),
-      });
-      this.scheduleSnapshot(page, 'domcontentloaded');
-    });
-    page.on('popup', (popup) => {
-      void this.record({
-        kind: 'popup-opened',
-        pageId,
-        pageUrl: page.url(),
-        payload: { popupPageId: this.pageId(popup), popupUrl: popup.url() },
-      });
-    });
-    page.on('close', () => {
-      void this.record({ kind: 'page-closed', pageId, pageUrl: page.url() });
-    });
-    page.on('console', (message) => {
-      void this.record({
-        kind: 'console',
-        pageId,
-        pageUrl: page.url(),
-        payload: {
-          type: message.type(),
-          text: excerpt(message.text(), 800),
-          location: message.location(),
-        },
-      });
-    });
-  }
-
-  private scheduleSnapshot(page: Page, reason: string): void {
-    const existing = this.snapshotTimers.get(page);
-    if (existing !== undefined) clearTimeout(existing);
-    const timer = setTimeout(() => {
-      void this.snapshotPage(page, reason).catch((error: unknown) => {
-        void this.record({
-          kind: 'snapshot-failed',
-          pageId: this.pageId(page),
-          pageUrl: page.url(),
-          payload: { reason, error: error instanceof Error ? error.message : String(error) },
-        });
-      });
-    }, 750);
-    this.snapshotTimers.set(page, timer);
-  }
-
-  async record(event: Omit<ManualEvent, 'at'>): Promise<void> {
-    const withTime: ManualEvent = { at: new Date().toISOString(), ...event };
-    await appendFile(this.eventsPath, `${JSON.stringify(withTime)}\n`, 'utf8');
-  }
-
-  async snapshotPage(page: Page, reason: string): Promise<void> {
-    if (page.isClosed()) return;
-    const pageId = this.pageId(page);
-    const url = page.url();
-    if (url === 'about:blank') return;
-    const title = await page.title().catch(() => '');
-    const urlHash = createHash('sha256').update(url).digest('hex').slice(0, 10);
-    const base = `${Date.now()}-${pageId}-${safeName(title || new URL(url).hostname)}-${reason}-${urlHash}`;
-    const text = await page.evaluate(() => document.body?.innerText ?? '').catch(() => '');
-    const html = await page.content().catch(() => '');
-    const meta = {
-      at: new Date().toISOString(),
-      pageId,
-      reason,
-      url,
-      title,
-      textPath: `pages/${base}.txt`,
-      htmlPath: `pages/${base}.html`,
-      screenshotPath: `pages/${base}.png`,
-    };
-    await writeFile(path.join(this.pagesDir, `${base}.txt`), text.slice(0, 80_000), 'utf8');
-    await writeFile(path.join(this.pagesDir, `${base}.html`), html.slice(0, 240_000), 'utf8');
-    await page
-      .screenshot({ path: path.join(this.pagesDir, `${base}.png`), fullPage: false })
-      .catch(() => undefined);
-    await writeJson(path.join(this.pagesDir, `${base}.json`), meta);
-    await this.record({
-      kind: 'page-snapshot',
-      pageId,
-      pageUrl: url,
-      title,
-      payload: meta,
-    });
-  }
-
-  async snapshotAll(reason: string): Promise<void> {
-    for (const page of this.context.pages()) {
-      await this.snapshotPage(page, reason).catch((error: unknown) =>
-        this.record({
-          kind: 'snapshot-failed',
-          pageId: this.pageId(page),
-          pageUrl: page.url(),
-          payload: { reason, error: error instanceof Error ? error.message : String(error) },
-        }),
-      );
-    }
-  }
-
-  async writeSummary(): Promise<void> {
-    const raw = await readFile(this.eventsPath, 'utf8').catch(() => '');
-    const events = raw
-      .split('\n')
-      .filter((line) => line.trim().length > 0)
-      .map((line) => JSON.parse(line) as ManualEvent);
-    const navigations = events.filter((event) => event.kind === 'navigation');
-    const clicks = events.filter((event) => event.kind === 'click' || event.kind === 'auxclick');
-    const copies = events.filter((event) => event.kind === 'copy');
-    const pastes = events.filter((event) => event.kind === 'paste');
-    const workstreamChanges = events.filter((event) => event.kind === 'sidetrack-storage-changed');
-    const lines = [
-      '# Sidetrack L5 Manual Recorder Summary',
-      '',
-      `Artifacts: ${this.artifactsDir}`,
-      `Events: ${events.length}`,
-      `Navigations: ${navigations.length}`,
-      `Clicks: ${clicks.length}`,
-      `Copies: ${copies.length}`,
-      `Pastes: ${pastes.length}`,
-      `Sidetrack storage changes: ${workstreamChanges.length}`,
-      '',
-      '## Navigations',
-      ...navigations
-        .slice(-80)
-        .map((event) => `- ${event.at} ${event.pageId ?? '?'} ${event.pageUrl ?? ''}`),
-      '',
-      '## Link Clicks',
-      ...clicks.slice(-80).map((event) => {
-        const target = isRecord(event.payload?.['target']) ? event.payload?.['target'] : {};
-        return `- ${event.at} ${event.pageId ?? '?'} ${excerpt(target['text']) ?? ''} ${typeof target['href'] === 'string' ? target['href'] : ''}`;
-      }),
-      '',
-      '## Copy/Paste',
-      ...[...copies, ...pastes].slice(-40).map((event) => {
-        const text = event.kind === 'copy' ? event.payload?.['selection'] : event.payload?.['text'];
-        return `- ${event.at} ${event.kind} ${event.pageId ?? '?'} ${excerpt(text, 400) ?? ''}`;
-      }),
-      '',
-      '## Workstream Storage Changes',
-      ...workstreamChanges
-        .slice(-40)
-        .map(
-          (event) =>
-            `- ${event.at} ${event.pageId ?? '?'} active=${String(event.payload?.['activeWorkstreamId'] ?? '')}`,
-        ),
-      '',
-    ];
-    await writeFile(
-      path.join(this.artifactsDir, 'activity-summary.md'),
-      `${lines.join('\n')}\n`,
-      'utf8',
-    );
-  }
-}
-
 const dumpCompanionState = async (
   artifactsDir: string,
   label: string,
@@ -927,7 +523,7 @@ const waitForConnections = async (
 test.describe('manual L5 full-browser recorder', () => {
   test('records user-driven real-page activity for L5 fixture hardening', async () => {
     test.setTimeout(0);
-    process.env['SIDETRACK_E2E_HEADLESS'] = '0';
+    process.env.SIDETRACK_E2E_HEADLESS = '0';
 
     const profileDir = expandTilde(process.env[PROFILE_ENV] ?? DEFAULT_PROFILE);
     const artifactsDir = path.join(tmpdir(), 'sidetrack-manual-l5', isoStamp());
@@ -985,7 +581,6 @@ test.describe('manual L5 full-browser recorder', () => {
       await reinitializeTimeline(runtimeA, panelA);
       await reinitializeTimeline(runtimeB, panelB);
       await grantDeeperPageAccessIfNeeded(panelA).catch((error: unknown) => {
-        // eslint-disable-next-line no-console
         console.warn(
           `[manual-l5] permission auto-grant did not complete: ${error instanceof Error ? error.message : String(error)}`,
         );
@@ -1080,12 +675,11 @@ dumps, visible screenshots, and companion/plugin result JSON.
       })) as { readonly data?: { readonly bac_id?: unknown; readonly mcpRequest?: unknown } };
       const dispatchId =
         typeof dispatchResponse.data?.bac_id === 'string' ? dispatchResponse.data.bac_id : null;
-      const mcpRequest = isRecord(dispatchResponse.data?.mcpRequest)
-        ? dispatchResponse.data?.mcpRequest
-        : {};
+      const rawMcpRequest = dispatchResponse.data?.mcpRequest;
+      const mcpRequest = isRecord(rawMcpRequest) ? rawMcpRequest : {};
       const codingSessionId =
-        typeof mcpRequest['codingSessionId'] === 'string'
-          ? mcpRequest['codingSessionId']
+        typeof mcpRequest.codingSessionId === 'string'
+          ? mcpRequest.codingSessionId
           : `manual-l5-${randomUUID().replaceAll('-', '').slice(0, 12)}`;
       if (dispatchId !== null) {
         await writeCollectorDemo(companionA.vaultPath, { dispatchId, codingSessionId });
