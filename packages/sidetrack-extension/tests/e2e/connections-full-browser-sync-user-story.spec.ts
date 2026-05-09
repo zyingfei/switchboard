@@ -15,37 +15,37 @@ const CODEX_COLLECTOR_ID = 'sidetrack.codex-cli';
 
 const VISITS = [
   {
-    url: 'https://eval.sidetrack.local/postgres/sidetrack_eval_postgres/merge-a',
+    url: 'http://localhost/sidetrack-eval/postgres/sidetrack_eval_postgres/merge-a',
     title: 'sidetrack_eval_postgres merge concurrency write skew',
     body: 'sidetrack_eval_postgres merge concurrency write skew with row locking notes',
   },
   {
-    url: 'https://eval.sidetrack.local/postgres/sidetrack_eval_postgres/merge-b',
+    url: 'http://localhost/sidetrack-eval/postgres/sidetrack_eval_postgres/merge-b',
     title: 'sidetrack_eval_postgres merge lock ordering diagnostics',
     body: 'sidetrack_eval_postgres lock ordering diagnostics and retry analysis',
   },
   {
-    url: 'https://eval.sidetrack.local/postgres/sidetrack_eval_postgres/merge-c',
+    url: 'http://localhost/sidetrack-eval/postgres/sidetrack_eval_postgres/merge-c',
     title: 'sidetrack_eval_postgres merge retry plan',
     body: 'sidetrack_eval_postgres retry plan for serializable transactions',
   },
   {
-    url: 'https://eval.sidetrack.local/kubernetes/sidetrack_eval_kubernetes/eviction-a',
+    url: 'http://localhost/sidetrack-eval/kubernetes/sidetrack_eval_kubernetes/eviction-a',
     title: 'sidetrack_eval_kubernetes pod eviction pressure',
     body: 'sidetrack_eval_kubernetes pod eviction pressure and scheduler diagnostics',
   },
   {
-    url: 'https://eval.sidetrack.local/kubernetes/sidetrack_eval_kubernetes/eviction-b',
+    url: 'http://localhost/sidetrack-eval/kubernetes/sidetrack_eval_kubernetes/eviction-b',
     title: 'sidetrack_eval_kubernetes pod restart budget',
     body: 'sidetrack_eval_kubernetes restart budget and disruption planning',
   },
   {
-    url: 'https://eval.sidetrack.local/accounting/sidetrack_eval_negative/invoice-aging',
+    url: 'http://localhost/sidetrack-eval/accounting/sidetrack_eval_negative/invoice-aging',
     title: 'sidetrack_eval_negative invoice aging reconciliation',
     body: 'sidetrack_eval_negative invoice aging reconciliation unrelated accounting work',
   },
   {
-    url: 'https://copy.fail/',
+    url: 'http://localhost/sidetrack-copy-fail/',
     title: 'copy.fail ambient clipboard research',
     body: 'Ambient browser visit while the workstream stays focused in Sidetrack.',
   },
@@ -373,22 +373,35 @@ const drainEdgeEvents = async (
   runtime: ExtensionRuntime,
   page: Page,
   expectedAtLeast: number,
+  requiredTypes: Readonly<Record<string, number>> = {},
 ): Promise<void> => {
   let uploaded = 0;
+  const uploadedByType: Record<string, number> = {};
   let latest: unknown = null;
-  for (let attempt = 0; attempt < 40; attempt += 1) {
+  for (let attempt = 0; attempt < 80; attempt += 1) {
     latest = await runtime.sendRuntimeMessage(page, {
       type: 'sidetrack.edge-events.force-drain',
     });
     const result = latest as {
       ok?: boolean;
-      drain?: { uploaded?: number; remaining?: number };
+      drain?: {
+        uploaded?: number;
+        remaining?: number;
+        uploadedByType?: Record<string, number>;
+      };
     } | null;
     uploaded += result?.drain?.uploaded ?? 0;
+    for (const [kind, count] of Object.entries(result?.drain?.uploadedByType ?? {})) {
+      uploadedByType[kind] = (uploadedByType[kind] ?? 0) + count;
+    }
+    const hasRequiredTypes = Object.entries(requiredTypes).every(
+      ([kind, count]) => (uploadedByType[kind] ?? 0) >= count,
+    );
     if (
       result !== null &&
       result.ok === true &&
       uploaded >= expectedAtLeast &&
+      hasRequiredTypes &&
       (result.drain?.remaining ?? 0) === 0
     ) {
       return;
@@ -396,101 +409,8 @@ const drainEdgeEvents = async (
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   throw new Error(
-    `edge-event force drain uploaded ${String(uploaded)} events, wanted ${String(expectedAtLeast)}: ${JSON.stringify(latest)}`,
+    `edge-event force drain uploaded ${String(uploaded)} events (${JSON.stringify(uploadedByType)}), wanted ${String(expectedAtLeast)} and types ${JSON.stringify(requiredTypes)}: ${JSON.stringify(latest)}`,
   );
-};
-
-const engagementTotals = (input: {
-  readonly copyCount?: number;
-  readonly pasteCount?: number;
-}): Record<string, number> => ({
-  activeMs: 6_500,
-  visibleMs: 6_500,
-  focusedWindowMs: 6_500,
-  idleMs: 0,
-  foregroundBursts: 1,
-  returnCount: 1,
-  scrollEvents: 4,
-  maxScrollRatio: 0.8,
-  copyCount: input.copyCount ?? 0,
-  pasteCount: input.pasteCount ?? 0,
-});
-
-const postBrowserAEdgeObservations = async (comp: TestCompanion): Promise<void> => {
-  const now = Date.now();
-  const observedAt = (offsetMs: number): string => new Date(now + offsetMs).toISOString();
-  const edgeEvent = (input: {
-    readonly seq: number;
-    readonly type: string;
-    readonly aggregateId: string;
-    readonly payload: Record<string, unknown>;
-    readonly acceptedAtMs: number;
-  }): Record<string, unknown> => ({
-    clientEventId: `l5-browser-a:${input.type}:${String(input.seq)}`,
-    dot: { replicaId: 'l5-browser-a', seq: input.seq },
-    deps: {},
-    aggregateId: input.aggregateId,
-    type: input.type,
-    payload: input.payload,
-    acceptedAtMs: input.acceptedAtMs,
-  });
-
-  const engagementEvents = VISITS.slice(0, 3).map((visit, index) =>
-    edgeEvent({
-      seq: index + 1,
-      type: 'engagement.session.aggregated',
-      aggregateId: `engagement:${visit.url}`,
-      payload: {
-        payloadVersion: 1,
-        visitId: stripTrailingSlash(visit.url),
-        sessionId: 'l5-browser-a',
-        dimensions: {
-          engagement: engagementTotals({
-            copyCount: index === 1 ? 1 : 0,
-            pasteCount: index === 2 ? 1 : 0,
-          }),
-        },
-      },
-      acceptedAtMs: now + index,
-    }),
-  );
-
-  await apiPost(comp, '/v1/edge/events', {
-    events: [
-      ...engagementEvents,
-      edgeEvent({
-        seq: 10,
-        type: 'selection.copied',
-        aggregateId: `selection:${VISITS[1].url}`,
-        payload: {
-          payloadVersion: 1,
-          visitId: stripTrailingSlash(VISITS[1].url),
-          selectionHash: 'l5-selection-hash',
-          simhash64: 'l5-selection-simhash',
-          charCount: 128,
-          lineCount: 1,
-          contentKindHint: 'prose',
-          rawTextStored: false,
-        },
-        acceptedAtMs: Date.parse(observedAt(10)),
-      }),
-      edgeEvent({
-        seq: 11,
-        type: 'selection.pasted',
-        aggregateId: `selection:${VISITS[2].url}`,
-        payload: {
-          payloadVersion: 1,
-          destinationKind: 'search',
-          destinationId: stripTrailingSlash(VISITS[2].url),
-          selectionHash: 'l5-selection-hash',
-          simhash64: 'l5-selection-simhash',
-          charCount: 128,
-          rawTextStored: false,
-        },
-        acceptedAtMs: Date.parse(observedAt(11)),
-      }),
-    ],
-  });
 };
 
 const grantDeeperPageAccess = async (panel: Page): Promise<void> => {
@@ -508,6 +428,48 @@ const grantDeeperPageAccess = async (panel: Page): Promise<void> => {
   await panel.locator('button.btn.btn-ghost', { hasText: 'Close' }).click();
 };
 
+const ensureEngagementRuntimeOnPage = async (panel: Page, page: Page): Promise<void> => {
+  const targetUrl = stripTrailingSlash(page.url());
+  const result = await panel.evaluate(
+    async (
+      url,
+    ): Promise<{ readonly ok: boolean; readonly injected: boolean; readonly error?: string }> => {
+      const normalize = (value: string): string => value.replace(/#.*$/u, '').replace(/\/$/u, '');
+      const tabs = await chrome.tabs.query({});
+      const tab = tabs.find((candidate) => {
+        if (typeof candidate.id !== 'number' || typeof candidate.url !== 'string') return false;
+        return normalize(candidate.url) === url;
+      });
+      if (tab?.id === undefined)
+        return { ok: false, injected: false, error: `tab not found: ${url}` };
+      const isEngagementAck = (value: unknown): boolean =>
+        typeof value === 'object' && value !== null && (value as { ok?: unknown }).ok === true;
+      const alreadyPresent = await chrome.tabs
+        .sendMessage(tab.id, { type: 'sidetrack.engagement.idle', idle: false })
+        .then(isEngagementAck)
+        .catch(() => false);
+      if (alreadyPresent) return { ok: true, injected: false };
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ['engagement.js'],
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const presentAfterInject = await chrome.tabs
+        .sendMessage(tab.id, { type: 'sidetrack.engagement.idle', idle: false })
+        .then(isEngagementAck)
+        .catch(() => false);
+      return {
+        ok: presentAfterInject,
+        injected: true,
+        ...(presentAfterInject ? {} : { error: `engagement runtime did not respond: ${url}` }),
+      };
+    },
+    targetUrl,
+  );
+  expect(result.ok, result.error ?? `engagement runtime unavailable for ${targetUrl}`).toBe(true);
+  await new Promise((resolve) => setTimeout(resolve, result.injected ? 250 : 50));
+};
+
 const performCopyPasteBestEffort = async (source: Page, destination: Page): Promise<void> => {
   await source.evaluate(() => {
     window.scrollBy(0, 700);
@@ -521,6 +483,11 @@ const performCopyPasteBestEffort = async (source: Page, destination: Page): Prom
   });
   await source.keyboard
     .press(process.platform === 'darwin' ? 'Meta+C' : 'Control+C')
+    .catch(() => undefined);
+  await source
+    .evaluate(() => {
+      document.dispatchEvent(new ClipboardEvent('copy', { bubbles: true, cancelable: true }));
+    })
     .catch(() => undefined);
   await source
     .evaluate(async () => {
@@ -537,11 +504,44 @@ const performCopyPasteBestEffort = async (source: Page, destination: Page): Prom
     .evaluate(() => {
       const target = document.querySelector('#paste-target');
       if (!(target instanceof HTMLTextAreaElement)) return;
+      const data = new DataTransfer();
+      data.setData('text/plain', 'sidetrack L5 copied snippet');
+      target.dispatchEvent(
+        new ClipboardEvent('paste', {
+          bubbles: true,
+          cancelable: true,
+          clipboardData: data,
+        }),
+      );
       target.value = `${target.value} sidetrack L5 copied snippet`;
       target.dispatchEvent(new Event('input', { bubbles: true }));
-      target.dispatchEvent(new Event('paste', { bubbles: true }));
     })
     .catch(() => undefined);
+};
+
+const finalizeEngagementObservation = async (panel: Page, page: Page): Promise<void> => {
+  const targetUrl = stripTrailingSlash(page.url());
+  const result = await panel.evaluate(
+    async (url): Promise<{ readonly ok: boolean; readonly error?: string }> => {
+      const normalize = (value: string): string => value.replace(/#.*$/u, '').replace(/\/$/u, '');
+      const tabs = await chrome.tabs.query({});
+      const tab = tabs.find((candidate) => {
+        if (typeof candidate.id !== 'number' || typeof candidate.url !== 'string') return false;
+        return normalize(candidate.url) === url;
+      });
+      if (tab?.id === undefined) return { ok: false, error: `tab not found: ${url}` };
+      return await chrome.tabs
+        .sendMessage(tab.id, { type: 'sidetrack.engagement.force-finalize' })
+        .then(() => ({ ok: true }))
+        .catch((error: unknown) => ({
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        }));
+    },
+    targetUrl,
+  );
+  expect(result.ok, result.error ?? `engagement finalize failed for ${targetUrl}`).toBe(true);
+  await new Promise((resolve) => setTimeout(resolve, 250));
 };
 
 const dwellAndScroll = async (page: Page, dwellMs = 6_000): Promise<void> => {
@@ -560,18 +560,24 @@ const dwellAndScroll = async (page: Page, dwellMs = 6_000): Promise<void> => {
   if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
 };
 
-const driveBrowserAVisits = async (runtime: ExtensionRuntime): Promise<void> => {
+const driveBrowserAVisits = async (runtime: ExtensionRuntime, panel: Page): Promise<void> => {
   const researchTab = await runtime.context.newPage();
   await researchTab.goto(VISITS[0].url, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
+  await ensureEngagementRuntimeOnPage(panel, researchTab);
   await dwellAndScroll(researchTab);
+  await finalizeEngagementObservation(panel, researchTab);
 
   await researchTab.goto(VISITS[1].url, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
+  await ensureEngagementRuntimeOnPage(panel, researchTab);
   await dwellAndScroll(researchTab);
 
   const pasteTab = await runtime.context.newPage();
   await pasteTab.goto(VISITS[2].url, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
+  await ensureEngagementRuntimeOnPage(panel, pasteTab);
   await dwellAndScroll(pasteTab);
   await performCopyPasteBestEffort(researchTab, pasteTab);
+  await finalizeEngagementObservation(panel, researchTab);
+  await finalizeEngagementObservation(panel, pasteTab);
   await new Promise((resolve) => setTimeout(resolve, 500));
 
   await pasteTab.close();
@@ -580,8 +586,10 @@ const driveBrowserAVisits = async (runtime: ExtensionRuntime): Promise<void> => 
   for (const visit of VISITS.slice(3)) {
     const page = await runtime.context.newPage();
     await page.goto(visit.url, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
+    await ensureEngagementRuntimeOnPage(panel, page);
     await page.evaluate(() => window.scrollBy(0, 500)).catch(() => undefined);
     await new Promise((resolve) => setTimeout(resolve, 300));
+    await finalizeEngagementObservation(panel, page);
     await page.close();
   }
 };
@@ -838,15 +846,16 @@ test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 com
     });
     expect((gateChanged as { ok?: boolean } | null)?.ok).toBe(true);
 
-    await driveBrowserAVisits(runtimeA);
+    await driveBrowserAVisits(runtimeA, panelA);
     const drainSender = await runtimeA.context.newPage();
     await drainSender.goto(`chrome-extension://${runtimeA.extensionId}/sidepanel.html`, {
       waitUntil: 'domcontentloaded',
     });
     await drainTimeline(runtimeA, drainSender, ALL_URLS.length);
-    await drainEdgeEvents(runtimeA, drainSender, ALL_URLS.length);
+    await drainEdgeEvents(runtimeA, drainSender, ALL_URLS.length, {
+      'engagement.session.aggregated': 1,
+    });
     await drainSender.close();
-    await postBrowserAEdgeObservations(companionA);
 
     await writeCodexCollectorFixture(companionA.vaultPath, companionA);
     const bootstrapFeedback = await postBootstrapFeedbackLabels(companionA);

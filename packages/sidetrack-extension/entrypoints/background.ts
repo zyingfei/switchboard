@@ -2881,14 +2881,22 @@ export default defineBackground(() => {
     readonly uploaded: number;
     readonly remaining: number;
     readonly skipped: number;
+    readonly uploadedByType: Record<string, number>;
   }> => {
     const companion = await readTimelineCompanionConfig();
     if (companion === null || companion.url.trim().length === 0) {
-      return { uploaded: 0, remaining: await engagementEventBuffer.count(), skipped: 0 };
+      return {
+        uploaded: 0,
+        remaining: await engagementEventBuffer.count(),
+        skipped: 0,
+        uploadedByType: {},
+      };
     }
 
     const batch = await engagementEventBuffer.peek(100);
-    if (batch.length === 0) return { uploaded: 0, remaining: 0, skipped: 0 };
+    if (batch.length === 0) {
+      return { uploaded: 0, remaining: 0, skipped: 0, uploadedByType: {} };
+    }
     const events = batch.map((event) => ({
       clientEventId: `edge:${event.streamName}:${event.replicaId}:${String(event.lamport)}`,
       dot: { replicaId: event.replicaId, seq: event.lamport },
@@ -2923,13 +2931,19 @@ export default defineBackground(() => {
         (event) => `${event.replicaId}:${String(event.seq)}`,
       ),
     );
-    const deleted = await engagementEventBuffer.deleteMany(
-      batch.filter((event) => acked.has(`${event.replicaId}:${String(event.lamport)}`)),
+    const ackedBatch = batch.filter((event) =>
+      acked.has(`${event.replicaId}:${String(event.lamport)}`),
     );
+    const uploadedByType: Record<string, number> = {};
+    for (const event of ackedBatch) {
+      uploadedByType[event.streamName] = (uploadedByType[event.streamName] ?? 0) + 1;
+    }
+    const deleted = await engagementEventBuffer.deleteMany(ackedBatch);
     return {
       uploaded: deleted,
       remaining: await engagementEventBuffer.count(),
       skipped: skipped.length,
+      uploadedByType,
     };
   };
 
