@@ -105,10 +105,15 @@ const SWITCHBOARD_VISITS = [
 
 const VISITS = [...SECURITY_VISITS, ...SWITCHBOARD_VISITS] as const;
 const ALL_URLS = VISITS.map((visit) => visit.url);
+const GOOGLE_HOME_URL = 'https://www.google.com/';
+const CHRONOX_AF_ALG_URL = 'https://www.chronox.de/libkcapi/html/ch01s02.html';
+const SWITCHBOARD_PR_110_URL = 'https://github.com/zyingfei/switchboard/pull/110';
+const SWITCHBOARD_PR_110_FILES_URL = 'https://github.com/zyingfei/switchboard/pull/110/files';
 const REAL_STORY_HOST_PERMISSIONS = [
   'https://news.ycombinator.com/*',
   'https://xint.io/*',
   'https://www.google.com/*',
+  'https://www.chronox.de/*',
   'https://chatgpt.com/*',
   'https://github.com/*',
   'https://copy.fail/*',
@@ -177,6 +182,8 @@ interface CollectorsEnvelope {
 }
 
 const stripTrailingSlash = (url: string): string => url.replace(/\/+$/u, '');
+const normalizeTabLookupUrl = (url: string): string =>
+  url.replace(/#.*$/u, '').replace(/\/+$/u, '');
 
 const visitNodeId = (url: string): string => `timeline-visit:${stripTrailingSlash(url)}`;
 
@@ -418,33 +425,292 @@ const openConnectionsPanel = async (
   return panel;
 };
 
+const escapeHtml = (value: string): string =>
+  value
+    .replace(/&/gu, '&amp;')
+    .replace(/</gu, '&lt;')
+    .replace(/>/gu, '&gt;')
+    .replace(/"/gu, '&quot;');
+
+const storyHtml = (input: {
+  readonly title: string;
+  readonly body: string;
+  readonly links?: readonly {
+    readonly href: string;
+    readonly label: string;
+    readonly id?: string;
+  }[];
+  readonly controls?: string;
+}): string => `<!doctype html>
+<html>
+  <head>
+    <title>${escapeHtml(input.title)}</title>
+    <style>
+      body { font: 15px/1.45 system-ui, sans-serif; margin: 32px; max-width: 980px; }
+      nav, .actions { display: flex; flex-wrap: wrap; gap: 12px; margin: 20px 0; }
+      a { color: #0b57d0; }
+      textarea, input { width: 760px; max-width: 100%; min-height: 44px; display: block; margin: 12px 0; }
+      pre { white-space: pre-wrap; background: #f6f8fa; padding: 12px; border-radius: 6px; }
+      .spacer { height: 1800px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>${escapeHtml(input.title)}</h1>
+      <p id="copy-source">${escapeHtml(input.body)}</p>
+      <nav>
+        ${(input.links ?? [])
+          .map(
+            (link) =>
+              `<a ${link.id === undefined ? '' : `id="${escapeHtml(link.id)}"`} href="${escapeHtml(link.href)}">${escapeHtml(link.label)}</a>`,
+          )
+          .join('\n')}
+      </nav>
+      ${input.controls ?? ''}
+      <section id="affected"><h2>Am I affected?</h2><p>The page cache is shared across the host. A pod with the right primitives compromises the node and crosses tenant boundaries.</p></section>
+      <section id="exploit"><h2>Exploit</h2><p>Download the public proof of concept and validate it in an isolated VM.</p></section>
+      <section id="contact"><h2>Contact</h2><p>Xint Code follow-up and disclosure coordination.</p></section>
+      <div class="spacer"></div>
+    </main>
+  </body>
+</html>`;
+
+const pageForPublicUrl = (rawUrl: string): { readonly title: string; readonly body: string } => {
+  const url = new URL(rawUrl);
+  const requestUrl = stripTrailingSlash(rawUrl);
+  const visit = VISITS.find((candidate) => stripTrailingSlash(candidate.url) === requestUrl);
+  if (visit !== undefined) {
+    return { title: visit.title, body: visit.body };
+  }
+  if (rawUrl === GOOGLE_HOME_URL) {
+    return {
+      title: 'Google',
+      body: 'Google home page with search box for Linux crypto subsystem.',
+    };
+  }
+  if (url.hostname === 'www.google.com' && url.pathname === '/search') {
+    return {
+      title: `${url.searchParams.get('q') ?? 'search'} - Google Search`,
+      body: 'Search results include ChatGPT analysis, Gemini analysis, and related Linux crypto subsystem references.',
+    };
+  }
+  if (rawUrl === CHRONOX_AF_ALG_URL) {
+    return {
+      title: 'Purpose Of AF_ALG',
+      body: 'AF_ALG exposes the Linux kernel crypto API through sockets and provides background context for copy.fail research.',
+    };
+  }
+  if (rawUrl === SWITCHBOARD_PR_110_URL) {
+    return {
+      title: 'Stage 4 L5 - full browser sync e2e by zyingfei',
+      body: 'PR #110 review body with L5 hardening notes, route realism requirements, and links to analysis surfaces.',
+    };
+  }
+  if (rawUrl === SWITCHBOARD_PR_110_FILES_URL) {
+    return {
+      title: 'Files changed - Stage 4 L5 full browser sync e2e',
+      body: 'Files changed for the L5 Playwright e2e and runtime helpers.',
+    };
+  }
+  return {
+    title: `${url.hostname} context`,
+    body: `Context page for ${rawUrl}`,
+  };
+};
+
+const fixtureBodyForUrl = (rawUrl: string): string => {
+  const url = new URL(rawUrl);
+  const page = pageForPublicUrl(rawUrl);
+
+  if (url.hostname === 'news.ycombinator.com') {
+    return storyHtml({
+      ...page,
+      links: [
+        { href: 'https://copy.fail/', label: 'Copy Fail' },
+        { href: CHRONOX_AF_ALG_URL, label: CHRONOX_AF_ALG_URL },
+      ],
+      controls:
+        '<p>HN comments discuss AF_ALG, Linux distro coverage, exploit shape, and VM safety.</p>',
+    });
+  }
+
+  if (url.hostname === 'copy.fail') {
+    return storyHtml({
+      ...page,
+      links: [
+        { href: 'https://xint.io/blog/copy-fail-linux-distributions', label: 'Read the write-up' },
+        { href: 'https://copy.fail/#exploit', label: 'Get the exploit' },
+        {
+          href: 'https://github.com/theori-io/copy-fail-CVE-2026-31431/blob/main/copy_fail_exp.py',
+          label: 'Download (GitHub)',
+        },
+        { href: 'https://copy.fail/#affected', label: 'Am I affected?' },
+        { href: 'https://copy.fail/#contact', label: 'Contact' },
+        { href: 'https://xint.io/', label: 'Xint Code' },
+      ],
+      controls: `<pre>${escapeHtml(DISPATCH_SNIPPET)}</pre>`,
+    });
+  }
+
+  if (url.hostname === 'xint.io') {
+    return storyHtml({
+      ...page,
+      links: [
+        {
+          href: 'https://xint.io/blog/copy-fail-linux-distributions#what-makes-copy-fail-different-0',
+          label: 'What Makes Copy Fail Different',
+        },
+        { href: 'https://copy.fail/', label: 'Copy Fail' },
+      ],
+      controls:
+        '<p>Write-up sections cover distro impact, AF_ALG primitives, and the 732-byte exploit path.</p>',
+    });
+  }
+
+  if (url.hostname === 'www.google.com' && url.pathname === '/') {
+    return storyHtml({
+      ...page,
+      controls:
+        '<form action="/search" method="get"><label>Search <input aria-label="Search" name="q" autofocus /></label><button type="submit">Google Search</button></form>',
+    });
+  }
+
+  if (url.hostname === 'www.google.com' && url.pathname === '/search') {
+    const q = url.searchParams.get('q') ?? '';
+    return storyHtml({
+      ...page,
+      links: q.includes('Ranking')
+        ? [
+            {
+              href: 'https://sease.io/information-retrieval-mini-training/train-evaluate-explain-your-learning-to-rank-model',
+              label: 'How to Train, Evaluate and Explain your Learning to Rank Model',
+            },
+            {
+              href: 'https://www.youtube.com/watch?v=rT7G57vto0o&t=122',
+              label: 'How we scaled ranking with Learn-to-Rank - Zachary Nickerson',
+            },
+          ]
+        : [
+            {
+              href: 'https://chatgpt.com/c/69fb9815-41f8-8329-a790-edfa4b914dfd',
+              label: 'ChatGPT copy-fail analysis',
+            },
+            { href: CHRONOX_AF_ALG_URL, label: 'Purpose Of AF_ALG' },
+          ],
+      controls: `<p>Query: ${escapeHtml(q)}</p>`,
+    });
+  }
+
+  if (url.hostname === 'chatgpt.com') {
+    return storyHtml({
+      ...page,
+      links: [
+        {
+          href: SWITCHBOARD_VISITS[3].url,
+          label: 'Open sibling analysis thread',
+        },
+        { href: SWITCHBOARD_PR_110_URL, label: 'Return to PR #110' },
+      ],
+      controls:
+        '<p>Analysis captures PR requirements, route realism notes, and follow-up coding-agent work.</p>',
+    });
+  }
+
+  if (url.hostname === 'github.com' && url.pathname === '/zyingfei/switchboard') {
+    return storyHtml({
+      ...page,
+      links: [{ href: 'https://github.com/zyingfei/switchboard/pulls', label: 'Pull requests' }],
+    });
+  }
+
+  if (url.hostname === 'github.com' && url.pathname === '/zyingfei/switchboard/pulls') {
+    return storyHtml({
+      ...page,
+      links: [
+        { href: SWITCHBOARD_PR_110_URL, label: 'Stage 4 L5 - full browser sync e2e' },
+        {
+          href: 'https://github.com/zyingfei/switchboard/pull/109',
+          label: 'Stage 4 - L5 full browser sync e2e (Codex pull brief)',
+        },
+        { href: SWITCHBOARD_VISITS[2].url, label: 'ChatGPT Switchboard project analysis' },
+      ],
+    });
+  }
+
+  if (rawUrl === SWITCHBOARD_PR_110_URL || rawUrl === SWITCHBOARD_PR_110_FILES_URL) {
+    return storyHtml({
+      ...page,
+      links: [
+        { href: SWITCHBOARD_PR_110_FILES_URL, label: 'Files changed' },
+        { href: SWITCHBOARD_VISITS[2].url, label: 'ChatGPT Switchboard project analysis' },
+        { href: SWITCHBOARD_VISITS[4].url, label: 'YouTube ambient context' },
+        { href: SWITCHBOARD_VISITS[5].url, label: 'Gemini Switchboard analysis' },
+      ],
+      controls:
+        '<p>Summary: Adds and hardens the Stage 4 L5 composed Playwright e2e and runtime host-permission path.</p>',
+    });
+  }
+
+  if (
+    url.hostname === 'github.com' &&
+    url.pathname === '/theori-io/copy-fail-CVE-2026-31431/blob/main/copy_fail_exp.py'
+  ) {
+    return storyHtml({
+      ...page,
+      links: [
+        {
+          href: 'https://github.com/theori-io/copy-fail-CVE-2026-31431/blob/main/README.md',
+          label: 'README.md',
+        },
+        {
+          href: 'https://github.com/theori-io/copy-fail-CVE-2026-31431/tree/main',
+          label: 'copy-fail-CVE-2026-31431',
+        },
+      ],
+      controls:
+        '<textarea id="coding-agent-input" aria-label="Coding agent prompt" placeholder="Paste coding-agent task here"></textarea><textarea id="paste-target" aria-label="Paste target"></textarea>',
+    });
+  }
+
+  if (url.hostname === 'gemini.google.com') {
+    return storyHtml({
+      ...page,
+      links: [
+        {
+          href: 'https://www.google.com/search?q=Ranking+and+Training',
+          label: 'Ranking and Training',
+        },
+        { href: SWITCHBOARD_PR_110_URL, label: 'Stage 4 L5 PR' },
+      ],
+      controls:
+        '<button type="button">Tools</button><button type="button">switchboard</button><label>Import code<textarea id="repo-import" aria-label="Import code"></textarea></label><button type="button">Import</button><p>The codebase is currently undergoing a hardening phase, particularly concerning the work graph and connection logic.</p>',
+    });
+  }
+
+  if (url.hostname === 'www.youtube.com') {
+    return storyHtml({
+      ...page,
+      links: [{ href: SWITCHBOARD_PR_110_URL, label: 'Back to PR review' }],
+      controls:
+        '<p>Ambient video context remains in the active Switchboard workstream while review continues.</p>',
+    });
+  }
+
+  return storyHtml(page);
+};
+
 const installVisitRoutes = async (runtime: ExtensionRuntime): Promise<void> => {
   await runtime.context.route(/^https?:\/\//u, async (route) => {
-    const requestUrl = stripTrailingSlash(route.request().url());
-    const visit = VISITS.find((candidate) => stripTrailingSlash(candidate.url) === requestUrl);
-    if (visit === undefined) {
+    const rawUrl = route.request().url();
+    const url = new URL(rawUrl);
+    if (url.hostname === '127.0.0.1' || url.hostname === 'localhost') {
       await route.fallback();
       return;
     }
     await route.fulfill({
       status: 200,
       contentType: 'text/html',
-      body: `<!doctype html>
-        <html>
-          <head><title>${visit.title}</title></head>
-          <body>
-            <main>
-              <h1>${visit.title}</h1>
-              <p id="copy-source">${visit.body}</p>
-              <textarea id="paste-target" aria-label="Paste target"></textarea>
-              <textarea id="coding-agent-input" aria-label="Coding agent prompt"></textarea>
-              <a href="https://github.com/theori-io/copy-fail-CVE-2026-31431/blob/main/copy_fail_exp.py">
-                copy_fail_exp.py
-              </a>
-              <div style="height: 1800px"></div>
-            </main>
-          </body>
-        </html>`,
+      body: fixtureBodyForUrl(rawUrl),
     });
   });
 };
@@ -544,7 +810,7 @@ const setActiveWorkstream = async (
 };
 
 const ensureEngagementRuntimeOnPage = async (panel: Page, page: Page): Promise<void> => {
-  const targetUrl = stripTrailingSlash(page.url());
+  const targetUrl = normalizeTabLookupUrl(page.url());
   const result = await panel.evaluate(
     async (
       url,
@@ -649,7 +915,7 @@ const performCopyPasteBestEffort = async (source: Page, destination: Page): Prom
 };
 
 const finalizeEngagementObservation = async (panel: Page, page: Page): Promise<void> => {
-  const targetUrl = stripTrailingSlash(page.url());
+  const targetUrl = normalizeTabLookupUrl(page.url());
   const result = await panel.evaluate(
     async (url): Promise<{ readonly ok: boolean; readonly error?: string }> => {
       const normalize = (value: string): string => value.replace(/#.*$/u, '').replace(/\/$/u, '');
@@ -689,19 +955,63 @@ const dwellAndScroll = async (page: Page, dwellMs = 6_000): Promise<void> => {
   if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
 };
 
-const visitInWorkstream = async (
+const observeCurrentPageInWorkstream = async (
   runtime: ExtensionRuntime,
   panel: Page,
   page: Page,
-  visit: VisitFixture,
   workstreamId: string,
-  dwellMs = 1_500,
+  dwellMs = 6_000,
 ): Promise<void> => {
   await setActiveWorkstream(runtime, panel, workstreamId);
-  await page.goto(visit.url, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
   await ensureEngagementRuntimeOnPage(panel, page);
   await dwellAndScroll(page, dwellMs);
   await finalizeEngagementObservation(panel, page);
+};
+
+const waitForStoryUrl = async (page: Page, expectedUrl: string): Promise<void> => {
+  await page
+    .waitForURL(
+      (url) => normalizeTabLookupUrl(url.toString()) === normalizeTabLookupUrl(expectedUrl),
+      { waitUntil: 'domcontentloaded', timeout: 15_000 },
+    )
+    .catch(() => undefined);
+  await page.waitForLoadState('domcontentloaded', { timeout: 10_000 }).catch(() => undefined);
+};
+
+const openStoryRoot = async (
+  runtime: ExtensionRuntime,
+  panel: Page,
+  page: Page,
+  url: string,
+  workstreamId: string,
+  dwellMs = 6_000,
+): Promise<void> => {
+  await setActiveWorkstream(runtime, panel, workstreamId);
+  await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
+  await observeCurrentPageInWorkstream(runtime, panel, page, workstreamId, dwellMs);
+};
+
+const clickStoryLink = async (
+  runtime: ExtensionRuntime,
+  panel: Page,
+  page: Page,
+  input: {
+    readonly label: string | RegExp;
+    readonly expectedUrl: string;
+    readonly workstreamId: string;
+    readonly dwellMs?: number;
+  },
+): Promise<void> => {
+  await setActiveWorkstream(runtime, panel, input.workstreamId);
+  await page.getByRole('link', { name: input.label }).click();
+  await waitForStoryUrl(page, input.expectedUrl);
+  await observeCurrentPageInWorkstream(
+    runtime,
+    panel,
+    page,
+    input.workstreamId,
+    input.dwellMs ?? 6_000,
+  );
 };
 
 const driveBrowserAVisits = async (
@@ -713,110 +1023,179 @@ const driveBrowserAVisits = async (
   },
 ): Promise<{ readonly dispatchSnippet: string }> => {
   const securityTab = await runtime.context.newPage();
-  const switchboardTab = await runtime.context.newPage();
+  const googleTab = await runtime.context.newPage();
+  const sourceCopyFailTab = await runtime.context.newPage();
   const copyFailTab = await runtime.context.newPage();
   const codingAgentTab = await runtime.context.newPage();
+  const switchboardTab = await runtime.context.newPage();
+  const chatgptReviewTab = await runtime.context.newPage();
   const youtubeTab = await runtime.context.newPage();
   const geminiTab = await runtime.context.newPage();
 
-  await visitInWorkstream(
+  // Security flow, shaped after the manual recording: start on HN,
+  // click the story title into copy.fail, then follow the write-up.
+  await openStoryRoot(
     runtime,
     panel,
     securityTab,
-    SECURITY_VISITS[0],
+    SECURITY_VISITS[0].url,
     input.securityWorkstreamId,
-    6_000,
   );
-  await visitInWorkstream(
-    runtime,
-    panel,
-    switchboardTab,
-    SWITCHBOARD_VISITS[0],
-    input.switchboardWorkstreamId,
-    6_000,
-  );
-  await visitInWorkstream(
-    runtime,
-    panel,
-    securityTab,
-    SECURITY_VISITS[1],
-    input.securityWorkstreamId,
-    6_000,
-  );
-  await visitInWorkstream(
-    runtime,
-    panel,
-    switchboardTab,
-    SWITCHBOARD_VISITS[1],
-    input.switchboardWorkstreamId,
-    6_000,
-  );
-  await visitInWorkstream(
-    runtime,
-    panel,
-    securityTab,
-    SECURITY_VISITS[2],
-    input.securityWorkstreamId,
-    6_000,
-  );
-  await visitInWorkstream(
-    runtime,
-    panel,
-    switchboardTab,
-    SWITCHBOARD_VISITS[2],
-    input.switchboardWorkstreamId,
-    6_000,
-  );
-  await visitInWorkstream(
-    runtime,
-    panel,
-    securityTab,
-    SECURITY_VISITS[3],
-    input.securityWorkstreamId,
-    6_000,
-  );
-  await visitInWorkstream(
-    runtime,
-    panel,
-    switchboardTab,
-    SWITCHBOARD_VISITS[3],
-    input.switchboardWorkstreamId,
-    6_000,
-  );
+  await clickStoryLink(runtime, panel, securityTab, {
+    label: 'Copy Fail',
+    expectedUrl: SECURITY_VISITS[4].url,
+    workstreamId: input.securityWorkstreamId,
+  });
+  await clickStoryLink(runtime, panel, securityTab, {
+    label: 'Read the write-up',
+    expectedUrl: SECURITY_VISITS[1].url,
+    workstreamId: input.securityWorkstreamId,
+  });
 
-  await visitInWorkstream(
+  // The recorded search was copy/paste driven; the deterministic test
+  // keeps it keyboard-driven but reaches the same real-shaped query URL
+  // and follows a result link to the ChatGPT analysis thread.
+  await openStoryRoot(
+    runtime,
+    panel,
+    googleTab,
+    GOOGLE_HOME_URL,
+    input.securityWorkstreamId,
+    1_500,
+  );
+  await setActiveWorkstream(runtime, panel, input.securityWorkstreamId);
+  await googleTab.getByLabel('Search').fill('Linux crypto subsystem');
+  await googleTab.keyboard.press('Enter');
+  await waitForStoryUrl(googleTab, SECURITY_VISITS[2].url);
+  await observeCurrentPageInWorkstream(
+    runtime,
+    panel,
+    googleTab,
+    input.securityWorkstreamId,
+    6_000,
+  );
+  await clickStoryLink(runtime, panel, googleTab, {
+    label: 'ChatGPT copy-fail analysis',
+    expectedUrl: SECURITY_VISITS[3].url,
+    workstreamId: input.securityWorkstreamId,
+  });
+
+  // Dispatch direction: keep a source copy.fail page open, then click
+  // copy.fail -> exploit -> GitHub and paste the snippet into the
+  // coding-agent prompt surface on the GitHub page.
+  await openStoryRoot(
+    runtime,
+    panel,
+    sourceCopyFailTab,
+    SECURITY_VISITS[4].url,
+    input.securityWorkstreamId,
+  );
+  await openStoryRoot(
     runtime,
     panel,
     copyFailTab,
-    SECURITY_VISITS[4],
+    SECURITY_VISITS[4].url,
     input.securityWorkstreamId,
-    6_000,
   );
-  await visitInWorkstream(
+  await setActiveWorkstream(runtime, panel, input.securityWorkstreamId);
+  await copyFailTab.getByRole('link', { name: 'Get the exploit' }).click();
+  await waitForStoryUrl(copyFailTab, 'https://copy.fail/#exploit');
+  await copyFailTab.getByRole('link', { name: 'Download (GitHub)' }).click();
+  await waitForStoryUrl(copyFailTab, SECURITY_VISITS[5].url);
+  await observeCurrentPageInWorkstream(
     runtime,
     panel,
-    codingAgentTab,
-    SECURITY_VISITS[5],
+    copyFailTab,
     input.securityWorkstreamId,
     6_000,
   );
-  const dispatchSnippet = await performCopyPasteBestEffort(copyFailTab, codingAgentTab);
+  const dispatchSnippet = await performCopyPasteBestEffort(sourceCopyFailTab, copyFailTab);
+  await finalizeEngagementObservation(panel, sourceCopyFailTab);
   await finalizeEngagementObservation(panel, copyFailTab);
-  await finalizeEngagementObservation(panel, codingAgentTab);
 
-  await visitInWorkstream(
+  // Switchboard flow: explicit active-workstream toggle remains the
+  // implemented attribution hook. The route through GitHub/PRs/AI
+  // pages is click-shaped from the recorded manual pass.
+  await openStoryRoot(
+    runtime,
+    panel,
+    switchboardTab,
+    SWITCHBOARD_VISITS[0].url,
+    input.switchboardWorkstreamId,
+  );
+  await clickStoryLink(runtime, panel, switchboardTab, {
+    label: 'Pull requests',
+    expectedUrl: SWITCHBOARD_VISITS[1].url,
+    workstreamId: input.switchboardWorkstreamId,
+  });
+  await clickStoryLink(runtime, panel, switchboardTab, {
+    label: 'Stage 4 L5 - full browser sync e2e',
+    expectedUrl: SWITCHBOARD_PR_110_URL,
+    workstreamId: input.switchboardWorkstreamId,
+    dwellMs: 2_000,
+  });
+  await clickStoryLink(runtime, panel, switchboardTab, {
+    label: 'Files changed',
+    expectedUrl: SWITCHBOARD_PR_110_FILES_URL,
+    workstreamId: input.switchboardWorkstreamId,
+    dwellMs: 2_000,
+  });
+
+  await openStoryRoot(
+    runtime,
+    panel,
+    chatgptReviewTab,
+    SWITCHBOARD_PR_110_URL,
+    input.switchboardWorkstreamId,
+    1_500,
+  );
+  await clickStoryLink(runtime, panel, chatgptReviewTab, {
+    label: 'ChatGPT Switchboard project analysis',
+    expectedUrl: SWITCHBOARD_VISITS[2].url,
+    workstreamId: input.switchboardWorkstreamId,
+  });
+  await clickStoryLink(runtime, panel, chatgptReviewTab, {
+    label: 'Open sibling analysis thread',
+    expectedUrl: SWITCHBOARD_VISITS[3].url,
+    workstreamId: input.switchboardWorkstreamId,
+  });
+
+  await openStoryRoot(
     runtime,
     panel,
     youtubeTab,
-    SWITCHBOARD_VISITS[4],
+    SWITCHBOARD_PR_110_URL,
     input.switchboardWorkstreamId,
-    6_000,
+    1_500,
   );
-  await visitInWorkstream(
+  await clickStoryLink(runtime, panel, youtubeTab, {
+    label: 'YouTube ambient context',
+    expectedUrl: SWITCHBOARD_VISITS[4].url,
+    workstreamId: input.switchboardWorkstreamId,
+  });
+
+  await openStoryRoot(
     runtime,
     panel,
     geminiTab,
-    SWITCHBOARD_VISITS[5],
+    SWITCHBOARD_PR_110_URL,
+    input.switchboardWorkstreamId,
+    1_500,
+  );
+  await clickStoryLink(runtime, panel, geminiTab, {
+    label: 'Gemini Switchboard analysis',
+    expectedUrl: SWITCHBOARD_VISITS[5].url,
+    workstreamId: input.switchboardWorkstreamId,
+    dwellMs: 1_000,
+  });
+  await geminiTab.getByRole('button', { name: 'Tools' }).click();
+  await geminiTab.getByRole('button', { name: 'switchboard' }).click();
+  await geminiTab.getByLabel('Import code').fill('https://github.com/zyingfei/switchboard');
+  await geminiTab.getByRole('button', { name: 'Import' }).click();
+  await observeCurrentPageInWorkstream(
+    runtime,
+    panel,
+    geminiTab,
     input.switchboardWorkstreamId,
     6_000,
   );
