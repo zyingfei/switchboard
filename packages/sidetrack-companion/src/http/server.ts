@@ -691,6 +691,37 @@ const readWorkstreams = async (vaultRoot: string): Promise<readonly BuildSignals
   return workstreams;
 };
 
+const isJsonObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const readWorkstreamProjections = async (vaultRoot: string): Promise<readonly unknown[]> => {
+  const root = join(vaultRoot, '_BAC', 'workstreams', 'projections');
+  const names = await readdir(root).catch(() => []);
+  const projections: unknown[] = [];
+  for (const name of names.filter((candidate) => candidate.endsWith('.json'))) {
+    try {
+      const parsed = JSON.parse(await readFile(join(root, name), 'utf8')) as unknown;
+      if (
+        isJsonObject(parsed) &&
+        typeof parsed['bac_id'] === 'string' &&
+        isJsonObject(parsed['record']) &&
+        typeof parsed['deleted'] === 'boolean'
+      ) {
+        projections.push(parsed);
+      }
+    } catch {
+      // Ignore malformed projection records; peer catch-up is best-effort.
+    }
+  }
+  return projections.sort((left, right) => {
+    const leftMs =
+      isJsonObject(left) && typeof left['updatedAtMs'] === 'number' ? left['updatedAtMs'] : 0;
+    const rightMs =
+      isJsonObject(right) && typeof right['updatedAtMs'] === 'number' ? right['updatedAtMs'] : 0;
+    return rightMs - leftMs;
+  });
+};
+
 const readVaultMarkdown = async (
   vaultRoot: string,
   kind: 'threads' | 'workstreams',
@@ -3234,6 +3265,15 @@ const routes: readonly RouteDefinition[] = [
           .catch(() => undefined);
       }
       return [201, mutationResponse(result, requestId)];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/workstreams\/projections$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      return [200, { data: await readWorkstreamProjections(vaultRoot) }];
     },
   },
   {

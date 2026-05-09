@@ -105,6 +105,7 @@ import {
   readQueueItems,
   readWorkstreams,
   readThreads,
+  mirrorRemoteWorkstream,
   readSettings,
   recordSelectorCanary,
   saveAutoTrack,
@@ -1657,6 +1658,23 @@ type WorkboardChangeReason =
   | 'thread'
   | 'settings';
 
+const refreshCachedWorkstreams = async (): Promise<void> => {
+  if (!(await isCompanionConfigured())) {
+    return;
+  }
+  const settings = await readSettings();
+  try {
+    const projections = await createCompanionClient(settings.companion).listWorkstreamProjections();
+    for (const projection of projections) {
+      await mirrorRemoteWorkstream(projection);
+    }
+  } catch {
+    // Companion unreachable or too old for the projection-list route.
+    // Keep SSE/local state as-is and let the normal status surface
+    // report connectivity separately.
+  }
+};
+
 const refreshCachedCodingSessions = async (): Promise<void> => {
   if (!(await isCompanionConfigured())) {
     await writeCachedCodingSessions([]);
@@ -1726,6 +1744,9 @@ const withCompanionStatus = async (
     }
     await replayQueuedCaptures();
     const status = await assertCompanionReachable();
+    if (status === 'connected') {
+      await refreshCachedWorkstreams();
+    }
     await refreshCachedCodingSessions();
     await refreshCachedDispatches();
     const state = await buildState(status);

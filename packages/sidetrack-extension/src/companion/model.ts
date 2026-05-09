@@ -184,6 +184,30 @@ export interface ChecklistItem {
   readonly updatedAt: string;
 }
 
+export interface RegisterProjection<T> {
+  readonly status: 'resolved' | 'conflict';
+  readonly value?: T;
+  readonly candidates?: readonly { readonly value: T }[];
+}
+
+export interface WorkstreamProjectionRecord {
+  readonly bac_id: string;
+  readonly title: string;
+  readonly parentId?: string;
+  readonly privacy?: 'private' | 'shared' | 'public';
+  readonly screenShareSensitive?: boolean;
+  readonly tags: readonly string[];
+  readonly children: readonly string[];
+  readonly checklist: readonly ChecklistItem[];
+  readonly description?: string;
+}
+
+export interface WorkstreamProjection {
+  readonly bac_id: string;
+  readonly record: RegisterProjection<WorkstreamProjectionRecord>;
+  readonly deleted: boolean;
+}
+
 export interface WorkstreamUpdate {
   readonly revision: string;
   readonly title?: string;

@@ -6,6 +6,7 @@ import { expect, test, type Page } from '@playwright/test';
 
 import { generateRendezvousSecret } from '../../../sidetrack-companion/src/sync/relayCrypto';
 import { canonicalThreadUrl } from '../../src/capture/providerDetection';
+import { isRuntimeResponse, messageTypes } from '../../src/messages';
 import { startTestCompanion, type TestCompanion } from './helpers/companion';
 import { installLlmNetworkMock, type LlmNetworkMock } from './helpers/llm-network-mock';
 import { startTestRelay, type TestRelay } from './helpers/relay';
@@ -406,6 +407,70 @@ const setConnectionsAnchor = async (panel: Page, anchorId: string, hops = '2'): 
   }
   await panel.getByTestId('connections-hops-select').selectOption(hops);
   await expect(panel.getByTestId('connections-groups')).toBeVisible({ timeout: 30_000 });
+};
+
+const assertRuntimeState = (response: unknown) => {
+  if (!isRuntimeResponse(response)) {
+    throw new Error('Background returned a non-Sidetrack response.');
+  }
+  if (!response.ok) {
+    throw new Error(response.error);
+  }
+  return response.state;
+};
+
+const createWorkstreamThroughExtension = async (
+  runtime: ExtensionRuntime,
+  panel: Page,
+  input: { readonly title: string },
+): Promise<string> => {
+  const state = assertRuntimeState(
+    await runtime.sendRuntimeMessage(panel, {
+      type: messageTypes.createWorkstream,
+      workstream: {
+        title: input.title,
+        privacy: 'shared',
+      },
+    }),
+  );
+  const workstream = state.workstreams.find((candidate) => candidate.title === input.title);
+  if (workstream === undefined) {
+    throw new Error(`Created workstream ${input.title} was not returned in extension state.`);
+  }
+  if (workstream.revision.startsWith('local_')) {
+    throw new Error(
+      `Created workstream ${input.title} stayed local-only instead of using the companion sync path.`,
+    );
+  }
+  return workstream.bac_id;
+};
+
+const extensionHasWorkstreams = async (
+  runtime: ExtensionRuntime,
+  panel: Page,
+  workstreamIds: readonly string[],
+): Promise<boolean> => {
+  const state = assertRuntimeState(
+    await runtime.sendRuntimeMessage(panel, {
+      type: messageTypes.getWorkboardState,
+    }),
+  );
+  return workstreamIds.every((id) =>
+    state.workstreams.some((candidate) => candidate.bac_id === id),
+  );
+};
+
+const expectWorkstreamSelectorOptions = async (
+  panel: Page,
+  workstreams: readonly { readonly id: string; readonly title: string }[],
+): Promise<void> => {
+  const select = panel.getByTestId('connections-workstream-select');
+  for (const workstream of workstreams) {
+    await expect(select.locator(`option[value="workstream:${workstream.id}"]`)).toHaveText(
+      workstream.title,
+      { timeout: 30_000 },
+    );
+  }
 };
 
 const openConnectionsPanel = async (
@@ -1526,18 +1591,35 @@ test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 com
     await installVisitRoutes(runtimeA);
     await installVisitRoutes(runtimeB);
 
-    const wsSecurityRes = (await apiPost(companionA, '/v1/workstreams', {
+    await openPrivacyGate(companionA, 'engagement');
+    const panelA = await openConnectionsPanel(runtimeA, companionA);
+    const panelB = await openConnectionsPanel(runtimeB, companionB);
+
+    // Let Browser B's vault-change SSE client settle before Browser A
+    // creates workstreams. The assertion below still proves the
+    // production sync path because Browser B is not storage-seeded.
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+
+    const wsSecurityId = await createWorkstreamThroughExtension(runtimeA, panelA, {
       title: 'Copy-fail Linux security research',
-    })) as { data: { bac_id: string } };
-    const wsSwitchboardRes = (await apiPost(companionA, '/v1/workstreams', {
+    });
+    const wsSwitchboardId = await createWorkstreamThroughExtension(runtimeA, panelA, {
       title: 'Switchboard PR review',
-    })) as { data: { bac_id: string } };
-    const wsSecurityId = wsSecurityRes.data.bac_id;
-    const wsSwitchboardId = wsSwitchboardRes.data.bac_id;
+    });
+    const expectedWorkstreams = [
+      { id: wsSecurityId, title: 'Copy-fail Linux security research' },
+      { id: wsSwitchboardId, title: 'Switchboard PR review' },
+    ] as const;
     const codingSessionId = `cs_copyfail_vm_${randomUUID().replaceAll('-', '').slice(0, 16)}`;
 
-    await openPrivacyGate(companionA, 'engagement');
-    const panelA = await openConnectionsPanel(runtimeA, companionA, wsSecurityId);
+    await expectWorkstreamSelectorOptions(panelA, expectedWorkstreams);
+    await waitForCondition(
+      async () => await extensionHasWorkstreams(runtimeB!, panelB, [wsSecurityId, wsSwitchboardId]),
+      'Browser B extension state did not mirror workstreams created through Browser A extension',
+      120_000,
+    );
+    await expectWorkstreamSelectorOptions(panelB, expectedWorkstreams);
+
     await runtimeA.seedStorage(panelA, {
       'sidetrack.timeline.enabled': true,
       'sidetrack.activeWorkstreamId': wsSecurityId,
@@ -1671,7 +1753,6 @@ test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 com
       ),
     ).toBe(true);
 
-    const panelB = await openConnectionsPanel(runtimeB, companionB, wsSecurityId);
     await runtimeB.seedStorage(panelB, {
       'sidetrack.timeline.enabled': true,
       'sidetrack.activeWorkstreamId': wsSecurityId,
