@@ -1914,6 +1914,39 @@ describe('companion HTTP server', () => {
     });
   });
 
+  it('reports work graph health without a trained ranker revision', async () => {
+    const health = await jsonFetch(context, `${baseUrl}/v1/system/health`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+
+    expect(health.status).toBe(200);
+    expect(health.body).toMatchObject({
+      data: {
+        workGraph: {
+          ranker: {
+            activeRevisionId: null,
+            loadStatus: 'missing',
+            retrainSkipReason: 'no-labels',
+          },
+          feedback: {
+            positiveLabelCount: 0,
+            negativeLabelCount: 0,
+          },
+          topicProducer: {
+            activeRevisionId: null,
+            topicCount: 0,
+          },
+        },
+      },
+    });
+    const workGraph = (health.body as { readonly data?: { readonly workGraph?: unknown } }).data
+      ?.workGraph;
+    expect(workGraph).toBeDefined();
+    expect(health.body).toMatchObject({
+      data: { workGraph: { ann: { backend: expect.stringMatching(/^(hnsw|flat)$/u) } } },
+    });
+  });
+
   it('GET /v1/recall/query uses hybrid lexical + vector ranking with chunk metadata', async () => {
     // Seed two chunk-shaped entries directly so we control which one
     // wins on lexical vs vector. The mock embedder above sets

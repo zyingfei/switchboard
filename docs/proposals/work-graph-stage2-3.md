@@ -45,7 +45,7 @@ Pulled from the deferred roadmap in
 ### Future stages — locked scope (per user direction 2026-05-08)
 
 - [ ] 🔵 **F1 deferred.** Optional cloud-LLM enhancement — NOT in this PR. Stays a future PR; the Class E revision pattern from Stage 1 makes it purely additive.
-- [ ] 🟢 **F2.** Cross-replica continuation classifier — the *inference* edge atop `visit_observed_on_replica`. LightGBM over (engagement, provenance, lineage, recency) features.
+- [ ] 🟢 **F2.** Cross-replica continuation classifier — the *inference* edge atop `visit_observed_on_replica`. Implemented as deterministic v1 over engagement, provenance, lineage, and recency features; a learned revision can replace it later under a new revision id.
 - [ ] 🟢 **F3-partial.** DOM-skeleton hash only (no screenshots, no pHash). Captures structural template recognition + DOM-duplicate detection. Privacy-gated (separate `visual.fingerprint` gate).
 - [ ] 🟢 **F4.** ANN indexes (USearch/hnswlib/Faiss). Wraps existing recall index V3 access path; no migration of the binary format.
 - [ ] 🟢 **F5.** HDBSCAN / centroid-stable clustering. Alternative to Union-Find for `topic` formation; consumer of the existing `visit_resembles_visit` edges.

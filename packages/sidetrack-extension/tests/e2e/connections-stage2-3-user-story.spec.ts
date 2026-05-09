@@ -1,68 +1,140 @@
 import { randomUUID } from 'node:crypto';
 
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 
 import { startTestCompanion, type TestCompanion } from './helpers/companion';
 import { installLlmNetworkMock, type LlmNetworkMock } from './helpers/llm-network-mock';
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
 import { SETTINGS_KEY, SETUP_KEY } from './helpers/sidepanel';
+import {
+  buildWorkGraphEvalAcceptedEvents,
+  WORK_GRAPH_EVAL_EXPECTED,
+  WORK_GRAPH_EVAL_VISIT_BY_KEY,
+  WORK_GRAPH_EVAL_VISITS,
+  WORK_GRAPH_EVAL_WORKSTREAM_ID,
+} from '../../../sidetrack-companion/src/connections/__fixtures__/workGraphEval.js';
 
 // Stage 2/3 user-story e2e (L1).
 //
 // Drives the feedback-driven learning loop end-to-end through the UI:
 //
-//   1. Stage 1 UI setup (workstream + timeline + permission). Re-uses the
-//      same pattern as connections-mvp-user-story.spec.ts.
-//   2. Drive 6 real chrome.tabs navigations spanning two clusters
-//      (Postgres MERGE-related, Kubernetes-pod-related).
-//   3. Force-drain spool. Assert visits + visit_in_workstream + (when
-//      embedder produces the right cosines) topic clusters land.
-//   4. Open the Connections panel, navigate to Why-Related on a
-//      cosine-similarity edge.
-//   5. Capture user feedback via the S26 FeedbackButtons (confirm + reject
-//      pair). Assert the corresponding `user.flow.confirmed` /
-//      `user.flow.rejected` events were emitted to the companion.
-//   6. Surface the S27 ProducerPin. Pin a revision. Verify
-//      `chrome.storage.local` now records the pinned revisionId.
-//   7. Verify the stage-2/3 architecture guarantees: zero LLM-shaped
-//      network calls; inferred edges render dashed; producedBy provenance
-//      is exposed on UI surfaces.
-//
-// This e2e ASSERTS the signal-capture chain end-to-end (UI ➝ chrome.runtime
-// message ➝ companion HTTP ➝ event log ➝ feedback projection). It does
-// NOT assert model accuracy — that's the unit tests' job (S20 predict.test,
-// S25 retrain.test).
-//
-// Topic-formation, engagement-class assignment, and closest_visit ranker
-// edges remain INFORMATIONAL (logged, not gated) because the deterministic
-// test embedder doesn't guarantee specific cosine ranges for arbitrary
-// title strings. Stage 1's connections-mvp-user-story.spec.ts established
-// this pattern.
-
-const URL_PG_1 = 'https://example.org/postgres/merge-pitfalls-stage23';
-const URL_PG_2 = 'https://example.org/postgres/upsert-semantics-stage23';
-const URL_PG_3 = 'https://example.org/postgres/merge-vs-upsert-stage23';
-const URL_K8S_1 = 'https://example.org/kubernetes/pod-eviction';
-const URL_K8S_2 = 'https://example.org/kubernetes/pod-restart-policy';
-const URL_HN = 'https://news.ycombinator.com/item?id=stage23_l1';
-
-const ALL_URLS = [URL_PG_1, URL_PG_2, URL_PG_3, URL_K8S_1, URL_K8S_2, URL_HN];
-
-const stripTrailingSlash = (u: string): string => u.replace(/\/+$/u, '');
+//   1. Seed the real companion event log with the deterministic eval pack.
+//      The pack uses `sidetrack_eval_*` cluster tokens that the test embedder
+//      maps to fixed vector axes, so cosine neighborhoods are predictable.
+//   2. Gate the graph snapshot on non-zero Stage 2/3 outputs:
+//      visit_resembles_visit, topic nodes, visit_continues_visit,
+//      closest_visit, and revision-bearing inferred edges.
+//   3. Open the Connections panel, verify Why Related shows ranker feature
+//      contributions, pin the actual ranker revision, and submit confirm +
+//      reject feedback via S26 UI buttons.
+//   4. Assert feedback landed in `/v1/feedback/projection`, force retrain,
+//      and verify the rejected pair's closest_visit score decreases or the
+//      edge disappears.
+//   5. Verify zero LLM-shaped network calls.
 
 interface ConnectionsEnvelope {
   data: {
     snapshot: {
       nodes: { id: string; kind: string; metadata?: Record<string, unknown> }[];
       edges: {
+        id: string;
         kind: string;
         fromNodeId: string;
         toNodeId: string;
         confidence?: string;
         producedBy?: { source?: string; revisionId?: string };
+        metadata?: Record<string, unknown>;
       }[];
     };
   };
+}
+
+type SnapshotEdge = ConnectionsEnvelope['data']['snapshot']['edges'][number];
+
+const nodeIdForVisitKey = (key: keyof typeof WORK_GRAPH_EVAL_VISIT_BY_KEY): string =>
+  `timeline-visit:${WORK_GRAPH_EVAL_VISIT_BY_KEY[key].url}`;
+
+const edgeConnects = (edge: SnapshotEdge, left: string, right: string): boolean =>
+  (edge.fromNodeId === left && edge.toNodeId === right) ||
+  (edge.fromNodeId === right && edge.toNodeId === left);
+
+const edgeScore = (edge: SnapshotEdge): number => {
+  const raw = edge.metadata?.score;
+  return typeof raw === 'number' && Number.isFinite(raw) ? raw : 0;
+};
+
+const topContributionCount = (edge: SnapshotEdge): number => {
+  const raw = edge.metadata?.topContributions;
+  return Array.isArray(raw) ? raw.length : 0;
+};
+
+const waitForConnections = async (
+  comp: TestCompanion,
+  predicate: (env: ConnectionsEnvelope) => boolean,
+  message: string,
+): Promise<ConnectionsEnvelope> => {
+  const startedMs = Date.now();
+  let latest: ConnectionsEnvelope | null = null;
+  while (Date.now() - startedMs < 90_000) {
+    latest = (await apiGet(comp, '/v1/connections')) as ConnectionsEnvelope;
+    if (predicate(latest)) return latest;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  throw new Error(`${message}; latest=${JSON.stringify(latest?.data.snapshot ?? null)}`);
+};
+
+const findEdge = (
+  env: ConnectionsEnvelope,
+  kind: string,
+  left: string,
+  right: string,
+): SnapshotEdge | undefined =>
+  env.data.snapshot.edges.find((edge) => edge.kind === kind && edgeConnects(edge, left, right));
+
+const clickVisibleEdge = async (panel: Page, edge: SnapshotEdge): Promise<void> => {
+  const row = panel.getByTestId(`edge-${edge.id}`);
+  await expect(row).toBeVisible({ timeout: 10_000 });
+  await row.click();
+};
+
+interface FeedbackProjectionEnvelope {
+  data: {
+    positiveLabels: { fromId: string; toId: string }[];
+    negativeLabels: { fromId: string; toId: string }[];
+  };
+}
+
+interface HealthEnvelope {
+  data: {
+    workGraph?: {
+      ranker?: {
+        activeRevisionId: string | null;
+        loadStatus: string;
+        retrainSkipReason: string | null;
+      };
+      ann?: { backend: string; fallbackActive: boolean };
+      feedback?: { positiveLabelCount: number; negativeLabelCount: number };
+      topicProducer?: {
+        activeRevisionId: string | null;
+        algorithmVersion: string | null;
+        topicCount: number;
+      };
+    };
+  };
+}
+
+interface RetrainEnvelope {
+  data:
+    | {
+        status: 'trained';
+        revisionId: string;
+        candidateCount: number;
+      }
+    | {
+        status: 'skipped' | 'failed';
+        reason?: string;
+        error?: string;
+      };
 }
 
 const apiGet = async (comp: TestCompanion, path: string): Promise<unknown> => {
@@ -93,7 +165,7 @@ const apiPost = async (
 
 test.describe('Stage 2/3 user story (feedback + producer pin)', () => {
   test.skip(
-    process.env['SIDETRACK_E2E_SKIP_LIVE_BROWSERS'] === '1',
+    process.env.SIDETRACK_E2E_SKIP_LIVE_BROWSERS === '1',
     'set SIDETRACK_E2E_SKIP_LIVE_BROWSERS=1 to skip when CfT is unavailable',
   );
   test.setTimeout(240_000);
@@ -111,36 +183,100 @@ test.describe('Stage 2/3 user story (feedback + producer pin)', () => {
 
   test('drives the feedback loop end-to-end with zero LLM calls', async () => {
     companion = await startTestCompanion();
+    await companion.ingestEvents(buildWorkGraphEvalAcceptedEvents());
+
+    const expectedVisitIds = WORK_GRAPH_EVAL_VISITS.map((visit) => `timeline-visit:${visit.url}`);
+    const seededEnv = await waitForConnections(
+      companion,
+      (candidate) => {
+        const ids = new Set(candidate.data.snapshot.nodes.map((node) => node.id));
+        return expectedVisitIds.every((id) => ids.has(id));
+      },
+      'work-graph eval visits did not materialize',
+    );
+
+    const wsEdges = seededEnv.data.snapshot.edges.filter(
+      (edge) =>
+        edge.kind === 'visit_in_workstream' &&
+        edge.toNodeId === `workstream:${WORK_GRAPH_EVAL_WORKSTREAM_ID}`,
+    );
+    expect(wsEdges.length).toBeGreaterThanOrEqual(WORK_GRAPH_EVAL_VISITS.length);
+
+    const resemblesEdges = seededEnv.data.snapshot.edges.filter(
+      (edge) => edge.kind === 'visit_resembles_visit',
+    );
+    expect(resemblesEdges.length).toBeGreaterThan(0);
+
+    const topicNodes = seededEnv.data.snapshot.nodes.filter((node) => node.kind === 'topic');
+    expect(topicNodes.length).toBeGreaterThan(0);
+    for (const expectedTopic of WORK_GRAPH_EVAL_EXPECTED.expectedTopicClusters) {
+      const matchingTopic = topicNodes.find((node) => {
+        const memberCount = node.metadata?.memberCount;
+        const titles = node.metadata?.representativeTitles;
+        return (
+          typeof memberCount === 'number' &&
+          memberCount >= expectedTopic.minimumMembers &&
+          Array.isArray(titles) &&
+          titles.some(
+            (title) =>
+              typeof title === 'string' &&
+              title.includes(`sidetrack_eval_${expectedTopic.cluster}`),
+          )
+        );
+      });
+      expect(matchingTopic, `topic for ${expectedTopic.cluster}`).toBeDefined();
+    }
+
+    const continuationEdges = seededEnv.data.snapshot.edges.filter(
+      (edge) => edge.kind === 'visit_continues_visit',
+    );
+    expect(continuationEdges.length).toBeGreaterThan(0);
+
+    const baselineRetrain = (await apiPost(companion, '/v1/connections/ranker/retrain', {
+      force: true,
+      numRound: 8,
+      randomNegativeCandidatesPerPositive: 1,
+    })) as RetrainEnvelope;
+    expect(baselineRetrain.data.status).toBe('trained');
+    if (baselineRetrain.data.status !== 'trained') {
+      throw new Error(`baseline retrain did not train: ${JSON.stringify(baselineRetrain.data)}`);
+    }
+    const baselineRevisionId = baselineRetrain.data.revisionId;
+
+    const env = await waitForConnections(
+      companion,
+      (candidate) => candidate.data.snapshot.edges.some((edge) => edge.kind === 'closest_visit'),
+      'closest_visit edges did not materialize after forced retrain',
+    );
+    const closestVisitEdges = env.data.snapshot.edges.filter(
+      (edge) => edge.kind === 'closest_visit',
+    );
+    expect(closestVisitEdges.length).toBeGreaterThan(0);
+    for (const edge of closestVisitEdges) {
+      expect(edge.confidence).toBe('inferred');
+      expect(edge.producedBy?.source).toBe('ranker');
+      expect(edge.producedBy?.revisionId).toBe(baselineRevisionId);
+      expect(topContributionCount(edge)).toBeGreaterThan(0);
+    }
+
+    const inferredRevisionEdges = env.data.snapshot.edges.filter(
+      (edge) => edge.confidence === 'inferred' && typeof edge.producedBy?.revisionId === 'string',
+    );
+    expect(inferredRevisionEdges.length).toBeGreaterThan(0);
+
+    const health = (await apiGet(companion, '/v1/system/health')) as HealthEnvelope;
+    expect(health.data.workGraph?.ranker?.activeRevisionId).toBe(baselineRevisionId);
+    expect(health.data.workGraph?.ranker?.loadStatus).toBe('ready');
+    expect(health.data.workGraph?.ann?.backend).toMatch(/^(hnsw|flat)$/u);
+    expect(health.data.workGraph?.feedback?.positiveLabelCount).toBeGreaterThan(0);
+    expect(health.data.workGraph?.feedback?.negativeLabelCount).toBeGreaterThan(0);
+    expect(health.data.workGraph?.topicProducer?.activeRevisionId).toEqual(expect.any(String));
+    expect(health.data.workGraph?.topicProducer?.topicCount).toBeGreaterThan(0);
+
     runtime = await launchExtensionRuntime({ forceLocalProfile: true });
 
     llmMock = await installLlmNetworkMock(runtime.context);
 
-    await runtime.context.route(/^https?:\/\//u, async (route) => {
-      const url = route.request().url();
-      if (ALL_URLS.some((target) => url.startsWith(target.split('?')[0]))) {
-        const title =
-          url.includes('postgres/merge-pitfalls')
-            ? 'Postgres MERGE Pitfalls — Stage 2/3 e2e'
-            : url.includes('postgres/upsert-semantics')
-              ? 'Postgres UPSERT semantics — Stage 2/3 e2e'
-              : url.includes('postgres/merge-vs-upsert')
-                ? 'Postgres MERGE vs UPSERT — Stage 2/3 e2e'
-                : url.includes('kubernetes/pod-eviction')
-                  ? 'Kubernetes Pod Eviction — Stage 2/3 e2e'
-                  : url.includes('kubernetes/pod-restart-policy')
-                    ? 'Kubernetes Pod Restart Policy — Stage 2/3 e2e'
-                    : 'HN: Postgres MERGE deep dive — Stage 2/3 e2e';
-        await route.fulfill({
-          status: 200,
-          contentType: 'text/html',
-          body: `<!doctype html><title>${title}</title><body><h1>${title}</h1><p>${title}</p></body>`,
-        });
-        return;
-      }
-      await route.fallback();
-    });
-
-    // ── Stage 1 UI setup ──────────────────────────────────────────────
     const panel = await runtime.context.newPage();
     await panel.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
       waitUntil: 'domcontentloaded',
@@ -153,176 +289,136 @@ test.describe('Stage 2/3 user story (feedback + producer pin)', () => {
         siteToggles: { chatgpt: true, claude: true, gemini: true },
         notifyOnQueueComplete: true,
       },
+      'sidetrack.activeWorkstreamId': WORK_GRAPH_EVAL_WORKSTREAM_ID,
     });
     await panel.reload({ waitUntil: 'domcontentloaded' });
     await expect(panel.getByRole('main', { name: 'Sidetrack workboard' })).toBeVisible({
       timeout: 30_000,
     });
 
-    // Workstream create + select.
-    const workstreamTitle = 'Stage 2/3 — feedback loop research';
-    await panel.getByRole('button', { name: 'Add sub-workstream' }).click();
-    await panel.getByPlaceholder('New workstream name…').fill(workstreamTitle);
-    await panel.getByRole('button', { name: 'Create', exact: true }).click();
-    const wsRow = panel.locator('.ws-picker-row', { hasText: workstreamTitle }).first();
-    await expect(wsRow).toBeVisible({ timeout: 15_000 });
-    await wsRow.click();
-
-    const activeWsId = await panel.evaluate(async () => {
-      const got = await chrome.storage.local.get('sidetrack.activeWorkstreamId');
-      const v = got['sidetrack.activeWorkstreamId'];
-      return typeof v === 'string' ? v : null;
-    });
-    expect(activeWsId).toBeTruthy();
-    if (activeWsId === null) throw new Error('active workstream id not persisted');
-
-    // Settings → Timeline ON + Grant URL.
-    await panel.getByRole('button', { name: 'Settings' }).click();
-    const timelineSection = panel.getByTestId('settings-timeline-section');
-    await expect(timelineSection).toBeVisible({ timeout: 10_000 });
-    await timelineSection.scrollIntoViewIfNeeded();
-    await panel.locator('label.switch', { hasText: 'Observe browser activity' }).click();
-    const grantBtn = panel.getByTestId('settings-timeline-grant-permission');
-    if (await grantBtn.isVisible().catch(() => false)) {
-      await grantBtn.scrollIntoViewIfNeeded();
-      await grantBtn.click();
-    }
-    await panel.locator('button.btn.btn-ghost', { hasText: 'Close' }).click();
-
-    // ── Drive 6 navigations ────────────────────────────────────────────
-    for (const url of ALL_URLS) {
-      const t = await runtime.context.newPage();
-      await t.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
-      await t.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => undefined);
-      await new Promise((r) => setTimeout(r, 400));
-      await t.close();
-    }
-
-    // ── Force-drain ────────────────────────────────────────────────────
-    const drainSender = await runtime.context.newPage();
-    await drainSender.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
-      waitUntil: 'domcontentloaded',
-    });
-    for (let attempt = 0; attempt < 30; attempt += 1) {
-      const r = (await runtime.sendRuntimeMessage(drainSender, {
-        type: 'sidetrack.timeline.force-drain',
-      })) as { ok?: boolean; drain?: { uploaded?: number } } | null;
-      if (r !== null && r.ok === true && (r.drain?.uploaded ?? 0) >= ALL_URLS.length) break;
-      await new Promise((r) => setTimeout(r, 500));
-    }
-    await drainSender.close();
-
-    // ── Wait for visits to land on the companion side ──────────────────
-    const wantNodeIds = ALL_URLS.map((u) => `timeline-visit:${stripTrailingSlash(u)}`);
-    const startedMs = Date.now();
-    let env: ConnectionsEnvelope | null = null;
-    while (Date.now() - startedMs < 60_000) {
-      env = (await apiGet(companion, '/v1/connections')) as ConnectionsEnvelope;
-      const ids = new Set(env.data.snapshot.nodes.map((n) => n.id));
-      if (wantNodeIds.every((w) => ids.has(w))) break;
-      await new Promise((r) => setTimeout(r, 500));
-    }
-    if (env === null) throw new Error('connections snapshot never returned');
-
-    // ── Stage 1 inherited assertions ───────────────────────────────────
-    // visit_in_workstream edges with confidence: 'inferred'.
-    const wsEdges = env.data.snapshot.edges.filter(
-      (e) => e.kind === 'visit_in_workstream' && e.toNodeId === `workstream:${activeWsId}`,
-    );
-    expect(wsEdges.length).toBeGreaterThanOrEqual(ALL_URLS.length);
-    for (const edge of wsEdges) expect(edge.confidence).toBe('inferred');
-
-    // ── Stage 2 — `closest_visit` edges (informational) ────────────────
-    // Under the deterministic test embedder + small test corpus, the LightGBM
-    // ranker may not produce closest_visit edges; if it does, every score
-    // must come with per-feature contributions in metadata.
-    const closestVisitEdges = env.data.snapshot.edges.filter(
-      (e) => e.kind === 'closest_visit',
-    );
-    // eslint-disable-next-line no-console
-    console.log(`[stage2-3-user-story] closest_visit edges: ${String(closestVisitEdges.length)}`);
-    for (const edge of closestVisitEdges) {
-      expect(edge.producedBy?.source).toBe('ranker');
-      expect(typeof edge.producedBy?.revisionId).toBe('string');
-    }
-
-    // ── Stage 2 — `visit_continues_visit` edges (informational) ────────
-    const continuationEdges = env.data.snapshot.edges.filter(
-      (e) => e.kind === 'visit_continues_visit',
-    );
-    // eslint-disable-next-line no-console
-    console.log(
-      `[stage2-3-user-story] visit_continues_visit edges: ${String(continuationEdges.length)}`,
-    );
-
-    // ── S26 — feedback capture via UI ──────────────────────────────────
-    // Open the Connections view, anchor on the workstream, switch to a
-    // mode that surfaces feedback affordances. The FeedbackButtons
-    // component renders inside the Why Related panel + Focus View.
     await panel.bringToFront();
-    await panel.reload({ waitUntil: 'domcontentloaded' });
     await panel.getByRole('tab', { name: 'Connections' }).click();
     await expect(panel.getByTestId('connections-view')).toBeVisible({ timeout: 10_000 });
 
     const anchor = panel.getByTestId('connections-anchor-input');
     await anchor.click();
-    await anchor.fill(`workstream:${activeWsId}`);
+    await anchor.fill(`workstream:${WORK_GRAPH_EVAL_WORKSTREAM_ID}`);
     await anchor.press('Enter');
     await expect(panel.getByTestId('connections-groups')).toBeVisible({ timeout: 30_000 });
 
-    // Switch to Focus View where feedback buttons surface on cards.
-    await panel.getByTestId('connections-mode-focus').click();
-    await expect(panel.getByTestId('focus-view')).toBeVisible();
-
-    // The first FeedbackButtons row in the panel — confirm + reject pair.
-    const firstFeedbackRow = panel.getByTestId('feedback-buttons').first();
-    if (await firstFeedbackRow.isVisible().catch(() => false)) {
-      const confirmBtn = firstFeedbackRow.getByTestId('feedback-confirm');
-      const rejectBtn = firstFeedbackRow.getByTestId('feedback-reject');
-      await confirmBtn.click().catch(() => undefined);
-      await new Promise((r) => setTimeout(r, 400));
-      // Re-locate the second FeedbackButtons row (different visit) for reject.
-      const allRows = panel.getByTestId('feedback-buttons');
-      const rowCount = await allRows.count();
-      if (rowCount > 1) {
-        const second = allRows.nth(1).getByTestId('feedback-reject');
-        await second.click().catch(() => undefined);
-      } else {
-        await rejectBtn.click().catch(() => undefined);
-      }
-      await new Promise((r) => setTimeout(r, 600));
+    const rejectedFromId = nodeIdForVisitKey(WORK_GRAPH_EVAL_EXPECTED.feedbackEffect.rejectedPair[0]);
+    const rejectedToId = nodeIdForVisitKey(WORK_GRAPH_EVAL_EXPECTED.feedbackEffect.rejectedPair[1]);
+    const confirmedFromId = nodeIdForVisitKey('pg_merge_a');
+    const confirmedToId = nodeIdForVisitKey('pg_merge_c');
+    const rejectEdge = findEdge(env, 'closest_visit', rejectedFromId, rejectedToId);
+    const confirmEdge =
+      findEdge(env, 'closest_visit', confirmedFromId, confirmedToId) ??
+      findEdge(env, 'visit_resembles_visit', confirmedFromId, confirmedToId);
+    expect(rejectEdge, 'baseline closest_visit edge to reject').toBeDefined();
+    expect(confirmEdge, 'baseline relation edge to confirm').toBeDefined();
+    if (rejectEdge === undefined || confirmEdge === undefined) {
+      throw new Error('Missing baseline feedback edges.');
     }
-
-    // ── Verify feedback events landed on the companion ─────────────────
-    // Feedback events are Class A; companion stores them in the event log.
-    // Quick check: query /v1/connections again; the snapshot should reflect
-    // any user-asserted edges. For this e2e we assert via /v1/feedback OR
-    // /v1/connections (whichever is wired). If the feedback projection is
-    // consumer-only, snapshot edges may not change immediately — we just
-    // verify the round-trip didn't error.
-    const envPostFeedback = (await apiGet(
-      companion,
-      '/v1/connections',
-    )) as ConnectionsEnvelope;
-    expect(envPostFeedback.data.snapshot.nodes.length).toBeGreaterThan(0);
-
-    // ── S27 — producer-pin UI surfaces ─────────────────────────────────
-    // Open Linked mode + click an edge to surface Why Related, then verify
-    // ProducerPin renders for any inferred edge that has a revisionId. If
-    // no inferred edge has a revisionId in this test run, the pin is
-    // simply absent — that's not a failure (the unit suite covers
-    // ProducerPin determinism).
-    await panel.getByTestId('connections-mode-linked').click();
-    await expect(panel.getByTestId('connections-groups')).toBeVisible();
-    const inferredEdges = env.data.snapshot.edges.filter(
-      (e) => e.confidence === 'inferred' && typeof e.producedBy?.revisionId === 'string',
-    );
+    const rejectScoreBefore = edgeScore(rejectEdge);
     // eslint-disable-next-line no-console
     console.log(
-      `[stage2-3-user-story] inferred edges with revisionId: ${String(inferredEdges.length)}`,
+      `[stage2-3] rejected closest_visit score before retrain: ${rejectedFromId} -> ${rejectedToId} = ${String(
+        rejectScoreBefore,
+      )}`,
     );
 
-    // ── Final architectural-guarantee assertions ───────────────────────
-    if (llmMock !== null) llmMock.assertNoLlmCalls();
+    await anchor.click();
+    await anchor.fill(rejectedFromId);
+    await anchor.press('Enter');
+    await panel.getByTestId('connections-mode-linked').click();
+    await clickVisibleEdge(panel, rejectEdge);
+    await expect(panel.getByTestId('edge-provenance')).toBeVisible({ timeout: 10_000 });
+    await expect(panel.getByTestId('producer-pin-ranker')).toBeVisible();
+    await panel.getByTestId('producer-pin-ranker-pin').click();
+    const pinnedRevision = await panel.evaluate(async () => {
+      const got = await chrome.storage.local.get('sidetrack.producerPin.ranker');
+      const value = got['sidetrack.producerPin.ranker'];
+      return typeof value === 'string' ? value : null;
+    });
+    expect(pinnedRevision).toBe(baselineRevisionId);
+
+    await panel.getByTestId('connections-mode-focus').click();
+    await expect(panel.getByTestId('focus-view')).toBeVisible();
+    const topicEdge = env.data.snapshot.edges.find(
+      (edge) => edge.kind === 'visit_in_topic' && edge.fromNodeId === rejectedFromId,
+    );
+    expect(topicEdge, 'topic membership for Why Related visit').toBeDefined();
+    if (topicEdge === undefined) throw new Error('Missing topic membership for Why Related visit.');
+    await panel.getByTestId(`focus-expand-${topicEdge.toNodeId}`).click();
+    await panel.getByTestId(`focus-visit-${rejectedFromId}`).click();
+    await expect(panel.getByTestId('why-related-panel')).toBeVisible();
+    await expect(panel.getByTestId('why-related-panel')).toContainText(/Ranker score/u);
+    await expect(panel.getByTestId('why-related-panel')).toContainText(
+      /Ranker score [0-9.]+: [a-z_]+ [+-][0-9.]+/u,
+    );
+
+    await panel.getByTestId('connections-mode-linked').click();
+    await expect(panel.getByTestId('connections-groups')).toBeVisible();
+    await clickVisibleEdge(panel, confirmEdge);
+    await panel.getByTestId('edge-provenance').getByTestId('feedback-confirm').click();
+    await expect(panel.getByTestId('edge-provenance').getByTestId('feedback-saved')).toBeVisible();
+    await clickVisibleEdge(panel, rejectEdge);
+    await panel.getByTestId('edge-provenance').getByTestId('feedback-reject').click();
+    await expect(panel.getByTestId('edge-provenance').getByTestId('feedback-saved')).toBeVisible();
+
+    const feedbackProjection = (await apiGet(
+      companion,
+      '/v1/feedback/projection',
+    )) as FeedbackProjectionEnvelope;
+    expect(
+      feedbackProjection.data.positiveLabels.some(
+        (label) => label.fromId === confirmEdge.fromNodeId && label.toId === confirmEdge.toNodeId,
+      ),
+    ).toBe(true);
+    expect(
+      feedbackProjection.data.negativeLabels.some(
+        (label) => label.fromId === rejectEdge.fromNodeId && label.toId === rejectEdge.toNodeId,
+      ),
+    ).toBe(true);
+
+    const retrained = (await apiPost(companion, '/v1/connections/ranker/retrain', {
+      force: true,
+      numRound: 8,
+      randomNegativeCandidatesPerPositive: 1,
+    })) as RetrainEnvelope;
+    expect(retrained.data.status).toBe('trained');
+    if (retrained.data.status !== 'trained') {
+      throw new Error(`post-feedback retrain did not train: ${JSON.stringify(retrained.data)}`);
+    }
+    expect(retrained.data.revisionId).not.toBe(baselineRevisionId);
+
+    const retrainedEnv = (await apiGet(companion, '/v1/connections')) as ConnectionsEnvelope;
+    const rejectEdgeAfter = findEdge(retrainedEnv, 'closest_visit', rejectedFromId, rejectedToId);
+    if (rejectEdgeAfter !== undefined) {
+      const rejectScoreAfter = edgeScore(rejectEdgeAfter);
+      // eslint-disable-next-line no-console
+      console.log(
+        `[stage2-3] rejected closest_visit score after retrain: ${rejectedFromId} -> ${rejectedToId} = ${String(
+          rejectScoreAfter,
+        )}`,
+      );
+      expect(rejectScoreAfter).toBeLessThan(rejectScoreBefore);
+    } else {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[stage2-3] rejected closest_visit score after retrain: ${rejectedFromId} -> ${rejectedToId} = edge disappeared`,
+      );
+    }
+
+    const postRetrainHealth = (await apiGet(companion, '/v1/system/health')) as HealthEnvelope;
+    expect(postRetrainHealth.data.workGraph?.ranker?.activeRevisionId).toBe(
+      retrained.data.revisionId,
+    );
+    expect(postRetrainHealth.data.workGraph?.ranker?.loadStatus).toBe('ready');
+    expect(postRetrainHealth.data.workGraph?.feedback?.negativeLabelCount).toBeGreaterThanOrEqual(
+      2,
+    );
+
+    llmMock.assertNoLlmCalls();
   });
 });
