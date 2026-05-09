@@ -19,6 +19,10 @@ import { randomBytes } from 'node:crypto';
 const TEST_TICK_COLLECTOR_ID = 'sidetrack.test-tick' as const;
 const TEST_TICK_COLLECTOR_VERSION = '0.1.0' as const;
 
+// Same shape as the default test-tick lines but parameterized by
+// collector_id so spine.e2e.ts test #6 can drive two collectors
+// emitting the same event_type ("tick") with distinct ruleIds.
+
 export interface TestTickWriteOpts {
   readonly vaultRoot: string;
   readonly collectorRunId?: string; // ULID-ish; auto-generated if omitted
@@ -94,13 +98,20 @@ const buildLine = (
 // in one shot.)
 export const writeTickBatch = async (
   count: number,
-  opts: TestTickWriteOpts,
+  opts: TestTickWriteOpts & { readonly collectorId?: string },
 ): Promise<{ readonly runId: string; readonly path: string; readonly lines: number }> => {
+  const collectorId = opts.collectorId ?? TEST_TICK_COLLECTOR_ID;
   const runId = opts.collectorRunId ?? generateRunId();
   const base = opts.emittedAtBase ?? new Date();
   const payloadVersion = opts.payloadVersion ?? 1;
   const dateStamp = opts.dateStamp ?? dateStampUtc(base);
-  const finalPath = inboxFilePath(opts.vaultRoot, dateStamp);
+  const finalPath = join(
+    opts.vaultRoot,
+    '_BAC',
+    'inbox',
+    collectorId,
+    `${dateStamp}.jsonl`,
+  );
 
   await mkdir(dirname(finalPath), { recursive: true });
 
@@ -108,7 +119,9 @@ export const writeTickBatch = async (
 
   const lines: string[] = [];
   for (let i = 0; i < count; i += 1) {
-    lines.push(JSON.stringify(buildLine(i, base, runId, payloadVersion)));
+    const line = buildLine(i, base, runId, payloadVersion);
+    // Override collector_id at the line level when the param is set.
+    lines.push(JSON.stringify({ ...line, collector_id: collectorId }));
   }
   const merged = existing + lines.join('\n') + (lines.length > 0 ? '\n' : '');
 

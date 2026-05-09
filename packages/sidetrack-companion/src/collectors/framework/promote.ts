@@ -18,10 +18,11 @@
 // injected `onPromote` (which appends Class A events) and `isAlreadyPromoted`
 // (which checks the dedup ledger).
 
-import type {
-  CollectorEvent,
-  PromotionResult,
-  QuarantineReason,
+import {
+  MAX_RAW_LINE_BYTES,
+  type CollectorEvent,
+  type PromotionResult,
+  type QuarantineReason,
 } from './types.js';
 import type { MaterializerRegistration, MaterializerRegistry } from './materializer.js';
 import {
@@ -135,6 +136,23 @@ export const materializeCollectorLine = async (
   rawLine: string,
   ctx: PromoteContext,
 ): Promise<PromotionResult> => {
+  // 0. Safety cap: drop oversized lines BEFORE JSON.parse to bound
+  // parser-memory worst case. The line still goes to quarantine for
+  // forensics; the audit subtype is collector:line-too-large.
+  if (Buffer.byteLength(rawLine, 'utf8') > MAX_RAW_LINE_BYTES) {
+    const placeholder: CollectorEvent = {
+      collector_id: '<too-large>',
+      event_type: '<too-large>',
+      payload_version: 0,
+      emitted_at: new Date(0).toISOString(),
+      collector_version: '0.0.0',
+      collector_run_id: '<too-large>',
+      payload: rawLine.slice(0, 1024),
+      dimensions: { byte_length: Buffer.byteLength(rawLine, 'utf8') },
+    };
+    return quarantine(placeholder, 'line-too-large');
+  }
+
   // 1. Parse JSON envelope. Malformed → caller treats as "line-malformed"
   // and writes to quarantine via the never-drop policy.
   let parsed: unknown;

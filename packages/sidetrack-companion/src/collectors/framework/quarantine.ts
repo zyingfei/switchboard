@@ -16,7 +16,11 @@ import {
   quarantineFileFor,
   quarantineRootFor,
 } from '../../vault/inbox.js';
-import type { CollectorEvent, QuarantineReason } from './types.js';
+import {
+  MAX_QUARANTINE_RAW_BYTES,
+  type CollectorEvent,
+  type QuarantineReason,
+} from './types.js';
 
 export interface QuarantineEntry {
   readonly line: CollectorEvent;
@@ -27,6 +31,9 @@ export interface QuarantineEntry {
   readonly companion_version: string;
   readonly framework_version: string;
   readonly last_replay_at?: string | null;
+  // Set when the original raw line exceeded MAX_QUARANTINE_RAW_BYTES;
+  // raw_line is truncated to the cap, the hash still covers original.
+  readonly truncated_original_bytes?: number;
 }
 
 export interface QuarantineWriter {
@@ -123,15 +130,26 @@ export const createQuarantineWriter = (opts: QuarantineOpts): QuarantineWriter =
         return { written: false, path };
       }
 
+      // Cap raw_line size at MAX_QUARANTINE_RAW_BYTES — line_hash
+      // still reflects the original full bytes for dedup, but the
+      // stored body is truncated so quarantine files don't bloat
+      // unbounded on pathological inputs.
+      const rawBytes = Buffer.byteLength(rawLine, 'utf8');
+      const truncated = rawBytes > MAX_QUARANTINE_RAW_BYTES;
+      const storedRawLine = truncated
+        ? Buffer.from(rawLine, 'utf8').subarray(0, MAX_QUARANTINE_RAW_BYTES).toString('utf8')
+        : rawLine;
+
       const entry: QuarantineEntry = {
         line: parsed,
-        raw_line: rawLine,
+        raw_line: storedRawLine,
         line_hash: lineHash,
         quarantined_at: at.toISOString(),
         reason,
         companion_version: companionVersion,
         framework_version: frameworkVersion,
         last_replay_at: null,
+        ...(truncated ? { truncated_original_bytes: rawBytes } : {}),
       };
       const body = JSON.stringify(entry) + '\n';
       await writeFile(path, body, { encoding: 'utf8', flag: 'a' });

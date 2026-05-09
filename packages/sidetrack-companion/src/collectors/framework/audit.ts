@@ -21,6 +21,7 @@ export const COLLECTOR_AUDIT_ROUTES = {
   LINE_PROMOTED: 'collector:line-promoted',
   LINE_QUARANTINED: 'collector:line-quarantined',
   LINE_DEDUPED: 'collector:line-deduped',
+  LINE_TOO_LARGE: 'collector:line-too-large',
   BOOKMARK_ADVANCED: 'collector:bookmark-advanced',
   // Manifest discovery + load decision.
   MANIFEST_LOADED: 'collector:manifest-loaded',

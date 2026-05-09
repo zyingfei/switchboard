@@ -9,7 +9,7 @@ export interface TestTickManifestOpts {
   readonly version?: string; // default '0.1.0'
   readonly manifestSchema?: number; // default 1
   readonly requiresCompanion?: string; // default '>=1.0.0 <2.0.0'
-  readonly requiresVault?: string; // default '>=1'
+  readonly requiresVault?: number; // default 1 (integer per manifest schema)
   readonly emits?: ReadonlyArray<{
     readonly event_type: string;
     readonly payload_version: number;
@@ -27,7 +27,7 @@ export const renderTestTickManifest = (opts: TestTickManifestOpts = {}): string 
   const version = opts.version ?? '0.1.0';
   const manifestSchema = opts.manifestSchema ?? 1;
   const requiresCompanion = opts.requiresCompanion ?? '>=1.0.0 <2.0.0';
-  const requiresVault = opts.requiresVault ?? '>=1';
+  const requiresVault = opts.requiresVault ?? 1;
   const emits = opts.emits ?? [{ event_type: 'tick', payload_version: 1, stability: 'beta' }];
   const readsPaths = opts.readsPaths ?? [];
   const readsEnv = opts.readsEnv ?? [];
@@ -52,11 +52,10 @@ manifest_schema = ${manifestSchema}
 
 [compatibility]
 requires-companion = ${JSON.stringify(requiresCompanion)}
-requires-vault     = ${JSON.stringify(requiresVault)}
+requires-vault     = ${requiresVault}
 
 ${emitBlocks}
 [io]
-output_dir = "_BAC/inbox/${id}/"
 rotation = "daily"
 
 [capabilities]

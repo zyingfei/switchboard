@@ -2268,6 +2268,93 @@ describe('companion HTTP server', () => {
     expect(result.body).toMatchObject({ code: 'AUTO_UPDATE_DISABLED' });
   });
 
+  // Stage 4 — collector framework HTTP routes.
+  it('GET /v1/collectors returns 503 when framework is not wired', async () => {
+    const result = await jsonFetch(context, `${baseUrl}/v1/collectors`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect(result.status).toBe(503);
+    expect(result.body).toMatchObject({ error: 'collector framework not enabled' });
+  });
+
+  it('GET /v1/collectors lists loaded manifests when framework is wired', async () => {
+    context = {
+      ...context,
+      collectorFramework: {
+        loadedCollectors: () => [
+          {
+            manifest: {
+              id: 'sidetrack.test-tick',
+              name: 'Test Tick',
+              version: '0.1.0',
+              manifest_schema: 1,
+              emits: [{ event_type: 'tick', payload_version: 1, stability: 'beta' as const }],
+              capabilities: {
+                'reads-paths': [],
+                'reads-env': [],
+                'reads-network': false,
+                'default-enabled': true,
+              },
+            },
+            status: 'loaded' as const,
+          },
+        ],
+        quarantineCountFor: async () => 0,
+        replayCollector: async () => ({
+          scanned: 0,
+          promoted: 0,
+          stillQuarantined: 0,
+        }),
+      },
+    };
+    const result = await jsonFetch(context, `${baseUrl}/v1/collectors`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({
+      collectors: [
+        {
+          collector_id: 'sidetrack.test-tick',
+          name: 'Test Tick',
+          version: '0.1.0',
+          status: 'loaded',
+          quarantine_count: 0,
+        },
+      ],
+    });
+  });
+
+  it('POST /v1/collectors/{id}/replay invokes the framework replay', async () => {
+    const replayed: string[] = [];
+    context = {
+      ...context,
+      collectorFramework: {
+        loadedCollectors: () => [],
+        quarantineCountFor: async () => 0,
+        replayCollector: async (collectorId) => {
+          replayed.push(collectorId);
+          return { scanned: 7, promoted: 4, stillQuarantined: 3 };
+        },
+      },
+    };
+    const result = await jsonFetch(
+      context,
+      `${baseUrl}/v1/collectors/sidetrack.test-tick/replay`,
+      {
+        method: 'POST',
+        headers: { 'x-bac-bridge-key': bridgeKey },
+      },
+    );
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({
+      collector_id: 'sidetrack.test-tick',
+      scanned: 7,
+      promoted: 4,
+      still_quarantined: 3,
+    });
+    expect(replayed).toEqual(['sidetrack.test-tick']);
+  });
+
   it('lists and replaces multi-vault buckets', async () => {
     const secondary = await mkdtemp(join(tmpdir(), 'sidetrack-secondary-vault-'));
     context = { ...context, bucketRegistry: createBucketRegistry(vaultPath) };

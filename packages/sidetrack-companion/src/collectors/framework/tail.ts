@@ -40,7 +40,7 @@ import { join } from 'node:path';
 
 import { writeJsonAtomic } from '../../vault/atomic.js';
 import { bookmarkPathFor, inboxDirFor, inboxFileFor } from '../../vault/inbox.js';
-import type { PromotionResult } from './types.js';
+import { MAX_RAW_LINE_BYTES, type PromotionResult } from './types.js';
 
 interface Bookmark {
   readonly filename: string;
@@ -162,6 +162,15 @@ export const startTail = async (opts: TailOpts): Promise<TailHandle> => {
         cursor += consumed;
         continue;
       }
+      // Safety cap: route oversized lines to a dedicated audit
+      // subtype so observers can spot pathological producers without
+      // grepping the full quarantine reason set. The choke point
+      // still applies its own MAX_RAW_LINE_BYTES guard, but emitting
+      // line-too-large here makes the audit trail explicit at the
+      // tail boundary.
+      if (Buffer.byteLength(line, 'utf8') > MAX_RAW_LINE_BYTES) {
+        await auditRoute('collector:line-too-large', `${collectorId}:${String(cursor)}`);
+      }
       await auditRoute('collector:line-read', `${collectorId}:${String(cursor)}`);
       try {
         const result = await onLine(line);
@@ -244,11 +253,17 @@ export const startTail = async (opts: TailOpts): Promise<TailHandle> => {
       if (scheduledTimer !== null) {
         clearTimeout(scheduledTimer);
         scheduledTimer = null;
-        enqueueProcess();
       }
+      // Always force an unconditional rescan so any bytes that
+      // landed via writeTickBatch (or any producer) BEFORE fs.watch
+      // delivered its notification still get processed. Without
+      // this, waitIdle returns "no work pending" while the OS has
+      // bytes queued for the watcher's dispatch.
+      enqueueProcess();
       await processing;
       // One more pass in case enqueueProcess fired processing while
-      // we awaited.
+      // we awaited (chained file growth on macOS APFS).
+      enqueueProcess();
       await processing;
     },
     async close() {

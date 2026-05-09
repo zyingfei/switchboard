@@ -1,8 +1,28 @@
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+
 import { ensureBridgeKey } from '../auth/bridgeKey.js';
 import { createIdempotencyStore } from '../http/idempotency.js';
 import { pickInstaller } from '../install/index.js';
 import { createRecallActivityTracker } from '../recall/activity.js';
 import { createRecallLifecycle } from '../recall/lifecycle.js';
+import {
+  bootCollectorFramework,
+  type CollectorFrameworkHandle,
+} from '../collectors/framework/runtime.js';
+import {
+  gateStateForCollector,
+  type CollectorCapability,
+} from '../collectors/framework/capabilityGates.js';
+import { COLLECTOR_FRAMEWORK_VERSION } from '../version.js';
+import { projectPrivacy, type PrivacyProjection } from '../privacy/projection.js';
+import {
+  PRIVACY_GATE_FLIPPED,
+  PRIVACY_PERMISSION_GRANTED,
+  PRIVACY_PERMISSION_REVOKED,
+} from '../privacy/events.js';
+import type { AcceptedEvent } from '../sync/causal.js';
 import {
   acquireRecallProcessLock,
   cleanupOrphanIndexTmpFiles,
@@ -309,6 +329,9 @@ export const startCompanion = async (
         .publishEvent(accepted.dot.replicaId, accepted as never)
         .catch(() => undefined);
     }
+    // Stage 4: privacy events refresh the cached projection so
+    // collector capability gates see the new state on next promote.
+    onPrivacyEventAccepted(accepted as AcceptedEvent);
   };
   const eventLog = {
     ...baseEventLog,
@@ -366,6 +389,116 @@ export const startCompanion = async (
       embeddingCache: createEmbeddingCache(options.vaultPath),
     }),
   );
+  // ─── Collector framework (Stage 4) ──────────────────────────────
+  // Wired BEFORE the HTTP server starts so the GET /v1/collectors and
+  // POST /v1/collectors/{id}/replay routes have a live framework
+  // handle to query. Best-effort: if boot throws (corrupt manifest,
+  // FS issue, etc.) we log + continue without it; HTTP routes return
+  // 503 in that case.
+  let collectorFramework: CollectorFrameworkHandle | null = null;
+  let cachedPrivacyProjection: PrivacyProjection = projectPrivacy([]);
+  const refreshPrivacyProjectionFromLog = async (): Promise<void> => {
+    try {
+      const all = await baseEventLog.readMerged();
+      cachedPrivacyProjection = projectPrivacy(
+        all.filter(
+          (e) =>
+            e.type === PRIVACY_GATE_FLIPPED ||
+            e.type === PRIVACY_PERMISSION_GRANTED ||
+            e.type === PRIVACY_PERMISSION_REVOKED,
+        ),
+      );
+    } catch {
+      // Initial empty projection is the safe default.
+    }
+  };
+  const onPrivacyEventAccepted = (event: AcceptedEvent): void => {
+    if (
+      event.type === PRIVACY_GATE_FLIPPED ||
+      event.type === PRIVACY_PERMISSION_GRANTED ||
+      event.type === PRIVACY_PERMISSION_REVOKED
+    ) {
+      // Async refresh; collector promotions read the CACHED projection
+      // synchronously, so a brief stale window is acceptable. The
+      // alternative (synchronous refresh) would block every privacy
+      // event accept on a full event-log read.
+      void refreshPrivacyProjectionFromLog();
+    }
+  };
+  await refreshPrivacyProjectionFromLog();
+
+  const appendCollectorAudit = async (
+    route: string,
+    subject: string,
+  ): Promise<void> => {
+    const now = new Date();
+    const datePath = join(
+      options.vaultPath,
+      '_BAC',
+      'audit',
+      `${now.toISOString().slice(0, 10)}.jsonl`,
+    );
+    try {
+      await mkdir(join(datePath, '..'), { recursive: true });
+      const entry = {
+        requestId: `collector:${randomUUID()}`,
+        route,
+        outcome: 'success' as const,
+        bac_id: subject,
+        timestamp: now.toISOString(),
+      };
+      await writeFile(datePath, `${JSON.stringify(entry)}\n`, {
+        encoding: 'utf8',
+        flag: 'a',
+      });
+    } catch {
+      // Audit-write failures are non-fatal — the collector framework
+      // does not depend on audit success.
+    }
+  };
+
+  try {
+    collectorFramework = await bootCollectorFramework({
+      vaultRoot: options.vaultPath,
+      companionFrameworkVersion: COLLECTOR_FRAMEWORK_VERSION,
+      vaultMajor: 1,
+      appendClassA: async (event, ruleId) => {
+        const e = event as {
+          type?: string;
+          payloadVersion?: number;
+          emittedAt?: string;
+          producedBy?: { runId?: string };
+        };
+        // Idempotent clientEventId: ruleId + emittedAt + runId is
+        // unique per (collector run, source line). A retried promote
+        // (e.g. replay-on-startup of a previously-promoted line) is
+        // short-circuited by appendClient's clientEventId dedupe.
+        const clientEventId = `collector:${ruleId}:${e.emittedAt ?? ''}:${e.producedBy?.runId ?? ''}`;
+        await eventLog.appendServerObserved({
+          clientEventId,
+          aggregateId: ruleId,
+          type: e.type ?? 'collector.unknown',
+          payload: event as Record<string, unknown>,
+        });
+      },
+      auditRoute: appendCollectorAudit,
+      resolveGate: (collectorId, capability, defaultEnabled) =>
+        gateStateForCollector(
+          cachedPrivacyProjection,
+          collectorId,
+          capability as CollectorCapability,
+          defaultEnabled,
+        ),
+    });
+    {
+      const handle = collectorFramework;
+      teardown.push(() => handle.close());
+    }
+  } catch {
+    collectorFramework = null;
+  }
+  // ────────────────────────────────────────────────────────────────
+
   // Don't block startup on the rebuild — health endpoint will report
   // status: 'rebuilding' until the background task completes.
   // The fresh-check + incremental ingest BOTH run through the
@@ -405,6 +538,7 @@ export const startCompanion = async (
     allowAutoUpdate: options.allowAutoUpdate ?? false,
     startedAt: new Date(),
     bucketRegistry: createBucketRegistry(options.vaultPath),
+    ...(collectorFramework === null ? {} : { collectorFramework }),
     hygieneStatus,
     recallLifecycle,
     recallActivity,

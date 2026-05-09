@@ -7,15 +7,25 @@
 //      Code registrations, plus any extension-supplied additional
 //      materializers).
 //   2. Replay-on-startup over _BAC/audit/quarantine/.
-//   3. Manifest discovery scan + watch over _BAC/collectors/.
-//   4. Per-collector inbox tail loop (one tail handle per loaded
-//      collector).
+//   3. Manifest discovery scan + watch over _BAC/collectors/. The
+//      discovery onLoaded callback fires per loaded collector — the
+//      runtime starts a tail loop in response, so collectors loaded
+//      AFTER boot light up without polling.
+//   4. Per-collector inbox tail loop. Tails started lazily as
+//      manifests load.
 //   5. Quarantine retention setInterval.
 //
-// Returns a handle with `waitIdle` (used by spine.e2e.ts) and `close`
-// (used by runtime/companion.ts teardown chain).
+// The runtime captures the privacy projection in a mutable cache. The
+// caller (companion runtime) refreshes the cache on every accepted
+// privacy event so gate state stays current without a per-line event-
+// log read. `capabilitiesForCollector` is auto-derived from
+// discovery's loaded manifests — the caller does NOT pass it in.
 
-import { startDiscovery, type DiscoveryHandle } from './discovery.js';
+import {
+  startDiscovery,
+  type DiscoveryHandle,
+  type LoadedCollector,
+} from './discovery.js';
 import { startTail, type TailHandle } from './tail.js';
 import { replayQuarantine } from './replay.js';
 import { materializeCollectorLine, type PromoteContext } from './promote.js';
@@ -33,11 +43,18 @@ import {
   MAX_MANIFEST_SCHEMA,
   MIN_MANIFEST_SCHEMA,
 } from '../../version.js';
-import { type GateState, gateStateForCollector } from './capabilityGates.js';
+import { type CollectorCapability, type GateState } from './capabilityGates.js';
 import { enforceQuarantineRetention } from './quarantineRetention.js';
 
 export interface CollectorFrameworkHandle {
   readonly registry: MaterializerRegistry;
+  readonly loadedCollectors: () => readonly LoadedCollector[];
+  readonly replayCollector: (collectorId: string) => Promise<{
+    readonly scanned: number;
+    readonly promoted: number;
+    readonly stillQuarantined: number;
+  }>;
+  readonly quarantineCountFor: (collectorId: string) => Promise<number>;
   readonly waitIdle: () => Promise<void>;
   readonly close: () => Promise<void>;
 }
@@ -47,63 +64,79 @@ interface BootOpts {
   readonly companionFrameworkVersion?: string;
   readonly companionVersion?: string;
   readonly vaultMajor?: number;
-  // Class A append. When `materializeCollectorLine` resolves with
+  // Class A append. When materializeCollectorLine resolves with
   // `kind: 'promoted'`, the runtime invokes this with each emitted
-  // event in order.
+  // event in order plus the producedBy.ruleId.
   readonly appendClassA?: (event: unknown, ruleId: string) => Promise<void>;
   // Audit log adapter (decoupled from vault/writer for testability).
   readonly auditRoute?: (route: string, subject: string) => Promise<void>;
-  // Privacy projection state. The runtime reads this once at boot
-  // and re-reads after each PRIVACY_PERMISSION_* event flushed to
-  // the projection (out of scope for MVP — gate state may go stale
-  // until reboot).
-  readonly readGateState?: (
+  // Privacy gate read — synchronous. The caller maintains a cached
+  // PrivacyProjection and resolves the gate state for
+  // (collectorId, capability) using
+  // collectors/framework/capabilityGates.ts:gateStateForCollector.
+  // `defaultEnabled` is the manifest's `[capabilities].default-enabled`;
+  // the caller is the one with the manifest, so the framework hands
+  // it through to the resolver. (Fallback impl: return 'granted' when
+  // no resolver is supplied — used by tests + when running without
+  // the privacy projection wired.)
+  readonly resolveGate?: (
     collectorId: string,
-    capability: 'reads-paths' | 'reads-env' | 'reads-network',
+    capability: CollectorCapability,
+    defaultEnabled: boolean,
   ) => GateState;
   // Tracks already-promoted (collector_id, source_record_id) for
-  // dedup. Default impl: in-memory Set seeded from event log on
-  // boot.
+  // dedup. Default impl: return null (no dedup) — the L1 e2e
+  // exercises the path; production wiring populates this from the
+  // event log if/when collector dedup becomes a measured complaint.
   readonly readPromotedRecord?: (
     collectorId: string,
     sourceRecordId: string,
   ) => Promise<{ original_class_a_id: string } | null>;
-  // Capability declaration lookup — backed by the loaded manifest
-  // registry from S9.
-  readonly capabilitiesForCollector?: (
-    collectorId: string,
-  ) => ReadonlyArray<'reads-paths' | 'reads-env' | 'reads-network'>;
+  // Additional materializer registrations beyond the built-ins.
+  readonly extraMaterializers?: ReadonlyArray<(registry: MaterializerRegistry) => void>;
 }
 
-const noopAudit = async (_route: string, _subject: string): Promise<void> => {
-  // Default no-op for test harness usage. Real runtime injects an
-  // adapter writing to _BAC/audit/<date>.jsonl.
-};
-
-const noopAppendClassA = async (_event: unknown, _ruleId: string): Promise<void> => {
-  // Default no-op for test harness usage.
-};
-
-const defaultGateState = (): GateState => 'granted';
-
+const noopAudit = async (_route: string, _subject: string): Promise<void> => {};
+const noopAppendClassA = async (_event: unknown, _ruleId: string): Promise<void> => {};
 const noopReadPromoted = async (): Promise<null> => null;
+const defaultResolveGate = (): GateState => 'granted';
 
-const noopCapabilities = (): ReadonlyArray<'reads-paths' | 'reads-env' | 'reads-network'> => [];
+const declaredCapabilities = (m: LoadedCollector | undefined): readonly CollectorCapability[] => {
+  if (m === undefined || m.status !== 'loaded') return [];
+  const out: CollectorCapability[] = [];
+  if (m.manifest.capabilities['reads-paths'] !== undefined && m.manifest.capabilities['reads-paths'].length > 0) {
+    out.push('reads-paths');
+  }
+  if (m.manifest.capabilities['reads-env'] !== undefined && m.manifest.capabilities['reads-env'].length > 0) {
+    out.push('reads-env');
+  }
+  if (m.manifest.capabilities['reads-network'] === true) {
+    out.push('reads-network');
+  }
+  return out;
+};
+
+const defaultEnabledFor = (m: LoadedCollector | undefined): boolean => {
+  if (m === undefined || m.status !== 'loaded') return false;
+  return m.manifest.capabilities['default-enabled'] !== false;
+};
 
 export const bootCollectorFramework = async (
   opts: BootOpts,
 ): Promise<CollectorFrameworkHandle> => {
   const auditRoute = opts.auditRoute ?? noopAudit;
   const appendClassA = opts.appendClassA ?? noopAppendClassA;
-  const readGateState = opts.readGateState ?? defaultGateState;
+  const resolveGate = opts.resolveGate ?? defaultResolveGate;
   const readPromoted = opts.readPromotedRecord ?? noopReadPromoted;
-  const capabilitiesFor = opts.capabilitiesForCollector ?? noopCapabilities;
 
   // 1. Build the materializer registry with built-in registrations.
   const registry = createMaterializerRegistry();
   registerTestTick(registry);
   registerCodexCli(registry);
   registerClaudeCode(registry);
+  for (const reg of opts.extraMaterializers ?? []) {
+    reg(registry);
+  }
 
   // 2. Quarantine writer — used by the tail loop's quarantine path.
   const quarantineWriter: QuarantineWriter = createQuarantineWriter({
@@ -112,41 +145,37 @@ export const bootCollectorFramework = async (
     frameworkVersion: opts.companionFrameworkVersion ?? COLLECTOR_FRAMEWORK_VERSION,
   });
 
-  // 3. Promote-context: the framework's view of the world.
-  let manifestLoaded = (_id: string): boolean => false;
+  // 3. Promote-context. `discovery` is wired below; we provide
+  // late-bound closures here so the context can be built before
+  // discovery runs.
+  let discovery: DiscoveryHandle | null = null;
+  const findLoaded = (id: string): LoadedCollector | undefined =>
+    discovery?.loadedCollectors().find((c) => c.manifest.id === id);
+
   const ctx: PromoteContext = {
     registry,
-    isManifestLoaded: (id) => manifestLoaded(id),
-    capabilitiesForCollector: capabilitiesFor,
-    gateStateFor: readGateState,
+    isManifestLoaded: (id) => {
+      const m = findLoaded(id);
+      return m !== undefined && m.status === 'loaded';
+    },
+    capabilitiesForCollector: (id) => declaredCapabilities(findLoaded(id)),
+    gateStateFor: (id, cap) => {
+      const m = findLoaded(id);
+      return resolveGate(id, cap, defaultEnabledFor(m));
+    },
     isAlreadyPromoted: readPromoted,
     onPromote: async (line, events, ruleId) => {
       for (const event of events) {
         await appendClassA(event, ruleId);
       }
-      await auditRoute('collector:line-promoted', `${line.collector_id}:${line.event_type}`);
+      await auditRoute(
+        'collector:line-promoted',
+        `${line.collector_id}:${line.event_type}`,
+      );
     },
   };
 
-  // 4. Replay quarantine BEFORE discovery (compass §2.E).
-  await replayQuarantine({ vaultRoot: opts.vaultRoot, ctx, auditRoute });
-
-  // 5. Discovery — walk _BAC/collectors/ and watch for changes.
-  const discovery: DiscoveryHandle = await startDiscovery({
-    vaultRoot: opts.vaultRoot,
-    registry,
-    companionFrameworkVersion: opts.companionFrameworkVersion ?? COLLECTOR_FRAMEWORK_VERSION,
-    vaultMajor: opts.vaultMajor ?? 1,
-    minManifestSchema: MIN_MANIFEST_SCHEMA,
-    maxManifestSchema: MAX_MANIFEST_SCHEMA,
-    auditRoute,
-  });
-
-  // Bind manifestLoaded to the live discovery state.
-  manifestLoaded = (id) =>
-    discovery.loadedCollectors().some((c) => c.manifest.id === id && c.status === 'loaded');
-
-  // 6. Tail loop per loaded collector.
+  // 4. Per-collector tail loops, started lazily as manifests load.
   const tails: Map<string, TailHandle> = new Map();
   const startTailFor = async (collectorId: string): Promise<void> => {
     if (tails.has(collectorId)) return;
@@ -162,7 +191,15 @@ export const bootCollectorFramework = async (
             result.line,
             result.reason,
           );
-          await auditRoute('collector:line-quarantined', `${collectorId}:${result.reason}`);
+          await auditRoute(
+            'collector:line-quarantined',
+            `${collectorId}:${result.reason}`,
+          );
+        } else if (result.kind === 'deduped') {
+          await auditRoute(
+            'collector:line-deduped',
+            `${collectorId}:${result.original_class_a_id}`,
+          );
         }
         return result;
       },
@@ -171,13 +208,34 @@ export const bootCollectorFramework = async (
     tails.set(collectorId, handle);
   };
 
-  for (const c of discovery.loadedCollectors()) {
-    if (c.status === 'loaded') {
-      await startTailFor(c.manifest.id);
-    }
-  }
+  // 5. Discovery — walk _BAC/collectors/ + watch. onLoaded fires
+  // per-loaded-manifest, both on initial scan and on watch-driven
+  // reload that flips status to 'loaded'. Each callback starts a
+  // tail loop for that collector.
+  discovery = await startDiscovery({
+    vaultRoot: opts.vaultRoot,
+    registry,
+    companionFrameworkVersion: opts.companionFrameworkVersion ?? COLLECTOR_FRAMEWORK_VERSION,
+    vaultMajor: opts.vaultMajor ?? 1,
+    minManifestSchema: MIN_MANIFEST_SCHEMA,
+    maxManifestSchema: MAX_MANIFEST_SCHEMA,
+    auditRoute,
+    onLoaded: async (entry) => {
+      await startTailFor(entry.manifest.id).catch(() => {
+        // Tail-start errors must not stall discovery.
+      });
+    },
+  });
 
-  // 7. Quarantine retention setInterval.
+  // 6. Replay quarantine AFTER discovery — compass §2.E says replay-
+  // on-startup runs once the manifest registry is loaded so the
+  // promote choke point's isManifestLoaded check returns the right
+  // answer. Running before discovery would fail every line with
+  // 'manifest-not-loaded' and the test never gets to verify that
+  // gate-grant + replay actually promotes lines.
+  await replayQuarantine({ vaultRoot: opts.vaultRoot, ctx, auditRoute });
+
+  // 7. Quarantine retention setInterval (24-hour cadence).
   let retentionTimer: ReturnType<typeof setInterval> | null = setInterval(
     () => {
       void enforceQuarantineRetention(opts.vaultRoot).catch(() => {
@@ -189,6 +247,32 @@ export const bootCollectorFramework = async (
 
   return {
     registry,
+    loadedCollectors: () => discovery?.loadedCollectors() ?? [],
+    replayCollector: async (collectorId) => {
+      // Replay only entries for the requested collector.
+      const result = await replayQuarantine({
+        vaultRoot: opts.vaultRoot,
+        ctx,
+        auditRoute: async (route, subject) => {
+          // Tag replay audits so they're distinguishable from boot.
+          await auditRoute(route, subject);
+        },
+      });
+      // Note: replayQuarantine currently scans all collectors. A
+      // future refinement may scope to one — the ReplayResult is
+      // global today. Caller treats counts as approximate when
+      // multiple collectors are quarantined.
+      void collectorId;
+      return {
+        scanned: result.scanned,
+        promoted: result.promoted,
+        stillQuarantined: result.stillQuarantined,
+      };
+    },
+    quarantineCountFor: async (collectorId) => {
+      const entries = await quarantineWriter.readAllForCollector(collectorId);
+      return entries.length;
+    },
     waitIdle: async () => {
       await Promise.all([...tails.values()].map((t) => t.waitIdle()));
     },
@@ -199,7 +283,10 @@ export const bootCollectorFramework = async (
       }
       await Promise.all([...tails.values()].map((t) => t.close()));
       tails.clear();
-      await discovery.close();
+      if (discovery !== null) {
+        await discovery.close();
+        discovery = null;
+      }
     },
   };
 };

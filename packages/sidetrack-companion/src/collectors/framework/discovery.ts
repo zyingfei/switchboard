@@ -1,5 +1,5 @@
 import { watch } from 'node:fs';
-import { readdir, readFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 
 import {
@@ -36,6 +36,12 @@ export interface DiscoveryOpts {
   readonly minManifestSchema: number;
   readonly maxManifestSchema: number;
   readonly auditRoute: (route: string, subject: string) => Promise<void>;
+  // Fired when a collector transitions to status='loaded' — both on
+  // the initial scan AND when a previously load-failed (or absent)
+  // collector flips to loaded via fs.watch. Caller uses this to start
+  // the per-collector tail loop without polling. Errors are
+  // swallowed so a buggy callback can't stall discovery.
+  readonly onLoaded?: (entry: LoadedCollector) => void | Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +149,17 @@ const evaluateCollector = async (
 export const startDiscovery = async (opts: DiscoveryOpts): Promise<DiscoveryHandle> => {
   const collectorsRoot = manifestRootFor(opts.vaultRoot);
 
+  // Ensure the directory exists before we set up fs.watch on it —
+  // otherwise the watcher silently no-ops, and manifests dropped
+  // post-boot never trigger discovery. Idempotent: mkdir({recursive:
+  // true}) is a no-op when the directory already exists.
+  try {
+    await mkdir(collectorsRoot, { recursive: true });
+  } catch {
+    // Permissions or read-only fs; watcher will remain null and we
+    // proceed without dynamic discovery.
+  }
+
   // In-memory registry: collectorId → LoadedCollector
   const registry = new Map<string, LoadedCollector>();
 
@@ -156,6 +173,15 @@ export const startDiscovery = async (opts: DiscoveryOpts): Promise<DiscoveryHand
     // No collectors directory yet — that is fine.
   }
 
+  const fireOnLoaded = async (entry: LoadedCollector): Promise<void> => {
+    if (opts.onLoaded === undefined) return;
+    try {
+      await opts.onLoaded(entry);
+    } catch {
+      // Callback errors must not stall discovery.
+    }
+  };
+
   await Promise.all(
     entries
       .filter((name) => validCollectorId(name))
@@ -163,6 +189,9 @@ export const startDiscovery = async (opts: DiscoveryOpts): Promise<DiscoveryHand
         const result = await evaluateCollector(collectorsRoot, id, opts);
         if (result !== null) {
           registry.set(result.id, result.entry);
+          if (result.entry.status === 'loaded') {
+            await fireOnLoaded(result.entry);
+          }
         }
       }),
   );
@@ -206,6 +235,15 @@ export const startDiscovery = async (opts: DiscoveryOpts): Promise<DiscoveryHand
 
           if (changed && previous_entry !== undefined) {
             await opts.auditRoute('collector:manifest-reloaded', id);
+          }
+          // Fire onLoaded when a collector becomes loaded — first
+          // appearance OR transition from load-failed → loaded. The
+          // runtime starts a tail loop in response.
+          const becameLoaded =
+            result.entry.status === 'loaded' &&
+            (previous_entry === undefined || previous_entry.status !== 'loaded');
+          if (becameLoaded) {
+            await fireOnLoaded(result.entry);
           }
         })();
       }, debounceMs),
