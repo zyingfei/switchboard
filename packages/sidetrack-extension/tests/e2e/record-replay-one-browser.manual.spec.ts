@@ -12,15 +12,20 @@
 // companion through chrome.tabs navigations and route stubs, then
 // writes report.md + report.json under the pack's per-run folder.
 
+import { mkdir } from 'node:fs/promises';
+import path from 'node:path';
+
 import { expect, test, type Page } from '@playwright/test';
 
 import { startTestCompanion, type TestCompanion } from './helpers/companion';
+import { ManualRecorder } from './helpers/manualRecorder';
 import {
   ACTIVE_WORKSTREAM_STORAGE_KEY,
   assertNoDisallowedStorageValues,
   assertPackPrivacy,
   companionGet,
   createMinimalOneBrowserPack,
+  createSessionPackFromManualRecorder,
   driveReplayFromPack,
   evaluateOneBrowserReplay,
   firstBrowser,
@@ -28,14 +33,18 @@ import {
   installRouteStubsForPack,
   installRouteStubsForWorkflow,
   readChromeStorageSnapshot,
+  readSessionPack,
   readSidetrackVersion,
   recordedCanonicalUrls,
+  redactHtmlForSessionPack,
   resolveCaptureLevel,
   resolveTestSessionsDir,
   waitForReplaySurfaces,
   writeReplayReport,
   writeSessionPack,
+  type CaptureLevel,
   type MinimalWorkflowStep,
+  type SessionPack,
 } from './helpers/recordReplay';
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
 import { SETTINGS_KEY, SETUP_KEY } from './helpers/sidepanel';
@@ -59,6 +68,9 @@ const WORKFLOW: readonly MinimalWorkflowStep[] = [
     provider: 'chatgpt',
   },
 ];
+
+const REPLAY_PACK_PATH = process.env['SIDETRACK_REPLAY_PACK'];
+const REPLAY_REPORT_DIR = process.env['SIDETRACK_REPLAY_REPORT_DIR'];
 
 const settingsFor = (companion: TestCompanion) => ({
   companion: { port: companion.port, bridgeKey: companion.bridgeKey },
@@ -115,9 +127,107 @@ test.describe('manual T1 Wave 2a one-browser record/replay', () => {
     recordCompanion = null;
   });
 
+  const recordPack = async (input: {
+    readonly captureLevel: CaptureLevel;
+    readonly runtime: ExtensionRuntime;
+    readonly sidetrackVersion: string;
+    readonly activeWorkstreamId: string;
+  }): Promise<SessionPack> => {
+    if (input.captureLevel === 'minimal') {
+      return await createMinimalOneBrowserPack({
+        runtime: input.runtime,
+        workflow: WORKFLOW,
+        activeWorkstreamId: input.activeWorkstreamId,
+        sidetrackVersion: input.sidetrackVersion,
+      });
+    }
+    const sessionsRoot = resolveTestSessionsDir();
+    await mkdir(sessionsRoot, { recursive: true });
+    const artifactDir = path.join(sessionsRoot, `manual-2d-one-${String(Date.now())}`);
+    await mkdir(artifactDir, { recursive: true });
+    const recorder = new ManualRecorder(input.runtime.context, artifactDir, {
+      captureScreenshots: false,
+      captureTextSnapshots: false,
+      recordTextValues: input.captureLevel === 'html+paste',
+      transformHtmlSnapshot: ({ html }) => {
+        const redacted = redactHtmlForSessionPack(html);
+        return {
+          html: redacted.htmlRedacted,
+          redactionCounts: redacted.redactionCounts,
+        };
+      },
+    });
+    await recorder.install();
+    for (const step of WORKFLOW) {
+      const page = await input.runtime.context.newPage();
+      await page.goto(step.url, { waitUntil: 'domcontentloaded' });
+      await recorder.snapshotPage(page, 'wave-2d-record');
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await page.close();
+    }
+    return createSessionPackFromManualRecorder({
+      captureLevel: input.captureLevel,
+      sidetrackVersion: input.sidetrackVersion,
+      browsers: [
+        {
+          label: 'A',
+          activeWorkstreamId: input.activeWorkstreamId,
+          events: await recorder.readEvents(),
+          snapshots: await recorder.readSnapshotFiles(),
+        },
+      ],
+    });
+  };
+
+  const replayPack = async (input: {
+    readonly pack: SessionPack;
+    readonly packPath: string;
+  }): Promise<void> => {
+    expect(input.pack.mode.browsers).toBe(1);
+    replayCompanion = await startTestCompanion();
+    replayRuntime = await launchExtensionRuntime({ forceLocalProfile: true });
+    const { panel: replayPanel } = await seedTimelineRuntime(replayRuntime, replayCompanion);
+    const routeTracker = await installRouteStubsForPack(replayRuntime.context, input.pack);
+    const pageReplay = await driveReplayFromPack({
+      runtime: replayRuntime,
+      senderPage: replayPanel,
+      pack: input.pack,
+    });
+    const expectedUrls = recordedCanonicalUrls(input.pack);
+    const drain = await forceDrainTimeline(replayRuntime, replayPanel, expectedUrls.length);
+    const surfaces = await waitForReplaySurfaces({
+      companion: replayCompanion,
+      expectedCanonicalUrls: expectedUrls,
+      activeWorkstreamId: firstBrowser(input.pack).activeWorkstreamId,
+    });
+    const report = evaluateOneBrowserReplay({
+      pack: input.pack,
+      routeTracker,
+      pageReplay,
+      drain,
+      timeline: surfaces.timeline,
+      connections: surfaces.connections,
+    });
+    const writtenReport = await writeReplayReport(path.dirname(input.packPath), report, {
+      ...(REPLAY_REPORT_DIR === undefined ? {} : { reportDir: REPLAY_REPORT_DIR }),
+    });
+    // eslint-disable-next-line no-console
+    console.log(`[sidetrack-test] report: ${writtenReport.markdownPath}`);
+    // eslint-disable-next-line no-console
+    console.log(`[sidetrack-test] report-json: ${writtenReport.jsonPath}`);
+    expect(report.status).toBe('pass');
+  };
+
   test('manual minimal pack records, replays, evaluates, and reports', async ({}, testInfo) => {
     expect(testInfo.project.name).toBe('manual');
-    expect(resolveCaptureLevel()).toBe('minimal');
+    if (REPLAY_PACK_PATH !== undefined) {
+      await replayPack({
+        pack: await readSessionPack(REPLAY_PACK_PATH),
+        packPath: REPLAY_PACK_PATH,
+      });
+      return;
+    }
+    const captureLevel = resolveCaptureLevel();
 
     recordCompanion = await startTestCompanion();
     recordRuntime = await launchExtensionRuntime({ forceLocalProfile: true });
@@ -126,9 +236,9 @@ test.describe('manual T1 Wave 2a one-browser record/replay', () => {
     const storageBeforeRecording = await readChromeStorageSnapshot(recordPanel);
 
     const sidetrackVersion = await readSidetrackVersion();
-    const draftPack = await createMinimalOneBrowserPack({
+    const draftPack = await recordPack({
+      captureLevel,
       runtime: recordRuntime,
-      workflow: WORKFLOW,
       activeWorkstreamId: ACTIVE_WORKSTREAM_ID,
       sidetrackVersion,
     });
@@ -184,5 +294,9 @@ test.describe('manual T1 Wave 2a one-browser record/replay', () => {
     console.log(`[record-replay] pack: ${writtenPack.packPath}`);
     // eslint-disable-next-line no-console
     console.log(`[record-replay] report: ${writtenReport.markdownPath}`);
+    // eslint-disable-next-line no-console
+    console.log(`[sidetrack-test] pack: ${writtenPack.packPath}`);
+    // eslint-disable-next-line no-console
+    console.log(`[sidetrack-test] report: ${writtenReport.markdownPath}`);
   });
 });

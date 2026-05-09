@@ -1363,8 +1363,12 @@ export const evaluateOneBrowserReplay = (input: {
 export const writeReplayReport = async (
   packDir: string,
   report: ReplayEvaluationReport,
+  options: { readonly reportDir?: string } = {},
 ): Promise<WrittenReplayReport> => {
-  const runDir = path.join(packDir, 'runs', report.runId);
+  const runDir =
+    options.reportDir === undefined
+      ? path.join(packDir, 'runs', report.runId)
+      : path.join(options.reportDir, report.runId);
   await mkdir(runDir, { recursive: true });
   const markdownPath = path.join(runDir, 'report.md');
   const jsonPath = path.join(runDir, 'report.json');

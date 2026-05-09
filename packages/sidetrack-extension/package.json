@@ -4,6 +4,9 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "bin": {
+    "sidetrack-test": "./scripts/sidetrack-test.mjs"
+  },
   "scripts": {
     "dev": "wxt",
     "build": "wxt build",
@@ -24,6 +27,7 @@
     "e2e:gc-cft": "node scripts/gc-cft.mjs",
     "e2e:pair": "node scripts/pair-extension.mjs",
     "e2e:codex-inbound": "node scripts/codex-inbound-e2e.mjs",
+    "sidetrack-test": "node scripts/sidetrack-test.mjs",
     "postinstall": "wxt prepare"
   },
   "dependencies": {
