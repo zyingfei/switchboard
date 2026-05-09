@@ -217,6 +217,7 @@ test.describe('manual interactive two-browser harness', () => {
 
       // Hang forever. The user kills with Ctrl-C; Playwright
       // catches SIGINT and runs our finally{} cleanup.
+      // eslint-disable-next-line @typescript-eslint/no-empty-function
       await new Promise(() => {});
     } finally {
       await runtimeB?.close();

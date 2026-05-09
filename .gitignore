@@ -10,6 +10,12 @@
 .env
 .env.local
 
+# Local-only T1 record/replay packs (also protects repo-relative
+# SIDETRACK_TEST_SESSIONS_DIR overrides).
+.sidetrack-test-sessions/
+sidetrack-test-sessions/
+test-sessions/
+
 # Private working directory (kept on poc-planning only)
 imports/
 # Claude -> Codex worker local config and logs
