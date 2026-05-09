@@ -78,9 +78,30 @@ Branch `t1/record-replay-2a`. Goal: smallest end-to-end loop.
 
 Branch `t1/record-replay-2b`. Builds directly on 2a's helpers.
 
+**Critical: harmonize with the existing L5 recorder, do not
+parallel-build.** A real-user manual recorder already exists at
+`packages/sidetrack-extension/tests/e2e/manual-l5-recorder.spec.ts`
+(landed via PR #110 / the Stage 4 collector-framework merge). It
+captures real user browsing across live websites, paced by stdin,
+drains Sidetrack on exit, and writes its own artifact format.
+Wave 2a's `recordReplay.ts` covers the deterministic
+replay-fixture path (charter Cycle B/C); the L5 recorder covers
+the real-user record path (charter Cycle A). Wave 2b must:
+
+- Read `manual-l5-recorder.spec.ts` first and treat its event
+  capture machinery as the canonical real-user-record pattern.
+- Extend or wrap that recorder so its captured events serialize to
+  `SessionPack` v1 (the schema in `CHARTER.md`). Do not introduce
+  a third event format. If the L5 recorder's event shape diverges
+  from `SessionPack` v1, write a small converter rather than
+  forking either.
+- Pull shared scaffolding (relay + 2 companions + 2 extension
+  runtimes) from the existing two-browser-harness specs.
+
+Then deliver the rest of 2b on top of that base:
+
 - Extend record to two browsers (Browser A active + Browser B
-  review) reusing the existing two-browser-harness scaffolding
-  pattern.
+  review) using the existing two-browser-harness scaffolding.
 - Replay drives both browsers through stubbed routes; the relay is
   the existing test relay. After replay, Browser B's Connections
   must render the expected nodes/edges from Browser A's recorded
