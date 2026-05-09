@@ -7040,6 +7040,41 @@ pre.diff {
   background: var(--paper-tinted); border: 1px solid var(--rule-soft);
   border-radius: 999px; flex: none;
 }
+.cx-row-anchor-action { flex: none; }
+.cx-select {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.cx-select-label,
+.cx-advanced-anchor summary {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  color: var(--ink-3);
+  text-transform: uppercase;
+}
+.cx-select select {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--rule);
+  border-radius: var(--rad-s);
+  background: var(--paper-light);
+  color: var(--ink);
+  padding: 7px 8px;
+  font: inherit;
+}
+.cx-select select:disabled {
+  color: var(--ink-3);
+  background: var(--paper-tinted);
+}
+.cx-advanced-anchor {
+  margin-top: 10px;
+}
+.cx-advanced-anchor summary {
+  cursor: pointer;
+  margin-bottom: 7px;
+}
 
 /* edge family lines (4 styles → 4 families). Color held neutral. */
 .cx-edge { display: inline-flex; align-items: center; gap: 6px;
@@ -7068,6 +7103,31 @@ pre.diff {
   white-space: nowrap;
 }
 .cx-edgelabel.is-selected { color: var(--signal); border-color: var(--signal); background: var(--signal-bg); }
+.cx-edge-section-note {
+  margin: -2px 0 8px;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.cx-edge-list {
+  display: grid;
+  gap: 5px;
+}
+.cx-edgelabel.cx-edge-summary {
+  width: 100%;
+  min-width: 0;
+  justify-content: flex-start;
+  padding: 5px 8px;
+  cursor: pointer;
+  letter-spacing: 0;
+  text-align: left;
+}
+.cx-edge-summary-main {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink);
+}
 
 /* provenance card (receipt / evidence) */
 .cx-prov {
@@ -7634,7 +7694,13 @@ pre.diff {
   position: absolute;
   transform: translate(-50%, -50%);
   cursor: pointer;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
 }
+.cx-orbit-node:hover .cx-node { border-color: var(--signal-tint); }
 .cx-orbit-edges-strip {
   display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
   padding: 10px 16px;
@@ -7644,6 +7710,10 @@ pre.diff {
 .cx-orbit-edges-strip .label {
   font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.05em;
   color: var(--ink-3); margin-right: 4px;
+}
+.cx-orbit-edges-strip .cx-edgelabel.cx-edge-summary {
+  width: auto;
+  max-width: min(420px, 100%);
 }
 
 /* recent-anchor quick-pick chip in the left column */

@@ -84,6 +84,116 @@ describe('ConnectionsView — engineering scaffold', () => {
     expect(screen.getByText(/2×/u)).toBeDefined();
   });
 
+  it('renders edge labels with readable endpoints instead of raw edge kinds only', async () => {
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        return { ok: true, data: buildSnapshot() };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+    render(<ConnectionsView initialAnchor="thread:thread_a" />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-groups')).not.toBeNull();
+    });
+
+    expect(screen.getByTitle('Tax flow → Tax automation · in workstream')).toBeDefined();
+    expect(screen.getByText('Tax flow → Tax automation')).toBeDefined();
+  });
+
+  it('uses a workstream selector as the primary anchor control', async () => {
+    const requestedNodeIds: string[] = [];
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string; nodeId?: string };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        requestedNodeIds.push(m.nodeId ?? '');
+        return { ok: true, data: buildSnapshot() };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+    render(
+      <ConnectionsView
+        workstreamAnchors={[
+          { id: 'workstream:ws_x', label: 'Tax automation' },
+          { id: 'workstream:ws_y', label: 'Research queue' },
+        ]}
+      />,
+    );
+
+    const selector = screen.getByTestId('connections-workstream-select') as HTMLSelectElement;
+    expect(selector.value).toBe('');
+    fireEvent.change(selector, { target: { value: 'workstream:ws_x' } });
+
+    await waitFor(() => {
+      expect(requestedNodeIds).toContain('workstream:ws_x');
+    });
+    expect(selector.value).toBe('workstream:ws_x');
+  });
+
+  it('can re-anchor from a visible neighbor row', async () => {
+    const requestedNodeIds: string[] = [];
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string; nodeId?: string };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        const nodeId = m.nodeId ?? 'thread:thread_a';
+        requestedNodeIds.push(nodeId);
+        return {
+          ok: true,
+          data: {
+            scope: 'companion-extended',
+            snapshot: {
+              scope: { nodeId, hops: 1 },
+              nodes: [
+                {
+                  id: nodeId,
+                  kind: nodeId.startsWith('workstream:') ? 'workstream' : 'thread',
+                  label: nodeId.startsWith('workstream:') ? 'Tax automation' : 'Tax flow',
+                  originReplicaIds: ['replica-A'],
+                  metadata: {},
+                },
+                {
+                  id: nodeId === 'workstream:ws_x' ? 'thread:thread_a' : 'workstream:ws_x',
+                  kind: nodeId === 'workstream:ws_x' ? 'thread' : 'workstream',
+                  label: nodeId === 'workstream:ws_x' ? 'Tax flow' : 'Tax automation',
+                  originReplicaIds: ['replica-A'],
+                  metadata: {},
+                },
+              ],
+              edges: [
+                {
+                  id: 'edge:thread_in_workstream:thread:thread_a:workstream:ws_x',
+                  kind: 'thread_in_workstream',
+                  fromNodeId: 'thread:thread_a',
+                  toNodeId: 'workstream:ws_x',
+                  observedAt: '2026-05-07T10:00:00.000Z',
+                  producedBy: { source: 'event-log', eventType: 'thread.upserted' },
+                  confidence: 'asserted',
+                },
+              ],
+              updatedAt: '2026-05-07T10:00:00.000Z',
+              nodeCount: 2,
+              edgeCount: 1,
+            },
+          },
+        };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+
+    render(<ConnectionsView initialAnchor="thread:thread_a" />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('node-anchor-workstream:ws_x')).not.toBeNull();
+    });
+    fireEvent.click(screen.getByTestId('node-anchor-workstream:ws_x'));
+
+    await waitFor(() => {
+      expect(requestedNodeIds).toContain('workstream:ws_x');
+    });
+    expect((screen.getByTestId('connections-workstream-select') as HTMLSelectElement).value).toBe(
+      'workstream:ws_x',
+    );
+  });
+
   it('renders the unreachable-scope message when companion is offline', async () => {
     setConnectionsClientTransportForTests(async () => ({
       ok: true,

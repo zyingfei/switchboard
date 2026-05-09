@@ -390,3 +390,259 @@ gate-toggle.
 - `design/stage-4-collector-framework/COLLECTOR-BRIEF-TEMPLATE.md` (NEW —
   9-field template per parent plan).
 - `docs/architecture.md` (modify — add collector framework section).
+
+---
+
+## Wave E — composed acceptance e2e
+
+### L5 — Full browser sync user story (Stage 1 + 2/3 + 4 composed)
+
+**Owner:** Codex sub-task (lead authors the brief; Codex executes).
+**Branch convention:** `codex/stage4-l5-full-browser-sync-e2e` off
+`feat/collector-framework` HEAD.
+**File:** `packages/sidetrack-extension/tests/e2e/connections-full-browser-sync-user-story.spec.ts` (NEW, single file).
+
+This is the largest e2e in the repo. Composes Stage 1 (timeline +
+engagement + snippets + connections) + Stage 2/3 (ranker + feedback +
+producer pin) + Stage 4 (collector framework + relay sync) into one
+acceptance test.
+
+#### Setup
+
+```sh
+cd /Users/yingfei/Documents/playground/browser-ai-companion
+git fetch origin --quiet
+git worktree add -b codex/stage4-l5-full-browser-sync-e2e \
+  /tmp/codex-stage4-l5 origin/feat/collector-framework
+cd /tmp/codex-stage4-l5
+```
+
+#### Read FIRST (harness templates)
+
+Three existing specs cover ~95% of the moves:
+
+- `packages/sidetrack-extension/tests/e2e/connections-cross-replica-browser.spec.ts`
+  — full template for two-browser + relay + two-companion setup
+  (`startTestRelay`, `startTestCompanion({syncRelay, syncRendezvousSecret})`,
+  `launchExtensionRuntime({forceLocalProfile: true})`,
+  `runtime.seedStorage`, `waitForCompanionToContain`).
+- `packages/sidetrack-extension/tests/e2e/connections-real-tabs.spec.ts`
+  — template for real `chrome.tabs` navigation + force-drain + ambient
+  workstream attribution. Drives `runtime.context.route()` HTTP stubs +
+  `sidetrack.timeline.enabled` flag in `chrome.storage` +
+  `sidetrack.timeline.reinit` runtime message + per-URL new-tab fan-out
+  + `sidetrack.timeline.force-drain` loop.
+- `packages/sidetrack-extension/tests/e2e/connections-stage2-3-user-story.spec.ts`
+  — template for feedback button + producer pin testIDs:
+  `producer-pin-ranker`, `producer-pin-ranker-pin`, `edge-provenance >
+  feedback-confirm`, `edge-provenance > feedback-reject`,
+  `edge-provenance > feedback-saved`.
+
+Helpers (all under `packages/sidetrack-extension/tests/e2e/helpers/`):
+- `companion.ts` — `startTestCompanion(opts)` returns `TestCompanion`
+  with `{ port, bridgeKey, vaultPath, close, ... }`. **`vaultPath` is
+  exposed**; the brief uses it for filesystem-level inbox drops.
+- `relay.ts` — `startTestRelay({})`.
+- `runtime.ts` — `launchExtensionRuntime({forceLocalProfile: true})`.
+- `sidepanel.ts` — `SETUP_KEY`, `SETTINGS_KEY` constants.
+
+#### Acceptance criteria (firm)
+
+1. **No direct `/v1/timeline/events` seeding.** All timeline visits
+   come from real `chrome.tabs` navigation in the playwright runtime.
+2. **No direct work-graph eval fixture seeding for the browser story.**
+   Stage 2/3 ranker fixtures are NOT loaded in this spec.
+3. Browser A uses real `chrome.tabs` / CDP navigation.
+4. Browser A performs scroll / copy / paste interactions where possible
+   (gracefully degrade if clipboard isn't permitted in the headless
+   chromium profile).
+5. Companion A ingests collector JSONL through `_BAC/inbox/<id>/`,
+   NOT direct API.
+6. Relay syncs to companion B.
+7. Browser B renders the synced graph from its own companion (panel B
+   is wired to companion B; never queries companion A).
+8. Browser B sees:
+   - ambient visits
+   - `visit_in_workstream`
+   - navigation/opened-from edges
+   - engagement/focus classification
+   - topic nodes (allow soft-fail with informational `console.log`
+     when the deterministic test embedder can't push cosines past the
+     threshold)
+   - `closest_visit` with `revisionId`
+   - why-related feature reasons
+   - feedback projection
+   - collector-promoted coding session/turn events
+9. **No LLM-shaped network calls.** Network mock fails the test on
+   `*ollama*`, `*openai*`, `*anthropic*`, `*claude*`, `*completions*`
+   outbound requests.
+
+#### Spec structure (high-level)
+
+```ts
+test.describe('connections — full browser sync user story (Stage 1 + 2/3 + 4 composed)', () => {
+  test.skip(
+    process.env['SIDETRACK_E2E_SKIP_LIVE_BROWSERS'] === '1',
+    'set SIDETRACK_E2E_SKIP_LIVE_BROWSERS=1 to skip when CfT is unavailable',
+  );
+  test.setTimeout(600_000); // 10 min — longest e2e in the repo.
+
+  let relay, companionA, companionB, runtimeA, runtimeB, panelA, panelB, wsId;
+
+  test.beforeAll(async () => { /* spawn relay + 2 companions wired to it + 2 runtimes */ });
+  test.afterAll(async () => { /* close everything */ });
+
+  test('full Stage 1+2/3+4 user story syncs A → B with no LLM calls', async () => {
+    /* The single big test — see Flow below. */
+  });
+});
+```
+
+#### Flow
+
+**Step 1 — relay + companions + browsers up.**
+Mirror `connections-cross-replica-browser.spec.ts:197-228`. Generate
+ONE rendezvous secret via `generateRendezvousSecret`; pass to both
+companions. Two `launchExtensionRuntime({forceLocalProfile: true})`.
+
+**Step 2 — Browser A: workstream + timeline gate via UI/storage.**
+Mirror `connections-real-tabs.spec.ts:136-164`. Create the workstream
+via `apiPost(companionA, '/v1/workstreams', {title:'Full sync research'})`
+— **note**: workstream creation IS allowed via API per acceptance #1
+(which only forbids `/v1/timeline/events` seeding). Stamp
+`sidetrack.timeline.enabled = true` + `sidetrack.activeWorkstreamId =
+wsId` in `chrome.storage`. Send `sidetrack.timeline.reinit` runtime
+message.
+
+**Step 3 — Browser A: real `chrome.tabs` navigation + interaction.**
+Stub HTTP responses for ~7 URLs (HN, blog, search, chat, ambient, PR,
+video — same set as `connections-real-tabs.spec.ts`). Open each URL
+in a new tab via `runtime.context.newPage()` + `goto(url)`. For at
+least one URL, perform interactions:
+
+```ts
+await tab.evaluate(() => window.scrollBy(0, 500));
+await tab.evaluate(() =>
+  navigator.clipboard?.writeText('test snippet').catch(() => undefined),
+);
+```
+
+Don't fail the test if clipboard isn't permitted — wrap in `.catch()`.
+Force-drain via `sidetrack.timeline.force-drain` runtime message in a
+loop until `uploaded >= ALL_URLS.length`.
+
+**Step 4 — Browser A: collector JSONL via filesystem (NOT API).**
+Drop a Codex CLI shaped JSONL file at:
+
+```
+${companionA.vaultPath}/_BAC/inbox/sidetrack.codex-cli/${YYYY-MM-DD}.jsonl
+```
+
+Use `node:fs/promises` `mkdir` + `writeFile`. Also drop a
+`_BAC/collectors/sidetrack.codex-cli/collector.toml` manifest so the
+framework's discovery loads it. Inline a minimal TOML — easier than
+importing the test-tick fixture builder.
+
+The lines should be 2× `coding.session.started` + 4×
+`coding.session.turn.observed` envelope shapes per
+`packages/sidetrack-companion/src/collectors/codex-cli/materializers.ts`.
+Each line carries a stable `source_record_id` so promotion is
+idempotent.
+
+Wait for companion A's framework to promote: poll
+`apiGet(companionA, '/v1/connections')` or wait a few seconds and
+proceed (relay sync covers the rest).
+
+**Step 5 — Browser A: feedback + producer pin via UI.**
+Mirror `connections-stage2-3-user-story.spec.ts:309-374`:
+- Anchor the Connections panel on the workstream.
+- Find a candidate edge.
+- Click `edge-provenance > feedback-confirm` and `feedback-reject`.
+- Click `producer-pin-ranker-pin` to pin the ranker revision.
+
+**Step 6 — Wait for relay sync.**
+Mirror `connections-cross-replica-browser.spec.ts:221-228`:
+- `waitForCompanionToContain(companionB, 'workstream:${wsId}')`
+- `waitForCompanionToContain(companionB, 'timeline-visit:<each URL>')`
+- For collector-promoted events: query companion B's connections
+  snapshot for `producedBy.kind === 'collector'`, OR fall back to
+  reading `companionB.vaultPath/_BAC/events/<date>.jsonl` via
+  `node:fs/promises.readdir` and assert at least one
+  `coding.session.turn.observed` event type appears.
+
+**Step 7 — Browser B: panel asserts the synced graph.**
+Open Browser B's side panel pointing at companion B (mirror
+`connections-cross-replica-browser.spec.ts:230-258`). Anchor on
+`workstream:${wsId}`. Assert:
+- All timeline-visit nodes present (the navigated URLs).
+- The ambient visit's `visit_in_workstream` edge to the workstream.
+- At least one navigation/opened-from edge between two consecutive
+  visits in the same tab (`opener_chain` or
+  `previous_visit_in_tab_session` per the connections types).
+- Engagement-class metadata is set on at least one visit (read
+  snapshot edges/nodes for `engagement-class:v1:rules` revision
+  presence).
+- At least one topic node (`kind === 'topic'`) if the union-find
+  clusterer fired. (Allow soft-fail with informational `console.log`
+  per the prior spec's pattern.)
+- At least one `closest_visit` edge with `producedBy.revisionId !== null`.
+- Why-related panel: click a node, expect `edge-provenance` to
+  surface at least one feature reason.
+- Feedback projection on companion B:
+  `apiGet(companionB, '/v1/feedback/projection')` shows the positive
+  + negative labels Browser A submitted.
+- Coding session/turn events made it to B's event log: assert via
+  `apiGet(companionB, '/v1/recall/query?q=session')` OR read
+  `companionB.vaultPath/_BAC/events/<date>.jsonl` for
+  `coding.session.turn.observed` types.
+
+**Step 8 — Network-mock asserts no LLM-shaped requests.**
+Install `runtime.context.route()` rules at the top of the test that
+fail on `*ollama*`, `*openai*`, `*anthropic*`, `*claude*`,
+`*completions*` outbound requests. Mirror the exact glob list from
+`connections-stage2-3-user-story.spec.ts`.
+
+#### Constraints
+
+- TypeScript strict; `import` style with the existing project
+  conventions (the extension test files do NOT use `.js` extensions
+  on relative TS imports — match the surrounding files).
+- Test gated on `SIDETRACK_E2E_SKIP_LIVE_BROWSERS=1` (skip when set).
+- Test timeout 10 min (`test.setTimeout(600_000)`).
+- DO NOT add new helper files. Inline anything you need.
+- DO NOT seed `/v1/timeline/events` (acceptance #1 is firm).
+- DO NOT seed work-graph eval fixtures (acceptance #2 is firm).
+- DO NOT touch any non-test file.
+
+#### Verify
+
+```sh
+cd /tmp/codex-stage4-l5/packages/sidetrack-extension
+# tsc on the test config (Playwright tests have their own tsconfig).
+npx tsc --noEmit -p tsconfig.test.json 2>&1 | tail -10 || true
+
+# Skip-mode smoke test. The spec MUST skip cleanly when the env is set.
+SIDETRACK_E2E_SKIP_LIVE_BROWSERS=1 \
+  npx playwright test connections-full-browser-sync-user-story 2>&1 | tail -20
+```
+
+If real Chromium is available locally and the env is unset, also try
+a non-skipped run. If it times out at the 600s mark, that's an
+indication the spec needs more force-drain calls or longer waits —
+report the result; the brief tolerates timeout in that environment.
+
+#### Commit + push
+
+```sh
+cd /tmp/codex-stage4-l5
+git add packages/sidetrack-extension/tests/e2e/connections-full-browser-sync-user-story.spec.ts
+git commit -m "stage-4: L5 — full browser sync user story e2e (Stage 1 + 2/3 + 4 composed)
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
+git push -u origin codex/stage4-l5-full-browser-sync-e2e
+```
+
+#### Report
+
+In the final response: SHA, tsc result, skip-mode playwright result,
+any non-obvious deviations from this brief.

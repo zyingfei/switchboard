@@ -64,13 +64,23 @@ export const startEngagementTracking = (): void => {
   window.addEventListener('beforeunload', () => {
     emit(true);
   });
-  chrome.runtime.onMessage.addListener((message: unknown) => {
+  chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
     if (
       typeof message === 'object' &&
       message !== null &&
       (message as { type?: unknown }).type === 'sidetrack.engagement.idle'
     ) {
       aggregator.setIdle((message as { idle?: unknown }).idle === true);
+      sendResponse({ ok: true });
+      return undefined;
+    }
+    if (
+      typeof message === 'object' &&
+      message !== null &&
+      (message as { type?: unknown }).type === 'sidetrack.engagement.force-finalize'
+    ) {
+      emit(true);
+      sendResponse({ ok: true });
     }
     return undefined;
   });

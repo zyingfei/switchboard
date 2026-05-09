@@ -43,13 +43,21 @@ export const FlowPathView = ({
     list.push(visit);
     visitsByTab.set(visit.tabSessionIdHash, list);
   }
+  const visitById = new Map(visits.map((visit) => [visit.id, visit] as const));
+  const tabLabelByHash = new Map(
+    [...visitsByTab.keys()].map((tabSessionIdHash, index) => [
+      tabSessionIdHash,
+      `Tab ${String(index + 1)}`,
+    ]),
+  );
+  const visitLabel = (visitId: string): string => visitById.get(visitId)?.label ?? visitId;
 
   return (
     <section className="cx-flow" data-testid="flow-path-view">
       {[...visitsByTab.entries()].map(([tabSessionIdHash, tabVisits]) => (
         <div className="cx-flow-row" key={tabSessionIdHash}>
           <div className="cx-flow-tab" title={tabSessionIdHash}>
-            {tabSessionIdHash}
+            {tabLabelByHash.get(tabSessionIdHash)}
           </div>
           <div className="cx-flow-visits">
             {tabVisits.map((visit) => (
@@ -57,7 +65,7 @@ export const FlowPathView = ({
                 key={visit.id}
                 type="button"
                 className="cx-flow-visit"
-                title={visit.engagementClass}
+                title={visit.id}
                 onClick={() => onNodeClick(visit.id)}
                 data-testid={`flow-visit-${visit.id}`}
               >
@@ -70,10 +78,15 @@ export const FlowPathView = ({
       ))}
       <div className="cx-flow-edges" aria-label="Navigation edges">
         {navigationEdges.map((edge) => (
-          <span key={edge.id} className="cx-flow-edge" data-testid={`flow-nav-edge-${edge.id}`}>
-            {edge.kind}: {edge.fromVisitId}
+          <span
+            key={edge.id}
+            className="cx-flow-edge"
+            data-testid={`flow-nav-edge-${edge.id}`}
+            title={`${edge.fromVisitId} -> ${edge.toVisitId}`}
+          >
+            {edge.kind}: {visitLabel(edge.fromVisitId)}
             {' -> '}
-            {edge.toVisitId}
+            {visitLabel(edge.toVisitId)}
           </span>
         ))}
         {crossReplicaEdges.map((edge) => (
@@ -81,8 +94,9 @@ export const FlowPathView = ({
             key={edge.id}
             className="cx-flow-edge cx-edge-cross-replica"
             data-testid={`flow-cross-replica-edge-${edge.id}`}
+            title={edge.fromVisitId}
           >
-            replica: {edge.fromVisitId}
+            replica: {visitLabel(edge.fromVisitId)}
             {' -> '}
             {edge.replicaId}
           </span>

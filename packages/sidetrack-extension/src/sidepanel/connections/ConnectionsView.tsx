@@ -70,9 +70,16 @@ export interface ConnectionsViewRecentAnchor {
   readonly meta?: string;
 }
 
+export interface ConnectionsViewWorkstreamAnchor {
+  readonly id: string;
+  readonly label: string;
+  readonly meta?: string;
+}
+
 type Props = {
   readonly initialAnchor?: string;
   readonly recentAnchors?: readonly ConnectionsViewRecentAnchor[];
+  readonly workstreamAnchors?: readonly ConnectionsViewWorkstreamAnchor[];
 };
 
 type SubMode = 'linked' | 'orbital' | 'flow' | 'focus' | 'context';
@@ -84,6 +91,9 @@ const KIND_RANK = new Map<ConnectionNodeKind, number>(
 const edgeConfidenceClass = (confidence: ConnectionEdge['confidence']): string => {
   return confidence === 'inferred' ? 'confidence-inferred' : '';
 };
+
+const normalizeWorkstreamAnchorId = (id: string): string =>
+  id.startsWith('workstream:') ? id : `workstream:${id}`;
 
 const metadataString = (
   metadata: Record<string, unknown>,
@@ -289,6 +299,35 @@ const edgeConnects = (edge: ConnectionEdge, leftId: string, rightId: string): bo
   (edge.fromNodeId === leftId && edge.toNodeId === rightId) ||
   (edge.fromNodeId === rightId && edge.toNodeId === leftId);
 
+const symmetricEdgeKinds = new Set(['closest_visit', 'visit_resembles_visit']);
+
+const shortNodeId = (id: string): string => {
+  const separator = id.indexOf(':');
+  const raw = separator === -1 ? id : id.slice(separator + 1);
+  return raw.length <= 40 ? raw : `${raw.slice(0, 37)}...`;
+};
+
+const nodeDisplayLabel = (
+  nodeById: ReadonlyMap<string, ConnectionNode>,
+  nodeId: string,
+): string => {
+  const node = nodeById.get(nodeId);
+  const label = node?.label.trim();
+  return label === undefined || label.length === 0 ? shortNodeId(nodeId) : label;
+};
+
+const edgeKindLabel = (edge: ConnectionEdge): string =>
+  EDGE_KINDS[edge.kind]?.label ?? edge.kind.replaceAll('_', ' ');
+
+const edgeEndpointLabel = (
+  edge: ConnectionEdge,
+  nodeById: ReadonlyMap<string, ConnectionNode>,
+): string => {
+  const from = nodeDisplayLabel(nodeById, edge.fromNodeId);
+  const to = nodeDisplayLabel(nodeById, edge.toNodeId);
+  return symmetricEdgeKinds.has(edge.kind) ? `${from} ↔ ${to}` : `${from} → ${to}`;
+};
+
 const findFeedbackEdge = (
   edges: readonly ConnectionEdge[],
   leftId: string,
@@ -308,8 +347,10 @@ const findRevisionEdgeForVisit = (
   edges: readonly ConnectionEdge[],
   visitId: string,
 ): ConnectionEdge | null =>
-  edges.find((edge) => hasRevisionProducer(edge) && (edge.fromNodeId === visitId || edge.toNodeId === visitId)) ??
-  null;
+  edges.find(
+    (edge) =>
+      hasRevisionProducer(edge) && (edge.fromNodeId === visitId || edge.toNodeId === visitId),
+  ) ?? null;
 
 const snippetSourceVisitId = (node: ConnectionNode, edge: ConnectionEdge | null): string | null => {
   if (node.kind !== 'snippet' || edge === null) return null;
@@ -351,6 +392,7 @@ const sortGroupKeys = (kinds: readonly ConnectionNodeKind[]): ConnectionNodeKind
 export const ConnectionsView = ({
   initialAnchor = '',
   recentAnchors = [],
+  workstreamAnchors = [],
 }: Props): ReactElement => {
   const [anchor, setAnchor] = useState<string>(initialAnchor);
   const [draftAnchor, setDraftAnchor] = useState<string>(initialAnchor);
@@ -393,6 +435,7 @@ export const ConnectionsView = ({
       setEdgeDetail(null);
       return;
     }
+    setEdgeDetail(null);
     let cancelled = false;
     fetchConnectionsEdge(selectedEdge.id).then((r) => {
       if (cancelled) return;
@@ -413,12 +456,55 @@ export const ConnectionsView = ({
     return computeTimelineRail(result.snapshot, anchor);
   }, [result, anchor]);
 
+  const workstreamOptions = useMemo<readonly ConnectionsViewWorkstreamAnchor[]>(() => {
+    const byId = new Map<string, ConnectionsViewWorkstreamAnchor>();
+    const add = (input: ConnectionsViewWorkstreamAnchor): void => {
+      const id = normalizeWorkstreamAnchorId(input.id);
+      if (byId.has(id)) return;
+      byId.set(id, { ...input, id });
+    };
+    for (const input of workstreamAnchors) add(input);
+    for (const recent of recentAnchors) {
+      if (recent.kind === 'workstream') {
+        add({
+          id: recent.id,
+          label: recent.label,
+          ...(recent.meta === undefined ? {} : { meta: recent.meta }),
+        });
+      }
+    }
+    for (const node of result?.snapshot.nodes ?? []) {
+      if (node.kind !== 'workstream') continue;
+      add({
+        id: node.id,
+        label: node.label.trim().length > 0 ? node.label : shortNodeId(node.id),
+        ...(node.lastSeenAt === undefined ? {} : { meta: node.lastSeenAt.slice(0, 10) }),
+      });
+    }
+    if (anchor.startsWith('workstream:')) {
+      add({
+        id: anchor,
+        label: anchorNode?.label ?? shortNodeId(anchor),
+      });
+    }
+    return [...byId.values()].sort((left, right) => left.label.localeCompare(right.label));
+  }, [anchor, anchorNode, recentAnchors, result, workstreamAnchors]);
+
   const submitAnchor = (next?: string): void => {
     const value = (next ?? draftAnchor).trim();
     if (next !== undefined) setDraftAnchor(value);
     setSelectedEdge(null);
     setWhyVisitId(null);
     setAnchor(value);
+  };
+
+  const selectedWorkstreamAnchor = anchor.startsWith('workstream:') ? anchor : '';
+
+  const useNodeAsAnchor = (nodeId: string): void => {
+    setSelectedEdge(null);
+    setWhyVisitId(null);
+    setDraftAnchor(nodeId);
+    setAnchor(nodeId);
   };
 
   const selectEdge = (edge: ConnectionEdge): void => {
@@ -622,27 +708,58 @@ export const ConnectionsView = ({
       <div className="cx-cols">
         <aside className="cx-col-l">
           <div className="cx-section">
-            <h4>Anchor</h4>
-            <label className="cx-input">
-              <span
-                aria-hidden
-                style={{ color: 'var(--ink-3)', display: 'grid', placeItems: 'center' }}
-              >
-                {SearchIcon}
-              </span>
-              <input
-                type="text"
-                placeholder="thread:bac_…  workstream:bac_…"
-                value={draftAnchor}
-                onChange={(e) => setDraftAnchor(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') submitAnchor();
+            <h4>Workstream</h4>
+            <label className="cx-select">
+              <span className="cx-select-label">Show connections around</span>
+              <select
+                value={selectedWorkstreamAnchor}
+                onChange={(event) => {
+                  if (event.currentTarget.value.length > 0) submitAnchor(event.currentTarget.value);
                 }}
-                onBlur={() => submitAnchor()}
-                aria-label="Connections anchor"
-                data-testid="connections-anchor-input"
-              />
+                aria-label="Connections workstream"
+                data-testid="connections-workstream-select"
+                disabled={workstreamOptions.length === 0}
+              >
+                <option value="">
+                  {workstreamOptions.length === 0 ? 'No workstreams in view' : 'Choose workstream'}
+                </option>
+                {workstreamOptions.map((workstream) => (
+                  <option key={workstream.id} value={workstream.id}>
+                    {workstream.label}
+                    {workstream.meta === undefined ? '' : ` · ${workstream.meta}`}
+                  </option>
+                ))}
+              </select>
             </label>
+            <details
+              className="cx-advanced-anchor"
+              data-testid="connections-advanced-anchor"
+              open={workstreamOptions.length === 0 || !anchor.startsWith('workstream:')}
+            >
+              <summary data-testid="connections-advanced-anchor-summary">
+                Advanced node anchor
+              </summary>
+              <label className="cx-input">
+                <span
+                  aria-hidden
+                  style={{ color: 'var(--ink-3)', display: 'grid', placeItems: 'center' }}
+                >
+                  {SearchIcon}
+                </span>
+                <input
+                  type="text"
+                  placeholder="thread:bac_...  visit:https://..."
+                  value={draftAnchor}
+                  onChange={(e) => setDraftAnchor(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') submitAnchor();
+                  }}
+                  onBlur={() => submitAnchor()}
+                  aria-label="Connections anchor"
+                  data-testid="connections-anchor-input"
+                />
+              </label>
+            </details>
           </div>
           {recentAnchors.length > 0 ? (
             <div className="cx-section" data-testid="connections-recent-anchors">
@@ -728,6 +845,7 @@ export const ConnectionsView = ({
                 anchorId={anchor}
                 selectedEdge={selectedEdge}
                 onSelectEdge={selectEdge}
+                onUseNodeAsAnchor={useNodeAsAnchor}
                 onPromoteSnippet={submitSnippetPromotion}
               />
             ) : subMode === 'orbital' ? (
@@ -737,6 +855,7 @@ export const ConnectionsView = ({
                 hops={hops}
                 selectedEdge={selectedEdge}
                 onSelectEdge={selectEdge}
+                onUseNodeAsAnchor={useNodeAsAnchor}
               />
             ) : subMode === 'flow' ? (
               <FlowPathView
@@ -822,12 +941,14 @@ const ConnectionsLinkedCenter = ({
   anchorId,
   selectedEdge,
   onSelectEdge,
+  onUseNodeAsAnchor,
   onPromoteSnippet,
 }: {
   readonly result: ConnectionsScopedResult;
   readonly anchorId: string;
   readonly selectedEdge: ConnectionEdge | null;
   readonly onSelectEdge: (edge: ConnectionEdge) => void;
+  readonly onUseNodeAsAnchor: (nodeId: string) => void;
   readonly onPromoteSnippet: (input: {
     readonly snippetId: string;
     readonly sourceVisitId: string;
@@ -852,6 +973,7 @@ const ConnectionsLinkedCenter = ({
   const neighbors = result.snapshot.nodes.filter((n) => n.id !== anchorId);
   const groups = groupByKind(neighbors);
   const orderedKinds = sortGroupKeys([...groups.keys()]);
+  const nodeById = new Map(result.snapshot.nodes.map((node) => [node.id, node] as const));
   const edgesByOtherEnd = new Map<string, ConnectionEdge>();
   for (const e of result.snapshot.edges) {
     if (e.fromNodeId === anchorId && !edgesByOtherEnd.has(e.toNodeId)) {
@@ -892,6 +1014,9 @@ const ConnectionsLinkedCenter = ({
                     direction={edge?.fromNodeId === anchorId ? 'out' : 'in'}
                     selected={selectedEdge?.id === edge?.id && edge !== undefined}
                     onPromoteSnippet={onPromoteSnippet}
+                    onUseAsAnchor={() => {
+                      onUseNodeAsAnchor(n.id);
+                    }}
                     onClick={() => {
                       if (edge !== undefined) onSelectEdge(edge);
                     }}
@@ -902,9 +1027,10 @@ const ConnectionsLinkedCenter = ({
           </section>
         );
       })}
-      <section className="cx-section" data-testid="connections-edges">
-        <h4>All edges (click for provenance)</h4>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      <section className="cx-section cx-edge-section" data-testid="connections-edges">
+        <h4>Provenance edges</h4>
+        <p className="cx-edge-section-note">Click an edge to inspect why Sidetrack connected it.</p>
+        <div className="cx-edge-list">
           {result.snapshot.edges.map((edge) => {
             const meta = EDGE_KINDS[edge.kind];
             const fam: EdgeFamily = meta?.family ?? 'urlmatch';
@@ -916,8 +1042,8 @@ const ConnectionsLinkedCenter = ({
                 type="button"
                 onClick={() => onSelectEdge(edge)}
                 data-testid={`edge-${edge.id}`}
-                className={`cx-edgelabel ${isSelected ? 'is-selected' : ''}`}
-                style={{ cursor: 'pointer', justifyContent: 'flex-start', padding: '4px 8px' }}
+                className={`cx-edgelabel cx-edge-summary ${isSelected ? 'is-selected' : ''}`}
+                title={`${edgeEndpointLabel(edge, nodeById)} · ${edgeKindLabel(edge)}`}
               >
                 <span
                   className={`cx-edge fam-${fam} ${edgeConfidenceClass(edge.confidence)}`.trim()}
@@ -925,7 +1051,8 @@ const ConnectionsLinkedCenter = ({
                 >
                   <span className="cx-edge-line" />
                 </span>
-                <span style={{ color: 'var(--ink)' }}>{edge.kind}</span>
+                <span className="cx-edge-summary-main">{edgeEndpointLabel(edge, nodeById)}</span>
+                <span className="bac-connections-edge-hint">{edgeKindLabel(edge)}</span>
                 {hint !== null ? (
                   <span className="bac-connections-edge-hint" data-testid={`edge-hint-${edge.id}`}>
                     {hint}
@@ -949,12 +1076,14 @@ const ConnectionsOrbitalCenter = ({
   hops,
   selectedEdge,
   onSelectEdge,
+  onUseNodeAsAnchor,
 }: {
   readonly result: ConnectionsScopedResult;
   readonly anchorId: string;
   readonly hops: number;
   readonly selectedEdge: ConnectionEdge | null;
   readonly onSelectEdge: (edge: ConnectionEdge) => void;
+  readonly onUseNodeAsAnchor: (nodeId: string) => void;
 }): ReactElement => {
   // Hooks must run on every render — keep the layout call before
   // any early returns.
@@ -979,6 +1108,20 @@ const ConnectionsOrbitalCenter = ({
   }
   const nodeById = new Map<string, ConnectionNode>();
   for (const n of result.snapshot.nodes) nodeById.set(n.id, n);
+  const anchorEdges = layout.edges.filter(
+    (edge) => edge.fromNodeId === anchorId || edge.toNodeId === anchorId,
+  );
+  const stripEdges =
+    selectedEdge === null
+      ? anchorEdges
+      : layout.edges.filter(
+          (edge) =>
+            edge.id === selectedEdge.id ||
+            edge.fromNodeId === selectedEdge.fromNodeId ||
+            edge.toNodeId === selectedEdge.toNodeId ||
+            edge.fromNodeId === selectedEdge.toNodeId ||
+            edge.toNodeId === selectedEdge.fromNodeId,
+        );
 
   return (
     <div
@@ -1048,9 +1191,14 @@ const ConnectionsOrbitalCenter = ({
             !isAnchor &&
             !(selectedEdge.fromNodeId === p.id || selectedEdge.toNodeId === p.id);
           return (
-            <div
+            <button
+              type="button"
               key={p.id}
               className="cx-orbit-node"
+              onClick={() => {
+                onUseNodeAsAnchor(p.id);
+              }}
+              title={`Use ${node.label} as anchor`}
               style={{
                 left: `${String((p.x / ORBIT_W) * 100)}%`,
                 top: `${String((p.y / ORBIT_H) * 100)}%`,
@@ -1062,13 +1210,14 @@ const ConnectionsOrbitalCenter = ({
                 size={isAnchor ? 'lg' : 'md'}
                 state={isAnchor ? 'anchor' : isDim ? undefined : undefined}
               />
-            </div>
+            </button>
           );
         })}
       </div>
       <div className="cx-orbit-edges-strip" data-testid="connections-edges">
-        <span className="label">Edges</span>
-        {layout.edges.map((edge) => {
+        <span className="label">Anchor edges</span>
+        {stripEdges.length === 0 ? <span className="cx-mono cx-dim">none</span> : null}
+        {stripEdges.map((edge) => {
           const meta = EDGE_KINDS[edge.kind];
           const fam: EdgeFamily = meta?.family ?? 'urlmatch';
           const isSelected = selectedEdge?.id === edge.id;
@@ -1077,10 +1226,10 @@ const ConnectionsOrbitalCenter = ({
             <button
               key={edge.id}
               type="button"
-              className={`cx-edgelabel ${isSelected ? 'is-selected' : ''}`}
+              className={`cx-edgelabel cx-edge-summary ${isSelected ? 'is-selected' : ''}`}
               onClick={() => onSelectEdge(edge)}
               data-testid={`edge-${edge.id}`}
-              style={{ cursor: 'pointer' }}
+              title={`${edgeEndpointLabel(edge, nodeById)} · ${edgeKindLabel(edge)}`}
             >
               <span
                 className={`cx-edge fam-${fam} ${edgeConfidenceClass(edge.confidence)}`.trim()}
@@ -1088,7 +1237,8 @@ const ConnectionsOrbitalCenter = ({
               >
                 <span className="cx-edge-line" />
               </span>
-              <span>{meta?.label ?? edge.kind}</span>
+              <span className="cx-edge-summary-main">{edgeEndpointLabel(edge, nodeById)}</span>
+              <span className="bac-connections-edge-hint">{meta?.label ?? edge.kind}</span>
               {hint !== null ? (
                 <span className="bac-connections-edge-hint" data-testid={`edge-hint-${edge.id}`}>
                   {hint}
@@ -1097,6 +1247,11 @@ const ConnectionsOrbitalCenter = ({
             </button>
           );
         })}
+        {layout.edges.length > stripEdges.length ? (
+          <span className="cx-mono cx-dim">
+            {layout.edges.length - stripEdges.length} more in Linked
+          </span>
+        ) : null}
       </div>
     </div>
   );
@@ -1195,6 +1350,7 @@ const NodeRow = ({
   direction,
   selected,
   onPromoteSnippet,
+  onUseAsAnchor,
   onClick,
 }: {
   readonly node: ConnectionNode;
@@ -1205,6 +1361,7 @@ const NodeRow = ({
     readonly snippetId: string;
     readonly sourceVisitId: string;
   }) => Promise<void>;
+  readonly onUseAsAnchor: () => void;
   readonly onClick: () => void;
 }): ReactElement => {
   const [promoting, setPromoting] = useState<boolean>(false);
@@ -1287,6 +1444,15 @@ const NodeRow = ({
           {promoteStatus === 'saved' ? 'Promoted' : promoteStatus === 'error' ? 'Retry' : 'Promote'}
         </button>
       ) : null}
+      <button
+        type="button"
+        className="cx-focus-expand cx-row-anchor-action"
+        onClick={onUseAsAnchor}
+        data-testid={`node-anchor-${node.id}`}
+        title={`Use ${node.label} as anchor`}
+      >
+        Open
+      </button>
     </div>
   );
 };
@@ -1364,7 +1530,7 @@ const ProvenanceCard = ({
   const reason = meta?.description ?? edge.kind;
   const supportsFlowFeedback = feedbackRelationKindForEdgeKind(edge.kind) !== null;
   return (
-    <aside className="cx-prov" data-testid="edge-provenance">
+    <aside className="cx-prov" data-testid="edge-provenance" data-edge-id={edge.id}>
       <header className="cx-prov-head">
         <span className="cx-prov-kind">{edge.kind}</span>
         <span className="cx-stamp">{edge.confidence}</span>
@@ -1419,6 +1585,7 @@ const ProvenanceCard = ({
       {supportsFlowFeedback ? (
         <div style={{ paddingTop: 10 }}>
           <FeedbackButtons
+            key={edge.id}
             label="relation"
             onFeedback={async (choice) => {
               await onFlowFeedback(edge, choice);
