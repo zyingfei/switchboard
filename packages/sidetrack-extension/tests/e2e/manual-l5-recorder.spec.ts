@@ -18,6 +18,12 @@ import { expect, test, type Page } from '@playwright/test';
 
 import { generateRendezvousSecret } from '../../../sidetrack-companion/src/sync/relayCrypto';
 import { startTestCompanion, type TestCompanion } from './helpers/companion';
+import {
+  formatManualExperimentSummary,
+  installManualNetworkOutcomeRecorder,
+  resolveManualBrowserMode,
+  summarizeManualExperiment,
+} from './helpers/manualBrowserMode';
 import { ManualRecorder } from './helpers/manualRecorder';
 import { startTestRelay, type TestRelay } from './helpers/relay';
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
@@ -322,7 +328,7 @@ const createLaunchpad = async (
       .map(
         (link) => `
           <li>
-            <a href="${link.url}" target="_blank" rel="noreferrer">${link.title}</a>
+            <a href="${link.url}" target="_blank" rel="noreferrer" data-open-live-link>${link.title}</a>
             <small>${link.note}</small>
           </li>`,
       )
@@ -356,8 +362,8 @@ const createLaunchpad = async (
     <li>Use the Sidetrack panel tab for Browser A to keep the active workstream aligned.</li>
     <li>Security flow workstream id: <code>${input.securityWorkstreamId}</code>.</li>
     <li>Switchboard flow workstream id: <code>${input.switchboardWorkstreamId}</code>.</li>
-    <li>Browser A panel: <a href="${input.browserPanelUrl}" target="_blank" rel="noreferrer">${input.browserPanelUrl}</a>.</li>
-    <li>Reviewer panel: <a href="${input.reviewerPanelUrl}" target="_blank" rel="noreferrer">${input.reviewerPanelUrl}</a>.</li>
+    <li>Browser A panel: <a href="${input.browserPanelUrl}" target="_blank" rel="noreferrer" data-open-live-link>${input.browserPanelUrl}</a>.</li>
+    <li>Reviewer panel: <a href="${input.reviewerPanelUrl}" target="_blank" rel="noreferrer" data-open-live-link>${input.reviewerPanelUrl}</a>.</li>
   </ol>
   <div class="grid">
     <section>
@@ -369,6 +375,24 @@ const createLaunchpad = async (
       <ul>${linkSections('switchboard')}</ul>
     </section>
   </div>
+  <script>
+    document.addEventListener('click', (event) => {
+      if (event.defaultPrevented || event.button !== 0) return;
+      if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      const target = event.target instanceof Element
+        ? event.target.closest('a[data-open-live-link]')
+        : null;
+      if (!(target instanceof HTMLAnchorElement)) return;
+      event.preventDefault();
+      const opened = window.open(target.href, '_blank');
+      if (opened === null) {
+        window.location.href = target.href;
+        return;
+      }
+      opened.opener = null;
+      opened.focus();
+    });
+  </script>
 </body>
 </html>
 `;
@@ -525,6 +549,10 @@ test.describe('manual L5 full-browser recorder', () => {
     test.setTimeout(0);
     process.env.SIDETRACK_E2E_HEADLESS = '0';
 
+    const modeConfig = resolveManualBrowserMode({
+      env: process.env,
+      defaultMode: 'persistent-playwright-manual',
+    });
     const profileDir = expandTilde(process.env[PROFILE_ENV] ?? DEFAULT_PROFILE);
     const artifactsDir = path.join(tmpdir(), 'sidetrack-manual-l5', isoStamp());
     await mkdir(artifactsDir, { recursive: true });
@@ -546,18 +574,33 @@ test.describe('manual L5 full-browser recorder', () => {
         syncRendezvousSecret: secret,
       });
 
+      const runtimeAOptions = modeConfig.stealthExperiment
+        ? {}
+        : {
+            userDataDir: profileDir,
+          };
       runtimeA = await launchExtensionRuntime({
-        userDataDir: profileDir,
+        ...runtimeAOptions,
         extraHostPermissions: RECORDER_HOST_PERMISSIONS,
+        browserMode: modeConfig.mode,
       });
       const reviewerProfile = await mkdtemp(path.join(tmpdir(), 'sidetrack-manual-l5-reviewer-'));
       runtimeB = await launchExtensionRuntime({
         userDataDir: reviewerProfile,
         extraHostPermissions: RECORDER_HOST_PERMISSIONS,
+        browserMode: modeConfig.mode,
       });
 
-      const recorder = new ManualRecorder(runtimeA.context, artifactsDir);
+      const recorder = new ManualRecorder(runtimeA.context, artifactsDir, {
+        eventHookInjection: modeConfig.stealthExperiment
+          ? 'page-main-world'
+          : 'context-init-script',
+      });
       await recorder.install();
+      installManualNetworkOutcomeRecorder(runtimeA.context, recorder, {
+        allowedHosts: modeConfig.allowedHosts,
+        recordLoadedDocuments: true,
+      });
 
       await openPrivacyGate(companionA, 'timeline');
       await openPrivacyGate(companionA, 'engagement');
@@ -590,7 +633,9 @@ test.describe('manual L5 full-browser recorder', () => {
         kind: 'manual-session-ready',
         payload: {
           artifactsDir,
-          profileDir,
+          profileDir: runtimeA.userDataDir,
+          browserMode: modeConfig.mode,
+          patchrightLoaded: runtimeA.metadata?.patchrightLoaded ?? false,
           securityWorkstreamId: wsSecurityId,
           switchboardWorkstreamId: wsSwitchboardId,
           companionA: {
@@ -619,7 +664,8 @@ test.describe('manual L5 full-browser recorder', () => {
  SIDETRACK L5 MANUAL RECORDER READY
 ================================================================
 
- Browser A profile: ${profileDir}
+ Browser mode     : ${modeConfig.mode}
+ Browser A profile: ${runtimeA.userDataDir}
  Browser A panel  : chrome-extension://${runtimeA.extensionId}/sidepanel.html
  Reviewer panel   : chrome-extension://${runtimeB.extensionId}/sidepanel.html
 
@@ -656,6 +702,14 @@ dumps, visible screenshots, and companion/plugin result JSON.
 
       await recorder.snapshotAll('manual-finished');
       await recorder.writeSummary();
+      const diagnostics = summarizeManualExperiment({
+        runtime: runtimeA,
+        events: await recorder.readEvents(),
+        capturedPageSnapshots: (await recorder.readSnapshotFiles()).length,
+      });
+      await writeJson(path.join(artifactsDir, 'manual-browser-diagnostics.json'), diagnostics);
+      // eslint-disable-next-line no-console
+      console.log(formatManualExperimentSummary(diagnostics));
       const drainA = await drainRuntime(runtimeA, panelA);
       const drainB = await drainRuntime(runtimeB, panelB);
       await writeJson(path.join(artifactsDir, 'drain-results.json'), { A: drainA, B: drainB });
@@ -669,7 +723,7 @@ dumps, visible screenshots, and companion/plugin result JSON.
         createdAt: new Date().toISOString(),
         mcpRequest: {
           codingSessionId: `manual-l5-${randomUUID().replaceAll('-', '').slice(0, 12)}`,
-          approval: 'manual-recorder',
+          approval: 'auto-approved',
           requestedAt: new Date().toISOString(),
         },
       })) as { readonly data?: { readonly bac_id?: unknown; readonly mcpRequest?: unknown } };

@@ -36,6 +36,7 @@ export interface ManualRecorderOptions {
   readonly captureHtmlSnapshots?: boolean;
   readonly recordTextValues?: boolean;
   readonly snapshotDelayMs?: number;
+  readonly eventHookInjection?: 'context-init-script' | 'page-main-world';
   readonly transformHtmlSnapshot?: (
     input: ManualHtmlSnapshotTransformInput,
   ) => Promise<ManualHtmlSnapshotTransformResult> | ManualHtmlSnapshotTransformResult;
@@ -72,6 +73,14 @@ interface SnapshotMeta {
 interface InitScriptOptions {
   readonly recordTextValues: boolean;
 }
+
+type MainWorldPage = Page & {
+  readonly evaluate: <Arg, Result>(
+    pageFunction: (arg: Arg) => Result | Promise<Result>,
+    arg: Arg,
+    isolatedContext: false,
+  ) => Promise<Result>;
+};
 
 const DEFAULT_OPTIONS: Required<
   Pick<
@@ -165,6 +174,188 @@ const parseSnapshotMeta = (payload: unknown): SnapshotMeta | null => {
 const isNumberRecord = (value: unknown): value is Record<string, number> =>
   isRecord(value) && Object.values(value).every((item) => typeof item === 'number');
 
+const installManualEventHooks = (options: InitScriptOptions): void => {
+  type ManualWindow = Window & {
+    sidetrackManualEvent?: (payload: Record<string, unknown>) => Promise<void>;
+    __sidetrackManualRecorderInstalled?: boolean;
+    __sidetrackManualEventQueue?: Record<string, unknown>[];
+  };
+  const win = window as ManualWindow;
+  if (win.__sidetrackManualRecorderInstalled === true) return;
+  win.__sidetrackManualRecorderInstalled = true;
+
+  const normalize = (value: string | null | undefined, max = 240): string | undefined => {
+    const text = value?.replace(/\s+/gu, ' ').trim();
+    if (text === undefined || text.length === 0) return undefined;
+    return text.length > max ? `${text.slice(0, max)}...` : text;
+  };
+  const cssPath = (element: Element): string => {
+    const parts: string[] = [];
+    let current: Element | null = element;
+    while (current !== null && parts.length < 5) {
+      const tag = current.tagName.toLowerCase();
+      const id = current.id.length > 0 ? `#${current.id}` : '';
+      const cls =
+        current.classList.length > 0
+          ? `.${Array.from(current.classList).slice(0, 3).join('.')}`
+          : '';
+      parts.unshift(`${tag}${id}${cls}`);
+      current = current.parentElement;
+    }
+    return parts.join(' > ');
+  };
+  const describeTarget = (target: EventTarget | null): Record<string, unknown> => {
+    if (!(target instanceof Element)) return {};
+    const input = target instanceof HTMLInputElement ? target : null;
+    const editable = target.closest('[contenteditable="true"]');
+    const anchor = target.closest('a[href]');
+    return {
+      tagName: target.tagName.toLowerCase(),
+      selector: cssPath(target),
+      role: target.getAttribute('role') ?? undefined,
+      ariaLabel: target.getAttribute('aria-label') ?? undefined,
+      href: anchor instanceof HTMLAnchorElement ? anchor.href : undefined,
+      text: options.recordTextValues ? normalize(target.textContent) : undefined,
+      inputType: input?.type,
+      inputName: input?.name,
+      inputPlaceholder: input?.placeholder,
+      editable: editable !== null,
+    };
+  };
+  const post = (payload: Record<string, unknown>): void => {
+    const event = {
+      ...payload,
+      href: window.location.href,
+      documentTitle: document.title,
+      visibilityState: document.visibilityState,
+      scrollX: window.scrollX,
+      scrollY: window.scrollY,
+    };
+    if (typeof win.sidetrackManualEvent === 'function') {
+      void win.sidetrackManualEvent(event).catch(() => undefined);
+      return;
+    }
+    win.__sidetrackManualEventQueue = win.__sidetrackManualEventQueue ?? [];
+    win.__sidetrackManualEventQueue.push(event);
+  };
+  window.addEventListener(
+    'click',
+    (event) => {
+      post({
+        kind: 'click',
+        button: event.button,
+        metaKey: event.metaKey,
+        ctrlKey: event.ctrlKey,
+        shiftKey: event.shiftKey,
+        altKey: event.altKey,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        target: describeTarget(event.target),
+      });
+    },
+    true,
+  );
+  window.addEventListener(
+    'auxclick',
+    (event) => {
+      post({
+        kind: 'auxclick',
+        button: event.button,
+        metaKey: event.metaKey,
+        ctrlKey: event.ctrlKey,
+        shiftKey: event.shiftKey,
+        altKey: event.altKey,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        target: describeTarget(event.target),
+      });
+    },
+    true,
+  );
+  window.addEventListener(
+    'copy',
+    () => {
+      const selection = window.getSelection()?.toString() ?? '';
+      post({
+        kind: 'copy',
+        selection: options.recordTextValues ? selection : undefined,
+        selectionLength: selection.length,
+      });
+    },
+    true,
+  );
+  window.addEventListener(
+    'paste',
+    (event) => {
+      const text = event.clipboardData?.getData('text/plain') ?? '';
+      post({
+        kind: 'paste',
+        text: options.recordTextValues ? text : undefined,
+        textLength: text.length,
+        target: describeTarget(event.target),
+      });
+    },
+    true,
+  );
+  window.addEventListener(
+    'input',
+    (event) => {
+      const target = event.target;
+      let value: string | undefined;
+      if (target instanceof HTMLTextAreaElement) value = target.value;
+      if (target instanceof HTMLInputElement && target.type !== 'password') value = target.value;
+      post({
+        kind: 'input',
+        valueLength: value?.length,
+        value: options.recordTextValues ? normalize(value, 400) : undefined,
+        target: describeTarget(target),
+      });
+    },
+    true,
+  );
+  window.addEventListener(
+    'focus',
+    () => {
+      post({ kind: 'window-focus' });
+    },
+    true,
+  );
+  window.addEventListener(
+    'blur',
+    () => {
+      post({ kind: 'window-blur' });
+    },
+    true,
+  );
+  document.addEventListener('visibilitychange', () => {
+    post({ kind: 'visibilitychange', state: document.visibilityState });
+  });
+  let scrollTimer: number | undefined;
+  window.addEventListener(
+    'scroll',
+    () => {
+      if (scrollTimer !== undefined) window.clearTimeout(scrollTimer);
+      scrollTimer = window.setTimeout(() => {
+        post({ kind: 'scroll' });
+      }, 350);
+    },
+    { passive: true, capture: true },
+  );
+  if (typeof chrome !== 'undefined' && chrome.storage?.onChanged !== undefined) {
+    chrome.storage.onChanged.addListener((changes) => {
+      const keys = Object.keys(changes).filter((key) => key.startsWith('sidetrack'));
+      if (keys.length === 0) return;
+      post({
+        kind: 'sidetrack-storage-changed',
+        keys,
+        activeWorkstreamId:
+          changes['sidetrack.activeWorkstreamId']?.newValue ??
+          changes['sidetrack.activeWorkstreamId']?.oldValue,
+      });
+    });
+  }
+};
+
 export class ManualRecorder {
   private readonly context: BrowserContext;
   private readonly artifactsDir: string;
@@ -184,6 +375,7 @@ export class ManualRecorder {
   > & {
     readonly transformHtmlSnapshot?: ManualRecorderOptions['transformHtmlSnapshot'];
   };
+  private readonly eventHookInjection: NonNullable<ManualRecorderOptions['eventHookInjection']>;
   private nextPageId = 1;
 
   constructor(context: BrowserContext, artifactsDir: string, options: ManualRecorderOptions = {}) {
@@ -201,210 +393,22 @@ export class ManualRecorder {
         ? {}
         : { transformHtmlSnapshot: options.transformHtmlSnapshot }),
     };
+    this.eventHookInjection = options.eventHookInjection ?? 'context-init-script';
   }
 
   async install(): Promise<void> {
     await mkdir(this.pagesDir, { recursive: true });
-    await this.context.exposeBinding(
-      'sidetrackManualEvent',
-      async (source: BindingSourceLike, payload: unknown) => {
-        const normalized = isRecord(payload) ? payload : { value: payload };
-        await this.record({
-          kind: typeof normalized.kind === 'string' ? normalized.kind : 'browser-event',
-          pageId: this.pageId(source.page),
-          frameUrl: source.frame.url(),
-          pageUrl: source.page.url(),
-          title: await source.page.title().catch(() => undefined),
-          payload: normalized,
-        });
-        const eventKind = typeof normalized.kind === 'string' ? normalized.kind : '';
-        if (
-          eventKind === 'click' ||
-          eventKind === 'auxclick' ||
-          eventKind === 'paste' ||
-          eventKind === 'copy' ||
-          eventKind === 'input'
-        ) {
-          this.scheduleSnapshot(source.page, eventKind);
-        }
-      },
-    );
-    await this.context.addInitScript(
-      (options: InitScriptOptions) => {
-        type ManualWindow = Window & {
-          sidetrackManualEvent?: (payload: Record<string, unknown>) => Promise<void>;
-        };
-        const win = window as ManualWindow;
-        const normalize = (value: string | null | undefined, max = 240): string | undefined => {
-          const text = value?.replace(/\s+/gu, ' ').trim();
-          if (text === undefined || text.length === 0) return undefined;
-          return text.length > max ? `${text.slice(0, max)}...` : text;
-        };
-        const cssPath = (element: Element): string => {
-          const parts: string[] = [];
-          let current: Element | null = element;
-          while (current !== null && parts.length < 5) {
-            const tag = current.tagName.toLowerCase();
-            const id = current.id.length > 0 ? `#${current.id}` : '';
-            const cls =
-              current.classList.length > 0
-                ? `.${Array.from(current.classList).slice(0, 3).join('.')}`
-                : '';
-            parts.unshift(`${tag}${id}${cls}`);
-            current = current.parentElement;
-          }
-          return parts.join(' > ');
-        };
-        const describeTarget = (target: EventTarget | null): Record<string, unknown> => {
-          if (!(target instanceof Element)) return {};
-          const input = target instanceof HTMLInputElement ? target : null;
-          const editable = target.closest('[contenteditable="true"]');
-          const anchor = target.closest('a[href]');
-          return {
-            tagName: target.tagName.toLowerCase(),
-            selector: cssPath(target),
-            role: target.getAttribute('role') ?? undefined,
-            ariaLabel: target.getAttribute('aria-label') ?? undefined,
-            href: anchor instanceof HTMLAnchorElement ? anchor.href : undefined,
-            text: options.recordTextValues ? normalize(target.textContent) : undefined,
-            inputType: input?.type,
-            inputName: input?.name,
-            inputPlaceholder: input?.placeholder,
-            editable: editable !== null,
-          };
-        };
-        const post = (payload: Record<string, unknown>): void => {
-          void win
-            .sidetrackManualEvent?.({
-              ...payload,
-              href: window.location.href,
-              documentTitle: document.title,
-              visibilityState: document.visibilityState,
-              scrollX: window.scrollX,
-              scrollY: window.scrollY,
-            })
-            .catch(() => undefined);
-        };
-        window.addEventListener(
-          'click',
-          (event) => {
-            post({
-              kind: 'click',
-              button: event.button,
-              metaKey: event.metaKey,
-              ctrlKey: event.ctrlKey,
-              shiftKey: event.shiftKey,
-              altKey: event.altKey,
-              clientX: event.clientX,
-              clientY: event.clientY,
-              target: describeTarget(event.target),
-            });
-          },
-          true,
-        );
-        window.addEventListener(
-          'auxclick',
-          (event) => {
-            post({
-              kind: 'auxclick',
-              button: event.button,
-              metaKey: event.metaKey,
-              ctrlKey: event.ctrlKey,
-              shiftKey: event.shiftKey,
-              altKey: event.altKey,
-              clientX: event.clientX,
-              clientY: event.clientY,
-              target: describeTarget(event.target),
-            });
-          },
-          true,
-        );
-        window.addEventListener(
-          'copy',
-          () => {
-            const selection = window.getSelection()?.toString() ?? '';
-            post({
-              kind: 'copy',
-              selection: options.recordTextValues ? selection : undefined,
-              selectionLength: selection.length,
-            });
-          },
-          true,
-        );
-        window.addEventListener(
-          'paste',
-          (event) => {
-            const text = event.clipboardData?.getData('text/plain') ?? '';
-            post({
-              kind: 'paste',
-              text: options.recordTextValues ? text : undefined,
-              textLength: text.length,
-              target: describeTarget(event.target),
-            });
-          },
-          true,
-        );
-        window.addEventListener(
-          'input',
-          (event) => {
-            const target = event.target;
-            let value: string | undefined;
-            if (target instanceof HTMLTextAreaElement) value = target.value;
-            if (target instanceof HTMLInputElement && target.type !== 'password')
-              value = target.value;
-            post({
-              kind: 'input',
-              valueLength: value?.length,
-              value: options.recordTextValues ? normalize(value, 400) : undefined,
-              target: describeTarget(target),
-            });
-          },
-          true,
-        );
-        window.addEventListener(
-          'focus',
-          () => {
-            post({ kind: 'window-focus' });
-          },
-          true,
-        );
-        window.addEventListener(
-          'blur',
-          () => {
-            post({ kind: 'window-blur' });
-          },
-          true,
-        );
-        document.addEventListener('visibilitychange', () => {
-          post({ kind: 'visibilitychange', state: document.visibilityState });
-        });
-        let scrollTimer: number | undefined;
-        window.addEventListener(
-          'scroll',
-          () => {
-            if (scrollTimer !== undefined) window.clearTimeout(scrollTimer);
-            scrollTimer = window.setTimeout(() => {
-              post({ kind: 'scroll' });
-            }, 350);
-          },
-          { passive: true, capture: true },
-        );
-        if (typeof chrome !== 'undefined' && chrome.storage?.onChanged !== undefined) {
-          chrome.storage.onChanged.addListener((changes) => {
-            const keys = Object.keys(changes).filter((key) => key.startsWith('sidetrack'));
-            if (keys.length === 0) return;
-            post({
-              kind: 'sidetrack-storage-changed',
-              keys,
-              activeWorkstreamId:
-                changes['sidetrack.activeWorkstreamId']?.newValue ??
-                changes['sidetrack.activeWorkstreamId']?.oldValue,
-            });
-          });
-        }
-      },
-      { recordTextValues: this.options.recordTextValues },
-    );
+    if (this.eventHookInjection === 'context-init-script') {
+      await this.context.exposeBinding(
+        'sidetrackManualEvent',
+        async (source: BindingSourceLike, payload: unknown) => {
+          await this.recordBrowserEvent(source.page, source.frame.url(), payload);
+        },
+      );
+      await this.context.addInitScript(installManualEventHooks, {
+        recordTextValues: this.options.recordTextValues,
+      });
+    }
     this.context.on('page', (page) => {
       this.attachPage(page);
     });
@@ -448,9 +452,91 @@ export class ManualRecorder {
     return id;
   }
 
+  private async recordBrowserEvent(
+    page: Page,
+    frameUrl: string | undefined,
+    payload: unknown,
+  ): Promise<void> {
+    const normalized = isRecord(payload) ? payload : { value: payload };
+    await this.record({
+      kind: typeof normalized.kind === 'string' ? normalized.kind : 'browser-event',
+      pageId: this.pageId(page),
+      frameUrl,
+      pageUrl: page.url(),
+      title: await page.title().catch(() => undefined),
+      payload: normalized,
+    });
+    const eventKind = typeof normalized.kind === 'string' ? normalized.kind : '';
+    if (
+      eventKind === 'click' ||
+      eventKind === 'auxclick' ||
+      eventKind === 'paste' ||
+      eventKind === 'copy' ||
+      eventKind === 'input'
+    ) {
+      this.scheduleSnapshot(page, eventKind);
+    }
+  }
+
+  private drainQueuedPageEvents(page: Page): void {
+    if (this.eventHookInjection !== 'page-main-world') return;
+    void (async () => {
+      if (page.isClosed() || page.url() === 'about:blank') return;
+      const events = await (page as MainWorldPage).evaluate(
+        () => {
+          type ManualWindow = Window & {
+            __sidetrackManualEventQueue?: Record<string, unknown>[];
+          };
+          const win = window as ManualWindow;
+          const queued = win.__sidetrackManualEventQueue ?? [];
+          win.__sidetrackManualEventQueue = [];
+          return queued;
+        },
+        null,
+        false,
+      );
+      for (const event of events) {
+        await this.recordBrowserEvent(page, page.mainFrame().url(), event);
+      }
+    })().catch(() => undefined);
+  }
+
+  private startPageEventPolling(page: Page): void {
+    if (this.eventHookInjection !== 'page-main-world') return;
+    const timer = setInterval(() => {
+      this.drainQueuedPageEvents(page);
+    }, 500);
+    page.on('close', () => {
+      clearInterval(timer);
+      this.drainQueuedPageEvents(page);
+    });
+  }
+
+  private installPageEventHooks(page: Page): void {
+    if (this.eventHookInjection !== 'page-main-world') return;
+    void (async () => {
+      await page.waitForLoadState('domcontentloaded', { timeout: 5_000 }).catch(() => undefined);
+      if (page.isClosed() || page.url() === 'about:blank') return;
+      await (page as MainWorldPage).evaluate(
+        installManualEventHooks,
+        { recordTextValues: this.options.recordTextValues },
+        false,
+      );
+    })().catch((error: unknown) => {
+      void this.record({
+        kind: 'event-hook-install-failed',
+        pageId: this.pageId(page),
+        pageUrl: page.url(),
+        payload: { error: error instanceof Error ? error.message : String(error) },
+      });
+    });
+  }
+
   private attachPage(page: Page): void {
     const pageId = this.pageId(page);
     void this.record({ kind: 'page-opened', pageId, pageUrl: page.url() });
+    this.startPageEventPolling(page);
+    this.installPageEventHooks(page);
     page.on('framenavigated', (frame) => {
       if (frame !== page.mainFrame()) return;
       void this.record({
@@ -463,6 +549,7 @@ export class ManualRecorder {
       this.scheduleSnapshot(page, 'navigation');
     });
     page.on('domcontentloaded', () => {
+      this.installPageEventHooks(page);
       void this.record({
         kind: 'domcontentloaded',
         pageId,

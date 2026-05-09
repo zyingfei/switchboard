@@ -3,5 +3,6 @@ node_modules/
 .wxt/
 .cache/
 coverage/
+.sidetrack-browser-profiles/
 # Chrome for Testing binary (downloaded by `npm run e2e:install-cft`)
 .chrome-for-testing/

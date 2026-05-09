@@ -4,6 +4,21 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium, type BrowserContext, type Page, type Worker } from '@playwright/test';
 
+import {
+  resolveManualBrowserMode,
+  STEALTH_EXPERIMENT_WARNING,
+  type ManualBrowserMode,
+} from './manualBrowserMode';
+import { launchStealthPersistentContext } from './stealth-runtime';
+
+export interface ExtensionRuntimeMetadata {
+  readonly browserMode: ManualBrowserMode;
+  readonly browserChannel: string;
+  readonly cdpAttached: boolean;
+  readonly patchrightLoaded: boolean;
+  readonly headed: boolean;
+}
+
 export interface ExtensionRuntime {
   readonly context: BrowserContext;
   readonly extensionId: string;
@@ -16,9 +31,11 @@ export interface ExtensionRuntime {
   readonly sendRuntimeMessage: (senderPage: Page, message: unknown) => Promise<unknown>;
   readonly seedStorage: (senderPage: Page, values: Record<string, unknown>) => Promise<void>;
   readonly close: () => Promise<void>;
+  readonly metadata?: ExtensionRuntimeMetadata;
 }
 
 const packageRoot = path.resolve(fileURLToPath(new URL('../../../', import.meta.url)));
+let stealthExperimentWarningPrinted = false;
 
 const readExtensionPath = (): string =>
   process.env.SIDETRACK_EXTENSION_PATH ?? path.join(packageRoot, '.output/chrome-mv3');
@@ -32,11 +49,52 @@ const extensionIdFromWorker = (worker: Worker): string => {
   return extensionId;
 };
 
+const isSidetrackExtensionWorker = (worker: Worker): boolean =>
+  worker.url().startsWith('chrome-extension://') && worker.url().endsWith('/background.js');
+
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+type PatchrightMainWorldPage = Page & {
+  readonly evaluate: <Arg, Result>(
+    pageFunction: (arg: Arg) => Result | Promise<Result>,
+    arg: Arg,
+    isolatedContext: false,
+  ) => Promise<Result>;
+};
+
+const evaluateInMainWorld = async <Arg, Result>(
+  page: Page,
+  pageFunction: (arg: Arg) => Result | Promise<Result>,
+  arg: Arg,
+): Promise<Result> => await (page as PatchrightMainWorldPage).evaluate(pageFunction, arg, false);
+
+const expandTilde = (input: string): string =>
+  input.startsWith('~')
+    ? path.join(process.env.HOME ?? '', input.slice(1).replace(/^[/\\]/u, ''))
+    : input;
+
+const resolveProfileDir = (input: string): string =>
+  path.isAbsolute(input) ? input : path.resolve(packageRoot, input);
+
+const assertSidetrackOwnedTestProfile = (profilePath: string): void => {
+  const normalized = path.resolve(profilePath).toLowerCase();
+  if (
+    normalized.includes('/library/application support/google/chrome') ||
+    normalized.endsWith('/google/chrome/default') ||
+    normalized.endsWith('/google/chrome/profile 1')
+  ) {
+    throw new Error(
+      `Refusing to use personal Chrome profile for stealth experiment: ${profilePath}`,
+    );
+  }
+  if (!normalized.includes('sidetrack')) {
+    throw new Error(`Stealth experiment profile must be clearly Sidetrack-owned: ${profilePath}`);
+  }
+};
 
 const waitForExtensionWorker = async (context: BrowserContext): Promise<Worker> => {
   const findWorker = (): Worker | undefined =>
-    context.serviceWorkers().find((worker) => worker.url().startsWith('chrome-extension://'));
+    context.serviceWorkers().find((worker) => isSidetrackExtensionWorker(worker));
 
   const existing = findWorker();
   if (existing !== undefined) {
@@ -54,7 +112,7 @@ const waitForExtensionWorker = async (context: BrowserContext): Promise<Worker> 
   // appear in context.serviceWorkers().
   const eventWait = context.waitForEvent('serviceworker', {
     timeout: 0,
-    predicate: (worker) => worker.url().startsWith('chrome-extension://'),
+    predicate: isSidetrackExtensionWorker,
   });
   const pollWait = (async (): Promise<Worker> => {
     for (let attempt = 0; attempt < 90; attempt += 1) {
@@ -162,6 +220,13 @@ const attachOverCdp = async (cdpUrl: string): Promise<ExtensionRuntime> => {
     // signals "not under our control" so SW-restart tests skip
     // this path.
     userDataDir: '',
+    metadata: {
+      browserMode: 'normal-chrome-manual',
+      browserChannel: 'cdp',
+      cdpAttached: true,
+      patchrightLoaded: false,
+      headed: true,
+    },
     async sendRuntimeMessage(senderPage: Page, message: unknown) {
       return await senderPage.evaluate(async (runtimeMessage) => {
         const response = (await chrome.runtime.sendMessage(runtimeMessage)) as unknown;
@@ -200,6 +265,7 @@ export interface LaunchOptions {
   // the built extension into a temp dir and amends manifest.json before
   // Chrome loads it.
   readonly extraHostPermissions?: readonly string[];
+  readonly browserMode?: ManualBrowserMode;
 }
 
 const extensionPathWithExtraHostPermissions = async (
@@ -214,10 +280,10 @@ const extensionPathWithExtraHostPermissions = async (
   await cp(baseExtensionPath, extensionPath, { recursive: true });
   const manifestPath = path.join(extensionPath, 'manifest.json');
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>;
-  const existing = Array.isArray(manifest['host_permissions'])
-    ? manifest['host_permissions'].filter((value): value is string => typeof value === 'string')
+  const existing = Array.isArray(manifest.host_permissions)
+    ? manifest.host_permissions.filter((value): value is string => typeof value === 'string')
     : [];
-  manifest['host_permissions'] = [...new Set([...existing, ...extraHostPermissions])];
+  manifest.host_permissions = [...new Set([...existing, ...extraHostPermissions])];
   await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
   return { extensionPath, cleanupPath: tempRoot };
 };
@@ -225,9 +291,28 @@ const extensionPathWithExtraHostPermissions = async (
 export const launchExtensionRuntime = async (
   options: LaunchOptions = {},
 ): Promise<ExtensionRuntime> => {
+  const modeConfig = resolveManualBrowserMode({
+    requestedMode: options.browserMode,
+    env: process.env,
+    defaultMode:
+      process.env.SIDETRACK_E2E_CDP_URL !== undefined &&
+      process.env.SIDETRACK_E2E_CDP_URL.length > 0
+        ? 'normal-chrome-manual'
+        : 'persistent-playwright-manual',
+  });
   const cdpUrl = process.env.SIDETRACK_E2E_CDP_URL;
-  if (cdpUrl !== undefined && cdpUrl.length > 0 && options.forceLocalProfile !== true) {
+  if (
+    cdpUrl !== undefined &&
+    cdpUrl.length > 0 &&
+    options.forceLocalProfile !== true &&
+    !modeConfig.stealthExperiment
+  ) {
     return await attachOverCdp(cdpUrl);
+  }
+  if (cdpUrl !== undefined && cdpUrl.length > 0 && modeConfig.stealthExperiment) {
+    console.warn(
+      '[runtime] SIDETRACK_E2E_CDP_URL ignored for stealth experiment; using a Sidetrack-owned test profile.',
+    );
   }
   const extensionForLaunch = await extensionPathWithExtraHostPermissions(
     readExtensionPath(),
@@ -236,16 +321,25 @@ export const launchExtensionRuntime = async (
   const extensionPath = extensionForLaunch.extensionPath;
   // SIDETRACK_USER_DATA_DIR lets the dev pin a long-lived profile (e.g.
   // ~/.sidetrack-test-profile) so logins to chatgpt.com / claude.ai /
-  // gemini.google.com survive across runs. When unset, every run gets a
-  // fresh tmpdir profile that's wiped on close.
-  const persistentDir = process.env.SIDETRACK_USER_DATA_DIR;
+  // gemini.google.com survive across runs. Stealth experiments default
+  // to a Sidetrack-owned persistent profile so manual logins survive.
+  // Non-stealth local runs keep the historical throwaway tmpdir default.
+  const persistentDir = modeConfig.stealthExperiment
+    ? (process.env.SIDETRACK_STEALTH_USER_DATA_DIR ??
+      path.join(packageRoot, '.sidetrack-browser-profiles/stealth-experiment'))
+    : process.env.SIDETRACK_USER_DATA_DIR;
   const callerDir = options.userDataDir;
   const userDataDir =
     callerDir !== undefined && callerDir.length > 0
-      ? (await mkdir(callerDir, { recursive: true }), callerDir)
+      ? (await mkdir(resolveProfileDir(expandTilde(callerDir)), { recursive: true }),
+        resolveProfileDir(expandTilde(callerDir)))
       : persistentDir !== undefined && persistentDir.length > 0
-        ? (await mkdir(persistentDir, { recursive: true }), persistentDir)
+        ? (await mkdir(resolveProfileDir(expandTilde(persistentDir)), { recursive: true }),
+          resolveProfileDir(expandTilde(persistentDir)))
         : await mkdtemp(path.join(tmpdir(), 'sidetrack-extension-e2e-profile-'));
+  if (modeConfig.stealthExperiment) {
+    assertSidetrackOwnedTestProfile(userDataDir);
+  }
   // Caller-supplied dirs are managed by the caller (so they can do
   // close → re-launch). Env-supplied long-lived profiles persist
   // across runs. Only the auto-mkdtemp path cleans up on close.
@@ -253,43 +347,56 @@ export const launchExtensionRuntime = async (
     (callerDir === undefined || callerDir.length === 0) &&
     (persistentDir === undefined || persistentDir.length === 0);
   const headless = process.env.SIDETRACK_E2E_HEADLESS !== '0';
-  // Use Chrome stable when a persistent profile is requested (the
-  // login-test-profile script uses Chrome to bypass Google's OAuth
-  // automation block, and the same profile must be opened with the
-  // same browser to read its cookies). Default to Playwright's
-  // Chromium for the throwaway-profile path.
-  const channel = process.env.SIDETRACK_E2E_BROWSER ?? (cleanupOnClose ? 'chromium' : 'chrome');
+  // Use Chrome stable when a non-stealth persistent profile is requested
+  // (the login-test-profile script uses Chrome to keep provider logins).
+  // Patchright's Chrome channel can expose Chrome's own extension worker
+  // without loading our unpacked MV3 extension, so the stealth experiment
+  // defaults to Patchright Chromium.
+  const channel =
+    process.env.SIDETRACK_E2E_BROWSER ??
+    (modeConfig.stealthExperiment ? 'chromium' : cleanupOnClose ? 'chromium' : 'chrome');
+  if (modeConfig.stealthExperiment && headless) {
+    throw new Error('Stealth experiment mode is headed/manual only; set SIDETRACK_E2E_HEADLESS=0.');
+  }
 
-  const context = await chromium
-    .launchPersistentContext(userDataDir, {
-      channel,
-      headless,
-      ignoreDefaultArgs: ['--disable-extensions', '--enable-automation'],
-      viewport: {
-        width: 1280,
-        height: 900,
-      },
-      args: [
-        ...(headless ? ['--headless=new'] : []),
-        '--no-first-run',
-        '--no-default-browser-check',
-        '--disable-blink-features=AutomationControlled',
-        `--disable-extensions-except=${extensionPath}`,
-        `--load-extension=${extensionPath}`,
-      ],
-    })
-    .catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      if (message.includes('ProcessSingleton')) {
-        throw new Error(
-          `Could not lock the user-data dir at ${userDataDir}. ` +
-            `Another Chrome process (likely the one started by ` +
-            `\`npm run e2e:login\`) still holds it. Close that window ` +
-            `(Cmd-Q on the login window) and re-run.`,
-        );
-      }
-      throw error;
-    });
+  const launchOptions = {
+    channel,
+    headless,
+    ignoreDefaultArgs: ['--disable-extensions', '--enable-automation'],
+    viewport: modeConfig.stealthExperiment ? null : { width: 1280, height: 900 },
+    args: [
+      ...(headless ? ['--headless=new'] : []),
+      '--no-first-run',
+      '--no-default-browser-check',
+      ...(modeConfig.stealthExperiment ? [] : ['--disable-blink-features=AutomationControlled']),
+      `--disable-extensions-except=${extensionPath}`,
+      `--load-extension=${extensionPath}`,
+    ],
+  };
+  if (modeConfig.stealthExperiment && !stealthExperimentWarningPrinted) {
+    stealthExperimentWarningPrinted = true;
+    console.warn(STEALTH_EXPERIMENT_WARNING);
+  }
+
+  const launched = await (
+    modeConfig.stealthExperiment
+      ? launchStealthPersistentContext({ userDataDir, options: launchOptions })
+      : chromium
+          .launchPersistentContext(userDataDir, launchOptions)
+          .then((context) => ({ context, patchrightLoaded: false }))
+  ).catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes('ProcessSingleton')) {
+      throw new Error(
+        `Could not lock the user-data dir at ${userDataDir}. ` +
+          `Another Chrome process (likely the one started by ` +
+          `\`npm run e2e:login\`) still holds it. Close that window ` +
+          `(Cmd-Q on the login window) and re-run.`,
+      );
+    }
+    throw error;
+  });
+  const { context } = launched;
   const worker = await waitForExtensionWorker(context);
   const extensionId = extensionIdFromWorker(worker);
 
@@ -298,13 +405,40 @@ export const launchExtensionRuntime = async (
     extensionId,
     extensionPath,
     userDataDir,
+    metadata: {
+      browserMode: modeConfig.mode,
+      browserChannel: channel,
+      cdpAttached: false,
+      patchrightLoaded: launched.patchrightLoaded,
+      headed: !headless,
+    },
     async sendRuntimeMessage(senderPage: Page, message: unknown) {
+      if (modeConfig.stealthExperiment) {
+        return await evaluateInMainWorld(
+          senderPage,
+          async (runtimeMessage) => {
+            const response = (await chrome.runtime.sendMessage(runtimeMessage)) as unknown;
+            return response;
+          },
+          message,
+        );
+      }
       return await senderPage.evaluate(async (runtimeMessage) => {
         const response = (await chrome.runtime.sendMessage(runtimeMessage)) as unknown;
         return response;
       }, message);
     },
     async seedStorage(senderPage: Page, values: Record<string, unknown>) {
+      if (modeConfig.stealthExperiment) {
+        await evaluateInMainWorld(
+          senderPage,
+          async (vals) => {
+            await chrome.storage.local.set(vals);
+          },
+          values,
+        );
+        return;
+      }
       await senderPage.evaluate(async (vals) => {
         await chrome.storage.local.set(vals);
       }, values);

@@ -11,6 +11,7 @@ import type { BrowserContext, Page } from '@playwright/test';
 import { redact } from '../../../../sidetrack-companion/src/safety/redaction';
 import { sanitizeTimelineUrl } from '../../../src/timeline/sanitize';
 import type { TestCompanion } from './companion';
+import { assertRoutedFixtureDisallowsStealth } from './manualBrowserMode';
 import type { ManualEvent, ManualSnapshotFile } from './manualRecorder';
 import type { ExtensionRuntime } from './runtime';
 
@@ -864,6 +865,7 @@ const installRouteStubs = async (
   context: BrowserContext,
   routeStubs: readonly RouteStub[],
 ): Promise<RouteStubTracker> => {
+  assertRoutedFixtureDisallowsStealth();
   const stubs = new Map<
     string,
     { readonly canonicalUrl: string; readonly title: string; readonly body?: string }
@@ -879,8 +881,23 @@ const installRouteStubs = async (
   const fulfilledBodies = new Map<string, string>();
   await context.route(/^https?:\/\//u, async (route) => {
     const requestUrl = sanitizeTimelineUrl(route.request().url());
+    const request = route.request();
+    const url = new URL(request.url());
+    if (
+      url.hostname === 'challenges.cloudflare.com' ||
+      url.pathname.includes('/cdn-cgi/challenge-platform/')
+    ) {
+      await route.abort('blockedbyclient');
+      throw new Error(`Routed fixture replay hit a Cloudflare challenge URL: ${request.url()}`);
+    }
     const stub = stubs.get(routeKeyFor(requestUrl));
     if (stub === undefined) {
+      if (request.resourceType() === 'document') {
+        await route.abort('blockedbyclient');
+        throw new Error(
+          `Routed fixture replay leaked a live third-party document request: ${request.url()}`,
+        );
+      }
       await route.fallback();
       return;
     }
