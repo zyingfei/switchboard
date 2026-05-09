@@ -4,25 +4,11 @@ import { join } from 'node:path';
 
 import { buildAnchorFromTerm } from '../annotation/anchorBuilder.js';
 import { isBridgeKeyAccepted, rotateBridgeKey } from '../auth/bridgeKey.js';
-import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from '../timeline/events.js';
+import {
+  BROWSER_TIMELINE_OBSERVED,
+  isBrowserTimelineObservedPayload,
+} from '../timeline/events.js';
 import { sanitizeTimelinePayload } from '../timeline/sanitize.js';
-import {
-  ENGAGEMENT_INTERVAL_OBSERVED,
-  ENGAGEMENT_SESSION_AGGREGATED,
-  isEngagementIntervalObservedPayload,
-  isEngagementSessionAggregatedPayload,
-} from '../engagement/events.js';
-import { NAVIGATION_COMMITTED, isNavigationCommittedPayload } from '../navigation/events.js';
-import {
-  SELECTION_COPIED,
-  SELECTION_PASTED,
-  isSelectionCopiedPayload,
-  isSelectionPastedPayload,
-} from '../snippets/events.js';
-import {
-  VISUAL_FINGERPRINT_OBSERVED,
-  isVisualFingerprintObservedPayload,
-} from '../visual/events.js';
 import {
   defaultAllowedTools,
   isAllowed,
@@ -83,7 +69,12 @@ import {
   tombstoneByThread as tombstoneByThreadRaw,
 } from '../recall/indexFile.js';
 import type { RecallLifecycle } from '../recall/lifecycle.js';
-import { buildLexicalIndex, rank, rankHybrid, type HybridLexicalIndex } from '../recall/ranker.js';
+import {
+  buildLexicalIndex,
+  rank,
+  rankHybrid,
+  type HybridLexicalIndex,
+} from '../recall/ranker.js';
 import { rebuildFromEventLog } from '../recall/rebuild.js';
 import type { BucketRegistry } from '../routing/registry.js';
 import { redact } from '../safety/redaction.js';
@@ -201,7 +192,8 @@ const syncSummaryDeps = (
 const baseVectorForAggregate = async (
   eventLog: EventLog,
   aggregateId: string,
-): Promise<VersionVector> => vectorFromEvents(await eventLog.readByAggregate(aggregateId));
+): Promise<VersionVector> =>
+  vectorFromEvents(await eventLog.readByAggregate(aggregateId));
 
 import { isReviewDraftEvent, projectReviewDraft } from '../review/projection.js';
 import {
@@ -691,37 +683,6 @@ const readWorkstreams = async (vaultRoot: string): Promise<readonly BuildSignals
   return workstreams;
 };
 
-const isJsonObject = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
-
-const readWorkstreamProjections = async (vaultRoot: string): Promise<readonly unknown[]> => {
-  const root = join(vaultRoot, '_BAC', 'workstreams', 'projections');
-  const names = await readdir(root).catch(() => []);
-  const projections: unknown[] = [];
-  for (const name of names.filter((candidate) => candidate.endsWith('.json'))) {
-    try {
-      const parsed = JSON.parse(await readFile(join(root, name), 'utf8')) as unknown;
-      if (
-        isJsonObject(parsed) &&
-        typeof parsed['bac_id'] === 'string' &&
-        isJsonObject(parsed['record']) &&
-        typeof parsed['deleted'] === 'boolean'
-      ) {
-        projections.push(parsed);
-      }
-    } catch {
-      // Ignore malformed projection records; peer catch-up is best-effort.
-    }
-  }
-  return projections.sort((left, right) => {
-    const leftMs =
-      isJsonObject(left) && typeof left['updatedAtMs'] === 'number' ? left['updatedAtMs'] : 0;
-    const rightMs =
-      isJsonObject(right) && typeof right['updatedAtMs'] === 'number' ? right['updatedAtMs'] : 0;
-    return rightMs - leftMs;
-  });
-};
-
 const readVaultMarkdown = async (
   vaultRoot: string,
   kind: 'threads' | 'workstreams',
@@ -988,7 +949,10 @@ const objectRecord = (value: unknown): Record<string, unknown> | undefined =>
     ? (value as Record<string, unknown>)
     : undefined;
 
-const optionalFiniteNumber = (value: unknown, fieldName: string): number | undefined => {
+const optionalFiniteNumber = (
+  value: unknown,
+  fieldName: string,
+): number | undefined => {
   if (value === undefined) return undefined;
   if (typeof value !== 'number' || !Number.isFinite(value)) {
     throw new HttpRouteError(
@@ -1003,9 +967,7 @@ const optionalFiniteNumber = (value: unknown, fieldName: string): number | undef
 
 const PRIVACY_AGGREGATE_ID = 'privacy';
 
-const isPrivacyEventType = (
-  value: unknown,
-): value is
+const isPrivacyEventType = (value: unknown): value is
   | typeof PRIVACY_GATE_FLIPPED
   | typeof PRIVACY_PERMISSION_GRANTED
   | typeof PRIVACY_PERMISSION_REVOKED =>
@@ -1052,35 +1014,6 @@ const isFeedbackPayloadForType = (
   if (type === USER_FLOW_REJECTED) return isUserFlowRejectedPayload(payload);
   if (type === USER_TOPIC_RENAMED) return isUserTopicRenamedPayload(payload);
   if (type === USER_SNIPPET_PROMOTED) return isUserSnippetPromotedPayload(payload);
-  return false;
-};
-
-const isEdgeEventType = (
-  value: unknown,
-): value is
-  | typeof NAVIGATION_COMMITTED
-  | typeof ENGAGEMENT_INTERVAL_OBSERVED
-  | typeof ENGAGEMENT_SESSION_AGGREGATED
-  | typeof SELECTION_COPIED
-  | typeof SELECTION_PASTED
-  | typeof VISUAL_FINGERPRINT_OBSERVED =>
-  value === NAVIGATION_COMMITTED ||
-  value === ENGAGEMENT_INTERVAL_OBSERVED ||
-  value === ENGAGEMENT_SESSION_AGGREGATED ||
-  value === SELECTION_COPIED ||
-  value === SELECTION_PASTED ||
-  value === VISUAL_FINGERPRINT_OBSERVED;
-
-const isEdgePayloadForType = (
-  type: string,
-  payload: unknown,
-): payload is Record<string, unknown> => {
-  if (type === NAVIGATION_COMMITTED) return isNavigationCommittedPayload(payload);
-  if (type === ENGAGEMENT_INTERVAL_OBSERVED) return isEngagementIntervalObservedPayload(payload);
-  if (type === ENGAGEMENT_SESSION_AGGREGATED) return isEngagementSessionAggregatedPayload(payload);
-  if (type === SELECTION_COPIED) return isSelectionCopiedPayload(payload);
-  if (type === SELECTION_PASTED) return isSelectionPastedPayload(payload);
-  if (type === VISUAL_FINGERPRINT_OBSERVED) return isVisualFingerprintObservedPayload(payload);
   return false;
 };
 
@@ -1293,10 +1226,7 @@ const routes: readonly RouteDefinition[] = [
           'Event log is not configured on this companion.',
         );
       }
-      return [
-        200,
-        { data: projectPrivacy(privacyEventsFrom(await context.eventLog.readMerged())) },
-      ];
+      return [200, { data: projectPrivacy(privacyEventsFrom(await context.eventLog.readMerged())) }];
     },
   },
   {
@@ -1635,7 +1565,9 @@ const routes: readonly RouteDefinition[] = [
             e.manifest.capabilities['reads-env'] !== undefined &&
             e.manifest.capabilities['reads-env'].length > 0
           ) {
-            capabilityGates['reads-env'] = resolveGate ? resolveGate(id, 'reads-env') : 'pending';
+            capabilityGates['reads-env'] = resolveGate
+              ? resolveGate(id, 'reads-env')
+              : 'pending';
           }
           if (e.manifest.capabilities['reads-network'] === true) {
             capabilityGates['reads-network'] = resolveGate
@@ -1648,7 +1580,9 @@ const routes: readonly RouteDefinition[] = [
             version: e.manifest.version,
             manifest_schema: e.manifest.manifest_schema,
             status: e.status,
-            ...(e.rejectedReason === undefined ? {} : { rejected_reason: e.rejectedReason }),
+            ...(e.rejectedReason === undefined
+              ? {}
+              : { rejected_reason: e.rejectedReason }),
             emits: e.manifest.emits,
             capabilities: {
               reads_paths: e.manifest.capabilities['reads-paths'] ?? [],
@@ -1799,9 +1733,11 @@ const routes: readonly RouteDefinition[] = [
                           codingSessionId: dispatchEvent.mcpRequest.codingSessionId,
                         },
                       }),
-                  ...(dispatchEvent.title === undefined ? {} : { title: dispatchEvent.title }),
+                  ...(dispatchEvent.title === undefined
+                    ? {}
+                    : { title: dispatchEvent.title }),
                 },
-              })
+                  })
               .catch(() => undefined);
           }
           return [
@@ -2506,7 +2442,7 @@ const routes: readonly RouteDefinition[] = [
                   note: input.note,
                   pageTitle,
                 },
-              })
+                  })
               .catch(() => undefined);
           }
           // totalForThread/totalForUrl: total non-deleted
@@ -2542,7 +2478,7 @@ const routes: readonly RouteDefinition[] = [
                 note: input.note,
                 pageTitle: input.pageTitle,
               },
-            })
+              })
             .catch(() => undefined);
         }
         return [201, { data: result }];
@@ -2823,11 +2759,7 @@ const routes: readonly RouteDefinition[] = [
         cached.entryCount === index.items.length
           ? cached.index
           : buildLexicalIndex(index.items);
-      if (
-        cached === undefined ||
-        cached.mtimeMs !== indexMtime ||
-        cached.entryCount !== index.items.length
-      ) {
+      if (cached === undefined || cached.mtimeMs !== indexMtime || cached.entryCount !== index.items.length) {
         lexicalIndexCache.set(indexFilePath, {
           mtimeMs: indexMtime,
           entryCount: index.items.length,
@@ -3057,7 +2989,7 @@ const routes: readonly RouteDefinition[] = [
                       ...(turn.modelName === undefined ? {} : { modelName: turn.modelName }),
                     })),
                   },
-                })
+                      })
                 .then(() => true)
                 .catch(() => false);
         void eventLogAppended;
@@ -3269,15 +3201,6 @@ const routes: readonly RouteDefinition[] = [
   },
   {
     method: 'GET',
-    pattern: /^\/v1\/workstreams\/projections$/,
-    authRequired: true,
-    handle: async (_request, _requestId, _match, context) => {
-      const vaultRoot = requireVaultRoot(context);
-      return [200, { data: await readWorkstreamProjections(vaultRoot) }];
-    },
-  },
-  {
-    method: 'GET',
     pattern: /^\/v1\/workstreams\/(?<bacId>[A-Za-z0-9_-]+)\/projection$/,
     authRequired: true,
     handle: async (_request, _requestId, match, context) => {
@@ -3417,7 +3340,7 @@ const routes: readonly RouteDefinition[] = [
                   ? { description: record['description'] }
                   : {}),
               },
-            });
+              });
           }
         } catch {
           // Best effort — the vault write succeeded regardless.
@@ -3515,7 +3438,7 @@ const routes: readonly RouteDefinition[] = [
                 ...(input.targetId === undefined ? {} : { targetId: input.targetId }),
                 ...(input.status === undefined ? {} : { status: input.status }),
               },
-            })
+              })
             .catch(() => undefined);
         }
         return [201, mutationResponse(result, requestId)];
@@ -3626,83 +3549,15 @@ const routes: readonly RouteDefinition[] = [
   // a ScopedResult-shaped envelope with `scope: 'companion-extended'`.
   {
     method: 'POST',
-    pattern: /^\/v1\/edge\/events$/u,
-    authRequired: true,
-    handle: async (request, _requestId, _match, context) => {
-      if (context.importEdgeEvent === undefined) {
-        throw new HttpRouteError(
-          503,
-          'EDGE_EVENTS_NOT_WIRED',
-          'Edge-event import is not configured.',
-        );
-      }
-      const body = (await readBody(request)) as { events?: unknown };
-      if (body === null || typeof body !== 'object' || !Array.isArray(body.events)) {
-        throw new HttpRouteError(
-          400,
-          'INVALID_REQUEST',
-          'Body must be { events: AcceptedEvent[] }.',
-        );
-      }
-
-      const imported: { replicaId: string; seq: number }[] = [];
-      const skipped: { replicaId: string; seq: number; reason: string }[] = [];
-      for (const candidate of body.events) {
-        if (
-          candidate === null ||
-          typeof candidate !== 'object' ||
-          typeof (candidate as { type?: unknown }).type !== 'string' ||
-          typeof (candidate as { dot?: unknown }).dot !== 'object' ||
-          (candidate as { dot?: { replicaId?: unknown } }).dot === null
-        ) {
-          continue;
-        }
-        const event = candidate as import('../sync/causal.js').AcceptedEvent;
-        if (!isEdgeEventType(event.type)) {
-          skipped.push({
-            replicaId: event.dot.replicaId,
-            seq: event.dot.seq,
-            reason: 'invalid-event-type',
-          });
-          continue;
-        }
-        if (!isEdgePayloadForType(event.type, event.payload)) {
-          skipped.push({
-            replicaId: event.dot.replicaId,
-            seq: event.dot.seq,
-            reason: 'invalid-payload',
-          });
-          continue;
-        }
-        try {
-          const result = await context.importEdgeEvent(event);
-          if (result.imported) {
-            imported.push({ replicaId: event.dot.replicaId, seq: event.dot.seq });
-          } else {
-            skipped.push({
-              replicaId: event.dot.replicaId,
-              seq: event.dot.seq,
-              reason: 'already-imported',
-            });
-          }
-        } catch (err) {
-          skipped.push({
-            replicaId: event.dot.replicaId,
-            seq: event.dot.seq,
-            reason: err instanceof Error ? err.message : String(err),
-          });
-        }
-      }
-      return [200, { data: { imported, skipped } }];
-    },
-  },
-  {
-    method: 'POST',
     pattern: /^\/v1\/timeline\/events$/u,
     authRequired: true,
     handle: async (request, requestId, _match, context) => {
       if (context.importEdgeEvent === undefined) {
-        throw new HttpRouteError(503, 'TIMELINE_NOT_WIRED', 'Timeline import is not configured.');
+        throw new HttpRouteError(
+          503,
+          'TIMELINE_NOT_WIRED',
+          'Timeline import is not configured.',
+        );
       }
       const body = (await readBody(request)) as { events?: unknown };
       if (body === null || typeof body !== 'object' || !Array.isArray(body.events)) {
@@ -3757,7 +3612,9 @@ const routes: readonly RouteDefinition[] = [
         // so importPeerEvent dedupe still works).
         const sanitizedPayload = sanitizeTimelinePayload(event.payload);
         const sanitizedEvent =
-          sanitizedPayload === event.payload ? event : { ...event, payload: sanitizedPayload };
+          sanitizedPayload === event.payload
+            ? event
+            : { ...event, payload: sanitizedPayload };
         try {
           const result = await context.importEdgeEvent(sanitizedEvent);
           if (result.imported) {
@@ -3804,17 +3661,9 @@ const routes: readonly RouteDefinition[] = [
       // alone — "exact" filtering at the timestamp level.
       const isDateOnly = (s: string): boolean => /^\d{4}-\d{2}-\d{2}$/.test(s);
       const since =
-        sinceRaw === undefined
-          ? undefined
-          : isDateOnly(sinceRaw)
-            ? `${sinceRaw}T00:00:00.000Z`
-            : sinceRaw;
+        sinceRaw === undefined ? undefined : isDateOnly(sinceRaw) ? `${sinceRaw}T00:00:00.000Z` : sinceRaw;
       const until =
-        untilRaw === undefined
-          ? undefined
-          : isDateOnly(untilRaw)
-            ? `${untilRaw}T23:59:59.999Z`
-            : untilRaw;
+        untilRaw === undefined ? undefined : isDateOnly(untilRaw) ? `${untilRaw}T23:59:59.999Z` : untilRaw;
       const q = (url.searchParams.get('q') ?? '').trim().toLowerCase();
       const limitRaw = Number.parseInt(url.searchParams.get('limit') ?? '100', 10);
       const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 1000) : 100;
@@ -3844,7 +3693,10 @@ const routes: readonly RouteDefinition[] = [
       // [firstSeenAt, lastSeenAt] window overlaps [since, until].
       // Without this, since=2026-05-07T12:00:00Z would still
       // return entries from 09:00 the same day.
-      const overlapsRange = (entry: { firstSeenAt: string; lastSeenAt: string }): boolean => {
+      const overlapsRange = (entry: {
+        firstSeenAt: string;
+        lastSeenAt: string;
+      }): boolean => {
         if (since !== undefined && entry.lastSeenAt < since) return false;
         if (until !== undefined && entry.firstSeenAt > until) return false;
         return true;
@@ -3994,7 +3846,9 @@ const routes: readonly RouteDefinition[] = [
           if (keepNodeIds.has(e.toNodeId)) keepNodeIds.add(e.fromNodeId);
         }
         nodes = nodes.filter((n) => keepNodeIds.has(n.id));
-        edges = edges.filter((e) => keepNodeIds.has(e.fromNodeId) && keepNodeIds.has(e.toNodeId));
+        edges = edges.filter(
+          (e) => keepNodeIds.has(e.fromNodeId) && keepNodeIds.has(e.toNodeId),
+        );
       }
       if (nodeKind !== undefined) {
         nodes = nodes.filter((n) => n.kind === nodeKind);
@@ -4048,22 +3902,7 @@ const routes: readonly RouteDefinition[] = [
       const hops = Number.isFinite(hopsRaw) && hopsRaw >= 0 ? Math.min(hopsRaw, 4) : 1;
       const snap = await context.connectionsStore.readCurrent();
       if (snap === null) {
-        return [
-          200,
-          {
-            data: {
-              scope: 'companion-extended',
-              snapshot: {
-                scope: { nodeId, hops },
-                nodes: [],
-                edges: [],
-                updatedAt: '1970-01-01T00:00:00.000Z',
-                nodeCount: 0,
-                edgeCount: 0,
-              },
-            },
-          },
-        ];
+        return [200, { data: { scope: 'companion-extended', snapshot: { scope: { nodeId, hops }, nodes: [], edges: [], updatedAt: '1970-01-01T00:00:00.000Z', nodeCount: 0, edgeCount: 0 } } }];
       }
       const { subgraphForNode } = await import('../connections/snapshot.js');
       const sub = subgraphForNode(snap, nodeId, hops);
