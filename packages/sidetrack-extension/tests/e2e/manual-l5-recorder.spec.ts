@@ -12,7 +12,6 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readdir, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import { expect, test, type Page } from '@playwright/test';
 
@@ -51,9 +50,6 @@ interface ConnectionsEnvelope {
   };
 }
 
-const packageRoot = path.resolve(fileURLToPath(new URL('../../../', import.meta.url)));
-
-const CODEX_COLLECTOR_ID = 'sidetrack.codex-cli';
 const RECORDER_HOST_PERMISSIONS = ['https://*/*', 'http://*/*'] as const;
 const PROFILE_ENV = 'SIDETRACK_USER_DATA_DIR';
 const DEFAULT_PROFILE = '~/.sidetrack-test-profile';
@@ -137,9 +133,6 @@ const expandTilde = (input: string): string =>
   input.startsWith('~') ? path.join(homedir(), input.slice(1).replace(/^[/\\]/u, '')) : input;
 
 const isoStamp = (): string => new Date().toISOString().replace(/[:.]/gu, '-');
-
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
 
 const waitForEnter = async (label: string): Promise<void> => {
   // eslint-disable-next-line no-console
@@ -230,12 +223,15 @@ const openPrivacyGate = async (comp: TestCompanion, gate: string): Promise<void>
 const openRecorderSidepanel = async (
   runtime: ExtensionRuntime,
   comp: TestCompanion,
-  activeWorkstreamId: string,
 ): Promise<Page> => {
   const page = await runtime.context.newPage();
   await page.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
     waitUntil: 'domcontentloaded',
   });
+  // Seed only what's needed to pair the side panel with the spawned
+  // companion. Workstreams + activeWorkstreamId stay un-seeded so the
+  // recording is fully organic — the user creates / picks workstreams
+  // through the panel UI like they would in production.
   await runtime.seedStorage(page, {
     [SETUP_KEY]: true,
     [SETTINGS_KEY]: {
@@ -245,7 +241,6 @@ const openRecorderSidepanel = async (
       notifyOnQueueComplete: true,
     },
     'sidetrack.timeline.enabled': true,
-    'sidetrack.activeWorkstreamId': activeWorkstreamId,
   });
   await page.reload({ waitUntil: 'domcontentloaded' });
   await expect(page.getByRole('main', { name: 'Sidetrack workboard' })).toBeVisible({
@@ -312,8 +307,6 @@ const writeJson = async (filePath: string, value: unknown): Promise<void> => {
 const createLaunchpad = async (
   artifactsDir: string,
   input: {
-    readonly securityWorkstreamId: string;
-    readonly switchboardWorkstreamId: string;
     readonly browserPanelUrl: string;
     readonly reviewerPanelUrl: string;
   },
@@ -367,9 +360,8 @@ const createLaunchpad = async (
   <div id="lp-status"></div>
   <h2>Before clicking links</h2>
   <ol>
-    <li>Use the Sidetrack panel tab for Browser A to keep the active workstream aligned.</li>
-    <li>Security flow workstream id: <code>${input.securityWorkstreamId}</code>.</li>
-    <li>Switchboard flow workstream id: <code>${input.switchboardWorkstreamId}</code>.</li>
+    <li>Open the Browser A side panel and create whatever workstreams you want for this session — they persist across reruns now, so reuse last session's if you'd like.</li>
+    <li>Pick the active workstream pill that matches what you're about to research before clicking the launchpad links below.</li>
     <li>Browser A panel: <a href="${input.browserPanelUrl}" target="_blank" rel="noreferrer" data-open-live-link>${input.browserPanelUrl}</a>.</li>
     <li>Reviewer panel: <a href="${input.reviewerPanelUrl}" target="_blank" rel="noreferrer" data-open-live-link>${input.reviewerPanelUrl}</a>.</li>
   </ol>
@@ -473,90 +465,31 @@ const renderConnectionsForReview = async (
   });
 };
 
-const collectorManifest = (): string => `id = "${CODEX_COLLECTOR_ID}"
-name = "Sidetrack Codex CLI"
-version = "0.1.0"
-manifest_schema = 1
+interface CompanionWorkstream {
+  readonly bac_id: string;
+  readonly title: string;
+}
 
-[compatibility]
-requires-companion = ">=1.0.0 <2.0.0"
-requires-vault = 1
-
-[[emits]]
-event_type = "session_started"
-payload_version = 1
-stability = "alpha"
-
-[[emits]]
-event_type = "session_turn"
-payload_version = 1
-stability = "alpha"
-
-[io]
-rotation = "daily"
-
-[capabilities]
-reads-paths = []
-reads-env = []
-reads-network = false
-default-enabled = true
-
-[process]
-managed-by = "user"
-`;
-
-const writeCollectorDemo = async (
-  vaultPath: string,
-  input: {
-    readonly dispatchId: string;
-    readonly codingSessionId: string;
-  },
-): Promise<void> => {
-  const manifestDir = path.join(vaultPath, '_BAC', 'collectors', CODEX_COLLECTOR_ID);
-  await mkdir(manifestDir, { recursive: true });
-  await writeFile(path.join(manifestDir, 'collector.toml'), collectorManifest(), 'utf8');
-  const now = Date.now();
-  const runId = `manual-${randomUUID()}`;
-  const line = (eventType: 'session_started' | 'session_turn', offsetMs: number): string =>
-    JSON.stringify({
-      collector_id: CODEX_COLLECTOR_ID,
-      event_type: eventType,
-      payload_version: 1,
-      emitted_at: new Date(now + offsetMs).toISOString(),
-      collector_version: '0.1.0',
-      collector_run_id: runId,
-      source_record_id: `${input.codingSessionId}:${eventType}`,
-      dimensions: {
-        dispatchId: input.dispatchId,
-        codingSessionId: input.codingSessionId,
-      },
-      payload:
-        eventType === 'session_started'
-          ? {
-              session_id: input.codingSessionId,
-              started_at: new Date(now + offsetMs).toISOString(),
-              cwd: packageRoot,
-              model: 'manual-recorder',
-            }
-          : {
-              session_id: input.codingSessionId,
-              turn_index: 0,
-              started_at: new Date(now + offsetMs).toISOString(),
-              completed_at: new Date(now + offsetMs + 1000).toISOString(),
-              model: 'manual-recorder',
-              prompt_text: `Manual recorder dispatch ${input.dispatchId}`,
-              response_text: 'Manual coding-agent turn observed for L5 result review.',
-              tool_call_count: 1,
-              exec_command_count: 1,
-            },
-    });
-  const inboxDir = path.join(vaultPath, '_BAC', 'inbox', CODEX_COLLECTOR_ID);
-  await mkdir(inboxDir, { recursive: true });
-  await writeFile(
-    path.join(inboxDir, `${new Date().toISOString().slice(0, 10)}.jsonl`),
-    `${line('session_started', -5000)}\n${line('session_turn', -3000)}\n`,
-    'utf8',
-  );
+const listUserWorkstreams = async (comp: TestCompanion): Promise<readonly CompanionWorkstream[]> => {
+  const url = `http://127.0.0.1:${String(comp.port)}/v1/workstreams/projections`;
+  const response = await fetch(url, { headers: { 'x-bac-bridge-key': comp.bridgeKey } });
+  if (!response.ok) return [];
+  const body = (await response.json()) as {
+    readonly data?: readonly {
+      readonly bac_id?: unknown;
+      readonly deleted?: unknown;
+      readonly record?: { readonly status?: unknown; readonly value?: { readonly title?: unknown } };
+    }[];
+  };
+  const data = body.data ?? [];
+  return data.flatMap((item) => {
+    if (item.deleted === true) return [];
+    if (typeof item.bac_id !== 'string') return [];
+    const value =
+      item.record?.status === 'resolved' ? (item.record as { value?: { title?: unknown } }).value : undefined;
+    const title = typeof value?.title === 'string' ? value.title : item.bac_id;
+    return [{ bac_id: item.bac_id, title }];
+  });
 };
 
 const waitForConnections = async (
@@ -651,20 +584,12 @@ test.describe('manual L5 full-browser recorder', () => {
       await openPrivacyGate(companionB, 'timeline');
       await openPrivacyGate(companionB, 'engagement');
 
-      const wsSecurityRes = (await apiPost(companionA, '/v1/workstreams', {
-        title: 'Copy-fail Linux security research',
-      })) as { readonly data?: { readonly bac_id?: unknown } };
-      const wsSwitchboardRes = (await apiPost(companionA, '/v1/workstreams', {
-        title: 'Switchboard PR review',
-      })) as { readonly data?: { readonly bac_id?: unknown } };
-      const wsSecurityId = wsSecurityRes.data?.bac_id;
-      const wsSwitchboardId = wsSwitchboardRes.data?.bac_id;
-      if (typeof wsSecurityId !== 'string' || typeof wsSwitchboardId !== 'string') {
-        throw new Error('workstream creation did not return ids');
-      }
-
-      const panelA = await openRecorderSidepanel(runtimeA, companionA, wsSecurityId);
-      const panelB = await openRecorderSidepanel(runtimeB, companionB, wsSecurityId);
+      // No pre-seeded workstreams. The user creates whatever workstreams
+      // they want via the side panel during the session; the persistent
+      // companion vault keeps them across reruns. Post-record analysis
+      // discovers what's there organically (see below).
+      const panelA = await openRecorderSidepanel(runtimeA, companionA);
+      const panelB = await openRecorderSidepanel(runtimeB, companionB);
       await reinitializeTimeline(runtimeA, panelA);
       await reinitializeTimeline(runtimeB, panelB);
       await grantDeeperPageAccessIfNeeded(panelA).catch((error: unknown) => {
@@ -678,8 +603,6 @@ test.describe('manual L5 full-browser recorder', () => {
         payload: {
           artifactsDir,
           profileDir,
-          securityWorkstreamId: wsSecurityId,
-          switchboardWorkstreamId: wsSwitchboardId,
           companionA: {
             port: companionA.port,
             vaultPath: companionA.vaultPath,
@@ -692,8 +615,6 @@ test.describe('manual L5 full-browser recorder', () => {
       });
 
       const launchpadUrl = await createLaunchpad(artifactsDir, {
-        securityWorkstreamId: wsSecurityId,
-        switchboardWorkstreamId: wsSwitchboardId,
         browserPanelUrl: `chrome-extension://${runtimeA.extensionId}/sidepanel.html`,
         reviewerPanelUrl: `chrome-extension://${runtimeB.extensionId}/sidepanel.html`,
       });
@@ -714,23 +635,21 @@ test.describe('manual L5 full-browser recorder', () => {
  Companion B      : http://127.0.0.1:${String(companionB.port)}
  Artifacts        : ${artifactsDir}
 
- Workstreams:
-   Flow A security     : ${wsSecurityId}
-   Flow B Switchboard  : ${wsSwitchboardId}
-
  Manual steps:
-   1. Use the launchpad tab to click links. Cmd-click or middle-click
+   1. In the Browser A side panel, create the workstreams you want for
+      this session (or reuse last session's — the companion vault is
+      persistent now). Pick the active workstream pill before doing
+      research that should land in it.
+   2. Use the launchpad tab to click links. Cmd-click or middle-click
       if you want a link to open in a new tab.
-   2. Keep the Sidetrack panel's active workstream on Flow A while
-      doing HN/xint/google/ChatGPT/copy.fail/GitHub exploit work.
-   3. Switch the active workstream to Flow B before GitHub
-      switchboard/pulls/ChatGPT/YouTube/Gemini.
-   4. For the dispatch direction, copy a useful snippet from
-      copy.fail and paste it into a GitHub/coding-agent input if the
-      page offers one. The recorder logs copy/paste text excerpts.
-   5. Tell Codex "done" when finished. I will stop the recorder,
-      drain Sidetrack, dump connections/timeline state, and summarize
-      the observed activities for confirmation.
+   3. Switch the active workstream pill any time the focus of your
+      research shifts.
+   4. For dispatch flows, copy a useful snippet from a source page
+      and paste it into a GitHub / coding-agent input if the page
+      offers one. The recorder logs copy/paste excerpts.
+   5. Tell Codex "done" when finished. The harness stops the recorder,
+      drains Sidetrack, dumps connections/timeline state, and reports
+      whatever workstreams + dispatches you actually created.
 
 No video is recorded. Artifacts are JSONL events, page text/html
 dumps, visible screenshots, and companion/plugin result JSON.
@@ -747,56 +666,36 @@ dumps, visible screenshots, and companion/plugin result JSON.
       const drainB = await drainRuntime(runtimeB, panelB);
       await writeJson(path.join(artifactsDir, 'drain-results.json'), { A: drainA, B: drainB });
 
-      const dispatchResponse = (await apiPost(companionA, '/v1/dispatches', {
-        kind: 'coding',
-        target: { provider: 'codex', mode: 'paste' },
-        workstreamId: wsSecurityId,
-        title: 'Manual L5 copy.fail coding dispatch',
-        body: 'Manual recorder observed copy.fail to coding-agent dispatch flow.',
-        createdAt: new Date().toISOString(),
-        mcpRequest: {
-          codingSessionId: `manual-l5-${randomUUID().replaceAll('-', '').slice(0, 12)}`,
-          approval: 'manual-recorder',
-          requestedAt: new Date().toISOString(),
-        },
-      })) as { readonly data?: { readonly bac_id?: unknown; readonly mcpRequest?: unknown } };
-      const dispatchId =
-        typeof dispatchResponse.data?.bac_id === 'string' ? dispatchResponse.data.bac_id : null;
-      const rawMcpRequest = dispatchResponse.data?.mcpRequest;
-      const mcpRequest = isRecord(rawMcpRequest) ? rawMcpRequest : {};
-      const codingSessionId =
-        typeof mcpRequest.codingSessionId === 'string'
-          ? mcpRequest.codingSessionId
-          : `manual-l5-${randomUUID().replaceAll('-', '').slice(0, 12)}`;
-      if (dispatchId !== null) {
-        await writeCollectorDemo(companionA.vaultPath, { dispatchId, codingSessionId });
+      // Discover whatever workstreams the user actually created during the
+      // recording (organic data, not pre-seeded test fixtures). If none —
+      // skip the workstream-scoped review steps without failing.
+      const userWorkstreams = await listUserWorkstreams(companionA);
+      if (userWorkstreams.length === 0) {
+        // eslint-disable-next-line no-console
+        console.log(
+          '[manual-l5] no workstreams found on Companion A; skipping workstream-scoped post-actions.',
+        );
       }
 
+      // Wait briefly for relay to mirror whatever happened to companion B.
+      // Doesn't assert any specific edge — that depends on what the user
+      // actually did during the session.
       await waitForConnections(
         companionB,
-        (env) => {
-          const edges = env.data?.snapshot?.edges ?? [];
-          return (
-            edges.some((edge) => edge.kind === 'visit_in_workstream') &&
-            (dispatchId === null ||
-              edges.some(
-                (edge) =>
-                  edge.kind === 'dispatch_in_workstream' &&
-                  edge.fromNodeId === `dispatch:${dispatchId}`,
-              ))
-          );
-        },
+        (env) => (env.data?.snapshot?.edges ?? []).length > 0,
         20_000,
-      );
+      ).catch(() => undefined);
 
       await dumpCompanionState(artifactsDir, 'browser-a', companionA);
       await dumpCompanionState(artifactsDir, 'reviewer-b', companionB);
-      await renderConnectionsForReview(panelB, wsSecurityId, artifactsDir, 'security').catch(
-        () => undefined,
-      );
-      await renderConnectionsForReview(panelB, wsSwitchboardId, artifactsDir, 'switchboard').catch(
-        () => undefined,
-      );
+      for (const ws of userWorkstreams) {
+        await renderConnectionsForReview(
+          panelB,
+          ws.bac_id,
+          artifactsDir,
+          ws.title.replaceAll(/[^a-z0-9]+/giu, '-').toLowerCase().slice(0, 32) || ws.bac_id,
+        ).catch(() => undefined);
+      }
       await recorder.snapshotPage(panelA, 'panel-a-final');
       await recorder.snapshotPage(panelB, 'panel-b-final');
       const summaryPath = path.join(artifactsDir, 'activity-summary.md');
