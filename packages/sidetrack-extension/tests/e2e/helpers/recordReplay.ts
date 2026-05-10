@@ -16,6 +16,7 @@ import type { ExtensionRuntime } from './runtime';
 
 export const SESSION_PACK_SCHEMA_VERSION = 1;
 export const ACTIVE_WORKSTREAM_STORAGE_KEY = 'sidetrack.activeWorkstreamId';
+export const TIMELINE_REPLAY_DEBUG_STORAGE_KEY = 'sidetrack.timeline.replayDebug';
 
 export type CaptureLevel = 'minimal' | 'html' | 'html+paste';
 export type BrowserLabel = 'A' | 'B';
@@ -179,6 +180,17 @@ export interface TimelineDrainResult {
   readonly uploaded: number;
   readonly remaining: number;
 }
+
+export const timelineReplayDebugEnabled = (): boolean =>
+  process.env['SIDETRACK_REPLAY_DEBUG'] === '1';
+
+export const readTimelineReplayDiagnostics = async (
+  runtime: ExtensionRuntime,
+  senderPage: Page,
+): Promise<unknown> =>
+  await runtime.sendRuntimeMessage(senderPage, {
+    type: 'sidetrack.timeline.diagnostics',
+  });
 
 export type ReplayLayerName =
   | 'page-replay'
@@ -907,10 +919,15 @@ const installRouteStubs = async (
   const fulfilledBodies = new Map<string, string>();
   let aborted = 0;
   await context.route(/^https?:\/\//u, async (route) => {
-    const requestUrl = sanitizeTimelineUrl(route.request().url());
+    const rawRequestUrl = route.request().url();
+    const requestUrl = sanitizeTimelineUrl(rawRequestUrl);
     const stub = stubs.get(routeKeyFor(requestUrl));
     if (stub === undefined) {
       if (strictOffline) {
+        if (isLoopbackHttpUrl(rawRequestUrl)) {
+          await route.fallback();
+          return;
+        }
         aborted += 1;
         await route.abort('blockedbyclient');
         return;
@@ -941,6 +958,18 @@ const installRouteStubs = async (
   };
 };
 
+const isLoopbackHttpUrl = (input: string): boolean => {
+  try {
+    const url = new URL(input);
+    return (
+      (url.protocol === 'http:' || url.protocol === 'https:') &&
+      (url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]')
+    );
+  } catch {
+    return false;
+  }
+};
+
 export interface ReplayTimingOptions {
   // Multiplier applied to recorded `atMs` deltas. 1 = real-time;
   // 0.5 = twice as fast; 2 = half as fast. Default: 1.
@@ -953,9 +982,7 @@ export interface ReplayTimingOptions {
   readonly maxIdleGapMs?: number;
 }
 
-const resolveReplayTimingFromEnv = (
-  env: NodeJS.ProcessEnv = process.env,
-): ReplayTimingOptions => {
+const resolveReplayTimingFromEnv = (env: NodeJS.ProcessEnv = process.env): ReplayTimingOptions => {
   const speedRaw = env['SIDETRACK_REPLAY_SPEED'];
   const idleRaw = env['SIDETRACK_REPLAY_MAX_IDLE_MS'];
   const speed =

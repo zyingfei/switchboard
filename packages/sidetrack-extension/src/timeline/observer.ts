@@ -110,6 +110,42 @@ export interface TimelineObserver {
   readonly close: (input: CloseInput) => void;
 }
 
+export interface TimelineObserverDiagnostics {
+  readonly observeCalls: number;
+  readonly emitCalls: number;
+  readonly closeCalls: number;
+  readonly coalescedCalls: number;
+  readonly droppedUrlTooLong: number;
+  readonly closeDroppedMissingTab: number;
+  readonly lastDecision: null | {
+    readonly at: string;
+    readonly kind: 'emit' | 'coalesce' | 'drop-url-too-long' | 'close-emit' | 'close-missing-tab';
+    readonly transition?: TimelineTransition;
+    readonly sanitizedUrl?: string;
+    readonly canonicalUrl?: string;
+    readonly hasWorkstreamId?: boolean;
+    readonly urlLength?: number;
+  };
+}
+
+let observeCalls = 0;
+let emitCalls = 0;
+let closeCalls = 0;
+let coalescedCalls = 0;
+let droppedUrlTooLong = 0;
+let closeDroppedMissingTab = 0;
+let lastDecision: TimelineObserverDiagnostics['lastDecision'] = null;
+
+export const getTimelineObserverDiagnostics = (): TimelineObserverDiagnostics => ({
+  observeCalls,
+  emitCalls,
+  closeCalls,
+  coalescedCalls,
+  droppedUrlTooLong,
+  closeDroppedMissingTab,
+  lastDecision,
+});
+
 const defaultMintEventId = (input: {
   tabIdHash: string;
   canonicalUrl?: string;
@@ -142,10 +178,20 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
   };
 
   const observe = (input: ObserveInput): void => {
+    observeCalls += 1;
     // Bound URL + title before doing any other work. An oversized
     // input is dropped silently (passive intent — same posture as
     // the budget guard's `dropped-passive-by-policy`).
-    if (input.url.length > URL_MAX_LENGTH) return;
+    if (input.url.length > URL_MAX_LENGTH) {
+      droppedUrlTooLong += 1;
+      lastDecision = {
+        at: deps.clock().toISOString(),
+        kind: 'drop-url-too-long',
+        transition: input.transition,
+        urlLength: input.url.length,
+      };
+      return;
+    }
     const boundedTitle =
       input.title === undefined
         ? undefined
@@ -165,8 +211,7 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
     // arbitrary URLs would still ship to the companion.
     const sanitizedUrl = sanitizeTimelineUrl(input.url);
     const rawCanonical = deps.canonicalize?.(input.url);
-    const canonicalUrl =
-      rawCanonical === undefined ? undefined : sanitizeTimelineUrl(rawCanonical);
+    const canonicalUrl = rawCanonical === undefined ? undefined : sanitizeTimelineUrl(rawCanonical);
     const provider = deps.providerOf?.(canonicalUrl ?? sanitizedUrl);
     const existing = byTab.get(tabIdHash);
 
@@ -181,6 +226,16 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
       // Coalesce within the window — no emission.
       const elapsed = now.getTime() - existing.lastEmittedAt;
       if (elapsed < coalesceWindowMs) {
+        const workstreamId = resolveWorkstreamId();
+        coalescedCalls += 1;
+        lastDecision = {
+          at: observedAt,
+          kind: 'coalesce',
+          transition: input.transition,
+          sanitizedUrl,
+          ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
+          hasWorkstreamId: workstreamId !== undefined,
+        };
         // Title-only update merges in-memory.
         if (boundedTitle !== undefined && boundedTitle !== existing.title) {
           byTab.set(tabIdHash, { ...existing, title: boundedTitle });
@@ -188,6 +243,7 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
         return;
       }
       // Outside the window — emit a refresh observation as 'updated'.
+      const workstreamId = resolveWorkstreamId();
       const payload: BrowserTimelineObservedPayload = {
         eventId: mintEventId({
           tabIdHash,
@@ -203,9 +259,16 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
         transition: 'updated',
         tabIdHash,
         windowIdHash,
-        ...(resolveWorkstreamId() === undefined
-          ? {}
-          : { workstreamId: resolveWorkstreamId()! }),
+        ...(workstreamId === undefined ? {} : { workstreamId }),
+      };
+      emitCalls += 1;
+      lastDecision = {
+        at: observedAt,
+        kind: 'emit',
+        transition: 'updated',
+        sanitizedUrl,
+        ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
+        hasWorkstreamId: workstreamId !== undefined,
       };
       deps.emit(payload);
       byTab.set(tabIdHash, {
@@ -221,8 +284,8 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
     }
 
     // New tab OR navigation to a new canonicalUrl — emit.
-    const transition: TimelineTransition =
-      existing === undefined ? input.transition : 'updated';
+    const transition: TimelineTransition = existing === undefined ? input.transition : 'updated';
+    const workstreamId = resolveWorkstreamId();
     const payload: BrowserTimelineObservedPayload = {
       eventId: mintEventId({
         tabIdHash,
@@ -238,9 +301,16 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
       transition,
       tabIdHash,
       windowIdHash,
-      ...(resolveWorkstreamId() === undefined
-        ? {}
-        : { workstreamId: resolveWorkstreamId()! }),
+      ...(workstreamId === undefined ? {} : { workstreamId }),
+    };
+    emitCalls += 1;
+    lastDecision = {
+      at: observedAt,
+      kind: 'emit',
+      transition,
+      sanitizedUrl,
+      ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
+      hasWorkstreamId: workstreamId !== undefined,
     };
     deps.emit(payload);
     byTab.set(tabIdHash, {
@@ -255,10 +325,19 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
   };
 
   const close = (input: CloseInput): void => {
+    closeCalls += 1;
     const tabIdHash = deps.hashTabId(input.tabId, input.windowId);
     const existing = byTab.get(tabIdHash);
-    if (existing === undefined) return;
+    if (existing === undefined) {
+      closeDroppedMissingTab += 1;
+      lastDecision = {
+        at: deps.clock().toISOString(),
+        kind: 'close-missing-tab',
+      };
+      return;
+    }
     const observedAt = deps.clock().toISOString();
+    const workstreamId = resolveWorkstreamId();
     const payload: BrowserTimelineObservedPayload = {
       eventId: defaultMintEventId({
         tabIdHash,
@@ -274,9 +353,16 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
       transition: 'closed',
       tabIdHash,
       windowIdHash: existing.windowIdHash,
-      ...(resolveWorkstreamId() === undefined
-        ? {}
-        : { workstreamId: resolveWorkstreamId()! }),
+      ...(workstreamId === undefined ? {} : { workstreamId }),
+    };
+    emitCalls += 1;
+    lastDecision = {
+      at: observedAt,
+      kind: 'close-emit',
+      transition: 'closed',
+      sanitizedUrl: existing.url,
+      ...(existing.canonicalUrl === undefined ? {} : { canonicalUrl: existing.canonicalUrl }),
+      hasWorkstreamId: workstreamId !== undefined,
     };
     deps.emit(payload);
     byTab.delete(tabIdHash);

@@ -40,9 +40,11 @@ import {
 import { drainReviewDraftOutbox } from '../src/review/outbox';
 import {
   initializeTimelineWiring,
+  readTimelineReplayDiagnostics,
   resetTimelineWiringForTests,
   TIMELINE_ENABLED_KEY,
   TIMELINE_PRIVACY_GATE,
+  TIMELINE_REPLAY_DEBUG_KEY,
   triggerTimelineDrain,
 } from '../src/timeline/wiring';
 import {
@@ -356,6 +358,15 @@ const isTimelinePrivacyGateOpen = async (): Promise<boolean> => {
   try {
     const projection = await readPrivacyProjection();
     return projection.gateStates?.[TIMELINE_PRIVACY_GATE] === 'open';
+  } catch {
+    return false;
+  }
+};
+
+const isTimelineReplayDebugEnabled = async (): Promise<boolean> => {
+  try {
+    const got = await chrome.storage.local.get(TIMELINE_REPLAY_DEBUG_KEY);
+    return got[TIMELINE_REPLAY_DEBUG_KEY] === true;
   } catch {
     return false;
   }
@@ -3416,6 +3427,29 @@ export default defineBackground(() => {
             sendResponse({
               ok: false,
               error: error instanceof Error ? error.message : 'reinit failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.timeline.diagnostics'
+      ) {
+        void (async () => {
+          if (!(await isTimelineReplayDebugEnabled())) {
+            return { ok: false, error: 'timeline replay diagnostics disabled' };
+          }
+          const diagnostics = await readTimelineReplayDiagnostics();
+          return { ok: true, diagnostics };
+        })()
+          .then((response) => {
+            sendResponse(response as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'timeline diagnostics failed',
             } as unknown as RuntimeResponse);
           });
         return true;

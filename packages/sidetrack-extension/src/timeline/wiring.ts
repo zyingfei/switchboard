@@ -8,9 +8,14 @@ import {
   setTimelineDrainHook,
   setTimelineFetchHook,
   timelinePluginMaterializer,
+  getTimelineMaterializerDiagnostics,
 } from './materializer';
-import { createTimelineObserver, type TimelineObserver } from './observer';
-import type { BrowserTimelineObservedPayload, TimelineProvider } from './events';
+import {
+  createTimelineObserver,
+  getTimelineObserverDiagnostics,
+  type TimelineObserver,
+} from './observer';
+import type { BrowserTimelineObservedPayload } from './events';
 
 // Sync Contract v1 / Class F — bind chrome.tabs APIs to the timeline
 // observer + materializer. Production wiring referenced in
@@ -43,6 +48,7 @@ const DRAIN_PERIOD_MIN = 1; // every minute when companion reachable
 // flag.
 export const TIMELINE_ENABLED_KEY = 'sidetrack.timeline.enabled';
 export const TIMELINE_PRIVACY_GATE = 'timeline';
+export const TIMELINE_REPLAY_DEBUG_KEY = 'sidetrack.timeline.replayDebug';
 
 // Settings key for the user's currently-focused workstream. When
 // set, the timeline observer stamps it onto every browser.timeline.
@@ -87,6 +93,108 @@ export const setTimelineEnabled = async (enabled: boolean): Promise<boolean> => 
 };
 
 let initialized = false;
+let initializeCalls = 0;
+let successfulInitializeCalls = 0;
+let activeWorkstreamCacheRefreshes = 0;
+let storageChangeListenerAttached = false;
+let onActivatedListenerCount = 0;
+let onUpdatedListenerCount = 0;
+let onRemovedListenerCount = 0;
+let alarmListenerCount = 0;
+let onActivatedCalls = 0;
+let onUpdatedCalls = 0;
+let onRemovedCalls = 0;
+let onUpdatedSequence = 0;
+let observerObserveCalls = 0;
+let observerCloseCalls = 0;
+let triggerDrainCalls = 0;
+type TimelineGateBoundary = 'init' | 'onActivated' | 'onUpdated' | 'onRemoved';
+interface TimelineGateReadDiagnostic {
+  readonly at: string;
+  readonly boundary: TimelineGateBoundary;
+  readonly open: boolean;
+}
+
+interface TimelineOnUpdatedDiagnostic {
+  readonly sequence: number;
+  readonly at: string;
+  readonly tabId: number;
+  readonly status?: string;
+  readonly hasChangeUrl: boolean;
+  readonly tabUrl?: string;
+  readonly urlUsed?: string;
+  readonly gateOpen?: boolean;
+  readonly skippedReason?: string;
+}
+
+interface TimelineObserveRequestDiagnostic {
+  readonly at: string;
+  readonly source: 'onActivated' | 'onUpdated' | 'onRemoved';
+  readonly transition?: BrowserTimelineObservedPayload['transition'];
+  readonly url?: string;
+  readonly activeWorkstreamId?: string;
+}
+
+interface TimelineDrainTriggerDiagnostic {
+  readonly at: string;
+  readonly capturedInitDepsPresent: boolean;
+  readonly uploaded: number;
+  readonly remaining: number;
+}
+let lastGateRead: TimelineGateReadDiagnostic | null = null;
+let lastOnUpdated: TimelineOnUpdatedDiagnostic | null = null;
+let lastObserveRequest: TimelineObserveRequestDiagnostic | null = null;
+let lastDrainTrigger: TimelineDrainTriggerDiagnostic | null = null;
+
+export interface TimelineWiringDiagnostics {
+  readonly initialized: boolean;
+  readonly capturedInitDepsPresent: boolean;
+  readonly initializeCalls: number;
+  readonly successfulInitializeCalls: number;
+  readonly listeners: {
+    readonly storageChangeAttached: boolean;
+    readonly onActivated: number;
+    readonly onUpdated: number;
+    readonly onRemoved: number;
+    readonly alarm: number;
+  };
+  readonly listenerCalls: {
+    readonly onActivated: number;
+    readonly onUpdated: number;
+    readonly onRemoved: number;
+  };
+  readonly observerBridgeCalls: {
+    readonly observe: number;
+    readonly close: number;
+  };
+  readonly activeWorkstreamCache: {
+    readonly refreshes: number;
+    readonly value: string | null;
+  };
+  readonly triggerDrainCalls: number;
+  readonly lastGateRead: TimelineGateReadDiagnostic | null;
+  readonly lastOnUpdated: TimelineOnUpdatedDiagnostic | null;
+  readonly lastObserveRequest: TimelineObserveRequestDiagnostic | null;
+  readonly lastDrainTrigger: TimelineDrainTriggerDiagnostic | null;
+}
+
+export interface TimelineReplayDiagnostics {
+  readonly wiring: TimelineWiringDiagnostics;
+  readonly observer: ReturnType<typeof getTimelineObserverDiagnostics>;
+  readonly materializer: Awaited<ReturnType<typeof getTimelineMaterializerDiagnostics>>;
+}
+
+const recordGateRead = (boundary: TimelineGateBoundary, open: boolean): void => {
+  lastGateRead = { at: new Date().toISOString(), boundary, open };
+};
+
+const updateLastOnUpdated = (
+  sequence: number,
+  patch: Partial<Omit<TimelineOnUpdatedDiagnostic, 'sequence'>>,
+): void => {
+  if (lastOnUpdated === null || lastOnUpdated.sequence !== sequence) return;
+  lastOnUpdated = { ...lastOnUpdated, ...patch };
+};
 
 // Deterministic synchronous hash (FNV-1a 64-bit) used to scope
 // (tabId, windowId) into a stable opaque identity. Salted with the
@@ -111,6 +219,7 @@ const fnv1a64 = (input: string): string => {
 let cachedActiveWorkstreamId: string | undefined;
 
 const refreshActiveWorkstreamCache = async (): Promise<void> => {
+  activeWorkstreamCacheRefreshes += 1;
   try {
     const got = await getStorage().get(ACTIVE_WORKSTREAM_KEY);
     const v = got[ACTIVE_WORKSTREAM_KEY];
@@ -141,6 +250,7 @@ const startActiveWorkstreamCache = async (): Promise<void> => {
       cachedActiveWorkstreamId = typeof v === 'string' && v.length > 0 ? v : undefined;
     }
   });
+  storageChangeListenerAttached = true;
 };
 
 const buildObserver = (replica: EdgeReplica): TimelineObserver => {
@@ -238,17 +348,37 @@ export const triggerTimelineDrain = async (): Promise<{
   uploaded: number;
   remaining: number;
 }> => {
-  if (capturedInitDeps === null) return { uploaded: 0, remaining: 0 };
-  return await tryDrain(capturedInitDeps);
+  triggerDrainCalls += 1;
+  if (capturedInitDeps === null) {
+    lastDrainTrigger = {
+      at: new Date().toISOString(),
+      capturedInitDepsPresent: false,
+      uploaded: 0,
+      remaining: 0,
+    };
+    return { uploaded: 0, remaining: 0 };
+  }
+  const result = await tryDrain(capturedInitDeps);
+  lastDrainTrigger = {
+    at: new Date().toISOString(),
+    capturedInitDepsPresent: true,
+    uploaded: result.uploaded,
+    remaining: result.remaining,
+  };
+  return result;
 };
 
 export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> => {
+  initializeCalls += 1;
   if (initialized) return;
   const readTimelineGateState = deps.readTimelineGateState ?? isTimelineEnabled;
   // Gate first — if the user hasn't opted in via the privacy
   // projection, register nothing.
-  if (!(await readTimelineGateState())) return;
+  const initGateOpen = await readTimelineGateState();
+  recordGateRead('init', initGateOpen);
+  if (!initGateOpen) return;
   initialized = true;
+  successfulInitializeCalls += 1;
   capturedInitDeps = deps;
 
   // Phase 4: keep the active-workstream-id cache hot before the
@@ -264,11 +394,24 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
   // current URL. We have to re-fetch the tab because onActivated
   // doesn't carry a URL.
   chrome.tabs.onActivated.addListener((info) => {
+    onActivatedCalls += 1;
     void (async () => {
       try {
-        if (!(await readTimelineGateState())) return;
+        const gateOpen = await readTimelineGateState();
+        recordGateRead('onActivated', gateOpen);
+        if (!gateOpen) return;
         const tab = await chrome.tabs.get(info.tabId);
         if (typeof tab.url !== 'string' || tab.url.length === 0) return;
+        observerObserveCalls += 1;
+        lastObserveRequest = {
+          at: new Date().toISOString(),
+          source: 'onActivated',
+          transition: 'activated',
+          url: tab.url,
+          ...(cachedActiveWorkstreamId === undefined
+            ? {}
+            : { activeWorkstreamId: cachedActiveWorkstreamId }),
+        };
         observer.observe({
           tabId: info.tabId,
           windowId: info.windowId,
@@ -281,17 +424,54 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
       }
     })();
   });
+  onActivatedListenerCount += 1;
 
   // chrome.tabs.onUpdated fires on URL change, status complete, and
   // title changes. We only emit on URL changes (the observer's
   // coalesce drops repeated identical-canonical observations).
   chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    onUpdatedCalls += 1;
+    const sequence = (onUpdatedSequence += 1);
+    lastOnUpdated = {
+      sequence,
+      at: new Date().toISOString(),
+      tabId,
+      ...(typeof changeInfo.status === 'string' ? { status: changeInfo.status } : {}),
+      hasChangeUrl: changeInfo.url !== undefined,
+      ...(typeof tab.url === 'string' ? { tabUrl: tab.url } : {}),
+    };
     void (async () => {
-      if (!(await readTimelineGateState())) return;
-      if (changeInfo.url === undefined && changeInfo.status !== 'complete') return;
+      const gateOpen = await readTimelineGateState();
+      recordGateRead('onUpdated', gateOpen);
+      updateLastOnUpdated(sequence, { gateOpen });
+      if (!gateOpen) {
+        updateLastOnUpdated(sequence, { skippedReason: 'gate-closed' });
+        return;
+      }
+      if (changeInfo.url === undefined && changeInfo.status !== 'complete') {
+        updateLastOnUpdated(sequence, { skippedReason: 'no-url-and-not-complete' });
+        return;
+      }
       const url = tab.url ?? changeInfo.url;
-      if (typeof url !== 'string' || url.length === 0) return;
-      if (typeof tab.windowId !== 'number') return;
+      if (typeof url !== 'string' || url.length === 0) {
+        updateLastOnUpdated(sequence, { skippedReason: 'missing-url' });
+        return;
+      }
+      updateLastOnUpdated(sequence, { urlUsed: url });
+      if (typeof tab.windowId !== 'number') {
+        updateLastOnUpdated(sequence, { skippedReason: 'missing-window-id' });
+        return;
+      }
+      observerObserveCalls += 1;
+      lastObserveRequest = {
+        at: new Date().toISOString(),
+        source: 'onUpdated',
+        transition: changeInfo.status === 'complete' ? 'completed' : 'updated',
+        url,
+        ...(cachedActiveWorkstreamId === undefined
+          ? {}
+          : { activeWorkstreamId: cachedActiveWorkstreamId }),
+      };
       observer.observe({
         tabId,
         windowId: tab.windowId,
@@ -301,15 +481,28 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
       });
     })();
   });
+  onUpdatedListenerCount += 1;
 
   // chrome.tabs.onRemoved: emit a closed transition so timeline
   // sessions have a clean tail.
   chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
+    onRemovedCalls += 1;
     void (async () => {
-      if (!(await readTimelineGateState())) return;
+      const gateOpen = await readTimelineGateState();
+      recordGateRead('onRemoved', gateOpen);
+      if (!gateOpen) return;
+      observerCloseCalls += 1;
+      lastObserveRequest = {
+        at: new Date().toISOString(),
+        source: 'onRemoved',
+        ...(cachedActiveWorkstreamId === undefined
+          ? {}
+          : { activeWorkstreamId: cachedActiveWorkstreamId }),
+      };
       observer.close({ tabId, windowId: removeInfo.windowId });
     })();
   });
+  onRemovedListenerCount += 1;
 
   // Periodic drain via chrome.alarms (1-minute cadence; same minimum
   // MV3 floor as the dispatch poll alarm).
@@ -324,11 +517,48 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
     if (alarm.name !== DRAIN_ALARM) return;
     void tryDrain(deps).catch(() => undefined);
   });
+  alarmListenerCount += 1;
 
   // Eager first drain on init — picks up anything spooled across a
   // service-worker restart.
   void tryDrain(deps).catch(() => undefined);
 };
+
+export const readTimelineReplayDiagnostics = async (): Promise<TimelineReplayDiagnostics> => ({
+  wiring: {
+    initialized,
+    capturedInitDepsPresent: capturedInitDeps !== null,
+    initializeCalls,
+    successfulInitializeCalls,
+    listeners: {
+      storageChangeAttached: storageChangeListenerAttached,
+      onActivated: onActivatedListenerCount,
+      onUpdated: onUpdatedListenerCount,
+      onRemoved: onRemovedListenerCount,
+      alarm: alarmListenerCount,
+    },
+    listenerCalls: {
+      onActivated: onActivatedCalls,
+      onUpdated: onUpdatedCalls,
+      onRemoved: onRemovedCalls,
+    },
+    observerBridgeCalls: {
+      observe: observerObserveCalls,
+      close: observerCloseCalls,
+    },
+    activeWorkstreamCache: {
+      refreshes: activeWorkstreamCacheRefreshes,
+      value: cachedActiveWorkstreamId ?? null,
+    },
+    triggerDrainCalls,
+    lastGateRead,
+    lastOnUpdated,
+    lastObserveRequest,
+    lastDrainTrigger,
+  },
+  observer: getTimelineObserverDiagnostics(),
+  materializer: await getTimelineMaterializerDiagnostics(),
+});
 
 // Test-only seam to reset the init guard between tests.
 export const resetTimelineWiringForTests = (): void => {
