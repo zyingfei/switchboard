@@ -19,6 +19,7 @@ import {
   redactHtmlForSessionPack,
   resolveCaptureLevel,
   resolveTestSessionsDir,
+  routeKeyFor,
   sha256Hex,
   writeSessionPack,
   type ConnectionsEnvelope,
@@ -734,6 +735,84 @@ describe('T1 record/replay session pack helpers', () => {
 
     const offMarkdown = renderReplayMarkdown(offReport);
     expect(offMarkdown).not.toContain('## Strict offline replay');
+  });
+
+  it('routeKeyFor normalizes trailing slashes so /pulls and /pulls/ match', () => {
+    expect(routeKeyFor('https://example.test/pulls')).toBe('https://example.test/pulls');
+    expect(routeKeyFor('https://example.test/pulls/')).toBe('https://example.test/pulls');
+    expect(routeKeyFor('https://example.test/')).toBe('https://example.test/');
+    expect(routeKeyFor('https://example.test')).toBe('https://example.test/');
+    expect(routeKeyFor('https://example.test/path?q=1')).toBe('https://example.test/path');
+    expect(routeKeyFor('not a url')).toBe('not a url');
+    expect(routeKeyFor('not a url?with=qs')).toBe('not a url');
+  });
+
+  it('privacy gate accepts inline-script localStorage references in redacted HTML', () => {
+    const pack = basePack();
+    const browser = pack.browsers[0];
+    const htmlPack: SessionPack = {
+      ...pack,
+      mode: { browsers: 1, captureLevel: 'html' },
+      browsers: [
+        {
+          ...browser,
+          snapshots: {
+            'https://example.test/a': {
+              capturedAt: '2026-05-09T12:00:00.000Z',
+              title: 'Example',
+              htmlRedacted:
+                '<html><body><script>localStorage.setItem("k","v"); sessionStorage.getItem("x");</script></body></html>',
+              redactionCounts: { email: 0 },
+            },
+          },
+        },
+      ],
+    };
+    expect(() => {
+      assertPackPrivacy(htmlPack);
+    }).not.toThrow();
+  });
+
+  it('privacy gate still rejects authorization headers, bearer tokens, and provider keys', () => {
+    const pack = basePack();
+    const browser = pack.browsers[0];
+    const cases: readonly (readonly [string, string, RegExp])[] = [
+      ['Authorization: Bearer abc.def-123', 'authorization header', /authorization header/u],
+      [
+        'Bearer abcdefghijklmnop',
+        'bearer token',
+        /bearer token|authorization header/u,
+      ],
+      ['Set-Cookie: sid=abc', 'set-cookie header', /set-cookie header/u],
+      ['cookie: sid=abc', 'cookie header', /cookie header/u],
+      ['ghp_AAAAAAAAAAAAAAAAAAAAAAAAAA', 'GitHub token', /GitHub token/u],
+      ['sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 'OpenAI key', /OpenAI key/u],
+    ];
+    for (const [snippet, label, expected] of cases) {
+      const tainted: SessionPack = {
+        ...pack,
+        mode: { browsers: 1, captureLevel: 'html' },
+        browsers: [
+          {
+            ...browser,
+            snapshots: {
+              'https://example.test/a': {
+                capturedAt: '2026-05-09T12:00:00.000Z',
+                title: 'Example',
+                htmlRedacted: `<body>${snippet}</body>`,
+                redactionCounts: { email: 0 },
+              },
+            },
+          },
+        ],
+      };
+      expect(
+        () => {
+          assertPackPrivacy(tainted);
+        },
+        `expected ${label} to trip the deny-list`,
+      ).toThrow(expected);
+    }
   });
 
   it('writes local-only pack.json under the selected session root', async () => {
