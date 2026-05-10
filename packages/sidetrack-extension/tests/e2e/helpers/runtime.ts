@@ -213,23 +213,36 @@ const attachOverCdp = async (cdpUrl: string): Promise<ExtensionRuntime> => {
             }
             await sleep(intervalMs);
           }
+          const chromeKeys = c === undefined ? [] : Object.keys(c).sort();
+          const runtimeKeys =
+            (c as { runtime?: object }).runtime === undefined
+              ? []
+              : Object.keys((c as { runtime: object }).runtime).sort();
+          const runtimeIdGetter =
+            (c as { runtime?: { id?: string } }).runtime?.id ?? '<undefined>';
           return {
             ok: false,
             url: location.href,
             chromePresent: c !== undefined,
             storagePresent: c?.storage !== undefined,
             localPresent: c?.storage?.local !== undefined,
+            chromeKeys,
+            runtimeKeys,
+            runtimeId: runtimeIdGetter,
           } as const;
         },
         { vals: values, retries: 50, intervalMs: 100 },
       );
       if (diagnostic.ok !== true) {
         throw new Error(
-          `seedStorage: chrome.storage.local.set unavailable after 5s polling. ` +
-            `url=${diagnostic.url} ` +
-            `chromePresent=${String(diagnostic.chromePresent)} ` +
-            `storagePresent=${String(diagnostic.storagePresent)} ` +
-            `localPresent=${String(diagnostic.localPresent)}`,
+          `seedStorage: chrome.storage.local.set unavailable after 5s polling.\n` +
+            `  url=${diagnostic.url}\n` +
+            `  chromePresent=${String(diagnostic.chromePresent)}\n` +
+            `  storagePresent=${String(diagnostic.storagePresent)}\n` +
+            `  localPresent=${String(diagnostic.localPresent)}\n` +
+            `  chrome keys (first 20): ${diagnostic.chromeKeys.slice(0, 20).join(', ')}\n` +
+            `  chrome.runtime keys (first 20): ${diagnostic.runtimeKeys.slice(0, 20).join(', ')}\n` +
+            `  chrome.runtime.id: ${diagnostic.runtimeId}`,
         );
       }
     },
@@ -433,23 +446,36 @@ export const launchExtensionRuntime = async (
             }
             await sleep(intervalMs);
           }
+          const chromeKeys = c === undefined ? [] : Object.keys(c).sort();
+          const runtimeKeys =
+            (c as { runtime?: object }).runtime === undefined
+              ? []
+              : Object.keys((c as { runtime: object }).runtime).sort();
+          const runtimeIdGetter =
+            (c as { runtime?: { id?: string } }).runtime?.id ?? '<undefined>';
           return {
             ok: false,
             url: location.href,
             chromePresent: c !== undefined,
             storagePresent: c?.storage !== undefined,
             localPresent: c?.storage?.local !== undefined,
+            chromeKeys,
+            runtimeKeys,
+            runtimeId: runtimeIdGetter,
           } as const;
         },
         { vals: values, retries: 50, intervalMs: 100 },
       );
       if (diagnostic.ok !== true) {
         throw new Error(
-          `seedStorage: chrome.storage.local.set unavailable after 5s polling. ` +
-            `url=${diagnostic.url} ` +
-            `chromePresent=${String(diagnostic.chromePresent)} ` +
-            `storagePresent=${String(diagnostic.storagePresent)} ` +
-            `localPresent=${String(diagnostic.localPresent)}`,
+          `seedStorage: chrome.storage.local.set unavailable after 5s polling.\n` +
+            `  url=${diagnostic.url}\n` +
+            `  chromePresent=${String(diagnostic.chromePresent)}\n` +
+            `  storagePresent=${String(diagnostic.storagePresent)}\n` +
+            `  localPresent=${String(diagnostic.localPresent)}\n` +
+            `  chrome keys (first 20): ${diagnostic.chromeKeys.slice(0, 20).join(', ')}\n` +
+            `  chrome.runtime keys (first 20): ${diagnostic.runtimeKeys.slice(0, 20).join(', ')}\n` +
+            `  chrome.runtime.id: ${diagnostic.runtimeId}`,
         );
       }
     },
