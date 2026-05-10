@@ -147,6 +147,8 @@ interface CompanionTimelineEntry {
   readonly canonicalUrl?: string;
   readonly title?: string;
   readonly provider?: TimelineProvider;
+  readonly tabSessionId?: string;
+  readonly openerTabSessionId?: string;
   readonly visitCount: number;
 }
 
@@ -375,6 +377,10 @@ const fetchExtended = async (
         ...(entry.canonicalUrl === undefined ? {} : { canonicalUrl: entry.canonicalUrl }),
         ...(entry.title === undefined ? {} : { title: entry.title }),
         ...(entry.provider === undefined ? {} : { provider: entry.provider }),
+        ...(entry.tabSessionId === undefined ? {} : { tabSessionId: entry.tabSessionId }),
+        ...(entry.openerTabSessionId === undefined
+          ? {}
+          : { openerTabSessionId: entry.openerTabSessionId }),
       },
     }));
     return buildScopedResult<ActiveTimelineObservation>(result.scope, items);

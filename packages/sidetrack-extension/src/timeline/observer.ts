@@ -71,15 +71,6 @@ export interface TimelineObserverDeps {
     url: string;
     observedAt: string;
   }) => string;
-  // Phase 4 active-workstream attribution. When the user has a
-  // workstream focused in the side panel, this returns its bac_id
-  // so the observer can stamp it on every emitted event payload;
-  // returns null/undefined when no workstream is focused (the
-  // visit stays unattributed). Synchronous so the emit hot path
-  // doesn't await — the caller is expected to maintain a cached
-  // copy of `chrome.storage.local['sidetrack.activeWorkstreamId']`
-  // and refresh it via `chrome.storage.onChanged`.
-  readonly getActiveWorkstreamId?: () => string | null | undefined;
 }
 
 export interface ObserveInput {
@@ -88,11 +79,15 @@ export interface ObserveInput {
   readonly url: string;
   readonly title?: string;
   readonly transition: TimelineTransition;
+  readonly tabSessionId?: string;
+  readonly openerTabSessionId?: string;
 }
 
 export interface CloseInput {
   readonly tabId: number;
   readonly windowId: number;
+  readonly tabSessionId?: string;
+  readonly openerTabSessionId?: string;
 }
 
 interface TabState {
@@ -102,6 +97,8 @@ interface TabState {
   readonly canonicalUrl?: string;
   readonly provider?: TimelineProvider;
   readonly title?: string;
+  readonly tabSessionId?: string;
+  readonly openerTabSessionId?: string;
   readonly lastEmittedAt: number; // ms epoch
 }
 
@@ -123,7 +120,7 @@ export interface TimelineObserverDiagnostics {
     readonly transition?: TimelineTransition;
     readonly sanitizedUrl?: string;
     readonly canonicalUrl?: string;
-    readonly hasWorkstreamId?: boolean;
+    readonly hasTabSessionId?: boolean;
     readonly urlLength?: number;
   };
 }
@@ -164,18 +161,6 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
   // unbounded). For passive intent + bounded tabs per browser, the
   // table stays small.
   const byTab = new Map<string, TabState>();
-
-  // Resolve the user's currently-focused workstream (Phase 4). Sync
-  // resolution: callers cache the value off `chrome.storage.onChanged`
-  // so the emit hot path doesn't await. Returns `undefined` when no
-  // workstream is focused — the visit then stays unattributed,
-  // exactly the behavior before this hook existed.
-  const resolveWorkstreamId = (): string | undefined => {
-    if (deps.getActiveWorkstreamId === undefined) return undefined;
-    const v = deps.getActiveWorkstreamId();
-    if (typeof v !== 'string' || v.length === 0) return undefined;
-    return v;
-  };
 
   const observe = (input: ObserveInput): void => {
     observeCalls += 1;
@@ -226,7 +211,6 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
       // Coalesce within the window — no emission.
       const elapsed = now.getTime() - existing.lastEmittedAt;
       if (elapsed < coalesceWindowMs) {
-        const workstreamId = resolveWorkstreamId();
         coalescedCalls += 1;
         lastDecision = {
           at: observedAt,
@@ -234,16 +218,26 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
           transition: input.transition,
           sanitizedUrl,
           ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
-          hasWorkstreamId: workstreamId !== undefined,
+          hasTabSessionId: input.tabSessionId !== undefined,
         };
         // Title-only update merges in-memory.
-        if (boundedTitle !== undefined && boundedTitle !== existing.title) {
-          byTab.set(tabIdHash, { ...existing, title: boundedTitle });
+        if (
+          boundedTitle !== undefined ||
+          input.tabSessionId !== existing.tabSessionId ||
+          input.openerTabSessionId !== existing.openerTabSessionId
+        ) {
+          byTab.set(tabIdHash, {
+            ...existing,
+            ...(boundedTitle === undefined ? {} : { title: boundedTitle }),
+            ...(input.tabSessionId === undefined ? {} : { tabSessionId: input.tabSessionId }),
+            ...(input.openerTabSessionId === undefined
+              ? {}
+              : { openerTabSessionId: input.openerTabSessionId }),
+          });
         }
         return;
       }
       // Outside the window — emit a refresh observation as 'updated'.
-      const workstreamId = resolveWorkstreamId();
       const payload: BrowserTimelineObservedPayload = {
         eventId: mintEventId({
           tabIdHash,
@@ -259,7 +253,10 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
         transition: 'updated',
         tabIdHash,
         windowIdHash,
-        ...(workstreamId === undefined ? {} : { workstreamId }),
+        ...(input.tabSessionId === undefined ? {} : { tabSessionId: input.tabSessionId }),
+        ...(input.openerTabSessionId === undefined
+          ? {}
+          : { openerTabSessionId: input.openerTabSessionId }),
       };
       emitCalls += 1;
       lastDecision = {
@@ -268,7 +265,7 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
         transition: 'updated',
         sanitizedUrl,
         ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
-        hasWorkstreamId: workstreamId !== undefined,
+        hasTabSessionId: input.tabSessionId !== undefined,
       };
       deps.emit(payload);
       byTab.set(tabIdHash, {
@@ -278,6 +275,10 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
         ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
         ...(provider === undefined ? {} : { provider }),
         ...(boundedTitle === undefined ? {} : { title: boundedTitle }),
+        ...(input.tabSessionId === undefined ? {} : { tabSessionId: input.tabSessionId }),
+        ...(input.openerTabSessionId === undefined
+          ? {}
+          : { openerTabSessionId: input.openerTabSessionId }),
         lastEmittedAt: now.getTime(),
       });
       return;
@@ -285,7 +286,6 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
 
     // New tab OR navigation to a new canonicalUrl — emit.
     const transition: TimelineTransition = existing === undefined ? input.transition : 'updated';
-    const workstreamId = resolveWorkstreamId();
     const payload: BrowserTimelineObservedPayload = {
       eventId: mintEventId({
         tabIdHash,
@@ -301,7 +301,10 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
       transition,
       tabIdHash,
       windowIdHash,
-      ...(workstreamId === undefined ? {} : { workstreamId }),
+      ...(input.tabSessionId === undefined ? {} : { tabSessionId: input.tabSessionId }),
+      ...(input.openerTabSessionId === undefined
+        ? {}
+        : { openerTabSessionId: input.openerTabSessionId }),
     };
     emitCalls += 1;
     lastDecision = {
@@ -310,7 +313,7 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
       transition,
       sanitizedUrl,
       ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
-      hasWorkstreamId: workstreamId !== undefined,
+      hasTabSessionId: input.tabSessionId !== undefined,
     };
     deps.emit(payload);
     byTab.set(tabIdHash, {
@@ -320,6 +323,10 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
       ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
       ...(provider === undefined ? {} : { provider }),
       ...(boundedTitle === undefined ? {} : { title: boundedTitle }),
+      ...(input.tabSessionId === undefined ? {} : { tabSessionId: input.tabSessionId }),
+      ...(input.openerTabSessionId === undefined
+        ? {}
+        : { openerTabSessionId: input.openerTabSessionId }),
       lastEmittedAt: now.getTime(),
     });
   };
@@ -337,7 +344,8 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
       return;
     }
     const observedAt = deps.clock().toISOString();
-    const workstreamId = resolveWorkstreamId();
+    const tabSessionId = input.tabSessionId ?? existing.tabSessionId;
+    const openerTabSessionId = input.openerTabSessionId ?? existing.openerTabSessionId;
     const payload: BrowserTimelineObservedPayload = {
       eventId: defaultMintEventId({
         tabIdHash,
@@ -353,7 +361,8 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
       transition: 'closed',
       tabIdHash,
       windowIdHash: existing.windowIdHash,
-      ...(workstreamId === undefined ? {} : { workstreamId }),
+      ...(tabSessionId === undefined ? {} : { tabSessionId }),
+      ...(openerTabSessionId === undefined ? {} : { openerTabSessionId }),
     };
     emitCalls += 1;
     lastDecision = {
@@ -362,7 +371,7 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
       transition: 'closed',
       sanitizedUrl: existing.url,
       ...(existing.canonicalUrl === undefined ? {} : { canonicalUrl: existing.canonicalUrl }),
-      hasWorkstreamId: workstreamId !== undefined,
+      hasTabSessionId: tabSessionId !== undefined,
     };
     deps.emit(payload);
     byTab.delete(tabIdHash);

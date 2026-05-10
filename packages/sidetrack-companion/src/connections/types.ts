@@ -24,6 +24,7 @@ export type ConnectionNodeKind =
   | 'inbound-reminder'
   | 'coding-session'
   | 'timeline-visit'
+  | 'tab-session'
   | 'annotation'
   | 'snippet'
   | 'topic'
@@ -105,12 +106,11 @@ export type ConnectionEdgeKind =
   // embedding model.
   | 'closest_visit'
   | 'visit_resembles_visit'
-  // Active-workstream attribution: the timeline observer stamped the
-  // user's currently-focused workstream id onto the visit. Closes
-  // the "ambient browsing" gap — pages the user looked at while
-  // working in a workstream attach to that workstream even when no
-  // chat / dispatch / annotation references them.
+  // Active-workstream attribution: retained for Phase 2 replacement.
+  // Phase 1 stops emitting this from the active pointer.
   | 'visit_in_workstream'
+  | 'visit_in_tab_session'
+  | 'tab_session_opener_chain'
   | 'previous_visit_in_tab_session'
   | 'opener_visit'
   | 'visit_in_topic'

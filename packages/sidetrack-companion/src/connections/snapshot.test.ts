@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { ANNOTATION_CREATED } from '../annotations/events.js';
 import { CONTINUATION_CLASSIFIER_REVISION_ID } from '../continuation/classifier.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../dispatches/events.js';
+import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
 import { NAVIGATION_COMMITTED, type NavigationCommittedPayload } from '../navigation/events.js';
 import { QUEUE_CREATED } from '../queue/events.js';
 import { FEATURE_SCHEMA_VERSION, type CandidatePairFeatures } from '../ranker/feature-schema.js';
@@ -10,6 +11,7 @@ import { CAPTURE_RECORDED } from '../recall/events.js';
 import { SELECTION_COPIED, SELECTION_PASTED } from '../snippets/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { THREAD_UPSERTED } from '../threads/events.js';
+import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import type { TimelineDayProjection } from '../timeline/projection.js';
 import { TOPIC_UNION_FIND_REVISION_KEY, type TopicRevision } from '../producers/topic-revision.js';
 import { VISUAL_FINGERPRINT_OBSERVED } from '../visual/events.js';
@@ -105,11 +107,11 @@ const rankerContributionsFor = (
   score: number,
 ): Readonly<Record<keyof CandidatePairFeatures, number>> => ({
   schemaVersion: 0,
-  same_workstream: score * 0.5,
+  same_workstream: 0,
   opener_chain_depth: 0,
   in_navigation_chain: 0,
   same_canonical_url: 0,
-  same_host: 0,
+  same_host: score * 0.5,
   same_repo: 0,
   same_search_query: 0,
   same_copied_snippet_count: 0,
@@ -123,6 +125,17 @@ const rankerContributionsFor = (
   return_count_to: 0,
   user_asserted_in_thread: 0,
   user_asserted_in_workstream: 0,
+});
+
+const organizedVisitPayload = (input: {
+  readonly visitId: string;
+  readonly toContainer: string;
+}): unknown => ({
+  payloadVersion: 1,
+  itemKind: 'visit',
+  itemId: input.visitId,
+  action: 'move',
+  toContainer: input.toContainer,
 });
 
 describe('connections — snapshot reducer (Given/Then)', () => {
@@ -1105,7 +1118,6 @@ describe('connections — content-derived edges', () => {
         title: `Ranker fixture ${String(index)}`,
         provider: 'generic',
         visitCount: 1,
-        workstreamId: 'ws-ranker',
       })),
       updatedAt: '2026-05-07T09:04:30.000Z',
       entryCount: urls.length,
@@ -1119,6 +1131,22 @@ describe('connections — content-derived edges', () => {
 
     const snap = buildConnectionsSnapshot(
       emptyInput({
+        events: urls.map((url, index) =>
+          buildEvent({
+            seq: index + 1,
+            type: BROWSER_TIMELINE_OBSERVED,
+            payload: {
+              eventId: `tl-ranker-${String(index)}`,
+              observedAt: `2026-05-07T09:${String(index).padStart(2, '0')}:30.000Z`,
+              url,
+              canonicalUrl: url,
+              title: `Ranker fixture ${String(index)}`,
+              provider: 'generic',
+              transition: 'updated',
+              tabSessionId: `tses_ranker_${String(index)}`,
+            },
+          }),
+        ),
         timelineDays: [day],
         closestVisitRanker: {
           revisionId: 'ranker-rev-1',
@@ -1150,7 +1178,7 @@ describe('connections — content-derived edges', () => {
         score: 0.91,
         featureSchemaVersion: FEATURE_SCHEMA_VERSION,
         topContributions: [
-          { feature: 'same_workstream', weight: 0.455 },
+          { feature: 'same_host', weight: 0.455 },
           { feature: 'shared_title_tokens', weight: 0.2275 },
           { feature: 'recency_score_to', weight: -0.1 },
         ],
@@ -1164,11 +1192,7 @@ describe('connections — content-derived edges', () => {
     );
   });
 
-  it('visit_in_workstream fires when the timeline entry carries a workstreamId (active-workstream attribution)', () => {
-    // Active-workstream attribution: the observer stamps
-    // workstreamId on visits when the user has a workstream
-    // focused. Two visits — one with workstreamId, one without.
-    // Only the tagged one emits visit_in_workstream.
+  it('tab-session nodes and visit edges replace active-pointer visit_in_workstream edges', () => {
     const day: TimelineDayProjection = {
       date: '2026-05-07',
       entries: [
@@ -1180,6 +1204,8 @@ describe('connections — content-derived edges', () => {
           canonicalUrl: 'https://copy.fail/',
           visitCount: 1,
           workstreamId: 'ws_security',
+          tabSessionId: 'tses_child',
+          openerTabSessionId: 'tses_parent',
         },
         {
           id: 'https://www.youtube.com/watch?v=rY44ViY45q8',
@@ -1188,37 +1214,43 @@ describe('connections — content-derived edges', () => {
           url: 'https://www.youtube.com/watch?v=rY44ViY45q8',
           canonicalUrl: 'https://www.youtube.com/watch?v=rY44ViY45q8',
           visitCount: 1,
-          // intentionally no workstreamId — stays orphan
+          tabSessionId: 'tses_child',
         },
       ],
       updatedAt: '2026-05-07T10:30:00.000Z',
       entryCount: 2,
     };
     const snap = buildConnectionsSnapshot(emptyInput({ timelineDays: [day] }));
-    const visitEdges = snap.edges.filter((e) => e.kind === 'visit_in_workstream');
-    expect(visitEdges.length).toBe(1);
-    expect(visitEdges[0]?.fromNodeId).toBe(nodeIdFor('timeline-visit', 'https://copy.fail'));
-    expect(visitEdges[0]?.toNodeId).toBe(nodeIdFor('workstream', 'ws_security'));
-    expect(visitEdges[0]?.confidence).toBe('inferred');
-    expect(visitEdges[0]?.producedBy.source).toBe('timeline-projection');
-    // The visit-node metadata also carries the workstreamId.
+    expect(snap.edges.some((e) => e.kind === 'visit_in_workstream')).toBe(false);
+    expect(snap.nodes.some((n) => n.id === nodeIdFor('tab-session', 'tses_child'))).toBe(true);
+    expect(snap.nodes.some((n) => n.id === nodeIdFor('tab-session', 'tses_parent'))).toBe(true);
+    const visitEdges = snap.edges.filter((e) => e.kind === 'visit_in_tab_session');
+    expect(visitEdges.length).toBe(2);
+    expect(
+      visitEdges.some(
+        (edge) =>
+          edge.fromNodeId === nodeIdFor('timeline-visit', 'https://copy.fail') &&
+          edge.toNodeId === nodeIdFor('tab-session', 'tses_child') &&
+          edge.confidence === 'observed' &&
+          edge.producedBy.source === 'timeline-projection',
+      ),
+    ).toBe(true);
+    expect(
+      snap.edges.some(
+        (edge) =>
+          edge.kind === 'tab_session_opener_chain' &&
+          edge.fromNodeId === nodeIdFor('tab-session', 'tses_child') &&
+          edge.toNodeId === nodeIdFor('tab-session', 'tses_parent'),
+      ),
+    ).toBe(true);
     const taggedVisit = snap.nodes.find(
       (n) => n.id === nodeIdFor('timeline-visit', 'https://copy.fail'),
     );
-    expect(taggedVisit?.metadata['workstreamId']).toBe('ws_security');
-    // The untagged visit has no metadata.workstreamId.
-    const orphanVisit = snap.nodes.find(
-      (n) => n.id === nodeIdFor('timeline-visit', 'https://www.youtube.com/watch?v=rY44ViY45q8'),
-    );
-    expect(orphanVisit?.metadata['workstreamId']).toBeUndefined();
+    expect(taggedVisit?.metadata['tabSessionId']).toBe('tses_child');
+    expect(taggedVisit?.metadata['workstreamId']).toBeUndefined();
   });
 
-  it('visit_in_workstream subgraph: anchored on workstream reaches every tagged ambient visit', () => {
-    // The acceptance-criteria scenario: visits to copy.fail/ and
-    // YouTube (ambient — no chat / dispatch / annotation references
-    // them) attach to the workstream when the active-workstream
-    // observer tagged them. Anchoring on the workstream reaches
-    // both via 1-hop visit_in_workstream edges.
+  it('visit_in_tab_session subgraph: anchored on tab-session reaches every session visit', () => {
     const day: TimelineDayProjection = {
       date: '2026-05-07',
       entries: [
@@ -1229,7 +1261,7 @@ describe('connections — content-derived edges', () => {
           url: 'https://copy.fail/',
           canonicalUrl: 'https://copy.fail/',
           visitCount: 1,
-          workstreamId: 'ws_security',
+          tabSessionId: 'tses_security_research',
         },
         {
           id: 'https://www.youtube.com/watch?v=rY44ViY45q8',
@@ -1238,14 +1270,14 @@ describe('connections — content-derived edges', () => {
           url: 'https://www.youtube.com/watch?v=rY44ViY45q8',
           canonicalUrl: 'https://www.youtube.com/watch?v=rY44ViY45q8',
           visitCount: 1,
-          workstreamId: 'ws_security',
+          tabSessionId: 'tses_security_research',
         },
       ],
       updatedAt: '2026-05-07T10:35:00.000Z',
       entryCount: 2,
     };
     const snap = buildConnectionsSnapshot(emptyInput({ timelineDays: [day] }));
-    const sub = subgraphForNode(snap, nodeIdFor('workstream', 'ws_security'), 1);
+    const sub = subgraphForNode(snap, nodeIdFor('tab-session', 'tses_security_research'), 1);
     const ids = new Set(sub.nodes.map((n) => n.id));
     expect(ids.has(nodeIdFor('timeline-visit', 'https://copy.fail'))).toBe(true);
     expect(
@@ -1299,7 +1331,6 @@ describe('connections — content-derived edges', () => {
           canonicalUrl: 'https://topic.test/a',
           title: 'Topic A',
           visitCount: 1,
-          workstreamId: 'ws_topic',
         },
         {
           id: 'https://topic.test/b',
@@ -1309,7 +1340,6 @@ describe('connections — content-derived edges', () => {
           canonicalUrl: 'https://topic.test/b',
           title: 'Topic B',
           visitCount: 1,
-          workstreamId: 'ws_topic',
         },
         {
           id: 'https://topic.test/c',
@@ -1319,7 +1349,6 @@ describe('connections — content-derived edges', () => {
           canonicalUrl: 'https://topic.test/c',
           title: 'Topic C',
           visitCount: 1,
-          workstreamId: 'ws_topic',
         },
         {
           id: 'https://topic.test/d',
@@ -1329,14 +1358,19 @@ describe('connections — content-derived edges', () => {
           canonicalUrl: 'https://topic.test/d',
           title: 'Topic D',
           visitCount: 1,
-          workstreamId: 'ws_other',
         },
       ],
       updatedAt: '2026-05-07T10:30:00.000Z',
       entryCount: 4,
     };
 
-    const snap = buildConnectionsSnapshot(emptyInput({ timelineDays: [day], topicRevision }));
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        timelineDays: [day],
+        topicRevision,
+        topicWorkstreamShareThreshold: 0,
+      }),
+    );
     const topicNodeId = nodeIdFor('topic', 'topic:abc123');
     const topicNode = snap.nodes.find((node) => node.id === topicNodeId);
 
@@ -1713,7 +1747,6 @@ describe('connections — determinism + cross-replica', () => {
           title: 'Shared research',
           provider: 'generic',
           visitCount: 2,
-          workstreamId: 'ws-research',
         },
       ],
     };
@@ -1754,6 +1787,22 @@ describe('connections — determinism + cross-replica', () => {
             seq: 4,
             type: SELECTION_COPIED,
             payload: { ...copied, visitId: continuedVisitId },
+          }),
+          buildEvent({
+            seq: 5,
+            type: USER_ORGANIZED_ITEM,
+            payload: organizedVisitPayload({
+              visitId: sourceVisitId,
+              toContainer: 'workstream:ws-research',
+            }),
+          }),
+          buildEvent({
+            seq: 6,
+            type: USER_ORGANIZED_ITEM,
+            payload: organizedVisitPayload({
+              visitId: continuedVisitId,
+              toContainer: 'workstream:ws-research',
+            }),
           }),
         ],
       }),

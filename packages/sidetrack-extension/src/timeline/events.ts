@@ -21,10 +21,11 @@ export interface BrowserTimelineObservedPayload {
   readonly transition: TimelineTransition;
   readonly tabIdHash?: string;
   readonly windowIdHash?: string;
-  // Phase 4 — Active-workstream attribution. Set by the observer
-  // when the user has a workstream focused in the side panel at
-  // observation time. Companion-side TimelineEntry + connections-
-  // graph carry this through and emit `visit_in_workstream`.
+  readonly tabSessionId?: string;
+  readonly openerTabSessionId?: string;
+  // Legacy optional field accepted for older spool entries only. New
+  // observations are keyed by tabSessionId and do not stamp the active
+  // workstream pointer.
   readonly workstreamId?: string;
   readonly payloadVersion?: number;
   readonly dimensions?: Record<string, unknown>;

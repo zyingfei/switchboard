@@ -1,5 +1,7 @@
 import { canonicalThreadUrl, detectProviderFromUrl } from '../capture/providerDetection';
 import { loadOrCreateEdgeReplica, type EdgeReplica } from '../sync/edgeReplicaId';
+import { createTabSessionBoundary, type TabSessionBoundary } from '../tabsession/boundary';
+import { createChromeTabSessionStorage } from '../tabsession/storage';
 import {
   createDefaultTimelineDrainHook,
   createDefaultTimelineFetchHook,
@@ -98,17 +100,27 @@ let successfulInitializeCalls = 0;
 let activeWorkstreamCacheRefreshes = 0;
 let storageChangeListenerAttached = false;
 let onActivatedListenerCount = 0;
+let onCreatedListenerCount = 0;
 let onUpdatedListenerCount = 0;
 let onRemovedListenerCount = 0;
+let onWindowRemovedListenerCount = 0;
 let alarmListenerCount = 0;
 let onActivatedCalls = 0;
+let onCreatedCalls = 0;
 let onUpdatedCalls = 0;
 let onRemovedCalls = 0;
+let onWindowRemovedCalls = 0;
 let onUpdatedSequence = 0;
 let observerObserveCalls = 0;
 let observerCloseCalls = 0;
 let triggerDrainCalls = 0;
-type TimelineGateBoundary = 'init' | 'onActivated' | 'onUpdated' | 'onRemoved';
+type TimelineGateBoundary =
+  | 'init'
+  | 'onActivated'
+  | 'onCreated'
+  | 'onUpdated'
+  | 'onRemoved'
+  | 'onWindowRemoved';
 interface TimelineGateReadDiagnostic {
   readonly at: string;
   readonly boundary: TimelineGateBoundary;
@@ -132,7 +144,7 @@ interface TimelineObserveRequestDiagnostic {
   readonly source: 'onActivated' | 'onUpdated' | 'onRemoved';
   readonly transition?: BrowserTimelineObservedPayload['transition'];
   readonly url?: string;
-  readonly activeWorkstreamId?: string;
+  readonly tabSessionId?: string;
 }
 
 interface TimelineDrainTriggerDiagnostic {
@@ -153,15 +165,19 @@ export interface TimelineWiringDiagnostics {
   readonly successfulInitializeCalls: number;
   readonly listeners: {
     readonly storageChangeAttached: boolean;
+    readonly onCreated: number;
     readonly onActivated: number;
     readonly onUpdated: number;
     readonly onRemoved: number;
+    readonly onWindowRemoved: number;
     readonly alarm: number;
   };
   readonly listenerCalls: {
+    readonly onCreated: number;
     readonly onActivated: number;
     readonly onUpdated: number;
     readonly onRemoved: number;
+    readonly onWindowRemoved: number;
   };
   readonly observerBridgeCalls: {
     readonly observe: number;
@@ -281,8 +297,16 @@ const startActiveWorkstreamCache = async (): Promise<void> => {
   storageChangeListenerAttached = true;
 };
 
-const buildObserver = (replica: EdgeReplica): TimelineObserver => {
-  const salt = replica.edgeReplicaId;
+const hashTabIdForReplica = (replica: EdgeReplica, tabId: number, windowId: number): string =>
+  fnv1a64(`${replica.edgeReplicaId}|tab|${String(tabId)}|${String(windowId)}`).slice(0, 16);
+
+const hashWindowIdForReplica = (replica: EdgeReplica, windowId: number): string =>
+  fnv1a64(`${replica.edgeReplicaId}|win|${String(windowId)}`).slice(0, 16);
+
+const buildObserver = (input: {
+  readonly hashTabId: (tabId: number, windowId: number) => string;
+  readonly hashWindowId: (windowId: number) => string;
+}): TimelineObserver => {
   return createTimelineObserver({
     clock: () => new Date(),
     emit: (payload) => {
@@ -292,10 +316,8 @@ const buildObserver = (replica: EdgeReplica): TimelineObserver => {
         .admitLocal(observationFromPayload(payload), 'passive')
         .catch(() => undefined);
     },
-    getActiveWorkstreamId: () => cachedActiveWorkstreamId,
-    hashTabId: (tabId, windowId) =>
-      fnv1a64(`${salt}|tab|${String(tabId)}|${String(windowId)}`).slice(0, 16),
-    hashWindowId: (windowId) => fnv1a64(`${salt}|win|${String(windowId)}`).slice(0, 16),
+    hashTabId: input.hashTabId,
+    hashWindowId: input.hashWindowId,
     canonicalize: (url) => {
       try {
         return canonicalThreadUrl(url);
@@ -416,7 +438,31 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
   await startActiveWorkstreamCache();
 
   const replica = await loadOrCreateEdgeReplica();
-  const observer = buildObserver(replica);
+  const hashTabId = (tabId: number, windowId: number): string =>
+    hashTabIdForReplica(replica, tabId, windowId);
+  const hashWindowId = (windowId: number): string => hashWindowIdForReplica(replica, windowId);
+  const tabSessions: TabSessionBoundary = createTabSessionBoundary({
+    storage: createChromeTabSessionStorage(),
+  });
+  const observer = buildObserver({ hashTabId, hashWindowId });
+
+  chrome.tabs.onCreated.addListener((tab) => {
+    onCreatedCalls += 1;
+    void (async () => {
+      const gateOpen = await readTimelineGateState();
+      recordGateRead('onCreated', gateOpen);
+      if (!gateOpen) return;
+      if (typeof tab.id !== 'number' || typeof tab.windowId !== 'number') return;
+      await tabSessions.recordTabCreated({
+        tabIdHash: hashTabId(tab.id, tab.windowId),
+        windowIdHash: hashWindowId(tab.windowId),
+        ...(typeof tab.openerTabId === 'number'
+          ? { openerTabIdHash: hashTabId(tab.openerTabId, tab.windowId) }
+          : {}),
+      });
+    })().catch(() => undefined);
+  });
+  onCreatedListenerCount += 1;
 
   // chrome.tabs.onActivated → observer.observe with the active tab's
   // current URL. We have to re-fetch the tab because onActivated
@@ -430,15 +476,18 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
         if (!gateOpen) return;
         const tab = await chrome.tabs.get(info.tabId);
         if (typeof tab.url !== 'string' || tab.url.length === 0) return;
+        const tabSession = await tabSessions.recordActivity({
+          tabIdHash: hashTabId(info.tabId, info.windowId),
+          windowIdHash: hashWindowId(info.windowId),
+          url: tab.url,
+        });
         observerObserveCalls += 1;
         lastObserveRequest = {
           at: new Date().toISOString(),
           source: 'onActivated',
           transition: 'activated',
           url: tab.url,
-          ...(cachedActiveWorkstreamId === undefined
-            ? {}
-            : { activeWorkstreamId: cachedActiveWorkstreamId }),
+          tabSessionId: tabSession.tabSessionId,
         };
         observer.observe({
           tabId: info.tabId,
@@ -446,6 +495,10 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
           url: tab.url,
           ...(typeof tab.title === 'string' ? { title: tab.title } : {}),
           transition: 'activated',
+          tabSessionId: tabSession.tabSessionId,
+          ...(tabSession.openerTabSessionId === undefined
+            ? {}
+            : { openerTabSessionId: tabSession.openerTabSessionId }),
         });
       } catch {
         // Tab might be gone by the time we look up — silent.
@@ -490,15 +543,18 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
         updateLastOnUpdated(sequence, { skippedReason: 'missing-window-id' });
         return;
       }
+      const tabSession = await tabSessions.recordActivity({
+        tabIdHash: hashTabId(tabId, tab.windowId),
+        windowIdHash: hashWindowId(tab.windowId),
+        url,
+      });
       observerObserveCalls += 1;
       lastObserveRequest = {
         at: new Date().toISOString(),
         source: 'onUpdated',
         transition: changeInfo.status === 'complete' ? 'completed' : 'updated',
         url,
-        ...(cachedActiveWorkstreamId === undefined
-          ? {}
-          : { activeWorkstreamId: cachedActiveWorkstreamId }),
+        tabSessionId: tabSession.tabSessionId,
       };
       observer.observe({
         tabId,
@@ -506,6 +562,10 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
         url,
         ...(typeof tab.title === 'string' ? { title: tab.title } : {}),
         transition: changeInfo.status === 'complete' ? 'completed' : 'updated',
+        tabSessionId: tabSession.tabSessionId,
+        ...(tabSession.openerTabSessionId === undefined
+          ? {}
+          : { openerTabSessionId: tabSession.openerTabSessionId }),
       });
     })();
   });
@@ -523,14 +583,31 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
       lastObserveRequest = {
         at: new Date().toISOString(),
         source: 'onRemoved',
-        ...(cachedActiveWorkstreamId === undefined
-          ? {}
-          : { activeWorkstreamId: cachedActiveWorkstreamId }),
       };
       observer.close({ tabId, windowId: removeInfo.windowId });
+      await tabSessions.hardStopTab(hashTabId(tabId, removeInfo.windowId));
     })();
   });
   onRemovedListenerCount += 1;
+
+  chrome.windows.onRemoved.addListener((windowId) => {
+    onWindowRemovedCalls += 1;
+    void (async () => {
+      const gateOpen = await readTimelineGateState();
+      recordGateRead('onWindowRemoved', gateOpen);
+      if (!gateOpen) return;
+      await tabSessions.hardStopWindow(hashWindowId(windowId));
+    })().catch(() => undefined);
+  });
+  onWindowRemovedListenerCount += 1;
+
+  chrome.idle.onStateChanged.addListener((state) => {
+    if (state === 'idle' || state === 'locked') {
+      void tabSessions.markIdle().catch(() => undefined);
+      return;
+    }
+    void tabSessions.markActive().catch(() => undefined);
+  });
 
   // Periodic drain via chrome.alarms (1-minute cadence; same minimum
   // MV3 floor as the dispatch poll alarm).
@@ -543,7 +620,10 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
   }
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name !== DRAIN_ALARM) return;
-    void tryDrain(deps).catch(() => undefined);
+    void (async () => {
+      await tabSessions.sweepIdle();
+      await tryDrain(deps);
+    })().catch(() => undefined);
   });
   alarmListenerCount += 1;
 
@@ -560,15 +640,19 @@ export const readTimelineReplayDiagnostics = async (): Promise<TimelineReplayDia
     successfulInitializeCalls,
     listeners: {
       storageChangeAttached: storageChangeListenerAttached,
+      onCreated: onCreatedListenerCount,
       onActivated: onActivatedListenerCount,
       onUpdated: onUpdatedListenerCount,
       onRemoved: onRemovedListenerCount,
+      onWindowRemoved: onWindowRemovedListenerCount,
       alarm: alarmListenerCount,
     },
     listenerCalls: {
+      onCreated: onCreatedCalls,
       onActivated: onActivatedCalls,
       onUpdated: onUpdatedCalls,
       onRemoved: onRemovedCalls,
+      onWindowRemoved: onWindowRemovedCalls,
     },
     observerBridgeCalls: {
       observe: observerObserveCalls,

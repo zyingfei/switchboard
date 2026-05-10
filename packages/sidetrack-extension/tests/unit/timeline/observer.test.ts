@@ -47,6 +47,23 @@ describe('TimelineObserver — coalesce + debounce', () => {
     expect(emitted[0]?.transition).toBe('activated');
     expect(emitted[0]?.tabIdHash).toBe('tab_1_1');
     expect(emitted[0]?.canonicalUrl).toBe('https://x/a');
+    expect(emitted[0]?.workstreamId).toBeUndefined();
+  });
+
+  it('emits tabSessionId and openerTabSessionId when supplied by wiring', () => {
+    const { emitted, observer } = setup();
+    observer.observe({
+      tabId: 1,
+      windowId: 1,
+      url: 'https://x/a',
+      transition: 'activated',
+      tabSessionId: 'tses_child',
+      openerTabSessionId: 'tses_parent',
+    });
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]?.tabSessionId).toBe('tses_child');
+    expect(emitted[0]?.openerTabSessionId).toBe('tses_parent');
+    expect(emitted[0]?.workstreamId).toBeUndefined();
   });
 
   it('same (tabIdHash, canonicalUrl) within window does NOT emit', () => {

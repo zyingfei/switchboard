@@ -1,0 +1,253 @@
+# Tab-Session Attribution v1 — Phased Delivery
+
+This document is the load-bearing contract between Claude (lead) and the worker (Codex) for the five-PR delivery of Tab-Session Attribution v1. Each phase is an independent PR. The PRD this implements is the steady-kindling-kay plan; the per-PR phases below are the *implementation surgery* that maps the PRD onto the existing Sync Contract.
+
+## Architectural ground rules (read first, every phase)
+
+These rules apply to every phase. The reviewer's blockers — they exist because v0 of the plan would have built parallel infrastructure that fights existing code.
+
+1. **No parallel event-log architecture.** The PRD's "ObservedEvents / UserAssertions / InferredOpinions" split is *semantic*, not physical. Map onto the existing Sync Contract:
+   - Observed facts → existing **Class F** browser/navigation/timeline events; **Class B** projections.
+   - User assertions → existing **Class A** `user.organized.item` and friends in `packages/sidetrack-companion/src/feedback/`.
+   - Inferred opinions → **Class E** revision artifacts + local audit; **not** canonical synced facts.
+2. **Reuse `user.organized.item` for tab-session attribution.** Extend `UserOrganizedItemKind` with `'tab-session'` (and later `'tab-group-link'`). Do **not** create a new `TabAttributedToWorkstream` event family — it would bypass the existing feedback projection and ranker retraining.
+3. **Tab-session ID enters via `browser.timeline.observed`.** Add `tabSessionId?: string` to `BrowserTimelineObservedPayload`. Do **not** add a new observation bus.
+4. **Stop using `activeWorkstreamId` as visit attribution truth.** It is a *default for new captures/dispatches*, not the answer to "which workstream does this tab belong to."
+5. **No new HTTP endpoints, schemas, or routes outside what each phase explicitly authorizes.** Specifically: no `/v1/observed/events` or `/v1/asserted/events` — those are PRD vocabulary, not implementation.
+6. **MV3 service-worker dormancy: use the existing 1-minute drain alarm.** Do not add a 30-second alarm or per-tab keepalive ports unless replay diagnostics prove missed boundary events. The existing buffer + drain pattern in `packages/sidetrack-extension/src/timeline/wiring.ts` already handles the realistic case.
+7. **HDBSCAN is optional.** Cluster evidence is consumed if `topic_in_workstream` exists in the Connections snapshot; otherwise the resolver runs without it. Do not add `hdbscan-ts` as a critical-path dependency.
+8. **Tab groups are Phase 5, not bundled into earlier phases.** Auto-apply / Inbox / resolver must work without tab groups.
+9. **T1/L5 replay rebuild mode.** For evaluation, packs must be re-runnable to materialize tab-session attribution from observations + assertions; production upgrades remain "fresh state on upgrade" (no backfill of historical active-pointer attributions).
+
+---
+
+## Phase 1 — Tab-session identity through `browser.timeline.observed`
+
+**Branch:** `feat/tab-session-attribution-phase-1` (already created off main).
+
+**Goal.** Establish `tabSessionId` as a first-class field on the existing observation event, add a tab-session boundary state machine in the extension, persist `tabSessionId` through the timeline projection, and stop writing `workstreamId` at observation time. After this phase, the Connections graph stops emitting `visit_in_workstream` from the active-pointer stamp; it emits nothing yet — Phase 2 wires the tab-session attribution.
+
+**Worker prompt.**
+
+> Implement Phase 1 of `docs/tab-session-attribution/PHASES.md` on branch `feat/tab-session-attribution-phase-1`. Read the architectural ground rules; do not deviate. Keep this PR small.
+>
+> 1. **Companion (`packages/sidetrack-companion/`):**
+>    - Add `tabSessionId?: string` to `BrowserTimelineObservedPayload` in `src/timeline/events.ts` (payload version stays the same; this is an additive optional field — Sync Contract v1 backwards-compatible).
+>    - Thread `tabSessionId` into `TimelineEntry` via `src/timeline/projection.ts`. Last-write-wins semantics; existing entries without `tabSessionId` stay unattributed.
+>    - In `src/connections/snapshot.ts`: add new node kind `tab-session` (`{ kind: 'tab-session', key: tabSessionId, label: ... }`) and new edge kinds `visit_in_tab_session` (timeline-visit → tab-session) and `tab_session_opener_chain` (child tab-session → parent tab-session, when an opener is recorded). Emit them from the timeline projection. **Do not** emit `tab_session_in_workstream` or `visit_in_workstream` from these — Phase 2 owns that wiring.
+>    - In Pass 3 of `snapshot.ts`: stop reading `entry.workstreamId` for the `visit_in_workstream` edge. Comment the old code out with a `// PHASE 2:` marker rather than deleting (Phase 2 will replace it). **No new `visit_in_workstream` edges should be emitted in this phase.**
+> 2. **Extension (`packages/sidetrack-extension/`):**
+>    - Create `src/tabsession/idMint.ts` minting `tses_<crockford32-ulid>`. Extract the ULID encoder from `tests/e2e/helpers/recordReplay.ts:createSessionId` into a shared helper if straightforward; otherwise inline the same algorithm.
+>    - Create `src/tabsession/storage.ts` with chrome.storage.local helpers for a `byTabIdHash` map: `{ tabSessionId, openedAt, lastActivityAt, idleSince? }`. Survives SW restarts.
+>    - Create `src/tabsession/boundary.ts` with the v1 boundary state machine: hard stops on `chrome.tabs.onRemoved`, `chrome.windows.onRemoved`, explicit move gesture (callable from Phase 3), and provider-thread-id change in known AI hosts. Soft close on `idle ≥ 15min AND embedding-drift ≥ 0.4` — at this phase the embedding-drift dependency is **not yet wired**, so document and gate that branch behind a feature flag (default off). Idle uses `chrome.idle.onStateChanged` and the existing 1-minute drain alarm — **no new 30-second alarm**.
+>    - Modify `src/timeline/wiring.ts`:
+>      - Stop reading `cachedActiveWorkstreamId` for stamping observations. The observer must NOT include `workstreamId` in `browser.timeline.observed` payloads it emits.
+>      - Resolve the active `tabSessionId` from the boundary state machine on every observation; include it in the payload.
+>      - On `chrome.tabs.onRemoved` / `onCreated` / `onActivated`: invoke the boundary state machine.
+> 3. **Sync Contract registry (`src/sync/contract/registry.ts`):** No new event types in this phase. Confirm `browser.timeline.observed` remains Class F.
+> 4. **Tests:**
+>    - Unit test `boundary.ts` deterministically: cover hard stops, idle progression, session reopen on activity within idle window.
+>    - Unit test `projection.ts` to assert `tabSessionId` threads correctly into `TimelineEntry`.
+>    - Snapshot test `snapshot.ts`: confirm new node/edge kinds appear and `visit_in_workstream` no longer appears for active-pointer-only attribution. (Use a synthetic `EventLog` fixture.)
+>    - Re-run T1 manual replay if available locally; expected behavior is **no `visit_in_workstream` edges in the rebuilt graph** (visits are unattributed). This is the intended regression — Phase 2 restores edges from a different source.
+> 5. **Type & test gates:** `npx tsc --noEmit -p tsconfig.json` clean across both packages; `npm run test` (companion + extension) green.
+> 6. **Commit message:** `feat(tabsession): phase 1 — tabSessionId on browser.timeline.observed + boundary state machine` with the standard `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>` trailer.
+> 7. Push the branch and announce `READY` in the PR description.
+
+**Acceptance criteria (lead must verify before merging).**
+
+- All new observed visits carry `tabSessionId` in their payload; no observation includes `workstreamId`.
+- `Connections` snapshot rebuilds emit zero `visit_in_workstream` edges sourced from the active-pointer stamp.
+- `tab-session` node + `visit_in_tab_session` + `tab_session_opener_chain` edges appear in the rebuilt graph.
+- `npx tsc --noEmit` and `npm run test` clean.
+- T1 replay shows visits as unattributed (the intended regression). Document the diff vs baseline in the PR description.
+- No `tabGroups` permission, no new HTTP routes, no new event types.
+
+---
+
+## Phase 2 — User assertions via `user.organized.item` + tab-session projection
+
+**Branch:** `feat/tab-session-attribution-phase-2` (created from `main` after Phase 1 lands).
+
+**Goal.** Wire user-explicit attribution. Extend the existing Class A `user.organized.item` event family with a new `itemKind: 'tab-session'`. Build the tab-session projection that joins Class F observations + Class A assertions. Add the three HTTP helpers. Connections snapshot now emits `tab_session_in_workstream` and `visit_in_workstream` derived through the tab-session projection.
+
+**Worker prompt.**
+
+> Implement Phase 2 of `docs/tab-session-attribution/PHASES.md` on branch `feat/tab-session-attribution-phase-2`. Phase 1 is on main. Read ground rules.
+>
+> 1. **Extend `user.organized.item` (Class A).**
+>    - In `packages/sidetrack-companion/src/feedback/events.ts` (or wherever the union type lives): add `'tab-session'` and `'tab-group-link'` to `UserOrganizedItemKind`. The latter is reserved for Phase 5; payload validation accepts it but no consumer yet.
+>    - Action vocabulary stays the existing one (`'move' | 'reject' | 'split' | 'merge' | ...`). For tab-session attribution: `move` carries `{ fromWorkstreamId, toWorkstreamId | null }`. `null` toWorkstreamId encodes "dismiss to inbox."
+> 2. **Tab-session projection.**
+>    - Create `packages/sidetrack-companion/src/tabsession/projection.ts` (folder is new). Pure fold over the existing event log; consumes `browser.timeline.observed` (Class F) for `(tabSessionId, openedAt, openerTabSessionId)` and `user.organized.item` with `itemKind: 'tab-session'` (Class A) for current attribution.
+>    - Output type: `TabSessionProjection { bySessionId: Map<...>, openSessionsByTabId: Map<...> }`. Each `TabSessionRecord` carries `currentAttribution?: { workstreamId | null, source: 'user_asserted', observedAt, clientEventId }` plus an append-only `attributionHistory`. Class A is the only allowed source in this phase; inferred attribution is Phase 4.
+>    - Reducer rule: latest `user.organized.item` for that `tabSessionId` wins. No multi-class precedence yet.
+>    - `projection.test.ts` covers determinism under shuffled events, idempotent re-runs, frozen-on-close behavior.
+> 3. **HTTP endpoints.**
+>    - Extend `packages/sidetrack-companion/src/http/server.ts`:
+>      - `GET /v1/tabsessions/projection` → returns the projection.
+>      - `GET /v1/tabsessions/inbox?limit&offset` → derived view of sessions where `currentAttribution` is null or absent. Sort by recency. No EVOI ranking yet (Phase 3 stub).
+>      - `POST /v1/tabsessions/{tabSessionId}/attribute` → convenience wrapper that emits `user.organized.item` with `itemKind: 'tab-session'`, `action: 'move'`, body `{ workstreamId: string | null }`. Reuses the existing `requireIdempotencyKey` + `runIdempotent` + `appendClient` pattern from privacy projection.
+>    - Mirror the privacy projection's response shape: `{ accepted, projection }` for POST.
+> 4. **Connections snapshot integration.**
+>    - In `packages/sidetrack-companion/src/connections/snapshot.ts`: extend `ConnectionsInput` with `tabSessionProjection: TabSessionProjection`.
+>    - In Pass 3 (the `// PHASE 2:` marker from Phase 1): replace the disabled active-pointer-stamp read with a tab-session-projection read. For each timeline entry with a `tabSessionId`, look up the session's `currentAttribution`. If present and `workstreamId !== null`, emit a `visit_in_workstream` edge. Add a new `tab_session_in_workstream` edge from the tab-session node to the workstream node (one per session with attribution).
+>    - Edge metadata records `attributionSource: 'user_asserted'` (this is the only source in Phase 2).
+> 5. **Side panel (`packages/sidetrack-extension/entrypoints/sidepanel/App.tsx`):**
+>    - Update the existing thread drag-to-pill handler to include tab-session drag-to-pill (when a tab-session card is dragged onto a workstream pill, POST `/v1/tabsessions/{id}/attribute`). Light wiring only — full Inbox UI is Phase 3.
+>    - **Do not** introduce the Inbox tab yet (Phase 3).
+> 6. **Tests.**
+>    - Unit tests for the projection.
+>    - Integration test posting `user.organized.item` with `itemKind: 'tab-session'` and asserting the projection updates.
+>    - Snapshot test confirming `tab_session_in_workstream` and `visit_in_workstream` edges materialize from a tab-session attribution.
+> 7. **Type & test gates** + commit message `feat(tabsession): phase 2 — user.organized.item itemKind='tab-session' + projection` with co-author trailer.
+
+**Acceptance criteria.**
+
+- `user.organized.item` with `itemKind: 'tab-session'` validates, persists, and rebuilds the projection deterministically.
+- POST `/v1/tabsessions/{id}/attribute` updates the projection within the same request cycle.
+- Connections graph shows `visit_in_workstream` edges *only* for tabs that have a Class A attribution; visits without one stay unattributed (no fallback to active pointer).
+- Drag-to-pill of a tab-session card emits the assertion and the graph updates within the snapshot rebuild + 30s cache.
+- T1 replay against a fixture pack with a synthetic Class A attribution shows the expected `visit_in_workstream` edges.
+
+---
+
+## Phase 3 — Inbox / manual attribution UX
+
+**Branch:** `feat/tab-session-attribution-phase-3`.
+
+**Goal.** Make the Inbox the cold-start product surface. Binary yes/no decisions, AttributionBadge, provenance shell (no resolver yet, so provenance is "user-asserted" or "no attribution"), workstream pill copy clarifying intent vs focused-tab attribution. Hard cap at 50 cards/session.
+
+**Worker prompt.**
+
+> Implement Phase 3 of `docs/tab-session-attribution/PHASES.md` on branch `feat/tab-session-attribution-phase-3`.
+>
+> 1. **Inbox view (`packages/sidetrack-extension/src/sidepanel/tabsession/`):**
+>    - `InboxView.tsx`: new top-level tab in the side panel labelled `Inbox (N)`. Reads `/v1/tabsessions/inbox`.
+>    - `InboxCard.tsx`: per-card UI per the PRD. At this phase no resolver exists, so the card just shows favicon, title, host, "Move to" workstream picker, "Not in any workstream" (dismiss → POST attribute with `workstreamId: null`), and "Different…" picker.
+>    - 50-card hard cap per panel-open; "Take a break — review more later." sentinel.
+>    - `inboxPriority.ts`: stub. Sort by recency; mark TODO for Phase 4 EVOI integration.
+> 2. **Per-tab attribution badge (`AttributionBadge.tsx`):**
+>    - Solid pill (workstream color) for `user_asserted` non-null.
+>    - Grey "?" pill for null/missing attribution (Inbox state).
+>    - No outlined-pill variant yet — it activates in Phase 4 when inferred attribution exists.
+> 3. **Provenance overlay (`AttributionProvenance.tsx`):**
+>    - Shell only. For `user_asserted` show "Attributed by you on {date}." For null show empty state.
+> 4. **Pill strip semantics (`entrypoints/sidepanel/App.tsx`):**
+>    - The existing pill strip click already sets the intent pointer (via `setCurrentWs` → `chrome.storage.local['sidetrack.activeWorkstreamId']`). Add a small inline cue near the URL bar: `Tab is in: <pill>` showing the *focused* tab's tab-session attribution. If different from the active pointer, both are shown to close the cognitive gap.
+>    - No new event types here.
+> 5. **Per-workstream tab-session list:**
+>    - Inside any workstream view, add a "Tabs in this workstream (N)" section listing currently-open tab sessions with attribution to that workstream. Drag a card to a different pill triggers explicit re-attribution (reuses Phase 2's POST helper).
+> 6. **Tests.**
+>    - Component tests for `InboxCard` (yes/no/different actions).
+>    - Manual smoke documented in the PR description: open 5 unrelated tabs, confirm Inbox shows them; assign one; confirm `visit_in_workstream` edge appears; reopen panel; confirm 50-card cap.
+> 7. Commit message `feat(tabsession): phase 3 — Inbox + AttributionBadge + provenance shell` with co-author trailer.
+
+**Acceptance criteria.**
+
+- Inbox tab renders, shows unattributed sessions, accepts yes/no/different decisions, and updates the projection.
+- Pill-strip cue shows focused-tab attribution distinct from active-pointer.
+- 50-card cap enforced per panel session.
+- AttributionBadge solid/grey variants render correctly.
+- No regressions in existing thread / workstream UI.
+- No new event types or HTTP routes (everything reuses Phase 2's POST helper).
+
+---
+
+## Phase 4 — Resolver dry-run (read-only suggestions)
+
+**Branch:** `feat/tab-session-attribution-phase-4`.
+
+**Goal.** Build the calibrated graph-attribution engine as a *read-only* surface. Signed PPR + similarity + (optional) cluster evidence + log-linear NB fusion + score-margin abstention. Exposed only via `GET /v1/tabsessions/{id}/resolve?dryRun=true`. **No event writes from this phase** — the resolver returns candidates + reasons; the side panel may render them as suggestions.
+
+**Worker prompt.**
+
+> Implement Phase 4 of `docs/tab-session-attribution/PHASES.md` on branch `feat/tab-session-attribution-phase-4`.
+>
+> 1. **Typed evidence-graph adapter.** Create `packages/sidetrack-companion/src/tabsession/evidenceGraph.ts`. Wraps the Connections snapshot into a `graphology` instance with typed-edge weights from `edgePriors.ts` (also new; documented priors per the PRD). One adapter, multiple consumers.
+> 2. **Signed PPR (`tabsession/causalPpr.ts`).** Hand-rolled power-iteration over `graphology` with the personalization vector. Signature: `runPPR(graph, seedVector: Map<NodeId, number>, alpha = 0.15, tol = 1e-6, maxIter = 50): Map<NodeId, number>`. Cache per `(tabSessionId, graphRevision, seedHash)` for 5 min. Iteration cap and timeout are mandatory. **Candidate-only seeding**: only run PPR for workstreams reachable from local graph anchors of the target session — full-graph PPR per workstream is the fallback, not the default. Negative seeds: `score = PPR(S⁺) − γ·PPR(S⁻)` with `γ = 0.5`. Negative anchors: `user.flow.rejected` events + dismissals + (Phase 5) tab-group pull-outs.
+> 3. **Similarity generator (`tabsession/similarity.ts`).** Reuses existing `generateCandidates` + `predictRanker` from `packages/sidetrack-companion/src/ranker/`. Per workstream: `simTopScore`, `simMeanScore`, `simAgreement`, `simMargin`. K=10.
+> 4. **Cluster evidence (`tabsession/clusterEvidence.ts`).** **Optional.** If the Connections snapshot has `topic_in_workstream` edges, consume them as a Bayesian-smoothed cluster posterior with `minSupport = 3` and Laplace-α = 1. If not, return empty. Do **not** add `hdbscan-ts` as a critical-path dependency in this phase.
+> 5. **Fusion (`tabsession/fusion.ts`).** Log-linear NB with hand-set log-LRs. The default weights are documented in code comments (per PRD); they are priors, not learned values. Output `rawFusionLogit(W)` per candidate.
+> 6. **Abstention (`tabsession/policy.ts` + decision rule in `resolver.ts`).** Score-margin + corroboration-count abstention. **No conformal, no Beta calibration in this phase** — those are deferred behind label-count triggers. Three policy modes (conservative/balanced/aggressive) pulled from PRD; only the score-margin / corroboration / engagement / source-allowlist gates apply.
+> 7. **Resolver orchestrator (`tabsession/resolver.ts`).** Top-level `resolveAttribution(input): ResolutionResult`. Pure function. Returns `fusedCandidates`, dominant source per top candidate, abstention decision (`auto-apply | suggest | inbox`), and a `reasons` blob for the provenance UI.
+> 8. **HTTP endpoint.** `GET /v1/tabsessions/{id}/resolve?dryRun=true` runs the resolver and returns the result. **No POST**. **No event writes** from this resolver path. The Inbox UI from Phase 3 can call this endpoint to render top-3 suggestions + provenance, but `Inbox` cards still require an explicit user action to attribute.
+> 9. **Dependency tracker (`tabsession/dependencyTracker.ts`).** `ResolverDependencyKey` cache + invalidation queue. Event-driven (graphRevision / rankerRevision / topicRevision / feedbackRevision / modelRevision changes). Resolver runs lazy on `dryRun=true` request; the queue exists but no daemon yet.
+> 10. **Provenance overlay (`AttributionProvenance.tsx`):** activate the inferred-source variant. When the resolver returns a candidate, the side panel shows the dominant source + top-3 contributing anchors + score margin. `AttributionBadge` outlined-pill variant activates here for sessions where Phase 3 user-attribution is absent but a strong suggestion exists.
+> 11. **SuggestionBanner (`SuggestionBanner.tsx`):** non-modal banner at panel top when ≥1 open session has `action: 'suggest'`. Yes / No / Different actions emit `user.organized.item` (Phase 2's path), not new events.
+> 12. **Tests.**
+>     - PPR convergence test on a 50-node fixture graph.
+>     - Cluster posterior test with smoothing + min-support.
+>     - Fusion test on a 5-candidate fixture.
+>     - Resolver e2e test: feed a synthetic `ConnectionsInput` + Class A history; assert action and reasons.
+>     - Replay test against a T1 pack (or fixture if no pack handy): assert resolver emits at least one auto-apply candidate for a strong-causal session.
+> 13. Commit message `feat(tabsession): phase 4 — signed PPR + log-linear fusion + dry-run resolver` with co-author trailer.
+
+**Acceptance criteria.**
+
+- `GET /v1/tabsessions/{id}/resolve?dryRun=true` returns explainable candidates without writing events.
+- PPR converges deterministically; cache is keyed correctly; iteration cap enforced.
+- Cluster evidence is optional (resolver runs cleanly with `topic_in_workstream` absent).
+- No HDBSCAN dependency added.
+- Suggestion banner + outlined-pill badge render when the resolver suggests; user actions still flow through Phase 2's `user.organized.item` path.
+- No new HTTP write paths; no auto-apply yet.
+
+---
+
+## Phase 5 — Chrome tab groups + auto-apply policy
+
+**Branch:** `feat/tab-session-attribution-phase-5`.
+
+**Goal.** Bidirectional Chrome tab-group integration as a feedback surface, durable `TabGroupLink` identity decoupled from Chrome's volatile group ids, and the auto-apply policy gate (gated on telemetry from Phases 1–4).
+
+**Worker prompt.**
+
+> Implement Phase 5 of `docs/tab-session-attribution/PHASES.md` on branch `feat/tab-session-attribution-phase-5`.
+>
+> 1. **Manifest:** add `'tabGroups'` to `permissions` in `wxt.config.ts`.
+> 2. **Tab-group wiring (`packages/sidetrack-extension/src/tabgroups/`):**
+>    - `wiring.ts`: subscribe to `chrome.tabGroups.onCreated/onUpdated/onMoved/onRemoved` (metadata) and `chrome.tabs.onUpdated` filtered to `changeInfo.groupId !== undefined` (membership). **Do not use** `chrome.tabs.onAttached/onDetached` — those are window events, not group events.
+>    - `originDetection.ts`: 200ms-window classifier for `system-suggested` vs `user-created` group origin (matches against the Sidetrack-issued `chrome.tabs.group` calls).
+>    - `reconciliation.ts`: on browser restart, match `(title, color, ordered-set-of-canonical-URLs)` to durable `TabGroupLink`. Drop on weak match; surface "Re-link group?" banner. Never silent re-link.
+> 3. **Durable identity.** Mint `linkId = tgrp_<crockford32-ulid>`. Persist via `user.organized.item` with `itemKind: 'tab-group-link'`. Actions: `move` (attach group→workstream), `reject` (detach), `split` (origin transition).
+> 4. **Pull-in / pull-out as feedback.**
+>    - `tabs.onUpdated` `changeInfo.groupId ≥ 0` (joined): emit `user.organized.item itemKind: 'tab-session', action: 'move', toWorkstreamId: link.workstreamId`. Source-tag the assertion: the projection records `source: 'tab-group-pull-in'` for telemetry.
+>    - `changeInfo.groupId === -1` (left): emit `user.organized.item itemKind: 'tab-session', action: 'move', toWorkstreamId: null` + `user.flow.rejected` against the prior link's workstream (existing event family).
+> 5. **Auto-create policy.** Use the resolver's cluster output (Phase 4) to suggest groups via `connected components` over the per-window evidence subgraph (`graphology-components`, edge-weight threshold 0.5). Per policy mode threshold (conservative=never, balanced=≥3, aggressive=≥2). On trigger: SW calls `chrome.tabs.group` then `chrome.tabGroups.update`. Mints `TabGroupLink` (`origin: 'system-suggested'`).
+> 6. **Cluster → workstream promotion.** Renaming a system-suggested group with no workstream link triggers a SuggestionBanner ("Create workstream from this group?"). On confirm: POST `/v1/workstreams` + `user.organized.item itemKind: 'tab-group-link', action: 'move', toWorkstreamId: <new>`.
+> 7. **Auto-apply gate.** In `tabsession/policy.ts`: enable the auto-apply path. Decision rule from Phase 4 now writes a Class E inferred-attribution event (new event type registered as Class E in `sync/contract/registry.ts`) **only when** policy mode allows the dominant source + regret rate is below the source's budget + corroboration count is met. Engagement gate uses Stage 1 classifier. Auto-applied attributions DO NOT override `user_asserted`.
+> 8. **Reducer rule.** In `tabsession/projection.ts`: extend the precedence rule to two-tier (`user_asserted > inferred`) within stream class. Verify pull-out-after-pull-in correctly overrides via LWW within `user_asserted`.
+> 9. **Visual marker.** 🔄 emoji prefix on system-suggested group titles. Document in onboarding.
+> 10. **Tests.**
+>     - Unit test reconciliation matcher.
+>     - E2e test: drag tab into Chrome group → assertion + attribution; drag out → null attribution; verify pull-out beats earlier pull-in.
+>     - Auto-apply telemetry sanity: regret-rate counter increments on user override.
+>     - T1 manual replay end-to-end with policy=balanced: confirm at least one auto-apply fires for a strong-causal session.
+> 11. Commit message `feat(tabsession): phase 5 — tab groups + auto-apply policy` with co-author trailer.
+
+**Acceptance criteria.**
+
+- Drag tab into a Chrome group attributes the tab to the linked workstream; drag out unattributes.
+- Pull-out after pull-in correctly overrides (verifies the source-class fix).
+- `chrome.tabs.onAttached/onDetached` is not used for group membership.
+- Chrome group ids never appear as canonical state in synced events.
+- Browser restart triggers either silent reconciliation on strong match or a "Re-link group?" banner on weak match — never silent re-link on weak match.
+- Auto-apply path emits Class E events; never overrides `user_asserted`; respects policy-mode gates.
+- T1 replay shows auto-apply working end-to-end at policy=balanced for a strong-causal session.
+
+---
+
+## Out-of-scope across all phases (Wave 1 explicit non-goals)
+
+- Backfill of legacy active-pointer attributions in production.
+- Full PRD vocabulary additions (conformal, Beta calibration, BOCPD, Leiden, GBDT ranker, learning-to-defer) — all gated behind label-count triggers documented in the PRD.
+- Mobile / non-Chrome surfaces.
+- Cross-replica explicit-attribution propagation by URL match (per-replica scoping; cross-replica via similarity evidence stays the policy).
+
+---
+
+## Workflow
+
+- Each phase is its own PR off `main` (Phase N+1 branched after Phase N lands).
+- Worker drives implementation; lead reviews diff, runs acceptance checks locally, lands.
+- Mode B (PR-poll cadence per session memory).

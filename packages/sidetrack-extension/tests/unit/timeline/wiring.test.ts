@@ -14,6 +14,7 @@ import {
 // APIs.
 
 interface ListenerStore {
+  onCreated: (tab: { id?: number; openerTabId?: number; windowId?: number }) => void;
   onActivated: (info: { tabId: number; windowId: number }) => void;
   onUpdated: (
     tabId: number,
@@ -21,6 +22,8 @@ interface ListenerStore {
     tab: { id?: number; url?: string; title?: string; windowId?: number },
   ) => void;
   onRemoved: (tabId: number, info: { windowId: number; isWindowClosing: boolean }) => void;
+  onWindowRemoved: (windowId: number) => void;
+  onIdleStateChanged: (state: 'active' | 'idle' | 'locked') => void;
   onAlarm: (alarm: { name: string; scheduledTime: number }) => void;
 }
 
@@ -31,9 +34,12 @@ const stubChrome = (): {
 } => {
   const store: Record<string, unknown> = {};
   const listeners: ListenerStore = {
+    onCreated: () => undefined,
     onActivated: () => undefined,
     onUpdated: () => undefined,
     onRemoved: () => undefined,
+    onWindowRemoved: () => undefined,
+    onIdleStateChanged: () => undefined,
     onAlarm: () => undefined,
   };
   const tabState = new Map<number, { url?: string; title?: string; windowId?: number }>();
@@ -61,6 +67,7 @@ const stubChrome = (): {
       },
     },
     tabs: {
+      onCreated: { addListener: vi.fn((cb: ListenerStore['onCreated']) => { listeners.onCreated = cb; }) },
       onActivated: { addListener: vi.fn((cb: ListenerStore['onActivated']) => { listeners.onActivated = cb; }) },
       onUpdated: { addListener: vi.fn((cb: ListenerStore['onUpdated']) => { listeners.onUpdated = cb; }) },
       onRemoved: { addListener: vi.fn((cb: ListenerStore['onRemoved']) => { listeners.onRemoved = cb; }) },
@@ -68,6 +75,12 @@ const stubChrome = (): {
       __setTab: (tabId: number, data: { url?: string; title?: string; windowId?: number }) => {
         tabState.set(tabId, data);
       },
+    },
+    windows: {
+      onRemoved: { addListener: vi.fn((cb: ListenerStore['onWindowRemoved']) => { listeners.onWindowRemoved = cb; }) },
+    },
+    idle: {
+      onStateChanged: { addListener: vi.fn((cb: ListenerStore['onIdleStateChanged']) => { listeners.onIdleStateChanged = cb; }) },
     },
     alarms: {
       create: vi.fn(() => Promise.resolve()),
@@ -107,11 +120,19 @@ describe('timeline wiring', () => {
     });
     const c = (globalThis as unknown as {
       chrome: {
-        tabs: { onActivated: { addListener: { mock: { calls: unknown[] } } } };
+        tabs: {
+          onCreated: { addListener: { mock: { calls: unknown[] } } };
+          onActivated: { addListener: { mock: { calls: unknown[] } } };
+        };
+        windows: { onRemoved: { addListener: { mock: { calls: unknown[] } } } };
+        idle: { onStateChanged: { addListener: { mock: { calls: unknown[] } } } };
         alarms: { create: { mock: { calls: unknown[] } } };
       };
     }).chrome;
+    expect(c.tabs.onCreated.addListener.mock.calls.length).toBe(1);
     expect(c.tabs.onActivated.addListener.mock.calls.length).toBe(1);
+    expect(c.windows.onRemoved.addListener.mock.calls.length).toBe(1);
+    expect(c.idle.onStateChanged.addListener.mock.calls.length).toBe(1);
     expect(c.alarms.create.mock.calls.length).toBe(1);
   });
 
@@ -165,11 +186,19 @@ describe('timeline wiring', () => {
     await initializeTimelineWiring({ readCompanion: async () => null });
     const c = (globalThis as unknown as {
       chrome: {
-        tabs: { onActivated: { addListener: { mock: { calls: unknown[] } } } };
+        tabs: {
+          onCreated: { addListener: { mock: { calls: unknown[] } } };
+          onActivated: { addListener: { mock: { calls: unknown[] } } };
+        };
+        windows: { onRemoved: { addListener: { mock: { calls: unknown[] } } } };
+        idle: { onStateChanged: { addListener: { mock: { calls: unknown[] } } } };
         alarms: { create: { mock: { calls: unknown[] } } };
       };
     }).chrome;
+    expect(c.tabs.onCreated.addListener.mock.calls.length).toBe(0);
     expect(c.tabs.onActivated.addListener.mock.calls.length).toBe(0);
+    expect(c.windows.onRemoved.addListener.mock.calls.length).toBe(0);
+    expect(c.idle.onStateChanged.addListener.mock.calls.length).toBe(0);
     expect(c.alarms.create.mock.calls.length).toBe(0);
   });
 
