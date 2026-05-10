@@ -66,9 +66,8 @@ const parseByTabIdHash = (value: unknown): TabSessionByTabIdHash => {
 };
 
 const chromeStorageLocal = (): ChromeStorageLocal => {
-  const c = (
-    globalThis as unknown as { chrome?: { storage?: { local?: ChromeStorageLocal } } }
-  ).chrome;
+  const c = (globalThis as unknown as { chrome?: { storage?: { local?: ChromeStorageLocal } } })
+    .chrome;
   const local = c?.storage?.local;
   if (local === undefined) throw new Error('chrome.storage.local is unavailable');
   return local;
@@ -77,6 +76,7 @@ const chromeStorageLocal = (): ChromeStorageLocal => {
 export const createChromeTabSessionStorage = (
   storage: ChromeStorageLocal = chromeStorageLocal(),
 ): TabSessionStorage => {
+  let mutationQueue: Promise<void> = Promise.resolve();
   const readAll = async (): Promise<TabSessionByTabIdHash> => {
     const got = await storage.get(TAB_SESSION_BY_TAB_HASH_KEY);
     return parseByTabIdHash(got[TAB_SESSION_BY_TAB_HASH_KEY]);
@@ -84,19 +84,26 @@ export const createChromeTabSessionStorage = (
   const writeAll = async (records: TabSessionByTabIdHash): Promise<void> => {
     await storage.set({ [TAB_SESSION_BY_TAB_HASH_KEY]: records });
   };
+  const mutate = async (
+    apply: (records: TabSessionByTabIdHash) => TabSessionByTabIdHash,
+  ): Promise<void> => {
+    const run = mutationQueue.then(async () => {
+      const records = await readAll();
+      await writeAll(apply(records));
+    });
+    mutationQueue = run.catch(() => {});
+    await run;
+  };
   return {
     readAll,
     writeAll,
     get: async (tabIdHash) => (await readAll())[tabIdHash],
-    set: async (tabIdHash, record) => {
-      const records = await readAll();
-      await writeAll({ ...records, [tabIdHash]: record });
-    },
-    remove: async (tabIdHash) => {
-      const records = await readAll();
-      const next = { ...records };
-      delete next[tabIdHash];
-      await writeAll(next);
-    },
+    set: async (tabIdHash, record) => mutate((records) => ({ ...records, [tabIdHash]: record })),
+    remove: async (tabIdHash) =>
+      mutate((records) => {
+        const next = { ...records };
+        delete next[tabIdHash];
+        return next;
+      }),
   };
 };
