@@ -35,10 +35,13 @@ import {
   readChromeStorageSnapshot,
   readSessionPack,
   readSidetrackVersion,
+  readTimelineReplayDiagnostics,
   recordedCanonicalUrls,
   redactHtmlForSessionPack,
   resolveCaptureLevel,
   resolveTestSessionsDir,
+  TIMELINE_REPLAY_DEBUG_STORAGE_KEY,
+  timelineReplayDebugEnabled,
   waitForReplaySurfaces,
   writeReplayReport,
   writeSessionPack,
@@ -93,6 +96,7 @@ const seedTimelineRuntime = async (
     [SETTINGS_KEY]: settingsFor(companion),
     'sidetrack.timeline.enabled': true,
     [ACTIVE_WORKSTREAM_STORAGE_KEY]: ACTIVE_WORKSTREAM_ID,
+    ...(timelineReplayDebugEnabled() ? { [TIMELINE_REPLAY_DEBUG_STORAGE_KEY]: true } : {}),
   });
   await panel.reload({ waitUntil: 'domcontentloaded' });
   await expect(panel.getByRole('main', { name: 'Sidetrack workboard' })).toBeVisible({
@@ -103,6 +107,17 @@ const seedTimelineRuntime = async (
   });
   expect((reinitResult as { ok?: boolean } | null)?.ok).toBe(true);
   return { panel };
+};
+
+const logTimelineReplayDiagnostics = async (
+  runtime: ExtensionRuntime,
+  panel: Page,
+  label: string,
+): Promise<void> => {
+  if (!timelineReplayDebugEnabled()) return;
+  const diagnostics = await readTimelineReplayDiagnostics(runtime, panel);
+  // eslint-disable-next-line no-console
+  console.log(`[record-replay:timeline-diagnostics:${label}] ${JSON.stringify(diagnostics)}`);
 };
 
 test.describe('manual T1 Wave 2a one-browser record/replay', () => {
@@ -188,6 +203,7 @@ test.describe('manual T1 Wave 2a one-browser record/replay', () => {
     replayCompanion = await startTestCompanion();
     replayRuntime = await launchExtensionRuntime({ forceLocalProfile: true });
     const { panel: replayPanel } = await seedTimelineRuntime(replayRuntime, replayCompanion);
+    await logTimelineReplayDiagnostics(replayRuntime, replayPanel, 'after-seed');
     const routeTracker = await installRouteStubsForPack(replayRuntime.context, input.pack, {
       strictOffline: STRICT_OFFLINE,
     });
@@ -196,8 +212,10 @@ test.describe('manual T1 Wave 2a one-browser record/replay', () => {
       senderPage: replayPanel,
       pack: input.pack,
     });
+    await logTimelineReplayDiagnostics(replayRuntime, replayPanel, 'after-page-replay');
     const expectedUrls = recordedCanonicalUrls(input.pack);
     const drain = await forceDrainTimeline(replayRuntime, replayPanel, expectedUrls.length);
+    await logTimelineReplayDiagnostics(replayRuntime, replayPanel, 'after-force-drain');
     const surfaces = await waitForReplaySurfaces({
       companion: replayCompanion,
       expectedCanonicalUrls: expectedUrls,
@@ -262,6 +280,7 @@ test.describe('manual T1 Wave 2a one-browser record/replay', () => {
     replayCompanion = await startTestCompanion();
     replayRuntime = await launchExtensionRuntime({ forceLocalProfile: true });
     const { panel: replayPanel } = await seedTimelineRuntime(replayRuntime, replayCompanion);
+    await logTimelineReplayDiagnostics(replayRuntime, replayPanel, 'record-fresh-after-seed');
     const routeTracker = await installRouteStubsForPack(replayRuntime.context, draftPack, {
       strictOffline: STRICT_OFFLINE,
     });
@@ -270,8 +289,18 @@ test.describe('manual T1 Wave 2a one-browser record/replay', () => {
       senderPage: replayPanel,
       pack: draftPack,
     });
+    await logTimelineReplayDiagnostics(
+      replayRuntime,
+      replayPanel,
+      'record-fresh-after-page-replay',
+    );
     const expectedUrls = recordedCanonicalUrls(draftPack);
     const drain = await forceDrainTimeline(replayRuntime, replayPanel, expectedUrls.length);
+    await logTimelineReplayDiagnostics(
+      replayRuntime,
+      replayPanel,
+      'record-fresh-after-force-drain',
+    );
     const surfaces = await waitForReplaySurfaces({
       companion: replayCompanion,
       expectedCanonicalUrls: expectedUrls,

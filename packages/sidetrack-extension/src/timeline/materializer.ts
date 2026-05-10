@@ -44,9 +44,7 @@ import {
 
 const SURFACE = 'timeline';
 
-const ACTIVE_BUDGET =
-  DEFAULT_PLUGIN_BUDGETS.activeSetCount[SURFACE] ?? 200;
-
+const ACTIVE_BUDGET = DEFAULT_PLUGIN_BUDGETS.activeSetCount[SURFACE] ?? 200;
 
 // State tracked in module memory for health reporting. The spool +
 // chrome.storage are the durable truth; counters are derived.
@@ -54,6 +52,72 @@ let lastReconcileAt: string | null = null;
 let lastError: string | null = null;
 let companionReachable = false;
 let lastObservedAt: string | null = null;
+let admitAttempts = 0;
+let admittedCount = 0;
+let rejectedCount = 0;
+type TimelineAdmitRejectReason =
+  | 'spool-full-explicit'
+  | 'spool-full-passive-policy-drop'
+  | 'export-required';
+interface TimelineAdmitDiagnostic {
+  readonly at: string;
+  readonly ok: boolean;
+  readonly intent: AdmitIntent;
+  readonly tier?: 'active' | 'spool';
+  readonly reason?: TimelineAdmitRejectReason;
+  readonly activeCount: number;
+  readonly spoolCount: number;
+  readonly clientEventId: string;
+}
+
+interface TimelineDrainDiagnostic {
+  readonly at: string;
+  readonly drainableCount: number;
+  readonly drainHookPresent: boolean;
+  readonly uploaded: number;
+  readonly remaining: number;
+  readonly error?: string;
+}
+let lastAdmit: TimelineAdmitDiagnostic | null = null;
+let lastDrain: TimelineDrainDiagnostic | null = null;
+
+export interface TimelineMaterializerDiagnostics {
+  readonly admitAttempts: number;
+  readonly admittedCount: number;
+  readonly rejectedCount: number;
+  readonly lastAdmit: TimelineAdmitDiagnostic | null;
+  readonly lastDrain: TimelineDrainDiagnostic | null;
+  readonly companionReachable: boolean;
+  readonly lastObservedAt: string | null;
+  readonly lastError: string | null;
+  readonly spool: {
+    readonly total: number;
+    readonly active: number;
+    readonly spooled: number;
+    readonly pendingSend: number;
+  };
+}
+
+export const getTimelineMaterializerDiagnostics =
+  async (): Promise<TimelineMaterializerDiagnostics> => {
+    const metrics = await spoolMetrics(SURFACE);
+    return {
+      admitAttempts,
+      admittedCount,
+      rejectedCount,
+      lastAdmit,
+      lastDrain,
+      companionReachable,
+      lastObservedAt,
+      lastError,
+      spool: {
+        total: metrics.total,
+        active: metrics.byState.active,
+        spooled: metrics.byState.spooled,
+        pendingSend: metrics.byState['pending-send'],
+      },
+    };
+  };
 
 export const setCompanionReachableForTimeline = (reachable: boolean): void => {
   companionReachable = reachable;
@@ -132,9 +196,11 @@ export const createDefaultTimelineFetchHook = (
 
 // Hook for tests + production wiring. The default is a fetch wrapper
 // against the companion's /v1/timeline/events endpoint.
-let drainHook: ((entries: readonly SpoolEntry<BrowserTimelineObservedPayload>[]) => Promise<{
-  uploaded: readonly SpoolEntry['edgeDot'][];
-}>) | null = null;
+let drainHook:
+  | ((entries: readonly SpoolEntry<BrowserTimelineObservedPayload>[]) => Promise<{
+      uploaded: readonly SpoolEntry['edgeDot'][];
+    }>)
+  | null = null;
 
 export const setTimelineDrainHook = (
   hook:
@@ -211,17 +277,28 @@ const admitLocal = async (
   intent: AdmitIntent = 'passive',
 ): Promise<AdmitResult> => {
   const metrics = await spoolMetrics(SURFACE);
-  const activeCount = metrics.byState['active'] + metrics.byState['spooled'];
+  const activeCount = metrics.byState.active + metrics.byState.spooled;
+  const spoolCount = metrics.byState.spooled + metrics.byState['pending-send'];
+  admitAttempts += 1;
   const decision = guard.decideAdmit({
     intent,
     activeSetCount: activeCount,
-    spoolCount:
-      metrics.byState['spooled'] + metrics.byState['pending-send'],
+    spoolCount,
     activeSetBudget: ACTIVE_BUDGET,
   });
   if (!decision.ok) {
     // Health-visible. Counters live on the budget guard; reflected in
     // health() below.
+    rejectedCount += 1;
+    lastAdmit = {
+      at: new Date().toISOString(),
+      ok: false,
+      intent,
+      reason: decision.reason,
+      activeCount,
+      spoolCount,
+      clientEventId: observation.payload.eventId,
+    };
     return decision;
   }
   // Allocate an edge dot now so even if the drainer reorders, the
@@ -237,8 +314,18 @@ const admitLocal = async (
     createdAt: observation.payload.observedAt,
     lastTransitionAt: new Date().toISOString(),
   };
-  await spoolAppend(SURFACE, entry as SpoolEntry);
+  await spoolAppend(SURFACE, entry);
   lastObservedAt = observation.payload.observedAt;
+  admittedCount += 1;
+  lastAdmit = {
+    at: new Date().toISOString(),
+    ok: true,
+    intent,
+    tier: decision.tier,
+    activeCount,
+    spoolCount,
+    clientEventId: observation.payload.eventId,
+  };
   return decision;
 };
 
@@ -310,9 +397,23 @@ const drainSpoolToCompanion = async (): Promise<{
   ) as SpoolEntry<BrowserTimelineObservedPayload>[];
   if (drainable.length === 0) {
     const remainingSpool = entries.filter((e) => e.state === 'pending-send').length;
+    lastDrain = {
+      at: new Date().toISOString(),
+      drainableCount: 0,
+      drainHookPresent: drainHook !== null,
+      uploaded: 0,
+      remaining: remainingSpool,
+    };
     return { uploaded: 0, remaining: remainingSpool };
   }
   if (drainHook === null) {
+    lastDrain = {
+      at: new Date().toISOString(),
+      drainableCount: drainable.length,
+      drainHookPresent: false,
+      uploaded: 0,
+      remaining: drainable.length,
+    };
     return { uploaded: 0, remaining: drainable.length };
   }
   // Mark each entry as pending-send while we ship it; if drain
@@ -328,9 +429,9 @@ const drainSpoolToCompanion = async (): Promise<{
   // leaving the un-acked entries stuck in 'pending-send' forever
   // because the rollback only ran in the catch path. The
   // success-with-leftovers case is now handled too.
-  const ackedKey = (dot: SpoolEntry['edgeDot']): string =>
-    `${dot.replicaId}|${String(dot.seq)}`;
+  const ackedKey = (dot: SpoolEntry['edgeDot']): string => `${dot.replicaId}|${String(dot.seq)}`;
   const ackedSet = new Set<string>();
+  let drainError: string | undefined;
   try {
     const result = await drainHook(drainable);
     for (const dot of result.uploaded) {
@@ -346,6 +447,7 @@ const drainSpoolToCompanion = async (): Promise<{
     lastError = null;
   } catch (err) {
     lastError = err instanceof Error ? err.message : String(err);
+    drainError = lastError;
   }
   // Rollback path runs in BOTH success and failure cases — every
   // entry we transitioned to 'pending-send' that did NOT get acked
@@ -366,6 +468,14 @@ const drainSpoolToCompanion = async (): Promise<{
   const remaining = (await readSpool(SURFACE)).filter(
     (e) => e.state === 'spooled' || e.state === 'pending-send',
   ).length;
+  lastDrain = {
+    at: new Date().toISOString(),
+    drainableCount: drainable.length,
+    drainHookPresent: true,
+    uploaded,
+    remaining,
+    ...(drainError === undefined ? {} : { error: drainError }),
+  };
   return { uploaded, remaining };
 };
 
@@ -415,9 +525,8 @@ export const timelineHealthSnapshot = async (): Promise<PluginMaterializerHealth
   const base = health();
   return {
     ...base,
-    activeSetSize: metrics.byState['active'] + metrics.byState['spooled'],
-    spoolSize:
-      metrics.byState['spooled'] + metrics.byState['pending-send'],
+    activeSetSize: metrics.byState.active + metrics.byState.spooled,
+    spoolSize: metrics.byState.spooled + metrics.byState['pending-send'],
   };
 };
 
@@ -428,6 +537,11 @@ export const resetTimelineMaterializerStateForTests = (): void => {
   lastError = null;
   companionReachable = false;
   lastObservedAt = null;
+  admitAttempts = 0;
+  admittedCount = 0;
+  rejectedCount = 0;
+  lastAdmit = null;
+  lastDrain = null;
   // Counters on the guard are intentionally reset by re-instantiating;
   // tests that care should clear chrome.storage spool entries
   // directly.
