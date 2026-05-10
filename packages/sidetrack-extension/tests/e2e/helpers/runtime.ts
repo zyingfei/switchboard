@@ -13,6 +13,29 @@ import { launchStealthPersistentContext } from './stealth-runtime';
 
 let stealthExperimentWarningPrinted = false;
 
+// Patchright extends page.evaluate with a 3rd `isolatedContext: false` param
+// that forces evaluation in the page's main world. Without it, patchright
+// runs page.evaluate in an isolated context where chrome-extension page APIs
+// (chrome.runtime, chrome.storage, …) are NOT bound. Stock Playwright ignores
+// the extra arg.
+type PatchrightMainWorldPage = Page & {
+  readonly evaluate: <Arg, Result>(
+    pageFunction: (arg: Arg) => Result | Promise<Result>,
+    arg: Arg,
+    isolatedContext: false,
+  ) => Promise<Result>;
+};
+
+const evaluateInMainWorld = async <Arg, Result>(
+  page: Page,
+  pageFunction: (arg: Arg) => Result | Promise<Result>,
+  arg: Arg,
+): Promise<Result> =>
+  await (page as PatchrightMainWorldPage).evaluate(pageFunction, arg, false);
+
+const isSidetrackExtensionWorker = (worker: Worker): boolean =>
+  worker.url().startsWith('chrome-extension://') && worker.url().endsWith('/background.js');
+
 export interface ExtensionRuntimeMetadata {
   readonly browserMode: ManualBrowserMode;
   readonly browserChannel: string;
@@ -54,7 +77,7 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 
 const waitForExtensionWorker = async (context: BrowserContext): Promise<Worker> => {
   const findWorker = (): Worker | undefined =>
-    context.serviceWorkers().find((worker) => worker.url().startsWith('chrome-extension://'));
+    context.serviceWorkers().find(isSidetrackExtensionWorker);
 
   const existing = findWorker();
   if (existing !== undefined) {
@@ -72,7 +95,7 @@ const waitForExtensionWorker = async (context: BrowserContext): Promise<Worker> 
   // appear in context.serviceWorkers().
   const eventWait = context.waitForEvent('serviceworker', {
     timeout: 0,
-    predicate: (worker) => worker.url().startsWith('chrome-extension://'),
+    predicate: isSidetrackExtensionWorker,
   });
   const pollWait = (async (): Promise<Worker> => {
     for (let attempt = 0; attempt < 90; attempt += 1) {
@@ -188,16 +211,23 @@ const attachOverCdp = async (cdpUrl: string): Promise<ExtensionRuntime> => {
       headed: true,
     },
     async sendRuntimeMessage(senderPage: Page, message: unknown) {
-      return await senderPage.evaluate(async (runtimeMessage) => {
-        const response = (await chrome.runtime.sendMessage(runtimeMessage)) as unknown;
-        return response;
-      }, message);
+      return await evaluateInMainWorld(
+        senderPage,
+        async (runtimeMessage) => {
+          const response = (await chrome.runtime.sendMessage(runtimeMessage)) as unknown;
+          return response;
+        },
+        message,
+      );
     },
     async seedStorage(senderPage: Page, values: Record<string, unknown>) {
       // Wait briefly for chrome.storage to become available — under stealth /
       // CFT launches the extension service worker can register a beat after
-      // the sidepanel page hits domcontentloaded.
-      const diagnostic = await senderPage.evaluate(
+      // the sidepanel page hits domcontentloaded. Force main-world evaluation
+      // so patchright doesn't run the probe in an isolated context where
+      // chrome.* extension APIs aren't bound.
+      const diagnostic = await evaluateInMainWorld(
+        senderPage,
         async ({ vals, retries, intervalMs }) => {
           const c = (
             globalThis as unknown as {
@@ -421,16 +451,23 @@ export const launchExtensionRuntime = async (
       headed: !headless,
     },
     async sendRuntimeMessage(senderPage: Page, message: unknown) {
-      return await senderPage.evaluate(async (runtimeMessage) => {
-        const response = (await chrome.runtime.sendMessage(runtimeMessage)) as unknown;
-        return response;
-      }, message);
+      return await evaluateInMainWorld(
+        senderPage,
+        async (runtimeMessage) => {
+          const response = (await chrome.runtime.sendMessage(runtimeMessage)) as unknown;
+          return response;
+        },
+        message,
+      );
     },
     async seedStorage(senderPage: Page, values: Record<string, unknown>) {
       // Wait briefly for chrome.storage to become available — under stealth /
       // CFT launches the extension service worker can register a beat after
-      // the sidepanel page hits domcontentloaded.
-      const diagnostic = await senderPage.evaluate(
+      // the sidepanel page hits domcontentloaded. Force main-world evaluation
+      // so patchright doesn't run the probe in an isolated context where
+      // chrome.* extension APIs aren't bound.
+      const diagnostic = await evaluateInMainWorld(
+        senderPage,
         async ({ vals, retries, intervalMs }) => {
           const c = (
             globalThis as unknown as {
