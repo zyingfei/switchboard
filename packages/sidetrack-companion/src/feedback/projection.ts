@@ -68,10 +68,7 @@ const compareLabel = (left: FeedbackTrainingLabel, right: FeedbackTrainingLabel)
   return left.weight - right.weight;
 };
 
-const pushAction = (
-  perItem: Map<string, UserAction[]>,
-  action: UserAction,
-): void => {
+const pushAction = (perItem: Map<string, UserAction[]>, action: UserAction): void => {
   const list = perItem.get(action.itemId);
   if (list === undefined) {
     perItem.set(action.itemId, [action]);
@@ -87,12 +84,18 @@ const label = (fromId: string | undefined, toId: string | undefined): FeedbackTr
   return [{ fromId, toId, weight: 1 }];
 };
 
+const nonNullContainer = (value: string | null | undefined): string | undefined =>
+  value === null ? undefined : value;
+
 const labelsForOrganizedItem = (
   payload: Extract<FeedbackPayload, { readonly itemId: string }>,
-): { readonly positive: readonly FeedbackTrainingLabel[]; readonly negative: readonly FeedbackTrainingLabel[] } => {
+): {
+  readonly positive: readonly FeedbackTrainingLabel[];
+  readonly negative: readonly FeedbackTrainingLabel[];
+} => {
   if (!isUserOrganizedItemPayload(payload)) return { positive: [], negative: [] };
   if (payload.action === 'move' || payload.action === 'merge' || payload.action === 'promote') {
-    return { positive: label(payload.itemId, payload.toContainer), negative: [] };
+    return { positive: label(payload.itemId, nonNullContainer(payload.toContainer)), negative: [] };
   }
   if (payload.action === 'split') {
     return {
@@ -103,12 +106,17 @@ const labelsForOrganizedItem = (
     };
   }
   if (payload.action === 'ignore') {
-    return { positive: [], negative: label(payload.itemId, payload.fromContainer ?? payload.itemId) };
+    return {
+      positive: [],
+      negative: label(payload.itemId, payload.fromContainer ?? payload.itemId),
+    };
   }
   return { positive: [], negative: [] };
 };
 
-const stablePerItem = (perItem: ReadonlyMap<string, readonly UserAction[]>): Record<string, readonly UserAction[]> => {
+const stablePerItem = (
+  perItem: ReadonlyMap<string, readonly UserAction[]>,
+): Record<string, readonly UserAction[]> => {
   const out: Record<string, readonly UserAction[]> = {};
   for (const key of [...perItem.keys()].sort(compareString)) {
     out[key] = [...(perItem.get(key) ?? [])].sort(compareAction);
@@ -205,7 +213,9 @@ export const projectFeedback = (events: readonly AcceptedEvent[]): FeedbackProje
         seq: event.dot.seq,
         payload: event.payload,
       });
-      positiveLabels.push(...label(event.payload.sourceVisitId ?? event.payload.snippetId, event.payload.targetId));
+      positiveLabels.push(
+        ...label(event.payload.sourceVisitId ?? event.payload.snippetId, event.payload.targetId),
+      );
     }
   }
 

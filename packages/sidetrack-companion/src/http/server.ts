@@ -4,10 +4,7 @@ import { join } from 'node:path';
 
 import { buildAnchorFromTerm } from '../annotation/anchorBuilder.js';
 import { isBridgeKeyAccepted, rotateBridgeKey } from '../auth/bridgeKey.js';
-import {
-  BROWSER_TIMELINE_OBSERVED,
-  isBrowserTimelineObservedPayload,
-} from '../timeline/events.js';
+import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from '../timeline/events.js';
 import { sanitizeTimelinePayload } from '../timeline/sanitize.js';
 import {
   defaultAllowedTools,
@@ -63,18 +60,18 @@ import {
 import { projectFeedback } from '../feedback/projection.js';
 import { projectPrivacy } from '../privacy/projection.js';
 import {
+  projectTabSessions,
+  serializeTabSessionProjection,
+  tabSessionInbox,
+} from '../tabsession/projection.js';
+import {
   appendEntry as appendEntryRaw,
   gcEntries as gcEntriesRaw,
   readIndex,
   tombstoneByThread as tombstoneByThreadRaw,
 } from '../recall/indexFile.js';
 import type { RecallLifecycle } from '../recall/lifecycle.js';
-import {
-  buildLexicalIndex,
-  rank,
-  rankHybrid,
-  type HybridLexicalIndex,
-} from '../recall/ranker.js';
+import { buildLexicalIndex, rank, rankHybrid, type HybridLexicalIndex } from '../recall/ranker.js';
 import { rebuildFromEventLog } from '../recall/rebuild.js';
 import type { BucketRegistry } from '../routing/registry.js';
 import { redact } from '../safety/redaction.js';
@@ -192,8 +189,7 @@ const syncSummaryDeps = (
 const baseVectorForAggregate = async (
   eventLog: EventLog,
   aggregateId: string,
-): Promise<VersionVector> =>
-  vectorFromEvents(await eventLog.readByAggregate(aggregateId));
+): Promise<VersionVector> => vectorFromEvents(await eventLog.readByAggregate(aggregateId));
 
 import { isReviewDraftEvent, projectReviewDraft } from '../review/projection.js';
 import {
@@ -394,6 +390,7 @@ type HttpMethod = 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE';
 
 interface RouteMatch {
   readonly workstreamId?: string;
+  readonly tabSessionId?: string;
   readonly reminderId?: string;
   readonly codingSessionId?: string;
   readonly threadId?: string;
@@ -949,10 +946,7 @@ const objectRecord = (value: unknown): Record<string, unknown> | undefined =>
     ? (value as Record<string, unknown>)
     : undefined;
 
-const optionalFiniteNumber = (
-  value: unknown,
-  fieldName: string,
-): number | undefined => {
+const optionalFiniteNumber = (value: unknown, fieldName: string): number | undefined => {
   if (value === undefined) return undefined;
   if (typeof value !== 'number' || !Number.isFinite(value)) {
     throw new HttpRouteError(
@@ -967,7 +961,9 @@ const optionalFiniteNumber = (
 
 const PRIVACY_AGGREGATE_ID = 'privacy';
 
-const isPrivacyEventType = (value: unknown): value is
+const isPrivacyEventType = (
+  value: unknown,
+): value is
   | typeof PRIVACY_GATE_FLIPPED
   | typeof PRIVACY_PERMISSION_GRANTED
   | typeof PRIVACY_PERMISSION_REVOKED =>
@@ -1226,7 +1222,10 @@ const routes: readonly RouteDefinition[] = [
           'Event log is not configured on this companion.',
         );
       }
-      return [200, { data: projectPrivacy(privacyEventsFrom(await context.eventLog.readMerged())) }];
+      return [
+        200,
+        { data: projectPrivacy(privacyEventsFrom(await context.eventLog.readMerged())) },
+      ];
     },
   },
   {
@@ -1325,6 +1324,127 @@ const routes: readonly RouteDefinition[] = [
         );
       }
       return [200, { data: projectFeedback(await context.eventLog.readMerged()) }];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/tabsessions\/projection$/u,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      return [
+        200,
+        {
+          data: serializeTabSessionProjection(
+            projectTabSessions(await context.eventLog.readMerged()),
+          ),
+        },
+      ];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/tabsessions\/inbox$/u,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const url = new URL(request.url ?? '/v1/tabsessions/inbox', 'http://internal');
+      const limitRaw = Number.parseInt(url.searchParams.get('limit') ?? '50', 10);
+      const offsetRaw = Number.parseInt(url.searchParams.get('offset') ?? '0', 10);
+      const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 200) : 50;
+      const offset = Number.isFinite(offsetRaw) && offsetRaw > 0 ? offsetRaw : 0;
+      const projection = projectTabSessions(await context.eventLog.readMerged());
+      const items = tabSessionInbox(projection, { limit, offset });
+      return [
+        200,
+        {
+          data: {
+            items,
+            total: tabSessionInbox(projection, { limit: Number.MAX_SAFE_INTEGER, offset: 0 })
+              .length,
+            limit,
+            offset,
+          },
+        },
+      ];
+    },
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/tabsessions\/(?<tabSessionId>[^/]+)\/attribute$/u,
+    authRequired: true,
+    handle: async (request, _requestId, match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const tabSessionId = decodeURIComponent(match.tabSessionId ?? '');
+      if (tabSessionId.length === 0) {
+        throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
+      }
+      const eventLog = context.eventLog;
+      const idempotencyKey = requireIdempotencyKey(request);
+      return await runIdempotent(context, 'tabSessionAttribute', idempotencyKey, async () => {
+        const body = objectRecord(await readBody(request));
+        const workstreamId = body?.['workstreamId'];
+        if (
+          !(workstreamId === null || (typeof workstreamId === 'string' && workstreamId.length > 0))
+        ) {
+          throw new HttpRouteError(
+            400,
+            'VALIDATION_ERROR',
+            'Validation failed.',
+            'Body must contain workstreamId as a non-empty string or null.',
+          );
+        }
+        const priorProjection = projectTabSessions(await eventLog.readMerged());
+        const fromWorkstreamId =
+          priorProjection.bySessionId.get(tabSessionId)?.currentAttribution?.workstreamId;
+        const payload = {
+          payloadVersion: 1,
+          itemKind: 'tab-session',
+          itemId: tabSessionId,
+          action: 'move',
+          ...(fromWorkstreamId === undefined || fromWorkstreamId === null
+            ? {}
+            : { fromContainer: fromWorkstreamId }),
+          toContainer: workstreamId,
+        } as const;
+        const aggregateId = aggregateIdForFeedbackEvent(USER_ORGANIZED_ITEM, payload);
+        const accepted = await eventLog.appendClient({
+          clientEventId: idempotencyKey,
+          aggregateId,
+          type: USER_ORGANIZED_ITEM,
+          payload,
+          baseVector: await baseVectorForAggregate(eventLog, aggregateId),
+        });
+        return [
+          201,
+          {
+            data: {
+              accepted,
+              projection: serializeTabSessionProjection(
+                projectTabSessions(await eventLog.readMerged()),
+              ),
+            },
+          },
+        ];
+      });
     },
   },
   {
@@ -1565,9 +1685,7 @@ const routes: readonly RouteDefinition[] = [
             e.manifest.capabilities['reads-env'] !== undefined &&
             e.manifest.capabilities['reads-env'].length > 0
           ) {
-            capabilityGates['reads-env'] = resolveGate
-              ? resolveGate(id, 'reads-env')
-              : 'pending';
+            capabilityGates['reads-env'] = resolveGate ? resolveGate(id, 'reads-env') : 'pending';
           }
           if (e.manifest.capabilities['reads-network'] === true) {
             capabilityGates['reads-network'] = resolveGate
@@ -1580,9 +1698,7 @@ const routes: readonly RouteDefinition[] = [
             version: e.manifest.version,
             manifest_schema: e.manifest.manifest_schema,
             status: e.status,
-            ...(e.rejectedReason === undefined
-              ? {}
-              : { rejected_reason: e.rejectedReason }),
+            ...(e.rejectedReason === undefined ? {} : { rejected_reason: e.rejectedReason }),
             emits: e.manifest.emits,
             capabilities: {
               reads_paths: e.manifest.capabilities['reads-paths'] ?? [],
@@ -1733,11 +1849,9 @@ const routes: readonly RouteDefinition[] = [
                           codingSessionId: dispatchEvent.mcpRequest.codingSessionId,
                         },
                       }),
-                  ...(dispatchEvent.title === undefined
-                    ? {}
-                    : { title: dispatchEvent.title }),
+                  ...(dispatchEvent.title === undefined ? {} : { title: dispatchEvent.title }),
                 },
-                  })
+              })
               .catch(() => undefined);
           }
           return [
@@ -2442,7 +2556,7 @@ const routes: readonly RouteDefinition[] = [
                   note: input.note,
                   pageTitle,
                 },
-                  })
+              })
               .catch(() => undefined);
           }
           // totalForThread/totalForUrl: total non-deleted
@@ -2478,7 +2592,7 @@ const routes: readonly RouteDefinition[] = [
                 note: input.note,
                 pageTitle: input.pageTitle,
               },
-              })
+            })
             .catch(() => undefined);
         }
         return [201, { data: result }];
@@ -2759,7 +2873,11 @@ const routes: readonly RouteDefinition[] = [
         cached.entryCount === index.items.length
           ? cached.index
           : buildLexicalIndex(index.items);
-      if (cached === undefined || cached.mtimeMs !== indexMtime || cached.entryCount !== index.items.length) {
+      if (
+        cached === undefined ||
+        cached.mtimeMs !== indexMtime ||
+        cached.entryCount !== index.items.length
+      ) {
         lexicalIndexCache.set(indexFilePath, {
           mtimeMs: indexMtime,
           entryCount: index.items.length,
@@ -2989,7 +3107,7 @@ const routes: readonly RouteDefinition[] = [
                       ...(turn.modelName === undefined ? {} : { modelName: turn.modelName }),
                     })),
                   },
-                      })
+                })
                 .then(() => true)
                 .catch(() => false);
         void eventLogAppended;
@@ -3340,7 +3458,7 @@ const routes: readonly RouteDefinition[] = [
                   ? { description: record['description'] }
                   : {}),
               },
-              });
+            });
           }
         } catch {
           // Best effort — the vault write succeeded regardless.
@@ -3438,7 +3556,7 @@ const routes: readonly RouteDefinition[] = [
                 ...(input.targetId === undefined ? {} : { targetId: input.targetId }),
                 ...(input.status === undefined ? {} : { status: input.status }),
               },
-              })
+            })
             .catch(() => undefined);
         }
         return [201, mutationResponse(result, requestId)];
@@ -3553,11 +3671,7 @@ const routes: readonly RouteDefinition[] = [
     authRequired: true,
     handle: async (request, requestId, _match, context) => {
       if (context.importEdgeEvent === undefined) {
-        throw new HttpRouteError(
-          503,
-          'TIMELINE_NOT_WIRED',
-          'Timeline import is not configured.',
-        );
+        throw new HttpRouteError(503, 'TIMELINE_NOT_WIRED', 'Timeline import is not configured.');
       }
       const body = (await readBody(request)) as { events?: unknown };
       if (body === null || typeof body !== 'object' || !Array.isArray(body.events)) {
@@ -3612,9 +3726,7 @@ const routes: readonly RouteDefinition[] = [
         // so importPeerEvent dedupe still works).
         const sanitizedPayload = sanitizeTimelinePayload(event.payload);
         const sanitizedEvent =
-          sanitizedPayload === event.payload
-            ? event
-            : { ...event, payload: sanitizedPayload };
+          sanitizedPayload === event.payload ? event : { ...event, payload: sanitizedPayload };
         try {
           const result = await context.importEdgeEvent(sanitizedEvent);
           if (result.imported) {
@@ -3661,9 +3773,17 @@ const routes: readonly RouteDefinition[] = [
       // alone — "exact" filtering at the timestamp level.
       const isDateOnly = (s: string): boolean => /^\d{4}-\d{2}-\d{2}$/.test(s);
       const since =
-        sinceRaw === undefined ? undefined : isDateOnly(sinceRaw) ? `${sinceRaw}T00:00:00.000Z` : sinceRaw;
+        sinceRaw === undefined
+          ? undefined
+          : isDateOnly(sinceRaw)
+            ? `${sinceRaw}T00:00:00.000Z`
+            : sinceRaw;
       const until =
-        untilRaw === undefined ? undefined : isDateOnly(untilRaw) ? `${untilRaw}T23:59:59.999Z` : untilRaw;
+        untilRaw === undefined
+          ? undefined
+          : isDateOnly(untilRaw)
+            ? `${untilRaw}T23:59:59.999Z`
+            : untilRaw;
       const q = (url.searchParams.get('q') ?? '').trim().toLowerCase();
       const limitRaw = Number.parseInt(url.searchParams.get('limit') ?? '100', 10);
       const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 1000) : 100;
@@ -3693,10 +3813,7 @@ const routes: readonly RouteDefinition[] = [
       // [firstSeenAt, lastSeenAt] window overlaps [since, until].
       // Without this, since=2026-05-07T12:00:00Z would still
       // return entries from 09:00 the same day.
-      const overlapsRange = (entry: {
-        firstSeenAt: string;
-        lastSeenAt: string;
-      }): boolean => {
+      const overlapsRange = (entry: { firstSeenAt: string; lastSeenAt: string }): boolean => {
         if (since !== undefined && entry.lastSeenAt < since) return false;
         if (until !== undefined && entry.firstSeenAt > until) return false;
         return true;
@@ -3846,9 +3963,7 @@ const routes: readonly RouteDefinition[] = [
           if (keepNodeIds.has(e.toNodeId)) keepNodeIds.add(e.fromNodeId);
         }
         nodes = nodes.filter((n) => keepNodeIds.has(n.id));
-        edges = edges.filter(
-          (e) => keepNodeIds.has(e.fromNodeId) && keepNodeIds.has(e.toNodeId),
-        );
+        edges = edges.filter((e) => keepNodeIds.has(e.fromNodeId) && keepNodeIds.has(e.toNodeId));
       }
       if (nodeKind !== undefined) {
         nodes = nodes.filter((n) => n.kind === nodeKind);
@@ -3902,7 +4017,22 @@ const routes: readonly RouteDefinition[] = [
       const hops = Number.isFinite(hopsRaw) && hopsRaw >= 0 ? Math.min(hopsRaw, 4) : 1;
       const snap = await context.connectionsStore.readCurrent();
       if (snap === null) {
-        return [200, { data: { scope: 'companion-extended', snapshot: { scope: { nodeId, hops }, nodes: [], edges: [], updatedAt: '1970-01-01T00:00:00.000Z', nodeCount: 0, edgeCount: 0 } } }];
+        return [
+          200,
+          {
+            data: {
+              scope: 'companion-extended',
+              snapshot: {
+                scope: { nodeId, hops },
+                nodes: [],
+                edges: [],
+                updatedAt: '1970-01-01T00:00:00.000Z',
+                nodeCount: 0,
+                edgeCount: 0,
+              },
+            },
+          },
+        ];
       }
       const { subgraphForNode } = await import('../connections/snapshot.js');
       const sub = subgraphForNode(snap, nodeId, hops);

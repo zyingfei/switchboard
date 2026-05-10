@@ -22,6 +22,8 @@ export const USER_ORGANIZED_ITEM_KINDS = [
   'thread',
   'workstream',
   'visit',
+  'tab-session',
+  'tab-group-link',
   'topic',
   'snippet',
 ] as const;
@@ -51,7 +53,7 @@ export interface UserOrganizedItemPayload {
   readonly itemId: string;
   readonly action: UserOrganizedItemAction;
   readonly fromContainer?: string;
-  readonly toContainer?: string;
+  readonly toContainer?: string | null;
   readonly details?: UserOrganizedItemDetails;
 }
 
@@ -157,6 +159,9 @@ const hasPayloadVersionAndNoDimensions = (value: Record<string, unknown>): boole
 const isOptionalString = (value: unknown): value is string | undefined =>
   value === undefined || isNonEmptyString(value);
 
+const isOptionalStringOrNull = (value: unknown): value is string | null | undefined =>
+  value === null || isOptionalString(value);
+
 const isOptionalStringArray = (value: unknown): value is readonly string[] | undefined =>
   value === undefined || isStringArray(value);
 
@@ -204,7 +209,7 @@ export const isUserOrganizedItemPayload = (value: unknown): value is UserOrganiz
   isNonEmptyString(value['itemId']) &&
   isOrganizedItemAction(value['action']) &&
   isOptionalString(value['fromContainer']) &&
-  isOptionalString(value['toContainer']) &&
+  isOptionalStringOrNull(value['toContainer']) &&
   isOptionalUserOrganizedItemDetails(value['details']);
 
 export const isUserEngagementRelabeledPayload = (

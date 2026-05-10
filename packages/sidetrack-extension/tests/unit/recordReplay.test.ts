@@ -735,6 +735,56 @@ describe('T1 record/replay session pack helpers', () => {
     expect(analysis.scores['ranking-plausibility'].score).toBe(0.5);
   });
 
+  it('does not infer graph edge expectations from the active workstream pointer', () => {
+    const pack = basePack();
+    const urls = recordedCanonicalUrls(pack);
+    const report = evaluateOneBrowserReplay({
+      pack,
+      routeTracker: stubRouteTracker(urls),
+      pageReplay: { succeededCanonicalUrls: urls, failures: [] },
+      drain: { ok: true, uploaded: urls.length, remaining: 0 },
+      timeline: timelineFor(pack),
+      connections: connectionsFor(urls, []),
+    });
+
+    expect(report.layers.find((layer) => layer.layer === 'graph-materialization')?.status).toBe(
+      'pass',
+    );
+    expect(report.status).toBe('pass');
+  });
+
+  it('still fails graph materialization when a pack declares an expected edge', () => {
+    const pack: SessionPack = {
+      ...basePack(),
+      expectations: {
+        expectedCanonicalUrls: ['https://example.test/a'],
+        expectedEdges: [
+          {
+            kind: 'visit_in_workstream',
+            from: visitNodeId('https://example.test/a'),
+            to: 'workstream:ws_t1',
+          },
+        ],
+        knownDetours: [],
+      },
+    };
+    const urls = recordedCanonicalUrls(pack);
+    const report = evaluateOneBrowserReplay({
+      pack,
+      routeTracker: stubRouteTracker(urls),
+      pageReplay: { succeededCanonicalUrls: urls, failures: [] },
+      drain: { ok: true, uploaded: urls.length, remaining: 0 },
+      timeline: timelineFor(pack),
+      connections: connectionsFor(urls, []),
+    });
+
+    const graphLayer = report.layers.find((layer) => layer.layer === 'graph-materialization');
+    expect(graphLayer?.status).toBe('fail');
+    expect(graphLayer?.details).toEqual([
+      'missing expected edge visit_in_workstream timeline-visit:https://example.test/a -> workstream:ws_t1',
+    ]);
+  });
+
   it('opens markdown reports with the score table and keeps scores stable in JSON', () => {
     const pack = basePack();
     const urls = recordedCanonicalUrls(pack);

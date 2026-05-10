@@ -26,7 +26,14 @@ export const USER_FLOW_REJECTED = 'user.flow.rejected' as const;
 export const USER_TOPIC_RENAMED = 'user.topic.renamed' as const;
 export const USER_SNIPPET_PROMOTED = 'user.snippet.promoted' as const;
 
-export type UserOrganizedItemKind = 'thread' | 'workstream' | 'visit' | 'topic' | 'snippet';
+export type UserOrganizedItemKind =
+  | 'thread'
+  | 'workstream'
+  | 'visit'
+  | 'tab-session'
+  | 'tab-group-link'
+  | 'topic'
+  | 'snippet';
 export type UserOrganizedItemAction = 'move' | 'merge' | 'split' | 'rename' | 'promote' | 'ignore';
 export type UserEngagementClass =
   | 'parked_background'
@@ -53,7 +60,7 @@ export interface UserOrganizedItemPayload {
   readonly itemId: string;
   readonly action: UserOrganizedItemAction;
   readonly fromContainer?: string;
-  readonly toContainer?: string;
+  readonly toContainer?: string | null;
   readonly details?: {
     readonly rename?: string;
     readonly mergeMembers?: readonly string[];

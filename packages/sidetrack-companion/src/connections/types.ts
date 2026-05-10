@@ -109,6 +109,7 @@ export type ConnectionEdgeKind =
   // Active-workstream attribution: retained for Phase 2 replacement.
   // Phase 1 stops emitting this from the active pointer.
   | 'visit_in_workstream'
+  | 'tab_session_in_workstream'
   | 'visit_in_tab_session'
   | 'tab_session_opener_chain'
   | 'previous_visit_in_tab_session'

@@ -23,6 +23,7 @@ import {
   assertNoDisallowedStorageValues,
   assertPackPrivacy,
   companionGet,
+  companionPost,
   createMinimalOneBrowserPack,
   createSessionPackFromManualRecorder,
   driveReplayFromPack,
@@ -34,6 +35,7 @@ import {
   readChromeStorageSnapshot,
   readSessionPack,
   readSidetrackVersion,
+  readTimeline,
   readTimelineReplayDiagnostics,
   recordedCanonicalUrls,
   redactHtmlForSessionPack,
@@ -74,6 +76,8 @@ const WORKFLOW: readonly MinimalWorkflowStep[] = [
 const REPLAY_PACK_PATH = process.env['SIDETRACK_REPLAY_PACK'];
 const REPLAY_REPORT_DIR = process.env['SIDETRACK_REPLAY_REPORT_DIR'];
 const STRICT_OFFLINE = process.env['SIDETRACK_REPLAY_STRICT_OFFLINE'] === '1';
+const SYNTHETIC_TAB_SESSION_ATTRIBUTION =
+  process.env['SIDETRACK_T1_SYNTHETIC_TAB_ATTRIBUTION'] === '1';
 
 const settingsFor = (companion: TestCompanion) => ({
   companion: { port: companion.port, bridgeKey: companion.bridgeKey },
@@ -124,6 +128,77 @@ const logTimelineReplayDiagnostics = async (
   const diagnostics = await readTimelineReplayDiagnostics(runtime, panel);
   // eslint-disable-next-line no-console
   console.log(`[record-replay:timeline-diagnostics:${label}] ${JSON.stringify(diagnostics)}`);
+};
+
+const visitNodeId = (canonicalUrl: string): string => `timeline-visit:${canonicalUrl}`;
+
+const canonicalForTimelineItem = (input: string): string =>
+  input.length > 1 && input.endsWith('/') ? input.slice(0, -1) : input;
+
+const waitForTimelineTabSessions = async (
+  companion: TestCompanion,
+  expectedUrls: readonly string[],
+): Promise<ReadonlyMap<string, string>> => {
+  let last = new Map<string, string>();
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const timeline = await readTimeline(companion);
+    const byCanonical = new Map<string, string>();
+    for (const item of timeline.data.items) {
+      if (item.tabSessionId === undefined || item.tabSessionId.length === 0) continue;
+      byCanonical.set(canonicalForTimelineItem(item.canonicalUrl ?? item.url), item.tabSessionId);
+    }
+    last = byCanonical;
+    if (expectedUrls.every((url) => byCanonical.has(url))) return byCanonical;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(
+    `Timed out waiting for tabSessionId on timeline replay items; found ${JSON.stringify([
+      ...last.entries(),
+    ])}`,
+  );
+};
+
+const withSyntheticExpectedEdges = (
+  pack: SessionPack,
+  expectedUrls: readonly string[],
+  workstreamId: string,
+): SessionPack => ({
+  ...pack,
+  expectations: {
+    expectedCanonicalUrls: pack.expectations?.expectedCanonicalUrls ?? expectedUrls,
+    expectedEdges: [
+      ...(pack.expectations?.expectedEdges ?? []),
+      ...expectedUrls.map((url) => ({
+        kind: 'visit_in_workstream',
+        from: visitNodeId(url),
+        to: `workstream:${workstreamId}`,
+      })),
+    ],
+    knownDetours: pack.expectations?.knownDetours ?? [],
+  },
+});
+
+const applySyntheticTabSessionAttribution = async (
+  companion: TestCompanion,
+  pack: SessionPack,
+  expectedUrls: readonly string[],
+): Promise<SessionPack> => {
+  if (!SYNTHETIC_TAB_SESSION_ATTRIBUTION) return pack;
+  const workstreamId = firstBrowser(pack).activeWorkstreamId;
+  if (workstreamId === null) {
+    throw new Error('Synthetic tab-session attribution requires an active workstream id.');
+  }
+  const tabSessionByUrl = await waitForTimelineTabSessions(companion, expectedUrls);
+  const attributed = new Set<string>();
+  for (const url of expectedUrls) {
+    const tabSessionId = tabSessionByUrl.get(url);
+    if (tabSessionId === undefined || attributed.has(tabSessionId)) continue;
+    await companionPost(companion, `/v1/tabsessions/${encodeURIComponent(tabSessionId)}/attribute`, {
+      workstreamId,
+    });
+    attributed.add(tabSessionId);
+  }
+  return withSyntheticExpectedEdges(pack, expectedUrls, workstreamId);
 };
 
 test.describe('manual T1 Wave 2a one-browser record/replay', () => {
@@ -222,13 +297,17 @@ test.describe('manual T1 Wave 2a one-browser record/replay', () => {
     const expectedUrls = recordedCanonicalUrls(input.pack);
     const drain = await forceDrainTimeline(replayRuntime, replayPanel, expectedUrls.length);
     await logTimelineReplayDiagnostics(replayRuntime, replayPanel, 'after-force-drain');
+    const evaluationPack = await applySyntheticTabSessionAttribution(
+      replayCompanion,
+      input.pack,
+      expectedUrls,
+    );
     const surfaces = await waitForReplaySurfaces({
       companion: replayCompanion,
       expectedCanonicalUrls: expectedUrls,
-      activeWorkstreamId: firstBrowser(input.pack).activeWorkstreamId,
     });
     const report = evaluateOneBrowserReplay({
-      pack: input.pack,
+      pack: evaluationPack,
       routeTracker,
       pageReplay,
       drain,
@@ -307,13 +386,17 @@ test.describe('manual T1 Wave 2a one-browser record/replay', () => {
       replayPanel,
       'record-fresh-after-force-drain',
     );
+    const evaluationPack = await applySyntheticTabSessionAttribution(
+      replayCompanion,
+      draftPack,
+      expectedUrls,
+    );
     const surfaces = await waitForReplaySurfaces({
       companion: replayCompanion,
       expectedCanonicalUrls: expectedUrls,
-      activeWorkstreamId: firstBrowser(draftPack).activeWorkstreamId,
     });
     const report = evaluateOneBrowserReplay({
-      pack: draftPack,
+      pack: evaluationPack,
       routeTracker,
       pageReplay,
       drain,

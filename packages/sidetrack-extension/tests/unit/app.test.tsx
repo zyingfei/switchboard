@@ -415,6 +415,41 @@ describe('live side-panel App wiring', () => {
     });
   });
 
+  it('routes tab-session drag/drop across workstream pills through the attribution endpoint', async () => {
+    installChromeMock(liveState(), { [SETUP_COMPLETED_KEY]: true });
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 201,
+      json: async () => ({ data: { accepted: {} } }),
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+
+    const dataTransfer = {
+      dropEffect: 'none',
+      effectAllowed: 'move',
+      types: ['text/plain'],
+      getData: vi.fn((type: string) => (type === 'text/plain' ? 'tses_test' : '')),
+      setData: vi.fn(),
+    };
+    fireEvent.drop(await screen.findByRole('button', { name: 'Sibling' }), { dataTransfer });
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        'http://127.0.0.1:17373/v1/tabsessions/tses_test/attribute',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ workstreamId: 'bac_workstream_sibling' }),
+          headers: expect.objectContaining({
+            'content-type': 'application/json',
+            'x-bac-bridge-key': 'bridge-test-key',
+          }),
+        }),
+      );
+    });
+  });
+
   it('pulses the find icon when the active tab matches an unfocused tracked thread', async () => {
     const state = liveState();
     installChromeMock(

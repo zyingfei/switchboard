@@ -10,6 +10,7 @@ import { FEATURE_SCHEMA_VERSION, type CandidatePairFeatures } from '../ranker/fe
 import { CAPTURE_RECORDED } from '../recall/events.js';
 import { SELECTION_COPIED, SELECTION_PASTED } from '../snippets/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
+import { createEmptyTabSessionProjection, projectTabSessions } from '../tabsession/projection.js';
 import { THREAD_UPSERTED } from '../threads/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import type { TimelineDayProjection } from '../timeline/projection.js';
@@ -37,6 +38,7 @@ const emptyInput = (overrides: Partial<ConnectionsInput> = {}): ConnectionsInput
   reminders: [],
   codingSessions: [],
   timelineDays: [],
+  tabSessionProjection: createEmptyTabSessionProjection(),
   ...overrides,
 });
 
@@ -1248,6 +1250,79 @@ describe('connections — content-derived edges', () => {
     );
     expect(taggedVisit?.metadata['tabSessionId']).toBe('tses_child');
     expect(taggedVisit?.metadata['workstreamId']).toBeUndefined();
+  });
+
+  it('explicit tab-session attribution emits tab_session_in_workstream and visit_in_workstream edges', () => {
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: [
+        {
+          id: 'https://copy.fail',
+          firstSeenAt: '2026-05-07T10:00:00.000Z',
+          lastSeenAt: '2026-05-07T10:00:30.000Z',
+          url: 'https://copy.fail',
+          canonicalUrl: 'https://copy.fail',
+          visitCount: 1,
+          tabSessionId: 'tses_child',
+        },
+      ],
+      updatedAt: '2026-05-07T10:00:30.000Z',
+      entryCount: 1,
+    };
+    const events: AcceptedEvent[] = [
+      buildEvent({
+        seq: 1,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: {
+          eventId: 'tl-1',
+          observedAt: '2026-05-07T10:00:00.000Z',
+          url: 'https://copy.fail',
+          canonicalUrl: 'https://copy.fail',
+          transition: 'updated',
+          tabIdHash: 'tab_a',
+          tabSessionId: 'tses_child',
+        },
+      }),
+      buildEvent({
+        seq: 2,
+        type: USER_ORGANIZED_ITEM,
+        payload: {
+          payloadVersion: 1,
+          itemKind: 'tab-session',
+          itemId: 'tses_child',
+          action: 'move',
+          toContainer: 'ws_security',
+        },
+      }),
+    ];
+    const snap = buildConnectionsSnapshot(
+      emptyInput({ events, timelineDays: [day], tabSessionProjection: projectTabSessions(events) }),
+    );
+
+    expect(
+      snap.edges.find(
+        (edge) =>
+          edge.kind === 'tab_session_in_workstream' &&
+          edge.fromNodeId === nodeIdFor('tab-session', 'tses_child') &&
+          edge.toNodeId === nodeIdFor('workstream', 'ws_security'),
+      ),
+    ).toMatchObject({
+      confidence: 'asserted',
+      producedBy: { source: 'event-log', eventType: USER_ORGANIZED_ITEM },
+      metadata: { attributionSource: 'user_asserted' },
+    });
+    expect(
+      snap.edges.find(
+        (edge) =>
+          edge.kind === 'visit_in_workstream' &&
+          edge.fromNodeId === nodeIdFor('timeline-visit', 'https://copy.fail') &&
+          edge.toNodeId === nodeIdFor('workstream', 'ws_security'),
+      ),
+    ).toMatchObject({
+      confidence: 'asserted',
+      producedBy: { source: 'event-log', eventType: USER_ORGANIZED_ITEM },
+      metadata: { attributionSource: 'user_asserted' },
+    });
   });
 
   it('visit_in_tab_session subgraph: anchored on tab-session reaches every session visit', () => {

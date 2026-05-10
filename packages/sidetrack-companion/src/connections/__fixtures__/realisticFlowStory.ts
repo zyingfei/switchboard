@@ -28,6 +28,7 @@ import { ANNOTATION_CREATED } from '../../annotations/events.js';
 import { DISPATCH_RECORDED } from '../../dispatches/events.js';
 import { CAPTURE_RECORDED } from '../../recall/events.js';
 import type { AcceptedEvent } from '../../sync/causal.js';
+import { createEmptyTabSessionProjection } from '../../tabsession/projection.js';
 import { THREAD_UPSERTED } from '../../threads/events.js';
 import type { TimelineDayProjection } from '../../timeline/projection.js';
 import { WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
@@ -504,6 +505,7 @@ export const buildRealisticFlowFixture = (): ConnectionsInput => ({
   reminders: [],
   codingSessions,
   timelineDays: [buildDay()],
+  tabSessionProjection: createEmptyTabSessionProjection(),
 });
 
 // All tracked nodes the user expected to see, grouped by flow.

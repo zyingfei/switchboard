@@ -26,6 +26,7 @@ import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
 import { QUEUE_CREATED } from '../../queue/events.js';
 import { CAPTURE_RECORDED } from '../../recall/events.js';
 import type { AcceptedEvent } from '../../sync/causal.js';
+import { createEmptyTabSessionProjection } from '../../tabsession/projection.js';
 import { THREAD_UPSERTED } from '../../threads/events.js';
 import type { TimelineDayProjection } from '../../timeline/projection.js';
 import { WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
@@ -832,6 +833,7 @@ export const buildMultiFlowFixture = (): ConnectionsInput => ({
   reminders,
   codingSessions,
   timelineDays: [buildDay()],
+  tabSessionProjection: createEmptyTabSessionProjection(),
 });
 
 // Per-flow node-id catalogues. Tests use these to derive expected

@@ -13,6 +13,7 @@ import {
   isDispatchRecordedPayload,
 } from '../dispatches/events.js';
 import { createRevision } from '../domain/ids.js';
+import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
 import {
   buildCrossReplicaMaterialization,
   replicaIdFromNodeId,
@@ -35,6 +36,7 @@ import { extractFeatures } from '../ranker/features.js';
 import type { Candidate } from '../ranker/types.js';
 import { projectSnippetLineage } from '../snippets/projection.js';
 import type { AcceptedEvent } from '../sync/causal.js';
+import type { TabSessionProjection } from '../tabsession/projection.js';
 import { THREAD_UPSERTED, isThreadUpsertedPayload } from '../threads/events.js';
 import type { TimelineDayProjection } from '../timeline/projection.js';
 import { detectSearchUrl } from '../timeline/sanitize.js';
@@ -189,6 +191,7 @@ export interface ConnectionsInput {
   readonly reminders: readonly ReminderVaultRecord[];
   readonly codingSessions: readonly CodingSessionVaultRecord[];
   readonly timelineDays: readonly TimelineDayProjection[];
+  readonly tabSessionProjection: TabSessionProjection;
   readonly visitSimilarity?: VisitSimilarityRevision;
   readonly topicRevision?: TopicRevision;
   readonly topicWorkstreamShareThreshold?: number;
@@ -912,23 +915,44 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
           });
         }
       }
-      // PHASE 2: replace the old active-pointer edge below with a
-      // lookup through the tab-session attribution projection.
-      // if (typeof entry.workstreamId === 'string' && entry.workstreamId.length > 0) {
-      //   upsertNode(nodes, {
-      //     kind: 'workstream',
-      //     key: entry.workstreamId,
-      //     label: entry.workstreamId,
-      //   });
-      //   upsertEdge(edges, {
-      //     kind: 'visit_in_workstream',
-      //     fromNodeId: nodeIdFor('timeline-visit', visitKey),
-      //     toNodeId: nodeIdFor('workstream', entry.workstreamId),
-      //     observedAt: entry.lastSeenAt,
-      //     producedBy: { source: 'timeline-projection' },
-      //     confidence: 'inferred',
-      //   });
-      // }
+      if (typeof entry.tabSessionId === 'string' && entry.tabSessionId.length > 0) {
+        const attribution = input.tabSessionProjection.bySessionId.get(
+          entry.tabSessionId,
+        )?.currentAttribution;
+        if (attribution !== undefined && attribution.workstreamId !== null) {
+          upsertNode(nodes, {
+            kind: 'workstream',
+            key: attribution.workstreamId,
+            label: attribution.workstreamId,
+          });
+          upsertEdge(edges, {
+            kind: 'tab_session_in_workstream',
+            fromNodeId: nodeIdFor('tab-session', entry.tabSessionId),
+            toNodeId: nodeIdFor('workstream', attribution.workstreamId),
+            observedAt: attribution.observedAt,
+            producedBy: {
+              source: 'event-log',
+              eventType: USER_ORGANIZED_ITEM,
+              dot: { replicaId: attribution.replicaId, seq: attribution.seq },
+            },
+            confidence: 'asserted',
+            metadata: { attributionSource: attribution.source },
+          });
+          upsertEdge(edges, {
+            kind: 'visit_in_workstream',
+            fromNodeId: nodeIdFor('timeline-visit', visitKey),
+            toNodeId: nodeIdFor('workstream', attribution.workstreamId),
+            observedAt: entry.lastSeenAt,
+            producedBy: {
+              source: 'event-log',
+              eventType: USER_ORGANIZED_ITEM,
+              dot: { replicaId: attribution.replicaId, seq: attribution.seq },
+            },
+            confidence: 'asserted',
+            metadata: { attributionSource: attribution.source },
+          });
+        }
+      }
       const threadId = threadIdByUrl.get(visitKey);
       if (threadId !== undefined) {
         upsertNode(nodes, { kind: 'thread', key: threadId, label: threadId });
