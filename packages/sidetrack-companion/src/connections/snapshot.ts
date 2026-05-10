@@ -1075,11 +1075,43 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
         provider: instance.provider,
       },
     });
+    // Hydrate the tab-session node from the projection so frontend
+    // surfaces (Connections nodes, AttributionProvenance anchors,
+    // FlowPath labels) can render a human-friendly title instead of
+    // the raw tabSessionId. The frontend's entityDisplay layer is the
+    // load-bearing guard against id leaks — this just makes the
+    // server-side label informative too.
+    const tabSessionRecord = input.tabSessionProjection.bySessionId.get(instance.tabSessionId);
+    const tabSessionLatestTitle = tabSessionRecord?.latestTitle;
+    const tabSessionLatestUrl = tabSessionRecord?.latestUrl;
+    const tabSessionProvider = tabSessionRecord?.provider ?? instance.provider;
+    const tabSessionLastActivityAt = tabSessionRecord?.lastActivityAt;
+    const hostFromUrl = (raw: string | undefined): string | undefined => {
+      if (raw === undefined || raw.length === 0) return undefined;
+      try {
+        const host = new URL(raw).host;
+        return host.length > 0 ? host : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+    const tabSessionLabel =
+      tabSessionLatestTitle ??
+      instance.title ??
+      hostFromUrl(tabSessionLatestUrl ?? instance.url) ??
+      instance.tabSessionId;
     upsertNode(nodes, {
       kind: 'tab-session',
       key: instance.tabSessionId,
-      label: instance.tabSessionId,
+      label: tabSessionLabel,
       observedAt: instance.firstSeenAt,
+      metadata: {
+        latestTitle: tabSessionLatestTitle,
+        latestUrl: tabSessionLatestUrl,
+        canonicalUrl: instance.canonicalUrl,
+        provider: tabSessionProvider,
+        lastActivityAt: tabSessionLastActivityAt,
+      },
     });
     upsertEdge(edges, {
       kind: 'visit_instance_same_url_as_timeline_visit',
@@ -1102,10 +1134,29 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
       instance.openerTabSessionId.length > 0 &&
       instance.openerTabSessionId !== instance.tabSessionId
     ) {
+      // Same hydration for the opener — degrade gracefully when its
+      // projection record is absent.
+      const openerRecord = input.tabSessionProjection.bySessionId.get(
+        instance.openerTabSessionId,
+      );
+      const openerLabel =
+        openerRecord?.latestTitle ??
+        hostFromUrl(openerRecord?.latestUrl) ??
+        instance.openerTabSessionId;
       upsertNode(nodes, {
         kind: 'tab-session',
         key: instance.openerTabSessionId,
-        label: instance.openerTabSessionId,
+        label: openerLabel,
+        ...(openerRecord === undefined
+          ? {}
+          : {
+              metadata: {
+                latestTitle: openerRecord.latestTitle,
+                latestUrl: openerRecord.latestUrl,
+                provider: openerRecord.provider,
+                lastActivityAt: openerRecord.lastActivityAt,
+              },
+            }),
       });
       upsertEdge(edges, {
         kind: 'tab_session_opener_chain',

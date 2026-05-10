@@ -10,7 +10,12 @@ import { FEATURE_SCHEMA_VERSION, type CandidatePairFeatures } from '../ranker/fe
 import { CAPTURE_RECORDED } from '../recall/events.js';
 import { SELECTION_COPIED, SELECTION_PASTED } from '../snippets/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
-import { createEmptyTabSessionProjection, projectTabSessions } from '../tabsession/projection.js';
+import {
+  createEmptyTabSessionProjection,
+  projectTabSessions,
+  TAB_SESSION_PROJECTION_SCHEMA_VERSION,
+  type TabSessionProjection,
+} from '../tabsession/projection.js';
 import { THREAD_UPSERTED } from '../threads/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import type { TimelineDayProjection } from '../timeline/projection.js';
@@ -1259,6 +1264,91 @@ describe('connections — content-derived edges', () => {
           edge.toNodeId === nodeIdFor('timeline-visit', 'https://copy.fail'),
       ),
     ).toBe(true);
+  });
+
+  it('tab-session nodes carry latestTitle/latestUrl from the projection so frontend labels are human-readable', () => {
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: [
+        {
+          id: 'https://chatgpt.com/g/g-p-x/c/y',
+          firstSeenAt: '2026-05-07T10:00:00.000Z',
+          lastSeenAt: '2026-05-07T10:00:30.000Z',
+          url: 'https://chatgpt.com/g/g-p-x/c/y',
+          canonicalUrl: 'https://chatgpt.com/g/g-p-x/c/y',
+          visitCount: 1,
+          tabSessionId: 'tses_chat',
+        },
+      ],
+      updatedAt: '2026-05-07T10:00:30.000Z',
+      entryCount: 1,
+    };
+    const tabSessionProjection: TabSessionProjection = {
+      schemaVersion: TAB_SESSION_PROJECTION_SCHEMA_VERSION,
+      bySessionId: new Map([
+        [
+          'tses_chat',
+          {
+            tabSessionId: 'tses_chat',
+            openedAt: '2026-05-07T09:55:00.000Z',
+            lastActivityAt: '2026-05-07T10:00:30.000Z',
+            latestUrl: 'https://chatgpt.com/g/g-p-x/c/y',
+            latestTitle: 'Codex collector — design notes',
+            provider: 'chatgpt',
+            attributionHistory: [],
+          },
+        ],
+      ]),
+      openSessionsByTabId: new Map(),
+    };
+    const snap = buildConnectionsSnapshot(
+      emptyInput({ timelineDays: [day], tabSessionProjection }),
+    );
+    const tabNode = snap.nodes.find((n) => n.id === nodeIdFor('tab-session', 'tses_chat'));
+    expect(tabNode?.label).toBe('Codex collector — design notes');
+    expect(tabNode?.metadata['latestTitle']).toBe('Codex collector — design notes');
+    expect(tabNode?.metadata['latestUrl']).toBe('https://chatgpt.com/g/g-p-x/c/y');
+    expect(tabNode?.metadata['provider']).toBe('chatgpt');
+  });
+
+  it('tab-session label falls back to host when the projection has a URL but no title', () => {
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: [
+        {
+          id: 'https://chatgpt.com/g/g-p-x/c/y',
+          firstSeenAt: '2026-05-07T10:00:00.000Z',
+          lastSeenAt: '2026-05-07T10:00:30.000Z',
+          url: 'https://chatgpt.com/g/g-p-x/c/y',
+          canonicalUrl: 'https://chatgpt.com/g/g-p-x/c/y',
+          visitCount: 1,
+          tabSessionId: 'tses_chat',
+        },
+      ],
+      updatedAt: '2026-05-07T10:00:30.000Z',
+      entryCount: 1,
+    };
+    const tabSessionProjection: TabSessionProjection = {
+      schemaVersion: TAB_SESSION_PROJECTION_SCHEMA_VERSION,
+      bySessionId: new Map([
+        [
+          'tses_chat',
+          {
+            tabSessionId: 'tses_chat',
+            openedAt: '2026-05-07T09:55:00.000Z',
+            lastActivityAt: '2026-05-07T10:00:30.000Z',
+            latestUrl: 'https://chatgpt.com/g/g-p-x/c/y',
+            attributionHistory: [],
+          },
+        ],
+      ]),
+      openSessionsByTabId: new Map(),
+    };
+    const snap = buildConnectionsSnapshot(
+      emptyInput({ timelineDays: [day], tabSessionProjection }),
+    );
+    const tabNode = snap.nodes.find((n) => n.id === nodeIdFor('tab-session', 'tses_chat'));
+    expect(tabNode?.label).toBe('chatgpt.com');
   });
 
   it('explicit tab-session attribution emits tab_session_in_workstream and visit_instance_in_workstream edges', () => {
