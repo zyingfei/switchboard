@@ -893,6 +893,22 @@ const App = () => {
     void loadTabSessions();
   }, [loadTabSessions, state.companionStatus, state.updatedAt, viewMode]);
 
+  // Periodic refresh while the companion is connected so newly observed
+  // browser titles + recorder events flow into the Inbox / suggestion
+  // banner without waiting for state.updatedAt to bump. 4s is a balance
+  // between perceived latency (titles arrive a beat after status:complete)
+  // and HTTP load on the companion. Stops as soon as the companion
+  // disconnects.
+  useEffect(() => {
+    if (state.companionStatus !== 'connected') return;
+    const handle = setInterval(() => {
+      void loadTabSessions();
+    }, 4000);
+    return () => {
+      clearInterval(handle);
+    };
+  }, [loadTabSessions, state.companionStatus]);
+
   useEffect(() => {
     void refresh()
       .catch((loadError: unknown) => {
