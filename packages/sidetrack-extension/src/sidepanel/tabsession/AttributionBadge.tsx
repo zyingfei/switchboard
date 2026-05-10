@@ -1,4 +1,8 @@
-import type { TabSessionRecord, TabSessionWorkstreamOption } from './types';
+import type {
+  TabSessionRecord,
+  TabSessionResolutionResult,
+  TabSessionWorkstreamOption,
+} from './types';
 
 const workstreamLabel = (
   workstreamId: string | null | undefined,
@@ -10,17 +14,28 @@ const workstreamLabel = (
 
 export interface AttributionBadgeProps {
   readonly record?: TabSessionRecord;
+  readonly suggestion?: TabSessionResolutionResult;
   readonly workstreams: readonly TabSessionWorkstreamOption[];
 }
 
-export function AttributionBadge({ record, workstreams }: AttributionBadgeProps) {
+export function AttributionBadge({ record, suggestion, workstreams }: AttributionBadgeProps) {
   const attribution = record?.currentAttribution;
-  const label = workstreamLabel(attribution?.workstreamId, workstreams);
+  const suggestedWorkstreamId = suggestion?.decision.workstreamId;
+  const label = workstreamLabel(attribution?.workstreamId ?? suggestedWorkstreamId, workstreams);
   const asserted = attribution?.source === 'user_asserted' && attribution.workstreamId !== null;
+  const suggested = !asserted && suggestedWorkstreamId !== undefined;
   return (
     <span
-      className={'tab-session-badge ' + (asserted ? 'is-asserted' : 'is-empty')}
-      title={asserted ? `Attributed by you to ${label}` : 'No tab-session attribution'}
+      className={
+        'tab-session-badge ' + (asserted ? 'is-asserted' : suggested ? 'is-suggested' : 'is-empty')
+      }
+      title={
+        asserted
+          ? `Attributed by you to ${label}`
+          : suggested
+            ? `Suggested by Sidetrack: ${label}`
+            : 'No tab-session attribution'
+      }
     >
       {label}
     </span>

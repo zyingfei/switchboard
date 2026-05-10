@@ -533,6 +533,92 @@ describe('live side-panel App wiring', () => {
     });
   });
 
+  it('renders resolver suggestions and confirms them through tab-session attribution', async () => {
+    installChromeMock(
+      {
+        ...liveState(),
+        companionStatus: 'connected',
+        activeTabUrl: 'https://example.test/research',
+      },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    const projection = {
+      schemaVersion: 1,
+      bySessionId: {
+        tses_suggested: {
+          tabSessionId: 'tses_suggested',
+          openedAt: NOW,
+          lastActivityAt: NOW,
+          latestUrl: 'https://example.test/research',
+          latestTitle: 'Open research',
+          attributionHistory: [],
+        },
+      },
+      openSessionsByTabId: { tab_a: 'tses_suggested' },
+    };
+    const suggestion = {
+      tabSessionId: 'tses_suggested',
+      dryRun: true,
+      decision: {
+        action: 'suggest',
+        workstreamId: 'bac_workstream_sibling',
+        margin: 1.35,
+      },
+      fusedCandidates: [
+        {
+          workstreamId: 'bac_workstream_sibling',
+          rawFusionLogit: 2.4,
+          dominantSource: 'ppr',
+          reasons: [
+            {
+              source: 'ppr',
+              summary: 'Signed graph score 0.7',
+              anchors: ['timeline-visit:https://example.test/research'],
+            },
+          ],
+        },
+      ],
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v1/tabsessions/projection')) {
+        return { ok: true, status: 200, json: async () => ({ data: projection }) };
+      }
+      if (url.includes('/v1/tabsessions/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: { items: [], total: 0, limit: 51, offset: 0 },
+          }),
+        };
+      }
+      if (url.includes('/v1/tabsessions/tses_suggested/resolve')) {
+        return { ok: true, status: 200, json: async () => ({ data: suggestion }) };
+      }
+      if (url.includes('/v1/tabsessions/tses_suggested/attribute')) {
+        return { ok: true, status: 201, json: async () => ({ data: { accepted: {} } }) };
+      }
+      return { ok: false, status: 404, text: async () => 'not found' };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+
+    expect(await screen.findByLabelText('Tab-session suggestion')).toHaveTextContent('Sibling');
+    fireEvent.click(screen.getByRole('button', { name: 'Yes' }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        'http://127.0.0.1:17373/v1/tabsessions/tses_suggested/attribute',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ workstreamId: 'bac_workstream_sibling' }),
+        }),
+      );
+    });
+  });
+
   it('pulses the find icon when the active tab matches an unfocused tracked thread', async () => {
     const state = liveState();
     installChromeMock(

@@ -64,6 +64,7 @@ import {
   serializeTabSessionProjection,
   tabSessionInbox,
 } from '../tabsession/projection.js';
+import { resolveAttribution } from '../tabsession/resolver.js';
 import {
   appendEntry as appendEntryRaw,
   gcEntries as gcEntriesRaw,
@@ -1377,6 +1378,57 @@ const routes: readonly RouteDefinition[] = [
             limit,
             offset,
           },
+        },
+      ];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/tabsessions\/(?<tabSessionId>[^/]+)\/resolve$/u,
+    authRequired: true,
+    handle: async (request, _requestId, match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      if (context.connectionsStore === undefined) {
+        throw new HttpRouteError(503, 'CONNECTIONS_NOT_WIRED', 'Connections is not configured.');
+      }
+      const url = new URL(request.url ?? '/v1/tabsessions/resolve', 'http://internal');
+      if (url.searchParams.get('dryRun') !== 'true') {
+        throw new HttpRouteError(
+          400,
+          'VALIDATION_ERROR',
+          'Validation failed.',
+          'Tab-session resolver is dry-run only in this phase.',
+        );
+      }
+      const snapshot = await context.connectionsStore.readCurrent();
+      if (snapshot === null) {
+        throw new HttpRouteError(
+          409,
+          'CONNECTIONS_SNAPSHOT_MISSING',
+          'Connections snapshot is not ready.',
+        );
+      }
+      const tabSessionId = decodeURIComponent(match.tabSessionId ?? '');
+      const merged = await context.eventLog.readMerged();
+      const projection = projectTabSessions(merged);
+      if (!projection.bySessionId.has(tabSessionId)) {
+        throw new HttpRouteError(404, 'TAB_SESSION_NOT_FOUND', 'Tab session was not found.');
+      }
+      return [
+        200,
+        {
+          data: resolveAttribution({
+            tabSessionId,
+            snapshot,
+            projection,
+            events: merged,
+          }),
         },
       ];
     },

@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import type { ConnectionsSnapshot, ConnectionsStore } from '../connections/snapshot.js';
 import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import { createEventLog, type EventLog } from '../sync/eventLog.js';
@@ -15,6 +16,7 @@ describe('tab-session HTTP routes', () => {
   let vaultRoot: string;
   let serverUrl: string;
   let eventLog: EventLog;
+  let currentConnectionsSnapshot: ConnectionsSnapshot | null = null;
   let close: (() => Promise<void>) | null = null;
   const bridgeKey = 'tabsession-bridge-key';
 
@@ -22,6 +24,15 @@ describe('tab-session HTTP routes', () => {
     vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-tabsession-http-'));
     const replica = await loadOrCreateReplica(vaultRoot);
     eventLog = createEventLog(vaultRoot, replica);
+    const connectionsStore: ConnectionsStore = {
+      putCurrent: async (snapshot) => {
+        currentConnectionsSnapshot = snapshot;
+      },
+      readCurrent: async () => currentConnectionsSnapshot,
+      putDay: async () => undefined,
+      readDay: async () => null,
+      listDays: async () => [],
+    };
     const server = createCompanionHttpServer({
       bridgeKey,
       vaultWriter: createVaultWriter(vaultRoot),
@@ -29,6 +40,7 @@ describe('tab-session HTTP routes', () => {
       idempotencyStore: createIdempotencyStore(vaultRoot),
       replica,
       eventLog,
+      connectionsStore,
     });
     const started = await startHttpServer(server, 0);
     serverUrl = started.url;
@@ -73,7 +85,6 @@ describe('tab-session HTTP routes', () => {
         }),
       ]),
     );
-
   });
 
   it('posts an attribution and returns the updated projection in the same request', async () => {
@@ -180,5 +191,103 @@ describe('tab-session HTTP routes', () => {
       readonly data?: { readonly items?: readonly { readonly tabSessionId: string }[] };
     };
     expect(body.data?.items?.map((item) => item.tabSessionId)).toEqual(['tses_a']);
+  });
+
+  it('resolves tab-session attribution candidates through the dry-run endpoint without writes', async () => {
+    await eventLog.appendClient({
+      clientEventId: 'observed-tses-a',
+      aggregateId: '2026-05-07',
+      type: BROWSER_TIMELINE_OBSERVED,
+      payload: {
+        eventId: 'tl-1',
+        observedAt: '2026-05-07T10:00:00.000Z',
+        url: 'https://example.test/a',
+        transition: 'updated',
+        tabIdHash: 'tab_a',
+        tabSessionId: 'tses_a',
+      },
+      baseVector: {},
+    });
+    currentConnectionsSnapshot = {
+      scope: {},
+      nodes: [
+        {
+          id: 'tab-session:tses_a',
+          kind: 'tab-session',
+          label: 'tses_a',
+          originReplicaIds: [],
+          metadata: {},
+        },
+        {
+          id: 'timeline-visit:https://example.test/a',
+          kind: 'timeline-visit',
+          label: 'A',
+          originReplicaIds: [],
+          metadata: {},
+        },
+        {
+          id: 'timeline-visit:https://example.test/anchor',
+          kind: 'timeline-visit',
+          label: 'Anchor',
+          originReplicaIds: [],
+          metadata: {},
+        },
+        {
+          id: 'workstream:ws_security',
+          kind: 'workstream',
+          label: 'Security',
+          originReplicaIds: [],
+          metadata: {},
+        },
+      ],
+      edges: [
+        {
+          id: 'edge:visit-session',
+          kind: 'visit_in_tab_session',
+          fromNodeId: 'timeline-visit:https://example.test/a',
+          toNodeId: 'tab-session:tses_a',
+          observedAt: '2026-05-07T10:00:00.000Z',
+          producedBy: { source: 'event-log' },
+          confidence: 'observed',
+        },
+        {
+          id: 'edge:closest',
+          kind: 'closest_visit',
+          fromNodeId: 'timeline-visit:https://example.test/a',
+          toNodeId: 'timeline-visit:https://example.test/anchor',
+          observedAt: '2026-05-07T10:00:00.000Z',
+          producedBy: { source: 'ranker', revisionId: 'ranker-test' },
+          confidence: 'inferred',
+        },
+        {
+          id: 'edge:visit-workstream',
+          kind: 'visit_in_workstream',
+          fromNodeId: 'timeline-visit:https://example.test/anchor',
+          toNodeId: 'workstream:ws_security',
+          observedAt: '2026-05-07T10:00:00.000Z',
+          producedBy: { source: 'event-log' },
+          confidence: 'asserted',
+        },
+      ],
+      updatedAt: '2026-05-07T10:00:00.000Z',
+      nodeCount: 4,
+      edgeCount: 3,
+    };
+    const before = await eventLog.readMerged();
+
+    const response = await fetch(`${serverUrl}/v1/tabsessions/tses_a/resolve?dryRun=true`, {
+      headers: headers(),
+    });
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      readonly data?: {
+        readonly dryRun?: boolean;
+        readonly fusedCandidates?: readonly { readonly workstreamId?: string }[];
+      };
+    };
+    expect(body.data?.dryRun).toBe(true);
+    expect(body.data?.fusedCandidates?.[0]?.workstreamId).toBe('ws_security');
+    await expect(eventLog.readMerged()).resolves.toEqual(before);
   });
 });

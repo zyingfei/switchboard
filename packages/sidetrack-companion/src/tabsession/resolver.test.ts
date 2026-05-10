@@ -1,0 +1,245 @@
+import { describe, expect, it } from 'vitest';
+
+import type { ConnectionsSnapshot } from '../connections/types.js';
+import type { ClosestVisitRanker } from '../connections/snapshot.js';
+import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
+import type { AcceptedEvent } from '../sync/causal.js';
+import { createPprCache, runPPR, seedHash } from './causalPpr.js';
+import { buildClusterEvidence } from './clusterEvidence.js';
+import { buildEvidenceGraph } from './evidenceGraph.js';
+import { fuseCandidates, type CandidateEvidence } from './fusion.js';
+import { projectTabSessions } from './projection.js';
+import { resolveAttribution } from './resolver.js';
+import { buildSimilarityEvidence } from './similarity.js';
+
+const snapshot = (
+  nodeIds: readonly string[],
+  edges: readonly {
+    readonly kind: ConnectionsSnapshot['edges'][number]['kind'];
+    readonly from: string;
+    readonly to: string;
+  }[],
+): ConnectionsSnapshot => ({
+  scope: {},
+  nodes: nodeIds.map((id) => ({
+    id,
+    kind: id.startsWith('workstream:')
+      ? 'workstream'
+      : id.startsWith('tab-session:')
+        ? 'tab-session'
+        : id.startsWith('topic:')
+          ? 'topic'
+          : 'timeline-visit',
+    label: id,
+    originReplicaIds: [],
+    metadata: {},
+  })),
+  edges: edges.map((edge, index) => ({
+    id: `edge:${String(index)}`,
+    kind: edge.kind,
+    fromNodeId: edge.from,
+    toNodeId: edge.to,
+    observedAt: '2026-05-10T10:00:00.000Z',
+    producedBy: { source: 'event-log' },
+    confidence: edge.kind === 'tab_session_in_workstream' ? 'asserted' : 'observed',
+  })),
+  updatedAt: '2026-05-10T10:00:00.000Z',
+  nodeCount: nodeIds.length,
+  edgeCount: edges.length,
+});
+
+const observed = (
+  seq: number,
+  tabSessionId: string,
+  url = `https://example.test/${tabSessionId}`,
+  title?: string,
+): AcceptedEvent => ({
+  clientEventId: `evt-${String(seq)}`,
+  dot: { replicaId: 'replica-a', seq },
+  deps: {},
+  aggregateId: '2026-05-10',
+  type: BROWSER_TIMELINE_OBSERVED,
+  acceptedAtMs: Date.parse('2026-05-10T10:00:00.000Z') + seq,
+  payload: {
+    eventId: `tl-${String(seq)}`,
+    observedAt: '2026-05-10T10:00:00.000Z',
+    url,
+    canonicalUrl: url,
+    transition: 'updated',
+    tabIdHash: 'tab-a',
+    tabSessionId,
+    ...(title === undefined ? {} : { title }),
+  },
+});
+
+const emptyContributions = (): ReturnType<ClosestVisitRanker['predict']>['contributions'] => ({
+  schemaVersion: 0,
+  same_workstream: 0,
+  opener_chain_depth: 0,
+  in_navigation_chain: 0,
+  same_canonical_url: 0,
+  same_host: 0,
+  same_repo: 0,
+  same_search_query: 0,
+  same_copied_snippet_count: 0,
+  shared_title_tokens: 0,
+  shared_path_tokens: 0,
+  cosine_similarity: 0,
+  recency_score_from: 0,
+  recency_score_to: 0,
+  engagement_class_match: 0,
+  return_count_from: 0,
+  return_count_to: 0,
+  user_asserted_in_thread: 0,
+  user_asserted_in_workstream: 0,
+});
+
+describe('tab-session resolver', () => {
+  it('runs deterministic signed PPR with an iteration cap on a 50-node fixture', () => {
+    const nodes = Array.from({ length: 50 }, (_, index) => `timeline-visit:v${String(index)}`);
+    const edges = nodes.slice(1).map((node, index) => ({
+      kind: 'previous_visit_in_tab_session' as const,
+      from: nodes[index]!,
+      to: node,
+    }));
+    const graph = buildEvidenceGraph(snapshot(nodes, edges));
+    const first = runPPR(graph, new Map([[nodes[0]!, 1]]), 0.15, 1e-9, 50);
+    const second = runPPR(graph, new Map([[nodes[0]!, 1]]), 0.15, 1e-9, 50);
+
+    expect([...first.entries()]).toEqual([...second.entries()]);
+    expect(first.get(nodes[0]!)).toBeGreaterThan(first.get(nodes[49]!) ?? 0);
+  });
+
+  it('keys PPR cache by tab session, graph revision, and deterministic seed hash', () => {
+    const cache = createPprCache(100);
+    const leftSeed = new Map([
+      ['timeline-visit:b', -0.5],
+      ['tab-session:tses_a', 1],
+    ]);
+    const rightSeed = new Map([...leftSeed.entries()].reverse());
+    const key = `tses_a|graph-rev|${seedHash(leftSeed)}`;
+    const result = new Map([['workstream:ws_security', 0.42]]);
+
+    expect(seedHash(leftSeed)).toBe(seedHash(rightSeed));
+    cache.set(key, result, 1_000);
+    expect(cache.get(`tses_a|graph-rev|${seedHash(rightSeed)}`, 1_050)).toBe(result);
+    expect(cache.get(key, 1_200)).toBeNull();
+  });
+
+  it('computes optional cluster posterior with smoothing and min-support', () => {
+    const snap = snapshot(
+      ['topic:a', 'topic:b', 'topic:c', 'topic:d', 'workstream:ws_a', 'workstream:ws_b'],
+      [
+        { kind: 'topic_in_workstream', from: 'topic:a', to: 'workstream:ws_a' },
+        { kind: 'topic_in_workstream', from: 'topic:b', to: 'workstream:ws_a' },
+        { kind: 'topic_in_workstream', from: 'topic:c', to: 'workstream:ws_a' },
+        { kind: 'topic_in_workstream', from: 'topic:d', to: 'workstream:ws_b' },
+      ],
+    );
+
+    expect(buildClusterEvidence(snap)).toEqual([
+      { workstreamId: 'ws_a', support: 3, posterior: 4 / 6 },
+    ]);
+  });
+
+  it('fuses a five-candidate fixture by logit strength', () => {
+    const candidates: CandidateEvidence[] = Array.from({ length: 5 }, (_, index) => ({
+      workstreamId: `ws_${String(index)}`,
+      pprScore: index === 3 ? 0.8 : 0.1,
+      simTopScore: index === 2 ? 0.7 : 0,
+      simMeanScore: 0,
+      simAgreement: 0,
+      simMargin: 0,
+      clusterPosterior: index === 4 ? 0.5 : 0,
+      corroborationCount: 1,
+    }));
+
+    expect(fuseCandidates(candidates)[0]?.workstreamId).toBe('ws_3');
+  });
+
+  it('builds similarity evidence through generated candidates and an injected ranker', () => {
+    const snap = snapshot(
+      [
+        'timeline-visit:https://example.test/current',
+        'timeline-visit:https://example.test/anchor',
+        'workstream:ws_security',
+      ],
+      [
+        {
+          kind: 'visit_in_workstream',
+          from: 'timeline-visit:https://example.test/anchor',
+          to: 'workstream:ws_security',
+        },
+      ],
+    );
+    let predictCalls = 0;
+    const ranker: ClosestVisitRanker = {
+      revisionId: 'ranker-test',
+      predict: (_features, candidate) => {
+        predictCalls += 1;
+        return {
+          score: candidate.toVisitId === 'https://example.test/anchor' ? 0.91 : 0.01,
+          contributions: emptyContributions(),
+        };
+      },
+    };
+
+    const evidence = buildSimilarityEvidence({
+      snapshot: snap,
+      targetVisitNodeIds: new Set(['timeline-visit:https://example.test/current']),
+      events: [
+        observed(1, 'tses_current', 'https://example.test/current', 'Current research'),
+        observed(2, 'tses_anchor', 'https://example.test/anchor', 'Anchor research'),
+      ],
+      closestVisitRanker: ranker,
+    });
+
+    expect(predictCalls).toBeGreaterThan(0);
+    expect(evidence[0]).toMatchObject({
+      workstreamId: 'ws_security',
+      simTopScore: 0.91,
+    });
+  });
+
+  it('resolves a strong causal session with explainable candidates and no writes', () => {
+    const snap = snapshot(
+      [
+        'tab-session:tses_a',
+        'timeline-visit:https://example.test/a',
+        'timeline-visit:https://example.test/anchor',
+        'workstream:ws_security',
+      ],
+      [
+        {
+          kind: 'visit_in_tab_session',
+          from: 'timeline-visit:https://example.test/a',
+          to: 'tab-session:tses_a',
+        },
+        {
+          kind: 'closest_visit',
+          from: 'timeline-visit:https://example.test/a',
+          to: 'timeline-visit:https://example.test/anchor',
+        },
+        {
+          kind: 'visit_in_workstream',
+          from: 'timeline-visit:https://example.test/anchor',
+          to: 'workstream:ws_security',
+        },
+      ],
+    );
+    const events = [observed(1, 'tses_a')];
+    const result = resolveAttribution({
+      tabSessionId: 'tses_a',
+      snapshot: snap,
+      projection: projectTabSessions(events),
+      events,
+      policyMode: 'aggressive',
+      nowMs: Date.parse('2026-05-10T10:01:00.000Z'),
+    });
+
+    expect(result.dryRun).toBe(true);
+    expect(result.decision.action).toBe('auto-apply');
+    expect(result.fusedCandidates[0]?.workstreamId).toBe('ws_security');
+    expect(result.fusedCandidates[0]?.reasons.length).toBeGreaterThan(0);
+  });
+});
