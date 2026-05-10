@@ -39,10 +39,12 @@ import {
 } from '../src/review/draftClient';
 import { drainReviewDraftOutbox } from '../src/review/outbox';
 import {
+  ACTIVE_WORKSTREAM_KEY,
   initializeTimelineWiring,
   readTimelineReplayDiagnostics,
   refreshActiveWorkstreamFromStorage,
   resetTimelineWiringForTests,
+  setActiveWorkstreamCache,
   TIMELINE_ENABLED_KEY,
   TIMELINE_PRIVACY_GATE,
   TIMELINE_REPLAY_DEBUG_KEY,
@@ -3500,6 +3502,44 @@ export default defineBackground(() => {
               error: error instanceof Error ? error.message : 'workstream-cache refresh failed',
             } as unknown as RuntimeResponse);
           });
+        return true;
+      }
+      // Set the active workstream — atomic version of seedStorage +
+      // refresh-workstream-cache. Updates the SW's in-memory cache
+      // first (sync), then writes chrome.storage.local. The cache
+      // update is what observer.observe reads on the emit hot path;
+      // doing it sync first guarantees that any chrome.tabs event
+      // arriving after this message-response sees the new workstream
+      // even if the storage write hasn't yet propagated to other
+      // consumers. The SAS race the previous refresh-workstream-cache
+      // path narrowed (storage write + cache read both async) is
+      // closed here because the cache is no longer derived from a
+      // separate storage read.
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.timeline.set-active-workstream'
+      ) {
+        const value = (message as { workstreamId?: unknown }).workstreamId;
+        const next =
+          typeof value === 'string' && value.length > 0 ? value : null;
+        void (async () => {
+          setActiveWorkstreamCache(next);
+          try {
+            if (next === null) {
+              await chrome.storage.local.remove(ACTIVE_WORKSTREAM_KEY);
+            } else {
+              await chrome.storage.local.set({ [ACTIVE_WORKSTREAM_KEY]: next });
+            }
+            sendResponse({ ok: true, workstreamId: next } as unknown as RuntimeResponse);
+          } catch (error: unknown) {
+            sendResponse({
+              ok: false,
+              error:
+                error instanceof Error ? error.message : 'set-active-workstream storage write failed',
+            } as unknown as RuntimeResponse);
+          }
+        })();
         return true;
       }
       if (

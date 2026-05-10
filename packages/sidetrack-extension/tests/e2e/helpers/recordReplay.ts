@@ -921,12 +921,30 @@ const installRouteStubs = async (
     string,
     { readonly canonicalUrl: string; readonly title: string; readonly body?: string }
   >();
+  // Multiple recorded canonical URLs can share a routeKey
+  // (origin+pathname), e.g. github.com/.../pulls and
+  // github.com/.../pulls?q=is:pr+is:closed both have pathname
+  // /zyingfei/switchboard/pulls. Track ALL canonicals per routeKey so
+  // a single browser request increments hits for every recorded
+  // canonical that shares that routeKey — otherwise the canonicals
+  // not chosen as the "primary" stub get falsely reported as
+  // route-stub misses even though the underlying page was visited.
+  const canonicalsByRouteKey = new Map<string, Set<string>>();
   for (const stub of routeStubs) {
-    stubs.set(routeKeyFor(stub.url), {
-      canonicalUrl: stub.canonicalUrl,
-      title: stub.title,
-      ...(stub.body === undefined ? {} : { body: stub.body }),
-    });
+    const key = routeKeyFor(stub.url);
+    // First-write wins for the body fulfillment; that arbitrary choice
+    // is fine because both URLs render the same path. The hits map is
+    // what determines the page-replay layer's pass/fail.
+    if (!stubs.has(key)) {
+      stubs.set(key, {
+        canonicalUrl: stub.canonicalUrl,
+        title: stub.title,
+        ...(stub.body === undefined ? {} : { body: stub.body }),
+      });
+    }
+    const set = canonicalsByRouteKey.get(key) ?? new Set<string>();
+    set.add(stub.canonicalUrl);
+    canonicalsByRouteKey.set(key, set);
   }
   const hits = new Map<string, number>();
   const fulfilledBodies = new Map<string, string>();
@@ -934,7 +952,8 @@ const installRouteStubs = async (
   await context.route(/^https?:\/\//u, async (route) => {
     const rawRequestUrl = route.request().url();
     const requestUrl = sanitizeTimelineUrl(rawRequestUrl);
-    const stub = stubs.get(routeKeyFor(requestUrl));
+    const key = routeKeyFor(requestUrl);
+    const stub = stubs.get(key);
     if (stub === undefined) {
       if (strictOffline) {
         if (isLoopbackHttpUrl(rawRequestUrl)) {
@@ -948,7 +967,13 @@ const installRouteStubs = async (
       await route.fallback();
       return;
     }
-    hits.set(stub.canonicalUrl, (hits.get(stub.canonicalUrl) ?? 0) + 1);
+    // Increment hits for every canonical that shares this routeKey,
+    // not just the body-fulfillment winner. See routeKey-collision
+    // comment above.
+    const matchingCanonicals = canonicalsByRouteKey.get(key) ?? new Set([stub.canonicalUrl]);
+    for (const canonical of matchingCanonicals) {
+      hits.set(canonical, (hits.get(canonical) ?? 0) + 1);
+    }
     const body =
       stub.body ??
       `<!doctype html><title>${escapeHtml(stub.title)}</title><body><h1>${escapeHtml(
@@ -963,7 +988,9 @@ const installRouteStubs = async (
   });
   return {
     expectedCanonicalUrls: [
-      ...new Set([...stubs.values()].map((stub) => stub.canonicalUrl)),
+      ...new Set(
+        [...canonicalsByRouteKey.values()].flatMap((set) => [...set]),
+      ),
     ].sort(),
     hitCounts: () => new Map(hits),
     fulfilledBodies: () => new Map(fulfilledBodies),
@@ -1072,22 +1099,31 @@ export const driveReplayBrowserFromPack = async (input: {
     const delayMs = Math.max(0, targetMs - (Date.now() - startedAtMs));
     if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
     if (event.kind === 'workstreamSwitch') {
-      await input.runtime.seedStorage(input.senderPage, {
-        [ACTIVE_WORKSTREAM_STORAGE_KEY]: event.workstreamId,
-      });
-      // chrome.storage.onChanged fires async after `set()` resolves;
-      // for replays that switch workstreams in rapid succession, the
-      // observer's cached workstream id can lag the next page.goto
-      // and emit unattributed events. Force a synchronous refresh so
-      // the next navigation's emit reads the new workstream id and
-      // the companion produces the corresponding visit_in_workstream
-      // edge. Best-effort — older builds without the handler return
-      // ok:false and we proceed anyway.
-      await input.runtime
+      // Atomic switch via the new set-active-workstream message:
+      // the SW's in-memory cache is updated first (sync), then
+      // chrome.storage.local is written. This eliminates the
+      // storage→cache race the previous seedStorage +
+      // refresh-workstream-cache pair only narrowed: even if
+      // chrome.storage.onChanged is still in flight, observer.observe
+      // reads the new workstream id from the cache the moment this
+      // message resolves. Falls back to the previous path on builds
+      // older than fix/replay-residuals-final-shot.
+      const setResult = await input.runtime
         .sendRuntimeMessage(input.senderPage, {
-          type: 'sidetrack.timeline.refresh-workstream-cache',
+          type: 'sidetrack.timeline.set-active-workstream',
+          workstreamId: event.workstreamId,
         })
-        .catch(() => undefined);
+        .catch(() => null);
+      if (!isOkRuntimeResponse(setResult)) {
+        await input.runtime.seedStorage(input.senderPage, {
+          [ACTIVE_WORKSTREAM_STORAGE_KEY]: event.workstreamId,
+        });
+        await input.runtime
+          .sendRuntimeMessage(input.senderPage, {
+            type: 'sidetrack.timeline.refresh-workstream-cache',
+          })
+          .catch(() => undefined);
+      }
       continue;
     }
     if (event.kind === 'tabOpen') {
@@ -2244,17 +2280,43 @@ const edgeScore = (edge: ConnectionsEnvelope['data']['snapshot']['edges'][number
   return edge.kind === 'closest_visit' || edge.kind === 'visit_resembles_visit' ? 1 : 0;
 };
 
+// Hostnames whose visits are content-watching/listening, not auth /
+// configuration / settings. Subdomain-aware so accounts.youtube.com
+// (an OAuth flow) is NOT considered ambient even though it shares the
+// `youtube.com` parent. The previous substring-based check matched
+// any URL containing `youtube.com` and false-flagged the auth path
+// the L5 recorder captured during ChatGPT login.
+const AMBIENT_HOSTS: readonly string[] = [
+  'www.youtube.com',
+  'youtube.com',
+  'm.youtube.com',
+  'music.youtube.com',
+  'youtu.be',
+  'open.spotify.com',
+  'spotify.com',
+  'soundcloud.com',
+  'www.soundcloud.com',
+  'www.netflix.com',
+  'netflix.com',
+  'twitch.tv',
+  'www.twitch.tv',
+];
+
 const isAmbientVisit = (event: Extract<SessionEvent, { readonly kind: 'navigation' }>): boolean => {
-  const haystack = `${event.canonicalUrl} ${event.title}`.toLowerCase();
-  return (
-    haystack.includes('youtube.com') ||
-    haystack.includes('youtu.be') ||
-    haystack.includes('spotify.com') ||
-    haystack.includes('music') ||
-    haystack.includes('soundcloud.com') ||
-    haystack.includes('netflix.com') ||
-    haystack.includes('twitch.tv')
-  );
+  let host = '';
+  try {
+    host = new URL(event.canonicalUrl).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (AMBIENT_HOSTS.includes(host)) return true;
+  // Title heuristic: only fires when the URL's host doesn't already
+  // suggest a non-ambient surface. "music" is the only title token —
+  // it's a strong enough signal for music-app titles ("Discover Weekly
+  // — Spotify Music") but specific enough not to false-fire on
+  // arbitrary pages that mention the word in passing.
+  const title = (event.title ?? '').toLowerCase();
+  return title.includes('music');
 };
 
 const isSearchVisit = (event: Extract<SessionEvent, { readonly kind: 'navigation' }>): boolean => {

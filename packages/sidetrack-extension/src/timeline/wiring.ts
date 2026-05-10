@@ -241,6 +241,22 @@ export const refreshActiveWorkstreamFromStorage = async (): Promise<string | und
   return cachedActiveWorkstreamId;
 };
 
+// Set the active-workstream cache directly to a known value, without
+// going through chrome.storage. Used by the replay-from-pack driver
+// to atomically swap the cached workstream + chrome.storage.local
+// value in one runtime-message turn, eliminating the storage→cache
+// race that `refreshActiveWorkstreamFromStorage` only narrows.
+// The caller is responsible for also persisting the value to
+// chrome.storage.local so other consumers (the side panel, future
+// SW restarts) read the same value; the SET-then-write contract
+// is documented at the runtime-message handler in
+// entrypoints/background.ts.
+export const setActiveWorkstreamCache = (workstreamId: string | null | undefined): void => {
+  cachedActiveWorkstreamId =
+    typeof workstreamId === 'string' && workstreamId.length > 0 ? workstreamId : undefined;
+  activeWorkstreamCacheRefreshes += 1;
+};
+
 const startActiveWorkstreamCache = async (): Promise<void> => {
   await refreshActiveWorkstreamCache();
   const c = (
