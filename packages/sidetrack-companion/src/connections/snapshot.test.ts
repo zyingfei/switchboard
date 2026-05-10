@@ -1325,6 +1325,111 @@ describe('connections — content-derived edges', () => {
     });
   });
 
+  it('same canonicalUrl in two tab sessions only attributes the asserted session', () => {
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: [
+        {
+          id: 'copy-fail-tses-a',
+          firstSeenAt: '2026-05-07T10:00:00.000Z',
+          lastSeenAt: '2026-05-07T10:00:30.000Z',
+          url: 'https://copy.fail',
+          canonicalUrl: 'https://copy.fail',
+          visitCount: 1,
+          tabSessionId: 'tses_a',
+        },
+        {
+          id: 'copy-fail-tses-b',
+          firstSeenAt: '2026-05-07T10:05:00.000Z',
+          lastSeenAt: '2026-05-07T10:05:30.000Z',
+          url: 'https://copy.fail',
+          canonicalUrl: 'https://copy.fail',
+          visitCount: 1,
+          tabSessionId: 'tses_b',
+        },
+      ],
+      updatedAt: '2026-05-07T10:05:30.000Z',
+      entryCount: 2,
+    };
+    const events: AcceptedEvent[] = [
+      buildEvent({
+        seq: 1,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: {
+          eventId: 'tl-a',
+          observedAt: '2026-05-07T10:00:00.000Z',
+          url: 'https://copy.fail',
+          canonicalUrl: 'https://copy.fail',
+          transition: 'updated',
+          tabIdHash: 'tab_a',
+          tabSessionId: 'tses_a',
+        },
+      }),
+      buildEvent({
+        seq: 2,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: {
+          eventId: 'tl-b',
+          observedAt: '2026-05-07T10:05:00.000Z',
+          url: 'https://copy.fail',
+          canonicalUrl: 'https://copy.fail',
+          transition: 'updated',
+          tabIdHash: 'tab_b',
+          tabSessionId: 'tses_b',
+        },
+      }),
+      buildEvent({
+        seq: 3,
+        type: USER_ORGANIZED_ITEM,
+        payload: {
+          payloadVersion: 1,
+          itemKind: 'tab-session',
+          itemId: 'tses_a',
+          action: 'move',
+          toContainer: 'ws_security',
+        },
+      }),
+    ];
+    const tabSessionProjection = projectTabSessions(events);
+    const snap = buildConnectionsSnapshot(
+      emptyInput({ events, timelineDays: [day], tabSessionProjection }),
+    );
+
+    expect([...tabSessionProjection.bySessionId.keys()].sort()).toEqual(['tses_a', 'tses_b']);
+    expect(tabSessionProjection.bySessionId.get('tses_a')?.currentAttribution).toMatchObject({
+      workstreamId: 'ws_security',
+      source: 'user_asserted',
+    });
+    expect(tabSessionProjection.bySessionId.get('tses_b')?.currentAttribution).toBeUndefined();
+
+    expect(
+      snap.edges.filter(
+        (edge) =>
+          edge.kind === 'visit_in_tab_session' &&
+          edge.fromNodeId === nodeIdFor('timeline-visit', 'https://copy.fail'),
+      ),
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ toNodeId: nodeIdFor('tab-session', 'tses_a') }),
+        expect.objectContaining({ toNodeId: nodeIdFor('tab-session', 'tses_b') }),
+      ]),
+    );
+    expect(
+      snap.edges.filter(
+        (edge) =>
+          edge.kind === 'tab_session_in_workstream' &&
+          edge.toNodeId === nodeIdFor('workstream', 'ws_security'),
+      ),
+    ).toEqual([expect.objectContaining({ fromNodeId: nodeIdFor('tab-session', 'tses_a') })]);
+    expect(
+      snap.edges.filter(
+        (edge) =>
+          edge.kind === 'visit_in_workstream' &&
+          edge.fromNodeId === nodeIdFor('timeline-visit', 'https://copy.fail'),
+      ),
+    ).toEqual([expect.objectContaining({ toNodeId: nodeIdFor('workstream', 'ws_security') })]);
+  });
+
   it('visit_in_tab_session subgraph: anchored on tab-session reaches every session visit', () => {
     const day: TimelineDayProjection = {
       date: '2026-05-07',
