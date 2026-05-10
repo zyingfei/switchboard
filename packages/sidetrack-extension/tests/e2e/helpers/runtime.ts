@@ -194,9 +194,44 @@ const attachOverCdp = async (cdpUrl: string): Promise<ExtensionRuntime> => {
       }, message);
     },
     async seedStorage(senderPage: Page, values: Record<string, unknown>) {
-      await senderPage.evaluate(async (vals) => {
-        await chrome.storage.local.set(vals);
-      }, values);
+      // Wait briefly for chrome.storage to become available — under stealth /
+      // CFT launches the extension service worker can register a beat after
+      // the sidepanel page hits domcontentloaded.
+      const diagnostic = await senderPage.evaluate(
+        async ({ vals, retries, intervalMs }) => {
+          const c = (
+            globalThis as unknown as {
+              chrome?: { storage?: { local?: { set?: (v: unknown) => Promise<void> } } };
+            }
+          ).chrome;
+          const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+          for (let i = 0; i < retries; i += 1) {
+            const setFn = c?.storage?.local?.set;
+            if (typeof setFn === 'function') {
+              await setFn.call(c?.storage?.local, vals);
+              return { ok: true } as const;
+            }
+            await sleep(intervalMs);
+          }
+          return {
+            ok: false,
+            url: location.href,
+            chromePresent: c !== undefined,
+            storagePresent: c?.storage !== undefined,
+            localPresent: c?.storage?.local !== undefined,
+          } as const;
+        },
+        { vals: values, retries: 50, intervalMs: 100 },
+      );
+      if (diagnostic.ok !== true) {
+        throw new Error(
+          `seedStorage: chrome.storage.local.set unavailable after 5s polling. ` +
+            `url=${diagnostic.url} ` +
+            `chromePresent=${String(diagnostic.chromePresent)} ` +
+            `storagePresent=${String(diagnostic.storagePresent)} ` +
+            `localPresent=${String(diagnostic.localPresent)}`,
+        );
+      }
     },
     async close() {
       // Don't close the user's Chrome AND don't call browser.close()
@@ -379,9 +414,44 @@ export const launchExtensionRuntime = async (
       }, message);
     },
     async seedStorage(senderPage: Page, values: Record<string, unknown>) {
-      await senderPage.evaluate(async (vals) => {
-        await chrome.storage.local.set(vals);
-      }, values);
+      // Wait briefly for chrome.storage to become available — under stealth /
+      // CFT launches the extension service worker can register a beat after
+      // the sidepanel page hits domcontentloaded.
+      const diagnostic = await senderPage.evaluate(
+        async ({ vals, retries, intervalMs }) => {
+          const c = (
+            globalThis as unknown as {
+              chrome?: { storage?: { local?: { set?: (v: unknown) => Promise<void> } } };
+            }
+          ).chrome;
+          const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+          for (let i = 0; i < retries; i += 1) {
+            const setFn = c?.storage?.local?.set;
+            if (typeof setFn === 'function') {
+              await setFn.call(c?.storage?.local, vals);
+              return { ok: true } as const;
+            }
+            await sleep(intervalMs);
+          }
+          return {
+            ok: false,
+            url: location.href,
+            chromePresent: c !== undefined,
+            storagePresent: c?.storage !== undefined,
+            localPresent: c?.storage?.local !== undefined,
+          } as const;
+        },
+        { vals: values, retries: 50, intervalMs: 100 },
+      );
+      if (diagnostic.ok !== true) {
+        throw new Error(
+          `seedStorage: chrome.storage.local.set unavailable after 5s polling. ` +
+            `url=${diagnostic.url} ` +
+            `chromePresent=${String(diagnostic.chromePresent)} ` +
+            `storagePresent=${String(diagnostic.storagePresent)} ` +
+            `localPresent=${String(diagnostic.localPresent)}`,
+        );
+      }
     },
     async close() {
       try {
