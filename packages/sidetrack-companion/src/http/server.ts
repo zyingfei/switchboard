@@ -3499,6 +3499,37 @@ const routes: readonly RouteDefinition[] = [
   },
   {
     method: 'GET',
+    pattern: /^\/v1\/workstreams\/projections$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      // Bulk endpoint used by extension's refreshCachedWorkstreams: enumerate
+      // every aggregate id touched by a WORKSTREAM_UPSERTED or
+      // WORKSTREAM_DELETED event and project each one. This is the bridge
+      // from the companion's relay-replicated event log to the extension's
+      // chrome.storage cache, so workstreams created on Browser A reach
+      // Browser B's side panel via the standard sync path.
+      const events = await context.eventLog.readMerged();
+      const aggregateIds = new Set<string>();
+      for (const event of events) {
+        if (event.type === WORKSTREAM_UPSERTED || event.type === WORKSTREAM_DELETED) {
+          aggregateIds.add(event.aggregateId);
+        }
+      }
+      const projections = [...aggregateIds]
+        .sort()
+        .map((bacId) => projectWorkstream(bacId, events));
+      return [200, { data: projections }];
+    },
+  },
+  {
+    method: 'GET',
     pattern: /^\/v1\/workstreams\/(?<bacId>[A-Za-z0-9_-]+)\/projection$/,
     authRequired: true,
     handle: async (_request, _requestId, match, context) => {
