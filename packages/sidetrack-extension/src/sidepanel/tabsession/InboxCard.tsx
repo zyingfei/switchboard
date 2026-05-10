@@ -1,8 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
 
+import { Icons } from '../../../entrypoints/sidepanel/components/icons';
 import { formatRelative } from '../../util/time';
+import type { ConnectionNode } from '../connections/types';
+import type { EntityDisplayCtx } from '../entityDisplay/format';
 import { AttributionBadge } from './AttributionBadge';
 import { AttributionProvenance } from './AttributionProvenance';
+import { tabSessionDisplayTitle } from './displayTitle';
 import {
   TAB_SESSION_DRAG_MIME,
   type TabSessionRecord,
@@ -20,15 +24,16 @@ const hostFor = (record: TabSessionRecord): string => {
   }
 };
 
-const titleFor = (record: TabSessionRecord): string =>
-  record.latestTitle?.trim() || record.latestUrl || record.tabSessionId;
-
 export interface InboxCardProps {
   readonly record: TabSessionRecord;
   readonly suggestion?: TabSessionResolutionResult;
   readonly workstreams: readonly TabSessionWorkstreamOption[];
   readonly onAttribute: (tabSessionId: string, workstreamId: string | null) => void;
   readonly onOpenTab?: (record: TabSessionRecord) => void;
+  // Optional; when present, anchor labels in the provenance row use
+  // the live connections snapshot to render human-friendly text.
+  readonly nodeById?: ReadonlyMap<string, ConnectionNode>;
+  readonly displayCtx?: EntityDisplayCtx;
 }
 
 export function InboxCard({
@@ -37,6 +42,8 @@ export function InboxCard({
   workstreams,
   onAttribute,
   onOpenTab,
+  nodeById,
+  displayCtx,
 }: InboxCardProps) {
   const defaultWorkstreamId = suggestion?.decision.workstreamId ?? workstreams[0]?.bac_id ?? '';
   const [selectedWorkstreamId, setSelectedWorkstreamId] = useState(defaultWorkstreamId);
@@ -44,10 +51,11 @@ export function InboxCard({
     if (defaultWorkstreamId.length > 0) setSelectedWorkstreamId(defaultWorkstreamId);
   }, [defaultWorkstreamId]);
   const host = hostFor(record);
-  const title = titleFor(record);
+  const title = tabSessionDisplayTitle(record);
   const currentWorkstreamId = record.currentAttribution?.workstreamId;
   const canMove = selectedWorkstreamId.length > 0 && selectedWorkstreamId !== currentWorkstreamId;
   const canDismiss = record.currentAttribution?.workstreamId !== null;
+  const canOpenTab = onOpenTab !== undefined && record.latestUrl !== undefined;
   const faviconLetter = useMemo(() => host.slice(0, 1).toUpperCase() || '?', [host]);
 
   return (
@@ -66,27 +74,39 @@ export function InboxCard({
       </div>
       <div className="tab-session-card-main">
         <div className="tab-session-card-head">
-          {onOpenTab !== undefined && record.latestUrl !== undefined ? (
+          <span className="tab-session-title" title={record.latestUrl ?? title}>
+            {title}
+          </span>
+          <AttributionBadge record={record} suggestion={suggestion} workstreams={workstreams} />
+          {canOpenTab ? (
             <button
               type="button"
-              className="tab-session-title tab-session-title-link"
+              className="tab-session-go-to"
               onClick={() => {
                 onOpenTab(record);
               }}
               title="Switch to this tab or reopen it"
+              aria-label="Go to tab"
+              data-testid={`tab-session-go-to-${record.tabSessionId}`}
             >
-              {title}
+              <span className="icon-12" aria-hidden>
+                {Icons.arrowR}
+              </span>
+              <span>Go to</span>
             </button>
-          ) : (
-            <span className="tab-session-title">{title}</span>
-          )}
-          <AttributionBadge record={record} suggestion={suggestion} workstreams={workstreams} />
+          ) : null}
         </div>
         <div className="tab-session-meta mono">
           <span>{host}</span>
           <span>{formatRelative(record.lastActivityAt)}</span>
         </div>
-        <AttributionProvenance record={record} suggestion={suggestion} workstreams={workstreams} />
+        <AttributionProvenance
+          record={record}
+          suggestion={suggestion}
+          workstreams={workstreams}
+          {...(nodeById === undefined ? {} : { nodeById })}
+          {...(displayCtx === undefined ? {} : { displayCtx })}
+        />
         <div className="tab-session-actions">
           <label className="tab-session-picker">
             <span className="sr-only">Move to</span>

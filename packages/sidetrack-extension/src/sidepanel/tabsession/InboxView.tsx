@@ -1,3 +1,5 @@
+import type { ConnectionNode } from '../connections/types';
+import type { EntityDisplayCtx } from '../entityDisplay/format';
 import { InboxCard } from './InboxCard';
 import { sliceInboxForPanel } from './inboxPriority';
 import type {
@@ -16,6 +18,8 @@ export interface InboxViewProps {
   readonly onRefresh: () => void;
   readonly onAttribute: (tabSessionId: string, workstreamId: string | null) => void;
   readonly onOpenTab?: (record: TabSessionRecord) => void;
+  readonly nodeById?: ReadonlyMap<string, ConnectionNode>;
+  readonly displayCtx?: EntityDisplayCtx;
 }
 
 export function InboxView({
@@ -27,6 +31,8 @@ export function InboxView({
   onRefresh,
   onAttribute,
   onOpenTab,
+  nodeById,
+  displayCtx,
 }: InboxViewProps) {
   const slice = sliceInboxForPanel(inbox.items, inbox.total);
   return (
@@ -54,6 +60,8 @@ export function InboxView({
             workstreams={workstreams}
             onAttribute={onAttribute}
             {...(onOpenTab === undefined ? {} : { onOpenTab })}
+            {...(nodeById === undefined ? {} : { nodeById })}
+            {...(displayCtx === undefined ? {} : { displayCtx })}
           />
         ))}
       </div>

@@ -105,6 +105,13 @@ export const KindIcons: Record<ConnectionNodeKind, ReactElement> = {
       <path d="M7 12v6c0 1.7 2.2 3 5 3s5-1.3 5-3v-6" />
     </svg>
   ),
+  template: (
+    <svg {...baseProps}>
+      <rect x="4" y="4" width="16" height="16" rx="2" />
+      <path d="M4 9h16" />
+      <path d="M9 9v11" />
+    </svg>
+  ),
 };
 
 export const SearchIcon = (

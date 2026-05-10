@@ -83,10 +83,14 @@ import { formatRelative } from '../../src/util/time';
 import { createSuggestionsClient } from '../../src/companion/suggestionsClient';
 import { listPendingOffers, markStatus, type OfferRecord } from '../../src/codingAttach/state';
 import { ConnectionsView } from '../../src/sidepanel/connections/ConnectionsView';
+import { hostOf, type EntityDisplayCtx } from '../../src/sidepanel/entityDisplay/format';
+import { useReplicaAliasMap } from '../../src/sidepanel/entityDisplay/replicaAliases';
 import { AttributionBadge } from '../../src/sidepanel/tabsession/AttributionBadge';
+import { tabSessionDisplayTitle } from '../../src/sidepanel/tabsession/displayTitle';
 import { InboxCard } from '../../src/sidepanel/tabsession/InboxCard';
 import { InboxView } from '../../src/sidepanel/tabsession/InboxView';
 import { SuggestionBanner } from '../../src/sidepanel/tabsession/SuggestionBanner';
+import { loadOrCreateEdgeReplica } from '../../src/sync/edgeReplicaId';
 import {
   TAB_SESSION_DRAG_MIME,
   type TabSessionInboxData,
@@ -737,6 +741,36 @@ const App = () => {
   const resolveWorkstreamLabel = useCallback(
     (workstreamId: string) => workstreamPath(workstreamId, state.workstreams),
     [state.workstreams],
+  );
+  // Unified display context for the entityDisplay helpers — feeds
+  // ConnectionsView and the Inbox provenance row. `resolveWorkstreamPath`
+  // returns null when the workstream isn't in the local list so the
+  // helper can fall back to "Unknown workstream" instead of leaking a
+  // raw bac_id. Replica aliases are persisted by useReplicaAliasMap so
+  // numbering stays stable across panel reloads.
+  const [localReplicaId, setLocalReplicaId] = useState<string | undefined>(undefined);
+  useEffect(() => {
+    let cancelled = false;
+    void loadOrCreateEdgeReplica().then((replica) => {
+      if (!cancelled) setLocalReplicaId(replica.edgeReplicaId);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const replicaAlias = useReplicaAliasMap({
+    ...(localReplicaId === undefined ? {} : { localReplicaId }),
+    observedReplicaIds: [],
+  });
+  const displayCtx = useMemo<EntityDisplayCtx>(
+    () => ({
+      resolveWorkstreamPath: (bacId) => {
+        const found = state.workstreams.find((w) => w.bac_id === bacId);
+        return found === undefined ? null : workstreamPath(bacId, state.workstreams);
+      },
+      replicaAlias,
+    }),
+    [state.workstreams, replicaAlias],
   );
   // Invalidate every cached suggestion when the workstream
   // fingerprint shifts (rename, member move, new/deleted workstream).
@@ -4458,22 +4492,33 @@ const App = () => {
       >
         <div className="tab-attribution-card-head">
           <span className="tab-attribution-card-eyebrow mono">Current tab</span>
+          {focusedTabSession !== undefined ? (
+            <span
+              className="tab-attribution-card-title"
+              title={focusedTabSession.latestUrl ?? tabSessionDisplayTitle(focusedTabSession)}
+            >
+              {tabSessionDisplayTitle(focusedTabSession)}
+            </span>
+          ) : (
+            <span className="tab-attribution-card-title subtle">No tracked tab in focus</span>
+          )}
           {focusedTabSession !== undefined && focusedTabSession.latestUrl !== undefined ? (
             <button
               type="button"
-              className="tab-attribution-card-title-link"
+              className="tab-session-go-to"
               onClick={() => {
                 openTabForSession(focusedTabSession);
               }}
               title="Switch to this tab or reopen it"
+              aria-label="Go to tab"
+              data-testid="focused-tab-go-to"
             >
-              {focusedTabSession.latestTitle?.trim() ||
-                focusedTabSession.latestUrl ||
-                focusedTabSession.tabSessionId}
+              <span className="icon-12" aria-hidden>
+                {Icons.arrowR}
+              </span>
+              <span>Go to</span>
             </button>
-          ) : (
-            <span className="tab-attribution-card-title subtle">No tracked tab in focus</span>
-          )}
+          ) : null}
         </div>
         <div className="tab-attribution-card-body">
           <span className="tab-attribution-card-prefix mono">In workstream:</span>
@@ -4772,6 +4817,7 @@ const App = () => {
       {viewMode === 'connections' ? (
         <ConnectionsView
           {...(currentWsId === null ? {} : { initialAnchor: `workstream:${currentWsId}` })}
+          displayCtx={displayCtx}
           workstreamAnchors={state.workstreams.map((w) => ({
             id: `workstream:${w.bac_id}`,
             label: workstreamPath(w.bac_id, state.workstreams),
@@ -4780,15 +4826,25 @@ const App = () => {
             ...[...state.threads]
               .sort((a, b) => (a.lastSeenAt < b.lastSeenAt ? 1 : -1))
               .slice(0, 6)
-              .map((t) => ({
-                id: `thread:${t.bac_id}`,
-                kind: 'thread' as const,
-                label: t.title || t.threadUrl,
-              })),
+              .map((t) => {
+                // Never fall back to the raw threadUrl as a visible label —
+                // it's how the URL leak showed up in the recent-anchors strip.
+                // Title first, then host of the thread URL, then a kind label.
+                const label =
+                  t.title.trim().length > 0
+                    ? t.title
+                    : (hostOf(t.threadUrl) ?? '(untitled thread)');
+                return {
+                  id: `thread:${t.bac_id}`,
+                  kind: 'thread' as const,
+                  label,
+                };
+              }),
             ...[...state.workstreams].slice(0, 3).map((w) => ({
               id: `workstream:${w.bac_id}`,
               kind: 'workstream' as const,
-              label: w.title || w.bac_id,
+              // Always render the path (parent walk) — never the bac_id.
+              label: workstreamPath(w.bac_id, state.workstreams),
             })),
           ]}
           onOpenUrl={(url) => {
@@ -4890,6 +4946,7 @@ const App = () => {
                       workstreams={tabSessionWorkstreams}
                       onAttribute={handleTabSessionAttribute}
                       onOpenTab={openTabForSession}
+                      displayCtx={displayCtx}
                     />
                   ))}
                 </div>
@@ -4909,6 +4966,7 @@ const App = () => {
           }}
           onAttribute={handleTabSessionAttribute}
           onOpenTab={openTabForSession}
+          displayCtx={displayCtx}
         />
       ) : (
         <>

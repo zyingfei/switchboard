@@ -1,24 +1,11 @@
 import { useState } from 'react';
 
+import { tabSessionDisplayTitle, tabSessionDisplayUrl } from './displayTitle';
 import type {
   TabSessionRecord,
   TabSessionResolutionResult,
   TabSessionWorkstreamOption,
 } from './types';
-
-const blankToUndefined = (input: string | undefined): string | undefined => {
-  if (input === undefined) return undefined;
-  const trimmed = input.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
-};
-
-const displayTitle = (record: TabSessionRecord): string =>
-  blankToUndefined(record.latestTitle) ??
-  blankToUndefined(record.latestUrl) ??
-  record.tabSessionId;
-
-const displayUrl = (record: TabSessionRecord): string | undefined =>
-  blankToUndefined(record.latestUrl);
 
 const workstreamLabel = (
   workstreamId: string | undefined,
@@ -54,9 +41,10 @@ export function SuggestionBanner({
     <section className="tab-session-suggestion-banner" aria-label="Tab-session suggestion">
       <div className="tab-session-suggestion-copy">
         <b>{workstreamLabel(suggestedWorkstreamId, workstreams)}</b>
-        <span className="tab-session-suggestion-title">{displayTitle(record)}</span>
-        {displayUrl(record) !== undefined && displayUrl(record) !== displayTitle(record) ? (
-          <span className="mono tab-session-suggestion-url">{displayUrl(record)}</span>
+        <span className="tab-session-suggestion-title">{tabSessionDisplayTitle(record)}</span>
+        {tabSessionDisplayUrl(record) !== undefined &&
+        tabSessionDisplayUrl(record) !== tabSessionDisplayTitle(record) ? (
+          <span className="mono tab-session-suggestion-url">{tabSessionDisplayUrl(record)}</span>
         ) : null}
       </div>
       <div className="tab-session-suggestion-actions">

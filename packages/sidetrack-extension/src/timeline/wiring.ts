@@ -531,8 +531,17 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
         updateLastOnUpdated(sequence, { skippedReason: 'gate-closed' });
         return;
       }
-      if (changeInfo.url === undefined && changeInfo.status !== 'complete') {
-        updateLastOnUpdated(sequence, { skippedReason: 'no-url-and-not-complete' });
+      // ChatGPT / Gemini / other SPAs update `document.title` long after
+      // status:complete fires (the chat content streams in). Chrome
+      // dispatches that as `onUpdated` with `changeInfo = { title: ... }`,
+      // no URL, no status. We must thread title-only updates through to
+      // the observer so the tab-session projection picks up `latestTitle`
+      // and the Inbox / current-tab card show a human-readable string
+      // instead of the canonical URL.
+      const hasTitleChange =
+        typeof changeInfo.title === 'string' && changeInfo.title.length > 0;
+      if (changeInfo.url === undefined && changeInfo.status !== 'complete' && !hasTitleChange) {
+        updateLastOnUpdated(sequence, { skippedReason: 'no-url-and-not-complete-and-no-title' });
         return;
       }
       const url = tab.url ?? changeInfo.url;

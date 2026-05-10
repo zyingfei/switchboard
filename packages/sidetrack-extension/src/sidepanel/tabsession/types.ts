@@ -39,6 +39,19 @@ export interface TabSessionWorkstreamOption {
   readonly path: string;
 }
 
+// Sync Contract v1 / read-response (NOT a sync event) — the resolver
+// returns reasons[].anchors. As of payload schemaVersion 2, anchors
+// may be either bare node-id strings (legacy) or enriched objects
+// carrying { id, kind, label } drawn from the resolver's evidence
+// graph. The frontend reader (formatAnchorDisplay / upgradeAnchor in
+// entityDisplay/format.ts) accepts both forms so the companion and
+// extension can deploy independently.
+export interface AttributionAnchor {
+  readonly id: string;
+  readonly kind?: string;
+  readonly label?: string;
+}
+
 export interface TabSessionResolverCandidate {
   readonly workstreamId: string;
   readonly rawFusionLogit: number;
@@ -46,7 +59,7 @@ export interface TabSessionResolverCandidate {
   readonly reasons: readonly {
     readonly source: 'ppr' | 'similarity' | 'cluster';
     readonly summary: string;
-    readonly anchors: readonly string[];
+    readonly anchors: readonly (string | AttributionAnchor)[];
   }[];
 }
 

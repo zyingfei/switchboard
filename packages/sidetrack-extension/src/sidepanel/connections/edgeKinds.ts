@@ -257,6 +257,7 @@ export const NODE_KIND_DISPLAY: Record<
   snippet: { label: 'Snippet', tintClass: 'cx-type-snippet' },
   topic: { label: 'Topic', tintClass: 'cx-type-topic' },
   replica: { label: 'Replica', tintClass: 'cx-type-replica' },
+  template: { label: 'Template', tintClass: 'cx-type-template' },
 };
 
 // Display order for kind groups in the linked-panels center column.
@@ -276,6 +277,7 @@ export const NODE_KIND_GROUP_ORDER: readonly ConnectionNodeKind[] = [
   'annotation',
   'queue-item',
   'inbound-reminder',
+  'template',
 ];
 
 // Tiny inline hint for content-derived edges; preserved from the

@@ -443,8 +443,7 @@ button:disabled {
   letter-spacing: 0.04em;
   color: var(--ink-3);
 }
-.tab-attribution-card-title,
-.tab-attribution-card-title-link {
+.tab-attribution-card-title {
   font-weight: 600;
   font-size: 13px;
   color: var(--ink-1);
@@ -453,17 +452,6 @@ button:disabled {
   white-space: nowrap;
   min-width: 0;
   flex: 1;
-}
-.tab-attribution-card-title-link {
-  background: none;
-  border: 0;
-  padding: 0;
-  text-align: left;
-  cursor: pointer;
-  text-decoration: underline dotted;
-}
-.tab-attribution-card-title-link:hover {
-  color: var(--accent, #0b57d0);
 }
 .tab-attribution-card-body {
   display: flex;
@@ -494,24 +482,46 @@ button:disabled {
   color: var(--ink-3);
 }
 
-/* Linkified tab-session title inside InboxCard (matches the
-   thread-title behaviour: click to focus the live tab or reopen). */
-.tab-session-title-link {
-  background: none;
-  border: 0;
-  padding: 0;
+/* Explicit "Go to" affordance for tab-session cards (InboxCard) and the
+   current-tab card. Mirrors `.thread-actions .thread-action-icon` from
+   the workstream thread rows so the affordance reads identically across
+   surfaces. The icon-then-label pattern is what users now associate with
+   "open this in a tab" elsewhere in the panel. */
+.tab-session-go-to {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  padding: 3px 7px;
+  border: 1px solid var(--rule-soft, #e5ddc9);
+  border-radius: 4px;
+  background: var(--paper-light, #fbf7ee);
+  color: var(--ink-3, #7a7269);
+  font-size: 11px;
+  font-weight: 500;
+  min-height: 0;
+  line-height: 1;
   cursor: pointer;
-  text-decoration: underline dotted;
-  text-align: left;
-  font: inherit;
-  color: inherit;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  transition:
+    border-color 120ms ease,
+    color 120ms ease,
+    background-color 120ms ease;
 }
-.tab-session-title-link:hover {
-  color: var(--accent, #0b57d0);
+.tab-session-go-to:hover,
+.tab-session-go-to:focus-visible {
+  border-color: var(--rule, #d4cdb8);
+  background: var(--paper, #f5efe2);
+  color: var(--signal, #c2410c);
+  outline: none;
+}
+.tab-session-go-to .icon-12 {
+  width: 13px;
+  height: 13px;
+  display: inline-flex;
+}
+.tab-session-go-to .icon-12 svg {
+  width: 13px;
+  height: 13px;
 }
 
 .tab-session-list {

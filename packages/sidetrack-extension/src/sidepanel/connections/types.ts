@@ -16,7 +16,8 @@ export type ConnectionNodeKind =
   | 'annotation'
   | 'snippet'
   | 'topic'
-  | 'replica';
+  | 'replica'
+  | 'template';
 
 export interface ConnectionNode {
   readonly id: string;
