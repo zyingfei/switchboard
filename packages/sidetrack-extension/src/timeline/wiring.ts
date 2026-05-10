@@ -229,6 +229,18 @@ const refreshActiveWorkstreamCache = async (): Promise<void> => {
   }
 };
 
+// Exposed so the replay-from-pack driver (and any other test that
+// programmatically writes ACTIVE_WORKSTREAM_KEY in rapid succession)
+// can force a cache refresh synchronously rather than waiting for
+// the chrome.storage.onChanged listener — which fires async after
+// `set()` resolves and may lose to the next page.goto if the replay
+// loop drives navigations on the heels of a workstreamSwitch event.
+// Returns a string when a workstream is focused, undefined otherwise.
+export const refreshActiveWorkstreamFromStorage = async (): Promise<string | undefined> => {
+  await refreshActiveWorkstreamCache();
+  return cachedActiveWorkstreamId;
+};
+
 const startActiveWorkstreamCache = async (): Promise<void> => {
   await refreshActiveWorkstreamCache();
   const c = (

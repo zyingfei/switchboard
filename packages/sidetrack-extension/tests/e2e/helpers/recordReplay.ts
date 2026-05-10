@@ -9,6 +9,7 @@ import path from 'node:path';
 import type { BrowserContext, Page } from '@playwright/test';
 
 import { redact } from '../../../../sidetrack-companion/src/safety/redaction';
+import { canonicalThreadUrl } from '../../../src/capture/providerDetection';
 import { sanitizeTimelineUrl } from '../../../src/timeline/sanitize';
 import type { TestCompanion } from './companion';
 import type { ManualEvent, ManualSnapshotFile } from './manualRecorder';
@@ -659,12 +660,20 @@ const convertManualBrowserEvents = (input: {
     if (event.kind === 'navigation') {
       const url = manualEventUrl(event);
       if (url === null || !isReplayScopedUrl(url)) continue;
-      const canonicalUrl = stripTrailingSlash(sanitizeTimelineUrl(url));
+      // Mirror the runtime observer's canonicalization: it applies
+      // canonicalThreadUrl to the raw URL, then sanitizeTimelineUrl
+      // to the result. Without canonicalThreadUrl here, provider URLs
+      // with locale params (e.g. gemini.google.com/app/<id>?hl=en-US)
+      // get stored in the pack with the param but get stripped at
+      // replay time, producing an "unexpected/missing" mismatch in
+      // companion-projection.
+      const sanitizedUrl = stripTrailingSlash(sanitizeTimelineUrl(url));
+      const canonicalUrl = stripTrailingSlash(sanitizeTimelineUrl(canonicalThreadUrl(url)));
       events.push({
         kind: 'navigation',
         atMs,
         tabIdHash,
-        url: canonicalUrl,
+        url: sanitizedUrl,
         canonicalUrl,
         title: titleForManualNavigation(event, input.snapshots) ?? canonicalUrl,
         transition: 'updated',
@@ -688,7 +697,11 @@ const snapshotsFromManualFiles = (
   const output: Record<string, HtmlSnapshot> = {};
   for (const snapshot of snapshots) {
     if (!isReplayScopedUrl(snapshot.url)) continue;
-    const canonicalUrl = stripTrailingSlash(sanitizeTimelineUrl(snapshot.url));
+    // Same canonicalization the navigation events use, so pack
+    // snapshots and pack events agree on the canonical key.
+    const canonicalUrl = stripTrailingSlash(
+      sanitizeTimelineUrl(canonicalThreadUrl(snapshot.url)),
+    );
     const redacted =
       snapshot.redactionCounts === undefined
         ? redactHtmlForSessionPack(snapshot.html)
@@ -1062,6 +1075,19 @@ export const driveReplayBrowserFromPack = async (input: {
       await input.runtime.seedStorage(input.senderPage, {
         [ACTIVE_WORKSTREAM_STORAGE_KEY]: event.workstreamId,
       });
+      // chrome.storage.onChanged fires async after `set()` resolves;
+      // for replays that switch workstreams in rapid succession, the
+      // observer's cached workstream id can lag the next page.goto
+      // and emit unattributed events. Force a synchronous refresh so
+      // the next navigation's emit reads the new workstream id and
+      // the companion produces the corresponding visit_in_workstream
+      // edge. Best-effort — older builds without the handler return
+      // ok:false and we proceed anyway.
+      await input.runtime
+        .sendRuntimeMessage(input.senderPage, {
+          type: 'sidetrack.timeline.refresh-workstream-cache',
+        })
+        .catch(() => undefined);
       continue;
     }
     if (event.kind === 'tabOpen') {

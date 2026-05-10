@@ -765,6 +765,61 @@ describe('T1 record/replay session pack helpers', () => {
     expect(tightSlow).toEqual([0, 1000, 2000, 3000, 4000]);
   });
 
+  it('applies canonicalThreadUrl during conversion so provider locale params do not split canonicals', () => {
+    const pack = createSessionPackFromManualRecorder({
+      captureLevel: 'html',
+      sidetrackVersion: 'test',
+      sessionId: 'ses_01HX0000000000000000000003',
+      recordedAt: '2026-05-09T12:00:00.000Z',
+      browsers: [
+        {
+          label: 'A',
+          activeWorkstreamId: 'ws_t1',
+          events: [
+            {
+              at: '2026-05-09T12:00:00.000Z',
+              kind: 'page-opened',
+              pageId: 'p01',
+              pageUrl: 'about:blank',
+            },
+            {
+              at: '2026-05-09T12:00:00.100Z',
+              kind: 'navigation',
+              pageId: 'p01',
+              pageUrl: 'https://gemini.google.com/app/abc?hl=en-US',
+              title: 'Gemini',
+            },
+          ],
+          snapshots: [
+            {
+              capturedAt: '2026-05-09T12:00:00.150Z',
+              pageId: 'p01',
+              reason: 'navigation',
+              url: 'https://gemini.google.com/app/abc?hl=en-US',
+              title: 'Gemini',
+              html: '<main>Gemini</main>',
+            },
+          ],
+        },
+      ],
+    });
+    const browser = pack.browsers[0];
+    const navigation = browser.events.find((event) => event.kind === 'navigation');
+    expect(navigation).toBeDefined();
+    if (navigation === undefined || navigation.kind !== 'navigation') {
+      throw new Error('expected a navigation event');
+    }
+    // Runtime canonicalization strips ?hl=en-US for Gemini app URLs;
+    // pack must mirror that or replay will report unexpected/missing.
+    expect(navigation.canonicalUrl).toBe('https://gemini.google.com/app/abc');
+    // The bare URL (the one page.goto will use during replay) keeps
+    // the locale param so route stubs match the recorded request.
+    expect(navigation.url).toBe('https://gemini.google.com/app/abc?hl=en-US');
+    // Snapshot is keyed by canonicalUrl, not url, so installRouteStubsForPack
+    // can find it via the navigation's canonicalUrl.
+    expect(Object.keys(browser.snapshots)).toEqual(['https://gemini.google.com/app/abc']);
+  });
+
   it('routeKeyFor normalizes trailing slashes so /pulls and /pulls/ match', () => {
     expect(routeKeyFor('https://example.test/pulls')).toBe('https://example.test/pulls');
     expect(routeKeyFor('https://example.test/pulls/')).toBe('https://example.test/pulls');

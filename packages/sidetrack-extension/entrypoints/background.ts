@@ -41,6 +41,7 @@ import { drainReviewDraftOutbox } from '../src/review/outbox';
 import {
   initializeTimelineWiring,
   readTimelineReplayDiagnostics,
+  refreshActiveWorkstreamFromStorage,
   resetTimelineWiringForTests,
   TIMELINE_ENABLED_KEY,
   TIMELINE_PRIVACY_GATE,
@@ -3470,6 +3471,33 @@ export default defineBackground(() => {
             sendResponse({
               ok: false,
               error: error instanceof Error ? error.message : 'force-drain failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+      // Synchronously refresh the active-workstream cache from
+      // chrome.storage.local. Used by the replay-from-pack driver
+      // after each workstreamSwitch event so the next navigation's
+      // emit reads a fresh workstream id rather than the stale
+      // value the chrome.storage.onChanged listener hasn't yet
+      // propagated. Returns the resolved id (or null when no
+      // workstream is focused) so callers can sanity-check.
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.timeline.refresh-workstream-cache'
+      ) {
+        void refreshActiveWorkstreamFromStorage()
+          .then((workstreamId) => {
+            sendResponse({
+              ok: true,
+              workstreamId: workstreamId ?? null,
+            } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'workstream-cache refresh failed',
             } as unknown as RuntimeResponse);
           });
         return true;
