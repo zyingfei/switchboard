@@ -31,11 +31,13 @@ const observed = (input: {
   buildEvent({
     seq: input.seq,
     type: BROWSER_TIMELINE_OBSERVED,
-    payload: {
-      eventId: `tl-${String(input.seq)}`,
-      observedAt: input.observedAt,
-      url: `https://example.test/${input.tabSessionId}/${String(input.seq)}`,
-      transition: input.transition ?? 'updated',
+      payload: {
+        eventId: `tl-${String(input.seq)}`,
+        observedAt: input.observedAt,
+        url: `https://example.test/${input.tabSessionId}/${String(input.seq)}`,
+        title: `Page ${String(input.seq)}`,
+        provider: 'generic',
+        transition: input.transition ?? 'updated',
       ...(input.tabIdHash === undefined ? {} : { tabIdHash: input.tabIdHash }),
       tabSessionId: input.tabSessionId,
       ...(input.openerTabSessionId === undefined
@@ -84,6 +86,11 @@ describe('tab-session projection', () => {
       workstreamId: 'ws_new',
       source: 'user_asserted',
       clientEventId: 'evt-3',
+    });
+    expect(left.bySessionId['tses_a']).toMatchObject({
+      latestUrl: 'https://example.test/tses_a/1',
+      latestTitle: 'Page 1',
+      provider: 'generic',
     });
     expect(left.openSessionsByTabId).toEqual({ tab_a: 'tses_a' });
   });

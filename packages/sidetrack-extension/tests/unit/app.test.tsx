@@ -450,6 +450,89 @@ describe('live side-panel App wiring', () => {
     });
   });
 
+  it('renders the tab-session Inbox tab and posts move decisions', async () => {
+    installChromeMock(
+      {
+        ...liveState(),
+        companionStatus: 'connected',
+        activeTabUrl: 'https://example.test/research',
+      },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    const projection = {
+      schemaVersion: 1,
+      bySessionId: {
+        tses_test: {
+          tabSessionId: 'tses_test',
+          openedAt: NOW,
+          lastActivityAt: NOW,
+          latestUrl: 'https://example.test/research',
+          latestTitle: 'Research page',
+          currentAttribution: {
+            workstreamId: 'bac_workstream_root',
+            source: 'user_asserted',
+            observedAt: NOW,
+            clientEventId: 'evt-1',
+          },
+          attributionHistory: [],
+        },
+        tses_inbox: {
+          tabSessionId: 'tses_inbox',
+          openedAt: NOW,
+          lastActivityAt: NOW,
+          latestUrl: 'https://copy.fail',
+          latestTitle: 'Copy fail',
+          attributionHistory: [],
+        },
+      },
+      openSessionsByTabId: { tab_a: 'tses_test' },
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v1/tabsessions/projection')) {
+        return { ok: true, status: 200, json: async () => ({ data: projection }) };
+      }
+      if (url.includes('/v1/tabsessions/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: {
+              items: [projection.bySessionId.tses_inbox],
+              total: 1,
+              limit: 51,
+              offset: 0,
+            },
+          }),
+        };
+      }
+      if (url.includes('/v1/tabsessions/tses_inbox/attribute')) {
+        return { ok: true, status: 201, json: async () => ({ data: { accepted: {} } }) };
+      }
+      return { ok: false, status: 404, text: async () => 'not found' };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('focused-tab-attribution')).toHaveTextContent('Sidetrack');
+    });
+    fireEvent.click(screen.getByRole('tab', { name: 'Inbox' }));
+    expect(await screen.findByText('Copy fail')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Move' }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        'http://127.0.0.1:17373/v1/tabsessions/tses_inbox/attribute',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ workstreamId: 'bac_workstream_root' }),
+        }),
+      );
+    });
+  });
+
   it('pulses the find icon when the active tab matches an unfocused tracked thread', async () => {
     const state = liveState();
     installChromeMock(
