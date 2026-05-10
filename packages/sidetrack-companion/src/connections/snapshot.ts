@@ -85,9 +85,12 @@ export type { ConnectionsSnapshot } from './types.js';
 //                                         visit's query (whole-word match)
 //   visit_resembles_visit                deterministic visit similarity
 //                                        revision over title/host/path
-//   visit_in_workstream                   timeline observer stamped a
-//                                         workstreamId on the visit (active
-//                                         workstream attribution)
+//   visit_in_tab_session                  timeline projection records a
+//                                         stable tabSessionId for a visit
+//   tab_session_opener_chain              child tab-session opened from a
+//                                         parent tab-session
+//   visit_in_workstream                   Phase 2: explicit tab-session
+//                                         attribution to workstream
 //   previous_visit_in_tab_session         chrome.webNavigation same-tab
 //                                         sequence evidence
 //   opener_visit                          chrome.webNavigation opener tab
@@ -869,29 +872,63 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
           ...(engagementClass === undefined
             ? {}
             : { engagement: { class: engagementClass.class } }),
-          ...(entry.workstreamId === undefined ? {} : { workstreamId: entry.workstreamId }),
+          ...(entry.tabSessionId === undefined ? {} : { tabSessionId: entry.tabSessionId }),
+          ...(entry.openerTabSessionId === undefined
+            ? {}
+            : { openerTabSessionId: entry.openerTabSessionId }),
         },
       });
-      // Active-workstream attribution edge: emit when the timeline
-      // entry carries a workstreamId stamped by the side-panel
-      // observer at observation time. Lazy-create the workstream
-      // node so the edge endpoint is valid even if WORKSTREAM_UPSERTED
-      // hasn't been replayed yet.
-      if (typeof entry.workstreamId === 'string' && entry.workstreamId.length > 0) {
+      if (typeof entry.tabSessionId === 'string' && entry.tabSessionId.length > 0) {
         upsertNode(nodes, {
-          kind: 'workstream',
-          key: entry.workstreamId,
-          label: entry.workstreamId,
+          kind: 'tab-session',
+          key: entry.tabSessionId,
+          label: entry.tabSessionId,
         });
         upsertEdge(edges, {
-          kind: 'visit_in_workstream',
+          kind: 'visit_in_tab_session',
           fromNodeId: nodeIdFor('timeline-visit', visitKey),
-          toNodeId: nodeIdFor('workstream', entry.workstreamId),
+          toNodeId: nodeIdFor('tab-session', entry.tabSessionId),
           observedAt: entry.lastSeenAt,
           producedBy: { source: 'timeline-projection' },
-          confidence: 'inferred',
+          confidence: 'observed',
         });
+        if (
+          typeof entry.openerTabSessionId === 'string' &&
+          entry.openerTabSessionId.length > 0 &&
+          entry.openerTabSessionId !== entry.tabSessionId
+        ) {
+          upsertNode(nodes, {
+            kind: 'tab-session',
+            key: entry.openerTabSessionId,
+            label: entry.openerTabSessionId,
+          });
+          upsertEdge(edges, {
+            kind: 'tab_session_opener_chain',
+            fromNodeId: nodeIdFor('tab-session', entry.tabSessionId),
+            toNodeId: nodeIdFor('tab-session', entry.openerTabSessionId),
+            observedAt: entry.lastSeenAt,
+            producedBy: { source: 'timeline-projection' },
+            confidence: 'observed',
+          });
+        }
       }
+      // PHASE 2: replace the old active-pointer edge below with a
+      // lookup through the tab-session attribution projection.
+      // if (typeof entry.workstreamId === 'string' && entry.workstreamId.length > 0) {
+      //   upsertNode(nodes, {
+      //     kind: 'workstream',
+      //     key: entry.workstreamId,
+      //     label: entry.workstreamId,
+      //   });
+      //   upsertEdge(edges, {
+      //     kind: 'visit_in_workstream',
+      //     fromNodeId: nodeIdFor('timeline-visit', visitKey),
+      //     toNodeId: nodeIdFor('workstream', entry.workstreamId),
+      //     observedAt: entry.lastSeenAt,
+      //     producedBy: { source: 'timeline-projection' },
+      //     confidence: 'inferred',
+      //   });
+      // }
       const threadId = threadIdByUrl.get(visitKey);
       if (threadId !== undefined) {
         upsertNode(nodes, { kind: 'thread', key: threadId, label: threadId });

@@ -35,14 +35,16 @@ export interface BrowserTimelineObservedPayload {
   readonly transition: TimelineTransition;
   readonly tabIdHash?: string;
   readonly windowIdHash?: string;
-  // Active-workstream attribution (Phase 4). When the user has a
-  // workstream focused in the side panel at observation time, the
-  // observer stamps this on the event so the connections graph can
-  // emit `visit_in_workstream` and ambient browsing (search /
-  // YouTube / generic doc pages) attaches to the right flow without
-  // needing the URL to be pasted into a chat. Optional — visits
-  // observed without an active workstream stay orphan, exactly the
-  // same as before this field existed.
+  // Stable tab-session identity minted by the extension. Phase 1
+  // uses this instead of the active workstream pointer as the
+  // browser-visit attribution primitive. openerTabSessionId is
+  // optional and present only when Chrome exposes an opener chain.
+  readonly tabSessionId?: string;
+  readonly openerTabSessionId?: string;
+  // Legacy optional field accepted for backwards compatibility with
+  // older Class F spool entries. New extension observations do not
+  // stamp workstreamId; Phase 2 restores visit_in_workstream through
+  // explicit tab-session attribution.
   readonly workstreamId?: string;
   readonly payloadVersion?: number;
   readonly dimensions?: Record<string, unknown>;
@@ -75,6 +77,13 @@ export const TIMELINE_URL_MAX_LENGTH = 4096;
 export const TIMELINE_TITLE_MAX_LENGTH = 1024;
 export const TIMELINE_HASH_MAX_LENGTH = 64;
 export const TIMELINE_EVENT_ID_MAX_LENGTH = 256;
+export const TIMELINE_TAB_SESSION_ID_MAX_LENGTH = 128;
+
+const isStableId = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  value.length > 0 &&
+  value.length <= TIMELINE_TAB_SESSION_ID_MAX_LENGTH &&
+  /^[A-Za-z0-9_-]+$/u.test(value);
 
 export const isBrowserTimelineObservedPayload = (
   value: unknown,
@@ -107,16 +116,18 @@ export const isBrowserTimelineObservedPayload = (
     if (typeof value['windowIdHash'] !== 'string') return false;
     if ((value['windowIdHash'] as string).length > TIMELINE_HASH_MAX_LENGTH) return false;
   }
+  if (value['tabSessionId'] !== undefined && !isStableId(value['tabSessionId'])) return false;
+  if (
+    value['openerTabSessionId'] !== undefined &&
+    !isStableId(value['openerTabSessionId'])
+  ) {
+    return false;
+  }
   if (!hasValidPayloadExtensionFields(value)) return false;
   if (value['workstreamId'] !== undefined) {
-    if (typeof value['workstreamId'] !== 'string') return false;
-    // Same shape constraint as bac-id elsewhere (alnum + hyphen +
-    // underscore, bounded length). Defensive check at the import
-    // boundary; the side-panel sets this from chrome.storage so a
-    // stolen bridge key shouldn't be able to inject arbitrary text.
-    if ((value['workstreamId'] as string).length === 0) return false;
-    if ((value['workstreamId'] as string).length > 128) return false;
-    if (!/^[A-Za-z0-9_-]+$/u.test(value['workstreamId'] as string)) return false;
+    // Backwards-compatible validation for older active-pointer
+    // observations.
+    if (!isStableId(value['workstreamId'])) return false;
   }
   return true;
 };

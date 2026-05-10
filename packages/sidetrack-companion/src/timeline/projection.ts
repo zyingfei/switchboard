@@ -43,11 +43,15 @@ export interface TimelineEntry {
   readonly title?: string;
   readonly provider?: TimelineProvider;
   readonly visitCount: number;
-  // Active-workstream attribution (Phase 4). Set by the side-panel
-  // observer when the user has a workstream focused at observation
-  // time. Last-write-wins by `observedAt` — a URL revisited under a
-  // different workstream rebinds. Optional — visits observed without
-  // a focused workstream stay unattributed.
+  // Stable tab-session identity. Last-write-wins by observedAt so a
+  // URL revisited in a new tab-session rebinds to that session in the
+  // daily projection. Existing rows without tabSessionId remain
+  // unattributed until Phase 2 adds explicit attribution.
+  readonly tabSessionId?: string;
+  readonly openerTabSessionId?: string;
+  // Legacy active-pointer field retained for old projections only.
+  // Phase 1 stops new extension observations from setting this and
+  // Connections no longer uses it for visit attribution.
   readonly workstreamId?: string;
 }
 
@@ -112,6 +116,9 @@ export const reduceTimelineEvents = (
     visitCount: number;
     titleObservedAt?: string;
     providerObservedAt?: string;
+    tabSessionId?: string;
+    openerTabSessionId?: string;
+    tabSessionObservedAt?: string;
     workstreamId?: string;
     workstreamObservedAt?: string;
   }>();
@@ -131,6 +138,15 @@ export const reduceTimelineEvents = (
         ...(event.provider === undefined
           ? {}
           : { provider: event.provider, providerObservedAt: event.observedAt }),
+        ...(event.tabSessionId === undefined
+          ? {}
+          : {
+              tabSessionId: event.tabSessionId,
+              ...(event.openerTabSessionId === undefined
+                ? {}
+                : { openerTabSessionId: event.openerTabSessionId }),
+              tabSessionObservedAt: event.observedAt,
+            }),
         ...(event.workstreamId === undefined
           ? {}
           : { workstreamId: event.workstreamId, workstreamObservedAt: event.observedAt }),
@@ -151,6 +167,23 @@ export const reduceTimelineEvents = (
       if (existing.providerObservedAt === undefined || event.observedAt >= existing.providerObservedAt) {
         existing.provider = event.provider;
         existing.providerObservedAt = event.observedAt;
+      }
+    }
+    // tabSessionId: last-write-wins. This keeps the projection
+    // deterministic while letting Phase 1 distinguish a revisited URL
+    // that moved to a new tab-session boundary.
+    if (event.tabSessionId !== undefined && event.tabSessionId.length > 0) {
+      if (
+        existing.tabSessionObservedAt === undefined ||
+        event.observedAt >= existing.tabSessionObservedAt
+      ) {
+        existing.tabSessionId = event.tabSessionId;
+        existing.tabSessionObservedAt = event.observedAt;
+        if (event.openerTabSessionId === undefined) {
+          delete existing.openerTabSessionId;
+        } else {
+          existing.openerTabSessionId = event.openerTabSessionId;
+        }
       }
     }
     // workstreamId: last-write-wins. Tracks "what flow was the user
@@ -178,6 +211,10 @@ export const reduceTimelineEvents = (
       ...(agg.canonicalUrl === undefined ? {} : { canonicalUrl: agg.canonicalUrl }),
       ...(agg.title === undefined ? {} : { title: agg.title }),
       ...(agg.provider === undefined ? {} : { provider: agg.provider }),
+      ...(agg.tabSessionId === undefined ? {} : { tabSessionId: agg.tabSessionId }),
+      ...(agg.openerTabSessionId === undefined
+        ? {}
+        : { openerTabSessionId: agg.openerTabSessionId }),
       ...(agg.workstreamId === undefined ? {} : { workstreamId: agg.workstreamId }),
       visitCount: agg.visitCount,
     });

@@ -23,6 +23,10 @@ const observe = (input: Partial<BrowserTimelineObservedPayload> & { observedAt: 
   ...(input.provider === undefined ? {} : { provider: input.provider }),
   ...(input.tabIdHash === undefined ? {} : { tabIdHash: input.tabIdHash }),
   ...(input.windowIdHash === undefined ? {} : { windowIdHash: input.windowIdHash }),
+  ...(input.tabSessionId === undefined ? {} : { tabSessionId: input.tabSessionId }),
+  ...(input.openerTabSessionId === undefined
+    ? {}
+    : { openerTabSessionId: input.openerTabSessionId }),
 });
 
 describe('timeline projection reducer (Class B)', () => {
@@ -95,6 +99,28 @@ describe('timeline projection reducer (Class B)', () => {
     const entries = reduceTimelineEvents(events);
     expect(entries[0]?.id).toBe('https://no-canonical/foo');
     expect(entries[0]?.canonicalUrl).toBeUndefined();
+  });
+
+  it('threads tabSessionId through TimelineEntry with last-write-wins semantics', () => {
+    const events = [
+      observe({
+        observedAt: '2026-05-07T10:00:00.000Z',
+        url: 'https://x/a',
+        canonicalUrl: 'https://x/a',
+        tabSessionId: 'tses_older',
+      }),
+      observe({
+        observedAt: '2026-05-07T10:05:00.000Z',
+        url: 'https://x/a',
+        canonicalUrl: 'https://x/a',
+        tabSessionId: 'tses_newer',
+        openerTabSessionId: 'tses_parent',
+      }),
+    ];
+    const entries = reduceTimelineEvents(events);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.tabSessionId).toBe('tses_newer');
+    expect(entries[0]?.openerTabSessionId).toBe('tses_parent');
   });
 
   it('strips fragments and trailing slashes from entry id', () => {

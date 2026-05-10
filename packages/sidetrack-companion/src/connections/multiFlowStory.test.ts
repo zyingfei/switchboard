@@ -38,7 +38,6 @@ const COMPANION_EMITTED_KINDS: readonly string[] = [
   'annotation_references_url',
   'thread_quotes_thread',
   'thread_text_mentions_search_query',
-  'visit_in_workstream',
 ];
 
 describe('connections — multi-flow user-story integration', () => {
