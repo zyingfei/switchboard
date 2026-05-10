@@ -586,6 +586,54 @@ describe('T1 record/replay session pack helpers', () => {
     }
   });
 
+  it('isAmbientVisit checks hostname (not substring) so auth subdomains do not register as ambient', () => {
+    // Re-using the spec's basePack helpers via the public analyzer is the
+    // fastest way to exercise isAmbientVisit transitively. Build a tiny
+    // pack with one ambient URL and one auth-subdomain URL that the old
+    // substring check would have false-classified as ambient.
+    const buildPack = (canonicalUrl: string, title: string): SessionPack => ({
+      ...basePack(),
+      mode: { browsers: 1, captureLevel: 'minimal' },
+      browsers: [
+        {
+          label: 'A',
+          activeWorkstreamId: 'ws_focus',
+          snapshots: {},
+          events: [
+            { kind: 'workstreamSwitch', atMs: 0, workstreamId: 'ws_focus' },
+            navigation(0, 'tab_a', canonicalUrl, title),
+          ],
+        },
+      ],
+    });
+    const cases: ReadonlyArray<readonly [string, string, boolean]> = [
+      ['https://www.youtube.com/watch?v=abc', 'Music mix', true],
+      ['https://youtu.be/abc', 'Music mix', true],
+      ['https://accounts.youtube.com/accounts/SetSID', 'Sign in', false],
+      ['https://music.youtube.com/playlist/abc', 'Music', true],
+      ['https://example.test/music-theory-101', 'Music theory 101', true],
+      ['https://example.test/page', 'About us', false],
+    ];
+    for (const [canonicalUrl, title, expected] of cases) {
+      const pack = buildPack(canonicalUrl, title);
+      const analysis = analyzeReplayQuality({
+        pack,
+        timeline: timelineFor(pack),
+        connections: connectionsFor(recordedCanonicalUrls(pack), [
+          {
+            kind: 'visit_in_workstream',
+            fromNodeId: visitNodeId(canonicalUrl),
+            toNodeId: 'workstream:ws_focus',
+          },
+        ]),
+      });
+      const ambientWarning = analysis.qualitativeWarnings.find(
+        (w) => w.kind === 'ambient-page-attached-to-wrong-workstream',
+      );
+      expect(ambientWarning !== undefined, `${canonicalUrl} (title: ${title})`).toBe(expected);
+    }
+  });
+
   it('does not flag known-provider URLs as cloudflare-challenge purely on title', () => {
     // The L5 recorder captures the page title at navigation time, which
     // may be "Just a moment..." even though the canonical URL is the
