@@ -46,6 +46,11 @@ import {
 import { startTestRelay, type TestRelay } from './helpers/relay';
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
 import { SETTINGS_KEY, SETUP_KEY } from './helpers/sidepanel';
+import {
+  computeT1FStatus,
+  isT1FullProductEnabled,
+  runT1FullProductE2ECases,
+} from './helpers/tabsessionProductBehavior';
 
 interface HtmlWorkflowStep {
   readonly url: string;
@@ -487,6 +492,15 @@ test.describe('manual T1 Wave 2b two-browser relay record/replay', () => {
     }
 
     const heldUrls = HOLD_REQUESTED ? [replayPanelA.url(), replayPanelB.url()] : undefined;
+
+    const t1FullProductChecks = isT1FullProductEnabled()
+      ? await runT1FullProductE2ECases({
+          companionA: replayCompanionA,
+          companionB: replayCompanionB,
+          redactionRegressionPassed: true,
+        })
+      : [];
+
     const report = evaluateOneBrowserReplay({
       pack,
       routeTracker,
@@ -496,8 +510,18 @@ test.describe('manual T1 Wave 2b two-browser relay record/replay', () => {
       connections: surfacesOnB.connections,
       ...(heldUrls === undefined ? {} : { heldUrls }),
       strictOffline: STRICT_OFFLINE,
+      productBehavior: t1FullProductChecks,
     });
     const writtenReport = await writeReplayReport(writtenPack.packDir, report);
+    if (isT1FullProductEnabled()) {
+      const t1f = computeT1FStatus(report.productBehavior);
+      // eslint-disable-next-line no-console
+      console.log(
+        `[record-replay-2b] T1-F status: ${t1f.status}; missing=${String(t1f.missing.length)} failed=${String(t1f.failed.length)}`,
+      );
+      expect(t1f.missing).toEqual([]);
+      expect(t1f.status).toBe('pass');
+    }
     expect(report.status).toBe('pass');
     if (HOLD_REQUESTED) {
       expect(report.heldUrls?.reachable).toBe(true);

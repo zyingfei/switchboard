@@ -225,7 +225,8 @@ export type T1ProductBehaviorMode =
   | 'T1-A identity replay'
   | 'T1-B explicit attribution replay'
   | 'T1-C inbox UX replay'
-  | 'T1-D resolver/tab-group replay';
+  | 'T1-D resolver/tab-group replay'
+  | 'T1-F full product e2e';
 
 export interface T1ProductBehaviorCheck {
   readonly mode: T1ProductBehaviorMode;
