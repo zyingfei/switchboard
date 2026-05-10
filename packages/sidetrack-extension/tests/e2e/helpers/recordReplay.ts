@@ -1075,13 +1075,19 @@ export const driveReplayBrowserFromPack = async (input: {
   readonly timing?: ReplayTimingOptions;
 }): Promise<PageReplayResult> => {
   const browser = browserByLabel(input.pack, input.label);
-  if (browser.activeWorkstreamId !== null) {
-    await input.runtime.seedStorage(input.senderPage, {
-      [ACTIVE_WORKSTREAM_STORAGE_KEY]: browser.activeWorkstreamId,
-    });
-  }
+  // Pass the workstream id THROUGH the reinit message so the SW writes
+  // chrome.storage.local from its own context, atomic with the
+  // refreshActiveWorkstreamCache call inside initializeTimelineWiring.
+  // The previous panel.evaluate seedStorage path was racy: the SW's
+  // refresh could read storage BEFORE the cross-context propagation
+  // completed, leaving the cache null and observations in that window
+  // unstamped (no workstreamId, no visit_in_workstream edge from the
+  // companion projection). Passing it via the reinit message closes
+  // that window — the message handler awaits chrome.storage.local.set
+  // (in the SW context) before calling init.
   const reinitResult = await input.runtime.sendRuntimeMessage(input.senderPage, {
     type: 'sidetrack.timeline.reinit',
+    activeWorkstreamId: browser.activeWorkstreamId,
   });
   if (!isOkRuntimeResponse(reinitResult)) {
     throw new Error('Timeline observer did not reinitialize before replay.');

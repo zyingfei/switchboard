@@ -3415,8 +3415,37 @@ export default defineBackground(() => {
         typeof message === 'object' &&
         (message as { type?: unknown }).type === 'sidetrack.timeline.reinit'
       ) {
+        // Optional: callers (the replay-from-pack driver, the test's
+        // seedTimelineRuntime helper) may pass an `activeWorkstreamId`
+        // to atomically seed it from the SW context. The previous
+        // pattern of writing chrome.storage.local from the panel
+        // context (panel.evaluate) and then sending reinit was racy:
+        // refreshActiveWorkstreamCache (called from init below) could
+        // read chrome.storage BEFORE the panel→SW propagation
+        // completed, leaving the cache null until the next message.
+        // Writing from the SW context here resolves before init runs,
+        // so the refresh inside init sees the just-written value.
+        const explicitWorkstreamRaw = (message as { activeWorkstreamId?: unknown })
+          .activeWorkstreamId;
+        const explicitWorkstreamId =
+          typeof explicitWorkstreamRaw === 'string'
+            ? explicitWorkstreamRaw
+            : explicitWorkstreamRaw === null
+              ? null
+              : undefined;
         void (async () => {
           await bootstrapTimelinePrivacyGate().catch(() => undefined);
+          if (explicitWorkstreamId !== undefined) {
+            // Strings of length 0 are normalised to "remove the key"
+            // so the cache returns to the unfocused state.
+            if (typeof explicitWorkstreamId === 'string' && explicitWorkstreamId.length > 0) {
+              await chrome.storage.local.set({
+                [ACTIVE_WORKSTREAM_KEY]: explicitWorkstreamId,
+              });
+            } else {
+              await chrome.storage.local.remove(ACTIVE_WORKSTREAM_KEY);
+            }
+          }
           resetTimelineWiringForTests();
           await initializeTimelineWiring({
             readCompanion: readTimelineCompanionConfig,

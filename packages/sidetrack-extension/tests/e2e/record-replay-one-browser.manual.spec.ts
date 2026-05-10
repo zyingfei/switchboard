@@ -20,7 +20,6 @@ import { expect, test, type Page } from '@playwright/test';
 import { startTestCompanion, type TestCompanion } from './helpers/companion';
 import { ManualRecorder } from './helpers/manualRecorder';
 import {
-  ACTIVE_WORKSTREAM_STORAGE_KEY,
   assertNoDisallowedStorageValues,
   assertPackPrivacy,
   companionGet,
@@ -91,11 +90,17 @@ const seedTimelineRuntime = async (
   await panel.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
     waitUntil: 'domcontentloaded',
   });
+  // Note: ACTIVE_WORKSTREAM_STORAGE_KEY is intentionally NOT included
+  // in seedStorage. Writing it via panel.evaluate is racy with the
+  // SW's refreshActiveWorkstreamCache (the cross-context propagation
+  // can lose to the next chrome.tabs.onUpdated). Instead, we pass
+  // the workstream id THROUGH the reinit message below so the SW
+  // writes storage from its own context, atomic with the refresh
+  // call inside initializeTimelineWiring.
   await runtime.seedStorage(panel, {
     [SETUP_KEY]: true,
     [SETTINGS_KEY]: settingsFor(companion),
     'sidetrack.timeline.enabled': true,
-    [ACTIVE_WORKSTREAM_STORAGE_KEY]: ACTIVE_WORKSTREAM_ID,
     ...(timelineReplayDebugEnabled() ? { [TIMELINE_REPLAY_DEBUG_STORAGE_KEY]: true } : {}),
   });
   await panel.reload({ waitUntil: 'domcontentloaded' });
@@ -104,6 +109,7 @@ const seedTimelineRuntime = async (
   });
   const reinitResult = await runtime.sendRuntimeMessage(panel, {
     type: 'sidetrack.timeline.reinit',
+    activeWorkstreamId: ACTIVE_WORKSTREAM_ID,
   });
   expect((reinitResult as { ok?: boolean } | null)?.ok).toBe(true);
   return { panel };
