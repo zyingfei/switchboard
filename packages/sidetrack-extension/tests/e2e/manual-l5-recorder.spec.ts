@@ -624,7 +624,16 @@ test.describe('manual L5 full-browser recorder', () => {
         browserMode: modeConfig.mode,
       });
 
-      const recorder = new ManualRecorder(runtimeA.context, artifactsDir);
+      // Patchright's _evaluateOnNewDocument is a no-op so addInitScript
+      // doesn't actually inject; exposeBinding crashes Network.setCacheDisabled
+      // on closed sessions under stealth. The 'page-main-world' path skips
+      // both — installs hooks per page via main-world evaluate and polls a
+      // queue.
+      const recorder = new ManualRecorder(runtimeA.context, artifactsDir, {
+        eventHookInjection: modeConfig.stealthExperiment
+          ? 'page-main-world'
+          : 'context-init-script',
+      });
       await recorder.install();
 
       await openPrivacyGate(companionA, 'timeline');

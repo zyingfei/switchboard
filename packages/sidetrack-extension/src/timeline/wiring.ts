@@ -17,6 +17,7 @@ import {
   getTimelineObserverDiagnostics,
   type TimelineObserver,
 } from './observer';
+import { isTrackableUrl } from './sanitize';
 import type { BrowserTimelineObservedPayload } from './events';
 
 // Sync Contract v1 / Class F — bind chrome.tabs APIs to the timeline
@@ -476,6 +477,11 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
         if (!gateOpen) return;
         const tab = await chrome.tabs.get(info.tabId);
         if (typeof tab.url !== 'string' || tab.url.length === 0) return;
+        // Skip non-content browser surfaces (about:blank, chrome://newtab,
+        // chrome-extension:// pages, devtools://, view-source:, …) — they
+        // never represent meaningful work to attribute, and we don't want
+        // them showing up in Inbox or Connections.
+        if (!isTrackableUrl(tab.url)) return;
         const tabSession = await tabSessions.recordActivity({
           tabIdHash: hashTabId(info.tabId, info.windowId),
           windowIdHash: hashWindowId(info.windowId),
@@ -536,6 +542,11 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
       const url = tab.url ?? changeInfo.url;
       if (typeof url !== 'string' || url.length === 0) {
         updateLastOnUpdated(sequence, { skippedReason: 'missing-url' });
+        return;
+      }
+      // See onActivated above: never observe non-content surfaces.
+      if (!isTrackableUrl(url)) {
+        updateLastOnUpdated(sequence, { skippedReason: 'non-trackable-scheme' });
         return;
       }
       updateLastOnUpdated(sequence, { urlUsed: url });
