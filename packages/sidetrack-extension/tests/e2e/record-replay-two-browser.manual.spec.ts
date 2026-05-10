@@ -20,7 +20,6 @@ import { generateRendezvousSecret } from '../../../sidetrack-companion/src/sync/
 import { startTestCompanion, type TestCompanion } from './helpers/companion';
 import { ManualRecorder } from './helpers/manualRecorder';
 import {
-  ACTIVE_WORKSTREAM_STORAGE_KEY,
   assertNoDisallowedStorageValues,
   assertPackPrivacy,
   browserByLabel,
@@ -127,11 +126,12 @@ const seedTimelineRuntime = async (
   await panel.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
     waitUntil: 'domcontentloaded',
   });
+  // Pass the workstream id through reinit (SW-context write); see
+  // the matching note in record-replay-one-browser.manual.spec.ts.
   await runtime.seedStorage(panel, {
     [SETUP_KEY]: true,
     [SETTINGS_KEY]: settingsFor(companion),
     'sidetrack.timeline.enabled': true,
-    [ACTIVE_WORKSTREAM_STORAGE_KEY]: activeWorkstreamId,
   });
   await panel.reload({ waitUntil: 'domcontentloaded' });
   await expect(panel.getByRole('main', { name: 'Sidetrack workboard' })).toBeVisible({
@@ -139,6 +139,7 @@ const seedTimelineRuntime = async (
   });
   const reinitResult = await runtime.sendRuntimeMessage(panel, {
     type: 'sidetrack.timeline.reinit',
+    activeWorkstreamId,
   });
   expect((reinitResult as { ok?: boolean } | null)?.ok).toBe(true);
   return panel;
