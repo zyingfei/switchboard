@@ -18,6 +18,7 @@
     "@iarna/toml": "^2.2.5",
     "@wlearn/lightgbm": "^0.1.0",
     "gpt-tokenizer": "^3.4.0",
+    "graphology": "^0.26.0",
     "minisearch": "^7.2.0",
     "usearch": "2.25.1",
     "ws": "^8.20.0",

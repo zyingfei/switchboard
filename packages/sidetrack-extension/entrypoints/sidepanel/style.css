@@ -497,9 +497,46 @@ button:disabled {
   border-color: var(--green-tint);
 }
 
+.tab-session-badge.is-suggested {
+  background: var(--paper);
+  color: var(--amber);
+  border-color: var(--amber-tint);
+}
+
 .tab-session-badge.is-empty {
   background: var(--ink-0);
   color: var(--ink-3);
+}
+
+.tab-session-suggestion-banner {
+  display: grid;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: var(--hair-soft);
+  background: var(--amber-bg);
+  color: var(--ink-1);
+}
+
+.tab-session-suggestion-copy {
+  display: flex;
+  min-width: 0;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.tab-session-suggestion-copy b,
+.tab-session-suggestion-copy span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-session-suggestion-actions {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: center;
 }
 
 .tab-session-actions {

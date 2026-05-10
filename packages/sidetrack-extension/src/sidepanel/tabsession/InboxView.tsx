@@ -1,12 +1,17 @@
 import { InboxCard } from './InboxCard';
 import { sliceInboxForPanel } from './inboxPriority';
-import type { TabSessionInboxData, TabSessionWorkstreamOption } from './types';
+import type {
+  TabSessionInboxData,
+  TabSessionResolutionResult,
+  TabSessionWorkstreamOption,
+} from './types';
 
 export interface InboxViewProps {
   readonly inbox: TabSessionInboxData;
   readonly loading: boolean;
   readonly error: string | null;
   readonly workstreams: readonly TabSessionWorkstreamOption[];
+  readonly suggestions: Readonly<Record<string, TabSessionResolutionResult>>;
   readonly onRefresh: () => void;
   readonly onAttribute: (tabSessionId: string, workstreamId: string | null) => void;
 }
@@ -16,6 +21,7 @@ export function InboxView({
   loading,
   error,
   workstreams,
+  suggestions,
   onRefresh,
   onAttribute,
 }: InboxViewProps) {
@@ -41,6 +47,7 @@ export function InboxView({
           <InboxCard
             key={record.tabSessionId}
             record={record}
+            suggestion={suggestions[record.tabSessionId]}
             workstreams={workstreams}
             onAttribute={onAttribute}
           />

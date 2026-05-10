@@ -6,6 +6,7 @@ import { AttributionProvenance } from './AttributionProvenance';
 import {
   TAB_SESSION_DRAG_MIME,
   type TabSessionRecord,
+  type TabSessionResolutionResult,
   type TabSessionWorkstreamOption,
 } from './types';
 
@@ -24,12 +25,13 @@ const titleFor = (record: TabSessionRecord): string =>
 
 export interface InboxCardProps {
   readonly record: TabSessionRecord;
+  readonly suggestion?: TabSessionResolutionResult;
   readonly workstreams: readonly TabSessionWorkstreamOption[];
   readonly onAttribute: (tabSessionId: string, workstreamId: string | null) => void;
 }
 
-export function InboxCard({ record, workstreams, onAttribute }: InboxCardProps) {
-  const defaultWorkstreamId = workstreams[0]?.bac_id ?? '';
+export function InboxCard({ record, suggestion, workstreams, onAttribute }: InboxCardProps) {
+  const defaultWorkstreamId = suggestion?.decision.workstreamId ?? workstreams[0]?.bac_id ?? '';
   const [selectedWorkstreamId, setSelectedWorkstreamId] = useState(defaultWorkstreamId);
   const host = hostFor(record);
   const title = titleFor(record);
@@ -54,13 +56,13 @@ export function InboxCard({ record, workstreams, onAttribute }: InboxCardProps) 
       <div className="tab-session-card-main">
         <div className="tab-session-card-head">
           <span className="tab-session-title">{title}</span>
-          <AttributionBadge record={record} workstreams={workstreams} />
+          <AttributionBadge record={record} suggestion={suggestion} workstreams={workstreams} />
         </div>
         <div className="tab-session-meta mono">
           <span>{host}</span>
           <span>{formatRelative(record.lastActivityAt)}</span>
         </div>
-        <AttributionProvenance record={record} workstreams={workstreams} />
+        <AttributionProvenance record={record} suggestion={suggestion} workstreams={workstreams} />
         <div className="tab-session-actions">
           <label className="tab-session-picker">
             <span className="sr-only">Move to</span>

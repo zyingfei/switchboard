@@ -3,7 +3,10 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { InboxCard } from '../../../src/sidepanel/tabsession/InboxCard';
 import { sliceInboxForPanel } from '../../../src/sidepanel/tabsession/inboxPriority';
-import type { TabSessionRecord } from '../../../src/sidepanel/tabsession/types';
+import type {
+  TabSessionRecord,
+  TabSessionResolutionResult,
+} from '../../../src/sidepanel/tabsession/types';
 
 const record = (input: Partial<TabSessionRecord> = {}): TabSessionRecord => ({
   tabSessionId: 'tses_test',
@@ -20,6 +23,26 @@ const workstreams = [
   { bac_id: 'ws_security', path: 'Security' },
   { bac_id: 'ws_switchboard', path: 'Switchboard' },
 ];
+
+const suggestion = (): TabSessionResolutionResult => ({
+  tabSessionId: 'tses_test',
+  dryRun: true,
+  decision: { action: 'suggest', workstreamId: 'ws_switchboard', margin: 1.4 },
+  fusedCandidates: [
+    {
+      workstreamId: 'ws_switchboard',
+      rawFusionLogit: 3.2,
+      dominantSource: 'ppr',
+      reasons: [
+        {
+          source: 'ppr',
+          summary: 'Signed graph score 0.8',
+          anchors: ['timeline-visit:https://example.test/research'],
+        },
+      ],
+    },
+  ],
+});
 
 describe('InboxCard', () => {
   it('moves a tab session to the selected workstream', () => {
@@ -54,6 +77,26 @@ describe('InboxCard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Not in any workstream' }));
 
     expect(onAttribute).toHaveBeenCalledWith('tses_test', null);
+  });
+
+  it('renders resolver suggestions as outlined attribution and default move target', () => {
+    const onAttribute = vi.fn();
+    render(
+      <InboxCard
+        record={record()}
+        suggestion={suggestion()}
+        workstreams={workstreams}
+        onAttribute={onAttribute}
+      />,
+    );
+
+    expect(screen.getByTitle('Suggested by Sidetrack: Switchboard')).toHaveTextContent(
+      'Switchboard',
+    );
+    expect(screen.getByText(/Suggested by ppr/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Move' }));
+
+    expect(onAttribute).toHaveBeenCalledWith('tses_test', 'ws_switchboard');
   });
 
   it('caps inbox rendering at 50 records per panel session', () => {

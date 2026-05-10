@@ -86,11 +86,13 @@ import { ConnectionsView } from '../../src/sidepanel/connections/ConnectionsView
 import { AttributionBadge } from '../../src/sidepanel/tabsession/AttributionBadge';
 import { InboxCard } from '../../src/sidepanel/tabsession/InboxCard';
 import { InboxView } from '../../src/sidepanel/tabsession/InboxView';
+import { SuggestionBanner } from '../../src/sidepanel/tabsession/SuggestionBanner';
 import {
   TAB_SESSION_DRAG_MIME,
   type TabSessionInboxData,
   type TabSessionProjection,
   type TabSessionRecord,
+  type TabSessionResolutionResult,
   type TabSessionWorkstreamOption,
 } from '../../src/sidepanel/tabsession/types';
 import {
@@ -147,6 +149,20 @@ const isTabSessionInboxData = (value: unknown): value is TabSessionInboxData =>
   typeof value['total'] === 'number' &&
   typeof value['limit'] === 'number' &&
   typeof value['offset'] === 'number';
+
+const isResolverAction = (value: unknown): value is 'auto-apply' | 'suggest' | 'inbox' =>
+  value === 'auto-apply' || value === 'suggest' || value === 'inbox';
+
+const isTabSessionResolutionResult = (value: unknown): value is TabSessionResolutionResult =>
+  isPlainRecord(value) &&
+  typeof value['tabSessionId'] === 'string' &&
+  value['dryRun'] === true &&
+  isPlainRecord(value['decision']) &&
+  isResolverAction(value['decision']['action']) &&
+  (value['decision']['workstreamId'] === undefined ||
+    typeof value['decision']['workstreamId'] === 'string') &&
+  typeof value['decision']['margin'] === 'number' &&
+  Array.isArray(value['fusedCandidates']);
 
 const sendRequestRaw = async (
   request: WorkboardRequest,
@@ -536,6 +552,9 @@ const App = () => {
   const [tabSessionProjection, setTabSessionProjection] = useState<TabSessionProjection | null>(
     null,
   );
+  const [tabSessionSuggestions, setTabSessionSuggestions] = useState<
+    Record<string, TabSessionResolutionResult>
+  >({});
   const [tabSessionLoading, setTabSessionLoading] = useState(false);
   const [tabSessionError, setTabSessionError] = useState<string | null>(null);
   const [pendingCodingOffers, setPendingCodingOffers] = useState<readonly OfferRecord[]>([]);
@@ -802,10 +821,48 @@ const App = () => {
     [bridgeKey, port],
   );
 
+  const loadTabSessionSuggestions = useCallback(
+    async (
+      projection: TabSessionProjection,
+      inbox: TabSessionInboxData,
+    ): Promise<Record<string, TabSessionResolutionResult>> => {
+      const recordsById = new Map<string, TabSessionRecord>();
+      for (const record of Object.values(projection.bySessionId)) {
+        if (record.closedAt === undefined && record.currentAttribution === undefined) {
+          recordsById.set(record.tabSessionId, record);
+        }
+      }
+      for (const record of inbox.items) {
+        if (record.currentAttribution === undefined) {
+          recordsById.set(record.tabSessionId, record);
+        }
+      }
+      const entries = await Promise.all(
+        [...recordsById.keys()].map(async (tabSessionId) => {
+          try {
+            const result = await fetchCompanionJson<unknown>(
+              `/v1/tabsessions/${encodeURIComponent(tabSessionId)}/resolve?dryRun=true`,
+            );
+            return isTabSessionResolutionResult(result) ? ([tabSessionId, result] as const) : null;
+          } catch {
+            return null;
+          }
+        }),
+      );
+      return Object.fromEntries(
+        entries.filter(
+          (entry): entry is readonly [string, TabSessionResolutionResult] => entry !== null,
+        ),
+      );
+    },
+    [fetchCompanionJson],
+  );
+
   const loadTabSessions = useCallback(async (): Promise<void> => {
     if (port.length === 0 || bridgeKey.length === 0) {
       setTabSessionProjection(null);
       setTabSessionInbox(EMPTY_TAB_SESSION_INBOX);
+      setTabSessionSuggestions({});
       return;
     }
     setTabSessionLoading(true);
@@ -820,14 +877,16 @@ const App = () => {
       }
       setTabSessionProjection(projection);
       setTabSessionInbox(inbox);
+      setTabSessionSuggestions(await loadTabSessionSuggestions(projection, inbox));
     } catch (loadError) {
       setTabSessionError(
         loadError instanceof Error ? loadError.message : 'Could not load tab sessions.',
       );
+      setTabSessionSuggestions({});
     } finally {
       setTabSessionLoading(false);
     }
-  }, [bridgeKey, fetchCompanionJson, port]);
+  }, [bridgeKey, fetchCompanionJson, loadTabSessionSuggestions, port]);
 
   useEffect(() => {
     if (state.companionStatus !== 'connected') return;
@@ -2661,10 +2720,29 @@ const App = () => {
   );
   const focusedTabSession = useMemo(() => {
     if (focusedTabUrl === null) return undefined;
-    return tabSessionRecords.find(
-      (record) => comparableTabUrl(record.latestUrl) === focusedTabUrl,
-    );
+    return tabSessionRecords.find((record) => comparableTabUrl(record.latestUrl) === focusedTabUrl);
   }, [focusedTabUrl, tabSessionRecords]);
+  const focusedTabSuggestion =
+    focusedTabSession === undefined
+      ? undefined
+      : tabSessionSuggestions[focusedTabSession.tabSessionId];
+  const suggestedOpenTabSession = useMemo(
+    () =>
+      tabSessionRecords.find((record) => {
+        const suggestion = tabSessionSuggestions[record.tabSessionId];
+        return (
+          record.closedAt === undefined &&
+          record.currentAttribution === undefined &&
+          suggestion?.decision.action === 'suggest' &&
+          suggestion.decision.workstreamId !== undefined
+        );
+      }),
+    [tabSessionRecords, tabSessionSuggestions],
+  );
+  const suggestedOpenTabSessionResolution =
+    suggestedOpenTabSession === undefined
+      ? undefined
+      : tabSessionSuggestions[suggestedOpenTabSession.tabSessionId];
   const currentWorkstreamTabSessions = useMemo(
     () =>
       currentWsId === null
@@ -4294,7 +4372,11 @@ const App = () => {
       ) : (
         <div className="ws-bar all-bar">
           <span className="lbl">
-            {viewMode === 'inbox' ? 'Inbox' : viewMode === 'connections' ? 'Connections' : 'All threads'}
+            {viewMode === 'inbox'
+              ? 'Inbox'
+              : viewMode === 'connections'
+                ? 'Connections'
+                : 'All threads'}
           </span>
           <span className="ws-status mono">{companionStatusLabel(state.companionStatus)}</span>
         </div>
@@ -4302,11 +4384,24 @@ const App = () => {
 
       <div className="tab-attribution-cue" data-testid="focused-tab-attribution">
         <span className="mono">Tab is in:</span>
-        <AttributionBadge record={focusedTabSession} workstreams={tabSessionWorkstreams} />
+        <AttributionBadge
+          record={focusedTabSession}
+          suggestion={focusedTabSuggestion}
+          workstreams={tabSessionWorkstreams}
+        />
         {currentWsId !== focusedTabSession?.currentAttribution?.workstreamId ? (
           <span className="tab-attribution-intent mono">Intent: {currentWsLabel}</span>
         ) : null}
       </div>
+
+      {suggestedOpenTabSession !== undefined && suggestedOpenTabSessionResolution !== undefined ? (
+        <SuggestionBanner
+          record={suggestedOpenTabSession}
+          suggestion={suggestedOpenTabSessionResolution}
+          workstreams={tabSessionWorkstreams}
+          onAttribute={handleTabSessionAttribute}
+        />
+      ) : null}
 
       {threadSearchOpen ? (
         <form
@@ -4631,6 +4726,7 @@ const App = () => {
                     <InboxCard
                       key={record.tabSessionId}
                       record={record}
+                      suggestion={tabSessionSuggestions[record.tabSessionId]}
                       workstreams={tabSessionWorkstreams}
                       onAttribute={handleTabSessionAttribute}
                     />
@@ -4646,6 +4742,7 @@ const App = () => {
           loading={tabSessionLoading}
           error={tabSessionError}
           workstreams={tabSessionWorkstreams}
+          suggestions={tabSessionSuggestions}
           onRefresh={() => {
             void loadTabSessions();
           }}

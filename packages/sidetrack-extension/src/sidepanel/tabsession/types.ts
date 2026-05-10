@@ -38,3 +38,25 @@ export interface TabSessionWorkstreamOption {
   readonly bac_id: string;
   readonly path: string;
 }
+
+export interface TabSessionResolverCandidate {
+  readonly workstreamId: string;
+  readonly rawFusionLogit: number;
+  readonly dominantSource: 'ppr' | 'similarity' | 'cluster' | 'none';
+  readonly reasons: readonly {
+    readonly source: 'ppr' | 'similarity' | 'cluster';
+    readonly summary: string;
+    readonly anchors: readonly string[];
+  }[];
+}
+
+export interface TabSessionResolutionResult {
+  readonly tabSessionId: string;
+  readonly dryRun: true;
+  readonly decision: {
+    readonly action: 'auto-apply' | 'suggest' | 'inbox';
+    readonly workstreamId?: string;
+    readonly margin: number;
+  };
+  readonly fusedCandidates: readonly TabSessionResolverCandidate[];
+}
