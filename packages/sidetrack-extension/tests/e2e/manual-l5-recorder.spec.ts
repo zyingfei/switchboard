@@ -323,7 +323,7 @@ const createLaunchpad = async (
       .map(
         (link) => `
           <li>
-            <a href="${link.url}" target="_blank" rel="noreferrer">${link.title}</a>
+            <a href="${link.url}" target="_blank" rel="noreferrer" data-open-live-link>${link.title}</a>
             <small>${link.note}</small>
           </li>`,
       )
@@ -357,8 +357,8 @@ const createLaunchpad = async (
     <li>Use the Sidetrack panel tab for Browser A to keep the active workstream aligned.</li>
     <li>Security flow workstream id: <code>${input.securityWorkstreamId}</code>.</li>
     <li>Switchboard flow workstream id: <code>${input.switchboardWorkstreamId}</code>.</li>
-    <li>Browser A panel: <a href="${input.browserPanelUrl}" target="_blank" rel="noreferrer">${input.browserPanelUrl}</a>.</li>
-    <li>Reviewer panel: <a href="${input.reviewerPanelUrl}" target="_blank" rel="noreferrer">${input.reviewerPanelUrl}</a>.</li>
+    <li>Browser A panel: <a href="${input.browserPanelUrl}" target="_blank" rel="noreferrer" data-open-live-link>${input.browserPanelUrl}</a>.</li>
+    <li>Reviewer panel: <a href="${input.reviewerPanelUrl}" target="_blank" rel="noreferrer" data-open-live-link>${input.reviewerPanelUrl}</a>.</li>
   </ol>
   <div class="grid">
     <section>
@@ -370,6 +370,28 @@ const createLaunchpad = async (
       <ul>${linkSections('switchboard')}</ul>
     </section>
   </div>
+  <script>
+    // Plain <a target="_blank"> from a file:// opener under stealth/CFT
+    // leaves the new tab spinning on about:blank because the popup
+    // inherits the file:// opener and cross-origin navigation gets blocked.
+    // Programmatic window.open() with opener detached sidesteps the issue.
+    document.addEventListener('click', (event) => {
+      if (event.defaultPrevented || event.button !== 0) return;
+      if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      const target = event.target instanceof Element
+        ? event.target.closest('a[data-open-live-link]')
+        : null;
+      if (!(target instanceof HTMLAnchorElement)) return;
+      event.preventDefault();
+      const opened = window.open(target.href, '_blank');
+      if (opened === null) {
+        window.location.href = target.href;
+        return;
+      }
+      opened.opener = null;
+      opened.focus();
+    });
+  </script>
 </body>
 </html>
 `;
