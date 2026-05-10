@@ -1,0 +1,10 @@
+{
+  "id": "case-5-autoapply-policy-mode",
+  "mode": "T1-D",
+  "description": "Balanced policy auto-applies a strong same-URL causal session and the disabled switch leaves it read-only.",
+  "expected": [
+    "balanced resolver decision is auto-apply for strong same-URL evidence",
+    "POST resolve with dryRun:false writes Class E inferred attribution",
+    "SIDETRACK_T1_AUTO_APPLY_DISABLED=1 performs no Class E write"
+  ]
+}

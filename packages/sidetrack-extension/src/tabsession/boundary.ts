@@ -152,49 +152,53 @@ export const createTabSessionBoundary = (deps: TabSessionBoundaryDeps): TabSessi
   };
 
   const hardStopWindow = async (windowIdHash: string): Promise<void> => {
-    const records = await deps.storage.readAll();
-    const next = { ...records };
-    for (const [tabIdHash, record] of Object.entries(records)) {
-      if (record.windowIdHash === windowIdHash) delete next[tabIdHash];
-    }
-    await deps.storage.writeAll(next);
+    await deps.storage.mutate((records) => {
+      const next = { ...records };
+      for (const [tabIdHash, record] of Object.entries(records)) {
+        if (record.windowIdHash === windowIdHash) delete next[tabIdHash];
+      }
+      return next;
+    });
   };
 
   const markIdle = async (at: Date = clock()): Promise<void> => {
     const now = asIso(at);
-    const records = await deps.storage.readAll();
-    const next: Record<string, StoredTabSession> = {};
-    for (const [tabIdHash, record] of Object.entries(records)) {
-      next[tabIdHash] = { ...record, idleSince: record.idleSince ?? now };
-    }
-    await deps.storage.writeAll(next);
+    await deps.storage.mutate((records) => {
+      const next: Record<string, StoredTabSession> = {};
+      for (const [tabIdHash, record] of Object.entries(records)) {
+        next[tabIdHash] = { ...record, idleSince: record.idleSince ?? now };
+      }
+      return next;
+    });
   };
 
   const markActive = async (at: Date = clock()): Promise<void> => {
     const now = asIso(at);
-    const records = await deps.storage.readAll();
-    const next: Record<string, StoredTabSession> = {};
-    for (const [tabIdHash, record] of Object.entries(records)) {
-      const { idleSince, ...awakeRecord } = record;
-      void idleSince;
-      next[tabIdHash] = { ...awakeRecord, lastActivityAt: now };
-    }
-    await deps.storage.writeAll(next);
+    await deps.storage.mutate((records) => {
+      const next: Record<string, StoredTabSession> = {};
+      for (const [tabIdHash, record] of Object.entries(records)) {
+        const { idleSince, ...awakeRecord } = record;
+        void idleSince;
+        next[tabIdHash] = { ...awakeRecord, lastActivityAt: now };
+      }
+      return next;
+    });
   };
 
   const sweepIdle = async (at: Date = clock()): Promise<void> => {
     if (deps.softCloseOnIdleDriftEnabled !== true) return;
-    const records = await deps.storage.readAll();
-    const next = { ...records };
-    for (const [tabIdHash, record] of Object.entries(records)) {
-      if (record.idleSince === undefined) continue;
-      const idleMs = at.getTime() - Date.parse(record.idleSince);
-      const drift = deps.embeddingDriftForTab?.(tabIdHash, record) ?? 0;
-      if (idleMs >= IDLE_SOFT_CLOSE_MS && drift >= SOFT_CLOSE_DRIFT_THRESHOLD) {
-        delete next[tabIdHash];
+    await deps.storage.mutate((records) => {
+      const next = { ...records };
+      for (const [tabIdHash, record] of Object.entries(records)) {
+        if (record.idleSince === undefined) continue;
+        const idleMs = at.getTime() - Date.parse(record.idleSince);
+        const drift = deps.embeddingDriftForTab?.(tabIdHash, record) ?? 0;
+        if (idleMs >= IDLE_SOFT_CLOSE_MS && drift >= SOFT_CLOSE_DRIFT_THRESHOLD) {
+          delete next[tabIdHash];
+        }
       }
-    }
-    await deps.storage.writeAll(next);
+      return next;
+    });
   };
 
   return {

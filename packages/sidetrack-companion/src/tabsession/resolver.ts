@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import {
   USER_FLOW_REJECTED,
   USER_ORGANIZED_ITEM,
@@ -23,7 +25,9 @@ import type { TabSessionProjection } from './projection.js';
 
 const TAB_SESSION_PREFIX = 'tab-session:';
 const VISIT_PREFIX = 'timeline-visit:';
+const VISIT_INSTANCE_PREFIX = 'visit-instance:';
 const WORKSTREAM_PREFIX = 'workstream:';
+const MODEL_REVISION = 'tabsession-resolver-v1';
 const pprCache = createPprCache();
 
 export interface AttributionReason {
@@ -48,6 +52,9 @@ export interface ResolutionResult {
   readonly fusedCandidates: readonly ResolverCandidate[];
   readonly reasons: {
     readonly dependencyKey: string;
+    readonly modelRevision: string;
+    readonly graphRevision: string;
+    readonly evidenceHash: string;
     readonly targetAnchors: readonly string[];
     readonly topContributingAnchors: readonly string[];
   };
@@ -76,11 +83,19 @@ const targetVisitNodes = (snapshot: ConnectionsSnapshot, tabSessionId: string): 
   const target = tabSessionNodeId(tabSessionId);
   const visits = new Set<string>();
   for (const edge of snapshot.edges) {
-    if (edge.kind !== 'visit_in_tab_session') continue;
-    if (edge.toNodeId === target && edge.fromNodeId.startsWith(VISIT_PREFIX)) {
+    if (edge.kind !== 'visit_in_tab_session' && edge.kind !== 'visit_instance_in_tab_session') {
+      continue;
+    }
+    if (
+      edge.toNodeId === target &&
+      (edge.fromNodeId.startsWith(VISIT_PREFIX) || edge.fromNodeId.startsWith(VISIT_INSTANCE_PREFIX))
+    ) {
       visits.add(edge.fromNodeId);
     }
-    if (edge.fromNodeId === target && edge.toNodeId.startsWith(VISIT_PREFIX)) {
+    if (
+      edge.fromNodeId === target &&
+      (edge.toNodeId.startsWith(VISIT_PREFIX) || edge.toNodeId.startsWith(VISIT_INSTANCE_PREFIX))
+    ) {
       visits.add(edge.toNodeId);
     }
   }
@@ -184,7 +199,11 @@ export const resolveAttribution = (input: ResolveAttributionInput): ResolutionRe
   for (const anchor of anchors) seed.set(anchor, 1);
   for (const [anchor, value] of negativeSeeds(input)) seed.set(anchor, value);
 
-  const cacheKey = `${input.tabSessionId}|${evidence.revision}|${seedHash(seed)}`;
+  const seedFingerprint = seedHash(seed);
+  const evidenceHash = createHash('sha256')
+    .update(`${MODEL_REVISION}|${input.tabSessionId}|${evidence.revision}|${seedFingerprint}`)
+    .digest('hex');
+  const cacheKey = `${input.tabSessionId}|${evidence.revision}|${seedFingerprint}`;
   const nowMs = input.nowMs ?? Date.now();
   const ppr = pprCache.get(cacheKey, nowMs) ?? runPPR(evidence, seed);
   pprCache.set(cacheKey, ppr, nowMs);
@@ -200,7 +219,7 @@ export const resolveAttribution = (input: ResolveAttributionInput): ResolutionRe
     }).map((item) => [item.workstreamId, item]),
   );
   const cluster = new Map(
-    buildClusterEvidence(input.snapshot).map((item) => [item.workstreamId, item]),
+    buildClusterEvidence(input.snapshot, visits).map((item) => [item.workstreamId, item]),
   );
   const workstreamIds = candidateWorkstreamIds(evidence, anchors, allWorkstreamIds(input.snapshot));
   for (const key of similarity.keys()) workstreamIds.add(key);
@@ -245,6 +264,9 @@ export const resolveAttribution = (input: ResolveAttributionInput): ResolutionRe
     fusedCandidates,
     reasons: {
       dependencyKey: cacheKey,
+      modelRevision: MODEL_REVISION,
+      graphRevision: evidence.revision,
+      evidenceHash,
       targetAnchors: anchors,
       topContributingAnchors: anchors.slice(0, 3),
     },
@@ -270,5 +292,14 @@ export const inferredAttributionPayloadFromResolution = (
     rawFusionLogit: top.rawFusionLogit,
     margin: result.decision.margin,
     corroborationCount: top.corroborationCount,
+    modelRevision: result.reasons.modelRevision,
+    graphRevision: result.reasons.graphRevision,
+    evidenceHash: result.reasons.evidenceHash,
+    resolverDependencyKey: result.reasons.dependencyKey,
+    reasonSummary:
+      top.reasons
+        .map((reason) => reason.summary)
+        .filter((summary) => summary.length > 0)
+        .join('; ') || `${top.dominantSource} evidence`,
   };
 };

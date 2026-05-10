@@ -22,6 +22,7 @@ export interface BuildSimilarityEvidenceInput {
 }
 
 const VISIT_PREFIX = 'timeline-visit:';
+const VISIT_INSTANCE_PREFIX = 'visit-instance:';
 const WORKSTREAM_PREFIX = 'workstream:';
 
 const scoreForEdge = (kind: string): number => {
@@ -50,6 +51,18 @@ const visitKeyFromNodeOrRaw = (visitId: string): string =>
 
 const visitNodeId = (visitKey: string): string => `${VISIT_PREFIX}${visitKey}`;
 
+const canonicalVisitForNode = (snapshot: ConnectionsSnapshot, nodeId: string): string => {
+  if (nodeId.startsWith(VISIT_PREFIX)) return nodeId;
+  const node = snapshot.nodes.find((candidate) => candidate.id === nodeId);
+  const timelineVisitId = node?.metadata?.['timelineVisitId'];
+  if (typeof timelineVisitId === 'string' && timelineVisitId.startsWith(VISIT_PREFIX)) {
+    return timelineVisitId;
+  }
+  const canonicalUrl = node?.metadata?.['canonicalUrl'];
+  if (typeof canonicalUrl === 'string' && canonicalUrl.length > 0) return visitNodeId(canonicalUrl);
+  return nodeId;
+};
+
 export const buildSimilarityEvidence = ({
   snapshot,
   targetVisitNodeIds,
@@ -59,13 +72,20 @@ export const buildSimilarityEvidence = ({
 }: BuildSimilarityEvidenceInput): readonly SimilarityEvidence[] => {
   const visitWorkstream = new Map<string, string>();
   for (const edge of snapshot.edges) {
-    if (edge.kind !== 'visit_in_workstream') continue;
-    if (!edge.fromNodeId.startsWith(VISIT_PREFIX) || !edge.toNodeId.startsWith(WORKSTREAM_PREFIX)) {
+    if (edge.kind !== 'visit_in_workstream' && edge.kind !== 'visit_instance_in_workstream') {
+      continue;
+    }
+    if (
+      !(edge.fromNodeId.startsWith(VISIT_PREFIX) || edge.fromNodeId.startsWith(VISIT_INSTANCE_PREFIX)) ||
+      !edge.toNodeId.startsWith(WORKSTREAM_PREFIX)
+    ) {
       continue;
     }
     const workstreamId = edge.toNodeId.slice(WORKSTREAM_PREFIX.length);
     visitWorkstream.set(edge.fromNodeId, workstreamId);
-    visitWorkstream.set(visitKeyFromNodeOrRaw(edge.fromNodeId), workstreamId);
+    const canonicalVisitNodeId = canonicalVisitForNode(snapshot, edge.fromNodeId);
+    visitWorkstream.set(canonicalVisitNodeId, workstreamId);
+    visitWorkstream.set(visitKeyFromNodeOrRaw(canonicalVisitNodeId), workstreamId);
   }
 
   const byWorkstream = new Map<string, number[]>();
@@ -78,7 +98,7 @@ export const buildSimilarityEvidence = ({
 
   const context = { merged: [...events], existingEdges: [...snapshot.edges] };
   for (const targetVisitNodeId of [...targetVisitNodeIds].sort()) {
-    const targetVisitKey = visitKeyFromNodeOrRaw(targetVisitNodeId);
+    const targetVisitKey = visitKeyFromNodeOrRaw(canonicalVisitForNode(snapshot, targetVisitNodeId));
     const scored = generateCandidates(targetVisitKey, context)
       .map((candidate) => {
         const score =
@@ -121,8 +141,12 @@ export const buildSimilarityEvidence = ({
     const other =
       targetVisitNodeIds.has(edge.fromNodeId) && edge.toNodeId.startsWith(VISIT_PREFIX)
         ? edge.toNodeId
-        : targetVisitNodeIds.has(edge.toNodeId) && edge.fromNodeId.startsWith(VISIT_PREFIX)
-          ? edge.fromNodeId
+      : targetVisitNodeIds.has(edge.toNodeId) && edge.fromNodeId.startsWith(VISIT_PREFIX)
+        ? edge.fromNodeId
+        : targetVisitNodeIds.has(edge.fromNodeId) && edge.toNodeId.startsWith(VISIT_INSTANCE_PREFIX)
+          ? canonicalVisitForNode(snapshot, edge.toNodeId)
+        : targetVisitNodeIds.has(edge.toNodeId) && edge.fromNodeId.startsWith(VISIT_INSTANCE_PREFIX)
+          ? canonicalVisitForNode(snapshot, edge.fromNodeId)
           : null;
     if (other === null) continue;
     addScore(visitWorkstream.get(other), score);

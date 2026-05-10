@@ -1,0 +1,11 @@
+{
+  "id": "case-4-tabgroup-pull-in-out",
+  "mode": "T1-D",
+  "description": "Chrome tab-group membership changes emit pull-in and pull-out tab-session attribution feedback.",
+  "expected": [
+    "test hook creates a linked Chrome tab group",
+    "moving a tab into the linked group emits tab-group-pull-in",
+    "moving the tab out emits tab-group-pull-out",
+    "pull-out leaves current attribution null"
+  ]
+}

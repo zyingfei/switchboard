@@ -37,9 +37,15 @@ export function AttributionProvenance({
     const label =
       workstreams.find((workstream) => workstream.bac_id === attribution.workstreamId)?.path ??
       attribution.workstreamId;
+    const source =
+      attribution.source === 'user_asserted'
+        ? 'you'
+        : attribution.source === 'inferred'
+          ? 'Sidetrack'
+          : attribution.source;
     return (
       <span className="tab-session-provenance mono">
-        Attributed by you on {formatDate(attribution.observedAt)} · {label}
+        Attributed by {source} on {formatDate(attribution.observedAt)} · {label}
       </span>
     );
   }

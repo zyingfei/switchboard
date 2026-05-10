@@ -1,0 +1,11 @@
+{
+  "id": "case-1-same-url-two-sessions",
+  "mode": "T1-A",
+  "description": "Same canonical URL observed in two tab sessions must produce session-scoped visit instances and no URL-scoped workstream attribution.",
+  "expected": [
+    "tab-session nodes exist",
+    "visit_instance_in_tab_session edges exist",
+    "visit_instance_same_url_as_timeline_visit edges preserve content identity",
+    "zero URL-scoped visit_in_workstream edges from the active pointer"
+  ]
+}

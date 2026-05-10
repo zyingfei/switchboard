@@ -17,6 +17,11 @@ const memoryStorage = (): { readonly records: TabSessionByTabIdHash; readonly st
         for (const key of Object.keys(records)) delete records[key];
         Object.assign(records, next);
       },
+      mutate: async (apply) => {
+        const next = apply({ ...records });
+        for (const key of Object.keys(records)) delete records[key];
+        Object.assign(records, next);
+      },
       get: async (tabIdHash) => records[tabIdHash],
       set: async (tabIdHash, record) => {
         records[tabIdHash] = record;

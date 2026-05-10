@@ -1226,12 +1226,13 @@ describe('connections — content-derived edges', () => {
     expect(snap.edges.some((e) => e.kind === 'visit_in_workstream')).toBe(false);
     expect(snap.nodes.some((n) => n.id === nodeIdFor('tab-session', 'tses_child'))).toBe(true);
     expect(snap.nodes.some((n) => n.id === nodeIdFor('tab-session', 'tses_parent'))).toBe(true);
-    const visitEdges = snap.edges.filter((e) => e.kind === 'visit_in_tab_session');
+    const visitEdges = snap.edges.filter((e) => e.kind === 'visit_instance_in_tab_session');
     expect(visitEdges.length).toBe(2);
     expect(
       visitEdges.some(
         (edge) =>
-          edge.fromNodeId === nodeIdFor('timeline-visit', 'https://copy.fail') &&
+          edge.fromNodeId.startsWith('visit-instance:tses_child:') &&
+          edge.fromNodeId.includes('https://copy.fail') &&
           edge.toNodeId === nodeIdFor('tab-session', 'tses_child') &&
           edge.confidence === 'observed' &&
           edge.producedBy.source === 'timeline-projection',
@@ -1248,11 +1249,19 @@ describe('connections — content-derived edges', () => {
     const taggedVisit = snap.nodes.find(
       (n) => n.id === nodeIdFor('timeline-visit', 'https://copy.fail'),
     );
-    expect(taggedVisit?.metadata['tabSessionId']).toBe('tses_child');
+    expect(taggedVisit?.metadata['tabSessionId']).toBeUndefined();
     expect(taggedVisit?.metadata['workstreamId']).toBeUndefined();
+    expect(
+      snap.edges.some(
+        (edge) =>
+          edge.kind === 'visit_instance_same_url_as_timeline_visit' &&
+          edge.fromNodeId.startsWith('visit-instance:tses_child:') &&
+          edge.toNodeId === nodeIdFor('timeline-visit', 'https://copy.fail'),
+      ),
+    ).toBe(true);
   });
 
-  it('explicit tab-session attribution emits tab_session_in_workstream and visit_in_workstream edges', () => {
+  it('explicit tab-session attribution emits tab_session_in_workstream and visit_instance_in_workstream edges', () => {
     const day: TimelineDayProjection = {
       date: '2026-05-07',
       entries: [
@@ -1314,8 +1323,8 @@ describe('connections — content-derived edges', () => {
     expect(
       snap.edges.find(
         (edge) =>
-          edge.kind === 'visit_in_workstream' &&
-          edge.fromNodeId === nodeIdFor('timeline-visit', 'https://copy.fail') &&
+          edge.kind === 'visit_instance_in_workstream' &&
+          edge.fromNodeId.startsWith('visit-instance:tses_child:') &&
           edge.toNodeId === nodeIdFor('workstream', 'ws_security'),
       ),
     ).toMatchObject({
@@ -1405,8 +1414,8 @@ describe('connections — content-derived edges', () => {
     expect(
       snap.edges.filter(
         (edge) =>
-          edge.kind === 'visit_in_tab_session' &&
-          edge.fromNodeId === nodeIdFor('timeline-visit', 'https://copy.fail'),
+          edge.kind === 'visit_instance_in_tab_session' &&
+          edge.fromNodeId.startsWith('visit-instance:'),
       ),
     ).toEqual(
       expect.arrayContaining([
@@ -1424,13 +1433,25 @@ describe('connections — content-derived edges', () => {
     expect(
       snap.edges.filter(
         (edge) =>
+          edge.kind === 'visit_instance_in_workstream' &&
+          edge.fromNodeId.startsWith('visit-instance:'),
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        fromNodeId: expect.stringContaining('visit-instance:tses_a:'),
+        toNodeId: nodeIdFor('workstream', 'ws_security'),
+      }),
+    ]);
+    expect(
+      snap.edges.some(
+        (edge) =>
           edge.kind === 'visit_in_workstream' &&
           edge.fromNodeId === nodeIdFor('timeline-visit', 'https://copy.fail'),
       ),
-    ).toEqual([expect.objectContaining({ toNodeId: nodeIdFor('workstream', 'ws_security') })]);
+    ).toBe(false);
   });
 
-  it('visit_in_tab_session subgraph: anchored on tab-session reaches every session visit', () => {
+  it('visit_instance_in_tab_session subgraph: anchored on tab-session reaches every session visit', () => {
     const day: TimelineDayProjection = {
       date: '2026-05-07',
       entries: [
@@ -1457,8 +1478,11 @@ describe('connections — content-derived edges', () => {
       entryCount: 2,
     };
     const snap = buildConnectionsSnapshot(emptyInput({ timelineDays: [day] }));
-    const sub = subgraphForNode(snap, nodeIdFor('tab-session', 'tses_security_research'), 1);
+    const sub = subgraphForNode(snap, nodeIdFor('tab-session', 'tses_security_research'), 2);
     const ids = new Set(sub.nodes.map((n) => n.id));
+    expect([...ids].some((id) => id.startsWith('visit-instance:tses_security_research:'))).toBe(
+      true,
+    );
     expect(ids.has(nodeIdFor('timeline-visit', 'https://copy.fail'))).toBe(true);
     expect(
       ids.has(nodeIdFor('timeline-visit', 'https://www.youtube.com/watch?v=rY44ViY45q8')),

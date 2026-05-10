@@ -1,0 +1,10 @@
+{
+  "id": "case-3-resolver-dryrun-no-write",
+  "mode": "T1-D",
+  "description": "Resolver dry-run returns explainable candidates without writing inferred attribution events.",
+  "expected": [
+    "GET resolve?dryRun=true returns candidates",
+    "top candidate exposes dominantSource and reasons",
+    "projection contains no inferred attribution after dry-run"
+  ]
+}

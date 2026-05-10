@@ -73,7 +73,9 @@ describe('InboxCard', () => {
       />,
     );
 
-    expect(screen.getByTitle('Attributed by you to Security')).toHaveTextContent('Security');
+    expect(screen.getByTitle('Attributed to Security (user_asserted)')).toHaveTextContent(
+      'Security',
+    );
     fireEvent.click(screen.getByRole('button', { name: 'Not in any workstream' }));
 
     expect(onAttribute).toHaveBeenCalledWith('tses_test', null);

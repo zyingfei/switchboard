@@ -89,6 +89,11 @@ const inferredAttribution = (input: {
       rawFusionLogit: 3.2,
       margin: 0.8,
       corroborationCount: 2,
+      modelRevision: 'tabsession-resolver-v1',
+      graphRevision: 'graph-test',
+      evidenceHash: 'evidence-test',
+      resolverDependencyKey: 'dependency-test',
+      reasonSummary: 'PPR test evidence',
     },
   });
 

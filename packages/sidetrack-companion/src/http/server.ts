@@ -64,6 +64,11 @@ import {
   serializeTabSessionProjection,
   tabSessionInbox,
 } from '../tabsession/projection.js';
+import { autoApplyTabSessionAttribution } from '../tabsession/autoApply.js';
+import type {
+  AttributionPolicyMode,
+  AttributionPolicyTelemetry,
+} from '../tabsession/policy.js';
 import { resolveAttribution } from '../tabsession/resolver.js';
 import {
   appendEntry as appendEntryRaw,
@@ -947,6 +952,62 @@ const objectRecord = (value: unknown): Record<string, unknown> | undefined =>
     ? (value as Record<string, unknown>)
     : undefined;
 
+const optionalAttributionPolicyMode = (
+  value: unknown,
+  fieldName: string,
+): AttributionPolicyMode | undefined => {
+  if (value === undefined) return undefined;
+  if (value === 'conservative' || value === 'balanced' || value === 'aggressive') return value;
+  throw new HttpRouteError(
+    400,
+    'VALIDATION_ERROR',
+    'Validation failed.',
+    `${fieldName} must be conservative, balanced, or aggressive when provided.`,
+  );
+};
+
+const optionalAttributionPolicyTelemetry = (
+  value: unknown,
+  fieldName: string,
+): AttributionPolicyTelemetry | undefined => {
+  if (value === undefined) return undefined;
+  const record = objectRecord(value);
+  if (record === undefined) {
+    throw new HttpRouteError(
+      400,
+      'VALIDATION_ERROR',
+      'Validation failed.',
+      `${fieldName} must be an object when provided.`,
+    );
+  }
+  const rawRegret = record['regretRateBySource'];
+  if (rawRegret === undefined) return {};
+  const regretRecord = objectRecord(rawRegret);
+  if (regretRecord === undefined) {
+    throw new HttpRouteError(
+      400,
+      'VALIDATION_ERROR',
+      'Validation failed.',
+      `${fieldName}.regretRateBySource must be an object when provided.`,
+    );
+  }
+  const regretRateBySource: NonNullable<AttributionPolicyTelemetry['regretRateBySource']> = {};
+  for (const source of ['ppr', 'similarity', 'cluster'] as const) {
+    const rawRate = regretRecord[source];
+    if (rawRate === undefined) continue;
+    if (typeof rawRate !== 'number' || !Number.isFinite(rawRate) || rawRate < 0 || rawRate > 1) {
+      throw new HttpRouteError(
+        400,
+        'VALIDATION_ERROR',
+        'Validation failed.',
+        `${fieldName}.regretRateBySource.${source} must be a number between 0 and 1.`,
+      );
+    }
+    regretRateBySource[source] = rawRate;
+  }
+  return { regretRateBySource };
+};
+
 const optionalFiniteNumber = (value: unknown, fieldName: string): number | undefined => {
   if (value === undefined) return undefined;
   if (typeof value !== 'number' || !Number.isFinite(value)) {
@@ -1431,6 +1492,73 @@ const routes: readonly RouteDefinition[] = [
           }),
         },
       ];
+    },
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/tabsessions\/(?<tabSessionId>[^/]+)\/resolve$/u,
+    authRequired: true,
+    handle: async (request, _requestId, match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      if (context.connectionsStore === undefined) {
+        throw new HttpRouteError(503, 'CONNECTIONS_NOT_WIRED', 'Connections is not configured.');
+      }
+      const eventLog = context.eventLog;
+      const connectionsStore = context.connectionsStore;
+      const idempotencyKey = requireIdempotencyKey(request);
+      return await runIdempotent(context, 'tabSessionResolveAutoApply', idempotencyKey, async () => {
+        const body = objectRecord(await readBody(request)) ?? {};
+        if (body['dryRun'] !== false) {
+          throw new HttpRouteError(
+            400,
+            'VALIDATION_ERROR',
+            'Validation failed.',
+            'Body must set dryRun:false for auto-apply.',
+          );
+        }
+        const snapshot = await connectionsStore.readCurrent();
+        if (snapshot === null) {
+          throw new HttpRouteError(
+            409,
+            'CONNECTIONS_SNAPSHOT_MISSING',
+            'Connections snapshot is not ready.',
+          );
+        }
+        const tabSessionId = decodeURIComponent(match.tabSessionId ?? '');
+        const projection = projectTabSessions(await eventLog.readMerged());
+        if (!projection.bySessionId.has(tabSessionId)) {
+          throw new HttpRouteError(404, 'TAB_SESSION_NOT_FOUND', 'Tab session was not found.');
+        }
+        const policyMode = optionalAttributionPolicyMode(body['policyMode'], 'policyMode');
+        const policyTelemetry = optionalAttributionPolicyTelemetry(
+          body['policyTelemetry'],
+          'policyTelemetry',
+        );
+        const result = await autoApplyTabSessionAttribution({
+          eventLog,
+          snapshot,
+          tabSessionId,
+          ...(policyMode === undefined ? {} : { policyMode }),
+          ...(policyTelemetry === undefined ? {} : { policyTelemetry }),
+        });
+        return [
+          result.status === 'applied' ? 201 : 200,
+          {
+            data: {
+              status: result.status,
+              resolution: result.resolution,
+              ...(result.accepted === undefined ? {} : { accepted: result.accepted }),
+              projection: serializeTabSessionProjection(result.projection),
+            },
+          },
+        ];
+      });
     },
   },
   {

@@ -23,13 +23,15 @@ const snapshot = (
   scope: {},
   nodes: nodeIds.map((id) => ({
     id,
-    kind: id.startsWith('workstream:')
-      ? 'workstream'
-      : id.startsWith('tab-session:')
-        ? 'tab-session'
-        : id.startsWith('topic:')
-          ? 'topic'
-          : 'timeline-visit',
+	    kind: id.startsWith('workstream:')
+	      ? 'workstream'
+	      : id.startsWith('tab-session:')
+	        ? 'tab-session'
+	        : id.startsWith('topic:')
+	          ? 'topic'
+	          : id.startsWith('visit-instance:')
+	            ? 'visit-instance'
+	            : 'timeline-visit',
     label: id,
     originReplicaIds: [],
     metadata: {},
@@ -126,20 +128,62 @@ describe('tab-session resolver', () => {
     expect(cache.get(key, 1_200)).toBeNull();
   });
 
-  it('computes optional cluster posterior with smoothing and min-support', () => {
+  it('builds evidence graph with duplicate from/to edges across different kinds', () => {
     const snap = snapshot(
-      ['topic:a', 'topic:b', 'topic:c', 'topic:d', 'workstream:ws_a', 'workstream:ws_b'],
+      ['timeline-visit:a', 'timeline-visit:b'],
       [
+        { kind: 'closest_visit', from: 'timeline-visit:a', to: 'timeline-visit:b' },
+        { kind: 'visit_resembles_visit', from: 'timeline-visit:a', to: 'timeline-visit:b' },
+      ],
+    );
+
+    expect(() => buildEvidenceGraph(snap)).not.toThrow();
+    expect(buildEvidenceGraph(snap).adjacency.get('timeline-visit:a')).toHaveLength(2);
+  });
+
+  it('computes target-local cluster posterior with smoothing and min-support', () => {
+    const snap = snapshot(
+      [
+        'visit-instance:tses_a:1',
+        'timeline-visit:a',
+        'timeline-visit:global',
+        'topic:a',
+        'topic:b',
+        'topic:c',
+        'topic:d',
+        'topic:global-a',
+        'topic:global-b',
+        'topic:global-c',
+        'workstream:ws_a',
+        'workstream:ws_b',
+      ],
+      [
+        {
+          kind: 'visit_instance_same_url_as_timeline_visit',
+          from: 'visit-instance:tses_a:1',
+          to: 'timeline-visit:a',
+        },
+        { kind: 'visit_in_topic', from: 'timeline-visit:a', to: 'topic:a' },
+        { kind: 'visit_in_topic', from: 'timeline-visit:a', to: 'topic:b' },
+        { kind: 'visit_in_topic', from: 'timeline-visit:a', to: 'topic:c' },
+        { kind: 'visit_in_topic', from: 'timeline-visit:a', to: 'topic:d' },
+        { kind: 'visit_in_topic', from: 'timeline-visit:global', to: 'topic:global-a' },
+        { kind: 'visit_in_topic', from: 'timeline-visit:global', to: 'topic:global-b' },
+        { kind: 'visit_in_topic', from: 'timeline-visit:global', to: 'topic:global-c' },
         { kind: 'topic_in_workstream', from: 'topic:a', to: 'workstream:ws_a' },
         { kind: 'topic_in_workstream', from: 'topic:b', to: 'workstream:ws_a' },
         { kind: 'topic_in_workstream', from: 'topic:c', to: 'workstream:ws_a' },
         { kind: 'topic_in_workstream', from: 'topic:d', to: 'workstream:ws_b' },
+        { kind: 'topic_in_workstream', from: 'topic:global-a', to: 'workstream:ws_b' },
+        { kind: 'topic_in_workstream', from: 'topic:global-b', to: 'workstream:ws_b' },
+        { kind: 'topic_in_workstream', from: 'topic:global-c', to: 'workstream:ws_b' },
       ],
     );
 
-    expect(buildClusterEvidence(snap)).toEqual([
+    expect(buildClusterEvidence(snap, new Set(['visit-instance:tses_a:1']))).toEqual([
       { workstreamId: 'ws_a', support: 3, posterior: 4 / 6 },
     ]);
+    expect(buildClusterEvidence(snap, new Set(['timeline-visit:missing']))).toEqual([]);
   });
 
   it('fuses a five-candidate fixture by logit strength', () => {

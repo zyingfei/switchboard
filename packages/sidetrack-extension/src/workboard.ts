@@ -242,6 +242,7 @@ export interface WorkboardState {
   readonly settings: UiSettings;
   readonly screenShareMode: boolean;
   readonly activeTabUrl?: string;
+  readonly activeTabSessionId?: string;
   readonly currentTab?: TrackedThread;
   readonly threads: readonly TrackedThread[];
   readonly workstreams: readonly WorkstreamNode[];
