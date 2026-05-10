@@ -1269,13 +1269,31 @@ export const classifyDetour = (input: {
     reason,
   });
 
-  if (
+  // Cloudflare challenge classifier. URL signals are authoritative —
+  // they only match real Cloudflare interstitials. Title signals are
+  // ambiguous: a real provider page can carry a "Just a moment..."
+  // title when the recorder captured the page mid-cf-challenge but
+  // the user later landed on the actual content with the same canonical
+  // URL (the title sticks in the recording even though the URL is the
+  // real target). To avoid false-flagging real provider URLs as
+  // detours, gate the title heuristic so it only fires when the URL
+  // ALSO looks suspicious (cf challenge token in query, no recognised
+  // provider hostname, etc.).
+  const looksLikeCloudflareUrl =
     url.includes('/cdn-cgi/challenge') ||
+    url.includes('__cf_chl_') ||
+    url.includes('cloudflare.com');
+  const isKnownProviderHost =
+    url.includes('chatgpt.com') ||
+    url.includes('claude.ai') ||
+    url.includes('gemini.google.com') ||
+    url.includes('github.com');
+  const cloudflareTitleMatch =
     title.includes('just a moment') ||
     title.includes('attention required') ||
     title.includes('checking your browser') ||
-    title.includes('cloudflare')
-  ) {
+    title.includes('cloudflare');
+  if (looksLikeCloudflareUrl || (cloudflareTitleMatch && !isKnownProviderHost)) {
     return finding('cloudflare-challenge', 'Cloudflare challenge URL/title heuristic matched.');
   }
   if (
