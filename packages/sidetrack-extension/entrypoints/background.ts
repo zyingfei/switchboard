@@ -79,7 +79,11 @@ import { createVaultChangesClient } from '../src/companion/vaultChanges';
 import { createRecallClient } from '../src/companion/recallClient';
 import { buildReviewFollowUpText } from '../src/review/draft';
 import type { ReviewDraft } from '../src/review/types';
-import { createTabGroupWiring, type TabGroupFeedbackEvent } from '../src/tabgroups/wiring';
+import {
+  createTabGroupWiring,
+  type TabGroupFeedbackEvent,
+  type TabGroupWiring,
+} from '../src/tabgroups/wiring';
 import { createChromeTabSessionStorage } from '../src/tabsession/storage';
 import {
   isContentResponse,
@@ -155,6 +159,8 @@ const activeTab = async (): Promise<chrome.tabs.Tab | undefined> => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   return tab;
 };
+
+let runtimeTabGroupWiring: TabGroupWiring | null = null;
 
 const fnv1a64ForTabGroup = (input: string): string => {
   let h = 0xcbf29ce484222325n;
@@ -1494,11 +1500,26 @@ const currentTabThread = async (): Promise<TrackedThread | undefined> => {
   };
 };
 
+const currentActiveTabSessionId = async (): Promise<string | undefined> => {
+  try {
+    const tab = await activeTab();
+    if (typeof tab?.id !== 'number' || typeof tab.windowId !== 'number') return undefined;
+    const replica = await loadOrCreateEdgeReplica();
+    const tabIdHash = fnv1a64ForTabGroup(
+      `${replica.edgeReplicaId}|tab|${String(tab.id)}|${String(tab.windowId)}`,
+    ).slice(0, 16);
+    return (await createChromeTabSessionStorage().get(tabIdHash))?.tabSessionId;
+  } catch {
+    return undefined;
+  }
+};
+
 const buildState = async (
   companionStatus: WorkboardState['companionStatus'],
   lastError?: string,
 ): Promise<WorkboardState> => {
   const tab = await activeTab();
+  const activeTabSessionId = await currentActiveTabSessionId();
   // Pull the cached relay status set by the most recent
   // assertCompanionReachable. Always fresh on a polling refresh
   // because withCompanionStatus calls assertCompanionReachable
@@ -1507,6 +1528,7 @@ const buildState = async (
   return {
     ...(await buildWorkboardState(companionStatus, lastError, relayHealth)),
     ...(tab?.url === undefined ? {} : { activeTabUrl: tab.url }),
+    ...(activeTabSessionId === undefined ? {} : { activeTabSessionId }),
     currentTab: await currentTabThread(),
   };
 };
@@ -3169,18 +3191,19 @@ export default defineBackground(() => {
         16,
       );
     const postFeedbackEvent = async (event: TabGroupFeedbackEvent): Promise<void> => {
+      if (!(await isTimelinePrivacyGateOpen())) return;
       await companionJson('/v1/feedback/events', {
         method: 'POST',
         headers: {
           'idempotency-key': idempotencyKey(
             'tabgroup-feedback',
-            `${event.type}-${String(Date.now())}`,
+            `${event.type}-${JSON.stringify(event.payload)}`,
           ),
         },
         body: JSON.stringify(event),
       });
     };
-    createTabGroupWiring({
+    runtimeTabGroupWiring = createTabGroupWiring({
       runtime: {
         tabGroups: chrome.tabGroups,
         tabs: {
@@ -3630,6 +3653,53 @@ export default defineBackground(() => {
             } as unknown as RuntimeResponse);
           }
         })();
+        return true;
+      }
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.tabgroups.test.pull-in-out'
+      ) {
+        const raw = message as {
+          seedUrl?: unknown;
+          targetUrl?: unknown;
+          workstreamId?: unknown;
+        };
+        void (async () => {
+          if (runtimeTabGroupWiring === null || chrome.tabGroups === undefined) {
+            throw new Error('tab-group wiring is unavailable');
+          }
+          const seedUrl = typeof raw.seedUrl === 'string' ? raw.seedUrl : '';
+          const targetUrl = typeof raw.targetUrl === 'string' ? raw.targetUrl : '';
+          const workstreamId = typeof raw.workstreamId === 'string' ? raw.workstreamId : '';
+          if (seedUrl.length === 0 || targetUrl.length === 0 || workstreamId.length === 0) {
+            throw new Error('seedUrl, targetUrl, and workstreamId are required');
+          }
+          const normalize = (input: string): string =>
+            canonicalThreadUrl(input).replace(/#.*$/u, '').replace(/\/+$/u, '');
+          const tabs = await chrome.tabs.query({});
+          const seedTab = tabs.find((tab) => typeof tab.url === 'string' && normalize(tab.url) === normalize(seedUrl));
+          const targetTab = tabs.find((tab) => typeof tab.url === 'string' && normalize(tab.url) === normalize(targetUrl));
+          if (typeof seedTab?.id !== 'number' || typeof targetTab?.id !== 'number') {
+            throw new Error('could not find seed and target tabs for tab-group replay');
+          }
+          const groupId = await chrome.tabs.group({ tabIds: seedTab.id });
+          await chrome.tabGroups.update(groupId, {
+            title: 'Sidetrack T1',
+            color: 'blue',
+          });
+          await delay(100);
+          await runtimeTabGroupWiring.linkGroupToWorkstream(groupId, workstreamId);
+          await chrome.tabs.group({ groupId, tabIds: targetTab.id });
+          await delay(100);
+          await chrome.tabs.ungroup(targetTab.id);
+          sendResponse({ ok: true, groupId } as unknown as RuntimeResponse);
+        })().catch((error: unknown) => {
+          sendResponse({
+            ok: false,
+            error: error instanceof Error ? error.message : 'tab-group test hook failed',
+          } as unknown as RuntimeResponse);
+        });
         return true;
       }
       if (

@@ -9,6 +9,11 @@ export interface TabSessionAttributionInferredPayload {
   readonly rawFusionLogit: number;
   readonly margin: number;
   readonly corroborationCount: number;
+  readonly modelRevision: string;
+  readonly graphRevision: string;
+  readonly evidenceHash: string;
+  readonly resolverDependencyKey: string;
+  readonly reasonSummary: string;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -43,6 +48,11 @@ export const isTabSessionAttributionInferredPayload = (
     isDominantSource(value['dominantSource']) &&
     isFiniteNumber(value['rawFusionLogit']) &&
     isFiniteNumber(value['margin']) &&
+    isNonEmptyString(value['modelRevision']) &&
+    isNonEmptyString(value['graphRevision']) &&
+    isNonEmptyString(value['evidenceHash']) &&
+    isNonEmptyString(value['resolverDependencyKey']) &&
+    isNonEmptyString(value['reasonSummary']) &&
     typeof corroborationCount === 'number' &&
     Number.isInteger(corroborationCount) &&
     corroborationCount >= 0

@@ -2,7 +2,7 @@ export const TAB_SESSION_DRAG_MIME = 'application/x-sidetrack-tab-session-id';
 
 export interface TabSessionAttribution {
   readonly workstreamId: string | null;
-  readonly source: 'user_asserted';
+  readonly source: 'user_asserted' | 'tab-group-pull-in' | 'tab-group-pull-out' | 'inferred';
   readonly observedAt: string;
   readonly clientEventId: string;
 }

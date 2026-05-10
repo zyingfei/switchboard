@@ -268,11 +268,7 @@ export const tabSessionInbox = (
   input: { readonly limit: number; readonly offset: number },
 ): readonly TabSessionRecord[] =>
   [...projection.bySessionId.values()]
-    .filter(
-      (record) =>
-        record.currentAttribution?.workstreamId === undefined ||
-        record.currentAttribution.workstreamId === null,
-    )
+    .filter((record) => record.closedAt === undefined && record.currentAttribution === undefined)
     .sort((left, right) => {
       if (left.lastActivityAt !== right.lastActivityAt) {
         return left.lastActivityAt < right.lastActivityAt ? 1 : -1;

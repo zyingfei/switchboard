@@ -3,7 +3,10 @@ import type { ConnectionEdgeKind } from '../connections/types.js';
 export const EDGE_PRIOR_WEIGHTS: Partial<Record<ConnectionEdgeKind, number>> = {
   tab_session_in_workstream: 4.0,
   visit_in_workstream: 3.5,
+  visit_instance_in_workstream: 3.5,
   visit_in_tab_session: 3.0,
+  visit_instance_in_tab_session: 3.0,
+  visit_instance_same_url_as_timeline_visit: 1.5,
   previous_visit_in_tab_session: 2.5,
   opener_visit: 2.0,
   tab_session_opener_chain: 1.75,

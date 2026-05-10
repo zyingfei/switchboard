@@ -619,6 +619,76 @@ describe('live side-panel App wiring', () => {
     });
   });
 
+  it('matches the focused tab cue by tabSessionId before falling back to URL', async () => {
+    installChromeMock(
+      {
+        ...liveState(),
+        companionStatus: 'connected',
+        activeTabUrl: 'https://example.test/shared',
+        activeTabSessionId: 'tses_b',
+      },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    const projection = {
+      schemaVersion: 1,
+      bySessionId: {
+        tses_a: {
+          tabSessionId: 'tses_a',
+          openedAt: NOW,
+          lastActivityAt: NOW,
+          latestUrl: 'https://example.test/shared',
+          latestTitle: 'Shared A',
+          currentAttribution: {
+            workstreamId: 'bac_workstream_root',
+            source: 'user_asserted',
+            observedAt: NOW,
+            clientEventId: 'evt-a',
+          },
+          attributionHistory: [],
+        },
+        tses_b: {
+          tabSessionId: 'tses_b',
+          openedAt: NOW,
+          lastActivityAt: NOW,
+          latestUrl: 'https://example.test/shared',
+          latestTitle: 'Shared B',
+          currentAttribution: {
+            workstreamId: 'bac_workstream_sibling',
+            source: 'user_asserted',
+            observedAt: NOW,
+            clientEventId: 'evt-b',
+          },
+          attributionHistory: [],
+        },
+      },
+      openSessionsByTabId: { tab_a: 'tses_a', tab_b: 'tses_b' },
+    };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/v1/tabsessions/projection')) {
+          return { ok: true, status: 200, json: async () => ({ data: projection }) };
+        }
+        if (url.includes('/v1/tabsessions/inbox')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+          };
+        }
+        return { ok: false, status: 404, text: async () => 'not found' };
+      }),
+    );
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('focused-tab-attribution')).toHaveTextContent('Sibling');
+    });
+    expect(screen.getByTestId('focused-tab-attribution')).not.toHaveTextContent('Sidetrack');
+  });
+
   it('pulses the find icon when the active tab matches an unfocused tracked thread', async () => {
     const state = liveState();
     installChromeMock(

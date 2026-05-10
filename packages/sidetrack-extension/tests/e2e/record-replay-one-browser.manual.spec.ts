@@ -32,6 +32,7 @@ import {
   forceDrainTimeline,
   installRouteStubsForPack,
   installRouteStubsForWorkflow,
+  loadTabSessionCaseFixtures,
   readChromeStorageSnapshot,
   readSessionPack,
   readSidetrackVersion,
@@ -42,6 +43,10 @@ import {
   resolveCaptureLevel,
   resolveTestSessionsDir,
   TIMELINE_REPLAY_DEBUG_STORAGE_KEY,
+  t1AutoApplyDisabled,
+  t1ExplicitAttributionFixtureEnabled,
+  t1InboxUxReplayEnabled,
+  t1ResolverTabGroupReplayEnabled,
   timelineReplayDebugEnabled,
   waitForReplaySurfaces,
   writeReplayReport,
@@ -49,16 +54,23 @@ import {
   type CaptureLevel,
   type MinimalWorkflowStep,
   type SessionPack,
+  type T1ProductBehaviorCheck,
 } from './helpers/recordReplay';
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
-import { SETTINGS_KEY, SETUP_KEY } from './helpers/sidepanel';
+import { SETTINGS_KEY, SETUP_KEY, WORKSTREAMS_KEY } from './helpers/sidepanel';
 
 const ACTIVE_WORKSTREAM_ID = 'ws_t1_record_replay_2a';
+const SECONDARY_WORKSTREAM_ID = 'ws_t1_record_replay_secondary';
 
 const WORKFLOW: readonly MinimalWorkflowStep[] = [
   {
     url: 'https://example.test/t1/record-replay?keep=1&token=secret#private',
     title: 'T1 record/replay charter',
+    provider: 'generic',
+  },
+  {
+    url: 'https://example.test/t1/record-replay?keep=1&token=secret#private',
+    title: 'T1 record/replay charter — second tab',
     provider: 'generic',
   },
   {
@@ -76,8 +88,33 @@ const WORKFLOW: readonly MinimalWorkflowStep[] = [
 const REPLAY_PACK_PATH = process.env['SIDETRACK_REPLAY_PACK'];
 const REPLAY_REPORT_DIR = process.env['SIDETRACK_REPLAY_REPORT_DIR'];
 const STRICT_OFFLINE = process.env['SIDETRACK_REPLAY_STRICT_OFFLINE'] === '1';
-const SYNTHETIC_TAB_SESSION_ATTRIBUTION =
-  process.env['SIDETRACK_T1_SYNTHETIC_TAB_ATTRIBUTION'] === '1';
+const APPLY_EXPLICIT_ATTRIBUTION_FIXTURE = t1ExplicitAttributionFixtureEnabled();
+const RUN_INBOX_UX_REPLAY = t1InboxUxReplayEnabled();
+const RUN_RESOLVER_TABGROUP_REPLAY = t1ResolverTabGroupReplayEnabled();
+const AUTO_APPLY_DISABLED = t1AutoApplyDisabled();
+
+const T1_WORKSTREAMS = [
+  {
+    bac_id: ACTIVE_WORKSTREAM_ID,
+    revision: 'rev_t1_record_replay_2a',
+    title: 'Sidetrack T1',
+    children: [],
+    tags: [],
+    checklist: [],
+    privacy: 'shared',
+    updatedAt: '2026-05-10T00:00:00.000Z',
+  },
+  {
+    bac_id: SECONDARY_WORKSTREAM_ID,
+    revision: 'rev_t1_record_replay_secondary',
+    title: 'Sidetrack Secondary',
+    children: [],
+    tags: [],
+    checklist: [],
+    privacy: 'shared',
+    updatedAt: '2026-05-10T00:00:00.000Z',
+  },
+] as const;
 
 const settingsFor = (companion: TestCompanion) => ({
   companion: { port: companion.port, bridgeKey: companion.bridgeKey },
@@ -104,6 +141,7 @@ const seedTimelineRuntime = async (
   await runtime.seedStorage(panel, {
     [SETUP_KEY]: true,
     [SETTINGS_KEY]: settingsFor(companion),
+    [WORKSTREAMS_KEY]: T1_WORKSTREAMS,
     'sidetrack.timeline.enabled': true,
     ...(timelineReplayDebugEnabled() ? { [TIMELINE_REPLAY_DEBUG_STORAGE_KEY]: true } : {}),
   });
@@ -130,75 +168,516 @@ const logTimelineReplayDiagnostics = async (
   console.log(`[record-replay:timeline-diagnostics:${label}] ${JSON.stringify(diagnostics)}`);
 };
 
-const visitNodeId = (canonicalUrl: string): string => `timeline-visit:${canonicalUrl}`;
-
 const canonicalForTimelineItem = (input: string): string =>
   input.length > 1 && input.endsWith('/') ? input.slice(0, -1) : input;
 
-const waitForTimelineTabSessions = async (
+interface T1TabSessionRecord {
+  readonly tabSessionId: string;
+  readonly latestUrl?: string;
+  readonly currentAttribution?: {
+    readonly workstreamId: string | null;
+    readonly source: string;
+  };
+  readonly attributionHistory: readonly {
+    readonly workstreamId: string | null;
+    readonly source: string;
+  }[];
+}
+
+interface T1TabSessionProjection {
+  readonly bySessionId: Record<string, T1TabSessionRecord>;
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const readTabSessionProjection = async (
   companion: TestCompanion,
-  expectedUrls: readonly string[],
-): Promise<ReadonlyMap<string, string>> => {
-  let last = new Map<string, string>();
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const timeline = await readTimeline(companion);
-    const byCanonical = new Map<string, string>();
-    for (const item of timeline.data.items) {
-      if (item.tabSessionId === undefined || item.tabSessionId.length === 0) continue;
-      byCanonical.set(canonicalForTimelineItem(item.canonicalUrl ?? item.url), item.tabSessionId);
-    }
-    last = byCanonical;
-    if (expectedUrls.every((url) => byCanonical.has(url))) return byCanonical;
-    await new Promise((resolve) => setTimeout(resolve, 500));
+): Promise<T1TabSessionProjection> => {
+  const body = await companionGet(companion, '/v1/tabsessions/projection');
+  const data = isRecord(body) ? body['data'] : undefined;
+  if (!isRecord(data) || !isRecord(data['bySessionId'])) {
+    throw new Error('Companion returned an invalid tab-session projection.');
   }
-  throw new Error(
-    `Timed out waiting for tabSessionId on timeline replay items; found ${JSON.stringify([
-      ...last.entries(),
-    ])}`,
-  );
+  return { bySessionId: data['bySessionId'] as Record<string, T1TabSessionRecord> };
 };
 
-const withSyntheticExpectedEdges = (
-  pack: SessionPack,
+const tabSessionRecordsForCanonicals = (
+  projection: T1TabSessionProjection,
   expectedUrls: readonly string[],
-  workstreamId: string,
-): SessionPack => ({
-  ...pack,
-  expectations: {
-    expectedCanonicalUrls: pack.expectations?.expectedCanonicalUrls ?? expectedUrls,
-    expectedEdges: [
-      ...(pack.expectations?.expectedEdges ?? []),
-      ...expectedUrls.map((url) => ({
-        kind: 'visit_in_workstream',
-        from: visitNodeId(url),
-        to: `workstream:${workstreamId}`,
-      })),
-    ],
-    knownDetours: pack.expectations?.knownDetours ?? [],
-  },
-});
+): readonly T1TabSessionRecord[] => {
+  const expected = new Set(expectedUrls.map(canonicalForTimelineItem));
+  return Object.values(projection.bySessionId)
+    .filter((record) => {
+      const url = record.latestUrl;
+      return typeof url === 'string' && expected.has(canonicalForTimelineItem(url));
+    })
+    .sort((left, right) => left.tabSessionId.localeCompare(right.tabSessionId));
+};
 
-const applySyntheticTabSessionAttribution = async (
+const pass = (
+  mode: T1ProductBehaviorCheck['mode'],
+  caseId: string,
+  summary: string,
+  details: readonly string[] = [],
+): T1ProductBehaviorCheck => ({ mode, caseId, status: 'pass', summary, details });
+
+const fail = (
+  mode: T1ProductBehaviorCheck['mode'],
+  caseId: string,
+  summary: string,
+  details: readonly string[],
+): T1ProductBehaviorCheck => ({ mode, caseId, status: 'fail', summary, details });
+
+const evaluateIdentityReplay = async (input: {
+  readonly companion: TestCompanion;
+  readonly expectedUrls: readonly string[];
+}): Promise<readonly T1ProductBehaviorCheck[]> => {
+  const timeline = await readTimeline(input.companion);
+  const connections = (await companionGet(input.companion, '/v1/connections')) as {
+    readonly data?: {
+      readonly snapshot?: {
+        readonly nodes?: readonly { readonly id?: string; readonly kind?: string }[];
+        readonly edges?: readonly {
+          readonly kind?: string;
+          readonly fromNodeId?: string;
+          readonly toNodeId?: string;
+        }[];
+      };
+    };
+  };
+  const nodes = connections.data?.snapshot?.nodes ?? [];
+  const edges = connections.data?.snapshot?.edges ?? [];
+  const timelineItemsWithSessions = timeline.data.items.filter(
+    (item) =>
+      input.expectedUrls.includes(canonicalForTimelineItem(item.canonicalUrl ?? item.url)) &&
+      item.tabSessionId !== undefined &&
+      item.tabSessionId.length > 0,
+  );
+  const tabSessionNodes = nodes.filter((node) => node.id?.startsWith('tab-session:') === true);
+  const visitInstanceEdges = edges.filter((edge) => edge.kind === 'visit_instance_in_tab_session');
+  const sameUrlEdges = edges.filter(
+    (edge) => edge.kind === 'visit_instance_same_url_as_timeline_visit',
+  );
+  const urlScopedWorkstreamEdges = edges.filter((edge) => edge.kind === 'visit_in_workstream');
+  const details = [
+    `timeline items with tabSessionId: ${String(timelineItemsWithSessions.length)}`,
+    `tab-session nodes: ${String(tabSessionNodes.length)}`,
+    `visit_instance_in_tab_session edges: ${String(visitInstanceEdges.length)}`,
+    `visit_instance_same_url_as_timeline_visit edges: ${String(sameUrlEdges.length)}`,
+    `URL-scoped visit_in_workstream edges: ${String(urlScopedWorkstreamEdges.length)}`,
+  ];
+  if (
+    timelineItemsWithSessions.length === 0 ||
+    tabSessionNodes.length === 0 ||
+    visitInstanceEdges.length === 0 ||
+    sameUrlEdges.length === 0 ||
+    urlScopedWorkstreamEdges.length > 0
+  ) {
+    return [
+      fail('T1-A identity replay', 'case-1-same-url-two-sessions', 'identity replay failed', details),
+      fail('T1-A identity replay', 'case-6-active-pointer-not-truth', 'active pointer leaked', details),
+    ];
+  }
+  return [
+    pass('T1-A identity replay', 'case-1-same-url-two-sessions', 'session-scoped visit identity held', details),
+    pass('T1-A identity replay', 'case-6-active-pointer-not-truth', 'active pointer did not create URL-scoped graph truth', details),
+  ];
+};
+
+const applyExplicitAttributionFixture = async (
   companion: TestCompanion,
   pack: SessionPack,
   expectedUrls: readonly string[],
-): Promise<SessionPack> => {
-  if (!SYNTHETIC_TAB_SESSION_ATTRIBUTION) return pack;
+): Promise<readonly T1ProductBehaviorCheck[]> => {
+  if (!APPLY_EXPLICIT_ATTRIBUTION_FIXTURE) return [];
   const workstreamId = firstBrowser(pack).activeWorkstreamId;
   if (workstreamId === null) {
-    throw new Error('Synthetic tab-session attribution requires an active workstream id.');
+    throw new Error('Explicit tab-session attribution fixture requires an active workstream id.');
   }
-  const tabSessionByUrl = await waitForTimelineTabSessions(companion, expectedUrls);
+  const projection = await readTabSessionProjection(companion);
+  const records = tabSessionRecordsForCanonicals(projection, expectedUrls);
   const attributed = new Set<string>();
-  for (const url of expectedUrls) {
-    const tabSessionId = tabSessionByUrl.get(url);
-    if (tabSessionId === undefined || attributed.has(tabSessionId)) continue;
+  for (const record of records) {
+    const tabSessionId = record.tabSessionId;
+    if (attributed.has(tabSessionId)) continue;
     await companionPost(companion, `/v1/tabsessions/${encodeURIComponent(tabSessionId)}/attribute`, {
       workstreamId,
     });
     attributed.add(tabSessionId);
   }
-  return withSyntheticExpectedEdges(pack, expectedUrls, workstreamId);
+  const after = await readTabSessionProjection(companion);
+  const afterRecords = [...attributed].map((tabSessionId) => after.bySessionId[tabSessionId]);
+  const missing = afterRecords.filter(
+    (record) => record?.currentAttribution?.workstreamId !== workstreamId,
+  );
+  let tabSessionEdges = 0;
+  let visitInstanceEdges = 0;
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const body = (await companionGet(companion, '/v1/connections')) as {
+      readonly data?: {
+        readonly snapshot?: {
+          readonly edges?: readonly {
+            readonly kind?: string;
+            readonly fromNodeId?: string;
+            readonly toNodeId?: string;
+          }[];
+        };
+      };
+    };
+    const edges = body.data?.snapshot?.edges ?? [];
+    tabSessionEdges = edges.filter(
+      (edge) =>
+        edge.kind === 'tab_session_in_workstream' &&
+        attributed.has((edge.fromNodeId ?? '').replace(/^tab-session:/u, '')) &&
+        edge.toNodeId === `workstream:${workstreamId}`,
+    ).length;
+    visitInstanceEdges = edges.filter(
+      (edge) =>
+        edge.kind === 'visit_instance_in_workstream' &&
+        edge.toNodeId === `workstream:${workstreamId}`,
+    ).length;
+    if (tabSessionEdges >= attributed.size && visitInstanceEdges >= attributed.size) break;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  const details = [
+    ...[...attributed].sort(),
+    `tab_session_in_workstream=${String(tabSessionEdges)}`,
+    `visit_instance_in_workstream=${String(visitInstanceEdges)}`,
+  ];
+  return missing.length === 0 &&
+    attributed.size > 0 &&
+    tabSessionEdges >= attributed.size &&
+    visitInstanceEdges >= attributed.size
+    ? [
+        pass(
+          'T1-B explicit attribution replay',
+          'case-1-same-url-two-sessions',
+          `explicit fixture attributed ${String(attributed.size)} tab session(s)`,
+          details,
+        ),
+      ]
+    : [
+        fail(
+          'T1-B explicit attribution replay',
+          'case-1-same-url-two-sessions',
+          'explicit attribution fixture did not materialize',
+          [...missing.map((record) => record?.tabSessionId ?? '<missing record>'), ...details],
+        ),
+      ];
+};
+
+const waitForProjection = async (
+  companion: TestCompanion,
+  predicate: (projection: T1TabSessionProjection) => boolean,
+): Promise<T1TabSessionProjection> => {
+  let last = await readTabSessionProjection(companion);
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    last = await readTabSessionProjection(companion);
+    if (predicate(last)) return last;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return last;
+};
+
+const runInboxUxReplay = async (input: {
+  readonly panel: Page;
+  readonly companion: TestCompanion;
+  readonly expectedUrls: readonly string[];
+}): Promise<readonly T1ProductBehaviorCheck[]> => {
+  if (!RUN_INBOX_UX_REPLAY) return [];
+  const before = await readTabSessionProjection(input.companion);
+  const records = tabSessionRecordsForCanonicals(before, input.expectedUrls);
+  const [assigned, dismissed, unassigned] = records;
+  if (assigned === undefined || dismissed === undefined || unassigned === undefined) {
+    return [
+      fail('T1-C inbox UX replay', 'case-2-real-inbox-assignment', 'not enough tab sessions for three-card UX case', [
+        `records: ${records.map((record) => record.tabSessionId).join(', ')}`,
+      ]),
+    ];
+  }
+
+  await input.panel.bringToFront();
+  await input.panel.reload({ waitUntil: 'domcontentloaded' });
+  await input.panel.getByRole('tab', { name: 'Inbox' }).click();
+  await expect(input.panel.getByTestId(`tab-session-card-${assigned.tabSessionId}`)).toBeVisible({
+    timeout: 30_000,
+  });
+  const assignedCard = input.panel.getByTestId(`tab-session-card-${assigned.tabSessionId}`);
+  await assignedCard.getByRole('combobox').selectOption(ACTIVE_WORKSTREAM_ID);
+  await assignedCard.getByRole('button', { name: 'Move' }).click();
+  await waitForProjection(
+    input.companion,
+    (projection) =>
+      projection.bySessionId[assigned.tabSessionId]?.currentAttribution?.workstreamId ===
+      ACTIVE_WORKSTREAM_ID,
+  );
+
+  await input.panel.reload({ waitUntil: 'domcontentloaded' });
+  await input.panel.getByRole('tab', { name: 'Inbox' }).click();
+  const dismissedCard = input.panel.getByTestId(`tab-session-card-${dismissed.tabSessionId}`);
+  await expect(dismissedCard).toBeVisible({ timeout: 30_000 });
+  await dismissedCard.getByRole('button', { name: 'Not in any workstream' }).click();
+  const after = await waitForProjection(
+    input.companion,
+    (projection) =>
+      projection.bySessionId[dismissed.tabSessionId]?.currentAttribution?.workstreamId === null,
+  );
+  const assignedOk =
+    after.bySessionId[assigned.tabSessionId]?.currentAttribution?.workstreamId ===
+    ACTIVE_WORKSTREAM_ID;
+  const dismissedOk =
+    after.bySessionId[dismissed.tabSessionId]?.currentAttribution?.workstreamId === null;
+  const unassignedOk = after.bySessionId[unassigned.tabSessionId]?.currentAttribution === undefined;
+  const details = [
+    `assigned=${assigned.tabSessionId}:${String(assignedOk)}`,
+    `dismissed=${dismissed.tabSessionId}:${String(dismissedOk)}`,
+    `unassigned=${unassigned.tabSessionId}:${String(unassignedOk)}`,
+  ];
+  return assignedOk && dismissedOk && unassignedOk
+    ? [pass('T1-C inbox UX replay', 'case-2-real-inbox-assignment', 'real Inbox UI assigned/dismissed/left cards correctly', details)]
+    : [fail('T1-C inbox UX replay', 'case-2-real-inbox-assignment', 'Inbox UI state did not match expected assignments', details)];
+};
+
+const firstSameUrlPair = (
+  records: readonly T1TabSessionRecord[],
+): readonly [T1TabSessionRecord, T1TabSessionRecord] | null => {
+  const byUrl = new Map<string, T1TabSessionRecord[]>();
+  for (const record of records) {
+    if (record.latestUrl === undefined) continue;
+    const key = canonicalForTimelineItem(record.latestUrl);
+    const list = byUrl.get(key) ?? [];
+    list.push(record);
+    byUrl.set(key, list);
+  }
+  for (const list of byUrl.values()) {
+    if (list.length >= 2 && list[0] !== undefined && list[1] !== undefined) {
+      return [list[0], list[1]];
+    }
+  }
+  return null;
+};
+
+const runResolverTabGroupReplay = async (input: {
+  readonly runtime: ExtensionRuntime;
+  readonly panel: Page;
+  readonly companion: TestCompanion;
+  readonly expectedUrls: readonly string[];
+}): Promise<readonly T1ProductBehaviorCheck[]> => {
+  if (!RUN_RESOLVER_TABGROUP_REPLAY) return [];
+  const checks: T1ProductBehaviorCheck[] = [];
+  const before = await readTabSessionProjection(input.companion);
+  const pair = firstSameUrlPair(tabSessionRecordsForCanonicals(before, input.expectedUrls));
+  if (pair === null) {
+    return [
+      fail('T1-D resolver/tab-group replay', 'case-3-resolver-dryrun-no-write', 'no same-URL tab-session pair was available', []),
+    ];
+  }
+  const [anchor, target] = pair;
+  await companionPost(input.companion, `/v1/tabsessions/${encodeURIComponent(anchor.tabSessionId)}/attribute`, {
+    workstreamId: ACTIVE_WORKSTREAM_ID,
+  });
+  await waitForReplaySurfaces({ companion: input.companion, expectedCanonicalUrls: input.expectedUrls });
+
+  const dryRunBody = (await companionGet(
+    input.companion,
+    `/v1/tabsessions/${encodeURIComponent(target.tabSessionId)}/resolve?dryRun=true`,
+  )) as {
+    readonly data?: {
+      readonly decision?: { readonly action?: string; readonly workstreamId?: string };
+      readonly fusedCandidates?: readonly {
+        readonly workstreamId?: string;
+        readonly dominantSource?: string;
+        readonly reasons?: readonly unknown[];
+      }[];
+    };
+  };
+  const top = dryRunBody.data?.fusedCandidates?.[0];
+  const dryRunOk =
+    top?.workstreamId === ACTIVE_WORKSTREAM_ID &&
+    typeof top.dominantSource === 'string' &&
+    top.dominantSource !== 'none' &&
+    (top.reasons?.length ?? 0) > 0;
+  const projectionAfterDryRun = await readTabSessionProjection(input.companion);
+  const dryRunWrote =
+    projectionAfterDryRun.bySessionId[target.tabSessionId]?.currentAttribution?.source ===
+    'inferred';
+  checks.push(
+    dryRunOk && !dryRunWrote
+      ? pass('T1-D resolver/tab-group replay', 'case-3-resolver-dryrun-no-write', 'resolver dry-run returned explainable candidates without inferred writes', [
+          `top=${top.workstreamId}:${top.dominantSource}`,
+        ])
+      : fail('T1-D resolver/tab-group replay', 'case-3-resolver-dryrun-no-write', 'resolver dry-run failed or wrote inferred attribution', [
+          `top=${JSON.stringify(top)}`,
+          `dryRunWrote=${String(dryRunWrote)}`,
+        ]),
+  );
+
+  if (AUTO_APPLY_DISABLED) {
+    const disabledProjection = await readTabSessionProjection(input.companion);
+    const disabledOk =
+      disabledProjection.bySessionId[target.tabSessionId]?.currentAttribution?.source !==
+      'inferred';
+    checks.push(
+      disabledOk
+        ? pass(
+            'T1-D resolver/tab-group replay',
+            'case-5-autoapply-policy-mode',
+            'auto-apply disabled; no Class E write attempted',
+            [`target=${target.tabSessionId}`],
+          )
+        : fail(
+            'T1-D resolver/tab-group replay',
+            'case-5-autoapply-policy-mode',
+            'auto-apply disabled but inferred attribution was present',
+            [`target=${target.tabSessionId}`],
+          ),
+    );
+  } else {
+    const autoBody = (await companionPost(
+      input.companion,
+      `/v1/tabsessions/${encodeURIComponent(target.tabSessionId)}/resolve`,
+      { dryRun: false, policyMode: 'balanced' },
+    )) as {
+      readonly data?: {
+        readonly status?: string;
+        readonly projection?: T1TabSessionProjection;
+      };
+    };
+    const applied =
+      autoBody.data?.status === 'applied' &&
+      autoBody.data.projection?.bySessionId[target.tabSessionId]?.currentAttribution?.source ===
+        'inferred' &&
+      autoBody.data.projection.bySessionId[target.tabSessionId]?.currentAttribution?.workstreamId ===
+        ACTIVE_WORKSTREAM_ID;
+    checks.push(
+      applied
+        ? pass('T1-D resolver/tab-group replay', 'case-5-autoapply-policy-mode', 'balanced policy wrote Class E inferred attribution', [
+            `target=${target.tabSessionId}`,
+          ])
+        : fail('T1-D resolver/tab-group replay', 'case-5-autoapply-policy-mode', 'balanced policy did not auto-apply strong evidence', [
+            JSON.stringify(autoBody.data),
+          ]),
+    );
+  }
+
+  const [seedUrl, targetUrl] = input.expectedUrls;
+  if (seedUrl === undefined || targetUrl === undefined) {
+    checks.push(
+      fail('T1-D resolver/tab-group replay', 'case-4-tabgroup-pull-in-out', 'missing URLs for tab-group replay', []),
+    );
+    return checks;
+  }
+  const seedPage = await input.runtime.context.newPage();
+  const targetPage = await input.runtime.context.newPage();
+  try {
+    await seedPage.goto(seedUrl, { waitUntil: 'domcontentloaded' });
+    await targetPage.goto(targetUrl, { waitUntil: 'domcontentloaded' });
+    await targetPage.bringToFront();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const result = (await input.runtime.sendRuntimeMessage(input.panel, {
+      type: 'sidetrack.tabgroups.test.pull-in-out',
+      seedUrl,
+      targetUrl,
+      workstreamId: ACTIVE_WORKSTREAM_ID,
+    })) as { readonly ok?: boolean; readonly error?: string };
+    const afterTabGroup = await waitForProjection(input.companion, (projection) =>
+      Object.values(projection.bySessionId).some((record) =>
+        record.attributionHistory.some((entry) => entry.source === 'tab-group-pull-out'),
+      ),
+    );
+    const pullOutRecord = Object.values(afterTabGroup.bySessionId).find((record) =>
+      record.attributionHistory.some((entry) => entry.source === 'tab-group-pull-out'),
+    );
+    const pullInRecord = Object.values(afterTabGroup.bySessionId).find((record) =>
+      record.attributionHistory.some((entry) => entry.source === 'tab-group-pull-in'),
+    );
+    const tabGroupOk =
+      result.ok === true &&
+      pullInRecord !== undefined &&
+      pullOutRecord !== undefined &&
+      pullOutRecord.currentAttribution?.workstreamId === null;
+    checks.push(
+      tabGroupOk
+        ? pass('T1-D resolver/tab-group replay', 'case-4-tabgroup-pull-in-out', 'tab-group pull-in and pull-out events materialized', [
+            `pullIn=${pullInRecord?.tabSessionId ?? '<none>'}`,
+            `pullOut=${pullOutRecord?.tabSessionId ?? '<none>'}`,
+          ])
+        : fail('T1-D resolver/tab-group replay', 'case-4-tabgroup-pull-in-out', 'tab-group hook did not produce pull-in/pull-out attribution', [
+            `hook=${JSON.stringify(result)}`,
+            `pullIn=${pullInRecord?.tabSessionId ?? '<none>'}`,
+            `pullOut=${pullOutRecord?.tabSessionId ?? '<none>'}`,
+          ]),
+    );
+  } finally {
+    await seedPage.close().catch(() => undefined);
+    await targetPage.close().catch(() => undefined);
+  }
+
+  return checks;
+};
+
+const runProductBehaviorModes = async (input: {
+  readonly runtime: ExtensionRuntime;
+  readonly panel: Page;
+  readonly companion: TestCompanion;
+  readonly pack: SessionPack;
+  readonly expectedUrls: readonly string[];
+}): Promise<{
+  readonly surfaces: Awaited<ReturnType<typeof waitForReplaySurfaces>>;
+  readonly checks: readonly T1ProductBehaviorCheck[];
+}> => {
+  const fixtures = await loadTabSessionCaseFixtures();
+  const checks: T1ProductBehaviorCheck[] = [
+    fixtures.length === 6
+      ? pass(
+          'T1-A identity replay',
+          'phase-6-fixtures',
+          'loaded all six tab-session T1 case fixtures',
+          fixtures.map((fixture) => fixture.id),
+        )
+      : fail(
+          'T1-A identity replay',
+          'phase-6-fixtures',
+          'fixture set is incomplete',
+          fixtures.map((fixture) => fixture.id),
+        ),
+  ];
+  await waitForReplaySurfaces({
+    companion: input.companion,
+    expectedCanonicalUrls: input.expectedUrls,
+  });
+  checks.push(
+    ...(await evaluateIdentityReplay({
+      companion: input.companion,
+      expectedUrls: input.expectedUrls,
+    })),
+  );
+  checks.push(
+    ...(await runResolverTabGroupReplay({
+      runtime: input.runtime,
+      panel: input.panel,
+      companion: input.companion,
+      expectedUrls: input.expectedUrls,
+    })),
+  );
+  checks.push(
+    ...(await runInboxUxReplay({
+      panel: input.panel,
+      companion: input.companion,
+      expectedUrls: input.expectedUrls,
+    })),
+  );
+  checks.push(
+    ...(await applyExplicitAttributionFixture(input.companion, input.pack, input.expectedUrls)),
+  );
+  return {
+    surfaces: await waitForReplaySurfaces({
+      companion: input.companion,
+      expectedCanonicalUrls: input.expectedUrls,
+    }),
+    checks,
+  };
 };
 
 test.describe('manual T1 Wave 2a one-browser record/replay', () => {
@@ -297,22 +776,21 @@ test.describe('manual T1 Wave 2a one-browser record/replay', () => {
     const expectedUrls = recordedCanonicalUrls(input.pack);
     const drain = await forceDrainTimeline(replayRuntime, replayPanel, expectedUrls.length);
     await logTimelineReplayDiagnostics(replayRuntime, replayPanel, 'after-force-drain');
-    const evaluationPack = await applySyntheticTabSessionAttribution(
-      replayCompanion,
-      input.pack,
-      expectedUrls,
-    );
-    const surfaces = await waitForReplaySurfaces({
+    const product = await runProductBehaviorModes({
+      runtime: replayRuntime,
+      panel: replayPanel,
       companion: replayCompanion,
-      expectedCanonicalUrls: expectedUrls,
+      pack: input.pack,
+      expectedUrls,
     });
     const report = evaluateOneBrowserReplay({
-      pack: evaluationPack,
+      pack: input.pack,
       routeTracker,
       pageReplay,
       drain,
-      timeline: surfaces.timeline,
-      connections: surfaces.connections,
+      timeline: product.surfaces.timeline,
+      connections: product.surfaces.connections,
+      productBehavior: product.checks,
       strictOffline: STRICT_OFFLINE,
     });
     const writtenReport = await writeReplayReport(path.dirname(input.packPath), report, {
@@ -386,22 +864,21 @@ test.describe('manual T1 Wave 2a one-browser record/replay', () => {
       replayPanel,
       'record-fresh-after-force-drain',
     );
-    const evaluationPack = await applySyntheticTabSessionAttribution(
-      replayCompanion,
-      draftPack,
-      expectedUrls,
-    );
-    const surfaces = await waitForReplaySurfaces({
+    const product = await runProductBehaviorModes({
+      runtime: replayRuntime,
+      panel: replayPanel,
       companion: replayCompanion,
-      expectedCanonicalUrls: expectedUrls,
+      pack: draftPack,
+      expectedUrls,
     });
     const report = evaluateOneBrowserReplay({
-      pack: evaluationPack,
+      pack: draftPack,
       routeTracker,
       pageReplay,
       drain,
-      timeline: surfaces.timeline,
-      connections: surfaces.connections,
+      timeline: product.surfaces.timeline,
+      connections: product.surfaces.connections,
+      productBehavior: product.checks,
       strictOffline: STRICT_OFFLINE,
     });
     const writtenReport = await writeReplayReport(writtenPack.packDir, report);
@@ -411,6 +888,7 @@ test.describe('manual T1 Wave 2a one-browser record/replay', () => {
       'extension-observation',
       'companion-projection',
       'graph-materialization',
+      'product-behavior',
       'evaluation-expectations',
     ]);
     expect(report.status).toBe('pass');

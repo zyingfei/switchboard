@@ -2719,9 +2719,15 @@ const App = () => {
     state.activeTabUrl ?? state.currentTab?.tabSnapshot?.url ?? state.currentTab?.threadUrl,
   );
   const focusedTabSession = useMemo(() => {
+    if (state.activeTabSessionId !== undefined) {
+      const exact = tabSessionRecords.find(
+        (record) => record.tabSessionId === state.activeTabSessionId,
+      );
+      if (exact !== undefined) return exact;
+    }
     if (focusedTabUrl === null) return undefined;
     return tabSessionRecords.find((record) => comparableTabUrl(record.latestUrl) === focusedTabUrl);
-  }, [focusedTabUrl, tabSessionRecords]);
+  }, [focusedTabUrl, state.activeTabSessionId, tabSessionRecords]);
   const focusedTabSuggestion =
     focusedTabSession === undefined
       ? undefined

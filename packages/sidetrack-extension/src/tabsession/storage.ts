@@ -20,6 +20,9 @@ interface ChromeStorageLocal {
 export interface TabSessionStorage {
   readonly readAll: () => Promise<TabSessionByTabIdHash>;
   readonly writeAll: (records: TabSessionByTabIdHash) => Promise<void>;
+  readonly mutate: (
+    apply: (records: TabSessionByTabIdHash) => TabSessionByTabIdHash,
+  ) => Promise<void>;
   readonly get: (tabIdHash: string) => Promise<StoredTabSession | undefined>;
   readonly set: (tabIdHash: string, record: StoredTabSession) => Promise<void>;
   readonly remove: (tabIdHash: string) => Promise<void>;
@@ -97,6 +100,7 @@ export const createChromeTabSessionStorage = (
   return {
     readAll,
     writeAll,
+    mutate,
     get: async (tabIdHash) => (await readAll())[tabIdHash],
     set: async (tabIdHash, record) => mutate((records) => ({ ...records, [tabIdHash]: record })),
     remove: async (tabIdHash) =>

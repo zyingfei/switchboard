@@ -22,8 +22,10 @@ export function AttributionBadge({ record, suggestion, workstreams }: Attributio
   const attribution = record?.currentAttribution;
   const suggestedWorkstreamId = suggestion?.decision.workstreamId;
   const label = workstreamLabel(attribution?.workstreamId ?? suggestedWorkstreamId, workstreams);
-  const asserted = attribution?.source === 'user_asserted' && attribution.workstreamId !== null;
-  const suggested = !asserted && suggestedWorkstreamId !== undefined;
+  const attributed = attribution !== undefined && attribution.workstreamId !== null;
+  const asserted = attributed && attribution.source !== 'inferred';
+  const suggested = !attributed && suggestedWorkstreamId !== undefined;
+  const sourceLabel = attribution?.source ?? 'unknown';
   return (
     <span
       className={
@@ -31,10 +33,12 @@ export function AttributionBadge({ record, suggestion, workstreams }: Attributio
       }
       title={
         asserted
-          ? `Attributed by you to ${label}`
-          : suggested
-            ? `Suggested by Sidetrack: ${label}`
-            : 'No tab-session attribution'
+          ? `Attributed to ${label} (${sourceLabel})`
+          : attributed
+            ? `Inferred by Sidetrack: ${label}`
+            : suggested
+              ? `Suggested by Sidetrack: ${label}`
+              : 'No tab-session attribution'
       }
     >
       {label}

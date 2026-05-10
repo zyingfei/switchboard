@@ -2,7 +2,7 @@
 
 import { execFile } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
@@ -186,6 +186,33 @@ export interface TimelineDrainResult {
 export const timelineReplayDebugEnabled = (): boolean =>
   process.env['SIDETRACK_REPLAY_DEBUG'] === '1';
 
+let warnedLegacyExplicitAttributionFlag = false;
+
+export const t1ExplicitAttributionFixtureEnabled = (
+  env: NodeJS.ProcessEnv = process.env,
+): boolean => {
+  if (env['SIDETRACK_T1_APPLY_EXPLICIT_ATTRIBUTION_FIXTURE'] === '1') return true;
+  if (env['SIDETRACK_T1_SYNTHETIC_TAB_ATTRIBUTION'] !== '1') return false;
+  if (!warnedLegacyExplicitAttributionFlag) {
+    warnedLegacyExplicitAttributionFlag = true;
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[record-replay] SIDETRACK_T1_SYNTHETIC_TAB_ATTRIBUTION is deprecated; ' +
+        'use SIDETRACK_T1_APPLY_EXPLICIT_ATTRIBUTION_FIXTURE=1.',
+    );
+  }
+  return true;
+};
+
+export const t1InboxUxReplayEnabled = (env: NodeJS.ProcessEnv = process.env): boolean =>
+  env['SIDETRACK_T1_INBOX_UX_REPLAY'] === '1';
+
+export const t1ResolverTabGroupReplayEnabled = (env: NodeJS.ProcessEnv = process.env): boolean =>
+  env['SIDETRACK_T1_RESOLVER_TABGROUP_REPLAY'] === '1';
+
+export const t1AutoApplyDisabled = (env: NodeJS.ProcessEnv = process.env): boolean =>
+  env['SIDETRACK_T1_AUTO_APPLY_DISABLED'] === '1';
+
 export const readTimelineReplayDiagnostics = async (
   runtime: ExtensionRuntime,
   senderPage: Page,
@@ -194,11 +221,33 @@ export const readTimelineReplayDiagnostics = async (
     type: 'sidetrack.timeline.diagnostics',
   });
 
+export type T1ProductBehaviorMode =
+  | 'T1-A identity replay'
+  | 'T1-B explicit attribution replay'
+  | 'T1-C inbox UX replay'
+  | 'T1-D resolver/tab-group replay';
+
+export interface T1ProductBehaviorCheck {
+  readonly mode: T1ProductBehaviorMode;
+  readonly caseId: string;
+  readonly status: 'pass' | 'fail';
+  readonly summary: string;
+  readonly details: readonly string[];
+}
+
+export interface TabSessionCaseFixture {
+  readonly id: string;
+  readonly mode: 'T1-A' | 'T1-B' | 'T1-C' | 'T1-D';
+  readonly description: string;
+  readonly expected: readonly string[];
+}
+
 export type ReplayLayerName =
   | 'page-replay'
   | 'extension-observation'
   | 'companion-projection'
   | 'graph-materialization'
+  | 'product-behavior'
   | 'evaluation-expectations';
 
 export interface ReplayLayerReport {
@@ -221,6 +270,7 @@ export interface ReplayEvaluationReport {
   readonly detourAssertions: readonly DetourAssertion[];
   readonly qualitativeWarnings: readonly QualitativeWarning[];
   readonly layers: readonly ReplayLayerReport[];
+  readonly productBehavior: readonly T1ProductBehaviorCheck[];
   readonly recordedCanonicalUrls: readonly string[];
   readonly replayedCanonicalUrls: readonly string[];
   readonly timelineCanonicalUrls: readonly string[];
@@ -420,6 +470,58 @@ export const resolveTestSessionsDir = (env: NodeJS.ProcessEnv = process.env): st
   const override = env['SIDETRACK_TEST_SESSIONS_DIR'];
   if (override !== undefined && override.length > 0) return path.resolve(override);
   return path.join(homedir(), '.sidetrack', 'test-sessions');
+};
+
+const readFixtureStringArray = (
+  record: Record<string, unknown>,
+  key: string,
+): readonly string[] => {
+  const value = record[key];
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === 'string');
+};
+
+const parseTabSessionCaseFixture = (value: unknown): TabSessionCaseFixture => {
+  if (!isRecord(value)) {
+    throw new Error('Tab-session T1 fixture must be a JSON object.');
+  }
+  const id = value['id'];
+  const mode = value['mode'];
+  const description = value['description'];
+  const expected = value['expected'];
+  if (typeof id !== 'string' || id.length === 0) {
+    throw new Error('Tab-session T1 fixture is missing id.');
+  }
+  if (mode !== 'T1-A' && mode !== 'T1-B' && mode !== 'T1-C' && mode !== 'T1-D') {
+    throw new Error(`Tab-session T1 fixture ${id} has invalid mode.`);
+  }
+  if (typeof description !== 'string' || description.length === 0) {
+    throw new Error(`Tab-session T1 fixture ${id} is missing description.`);
+  }
+  if (!Array.isArray(expected) || !expected.every((item) => typeof item === 'string')) {
+    throw new Error(`Tab-session T1 fixture ${id} is missing expected checks.`);
+  }
+  return {
+    id,
+    mode,
+    description,
+    expected: readFixtureStringArray(value, 'expected'),
+  };
+};
+
+export const loadTabSessionCaseFixtures = async (
+  rootDir = path.resolve('tests/e2e/fixtures/tabsession-cases'),
+): Promise<readonly TabSessionCaseFixture[]> => {
+  const entries = await readdir(rootDir);
+  const fixtures = await Promise.all(
+    entries
+      .filter((entry) => entry.endsWith('.json'))
+      .sort()
+      .map(async (entry) =>
+        parseTabSessionCaseFixture(JSON.parse(await readFile(path.join(rootDir, entry), 'utf8'))),
+      ),
+  );
+  return fixtures.sort((left, right) => left.id.localeCompare(right.id));
 };
 
 export const stripTrailingSlash = (input: string): string => input.replace(/\/+$/u, '');
@@ -1442,6 +1544,7 @@ export const evaluateOneBrowserReplay = (input: {
   readonly drain: TimelineDrainResult;
   readonly timeline: TimelineEnvelope;
   readonly connections: ConnectionsEnvelope;
+  readonly productBehavior?: readonly T1ProductBehaviorCheck[];
   readonly heldUrls?: readonly string[];
   readonly strictOffline?: boolean;
 }): ReplayEvaluationReport => {
@@ -1471,6 +1574,8 @@ export const evaluateOneBrowserReplay = (input: {
   const failedDetourAssertions = quality.detourAssertions.filter(
     (assertion) => assertion.status === 'fail',
   );
+  const productBehavior = input.productBehavior ?? [];
+  const failedProductBehavior = productBehavior.filter((check) => check.status === 'fail');
 
   const layers: ReplayLayerReport[] = [
     layerReport(
@@ -1508,6 +1613,19 @@ export const evaluateOneBrowserReplay = (input: {
       ],
     ),
     layerReport(
+      'product-behavior',
+      failedProductBehavior.length === 0,
+      productBehavior.length === 0
+        ? 'no optional tab-session product modes enabled'
+        : `${String(productBehavior.filter((check) => check.status === 'pass').length)}/${String(
+            productBehavior.length,
+          )} tab-session product behavior check(s) passed`,
+      failedProductBehavior.flatMap((check) => [
+        `${check.mode} ${check.caseId}: ${check.summary}`,
+        ...check.details,
+      ]),
+    ),
+    layerReport(
       'evaluation-expectations',
       missingExpectedEdges.length === 0 &&
         failedDetourAssertions.length === 0 &&
@@ -1538,6 +1656,7 @@ export const evaluateOneBrowserReplay = (input: {
     detourAssertions: quality.detourAssertions,
     qualitativeWarnings: quality.qualitativeWarnings,
     layers,
+    productBehavior,
     recordedCanonicalUrls: expectedCanonicals,
     replayedCanonicalUrls: input.pageReplay.succeededCanonicalUrls,
     timelineCanonicalUrls: timelineCanonicals,
@@ -1610,6 +1729,12 @@ export const renderReplayMarkdown = (report: ReplayEvaluationReport): string => 
         `| ${markdownCell(warning.kind)} | ${markdownCell(warning.message)} | ${markdownCell(warning.canonicalUrls.join(', '))} |`,
     )
     .join('\n');
+  const productRows = report.productBehavior
+    .map(
+      (check) =>
+        `| ${markdownCell(check.mode)} | ${markdownCell(check.caseId)} | ${check.status.toUpperCase()} | ${markdownCell(check.summary)} |`,
+    )
+    .join('\n');
   const detailBlocks = report.layers
     .filter((layer) => layer.details.length > 0)
     .map(
@@ -1636,6 +1761,10 @@ export const renderReplayMarkdown = (report: ReplayEvaluationReport): string => 
     warningRows.length === 0
       ? '\n\n## Qualitative Warnings\n\nNo qualitative warnings.'
       : `\n\n## Qualitative Warnings\n\n| Warning | Message | Canonical URLs |\n|---|---|---|\n${warningRows}`;
+  const productBlock =
+    productRows.length === 0
+      ? '\n\n## Product Behavior\n\nNo optional tab-session product modes were enabled.'
+      : `\n\n## Product Behavior\n\n| Mode | Case | Status | Summary |\n|---|---|---|---|\n${productRows}`;
   return `| Score | Value | Color | Rationale |
 |---|---:|---|---|
 ${scoreRows}
@@ -1660,6 +1789,7 @@ ${layerRows}
 ${assertionRows}
 ${detourBlock}
 ${warningBlock}
+${productBlock}
 
 ## Recorded Canonical URLs
 

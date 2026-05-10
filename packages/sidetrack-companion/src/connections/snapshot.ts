@@ -36,8 +36,14 @@ import { extractFeatures } from '../ranker/features.js';
 import type { Candidate } from '../ranker/types.js';
 import { projectSnippetLineage } from '../snippets/projection.js';
 import type { AcceptedEvent } from '../sync/causal.js';
+import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../tabsession/events.js';
 import type { TabSessionProjection } from '../tabsession/projection.js';
 import { THREAD_UPSERTED, isThreadUpsertedPayload } from '../threads/events.js';
+import {
+  BROWSER_TIMELINE_OBSERVED,
+  isBrowserTimelineObservedPayload,
+  type TimelineTransition,
+} from '../timeline/events.js';
 import type { TimelineDayProjection } from '../timeline/projection.js';
 import { detectSearchUrl } from '../timeline/sanitize.js';
 import { VISUAL_FINGERPRINT_OBSERVED } from '../visual/events.js';
@@ -347,11 +353,145 @@ const stripFragmentAndTrailingSlash = (url: string): string =>
   url.replace(/#.*$/u, '').replace(/\/+$/u, '');
 
 const TIMELINE_VISIT_NODE_PREFIX = 'timeline-visit:';
+const VISIT_INSTANCE_NODE_KIND = 'visit-instance' as const;
+const VISIT_INSTANCE_INCREMENTING_TRANSITIONS: ReadonlySet<TimelineTransition> =
+  new Set<TimelineTransition>(['activated', 'updated']);
+
+interface VisitInstanceAccumulator {
+  readonly tabSessionId: string;
+  readonly visitKey: string;
+  readonly firstSeenAt: string;
+  lastSeenAt: string;
+  url: string;
+  canonicalUrl?: string;
+  title?: string;
+  provider?: string;
+  openerTabSessionId?: string;
+  visitCount: number;
+  replicaIds: Set<string>;
+}
 
 const visitKeyFromNodeOrRaw = (value: string): string =>
   value.startsWith(TIMELINE_VISIT_NODE_PREFIX)
     ? value.slice(TIMELINE_VISIT_NODE_PREFIX.length)
     : stripFragmentAndTrailingSlash(value);
+
+const visitInstanceKey = (input: {
+  readonly tabSessionId: string;
+  readonly visitKey: string;
+  readonly firstSeenAt: string;
+}): string => `${input.tabSessionId}:${input.firstSeenAt}:${input.visitKey}`;
+
+const collectVisitInstances = (input: {
+  readonly events: readonly AcceptedEvent[];
+  readonly timelineDays: readonly TimelineDayProjection[];
+}): readonly VisitInstanceAccumulator[] => {
+  const groups = new Map<string, VisitInstanceAccumulator>();
+  const upsert = (entry: {
+    readonly tabSessionId: string;
+    readonly visitKey: string;
+    readonly observedAt: string;
+    readonly url: string;
+    readonly canonicalUrl?: string;
+    readonly title?: string;
+    readonly provider?: string;
+    readonly openerTabSessionId?: string;
+    readonly transition?: TimelineTransition;
+    readonly visitCount?: number;
+    readonly replicaId?: string;
+  }): void => {
+    const groupKey = `${entry.tabSessionId}\u0000${entry.visitKey}`;
+    const existing = groups.get(groupKey);
+    const increments =
+      entry.visitCount ??
+      (entry.transition !== undefined && VISIT_INSTANCE_INCREMENTING_TRANSITIONS.has(entry.transition)
+        ? 1
+        : 0);
+    if (existing === undefined) {
+      groups.set(groupKey, {
+        tabSessionId: entry.tabSessionId,
+        visitKey: entry.visitKey,
+        firstSeenAt: entry.observedAt,
+        lastSeenAt: entry.observedAt,
+        url: entry.url,
+        ...(entry.canonicalUrl === undefined ? {} : { canonicalUrl: entry.canonicalUrl }),
+        ...(entry.title === undefined || entry.title.length === 0 ? {} : { title: entry.title }),
+        ...(entry.provider === undefined ? {} : { provider: entry.provider }),
+        ...(entry.openerTabSessionId === undefined || entry.openerTabSessionId.length === 0
+          ? {}
+          : { openerTabSessionId: entry.openerTabSessionId }),
+        visitCount: increments,
+        replicaIds: new Set(entry.replicaId === undefined ? [] : [entry.replicaId]),
+      });
+      return;
+    }
+    if (entry.observedAt > existing.lastSeenAt) {
+      existing.lastSeenAt = entry.observedAt;
+      existing.url = entry.url;
+      if (entry.canonicalUrl !== undefined) existing.canonicalUrl = entry.canonicalUrl;
+      if (entry.title !== undefined && entry.title.length > 0) existing.title = entry.title;
+      if (entry.provider !== undefined) existing.provider = entry.provider;
+      if (entry.openerTabSessionId !== undefined && entry.openerTabSessionId.length > 0) {
+        existing.openerTabSessionId = entry.openerTabSessionId;
+      }
+    }
+    existing.visitCount += increments;
+    if (entry.replicaId !== undefined) existing.replicaIds.add(entry.replicaId);
+  };
+
+  for (const event of input.events) {
+    if (event.type !== BROWSER_TIMELINE_OBSERVED) continue;
+    if (!isBrowserTimelineObservedPayload(event.payload)) continue;
+    const payload = event.payload;
+    if (payload.tabSessionId === undefined || payload.tabSessionId.length === 0) continue;
+    const visitKey = stripFragmentAndTrailingSlash(payload.canonicalUrl ?? payload.url);
+    upsert({
+      tabSessionId: payload.tabSessionId,
+      visitKey,
+      observedAt: payload.observedAt,
+      url: payload.url,
+      ...(payload.canonicalUrl === undefined ? {} : { canonicalUrl: payload.canonicalUrl }),
+      ...(payload.title === undefined ? {} : { title: payload.title }),
+      ...(payload.provider === undefined ? {} : { provider: payload.provider }),
+      ...(payload.openerTabSessionId === undefined
+        ? {}
+        : { openerTabSessionId: payload.openerTabSessionId }),
+      transition: payload.transition,
+      replicaId: event.dot.replicaId,
+    });
+  }
+
+  for (const day of input.timelineDays) {
+    for (const entry of day.entries) {
+      if (entry.tabSessionId === undefined || entry.tabSessionId.length === 0) continue;
+      const visitKey = stripFragmentAndTrailingSlash(entry.canonicalUrl ?? entry.url);
+      const groupKey = `${entry.tabSessionId}\u0000${visitKey}`;
+      if (groups.has(groupKey)) continue;
+      upsert({
+        tabSessionId: entry.tabSessionId,
+        visitKey,
+        observedAt: entry.firstSeenAt,
+        url: entry.url,
+        ...(entry.canonicalUrl === undefined ? {} : { canonicalUrl: entry.canonicalUrl }),
+        ...(entry.title === undefined ? {} : { title: entry.title }),
+        ...(entry.provider === undefined ? {} : { provider: entry.provider }),
+        ...(entry.openerTabSessionId === undefined
+          ? {}
+          : { openerTabSessionId: entry.openerTabSessionId }),
+        visitCount: entry.visitCount,
+      });
+      const inserted = groups.get(groupKey);
+      if (inserted !== undefined) inserted.lastSeenAt = entry.lastSeenAt;
+    }
+  }
+
+  return [...groups.values()].sort(
+    (left, right) =>
+      left.tabSessionId.localeCompare(right.tabSessionId) ||
+      left.firstSeenAt.localeCompare(right.firstSeenAt) ||
+      left.visitKey.localeCompare(right.visitKey),
+  );
+};
 
 const roundRankerMetric = (value: number): number => Number(value.toFixed(6));
 
@@ -875,84 +1015,8 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
           ...(engagementClass === undefined
             ? {}
             : { engagement: { class: engagementClass.class } }),
-          ...(entry.tabSessionId === undefined ? {} : { tabSessionId: entry.tabSessionId }),
-          ...(entry.openerTabSessionId === undefined
-            ? {}
-            : { openerTabSessionId: entry.openerTabSessionId }),
         },
       });
-      if (typeof entry.tabSessionId === 'string' && entry.tabSessionId.length > 0) {
-        upsertNode(nodes, {
-          kind: 'tab-session',
-          key: entry.tabSessionId,
-          label: entry.tabSessionId,
-        });
-        upsertEdge(edges, {
-          kind: 'visit_in_tab_session',
-          fromNodeId: nodeIdFor('timeline-visit', visitKey),
-          toNodeId: nodeIdFor('tab-session', entry.tabSessionId),
-          observedAt: entry.lastSeenAt,
-          producedBy: { source: 'timeline-projection' },
-          confidence: 'observed',
-        });
-        if (
-          typeof entry.openerTabSessionId === 'string' &&
-          entry.openerTabSessionId.length > 0 &&
-          entry.openerTabSessionId !== entry.tabSessionId
-        ) {
-          upsertNode(nodes, {
-            kind: 'tab-session',
-            key: entry.openerTabSessionId,
-            label: entry.openerTabSessionId,
-          });
-          upsertEdge(edges, {
-            kind: 'tab_session_opener_chain',
-            fromNodeId: nodeIdFor('tab-session', entry.tabSessionId),
-            toNodeId: nodeIdFor('tab-session', entry.openerTabSessionId),
-            observedAt: entry.lastSeenAt,
-            producedBy: { source: 'timeline-projection' },
-            confidence: 'observed',
-          });
-        }
-      }
-      if (typeof entry.tabSessionId === 'string' && entry.tabSessionId.length > 0) {
-        const attribution = input.tabSessionProjection.bySessionId.get(
-          entry.tabSessionId,
-        )?.currentAttribution;
-        if (attribution !== undefined && attribution.workstreamId !== null) {
-          upsertNode(nodes, {
-            kind: 'workstream',
-            key: attribution.workstreamId,
-            label: attribution.workstreamId,
-          });
-          upsertEdge(edges, {
-            kind: 'tab_session_in_workstream',
-            fromNodeId: nodeIdFor('tab-session', entry.tabSessionId),
-            toNodeId: nodeIdFor('workstream', attribution.workstreamId),
-            observedAt: attribution.observedAt,
-            producedBy: {
-              source: 'event-log',
-              eventType: USER_ORGANIZED_ITEM,
-              dot: { replicaId: attribution.replicaId, seq: attribution.seq },
-            },
-            confidence: 'asserted',
-            metadata: { attributionSource: attribution.source },
-          });
-          upsertEdge(edges, {
-            kind: 'visit_in_workstream',
-            fromNodeId: nodeIdFor('timeline-visit', visitKey),
-            toNodeId: nodeIdFor('workstream', attribution.workstreamId),
-            observedAt: entry.lastSeenAt,
-            producedBy: {
-              source: 'event-log',
-              eventType: USER_ORGANIZED_ITEM,
-              dot: { replicaId: attribution.replicaId, seq: attribution.seq },
-            },
-            confidence: 'asserted',
-            metadata: { attributionSource: attribution.source },
-          });
-        }
-      }
       const threadId = threadIdByUrl.get(visitKey);
       if (threadId !== undefined) {
         upsertNode(nodes, { kind: 'thread', key: threadId, label: threadId });
@@ -966,6 +1030,129 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
         });
       }
     }
+  }
+
+  for (const instance of collectVisitInstances({
+    events: input.events,
+    timelineDays: input.timelineDays,
+  })) {
+    const instanceKey = visitInstanceKey(instance);
+    const instanceNodeId = nodeIdFor(VISIT_INSTANCE_NODE_KIND, instanceKey);
+    const timelineVisitNodeId = nodeIdFor('timeline-visit', instance.visitKey);
+    upsertNode(nodes, {
+      kind: VISIT_INSTANCE_NODE_KIND,
+      key: instanceKey,
+      label: instance.title ?? instance.visitKey,
+      observedAt: instance.firstSeenAt,
+      metadata: {
+        url: instance.url,
+        canonicalUrl: instance.canonicalUrl,
+        title: instance.title,
+        provider: instance.provider,
+        visitCount: instance.visitCount,
+        tabSessionId: instance.tabSessionId,
+        timelineVisitId: timelineVisitNodeId,
+      },
+    });
+    for (const replicaId of [...instance.replicaIds].sort()) {
+      upsertNode(nodes, {
+        kind: VISIT_INSTANCE_NODE_KIND,
+        key: instanceKey,
+        label: instance.title ?? instance.visitKey,
+        observedAt: instance.firstSeenAt,
+        replicaId,
+      });
+    }
+    upsertNode(nodes, {
+      kind: 'timeline-visit',
+      key: instance.visitKey,
+      label: instance.title ?? instance.visitKey,
+      observedAt: instance.lastSeenAt,
+      metadata: {
+        url: instance.url,
+        canonicalUrl: instance.canonicalUrl,
+        title: instance.title,
+        provider: instance.provider,
+      },
+    });
+    upsertNode(nodes, {
+      kind: 'tab-session',
+      key: instance.tabSessionId,
+      label: instance.tabSessionId,
+      observedAt: instance.firstSeenAt,
+    });
+    upsertEdge(edges, {
+      kind: 'visit_instance_same_url_as_timeline_visit',
+      fromNodeId: instanceNodeId,
+      toNodeId: timelineVisitNodeId,
+      observedAt: instance.firstSeenAt,
+      producedBy: { source: 'timeline-projection' },
+      confidence: 'observed',
+    });
+    upsertEdge(edges, {
+      kind: 'visit_instance_in_tab_session',
+      fromNodeId: instanceNodeId,
+      toNodeId: nodeIdFor('tab-session', instance.tabSessionId),
+      observedAt: instance.firstSeenAt,
+      producedBy: { source: 'timeline-projection' },
+      confidence: 'observed',
+    });
+    if (
+      instance.openerTabSessionId !== undefined &&
+      instance.openerTabSessionId.length > 0 &&
+      instance.openerTabSessionId !== instance.tabSessionId
+    ) {
+      upsertNode(nodes, {
+        kind: 'tab-session',
+        key: instance.openerTabSessionId,
+        label: instance.openerTabSessionId,
+      });
+      upsertEdge(edges, {
+        kind: 'tab_session_opener_chain',
+        fromNodeId: nodeIdFor('tab-session', instance.tabSessionId),
+        toNodeId: nodeIdFor('tab-session', instance.openerTabSessionId),
+        observedAt: instance.firstSeenAt,
+        producedBy: { source: 'timeline-projection' },
+        confidence: 'observed',
+      });
+    }
+    const attribution = input.tabSessionProjection.bySessionId.get(
+      instance.tabSessionId,
+    )?.currentAttribution;
+    if (attribution === undefined || attribution.workstreamId === null) continue;
+    upsertNode(nodes, {
+      kind: 'workstream',
+      key: attribution.workstreamId,
+      label: attribution.workstreamId,
+    });
+    upsertEdge(edges, {
+      kind: 'tab_session_in_workstream',
+      fromNodeId: nodeIdFor('tab-session', instance.tabSessionId),
+      toNodeId: nodeIdFor('workstream', attribution.workstreamId),
+      observedAt: attribution.observedAt,
+      producedBy: {
+        source: 'event-log',
+        eventType:
+          attribution.source === 'inferred' ? TAB_SESSION_ATTRIBUTION_INFERRED : USER_ORGANIZED_ITEM,
+        dot: { replicaId: attribution.replicaId, seq: attribution.seq },
+      },
+      confidence: attribution.source === 'inferred' ? 'inferred' : 'asserted',
+      metadata: { attributionSource: attribution.source },
+    });
+    upsertEdge(edges, {
+      kind: 'visit_instance_in_workstream',
+      fromNodeId: instanceNodeId,
+      toNodeId: nodeIdFor('workstream', attribution.workstreamId),
+      observedAt: instance.firstSeenAt,
+      producedBy: {
+        source: 'event-log',
+        eventType:
+          attribution.source === 'inferred' ? TAB_SESSION_ATTRIBUTION_INFERRED : USER_ORGANIZED_ITEM,
+        dot: { replicaId: attribution.replicaId, seq: attribution.seq },
+      },
+      confidence: attribution.source === 'inferred' ? 'inferred' : 'asserted',
+      metadata: { attributionSource: attribution.source },
+    });
   }
 
   const navigationByVisitId = new Map<

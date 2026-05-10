@@ -1,0 +1,12 @@
+{
+  "id": "case-2-real-inbox-assignment",
+  "mode": "T1-C",
+  "description": "Inbox UX assigns one replayed tab session, explicitly dismisses another as no-workstream, and leaves another unattributed.",
+  "expected": [
+    "Inbox tab renders unattributed cards",
+    "real side-panel action posts manual attribution",
+    "assigned card materializes visit_instance_in_workstream",
+    "dismissed card has null attribution",
+    "unassigned card remains unattributed"
+  ]
+}

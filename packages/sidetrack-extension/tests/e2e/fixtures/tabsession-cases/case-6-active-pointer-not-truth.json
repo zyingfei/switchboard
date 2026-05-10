@@ -1,0 +1,11 @@
+{
+  "id": "case-6-active-pointer-not-truth",
+  "mode": "T1-A",
+  "description": "The active workstream pointer must not become canonical graph truth for replayed browser visits.",
+  "expected": [
+    "active workstream can be set during replay",
+    "timeline observations keep tabSessionId",
+    "connections omit active-pointer visit_in_workstream edges",
+    "focused-tab cue is based on tabSessionId when available"
+  ]
+}

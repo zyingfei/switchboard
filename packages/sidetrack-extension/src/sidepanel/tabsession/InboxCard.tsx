@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 
 import { formatRelative } from '../../util/time';
 import { AttributionBadge } from './AttributionBadge';
@@ -33,10 +33,14 @@ export interface InboxCardProps {
 export function InboxCard({ record, suggestion, workstreams, onAttribute }: InboxCardProps) {
   const defaultWorkstreamId = suggestion?.decision.workstreamId ?? workstreams[0]?.bac_id ?? '';
   const [selectedWorkstreamId, setSelectedWorkstreamId] = useState(defaultWorkstreamId);
+  useEffect(() => {
+    if (defaultWorkstreamId.length > 0) setSelectedWorkstreamId(defaultWorkstreamId);
+  }, [defaultWorkstreamId]);
   const host = hostFor(record);
   const title = titleFor(record);
   const currentWorkstreamId = record.currentAttribution?.workstreamId;
   const canMove = selectedWorkstreamId.length > 0 && selectedWorkstreamId !== currentWorkstreamId;
+  const canDismiss = record.currentAttribution?.workstreamId !== null;
   const faviconLetter = useMemo(() => host.slice(0, 1).toUpperCase() || '?', [host]);
 
   return (
@@ -93,7 +97,7 @@ export function InboxCard({ record, suggestion, workstreams, onAttribute }: Inbo
           <button
             type="button"
             className="tab-session-action subtle"
-            disabled={currentWorkstreamId === null}
+            disabled={!canDismiss}
             onClick={() => {
               onAttribute(record.tabSessionId, null);
             }}

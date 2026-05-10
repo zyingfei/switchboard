@@ -28,11 +28,13 @@ export const buildEvidenceGraph = (snapshot: ConnectionsSnapshot): EvidenceGraph
   }
 
   const adjacency = new Map<string, { to: string; weight: number }[]>();
-  const addArc = (from: string, to: string, weight: number): void => {
+  let edgeSeq = 0;
+  const addArc = (keyPrefix: string, from: string, to: string, weight: number): void => {
     if (from === to) return;
     if (!graph.hasNode(from)) graph.addNode(from);
     if (!graph.hasNode(to)) graph.addNode(to);
-    graph.addDirectedEdgeWithKey(`${from}->${to}:${String(graph.size)}`, from, to, { weight });
+    graph.addDirectedEdgeWithKey(`${keyPrefix}:${String(edgeSeq)}`, from, to, { weight });
+    edgeSeq += 1;
     const list = adjacency.get(from) ?? [];
     list.push({ to, weight });
     adjacency.set(from, list);
@@ -40,8 +42,8 @@ export const buildEvidenceGraph = (snapshot: ConnectionsSnapshot): EvidenceGraph
 
   for (const edge of [...snapshot.edges].sort((left, right) => compareString(left.id, right.id))) {
     const weight = edgeWeight(weightForEdgeKind(edge.kind), edge.confidence);
-    addArc(edge.fromNodeId, edge.toNodeId, weight);
-    addArc(edge.toNodeId, edge.fromNodeId, weight * 0.85);
+    addArc(edge.id, edge.fromNodeId, edge.toNodeId, weight);
+    addArc(`${edge.id}:reverse`, edge.toNodeId, edge.fromNodeId, weight * 0.85);
   }
 
   return {

@@ -24,6 +24,7 @@ export type ConnectionNodeKind =
   | 'inbound-reminder'
   | 'coding-session'
   | 'timeline-visit'
+  | 'visit-instance'
   | 'tab-session'
   | 'annotation'
   | 'snippet'
@@ -59,6 +60,8 @@ export interface ConnectionNodeMetadata {
   readonly dispatchId?: string;
   readonly codingSessionId?: string;
   readonly visitCount?: number;
+  readonly tabSessionId?: string;
+  readonly timelineVisitId?: string;
   readonly sourcePath?: string;
   // True when the node was redacted (e.g. private workstream during
   // a screen-share session). MVP doesn't set this; reserved for P2.
@@ -109,8 +112,11 @@ export type ConnectionEdgeKind =
   // Active-workstream attribution: retained for Phase 2 replacement.
   // Phase 1 stops emitting this from the active pointer.
   | 'visit_in_workstream'
+  | 'visit_instance_in_workstream'
   | 'tab_session_in_workstream'
   | 'visit_in_tab_session'
+  | 'visit_instance_in_tab_session'
+  | 'visit_instance_same_url_as_timeline_visit'
   | 'tab_session_opener_chain'
   | 'previous_visit_in_tab_session'
   | 'opener_visit'
