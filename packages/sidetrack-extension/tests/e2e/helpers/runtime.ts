@@ -283,8 +283,15 @@ export const launchExtensionRuntime = async (
   // SIDETRACK_USER_DATA_DIR lets the dev pin a long-lived profile (e.g.
   // ~/.sidetrack-test-profile) so logins to chatgpt.com / claude.ai /
   // gemini.google.com survive across runs. When unset, every run gets a
-  // fresh tmpdir profile that's wiped on close.
-  const persistentDir = process.env.SIDETRACK_USER_DATA_DIR;
+  // fresh tmpdir profile that's wiped on close. Stealth experiment mode
+  // uses a Sidetrack-owned default dir so manual logins survive without
+  // mixing with the user's actual Chrome profile (Patchright's Chromium
+  // can't cleanly load the unpacked MV3 extension into a profile that
+  // was last used by Chrome stable).
+  const stealthDefaultDir = path.join(packageRoot, '.sidetrack-browser-profiles/stealth-experiment');
+  const persistentDir = modeConfig.stealthExperiment
+    ? (process.env.SIDETRACK_STEALTH_USER_DATA_DIR ?? stealthDefaultDir)
+    : process.env.SIDETRACK_USER_DATA_DIR;
   const callerDir = options.userDataDir;
   const userDataDir =
     callerDir !== undefined && callerDir.length > 0

@@ -18,6 +18,7 @@ import { expect, test, type Page } from '@playwright/test';
 
 import { generateRendezvousSecret } from '../../../sidetrack-companion/src/sync/relayCrypto';
 import { startTestCompanion, type TestCompanion } from './helpers/companion';
+import { resolveManualBrowserMode } from './helpers/manualBrowserMode';
 import { ManualRecorder } from './helpers/manualRecorder';
 import { startTestRelay, type TestRelay } from './helpers/relay';
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
@@ -525,6 +526,10 @@ test.describe('manual L5 full-browser recorder', () => {
     test.setTimeout(0);
     process.env.SIDETRACK_E2E_HEADLESS = '0';
 
+    const modeConfig = resolveManualBrowserMode({
+      env: process.env,
+      defaultMode: 'persistent-playwright-manual',
+    });
     const profileDir = expandTilde(process.env[PROFILE_ENV] ?? DEFAULT_PROFILE);
     const artifactsDir = path.join(tmpdir(), 'sidetrack-manual-l5', isoStamp());
     await mkdir(artifactsDir, { recursive: true });
@@ -546,14 +551,24 @@ test.describe('manual L5 full-browser recorder', () => {
         syncRendezvousSecret: secret,
       });
 
+      // Stealth experiment uses a Sidetrack-owned dir (resolved inside
+      // launchExtensionRuntime) so Patchright's Chromium can cleanly
+      // load the unpacked MV3 extension; mixing stealth Chromium with
+      // the user's pinned Chrome login profile leaves chrome.storage
+      // unreachable on the sidepanel page.
+      const runtimeAOptions = modeConfig.stealthExperiment
+        ? {}
+        : { userDataDir: profileDir };
       runtimeA = await launchExtensionRuntime({
-        userDataDir: profileDir,
+        ...runtimeAOptions,
         extraHostPermissions: RECORDER_HOST_PERMISSIONS,
+        browserMode: modeConfig.mode,
       });
       const reviewerProfile = await mkdtemp(path.join(tmpdir(), 'sidetrack-manual-l5-reviewer-'));
       runtimeB = await launchExtensionRuntime({
         userDataDir: reviewerProfile,
         extraHostPermissions: RECORDER_HOST_PERMISSIONS,
+        browserMode: modeConfig.mode,
       });
 
       const recorder = new ManualRecorder(runtimeA.context, artifactsDir);
