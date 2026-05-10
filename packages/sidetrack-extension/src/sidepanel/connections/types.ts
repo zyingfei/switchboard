@@ -11,6 +11,8 @@ export type ConnectionNodeKind =
   | 'inbound-reminder'
   | 'coding-session'
   | 'timeline-visit'
+  | 'visit-instance'
+  | 'tab-session'
   | 'annotation'
   | 'snippet'
   | 'topic'

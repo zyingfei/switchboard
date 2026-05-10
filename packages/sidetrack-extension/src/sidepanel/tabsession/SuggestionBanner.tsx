@@ -6,8 +6,11 @@ import type {
   TabSessionWorkstreamOption,
 } from './types';
 
-const titleFor = (record: TabSessionRecord): string =>
+const displayTitle = (record: TabSessionRecord): string =>
   record.latestTitle?.trim() || record.latestUrl || record.tabSessionId;
+
+const displayUrl = (record: TabSessionRecord): string | undefined =>
+  record.latestUrl?.trim() || undefined;
 
 const workstreamLabel = (
   workstreamId: string | undefined,
@@ -40,7 +43,10 @@ export function SuggestionBanner({
     <section className="tab-session-suggestion-banner" aria-label="Tab-session suggestion">
       <div className="tab-session-suggestion-copy">
         <b>{workstreamLabel(suggestedWorkstreamId, workstreams)}</b>
-        <span className="mono">{titleFor(record)}</span>
+        <span className="tab-session-suggestion-title">{displayTitle(record)}</span>
+        {displayUrl(record) !== undefined && displayUrl(record) !== displayTitle(record) ? (
+          <span className="mono tab-session-suggestion-url">{displayUrl(record)}</span>
+        ) : null}
       </div>
       <div className="tab-session-suggestion-actions">
         <button

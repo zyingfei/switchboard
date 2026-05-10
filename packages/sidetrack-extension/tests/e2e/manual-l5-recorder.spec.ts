@@ -595,9 +595,17 @@ test.describe('manual L5 full-browser recorder', () => {
     try {
       relay = await startTestRelay({});
       const secret = generateRendezvousSecret().toString('base64url');
+      // Persist Companion A's vault across reruns of the manual recorder so
+      // workstreams + connections data the user creates in one session
+      // survive the next run. Reviewer companion B stays ephemeral; it's
+      // recreated per run and is not the source of truth in this flow.
+      const persistentVaultRoot =
+        process.env.SIDETRACK_MANUAL_L5_VAULT_DIR ??
+        path.join(packageRoot, '.sidetrack-browser-profiles/manual-l5-companion-vault');
       companionA = await startTestCompanion({
         syncRelay: relay.url,
         syncRendezvousSecret: secret,
+        vaultDir: persistentVaultRoot,
       });
       companionB = await startTestCompanion({
         syncRelay: relay.url,

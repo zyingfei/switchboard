@@ -2732,7 +2732,19 @@ const App = () => {
     focusedTabSession === undefined
       ? undefined
       : tabSessionSuggestions[focusedTabSession.tabSessionId];
-  const suggestedOpenTabSession = useMemo(
+  // Prefer the focused-tab's session for the suggestion banner when it has
+  // an actionable suggest decision and is unattributed. Otherwise fall back
+  // to the first unattributed session anywhere in the list — that surface
+  // exists so user can still triage Inbox without switching tabs, but
+  // hijacking it for an unrelated tab while the user is actively reading
+  // a different one was confusing (Phase 7 follow-up).
+  const focusedSuggestionIsActionable =
+    focusedTabSession !== undefined &&
+    focusedTabSession.closedAt === undefined &&
+    focusedTabSession.currentAttribution === undefined &&
+    focusedTabSuggestion?.decision.action === 'suggest' &&
+    focusedTabSuggestion.decision.workstreamId !== undefined;
+  const fallbackSuggestedSession = useMemo(
     () =>
       tabSessionRecords.find((record) => {
         const suggestion = tabSessionSuggestions[record.tabSessionId];
@@ -2745,6 +2757,9 @@ const App = () => {
       }),
     [tabSessionRecords, tabSessionSuggestions],
   );
+  const suggestedOpenTabSession = focusedSuggestionIsActionable
+    ? focusedTabSession
+    : fallbackSuggestedSession;
   const suggestedOpenTabSessionResolution =
     suggestedOpenTabSession === undefined
       ? undefined

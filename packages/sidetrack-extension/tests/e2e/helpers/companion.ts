@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -29,6 +29,13 @@ export interface StartTestCompanionOptions {
   readonly syncRelay?: string;
   readonly syncRelayLocalPort?: number;
   readonly syncRendezvousSecret?: string;
+  // Pin the companion's vault dir so workstreams / threads / connections
+  // survive across test reruns. When omitted (the default), a fresh
+  // mkdtemp vault is created and discarded on close. Manual recorder
+  // sessions pass a stable path under e.g.
+  // .sidetrack-browser-profiles/<runner>/companion-vault so the user
+  // doesn't have to recreate workstreams every time.
+  readonly vaultDir?: string;
 }
 
 const packageRoot = path.resolve(fileURLToPath(new URL('../../../', import.meta.url)));
@@ -163,7 +170,10 @@ const runCli = async (args: readonly string[]): Promise<void> => {
 export const startTestCompanion = async (
   options: StartTestCompanionOptions = {},
 ): Promise<TestCompanion> => {
-  const vaultPath = await mkdtemp(path.join(tmpdir(), 'sidetrack-extension-e2e-vault-'));
+  const vaultPath =
+    options.vaultDir !== undefined && options.vaultDir.length > 0
+      ? (await mkdir(options.vaultDir, { recursive: true }), options.vaultDir)
+      : await mkdtemp(path.join(tmpdir(), 'sidetrack-extension-e2e-vault-'));
   const port = await reservePort();
   const args = [
     companionCliPath,
@@ -238,6 +248,12 @@ export const startTestCompanion = async (
     child = next;
   };
 
+  // When the caller supplied vaultDir, the vault is THEIRS and must
+  // survive across runs (workstreams, connections, etc.). Auto-mkdtemp
+  // vaults are owned by us and cleaned up on close.
+  const cleanupOnClose =
+    options.vaultDir === undefined || options.vaultDir.length === 0;
+
   await spawnNow();
   let bridgeKey: string;
   try {
@@ -246,7 +262,7 @@ export const startTestCompanion = async (
     ).trim();
   } catch (error) {
     if (child !== null) await closeProcess(child);
-    await rm(vaultPath, { recursive: true, force: true });
+    if (cleanupOnClose) await rm(vaultPath, { recursive: true, force: true });
     throw error;
   }
 
@@ -258,7 +274,7 @@ export const startTestCompanion = async (
       try {
         if (child !== null) await closeProcess(child);
       } finally {
-        await rm(vaultPath, { recursive: true, force: true });
+        if (cleanupOnClose) await rm(vaultPath, { recursive: true, force: true });
       }
     },
     async stop() {

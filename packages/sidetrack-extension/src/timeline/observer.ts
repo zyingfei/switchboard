@@ -208,9 +208,17 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
     })();
 
     if (isSameUrl && existing !== undefined) {
-      // Coalesce within the window — no emission.
+      // Real-page title typically loads a beat after status:complete fires,
+      // so the very first observation for a URL often has no title and the
+      // second one (carrying the title) lands inside the coalesce window.
+      // We coalesce on URL but ALWAYS emit when a previously-unknown title
+      // arrives — otherwise the companion's tab-session projection never
+      // gets a `latestTitle` and the Inbox / suggestion banner stays
+      // stuck displaying raw URLs.
+      const titleNewlyAvailable =
+        boundedTitle !== undefined && existing.title === undefined;
       const elapsed = now.getTime() - existing.lastEmittedAt;
-      if (elapsed < coalesceWindowMs) {
+      if (elapsed < coalesceWindowMs && !titleNewlyAvailable) {
         coalescedCalls += 1;
         lastDecision = {
           at: observedAt,
@@ -220,7 +228,8 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
           ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
           hasTabSessionId: input.tabSessionId !== undefined,
         };
-        // Title-only update merges in-memory.
+        // In-memory merge so subsequent comparisons see the latest title /
+        // session ids, even though we don't emit.
         if (
           boundedTitle !== undefined ||
           input.tabSessionId !== existing.tabSessionId ||
