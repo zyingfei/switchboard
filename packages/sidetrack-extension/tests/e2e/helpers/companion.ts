@@ -229,7 +229,7 @@ export const startTestCompanion = async (
     // surface companion errors; stdout is silenced (the build's
     // own [recall] / [relay] info logs would drown out test
     // output otherwise — set DEBUG_COMP=1 to re-enable).
-    const debugComp = process.env['DEBUG_COMP'] === '1';
+    const debugComp = process.env.DEBUG_COMP === '1';
     next.stdout.on('data', (chunk: Buffer) => {
       if (!debugComp) return;
       const text = chunk.toString('utf8').trimEnd();
@@ -241,7 +241,7 @@ export const startTestCompanion = async (
     next.stderr.on('data', (chunk: Buffer) => {
       const text = chunk.toString('utf8').trimEnd();
       if (text.length > 0) {
-        // eslint-disable-next-line no-console
+         
         console.warn(`[comp:${String(port)}] ${text}`);
       }
     });
@@ -261,6 +261,10 @@ export const startTestCompanion = async (
       await readFile(path.join(vaultPath, '_BAC/.config/bridge.key'), 'utf8')
     ).trim();
   } catch (error) {
+    // spawnNow() mutates `child` via closure capture, but TS narrows
+    // the local back to `null` because the mutation isn't visible in
+    // type-flow analysis. The runtime check is meaningful.
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
     if (child !== null) await closeProcess(child);
     if (cleanupOnClose) await rm(vaultPath, { recursive: true, force: true });
     throw error;

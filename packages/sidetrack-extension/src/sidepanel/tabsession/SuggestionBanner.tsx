@@ -6,11 +6,19 @@ import type {
   TabSessionWorkstreamOption,
 } from './types';
 
+const blankToUndefined = (input: string | undefined): string | undefined => {
+  if (input === undefined) return undefined;
+  const trimmed = input.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+};
+
 const displayTitle = (record: TabSessionRecord): string =>
-  record.latestTitle?.trim() || record.latestUrl || record.tabSessionId;
+  blankToUndefined(record.latestTitle) ??
+  blankToUndefined(record.latestUrl) ??
+  record.tabSessionId;
 
 const displayUrl = (record: TabSessionRecord): string | undefined =>
-  record.latestUrl?.trim() || undefined;
+  blankToUndefined(record.latestUrl);
 
 const workstreamLabel = (
   workstreamId: string | undefined,
@@ -34,7 +42,8 @@ export function SuggestionBanner({
   onAttribute,
 }: SuggestionBannerProps) {
   const suggestedWorkstreamId = suggestion.decision.workstreamId;
-  const defaultWorkstreamId = suggestedWorkstreamId ?? workstreams[0]?.bac_id ?? '';
+  const fallbackWorkstreamId = workstreams.length > 0 ? workstreams[0].bac_id : '';
+  const defaultWorkstreamId = suggestedWorkstreamId ?? fallbackWorkstreamId;
   const [selectedWorkstreamId, setSelectedWorkstreamId] = useState(defaultWorkstreamId);
   if (suggestion.decision.action !== 'suggest' || suggestedWorkstreamId === undefined) {
     return null;

@@ -268,7 +268,7 @@ const attachOverCdp = async (cdpUrl: string): Promise<ExtensionRuntime> => {
         },
         { vals: values, retries: 50, intervalMs: 100 },
       );
-      if (diagnostic.ok !== true) {
+      if (!diagnostic.ok) {
         throw new Error(
           `seedStorage: chrome.storage.local.set unavailable after 5s polling.\n` +
             `  url=${diagnostic.url}\n` +
@@ -337,10 +337,10 @@ const extensionPathWithExtraHostPermissions = async (
     await cp(baseExtensionPath, extensionPath, { recursive: true });
     const manifestPath = path.join(extensionPath, 'manifest.json');
     const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>;
-    const existing = Array.isArray(manifest['host_permissions'])
-      ? manifest['host_permissions'].filter((value): value is string => typeof value === 'string')
+    const existing = Array.isArray(manifest.host_permissions)
+      ? manifest.host_permissions.filter((value): value is string => typeof value === 'string')
       : [];
-    manifest['host_permissions'] = [...new Set([...existing, ...extraHostPermissions])];
+    manifest.host_permissions = [...new Set([...existing, ...extraHostPermissions])];
     await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
     // No cleanupPath — the dir is meant to stay across runs.
     return { extensionPath };
@@ -350,10 +350,10 @@ const extensionPathWithExtraHostPermissions = async (
   await cp(baseExtensionPath, extensionPath, { recursive: true });
   const manifestPath = path.join(extensionPath, 'manifest.json');
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>;
-  const existing = Array.isArray(manifest['host_permissions'])
-    ? manifest['host_permissions'].filter((value): value is string => typeof value === 'string')
+  const existing = Array.isArray(manifest.host_permissions)
+    ? manifest.host_permissions.filter((value): value is string => typeof value === 'string')
     : [];
-  manifest['host_permissions'] = [...new Set([...existing, ...extraHostPermissions])];
+  manifest.host_permissions = [...new Set([...existing, ...extraHostPermissions])];
   await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
   return { extensionPath, cleanupPath: tempRoot };
 };
@@ -537,7 +537,7 @@ export const launchExtensionRuntime = async (
         },
         { vals: values, retries: 50, intervalMs: 100 },
       );
-      if (diagnostic.ok !== true) {
+      if (!diagnostic.ok) {
         throw new Error(
           `seedStorage: chrome.storage.local.set unavailable after 5s polling.\n` +
             `  url=${diagnostic.url}\n` +

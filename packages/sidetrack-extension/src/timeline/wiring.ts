@@ -209,7 +209,7 @@ const updateLastOnUpdated = (
   sequence: number,
   patch: Partial<Omit<TimelineOnUpdatedDiagnostic, 'sequence'>>,
 ): void => {
-  if (lastOnUpdated === null || lastOnUpdated.sequence !== sequence) return;
+  if (lastOnUpdated?.sequence !== sequence) return;
   lastOnUpdated = { ...lastOnUpdated, ...patch };
 };
 
@@ -291,7 +291,7 @@ const startActiveWorkstreamCache = async (): Promise<void> => {
   ).chrome;
   c?.storage?.onChanged?.addListener((changes) => {
     if (Object.prototype.hasOwnProperty.call(changes, ACTIVE_WORKSTREAM_KEY)) {
-      const v = changes[ACTIVE_WORKSTREAM_KEY]?.newValue;
+      const v = changes[ACTIVE_WORKSTREAM_KEY].newValue;
       cachedActiveWorkstreamId = typeof v === 'string' && v.length > 0 ? v : undefined;
     }
   });
@@ -332,12 +332,8 @@ const buildObserver = (input: {
       if (provider === 'chatgpt' || provider === 'claude' || provider === 'gemini') {
         return provider;
       }
-      // 'codex' and 'unknown' fall through to 'generic' (or undefined
-      // for non-providers); we elide non-provider URLs to keep the
-      // projection focused.
-      if (provider === 'codex' || provider === 'unknown') {
-        return undefined;
-      }
+      // 'codex' and 'unknown' elide — we keep the projection focused on
+      // explicit AI-provider hosts.
       return undefined;
     },
     coalesceWindowMs: 30_000,
