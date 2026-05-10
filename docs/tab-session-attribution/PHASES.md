@@ -112,6 +112,58 @@ These rules apply to every phase. The reviewer's blockers — they exist because
 
 ---
 
+## Phase 2 Carryover — storage concurrency + same-URL multi-session test
+
+**Branch:** `feat/tabsession-phase-2-carryover` (off main).
+
+**Goal.** Address two risks flagged in the post-merge review of PR #127 (Phase 2). They were not in the Phase 2 PR; they must land **before Phase 5** because Phase 5's tab-group event listeners will create concurrent `chrome.tabs` callsites that worsen the storage race.
+
+**Worker prompt.**
+
+> Implement Phase 2 Carryover on branch `feat/tabsession-phase-2-carryover` (off main). Two changes in one PR.
+>
+> 1. **Fix storage concurrency in `packages/sidetrack-extension/src/tabsession/storage.ts`.**
+>    Current `set()` and `remove()` do non-atomic read-all → modify → write-all on the single `byTabIdHash` chrome.storage key. Concurrent `chrome.tabs.onCreated` events can lose updates: A reads {}, B reads {}, A writes {A}, B writes {B} → A is lost.
+>    Fix with one of (recommended first):
+>    - In-memory single-flight serialized write queue. Mirrors the atomic-reinit-message pattern from PRs #122/#124/#125.
+>    - Per-tab storage keys (one chrome.storage entry per `tabIdHash`).
+>    - Compare-retry loop (read; if mutated since read, retry).
+>
+>    Add a unit test covering the race: fire two `set()` calls without `await`, then assert both records persist:
+>    ```ts
+>    // packages/sidetrack-extension/tests/unit/tabsession/storage.test.ts
+>    it('concurrent set("tab-a") and set("tab-b") preserves both records', async () => {
+>      const storage = createChromeTabSessionStorage(/* ... */);
+>      await Promise.all([storage.set('tab_a', recordA), storage.set('tab_b', recordB)]);
+>      const all = await storage.readAll();
+>      expect(all).toMatchObject({ tab_a: recordA, tab_b: recordB });
+>    });
+>    ```
+>
+> 2. **Add same-canonical-URL-across-two-tabSessionIds test** to `packages/sidetrack-companion/src/tabsession/projection.test.ts` (and/or `packages/sidetrack-companion/src/connections/snapshot.test.ts`):
+>    ```ts
+>    it('same canonicalUrl observed in two tabSessionIds → projection contains both sessions; attribution of session A does not attribute session B', () => {
+>      // Observe https://copy.fail under tses_a, then again under tses_b
+>      // user.organized.item itemKind='tab-session' move tses_a → ws_security
+>      // expect projection.bySessionId has both tses_a and tses_b
+>      // expect tses_b.currentAttribution is undefined
+>      // expect snapshot has visit_in_workstream edge ONLY for visits in tses_a
+>    });
+>    ```
+>    Without this test the URL-aggregate lossiness regression flagged in the PR #126 review can pass silently.
+>
+> 3. **Type & test gates** + commit message `fix(tabsession): phase 2 carryover — storage concurrency + multi-session URL test` with co-author trailer.
+
+**Acceptance criteria.**
+
+- `npx tsc --noEmit` clean across both packages.
+- `npm run test` green: companion + extension.
+- Storage concurrency test (a) passes; the underlying fix is one of the three approved patterns above.
+- Multi-session URL test (b) passes and demonstrates per-session attribution isolation.
+- Both items in **one PR**.
+
+---
+
 ## Phase 3 — Inbox / manual attribution UX
 
 **Branch:** `feat/tab-session-attribution-phase-3`.
@@ -196,7 +248,9 @@ These rules apply to every phase. The reviewer's blockers — they exist because
 
 ## Phase 5 — Chrome tab groups + auto-apply policy
 
-**Branch:** `feat/tab-session-attribution-phase-5`.
+**Branch:** `feat/tab-session-attribution-phase-5` (already pushed off main).
+
+**Prerequisite:** Phase 2 Carryover must be merged before Phase 5 starts. Phase 5's `chrome.tabs.onUpdated(changeInfo.groupId)` listeners will create concurrent storage callsites that worsen the unfixed `byTabIdHash` race.
 
 **Goal.** Bidirectional Chrome tab-group integration as a feedback surface, durable `TabGroupLink` identity decoupled from Chrome's volatile group ids, and the auto-apply policy gate (gated on telemetry from Phases 1–4).
 
