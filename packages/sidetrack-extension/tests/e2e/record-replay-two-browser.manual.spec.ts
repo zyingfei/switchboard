@@ -498,6 +498,8 @@ test.describe('manual T1 Wave 2b two-browser relay record/replay', () => {
           companionA: replayCompanionA,
           companionB: replayCompanionB,
           redactionRegressionPassed: true,
+          panelA: replayPanelA,
+          panelB: replayPanelB,
         })
       : [];
 
