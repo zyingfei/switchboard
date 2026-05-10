@@ -586,6 +586,34 @@ describe('T1 record/replay session pack helpers', () => {
     }
   });
 
+  it('does not flag known-provider URLs as cloudflare-challenge purely on title', () => {
+    // The L5 recorder captures the page title at navigation time, which
+    // may be "Just a moment..." even though the canonical URL is the
+    // real provider thread. Without a URL co-signal the classifier was
+    // tagging real ChatGPT/Claude/Gemini visits as cloudflare detours.
+    const realProviderTitle = 'Just a moment...';
+    const cases: ReadonlyArray<readonly [string, string]> = [
+      ['https://chatgpt.com/c/abc', realProviderTitle],
+      ['https://claude.ai/chat/abc', realProviderTitle],
+      ['https://gemini.google.com/app/abc', realProviderTitle],
+      ['https://github.com/foo/bar', realProviderTitle],
+    ];
+    for (const [url, title] of cases) {
+      expect(classifyDetour({ url, title })).toBeNull();
+    }
+    // But the same title on a generic URL (or a URL that carries the
+    // cf challenge token in its query) DOES still fire.
+    expect(classifyDetour({ url: 'https://example.test/page', title: realProviderTitle })?.kind).toBe(
+      'cloudflare-challenge',
+    );
+    expect(
+      classifyDetour({
+        url: 'https://chatgpt.com/c/abc?__cf_chl_rt_tk=opaque',
+        title: 'ChatGPT — thread',
+      })?.kind,
+    ).toBe('cloudflare-challenge');
+  });
+
   it('fires each qualitative warning on a constructed pack', () => {
     const pack = warningPack();
     const analysis = analyzeReplayQuality({
