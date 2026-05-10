@@ -9,6 +9,12 @@ export interface PolicyDecision {
   readonly margin: number;
 }
 
+export interface AttributionPolicyTelemetry {
+  readonly regretRateBySource?: Partial<
+    Record<Exclude<FusedCandidate['dominantSource'], 'none'>, number>
+  >;
+}
+
 const POLICY = {
   conservative: { suggest: 2.2, auto: Number.POSITIVE_INFINITY, margin: 0.75, corroboration: 2 },
   balanced: { suggest: 1.2, auto: 2.8, margin: 0.35, corroboration: 1 },
@@ -18,15 +24,24 @@ const POLICY = {
 export const decideAttribution = (
   candidates: readonly FusedCandidate[],
   mode: AttributionPolicyMode = 'balanced',
+  telemetry: AttributionPolicyTelemetry = {},
 ): PolicyDecision => {
   const [top, second] = candidates;
   if (top === undefined) return { action: 'inbox', margin: 0 };
   const margin = top.rawFusionLogit - (second?.rawFusionLogit ?? 0);
   const policy = POLICY[mode];
+  const dominantSource = top.dominantSource === 'none' ? undefined : top.dominantSource;
+  const regretRate =
+    dominantSource === undefined
+      ? Number.POSITIVE_INFINITY
+      : (telemetry.regretRateBySource?.[dominantSource] ?? 0);
+  const regretBudget =
+    dominantSource === 'ppr' ? 0.08 : dominantSource === 'similarity' ? 0.05 : 0.12;
   if (
     top.rawFusionLogit >= policy.auto &&
     margin >= policy.margin &&
-    top.corroborationCount >= policy.corroboration
+    top.corroborationCount >= policy.corroboration &&
+    regretRate <= regretBudget
   ) {
     return { action: 'auto-apply', workstreamId: top.workstreamId, margin };
   }

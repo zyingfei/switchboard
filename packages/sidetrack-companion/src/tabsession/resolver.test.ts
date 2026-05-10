@@ -9,7 +9,7 @@ import { buildClusterEvidence } from './clusterEvidence.js';
 import { buildEvidenceGraph } from './evidenceGraph.js';
 import { fuseCandidates, type CandidateEvidence } from './fusion.js';
 import { projectTabSessions } from './projection.js';
-import { resolveAttribution } from './resolver.js';
+import { inferredAttributionPayloadFromResolution, resolveAttribution } from './resolver.js';
 import { buildSimilarityEvidence } from './similarity.js';
 
 const snapshot = (
@@ -233,7 +233,7 @@ describe('tab-session resolver', () => {
       snapshot: snap,
       projection: projectTabSessions(events),
       events,
-      policyMode: 'aggressive',
+      policyMode: 'balanced',
       nowMs: Date.parse('2026-05-10T10:01:00.000Z'),
     });
 
@@ -241,5 +241,53 @@ describe('tab-session resolver', () => {
     expect(result.decision.action).toBe('auto-apply');
     expect(result.fusedCandidates[0]?.workstreamId).toBe('ws_security');
     expect(result.fusedCandidates[0]?.reasons.length).toBeGreaterThan(0);
+    expect(inferredAttributionPayloadFromResolution(result)).toMatchObject({
+      payloadVersion: 1,
+      tabSessionId: 'tses_a',
+      workstreamId: 'ws_security',
+      policyMode: 'balanced',
+      dominantSource: 'similarity',
+    });
+  });
+
+  it('blocks auto-apply when source regret exceeds the policy budget', () => {
+    const snap = snapshot(
+      [
+        'tab-session:tses_a',
+        'timeline-visit:https://example.test/a',
+        'timeline-visit:https://example.test/anchor',
+        'workstream:ws_security',
+      ],
+      [
+        {
+          kind: 'visit_in_tab_session',
+          from: 'timeline-visit:https://example.test/a',
+          to: 'tab-session:tses_a',
+        },
+        {
+          kind: 'closest_visit',
+          from: 'timeline-visit:https://example.test/a',
+          to: 'timeline-visit:https://example.test/anchor',
+        },
+        {
+          kind: 'visit_in_workstream',
+          from: 'timeline-visit:https://example.test/anchor',
+          to: 'workstream:ws_security',
+        },
+      ],
+    );
+    const events = [observed(1, 'tses_a')];
+    const result = resolveAttribution({
+      tabSessionId: 'tses_a',
+      snapshot: snap,
+      projection: projectTabSessions(events),
+      events,
+      policyMode: 'balanced',
+      policyTelemetry: { regretRateBySource: { similarity: 0.5 } },
+      nowMs: Date.parse('2026-05-10T10:01:00.000Z'),
+    });
+
+    expect(result.decision.action).toBe('suggest');
+    expect(inferredAttributionPayloadFromResolution(result)).toBeNull();
   });
 });

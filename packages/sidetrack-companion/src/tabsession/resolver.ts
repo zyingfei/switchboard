@@ -9,9 +9,15 @@ import type { ConnectionsSnapshot } from '../connections/types.js';
 import type { ClosestVisitRanker } from '../connections/snapshot.js';
 import { seedHash, runPPR, createPprCache } from './causalPpr.js';
 import { buildClusterEvidence } from './clusterEvidence.js';
+import type { TabSessionAttributionInferredPayload } from './events.js';
 import { buildEvidenceGraph } from './evidenceGraph.js';
 import { fuseCandidates, type CandidateEvidence, type FusedCandidate } from './fusion.js';
-import { decideAttribution, type AttributionAction, type AttributionPolicyMode } from './policy.js';
+import {
+  decideAttribution,
+  type AttributionAction,
+  type AttributionPolicyMode,
+  type AttributionPolicyTelemetry,
+} from './policy.js';
 import { buildSimilarityEvidence } from './similarity.js';
 import type { TabSessionProjection } from './projection.js';
 
@@ -53,6 +59,7 @@ export interface ResolveAttributionInput {
   readonly projection: TabSessionProjection;
   readonly events: readonly AcceptedEvent[];
   readonly policyMode?: AttributionPolicyMode;
+  readonly policyTelemetry?: AttributionPolicyTelemetry;
   readonly nowMs?: number;
   readonly closestVisitRanker?: ClosestVisitRanker;
 }
@@ -228,7 +235,7 @@ export const resolveAttribution = (input: ResolveAttributionInput): ResolutionRe
       ...candidate,
       reasons: evidenceReasons(candidate, anchors.slice(0, 3)),
     }));
-  const decision = decideAttribution(fusedCandidates, mode);
+  const decision = decideAttribution(fusedCandidates, mode, input.policyTelemetry);
 
   return {
     tabSessionId: input.tabSessionId,
@@ -241,5 +248,27 @@ export const resolveAttribution = (input: ResolveAttributionInput): ResolutionRe
       targetAnchors: anchors,
       topContributingAnchors: anchors.slice(0, 3),
     },
+  };
+};
+
+export const inferredAttributionPayloadFromResolution = (
+  result: ResolutionResult,
+): TabSessionAttributionInferredPayload | null => {
+  if (result.decision.action !== 'auto-apply' || result.decision.workstreamId === undefined) {
+    return null;
+  }
+  const top = result.fusedCandidates.find(
+    (candidate) => candidate.workstreamId === result.decision.workstreamId,
+  );
+  if (top === undefined || top.dominantSource === 'none') return null;
+  return {
+    payloadVersion: 1,
+    tabSessionId: result.tabSessionId,
+    workstreamId: result.decision.workstreamId,
+    policyMode: result.policyMode,
+    dominantSource: top.dominantSource,
+    rawFusionLogit: top.rawFusionLogit,
+    margin: result.decision.margin,
+    corroborationCount: top.corroborationCount,
   };
 };
