@@ -415,6 +415,105 @@ button:disabled {
   color: var(--ink-3);
 }
 
+/* Redesigned current-tab card: stronger surface than the old inline cue
+   so the user can tell at a glance which tab the panel is talking about
+   plus a path to change its workstream via the same WorkstreamPicker
+   used by the All-Threads list. */
+.tab-attribution-card {
+  display: grid;
+  gap: 4px;
+  padding: 8px 12px;
+  border-bottom: var(--hair-soft);
+  background: var(--accent-soft, #fff8dc);
+  color: var(--ink-2);
+}
+.tab-attribution-card.is-empty {
+  background: var(--paper-2, #fbfaf6);
+  color: var(--ink-3);
+}
+.tab-attribution-card-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+.tab-attribution-card-eyebrow {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+}
+.tab-attribution-card-title,
+.tab-attribution-card-title-link {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--ink-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+.tab-attribution-card-title-link {
+  background: none;
+  border: 0;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+  text-decoration: underline dotted;
+}
+.tab-attribution-card-title-link:hover {
+  color: var(--accent, #0b57d0);
+}
+.tab-attribution-card-body {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.tab-attribution-card-prefix {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.tab-attribution-card-change {
+  background: transparent;
+  border: 1px solid var(--hair);
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--ink-2);
+}
+.tab-attribution-card-change:hover {
+  border-color: var(--accent, #0b57d0);
+  color: var(--accent, #0b57d0);
+}
+.tab-attribution-card-intent {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+/* Linkified tab-session title inside InboxCard (matches the
+   thread-title behaviour: click to focus the live tab or reopen). */
+.tab-session-title-link {
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tab-session-title-link:hover {
+  color: var(--accent, #0b57d0);
+}
+
 .tab-session-list {
   display: grid;
   gap: 6px;

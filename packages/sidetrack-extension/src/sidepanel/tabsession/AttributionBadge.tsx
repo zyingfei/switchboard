@@ -9,7 +9,12 @@ const workstreamLabel = (
   workstreams: readonly TabSessionWorkstreamOption[],
 ): string => {
   if (workstreamId === null || workstreamId === undefined) return '?';
-  return workstreams.find((workstream) => workstream.bac_id === workstreamId)?.path ?? workstreamId;
+  // If the referenced workstream is gone (user deleted it after attribution
+  // landed) fall back to a human marker instead of leaking the raw bac_id.
+  return (
+    workstreams.find((workstream) => workstream.bac_id === workstreamId)?.path ??
+    '(removed)'
+  );
 };
 
 export interface AttributionBadgeProps {

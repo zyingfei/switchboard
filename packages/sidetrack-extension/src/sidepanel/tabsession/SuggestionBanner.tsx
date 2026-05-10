@@ -25,7 +25,9 @@ const workstreamLabel = (
   workstreams: readonly TabSessionWorkstreamOption[],
 ): string => {
   if (workstreamId === undefined) return 'unknown';
-  return workstreams.find((workstream) => workstream.bac_id === workstreamId)?.path ?? workstreamId;
+  return (
+    workstreams.find((workstream) => workstream.bac_id === workstreamId)?.path ?? '(removed)'
+  );
 };
 
 export interface SuggestionBannerProps {

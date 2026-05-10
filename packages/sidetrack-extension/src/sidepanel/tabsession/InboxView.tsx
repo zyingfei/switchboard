@@ -2,6 +2,7 @@ import { InboxCard } from './InboxCard';
 import { sliceInboxForPanel } from './inboxPriority';
 import type {
   TabSessionInboxData,
+  TabSessionRecord,
   TabSessionResolutionResult,
   TabSessionWorkstreamOption,
 } from './types';
@@ -14,6 +15,7 @@ export interface InboxViewProps {
   readonly suggestions: Readonly<Record<string, TabSessionResolutionResult>>;
   readonly onRefresh: () => void;
   readonly onAttribute: (tabSessionId: string, workstreamId: string | null) => void;
+  readonly onOpenTab?: (record: TabSessionRecord) => void;
 }
 
 export function InboxView({
@@ -24,6 +26,7 @@ export function InboxView({
   suggestions,
   onRefresh,
   onAttribute,
+  onOpenTab,
 }: InboxViewProps) {
   const slice = sliceInboxForPanel(inbox.items, inbox.total);
   return (
@@ -50,6 +53,7 @@ export function InboxView({
             suggestion={suggestions[record.tabSessionId]}
             workstreams={workstreams}
             onAttribute={onAttribute}
+            {...(onOpenTab === undefined ? {} : { onOpenTab })}
           />
         ))}
       </div>

@@ -80,6 +80,10 @@ type Props = {
   readonly initialAnchor?: string;
   readonly recentAnchors?: readonly ConnectionsViewRecentAnchor[];
   readonly workstreamAnchors?: readonly ConnectionsViewWorkstreamAnchor[];
+  // Switch to (or open) a browser tab at the given URL when the user
+  // clicks "Go to tab" on a URL-bearing node. When omitted, the
+  // Go-to-tab button is not rendered for any node.
+  readonly onOpenUrl?: (url: string) => void;
 };
 
 type SubMode = 'linked' | 'orbital' | 'flow' | 'focus' | 'context';
@@ -393,6 +397,7 @@ export const ConnectionsView = ({
   initialAnchor = '',
   recentAnchors = [],
   workstreamAnchors = [],
+  onOpenUrl,
 }: Props): ReactElement => {
   const [anchor, setAnchor] = useState<string>(initialAnchor);
   const [draftAnchor, setDraftAnchor] = useState<string>(initialAnchor);
@@ -847,6 +852,7 @@ export const ConnectionsView = ({
                 onSelectEdge={selectEdge}
                 onUseNodeAsAnchor={useNodeAsAnchor}
                 onPromoteSnippet={submitSnippetPromotion}
+                {...(onOpenUrl === undefined ? {} : { onOpenUrl })}
               />
             ) : subMode === 'orbital' ? (
               <ConnectionsOrbitalCenter
@@ -943,6 +949,7 @@ const ConnectionsLinkedCenter = ({
   onSelectEdge,
   onUseNodeAsAnchor,
   onPromoteSnippet,
+  onOpenUrl,
 }: {
   readonly result: ConnectionsScopedResult;
   readonly anchorId: string;
@@ -953,6 +960,7 @@ const ConnectionsLinkedCenter = ({
     readonly snippetId: string;
     readonly sourceVisitId: string;
   }) => Promise<void>;
+  readonly onOpenUrl?: (url: string) => void;
 }): ReactElement => {
   if (result.scope === 'plugin-active-only-companion-unreachable') {
     return (
@@ -1020,6 +1028,7 @@ const ConnectionsLinkedCenter = ({
                     onClick={() => {
                       if (edge !== undefined) onSelectEdge(edge);
                     }}
+                    {...(onOpenUrl === undefined ? {} : { onOpenUrl })}
                   />
                 );
               })}
@@ -1352,6 +1361,7 @@ const NodeRow = ({
   onPromoteSnippet,
   onUseAsAnchor,
   onClick,
+  onOpenUrl,
 }: {
   readonly node: ConnectionNode;
   readonly edge: ConnectionEdge | null;
@@ -1363,7 +1373,10 @@ const NodeRow = ({
   }) => Promise<void>;
   readonly onUseAsAnchor: () => void;
   readonly onClick: () => void;
+  readonly onOpenUrl?: (url: string) => void;
 }): ReactElement => {
+  const openUrl = metadataString(node.metadata, ['url', 'canonicalUrl']);
+  const canOpenTab = onOpenUrl !== undefined && openUrl !== undefined && openUrl.length > 0;
   const [promoting, setPromoting] = useState<boolean>(false);
   const [promoteStatus, setPromoteStatus] = useState<'saved' | 'error' | null>(null);
   const display = NODE_KIND_DISPLAY[node.kind];
@@ -1442,6 +1455,19 @@ const NodeRow = ({
           data-testid={`snippet-promote-${node.id}`}
         >
           {promoteStatus === 'saved' ? 'Promoted' : promoteStatus === 'error' ? 'Retry' : 'Promote'}
+        </button>
+      ) : null}
+      {canOpenTab ? (
+        <button
+          type="button"
+          className="cx-focus-expand cx-row-open-tab"
+          onClick={() => {
+            onOpenUrl(openUrl);
+          }}
+          data-testid={`node-open-${node.id}`}
+          title={`Open ${openUrl} in a tab`}
+        >
+          Go to tab
         </button>
       ) : null}
       <button

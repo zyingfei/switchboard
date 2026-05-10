@@ -28,9 +28,16 @@ export interface InboxCardProps {
   readonly suggestion?: TabSessionResolutionResult;
   readonly workstreams: readonly TabSessionWorkstreamOption[];
   readonly onAttribute: (tabSessionId: string, workstreamId: string | null) => void;
+  readonly onOpenTab?: (record: TabSessionRecord) => void;
 }
 
-export function InboxCard({ record, suggestion, workstreams, onAttribute }: InboxCardProps) {
+export function InboxCard({
+  record,
+  suggestion,
+  workstreams,
+  onAttribute,
+  onOpenTab,
+}: InboxCardProps) {
   const defaultWorkstreamId = suggestion?.decision.workstreamId ?? workstreams[0]?.bac_id ?? '';
   const [selectedWorkstreamId, setSelectedWorkstreamId] = useState(defaultWorkstreamId);
   useEffect(() => {
@@ -59,7 +66,20 @@ export function InboxCard({ record, suggestion, workstreams, onAttribute }: Inbo
       </div>
       <div className="tab-session-card-main">
         <div className="tab-session-card-head">
-          <span className="tab-session-title">{title}</span>
+          {onOpenTab !== undefined && record.latestUrl !== undefined ? (
+            <button
+              type="button"
+              className="tab-session-title tab-session-title-link"
+              onClick={() => {
+                onOpenTab(record);
+              }}
+              title="Switch to this tab or reopen it"
+            >
+              {title}
+            </button>
+          ) : (
+            <span className="tab-session-title">{title}</span>
+          )}
           <AttributionBadge record={record} suggestion={suggestion} workstreams={workstreams} />
         </div>
         <div className="tab-session-meta mono">

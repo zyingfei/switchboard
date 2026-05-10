@@ -453,6 +453,11 @@ const App = () => {
   const [expandedWorkstreamId, setExpandedWorkstreamId] = useState<string | null>(null);
   const [wsPickerOpen, setWsPickerOpen] = useState(false);
   const [wsPickerCreateMode, setWsPickerCreateMode] = useState(false);
+  // Tab-session re-attribution picker — when set, the WorkstreamPicker
+  // modal applies its selection to this tab-session id (not the global
+  // "active workstream pill" intent). Keeps tab attribution and intent
+  // independent so changing one doesn't accidentally change the other.
+  const [tabSessionMoveId, setTabSessionMoveId] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<'workstream' | 'all' | 'inbox' | 'connections'>(
     'workstream',
   );
@@ -1755,6 +1760,31 @@ const App = () => {
       }),
     );
   };
+
+  // Focus (or open) the live browser tab for a tab-session card. The
+  // session record carries the latest canonical URL we observed for it;
+  // we mirror openTabForThread's policy of "find existing tab → focus,
+  // else open new".
+  const openTabForSession = useCallback((record: TabSessionRecord): void => {
+    const url = record.latestUrl;
+    if (typeof url !== 'string' || url.length === 0) return;
+    void (async () => {
+      try {
+        const tabs = await chrome.tabs.query({ url });
+        const live = tabs.find((t) => typeof t.id === 'number');
+        if (live !== undefined && typeof live.id === 'number') {
+          await chrome.tabs.update(live.id, { active: true });
+          if (live.windowId !== undefined) {
+            await chrome.windows.update(live.windowId, { focused: true });
+          }
+          return;
+        }
+      } catch {
+        // host_permission may be missing for arbitrary hosts; fall through.
+      }
+      await chrome.tabs.create({ url });
+    })();
+  }, []);
 
   // Switch to the thread's existing tab if still alive, otherwise open a new
   // one at the same URL.
@@ -4419,17 +4449,58 @@ const App = () => {
         </div>
       )}
 
-      <div className="tab-attribution-cue" data-testid="focused-tab-attribution">
-        <span className="mono">Tab is in:</span>
-        <AttributionBadge
-          record={focusedTabSession}
-          suggestion={focusedTabSuggestion}
-          workstreams={tabSessionWorkstreams}
-        />
-        {currentWsId !== focusedTabSession?.currentAttribution?.workstreamId ? (
-          <span className="tab-attribution-intent mono">Intent: {currentWsLabel}</span>
-        ) : null}
-      </div>
+      <section
+        className={
+          'tab-attribution-card' + (focusedTabSession !== undefined ? ' is-active' : ' is-empty')
+        }
+        data-testid="focused-tab-attribution"
+        aria-label="Current tab attribution"
+      >
+        <div className="tab-attribution-card-head">
+          <span className="tab-attribution-card-eyebrow mono">Current tab</span>
+          {focusedTabSession !== undefined && focusedTabSession.latestUrl !== undefined ? (
+            <button
+              type="button"
+              className="tab-attribution-card-title-link"
+              onClick={() => {
+                openTabForSession(focusedTabSession);
+              }}
+              title="Switch to this tab or reopen it"
+            >
+              {focusedTabSession.latestTitle?.trim() ||
+                focusedTabSession.latestUrl ||
+                focusedTabSession.tabSessionId}
+            </button>
+          ) : (
+            <span className="tab-attribution-card-title subtle">No tracked tab in focus</span>
+          )}
+        </div>
+        <div className="tab-attribution-card-body">
+          <span className="tab-attribution-card-prefix mono">In workstream:</span>
+          <AttributionBadge
+            record={focusedTabSession}
+            suggestion={focusedTabSuggestion}
+            workstreams={tabSessionWorkstreams}
+          />
+          {focusedTabSession !== undefined ? (
+            <button
+              type="button"
+              className="tab-attribution-card-change"
+              onClick={() => {
+                setTabSessionMoveId(focusedTabSession.tabSessionId);
+              }}
+              title="Move this tab session to a different workstream"
+            >
+              Change…
+            </button>
+          ) : null}
+          {currentWsId !== focusedTabSession?.currentAttribution?.workstreamId ? (
+            <span className="tab-attribution-card-intent mono" title="Active workstream pill (default for new captures)">
+              Intent: {currentWsLabel}
+            </span>
+          ) : null}
+        </div>
+      </section>
 
       {suggestedOpenTabSession !== undefined && suggestedOpenTabSessionResolution !== undefined ? (
         <SuggestionBanner
@@ -4590,6 +4661,40 @@ const App = () => {
         />
       ) : null}
 
+      {tabSessionMoveId !== null ? (
+        <WorkstreamPicker
+          workstreams={state.workstreams}
+          threads={threads}
+          /* Highlight whatever workstream the tab is currently attributed to. */
+          currentWsId={
+            tabSessionRecords.find((record) => record.tabSessionId === tabSessionMoveId)
+              ?.currentAttribution?.workstreamId ?? null
+          }
+          createMode={false}
+          onClose={() => {
+            setTabSessionMoveId(null);
+          }}
+          onSelect={(id) => {
+            handleTabSessionAttribute(tabSessionMoveId, id);
+            setTabSessionMoveId(null);
+          }}
+          onCreate={(title, parentId, description) => {
+            void runAction(async () => {
+              return await sendRequest({
+                type: messageTypes.createWorkstream,
+                workstream: {
+                  title,
+                  ...(parentId === null ? {} : { parentId }),
+                  privacy: 'shared',
+                  ...(description !== undefined && description.length > 0 ? { description } : {}),
+                },
+              });
+            });
+          }}
+          parentForNew={null}
+        />
+      ) : null}
+
       {pendingCodingOffers.length > 0
         ? (() => {
             const offer = pendingCodingOffers[0];
@@ -4686,6 +4791,24 @@ const App = () => {
               label: w.title || w.bac_id,
             })),
           ]}
+          onOpenUrl={(url) => {
+            void (async () => {
+              try {
+                const tabs = await chrome.tabs.query({ url });
+                const live = tabs.find((t) => typeof t.id === 'number');
+                if (live !== undefined && typeof live.id === 'number') {
+                  await chrome.tabs.update(live.id, { active: true });
+                  if (live.windowId !== undefined) {
+                    await chrome.windows.update(live.windowId, { focused: true });
+                  }
+                  return;
+                }
+              } catch {
+                // host_permission may be missing for arbitrary URLs.
+              }
+              await chrome.tabs.create({ url });
+            })();
+          }}
         />
       ) : viewMode === 'workstream' ? (
         <>
@@ -4766,6 +4889,7 @@ const App = () => {
                       suggestion={tabSessionSuggestions[record.tabSessionId]}
                       workstreams={tabSessionWorkstreams}
                       onAttribute={handleTabSessionAttribute}
+                      onOpenTab={openTabForSession}
                     />
                   ))}
                 </div>
@@ -4784,6 +4908,7 @@ const App = () => {
             void loadTabSessions();
           }}
           onAttribute={handleTabSessionAttribute}
+          onOpenTab={openTabForSession}
         />
       ) : (
         <>
