@@ -764,13 +764,19 @@ export const assertNoDisallowedStorageValues = (
 
 export const assertPackPrivacy = (pack: SessionPack): void => {
   const json = JSON.stringify(pack);
+  // The /\blocalStorage\b/ and /\bsessionStorage\b/ rules used to live
+  // here but tripped on inline-script API references in real provider
+  // HTML (every modern page has `localStorage.setItem(...)` somewhere).
+  // The actual privacy boundary for chrome.storage.local *values* is
+  // assertNoDisallowedStorageValues, which compares pack JSON against a
+  // live chrome.storage.local snapshot. Word-level matches on the API
+  // name catch noise, not leaked values, so they are intentionally
+  // omitted here.
   const denied: readonly { readonly name: string; readonly pattern: RegExp }[] = [
     { name: 'authorization header', pattern: /\bauthorization\s*:/iu },
     { name: 'bearer token', pattern: /\bbearer\s+[a-z0-9._~+/=-]{8,}/iu },
     { name: 'set-cookie header', pattern: /\bset-cookie\s*:/iu },
     { name: 'cookie header', pattern: /\bcookie\s*[=:]/iu },
-    { name: 'local storage marker', pattern: /\blocalStorage\b/u },
-    { name: 'session storage marker', pattern: /\bsessionStorage\b/u },
     { name: 'GitHub token', pattern: /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/u },
     { name: 'OpenAI key', pattern: /\bsk-[A-Za-z0-9_-]{32,}\b/u },
   ];
@@ -821,12 +827,20 @@ export const readSessionPack = async (packPath: string): Promise<SessionPack> =>
   return parseSessionPack(parsed);
 };
 
-const routeKeyFor = (input: string): string => {
+export const routeKeyFor = (input: string): string => {
+  // Normalize trailing slashes so a recorded canonical of /pulls matches
+  // a browser-issued request to /pulls/. The recorder's canonical URL
+  // pipeline strips trailing slashes; some servers normalise to a slash
+  // when issuing redirects. Without this, the route handler reports
+  // "stub was not hit" for clean URLs that did navigate during replay.
+  const normalize = (pathname: string): string =>
+    pathname.length > 1 ? stripTrailingSlash(pathname) : pathname;
   try {
     const url = new URL(input);
-    return `${url.origin}${url.pathname}`;
+    return `${url.origin}${normalize(url.pathname)}`;
   } catch {
-    return input.split('?')[0] ?? input;
+    const withoutQuery = input.split('?')[0] ?? input;
+    return normalize(withoutQuery);
   }
 };
 
