@@ -45,6 +45,7 @@ export interface UserOrganizedItemDetails {
   readonly rename?: string;
   readonly mergeMembers?: readonly string[];
   readonly splitInto?: readonly string[];
+  readonly attributionSource?: 'manual' | 'tab-group-pull-in' | 'tab-group-pull-out';
 }
 
 export interface UserOrganizedItemPayload {
@@ -165,6 +166,14 @@ const isOptionalStringOrNull = (value: unknown): value is string | null | undefi
 const isOptionalStringArray = (value: unknown): value is readonly string[] | undefined =>
   value === undefined || isStringArray(value);
 
+const isOptionalAttributionSource = (
+  value: unknown,
+): value is UserOrganizedItemDetails['attributionSource'] =>
+  value === undefined ||
+  value === 'manual' ||
+  value === 'tab-group-pull-in' ||
+  value === 'tab-group-pull-out';
+
 const isOrganizedItemKind = (value: unknown): value is UserOrganizedItemKind =>
   typeof value === 'string' && ORGANIZED_ITEM_KINDS.has(value);
 
@@ -193,7 +202,8 @@ const isUserOrganizedItemDetails = (value: unknown): value is UserOrganizedItemD
   return (
     isOptionalString(value['rename']) &&
     isOptionalStringArray(value['mergeMembers']) &&
-    isOptionalStringArray(value['splitInto'])
+    isOptionalStringArray(value['splitInto']) &&
+    isOptionalAttributionSource(value['attributionSource'])
   );
 };
 

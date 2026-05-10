@@ -79,6 +79,8 @@ import { createVaultChangesClient } from '../src/companion/vaultChanges';
 import { createRecallClient } from '../src/companion/recallClient';
 import { buildReviewFollowUpText } from '../src/review/draft';
 import type { ReviewDraft } from '../src/review/types';
+import { createTabGroupWiring, type TabGroupFeedbackEvent } from '../src/tabgroups/wiring';
+import { createChromeTabSessionStorage } from '../src/tabsession/storage';
 import {
   isContentResponse,
   isRuntimeRequest,
@@ -152,6 +154,17 @@ import { tryLinkCapturedThread } from '../src/companion/dispatchLinking';
 const activeTab = async (): Promise<chrome.tabs.Tab | undefined> => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   return tab;
+};
+
+const fnv1a64ForTabGroup = (input: string): string => {
+  let h = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  const mask = 0xffffffffffffffffn;
+  for (let i = 0; i < input.length; i += 1) {
+    h ^= BigInt(input.charCodeAt(i));
+    h = (h * prime) & mask;
+  }
+  return h.toString(16).padStart(16, '0');
 };
 
 // True when the captured thread is the active tab in the currently
@@ -3146,6 +3159,53 @@ export default defineBackground(() => {
     console.warn('[timeline] init failed:', error);
   });
 
+  void (async () => {
+    if (chrome.tabGroups === undefined) return;
+    const replica = await loadOrCreateEdgeReplica();
+    const tabSessionStorage = createChromeTabSessionStorage();
+    const hashTabId = (tabId: number, windowId: number): string =>
+      fnv1a64ForTabGroup(`${replica.edgeReplicaId}|tab|${String(tabId)}|${String(windowId)}`).slice(
+        0,
+        16,
+      );
+    const postFeedbackEvent = async (event: TabGroupFeedbackEvent): Promise<void> => {
+      await companionJson('/v1/feedback/events', {
+        method: 'POST',
+        headers: {
+          'idempotency-key': idempotencyKey(
+            'tabgroup-feedback',
+            `${event.type}-${String(Date.now())}`,
+          ),
+        },
+        body: JSON.stringify(event),
+      });
+    };
+    createTabGroupWiring({
+      runtime: {
+        tabGroups: chrome.tabGroups,
+        tabs: {
+          onUpdated: chrome.tabs.onUpdated,
+          group: (options) => chrome.tabs.group(options),
+          get: (tabId) => chrome.tabs.get(tabId),
+        },
+      },
+      postFeedbackEvent,
+      tabSessionIdForTab: async (tab) => {
+        if (typeof tab.id !== 'number' || typeof tab.windowId !== 'number') return null;
+        const record = await tabSessionStorage.get(hashTabId(tab.id, tab.windowId));
+        return record?.tabSessionId ?? null;
+      },
+      canonicalUrlsForTabs: async (tabIds) => {
+        const tabs = await Promise.all(tabIds.map((tabId) => chrome.tabs.get(tabId)));
+        return tabs
+          .map((tab) => (typeof tab.url === 'string' ? canonicalThreadUrl(tab.url) : null))
+          .filter((url): url is string => url !== null);
+      },
+    });
+  })().catch((error: unknown) => {
+    console.warn('[tabgroups] init failed:', error);
+  });
+
   // Connections graph messages — proxied to /v1/connections* with
   // a 30 s TTL cache. Sits BEFORE the main RuntimeRequest handler
   // because these messages have a different response shape and
@@ -3550,8 +3610,7 @@ export default defineBackground(() => {
         (message as { type?: unknown }).type === 'sidetrack.timeline.set-active-workstream'
       ) {
         const value = (message as { workstreamId?: unknown }).workstreamId;
-        const next =
-          typeof value === 'string' && value.length > 0 ? value : null;
+        const next = typeof value === 'string' && value.length > 0 ? value : null;
         void (async () => {
           setActiveWorkstreamCache(next);
           try {
@@ -3565,7 +3624,9 @@ export default defineBackground(() => {
             sendResponse({
               ok: false,
               error:
-                error instanceof Error ? error.message : 'set-active-workstream storage write failed',
+                error instanceof Error
+                  ? error.message
+                  : 'set-active-workstream storage write failed',
             } as unknown as RuntimeResponse);
           }
         })();

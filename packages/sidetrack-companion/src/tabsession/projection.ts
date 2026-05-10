@@ -1,12 +1,16 @@
 import type { AcceptedEvent } from '../sync/causal.js';
 import { USER_ORGANIZED_ITEM, isUserOrganizedItemPayload } from '../feedback/events.js';
 import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from '../timeline/events.js';
+import {
+  TAB_SESSION_ATTRIBUTION_INFERRED,
+  isTabSessionAttributionInferredPayload,
+} from './events.js';
 
 export const TAB_SESSION_PROJECTION_SCHEMA_VERSION = 1;
 
 export interface TabSessionAttribution {
   readonly workstreamId: string | null;
-  readonly source: 'user_asserted';
+  readonly source: 'user_asserted' | 'tab-group-pull-in' | 'tab-group-pull-out' | 'inferred';
   readonly observedAt: string;
   readonly clientEventId: string;
   readonly replicaId: string;
@@ -51,6 +55,10 @@ const compareEventOrder = (left: AcceptedEvent, right: AcceptedEvent): number =>
 };
 
 const compareAttribution = (left: TabSessionAttribution, right: TabSessionAttribution): number => {
+  const precedence = (value: TabSessionAttribution): number =>
+    value.source === 'inferred' ? 0 : 1;
+  const tier = precedence(left) - precedence(right);
+  if (tier !== 0) return tier;
   const observed = compareString(left.observedAt, right.observedAt);
   if (observed !== 0) return observed;
   const replica = compareString(left.replicaId, right.replicaId);
@@ -207,7 +215,27 @@ export const projectTabSessions = (events: readonly AcceptedEvent[]): TabSession
       upsertAttribution(records, {
         tabSessionId: payload.itemId,
         workstreamId: payload.toContainer ?? null,
-        source: 'user_asserted',
+        source:
+          payload.details?.attributionSource === 'tab-group-pull-in' ||
+          payload.details?.attributionSource === 'tab-group-pull-out'
+            ? payload.details.attributionSource
+            : 'user_asserted',
+        observedAt: isoFromAcceptedAt(event.acceptedAtMs),
+        clientEventId: event.clientEventId,
+        replicaId: event.dot.replicaId,
+        seq: event.dot.seq,
+      });
+      continue;
+    }
+
+    if (
+      event.type === TAB_SESSION_ATTRIBUTION_INFERRED &&
+      isTabSessionAttributionInferredPayload(event.payload)
+    ) {
+      upsertAttribution(records, {
+        tabSessionId: event.payload.tabSessionId,
+        workstreamId: event.payload.workstreamId,
+        source: 'inferred',
         observedAt: isoFromAcceptedAt(event.acceptedAtMs),
         clientEventId: event.clientEventId,
         replicaId: event.dot.replicaId,
