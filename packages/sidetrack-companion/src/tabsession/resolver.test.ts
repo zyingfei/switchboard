@@ -285,6 +285,18 @@ describe('tab-session resolver', () => {
     expect(result.decision.action).toBe('auto-apply');
     expect(result.fusedCandidates[0]?.workstreamId).toBe('ws_security');
     expect(result.fusedCandidates[0]?.reasons.length).toBeGreaterThan(0);
+    // Enriched anchor shape: each anchor carries { id, kind, label }
+    // so the extension can render human text without a separate
+    // graph lookup. Backward compat for bare-string anchors lives in
+    // the extension's formatAnchorDisplay reader.
+    const anchorList = result.fusedCandidates[0]?.reasons[0]?.anchors ?? [];
+    expect(anchorList.length).toBeGreaterThan(0);
+    for (const anchor of anchorList) {
+      expect(typeof anchor).toBe('object');
+      expect(typeof anchor.id).toBe('string');
+      expect(typeof anchor.kind).toBe('string');
+      expect(typeof anchor.label).toBe('string');
+    }
     expect(inferredAttributionPayloadFromResolution(result)).toMatchObject({
       payloadVersion: 1,
       tabSessionId: 'tses_a',

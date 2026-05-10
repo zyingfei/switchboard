@@ -7,7 +7,7 @@ import {
   isUserOrganizedItemPayload,
 } from '../feedback/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
-import type { ConnectionsSnapshot } from '../connections/types.js';
+import type { ConnectionNode, ConnectionsSnapshot } from '../connections/types.js';
 import type { ClosestVisitRanker } from '../connections/snapshot.js';
 import { seedHash, runPPR, createPprCache } from './causalPpr.js';
 import { buildClusterEvidence } from './clusterEvidence.js';
@@ -30,10 +30,24 @@ const WORKSTREAM_PREFIX = 'workstream:';
 const MODEL_REVISION = 'tabsession-resolver-v1';
 const pprCache = createPprCache();
 
+// Enriched anchor — the resolver now ships kind + best-effort label
+// alongside the raw node id so the extension's AttributionProvenance
+// can render human-friendly text ("ChatGPT — sidetrack") instead of
+// raw `tses_*` / `visit-instance:tses_*:date:url` strings. The
+// resolver pulls `label` from the same connections graph the snapshot
+// builds, with a fallback derived from the id prefix when the graph
+// has no entry. The extension's reader accepts both this enriched
+// shape and the legacy bare-string form for backward compat.
+export interface AttributionAnchor {
+  readonly id: string;
+  readonly kind: string;
+  readonly label: string;
+}
+
 export interface AttributionReason {
   readonly source: 'ppr' | 'similarity' | 'cluster';
   readonly summary: string;
-  readonly anchors: readonly string[];
+  readonly anchors: readonly AttributionAnchor[];
 }
 
 export interface ResolverCandidate extends FusedCandidate {
@@ -158,9 +172,32 @@ const negativeSeeds = (input: ResolveAttributionInput): Map<string, number> => {
   return seeds;
 };
 
+// Derive { kind, label } for an anchor node id from the connections
+// snapshot. When the snapshot has a real ConnectionNode we use its
+// label (which the snapshot builder has already hydrated with title
+// and host fallbacks); otherwise we synthesize a kind-aware
+// placeholder so the wire format never sends an unlabeled anchor.
+// The extension's `formatAnchorDisplay` will further override with
+// its live snapshot when the user has fresher metadata, but this
+// gives audit-log readers and other consumers a usable label too.
+const kindFromAnchorId = (id: string): string => {
+  const colon = id.indexOf(':');
+  return colon === -1 ? 'node' : id.slice(0, colon);
+};
+
+const enrichAnchor = (
+  anchorId: string,
+  nodeById: ReadonlyMap<string, ConnectionNode>,
+): AttributionAnchor => {
+  const node = nodeById.get(anchorId);
+  const kind = node?.kind ?? kindFromAnchorId(anchorId);
+  const label = node?.label && node.label.length > 0 ? node.label : '';
+  return { id: anchorId, kind, label };
+};
+
 const evidenceReasons = (
   candidate: CandidateEvidence,
-  anchors: readonly string[],
+  anchors: readonly AttributionAnchor[],
 ): readonly AttributionReason[] => {
   const reasons: AttributionReason[] = [];
   if (candidate.pprScore > 0) {
@@ -247,12 +284,23 @@ export const resolveAttribution = (input: ResolveAttributionInput): ResolutionRe
       };
     });
 
+  // Build the enriched anchor list once and reuse across reasons.
+  // Each anchor is { id, kind, label } where kind/label are pulled
+  // from the connections snapshot (which hydrates tab-session labels
+  // from the projection — see snapshot.ts).
+  const nodeById = new Map<string, ConnectionNode>(
+    input.snapshot.nodes.map((node) => [node.id, node] as const),
+  );
+  const enrichedAnchors: readonly AttributionAnchor[] = anchors
+    .slice(0, 3)
+    .map((anchorId) => enrichAnchor(anchorId, nodeById));
+
   const fusedCandidates = fuseCandidates(candidateEvidence)
     .filter((candidate) => candidate.corroborationCount > 0)
     .slice(0, 5)
     .map((candidate) => ({
       ...candidate,
-      reasons: evidenceReasons(candidate, anchors.slice(0, 3)),
+      reasons: evidenceReasons(candidate, enrichedAnchors),
     }));
   const decision = decideAttribution(fusedCandidates, mode, input.policyTelemetry);
 
