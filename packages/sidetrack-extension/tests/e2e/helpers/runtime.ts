@@ -36,6 +36,11 @@ const evaluateInMainWorld = async <Arg, Result>(
 const isSidetrackExtensionWorker = (worker: Worker): boolean =>
   worker.url().startsWith('chrome-extension://') && worker.url().endsWith('/background.js');
 
+const expandHomeDir = (input: string): string =>
+  input.startsWith('~')
+    ? path.join(process.env.HOME ?? '', input.slice(1).replace(/^[/\\]/u, ''))
+    : input;
+
 export interface ExtensionRuntimeMetadata {
   readonly browserMode: ManualBrowserMode;
   readonly browserChannel: string;
@@ -314,9 +319,31 @@ export interface LaunchOptions {
 const extensionPathWithExtraHostPermissions = async (
   baseExtensionPath: string,
   extraHostPermissions: readonly string[] | undefined,
+  options: { readonly stableCacheDir?: string } = {},
 ): Promise<{ readonly extensionPath: string; readonly cleanupPath?: string }> => {
   if (extraHostPermissions === undefined || extraHostPermissions.length === 0) {
     return { extensionPath: baseExtensionPath };
+  }
+  // When stableCacheDir is provided, write to that path so Chrome derives
+  // the same extension ID across runs — chrome.storage.local (where the
+  // side panel keeps workstreams under sidetrack.workstreams) is keyed
+  // by extension ID. Without a stable load path Chrome mints a fresh ID
+  // per run, which orphans the prior ID's storage and the user's
+  // workstreams effectively disappear.
+  if (options.stableCacheDir !== undefined && options.stableCacheDir.length > 0) {
+    const extensionPath = options.stableCacheDir;
+    await rm(extensionPath, { recursive: true, force: true });
+    await mkdir(extensionPath, { recursive: true });
+    await cp(baseExtensionPath, extensionPath, { recursive: true });
+    const manifestPath = path.join(extensionPath, 'manifest.json');
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>;
+    const existing = Array.isArray(manifest['host_permissions'])
+      ? manifest['host_permissions'].filter((value): value is string => typeof value === 'string')
+      : [];
+    manifest['host_permissions'] = [...new Set([...existing, ...extraHostPermissions])];
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    // No cleanupPath — the dir is meant to stay across runs.
+    return { extensionPath };
   }
   const tempRoot = await mkdtemp(path.join(tmpdir(), 'sidetrack-extension-e2e-hosts-'));
   const extensionPath = path.join(tempRoot, 'chrome-mv3');
@@ -353,20 +380,27 @@ export const launchExtensionRuntime = async (
       '[runtime] SIDETRACK_E2E_CDP_URL ignored for stealth experiment; using a Sidetrack-owned test profile.',
     );
   }
+  // Under stealth/manual recording, use a stable cache dir for the
+  // host-permission-widened extension copy. Same path → same extension
+  // ID → chrome.storage (workstreams) survives across runs.
+  const stableExtensionCacheDir = modeConfig.stealthExperiment
+    ? expandHomeDir('~/.sidetrack-stealth-extension')
+    : undefined;
   const extensionForLaunch = await extensionPathWithExtraHostPermissions(
     readExtensionPath(),
     options.extraHostPermissions,
+    stableExtensionCacheDir === undefined ? {} : { stableCacheDir: stableExtensionCacheDir },
   );
   const extensionPath = extensionForLaunch.extensionPath;
   // SIDETRACK_USER_DATA_DIR lets the dev pin a long-lived profile (e.g.
   // ~/.sidetrack-test-profile) so logins to chatgpt.com / claude.ai /
   // gemini.google.com survive across runs. When unset, every run gets a
   // fresh tmpdir profile that's wiped on close. Stealth experiment mode
-  // uses a Sidetrack-owned default dir so manual logins survive without
-  // mixing with the user's actual Chrome profile (Patchright's Chromium
-  // can't cleanly load the unpacked MV3 extension into a profile that
-  // was last used by Chrome stable).
-  const stealthDefaultDir = path.join(packageRoot, '.sidetrack-browser-profiles/stealth-experiment');
+  // uses a Sidetrack-owned default dir under $HOME so manual logins
+  // survive without mixing with the user's actual Chrome profile
+  // (Patchright's Chromium can't cleanly load the unpacked MV3
+  // extension into a profile that was last used by Chrome stable).
+  const stealthDefaultDir = expandHomeDir('~/.sidetrack-stealth-profile');
   const persistentDir = modeConfig.stealthExperiment
     ? (process.env.SIDETRACK_STEALTH_USER_DATA_DIR ?? stealthDefaultDir)
     : process.env.SIDETRACK_USER_DATA_DIR;
