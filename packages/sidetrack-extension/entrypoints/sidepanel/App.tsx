@@ -83,6 +83,16 @@ import { formatRelative } from '../../src/util/time';
 import { createSuggestionsClient } from '../../src/companion/suggestionsClient';
 import { listPendingOffers, markStatus, type OfferRecord } from '../../src/codingAttach/state';
 import { ConnectionsView } from '../../src/sidepanel/connections/ConnectionsView';
+import { AttributionBadge } from '../../src/sidepanel/tabsession/AttributionBadge';
+import { InboxCard } from '../../src/sidepanel/tabsession/InboxCard';
+import { InboxView } from '../../src/sidepanel/tabsession/InboxView';
+import {
+  TAB_SESSION_DRAG_MIME,
+  type TabSessionInboxData,
+  type TabSessionProjection,
+  type TabSessionRecord,
+  type TabSessionWorkstreamOption,
+} from '../../src/sidepanel/tabsession/types';
 import {
   USER_ORGANIZED_ITEM,
   feedbackClientEventId,
@@ -101,7 +111,12 @@ const TARGET_PROVIDER_LABEL: Record<string, string> = {
   other: 'Other',
 };
 
-const TAB_SESSION_DRAG_MIME = 'application/x-sidetrack-tab-session-id';
+const EMPTY_TAB_SESSION_INBOX: TabSessionInboxData = {
+  items: [],
+  total: 0,
+  limit: 51,
+  offset: 0,
+};
 
 const tabSessionIdFromDragEvent = (event: DragEvent<HTMLElement>): string | null => {
   if (typeof event.dataTransfer.getData !== 'function') return null;
@@ -110,6 +125,28 @@ const tabSessionIdFromDragEvent = (event: DragEvent<HTMLElement>): string | null
   const plain = event.dataTransfer.getData('text/plain');
   return plain.startsWith('tses_') ? plain : null;
 };
+
+const comparableTabUrl = (input: string | undefined): string | null => {
+  if (input === undefined || input.length === 0) return null;
+  const canonical = canonicalThreadUrl(input);
+  return canonical.length > 1 && canonical.endsWith('/') ? canonical.slice(0, -1) : canonical;
+};
+
+const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const isTabSessionProjection = (value: unknown): value is TabSessionProjection =>
+  isPlainRecord(value) &&
+  value['schemaVersion'] === 1 &&
+  isPlainRecord(value['bySessionId']) &&
+  isPlainRecord(value['openSessionsByTabId']);
+
+const isTabSessionInboxData = (value: unknown): value is TabSessionInboxData =>
+  isPlainRecord(value) &&
+  Array.isArray(value['items']) &&
+  typeof value['total'] === 'number' &&
+  typeof value['limit'] === 'number' &&
+  typeof value['offset'] === 'number';
 
 const sendRequestRaw = async (
   request: WorkboardRequest,
@@ -400,7 +437,9 @@ const App = () => {
   const [expandedWorkstreamId, setExpandedWorkstreamId] = useState<string | null>(null);
   const [wsPickerOpen, setWsPickerOpen] = useState(false);
   const [wsPickerCreateMode, setWsPickerCreateMode] = useState(false);
-  const [viewMode, setViewMode] = useState<'workstream' | 'all' | 'connections'>('workstream');
+  const [viewMode, setViewMode] = useState<'workstream' | 'all' | 'inbox' | 'connections'>(
+    'workstream',
+  );
   const [queueDraft, setQueueDraft] = useState('');
   const [queueExpandFor, setQueueExpandFor] = useState<string | null>(null);
   // Set briefly after the user opens compose-at-end via the row's
@@ -492,6 +531,13 @@ const App = () => {
       allowed: true,
     },
   ]);
+  const [tabSessionInbox, setTabSessionInbox] =
+    useState<TabSessionInboxData>(EMPTY_TAB_SESSION_INBOX);
+  const [tabSessionProjection, setTabSessionProjection] = useState<TabSessionProjection | null>(
+    null,
+  );
+  const [tabSessionLoading, setTabSessionLoading] = useState(false);
+  const [tabSessionError, setTabSessionError] = useState<string | null>(null);
   const [pendingCodingOffers, setPendingCodingOffers] = useState<readonly OfferRecord[]>([]);
   // Per-row dismissals for the Needs-Organize inline suggestion. Local
   // (per-session) — survives panel close but not extension reload.
@@ -735,6 +781,58 @@ const App = () => {
     }
     // Default to "not set" (Inbox) on first load — user picks via the ws-bar.
   };
+
+  const fetchCompanionJson = useCallback(
+    async <T,>(path: string): Promise<T> => {
+      if (port.length === 0 || bridgeKey.length === 0) {
+        throw new Error('Companion is not configured.');
+      }
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        headers: { 'x-bac-bridge-key': bridgeKey },
+      });
+      if (!response.ok) {
+        throw new Error(`Companion ${path} failed (${String(response.status)}).`);
+      }
+      const body = (await response.json()) as { readonly data?: T };
+      if (body.data === undefined) {
+        throw new Error(`Companion ${path} returned no data.`);
+      }
+      return body.data;
+    },
+    [bridgeKey, port],
+  );
+
+  const loadTabSessions = useCallback(async (): Promise<void> => {
+    if (port.length === 0 || bridgeKey.length === 0) {
+      setTabSessionProjection(null);
+      setTabSessionInbox(EMPTY_TAB_SESSION_INBOX);
+      return;
+    }
+    setTabSessionLoading(true);
+    setTabSessionError(null);
+    try {
+      const [projection, inbox] = await Promise.all([
+        fetchCompanionJson<unknown>('/v1/tabsessions/projection'),
+        fetchCompanionJson<unknown>('/v1/tabsessions/inbox?limit=51&offset=0'),
+      ]);
+      if (!isTabSessionProjection(projection) || !isTabSessionInboxData(inbox)) {
+        throw new Error('Companion returned an invalid tab-session projection.');
+      }
+      setTabSessionProjection(projection);
+      setTabSessionInbox(inbox);
+    } catch (loadError) {
+      setTabSessionError(
+        loadError instanceof Error ? loadError.message : 'Could not load tab sessions.',
+      );
+    } finally {
+      setTabSessionLoading(false);
+    }
+  }, [bridgeKey, fetchCompanionJson, port]);
+
+  useEffect(() => {
+    if (state.companionStatus !== 'connected') return;
+    void loadTabSessions();
+  }, [loadTabSessions, state.companionStatus, state.updatedAt, viewMode]);
 
   useEffect(() => {
     void refresh()
@@ -1159,7 +1257,7 @@ const App = () => {
   // the All-Threads bucket containing a given thread. Each is mirrored
   // through a ref so the listener always reads the latest values
   // even though the registration runs only once.
-  const viewModeRef = useRef<'workstream' | 'all' | 'connections'>('workstream');
+  const viewModeRef = useRef<'workstream' | 'all' | 'inbox' | 'connections'>('workstream');
   const currentWsIdRef = useRef<string | null>(null);
   const expandBucketForThreadRef = useRef<((thread: TrackedThread) => Promise<void>) | null>(null);
   const activeTabTrackedThread = useMemo(
@@ -1471,7 +1569,7 @@ const App = () => {
 
   const attributeTabSessionToWorkstream = async (
     tabSessionId: string,
-    workstreamId: string,
+    workstreamId: string | null,
   ): Promise<WorkboardState> => {
     if (port.length === 0 || bridgeKey.length === 0) {
       throw new Error('Companion is not configured.');
@@ -1482,7 +1580,9 @@ const App = () => {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          'idempotency-key': `tabsession-${tabSessionId}-${workstreamId}-${String(Date.now())}`,
+          'idempotency-key': `tabsession-${tabSessionId}-${workstreamId ?? 'inbox'}-${String(
+            Date.now(),
+          )}`,
           'x-bac-bridge-key': bridgeKey,
         },
         body: JSON.stringify({ workstreamId }),
@@ -1491,7 +1591,12 @@ const App = () => {
     if (!response.ok) {
       throw new Error(`Tab-session attribution failed (${String(response.status)}).`);
     }
+    await loadTabSessions();
     return await sendRequest({ type: messageTypes.getWorkboardState });
+  };
+
+  const handleTabSessionAttribute = (tabSessionId: string, workstreamId: string | null) => {
+    void runAction(() => attributeTabSessionToWorkstream(tabSessionId, workstreamId));
   };
 
   const handleMoveTarget = (target: WorkstreamOption | { readonly create: string }) => {
@@ -2538,6 +2643,41 @@ const App = () => {
     currentWsId === null ? null : (state.workstreams.find((w) => w.bac_id === currentWsId) ?? null);
   const currentWsLabel =
     currentWs === null ? 'not set' : workstreamPath(currentWs.bac_id, state.workstreams);
+  const tabSessionWorkstreams = useMemo<readonly TabSessionWorkstreamOption[]>(
+    () => workstreamOptions.map((workstream) => ({ ...workstream })),
+    [workstreamOptions],
+  );
+  const tabSessionRecords = useMemo<readonly TabSessionRecord[]>(
+    () =>
+      tabSessionProjection === null
+        ? []
+        : Object.values(tabSessionProjection.bySessionId).sort((left, right) =>
+            left.lastActivityAt < right.lastActivityAt ? 1 : -1,
+          ),
+    [tabSessionProjection],
+  );
+  const focusedTabUrl = comparableTabUrl(
+    state.activeTabUrl ?? state.currentTab?.tabSnapshot?.url ?? state.currentTab?.threadUrl,
+  );
+  const focusedTabSession = useMemo(() => {
+    if (focusedTabUrl === null) return undefined;
+    return tabSessionRecords.find(
+      (record) => comparableTabUrl(record.latestUrl) === focusedTabUrl,
+    );
+  }, [focusedTabUrl, tabSessionRecords]);
+  const currentWorkstreamTabSessions = useMemo(
+    () =>
+      currentWsId === null
+        ? []
+        : tabSessionRecords
+            .filter(
+              (record) =>
+                record.closedAt === undefined &&
+                record.currentAttribution?.workstreamId === currentWsId,
+            )
+            .slice(0, 50),
+    [currentWsId, tabSessionRecords],
+  );
   const currentWsThreads = sortThreadsByLifecycle(
     currentWsId === null
       ? threads.filter((t) => t.primaryWorkstreamId === undefined)
@@ -3736,6 +3876,21 @@ const App = () => {
           <button
             type="button"
             role="tab"
+            aria-selected={viewMode === 'inbox'}
+            aria-label="Inbox"
+            className={'view-tab' + (viewMode === 'inbox' ? ' on' : '')}
+            onClick={() => {
+              setViewMode('inbox');
+            }}
+          >
+            Inbox
+            <span className="ct mono" aria-hidden>
+              {tabSessionInbox.total}
+            </span>
+          </button>
+          <button
+            type="button"
+            role="tab"
             aria-selected={viewMode === 'connections'}
             aria-label="Connections"
             className={'view-tab' + (viewMode === 'connections' ? ' on' : '')}
@@ -4138,10 +4293,20 @@ const App = () => {
         />
       ) : (
         <div className="ws-bar all-bar">
-          <span className="lbl">All threads</span>
+          <span className="lbl">
+            {viewMode === 'inbox' ? 'Inbox' : viewMode === 'connections' ? 'Connections' : 'All threads'}
+          </span>
           <span className="ws-status mono">{companionStatusLabel(state.companionStatus)}</span>
         </div>
       )}
+
+      <div className="tab-attribution-cue" data-testid="focused-tab-attribution">
+        <span className="mono">Tab is in:</span>
+        <AttributionBadge record={focusedTabSession} workstreams={tabSessionWorkstreams} />
+        {currentWsId !== focusedTabSession?.currentAttribution?.workstreamId ? (
+          <span className="tab-attribution-intent mono">Intent: {currentWsLabel}</span>
+        ) : null}
+      </div>
 
       {threadSearchOpen ? (
         <form
@@ -4452,7 +4617,40 @@ const App = () => {
               );
             })}
           </div>
+          {currentWsId !== null ? (
+            <>
+              <div className="sec-head">
+                <span>Tabs in this workstream</span>
+                <span className="count mono">{String(currentWorkstreamTabSessions.length)}</span>
+              </div>
+              {currentWorkstreamTabSessions.length === 0 ? (
+                <div className="thread-empty subtle">No open tab sessions here.</div>
+              ) : (
+                <div className="tab-session-list">
+                  {currentWorkstreamTabSessions.map((record) => (
+                    <InboxCard
+                      key={record.tabSessionId}
+                      record={record}
+                      workstreams={tabSessionWorkstreams}
+                      onAttribute={handleTabSessionAttribute}
+                    />
+                  ))}
+                </div>
+              )}
+            </>
+          ) : null}
         </>
+      ) : viewMode === 'inbox' ? (
+        <InboxView
+          inbox={tabSessionInbox}
+          loading={tabSessionLoading}
+          error={tabSessionError}
+          workstreams={tabSessionWorkstreams}
+          onRefresh={() => {
+            void loadTabSessions();
+          }}
+          onAttribute={handleTabSessionAttribute}
+        />
       ) : (
         <>
           <div className="sec-head">

@@ -20,6 +20,9 @@ export interface TabSessionRecord {
   readonly closedAt?: string;
   readonly tabIdHash?: string;
   readonly openerTabSessionId?: string;
+  readonly latestUrl?: string;
+  readonly latestTitle?: string;
+  readonly provider?: string;
   readonly currentAttribution?: TabSessionAttribution;
   readonly attributionHistory: readonly TabSessionAttribution[];
 }
@@ -75,6 +78,9 @@ const upsertObservedSession = (
     readonly transition: string;
     readonly tabIdHash?: string;
     readonly openerTabSessionId?: string;
+    readonly url?: string;
+    readonly title?: string;
+    readonly provider?: string;
   },
 ): void => {
   const existing = records.get(input.tabSessionId);
@@ -93,6 +99,9 @@ const upsertObservedSession = (
           ...(input.openerTabSessionId === undefined
             ? {}
             : { openerTabSessionId: input.openerTabSessionId }),
+          ...(input.url === undefined ? {} : { latestUrl: input.url }),
+          ...(input.title === undefined ? {} : { latestTitle: input.title }),
+          ...(input.provider === undefined ? {} : { provider: input.provider }),
           attributionHistory: [],
         }
       : {
@@ -112,6 +121,9 @@ const upsertObservedSession = (
           ...(input.openerTabSessionId === undefined
             ? {}
             : { openerTabSessionId: input.openerTabSessionId }),
+          ...(input.url === undefined ? {} : { latestUrl: input.url }),
+          ...(input.title === undefined ? {} : { latestTitle: input.title }),
+          ...(input.provider === undefined ? {} : { provider: input.provider }),
         };
   records.set(input.tabSessionId, next);
 
@@ -154,6 +166,9 @@ const upsertAttribution = (
     ...(existing?.openerTabSessionId === undefined
       ? {}
       : { openerTabSessionId: existing.openerTabSessionId }),
+    ...(existing?.latestUrl === undefined ? {} : { latestUrl: existing.latestUrl }),
+    ...(existing?.latestTitle === undefined ? {} : { latestTitle: existing.latestTitle }),
+    ...(existing?.provider === undefined ? {} : { provider: existing.provider }),
     ...(currentAttribution === undefined ? {} : { currentAttribution }),
     attributionHistory: history,
   });
@@ -179,6 +194,9 @@ export const projectTabSessions = (events: readonly AcceptedEvent[]): TabSession
         ...(payload.openerTabSessionId === undefined
           ? {}
           : { openerTabSessionId: payload.openerTabSessionId }),
+        url: payload.canonicalUrl ?? payload.url,
+        ...(payload.title === undefined ? {} : { title: payload.title }),
+        ...(payload.provider === undefined ? {} : { provider: payload.provider }),
       });
       continue;
     }
