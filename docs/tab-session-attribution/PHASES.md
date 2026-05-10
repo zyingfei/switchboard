@@ -291,6 +291,65 @@ These rules apply to every phase. The reviewer's blockers — they exist because
 
 ---
 
+## Phase 6 — T1 alignment with full tab-attribution product behavior
+
+**Branch:** `feat/tabsession-phase-6-t1-alignment` (off main).
+
+**Prerequisite:** Phase 5 merged. (Phases 1–5 + Phase 2 carryover all on main as of PR #132.)
+
+**Goal.** Bring T1 from a plumbing/replay/graph-materialization harness up to a full product-behavior harness across all five implemented phases. T1 currently validates `browser replay → extension observation → timeline projection → graph materialization`, plus a synthetic-attribution bridge added in Phase 2. It does NOT yet validate Inbox UX, real user manual attribution through the side panel, resolver suggestion quality, tab-group pull-in/pull-out, durable tab-group links, auto-apply event writing, or same-URL/different-tab-session correctness in the real reducer path.
+
+### PR-by-PR alignment baseline (record before changing T1)
+
+| PR | T1 alignment | Notes |
+|---|---|---|
+| #126 (Phase 1) | aligned | Phase 1 regression visible in replay; `tab-session:*` nodes appeared. |
+| #127 (Phase 2) | aligned via synthetic | T1 runs with `SIDETRACK_T1_SYNTHETIC_TAB_ATTRIBUTION=1` (record + replay) for an advisory GREEN. |
+| #128 (Phase 3) | not aligned | Inbox UX verified by component/unit + manual smoke only. |
+| #129 (Phase 4) | not aligned | Resolver verified by resolver/unit + route tests; T1 doesn't check suggestion quality. |
+| #131 (carryover) | partial | Storage concurrency + multi-session URL covered by unit tests, not the T1 replay path. |
+| #132 (Phase 5) | not aligned | Tab groups + auto-apply verified by unit tests; T1 doesn't exercise real-browser group events or auto-apply event writes. |
+
+### Worker prompt
+
+> Implement Phase 6 of `docs/tab-session-attribution/PHASES.md` on branch `feat/tabsession-phase-6-t1-alignment`. Read ground rules; do not deviate.
+>
+> 1. **Split T1 into four explicit modes** in `packages/sidetrack-extension/tests/e2e/record-replay-one-browser.manual.spec.ts` and `tests/e2e/helpers/recordReplay.ts`. Each mode is selected by an env knob and produces its own report layer in `report.md`/`report.json`. Modes can be composed (e.g. running A+B in one invocation) — keep the helper modular.
+>
+>    - **T1-A — Phase 1 identity replay.** Existing default behavior. Replay observation flow; assert timeline carries `tabSessionId`, Connections has `tab-session` nodes + `visit_in_tab_session` edges, and emits zero active-pointer-derived `visit_in_workstream` edges.
+>
+>    - **T1-B — explicit attribution replay.** **Rename** `SIDETRACK_T1_SYNTHETIC_TAB_ATTRIBUTION` → `SIDETRACK_T1_APPLY_EXPLICIT_ATTRIBUTION_FIXTURE` so the flag name reflects what it actually does (post a Class A `user.organized.item` `itemKind: 'tab-session'` per expected URL, NOT synthesize a fake source). Keep the legacy env name as a deprecation shim that maps to the new one and logs a warning. Assertion: `tab_session_in_workstream` + `visit_in_workstream` materialize through Phase 2's POST helper.
+>
+>    - **T1-C — real Inbox/manual UX replay.** New mode (env knob: `SIDETRACK_T1_INBOX_UX_REPLAY=1`). Drives the side panel via Playwright (the existing record-replay spec already opens the side panel context — reuse it). Steps: open ≥3 tab sessions (some attributed in the pack, some unattributed), open Inbox tab, assert N=unattributed cards visible, click "Yes" on one card to assign via the real UI flow (NOT the POST helper), leave another card unset, click "Not in any workstream" on a third (dismiss). Assertion: Connections updates `visit_in_workstream` only for the assigned card; the dismissed card emits `dismiss` source; the unassigned card stays unattributed. Also assert the focused-tab "Tab is in: <pill>" cue renders correctly when active workstream pointer ≠ focused-tab attribution. **Do not** use `SIDETRACK_T1_APPLY_EXPLICIT_ATTRIBUTION_FIXTURE` in this mode.
+>
+>    - **T1-D — resolver + tab-group replay.** New mode (env knob: `SIDETRACK_T1_RESOLVER_TABGROUP_REPLAY=1`). For resolver: invoke `GET /v1/tabsessions/{id}/resolve?dryRun=true` against the running companion, assert the response contains explainable candidates with `dominantSource`, and confirm the SuggestionBanner renders for at least one open session. Assert NO `InferredOpinions/AttributionSuggested` write occurred for the dry-run path. For tab groups: drive Chrome to create a group via the omnibox (or `chrome.tabs.group` from a dev-only test hook if omnibox driving is too brittle), then drag a tab in via `chrome.tabs.update({ groupId })`. Assert: `chrome.tabs.onUpdated(changeInfo.groupId)` fires, a `user.organized.item itemKind: 'tab-session', source: 'tab-group-pull-in'` is emitted, attribution materializes; then move the tab out (`groupId: -1`), assert pull-out is emitted and overrides the prior pull-in. For auto-apply: with policy mode = `balanced`, run a strong-causal fixture (chatgpt thread → its workstream); assert one `InferredOpinions/AttributionAutoApplied` lands and matches the expected workstream.
+>
+> 2. **Add the six structural replay cases** as parameterized fixtures (one fixture file each under `tests/e2e/fixtures/tabsession-cases/`):
+>    - `case-1-same-url-two-sessions.json`: same `canonicalUrl` observed under `tses_a` then `tses_b`; user attributes only `tses_a`. Assert `tses_b.currentAttribution` stays null and `visit_in_workstream` materializes only for `tses_a`'s visit-instance, not the URL aggregate.
+>    - `case-2-real-inbox-assignment.json`: drives T1-C above on a 3-session pack.
+>    - `case-3-resolver-dryrun-no-write.json`: invokes T1-D resolver flow; asserts dry-run is read-only.
+>    - `case-4-tabgroup-pull-in-out.json`: drives T1-D tab-group flow; asserts pull-in then pull-out yields null attribution.
+>    - `case-5-autoapply-policy-mode.json`: drives T1-D auto-apply at policy=balanced; asserts Class E event landed, AND a parallel run with auto-apply disabled (`SIDETRACK_T1_AUTO_APPLY_DISABLED=1`) emits no Class E events.
+>    - `case-6-active-pointer-not-truth.json`: replay with `activeWorkstreamId` set in storage but no explicit attribution; assert no `visit_in_workstream` edge materializes from the active pointer.
+>
+> 3. **Update the T1 acceptance contract.** Each PR landing on `main` from this point forward must declare which T1 mode(s) it exercises in the PR description. The default replay command (`npx playwright test record-replay-one-browser`) runs T1-A; CI smoke for the other modes is gated by env knobs to keep the default fast.
+>
+> 4. **Update the report layers in `report.md`/`report.json`.** New layer ordering: `page-replay → extension-observation → companion-projection → graph-materialization → product-behavior (T1-C/T1-D) → evaluation-expectations`. Document the layer in `tests/e2e/helpers/recordReplay.ts`.
+>
+> 5. **Type & test gates** + commit message `feat(tabsession): phase 6 — T1 modes A/B/C/D + six product-behavior replay cases` with co-author trailer.
+
+**Acceptance criteria.**
+
+- T1-A still passes for #126's regression (zero active-pointer `visit_in_workstream`; `tab-session` nodes present).
+- T1-B passes via the renamed `SIDETRACK_T1_APPLY_EXPLICIT_ATTRIBUTION_FIXTURE` flag (legacy name still works with a deprecation warning).
+- T1-C passes the three-card scenario (assigned / unassigned / dismissed) using the real side panel — no synthetic POST helper.
+- T1-D passes resolver dry-run (no writes), tab-group pull-in/pull-out (with pull-out overriding pull-in), and auto-apply at policy=balanced.
+- All six cases (`case-1` through `case-6`) pass; `case-1` specifically demonstrates same-URL multi-session correctness in the real reducer path (not just the unit test from PR #131).
+- `npx tsc --noEmit` clean both packages; vitest green both packages.
+- `report.md` shows the new product-behavior layer alongside the existing five.
+
+---
+
 ## Out-of-scope across all phases (Wave 1 explicit non-goals)
 
 - Backfill of legacy active-pointer attributions in production.
