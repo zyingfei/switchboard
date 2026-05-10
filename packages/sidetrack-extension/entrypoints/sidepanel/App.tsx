@@ -101,6 +101,16 @@ const TARGET_PROVIDER_LABEL: Record<string, string> = {
   other: 'Other',
 };
 
+const TAB_SESSION_DRAG_MIME = 'application/x-sidetrack-tab-session-id';
+
+const tabSessionIdFromDragEvent = (event: DragEvent<HTMLElement>): string | null => {
+  if (typeof event.dataTransfer.getData !== 'function') return null;
+  const explicit = event.dataTransfer.getData(TAB_SESSION_DRAG_MIME);
+  if (explicit.length > 0) return explicit;
+  const plain = event.dataTransfer.getData('text/plain');
+  return plain.startsWith('tses_') ? plain : null;
+};
+
 const sendRequestRaw = async (
   request: WorkboardRequest,
 ): Promise<Extract<RuntimeResponse, { ok: true }>> => {
@@ -380,6 +390,7 @@ const App = () => {
   const [selectedWorkstream, setSelectedWorkstream] = useState('');
   const [moveThreadId, setMoveThreadId] = useState<string | null>(null);
   const [draggingThreadId, setDraggingThreadId] = useState<string | null>(null);
+  const [draggingTabSessionId, setDraggingTabSessionId] = useState<string | null>(null);
   const [dropWorkstreamId, setDropWorkstreamId] = useState<string | null>(null);
   const [recoveryThreadId, setRecoveryThreadId] = useState<string | null>(null);
   // Bac_id of a dispatch the user clicked to inspect — used by the
@@ -718,7 +729,7 @@ const App = () => {
     setState(next);
     setBridgeKey(next.settings.companion.bridgeKey);
     setPort(String(next.settings.companion.port));
-    setError(next.lastError ?? (response.ok ? null : response.error ?? null));
+    setError(next.lastError ?? (response.ok ? null : (response.error ?? null)));
     if (next.vaultPath !== undefined) {
       setVaultPath(next.vaultPath);
     }
@@ -1458,6 +1469,31 @@ const App = () => {
     return next;
   };
 
+  const attributeTabSessionToWorkstream = async (
+    tabSessionId: string,
+    workstreamId: string,
+  ): Promise<WorkboardState> => {
+    if (port.length === 0 || bridgeKey.length === 0) {
+      throw new Error('Companion is not configured.');
+    }
+    const response = await fetch(
+      `http://127.0.0.1:${port}/v1/tabsessions/${encodeURIComponent(tabSessionId)}/attribute`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'idempotency-key': `tabsession-${tabSessionId}-${workstreamId}-${String(Date.now())}`,
+          'x-bac-bridge-key': bridgeKey,
+        },
+        body: JSON.stringify({ workstreamId }),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Tab-session attribution failed (${String(response.status)}).`);
+    }
+    return await sendRequest({ type: messageTypes.getWorkboardState });
+  };
+
   const handleMoveTarget = (target: WorkstreamOption | { readonly create: string }) => {
     const threadId = moveThreadId;
     if (threadId === null) {
@@ -1502,8 +1538,28 @@ const App = () => {
     void runAction(() => moveThreadToWorkstream(threadId, workstreamId));
   };
 
+  const handleWorkstreamDrop = (event: DragEvent<HTMLElement>, workstreamId: string) => {
+    if (draggingThreadId !== null) {
+      handleThreadDrop(workstreamId);
+      return;
+    }
+    const tabSessionId = draggingTabSessionId ?? tabSessionIdFromDragEvent(event);
+    setDropWorkstreamId(null);
+    setDraggingTabSessionId(null);
+    if (tabSessionId === null) {
+      return;
+    }
+    void runAction(() => attributeTabSessionToWorkstream(tabSessionId, workstreamId));
+  };
+
   const allowThreadDrop = (event: DragEvent<HTMLElement>, workstreamId: string) => {
-    if (draggingThreadId === null) {
+    const types = Array.from(event.dataTransfer.types ?? []);
+    if (
+      draggingThreadId === null &&
+      draggingTabSessionId === null &&
+      !types.includes(TAB_SESSION_DRAG_MIME) &&
+      !types.includes('text/plain')
+    ) {
       return;
     }
     event.preventDefault();
@@ -2346,11 +2402,7 @@ const App = () => {
     void runAction(() => sendRequest({ type: messageTypes.updateReviewDraft, threadId, ...patch }));
   };
 
-  const setReviewDraftSpanComment = (
-    threadId: string,
-    spanId: string,
-    comment: string,
-  ) => {
+  const setReviewDraftSpanComment = (threadId: string, spanId: string, comment: string) => {
     void runAction(() =>
       sendRequest({
         type: messageTypes.setReviewDraftSpanComment,
@@ -2942,9 +2994,7 @@ const App = () => {
                 e.stopPropagation();
                 void (async () => {
                   await openTabForThread(thread);
-                  await runAction(() =>
-                    sendRequest({ type: messageTypes.captureCurrentTab }),
-                  );
+                  await runAction(() => sendRequest({ type: messageTypes.captureCurrentTab }));
                 })();
               }}
             >
@@ -4200,7 +4250,7 @@ const App = () => {
             }}
             onDrop={(event) => {
               event.preventDefault();
-              handleThreadDrop(workstream.bac_id);
+              handleWorkstreamDrop(event, workstream.bac_id);
             }}
           >
             {workstream.title}
@@ -4309,9 +4359,7 @@ const App = () => {
               setWizardOpen(true);
             }}
             onRetryFailedCaptures={() => {
-              void runAction(async () =>
-                sendRequest({ type: messageTypes.retryFailedCaptures }),
-              );
+              void runAction(async () => sendRequest({ type: messageTypes.retryFailedCaptures }));
             }}
           />
         </div>
@@ -4335,13 +4383,11 @@ const App = () => {
                 kind: 'thread' as const,
                 label: t.title || t.threadUrl,
               })),
-            ...[...state.workstreams]
-              .slice(0, 3)
-              .map((w) => ({
-                id: `workstream:${w.bac_id}`,
-                kind: 'workstream' as const,
-                label: w.title || w.bac_id,
-              })),
+            ...[...state.workstreams].slice(0, 3).map((w) => ({
+              id: `workstream:${w.bac_id}`,
+              kind: 'workstream' as const,
+              label: w.title || w.bac_id,
+            })),
           ]}
         />
       ) : viewMode === 'workstream' ? (
@@ -5472,9 +5518,8 @@ const App = () => {
                   });
                   setCurrentWs(null);
                 },
-                threadCount: threads.filter(
-                  (t) => t.primaryWorkstreamId === currentWs.bac_id,
-                ).length,
+                threadCount: threads.filter((t) => t.primaryWorkstreamId === currentWs.bac_id)
+                  .length,
               })}
           linkedNotes={workstreamDetailLinkedNotes}
           trustEntries={workstreamDetailTrust}

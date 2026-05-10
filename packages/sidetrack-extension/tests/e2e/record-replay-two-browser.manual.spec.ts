@@ -287,7 +287,6 @@ test.describe('manual T1 Wave 2b two-browser relay record/replay', () => {
     const surfacesOnB = await waitForReplaySurfaces({
       companion: replayCompanionB,
       expectedCanonicalUrls: expectedUrls,
-      activeWorkstreamId,
       timeoutMs: 60_000,
     });
     if (activeWorkstreamId !== null) {
@@ -473,7 +472,6 @@ test.describe('manual T1 Wave 2b two-browser relay record/replay', () => {
     const surfacesOnB = await waitForReplaySurfaces({
       companion: replayCompanionB,
       expectedCanonicalUrls: expectedUrls,
-      activeWorkstreamId,
       timeoutMs: 60_000,
     });
 

@@ -607,7 +607,13 @@ const buildUserAssertedMaps = (
 
   for (const event of events) {
     if (event.type !== USER_ORGANIZED_ITEM || !isUserOrganizedItemPayload(event.payload)) continue;
-    if (event.payload.itemKind !== 'visit' || event.payload.toContainer === undefined) continue;
+    if (
+      event.payload.itemKind !== 'visit' ||
+      event.payload.toContainer === undefined ||
+      event.payload.toContainer === null
+    ) {
+      continue;
+    }
     const container = containerKindForOrganizedTarget(event.payload.toContainer, snapshot);
     if (container === null) continue;
     for (const visitId of organizedVisitIds(event.payload)) {

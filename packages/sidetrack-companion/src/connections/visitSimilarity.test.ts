@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { createEmptyTabSessionProjection } from '../tabsession/projection.js';
 import { buildConnectionsSnapshot } from './snapshot.js';
 import {
   buildVisitSimilarity,
@@ -270,6 +271,7 @@ describe('buildVisitSimilarity', () => {
           entryCount: entries.length,
         },
       ],
+      tabSessionProjection: createEmptyTabSessionProjection(),
       visitSimilarity: revision,
     });
     expect(snapshot.nodes.map((node) => node.id)).toContain(

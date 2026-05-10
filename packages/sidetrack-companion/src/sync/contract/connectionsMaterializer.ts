@@ -81,6 +81,7 @@ import { VISUAL_FINGERPRINT_OBSERVED } from '../../visual/events.js';
 import type { AcceptedEvent } from '../causal.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
+import { projectTabSessions } from '../../tabsession/projection.js';
 
 // Sync Contract v1 / Class B — Connections graph materializer.
 //
@@ -376,6 +377,7 @@ export const createConnectionsMaterializer = (
       events: merged,
       ...vault,
       timelineDays,
+      tabSessionProjection: projectTabSessions(merged),
       visitSimilarity,
       topicRevision,
       engagementClassRevision,

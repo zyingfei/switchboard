@@ -124,6 +124,7 @@ export interface TimelineItem {
   readonly url: string;
   readonly canonicalUrl?: string;
   readonly title?: string;
+  readonly tabSessionId?: string;
   readonly visitCount: number;
 }
 
@@ -1272,7 +1273,6 @@ export const readConnections = async (companion: TestCompanion): Promise<Connect
 export const waitForReplaySurfaces = async (input: {
   readonly companion: TestCompanion;
   readonly expectedCanonicalUrls: readonly string[];
-  readonly activeWorkstreamId: string | null;
   readonly timeoutMs?: number;
 }): Promise<{ readonly timeline: TimelineEnvelope; readonly connections: ConnectionsEnvelope }> => {
   const timeoutMs = input.timeoutMs ?? 60_000;
@@ -1284,11 +1284,7 @@ export const waitForReplaySurfaces = async (input: {
     lastConnections = await readConnections(input.companion);
     if (
       timelineHasCanonicals(lastTimeline, input.expectedCanonicalUrls) &&
-      connectionsHasCanonicals(
-        lastConnections,
-        input.expectedCanonicalUrls,
-        input.activeWorkstreamId,
-      )
+      connectionsHasCanonicals(lastConnections, input.expectedCanonicalUrls)
     ) {
       return { timeline: lastTimeline, connections: lastConnections };
     }
@@ -1462,19 +1458,6 @@ export const evaluateOneBrowserReplay = (input: {
   const graphMissingNodes = expectedCanonicals
     .map((url) => `timeline-visit:${url}`)
     .filter((nodeId) => !connectionNodeIds.includes(nodeId));
-  const activeWorkstreamId = firstBrowser(input.pack).activeWorkstreamId;
-  const graphMissingEdges =
-    activeWorkstreamId === null
-      ? []
-      : expectedCanonicals.filter(
-          (url) =>
-            !input.connections.data.snapshot.edges.some(
-              (edge) =>
-                edge.kind === 'visit_in_workstream' &&
-                edge.fromNodeId === `timeline-visit:${url}` &&
-                edge.toNodeId === `workstream:${activeWorkstreamId}`,
-            ),
-        );
   const expectedEdges = input.pack.expectations?.expectedEdges ?? [];
   const missingExpectedEdges = expectedEdges.filter(
     (expected) =>
@@ -1515,11 +1498,13 @@ export const evaluateOneBrowserReplay = (input: {
     ),
     layerReport(
       'graph-materialization',
-      graphMissingNodes.length === 0 && graphMissingEdges.length === 0,
+      graphMissingNodes.length === 0 && missingExpectedEdges.length === 0,
       `/v1/connections exposed ${String(connectionNodeIds.length)} node(s)`,
       [
         ...graphMissingNodes.map((nodeId) => `missing node ${nodeId}`),
-        ...graphMissingEdges.map((url) => `missing visit_in_workstream edge for ${url}`),
+        ...missingExpectedEdges.map(
+          (edge) => `missing expected edge ${edge.kind} ${edge.from} -> ${edge.to}`,
+        ),
       ],
     ),
     layerReport(
@@ -2383,19 +2368,9 @@ const timelineHasCanonicals = (timeline: TimelineEnvelope, expected: readonly st
 const connectionsHasCanonicals = (
   connections: ConnectionsEnvelope,
   expected: readonly string[],
-  activeWorkstreamId: string | null,
 ): boolean => {
   const nodeIds = new Set(connections.data.snapshot.nodes.map((node) => node.id));
-  if (!expected.every((url) => nodeIds.has(`timeline-visit:${url}`))) return false;
-  if (activeWorkstreamId === null) return true;
-  return expected.every((url) =>
-    connections.data.snapshot.edges.some(
-      (edge) =>
-        edge.kind === 'visit_in_workstream' &&
-        edge.fromNodeId === `timeline-visit:${url}` &&
-        edge.toNodeId === `workstream:${activeWorkstreamId}`,
-    ),
-  );
+  return expected.every((url) => nodeIds.has(`timeline-visit:${url}`));
 };
 
 const sameStringSet = (left: readonly string[], right: readonly string[]): boolean => {
@@ -2444,12 +2419,14 @@ const parseTimelineItem = (value: unknown): TimelineItem => {
   const url = readString(record, 'url');
   const canonicalUrl = optionalString(record, 'canonicalUrl');
   const title = optionalString(record, 'title');
+  const tabSessionId = optionalString(record, 'tabSessionId');
   const visitCount = typeof record['visitCount'] === 'number' ? record['visitCount'] : 0;
   return {
     id,
     url,
     ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
     ...(title === undefined ? {} : { title }),
+    ...(tabSessionId === undefined ? {} : { tabSessionId }),
     visitCount,
   };
 };
