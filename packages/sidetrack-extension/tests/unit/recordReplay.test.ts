@@ -10,6 +10,7 @@ import {
   assertNoDisallowedStorageValues,
   assertPackPrivacy,
   classifyDetour,
+  computeReplayDelays,
   createSessionPackFromManualRecorder,
   createRunId,
   createSessionId,
@@ -735,6 +736,33 @@ describe('T1 record/replay session pack helpers', () => {
 
     const offMarkdown = renderReplayMarkdown(offReport);
     expect(offMarkdown).not.toContain('## Strict offline replay');
+  });
+
+  it('computeReplayDelays caps idle gaps and applies the speed multiplier', () => {
+    // Recorded events: a 17-second idle gap up front, then quick navs.
+    const events = [
+      { atMs: 0 },
+      { atMs: 17_000 },
+      { atMs: 17_500 },
+      { atMs: 19_000 },
+      { atMs: 90_000 },
+    ];
+
+    // Default — gaps capped at 1500ms.
+    const defaultDelays = computeReplayDelays(events);
+    expect(defaultDelays).toEqual([0, 1500, 2000, 3500, 5000]);
+
+    // Raw timing preserved when maxIdleGapMs is Infinity.
+    const rawDelays = computeReplayDelays(events, { maxIdleGapMs: Number.POSITIVE_INFINITY });
+    expect(rawDelays).toEqual([0, 17_000, 17_500, 19_000, 90_000]);
+
+    // Speed multiplier scales every gap (after capping). speed=2 halves.
+    const fastDelays = computeReplayDelays(events, { speed: 2 });
+    expect(fastDelays).toEqual([0, 750, 1000, 1750, 2500]);
+
+    // Tight cap + slow speed.
+    const tightSlow = computeReplayDelays(events, { maxIdleGapMs: 500, speed: 0.5 });
+    expect(tightSlow).toEqual([0, 1000, 2000, 3000, 4000]);
   });
 
   it('routeKeyFor normalizes trailing slashes so /pulls and /pulls/ match', () => {

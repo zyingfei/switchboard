@@ -941,10 +941,61 @@ const installRouteStubs = async (
   };
 };
 
+export interface ReplayTimingOptions {
+  // Multiplier applied to recorded `atMs` deltas. 1 = real-time;
+  // 0.5 = twice as fast; 2 = half as fast. Default: 1.
+  readonly speed?: number;
+  // Hard cap on the gap between two consecutive events in replay.
+  // Recorded gaps larger than this are compressed to this value.
+  // Defaults to 1500ms — long enough for the extension's drain
+  // tick to settle, short enough that MV3 service workers don't
+  // recycle between events. Set to Infinity to preserve raw timing.
+  readonly maxIdleGapMs?: number;
+}
+
+const resolveReplayTimingFromEnv = (
+  env: NodeJS.ProcessEnv = process.env,
+): ReplayTimingOptions => {
+  const speedRaw = env['SIDETRACK_REPLAY_SPEED'];
+  const idleRaw = env['SIDETRACK_REPLAY_MAX_IDLE_MS'];
+  const speed =
+    speedRaw === undefined || speedRaw.length === 0 ? undefined : Number.parseFloat(speedRaw);
+  const maxIdleGapMs =
+    idleRaw === undefined || idleRaw.length === 0 ? undefined : Number.parseFloat(idleRaw);
+  return {
+    ...(speed !== undefined && Number.isFinite(speed) && speed > 0 ? { speed } : {}),
+    ...(maxIdleGapMs !== undefined && Number.isFinite(maxIdleGapMs) && maxIdleGapMs >= 0
+      ? { maxIdleGapMs }
+      : {}),
+  };
+};
+
+export const computeReplayDelays = (
+  events: readonly { readonly atMs: number }[],
+  options: ReplayTimingOptions = {},
+): readonly number[] => {
+  const speed = options.speed === undefined || options.speed <= 0 ? 1 : options.speed;
+  const maxIdleGapMs = options.maxIdleGapMs ?? 1500;
+  const sorted = [...events].sort((left, right) => left.atMs - right.atMs);
+  const delays: number[] = [];
+  let previousAtMs = sorted.length > 0 ? sorted[0].atMs : 0;
+  let cumulative = 0;
+  for (const event of sorted) {
+    const recordedGap = Math.max(0, event.atMs - previousAtMs);
+    const cappedGap = Math.min(recordedGap, maxIdleGapMs);
+    const scaledGap = cappedGap / speed;
+    cumulative += scaledGap;
+    delays.push(cumulative);
+    previousAtMs = event.atMs;
+  }
+  return delays;
+};
+
 export const driveReplayFromPack = async (input: {
   readonly runtime: ExtensionRuntime;
   readonly senderPage: Page;
   readonly pack: SessionPack;
+  readonly timing?: ReplayTimingOptions;
 }): Promise<PageReplayResult> => {
   return await driveReplayBrowserFromPack({ ...input, label: firstBrowser(input.pack).label });
 };
@@ -954,6 +1005,7 @@ export const driveReplayBrowserFromPack = async (input: {
   readonly senderPage: Page;
   readonly pack: SessionPack;
   readonly label: BrowserLabel;
+  readonly timing?: ReplayTimingOptions;
 }): Promise<PageReplayResult> => {
   const browser = browserByLabel(input.pack, input.label);
   if (browser.activeWorkstreamId !== null) {
@@ -971,9 +1023,13 @@ export const driveReplayBrowserFromPack = async (input: {
   const pages = new Map<string, Page>();
   const succeeded: string[] = [];
   const failures: { canonicalUrl: string; reason: string }[] = [];
+  const sortedEvents = [...browser.events].sort((a, b) => a.atMs - b.atMs);
+  const timing = input.timing ?? resolveReplayTimingFromEnv();
+  const delays = computeReplayDelays(sortedEvents, timing);
   const startedAtMs = Date.now();
-  for (const event of [...browser.events].sort((a, b) => a.atMs - b.atMs)) {
-    const delayMs = Math.max(0, event.atMs - (Date.now() - startedAtMs));
+  for (const [index, event] of sortedEvents.entries()) {
+    const targetMs = delays[index] ?? 0;
+    const delayMs = Math.max(0, targetMs - (Date.now() - startedAtMs));
     if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
     if (event.kind === 'workstreamSwitch') {
       await input.runtime.seedStorage(input.senderPage, {
@@ -1032,12 +1088,15 @@ export const driveTwoBrowserReplayFromPack = async (input: {
   readonly runtimeB: ExtensionRuntime;
   readonly senderPageB: Page;
   readonly pack: SessionPack;
+  readonly timing?: ReplayTimingOptions;
 }): Promise<PageReplayResult> => {
+  const timing = input.timing ?? resolveReplayTimingFromEnv();
   const replayA = await driveReplayBrowserFromPack({
     runtime: input.runtimeA,
     senderPage: input.senderPageA,
     pack: input.pack,
     label: 'A',
+    timing,
   });
   const replayB = input.pack.browsers.some((browser) => browser.label === 'B')
     ? await driveReplayBrowserFromPack({
@@ -1045,6 +1104,7 @@ export const driveTwoBrowserReplayFromPack = async (input: {
         senderPage: input.senderPageB,
         pack: input.pack,
         label: 'B',
+        timing,
       })
     : { succeededCanonicalUrls: [], failures: [] };
   return {

@@ -15,7 +15,7 @@ const CAPTURE_LEVELS = new Set(['minimal', 'html', 'html+paste']);
 
 const usage = `Usage:
   sidetrack-test record [--browsers 1|2] [--capture-level minimal|html|html+paste] [--strict-offline]
-  sidetrack-test replay <pack> [--hold] [--report-dir <path>] [--strict-offline]
+  sidetrack-test replay <pack> [--hold] [--report-dir <path>] [--strict-offline] [--speed N] [--max-idle-ms N]
   sidetrack-test report <run>
   sidetrack-test list
   sidetrack-test inspect <pack>
@@ -23,7 +23,12 @@ const usage = `Usage:
 Flags:
   --strict-offline   Block any HTTP request that does not match a recorded
                      navigation; report counts the aborted requests. Equivalent
-                     to setting SIDETRACK_REPLAY_STRICT_OFFLINE=1.
+                     to SIDETRACK_REPLAY_STRICT_OFFLINE=1.
+  --speed N          Replay-timing multiplier (1 = real-time; 2 = 2x faster).
+                     Equivalent to SIDETRACK_REPLAY_SPEED=N.
+  --max-idle-ms N    Cap the gap between consecutive replay events. Default
+                     1500ms. Use a large value (or "Infinity") to keep raw
+                     timing. Equivalent to SIDETRACK_REPLAY_MAX_IDLE_MS=N.
 `;
 
 const fail = (message, code = 1) => {
@@ -156,6 +161,8 @@ const selectedEnv = (env) => {
     'SIDETRACK_REPLAY_HOLD',
     'SIDETRACK_REPLAY_REPORT_DIR',
     'SIDETRACK_REPLAY_STRICT_OFFLINE',
+    'SIDETRACK_REPLAY_SPEED',
+    'SIDETRACK_REPLAY_MAX_IDLE_MS',
     'SIDETRACK_E2E_MANUAL',
   ];
   return Object.fromEntries(
@@ -269,6 +276,20 @@ const commandReplay = async (args) => {
       : assertInsideSessions(reportDirRaw, sessionsDir, 'report directory');
   const strictOffline =
     options.has('strict-offline') || process.env.SIDETRACK_REPLAY_STRICT_OFFLINE === '1';
+  const speed = options.get('speed') ?? process.env.SIDETRACK_REPLAY_SPEED;
+  if (speed !== undefined) {
+    const parsed = Number.parseFloat(speed);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      throw new Error('--speed must be a positive number (e.g. 1, 0.5, 2).');
+    }
+  }
+  const maxIdle = options.get('max-idle-ms') ?? process.env.SIDETRACK_REPLAY_MAX_IDLE_MS;
+  if (maxIdle !== undefined && maxIdle !== 'Infinity') {
+    const parsed = Number.parseFloat(maxIdle);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      throw new Error('--max-idle-ms must be a non-negative number or "Infinity".');
+    }
+  }
   const env = {
     ...process.env,
     SIDETRACK_E2E_MANUAL: '1',
@@ -279,6 +300,8 @@ const commandReplay = async (args) => {
     ...(options.has('hold') ? { SIDETRACK_REPLAY_HOLD: '1' } : {}),
     ...(reportDir === undefined ? {} : { SIDETRACK_REPLAY_REPORT_DIR: reportDir }),
     ...(strictOffline ? { SIDETRACK_REPLAY_STRICT_OFFLINE: '1' } : {}),
+    ...(speed === undefined ? {} : { SIDETRACK_REPLAY_SPEED: speed }),
+    ...(maxIdle === undefined ? {} : { SIDETRACK_REPLAY_MAX_IDLE_MS: maxIdle }),
   };
   return await spawnPlaywright(
     pack.mode.browsers === 1 ? ONE_BROWSER_SPEC : TWO_BROWSER_SPEC,
