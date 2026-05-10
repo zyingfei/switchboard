@@ -350,6 +350,224 @@ These rules apply to every phase. The reviewer's blockers — they exist because
 
 ---
 
+## Phase 7 — T1-F full recent-feature product e2e
+
+**Branch:** `feat/tabsession-phase-7-t1-full-product-e2e` (off main).
+
+**Prerequisite:** Phase 6 merged. (PR #134 on main as of `c5a9672c`.)
+
+**Goal.** A single browser-user story that proves the entire tab-session attribution stack works locally, across relay, through UI, through resolver/ML evidence, through tab groups, through Class A/Class E event paths, and back into Connections. Relay is **one sub-check**, not the whole test. T1-F validates *product behavior*, not just plumbing.
+
+### T1 mode taxonomy (post Phase 7)
+
+| Mode | Scope |
+|---|---|
+| T1-A / T1-B / T1-C / T1-D | Local tab-session product behavior (Phase 6) |
+| T1-R | Relay sync only (the existing two-browser baseline) |
+| **T1-F** | Full recent-feature product e2e — Phase 7 |
+| L5 | Broad cross-feature realism beyond tab-session attribution |
+
+### Paths the test must exercise
+
+| Path | Must prove |
+|---|---|
+| Class F observation | `browser.timeline.observed` carries `tabSessionId`; active pointer is not graph truth. |
+| Class B projections | timeline + tab-session projection + Connections snapshot rebuild deterministically. |
+| Class A assertions | `user.organized.item itemKind='tab-session'` moves/dismisses sessions. |
+| Class E inference | `tabsession.attribution.inferred` writes only through POST `dryRun:false`. |
+| Resolver dry-run | `GET /resolve?dryRun=true` gives candidates/reasons and writes nothing. |
+| ML evidence | PPR/causal, similarity, inherited, target-local cluster evidence where available. |
+| Negative feedback | pull-out / reject affects projection and future resolver behavior. |
+| UI | Inbox, badge, provenance, focused-tab cue, per-workstream tabs, suggestion banner. |
+| Chrome tab groups | `tabs.onUpdated(changeInfo.groupId)` membership; no raw Chrome group id as canonical synced state. |
+| Relay | A-origin observations reach B; B assertions/inferences reach A. |
+| Redaction | existing HTML/session-pack privacy path remains green. |
+| Same-URL sessions | attribution is visit-instance/session-scoped, not URL-scoped. |
+
+### Worker prompt
+
+> Implement T1-F — Full recent-feature product e2e for Tab-Session Attribution v1 on branch `feat/tabsession-phase-7-t1-full-product-e2e`. Read the architectural ground rules at the top of this doc; do not deviate.
+>
+> Goal: prove the full recent-feature chain end-to-end — Phase 1 `tabSessionId`, Phase 2 projection/user attribution, Phase 3 Inbox UX, Phase 4 resolver dry-run, Phase 5 tab groups + auto-apply, Phase 6 T1 product modes, the carryover fixes, relay sync, and graph/UI agreement.
+>
+> Phase 6 (PR #134) shipped local T1 modes A/B/C/D and six fixture cases. This phase adds **one comprehensive product e2e** that uses the real browser, side panel, companion, Connections, resolver, tab groups, relay, and report layer — not a parallel event architecture.
+>
+> Use existing event paths (do **not** create new buses):
+> - Observed facts: `browser.timeline.observed`, existing timeline/navigation projections.
+> - User assertions: `user.organized.item itemKind='tab-session'`, `user.flow.rejected`.
+> - Inferred opinions: `tabsession.attribution.inferred` (Class E).
+>
+> Existing routes (do **not** add new ones unless the prompt explicitly authorizes):
+> - `GET  /v1/tabsessions/projection`
+> - `GET  /v1/tabsessions/inbox`
+> - `POST /v1/tabsessions/{id}/attribute`
+> - `GET  /v1/tabsessions/{id}/resolve?dryRun=true`
+> - `POST /v1/tabsessions/{id}/resolve` with `{ dryRun:false, policyMode }`
+> - `GET  /v1/connections`
+> - `GET  /v1/feedback/projection` if needed
+>
+> Files to modify (preferred):
+> - Extract reusable product-behavior helpers from `packages/sidetrack-extension/tests/e2e/record-replay-one-browser.manual.spec.ts` into `packages/sidetrack-extension/tests/e2e/helpers/tabsessionProductBehavior.ts`.
+> - Extend `packages/sidetrack-extension/tests/e2e/record-replay-two-browser.manual.spec.ts`.
+> - Extend `packages/sidetrack-extension/tests/e2e/helpers/recordReplay.ts`.
+> - Add fixtures only if needed: `packages/sidetrack-extension/tests/e2e/fixtures/tabsession-full-product/*.json`.
+>
+> Env knob: `SIDETRACK_T1_FULL_PRODUCT_E2E=1`. Default Mode A and the existing two-browser replay must remain unchanged when this var is absent.
+>
+> #### Required story
+>
+> Browser A and Browser B run with two companions over a real relay. Two workstreams created up front: `ws_switchboard` ("Switchboard") and `ws_security` ("Security").
+>
+> **Browser A:**
+> 1. Enable timeline observation through the existing test setup path.
+> 2. Set `activeWorkstreamId` to Switchboard.
+> 3. Open ≥6 tabs/pages through real `chrome.tabs` navigation + route stubs:
+>    - same canonical URL twice in two different tab sessions
+>    - one source/research page
+>    - one GitHub/project-like page
+>    - one Google/search-like page
+>    - one AI-chat-shaped page
+>    - one unrelated/ambient page
+> 4. Include ≥1 opener or same-tab causal chain.
+> 5. Include ≥1 AI-chat-shaped anchor that can later be assigned to a workstream.
+> 6. Force-drain the timeline.
+>
+> **Browser B:**
+> 7. Wait for Browser A observations to relay to Companion B.
+> 8. Open the side panel.
+> 9. Open Inbox.
+> 10. Assign one relayed A-origin tab session to Switchboard through real UI if possible. Fallback only if UI lookup is impossible: call `POST /v1/tabsessions/{id}/attribute`. Report fallback usage in `details`.
+> 11. Dismiss a second session as "Not in any workstream".
+> 12. Leave a third session unset.
+> 13. Verify the focused-tab cue uses `activeTabSessionId` before any URL fallback.
+> 14. Verify non-AI browsing pages are NOT in All Threads.
+> 15. Verify the workstream view shows "Tabs in this workstream".
+>
+> **Resolver / ML:**
+> 16. `GET /v1/tabsessions/{target}/resolve?dryRun=true` on a target with causal/similarity evidence.
+> 17. Assert dry-run: returns `fusedCandidates`; top candidate is the expected workstream; `reasons`/provenance present; `dominantSource !== 'none'`; **writes no `tabsession.attribution.inferred`**; `dependencyKey`/`evidenceHash` stable across two calls when `graphRevision` is unchanged.
+> 18. ≥1 case proves causal/PPR evidence beats similarity-only when causal evidence exists.
+> 19. Target-local cluster evidence is either exercised through fixture topic edges OR explicitly asserted absent when the target has no `visit_in_topic`. Global topic popularity must NOT influence resolver output.
+>
+> **Auto-apply:**
+> 20. `POST /v1/tabsessions/{target}/resolve` with `{ dryRun:false, policyMode:"balanced" }` on a target with strong evidence.
+> 21. Assert: `status` is `applied`; `accepted.type` is `tabsession.attribution.inferred`; payload includes `modelRevision`, `graphRevision`, `evidenceHash`, `resolverDependencyKey`, `reasonSummary`; `currentAttribution.source` is `inferred`.
+> 22. Relay to the other companion.
+> 23. Emit a Class A user move/dismiss for the same session.
+> 24. Assert on both replicas: `user_asserted` overrides inferred; inferred remains in `attributionHistory` but not `currentAttribution`.
+>
+> **Chrome tab group:**
+> 25. On Browser B, drive the real Chrome tab-group path. A runtime test hook is acceptable only if it uses real `chrome.tabs.group` / `chrome.tabs.ungroup` underneath.
+> 26. Link a group to Switchboard.
+> 27. Pull a tab into the group.
+> 28. Pull it out.
+> 29. Assert on B and (after relay) on A: `attributionHistory` includes `tab-group-pull-in` then `tab-group-pull-out`; `currentAttribution.workstreamId === null` after pull-out; a `user.flow.rejected` exists for the prior workstream; resolver dry-run after pull-out does NOT auto-apply the rejected workstream; **no raw Chrome `groupId` persisted as canonical synced identity**.
+>
+> **Same-URL / visit-instance:**
+> 30. Use the two same-canonical-URL sessions from Browser A.
+> 31. Attribute only one session.
+> 32. Assert on A and B: both `tabSessionId`s exist; both visit-instance nodes exist; only the attributed visit instance has `visit_instance_in_workstream`; **no URL-scoped `visit_in_workstream` edge exists**; `timeline-visit:<url>` does not carry workstream truth; subgraph around the unassigned session does not imply membership in the attributed workstream.
+>
+> **Active pointer:**
+> 33. With `activeWorkstreamId` set, open an unrelated non-AI page.
+> 34. Assert: tab session appears; **no `visit_instance_in_workstream`**; **no `visit_in_workstream`**; active pointer is intent/default only, never graph truth.
+>
+> **Relay:**
+> 35. A-origin Class F observations visible on B.
+> 36. B-origin Class A user assertions visible on A.
+> 37. Class E inferred attribution relays or is materialized per existing registry policy.
+> 38. Both companions converge to the same effective tab-session projection for tested sessions.
+> 39. Both companions converge to the same relevant Connections edges.
+>
+> **Redaction / privacy:**
+> 40. Preserve the existing two-browser HTML redaction checks: fake email redacted; fake OpenAI key redacted; raw secret values absent from pack; raw secret values absent from fulfilled replay body.
+> 41. Preserve strict-offline route behavior.
+
+### Required report caseIds
+
+`report.md`/`report.json` gain a first-class **T1-F Full Product E2E** section. Each check carries `{ caseId, status, summary, details }`. The test does NOT pass unless every required `caseId` is `pass`:
+
+- `full-observed-A-to-B`
+- `full-inbox-user-assertion-B-to-A`
+- `full-same-url-visit-instance-no-leak`
+- `full-resolver-dryrun-no-write`
+- `full-ppr-causal-beats-similarity`
+- `full-cluster-target-local-or-absent`
+- `full-autoapply-ClassE`
+- `full-user-assertion-overrides-inferred`
+- `full-tabgroup-pull-in-out`
+- `full-active-pointer-not-truth`
+- `full-focused-tab-cue-uses-session-id`
+- `full-non-ai-not-all-threads`
+- `full-redaction-regression`
+- `full-graph-determinism`
+
+### Implementation constraints (negative list)
+
+- Do NOT use `/v1/timeline/events` direct seeding.
+- Do NOT use work-graph eval fixture seeding for the browser story.
+- Do NOT bypass the side-panel UI for Inbox / manual UX unless the UI element cannot be found; if fallback is used, report it in `details`.
+- Do NOT use `chrome.tabs.onAttached` / `onDetached` for group membership.
+- Do NOT reintroduce `activeWorkstreamId` stamping.
+- Do NOT persist raw Chrome `groupId` as canonical synced state.
+- Do NOT allow resolver dry-run to append Class E.
+- Do NOT allow inferred attribution to override Class A.
+- Do NOT rely on URL-level nodes for attribution.
+- Do NOT require HDBSCAN; cluster evidence must be optional and target-local.
+- Use existing 1-minute drain / event-buffer behavior; do NOT add 30-second alarms or per-tab keepalive ports.
+
+### Validation commands
+
+```bash
+cd packages/sidetrack-companion
+npm run typecheck
+npm run test -- \
+  src/tabsession/resolver.test.ts \
+  src/tabsession/projection.test.ts \
+  src/http/tabsessionRoutes.test.ts \
+  src/connections/snapshot.test.ts
+
+cd ../sidetrack-extension
+npm run typecheck
+npm run test -- \
+  tests/unit/tabsession/InboxCard.test.tsx \
+  tests/unit/tabsession/boundary.test.ts \
+  tests/unit/tabgroups/wiring.test.ts \
+  tests/unit/app.test.tsx
+
+SIDETRACK_CAPTURE_LEVEL=html \
+SIDETRACK_REPLAY_STRICT_OFFLINE=1 \
+SIDETRACK_T1_FULL_PRODUCT_E2E=1 \
+npx playwright test tests/e2e/record-replay-two-browser.manual.spec.ts \
+  --headed --timeout 0 --grep manual
+
+# Replay-from-pack must also pass:
+SIDETRACK_REPLAY_PACK=<pack-from-first-run>/pack.json \
+SIDETRACK_REPLAY_STRICT_OFFLINE=1 \
+SIDETRACK_T1_FULL_PRODUCT_E2E=1 \
+npx playwright test tests/e2e/record-replay-two-browser.manual.spec.ts \
+  --headed --timeout 0 --grep manual
+```
+
+### Acceptance criteria
+
+- `report.status === 'pass'`.
+- `report` includes a **T1-F Full Product E2E** section.
+- Every required `caseId` listed above is `pass`.
+- Browser B Connections shows Browser A relayed sessions.
+- Browser A sees Browser B user assertions and inferred events after relay.
+- Same-URL sessions remain isolated by visit-instance identity.
+- `activeWorkstreamId` never produces attribution truth.
+- Dry-run resolver writes nothing.
+- Auto-apply writes Class E only through POST `dryRun:false`.
+- Class A overrides Class E.
+- Chrome tab-group pull-in/out produces correct attribution + rejection history.
+- Non-AI tabs stay out of All Threads.
+- Focused-tab cue uses `activeTabSessionId`.
+- Redaction and strict-offline replay remain green.
+
+---
+
 ## Out-of-scope across all phases (Wave 1 explicit non-goals)
 
 - Backfill of legacy active-pointer attributions in production.
