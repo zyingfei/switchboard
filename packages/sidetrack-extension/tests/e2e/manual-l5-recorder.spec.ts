@@ -345,6 +345,18 @@ const createLaunchpad = async (
     small { display: block; color: #555; margin-top: 2px; }
     code { background: #f4f4f4; padding: 2px 5px; border-radius: 4px; }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; }
+    #lp-status {
+      margin-top: 12px;
+      padding: 8px 12px;
+      background: #fff8c5;
+      border: 1px solid #d4a72c;
+      border-radius: 4px;
+      font-family: ui-monospace, monospace;
+      font-size: 13px;
+      display: none;
+    }
+    #lp-status.lp-ok { background: #dafbe1; border-color: #1a7f37; }
+    #lp-status.lp-fail { background: #ffebe9; border-color: #cf222e; }
   </style>
 </head>
 <body>
@@ -352,6 +364,7 @@ const createLaunchpad = async (
     <h1>Sidetrack L5 manual recorder</h1>
     <span>Artifacts are written locally under <code>${artifactsDir}</code>.</span>
   </header>
+  <div id="lp-status"></div>
   <h2>Before clicking links</h2>
   <ol>
     <li>Use the Sidetrack panel tab for Browser A to keep the active workstream aligned.</li>
@@ -375,21 +388,39 @@ const createLaunchpad = async (
     // leaves the new tab spinning on about:blank because the popup
     // inherits the file:// opener and cross-origin navigation gets blocked.
     // Programmatic window.open() with opener detached sidesteps the issue.
+    const status = document.getElementById('lp-status');
+    const setStatus = (msg, kind) => {
+      if (!status) return;
+      status.textContent = '[launchpad] ' + msg;
+      status.className = kind ? 'lp-' + kind : '';
+      status.style.display = 'block';
+    };
+    setStatus('inline script ready; click any link to test handler', 'ok');
     document.addEventListener('click', (event) => {
       if (event.defaultPrevented || event.button !== 0) return;
       if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
       const target = event.target instanceof Element
         ? event.target.closest('a[data-open-live-link]')
         : null;
-      if (!(target instanceof HTMLAnchorElement)) return;
+      if (!(target instanceof HTMLAnchorElement)) {
+        setStatus('click ignored (target=' + (event.target instanceof Element ? event.target.tagName : 'non-element') + ')');
+        return;
+      }
       event.preventDefault();
+      setStatus('opening: ' + target.href);
       const opened = window.open(target.href, '_blank');
       if (opened === null) {
+        setStatus('window.open returned null; falling back to in-place navigation', 'fail');
         window.location.href = target.href;
         return;
       }
-      opened.opener = null;
+      try {
+        opened.opener = null;
+      } catch (e) {
+        setStatus('opener detach threw: ' + (e instanceof Error ? e.message : String(e)), 'fail');
+      }
       opened.focus();
+      setStatus('opened new tab for ' + target.href, 'ok');
     });
   </script>
 </body>
