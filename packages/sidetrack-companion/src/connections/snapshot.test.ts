@@ -1311,6 +1311,92 @@ describe('connections — content-derived edges', () => {
     expect(tabNode?.metadata['provider']).toBe('chatgpt');
   });
 
+  it('URL attribution drives visit_instance_in_workstream edges (URL beats tab-session)', () => {
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: [
+        {
+          id: 'https://example.test/article',
+          firstSeenAt: '2026-05-07T10:00:00.000Z',
+          lastSeenAt: '2026-05-07T10:00:30.000Z',
+          url: 'https://example.test/article',
+          canonicalUrl: 'https://example.test/article',
+          visitCount: 1,
+          tabSessionId: 'tses_a',
+        },
+      ],
+      updatedAt: '2026-05-07T10:00:30.000Z',
+      entryCount: 1,
+    };
+    // The tab session is attributed to ws_tabFallback. The URL is
+    // attributed to ws_urlPrimary. URL wins.
+    const tabSessionProjection: TabSessionProjection = {
+      schemaVersion: TAB_SESSION_PROJECTION_SCHEMA_VERSION,
+      bySessionId: new Map([
+        [
+          'tses_a',
+          {
+            tabSessionId: 'tses_a',
+            openedAt: '2026-05-07T09:55:00.000Z',
+            lastActivityAt: '2026-05-07T10:00:30.000Z',
+            currentAttribution: {
+              workstreamId: 'ws_tabFallback',
+              source: 'user_asserted',
+              observedAt: '2026-05-07T10:01:00.000Z',
+              clientEventId: 'evt-1',
+              replicaId: 'r1',
+              seq: 1,
+            },
+            attributionHistory: [],
+          },
+        ],
+      ]),
+      openSessionsByTabId: new Map(),
+    };
+    const urlProjection = {
+      schemaVersion: 1 as const,
+      byCanonicalUrl: new Map([
+        [
+          'https://example.test/article',
+          {
+            canonicalUrl: 'https://example.test/article',
+            firstSeenAt: '2026-05-07T10:00:00.000Z',
+            lastSeenAt: '2026-05-07T10:00:30.000Z',
+            visitCount: 1,
+            tabSessionIds: ['tses_a'],
+            attributionHistory: [],
+            currentAttribution: {
+              workstreamId: 'ws_urlPrimary',
+              source: 'user_asserted' as const,
+              observedAt: '2026-05-07T10:02:00.000Z',
+              clientEventId: 'evt-url-1',
+              replicaId: 'r1',
+              seq: 2,
+            },
+          },
+        ],
+      ]),
+    };
+    const snap = buildConnectionsSnapshot(
+      emptyInput({ timelineDays: [day], tabSessionProjection, urlProjection }),
+    );
+    const visitInstanceEdge = snap.edges.find(
+      (edge) =>
+        edge.kind === 'visit_instance_in_workstream' &&
+        edge.fromNodeId.startsWith('visit-instance:tses_a:'),
+    );
+    expect(visitInstanceEdge?.toNodeId).toBe(nodeIdFor('workstream', 'ws_urlPrimary'));
+    expect(visitInstanceEdge?.metadata?.['attributionOrigin']).toBe('canonical-url');
+    // Tab-session attribution still drives the tab_session_in_workstream
+    // edge — it's a separate signal about the whole tab.
+    const tabSessionEdge = snap.edges.find(
+      (edge) =>
+        edge.kind === 'tab_session_in_workstream' &&
+        edge.fromNodeId === nodeIdFor('tab-session', 'tses_a'),
+    );
+    expect(tabSessionEdge?.toNodeId).toBe(nodeIdFor('workstream', 'ws_tabFallback'));
+  });
+
   it('tab-session label falls back to host when the projection has a URL but no title', () => {
     const day: TimelineDayProjection = {
       date: '2026-05-07',

@@ -224,6 +224,176 @@ const evidenceReasons = (
   return reasons;
 };
 
+// Per-canonical-URL resolver. Anchors are every visit-instance and
+// timeline-visit node whose canonical URL matches the target. The
+// resolver runs the same PPR + similarity + cluster + fusion pipeline
+// as the tab-session resolver — only the seed set differs.
+export interface ResolveUrlAttributionInput {
+  readonly canonicalUrl: string;
+  readonly snapshot: ConnectionsSnapshot;
+  readonly events: readonly AcceptedEvent[];
+  readonly policyMode?: AttributionPolicyMode;
+  readonly policyTelemetry?: AttributionPolicyTelemetry;
+  readonly nowMs?: number;
+  readonly closestVisitRanker?: ClosestVisitRanker;
+}
+
+export interface UrlResolutionResult {
+  readonly canonicalUrl: string;
+  readonly dryRun: true;
+  readonly policyMode: AttributionPolicyMode;
+  readonly decision: {
+    readonly action: AttributionAction;
+    readonly workstreamId?: string;
+    readonly margin: number;
+  };
+  readonly fusedCandidates: readonly ResolverCandidate[];
+  readonly reasons: {
+    readonly dependencyKey: string;
+    readonly modelRevision: string;
+    readonly graphRevision: string;
+    readonly evidenceHash: string;
+    readonly targetAnchors: readonly string[];
+    readonly topContributingAnchors: readonly string[];
+  };
+}
+
+const urlNegativeSeeds = (input: ResolveUrlAttributionInput): Map<string, number> => {
+  const seeds = new Map<string, number>();
+  for (const event of input.events) {
+    if (event.type === USER_FLOW_REJECTED && isUserFlowRejectedPayload(event.payload)) {
+      seeds.set(event.payload.toId, -0.5);
+    }
+    if (event.type !== USER_ORGANIZED_ITEM || !isUserOrganizedItemPayload(event.payload)) continue;
+    if (
+      event.payload.itemKind === 'canonical-url' &&
+      event.payload.itemId === input.canonicalUrl &&
+      event.payload.toContainer === null &&
+      typeof event.payload.fromContainer === 'string'
+    ) {
+      seeds.set(`${WORKSTREAM_PREFIX}${event.payload.fromContainer}`, -0.75);
+    }
+  }
+  return seeds;
+};
+
+const collectUrlAnchors = (
+  snapshot: ConnectionsSnapshot,
+  canonicalUrl: string,
+): readonly string[] => {
+  const out: string[] = [];
+  const timelineVisitId = `timeline-visit:${canonicalUrl}`;
+  if (snapshot.nodes.some((node) => node.id === timelineVisitId)) {
+    out.push(timelineVisitId);
+  }
+  for (const node of snapshot.nodes) {
+    if (node.kind !== 'visit-instance') continue;
+    const nodeCanonical =
+      typeof node.metadata['canonicalUrl'] === 'string'
+        ? (node.metadata['canonicalUrl'] as string)
+        : typeof node.metadata['url'] === 'string'
+          ? (node.metadata['url'] as string)
+          : undefined;
+    if (nodeCanonical === canonicalUrl) out.push(node.id);
+  }
+  return out.sort(compareString);
+};
+
+export const resolveUrlAttribution = (
+  input: ResolveUrlAttributionInput,
+): UrlResolutionResult => {
+  const mode = input.policyMode ?? 'balanced';
+  const evidence = buildEvidenceGraph(input.snapshot);
+  const anchors = collectUrlAnchors(input.snapshot, input.canonicalUrl).filter((anchor) =>
+    evidence.graph.hasNode(anchor),
+  );
+  const seed = new Map<string, number>();
+  for (const anchor of anchors) seed.set(anchor, 1);
+  for (const [anchor, value] of urlNegativeSeeds(input)) seed.set(anchor, value);
+
+  const seedFingerprint = seedHash(seed);
+  const evidenceHash = createHash('sha256')
+    .update(`${MODEL_REVISION}|url:${input.canonicalUrl}|${evidence.revision}|${seedFingerprint}`)
+    .digest('hex');
+  const cacheKey = `url:${input.canonicalUrl}|${evidence.revision}|${seedFingerprint}`;
+  const nowMs = input.nowMs ?? Date.now();
+  const ppr = pprCache.get(cacheKey, nowMs) ?? runPPR(evidence, seed);
+  pprCache.set(cacheKey, ppr, nowMs);
+
+  // For similarity/cluster, target the visit-instance / timeline-visit
+  // anchors (same set as PPR's positive seeds).
+  const similarity = new Map(
+    buildSimilarityEvidence({
+      snapshot: input.snapshot,
+      targetVisitNodeIds: new Set(anchors),
+      events: input.events,
+      ...(input.closestVisitRanker === undefined
+        ? {}
+        : { closestVisitRanker: input.closestVisitRanker }),
+    }).map((item) => [item.workstreamId, item]),
+  );
+  const cluster = new Map(
+    buildClusterEvidence(input.snapshot, new Set(anchors)).map((item) => [item.workstreamId, item]),
+  );
+  const workstreamIds = candidateWorkstreamIds(evidence, anchors, allWorkstreamIds(input.snapshot));
+  for (const key of similarity.keys()) workstreamIds.add(key);
+  for (const key of cluster.keys()) workstreamIds.add(key);
+
+  const candidateEvidence: CandidateEvidence[] = [...workstreamIds]
+    .sort(compareString)
+    .map((workstreamId) => {
+      const sim = similarity.get(workstreamId);
+      const clusterEvidence = cluster.get(workstreamId);
+      const pprScore = Math.max(0, ppr.get(`${WORKSTREAM_PREFIX}${workstreamId}`) ?? 0);
+      const corroborationCount =
+        (pprScore > 0.01 ? 1 : 0) +
+        ((sim?.simTopScore ?? 0) > 0 ? 1 : 0) +
+        ((clusterEvidence?.posterior ?? 0) > 0 ? 1 : 0);
+      return {
+        workstreamId,
+        pprScore,
+        simTopScore: sim?.simTopScore ?? 0,
+        simMeanScore: sim?.simMeanScore ?? 0,
+        simAgreement: sim?.simAgreement ?? 0,
+        simMargin: sim?.simMargin ?? 0,
+        clusterPosterior: clusterEvidence?.posterior ?? 0,
+        corroborationCount,
+      };
+    });
+
+  const nodeById = new Map<string, ConnectionNode>(
+    input.snapshot.nodes.map((node) => [node.id, node] as const),
+  );
+  const enrichedAnchors: readonly AttributionAnchor[] = anchors
+    .slice(0, 3)
+    .map((anchorId) => enrichAnchor(anchorId, nodeById));
+
+  const fusedCandidates = fuseCandidates(candidateEvidence)
+    .filter((candidate) => candidate.corroborationCount > 0)
+    .slice(0, 5)
+    .map((candidate) => ({
+      ...candidate,
+      reasons: evidenceReasons(candidate, enrichedAnchors),
+    }));
+  const decision = decideAttribution(fusedCandidates, mode, input.policyTelemetry);
+
+  return {
+    canonicalUrl: input.canonicalUrl,
+    dryRun: true,
+    policyMode: mode,
+    decision,
+    fusedCandidates,
+    reasons: {
+      dependencyKey: cacheKey,
+      modelRevision: MODEL_REVISION,
+      graphRevision: evidence.revision,
+      evidenceHash,
+      targetAnchors: anchors,
+      topContributingAnchors: anchors.slice(0, 3),
+    },
+  };
+};
+
 export const resolveAttribution = (input: ResolveAttributionInput): ResolutionResult => {
   const mode = input.policyMode ?? 'balanced';
   const evidence = buildEvidenceGraph(input.snapshot);

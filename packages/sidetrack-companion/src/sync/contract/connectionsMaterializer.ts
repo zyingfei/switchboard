@@ -82,6 +82,7 @@ import type { AcceptedEvent } from '../causal.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
 import { projectTabSessions } from '../../tabsession/projection.js';
+import { projectUrls } from '../../urls/projection.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../../tabsession/events.js';
 
 // Sync Contract v1 / Class B — Connections graph materializer.
@@ -380,6 +381,7 @@ export const createConnectionsMaterializer = (
       ...vault,
       timelineDays,
       tabSessionProjection: projectTabSessions(merged),
+      urlProjection: projectUrls(merged),
       visitSimilarity,
       topicRevision,
       engagementClassRevision,

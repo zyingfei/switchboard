@@ -26,6 +26,11 @@ export const USER_ORGANIZED_ITEM_KINDS = [
   'tab-group-link',
   'topic',
   'snippet',
+  // Per-canonical-URL attribution unit. `itemId` is the canonical URL
+  // string. Used by the per-visit Inbox: every visit-instance of this
+  // URL inherits the attribution, regardless of which tab session
+  // observed it.
+  'canonical-url',
 ] as const;
 
 export type UserOrganizedItemKind = (typeof USER_ORGANIZED_ITEM_KINDS)[number];
