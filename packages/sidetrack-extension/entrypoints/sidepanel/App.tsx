@@ -598,6 +598,7 @@ const App = () => {
   // here pulls activeTabUrl into the side panel immediately, without
   // waiting for the SW round-trip.
   const [liveActiveTabUrl, setLiveActiveTabUrl] = useState<string | undefined>(undefined);
+  const [liveActiveTabTitle, setLiveActiveTabTitle] = useState<string | undefined>(undefined);
   const [threadSearchOpen, setThreadSearchOpen] = useState(false);
   const [threadSearchQuery, setThreadSearchQuery] = useState('');
   const [threadSearchResults, setThreadSearchResults] = useState<readonly ThreadSearchResult[]>([]);
@@ -742,7 +743,9 @@ const App = () => {
         chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
           if (cancelled) return;
           const url = tabs[0]?.url;
+          const title = tabs[0]?.title;
           setLiveActiveTabUrl(url === undefined || url.length === 0 ? undefined : url);
+          setLiveActiveTabTitle(title === undefined || title.length === 0 ? undefined : title);
         });
       } catch {
         // Test harness — leave state untouched.
@@ -752,10 +755,11 @@ const App = () => {
     const onActivated = (): void => refresh();
     const onUpdated = (
       _tabId: number,
-      changeInfo: { url?: string },
+      changeInfo: { url?: string; title?: string },
       tab: { active?: boolean },
     ): void => {
-      if (changeInfo.url !== undefined && tab.active === true) refresh();
+      if (tab.active !== true) return;
+      if (changeInfo.url !== undefined || changeInfo.title !== undefined) refresh();
     };
     const onFocusChanged = (): void => refresh();
     type ListenerEvent = {
@@ -4955,7 +4959,12 @@ const App = () => {
 
       <section
         className={
-          'tab-attribution-card' + (focusedTabSession !== undefined ? ' is-active' : ' is-empty')
+          'tab-attribution-card' +
+          (focusedTabSession !== undefined
+            ? ' is-active'
+            : liveActiveTabUrl !== undefined
+              ? ' is-loading'
+              : ' is-empty')
         }
         data-testid="focused-tab-attribution"
         aria-label="Current tab attribution"
@@ -4968,6 +4977,22 @@ const App = () => {
               title={focusedTabSession.latestUrl ?? tabSessionDisplayTitle(focusedTabSession)}
             >
               {tabSessionDisplayTitle(focusedTabSession)}
+            </span>
+          ) : liveActiveTabUrl !== undefined ? (
+            // Optimistic render before urlProjection has the entry.
+            // The companion takes a few seconds to materialize the visit
+            // (observe → drain → projection → 4 s side-panel poll).
+            // Showing the live tab title + host instead of "No tracked
+            // tab in focus" gives instant feedback that the side panel
+            // sees the navigation.
+            <span
+              className="tab-attribution-card-title subtle"
+              title={liveActiveTabUrl}
+            >
+              {liveActiveTabTitle ?? (() => {
+                try { return new URL(liveActiveTabUrl).hostname; } catch { return liveActiveTabUrl; }
+              })()}
+              <span className="tab-attribution-card-pending mono"> (capturing…)</span>
             </span>
           ) : (
             <span className="tab-attribution-card-title subtle">No tracked tab in focus</span>

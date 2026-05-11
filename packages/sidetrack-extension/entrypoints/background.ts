@@ -476,27 +476,68 @@ const hasEngagementHostPermission = async (): Promise<boolean> => {
   }
 };
 
+const recordEngagementSyncDiag = async (
+  step: string,
+  detail?: Record<string, unknown>,
+): Promise<void> => {
+  // Persistent journal of every sync attempt. Readable from any extension
+  // page (side panel / popup) via:
+  //   await chrome.storage.local.get('sidetrack.engagement.diag')
+  // Keeps the last 20 entries so the journal doesn't grow unboundedly.
+  try {
+    const key = 'sidetrack.engagement.diag';
+    const got = await chrome.storage.local.get(key);
+    const prior = Array.isArray(got[key])
+      ? (got[key] as unknown[]).filter((e): e is Record<string, unknown> => typeof e === 'object' && e !== null)
+      : [];
+    const entry: Record<string, unknown> = {
+      at: new Date().toISOString(),
+      step,
+    };
+    if (detail !== undefined) entry['detail'] = detail;
+    const next = [...prior, entry].slice(-20);
+    await chrome.storage.local.set({ [key]: next });
+  } catch {
+    // Best-effort journal.
+  }
+};
+
 const syncEngagementContentScriptRegistration = async (): Promise<void> => {
   // Engagement is default-on. The gate stayed closed for production
   // users because nothing wrote the privacy.gate.flipped event; open
   // it idempotently so the only remaining gate is host permission.
   await ensureEngagementGateDefaultOpen().catch(() => undefined);
-  const shouldRegister =
-    (await isEngagementPrivacyGateOpen()) && (await hasEngagementHostPermission());
+  const gateOpen = await isEngagementPrivacyGateOpen();
+  const hasPermission = await hasEngagementHostPermission();
+  const shouldRegister = gateOpen && hasPermission;
   const registered = await chrome.scripting.getRegisteredContentScripts({
     ids: [ENGAGEMENT_CONTENT_SCRIPT_ID],
   });
   const alreadyRegistered = registered.length > 0;
+  await recordEngagementSyncDiag('sync.invoked', {
+    gateOpen,
+    hasPermission,
+    shouldRegister,
+    alreadyRegistered,
+  });
   if (shouldRegister && !alreadyRegistered) {
-    await chrome.scripting.registerContentScripts([
-      {
-        id: ENGAGEMENT_CONTENT_SCRIPT_ID,
-        matches: [...ENGAGEMENT_HOST_ORIGINS],
-        js: [ENGAGEMENT_CONTENT_SCRIPT_FILE],
-        runAt: 'document_idle',
-        persistAcrossSessions: true,
-      },
-    ]);
+    try {
+      await chrome.scripting.registerContentScripts([
+        {
+          id: ENGAGEMENT_CONTENT_SCRIPT_ID,
+          matches: [...ENGAGEMENT_HOST_ORIGINS],
+          js: [ENGAGEMENT_CONTENT_SCRIPT_FILE],
+          runAt: 'document_idle',
+          persistAcrossSessions: true,
+        },
+      ]);
+      await recordEngagementSyncDiag('register.ok');
+    } catch (error) {
+      await recordEngagementSyncDiag('register.failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
     // Catch-up: the registration covers future navigations only, so
     // dogfooders staring at already-open tabs see no engagement signal
     // until they manually refresh. Inject into those tabs now.
@@ -505,12 +546,14 @@ const syncEngagementContentScriptRegistration = async (): Promise<void> => {
   }
   if (!shouldRegister && alreadyRegistered) {
     await chrome.scripting.unregisterContentScripts({ ids: [ENGAGEMENT_CONTENT_SCRIPT_ID] });
+    await recordEngagementSyncDiag('unregister.ok');
     return;
   }
   // Already-registered case: still catch up on open tabs in case a prior
   // sync registered but skipped the inject (e.g. SW restart, install).
   if (shouldRegister && alreadyRegistered) {
     await reinjectEngagementScriptIntoOpenTabs();
+    await recordEngagementSyncDiag('reinject.ok');
   }
 };
 
@@ -2842,25 +2885,40 @@ const reinjectContentScriptIntoOpenTabs = async (): Promise<void> => {
 // because the engagement runtime keys its aggregator by visitId.
 const reinjectEngagementScriptIntoOpenTabs = async (): Promise<void> => {
   if (!(await isEngagementPrivacyGateOpen()) || !(await hasEngagementHostPermission())) {
+    await recordEngagementSyncDiag('reinject.skipped', { reason: 'gate-or-permission-closed' });
     return;
   }
   try {
     const tabs = await chrome.tabs.query({ url: [...ENGAGEMENT_HOST_ORIGINS] });
-    await Promise.all(
+    const results = await Promise.all(
       tabs.map(async (tab) => {
-        if (typeof tab.id !== 'number') return;
+        if (typeof tab.id !== 'number') return { tabId: null, ok: false, reason: 'no-id' };
         try {
           await chrome.scripting.executeScript({
             target: { tabId: tab.id },
             files: [ENGAGEMENT_CONTENT_SCRIPT_FILE],
           });
-        } catch {
-          // chrome://, Web Store, file:, devtools — skip silently.
+          return { tabId: tab.id, ok: true, url: tab.url?.slice(0, 80) ?? null };
+        } catch (error) {
+          return {
+            tabId: tab.id,
+            ok: false,
+            url: tab.url?.slice(0, 80) ?? null,
+            reason: error instanceof Error ? error.message : String(error),
+          };
         }
       }),
     );
-  } catch {
-    // tabs.query/scripting unavailable — nothing to log.
+    await recordEngagementSyncDiag('reinject.attempted', {
+      tabsFound: tabs.length,
+      injected: results.filter((r) => r.ok).length,
+      failed: results.filter((r) => !r.ok).length,
+      sample: results.slice(0, 3),
+    });
+  } catch (error) {
+    await recordEngagementSyncDiag('reinject.query-failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
   }
 };
 
@@ -2969,7 +3027,17 @@ export default defineBackground(() => {
     message: unknown,
     tabId: number | undefined,
   ): Promise<void> => {
-    if (tabId === undefined || !isEngagementIntervalMessage(message)) return;
+    if (tabId === undefined) {
+      await recordEngagementSyncDiag('interval.dropped', { reason: 'no-tabId' });
+      return;
+    }
+    if (!isEngagementIntervalMessage(message)) {
+      await recordEngagementSyncDiag('interval.dropped', {
+        reason: 'shape-mismatch',
+        rawType: typeof message,
+      });
+      return;
+    }
     const runtime = await engagementRuntime();
     const merged = runtime.cache.mergeInterval(tabId, message);
     const payloads: {
@@ -2980,6 +3048,11 @@ export default defineBackground(() => {
       payloads.push({ streamName: 'engagement.session.aggregated', payload: merged.aggregate });
     }
     await appendEngagementEvents(payloads);
+    await recordEngagementSyncDiag('interval.buffered', {
+      tabId,
+      final: message.final,
+      payloadCount: payloads.length,
+    });
   };
 
   const finalizeEngagementForTab = async (tabId: number): Promise<void> => {
