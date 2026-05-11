@@ -8,7 +8,11 @@ import {
   type IndexEntry,
 } from '../recall/ranker.js';
 import type { TimelineEntry } from '../timeline/projection.js';
-import type { VisitSimilarityEdge, VisitSimilarityRevision } from './types.js';
+import type {
+  VisitSimilarityEdge,
+  VisitSimilarityProducer,
+  VisitSimilarityRevision,
+} from './types.js';
 
 export type VisitSimilarityEmbedder = (
   texts: readonly string[],
@@ -22,6 +26,14 @@ export interface BuildVisitSimilarityOptions {
   readonly threshold?: number;
   readonly topK?: number;
   readonly engagementGateMs?: number;
+  // Stage 5 / T2. When `lexicalThreshold` is omitted, the env var
+  // VISIT_SIMILARITY_LEXICAL_THRESHOLD_ENV wins; otherwise
+  // VISIT_SIMILARITY_DEFAULT_LEXICAL_THRESHOLD.
+  readonly lexicalThreshold?: number;
+  // Set to `false` to disable the metadata-Jaccard fallback in tests
+  // that simulate "embedder is unavailable, no edges expected." Default
+  // honors the env var (enabled unless explicitly disabled).
+  readonly lexicalFallbackEnabled?: boolean;
 }
 
 export const VISIT_SIMILARITY_MODEL_ID = 'Xenova/multilingual-e5-small' as const;
@@ -29,6 +41,36 @@ export const VISIT_SIMILARITY_FEATURE_SCHEMA_VERSION = 1;
 export const VISIT_SIMILARITY_DEFAULT_THRESHOLD = 0.85;
 export const VISIT_SIMILARITY_DEFAULT_TOP_K = 50;
 export const VISIT_SIMILARITY_DEFAULT_ENGAGEMENT_GATE_MS = 5_000;
+// Stage 5 / T2 — lexical fallback. Token-set Jaccard over the same
+// (title + host + path-tokens) corpus the embedding pipeline uses.
+// Default threshold is intentionally generous: the fallback's purpose
+// is to *light up downstream diagnostics* when the embedder is
+// unavailable, not to ship high-confidence edges. Production runs are
+// expected to be on the embedding path; lexical revisions are flagged
+// with `producer: 'lexical'` so consumers can distinguish.
+export const VISIT_SIMILARITY_DEFAULT_LEXICAL_THRESHOLD = 0.3;
+
+export const VISIT_SIMILARITY_THRESHOLD_ENV = 'SIDETRACK_SIMILARITY_THRESHOLD';
+export const VISIT_SIMILARITY_TOP_K_ENV = 'SIDETRACK_SIMILARITY_TOP_K';
+export const VISIT_SIMILARITY_ENGAGEMENT_GATE_MS_ENV =
+  'SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS';
+export const VISIT_SIMILARITY_LEXICAL_THRESHOLD_ENV =
+  'SIDETRACK_SIMILARITY_LEXICAL_THRESHOLD';
+export const VISIT_SIMILARITY_LEXICAL_FALLBACK_ENV =
+  'SIDETRACK_SIMILARITY_LEXICAL_FALLBACK';
+
+const readEnvNumber = (name: string): number | undefined => {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return undefined;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : undefined;
+};
+
+const lexicalFallbackEnabled = (): boolean => {
+  const raw = process.env[VISIT_SIMILARITY_LEXICAL_FALLBACK_ENV];
+  if (raw === undefined || raw === '') return true;
+  return raw !== '0' && raw.toLowerCase() !== 'false';
+};
 
 const PASSAGE_PREFIX = 'passage: ';
 const QUERY_PREFIX = 'query: ';
@@ -146,24 +188,38 @@ const normalizeEntries = (
   );
 };
 
+const clampUnit = (value: number): number => Math.min(Math.max(value, 0), 1);
+
 const clampThreshold = (threshold: number | undefined): number => {
-  if (threshold === undefined) return VISIT_SIMILARITY_DEFAULT_THRESHOLD;
-  if (!Number.isFinite(threshold)) return VISIT_SIMILARITY_DEFAULT_THRESHOLD;
-  return Math.min(Math.max(threshold, 0), 1);
+  if (threshold !== undefined && Number.isFinite(threshold)) return clampUnit(threshold);
+  const envValue = readEnvNumber(VISIT_SIMILARITY_THRESHOLD_ENV);
+  if (envValue !== undefined) return clampUnit(envValue);
+  return VISIT_SIMILARITY_DEFAULT_THRESHOLD;
 };
 
 const clampTopK = (topK: number | undefined): number => {
-  if (topK === undefined || !Number.isFinite(topK)) {
-    return VISIT_SIMILARITY_DEFAULT_TOP_K;
-  }
-  return Math.max(1, Math.trunc(topK));
+  if (topK !== undefined && Number.isFinite(topK)) return Math.max(1, Math.trunc(topK));
+  const envValue = readEnvNumber(VISIT_SIMILARITY_TOP_K_ENV);
+  if (envValue !== undefined) return Math.max(1, Math.trunc(envValue));
+  return VISIT_SIMILARITY_DEFAULT_TOP_K;
 };
 
 const clampEngagementGate = (engagementGateMs: number | undefined): number => {
-  if (engagementGateMs === undefined || !Number.isFinite(engagementGateMs)) {
-    return VISIT_SIMILARITY_DEFAULT_ENGAGEMENT_GATE_MS;
+  if (engagementGateMs !== undefined && Number.isFinite(engagementGateMs)) {
+    return Math.max(0, engagementGateMs);
   }
-  return Math.max(0, engagementGateMs);
+  const envValue = readEnvNumber(VISIT_SIMILARITY_ENGAGEMENT_GATE_MS_ENV);
+  if (envValue !== undefined) return Math.max(0, envValue);
+  return VISIT_SIMILARITY_DEFAULT_ENGAGEMENT_GATE_MS;
+};
+
+const clampLexicalThreshold = (lexicalThreshold: number | undefined): number => {
+  if (lexicalThreshold !== undefined && Number.isFinite(lexicalThreshold)) {
+    return clampUnit(lexicalThreshold);
+  }
+  const envValue = readEnvNumber(VISIT_SIMILARITY_LEXICAL_THRESHOLD_ENV);
+  if (envValue !== undefined) return clampUnit(envValue);
+  return VISIT_SIMILARITY_DEFAULT_LEXICAL_THRESHOLD;
 };
 
 const roundedCosine = (value: number): number => Number(value.toFixed(6));
@@ -198,6 +254,7 @@ const emptyRevision = (input: {
   readonly revisionId: string;
   readonly modelRevision: string;
   readonly threshold: number;
+  readonly producer?: VisitSimilarityProducer;
 }): VisitSimilarityRevision => ({
   revisionId: input.revisionId,
   modelId: VISIT_SIMILARITY_MODEL_ID,
@@ -206,7 +263,85 @@ const emptyRevision = (input: {
   threshold: input.threshold,
   edges: [],
   producedAt: Date.now(),
+  ...(input.producer === undefined ? {} : { producer: input.producer }),
 });
+
+// Stage 5 / T2 — token-set Jaccard fallback. Produces the same edge
+// shape as the embedding path so downstream reducers and the snapshot
+// emitter handle both uniformly. The revision is tagged
+// `producer: 'lexical'`; the cosine field re-uses the Jaccard score in
+// [0, 1] so the snapshot's `cosine < threshold` filter remains
+// honored.
+const tokenize = (corpus: string): ReadonlySet<string> => {
+  const tokens = new Set<string>();
+  for (const raw of corpus.split(/\s+/u)) {
+    const trimmed = raw.trim().toLowerCase();
+    if (trimmed.length === 0) continue;
+    tokens.add(trimmed);
+  }
+  return tokens;
+};
+
+const jaccard = (left: ReadonlySet<string>, right: ReadonlySet<string>): number => {
+  if (left.size === 0 || right.size === 0) return 0;
+  let intersection = 0;
+  const smaller = left.size <= right.size ? left : right;
+  const larger = smaller === left ? right : left;
+  for (const token of smaller) {
+    if (larger.has(token)) intersection += 1;
+  }
+  const union = left.size + right.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+};
+
+const buildLexicalEdges = (
+  visits: readonly NormalizedVisit[],
+  threshold: number,
+  topK: number,
+): readonly VisitSimilarityEdge[] => {
+  if (visits.length < 2) return [];
+  const tokensByVisit = new Map<string, ReadonlySet<string>>();
+  for (const visit of visits) {
+    tokensByVisit.set(visit.visitKey, tokenize(visit.corpus));
+  }
+  const edges: VisitSimilarityEdge[] = [];
+  for (const source of visits) {
+    const sourceTokens = tokensByVisit.get(source.visitKey);
+    if (sourceTokens === undefined || sourceTokens.size === 0) continue;
+    const ranked: { readonly id: string; readonly similarity: number }[] = [];
+    for (const candidate of visits) {
+      if (candidate.visitKey === source.visitKey) continue;
+      const candTokens = tokensByVisit.get(candidate.visitKey);
+      if (candTokens === undefined || candTokens.size === 0) continue;
+      const similarity = jaccard(sourceTokens, candTokens);
+      if (similarity < threshold) continue;
+      ranked.push({ id: candidate.visitKey, similarity });
+    }
+    ranked.sort((left, right) => {
+      if (right.similarity !== left.similarity) return right.similarity - left.similarity;
+      return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+    });
+    for (const candidate of ranked.slice(0, topK)) {
+      // Deduplicate the undirected edge by emitting only when source<candidate.
+      if (candidate.id <= source.visitKey) continue;
+      edges.push({
+        fromVisitKey: source.visitKey,
+        toVisitKey: candidate.id,
+        cosine: roundedCosine(candidate.similarity),
+      });
+    }
+  }
+  edges.sort((left, right) => {
+    if (left.fromVisitKey !== right.fromVisitKey) {
+      return left.fromVisitKey < right.fromVisitKey ? -1 : 1;
+    }
+    if (left.toVisitKey !== right.toVisitKey) {
+      return left.toVisitKey < right.toVisitKey ? -1 : 1;
+    }
+    return left.cosine - right.cosine;
+  });
+  return edges;
+};
 
 const logMaterializerError = (error: unknown): void => {
   const message = error instanceof Error ? error.message : String(error);
@@ -253,6 +388,8 @@ export const buildVisitSimilarity = async (
   const threshold = clampThreshold(options.threshold);
   const topK = clampTopK(options.topK);
   const engagementGateMs = clampEngagementGate(options.engagementGateMs);
+  const lexicalThreshold = clampLexicalThreshold(options.lexicalThreshold);
+  const fallbackAllowed = options.lexicalFallbackEnabled ?? lexicalFallbackEnabled();
   const modelRevision = RECALL_MODEL.revision;
   const visits = normalizeEntries(entries);
   const revisionId = revisionIdFor({
@@ -269,7 +406,24 @@ export const buildVisitSimilarity = async (
     featureSchemaVersion: VISIT_SIMILARITY_FEATURE_SCHEMA_VERSION,
     threshold,
     producedAt: Date.now(),
+    producer: 'embedding' as VisitSimilarityProducer,
   } satisfies Omit<VisitSimilarityRevision, 'edges'>;
+
+  // Lexical fallback path: produces edges whose `cosine` field is a
+  // Jaccard score in [0, 1]. The revision's `threshold` matches the
+  // lexical threshold so the snapshot's `cosine < threshold` filter
+  // gates correctly without changing the reducer.
+  const lexicalRevision = (): VisitSimilarityRevision => {
+    const eligibleForLexical = visits.filter((visit) => visit.focusedWindowMs >= engagementGateMs);
+    return {
+      ...base,
+      threshold: lexicalThreshold,
+      producer: 'lexical',
+      edges: fallbackAllowed
+        ? buildLexicalEdges(eligibleForLexical, lexicalThreshold, topK)
+        : [],
+    };
+  };
 
   const eligible = visits.filter((visit) => visit.focusedWindowMs >= engagementGateMs);
   if (eligible.length < 2) {
@@ -283,7 +437,8 @@ export const buildVisitSimilarity = async (
     embedded = await embed([...passageTexts, ...queryTexts]);
   } catch (error) {
     logMaterializerError(error);
-    return emptyRevision({ revisionId, modelRevision, threshold });
+    if (fallbackAllowed) return lexicalRevision();
+    return emptyRevision({ revisionId, modelRevision, threshold, producer: 'embedding' });
   }
   if (embedded.length !== passageTexts.length + queryTexts.length) {
     logMaterializerError(
@@ -291,7 +446,8 @@ export const buildVisitSimilarity = async (
         `expected ${String(passageTexts.length + queryTexts.length)} embeddings, received ${String(embedded.length)}`,
       ),
     );
-    return emptyRevision({ revisionId, modelRevision, threshold });
+    if (fallbackAllowed) return lexicalRevision();
+    return emptyRevision({ revisionId, modelRevision, threshold, producer: 'embedding' });
   }
 
   const passageVectors = embedded.slice(0, passageTexts.length);

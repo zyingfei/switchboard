@@ -244,9 +244,16 @@ describe('buildVisitSimilarity', () => {
   it('returns an empty-edge revision and leaves snapshot build usable when embed throws', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const entries = [visit('alpha'), visit('bravo')];
-    const revision = await buildVisitSimilarity(entries, async () => {
-      throw new Error('model cache empty');
-    });
+    const revision = await buildVisitSimilarity(
+      entries,
+      async () => {
+        throw new Error('model cache empty');
+      },
+      // Stage 5 / T2: this test pins the original "embedder unavailable
+      // ⇒ no edges" contract by explicitly disabling the lexical
+      // fallback. Lexical-fallback behavior is covered separately.
+      { lexicalFallbackEnabled: false },
+    );
 
     expect(revision.edges).toEqual([]);
     expect(warn).toHaveBeenCalledWith(
@@ -322,5 +329,207 @@ describe('buildVisitSimilarity', () => {
 
     expect(seen.filter((text) => text.startsWith('passage: '))).toHaveLength(2);
     expect(seen.filter((text) => text.startsWith('query: '))).toHaveLength(2);
+  });
+
+  it('tags the revision with producer="embedding" when the embedder succeeds', async () => {
+    const revision = await buildVisitSimilarity(
+      [visit('alpha'), visit('bravo')],
+      embedFromVectors(
+        new Map<string, Float32Array>([
+          ['visit-alpha', unit([1, 0])],
+          ['visit-bravo', unit([1, 0])],
+        ]),
+      ),
+    );
+    expect(revision.producer).toBe('embedding');
+  });
+});
+
+describe('buildVisitSimilarity — Stage 5 / T2 env-driven gates', () => {
+  it('lowers the cosine threshold from the env when no explicit option is supplied', async () => {
+    const original = process.env['SIDETRACK_SIMILARITY_THRESHOLD'];
+    process.env['SIDETRACK_SIMILARITY_THRESHOLD'] = '0.6';
+    try {
+      const revision = await buildVisitSimilarity(
+        [visit('alpha'), visit('bravo')],
+        embedFromVectors(
+          new Map<string, Float32Array>([
+            ['visit-alpha', unit([1, 0])],
+            ['visit-bravo', vectorAtCosine(0.7)],
+          ]),
+        ),
+      );
+      expect(revision.threshold).toBeCloseTo(0.6, 6);
+      expect(revision.edges).toHaveLength(1);
+    } finally {
+      if (original === undefined) {
+        delete process.env['SIDETRACK_SIMILARITY_THRESHOLD'];
+      } else {
+        process.env['SIDETRACK_SIMILARITY_THRESHOLD'] = original;
+      }
+    }
+  });
+
+  it('lowers the engagement gate from the env when no explicit option is supplied', async () => {
+    const original = process.env['SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS'];
+    process.env['SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS'] = '500';
+    try {
+      const revision = await buildVisitSimilarity(
+        [
+          visit('alpha', { focusedWindowMs: 600 }),
+          visit('bravo', { focusedWindowMs: 700 }),
+        ],
+        embedFromVectors(
+          new Map<string, Float32Array>([
+            ['visit-alpha', unit([1, 0])],
+            ['visit-bravo', unit([1, 0])],
+          ]),
+        ),
+      );
+      expect(revision.edges).toHaveLength(1);
+    } finally {
+      if (original === undefined) {
+        delete process.env['SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS'];
+      } else {
+        process.env['SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS'] = original;
+      }
+    }
+  });
+
+  it('uses explicit option arg in preference to the env var', async () => {
+    const original = process.env['SIDETRACK_SIMILARITY_THRESHOLD'];
+    process.env['SIDETRACK_SIMILARITY_THRESHOLD'] = '0.1';
+    try {
+      const revision = await buildVisitSimilarity(
+        [visit('alpha'), visit('bravo')],
+        embedFromVectors(
+          new Map<string, Float32Array>([
+            ['visit-alpha', unit([1, 0])],
+            ['visit-bravo', vectorAtCosine(0.5)],
+          ]),
+        ),
+        { threshold: 0.9 },
+      );
+      expect(revision.threshold).toBeCloseTo(0.9, 6);
+      expect(revision.edges).toEqual([]);
+    } finally {
+      if (original === undefined) {
+        delete process.env['SIDETRACK_SIMILARITY_THRESHOLD'];
+      } else {
+        process.env['SIDETRACK_SIMILARITY_THRESHOLD'] = original;
+      }
+    }
+  });
+});
+
+describe('buildVisitSimilarity — Stage 5 / T2 lexical fallback', () => {
+  it('falls back to Jaccard edges when the embedder throws', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    // alpha and beta-alpha share three of four tokens ("foo bar baz") so
+    // the Jaccard exceeds the default lexical threshold of 0.3.
+    const a: VisitSimilarityEntry = {
+      ...visit('a'),
+      title: 'foo bar baz qux',
+      canonicalUrl: 'https://example.test/x/a',
+      url: 'https://example.test/x/a',
+    };
+    const b: VisitSimilarityEntry = {
+      ...visit('b'),
+      title: 'foo bar baz quux',
+      canonicalUrl: 'https://example.test/x/b',
+      url: 'https://example.test/x/b',
+    };
+    const revision = await buildVisitSimilarity(
+      [a, b],
+      () => Promise.reject(new Error('embedder offline')),
+      { lexicalThreshold: 0.3 },
+    );
+    expect(revision.producer).toBe('lexical');
+    expect(revision.edges.length).toBeGreaterThan(0);
+    expect(revision.threshold).toBeCloseTo(0.3, 6);
+    expect(warn).toHaveBeenCalled();
+  });
+
+  it('omits lexical edges below the lexical threshold', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    // alpha and bravo share only the host ('example.test') — Jaccard < 0.3.
+    const revision = await buildVisitSimilarity([visit('alpha'), visit('bravo')], () =>
+      Promise.reject(new Error('embedder offline')),
+    );
+    expect(revision.producer).toBe('lexical');
+    expect(revision.edges).toEqual([]);
+  });
+
+  it('falls back when the embedder returns the wrong number of vectors', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const a: VisitSimilarityEntry = {
+      ...visit('a'),
+      title: 'foo bar baz qux',
+      canonicalUrl: 'https://example.test/x/a',
+      url: 'https://example.test/x/a',
+    };
+    const b: VisitSimilarityEntry = {
+      ...visit('b'),
+      title: 'foo bar baz quux',
+      canonicalUrl: 'https://example.test/x/b',
+      url: 'https://example.test/x/b',
+    };
+    const revision = await buildVisitSimilarity([a, b], () => Promise.resolve([unit([1, 0])]));
+    expect(revision.producer).toBe('lexical');
+    expect(revision.edges.length).toBeGreaterThan(0);
+  });
+
+  it('honors lexicalFallbackEnabled=false even when the embedder fails', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const a: VisitSimilarityEntry = {
+      ...visit('a'),
+      title: 'foo bar baz qux',
+      canonicalUrl: 'https://example.test/x/a',
+      url: 'https://example.test/x/a',
+    };
+    const b: VisitSimilarityEntry = {
+      ...visit('b'),
+      title: 'foo bar baz quux',
+      canonicalUrl: 'https://example.test/x/b',
+      url: 'https://example.test/x/b',
+    };
+    const revision = await buildVisitSimilarity(
+      [a, b],
+      () => Promise.reject(new Error('embedder offline')),
+      { lexicalFallbackEnabled: false },
+    );
+    expect(revision.producer).toBe('embedding');
+    expect(revision.edges).toEqual([]);
+  });
+
+  it('honors SIDETRACK_SIMILARITY_LEXICAL_FALLBACK=0 even when the embedder fails', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const original = process.env['SIDETRACK_SIMILARITY_LEXICAL_FALLBACK'];
+    process.env['SIDETRACK_SIMILARITY_LEXICAL_FALLBACK'] = '0';
+    try {
+      const a: VisitSimilarityEntry = {
+        ...visit('a'),
+        title: 'foo bar baz qux',
+        canonicalUrl: 'https://example.test/x/a',
+        url: 'https://example.test/x/a',
+      };
+      const b: VisitSimilarityEntry = {
+        ...visit('b'),
+        title: 'foo bar baz quux',
+        canonicalUrl: 'https://example.test/x/b',
+        url: 'https://example.test/x/b',
+      };
+      const revision = await buildVisitSimilarity([a, b], () =>
+        Promise.reject(new Error('embedder offline')),
+      );
+      expect(revision.producer).toBe('embedding');
+      expect(revision.edges).toEqual([]);
+    } finally {
+      if (original === undefined) {
+        delete process.env['SIDETRACK_SIMILARITY_LEXICAL_FALLBACK'];
+      } else {
+        process.env['SIDETRACK_SIMILARITY_LEXICAL_FALLBACK'] = original;
+      }
+    }
   });
 });

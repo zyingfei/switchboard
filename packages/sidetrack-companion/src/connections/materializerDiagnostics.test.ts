@@ -130,6 +130,7 @@ const emptySimilarityRevision = (): VisitSimilarityRevision => ({
   threshold: 0.85,
   edges: [],
   producedAt: ACCEPTED_AT_MS,
+  producer: 'embedding',
 });
 
 const emptyTopicRevision = () => ({
@@ -389,9 +390,30 @@ describe('summarizeMaterializerDiagnostics', () => {
     );
     const summary = summarizeMaterializerDiagnostics(diag);
     expect(summary.startsWith('[materializer-diag] ')).toBe(true);
-    expect(summary).toContain('simEdges=0');
+    expect(summary).toContain('simEdges=0(embedding)');
     expect(summary).toContain('engagementEligible=1');
     expect(summary).toContain('ranker=not-run');
+  });
+
+  it('flags the similarity producer when the lexical fallback runs', () => {
+    const diag = collectMaterializerDiagnostics(
+      baseInput({
+        visitSimilarity: { ...emptySimilarityRevision(), producer: 'lexical' },
+      }),
+    );
+    expect(diag.similarity.producer).toBe('lexical');
+    expect(summarizeMaterializerDiagnostics(diag)).toContain('simEdges=0(lexical)');
+  });
+
+  it('reports producer="unknown" for legacy revisions without the producer field', () => {
+    const legacy: VisitSimilarityRevision = {
+      ...emptySimilarityRevision(),
+    };
+    // Strip producer to simulate the pre-T2 fixture shape.
+    const { producer: _producer, ...stripped } = legacy;
+    void _producer;
+    const diag = collectMaterializerDiagnostics(baseInput({ visitSimilarity: stripped }));
+    expect(diag.similarity.producer).toBe('unknown');
   });
 });
 

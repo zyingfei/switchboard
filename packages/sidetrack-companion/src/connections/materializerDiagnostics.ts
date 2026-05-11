@@ -45,6 +45,10 @@ export interface MaterializerSimilarityCounters {
   readonly modelRevision: string;
   readonly threshold: number;
   readonly edgeCount: number;
+  // Stage 5 / T2 — present when the revision came from the metadata
+  // lexical fallback ('lexical') vs the embedding pipeline ('embedding',
+  // or absent for older fixture data that pre-dates the field).
+  readonly producer: 'embedding' | 'lexical' | 'unknown';
 }
 
 export interface MaterializerTopicCounters {
@@ -182,6 +186,7 @@ const collectSimilarityCounters = (
   modelRevision: revision.modelRevision,
   threshold: revision.threshold,
   edgeCount: revision.edges.length,
+  producer: revision.producer ?? 'unknown',
 });
 
 const collectTopicCounters = (revision: TopicRevision): MaterializerTopicCounters => {
@@ -353,7 +358,7 @@ export const summarizeMaterializerDiagnostics = (
     `edges=${String(diagnostics.snapshot.edgeCount)}`,
     `visits=${String(diagnostics.timeline.entryCount)}`,
     `engagementEligible=${String(diagnostics.timeline.engagementEligibleEntryCount)}`,
-    `simEdges=${String(diagnostics.similarity.edgeCount)}`,
+    `simEdges=${String(diagnostics.similarity.edgeCount)}(${diagnostics.similarity.producer})`,
     `topics=${String(diagnostics.topics.topicCount)}`,
     `topicMembers=${String(diagnostics.topics.memberCount)}`,
     `ranker=${diagnostics.ranker.status}${diagnostics.ranker.reason === null ? '' : `:${diagnostics.ranker.reason}`}`,
