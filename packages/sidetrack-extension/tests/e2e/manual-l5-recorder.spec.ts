@@ -367,6 +367,94 @@ const grantDeeperPageAccessIfNeeded = async (panel: Page): Promise<void> => {
   await panel.locator('button.btn.btn-ghost', { hasText: 'Close' }).click();
 };
 
+// Stage 5 follow-up — periodically dump the SW dev.diag stash to
+// disk during long-running recorder sessions. Lets the operator
+// (or me) inspect `wiring.lastOnUpdated` / `observer.lastDecision` /
+// `contentTitleSink.hits` post-hoc without opening the SW DevTools.
+//
+// The dumper triggers a `sidetrack.dev.diag` message (which writes
+// the stash to chrome.storage.session via the SW handler), then
+// reads the stash and writes a per-tick file under
+// <artifactsDir>/sw-diag/<isoTimestamp>.json.
+const dumpSwDiagOnce = async (
+  runtime: ExtensionRuntime,
+  panel: Page,
+  outDir: string,
+  label: string,
+): Promise<void> => {
+  try {
+    await runtime.sendRuntimeMessage(panel, { type: 'sidetrack.dev.diag' });
+  } catch {
+    // The message handler returns sendResponse({ok:true}) but some
+    // SW startup races can throw "message port closed"; that's fine
+    // — the stash is still written.
+  }
+  // Give chrome.storage.session a tick to settle.
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  let stash: unknown;
+  try {
+    stash = await runtime.sendRuntimeMessage(panel, {
+      type: 'sidetrack.dev.diag.read',
+    });
+  } catch {
+    stash = null;
+  }
+  // Fallback: read directly via chrome.storage.session in the panel.
+  stash ??= await (
+    panel as unknown as {
+      evaluate: (fn: () => Promise<unknown>) => Promise<unknown>;
+    }
+  ).evaluate(async () => {
+    const c = (globalThis as unknown as { chrome?: typeof chrome }).chrome;
+    if (c === undefined) return null;
+    try {
+      const sessionStorage = (c.storage as { readonly session?: typeof c.storage.local }).session;
+      if (sessionStorage === undefined) return null;
+      const got = await sessionStorage.get('sidetrack.dev.diag');
+      return got['sidetrack.dev.diag'] ?? null;
+    } catch {
+      return null;
+    }
+  });
+  await mkdir(outDir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/gu, '-');
+  await writeFile(
+    path.join(outDir, `${stamp}-${label}.json`),
+    `${JSON.stringify(stash, null, 2)}\n`,
+    'utf8',
+  );
+};
+
+const startPeriodicSwDiagDump = (
+  runtimes: readonly { readonly label: string; readonly runtime: ExtensionRuntime; readonly panel: Page }[],
+  outDir: string,
+  intervalMs: number,
+): { readonly stop: () => Promise<void> } => {
+  let stopped = false;
+  const tick = async (): Promise<void> => {
+    if (stopped) return;
+    for (const { label, runtime, panel } of runtimes) {
+      try {
+        await dumpSwDiagOnce(runtime, panel, outDir, label);
+      } catch {
+        // Periodic best-effort — never fail the recorder on a dump miss.
+      }
+    }
+  };
+  // First tick immediately so the operator gets an early snapshot.
+  void tick();
+  const handle = setInterval(() => {
+    void tick();
+  }, intervalMs);
+  return {
+    stop: () => {
+      stopped = true;
+      clearInterval(handle);
+      return Promise.resolve();
+    },
+  };
+};
+
 const drainRuntime = async (
   runtime: ExtensionRuntime,
   panel: Page,
@@ -768,7 +856,23 @@ dumps, visible screenshots, and companion/plugin result JSON.
       // eslint-disable-next-line no-console
       console.log(banner);
 
-      await waitForEnter('[manual-l5] Waiting. Send Enter after the user says done...');
+      // Stage 5 follow-up — dump SW dev.diag every 20 s to
+      // `<artifactsDir>/sw-diag/<iso>-{A,B}.json` so the recorder
+      // session leaves behind enough evidence to diagnose
+      // capture/title-sink/observer issues post-hoc.
+      const swDiagDumper = startPeriodicSwDiagDump(
+        [
+          { label: 'A', runtime: runtimeA, panel: panelA },
+          { label: 'B', runtime: runtimeB, panel: panelB },
+        ],
+        path.join(artifactsDir, 'sw-diag'),
+        20_000,
+      );
+      try {
+        await waitForEnter('[manual-l5] Waiting. Send Enter after the user says done...');
+      } finally {
+        await swDiagDumper.stop();
+      }
 
       await recorder.snapshotAll('manual-finished');
       await recorder.writeSummary();
