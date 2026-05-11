@@ -7,6 +7,22 @@ import { isBridgeKeyAccepted, rotateBridgeKey } from '../auth/bridgeKey.js';
 import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from '../timeline/events.js';
 import { sanitizeTimelinePayload } from '../timeline/sanitize.js';
 import {
+  ENGAGEMENT_INTERVAL_OBSERVED,
+  ENGAGEMENT_SESSION_AGGREGATED,
+  isEngagementIntervalObservedPayload,
+  isEngagementSessionAggregatedPayload,
+} from '../engagement/events.js';
+import {
+  SELECTION_COPIED,
+  SELECTION_PASTED,
+  isSelectionCopiedPayload,
+  isSelectionPastedPayload,
+} from '../snippets/events.js';
+import {
+  VISUAL_FINGERPRINT_OBSERVED,
+  isVisualFingerprintObservedPayload,
+} from '../visual/events.js';
+import {
   defaultAllowedTools,
   isAllowed,
   readTrust,
@@ -4118,9 +4134,9 @@ const routes: readonly RouteDefinition[] = [
         const event = candidate as import('../sync/causal.js').AcceptedEvent;
         // Reviewer-flagged: this endpoint is timeline-only. Reject
         // any event whose type is not browser.timeline.observed OR
-        // whose payload fails the runtime predicate. Keeps the
-        // route narrow — a future generic `/v1/edge/events` router
-        // would be a separate route.
+        // whose payload fails the runtime predicate. Engagement /
+        // selection / visual-fingerprint events go through the
+        // companion's `/v1/edge/events` route (defined below).
         if (event.type !== BROWSER_TIMELINE_OBSERVED) {
           skipped.push({
             replicaId: event.dot.replicaId,
@@ -4151,6 +4167,110 @@ const routes: readonly RouteDefinition[] = [
           sanitizedPayload === event.payload ? event : { ...event, payload: sanitizedPayload };
         try {
           const result = await context.importEdgeEvent(sanitizedEvent);
+          if (result.imported) {
+            imported.push({ replicaId: event.dot.replicaId, seq: event.dot.seq });
+          } else {
+            skipped.push({
+              replicaId: event.dot.replicaId,
+              seq: event.dot.seq,
+              reason: 'already-imported',
+            });
+          }
+        } catch (err) {
+          skipped.push({
+            replicaId: event.dot.replicaId,
+            seq: event.dot.seq,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      void requestId;
+      return [200, { data: { imported, skipped } }];
+    },
+  },
+  // POST /v1/edge/events — generic ingest route for plugin-originated
+  // edge events that are NOT timeline observations: engagement
+  // (interval + session aggregated), selection (copied + pasted),
+  // visual fingerprint. The plugin's edge-event buffer drains here on
+  // its 1-minute alarm; pre-fix this route returned 404 and engagement
+  // events accumulated in the plugin's IndexedDB forever, starving
+  // similarity edges, URL inference, and the ranker. Same import +
+  // dedupe pipeline as /v1/timeline/events, narrowed to the set of
+  // event types this route accepts.
+  {
+    method: 'POST',
+    pattern: /^\/v1\/edge\/events$/u,
+    authRequired: true,
+    handle: async (request, requestId, _match, context) => {
+      if (context.importEdgeEvent === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EDGE_EVENTS_NOT_WIRED',
+          'Edge event import is not configured.',
+        );
+      }
+      const body = (await readBody(request)) as { events?: unknown };
+      if (body === null || typeof body !== 'object' || !Array.isArray(body.events)) {
+        throw new HttpRouteError(
+          400,
+          'INVALID_REQUEST',
+          'Body must be { events: AcceptedEvent[] }.',
+        );
+      }
+      const ACCEPTED_EDGE_EVENT_TYPES = new Set<string>([
+        ENGAGEMENT_INTERVAL_OBSERVED,
+        ENGAGEMENT_SESSION_AGGREGATED,
+        SELECTION_COPIED,
+        SELECTION_PASTED,
+        VISUAL_FINGERPRINT_OBSERVED,
+      ]);
+      const validatePayload = (type: string, payload: unknown): boolean => {
+        switch (type) {
+          case ENGAGEMENT_INTERVAL_OBSERVED:
+            return isEngagementIntervalObservedPayload(payload);
+          case ENGAGEMENT_SESSION_AGGREGATED:
+            return isEngagementSessionAggregatedPayload(payload);
+          case SELECTION_COPIED:
+            return isSelectionCopiedPayload(payload);
+          case SELECTION_PASTED:
+            return isSelectionPastedPayload(payload);
+          case VISUAL_FINGERPRINT_OBSERVED:
+            return isVisualFingerprintObservedPayload(payload);
+          default:
+            return false;
+        }
+      };
+      const imported: { replicaId: string; seq: number }[] = [];
+      const skipped: { replicaId: string; seq: number; reason: string }[] = [];
+      for (const candidate of body.events) {
+        if (
+          candidate === null ||
+          typeof candidate !== 'object' ||
+          typeof (candidate as { type?: unknown }).type !== 'string' ||
+          typeof (candidate as { dot?: unknown }).dot !== 'object' ||
+          (candidate as { dot?: { replicaId?: unknown } }).dot === null
+        ) {
+          continue;
+        }
+        const event = candidate as import('../sync/causal.js').AcceptedEvent;
+        if (!ACCEPTED_EDGE_EVENT_TYPES.has(event.type)) {
+          skipped.push({
+            replicaId: event.dot.replicaId,
+            seq: event.dot.seq,
+            reason: 'invalid-event-type',
+          });
+          continue;
+        }
+        if (!validatePayload(event.type, event.payload)) {
+          skipped.push({
+            replicaId: event.dot.replicaId,
+            seq: event.dot.seq,
+            reason: 'invalid-payload',
+          });
+          continue;
+        }
+        try {
+          const result = await context.importEdgeEvent(event);
           if (result.imported) {
             imported.push({ replicaId: event.dot.replicaId, seq: event.dot.seq });
           } else {
