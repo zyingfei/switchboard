@@ -1,15 +1,20 @@
-// Manual L5 realism recorder - NOT a CI test.
+// Manual full-browser recorder — NOT a CI test.
 //
 // Run with:
-//   SIDETRACK_USER_DATA_DIR=~/.sidetrack-test-profile \
-//     npm run e2e:manual-l5-recorder
+//   npm run e2e:recorder            # or, for muscle memory: e2e:manual-l5-recorder
 //
-// The browser stays open until stdin advances the two prompts:
-//   1. first Enter: stop recording, drain Sidetrack, write artifacts
-//   2. second Enter: close browsers and companion processes
+// The browser stays open until stdin advances the prompts:
+//   1. (only when an existing vault is detected) keep [Enter] / new vault [n]
+//   2. first Enter after recording starts: drain Sidetrack + write artifacts
+//   3. second Enter: close browsers and companion processes
+//
+// Defaults (override individually via env):
+//   SIDETRACK_USER_DATA_DIR=~/.sidetrack-test-profile  (browser profile — sticky)
+//   SIDETRACK_VAULT_DIR=~/.sidetrack-vault             (companion vault — sticky)
+// The legacy SIDETRACK_MANUAL_L5_VAULT_DIR is still honoured for back-compat.
 
 import { randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readdir, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readdir, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -145,6 +150,51 @@ const waitForEnter = async (label: string): Promise<void> => {
   });
 };
 
+const readKey = async (label: string): Promise<string> => {
+  // eslint-disable-next-line no-console
+  console.log(label);
+  process.stdin.resume();
+  return await new Promise<string>((resolve) => {
+    process.stdin.once('data', (chunk: Buffer) => {
+      resolve(chunk.toString('utf8').trim().toLowerCase());
+    });
+  });
+};
+
+const vaultHasData = async (vaultRoot: string): Promise<boolean> => {
+  // Sidetrack writes vault state under `<vaultRoot>/_BAC/`. Presence is
+  // a good-enough proxy for "this directory has prior recording data".
+  try {
+    await access(path.join(vaultRoot, '_BAC'));
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const resolveVaultRoot = async (defaultPath: string): Promise<string> => {
+  const resolved = expandTilde(defaultPath);
+  if (!(await vaultHasData(resolved))) {
+    // eslint-disable-next-line no-console
+    console.log(`[recorder] Using vault: ${resolved} (no prior data)`);
+    return resolved;
+  }
+  const answer = await readKey(
+    `[recorder] Existing vault found at ${resolved}.\n` +
+      `  Press Enter to keep using it, or type 'n' + Enter to start a fresh timestamped vault.`,
+  );
+  if (answer === 'n' || answer === 'new') {
+    const stamp = isoStamp();
+    const fresh = `${resolved}-${stamp}`;
+    // eslint-disable-next-line no-console
+    console.log(`[recorder] Creating fresh vault at ${fresh}`);
+    return fresh;
+  }
+  // eslint-disable-next-line no-console
+  console.log(`[recorder] Continuing with existing vault at ${resolved}`);
+  return resolved;
+};
+
 const withTimeout = async <T>(
   label: string,
   task: Promise<T>,
@@ -215,7 +265,7 @@ const openPrivacyGate = async (comp: TestCompanion, gate: string): Promise<void>
       gate,
       state: 'open',
       actor: 'user',
-      reason: 'manual-l5-recorder',
+      reason: 'manual-recorder',
     },
   });
 };
@@ -326,7 +376,7 @@ const createLaunchpad = async (
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Sidetrack L5 manual recorder launchpad</title>
+  <title>Sidetrack manual recorder launchpad</title>
   <style>
     body { font: 15px/1.45 system-ui, sans-serif; margin: 32px; max-width: 1120px; }
     header { display: flex; align-items: baseline; gap: 16px; border-bottom: 1px solid #ddd; }
@@ -354,7 +404,7 @@ const createLaunchpad = async (
 </head>
 <body>
   <header>
-    <h1>Sidetrack L5 manual recorder</h1>
+    <h1>Sidetrack manual recorder</h1>
     <span>Artifacts are written locally under <code>${artifactsDir}</code>.</span>
   </header>
   <div id="lp-status"></div>
@@ -507,8 +557,8 @@ const waitForConnections = async (
   return latest;
 };
 
-test.describe('manual L5 full-browser recorder', () => {
-  test('records user-driven real-page activity for L5 fixture hardening', async () => {
+test.describe('manual full-browser recorder', () => {
+  test('records user-driven real-page activity for manual review', async () => {
     test.setTimeout(0);
     process.env.SIDETRACK_E2E_HEADLESS = '0';
 
@@ -517,7 +567,7 @@ test.describe('manual L5 full-browser recorder', () => {
       defaultMode: 'persistent-playwright-manual',
     });
     const profileDir = expandTilde(process.env[PROFILE_ENV] ?? DEFAULT_PROFILE);
-    const artifactsDir = path.join(tmpdir(), 'sidetrack-manual-l5', isoStamp());
+    const artifactsDir = path.join(tmpdir(), 'sidetrack-recorder', isoStamp());
     await mkdir(artifactsDir, { recursive: true });
 
     let relay: TestRelay | undefined;
@@ -528,15 +578,20 @@ test.describe('manual L5 full-browser recorder', () => {
     try {
       relay = await startTestRelay({});
       const secret = generateRendezvousSecret().toString('base64url');
-      // Persist Companion A's vault across reruns of the manual recorder so
-      // workstreams + connections + threads the user creates in one
-      // session survive the next run. Default lives under $HOME so the
-      // location matches the rest of the manual-test convention
-      // (~/.sidetrack-test-profile etc.) and is independent of this
-      // package's working tree. Reviewer companion B stays ephemeral.
-      const persistentVaultRoot = expandTilde(
-        process.env.SIDETRACK_MANUAL_L5_VAULT_DIR ?? '~/.sidetrack-manual-l5-vault',
-      );
+      // Persist Companion A's vault across reruns so workstreams +
+      // connections + threads the user creates in one session survive
+      // the next run. Default lives under $HOME alongside the browser
+      // profile (~/.sidetrack-test-profile) so paths stay stable across
+      // updates. The recorder prompts the user when the default vault
+      // already has data — keep using it, or start a fresh timestamped
+      // vault — so old test-stage names don't bleed into new sessions.
+      // Reviewer companion B stays ephemeral.
+      const vaultEnvOverride =
+        process.env.SIDETRACK_VAULT_DIR ?? process.env.SIDETRACK_MANUAL_L5_VAULT_DIR;
+      const persistentVaultRoot =
+        vaultEnvOverride !== undefined && vaultEnvOverride.length > 0
+          ? expandTilde(vaultEnvOverride)
+          : await resolveVaultRoot('~/.sidetrack-vault');
       companionA = await startTestCompanion({
         syncRelay: relay.url,
         syncRendezvousSecret: secret,
@@ -560,7 +615,7 @@ test.describe('manual L5 full-browser recorder', () => {
         extraHostPermissions: RECORDER_HOST_PERMISSIONS,
         browserMode: modeConfig.mode,
       });
-      const reviewerProfile = await mkdtemp(path.join(tmpdir(), 'sidetrack-manual-l5-reviewer-'));
+      const reviewerProfile = await mkdtemp(path.join(tmpdir(), 'sidetrack-recorder-reviewer-'));
       runtimeB = await launchExtensionRuntime({
         userDataDir: reviewerProfile,
         extraHostPermissions: RECORDER_HOST_PERMISSIONS,
@@ -624,7 +679,7 @@ test.describe('manual L5 full-browser recorder', () => {
 
       const banner = `
 ================================================================
- SIDETRACK L5 MANUAL RECORDER READY
+ SIDETRACK MANUAL RECORDER READY
 ================================================================
 
  Browser A profile: ${profileDir}
@@ -703,7 +758,7 @@ dumps, visible screenshots, and companion/plugin result JSON.
       // eslint-disable-next-line no-console
       console.log(`
 ================================================================
- SIDETRACK L5 MANUAL RECORDER DUMPED ARTIFACTS
+ SIDETRACK MANUAL RECORDER DUMPED ARTIFACTS
 ================================================================
 
  Summary:   ${summaryPath}
