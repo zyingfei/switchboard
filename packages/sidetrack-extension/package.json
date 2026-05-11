@@ -23,6 +23,7 @@
     "e2e:login": "npm run build && node scripts/login-test-profile.mjs",
     "e2e:chrome-debug": "npm run build && node scripts/chrome-debug.mjs",
     "e2e:recorder": "npm run build && npm run e2e:prepare-companion && npm run e2e:verify && SIDETRACK_MANUAL_BROWSER_MODE=persistent-playwright-stealth-experiment SIDETRACK_E2E_STEALTH_EXPERIMENT=1 SIDETRACK_E2E_HEADLESS=0 playwright test tests/e2e/manual-l5-recorder.spec.ts --project=manual --grep manual --headed --timeout 0",
+    "e2e:recorder:fresh": "SIDETRACK_VAULT_FRESH=1 npm run e2e:recorder",
     "e2e:manual-stealth-smoke": "npm run build && SIDETRACK_MANUAL_BROWSER_MODE=persistent-playwright-stealth-experiment SIDETRACK_E2E_STEALTH_EXPERIMENT=1 SIDETRACK_E2E_HEADLESS=0 playwright test tests/e2e/manual-stealth-experiment-smoke.spec.ts --project=manual --grep manual --headed",
     "e2e:install-cft": "node scripts/install-cft.mjs",
     "e2e:gc-cft": "node scripts/gc-cft.mjs",

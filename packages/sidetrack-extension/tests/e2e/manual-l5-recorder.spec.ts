@@ -1,28 +1,28 @@
 // Manual full-browser recorder — NOT a CI test.
 //
-// Run with (one-liner from repo root):
+// Two entry points (both run in stealth mode):
+//   e2e:recorder        Reuse existing vault as-is
+//   e2e:recorder:fresh  Archive any existing vault to
+//                       <path>.backup-<iso>, start fresh
+//
+// One-liner from repo root:
 //   git pull && npm --prefix packages/sidetrack-extension run e2e:recorder \
 //     2>&1 | tee /tmp/sidetrack-recorder.log
 //
-// `e2e:recorder` runs in stealth mode (Patchright-driven Chromium so
-// chatgpt.com / claude.ai / gemini.google.com don't fight the
-// automation flag).
-//
 // The browser stays open until stdin advances the prompts:
-//   1. (only when an existing vault is detected) keep [Enter] / new vault [n]
-//   2. first Enter after recording starts: drain Sidetrack + write artifacts
-//   3. second Enter: close browsers and companion processes
+//   1. first Enter after recording starts: drain Sidetrack + write artifacts
+//   2. second Enter: close browsers and companion processes
 //
 // Defaults (override individually via env):
 //   SIDETRACK_USER_DATA_DIR=~/.sidetrack-test-profile  (browser profile — sticky)
 //   SIDETRACK_VAULT_DIR=~/.sidetrack-vault             (companion vault — sticky)
+//   SIDETRACK_VAULT_FRESH=1                            (archive + restart fresh)
 // The legacy SIDETRACK_MANUAL_L5_VAULT_DIR is still honoured for back-compat.
 
 import { randomUUID } from 'node:crypto';
 import { access, mkdir, mkdtemp, readdir, rename, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
-import { createInterface } from 'node:readline';
 
 import { expect, test, type Page } from '@playwright/test';
 
@@ -156,21 +156,6 @@ const waitForEnter = async (label: string): Promise<void> => {
   });
 };
 
-// readline-based single-line read; survives Playwright's stdin shape
-// where raw `process.stdin.once('data', …)` can drop input. Echoes
-// nothing extra — the user's terminal still shows their keystrokes.
-const readLineFromStdin = async (label: string): Promise<string> => {
-  // eslint-disable-next-line no-console
-  console.log(label);
-  const rl = createInterface({ input: process.stdin, terminal: false });
-  return await new Promise<string>((resolve) => {
-    rl.once('line', (line) => {
-      rl.close();
-      resolve(line.trim().toLowerCase());
-    });
-  });
-};
-
 const vaultHasData = async (vaultRoot: string): Promise<boolean> => {
   // Sidetrack writes vault state under `<vaultRoot>/_BAC/`. Presence is
   // a good-enough proxy for "this directory has prior recording data".
@@ -182,29 +167,31 @@ const vaultHasData = async (vaultRoot: string): Promise<boolean> => {
   }
 };
 
+// Vault resolution is non-interactive. Two npm entry points:
+//   e2e:recorder        — reuse the existing vault as-is (companion
+//                         starts with all prior workstreams + history).
+//   e2e:recorder:fresh  — sets SIDETRACK_VAULT_FRESH=1, which archives
+//                         any existing vault to <path>.backup-<iso>
+//                         and starts fresh at the canonical path.
+// The interactive "press n" prompt was unreliable under Playwright's
+// stdin handling — separate scripts are simpler and never wedge.
 const resolveVaultRoot = async (defaultPath: string): Promise<string> => {
   const resolved = expandTilde(defaultPath);
-  if (!(await vaultHasData(resolved))) {
-    // eslint-disable-next-line no-console
-    console.log(`[recorder] Using vault: ${resolved} (no prior data)`);
-    return resolved;
-  }
-  const answer = await readLineFromStdin(
-    `[recorder] Existing vault found at ${resolved}.\n` +
-      `  Press Enter to keep using it, or type 'n' + Enter to start fresh\n` +
-      `  (the existing vault will be moved to <path>.backup-<iso>).`,
-  );
-  if (answer === 'n' || answer === 'new') {
+  const wantsFresh = process.env.SIDETRACK_VAULT_FRESH === '1';
+  if (wantsFresh && (await vaultHasData(resolved))) {
     const backup = `${resolved}.backup-${isoStamp()}`;
     await rename(resolved, backup);
     // eslint-disable-next-line no-console
     console.log(`[recorder] Archived previous vault to ${backup}`);
-    // eslint-disable-next-line no-console
-    console.log(`[recorder] Starting fresh vault at ${resolved}`);
-    return resolved;
   }
   // eslint-disable-next-line no-console
-  console.log(`[recorder] Continuing with existing vault at ${resolved}`);
+  console.log(
+    wantsFresh
+      ? `[recorder] Starting fresh vault at ${resolved}`
+      : (await vaultHasData(resolved))
+        ? `[recorder] Reusing existing vault at ${resolved}`
+        : `[recorder] Using vault: ${resolved} (no prior data)`,
+  );
   return resolved;
 };
 
