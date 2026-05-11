@@ -1077,9 +1077,16 @@ const App = () => {
     [bridgeKey, fetchCompanionJson, loadTabSessionSuggestions, loadUrlSuggestions, port],
   );
 
+  // Stage 5 follow-up — `state.updatedAt` and `viewMode` are reactive
+  // (workboard state bumps, panel-tab switches), not user-initiated
+  // loads. Firing the foreground loader here flipped
+  // `tabSessionLoading` every time an attribution landed, which made
+  // the "Loading tab sessions…" line appear above the existing cards
+  // and shift them down. Use background mode; the InboxView still
+  // shows a loading skeleton when there's no projection yet.
   useEffect(() => {
     if (state.companionStatus !== 'connected') return;
-    void loadTabSessions();
+    void loadTabSessions({ background: true });
   }, [loadTabSessions, state.companionStatus, state.updatedAt, viewMode]);
 
   // Periodic refresh while the companion is connected so newly observed
@@ -5222,7 +5229,10 @@ const App = () => {
             limit: urlInbox.limit,
             offset: urlInbox.offset,
           }}
-          loading={tabSessionLoading}
+          // Stage 5 follow-up — only surface the loading line on the
+          // actual first load (no projection yet). Subsequent fetches
+          // swap data silently so existing cards don't shift down.
+          loading={tabSessionLoading && tabSessionProjection === null && urlProjection === null}
           error={tabSessionError}
           workstreams={tabSessionWorkstreams}
           suggestions={Object.fromEntries(
