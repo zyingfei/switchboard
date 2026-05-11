@@ -3484,7 +3484,15 @@ export default defineBackground(() => {
         typeof message === 'object' &&
         (message as { type?: unknown }).type === 'sidetrack.timeline.permission.granted'
       ) {
+        // Stage 5 follow-up — record the grant event AND re-sync the
+        // privacy-gated content scripts. Pre-fix, the grant flowed
+        // into the vault but `syncPrivacyGatedContentScriptRegistrations`
+        // never ran, so the engagement content script stayed
+        // unregistered (its second gate, `hasEngagementHostPermission`,
+        // had just flipped to true but nothing rechecked it). Engagement
+        // events only flowed after a full SW restart.
         void recordTimelinePermissionGranted()
+          .then(() => syncPrivacyGatedContentScriptRegistrations())
           .then(() => {
             sendResponse({ ok: true } as unknown as RuntimeResponse);
           })
@@ -3502,7 +3510,10 @@ export default defineBackground(() => {
         typeof message === 'object' &&
         (message as { type?: unknown }).type === 'sidetrack.timeline.permission.revoked'
       ) {
+        // Same as above — revoke flow must unregister the now-gated-out
+        // scripts so they stop injecting on subsequent navigations.
         void recordTimelinePermissionRevoked()
+          .then(() => syncPrivacyGatedContentScriptRegistrations())
           .then(() => {
             sendResponse({ ok: true } as unknown as RuntimeResponse);
           })
