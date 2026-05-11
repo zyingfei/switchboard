@@ -183,6 +183,13 @@ const tabSessionIdFromDragEvent = (event: DragEvent<HTMLElement>): string | null
 // transient "companion disconnected" banner. Holding to 4 in-flight
 // keeps the companion's single-threaded HTTP loop responsive AND
 // keeps the periodic /v1/system/health probe from being starved.
+//
+// Implementation: when a release happens and the queue is non-empty,
+// the slot is TRANSFERRED to the waiter (active stays the same). Only
+// when the queue is empty does release decrement active. This avoids
+// the over-allocate drift that the simpler decrement-then-resolve
+// version exhibited under heavy load (the resolve→continuation gap
+// let another acquire slip in and over-allocate).
 const COMPANION_FETCH_MAX_CONCURRENCY = 4;
 const companionFetchState = { active: 0, queue: [] as Array<() => void> };
 const acquireCompanionFetchSlot = async (): Promise<() => void> => {
@@ -192,15 +199,19 @@ const acquireCompanionFetchSlot = async (): Promise<() => void> => {
     await new Promise<void>((resolve) => {
       companionFetchState.queue.push(resolve);
     });
-    companionFetchState.active += 1;
+    // Slot was transferred to us by the previous releaser — active
+    // was NOT decremented in that path. Don't re-increment here.
   }
   let released = false;
   return () => {
     if (released) return;
     released = true;
-    companionFetchState.active -= 1;
     const next = companionFetchState.queue.shift();
-    if (next !== undefined) next();
+    if (next !== undefined) {
+      next(); // Transfer slot; active stays at MAX.
+    } else {
+      companionFetchState.active -= 1;
+    }
   };
 };
 

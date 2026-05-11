@@ -467,6 +467,11 @@ export const launchExtensionRuntime = async (
   const channel =
     process.env.SIDETRACK_E2E_BROWSER ??
     (modeConfig.stealthExperiment ? 'chromium' : cleanupOnClose ? 'chromium' : 'chrome');
+  // Optional CDP exposure so an operator can attach Playwright /
+  // chromium.connectOverCDP and inspect the live recorder session.
+  // Set SIDETRACK_E2E_CDP_DEBUG_PORT=9223 (or any free port) to enable.
+  // Defeats stealth — only use for debugging.
+  const cdpDebugPort = (process.env.SIDETRACK_E2E_CDP_DEBUG_PORT ?? '').trim();
   const launchArgs = [
     ...(headless ? ['--headless=new'] : []),
     '--no-first-run',
@@ -474,7 +479,15 @@ export const launchExtensionRuntime = async (
     ...(modeConfig.stealthExperiment ? [] : ['--disable-blink-features=AutomationControlled']),
     `--disable-extensions-except=${extensionPath}`,
     `--load-extension=${extensionPath}`,
+    ...(cdpDebugPort.length > 0
+      ? [`--remote-debugging-port=${cdpDebugPort}`, '--remote-allow-origins=*']
+      : []),
   ];
+  if (cdpDebugPort.length > 0) {
+    console.warn(
+      `[recorder] CDP debug port enabled at http://localhost:${cdpDebugPort} — attach via chromium.connectOverCDP`,
+    );
+  }
   const launchOptions = {
     channel,
     headless,
