@@ -487,4 +487,80 @@ describe('buildTopicRevision', () => {
 
     expect(JSON.stringify(first)).toBe(JSON.stringify(second));
   });
+
+  // Stage 5 follow-up — user assertions bypass the engagement gate.
+  // Without this, T3 derives relations correctly but topics stay
+  // empty in dogfood because most visits are below the 5 s gate.
+  it('forms a topic from user-asserted relations even when visits are below the engagement gate', async () => {
+    const a = 'https://example.test/a';
+    const b = 'https://example.test/b';
+    const revision = await buildTopicRevision({
+      // Both visits have 1 s focused time, well below the 5 s default
+      // gate. The user-asserted relation still unions them.
+      visits: [
+        visit(a, { focusedWindowMs: 1_000 }),
+        visit(b, { focusedWindowMs: 1_000 }),
+      ],
+      visitSimilarity: { revisionId: 'sim-empty', edges: [] },
+      userAssertedRelations: [
+        { kind: 'in_workstream' as const, fromVisitKey: a, toVisitKey: b },
+      ],
+      options: { producedAt },
+    });
+    expect(revision.topics).toHaveLength(1);
+    expect(revision.topics[0]?.memberCanonicalUrls).toEqual([a, b]);
+  });
+
+  it('keeps the engagement gate active for visits with no user assertion', async () => {
+    const a = 'https://example.test/a';
+    const b = 'https://example.test/b';
+    const c = 'https://example.test/c';
+    // a + b are user-asserted (bypass the gate). c only has a
+    // similarity edge to a, with low engagement — it should NOT be
+    // pulled into the topic.
+    const revision = await buildTopicRevision({
+      visits: [
+        visit(a, { focusedWindowMs: 1_000 }),
+        visit(b, { focusedWindowMs: 1_000 }),
+        visit(c, { focusedWindowMs: 1_000 }),
+      ],
+      visitSimilarity: {
+        revisionId: 'sim-mixed',
+        edges: [edge(a, c, 0.95)],
+      },
+      userAssertedRelations: [
+        { kind: 'in_workstream' as const, fromVisitKey: a, toVisitKey: b },
+      ],
+      options: { producedAt },
+    });
+    expect(revision.topics).toHaveLength(1);
+    expect(revision.topics[0]?.memberCanonicalUrls).toEqual([a, b]);
+  });
+
+  it('honors SIDETRACK_TOPIC_ENGAGEMENT_GATE_MS for non-asserted visits too', async () => {
+    const original = process.env['SIDETRACK_TOPIC_ENGAGEMENT_GATE_MS'];
+    process.env['SIDETRACK_TOPIC_ENGAGEMENT_GATE_MS'] = '500';
+    try {
+      const a = 'https://example.test/a';
+      const b = 'https://example.test/b';
+      const revision = await buildTopicRevision({
+        visits: [
+          visit(a, { focusedWindowMs: 800 }),
+          visit(b, { focusedWindowMs: 800 }),
+        ],
+        visitSimilarity: {
+          revisionId: 'sim-env',
+          edges: [edge(a, b, 0.95)],
+        },
+        options: { producedAt },
+      });
+      expect(revision.topics).toHaveLength(1);
+      expect(revision.topics[0]?.memberCanonicalUrls).toEqual([a, b]);
+    } finally {
+      /* eslint-disable @typescript-eslint/no-dynamic-delete */
+      if (original === undefined) delete process.env['SIDETRACK_TOPIC_ENGAGEMENT_GATE_MS'];
+      else process.env['SIDETRACK_TOPIC_ENGAGEMENT_GATE_MS'] = original;
+      /* eslint-enable @typescript-eslint/no-dynamic-delete */
+    }
+  });
 });

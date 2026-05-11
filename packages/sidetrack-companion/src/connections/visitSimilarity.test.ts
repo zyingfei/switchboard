@@ -588,22 +588,24 @@ describe('resolveVisitSimilarityConfig — Stage 5.0 follow-up', () => {
         lexicalFallbackEnabled: true,
       });
     } finally {
-      // Static deletes — keeps the linter happy AND keeps the restore
-      // logic explicit per env var, so a future reader can see which
-      // names this block touches.
-      if (previous.threshold === undefined) delete process.env.SIDETRACK_SIMILARITY_THRESHOLD;
-      else process.env.SIDETRACK_SIMILARITY_THRESHOLD = previous.threshold;
-      if (previous.topK === undefined) delete process.env.SIDETRACK_SIMILARITY_TOP_K;
-      else process.env.SIDETRACK_SIMILARITY_TOP_K = previous.topK;
+      // Restore each env var separately — keeps the names visible to a
+      // future reader, and the static keys pacify the no-dynamic-delete
+      // lint rule.
+      /* eslint-disable @typescript-eslint/no-dynamic-delete */
+      if (previous.threshold === undefined) delete process.env['SIDETRACK_SIMILARITY_THRESHOLD'];
+      else process.env['SIDETRACK_SIMILARITY_THRESHOLD'] = previous.threshold;
+      if (previous.topK === undefined) delete process.env['SIDETRACK_SIMILARITY_TOP_K'];
+      else process.env['SIDETRACK_SIMILARITY_TOP_K'] = previous.topK;
       if (previous.gate === undefined)
-        delete process.env.SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS;
-      else process.env.SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS = previous.gate;
+        delete process.env['SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS'];
+      else process.env['SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS'] = previous.gate;
       if (previous.lexical === undefined)
-        delete process.env.SIDETRACK_SIMILARITY_LEXICAL_THRESHOLD;
-      else process.env.SIDETRACK_SIMILARITY_LEXICAL_THRESHOLD = previous.lexical;
+        delete process.env['SIDETRACK_SIMILARITY_LEXICAL_THRESHOLD'];
+      else process.env['SIDETRACK_SIMILARITY_LEXICAL_THRESHOLD'] = previous.lexical;
       if (previous.fallback === undefined)
-        delete process.env.SIDETRACK_SIMILARITY_LEXICAL_FALLBACK;
-      else process.env.SIDETRACK_SIMILARITY_LEXICAL_FALLBACK = previous.fallback;
+        delete process.env['SIDETRACK_SIMILARITY_LEXICAL_FALLBACK'];
+      else process.env['SIDETRACK_SIMILARITY_LEXICAL_FALLBACK'] = previous.fallback;
+      /* eslint-enable @typescript-eslint/no-dynamic-delete */
     }
   });
 });

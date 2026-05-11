@@ -458,10 +458,17 @@ SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS                      default 5000
 SIDETRACK_SIMILARITY_TOP_K                                  default 50
 SIDETRACK_SIMILARITY_LEXICAL_THRESHOLD                      default 0.30
 SIDETRACK_SIMILARITY_LEXICAL_FALLBACK                       default on
+SIDETRACK_TOPIC_ENGAGEMENT_GATE_MS                          default 5000
 SIDETRACK_RANKER_RETRAIN_MIN_LABELS                         default 50
 SIDETRACK_TIMELINE_SAME_URL_AS_THREAD_TITLE_JACCARD         default 0.25
 SIDETRACK_TIMELINE_SAME_URL_AS_THREAD_RECENCY_WINDOW_MS     default 24 h
 ```
+
+User-asserted relations bypass `SIDETRACK_TOPIC_ENGAGEMENT_GATE_MS` —
+the user's intent (organizing a URL into a workstream) is treated as
+a stronger signal than focused-window time. Similarity edges still
+honor the gate so noisy short visits don't pull peripheral URLs into
+a topic.
 
 For the track-by-track plan see
 [`docs/proposals/work-graph-stage5-data-bridge.md`](proposals/work-graph-stage5-data-bridge.md).
