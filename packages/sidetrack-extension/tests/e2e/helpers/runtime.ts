@@ -60,6 +60,7 @@ export interface ExtensionRuntime {
   readonly userDataDir: string;
   readonly sendRuntimeMessage: (senderPage: Page, message: unknown) => Promise<unknown>;
   readonly seedStorage: (senderPage: Page, values: Record<string, unknown>) => Promise<void>;
+  readonly clearStorage: (senderPage: Page) => Promise<void>;
   readonly close: () => Promise<void>;
   readonly metadata?: ExtensionRuntimeMetadata;
 }
@@ -280,6 +281,40 @@ const attachOverCdp = async (cdpUrl: string): Promise<ExtensionRuntime> => {
             `  chrome.runtime.id: ${diagnostic.runtimeId}`,
         );
       }
+    },
+    async clearStorage(senderPage: Page) {
+      // Wipe chrome.storage.local + .session so cached projections from
+      // a prior run don't leak in. Uses the same main-world retry shape
+      // as seedStorage because chrome.* binding can lag the panel load.
+      await evaluateInMainWorld(
+        senderPage,
+        async ({ retries, intervalMs }) => {
+          const c = (
+            globalThis as unknown as {
+              chrome?: {
+                storage?: {
+                  local?: { clear?: () => Promise<void> };
+                  session?: { clear?: () => Promise<void> };
+                };
+              };
+            }
+          ).chrome;
+          const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+          for (let i = 0; i < retries; i += 1) {
+            const clearLocal = c?.storage?.local?.clear;
+            if (typeof clearLocal === 'function') {
+              await clearLocal.call(c?.storage?.local);
+              const clearSession = c?.storage?.session?.clear;
+              if (typeof clearSession === 'function') {
+                await clearSession.call(c?.storage?.session);
+              }
+              return;
+            }
+            await sleep(intervalMs);
+          }
+        },
+        { retries: 50, intervalMs: 100 },
+      );
     },
     async close() {
       // Don't close the user's Chrome AND don't call browser.close()
@@ -549,6 +584,37 @@ export const launchExtensionRuntime = async (
             `  chrome.runtime.id: ${diagnostic.runtimeId}`,
         );
       }
+    },
+    async clearStorage(senderPage: Page) {
+      await evaluateInMainWorld(
+        senderPage,
+        async ({ retries, intervalMs }) => {
+          const c = (
+            globalThis as unknown as {
+              chrome?: {
+                storage?: {
+                  local?: { clear?: () => Promise<void> };
+                  session?: { clear?: () => Promise<void> };
+                };
+              };
+            }
+          ).chrome;
+          const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+          for (let i = 0; i < retries; i += 1) {
+            const clearLocal = c?.storage?.local?.clear;
+            if (typeof clearLocal === 'function') {
+              await clearLocal.call(c?.storage?.local);
+              const clearSession = c?.storage?.session?.clear;
+              if (typeof clearSession === 'function') {
+                await clearSession.call(c?.storage?.session);
+              }
+              return;
+            }
+            await sleep(intervalMs);
+          }
+        },
+        { retries: 50, intervalMs: 100 },
+      );
     },
     async close() {
       try {

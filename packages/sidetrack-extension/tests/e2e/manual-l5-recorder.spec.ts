@@ -283,19 +283,11 @@ const openRecorderSidepanel = async (
   // projections (workstreams, active workstream id, tab sessions, …)
   // in chrome.storage.local under the browser profile — that profile
   // is sticky across runs so the cache survives. Wipe it now, before
-  // the panel renders, so the user sees a truly empty slate.
+  // the panel seeds, so the user sees a truly empty slate.
+  // Uses runtime.clearStorage so the evaluate runs in the main world
+  // (patchright's default isolated context can't see chrome.*).
   if (process.env.SIDETRACK_VAULT_FRESH === '1') {
-    await page.evaluate(async () => {
-      const c = (
-        globalThis as unknown as {
-          chrome?: { storage?: { local?: { clear?: () => Promise<void> } } };
-        }
-      ).chrome;
-      const clearFn = c?.storage?.local?.clear;
-      if (typeof clearFn === 'function') {
-        await clearFn.call(c?.storage?.local);
-      }
-    });
+    await runtime.clearStorage(page);
     // eslint-disable-next-line no-console
     console.log('[recorder] Cleared chrome.storage.local for fresh-vault run');
   }
