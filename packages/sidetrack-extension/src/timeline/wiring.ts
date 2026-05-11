@@ -390,6 +390,29 @@ interface InitDeps {
 // same drain path (used by tests + a side-panel "drain now" path).
 let capturedInitDeps: InitDeps | null = null;
 
+// Captured at init() so external content-script-driven title updates
+// (entrypoints/title-watcher.content.ts) can flow through the same
+// observer pipeline. Set to null when the gate is closed / wiring
+// isn't initialized.
+let contentTitleSink:
+  | ((input: { tabId: number; windowId: number; url: string; title: string }) => Promise<void>)
+  | null = null;
+
+// External entry point — background.ts routes
+// `sidetrack.timeline.titleObserved` runtime messages from the
+// content script here. Silently no-ops when wiring isn't ready (gate
+// closed, pre-init, etc.) so the content script can fire without
+// worrying about timing.
+export const recordTitleFromContent = async (input: {
+  readonly tabId: number;
+  readonly windowId: number;
+  readonly url: string;
+  readonly title: string;
+}): Promise<void> => {
+  if (contentTitleSink === null) return;
+  await contentTitleSink(input);
+};
+
 const tryDrain = async (deps: InitDeps): Promise<{ uploaded: number; remaining: number }> => {
   const companion = await deps.readCompanion();
   if (companion === null || companion.url.trim().length === 0) {
@@ -484,6 +507,34 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
     hashWindowId,
     onAdmit: activityDrain.schedule,
   });
+
+  // Wire the content-script title sink. The content script
+  // (entrypoints/title-watcher.content.ts) pushes document.title
+  // changes here the moment they happen — direct DOM read, no
+  // chrome.tabs.title round-trip. Same approach the AI-chat content
+  // script uses for its threads; broadened to every URL so the Inbox
+  // and Current-tab card light up as fast as All Threads does.
+  contentTitleSink = async (input) => {
+    if (!isTrackableUrl(input.url)) return;
+    const gateOpen = await readTimelineGateState();
+    if (!gateOpen) return;
+    const tabSession = await tabSessions.recordActivity({
+      tabIdHash: hashTabId(input.tabId, input.windowId),
+      windowIdHash: hashWindowId(input.windowId),
+      url: input.url,
+    });
+    observer.observe({
+      tabId: input.tabId,
+      windowId: input.windowId,
+      url: input.url,
+      title: input.title,
+      transition: 'updated',
+      tabSessionId: tabSession.tabSessionId,
+      ...(tabSession.openerTabSessionId === undefined
+        ? {}
+        : { openerTabSessionId: tabSession.openerTabSessionId }),
+    });
+  };
 
   // Stealth Chromium / patchright sometimes blocks `chrome.tabs.title`
   // from reflecting `document.title` changes — the URL-shaped fake

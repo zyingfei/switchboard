@@ -42,6 +42,7 @@ import {
   ACTIVE_WORKSTREAM_KEY,
   initializeTimelineWiring,
   readTimelineReplayDiagnostics,
+  recordTitleFromContent,
   refreshActiveWorkstreamFromStorage,
   resetTimelineWiringForTests,
   setActiveWorkstreamCache,
@@ -3567,6 +3568,36 @@ export default defineBackground(() => {
               error: error instanceof Error ? error.message : 'timeline diagnostics failed',
             } as unknown as RuntimeResponse);
           });
+        return true;
+      }
+      // Content-script title push (entrypoints/title-watcher.content.ts).
+      // Bypasses tab.title's stealth-Chromium blind spots by reading
+      // document.title directly from the page DOM. Fire-and-forget;
+      // no response needed.
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.timeline.titleObserved'
+      ) {
+        const payload = message as { url?: unknown; title?: unknown };
+        const senderTab = sender.tab;
+        if (
+          typeof payload.url === 'string' &&
+          payload.url.length > 0 &&
+          typeof payload.title === 'string' &&
+          payload.title.length > 0 &&
+          senderTab !== undefined &&
+          typeof senderTab.id === 'number' &&
+          typeof senderTab.windowId === 'number'
+        ) {
+          void recordTitleFromContent({
+            tabId: senderTab.id,
+            windowId: senderTab.windowId,
+            url: payload.url,
+            title: payload.title,
+          }).catch(() => undefined);
+        }
+        sendResponse({ ok: true } as unknown as RuntimeResponse);
         return true;
       }
       // Force-drain the timeline spool. Used by e2e tests + the
