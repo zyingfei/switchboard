@@ -38,6 +38,8 @@ import { projectSnippetLineage } from '../snippets/projection.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../tabsession/events.js';
 import type { TabSessionProjection } from '../tabsession/projection.js';
+import type { UrlProjection } from '../urls/projection.js';
+import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import { THREAD_UPSERTED, isThreadUpsertedPayload } from '../threads/events.js';
 import {
   BROWSER_TIMELINE_OBSERVED,
@@ -198,6 +200,11 @@ export interface ConnectionsInput {
   readonly codingSessions: readonly CodingSessionVaultRecord[];
   readonly timelineDays: readonly TimelineDayProjection[];
   readonly tabSessionProjection: TabSessionProjection;
+  // Per-canonical-URL attribution (preferred over tab-session
+  // attribution for visit-instance edges — the user attributes pages,
+  // not tabs). Optional for back-compat with older callers that haven't
+  // wired the projection yet.
+  readonly urlProjection?: UrlProjection;
   readonly visitSimilarity?: VisitSimilarityRevision;
   readonly topicRevision?: TopicRevision;
   readonly topicWorkstreamShareThreshold?: number;
@@ -1075,11 +1082,43 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
         provider: instance.provider,
       },
     });
+    // Hydrate the tab-session node from the projection so frontend
+    // surfaces (Connections nodes, AttributionProvenance anchors,
+    // FlowPath labels) can render a human-friendly title instead of
+    // the raw tabSessionId. The frontend's entityDisplay layer is the
+    // load-bearing guard against id leaks — this just makes the
+    // server-side label informative too.
+    const tabSessionRecord = input.tabSessionProjection.bySessionId.get(instance.tabSessionId);
+    const tabSessionLatestTitle = tabSessionRecord?.latestTitle;
+    const tabSessionLatestUrl = tabSessionRecord?.latestUrl;
+    const tabSessionProvider = tabSessionRecord?.provider ?? instance.provider;
+    const tabSessionLastActivityAt = tabSessionRecord?.lastActivityAt;
+    const hostFromUrl = (raw: string | undefined): string | undefined => {
+      if (raw === undefined || raw.length === 0) return undefined;
+      try {
+        const host = new URL(raw).host;
+        return host.length > 0 ? host : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+    const tabSessionLabel =
+      tabSessionLatestTitle ??
+      instance.title ??
+      hostFromUrl(tabSessionLatestUrl ?? instance.url) ??
+      instance.tabSessionId;
     upsertNode(nodes, {
       kind: 'tab-session',
       key: instance.tabSessionId,
-      label: instance.tabSessionId,
+      label: tabSessionLabel,
       observedAt: instance.firstSeenAt,
+      metadata: {
+        latestTitle: tabSessionLatestTitle,
+        latestUrl: tabSessionLatestUrl,
+        canonicalUrl: instance.canonicalUrl,
+        provider: tabSessionProvider,
+        lastActivityAt: tabSessionLastActivityAt,
+      },
     });
     upsertEdge(edges, {
       kind: 'visit_instance_same_url_as_timeline_visit',
@@ -1102,10 +1141,29 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
       instance.openerTabSessionId.length > 0 &&
       instance.openerTabSessionId !== instance.tabSessionId
     ) {
+      // Same hydration for the opener — degrade gracefully when its
+      // projection record is absent.
+      const openerRecord = input.tabSessionProjection.bySessionId.get(
+        instance.openerTabSessionId,
+      );
+      const openerLabel =
+        openerRecord?.latestTitle ??
+        hostFromUrl(openerRecord?.latestUrl) ??
+        instance.openerTabSessionId;
       upsertNode(nodes, {
         kind: 'tab-session',
         key: instance.openerTabSessionId,
-        label: instance.openerTabSessionId,
+        label: openerLabel,
+        ...(openerRecord === undefined
+          ? {}
+          : {
+              metadata: {
+                latestTitle: openerRecord.latestTitle,
+                latestUrl: openerRecord.latestUrl,
+                provider: openerRecord.provider,
+                lastActivityAt: openerRecord.lastActivityAt,
+              },
+            }),
       });
       upsertEdge(edges, {
         kind: 'tab_session_opener_chain',
@@ -1116,42 +1174,75 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
         confidence: 'observed',
       });
     }
-    const attribution = input.tabSessionProjection.bySessionId.get(
+    // URL attribution is the primary source for `visit_instance_in_workstream`
+    // edges — the user attributes pages, not tabs. Tab-session attribution
+    // still drives `tab_session_in_workstream` and acts as a fallback when
+    // no URL attribution exists yet.
+    const lookupCanonical = instance.canonicalUrl ?? instance.url;
+    const urlAttribution =
+      lookupCanonical === undefined
+        ? undefined
+        : input.urlProjection?.byCanonicalUrl.get(lookupCanonical)?.currentAttribution;
+    const tabSessionAttribution = input.tabSessionProjection.bySessionId.get(
       instance.tabSessionId,
     )?.currentAttribution;
-    if (attribution === undefined || attribution.workstreamId === null) continue;
+    if (tabSessionAttribution !== undefined && tabSessionAttribution.workstreamId !== null) {
+      upsertNode(nodes, {
+        kind: 'workstream',
+        key: tabSessionAttribution.workstreamId,
+        label: tabSessionAttribution.workstreamId,
+      });
+      upsertEdge(edges, {
+        kind: 'tab_session_in_workstream',
+        fromNodeId: nodeIdFor('tab-session', instance.tabSessionId),
+        toNodeId: nodeIdFor('workstream', tabSessionAttribution.workstreamId),
+        observedAt: tabSessionAttribution.observedAt,
+        producedBy: {
+          source: 'event-log',
+          eventType:
+            tabSessionAttribution.source === 'inferred'
+              ? TAB_SESSION_ATTRIBUTION_INFERRED
+              : USER_ORGANIZED_ITEM,
+          dot: { replicaId: tabSessionAttribution.replicaId, seq: tabSessionAttribution.seq },
+        },
+        confidence: tabSessionAttribution.source === 'inferred' ? 'inferred' : 'asserted',
+        metadata: { attributionSource: tabSessionAttribution.source },
+      });
+    }
+    // Pick the effective attribution for the visit-instance: URL takes
+    // precedence; tab-session is the fallback.
+    const effective =
+      urlAttribution !== undefined && urlAttribution.workstreamId !== null
+        ? { ...urlAttribution, origin: 'canonical-url' as const }
+        : tabSessionAttribution !== undefined && tabSessionAttribution.workstreamId !== null
+          ? { ...tabSessionAttribution, origin: 'tab-session' as const }
+          : null;
+    if (effective === null || effective.workstreamId === null) continue;
     upsertNode(nodes, {
       kind: 'workstream',
-      key: attribution.workstreamId,
-      label: attribution.workstreamId,
-    });
-    upsertEdge(edges, {
-      kind: 'tab_session_in_workstream',
-      fromNodeId: nodeIdFor('tab-session', instance.tabSessionId),
-      toNodeId: nodeIdFor('workstream', attribution.workstreamId),
-      observedAt: attribution.observedAt,
-      producedBy: {
-        source: 'event-log',
-        eventType:
-          attribution.source === 'inferred' ? TAB_SESSION_ATTRIBUTION_INFERRED : USER_ORGANIZED_ITEM,
-        dot: { replicaId: attribution.replicaId, seq: attribution.seq },
-      },
-      confidence: attribution.source === 'inferred' ? 'inferred' : 'asserted',
-      metadata: { attributionSource: attribution.source },
+      key: effective.workstreamId,
+      label: effective.workstreamId,
     });
     upsertEdge(edges, {
       kind: 'visit_instance_in_workstream',
       fromNodeId: instanceNodeId,
-      toNodeId: nodeIdFor('workstream', attribution.workstreamId),
+      toNodeId: nodeIdFor('workstream', effective.workstreamId),
       observedAt: instance.firstSeenAt,
       producedBy: {
         source: 'event-log',
         eventType:
-          attribution.source === 'inferred' ? TAB_SESSION_ATTRIBUTION_INFERRED : USER_ORGANIZED_ITEM,
-        dot: { replicaId: attribution.replicaId, seq: attribution.seq },
+          effective.source === 'inferred'
+            ? effective.origin === 'canonical-url'
+              ? URL_ATTRIBUTION_INFERRED
+              : TAB_SESSION_ATTRIBUTION_INFERRED
+            : USER_ORGANIZED_ITEM,
+        dot: { replicaId: effective.replicaId, seq: effective.seq },
       },
-      confidence: attribution.source === 'inferred' ? 'inferred' : 'asserted',
-      metadata: { attributionSource: attribution.source },
+      confidence: effective.source === 'inferred' ? 'inferred' : 'asserted',
+      metadata: {
+        attributionSource: effective.source,
+        attributionOrigin: effective.origin,
+      },
     });
   }
 

@@ -42,6 +42,7 @@ import {
   ACTIVE_WORKSTREAM_KEY,
   initializeTimelineWiring,
   readTimelineReplayDiagnostics,
+  recordTitleFromContent,
   refreshActiveWorkstreamFromStorage,
   resetTimelineWiringForTests,
   setActiveWorkstreamCache,
@@ -376,11 +377,34 @@ const readPrivacyProjection = async (): Promise<PrivacyProjectionPayload> => {
   };
 };
 
+// chrome.tabs.onUpdated can fire many times per navigation. Every call
+// of the gate predicate used to make an HTTP round-trip to the
+// companion (`/v1/privacy/projection`), which made the SW slow and
+// fragile: under contention the projection fetch could time out, the
+// gate would read as closed, and the listener would skip the
+// observation entirely. Cache the result for a short window. The cache
+// is busted whenever the gate flips via a Class A event handler so the
+// spec's `sidetrack.privacy.gateChanged` propagates immediately.
+const GATE_CACHE_TTL_MS = 5_000;
+let cachedTimelineGateState: { value: boolean; expiresAtMs: number } | null = null;
+
+const invalidateTimelineGateCache = (): void => {
+  cachedTimelineGateState = null;
+};
+
 const isTimelinePrivacyGateOpen = async (): Promise<boolean> => {
+  const now = Date.now();
+  if (cachedTimelineGateState !== null && cachedTimelineGateState.expiresAtMs > now) {
+    return cachedTimelineGateState.value;
+  }
   try {
     const projection = await readPrivacyProjection();
-    return projection.gateStates?.[TIMELINE_PRIVACY_GATE] === 'open';
+    const value = projection.gateStates?.[TIMELINE_PRIVACY_GATE] === 'open';
+    cachedTimelineGateState = { value, expiresAtMs: now + GATE_CACHE_TTL_MS };
+    return value;
   } catch {
+    // Don't cache failures — the companion may briefly be unreachable
+    // and we want the next call to retry rather than wedge "closed".
     return false;
   }
 };
@@ -3375,6 +3399,7 @@ export default defineBackground(() => {
         typeof message === 'object' &&
         (message as { type?: unknown }).type === 'sidetrack.privacy.gateChanged'
       ) {
+        invalidateTimelineGateCache();
         void syncPrivacyGatedContentScriptRegistrations()
           .then(() => {
             sendResponse({ ok: true } as unknown as RuntimeResponse);
@@ -3435,6 +3460,7 @@ export default defineBackground(() => {
         const enabled = (message as { enabled?: unknown }).enabled === true;
         void (async () => {
           await setTimelinePrivacyGate(enabled);
+          invalidateTimelineGateCache();
           resetTimelineWiringForTests();
           await initializeTimelineWiring({
             readCompanion: readTimelineCompanionConfig,
@@ -3518,6 +3544,7 @@ export default defineBackground(() => {
               : undefined;
         void (async () => {
           await bootstrapTimelinePrivacyGate().catch(() => undefined);
+          invalidateTimelineGateCache();
           if (explicitWorkstreamId !== undefined) {
             // Strings of length 0 are normalised to "remove the key"
             // so the cache returns to the unfocused state.
@@ -3567,6 +3594,92 @@ export default defineBackground(() => {
               error: error instanceof Error ? error.message : 'timeline diagnostics failed',
             } as unknown as RuntimeResponse);
           });
+        return true;
+      }
+      // Always-available diagnostic for the title-push pipeline.
+      //
+      // Stealth Chromium suspends the SW aggressively; the async
+      // sendMessage response sometimes drops with
+      //   "The message port closed before a response was received".
+      // Workaround: also stash the result in chrome.storage.session
+      // under 'sidetrack.dev.diag' so the caller can read it back even
+      // if the response message channel died.
+      //
+      // From any extension DevTools console:
+      //   chrome.runtime.sendMessage({type:'sidetrack.dev.diag'});
+      //   // ... then a moment later:
+      //   chrome.storage.session.get('sidetrack.dev.diag').then(console.log);
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.dev.diag'
+      ) {
+        void readTimelineReplayDiagnostics()
+          .then(async (diagnostics) => {
+            try {
+              await chrome.storage.session.set({
+                'sidetrack.dev.diag': { capturedAt: new Date().toISOString(), diagnostics },
+              });
+            } catch {
+              // session storage may not be available in some test harnesses
+            }
+            sendResponse({ ok: true, diagnostics } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'diag failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
+      // Content-script title push (entrypoints/title-watcher.content.ts).
+      // Bypasses tab.title's stealth-Chromium blind spots by reading
+      // document.title directly from the page DOM. Fire-and-forget;
+      // no response needed.
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.timeline.titleObserved'
+      ) {
+        const payload = message as { url?: unknown; title?: unknown };
+        const senderTab = sender.tab;
+        console.log(
+          '[sidetrack:title-handler] received',
+          typeof payload.title === 'string' ? payload.title : '<no-title>',
+          'tabId:',
+          senderTab?.id,
+          'url:',
+          typeof payload.url === 'string' ? payload.url : '<no-url>',
+        );
+        if (
+          typeof payload.url === 'string' &&
+          payload.url.length > 0 &&
+          typeof payload.title === 'string' &&
+          payload.title.length > 0 &&
+          senderTab !== undefined &&
+          typeof senderTab.id === 'number' &&
+          typeof senderTab.windowId === 'number'
+        ) {
+          void recordTitleFromContent({
+            tabId: senderTab.id,
+            windowId: senderTab.windowId,
+            url: payload.url,
+            title: payload.title,
+          })
+            .then(() => {
+              console.log('[sidetrack:title-handler] recorded', payload.title);
+            })
+            .catch((err: unknown) => {
+              console.warn('[sidetrack:title-handler] record failed', err);
+            });
+        } else {
+          console.warn(
+            '[sidetrack:title-handler] rejected payload — missing/invalid fields',
+            { hasUrl: typeof payload.url === 'string', hasTitle: typeof payload.title === 'string', hasTab: senderTab !== undefined },
+          );
+        }
+        sendResponse({ ok: true } as unknown as RuntimeResponse);
         return true;
       }
       // Force-drain the timeline spool. Used by e2e tests + the

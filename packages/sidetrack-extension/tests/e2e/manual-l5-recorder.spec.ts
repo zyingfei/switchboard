@@ -1,18 +1,28 @@
-// Manual L5 realism recorder - NOT a CI test.
+// Manual full-browser recorder — NOT a CI test.
 //
-// Run with:
-//   SIDETRACK_USER_DATA_DIR=~/.sidetrack-test-profile \
-//     npm run e2e:manual-l5-recorder
+// Two entry points (both run in stealth mode):
+//   e2e:recorder        Reuse existing vault as-is
+//   e2e:recorder:fresh  Archive any existing vault to
+//                       <path>.backup-<iso>, start fresh
 //
-// The browser stays open until stdin advances the two prompts:
-//   1. first Enter: stop recording, drain Sidetrack, write artifacts
+// One-liner from repo root:
+//   git pull && npm --prefix packages/sidetrack-extension run e2e:recorder \
+//     2>&1 | tee /tmp/sidetrack-recorder.log
+//
+// The browser stays open until stdin advances the prompts:
+//   1. first Enter after recording starts: drain Sidetrack + write artifacts
 //   2. second Enter: close browsers and companion processes
+//
+// Defaults (override individually via env):
+//   SIDETRACK_USER_DATA_DIR=~/.sidetrack-test-profile  (browser profile — sticky)
+//   SIDETRACK_VAULT_DIR=~/.sidetrack-vault             (companion vault — sticky)
+//   SIDETRACK_VAULT_FRESH=1                            (archive + restart fresh)
+// The legacy SIDETRACK_MANUAL_L5_VAULT_DIR is still honoured for back-compat.
 
 import { randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readdir, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readdir, rename, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import { expect, test, type Page } from '@playwright/test';
 
@@ -51,9 +61,6 @@ interface ConnectionsEnvelope {
   };
 }
 
-const packageRoot = path.resolve(fileURLToPath(new URL('../../../', import.meta.url)));
-
-const CODEX_COLLECTOR_ID = 'sidetrack.codex-cli';
 const RECORDER_HOST_PERMISSIONS = ['https://*/*', 'http://*/*'] as const;
 const PROFILE_ENV = 'SIDETRACK_USER_DATA_DIR';
 const DEFAULT_PROFILE = '~/.sidetrack-test-profile';
@@ -138,9 +145,6 @@ const expandTilde = (input: string): string =>
 
 const isoStamp = (): string => new Date().toISOString().replace(/[:.]/gu, '-');
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
-
 const waitForEnter = async (label: string): Promise<void> => {
   // eslint-disable-next-line no-console
   console.log(label);
@@ -150,6 +154,45 @@ const waitForEnter = async (label: string): Promise<void> => {
       resolve();
     });
   });
+};
+
+const vaultHasData = async (vaultRoot: string): Promise<boolean> => {
+  // Sidetrack writes vault state under `<vaultRoot>/_BAC/`. Presence is
+  // a good-enough proxy for "this directory has prior recording data".
+  try {
+    await access(path.join(vaultRoot, '_BAC'));
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+// Vault resolution is non-interactive. Two npm entry points:
+//   e2e:recorder        — reuse the existing vault as-is (companion
+//                         starts with all prior workstreams + history).
+//   e2e:recorder:fresh  — sets SIDETRACK_VAULT_FRESH=1, which archives
+//                         any existing vault to <path>.backup-<iso>
+//                         and starts fresh at the canonical path.
+// The interactive "press n" prompt was unreliable under Playwright's
+// stdin handling — separate scripts are simpler and never wedge.
+const resolveVaultRoot = async (defaultPath: string): Promise<string> => {
+  const resolved = expandTilde(defaultPath);
+  const wantsFresh = process.env.SIDETRACK_VAULT_FRESH === '1';
+  if (wantsFresh && (await vaultHasData(resolved))) {
+    const backup = `${resolved}.backup-${isoStamp()}`;
+    await rename(resolved, backup);
+    // eslint-disable-next-line no-console
+    console.log(`[recorder] Archived previous vault to ${backup}`);
+  }
+  // eslint-disable-next-line no-console
+  console.log(
+    wantsFresh
+      ? `[recorder] Starting fresh vault at ${resolved}`
+      : (await vaultHasData(resolved))
+        ? `[recorder] Reusing existing vault at ${resolved}`
+        : `[recorder] Using vault: ${resolved} (no prior data)`,
+  );
+  return resolved;
 };
 
 const withTimeout = async <T>(
@@ -222,7 +265,7 @@ const openPrivacyGate = async (comp: TestCompanion, gate: string): Promise<void>
       gate,
       state: 'open',
       actor: 'user',
-      reason: 'manual-l5-recorder',
+      reason: 'manual-recorder',
     },
   });
 };
@@ -230,12 +273,28 @@ const openPrivacyGate = async (comp: TestCompanion, gate: string): Promise<void>
 const openRecorderSidepanel = async (
   runtime: ExtensionRuntime,
   comp: TestCompanion,
-  activeWorkstreamId: string,
 ): Promise<Page> => {
   const page = await runtime.context.newPage();
   await page.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
     waitUntil: 'domcontentloaded',
   });
+  // When the operator picked `e2e:recorder:fresh`, the companion vault
+  // was already moved to backup. But the extension caches its
+  // projections (workstreams, active workstream id, tab sessions, …)
+  // in chrome.storage.local under the browser profile — that profile
+  // is sticky across runs so the cache survives. Wipe it now, before
+  // the panel seeds, so the user sees a truly empty slate.
+  // Uses runtime.clearStorage so the evaluate runs in the main world
+  // (patchright's default isolated context can't see chrome.*).
+  if (process.env.SIDETRACK_VAULT_FRESH === '1') {
+    await runtime.clearStorage(page);
+    // eslint-disable-next-line no-console
+    console.log('[recorder] Cleared chrome.storage.local for fresh-vault run');
+  }
+  // Seed only what's needed to pair the side panel with the spawned
+  // companion. Workstreams + activeWorkstreamId stay un-seeded so the
+  // recording is fully organic — the user creates / picks workstreams
+  // through the panel UI like they would in production.
   await runtime.seedStorage(page, {
     [SETUP_KEY]: true,
     [SETTINGS_KEY]: {
@@ -245,7 +304,6 @@ const openRecorderSidepanel = async (
       notifyOnQueueComplete: true,
     },
     'sidetrack.timeline.enabled': true,
-    'sidetrack.activeWorkstreamId': activeWorkstreamId,
   });
   await page.reload({ waitUntil: 'domcontentloaded' });
   await expect(page.getByRole('main', { name: 'Sidetrack workboard' })).toBeVisible({
@@ -312,8 +370,6 @@ const writeJson = async (filePath: string, value: unknown): Promise<void> => {
 const createLaunchpad = async (
   artifactsDir: string,
   input: {
-    readonly securityWorkstreamId: string;
-    readonly switchboardWorkstreamId: string;
     readonly browserPanelUrl: string;
     readonly reviewerPanelUrl: string;
   },
@@ -323,7 +379,7 @@ const createLaunchpad = async (
       .map(
         (link) => `
           <li>
-            <a href="${link.url}" target="_blank" rel="noreferrer">${link.title}</a>
+            <a href="${link.url}" target="_blank" rel="noreferrer" data-open-live-link>${link.title}</a>
             <small>${link.note}</small>
           </li>`,
       )
@@ -333,7 +389,7 @@ const createLaunchpad = async (
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Sidetrack L5 manual recorder launchpad</title>
+  <title>Sidetrack manual recorder launchpad</title>
   <style>
     body { font: 15px/1.45 system-ui, sans-serif; margin: 32px; max-width: 1120px; }
     header { display: flex; align-items: baseline; gap: 16px; border-bottom: 1px solid #ddd; }
@@ -345,20 +401,32 @@ const createLaunchpad = async (
     small { display: block; color: #555; margin-top: 2px; }
     code { background: #f4f4f4; padding: 2px 5px; border-radius: 4px; }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; }
+    #lp-status {
+      margin-top: 12px;
+      padding: 8px 12px;
+      background: #fff8c5;
+      border: 1px solid #d4a72c;
+      border-radius: 4px;
+      font-family: ui-monospace, monospace;
+      font-size: 13px;
+      display: none;
+    }
+    #lp-status.lp-ok { background: #dafbe1; border-color: #1a7f37; }
+    #lp-status.lp-fail { background: #ffebe9; border-color: #cf222e; }
   </style>
 </head>
 <body>
   <header>
-    <h1>Sidetrack L5 manual recorder</h1>
+    <h1>Sidetrack manual recorder</h1>
     <span>Artifacts are written locally under <code>${artifactsDir}</code>.</span>
   </header>
+  <div id="lp-status"></div>
   <h2>Before clicking links</h2>
   <ol>
-    <li>Use the Sidetrack panel tab for Browser A to keep the active workstream aligned.</li>
-    <li>Security flow workstream id: <code>${input.securityWorkstreamId}</code>.</li>
-    <li>Switchboard flow workstream id: <code>${input.switchboardWorkstreamId}</code>.</li>
-    <li>Browser A panel: <a href="${input.browserPanelUrl}" target="_blank" rel="noreferrer">${input.browserPanelUrl}</a>.</li>
-    <li>Reviewer panel: <a href="${input.reviewerPanelUrl}" target="_blank" rel="noreferrer">${input.reviewerPanelUrl}</a>.</li>
+    <li>Open the Browser A side panel and create whatever workstreams you want for this session — they persist across reruns now, so reuse last session's if you'd like.</li>
+    <li>Pick the active workstream pill that matches what you're about to research before clicking the launchpad links below.</li>
+    <li>Browser A panel: <a href="${input.browserPanelUrl}" target="_blank" rel="noreferrer" data-open-live-link>${input.browserPanelUrl}</a>.</li>
+    <li>Reviewer panel: <a href="${input.reviewerPanelUrl}" target="_blank" rel="noreferrer" data-open-live-link>${input.reviewerPanelUrl}</a>.</li>
   </ol>
   <div class="grid">
     <section>
@@ -370,6 +438,46 @@ const createLaunchpad = async (
       <ul>${linkSections('switchboard')}</ul>
     </section>
   </div>
+  <script>
+    // Plain <a target="_blank"> from a file:// opener under stealth/CFT
+    // leaves the new tab spinning on about:blank because the popup
+    // inherits the file:// opener and cross-origin navigation gets blocked.
+    // Programmatic window.open() with opener detached sidesteps the issue.
+    const status = document.getElementById('lp-status');
+    const setStatus = (msg, kind) => {
+      if (!status) return;
+      status.textContent = '[launchpad] ' + msg;
+      status.className = kind ? 'lp-' + kind : '';
+      status.style.display = 'block';
+    };
+    setStatus('inline script ready; click any link to test handler', 'ok');
+    document.addEventListener('click', (event) => {
+      if (event.defaultPrevented || event.button !== 0) return;
+      if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      const target = event.target instanceof Element
+        ? event.target.closest('a[data-open-live-link]')
+        : null;
+      if (!(target instanceof HTMLAnchorElement)) {
+        setStatus('click ignored (target=' + (event.target instanceof Element ? event.target.tagName : 'non-element') + ')');
+        return;
+      }
+      event.preventDefault();
+      setStatus('opening: ' + target.href);
+      const opened = window.open(target.href, '_blank');
+      if (opened === null) {
+        setStatus('window.open returned null; falling back to in-place navigation', 'fail');
+        window.location.href = target.href;
+        return;
+      }
+      try {
+        opened.opener = null;
+      } catch (e) {
+        setStatus('opener detach threw: ' + (e instanceof Error ? e.message : String(e)), 'fail');
+      }
+      opened.focus();
+      setStatus('opened new tab for ' + target.href, 'ok');
+    });
+  </script>
 </body>
 </html>
 `;
@@ -420,90 +528,31 @@ const renderConnectionsForReview = async (
   });
 };
 
-const collectorManifest = (): string => `id = "${CODEX_COLLECTOR_ID}"
-name = "Sidetrack Codex CLI"
-version = "0.1.0"
-manifest_schema = 1
+interface CompanionWorkstream {
+  readonly bac_id: string;
+  readonly title: string;
+}
 
-[compatibility]
-requires-companion = ">=1.0.0 <2.0.0"
-requires-vault = 1
-
-[[emits]]
-event_type = "session_started"
-payload_version = 1
-stability = "alpha"
-
-[[emits]]
-event_type = "session_turn"
-payload_version = 1
-stability = "alpha"
-
-[io]
-rotation = "daily"
-
-[capabilities]
-reads-paths = []
-reads-env = []
-reads-network = false
-default-enabled = true
-
-[process]
-managed-by = "user"
-`;
-
-const writeCollectorDemo = async (
-  vaultPath: string,
-  input: {
-    readonly dispatchId: string;
-    readonly codingSessionId: string;
-  },
-): Promise<void> => {
-  const manifestDir = path.join(vaultPath, '_BAC', 'collectors', CODEX_COLLECTOR_ID);
-  await mkdir(manifestDir, { recursive: true });
-  await writeFile(path.join(manifestDir, 'collector.toml'), collectorManifest(), 'utf8');
-  const now = Date.now();
-  const runId = `manual-${randomUUID()}`;
-  const line = (eventType: 'session_started' | 'session_turn', offsetMs: number): string =>
-    JSON.stringify({
-      collector_id: CODEX_COLLECTOR_ID,
-      event_type: eventType,
-      payload_version: 1,
-      emitted_at: new Date(now + offsetMs).toISOString(),
-      collector_version: '0.1.0',
-      collector_run_id: runId,
-      source_record_id: `${input.codingSessionId}:${eventType}`,
-      dimensions: {
-        dispatchId: input.dispatchId,
-        codingSessionId: input.codingSessionId,
-      },
-      payload:
-        eventType === 'session_started'
-          ? {
-              session_id: input.codingSessionId,
-              started_at: new Date(now + offsetMs).toISOString(),
-              cwd: packageRoot,
-              model: 'manual-recorder',
-            }
-          : {
-              session_id: input.codingSessionId,
-              turn_index: 0,
-              started_at: new Date(now + offsetMs).toISOString(),
-              completed_at: new Date(now + offsetMs + 1000).toISOString(),
-              model: 'manual-recorder',
-              prompt_text: `Manual recorder dispatch ${input.dispatchId}`,
-              response_text: 'Manual coding-agent turn observed for L5 result review.',
-              tool_call_count: 1,
-              exec_command_count: 1,
-            },
-    });
-  const inboxDir = path.join(vaultPath, '_BAC', 'inbox', CODEX_COLLECTOR_ID);
-  await mkdir(inboxDir, { recursive: true });
-  await writeFile(
-    path.join(inboxDir, `${new Date().toISOString().slice(0, 10)}.jsonl`),
-    `${line('session_started', -5000)}\n${line('session_turn', -3000)}\n`,
-    'utf8',
-  );
+const listUserWorkstreams = async (comp: TestCompanion): Promise<readonly CompanionWorkstream[]> => {
+  const url = `http://127.0.0.1:${String(comp.port)}/v1/workstreams/projections`;
+  const response = await fetch(url, { headers: { 'x-bac-bridge-key': comp.bridgeKey } });
+  if (!response.ok) return [];
+  const body = (await response.json()) as {
+    readonly data?: readonly {
+      readonly bac_id?: unknown;
+      readonly deleted?: unknown;
+      readonly record?: { readonly status?: unknown; readonly value?: { readonly title?: unknown } };
+    }[];
+  };
+  const data = body.data ?? [];
+  return data.flatMap((item) => {
+    if (item.deleted === true) return [];
+    if (typeof item.bac_id !== 'string') return [];
+    const value =
+      item.record?.status === 'resolved' ? (item.record as { value?: { title?: unknown } }).value : undefined;
+    const title = typeof value?.title === 'string' ? value.title : item.bac_id;
+    return [{ bac_id: item.bac_id, title }];
+  });
 };
 
 const waitForConnections = async (
@@ -521,8 +570,8 @@ const waitForConnections = async (
   return latest;
 };
 
-test.describe('manual L5 full-browser recorder', () => {
-  test('records user-driven real-page activity for L5 fixture hardening', async () => {
+test.describe('manual full-browser recorder', () => {
+  test('records user-driven real-page activity for manual review', async () => {
     test.setTimeout(0);
     process.env.SIDETRACK_E2E_HEADLESS = '0';
 
@@ -531,7 +580,7 @@ test.describe('manual L5 full-browser recorder', () => {
       defaultMode: 'persistent-playwright-manual',
     });
     const profileDir = expandTilde(process.env[PROFILE_ENV] ?? DEFAULT_PROFILE);
-    const artifactsDir = path.join(tmpdir(), 'sidetrack-manual-l5', isoStamp());
+    const artifactsDir = path.join(tmpdir(), 'sidetrack-recorder', isoStamp());
     await mkdir(artifactsDir, { recursive: true });
 
     let relay: TestRelay | undefined;
@@ -542,9 +591,24 @@ test.describe('manual L5 full-browser recorder', () => {
     try {
       relay = await startTestRelay({});
       const secret = generateRendezvousSecret().toString('base64url');
+      // Persist Companion A's vault across reruns so workstreams +
+      // connections + threads the user creates in one session survive
+      // the next run. Default lives under $HOME alongside the browser
+      // profile (~/.sidetrack-test-profile) so paths stay stable across
+      // updates. The recorder prompts the user when the default vault
+      // already has data — keep using it, or start a fresh timestamped
+      // vault — so old test-stage names don't bleed into new sessions.
+      // Reviewer companion B stays ephemeral.
+      const vaultEnvOverride =
+        process.env.SIDETRACK_VAULT_DIR ?? process.env.SIDETRACK_MANUAL_L5_VAULT_DIR;
+      const persistentVaultRoot =
+        vaultEnvOverride !== undefined && vaultEnvOverride.length > 0
+          ? expandTilde(vaultEnvOverride)
+          : await resolveVaultRoot('~/.sidetrack-vault');
       companionA = await startTestCompanion({
         syncRelay: relay.url,
         syncRendezvousSecret: secret,
+        vaultDir: persistentVaultRoot,
       });
       companionB = await startTestCompanion({
         syncRelay: relay.url,
@@ -564,14 +628,23 @@ test.describe('manual L5 full-browser recorder', () => {
         extraHostPermissions: RECORDER_HOST_PERMISSIONS,
         browserMode: modeConfig.mode,
       });
-      const reviewerProfile = await mkdtemp(path.join(tmpdir(), 'sidetrack-manual-l5-reviewer-'));
+      const reviewerProfile = await mkdtemp(path.join(tmpdir(), 'sidetrack-recorder-reviewer-'));
       runtimeB = await launchExtensionRuntime({
         userDataDir: reviewerProfile,
         extraHostPermissions: RECORDER_HOST_PERMISSIONS,
         browserMode: modeConfig.mode,
       });
 
-      const recorder = new ManualRecorder(runtimeA.context, artifactsDir);
+      // Patchright's _evaluateOnNewDocument is a no-op so addInitScript
+      // doesn't actually inject; exposeBinding crashes Network.setCacheDisabled
+      // on closed sessions under stealth. The 'page-main-world' path skips
+      // both — installs hooks per page via main-world evaluate and polls a
+      // queue.
+      const recorder = new ManualRecorder(runtimeA.context, artifactsDir, {
+        eventHookInjection: modeConfig.stealthExperiment
+          ? 'page-main-world'
+          : 'context-init-script',
+      });
       await recorder.install();
 
       await openPrivacyGate(companionA, 'timeline');
@@ -579,20 +652,12 @@ test.describe('manual L5 full-browser recorder', () => {
       await openPrivacyGate(companionB, 'timeline');
       await openPrivacyGate(companionB, 'engagement');
 
-      const wsSecurityRes = (await apiPost(companionA, '/v1/workstreams', {
-        title: 'Copy-fail Linux security research',
-      })) as { readonly data?: { readonly bac_id?: unknown } };
-      const wsSwitchboardRes = (await apiPost(companionA, '/v1/workstreams', {
-        title: 'Switchboard PR review',
-      })) as { readonly data?: { readonly bac_id?: unknown } };
-      const wsSecurityId = wsSecurityRes.data?.bac_id;
-      const wsSwitchboardId = wsSwitchboardRes.data?.bac_id;
-      if (typeof wsSecurityId !== 'string' || typeof wsSwitchboardId !== 'string') {
-        throw new Error('workstream creation did not return ids');
-      }
-
-      const panelA = await openRecorderSidepanel(runtimeA, companionA, wsSecurityId);
-      const panelB = await openRecorderSidepanel(runtimeB, companionB, wsSecurityId);
+      // No pre-seeded workstreams. The user creates whatever workstreams
+      // they want via the side panel during the session; the persistent
+      // companion vault keeps them across reruns. Post-record analysis
+      // discovers what's there organically (see below).
+      const panelA = await openRecorderSidepanel(runtimeA, companionA);
+      const panelB = await openRecorderSidepanel(runtimeB, companionB);
       await reinitializeTimeline(runtimeA, panelA);
       await reinitializeTimeline(runtimeB, panelB);
       await grantDeeperPageAccessIfNeeded(panelA).catch((error: unknown) => {
@@ -606,8 +671,6 @@ test.describe('manual L5 full-browser recorder', () => {
         payload: {
           artifactsDir,
           profileDir,
-          securityWorkstreamId: wsSecurityId,
-          switchboardWorkstreamId: wsSwitchboardId,
           companionA: {
             port: companionA.port,
             vaultPath: companionA.vaultPath,
@@ -620,8 +683,6 @@ test.describe('manual L5 full-browser recorder', () => {
       });
 
       const launchpadUrl = await createLaunchpad(artifactsDir, {
-        securityWorkstreamId: wsSecurityId,
-        switchboardWorkstreamId: wsSwitchboardId,
         browserPanelUrl: `chrome-extension://${runtimeA.extensionId}/sidepanel.html`,
         reviewerPanelUrl: `chrome-extension://${runtimeB.extensionId}/sidepanel.html`,
       });
@@ -631,7 +692,7 @@ test.describe('manual L5 full-browser recorder', () => {
 
       const banner = `
 ================================================================
- SIDETRACK L5 MANUAL RECORDER READY
+ SIDETRACK MANUAL RECORDER READY
 ================================================================
 
  Browser A profile: ${profileDir}
@@ -642,23 +703,21 @@ test.describe('manual L5 full-browser recorder', () => {
  Companion B      : http://127.0.0.1:${String(companionB.port)}
  Artifacts        : ${artifactsDir}
 
- Workstreams:
-   Flow A security     : ${wsSecurityId}
-   Flow B Switchboard  : ${wsSwitchboardId}
-
  Manual steps:
-   1. Use the launchpad tab to click links. Cmd-click or middle-click
+   1. In the Browser A side panel, create the workstreams you want for
+      this session (or reuse last session's — the companion vault is
+      persistent now). Pick the active workstream pill before doing
+      research that should land in it.
+   2. Use the launchpad tab to click links. Cmd-click or middle-click
       if you want a link to open in a new tab.
-   2. Keep the Sidetrack panel's active workstream on Flow A while
-      doing HN/xint/google/ChatGPT/copy.fail/GitHub exploit work.
-   3. Switch the active workstream to Flow B before GitHub
-      switchboard/pulls/ChatGPT/YouTube/Gemini.
-   4. For the dispatch direction, copy a useful snippet from
-      copy.fail and paste it into a GitHub/coding-agent input if the
-      page offers one. The recorder logs copy/paste text excerpts.
-   5. Tell Codex "done" when finished. I will stop the recorder,
-      drain Sidetrack, dump connections/timeline state, and summarize
-      the observed activities for confirmation.
+   3. Switch the active workstream pill any time the focus of your
+      research shifts.
+   4. For dispatch flows, copy a useful snippet from a source page
+      and paste it into a GitHub / coding-agent input if the page
+      offers one. The recorder logs copy/paste excerpts.
+   5. Tell Codex "done" when finished. The harness stops the recorder,
+      drains Sidetrack, dumps connections/timeline state, and reports
+      whatever workstreams + dispatches you actually created.
 
 No video is recorded. Artifacts are JSONL events, page text/html
 dumps, visible screenshots, and companion/plugin result JSON.
@@ -675,56 +734,36 @@ dumps, visible screenshots, and companion/plugin result JSON.
       const drainB = await drainRuntime(runtimeB, panelB);
       await writeJson(path.join(artifactsDir, 'drain-results.json'), { A: drainA, B: drainB });
 
-      const dispatchResponse = (await apiPost(companionA, '/v1/dispatches', {
-        kind: 'coding',
-        target: { provider: 'codex', mode: 'paste' },
-        workstreamId: wsSecurityId,
-        title: 'Manual L5 copy.fail coding dispatch',
-        body: 'Manual recorder observed copy.fail to coding-agent dispatch flow.',
-        createdAt: new Date().toISOString(),
-        mcpRequest: {
-          codingSessionId: `manual-l5-${randomUUID().replaceAll('-', '').slice(0, 12)}`,
-          approval: 'manual-recorder',
-          requestedAt: new Date().toISOString(),
-        },
-      })) as { readonly data?: { readonly bac_id?: unknown; readonly mcpRequest?: unknown } };
-      const dispatchId =
-        typeof dispatchResponse.data?.bac_id === 'string' ? dispatchResponse.data.bac_id : null;
-      const rawMcpRequest = dispatchResponse.data?.mcpRequest;
-      const mcpRequest = isRecord(rawMcpRequest) ? rawMcpRequest : {};
-      const codingSessionId =
-        typeof mcpRequest.codingSessionId === 'string'
-          ? mcpRequest.codingSessionId
-          : `manual-l5-${randomUUID().replaceAll('-', '').slice(0, 12)}`;
-      if (dispatchId !== null) {
-        await writeCollectorDemo(companionA.vaultPath, { dispatchId, codingSessionId });
+      // Discover whatever workstreams the user actually created during the
+      // recording (organic data, not pre-seeded test fixtures). If none —
+      // skip the workstream-scoped review steps without failing.
+      const userWorkstreams = await listUserWorkstreams(companionA);
+      if (userWorkstreams.length === 0) {
+        // eslint-disable-next-line no-console
+        console.log(
+          '[manual-l5] no workstreams found on Companion A; skipping workstream-scoped post-actions.',
+        );
       }
 
+      // Wait briefly for relay to mirror whatever happened to companion B.
+      // Doesn't assert any specific edge — that depends on what the user
+      // actually did during the session.
       await waitForConnections(
         companionB,
-        (env) => {
-          const edges = env.data?.snapshot?.edges ?? [];
-          return (
-            edges.some((edge) => edge.kind === 'visit_in_workstream') &&
-            (dispatchId === null ||
-              edges.some(
-                (edge) =>
-                  edge.kind === 'dispatch_in_workstream' &&
-                  edge.fromNodeId === `dispatch:${dispatchId}`,
-              ))
-          );
-        },
+        (env) => (env.data?.snapshot?.edges ?? []).length > 0,
         20_000,
-      );
+      ).catch(() => undefined);
 
       await dumpCompanionState(artifactsDir, 'browser-a', companionA);
       await dumpCompanionState(artifactsDir, 'reviewer-b', companionB);
-      await renderConnectionsForReview(panelB, wsSecurityId, artifactsDir, 'security').catch(
-        () => undefined,
-      );
-      await renderConnectionsForReview(panelB, wsSwitchboardId, artifactsDir, 'switchboard').catch(
-        () => undefined,
-      );
+      for (const ws of userWorkstreams) {
+        await renderConnectionsForReview(
+          panelB,
+          ws.bac_id,
+          artifactsDir,
+          ws.title.replaceAll(/[^a-z0-9]+/giu, '-').toLowerCase().slice(0, 32) || ws.bac_id,
+        ).catch(() => undefined);
+      }
       await recorder.snapshotPage(panelA, 'panel-a-final');
       await recorder.snapshotPage(panelB, 'panel-b-final');
       const summaryPath = path.join(artifactsDir, 'activity-summary.md');
@@ -732,7 +771,7 @@ dumps, visible screenshots, and companion/plugin result JSON.
       // eslint-disable-next-line no-console
       console.log(`
 ================================================================
- SIDETRACK L5 MANUAL RECORDER DUMPED ARTIFACTS
+ SIDETRACK MANUAL RECORDER DUMPED ARTIFACTS
 ================================================================
 
  Summary:   ${summaryPath}

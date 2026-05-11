@@ -11,10 +11,13 @@ export type ConnectionNodeKind =
   | 'inbound-reminder'
   | 'coding-session'
   | 'timeline-visit'
+  | 'visit-instance'
+  | 'tab-session'
   | 'annotation'
   | 'snippet'
   | 'topic'
-  | 'replica';
+  | 'replica'
+  | 'template';
 
 export interface ConnectionNode {
   readonly id: string;
@@ -26,13 +29,13 @@ export interface ConnectionNode {
   readonly metadata: Record<string, unknown>;
 }
 
-export type ConnectionEdgeProducedBy = {
+export interface ConnectionEdgeProducedBy {
   readonly source: string;
   readonly eventType?: string;
   readonly dot?: { readonly replicaId: string; readonly seq: number };
   readonly recordId?: string;
   readonly revisionId?: string;
-};
+}
 
 export interface ConnectionEdge {
   readonly id: string;

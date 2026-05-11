@@ -58,6 +58,7 @@ import {
 } from '../../threads/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../../tabsession/events.js';
+import { URL_ATTRIBUTION_INFERRED } from '../../urls/events.js';
 import { VISUAL_FINGERPRINT_OBSERVED } from '../../visual/events.js';
 import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
 
@@ -450,6 +451,19 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
     surfaces: [
       {
         surface: 'tabsession-inferred-attribution-revisions',
+        class: 'extraction-revision',
+        materializer: 'connections',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+    ],
+  },
+  {
+    eventType: URL_ATTRIBUTION_INFERRED,
+    currentPayloadVersion: 1,
+    surfaces: [
+      {
+        surface: 'url-inferred-attribution-revisions',
         class: 'extraction-revision',
         materializer: 'connections',
         peerFreshnessMs: 30_000,

@@ -39,6 +39,19 @@ export interface TabSessionWorkstreamOption {
   readonly path: string;
 }
 
+// Sync Contract v1 / read-response (NOT a sync event) — the resolver
+// returns reasons[].anchors. As of payload schemaVersion 2, anchors
+// may be either bare node-id strings (legacy) or enriched objects
+// carrying { id, kind, label } drawn from the resolver's evidence
+// graph. The frontend reader (formatAnchorDisplay / upgradeAnchor in
+// entityDisplay/format.ts) accepts both forms so the companion and
+// extension can deploy independently.
+export interface AttributionAnchor {
+  readonly id: string;
+  readonly kind?: string;
+  readonly label?: string;
+}
+
 export interface TabSessionResolverCandidate {
   readonly workstreamId: string;
   readonly rawFusionLogit: number;
@@ -46,12 +59,59 @@ export interface TabSessionResolverCandidate {
   readonly reasons: readonly {
     readonly source: 'ppr' | 'similarity' | 'cluster';
     readonly summary: string;
-    readonly anchors: readonly string[];
+    readonly anchors: readonly (string | AttributionAnchor)[];
   }[];
 }
 
 export interface TabSessionResolutionResult {
   readonly tabSessionId: string;
+  readonly dryRun: true;
+  readonly decision: {
+    readonly action: 'auto-apply' | 'suggest' | 'inbox';
+    readonly workstreamId?: string;
+    readonly margin: number;
+  };
+  readonly fusedCandidates: readonly TabSessionResolverCandidate[];
+}
+
+// -- Per-canonical-URL attribution (Phase B — the URL is the
+// attribution unit; tabs are just transport) ----------------------
+
+export interface UrlAttribution {
+  readonly workstreamId: string | null;
+  readonly source: 'user_asserted' | 'tab-group-pull-in' | 'tab-group-pull-out' | 'inferred';
+  readonly observedAt: string;
+  readonly clientEventId: string;
+}
+
+export interface UrlVisitRecord {
+  readonly canonicalUrl: string;
+  readonly firstSeenAt: string;
+  readonly lastSeenAt: string;
+  readonly visitCount: number;
+  readonly tabSessionIds: readonly string[];
+  readonly latestUrl?: string;
+  readonly latestTitle?: string;
+  readonly provider?: string;
+  readonly host?: string;
+  readonly currentAttribution?: UrlAttribution;
+  readonly attributionHistory: readonly UrlAttribution[];
+}
+
+export interface UrlProjection {
+  readonly schemaVersion: 1;
+  readonly byCanonicalUrl: Record<string, UrlVisitRecord>;
+}
+
+export interface UrlInboxData {
+  readonly items: readonly UrlVisitRecord[];
+  readonly total: number;
+  readonly limit: number;
+  readonly offset: number;
+}
+
+export interface UrlResolutionResult {
+  readonly canonicalUrl: string;
   readonly dryRun: true;
   readonly decision: {
     readonly action: 'auto-apply' | 'suggest' | 'inbox';

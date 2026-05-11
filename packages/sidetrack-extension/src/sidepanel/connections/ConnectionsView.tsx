@@ -42,6 +42,12 @@ import type {
   ConnectionNodeKind,
   ConnectionsScopedResult,
 } from './types';
+import {
+  formatEntityDisplay,
+  formatNodeIdDisplay,
+  type EntityDisplay,
+  type EntityDisplayCtx,
+} from '../entityDisplay/format';
 import { FeedbackButtons, type FeedbackChoice } from '../feedback/FeedbackButtons';
 import { ProducerPin } from './ProducerPin';
 import { WhyRelatedPanel } from './WhyRelatedPanel';
@@ -80,6 +86,20 @@ type Props = {
   readonly initialAnchor?: string;
   readonly recentAnchors?: readonly ConnectionsViewRecentAnchor[];
   readonly workstreamAnchors?: readonly ConnectionsViewWorkstreamAnchor[];
+  // Switch to (or open) a browser tab at the given URL when the user
+  // clicks "Go to tab" on a URL-bearing node. When omitted, the
+  // Go-to-tab button is not rendered for any node.
+  readonly onOpenUrl?: (url: string) => void;
+  // Unified entity display context. When omitted, falls back to a
+  // safe ctx that returns null for workstream paths (helper degrades
+  // to metadata.title or "Unknown workstream") and "Browser" for
+  // replica aliases. Production callers pass a real ctx from App.tsx.
+  readonly displayCtx?: EntityDisplayCtx;
+};
+
+const DEFAULT_DISPLAY_CTX: EntityDisplayCtx = {
+  resolveWorkstreamPath: () => null,
+  replicaAlias: () => 'Browser',
 };
 
 type SubMode = 'linked' | 'orbital' | 'flow' | 'focus' | 'context';
@@ -159,12 +179,15 @@ const engagementClassForNode = (node: ConnectionNode): EngagementClass | undefin
   return isEngagementClass(value) ? value : undefined;
 };
 
-const deriveFlowVisits = (nodes: readonly ConnectionNode[]): readonly TimelineVisit[] =>
+const deriveFlowVisits = (
+  nodes: readonly ConnectionNode[],
+  ctx: EntityDisplayCtx,
+): readonly TimelineVisit[] =>
   nodes
     .filter((node) => node.kind === 'timeline-visit')
     .map((node) => ({
       id: node.id,
-      label: node.label,
+      label: formatEntityDisplay(node, ctx).primary,
       commitTimestamp:
         node.lastSeenAt ??
         metadataString(node.metadata, ['commitTimestamp', 'lastSeenAt', 'observedAt']) ??
@@ -198,6 +221,7 @@ const deriveCrossReplicaEdges = (edges: readonly ConnectionEdge[]): readonly Cro
 const deriveFocusData = (
   nodes: readonly ConnectionNode[],
   edges: readonly ConnectionEdge[],
+  ctx: EntityDisplayCtx,
 ): {
   readonly topics: readonly TopicNode[];
   readonly visitsByTopic: Record<string, readonly TopicVisit[]>;
@@ -208,7 +232,7 @@ const deriveFocusData = (
     .filter((node) => node.kind === 'topic')
     .map((node) => ({
       id: node.id,
-      label: node.label,
+      label: formatEntityDisplay(node, ctx).primary,
       memberCount: metadataNumber(node.metadata, 'memberCount', 0),
       cohesion: metadataNumber(node.metadata, 'cohesion', 0),
       ...(metadataString(node.metadata, ['dominantWorkstreamId']) === undefined
@@ -232,7 +256,7 @@ const deriveFocusData = (
       ...list,
       {
         id: visit.id,
-        label: visit.label,
+        label: formatEntityDisplay(visit, ctx).primary,
         focusedWindowMs: metadataNumber(visit.metadata, 'focusedWindowMs', 0),
       },
     ];
@@ -244,6 +268,7 @@ const reasonsForVisit = (
   nodes: readonly ConnectionNode[],
   edges: readonly ConnectionEdge[],
   visitId: string,
+  ctx: EntityDisplayCtx,
 ): readonly Reason[] => {
   const nodeById = new Map(nodes.map((node) => [node.id, node] as const));
   const reasons: Reason[] = [];
@@ -254,7 +279,7 @@ const reasonsForVisit = (
       reasons.push({
         code: 'SAME_THREAD',
         threadId: thread?.id ?? 'thread:unknown',
-        threadName: thread?.label ?? 'Unknown thread',
+        threadName: thread === undefined ? 'Unknown thread' : formatEntityDisplay(thread, ctx).primary,
       });
     } else if (edge.kind === 'visit_resembles_visit') {
       reasons.push({ code: 'COSINE_ABOVE_THRESHOLD', cosine: 0.85, threshold: 0.85 });
@@ -284,15 +309,23 @@ const reasonsForVisit = (
     } else if (edge.kind === 'thread_text_mentions_search_query') {
       const visit = nodeById.get(visitId);
       const query = metadataString(visit?.metadata ?? {}, ['searchQuery']);
+      const fallback =
+        visit === undefined ? '(visit)' : formatEntityDisplay(visit, ctx).primary;
       reasons.push({
         code: 'LEXICAL_OVERLAP',
-        topTokens: query === undefined ? [visit?.label ?? visitId] : query.split(/\s+/u),
+        topTokens: query === undefined ? [fallback] : query.split(/\s+/u),
       });
     }
   }
+  const fallbackVisitLabel = (() => {
+    const node = nodeById.get(visitId);
+    return node === undefined
+      ? formatNodeIdDisplay(visitId, nodeById, ctx).primary
+      : formatEntityDisplay(node, ctx).primary;
+  })();
   return reasons.length > 0
     ? reasons
-    : [{ code: 'LEXICAL_OVERLAP', topTokens: [nodeById.get(visitId)?.label ?? visitId] }];
+    : [{ code: 'LEXICAL_OVERLAP', topTokens: [fallbackVisitLabel] }];
 };
 
 const edgeConnects = (edge: ConnectionEdge, leftId: string, rightId: string): boolean =>
@@ -301,20 +334,15 @@ const edgeConnects = (edge: ConnectionEdge, leftId: string, rightId: string): bo
 
 const symmetricEdgeKinds = new Set(['closest_visit', 'visit_resembles_visit']);
 
-const shortNodeId = (id: string): string => {
-  const separator = id.indexOf(':');
-  const raw = separator === -1 ? id : id.slice(separator + 1);
-  return raw.length <= 40 ? raw : `${raw.slice(0, 37)}...`;
-};
-
+// Resolve a node id to its primary display string via the unified
+// helper. Used everywhere that previously read `node.label` directly
+// or fell back to `shortNodeId(...)`. Visible text never contains a
+// raw internal id.
 const nodeDisplayLabel = (
   nodeById: ReadonlyMap<string, ConnectionNode>,
   nodeId: string,
-): string => {
-  const node = nodeById.get(nodeId);
-  const label = node?.label.trim();
-  return label === undefined || label.length === 0 ? shortNodeId(nodeId) : label;
-};
+  ctx: EntityDisplayCtx,
+): string => formatNodeIdDisplay(nodeId, nodeById, ctx).primary;
 
 const edgeKindLabel = (edge: ConnectionEdge): string =>
   EDGE_KINDS[edge.kind]?.label ?? edge.kind.replaceAll('_', ' ');
@@ -322,9 +350,10 @@ const edgeKindLabel = (edge: ConnectionEdge): string =>
 const edgeEndpointLabel = (
   edge: ConnectionEdge,
   nodeById: ReadonlyMap<string, ConnectionNode>,
+  ctx: EntityDisplayCtx,
 ): string => {
-  const from = nodeDisplayLabel(nodeById, edge.fromNodeId);
-  const to = nodeDisplayLabel(nodeById, edge.toNodeId);
+  const from = nodeDisplayLabel(nodeById, edge.fromNodeId, ctx);
+  const to = nodeDisplayLabel(nodeById, edge.toNodeId, ctx);
   return symmetricEdgeKinds.has(edge.kind) ? `${from} ↔ ${to}` : `${from} → ${to}`;
 };
 
@@ -393,7 +422,10 @@ export const ConnectionsView = ({
   initialAnchor = '',
   recentAnchors = [],
   workstreamAnchors = [],
+  onOpenUrl,
+  displayCtx,
 }: Props): ReactElement => {
+  const ctx: EntityDisplayCtx = displayCtx ?? DEFAULT_DISPLAY_CTX;
   const [anchor, setAnchor] = useState<string>(initialAnchor);
   const [draftAnchor, setDraftAnchor] = useState<string>(initialAnchor);
   const [hops, setHops] = useState<number>(1);
@@ -477,18 +509,20 @@ export const ConnectionsView = ({
       if (node.kind !== 'workstream') continue;
       add({
         id: node.id,
-        label: node.label.trim().length > 0 ? node.label : shortNodeId(node.id),
+        label: formatEntityDisplay(node, ctx).primary,
         ...(node.lastSeenAt === undefined ? {} : { meta: node.lastSeenAt.slice(0, 10) }),
       });
     }
     if (anchor.startsWith('workstream:')) {
+      const fallbackNodeById = new Map<string, ConnectionNode>();
+      if (anchorNode !== null) fallbackNodeById.set(anchorNode.id, anchorNode);
       add({
         id: anchor,
-        label: anchorNode?.label ?? shortNodeId(anchor),
+        label: formatNodeIdDisplay(anchor, fallbackNodeById, ctx).primary,
       });
     }
     return [...byId.values()].sort((left, right) => left.label.localeCompare(right.label));
-  }, [anchor, anchorNode, recentAnchors, result, workstreamAnchors]);
+  }, [anchor, anchorNode, ctx, recentAnchors, result, workstreamAnchors]);
 
   const submitAnchor = (next?: string): void => {
     const value = (next ?? draftAnchor).trim();
@@ -630,8 +664,8 @@ export const ConnectionsView = ({
     () =>
       result === null
         ? { topics: [], visitsByTopic: {}, engagementClassesByVisit: {} }
-        : deriveFocusData(result.snapshot.nodes, result.snapshot.edges),
-    [result],
+        : deriveFocusData(result.snapshot.nodes, result.snapshot.edges, ctx),
+    [result, ctx],
   );
   const contextWorkstreamId = useMemo(() => {
     if (anchor.startsWith('workstream:')) return anchor.replace(/^workstream:/u, '');
@@ -644,7 +678,7 @@ export const ConnectionsView = ({
       <div className="cx-anchorbar">
         <span className="cx-anchor-label">Anchor</span>
         {anchorNode !== null ? (
-          <NodeChip node={anchorNode} state="anchor" />
+          <NodeChip node={anchorNode} state="anchor" ctx={ctx} />
         ) : (
           <span className="cx-mono cx-dim">no anchor selected</span>
         )}
@@ -704,7 +738,7 @@ export const ConnectionsView = ({
           Context Pack
         </button>
       </div>
-      {timeline !== null ? <TimelineRail data={timeline} /> : null}
+      {timeline !== null ? <TimelineRail data={timeline} ctx={ctx} /> : null}
       <div className="cx-cols">
         <aside className="cx-col-l">
           <div className="cx-section">
@@ -847,6 +881,8 @@ export const ConnectionsView = ({
                 onSelectEdge={selectEdge}
                 onUseNodeAsAnchor={useNodeAsAnchor}
                 onPromoteSnippet={submitSnippetPromotion}
+                ctx={ctx}
+                {...(onOpenUrl === undefined ? {} : { onOpenUrl })}
               />
             ) : subMode === 'orbital' ? (
               <ConnectionsOrbitalCenter
@@ -856,12 +892,14 @@ export const ConnectionsView = ({
                 selectedEdge={selectedEdge}
                 onSelectEdge={selectEdge}
                 onUseNodeAsAnchor={useNodeAsAnchor}
+                ctx={ctx}
               />
             ) : subMode === 'flow' ? (
               <FlowPathView
-                visits={deriveFlowVisits(result.snapshot.nodes)}
+                visits={deriveFlowVisits(result.snapshot.nodes, ctx)}
                 navigationEdges={deriveNavigationEdges(result.snapshot.edges)}
                 crossReplicaEdges={deriveCrossReplicaEdges(result.snapshot.edges)}
+                replicaAlias={ctx.replicaAlias}
                 onNodeClick={(visitId) => {
                   setSelectedEdge(null);
                   setWhyVisitId(visitId);
@@ -904,7 +942,7 @@ export const ConnectionsView = ({
             {whyVisitId !== null && result !== null ? (
               <WhyRelatedPanel
                 fromVisitId={whyVisitId}
-                reasons={reasonsForVisit(result.snapshot.nodes, result.snapshot.edges, whyVisitId)}
+                reasons={reasonsForVisit(result.snapshot.nodes, result.snapshot.edges, whyVisitId, ctx)}
                 showOnlyUserAsserted={whyAssertedOnly}
                 feedback={
                   whyFeedbackEdge === null
@@ -925,9 +963,10 @@ export const ConnectionsView = ({
                 allNodes={result?.snapshot.nodes ?? []}
                 onFlowFeedback={(edge, choice) => submitFlowFeedback(edge, choice)}
                 onClose={() => setSelectedEdge(null)}
+                ctx={ctx}
               />
             ) : (
-              <ProvenanceEmpty anchor={anchorNode} />
+              <ProvenanceEmpty anchor={anchorNode} ctx={ctx} />
             )}
           </div>
         </aside>
@@ -943,6 +982,8 @@ const ConnectionsLinkedCenter = ({
   onSelectEdge,
   onUseNodeAsAnchor,
   onPromoteSnippet,
+  onOpenUrl,
+  ctx,
 }: {
   readonly result: ConnectionsScopedResult;
   readonly anchorId: string;
@@ -953,6 +994,8 @@ const ConnectionsLinkedCenter = ({
     readonly snippetId: string;
     readonly sourceVisitId: string;
   }) => Promise<void>;
+  readonly onOpenUrl?: (url: string) => void;
+  readonly ctx: EntityDisplayCtx;
 }): ReactElement => {
   if (result.scope === 'plugin-active-only-companion-unreachable') {
     return (
@@ -1020,6 +1063,8 @@ const ConnectionsLinkedCenter = ({
                     onClick={() => {
                       if (edge !== undefined) onSelectEdge(edge);
                     }}
+                    ctx={ctx}
+                    {...(onOpenUrl === undefined ? {} : { onOpenUrl })}
                   />
                 );
               })}
@@ -1043,7 +1088,7 @@ const ConnectionsLinkedCenter = ({
                 onClick={() => onSelectEdge(edge)}
                 data-testid={`edge-${edge.id}`}
                 className={`cx-edgelabel cx-edge-summary ${isSelected ? 'is-selected' : ''}`}
-                title={`${edgeEndpointLabel(edge, nodeById)} · ${edgeKindLabel(edge)}`}
+                title={`${edgeEndpointLabel(edge, nodeById, ctx)} · ${edgeKindLabel(edge)}`}
               >
                 <span
                   className={`cx-edge fam-${fam} ${edgeConfidenceClass(edge.confidence)}`.trim()}
@@ -1051,7 +1096,7 @@ const ConnectionsLinkedCenter = ({
                 >
                   <span className="cx-edge-line" />
                 </span>
-                <span className="cx-edge-summary-main">{edgeEndpointLabel(edge, nodeById)}</span>
+                <span className="cx-edge-summary-main">{edgeEndpointLabel(edge, nodeById, ctx)}</span>
                 <span className="bac-connections-edge-hint">{edgeKindLabel(edge)}</span>
                 {hint !== null ? (
                   <span className="bac-connections-edge-hint" data-testid={`edge-hint-${edge.id}`}>
@@ -1077,6 +1122,7 @@ const ConnectionsOrbitalCenter = ({
   selectedEdge,
   onSelectEdge,
   onUseNodeAsAnchor,
+  ctx,
 }: {
   readonly result: ConnectionsScopedResult;
   readonly anchorId: string;
@@ -1084,6 +1130,7 @@ const ConnectionsOrbitalCenter = ({
   readonly selectedEdge: ConnectionEdge | null;
   readonly onSelectEdge: (edge: ConnectionEdge) => void;
   readonly onUseNodeAsAnchor: (nodeId: string) => void;
+  readonly ctx: EntityDisplayCtx;
 }): ReactElement => {
   // Hooks must run on every render — keep the layout call before
   // any early returns.
@@ -1190,6 +1237,7 @@ const ConnectionsOrbitalCenter = ({
             selectedEdge !== null &&
             !isAnchor &&
             !(selectedEdge.fromNodeId === p.id || selectedEdge.toNodeId === p.id);
+          const orbitDisplay = formatEntityDisplay(node, ctx);
           return (
             <button
               type="button"
@@ -1198,7 +1246,7 @@ const ConnectionsOrbitalCenter = ({
               onClick={() => {
                 onUseNodeAsAnchor(p.id);
               }}
-              title={`Use ${node.label} as anchor`}
+              title={`Use ${orbitDisplay.primary} as anchor`}
               style={{
                 left: `${String((p.x / ORBIT_W) * 100)}%`,
                 top: `${String((p.y / ORBIT_H) * 100)}%`,
@@ -1209,6 +1257,7 @@ const ConnectionsOrbitalCenter = ({
                 node={node}
                 size={isAnchor ? 'lg' : 'md'}
                 state={isAnchor ? 'anchor' : isDim ? undefined : undefined}
+                ctx={ctx}
               />
             </button>
           );
@@ -1229,7 +1278,7 @@ const ConnectionsOrbitalCenter = ({
               className={`cx-edgelabel cx-edge-summary ${isSelected ? 'is-selected' : ''}`}
               onClick={() => onSelectEdge(edge)}
               data-testid={`edge-${edge.id}`}
-              title={`${edgeEndpointLabel(edge, nodeById)} · ${edgeKindLabel(edge)}`}
+              title={`${edgeEndpointLabel(edge, nodeById, ctx)} · ${edgeKindLabel(edge)}`}
             >
               <span
                 className={`cx-edge fam-${fam} ${edgeConfidenceClass(edge.confidence)}`.trim()}
@@ -1237,7 +1286,7 @@ const ConnectionsOrbitalCenter = ({
               >
                 <span className="cx-edge-line" />
               </span>
-              <span className="cx-edge-summary-main">{edgeEndpointLabel(edge, nodeById)}</span>
+              <span className="cx-edge-summary-main">{edgeEndpointLabel(edge, nodeById, ctx)}</span>
               <span className="bac-connections-edge-hint">{meta?.label ?? edge.kind}</span>
               {hint !== null ? (
                 <span className="bac-connections-edge-hint" data-testid={`edge-hint-${edge.id}`}>
@@ -1257,7 +1306,13 @@ const ConnectionsOrbitalCenter = ({
   );
 };
 
-const TimelineRail = ({ data }: { readonly data: TimelineRailData }): ReactElement => {
+const TimelineRail = ({
+  data,
+  ctx,
+}: {
+  readonly data: TimelineRailData;
+  readonly ctx: EntityDisplayCtx;
+}): ReactElement => {
   const pct = (h: number): number => (h / 24) * 100;
   return (
     <div className="cx-timeline" data-testid="connections-timeline">
@@ -1280,7 +1335,7 @@ const TimelineRail = ({ data }: { readonly data: TimelineRailData }): ReactEleme
           <div key={row.replicaId} className="cx-timeline-row">
             <div className="device" title={row.replicaId}>
               <span className="cx-replica-dot" />
-              <span>{row.replicaId}</span>
+              <span>{ctx.replicaAlias(row.replicaId)}</span>
             </div>
             <div className="lane">
               {row.windows.map(([a, b], j) => (
@@ -1320,25 +1375,28 @@ const NodeChip = ({
   node,
   state,
   size = 'md',
+  ctx,
 }: {
   readonly node: ConnectionNode;
   readonly state?: 'anchor' | 'selected';
   readonly size?: 'md' | 'lg';
+  readonly ctx: EntityDisplayCtx;
 }): ReactElement => {
   const display = NODE_KIND_DISPLAY[node.kind];
+  const entity = formatEntityDisplay(node, ctx);
   const cls =
     `cx-node ${display.tintClass}` +
     (size === 'lg' ? ' lg' : '') +
     (state === 'anchor' ? ' is-anchor' : '') +
     (state === 'selected' ? ' is-selected' : '');
   return (
-    <div className={cls} data-testid={`node-${node.id}`}>
+    <div className={cls} data-testid={`node-${node.id}`} title={entity.tooltip}>
       <span className="cx-node-icon" aria-hidden>
         {KindIcons[node.kind]}
       </span>
       <span className="cx-node-body">
         <span className="cx-node-kind">{display.label}</span>
-        <span className="cx-node-title">{node.label}</span>
+        <span className="cx-node-title">{entity.primary}</span>
       </span>
     </div>
   );
@@ -1352,6 +1410,8 @@ const NodeRow = ({
   onPromoteSnippet,
   onUseAsAnchor,
   onClick,
+  onOpenUrl,
+  ctx,
 }: {
   readonly node: ConnectionNode;
   readonly edge: ConnectionEdge | null;
@@ -1363,10 +1423,15 @@ const NodeRow = ({
   }) => Promise<void>;
   readonly onUseAsAnchor: () => void;
   readonly onClick: () => void;
+  readonly onOpenUrl?: (url: string) => void;
+  readonly ctx: EntityDisplayCtx;
 }): ReactElement => {
+  const openUrl = metadataString(node.metadata, ['url', 'canonicalUrl']);
+  const canOpenTab = onOpenUrl !== undefined && openUrl !== undefined && openUrl.length > 0;
   const [promoting, setPromoting] = useState<boolean>(false);
   const [promoteStatus, setPromoteStatus] = useState<'saved' | 'error' | null>(null);
   const display = NODE_KIND_DISPLAY[node.kind];
+  const entity = formatEntityDisplay(node, ctx);
   const meta = edge !== null ? EDGE_KINDS[edge.kind] : null;
   const cls = `cx-row ${display.tintClass} ${selected ? 'is-selected' : ''}`;
   const sourceVisitId = snippetSourceVisitId(node, edge);
@@ -1410,10 +1475,17 @@ const NodeRow = ({
           {KindIcons[node.kind]}
         </span>
         <span className="cx-row-body">
-          <span className="cx-row-title">{node.label}</span>
+          <span className="cx-row-title" title={entity.tooltip}>
+            {entity.primary}
+          </span>
           <span className="cx-row-meta">
             <span>{display.label}</span>
-            {node.lastSeenAt !== undefined ? (
+            {entity.secondary !== undefined ? (
+              <>
+                <span>·</span>
+                <span>{entity.secondary}</span>
+              </>
+            ) : node.lastSeenAt !== undefined ? (
               <>
                 <span>·</span>
                 <span>{node.lastSeenAt.slice(0, 10)}</span>
@@ -1422,7 +1494,7 @@ const NodeRow = ({
             {node.originReplicaIds.length > 0 ? (
               <>
                 <span>·</span>
-                <ReplicaDots replicaIds={node.originReplicaIds} />
+                <ReplicaDots replicaIds={node.originReplicaIds} ctx={ctx} />
               </>
             ) : null}
           </span>
@@ -1444,12 +1516,25 @@ const NodeRow = ({
           {promoteStatus === 'saved' ? 'Promoted' : promoteStatus === 'error' ? 'Retry' : 'Promote'}
         </button>
       ) : null}
+      {canOpenTab ? (
+        <button
+          type="button"
+          className="cx-focus-expand cx-row-open-tab"
+          onClick={() => {
+            onOpenUrl(openUrl);
+          }}
+          data-testid={`node-open-${node.id}`}
+          title={`Open ${openUrl} in a tab`}
+        >
+          Go to tab
+        </button>
+      ) : null}
       <button
         type="button"
         className="cx-focus-expand cx-row-anchor-action"
         onClick={onUseAsAnchor}
         data-testid={`node-anchor-${node.id}`}
-        title={`Use ${node.label} as anchor`}
+        title={`Use ${entity.primary} as anchor`}
       >
         Open
       </button>
@@ -1497,13 +1582,19 @@ const FamilyLegend = (): ReactElement => (
   </div>
 );
 
-const ReplicaDots = ({ replicaIds }: { readonly replicaIds: readonly string[] }): ReactElement => {
+const ReplicaDots = ({
+  replicaIds,
+  ctx,
+}: {
+  readonly replicaIds: readonly string[];
+  readonly ctx: EntityDisplayCtx;
+}): ReactElement => {
   const count = replicaIds.length;
+  const aliases = replicaIds.map((id) => ctx.replicaAlias(id)).join(', ');
+  const tooltip =
+    count === 1 ? `Seen on ${aliases}` : `Seen on ${String(count)} devices · ${aliases}`;
   return (
-    <span
-      className="cx-replicas"
-      title={count === 1 ? 'Seen on 1 device' : `Seen on ${String(count)} devices`}
-    >
+    <span className="cx-replicas" title={tooltip}>
       {Array.from({ length: Math.min(count, 3) }).map((_, i) => (
         <span key={i} className="cx-replica-dot" />
       ))}
@@ -1517,16 +1608,22 @@ const ProvenanceCard = ({
   allNodes,
   onFlowFeedback,
   onClose,
+  ctx,
 }: {
   readonly edge: ConnectionEdge;
   readonly allNodes: readonly ConnectionNode[];
   readonly onFlowFeedback: (edge: ConnectionEdge, choice: FeedbackChoice) => Promise<void>;
   readonly onClose: () => void;
+  readonly ctx: EntityDisplayCtx;
 }): ReactElement => {
   const meta = EDGE_KINDS[edge.kind];
   const family: EdgeFamily = meta?.family ?? 'urlmatch';
   const fromNode = allNodes.find((n) => n.id === edge.fromNodeId);
   const toNode = allNodes.find((n) => n.id === edge.toNodeId);
+  const nodeByIdLocal = useMemo(
+    () => new Map(allNodes.map((node) => [node.id, node] as const)),
+    [allNodes],
+  );
   const reason = meta?.description ?? edge.kind;
   const supportsFlowFeedback = feedbackRelationKindForEdgeKind(edge.kind) !== null;
   return (
@@ -1555,9 +1652,11 @@ const ProvenanceCard = ({
       </header>
       <div className="cx-prov-pair">
         {fromNode !== undefined ? (
-          <NodeChip node={fromNode} />
+          <NodeChip node={fromNode} ctx={ctx} />
         ) : (
-          <span className="cx-mono cx-dim">{edge.fromNodeId}</span>
+          <span className="cx-dim" title={edge.fromNodeId}>
+            {formatNodeIdDisplay(edge.fromNodeId, nodeByIdLocal, ctx).primary}
+          </span>
         )}
         <div className="cx-prov-arrow">
           <span
@@ -1571,9 +1670,11 @@ const ProvenanceCard = ({
           </span>
         </div>
         {toNode !== undefined ? (
-          <NodeChip node={toNode} />
+          <NodeChip node={toNode} ctx={ctx} />
         ) : (
-          <span className="cx-mono cx-dim">{edge.toNodeId}</span>
+          <span className="cx-dim" title={edge.toNodeId}>
+            {formatNodeIdDisplay(edge.toNodeId, nodeByIdLocal, ctx).primary}
+          </span>
         )}
       </div>
       <div className="cx-prov-reason">
@@ -1604,8 +1705,7 @@ const ProvenanceCard = ({
         {edge.producedBy.dot !== undefined ? (
           <ProvRow
             label="Origin replica"
-            value={`${edge.producedBy.dot.replicaId} · seq ${String(edge.producedBy.dot.seq)}`}
-            mono
+            value={`${ctx.replicaAlias(edge.producedBy.dot.replicaId)} · seq ${String(edge.producedBy.dot.seq)}`}
           />
         ) : null}
         {edge.producedBy.recordId !== undefined ? (
@@ -1642,7 +1742,13 @@ const ProvRow = ({
   </div>
 );
 
-const ProvenanceEmpty = ({ anchor }: { readonly anchor: ConnectionNode | null }): ReactElement => (
+const ProvenanceEmpty = ({
+  anchor,
+  ctx,
+}: {
+  readonly anchor: ConnectionNode | null;
+  readonly ctx: EntityDisplayCtx;
+}): ReactElement => (
   <div>
     <div
       style={{
@@ -1656,7 +1762,7 @@ const ProvenanceEmpty = ({ anchor }: { readonly anchor: ConnectionNode | null })
     >
       {anchor !== null ? 'Anchor summary' : 'No anchor'}
     </div>
-    {anchor !== null ? <NodeChip node={anchor} state="anchor" size="lg" /> : null}
+    {anchor !== null ? <NodeChip node={anchor} state="anchor" size="lg" ctx={ctx} /> : null}
     <div
       style={{
         marginTop: 14,

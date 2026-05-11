@@ -1,0 +1,739 @@
+#!/usr/bin/env node
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { ensureMcpAuthKey } from './auth/mcpAuthKey.js';
+import { pickInstaller } from './install/index.js';
+import { getModelCacheStatus, resolveModelsDir } from './recall/modelCache.js';
+import { RECALL_MODEL } from './recall/modelManifest.js';
+import { startCompanion } from './runtime/companion.js';
+import { ensureRendezvousSecret } from './sync/rendezvousSecret.js';
+import { startRelayServer } from './sync/relayServer.js';
+import { COMPANION_VERSION } from './version.js';
+export const companionVersion = COMPANION_VERSION;
+export const renderHelp = () => [
+    'sidetrack-companion',
+    '',
+    'Local Sidetrack companion process.',
+    '',
+    'Usage:',
+    '  sidetrack-companion --help',
+    '  sidetrack-companion --version',
+    '  sidetrack-companion --install-service --vault <path> [--port 17373]',
+    '                      [--mcp-port <port>] [--mcp-bin <path>]',
+    '  sidetrack-companion --uninstall-service',
+    '  sidetrack-companion --service-status',
+    '  sidetrack-companion --vault <path> [--port 17373] [--allow-auto-update]',
+    '                      [--mcp-port <port> [--mcp-auth-key <key>]]',
+    '                      [--mcp-bin <path>]',
+    '                      [--models-dir <path>] [--offline-models]',
+    '                      [--sync-relay <wss://...>]',
+    '                      [--sync-relay-local [port]] [--sync-rendezvous-secret <base64url>]',
+    '  sidetrack-companion relay [--relay-port 8443]',
+    '',
+    'Starts the localhost companion API and writes Sidetrack-owned files under _BAC/.',
+    '',
+    'When --mcp-port is set, the companion also spawns',
+    'the sibling sidetrack-mcp Streamable HTTP server pointed at itself. The MCP',
+    "server shares the companion's lifetime; killing the companion kills it too.",
+    'If --mcp-auth-key is omitted, a persistent key is created under _BAC/.config.',
+    'Override the binary path with --mcp-bin if the sibling layout differs',
+    '(default: ../sidetrack-mcp/dist/cli.js relative to this CLI).',
+    '',
+    'Recall embedding-model cache:',
+    '  --models-dir <path>      Override the model cache directory (also reads',
+    '                           SIDETRACK_MODELS_DIR). Default: platform-specific',
+    '                           (~/Library/Application Support/Sidetrack/models on macOS,',
+    '                           ~/.local/share/sidetrack/models on Linux,',
+    '                           %LOCALAPPDATA%/Sidetrack/models on Windows).',
+    '  --offline-models         Refuse remote downloads (also reads',
+    '                           SIDETRACK_OFFLINE_MODELS=1). Recall queries 503 with',
+    '                           code RECALL_MODEL_MISSING when the cache is empty.',
+    '',
+    'Sync relay (optional, end-to-end encrypted):',
+    '  --sync-relay <wss://...>          WebSocket URL of a sidetrack relay.',
+    '  --sync-relay-local [port]         Start a local relay in this companion process.',
+    '  --sync-rendezvous-secret <bytes>  Base64url-encoded shared secret.',
+    '                                    If omitted, Sidetrack reuses or creates',
+    '                                    _BAC/.config/sync-rendezvous.secret.',
+    '',
+    'Relay subcommand:',
+    '  sidetrack-companion relay [--relay-port 8443]',
+    '    Run the bundled relay server. Stateless ring-buffer fanout; restart wipes',
+    '    every rendezvous. Front with a TLS reverse proxy for wss:// access.',
+    '',
+    'Models subcommand (recall embedding model):',
+    '  sidetrack-companion models status [--models-dir <path>] [--json]',
+    '  sidetrack-companion models ensure [--models-dir <path>]',
+    '  sidetrack-companion models verify [--models-dir <path>]',
+    '    Manage the local embedding-model cache. The default cache lives at',
+    '    ~/Library/Application Support/Sidetrack/models on macOS,',
+    '    ~/.local/share/sidetrack/models on Linux,',
+    "    %LOCALAPPDATA%/Sidetrack/models on Windows. Override with --models-dir or",
+    '    SIDETRACK_MODELS_DIR. Set SIDETRACK_OFFLINE_MODELS=1 to disable downloads.',
+    '',
+    'Recall subcommand (index lifecycle):',
+    '  sidetrack-companion recall status --vault <path> [--json]',
+    '  sidetrack-companion recall reingest --vault <path>',
+    '  sidetrack-companion recall verify --vault <path>',
+    '    The recall index is a rebuildable cache. `reingest` walks the merged',
+    '    event log and projects unprocessed capture events into chunk entries',
+    '    without touching raw _BAC/log/ data.',
+].join('\n');
+const writeLine = (stream, text) => {
+    stream.write(`${text}\n`);
+};
+const parsePortArg = (raw, flag) => {
+    const parsed = raw === undefined ? Number.NaN : Number.parseInt(raw, 10);
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+        throw new Error(`${flag} must be an integer from 1 to 65535.`);
+    }
+    return parsed;
+};
+const DEFAULT_LOCAL_RELAY_PORT = 18443;
+const nextLooksLikeValue = (raw) => raw !== undefined && raw.length > 0 && !raw.startsWith('--') && raw !== 'relay';
+const parseArgs = (argv) => {
+    let vaultPath;
+    let port = 17373;
+    let mcpPort;
+    let mcpAuthKey;
+    let mcpBin;
+    let modelsDir;
+    let syncRelay;
+    let syncRendezvousSecret;
+    let syncRelayLocalPort;
+    let relayPort;
+    for (let index = 0; index < argv.length; index += 1) {
+        const arg = argv[index];
+        if (arg === '--vault') {
+            vaultPath = argv[index + 1];
+            index += 1;
+            continue;
+        }
+        if (arg === '--port') {
+            port = parsePortArg(argv[index + 1], '--port');
+            index += 1;
+            continue;
+        }
+        if (arg === '--mcp-port') {
+            mcpPort = parsePortArg(argv[index + 1], '--mcp-port');
+            index += 1;
+            continue;
+        }
+        if (arg === '--mcp-auth-key') {
+            const value = argv[index + 1];
+            if (value === undefined || value.length === 0) {
+                throw new Error('--mcp-auth-key requires a non-empty value.');
+            }
+            mcpAuthKey = value;
+            index += 1;
+            continue;
+        }
+        if (arg === '--mcp-bin') {
+            const value = argv[index + 1];
+            if (value === undefined || value.length === 0) {
+                throw new Error('--mcp-bin requires a non-empty path.');
+            }
+            mcpBin = value;
+            index += 1;
+            continue;
+        }
+        if (arg === '--sync-relay') {
+            const value = argv[index + 1];
+            if (value === undefined || value.length === 0) {
+                throw new Error('--sync-relay requires a non-empty URL.');
+            }
+            syncRelay = value;
+            index += 1;
+            continue;
+        }
+        if (arg === '--sync-rendezvous-secret') {
+            const value = argv[index + 1];
+            if (value === undefined || value.length === 0) {
+                throw new Error('--sync-rendezvous-secret requires a non-empty value.');
+            }
+            syncRendezvousSecret = value;
+            index += 1;
+            continue;
+        }
+        if (arg === '--sync-relay-local') {
+            if (nextLooksLikeValue(argv[index + 1])) {
+                syncRelayLocalPort = parsePortArg(argv[index + 1], '--sync-relay-local');
+                index += 1;
+            }
+            else {
+                syncRelayLocalPort = DEFAULT_LOCAL_RELAY_PORT;
+            }
+            continue;
+        }
+        if (arg === '--relay-port') {
+            relayPort = parsePortArg(argv[index + 1], '--relay-port');
+            index += 1;
+            continue;
+        }
+        if (arg === '--models-dir') {
+            const value = argv[index + 1];
+            if (value === undefined || value.length === 0) {
+                throw new Error('--models-dir requires a non-empty path.');
+            }
+            modelsDir = value;
+            index += 1;
+            continue;
+        }
+    }
+    const parsed = {
+        help: argv.includes('--help') || argv.includes('-h'),
+        version: argv.includes('--version'),
+        installService: argv.includes('--install-service'),
+        uninstallService: argv.includes('--uninstall-service'),
+        serviceStatus: argv.includes('--service-status'),
+        allowAutoUpdate: argv.includes('--allow-auto-update'),
+        relayMode: argv.includes('relay'),
+        offlineModels: argv.includes('--offline-models'),
+        port,
+        ...(mcpPort === undefined ? {} : { mcpPort }),
+        ...(mcpAuthKey === undefined ? {} : { mcpAuthKey }),
+        ...(mcpBin === undefined ? {} : { mcpBin }),
+        ...(syncRelay === undefined ? {} : { syncRelay }),
+        ...(syncRendezvousSecret === undefined ? {} : { syncRendezvousSecret }),
+        ...(syncRelayLocalPort === undefined ? {} : { syncRelayLocalPort }),
+        ...(relayPort === undefined ? {} : { relayPort }),
+        ...(modelsDir === undefined ? {} : { modelsDir }),
+    };
+    return vaultPath === undefined ? parsed : { ...parsed, vaultPath };
+};
+// Spawn the sibling sidetrack-mcp CLI and stream its output through
+// the companion's stdio so the user sees a single combined log. The
+// child is killed when the companion process exits.
+const spawnMcpServer = (input) => {
+    const args = [
+        input.mcpBin,
+        '--transport',
+        'streamable-http',
+        '--vault',
+        input.vaultPath,
+        '--port',
+        String(input.mcpPort),
+        '--companion-url',
+        input.companionUrl,
+        '--bridge-key',
+        input.bridgeKey,
+        '--mcp-auth-key',
+        input.mcpAuthKey,
+    ];
+    const child = spawn(process.execPath, args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.stdout.on('data', (chunk) => {
+        input.stdout.write(`[mcp] ${chunk.toString('utf8')}`);
+    });
+    child.stderr.on('data', (chunk) => {
+        input.stderr.write(`[mcp] ${chunk.toString('utf8')}`);
+    });
+    child.on('exit', (code, signal) => {
+        input.stderr.write(`[mcp] sidetrack-mcp exited (code=${String(code)}, signal=${String(signal)}).\n`);
+    });
+    return child;
+};
+const resolveDefaultMcpBin = () => {
+    // Resolve relative to this CLI's compiled location:
+    //   packages/sidetrack-companion/dist/cli.js
+    // → ../../sidetrack-mcp/dist/cli.js
+    const here = fileURLToPath(import.meta.url);
+    return resolve(dirname(here), '../../sidetrack-mcp/dist/cli.js');
+};
+const currentCompanionCommand = () => {
+    const entrypoint = process.argv[1];
+    return entrypoint === undefined ? [process.execPath] : [process.execPath, resolve(entrypoint)];
+};
+const relayUrl = (relay) => `ws://${relay.host}:${String(relay.port)}/`;
+const syncRequested = (args) => args.syncRelay !== undefined || args.syncRelayLocalPort !== undefined;
+// Argument lookup for sub-command modes. Avoids re-running the
+// flag-driven parser when we only need a couple of override values.
+const findArgValue = (argv, name) => {
+    for (let index = 0; index < argv.length; index += 1) {
+        if (argv[index] === name)
+            return argv[index + 1];
+        const eq = argv[index]?.startsWith(`${name}=`) === true ? argv[index] : undefined;
+        if (eq !== undefined)
+            return eq.slice(name.length + 1);
+    }
+    return undefined;
+};
+const runModelsSubcommand = async (argv, streams) => {
+    // argv[0] is 'models'; argv[1] is the verb.
+    const verb = argv[1];
+    if (verb === undefined || verb === 'help' || verb === '--help') {
+        writeLine(streams.stdout, 'Usage: sidetrack-companion models {status|ensure|verify} [--models-dir <path>] [--json]');
+        return verb === undefined ? 2 : 0;
+    }
+    const modelsDirArg = findArgValue(argv, '--models-dir');
+    const json = argv.includes('--json');
+    const offline = argv.includes('--offline-models');
+    const opts = {
+        ...(modelsDirArg === undefined ? {} : { modelsDir: modelsDirArg }),
+        ...(offline ? { offline: true } : {}),
+    };
+    const cacheDir = resolveModelsDir(opts);
+    if (verb === 'status') {
+        const status = await getModelCacheStatus(opts);
+        if (json) {
+            writeLine(streams.stdout, JSON.stringify(status, null, 2));
+            return 0;
+        }
+        writeLine(streams.stdout, `model id     ${status.modelId}`);
+        writeLine(streams.stdout, `revision     ${status.revision}`);
+        writeLine(streams.stdout, `cache dir    ${status.cacheDir}`);
+        writeLine(streams.stdout, `present      ${status.present ? 'yes' : 'no'}`);
+        // `verified` means the cached refs/<branch> token matches the
+        // pinned manifest sha. False splits two ways: model isn't on
+        // disk at all (run `models ensure`), or it IS on disk but the
+        // cached revision doesn't match (cache populated by an older
+        // companion version, or the manifest moved). Distinguish so the
+        // user knows whether to ensure or re-ensure.
+        const verifiedReason = status.verified
+            ? 'yes'
+            : status.present
+                ? 'no (cached revision does not match pinned sha)'
+                : 'no (model not present)';
+        writeLine(streams.stdout, `verified     ${verifiedReason}`);
+        writeLine(streams.stdout, `offline      ${status.offline ? 'yes' : 'no'}`);
+        return 0;
+    }
+    if (verb === 'ensure') {
+        if (offline) {
+            writeLine(streams.stderr, 'models ensure cannot run with --offline-models / SIDETRACK_OFFLINE_MODELS=1; remove the offline flag and retry.');
+            return 1;
+        }
+        writeLine(streams.stdout, `Ensuring ${RECALL_MODEL.modelId} into ${cacheDir} …`);
+        // The download is driven by the embedder's lazy load on first
+        // call. Trigger it deterministically here by routing the
+        // transformers cache to the requested dir and asking for one
+        // embedding. Use a process-local env override so we don't
+        // mutate the running config.
+        process.env['SIDETRACK_MODELS_DIR'] = cacheDir;
+        const { embed } = await import('./recall/embedder.js');
+        await embed(['warmup']);
+        const post = await getModelCacheStatus({ ...opts, modelsDir: cacheDir });
+        writeLine(streams.stdout, post.present ? 'ok — model cached' : 'WARN — embedder ran but cache check still missing');
+        return post.present ? 0 : 1;
+    }
+    if (verb === 'verify') {
+        const status = await getModelCacheStatus(opts);
+        if (!status.present) {
+            writeLine(streams.stderr, 'verify: model not present in cache. Run `models ensure` first.');
+            return 1;
+        }
+        if (status.verified) {
+            writeLine(streams.stdout, 'verify: ok (cached refs/<branch> revision matches the manifest sha)');
+            return 0;
+        }
+        writeLine(streams.stdout, 'verify: present but no revision marker matched. The cache may have been populated by an older companion version (no refs/main file written) or by a different revision. Run `models ensure` to refetch against the pinned revision.');
+        return 0;
+    }
+    writeLine(streams.stderr, `unknown models verb: ${verb}`);
+    writeLine(streams.stderr, 'try: status | ensure | verify');
+    return 2;
+};
+const runRecallSubcommand = async (argv, streams) => {
+    const verb = argv[1];
+    if (verb === undefined || verb === 'help' || verb === '--help') {
+        writeLine(streams.stdout, 'Usage: sidetrack-companion recall {status|reingest|verify} --vault <path> [--json]');
+        return verb === undefined ? 2 : 0;
+    }
+    const vaultPath = findArgValue(argv, '--vault');
+    if (vaultPath === undefined || vaultPath.length === 0) {
+        writeLine(streams.stderr, '--vault <path> is required for the recall sub-command.');
+        return 2;
+    }
+    const json = argv.includes('--json');
+    // Lazy imports so `models` runs (and all the help/version paths)
+    // don't pull in the full eventLog + indexFile + embedder graph.
+    const { readIngestState, readRecallManifest, ingestIncremental } = await import('./recall/ingestor.js');
+    const { readIndex } = await import('./recall/indexFile.js');
+    const { createEventLog } = await import('./sync/eventLog.js');
+    const { loadOrCreateReplica } = await import('./sync/replicaId.js');
+    if (verb === 'status') {
+        const [manifest, state, index] = await Promise.all([
+            readRecallManifest(vaultPath),
+            readIngestState(vaultPath),
+            readIndex(`${vaultPath}/_BAC/recall/index.bin`),
+        ]);
+        const status = {
+            manifest,
+            ingestState: state,
+            index: index === null ? null : { entryCount: index.items.length, modelId: index.modelId },
+        };
+        if (json) {
+            writeLine(streams.stdout, JSON.stringify(status, null, 2));
+            return 0;
+        }
+        writeLine(streams.stdout, `manifest      ${manifest === null ? '(none — run `recall reingest`)' : `${manifest.modelId} rev=${manifest.modelRevision} v${String(manifest.indexVersion)}`}`);
+        writeLine(streams.stdout, `index         ${index === null ? '(none)' : `${String(index.items.length)} entries (${index.modelId})`}`);
+        writeLine(streams.stdout, `frontier      ${Object.keys(state.processedEvents).length === 0
+            ? '(nothing ingested yet)'
+            : Object.entries(state.processedEvents)
+                .map(([k, v]) => `${k}@${String(v)}`)
+                .join(' ')}`);
+        if (state.lastIncrementalIngestAt !== undefined) {
+            writeLine(streams.stdout, `last ingest   ${state.lastIncrementalIngestAt}`);
+        }
+        return 0;
+    }
+    if (verb === 'reingest') {
+        // `reingest` is a writer — it walks the merged event log and
+        // upserts chunks into `_BAC/recall/index.bin`. A running companion
+        // holds the recall process-lock for the same reason (single
+        // writer per vault). If we let two writers run concurrently they
+        // race the atomic-rename pattern and the binary index can
+        // tear / drift. Take the lock; refuse if another live PID owns
+        // it.
+        const { acquireRecallProcessLock, RecallLockHeldError } = await import('./recall/recovery.js');
+        let recallLock;
+        try {
+            recallLock = await acquireRecallProcessLock(vaultPath);
+        }
+        catch (error) {
+            if (error instanceof RecallLockHeldError) {
+                writeLine(streams.stderr, `reingest: refusing — companion (pid ${String(error.pid)}) is already writing the recall index for ${vaultPath}.`);
+                writeLine(streams.stderr, 'Stop the companion (or wait for it to exit) and re-run, or hit POST /v1/recall/reingest on the running companion instead.');
+                return 1;
+            }
+            throw error;
+        }
+        try {
+            const replica = await loadOrCreateReplica(vaultPath);
+            const eventLog = createEventLog(vaultPath, replica);
+            writeLine(streams.stdout, `reingesting from event log into ${vaultPath}/_BAC/recall/ …`);
+            const result = await ingestIncremental(vaultPath, eventLog);
+            writeLine(streams.stdout, `ok — indexed ${String(result.indexedChunks)} chunks, ${String(result.tombstonedChunks)} tombstoned`);
+            return 0;
+        }
+        finally {
+            await recallLock.release();
+        }
+    }
+    if (verb === 'verify') {
+        const [manifest, index] = await Promise.all([
+            readRecallManifest(vaultPath),
+            readIndex(`${vaultPath}/_BAC/recall/index.bin`),
+        ]);
+        if (manifest === null) {
+            writeLine(streams.stderr, 'verify: no manifest. Run `recall reingest` first.');
+            return 1;
+        }
+        if (index === null) {
+            writeLine(streams.stderr, 'verify: no index file on disk.');
+            return 1;
+        }
+        if (manifest.modelId !== index.modelId.split('#')[0]) {
+            writeLine(streams.stderr, `verify: model mismatch — manifest=${manifest.modelId} index=${index.modelId}`);
+            return 1;
+        }
+        writeLine(streams.stdout, `verify: ok — manifest matches index (${String(index.items.length)} entries, ${manifest.modelId})`);
+        return 0;
+    }
+    writeLine(streams.stderr, `unknown recall verb: ${verb}`);
+    writeLine(streams.stderr, 'try: status | reingest | verify');
+    return 2;
+};
+// Sync Contract v1 / Class F — companion `ingest --import <archive>`
+// CLI verb. Imports an archive pack of edge-origin events into the
+// companion's event log. Idempotent on edge dot — same archive
+// imported twice produces no duplicates; same archive imported by
+// two different companions deduplicates at the relay level (both
+// will publish; receiving peer dedupes on dot).
+//
+// Lane 3 stage 4. The archive pack format is JSONL of AcceptedEvent
+// objects with edge-origin dots. Each event is fed through
+// importPeerEvent (which already handles dot collisions + idempotency).
+const runIngestSubcommand = async (argv, streams) => {
+    const verb = argv[1];
+    if (verb === undefined || verb === 'help' || verb === '--help') {
+        writeLine(streams.stdout, 'Sync Contract v1 / Class F archive import.');
+        writeLine(streams.stdout, '');
+        writeLine(streams.stdout, 'Usage:');
+        writeLine(streams.stdout, '  sidetrack-companion ingest --import <archive.jsonl> --vault <path>');
+        return verb === undefined ? 2 : 0;
+    }
+    if (verb !== '--import') {
+        writeLine(streams.stderr, `unknown ingest verb: ${verb}`);
+        writeLine(streams.stderr, 'try: --import <archive.jsonl>');
+        return 2;
+    }
+    const archivePath = argv[2];
+    if (archivePath === undefined) {
+        writeLine(streams.stderr, '--import requires a path argument.');
+        return 2;
+    }
+    const vaultIdx = argv.indexOf('--vault');
+    const vaultPath = vaultIdx === -1 ? undefined : argv[vaultIdx + 1];
+    if (vaultPath === undefined) {
+        writeLine(streams.stderr, '--vault <path> is required for ingest --import.');
+        return 2;
+    }
+    // Lazy imports — keeps CLI startup fast for unrelated verbs.
+    const { readFile } = await import('node:fs/promises');
+    const { createEventLog } = await import('./sync/eventLog.js');
+    const { loadOrCreateReplica } = await import('./sync/replicaId.js');
+    const replica = await loadOrCreateReplica(vaultPath);
+    const eventLog = createEventLog(vaultPath, replica);
+    const text = await readFile(archivePath, 'utf8');
+    const lines = text.split('\n').filter((l) => l.trim().length > 0);
+    let imported = 0;
+    let skipped = 0;
+    let errors = 0;
+    for (const line of lines) {
+        try {
+            const event = JSON.parse(line);
+            const result = await eventLog.importPeerEvent(event);
+            if (result.imported)
+                imported += 1;
+            else
+                skipped += 1;
+        }
+        catch (err) {
+            errors += 1;
+            writeLine(streams.stderr, `[ingest] error: ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
+    writeLine(streams.stdout, `ingest: imported=${String(imported)} skipped=${String(skipped)} errors=${String(errors)} total=${String(lines.length)}`);
+    return errors > 0 ? 1 : 0;
+};
+export const runCli = async (argv, streams) => {
+    // Sub-command dispatch happens BEFORE the flag-driven parser so a
+    // verb like `models` doesn't get interpreted as a positional vault
+    // path. Existing flag-only invocations are unaffected.
+    if (argv[0] === 'models') {
+        return await runModelsSubcommand(argv, streams);
+    }
+    if (argv[0] === 'recall') {
+        return await runRecallSubcommand(argv, streams);
+    }
+    if (argv[0] === 'ingest') {
+        return await runIngestSubcommand(argv, streams);
+    }
+    const args = parseArgs(argv);
+    if (args.version) {
+        writeLine(streams.stdout, companionVersion);
+        return 0;
+    }
+    if (args.help) {
+        writeLine(streams.stdout, renderHelp());
+        return 0;
+    }
+    if (args.relayMode) {
+        const port = args.relayPort ?? 8443;
+        const relay = await startRelayServer({ port });
+        writeLine(streams.stdout, `sidetrack-relay listening on http://${relay.host}:${String(relay.port)} (use a TLS reverse proxy for wss://)`);
+        return await new Promise((resolve) => {
+            const shutdown = (signal) => {
+                writeLine(streams.stdout, `[relay] received ${signal}, shutting down`);
+                void relay.close().then(() => {
+                    resolve(0);
+                });
+            };
+            process.once('SIGINT', () => {
+                shutdown('SIGINT');
+            });
+            process.once('SIGTERM', () => {
+                shutdown('SIGTERM');
+            });
+        });
+    }
+    if (args.serviceStatus) {
+        const status = await pickInstaller().status();
+        writeLine(streams.stdout, `service ${status.installed ? 'installed' : 'not installed'}; ${status.running ? 'running' : 'not running'} (${status.platform})`);
+        if (status.path !== undefined) {
+            writeLine(streams.stdout, `path ${status.path}`);
+        }
+        return 0;
+    }
+    if (args.uninstallService) {
+        await pickInstaller().uninstall();
+        writeLine(streams.stdout, 'sidetrack companion service uninstalled');
+        return 0;
+    }
+    if (args.vaultPath === undefined || args.vaultPath.length === 0) {
+        writeLine(streams.stderr, 'Missing required --vault <path>.');
+        writeLine(streams.stderr, renderHelp());
+        return 2;
+    }
+    if (args.syncRelay !== undefined && args.syncRelayLocalPort !== undefined) {
+        writeLine(streams.stderr, 'Use either --sync-relay or --sync-relay-local, not both.');
+        return 2;
+    }
+    // Surface --models-dir / --offline-models as process env so the
+    // lazily-instantiated embedder + modelCache pick them up without
+    // a config-passing rewrite. Only set when explicit flags are
+    // present; if they're not we leave any pre-existing env alone so
+    // a launchd-installed plist can still pin the values.
+    if (args.modelsDir !== undefined) {
+        process.env['SIDETRACK_MODELS_DIR'] = args.modelsDir;
+    }
+    if (args.offlineModels) {
+        process.env['SIDETRACK_OFFLINE_MODELS'] = '1';
+    }
+    if (args.installService) {
+        if (syncRequested(args)) {
+            await ensureRendezvousSecret(args.vaultPath, args.syncRendezvousSecret);
+        }
+        const result = await pickInstaller().install({
+            vaultPath: args.vaultPath,
+            port: args.port,
+            companionCommand: currentCompanionCommand(),
+            ...(args.mcpPort === undefined ? {} : { mcpPort: args.mcpPort }),
+            ...(args.mcpBin === undefined ? {} : { mcpBin: resolve(args.mcpBin) }),
+            ...(args.syncRelayLocalPort === undefined
+                ? {}
+                : { syncRelayLocalPort: args.syncRelayLocalPort }),
+            ...(args.syncRelay === undefined ? {} : { syncRelay: args.syncRelay }),
+        });
+        writeLine(streams.stdout, `sidetrack companion service installed (${result.platform})`);
+        writeLine(streams.stdout, `path ${result.path}`);
+        return result.installed ? 0 : 1;
+    }
+    // Resolve MCP auth key BEFORE starting the companion HTTP server,
+    // so /v1/status returns the same key the MCP child will be running
+    // with. Explicit --mcp-auth-key wins (useful for testing); otherwise
+    // we ensure the persistent key on disk and reuse it across restarts.
+    let resolvedMcpAuthKey = args.mcpAuthKey;
+    let mcpAuthKeyPath;
+    let mcpAuthKeyCreated = false;
+    if (args.mcpPort !== undefined && resolvedMcpAuthKey === undefined) {
+        const ensured = await ensureMcpAuthKey(args.vaultPath);
+        resolvedMcpAuthKey = ensured.key;
+        mcpAuthKeyPath = ensured.path;
+        mcpAuthKeyCreated = ensured.created;
+    }
+    let localRelay;
+    if (args.syncRelayLocalPort !== undefined) {
+        localRelay = await startRelayServer({ port: args.syncRelayLocalPort });
+    }
+    const syncRelayUrl = localRelay === undefined ? args.syncRelay : relayUrl(localRelay);
+    const syncSecret = syncRelayUrl === undefined
+        ? undefined
+        : await ensureRendezvousSecret(args.vaultPath, args.syncRendezvousSecret);
+    const runtime = await startCompanion({
+        vaultPath: args.vaultPath,
+        port: args.port,
+        allowAutoUpdate: args.allowAutoUpdate,
+        ...(args.mcpPort !== undefined && resolvedMcpAuthKey !== undefined
+            ? { mcp: { port: args.mcpPort, authKey: resolvedMcpAuthKey } }
+            : {}),
+        ...(syncRelayUrl !== undefined && syncSecret !== undefined
+            ? {
+                relay: {
+                    url: syncRelayUrl,
+                    mode: localRelay === undefined ? 'remote' : 'local',
+                    rendezvousSecret: syncSecret.secret,
+                },
+            }
+            : {}),
+        service: {
+            companionCommand: currentCompanionCommand(),
+            ...(args.mcpBin === undefined ? {} : { mcpBin: resolve(args.mcpBin) }),
+            ...(args.syncRelayLocalPort === undefined
+                ? {}
+                : { syncRelayLocalPort: args.syncRelayLocalPort }),
+            ...(args.syncRelay === undefined ? {} : { syncRelay: args.syncRelay }),
+        },
+    }).catch(async (error) => {
+        await localRelay?.close();
+        throw error;
+    });
+    writeLine(streams.stdout, `sidetrack-companion listening on ${runtime.url}`);
+    writeLine(streams.stdout, `vault           ${runtime.vaultPath}`);
+    writeLine(streams.stdout, `bridge key file ${runtime.bridgeKeyPath}`);
+    writeLine(streams.stdout, `replica id      ${runtime.replicaId}${runtime.replicaIdCreated ? ' (new)' : ''}`);
+    if (syncRelayUrl !== undefined && syncSecret !== undefined) {
+        writeLine(streams.stdout, `sync relay      ${syncRelayUrl} (${localRelay === undefined ? 'remote' : 'local'}; e2e-encrypted)`);
+        writeLine(streams.stdout, `sync secret     ${syncSecret.created ? 'generated' : 'reused'} (${syncSecret.path})`);
+    }
+    writeLine(streams.stdout, `auto-update     ${args.allowAutoUpdate ? 'enabled' : 'disabled'}`);
+    if (runtime.bridgeKeyCreated) {
+        // First run for this vault — print the key once so the user can
+        // paste it into the side panel without going to the file system.
+        // Subsequent runs reuse the file; we only point at the path.
+        writeLine(streams.stdout, '');
+        writeLine(streams.stdout, 'A new bridge key was generated. Paste this into the side panel:');
+        writeLine(streams.stdout, `Settings → Companion bridge key → ${runtime.bridgeKey}`);
+        writeLine(streams.stdout, '');
+        writeLine(streams.stdout, `(The key is saved to ${runtime.bridgeKeyPath} — \`cat\` it any time you need to recover it.)`);
+    }
+    else {
+        writeLine(streams.stdout, `(Reusing the existing key. Run \`cat ${runtime.bridgeKeyPath}\` to copy it again.)`);
+    }
+    // Track an optional MCP child + close hook on a single object so
+    // there's exactly one shutdown path regardless of which optional
+    // sidecars are wired (mcp / local relay / neither).
+    let mcpChild;
+    const closeAll = async () => {
+        await runtime.close();
+        await localRelay?.close();
+    };
+    if (args.mcpPort !== undefined && resolvedMcpAuthKey !== undefined) {
+        const mcpBin = args.mcpBin ?? resolveDefaultMcpBin();
+        if (!existsSync(mcpBin)) {
+            writeLine(streams.stderr, `--mcp-port set but sidetrack-mcp CLI not found at ${mcpBin}. Build it (npm --prefix packages/sidetrack-mcp run build) or pass --mcp-bin <path>.`);
+            await closeAll();
+            return 1;
+        }
+        mcpChild = spawnMcpServer({
+            mcpBin,
+            mcpPort: args.mcpPort,
+            mcpAuthKey: resolvedMcpAuthKey,
+            vaultPath: args.vaultPath,
+            companionUrl: runtime.url,
+            bridgeKey: runtime.bridgeKey,
+            stdout: streams.stdout,
+            stderr: streams.stderr,
+        });
+        writeLine(streams.stdout, `mcp http       http://127.0.0.1:${String(args.mcpPort)}/mcp (managed by companion)`);
+        if (mcpAuthKeyPath !== undefined) {
+            const keyOrigin = mcpAuthKeyCreated ? 'generated' : 'reused';
+            writeLine(streams.stdout, `mcp auth key   ${keyOrigin} (${mcpAuthKeyPath}). The side panel reads this from /v1/status.`);
+        }
+        else {
+            writeLine(streams.stdout, 'mcp auth key   provided via --mcp-auth-key (skip the side-panel prompt regen if you change it).');
+        }
+    }
+    // Always wire SIGINT/SIGTERM. Without this the bare-runtime case
+    // (no --mcp-port, no --sync-relay-local) had no handler at all,
+    // so `kill` left `_BAC/recall/.lock` pointing at the now-dead pid
+    // and stranded the next-launch on the recovery path's stale-pid
+    // takeover. closeAll() releases the lock via runtime.close().
+    const shutdown = (signal) => {
+        if (mcpChild !== undefined)
+            mcpChild.kill(signal);
+        if (localRelay !== undefined) {
+            writeLine(streams.stdout, `[sync relay] received ${signal}, shutting down`);
+        }
+        void closeAll().finally(() => {
+            process.exit(0);
+        });
+    };
+    process.once('SIGINT', () => {
+        shutdown('SIGINT');
+    });
+    process.once('SIGTERM', () => {
+        shutdown('SIGTERM');
+    });
+    return 0;
+};
+const entrypointPath = process.argv[1];
+if (entrypointPath !== undefined && import.meta.url === pathToFileURL(entrypointPath).href) {
+    runCli(process.argv.slice(2), {
+        stdout: process.stdout,
+        stderr: process.stderr,
+    })
+        .then((exitCode) => {
+        process.exitCode = exitCode;
+    })
+        .catch((error) => {
+        process.stderr.write(`${error instanceof Error ? error.message : 'Unknown error'}\n`);
+        process.exitCode = 1;
+    });
+}
+//# sourceMappingURL=cli.js.map

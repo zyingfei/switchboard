@@ -69,7 +69,12 @@ import type {
   AttributionPolicyMode,
   AttributionPolicyTelemetry,
 } from '../tabsession/policy.js';
-import { resolveAttribution } from '../tabsession/resolver.js';
+import { resolveAttribution, resolveUrlAttribution } from '../tabsession/resolver.js';
+import {
+  projectUrls,
+  serializeUrlProjection,
+  urlInbox,
+} from '../urls/projection.js';
 import {
   appendEntry as appendEntryRaw,
   gcEntries as gcEntriesRaw,
@@ -405,6 +410,7 @@ interface RouteMatch {
   readonly connectionsNodeId?: string;
   readonly connectionsEdgeId?: string;
   readonly collectorId?: string;
+  readonly canonicalUrl?: string;
 }
 
 interface RouteDefinition {
@@ -1621,6 +1627,179 @@ const routes: readonly RouteDefinition[] = [
               projection: serializeTabSessionProjection(
                 projectTabSessions(await eventLog.readMerged()),
               ),
+            },
+          },
+        ];
+      });
+    },
+  },
+  // -- Per-canonical-URL attribution surface --------------------------
+  // The user-facing Inbox/Connections triages PAGES (canonical URLs),
+  // not tab sessions. These routes mirror /v1/tabsessions/* but key by
+  // canonical URL so multiple visits of the same page collapse to one
+  // attribution unit. Tab-session attribution stays available for
+  // back-compat sync from older replicas.
+  {
+    method: 'GET',
+    pattern: /^\/v1\/visits\/projection$/u,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      return [
+        200,
+        {
+          data: serializeUrlProjection(projectUrls(await context.eventLog.readMerged())),
+        },
+      ];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/visits\/inbox$/u,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const url = new URL(request.url ?? '/v1/visits/inbox', 'http://internal');
+      const limitRaw = Number.parseInt(url.searchParams.get('limit') ?? '50', 10);
+      const offsetRaw = Number.parseInt(url.searchParams.get('offset') ?? '0', 10);
+      const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 200) : 50;
+      const offset = Number.isFinite(offsetRaw) && offsetRaw > 0 ? offsetRaw : 0;
+      const projection = projectUrls(await context.eventLog.readMerged());
+      const items = urlInbox(projection, { limit, offset });
+      return [
+        200,
+        {
+          data: {
+            items,
+            total: urlInbox(projection, { limit: Number.MAX_SAFE_INTEGER, offset: 0 }).length,
+            limit,
+            offset,
+          },
+        },
+      ];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/visits\/(?<canonicalUrl>[^/]+)\/resolve$/u,
+    authRequired: true,
+    handle: async (request, _requestId, match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      if (context.connectionsStore === undefined) {
+        throw new HttpRouteError(503, 'CONNECTIONS_NOT_WIRED', 'Connections is not configured.');
+      }
+      const url = new URL(request.url ?? '/v1/visits/resolve', 'http://internal');
+      if (url.searchParams.get('dryRun') !== 'true') {
+        throw new HttpRouteError(
+          400,
+          'VALIDATION_ERROR',
+          'Validation failed.',
+          'URL resolver is dry-run only in this phase.',
+        );
+      }
+      const snapshot = await context.connectionsStore.readCurrent();
+      if (snapshot === null) {
+        throw new HttpRouteError(
+          409,
+          'CONNECTIONS_SNAPSHOT_MISSING',
+          'Connections snapshot is not ready.',
+        );
+      }
+      const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
+      if (canonicalUrl.length === 0) {
+        throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
+      }
+      const merged = await context.eventLog.readMerged();
+      return [
+        200,
+        {
+          data: resolveUrlAttribution({
+            canonicalUrl,
+            snapshot,
+            events: merged,
+          }),
+        },
+      ];
+    },
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/visits\/(?<canonicalUrl>[^/]+)\/attribute$/u,
+    authRequired: true,
+    handle: async (request, _requestId, match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      // canonicalUrl is URL-encoded in the path component (slashes and
+      // colons survive encoding). Decode and validate non-empty.
+      const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
+      if (canonicalUrl.length === 0) {
+        throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
+      }
+      const eventLog = context.eventLog;
+      const idempotencyKey = requireIdempotencyKey(request);
+      return await runIdempotent(context, 'urlAttribute', idempotencyKey, async () => {
+        const body = objectRecord(await readBody(request));
+        const workstreamId = body?.['workstreamId'];
+        if (
+          !(workstreamId === null || (typeof workstreamId === 'string' && workstreamId.length > 0))
+        ) {
+          throw new HttpRouteError(
+            400,
+            'VALIDATION_ERROR',
+            'Validation failed.',
+            'Body must contain workstreamId as a non-empty string or null.',
+          );
+        }
+        const priorProjection = projectUrls(await eventLog.readMerged());
+        const fromWorkstreamId =
+          priorProjection.byCanonicalUrl.get(canonicalUrl)?.currentAttribution?.workstreamId;
+        const payload = {
+          payloadVersion: 1,
+          itemKind: 'canonical-url',
+          itemId: canonicalUrl,
+          action: 'move',
+          ...(fromWorkstreamId === undefined || fromWorkstreamId === null
+            ? {}
+            : { fromContainer: fromWorkstreamId }),
+          toContainer: workstreamId,
+        } as const;
+        const aggregateId = aggregateIdForFeedbackEvent(USER_ORGANIZED_ITEM, payload);
+        const accepted = await eventLog.appendClient({
+          clientEventId: idempotencyKey,
+          aggregateId,
+          type: USER_ORGANIZED_ITEM,
+          payload,
+          baseVector: await baseVectorForAggregate(eventLog, aggregateId),
+        });
+        return [
+          201,
+          {
+            data: {
+              accepted,
+              projection: serializeUrlProjection(projectUrls(await eventLog.readMerged())),
             },
           },
         ];
@@ -3495,6 +3674,37 @@ const routes: readonly RouteDefinition[] = [
           .catch(() => undefined);
       }
       return [201, mutationResponse(result, requestId)];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/workstreams\/projections$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      // Bulk endpoint used by extension's refreshCachedWorkstreams: enumerate
+      // every aggregate id touched by a WORKSTREAM_UPSERTED or
+      // WORKSTREAM_DELETED event and project each one. This is the bridge
+      // from the companion's relay-replicated event log to the extension's
+      // chrome.storage cache, so workstreams created on Browser A reach
+      // Browser B's side panel via the standard sync path.
+      const events = await context.eventLog.readMerged();
+      const aggregateIds = new Set<string>();
+      for (const event of events) {
+        if (event.type === WORKSTREAM_UPSERTED || event.type === WORKSTREAM_DELETED) {
+          aggregateIds.add(event.aggregateId);
+        }
+      }
+      const projections = [...aggregateIds]
+        .sort()
+        .map((bacId) => projectWorkstream(bacId, events));
+      return [200, { data: projections }];
     },
   },
   {

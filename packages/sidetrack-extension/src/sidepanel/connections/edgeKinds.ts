@@ -192,6 +192,39 @@ export const EDGE_KINDS: Record<string, EdgeKindMetadata> = {
     label: 'reused in',
     description: 'The same hash-only snippet was pasted into two or more threads.',
   },
+  // Phase 1 / Phase 7 — tab-session + visit-instance edges. The side-panel
+  // mirror needs an entry per kind or `EDGE_KINDS[kind].label` lookups
+  // crash with `Cannot read properties of undefined (reading 'label')`.
+  visit_in_tab_session: {
+    family: 'contain',
+    label: 'in tab session',
+    description: 'Timeline visit was observed within this tab session lifecycle.',
+  },
+  tab_session_in_workstream: {
+    family: 'contain',
+    label: 'in workstream',
+    description: 'Tab session attributed to this workstream via Class A user assertion.',
+  },
+  tab_session_opener_chain: {
+    family: 'flow',
+    label: 'opened by tab',
+    description: 'This tab session was opened from another tab session (chrome.tabs.openerTabId).',
+  },
+  visit_instance_in_tab_session: {
+    family: 'contain',
+    label: 'in tab session',
+    description: 'Per-visit-instance variant of visit_in_tab_session (Phase 7 visit-instance identity).',
+  },
+  visit_instance_in_workstream: {
+    family: 'contain',
+    label: 'in workstream',
+    description: 'Per-visit-instance attribution edge (Phase 7) — replaces URL-aggregate visit_in_workstream so same-URL sessions stay isolated.',
+  },
+  visit_instance_same_url_as_timeline_visit: {
+    family: 'urlmatch',
+    label: 'same canonical URL',
+    description: 'Visit instance and the URL-aggregate timeline-visit share a canonical URL.',
+  },
 };
 
 export const FAMILIES: Record<
@@ -218,10 +251,13 @@ export const NODE_KIND_DISPLAY: Record<
   'inbound-reminder': { label: 'Reminder', tintClass: 'cx-type-reminder' },
   'coding-session': { label: 'Coding session', tintClass: 'cx-type-coding' },
   'timeline-visit': { label: 'Browser visit', tintClass: 'cx-type-visit' },
+  'visit-instance': { label: 'Visit instance', tintClass: 'cx-type-visit' },
+  'tab-session': { label: 'Tab session', tintClass: 'cx-type-tab-session' },
   annotation: { label: 'Annotation', tintClass: 'cx-type-annotation' },
   snippet: { label: 'Snippet', tintClass: 'cx-type-snippet' },
   topic: { label: 'Topic', tintClass: 'cx-type-topic' },
   replica: { label: 'Replica', tintClass: 'cx-type-replica' },
+  template: { label: 'Template', tintClass: 'cx-type-template' },
 };
 
 // Display order for kind groups in the linked-panels center column.
@@ -232,6 +268,8 @@ export const NODE_KIND_GROUP_ORDER: readonly ConnectionNodeKind[] = [
   'thread',
   'dispatch',
   'coding-session',
+  'tab-session',
+  'visit-instance',
   'timeline-visit',
   'topic',
   'snippet',
@@ -239,6 +277,7 @@ export const NODE_KIND_GROUP_ORDER: readonly ConnectionNodeKind[] = [
   'annotation',
   'queue-item',
   'inbound-reminder',
+  'template',
 ];
 
 // Tiny inline hint for content-derived edges; preserved from the

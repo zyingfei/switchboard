@@ -20,11 +20,15 @@ const TITLE_MAX_LENGTH = 1024;
 // `browser.timeline.observed` payloads with debounce + coalescing.
 //
 // Coalescing rules (from docs/timeline.md):
-//   1. Same (tabIdHash, canonicalUrl) within `coalesceWindowMs` →
-//      no emission. Title updates merge in-memory.
+//   1. Same (tabIdHash, canonicalUrl, title) within `coalesceWindowMs` →
+//      no emission.
 //   2. Same tabIdHash, new canonicalUrl → emit (navigation).
 //   3. New tabIdHash → emit.
-//   4. Title-only change → no emission.
+//   4. Same canonicalUrl with a CHANGED title within the coalesce
+//      window → emit (projection captures the new latestTitle). SPAs
+//      like chatgpt.com set document.title long after status:complete,
+//      and the title is what makes Inbox / current-tab cards human-
+//      readable.
 //   5. Tab close → emit `transition: 'closed'` for the last URL of
 //      that tab.
 //
@@ -208,9 +212,19 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
     })();
 
     if (isSameUrl && existing !== undefined) {
-      // Coalesce within the window — no emission.
+      // Real-page title typically loads a beat after status:complete fires,
+      // so the very first observation for a URL often has no title and the
+      // second one (carrying the title) lands inside the coalesce window.
+      // ChatGPT/Claude/Gemini also update document.title several seconds
+      // later when a chat acquires a subject. We coalesce on URL but
+      // ALWAYS emit when the title changes to a new non-empty value —
+      // otherwise the companion's tab-session projection never gets a
+      // useful `latestTitle` and the Inbox / current-tab card stays stuck
+      // displaying raw URLs.
+      const titleChanged =
+        boundedTitle !== undefined && existing.title !== boundedTitle;
       const elapsed = now.getTime() - existing.lastEmittedAt;
-      if (elapsed < coalesceWindowMs) {
+      if (elapsed < coalesceWindowMs && !titleChanged) {
         coalescedCalls += 1;
         lastDecision = {
           at: observedAt,
@@ -220,7 +234,8 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
           ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
           hasTabSessionId: input.tabSessionId !== undefined,
         };
-        // Title-only update merges in-memory.
+        // In-memory merge so subsequent comparisons see the latest title /
+        // session ids, even though we don't emit.
         if (
           boundedTitle !== undefined ||
           input.tabSessionId !== existing.tabSessionId ||

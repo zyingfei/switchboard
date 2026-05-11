@@ -61,6 +61,7 @@ test.describe('manual stealth experiment smoke', () => {
 
       const recorder = new ManualRecorder(runtime.context, artifactsDir, {
         captureScreenshots: false,
+        eventHookInjection: 'page-main-world',
       });
       await recorder.install();
       installManualNetworkOutcomeRecorder(runtime.context, recorder, {

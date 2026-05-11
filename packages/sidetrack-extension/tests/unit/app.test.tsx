@@ -487,6 +487,41 @@ describe('live side-panel App wiring', () => {
       },
       openSessionsByTabId: { tab_a: 'tses_test' },
     };
+    // URL projection (Phase B): URL is the attribution unit, so the
+    // panel's Inbox and Current-tab card read from /v1/visits/*. Mock
+    // both alongside the legacy /v1/tabsessions/* endpoints — the
+    // panel hits both during the initial load.
+    const urlProjection = {
+      schemaVersion: 1,
+      byCanonicalUrl: {
+        'https://example.test/research': {
+          canonicalUrl: 'https://example.test/research',
+          firstSeenAt: NOW,
+          lastSeenAt: NOW,
+          visitCount: 1,
+          tabSessionIds: ['tses_test'],
+          latestUrl: 'https://example.test/research',
+          latestTitle: 'Research page',
+          currentAttribution: {
+            workstreamId: 'bac_workstream_root',
+            source: 'user_asserted',
+            observedAt: NOW,
+            clientEventId: 'evt-1',
+          },
+          attributionHistory: [],
+        },
+        'https://copy.fail': {
+          canonicalUrl: 'https://copy.fail',
+          firstSeenAt: NOW,
+          lastSeenAt: NOW,
+          visitCount: 1,
+          tabSessionIds: ['tses_inbox'],
+          latestUrl: 'https://copy.fail',
+          latestTitle: 'Copy fail',
+          attributionHistory: [],
+        },
+      },
+    };
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes('/v1/tabsessions/projection')) {
@@ -506,6 +541,26 @@ describe('live side-panel App wiring', () => {
           }),
         };
       }
+      if (url.includes('/v1/visits/projection')) {
+        return { ok: true, status: 200, json: async () => ({ data: urlProjection }) };
+      }
+      if (url.includes('/v1/visits/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: {
+              items: [urlProjection.byCanonicalUrl['https://copy.fail']],
+              total: 1,
+              limit: 51,
+              offset: 0,
+            },
+          }),
+        };
+      }
+      if (url.includes('/v1/visits/') && url.includes('/attribute')) {
+        return { ok: true, status: 201, json: async () => ({ data: { accepted: {} } }) };
+      }
       if (url.includes('/v1/tabsessions/tses_inbox/attribute')) {
         return { ok: true, status: 201, json: async () => ({ data: { accepted: {} } }) };
       }
@@ -522,9 +577,10 @@ describe('live side-panel App wiring', () => {
     expect(await screen.findByText('Copy fail')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Move' }));
 
+    // Phase B routes attribute through /v1/visits/{url}/attribute.
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
-        'http://127.0.0.1:17373/v1/tabsessions/tses_inbox/attribute',
+        `http://127.0.0.1:17373/v1/visits/${encodeURIComponent('https://copy.fail')}/attribute`,
         expect.objectContaining({
           method: 'POST',
           body: JSON.stringify({ workstreamId: 'bac_workstream_root' }),
@@ -579,6 +635,33 @@ describe('live side-panel App wiring', () => {
         },
       ],
     };
+    // URL projection mirrors the tab-session shape. The suggestion is
+    // resolved via /v1/visits/{url}/resolve and applied via attribute.
+    const urlProjection = {
+      schemaVersion: 1,
+      byCanonicalUrl: {
+        'https://example.test/research': {
+          canonicalUrl: 'https://example.test/research',
+          firstSeenAt: NOW,
+          lastSeenAt: NOW,
+          visitCount: 1,
+          tabSessionIds: ['tses_suggested'],
+          latestUrl: 'https://example.test/research',
+          latestTitle: 'Open research',
+          attributionHistory: [],
+        },
+      },
+    };
+    const urlSuggestion = {
+      canonicalUrl: 'https://example.test/research',
+      dryRun: true,
+      decision: {
+        action: 'suggest',
+        workstreamId: 'bac_workstream_sibling',
+        margin: 1.35,
+      },
+      fusedCandidates: suggestion.fusedCandidates,
+    };
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes('/v1/tabsessions/projection')) {
@@ -596,7 +679,27 @@ describe('live side-panel App wiring', () => {
       if (url.includes('/v1/tabsessions/tses_suggested/resolve')) {
         return { ok: true, status: 200, json: async () => ({ data: suggestion }) };
       }
-      if (url.includes('/v1/tabsessions/tses_suggested/attribute')) {
+      if (url.includes('/v1/visits/projection')) {
+        return { ok: true, status: 200, json: async () => ({ data: urlProjection }) };
+      }
+      if (url.includes('/v1/visits/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: {
+              items: [urlProjection.byCanonicalUrl['https://example.test/research']],
+              total: 1,
+              limit: 51,
+              offset: 0,
+            },
+          }),
+        };
+      }
+      if (url.includes('/v1/visits/') && url.includes('/resolve')) {
+        return { ok: true, status: 200, json: async () => ({ data: urlSuggestion }) };
+      }
+      if (url.includes('/v1/visits/') && url.includes('/attribute')) {
         return { ok: true, status: 201, json: async () => ({ data: { accepted: {} } }) };
       }
       return { ok: false, status: 404, text: async () => 'not found' };
@@ -610,7 +713,7 @@ describe('live side-panel App wiring', () => {
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
-        'http://127.0.0.1:17373/v1/tabsessions/tses_suggested/attribute',
+        `http://127.0.0.1:17373/v1/visits/${encodeURIComponent('https://example.test/research')}/attribute`,
         expect.objectContaining({
           method: 'POST',
           body: JSON.stringify({ workstreamId: 'bac_workstream_sibling' }),
@@ -663,6 +766,30 @@ describe('live side-panel App wiring', () => {
       },
       openSessionsByTabId: { tab_a: 'tses_a', tab_b: 'tses_b' },
     };
+    // Phase B: attribution is per canonical URL, not per tab session.
+    // Two tab sessions on the same URL collapse to one URL record;
+    // the URL record's attribution (Sibling) is what shows.
+    const urlProjection = {
+      schemaVersion: 1,
+      byCanonicalUrl: {
+        'https://example.test/shared': {
+          canonicalUrl: 'https://example.test/shared',
+          firstSeenAt: NOW,
+          lastSeenAt: NOW,
+          visitCount: 2,
+          tabSessionIds: ['tses_a', 'tses_b'],
+          latestUrl: 'https://example.test/shared',
+          latestTitle: 'Shared B',
+          currentAttribution: {
+            workstreamId: 'bac_workstream_sibling',
+            source: 'user_asserted',
+            observedAt: NOW,
+            clientEventId: 'evt-url',
+          },
+          attributionHistory: [],
+        },
+      },
+    };
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: RequestInfo | URL) => {
@@ -671,6 +798,16 @@ describe('live side-panel App wiring', () => {
           return { ok: true, status: 200, json: async () => ({ data: projection }) };
         }
         if (url.includes('/v1/tabsessions/inbox')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+          };
+        }
+        if (url.includes('/v1/visits/projection')) {
+          return { ok: true, status: 200, json: async () => ({ data: urlProjection }) };
+        }
+        if (url.includes('/v1/visits/inbox')) {
           return {
             ok: true,
             status: 200,

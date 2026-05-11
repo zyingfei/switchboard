@@ -39,7 +39,7 @@ export interface T1FStatus {
 }
 
 export const isT1FullProductEnabled = (env: NodeJS.ProcessEnv = process.env): boolean =>
-  env['SIDETRACK_T1_FULL_PRODUCT_E2E'] === '1';
+  env.SIDETRACK_T1_FULL_PRODUCT_E2E === '1';
 
 export const buildPendingT1FCheck = (
   caseId: T1FRequiredCaseId,
@@ -132,9 +132,12 @@ interface ResolverDryRunResponse {
   };
 }
 
+// Status is `'applied'`, `'skipped-existing-attribution'`, `'skipped-no-evidence'`,
+// or any future value the companion adds. `string` already subsumes the literals,
+// so we just type as `string` and inspect known values where needed.
 interface ResolverAutoApplyResponse {
   readonly data: {
-    readonly status: 'applied' | 'skipped-existing-attribution' | 'skipped-no-evidence' | string;
+    readonly status: string;
     readonly accepted?: { readonly type?: string; readonly payload?: Record<string, unknown> };
   };
 }
@@ -286,9 +289,6 @@ const runResolverDryRunNoWriteCheck = async (
       );
     }
     const target = sessionIds[0];
-    if (target === undefined) {
-      return buildFailT1FCheck('full-resolver-dryrun-no-write', 'unexpected empty sessionId list');
-    }
     const before = countInferredAttributionEntries(proj);
     // Two dry-run calls — second one also catches caching-induced writes.
     await companionGet(
@@ -339,12 +339,6 @@ const runUserAssertionOverridesInferredCheck = async (
     }
     // Pick the LAST session so we don't conflict with the dry-run target above.
     const target = sessionIds[sessionIds.length - 1];
-    if (target === undefined) {
-      return buildFailT1FCheck(
-        'full-user-assertion-overrides-inferred',
-        'unexpected empty sessionId list',
-      );
-    }
     // Dismiss to inbox to keep the test idempotent (no dependence on workstream existence).
     await companionPost(
       harness.companionA,
@@ -356,7 +350,7 @@ const runUserAssertionOverridesInferredCheck = async (
       '/v1/tabsessions/projection',
     )) as TabSessionProjectionSnapshot;
     const session = proj2.data.bySessionId[target];
-    const source = session?.currentAttribution?.source;
+    const source = session.currentAttribution?.source;
     const userAssertedSources = new Set([
       'user_asserted',
       'tab-group-pull-in',
@@ -370,7 +364,7 @@ const runUserAssertionOverridesInferredCheck = async (
     }
     return buildFailT1FCheck(
       'full-user-assertion-overrides-inferred',
-      `POST /attribute did not produce a user-asserted source; got ${String(source ?? 'undefined')}`,
+      `POST /attribute did not produce a user-asserted source; got ${source ?? 'undefined'}`,
     );
   } catch (err) {
     return buildFailT1FCheck(
@@ -407,7 +401,7 @@ const runSameUrlVisitInstanceNoLeakCheck = async (
     const violations: string[] = [];
     for (const [url, sids] of dupes) {
       const attributedSids = sids.filter(
-        (s) => proj.data.bySessionId[s]?.currentAttribution?.workstreamId !== undefined,
+        (s) => proj.data.bySessionId[s].currentAttribution?.workstreamId !== undefined,
       );
       if (attributedSids.length > 0 && attributedSids.length < sids.length) {
         // Some attributed, some not — this is exactly the test scenario.

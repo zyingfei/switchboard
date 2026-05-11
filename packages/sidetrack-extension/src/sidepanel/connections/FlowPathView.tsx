@@ -26,6 +26,10 @@ export interface FlowPathViewProps {
   readonly navigationEdges: readonly NavigationEdge[];
   readonly crossReplicaEdges: readonly CrossReplicaEdge[];
   readonly onNodeClick: (visitId: string) => void;
+  // Resolver for replica aliases ("This browser" / "Browser 2"). When
+  // omitted, falls back to a placeholder; never displays the raw
+  // replicaId as visible text.
+  readonly replicaAlias?: (replicaId: string) => string;
 }
 
 const compareVisit = (left: TimelineVisit, right: TimelineVisit): number =>
@@ -36,6 +40,7 @@ export const FlowPathView = ({
   navigationEdges,
   crossReplicaEdges,
   onNodeClick,
+  replicaAlias,
 }: FlowPathViewProps): ReactElement => {
   const visitsByTab = new Map<string, TimelineVisit[]>();
   for (const visit of [...visits].sort(compareVisit)) {
@@ -50,7 +55,13 @@ export const FlowPathView = ({
       `Tab ${String(index + 1)}`,
     ]),
   );
-  const visitLabel = (visitId: string): string => visitById.get(visitId)?.label ?? visitId;
+  // Visit label never falls back to the raw visit id — the upstream
+  // derivation (`deriveFlowVisits` in ConnectionsView) already passes
+  // a formatted label, so a missing entry means the edge points at a
+  // node we couldn't resolve. Use a kind-aware placeholder instead.
+  const visitLabel = (visitId: string): string => visitById.get(visitId)?.label ?? '(visit)';
+  const replicaName = (replicaId: string): string =>
+    replicaAlias !== undefined ? replicaAlias(replicaId) : 'Browser';
 
   return (
     <section className="cx-flow" data-testid="flow-path-view">
@@ -94,11 +105,11 @@ export const FlowPathView = ({
             key={edge.id}
             className="cx-flow-edge cx-edge-cross-replica"
             data-testid={`flow-cross-replica-edge-${edge.id}`}
-            title={edge.fromVisitId}
+            title={edge.replicaId}
           >
             replica: {visitLabel(edge.fromVisitId)}
             {' -> '}
-            {edge.replicaId}
+            {replicaName(edge.replicaId)}
           </span>
         ))}
       </div>

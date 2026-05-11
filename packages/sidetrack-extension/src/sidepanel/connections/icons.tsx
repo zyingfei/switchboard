@@ -59,6 +59,19 @@ export const KindIcons: Record<ConnectionNodeKind, ReactElement> = {
       <path d="M12 3a13 13 0 0 1 0 18 13 13 0 0 1 0-18z" />
     </svg>
   ),
+  'visit-instance': (
+    <svg {...baseProps}>
+      <circle cx="12" cy="12" r="9" />
+      <circle cx="12" cy="12" r="3" />
+    </svg>
+  ),
+  'tab-session': (
+    <svg {...baseProps}>
+      <path d="M4 7a2 2 0 0 1 2-2h4l1 1h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z" />
+      <path d="M8 11h8" />
+      <path d="M8 14h5" />
+    </svg>
+  ),
   annotation: (
     <svg {...baseProps}>
       <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h10l6 6v10a2 2 0 0 1-2 2z" />
@@ -90,6 +103,13 @@ export const KindIcons: Record<ConnectionNodeKind, ReactElement> = {
       <path d="M7 6c0-1.7 2.2-3 5-3s5 1.3 5 3-2.2 3-5 3-5-1.3-5-3z" />
       <path d="M7 6v6c0 1.7 2.2 3 5 3s5-1.3 5-3V6" />
       <path d="M7 12v6c0 1.7 2.2 3 5 3s5-1.3 5-3v-6" />
+    </svg>
+  ),
+  template: (
+    <svg {...baseProps}>
+      <rect x="4" y="4" width="16" height="16" rx="2" />
+      <path d="M4 9h16" />
+      <path d="M9 9v11" />
     </svg>
   ),
 };

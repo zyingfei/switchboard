@@ -1,20 +1,20 @@
 import { useState } from 'react';
 
+import { tabSessionDisplayTitle, tabSessionDisplayUrl } from './displayTitle';
 import type {
   TabSessionRecord,
   TabSessionResolutionResult,
   TabSessionWorkstreamOption,
 } from './types';
 
-const titleFor = (record: TabSessionRecord): string =>
-  record.latestTitle?.trim() || record.latestUrl || record.tabSessionId;
-
 const workstreamLabel = (
   workstreamId: string | undefined,
   workstreams: readonly TabSessionWorkstreamOption[],
 ): string => {
   if (workstreamId === undefined) return 'unknown';
-  return workstreams.find((workstream) => workstream.bac_id === workstreamId)?.path ?? workstreamId;
+  return (
+    workstreams.find((workstream) => workstream.bac_id === workstreamId)?.path ?? '(removed)'
+  );
 };
 
 export interface SuggestionBannerProps {
@@ -31,7 +31,8 @@ export function SuggestionBanner({
   onAttribute,
 }: SuggestionBannerProps) {
   const suggestedWorkstreamId = suggestion.decision.workstreamId;
-  const defaultWorkstreamId = suggestedWorkstreamId ?? workstreams[0]?.bac_id ?? '';
+  const fallbackWorkstreamId = workstreams.length > 0 ? workstreams[0].bac_id : '';
+  const defaultWorkstreamId = suggestedWorkstreamId ?? fallbackWorkstreamId;
   const [selectedWorkstreamId, setSelectedWorkstreamId] = useState(defaultWorkstreamId);
   if (suggestion.decision.action !== 'suggest' || suggestedWorkstreamId === undefined) {
     return null;
@@ -40,7 +41,11 @@ export function SuggestionBanner({
     <section className="tab-session-suggestion-banner" aria-label="Tab-session suggestion">
       <div className="tab-session-suggestion-copy">
         <b>{workstreamLabel(suggestedWorkstreamId, workstreams)}</b>
-        <span className="mono">{titleFor(record)}</span>
+        <span className="tab-session-suggestion-title">{tabSessionDisplayTitle(record)}</span>
+        {tabSessionDisplayUrl(record) !== undefined &&
+        tabSessionDisplayUrl(record) !== tabSessionDisplayTitle(record) ? (
+          <span className="mono tab-session-suggestion-url">{tabSessionDisplayUrl(record)}</span>
+        ) : null}
       </div>
       <div className="tab-session-suggestion-actions">
         <button

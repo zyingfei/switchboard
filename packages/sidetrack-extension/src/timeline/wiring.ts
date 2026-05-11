@@ -17,6 +17,7 @@ import {
   getTimelineObserverDiagnostics,
   type TimelineObserver,
 } from './observer';
+import { isTrackableUrl } from './sanitize';
 import type { BrowserTimelineObservedPayload } from './events';
 
 // Sync Contract v1 / Class F — bind chrome.tabs APIs to the timeline
@@ -114,6 +115,12 @@ let onUpdatedSequence = 0;
 let observerObserveCalls = 0;
 let observerCloseCalls = 0;
 let triggerDrainCalls = 0;
+let contentTitleSinkHits = 0;
+let contentTitleSinkSkippedNotInit = 0;
+let contentTitleSinkSkippedGateClosed = 0;
+let contentTitleSinkSkippedUntrackable = 0;
+let lastContentTitleAt: string | null = null;
+let lastContentTitleValue: string | null = null;
 type TimelineGateBoundary =
   | 'init'
   | 'onActivated'
@@ -192,6 +199,15 @@ export interface TimelineWiringDiagnostics {
   readonly lastOnUpdated: TimelineOnUpdatedDiagnostic | null;
   readonly lastObserveRequest: TimelineObserveRequestDiagnostic | null;
   readonly lastDrainTrigger: TimelineDrainTriggerDiagnostic | null;
+  readonly contentTitleSink: {
+    readonly hits: number;
+    readonly skippedNotInit: number;
+    readonly skippedGateClosed: number;
+    readonly skippedUntrackable: number;
+    readonly lastAt: string | null;
+    readonly lastValue: string | null;
+    readonly sinkAttached: boolean;
+  };
 }
 
 export interface TimelineReplayDiagnostics {
@@ -208,7 +224,7 @@ const updateLastOnUpdated = (
   sequence: number,
   patch: Partial<Omit<TimelineOnUpdatedDiagnostic, 'sequence'>>,
 ): void => {
-  if (lastOnUpdated === null || lastOnUpdated.sequence !== sequence) return;
+  if (lastOnUpdated?.sequence !== sequence) return;
   lastOnUpdated = { ...lastOnUpdated, ...patch };
 };
 
@@ -290,7 +306,7 @@ const startActiveWorkstreamCache = async (): Promise<void> => {
   ).chrome;
   c?.storage?.onChanged?.addListener((changes) => {
     if (Object.prototype.hasOwnProperty.call(changes, ACTIVE_WORKSTREAM_KEY)) {
-      const v = changes[ACTIVE_WORKSTREAM_KEY]?.newValue;
+      const v = changes[ACTIVE_WORKSTREAM_KEY].newValue;
       cachedActiveWorkstreamId = typeof v === 'string' && v.length > 0 ? v : undefined;
     }
   });
@@ -306,6 +322,13 @@ const hashWindowIdForReplica = (replica: EdgeReplica, windowId: number): string 
 const buildObserver = (input: {
   readonly hashTabId: (tabId: number, windowId: number) => string;
   readonly hashWindowId: (windowId: number) => string;
+  // Called after every successful local admit so the wiring layer can
+  // schedule an opportunistic drain. The default 60-second alarm
+  // dominated end-to-end latency for the "Current tab" card and the
+  // title-arrival path — a trailing-debounced drain after admit shrinks
+  // it to ~500ms while still coalescing the chatty title-update bursts
+  // that follow a navigation.
+  readonly onAdmit?: () => void;
 }): TimelineObserver => {
   return createTimelineObserver({
     clock: () => new Date(),
@@ -314,6 +337,9 @@ const buildObserver = (input: {
       // drop on failure (passive intent, health-visible counter).
       void timelinePluginMaterializer
         .admitLocal(observationFromPayload(payload), 'passive')
+        .then(() => {
+          input.onAdmit?.();
+        })
         .catch(() => undefined);
     },
     hashTabId: input.hashTabId,
@@ -331,16 +357,60 @@ const buildObserver = (input: {
       if (provider === 'chatgpt' || provider === 'claude' || provider === 'gemini') {
         return provider;
       }
-      // 'codex' and 'unknown' fall through to 'generic' (or undefined
-      // for non-providers); we elide non-provider URLs to keep the
-      // projection focused.
-      if (provider === 'codex' || provider === 'unknown') {
-        return undefined;
-      }
+      // 'codex' and 'unknown' elide — we keep the projection focused on
+      // explicit AI-provider hosts.
       return undefined;
     },
     coalesceWindowMs: 30_000,
   });
+};
+
+// Trailing-debounced activity drain: every admit kicks the timer; the
+// drain actually fires `ACTIVITY_DRAIN_DEBOUNCE_MS` after the LAST
+// admit. Coalesces the URL → status:complete → title-changed burst that
+// a typical navigation produces, while keeping the worst-case lag well
+// under a second for any user-visible signal.
+const ACTIVITY_DRAIN_DEBOUNCE_MS = 500;
+
+// Chrome sometimes returns the URL itself (or host+path+query) as
+// `tab.title` during early page load — before <title> is parsed.
+// Stealth Chromium keeps that fake title around even after the real
+// one is set in the page DOM. If we pass it to observer.observe AFTER
+// the content script already pushed the real title, the observer's
+// title-change detection treats the fake as "new" and overwrites the
+// real one in the projection. Detect and skip URL-shaped fake titles
+// at the wiring layer — let the content-script title push remain
+// authoritative.
+const stripScheme = (url: string): string => url.replace(/^[a-z]+:\/\//iu, '');
+export const isUrlShapedFakeTitle = (title: string, url: string): boolean => {
+  if (title.length === 0) return false;
+  if (title === url) return true;
+  const bare = stripScheme(url);
+  if (title === bare) return true;
+  // host+path without query (Chrome occasionally trims).
+  const noQuery = bare.split('?')[0] ?? bare;
+  if (title === noQuery) return true;
+  return false;
+};
+
+const makeActivityDrainScheduler = (
+  deps: InitDeps,
+): { readonly schedule: () => void; readonly cancel: () => void } => {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const schedule = (): void => {
+    if (timer !== null) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      void tryDrain(deps).catch(() => undefined);
+    }, ACTIVITY_DRAIN_DEBOUNCE_MS);
+  };
+  const cancel = (): void => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+  return { schedule, cancel };
 };
 
 interface InitDeps {
@@ -355,6 +425,40 @@ interface InitDeps {
 // Captured at init() so external triggerTimelineDrain() can run the
 // same drain path (used by tests + a side-panel "drain now" path).
 let capturedInitDeps: InitDeps | null = null;
+
+// Captured at init() so external content-script-driven title updates
+// (entrypoints/title-watcher.content.ts) can flow through the same
+// observer pipeline. Set to null when the gate is closed / wiring
+// isn't initialized.
+let contentTitleSink:
+  | ((input: { tabId: number; windowId: number; url: string; title: string }) => Promise<void>)
+  | null = null;
+
+// External entry point — background.ts routes
+// `sidetrack.timeline.titleObserved` runtime messages from the
+// content script here. Silently no-ops when wiring isn't ready (gate
+// closed, pre-init, etc.) so the content script can fire without
+// worrying about timing.
+export const recordTitleFromContent = async (input: {
+  readonly tabId: number;
+  readonly windowId: number;
+  readonly url: string;
+  readonly title: string;
+}): Promise<void> => {
+  contentTitleSinkHits += 1;
+  lastContentTitleAt = new Date().toISOString();
+  lastContentTitleValue = input.title;
+  if (contentTitleSink === null) {
+    contentTitleSinkSkippedNotInit += 1;
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[sidetrack:title-sink] dropped (sink not initialized — gate closed or pre-init)',
+      input.url,
+    );
+    return;
+  }
+  await contentTitleSink(input);
+};
 
 const tryDrain = async (deps: InitDeps): Promise<{ uploaded: number; remaining: number }> => {
   const companion = await deps.readCompanion();
@@ -444,7 +548,114 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
   const tabSessions: TabSessionBoundary = createTabSessionBoundary({
     storage: createChromeTabSessionStorage(),
   });
-  const observer = buildObserver({ hashTabId, hashWindowId });
+  const activityDrain = makeActivityDrainScheduler(deps);
+  const observer = buildObserver({
+    hashTabId,
+    hashWindowId,
+    onAdmit: activityDrain.schedule,
+  });
+
+  // Wire the content-script title sink. The content script
+  // (entrypoints/title-watcher.content.ts) pushes document.title
+  // changes here the moment they happen — direct DOM read, no
+  // chrome.tabs.title round-trip. Same approach the AI-chat content
+  // script uses for its threads; broadened to every URL so the Inbox
+  // and Current-tab card light up as fast as All Threads does.
+  contentTitleSink = async (input) => {
+    if (!isTrackableUrl(input.url)) {
+      contentTitleSinkSkippedUntrackable += 1;
+      // eslint-disable-next-line no-console
+      console.warn('[sidetrack:title-sink] non-trackable URL', input.url);
+      return;
+    }
+    const gateOpen = await readTimelineGateState();
+    if (!gateOpen) {
+      contentTitleSinkSkippedGateClosed += 1;
+      // eslint-disable-next-line no-console
+      console.warn('[sidetrack:title-sink] gate closed', input.url);
+      return;
+    }
+    const tabSession = await tabSessions.recordActivity({
+      tabIdHash: hashTabId(input.tabId, input.windowId),
+      windowIdHash: hashWindowId(input.windowId),
+      url: input.url,
+    });
+    // eslint-disable-next-line no-console
+    console.log(
+      '[sidetrack:title-sink] observing',
+      input.title,
+      'on tabSessionId=',
+      tabSession.tabSessionId,
+    );
+    observer.observe({
+      tabId: input.tabId,
+      windowId: input.windowId,
+      url: input.url,
+      title: input.title,
+      transition: 'updated',
+      tabSessionId: tabSession.tabSessionId,
+      ...(tabSession.openerTabSessionId === undefined
+        ? {}
+        : { openerTabSessionId: tabSession.openerTabSessionId }),
+    });
+  };
+
+  // Stealth Chromium / patchright sometimes blocks `chrome.tabs.title`
+  // from reflecting `document.title` changes — the URL-shaped fake
+  // title that Chrome shows during early page load sticks around in
+  // tab.title. Schedule a brief follow-up that reads document.title
+  // directly via chrome.scripting and re-emits if it differs. The
+  // observer's coalesce path is a no-op when the title matches, so
+  // we can be eager without wasting work.
+  const TITLE_RECHECK_DELAYS_MS = [1500, 4000];
+  const titleReCheckTimers = new Map<string, ReturnType<typeof setTimeout>[]>();
+  const scheduleTitleReCheck = (input: {
+    readonly tabId: number;
+    readonly windowId: number;
+    readonly url: string;
+    readonly tabSessionId: string;
+    readonly openerTabSessionId?: string;
+  }): void => {
+    const key = `${String(input.tabId)}:${input.url}`;
+    // Cancel any prior re-checks for this (tabId, url) so a fresh
+    // navigation supersedes lingering polls.
+    const existing = titleReCheckTimers.get(key);
+    if (existing !== undefined) {
+      for (const handle of existing) clearTimeout(handle);
+    }
+    const handles = TITLE_RECHECK_DELAYS_MS.map((delay) =>
+      setTimeout(() => {
+        void (async () => {
+          try {
+            const results = await chrome.scripting.executeScript({
+              target: { tabId: input.tabId },
+              func: () => document.title,
+            });
+            const title = results[0]?.result;
+            if (typeof title !== 'string' || title.length === 0) return;
+            // If the user navigated away mid-poll, tab.url no longer
+            // matches input.url — skip stale observations.
+            const tab = await chrome.tabs.get(input.tabId).catch(() => null);
+            if (tab === null || tab.url !== input.url) return;
+            observer.observe({
+              tabId: input.tabId,
+              windowId: input.windowId,
+              url: input.url,
+              title,
+              transition: 'updated',
+              tabSessionId: input.tabSessionId,
+              ...(input.openerTabSessionId === undefined
+                ? {}
+                : { openerTabSessionId: input.openerTabSessionId }),
+            });
+          } catch {
+            // chrome.scripting may fail on host_permissions denial — silent.
+          }
+        })();
+      }, delay),
+    );
+    titleReCheckTimers.set(key, handles);
+  };
 
   chrome.tabs.onCreated.addListener((tab) => {
     onCreatedCalls += 1;
@@ -476,6 +687,11 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
         if (!gateOpen) return;
         const tab = await chrome.tabs.get(info.tabId);
         if (typeof tab.url !== 'string' || tab.url.length === 0) return;
+        // Skip non-content browser surfaces (about:blank, chrome://newtab,
+        // chrome-extension:// pages, devtools://, view-source:, …) — they
+        // never represent meaningful work to attribute, and we don't want
+        // them showing up in Inbox or Connections.
+        if (!isTrackableUrl(tab.url)) return;
         const tabSession = await tabSessions.recordActivity({
           tabIdHash: hashTabId(info.tabId, info.windowId),
           windowIdHash: hashWindowId(info.windowId),
@@ -489,11 +705,15 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
           url: tab.url,
           tabSessionId: tabSession.tabSessionId,
         };
+        const activatedTitle =
+          typeof tab.title === 'string' && !isUrlShapedFakeTitle(tab.title, tab.url)
+            ? tab.title
+            : undefined;
         observer.observe({
           tabId: info.tabId,
           windowId: info.windowId,
           url: tab.url,
-          ...(typeof tab.title === 'string' ? { title: tab.title } : {}),
+          ...(activatedTitle === undefined ? {} : { title: activatedTitle }),
           transition: 'activated',
           tabSessionId: tabSession.tabSessionId,
           ...(tabSession.openerTabSessionId === undefined
@@ -529,13 +749,27 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
         updateLastOnUpdated(sequence, { skippedReason: 'gate-closed' });
         return;
       }
-      if (changeInfo.url === undefined && changeInfo.status !== 'complete') {
-        updateLastOnUpdated(sequence, { skippedReason: 'no-url-and-not-complete' });
+      // ChatGPT / Gemini / other SPAs update `document.title` long after
+      // status:complete fires (the chat content streams in). Chrome
+      // dispatches that as `onUpdated` with `changeInfo = { title: ... }`,
+      // no URL, no status. We must thread title-only updates through to
+      // the observer so the tab-session projection picks up `latestTitle`
+      // and the Inbox / current-tab card show a human-readable string
+      // instead of the canonical URL.
+      const hasTitleChange =
+        typeof changeInfo.title === 'string' && changeInfo.title.length > 0;
+      if (changeInfo.url === undefined && changeInfo.status !== 'complete' && !hasTitleChange) {
+        updateLastOnUpdated(sequence, { skippedReason: 'no-url-and-not-complete-and-no-title' });
         return;
       }
       const url = tab.url ?? changeInfo.url;
       if (typeof url !== 'string' || url.length === 0) {
         updateLastOnUpdated(sequence, { skippedReason: 'missing-url' });
+        return;
+      }
+      // See onActivated above: never observe non-content surfaces.
+      if (!isTrackableUrl(url)) {
+        updateLastOnUpdated(sequence, { skippedReason: 'non-trackable-scheme' });
         return;
       }
       updateLastOnUpdated(sequence, { urlUsed: url });
@@ -556,17 +790,42 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
         url,
         tabSessionId: tabSession.tabSessionId,
       };
+      // Only forward `tab.title` if it isn't URL-shaped (see
+      // isUrlShapedFakeTitle). The content-script title-watcher
+      // pushes the real document.title separately; passing the
+      // URL-shaped fake here would clobber it in the projection.
+      const tabTitleForObserve =
+        typeof tab.title === 'string' && !isUrlShapedFakeTitle(tab.title, url)
+          ? tab.title
+          : undefined;
       observer.observe({
         tabId,
         windowId: tab.windowId,
         url,
-        ...(typeof tab.title === 'string' ? { title: tab.title } : {}),
+        ...(tabTitleForObserve === undefined ? {} : { title: tabTitleForObserve }),
         transition: changeInfo.status === 'complete' ? 'completed' : 'updated',
         tabSessionId: tabSession.tabSessionId,
         ...(tabSession.openerTabSessionId === undefined
           ? {}
           : { openerTabSessionId: tabSession.openerTabSessionId }),
       });
+      // Stealth Chromium / patchright sometimes doesn't propagate
+      // document.title back through `tab.title`, so the URL-as-title
+      // fallback sticks. Read `document.title` directly via
+      // chrome.scripting a beat later and re-emit if it differs. The
+      // observer's coalesce path no-ops when the title is unchanged,
+      // so this is cheap when chrome.tabs already worked.
+      if (changeInfo.status === 'complete' || hasTitleChange) {
+        scheduleTitleReCheck({
+          tabId,
+          windowId: tab.windowId,
+          url,
+          tabSessionId: tabSession.tabSessionId,
+          ...(tabSession.openerTabSessionId === undefined
+            ? {}
+            : { openerTabSessionId: tabSession.openerTabSessionId }),
+        });
+      }
     })();
   });
   onUpdatedListenerCount += 1;
@@ -667,6 +926,15 @@ export const readTimelineReplayDiagnostics = async (): Promise<TimelineReplayDia
     lastOnUpdated,
     lastObserveRequest,
     lastDrainTrigger,
+    contentTitleSink: {
+      hits: contentTitleSinkHits,
+      skippedNotInit: contentTitleSinkSkippedNotInit,
+      skippedGateClosed: contentTitleSinkSkippedGateClosed,
+      skippedUntrackable: contentTitleSinkSkippedUntrackable,
+      lastAt: lastContentTitleAt,
+      lastValue: lastContentTitleValue,
+      sinkAttached: contentTitleSink !== null,
+    },
   },
   observer: getTimelineObserverDiagnostics(),
   materializer: await getTimelineMaterializerDiagnostics(),

@@ -92,6 +92,57 @@ export const sanitizeTimelineUrl = (input: string): string => {
   return parsed.toString();
 };
 
+// Schemes that the timeline observer ignores. Internal browser surfaces
+// (new-tab page, settings, devtools), extension pages, and `about:` /
+// blank-document placeholders never represent meaningful user content.
+// The boundary state machine + observer skip these so they never produce
+// tab sessions, never appear in the Inbox, and never reach Connections.
+const NON_TRACKABLE_SCHEMES = new Set([
+  'about:',
+  'chrome:',
+  'chrome-extension:',
+  'chrome-search:',
+  'chrome-devtools:',
+  'devtools:',
+  'edge:',
+  'view-source:',
+  'data:',
+  'javascript:',
+]);
+
+// Returns true when the URL has a scheme + host worth observing in the
+// timeline. False for non-content browser surfaces (about:blank, the
+// new-tab page, chrome-extension://, devtools://, etc.). `file://` IS
+// trackable: local scaffolds (e.g. the test launchpad.html) act as
+// openers for the real-page tabs the user clicks into, and the Flow
+// Path view anchors on the launchpad to surface that lineage. The
+// extension's Inbox UI filters file:// records from the visible list
+// (src/sidepanel/tabsession/inboxPriority.ts) so they don't pollute
+// the triage queue — the data itself stays in the projection.
+//
+// The check is scheme-based rather than domain-based, so it does not
+// need a host allowlist and stays correct for any provider.
+export const isTrackableUrl = (input: string): boolean => {
+  if (typeof input !== 'string' || input.length === 0) return false;
+  // Bare 'about:blank' (and friends) — handled before URL parsing because
+  // some platforms accept it without a slash.
+  if (input === 'about:blank' || input.startsWith('about:')) return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(input);
+  } catch {
+    return false;
+  }
+  if (NON_TRACKABLE_SCHEMES.has(parsed.protocol)) return false;
+  // Reject URLs whose protocol resolves to chrome-extension:// without
+  // the trailing colon being included in NON_TRACKABLE_SCHEMES (some
+  // platform variants strip it).
+  if (parsed.protocol.startsWith('chrome')) return false;
+  // Bare-host or empty-path file:// URLs carry no content.
+  if (parsed.protocol === 'file:' && parsed.pathname.length <= 1) return false;
+  return true;
+};
+
 // Whether a URL contains anything that would be stripped. Used by
 // tests to assert the sanitizer fires on a fixture; not by the
 // observer (which always sanitizes).

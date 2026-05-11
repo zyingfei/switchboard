@@ -102,12 +102,33 @@ describe('TimelineObserver — coalesce + debounce', () => {
     expect(emitted[1]?.tabIdHash).toBe('tab_2_1');
   });
 
-  it('title-only change within the coalesce window does NOT emit', () => {
+  it('repeat of the same URL+title within the coalesce window does NOT emit', () => {
+    const { emitted, observer, advance } = setup();
+    observer.observe({ tabId: 1, windowId: 1, url: 'https://x/a', title: 'A', transition: 'activated' });
+    advance(2_000);
+    observer.observe({ tabId: 1, windowId: 1, url: 'https://x/a', title: 'A', transition: 'updated' });
+    expect(emitted).toHaveLength(1);
+  });
+
+  it('title change within the coalesce window DOES emit so the projection picks it up', () => {
+    // SPAs like chatgpt.com update document.title after streaming finishes,
+    // landing well inside the 30 s coalesce window. The observer must re-emit
+    // so the tab-session projection's latestTitle reflects the new value.
+    const { emitted, observer, advance } = setup();
+    observer.observe({ tabId: 1, windowId: 1, url: 'https://x/a', transition: 'activated' });
+    advance(2_000);
+    observer.observe({ tabId: 1, windowId: 1, url: 'https://x/a', title: 'A real title', transition: 'updated' });
+    expect(emitted).toHaveLength(2);
+    expect(emitted[1]?.title).toBe('A real title');
+  });
+
+  it('title rename within the coalesce window emits the new title', () => {
     const { emitted, observer, advance } = setup();
     observer.observe({ tabId: 1, windowId: 1, url: 'https://x/a', title: 'A', transition: 'activated' });
     advance(2_000);
     observer.observe({ tabId: 1, windowId: 1, url: 'https://x/a', title: 'A renamed', transition: 'updated' });
-    expect(emitted).toHaveLength(1);
+    expect(emitted).toHaveLength(2);
+    expect(emitted[1]?.title).toBe('A renamed');
   });
 
   it('close emits a closed transition with the last observed URL', () => {

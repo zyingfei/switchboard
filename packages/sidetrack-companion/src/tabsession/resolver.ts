@@ -7,7 +7,7 @@ import {
   isUserOrganizedItemPayload,
 } from '../feedback/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
-import type { ConnectionsSnapshot } from '../connections/types.js';
+import type { ConnectionNode, ConnectionsSnapshot } from '../connections/types.js';
 import type { ClosestVisitRanker } from '../connections/snapshot.js';
 import { seedHash, runPPR, createPprCache } from './causalPpr.js';
 import { buildClusterEvidence } from './clusterEvidence.js';
@@ -30,10 +30,24 @@ const WORKSTREAM_PREFIX = 'workstream:';
 const MODEL_REVISION = 'tabsession-resolver-v1';
 const pprCache = createPprCache();
 
+// Enriched anchor — the resolver now ships kind + best-effort label
+// alongside the raw node id so the extension's AttributionProvenance
+// can render human-friendly text ("ChatGPT — sidetrack") instead of
+// raw `tses_*` / `visit-instance:tses_*:date:url` strings. The
+// resolver pulls `label` from the same connections graph the snapshot
+// builds, with a fallback derived from the id prefix when the graph
+// has no entry. The extension's reader accepts both this enriched
+// shape and the legacy bare-string form for backward compat.
+export interface AttributionAnchor {
+  readonly id: string;
+  readonly kind: string;
+  readonly label: string;
+}
+
 export interface AttributionReason {
   readonly source: 'ppr' | 'similarity' | 'cluster';
   readonly summary: string;
-  readonly anchors: readonly string[];
+  readonly anchors: readonly AttributionAnchor[];
 }
 
 export interface ResolverCandidate extends FusedCandidate {
@@ -158,9 +172,32 @@ const negativeSeeds = (input: ResolveAttributionInput): Map<string, number> => {
   return seeds;
 };
 
+// Derive { kind, label } for an anchor node id from the connections
+// snapshot. When the snapshot has a real ConnectionNode we use its
+// label (which the snapshot builder has already hydrated with title
+// and host fallbacks); otherwise we synthesize a kind-aware
+// placeholder so the wire format never sends an unlabeled anchor.
+// The extension's `formatAnchorDisplay` will further override with
+// its live snapshot when the user has fresher metadata, but this
+// gives audit-log readers and other consumers a usable label too.
+const kindFromAnchorId = (id: string): string => {
+  const colon = id.indexOf(':');
+  return colon === -1 ? 'node' : id.slice(0, colon);
+};
+
+const enrichAnchor = (
+  anchorId: string,
+  nodeById: ReadonlyMap<string, ConnectionNode>,
+): AttributionAnchor => {
+  const node = nodeById.get(anchorId);
+  const kind = node?.kind ?? kindFromAnchorId(anchorId);
+  const label = node?.label && node.label.length > 0 ? node.label : '';
+  return { id: anchorId, kind, label };
+};
+
 const evidenceReasons = (
   candidate: CandidateEvidence,
-  anchors: readonly string[],
+  anchors: readonly AttributionAnchor[],
 ): readonly AttributionReason[] => {
   const reasons: AttributionReason[] = [];
   if (candidate.pprScore > 0) {
@@ -185,6 +222,176 @@ const evidenceReasons = (
     });
   }
   return reasons;
+};
+
+// Per-canonical-URL resolver. Anchors are every visit-instance and
+// timeline-visit node whose canonical URL matches the target. The
+// resolver runs the same PPR + similarity + cluster + fusion pipeline
+// as the tab-session resolver — only the seed set differs.
+export interface ResolveUrlAttributionInput {
+  readonly canonicalUrl: string;
+  readonly snapshot: ConnectionsSnapshot;
+  readonly events: readonly AcceptedEvent[];
+  readonly policyMode?: AttributionPolicyMode;
+  readonly policyTelemetry?: AttributionPolicyTelemetry;
+  readonly nowMs?: number;
+  readonly closestVisitRanker?: ClosestVisitRanker;
+}
+
+export interface UrlResolutionResult {
+  readonly canonicalUrl: string;
+  readonly dryRun: true;
+  readonly policyMode: AttributionPolicyMode;
+  readonly decision: {
+    readonly action: AttributionAction;
+    readonly workstreamId?: string;
+    readonly margin: number;
+  };
+  readonly fusedCandidates: readonly ResolverCandidate[];
+  readonly reasons: {
+    readonly dependencyKey: string;
+    readonly modelRevision: string;
+    readonly graphRevision: string;
+    readonly evidenceHash: string;
+    readonly targetAnchors: readonly string[];
+    readonly topContributingAnchors: readonly string[];
+  };
+}
+
+const urlNegativeSeeds = (input: ResolveUrlAttributionInput): Map<string, number> => {
+  const seeds = new Map<string, number>();
+  for (const event of input.events) {
+    if (event.type === USER_FLOW_REJECTED && isUserFlowRejectedPayload(event.payload)) {
+      seeds.set(event.payload.toId, -0.5);
+    }
+    if (event.type !== USER_ORGANIZED_ITEM || !isUserOrganizedItemPayload(event.payload)) continue;
+    if (
+      event.payload.itemKind === 'canonical-url' &&
+      event.payload.itemId === input.canonicalUrl &&
+      event.payload.toContainer === null &&
+      typeof event.payload.fromContainer === 'string'
+    ) {
+      seeds.set(`${WORKSTREAM_PREFIX}${event.payload.fromContainer}`, -0.75);
+    }
+  }
+  return seeds;
+};
+
+const collectUrlAnchors = (
+  snapshot: ConnectionsSnapshot,
+  canonicalUrl: string,
+): readonly string[] => {
+  const out: string[] = [];
+  const timelineVisitId = `timeline-visit:${canonicalUrl}`;
+  if (snapshot.nodes.some((node) => node.id === timelineVisitId)) {
+    out.push(timelineVisitId);
+  }
+  for (const node of snapshot.nodes) {
+    if (node.kind !== 'visit-instance') continue;
+    const nodeCanonical =
+      typeof node.metadata['canonicalUrl'] === 'string'
+        ? (node.metadata['canonicalUrl'] as string)
+        : typeof node.metadata['url'] === 'string'
+          ? (node.metadata['url'] as string)
+          : undefined;
+    if (nodeCanonical === canonicalUrl) out.push(node.id);
+  }
+  return out.sort(compareString);
+};
+
+export const resolveUrlAttribution = (
+  input: ResolveUrlAttributionInput,
+): UrlResolutionResult => {
+  const mode = input.policyMode ?? 'balanced';
+  const evidence = buildEvidenceGraph(input.snapshot);
+  const anchors = collectUrlAnchors(input.snapshot, input.canonicalUrl).filter((anchor) =>
+    evidence.graph.hasNode(anchor),
+  );
+  const seed = new Map<string, number>();
+  for (const anchor of anchors) seed.set(anchor, 1);
+  for (const [anchor, value] of urlNegativeSeeds(input)) seed.set(anchor, value);
+
+  const seedFingerprint = seedHash(seed);
+  const evidenceHash = createHash('sha256')
+    .update(`${MODEL_REVISION}|url:${input.canonicalUrl}|${evidence.revision}|${seedFingerprint}`)
+    .digest('hex');
+  const cacheKey = `url:${input.canonicalUrl}|${evidence.revision}|${seedFingerprint}`;
+  const nowMs = input.nowMs ?? Date.now();
+  const ppr = pprCache.get(cacheKey, nowMs) ?? runPPR(evidence, seed);
+  pprCache.set(cacheKey, ppr, nowMs);
+
+  // For similarity/cluster, target the visit-instance / timeline-visit
+  // anchors (same set as PPR's positive seeds).
+  const similarity = new Map(
+    buildSimilarityEvidence({
+      snapshot: input.snapshot,
+      targetVisitNodeIds: new Set(anchors),
+      events: input.events,
+      ...(input.closestVisitRanker === undefined
+        ? {}
+        : { closestVisitRanker: input.closestVisitRanker }),
+    }).map((item) => [item.workstreamId, item]),
+  );
+  const cluster = new Map(
+    buildClusterEvidence(input.snapshot, new Set(anchors)).map((item) => [item.workstreamId, item]),
+  );
+  const workstreamIds = candidateWorkstreamIds(evidence, anchors, allWorkstreamIds(input.snapshot));
+  for (const key of similarity.keys()) workstreamIds.add(key);
+  for (const key of cluster.keys()) workstreamIds.add(key);
+
+  const candidateEvidence: CandidateEvidence[] = [...workstreamIds]
+    .sort(compareString)
+    .map((workstreamId) => {
+      const sim = similarity.get(workstreamId);
+      const clusterEvidence = cluster.get(workstreamId);
+      const pprScore = Math.max(0, ppr.get(`${WORKSTREAM_PREFIX}${workstreamId}`) ?? 0);
+      const corroborationCount =
+        (pprScore > 0.01 ? 1 : 0) +
+        ((sim?.simTopScore ?? 0) > 0 ? 1 : 0) +
+        ((clusterEvidence?.posterior ?? 0) > 0 ? 1 : 0);
+      return {
+        workstreamId,
+        pprScore,
+        simTopScore: sim?.simTopScore ?? 0,
+        simMeanScore: sim?.simMeanScore ?? 0,
+        simAgreement: sim?.simAgreement ?? 0,
+        simMargin: sim?.simMargin ?? 0,
+        clusterPosterior: clusterEvidence?.posterior ?? 0,
+        corroborationCount,
+      };
+    });
+
+  const nodeById = new Map<string, ConnectionNode>(
+    input.snapshot.nodes.map((node) => [node.id, node] as const),
+  );
+  const enrichedAnchors: readonly AttributionAnchor[] = anchors
+    .slice(0, 3)
+    .map((anchorId) => enrichAnchor(anchorId, nodeById));
+
+  const fusedCandidates = fuseCandidates(candidateEvidence)
+    .filter((candidate) => candidate.corroborationCount > 0)
+    .slice(0, 5)
+    .map((candidate) => ({
+      ...candidate,
+      reasons: evidenceReasons(candidate, enrichedAnchors),
+    }));
+  const decision = decideAttribution(fusedCandidates, mode, input.policyTelemetry);
+
+  return {
+    canonicalUrl: input.canonicalUrl,
+    dryRun: true,
+    policyMode: mode,
+    decision,
+    fusedCandidates,
+    reasons: {
+      dependencyKey: cacheKey,
+      modelRevision: MODEL_REVISION,
+      graphRevision: evidence.revision,
+      evidenceHash,
+      targetAnchors: anchors,
+      topContributingAnchors: anchors.slice(0, 3),
+    },
+  };
 };
 
 export const resolveAttribution = (input: ResolveAttributionInput): ResolutionResult => {
@@ -247,12 +454,23 @@ export const resolveAttribution = (input: ResolveAttributionInput): ResolutionRe
       };
     });
 
+  // Build the enriched anchor list once and reuse across reasons.
+  // Each anchor is { id, kind, label } where kind/label are pulled
+  // from the connections snapshot (which hydrates tab-session labels
+  // from the projection — see snapshot.ts).
+  const nodeById = new Map<string, ConnectionNode>(
+    input.snapshot.nodes.map((node) => [node.id, node] as const),
+  );
+  const enrichedAnchors: readonly AttributionAnchor[] = anchors
+    .slice(0, 3)
+    .map((anchorId) => enrichAnchor(anchorId, nodeById));
+
   const fusedCandidates = fuseCandidates(candidateEvidence)
     .filter((candidate) => candidate.corroborationCount > 0)
     .slice(0, 5)
     .map((candidate) => ({
       ...candidate,
-      reasons: evidenceReasons(candidate, anchors.slice(0, 3)),
+      reasons: evidenceReasons(candidate, enrichedAnchors),
     }));
   const decision = decideAttribution(fusedCandidates, mode, input.policyTelemetry);
 
