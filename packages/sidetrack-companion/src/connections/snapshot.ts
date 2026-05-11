@@ -359,6 +359,118 @@ const snapshotFromAccumulators = (
 const stripFragmentAndTrailingSlash = (url: string): string =>
   url.replace(/#.*$/u, '').replace(/\/+$/u, '');
 
+// Stage 5 / T5 — `timeline_same_url_as_thread` gates. Pre-T5 the edge
+// fired whenever a timeline-visit's canonical URL matched a thread's
+// URL, which is noisy: shared URLs across tabs, reloads, preview
+// pages, and unrelated visits to a chat host all triggered it.
+//
+// T5 demotes the edge by requiring at least the same provider OR a
+// reasonable title overlap, AND a recency window. Edges that pass keep
+// `confidence: 'inferred'` and gain a `producedBy.evidence` blob
+// recording which gates fired. Edges that don't pass are simply not
+// emitted.
+//
+// These gates intentionally err on the side of dropping signal — the
+// retro's diagnosis was that the existing edge family was the only
+// inferred kind at scale (8 of 9 edges) and the weakest signal. T5
+// trades coverage for honesty.
+
+export const TIMELINE_SAME_URL_AS_THREAD_TITLE_JACCARD_THRESHOLD = 0.25;
+export const TIMELINE_SAME_URL_AS_THREAD_RECENCY_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+export const TIMELINE_SAME_URL_AS_THREAD_TITLE_JACCARD_ENV =
+  'SIDETRACK_TIMELINE_SAME_URL_AS_THREAD_TITLE_JACCARD';
+export const TIMELINE_SAME_URL_AS_THREAD_RECENCY_WINDOW_MS_ENV =
+  'SIDETRACK_TIMELINE_SAME_URL_AS_THREAD_RECENCY_WINDOW_MS';
+
+const readEnvNumberSnapshot = (name: string): number | undefined => {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return undefined;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : undefined;
+};
+
+const titleJaccardThreshold = (): number => {
+  const env = readEnvNumberSnapshot(TIMELINE_SAME_URL_AS_THREAD_TITLE_JACCARD_ENV);
+  if (env === undefined) return TIMELINE_SAME_URL_AS_THREAD_TITLE_JACCARD_THRESHOLD;
+  return Math.min(Math.max(env, 0), 1);
+};
+
+const recencyWindowMs = (): number => {
+  const env = readEnvNumberSnapshot(TIMELINE_SAME_URL_AS_THREAD_RECENCY_WINDOW_MS_ENV);
+  if (env === undefined) return TIMELINE_SAME_URL_AS_THREAD_RECENCY_WINDOW_MS;
+  return Math.max(0, env);
+};
+
+const tokenizeTitle = (title: string | undefined): ReadonlySet<string> => {
+  const set = new Set<string>();
+  if (title === undefined) return set;
+  for (const raw of title.split(/\s+/u)) {
+    const trimmed = raw.trim().toLowerCase();
+    if (trimmed.length === 0) continue;
+    set.add(trimmed);
+  }
+  return set;
+};
+
+const titleJaccard = (left: string | undefined, right: string | undefined): number => {
+  const leftTokens = tokenizeTitle(left);
+  const rightTokens = tokenizeTitle(right);
+  if (leftTokens.size === 0 || rightTokens.size === 0) return 0;
+  let intersection = 0;
+  const [smaller, larger] =
+    leftTokens.size <= rightTokens.size ? [leftTokens, rightTokens] : [rightTokens, leftTokens];
+  for (const token of smaller) {
+    if (larger.has(token)) intersection += 1;
+  }
+  const union = leftTokens.size + rightTokens.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+};
+
+// Returns null when the candidate edge should not be emitted; otherwise
+// returns the evidence blob to record on `producedBy.evidence`.
+export interface TimelineSameUrlAsThreadGateInput {
+  readonly visitTitle?: string;
+  readonly visitProvider?: string;
+  readonly visitObservedAt: string;
+  readonly threadTitle?: string;
+  readonly threadProvider?: string;
+  readonly threadLastSeenAt?: string;
+}
+
+export interface TimelineSameUrlAsThreadEvidence {
+  readonly providerMatched: boolean;
+  readonly titleJaccard: number;
+  readonly recencyDeltaMs: number | null;
+}
+
+export const evaluateTimelineSameUrlAsThreadGate = (
+  input: TimelineSameUrlAsThreadGateInput,
+): TimelineSameUrlAsThreadEvidence | null => {
+  const providerMatched =
+    input.visitProvider !== undefined &&
+    input.threadProvider !== undefined &&
+    input.visitProvider.length > 0 &&
+    input.visitProvider === input.threadProvider;
+  const jaccard = titleJaccard(input.visitTitle, input.threadTitle);
+  // Provider OR title-overlap. When neither side has a title we fall
+  // back to requiring a provider match.
+  const overlapPasses = providerMatched || jaccard >= titleJaccardThreshold();
+  if (!overlapPasses) return null;
+  // Recency window. When the thread has no `lastSeenAt`, skip the
+  // recency check — the metadata isn't available to reject on.
+  let recencyDeltaMs: number | null = null;
+  if (input.threadLastSeenAt !== undefined) {
+    const left = Date.parse(input.visitObservedAt);
+    const right = Date.parse(input.threadLastSeenAt);
+    if (Number.isFinite(left) && Number.isFinite(right)) {
+      recencyDeltaMs = Math.abs(left - right);
+      if (recencyDeltaMs > recencyWindowMs()) return null;
+    }
+  }
+  return { providerMatched, titleJaccard: jaccard, recencyDeltaMs };
+};
+
 const TIMELINE_VISIT_NODE_PREFIX = 'timeline-visit:';
 const VISIT_INSTANCE_NODE_KIND = 'visit-instance' as const;
 const VISIT_INSTANCE_INCREMENTING_TRANSITIONS: ReadonlySet<TimelineTransition> =
@@ -973,8 +1085,10 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
   // Build URL → thread id map. canonicalUrl preferred; fall back to
   // threadUrl (with fragment + trailing-slash normalization).
   const threadIdByUrl = new Map<string, string>();
+  const threadByBacId = new Map<string, ThreadVaultRecord>();
   const visitObservedAtByKey = new Map<string, string>();
   for (const t of input.threads) {
+    threadByBacId.set(t.bac_id, t);
     const candidate = t.canonicalUrl ?? t.threadUrl;
     if (typeof candidate !== 'string' || candidate.length === 0) continue;
     threadIdByUrl.set(stripFragmentAndTrailingSlash(candidate), t.bac_id);
@@ -1026,15 +1140,35 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
       });
       const threadId = threadIdByUrl.get(visitKey);
       if (threadId !== undefined) {
-        upsertNode(nodes, { kind: 'thread', key: threadId, label: threadId });
-        upsertEdge(edges, {
-          kind: 'timeline_same_url_as_thread',
-          fromNodeId: nodeIdFor('timeline-visit', visitKey),
-          toNodeId: nodeIdFor('thread', threadId),
-          observedAt: entry.lastSeenAt,
-          producedBy: { source: 'timeline-projection' },
-          confidence: 'inferred',
+        const thread = threadByBacId.get(threadId);
+        const evidence = evaluateTimelineSameUrlAsThreadGate({
+          ...(entry.title === undefined ? {} : { visitTitle: entry.title }),
+          ...(entry.provider === undefined ? {} : { visitProvider: entry.provider }),
+          visitObservedAt: entry.lastSeenAt,
+          ...(thread?.title === undefined ? {} : { threadTitle: thread.title }),
+          ...(thread?.provider === undefined ? {} : { threadProvider: thread.provider }),
+          ...(thread?.lastSeenAt === undefined ? {} : { threadLastSeenAt: thread.lastSeenAt }),
         });
+        if (evidence !== null) {
+          upsertNode(nodes, { kind: 'thread', key: threadId, label: threadId });
+          upsertEdge(edges, {
+            kind: 'timeline_same_url_as_thread',
+            fromNodeId: nodeIdFor('timeline-visit', visitKey),
+            toNodeId: nodeIdFor('thread', threadId),
+            observedAt: entry.lastSeenAt,
+            producedBy: { source: 'timeline-projection' },
+            confidence: 'inferred',
+            metadata: {
+              evidence: {
+                providerMatched: evidence.providerMatched,
+                titleJaccard: Number(evidence.titleJaccard.toFixed(4)),
+                ...(evidence.recencyDeltaMs === null
+                  ? {}
+                  : { recencyDeltaMs: evidence.recencyDeltaMs }),
+              },
+            },
+          });
+        }
       }
     }
   }
