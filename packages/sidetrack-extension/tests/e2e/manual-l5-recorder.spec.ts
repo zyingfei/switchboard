@@ -278,6 +278,27 @@ const openRecorderSidepanel = async (
   await page.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
     waitUntil: 'domcontentloaded',
   });
+  // When the operator picked `e2e:recorder:fresh`, the companion vault
+  // was already moved to backup. But the extension caches its
+  // projections (workstreams, active workstream id, tab sessions, …)
+  // in chrome.storage.local under the browser profile — that profile
+  // is sticky across runs so the cache survives. Wipe it now, before
+  // the panel renders, so the user sees a truly empty slate.
+  if (process.env.SIDETRACK_VAULT_FRESH === '1') {
+    await page.evaluate(async () => {
+      const c = (
+        globalThis as unknown as {
+          chrome?: { storage?: { local?: { clear?: () => Promise<void> } } };
+        }
+      ).chrome;
+      const clearFn = c?.storage?.local?.clear;
+      if (typeof clearFn === 'function') {
+        await clearFn.call(c?.storage?.local);
+      }
+    });
+    // eslint-disable-next-line no-console
+    console.log('[recorder] Cleared chrome.storage.local for fresh-vault run');
+  }
   // Seed only what's needed to pair the side panel with the spawned
   // companion. Workstreams + activeWorkstreamId stay un-seeded so the
   // recording is fully organic — the user creates / picks workstreams
