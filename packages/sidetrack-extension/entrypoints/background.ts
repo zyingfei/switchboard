@@ -476,36 +476,43 @@ const hasEngagementHostPermission = async (): Promise<boolean> => {
   }
 };
 
+// Primary in-memory journal. Survives SW lifetime, no async dependency
+// on chrome.storage, no race conditions. Mirrored to chrome.storage.session
+// and console.warn as fallbacks for operators who can't read globalThis
+// from a non-SW context.
+const engagementSyncJournal: Array<Record<string, unknown>> = [];
+const ENGAGEMENT_SYNC_JOURNAL_MAX = 50;
+
 const recordEngagementSyncDiag = async (
   step: string,
   detail?: Record<string, unknown>,
 ): Promise<void> => {
-  // Journal of every sync attempt for the engagement subsystem. Uses
-  // chrome.storage.session because earlier diag traces showed that
-  // chrome.storage.local writes from inside SW message-listener bodies
-  // intermittently failed to persist on Chrome 148. Session storage is
-  // in-memory and survives the SW lifetime; the journal also gets
-  // mirrored to console.warn so it shows up in SW DevTools regardless
-  // of storage availability.
-  //
-  // Readable from any extension page DevTools (side panel works):
-  //   await chrome.storage.session.get('sidetrack.engagement.diag')
   const entry: Record<string, unknown> = {
     at: new Date().toISOString(),
     step,
   };
   if (detail !== undefined) entry['detail'] = detail;
+  // Primary: globalThis array. Read from SW DevTools via:
+  //   globalThis.__sidetrackEngagementDiag
+  // Or from any extension page DevTools via sidetrack.dev.diag dump
+  // (folded into the response below).
+  engagementSyncJournal.push(entry);
+  if (engagementSyncJournal.length > ENGAGEMENT_SYNC_JOURNAL_MAX) {
+    engagementSyncJournal.shift();
+  }
+  (globalThis as unknown as { __sidetrackEngagementDiag: unknown[] }).__sidetrackEngagementDiag =
+    engagementSyncJournal;
+  // Console fallback — visible in the SW DevTools console regardless
+  // of storage availability.
   console.warn('[engagement.diag]', step, detail ?? '');
+  // Best-effort secondary: chrome.storage.session so a side-panel
+  // DevTools can probe it. Chrome 148 sometimes loses these writes
+  // (we hit this earlier), so it's belt-and-suspenders not primary.
   try {
     const key = 'sidetrack.engagement.diag';
-    const got = await chrome.storage.session.get(key);
-    const prior = Array.isArray(got[key])
-      ? (got[key] as unknown[]).filter((e): e is Record<string, unknown> => typeof e === 'object' && e !== null)
-      : [];
-    const next = [...prior, entry].slice(-20);
-    await chrome.storage.session.set({ [key]: next });
+    await chrome.storage.session.set({ [key]: [...engagementSyncJournal] });
   } catch {
-    // Best-effort journal.
+    // Storage failed — globalThis still has the data.
   }
 };
 
@@ -3881,14 +3888,30 @@ export default defineBackground(() => {
       ) {
         void readTimelineReplayDiagnostics()
           .then(async (diagnostics) => {
+            // Fold the engagement journal into the diag response so the
+            // recorder's existing periodic SW-diag dump captures it
+            // automatically — no separate plumbing needed.
+            const fullDiagnostics = {
+              ...diagnostics,
+              engagement: {
+                journal: [...engagementSyncJournal],
+                journalLength: engagementSyncJournal.length,
+              },
+            };
             try {
               await chrome.storage.session.set({
-                'sidetrack.dev.diag': { capturedAt: new Date().toISOString(), diagnostics },
+                'sidetrack.dev.diag': {
+                  capturedAt: new Date().toISOString(),
+                  diagnostics: fullDiagnostics,
+                },
               });
             } catch {
               // session storage may not be available in some test harnesses
             }
-            sendResponse({ ok: true, diagnostics } as unknown as RuntimeResponse);
+            sendResponse({
+              ok: true,
+              diagnostics: fullDiagnostics,
+            } as unknown as RuntimeResponse);
           })
           .catch((error: unknown) => {
             sendResponse({
