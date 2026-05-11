@@ -175,6 +175,35 @@ const tabSessionIdFromDragEvent = (event: DragEvent<HTMLElement>): string | null
   return plain.startsWith('tses_') ? plain : null;
 };
 
+// Module-level semaphore to cap concurrent fetches to the companion.
+// Without this, dozens of NeedsOrganizeSuggestionRow components mount
+// at once and each fires its own /v1/suggestions/thread/{id} fetch in
+// useEffect, blowing past Chrome's per-origin socket cap (~6 for
+// HTTP/1.1) and triggering ERR_INSUFFICIENT_RESOURCES failures + a
+// transient "companion disconnected" banner. Holding to 4 in-flight
+// keeps the companion's single-threaded HTTP loop responsive AND
+// keeps the periodic /v1/system/health probe from being starved.
+const COMPANION_FETCH_MAX_CONCURRENCY = 4;
+const companionFetchState = { active: 0, queue: [] as Array<() => void> };
+const acquireCompanionFetchSlot = async (): Promise<() => void> => {
+  if (companionFetchState.active < COMPANION_FETCH_MAX_CONCURRENCY) {
+    companionFetchState.active += 1;
+  } else {
+    await new Promise<void>((resolve) => {
+      companionFetchState.queue.push(resolve);
+    });
+    companionFetchState.active += 1;
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    companionFetchState.active -= 1;
+    const next = companionFetchState.queue.shift();
+    if (next !== undefined) next();
+  };
+};
+
 // The URL projection's byCanonicalUrl is keyed by what the observer
 // produced — `sanitizeTimelineUrl(canonicalThreadUrl(rawUrl))`. The live
 // `chrome.tabs` URL the side panel reads has NOT been through that
@@ -6707,6 +6736,14 @@ function NeedsOrganizeSuggestionRow({
     let cancelled = false;
     setPending(true);
     void (async () => {
+      // Throttle: acquire a global slot before issuing the fetch so
+      // the simultaneous mount of N suggestion rows can't exhaust
+      // Chrome's per-origin socket pool. Slot releases on finally.
+      const release = await acquireCompanionFetchSlot();
+      if (cancelled) {
+        release();
+        return;
+      }
       try {
         const url = `http://127.0.0.1:${String(companionPort)}/v1/suggestions/thread/${threadId}?limit=1`;
         const response = await fetch(url, { headers: { 'x-bac-bridge-key': bridgeKey } });
@@ -6741,6 +6778,7 @@ function NeedsOrganizeSuggestionRow({
       } catch {
         // Silent — empty render
       } finally {
+        release();
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled mutated by cleanup
         if (!cancelled) setPending(false);
       }

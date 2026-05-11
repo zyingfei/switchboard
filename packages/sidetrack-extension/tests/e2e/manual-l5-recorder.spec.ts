@@ -426,11 +426,68 @@ const dumpSwDiagOnce = async (
       stash = null;
     }
   }
+  // Also pull the engagement journal from session storage so the
+  // artifact gives a full picture of what the engagement subsystem
+  // did between dumps. Same evaluate pattern; tolerates missing
+  // storage.session.
+  let engagementDiag: unknown = null;
+  try {
+    engagementDiag = await (
+      panel as unknown as { evaluate: (fn: () => Promise<unknown>) => Promise<unknown> }
+    ).evaluate(async () => {
+      const c = (globalThis as unknown as { chrome?: typeof chrome }).chrome;
+      if (c === undefined) return null;
+      try {
+        const sessionStorage = (c.storage as { readonly session?: typeof c.storage.local }).session;
+        if (sessionStorage === undefined) return null;
+        const got = await sessionStorage.get('sidetrack.engagement.diag');
+        return got['sidetrack.engagement.diag'] ?? null;
+      } catch {
+        return null;
+      }
+    });
+  } catch {
+    engagementDiag = null;
+  }
+  // Also inspect what the side panel sees from chrome.scripting (is the
+  // engagement script registered?) and chrome.permissions (does the
+  // browser still report host access?) so the artifact captures the
+  // full state in one place.
+  let extensionState: unknown = null;
+  try {
+    extensionState = await (
+      panel as unknown as { evaluate: (fn: () => Promise<unknown>) => Promise<unknown> }
+    ).evaluate(async () => {
+      const c = (globalThis as unknown as { chrome?: typeof chrome }).chrome;
+      if (c === undefined) return null;
+      try {
+        const registrations = await c.scripting.getRegisteredContentScripts({
+          ids: ['sidetrack-engagement'],
+        });
+        const hostPermission = await new Promise<boolean>((resolve) => {
+          c.permissions.contains({ origins: ['https://*/*', 'http://*/*'] }, (g) => {
+            resolve(Boolean(g));
+          });
+        });
+        const tabs = await c.tabs.query({ url: ['https://*/*', 'http://*/*'] });
+        return {
+          engagementRegistrations: registrations,
+          hostPermission,
+          httpTabCount: tabs.length,
+          sampleTabs: tabs.slice(0, 3).map((t) => ({ id: t.id ?? null, url: t.url?.slice(0, 80) ?? null })),
+        };
+      } catch (error) {
+        return { error: error instanceof Error ? error.message : String(error) };
+      }
+    });
+  } catch {
+    extensionState = null;
+  }
   await mkdir(outDir, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/gu, '-');
   await writeFile(
     path.join(outDir, `${stamp}-${label}.json`),
-    `${JSON.stringify(stash, null, 2)}\n`,
+    `${JSON.stringify({ swDiag: stash, engagementDiag, extensionState }, null, 2)}\n`,
     'utf8',
   );
 };
