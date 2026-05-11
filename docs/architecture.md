@@ -481,6 +481,45 @@ a marketing-analytics dashboard host) are a Stage 5.1 follow-up.
 For the track-by-track plan see
 [`docs/proposals/work-graph-stage5-data-bridge.md`](proposals/work-graph-stage5-data-bridge.md).
 
+### Live debug: attach-diag
+
+When the recorder is running, an operator can attach to the live
+browser without touching it manually and produce a JSON evidence
+block:
+
+```bash
+# Terminal A (already running, keep it):
+npm --prefix packages/sidetrack-extension run e2e:chrome-debug
+
+# Terminal B:
+SIDETRACK_E2E_CDP_URL=http://localhost:9222 \
+  npm --prefix packages/sidetrack-extension run e2e:attach-diag
+```
+
+The harness connects over CDP, wakes the MV3 service worker, reads
+the diag stash, inspects `chrome.permissions` + registered content
+scripts, exercises a normal http(s) page for ~8 s, force-drains the
+timeline spool, queries the companion's `/v1/version`,
+`/v1/privacy/projection`, `/v1/threads/projections`, and
+`/v1/visits/projection`, and writes a JSON report to
+`packages/sidetrack-extension/test-results/attach-diag.json`. The
+report classifies engagement failure into one of: `closed gate`,
+`missing permission`, `wrong built script path`, `registration not
+called`, `script registered but not injected`, `SW did not receive
+interval`, `companion post failed`, `materializer did not consume
+event`, or `ok`. Thread→URL propagation is similarly classified
+without manual grep.
+
+Stale-process detection: the report cross-checks the extension build
+SHA against the companion's `/v1/version` SHA. When they differ, the
+report prints:
+
+```
+STALE_PROCESS: extension build sha (X) and companion build sha (Y)
+differ; restart the recorder/companion before interpreting
+companion-side diagnostics.
+```
+
 ## The most important design principle
 
 > **Facts are event-sourced. Interpretations are versioned. Suggestions

@@ -213,6 +213,7 @@ import { runAutoUpdate } from '../system/autoUpdate.js';
 import { collectHealth, type CaptureWarningHealth, type HealthReport } from '../system/health.js';
 import { collectWorkGraphHealth } from '../system/workGraphHealth.js';
 import { checkLatestVersion, type UpdateAdvisory } from '../system/versionCheck.js';
+import { COMPANION_VERSION } from '../version.js';
 import { maybeRetrainClosestVisitRanker } from '../ranker/retrain.js';
 import {
   listAnnotations,
@@ -1143,6 +1144,37 @@ const routes: readonly RouteDefinition[] = [
     pattern: /^\/v1\/health$/,
     authRequired: false,
     handle: (_request, requestId) => Promise.resolve([200, { status: 'ok', requestId }]),
+  },
+  {
+    // Stage 5 follow-up — minimal version/identity probe used by the
+    // attach-diagnostic to detect a stale companion process (extension
+    // rebuilt but companion still running the prior build). Returns
+    // companion-controlled fields only; no auth needed because the
+    // information leak is harmless.
+    method: 'GET',
+    pattern: /^\/v1\/version$/,
+    authRequired: false,
+    handle: (_request, requestId, _match, context) =>
+      Promise.resolve([
+        200,
+        {
+          data: {
+            companionVersion: COMPANION_VERSION,
+            ...(context.vaultRoot === undefined ? {} : { vaultRoot: context.vaultRoot }),
+            ...(context.startedAt === undefined
+              ? {}
+              : { startedAt: context.startedAt.toISOString() }),
+            // gitSha is best-effort: it's set when the CLI is invoked
+            // with --git-sha or with the SIDETRACK_COMPANION_GIT_SHA
+            // env var. Absent in normal `node dist/cli.js` runs.
+            ...(typeof process.env['SIDETRACK_COMPANION_GIT_SHA'] === 'string' &&
+            process.env['SIDETRACK_COMPANION_GIT_SHA'].length > 0
+              ? { gitSha: process.env['SIDETRACK_COMPANION_GIT_SHA'] }
+              : {}),
+            requestId,
+          },
+        },
+      ]),
   },
   {
     method: 'GET',
