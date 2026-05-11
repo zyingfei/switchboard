@@ -19,6 +19,7 @@
 //   SIDETRACK_VAULT_FRESH=1                            (archive + restart fresh)
 // The legacy SIDETRACK_MANUAL_L5_VAULT_DIR is still honoured for back-compat.
 
+import { execSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { access, mkdir, mkdtemp, readdir, rename, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
@@ -255,6 +256,33 @@ const apiPost = async (
   } finally {
     clearTimeout(timer);
   }
+};
+
+// Resolve the build's git identity for the recorder banner. The
+// recorder runs from a working tree, so showing branch + short SHA +
+// dirty marker lets the operator confirm which code the running
+// companion + extension are built from — load-bearing when fixes
+// land on a feature branch and the operator wants to verify them
+// without a `git log` round-trip.
+interface VersionInfo {
+  readonly branch: string;
+  readonly commit: string;
+  readonly dirty: boolean;
+}
+
+const readVersionInfo = (): VersionInfo => {
+  const gitTrim = (args: string): string => {
+    try {
+      return execSync(`git ${args}`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+        .trim();
+    } catch {
+      return '';
+    }
+  };
+  const branch = gitTrim('symbolic-ref --short HEAD') || 'detached';
+  const commit = gitTrim('rev-parse --short HEAD') || 'unknown';
+  const dirty = gitTrim('status --porcelain --untracked-files=no').length > 0;
+  return { branch, commit, dirty };
 };
 
 const openPrivacyGate = async (comp: TestCompanion, gate: string): Promise<void> => {
@@ -690,18 +718,32 @@ test.describe('manual full-browser recorder', () => {
       await launchpad.goto(launchpadUrl, { waitUntil: 'domcontentloaded' });
       await launchpad.bringToFront();
 
+      const version = readVersionInfo();
+      const versionLine = `${version.branch} @ ${version.commit}${version.dirty ? ' (dirty working tree)' : ''}`;
       const banner = `
 ================================================================
  SIDETRACK MANUAL RECORDER READY
 ================================================================
 
+ Version          : ${versionLine}
+
  Browser A profile: ${profileDir}
  Browser A panel  : chrome-extension://${runtimeA.extensionId}/sidepanel.html
  Reviewer panel   : chrome-extension://${runtimeB.extensionId}/sidepanel.html
 
- Companion A      : http://127.0.0.1:${String(companionA.port)}
- Companion B      : http://127.0.0.1:${String(companionB.port)}
+ Companion A
+   URL            : http://127.0.0.1:${String(companionA.port)}
+   Bridge key     : ${companionA.bridgeKey}
+   Vault          : ${companionA.vaultPath}
+ Companion B
+   URL            : http://127.0.0.1:${String(companionB.port)}
+   Bridge key     : ${companionB.bridgeKey}
+   Vault          : ${companionB.vaultPath}
  Artifacts        : ${artifactsDir}
+
+ Quick curl recipe (Companion A):
+   curl -s -H 'x-bac-bridge-key: ${companionA.bridgeKey}' \\
+     http://127.0.0.1:${String(companionA.port)}/v1/workstreams/projections | jq
 
  Manual steps:
    1. In the Browser A side panel, create the workstreams you want for
