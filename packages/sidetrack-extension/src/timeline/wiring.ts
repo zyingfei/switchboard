@@ -307,6 +307,13 @@ const hashWindowIdForReplica = (replica: EdgeReplica, windowId: number): string 
 const buildObserver = (input: {
   readonly hashTabId: (tabId: number, windowId: number) => string;
   readonly hashWindowId: (windowId: number) => string;
+  // Called after every successful local admit so the wiring layer can
+  // schedule an opportunistic drain. The default 60-second alarm
+  // dominated end-to-end latency for the "Current tab" card and the
+  // title-arrival path — a trailing-debounced drain after admit shrinks
+  // it to ~500ms while still coalescing the chatty title-update bursts
+  // that follow a navigation.
+  readonly onAdmit?: () => void;
 }): TimelineObserver => {
   return createTimelineObserver({
     clock: () => new Date(),
@@ -315,6 +322,9 @@ const buildObserver = (input: {
       // drop on failure (passive intent, health-visible counter).
       void timelinePluginMaterializer
         .admitLocal(observationFromPayload(payload), 'passive')
+        .then(() => {
+          input.onAdmit?.();
+        })
         .catch(() => undefined);
     },
     hashTabId: input.hashTabId,
@@ -338,6 +348,33 @@ const buildObserver = (input: {
     },
     coalesceWindowMs: 30_000,
   });
+};
+
+// Trailing-debounced activity drain: every admit kicks the timer; the
+// drain actually fires `ACTIVITY_DRAIN_DEBOUNCE_MS` after the LAST
+// admit. Coalesces the URL → status:complete → title-changed burst that
+// a typical navigation produces, while keeping the worst-case lag well
+// under a second for any user-visible signal.
+const ACTIVITY_DRAIN_DEBOUNCE_MS = 500;
+
+const makeActivityDrainScheduler = (
+  deps: InitDeps,
+): { readonly schedule: () => void; readonly cancel: () => void } => {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const schedule = (): void => {
+    if (timer !== null) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      void tryDrain(deps).catch(() => undefined);
+    }, ACTIVITY_DRAIN_DEBOUNCE_MS);
+  };
+  const cancel = (): void => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+  return { schedule, cancel };
 };
 
 interface InitDeps {
@@ -441,7 +478,12 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
   const tabSessions: TabSessionBoundary = createTabSessionBoundary({
     storage: createChromeTabSessionStorage(),
   });
-  const observer = buildObserver({ hashTabId, hashWindowId });
+  const activityDrain = makeActivityDrainScheduler(deps);
+  const observer = buildObserver({
+    hashTabId,
+    hashWindowId,
+    onAdmit: activityDrain.schedule,
+  });
 
   chrome.tabs.onCreated.addListener((tab) => {
     onCreatedCalls += 1;
