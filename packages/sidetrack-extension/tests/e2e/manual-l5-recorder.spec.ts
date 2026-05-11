@@ -382,40 +382,50 @@ const dumpSwDiagOnce = async (
   outDir: string,
   label: string,
 ): Promise<void> => {
+  // The SW's `sidetrack.dev.diag` handler responds with
+  // `{ok, diagnostics}` AND stashes a copy in chrome.storage.session.
+  // First try the direct response (works when the SW message port
+  // stays open). If that returns null (port closed mid-flight, common
+  // under stealth Chromium), fall back to the session-storage stash.
+  let response: unknown = null;
   try {
-    await runtime.sendRuntimeMessage(panel, { type: 'sidetrack.dev.diag' });
-  } catch {
-    // The message handler returns sendResponse({ok:true}) but some
-    // SW startup races can throw "message port closed"; that's fine
-    // — the stash is still written.
-  }
-  // Give chrome.storage.session a tick to settle.
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  let stash: unknown;
-  try {
-    stash = await runtime.sendRuntimeMessage(panel, {
-      type: 'sidetrack.dev.diag.read',
+    response = await runtime.sendRuntimeMessage(panel, {
+      type: 'sidetrack.dev.diag',
     });
   } catch {
-    stash = null;
+    response = null;
   }
-  // Fallback: read directly via chrome.storage.session in the panel.
-  stash ??= await (
-    panel as unknown as {
-      evaluate: (fn: () => Promise<unknown>) => Promise<unknown>;
-    }
-  ).evaluate(async () => {
-    const c = (globalThis as unknown as { chrome?: typeof chrome }).chrome;
-    if (c === undefined) return null;
+  let stash: unknown = response;
+  const responseHasDiagnostics =
+    typeof stash === 'object' &&
+    stash !== null &&
+    (stash as { diagnostics?: unknown }).diagnostics !== undefined;
+  if (!responseHasDiagnostics) {
+    // Give chrome.storage.session a beat to settle after the dev.diag
+    // handler's async stash write.
+    await new Promise((resolve) => setTimeout(resolve, 200));
     try {
-      const sessionStorage = (c.storage as { readonly session?: typeof c.storage.local }).session;
-      if (sessionStorage === undefined) return null;
-      const got = await sessionStorage.get('sidetrack.dev.diag');
-      return got['sidetrack.dev.diag'] ?? null;
+      stash = await (
+        panel as unknown as {
+          evaluate: (fn: () => Promise<unknown>) => Promise<unknown>;
+        }
+      ).evaluate(async () => {
+        const c = (globalThis as unknown as { chrome?: typeof chrome }).chrome;
+        if (c === undefined) return null;
+        try {
+          const sessionStorage = (c.storage as { readonly session?: typeof c.storage.local })
+            .session;
+          if (sessionStorage === undefined) return null;
+          const got = await sessionStorage.get('sidetrack.dev.diag');
+          return got['sidetrack.dev.diag'] ?? null;
+        } catch {
+          return null;
+        }
+      });
     } catch {
-      return null;
+      stash = null;
     }
-  });
+  }
   await mkdir(outDir, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/gu, '-');
   await writeFile(
