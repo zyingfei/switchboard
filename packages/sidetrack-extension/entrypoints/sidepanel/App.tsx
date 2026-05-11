@@ -995,78 +995,87 @@ const App = () => {
     [fetchCompanionJson],
   );
 
-  const loadTabSessions = useCallback(async (): Promise<void> => {
-    if (port.length === 0 || bridgeKey.length === 0) {
-      setTabSessionProjection(null);
-      setTabSessionInbox(EMPTY_TAB_SESSION_INBOX);
-      setTabSessionSuggestions({});
-      setUrlProjection(null);
-      setUrlInbox(EMPTY_URL_INBOX);
-      setUrlSuggestions({});
-      return;
-    }
-    setTabSessionLoading(true);
-    setTabSessionError(null);
-    try {
-      const [tabProjection, tabInbox] = await Promise.all([
-        fetchCompanionJson<unknown>('/v1/tabsessions/projection'),
-        fetchCompanionJson<unknown>('/v1/tabsessions/inbox?limit=51&offset=0'),
-      ]);
-      if (!isTabSessionProjection(tabProjection) || !isTabSessionInboxData(tabInbox)) {
-        throw new Error('Companion returned an invalid tab-session projection.');
+  // Stage 5 follow-up — background polls should NOT flip the
+  // `tabSessionLoading` flag (it toggles the "Loading tab sessions…"
+  // line, which reflows the Inbox layout every 4 s = visible flicker).
+  // Only the initial load + the explicit refresh button surface
+  // loading state; the poll silently swaps in fresh data.
+  //
+  // Similarly: the error banner is only cleared on SUCCESS, not on
+  // every fetch start. A flaky companion (one failed poll out of
+  // ten) used to flash the red banner on/off; now it persists until
+  // the next successful refresh, which is the actual signal the user
+  // wants.
+  const loadTabSessions = useCallback(
+    async (options: { readonly background?: boolean } = {}): Promise<void> => {
+      const background = options.background === true;
+      if (port.length === 0 || bridgeKey.length === 0) {
+        setTabSessionProjection(null);
+        setTabSessionInbox(EMPTY_TAB_SESSION_INBOX);
+        setTabSessionSuggestions({});
+        setUrlProjection(null);
+        setUrlInbox(EMPTY_URL_INBOX);
+        setUrlSuggestions({});
+        return;
       }
-      setTabSessionProjection(tabProjection);
-      setTabSessionInbox(tabInbox);
-      setTabSessionSuggestions(await loadTabSessionSuggestions(tabProjection, tabInbox));
-    } catch (loadError) {
-      setTabSessionError(
-        loadError instanceof Error ? loadError.message : 'Could not load tab sessions.',
-      );
-      setTabSessionSuggestions({});
-    } finally {
-      setTabSessionLoading(false);
-    }
-    // URL projection (Phase B) is fetched independently — older
-    // companions that don't yet expose /v1/visits/* return 404, which
-    // we tolerate by leaving the URL state empty. Tab-session state
-    // above keeps working in that case.
-    try {
-      const [urlProj, urlInboxResp] = await Promise.all([
-        fetchCompanionJson<unknown>('/v1/visits/projection'),
-        fetchCompanionJson<unknown>('/v1/visits/inbox?limit=51&offset=0'),
-      ]);
-      if (isUrlProjection(urlProj) && isUrlInboxData(urlInboxResp)) {
-        setUrlProjection(urlProj);
-        setUrlInbox(urlInboxResp);
-        setUrlSuggestions(await loadUrlSuggestions(urlInboxResp));
-        // Diagnostic: log the URL record for whatever tab the user is
-        // currently looking at so we can see whether the projection
-        // already has the real title (companion-side) but the panel is
-        // stuck on a stale render.
-        // eslint-disable-next-line no-console
-        const focused =
-          typeof state.activeTabUrl === 'string'
-            ? (urlProj as UrlProjection).byCanonicalUrl[state.activeTabUrl]
-            : undefined;
-        // eslint-disable-next-line no-console
-        console.log(
-          '[sidetrack:panel] loadTabSessions',
-          'activeTabUrl=',
-          state.activeTabUrl,
-          'urlRecord=',
-          focused === undefined
-            ? '<not in projection>'
-            : { latestTitle: focused.latestTitle, latestUrl: focused.latestUrl },
-        );
-      } else {
-        // eslint-disable-next-line no-console
-        console.warn('[sidetrack:panel] loadTabSessions — invalid /v1/visits payload');
+      if (!background) {
+        setTabSessionLoading(true);
+        setTabSessionError(null);
       }
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.warn('[sidetrack:panel] loadTabSessions — /v1/visits fetch failed', err);
-    }
-  }, [bridgeKey, fetchCompanionJson, loadTabSessionSuggestions, loadUrlSuggestions, port, state.activeTabUrl]);
+      try {
+        const [tabProjection, tabInbox] = await Promise.all([
+          fetchCompanionJson<unknown>('/v1/tabsessions/projection'),
+          fetchCompanionJson<unknown>('/v1/tabsessions/inbox?limit=51&offset=0'),
+        ]);
+        if (!isTabSessionProjection(tabProjection) || !isTabSessionInboxData(tabInbox)) {
+          throw new Error('Companion returned an invalid tab-session projection.');
+        }
+        setTabSessionProjection(tabProjection);
+        setTabSessionInbox(tabInbox);
+        setTabSessionSuggestions(await loadTabSessionSuggestions(tabProjection, tabInbox));
+        // Successful fetch — clear any error banner left over from a
+        // prior poll. Doing it here (vs at start) keeps the banner
+        // sticky until the situation actually recovers.
+        setTabSessionError(null);
+      } catch (loadError) {
+        // Only surface tab-session errors in the foreground. A
+        // single failed background poll doesn't deserve a red
+        // banner; if the failure persists, the next foreground
+        // action (refresh button, view-mode change, initial mount)
+        // will surface it.
+        if (!background) {
+          setTabSessionError(
+            loadError instanceof Error ? loadError.message : 'Could not load tab sessions.',
+          );
+          setTabSessionSuggestions({});
+        }
+      } finally {
+        if (!background) setTabSessionLoading(false);
+      }
+      // URL projection (Phase B) is fetched independently — older
+      // companions that don't yet expose /v1/visits/* return 404, which
+      // we tolerate by leaving the URL state empty. Tab-session state
+      // above keeps working in that case.
+      try {
+        const [urlProj, urlInboxResp] = await Promise.all([
+          fetchCompanionJson<unknown>('/v1/visits/projection'),
+          fetchCompanionJson<unknown>('/v1/visits/inbox?limit=51&offset=0'),
+        ]);
+        if (isUrlProjection(urlProj) && isUrlInboxData(urlInboxResp)) {
+          setUrlProjection(urlProj);
+          setUrlInbox(urlInboxResp);
+          setUrlSuggestions(await loadUrlSuggestions(urlInboxResp));
+        } else {
+          // eslint-disable-next-line no-console
+          console.warn('[sidetrack:panel] loadTabSessions — invalid /v1/visits payload');
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[sidetrack:panel] loadTabSessions — /v1/visits fetch failed', err);
+      }
+    },
+    [bridgeKey, fetchCompanionJson, loadTabSessionSuggestions, loadUrlSuggestions, port],
+  );
 
   useEffect(() => {
     if (state.companionStatus !== 'connected') return;
@@ -1082,7 +1091,7 @@ const App = () => {
   useEffect(() => {
     if (state.companionStatus !== 'connected') return;
     const handle = setInterval(() => {
-      void loadTabSessions();
+      void loadTabSessions({ background: true });
     }, 4000);
     return () => {
       clearInterval(handle);
@@ -1111,11 +1120,11 @@ const App = () => {
           chromeApi?.runtime?.sendMessage(
             { type: 'sidetrack.timeline.force-drain' },
             () => {
-              void loadTabSessions().catch(() => undefined);
+              void loadTabSessions({ background: true }).catch(() => undefined);
             },
           );
         } catch {
-          void loadTabSessions().catch(() => undefined);
+          void loadTabSessions({ background: true }).catch(() => undefined);
         }
       }, 250);
     };
