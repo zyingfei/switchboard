@@ -372,6 +372,27 @@ const buildObserver = (input: {
 // under a second for any user-visible signal.
 const ACTIVITY_DRAIN_DEBOUNCE_MS = 500;
 
+// Chrome sometimes returns the URL itself (or host+path+query) as
+// `tab.title` during early page load — before <title> is parsed.
+// Stealth Chromium keeps that fake title around even after the real
+// one is set in the page DOM. If we pass it to observer.observe AFTER
+// the content script already pushed the real title, the observer's
+// title-change detection treats the fake as "new" and overwrites the
+// real one in the projection. Detect and skip URL-shaped fake titles
+// at the wiring layer — let the content-script title push remain
+// authoritative.
+const stripScheme = (url: string): string => url.replace(/^[a-z]+:\/\//iu, '');
+export const isUrlShapedFakeTitle = (title: string, url: string): boolean => {
+  if (title.length === 0) return false;
+  if (title === url) return true;
+  const bare = stripScheme(url);
+  if (title === bare) return true;
+  // host+path without query (Chrome occasionally trims).
+  const noQuery = bare.split('?')[0] ?? bare;
+  if (title === noQuery) return true;
+  return false;
+};
+
 const makeActivityDrainScheduler = (
   deps: InitDeps,
 ): { readonly schedule: () => void; readonly cancel: () => void } => {
@@ -684,11 +705,15 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
           url: tab.url,
           tabSessionId: tabSession.tabSessionId,
         };
+        const activatedTitle =
+          typeof tab.title === 'string' && !isUrlShapedFakeTitle(tab.title, tab.url)
+            ? tab.title
+            : undefined;
         observer.observe({
           tabId: info.tabId,
           windowId: info.windowId,
           url: tab.url,
-          ...(typeof tab.title === 'string' ? { title: tab.title } : {}),
+          ...(activatedTitle === undefined ? {} : { title: activatedTitle }),
           transition: 'activated',
           tabSessionId: tabSession.tabSessionId,
           ...(tabSession.openerTabSessionId === undefined
@@ -765,11 +790,19 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
         url,
         tabSessionId: tabSession.tabSessionId,
       };
+      // Only forward `tab.title` if it isn't URL-shaped (see
+      // isUrlShapedFakeTitle). The content-script title-watcher
+      // pushes the real document.title separately; passing the
+      // URL-shaped fake here would clobber it in the projection.
+      const tabTitleForObserve =
+        typeof tab.title === 'string' && !isUrlShapedFakeTitle(tab.title, url)
+          ? tab.title
+          : undefined;
       observer.observe({
         tabId,
         windowId: tab.windowId,
         url,
-        ...(typeof tab.title === 'string' ? { title: tab.title } : {}),
+        ...(tabTitleForObserve === undefined ? {} : { title: tabTitleForObserve }),
         transition: changeInfo.status === 'complete' ? 'completed' : 'updated',
         tabSessionId: tabSession.tabSessionId,
         ...(tabSession.openerTabSessionId === undefined
