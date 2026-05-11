@@ -23,6 +23,10 @@ import {
   type BuildTopicRevisionInput,
   type TopicVisit,
 } from '../../connections/topicClusterer.js';
+import {
+  deriveUserAssertedRelations,
+  knownCanonicalUrlsFor,
+} from '../../connections/userAssertedRelations.js';
 import { buildHdbscanTopicRevision } from '../../connections/hdbscanClusterer.js';
 import {
   VISIT_SIMILARITY_DEFAULT_ENGAGEMENT_GATE_MS,
@@ -385,18 +389,26 @@ export const createConnectionsMaterializer = (
     );
     await writeVisitSimilarityRevision(deps.vaultRoot, visitSimilarity);
     const previousTopicRevision = await topicRevisionStore.readActiveRevision();
+    const topicVisits = timelineDays.flatMap((day) => day.entries.map(topicVisitFromEntry));
+    const tabSessionProjection = projectTabSessions(merged);
+    const urlProjection = projectUrls(merged);
+    const userAssertedRelations = deriveUserAssertedRelations({
+      urlProjection,
+      tabSessionProjection,
+      knownCanonicalUrls: knownCanonicalUrlsFor(topicVisits),
+    });
     const topicRevision = await buildSelectedTopicRevision({
-      visits: timelineDays.flatMap((day) => day.entries.map(topicVisitFromEntry)),
+      visits: topicVisits,
       visitSimilarity,
+      ...(userAssertedRelations.length === 0 ? {} : { userAssertedRelations }),
       ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
     });
     await topicRevisionStore.putActiveRevision(topicRevision);
-    const urlProjection = projectUrls(merged);
     const input: ConnectionsInput = {
       events: merged,
       ...vault,
       timelineDays,
-      tabSessionProjection: projectTabSessions(merged),
+      tabSessionProjection,
       urlProjection,
       visitSimilarity,
       topicRevision,
