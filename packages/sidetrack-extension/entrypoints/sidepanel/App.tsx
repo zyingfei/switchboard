@@ -1123,11 +1123,12 @@ const App = () => {
       _tabId: number,
       changeInfo: { url?: string; status?: string; title?: string },
     ): void => {
-      if (
-        changeInfo.url !== undefined ||
-        changeInfo.status === 'complete' ||
-        (typeof changeInfo.title === 'string' && changeInfo.title.length > 0)
-      ) {
+      // Only refresh on URL change. Title / status updates flow through
+      // the SW's drain + the panel's 4 s poll; firing here for every
+      // title or status change made the Inbox look like it was
+      // "constantly refreshing" — items moved around as the projection
+      // bumped lastSeenAt.
+      if (changeInfo.url !== undefined) {
         trigger();
       }
     };

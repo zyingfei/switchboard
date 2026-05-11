@@ -140,7 +140,7 @@ describe('url projection', () => {
     expect(record?.currentAttribution?.workstreamId).toBeNull();
   });
 
-  it('inbox lists unattributed URLs newest-first', () => {
+  it('inbox lists unattributed URLs newest-first by first-seen', () => {
     const events: AcceptedEvent[] = [
       observed({
         seq: 1,
@@ -162,5 +162,27 @@ describe('url projection', () => {
     const projection = projectUrls(events);
     const inbox = urlInbox(projection, { limit: 10, offset: 0 });
     expect(inbox.map((r) => r.canonicalUrl)).toEqual(['https://x/new', 'https://x/old']);
+  });
+
+  it('inbox order stays stable when an existing URL is revisited', () => {
+    // The user reported the Inbox "items jumping" when sorted by
+    // lastSeenAt — every revisit reordered the list. firstSeenAt sort
+    // keeps existing items in place; only NEW URLs appear at the top.
+    const events: AcceptedEvent[] = [
+      observed({ seq: 1, canonicalUrl: 'https://x/a', observedAt: '2026-05-07T10:00:00.000Z' }),
+      observed({ seq: 2, canonicalUrl: 'https://x/b', observedAt: '2026-05-07T10:10:00.000Z' }),
+      observed({ seq: 3, canonicalUrl: 'https://x/c', observedAt: '2026-05-07T10:20:00.000Z' }),
+    ];
+    const before = urlInbox(projectUrls(events), { limit: 10, offset: 0 }).map((r) => r.canonicalUrl);
+    // Revisit `a` — under lastSeenAt sort this would jump `a` to the
+    // top of the list. Under firstSeenAt sort it stays put.
+    const withRevisit: AcceptedEvent[] = [
+      ...events,
+      observed({ seq: 4, canonicalUrl: 'https://x/a', observedAt: '2026-05-07T11:00:00.000Z' }),
+    ];
+    const after = urlInbox(projectUrls(withRevisit), { limit: 10, offset: 0 }).map(
+      (r) => r.canonicalUrl,
+    );
+    expect(after).toEqual(before);
   });
 });

@@ -262,9 +262,14 @@ export const urlInbox = (
 ): readonly UrlVisitRecord[] =>
   [...projection.byCanonicalUrl.values()]
     .filter((record) => record.currentAttribution === undefined)
+    // Sort by FIRST seen (descending — newest URL on top), not last
+    // seen. Sorting by lastSeenAt makes existing items jump around the
+    // list every time the user revisits the page, which the user
+    // perceives as the Inbox "constantly refreshing". firstSeenAt is
+    // stable per URL, so cards stay in place once they enter the list.
     .sort((left, right) => {
-      if (left.lastSeenAt !== right.lastSeenAt) {
-        return left.lastSeenAt < right.lastSeenAt ? 1 : -1;
+      if (left.firstSeenAt !== right.firstSeenAt) {
+        return left.firstSeenAt < right.firstSeenAt ? 1 : -1;
       }
       return compareString(left.canonicalUrl, right.canonicalUrl);
     })
