@@ -16,15 +16,20 @@ import { defineContentScript } from 'wxt/utils/define-content-script';
 
 export default defineContentScript({
   matches: ['http://*/*', 'https://*/*'],
-  // run_at: document_end so document.title is parsed but the page
-  // hasn't run its own JS yet. The MutationObserver picks up later
-  // JS-driven title changes.
-  runAt: 'document_end',
+  // document_idle so the page has run its initial scripts and set
+  // document.title before we sample. Aligns with the AI capture
+  // content script's run_at (the user observed "All Threads"
+  // captures fast and stably — same lifecycle hook).
+  runAt: 'document_idle',
   main() {
+    // eslint-disable-next-line no-console
+    console.log('[sidetrack:title-watcher] mounted', window.location.href);
     let lastTitle = '';
     const post = (title: string): void => {
       if (title.length === 0 || title === lastTitle) return;
       lastTitle = title;
+      // eslint-disable-next-line no-console
+      console.log('[sidetrack:title-watcher] push', title);
       try {
         void chrome.runtime
           .sendMessage({
@@ -32,9 +37,11 @@ export default defineContentScript({
             url: window.location.href,
             title,
           })
-          .catch(() => undefined);
-      } catch {
-        // Extension context invalidated (panel restart, etc.) — silent.
+          // eslint-disable-next-line no-console
+          .catch((err) => console.warn('[sidetrack:title-watcher] sendMessage failed', err));
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[sidetrack:title-watcher] extension context invalidated', err);
       }
     };
 

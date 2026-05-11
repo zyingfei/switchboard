@@ -3607,6 +3607,14 @@ export default defineBackground(() => {
       ) {
         const payload = message as { url?: unknown; title?: unknown };
         const senderTab = sender.tab;
+        console.log(
+          '[sidetrack:title-handler] received',
+          typeof payload.title === 'string' ? payload.title : '<no-title>',
+          'tabId:',
+          senderTab?.id,
+          'url:',
+          typeof payload.url === 'string' ? payload.url : '<no-url>',
+        );
         if (
           typeof payload.url === 'string' &&
           payload.url.length > 0 &&
@@ -3621,7 +3629,18 @@ export default defineBackground(() => {
             windowId: senderTab.windowId,
             url: payload.url,
             title: payload.title,
-          }).catch(() => undefined);
+          })
+            .then(() => {
+              console.log('[sidetrack:title-handler] recorded', payload.title);
+            })
+            .catch((err: unknown) => {
+              console.warn('[sidetrack:title-handler] record failed', err);
+            });
+        } else {
+          console.warn(
+            '[sidetrack:title-handler] rejected payload — missing/invalid fields',
+            { hasUrl: typeof payload.url === 'string', hasTitle: typeof payload.title === 'string', hasTab: senderTab !== undefined },
+          );
         }
         sendResponse({ ok: true } as unknown as RuntimeResponse);
         return true;

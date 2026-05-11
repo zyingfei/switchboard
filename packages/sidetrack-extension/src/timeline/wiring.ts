@@ -409,7 +409,14 @@ export const recordTitleFromContent = async (input: {
   readonly url: string;
   readonly title: string;
 }): Promise<void> => {
-  if (contentTitleSink === null) return;
+  if (contentTitleSink === null) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[sidetrack:title-sink] dropped (sink not initialized — gate closed or pre-init)',
+      input.url,
+    );
+    return;
+  }
   await contentTitleSink(input);
 };
 
@@ -515,14 +522,29 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
   // script uses for its threads; broadened to every URL so the Inbox
   // and Current-tab card light up as fast as All Threads does.
   contentTitleSink = async (input) => {
-    if (!isTrackableUrl(input.url)) return;
+    if (!isTrackableUrl(input.url)) {
+      // eslint-disable-next-line no-console
+      console.warn('[sidetrack:title-sink] non-trackable URL', input.url);
+      return;
+    }
     const gateOpen = await readTimelineGateState();
-    if (!gateOpen) return;
+    if (!gateOpen) {
+      // eslint-disable-next-line no-console
+      console.warn('[sidetrack:title-sink] gate closed', input.url);
+      return;
+    }
     const tabSession = await tabSessions.recordActivity({
       tabIdHash: hashTabId(input.tabId, input.windowId),
       windowIdHash: hashWindowId(input.windowId),
       url: input.url,
     });
+    // eslint-disable-next-line no-console
+    console.log(
+      '[sidetrack:title-sink] observing',
+      input.title,
+      'on tabSessionId=',
+      tabSession.tabSessionId,
+    );
     observer.observe({
       tabId: input.tabId,
       windowId: input.windowId,
