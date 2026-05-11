@@ -108,17 +108,20 @@ const NON_TRACKABLE_SCHEMES = new Set([
   'view-source:',
   'data:',
   'javascript:',
-  // file:// pages are local scaffolds (e.g. the test launchpad.html). They
-  // never represent a workstream-relevant page and they pollute the Inbox
-  // with absolute filesystem paths.
-  'file:',
 ]);
 
 // Returns true when the URL has a scheme + host worth observing in the
 // timeline. False for non-content browser surfaces (about:blank, the
-// new-tab page, chrome-extension://, devtools://, file://, etc.). The
-// check is scheme-based rather than domain-based, so it does not need a
-// host allowlist and stays correct for any provider.
+// new-tab page, chrome-extension://, devtools://, etc.). `file://` IS
+// trackable: local scaffolds (e.g. the test launchpad.html) act as
+// openers for the real-page tabs the user clicks into, and the Flow
+// Path view anchors on the launchpad to surface that lineage. The
+// extension's Inbox UI filters file:// records from the visible list
+// (src/sidepanel/tabsession/inboxPriority.ts) so they don't pollute
+// the triage queue — the data itself stays in the projection.
+//
+// The check is scheme-based rather than domain-based, so it does not
+// need a host allowlist and stays correct for any provider.
 export const isTrackableUrl = (input: string): boolean => {
   if (typeof input !== 'string' || input.length === 0) return false;
   // Bare 'about:blank' (and friends) — handled before URL parsing because
@@ -135,6 +138,8 @@ export const isTrackableUrl = (input: string): boolean => {
   // the trailing colon being included in NON_TRACKABLE_SCHEMES (some
   // platform variants strip it).
   if (parsed.protocol.startsWith('chrome')) return false;
+  // Bare-host or empty-path file:// URLs carry no content.
+  if (parsed.protocol === 'file:' && parsed.pathname.length <= 1) return false;
   return true;
 };
 

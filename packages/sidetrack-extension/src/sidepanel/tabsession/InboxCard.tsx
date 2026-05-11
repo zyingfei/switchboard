@@ -45,7 +45,16 @@ export function InboxCard({
   nodeById,
   displayCtx,
 }: InboxCardProps) {
-  const defaultWorkstreamId = suggestion?.decision.workstreamId ?? workstreams[0]?.bac_id ?? '';
+  // Default the picker to whatever the tab is already attributed to,
+  // so the "Move" affordance is a no-op until the user actively picks
+  // somewhere different. Falling through to the suggestion (cold-start
+  // path) and then to workstreams[0] (which alphabetized to "ai" and
+  // surprised the user by suggesting it for already-attributed cards).
+  const defaultWorkstreamId =
+    record.currentAttribution?.workstreamId ??
+    suggestion?.decision.workstreamId ??
+    workstreams[0]?.bac_id ??
+    '';
   const [selectedWorkstreamId, setSelectedWorkstreamId] = useState(defaultWorkstreamId);
   useEffect(() => {
     if (defaultWorkstreamId.length > 0) setSelectedWorkstreamId(defaultWorkstreamId);

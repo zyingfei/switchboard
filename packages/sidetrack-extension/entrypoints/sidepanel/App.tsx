@@ -2799,13 +2799,28 @@ const App = () => {
     state.activeTabUrl ?? state.currentTab?.tabSnapshot?.url ?? state.currentTab?.threadUrl,
   );
   const focusedTabSession = useMemo(() => {
+    // tabIdHash → tabSessionId in chrome.storage can lag boundary
+    // re-mints (the projection refreshes on a 4 s cadence; the
+    // boundary closes/re-opens on URL change or idle threshold). If
+    // we trust `activeTabSessionId` blindly we end up showing a
+    // stale title — the user reported "Current tab" showing a chat
+    // from a different ChatGPT project than the one actually open.
+    // Verify the matched record's URL agrees with the live tab URL
+    // before returning it; otherwise fall through to the URL match.
     if (state.activeTabSessionId !== undefined) {
       const exact = tabSessionRecords.find(
         (record) => record.tabSessionId === state.activeTabSessionId,
       );
-      if (exact !== undefined) return exact;
+      if (exact !== undefined) {
+        const exactUrl = comparableTabUrl(exact.latestUrl);
+        if (focusedTabUrl === null || exactUrl === focusedTabUrl) {
+          return exact;
+        }
+      }
     }
     if (focusedTabUrl === null) return undefined;
+    // tabSessionRecords is sorted by lastActivityAt desc, so .find()
+    // returns the most-recent session whose URL matches.
     return tabSessionRecords.find((record) => comparableTabUrl(record.latestUrl) === focusedTabUrl);
   }, [focusedTabUrl, state.activeTabSessionId, tabSessionRecords]);
   const focusedTabSuggestion =
