@@ -24,6 +24,7 @@ import {
   type WorkboardRequest,
 } from '../../src/messages';
 import { canonicalThreadUrl, detectProviderFromUrl } from '../../src/capture/providerDetection';
+import { sanitizeTimelineUrl } from '../../src/timeline/sanitize';
 import {
   CodingAttach,
   AutoSendQueueRow,
@@ -174,9 +175,15 @@ const tabSessionIdFromDragEvent = (event: DragEvent<HTMLElement>): string | null
   return plain.startsWith('tses_') ? plain : null;
 };
 
+// The URL projection's byCanonicalUrl is keyed by what the observer
+// produced — `sanitizeTimelineUrl(canonicalThreadUrl(rawUrl))`. The live
+// `chrome.tabs` URL the side panel reads has NOT been through that
+// pipeline, so it can carry a fragment (Google appends `#scso=...`
+// post-load), marketing params, or sensitive params that the stored
+// canonical dropped. Apply the same pipeline here so lookup keys agree.
 const comparableTabUrl = (input: string | undefined): string | null => {
   if (input === undefined || input.length === 0) return null;
-  const canonical = canonicalThreadUrl(input);
+  const canonical = sanitizeTimelineUrl(canonicalThreadUrl(input));
   return canonical.length > 1 && canonical.endsWith('/') ? canonical.slice(0, -1) : canonical;
 };
 
@@ -576,6 +583,21 @@ const App = () => {
   const [settings, setSettings] = useState<SettingsDocument | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [healthPanelOpen, setHealthPanelOpen] = useState(false);
+  // Deeper-page-access banner: engagement + future content-extraction
+  // subsystems need `https://*/*` host permission. Default `true` so the
+  // first paint is clean; useEffect below corrects it after the
+  // chrome.permissions.contains probe resolves. When the user dismisses
+  // the banner manually we hide it for the session (re-shown on a fresh
+  // panel open if still missing).
+  const [hasDeeperPagePermission, setHasDeeperPagePermission] = useState<boolean>(true);
+  const [deeperAccessBannerDismissed, setDeeperAccessBannerDismissed] = useState<boolean>(false);
+  const [deeperAccessBannerBusy, setDeeperAccessBannerBusy] = useState<boolean>(false);
+  // Direct chrome.tabs read for the active tab URL. `state.activeTabUrl`
+  // only updates on the 15 s state poll, so the Current-tab card lagged
+  // visibly after every navigation. Subscribing to chrome.tabs events
+  // here pulls activeTabUrl into the side panel immediately, without
+  // waiting for the SW round-trip.
+  const [liveActiveTabUrl, setLiveActiveTabUrl] = useState<string | undefined>(undefined);
   const [threadSearchOpen, setThreadSearchOpen] = useState(false);
   const [threadSearchQuery, setThreadSearchQuery] = useState('');
   const [threadSearchResults, setThreadSearchResults] = useState<readonly ThreadSearchResult[]>([]);
@@ -672,6 +694,108 @@ const App = () => {
       document.removeEventListener('mousedown', onDoc);
     };
   }, [actionMenuOpenFor]);
+  // Probe + watch the host permission state. `chrome.permissions.contains`
+  // is the source of truth; `onAdded`/`onRemoved` fire when the user
+  // grants or revokes (including from Chrome's chrome://extensions UI).
+  // Each chrome.* read is guarded because the test harness mounts the
+  // side panel against a partially-stubbed chrome.
+  useEffect(() => {
+    if (typeof chrome === 'undefined' || chrome.permissions === undefined) return undefined;
+    const origins = ['https://*/*', 'http://*/*'];
+    let cancelled = false;
+    const probe = (): void => {
+      try {
+        chrome.permissions.contains({ origins }, (granted) => {
+          if (!cancelled) setHasDeeperPagePermission(Boolean(granted));
+        });
+      } catch {
+        // Test harness without chrome.permissions — leave optimistic default.
+      }
+    };
+    probe();
+    const onChange = (): void => probe();
+    type ListenerEvent = {
+      readonly addListener?: (cb: (...args: unknown[]) => void) => void;
+      readonly removeListener?: (cb: (...args: unknown[]) => void) => void;
+    };
+    const onAdded = chrome.permissions.onAdded as unknown as ListenerEvent | undefined;
+    const onRemoved = chrome.permissions.onRemoved as unknown as ListenerEvent | undefined;
+    const onChangeAny = onChange as unknown as (...args: unknown[]) => void;
+    onAdded?.addListener?.(onChangeAny);
+    onRemoved?.addListener?.(onChangeAny);
+    return () => {
+      cancelled = true;
+      onAdded?.removeListener?.(onChangeAny);
+      onRemoved?.removeListener?.(onChangeAny);
+    };
+  }, []);
+  // Keep liveActiveTabUrl in sync with the focused tab using chrome.tabs
+  // directly. Listening to onActivated + onUpdated gives sub-second
+  // latency for the Current-tab card, instead of waiting on the SW's
+  // periodic state poll. Each chrome.* read is guarded because the test
+  // harness mounts the side panel against a partially-stubbed chrome.
+  useEffect(() => {
+    if (typeof chrome === 'undefined' || chrome.tabs === undefined) return undefined;
+    let cancelled = false;
+    const refresh = (): void => {
+      try {
+        chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
+          if (cancelled) return;
+          const url = tabs[0]?.url;
+          setLiveActiveTabUrl(url === undefined || url.length === 0 ? undefined : url);
+        });
+      } catch {
+        // Test harness — leave state untouched.
+      }
+    };
+    refresh();
+    const onActivated = (): void => refresh();
+    const onUpdated = (
+      _tabId: number,
+      changeInfo: { url?: string },
+      tab: { active?: boolean },
+    ): void => {
+      if (changeInfo.url !== undefined && tab.active === true) refresh();
+    };
+    const onFocusChanged = (): void => refresh();
+    type ListenerEvent = {
+      readonly addListener?: (cb: (...args: unknown[]) => void) => void;
+      readonly removeListener?: (cb: (...args: unknown[]) => void) => void;
+    };
+    const activatedApi = chrome.tabs.onActivated as unknown as ListenerEvent | undefined;
+    const updatedApi = chrome.tabs.onUpdated as unknown as ListenerEvent | undefined;
+    const focusApi = chrome.windows?.onFocusChanged as unknown as ListenerEvent | undefined;
+    const onActivatedAny = onActivated as unknown as (...args: unknown[]) => void;
+    const onUpdatedAny = onUpdated as unknown as (...args: unknown[]) => void;
+    const onFocusChangedAny = onFocusChanged as unknown as (...args: unknown[]) => void;
+    activatedApi?.addListener?.(onActivatedAny);
+    updatedApi?.addListener?.(onUpdatedAny);
+    focusApi?.addListener?.(onFocusChangedAny);
+    return () => {
+      cancelled = true;
+      activatedApi?.removeListener?.(onActivatedAny);
+      updatedApi?.removeListener?.(onUpdatedAny);
+      focusApi?.removeListener?.(onFocusChangedAny);
+    };
+  }, []);
+  const handleGrantDeeperPageAccess = useCallback(async (): Promise<void> => {
+    setDeeperAccessBannerBusy(true);
+    try {
+      const granted = await new Promise<boolean>((resolve) => {
+        chrome.permissions.request({ origins: ['https://*/*', 'http://*/*'] }, (g) => {
+          resolve(Boolean(g));
+        });
+      });
+      setHasDeeperPagePermission(granted);
+      if (granted) {
+        await chrome.runtime
+          .sendMessage({ type: 'sidetrack.timeline.permission.granted' })
+          .catch(() => undefined);
+      }
+    } finally {
+      setDeeperAccessBannerBusy(false);
+    }
+  }, []);
   // Cache of suggested workstream per thread, keyed by thread bac_id.
   // Populated from companion's GET /v1/suggestions/thread/{id} (PR #76
   // Track F) when the row is rendered. Empty fallback shows nothing.
@@ -3098,7 +3222,10 @@ const App = () => {
     [tabSessionProjection],
   );
   const focusedTabUrl = comparableTabUrl(
-    state.activeTabUrl ?? state.currentTab?.tabSnapshot?.url ?? state.currentTab?.threadUrl,
+    liveActiveTabUrl ??
+      state.activeTabUrl ??
+      state.currentTab?.tabSnapshot?.url ??
+      state.currentTab?.threadUrl,
   );
   // Per-URL state: every visible attribution surface (Current tab,
   // Inbox, Pages-in-this-workstream) reads from `urlProjection` instead
@@ -4685,6 +4812,43 @@ const App = () => {
           </span>
         ) : null}
       </div>
+
+      {!hasDeeperPagePermission && !deeperAccessBannerDismissed ? (
+        <div
+          className="banner warning deeper-access-banner"
+          role="status"
+          aria-live="polite"
+          data-testid="deeper-access-banner"
+        >
+          <div className="deeper-access-banner-body">
+            <strong>Deeper page access not granted.</strong>{' '}
+            Engagement tracking (focus, scroll, copy) and future in-page features
+            need it. URL + title observation already works without it.
+          </div>
+          <div className="deeper-access-banner-actions">
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={deeperAccessBannerBusy}
+              onClick={() => {
+                void handleGrantDeeperPageAccess();
+              }}
+            >
+              {deeperAccessBannerBusy ? 'Requesting…' : 'Grant access'}
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost"
+              onClick={() => {
+                setDeeperAccessBannerDismissed(true);
+              }}
+              aria-label="Dismiss banner"
+            >
+              Not now
+            </button>
+          </div>
+        </div>
+      ) : null}
 
       {viewMode === 'workstream' ? (
         <WorkstreamBar

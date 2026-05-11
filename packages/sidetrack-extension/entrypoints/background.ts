@@ -427,6 +427,34 @@ const isEngagementPrivacyGateOpen = async (): Promise<boolean> => {
   }
 };
 
+// Stage 5 follow-up — the engagement subsystem (focus/scroll/copy
+// aggregator) needs BOTH a host permission AND an "engagement" privacy
+// gate flipped open before its content script registers. Until this
+// helper landed, no production code path opened the gate — only e2e
+// test scripts wrote `privacy.gate.flipped { gate: 'engagement' }`.
+// Production users granted host permission, saw "deeper page access
+// granted" green, but the engagement content script never registered,
+// so the materializer's engagement counters stayed at zero (which in
+// turn starved the similarity ranker and the URL auto-inference path).
+//
+// Design: engagement is default-on. The privacy gate is kept open
+// idempotently; the only thing that actually blocks engagement is the
+// host permission, which has its own user-facing grant flow + banner.
+const ensureEngagementGateDefaultOpen = async (): Promise<void> => {
+  if (await isEngagementPrivacyGateOpen()) return;
+  await appendPrivacyEvent(
+    PRIVACY_GATE_FLIPPED,
+    {
+      gate: ENGAGEMENT_PRIVACY_GATE,
+      state: 'open',
+      actor: 'system',
+      reason: 'default-on',
+      payloadVersion: 1,
+    },
+    `${ENGAGEMENT_PRIVACY_GATE}-open-default`,
+  );
+};
+
 const isVisualFingerprintPrivacyGateOpen = async (): Promise<boolean> => {
   try {
     const projection = await readPrivacyProjection();
@@ -449,6 +477,10 @@ const hasEngagementHostPermission = async (): Promise<boolean> => {
 };
 
 const syncEngagementContentScriptRegistration = async (): Promise<void> => {
+  // Engagement is default-on. The gate stayed closed for production
+  // users because nothing wrote the privacy.gate.flipped event; open
+  // it idempotently so the only remaining gate is host permission.
+  await ensureEngagementGateDefaultOpen().catch(() => undefined);
   const shouldRegister =
     (await isEngagementPrivacyGateOpen()) && (await hasEngagementHostPermission());
   const registered = await chrome.scripting.getRegisteredContentScripts({
@@ -465,10 +497,20 @@ const syncEngagementContentScriptRegistration = async (): Promise<void> => {
         persistAcrossSessions: true,
       },
     ]);
+    // Catch-up: the registration covers future navigations only, so
+    // dogfooders staring at already-open tabs see no engagement signal
+    // until they manually refresh. Inject into those tabs now.
+    await reinjectEngagementScriptIntoOpenTabs();
     return;
   }
   if (!shouldRegister && alreadyRegistered) {
     await chrome.scripting.unregisterContentScripts({ ids: [ENGAGEMENT_CONTENT_SCRIPT_ID] });
+    return;
+  }
+  // Already-registered case: still catch up on open tabs in case a prior
+  // sync registered but skipped the inject (e.g. SW restart, install).
+  if (shouldRegister && alreadyRegistered) {
+    await reinjectEngagementScriptIntoOpenTabs();
   }
 };
 
@@ -2792,6 +2834,36 @@ const reinjectContentScriptIntoOpenTabs = async (): Promise<void> => {
   }
 };
 
+// chrome.scripting.registerContentScripts only matches FUTURE navigations.
+// Already-open tabs from before the registration won't run the engagement
+// script until they refresh. Without this catch-up inject, dogfooders
+// see zero engagement counters until they manually reload every tab.
+// Run after registration sync — idempotent on tabs that already have it
+// because the engagement runtime keys its aggregator by visitId.
+const reinjectEngagementScriptIntoOpenTabs = async (): Promise<void> => {
+  if (!(await isEngagementPrivacyGateOpen()) || !(await hasEngagementHostPermission())) {
+    return;
+  }
+  try {
+    const tabs = await chrome.tabs.query({ url: [...ENGAGEMENT_HOST_ORIGINS] });
+    await Promise.all(
+      tabs.map(async (tab) => {
+        if (typeof tab.id !== 'number') return;
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            files: [ENGAGEMENT_CONTENT_SCRIPT_FILE],
+          });
+        } catch {
+          // chrome://, Web Store, file:, devtools — skip silently.
+        }
+      }),
+    );
+  } catch {
+    // tabs.query/scripting unavailable — nothing to log.
+  }
+};
+
 const detectCodingAttachForTab = async (tabId: number, url: string): Promise<void> => {
   try {
     const [result] = await chrome.scripting.executeScript({
@@ -3046,6 +3118,27 @@ export default defineBackground(() => {
   // sendToCompanion bug (every capture reissued a thread bac_id;
   // reminders accumulated against orphans). Idempotent — runs on
   // every service-worker boot, no-op when storage is already clean.
+  // Periodic drain for buffered edge events (engagement.interval.observed,
+  // engagement.session.aggregated, selection.copied, selection.pasted,
+  // visual.fingerprint.observed). Pre-fix, drainBufferedEdgeEvents was
+  // only invoked by the test-only `sidetrack.edge-events.force-drain`
+  // message, so in production engagement events accumulated in
+  // IndexedDB indefinitely and the materializer's engagement counters
+  // stayed at zero forever — that's why ranker training had 794
+  // positive labels and 0 negatives, the similarity ranker stayed at 0
+  // edges, and URL auto-attribution never inferred. 1-minute cadence
+  // matches the dispatch poll: Chrome's alarm minimum, and the
+  // engagement aggregator's own emit interval is 30 s so the worst-case
+  // end-to-end latency is < 90 s.
+  const EDGE_EVENTS_DRAIN_ALARM = 'sidetrack.edge-events.drain';
+  const ensureEdgeEventsDrainAlarm = async (): Promise<void> => {
+    try {
+      await chrome.alarms.create(EDGE_EVENTS_DRAIN_ALARM, { periodInMinutes: 1 });
+    } catch (error) {
+      console.warn('[edge-events.drain] alarm create failed:', error);
+    }
+  };
+
   const DISPATCH_POLL_ALARM = 'sidetrack.dispatch.poll';
   // 1-minute cadence: Chrome's MV3 minimum. Latency from
   // bac.request_dispatch to the chat tab opening is bounded by this
@@ -3140,24 +3233,70 @@ export default defineBackground(() => {
   // bac.request_dispatch to "tab opens" is ~1 minute. The alarm is
   // additive; explicit side-panel actions still trigger immediately.
   chrome.alarms.onAlarm.addListener((alarm) => {
-    if (alarm.name !== DISPATCH_POLL_ALARM) return;
-    void (async () => {
-      try {
-        if (!(await isCompanionConfigured())) return;
-        await refreshCachedDispatches();
-      } catch (error) {
-        console.warn('[dispatch.poll] failed:', error);
-      }
-    })();
+    if (alarm.name === DISPATCH_POLL_ALARM) {
+      void (async () => {
+        try {
+          if (!(await isCompanionConfigured())) return;
+          await refreshCachedDispatches();
+        } catch (error) {
+          console.warn('[dispatch.poll] failed:', error);
+        }
+      })();
+      return;
+    }
+    if (alarm.name === EDGE_EVENTS_DRAIN_ALARM) {
+      void drainBufferedEdgeEvents().catch((error: unknown) => {
+        console.warn('[edge-events.drain] periodic drain failed:', error);
+      });
+      return;
+    }
   });
   void ensureDispatchPollAlarm();
+  void ensureEdgeEventsDrainAlarm();
+  // Eager first drain on SW boot — picks up anything buffered across a
+  // service-worker restart so the first drain doesn't wait a full minute.
+  void drainBufferedEdgeEvents().catch(() => undefined);
+
+  // Debug hook for the SW DevTools console. `chrome.runtime.sendMessage`
+  // from the SW itself never reaches the SW's own onMessage listener
+  // (Chrome routes those only to OTHER extension contexts) — so the
+  // `sidetrack.dev.ping` + `.edge-events.force-drain` messages always
+  // returned `undefined` when invoked from chrome://extensions ->
+  // service worker -> Inspect. Exposing these on globalThis lets the
+  // operator call them directly without crossing the message bus.
+  //
+  // Usage from the SW DevTools console:
+  //   sidetrackDebug.build           — version/sha/dirty/builtAt
+  //   await sidetrackDebug.drainEdgeEvents()
+  //   await sidetrackDebug.engagementBufferCount()
+  //   await sidetrackDebug.engagementGate()
+  //   await sidetrackDebug.engagementHostPermission()
+  //   await sidetrackDebug.engagementRegistrations()
+  (globalThis as unknown as { sidetrackDebug?: unknown }).sidetrackDebug = {
+    build: __BUILD_INFO__,
+    drainEdgeEvents: drainBufferedEdgeEvents,
+    engagementBufferCount: () => engagementEventBuffer.count(),
+    engagementGate: isEngagementPrivacyGateOpen,
+    engagementHostPermission: hasEngagementHostPermission,
+    engagementRegistrations: () =>
+      chrome.scripting.getRegisteredContentScripts({ ids: [ENGAGEMENT_CONTENT_SCRIPT_ID] }),
+    syncRegistrations: syncPrivacyGatedContentScriptRegistrations,
+    reinjectEngagementIntoOpenTabs: reinjectEngagementScriptIntoOpenTabs,
+  };
 
   chrome.tabs.onRemoved.addListener((tabId) => {
     void markClosedTabRestorable(tabId).catch(() => undefined);
     // Clean up MCP-dispatch markers on tab close so the storage map
     // doesn't accumulate dead entries.
     void dropMcpDispatchTab(tabId).catch(() => undefined);
-    void finalizeEngagementForTab(tabId).catch(() => undefined);
+    // Finalize emits a `.session.aggregated` final-snapshot event into
+    // the buffer; pipe it straight to the companion so the
+    // materializer's lateral lookup (engagement → similarity) sees the
+    // session within ~1 s of tab close instead of waiting for the
+    // 1-min periodic drain.
+    void finalizeEngagementForTab(tabId)
+      .then(() => drainBufferedEdgeEvents())
+      .catch(() => undefined);
   });
 
   // Whenever the user activates a different tab or a tab's URL
@@ -3352,6 +3491,26 @@ export default defineBackground(() => {
 
   chrome.runtime.onMessage.addListener(
     (message: unknown, sender, sendResponse: (response: RuntimeResponse) => void) => {
+      // Build-verification ping from any extension page (side panel,
+      // any extension HTML). Returns the build sha + dirty flag + builtAt
+      // so operators can confirm which bundle is loaded.
+      // NOTE: invoking this from the SW DevTools console returns
+      // `undefined` — Chrome routes chrome.runtime.sendMessage to all
+      // extension contexts EXCEPT the sender, so the SW never receives
+      // its own messages. Use the side panel's DevTools instead, or read
+      // the footer banner.
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.dev.ping'
+      ) {
+        sendResponse({
+          ok: true,
+          build: __BUILD_INFO__,
+          listenerReached: true,
+        } as unknown as RuntimeResponse);
+        return true;
+      }
       if (isVisualFingerprintObservedMessage(message)) {
         void handleVisualFingerprintObserved(message)
           .then(() => {

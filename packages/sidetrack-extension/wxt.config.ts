@@ -30,9 +30,26 @@ const gitSha = ((): string => {
     return 'dev';
   }
 })();
+// Uncommitted local edits = dirty. Without this flag the version banner
+// kept showing the last committed sha even after rebuilds layered fresh
+// changes on top — operators had no way to tell "this bundle includes
+// my WIP edit" from "this bundle is the released sha". The output of
+// `git status --porcelain` is empty iff the worktree is clean.
+const gitDirty = ((): boolean => {
+  try {
+    const status = execSync('git status --porcelain', {
+      cwd: here,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return status.trim().length > 0;
+  } catch {
+    return false;
+  }
+})();
 const buildInfo = {
   version: pkgVersion,
-  sha: gitSha,
+  sha: gitDirty ? `${gitSha}-dirty` : gitSha,
   builtAt: new Date().toISOString(),
 };
 
