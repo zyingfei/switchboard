@@ -61,17 +61,25 @@ export function AttributionProvenance({
       </span>
     );
   }
-  if (suggestion?.decision.workstreamId !== undefined) {
-    const top = suggestion.fusedCandidates[0];
-    const source = top?.dominantSource ?? 'none';
+  // Surface the resolver's top fused candidate even when the decision
+  // is `inbox` (cold-start under threshold) — the user can still see
+  // the best guess and one-click confirm. This is the difference
+  // between "we have no idea" and "we have a guess but aren't sure".
+  // Decision-level workstreamId is set only for suggest/auto-apply;
+  // for inbox decisions we read fusedCandidates[0] directly.
+  const decisionTarget = suggestion?.decision.workstreamId;
+  const topCandidate = suggestion?.fusedCandidates[0];
+  const targetWorkstreamId = decisionTarget ?? topCandidate?.workstreamId;
+  if (targetWorkstreamId !== undefined && topCandidate !== undefined) {
+    const targetPath =
+      workstreams.find((workstream) => workstream.bac_id === targetWorkstreamId)?.path ??
+      '(removed)';
+    const source = topCandidate.dominantSource;
     const seen = new Set<string>();
     const anchorLabels: string[] = [];
-    for (const reason of top?.reasons ?? []) {
+    for (const reason of topCandidate.reasons) {
       for (const anchor of reason.anchors) {
         const display = formatAnchorDisplay(anchor, byId, ctx);
-        // Skip low-signal generic placeholders so we don't waste row
-        // space repeating "Tab session" / "(visit)". When every anchor
-        // is generic, the empty list is honest about not knowing more.
         if (display.primary.startsWith('(')) continue;
         if (seen.has(display.primary)) continue;
         seen.add(display.primary);
@@ -80,9 +88,12 @@ export function AttributionProvenance({
       }
       if (anchorLabels.length >= 3) break;
     }
+    // Different phrasing makes the confidence level legible to the user.
+    const verb = decisionTarget === undefined ? 'Best guess' : 'Suggested';
+    const margin = suggestion?.decision.margin ?? 0;
     return (
       <span className="tab-session-provenance mono">
-        Suggested by {source} · margin {suggestion.decision.margin.toFixed(2)}
+        {verb}: {targetPath} · {source} · margin {margin.toFixed(2)}
         {anchorLabels.length > 0 ? ` · ${anchorLabels.join(' · ')}` : ''}
       </span>
     );

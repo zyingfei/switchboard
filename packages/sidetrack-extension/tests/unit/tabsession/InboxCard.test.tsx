@@ -95,20 +95,66 @@ describe('InboxCard', () => {
     expect(screen.getByTitle('Suggested by Sidetrack: Switchboard')).toHaveTextContent(
       'Switchboard',
     );
-    expect(screen.getByText(/Suggested by ppr/)).toBeInTheDocument();
+    // New provenance line surfaces the target path + dominant source,
+    // and uses "Best guess" vs "Suggested" depending on whether the
+    // resolver's policy already produced a decision-level workstreamId.
+    expect(screen.getByText(/Suggested: Switchboard · ppr/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Move' }));
 
     expect(onAttribute).toHaveBeenCalledWith('tses_test', 'ws_switchboard');
   });
 
   it('caps inbox rendering at 50 records per panel session', () => {
+    // Distinct URLs so dedupe by URL doesn't collapse them — the cap
+    // contract is "show 50 unique URLs and report the rest as hidden".
     const records = Array.from({ length: 55 }, (_, index) =>
-      record({ tabSessionId: `tses_${String(index).padStart(2, '0')}` }),
+      record({
+        tabSessionId: `tses_${String(index).padStart(2, '0')}`,
+        latestUrl: `https://example.test/research/${String(index)}`,
+      }),
     );
 
     const slice = sliceInboxForPanel(records, records.length);
 
     expect(slice.visible).toHaveLength(50);
     expect(slice.hiddenCount).toBe(5);
+  });
+
+  it('dedupes same-URL tab sessions in the Inbox slice (keeps most recent)', () => {
+    const records: TabSessionRecord[] = [
+      record({
+        tabSessionId: 'tses_stale',
+        latestUrl: 'https://github.com/zyingfei/switchboard/pulls',
+        latestTitle: 'github.com/zyingfei/switchboard/pulls',
+        lastActivityAt: '2026-05-10T00:55:00.000Z',
+      }),
+      record({
+        tabSessionId: 'tses_fresh',
+        latestUrl: 'https://github.com/zyingfei/switchboard/pulls',
+        latestTitle: 'Pull requests · zyingfei/switchboard · GitHub',
+        lastActivityAt: '2026-05-10T01:06:00.000Z',
+      }),
+    ];
+    const slice = sliceInboxForPanel(records, records.length);
+    expect(slice.visible).toHaveLength(1);
+    expect(slice.visible[0]?.tabSessionId).toBe('tses_fresh');
+  });
+
+  it('hides file:// pages from the Inbox triage queue', () => {
+    const records: TabSessionRecord[] = [
+      record({
+        tabSessionId: 'tses_launchpad',
+        latestUrl: 'file:///tmp/launchpad.html',
+        latestTitle: 'launchpad.html',
+      }),
+      record({
+        tabSessionId: 'tses_real',
+        latestUrl: 'https://example.test/article',
+        latestTitle: 'Article',
+      }),
+    ];
+    const slice = sliceInboxForPanel(records, records.length);
+    expect(slice.visible).toHaveLength(1);
+    expect(slice.visible[0]?.tabSessionId).toBe('tses_real');
   });
 });

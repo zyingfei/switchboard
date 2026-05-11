@@ -47,12 +47,16 @@ export function InboxCard({
 }: InboxCardProps) {
   // Default the picker to whatever the tab is already attributed to,
   // so the "Move" affordance is a no-op until the user actively picks
-  // somewhere different. Falling through to the suggestion (cold-start
-  // path) and then to workstreams[0] (which alphabetized to "ai" and
-  // surprised the user by suggesting it for already-attributed cards).
+  // somewhere different. Falling through to the resolver's suggestion
+  // (when policy says suggest/auto-apply), then to the top fused
+  // candidate (when the resolver has a guess that's under threshold —
+  // cold-start), and finally to workstreams[0] (last resort; the
+  // alphabetical-first surprised the user by suggesting "ai" for
+  // unrelated tabs).
   const defaultWorkstreamId =
     record.currentAttribution?.workstreamId ??
     suggestion?.decision.workstreamId ??
+    suggestion?.fusedCandidates[0]?.workstreamId ??
     workstreams[0]?.bac_id ??
     '';
   const [selectedWorkstreamId, setSelectedWorkstreamId] = useState(defaultWorkstreamId);
