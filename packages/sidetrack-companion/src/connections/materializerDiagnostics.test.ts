@@ -355,6 +355,7 @@ describe('collectMaterializerDiagnostics', () => {
       canonicalUrlCount: 4,
       attributedCanonicalUrlCount: 2,
       attributedByUserCanonicalUrlCount: 1,
+      attributionBySource: { user_asserted: 1, inferred: 1 },
     });
   });
 

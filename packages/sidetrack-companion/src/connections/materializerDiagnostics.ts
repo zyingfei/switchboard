@@ -113,6 +113,12 @@ export interface MaterializerUrlCounters {
   readonly canonicalUrlCount: number;
   readonly attributedCanonicalUrlCount: number;
   readonly attributedByUserCanonicalUrlCount: number;
+  // Stage 5 follow-up — per-source breakdown so the operator can
+  // verify each propagation path is actually firing. Catches the
+  // case where thread→URL propagation would have attributed a URL
+  // but a direct user_asserted move beat it on tie-break (so the
+  // total counts don't move, but the source-of-truth changes).
+  readonly attributionBySource: Readonly<Record<string, number>>;
 }
 
 export interface MaterializerSnapshotCounters {
@@ -357,6 +363,7 @@ const collectEventCounters = (
 const collectUrlCounters = (projection: UrlProjection): MaterializerUrlCounters => {
   let attributedCanonicalUrlCount = 0;
   let attributedByUserCanonicalUrlCount = 0;
+  const attributionBySource: Record<string, number> = {};
   for (const record of projection.byCanonicalUrl.values()) {
     const attribution = record.currentAttribution;
     if (attribution?.workstreamId === undefined || attribution.workstreamId === null) continue;
@@ -367,11 +374,13 @@ const collectUrlCounters = (projection: UrlProjection): MaterializerUrlCounters 
     if (attribution.source === 'user_asserted' || attribution.source === 'thread') {
       attributedByUserCanonicalUrlCount += 1;
     }
+    attributionBySource[attribution.source] = (attributionBySource[attribution.source] ?? 0) + 1;
   }
   return {
     canonicalUrlCount: projection.byCanonicalUrl.size,
     attributedCanonicalUrlCount,
     attributedByUserCanonicalUrlCount,
+    attributionBySource,
   };
 };
 
