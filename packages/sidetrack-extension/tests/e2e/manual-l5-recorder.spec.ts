@@ -4,10 +4,9 @@
 //   git pull && npm --prefix packages/sidetrack-extension run e2e:recorder \
 //     2>&1 | tee /tmp/sidetrack-recorder.log
 //
-// `e2e:recorder` runs in stealth mode by default (Patchright-driven
-// Chromium so chatgpt.com / claude.ai / gemini.google.com don't fight
-// the automation flag). The legacy script names `e2e:manual-l5-recorder`
-// and `e2e:manual-stealth-experiment` are aliases.
+// `e2e:recorder` runs in stealth mode (Patchright-driven Chromium so
+// chatgpt.com / claude.ai / gemini.google.com don't fight the
+// automation flag).
 //
 // The browser stays open until stdin advances the prompts:
 //   1. (only when an existing vault is detected) keep [Enter] / new vault [n]
@@ -20,9 +19,10 @@
 // The legacy SIDETRACK_MANUAL_L5_VAULT_DIR is still honoured for back-compat.
 
 import { randomUUID } from 'node:crypto';
-import { access, mkdir, mkdtemp, readdir, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readdir, rename, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
+import { createInterface } from 'node:readline';
 
 import { expect, test, type Page } from '@playwright/test';
 
@@ -156,13 +156,17 @@ const waitForEnter = async (label: string): Promise<void> => {
   });
 };
 
-const readKey = async (label: string): Promise<string> => {
+// readline-based single-line read; survives Playwright's stdin shape
+// where raw `process.stdin.once('data', …)` can drop input. Echoes
+// nothing extra — the user's terminal still shows their keystrokes.
+const readLineFromStdin = async (label: string): Promise<string> => {
   // eslint-disable-next-line no-console
   console.log(label);
-  process.stdin.resume();
+  const rl = createInterface({ input: process.stdin, terminal: false });
   return await new Promise<string>((resolve) => {
-    process.stdin.once('data', (chunk: Buffer) => {
-      resolve(chunk.toString('utf8').trim().toLowerCase());
+    rl.once('line', (line) => {
+      rl.close();
+      resolve(line.trim().toLowerCase());
     });
   });
 };
@@ -185,16 +189,19 @@ const resolveVaultRoot = async (defaultPath: string): Promise<string> => {
     console.log(`[recorder] Using vault: ${resolved} (no prior data)`);
     return resolved;
   }
-  const answer = await readKey(
+  const answer = await readLineFromStdin(
     `[recorder] Existing vault found at ${resolved}.\n` +
-      `  Press Enter to keep using it, or type 'n' + Enter to start a fresh timestamped vault.`,
+      `  Press Enter to keep using it, or type 'n' + Enter to start fresh\n` +
+      `  (the existing vault will be moved to <path>.backup-<iso>).`,
   );
   if (answer === 'n' || answer === 'new') {
-    const stamp = isoStamp();
-    const fresh = `${resolved}-${stamp}`;
+    const backup = `${resolved}.backup-${isoStamp()}`;
+    await rename(resolved, backup);
     // eslint-disable-next-line no-console
-    console.log(`[recorder] Creating fresh vault at ${fresh}`);
-    return fresh;
+    console.log(`[recorder] Archived previous vault to ${backup}`);
+    // eslint-disable-next-line no-console
+    console.log(`[recorder] Starting fresh vault at ${resolved}`);
+    return resolved;
   }
   // eslint-disable-next-line no-console
   console.log(`[recorder] Continuing with existing vault at ${resolved}`);
