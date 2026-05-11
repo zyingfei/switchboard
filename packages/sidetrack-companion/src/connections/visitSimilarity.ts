@@ -222,13 +222,49 @@ const clampLexicalThreshold = (lexicalThreshold: number | undefined): number => 
   return VISIT_SIMILARITY_DEFAULT_LEXICAL_THRESHOLD;
 };
 
-const roundedCosine = (value: number): number => Number(value.toFixed(6));
-
-const revisionIdFor = (input: {
-  readonly modelRevision: string;
+// Stage 5.0 follow-up — single source of truth for the effective
+// similarity config. The materializer calls this once and forwards
+// the same struct to `buildVisitSimilarity` AND
+// `collectMaterializerDiagnostics`, so the diagnostic artifact
+// reports the values actually used (not the constant defaults).
+//
+// Explicit `options` fields trump env vars; env vars trump defaults.
+export interface EffectiveVisitSimilarityConfig {
   readonly threshold: number;
   readonly topK: number;
   readonly engagementGateMs: number;
+  readonly lexicalThreshold: number;
+  readonly lexicalFallbackEnabled: boolean;
+}
+
+export const resolveVisitSimilarityConfig = (
+  options: BuildVisitSimilarityOptions = {},
+): EffectiveVisitSimilarityConfig => ({
+  threshold: clampThreshold(options.threshold),
+  topK: clampTopK(options.topK),
+  engagementGateMs: clampEngagementGate(options.engagementGateMs),
+  lexicalThreshold: clampLexicalThreshold(options.lexicalThreshold),
+  lexicalFallbackEnabled: options.lexicalFallbackEnabled ?? lexicalFallbackEnabled(),
+});
+
+const roundedCosine = (value: number): number => Number(value.toFixed(6));
+
+// Stage 5.0 follow-up — the revision-id hash now includes `producer`
+// + the lexical config so two materially different revisions
+// (embedding @ 0.85 vs lexical @ 0.30, same visits) get distinct ids,
+// AND tuning `SIDETRACK_SIMILARITY_LEXICAL_THRESHOLD` produces a new
+// revision id even when only the lexical path could fire. Older
+// embedding-only revisions on disk are unaffected because their
+// hashing was identical (producer === 'embedding', no lexical input);
+// the included fields are additive and stable.
+const revisionIdFor = (input: {
+  readonly modelRevision: string;
+  readonly producer: VisitSimilarityProducer;
+  readonly threshold: number;
+  readonly topK: number;
+  readonly engagementGateMs: number;
+  readonly lexicalThreshold: number;
+  readonly lexicalFallbackEnabled: boolean;
   readonly visits: readonly NormalizedVisit[];
 }): string => {
   const hash = createHash('sha256');
@@ -237,9 +273,12 @@ const revisionIdFor = (input: {
       modelId: VISIT_SIMILARITY_MODEL_ID,
       modelRevision: input.modelRevision,
       featureSchemaVersion: VISIT_SIMILARITY_FEATURE_SCHEMA_VERSION,
+      producer: input.producer,
       threshold: input.threshold,
       topK: input.topK,
       engagementGateMs: input.engagementGateMs,
+      lexicalThreshold: input.lexicalThreshold,
+      lexicalFallbackEnabled: input.lexicalFallbackEnabled,
       visits: input.visits.map((visit) => ({
         visitKey: visit.visitKey,
         corpus: visit.corpus,
@@ -385,22 +424,28 @@ export const buildVisitSimilarity = async (
   embed: VisitSimilarityEmbedder,
   options: BuildVisitSimilarityOptions = {},
 ): Promise<VisitSimilarityRevision> => {
-  const threshold = clampThreshold(options.threshold);
-  const topK = clampTopK(options.topK);
-  const engagementGateMs = clampEngagementGate(options.engagementGateMs);
-  const lexicalThreshold = clampLexicalThreshold(options.lexicalThreshold);
-  const fallbackAllowed = options.lexicalFallbackEnabled ?? lexicalFallbackEnabled();
+  const config = resolveVisitSimilarityConfig(options);
+  const { threshold, topK, engagementGateMs, lexicalThreshold } = config;
+  const fallbackAllowed = config.lexicalFallbackEnabled;
   const modelRevision = RECALL_MODEL.revision;
   const visits = normalizeEntries(entries);
-  const revisionId = revisionIdFor({
+  // Stage 5.0 follow-up — embedding-path id is computed up front and
+  // ALSO includes lexicalThreshold/lexicalFallbackEnabled in its
+  // hash. That keeps it sensitive to changes the operator made to the
+  // fallback config even when the embedder succeeded, so a future
+  // re-run that lost the embedder produces a distinct id.
+  const embeddingRevisionId = revisionIdFor({
     modelRevision,
+    producer: 'embedding',
     threshold,
     topK,
     engagementGateMs,
+    lexicalThreshold,
+    lexicalFallbackEnabled: fallbackAllowed,
     visits,
   });
-  const base = {
-    revisionId,
+  const embeddingBase = {
+    revisionId: embeddingRevisionId,
     modelId: VISIT_SIMILARITY_MODEL_ID,
     modelRevision,
     featureSchemaVersion: VISIT_SIMILARITY_FEATURE_SCHEMA_VERSION,
@@ -412,12 +457,29 @@ export const buildVisitSimilarity = async (
   // Lexical fallback path: produces edges whose `cosine` field is a
   // Jaccard score in [0, 1]. The revision's `threshold` matches the
   // lexical threshold so the snapshot's `cosine < threshold` filter
-  // gates correctly without changing the reducer.
+  // gates correctly without changing the reducer. The revision id is
+  // computed with `producer: 'lexical'` and the lexical threshold in
+  // the hash, so embedding and lexical revisions over the same visits
+  // are always distinct.
   const lexicalRevision = (): VisitSimilarityRevision => {
     const eligibleForLexical = visits.filter((visit) => visit.focusedWindowMs >= engagementGateMs);
-    return {
-      ...base,
+    const lexicalRevisionId = revisionIdFor({
+      modelRevision,
+      producer: 'lexical',
       threshold: lexicalThreshold,
+      topK,
+      engagementGateMs,
+      lexicalThreshold,
+      lexicalFallbackEnabled: fallbackAllowed,
+      visits,
+    });
+    return {
+      revisionId: lexicalRevisionId,
+      modelId: VISIT_SIMILARITY_MODEL_ID,
+      modelRevision,
+      featureSchemaVersion: VISIT_SIMILARITY_FEATURE_SCHEMA_VERSION,
+      threshold: lexicalThreshold,
+      producedAt: Date.now(),
       producer: 'lexical',
       edges: fallbackAllowed
         ? buildLexicalEdges(eligibleForLexical, lexicalThreshold, topK)
@@ -427,7 +489,7 @@ export const buildVisitSimilarity = async (
 
   const eligible = visits.filter((visit) => visit.focusedWindowMs >= engagementGateMs);
   if (eligible.length < 2) {
-    return { ...base, edges: [] };
+    return { ...embeddingBase, edges: [] };
   }
 
   const passageTexts = eligible.map((visit) => `${PASSAGE_PREFIX}${visit.corpus}`);
@@ -438,7 +500,12 @@ export const buildVisitSimilarity = async (
   } catch (error) {
     logMaterializerError(error);
     if (fallbackAllowed) return lexicalRevision();
-    return emptyRevision({ revisionId, modelRevision, threshold, producer: 'embedding' });
+    return emptyRevision({
+      revisionId: embeddingRevisionId,
+      modelRevision,
+      threshold,
+      producer: 'embedding',
+    });
   }
   if (embedded.length !== passageTexts.length + queryTexts.length) {
     logMaterializerError(
@@ -447,14 +514,19 @@ export const buildVisitSimilarity = async (
       ),
     );
     if (fallbackAllowed) return lexicalRevision();
-    return emptyRevision({ revisionId, modelRevision, threshold, producer: 'embedding' });
+    return emptyRevision({
+      revisionId: embeddingRevisionId,
+      modelRevision,
+      threshold,
+      producer: 'embedding',
+    });
   }
 
   const passageVectors = embedded.slice(0, passageTexts.length);
   const queryVectors = embedded.slice(passageTexts.length);
   const indexEntries = indexEntriesForVisits(eligible, passageVectors);
   const vectorIndex = await buildAnnIndex({
-    revisionId,
+    revisionId: embeddingRevisionId,
     items: indexEntries,
   });
   const edges: VisitSimilarityEdge[] = [];
@@ -503,5 +575,5 @@ export const buildVisitSimilarity = async (
     return left.cosine - right.cosine;
   });
 
-  return { ...base, edges };
+  return { ...embeddingBase, edges };
 };

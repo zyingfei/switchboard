@@ -366,7 +366,7 @@ const stripFragmentAndTrailingSlash = (url: string): string =>
 //
 // T5 demotes the edge by requiring at least the same provider OR a
 // reasonable title overlap, AND a recency window. Edges that pass keep
-// `confidence: 'inferred'` and gain a `producedBy.evidence` blob
+// `confidence: 'inferred'` and gain a `metadata.evidence` blob
 // recording which gates fired. Edges that don't pass are simply not
 // emitted.
 //
@@ -428,7 +428,7 @@ const titleJaccard = (left: string | undefined, right: string | undefined): numb
 };
 
 // Returns null when the candidate edge should not be emitted; otherwise
-// returns the evidence blob to record on `producedBy.evidence`.
+// returns the evidence blob to record on `edge.metadata.evidence`.
 export interface TimelineSameUrlAsThreadGateInput {
   readonly visitTitle?: string;
   readonly visitProvider?: string;

@@ -366,11 +366,21 @@ describe('connections — snapshot reducer (Given/Then)', () => {
     expect(edge).toBeDefined();
     expect(edge?.confidence).toBe('inferred');
     expect(edge?.producedBy.source).toBe('timeline-projection');
+    // Stage 5.0 follow-up — evidence is stored on `edge.metadata.evidence`,
+    // NOT `producedBy.evidence`. Assert both halves so a future move
+    // back to producedBy doesn't pass silently.
+    expect(
+      (edge?.producedBy as Record<string, unknown> | undefined)?.['evidence'],
+    ).toBeUndefined();
     const evidence = (edge?.metadata as { readonly evidence?: Record<string, unknown> } | undefined)
       ?.evidence;
     expect(evidence).toBeDefined();
     expect(evidence?.['providerMatched']).toBe(true);
     expect(evidence?.['titleJaccard']).toBeGreaterThanOrEqual(0.25);
+    expect(evidence?.['recencyDeltaMs']).toBeTypeOf('number');
+    expect(evidence?.['recencyDeltaMs']).toBeLessThanOrEqual(
+      24 * 60 * 60 * 1000,
+    );
   });
 
   it('drops timeline_same_url_as_thread when provider differs, titles do not overlap, and recency is irrelevant', () => {

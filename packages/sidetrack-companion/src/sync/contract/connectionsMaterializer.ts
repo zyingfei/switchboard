@@ -29,8 +29,9 @@ import {
 } from '../../connections/userAssertedRelations.js';
 import { buildHdbscanTopicRevision } from '../../connections/hdbscanClusterer.js';
 import {
-  VISIT_SIMILARITY_DEFAULT_ENGAGEMENT_GATE_MS,
   buildVisitSimilarity,
+  resolveVisitSimilarityConfig,
+  type EffectiveVisitSimilarityConfig,
   type VisitSimilarityEmbedder,
 } from '../../connections/visitSimilarity.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
@@ -383,9 +384,17 @@ export const createConnectionsMaterializer = (
     });
     await engagementClassStore.putRevision(engagementClassRevision);
     const timelineDays = enrichTimelineDaysWithEngagement(rawTimelineDays, engagementInputs);
+    // Stage 5.0 follow-up — resolve the similarity config once, then
+    // forward the SAME effective values to both buildVisitSimilarity
+    // (so production runs honor env overrides) and the diagnostics
+    // collector (so the artifact reports what actually ran, not the
+    // constant defaults).
+    const similarityConfig: EffectiveVisitSimilarityConfig =
+      resolveVisitSimilarityConfig();
     const visitSimilarity = await buildVisitSimilarity(
       timelineDays.flatMap((day) => day.entries),
       deps.embed ?? defaultEmbed,
+      similarityConfig,
     );
     await writeVisitSimilarityRevision(deps.vaultRoot, visitSimilarity);
     const previousTopicRevision = await topicRevisionStore.readActiveRevision();
@@ -432,7 +441,8 @@ export const createConnectionsMaterializer = (
     const diagnostics = collectMaterializerDiagnostics({
       producedAt: diagnosticsNow().toISOString(),
       maxAcceptedAtMs: maxAcceptedAtMs(merged),
-      engagementGateMs: VISIT_SIMILARITY_DEFAULT_ENGAGEMENT_GATE_MS,
+      engagementGateMs: similarityConfig.engagementGateMs,
+      similarityEffectiveConfig: similarityConfig,
       timelineEntries: timelineDays.flatMap((day) => day.entries),
       visitSimilarity,
       topicRevision,

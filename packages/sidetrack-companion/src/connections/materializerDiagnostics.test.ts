@@ -378,6 +378,41 @@ describe('collectMaterializerDiagnostics', () => {
     expect(diag.snapshot.nodeCountByKind['visit-instance']).toBe(3);
     expect(diag.snapshot.nodeCountByKind['workstream']).toBe(1);
   });
+
+  it('reports the effective similarity config the materializer forwarded', () => {
+    const diag = collectMaterializerDiagnostics(
+      baseInput({
+        engagementGateMs: 1_000,
+        similarityEffectiveConfig: {
+          threshold: 0.6,
+          topK: 25,
+          engagementGateMs: 1_000,
+          lexicalThreshold: 0.4,
+          lexicalFallbackEnabled: true,
+        },
+        timelineEntries: [
+          { dimensions: { engagement: { focusedWindowMs: 800 } } }, // below the override
+          { dimensions: { engagement: { focusedWindowMs: 1_500 } } }, // above the override
+        ],
+      }),
+    );
+    // engagementGateMs reflects the override, not the constant default.
+    expect(diag.timeline.engagementGateMs).toBe(1_000);
+    expect(diag.timeline.engagementEligibleEntryCount).toBe(1);
+    // effectiveConfig surfaces every knob.
+    expect(diag.similarity.effectiveConfig).toEqual({
+      threshold: 0.6,
+      topK: 25,
+      engagementGateMs: 1_000,
+      lexicalThreshold: 0.4,
+      lexicalFallbackEnabled: true,
+    });
+  });
+
+  it('omits effectiveConfig when no similarityEffectiveConfig is supplied (back-compat)', () => {
+    const diag = collectMaterializerDiagnostics(baseInput());
+    expect(diag.similarity.effectiveConfig).toBeUndefined();
+  });
 });
 
 describe('summarizeMaterializerDiagnostics', () => {

@@ -23,6 +23,7 @@ import type { TopicRevision } from '../producers/topic-revision.js';
 import type { RankerRetrainResult } from '../ranker/retrain.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import type { ConnectionsSnapshot, VisitSimilarityRevision } from './types.js';
+import type { EffectiveVisitSimilarityConfig } from './visitSimilarity.js';
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import type { UrlProjection } from '../urls/projection.js';
 
@@ -49,6 +50,17 @@ export interface MaterializerSimilarityCounters {
   // lexical fallback ('lexical') vs the embedding pipeline ('embedding',
   // or absent for older fixture data that pre-dates the field).
   readonly producer: 'embedding' | 'lexical' | 'unknown';
+  // Stage 5.0 follow-up — the effective config the materializer
+  // forwarded to `buildVisitSimilarity`, captured here so dogfood can
+  // confirm env overrides actually took effect. Optional because the
+  // collector accepts legacy input shapes that didn't carry it.
+  readonly effectiveConfig?: {
+    readonly threshold: number;
+    readonly topK: number;
+    readonly engagementGateMs: number;
+    readonly lexicalThreshold: number;
+    readonly lexicalFallbackEnabled: boolean;
+  };
 }
 
 export interface MaterializerTopicCounters {
@@ -119,6 +131,10 @@ export interface MaterializerDiagnosticsInput {
   readonly producedAt: string;
   readonly maxAcceptedAtMs: number;
   readonly engagementGateMs: number;
+  // Stage 5.0 follow-up — the materializer forwards the same struct
+  // it gave `buildVisitSimilarity`. Optional so test fixtures that
+  // pre-date the follow-up still compile.
+  readonly similarityEffectiveConfig?: EffectiveVisitSimilarityConfig;
   readonly timelineEntries: readonly {
     readonly tabSessionId?: string;
     readonly dimensions?: unknown;
@@ -181,12 +197,24 @@ const collectTimelineCounters = (
 
 const collectSimilarityCounters = (
   revision: VisitSimilarityRevision,
+  effectiveConfig: EffectiveVisitSimilarityConfig | undefined,
 ): MaterializerSimilarityCounters => ({
   revisionId: revision.revisionId,
   modelRevision: revision.modelRevision,
   threshold: revision.threshold,
   edgeCount: revision.edges.length,
   producer: revision.producer ?? 'unknown',
+  ...(effectiveConfig === undefined
+    ? {}
+    : {
+        effectiveConfig: {
+          threshold: effectiveConfig.threshold,
+          topK: effectiveConfig.topK,
+          engagementGateMs: effectiveConfig.engagementGateMs,
+          lexicalThreshold: effectiveConfig.lexicalThreshold,
+          lexicalFallbackEnabled: effectiveConfig.lexicalFallbackEnabled,
+        },
+      }),
 });
 
 const collectTopicCounters = (revision: TopicRevision): MaterializerTopicCounters => {
@@ -340,7 +368,7 @@ export const collectMaterializerDiagnostics = (
     producedAt: input.producedAt,
     maxAcceptedAtMs: input.maxAcceptedAtMs,
     timeline: collectTimelineCounters(input.timelineEntries, input.engagementGateMs),
-    similarity: collectSimilarityCounters(input.visitSimilarity),
+    similarity: collectSimilarityCounters(input.visitSimilarity, input.similarityEffectiveConfig),
     topics: collectTopicCounters(input.topicRevision),
     ranker: collectRankerCounters(input.rankerRetrainResult),
     userAssertions: eventCounters.userAssertions,
