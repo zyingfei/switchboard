@@ -1066,6 +1066,60 @@ const App = () => {
     };
   }, [loadTabSessions, state.companionStatus]);
 
+  // Push-driven refresh: the moment the user navigates a tab, force the
+  // SW to drain its spool and reload the projection. Without this the
+  // Inbox card / Current-tab card lag until the next 4 s poll + 60 s
+  // SW drain alarm. Listens to chrome.tabs.onUpdated (URL or title
+  // change) and debounces so the chatty status/title burst per
+  // navigation coalesces into one refresh.
+  useEffect(() => {
+    const chromeApi = (
+      globalThis as unknown as { chrome?: { tabs?: typeof chrome.tabs; runtime?: typeof chrome.runtime } }
+    ).chrome;
+    const tabsApi = chromeApi?.tabs;
+    if (tabsApi === undefined || typeof tabsApi.onUpdated?.addListener !== 'function') return;
+    let pending: ReturnType<typeof setTimeout> | null = null;
+    const trigger = (): void => {
+      if (pending !== null) clearTimeout(pending);
+      pending = setTimeout(() => {
+        pending = null;
+        if (state.companionStatus !== 'connected') return;
+        try {
+          chromeApi?.runtime?.sendMessage(
+            { type: 'sidetrack.timeline.force-drain' },
+            () => {
+              void loadTabSessions().catch(() => undefined);
+            },
+          );
+        } catch {
+          void loadTabSessions().catch(() => undefined);
+        }
+      }, 250);
+    };
+    const onUpdated = (
+      _tabId: number,
+      changeInfo: { url?: string; status?: string; title?: string },
+    ): void => {
+      if (
+        changeInfo.url !== undefined ||
+        changeInfo.status === 'complete' ||
+        (typeof changeInfo.title === 'string' && changeInfo.title.length > 0)
+      ) {
+        trigger();
+      }
+    };
+    const onActivated = (): void => {
+      trigger();
+    };
+    tabsApi.onUpdated.addListener(onUpdated);
+    tabsApi.onActivated.addListener(onActivated);
+    return () => {
+      tabsApi.onUpdated.removeListener(onUpdated);
+      tabsApi.onActivated.removeListener(onActivated);
+      if (pending !== null) clearTimeout(pending);
+    };
+  }, [loadTabSessions, state.companionStatus]);
+
   useEffect(() => {
     void refresh()
       .catch((loadError: unknown) => {
