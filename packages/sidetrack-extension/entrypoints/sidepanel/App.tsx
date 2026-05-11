@@ -98,6 +98,10 @@ import {
   type TabSessionRecord,
   type TabSessionResolutionResult,
   type TabSessionWorkstreamOption,
+  type UrlInboxData,
+  type UrlProjection,
+  type UrlResolutionResult,
+  type UrlVisitRecord,
 } from '../../src/sidepanel/tabsession/types';
 import {
   USER_ORGANIZED_ITEM,
@@ -123,6 +127,44 @@ const EMPTY_TAB_SESSION_INBOX: TabSessionInboxData = {
   limit: 51,
   offset: 0,
 };
+
+const EMPTY_URL_INBOX: UrlInboxData = {
+  items: [],
+  total: 0,
+  limit: 51,
+  offset: 0,
+};
+
+// Adapt a UrlVisitRecord to the TabSessionRecord shape the existing
+// InboxCard / current-tab card components expect. The synthesized id
+// is the canonical URL — actions interpret it as the URL-attribution
+// target (handleUrlAttribute), not a tab-session id.
+const tabSessionRecordFromUrl = (url: UrlVisitRecord): TabSessionRecord => ({
+  tabSessionId: url.canonicalUrl,
+  openedAt: url.firstSeenAt,
+  lastActivityAt: url.lastSeenAt,
+  ...(url.latestUrl === undefined ? {} : { latestUrl: url.latestUrl }),
+  ...(url.latestTitle === undefined ? {} : { latestTitle: url.latestTitle }),
+  ...(url.provider === undefined ? {} : { provider: url.provider }),
+  ...(url.currentAttribution === undefined
+    ? {}
+    : { currentAttribution: url.currentAttribution }),
+  attributionHistory: url.attributionHistory,
+});
+
+// The URL resolver returns a UrlResolutionResult ({ canonicalUrl, … });
+// the existing InboxCard / SuggestionBanner / AttributionBadge expect
+// a TabSessionResolutionResult ({ tabSessionId, … }). Same wire shape
+// apart from the key — surface-rename to keep the UI components
+// unaware of the underlying attribution unit.
+const tabSessionResolutionFromUrl = (
+  result: UrlResolutionResult,
+): TabSessionResolutionResult => ({
+  tabSessionId: result.canonicalUrl,
+  dryRun: true,
+  decision: result.decision,
+  fusedCandidates: result.fusedCandidates,
+});
 
 const tabSessionIdFromDragEvent = (event: DragEvent<HTMLElement>): string | null => {
   if (typeof event.dataTransfer.getData !== 'function') return null;
@@ -160,6 +202,29 @@ const isResolverAction = (value: unknown): value is 'auto-apply' | 'suggest' | '
 const isTabSessionResolutionResult = (value: unknown): value is TabSessionResolutionResult =>
   isPlainRecord(value) &&
   typeof value['tabSessionId'] === 'string' &&
+  value['dryRun'] === true &&
+  isPlainRecord(value['decision']) &&
+  isResolverAction(value['decision']['action']) &&
+  (value['decision']['workstreamId'] === undefined ||
+    typeof value['decision']['workstreamId'] === 'string') &&
+  typeof value['decision']['margin'] === 'number' &&
+  Array.isArray(value['fusedCandidates']);
+
+const isUrlProjection = (value: unknown): value is UrlProjection =>
+  isPlainRecord(value) &&
+  value['schemaVersion'] === 1 &&
+  isPlainRecord(value['byCanonicalUrl']);
+
+const isUrlInboxData = (value: unknown): value is UrlInboxData =>
+  isPlainRecord(value) &&
+  Array.isArray(value['items']) &&
+  typeof value['total'] === 'number' &&
+  typeof value['limit'] === 'number' &&
+  typeof value['offset'] === 'number';
+
+const isUrlResolutionResult = (value: unknown): value is UrlResolutionResult =>
+  isPlainRecord(value) &&
+  typeof value['canonicalUrl'] === 'string' &&
   value['dryRun'] === true &&
   isPlainRecord(value['decision']) &&
   isResolverAction(value['decision']['action']) &&
@@ -566,6 +631,12 @@ const App = () => {
   >({});
   const [tabSessionLoading, setTabSessionLoading] = useState(false);
   const [tabSessionError, setTabSessionError] = useState<string | null>(null);
+  // Per-canonical-URL state (Phase B). URL is the attribution unit;
+  // tab-session state above is preserved for back-compat with sync
+  // peers that haven't been updated yet.
+  const [urlInbox, setUrlInbox] = useState<UrlInboxData>(EMPTY_URL_INBOX);
+  const [urlProjection, setUrlProjection] = useState<UrlProjection | null>(null);
+  const [urlSuggestions, setUrlSuggestions] = useState<Record<string, UrlResolutionResult>>({});
   const [pendingCodingOffers, setPendingCodingOffers] = useState<readonly OfferRecord[]>([]);
   // Per-row dismissals for the Needs-Organize inline suggestion. Local
   // (per-session) — survives panel close but not extension reload.
@@ -897,26 +968,56 @@ const App = () => {
     [fetchCompanionJson],
   );
 
+  // Resolve every unattributed URL in the Inbox so the cards can show
+  // "Best guess: …" inline. Run in parallel; missing/errored URLs
+  // silently drop out of the result.
+  const loadUrlSuggestions = useCallback(
+    async (inbox: UrlInboxData): Promise<Record<string, UrlResolutionResult>> => {
+      const canonicalUrls = inbox.items
+        .filter((item) => item.currentAttribution === undefined)
+        .map((item) => item.canonicalUrl);
+      const entries = await Promise.all(
+        canonicalUrls.map(async (canonicalUrl) => {
+          try {
+            const result = await fetchCompanionJson<unknown>(
+              `/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve?dryRun=true`,
+            );
+            return isUrlResolutionResult(result) ? ([canonicalUrl, result] as const) : null;
+          } catch {
+            return null;
+          }
+        }),
+      );
+      return Object.fromEntries(
+        entries.filter((entry): entry is readonly [string, UrlResolutionResult] => entry !== null),
+      );
+    },
+    [fetchCompanionJson],
+  );
+
   const loadTabSessions = useCallback(async (): Promise<void> => {
     if (port.length === 0 || bridgeKey.length === 0) {
       setTabSessionProjection(null);
       setTabSessionInbox(EMPTY_TAB_SESSION_INBOX);
       setTabSessionSuggestions({});
+      setUrlProjection(null);
+      setUrlInbox(EMPTY_URL_INBOX);
+      setUrlSuggestions({});
       return;
     }
     setTabSessionLoading(true);
     setTabSessionError(null);
     try {
-      const [projection, inbox] = await Promise.all([
+      const [tabProjection, tabInbox] = await Promise.all([
         fetchCompanionJson<unknown>('/v1/tabsessions/projection'),
         fetchCompanionJson<unknown>('/v1/tabsessions/inbox?limit=51&offset=0'),
       ]);
-      if (!isTabSessionProjection(projection) || !isTabSessionInboxData(inbox)) {
+      if (!isTabSessionProjection(tabProjection) || !isTabSessionInboxData(tabInbox)) {
         throw new Error('Companion returned an invalid tab-session projection.');
       }
-      setTabSessionProjection(projection);
-      setTabSessionInbox(inbox);
-      setTabSessionSuggestions(await loadTabSessionSuggestions(projection, inbox));
+      setTabSessionProjection(tabProjection);
+      setTabSessionInbox(tabInbox);
+      setTabSessionSuggestions(await loadTabSessionSuggestions(tabProjection, tabInbox));
     } catch (loadError) {
       setTabSessionError(
         loadError instanceof Error ? loadError.message : 'Could not load tab sessions.',
@@ -925,7 +1026,24 @@ const App = () => {
     } finally {
       setTabSessionLoading(false);
     }
-  }, [bridgeKey, fetchCompanionJson, loadTabSessionSuggestions, port]);
+    // URL projection (Phase B) is fetched independently — older
+    // companions that don't yet expose /v1/visits/* return 404, which
+    // we tolerate by leaving the URL state empty. Tab-session state
+    // above keeps working in that case.
+    try {
+      const [urlProj, urlInboxResp] = await Promise.all([
+        fetchCompanionJson<unknown>('/v1/visits/projection'),
+        fetchCompanionJson<unknown>('/v1/visits/inbox?limit=51&offset=0'),
+      ]);
+      if (isUrlProjection(urlProj) && isUrlInboxData(urlInboxResp)) {
+        setUrlProjection(urlProj);
+        setUrlInbox(urlInboxResp);
+        setUrlSuggestions(await loadUrlSuggestions(urlInboxResp));
+      }
+    } catch {
+      // Older companion or transient failure — keep prior URL state.
+    }
+  }, [bridgeKey, fetchCompanionJson, loadTabSessionSuggestions, loadUrlSuggestions, port]);
 
   useEffect(() => {
     if (state.companionStatus !== 'connected') return;
@@ -1709,8 +1827,45 @@ const App = () => {
     return await sendRequest({ type: messageTypes.getWorkboardState });
   };
 
+  // Per-canonical-URL attribution (Phase B). The Inbox + Current-tab
+  // card now route through here — they attribute the PAGE, not the tab.
+  const attributeUrlToWorkstream = async (
+    canonicalUrl: string,
+    workstreamId: string | null,
+  ): Promise<WorkboardState> => {
+    if (port.length === 0 || bridgeKey.length === 0) {
+      throw new Error('Companion is not configured.');
+    }
+    const response = await fetch(
+      `http://127.0.0.1:${port}/v1/visits/${encodeURIComponent(canonicalUrl)}/attribute`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'idempotency-key': `url-${canonicalUrl}-${workstreamId ?? 'inbox'}-${String(Date.now())}`,
+          'x-bac-bridge-key': bridgeKey,
+        },
+        body: JSON.stringify({ workstreamId }),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`URL attribution failed (${String(response.status)}).`);
+    }
+    await loadTabSessions();
+    return await sendRequest({ type: messageTypes.getWorkboardState });
+  };
+
   const handleTabSessionAttribute = (tabSessionId: string, workstreamId: string | null) => {
     void runAction(() => attributeTabSessionToWorkstream(tabSessionId, workstreamId));
+  };
+
+  // Wrapper used by the Inbox + Current-tab card after the Phase B
+  // switchover. The card's record is a synthesized TabSessionRecord
+  // whose `tabSessionId` field carries the canonical URL — see
+  // `tabSessionRecordFromUrl` in this file. This dispatches to the
+  // per-URL attribution endpoint.
+  const handleUrlAttribute = (canonicalUrl: string, workstreamId: string | null) => {
+    void runAction(() => attributeUrlToWorkstream(canonicalUrl, workstreamId));
   };
 
   const handleMoveTarget = (target: WorkstreamOption | { readonly create: string }) => {
@@ -2798,79 +2953,68 @@ const App = () => {
   const focusedTabUrl = comparableTabUrl(
     state.activeTabUrl ?? state.currentTab?.tabSnapshot?.url ?? state.currentTab?.threadUrl,
   );
-  const focusedTabSession = useMemo(() => {
-    // tabIdHash → tabSessionId in chrome.storage can lag boundary
-    // re-mints (the projection refreshes on a 4 s cadence; the
-    // boundary closes/re-opens on URL change or idle threshold). If
-    // we trust `activeTabSessionId` blindly we end up showing a
-    // stale title — the user reported "Current tab" showing a chat
-    // from a different ChatGPT project than the one actually open.
-    // Verify the matched record's URL agrees with the live tab URL
-    // before returning it; otherwise fall through to the URL match.
-    if (state.activeTabSessionId !== undefined) {
-      const exact = tabSessionRecords.find(
-        (record) => record.tabSessionId === state.activeTabSessionId,
-      );
-      if (exact !== undefined) {
-        const exactUrl = comparableTabUrl(exact.latestUrl);
-        if (focusedTabUrl === null || exactUrl === focusedTabUrl) {
-          return exact;
-        }
-      }
-    }
+  // Per-URL state: every visible attribution surface (Current tab,
+  // Inbox, Pages-in-this-workstream) reads from `urlProjection` instead
+  // of the tab-session projection. The synthesized TabSessionRecord
+  // shape lets InboxCard / suggestion banner stay unchanged; the
+  // record's `tabSessionId` field carries the canonical URL.
+  const urlRecords = useMemo<readonly UrlVisitRecord[]>(
+    () =>
+      urlProjection === null
+        ? []
+        : Object.values(urlProjection.byCanonicalUrl).sort((left, right) =>
+            left.lastSeenAt < right.lastSeenAt ? 1 : -1,
+          ),
+    [urlProjection],
+  );
+  const focusedUrlRecord = useMemo(() => {
     if (focusedTabUrl === null) return undefined;
-    // tabSessionRecords is sorted by lastActivityAt desc, so .find()
-    // returns the most-recent session whose URL matches.
-    return tabSessionRecords.find((record) => comparableTabUrl(record.latestUrl) === focusedTabUrl);
-  }, [focusedTabUrl, state.activeTabSessionId, tabSessionRecords]);
+    // `byCanonicalUrl` is keyed by exact canonical URL; the comparable
+    // form may differ (canonicalThreadUrl strips fragments). Try both.
+    const direct = urlProjection?.byCanonicalUrl[focusedTabUrl];
+    if (direct !== undefined) return direct;
+    // urlRecords is sorted by lastSeenAt desc.
+    return urlRecords.find((record) => comparableTabUrl(record.canonicalUrl) === focusedTabUrl);
+  }, [focusedTabUrl, urlProjection, urlRecords]);
+  const focusedTabSession = useMemo(
+    () => (focusedUrlRecord === undefined ? undefined : tabSessionRecordFromUrl(focusedUrlRecord)),
+    [focusedUrlRecord],
+  );
   const focusedTabSuggestion =
-    focusedTabSession === undefined
-      ? undefined
-      : tabSessionSuggestions[focusedTabSession.tabSessionId];
-  // Prefer the focused-tab's session for the suggestion banner when it has
-  // an actionable suggest decision and is unattributed. Otherwise fall back
-  // to the first unattributed session anywhere in the list — that surface
-  // exists so user can still triage Inbox without switching tabs, but
-  // hijacking it for an unrelated tab while the user is actively reading
-  // a different one was confusing (Phase 7 follow-up).
+    focusedUrlRecord === undefined ? undefined : urlSuggestions[focusedUrlRecord.canonicalUrl];
   const focusedSuggestionIsActionable =
-    focusedTabSession !== undefined &&
-    focusedTabSession.closedAt === undefined &&
-    focusedTabSession.currentAttribution === undefined &&
+    focusedUrlRecord !== undefined &&
+    focusedUrlRecord.currentAttribution === undefined &&
     focusedTabSuggestion?.decision.action === 'suggest' &&
     focusedTabSuggestion.decision.workstreamId !== undefined;
-  const fallbackSuggestedSession = useMemo(
+  const fallbackSuggestedUrl = useMemo(
     () =>
-      tabSessionRecords.find((record) => {
-        const suggestion = tabSessionSuggestions[record.tabSessionId];
+      urlRecords.find((record) => {
+        const suggestion = urlSuggestions[record.canonicalUrl];
         return (
-          record.closedAt === undefined &&
           record.currentAttribution === undefined &&
           suggestion?.decision.action === 'suggest' &&
           suggestion.decision.workstreamId !== undefined
         );
       }),
-    [tabSessionRecords, tabSessionSuggestions],
+    [urlRecords, urlSuggestions],
   );
-  const suggestedOpenTabSession = focusedSuggestionIsActionable
-    ? focusedTabSession
-    : fallbackSuggestedSession;
+  const suggestedOpenUrl = focusedSuggestionIsActionable ? focusedUrlRecord : fallbackSuggestedUrl;
+  const suggestedOpenTabSession = useMemo(
+    () => (suggestedOpenUrl === undefined ? undefined : tabSessionRecordFromUrl(suggestedOpenUrl)),
+    [suggestedOpenUrl],
+  );
   const suggestedOpenTabSessionResolution =
-    suggestedOpenTabSession === undefined
-      ? undefined
-      : tabSessionSuggestions[suggestedOpenTabSession.tabSessionId];
+    suggestedOpenUrl === undefined ? undefined : urlSuggestions[suggestedOpenUrl.canonicalUrl];
   const currentWorkstreamTabSessions = useMemo(
     () =>
       currentWsId === null
         ? []
-        : tabSessionRecords
-            .filter(
-              (record) =>
-                record.closedAt === undefined &&
-                record.currentAttribution?.workstreamId === currentWsId,
-            )
-            .slice(0, 50),
-    [currentWsId, tabSessionRecords],
+        : urlRecords
+            .filter((record) => record.currentAttribution?.workstreamId === currentWsId)
+            .slice(0, 50)
+            .map(tabSessionRecordFromUrl),
+    [currentWsId, urlRecords],
   );
   const currentWsThreads = sortThreadsByLifecycle(
     currentWsId === null
@@ -4079,7 +4223,7 @@ const App = () => {
           >
             Inbox
             <span className="ct mono" aria-hidden>
-              {tabSessionInbox.total}
+              {urlInbox.total}
             </span>
           </button>
           <button
@@ -4539,17 +4683,24 @@ const App = () => {
           <span className="tab-attribution-card-prefix mono">In workstream:</span>
           <AttributionBadge
             record={focusedTabSession}
-            suggestion={focusedTabSuggestion}
+            suggestion={
+              focusedTabSuggestion === undefined
+                ? undefined
+                : tabSessionResolutionFromUrl(focusedTabSuggestion)
+            }
             workstreams={tabSessionWorkstreams}
           />
-          {focusedTabSession !== undefined ? (
+          {focusedUrlRecord !== undefined ? (
             <button
               type="button"
               className="tab-attribution-card-change"
               onClick={() => {
-                setTabSessionMoveId(focusedTabSession.tabSessionId);
+                // tabSessionMoveId carries the canonical URL post-Phase B
+                // — the move-target picker still works because the
+                // accept handler now dispatches to handleUrlAttribute.
+                setTabSessionMoveId(focusedUrlRecord.canonicalUrl);
               }}
-              title="Move this tab session to a different workstream"
+              title="Attribute this page to a different workstream"
             >
               Change…
             </button>
@@ -4565,9 +4716,9 @@ const App = () => {
       {suggestedOpenTabSession !== undefined && suggestedOpenTabSessionResolution !== undefined ? (
         <SuggestionBanner
           record={suggestedOpenTabSession}
-          suggestion={suggestedOpenTabSessionResolution}
+          suggestion={tabSessionResolutionFromUrl(suggestedOpenTabSessionResolution)}
           workstreams={tabSessionWorkstreams}
-          onAttribute={handleTabSessionAttribute}
+          onAttribute={handleUrlAttribute}
         />
       ) : null}
 
@@ -4725,17 +4876,17 @@ const App = () => {
         <WorkstreamPicker
           workstreams={state.workstreams}
           threads={threads}
-          /* Highlight whatever workstream the tab is currently attributed to. */
+          /* tabSessionMoveId is the canonical URL post-Phase B. */
           currentWsId={
-            tabSessionRecords.find((record) => record.tabSessionId === tabSessionMoveId)
-              ?.currentAttribution?.workstreamId ?? null
+            urlProjection?.byCanonicalUrl[tabSessionMoveId]?.currentAttribution?.workstreamId ??
+            null
           }
           createMode={false}
           onClose={() => {
             setTabSessionMoveId(null);
           }}
           onSelect={(id) => {
-            handleTabSessionAttribute(tabSessionMoveId, id);
+            handleUrlAttribute(tabSessionMoveId, id);
             setTabSessionMoveId(null);
           }}
           onCreate={(title, parentId, description) => {
@@ -4946,24 +5097,32 @@ const App = () => {
           {currentWsId !== null ? (
             <>
               <div className="sec-head">
-                <span>Tabs in this workstream</span>
+                <span>Pages in this workstream</span>
                 <span className="count mono">{String(currentWorkstreamTabSessions.length)}</span>
               </div>
               {currentWorkstreamTabSessions.length === 0 ? (
-                <div className="thread-empty subtle">No open tab sessions here.</div>
+                <div className="thread-empty subtle">No pages attributed here yet.</div>
               ) : (
                 <div className="tab-session-list">
-                  {currentWorkstreamTabSessions.map((record) => (
-                    <InboxCard
-                      key={record.tabSessionId}
-                      record={record}
-                      suggestion={tabSessionSuggestions[record.tabSessionId]}
-                      workstreams={tabSessionWorkstreams}
-                      onAttribute={handleTabSessionAttribute}
-                      onOpenTab={openTabForSession}
-                      displayCtx={displayCtx}
-                    />
-                  ))}
+                  {currentWorkstreamTabSessions.map((record) => {
+                    // `record.tabSessionId` is the canonical URL (see
+                    // tabSessionRecordFromUrl). Suggestions are keyed
+                    // the same way, so this lookup just works.
+                    const urlSuggestion = urlSuggestions[record.tabSessionId];
+                    return (
+                      <InboxCard
+                        key={record.tabSessionId}
+                        record={record}
+                        {...(urlSuggestion === undefined
+                          ? {}
+                          : { suggestion: tabSessionResolutionFromUrl(urlSuggestion) })}
+                        workstreams={tabSessionWorkstreams}
+                        onAttribute={handleUrlAttribute}
+                        onOpenTab={openTabForSession}
+                        displayCtx={displayCtx}
+                      />
+                    );
+                  })}
                 </div>
               )}
             </>
@@ -4971,15 +5130,29 @@ const App = () => {
         </>
       ) : viewMode === 'inbox' ? (
         <InboxView
-          inbox={tabSessionInbox}
+          // Per-URL Inbox (Phase B). Records are synthesized from
+          // urlInbox; each record's `tabSessionId` field carries the
+          // canonical URL, and onAttribute dispatches to the URL
+          // attribution endpoint.
+          inbox={{
+            items: urlInbox.items.map(tabSessionRecordFromUrl),
+            total: urlInbox.total,
+            limit: urlInbox.limit,
+            offset: urlInbox.offset,
+          }}
           loading={tabSessionLoading}
           error={tabSessionError}
           workstreams={tabSessionWorkstreams}
-          suggestions={tabSessionSuggestions}
+          suggestions={Object.fromEntries(
+            Object.entries(urlSuggestions).map(([canonicalUrl, result]) => [
+              canonicalUrl,
+              tabSessionResolutionFromUrl(result),
+            ]),
+          )}
           onRefresh={() => {
             void loadTabSessions();
           }}
-          onAttribute={handleTabSessionAttribute}
+          onAttribute={handleUrlAttribute}
           onOpenTab={openTabForSession}
           displayCtx={displayCtx}
         />
