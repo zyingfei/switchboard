@@ -173,7 +173,10 @@ interface SidepanelProbeResult {
   readonly httpHostAccess: boolean | null;
   readonly engagementScripts: readonly ContentScriptRegistration[];
   readonly visualFingerprintScripts: readonly ContentScriptRegistration[];
-  readonly devDiag: RuntimeDiagStash | null;
+  // Untyped on the wire because Playwright's evaluate marshals JSON
+  // and we can't carry our compile-time RuntimeDiagStash shape across
+  // the page boundary. Callers cast at the read site.
+  readonly devDiag: unknown;
 }
 
 const probeSidepanel = async (
@@ -186,101 +189,94 @@ const probeSidepanel = async (
   });
   // Give the SW a beat to be reachable.
   await page.waitForTimeout(500);
-  // Read companion config + permissions + scripts + diag stash in one main-world block.
-  const result: SidepanelProbeResult = await (
-    page as unknown as {
-      evaluate: (
-        fn: () => Promise<SidepanelProbeResult>,
-        arg?: unknown,
-        isolated?: boolean,
-      ) => Promise<SidepanelProbeResult>;
-    }
-  ).evaluate(
-    async (): Promise<SidepanelProbeResult> => {
-      const c = (globalThis as unknown as { chrome?: typeof chrome }).chrome;
-      if (c === undefined) {
-        return {
-          companionPort: null,
-          bridgeKey: null,
-          httpHostAccess: null,
-          engagementScripts: [],
-          visualFingerprintScripts: [],
-          devDiag: null,
-        };
-      }
-      const settingsKey = 'sidetrack.settings';
-      const got = await c.storage.local.get(settingsKey);
-      const settings = (got[settingsKey] ?? {}) as {
-        readonly companion?: { readonly port?: number; readonly bridgeKey?: string };
-      };
-      const companionPort =
-        typeof settings.companion?.port === 'number' ? settings.companion.port : null;
-      const bridgeKey =
-        typeof settings.companion?.bridgeKey === 'string' && settings.companion.bridgeKey.length > 0
-          ? settings.companion.bridgeKey
-          : null;
-      const httpHostAccess = await new Promise<boolean | null>((resolve) => {
-        try {
-          c.permissions.contains(
-            { origins: ['https://*/*', 'http://*/*'] },
-            (granted) => {
-              resolve(granted);
-            },
-          );
-        } catch {
-          resolve(null);
-        }
-      });
-      const fetchScripts = async (id: string): Promise<readonly ContentScriptRegistration[]> => {
-        try {
-          const list = await c.scripting.getRegisteredContentScripts({ ids: [id] });
-          return list.map((entry) => ({
-            id: entry.id,
-            matches: entry.matches,
-            js: entry.js,
-            runAt: entry.runAt,
-          }));
-        } catch {
-          return [];
-        }
-      };
-      const engagementScripts = await fetchScripts('sidetrack-engagement');
-      const visualFingerprintScripts = await fetchScripts('sidetrack-visual-fingerprint');
-      // Trigger the SW's dev.diag stash. Two-step: send the message,
-      // then read chrome.storage.session in case the response races.
-      try {
-        await c.runtime.sendMessage({ type: 'sidetrack.dev.diag' });
-      } catch {
-        // ignore — fall back to storage read
-      }
-      await new Promise<void>((resolve) => {
-        setTimeout(() => {
-          resolve();
-        }, 250);
-      });
-      let devDiag: RuntimeDiagStash | null = null;
-      try {
-        const sessionStorage = (c.storage as { readonly session?: typeof c.storage.local })
-          .session;
-        if (sessionStorage !== undefined) {
-          const stash = await sessionStorage.get('sidetrack.dev.diag');
-          devDiag = (stash['sidetrack.dev.diag'] as RuntimeDiagStash | undefined) ?? null;
-        }
-      } catch {
-        devDiag = null;
-      }
+  // Read companion config + permissions + scripts + diag stash in one block.
+  // The CDP-attached browser is vanilla Playwright (not Patchright), so
+  // `page.evaluate(fn)` runs in the page's main world by default — no
+  // third `isolatedContext` argument needed (or supported).
+  const result: SidepanelProbeResult = await page.evaluate(async () => {
+    const c = (globalThis as unknown as { chrome?: typeof chrome }).chrome;
+    if (c === undefined) {
       return {
-        companionPort,
-        bridgeKey,
-        httpHostAccess,
-        engagementScripts,
-        visualFingerprintScripts,
-        devDiag,
+        companionPort: null,
+        bridgeKey: null,
+        httpHostAccess: null,
+        engagementScripts: [],
+        visualFingerprintScripts: [],
+        devDiag: null,
       };
-    },
-    undefined,
-    false,
-  );
+    }
+    const settingsKey = 'sidetrack.settings';
+    const got = await c.storage.local.get(settingsKey);
+    const settings = (got[settingsKey] ?? {}) as {
+      readonly companion?: { readonly port?: number; readonly bridgeKey?: string };
+    };
+    const companionPort =
+      typeof settings.companion?.port === 'number' ? settings.companion.port : null;
+    const bridgeKey =
+      typeof settings.companion?.bridgeKey === 'string' && settings.companion.bridgeKey.length > 0
+        ? settings.companion.bridgeKey
+        : null;
+    const httpHostAccess = await new Promise<boolean | null>((resolve) => {
+      try {
+        c.permissions.contains(
+          { origins: ['https://*/*', 'http://*/*'] },
+          (granted) => {
+            resolve(granted);
+          },
+        );
+      } catch {
+        resolve(null);
+      }
+    });
+    const fetchScripts = async (
+      id: string,
+    ): Promise<{ id: string; matches?: readonly string[]; js?: readonly string[]; runAt?: string }[]> => {
+      try {
+        const list = await c.scripting.getRegisteredContentScripts({ ids: [id] });
+        return list.map((entry) => ({
+          id: entry.id,
+          matches: entry.matches,
+          js: entry.js,
+          runAt: entry.runAt,
+        }));
+      } catch {
+        return [];
+      }
+    };
+    const engagementScripts = await fetchScripts('sidetrack-engagement');
+    const visualFingerprintScripts = await fetchScripts('sidetrack-visual-fingerprint');
+    // Trigger the SW's dev.diag stash. Two-step: send the message,
+    // then read chrome.storage.session in case the response races.
+    try {
+      await c.runtime.sendMessage({ type: 'sidetrack.dev.diag' });
+    } catch {
+      // ignore — fall back to storage read
+    }
+    await new Promise<void>((resolve) => {
+      setTimeout(() => {
+        resolve();
+      }, 250);
+    });
+    let devDiag: unknown = null;
+    try {
+      const sessionStorage = (c.storage as { readonly session?: typeof c.storage.local })
+        .session;
+      if (sessionStorage !== undefined) {
+        const stash = await sessionStorage.get('sidetrack.dev.diag');
+        devDiag = stash['sidetrack.dev.diag'] ?? null;
+      }
+    } catch {
+      devDiag = null;
+    }
+    return {
+      companionPort,
+      bridgeKey,
+      httpHostAccess,
+      engagementScripts,
+      visualFingerprintScripts,
+      devDiag,
+    };
+  });
   return {
     result,
     cleanup: async () => {
@@ -614,8 +610,8 @@ test.describe('manual attach diagnostics', () => {
         },
         engagementFailureClass: '',
         threadPropagationFailureClass: '',
-        runtimeDiagBefore: before.result.devDiag,
-        runtimeDiagAfter: after.result.devDiag,
+        runtimeDiagBefore: (before.result.devDiag as RuntimeDiagStash | null) ?? null,
+        runtimeDiagAfter: (after.result.devDiag as RuntimeDiagStash | null) ?? null,
       };
 
       // 10: classify failure modes.
