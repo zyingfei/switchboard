@@ -377,11 +377,34 @@ const readPrivacyProjection = async (): Promise<PrivacyProjectionPayload> => {
   };
 };
 
+// chrome.tabs.onUpdated can fire many times per navigation. Every call
+// of the gate predicate used to make an HTTP round-trip to the
+// companion (`/v1/privacy/projection`), which made the SW slow and
+// fragile: under contention the projection fetch could time out, the
+// gate would read as closed, and the listener would skip the
+// observation entirely. Cache the result for a short window. The cache
+// is busted whenever the gate flips via a Class A event handler so the
+// spec's `sidetrack.privacy.gateChanged` propagates immediately.
+const GATE_CACHE_TTL_MS = 5_000;
+let cachedTimelineGateState: { value: boolean; expiresAtMs: number } | null = null;
+
+const invalidateTimelineGateCache = (): void => {
+  cachedTimelineGateState = null;
+};
+
 const isTimelinePrivacyGateOpen = async (): Promise<boolean> => {
+  const now = Date.now();
+  if (cachedTimelineGateState !== null && cachedTimelineGateState.expiresAtMs > now) {
+    return cachedTimelineGateState.value;
+  }
   try {
     const projection = await readPrivacyProjection();
-    return projection.gateStates?.[TIMELINE_PRIVACY_GATE] === 'open';
+    const value = projection.gateStates?.[TIMELINE_PRIVACY_GATE] === 'open';
+    cachedTimelineGateState = { value, expiresAtMs: now + GATE_CACHE_TTL_MS };
+    return value;
   } catch {
+    // Don't cache failures — the companion may briefly be unreachable
+    // and we want the next call to retry rather than wedge "closed".
     return false;
   }
 };
@@ -3376,6 +3399,7 @@ export default defineBackground(() => {
         typeof message === 'object' &&
         (message as { type?: unknown }).type === 'sidetrack.privacy.gateChanged'
       ) {
+        invalidateTimelineGateCache();
         void syncPrivacyGatedContentScriptRegistrations()
           .then(() => {
             sendResponse({ ok: true } as unknown as RuntimeResponse);
@@ -3436,6 +3460,7 @@ export default defineBackground(() => {
         const enabled = (message as { enabled?: unknown }).enabled === true;
         void (async () => {
           await setTimelinePrivacyGate(enabled);
+          invalidateTimelineGateCache();
           resetTimelineWiringForTests();
           await initializeTimelineWiring({
             readCompanion: readTimelineCompanionConfig,
@@ -3519,6 +3544,7 @@ export default defineBackground(() => {
               : undefined;
         void (async () => {
           await bootstrapTimelinePrivacyGate().catch(() => undefined);
+          invalidateTimelineGateCache();
           if (explicitWorkstreamId !== undefined) {
             // Strings of length 0 are normalised to "remove the key"
             // so the cache returns to the unfocused state.
