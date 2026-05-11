@@ -778,14 +778,27 @@ const App = () => {
   useEffect(() => {
     if (typeof chrome === 'undefined' || chrome.tabs === undefined) return undefined;
     let cancelled = false;
+    // Only http(s) URLs can be tracked. The side panel page itself
+    // (chrome-extension://…) often comes back as "active" when its
+    // window is focused, especially in stealth Chromium contexts where
+    // the side panel surface is opened as a regular tab. Without this
+    // filter, the Current-tab card rendered "Sidetrack (capturing…)"
+    // for the side panel's own URL. chrome:// / file:// / about: tabs
+    // are never observed by the timeline wiring, so leaving the live
+    // state at undefined is the honest answer.
+    const isTrackableScheme = (url: string): boolean =>
+      url.startsWith('https://') || url.startsWith('http://');
     const refresh = (): void => {
       try {
         chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
           if (cancelled) return;
           const url = tabs[0]?.url;
           const title = tabs[0]?.title;
-          setLiveActiveTabUrl(url === undefined || url.length === 0 ? undefined : url);
-          setLiveActiveTabTitle(title === undefined || title.length === 0 ? undefined : title);
+          const trackable = url !== undefined && url.length > 0 && isTrackableScheme(url);
+          setLiveActiveTabUrl(trackable ? url : undefined);
+          setLiveActiveTabTitle(
+            trackable && title !== undefined && title.length > 0 ? title : undefined,
+          );
         });
       } catch {
         // Test harness — leave state untouched.
