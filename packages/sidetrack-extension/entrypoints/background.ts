@@ -3596,6 +3596,27 @@ export default defineBackground(() => {
           });
         return true;
       }
+      // Always-available diagnostic for the title-push pipeline. Run
+      // from the side-panel DevTools console (since the SW console may
+      // be hard to reach in stealth Chromium):
+      //   chrome.runtime.sendMessage({type:'sidetrack.dev.diag'}, console.log)
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.dev.diag'
+      ) {
+        void readTimelineReplayDiagnostics()
+          .then((diagnostics) => {
+            sendResponse({ ok: true, diagnostics } as unknown as RuntimeResponse);
+          })
+          .catch((error: unknown) => {
+            sendResponse({
+              ok: false,
+              error: error instanceof Error ? error.message : 'diag failed',
+            } as unknown as RuntimeResponse);
+          });
+        return true;
+      }
       // Content-script title push (entrypoints/title-watcher.content.ts).
       // Bypasses tab.title's stealth-Chromium blind spots by reading
       // document.title directly from the page DOM. Fire-and-forget;

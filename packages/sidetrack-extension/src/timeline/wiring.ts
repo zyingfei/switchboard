@@ -115,6 +115,12 @@ let onUpdatedSequence = 0;
 let observerObserveCalls = 0;
 let observerCloseCalls = 0;
 let triggerDrainCalls = 0;
+let contentTitleSinkHits = 0;
+let contentTitleSinkSkippedNotInit = 0;
+let contentTitleSinkSkippedGateClosed = 0;
+let contentTitleSinkSkippedUntrackable = 0;
+let lastContentTitleAt: string | null = null;
+let lastContentTitleValue: string | null = null;
 type TimelineGateBoundary =
   | 'init'
   | 'onActivated'
@@ -193,6 +199,15 @@ export interface TimelineWiringDiagnostics {
   readonly lastOnUpdated: TimelineOnUpdatedDiagnostic | null;
   readonly lastObserveRequest: TimelineObserveRequestDiagnostic | null;
   readonly lastDrainTrigger: TimelineDrainTriggerDiagnostic | null;
+  readonly contentTitleSink: {
+    readonly hits: number;
+    readonly skippedNotInit: number;
+    readonly skippedGateClosed: number;
+    readonly skippedUntrackable: number;
+    readonly lastAt: string | null;
+    readonly lastValue: string | null;
+    readonly sinkAttached: boolean;
+  };
 }
 
 export interface TimelineReplayDiagnostics {
@@ -409,7 +424,11 @@ export const recordTitleFromContent = async (input: {
   readonly url: string;
   readonly title: string;
 }): Promise<void> => {
+  contentTitleSinkHits += 1;
+  lastContentTitleAt = new Date().toISOString();
+  lastContentTitleValue = input.title;
   if (contentTitleSink === null) {
+    contentTitleSinkSkippedNotInit += 1;
     // eslint-disable-next-line no-console
     console.warn(
       '[sidetrack:title-sink] dropped (sink not initialized — gate closed or pre-init)',
@@ -523,12 +542,14 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
   // and Current-tab card light up as fast as All Threads does.
   contentTitleSink = async (input) => {
     if (!isTrackableUrl(input.url)) {
+      contentTitleSinkSkippedUntrackable += 1;
       // eslint-disable-next-line no-console
       console.warn('[sidetrack:title-sink] non-trackable URL', input.url);
       return;
     }
     const gateOpen = await readTimelineGateState();
     if (!gateOpen) {
+      contentTitleSinkSkippedGateClosed += 1;
       // eslint-disable-next-line no-console
       console.warn('[sidetrack:title-sink] gate closed', input.url);
       return;
@@ -872,6 +893,15 @@ export const readTimelineReplayDiagnostics = async (): Promise<TimelineReplayDia
     lastOnUpdated,
     lastObserveRequest,
     lastDrainTrigger,
+    contentTitleSink: {
+      hits: contentTitleSinkHits,
+      skippedNotInit: contentTitleSinkSkippedNotInit,
+      skippedGateClosed: contentTitleSinkSkippedGateClosed,
+      skippedUntrackable: contentTitleSinkSkippedUntrackable,
+      lastAt: lastContentTitleAt,
+      lastValue: lastContentTitleValue,
+      sinkAttached: contentTitleSink !== null,
+    },
   },
   observer: getTimelineObserverDiagnostics(),
   materializer: await getTimelineMaterializerDiagnostics(),
