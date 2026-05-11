@@ -6,6 +6,13 @@ import {
 import { buildEngagementClassRevision } from '../../connections/engagementClassifier.js';
 import { readVaultStores } from '../../connections/loader.js';
 import {
+  collectMaterializerDiagnostics,
+  createMaterializerDiagnosticsStore,
+  logMaterializerDiagnostics,
+  type MaterializerDiagnostics,
+  type MaterializerDiagnosticsStore,
+} from '../../connections/materializerDiagnostics.js';
+import {
   buildConnectionsSnapshot,
   type ClosestVisitRanker,
   type ConnectionsInput,
@@ -18,6 +25,7 @@ import {
 } from '../../connections/topicClusterer.js';
 import { buildHdbscanTopicRevision } from '../../connections/hdbscanClusterer.js';
 import {
+  VISIT_SIMILARITY_DEFAULT_ENGAGEMENT_GATE_MS,
   buildVisitSimilarity,
   type VisitSimilarityEmbedder,
 } from '../../connections/visitSimilarity.js';
@@ -159,6 +167,9 @@ export interface CreateConnectionsMaterializerDeps {
   readonly topicRevisionStore?: TopicRevisionStore;
   readonly engagementClassStore?: EngagementClassRevisionStore;
   readonly rankerRetrainer?: RankerRetrainer;
+  readonly diagnosticsStore?: MaterializerDiagnosticsStore;
+  readonly diagnosticsLogger?: (diagnostics: MaterializerDiagnostics) => void;
+  readonly diagnosticsNow?: () => Date;
 }
 
 type TopicRevisionBuilder = (input: BuildTopicRevisionInput) => Promise<TopicRevision>;
@@ -188,6 +199,10 @@ export const createConnectionsMaterializer = (
   const rankerRetrainer =
     deps.rankerRetrainer ??
     ((context) => maybeRetrainClosestVisitRanker({ vaultRoot: deps.vaultRoot, ...context }));
+  const diagnosticsStore =
+    deps.diagnosticsStore ?? createMaterializerDiagnosticsStore(deps.vaultRoot);
+  const diagnosticsLogger = deps.diagnosticsLogger ?? logMaterializerDiagnostics;
+  const diagnosticsNow = deps.diagnosticsNow ?? ((): Date => new Date());
   let pending = false;
   let running = false;
   let dirty = false;
@@ -376,33 +391,52 @@ export const createConnectionsMaterializer = (
       ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
     });
     await topicRevisionStore.putActiveRevision(topicRevision);
+    const urlProjection = projectUrls(merged);
     const input: ConnectionsInput = {
       events: merged,
       ...vault,
       timelineDays,
       tabSessionProjection: projectTabSessions(merged),
-      urlProjection: projectUrls(merged),
+      urlProjection,
       visitSimilarity,
       topicRevision,
       engagementClassRevision,
     };
     const baseSnapshot = buildConnectionsSnapshot(input);
-    await rankerRetrainer({ merged, snapshot: baseSnapshot });
+    const rankerRetrainResult = await rankerRetrainer({ merged, snapshot: baseSnapshot });
     const closestVisitRanker = await loadClosestVisitRanker();
-    if (closestVisitRanker === null) {
-      await deps.store.putCurrent(baseSnapshot);
-      return;
-    }
-
+    let finalSnapshot = baseSnapshot;
     try {
-      const snapshot = buildConnectionsSnapshot({
-        ...input,
-        closestVisitRanker: closestVisitRanker.ranker,
-      });
-      await deps.store.putCurrent(snapshot);
+      if (closestVisitRanker !== null) {
+        finalSnapshot = buildConnectionsSnapshot({
+          ...input,
+          closestVisitRanker: closestVisitRanker.ranker,
+        });
+      }
+      await deps.store.putCurrent(finalSnapshot);
     } finally {
-      closestVisitRanker.model.dispose();
+      closestVisitRanker?.model.dispose();
     }
+    const diagnostics = collectMaterializerDiagnostics({
+      producedAt: diagnosticsNow().toISOString(),
+      maxAcceptedAtMs: maxAcceptedAtMs(merged),
+      engagementGateMs: VISIT_SIMILARITY_DEFAULT_ENGAGEMENT_GATE_MS,
+      timelineEntries: timelineDays.flatMap((day) => day.entries),
+      visitSimilarity,
+      topicRevision,
+      rankerRetrainResult,
+      events: merged,
+      urlProjection,
+      snapshot: finalSnapshot,
+    });
+    try {
+      await diagnosticsStore.write(diagnostics);
+    } catch (err) {
+      // Diagnostics is observability — never fail the drain on its IO.
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[materializer-diag] write failed: ${message}`);
+    }
+    diagnosticsLogger(diagnostics);
   };
 
   const drain = async (): Promise<void> => {
