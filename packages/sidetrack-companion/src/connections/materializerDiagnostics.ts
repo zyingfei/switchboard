@@ -12,6 +12,7 @@
 import { mkdir, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
+import { ENGAGEMENT_SESSION_AGGREGATED } from '../engagement/events.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../tabsession/events.js';
 import {
   USER_ORGANIZED_ITEM,
@@ -97,6 +98,17 @@ export interface MaterializerInferredEventCounters {
   readonly tabSessionAttributionInferredCount: number;
 }
 
+// Stage 5 follow-up — diagnostic counters for the engagement
+// subsystem, which is upstream of similarity / topic gates. Lets the
+// operator distinguish "extension never emitted engagement events"
+// (sessionAggregatedCount = 0) from "events arrived but recorded zero
+// focused window" (count > 0 but sumFocusedWindowMs = 0).
+export interface MaterializerEngagementCounters {
+  readonly sessionAggregatedCount: number;
+  readonly sumFocusedWindowMs: number;
+  readonly maxFocusedWindowMs: number;
+}
+
 export interface MaterializerUrlCounters {
   readonly canonicalUrlCount: number;
   readonly attributedCanonicalUrlCount: number;
@@ -123,6 +135,7 @@ export interface MaterializerDiagnostics {
   readonly ranker: MaterializerRankerCounters;
   readonly userAssertions: MaterializerUserAssertionCounters;
   readonly inferred: MaterializerInferredEventCounters;
+  readonly engagement: MaterializerEngagementCounters;
   readonly urls: MaterializerUrlCounters;
   readonly snapshot: MaterializerSnapshotCounters;
 }
@@ -284,16 +297,34 @@ const collectRankerCounters = (
   }
 };
 
+const isRecordLite = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const focusedWindowMsFromEngagementPayload = (payload: unknown): number => {
+  if (!isRecordLite(payload)) return 0;
+  const dimensions = payload['dimensions'];
+  if (!isRecordLite(dimensions)) return 0;
+  const engagement = dimensions['engagement'];
+  if (!isRecordLite(engagement)) return 0;
+  const focused = engagement['focusedWindowMs'];
+  if (typeof focused !== 'number' || !Number.isFinite(focused) || focused < 0) return 0;
+  return focused;
+};
+
 const collectEventCounters = (
   events: readonly AcceptedEvent[],
 ): {
   readonly userAssertions: MaterializerUserAssertionCounters;
   readonly inferred: MaterializerInferredEventCounters;
+  readonly engagement: MaterializerEngagementCounters;
 } => {
   const byItemKind = emptyUserAssertionsByKind();
   let total = 0;
   let urlAttributionInferredCount = 0;
   let tabSessionAttributionInferredCount = 0;
+  let sessionAggregatedCount = 0;
+  let sumFocusedWindowMs = 0;
+  let maxFocusedWindowMs = 0;
   for (const event of events) {
     if (event.type === USER_ORGANIZED_ITEM && isUserOrganizedItemPayload(event.payload)) {
       byItemKind[event.payload.itemKind] += 1;
@@ -308,10 +339,18 @@ const collectEventCounters = (
       tabSessionAttributionInferredCount += 1;
       continue;
     }
+    if (event.type === ENGAGEMENT_SESSION_AGGREGATED) {
+      sessionAggregatedCount += 1;
+      const focused = focusedWindowMsFromEngagementPayload(event.payload);
+      sumFocusedWindowMs += focused;
+      if (focused > maxFocusedWindowMs) maxFocusedWindowMs = focused;
+      continue;
+    }
   }
   return {
     userAssertions: { byItemKind, total },
     inferred: { urlAttributionInferredCount, tabSessionAttributionInferredCount },
+    engagement: { sessionAggregatedCount, sumFocusedWindowMs, maxFocusedWindowMs },
   };
 };
 
@@ -373,6 +412,7 @@ export const collectMaterializerDiagnostics = (
     ranker: collectRankerCounters(input.rankerRetrainResult),
     userAssertions: eventCounters.userAssertions,
     inferred: eventCounters.inferred,
+    engagement: eventCounters.engagement,
     urls: collectUrlCounters(input.urlProjection),
     snapshot: collectSnapshotCounters(input.snapshot),
   };
@@ -386,6 +426,7 @@ export const summarizeMaterializerDiagnostics = (
     `edges=${String(diagnostics.snapshot.edgeCount)}`,
     `visits=${String(diagnostics.timeline.entryCount)}`,
     `engagementEligible=${String(diagnostics.timeline.engagementEligibleEntryCount)}`,
+    `engagementEvents=${String(diagnostics.engagement.sessionAggregatedCount)}`,
     `simEdges=${String(diagnostics.similarity.edgeCount)}(${diagnostics.similarity.producer})`,
     `topics=${String(diagnostics.topics.topicCount)}`,
     `topicMembers=${String(diagnostics.topics.memberCount)}`,

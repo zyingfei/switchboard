@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { ENGAGEMENT_SESSION_AGGREGATED } from '../engagement/events.js';
 import {
   USER_ORGANIZED_ITEM,
   type UserOrganizedItemPayload,
@@ -377,6 +378,39 @@ describe('collectMaterializerDiagnostics', () => {
     expect(diag.snapshot.edgeCountByKind['visit_instance_in_workstream']).toBe(2);
     expect(diag.snapshot.nodeCountByKind['visit-instance']).toBe(3);
     expect(diag.snapshot.nodeCountByKind['workstream']).toBe(1);
+  });
+
+  it('counts engagement.session.aggregated events and aggregates focusedWindowMs', () => {
+    const engagementEvent = (focusedWindowMs: number, seq: number): AcceptedEvent =>
+      event({
+        type: ENGAGEMENT_SESSION_AGGREGATED,
+        payload: { dimensions: { engagement: { focusedWindowMs } } },
+        clientEventId: `engagement-${String(seq)}`,
+        dot: { replicaId: 'rep-1', seq },
+      });
+    const diag = collectMaterializerDiagnostics(
+      baseInput({
+        events: [
+          engagementEvent(1_200, 1),
+          engagementEvent(5_500, 2),
+          engagementEvent(0, 3),
+        ],
+      }),
+    );
+    expect(diag.engagement).toEqual({
+      sessionAggregatedCount: 3,
+      sumFocusedWindowMs: 6_700,
+      maxFocusedWindowMs: 5_500,
+    });
+  });
+
+  it('reports zeros when no engagement.session.aggregated events arrive', () => {
+    const diag = collectMaterializerDiagnostics(baseInput());
+    expect(diag.engagement).toEqual({
+      sessionAggregatedCount: 0,
+      sumFocusedWindowMs: 0,
+      maxFocusedWindowMs: 0,
+    });
   });
 
   it('reports the effective similarity config the materializer forwarded', () => {
