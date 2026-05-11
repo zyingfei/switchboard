@@ -462,6 +462,7 @@ SIDETRACK_TOPIC_ENGAGEMENT_GATE_MS                          default 5000
 SIDETRACK_RANKER_RETRAIN_MIN_LABELS                         default 50
 SIDETRACK_TIMELINE_SAME_URL_AS_THREAD_TITLE_JACCARD         default 0.25
 SIDETRACK_TIMELINE_SAME_URL_AS_THREAD_RECENCY_WINDOW_MS     default 24 h
+SIDETRACK_TIMELINE_STRIP_MARKETING_PARAMS                   default on
 ```
 
 User-asserted relations bypass `SIDETRACK_TOPIC_ENGAGEMENT_GATE_MS` —
@@ -469,6 +470,13 @@ the user's intent (organizing a URL into a workstream) is treated as
 a stronger signal than focused-window time. Similarity edges still
 honor the gate so noisy short visits don't pull peripheral URLs into
 a topic.
+
+`SIDETRACK_TIMELINE_STRIP_MARKETING_PARAMS=on` (default) collapses
+`utm_*`, `gclid`, `gbraid`, `hsa_*`, `gad_*`, `fbclid`, `msclkid`,
+`mc_*`, and other ad-tracking parameters before recording the URL,
+so the same content opened from different campaigns shares one
+canonical URL. Per-site rule overrides (e.g. keeping `utm_source` on
+a marketing-analytics dashboard host) are a Stage 5.1 follow-up.
 
 For the track-by-track plan see
 [`docs/proposals/work-graph-stage5-data-bridge.md`](proposals/work-graph-stage5-data-bridge.md).
