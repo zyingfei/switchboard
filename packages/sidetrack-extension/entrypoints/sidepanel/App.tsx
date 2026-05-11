@@ -637,6 +637,14 @@ const App = () => {
   const [urlInbox, setUrlInbox] = useState<UrlInboxData>(EMPTY_URL_INBOX);
   const [urlProjection, setUrlProjection] = useState<UrlProjection | null>(null);
   const [urlSuggestions, setUrlSuggestions] = useState<Record<string, UrlResolutionResult>>({});
+  // Stage 5 follow-up — refs let loadTabSessions read the latest
+  // suggestion cache without listing it as a dep (which would
+  // re-create the callback + tear down the 4s interval on every
+  // suggestion update).
+  const tabSessionSuggestionsRef = useRef(tabSessionSuggestions);
+  tabSessionSuggestionsRef.current = tabSessionSuggestions;
+  const urlSuggestionsRef = useRef(urlSuggestions);
+  urlSuggestionsRef.current = urlSuggestions;
   const [pendingCodingOffers, setPendingCodingOffers] = useState<readonly OfferRecord[]>([]);
   // Per-row dismissals for the Needs-Organize inline suggestion. Local
   // (per-session) — survives panel close but not extension reload.
@@ -931,10 +939,22 @@ const App = () => {
     [bridgeKey, port],
   );
 
+  // Stage 5 follow-up — `/resolve?dryRun=true` runs the full
+  // resolver pipeline (PPR + cluster + similarity + ranker fusion) on
+  // the companion. Firing it for every unattributed item on every 4 s
+  // poll dominated the panel's HTTP budget AND the companion's CPU as
+  // the graph grew. Cache results per id; only fetch resolves for ids
+  // we haven't seen yet, or for ids the caller marks dirty via
+  // `forceRefetch`.
+  //
+  // The cache is invalidated entirely on user mutation (attribution,
+  // dismiss) because those change the resolver inputs.
   const loadTabSessionSuggestions = useCallback(
     async (
       projection: TabSessionProjection,
       inbox: TabSessionInboxData,
+      previous: Readonly<Record<string, TabSessionResolutionResult>>,
+      forceRefetch = false,
     ): Promise<Record<string, TabSessionResolutionResult>> => {
       const recordsById = new Map<string, TabSessionRecord>();
       for (const record of Object.values(projection.bySessionId)) {
@@ -947,8 +967,16 @@ const App = () => {
           recordsById.set(record.tabSessionId, record);
         }
       }
-      const entries = await Promise.all(
-        [...recordsById.keys()].map(async (tabSessionId) => {
+      // Drop cached entries for ids no longer in the inbox.
+      const next: Record<string, TabSessionResolutionResult> = {};
+      for (const id of recordsById.keys()) {
+        if (!forceRefetch && previous[id] !== undefined) next[id] = previous[id];
+      }
+      const idsToFetch = [...recordsById.keys()].filter((id) =>
+        forceRefetch ? true : next[id] === undefined,
+      );
+      const fetched = await Promise.all(
+        idsToFetch.map(async (tabSessionId) => {
           try {
             const result = await fetchCompanionJson<unknown>(
               `/v1/tabsessions/${encodeURIComponent(tabSessionId)}/resolve?dryRun=true`,
@@ -959,25 +987,35 @@ const App = () => {
           }
         }),
       );
-      return Object.fromEntries(
-        entries.filter(
-          (entry): entry is readonly [string, TabSessionResolutionResult] => entry !== null,
-        ),
-      );
+      for (const entry of fetched) {
+        if (entry !== null) next[entry[0]] = entry[1];
+      }
+      return next;
     },
     [fetchCompanionJson],
   );
 
   // Resolve every unattributed URL in the Inbox so the cards can show
-  // "Best guess: …" inline. Run in parallel; missing/errored URLs
-  // silently drop out of the result.
+  // "Best guess: …" inline. Cached across polls; refetched on user
+  // mutation.
   const loadUrlSuggestions = useCallback(
-    async (inbox: UrlInboxData): Promise<Record<string, UrlResolutionResult>> => {
+    async (
+      inbox: UrlInboxData,
+      previous: Readonly<Record<string, UrlResolutionResult>>,
+      forceRefetch = false,
+    ): Promise<Record<string, UrlResolutionResult>> => {
       const canonicalUrls = inbox.items
         .filter((item) => item.currentAttribution === undefined)
         .map((item) => item.canonicalUrl);
-      const entries = await Promise.all(
-        canonicalUrls.map(async (canonicalUrl) => {
+      const next: Record<string, UrlResolutionResult> = {};
+      for (const url of canonicalUrls) {
+        if (!forceRefetch && previous[url] !== undefined) next[url] = previous[url];
+      }
+      const toFetch = canonicalUrls.filter((url) =>
+        forceRefetch ? true : next[url] === undefined,
+      );
+      const fetched = await Promise.all(
+        toFetch.map(async (canonicalUrl) => {
           try {
             const result = await fetchCompanionJson<unknown>(
               `/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve?dryRun=true`,
@@ -988,9 +1026,10 @@ const App = () => {
           }
         }),
       );
-      return Object.fromEntries(
-        entries.filter((entry): entry is readonly [string, UrlResolutionResult] => entry !== null),
-      );
+      for (const entry of fetched) {
+        if (entry !== null) next[entry[0]] = entry[1];
+      }
+      return next;
     },
     [fetchCompanionJson],
   );
@@ -1007,8 +1046,11 @@ const App = () => {
   // the next successful refresh, which is the actual signal the user
   // wants.
   const loadTabSessions = useCallback(
-    async (options: { readonly background?: boolean } = {}): Promise<void> => {
+    async (
+      options: { readonly background?: boolean; readonly forceRefetchSuggestions?: boolean } = {},
+    ): Promise<void> => {
       const background = options.background === true;
+      const forceRefetch = options.forceRefetchSuggestions === true;
       if (port.length === 0 || bridgeKey.length === 0) {
         setTabSessionProjection(null);
         setTabSessionInbox(EMPTY_TAB_SESSION_INBOX);
@@ -1032,7 +1074,14 @@ const App = () => {
         }
         setTabSessionProjection(tabProjection);
         setTabSessionInbox(tabInbox);
-        setTabSessionSuggestions(await loadTabSessionSuggestions(tabProjection, tabInbox));
+        setTabSessionSuggestions(
+          await loadTabSessionSuggestions(
+            tabProjection,
+            tabInbox,
+            tabSessionSuggestionsRef.current,
+            forceRefetch,
+          ),
+        );
         // Successful fetch — clear any error banner left over from a
         // prior poll. Doing it here (vs at start) keeps the banner
         // sticky until the situation actually recovers.
@@ -1064,7 +1113,9 @@ const App = () => {
         if (isUrlProjection(urlProj) && isUrlInboxData(urlInboxResp)) {
           setUrlProjection(urlProj);
           setUrlInbox(urlInboxResp);
-          setUrlSuggestions(await loadUrlSuggestions(urlInboxResp));
+          setUrlSuggestions(
+            await loadUrlSuggestions(urlInboxResp, urlSuggestionsRef.current, forceRefetch),
+          );
         } else {
           // eslint-disable-next-line no-console
           console.warn('[sidetrack:panel] loadTabSessions — invalid /v1/visits payload');
@@ -1917,7 +1968,8 @@ const App = () => {
     if (!response.ok) {
       throw new Error(`Tab-session attribution failed (${String(response.status)}).`);
     }
-    await loadTabSessions();
+    // User mutation — refetch resolver suggestions (cache is stale).
+    await loadTabSessions({ forceRefetchSuggestions: true });
     return await sendRequest({ type: messageTypes.getWorkboardState });
   };
 
@@ -1945,7 +1997,8 @@ const App = () => {
     if (!response.ok) {
       throw new Error(`URL attribution failed (${String(response.status)}).`);
     }
-    await loadTabSessions();
+    // User mutation — refetch resolver suggestions (cache is stale).
+    await loadTabSessions({ forceRefetchSuggestions: true });
     return await sendRequest({ type: messageTypes.getWorkboardState });
   };
 
