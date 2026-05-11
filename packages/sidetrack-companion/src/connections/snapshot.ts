@@ -1312,6 +1312,18 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
     // edges — the user attributes pages, not tabs. Tab-session attribution
     // still drives `tab_session_in_workstream` and acts as a fallback when
     // no URL attribution exists yet.
+    //
+    // Stage 5 / T6 — `tab_session_in_workstream` is intentionally
+    // dormant in dogfood post-Phase-B: the side panel currently routes
+    // user moves to `itemKind='canonical-url'`, so user-asserted
+    // tab-session attributions arrive only from cross-replica sync or
+    // legacy clients. Do not delete the projection / route / emission
+    // path — it remains the only way tab-group pulls, sticky labels,
+    // and older replicas express attribution. T1 diagnostics report
+    // `tabSessionAttributionInferredCount` and
+    // `userAssertions.byItemKind['tab-session']` so dormancy is
+    // measurable. See `docs/architecture.md` § Stage 5 / Class B edge
+    // inventory.
     const lookupCanonical = instance.canonicalUrl ?? instance.url;
     const urlAttribution =
       lookupCanonical === undefined

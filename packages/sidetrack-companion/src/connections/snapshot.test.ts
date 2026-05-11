@@ -383,7 +383,7 @@ describe('connections — snapshot reducer (Given/Then)', () => {
           lastSeenAt: '2026-05-07T10:30:00.000Z',
           url: 'https://chatgpt.com/c/abc',
           canonicalUrl: 'https://chatgpt.com/c/abc',
-          provider: 'unknown',
+          provider: 'generic',
           title: 'Quarterly revenue spreadsheet',
           visitCount: 1,
         },

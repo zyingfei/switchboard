@@ -403,6 +403,69 @@ and
 For the "write your own collector" guide, see
 [`docs/adding-a-collector.md`](adding-a-collector.md).
 
+## Stage 5 — close the data bridge
+
+Stage 1–3 shipped the producers (similarity, topics, ranker), the
+reducer, the resolver, and the snapshot. In dogfood the pipelines run
+but the snapshots are dark: zero similarity edges, zero topics, zero
+trained ranker revisions. Stage 5 closes that bridge without changing
+the architecture.
+
+### Class B edge inventory — dormant vs active
+
+`visit_instance_in_workstream` (URL-first): **active**. This is the
+primary attribution edge family. Each visit-instance picks the
+strongest available attribution — URL beats tab-session — and the edge
+records `producedBy.eventType` so the diagnostics can attribute the
+source.
+
+`tab_session_in_workstream`: **intentionally dormant** post-Phase-B.
+The routes, projection, and inferred-event family
+(`tabsession.attribution.inferred`) all remain in the codebase to
+support older replicas, tab-group flows, and the future return of a UX
+surface that flips `user.organized.item itemKind='tab-session'`
+events. Stage 5 / T1 diagnostics report
+`tabSessionAttributionInferredCount` + `userAssertions.byItemKind['tab-session']`
+so dormant ≠ broken. Do not delete the projection or the
+`tab_session_in_workstream` emission path.
+
+`timeline_same_url_as_thread`: **demoted, not deleted**. Stage 5 / T5
+gated the edge on `(provider match OR title-Jaccard ≥ 0.25) AND
+recency ≤ 24 h`. Edges that pass keep `confidence: 'inferred'` and
+carry a `metadata.evidence` blob recording which gates fired. Edges
+that don't pass are dropped at emission time.
+
+### Observability bar
+
+Every snapshot rebuild writes
+`_BAC/connections/diagnostics/latest.json` + per-rebuild
+`history/<iso>.json` capturing: timeline eligibility (entries, focused
+window, engagement gate), similarity (edge count + producer, embedding
+vs lexical), topics (component sizes, member count), ranker (status +
+skip reason + label counts), user assertions (by `itemKind`), inferred
+attribution event counts, URL projection attribution, snapshot
+node/edge counts by kind, attributed visit-instance count. A single
+`[materializer-diag]` line is emitted to stderr per drain. Track-level
+acceptance bars (T2 similarity edges ≥ 0, T4 ranker reaches `trained`
+when labels accumulate, T5 demoted edges retain `metadata.evidence`,
+etc.) are checked against these counters, not against "the code runs."
+
+### Env knobs (production defaults unchanged)
+
+```text
+SIDETRACK_SIMILARITY_THRESHOLD                              default 0.85
+SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS                      default 5000
+SIDETRACK_SIMILARITY_TOP_K                                  default 50
+SIDETRACK_SIMILARITY_LEXICAL_THRESHOLD                      default 0.30
+SIDETRACK_SIMILARITY_LEXICAL_FALLBACK                       default on
+SIDETRACK_RANKER_RETRAIN_MIN_LABELS                         default 50
+SIDETRACK_TIMELINE_SAME_URL_AS_THREAD_TITLE_JACCARD         default 0.25
+SIDETRACK_TIMELINE_SAME_URL_AS_THREAD_RECENCY_WINDOW_MS     default 24 h
+```
+
+For the track-by-track plan see
+[`docs/proposals/work-graph-stage5-data-bridge.md`](proposals/work-graph-stage5-data-bridge.md).
+
 ## The most important design principle
 
 > **Facts are event-sourced. Interpretations are versioned. Suggestions
