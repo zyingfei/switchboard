@@ -4782,11 +4782,6 @@ const App = () => {
               Change…
             </button>
           ) : null}
-          {currentWsId !== focusedTabSession?.currentAttribution?.workstreamId ? (
-            <span className="tab-attribution-card-intent mono" title="Active workstream pill (default for new captures)">
-              Intent: {currentWsLabel}
-            </span>
-          ) : null}
         </div>
       </section>
 
