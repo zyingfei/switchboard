@@ -1,7 +1,13 @@
 // Manual full-browser recorder — NOT a CI test.
 //
-// Run with:
-//   npm run e2e:recorder            # or, for muscle memory: e2e:manual-l5-recorder
+// Run with (one-liner from repo root):
+//   git pull && npm --prefix packages/sidetrack-extension run e2e:recorder \
+//     2>&1 | tee /tmp/sidetrack-recorder.log
+//
+// `e2e:recorder` runs in stealth mode by default (Patchright-driven
+// Chromium so chatgpt.com / claude.ai / gemini.google.com don't fight
+// the automation flag). The legacy script names `e2e:manual-l5-recorder`
+// and `e2e:manual-stealth-experiment` are aliases.
 //
 // The browser stays open until stdin advances the prompts:
 //   1. (only when an existing vault is detected) keep [Enter] / new vault [n]
