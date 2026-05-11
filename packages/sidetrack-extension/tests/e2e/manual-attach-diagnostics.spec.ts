@@ -9,30 +9,33 @@
 //     SIDETRACK_E2E_CDP_URL=http://localhost:9222 \
 //       npm --prefix packages/sidetrack-extension run e2e:attach-diag
 //
-// What it does — without asking the operator to manually click
-// anything in the side panel:
+// What it does (default = self-bootstrap mode) — without asking the
+// operator to manually click anything in the side panel:
 //
 //   1. Connects over CDP to the already-running Chrome.
 //   2. Wakes the MV3 service worker (opens chrome-extension://*/sidepanel.html).
-//   3. Reads chrome.storage.local to find companion port + bridge key.
-//   4. Asks the SW for its dev.diag stash and falls back to
-//      chrome.storage.session if the message port closes.
-//   5. Inspects chrome.permissions (host access for engagement) and
-//      chrome.scripting.getRegisteredContentScripts.
-//   6. Opens a benign https tab (Wikipedia main page) for ~8 seconds
-//      so the engagement aggregator has a chance to fire, then queries
-//      the SW again.
-//   7. Calls the SW's `sidetrack.timeline.force-drain`.
-//   8. Hits the companion's HTTP for vault/version/materializer/
-//      threads/URL-projection data.
-//   9. Computes per-condition classifications for engagement and
-//      thread→URL propagation.
-//  10. Writes a JSON report under test-results/attach-diag.json AND
-//      prints the report to stdout.
+//   3. Spawns a temp companion process (startTestCompanion).
+//   4. Writes companion settings into chrome.storage.local so the SW
+//      knows where to reach the companion.
+//   5. POSTs `privacy.gate.flipped` for the 'timeline' + 'engagement'
+//      gates so the SW's privacy projection reads "open".
+//   6. Sends `sidetrack.timeline.reinit` + `sidetrack.privacy.gateChanged`
+//      runtime messages so the SW re-runs initializeTimelineWiring and
+//      registers chrome.tabs listeners.
+//   7. Probes everything: chrome.permissions, registered content
+//      scripts, dev.diag stash.
+//   8. Opens a benign https tab (Wikipedia main page) and a Google
+//      search URL for ~8 seconds each so engagement + timeline
+//      observation get a chance to fire, then queries the SW again.
+//   9. Calls the SW's `sidetrack.timeline.force-drain`.
+//  10. Hits the companion's HTTP for /v1/version, /v1/privacy/projection,
+//      /v1/threads/projections, /v1/visits/projection, and reads the
+//      materializer diagnostic from the spawned vault.
+//  11. Computes per-condition classifications for engagement +
+//      thread→URL propagation and writes the JSON report.
 //
-// The whole spec runs without operator interaction. If something
-// fails it produces an EVIDENCE BLOCK identifying which exact
-// condition failed.
+// Skip self-bootstrap with SIDETRACK_E2E_ATTACH_DIAG_LIVE=1 — then it
+// probes whatever state the chrome-debug session already has.
 
 import { mkdir, readFile, writeFile, stat as statFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -40,6 +43,10 @@ import { fileURLToPath } from 'node:url';
 
 import { expect, test } from '@playwright/test';
 
+import {
+  startTestCompanion,
+  type TestCompanion,
+} from './helpers/companion';
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('../../../../', import.meta.url)));
@@ -372,6 +379,128 @@ const classifyThreadPropagationFailure = (
   return 'ok';
 };
 
+// --- Self-bootstrap helpers ----------------------------------------
+
+const openPrivacyGateViaCompanion = async (
+  companion: TestCompanion,
+  gate: string,
+): Promise<void> => {
+  const idempotencyKey = `attach-diag-gate-${gate}-${String(Date.now())}`;
+  const response = await fetch(
+    `http://127.0.0.1:${String(companion.port)}/v1/privacy/events`,
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': companion.bridgeKey,
+        'idempotency-key': idempotencyKey,
+      },
+      body: JSON.stringify({
+        type: 'privacy.gate.flipped',
+        payload: {
+          payloadVersion: 1,
+          gate,
+          state: 'open',
+          actor: 'user',
+          reason: 'attach-diag',
+        },
+      }),
+    },
+  );
+  if (!response.ok) {
+    throw new Error(`openPrivacyGate(${gate}) failed: HTTP ${String(response.status)}`);
+  }
+};
+
+// Configure the extension's chrome.storage.local with companion
+// settings, then nudge the SW to re-init. Required because attaching
+// to a fresh chrome-debug session leaves the extension unconfigured —
+// timeline wiring's init reads readTimelineGateState (false) and
+// aborts before registering chrome.tabs listeners, so no URL
+// observation happens at all.
+const configureExtensionForCompanion = async (
+  runtime: ExtensionRuntime,
+  companion: TestCompanion,
+): Promise<void> => {
+  const page = await runtime.context.newPage();
+  try {
+    await page.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 15_000,
+    });
+    await page.waitForTimeout(300);
+    // Seed companion settings. The extension reads
+    // chrome.storage.local['sidetrack.settings'] for port + bridgeKey.
+    await page.evaluate(
+      async ({ port, bridgeKey }: { port: number; bridgeKey: string }) => {
+        const c = (globalThis as unknown as { chrome?: typeof chrome }).chrome;
+        if (c === undefined) return;
+        await c.storage.local.set({
+          'sidetrack.settings': {
+            companion: { port, bridgeKey },
+            autoTrack: true,
+            siteToggles: { chatgpt: true, claude: true, gemini: true, codex: true },
+            notifyOnQueueComplete: true,
+          },
+          'sidetrack.setup.completed': true,
+          'sidetrack.timeline.enabled': true,
+        });
+      },
+      { port: companion.port, bridgeKey: companion.bridgeKey },
+    );
+    // Nudge the SW to re-init now that storage is seeded + gates open.
+    // These match what the recorder spec does (reinitializeTimeline).
+    await page.evaluate(async () => {
+      const c = (globalThis as unknown as { chrome?: typeof chrome }).chrome;
+      if (c === undefined) return;
+      try {
+        await c.runtime.sendMessage({ type: 'sidetrack.timeline.reinit' });
+      } catch {
+        // ignore
+      }
+      try {
+        await c.runtime.sendMessage({ type: 'sidetrack.privacy.gateChanged' });
+      } catch {
+        // ignore
+      }
+    });
+    // Give the SW a moment to actually register the listeners.
+    await page.waitForTimeout(800);
+  } finally {
+    await page.close();
+  }
+};
+
+const bootstrapCompanionAndGates = async (runtime: ExtensionRuntime): Promise<TestCompanion> => {
+  const companion = await startTestCompanion({});
+  await openPrivacyGateViaCompanion(companion, 'timeline');
+  await openPrivacyGateViaCompanion(companion, 'engagement');
+  await configureExtensionForCompanion(runtime, companion);
+  return companion;
+};
+
+const exerciseGoogleSearchPage = async (
+  runtime: ExtensionRuntime,
+): Promise<void> => {
+  const exerc = await runtime.context.newPage();
+  try {
+    // Repro for the Google-search URL bug. Navigate directly to a
+    // search URL so we don't depend on the user typing in a search
+    // box (which would require a form-submit + new-window dance).
+    await exerc.goto(
+      'https://www.google.com/search?q=sidetrack+attach+diag+probe',
+      { waitUntil: 'domcontentloaded', timeout: 20_000 },
+    );
+    await exerc.bringToFront();
+    await exerc.waitForTimeout(3_000);
+  } catch {
+    // Some networks block google.com; skip silently. Wikipedia path
+    // remains the primary probe.
+  } finally {
+    await exerc.close();
+  }
+};
+
 // --- Main spec -----------------------------------------------------
 
 test.describe('manual attach diagnostics', () => {
@@ -381,10 +510,19 @@ test.describe('manual attach diagnostics', () => {
   );
 
   test('produce a JSON report from the live browser', async () => {
-    test.setTimeout(120_000);
+    test.setTimeout(180_000);
 
     const runtime = await launchExtensionRuntime({});
+    let bootstrappedCompanion: TestCompanion | null = null;
     try {
+      // Self-bootstrap: spawn a companion + configure the extension +
+      // open the gates so the SW actually initializes its listeners.
+      // Skip when SIDETRACK_E2E_ATTACH_DIAG_LIVE=1 — caller wants to
+      // probe whatever state is already there.
+      if (process.env.SIDETRACK_E2E_ATTACH_DIAG_LIVE !== '1') {
+        bootstrappedCompanion = await bootstrapCompanionAndGates(runtime);
+      }
+
       // 1-3: connect + wake + open sidepanel + initial probe.
       const before = await probeSidepanel(runtime);
 
@@ -427,8 +565,30 @@ test.describe('manual attach diagnostics', () => {
               .then((body) => JSON.parse(body) as unknown)
               .catch(() => null);
 
-      // 6: exercise an engagement-eligible page, then re-probe.
-      await exerciseEngagementPage(runtime, 8_000);
+      // 6: exercise an engagement-eligible page + the Google search
+      // URL repro, then re-probe.
+      await exerciseEngagementPage(runtime, 5_000);
+      await exerciseGoogleSearchPage(runtime);
+      // Allow the timeline observer's coalesce + spool drain to flush.
+      const sidepanelPage = await runtime.context.newPage();
+      try {
+        await sidepanelPage.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
+          waitUntil: 'domcontentloaded',
+          timeout: 10_000,
+        });
+        await sidepanelPage.evaluate(async () => {
+          const c = (globalThis as unknown as { chrome?: typeof chrome }).chrome;
+          if (c === undefined) return;
+          try {
+            await c.runtime.sendMessage({ type: 'sidetrack.timeline.force-drain' });
+          } catch {
+            // ignore
+          }
+        });
+        await sidepanelPage.waitForTimeout(2_500);
+      } finally {
+        await sidepanelPage.close();
+      }
       const after = await probeSidepanel(runtime);
       const matDiagAfter: unknown =
         matDiagPath === null
@@ -658,6 +818,9 @@ test.describe('manual attach diagnostics', () => {
       // the JSON report's *failureClass fields.
       expect(finalReport.cdpAttached).toBe(true);
     } finally {
+      if (bootstrappedCompanion !== null) {
+        await bootstrappedCompanion.stop().catch(() => undefined);
+      }
       await runtime.close();
     }
   });
