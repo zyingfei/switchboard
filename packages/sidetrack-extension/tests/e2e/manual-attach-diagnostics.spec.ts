@@ -1,13 +1,32 @@
 // Manual attach diagnostics — NOT a CI test.
 //
+// REQUIRES `e2e:chrome-debug` running in a separate terminal. This
+// spec attaches to that browser via CDP (localhost:9222). If
+// chrome-debug isn't running, the spec is skipped with a readable
+// message explaining what to start.
+//
 // Two-terminal flow:
 //
-//   Terminal A:
+//   Terminal A — keep this running for the duration of the diag:
 //     npm --prefix packages/sidetrack-extension run e2e:chrome-debug
 //
-//   Terminal B (after the CfT window is open with Sidetrack loaded):
+//   Terminal B — runs in ~30 s, writes attach-diag.json + a summary:
 //     SIDETRACK_E2E_CDP_URL=http://localhost:9222 \
 //       npm --prefix packages/sidetrack-extension run e2e:attach-diag
+//
+// How this differs from `e2e:recorder`:
+//
+//   - e2e:recorder runs a 9-minute Patchright stealth session against
+//     a persistent ~/.sidetrack-vault. Real provider logins, recorded
+//     artifacts, no CDP exposed. The intended dogfooding harness.
+//
+//   - e2e:chrome-debug + e2e:attach-diag are a diagnostic pair. CfT
+//     launches in normal mode with CDP on port 9222; attach-diag
+//     connects, spawns a fresh ephemeral companion, configures the
+//     extension, opens the gates, exercises a few pages, and writes
+//     a JSON evidence block classifying any failure into one of
+//     N known buckets. NOT for recording user activity — for proving
+//     which condition failed.
 //
 // What it does (default = self-bootstrap mode) — without asking the
 // operator to manually click anything in the side panel:
@@ -503,6 +522,23 @@ const exerciseGoogleSearchPage = async (
 
 // --- Main spec -----------------------------------------------------
 
+// Pre-flight: poke the CDP endpoint before Playwright tries to use
+// it. A failed connectOverCDP throws a low-level "ECONNREFUSED" stack
+// trace; this returns a friendly message that tells the operator
+// exactly what to do.
+const preflightCdpReachable = async (cdpUrl: string): Promise<string | null> => {
+  try {
+    const response = await fetch(`${cdpUrl}/json/version`);
+    if (!response.ok) {
+      return `CDP at ${cdpUrl} responded HTTP ${String(response.status)} — is the chrome-debug session healthy?`;
+    }
+    return null;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    return `Could not reach CDP at ${cdpUrl} (${detail}). Run this first in another terminal:\n  npm --prefix packages/sidetrack-extension run e2e:chrome-debug\nThen re-run e2e:attach-diag.`;
+  }
+};
+
 test.describe('manual attach diagnostics', () => {
   test.skip(
     process.env.SIDETRACK_E2E_CDP_URL === undefined,
@@ -511,6 +547,14 @@ test.describe('manual attach diagnostics', () => {
 
   test('produce a JSON report from the live browser', async () => {
     test.setTimeout(180_000);
+
+    const cdpUrl = process.env.SIDETRACK_E2E_CDP_URL ?? 'http://localhost:9222';
+    const preflightError = await preflightCdpReachable(cdpUrl);
+    if (preflightError !== null) {
+      // Skip with a readable explanation instead of letting Playwright
+      // surface the connectOverCDP stack trace.
+      test.skip(true, preflightError);
+    }
 
     const runtime = await launchExtensionRuntime({});
     let bootstrappedCompanion: TestCompanion | null = null;
