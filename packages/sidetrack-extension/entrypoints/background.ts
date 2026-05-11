@@ -480,23 +480,30 @@ const recordEngagementSyncDiag = async (
   step: string,
   detail?: Record<string, unknown>,
 ): Promise<void> => {
-  // Persistent journal of every sync attempt. Readable from any extension
-  // page (side panel / popup) via:
-  //   await chrome.storage.local.get('sidetrack.engagement.diag')
-  // Keeps the last 20 entries so the journal doesn't grow unboundedly.
+  // Journal of every sync attempt for the engagement subsystem. Uses
+  // chrome.storage.session because earlier diag traces showed that
+  // chrome.storage.local writes from inside SW message-listener bodies
+  // intermittently failed to persist on Chrome 148. Session storage is
+  // in-memory and survives the SW lifetime; the journal also gets
+  // mirrored to console.warn so it shows up in SW DevTools regardless
+  // of storage availability.
+  //
+  // Readable from any extension page DevTools (side panel works):
+  //   await chrome.storage.session.get('sidetrack.engagement.diag')
+  const entry: Record<string, unknown> = {
+    at: new Date().toISOString(),
+    step,
+  };
+  if (detail !== undefined) entry['detail'] = detail;
+  console.warn('[engagement.diag]', step, detail ?? '');
   try {
     const key = 'sidetrack.engagement.diag';
-    const got = await chrome.storage.local.get(key);
+    const got = await chrome.storage.session.get(key);
     const prior = Array.isArray(got[key])
       ? (got[key] as unknown[]).filter((e): e is Record<string, unknown> => typeof e === 'object' && e !== null)
       : [];
-    const entry: Record<string, unknown> = {
-      at: new Date().toISOString(),
-      step,
-    };
-    if (detail !== undefined) entry['detail'] = detail;
     const next = [...prior, entry].slice(-20);
-    await chrome.storage.local.set({ [key]: next });
+    await chrome.storage.session.set({ [key]: next });
   } catch {
     // Best-effort journal.
   }
@@ -2979,6 +2986,21 @@ const detectCodingAttachForTab = async (tabId: number, url: string): Promise<voi
 };
 
 export default defineBackground(() => {
+  // chrome.storage.session is the in-memory backing for our diagnostic
+  // journals (engagement.diag, dev.diag). By default session storage
+  // from a background SW is only readable from the SAME context, which
+  // means side-panel DevTools can't pull it. Bumping the access level
+  // to TRUSTED_CONTEXTS lets the side panel + popup read it without
+  // affecting content-script access. Best-effort: older Chromes that
+  // don't ship session storage just throw, which we swallow.
+  try {
+    void chrome.storage.session
+      .setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })
+      .catch(() => undefined);
+  } catch {
+    // chrome.storage.session unavailable — leave as default.
+  }
+
   const tabOpenerStore = createTabOpenerStore();
   registerTabLifecycleListeners(chrome.tabs, tabOpenerStore);
   registerDefaultWebNavigationListeners(tabOpenerStore);

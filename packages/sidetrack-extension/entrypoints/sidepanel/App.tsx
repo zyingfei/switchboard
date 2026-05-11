@@ -1067,6 +1067,35 @@ const App = () => {
     [bridgeKey, port],
   );
 
+  // Cap the resolver fan-out so the side panel doesn't fire 50+
+  // concurrent /resolve calls at once. The companion's HTTP loop is
+  // single-threaded — saturating it caused the periodic
+  // /v1/system/health probe to time out, briefly flashing the
+  // "companion disconnected" banner, and stalled Inbox updates by 10+
+  // seconds per refresh cycle. Bound to 4 in-flight requests.
+  const mapWithConcurrency = useCallback(
+    async <T, R>(
+      items: readonly T[],
+      limit: number,
+      worker: (item: T) => Promise<R>,
+    ): Promise<R[]> => {
+      const out: R[] = new Array(items.length) as R[];
+      let next = 0;
+      const runners = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+        while (true) {
+          const i = next;
+          next += 1;
+          if (i >= items.length) return;
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+          out[i] = await worker(items[i]!);
+        }
+      });
+      await Promise.all(runners);
+      return out;
+    },
+    [],
+  );
+
   // Stage 5 follow-up — `/resolve?dryRun=true` runs the full
   // resolver pipeline (PPR + cluster + similarity + ranker fusion) on
   // the companion. Firing it for every unattributed item on every 4 s
@@ -1103,24 +1132,22 @@ const App = () => {
       const idsToFetch = [...recordsById.keys()].filter((id) =>
         forceRefetch ? true : next[id] === undefined,
       );
-      const fetched = await Promise.all(
-        idsToFetch.map(async (tabSessionId) => {
-          try {
-            const result = await fetchCompanionJson<unknown>(
-              `/v1/tabsessions/${encodeURIComponent(tabSessionId)}/resolve?dryRun=true`,
-            );
-            return isTabSessionResolutionResult(result) ? ([tabSessionId, result] as const) : null;
-          } catch {
-            return null;
-          }
-        }),
-      );
+      const fetched = await mapWithConcurrency(idsToFetch, 4, async (tabSessionId) => {
+        try {
+          const result = await fetchCompanionJson<unknown>(
+            `/v1/tabsessions/${encodeURIComponent(tabSessionId)}/resolve?dryRun=true`,
+          );
+          return isTabSessionResolutionResult(result) ? ([tabSessionId, result] as const) : null;
+        } catch {
+          return null;
+        }
+      });
       for (const entry of fetched) {
         if (entry !== null) next[entry[0]] = entry[1];
       }
       return next;
     },
-    [fetchCompanionJson],
+    [fetchCompanionJson, mapWithConcurrency],
   );
 
   // Resolve every unattributed URL in the Inbox so the cards can show
@@ -1142,24 +1169,22 @@ const App = () => {
       const toFetch = canonicalUrls.filter((url) =>
         forceRefetch ? true : next[url] === undefined,
       );
-      const fetched = await Promise.all(
-        toFetch.map(async (canonicalUrl) => {
-          try {
-            const result = await fetchCompanionJson<unknown>(
-              `/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve?dryRun=true`,
-            );
-            return isUrlResolutionResult(result) ? ([canonicalUrl, result] as const) : null;
-          } catch {
-            return null;
-          }
-        }),
-      );
+      const fetched = await mapWithConcurrency(toFetch, 4, async (canonicalUrl) => {
+        try {
+          const result = await fetchCompanionJson<unknown>(
+            `/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve?dryRun=true`,
+          );
+          return isUrlResolutionResult(result) ? ([canonicalUrl, result] as const) : null;
+        } catch {
+          return null;
+        }
+      });
       for (const entry of fetched) {
         if (entry !== null) next[entry[0]] = entry[1];
       }
       return next;
     },
-    [fetchCompanionJson],
+    [fetchCompanionJson, mapWithConcurrency],
   );
 
   // Stage 5 follow-up — background polls should NOT flip the
