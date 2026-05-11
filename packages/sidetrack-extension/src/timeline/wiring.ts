@@ -485,6 +485,63 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
     onAdmit: activityDrain.schedule,
   });
 
+  // Stealth Chromium / patchright sometimes blocks `chrome.tabs.title`
+  // from reflecting `document.title` changes — the URL-shaped fake
+  // title that Chrome shows during early page load sticks around in
+  // tab.title. Schedule a brief follow-up that reads document.title
+  // directly via chrome.scripting and re-emits if it differs. The
+  // observer's coalesce path is a no-op when the title matches, so
+  // we can be eager without wasting work.
+  const TITLE_RECHECK_DELAYS_MS = [1500, 4000];
+  const titleReCheckTimers = new Map<string, ReturnType<typeof setTimeout>[]>();
+  const scheduleTitleReCheck = (input: {
+    readonly tabId: number;
+    readonly windowId: number;
+    readonly url: string;
+    readonly tabSessionId: string;
+    readonly openerTabSessionId?: string;
+  }): void => {
+    const key = `${String(input.tabId)}:${input.url}`;
+    // Cancel any prior re-checks for this (tabId, url) so a fresh
+    // navigation supersedes lingering polls.
+    const existing = titleReCheckTimers.get(key);
+    if (existing !== undefined) {
+      for (const handle of existing) clearTimeout(handle);
+    }
+    const handles = TITLE_RECHECK_DELAYS_MS.map((delay) =>
+      setTimeout(() => {
+        void (async () => {
+          try {
+            const results = await chrome.scripting.executeScript({
+              target: { tabId: input.tabId },
+              func: () => document.title,
+            });
+            const title = results[0]?.result;
+            if (typeof title !== 'string' || title.length === 0) return;
+            // If the user navigated away mid-poll, tab.url no longer
+            // matches input.url — skip stale observations.
+            const tab = await chrome.tabs.get(input.tabId).catch(() => null);
+            if (tab === null || tab.url !== input.url) return;
+            observer.observe({
+              tabId: input.tabId,
+              windowId: input.windowId,
+              url: input.url,
+              title,
+              transition: 'updated',
+              tabSessionId: input.tabSessionId,
+              ...(input.openerTabSessionId === undefined
+                ? {}
+                : { openerTabSessionId: input.openerTabSessionId }),
+            });
+          } catch {
+            // chrome.scripting may fail on host_permissions denial — silent.
+          }
+        })();
+      }, delay),
+    );
+    titleReCheckTimers.set(key, handles);
+  };
+
   chrome.tabs.onCreated.addListener((tab) => {
     onCreatedCalls += 1;
     void (async () => {
@@ -625,6 +682,23 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
           ? {}
           : { openerTabSessionId: tabSession.openerTabSessionId }),
       });
+      // Stealth Chromium / patchright sometimes doesn't propagate
+      // document.title back through `tab.title`, so the URL-as-title
+      // fallback sticks. Read `document.title` directly via
+      // chrome.scripting a beat later and re-emit if it differs. The
+      // observer's coalesce path no-ops when the title is unchanged,
+      // so this is cheap when chrome.tabs already worked.
+      if (changeInfo.status === 'complete' || hasTitleChange) {
+        scheduleTitleReCheck({
+          tabId,
+          windowId: tab.windowId,
+          url,
+          tabSessionId: tabSession.tabSessionId,
+          ...(tabSession.openerTabSessionId === undefined
+            ? {}
+            : { openerTabSessionId: tabSession.openerTabSessionId }),
+        });
+      }
     })();
   });
   onUpdatedListenerCount += 1;
