@@ -1039,11 +1039,34 @@ const App = () => {
         setUrlProjection(urlProj);
         setUrlInbox(urlInboxResp);
         setUrlSuggestions(await loadUrlSuggestions(urlInboxResp));
+        // Diagnostic: log the URL record for whatever tab the user is
+        // currently looking at so we can see whether the projection
+        // already has the real title (companion-side) but the panel is
+        // stuck on a stale render.
+        // eslint-disable-next-line no-console
+        const focused =
+          typeof state.activeTabUrl === 'string'
+            ? (urlProj as UrlProjection).byCanonicalUrl[state.activeTabUrl]
+            : undefined;
+        // eslint-disable-next-line no-console
+        console.log(
+          '[sidetrack:panel] loadTabSessions',
+          'activeTabUrl=',
+          state.activeTabUrl,
+          'urlRecord=',
+          focused === undefined
+            ? '<not in projection>'
+            : { latestTitle: focused.latestTitle, latestUrl: focused.latestUrl },
+        );
+      } else {
+        // eslint-disable-next-line no-console
+        console.warn('[sidetrack:panel] loadTabSessions — invalid /v1/visits payload');
       }
-    } catch {
-      // Older companion or transient failure — keep prior URL state.
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[sidetrack:panel] loadTabSessions — /v1/visits fetch failed', err);
     }
-  }, [bridgeKey, fetchCompanionJson, loadTabSessionSuggestions, loadUrlSuggestions, port]);
+  }, [bridgeKey, fetchCompanionJson, loadTabSessionSuggestions, loadUrlSuggestions, port, state.activeTabUrl]);
 
   useEffect(() => {
     if (state.companionStatus !== 'connected') return;
