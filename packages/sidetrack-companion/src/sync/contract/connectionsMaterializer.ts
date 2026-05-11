@@ -400,7 +400,12 @@ export const createConnectionsMaterializer = (
     const previousTopicRevision = await topicRevisionStore.readActiveRevision();
     const topicVisits = timelineDays.flatMap((day) => day.entries.map(topicVisitFromEntry));
     const tabSessionProjection = projectTabSessions(merged);
-    const urlProjection = projectUrls(merged);
+    // Stage 5 follow-up — pass the threads-vault snapshot to projectUrls
+    // so a thread with primaryWorkstreamId set propagates as a
+    // synthetic `source: 'thread'` attribution on the matching
+    // canonical URL. Closes the "Inbox keeps asking me to attribute
+    // this chat URL even though I already moved its thread" gap.
+    const urlProjection = projectUrls(merged, { threads: vault.threads });
     const userAssertedRelations = deriveUserAssertedRelations({
       urlProjection,
       tabSessionProjection,

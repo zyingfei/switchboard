@@ -361,7 +361,12 @@ const collectUrlCounters = (projection: UrlProjection): MaterializerUrlCounters 
     const attribution = record.currentAttribution;
     if (attribution?.workstreamId === undefined || attribution.workstreamId === null) continue;
     attributedCanonicalUrlCount += 1;
-    if (attribution.source === 'user_asserted') attributedByUserCanonicalUrlCount += 1;
+    // Both direct URL moves and thread-derived attributions count as
+    // user-driven for the diagnostic ratio. 'inferred' and tab-group
+    // sources don't.
+    if (attribution.source === 'user_asserted' || attribution.source === 'thread') {
+      attributedByUserCanonicalUrlCount += 1;
+    }
   }
   return {
     canonicalUrlCount: projection.byCanonicalUrl.size,

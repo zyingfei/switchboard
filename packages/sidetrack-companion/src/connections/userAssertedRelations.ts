@@ -73,7 +73,10 @@ export const deriveUserAssertedRelations = (
   for (const record of input.urlProjection.byCanonicalUrl.values()) {
     const attribution = record.currentAttribution;
     if (attribution === undefined) continue;
-    if (attribution.source !== 'user_asserted') continue;
+    // 'user_asserted' (direct URL move) and 'thread' (derived from
+    // a thread attribution) both reflect explicit user intent and
+    // count as seeds. 'inferred' / 'tab-group-*' do not.
+    if (attribution.source !== 'user_asserted' && attribution.source !== 'thread') continue;
     if (attribution.workstreamId === null) continue;
     const canonical = stripFragmentAndTrailingSlash(record.canonicalUrl);
     if (!knownCanonicalUrls.has(canonical)) continue;
@@ -90,6 +93,9 @@ export const deriveUserAssertedRelations = (
   for (const record of input.tabSessionProjection.bySessionId.values()) {
     const attribution = record.currentAttribution;
     if (attribution === undefined) continue;
+    // TabSessionAttribution doesn't carry the 'thread' source —
+    // that's URL-projection-only. Only the direct user_asserted
+    // path seeds tab-session relations.
     if (attribution.source !== 'user_asserted') continue;
     if (attribution.workstreamId === null) continue;
     const sessionUrls = tabSessionUrls.get(record.tabSessionId) ?? [];

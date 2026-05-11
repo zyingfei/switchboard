@@ -185,4 +185,107 @@ describe('url projection', () => {
     );
     expect(after).toEqual(before);
   });
+
+  // Stage 5 follow-up — thread→URL attribution propagation. When a
+  // user moves a chat thread to a workstream via the workboard, the
+  // URL projection treats the matching canonical URL as attributed
+  // too (source: 'thread'), so the Inbox doesn't keep asking the
+  // user to re-attribute the same chat.
+  describe('thread→URL attribution propagation', () => {
+    it('derives a synthetic source="thread" attribution for canonical URLs that match a thread in a workstream', () => {
+      const events = [
+        observed({ seq: 1, canonicalUrl: 'https://chatgpt.com/c/abc-123', title: 'Tax flow' }),
+      ];
+      const projection = projectUrls(events, {
+        threads: [
+          {
+            bac_id: 'thread_a',
+            canonicalUrl: 'https://chatgpt.com/c/abc-123',
+            primaryWorkstreamId: 'WS-RESEARCH',
+            lastSeenAt: '2026-05-07T10:30:00.000Z',
+          },
+        ],
+      });
+      const record = projection.byCanonicalUrl.get('https://chatgpt.com/c/abc-123');
+      expect(record?.currentAttribution).toBeDefined();
+      expect(record?.currentAttribution?.source).toBe('thread');
+      expect(record?.currentAttribution?.workstreamId).toBe('WS-RESEARCH');
+    });
+
+    it('keeps thread URLs out of the Inbox once a matching thread is attributed', () => {
+      const events = [
+        observed({ seq: 1, canonicalUrl: 'https://chatgpt.com/c/abc-123', title: 'Tax flow' }),
+        observed({ seq: 2, canonicalUrl: 'https://news.ycombinator.com/item?id=42', title: 'HN' }),
+      ];
+      const projection = projectUrls(events, {
+        threads: [
+          {
+            bac_id: 'thread_a',
+            canonicalUrl: 'https://chatgpt.com/c/abc-123',
+            primaryWorkstreamId: 'WS-RESEARCH',
+            lastSeenAt: '2026-05-07T10:30:00.000Z',
+          },
+        ],
+      });
+      const inboxUrls = urlInbox(projection, { limit: 10, offset: 0 }).map(
+        (r) => r.canonicalUrl,
+      );
+      // Thread URL is excluded (attributed via thread propagation),
+      // HN URL is still in the Inbox (no matching thread).
+      expect(inboxUrls).toEqual(['https://news.ycombinator.com/item?id=42']);
+    });
+
+    it('skips threads without primaryWorkstreamId', () => {
+      const events = [observed({ seq: 1, canonicalUrl: 'https://chatgpt.com/c/abc-123' })];
+      const projection = projectUrls(events, {
+        threads: [
+          {
+            bac_id: 'thread_a',
+            canonicalUrl: 'https://chatgpt.com/c/abc-123',
+            // No primaryWorkstreamId — orphan thread.
+          },
+        ],
+      });
+      expect(
+        projection.byCanonicalUrl.get('https://chatgpt.com/c/abc-123')?.currentAttribution,
+      ).toBeUndefined();
+    });
+
+    it('does not synthesize a URL record when the thread URL was never observed', () => {
+      const events = [observed({ seq: 1, canonicalUrl: 'https://news.ycombinator.com/' })];
+      const projection = projectUrls(events, {
+        threads: [
+          {
+            bac_id: 'thread_a',
+            canonicalUrl: 'https://chatgpt.com/c/never-visited',
+            primaryWorkstreamId: 'WS-RESEARCH',
+          },
+        ],
+      });
+      // The thread URL wasn't observed in the timeline, so we don't
+      // fabricate a record for it.
+      expect(projection.byCanonicalUrl.has('https://chatgpt.com/c/never-visited')).toBe(false);
+    });
+
+    it('explicit URL move still wins over thread-derived attribution on tie-break', () => {
+      const events = [
+        observed({ seq: 1, canonicalUrl: 'https://chatgpt.com/c/abc' }),
+        userMove({ seq: 2, canonicalUrl: 'https://chatgpt.com/c/abc', workstreamId: 'WS-EXPLICIT' }),
+      ];
+      const projection = projectUrls(events, {
+        threads: [
+          {
+            bac_id: 'thread_a',
+            canonicalUrl: 'https://chatgpt.com/c/abc',
+            primaryWorkstreamId: 'WS-DIFFERENT',
+            // Older lastSeenAt — explicit move is newer.
+            lastSeenAt: '2026-05-07T09:00:00.000Z',
+          },
+        ],
+      });
+      const record = projection.byCanonicalUrl.get('https://chatgpt.com/c/abc');
+      expect(record?.currentAttribution?.workstreamId).toBe('WS-EXPLICIT');
+      expect(record?.currentAttribution?.source).toBe('user_asserted');
+    });
+  });
 });

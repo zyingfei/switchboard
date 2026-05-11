@@ -19,7 +19,17 @@ export const URL_PROJECTION_SCHEMA_VERSION = 1;
 
 export interface UrlAttribution {
   readonly workstreamId: string | null;
-  readonly source: 'user_asserted' | 'tab-group-pull-in' | 'tab-group-pull-out' | 'inferred';
+  // Stage 5 follow-up — `'thread'` is a derived source: the user
+  // attributed a chat THREAD to a workstream, and the projection
+  // propagates that to the matching canonical URL. Without this
+  // bridge, attributing an AI chat via the "All threads" tab leaves
+  // its URL in the Inbox asking for re-attribution.
+  readonly source:
+    | 'user_asserted'
+    | 'tab-group-pull-in'
+    | 'tab-group-pull-out'
+    | 'inferred'
+    | 'thread';
   readonly observedAt: string;
   readonly clientEventId: string;
   readonly replicaId: string;
@@ -62,8 +72,9 @@ const compareEventOrder = (left: AcceptedEvent, right: AcceptedEvent): number =>
 };
 
 const compareAttribution = (left: UrlAttribution, right: UrlAttribution): number => {
-  // user_asserted always beats inferred regardless of order — the user's
-  // explicit choice is sticky until the user changes it.
+  // user_asserted / thread always beat inferred regardless of order —
+  // the user's explicit choice (direct on the URL, or transitive
+  // through the thread) is sticky until the user changes it.
   const precedence = (value: UrlAttribution): number => (value.source === 'inferred' ? 0 : 1);
   const tier = precedence(left) - precedence(right);
   if (tier !== 0) return tier;
@@ -185,8 +196,44 @@ const upsertAttribution = (
   });
 };
 
-export const projectUrls = (events: readonly AcceptedEvent[]): UrlProjection => {
-  if (events.length === 0) return emptyProjection();
+// Stage 5 follow-up — thread→URL attribution propagation.
+//
+// The user reported "disconnect" between the workstream / All-threads
+// tabs (where AI chats appear as attributed) and the Inbox (where the
+// same chat URL keeps showing up unattributed, asking to be picked
+// again). Root cause: attributing a thread via the workboard sets
+// thread.primaryWorkstreamId in the vault, but emits NO event that
+// the URL projection knows about. So
+// `urlProjection[canonicalUrl].currentAttribution` stays undefined.
+//
+// This option lets the materializer pass the threads-vault snapshot
+// in. For every thread with `primaryWorkstreamId` set we synthesize
+// a derived `source: 'thread'` attribution on the matching canonical
+// URL. Downstream this propagates to the Inbox filter (hides
+// attributed URLs), the snapshot's `visit_instance_in_workstream`
+// edge (URL attribution path), and the ranker's
+// `deriveVisitPairLabelsFromSnapshot` (same workstream → visit-pair
+// label).
+export interface ProjectUrlsOptions {
+  readonly threads?: readonly {
+    readonly bac_id: string;
+    readonly canonicalUrl?: string;
+    readonly threadUrl?: string;
+    readonly primaryWorkstreamId?: string;
+    readonly lastSeenAt?: string;
+  }[];
+}
+
+const stripFragmentAndTrailingSlash = (url: string): string =>
+  url.replace(/#.*$/u, '').replace(/\/+$/u, '');
+
+export const projectUrls = (
+  events: readonly AcceptedEvent[],
+  options: ProjectUrlsOptions = {},
+): UrlProjection => {
+  if (events.length === 0 && (options.threads === undefined || options.threads.length === 0)) {
+    return emptyProjection();
+  }
   const records = new Map<string, UrlVisitRecord>();
 
   for (const event of [...events].sort(compareEventOrder)) {
@@ -239,6 +286,33 @@ export const projectUrls = (events: readonly AcceptedEvent[]): UrlProjection => 
         clientEventId: event.clientEventId,
         replicaId: event.dot.replicaId,
         seq: event.dot.seq,
+      });
+    }
+  }
+
+  // Stage 5 follow-up — thread→URL attribution propagation. Applied
+  // AFTER event-based attributions so an explicit URL attribution
+  // event (more recent + same source-tier as 'thread') still wins on
+  // tie-break. Only URLs that already appear in the projection (i.e.
+  // have been observed at least once) get the derived attribution —
+  // we don't fabricate URL records for thread URLs that were never
+  // visited as timeline entries.
+  if (options.threads !== undefined) {
+    for (const thread of options.threads) {
+      if (typeof thread.primaryWorkstreamId !== 'string') continue;
+      if (thread.primaryWorkstreamId.length === 0) continue;
+      const candidate = thread.canonicalUrl ?? thread.threadUrl;
+      if (typeof candidate !== 'string' || candidate.length === 0) continue;
+      const canonical = stripFragmentAndTrailingSlash(candidate);
+      if (!records.has(canonical)) continue;
+      upsertAttribution(records, {
+        canonicalUrl: canonical,
+        workstreamId: thread.primaryWorkstreamId,
+        source: 'thread',
+        observedAt: thread.lastSeenAt ?? new Date(0).toISOString(),
+        clientEventId: `thread:${thread.bac_id}`,
+        replicaId: 'derived',
+        seq: 0,
       });
     }
   }
