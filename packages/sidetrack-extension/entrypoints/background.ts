@@ -3596,17 +3596,33 @@ export default defineBackground(() => {
           });
         return true;
       }
-      // Always-available diagnostic for the title-push pipeline. Run
-      // from the side-panel DevTools console (since the SW console may
-      // be hard to reach in stealth Chromium):
-      //   chrome.runtime.sendMessage({type:'sidetrack.dev.diag'}, console.log)
+      // Always-available diagnostic for the title-push pipeline.
+      //
+      // Stealth Chromium suspends the SW aggressively; the async
+      // sendMessage response sometimes drops with
+      //   "The message port closed before a response was received".
+      // Workaround: also stash the result in chrome.storage.session
+      // under 'sidetrack.dev.diag' so the caller can read it back even
+      // if the response message channel died.
+      //
+      // From any extension DevTools console:
+      //   chrome.runtime.sendMessage({type:'sidetrack.dev.diag'});
+      //   // ... then a moment later:
+      //   chrome.storage.session.get('sidetrack.dev.diag').then(console.log);
       if (
         message !== null &&
         typeof message === 'object' &&
         (message as { type?: unknown }).type === 'sidetrack.dev.diag'
       ) {
         void readTimelineReplayDiagnostics()
-          .then((diagnostics) => {
+          .then(async (diagnostics) => {
+            try {
+              await chrome.storage.session.set({
+                'sidetrack.dev.diag': { capturedAt: new Date().toISOString(), diagnostics },
+              });
+            } catch {
+              // session storage may not be available in some test harnesses
+            }
             sendResponse({ ok: true, diagnostics } as unknown as RuntimeResponse);
           })
           .catch((error: unknown) => {
