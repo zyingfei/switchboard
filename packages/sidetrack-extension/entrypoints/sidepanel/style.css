@@ -8104,6 +8104,16 @@ pre.diff {
 }
 .cx-mode.is-disabled:hover,
 .cx-mode:disabled:hover { color: var(--ink-3); }
+/* Stage 5 polish — Connections time-range pill bar in the anchor row. */
+.cx-timerange { margin-right: 4px; }
+.cx-timerange-hidden {
+  margin-left: 4px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: var(--paper-tinted);
+  color: var(--ink-3);
+  font-size: 10px;
+}
 
 /* Wave D surfaces */
 .cx-flow {

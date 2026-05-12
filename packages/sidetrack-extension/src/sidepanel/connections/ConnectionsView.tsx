@@ -30,6 +30,11 @@ import { KindIcons, SearchIcon } from './icons';
 import { LinkedCenter } from './LinkedCenter';
 import { NodeChip } from './NodeChip';
 import { NodeSearchBox, type SearchableAnchor } from './NodeSearchBox';
+import {
+  TimeRangePills,
+  filterByTimeRange,
+  type TimeRangeKey,
+} from './TimeRangePills';
 import { OrbitalCenter } from './OrbitalCenter';
 import { ProvenanceCard, ProvenanceEmpty } from './ProvenancePanel';
 import { TimelineRail } from './TimelineRail';
@@ -369,6 +374,7 @@ export const ConnectionsView = ({
   const [draftAnchor, setDraftAnchor] = useState<string>(initialAnchor);
   const [hops, setHops] = useState<number>(1);
   const [subMode, setSubMode] = useState<SubMode>('linked');
+  const [timeRange, setTimeRange] = useState<TimeRangeKey>('all');
   const [selectedEdge, setSelectedEdge] = useState<ConnectionEdge | null>(null);
   const [whyVisitId, setWhyVisitId] = useState<string | null>(null);
   const [whyAssertedOnly, setWhyAssertedOnly] = useState<boolean>(false);
@@ -388,46 +394,68 @@ export const ConnectionsView = ({
   const [engagementOverrides, setEngagementOverrides] = useState<Record<string, EngagementClass>>(
     {},
   );
-  // Apply override maps to the raw snapshot. Downstream consumers
-  // see the same shape as a raw `ConnectionsScopedResult`, so they
-  // don't need to know about overrides at all.
+  // Apply override maps + time-range filter to the raw snapshot.
+  // Downstream consumers see the same shape as a raw
+  // `ConnectionsScopedResult`, so they don't need to know about
+  // overrides or the time filter at all.
   const result = useMemo(() => {
     if (rawSnapshot === null) return null;
+    // Step 1 — apply label / engagement overrides (topic rename,
+    // engagement relabel) so optimistic UI lands before the next
+    // companion fetch revalidates.
+    let nodes = rawSnapshot.snapshot.nodes;
     if (
-      Object.keys(labelOverrides).length === 0 &&
-      Object.keys(engagementOverrides).length === 0
+      Object.keys(labelOverrides).length > 0 ||
+      Object.keys(engagementOverrides).length > 0
     ) {
-      return rawSnapshot;
+      nodes = nodes.map((node) => {
+        const labelOverride = labelOverrides[node.id];
+        const engagementOverride = engagementOverrides[node.id];
+        if (labelOverride === undefined && engagementOverride === undefined) return node;
+        const nextMetadata =
+          engagementOverride === undefined
+            ? node.metadata
+            : {
+                ...node.metadata,
+                engagement: {
+                  ...((isRecord(node.metadata['engagement'])
+                    ? node.metadata['engagement']
+                    : {}) as Record<string, unknown>),
+                  class: engagementOverride,
+                },
+              };
+        return {
+          ...node,
+          ...(labelOverride === undefined ? {} : { label: labelOverride }),
+          metadata: nextMetadata,
+        };
+      });
     }
+    // Step 2 — apply the time-range filter. Anchor is kept
+    // unconditionally so the anchor chip never disappears under the
+    // user's feet.
+    const filtered = filterByTimeRange(nodes, rawSnapshot.snapshot.edges, timeRange, {
+      anchorId: anchor,
+    });
     return {
       ...rawSnapshot,
       snapshot: {
         ...rawSnapshot.snapshot,
-        nodes: rawSnapshot.snapshot.nodes.map((node) => {
-          const labelOverride = labelOverrides[node.id];
-          const engagementOverride = engagementOverrides[node.id];
-          if (labelOverride === undefined && engagementOverride === undefined) return node;
-          const nextMetadata =
-            engagementOverride === undefined
-              ? node.metadata
-              : {
-                  ...node.metadata,
-                  engagement: {
-                    ...((isRecord(node.metadata['engagement'])
-                      ? node.metadata['engagement']
-                      : {}) as Record<string, unknown>),
-                    class: engagementOverride,
-                  },
-                };
-          return {
-            ...node,
-            ...(labelOverride === undefined ? {} : { label: labelOverride }),
-            metadata: nextMetadata,
-          };
-        }),
+        nodes: filtered.nodes,
+        edges: filtered.edges,
+        nodeCount: filtered.nodes.length,
+        edgeCount: filtered.edges.length,
       },
     };
-  }, [engagementOverrides, labelOverrides, rawSnapshot]);
+  }, [anchor, engagementOverrides, labelOverrides, rawSnapshot, timeRange]);
+
+  // For the time-range pill bar — how many nodes are hidden by the
+  // current filter. Computed cheaply from the difference between
+  // the raw snapshot and the filtered result.
+  const hiddenByTime = useMemo(() => {
+    if (rawSnapshot === null || result === null) return 0;
+    return Math.max(0, rawSnapshot.snapshot.nodes.length - result.snapshot.nodes.length);
+  }, [rawSnapshot, result]);
 
   // Stage 5 polish — derived ctx that carries the current snapshot's
   // node map so kinds like `inbound-reminder` (which surfaces its
@@ -760,6 +788,7 @@ export const ConnectionsView = ({
         >
           ↻
         </button>
+        <TimeRangePills value={timeRange} onChange={setTimeRange} hiddenNodeCount={hiddenByTime} />
         <HopToggle value={hops} onChange={setHops} />
       </div>
       <div className="cx-modes" role="tablist" aria-label="View mode">
