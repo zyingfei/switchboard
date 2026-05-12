@@ -401,15 +401,44 @@ export class HttpCompanionClient implements CompanionClient {
     headers.set('content-type', 'application/json');
     headers.set('x-bac-bridge-key', this.settings.bridgeKey);
 
-    const response = await fetch(`${this.baseUrl}${path}`, {
-      ...init,
-      headers,
-    });
-    const value = (await response.json()) as unknown;
-    if (!response.ok) {
-      throw new Error(parseProblemMessage(value) ?? `Companion HTTP ${String(response.status)}`);
+    // Fixes: side panel stuck on "Companion: disconnected" even when the
+    // full tab is fine. Root cause: no fetch timeout here meant a slow
+    // companion (catchUp on a 5K-event vault) would hang the SW's
+    // getWorkboardState handler beyond Chrome's "message port closed
+    // before a response was received" ceiling. The panel's sendMessage
+    // resolved as undefined → isRuntimeResponse() false → refresh()
+    // threw → silent catch → panel kept whatever initial state it had
+    // (default: 'disconnected'). Bounding the fetch ensures the SW
+    // handler always returns within ~5s with EITHER the parsed status
+    // OR a thrown error that withCompanionStatus catches and surfaces as
+    // 'disconnected' WITH state, so the panel always gets a fresh state
+    // payload and the next 15s poll can recover when the companion
+    // unblocks.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5_000);
+    try {
+      const response = await fetch(`${this.baseUrl}${path}`, {
+        ...init,
+        headers,
+        signal: controller.signal,
+      });
+      const value = (await response.json()) as unknown;
+      if (!response.ok) {
+        throw new Error(parseProblemMessage(value) ?? `Companion HTTP ${String(response.status)}`);
+      }
+      return value;
+    } catch (error) {
+      // Translate AbortError into something users can act on; otherwise
+      // surface the underlying network error.
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new Error(
+          `Companion did not respond within 5s on ${path}. It may be busy (catchUp on a large vault). Retry in a few seconds.`,
+        );
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
     }
-    return value;
   }
 }
 

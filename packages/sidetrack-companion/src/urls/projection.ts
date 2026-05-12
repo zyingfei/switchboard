@@ -105,64 +105,6 @@ const emptyProjection = (): UrlProjection => ({
 
 export const createEmptyUrlProjection = (): UrlProjection => emptyProjection();
 
-const upsertObservedVisit = (
-  records: Map<string, UrlVisitRecord>,
-  input: {
-    readonly canonicalUrl: string;
-    readonly observedAt: string;
-    readonly latestUrl?: string;
-    readonly latestTitle?: string;
-    readonly provider?: string;
-    readonly tabSessionId?: string;
-  },
-): void => {
-  const existing = records.get(input.canonicalUrl);
-  const tabSessionIds = existing?.tabSessionIds ?? [];
-  const nextTabSessionIds =
-    input.tabSessionId === undefined || tabSessionIds.includes(input.tabSessionId)
-      ? tabSessionIds
-      : [...tabSessionIds, input.tabSessionId].sort(compareString);
-  const next: UrlVisitRecord = {
-    canonicalUrl: input.canonicalUrl,
-    firstSeenAt:
-      existing === undefined || input.observedAt < existing.firstSeenAt
-        ? input.observedAt
-        : existing.firstSeenAt,
-    lastSeenAt:
-      existing === undefined || input.observedAt > existing.lastSeenAt
-        ? input.observedAt
-        : existing.lastSeenAt,
-    visitCount: (existing?.visitCount ?? 0) + 1,
-    tabSessionIds: nextTabSessionIds,
-    attributionHistory: existing?.attributionHistory ?? [],
-    ...(existing?.currentAttribution === undefined
-      ? {}
-      : { currentAttribution: existing.currentAttribution }),
-    // Latest-wins for title/url/provider/host, derived from the latest
-    // observation we've seen by event order.
-    ...(input.latestUrl !== undefined
-      ? { latestUrl: input.latestUrl }
-      : existing?.latestUrl !== undefined
-        ? { latestUrl: existing.latestUrl }
-        : {}),
-    ...(input.latestTitle !== undefined
-      ? { latestTitle: input.latestTitle }
-      : existing?.latestTitle !== undefined
-        ? { latestTitle: existing.latestTitle }
-        : {}),
-    ...(input.provider !== undefined
-      ? { provider: input.provider }
-      : existing?.provider !== undefined
-        ? { provider: existing.provider }
-        : {}),
-    ...((): { host?: string } => {
-      const derived = hostOf(input.latestUrl ?? existing?.latestUrl ?? input.canonicalUrl);
-      return derived === undefined ? {} : { host: derived };
-    })(),
-  };
-  records.set(input.canonicalUrl, next);
-};
-
 const upsertAttribution = (
   records: Map<string, UrlVisitRecord>,
   attribution: UrlAttribution & { readonly canonicalUrl: string },
@@ -196,7 +138,7 @@ const upsertAttribution = (
   });
 };
 
-// Stage 5 follow-up — thread→URL attribution propagation.
+// Stage 5 follow-up (PR #141) — thread→URL attribution propagation.
 //
 // The user reported "disconnect" between the workstream / All-threads
 // tabs (where AI chats appear as attributed) and the Inbox (where the
@@ -227,6 +169,213 @@ export interface ProjectUrlsOptions {
 const stripFragmentAndTrailingSlash = (url: string): string =>
   url.replace(/#.*$/u, '').replace(/\/+$/u, '');
 
+// -- Stage 5.2 W2b — URL projection accumulator -----------------------
+// The legacy projectUrls() sorts events first then folds. That works
+// but makes every drain re-walk the entire log. The accumulator
+// exposes seed + fold + derive so callers (the connections
+// materializer) can hold the per-canonical-URL state across drains
+// and update only the records touched by newly accepted events.
+// Byte-equal output for any event-order permutation is the
+// load-bearing property — verified by the parity tests.
+
+interface UrlObservationCursor {
+  readonly acceptedAtMs: number;
+  readonly replicaId: string;
+  readonly seq: number;
+}
+
+export interface UrlProjectionAccumulator {
+  /** Live per-canonical-URL records. Mirrored to UrlProjection at derive time. */
+  readonly records: Map<string, UrlVisitRecord>;
+  /**
+   * Per-canonical-URL cursor for the most recent observation event seen
+   * by the accumulator. Used to make latest-* field updates
+   * (`latestUrl`, `latestTitle`, `provider`) order-independent: a later
+   * fold of an older event can still backfill an undefined field but
+   * never overwrite a value contributed by a newer event.
+   */
+  readonly observationCursors: Map<string, UrlObservationCursor>;
+}
+
+export const createEmptyUrlProjectionAccumulator = (): UrlProjectionAccumulator => ({
+  records: new Map<string, UrlVisitRecord>(),
+  observationCursors: new Map<string, UrlObservationCursor>(),
+});
+
+const cursorIsNewerThan = (
+  candidate: UrlObservationCursor,
+  baseline: UrlObservationCursor | undefined,
+): boolean => {
+  if (baseline === undefined) return true;
+  if (candidate.acceptedAtMs !== baseline.acceptedAtMs) {
+    return candidate.acceptedAtMs > baseline.acceptedAtMs;
+  }
+  const replica = compareString(candidate.replicaId, baseline.replicaId);
+  if (replica !== 0) return replica > 0;
+  return candidate.seq > baseline.seq;
+};
+
+const pickLatestField = <T>(
+  existingValue: T | undefined,
+  candidateValue: T | undefined,
+  candidateIsNewer: boolean,
+): T | undefined => {
+  if (candidateValue !== undefined && candidateIsNewer) return candidateValue;
+  if (candidateValue !== undefined && existingValue === undefined) return candidateValue;
+  return existingValue;
+};
+
+const foldObservedVisitIntoAccumulator = (
+  acc: UrlProjectionAccumulator,
+  event: AcceptedEvent,
+): void => {
+  if (event.type !== BROWSER_TIMELINE_OBSERVED) return;
+  if (!isBrowserTimelineObservedPayload(event.payload)) return;
+  const payload = event.payload;
+  const canonical = payload.canonicalUrl ?? payload.url;
+  if (typeof canonical !== 'string' || canonical.length === 0) return;
+  const cursor: UrlObservationCursor = {
+    acceptedAtMs: event.acceptedAtMs,
+    replicaId: event.dot.replicaId,
+    seq: event.dot.seq,
+  };
+  const existing = acc.records.get(canonical);
+  const existingCursor = acc.observationCursors.get(canonical);
+  const candidateIsNewer = cursorIsNewerThan(cursor, existingCursor);
+  const tabSessionIds = existing?.tabSessionIds ?? [];
+  const nextTabSessionIds =
+    payload.tabSessionId === undefined || tabSessionIds.includes(payload.tabSessionId)
+      ? tabSessionIds
+      : [...tabSessionIds, payload.tabSessionId].sort(compareString);
+  const latestUrl = pickLatestField(existing?.latestUrl, payload.url, candidateIsNewer);
+  const latestTitle = pickLatestField(existing?.latestTitle, payload.title, candidateIsNewer);
+  const provider = pickLatestField(existing?.provider, payload.provider, candidateIsNewer);
+  const derivedHost = hostOf(latestUrl ?? canonical);
+  const next: UrlVisitRecord = {
+    canonicalUrl: canonical,
+    firstSeenAt:
+      existing === undefined || payload.observedAt < existing.firstSeenAt
+        ? payload.observedAt
+        : existing.firstSeenAt,
+    lastSeenAt:
+      existing === undefined || payload.observedAt > existing.lastSeenAt
+        ? payload.observedAt
+        : existing.lastSeenAt,
+    visitCount: (existing?.visitCount ?? 0) + 1,
+    tabSessionIds: nextTabSessionIds,
+    attributionHistory: existing?.attributionHistory ?? [],
+    ...(existing?.currentAttribution === undefined
+      ? {}
+      : { currentAttribution: existing.currentAttribution }),
+    ...(latestUrl === undefined ? {} : { latestUrl }),
+    ...(latestTitle === undefined ? {} : { latestTitle }),
+    ...(provider === undefined ? {} : { provider }),
+    ...(derivedHost === undefined ? {} : { host: derivedHost }),
+  };
+  acc.records.set(canonical, next);
+  if (candidateIsNewer) acc.observationCursors.set(canonical, cursor);
+};
+
+const foldUserOrganizedIntoAccumulator = (
+  acc: UrlProjectionAccumulator,
+  event: AcceptedEvent,
+): void => {
+  if (event.type !== USER_ORGANIZED_ITEM) return;
+  if (!isUserOrganizedItemPayload(event.payload)) return;
+  const payload = event.payload;
+  if (payload.itemKind !== 'canonical-url' || payload.action !== 'move') return;
+  upsertAttribution(acc.records, {
+    canonicalUrl: payload.itemId,
+    workstreamId: payload.toContainer ?? null,
+    source:
+      payload.details?.attributionSource === 'tab-group-pull-in' ||
+      payload.details?.attributionSource === 'tab-group-pull-out'
+        ? payload.details.attributionSource
+        : 'user_asserted',
+    observedAt: isoFromAcceptedAt(event.acceptedAtMs),
+    clientEventId: event.clientEventId,
+    replicaId: event.dot.replicaId,
+    seq: event.dot.seq,
+  });
+};
+
+const foldUrlAttributionInferredIntoAccumulator = (
+  acc: UrlProjectionAccumulator,
+  event: AcceptedEvent,
+): void => {
+  if (event.type !== URL_ATTRIBUTION_INFERRED) return;
+  if (!isUrlAttributionInferredPayload(event.payload)) return;
+  upsertAttribution(acc.records, {
+    canonicalUrl: event.payload.canonicalUrl,
+    workstreamId: event.payload.workstreamId,
+    source: 'inferred',
+    observedAt: isoFromAcceptedAt(event.acceptedAtMs),
+    clientEventId: event.clientEventId,
+    replicaId: event.dot.replicaId,
+    seq: event.dot.seq,
+  });
+};
+
+export const foldEventIntoUrlProjectionAccumulator = (
+  acc: UrlProjectionAccumulator,
+  event: AcceptedEvent,
+): void => {
+  foldObservedVisitIntoAccumulator(acc, event);
+  foldUserOrganizedIntoAccumulator(acc, event);
+  foldUrlAttributionInferredIntoAccumulator(acc, event);
+};
+
+export const seedUrlProjectionAccumulator = (
+  events: readonly AcceptedEvent[],
+): UrlProjectionAccumulator => {
+  const acc = createEmptyUrlProjectionAccumulator();
+  for (const event of events) foldEventIntoUrlProjectionAccumulator(acc, event);
+  return acc;
+};
+
+export const urlProjectionFromAccumulator = (
+  acc: UrlProjectionAccumulator,
+): UrlProjection => ({
+  schemaVersion: URL_PROJECTION_SCHEMA_VERSION,
+  byCanonicalUrl: new Map(
+    [...acc.records.entries()].sort(([left], [right]) => compareString(left, right)),
+  ),
+});
+
+// Apply PR #141's thread→URL attribution propagation to the
+// accumulator's records map. Only URLs that already appear in the
+// projection (i.e. have been observed at least once) get the derived
+// attribution — we don't fabricate URL records for thread URLs that
+// were never visited as timeline entries. Pure mutation on the
+// records Map; caller derives the projection afterward.
+//
+// Exported so the materializer can apply thread attribution to its
+// long-lived accumulator (W2 wiring) without dropping back to a full
+// re-projection.
+export const applyThreadAttributionsToAccumulator = (
+  acc: UrlProjectionAccumulator,
+  threads: ProjectUrlsOptions['threads'],
+): void => {
+  if (threads === undefined) return;
+  for (const thread of threads) {
+    if (typeof thread.primaryWorkstreamId !== 'string') continue;
+    if (thread.primaryWorkstreamId.length === 0) continue;
+    const candidate = thread.canonicalUrl ?? thread.threadUrl;
+    if (typeof candidate !== 'string' || candidate.length === 0) continue;
+    const canonical = stripFragmentAndTrailingSlash(candidate);
+    if (!acc.records.has(canonical)) continue;
+    upsertAttribution(acc.records, {
+      canonicalUrl: canonical,
+      workstreamId: thread.primaryWorkstreamId,
+      source: 'thread',
+      observedAt: thread.lastSeenAt ?? new Date(0).toISOString(),
+      clientEventId: `thread:${thread.bac_id}`,
+      replicaId: 'derived',
+      seq: 0,
+    });
+  }
+};
+
 export const projectUrls = (
   events: readonly AcceptedEvent[],
   options: ProjectUrlsOptions = {},
@@ -234,100 +383,29 @@ export const projectUrls = (
   if (events.length === 0 && (options.threads === undefined || options.threads.length === 0)) {
     return emptyProjection();
   }
-  const records = new Map<string, UrlVisitRecord>();
-
-  for (const event of [...events].sort(compareEventOrder)) {
-    if (
-      event.type === BROWSER_TIMELINE_OBSERVED &&
-      isBrowserTimelineObservedPayload(event.payload)
-    ) {
-      const payload = event.payload;
-      const canonical = payload.canonicalUrl ?? payload.url;
-      if (typeof canonical !== 'string' || canonical.length === 0) continue;
-      upsertObservedVisit(records, {
-        canonicalUrl: canonical,
-        observedAt: payload.observedAt,
-        ...(payload.url === undefined ? {} : { latestUrl: payload.url }),
-        ...(payload.title === undefined ? {} : { latestTitle: payload.title }),
-        ...(payload.provider === undefined ? {} : { provider: payload.provider }),
-        ...(payload.tabSessionId === undefined ? {} : { tabSessionId: payload.tabSessionId }),
-      });
-      continue;
-    }
-
-    if (event.type === USER_ORGANIZED_ITEM && isUserOrganizedItemPayload(event.payload)) {
-      const payload = event.payload;
-      if (payload.itemKind !== 'canonical-url' || payload.action !== 'move') continue;
-      upsertAttribution(records, {
-        canonicalUrl: payload.itemId,
-        workstreamId: payload.toContainer ?? null,
-        source:
-          payload.details?.attributionSource === 'tab-group-pull-in' ||
-          payload.details?.attributionSource === 'tab-group-pull-out'
-            ? payload.details.attributionSource
-            : 'user_asserted',
-        observedAt: isoFromAcceptedAt(event.acceptedAtMs),
-        clientEventId: event.clientEventId,
-        replicaId: event.dot.replicaId,
-        seq: event.dot.seq,
-      });
-      continue;
-    }
-
-    if (
-      event.type === URL_ATTRIBUTION_INFERRED &&
-      isUrlAttributionInferredPayload(event.payload)
-    ) {
-      upsertAttribution(records, {
-        canonicalUrl: event.payload.canonicalUrl,
-        workstreamId: event.payload.workstreamId,
-        source: 'inferred',
-        observedAt: isoFromAcceptedAt(event.acceptedAtMs),
-        clientEventId: event.clientEventId,
-        replicaId: event.dot.replicaId,
-        seq: event.dot.seq,
-      });
-    }
-  }
-
-  // Stage 5 follow-up — thread→URL attribution propagation. Applied
-  // AFTER event-based attributions so an explicit URL attribution
-  // event (more recent + same source-tier as 'thread') still wins on
-  // tie-break. Only URLs that already appear in the projection (i.e.
-  // have been observed at least once) get the derived attribution —
-  // we don't fabricate URL records for thread URLs that were never
-  // visited as timeline entries.
-  if (options.threads !== undefined) {
-    for (const thread of options.threads) {
-      if (typeof thread.primaryWorkstreamId !== 'string') continue;
-      if (thread.primaryWorkstreamId.length === 0) continue;
-      const candidate = thread.canonicalUrl ?? thread.threadUrl;
-      if (typeof candidate !== 'string' || candidate.length === 0) continue;
-      const canonical = stripFragmentAndTrailingSlash(candidate);
-      if (!records.has(canonical)) continue;
-      upsertAttribution(records, {
-        canonicalUrl: canonical,
-        workstreamId: thread.primaryWorkstreamId,
-        source: 'thread',
-        observedAt: thread.lastSeenAt ?? new Date(0).toISOString(),
-        clientEventId: `thread:${thread.bac_id}`,
-        replicaId: 'derived',
-        seq: 0,
-      });
-    }
-  }
-
-  return {
-    schemaVersion: URL_PROJECTION_SCHEMA_VERSION,
-    byCanonicalUrl: new Map(
-      [...records.entries()].sort(([left], [right]) => compareString(left, right)),
-    ),
-  };
+  // Sorted-fold preserves byte-equality with the pre-W2b
+  // implementation. Thread→URL attribution from PR #141 is applied
+  // AFTER all events fold but BEFORE the projection derives, so an
+  // explicit URL attribution event still wins on tie-break.
+  const acc = seedUrlProjectionAccumulator([...events].sort(compareEventOrder));
+  applyThreadAttributionsToAccumulator(acc, options.threads);
+  return urlProjectionFromAccumulator(acc);
 };
 
 export const serializeUrlProjection = (projection: UrlProjection): SerializedUrlProjection => ({
   schemaVersion: projection.schemaVersion,
   byCanonicalUrl: Object.fromEntries(projection.byCanonicalUrl),
+});
+
+export const deserializeUrlProjection = (
+  serialized: SerializedUrlProjection,
+): UrlProjection => ({
+  schemaVersion: serialized.schemaVersion,
+  byCanonicalUrl: new Map(
+    Object.entries(serialized.byCanonicalUrl).sort(([left], [right]) =>
+      compareString(left, right),
+    ),
+  ),
 });
 
 export const urlInbox = (

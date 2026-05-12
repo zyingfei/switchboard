@@ -16,6 +16,9 @@
 // covers the 13 deterministic edges that the companion vault
 // observes directly.
 
+import type { SerializedTabSessionProjection } from '../tabsession/projection.js';
+import type { SerializedUrlProjection } from '../urls/projection.js';
+
 export type ConnectionNodeKind =
   | 'thread'
   | 'workstream'
@@ -269,6 +272,17 @@ export interface ConnectionsSnapshot {
   readonly updatedAt: string;
   readonly nodeCount: number;
   readonly edgeCount: number;
+  // Stage 5.2 R1 — projection fields embedded in the snapshot so HTTP
+  // routes serve from the committed snapshot instead of re-deriving
+  // from the event log on every request. Optional for graceful
+  // loading of pre-R1 snapshots (materializer re-derives on next
+  // buildAndWrite).
+  readonly urlProjection?: SerializedUrlProjection;
+  readonly tabSessionProjection?: SerializedTabSessionProjection;
+  // Stage 5.2 R4 — stable per-snapshot revision id (hash of the
+  // snapshot contents). Side panel uses this to detect stale reads
+  // and decide whether to refetch.
+  readonly snapshotRevision?: string;
 }
 
 // Helper id minters — exported so the materializer / tests / HTTP

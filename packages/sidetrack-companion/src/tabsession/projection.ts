@@ -182,77 +182,137 @@ const upsertAttribution = (
   });
 };
 
+// -- Stage 5.2 W2c — tab-session projection accumulator ---------------
+// Mirrors W2b's URL accumulator. Tab-session has additional complexity
+// (close events seal the record; openSessionsByTabId tracks tabIdHash
+// → tabSessionId for live sessions) so the per-event fold REQUIRES
+// event-order-sorted input — non-trivially out-of-order folds may not
+// match sorted-fold output (specifically when a close event arrives
+// later than other observations in the same session). The materializer's
+// real use case is seed-at-boot-then-fold-in-order, which preserves
+// strict parity. The byte-parity tests pin sorted-fold == legacy.
+
+export interface TabSessionProjectionAccumulator {
+  readonly records: Map<string, TabSessionRecord>;
+  readonly openSessionsByTabId: Map<string, string>;
+}
+
+export const createEmptyTabSessionProjectionAccumulator = (): TabSessionProjectionAccumulator => ({
+  records: new Map<string, TabSessionRecord>(),
+  openSessionsByTabId: new Map<string, string>(),
+});
+
+const foldObservedSessionIntoAccumulator = (
+  acc: TabSessionProjectionAccumulator,
+  event: AcceptedEvent,
+): void => {
+  if (event.type !== BROWSER_TIMELINE_OBSERVED) return;
+  if (!isBrowserTimelineObservedPayload(event.payload)) return;
+  const payload = event.payload;
+  if (payload.tabSessionId === undefined || payload.tabSessionId.length === 0) return;
+  upsertObservedSession(acc.records, acc.openSessionsByTabId, {
+    tabSessionId: payload.tabSessionId,
+    observedAt: payload.observedAt,
+    transition: payload.transition,
+    ...(payload.tabIdHash === undefined ? {} : { tabIdHash: payload.tabIdHash }),
+    ...(payload.openerTabSessionId === undefined
+      ? {}
+      : { openerTabSessionId: payload.openerTabSessionId }),
+    url: payload.canonicalUrl ?? payload.url,
+    ...(payload.title === undefined ? {} : { title: payload.title }),
+    ...(payload.provider === undefined ? {} : { provider: payload.provider }),
+  });
+};
+
+const foldUserOrganizedSessionIntoAccumulator = (
+  acc: TabSessionProjectionAccumulator,
+  event: AcceptedEvent,
+): void => {
+  if (event.type !== USER_ORGANIZED_ITEM) return;
+  if (!isUserOrganizedItemPayload(event.payload)) return;
+  const payload = event.payload;
+  if (payload.itemKind !== 'tab-session' || payload.action !== 'move') return;
+  upsertAttribution(acc.records, {
+    tabSessionId: payload.itemId,
+    workstreamId: payload.toContainer ?? null,
+    source:
+      payload.details?.attributionSource === 'tab-group-pull-in' ||
+      payload.details?.attributionSource === 'tab-group-pull-out'
+        ? payload.details.attributionSource
+        : 'user_asserted',
+    observedAt: isoFromAcceptedAt(event.acceptedAtMs),
+    clientEventId: event.clientEventId,
+    replicaId: event.dot.replicaId,
+    seq: event.dot.seq,
+  });
+};
+
+const foldInferredSessionAttributionIntoAccumulator = (
+  acc: TabSessionProjectionAccumulator,
+  event: AcceptedEvent,
+): void => {
+  if (event.type !== TAB_SESSION_ATTRIBUTION_INFERRED) return;
+  if (!isTabSessionAttributionInferredPayload(event.payload)) return;
+  upsertAttribution(acc.records, {
+    tabSessionId: event.payload.tabSessionId,
+    workstreamId: event.payload.workstreamId,
+    source: 'inferred',
+    observedAt: isoFromAcceptedAt(event.acceptedAtMs),
+    clientEventId: event.clientEventId,
+    replicaId: event.dot.replicaId,
+    seq: event.dot.seq,
+  });
+};
+
+/**
+ * Stage 5.2 W2c — per-event fold. Updates the accumulator for one
+ * accepted event. Caller is responsible for fold-order; the legacy
+ * projectTabSessions sorts events before folding, and incremental
+ * callers (the materializer drain) receive events in event-order so
+ * this is the natural use.
+ */
+export const foldEventIntoTabSessionProjectionAccumulator = (
+  acc: TabSessionProjectionAccumulator,
+  event: AcceptedEvent,
+): void => {
+  foldObservedSessionIntoAccumulator(acc, event);
+  foldUserOrganizedSessionIntoAccumulator(acc, event);
+  foldInferredSessionAttributionIntoAccumulator(acc, event);
+};
+
+/**
+ * Stage 5.2 W2c — full-pass seed. Sorts events by event-order and
+ * folds them all. Equivalent to projectTabSessions(events) → state.
+ */
+export const seedTabSessionProjectionAccumulator = (
+  events: readonly AcceptedEvent[],
+): TabSessionProjectionAccumulator => {
+  const acc = createEmptyTabSessionProjectionAccumulator();
+  for (const event of [...events].sort(compareEventOrder)) {
+    foldEventIntoTabSessionProjectionAccumulator(acc, event);
+  }
+  return acc;
+};
+
+/**
+ * Stage 5.2 W2c — derive a TabSessionProjection from accumulator
+ * state. Sorts bySessionId / openSessionsByTabId deterministically.
+ */
+export const tabSessionProjectionFromAccumulator = (
+  acc: TabSessionProjectionAccumulator,
+): TabSessionProjection => ({
+  schemaVersion: TAB_SESSION_PROJECTION_SCHEMA_VERSION,
+  bySessionId: new Map(
+    [...acc.records.entries()].sort(([left], [right]) => compareString(left, right)),
+  ),
+  openSessionsByTabId: new Map(
+    [...acc.openSessionsByTabId.entries()].sort(([left], [right]) => compareString(left, right)),
+  ),
+});
+
 export const projectTabSessions = (events: readonly AcceptedEvent[]): TabSessionProjection => {
   if (events.length === 0) return emptyProjection();
-  const records = new Map<string, TabSessionRecord>();
-  const openSessionsByTabId = new Map<string, string>();
-
-  for (const event of [...events].sort(compareEventOrder)) {
-    if (
-      event.type === BROWSER_TIMELINE_OBSERVED &&
-      isBrowserTimelineObservedPayload(event.payload)
-    ) {
-      const payload = event.payload;
-      if (payload.tabSessionId === undefined || payload.tabSessionId.length === 0) continue;
-      upsertObservedSession(records, openSessionsByTabId, {
-        tabSessionId: payload.tabSessionId,
-        observedAt: payload.observedAt,
-        transition: payload.transition,
-        ...(payload.tabIdHash === undefined ? {} : { tabIdHash: payload.tabIdHash }),
-        ...(payload.openerTabSessionId === undefined
-          ? {}
-          : { openerTabSessionId: payload.openerTabSessionId }),
-        url: payload.canonicalUrl ?? payload.url,
-        ...(payload.title === undefined ? {} : { title: payload.title }),
-        ...(payload.provider === undefined ? {} : { provider: payload.provider }),
-      });
-      continue;
-    }
-
-    if (event.type === USER_ORGANIZED_ITEM && isUserOrganizedItemPayload(event.payload)) {
-      const payload = event.payload;
-      if (payload.itemKind !== 'tab-session' || payload.action !== 'move') continue;
-      upsertAttribution(records, {
-        tabSessionId: payload.itemId,
-        workstreamId: payload.toContainer ?? null,
-        source:
-          payload.details?.attributionSource === 'tab-group-pull-in' ||
-          payload.details?.attributionSource === 'tab-group-pull-out'
-            ? payload.details.attributionSource
-            : 'user_asserted',
-        observedAt: isoFromAcceptedAt(event.acceptedAtMs),
-        clientEventId: event.clientEventId,
-        replicaId: event.dot.replicaId,
-        seq: event.dot.seq,
-      });
-      continue;
-    }
-
-    if (
-      event.type === TAB_SESSION_ATTRIBUTION_INFERRED &&
-      isTabSessionAttributionInferredPayload(event.payload)
-    ) {
-      upsertAttribution(records, {
-        tabSessionId: event.payload.tabSessionId,
-        workstreamId: event.payload.workstreamId,
-        source: 'inferred',
-        observedAt: isoFromAcceptedAt(event.acceptedAtMs),
-        clientEventId: event.clientEventId,
-        replicaId: event.dot.replicaId,
-        seq: event.dot.seq,
-      });
-    }
-  }
-
-  return {
-    schemaVersion: TAB_SESSION_PROJECTION_SCHEMA_VERSION,
-    bySessionId: new Map(
-      [...records.entries()].sort(([left], [right]) => compareString(left, right)),
-    ),
-    openSessionsByTabId: new Map(
-      [...openSessionsByTabId.entries()].sort(([left], [right]) => compareString(left, right)),
-    ),
-  };
+  return tabSessionProjectionFromAccumulator(seedTabSessionProjectionAccumulator(events));
 };
 
 export const serializeTabSessionProjection = (
@@ -261,6 +321,22 @@ export const serializeTabSessionProjection = (
   schemaVersion: projection.schemaVersion,
   bySessionId: Object.fromEntries(projection.bySessionId),
   openSessionsByTabId: Object.fromEntries(projection.openSessionsByTabId),
+});
+
+export const deserializeTabSessionProjection = (
+  serialized: SerializedTabSessionProjection,
+): TabSessionProjection => ({
+  schemaVersion: serialized.schemaVersion,
+  bySessionId: new Map(
+    Object.entries(serialized.bySessionId).sort(([left], [right]) =>
+      compareString(left, right),
+    ),
+  ),
+  openSessionsByTabId: new Map(
+    Object.entries(serialized.openSessionsByTabId).sort(([left], [right]) =>
+      compareString(left, right),
+    ),
+  ),
 });
 
 export const tabSessionInbox = (

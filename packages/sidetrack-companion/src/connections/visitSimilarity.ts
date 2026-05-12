@@ -419,6 +419,36 @@ const indexEntriesForVisits = (
     ];
   });
 
+// Stage 5.2 W3 — expose the revisionId computation so the materializer
+// can compute the expected id and skip buildVisitSimilarity entirely
+// when a revision with the same inputs already exists on disk. The
+// hash is byte-deterministic over (model + threshold + topK + gate +
+// per-visit corpus/focus), so two runs with the same input set yield
+// the same revisionId.
+export const computeVisitSimilarityRevisionId = (
+  entries: readonly VisitSimilarityEntry[],
+  options: BuildVisitSimilarityOptions = {},
+): string => {
+  // Merged PR #141 + main: PR #141 added producer/lexicalThreshold/
+  // lexicalFallbackEnabled to the revision-id hash so changes to the
+  // fallback config invalidate cached revisions even when the
+  // embedder succeeded. Mirror those here so the cache-probe revisionId
+  // matches buildVisitSimilarity's embedding-path id.
+  const config = resolveVisitSimilarityConfig(options);
+  const modelRevision = RECALL_MODEL.revision;
+  const visits = normalizeEntries(entries);
+  return revisionIdFor({
+    modelRevision,
+    producer: 'embedding',
+    threshold: config.threshold,
+    topK: config.topK,
+    engagementGateMs: config.engagementGateMs,
+    lexicalThreshold: config.lexicalThreshold,
+    lexicalFallbackEnabled: config.lexicalFallbackEnabled,
+    visits,
+  });
+};
+
 export const buildVisitSimilarity = async (
   entries: readonly VisitSimilarityEntry[],
   embed: VisitSimilarityEmbedder,

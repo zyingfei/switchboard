@@ -18,6 +18,7 @@ import {
 } from '../tabsession/projection.js';
 import { THREAD_UPSERTED } from '../threads/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
+import { projectUrls, URL_PROJECTION_SCHEMA_VERSION } from '../urls/projection.js';
 import type { TimelineDayProjection } from '../timeline/projection.js';
 import { TOPIC_UNION_FIND_REVISION_KEY, type TopicRevision } from '../producers/topic-revision.js';
 import { VISUAL_FINGERPRINT_OBSERVED } from '../visual/events.js';
@@ -2456,5 +2457,81 @@ describe('connections — subgraph + path helpers', () => {
     const snap = fixture();
     const path = findPath(snap, nodeIdFor('thread', 'thread_a'), nodeIdFor('thread', 'unknown'));
     expect(path.found).toBe(false);
+  });
+});
+
+// Stage 5.2 R1 + R4 — snapshot extension: every snapshot must embed the
+// URL + tab-session projections (so HTTP routes serve from the committed
+// snapshot, no event-log re-derivation) and carry a stable revision id.
+describe('connections — Stage 5.2 R1/R4 snapshot extension', () => {
+  const observation = buildEvent({
+    seq: 1,
+    type: BROWSER_TIMELINE_OBSERVED,
+    payload: {
+      eventId: 'tl-1',
+      tabSessionId: 'tses_test',
+      canonicalUrl: 'https://example.com/a',
+      url: 'https://example.com/a',
+      observedAt: '2026-05-07T10:00:00.000Z',
+      transition: 'activated',
+      title: 'A page',
+    },
+  });
+
+  it('snapshot includes a populated tabSessionProjection field', () => {
+    const tabSessionProjection = projectTabSessions([observation]);
+    const snap = buildConnectionsSnapshot(emptyInput({ events: [observation], tabSessionProjection }));
+    expect(snap.tabSessionProjection?.schemaVersion).toBe(TAB_SESSION_PROJECTION_SCHEMA_VERSION);
+    expect(Object.keys(snap.tabSessionProjection?.bySessionId ?? {})).toContain('tses_test');
+  });
+
+  it('snapshot includes a populated urlProjection field when wired', () => {
+    const urlProjection = projectUrls([observation]);
+    const tabSessionProjection = projectTabSessions([observation]);
+    const snap = buildConnectionsSnapshot(
+      emptyInput({ events: [observation], tabSessionProjection, urlProjection }),
+    );
+    expect(snap.urlProjection?.schemaVersion).toBe(URL_PROJECTION_SCHEMA_VERSION);
+    expect(Object.keys(snap.urlProjection?.byCanonicalUrl ?? {})).toContain(
+      'https://example.com/a',
+    );
+  });
+
+  it('omits urlProjection when ConnectionsInput.urlProjection is undefined (back-compat)', () => {
+    const snap = buildConnectionsSnapshot(emptyInput({ events: [observation] }));
+    expect(snap.urlProjection).toBeUndefined();
+    expect(snap.tabSessionProjection).toBeDefined();
+  });
+
+  it('emits a stable snapshotRevision that changes when content changes', () => {
+    const tabSessionProjection = projectTabSessions([observation]);
+    const urlProjection = projectUrls([observation]);
+    const snap1 = buildConnectionsSnapshot(
+      emptyInput({ events: [observation], tabSessionProjection, urlProjection }),
+    );
+    const snap2 = buildConnectionsSnapshot(
+      emptyInput({ events: [observation], tabSessionProjection, urlProjection }),
+    );
+    expect(snap1.snapshotRevision).toBeDefined();
+    expect(snap1.snapshotRevision).toBe(snap2.snapshotRevision);
+
+    const observation2 = buildEvent({
+      seq: 2,
+      type: BROWSER_TIMELINE_OBSERVED,
+      payload: {
+        ...(observation.payload as Record<string, unknown>),
+        eventId: 'tl-2',
+        canonicalUrl: 'https://example.com/b',
+        url: 'https://example.com/b',
+      },
+    });
+    const snap3 = buildConnectionsSnapshot(
+      emptyInput({
+        events: [observation, observation2],
+        tabSessionProjection: projectTabSessions([observation, observation2]),
+        urlProjection: projectUrls([observation, observation2]),
+      }),
+    );
+    expect(snap3.snapshotRevision).not.toBe(snap1.snapshotRevision);
   });
 });

@@ -212,13 +212,21 @@ const withTimeout = async <T>(
     ),
   ]);
 
-const API_TIMEOUT_MS = 60_000;
+// PR #141 raised the default recorder API timeout to 60s for slow CDP
+// operations; main added the env-tunable wrapper. Merge: keep the env
+// wrapper but use 60s as the fallback.
+const apiTimeoutMs = (): number => {
+  const raw = process.env.SIDETRACK_E2E_API_TIMEOUT_MS;
+  if (raw === undefined || raw.length === 0) return 60_000;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 60_000;
+};
 
 const apiGet = async (comp: TestCompanion, requestPath: string): Promise<unknown> => {
   const controller = new AbortController();
   const timer = setTimeout(() => {
     controller.abort();
-  }, API_TIMEOUT_MS);
+  }, apiTimeoutMs());
   try {
     const res = await fetch(`http://127.0.0.1:${String(comp.port)}${requestPath}`, {
       headers: { 'x-bac-bridge-key': comp.bridgeKey },
@@ -229,7 +237,7 @@ const apiGet = async (comp: TestCompanion, requestPath: string): Promise<unknown
     return await res.json();
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error(`GET ${requestPath} timed out after ${String(API_TIMEOUT_MS)}ms`);
+      throw new Error(`GET ${requestPath} timed out after ${String(apiTimeoutMs())}ms`);
     }
     throw error;
   } finally {
@@ -245,7 +253,7 @@ const apiPost = async (
   const controller = new AbortController();
   const timer = setTimeout(() => {
     controller.abort();
-  }, API_TIMEOUT_MS);
+  }, apiTimeoutMs());
   try {
     const res = await fetch(`http://127.0.0.1:${String(comp.port)}${requestPath}`, {
       method: 'POST',
@@ -262,7 +270,7 @@ const apiPost = async (
     return await res.json();
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error(`POST ${requestPath} timed out after ${String(API_TIMEOUT_MS)}ms`);
+      throw new Error(`POST ${requestPath} timed out after ${String(apiTimeoutMs())}ms`);
     }
     throw error;
   } finally {

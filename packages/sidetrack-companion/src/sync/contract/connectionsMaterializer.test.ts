@@ -349,7 +349,9 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     });
     await eventLog.importPeerEvent(event);
     m.onAccepted(event, { origin: 'peer' });
-    await new Promise((r) => setTimeout(r, 30));
+    // Stage 5.2 W1a — drain is debounced; awaitIdle waits through
+    // debounce + the failing drain attempt that parks lastError.
+    await m.awaitIdle();
     expect(m.health().status).toBe('failed');
     expect(m.health().lastError).toContain('disk full');
 
@@ -423,6 +425,71 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     expect(health.lastError).toContain('disk wedged');
   });
 
+  // Stage 5.2 W3 — visit-similarity skip-gate. When the same set of
+  // visits is processed twice, the second drain reads the cached
+  // revision from disk instead of re-running embed (the most
+  // expensive pass on the materializer's hot path).
+  it('reuses an existing similarity revision when visit inputs are unchanged', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+    let embedCalls = 0;
+    const embed: VisitSimilarityEmbedder = async (texts) => {
+      embedCalls += 1;
+      return texts.map(() => unit([1, 0]));
+    };
+    const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store, embed });
+
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 1,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: {
+          eventId: 'timeline-alpha',
+          observedAt: '2026-05-07T10:00:00.000Z',
+          url: 'https://example.test/alpha',
+          canonicalUrl: 'https://example.test/alpha',
+          title: 'visit-alpha',
+          provider: 'generic',
+          transition: 'activated',
+          payloadVersion: 1,
+          dimensions: { engagement: { focusedWindowMs: 10_000 } },
+        },
+      }),
+    );
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 2,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: {
+          eventId: 'timeline-bravo',
+          observedAt: '2026-05-07T10:05:00.000Z',
+          url: 'https://example.test/bravo',
+          canonicalUrl: 'https://example.test/bravo',
+          title: 'visit-bravo',
+          provider: 'generic',
+          transition: 'activated',
+          payloadVersion: 1,
+          dimensions: { engagement: { focusedWindowMs: 10_000 } },
+        },
+      }),
+    );
+
+    // First drain populates the similarity revision (calls embed once
+    // for the two passages).
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+    const firstCalls = embedCalls;
+    expect(firstCalls).toBeGreaterThan(0);
+
+    // Second drain over the same visit set: skip-gate hits, no
+    // additional embed call.
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+    expect(embedCalls).toBe(firstCalls);
+  });
+
   it('handles set covers expected event types', async () => {
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
@@ -442,5 +509,157 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     ];
     for (const t of expected) expect(m.handles.has(t)).toBe(true);
     expect(m.handles.has('unrelated.event')).toBe(false);
+  });
+
+  // Stage 5.2 W2b — high-frequency events that fold into the next
+  // natural drain (engagement aggregates, visual fingerprints) MUST NOT
+  // be in HANDLES, so they don't trigger their own per-event rebuild.
+  it('engagement.session.aggregated is NOT in handles (deferred to next structural drain)', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+    const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store });
+
+    expect(m.handles.has('engagement.session.aggregated')).toBe(false);
+    expect(m.handles.has('visual.fingerprint.observed')).toBe(false);
+  });
+
+  it('engagement bursts do not trigger any drain (deferred until next structural event)', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    let putCurrentCalls = 0;
+    const store = {
+      putCurrent: async (snapshot: import('../../connections/snapshot.js').ConnectionsSnapshot) => {
+        putCurrentCalls += 1;
+        void snapshot;
+      },
+      readCurrent: async () => null,
+      putDay: async () => undefined,
+      readDay: async () => null,
+      listDays: async () => [],
+    };
+    const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store });
+
+    // Simulate 50 engagement aggregates arriving while a user reads a
+    // page (every ~30s per tab × 4 tabs = these would have been 50
+    // per-event drains pre-W2b). With W2b they trigger zero drains
+    // because the materializer doesn't route the event type.
+    for (let i = 1; i <= 50; i += 1) {
+      const event = buildEvent({
+        seq: i,
+        type: 'engagement.session.aggregated',
+        payload: {
+          payloadVersion: 1,
+          visitId: `visit-${String(i % 5)}`,
+          sessionId: `session-${String(i)}`,
+          dimensions: {
+            engagement: {
+              activeMs: 1000,
+              visibleMs: 1000,
+              focusedWindowMs: 1000,
+              idleMs: 0,
+              foregroundBursts: 1,
+              returnCount: 0,
+              scrollEvents: 0,
+              maxScrollRatio: 0,
+              copyCount: 0,
+              pasteCount: 0,
+            },
+          },
+        },
+      });
+      await eventLog.importPeerEvent(event);
+      m.onAccepted(event, { origin: 'peer' });
+    }
+    await m.awaitIdle();
+
+    // No drains — engagement events are not in HANDLES.
+    expect(putCurrentCalls).toBe(0);
+  });
+
+  // Stage 5.2 W4 — topic-revision skip-gate. When the previous active
+  // topic revision matches the id we'd derive from the current visit
+  // similarity + threshold + algorithm, skip the union-find pass and
+  // reuse it. Pairs with W3: when visit similarity cache-hits, topics
+  // inherit the cache hit downstream.
+  it('topic-revision skip-gate reuses the active revision when its id matches', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+    let putActiveRevisionCalls = 0;
+    const baseTopicStore = createTopicRevisionStore(vaultRoot);
+    const topicRevisionStore = {
+      ...baseTopicStore,
+      putActiveRevision: async (
+        revision: import('../../producers/topic-revision.js').TopicRevision,
+      ) => {
+        putActiveRevisionCalls += 1;
+        await baseTopicStore.putActiveRevision(revision);
+      },
+    };
+    const embed = embedFromVectors(
+      new Map<string, Float32Array>([
+        ['visit-alpha', unit([1, 0])],
+        ['visit-bravo', unit([1, 0])],
+      ]),
+    );
+    const m = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store,
+      embed,
+      topicRevisionStore,
+    });
+
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 1,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: {
+          eventId: 'timeline-alpha',
+          observedAt: '2026-05-07T10:00:00.000Z',
+          url: 'https://example.test/alpha',
+          canonicalUrl: 'https://example.test/alpha',
+          title: 'visit-alpha',
+          provider: 'generic',
+          transition: 'activated',
+          payloadVersion: 1,
+          dimensions: { engagement: { focusedWindowMs: 10_000 } },
+        },
+      }),
+    );
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 2,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: {
+          eventId: 'timeline-bravo',
+          observedAt: '2026-05-07T10:05:00.000Z',
+          url: 'https://example.test/bravo',
+          canonicalUrl: 'https://example.test/bravo',
+          title: 'visit-bravo',
+          provider: 'generic',
+          transition: 'activated',
+          payloadVersion: 1,
+          dimensions: { engagement: { focusedWindowMs: 10_000 } },
+        },
+      }),
+    );
+
+    // First drain produces the topic revision.
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+    const firstCalls = putActiveRevisionCalls;
+    expect(firstCalls).toBeGreaterThanOrEqual(1);
+
+    // Second drain with the same inputs hits the skip-gate — no new
+    // topic revision written.
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+    expect(putActiveRevisionCalls).toBe(firstCalls);
   });
 });

@@ -242,9 +242,9 @@ const computeLineage = async (
   });
 };
 
-// Stage 5 follow-up — env-tunable topic engagement gate. Production
-// default still DEFAULT_TOPIC_ENGAGEMENT_GATE_MS (5000ms); dogfood can
-// dial it down for short browsing sessions.
+// PR #141 — env-tunable topic engagement gate. Production default
+// stays DEFAULT_TOPIC_ENGAGEMENT_GATE_MS (5000ms); dogfood can dial
+// it down for short browsing sessions via the env var.
 export const TOPIC_ENGAGEMENT_GATE_MS_ENV = 'SIDETRACK_TOPIC_ENGAGEMENT_GATE_MS';
 
 const resolveTopicEngagementGateMs = (override: number | undefined): number => {
@@ -256,6 +256,176 @@ const resolveTopicEngagementGateMs = (override: number | undefined): number => {
   }
   return DEFAULT_TOPIC_ENGAGEMENT_GATE_MS;
 };
+
+// -- Stage 5.2 W4 — incremental topic cluster accumulator -------------
+// Foundational additive path: maintain a UnionFind across drains so new
+// similarity edges merge components in O(α(n)) per edge instead of
+// re-clustering from scratch. Removal-aware fallback (the design doc's
+// "affected-component rebuild" for edge removals) is a follow-up; this
+// PR ships the hot-add path that covers the common Stage 5.2 case
+// (Class A leaf events keep producing similarity edges, never removing).
+//
+// What this PR does NOT do (yet):
+// - Lineage tracking across revisions (consumers still call
+//   buildTopicRevision for split/merge lineage).
+// - Engagement-gate filtering (the full builder filters visits by
+//   focusedWindowMs > engagementGateMs; the accumulator delegates that
+//   to the caller — only call addVisit / addEdge / addRelation for
+//   visits already past the gate).
+// - Eviction on edge removal. Callers needing splits must fall back to
+//   buildTopicRevision for the affected component.
+
+export interface IncrementalTopicComponent {
+  readonly topicId: string;
+  readonly memberCanonicalUrls: readonly string[];
+}
+
+interface EdgeRecord {
+  readonly a: string;
+  readonly b: string;
+  readonly source: 'similarity' | 'user-asserted';
+}
+
+const edgePairKey = (a: string, b: string): string =>
+  a < b ? `${a} ${b}` : `${b} ${a}`;
+
+export class IncrementalTopicClusterAccumulator {
+  private uf = new UnionFind();
+  private readonly visitsByCanonical = new Map<string, TopicVisit>();
+  /**
+   * Stage 5.2 W4 — edge ledger. Tracks every edge folded so removal
+   * can locate the affected component and reconstruct it from the
+   * remaining edges. Keyed by lexicographic pair so add/remove are
+   * symmetric.
+   */
+  private readonly edges = new Map<string, EdgeRecord>();
+
+  /** Register a visit (engagement-gated by caller). Idempotent. */
+  addVisit(visit: TopicVisit): void {
+    if (visit.canonicalUrl.length === 0) return;
+    this.uf.add(visit.canonicalUrl);
+    const existing = this.visitsByCanonical.get(visit.canonicalUrl);
+    if (existing === undefined) {
+      this.visitsByCanonical.set(visit.canonicalUrl, visit);
+      return;
+    }
+    // Latest-wins for metadata (caller is responsible for ordering;
+    // this matches sortedVisitsByCanonical's merge behaviour).
+    const title =
+      (existing.title ?? '').length >= (visit.title ?? '').length ? existing.title : visit.title;
+    this.visitsByCanonical.set(visit.canonicalUrl, {
+      canonicalUrl: visit.canonicalUrl,
+      ...(title === undefined ? {} : { title }),
+      focusedWindowMs: Math.max(existing.focusedWindowMs, visit.focusedWindowMs),
+      firstObservedAt:
+        existing.firstObservedAt < visit.firstObservedAt
+          ? existing.firstObservedAt
+          : visit.firstObservedAt,
+      lastObservedAt:
+        existing.lastObservedAt > visit.lastObservedAt
+          ? existing.lastObservedAt
+          : visit.lastObservedAt,
+      ...(visit.workstreamId !== undefined
+        ? { workstreamId: visit.workstreamId }
+        : existing.workstreamId !== undefined
+          ? { workstreamId: existing.workstreamId }
+          : {}),
+    });
+  }
+
+  /**
+   * Apply a similarity edge. If both endpoints are registered visits
+   * AND cosine >= threshold, merges the two components in O(α(n)).
+   */
+  addSimilarityEdge(edge: VisitSimilarityEdge, cosineThreshold: number): void {
+    if (edge.cosine < cosineThreshold) return;
+    if (!this.visitsByCanonical.has(edge.fromVisitKey)) return;
+    if (!this.visitsByCanonical.has(edge.toVisitKey)) return;
+    this.uf.union(edge.fromVisitKey, edge.toVisitKey);
+    this.edges.set(edgePairKey(edge.fromVisitKey, edge.toVisitKey), {
+      a: edge.fromVisitKey,
+      b: edge.toVisitKey,
+      source: 'similarity',
+    });
+  }
+
+  /** Apply a user-asserted relation — always merges (no threshold). */
+  addUserAssertedRelation(relation: UserAssertedVisitRelation): void {
+    if (!this.visitsByCanonical.has(relation.fromVisitKey)) return;
+    if (!this.visitsByCanonical.has(relation.toVisitKey)) return;
+    this.uf.union(relation.fromVisitKey, relation.toVisitKey);
+    this.edges.set(edgePairKey(relation.fromVisitKey, relation.toVisitKey), {
+      a: relation.fromVisitKey,
+      b: relation.toVisitKey,
+      source: 'user-asserted',
+    });
+  }
+
+  /**
+   * Stage 5.2 W4 — remove an edge and re-cluster the affected
+   * component. If the removal disconnects the component into multiple
+   * sub-components, the new components are returned in the next
+   * getComponents() call.
+   *
+   * Algorithm (per design doc):
+   *   1. Locate component(s) touching the removed edge.
+   *   2. Reset those members' UF state.
+   *   3. Re-cluster using only the remaining edges restricted to
+   *      this component's members.
+   *
+   * Cost: O(|component|·α(n)) — typically small.
+   */
+  removeEdge(a: string, b: string): void {
+    const key = edgePairKey(a, b);
+    if (!this.edges.has(key)) return;
+    this.edges.delete(key);
+    if (!this.visitsByCanonical.has(a) || !this.visitsByCanonical.has(b)) return;
+    // Find the affected component members BEFORE rebuilding (otherwise
+    // find() in the rebuilt UF would walk against the old parents).
+    const componentMembers = new Set<string>();
+    for (const member of this.uf.members(a)) componentMembers.add(member);
+    for (const member of this.uf.members(b)) componentMembers.add(member);
+    // Rebuild UF from scratch over the entire visit set; only the
+    // affected component's edges are re-applied + the unaffected
+    // components are reconstructed by virtue of their own edges.
+    // This is conceptually a "component-restricted re-cluster" but
+    // implemented as a global rebuild for simplicity — at this corpus
+    // size the overhead is negligible (UnionFind is O(α(n)) per op).
+    const fresh = new UnionFind();
+    for (const visitKey of [...this.visitsByCanonical.keys()].sort(compareString)) {
+      fresh.add(visitKey);
+    }
+    for (const edge of this.edges.values()) {
+      if (!this.visitsByCanonical.has(edge.a)) continue;
+      if (!this.visitsByCanonical.has(edge.b)) continue;
+      fresh.union(edge.a, edge.b);
+    }
+    this.uf = fresh;
+  }
+
+  /**
+   * Return components keyed by topicId. Singleton components (one
+   * member) are filtered out — they're not topics, they're isolated
+   * visits. Caller responsible for downstream TopicRevisionTopic
+   * derivation (metadata, lineage, persistent revisionId).
+   */
+  async getComponents(): Promise<readonly IncrementalTopicComponent[]> {
+    const components: IncrementalTopicComponent[] = [];
+    for (const component of this.uf.components()) {
+      if (component.members.length < 2) continue;
+      const memberCanonicalUrls = [...component.members].sort(compareString);
+      components.push({
+        topicId: await topicId(memberCanonicalUrls),
+        memberCanonicalUrls,
+      });
+    }
+    return components.sort((a, b) => compareString(a.topicId, b.topicId));
+  }
+
+  // Note: no clear() method. UnionFind state is permanent — callers
+  // needing a fresh accumulator should drop the instance and create a
+  // new one. removeEdge handles the disconnect path.
+}
 
 export const buildTopicRevision = async (
   input: BuildTopicRevisionInput,

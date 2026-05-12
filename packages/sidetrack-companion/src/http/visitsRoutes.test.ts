@@ -90,18 +90,21 @@ describe('per-URL HTTP routes', () => {
           id: `timeline-visit:${canonicalUrl}`,
           kind: 'timeline-visit',
           label: 'Target URL',
+          originReplicaIds: [],
           metadata: { canonicalUrl },
         },
         {
           id: 'workstream:ws_security',
           kind: 'workstream',
           label: 'Security workstream',
+          originReplicaIds: [],
           metadata: {},
         },
         {
           id: 'timeline-visit:https://example.test/anchor',
           kind: 'timeline-visit',
           label: 'Anchor URL',
+          originReplicaIds: [],
           metadata: { canonicalUrl: 'https://example.test/anchor' },
         },
       ],
@@ -285,5 +288,107 @@ describe('per-URL HTTP routes', () => {
       },
     );
     expect(response.status).toBe(400);
+  });
+});
+
+// Stage 5.2 R2 — when the companion has a connectionsStore wired and a
+// snapshot with urlProjection embedded, GET /v1/visits/projection serves
+// the projection from the snapshot (no event-log re-derivation) and
+// returns snapshotRevision in the response envelope.
+describe('per-URL HTTP routes — Stage 5.2 R2 snapshot-first read path', () => {
+  let vaultRoot: string;
+  let serverUrl: string;
+  let close: (() => Promise<void>) | null = null;
+  const bridgeKey = 'visits-snapshot-bridge-key';
+
+  const buildFakeStore = (snapshot: ConnectionsSnapshot | null): ConnectionsStore => ({
+    putCurrent: () => Promise.resolve(),
+    readCurrent: () => Promise.resolve(snapshot),
+    putDay: () => Promise.resolve(),
+    readDay: () => Promise.resolve(null),
+    listDays: () => Promise.resolve([]),
+  });
+
+  const snapshotWithProjection: ConnectionsSnapshot = {
+    scope: {},
+    nodes: [],
+    edges: [],
+    updatedAt: '2026-05-07T10:00:00.000Z',
+    nodeCount: 0,
+    edgeCount: 0,
+    urlProjection: {
+      schemaVersion: 1,
+      byCanonicalUrl: {
+        'https://snapshot.test/a': {
+          canonicalUrl: 'https://snapshot.test/a',
+          firstSeenAt: '2026-05-07T10:00:00.000Z',
+          lastSeenAt: '2026-05-07T10:00:00.000Z',
+          latestTitle: 'From snapshot',
+          host: 'snapshot.test',
+          visitCount: 1,
+          tabSessionIds: ['tses_snap'],
+          attributionHistory: [],
+        },
+      },
+    },
+    tabSessionProjection: {
+      schemaVersion: 1,
+      bySessionId: {},
+      openSessionsByTabId: {},
+    },
+    snapshotRevision: 'rev-test-abc',
+  };
+
+  beforeEach(async () => {
+    vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-visits-snapshot-'));
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const server = createCompanionHttpServer({
+      bridgeKey,
+      vaultWriter: createVaultWriter(vaultRoot),
+      vaultRoot,
+      idempotencyStore: createIdempotencyStore(vaultRoot),
+      replica,
+      eventLog,
+      connectionsStore: buildFakeStore(snapshotWithProjection),
+    });
+    const started = await startHttpServer(server, 0);
+    serverUrl = started.url;
+    close = started.close;
+  });
+
+  afterEach(async () => {
+    if (close !== null) await close();
+    close = null;
+    await rm(vaultRoot, { recursive: true, force: true });
+  });
+
+  const reqHeaders = (): Record<string, string> => ({
+    'content-type': 'application/json',
+    'x-bac-bridge-key': bridgeKey,
+  });
+
+  it('GET /v1/visits/projection returns urlProjection from the snapshot (no event-log work)', async () => {
+    const response = await fetch(`${serverUrl}/v1/visits/projection`, { headers: reqHeaders() });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      data: { byCanonicalUrl: Record<string, { latestTitle?: string }> };
+      snapshotRevision?: string;
+    };
+    expect(Object.keys(body.data.byCanonicalUrl)).toEqual(['https://snapshot.test/a']);
+    expect(body.data.byCanonicalUrl['https://snapshot.test/a']?.latestTitle).toBe('From snapshot');
+    expect(body.snapshotRevision).toBe('rev-test-abc');
+  });
+
+  it('GET /v1/visits/inbox reads from the snapshot and emits snapshotRevision', async () => {
+    const response = await fetch(`${serverUrl}/v1/visits/inbox`, { headers: reqHeaders() });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      data: { items: { canonicalUrl: string }[]; total: number };
+      snapshotRevision?: string;
+    };
+    expect(body.data.items).toHaveLength(1);
+    expect(body.data.items[0]?.canonicalUrl).toBe('https://snapshot.test/a');
+    expect(body.snapshotRevision).toBe('rev-test-abc');
   });
 });

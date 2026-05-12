@@ -483,4 +483,62 @@ describe('tab-session HTTP routes', () => {
       (await eventLog.readMerged()).filter((event) => event.type === TAB_SESSION_ATTRIBUTION_INFERRED),
     ).toHaveLength(0);
   });
+
+  it('rejects auto-apply when dependencyKey is stale (Stage 5.2 R4)', async () => {
+    await appendObservedTabSession();
+    installStrongCausalSnapshot();
+    // R4 only engages when the snapshot carries a revision the client
+    // could have read; production snapshots always do, but the
+    // strong-causal fixture is pre-R1 so we stamp one here.
+    if (currentConnectionsSnapshot !== null) {
+      currentConnectionsSnapshot = {
+        ...currentConnectionsSnapshot,
+        snapshotRevision: 'sha256-fresh-abc',
+      };
+    }
+    const response = await fetch(`${serverUrl}/v1/tabsessions/tses_a/resolve`, {
+      method: 'POST',
+      headers: headers('tabsession-auto-apply-stale-a'),
+      body: JSON.stringify({
+        dryRun: false,
+        policyMode: 'balanced',
+        dependencyKey: 'sha256-stale-does-not-match',
+      }),
+    });
+    expect(response.status).toBe(409);
+    const body = (await response.json()) as { code?: string };
+    expect(body.code).toBe('STALE_SNAPSHOT');
+  });
+
+  it('accepts auto-apply when dependencyKey matches the snapshot revision', async () => {
+    await appendObservedTabSession();
+    installStrongCausalSnapshot();
+    if (currentConnectionsSnapshot !== null) {
+      currentConnectionsSnapshot = {
+        ...currentConnectionsSnapshot,
+        snapshotRevision: 'sha256-matching-abc',
+      };
+    }
+    const response = await fetch(`${serverUrl}/v1/tabsessions/tses_a/resolve`, {
+      method: 'POST',
+      headers: headers('tabsession-auto-apply-match-a'),
+      body: JSON.stringify({
+        dryRun: false,
+        policyMode: 'balanced',
+        dependencyKey: 'sha256-matching-abc',
+      }),
+    });
+    expect(response.status).toBe(201);
+  });
+
+  it('accepts auto-apply when dependencyKey is omitted (back-compat)', async () => {
+    await appendObservedTabSession();
+    installStrongCausalSnapshot();
+    const response = await fetch(`${serverUrl}/v1/tabsessions/tses_a/resolve`, {
+      method: 'POST',
+      headers: headers('tabsession-auto-apply-no-key-a'),
+      body: JSON.stringify({ dryRun: false, policyMode: 'balanced' }),
+    });
+    expect(response.status).toBe(201);
+  });
 });
