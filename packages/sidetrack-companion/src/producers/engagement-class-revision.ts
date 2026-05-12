@@ -100,40 +100,6 @@ const canonicalVisitAliases = (canonicalUrl: string): readonly string[] => [
   `visit:${canonicalUrl}`,
 ];
 
-const buildCanonicalUrlByVisitId = (
-  events: readonly AcceptedEvent[],
-  timelineDays: readonly TimelineDayProjection[],
-): ReadonlyMap<string, string> => {
-  const byVisitId = new Map<string, string>();
-  const add = (visitId: string | undefined, canonicalUrl: string | undefined): void => {
-    if (visitId === undefined || visitId.length === 0) return;
-    if (canonicalUrl === undefined || canonicalUrl.length === 0) return;
-    const canonical = stripFragmentAndTrailingSlash(canonicalUrl);
-    byVisitId.set(visitId, canonical);
-    for (const alias of canonicalVisitAliases(canonical)) byVisitId.set(alias, canonical);
-  };
-
-  for (const event of events) {
-    if (event.type !== NAVIGATION_COMMITTED) continue;
-    if (!isNavigationCommittedPayload(event.payload)) continue;
-    add(event.payload.visitId, event.payload.canonicalUrl);
-  }
-
-  for (const day of timelineDays) {
-    for (const entry of day.entries) {
-      const canonical = stripFragmentAndTrailingSlash(entry.canonicalUrl ?? entry.url);
-      add(entry.id, canonical);
-      add(entry.url, canonical);
-      add(entry.canonicalUrl, canonical);
-      for (const alias of canonicalVisitAliases(stripFragmentAndTrailingSlash(entry.id))) {
-        add(alias, canonical);
-      }
-    }
-  }
-
-  return byVisitId;
-};
-
 const canonicalUrlForVisitId = (
   visitId: string,
   canonicalUrlByVisitId: ReadonlyMap<string, string>,
@@ -165,21 +131,6 @@ const addLineageSummary = (
   summaries.set(key, summary);
 };
 
-const buildLineageSummaries = (
-  events: readonly AcceptedEvent[],
-  canonicalUrlByVisitId: ReadonlyMap<string, string>,
-): ReadonlyMap<string, LineageSummary> => {
-  const summaries = new Map<string, LineageSummary>();
-  for (const lineage of projectSnippetLineage(events).lineages) {
-    const canonical = canonicalUrlForVisitId(lineage.copiedVisitId, canonicalUrlByVisitId);
-    addLineageSummary(summaries, lineage.copiedVisitId, lineage.destinationKind);
-    for (const alias of canonicalVisitAliases(canonical)) {
-      addLineageSummary(summaries, alias, lineage.destinationKind);
-    }
-  }
-  return summaries;
-};
-
 const selectSummary = (
   visitId: string,
   canonicalUrl: string,
@@ -187,45 +138,164 @@ const selectSummary = (
 ): LineageSummary | undefined =>
   summaries.get(visitId) ?? summaries.get(canonicalUrl) ?? summaries.get(`visit:${canonicalUrl}`);
 
-export const buildEngagementClassifierInputs = (
-  events: readonly AcceptedEvent[],
-  timelineDays: readonly TimelineDayProjection[],
-): readonly EngagementClassifierInput[] => {
-  const canonicalUrlByVisitId = buildCanonicalUrlByVisitId(events, timelineDays);
-  const latestByVisitSession = new Map<string, LatestSessionAggregate>();
+// Stage 5.2 W2a — accumulator-pattern state for the engagement
+// classifier. Foundational refactor: exposes seed + fold + derive so
+// future incremental tracks can update state per-event instead of
+// re-walking the entire event log on every drain. Today the
+// materializer still calls the one-shot `buildEngagementClassifierInputs`
+// for byte-equivalence; the streaming path is opt-in for callers that
+// want O(new-events) instead of O(total-events) per drain.
 
-  for (const event of events) {
-    if (event.type !== ENGAGEMENT_SESSION_AGGREGATED) continue;
-    if (!isEngagementSessionAggregatedPayload(event.payload)) continue;
-    const payload = event.payload;
-    const next: LatestSessionAggregate = {
-      visitId: payload.visitId,
-      sessionId: payload.sessionId,
-      engagement: payload.dimensions.engagement,
-      acceptedAtMs: event.acceptedAtMs,
-      replicaId: event.dot.replicaId,
-      seq: event.dot.seq,
-    };
-    const key = `${payload.visitId}\u0000${payload.sessionId}`;
-    const existing = latestByVisitSession.get(key);
-    if (existing === undefined || compareEventOrder(existing, next) < 0) {
-      latestByVisitSession.set(key, next);
+// Internal mutable accumulator. Returned from seed; mutated by fold.
+// derive (engagementClassifierInputsFromAccumulator) produces the
+// readonly EngagementClassifierInput[] consumed by
+// buildEngagementClassRevision.
+export interface EngagementAccumulator {
+  readonly latestByVisitSession: Map<string, LatestSessionAggregate>;
+  readonly canonicalUrlByVisitId: Map<string, string>;
+  readonly lineageSummaries: Map<string, LineageSummary>;
+}
+
+export const createEmptyEngagementAccumulator = (): EngagementAccumulator => ({
+  latestByVisitSession: new Map(),
+  canonicalUrlByVisitId: new Map(),
+  lineageSummaries: new Map(),
+});
+
+const recordCanonical = (
+  byVisitId: Map<string, string>,
+  visitId: string | undefined,
+  canonicalUrl: string | undefined,
+): void => {
+  if (visitId === undefined || visitId.length === 0) return;
+  if (canonicalUrl === undefined || canonicalUrl.length === 0) return;
+  const canonical = stripFragmentAndTrailingSlash(canonicalUrl);
+  byVisitId.set(visitId, canonical);
+  for (const alias of canonicalVisitAliases(canonical)) byVisitId.set(alias, canonical);
+};
+
+const recordTimelineDay = (
+  byVisitId: Map<string, string>,
+  day: TimelineDayProjection,
+): void => {
+  for (const entry of day.entries) {
+    const canonical = stripFragmentAndTrailingSlash(entry.canonicalUrl ?? entry.url);
+    recordCanonical(byVisitId, entry.id, canonical);
+    recordCanonical(byVisitId, entry.url, canonical);
+    recordCanonical(byVisitId, entry.canonicalUrl, canonical);
+    for (const alias of canonicalVisitAliases(stripFragmentAndTrailingSlash(entry.id))) {
+      recordCanonical(byVisitId, alias, canonical);
     }
   }
+};
 
+const foldEngagementAggregateIntoAccumulator = (
+  acc: EngagementAccumulator,
+  event: AcceptedEvent,
+): void => {
+  if (event.type !== ENGAGEMENT_SESSION_AGGREGATED) return;
+  if (!isEngagementSessionAggregatedPayload(event.payload)) return;
+  const payload = event.payload;
+  const next: LatestSessionAggregate = {
+    visitId: payload.visitId,
+    sessionId: payload.sessionId,
+    engagement: payload.dimensions.engagement,
+    acceptedAtMs: event.acceptedAtMs,
+    replicaId: event.dot.replicaId,
+    seq: event.dot.seq,
+  };
+  const key = `${payload.visitId}\u0000${payload.sessionId}`;
+  const existing = acc.latestByVisitSession.get(key);
+  if (existing === undefined || compareEventOrder(existing, next) < 0) {
+    acc.latestByVisitSession.set(key, next);
+  }
+};
+
+const foldNavigationIntoAccumulator = (
+  acc: EngagementAccumulator,
+  event: AcceptedEvent,
+): void => {
+  if (event.type !== NAVIGATION_COMMITTED) return;
+  if (!isNavigationCommittedPayload(event.payload)) return;
+  recordCanonical(acc.canonicalUrlByVisitId, event.payload.visitId, event.payload.canonicalUrl);
+};
+
+/**
+ * Stage 5.2 W2a — full-pass seed. Walks events + timeline days once
+ * to populate the accumulator. Equivalent to running fold over every
+ * event; future incremental callers seed at companion boot, then fold
+ * each newly accepted event into the same state.
+ */
+export const seedEngagementAccumulator = (
+  events: readonly AcceptedEvent[],
+  timelineDays: readonly TimelineDayProjection[],
+): EngagementAccumulator => {
+  const acc = createEmptyEngagementAccumulator();
+  // Navigation events first establish canonical-URL mappings the
+  // lineage-summary computation may rely on (selection events resolve
+  // copiedVisitId → canonical via this map).
+  for (const event of events) {
+    foldNavigationIntoAccumulator(acc, event);
+  }
+  for (const day of timelineDays) {
+    recordTimelineDay(acc.canonicalUrlByVisitId, day);
+  }
+  for (const event of events) {
+    foldEngagementAggregateIntoAccumulator(acc, event);
+  }
+  // Snippet lineage runs in one pass over selection events; the
+  // upstream `projectSnippetLineage` is not yet incremental. A future
+  // PR can refactor it the same way (state + per-event fold). Until
+  // then, callers needing fresh lineage after new selection events
+  // must re-seed.
+  for (const lineage of projectSnippetLineage(events).lineages) {
+    const canonical = canonicalUrlForVisitId(lineage.copiedVisitId, acc.canonicalUrlByVisitId);
+    addLineageSummary(acc.lineageSummaries, lineage.copiedVisitId, lineage.destinationKind);
+    for (const alias of canonicalVisitAliases(canonical)) {
+      addLineageSummary(acc.lineageSummaries, alias, lineage.destinationKind);
+    }
+  }
+  return acc;
+};
+
+/**
+ * Stage 5.2 W2a — per-event fold. Updates the accumulator for one
+ * accepted event. Handles ENGAGEMENT_SESSION_AGGREGATED (canonical
+ * use case) and NAVIGATION_COMMITTED (so canonical-URL mappings stay
+ * fresh for visits seen after seed).
+ *
+ * Does NOT update lineageSummaries — snippet lineage is still
+ * batch-projected via projectSnippetLineage. A SELECTION_COPIED /
+ * SELECTION_PASTED fold belongs with the snippet lineage refactor.
+ */
+export const foldEventIntoEngagementAccumulator = (
+  acc: EngagementAccumulator,
+  event: AcceptedEvent,
+): void => {
+  foldNavigationIntoAccumulator(acc, event);
+  foldEngagementAggregateIntoAccumulator(acc, event);
+};
+
+/**
+ * Stage 5.2 W2a — derive classifier inputs from the current
+ * accumulator state. Byte-equivalent to running the one-shot
+ * `buildEngagementClassifierInputs(events, days)` over the events
+ * that populated the accumulator.
+ */
+export const engagementClassifierInputsFromAccumulator = (
+  acc: EngagementAccumulator,
+): readonly EngagementClassifierInput[] => {
   const totalsByVisit = new Map<string, EngagementDimensions>();
-  for (const aggregate of latestByVisitSession.values()) {
+  for (const aggregate of acc.latestByVisitSession.values()) {
     const existing = totalsByVisit.get(aggregate.visitId) ?? emptyEngagement();
     totalsByVisit.set(aggregate.visitId, mergeEngagement(existing, aggregate.engagement));
   }
-
-  const lineageSummaries = buildLineageSummaries(events, canonicalUrlByVisitId);
   const inputs: EngagementClassifierInput[] = [];
   for (const [visitId, engagement] of [...totalsByVisit.entries()].sort((a, b) =>
     a[0].localeCompare(b[0]),
   )) {
-    const canonicalUrl = canonicalUrlForVisitId(visitId, canonicalUrlByVisitId);
-    const summary = selectSummary(visitId, canonicalUrl, lineageSummaries);
+    const canonicalUrl = canonicalUrlForVisitId(visitId, acc.canonicalUrlByVisitId);
+    const summary = selectSummary(visitId, canonicalUrl, acc.lineageSummaries);
     inputs.push({
       visitId,
       canonicalUrl,
@@ -236,6 +306,13 @@ export const buildEngagementClassifierInputs = (
   }
   return inputs;
 };
+
+export const buildEngagementClassifierInputs = (
+  events: readonly AcceptedEvent[],
+  timelineDays: readonly TimelineDayProjection[],
+): readonly EngagementClassifierInput[] =>
+  engagementClassifierInputsFromAccumulator(seedEngagementAccumulator(events, timelineDays));
+
 
 export const buildEngagementClassRevisionFromEvents = (
   events: readonly AcceptedEvent[],
