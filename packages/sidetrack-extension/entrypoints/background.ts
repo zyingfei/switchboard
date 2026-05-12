@@ -56,6 +56,10 @@ import {
   registerTabLifecycleListeners,
 } from '../src/background/listeners/tabs';
 import { registerDefaultWebNavigationListeners } from '../src/background/listeners/web-navigation';
+import {
+  createEdgeEventDrainSingleFlight,
+  summarizeEdgeEventDrain,
+} from '../src/background/storage/edge-event-drain';
 import { IndexedDbEventBuffer } from '../src/background/storage/indexeddb-event-buffer';
 import type { BufferedEvent } from '../src/background/storage/in-memory-event-buffer';
 import {
@@ -3145,27 +3149,100 @@ export default defineBackground(() => {
     return `${event.streamName}:${event.observedAt.slice(0, 10)}`;
   };
 
-  const drainBufferedEdgeEvents = async (): Promise<{
+  const acceptedEdgeEventStreamNames = new Set<BufferedEvent['streamName']>([
+    'engagement.interval.observed',
+    'engagement.session.aggregated',
+    'selection.copied',
+    'selection.pasted',
+    VISUAL_FINGERPRINT_OBSERVED,
+  ]);
+  const EDGE_EVENT_DRAIN_BATCH_SIZE = 10;
+
+  const countBufferedEventsByType = (
+    events: readonly BufferedEvent[],
+  ): Record<string, number> => {
+    const byType: Record<string, number> = {};
+    for (const event of events) {
+      byType[event.streamName] = (byType[event.streamName] ?? 0) + 1;
+    }
+    return byType;
+  };
+
+  const mergeCounts = (
+    ...counts: readonly Record<string, number>[]
+  ): Record<string, number> => {
+    const merged: Record<string, number> = {};
+    for (const count of counts) {
+      for (const [key, value] of Object.entries(count)) {
+        merged[key] = (merged[key] ?? 0) + value;
+      }
+    }
+    return merged;
+  };
+
+  interface EdgeEventDrainStats {
     readonly uploaded: number;
+    readonly evicted: number;
     readonly remaining: number;
     readonly skipped: number;
     readonly uploadedByType: Record<string, number>;
-  }> => {
+    readonly evictedByType: Record<string, number>;
+    readonly skippedByReason: Record<string, number>;
+  }
+
+  const drainBufferedEdgeEventsOnce = async (): Promise<EdgeEventDrainStats> => {
     const companion = await readTimelineCompanionConfig();
     if (companion === null || companion.url.trim().length === 0) {
       return {
         uploaded: 0,
+        evicted: 0,
         remaining: await engagementEventBuffer.count(),
         skipped: 0,
         uploadedByType: {},
+        evictedByType: {},
+        skippedByReason: {},
       };
     }
 
-    const batch = await engagementEventBuffer.peek(100);
+    const batch = await engagementEventBuffer.peek(EDGE_EVENT_DRAIN_BATCH_SIZE);
     if (batch.length === 0) {
-      return { uploaded: 0, remaining: 0, skipped: 0, uploadedByType: {} };
+      return {
+        uploaded: 0,
+        evicted: 0,
+        remaining: 0,
+        skipped: 0,
+        uploadedByType: {},
+        evictedByType: {},
+        skippedByReason: {},
+      };
     }
-    const events = batch.map((event) => ({
+
+    const routeBatch = batch.filter((event) => acceptedEdgeEventStreamNames.has(event.streamName));
+    const locallyRejectedBatch = batch.filter(
+      (event) => !acceptedEdgeEventStreamNames.has(event.streamName),
+    );
+    const locallyEvicted =
+      locallyRejectedBatch.length === 0
+        ? 0
+        : await engagementEventBuffer.deleteMany(locallyRejectedBatch);
+    const localEvictedByType = countBufferedEventsByType(locallyRejectedBatch);
+    const localSkippedByReason: Record<string, number> =
+      locallyRejectedBatch.length === 0
+        ? {}
+        : { 'invalid-event-type': locallyRejectedBatch.length };
+    if (routeBatch.length === 0) {
+      return {
+        uploaded: 0,
+        evicted: locallyEvicted,
+        remaining: await engagementEventBuffer.count(),
+        skipped: locallyRejectedBatch.length,
+        uploadedByType: {},
+        evictedByType: localEvictedByType,
+        skippedByReason: localSkippedByReason,
+      };
+    }
+
+    const events = routeBatch.map((event) => ({
       clientEventId: `edge:${event.streamName}:${event.replicaId}:${String(event.lamport)}`,
       dot: { replicaId: event.replicaId, seq: event.lamport },
       deps: {},
@@ -3194,26 +3271,25 @@ export default defineBackground(() => {
     };
     const imported = json.data?.imported ?? [];
     const skipped = json.data?.skipped ?? [];
-    const acked = new Set<string>(
-      [...imported, ...skipped.filter((event) => event.reason === 'already-imported')].map(
-        (event) => `${event.replicaId}:${String(event.seq)}`,
-      ),
-    );
-    const ackedBatch = batch.filter((event) =>
-      acked.has(`${event.replicaId}:${String(event.lamport)}`),
-    );
-    const uploadedByType: Record<string, number> = {};
-    for (const event of ackedBatch) {
-      uploadedByType[event.streamName] = (uploadedByType[event.streamName] ?? 0) + 1;
-    }
-    const deleted = await engagementEventBuffer.deleteMany(ackedBatch);
+    const summary = summarizeEdgeEventDrain(routeBatch, imported, skipped);
+    const deleted = await engagementEventBuffer.deleteMany(summary.acceptedEvents);
+    const evicted =
+      locallyEvicted + (await engagementEventBuffer.deleteMany(summary.permanentlyRejectedEvents));
     return {
       uploaded: deleted,
+      evicted,
       remaining: await engagementEventBuffer.count(),
-      skipped: skipped.length,
-      uploadedByType,
+      skipped: skipped.length + locallyRejectedBatch.length,
+      uploadedByType: summary.uploadedByType,
+      evictedByType: mergeCounts(
+        localEvictedByType,
+        summary.evictedByType,
+      ),
+      skippedByReason: mergeCounts(localSkippedByReason, summary.skippedByReason),
     };
   };
+
+  const drainBufferedEdgeEvents = createEdgeEventDrainSingleFlight(drainBufferedEdgeEventsOnce);
 
   // Drop reminders bound to thread bac_ids that no longer exist.
   // Cleanup pass for the historical mess caused by the pre-fix

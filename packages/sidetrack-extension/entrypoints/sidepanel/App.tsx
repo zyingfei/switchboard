@@ -708,6 +708,8 @@ const App = () => {
   tabSessionSuggestionsRef.current = tabSessionSuggestions;
   const urlSuggestionsRef = useRef(urlSuggestions);
   urlSuggestionsRef.current = urlSuggestions;
+  const tabSessionSuggestionLoadInFlightRef = useRef(false);
+  const urlSuggestionLoadInFlightRef = useRef(false);
   const [pendingCodingOffers, setPendingCodingOffers] = useState<readonly OfferRecord[]>([]);
   // Per-row dismissals for the Needs-Organize inline suggestion. Local
   // (per-session) — survives panel close but not extension reload.
@@ -788,17 +790,47 @@ const App = () => {
     // state at undefined is the honest answer.
     const isTrackableScheme = (url: string): boolean =>
       url.startsWith('https://') || url.startsWith('http://');
+    const applyActiveTab = (tabs: readonly chrome.tabs.Tab[]): void => {
+      if (cancelled) return;
+      const tab = tabs.find(
+        (candidate) =>
+          candidate.active === true &&
+          typeof candidate.url === 'string' &&
+          candidate.url.length > 0 &&
+          isTrackableScheme(candidate.url),
+      );
+      const url = tab?.url;
+      const title = tab?.title;
+      setLiveActiveTabUrl(url);
+      setLiveActiveTabTitle(
+        url !== undefined && title !== undefined && title.length > 0 ? title : undefined,
+      );
+    };
     const refresh = (): void => {
       try {
         chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
           if (cancelled) return;
-          const url = tabs[0]?.url;
-          const title = tabs[0]?.title;
-          const trackable = url !== undefined && url.length > 0 && isTrackableScheme(url);
-          setLiveActiveTabUrl(trackable ? url : undefined);
-          setLiveActiveTabTitle(
-            trackable && title !== undefined && title.length > 0 ? title : undefined,
-          );
+          if (
+            tabs.some(
+              (tab) =>
+                tab.active === true &&
+                typeof tab.url === 'string' &&
+                tab.url.length > 0 &&
+                isTrackableScheme(tab.url),
+            )
+          ) {
+            applyActiveTab(tabs);
+            return;
+          }
+          // In the headed recorder, the "side panel" can be a regular
+          // chrome-extension:// tab. That tab may be the last-focused
+          // window even though the user is actively browsing in another
+          // window. Fall back to all active tabs and pick an http(s) tab
+          // so Current-tab renders from live tab state instead of waiting
+          // for the slower projection poll.
+          chrome.tabs.query({ active: true }, (allActiveTabs) => {
+            applyActiveTab(allActiveTabs);
+          });
         });
       } catch {
         // Test harness — leave state untouched.
@@ -1270,6 +1302,34 @@ const App = () => {
         setTabSessionLoading(true);
         setTabSessionError(null);
       }
+      const loadUrlState = async (): Promise<void> => {
+        try {
+          const [urlProj, urlInboxResp] = await Promise.all([
+            fetchCompanionJson<unknown>('/v1/visits/projection'),
+            fetchCompanionJson<unknown>('/v1/visits/inbox?limit=51&offset=0'),
+          ]);
+          if (isUrlProjection(urlProj) && isUrlInboxData(urlInboxResp)) {
+            setUrlProjection(urlProj);
+            setUrlInbox(urlInboxResp);
+            if (!urlSuggestionLoadInFlightRef.current) {
+              urlSuggestionLoadInFlightRef.current = true;
+              void loadUrlSuggestions(urlInboxResp, urlSuggestionsRef.current, forceRefetch)
+                .then(setUrlSuggestions)
+                .catch(() => undefined)
+                .finally(() => {
+                  urlSuggestionLoadInFlightRef.current = false;
+                });
+            }
+          } else {
+            // eslint-disable-next-line no-console
+            console.warn('[sidetrack:panel] loadTabSessions — invalid /v1/visits payload');
+          }
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn('[sidetrack:panel] loadTabSessions — /v1/visits fetch failed', err);
+        }
+      };
+      void loadUrlState();
       try {
         const [tabProjection, tabInbox] = await Promise.all([
           fetchCompanionJson<unknown>('/v1/tabsessions/projection'),
@@ -1280,14 +1340,22 @@ const App = () => {
         }
         setTabSessionProjection(tabProjection);
         setTabSessionInbox(tabInbox);
-        setTabSessionSuggestions(
-          await loadTabSessionSuggestions(
+        if (!tabSessionSuggestionLoadInFlightRef.current) {
+          tabSessionSuggestionLoadInFlightRef.current = true;
+          void loadTabSessionSuggestions(
             tabProjection,
             tabInbox,
             tabSessionSuggestionsRef.current,
             forceRefetch,
-          ),
-        );
+          )
+            .then(setTabSessionSuggestions)
+            .catch(() => {
+              if (!background) setTabSessionSuggestions({});
+            })
+            .finally(() => {
+              tabSessionSuggestionLoadInFlightRef.current = false;
+            });
+        }
         // Successful fetch — clear any error banner left over from a
         // prior poll. Doing it here (vs at start) keeps the banner
         // sticky until the situation actually recovers.
@@ -1306,29 +1374,6 @@ const App = () => {
         }
       } finally {
         if (!background) setTabSessionLoading(false);
-      }
-      // URL projection (Phase B) is fetched independently — older
-      // companions that don't yet expose /v1/visits/* return 404, which
-      // we tolerate by leaving the URL state empty. Tab-session state
-      // above keeps working in that case.
-      try {
-        const [urlProj, urlInboxResp] = await Promise.all([
-          fetchCompanionJson<unknown>('/v1/visits/projection'),
-          fetchCompanionJson<unknown>('/v1/visits/inbox?limit=51&offset=0'),
-        ]);
-        if (isUrlProjection(urlProj) && isUrlInboxData(urlInboxResp)) {
-          setUrlProjection(urlProj);
-          setUrlInbox(urlInboxResp);
-          setUrlSuggestions(
-            await loadUrlSuggestions(urlInboxResp, urlSuggestionsRef.current, forceRefetch),
-          );
-        } else {
-          // eslint-disable-next-line no-console
-          console.warn('[sidetrack:panel] loadTabSessions — invalid /v1/visits payload');
-        }
-      } catch (err) {
-        // eslint-disable-next-line no-console
-        console.warn('[sidetrack:panel] loadTabSessions — /v1/visits fetch failed', err);
       }
     },
     [bridgeKey, fetchCompanionJson, loadTabSessionSuggestions, loadUrlSuggestions, port],
