@@ -49,7 +49,7 @@ describe('InboxCard', () => {
     const onAttribute = vi.fn();
     render(<InboxCard record={record()} workstreams={workstreams} onAttribute={onAttribute} />);
 
-    expect(screen.getByTitle('No tab-session attribution')).toHaveTextContent('?');
+    expect(screen.getByTitle('No attribution')).toHaveTextContent('?');
     fireEvent.change(screen.getByRole('combobox'), { target: { value: 'ws_switchboard' } });
     fireEvent.click(screen.getByRole('button', { name: 'Move' }));
 
@@ -73,9 +73,7 @@ describe('InboxCard', () => {
       />,
     );
 
-    expect(screen.getByTitle('Attributed to Security (user_asserted)')).toHaveTextContent(
-      'Security',
-    );
+    expect(screen.getByTitle('Moved here by you: Security')).toHaveTextContent('Security');
     fireEvent.click(screen.getByRole('button', { name: 'Not in any workstream' }));
 
     expect(onAttribute).toHaveBeenCalledWith('tses_test', null);

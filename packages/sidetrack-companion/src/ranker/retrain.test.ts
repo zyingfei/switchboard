@@ -169,6 +169,68 @@ describe('ranker retraining loop', () => {
     });
   });
 
+  it('skips with reason `cooldown` when threshold cleared but last train is too recent', () => {
+    const base = fingerprintFeedbackTrainingLabels(projection(manyLabels(10)));
+    const atThreshold = fingerprintFeedbackTrainingLabels(projection(manyLabels(60)));
+    const state: RankerRetrainState = {
+      schemaVersion: 1,
+      lastTrainedLabelDatasetHash: base.hash,
+      lastTrainedLabelCount: base.labelCount,
+      lastTrainedPositiveLabelCount: base.positiveLabelCount,
+      lastTrainedNegativeLabelCount: base.negativeLabelCount,
+      activeRevisionId: 'old-revision',
+      rankerTrainingDatasetHash: '0'.repeat(64),
+      updatedAt: observedAtMs,
+    };
+    // 2 minutes after the last train, well within the 10-minute cooldown.
+    expect(
+      planRankerRetrain({
+        fingerprint: atThreshold,
+        state,
+        threshold: 50,
+        cooldownMs: 10 * 60_000,
+        nowMs: observedAtMs + 2 * 60_000,
+      }),
+    ).toMatchObject({ action: 'skip', reason: 'cooldown', newLabelCount: 50 });
+    // 11 minutes later → past the cooldown, trains.
+    expect(
+      planRankerRetrain({
+        fingerprint: atThreshold,
+        state,
+        threshold: 50,
+        cooldownMs: 10 * 60_000,
+        nowMs: observedAtMs + 11 * 60_000,
+      }),
+    ).toMatchObject({ action: 'train', newLabelCount: 50 });
+  });
+
+  it('force flag bypasses below-threshold + cooldown', () => {
+    const base = fingerprintFeedbackTrainingLabels(projection(manyLabels(10)));
+    const tinyDelta = fingerprintFeedbackTrainingLabels(projection(manyLabels(11)));
+    const state: RankerRetrainState = {
+      schemaVersion: 1,
+      lastTrainedLabelDatasetHash: base.hash,
+      lastTrainedLabelCount: base.labelCount,
+      lastTrainedPositiveLabelCount: base.positiveLabelCount,
+      lastTrainedNegativeLabelCount: base.negativeLabelCount,
+      activeRevisionId: 'old-revision',
+      rankerTrainingDatasetHash: '0'.repeat(64),
+      updatedAt: observedAtMs,
+    };
+    // newLabelCount=1, threshold=50, cooldown=10min, nowMs = same as
+    // last train. Without force this would be 'below-threshold'.
+    expect(
+      planRankerRetrain({
+        fingerprint: tinyDelta,
+        state,
+        threshold: 50,
+        cooldownMs: 10 * 60_000,
+        nowMs: observedAtMs,
+        force: true,
+      }),
+    ).toMatchObject({ action: 'train', newLabelCount: 1 });
+  });
+
   it('builds ranker training candidates from feedback labels and snapshot features', () => {
     const from = 'https://example.test/a';
     const positive = 'https://example.test/b';

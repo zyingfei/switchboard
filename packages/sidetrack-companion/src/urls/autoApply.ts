@@ -13,7 +13,19 @@ import { projectUrls, type UrlProjection } from './projection.js';
 export type AutoApplyUrlAttributionStatus =
   | 'applied'
   | 'skipped-existing-attribution'
-  | 'skipped-policy';
+  | 'skipped-policy'
+  | 'skipped-disabled';
+
+// Env gate. Auto-apply is OFF by default — first-time rollout flips
+// this on per dogfood vault. Reversible: users can always re-organize
+// the URL themselves (their `user_asserted` move wins precedence tie
+// against the synthesized `inferred` attribution).
+export const URL_RESOLVER_AUTO_APPLY_ENV = 'SIDETRACK_URL_RESOLVER_AUTO_APPLY';
+
+const autoApplyEnabled = (): boolean => {
+  const raw = process.env[URL_RESOLVER_AUTO_APPLY_ENV];
+  return raw === '1' || raw === 'true';
+};
 
 export interface AutoApplyUrlAttributionResult {
   readonly status: AutoApplyUrlAttributionStatus;
@@ -55,6 +67,17 @@ export const autoApplyUrlAttribution = async (
     ...(input.policyMode === undefined ? {} : { policyMode: input.policyMode }),
     ...(input.policyTelemetry === undefined ? {} : { policyTelemetry: input.policyTelemetry }),
   });
+
+  // Env gate. We compute the resolution either way (cheap, side-effect-free)
+  // so the response surface in dryRun-like calls stays consistent. We just
+  // don't commit the event when auto-apply is off.
+  if (!autoApplyEnabled()) {
+    return {
+      status: 'skipped-disabled',
+      resolution,
+      projection: beforeProjection,
+    };
+  }
 
   if (existing !== undefined && existing.source !== 'inferred') {
     return {

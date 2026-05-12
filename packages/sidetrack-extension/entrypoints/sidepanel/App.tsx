@@ -638,6 +638,11 @@ const App = () => {
   // here pulls activeTabUrl into the side panel immediately, without
   // waiting for the SW round-trip.
   const [liveActiveTabUrl, setLiveActiveTabUrl] = useState<string | undefined>(undefined);
+  // Keep a ref so loadTabSessions (called from background polls) can
+  // read the current focused-tab URL without rebuilding the callback
+  // on every focus change.
+  const liveActiveTabUrlRef = useRef(liveActiveTabUrl);
+  liveActiveTabUrlRef.current = liveActiveTabUrl;
   const [liveActiveTabTitle, setLiveActiveTabTitle] = useState<string | undefined>(undefined);
   const [threadSearchOpen, setThreadSearchOpen] = useState(false);
   const [threadSearchQuery, setThreadSearchQuery] = useState('');
@@ -710,6 +715,12 @@ const App = () => {
   urlSuggestionsRef.current = urlSuggestions;
   const tabSessionSuggestionLoadInFlightRef = useRef(false);
   const urlSuggestionLoadInFlightRef = useRef(false);
+  // URL auto-apply is reversible (your manual move beats the inferred
+  // one on precedence tie-break) but we still don't want to retry the
+  // same URL on every poll cycle. Track in-flight + completed attempts
+  // per canonical URL so each URL is auto-applied at most once per
+  // session per server response.
+  const urlAutoApplyInFlightRef = useRef<Set<string>>(new Set<string>());
   const [pendingCodingOffers, setPendingCodingOffers] = useState<readonly OfferRecord[]>([]);
   // Per-row dismissals for the Needs-Organize inline suggestion. Local
   // (per-session) — survives panel close but not extension reload.
@@ -1243,10 +1254,14 @@ const App = () => {
       inbox: UrlInboxData,
       previous: Readonly<Record<string, UrlResolutionResult>>,
       forceRefetch = false,
+      extraCanonicalUrls: readonly string[] = [],
     ): Promise<Record<string, UrlResolutionResult>> => {
-      const canonicalUrls = inbox.items
+      const inboxCanonicalUrls = inbox.items
         .filter((item) => item.currentAttribution === undefined)
         .map((item) => item.canonicalUrl);
+      // Merge inbox URLs with caller-supplied extras (e.g., the focused
+      // tab's URL when it's not in the inbox top page). Dedupe by Set.
+      const canonicalUrls = [...new Set<string>([...inboxCanonicalUrls, ...extraCanonicalUrls])];
       const next: Record<string, UrlResolutionResult> = {};
       for (const url of canonicalUrls) {
         if (!forceRefetch && previous[url] !== undefined) next[url] = previous[url];
@@ -1313,7 +1328,26 @@ const App = () => {
             setUrlInbox(urlInboxResp);
             if (!urlSuggestionLoadInFlightRef.current) {
               urlSuggestionLoadInFlightRef.current = true;
-              void loadUrlSuggestions(urlInboxResp, urlSuggestionsRef.current, forceRefetch)
+              // Include the currently-focused tab's URL in the suggestion
+              // fetch even when it's not in the inbox top page — otherwise
+              // the Current Tab card renders without a suggestion for
+              // late-page or attributed URLs the resolver could still
+              // give us advice on. Read from the latest active-tab state.
+              const focusedCanonical =
+                liveActiveTabUrlRef.current ??
+                state.activeTabUrl ??
+                state.currentTab?.tabSnapshot?.url ??
+                state.currentTab?.threadUrl;
+              const focusedExtras =
+                typeof focusedCanonical === 'string' && focusedCanonical.length > 0
+                  ? [focusedCanonical]
+                  : [];
+              void loadUrlSuggestions(
+                urlInboxResp,
+                urlSuggestionsRef.current,
+                forceRefetch,
+                focusedExtras,
+              )
                 .then(setUrlSuggestions)
                 .catch(() => undefined)
                 .finally(() => {
@@ -2287,6 +2321,58 @@ const App = () => {
   const handleTabSessionAttribute = (tabSessionId: string, workstreamId: string | null) => {
     void runAction(() => attributeTabSessionToWorkstream(tabSessionId, workstreamId));
   };
+
+  // High-confidence URL resolver auto-apply. Companion gate is
+  // `SIDETRACK_URL_RESOLVER_AUTO_APPLY=1`; when it's off the POST
+  // returns `skipped-disabled` and the projection is unchanged. We
+  // still attempt the call so that flipping the env on takes effect
+  // without an extension reload. Bounded by:
+  //   1. Only URLs with `decision.action === 'auto-apply'`.
+  //   2. Only URLs with no existing user-asserted attribution
+  //      (the companion enforces this too as a safety check).
+  //   3. Track in-flight per-URL to avoid spamming the same URL.
+  const triggerUrlAutoApply = useCallback(
+    async (canonicalUrl: string): Promise<void> => {
+      if (port.length === 0 || bridgeKey.length === 0) return;
+      if (urlAutoApplyInFlightRef.current.has(canonicalUrl)) return;
+      urlAutoApplyInFlightRef.current.add(canonicalUrl);
+      try {
+        await fetch(
+          `http://127.0.0.1:${port}/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve`,
+          {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'idempotency-key': `url-auto-apply-${canonicalUrl}-${String(Date.now())}`,
+              'x-bac-bridge-key': bridgeKey,
+            },
+            body: JSON.stringify({ dryRun: false, policyMode: 'balanced' }),
+          },
+        );
+        // Success or skipped-disabled — re-fetch suggestions so the
+        // panel reflects the applied attribution (or stays as-is when
+        // disabled).
+        await loadTabSessions({ background: true, forceRefetchSuggestions: true });
+      } catch {
+        // Silent — auto-apply is best-effort.
+      } finally {
+        urlAutoApplyInFlightRef.current.delete(canonicalUrl);
+      }
+    },
+    [bridgeKey, port, loadTabSessions],
+  );
+
+  // Trigger auto-apply when fresh suggestions arrive. Effect debounces
+  // implicitly by depending on `urlSuggestions` — runs once per fetch.
+  useEffect(() => {
+    if (urlProjection === null) return;
+    for (const [canonicalUrl, result] of Object.entries(urlSuggestions)) {
+      if (result.decision.action !== 'auto-apply') continue;
+      const existing = urlProjection.byCanonicalUrl[canonicalUrl]?.currentAttribution;
+      if (existing !== undefined && existing.source !== 'inferred') continue;
+      void triggerUrlAutoApply(canonicalUrl);
+    }
+  }, [urlSuggestions, urlProjection, triggerUrlAutoApply]);
 
   // Wrapper used by the Inbox + Current-tab card after the Phase B
   // switchover. The card's record is a synthesized TabSessionRecord
@@ -5293,7 +5379,14 @@ const App = () => {
         </form>
       ) : null}
 
-      <div className="ws-drop-strip" aria-label="Drop thread on a workstream">
+      {/* Workstream chip selector. Hidden on Inbox + Connections
+          views: in those views the user is triaging unattributed
+          pages or exploring the graph, not picking a workstream to
+          focus. "Workstream:" label here renames PR-141-era
+          "focused workstream" wording — the browser tab is the
+          only "focus" in the panel. */}
+      {viewMode === 'workstream' || viewMode === 'all' ? (
+      <div className="ws-drop-strip" aria-label="Pick a workstream">
         {state.workstreams.map((workstream) => (
           <button
             type="button"
@@ -5321,6 +5414,7 @@ const App = () => {
           </button>
         ))}
       </div>
+      ) : null}
 
       {wsPickerOpen ? (
         <WorkstreamPicker
@@ -5619,8 +5713,20 @@ const App = () => {
           // urlInbox; each record's `tabSessionId` field carries the
           // canonical URL, and onAttribute dispatches to the URL
           // attribution endpoint.
+          //
+          // Dedupe against the focused tab: the Current Tab card at
+          // the top of the panel is its own surface for the URL in
+          // focus, so showing the same canonical URL twice (once at
+          // the top, once in the Inbox list) is the "dup items"
+          // confusion. Filter it out here.
           inbox={{
-            items: urlInbox.items.map(tabSessionRecordFromUrl),
+            items: urlInbox.items
+              .map(tabSessionRecordFromUrl)
+              .filter(
+                (item) =>
+                  focusedUrlRecord === undefined ||
+                  item.tabSessionId !== focusedUrlRecord.canonicalUrl,
+              ),
             total: urlInbox.total,
             limit: urlInbox.limit,
             offset: urlInbox.offset,

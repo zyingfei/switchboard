@@ -616,21 +616,61 @@ button:disabled {
   font-size: 10px;
 }
 
-.tab-session-badge.is-asserted {
+/* user-asserted: you moved it (solid green). */
+.tab-session-badge.is-user-asserted {
   background: var(--green-bg);
   color: var(--green);
   border-color: var(--green-tint);
 }
 
+/* inferred: resolver auto-applied. Solid but tinted differently so
+   it's easy to scan "I did this" vs "the system did this." */
+.tab-session-badge.is-inferred {
+  background: var(--blue-bg, var(--green-bg));
+  color: var(--blue, var(--green));
+  border-color: var(--blue-tint, var(--green-tint));
+}
+
+/* thread: derived from thread→workstream membership. Softer treatment
+   because it's a transitive derivation, not a direct user action. */
+.tab-session-badge.is-thread {
+  background: var(--paper);
+  color: var(--ink-2);
+  border-color: var(--hair-soft);
+  border-style: dotted;
+}
+
+/* suggested: not applied yet, resolver has a guess. Dashed border
+   distinguishes it from any "this is settled" state. */
 .tab-session-badge.is-suggested {
   background: var(--paper);
   color: var(--amber);
   border-color: var(--amber-tint);
+  border-style: dashed;
 }
 
 .tab-session-badge.is-empty {
   background: var(--ink-0);
   color: var(--ink-3);
+}
+
+.tab-session-badge-marker {
+  margin-right: 4px;
+  font-size: 9px;
+  opacity: 0.85;
+}
+
+.tab-session-badge-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Backwards-compat: keep `.is-asserted` styled like user-asserted in
+   case any code still emits it. */
+.tab-session-badge.is-asserted {
+  background: var(--green-bg);
+  color: var(--green);
+  border-color: var(--green-tint);
 }
 
 .tab-session-suggestion-banner {

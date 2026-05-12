@@ -228,6 +228,9 @@ describe('per-URL HTTP routes', () => {
     const canonicalUrl = 'https://example.test/strong-url';
     await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_a' });
     installStrongUrlSnapshot(canonicalUrl);
+    // URL auto-apply is OFF by default; opt in for this test.
+    const priorEnv = process.env['SIDETRACK_URL_RESOLVER_AUTO_APPLY'];
+    process.env['SIDETRACK_URL_RESOLVER_AUTO_APPLY'] = '1';
 
     const response = await fetch(
       `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve`,
@@ -237,6 +240,8 @@ describe('per-URL HTTP routes', () => {
         body: JSON.stringify({ dryRun: false, policyMode: 'balanced' }),
       },
     );
+    if (priorEnv === undefined) delete process.env['SIDETRACK_URL_RESOLVER_AUTO_APPLY'];
+    else process.env['SIDETRACK_URL_RESOLVER_AUTO_APPLY'] = priorEnv;
 
     expect(response.status).toBe(201);
     const body = (await response.json()) as {
