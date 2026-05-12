@@ -42,8 +42,10 @@ import {
   readClosestVisitRankerRevision,
 } from '../../producers/closest-visit-revision.js';
 import {
+  DEFAULT_TOPIC_COSINE_THRESHOLD,
   TOPIC_HDBSCAN_REVISION_KEY,
   TOPIC_UNION_FIND_REVISION_KEY,
+  createTopicRevisionId,
   createTopicRevisionStore,
   type TopicAlgorithmVersion,
   type TopicRevision,
@@ -432,12 +434,28 @@ export const createConnectionsMaterializer = (
     }
     const previousTopicRevision = await topicRevisionStore.readActiveRevision();
     await yieldToEventLoop();
-    const topicRevision = await buildSelectedTopicRevision({
-      visits: timelineDays.flatMap((day) => day.entries.map(topicVisitFromEntry)),
-      visitSimilarity,
-      ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
+    // Stage 5.2 W4 — topic-revision skip-gate. The TopicRevision id is
+    // derived from (visitSimilarityRevisionId + cosineThreshold +
+    // algorithmVersion). If the previous active revision already matches
+    // the id we'd produce now, skip the union-find / HDBSCAN pass and
+    // reuse it. Pairs naturally with W3: when visit similarity cache-hits,
+    // topics inherit the cache hit downstream.
+    const expectedTopicRevisionId = await createTopicRevisionId({
+      visitSimilarityRevisionId: visitSimilarity.revisionId,
+      cosineThreshold: DEFAULT_TOPIC_COSINE_THRESHOLD,
+      algorithmVersion: topicRevisionAlgorithm,
     });
-    await topicRevisionStore.putActiveRevision(topicRevision);
+    const topicRevision =
+      previousTopicRevision !== null && previousTopicRevision.revisionId === expectedTopicRevisionId
+        ? previousTopicRevision
+        : await buildSelectedTopicRevision({
+            visits: timelineDays.flatMap((day) => day.entries.map(topicVisitFromEntry)),
+            visitSimilarity,
+            ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
+          });
+    if (topicRevision !== previousTopicRevision) {
+      await topicRevisionStore.putActiveRevision(topicRevision);
+    }
     await yieldToEventLoop();
     const input: ConnectionsInput = {
       events: merged,
