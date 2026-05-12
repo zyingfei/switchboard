@@ -13,6 +13,14 @@ import { launchStealthPersistentContext } from './stealth-runtime';
 
 let stealthExperimentWarningPrinted = false;
 
+// Sequential allocation for the optional CDP debug port. The recorder
+// launches two browsers (Companion A + Companion B) in the same
+// process; if both bind the SAME port the second launch silently fails
+// to expose CDP at best, and at worst it aborts the launch entirely
+// (AbortError surfaces from the wait-for-readiness path). Each launch
+// gets baseEnvPort + cdpAllocationIndex.
+let cdpAllocationIndex = 0;
+
 // Patchright extends page.evaluate with a 3rd `isolatedContext: false` param
 // that forces evaluation in the page's main world. Without it, patchright
 // runs page.evaluate in an isolated context where chrome-extension page APIs
@@ -471,7 +479,21 @@ export const launchExtensionRuntime = async (
   // chromium.connectOverCDP and inspect the live recorder session.
   // Set SIDETRACK_E2E_CDP_DEBUG_PORT=9223 (or any free port) to enable.
   // Defeats stealth — only use for debugging.
-  const cdpDebugPort = (process.env.SIDETRACK_E2E_CDP_DEBUG_PORT ?? '').trim();
+  //
+  // The recorder launches two browsers (A + B) in the same process;
+  // they can't share a port. Allocate sequentially: A gets the base
+  // port, B gets base+1, etc. The console.warn line below makes the
+  // actual port for THIS browser visible so the operator knows which
+  // CDP endpoint maps to which browser.
+  const baseCdpPort = (process.env.SIDETRACK_E2E_CDP_DEBUG_PORT ?? '').trim();
+  const cdpDebugPort = (() => {
+    if (baseCdpPort.length === 0) return '';
+    const base = Number.parseInt(baseCdpPort, 10);
+    if (!Number.isFinite(base) || base <= 0) return '';
+    const allocated = base + cdpAllocationIndex;
+    cdpAllocationIndex += 1;
+    return String(allocated);
+  })();
   const launchArgs = [
     ...(headless ? ['--headless=new'] : []),
     '--no-first-run',
