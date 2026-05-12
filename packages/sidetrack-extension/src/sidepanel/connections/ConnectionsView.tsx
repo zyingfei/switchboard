@@ -640,6 +640,50 @@ export const ConnectionsView = ({
   };
 
   const totalEdges = result?.snapshot.edgeCount ?? 0;
+  // Stage 5 polish — sub-mode availability gates. Each gated mode
+  // surfaces a specific node kind, so when that kind isn't in the
+  // current subgraph the user gets a blank panel with no idea why.
+  // Pre-compute availability + a one-line reason so the tabs can
+  // disable themselves (and explain the gating) instead of silently
+  // rendering empty.
+  const modeAvailability = useMemo(() => {
+    const nodes = result?.snapshot.nodes ?? [];
+    const hasVisits = nodes.some((n) => n.kind === 'timeline-visit');
+    const hasTopics = nodes.some((n) => n.kind === 'topic');
+    const isWorkstream = anchor.startsWith('workstream:');
+    return {
+      flow: {
+        enabled: hasVisits,
+        reason: hasVisits
+          ? undefined
+          : 'No timeline-visits in scope. Anchor on a workstream + ↑ Hops to 2, or pick a topic.',
+      },
+      focus: {
+        enabled: hasTopics,
+        reason: hasTopics
+          ? undefined
+          : 'No topic clusters in scope. Topics appear at higher hop counts on workstream anchors.',
+      },
+      context: {
+        enabled: isWorkstream,
+        reason: isWorkstream
+          ? undefined
+          : 'Context Pack composer only works for workstream anchors. Pick a workstream first.',
+      },
+    };
+  }, [anchor, result]);
+
+  // Stage 5 polish — sub-mode auto-recovery. If the user is on a
+  // gated sub-mode (Flow Path / Focus / Context Pack) and the new
+  // anchor's subgraph doesn't satisfy that mode's requirement (no
+  // visits / no topics / not a workstream), fall back to Linked
+  // automatically so the center pane never goes blank with no
+  // explanation. The tab's tooltip explains why it's disabled.
+  useEffect(() => {
+    if (subMode === 'flow' && !modeAvailability.flow.enabled) setSubMode('linked');
+    else if (subMode === 'focus' && !modeAvailability.focus.enabled) setSubMode('linked');
+    else if (subMode === 'context' && !modeAvailability.context.enabled) setSubMode('linked');
+  }, [subMode, modeAvailability]);
   const whyFeedbackEdge = useMemo(() => {
     if (result === null || whyVisitId === null) return null;
     return findFeedbackEdge(result.snapshot.edges, anchor, whyVisitId);
@@ -748,10 +792,16 @@ export const ConnectionsView = ({
           type="button"
           role="tab"
           aria-selected={subMode === 'flow'}
-          className={'cx-mode' + (subMode === 'flow' ? ' is-active' : '')}
+          className={
+            'cx-mode' +
+            (subMode === 'flow' ? ' is-active' : '') +
+            (modeAvailability.flow.enabled ? '' : ' is-disabled')
+          }
           onClick={() => {
-            setSubMode('flow');
+            if (modeAvailability.flow.enabled) setSubMode('flow');
           }}
+          disabled={!modeAvailability.flow.enabled}
+          title={modeAvailability.flow.reason}
           data-testid="connections-mode-flow"
         >
           Flow Path
@@ -760,10 +810,16 @@ export const ConnectionsView = ({
           type="button"
           role="tab"
           aria-selected={subMode === 'focus'}
-          className={'cx-mode' + (subMode === 'focus' ? ' is-active' : '')}
+          className={
+            'cx-mode' +
+            (subMode === 'focus' ? ' is-active' : '') +
+            (modeAvailability.focus.enabled ? '' : ' is-disabled')
+          }
           onClick={() => {
-            setSubMode('focus');
+            if (modeAvailability.focus.enabled) setSubMode('focus');
           }}
+          disabled={!modeAvailability.focus.enabled}
+          title={modeAvailability.focus.reason}
           data-testid="connections-mode-focus"
         >
           Focus
@@ -772,10 +828,16 @@ export const ConnectionsView = ({
           type="button"
           role="tab"
           aria-selected={subMode === 'context'}
-          className={'cx-mode' + (subMode === 'context' ? ' is-active' : '')}
+          className={
+            'cx-mode' +
+            (subMode === 'context' ? ' is-active' : '') +
+            (modeAvailability.context.enabled ? '' : ' is-disabled')
+          }
           onClick={() => {
-            setSubMode('context');
+            if (modeAvailability.context.enabled) setSubMode('context');
           }}
+          disabled={!modeAvailability.context.enabled}
+          title={modeAvailability.context.reason}
           data-testid="connections-mode-context"
         >
           Context Pack

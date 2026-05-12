@@ -8096,6 +8096,14 @@ pre.diff {
   background: var(--paper-tinted); color: var(--ink-3);
 }
 .cx-mode.is-active .cx-count { background: var(--signal-bg); color: var(--signal); }
+.cx-mode.is-disabled,
+.cx-mode:disabled {
+  color: var(--ink-3);
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.cx-mode.is-disabled:hover,
+.cx-mode:disabled:hover { color: var(--ink-3); }
 
 /* Wave D surfaces */
 .cx-flow {
