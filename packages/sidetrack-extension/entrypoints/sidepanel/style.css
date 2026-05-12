@@ -7885,8 +7885,8 @@ pre.diff {
 /* 3-column shell */
 .cx-cols { display: flex; flex: 1; min-height: 0; }
 .cx-col-l { width: 240px; border-right: var(--hair-soft); display: flex; flex-direction: column; min-height: 0; flex: none; }
-.cx-col-c { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
-.cx-col-r { width: 320px; border-left: var(--hair); display: flex; flex-direction: column; min-height: 0; background: var(--paper); flex: none; }
+.cx-col-c { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; overflow: auto; }
+.cx-col-r { width: 320px; border-left: var(--hair); display: flex; flex-direction: column; min-height: 0; background: var(--paper); flex: none; overflow: auto; }
 .cx-section { padding: 14px 16px; border-bottom: var(--hair-soft); }
 .cx-section h4 {
   margin: 0 0 8px;
@@ -8396,4 +8396,59 @@ pre.diff {
 .cx-recent-anchor .cx-recent-meta {
   font-family: var(--mono); font-size: 9.5px; color: var(--ink-3);
   letter-spacing: 0.05em;
+}
+/* Stage 5 polish — Connections refactor (Phase D). All previously
+   inline `style={{}}` objects from ConnectionsView migrated here so
+   layout/spacing has one source of truth. */
+.cx-recent-anchor-list { display: flex; flex-direction: column; gap: 4px; }
+.cx-recent-anchor-label {
+  flex: 1; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.cx-input-icon {
+  color: var(--ink-3); display: grid; place-items: center;
+}
+.cx-hops-range {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 11px;
+  font-family: var(--mono); color: var(--ink-3);
+}
+.cx-hops-range select {
+  font: inherit; color: inherit; background: transparent; border: 0;
+}
+.cx-section-last { border-bottom: 0; }
+.cx-section-padded { padding: 14px; }
+.cx-legend-text { display: flex; flex-direction: column; }
+.cx-legend-desc { font-size: 11.5px; color: var(--ink-3); }
+.cx-loading { padding: 16px; }
+.cx-note { padding: 14px 16px 0; }
+.cx-row-click {
+  display: flex; align-items: center; gap: 9px;
+  flex: 1; min-width: 0; min-height: 0;
+  padding: 0; border: 0;
+  background: transparent; color: inherit;
+  text-align: left; cursor: pointer;
+}
+.cx-orbit-host { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.cx-orbit-sector-top { left: 50%; top: 12px; transform: translateX(-50%); }
+.cx-orbit-sector-right { right: 12px; top: 50%; transform: translateY(-50%); }
+.cx-orbit-sector-bottom { left: 50%; bottom: 12px; transform: translateX(-50%); }
+.cx-orbit-sector-left { left: 12px; top: 50%; transform: translateY(-50%); }
+.cx-prov-close {
+  background: transparent; border: 0; color: var(--ink-3);
+  cursor: pointer; display: grid; place-items: center;
+  width: 24px; height: 24px;
+}
+.cx-prov-arrow-label {
+  font-size: 9px; letter-spacing: 0.06em; text-transform: uppercase;
+}
+.cx-prov-feedback { padding-top: 10px; }
+.cx-prov-empty { display: block; }
+.cx-prov-empty-head {
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--ink-3); margin-bottom: 8px;
+}
+.cx-prov-empty-body {
+  margin-top: 14px; font-family: var(--body); font-size: 13px;
+  color: var(--ink-3); line-height: 1.55;
 }

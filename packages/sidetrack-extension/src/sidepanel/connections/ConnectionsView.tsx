@@ -12,14 +12,8 @@ import {
   postUserTopicRenamed,
   type UserFlowRelationKind,
 } from './client';
-import {
-  EDGE_KINDS,
-  FAMILIES,
-  NODE_KIND_DISPLAY,
-  NODE_KIND_GROUP_ORDER,
-  contentDerivedHint,
-  type EdgeFamily,
-} from './edgeKinds';
+import { NODE_KIND_DISPLAY } from './edgeKinds';
+import { FamilyLegend } from './FamilyLegend';
 import {
   FlowPathView,
   type CrossReplicaEdge,
@@ -33,8 +27,13 @@ import {
   type TopicNode,
   type TopicVisit,
 } from './FocusView';
-import { CloseIcon, KindIcons, SearchIcon } from './icons';
-import { computeOrbitalLayout, type OrbitalLayoutResult } from './orbitalLayout';
+import { HopToggle } from './HopToggle';
+import { KindIcons, SearchIcon } from './icons';
+import { LinkedCenter } from './LinkedCenter';
+import { NodeChip } from './NodeChip';
+import { OrbitalCenter } from './OrbitalCenter';
+import { ProvenanceCard, ProvenanceEmpty } from './ProvenancePanel';
+import { TimelineRail } from './TimelineRail';
 import { computeTimelineRail, type TimelineRailData } from './timelineWindows';
 import type {
   ConnectionEdge,
@@ -45,29 +44,25 @@ import type {
 import {
   formatEntityDisplay,
   formatNodeIdDisplay,
-  type EntityDisplay,
   type EntityDisplayCtx,
 } from '../entityDisplay/format';
-import { FeedbackButtons, type FeedbackChoice } from '../feedback/FeedbackButtons';
-import { ProducerPin } from './ProducerPin';
+import type { FeedbackChoice } from '../feedback/FeedbackButtons';
 import { WhyRelatedPanel } from './WhyRelatedPanel';
 import type { Reason } from './why-related/reasons';
 
-// Connections side-panel view — Concept A (linked panels) + Concept B
-// (orbital graph) ports of the Claude Design switchboard bundle.
+// Connections side-panel view — anchor + 3-col shell (left rail,
+// center subMode, right provenance). All subcomponents
+// (NodeChip / NodeRow / TimelineRail / LinkedCenter / OrbitalCenter
+// / ProvenancePanel / HopToggle / FamilyLegend / ReplicaDots) live
+// in sibling files so this root stays focused on:
+//   - anchor + draft + subMode state
+//   - HTTP fetch effects (neighbors + edge detail)
+//   - cross-mode derived data (timeline, focus, why-related)
+//   - center-pane subMode switch
 //
-// Layout:
-//   AnchorBar          — anchor + hop pills
-//   ModeToggle         — Linked / Orbital sub-modes
-//   TimelineRail       — per-replica observation windows + anchor /
-//                        neighbor markers (only when the snapshot has
-//                        event-log timestamps)
-//   3-col shell
-//     Left   — anchor input, recent-anchor quick-pick, family legend
-//     Center — linked-panels group list  OR  orbital SVG graph
-//     Right  — provenance card or anchor summary
-//
-// Tokens live in entrypoints/sidepanel/style.css (cx-* prefix).
+// Visible text never contains a raw internal id — every render path
+// goes through `formatEntityDisplay` / `formatNodeIdDisplay` from
+// the unified entity display layer.
 
 export interface ConnectionsViewRecentAnchor {
   readonly id: string;
@@ -103,14 +98,6 @@ const DEFAULT_DISPLAY_CTX: EntityDisplayCtx = {
 };
 
 type SubMode = 'linked' | 'orbital' | 'flow' | 'focus' | 'context';
-
-const KIND_RANK = new Map<ConnectionNodeKind, number>(
-  NODE_KIND_GROUP_ORDER.map((k, i) => [k, i] as const),
-);
-
-const edgeConfidenceClass = (confidence: ConnectionEdge['confidence']): string => {
-  return confidence === 'inferred' ? 'confidence-inferred' : '';
-};
 
 const normalizeWorkstreamAnchorId = (id: string): string =>
   id.startsWith('workstream:') ? id : `workstream:${id}`;
@@ -332,31 +319,6 @@ const edgeConnects = (edge: ConnectionEdge, leftId: string, rightId: string): bo
   (edge.fromNodeId === leftId && edge.toNodeId === rightId) ||
   (edge.fromNodeId === rightId && edge.toNodeId === leftId);
 
-const symmetricEdgeKinds = new Set(['closest_visit', 'visit_resembles_visit']);
-
-// Resolve a node id to its primary display string via the unified
-// helper. Used everywhere that previously read `node.label` directly
-// or fell back to `shortNodeId(...)`. Visible text never contains a
-// raw internal id.
-const nodeDisplayLabel = (
-  nodeById: ReadonlyMap<string, ConnectionNode>,
-  nodeId: string,
-  ctx: EntityDisplayCtx,
-): string => formatNodeIdDisplay(nodeId, nodeById, ctx).primary;
-
-const edgeKindLabel = (edge: ConnectionEdge): string =>
-  EDGE_KINDS[edge.kind]?.label ?? edge.kind.replaceAll('_', ' ');
-
-const edgeEndpointLabel = (
-  edge: ConnectionEdge,
-  nodeById: ReadonlyMap<string, ConnectionNode>,
-  ctx: EntityDisplayCtx,
-): string => {
-  const from = nodeDisplayLabel(nodeById, edge.fromNodeId, ctx);
-  const to = nodeDisplayLabel(nodeById, edge.toNodeId, ctx);
-  return symmetricEdgeKinds.has(edge.kind) ? `${from} ↔ ${to}` : `${from} → ${to}`;
-};
-
 const findFeedbackEdge = (
   edges: readonly ConnectionEdge[],
   leftId: string,
@@ -381,41 +343,12 @@ const findRevisionEdgeForVisit = (
       hasRevisionProducer(edge) && (edge.fromNodeId === visitId || edge.toNodeId === visitId),
   ) ?? null;
 
-const snippetSourceVisitId = (node: ConnectionNode, edge: ConnectionEdge | null): string | null => {
-  if (node.kind !== 'snippet' || edge === null) return null;
-  if (edge.kind === 'snippet_copied_from_visit' && edge.fromNodeId === node.id) {
-    return edge.toNodeId;
-  }
-  return null;
-};
-
 const requireFeedbackRelationKind = (edge: ConnectionEdge): UserFlowRelationKind => {
   const relationKind = feedbackRelationKindForEdgeKind(edge.kind);
   if (relationKind === null) {
     throw new Error(`Unsupported feedback edge kind: ${edge.kind}`);
   }
   return relationKind;
-};
-
-const groupByKind = (
-  nodes: readonly ConnectionNode[],
-): Map<ConnectionNodeKind, ConnectionNode[]> => {
-  const groups = new Map<ConnectionNodeKind, ConnectionNode[]>();
-  for (const n of nodes) {
-    const list = groups.get(n.kind) ?? [];
-    list.push(n);
-    groups.set(n.kind, list);
-  }
-  return groups;
-};
-
-const sortGroupKeys = (kinds: readonly ConnectionNodeKind[]): ConnectionNodeKind[] => {
-  return [...kinds].sort((a, b) => {
-    const ra = KIND_RANK.get(a) ?? 99;
-    const rb = KIND_RANK.get(b) ?? 99;
-    if (ra !== rb) return ra - rb;
-    return a < b ? -1 : a > b ? 1 : 0;
-  });
 };
 
 export const ConnectionsView = ({
@@ -691,7 +624,9 @@ export const ConnectionsView = ({
           role="tab"
           aria-selected={subMode === 'linked'}
           className={'cx-mode' + (subMode === 'linked' ? ' is-active' : '')}
-          onClick={() => setSubMode('linked')}
+          onClick={() => {
+            setSubMode('linked');
+          }}
           data-testid="connections-mode-linked"
         >
           Linked
@@ -702,7 +637,9 @@ export const ConnectionsView = ({
           role="tab"
           aria-selected={subMode === 'orbital'}
           className={'cx-mode' + (subMode === 'orbital' ? ' is-active' : '')}
-          onClick={() => setSubMode('orbital')}
+          onClick={() => {
+            setSubMode('orbital');
+          }}
           data-testid="connections-mode-orbital"
         >
           Orbital
@@ -712,7 +649,9 @@ export const ConnectionsView = ({
           role="tab"
           aria-selected={subMode === 'flow'}
           className={'cx-mode' + (subMode === 'flow' ? ' is-active' : '')}
-          onClick={() => setSubMode('flow')}
+          onClick={() => {
+            setSubMode('flow');
+          }}
           data-testid="connections-mode-flow"
         >
           Flow Path
@@ -722,7 +661,9 @@ export const ConnectionsView = ({
           role="tab"
           aria-selected={subMode === 'focus'}
           className={'cx-mode' + (subMode === 'focus' ? ' is-active' : '')}
-          onClick={() => setSubMode('focus')}
+          onClick={() => {
+            setSubMode('focus');
+          }}
           data-testid="connections-mode-focus"
         >
           Focus
@@ -732,7 +673,9 @@ export const ConnectionsView = ({
           role="tab"
           aria-selected={subMode === 'context'}
           className={'cx-mode' + (subMode === 'context' ? ' is-active' : '')}
-          onClick={() => setSubMode('context')}
+          onClick={() => {
+            setSubMode('context');
+          }}
           data-testid="connections-mode-context"
         >
           Context Pack
@@ -774,21 +717,22 @@ export const ConnectionsView = ({
                 Advanced node anchor
               </summary>
               <label className="cx-input">
-                <span
-                  aria-hidden
-                  style={{ color: 'var(--ink-3)', display: 'grid', placeItems: 'center' }}
-                >
+                <span aria-hidden className="cx-input-icon">
                   {SearchIcon}
                 </span>
                 <input
                   type="text"
                   placeholder="thread:bac_...  visit:https://..."
                   value={draftAnchor}
-                  onChange={(e) => setDraftAnchor(e.target.value)}
+                  onChange={(e) => {
+                    setDraftAnchor(e.target.value);
+                  }}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter') submitAnchor();
                   }}
-                  onBlur={() => submitAnchor()}
+                  onBlur={() => {
+                    submitAnchor();
+                  }}
                   aria-label="Connections anchor"
                   data-testid="connections-anchor-input"
                 />
@@ -798,13 +742,15 @@ export const ConnectionsView = ({
           {recentAnchors.length > 0 ? (
             <div className="cx-section" data-testid="connections-recent-anchors">
               <h4>Recent anchors</h4>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <div className="cx-recent-anchor-list">
                 {recentAnchors.map((r) => (
                   <button
                     key={r.id}
                     type="button"
                     className="cx-recent-anchor"
-                    onClick={() => submitAnchor(r.id)}
+                    onClick={() => {
+                      submitAnchor(r.id);
+                    }}
                     data-testid={`recent-anchor-${r.id}`}
                   >
                     <span
@@ -813,17 +759,7 @@ export const ConnectionsView = ({
                     >
                       {KindIcons[r.kind]}
                     </span>
-                    <span
-                      style={{
-                        flex: 1,
-                        minWidth: 0,
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
-                      }}
-                    >
-                      {r.label}
-                    </span>
+                    <span className="cx-recent-anchor-label">{r.label}</span>
                     <span className="cx-recent-meta">{NODE_KIND_DISPLAY[r.kind].label}</span>
                   </button>
                 ))}
@@ -832,16 +768,14 @@ export const ConnectionsView = ({
           ) : null}
           <div className="cx-section">
             <h4>Hops</h4>
-            <label
-              className="cx-mono cx-dim"
-              style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 }}
-            >
+            <label className="cx-hops-range">
               <span>Range</span>
               <select
                 value={hops}
-                onChange={(e) => setHops(Number.parseInt(e.target.value, 10) || 1)}
+                onChange={(e) => {
+                  setHops(Number.parseInt(e.target.value, 10) || 1);
+                }}
                 data-testid="connections-hops-select"
-                style={{ font: 'inherit', color: 'inherit', background: 'transparent', border: 0 }}
               >
                 {[1, 2, 3, 4].map((h) => (
                   <option key={h} value={h}>
@@ -851,18 +785,14 @@ export const ConnectionsView = ({
               </select>
             </label>
           </div>
-          <div className="cx-section" style={{ borderBottom: 0 }}>
+          <div className="cx-section cx-section-last">
             <h4>Edge family</h4>
             <FamilyLegend />
           </div>
         </aside>
-        <main className="cx-col-c" style={{ overflow: 'auto' }}>
+        <main className="cx-col-c">
           {loading ? (
-            <div
-              className="cx-mono cx-dim"
-              data-testid="connections-loading"
-              style={{ padding: 16 }}
-            >
+            <div className="cx-mono cx-dim cx-loading" data-testid="connections-loading">
               Loading…
             </div>
           ) : null}
@@ -874,7 +804,7 @@ export const ConnectionsView = ({
           ) : null}
           {result !== null ? (
             subMode === 'linked' ? (
-              <ConnectionsLinkedCenter
+              <LinkedCenter
                 result={result}
                 anchorId={anchor}
                 selectedEdge={selectedEdge}
@@ -885,7 +815,7 @@ export const ConnectionsView = ({
                 {...(onOpenUrl === undefined ? {} : { onOpenUrl })}
               />
             ) : subMode === 'orbital' ? (
-              <ConnectionsOrbitalCenter
+              <OrbitalCenter
                 result={result}
                 anchorId={anchor}
                 hops={hops}
@@ -916,12 +846,16 @@ export const ConnectionsView = ({
                   setAnchor(topicId);
                   setDraftAnchor(topicId);
                 }}
-                onVisitClick={(visitId) => setWhyVisitId(visitId)}
+                onVisitClick={(visitId) => {
+                  setWhyVisitId(visitId);
+                }}
               />
             ) : (
               <ContextPackComposer
                 workstreamId={contextWorkstreamId}
-                onClose={() => setSubMode('linked')}
+                onClose={() => {
+                  setSubMode('linked');
+                }}
               />
             )
           ) : (
@@ -937,8 +871,8 @@ export const ConnectionsView = ({
             )
           )}
         </main>
-        <aside className="cx-col-r" style={{ overflow: 'auto' }}>
-          <div className="cx-section" style={{ borderBottom: 0, padding: 14 }}>
+        <aside className="cx-col-r">
+          <div className="cx-section cx-section-last cx-section-padded">
             {whyVisitId !== null && result !== null ? (
               <WhyRelatedPanel
                 fromVisitId={whyVisitId}
@@ -954,15 +888,21 @@ export const ConnectionsView = ({
                 }
                 producedBy={whyRevisionEdge?.producedBy}
                 producerLabel={whyRevisionEdge?.kind}
-                onToggleAssertedOnly={() => setWhyAssertedOnly((value) => !value)}
-                onClose={() => setWhyVisitId(null)}
+                onToggleAssertedOnly={() => {
+                  setWhyAssertedOnly((value) => !value);
+                }}
+                onClose={() => {
+                  setWhyVisitId(null);
+                }}
               />
             ) : edgeDetail !== null ? (
               <ProvenanceCard
                 edge={edgeDetail}
                 allNodes={result?.snapshot.nodes ?? []}
                 onFlowFeedback={(edge, choice) => submitFlowFeedback(edge, choice)}
-                onClose={() => setSelectedEdge(null)}
+                onClose={() => {
+                  setSelectedEdge(null);
+                }}
                 ctx={ctx}
               />
             ) : (
@@ -974,807 +914,3 @@ export const ConnectionsView = ({
     </div>
   );
 };
-
-const ConnectionsLinkedCenter = ({
-  result,
-  anchorId,
-  selectedEdge,
-  onSelectEdge,
-  onUseNodeAsAnchor,
-  onPromoteSnippet,
-  onOpenUrl,
-  ctx,
-}: {
-  readonly result: ConnectionsScopedResult;
-  readonly anchorId: string;
-  readonly selectedEdge: ConnectionEdge | null;
-  readonly onSelectEdge: (edge: ConnectionEdge) => void;
-  readonly onUseNodeAsAnchor: (nodeId: string) => void;
-  readonly onPromoteSnippet: (input: {
-    readonly snippetId: string;
-    readonly sourceVisitId: string;
-  }) => Promise<void>;
-  readonly onOpenUrl?: (url: string) => void;
-  readonly ctx: EntityDisplayCtx;
-}): ReactElement => {
-  if (result.scope === 'plugin-active-only-companion-unreachable') {
-    return (
-      <div className="cx-empty" data-testid="connections-empty-companion-offline">
-        <h4>Connections need companion</h4>
-        <p>Connect to see what's related to this anchor.</p>
-      </div>
-    );
-  }
-  if (result.snapshot.nodeCount === 0) {
-    return (
-      <div className="cx-empty" data-testid="connections-empty">
-        <h4>Nothing connected</h4>
-        <p>The plugin sees activity as you work; come back later.</p>
-      </div>
-    );
-  }
-  const neighbors = result.snapshot.nodes.filter((n) => n.id !== anchorId);
-  const groups = groupByKind(neighbors);
-  const orderedKinds = sortGroupKeys([...groups.keys()]);
-  const nodeById = new Map(result.snapshot.nodes.map((node) => [node.id, node] as const));
-  const edgesByOtherEnd = new Map<string, ConnectionEdge>();
-  for (const e of result.snapshot.edges) {
-    if (e.fromNodeId === anchorId && !edgesByOtherEnd.has(e.toNodeId)) {
-      edgesByOtherEnd.set(e.toNodeId, e);
-    }
-    if (e.toNodeId === anchorId && !edgesByOtherEnd.has(e.fromNodeId)) {
-      edgesByOtherEnd.set(e.fromNodeId, e);
-    }
-  }
-  return (
-    <div data-testid="connections-groups">
-      {result.note !== undefined ? (
-        <div className="cx-mono cx-dim" style={{ padding: '14px 16px 0' }}>
-          {result.note}
-        </div>
-      ) : null}
-      {orderedKinds.map((kind) => {
-        const display = NODE_KIND_DISPLAY[kind];
-        const nodes = groups.get(kind) ?? [];
-        const plural = nodes.length === 1 ? display.label : `${display.label}s`;
-        return (
-          <section key={kind} data-testid={`group-${kind}`}>
-            <header className="cx-group-head">
-              <span className={`cx-node-icon ${display.tintClass}`} aria-hidden>
-                {KindIcons[kind]}
-              </span>
-              <h3>{plural}</h3>
-              <span className="cx-count">{nodes.length}</span>
-            </header>
-            <div className="cx-grouplist">
-              {nodes.map((n) => {
-                const edge = edgesByOtherEnd.get(n.id);
-                return (
-                  <NodeRow
-                    key={n.id}
-                    node={n}
-                    edge={edge ?? null}
-                    direction={edge?.fromNodeId === anchorId ? 'out' : 'in'}
-                    selected={selectedEdge?.id === edge?.id && edge !== undefined}
-                    onPromoteSnippet={onPromoteSnippet}
-                    onUseAsAnchor={() => {
-                      onUseNodeAsAnchor(n.id);
-                    }}
-                    onClick={() => {
-                      if (edge !== undefined) onSelectEdge(edge);
-                    }}
-                    ctx={ctx}
-                    {...(onOpenUrl === undefined ? {} : { onOpenUrl })}
-                  />
-                );
-              })}
-            </div>
-          </section>
-        );
-      })}
-      <section className="cx-section cx-edge-section" data-testid="connections-edges">
-        <h4>Provenance edges</h4>
-        <p className="cx-edge-section-note">Click an edge to inspect why Sidetrack connected it.</p>
-        <div className="cx-edge-list">
-          {result.snapshot.edges.map((edge) => {
-            const meta = EDGE_KINDS[edge.kind];
-            const fam: EdgeFamily = meta?.family ?? 'urlmatch';
-            const hint = contentDerivedHint(edge.kind);
-            const isSelected = selectedEdge?.id === edge.id;
-            return (
-              <button
-                key={edge.id}
-                type="button"
-                onClick={() => onSelectEdge(edge)}
-                data-testid={`edge-${edge.id}`}
-                className={`cx-edgelabel cx-edge-summary ${isSelected ? 'is-selected' : ''}`}
-                title={`${edgeEndpointLabel(edge, nodeById, ctx)} · ${edgeKindLabel(edge)}`}
-              >
-                <span
-                  className={`cx-edge fam-${fam} ${edgeConfidenceClass(edge.confidence)}`.trim()}
-                  aria-hidden
-                >
-                  <span className="cx-edge-line" />
-                </span>
-                <span className="cx-edge-summary-main">{edgeEndpointLabel(edge, nodeById, ctx)}</span>
-                <span className="bac-connections-edge-hint">{edgeKindLabel(edge)}</span>
-                {hint !== null ? (
-                  <span className="bac-connections-edge-hint" data-testid={`edge-hint-${edge.id}`}>
-                    {hint}
-                  </span>
-                ) : null}
-              </button>
-            );
-          })}
-        </div>
-      </section>
-    </div>
-  );
-};
-
-const ORBIT_W = 720;
-const ORBIT_H = 480;
-
-const ConnectionsOrbitalCenter = ({
-  result,
-  anchorId,
-  hops,
-  selectedEdge,
-  onSelectEdge,
-  onUseNodeAsAnchor,
-  ctx,
-}: {
-  readonly result: ConnectionsScopedResult;
-  readonly anchorId: string;
-  readonly hops: number;
-  readonly selectedEdge: ConnectionEdge | null;
-  readonly onSelectEdge: (edge: ConnectionEdge) => void;
-  readonly onUseNodeAsAnchor: (nodeId: string) => void;
-  readonly ctx: EntityDisplayCtx;
-}): ReactElement => {
-  // Hooks must run on every render — keep the layout call before
-  // any early returns.
-  const layout: OrbitalLayoutResult = useMemo(
-    () =>
-      computeOrbitalLayout({
-        snapshot: result.snapshot,
-        anchorId,
-        width: ORBIT_W,
-        height: ORBIT_H,
-        hops,
-      }),
-    [result.snapshot, anchorId, hops],
-  );
-  if (result.snapshot.nodeCount === 0) {
-    return (
-      <div className="cx-empty" data-testid="connections-empty">
-        <h4>Nothing to graph</h4>
-        <p>Pick an anchor with at least one neighbor.</p>
-      </div>
-    );
-  }
-  const nodeById = new Map<string, ConnectionNode>();
-  for (const n of result.snapshot.nodes) nodeById.set(n.id, n);
-  const anchorEdges = layout.edges.filter(
-    (edge) => edge.fromNodeId === anchorId || edge.toNodeId === anchorId,
-  );
-  const stripEdges =
-    selectedEdge === null
-      ? anchorEdges
-      : layout.edges.filter(
-          (edge) =>
-            edge.id === selectedEdge.id ||
-            edge.fromNodeId === selectedEdge.fromNodeId ||
-            edge.toNodeId === selectedEdge.toNodeId ||
-            edge.fromNodeId === selectedEdge.toNodeId ||
-            edge.toNodeId === selectedEdge.fromNodeId,
-        );
-
-  return (
-    <div
-      style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}
-      data-testid="connections-orbital"
-    >
-      <div className="cx-orbit" style={{ minHeight: ORBIT_H }}>
-        <div className="cx-orbit-ring" style={{ width: layout.r1 * 2, height: layout.r1 * 2 }} />
-        {hops >= 2 ? (
-          <div className="cx-orbit-ring" style={{ width: layout.r2 * 2, height: layout.r2 * 2 }} />
-        ) : null}
-        <div
-          className="cx-orbit-sector-label"
-          style={{ left: '50%', top: 12, transform: 'translateX(-50%)' }}
-        >
-          ↑ Containment
-        </div>
-        <div
-          className="cx-orbit-sector-label"
-          style={{ right: 12, top: '50%', transform: 'translateY(-50%)' }}
-        >
-          Flow →
-        </div>
-        <div
-          className="cx-orbit-sector-label"
-          style={{ left: '50%', bottom: 12, transform: 'translateX(-50%)' }}
-        >
-          ↓ Queue · Reminder
-        </div>
-        <div
-          className="cx-orbit-sector-label"
-          style={{ left: 12, top: '50%', transform: 'translateY(-50%)' }}
-        >
-          ← URL match
-        </div>
-        <svg
-          className="cx-orbit-svg"
-          viewBox={`0 0 ${String(ORBIT_W)} ${String(ORBIT_H)}`}
-          preserveAspectRatio="xMidYMid meet"
-          aria-hidden
-        >
-          {layout.edges.map((edge) => {
-            const meta = EDGE_KINDS[edge.kind];
-            const fam: EdgeFamily = meta?.family ?? 'urlmatch';
-            const ps = layout.positions.get(edge.fromNodeId)!;
-            const pt = layout.positions.get(edge.toNodeId)!;
-            const isSel = selectedEdge?.id === edge.id;
-            const isDim = selectedEdge !== null && !isSel;
-            const cls = [
-              'edge',
-              `fam-${fam}`,
-              edgeConfidenceClass(edge.confidence),
-              isSel && 'is-selected',
-              isDim && 'is-dim',
-            ]
-              .filter(Boolean)
-              .join(' ');
-            return <line key={edge.id} className={cls} x1={ps.x} y1={ps.y} x2={pt.x} y2={pt.y} />;
-          })}
-        </svg>
-        {[...layout.positions.values()].map((p) => {
-          const node = nodeById.get(p.id);
-          if (node === undefined) return null;
-          const isAnchor = p.ring === 0;
-          const isDim =
-            selectedEdge !== null &&
-            !isAnchor &&
-            !(selectedEdge.fromNodeId === p.id || selectedEdge.toNodeId === p.id);
-          const orbitDisplay = formatEntityDisplay(node, ctx);
-          return (
-            <button
-              type="button"
-              key={p.id}
-              className="cx-orbit-node"
-              onClick={() => {
-                onUseNodeAsAnchor(p.id);
-              }}
-              title={`Use ${orbitDisplay.primary} as anchor`}
-              style={{
-                left: `${String((p.x / ORBIT_W) * 100)}%`,
-                top: `${String((p.y / ORBIT_H) * 100)}%`,
-              }}
-              data-testid={`orbit-node-${p.id}`}
-            >
-              <NodeChip
-                node={node}
-                size={isAnchor ? 'lg' : 'md'}
-                state={isAnchor ? 'anchor' : isDim ? undefined : undefined}
-                ctx={ctx}
-              />
-            </button>
-          );
-        })}
-      </div>
-      <div className="cx-orbit-edges-strip" data-testid="connections-edges">
-        <span className="label">Anchor edges</span>
-        {stripEdges.length === 0 ? <span className="cx-mono cx-dim">none</span> : null}
-        {stripEdges.map((edge) => {
-          const meta = EDGE_KINDS[edge.kind];
-          const fam: EdgeFamily = meta?.family ?? 'urlmatch';
-          const isSelected = selectedEdge?.id === edge.id;
-          const hint = contentDerivedHint(edge.kind);
-          return (
-            <button
-              key={edge.id}
-              type="button"
-              className={`cx-edgelabel cx-edge-summary ${isSelected ? 'is-selected' : ''}`}
-              onClick={() => onSelectEdge(edge)}
-              data-testid={`edge-${edge.id}`}
-              title={`${edgeEndpointLabel(edge, nodeById, ctx)} · ${edgeKindLabel(edge)}`}
-            >
-              <span
-                className={`cx-edge fam-${fam} ${edgeConfidenceClass(edge.confidence)}`.trim()}
-                aria-hidden
-              >
-                <span className="cx-edge-line" />
-              </span>
-              <span className="cx-edge-summary-main">{edgeEndpointLabel(edge, nodeById, ctx)}</span>
-              <span className="bac-connections-edge-hint">{meta?.label ?? edge.kind}</span>
-              {hint !== null ? (
-                <span className="bac-connections-edge-hint" data-testid={`edge-hint-${edge.id}`}>
-                  {hint}
-                </span>
-              ) : null}
-            </button>
-          );
-        })}
-        {layout.edges.length > stripEdges.length ? (
-          <span className="cx-mono cx-dim">
-            {layout.edges.length - stripEdges.length} more in Linked
-          </span>
-        ) : null}
-      </div>
-    </div>
-  );
-};
-
-const TimelineRail = ({
-  data,
-  ctx,
-}: {
-  readonly data: TimelineRailData;
-  readonly ctx: EntityDisplayCtx;
-}): ReactElement => {
-  const pct = (h: number): number => (h / 24) * 100;
-  return (
-    <div className="cx-timeline" data-testid="connections-timeline">
-      <div className="cx-timeline-head">
-        <span className="cx-timeline-title">Observed activity</span>
-        <span className="cx-timeline-sub">Plugin presence — not time tracking</span>
-        <span className="cx-grow" />
-        <span className="cx-mono cx-dim">{data.date}</span>
-      </div>
-      <div className="cx-timeline-axis">
-        <span />
-        <div className="ticks">
-          {['12 AM', '3 AM', '6 AM', '9 AM', '12 PM', '3 PM', '6 PM', '9 PM'].map((t) => (
-            <span key={t}>{t}</span>
-          ))}
-        </div>
-      </div>
-      <div className="cx-timeline-rows">
-        {data.rows.map((row, i) => (
-          <div key={row.replicaId} className="cx-timeline-row">
-            <div className="device" title={row.replicaId}>
-              <span className="cx-replica-dot" />
-              <span>{ctx.replicaAlias(row.replicaId)}</span>
-            </div>
-            <div className="lane">
-              {row.windows.map(([a, b], j) => (
-                <span
-                  key={j}
-                  className="obs"
-                  style={{ left: `${String(pct(a))}%`, width: `${String(pct(b - a))}%` }}
-                />
-              ))}
-              {/* Anchor marker — only on the first row to avoid noise */}
-              {i === 0 && data.anchorTime !== null ? (
-                <span
-                  className="marker"
-                  style={{ left: `${String(pct(data.anchorTime))}%` }}
-                  title="Anchor"
-                />
-              ) : null}
-              {i === 0
-                ? data.neighborTimes.map((h, k) => (
-                    <span
-                      key={`n${String(k)}`}
-                      className="marker ghost"
-                      style={{ left: `${String(pct(h))}%` }}
-                      title="Neighbor"
-                    />
-                  ))
-                : null}
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-};
-
-const NodeChip = ({
-  node,
-  state,
-  size = 'md',
-  ctx,
-}: {
-  readonly node: ConnectionNode;
-  readonly state?: 'anchor' | 'selected';
-  readonly size?: 'md' | 'lg';
-  readonly ctx: EntityDisplayCtx;
-}): ReactElement => {
-  const display = NODE_KIND_DISPLAY[node.kind];
-  const entity = formatEntityDisplay(node, ctx);
-  const cls =
-    `cx-node ${display.tintClass}` +
-    (size === 'lg' ? ' lg' : '') +
-    (state === 'anchor' ? ' is-anchor' : '') +
-    (state === 'selected' ? ' is-selected' : '');
-  return (
-    <div className={cls} data-testid={`node-${node.id}`} title={entity.tooltip}>
-      <span className="cx-node-icon" aria-hidden>
-        {KindIcons[node.kind]}
-      </span>
-      <span className="cx-node-body">
-        <span className="cx-node-kind">{display.label}</span>
-        <span className="cx-node-title">{entity.primary}</span>
-      </span>
-    </div>
-  );
-};
-
-const NodeRow = ({
-  node,
-  edge,
-  direction,
-  selected,
-  onPromoteSnippet,
-  onUseAsAnchor,
-  onClick,
-  onOpenUrl,
-  ctx,
-}: {
-  readonly node: ConnectionNode;
-  readonly edge: ConnectionEdge | null;
-  readonly direction: 'in' | 'out';
-  readonly selected: boolean;
-  readonly onPromoteSnippet?: (input: {
-    readonly snippetId: string;
-    readonly sourceVisitId: string;
-  }) => Promise<void>;
-  readonly onUseAsAnchor: () => void;
-  readonly onClick: () => void;
-  readonly onOpenUrl?: (url: string) => void;
-  readonly ctx: EntityDisplayCtx;
-}): ReactElement => {
-  const openUrl = metadataString(node.metadata, ['url', 'canonicalUrl']);
-  const canOpenTab = onOpenUrl !== undefined && openUrl !== undefined && openUrl.length > 0;
-  const [promoting, setPromoting] = useState<boolean>(false);
-  const [promoteStatus, setPromoteStatus] = useState<'saved' | 'error' | null>(null);
-  const display = NODE_KIND_DISPLAY[node.kind];
-  const entity = formatEntityDisplay(node, ctx);
-  const meta = edge !== null ? EDGE_KINDS[edge.kind] : null;
-  const cls = `cx-row ${display.tintClass} ${selected ? 'is-selected' : ''}`;
-  const sourceVisitId = snippetSourceVisitId(node, edge);
-  const canPromote =
-    onPromoteSnippet !== undefined && node.kind === 'snippet' && sourceVisitId !== null;
-  const promote = (): void => {
-    if (!canPromote || sourceVisitId === null) return;
-    setPromoting(true);
-    setPromoteStatus(null);
-    void onPromoteSnippet({ snippetId: node.id, sourceVisitId })
-      .then(() => {
-        setPromoteStatus('saved');
-      })
-      .catch(() => {
-        setPromoteStatus('error');
-      })
-      .finally(() => {
-        setPromoting(false);
-      });
-  };
-  return (
-    <div className={cls} data-testid={`node-${node.id}`}>
-      <button
-        type="button"
-        onClick={onClick}
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 9,
-          flex: 1,
-          minWidth: 0,
-          minHeight: 0,
-          padding: 0,
-          border: 0,
-          background: 'transparent',
-          color: 'inherit',
-          textAlign: 'left',
-        }}
-      >
-        <span className={`cx-node-icon ${display.tintClass}`} aria-hidden>
-          {KindIcons[node.kind]}
-        </span>
-        <span className="cx-row-body">
-          <span className="cx-row-title" title={entity.tooltip}>
-            {entity.primary}
-          </span>
-          <span className="cx-row-meta">
-            <span>{display.label}</span>
-            {entity.secondary !== undefined ? (
-              <>
-                <span>·</span>
-                <span>{entity.secondary}</span>
-              </>
-            ) : node.lastSeenAt !== undefined ? (
-              <>
-                <span>·</span>
-                <span>{node.lastSeenAt.slice(0, 10)}</span>
-              </>
-            ) : null}
-            {node.originReplicaIds.length > 0 ? (
-              <>
-                <span>·</span>
-                <ReplicaDots replicaIds={node.originReplicaIds} ctx={ctx} />
-              </>
-            ) : null}
-          </span>
-        </span>
-        {meta !== null ? (
-          <span className="cx-row-edge">
-            {direction === 'out' ? `→ ${meta.label}` : meta.label}
-          </span>
-        ) : null}
-      </button>
-      {canPromote ? (
-        <button
-          type="button"
-          className="cx-focus-expand"
-          disabled={promoting}
-          onClick={promote}
-          data-testid={`snippet-promote-${node.id}`}
-        >
-          {promoteStatus === 'saved' ? 'Promoted' : promoteStatus === 'error' ? 'Retry' : 'Promote'}
-        </button>
-      ) : null}
-      {canOpenTab ? (
-        <button
-          type="button"
-          className="cx-focus-expand cx-row-open-tab"
-          onClick={() => {
-            onOpenUrl(openUrl);
-          }}
-          data-testid={`node-open-${node.id}`}
-          title={`Open ${openUrl} in a tab`}
-        >
-          Go to tab
-        </button>
-      ) : null}
-      <button
-        type="button"
-        className="cx-focus-expand cx-row-anchor-action"
-        onClick={onUseAsAnchor}
-        data-testid={`node-anchor-${node.id}`}
-        title={`Use ${entity.primary} as anchor`}
-      >
-        Open
-      </button>
-    </div>
-  );
-};
-
-const HopToggle = ({
-  value,
-  onChange,
-}: {
-  readonly value: number;
-  readonly onChange: (v: number) => void;
-}): ReactElement => (
-  <div className="cx-pill-group" role="group" aria-label="Hops">
-    {[1, 2].map((h) => (
-      <button
-        key={h}
-        type="button"
-        className={`cx-pill ${value === h ? 'is-active' : ''}`}
-        onClick={() => onChange(h)}
-      >
-        {h}-hop
-      </button>
-    ))}
-  </div>
-);
-
-const FamilyLegend = (): ReactElement => (
-  <div className="cx-legend">
-    {(Object.keys(FAMILIES) as EdgeFamily[]).map((fam) => {
-      const f = FAMILIES[fam];
-      return (
-        <div key={fam} className="cx-legend-row">
-          <span className={`cx-edge fam-${fam}`} aria-hidden>
-            <span className="cx-edge-line" />
-          </span>
-          <span style={{ display: 'flex', flexDirection: 'column' }}>
-            <span className="cx-legend-label">{f.label}</span>
-            <span style={{ fontSize: 11.5, color: 'var(--ink-3)' }}>{f.description}</span>
-          </span>
-        </div>
-      );
-    })}
-  </div>
-);
-
-const ReplicaDots = ({
-  replicaIds,
-  ctx,
-}: {
-  readonly replicaIds: readonly string[];
-  readonly ctx: EntityDisplayCtx;
-}): ReactElement => {
-  const count = replicaIds.length;
-  const aliases = replicaIds.map((id) => ctx.replicaAlias(id)).join(', ');
-  const tooltip =
-    count === 1 ? `Seen on ${aliases}` : `Seen on ${String(count)} devices · ${aliases}`;
-  return (
-    <span className="cx-replicas" title={tooltip}>
-      {Array.from({ length: Math.min(count, 3) }).map((_, i) => (
-        <span key={i} className="cx-replica-dot" />
-      ))}
-      {count > 1 ? <span className="cx-dim">{`${String(count)}×`}</span> : null}
-    </span>
-  );
-};
-
-const ProvenanceCard = ({
-  edge,
-  allNodes,
-  onFlowFeedback,
-  onClose,
-  ctx,
-}: {
-  readonly edge: ConnectionEdge;
-  readonly allNodes: readonly ConnectionNode[];
-  readonly onFlowFeedback: (edge: ConnectionEdge, choice: FeedbackChoice) => Promise<void>;
-  readonly onClose: () => void;
-  readonly ctx: EntityDisplayCtx;
-}): ReactElement => {
-  const meta = EDGE_KINDS[edge.kind];
-  const family: EdgeFamily = meta?.family ?? 'urlmatch';
-  const fromNode = allNodes.find((n) => n.id === edge.fromNodeId);
-  const toNode = allNodes.find((n) => n.id === edge.toNodeId);
-  const nodeByIdLocal = useMemo(
-    () => new Map(allNodes.map((node) => [node.id, node] as const)),
-    [allNodes],
-  );
-  const reason = meta?.description ?? edge.kind;
-  const supportsFlowFeedback = feedbackRelationKindForEdgeKind(edge.kind) !== null;
-  return (
-    <aside className="cx-prov" data-testid="edge-provenance" data-edge-id={edge.id}>
-      <header className="cx-prov-head">
-        <span className="cx-prov-kind">{edge.kind}</span>
-        <span className="cx-stamp">{edge.confidence}</span>
-        <span className="cx-grow" />
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="Close"
-          style={{
-            background: 'transparent',
-            border: 0,
-            color: 'var(--ink-3)',
-            cursor: 'pointer',
-            display: 'grid',
-            placeItems: 'center',
-            width: 24,
-            height: 24,
-          }}
-        >
-          {CloseIcon}
-        </button>
-      </header>
-      <div className="cx-prov-pair">
-        {fromNode !== undefined ? (
-          <NodeChip node={fromNode} ctx={ctx} />
-        ) : (
-          <span className="cx-dim" title={edge.fromNodeId}>
-            {formatNodeIdDisplay(edge.fromNodeId, nodeByIdLocal, ctx).primary}
-          </span>
-        )}
-        <div className="cx-prov-arrow">
-          <span
-            className={`cx-edge fam-${family} ${edgeConfidenceClass(edge.confidence)}`.trim()}
-            aria-hidden
-          >
-            <span className="cx-edge-line" />
-          </span>
-          <span style={{ fontSize: 9, letterSpacing: '0.06em', textTransform: 'uppercase' }}>
-            {meta?.label ?? edge.kind}
-          </span>
-        </div>
-        {toNode !== undefined ? (
-          <NodeChip node={toNode} ctx={ctx} />
-        ) : (
-          <span className="cx-dim" title={edge.toNodeId}>
-            {formatNodeIdDisplay(edge.toNodeId, nodeByIdLocal, ctx).primary}
-          </span>
-        )}
-      </div>
-      <div className="cx-prov-reason">
-        Reason: <code>{reason}</code>
-      </div>
-      {hasRevisionProducer(edge) ? (
-        <ProducerPin producedBy={edge.producedBy} producerLabel={edge.kind} />
-      ) : null}
-      {supportsFlowFeedback ? (
-        <div style={{ paddingTop: 10 }}>
-          <FeedbackButtons
-            key={edge.id}
-            label="relation"
-            onFeedback={async (choice) => {
-              await onFlowFeedback(edge, choice);
-              return { ok: true };
-            }}
-          />
-        </div>
-      ) : null}
-      <dl className="cx-prov-rows">
-        <ProvRow label="Edge kind" value={edge.kind} mono />
-        <ProvRow label="Family" value={FAMILIES[family].label} />
-        <ProvRow label="Source" value={edge.producedBy.source} />
-        {edge.producedBy.eventType !== undefined ? (
-          <ProvRow label="Event type" value={edge.producedBy.eventType} mono />
-        ) : null}
-        {edge.producedBy.dot !== undefined ? (
-          <ProvRow
-            label="Origin replica"
-            value={`${ctx.replicaAlias(edge.producedBy.dot.replicaId)} · seq ${String(edge.producedBy.dot.seq)}`}
-          />
-        ) : null}
-        {edge.producedBy.recordId !== undefined ? (
-          <ProvRow
-            label="Record id"
-            value={edge.producedBy.recordId}
-            mono
-            testId="edge-record-id"
-          />
-        ) : null}
-        <ProvRow label="Observed at" value={edge.observedAt} mono />
-        <ProvRow label="Confidence" value={edge.confidence} />
-      </dl>
-    </aside>
-  );
-};
-
-const ProvRow = ({
-  label,
-  value,
-  mono,
-  testId,
-}: {
-  readonly label: string;
-  readonly value: string;
-  readonly mono?: boolean;
-  readonly testId?: string;
-}): ReactElement => (
-  <div className="cx-prov-row">
-    <dt>{label}</dt>
-    <dd className={mono === true ? 'mono' : ''} data-testid={testId}>
-      {value}
-    </dd>
-  </div>
-);
-
-const ProvenanceEmpty = ({
-  anchor,
-  ctx,
-}: {
-  readonly anchor: ConnectionNode | null;
-  readonly ctx: EntityDisplayCtx;
-}): ReactElement => (
-  <div>
-    <div
-      style={{
-        fontFamily: 'var(--mono)',
-        fontSize: 9.5,
-        letterSpacing: '0.08em',
-        textTransform: 'uppercase',
-        color: 'var(--ink-3)',
-        marginBottom: 8,
-      }}
-    >
-      {anchor !== null ? 'Anchor summary' : 'No anchor'}
-    </div>
-    {anchor !== null ? <NodeChip node={anchor} state="anchor" size="lg" ctx={ctx} /> : null}
-    <div
-      style={{
-        marginTop: 14,
-        fontFamily: 'var(--body)',
-        fontSize: 13,
-        color: 'var(--ink-3)',
-        lineHeight: 1.55,
-      }}
-    >
-      {anchor !== null
-        ? 'Click an edge or neighbor row to see why each connection exists.'
-        : 'Pick a node on the left to anchor the graph.'}
-    </div>
-  </div>
-);
