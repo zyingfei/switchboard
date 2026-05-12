@@ -320,6 +320,96 @@ export function HealthPanel({
   const lastProvider = providerRows.find((row) => row.lastCaptureAt !== null);
   const activity = report?.recall.activity;
 
+  // Stage 5 polish — pipeline-stage rollup. Each entry describes one
+  // logical stage in the capture → … → resolver flow, with a glance-
+  // able status dot + a short detail line that surfaces the most
+  // load-bearing fact for that stage (count, age, status). Drawn as a
+  // left-to-right strip at the top of the panel so the user sees
+  // where data is moving before diving into the per-lane sections.
+  type PipelineStatus = 'ok' | 'warn' | 'err' | 'idle';
+  interface PipelineStage {
+    readonly id: string;
+    readonly name: string;
+    readonly status: PipelineStatus;
+    readonly detail: string;
+  }
+  const pipelineStages: readonly PipelineStage[] = (() => {
+    if (report === null) return [];
+    const captureStatus: PipelineStatus = queueWarn
+      ? 'warn'
+      : lastProvider === undefined
+        ? 'idle'
+        : 'ok';
+    const captureDetail =
+      lastProvider === undefined
+        ? 'no events yet'
+        : `${String(providerRows.length)} provider${providerRows.length === 1 ? '' : 's'} · ${formatWhen(lastProvider.lastCaptureAt)}`;
+    const vaultStatus: PipelineStatus = report.vault.writable ? 'ok' : 'err';
+    const vaultDetail = report.vault.writable
+      ? `writable · ${formatBytes(report.vault.sizeBytes)}`
+      : 'not writable';
+    const materializers = report.sync?.materializers ?? {};
+    const matEntries = Object.entries(materializers);
+    const matFailed = matEntries.filter(([, m]) => m.status === 'failed').length;
+    const matDegraded = matEntries.filter(([, m]) => m.status === 'degraded').length;
+    const matStatus: PipelineStatus =
+      matFailed > 0 ? 'err' : matDegraded > 0 ? 'warn' : matEntries.length === 0 ? 'idle' : 'ok';
+    const matDetail =
+      matEntries.length === 0
+        ? 'not configured'
+        : `${String(matEntries.length - matFailed - matDegraded)}/${String(matEntries.length)} healthy`;
+    const recallStatus = report.recall.status;
+    const recallStatusFor: PipelineStatus =
+      recallStatus === 'rebuilding'
+        ? 'warn'
+        : recallStatus === 'missing' || recallStatus === 'stale'
+          ? 'err'
+          : recallStatus === 'empty'
+            ? 'warn'
+            : recallStatus === 'ready'
+              ? 'ok'
+              : 'idle';
+    const recallDetail =
+      recallStatus === 'rebuilding' &&
+      report.recall.rebuildTotal !== undefined &&
+      report.recall.rebuildTotal > 0
+        ? `rebuilding ${String(report.recall.rebuildEmbedded ?? 0)}/${String(report.recall.rebuildTotal)}`
+        : recallStatus === undefined
+          ? `${formatCount(report.recall.entryCount)} vectors`
+          : `${recallStatus} · ${formatCount(report.recall.entryCount)} vectors`;
+    // Ranker stage proxies on the snapshot's recall activity for now —
+    // we don't yet have a dedicated ranker-snapshot timestamp in the
+    // health report. Surfaced as a placeholder so the stage is
+    // visible; backend follow-up will populate it with real data.
+    const rankerStatus: PipelineStatus = 'idle';
+    const rankerDetail = 'snapshot timestamp TBD';
+    const relay = report.sync?.relay;
+    const syncStatus: PipelineStatus =
+      relay === undefined
+        ? 'idle'
+        : relay.connected === false
+          ? 'warn'
+          : relay.connected === true
+            ? 'ok'
+            : 'idle';
+    const syncDetail =
+      relay === undefined
+        ? 'single-replica'
+        : relay.connected === true
+          ? `connected · ${relay.mode}`
+          : relay.connected === false
+            ? `disconnected${relay.consecutiveFailures !== undefined && relay.consecutiveFailures > 0 ? ` · ${String(relay.consecutiveFailures)} fails` : ''}`
+            : 'unknown';
+    return [
+      { id: 'capture', name: 'Capture', status: captureStatus, detail: captureDetail },
+      { id: 'vault', name: 'Vault', status: vaultStatus, detail: vaultDetail },
+      { id: 'materializers', name: 'Materializers', status: matStatus, detail: matDetail },
+      { id: 'recall', name: 'Embedding', status: recallStatusFor, detail: recallDetail },
+      { id: 'ranker', name: 'Ranker', status: rankerStatus, detail: rankerDetail },
+      { id: 'sync', name: 'Sync', status: syncStatus, detail: syncDetail },
+    ];
+  })();
+
   const copyDiagnostics = () => {
     if (report === null) return;
     const dump = JSON.stringify(
@@ -365,6 +455,39 @@ export function HealthPanel({
         </div>
       ) : (
         <>
+          {/* Pipeline strip — glance-able status of every stage in the
+              capture-to-resolver flow. Stages are intentionally
+              ordered so the leftmost column is where data enters and
+              the rightmost is where decisions go out; arrows make the
+              direction explicit. Click a stage to scroll to its
+              underlying lane (TODO follow-up: anchor links). */}
+          {pipelineStages.length > 0 ? (
+            <div className="hp-pipeline" data-testid="hp-pipeline">
+              <div className="hp-pipeline-head">
+                Pipeline · capture → vault → materializers → embedding → ranker → sync
+              </div>
+              <div className="hp-pipeline-flow">
+                {pipelineStages.map((stage, index) => (
+                  <span className="hp-pipeline-stage-wrap" key={stage.id}>
+                    <span
+                      className={`hp-pipeline-stage is-${stage.status}`}
+                      title={`${stage.name}: ${stage.detail}`}
+                      data-testid={`hp-pipeline-stage-${stage.id}`}
+                    >
+                      <span className={`hp-pipeline-dot ${stage.status}`} aria-hidden />
+                      <span className="hp-pipeline-name">{stage.name}</span>
+                      <span className="hp-pipeline-detail mono">{stage.detail}</span>
+                    </span>
+                    {index < pipelineStages.length - 1 ? (
+                      <span className="hp-pipeline-arrow" aria-hidden>
+                        →
+                      </span>
+                    ) : null}
+                  </span>
+                ))}
+              </div>
+            </div>
+          ) : null}
           {/* Stage 5 polish — three-lane locality grouping.
               🖥 LOCAL = lives in this browser tab (extension SW).
               ⚙ COMPANION = lives in the local companion Node process.
@@ -387,6 +510,27 @@ export function HealthPanel({
               </div>
               <div className="hc-foot">
                 cap 20 · dropped {dropped ?? 0} · {queueWarn ? 'warn' : 'ok'}
+              </div>
+            </div>
+            {/* Stage 5 polish — companion-reachability chip sits in the
+                LOCAL lane because the in-browser SW owns the reach
+                check. Mirrors the pipeline strip's intent: tell the
+                user where data is going next from this side. */}
+            <div className={'hc' + (loadState === 'live' ? '' : ' warn')}>
+              <div className="hc-lbl">companion reach</div>
+              <div className="hc-num small">
+                {loadState === 'live'
+                  ? 'reachable'
+                  : loadState === 'loading'
+                    ? 'checking…'
+                    : loadState === 'not-configured'
+                      ? 'not configured'
+                      : 'unreachable'}
+              </div>
+              <div className="hc-foot">
+                {companionPort === null || companionPort === undefined
+                  ? 'no port set'
+                  : `localhost:${String(companionPort)}`}
               </div>
             </div>
           </div>

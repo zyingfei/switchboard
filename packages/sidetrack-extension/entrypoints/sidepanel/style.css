@@ -5773,6 +5773,90 @@ button.btn-link.thread-dispatched-name:hover {
   padding: 12px;
 }
 
+/* Stage 5 polish — pipeline strip. Sits above the per-lane sections
+   so the user sees the capture→…→sync flow at a glance before
+   diving in. Each stage is a soft-bordered chip with a status dot;
+   the arrow between them makes the direction explicit. */
+.hp-pipeline {
+  padding: 10px 12px 8px 12px;
+  border-bottom: 1px solid var(--rule, #d4cdb8);
+  background: var(--paper-light, #fbf7ee);
+}
+.hp-pipeline-head {
+  font-size: 10px;
+  font-family: var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.7px;
+  color: var(--ink-3);
+  margin-bottom: 6px;
+}
+.hp-pipeline-flow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.hp-pipeline-stage-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.hp-pipeline-stage {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 3px 8px;
+  border: 1px solid var(--rule-soft, #e5ddc9);
+  border-radius: 6px;
+  background: var(--paper);
+  min-width: 0;
+}
+.hp-pipeline-stage.is-ok {
+  border-color: var(--green-tint, #b6dbc1);
+}
+.hp-pipeline-stage.is-warn {
+  border-color: var(--amber-tint, #d6a256);
+  background: var(--amber-bg, #fff8ec);
+}
+.hp-pipeline-stage.is-err {
+  border-color: var(--red-tint, #b91c1c);
+  background: #fff1f1;
+}
+.hp-pipeline-stage.is-idle {
+  opacity: 0.6;
+}
+.hp-pipeline-name {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ink-1);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.hp-pipeline-detail {
+  font-size: 9.5px;
+  color: var(--ink-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 140px;
+}
+.hp-pipeline-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ink-4, #a39a8c);
+  display: inline-block;
+}
+.hp-pipeline-dot.ok { background: #166534; }
+.hp-pipeline-dot.warn { background: #a16207; }
+.hp-pipeline-dot.err { background: #b91c1c; }
+.hp-pipeline-arrow {
+  color: var(--ink-4, #a39a8c);
+  font-size: 12px;
+  user-select: none;
+}
+
 /* Stage 5 polish — three-lane locality grouping. Visual separator
    each section so "this lives in browser SW" vs "this lives in
    companion" vs "this flows across replicas" is unambiguous. */
