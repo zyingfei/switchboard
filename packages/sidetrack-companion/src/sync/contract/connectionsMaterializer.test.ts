@@ -349,7 +349,9 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     });
     await eventLog.importPeerEvent(event);
     m.onAccepted(event, { origin: 'peer' });
-    await new Promise((r) => setTimeout(r, 30));
+    // Stage 5.2 W1a — drain is debounced; awaitIdle waits through
+    // debounce + the failing drain attempt that parks lastError.
+    await m.awaitIdle();
     expect(m.health().status).toBe('failed');
     expect(m.health().lastError).toContain('disk full');
 
