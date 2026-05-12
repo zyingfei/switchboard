@@ -17,6 +17,18 @@ export interface TabSessionAttribution {
   readonly clientEventId: string;
 }
 
+// Stage 5 polish — URL-level "user dismissed this as noise" state.
+// Distinct from `currentAttribution.workstreamId = null` (which says
+// "meaningful but no workstream"). Surfaces as the `ignored` badge
+// variant and the "Ignore" overflow action. Only set on the URL→
+// TabSessionRecord adapter path (the tab-session projection itself
+// has no ignored state).
+export interface TabSessionIgnoredState {
+  readonly reason: 'noise' | 'duplicate' | 'private';
+  readonly observedAt: string;
+  readonly clientEventId: string;
+}
+
 export interface TabSessionRecord {
   readonly tabSessionId: string;
   readonly openedAt: string;
@@ -28,6 +40,7 @@ export interface TabSessionRecord {
   readonly latestTitle?: string;
   readonly provider?: string;
   readonly currentAttribution?: TabSessionAttribution;
+  readonly currentIgnored?: TabSessionIgnoredState;
   readonly attributionHistory: readonly TabSessionAttribution[];
 }
 
@@ -102,6 +115,12 @@ export interface UrlAttribution {
   readonly clientEventId: string;
 }
 
+export interface UrlIgnoredState {
+  readonly reason: 'noise' | 'duplicate' | 'private';
+  readonly observedAt: string;
+  readonly clientEventId: string;
+}
+
 export interface UrlVisitRecord {
   readonly canonicalUrl: string;
   readonly firstSeenAt: string;
@@ -113,6 +132,7 @@ export interface UrlVisitRecord {
   readonly provider?: string;
   readonly host?: string;
   readonly currentAttribution?: UrlAttribution;
+  readonly currentIgnored?: UrlIgnoredState;
   readonly attributionHistory: readonly UrlAttribution[];
 }
 

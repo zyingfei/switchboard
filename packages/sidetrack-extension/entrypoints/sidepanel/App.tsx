@@ -150,6 +150,15 @@ const tabSessionRecordFromUrl = (url: UrlVisitRecord): TabSessionRecord => ({
   ...(url.currentAttribution === undefined
     ? {}
     : { currentAttribution: url.currentAttribution }),
+  ...(url.currentIgnored === undefined
+    ? {}
+    : {
+        currentIgnored: {
+          reason: url.currentIgnored.reason,
+          observedAt: url.currentIgnored.observedAt,
+          clientEventId: url.currentIgnored.clientEventId,
+        },
+      }),
   attributionHistory: url.attributionHistory,
 });
 

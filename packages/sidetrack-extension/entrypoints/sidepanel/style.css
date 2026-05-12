@@ -649,6 +649,14 @@ button:disabled {
   border-style: dashed;
 }
 
+/* ignored: user explicitly muted this URL. Struck-through + faded. */
+.tab-session-badge.is-ignored {
+  background: var(--ink-0);
+  color: var(--ink-3);
+  border-color: var(--hair-soft);
+  text-decoration: line-through;
+}
+
 .tab-session-badge.is-empty {
   background: var(--ink-0);
   color: var(--ink-3);
