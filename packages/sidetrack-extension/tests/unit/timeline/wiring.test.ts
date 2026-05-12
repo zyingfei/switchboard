@@ -171,6 +171,40 @@ describe('timeline wiring', () => {
     expect((spool as unknown[]).length).toBeGreaterThanOrEqual(1);
   });
 
+  it('chrome.tabs.onUpdated prefers changeInfo.url over stale tab.url', async () => {
+    // Repro for the Google `newwindow=1` search bug: when a new
+    // window/tab navigates to a search URL, chrome.tabs.onUpdated fires
+    // with `changeInfo.url = '<full search URL>'` while `tab.url` may
+    // still be `'https://www.google.com/'` (pre-nav). The observer must
+    // use the changeInfo (authoritative new URL), not the stale tab.url.
+    await initializeTimelineWiring({ readCompanion: async () => null });
+    const c = (globalThis as unknown as {
+      chrome: { tabs: { __setTab: (id: number, data: { url?: string; title?: string; windowId?: number }) => void } };
+    }).chrome;
+    // Tab snapshot is the pre-navigation homepage URL — what Chrome
+    // hands us as `tab.url` in the race-condition window.
+    c.tabs.__setTab(99, {
+      url: 'https://www.google.com/',
+      windowId: 1,
+    });
+    // Listener fires with the AUTHORITATIVE new URL in changeInfo.
+    env.listeners.onUpdated(
+      99,
+      { url: 'https://www.google.com/search?q=warp+exchange' },
+      { id: 99, url: 'https://www.google.com/', windowId: 1 },
+    );
+    await new Promise((r) => setTimeout(r, 10));
+    const spool = (await (globalThis as unknown as {
+      chrome: { storage: { local: { get: (k: string) => Promise<Record<string, unknown>> } } };
+    }).chrome.storage.local.get('sidetrack.sync.spool.timeline'))[
+      'sidetrack.sync.spool.timeline'
+    ] as readonly { readonly payload?: { readonly url?: string } }[];
+    expect(Array.isArray(spool)).toBe(true);
+    const urls = spool.map((entry) => entry.payload?.url).filter(Boolean);
+    expect(urls).toContain('https://www.google.com/search?q=warp+exchange');
+    expect(urls).not.toContain('https://www.google.com/');
+  });
+
   it('default OFF — gate disabled means NO listeners or alarm registered', async () => {
     // Reset and explicitly disable to assert the default-off
     // posture. No setTimelineEnabled(true) call this time.

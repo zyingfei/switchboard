@@ -66,10 +66,102 @@ const isSensitiveParam = (name: string): boolean => {
   return false;
 };
 
+// Stage 5 follow-up — marketing / ad-tracking parameters. Stripping
+// these collapses "same content, different campaign" URLs into a
+// single canonical record so the Inbox doesn't fragment by ad source.
+// Different from SENSITIVE_PARAM_NAMES: these aren't secrets, they're
+// noise. Per-site rule overrides are a separate Stage 5.1 follow-up
+// — when that ships, a per-host config will be able to override this
+// default (e.g. keep utm_source on a marketing-analytics dashboard).
+const MARKETING_PARAM_NAMES: ReadonlySet<string> = new Set<string>([
+  // Standard UTM
+  'utm_source',
+  'utm_medium',
+  'utm_campaign',
+  'utm_term',
+  'utm_content',
+  'utm_id',
+  'utm_name',
+  // Google Ads
+  'gclid',
+  'gbraid',
+  'wbraid',
+  'gad_source',
+  'gad_campaignid',
+  'dclid',
+  // Microsoft / Bing Ads
+  'msclkid',
+  // Facebook / Meta
+  'fbclid',
+  // X / Twitter
+  'twclid',
+  // LinkedIn
+  'li_fat_id',
+  // Snapchat
+  'sccid',
+  // TikTok
+  'ttclid',
+  // Instagram share
+  'igshid',
+  // Yandex
+  'yclid',
+  // Mailchimp
+  'mc_cid',
+  'mc_eid',
+  // Klaviyo
+  '_kx',
+  // Adobe Site Catalyst
+  's_cid',
+  // Vero
+  'vero_conv',
+  'vero_id',
+  // Generic referral hints
+  'ref',
+  'ref_',
+  'referrer',
+  // Google Analytics cross-domain linker
+  '_ga',
+  '_gl',
+]);
+
+// Prefix-matched marketing param families. `hsa_*` is HubSpot ad
+// tracking — every campaign produces hsa_acc/hsa_cam/hsa_grp/hsa_ad
+// (etc). Prefix-strip is safer than enumerating each leaf since the
+// network can introduce new sub-params at any time.
+const MARKETING_PARAM_PREFIXES: readonly string[] = [
+  'utm_',
+  'hsa_',
+  'gad_',
+  'mc_',
+];
+
+const STRIP_MARKETING_PARAMS_ENV = 'SIDETRACK_TIMELINE_STRIP_MARKETING_PARAMS';
+
+const stripMarketingParamsEnabled = (): boolean => {
+  // process.env is available in the SW build via the WXT/vite shim.
+  const raw =
+    typeof process !== 'undefined' && process.env !== undefined
+      ? process.env[STRIP_MARKETING_PARAMS_ENV]
+      : undefined;
+  if (raw === undefined || raw === '') return true;
+  return raw !== '0' && raw.toLowerCase() !== 'false';
+};
+
+const isMarketingParam = (name: string): boolean => {
+  const lower = name.toLowerCase();
+  if (MARKETING_PARAM_NAMES.has(lower)) return true;
+  for (const prefix of MARKETING_PARAM_PREFIXES) {
+    if (lower.startsWith(prefix)) return true;
+  }
+  return false;
+};
+
 // Sanitize a URL string for inclusion in a timeline payload.
 //   - Strip fragment.
 //   - Remove sensitive query params (full match or auth-shaped suffix).
-//   - Preserve everything else (scheme + host + path + non-sensitive query).
+//   - Remove marketing / ad-tracking params (utm_*, gclid, hsa_*,
+//     gad_*, fbclid, …) unless SIDETRACK_TIMELINE_STRIP_MARKETING_PARAMS=0.
+//   - Preserve everything else (scheme + host + path + non-noise query).
 //   - On parse failure, return the input with the fragment stripped
 //     so we never accidentally retain a #... section.
 export const sanitizeTimelineUrl = (input: string): string => {
@@ -83,10 +175,17 @@ export const sanitizeTimelineUrl = (input: string): string => {
     return hashAt >= 0 ? input.slice(0, hashAt) : input;
   }
   parsed.hash = '';
+  const stripMarketing = stripMarketingParamsEnabled();
   // Walk a copy of the keys so we can delete safely while iterating.
   const namesToDelete: string[] = [];
   parsed.searchParams.forEach((_value, name) => {
-    if (isSensitiveParam(name)) namesToDelete.push(name);
+    if (isSensitiveParam(name)) {
+      namesToDelete.push(name);
+      return;
+    }
+    if (stripMarketing && isMarketingParam(name)) {
+      namesToDelete.push(name);
+    }
   });
   for (const name of namesToDelete) parsed.searchParams.delete(name);
   return parsed.toString();

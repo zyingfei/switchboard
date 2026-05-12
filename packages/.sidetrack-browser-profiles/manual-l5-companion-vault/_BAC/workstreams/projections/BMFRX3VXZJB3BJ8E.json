@@ -1,0 +1,23 @@
+{
+  "bac_id": "BMFRX3VXZJB3BJ8E",
+  "record": {
+    "status": "resolved",
+    "value": {
+      "bac_id": "BMFRX3VXZJB3BJ8E",
+      "title": "sideproject",
+      "privacy": "shared",
+      "tags": [],
+      "children": [],
+      "checklist": []
+    },
+    "event": {
+      "replicaId": "eb71d296-4d1e-49fc-bc22-09805846b829",
+      "seq": 5
+    }
+  },
+  "deleted": false,
+  "vector": {
+    "eb71d296-4d1e-49fc-bc22-09805846b829": 5
+  },
+  "updatedAtMs": 1778447229369
+}

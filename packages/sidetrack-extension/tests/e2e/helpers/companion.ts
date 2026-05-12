@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessByStdio } from 'node:child_process';
+import { execSync, spawn, type ChildProcessByStdio } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -41,6 +41,23 @@ export interface StartTestCompanionOptions {
 const packageRoot = path.resolve(fileURLToPath(new URL('../../../', import.meta.url)));
 const companionRoot = path.resolve(packageRoot, '../sidetrack-companion');
 const companionCliPath = path.join(companionRoot, 'dist/cli.js');
+
+// Stage 5 follow-up — best-effort git SHA used by the attach-diag's
+// stale-process detection. Returns the env-var key/value pair when the
+// SHA can be read; returns `{}` so the spread is a no-op when git
+// isn't available (CI image without git, or running outside a repo).
+const readGitShaForEnv = (): { readonly SIDETRACK_COMPANION_GIT_SHA?: string } => {
+  try {
+    const sha = execSync('git rev-parse --short HEAD', {
+      cwd: companionRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    return sha.length > 0 ? { SIDETRACK_COMPANION_GIT_SHA: sha } : {};
+  } catch {
+    return {};
+  }
+};
 
 type CompanionProcess = ChildProcessByStdio<null, Readable, Readable>;
 
@@ -216,6 +233,13 @@ export const startTestCompanion = async (
         // companion-side unit tests via vi.mock; the env-var path
         // is what the spawned subprocess sees.
         SIDETRACK_TEST_EMBEDDER: '1',
+        // Stage 5 follow-up — inherit the test-harness's git SHA so the
+        // companion's /v1/version reports the actual build identity.
+        // Lets the attach-diag detect "extension rebuilt but the
+        // companion is still running the prior build."
+        ...(process.env['SIDETRACK_COMPANION_GIT_SHA'] === undefined
+          ? readGitShaForEnv()
+          : {}),
       },
     });
     try {

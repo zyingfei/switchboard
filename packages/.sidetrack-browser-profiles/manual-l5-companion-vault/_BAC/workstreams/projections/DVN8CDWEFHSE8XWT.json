@@ -1,0 +1,22 @@
+{
+  "bac_id": "DVN8CDWEFHSE8XWT",
+  "record": {
+    "status": "resolved",
+    "value": {
+      "bac_id": "DVN8CDWEFHSE8XWT",
+      "title": "Copy-fail Linux security research",
+      "tags": [],
+      "children": [],
+      "checklist": []
+    },
+    "event": {
+      "replicaId": "eb71d296-4d1e-49fc-bc22-09805846b829",
+      "seq": 3
+    }
+  },
+  "deleted": false,
+  "vector": {
+    "eb71d296-4d1e-49fc-bc22-09805846b829": 3
+  },
+  "updatedAtMs": 1778447167460
+}

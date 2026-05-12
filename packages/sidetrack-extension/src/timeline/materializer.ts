@@ -398,8 +398,21 @@ const drainSpoolToCompanion = async (): Promise<{
   remaining: number;
 }> => {
   const entries = await readSpool(SURFACE);
+  // Include 'pending-send' in drainable so entries orphaned by a
+  // crashed/restarted prior drain attempt (SW killed mid-POST,
+  // rollback loop never reached the entry because readSpool missed
+  // it on a race, etc.) get retried instead of stuck forever. The
+  // companion's POST /v1/timeline/events is idempotent on edge dot:
+  // a successful prior import returns the entry under
+  // skipped[reason='already-imported'], which createDefaultTimelineDrainHook
+  // folds into `uploaded` so the entry evicts cleanly on the retry.
+  //
+  // Without this, the spool state machine is one-way for any entry
+  // whose ack handler didn't complete (observed in the wild after
+  // SW restart: 12 entries stuck in pending-send for >10 min, drain
+  // alarm running but drainableCount=0 every cycle).
   const drainable = entries.filter(
-    (e) => e.state === 'active' || e.state === 'spooled',
+    (e) => e.state === 'active' || e.state === 'spooled' || e.state === 'pending-send',
   ) as SpoolEntry<BrowserTimelineObservedPayload>[];
   if (drainable.length === 0) {
     const remainingSpool = entries.filter((e) => e.state === 'pending-send').length;

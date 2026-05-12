@@ -237,6 +237,13 @@ export interface VisitSimilarityEdge {
   readonly cosine: number;
 }
 
+// Stage 5 / T2 — `producer` distinguishes whether the edges came from
+// the embedding pipeline or the metadata-Jaccard lexical fallback.
+// Field is optional + treated as 'embedding' when absent so existing
+// revision files on disk and snapshot/test fixtures remain valid
+// without migration.
+export type VisitSimilarityProducer = 'embedding' | 'lexical';
+
 export interface VisitSimilarityRevision {
   readonly revisionId: string;
   readonly modelId: 'Xenova/multilingual-e5-small';
@@ -245,6 +252,7 @@ export interface VisitSimilarityRevision {
   readonly threshold: number;
   readonly edges: readonly VisitSimilarityEdge[];
   readonly producedAt: number;
+  readonly producer?: VisitSimilarityProducer;
 }
 
 export interface ConnectionsSnapshotScope {

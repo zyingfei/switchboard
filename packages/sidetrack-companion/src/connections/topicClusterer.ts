@@ -242,6 +242,21 @@ const computeLineage = async (
   });
 };
 
+// PR #141 — env-tunable topic engagement gate. Production default
+// stays DEFAULT_TOPIC_ENGAGEMENT_GATE_MS (5000ms); dogfood can dial
+// it down for short browsing sessions via the env var.
+export const TOPIC_ENGAGEMENT_GATE_MS_ENV = 'SIDETRACK_TOPIC_ENGAGEMENT_GATE_MS';
+
+const resolveTopicEngagementGateMs = (override: number | undefined): number => {
+  if (override !== undefined && Number.isFinite(override)) return Math.max(0, override);
+  const raw = process.env[TOPIC_ENGAGEMENT_GATE_MS_ENV];
+  if (raw !== undefined && raw.length > 0) {
+    const value = Number(raw);
+    if (Number.isFinite(value)) return Math.max(0, value);
+  }
+  return DEFAULT_TOPIC_ENGAGEMENT_GATE_MS;
+};
+
 // -- Stage 5.2 W4 — incremental topic cluster accumulator -------------
 // Foundational additive path: maintain a UnionFind across drains so new
 // similarity edges merge components in O(α(n)) per edge instead of
@@ -425,15 +440,14 @@ export class IncrementalTopicClusterAccumulator {
 
   // Note: no clear() method. UnionFind state is permanent — callers
   // needing a fresh accumulator should drop the instance and create a
-  // new one. This matches the W4 design rule that hot-add never evicts;
-  // splits / removes route through buildTopicRevision's full rebuild.
+  // new one. removeEdge handles the disconnect path.
 }
 
 export const buildTopicRevision = async (
   input: BuildTopicRevisionInput,
 ): Promise<TopicRevision> => {
   const cosineThreshold = input.options?.cosineThreshold ?? DEFAULT_TOPIC_COSINE_THRESHOLD;
-  const engagementGateMs = input.options?.engagementGateMs ?? DEFAULT_TOPIC_ENGAGEMENT_GATE_MS;
+  const engagementGateMs = resolveTopicEngagementGateMs(input.options?.engagementGateMs);
   const algorithmVersion = input.options?.algorithmVersion ?? TOPIC_ALGORITHM_VERSION;
   const producedAt = input.options?.producedAt ?? Date.now();
   const observedAt = new Date(producedAt).toISOString();
@@ -445,9 +459,18 @@ export const buildTopicRevision = async (
     touchedVisitKeys.add(edge.fromVisitKey);
     touchedVisitKeys.add(edge.toVisitKey);
   }
+  // Stage 5 follow-up — user-asserted relations' endpoints get a
+  // bypass for the engagement gate. The user's intent (organized this
+  // URL into a workstream) is a stronger signal than "did they linger
+  // on the page for 5 s." Without this, T3 derives relations
+  // correctly but they silently fail to form topics because most
+  // dogfood visits are below the engagement gate.
+  const userAssertedVisitKeys = new Set<string>();
   for (const relation of input.userAssertedRelations ?? []) {
     touchedVisitKeys.add(relation.fromVisitKey);
     touchedVisitKeys.add(relation.toVisitKey);
+    userAssertedVisitKeys.add(relation.fromVisitKey);
+    userAssertedVisitKeys.add(relation.toVisitKey);
   }
   for (const previousTopic of input.previousRevision?.topics ?? []) {
     for (const member of previousTopic.memberCanonicalUrls) touchedVisitKeys.add(member);
@@ -456,7 +479,14 @@ export const buildTopicRevision = async (
   const eligibleVisitKeys = new Set<string>();
   for (const visit of visits) {
     if (!touchedVisitKeys.has(visit.canonicalUrl)) continue;
-    if (visit.focusedWindowMs <= engagementGateMs) continue;
+    // User-asserted endpoints bypass the engagement gate. Everyone
+    // else still has to clear it.
+    if (
+      visit.focusedWindowMs <= engagementGateMs &&
+      !userAssertedVisitKeys.has(visit.canonicalUrl)
+    ) {
+      continue;
+    }
     eligibleVisitKeys.add(visit.canonicalUrl);
   }
 

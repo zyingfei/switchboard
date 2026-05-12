@@ -19,6 +19,7 @@
 //   SIDETRACK_VAULT_FRESH=1                            (archive + restart fresh)
 // The legacy SIDETRACK_MANUAL_L5_VAULT_DIR is still honoured for back-compat.
 
+import { execSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { access, mkdir, mkdtemp, readdir, rename, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
@@ -211,11 +212,14 @@ const withTimeout = async <T>(
     ),
   ]);
 
+// PR #141 raised the default recorder API timeout to 60s for slow CDP
+// operations; main added the env-tunable wrapper. Merge: keep the env
+// wrapper but use 60s as the fallback.
 const apiTimeoutMs = (): number => {
   const raw = process.env.SIDETRACK_E2E_API_TIMEOUT_MS;
-  if (raw === undefined || raw.length === 0) return 10_000;
+  if (raw === undefined || raw.length === 0) return 60_000;
   const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 10_000;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 60_000;
 };
 
 const apiGet = async (comp: TestCompanion, requestPath: string): Promise<unknown> => {
@@ -231,6 +235,11 @@ const apiGet = async (comp: TestCompanion, requestPath: string): Promise<unknown
     if (!res.ok)
       throw new Error(`GET ${requestPath} failed: ${String(res.status)} ${await res.text()}`);
     return await res.json();
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error(`GET ${requestPath} timed out after ${String(apiTimeoutMs())}ms`);
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
   }
@@ -259,9 +268,41 @@ const apiPost = async (
     if (!res.ok)
       throw new Error(`POST ${requestPath} failed: ${String(res.status)} ${await res.text()}`);
     return await res.json();
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error(`POST ${requestPath} timed out after ${String(apiTimeoutMs())}ms`);
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
   }
+};
+
+// Resolve the build's git identity for the recorder banner. The
+// recorder runs from a working tree, so showing branch + short SHA +
+// dirty marker lets the operator confirm which code the running
+// companion + extension are built from — load-bearing when fixes
+// land on a feature branch and the operator wants to verify them
+// without a `git log` round-trip.
+interface VersionInfo {
+  readonly branch: string;
+  readonly commit: string;
+  readonly dirty: boolean;
+}
+
+const readVersionInfo = (): VersionInfo => {
+  const gitTrim = (args: string): string => {
+    try {
+      return execSync(`git ${args}`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+        .trim();
+    } catch {
+      return '';
+    }
+  };
+  const branch = gitTrim('symbolic-ref --short HEAD') || 'detached';
+  const commit = gitTrim('rev-parse --short HEAD') || 'unknown';
+  const dirty = gitTrim('status --porcelain --untracked-files=no').length > 0;
+  return { branch, commit, dirty };
 };
 
 const openPrivacyGate = async (comp: TestCompanion, gate: string): Promise<void> => {
@@ -344,6 +385,161 @@ const grantDeeperPageAccessIfNeeded = async (panel: Page): Promise<void> => {
     await grantButton.click();
   }
   await panel.locator('button.btn.btn-ghost', { hasText: 'Close' }).click();
+};
+
+// Stage 5 follow-up — periodically dump the SW dev.diag stash to
+// disk during long-running recorder sessions. Lets the operator
+// (or me) inspect `wiring.lastOnUpdated` / `observer.lastDecision` /
+// `contentTitleSink.hits` post-hoc without opening the SW DevTools.
+//
+// The dumper triggers a `sidetrack.dev.diag` message (which writes
+// the stash to chrome.storage.session via the SW handler), then
+// reads the stash and writes a per-tick file under
+// <artifactsDir>/sw-diag/<isoTimestamp>.json.
+const dumpSwDiagOnce = async (
+  runtime: ExtensionRuntime,
+  panel: Page,
+  outDir: string,
+  label: string,
+): Promise<void> => {
+  // The SW's `sidetrack.dev.diag` handler responds with
+  // `{ok, diagnostics}` AND stashes a copy in chrome.storage.session.
+  // First try the direct response (works when the SW message port
+  // stays open). If that returns null (port closed mid-flight, common
+  // under stealth Chromium), fall back to the session-storage stash.
+  let response: unknown = null;
+  try {
+    response = await runtime.sendRuntimeMessage(panel, {
+      type: 'sidetrack.dev.diag',
+    });
+  } catch {
+    response = null;
+  }
+  let stash: unknown = response;
+  const responseHasDiagnostics =
+    typeof stash === 'object' &&
+    stash !== null &&
+    (stash as { diagnostics?: unknown }).diagnostics !== undefined;
+  if (!responseHasDiagnostics) {
+    // Give chrome.storage.session a beat to settle after the dev.diag
+    // handler's async stash write.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    try {
+      stash = await (
+        panel as unknown as {
+          evaluate: (fn: () => Promise<unknown>) => Promise<unknown>;
+        }
+      ).evaluate(async () => {
+        const c = (globalThis as unknown as { chrome?: typeof chrome }).chrome;
+        if (c === undefined) return null;
+        try {
+          const sessionStorage = (c.storage as { readonly session?: typeof c.storage.local })
+            .session;
+          if (sessionStorage === undefined) return null;
+          const got = await sessionStorage.get('sidetrack.dev.diag');
+          return got['sidetrack.dev.diag'] ?? null;
+        } catch {
+          return null;
+        }
+      });
+    } catch {
+      stash = null;
+    }
+  }
+  // Also pull the engagement journal from session storage so the
+  // artifact gives a full picture of what the engagement subsystem
+  // did between dumps. Same evaluate pattern; tolerates missing
+  // storage.session.
+  let engagementDiag: unknown = null;
+  try {
+    engagementDiag = await (
+      panel as unknown as { evaluate: (fn: () => Promise<unknown>) => Promise<unknown> }
+    ).evaluate(async () => {
+      const c = (globalThis as unknown as { chrome?: typeof chrome }).chrome;
+      if (c === undefined) return null;
+      try {
+        const sessionStorage = (c.storage as { readonly session?: typeof c.storage.local }).session;
+        if (sessionStorage === undefined) return null;
+        const got = await sessionStorage.get('sidetrack.engagement.diag');
+        return got['sidetrack.engagement.diag'] ?? null;
+      } catch {
+        return null;
+      }
+    });
+  } catch {
+    engagementDiag = null;
+  }
+  // Also inspect what the side panel sees from chrome.scripting (is the
+  // engagement script registered?) and chrome.permissions (does the
+  // browser still report host access?) so the artifact captures the
+  // full state in one place.
+  let extensionState: unknown = null;
+  try {
+    extensionState = await (
+      panel as unknown as { evaluate: (fn: () => Promise<unknown>) => Promise<unknown> }
+    ).evaluate(async () => {
+      const c = (globalThis as unknown as { chrome?: typeof chrome }).chrome;
+      if (c === undefined) return null;
+      try {
+        const registrations = await c.scripting.getRegisteredContentScripts({
+          ids: ['sidetrack-engagement'],
+        });
+        const hostPermission = await new Promise<boolean>((resolve) => {
+          c.permissions.contains({ origins: ['https://*/*', 'http://*/*'] }, (g) => {
+            resolve(Boolean(g));
+          });
+        });
+        const tabs = await c.tabs.query({ url: ['https://*/*', 'http://*/*'] });
+        return {
+          engagementRegistrations: registrations,
+          hostPermission,
+          httpTabCount: tabs.length,
+          sampleTabs: tabs.slice(0, 3).map((t) => ({ id: t.id ?? null, url: t.url?.slice(0, 80) ?? null })),
+        };
+      } catch (error) {
+        return { error: error instanceof Error ? error.message : String(error) };
+      }
+    });
+  } catch {
+    extensionState = null;
+  }
+  await mkdir(outDir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/gu, '-');
+  await writeFile(
+    path.join(outDir, `${stamp}-${label}.json`),
+    `${JSON.stringify({ swDiag: stash, engagementDiag, extensionState }, null, 2)}\n`,
+    'utf8',
+  );
+};
+
+const startPeriodicSwDiagDump = (
+  runtimes: readonly { readonly label: string; readonly runtime: ExtensionRuntime; readonly panel: Page }[],
+  outDir: string,
+  intervalMs: number,
+): { readonly stop: () => Promise<void> } => {
+  let stopped = false;
+  const tick = async (): Promise<void> => {
+    if (stopped) return;
+    for (const { label, runtime, panel } of runtimes) {
+      try {
+        await dumpSwDiagOnce(runtime, panel, outDir, label);
+      } catch {
+        // Periodic best-effort — never fail the recorder on a dump miss.
+      }
+    }
+  };
+  // First tick immediately so the operator gets an early snapshot.
+  void tick();
+  const handle = setInterval(() => {
+    void tick();
+  }, intervalMs);
+  return {
+    stop: () => {
+      stopped = true;
+      clearInterval(handle);
+      return Promise.resolve();
+    },
+  };
 };
 
 const drainRuntime = async (
@@ -697,18 +893,32 @@ test.describe('manual full-browser recorder', () => {
       await launchpad.goto(launchpadUrl, { waitUntil: 'domcontentloaded' });
       await launchpad.bringToFront();
 
+      const version = readVersionInfo();
+      const versionLine = `${version.branch} @ ${version.commit}${version.dirty ? ' (dirty working tree)' : ''}`;
       const banner = `
 ================================================================
  SIDETRACK MANUAL RECORDER READY
 ================================================================
 
+ Version          : ${versionLine}
+
  Browser A profile: ${profileDir}
  Browser A panel  : chrome-extension://${runtimeA.extensionId}/sidepanel.html
  Reviewer panel   : chrome-extension://${runtimeB.extensionId}/sidepanel.html
 
- Companion A      : http://127.0.0.1:${String(companionA.port)}
- Companion B      : http://127.0.0.1:${String(companionB.port)}
+ Companion A
+   URL            : http://127.0.0.1:${String(companionA.port)}
+   Bridge key     : ${companionA.bridgeKey}
+   Vault          : ${companionA.vaultPath}
+ Companion B
+   URL            : http://127.0.0.1:${String(companionB.port)}
+   Bridge key     : ${companionB.bridgeKey}
+   Vault          : ${companionB.vaultPath}
  Artifacts        : ${artifactsDir}
+
+ Quick curl recipe (Companion A):
+   curl -s -H 'x-bac-bridge-key: ${companionA.bridgeKey}' \\
+     http://127.0.0.1:${String(companionA.port)}/v1/workstreams/projections | jq
 
  Manual steps:
    1. In the Browser A side panel, create the workstreams you want for
@@ -733,7 +943,23 @@ dumps, visible screenshots, and companion/plugin result JSON.
       // eslint-disable-next-line no-console
       console.log(banner);
 
-      await waitForEnter('[manual-l5] Waiting. Send Enter after the user says done...');
+      // Stage 5 follow-up — dump SW dev.diag every 20 s to
+      // `<artifactsDir>/sw-diag/<iso>-{A,B}.json` so the recorder
+      // session leaves behind enough evidence to diagnose
+      // capture/title-sink/observer issues post-hoc.
+      const swDiagDumper = startPeriodicSwDiagDump(
+        [
+          { label: 'A', runtime: runtimeA, panel: panelA },
+          { label: 'B', runtime: runtimeB, panel: panelB },
+        ],
+        path.join(artifactsDir, 'sw-diag'),
+        20_000,
+      );
+      try {
+        await waitForEnter('[manual-l5] Waiting. Send Enter after the user says done...');
+      } finally {
+        await swDiagDumper.stop();
+      }
 
       await recorder.snapshotAll('manual-finished');
       await recorder.writeSummary();

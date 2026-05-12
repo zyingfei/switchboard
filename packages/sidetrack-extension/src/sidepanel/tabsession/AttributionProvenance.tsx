@@ -52,9 +52,11 @@ export function AttributionProvenance({
     const source =
       attribution.source === 'user_asserted'
         ? 'you'
-        : attribution.source === 'inferred'
-          ? 'Sidetrack'
-          : attribution.source;
+        : attribution.source === 'thread'
+          ? 'thread move'
+          : attribution.source === 'inferred'
+            ? 'Sidetrack'
+            : attribution.source;
     return (
       <span className="tab-session-provenance mono">
         Attributed by {source} on {formatDate(attribution.observedAt)} · {label}

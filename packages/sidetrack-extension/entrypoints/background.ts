@@ -56,6 +56,11 @@ import {
   registerTabLifecycleListeners,
 } from '../src/background/listeners/tabs';
 import { registerDefaultWebNavigationListeners } from '../src/background/listeners/web-navigation';
+import {
+  createEdgeEventDrainSingleFlight,
+  partitionEdgeEventDrainBatch,
+  summarizeEdgeEventDrain,
+} from '../src/background/storage/edge-event-drain';
 import { IndexedDbEventBuffer } from '../src/background/storage/indexeddb-event-buffer';
 import type { BufferedEvent } from '../src/background/storage/in-memory-event-buffer';
 import {
@@ -427,6 +432,34 @@ const isEngagementPrivacyGateOpen = async (): Promise<boolean> => {
   }
 };
 
+// Stage 5 follow-up — the engagement subsystem (focus/scroll/copy
+// aggregator) needs BOTH a host permission AND an "engagement" privacy
+// gate flipped open before its content script registers. Until this
+// helper landed, no production code path opened the gate — only e2e
+// test scripts wrote `privacy.gate.flipped { gate: 'engagement' }`.
+// Production users granted host permission, saw "deeper page access
+// granted" green, but the engagement content script never registered,
+// so the materializer's engagement counters stayed at zero (which in
+// turn starved the similarity ranker and the URL auto-inference path).
+//
+// Design: engagement is default-on. The privacy gate is kept open
+// idempotently; the only thing that actually blocks engagement is the
+// host permission, which has its own user-facing grant flow + banner.
+const ensureEngagementGateDefaultOpen = async (): Promise<void> => {
+  if (await isEngagementPrivacyGateOpen()) return;
+  await appendPrivacyEvent(
+    PRIVACY_GATE_FLIPPED,
+    {
+      gate: ENGAGEMENT_PRIVACY_GATE,
+      state: 'open',
+      actor: 'system',
+      reason: 'default-on',
+      payloadVersion: 1,
+    },
+    `${ENGAGEMENT_PRIVACY_GATE}-open-default`,
+  );
+};
+
 const isVisualFingerprintPrivacyGateOpen = async (): Promise<boolean> => {
   try {
     const projection = await readPrivacyProjection();
@@ -448,27 +481,98 @@ const hasEngagementHostPermission = async (): Promise<boolean> => {
   }
 };
 
+// Primary in-memory journal. Survives SW lifetime, no async dependency
+// on chrome.storage, no race conditions. Mirrored to chrome.storage.session
+// and console.warn as fallbacks for operators who can't read globalThis
+// from a non-SW context.
+const engagementSyncJournal: Array<Record<string, unknown>> = [];
+const ENGAGEMENT_SYNC_JOURNAL_MAX = 50;
+
+const recordEngagementSyncDiag = async (
+  step: string,
+  detail?: Record<string, unknown>,
+): Promise<void> => {
+  const entry: Record<string, unknown> = {
+    at: new Date().toISOString(),
+    step,
+  };
+  if (detail !== undefined) entry['detail'] = detail;
+  // Primary: globalThis array. Read from SW DevTools via:
+  //   globalThis.__sidetrackEngagementDiag
+  // Or from any extension page DevTools via sidetrack.dev.diag dump
+  // (folded into the response below).
+  engagementSyncJournal.push(entry);
+  if (engagementSyncJournal.length > ENGAGEMENT_SYNC_JOURNAL_MAX) {
+    engagementSyncJournal.shift();
+  }
+  (globalThis as unknown as { __sidetrackEngagementDiag: unknown[] }).__sidetrackEngagementDiag =
+    engagementSyncJournal;
+  // Console fallback — visible in the SW DevTools console regardless
+  // of storage availability.
+  console.warn('[engagement.diag]', step, detail ?? '');
+  // Best-effort secondary: chrome.storage.session so a side-panel
+  // DevTools can probe it. Chrome 148 sometimes loses these writes
+  // (we hit this earlier), so it's belt-and-suspenders not primary.
+  try {
+    const key = 'sidetrack.engagement.diag';
+    await chrome.storage.session.set({ [key]: [...engagementSyncJournal] });
+  } catch {
+    // Storage failed — globalThis still has the data.
+  }
+};
+
 const syncEngagementContentScriptRegistration = async (): Promise<void> => {
-  const shouldRegister =
-    (await isEngagementPrivacyGateOpen()) && (await hasEngagementHostPermission());
+  // Engagement is default-on. The gate stayed closed for production
+  // users because nothing wrote the privacy.gate.flipped event; open
+  // it idempotently so the only remaining gate is host permission.
+  await ensureEngagementGateDefaultOpen().catch(() => undefined);
+  const gateOpen = await isEngagementPrivacyGateOpen();
+  const hasPermission = await hasEngagementHostPermission();
+  const shouldRegister = gateOpen && hasPermission;
   const registered = await chrome.scripting.getRegisteredContentScripts({
     ids: [ENGAGEMENT_CONTENT_SCRIPT_ID],
   });
   const alreadyRegistered = registered.length > 0;
+  await recordEngagementSyncDiag('sync.invoked', {
+    gateOpen,
+    hasPermission,
+    shouldRegister,
+    alreadyRegistered,
+  });
   if (shouldRegister && !alreadyRegistered) {
-    await chrome.scripting.registerContentScripts([
-      {
-        id: ENGAGEMENT_CONTENT_SCRIPT_ID,
-        matches: [...ENGAGEMENT_HOST_ORIGINS],
-        js: [ENGAGEMENT_CONTENT_SCRIPT_FILE],
-        runAt: 'document_idle',
-        persistAcrossSessions: true,
-      },
-    ]);
+    try {
+      await chrome.scripting.registerContentScripts([
+        {
+          id: ENGAGEMENT_CONTENT_SCRIPT_ID,
+          matches: [...ENGAGEMENT_HOST_ORIGINS],
+          js: [ENGAGEMENT_CONTENT_SCRIPT_FILE],
+          runAt: 'document_idle',
+          persistAcrossSessions: true,
+        },
+      ]);
+      await recordEngagementSyncDiag('register.ok');
+    } catch (error) {
+      await recordEngagementSyncDiag('register.failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+    // Catch-up: the registration covers future navigations only, so
+    // dogfooders staring at already-open tabs see no engagement signal
+    // until they manually refresh. Inject into those tabs now.
+    await reinjectEngagementScriptIntoOpenTabs();
     return;
   }
   if (!shouldRegister && alreadyRegistered) {
     await chrome.scripting.unregisterContentScripts({ ids: [ENGAGEMENT_CONTENT_SCRIPT_ID] });
+    await recordEngagementSyncDiag('unregister.ok');
+    return;
+  }
+  // Already-registered case: still catch up on open tabs in case a prior
+  // sync registered but skipped the inject (e.g. SW restart, install).
+  if (shouldRegister && alreadyRegistered) {
+    await reinjectEngagementScriptIntoOpenTabs();
+    await recordEngagementSyncDiag('reinject.ok');
   }
 };
 
@@ -2792,6 +2896,51 @@ const reinjectContentScriptIntoOpenTabs = async (): Promise<void> => {
   }
 };
 
+// chrome.scripting.registerContentScripts only matches FUTURE navigations.
+// Already-open tabs from before the registration won't run the engagement
+// script until they refresh. Without this catch-up inject, dogfooders
+// see zero engagement counters until they manually reload every tab.
+// Run after registration sync — idempotent on tabs that already have it
+// because the engagement runtime keys its aggregator by visitId.
+const reinjectEngagementScriptIntoOpenTabs = async (): Promise<void> => {
+  if (!(await isEngagementPrivacyGateOpen()) || !(await hasEngagementHostPermission())) {
+    await recordEngagementSyncDiag('reinject.skipped', { reason: 'gate-or-permission-closed' });
+    return;
+  }
+  try {
+    const tabs = await chrome.tabs.query({ url: [...ENGAGEMENT_HOST_ORIGINS] });
+    const results = await Promise.all(
+      tabs.map(async (tab) => {
+        if (typeof tab.id !== 'number') return { tabId: null, ok: false, reason: 'no-id' };
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            files: [ENGAGEMENT_CONTENT_SCRIPT_FILE],
+          });
+          return { tabId: tab.id, ok: true, url: tab.url?.slice(0, 80) ?? null };
+        } catch (error) {
+          return {
+            tabId: tab.id,
+            ok: false,
+            url: tab.url?.slice(0, 80) ?? null,
+            reason: error instanceof Error ? error.message : String(error),
+          };
+        }
+      }),
+    );
+    await recordEngagementSyncDiag('reinject.attempted', {
+      tabsFound: tabs.length,
+      injected: results.filter((r) => r.ok).length,
+      failed: results.filter((r) => !r.ok).length,
+      sample: results.slice(0, 3),
+    });
+  } catch (error) {
+    await recordEngagementSyncDiag('reinject.query-failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+};
+
 const detectCodingAttachForTab = async (tabId: number, url: string): Promise<void> => {
   try {
     const [result] = await chrome.scripting.executeScript({
@@ -2849,6 +2998,21 @@ const detectCodingAttachForTab = async (tabId: number, url: string): Promise<voi
 };
 
 export default defineBackground(() => {
+  // chrome.storage.session is the in-memory backing for our diagnostic
+  // journals (engagement.diag, dev.diag). By default session storage
+  // from a background SW is only readable from the SAME context, which
+  // means side-panel DevTools can't pull it. Bumping the access level
+  // to TRUSTED_CONTEXTS lets the side panel + popup read it without
+  // affecting content-script access. Best-effort: older Chromes that
+  // don't ship session storage just throw, which we swallow.
+  try {
+    void chrome.storage.session
+      .setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })
+      .catch(() => undefined);
+  } catch {
+    // chrome.storage.session unavailable — leave as default.
+  }
+
   const tabOpenerStore = createTabOpenerStore();
   registerTabLifecycleListeners(chrome.tabs, tabOpenerStore);
   registerDefaultWebNavigationListeners(tabOpenerStore);
@@ -2897,7 +3061,17 @@ export default defineBackground(() => {
     message: unknown,
     tabId: number | undefined,
   ): Promise<void> => {
-    if (tabId === undefined || !isEngagementIntervalMessage(message)) return;
+    if (tabId === undefined) {
+      await recordEngagementSyncDiag('interval.dropped', { reason: 'no-tabId' });
+      return;
+    }
+    if (!isEngagementIntervalMessage(message)) {
+      await recordEngagementSyncDiag('interval.dropped', {
+        reason: 'shape-mismatch',
+        rawType: typeof message,
+      });
+      return;
+    }
     const runtime = await engagementRuntime();
     const merged = runtime.cache.mergeInterval(tabId, message);
     const payloads: {
@@ -2908,6 +3082,11 @@ export default defineBackground(() => {
       payloads.push({ streamName: 'engagement.session.aggregated', payload: merged.aggregate });
     }
     await appendEngagementEvents(payloads);
+    await recordEngagementSyncDiag('interval.buffered', {
+      tabId,
+      final: message.final,
+      payloadCount: payloads.length,
+    });
   };
 
   const finalizeEngagementForTab = async (tabId: number): Promise<void> => {
@@ -2971,27 +3150,101 @@ export default defineBackground(() => {
     return `${event.streamName}:${event.observedAt.slice(0, 10)}`;
   };
 
-  const drainBufferedEdgeEvents = async (): Promise<{
+  const acceptedEdgeEventStreamNames = new Set<BufferedEvent['streamName']>([
+    'engagement.interval.observed',
+    'engagement.session.aggregated',
+    'selection.copied',
+    'selection.pasted',
+    VISUAL_FINGERPRINT_OBSERVED,
+  ]);
+  const EDGE_EVENT_DRAIN_ROUTE_BATCH_SIZE = 10;
+  const EDGE_EVENT_DRAIN_SCAN_BATCH_SIZE = 500;
+  const EDGE_EVENT_DRAIN_DEFAULT_MAX_BATCHES = 1;
+  const EDGE_EVENT_DRAIN_BULK_MAX_BATCHES = 50;
+
+  const mergeCounts = (
+    ...counts: readonly Record<string, number>[]
+  ): Record<string, number> => {
+    const merged: Record<string, number> = {};
+    for (const count of counts) {
+      for (const [key, value] of Object.entries(count)) {
+        merged[key] = (merged[key] ?? 0) + value;
+      }
+    }
+    return merged;
+  };
+
+  interface EdgeEventDrainStats {
     readonly uploaded: number;
+    readonly evicted: number;
     readonly remaining: number;
     readonly skipped: number;
     readonly uploadedByType: Record<string, number>;
-  }> => {
+    readonly evictedByType: Record<string, number>;
+    readonly skippedByReason: Record<string, number>;
+  }
+
+  const emptyEdgeEventDrainStats = (remaining: number): EdgeEventDrainStats => ({
+    uploaded: 0,
+    evicted: 0,
+    remaining,
+    skipped: 0,
+    uploadedByType: {},
+    evictedByType: {},
+    skippedByReason: {},
+  });
+
+  const mergeEdgeEventDrainStats = (
+    left: EdgeEventDrainStats,
+    right: EdgeEventDrainStats,
+  ): EdgeEventDrainStats => ({
+    uploaded: left.uploaded + right.uploaded,
+    evicted: left.evicted + right.evicted,
+    remaining: right.remaining,
+    skipped: left.skipped + right.skipped,
+    uploadedByType: mergeCounts(left.uploadedByType, right.uploadedByType),
+    evictedByType: mergeCounts(left.evictedByType, right.evictedByType),
+    skippedByReason: mergeCounts(left.skippedByReason, right.skippedByReason),
+  });
+
+  const drainBufferedEdgeEventsOnce = async (): Promise<EdgeEventDrainStats> => {
     const companion = await readTimelineCompanionConfig();
     if (companion === null || companion.url.trim().length === 0) {
+      return emptyEdgeEventDrainStats(await engagementEventBuffer.count());
+    }
+
+    const batch = await engagementEventBuffer.peek(EDGE_EVENT_DRAIN_SCAN_BATCH_SIZE);
+    if (batch.length === 0) {
+      return emptyEdgeEventDrainStats(0);
+    }
+
+    const {
+      routeBatch,
+      locallyRejectedBatch,
+      evictedByType: localEvictedByType,
+      skippedByReason: localSkippedByReason,
+    } = partitionEdgeEventDrainBatch(
+      batch,
+      acceptedEdgeEventStreamNames,
+      EDGE_EVENT_DRAIN_ROUTE_BATCH_SIZE,
+    );
+    const locallyEvicted =
+      locallyRejectedBatch.length === 0
+        ? 0
+        : await engagementEventBuffer.deleteMany(locallyRejectedBatch);
+    if (routeBatch.length === 0) {
       return {
         uploaded: 0,
+        evicted: locallyEvicted,
         remaining: await engagementEventBuffer.count(),
-        skipped: 0,
+        skipped: locallyRejectedBatch.length,
         uploadedByType: {},
+        evictedByType: localEvictedByType,
+        skippedByReason: localSkippedByReason,
       };
     }
 
-    const batch = await engagementEventBuffer.peek(100);
-    if (batch.length === 0) {
-      return { uploaded: 0, remaining: 0, skipped: 0, uploadedByType: {} };
-    }
-    const events = batch.map((event) => ({
+    const events = routeBatch.map((event) => ({
       clientEventId: `edge:${event.streamName}:${event.replicaId}:${String(event.lamport)}`,
       dot: { replicaId: event.replicaId, seq: event.lamport },
       deps: {},
@@ -3020,32 +3273,71 @@ export default defineBackground(() => {
     };
     const imported = json.data?.imported ?? [];
     const skipped = json.data?.skipped ?? [];
-    const acked = new Set<string>(
-      [...imported, ...skipped.filter((event) => event.reason === 'already-imported')].map(
-        (event) => `${event.replicaId}:${String(event.seq)}`,
-      ),
-    );
-    const ackedBatch = batch.filter((event) =>
-      acked.has(`${event.replicaId}:${String(event.lamport)}`),
-    );
-    const uploadedByType: Record<string, number> = {};
-    for (const event of ackedBatch) {
-      uploadedByType[event.streamName] = (uploadedByType[event.streamName] ?? 0) + 1;
-    }
-    const deleted = await engagementEventBuffer.deleteMany(ackedBatch);
+    const summary = summarizeEdgeEventDrain(routeBatch, imported, skipped);
+    const deleted = await engagementEventBuffer.deleteMany(summary.acceptedEvents);
+    const evicted =
+      locallyEvicted + (await engagementEventBuffer.deleteMany(summary.permanentlyRejectedEvents));
     return {
       uploaded: deleted,
+      evicted,
       remaining: await engagementEventBuffer.count(),
-      skipped: skipped.length,
-      uploadedByType,
+      skipped: skipped.length + locallyRejectedBatch.length,
+      uploadedByType: summary.uploadedByType,
+      evictedByType: mergeCounts(
+        localEvictedByType,
+        summary.evictedByType,
+      ),
+      skippedByReason: mergeCounts(localSkippedByReason, summary.skippedByReason),
     };
   };
+
+  const drainBufferedEdgeEventsLoop = async (
+    maxBatches = EDGE_EVENT_DRAIN_DEFAULT_MAX_BATCHES,
+  ): Promise<EdgeEventDrainStats> => {
+    let total: EdgeEventDrainStats | null = null;
+    const batchLimit = Math.max(1, Math.floor(maxBatches));
+    for (let i = 0; i < batchLimit; i += 1) {
+      const next = await drainBufferedEdgeEventsOnce();
+      total = total === null ? next : mergeEdgeEventDrainStats(total, next);
+      if (next.remaining === 0) break;
+      if (next.uploaded === 0 && next.evicted === 0) break;
+    }
+    return total ?? emptyEdgeEventDrainStats(await engagementEventBuffer.count());
+  };
+
+  const drainBufferedEdgeEvents = createEdgeEventDrainSingleFlight(() =>
+    drainBufferedEdgeEventsLoop(),
+  );
+  const drainBufferedEdgeEventsBulk = createEdgeEventDrainSingleFlight(() =>
+    drainBufferedEdgeEventsLoop(EDGE_EVENT_DRAIN_BULK_MAX_BATCHES),
+  );
 
   // Drop reminders bound to thread bac_ids that no longer exist.
   // Cleanup pass for the historical mess caused by the pre-fix
   // sendToCompanion bug (every capture reissued a thread bac_id;
   // reminders accumulated against orphans). Idempotent — runs on
   // every service-worker boot, no-op when storage is already clean.
+  // Periodic drain for buffered edge events (engagement.interval.observed,
+  // engagement.session.aggregated, selection.copied, selection.pasted,
+  // visual.fingerprint.observed). Pre-fix, drainBufferedEdgeEvents was
+  // only invoked by the test-only `sidetrack.edge-events.force-drain`
+  // message, so in production engagement events accumulated in
+  // IndexedDB indefinitely and the materializer's engagement counters
+  // stayed at zero forever — that's why ranker training had 794
+  // positive labels and 0 negatives, the similarity ranker stayed at 0
+  // edges, and URL auto-attribution never inferred. 1-minute cadence
+  // matches the dispatch poll: Chrome's alarm minimum, and the
+  // engagement aggregator's own emit interval is 30 s so the worst-case
+  // end-to-end latency is < 90 s.
+  const EDGE_EVENTS_DRAIN_ALARM = 'sidetrack.edge-events.drain';
+  const ensureEdgeEventsDrainAlarm = async (): Promise<void> => {
+    try {
+      await chrome.alarms.create(EDGE_EVENTS_DRAIN_ALARM, { periodInMinutes: 1 });
+    } catch (error) {
+      console.warn('[edge-events.drain] alarm create failed:', error);
+    }
+  };
+
   const DISPATCH_POLL_ALARM = 'sidetrack.dispatch.poll';
   // 1-minute cadence: Chrome's MV3 minimum. Latency from
   // bac.request_dispatch to the chat tab opening is bounded by this
@@ -3140,24 +3432,72 @@ export default defineBackground(() => {
   // bac.request_dispatch to "tab opens" is ~1 minute. The alarm is
   // additive; explicit side-panel actions still trigger immediately.
   chrome.alarms.onAlarm.addListener((alarm) => {
-    if (alarm.name !== DISPATCH_POLL_ALARM) return;
-    void (async () => {
-      try {
-        if (!(await isCompanionConfigured())) return;
-        await refreshCachedDispatches();
-      } catch (error) {
-        console.warn('[dispatch.poll] failed:', error);
-      }
-    })();
+    if (alarm.name === DISPATCH_POLL_ALARM) {
+      void (async () => {
+        try {
+          if (!(await isCompanionConfigured())) return;
+          await refreshCachedDispatches();
+        } catch (error) {
+          console.warn('[dispatch.poll] failed:', error);
+        }
+      })();
+      return;
+    }
+    if (alarm.name === EDGE_EVENTS_DRAIN_ALARM) {
+      void drainBufferedEdgeEvents().catch((error: unknown) => {
+        console.warn('[edge-events.drain] periodic drain failed:', error);
+      });
+      return;
+    }
   });
   void ensureDispatchPollAlarm();
+  void ensureEdgeEventsDrainAlarm();
+  // Eager first drain on SW boot — picks up anything buffered across a
+  // service-worker restart so the first drain doesn't wait a full minute.
+  void drainBufferedEdgeEvents().catch(() => undefined);
+
+  // Debug hook for the SW DevTools console. `chrome.runtime.sendMessage`
+  // from the SW itself never reaches the SW's own onMessage listener
+  // (Chrome routes those only to OTHER extension contexts) — so the
+  // `sidetrack.dev.ping` + `.edge-events.force-drain` messages always
+  // returned `undefined` when invoked from chrome://extensions ->
+  // service worker -> Inspect. Exposing these on globalThis lets the
+  // operator call them directly without crossing the message bus.
+  //
+  // Usage from the SW DevTools console:
+  //   sidetrackDebug.build           — version/sha/dirty/builtAt
+  //   await sidetrackDebug.drainEdgeEvents()      — one quick capped batch
+  //   await sidetrackDebug.drainEdgeEventsBulk()  — deliberate catch-up
+  //   await sidetrackDebug.engagementBufferCount()
+  //   await sidetrackDebug.engagementGate()
+  //   await sidetrackDebug.engagementHostPermission()
+  //   await sidetrackDebug.engagementRegistrations()
+  (globalThis as unknown as { sidetrackDebug?: unknown }).sidetrackDebug = {
+    build: __BUILD_INFO__,
+    drainEdgeEvents: drainBufferedEdgeEvents,
+    drainEdgeEventsBulk: drainBufferedEdgeEventsBulk,
+    engagementBufferCount: () => engagementEventBuffer.count(),
+    engagementGate: isEngagementPrivacyGateOpen,
+    engagementHostPermission: hasEngagementHostPermission,
+    engagementRegistrations: () =>
+      chrome.scripting.getRegisteredContentScripts({ ids: [ENGAGEMENT_CONTENT_SCRIPT_ID] }),
+    syncRegistrations: syncPrivacyGatedContentScriptRegistrations,
+    reinjectEngagementIntoOpenTabs: reinjectEngagementScriptIntoOpenTabs,
+  };
 
   chrome.tabs.onRemoved.addListener((tabId) => {
     void markClosedTabRestorable(tabId).catch(() => undefined);
     // Clean up MCP-dispatch markers on tab close so the storage map
     // doesn't accumulate dead entries.
     void dropMcpDispatchTab(tabId).catch(() => undefined);
-    void finalizeEngagementForTab(tabId).catch(() => undefined);
+    // Finalize emits a `.session.aggregated` final-snapshot event into
+    // the buffer; pipe it straight to the companion so the
+    // materializer's lateral lookup (engagement → similarity) sees the
+    // session within ~1 s of tab close instead of waiting for the
+    // 1-min periodic drain.
+    void finalizeEngagementForTab(tabId)
+      .then(() => drainBufferedEdgeEvents())
+      .catch(() => undefined);
   });
 
   // Whenever the user activates a different tab or a tab's URL
@@ -3352,6 +3692,26 @@ export default defineBackground(() => {
 
   chrome.runtime.onMessage.addListener(
     (message: unknown, sender, sendResponse: (response: RuntimeResponse) => void) => {
+      // Build-verification ping from any extension page (side panel,
+      // any extension HTML). Returns the build sha + dirty flag + builtAt
+      // so operators can confirm which bundle is loaded.
+      // NOTE: invoking this from the SW DevTools console returns
+      // `undefined` — Chrome routes chrome.runtime.sendMessage to all
+      // extension contexts EXCEPT the sender, so the SW never receives
+      // its own messages. Use the side panel's DevTools instead, or read
+      // the footer banner.
+      if (
+        message !== null &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'sidetrack.dev.ping'
+      ) {
+        sendResponse({
+          ok: true,
+          build: __BUILD_INFO__,
+          listenerReached: true,
+        } as unknown as RuntimeResponse);
+        return true;
+      }
       if (isVisualFingerprintObservedMessage(message)) {
         void handleVisualFingerprintObserved(message)
           .then(() => {
@@ -3484,7 +3844,15 @@ export default defineBackground(() => {
         typeof message === 'object' &&
         (message as { type?: unknown }).type === 'sidetrack.timeline.permission.granted'
       ) {
+        // Stage 5 follow-up — record the grant event AND re-sync the
+        // privacy-gated content scripts. Pre-fix, the grant flowed
+        // into the vault but `syncPrivacyGatedContentScriptRegistrations`
+        // never ran, so the engagement content script stayed
+        // unregistered (its second gate, `hasEngagementHostPermission`,
+        // had just flipped to true but nothing rechecked it). Engagement
+        // events only flowed after a full SW restart.
         void recordTimelinePermissionGranted()
+          .then(() => syncPrivacyGatedContentScriptRegistrations())
           .then(() => {
             sendResponse({ ok: true } as unknown as RuntimeResponse);
           })
@@ -3502,7 +3870,10 @@ export default defineBackground(() => {
         typeof message === 'object' &&
         (message as { type?: unknown }).type === 'sidetrack.timeline.permission.revoked'
       ) {
+        // Same as above — revoke flow must unregister the now-gated-out
+        // scripts so they stop injecting on subsequent navigations.
         void recordTimelinePermissionRevoked()
+          .then(() => syncPrivacyGatedContentScriptRegistrations())
           .then(() => {
             sendResponse({ ok: true } as unknown as RuntimeResponse);
           })
@@ -3616,14 +3987,30 @@ export default defineBackground(() => {
       ) {
         void readTimelineReplayDiagnostics()
           .then(async (diagnostics) => {
+            // Fold the engagement journal into the diag response so the
+            // recorder's existing periodic SW-diag dump captures it
+            // automatically — no separate plumbing needed.
+            const fullDiagnostics = {
+              ...diagnostics,
+              engagement: {
+                journal: [...engagementSyncJournal],
+                journalLength: engagementSyncJournal.length,
+              },
+            };
             try {
               await chrome.storage.session.set({
-                'sidetrack.dev.diag': { capturedAt: new Date().toISOString(), diagnostics },
+                'sidetrack.dev.diag': {
+                  capturedAt: new Date().toISOString(),
+                  diagnostics: fullDiagnostics,
+                },
               });
             } catch {
               // session storage may not be available in some test harnesses
             }
-            sendResponse({ ok: true, diagnostics } as unknown as RuntimeResponse);
+            sendResponse({
+              ok: true,
+              diagnostics: fullDiagnostics,
+            } as unknown as RuntimeResponse);
           })
           .catch((error: unknown) => {
             sendResponse({

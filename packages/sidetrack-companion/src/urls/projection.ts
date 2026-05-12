@@ -19,7 +19,17 @@ export const URL_PROJECTION_SCHEMA_VERSION = 1;
 
 export interface UrlAttribution {
   readonly workstreamId: string | null;
-  readonly source: 'user_asserted' | 'tab-group-pull-in' | 'tab-group-pull-out' | 'inferred';
+  // Stage 5 follow-up — `'thread'` is a derived source: the user
+  // attributed a chat THREAD to a workstream, and the projection
+  // propagates that to the matching canonical URL. Without this
+  // bridge, attributing an AI chat via the "All threads" tab leaves
+  // its URL in the Inbox asking for re-attribution.
+  readonly source:
+    | 'user_asserted'
+    | 'tab-group-pull-in'
+    | 'tab-group-pull-out'
+    | 'inferred'
+    | 'thread';
   readonly observedAt: string;
   readonly clientEventId: string;
   readonly replicaId: string;
@@ -62,8 +72,9 @@ const compareEventOrder = (left: AcceptedEvent, right: AcceptedEvent): number =>
 };
 
 const compareAttribution = (left: UrlAttribution, right: UrlAttribution): number => {
-  // user_asserted always beats inferred regardless of order — the user's
-  // explicit choice is sticky until the user changes it.
+  // user_asserted / thread always beat inferred regardless of order —
+  // the user's explicit choice (direct on the URL, or transitive
+  // through the thread) is sticky until the user changes it.
   const precedence = (value: UrlAttribution): number => (value.source === 'inferred' ? 0 : 1);
   const tier = precedence(left) - precedence(right);
   if (tier !== 0) return tier;
@@ -127,13 +138,44 @@ const upsertAttribution = (
   });
 };
 
+// Stage 5 follow-up (PR #141) — thread→URL attribution propagation.
+//
+// The user reported "disconnect" between the workstream / All-threads
+// tabs (where AI chats appear as attributed) and the Inbox (where the
+// same chat URL keeps showing up unattributed, asking to be picked
+// again). Root cause: attributing a thread via the workboard sets
+// thread.primaryWorkstreamId in the vault, but emits NO event that
+// the URL projection knows about. So
+// `urlProjection[canonicalUrl].currentAttribution` stays undefined.
+//
+// This option lets the materializer pass the threads-vault snapshot
+// in. For every thread with `primaryWorkstreamId` set we synthesize
+// a derived `source: 'thread'` attribution on the matching canonical
+// URL. Downstream this propagates to the Inbox filter (hides
+// attributed URLs), the snapshot's `visit_instance_in_workstream`
+// edge (URL attribution path), and the ranker's
+// `deriveVisitPairLabelsFromSnapshot` (same workstream → visit-pair
+// label).
+export interface ProjectUrlsOptions {
+  readonly threads?: readonly {
+    readonly bac_id: string;
+    readonly canonicalUrl?: string;
+    readonly threadUrl?: string;
+    readonly primaryWorkstreamId?: string;
+    readonly lastSeenAt?: string;
+  }[];
+}
+
+const stripFragmentAndTrailingSlash = (url: string): string =>
+  url.replace(/#.*$/u, '').replace(/\/+$/u, '');
+
 // -- Stage 5.2 W2b — URL projection accumulator -----------------------
 // The legacy projectUrls() sorts events first then folds. That works
 // but makes every drain re-walk the entire log. The accumulator
 // exposes seed + fold + derive so callers (the connections
-// materializer, eventually) can hold the per-canonical-URL state
-// across drains and update only the records touched by newly accepted
-// events. Byte-equal output for any event-order permutation is the
+// materializer) can hold the per-canonical-URL state across drains
+// and update only the records touched by newly accepted events.
+// Byte-equal output for any event-order permutation is the
 // load-bearing property — verified by the parity tests.
 
 interface UrlObservationCursor {
@@ -178,10 +220,6 @@ const pickLatestField = <T>(
   candidateValue: T | undefined,
   candidateIsNewer: boolean,
 ): T | undefined => {
-  // Newer event with a value: it wins.
-  // Older event with a value, existing undefined: backfill.
-  // Otherwise: keep existing (older event with a value but existing
-  // already has one from a newer event = no-op).
   if (candidateValue !== undefined && candidateIsNewer) return candidateValue;
   if (candidateValue !== undefined && existingValue === undefined) return candidateValue;
   return existingValue;
@@ -246,9 +284,6 @@ const foldUserOrganizedIntoAccumulator = (
   if (!isUserOrganizedItemPayload(event.payload)) return;
   const payload = event.payload;
   if (payload.itemKind !== 'canonical-url' || payload.action !== 'move') return;
-  // upsertAttribution is already order-independent (it sorts the
-  // attributionHistory by precedence + observedAt + replicaId + seq
-  // on every insert), so the fold is just the existing helper.
   upsertAttribution(acc.records, {
     canonicalUrl: payload.itemId,
     workstreamId: payload.toContainer ?? null,
@@ -281,11 +316,6 @@ const foldUrlAttributionInferredIntoAccumulator = (
   });
 };
 
-/**
- * Stage 5.2 W2b — per-event fold. Updates the accumulator for one
- * accepted event. Idempotent + order-independent: folding the same
- * stream in any permutation yields the same `byCanonicalUrl` map.
- */
 export const foldEventIntoUrlProjectionAccumulator = (
   acc: UrlProjectionAccumulator,
   event: AcceptedEvent,
@@ -295,12 +325,6 @@ export const foldEventIntoUrlProjectionAccumulator = (
   foldUrlAttributionInferredIntoAccumulator(acc, event);
 };
 
-/**
- * Stage 5.2 W2b — full-pass seed. Walks every event once to populate
- * the accumulator. Equivalent to running fold over every event;
- * future incremental callers seed at companion boot, then fold each
- * newly accepted event into the same state.
- */
 export const seedUrlProjectionAccumulator = (
   events: readonly AcceptedEvent[],
 ): UrlProjectionAccumulator => {
@@ -309,10 +333,6 @@ export const seedUrlProjectionAccumulator = (
   return acc;
 };
 
-/**
- * Stage 5.2 W2b — derive a UrlProjection from accumulator state.
- * Sorts byCanonicalUrl deterministically.
- */
 export const urlProjectionFromAccumulator = (
   acc: UrlProjectionAccumulator,
 ): UrlProjection => ({
@@ -322,16 +342,54 @@ export const urlProjectionFromAccumulator = (
   ),
 });
 
-export const projectUrls = (events: readonly AcceptedEvent[]): UrlProjection => {
-  if (events.length === 0) return emptyProjection();
+// Apply PR #141's thread→URL attribution propagation to the
+// accumulator's records map. Only URLs that already appear in the
+// projection (i.e. have been observed at least once) get the derived
+// attribution — we don't fabricate URL records for thread URLs that
+// were never visited as timeline entries. Pure mutation on the
+// records Map; caller derives the projection afterward.
+//
+// Exported so the materializer can apply thread attribution to its
+// long-lived accumulator (W2 wiring) without dropping back to a full
+// re-projection.
+export const applyThreadAttributionsToAccumulator = (
+  acc: UrlProjectionAccumulator,
+  threads: ProjectUrlsOptions['threads'],
+): void => {
+  if (threads === undefined) return;
+  for (const thread of threads) {
+    if (typeof thread.primaryWorkstreamId !== 'string') continue;
+    if (thread.primaryWorkstreamId.length === 0) continue;
+    const candidate = thread.canonicalUrl ?? thread.threadUrl;
+    if (typeof candidate !== 'string' || candidate.length === 0) continue;
+    const canonical = stripFragmentAndTrailingSlash(candidate);
+    if (!acc.records.has(canonical)) continue;
+    upsertAttribution(acc.records, {
+      canonicalUrl: canonical,
+      workstreamId: thread.primaryWorkstreamId,
+      source: 'thread',
+      observedAt: thread.lastSeenAt ?? new Date(0).toISOString(),
+      clientEventId: `thread:${thread.bac_id}`,
+      replicaId: 'derived',
+      seq: 0,
+    });
+  }
+};
+
+export const projectUrls = (
+  events: readonly AcceptedEvent[],
+  options: ProjectUrlsOptions = {},
+): UrlProjection => {
+  if (events.length === 0 && (options.threads === undefined || options.threads.length === 0)) {
+    return emptyProjection();
+  }
   // Sorted-fold preserves byte-equality with the pre-W2b
-  // implementation: prior callers relied on event-order'd
-  // visitCount accumulation + latest-wins for latestUrl/Title/provider.
-  // The accumulator fold is independently order-independent, but the
-  // legacy projectUrls contract is "sorted-fold output."
-  return urlProjectionFromAccumulator(
-    seedUrlProjectionAccumulator([...events].sort(compareEventOrder)),
-  );
+  // implementation. Thread→URL attribution from PR #141 is applied
+  // AFTER all events fold but BEFORE the projection derives, so an
+  // explicit URL attribution event still wins on tie-break.
+  const acc = seedUrlProjectionAccumulator([...events].sort(compareEventOrder));
+  applyThreadAttributionsToAccumulator(acc, options.threads);
+  return urlProjectionFromAccumulator(acc);
 };
 
 export const serializeUrlProjection = (projection: UrlProjection): SerializedUrlProjection => ({

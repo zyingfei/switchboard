@@ -2,7 +2,17 @@ export const TAB_SESSION_DRAG_MIME = 'application/x-sidetrack-tab-session-id';
 
 export interface TabSessionAttribution {
   readonly workstreamId: string | null;
-  readonly source: 'user_asserted' | 'tab-group-pull-in' | 'tab-group-pull-out' | 'inferred';
+  // Stage 5 follow-up — 'thread' shows up via the URL projection's
+  // adapter (UrlVisitRecord → TabSessionRecord). The companion's
+  // tab-session projection never emits 'thread', but the extension
+  // re-uses TabSessionRecord as the canonical InboxCard prop, so
+  // the type union must accept it for the adapter pass-through.
+  readonly source:
+    | 'user_asserted'
+    | 'tab-group-pull-in'
+    | 'tab-group-pull-out'
+    | 'inferred'
+    | 'thread';
   readonly observedAt: string;
   readonly clientEventId: string;
 }
@@ -79,7 +89,15 @@ export interface TabSessionResolutionResult {
 
 export interface UrlAttribution {
   readonly workstreamId: string | null;
-  readonly source: 'user_asserted' | 'tab-group-pull-in' | 'tab-group-pull-out' | 'inferred';
+  // Stage 5 follow-up — 'thread' is the companion-derived source for
+  // canonical URLs whose matching chat thread was user-attributed to
+  // a workstream. Treated as user-driven by the panel + ranker.
+  readonly source:
+    | 'user_asserted'
+    | 'tab-group-pull-in'
+    | 'tab-group-pull-out'
+    | 'inferred'
+    | 'thread';
   readonly observedAt: string;
   readonly clientEventId: string;
 }

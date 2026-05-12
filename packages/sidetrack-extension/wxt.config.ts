@@ -30,11 +30,42 @@ const gitSha = ((): string => {
     return 'dev';
   }
 })();
+// Uncommitted local edits = dirty. Without this flag the version banner
+// kept showing the last committed sha even after rebuilds layered fresh
+// changes on top — operators had no way to tell "this bundle includes
+// my WIP edit" from "this bundle is the released sha". The output of
+// `git status --porcelain` is empty iff the worktree is clean.
+const gitDirty = ((): boolean => {
+  try {
+    const status = execSync('git status --porcelain', {
+      cwd: here,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return status.trim().length > 0;
+  } catch {
+    return false;
+  }
+})();
 const buildInfo = {
   version: pkgVersion,
-  sha: gitSha,
+  sha: gitDirty ? `${gitSha}-dirty` : gitSha,
   builtAt: new Date().toISOString(),
 };
+
+// Encode the build time into the Chrome manifest version so the
+// chrome://extensions/ page surfaces it directly. Chrome manifest
+// versions allow up to four dot-separated integers, each 0–65535.
+// Format: 0.<YY>.<MMDD>.<HHMM> — e.g. "0.26.0511.1410" =
+// 2026-05-11 14:10. The pkg.json version stays 0.0.0 — the runtime
+// banner already shows that alongside sha + builtAt.
+const manifestVersionWithBuildTime = ((): string => {
+  const now = new Date();
+  const yy = now.getUTCFullYear() % 100;
+  const mmdd = (now.getUTCMonth() + 1) * 100 + now.getUTCDate();
+  const hhmm = now.getUTCHours() * 100 + now.getUTCMinutes();
+  return `0.${String(yy)}.${String(mmdd)}.${String(hhmm)}`;
+})();
 
 export default defineConfig({
   modules: ['@wxt-dev/module-react'],
@@ -46,6 +77,7 @@ export default defineConfig({
   }),
   manifest: {
     name: 'Sidetrack',
+    version: manifestVersionWithBuildTime,
     description: 'Local-first browser AI work tracker.',
     permissions: [
       'activeTab',

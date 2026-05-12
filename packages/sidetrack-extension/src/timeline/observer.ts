@@ -147,14 +147,40 @@ export const getTimelineObserverDiagnostics = (): TimelineObserverDiagnostics =>
   lastDecision,
 });
 
+// FNV-1a 32-bit hash — sync, no async crypto.subtle dependency, plenty
+// of identifier-space for the eventId's URL slot (collision risk on a
+// per-(tabIdHash, observedAt) tuple is negligible because the
+// timestamp is included in the surrounding key).
+const fnv1a32Hex = (input: string): string => {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+};
+
+// Stage 5 follow-up — Google search URLs (and other long
+// query-string URLs like marketing landing pages with utm_* +
+// gad_campaignid + sxsrf etc) routinely produce 500+ char URLs.
+// Embedding the full URL into the eventId pushed past the
+// companion's TIMELINE_EVENT_ID_MAX_LENGTH (256), which causes the
+// `/v1/timeline/events` POST to skip them with `invalid-payload`.
+// The drainer never gets an ack, the entries pile up in
+// `pending-send` forever, and the user sees "no tracked tab" for
+// the search URL because it never lands in the vault.
+//
+// Hash the URL portion to FNV-1a32; the eventId is now bounded by
+// `tl_<16hex>|<8hex>|<24-char-iso>` ≈ 56 chars.
 const defaultMintEventId = (input: {
   tabIdHash: string;
   canonicalUrl?: string;
   url: string;
   observedAt: string;
 }): string => {
-  const key = `${input.tabIdHash}|${input.canonicalUrl ?? input.url}|${input.observedAt}`;
-  return `tl_${key}`;
+  const urlForHash = input.canonicalUrl ?? input.url;
+  const urlHash = fnv1a32Hex(urlForHash);
+  return `tl_${input.tabIdHash}|${urlHash}|${input.observedAt}`;
 };
 
 export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObserver => {

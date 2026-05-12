@@ -13,6 +13,14 @@ import { launchStealthPersistentContext } from './stealth-runtime';
 
 let stealthExperimentWarningPrinted = false;
 
+// Sequential allocation for the optional CDP debug port. The recorder
+// launches two browsers (Companion A + Companion B) in the same
+// process; if both bind the SAME port the second launch silently fails
+// to expose CDP at best, and at worst it aborts the launch entirely
+// (AbortError surfaces from the wait-for-readiness path). Each launch
+// gets baseEnvPort + cdpAllocationIndex.
+let cdpAllocationIndex = 0;
+
 // Patchright extends page.evaluate with a 3rd `isolatedContext: false` param
 // that forces evaluation in the page's main world. Without it, patchright
 // runs page.evaluate in an isolated context where chrome-extension page APIs
@@ -181,6 +189,56 @@ const wakeServiceWorker = async (context: BrowserContext, extensionId: string): 
   } finally {
     await wakePage.close();
   }
+};
+
+const reloadExtensionFromDisk = async (
+  context: BrowserContext,
+  extensionId: string,
+  previousWorker: Worker,
+): Promise<Worker> => {
+  const reloadPage = await context.newPage();
+  try {
+    await reloadPage.goto(`chrome-extension://${extensionId}/sidepanel.html`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 10_000,
+    });
+    await evaluateInMainWorld(
+      reloadPage,
+      () => {
+        chrome.runtime.reload();
+      },
+      undefined,
+    ).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      if (
+        !message.includes('Target page, context or browser has been closed') &&
+        !message.includes('Execution context was destroyed')
+      ) {
+        throw error;
+      }
+    });
+  } finally {
+    await reloadPage.close().catch(() => undefined);
+  }
+
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    await sleep(250);
+    const replacement = context
+      .serviceWorkers()
+      .find((worker) => isSidetrackExtensionWorker(worker) && worker !== previousWorker);
+    if (replacement !== undefined) {
+      return replacement;
+    }
+    if (attempt % 8 === 7) {
+      await wakeServiceWorker(context, extensionId).catch(() => undefined);
+    }
+  }
+
+  // Some Chromium builds keep the same Playwright Worker wrapper after
+  // chrome.runtime.reload(); wake the origin and let the caller continue
+  // with the visible worker rather than failing a manual recorder launch.
+  await wakeServiceWorker(context, extensionId).catch(() => undefined);
+  return await waitForExtensionWorker(context);
 };
 
 // Attach to a Chrome that was started outside Playwright (via
@@ -418,7 +476,7 @@ export const launchExtensionRuntime = async (
   // Under stealth/manual recording, use a stable cache dir for the
   // host-permission-widened extension copy. Same path → same extension
   // ID → chrome.storage (workstreams) survives across runs.
-  const stableExtensionCacheDir = modeConfig.stealthExperiment
+  const stableExtensionCacheDir = modeConfig.stealthExperiment && options.userDataDir === undefined
     ? expandHomeDir('~/.sidetrack-stealth-extension')
     : undefined;
   const extensionForLaunch = await extensionPathWithExtraHostPermissions(
@@ -467,6 +525,25 @@ export const launchExtensionRuntime = async (
   const channel =
     process.env.SIDETRACK_E2E_BROWSER ??
     (modeConfig.stealthExperiment ? 'chromium' : cleanupOnClose ? 'chromium' : 'chrome');
+  // Optional CDP exposure so an operator can attach Playwright /
+  // chromium.connectOverCDP and inspect the live recorder session.
+  // Set SIDETRACK_E2E_CDP_DEBUG_PORT=9223 (or any free port) to enable.
+  // Defeats stealth — only use for debugging.
+  //
+  // The recorder launches two browsers (A + B) in the same process;
+  // they can't share a port. Allocate sequentially: A gets the base
+  // port, B gets base+1, etc. The console.warn line below makes the
+  // actual port for THIS browser visible so the operator knows which
+  // CDP endpoint maps to which browser.
+  const baseCdpPort = (process.env.SIDETRACK_E2E_CDP_DEBUG_PORT ?? '').trim();
+  const cdpDebugPort = (() => {
+    if (baseCdpPort.length === 0) return '';
+    const base = Number.parseInt(baseCdpPort, 10);
+    if (!Number.isFinite(base) || base <= 0) return '';
+    const allocated = base + cdpAllocationIndex;
+    cdpAllocationIndex += 1;
+    return String(allocated);
+  })();
   const launchArgs = [
     ...(headless ? ['--headless=new'] : []),
     '--no-first-run',
@@ -474,7 +551,15 @@ export const launchExtensionRuntime = async (
     ...(modeConfig.stealthExperiment ? [] : ['--disable-blink-features=AutomationControlled']),
     `--disable-extensions-except=${extensionPath}`,
     `--load-extension=${extensionPath}`,
+    ...(cdpDebugPort.length > 0
+      ? [`--remote-debugging-port=${cdpDebugPort}`, '--remote-allow-origins=*']
+      : []),
   ];
+  if (cdpDebugPort.length > 0) {
+    console.warn(
+      `[recorder] CDP debug port enabled at http://localhost:${cdpDebugPort} — attach via chromium.connectOverCDP`,
+    );
+  }
   const launchOptions = {
     channel,
     headless,
@@ -506,6 +591,12 @@ export const launchExtensionRuntime = async (
   const { context, patchrightLoaded } = launched;
   const worker = await waitForExtensionWorker(context);
   const extensionId = extensionIdFromWorker(worker);
+  if (stableExtensionCacheDir !== undefined) {
+    console.warn(
+      '[runtime] Reloading stable stealth extension from disk so Chrome does not reuse a stale MV3 service worker.',
+    );
+    await reloadExtensionFromDisk(context, extensionId, worker);
+  }
 
   return {
     context,

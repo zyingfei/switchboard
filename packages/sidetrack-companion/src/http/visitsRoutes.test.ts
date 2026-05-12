@@ -7,6 +7,7 @@ import type { ConnectionsSnapshot, ConnectionsStore } from '../connections/snaps
 import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import { createEventLog, type EventLog } from '../sync/eventLog.js';
 import { loadOrCreateReplica } from '../sync/replicaId.js';
+import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { createIdempotencyStore } from './idempotency.js';
 import { createCompanionHttpServer, startHttpServer } from './server.js';
@@ -15,6 +16,7 @@ describe('per-URL HTTP routes', () => {
   let vaultRoot: string;
   let serverUrl: string;
   let eventLog: EventLog;
+  let currentConnectionsSnapshot: ConnectionsSnapshot | null = null;
   let close: (() => Promise<void>) | null = null;
   const bridgeKey = 'visits-bridge-key';
 
@@ -22,6 +24,15 @@ describe('per-URL HTTP routes', () => {
     vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-visits-http-'));
     const replica = await loadOrCreateReplica(vaultRoot);
     eventLog = createEventLog(vaultRoot, replica);
+    const connectionsStore: ConnectionsStore = {
+      putCurrent: async (snapshot) => {
+        currentConnectionsSnapshot = snapshot;
+      },
+      readCurrent: async () => currentConnectionsSnapshot,
+      putDay: async () => undefined,
+      readDay: async () => null,
+      listDays: async () => [],
+    };
     const server = createCompanionHttpServer({
       bridgeKey,
       vaultWriter: createVaultWriter(vaultRoot),
@@ -29,6 +40,7 @@ describe('per-URL HTTP routes', () => {
       idempotencyStore: createIdempotencyStore(vaultRoot),
       replica,
       eventLog,
+      connectionsStore,
     });
     const started = await startHttpServer(server, 0);
     serverUrl = started.url;
@@ -68,6 +80,58 @@ describe('per-URL HTTP routes', () => {
       },
       baseVector: {},
     });
+  };
+
+  const installStrongUrlSnapshot = (canonicalUrl: string): void => {
+    currentConnectionsSnapshot = {
+      scope: {},
+      nodes: [
+        {
+          id: `timeline-visit:${canonicalUrl}`,
+          kind: 'timeline-visit',
+          label: 'Target URL',
+          originReplicaIds: [],
+          metadata: { canonicalUrl },
+        },
+        {
+          id: 'workstream:ws_security',
+          kind: 'workstream',
+          label: 'Security workstream',
+          originReplicaIds: [],
+          metadata: {},
+        },
+        {
+          id: 'timeline-visit:https://example.test/anchor',
+          kind: 'timeline-visit',
+          label: 'Anchor URL',
+          originReplicaIds: [],
+          metadata: { canonicalUrl: 'https://example.test/anchor' },
+        },
+      ],
+      edges: [
+        {
+          id: 'edge:target-anchor',
+          kind: 'closest_visit',
+          fromNodeId: `timeline-visit:${canonicalUrl}`,
+          toNodeId: 'timeline-visit:https://example.test/anchor',
+          observedAt: '2026-05-07T10:00:00.000Z',
+          producedBy: { source: 'ranker', revisionId: 'ranker-test' },
+          confidence: 'inferred',
+        },
+        {
+          id: 'edge:anchor-workstream',
+          kind: 'visit_in_workstream',
+          fromNodeId: 'timeline-visit:https://example.test/anchor',
+          toNodeId: 'workstream:ws_security',
+          observedAt: '2026-05-07T10:00:00.000Z',
+          producedBy: { source: 'event-log' },
+          confidence: 'asserted',
+        },
+      ],
+      updatedAt: '2026-05-07T10:00:00.000Z',
+      nodeCount: 3,
+      edgeCount: 2,
+    };
   };
 
   it('GET /v1/visits/inbox lists unattributed URLs newest-first', async () => {
@@ -158,6 +222,58 @@ describe('per-URL HTTP routes', () => {
       };
     };
     expect(body.data.byCanonicalUrl[canonicalUrl]?.currentAttribution?.workstreamId).toBeNull();
+  });
+
+  it('POST /v1/visits/{url}/resolve auto-applies a strong URL resolver decision', async () => {
+    const canonicalUrl = 'https://example.test/strong-url';
+    await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_a' });
+    installStrongUrlSnapshot(canonicalUrl);
+
+    const response = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve`,
+      {
+        method: 'POST',
+        headers: headers('url-auto-apply-a'),
+        body: JSON.stringify({ dryRun: false, policyMode: 'balanced' }),
+      },
+    );
+
+    expect(response.status).toBe(201);
+    const body = (await response.json()) as {
+      readonly data?: {
+        readonly status?: string;
+        readonly projection?: {
+          readonly byCanonicalUrl?: Record<
+            string,
+            {
+              readonly currentAttribution?: {
+                readonly workstreamId?: string;
+                readonly source?: string;
+              };
+            }
+          >;
+        };
+      };
+    };
+    expect(body.data?.status).toBe('applied');
+    expect(body.data?.projection?.byCanonicalUrl?.[canonicalUrl]?.currentAttribution).toMatchObject({
+      workstreamId: 'ws_security',
+      source: 'inferred',
+    });
+    await expect(eventLog.readMerged()).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: URL_ATTRIBUTION_INFERRED,
+          aggregateId: `url-inferred:${canonicalUrl}`,
+          payload: expect.objectContaining({
+            payloadVersion: 1,
+            canonicalUrl,
+            workstreamId: 'ws_security',
+            policyMode: 'balanced',
+          }),
+        }),
+      ]),
+    );
   });
 
   it('POST attribute rejects malformed body', async () => {

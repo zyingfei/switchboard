@@ -762,7 +762,15 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
         updateLastOnUpdated(sequence, { skippedReason: 'no-url-and-not-complete-and-no-title' });
         return;
       }
-      const url = tab.url ?? changeInfo.url;
+      // changeInfo.url is the AUTHORITATIVE new URL for this event;
+      // tab.url is the tab's current snapshot and can lag (race seen
+      // on new-window navigations from form submits — Google
+      // `newwindow=1` searches captured the opener homepage instead
+      // of the search URL because tab.url was still the pre-nav value
+      // when onUpdated fired). Prefer changeInfo.url; fall back to
+      // tab.url only for status-complete / title-only events that
+      // don't carry a URL diff.
+      const url = changeInfo.url ?? tab.url;
       if (typeof url !== 'string' || url.length === 0) {
         updateLastOnUpdated(sequence, { skippedReason: 'missing-url' });
         return;

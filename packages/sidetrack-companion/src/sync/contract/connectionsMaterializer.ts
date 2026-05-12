@@ -6,6 +6,13 @@ import {
 import { buildEngagementClassRevision } from '../../connections/engagementClassifier.js';
 import { readVaultStores } from '../../connections/loader.js';
 import {
+  collectMaterializerDiagnostics,
+  createMaterializerDiagnosticsStore,
+  logMaterializerDiagnostics,
+  type MaterializerDiagnostics,
+  type MaterializerDiagnosticsStore,
+} from '../../connections/materializerDiagnostics.js';
+import {
   buildConnectionsSnapshot,
   type ClosestVisitRanker,
   type ConnectionsInput,
@@ -16,10 +23,16 @@ import {
   type BuildTopicRevisionInput,
   type TopicVisit,
 } from '../../connections/topicClusterer.js';
+import {
+  deriveUserAssertedRelations,
+  knownCanonicalUrlsFor,
+} from '../../connections/userAssertedRelations.js';
 import { buildHdbscanTopicRevision } from '../../connections/hdbscanClusterer.js';
 import {
   buildVisitSimilarity,
   computeVisitSimilarityRevisionId,
+  resolveVisitSimilarityConfig,
+  type EffectiveVisitSimilarityConfig,
   type VisitSimilarityEmbedder,
 } from '../../connections/visitSimilarity.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
@@ -124,6 +137,7 @@ import {
   type TabSessionProjectionAccumulator,
 } from '../../tabsession/projection.js';
 import {
+  applyThreadAttributionsToAccumulator,
   createEmptyUrlProjectionAccumulator,
   foldEventIntoUrlProjectionAccumulator,
   seedUrlProjectionAccumulator,
@@ -232,6 +246,9 @@ export interface CreateConnectionsMaterializerDeps {
   readonly topicRevisionStore?: TopicRevisionStore;
   readonly engagementClassStore?: EngagementClassRevisionStore;
   readonly rankerRetrainer?: RankerRetrainer;
+  readonly diagnosticsStore?: MaterializerDiagnosticsStore;
+  readonly diagnosticsLogger?: (diagnostics: MaterializerDiagnostics) => void;
+  readonly diagnosticsNow?: () => Date;
 }
 
 type TopicRevisionBuilder = (input: BuildTopicRevisionInput) => Promise<TopicRevision>;
@@ -318,56 +335,42 @@ export const createConnectionsMaterializer = (
   const rankerRetrainer =
     deps.rankerRetrainer ??
     ((context) => maybeRetrainClosestVisitRanker({ vaultRoot: deps.vaultRoot, ...context }));
+  // PR #141 — materializer diagnostics store. Captures per-drain
+  // counters for the diagnostics route.
+  const diagnosticsStore =
+    deps.diagnosticsStore ?? createMaterializerDiagnosticsStore(deps.vaultRoot);
+  const diagnosticsLogger = deps.diagnosticsLogger ?? logMaterializerDiagnostics;
+  const diagnosticsNow = deps.diagnosticsNow ?? ((): Date => new Date());
   // Stage 5.2 W7 — in-memory dirty-source queue. Group B events
   // (capture.recorded, capture.extraction.produced, recall.tombstone.target)
   // fold into this queue on every accepted event; the content-lane
-  // reconciler (future PR) drains the queue off the hot path. The
-  // queue itself is allocation-free at fold time — only sourceUnitId
-  // strings are retained.
+  // reconciler drains the queue off the hot path via
+  // drainContentLaneQueue.
   const dirtySourceQueue = createDirtySourceQueue();
   // Stage 5.2 W6 — per-drain invalidation accumulator. Each accepted
   // event contributes invalidationsForEvent(event) (often []) and the
-  // set is dedupe'd at drain entry. Half 2's per-pass skip-gates
-  // consume the set; the connectionsStore.putCurrent revision check
-  // (W5) and the engagement / similarity / topic skip-gates (W3 / W4)
-  // already short-circuit redundant disk writes via content-hashing.
-  // W6 here adds an event-driven layer so callers can answer "which
-  // slices need recompute since last drain?" without re-deriving from
-  // the event log.
+  // set is dedupe'd at drain entry.
   let accumulatedInvalidations: InvalidationKey[] = [];
   let lastBuildInvalidations: readonly InvalidationKey[] = [];
   // Stage 5.2 W2b/c wiring — projection accumulators. State carried
   // across drains so per-drain cost is O(events-since-last-drain)
-  // instead of O(merged-log). First buildAndWrite seeds from the full
-  // log (same cost as today). Subsequent drains derive from the
-  // accumulator. catchUp resets initialized=false to force a re-seed.
+  // instead of O(merged-log).
   let urlAccumulator: UrlProjectionAccumulator = createEmptyUrlProjectionAccumulator();
   let tabSessionAccumulator: TabSessionProjectionAccumulator =
     createEmptyTabSessionProjectionAccumulator();
   let projectionAccumulatorsInitialized = false;
   // Stage 5.2 W6 per-pass skip — cache the last engagement class
   // revision so a drain whose W6 key set contains no engagement-touching
-  // keys (engagementVisit, rankerLabels) can reuse it. The classifier
-  // pass is O(events) and the dominant cost on a vault with many
-  // graph-additive events (annotations / dispatches / workstream
-  // mutations) — skipping it on those drains is a real win.
+  // keys can reuse it.
   let lastEngagementClassRevision: ReturnType<typeof buildEngagementClassRevision> | undefined;
-  // Stage 5.2 W3 wiring — embedder warmth tracker. Records the latency
-  // of each buildVisitSimilarity pass and exposes the recent p99 +
-  // warm-TTL window to future hot-path consumers. Future PR consults
-  // this via `decideHotPathEmbed` to choose between in-process embed
-  // (warm + fast) and the reconciliation worker (cold or slow).
+  // Stage 5.2 W3 wiring — embedder warmth tracker.
   const embedderWarmthTracker: EmbedderWarmthTracker = createEmbedderWarmthTracker();
   // Stage 5.2 W4 wiring — incremental topic accumulator maintained
-  // across drains. Each buildAndWrite folds the current similarity
-  // edges + user-asserted relations into the accumulator alongside the
-  // legacy buildSelectedTopicRevision path. Future PR replaces the
-  // legacy builder with derive-from-accumulator on the fast path; for
-  // now the accumulator is shadow state exposed via getter.
+  // across drains.
   const topicAccumulator = new IncrementalTopicClusterAccumulator();
   // Stage 5.2 W4 — track the last accepted similarity revision id so a
-  // revision flip (re-embedding, model upgrade) can invalidate
-  // accumulator state and recompute from the fresh edge set.
+  // revision flip (re-embedding, model upgrade) drives a removeEdge
+  // diff against the new revision's edges.
   let lastAcceptedSimilarityRevisionId: string | undefined;
   // Stage 5.2 W3 fast-path — incremental visit similarity index used
   // when SIDETRACK_CONNECTIONS_HOT_SIMILARITY=1 AND the embedder
@@ -604,9 +607,6 @@ export const createConnectionsMaterializer = (
     await yieldToEventLoop();
     // Stage 5.2 W6 per-pass skip — when no engagement-touching keys
     // arrived since last drain AND a cached revision exists, reuse it.
-    // The classifier pass is O(events) so this is a real per-drain win
-    // for graph-additive drains (annotations / dispatches / workstream
-    // mutations / queue mutations).
     const engagementTouchingKey = buildKeys.some(
       (k) => k.kind === 'engagementVisit' || k.kind === 'rankerLabels',
     );
@@ -640,7 +640,17 @@ export const createConnectionsMaterializer = (
     // processed, the on-disk revision is reusable byte-for-byte — no
     // need to re-embed.
     const similarityEntries = timelineDays.flatMap((day) => day.entries);
-    const expectedSimilarityRevisionId = computeVisitSimilarityRevisionId(similarityEntries);
+    // PR #141 — resolve the similarity config once so the same
+    // (threshold / topK / engagementGateMs / lexical fallback) values
+    // feed both the revision id + the build call. Honors env overrides:
+    // SIDETRACK_SIMILARITY_{THRESHOLD,MIN_ENGAGEMENT_MS,TOP_K} +
+    // SIDETRACK_SIMILARITY_LEXICAL_{THRESHOLD,FALLBACK_ENABLED}.
+    const similarityConfig: EffectiveVisitSimilarityConfig =
+      resolveVisitSimilarityConfig();
+    const expectedSimilarityRevisionId = computeVisitSimilarityRevisionId(
+      similarityEntries,
+      similarityConfig,
+    );
     const cachedSimilarityRevision = await readVisitSimilarityRevision(
       deps.vaultRoot,
       expectedSimilarityRevisionId,
@@ -696,6 +706,7 @@ export const createConnectionsMaterializer = (
           visitSimilarity = await buildVisitSimilarity(
             similarityEntries,
             deps.embed ?? defaultEmbed,
+            similarityConfig,
           );
         }
       }
@@ -711,9 +722,12 @@ export const createConnectionsMaterializer = (
         `buildVisitSimilarityIncremental newEmbedded=${String(newEntries.length)} indexSize=${String(incrementalSimilarityIndex.size())}`,
       );
     } else {
+      // Legacy path with PR #141's resolved similarityConfig
+      // (threshold / topK / engagementGateMs / lexical fallback).
       visitSimilarity = await buildVisitSimilarity(
         similarityEntries,
         deps.embed ?? defaultEmbed,
+        similarityConfig,
       );
       mark('buildVisitSimilarity');
     }
@@ -784,12 +798,24 @@ export const createConnectionsMaterializer = (
     const previousTopicRevision = await topicRevisionStore.readActiveRevision();
     mark('readActiveTopicRevision');
     await yieldToEventLoop();
+    // Stage 5.2 W2b/c wiring — derive the URL + tabSession projections
+    // from the long-lived accumulators. PR #141's thread→URL attribution
+    // propagation runs on the accumulator's records before deriving so
+    // the synthetic `source: 'thread'` attribution survives.
+    applyThreadAttributionsToAccumulator(urlAccumulator, vault.threads);
+    const urlProjection = urlProjectionFromAccumulator(urlAccumulator);
+    const tabSessionProjection = tabSessionProjectionFromAccumulator(tabSessionAccumulator);
     // Stage 5.2 W4 — topic-revision skip-gate. The TopicRevision id is
     // derived from (visitSimilarityRevisionId + cosineThreshold +
-    // algorithmVersion). If the previous active revision already matches
-    // the id we'd produce now, skip the union-find / HDBSCAN pass and
-    // reuse it. Pairs naturally with W3: when visit similarity cache-hits,
-    // topics inherit the cache hit downstream.
+    // algorithmVersion). PR #141 also threads userAssertedRelations
+    // through the builder so workstream/thread membership propagates as
+    // topic-cluster bias.
+    const topicVisits = timelineDays.flatMap((day) => day.entries.map(topicVisitFromEntry));
+    const userAssertedRelations = deriveUserAssertedRelations({
+      urlProjection,
+      tabSessionProjection,
+      knownCanonicalUrls: knownCanonicalUrlsFor(topicVisits),
+    });
     const expectedTopicRevisionId = await createTopicRevisionId({
       visitSimilarityRevisionId: visitSimilarity.revisionId,
       cosineThreshold: DEFAULT_TOPIC_COSINE_THRESHOLD,
@@ -801,6 +827,8 @@ export const createConnectionsMaterializer = (
     // producedAt with buildSelectedTopicRevision over the same inputs).
     // The accumulator has been kept in sync with the similarity edges
     // above via the revision-flip diff + per-drain addSimilarityEdge.
+    // PR #141's userAssertedRelations are still passed when falling
+    // through to the legacy builder.
     const hotTopicsMode = process.env['SIDETRACK_CONNECTIONS_HOT_TOPICS'] === '1';
     const useTopicAccumulatorFastPath =
       hotTopicsMode && (await topicAccumulator.getComponents()).length > 0;
@@ -811,7 +839,6 @@ export const createConnectionsMaterializer = (
     ) {
       topicRevision = previousTopicRevision;
     } else if (useTopicAccumulatorFastPath) {
-      const topicVisits = timelineDays.flatMap((day) => day.entries.map(topicVisitFromEntry));
       topicRevision = await buildTopicRevisionFromAccumulator({
         accumulator: topicAccumulator,
         visits: topicVisits,
@@ -821,8 +848,9 @@ export const createConnectionsMaterializer = (
       mark('buildTopicRevisionFromAccumulator (w4 fast path)');
     } else {
       topicRevision = await buildSelectedTopicRevision({
-        visits: timelineDays.flatMap((day) => day.entries.map(topicVisitFromEntry)),
+        visits: topicVisits,
         visitSimilarity,
+        ...(userAssertedRelations.length === 0 ? {} : { userAssertedRelations }),
         ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
       });
     }
@@ -838,8 +866,8 @@ export const createConnectionsMaterializer = (
       events: merged,
       ...vault,
       timelineDays,
-      tabSessionProjection: tabSessionProjectionFromAccumulator(tabSessionAccumulator),
-      urlProjection: urlProjectionFromAccumulator(urlAccumulator),
+      tabSessionProjection,
+      urlProjection,
       visitSimilarity,
       topicRevision,
       engagementClassRevision,
@@ -852,46 +880,65 @@ export const createConnectionsMaterializer = (
     // routes (and the side panel that reads them) have a valid current
     // snapshot to serve. The ranker-augmented build below adds
     // closest_visit edges; on a 5K-event vault that pass takes ~20s of
-    // synchronous CPU which would otherwise block HTTP. Publishing base
-    // first means HTTP is responsive within ~300ms; the ranker pass
-    // then overwrites the snapshot with the augmented version.
+    // synchronous CPU which would otherwise block HTTP.
     await deps.store.putCurrent(baseSnapshot);
     mark('putCurrent baseSnapshot');
     await yieldToEventLoop();
-    await rankerRetrainer({ merged, snapshot: baseSnapshot });
+    const rankerRetrainResult = await rankerRetrainer({ merged, snapshot: baseSnapshot });
     mark('rankerRetrainer');
-    // Stage 5.2 W3b/c — the ranker-augmented buildConnectionsSnapshot
-    // (pass 12: closest_visit top-K edges via LightGBM) is a 20+ second
-    // synchronous CPU block on a 5K-event vault. Until pass 12 is moved
-    // off the main thread (W1b-full worker_thread) or made incremental,
-    // gate the second snapshot build behind an opt-in env so the recorder
-    // and other HTTP-latency-sensitive consumers can suppress it. The
-    // base snapshot (already published above) still contains every node
-    // and all 14 deterministic edge kinds; only the predictive
-    // closest_visit edges are deferred.
-    if (process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'] === '1') {
-      mark('ranker-augmented skipped (SIDETRACK_SKIP_RANKER_SNAPSHOT=1)');
-      return;
-    }
-    const closestVisitRanker = await loadClosestVisitRanker();
-    mark(`loadClosestVisitRanker ranker=${String(closestVisitRanker !== null)}`);
-    if (closestVisitRanker === null) {
-      // Base already published above.
-      return;
-    }
-
+    // Track the snapshot we ultimately wrote so diagnostics see the
+    // ranker-augmented form when it was produced, the base form when
+    // the ranker pass was skipped.
+    let finalSnapshot = baseSnapshot;
+    let closestVisitRanker: Awaited<ReturnType<typeof loadClosestVisitRanker>> | null = null;
     try {
-      await yieldToEventLoop();
-      const snapshot = buildConnectionsSnapshot({
-        ...input,
-        closestVisitRanker: closestVisitRanker.ranker,
-      });
-      mark(`buildConnectionsSnapshot ranker-augmented nodes=${String(snapshot.nodes.length)} edges=${String(snapshot.edges.length)}`);
-      await deps.store.putCurrent(snapshot);
-      mark('putCurrent ranker-augmented');
+      // Stage 5.2 W3b/c — gate the ranker-augmented build behind
+      // SIDETRACK_SKIP_RANKER_SNAPSHOT for HTTP-latency-sensitive
+      // consumers (recorder).
+      if (process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'] !== '1') {
+        closestVisitRanker = await loadClosestVisitRanker();
+        mark(`loadClosestVisitRanker ranker=${String(closestVisitRanker !== null)}`);
+        if (closestVisitRanker !== null) {
+          await yieldToEventLoop();
+          finalSnapshot = buildConnectionsSnapshot({
+            ...input,
+            closestVisitRanker: closestVisitRanker.ranker,
+          });
+          mark(`buildConnectionsSnapshot ranker-augmented nodes=${String(finalSnapshot.nodes.length)} edges=${String(finalSnapshot.edges.length)}`);
+          await deps.store.putCurrent(finalSnapshot);
+          mark('putCurrent ranker-augmented');
+        }
+      } else {
+        mark('ranker-augmented skipped (SIDETRACK_SKIP_RANKER_SNAPSHOT=1)');
+      }
     } finally {
-      closestVisitRanker.model.dispose();
+      closestVisitRanker?.model.dispose();
     }
+    // PR #141 — write the diagnostics artifact after publishing. Uses
+    // `finalSnapshot` so the artifact reflects whichever snapshot the
+    // HTTP routes will see.
+    const diagnostics = collectMaterializerDiagnostics({
+      producedAt: diagnosticsNow().toISOString(),
+      maxAcceptedAtMs: maxAcceptedAtMs(merged),
+      engagementGateMs: similarityConfig.engagementGateMs,
+      similarityEffectiveConfig: similarityConfig,
+      timelineEntries: timelineDays.flatMap((day) => day.entries),
+      visitSimilarity,
+      topicRevision,
+      rankerRetrainResult,
+      events: merged,
+      urlProjection,
+      snapshot: finalSnapshot,
+    });
+    try {
+      await diagnosticsStore.write(diagnostics);
+    } catch (err) {
+      // Diagnostics is observability — never fail the drain on its IO.
+      const message = err instanceof Error ? err.message : String(err);
+      // eslint-disable-next-line no-console
+      console.warn(`[materializer-diag] write failed: ${message}`);
+    }
+    diagnosticsLogger(diagnostics);
   };
 
   // Stage 5.2 W1 — worker drain sequence counter. Increments per

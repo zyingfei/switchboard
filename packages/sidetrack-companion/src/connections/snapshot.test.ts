@@ -326,7 +326,11 @@ describe('connections — snapshot reducer (Given/Then)', () => {
     expect(edge?.fromNodeId).toBe(nodeIdFor('coding-session', 'sess_1'));
   });
 
-  it('timeline visit canonical-URL match yields timeline_same_url_as_thread', () => {
+  it('timeline visit canonical-URL match yields timeline_same_url_as_thread when the T5 gates pass', () => {
+    // Stage 5 / T5: the unconditional canonical-URL match was demoted.
+    // The edge now requires `provider match OR title-overlap >= 0.25`
+    // AND (recency ≤ 24h when thread.lastSeenAt is available). This
+    // fixture passes by matching provider + recent observed times.
     const day: TimelineDayProjection = {
       date: '2026-05-07',
       entries: [
@@ -336,7 +340,100 @@ describe('connections — snapshot reducer (Given/Then)', () => {
           lastSeenAt: '2026-05-07T10:30:00.000Z',
           url: 'https://chatgpt.com/c/abc',
           canonicalUrl: 'https://chatgpt.com/c/abc',
+          provider: 'chatgpt',
+          title: 'Tax flow chat',
           visitCount: 3,
+        },
+      ],
+      updatedAt: '2026-05-07T10:30:00.000Z',
+      entryCount: 1,
+    };
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        threads: [
+          {
+            bac_id: 'thread_a',
+            title: 'Tax flow chat',
+            threadUrl: 'https://chatgpt.com/c/abc',
+            canonicalUrl: 'https://chatgpt.com/c/abc',
+            provider: 'chatgpt',
+            lastSeenAt: '2026-05-07T10:35:00.000Z',
+          },
+        ],
+        timelineDays: [day],
+      }),
+    );
+    const edge = snap.edges.find((e) => e.kind === 'timeline_same_url_as_thread');
+    expect(edge).toBeDefined();
+    expect(edge?.confidence).toBe('inferred');
+    expect(edge?.producedBy.source).toBe('timeline-projection');
+    // Stage 5.0 follow-up — evidence is stored on `edge.metadata.evidence`,
+    // NOT `producedBy.evidence`. Assert both halves so a future move
+    // back to producedBy doesn't pass silently.
+    expect(
+      (edge?.producedBy as Record<string, unknown> | undefined)?.['evidence'],
+    ).toBeUndefined();
+    const evidence = (edge?.metadata as { readonly evidence?: Record<string, unknown> } | undefined)
+      ?.evidence;
+    expect(evidence).toBeDefined();
+    expect(evidence?.['providerMatched']).toBe(true);
+    expect(evidence?.['titleJaccard']).toBeGreaterThanOrEqual(0.25);
+    expect(evidence?.['recencyDeltaMs']).toBeTypeOf('number');
+    expect(evidence?.['recencyDeltaMs']).toBeLessThanOrEqual(
+      24 * 60 * 60 * 1000,
+    );
+  });
+
+  it('drops timeline_same_url_as_thread when provider differs, titles do not overlap, and recency is irrelevant', () => {
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: [
+        {
+          id: 'https://chatgpt.com/c/abc',
+          firstSeenAt: '2026-05-07T10:00:00.000Z',
+          lastSeenAt: '2026-05-07T10:30:00.000Z',
+          url: 'https://chatgpt.com/c/abc',
+          canonicalUrl: 'https://chatgpt.com/c/abc',
+          provider: 'generic',
+          title: 'Quarterly revenue spreadsheet',
+          visitCount: 1,
+        },
+      ],
+      updatedAt: '2026-05-07T10:30:00.000Z',
+      entryCount: 1,
+    };
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        threads: [
+          {
+            bac_id: 'thread_a',
+            title: 'Linux kernel boot sequence',
+            threadUrl: 'https://chatgpt.com/c/abc',
+            canonicalUrl: 'https://chatgpt.com/c/abc',
+            provider: 'chatgpt',
+          },
+        ],
+        timelineDays: [day],
+      }),
+    );
+    expect(
+      snap.edges.find((e) => e.kind === 'timeline_same_url_as_thread'),
+    ).toBeUndefined();
+  });
+
+  it('drops timeline_same_url_as_thread when recency exceeds the 24-hour window', () => {
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: [
+        {
+          id: 'https://chatgpt.com/c/abc',
+          firstSeenAt: '2026-05-07T10:00:00.000Z',
+          lastSeenAt: '2026-05-07T10:30:00.000Z',
+          url: 'https://chatgpt.com/c/abc',
+          canonicalUrl: 'https://chatgpt.com/c/abc',
+          provider: 'chatgpt',
+          title: 'Tax flow',
+          visitCount: 1,
         },
       ],
       updatedAt: '2026-05-07T10:30:00.000Z',
@@ -350,15 +447,17 @@ describe('connections — snapshot reducer (Given/Then)', () => {
             title: 'Tax flow',
             threadUrl: 'https://chatgpt.com/c/abc',
             canonicalUrl: 'https://chatgpt.com/c/abc',
+            provider: 'chatgpt',
+            // ~7 days earlier — fails the 24-hour recency gate.
+            lastSeenAt: '2026-04-30T10:30:00.000Z',
           },
         ],
         timelineDays: [day],
       }),
     );
-    const edge = snap.edges.find((e) => e.kind === 'timeline_same_url_as_thread');
-    expect(edge).toBeDefined();
-    expect(edge?.confidence).toBe('inferred');
-    expect(edge?.producedBy.source).toBe('timeline-projection');
+    expect(
+      snap.edges.find((e) => e.kind === 'timeline_same_url_as_thread'),
+    ).toBeUndefined();
   });
 
   it('annotation URL match yields annotation_targets_thread', () => {
@@ -658,6 +757,8 @@ describe('connections — content-derived edges', () => {
           lastSeenAt: '2026-05-07T09:35:00.000Z',
           url: CLAUDE_THREAD_URL,
           canonicalUrl: CLAUDE_THREAD_URL,
+          provider: 'claude',
+          title: 'Tax helper question',
           visitCount: 1,
         },
       ],
@@ -673,6 +774,8 @@ describe('connections — content-derived edges', () => {
             title: 'Tax helper question',
             threadUrl: CLAUDE_THREAD_URL,
             canonicalUrl: CLAUDE_THREAD_URL,
+            provider: 'claude',
+            lastSeenAt: '2026-05-07T09:35:00.000Z',
             primaryWorkstreamId: 'ws_research',
           },
           {
@@ -680,6 +783,8 @@ describe('connections — content-derived edges', () => {
             title: 'Code review',
             threadUrl: CHATGPT_THREAD_URL,
             canonicalUrl: CHATGPT_THREAD_URL,
+            provider: 'chatgpt',
+            lastSeenAt: '2026-05-07T09:35:00.000Z',
             primaryWorkstreamId: 'ws_research',
           },
         ],
