@@ -81,6 +81,10 @@ import {
   tabSessionInbox,
 } from '../tabsession/projection.js';
 import { autoApplyTabSessionAttribution } from '../tabsession/autoApply.js';
+import {
+  getCachedTabSessionProjection,
+  invalidateCachedTabSessionProjection,
+} from '../tabsession/cachedProjection.js';
 import type {
   AttributionPolicyMode,
   AttributionPolicyTelemetry,
@@ -1463,7 +1467,7 @@ const routes: readonly RouteDefinition[] = [
         200,
         {
           data: serializeTabSessionProjection(
-            projectTabSessions(await context.eventLog.readMerged()),
+            await getCachedTabSessionProjection(context.eventLog),
           ),
         },
       ];
@@ -1486,7 +1490,7 @@ const routes: readonly RouteDefinition[] = [
       const offsetRaw = Number.parseInt(url.searchParams.get('offset') ?? '0', 10);
       const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 200) : 50;
       const offset = Number.isFinite(offsetRaw) && offsetRaw > 0 ? offsetRaw : 0;
-      const projection = projectTabSessions(await context.eventLog.readMerged());
+      const projection = await getCachedTabSessionProjection(context.eventLog);
       const items = tabSessionInbox(projection, { limit, offset });
       return [
         200,
@@ -1606,6 +1610,9 @@ const routes: readonly RouteDefinition[] = [
           ...(policyMode === undefined ? {} : { policyMode }),
           ...(policyTelemetry === undefined ? {} : { policyTelemetry }),
         });
+        if (result.status === 'applied') {
+          invalidateCachedTabSessionProjection(eventLog);
+        }
         return [
           result.status === 'applied' ? 201 : 200,
           {
@@ -1672,6 +1679,7 @@ const routes: readonly RouteDefinition[] = [
           payload,
           baseVector: await baseVectorForAggregate(eventLog, aggregateId),
         });
+        invalidateCachedTabSessionProjection(eventLog);
         return [
           201,
           {
