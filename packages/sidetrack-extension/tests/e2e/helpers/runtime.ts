@@ -191,6 +191,56 @@ const wakeServiceWorker = async (context: BrowserContext, extensionId: string): 
   }
 };
 
+const reloadExtensionFromDisk = async (
+  context: BrowserContext,
+  extensionId: string,
+  previousWorker: Worker,
+): Promise<Worker> => {
+  const reloadPage = await context.newPage();
+  try {
+    await reloadPage.goto(`chrome-extension://${extensionId}/sidepanel.html`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 10_000,
+    });
+    await evaluateInMainWorld(
+      reloadPage,
+      () => {
+        chrome.runtime.reload();
+      },
+      undefined,
+    ).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      if (
+        !message.includes('Target page, context or browser has been closed') &&
+        !message.includes('Execution context was destroyed')
+      ) {
+        throw error;
+      }
+    });
+  } finally {
+    await reloadPage.close().catch(() => undefined);
+  }
+
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    await sleep(250);
+    const replacement = context
+      .serviceWorkers()
+      .find((worker) => isSidetrackExtensionWorker(worker) && worker !== previousWorker);
+    if (replacement !== undefined) {
+      return replacement;
+    }
+    if (attempt % 8 === 7) {
+      await wakeServiceWorker(context, extensionId).catch(() => undefined);
+    }
+  }
+
+  // Some Chromium builds keep the same Playwright Worker wrapper after
+  // chrome.runtime.reload(); wake the origin and let the caller continue
+  // with the visible worker rather than failing a manual recorder launch.
+  await wakeServiceWorker(context, extensionId).catch(() => undefined);
+  return await waitForExtensionWorker(context);
+};
+
 // Attach to a Chrome that was started outside Playwright (via
 // scripts/chrome-debug.mjs) — gives real Chrome cookies + reliable
 // MV3 service-worker registration without us having to manage the
@@ -426,7 +476,7 @@ export const launchExtensionRuntime = async (
   // Under stealth/manual recording, use a stable cache dir for the
   // host-permission-widened extension copy. Same path → same extension
   // ID → chrome.storage (workstreams) survives across runs.
-  const stableExtensionCacheDir = modeConfig.stealthExperiment
+  const stableExtensionCacheDir = modeConfig.stealthExperiment && options.userDataDir === undefined
     ? expandHomeDir('~/.sidetrack-stealth-extension')
     : undefined;
   const extensionForLaunch = await extensionPathWithExtraHostPermissions(
@@ -541,6 +591,12 @@ export const launchExtensionRuntime = async (
   const { context, patchrightLoaded } = launched;
   const worker = await waitForExtensionWorker(context);
   const extensionId = extensionIdFromWorker(worker);
+  if (stableExtensionCacheDir !== undefined) {
+    console.warn(
+      '[runtime] Reloading stable stealth extension from disk so Chrome does not reuse a stale MV3 service worker.',
+    );
+    await reloadExtensionFromDisk(context, extensionId, worker);
+  }
 
   return {
     context,
