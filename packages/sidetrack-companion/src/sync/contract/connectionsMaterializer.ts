@@ -354,28 +354,45 @@ export const createConnectionsMaterializer = (
     }
   };
 
+  // Stage 5.2 W1b — cooperative yielding. Each major sync-CPU phase
+  // is preceded by `yieldToEventLoop()` so HTTP request handlers and
+  // other I/O callbacks get a turn between phases. HTTP P99 during
+  // reconcile becomes "max phase duration" instead of "full rebuild
+  // duration." A future PR may move execution to a worker_thread,
+  // which would drop P99 to ~0; this is the lower-risk first step.
+  const yieldToEventLoop = (): Promise<void> =>
+    new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+
   const buildAndWrite = async (): Promise<void> => {
     const merged = await deps.eventLog.readMerged();
     const vault = await readVaultStores(deps.vaultRoot);
+    await yieldToEventLoop();
     const rawTimelineDays = buildTimelineDays(merged);
+    await yieldToEventLoop();
     const engagementInputs = buildEngagementClassifierInputs(merged, rawTimelineDays);
     const engagementClassRevision = buildEngagementClassRevision(engagementInputs, {
       producedAt: maxAcceptedAtMs(merged),
     });
     await engagementClassStore.putRevision(engagementClassRevision);
+    await yieldToEventLoop();
     const timelineDays = enrichTimelineDaysWithEngagement(rawTimelineDays, engagementInputs);
+    await yieldToEventLoop();
     const visitSimilarity = await buildVisitSimilarity(
       timelineDays.flatMap((day) => day.entries),
       deps.embed ?? defaultEmbed,
     );
     await writeVisitSimilarityRevision(deps.vaultRoot, visitSimilarity);
     const previousTopicRevision = await topicRevisionStore.readActiveRevision();
+    await yieldToEventLoop();
     const topicRevision = await buildSelectedTopicRevision({
       visits: timelineDays.flatMap((day) => day.entries.map(topicVisitFromEntry)),
       visitSimilarity,
       ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
     });
     await topicRevisionStore.putActiveRevision(topicRevision);
+    await yieldToEventLoop();
     const input: ConnectionsInput = {
       events: merged,
       ...vault,
@@ -386,7 +403,9 @@ export const createConnectionsMaterializer = (
       topicRevision,
       engagementClassRevision,
     };
+    await yieldToEventLoop();
     const baseSnapshot = buildConnectionsSnapshot(input);
+    await yieldToEventLoop();
     await rankerRetrainer({ merged, snapshot: baseSnapshot });
     const closestVisitRanker = await loadClosestVisitRanker();
     if (closestVisitRanker === null) {
@@ -395,6 +414,7 @@ export const createConnectionsMaterializer = (
     }
 
     try {
+      await yieldToEventLoop();
       const snapshot = buildConnectionsSnapshot({
         ...input,
         closestVisitRanker: closestVisitRanker.ranker,
