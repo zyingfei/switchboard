@@ -25,6 +25,12 @@ export interface EntityDisplayCtx {
   // Resolve a replica id to a human alias ("This browser" / "Browser 2"…).
   // Returns "Browser" while the alias map is hydrating from chrome.storage.
   readonly replicaAlias: (replicaId: string) => string;
+  // Stage 5 polish — cross-node lookup for kinds whose title depends on
+  // another node in the same snapshot. inbound-reminder needs the thread
+  // it points at; future kinds may follow the same pattern. Optional so
+  // surfaces without a snapshot (the Inbox path-resolver, for example)
+  // still work — those kinds just won't get the enriched title.
+  readonly nodeById?: ReadonlyMap<string, ConnectionNode>;
 }
 
 export interface EntityDisplay {
@@ -49,6 +55,7 @@ const ID_LIKE_PATTERNS: readonly RegExp[] = [
   /^replica:/i,
   /^topic:/i,
   /^snippet:/i,
+  /^snippet_[a-z0-9]/i, // bare snippet id (no kind prefix)
   /^coding-session:/i,
   /^annotation:/i,
   /^queue-item:/i,
@@ -241,10 +248,48 @@ export const formatEntityDisplay = (
       const replicaId = trimPrefix(node.id, 'replica:');
       return { primary: ctx.replicaAlias(replicaId), kindBadge, tooltip: replicaId };
     }
-    case 'snippet':
+    case 'inbound-reminder': {
+      // Stage 5 polish — every inbound-reminder previously rendered as
+      // `(inbound-reminder)` because the snapshot's reminder nodes
+      // carry only `threadId / provider / status`. Resolve the thread
+      // via ctx.nodeById and surface "Reminder: <thread title>" so
+      // users can tell 40 reminders apart at a glance.
+      const threadId = metaStr(metadata, ['threadId']);
+      const provider = metaStr(metadata, ['provider']);
+      const status = metaStr(metadata, ['status']);
+      const labelClean = cleanLabel(node.label);
+      let primary: string;
+      const threadNode =
+        threadId === undefined
+          ? undefined
+          : ctx.nodeById?.get(threadId) ?? ctx.nodeById?.get(`thread:${threadId}`);
+      if (threadNode !== undefined) {
+        const threadTitle = formatEntityDisplay(threadNode, ctx).primary;
+        primary = `Reminder: ${threadTitle}`;
+      } else if (labelClean !== undefined) {
+        primary = labelClean;
+      } else if (provider !== undefined) {
+        primary = `Reminder · ${provider}`;
+      } else {
+        primary = 'Reminder';
+      }
+      const secondary = composeSecondary([status, formatRelOrUndef(node.lastSeenAt)]);
+      return { primary, secondary, kindBadge, tooltip: node.id };
+    }
+    case 'snippet': {
+      // Stage 5 polish — snippets carry `match` (the copied text) plus
+      // `charHashPrefix`. The text is the most useful primary; the
+      // legacy `node.label` (= the raw snippet_<hex> id) is rejected
+      // by cleanLabel. Truncate-by-CSS only, so the full text remains
+      // available on the tooltip.
+      const match = metaStr(metadata, ['match', 'text', 'title']);
+      const labelClean = cleanLabel(node.label);
+      const primary = match ?? labelClean ?? '(snippet)';
+      const tooltip = metaStr(metadata, ['canonicalUrl', 'url']) ?? node.id;
+      return { primary, kindBadge, tooltip };
+    }
     case 'annotation':
     case 'queue-item':
-    case 'inbound-reminder':
     case 'template': {
       const title = metaStr(metadata, ['title', 'text', 'note']);
       const labelClean = cleanLabel(node.label);

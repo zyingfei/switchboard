@@ -358,7 +358,7 @@ export const ConnectionsView = ({
   onOpenUrl,
   displayCtx,
 }: Props): ReactElement => {
-  const ctx: EntityDisplayCtx = displayCtx ?? DEFAULT_DISPLAY_CTX;
+  const baseCtx: EntityDisplayCtx = displayCtx ?? DEFAULT_DISPLAY_CTX;
   // Anchor history — back/forward stack so drilling into a neighbor
   // and returning is one click. `history.current` is the anchor the
   // hook is currently focused on; `history.navigate(next)` pushes
@@ -427,6 +427,19 @@ export const ConnectionsView = ({
       },
     };
   }, [engagementOverrides, labelOverrides, rawSnapshot]);
+
+  // Stage 5 polish — derived ctx that carries the current snapshot's
+  // node map so kinds like `inbound-reminder` (which surfaces its
+  // thread's title in `formatEntityDisplay`) can resolve cross-node
+  // references without per-callsite plumbing.
+  const snapshotNodeById = useMemo(() => {
+    if (result === null) return new Map<string, ConnectionNode>();
+    return new Map(result.snapshot.nodes.map((node) => [node.id, node] as const));
+  }, [result]);
+  const ctx: EntityDisplayCtx = useMemo(
+    () => ({ ...baseCtx, nodeById: snapshotNodeById }),
+    [baseCtx, snapshotNodeById],
+  );
 
   const anchorNode = useMemo<ConnectionNode | null>(() => {
     if (result === null) return null;
