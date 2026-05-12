@@ -7263,17 +7263,50 @@ function WorkstreamPicker({
   const [draftTitle, setDraftTitle] = useState('');
   const [draftDescription, setDraftDescription] = useState('');
 
+  // Hierarchy-aware rendering: group workstreams as roots + per-root
+  // children. When a search query is active we flatten matches (search
+  // wins over hierarchy clarity); otherwise we render each root
+  // followed by its indented children.
   const matches = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (q.length === 0) {
-      return workstreams;
-    }
+    if (q.length === 0) return workstreams;
     return workstreams.filter((w) => w.title.toLowerCase().includes(q));
   }, [query, workstreams]);
+
+  const isSearching = query.trim().length > 0;
+  const hierarchical = useMemo(() => {
+    if (isSearching) return matches.map((w) => ({ ws: w, depth: 0 }));
+    // Build children index. Each entry's children get appended after it.
+    const byParent = new Map<string | null, WorkstreamNode[]>();
+    for (const w of workstreams) {
+      const key = w.parentId ?? null;
+      const list = byParent.get(key) ?? [];
+      list.push(w);
+      byParent.set(key, list);
+    }
+    const out: { ws: WorkstreamNode; depth: number }[] = [];
+    const walk = (parentId: string | null, depth: number): void => {
+      const children = byParent.get(parentId) ?? [];
+      for (const w of children) {
+        out.push({ ws: w, depth });
+        walk(w.bac_id, depth + 1);
+      }
+    };
+    walk(null, 0);
+    return out;
+  }, [isSearching, matches, workstreams]);
 
   const threadCountFor = (wsId: string): number =>
     threads.filter((t) => t.primaryWorkstreamId === wsId).length;
   const inboxCount = threads.filter((t) => t.primaryWorkstreamId === undefined).length;
+  // Track which parent the user is creating a sub-workstream under.
+  // null = top-level. Defaults to parentForNew (prop) but the user can
+  // toggle between "top-level" and "under current" via the trigger row.
+  const [createParent, setCreateParent] = useState<string | null>(parentForNew);
+  const parentTitle =
+    parentForNew === null
+      ? null
+      : workstreams.find((w) => w.bac_id === parentForNew)?.title ?? 'current';
 
   return (
     <div className="ws-picker-backdrop" onClick={onClose} role="presentation">
@@ -7295,34 +7328,58 @@ function WorkstreamPicker({
           }}
         />
         <div className="ws-picker-list">
+          {/* Column header explains what the right-hand count means. */}
+          <div className="ws-picker-header mono subtle">
+            <span>Workstream</span>
+            <span title="Threads currently attributed to this workstream">threads</span>
+          </div>
           <button
             type="button"
             className={'ws-picker-row' + (currentWsId === null ? ' on' : '')}
             onClick={() => {
               onSelect(null);
             }}
+            title="Inbox — threads waiting for you to assign a workstream"
           >
             <span className="ws-picker-name">
-              not set <em className="subtle">· captures land here</em>
+              <strong>Not assigned</strong>{' '}
+              <em className="subtle">— threads waiting for triage</em>
             </span>
-            <span className="mono subtle">{inboxCount}</span>
+            <span className="mono subtle" title={`${String(inboxCount)} unassigned threads`}>
+              {inboxCount}
+            </span>
           </button>
-          {matches.map((w) => (
-            <button
-              type="button"
-              key={w.bac_id}
-              className={'ws-picker-row' + (currentWsId === w.bac_id ? ' on' : '')}
-              onClick={() => {
-                onSelect(w.bac_id);
-              }}
-            >
-              <span className="ws-picker-name">
-                {w.title}
-                {w.parentId !== undefined ? <em className="subtle"> · sub</em> : null}
-              </span>
-              <span className="mono subtle">{threadCountFor(w.bac_id)}</span>
-            </button>
-          ))}
+          {hierarchical.map(({ ws: w, depth }) => {
+            const count = threadCountFor(w.bac_id);
+            return (
+              <button
+                type="button"
+                key={w.bac_id}
+                className={
+                  'ws-picker-row' +
+                  (currentWsId === w.bac_id ? ' on' : '') +
+                  (depth > 0 ? ' is-child' : '')
+                }
+                onClick={() => {
+                  onSelect(w.bac_id);
+                }}
+                title={
+                  depth > 0
+                    ? `Sub-workstream (nested ${String(depth)} deep)`
+                    : 'Top-level workstream'
+                }
+                style={depth > 0 ? { paddingLeft: `${String(12 + depth * 14)}px` } : undefined}
+              >
+                <span className="ws-picker-name">
+                  {depth > 0 ? <span className="ws-picker-indent">└ </span> : null}
+                  {w.title}
+                </span>
+                <span className="mono subtle" title={`${String(count)} threads in ${w.title}`}>
+                  {count}
+                </span>
+              </button>
+            );
+          })}
         </div>
         {creating ? (
           <form
@@ -7333,7 +7390,7 @@ function WorkstreamPicker({
               if (trimmed.length === 0) {
                 return;
               }
-              onCreate(trimmed, parentForNew, draftDescription.trim());
+              onCreate(trimmed, createParent, draftDescription.trim());
               setDraftTitle('');
               setDraftDescription('');
               setCreating(false);
@@ -7343,7 +7400,9 @@ function WorkstreamPicker({
               type="text"
               className="ws-picker-create-input"
               placeholder={
-                parentForNew === null ? 'New workstream name…' : 'New sub-workstream under current…'
+                createParent === null
+                  ? 'New top-level workstream name…'
+                  : `New sub-workstream under ${parentTitle ?? 'current'}…`
               }
               value={draftTitle}
               autoFocus
@@ -7381,15 +7440,32 @@ function WorkstreamPicker({
             </button>
           </form>
         ) : (
-          <button
-            type="button"
-            className="ws-picker-create-trigger"
-            onClick={() => {
-              setCreating(true);
-            }}
-          >
-            + New workstream{parentForNew !== null ? ' under current' : ''}
-          </button>
+          <div className="ws-picker-create-triggers">
+            {parentForNew !== null ? (
+              <button
+                type="button"
+                className="ws-picker-create-trigger"
+                onClick={() => {
+                  setCreateParent(parentForNew);
+                  setCreating(true);
+                }}
+                title={`Create a sub-workstream nested under ${parentTitle ?? 'current'}`}
+              >
+                + New under {parentTitle ?? 'current'}
+              </button>
+            ) : null}
+            <button
+              type="button"
+              className="ws-picker-create-trigger"
+              onClick={() => {
+                setCreateParent(null);
+                setCreating(true);
+              }}
+              title="Create a new top-level workstream (not nested under any other)"
+            >
+              + New top-level workstream
+            </button>
+          </div>
         )}
       </div>
     </div>

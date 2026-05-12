@@ -3803,6 +3803,42 @@ textarea.preview-body:focus {
   font-size: 12px;
   margin-top: 4px;
 }
+/* Side-by-side dual-create affordances: "under current" + "top-level".
+   Stack on narrow widths. */
+.ws-picker-create-triggers {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+.ws-picker-create-triggers .ws-picker-create-trigger {
+  flex: 1 1 140px;
+  margin-top: 0;
+}
+
+/* Column header above the workstream list — clarifies what the
+   right-hand count means. */
+.ws-picker-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--rule, #d4cdb8);
+  margin-bottom: 4px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* Indented sub-workstream row + leading tree connector. */
+.ws-picker-row.is-child {
+  color: var(--ink-2, #4a453d);
+}
+.ws-picker-indent {
+  color: var(--ink-3, #7a7165);
+  opacity: 0.7;
+  margin-right: 2px;
+}
 .ws-picker-create {
   display: flex;
   gap: 4px;
