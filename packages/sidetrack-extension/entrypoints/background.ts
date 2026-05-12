@@ -58,6 +58,7 @@ import {
 import { registerDefaultWebNavigationListeners } from '../src/background/listeners/web-navigation';
 import {
   createEdgeEventDrainSingleFlight,
+  partitionEdgeEventDrainBatch,
   summarizeEdgeEventDrain,
 } from '../src/background/storage/edge-event-drain';
 import { IndexedDbEventBuffer } from '../src/background/storage/indexeddb-event-buffer';
@@ -3156,17 +3157,8 @@ export default defineBackground(() => {
     'selection.pasted',
     VISUAL_FINGERPRINT_OBSERVED,
   ]);
-  const EDGE_EVENT_DRAIN_BATCH_SIZE = 10;
-
-  const countBufferedEventsByType = (
-    events: readonly BufferedEvent[],
-  ): Record<string, number> => {
-    const byType: Record<string, number> = {};
-    for (const event of events) {
-      byType[event.streamName] = (byType[event.streamName] ?? 0) + 1;
-    }
-    return byType;
-  };
+  const EDGE_EVENT_DRAIN_ROUTE_BATCH_SIZE = 10;
+  const EDGE_EVENT_DRAIN_SCAN_BATCH_SIZE = 500;
 
   const mergeCounts = (
     ...counts: readonly Record<string, number>[]
@@ -3204,7 +3196,7 @@ export default defineBackground(() => {
       };
     }
 
-    const batch = await engagementEventBuffer.peek(EDGE_EVENT_DRAIN_BATCH_SIZE);
+    const batch = await engagementEventBuffer.peek(EDGE_EVENT_DRAIN_SCAN_BATCH_SIZE);
     if (batch.length === 0) {
       return {
         uploaded: 0,
@@ -3217,19 +3209,20 @@ export default defineBackground(() => {
       };
     }
 
-    const routeBatch = batch.filter((event) => acceptedEdgeEventStreamNames.has(event.streamName));
-    const locallyRejectedBatch = batch.filter(
-      (event) => !acceptedEdgeEventStreamNames.has(event.streamName),
+    const {
+      routeBatch,
+      locallyRejectedBatch,
+      evictedByType: localEvictedByType,
+      skippedByReason: localSkippedByReason,
+    } = partitionEdgeEventDrainBatch(
+      batch,
+      acceptedEdgeEventStreamNames,
+      EDGE_EVENT_DRAIN_ROUTE_BATCH_SIZE,
     );
     const locallyEvicted =
       locallyRejectedBatch.length === 0
         ? 0
         : await engagementEventBuffer.deleteMany(locallyRejectedBatch);
-    const localEvictedByType = countBufferedEventsByType(locallyRejectedBatch);
-    const localSkippedByReason: Record<string, number> =
-      locallyRejectedBatch.length === 0
-        ? {}
-        : { 'invalid-event-type': locallyRejectedBatch.length };
     if (routeBatch.length === 0) {
       return {
         uploaded: 0,

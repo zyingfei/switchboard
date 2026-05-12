@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   createEdgeEventDrainSingleFlight,
+  partitionEdgeEventDrainBatch,
   summarizeEdgeEventDrain,
   type EdgeEventImportAck,
   type EdgeEventImportSkip,
@@ -21,6 +22,26 @@ const event = (
 });
 
 describe('summarizeEdgeEventDrain', () => {
+  it('scans past the upload cap to evict local non-edge records in bulk', () => {
+    const batch = [
+      event('navigation.committed', 1),
+      event('engagement.interval.observed', 2),
+      event('engagement.session.aggregated', 3),
+      event('navigation.committed', 4),
+    ];
+
+    const partition = partitionEdgeEventDrainBatch(
+      batch,
+      new Set(['engagement.interval.observed', 'engagement.session.aggregated']),
+      1,
+    );
+
+    expect(partition.routeBatch.map((e) => e.lamport)).toEqual([2]);
+    expect(partition.locallyRejectedBatch.map((e) => e.lamport)).toEqual([1, 4]);
+    expect(partition.evictedByType).toEqual({ 'navigation.committed': 2 });
+    expect(partition.skippedByReason).toEqual({ 'invalid-event-type': 2 });
+  });
+
   it('keeps uploaded accounting separate from permanent skip eviction', () => {
     const batch = [
       event('engagement.interval.observed', 1),

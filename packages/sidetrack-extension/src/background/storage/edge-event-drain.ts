@@ -17,6 +17,13 @@ export interface EdgeEventImportSkip extends EdgeEventImportAck {
   readonly reason: string;
 }
 
+export interface EdgeEventDrainBatchPartition {
+  readonly routeBatch: readonly BufferedEvent[];
+  readonly locallyRejectedBatch: readonly BufferedEvent[];
+  readonly evictedByType: Record<string, number>;
+  readonly skippedByReason: Record<string, number>;
+}
+
 export const createEdgeEventDrainSingleFlight = <T>(
   drainOnce: () => Promise<T>,
 ): (() => Promise<T>) => {
@@ -42,6 +49,46 @@ const PERMANENT_SKIP_REASONS = new Set([
   'invalid-event-type',
   'invalid-payload',
 ]);
+
+const countBufferedEventsByType = (
+  events: readonly BufferedEvent[],
+): Record<string, number> => {
+  const byType: Record<string, number> = {};
+  for (const event of events) {
+    byType[event.streamName] = (byType[event.streamName] ?? 0) + 1;
+  }
+  return byType;
+};
+
+export const partitionEdgeEventDrainBatch = (
+  batch: readonly BufferedEvent[],
+  acceptedStreamNames: ReadonlySet<BufferedEvent['streamName']>,
+  maxRouteBatchSize: number,
+): EdgeEventDrainBatchPartition => {
+  const routeBatch: BufferedEvent[] = [];
+  const locallyRejectedBatch: BufferedEvent[] = [];
+  const routeLimit = Math.max(0, Math.floor(maxRouteBatchSize));
+
+  for (const event of batch) {
+    if (!acceptedStreamNames.has(event.streamName)) {
+      locallyRejectedBatch.push(event);
+      continue;
+    }
+    if (routeBatch.length < routeLimit) {
+      routeBatch.push(event);
+    }
+  }
+
+  return {
+    routeBatch,
+    locallyRejectedBatch,
+    evictedByType: countBufferedEventsByType(locallyRejectedBatch),
+    skippedByReason:
+      locallyRejectedBatch.length === 0
+        ? {}
+        : { 'invalid-event-type': locallyRejectedBatch.length },
+  };
+};
 
 export const summarizeEdgeEventDrain = (
   batch: readonly BufferedEvent[],
