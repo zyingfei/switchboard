@@ -93,6 +93,10 @@ import {
 } from '../urls/projection.js';
 import { autoApplyUrlAttribution } from '../urls/autoApply.js';
 import {
+  getCachedUrlProjection,
+  invalidateCachedUrlProjection,
+} from '../urls/cachedProjection.js';
+import {
   appendEntry as appendEntryRaw,
   gcEntries as gcEntriesRaw,
   readIndex,
@@ -1703,7 +1707,7 @@ const routes: readonly RouteDefinition[] = [
       return [
         200,
         {
-          data: serializeUrlProjection(projectUrls(await context.eventLog.readMerged())),
+          data: serializeUrlProjection(await getCachedUrlProjection(context.eventLog)),
         },
       ];
     },
@@ -1725,7 +1729,7 @@ const routes: readonly RouteDefinition[] = [
       const offsetRaw = Number.parseInt(url.searchParams.get('offset') ?? '0', 10);
       const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 200) : 50;
       const offset = Number.isFinite(offsetRaw) && offsetRaw > 0 ? offsetRaw : 0;
-      const projection = projectUrls(await context.eventLog.readMerged());
+      const projection = await getCachedUrlProjection(context.eventLog);
       const items = urlInbox(projection, { limit, offset });
       return [
         200,
@@ -1845,6 +1849,9 @@ const routes: readonly RouteDefinition[] = [
           ...(policyMode === undefined ? {} : { policyMode }),
           ...(policyTelemetry === undefined ? {} : { policyTelemetry }),
         });
+        if (result.status === 'applied') {
+          invalidateCachedUrlProjection(eventLog);
+        }
         return [
           result.status === 'applied' ? 201 : 200,
           {
@@ -1911,6 +1918,7 @@ const routes: readonly RouteDefinition[] = [
           payload,
           baseVector: await baseVectorForAggregate(eventLog, aggregateId),
         });
+        invalidateCachedUrlProjection(eventLog);
         return [
           201,
           {
