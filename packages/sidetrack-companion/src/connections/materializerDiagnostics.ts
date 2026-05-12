@@ -79,6 +79,7 @@ export interface MaterializerRankerCounters {
   readonly labelCount: number;
   readonly positiveLabelCount: number;
   readonly negativeLabelCount: number;
+  readonly newLabelCount: number | null;
   readonly candidateCount: number | null;
   readonly revisionId: string | null;
   readonly error: string | null;
@@ -261,6 +262,7 @@ const collectRankerCounters = (
       labelCount: 0,
       positiveLabelCount: 0,
       negativeLabelCount: 0,
+      newLabelCount: null,
       candidateCount: null,
       revisionId: null,
       error: null,
@@ -274,6 +276,7 @@ const collectRankerCounters = (
         labelCount: result.fingerprint.labelCount,
         positiveLabelCount: result.fingerprint.positiveLabelCount,
         negativeLabelCount: result.fingerprint.negativeLabelCount,
+        newLabelCount: result.newLabelCount,
         candidateCount: result.candidateCount,
         revisionId: result.revisionId,
         error: null,
@@ -285,6 +288,7 @@ const collectRankerCounters = (
         labelCount: result.fingerprint.labelCount,
         positiveLabelCount: result.fingerprint.positiveLabelCount,
         negativeLabelCount: result.fingerprint.negativeLabelCount,
+        newLabelCount: result.newLabelCount,
         candidateCount: result.candidateCount ?? null,
         revisionId: null,
         error: null,
@@ -296,6 +300,7 @@ const collectRankerCounters = (
         labelCount: result.fingerprint.labelCount,
         positiveLabelCount: result.fingerprint.positiveLabelCount,
         negativeLabelCount: result.fingerprint.negativeLabelCount,
+        newLabelCount: result.newLabelCount,
         candidateCount: result.candidateCount,
         revisionId: null,
         error: result.error,
@@ -446,6 +451,7 @@ export const summarizeMaterializerDiagnostics = (
     `topicMembers=${String(diagnostics.topics.memberCount)}`,
     `ranker=${diagnostics.ranker.status}${diagnostics.ranker.reason === null ? '' : `:${diagnostics.ranker.reason}`}`,
     `labels=${String(diagnostics.ranker.labelCount)}(+${String(diagnostics.ranker.positiveLabelCount)}/-${String(diagnostics.ranker.negativeLabelCount)})`,
+    `newLabels=${diagnostics.ranker.newLabelCount === null ? 'n/a' : String(diagnostics.ranker.newLabelCount)}`,
     `userAssertions=${String(diagnostics.userAssertions.total)}`,
     `inferredUrlAttr=${String(diagnostics.inferred.urlAttributionInferredCount)}`,
     `inferredTabSessionAttr=${String(diagnostics.inferred.tabSessionAttributionInferredCount)}`,

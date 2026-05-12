@@ -91,6 +91,7 @@ import {
   serializeUrlProjection,
   urlInbox,
 } from '../urls/projection.js';
+import { autoApplyUrlAttribution } from '../urls/autoApply.js';
 import {
   appendEntry as appendEntryRaw,
   gcEntries as gcEntriesRaw,
@@ -1786,6 +1787,74 @@ const routes: readonly RouteDefinition[] = [
           }),
         },
       ];
+    },
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/visits\/(?<canonicalUrl>[^/]+)\/resolve$/u,
+    authRequired: true,
+    handle: async (request, _requestId, match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      if (context.connectionsStore === undefined) {
+        throw new HttpRouteError(503, 'CONNECTIONS_NOT_WIRED', 'Connections is not configured.');
+      }
+      const eventLog = context.eventLog;
+      const connectionsStore = context.connectionsStore;
+      const idempotencyKey = requireIdempotencyKey(request);
+      return await runIdempotent(context, 'urlResolveAutoApply', idempotencyKey, async () => {
+        const body = objectRecord(await readBody(request)) ?? {};
+        if (body['dryRun'] !== false) {
+          throw new HttpRouteError(
+            400,
+            'VALIDATION_ERROR',
+            'Validation failed.',
+            'Body must set dryRun:false for auto-apply.',
+          );
+        }
+        const snapshot = await connectionsStore.readCurrent();
+        if (snapshot === null) {
+          throw new HttpRouteError(
+            409,
+            'CONNECTIONS_SNAPSHOT_MISSING',
+            'Connections snapshot is not ready.',
+          );
+        }
+        const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
+        if (canonicalUrl.length === 0) {
+          throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
+        }
+        const projection = projectUrls(await eventLog.readMerged());
+        if (!projection.byCanonicalUrl.has(canonicalUrl)) {
+          throw new HttpRouteError(404, 'URL_NOT_FOUND', 'URL was not found.');
+        }
+        const policyMode = optionalAttributionPolicyMode(body['policyMode'], 'policyMode');
+        const policyTelemetry = optionalAttributionPolicyTelemetry(
+          body['policyTelemetry'],
+          'policyTelemetry',
+        );
+        const result = await autoApplyUrlAttribution({
+          eventLog,
+          snapshot,
+          canonicalUrl,
+          ...(policyMode === undefined ? {} : { policyMode }),
+          ...(policyTelemetry === undefined ? {} : { policyTelemetry }),
+        });
+        return [
+          result.status === 'applied' ? 201 : 200,
+          {
+            data: {
+              ...result,
+              projection: serializeUrlProjection(result.projection),
+            },
+          },
+        ];
+      });
     },
   },
   {

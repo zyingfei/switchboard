@@ -14,6 +14,7 @@ import { buildClusterEvidence } from './clusterEvidence.js';
 import type { TabSessionAttributionInferredPayload } from './events.js';
 import { buildEvidenceGraph } from './evidenceGraph.js';
 import { fuseCandidates, type CandidateEvidence, type FusedCandidate } from './fusion.js';
+import type { UrlAttributionInferredPayload } from '../urls/events.js';
 import {
   decideAttribution,
   type AttributionAction,
@@ -504,6 +505,37 @@ export const inferredAttributionPayloadFromResolution = (
   return {
     payloadVersion: 1,
     tabSessionId: result.tabSessionId,
+    workstreamId: result.decision.workstreamId,
+    policyMode: result.policyMode,
+    dominantSource: top.dominantSource,
+    rawFusionLogit: top.rawFusionLogit,
+    margin: result.decision.margin,
+    corroborationCount: top.corroborationCount,
+    modelRevision: result.reasons.modelRevision,
+    graphRevision: result.reasons.graphRevision,
+    evidenceHash: result.reasons.evidenceHash,
+    resolverDependencyKey: result.reasons.dependencyKey,
+    reasonSummary:
+      top.reasons
+        .map((reason) => reason.summary)
+        .filter((summary) => summary.length > 0)
+        .join('; ') || `${top.dominantSource} evidence`,
+  };
+};
+
+export const inferredUrlAttributionPayloadFromResolution = (
+  result: UrlResolutionResult,
+): UrlAttributionInferredPayload | null => {
+  if (result.decision.action !== 'auto-apply' || result.decision.workstreamId === undefined) {
+    return null;
+  }
+  const top = result.fusedCandidates.find(
+    (candidate) => candidate.workstreamId === result.decision.workstreamId,
+  );
+  if (top === undefined || top.dominantSource === 'none') return null;
+  return {
+    payloadVersion: 1,
+    canonicalUrl: result.canonicalUrl,
     workstreamId: result.decision.workstreamId,
     policyMode: result.policyMode,
     dominantSource: top.dominantSource,

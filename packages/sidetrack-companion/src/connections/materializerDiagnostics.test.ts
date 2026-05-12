@@ -284,6 +284,7 @@ describe('collectMaterializerDiagnostics', () => {
       labelCount: 12,
       positiveLabelCount: 7,
       negativeLabelCount: 5,
+      newLabelCount: 12,
       candidateCount: 30,
       revisionId: null,
       error: null,
@@ -307,6 +308,7 @@ describe('collectMaterializerDiagnostics', () => {
     expect(diag.ranker.status).toBe('trained');
     expect(diag.ranker.revisionId).toBe('ranker-rev-9');
     expect(diag.ranker.candidateCount).toBe(200);
+    expect(diag.ranker.newLabelCount).toBe(60);
   });
 
   it('reports not-run ranker counters when no retrain result is supplied', () => {
@@ -463,6 +465,7 @@ describe('summarizeMaterializerDiagnostics', () => {
     expect(summary).toContain('simEdges=0(embedding)');
     expect(summary).toContain('engagementEligible=1');
     expect(summary).toContain('ranker=not-run');
+    expect(summary).toContain('newLabels=n/a');
   });
 
   it('flags the similarity producer when the lexical fallback runs', () => {
