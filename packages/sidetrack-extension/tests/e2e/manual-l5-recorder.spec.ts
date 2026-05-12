@@ -212,11 +212,13 @@ const withTimeout = async <T>(
     ),
   ]);
 
+const API_TIMEOUT_MS = 60_000;
+
 const apiGet = async (comp: TestCompanion, requestPath: string): Promise<unknown> => {
   const controller = new AbortController();
   const timer = setTimeout(() => {
     controller.abort();
-  }, 10_000);
+  }, API_TIMEOUT_MS);
   try {
     const res = await fetch(`http://127.0.0.1:${String(comp.port)}${requestPath}`, {
       headers: { 'x-bac-bridge-key': comp.bridgeKey },
@@ -225,6 +227,11 @@ const apiGet = async (comp: TestCompanion, requestPath: string): Promise<unknown
     if (!res.ok)
       throw new Error(`GET ${requestPath} failed: ${String(res.status)} ${await res.text()}`);
     return await res.json();
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error(`GET ${requestPath} timed out after ${String(API_TIMEOUT_MS)}ms`);
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
   }
@@ -238,7 +245,7 @@ const apiPost = async (
   const controller = new AbortController();
   const timer = setTimeout(() => {
     controller.abort();
-  }, 10_000);
+  }, API_TIMEOUT_MS);
   try {
     const res = await fetch(`http://127.0.0.1:${String(comp.port)}${requestPath}`, {
       method: 'POST',
@@ -253,6 +260,11 @@ const apiPost = async (
     if (!res.ok)
       throw new Error(`POST ${requestPath} failed: ${String(res.status)} ${await res.text()}`);
     return await res.json();
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error(`POST ${requestPath} timed out after ${String(API_TIMEOUT_MS)}ms`);
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
   }

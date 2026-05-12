@@ -1420,21 +1420,52 @@ const App = () => {
     const tabsApi = chromeApi?.tabs;
     if (tabsApi === undefined || typeof tabsApi.onUpdated?.addListener !== 'function') return;
     let pending: ReturnType<typeof setTimeout> | null = null;
+    let refreshInFlight: Promise<void> | null = null;
+    let refreshAgain = false;
+    const delay = (ms: number): Promise<void> =>
+      new Promise((resolve) => {
+        setTimeout(resolve, ms);
+      });
+    const forceDrainTimeline = (): Promise<void> =>
+      new Promise((resolve) => {
+        if (chromeApi?.runtime?.sendMessage === undefined) {
+          resolve();
+          return;
+        }
+        try {
+          chromeApi.runtime.sendMessage({ type: 'sidetrack.timeline.force-drain' }, () => {
+            // Reading lastError prevents Chrome from surfacing an
+            // unchecked runtime error if the SW restarted mid-drain.
+            const lastError = chromeApi?.runtime?.lastError;
+            void lastError;
+            resolve();
+          });
+        } catch {
+          resolve();
+        }
+      });
+    const runRefresh = (): void => {
+      if (refreshInFlight !== null) {
+        refreshAgain = true;
+        return;
+      }
+      refreshInFlight = (async () => {
+        do {
+          refreshAgain = false;
+          if (state.companionStatus !== 'connected') return;
+          await forceDrainTimeline();
+          await delay(150);
+          await loadTabSessions({ background: true });
+        } while (refreshAgain);
+      })().finally(() => {
+        refreshInFlight = null;
+      });
+    };
     const trigger = (): void => {
       if (pending !== null) clearTimeout(pending);
       pending = setTimeout(() => {
         pending = null;
-        if (state.companionStatus !== 'connected') return;
-        try {
-          chromeApi?.runtime?.sendMessage(
-            { type: 'sidetrack.timeline.force-drain' },
-            () => {
-              void loadTabSessions({ background: true }).catch(() => undefined);
-            },
-          );
-        } catch {
-          void loadTabSessions({ background: true }).catch(() => undefined);
-        }
+        runRefresh();
       }, 250);
     };
     const onUpdated = (
