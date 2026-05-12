@@ -77,6 +77,47 @@ describe('Stage 5.2 W4 — IncrementalTopicClusterAccumulator', () => {
     expect(await acc.getComponents()).toEqual([]);
   });
 
+  it('removeEdge disconnects a component when no alternate path remains', async () => {
+    const visits = [visit('a'), visit('b'), visit('c')];
+    const acc = new IncrementalTopicClusterAccumulator();
+    for (const v of visits) acc.addVisit(v);
+    acc.addSimilarityEdge({ fromVisitKey: 'a', toVisitKey: 'b', cosine: 0.9 }, 0.85);
+    acc.addSimilarityEdge({ fromVisitKey: 'b', toVisitKey: 'c', cosine: 0.9 }, 0.85);
+    // Initially {a,b,c} is one component.
+    let components = await acc.getComponents();
+    expect(components).toHaveLength(1);
+    // Remove the a-b edge — {a} should split off, leaving {b,c}.
+    acc.removeEdge('a', 'b');
+    components = await acc.getComponents();
+    expect(components).toHaveLength(1);
+    expect([...components[0]!.memberCanonicalUrls].sort()).toEqual(['b', 'c']);
+  });
+
+  it('removeEdge keeps the component together when an alternate path exists', async () => {
+    const visits = [visit('a'), visit('b'), visit('c')];
+    const acc = new IncrementalTopicClusterAccumulator();
+    for (const v of visits) acc.addVisit(v);
+    // Triangle: a-b, b-c, a-c. Removing one edge keeps all in one component.
+    acc.addSimilarityEdge({ fromVisitKey: 'a', toVisitKey: 'b', cosine: 0.9 }, 0.85);
+    acc.addSimilarityEdge({ fromVisitKey: 'b', toVisitKey: 'c', cosine: 0.9 }, 0.85);
+    acc.addSimilarityEdge({ fromVisitKey: 'a', toVisitKey: 'c', cosine: 0.9 }, 0.85);
+    acc.removeEdge('a', 'b');
+    const components = await acc.getComponents();
+    expect(components).toHaveLength(1);
+    expect([...components[0]!.memberCanonicalUrls].sort()).toEqual(['a', 'b', 'c']);
+  });
+
+  it('removeEdge of a non-existent edge is a no-op', async () => {
+    const acc = new IncrementalTopicClusterAccumulator();
+    acc.addVisit(visit('a'));
+    acc.addVisit(visit('b'));
+    acc.addSimilarityEdge({ fromVisitKey: 'a', toVisitKey: 'b', cosine: 0.9 }, 0.85);
+    acc.removeEdge('a', 'z'); // 'z' isn't registered; removal silently ignored
+    const components = await acc.getComponents();
+    expect(components).toHaveLength(1);
+    expect([...components[0]!.memberCanonicalUrls].sort()).toEqual(['a', 'b']);
+  });
+
   it('addEdge is idempotent / commutative under permutation', async () => {
     const visits = [visit('a'), visit('b'), visit('c'), visit('d')];
     const edges: readonly VisitSimilarityEdge[] = [
