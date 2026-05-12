@@ -404,6 +404,22 @@ export class IncrementalTopicClusterAccumulator {
   }
 
   /**
+   * Stage 5.2 W4 — read the current edge ledger. Used by the
+   * materializer to diff old vs new similarity revisions on a
+   * model-revision flip: edges present in the old revision but
+   * missing from the new one are passed back to removeEdge so the
+   * accumulator's union-find stays consistent. Returns a snapshot
+   * sorted lexicographically by (a, b).
+   */
+  getEdges(): readonly { readonly a: string; readonly b: string; readonly source: 'similarity' | 'user-asserted' }[] {
+    return [...this.edges.values()].sort((left, right) => {
+      const a = compareString(left.a, right.a);
+      if (a !== 0) return a;
+      return compareString(left.b, right.b);
+    });
+  }
+
+  /**
    * Return components keyed by topicId. Singleton components (one
    * member) are filtered out — they're not topics, they're isolated
    * visits. Caller responsible for downstream TopicRevisionTopic
@@ -508,6 +524,93 @@ export const buildTopicRevision = async (
   const topics: TopicRevisionTopic[] = [];
   for (const component of currentComponents) {
     if (component.memberCanonicalUrls.length < 2) continue;
+    topics.push({
+      topicId: component.topicId,
+      memberCanonicalUrls: component.memberCanonicalUrls,
+      metadata: buildMetadata(
+        component.memberCanonicalUrls,
+        visitsByCanonical,
+        input.visitSimilarity.edges,
+        cosineThreshold,
+      ),
+    });
+  }
+  topics.sort((a, b) => compareString(a.topicId, b.topicId));
+
+  const lineage = await computeLineage(input.previousRevision, currentComponents, observedAt);
+  const revisionId = await createTopicRevisionId({
+    visitSimilarityRevisionId: input.visitSimilarity.revisionId,
+    cosineThreshold,
+    algorithmVersion,
+  });
+
+  return {
+    revisionId,
+    visitSimilarityRevisionId: input.visitSimilarity.revisionId,
+    cosineThreshold,
+    algorithmVersion,
+    topics,
+    lineage,
+    producedAt,
+  };
+};
+
+// -- Stage 5.2 W4 — derive-from-accumulator topic revision -----------
+// Pairs with IncrementalTopicClusterAccumulator. Callers maintain the
+// accumulator across drains (incremental add of similarity edges +
+// user-asserted relations); this builder reads accumulator.getComponents()
+// and fills in metadata + lineage using the same logic as
+// buildTopicRevision. Byte-equal output when:
+//   - The accumulator was fed the same engagement-gated visit set.
+//   - The accumulator was fed the same similarity edges (cosine >= threshold).
+//   - The accumulator was fed the same user-asserted relations.
+//   - The supplied previousRevision is identical.
+//   - The cosineThreshold / algorithmVersion / producedAt match.
+//
+// In short: feed the accumulator the same eligible inputs that
+// buildTopicRevision would have used, and the output is identical
+// modulo wall-clock producedAt.
+
+export interface BuildTopicRevisionFromAccumulatorInput {
+  readonly accumulator: IncrementalTopicClusterAccumulator;
+  /**
+   * Full visit set for metadata (representative titles, cohesion,
+   * dominant workstream). Engagement-gating is the caller's job —
+   * the accumulator was already fed eligible visits; this is just
+   * the lookup table for metadata.
+   */
+  readonly visits: readonly TopicVisit[];
+  /**
+   * Similarity edges used to compute per-topic cohesion. The same
+   * edges that fed the accumulator's addSimilarityEdge calls.
+   */
+  readonly visitSimilarity: VisitSimilarityRevisionInput;
+  readonly previousRevision?: TopicRevision;
+  readonly options?: BuildTopicRevisionOptions;
+}
+
+export const buildTopicRevisionFromAccumulator = async (
+  input: BuildTopicRevisionFromAccumulatorInput,
+): Promise<TopicRevision> => {
+  const cosineThreshold = input.options?.cosineThreshold ?? DEFAULT_TOPIC_COSINE_THRESHOLD;
+  const algorithmVersion = input.options?.algorithmVersion ?? TOPIC_ALGORITHM_VERSION;
+  const producedAt = input.options?.producedAt ?? Date.now();
+  const observedAt = new Date(producedAt).toISOString();
+
+  const visits = sortedVisitsByCanonical(input.visits);
+  const visitsByCanonical = new Map(visits.map((visit) => [visit.canonicalUrl, visit] as const));
+
+  // Components come from the accumulator's existing union-find state.
+  // getComponents() already filters singletons (a topic must have
+  // at least 2 members) and sorts by topicId.
+  const incrementalComponents = await input.accumulator.getComponents();
+  const currentComponents: CurrentComponent[] = incrementalComponents.map((c) => ({
+    topicId: c.topicId,
+    memberCanonicalUrls: c.memberCanonicalUrls,
+  }));
+
+  const topics: TopicRevisionTopic[] = [];
+  for (const component of currentComponents) {
     topics.push({
       topicId: component.topicId,
       memberCanonicalUrls: component.memberCanonicalUrls,

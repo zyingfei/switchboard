@@ -1,0 +1,50 @@
+{
+  "date": "2026-05-10",
+  "entries": [
+    {
+      "id": "https://github.com/zyingfei/switchboard",
+      "firstSeenAt": "2026-05-10T21:06:39.243Z",
+      "lastSeenAt": "2026-05-10T21:06:47.215Z",
+      "url": "https://github.com/zyingfei/switchboard",
+      "canonicalUrl": "https://github.com/zyingfei/switchboard",
+      "title": "Issues · zyingfei/switchboard · GitHub",
+      "tabSessionId": "tses_01KR9VDA0NJT5088RMXCP1S31G",
+      "openerTabSessionId": "tses_01KR9VCENTS4VCSE3VS0P26B8T",
+      "visitCount": 2
+    },
+    {
+      "id": "https://github.com/zyingfei/switchboard/issues",
+      "firstSeenAt": "2026-05-10T21:06:46.093Z",
+      "lastSeenAt": "2026-05-10T21:06:46.093Z",
+      "url": "https://github.com/zyingfei/switchboard/issues",
+      "canonicalUrl": "https://github.com/zyingfei/switchboard/issues",
+      "title": "Pull requests · zyingfei/switchboard · GitHub",
+      "tabSessionId": "tses_01KR9VDA0NJT5088RMXCP1S31G",
+      "openerTabSessionId": "tses_01KR9VCENTS4VCSE3VS0P26B8T",
+      "visitCount": 1
+    },
+    {
+      "id": "https://github.com/zyingfei/switchboard/pulls",
+      "firstSeenAt": "2026-05-10T21:06:43.981Z",
+      "lastSeenAt": "2026-05-10T21:06:43.981Z",
+      "url": "https://github.com/zyingfei/switchboard/pulls",
+      "canonicalUrl": "https://github.com/zyingfei/switchboard/pulls",
+      "title": "GitHub - zyingfei/switchboard · GitHub",
+      "tabSessionId": "tses_01KR9VDA0NJT5088RMXCP1S31G",
+      "openerTabSessionId": "tses_01KR9VCENTS4VCSE3VS0P26B8T",
+      "visitCount": 1
+    },
+    {
+      "id": "file:///var/folders/_p/qfpzpb_d7wj4tmgfhz2_837c0000gn/T/sidetrack-manual-l5/2026-05-10T21-06-04-066Z/launchpad.html",
+      "firstSeenAt": "2026-05-10T21:06:10.272Z",
+      "lastSeenAt": "2026-05-10T21:06:10.272Z",
+      "url": "file:///var/folders/_p/qfpzpb_d7wj4tmgfhz2_837c0000gn/T/sidetrack-manual-l5/2026-05-10T21-06-04-066Z/launchpad.html",
+      "canonicalUrl": "file:///var/folders/_p/qfpzpb_d7wj4tmgfhz2_837c0000gn/T/sidetrack-manual-l5/2026-05-10T21-06-04-066Z/launchpad.html",
+      "title": "launchpad.html",
+      "tabSessionId": "tses_01KR9VCENTS4VCSE3VS0P26B8T",
+      "visitCount": 1
+    }
+  ],
+  "updatedAt": "2026-05-10T21:06:47.215Z",
+  "entryCount": 4
+}

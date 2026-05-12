@@ -131,7 +131,10 @@ const hostnameForUrl = (url: string): string => {
   }
 };
 
-const corpusForEntry = (entry: VisitSimilarityEntry): string => {
+// Stage 5.2 W3 fast-path needs both helpers to embed + key new entries
+// from outside this module. They're stateless + cheap; expose as named
+// exports so the materializer can compute pre-embedding inputs.
+export const corpusForVisitEntry = (entry: VisitSimilarityEntry): string => {
   const url = entry.canonicalUrl ?? entry.url;
   return normalizeSpaces(
     [
@@ -142,8 +145,13 @@ const corpusForEntry = (entry: VisitSimilarityEntry): string => {
   );
 };
 
-const visitKeyForEntry = (entry: VisitSimilarityEntry): string =>
+export const visitKeyForVisitEntry = (entry: VisitSimilarityEntry): string =>
   stripFragmentAndTrailingSlash(entry.canonicalUrl ?? entry.url);
+
+// Internal aliases for in-module call sites (preserve existing
+// names below).
+const corpusForEntry = corpusForVisitEntry;
+const visitKeyForEntry = visitKeyForVisitEntry;
 
 const preferNewEntry = (
   existing: NormalizedVisit,
@@ -447,6 +455,88 @@ export const computeVisitSimilarityRevisionId = (
     lexicalFallbackEnabled: config.lexicalFallbackEnabled,
     visits,
   });
+};
+
+// -- Stage 5.2 W3 — incremental cosine-only fast path ---------------
+// Pairs with IncrementalVisitSimilarityIndex. This is NOT byte-equal
+// with buildVisitSimilarity below: that path uses a hybrid lexical +
+// vector ANN rank (with rerank by source.corpus / queryVector / lexical
+// fallback). The incremental path is cosine-only — same ranking
+// semantics as the in-memory index. The trade-off:
+//
+//   - buildVisitSimilarity: byte-deterministic over the legacy
+//     hybrid algorithm; expensive pairwise rebuild per drain.
+//   - buildVisitSimilarityIncremental: O(1) per new visit insert;
+//     produces a different revisionId (the modelRevision string is
+//     suffixed `:incremental`) so the on-disk cache can keep both
+//     side-by-side until the materializer decides which to use.
+//
+// The materializer's hot path consults `decideHotPathEmbed(budget)`
+// to pick this path on warm + small-corpus drains. Worker
+// reconciliation always uses buildVisitSimilarity (the byte-equality
+// oracle).
+
+import { IncrementalVisitSimilarityIndex } from './visitSimilarity.incremental.js';
+
+export interface BuildVisitSimilarityIncrementalInput {
+  /** Persistent in-memory index maintained by the materializer across drains. */
+  readonly index: IncrementalVisitSimilarityIndex;
+  /** Entries to ensure are present in the index. New entries are inserted; existing entries are no-ops. */
+  readonly entries: readonly VisitSimilarityEntry[];
+  /** Pre-computed embeddings keyed by visitKey (passage prefix). Caller is responsible for embedding new entries. */
+  readonly embeddingsByVisitKey: ReadonlyMap<string, Float32Array>;
+  readonly options?: BuildVisitSimilarityOptions;
+}
+
+export const buildVisitSimilarityIncremental = (
+  input: BuildVisitSimilarityIncrementalInput,
+): VisitSimilarityRevision => {
+  const config = resolveVisitSimilarityConfig(input.options ?? {});
+  const { threshold, topK, engagementGateMs } = config;
+  const modelRevision = `${RECALL_MODEL.revision}:incremental`;
+  const visits = normalizeEntries(input.entries);
+  // PR #141 enriched revisionIdFor with producer + lexical params.
+  // The incremental path is cosine-only so producer='embedding'
+  // matches; lexical params still need to flow through for the id
+  // to be a deterministic function of the resolved config.
+  const revisionId = revisionIdFor({
+    modelRevision,
+    producer: 'embedding',
+    threshold,
+    topK,
+    engagementGateMs,
+    lexicalThreshold: config.lexicalThreshold,
+    lexicalFallbackEnabled: config.lexicalFallbackEnabled,
+    visits,
+  });
+  const eligible = visits.filter((visit) => visit.focusedWindowMs >= engagementGateMs);
+  // Insert each eligible visit into the index. Existing visits no-op.
+  for (const visit of eligible) {
+    const embedding = input.embeddingsByVisitKey.get(visit.visitKey);
+    if (embedding === undefined) continue;
+    input.index.insert({
+      visitKey: visit.visitKey,
+      embedding,
+      // The caller-supplied budget context is fixed when invoking this
+      // function; we expect the caller to have already gated via
+      // decideHotPathEmbed before calling, so we pass a synthetic
+      // always-warm budget here to skip the gate inside insert().
+      budget: {
+        corpusSize: 0,
+        embedderWarmUntilMs: Number.MAX_SAFE_INTEGER,
+        recentEmbedP99Ms: 0,
+      },
+    });
+  }
+  return {
+    revisionId,
+    modelId: VISIT_SIMILARITY_MODEL_ID,
+    modelRevision,
+    featureSchemaVersion: VISIT_SIMILARITY_FEATURE_SCHEMA_VERSION,
+    threshold,
+    edges: input.index.edges(),
+    producedAt: Date.now(),
+  };
 };
 
 export const buildVisitSimilarity = async (
