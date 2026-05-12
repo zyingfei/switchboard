@@ -1591,6 +1591,24 @@ const routes: readonly RouteDefinition[] = [
             'Connections snapshot is not ready.',
           );
         }
+        // Stage 5.2 R4 — stale-snapshot guard. Auto-apply mutates
+        // attribution state; the caller MUST act on a fresh-enough
+        // snapshot. If a `dependencyKey` is supplied and it doesn't
+        // match the current snapshotRevision, reject with 409. Stale
+        // suggestions are fine; stale mutations are not.
+        const dependencyKey = body['dependencyKey'];
+        if (
+          typeof dependencyKey === 'string' &&
+          snapshot.snapshotRevision !== undefined &&
+          dependencyKey !== snapshot.snapshotRevision
+        ) {
+          throw new HttpRouteError(
+            409,
+            'STALE_SNAPSHOT',
+            'Caller-supplied dependencyKey is stale.',
+            `Expected snapshotRevision=${snapshot.snapshotRevision}; client sent dependencyKey=${dependencyKey}. Re-fetch the resolve dry-run and retry.`,
+          );
+        }
         const tabSessionId = decodeURIComponent(match.tabSessionId ?? '');
         // Stage 5.2 R2 — snapshot-first via loadTabSessionProjection;
         // the event-log fallback covers a snapshot loaded from disk that
