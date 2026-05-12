@@ -443,4 +443,88 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     for (const t of expected) expect(m.handles.has(t)).toBe(true);
     expect(m.handles.has('unrelated.event')).toBe(false);
   });
+
+  // Stage 5.2 W4 — topic-revision skip-gate. When the previous active
+  // topic revision matches the id we'd derive from the current visit
+  // similarity + threshold + algorithm, skip the union-find pass and
+  // reuse it. Pairs with W3: when visit similarity cache-hits, topics
+  // inherit the cache hit downstream.
+  it('topic-revision skip-gate reuses the active revision when its id matches', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+    let putActiveRevisionCalls = 0;
+    const baseTopicStore = createTopicRevisionStore(vaultRoot);
+    const topicRevisionStore = {
+      ...baseTopicStore,
+      putActiveRevision: async (
+        revision: import('../../producers/topic-revision.js').TopicRevision,
+      ) => {
+        putActiveRevisionCalls += 1;
+        await baseTopicStore.putActiveRevision(revision);
+      },
+    };
+    const embed = embedFromVectors(
+      new Map<string, Float32Array>([
+        ['visit-alpha', unit([1, 0])],
+        ['visit-bravo', unit([1, 0])],
+      ]),
+    );
+    const m = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store,
+      embed,
+      topicRevisionStore,
+    });
+
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 1,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: {
+          eventId: 'timeline-alpha',
+          observedAt: '2026-05-07T10:00:00.000Z',
+          url: 'https://example.test/alpha',
+          canonicalUrl: 'https://example.test/alpha',
+          title: 'visit-alpha',
+          provider: 'generic',
+          transition: 'activated',
+          payloadVersion: 1,
+          dimensions: { engagement: { focusedWindowMs: 10_000 } },
+        },
+      }),
+    );
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 2,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: {
+          eventId: 'timeline-bravo',
+          observedAt: '2026-05-07T10:05:00.000Z',
+          url: 'https://example.test/bravo',
+          canonicalUrl: 'https://example.test/bravo',
+          title: 'visit-bravo',
+          provider: 'generic',
+          transition: 'activated',
+          payloadVersion: 1,
+          dimensions: { engagement: { focusedWindowMs: 10_000 } },
+        },
+      }),
+    );
+
+    // First drain produces the topic revision.
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+    const firstCalls = putActiveRevisionCalls;
+    expect(firstCalls).toBeGreaterThanOrEqual(1);
+
+    // Second drain with the same inputs hits the skip-gate — no new
+    // topic revision written.
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+    expect(putActiveRevisionCalls).toBe(firstCalls);
+  });
 });
