@@ -58,6 +58,11 @@ import {
   writeVisitSimilarityRevision,
 } from '../../producers/visit-resembles-revision.js';
 import { QUEUE_CREATED, QUEUE_STATUS_SET } from '../../queue/events.js';
+import {
+  createDirtySourceQueue,
+  foldGroupBEventIntoQueue,
+  type DirtySourceQueueSnapshot,
+} from '../../recall/content-lane.js';
 import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from '../../recall/events.js';
 import { CAPTURE_EXTRACTION_PRODUCED } from '../../recall/extraction/events.js';
 import { embed as defaultEmbed } from '../../recall/embedder.js';
@@ -207,9 +212,28 @@ const topicRevisionBuilderFor = (algorithm: TopicAlgorithmVersion): TopicRevisio
   }
 };
 
+export interface ConnectionsMaterializer extends Materializer {
+  /**
+   * Stage 5.2 W7 — snapshot of source units that need re-chunking /
+   * re-embedding / recall-index replace. Read-only view; reconciler
+   * workers call `clearDirtySources(ids)` after successfully processing
+   * each entry. Returns deterministically sorted arrays so consumers
+   * can diff snapshots without normalising.
+   */
+  readonly getDirtySources: () => DirtySourceQueueSnapshot;
+  /**
+   * Stage 5.2 W7 — mark specific source units as reconciled. Called
+   * by the (future) content-lane reconciler worker after it has
+   * successfully replaced the source unit's chunks in the recall
+   * index. Latest extraction revisionIds are retained across clears
+   * (see the queue's `clear()` contract).
+   */
+  readonly clearDirtySources: (sourceUnitIds: readonly string[]) => void;
+}
+
 export const createConnectionsMaterializer = (
   deps: CreateConnectionsMaterializerDeps,
-): Materializer => {
+): ConnectionsMaterializer => {
   const topicRevisionStore = deps.topicRevisionStore ?? createTopicRevisionStore(deps.vaultRoot);
   const topicRevisionAlgorithm = deps.topicRevisionAlgorithm ?? TOPIC_UNION_FIND_REVISION_KEY;
   const buildSelectedTopicRevision = topicRevisionBuilderFor(topicRevisionAlgorithm);
@@ -218,6 +242,13 @@ export const createConnectionsMaterializer = (
   const rankerRetrainer =
     deps.rankerRetrainer ??
     ((context) => maybeRetrainClosestVisitRanker({ vaultRoot: deps.vaultRoot, ...context }));
+  // Stage 5.2 W7 — in-memory dirty-source queue. Group B events
+  // (capture.recorded, capture.extraction.produced, recall.tombstone.target)
+  // fold into this queue on every accepted event; the content-lane
+  // reconciler (future PR) drains the queue off the hot path. The
+  // queue itself is allocation-free at fold time — only sourceUnitId
+  // strings are retained.
+  const dirtySourceQueue = createDirtySourceQueue();
   let pending = false;
   let running = false;
   let dirty = false;
@@ -599,6 +630,14 @@ export const createConnectionsMaterializer = (
 
   const onAccepted: Materializer['onAccepted'] = (event) => {
     if (!HANDLES.has(event.type)) return;
+    // Stage 5.2 W7 — accumulate Group B events into the dirty-source
+    // queue before scheduling a drain. Non-Group-B events return false
+    // and don't touch the queue; Group B events mark their sourceUnitId
+    // dirty (or tombstoned) and optionally record the latest extraction
+    // revisionId. No I/O, no chunk/embed work — that's the reconciler's
+    // job. The buildAndWrite drain remains the byte-determinism oracle;
+    // this queue is purely for the off-path content reconciler.
+    foldGroupBEventIntoQueue(dirtySourceQueue, event);
     requestDrain();
   };
 
@@ -641,6 +680,11 @@ export const createConnectionsMaterializer = (
     pending,
   });
 
+  const getDirtySources = (): DirtySourceQueueSnapshot => dirtySourceQueue.snapshot();
+  const clearDirtySources = (sourceUnitIds: readonly string[]): void => {
+    dirtySourceQueue.clear(sourceUnitIds);
+  };
+
   return {
     name: 'connections',
     handles: HANDLES,
@@ -648,5 +692,7 @@ export const createConnectionsMaterializer = (
     catchUp,
     awaitIdle,
     health,
+    getDirtySources,
+    clearDirtySources,
   };
 };
