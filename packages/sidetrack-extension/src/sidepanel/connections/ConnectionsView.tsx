@@ -1,10 +1,8 @@
-import { useEffect, useMemo, useState, type ReactElement } from 'react';
+import { useMemo, useState, type ReactElement } from 'react';
 
 import { ContextPackComposer } from './ContextPackComposer';
 import {
   feedbackRelationKindForEdgeKind,
-  fetchConnectionsEdge,
-  fetchConnectionsNeighbors,
   postUserEngagementRelabeled,
   postUserFlowConfirmed,
   postUserFlowRejected,
@@ -41,6 +39,8 @@ import type {
   ConnectionNodeKind,
   ConnectionsScopedResult,
 } from './types';
+import { useAnchorHistory } from './useAnchorHistory';
+import { useConnectionsEdge, useConnectionsSnapshot } from './useConnectionsSnapshot';
 import {
   formatEntityDisplay,
   formatNodeIdDisplay,
@@ -359,57 +359,74 @@ export const ConnectionsView = ({
   displayCtx,
 }: Props): ReactElement => {
   const ctx: EntityDisplayCtx = displayCtx ?? DEFAULT_DISPLAY_CTX;
-  const [anchor, setAnchor] = useState<string>(initialAnchor);
+  // Anchor history — back/forward stack so drilling into a neighbor
+  // and returning is one click. `history.current` is the anchor the
+  // hook is currently focused on; `history.navigate(next)` pushes
+  // onto the past stack.
+  const history = useAnchorHistory(initialAnchor);
+  const anchor = history.current;
   const [draftAnchor, setDraftAnchor] = useState<string>(initialAnchor);
   const [hops, setHops] = useState<number>(1);
   const [subMode, setSubMode] = useState<SubMode>('linked');
-  const [result, setResult] = useState<ConnectionsScopedResult | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState<boolean>(false);
   const [selectedEdge, setSelectedEdge] = useState<ConnectionEdge | null>(null);
-  const [edgeDetail, setEdgeDetail] = useState<ConnectionEdge | null>(null);
   const [whyVisitId, setWhyVisitId] = useState<string | null>(null);
   const [whyAssertedOnly, setWhyAssertedOnly] = useState<boolean>(false);
 
-  useEffect(() => {
-    if (anchor.trim().length === 0) {
-      setResult(null);
-      setError(null);
-      return;
+  // Snapshot fetching: cached by (anchor, hops), revalidated in the
+  // background when revisited so the user gets instant flips through
+  // history with no perceptible loading state.
+  const { snapshot: rawSnapshot, loading, error, refresh } = useConnectionsSnapshot(anchor, hops);
+  // Edge detail enrichment — companion serves extra metadata (ranker
+  // contributions, etc.) the neighbor scope strips for size.
+  const edgeDetail = useConnectionsEdge(selectedEdge);
+  // Local in-memory mutation of the cached snapshot (topic rename,
+  // engagement relabel) — the snapshot is owned by the cache, so we
+  // keep a transient override map until the next fetch refreshes the
+  // canonical labels.
+  const [labelOverrides, setLabelOverrides] = useState<Record<string, string>>({});
+  const [engagementOverrides, setEngagementOverrides] = useState<Record<string, EngagementClass>>(
+    {},
+  );
+  // Apply override maps to the raw snapshot. Downstream consumers
+  // see the same shape as a raw `ConnectionsScopedResult`, so they
+  // don't need to know about overrides at all.
+  const result = useMemo(() => {
+    if (rawSnapshot === null) return null;
+    if (
+      Object.keys(labelOverrides).length === 0 &&
+      Object.keys(engagementOverrides).length === 0
+    ) {
+      return rawSnapshot;
     }
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
-    fetchConnectionsNeighbors({ nodeId: anchor, hops }).then((r) => {
-      if (cancelled) return;
-      setLoading(false);
-      if (r.ok && r.data !== undefined) {
-        setResult(r.data);
-      } else {
-        setError(r.error ?? 'unknown error');
-        setResult(null);
-      }
-    });
-    return () => {
-      cancelled = true;
+    return {
+      ...rawSnapshot,
+      snapshot: {
+        ...rawSnapshot.snapshot,
+        nodes: rawSnapshot.snapshot.nodes.map((node) => {
+          const labelOverride = labelOverrides[node.id];
+          const engagementOverride = engagementOverrides[node.id];
+          if (labelOverride === undefined && engagementOverride === undefined) return node;
+          const nextMetadata =
+            engagementOverride === undefined
+              ? node.metadata
+              : {
+                  ...node.metadata,
+                  engagement: {
+                    ...((isRecord(node.metadata['engagement'])
+                      ? node.metadata['engagement']
+                      : {}) as Record<string, unknown>),
+                    class: engagementOverride,
+                  },
+                };
+          return {
+            ...node,
+            ...(labelOverride === undefined ? {} : { label: labelOverride }),
+            metadata: nextMetadata,
+          };
+        }),
+      },
     };
-  }, [anchor, hops]);
-
-  useEffect(() => {
-    if (selectedEdge === null) {
-      setEdgeDetail(null);
-      return;
-    }
-    setEdgeDetail(null);
-    let cancelled = false;
-    fetchConnectionsEdge(selectedEdge.id).then((r) => {
-      if (cancelled) return;
-      if (r.ok && r.data !== undefined) setEdgeDetail(r.data);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [selectedEdge]);
+  }, [engagementOverrides, labelOverrides, rawSnapshot]);
 
   const anchorNode = useMemo<ConnectionNode | null>(() => {
     if (result === null) return null;
@@ -462,7 +479,7 @@ export const ConnectionsView = ({
     if (next !== undefined) setDraftAnchor(value);
     setSelectedEdge(null);
     setWhyVisitId(null);
-    setAnchor(value);
+    history.navigate(value);
   };
 
   const selectedWorkstreamAnchor = anchor.startsWith('workstream:') ? anchor : '';
@@ -471,7 +488,7 @@ export const ConnectionsView = ({
     setSelectedEdge(null);
     setWhyVisitId(null);
     setDraftAnchor(nodeId);
-    setAnchor(nodeId);
+    history.navigate(nodeId);
   };
 
   const selectEdge = (edge: ConnectionEdge): void => {
@@ -479,48 +496,18 @@ export const ConnectionsView = ({
     setSelectedEdge(edge);
   };
 
+  // Local overrides for topic-rename + engagement-relabel optimistic
+  // UI. The next snapshot fetch refreshes canonical labels; until
+  // then, the override map applied in `resultWithOverrides` shows
+  // the user their just-renamed value without a round-trip.
   const replaceNodeLabel = (nodeId: string, label: string): void => {
-    setResult((current) => {
-      if (current === null) return null;
-      return {
-        ...current,
-        snapshot: {
-          ...current.snapshot,
-          nodes: current.snapshot.nodes.map((node) =>
-            node.id === nodeId ? { ...node, label } : node,
-          ),
-        },
-      };
-    });
+    setLabelOverrides((current) => ({ ...current, [nodeId]: label }));
   };
-
-  const replaceNodeEngagementClass = (nodeId: string, engagementClass: EngagementClass): void => {
-    setResult((current) => {
-      if (current === null) return null;
-      return {
-        ...current,
-        snapshot: {
-          ...current.snapshot,
-          nodes: current.snapshot.nodes.map((node) => {
-            if (node.id !== nodeId) return node;
-            const currentEngagement = node.metadata['engagement'];
-            const engagement =
-              typeof currentEngagement === 'object' &&
-              currentEngagement !== null &&
-              !Array.isArray(currentEngagement)
-                ? currentEngagement
-                : {};
-            return {
-              ...node,
-              metadata: {
-                ...node.metadata,
-                engagement: { ...engagement, class: engagementClass },
-              },
-            };
-          }),
-        },
-      };
-    });
+  const replaceNodeEngagementClass = (
+    nodeId: string,
+    engagementClass: EngagementClass,
+  ): void => {
+    setEngagementOverrides((current) => ({ ...current, [nodeId]: engagementClass }));
   };
 
   const submitFlowFeedback = async (
@@ -609,13 +596,58 @@ export const ConnectionsView = ({
   return (
     <div className="cx-shell-host bac-connections-view" data-testid="connections-view">
       <div className="cx-anchorbar">
+        <div className="cx-anchorbar-nav">
+          <button
+            type="button"
+            className="cx-anchor-nav-btn"
+            onClick={() => {
+              setSelectedEdge(null);
+              setWhyVisitId(null);
+              history.back();
+            }}
+            disabled={!history.canBack}
+            aria-label="Previous anchor"
+            data-testid="connections-anchor-back"
+            title="Previous anchor (browser-back style)"
+          >
+            ←
+          </button>
+          <button
+            type="button"
+            className="cx-anchor-nav-btn"
+            onClick={() => {
+              setSelectedEdge(null);
+              setWhyVisitId(null);
+              history.forward();
+            }}
+            disabled={!history.canForward}
+            aria-label="Next anchor"
+            data-testid="connections-anchor-forward"
+            title="Next anchor (redo)"
+          >
+            →
+          </button>
+        </div>
         <span className="cx-anchor-label">Anchor</span>
         {anchorNode !== null ? (
           <NodeChip node={anchorNode} state="anchor" ctx={ctx} />
+        ) : anchor.length > 0 && loading ? (
+          <span className="cx-mono cx-dim">resolving anchor…</span>
         ) : (
           <span className="cx-mono cx-dim">no anchor selected</span>
         )}
         <span className="cx-spacer" />
+        <button
+          type="button"
+          className="cx-anchor-nav-btn"
+          onClick={refresh}
+          disabled={anchor.length === 0 || loading}
+          aria-label="Refresh snapshot"
+          data-testid="connections-anchor-refresh"
+          title="Refresh — drop the cache and re-fetch from companion"
+        >
+          ↻
+        </button>
         <HopToggle value={hops} onChange={setHops} />
       </div>
       <div className="cx-modes" role="tablist" aria-label="View mode">
@@ -843,8 +875,8 @@ export const ConnectionsView = ({
                 onTopicRename={submitTopicRename}
                 onEngagementRelabel={submitEngagementRelabel}
                 onTopicClick={(topicId) => {
-                  setAnchor(topicId);
                   setDraftAnchor(topicId);
+                  history.navigate(topicId);
                 }}
                 onVisitClick={(visitId) => {
                   setWhyVisitId(visitId);

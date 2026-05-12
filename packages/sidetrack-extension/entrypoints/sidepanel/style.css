@@ -7863,6 +7863,30 @@ pre.diff {
   text-transform: uppercase; color: var(--ink-3);
 }
 .cx-anchorbar .cx-spacer { flex: 1; }
+/* Stage 5 polish — Connections refactor (Phase C usability):
+   browser-style back/forward + refresh buttons in the anchor bar
+   so drilling into a neighbor and returning is one click. */
+.cx-anchorbar-nav {
+  display: inline-flex; gap: 2px;
+  border: 1px solid var(--rule);
+  border-radius: var(--rad-m);
+  overflow: hidden;
+}
+.cx-anchor-nav-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 24px;
+  padding: 0;
+  border: 0;
+  background: var(--paper-light);
+  color: var(--ink-1);
+  font-family: var(--mono); font-size: 14px;
+  cursor: pointer;
+  user-select: none;
+}
+.cx-anchor-nav-btn:hover:enabled { background: var(--paper-tinted); }
+.cx-anchor-nav-btn:disabled {
+  color: var(--ink-3); cursor: default; opacity: 0.6;
+}
 
 /* hop / filter pills */
 .cx-pill-group {
