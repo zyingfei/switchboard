@@ -389,6 +389,22 @@ export class IncrementalTopicClusterAccumulator {
   }
 
   /**
+   * Stage 5.2 W4 — read the current edge ledger. Used by the
+   * materializer to diff old vs new similarity revisions on a
+   * model-revision flip: edges present in the old revision but
+   * missing from the new one are passed back to removeEdge so the
+   * accumulator's union-find stays consistent. Returns a snapshot
+   * sorted lexicographically by (a, b).
+   */
+  getEdges(): readonly { readonly a: string; readonly b: string; readonly source: 'similarity' | 'user-asserted' }[] {
+    return [...this.edges.values()].sort((left, right) => {
+      const a = compareString(left.a, right.a);
+      if (a !== 0) return a;
+      return compareString(left.b, right.b);
+    });
+  }
+
+  /**
    * Return components keyed by topicId. Singleton components (one
    * member) are filtered out — they're not topics, they're isolated
    * visits. Caller responsible for downstream TopicRevisionTopic

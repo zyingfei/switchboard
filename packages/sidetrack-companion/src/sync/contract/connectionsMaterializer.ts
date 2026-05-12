@@ -66,9 +66,24 @@ import {
 import { runReconcileInWorker } from './connectionsReconcileWorker.js';
 import {
   createEmbedderWarmthTracker,
+  decideHotPathEmbed,
   type EmbedderWarmthTracker,
 } from '../../connections/visitSimilarity.budget.js';
-import { IncrementalTopicClusterAccumulator } from '../../connections/topicClusterer.js';
+import {
+  buildTopicRevisionFromAccumulator,
+  IncrementalTopicClusterAccumulator,
+} from '../../connections/topicClusterer.js';
+import {
+  IncrementalVisitSimilarityIndex,
+  type IncrementalVisitSimilarityIndexOptions,
+} from '../../connections/visitSimilarity.incremental.js';
+import {
+  buildVisitSimilarityIncremental,
+  corpusForVisitEntry,
+  visitKeyForVisitEntry,
+  VISIT_SIMILARITY_DEFAULT_THRESHOLD,
+  VISIT_SIMILARITY_DEFAULT_TOP_K,
+} from '../../connections/visitSimilarity.js';
 import {
   createDirtySourceQueue,
   foldGroupBEventIntoQueue,
@@ -354,6 +369,17 @@ export const createConnectionsMaterializer = (
   // revision flip (re-embedding, model upgrade) can invalidate
   // accumulator state and recompute from the fresh edge set.
   let lastAcceptedSimilarityRevisionId: string | undefined;
+  // Stage 5.2 W3 fast-path — incremental visit similarity index used
+  // when SIDETRACK_CONNECTIONS_HOT_SIMILARITY=1 AND the embedder
+  // warmth + corpus budget pass `decideHotPathEmbed`. Persisted across
+  // drains so each new visit only embeds once.
+  const incrementalSimilarityIndexOptions: IncrementalVisitSimilarityIndexOptions = {
+    threshold: VISIT_SIMILARITY_DEFAULT_THRESHOLD,
+    topK: VISIT_SIMILARITY_DEFAULT_TOP_K,
+  };
+  const incrementalSimilarityIndex = new IncrementalVisitSimilarityIndex(
+    incrementalSimilarityIndexOptions,
+  );
   let pending = false;
   let running = false;
   let dirty = false;
@@ -623,11 +649,75 @@ export const createConnectionsMaterializer = (
       `similarity probe entries=${String(similarityEntries.length)} cacheHit=${String(cachedSimilarityRevision !== null)}`,
     );
     const similarityStartedAtMs = Date.now();
-    const visitSimilarity =
-      cachedSimilarityRevision ??
-      (await buildVisitSimilarity(similarityEntries, deps.embed ?? defaultEmbed));
-    mark('buildVisitSimilarity');
-    if (cachedSimilarityRevision === null) {
+    // Stage 5.2 W3 fast path — when SIDETRACK_CONNECTIONS_HOT_SIMILARITY=1
+    // AND the embedder warmth + corpus budget passes decideHotPathEmbed,
+    // skip the legacy pairwise rebuild + ANN ranker and use the
+    // IncrementalVisitSimilarityIndex for cosine-only top-K. The
+    // resulting revisionId carries a `:incremental` suffix so on-disk
+    // cached revisions stay distinct from the legacy hybrid path.
+    const hotSimilarityMode =
+      process.env['SIDETRACK_CONNECTIONS_HOT_SIMILARITY'] === '1';
+    const hotSimilarityDecision = hotSimilarityMode
+      ? decideHotPathEmbed(
+          embedderWarmthTracker.snapshot(incrementalSimilarityIndex.size()),
+        )
+      : { shouldEmbedOnHotPath: false as const };
+    let visitSimilarity;
+    if (
+      cachedSimilarityRevision !== null &&
+      !hotSimilarityDecision.shouldEmbedOnHotPath
+    ) {
+      visitSimilarity = cachedSimilarityRevision;
+    } else if (hotSimilarityDecision.shouldEmbedOnHotPath) {
+      // Embed only entries not yet in the index. The legacy path embeds
+      // every entry every drain; the fast path amortises across drains.
+      const newEntries = similarityEntries.filter(
+        (entry) => !incrementalSimilarityIndex.has(visitKeyForVisitEntry(entry)),
+      );
+      const embeddingsByVisitKey = new Map<string, Float32Array>();
+      if (newEntries.length > 0) {
+        const texts = newEntries.map((e) => `passage: ${corpusForVisitEntry(e)}`);
+        try {
+          const embedded = await (deps.embed ?? defaultEmbed)(texts);
+          for (let i = 0; i < newEntries.length; i += 1) {
+            const embedding = embedded[i];
+            if (embedding !== undefined) {
+              embeddingsByVisitKey.set(visitKeyForVisitEntry(newEntries[i]!), embedding);
+            }
+          }
+        } catch (error) {
+          // Fast-path embed failure: log + fall back to legacy path.
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[connections] W3 fast-path embed failed; falling back: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          visitSimilarity = await buildVisitSimilarity(
+            similarityEntries,
+            deps.embed ?? defaultEmbed,
+          );
+        }
+      }
+      if (visitSimilarity === undefined) {
+        visitSimilarity = buildVisitSimilarityIncremental({
+          index: incrementalSimilarityIndex,
+          entries: similarityEntries,
+          embeddingsByVisitKey,
+          options: { threshold: VISIT_SIMILARITY_DEFAULT_THRESHOLD, topK: VISIT_SIMILARITY_DEFAULT_TOP_K },
+        });
+      }
+      mark(
+        `buildVisitSimilarityIncremental newEmbedded=${String(newEntries.length)} indexSize=${String(incrementalSimilarityIndex.size())}`,
+      );
+    } else {
+      visitSimilarity = await buildVisitSimilarity(
+        similarityEntries,
+        deps.embed ?? defaultEmbed,
+      );
+      mark('buildVisitSimilarity');
+    }
+    if (cachedSimilarityRevision === null && !hotSimilarityDecision.shouldEmbedOnHotPath) {
       // Stage 5.2 W3 wiring — record embedder latency only on cache miss
       // (cache hits don't exercise the embedder). Divide by entry count
       // for a per-embed proxy when entries > 0; treat the full pass as
@@ -645,16 +735,32 @@ export const createConnectionsMaterializer = (
     // the new revision via removeEdge so the accumulator's union-find
     // stays accurate.
     if (lastAcceptedSimilarityRevisionId !== visitSimilarity.revisionId) {
-      // Optional cleanup: the topic accumulator's internal edge ledger
-      // doesn't expose iteration, so on flip we drop the accumulator
-      // entirely and re-seed from the new edges. This matches the
-      // design doc's "full re-cluster on model revision flip" cadence.
-      // For incremental rebuilds the accumulator already supports
-      // removeEdge — that path activates once the reconciliation worker
-      // produces a delta instead of a full revision.
-      // (No-op for now; full re-seed happens implicitly via addVisit /
-      // addSimilarityEdge below since the accumulator is allocated per
-      // materializer instance and edges accumulate idempotently.)
+      // Stage 5.2 W4 — revision-flip diff. When the similarity producer
+      // emits a new revisionId, edges present in the old revision but
+      // missing from the new one route through removeEdge so the
+      // union-find stays consistent. This is the "removal-aware
+      // fallback" from the design doc, now actually wired (the
+      // accumulator's getEdges() exposes the ledger for diffing).
+      const prevSimilarityEdges = topicAccumulator
+        .getEdges()
+        .filter((edge) => edge.source === 'similarity');
+      const newSimilarityPairs = new Set<string>(
+        visitSimilarity.edges.map((e) =>
+          e.fromVisitKey < e.toVisitKey
+            ? `${e.fromVisitKey} ${e.toVisitKey}`
+            : `${e.toVisitKey} ${e.fromVisitKey}`,
+        ),
+      );
+      let removedCount = 0;
+      for (const edge of prevSimilarityEdges) {
+        const sig =
+          edge.a < edge.b ? `${edge.a} ${edge.b}` : `${edge.b} ${edge.a}`;
+        if (!newSimilarityPairs.has(sig)) {
+          topicAccumulator.removeEdge(edge.a, edge.b);
+          removedCount += 1;
+        }
+      }
+      mark(`topicAccumulator.revisionFlip removed=${String(removedCount)}`);
       lastAcceptedSimilarityRevisionId = visitSimilarity.revisionId;
     }
     for (const entry of similarityEntries) {
@@ -689,16 +795,39 @@ export const createConnectionsMaterializer = (
       cosineThreshold: DEFAULT_TOPIC_COSINE_THRESHOLD,
       algorithmVersion: topicRevisionAlgorithm,
     });
-    const topicRevision =
-      previousTopicRevision !== null && previousTopicRevision.revisionId === expectedTopicRevisionId
-        ? previousTopicRevision
-        : await buildSelectedTopicRevision({
-            visits: timelineDays.flatMap((day) => day.entries.map(topicVisitFromEntry)),
-            visitSimilarity,
-            ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
-          });
+    // Stage 5.2 W4 fast path — when SIDETRACK_CONNECTIONS_HOT_TOPICS=1
+    // AND the topic accumulator has at least one cluster, use
+    // buildTopicRevisionFromAccumulator (byte-equal output modulo
+    // producedAt with buildSelectedTopicRevision over the same inputs).
+    // The accumulator has been kept in sync with the similarity edges
+    // above via the revision-flip diff + per-drain addSimilarityEdge.
+    const hotTopicsMode = process.env['SIDETRACK_CONNECTIONS_HOT_TOPICS'] === '1';
+    const useTopicAccumulatorFastPath =
+      hotTopicsMode && (await topicAccumulator.getComponents()).length > 0;
+    let topicRevision;
+    if (
+      previousTopicRevision !== null &&
+      previousTopicRevision.revisionId === expectedTopicRevisionId
+    ) {
+      topicRevision = previousTopicRevision;
+    } else if (useTopicAccumulatorFastPath) {
+      const topicVisits = timelineDays.flatMap((day) => day.entries.map(topicVisitFromEntry));
+      topicRevision = await buildTopicRevisionFromAccumulator({
+        accumulator: topicAccumulator,
+        visits: topicVisits,
+        visitSimilarity,
+        ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
+      });
+      mark('buildTopicRevisionFromAccumulator (w4 fast path)');
+    } else {
+      topicRevision = await buildSelectedTopicRevision({
+        visits: timelineDays.flatMap((day) => day.entries.map(topicVisitFromEntry)),
+        visitSimilarity,
+        ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
+      });
+    }
     mark(
-      `buildSelectedTopicRevision cacheHit=${String(topicRevision === previousTopicRevision)}`,
+      `topicRevision cacheHit=${String(topicRevision === previousTopicRevision)} fastPath=${String(useTopicAccumulatorFastPath)}`,
     );
     if (topicRevision !== previousTopicRevision) {
       await topicRevisionStore.putActiveRevision(topicRevision);

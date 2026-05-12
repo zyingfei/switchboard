@@ -89,7 +89,10 @@ const hostnameForUrl = (url: string): string => {
   }
 };
 
-const corpusForEntry = (entry: VisitSimilarityEntry): string => {
+// Stage 5.2 W3 fast-path needs both helpers to embed + key new entries
+// from outside this module. They're stateless + cheap; expose as named
+// exports so the materializer can compute pre-embedding inputs.
+export const corpusForVisitEntry = (entry: VisitSimilarityEntry): string => {
   const url = entry.canonicalUrl ?? entry.url;
   return normalizeSpaces(
     [
@@ -100,8 +103,13 @@ const corpusForEntry = (entry: VisitSimilarityEntry): string => {
   );
 };
 
-const visitKeyForEntry = (entry: VisitSimilarityEntry): string =>
+export const visitKeyForVisitEntry = (entry: VisitSimilarityEntry): string =>
   stripFragmentAndTrailingSlash(entry.canonicalUrl ?? entry.url);
+
+// Internal aliases for in-module call sites (preserve existing
+// names below).
+const corpusForEntry = corpusForVisitEntry;
+const visitKeyForEntry = visitKeyForVisitEntry;
 
 const preferNewEntry = (
   existing: NormalizedVisit,
