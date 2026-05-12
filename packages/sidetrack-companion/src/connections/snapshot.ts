@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
@@ -37,8 +38,11 @@ import type { Candidate } from '../ranker/types.js';
 import { projectSnippetLineage } from '../snippets/projection.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../tabsession/events.js';
-import type { TabSessionProjection } from '../tabsession/projection.js';
-import type { UrlProjection } from '../urls/projection.js';
+import {
+  serializeTabSessionProjection,
+  type TabSessionProjection,
+} from '../tabsession/projection.js';
+import { serializeUrlProjection, type UrlProjection } from '../urls/projection.js';
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import { THREAD_UPSERTED, isThreadUpsertedPayload } from '../threads/events.js';
 import {
@@ -2298,7 +2302,51 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
   // -------------------------------------------------------------------
   // Materialize: convert accumulators to deterministic snapshot.
   // -------------------------------------------------------------------
-  return snapshotFromAccumulators(input.scope, nodes, edges, maxObservedAt);
+  const base = snapshotFromAccumulators(input.scope, nodes, edges, maxObservedAt);
+  // Stage 5.2 R1 — embed the URL and tab-session projections so HTTP
+  // routes serve from the committed snapshot. tabSessionProjection is
+  // always provided by the materializer; urlProjection is optional on
+  // ConnectionsInput for back-compat with older callers.
+  const tabSessionProjection = serializeTabSessionProjection(input.tabSessionProjection);
+  const urlProjection =
+    input.urlProjection === undefined ? undefined : serializeUrlProjection(input.urlProjection);
+  // Stage 5.2 R4 — stable per-snapshot revision id over byte-deterministic
+  // contents. Cheap hash so side panel + resolver can detect stale reads
+  // without diffing the whole snapshot.
+  const snapshotRevision = computeSnapshotRevision({
+    updatedAt: base.updatedAt,
+    nodeCount: base.nodeCount,
+    edgeCount: base.edgeCount,
+    urlProjectionKeyCount:
+      urlProjection === undefined ? 0 : Object.keys(urlProjection.byCanonicalUrl).length,
+    tabSessionProjectionKeyCount: Object.keys(tabSessionProjection.bySessionId).length,
+  });
+  return {
+    ...base,
+    ...(urlProjection === undefined ? {} : { urlProjection }),
+    tabSessionProjection,
+    snapshotRevision,
+  };
+};
+
+const computeSnapshotRevision = (parts: {
+  readonly updatedAt: string;
+  readonly nodeCount: number;
+  readonly edgeCount: number;
+  readonly urlProjectionKeyCount: number;
+  readonly tabSessionProjectionKeyCount: number;
+}): string => {
+  const hasher = createHash('sha256');
+  hasher.update(parts.updatedAt);
+  hasher.update('|');
+  hasher.update(String(parts.nodeCount));
+  hasher.update('|');
+  hasher.update(String(parts.edgeCount));
+  hasher.update('|');
+  hasher.update(String(parts.urlProjectionKeyCount));
+  hasher.update('|');
+  hasher.update(String(parts.tabSessionProjectionKeyCount));
+  return hasher.digest('hex').slice(0, 16);
 };
 
 // ---------------------------------------------------------------------------

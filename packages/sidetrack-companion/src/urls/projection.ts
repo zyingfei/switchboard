@@ -256,6 +256,17 @@ export const serializeUrlProjection = (projection: UrlProjection): SerializedUrl
   byCanonicalUrl: Object.fromEntries(projection.byCanonicalUrl),
 });
 
+export const deserializeUrlProjection = (
+  serialized: SerializedUrlProjection,
+): UrlProjection => ({
+  schemaVersion: serialized.schemaVersion,
+  byCanonicalUrl: new Map(
+    Object.entries(serialized.byCanonicalUrl).sort(([left], [right]) =>
+      compareString(left, right),
+    ),
+  ),
+});
+
 export const urlInbox = (
   projection: UrlProjection,
   input: { readonly limit: number; readonly offset: number },
