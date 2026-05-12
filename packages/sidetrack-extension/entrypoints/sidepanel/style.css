@@ -561,15 +561,17 @@ button:disabled {
   color: var(--ink-2);
 }
 
-/* Action bar under the Current Tab badge. Primary "Yes" stands out;
-   secondary "Pick another…" + the ⋯ overflow are softer. The overflow
-   uses a native <details> for low-JS click-outside-to-dismiss. */
+/* Action bar under the Current Tab badge. Same 2x2 grid as the
+   InboxCard + SuggestionBanner so all three surfaces read the same
+   shape regardless of how many cards stack. Primary "Yes, that's
+   right" still stands out via .primary; the other three are equal-
+   weight outlined buttons. */
 .tab-attribution-card-actions {
-  display: flex;
-  align-items: center;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
   gap: 6px;
   padding: 6px 0 0 0;
-  flex-wrap: wrap;
+  align-items: stretch;
 }
 .tab-attribution-card-action {
   background: transparent;
@@ -798,16 +800,16 @@ button:disabled {
 
 .tab-session-suggestion-actions {
   display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  grid-template-columns: 1fr 1fr;
   gap: 6px;
-  align-items: center;
+  align-items: stretch;
 }
 
 .tab-session-actions {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: 1fr 1fr;
   gap: 6px;
-  align-items: center;
+  align-items: stretch;
 }
 
 .tab-session-picker select {
