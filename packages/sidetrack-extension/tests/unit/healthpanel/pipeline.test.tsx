@@ -91,6 +91,72 @@ describe('HealthPanel pipeline strip', () => {
     });
   });
 
+  it('shows the ranker snapshot age when workGraph.ranker.loadStatus=ready', async () => {
+    vi.unstubAllGlobals();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () =>
+          ({
+            data: mkHealth({
+              workGraph: {
+                ranker: {
+                  activeRevisionId: 'rev_42',
+                  loadStatus: 'ready' as const,
+                  trainedAt: Date.now() - 60 * 60_000,
+                  retrainSkipReason: null,
+                  retrainNewLabelCount: 0,
+                },
+              },
+            }),
+          }),
+      })),
+    );
+
+    render(<HealthPanel onClose={vi.fn()} companionPort={17373} bridgeKey="key" />);
+
+    await waitFor(() => {
+      const stage = screen.getByTestId('hp-pipeline-stage-ranker');
+      expect(stage.className).toContain('is-ok');
+      expect(stage.textContent).toContain('snapshot');
+    });
+  });
+
+  it('marks ranker stage warn when loadStatus=missing with a skip reason', async () => {
+    vi.unstubAllGlobals();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () =>
+          ({
+            data: mkHealth({
+              workGraph: {
+                ranker: {
+                  activeRevisionId: null,
+                  loadStatus: 'missing' as const,
+                  trainedAt: null,
+                  retrainSkipReason: 'no-labels',
+                  retrainNewLabelCount: 0,
+                },
+              },
+            }),
+          }),
+      })),
+    );
+
+    render(<HealthPanel onClose={vi.fn()} companionPort={17373} bridgeKey="key" />);
+
+    await waitFor(() => {
+      const stage = screen.getByTestId('hp-pipeline-stage-ranker');
+      expect(stage.className).toContain('is-warn');
+      expect(stage.textContent).toContain('no-labels');
+    });
+  });
+
   it('flags the vault stage err when writable=false', async () => {
     vi.unstubAllGlobals();
     vi.stubGlobal(

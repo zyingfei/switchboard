@@ -703,28 +703,29 @@ export const maybeRetrainClosestVisitRanker = async ({
   }
 };
 
-// Stage 5 polish — Worker-thread variant of maybeRetrainClosestVisit
-// Ranker. The LightGBM training loop is the most CPU-heavy thing the
-// companion does (≥1s on dogfood vaults, longer on larger ones), and
-// running it inline on the HTTP request handler thread starves
-// /v1/status + every other warm-path poll. Spawning a worker moves
-// the math off the main event loop so the cold (training) and warm
-// (status / suggestions / inbox) paths are physically separate.
+// Stage 5 polish — Worker-thread spawn helper for ranker retrain.
+// The LightGBM training math AND the cold-path file reads
+// (readMerged, snapshot readCurrent) all run inside the worker so
+// /v1/status + every other warm-path poll stay responsive while
+// retrain is in flight.
+//
+// The worker accepts a minimal serializable job (vaultRoot + knobs),
+// constructs its own EventLog + connectionsStore inside the worker
+// context, and runs the full retrain pipeline. Mirrors the
+// `connectionsReconcileWorker.entry.ts` pattern that already
+// background-runs the materializer drain.
 //
 // The worker entry lives at `./retrain.worker.js` after build (the
-// matching .ts file in this directory). We pass the input via
-// `workerData`, which uses structuredClone — only the HTTP route's
-// real call shape (vaultRoot / merged / snapshot / threshold knobs)
-// is serializable, function overrides like `train`, `readState`, etc.
-// are NOT. Those defaults are picked up by the worker's own imports,
-// so leaving them off the input is the *expected* code path.
-//
-// readMerged() still runs on the main thread before the worker spawn
-// (cold-path file read + parse). A follow-up will push that into the
-// worker too, so the request handler returns immediately and the
-// status endpoint can poll for completion.
+// matching .ts file in this directory).
+export interface RunMaybeRetrainInWorkerInput {
+  readonly vaultRoot: string;
+  readonly threshold?: number;
+  readonly randomNegativeCandidatesPerPositive?: number;
+  readonly trainOptions?: TrainRankerOptions;
+}
+
 export const runMaybeRetrainInWorker = async (
-  input: MaybeRetrainClosestVisitRankerInput,
+  input: RunMaybeRetrainInWorkerInput,
 ): Promise<RankerRetrainResult> => {
   // Lazy-import worker_threads so the dual-purpose module (re-exported
   // for unit tests in addition to the production code path) doesn't

@@ -4654,35 +4654,49 @@ const routes: readonly RouteDefinition[] = [
         'randomNegativeCandidatesPerPositive',
       );
       const trainNumRound = optionalFiniteNumber(body['numRound'], 'numRound');
-      const snapshot = await context.connectionsStore.readCurrent();
-      if (snapshot === null) {
-        throw new HttpRouteError(
-          409,
-          'CONNECTIONS_SNAPSHOT_MISSING',
-          'Connections snapshot is not ready.',
-        );
-      }
-      // Stage 5 polish — route the retrain call through the worker
-      // helper so the LightGBM training math runs off the main event
-      // loop. /v1/status + every other warm-path poll stay
-      // responsive while retrain is in flight.
+      // Stage 5 polish — route through the worker helper so BOTH the
+      // cold-path file reads (readMerged + readCurrent) AND the
+      // LightGBM training math run off the main event loop. /v1/status
+      // + every other warm-path poll stay responsive while retrain is
+      // in flight. The handler now returns to the request body only
+      // after the worker round-trip, but it never executes any
+      // CPU-heavy or I/O-heavy work on its own thread.
       // SIDETRACK_RANKER_RETRAIN_INLINE=1 opts back into the legacy
       // inline path for fixtures + tests that don't carry a built
       // worker bundle.
-      const retrainInput = {
-        vaultRoot,
-        merged: await context.eventLog.readMerged(),
-        snapshot,
-        ...(threshold === undefined ? {} : { threshold }),
-        ...(randomNegativeCandidatesPerPositive === undefined
-          ? {}
-          : { randomNegativeCandidatesPerPositive }),
-        ...(trainNumRound === undefined ? {} : { trainOptions: { numRound: trainNumRound } }),
-      };
-      const result =
-        process.env['SIDETRACK_RANKER_RETRAIN_INLINE'] === '1'
-          ? await maybeRetrainClosestVisitRanker(retrainInput)
-          : await runMaybeRetrainInWorker(retrainInput);
+      const trainOptions = trainNumRound === undefined ? undefined : { numRound: trainNumRound };
+      let result: Awaited<ReturnType<typeof maybeRetrainClosestVisitRanker>>;
+      if (process.env['SIDETRACK_RANKER_RETRAIN_INLINE'] === '1') {
+        // Inline path also gets called for tests, which inject
+        // `context.eventLog` + `context.connectionsStore` directly.
+        const snapshot = await context.connectionsStore.readCurrent();
+        if (snapshot === null) {
+          throw new HttpRouteError(
+            409,
+            'CONNECTIONS_SNAPSHOT_MISSING',
+            'Connections snapshot is not ready.',
+          );
+        }
+        result = await maybeRetrainClosestVisitRanker({
+          vaultRoot,
+          merged: await context.eventLog.readMerged(),
+          snapshot,
+          ...(threshold === undefined ? {} : { threshold }),
+          ...(randomNegativeCandidatesPerPositive === undefined
+            ? {}
+            : { randomNegativeCandidatesPerPositive }),
+          ...(trainOptions === undefined ? {} : { trainOptions }),
+        });
+      } else {
+        result = await runMaybeRetrainInWorker({
+          vaultRoot,
+          ...(threshold === undefined ? {} : { threshold }),
+          ...(randomNegativeCandidatesPerPositive === undefined
+            ? {}
+            : { randomNegativeCandidatesPerPositive }),
+          ...(trainOptions === undefined ? {} : { trainOptions }),
+        });
+      }
       if (result.status === 'trained') {
         await context.refreshConnections?.();
       }

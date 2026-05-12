@@ -1,38 +1,29 @@
-import { access, mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
-import type { ConnectionsSnapshot } from '../connections/types.js';
-import type { AcceptedEvent } from '../sync/causal.js';
 import { runMaybeRetrainInWorker } from './retrain.js';
 
-// Empty snapshot — no edges, no nodes. With no feedback events either,
-// the retrain plan should land on `no-labels` skip immediately. That's
-// enough to prove the worker spawns, runs the planner, and round-trips
-// a result without crashing.
-const EMPTY_SNAPSHOT: ConnectionsSnapshot = {
-  scope: {},
-  nodes: [],
-  edges: [],
-  updatedAt: '2026-05-12T20:00:00.000Z',
-  nodeCount: 0,
-  edgeCount: 0,
-};
+// Worker integration test. Vitest runs off src/ which does not have
+// the compiled `retrain.worker.js` next to retrain.js, so the test
+// gracefully skips unless `npm run build` produced the dist bundle
+// AND the test environment was configured to load the worker from
+// there. The post-build path is exercised by the production runtime;
+// this test pins the contract.
 
 describe('ranker retrain worker', () => {
   let vaultRoot: string;
   let workerBundleAvailable = false;
 
   beforeAll(async () => {
-    // The worker spawns from the compiled `retrain.worker.js` next to
-    // `retrain.js`. Vitest runs off src/ which has the .ts file but
-    // not the compiled .js, so this test only runs when a fresh
-    // `npm run build` has produced the dist bundle. Mirror that
-    // gating here — production code (post-build) always has the .js
-    // file, but the unit suite without a build step does not.
+    // Worker entry is sibling to retrain.js at runtime — the
+    // production path uses `new URL('./retrain.worker.js', import.meta.url)`
+    // which resolves relative to the calling file. In the test
+    // environment (vitest from src/) the .js sibling doesn't exist
+    // unless a build has been run; skip the suite cleanly when absent.
     const here = dirname(fileURLToPath(import.meta.url));
     try {
       await access(join(here, 'retrain.worker.js'));
@@ -44,24 +35,36 @@ describe('ranker retrain worker', () => {
 
   beforeEach(async () => {
     vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-retrain-worker-'));
+    // Worker constructs its own connectionsStore via readCurrent;
+    // seed an empty snapshot file so the worker doesn't bail with
+    // "snapshot is not ready" before exercising the planner.
+    const dir = join(vaultRoot, '_BAC', 'connections');
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      join(dir, 'current.json'),
+      JSON.stringify({
+        scope: {},
+        nodes: [],
+        edges: [],
+        updatedAt: '2026-05-12T20:00:00.000Z',
+        nodeCount: 0,
+        edgeCount: 0,
+      }),
+    );
   });
 
   afterEach(async () => {
     await rm(vaultRoot, { recursive: true, force: true });
   });
 
-  it('round-trips an empty-input retrain through the worker thread (post-build only)', async () => {
+  it('runs the retrain pipeline end-to-end inside a worker (post-build only)', async () => {
     if (!workerBundleAvailable) {
       return;
     }
-    const merged: readonly AcceptedEvent[] = [];
-    const result = await runMaybeRetrainInWorker({
-      vaultRoot,
-      merged,
-      snapshot: EMPTY_SNAPSHOT,
-    });
-    // Acceptable skip outcomes for an empty input — proves the worker
-    // spawned, ran the planner, and round-tripped a structured result.
+    const result = await runMaybeRetrainInWorker({ vaultRoot });
+    // With no feedback events seeded, the planner should skip with a
+    // structural reason — exercises the entire spawn → readMerged →
+    // readCurrent → planRetrain round-trip.
     expect(result.status).toBe('skipped');
     if (result.status === 'skipped') {
       expect(['no-labels', 'unchanged', 'no-training-candidates']).toContain(result.reason);

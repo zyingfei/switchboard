@@ -74,6 +74,20 @@ interface SyncSummary {
   readonly materializers?: Record<string, MaterializerHealth>;
 }
 
+interface WorkGraphRankerHealth {
+  readonly activeRevisionId: string | null;
+  readonly loadStatus: 'missing' | 'ready' | 'invalid-model';
+  // Epoch ms when the active ranker snapshot was trained. Drives the
+  // "ranker · snapshot Xh ago" detail line in the pipeline strip.
+  readonly trainedAt: number | null;
+  readonly retrainSkipReason: string | null;
+  readonly retrainNewLabelCount: number;
+}
+
+interface WorkGraphHealth {
+  readonly ranker: WorkGraphRankerHealth;
+}
+
 interface HealthReport {
   readonly uptimeSec: number;
   readonly vault: {
@@ -81,6 +95,7 @@ interface HealthReport {
     readonly writable: boolean;
     readonly sizeBytes: number | null;
   };
+  readonly workGraph?: WorkGraphHealth;
   readonly capture: {
     readonly lastByProvider: Record<string, string | null>;
     readonly queueDepthHint: number | null;
@@ -377,12 +392,33 @@ export function HealthPanel({
         : recallStatus === undefined
           ? `${formatCount(report.recall.entryCount)} vectors`
           : `${recallStatus} · ${formatCount(report.recall.entryCount)} vectors`;
-    // Ranker stage proxies on the snapshot's recall activity for now —
-    // we don't yet have a dedicated ranker-snapshot timestamp in the
-    // health report. Surfaced as a placeholder so the stage is
-    // visible; backend follow-up will populate it with real data.
-    const rankerStatus: PipelineStatus = 'idle';
-    const rankerDetail = 'snapshot timestamp TBD';
+    // Ranker stage — driven by the workGraph health block exposed at
+    // /v1/system/health. `loadStatus = 'ready'` means an active
+    // snapshot is loaded; `trainedAt` is the epoch-ms timestamp of
+    // the last train. We show the snapshot age + the most recent
+    // skip reason so the user can tell whether the planner has been
+    // running but choosing not to retrain.
+    const rankerHealth = report.workGraph?.ranker;
+    const rankerStatus: PipelineStatus =
+      rankerHealth === undefined
+        ? 'idle'
+        : rankerHealth.loadStatus === 'ready'
+          ? 'ok'
+          : rankerHealth.loadStatus === 'invalid-model'
+            ? 'err'
+            : 'warn';
+    const rankerDetail =
+      rankerHealth === undefined
+        ? 'workGraph not reported'
+        : rankerHealth.loadStatus === 'ready' && rankerHealth.trainedAt !== null
+          ? `snapshot ${formatRelative(new Date(rankerHealth.trainedAt).toISOString())}`
+          : rankerHealth.loadStatus === 'missing'
+            ? rankerHealth.retrainSkipReason === null
+              ? 'no snapshot yet'
+              : `pending · ${rankerHealth.retrainSkipReason}`
+            : rankerHealth.loadStatus === 'invalid-model'
+              ? 'snapshot invalid'
+              : 'ready';
     const relay = report.sync?.relay;
     const syncStatus: PipelineStatus =
       relay === undefined
