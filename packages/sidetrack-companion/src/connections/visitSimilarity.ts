@@ -245,6 +245,24 @@ const indexEntriesForVisits = (
     ];
   });
 
+// Stage 5.2 W3 — expose the revisionId computation so the materializer
+// can compute the expected id and skip buildVisitSimilarity entirely
+// when a revision with the same inputs already exists on disk. The
+// hash is byte-deterministic over (model + threshold + topK + gate +
+// per-visit corpus/focus), so two runs with the same input set yield
+// the same revisionId.
+export const computeVisitSimilarityRevisionId = (
+  entries: readonly VisitSimilarityEntry[],
+  options: BuildVisitSimilarityOptions = {},
+): string => {
+  const threshold = clampThreshold(options.threshold);
+  const topK = clampTopK(options.topK);
+  const engagementGateMs = clampEngagementGate(options.engagementGateMs);
+  const modelRevision = RECALL_MODEL.revision;
+  const visits = normalizeEntries(entries);
+  return revisionIdFor({ modelRevision, threshold, topK, engagementGateMs, visits });
+};
+
 export const buildVisitSimilarity = async (
   entries: readonly VisitSimilarityEntry[],
   embed: VisitSimilarityEmbedder,

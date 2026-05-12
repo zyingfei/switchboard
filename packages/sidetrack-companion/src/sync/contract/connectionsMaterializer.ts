@@ -19,6 +19,7 @@ import {
 import { buildHdbscanTopicRevision } from '../../connections/hdbscanClusterer.js';
 import {
   buildVisitSimilarity,
+  computeVisitSimilarityRevisionId,
   type VisitSimilarityEmbedder,
 } from '../../connections/visitSimilarity.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
@@ -51,7 +52,10 @@ import {
 } from '../../producers/topic-revision.js';
 import { loadRankerModel, predictRanker, type LightGBMModel } from '../../ranker/predict.js';
 import { maybeRetrainClosestVisitRanker, type RankerRetrainer } from '../../ranker/retrain.js';
-import { writeVisitSimilarityRevision } from '../../producers/visit-resembles-revision.js';
+import {
+  readVisitSimilarityRevision,
+  writeVisitSimilarityRevision,
+} from '../../producers/visit-resembles-revision.js';
 import { QUEUE_CREATED, QUEUE_STATUS_SET } from '../../queue/events.js';
 import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from '../../recall/events.js';
 import { CAPTURE_EXTRACTION_PRODUCED } from '../../recall/extraction/events.js';
@@ -364,11 +368,23 @@ export const createConnectionsMaterializer = (
     });
     await engagementClassStore.putRevision(engagementClassRevision);
     const timelineDays = enrichTimelineDaysWithEngagement(rawTimelineDays, engagementInputs);
-    const visitSimilarity = await buildVisitSimilarity(
-      timelineDays.flatMap((day) => day.entries),
-      deps.embed ?? defaultEmbed,
+    // Stage 5.2 W3 — skip-gate the most expensive pass. The revisionId
+    // is a hash over (model + threshold + topK + gate + per-visit
+    // corpus/focus). If the same set of visits has already been
+    // processed, the on-disk revision is reusable byte-for-byte — no
+    // need to re-embed.
+    const similarityEntries = timelineDays.flatMap((day) => day.entries);
+    const expectedSimilarityRevisionId = computeVisitSimilarityRevisionId(similarityEntries);
+    const cachedSimilarityRevision = await readVisitSimilarityRevision(
+      deps.vaultRoot,
+      expectedSimilarityRevisionId,
     );
-    await writeVisitSimilarityRevision(deps.vaultRoot, visitSimilarity);
+    const visitSimilarity =
+      cachedSimilarityRevision ??
+      (await buildVisitSimilarity(similarityEntries, deps.embed ?? defaultEmbed));
+    if (cachedSimilarityRevision === null) {
+      await writeVisitSimilarityRevision(deps.vaultRoot, visitSimilarity);
+    }
     const previousTopicRevision = await topicRevisionStore.readActiveRevision();
     const topicRevision = await buildSelectedTopicRevision({
       visits: timelineDays.flatMap((day) => day.entries.map(topicVisitFromEntry)),
