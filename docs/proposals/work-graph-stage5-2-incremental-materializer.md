@@ -146,18 +146,28 @@ table (M6 in the migration plan below) is a declarative mapping from
 event type → set of affected slices; the incremental materializer reads
 that table and re-projects only the named slices.
 
-A helpful taxonomy for both halves:
+A helpful taxonomy for both halves. **"Append-only" does not always mean
+"O(1) fold."** Timeline/engagement-style metadata folds cheaply per
+event. Content/capture/extraction streams are append-only facts whose
+*derived* work (chunking, embedding, recall index, content-similarity)
+is heavy and belongs in a dedicated reconciliation lane.
 
-| Append-only LEAF streams (fold in O(1) forever) |
+| Group A — O(1) LEAF folds (hot-path safe) |
 |---|
-| `browser.timeline.observed` |
-| `engagement.interval.observed` |
-| `engagement.session.aggregated` |
-| `selection.copied` / `selection.pasted` |
-| `visual.fingerprint.observed` |
-| `capture.recorded` / `capture.extraction.produced` |
-| `coding.tick.observed` / `coding.session.turn.observed` / `coding.session.started` |
-| `dispatch.recorded` |
+| `browser.timeline.observed` — patch one `byCanonicalUrl` row + one `bySessionId` row |
+| `engagement.interval.observed` — fold into per-`visitId` accumulator |
+| `engagement.session.aggregated` — same |
+| `selection.copied` / `selection.pasted` — metadata-only; per-visit counter |
+| `visual.fingerprint.observed` — per-`visitId` row |
+| `coding.tick.observed` / `coding.session.turn.observed` / `coding.session.started` — per-session row |
+| `dispatch.recorded` — per-dispatch row |
+
+| Group B — heavy source streams (mark dirty, enqueue reconciliation) |
+|---|
+| `capture.recorded` — mark `sourceUnit` dirty; enqueue recall + content-similarity rebuild |
+| `capture.extraction.produced` — mark `extractionRevision` + `sourceUnit` dirty; reuse embeddings by `embedTextHash` |
+| (future) `page.content.extracted` — same shape as `capture.extraction.produced` |
+| (future) content-similarity source units — same shape |
 
 | Retroactive MUTATORS (invalidate declared slices) |
 |---|
@@ -169,6 +179,11 @@ A helpful taxonomy for both halves:
 | `queue.created`, `queue.statusSet` |
 | `dispatch.linked` |
 | `recall.tombstone.target` |
+
+Group B is what the **content / recall index lane** (W7 below) handles.
+Workstream/user-organization mutators should NOT trigger chunk/embed
+work; only Group B inserts + `embeddingModelRevision` / `chunkerVersion`
+upgrades do.
 
 ## Why the current design chose batch rebuild
 
@@ -301,13 +316,14 @@ re-grounds them. A byte-equality property test (random event sequence
 
 | Sub-model | Hot path (per event) | Reconciliation (periodic) |
 |---|---|---|
-| **Engagement classifier** | Fold the new event into `engagementByVisit[visitId]`. Update visit's class if threshold crossed. O(1). | Rebuild from scratch every 30 min for drift correction. |
-| **URL projection patch** | Update `byCanonicalUrl[url]` row for the new event's canonical URL. O(1). | Full `projectUrls(merged)` rebuild every 30 min. |
-| **Tab-session projection patch** | Same — patch `bySessionId[tabSessionId]`. O(1). | Full `projectTabSessions(merged)` rebuild every 30 min. |
-| **Visit similarity** | If event is `browser.timeline.observed` with a new visit: embed + top-K insert into the in-memory ANN index. O(K log N). | Full pairwise rebuild every 60 min OR on demand. |
-| **Topic clustering** | If new similarity edges link the new visit to existing components, union-find merge. O(1) amortized. | Full re-cluster every 60 min. |
+| **Engagement classifier** (Group A) | Fold into `engagementByVisit[visitId]`. Update visit's class if threshold crossed. O(1). | Rebuild from scratch every 30 min for drift correction. |
+| **URL projection patch** (Group A) | Update `byCanonicalUrl[url]` row for the new event's canonical URL. O(1). | Full `projectUrls(merged)` rebuild every 30 min. |
+| **Tab-session projection patch** (Group A) | Same — patch `bySessionId[tabSessionId]`. O(1). | Full `projectTabSessions(merged)` rebuild every 30 min. |
+| **Visit similarity** (W3) | Budgeted: if embedder warm + corpus under budget, embed + top-K insert (O(K log N)) and update displaced existing top-Ks. Otherwise mark `visitSimilarityDirty(sourceId)`. | Full pairwise rebuild on a coarse cadence (hourly) OR on demand. Byte-exact edge set. |
+| **Topic clustering** (W4) | Add: union-find merge across V's similarity neighbors. Remove: affected-component rebuild restricted to the touched component. | Full re-cluster every 60 min. |
 | **Ranker retrain** | No-op on hot path. | Already-gated: train if `newLabelCount ≥ 50`. Runs every 30 min. |
-| **Snapshot graph** | Apply minimal delta (1 node add, K edge adds) to the current in-memory snapshot. | Full `buildConnectionsSnapshot` every 30 min. |
+| **Snapshot graph** | Apply row-local delta (1 node add, K edge adds) to the current in-memory snapshot. | Full `buildConnectionsSnapshot` every 30 min. |
+| **Content / recall index** (Group B → W7) | `dirtySourceUnits.add(sourceUnitId)`; debounce. No chunk / embed / index on event loop. | Worker pass: chunk + embed (with cache reuse by `embedTextHash`) + atomic source-unit replace + content-similarity revision swap. |
 
 The cold-path rebuild that runs at companion boot is the reconciliation
 worker running once with full force. Same code, same byte output.
@@ -330,19 +346,25 @@ derived state on crash" maps onto the existing failure mode exactly.
 
 ## Similarity & topics — the hardest two
 
-Visit similarity needs a new visit's embedding compared against the
-top-K nearest. Hot-path options:
+Visit similarity (W3): a new visit's embedding needs comparison against
+the top-K nearest. Two failure modes to design against:
 
-- **Insert-only ANN**: maintain an in-memory ANN index (`hnswlib-node`,
-  or a simple K-nearest map sorted by recency). New visit → embed →
-  query top-K → add K new edges. O(K log N) per visit, not O(N×N).
-- **Lexical fallback**: same shape; maintain an in-memory inverted
-  index over tokenized titles/URLs; query by Jaccard. O(K) per visit.
+- Embedding is not free; doing it on the hot path for every visit
+  saturates CPU once content-aware similarity (Stage 5.1) lands.
+- ANN-index inserts can be O(K log N) but only if the embedder is
+  already warm; cold-start embed costs are seconds.
 
-Topic clustering: union-find supports incremental merge naturally.
-On new visit V with similarity edges to existing visits {A, B, C}, V
-joins the cluster containing A∪B∪C (or creates a new cluster). The
-full re-cluster pass moves to reconciliation, not per-event.
+W3 handles this with a **budget gate**: hot-path insert only when the
+embedder is warm and the corpus is small; otherwise mark dirty + defer
+to the reconciliation worker. Byte-exact edge-set equality is
+guaranteed by the worker, not the hot path.
+
+Topic clustering (W4): union-find supports incremental *merge* but
+not delete. Hot path handles add via union-find merge; remove (user
+moves URL out, privacy gate masks, edge dropped after re-embed) via
+**affected-component rebuild** — re-cluster only the touched
+component. Full re-cluster moves to reconciliation as the
+byte-equality oracle.
 
 ## Migration plan — two halves
 
@@ -350,11 +372,27 @@ The refactor splits cleanly along the two structural mistakes
 identified above. **Half 1 (Read path)** stops HTTP routes from
 re-deriving on every call; this alone removes the cache-and-rebuild
 churn that Stage 5.0 papered over. **Half 2 (Write path)** moves the
-recompute itself off the hot loop and folds leaf streams in O(1).
+recompute itself off the hot loop and folds Group-A leaf streams in
+O(1).
 
-Half 1 ships independently and unblocks the side panel without
-changing snapshot bytes. Half 2 is the deeper structural change and
-introduces byte-equality property tests as the safety net.
+Half 1 is a *semantics-preserving snapshot extension* — it adds two
+fields to `ConnectionsSnapshot` and routes HTTP through them. Snapshot
+bytes change (new fields) but the graph node/edge content does not.
+Half 2 is the deeper structural change and introduces byte-equality
+property tests as the safety net.
+
+**What Stage 5.2 is — and is not.** This is not "make everything
+incremental." It is:
+
+1. Serve reads from committed snapshots, never from ad-hoc
+   event-log projections.
+2. Move expensive reconciliation off the HTTP / event-ingest loop.
+3. Add O(1) hot folds only for Group-A projections that are truly
+   row-local.
+4. Treat content / indexing as a dirty-source reconciliation lane
+   (W7), not a hot-path operation.
+5. Use declarative invalidation for retroactive mutators.
+6. Preserve full replay as the correctness oracle.
 
 ### Half 1 — Read path: serve from snapshot
 
@@ -378,13 +416,18 @@ interface ConnectionsSnapshot {
 }
 ```
 
-This is a snapshot-format change; bump `payloadVersion` and add a
-fixture-regen for the existing golden tests under
+This is a *semantics-preserving snapshot extension*, not a no-byte-change
+refactor: bump `payloadVersion`, regenerate fixtures under
 `packages/sidetrack-companion/src/connections/*.test.ts`.
 
-**Acceptance:** snapshot tests regenerate; loading an older snapshot
-from disk degrades gracefully (re-derive on first read until next
-`buildAndWrite`).
+**Acceptance bar:**
+- Old snapshot loads gracefully (re-derive on first read until next
+  `buildAndWrite`).
+- New snapshot includes `urlProjection` and `tabSessionProjection`.
+- Graph node/edge content is unchanged modulo the added fields.
+- HTTP route output equals the pre-refactor `projectUrls(merged)` /
+  `projectTabSessions(merged)` output for every fixture in
+  `urls/projection.test.ts` and `tabsession/projection.test.ts`.
 
 #### R2 — Route HTTP endpoints through the store
 
@@ -414,7 +457,7 @@ at all call sites in `http/server.ts`.
 that exercised the caches either delete or repoint to direct snapshot
 reads.
 
-#### R4 — Snapshot freshness guarantee
+#### R4 — Snapshot freshness contract
 
 After Half 2 ships, HTTP reads serve up to the debounce window stale
 (see W2). Before then, the HTTP path is exactly as fresh as today:
@@ -422,8 +465,73 @@ each `buildAndWrite` call swaps a new snapshot in. Half 1 alone changes
 nothing about freshness; it only changes who PAYS for the projection
 derivation.
 
-This is the property to preserve through both halves: HTTP routes
-become async-cheap; only the writer pays.
+The property to preserve through both halves: HTTP routes become
+async-cheap; only the writer pays.
+
+Two consumer-facing freshness contracts to land alongside R2:
+
+**GET routes**: read `store.readCurrent()`. Response includes
+`snapshotRevision` so the side panel can detect stale data and refetch
+if needed. Default tolerance: side panel accepts up to the debounce
+window stale (250 ms target).
+
+**Resolver dry-run** (`POST .../resolve` with `dryRun: true`): may run
+against committed snapshot; accepts debounce-window staleness; response
+includes `snapshotRevision`.
+
+**Resolver auto-apply** (`POST .../resolve` with `dryRun: false`): must
+run against a *fresh-enough* snapshot. Two ways:
+- Force a read-through for the affected slice (single-row, not full
+  projection rebuild), OR
+- Reject with `409 stale-snapshot` if the caller's `dependencyKey`
+  doesn't match current `snapshotRevision`; caller retries.
+
+The first option is preferable for UX; the second is the correctness
+backstop. Stale *suggestions* are fine; stale *mutations* are not.
+
+#### R5 — Read-your-writes for mutation routes
+
+POST routes that mutate state historically returned the updated
+projection slice in the same response (so the UI re-renders without
+a follow-up GET). Switching them to read from `store.readCurrent()`
+naively would return the *pre-mutation* snapshot until reconciliation
+completes — that's a regression.
+
+Rule for each mutation route:
+
+```
+POST /v1/visits/{url}/attribute        — must return updated URL projection slice
+POST /v1/tabsessions/{id}/attribute    — must return updated tab-session slice
+POST /v1/visits/{url}/resolve dryRun=false  — must return updated URL slice
+POST /v1/tabsessions/{id}/resolve dryRun=false  — must return updated tab-session slice
+```
+
+Three options for satisfying this:
+
+**Option A (preferred): hot-path fold + return folded slice.** Mutation
+route appends the event, applies the row-local fold to the in-memory
+projection (one `byCanonicalUrl[url]` or `bySessionId[id]` entry),
+returns the folded slice. Reconciliation will re-ground it next pass.
+This is exactly what Half 2's W2 hot-path folds enable for Group-A
+events; mutation routes piggyback on the same accumulator.
+
+**Option B: read-through for the affected row only.** Mutation route
+runs a single-row `projectUrlsForOne(url)` against the event log
+(not the full projection). Bounded cost, ~5 ms per call. Acceptable
+fallback if Option A's accumulator isn't ready.
+
+**Option C: optimistic response + revision token.** Returns
+`{ accepted: true, snapshotRevision: previous, pendingProjection: true }`;
+UI optimistically renders the change. Acceptable for non-critical
+flows but adds UI complexity.
+
+Half 1 implementation should ship Option B (single-row read-through)
+to unblock Half 1's HTTP route refactor without depending on Half 2's
+accumulator. Half 2 W2 upgrades the route to Option A.
+
+**Acceptance:** for each mutation route, the response includes the
+*updated* projection slice; an integration test asserts the slice
+reflects the just-appended event.
 
 ### Half 2 — Write path: hot-path folds, off-thread recompute
 
@@ -486,44 +594,112 @@ Sub-tracks W2a–W2c (any order; each is independent):
 `fast-check`-generated event sequences run through both paths produce
 identical bytes for the affected slice.
 
-#### W3 — Incremental visit similarity
+#### W3 — Budgeted incremental visit similarity
 
-In-memory similarity index (hnswlib-node or sorted top-K). New visit
-inserts in O(K log N); existing-existing edges remain stable across
-inserts. Full pairwise rebuild stays in the reconciliation worker as
-the periodic safety net.
+Embedding is *not* a safe default hot-path operation. For metadata-only
+similarity with a warm embedder and small corpus it may be acceptable;
+for content-aware similarity (Stage 5.1 T7c) it is not.
 
-**Acceptance:** edge-set equality across the existing similarity test
-corpus. Wall-clock per-visit insert < 50 ms on a 5K-visit index.
+The hot path runs a budget gate:
 
-#### W4 — Incremental topic clustering
-
-Union-find supports incremental merge directly. New visit V with
-similarity edges to visits {A, B, C} → V joins the union of components
-of A, B, C (or starts a new one). Full re-cluster runs in
-reconciliation.
-
-**Acceptance:** cluster-membership equality between hot-path merge +
-reconciliation rebuild.
-
-#### W5 — Snapshot delta application
-
-`store.putCurrent` accepts an optional delta hint so disk writes are
-O(delta) not O(snapshot). Two shapes considered:
-
-```ts
-// Option A — full snapshot, store diffs internally
-store.putCurrent(snapshot);
-
-// Option B — explicit delta
-store.applyDelta({ addedNodes, addedEdges, updatedAttributions });
+```
+on new visit V:
+  if embedder is warm AND corpus size < BUDGET AND p99 embed-latency < 50 ms:
+    embed V
+    insert into in-memory similarity index
+    return new edges
+  else:
+    mark visitSimilarityDirty(V.sourceId)
+    enqueue worker reconciliation
+    return immediately (no new edges this tick)
 ```
 
-Option A keeps the store's external contract identical; the store
-computes the diff against the previous current. Easier to roll out.
+Worker reconciliation computes embeddings, updates the ANN / inverted
+index, writes a similarity revision, and atomic-swaps current.
 
-**Acceptance:** byte-identity between `N delta applications` and `one
-full rebuild` over the same event sequence.
+**Edge-set semantics on hot insert.** A new visit V's top-K neighborhood
+includes new V→existing edges. V may also enter older visits' top-K
+neighborhoods, evicting weaker edges. The hot path *should* recompute
+existing-visits' top-K when V's score beats their current Kth neighbor,
+but should NOT do a full pairwise pass.
+
+**Acceptance bar (split between paths):**
+- Hot path: bounded affected-neighborhood update — for the inserted
+  visit and at most O(K) existing visits whose top-K is displaced.
+- Reconciliation: byte-exact edge-set equality between incremental
+  state and full pairwise rebuild.
+
+Requiring exact full-corpus equality after every hot insert would push
+implementation back toward O(N²). The byte-exactness property lives in
+the reconciliation worker; the hot path is the responsiveness
+optimization.
+
+#### W4 — Incremental topic clustering with removal-aware fallback
+
+Union-find supports incremental *merges* cleanly: new visit V with
+similarity edges to visits {A, B, C} joins the union of components of
+A, B, C (or starts a new one). This covers most events.
+
+It does NOT support deletes / splits. Operations that REMOVE edges
+need a different path:
+
+- `user.organized.item` moves a URL between workstreams (removes
+  workstream-membership edge)
+- `privacy.gate.flipped` masks similarity for a gated time window
+- Similarity edge dropped after re-embedding (e.g., model upgrade
+  shifted relative distances)
+- `workstream.deleted` orphans visits
+
+For these, hot path runs **affected-component rebuild**: find the
+union-find component(s) touching the removed edge, re-cluster *that
+component only* using the current edge set. Cost is O(|component|) —
+typically small, not full corpus.
+
+```
+on edge removal R(A, B):
+  comp_A = uf.find(A); comp_B = uf.find(B)
+  if comp_A == comp_B:
+    members = uf.membersOf(comp_A)
+    reset members; re-cluster using current edge set restricted to members
+```
+
+Worker reconciliation owns the full re-cluster as the byte-determinism
+oracle.
+
+**Acceptance:**
+- Hot-path add: union-find merge yields same membership as worker
+  reconciliation.
+- Hot-path remove: affected-component rebuild yields same membership
+  as worker reconciliation for the involved components.
+
+#### W5 — Store-level diffing, external API unchanged
+
+`connectionsStore.putCurrent(snapshot)` accepts a complete snapshot as
+today. The store may internally diff against the previous current and
+write only changed regions, but that's an implementation detail —
+callers continue to hand it a full snapshot.
+
+```ts
+// External API (unchanged):
+store.putCurrent(snapshot)
+store.readCurrent(): Promise<ConnectionsSnapshot>
+
+// Internal implementation MAY:
+// - keep last-committed snapshot in memory
+// - compute byte-diff against previous
+// - write region-keyed deltas to disk
+// - reconstruct full snapshot on readCurrent if needed
+```
+
+Explicit `applyDelta({ addedNodes, addedEdges, ... })` is NOT exposed
+to callers in this stage. Every consumer (HTTP routes, materializer,
+side panel) treats the store as "give me a snapshot." If store-level
+diffing later becomes the bottleneck (it likely won't — snapshots are
+~200 KB), an explicit delta API is a backward-compatible upgrade.
+
+**Acceptance:** byte-identity between `N delta-applied snapshots` and
+`one full rebuild` over the same event sequence; HTTP route output is
+unchanged across the refactor.
 
 #### W6 — Declarative invalidation table for retroactive mutators
 
@@ -539,11 +715,22 @@ type InvalidationKey =
   | { kind: 'thread'; bacId: string }
   | { kind: 'workstream'; bacId: string }
   | { kind: 'workstreamTree' }              // structural change
+  | { kind: 'workstreamPathMemo'; bacId: string }   // path memo entries traversing bacId
   | { kind: 'engagementVisit'; visitId: string }
   | { kind: 'topicMember'; visitId: string }
   | { kind: 'queue'; itemId: string }
   | { kind: 'rankerLabels' }                // batch-level
-  | { kind: 'inboxFilter' };                // Inbox visibility predicate
+  | { kind: 'inboxFilter' }                 // Inbox visibility predicate
+
+  // Group B (content / recall index lane — see W7):
+  | { kind: 'sourceUnit'; sourceUnitId: string }
+  | { kind: 'extractionRevision'; extractionRevisionId: string }
+  | { kind: 'recallIndex'; sourceUnitId: string }
+  | { kind: 'contentSimilarity'; sourceUnitId: string }
+  | { kind: 'contentEvidence'; sourceUnitId: string }
+  | { kind: 'resolverAnchors'; nodeIds: readonly string[] }
+  | { kind: 'embeddingModelRevision' }      // batch-level — re-embed all
+  | { kind: 'chunkerVersion' };             // batch-level — re-chunk all
 
 const INVALIDATION_RULES: Record<EventType, (event: AcceptedEvent) => InvalidationKey[]> = {
   'user.organized.item': (e) => {
@@ -559,9 +746,11 @@ const INVALIDATION_RULES: Record<EventType, (event: AcceptedEvent) => Invalidati
   'user.flow.confirmed':   (e) => e.payload.visitIds.map(v => ({ kind: 'topicMember' as const, visitId: v })),
   'user.flow.rejected':    (e) => e.payload.visitIds.map(v => ({ kind: 'topicMember' as const, visitId: v })),
   'workstream.upserted':   (e) => [{ kind: 'workstream', bacId: e.payload.bac_id },
-                                   { kind: 'workstreamTree' }],
+                                   { kind: 'workstreamTree' },
+                                   { kind: 'workstreamPathMemo', bacId: e.payload.bac_id }],
   'workstream.deleted':    (e) => [{ kind: 'workstream', bacId: e.payload.bac_id },
-                                   { kind: 'workstreamTree' }],
+                                   { kind: 'workstreamTree' },
+                                   { kind: 'workstreamPathMemo', bacId: e.payload.bac_id }],
   'thread.upserted':       (e) => [{ kind: 'thread', bacId: e.payload.bac_id },
                                    { kind: 'url', canonicalUrl: e.payload.canonicalUrl }],
   'thread.archived':       (e) => [{ kind: 'thread', bacId: e.payload.bac_id },
@@ -572,55 +761,227 @@ const INVALIDATION_RULES: Record<EventType, (event: AcceptedEvent) => Invalidati
                                    { kind: 'inboxFilter' }],
   'urls.attribution.inferred':       (e) => [{ kind: 'url', canonicalUrl: e.payload.canonicalUrl }],
   'tabsession.attribution.inferred': (e) => [{ kind: 'tabSession', tabSessionId: e.payload.tabSessionId }],
-  'privacy.gate.flipped':            ()  => [],   // affects future events only
+  'privacy.gate.flipped':            ()  => [],   // see Privacy gate semantics section below
   'queue.created':                   (e) => [{ kind: 'queue', itemId: e.payload.itemId }],
   'queue.statusSet':                 (e) => [{ kind: 'queue', itemId: e.payload.itemId }],
+
+  // Group B — content / recall index lane (W7):
+  'capture.recorded':                (e) => [
+    { kind: 'sourceUnit', sourceUnitId: e.payload.sourceUnitId },
+    { kind: 'recallIndex', sourceUnitId: e.payload.sourceUnitId },
+    { kind: 'contentSimilarity', sourceUnitId: e.payload.sourceUnitId },
+  ],
+  'capture.extraction.produced':     (e) => [
+    { kind: 'sourceUnit', sourceUnitId: e.payload.sourceUnitId },
+    { kind: 'extractionRevision', extractionRevisionId: e.payload.extractionRevisionId },
+    { kind: 'recallIndex', sourceUnitId: e.payload.sourceUnitId },
+    { kind: 'contentSimilarity', sourceUnitId: e.payload.sourceUnitId },
+  ],
+  'recall.tombstone.target':         (e) => [
+    { kind: 'sourceUnit', sourceUnitId: e.payload.sourceUnitId },
+    { kind: 'recallIndex', sourceUnitId: e.payload.sourceUnitId },
+    { kind: 'contentSimilarity', sourceUnitId: e.payload.sourceUnitId },
+    { kind: 'resolverAnchors', nodeIds: e.payload.affectedNodeIds ?? [] },
+  ],
   // ...
 };
 ```
 
-Two important properties:
+The design rule that falls out of this table:
+
+- **Organization mutations** (`user.organized.item`, `workstream.*`,
+  `thread.*`) never invalidate `sourceUnit` / `recallIndex` /
+  `contentSimilarity`. Moving a URL between workstreams does NOT
+  re-embed its content.
+- **Content mutations** (`capture.*`, `recall.tombstone.*`) only
+  invalidate Group B keys; they do not invalidate workstream/thread
+  projections except via `resolverAnchors` (which represents
+  resolver-evidence that referenced the affected source).
+
+Three important properties:
 
 1. **`workstream.upserted` returns BOTH** the specific workstream
-   slice AND `workstreamTree`. Renaming X invalidates X's label AND
-   every URL/tabSession whose `currentAttribution.workstreamId`
-   resolves a display path through X (which is "any descendant of X
-   plus X itself"). The materializer reads the affected
-   `workstreamTree` key as "rebuild any path-derived display labels
-   that traverse the changed node." Practical implementation: hold a
-   `workstreamId → resolved-path` memo, invalidate the memo entries
-   whose path includes the changed bac_id.
+   slice AND `workstreamTree` AND `workstreamPathMemo`. Renaming X
+   invalidates X's label AND every URL/tabSession whose
+   `currentAttribution.workstreamId` resolves a display path through
+   X (which is "any descendant of X plus X itself"). The materializer
+   holds a `workstreamId → resolved-path` memo; the
+   `workstreamPathMemo` key invalidates memo entries whose path
+   includes the changed bac_id (the renamed/moved node + all its
+   descendants).
 2. **`workstream.deleted` may orphan attributions.** The reducer
    should NOT mutate the attribution row's `workstreamId` field —
    that violates byte-determinism if the deletion is later undone on
    a peer. Instead, mark the workstream node as `tombstoned: true`
    in the snapshot, and let the side panel render orphaned
    attributions as such. Re-attribution becomes a user action
-   (`user.organized.item`) rather than an automatic recovery.
+   (`user.organized.item`) rather than an automatic recovery. The
+   `workstreamPathMemo` key invalidates display paths that traverse
+   the deleted node; the attribution fact stays untouched.
+3. **Organization mutations don't trigger Group B work.** Moving a
+   URL between workstreams invalidates the URL's attribution row but
+   never its `sourceUnit` / `recallIndex` / `contentSimilarity`
+   keys. Re-embedding only happens when content actually changes
+   (`capture.*`) or when batch keys flip (`embeddingModelRevision`,
+   `chunkerVersion`).
 
 **Acceptance:** invalidation-trace test — for each mutating event
 type listed in the audit, the exact set of recomputed slices matches
 the documented rule. Property-test fixture: generate a random event
 sequence, run incremental + rebuild paths, assert identical slice
-content after each invalidation.
+content after each invalidation. Negative-property test: assert
+`user.organized.item` does NOT produce any `sourceUnit` /
+`recallIndex` / `contentSimilarity` keys.
+
+#### W7 — Content / recall index lane
+
+Group B (`capture.recorded`, `capture.extraction.produced`,
+`recall.tombstone.target`, plus future `page.content.extracted`) is
+append-only at the event-log level but expensive at the derived-state
+level: each event triggers chunking, embedding, recall index update,
+and content-similarity revision. W7 keeps that work *off* the hot
+path by treating source units as a dirty queue.
+
+**Hot path** (synchronous, runs on event ingest):
+
+```
+on capture.recorded(sourceUnitId, ...):
+  dirtySourceUnits.add(sourceUnitId)
+  scheduleContentReconcile()  // debounced
+
+on capture.extraction.produced(sourceUnitId, extractionRevisionId, ...):
+  dirtySourceUnits.add(sourceUnitId)
+  latestExtractionFor[sourceUnitId] = extractionRevisionId
+  scheduleContentReconcile()
+
+on recall.tombstone.target(sourceUnitId, ...):
+  tombstonedSourceUnits.add(sourceUnitId)
+  scheduleContentReconcile()
+```
+
+No chunking, no embedding, no index writes on the event loop.
+
+**Content reconciliation worker** (off-thread, debounced):
+
+```
+for sourceUnitId in dirtySourceUnits:
+  if sourceUnitId in tombstonedSourceUnits:
+    recallIndex.removeBySourceUnit(sourceUnitId)
+    contentSimilarity.removeBySourceUnit(sourceUnitId)
+    continue
+
+  extractionRev = latestExtractionFor[sourceUnitId]
+  chunks = chunker(extractionRev.content, chunkerVersion)
+  embeddings = chunks.map(c =>
+    embeddingCache.get(c.embedTextHash, embeddingModelRevision)
+      ?? embedder.embed(c, embeddingModelRevision))
+  recallIndex.replaceBySourceUnit(sourceUnitId, chunks, embeddings)
+  contentSimilarity.invalidateForSourceUnit(sourceUnitId)
+  resolverEvidence.invalidate({ kind: 'contentEvidence', sourceUnitId })
+
+contentSimilarity.recompute(dirtySourceUnits)
+contentSimilarityRevision.swapCurrent(newRevision)
+```
+
+Key properties:
+
+- **Embedding cache keyed by `(embedTextHash, embeddingModelRevision)`.**
+  If chunk text hasn't changed, embedding is reused — no recompute.
+- **`replaceBySourceUnit` is atomic at the source-unit granularity.**
+  Recall queries during reconciliation either see the old source's
+  chunks or the new ones, never a partial mix.
+- **Content-similarity invalidation is per source unit**, not whole
+  corpus. Existing source-to-source edges that don't touch the dirty
+  source remain.
+
+**Full rebuild required** when batch keys flip:
+- `embeddingModelRevision` changes → re-embed every chunk (worker pass
+  rate-limited; runs over hours, not minutes).
+- `chunkerVersion` changes → re-chunk every source then re-embed.
+- `extractionSchemaVersion` changes → re-extract upstream (separate
+  pipeline; W7 only consumes the latest extraction).
+- `contentSimilarityProducerVersion` changes → re-compute all edges.
+
+These are batch-level operations, not event-driven. They live behind
+a manual trigger or migration script.
+
+**Acceptance:**
+- `capture.recorded` doesn't run chunk/embed on event loop (CPU
+  profile shows main thread idle on capture ingest).
+- Embedding cache hit rate > 95 % when only attribution changes
+  (no actual content change).
+- Source-unit replacement is atomic — concurrent recall queries see
+  consistent chunk sets.
+- `user.organized.item` doesn't invalidate any Group B key.
+
+### Privacy gate semantics — explicit decision
+
+`privacy.gate.flipped` deserves a deliberate choice between two
+plausible semantics; the invalidation cost depends on which is picked.
+
+**Option F — future-only gate (recommended for v1).** The gate affects
+observation from this point forward. Old derived artifacts stay
+visible. `privacy.gate.flipped` invalidates nothing in the snapshot;
+it changes the predicate the recorder applies when emitting new events.
+
+- Invalidation cost: O(1)
+- Implementation: extension recorder consults the current gate state
+  before admitting a `browser.timeline.observed` / `engagement.*` /
+  `selection.*` event. Companion side does nothing.
+
+**Option G — retroactive derived-view mask.** The gate also masks
+materialized views for events in gated time windows. Old events stay in
+the log but derived caches hide them.
+
+- Invalidation cost: large. `privacy.gate.flipped` invalidates:
+  `engagementVisit[*]` (for visits in the gated window),
+  `topicMember[*]`, `rankerLabels`, `contentEvidence[*]`,
+  `resolverAnchors[*]`. Potentially full snapshot rebuild.
+- Implementation: materializer applies a "visible visit" filter at
+  every projection step.
+
+Given the local-first / privacy posture, Option F is the right
+default. The user's mental model is "starting now, don't record X";
+they don't expect toggling the gate to erase yesterday's view. If a
+user wants retroactive deletion they have `recall.tombstone.target`
+(per-source-unit) or full vault deletion (manual).
+
+**Implementation rule:** `INVALIDATION_RULES['privacy.gate.flipped']`
+returns `[]`. The recorder side handles the future-only enforcement.
+A separate `privacy.gate.scrubbed` event (if ever needed) would
+trigger Option G semantics for an explicit retroactive scrub — but
+that's a future concern, not this stage.
+
+**Acceptance:** flipping the gate does not trigger a connectionsStore
+write; existing snapshot bytes are unchanged. The recorder stops
+emitting gated event types from the moment of the flip.
 
 ### Sequencing rationale
 
-Half 1 ships first because it's a pure read-path refactor with no
-byte-format change to the existing computation — only adds two fields
-to `ConnectionsSnapshot` and routes HTTP to them. The user-visible
-benefit (HTTP responsiveness) lands without touching the materializer
-internals.
+Half 1 ships first because it's a semantics-preserving snapshot
+extension — adds two fields to `ConnectionsSnapshot` and routes HTTP
+to them. The user-visible benefit (HTTP responsiveness) lands without
+touching the materializer internals. R5's mutation-route Option B
+(single-row read-through) keeps read-your-writes working without
+depending on Half 2.
 
 Half 2 follows because it depends on Half 1's snapshot shape (W2's
 in-memory accumulators have the same shape as R1's `urlProjection`
 field) and because W1's worker-thread move is best done once the read
-path no longer cares whether the writer is mid-rebuild.
+path no longer cares whether the writer is mid-rebuild. W2 upgrades
+the mutation routes from Option B to Option A (hot-path fold + return
+folded slice).
 
-Stage 5.1 (T7a–T7d content-aware similarity) is independent of both
-halves. If Stage 5.1 lands first, W3 must account for content-similarity
-edges; if Stage 5.2 lands first, Stage 5.1 adds a new edge producer to
-W3's index.
+W7 (content / recall index lane) can ship alongside or after W1–W6.
+It depends on W1 (worker-thread reconciliation) but is otherwise
+independent of W2–W6.
+
+Stage 5.1 (T7a–T7d content-aware similarity) overlaps with W7. If
+Stage 5.1 lands first, W7 must consume its content-similarity
+revisions; if Stage 5.2 lands first, Stage 5.1 plugs into W7's dirty
+source-unit queue as the content evidence producer. The W3 budget
+gate accounts for either order — content embedding is always Group B
+work, never hot path.
 
 ## Risks & open questions
 
@@ -645,10 +1006,23 @@ W3's index.
    incremental coverage. Plan to wrap both paths behind a single
    harness so existing fixtures cover both.
 5. **Snapshot freshness after Half 2** — HTTP reads serve up to the
-   debounce window stale (default proposal: 250 ms). Acceptable for
-   side-panel UI; verify the resolver isn't sensitive to single-event
-   lag (it shouldn't be — resolver runs against the event log, not
-   the snapshot).
+   debounce window stale (default proposal: 250 ms). R4 makes this
+   explicit via `snapshotRevision` in responses. The resolver
+   dry-run path is fine with stale snapshots; the resolver
+   auto-apply path requires the R4 dependency-key check (or a
+   single-row read-through) — NOT a blanket assumption that resolver
+   reads the event log directly. Audit the current resolver paths
+   against this contract during Half 1 implementation.
+6. **Group B reconciliation cadence** — W7's chunk/embed/index lane
+   has its own cadence (independent of W1's snapshot reconciliation).
+   Need explicit budgets: max concurrent embeds, max work-per-tick,
+   embedding cache size. If `embeddingModelRevision` flips, the
+   re-embed-all pass should rate-limit (one source per N seconds)
+   to avoid pegging CPU for hours.
+7. **Worker stale-output races** — concurrent worker passes (W1 +
+   W7) could race on snapshot writes. Need a revision token check:
+   each worker reads `snapshotRevision` at start, refuses to swap if
+   a newer revision has already landed. See verification case #9.
 
 ## Verification approach
 
@@ -668,6 +1042,42 @@ For each R/W track:
    `inspect-companion-status.mjs` polls `/v1/status` every 15 s for
    30 minutes; pass criterion: zero timeouts, P99 < 200 ms.
 
+Track-specific cases:
+
+4. **R2 route equivalence** — for every projection HTTP route, assert
+   the post-refactor response equals the pre-refactor
+   `projectUrls(merged)` / `projectTabSessions(merged)` output across
+   the full test fixture corpus.
+5. **R5 read-your-writes** — for each mutation route
+   (`POST /v1/visits/{url}/attribute`, `.../resolve`,
+   `/v1/tabsessions/{id}/attribute`, `.../resolve`), assert the
+   response body contains the updated projection slice immediately
+   (the just-appended event is reflected). Test under both Option B
+   (single-row read-through) and Option A (hot-path fold) paths.
+6. **Resolver freshness** — dry-run accepts stale snapshot and
+   returns `snapshotRevision` in response; auto-apply rejects with
+   `409 stale-snapshot` when `dependencyKey` doesn't match current,
+   succeeds otherwise.
+7. **W7 content lane** — `capture.recorded` ingest does not chunk /
+   embed / index on the main event loop (CPU profile assertion).
+   `capture.extraction.produced` with unchanged `embedTextHash`
+   reuses the embedding cache (zero embedder calls). Source-unit
+   replacement is atomic across concurrent recall queries.
+8. **W7 negative property** — `user.organized.item`,
+   `workstream.upserted`, `thread.upserted` do NOT invalidate any
+   `sourceUnit` / `recallIndex` / `contentSimilarity` keys.
+9. **Worker stale-output guard** — if worker A starts at
+   `snapshotRevision = 10` and worker B starts at revision 12 and
+   completes first, worker A's late completion must NOT overwrite
+   the current snapshot. Assert via a forced-interleave fixture.
+10. **W4 topic removal** — issue an edge-removal sequence (e.g.,
+    user moves URL out of workstream); assert affected-component
+    rebuild yields the same membership as full reconciliation.
+11. **Privacy gate (Option F)** — flipping
+    `privacy.gate.flipped` does not trigger a connectionsStore
+    write; existing snapshot bytes are unchanged. The recorder
+    stops emitting gated event types from the moment of the flip.
+
 ## Out of scope (for this design doc)
 
 - **`/v1/system/health` directorySize** — separate fix; ~10 lines;
@@ -679,21 +1089,35 @@ For each R/W track:
   T7a as the most natural pairing (content evidence is the strongest
   candidate trigger for resolver auto-apply).
 
-## Open question for review
+## Open questions for review
 
-The biggest design call: **option A (full snapshot, store-computed
-diff) vs option B (explicit delta) for W5 writeback**. Option A keeps
-the store's external contract identical; the store internally diffs
-against the previous current. Option B exposes the delta shape to the
-caller — cleaner semantics but every caller now has to construct one.
+Three decisions worth explicit acknowledgement before this becomes an
+implementation prompt; each has a recommendation below.
 
-My recommendation is option A, because:
-- Callers don't have to think about delta construction; the writer
-  just hands the store a complete snapshot as today.
-- The store is the single place that knows the on-disk format, so
-  diffing there is consistent with the existing
-  write-then-rename atomic-swap protocol.
-- If option A becomes the bottleneck (it probably won't — snapshot
-  bytes are ~200 KB), option B is a backward-compatible upgrade.
+### Q1 — Privacy gate semantics (Option F vs Option G)
 
-Defer the decision to implementation but record the recommendation.
+See "Privacy gate semantics" section above. **Recommended: Option F
+(future-only)** for v1. Option G (retroactive derived-view mask) is a
+larger architectural commitment and not required by current product
+asks. Reserve the door for a separate `privacy.gate.scrubbed` event
+if retroactive scrub is needed later.
+
+### Q2 — R5 mutation route response shape (Option A vs B vs C)
+
+**Recommended: ship Option B with Half 1**, upgrade to Option A as
+part of W2. Option B (single-row read-through) is a 5-ms cost per
+mutation route call and doesn't depend on Half 2's accumulator
+landing. Option A (hot-path fold + return slice) is the long-term
+target; Option C (optimistic response) is acceptable for non-critical
+flows but adds UI complexity not worth taking on now.
+
+### Q3 — W5 store contract (full snapshot vs explicit delta)
+
+**Recommended: keep the full-snapshot external API.** The store may
+internally diff and write region-keyed deltas, but every caller
+continues to hand it a complete snapshot via `putCurrent(snapshot)`.
+Explicit `applyDelta()` is deferred until a consumer audit confirms
+it's needed; snapshot bytes (~200 KB) suggest it likely won't be.
+
+Defer all three decisions to implementation but record the
+recommendations.
