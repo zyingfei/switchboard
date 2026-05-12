@@ -57,6 +57,14 @@ interface MaterializerHealth {
   readonly pending: boolean;
 }
 
+interface SyncRelayPeerReplicaHealth {
+  readonly replicaId: string;
+  readonly eventsIn: number;
+  readonly eventsOut: number;
+  readonly lastInboundAtMs?: number;
+  readonly lastOutboundAtMs?: number;
+}
+
 interface SyncRelayHealth {
   readonly mode: 'local' | 'remote';
   readonly url: string;
@@ -65,6 +73,14 @@ interface SyncRelayHealth {
   readonly lastDisconnectedAtMs?: number;
   readonly consecutiveFailures?: number;
   readonly pendingPublishes?: number;
+  // Stage 5 polish — peer-event throughput counters. `eventsIn` and
+  // `eventsOut` are total since companion process start. `byReplica`
+  // carries per-replica drill for the "who am I talking to?" panel.
+  readonly eventsIn?: number;
+  readonly eventsOut?: number;
+  readonly lastInboundAtMs?: number;
+  readonly lastOutboundAtMs?: number;
+  readonly byReplica?: readonly SyncRelayPeerReplicaHealth[];
 }
 
 interface SyncSummary {
@@ -84,8 +100,16 @@ interface WorkGraphRankerHealth {
   readonly retrainNewLabelCount: number;
 }
 
+interface WorkGraphTopicProducerHealth {
+  readonly activeRevisionId: string | null;
+  readonly algorithmVersion: string | null;
+  readonly topicCount: number;
+  readonly lineageCount: number;
+}
+
 interface WorkGraphHealth {
   readonly ranker: WorkGraphRankerHealth;
+  readonly topicProducer?: WorkGraphTopicProducerHealth;
 }
 
 interface HealthReport {
@@ -436,11 +460,32 @@ export function HealthPanel({
           : relay.connected === false
             ? `disconnected${relay.consecutiveFailures !== undefined && relay.consecutiveFailures > 0 ? ` · ${String(relay.consecutiveFailures)} fails` : ''}`
             : 'unknown';
+    // Topics stage — depends on Embedding (similarity), feeds Ranker
+    // (cluster bias). `lineageCount` includes split + merge edges so
+    // the user can see whether clusters are evolving over time.
+    const topicHealth = report.workGraph?.topicProducer;
+    const topicStatus: PipelineStatus =
+      topicHealth === undefined
+        ? 'idle'
+        : topicHealth.activeRevisionId === null
+          ? 'warn'
+          : topicHealth.topicCount === 0
+            ? 'warn'
+            : 'ok';
+    const topicDetail =
+      topicHealth === undefined
+        ? 'workGraph not reported'
+        : topicHealth.activeRevisionId === null
+          ? 'no revision yet'
+          : topicHealth.topicCount === 0
+            ? 'no clusters yet'
+            : `${String(topicHealth.topicCount)} topic${topicHealth.topicCount === 1 ? '' : 's'} · ${String(topicHealth.lineageCount)} lineage`;
     return [
       { id: 'capture', name: 'Capture', status: captureStatus, detail: captureDetail },
       { id: 'vault', name: 'Vault', status: vaultStatus, detail: vaultDetail },
       { id: 'materializers', name: 'Materializers', status: matStatus, detail: matDetail },
       { id: 'recall', name: 'Embedding', status: recallStatusFor, detail: recallDetail },
+      { id: 'topics', name: 'Topics', status: topicStatus, detail: topicDetail },
       { id: 'ranker', name: 'Ranker', status: rankerStatus, detail: rankerDetail },
       { id: 'sync', name: 'Sync', status: syncStatus, detail: syncDetail },
     ];
@@ -500,7 +545,7 @@ export function HealthPanel({
           {pipelineStages.length > 0 ? (
             <div className="hp-pipeline" data-testid="hp-pipeline">
               <div className="hp-pipeline-head">
-                Pipeline · capture → vault → materializers → embedding → ranker → sync
+                Pipeline · capture → vault → materializers → embedding → topics → ranker → sync
               </div>
               <div className="hp-pipeline-flow">
                 {pipelineStages.map((stage, index) => (
@@ -821,10 +866,78 @@ export function HealthPanel({
                     ))}
                   </div>
                 ) : null}
-                <div className="hp-muted-row" style={{ fontSize: 10, opacity: 0.7 }}>
-                  Peer-event throughput + per-replica drill-down are coming —
-                  follow-up companion task tracked.
-                </div>
+                {report.sync.relay !== undefined &&
+                (report.sync.relay.eventsIn !== undefined ||
+                  report.sync.relay.eventsOut !== undefined) ? (
+                  <div className="hp-sec">
+                    <div className="hp-sec-head">
+                      Peer-event throughput · total since companion start
+                    </div>
+                    <div className="health-grid">
+                      <div className="hc">
+                        <div className="hc-lbl">in / out</div>
+                        <div className="hc-num small">
+                          {String(report.sync.relay.eventsIn ?? 0)} ·{' '}
+                          {String(report.sync.relay.eventsOut ?? 0)}
+                        </div>
+                        <div className="hc-foot">
+                          last in:{' '}
+                          {report.sync.relay.lastInboundAtMs !== undefined
+                            ? formatRelative(
+                                new Date(report.sync.relay.lastInboundAtMs).toISOString(),
+                              )
+                            : 'never'}
+                          {' · '}
+                          last out:{' '}
+                          {report.sync.relay.lastOutboundAtMs !== undefined
+                            ? formatRelative(
+                                new Date(report.sync.relay.lastOutboundAtMs).toISOString(),
+                              )
+                            : 'never'}
+                        </div>
+                      </div>
+                    </div>
+                    {report.sync.relay.byReplica !== undefined &&
+                    report.sync.relay.byReplica.length > 0 ? (
+                      <div className="hp-sec">
+                        <div className="hp-sec-head">Per-replica drill</div>
+                        {report.sync.relay.byReplica.map((peer) => (
+                          <div className="hp-row" key={peer.replicaId}>
+                            <span className="prov-pill mono">
+                              {peer.replicaId.slice(0, 8)}…
+                            </span>
+                            <span className="hp-num">
+                              {String(peer.eventsIn)}
+                              <span className="muted"> in</span>
+                            </span>
+                            <span className="hp-num">
+                              {String(peer.eventsOut)}
+                              <span className="muted"> out</span>
+                            </span>
+                            <span className="hp-last muted">
+                              {peer.lastInboundAtMs !== undefined ||
+                              peer.lastOutboundAtMs !== undefined
+                                ? formatRelative(
+                                    new Date(
+                                      Math.max(
+                                        peer.lastInboundAtMs ?? 0,
+                                        peer.lastOutboundAtMs ?? 0,
+                                      ),
+                                    ).toISOString(),
+                                  )
+                                : 'idle'}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : (
+                  <div className="hp-muted-row" style={{ fontSize: 10, opacity: 0.7 }}>
+                    No peer-event activity yet. Counters appear after the first inbound or
+                    outbound frame.
+                  </div>
+                )}
               </>
             )}
           </div>

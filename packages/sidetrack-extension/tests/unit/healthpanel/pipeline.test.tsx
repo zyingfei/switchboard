@@ -49,13 +49,53 @@ describe('HealthPanel pipeline strip', () => {
     vi.unstubAllGlobals();
   });
 
-  it('renders all six pipeline stages with the right status dots', async () => {
+  it('renders all seven pipeline stages with the right status dots', async () => {
     render(<HealthPanel onClose={vi.fn()} companionPort={17373} bridgeKey="key" />);
 
     const pipeline = await screen.findByTestId('hp-pipeline');
-    for (const id of ['capture', 'vault', 'materializers', 'recall', 'ranker', 'sync']) {
+    for (const id of ['capture', 'vault', 'materializers', 'recall', 'topics', 'ranker', 'sync']) {
       expect(pipeline.querySelector(`[data-testid="hp-pipeline-stage-${id}"]`)).not.toBeNull();
     }
+  });
+
+  it('shows the topic stage detail when workGraph.topicProducer reports clusters', async () => {
+    vi.unstubAllGlobals();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () =>
+          ({
+            data: mkHealth({
+              workGraph: {
+                ranker: {
+                  activeRevisionId: null,
+                  loadStatus: 'missing' as const,
+                  trainedAt: null,
+                  retrainSkipReason: null,
+                  retrainNewLabelCount: 0,
+                },
+                topicProducer: {
+                  activeRevisionId: 'rev_topic_42',
+                  algorithmVersion: 'topic-revision:v1:union-find',
+                  topicCount: 4,
+                  lineageCount: 2,
+                },
+              },
+            }),
+          }),
+      })),
+    );
+
+    render(<HealthPanel onClose={vi.fn()} companionPort={17373} bridgeKey="key" />);
+
+    await waitFor(() => {
+      const stage = screen.getByTestId('hp-pipeline-stage-topics');
+      expect(stage.className).toContain('is-ok');
+      expect(stage.textContent).toContain('4 topics');
+      expect(stage.textContent).toContain('2 lineage');
+    });
   });
 
   it('flags the recall stage warn when status=rebuilding', async () => {

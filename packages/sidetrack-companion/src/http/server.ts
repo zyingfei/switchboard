@@ -201,6 +201,20 @@ const syncSummaryDeps = (
                     ...(live.lastDisconnectedAtMs === undefined
                       ? {}
                       : { lastDisconnectedAtMs: live.lastDisconnectedAtMs }),
+                    // Stage 5 polish — peer-event throughput. Older
+                    // runtimes that haven't been recompiled won't have
+                    // these fields; guard via undefined.
+                    ...(live.eventsIn === undefined ? {} : { eventsIn: live.eventsIn }),
+                    ...(live.eventsOut === undefined ? {} : { eventsOut: live.eventsOut }),
+                    ...(live.lastInboundAtMs === undefined
+                      ? {}
+                      : { lastInboundAtMs: live.lastInboundAtMs }),
+                    ...(live.lastOutboundAtMs === undefined
+                      ? {}
+                      : { lastOutboundAtMs: live.lastOutboundAtMs }),
+                    ...(live.byReplica === undefined
+                      ? {}
+                      : { byReplica: live.byReplica }),
                   }),
             },
             ...materializersBlock,
@@ -315,6 +329,20 @@ export interface CompanionHttpConfig {
       readonly lastDisconnectedAtMs?: number;
       readonly consecutiveFailures: number;
       readonly pendingPublishes: number;
+      // Stage 5 polish — peer-event throughput counters. Optional so
+      // older runtimes that haven't shipped the relay change yet keep
+      // working against the new server typing.
+      readonly eventsIn?: number;
+      readonly eventsOut?: number;
+      readonly lastInboundAtMs?: number;
+      readonly lastOutboundAtMs?: number;
+      readonly byReplica?: ReadonlyArray<{
+        readonly replicaId: string;
+        readonly eventsIn: number;
+        readonly eventsOut: number;
+        readonly lastInboundAtMs?: number;
+        readonly lastOutboundAtMs?: number;
+      }>;
     } | null;
   };
   readonly updateChecker?: () => Promise<UpdateAdvisory>;
@@ -1338,6 +1366,24 @@ const routes: readonly RouteDefinition[] = [
                     ...(relayLive.lastDisconnectedAtMs === undefined
                       ? {}
                       : { lastDisconnectedAtMs: relayLive.lastDisconnectedAtMs }),
+                    // Peer-event throughput counters mirrored from
+                    // /v1/system/health.sync — the side panel polls
+                    // /v1/status frequently for reachability, so
+                    // surfacing them here too means the throughput
+                    // chips can update at the same cadence.
+                    ...(relayLive.eventsIn === undefined ? {} : { eventsIn: relayLive.eventsIn }),
+                    ...(relayLive.eventsOut === undefined
+                      ? {}
+                      : { eventsOut: relayLive.eventsOut }),
+                    ...(relayLive.lastInboundAtMs === undefined
+                      ? {}
+                      : { lastInboundAtMs: relayLive.lastInboundAtMs }),
+                    ...(relayLive.lastOutboundAtMs === undefined
+                      ? {}
+                      : { lastOutboundAtMs: relayLive.lastOutboundAtMs }),
+                    ...(relayLive.byReplica === undefined
+                      ? {}
+                      : { byReplica: relayLive.byReplica }),
                   }),
             };
       return [

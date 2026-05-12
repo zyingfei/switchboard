@@ -93,6 +93,49 @@ export const createRelayTransport = (options: RelayTransportOptions): LogTranspo
   // internals. Updated on the on('open') hook below.
   let lastConnectedAtMs: number | null = null;
   let lastDisconnectedAtMs: number | null = null;
+  // Stage 5 polish — peer-event throughput counters. Bumped from
+  // handleEvent (after a frame has been decrypted, signature-verified,
+  // and the trust check passed) and from publishEvent (after the
+  // promise resolves). Per-replica counters land in `byReplicaId`;
+  // last-inbound / last-outbound timestamps make the HealthPanel
+  // "active 1m ago" affordance possible without reaching into the
+  // event log.
+  let totalEventsIn = 0;
+  let totalEventsOut = 0;
+  let lastInboundAtMs: number | null = null;
+  let lastOutboundAtMs: number | null = null;
+  const byReplicaCounts = new Map<
+    string,
+    { eventsIn: number; eventsOut: number; lastInboundAtMs: number | null; lastOutboundAtMs: number | null }
+  >();
+  const bumpInbound = (replicaId: string): void => {
+    totalEventsIn += 1;
+    lastInboundAtMs = Date.now();
+    const entry =
+      byReplicaCounts.get(replicaId) ?? {
+        eventsIn: 0,
+        eventsOut: 0,
+        lastInboundAtMs: null,
+        lastOutboundAtMs: null,
+      };
+    entry.eventsIn += 1;
+    entry.lastInboundAtMs = lastInboundAtMs;
+    byReplicaCounts.set(replicaId, entry);
+  };
+  const bumpOutbound = (replicaId: string): void => {
+    totalEventsOut += 1;
+    lastOutboundAtMs = Date.now();
+    const entry =
+      byReplicaCounts.get(replicaId) ?? {
+        eventsIn: 0,
+        eventsOut: 0,
+        lastInboundAtMs: null,
+        lastOutboundAtMs: null,
+      };
+    entry.eventsOut += 1;
+    entry.lastOutboundAtMs = lastOutboundAtMs;
+    byReplicaCounts.set(replicaId, entry);
+  };
 
   const ws = (): WsWebSocket => {
     if (options.fetchWebSocket !== undefined) return options.fetchWebSocket(options.relayUrl);
@@ -186,10 +229,15 @@ export const createRelayTransport = (options: RelayTransportOptions): LogTranspo
       // while keeping the captured signature valid.
       const trustedPublicKey = decodeBytes(decision.record.publicKey);
       const ok = verifyCanonicalEvent(trustedPublicKey, canonicalEventBytes(parsed), signature);
+      // Bump inbound counter ONLY when the frame is admitted, signed
+      // off by the trusted key, and survives the verify check. We
+      // don't count dropped frames (revoked / mismatched / bad sig)
+      // — counters should reflect what reached the application layer.
       if (!ok) {
         log('warn', 'relay frame signature did not verify against the trusted public key');
         return;
       }
+      bumpInbound(parsed.dot.replicaId);
       for (const sub of subscribers) {
         if (sub.knownReplicas.size === 0 || sub.knownReplicas.has(parsed.dot.replicaId)) {
           sub.onEvent(parsed.dot.replicaId, parsed);
@@ -296,6 +344,12 @@ export const createRelayTransport = (options: RelayTransportOptions): LogTranspo
       pendingPublishes.push({ frame, resolve });
       flushPending();
     });
+    // Bump outbound counter after the publish promise resolves (the
+    // frame is on the wire — whether the peer ever ACKs it is the
+    // relay's problem, not ours). Per-replica drill uses event.dot
+    // .replicaId so we can compare local-publish counts against the
+    // event log's replica seq.
+    bumpOutbound(event.dot.replicaId);
   };
 
   const subscribePeers = (
@@ -324,17 +378,48 @@ export const createRelayTransport = (options: RelayTransportOptions): LogTranspo
   // this each request, so it's a snapshot — `connected` is "the
   // socket is currently OPEN," not "we've ever connected." Use
   // lastConnectedAtMs for the "we WERE connected" affordance.
-  const getStatus = (): RelayTransportStatus => ({
-    connected: socket?.readyState === WsWebSocket.OPEN,
-    consecutiveFailures,
-    pendingPublishes: pendingPublishes.length,
-    ...(lastConnectedAtMs === null ? {} : { lastConnectedAtMs }),
-    ...(lastDisconnectedAtMs === null ? {} : { lastDisconnectedAtMs }),
-  });
+  const getStatus = (): RelayTransportStatus => {
+    // Stage 5 polish — flatten per-replica drill into a stable array
+    // so the JSON surface is deterministic (sorted by replicaId) and
+    // easy to render in the side panel without extra normalization.
+    const byReplica = [...byReplicaCounts.entries()]
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([replicaId, counts]) => ({
+        replicaId,
+        eventsIn: counts.eventsIn,
+        eventsOut: counts.eventsOut,
+        ...(counts.lastInboundAtMs === null
+          ? {}
+          : { lastInboundAtMs: counts.lastInboundAtMs }),
+        ...(counts.lastOutboundAtMs === null
+          ? {}
+          : { lastOutboundAtMs: counts.lastOutboundAtMs }),
+      }));
+    return {
+      connected: socket?.readyState === WsWebSocket.OPEN,
+      consecutiveFailures,
+      pendingPublishes: pendingPublishes.length,
+      ...(lastConnectedAtMs === null ? {} : { lastConnectedAtMs }),
+      ...(lastDisconnectedAtMs === null ? {} : { lastDisconnectedAtMs }),
+      eventsIn: totalEventsIn,
+      eventsOut: totalEventsOut,
+      ...(lastInboundAtMs === null ? {} : { lastInboundAtMs }),
+      ...(lastOutboundAtMs === null ? {} : { lastOutboundAtMs }),
+      byReplica,
+    };
+  };
   Object.defineProperty(publishEvent, 'getStatus', { value: getStatus });
 
   return { publishEvent, subscribePeers };
 };
+
+export interface RelayTransportPerReplicaStatus {
+  readonly replicaId: string;
+  readonly eventsIn: number;
+  readonly eventsOut: number;
+  readonly lastInboundAtMs?: number;
+  readonly lastOutboundAtMs?: number;
+}
 
 export interface RelayTransportStatus {
   readonly connected: boolean;
@@ -342,6 +427,16 @@ export interface RelayTransportStatus {
   readonly lastDisconnectedAtMs?: number;
   readonly consecutiveFailures: number;
   readonly pendingPublishes: number;
+  // Stage 5 polish — peer-event throughput counters. `eventsIn` /
+  // `eventsOut` are total since process start. `byReplica` carries
+  // per-replica drill (sorted by replicaId so the JSON surface is
+  // deterministic). Backward-compatible: older consumers that only
+  // read connected/consecutiveFailures/pendingPublishes still work.
+  readonly eventsIn: number;
+  readonly eventsOut: number;
+  readonly lastInboundAtMs?: number;
+  readonly lastOutboundAtMs?: number;
+  readonly byReplica: readonly RelayTransportPerReplicaStatus[];
 }
 
 export const getRelayTransportStatus = (

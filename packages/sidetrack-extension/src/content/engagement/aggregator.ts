@@ -102,11 +102,21 @@ export const createEngagementAggregator = (input: {
     const delta = Math.max(0, atMs - state.lastTick);
     if (delta === 0) return;
     const active = state.visible && state.focused && !state.idle;
+    // Stage 5 follow-up — `focusedWindowMs` previously accrued for
+    // every tab whose window had OS focus, regardless of whether the
+    // tab was the selected one. That over-counted: background tabs in
+    // a focused window all accumulated the same time. Required signal
+    // for ranker / topic-label sorting is "this tab is the selected
+    // tab in a focused window," which is `visible && focused`. Idle
+    // is intentionally NOT part of this check — the user can read a
+    // page without scrolling/typing without invalidating its
+    // engagement-time signal.
+    const focusedAccrue = state.visible && state.focused;
     state.totals = {
       ...state.totals,
       activeMs: state.totals.activeMs + (active ? delta : 0),
       visibleMs: state.totals.visibleMs + (state.visible ? delta : 0),
-      focusedWindowMs: state.totals.focusedWindowMs + (state.focused ? delta : 0),
+      focusedWindowMs: state.totals.focusedWindowMs + (focusedAccrue ? delta : 0),
       idleMs: state.totals.idleMs + (state.idle ? delta : 0),
     };
     state.lastTick = atMs;
