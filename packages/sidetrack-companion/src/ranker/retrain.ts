@@ -702,3 +702,78 @@ export const maybeRetrainClosestVisitRanker = async ({
     };
   }
 };
+
+// Stage 5 polish — Worker-thread variant of maybeRetrainClosestVisit
+// Ranker. The LightGBM training loop is the most CPU-heavy thing the
+// companion does (≥1s on dogfood vaults, longer on larger ones), and
+// running it inline on the HTTP request handler thread starves
+// /v1/status + every other warm-path poll. Spawning a worker moves
+// the math off the main event loop so the cold (training) and warm
+// (status / suggestions / inbox) paths are physically separate.
+//
+// The worker entry lives at `./retrain.worker.js` after build (the
+// matching .ts file in this directory). We pass the input via
+// `workerData`, which uses structuredClone — only the HTTP route's
+// real call shape (vaultRoot / merged / snapshot / threshold knobs)
+// is serializable, function overrides like `train`, `readState`, etc.
+// are NOT. Those defaults are picked up by the worker's own imports,
+// so leaving them off the input is the *expected* code path.
+//
+// readMerged() still runs on the main thread before the worker spawn
+// (cold-path file read + parse). A follow-up will push that into the
+// worker too, so the request handler returns immediately and the
+// status endpoint can poll for completion.
+export const runMaybeRetrainInWorker = async (
+  input: MaybeRetrainClosestVisitRankerInput,
+): Promise<RankerRetrainResult> => {
+  // Lazy-import worker_threads so the dual-purpose module (re-exported
+  // for unit tests in addition to the production code path) doesn't
+  // crash environments where worker_threads isn't available (e.g.
+  // future browser-side reuse). Lazy + dynamic also keeps the worker
+  // entry off the cold-start critical path.
+  const { Worker } = await import('node:worker_threads');
+  const workerUrl = new URL('./retrain.worker.js', import.meta.url);
+  return await new Promise<RankerRetrainResult>((resolve, reject) => {
+    const worker = new Worker(workerUrl, { workerData: input });
+    let settled = false;
+    const settle = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      fn();
+    };
+    worker.once(
+      'message',
+      (
+        msg:
+          | { readonly ok: true; readonly result: RankerRetrainResult }
+          | { readonly ok: false; readonly error: string },
+      ) => {
+        settle(() => {
+          if (msg.ok) {
+            resolve(msg.result);
+          } else {
+            reject(new Error(msg.error));
+          }
+        });
+        void worker.terminate();
+      },
+    );
+    worker.once('error', (err) => {
+      settle(() => {
+        reject(err);
+      });
+    });
+    worker.once('exit', (code) => {
+      settle(() => {
+        if (code !== 0) {
+          reject(new Error(`Ranker retrain worker exited with code ${String(code)}`));
+        } else {
+          // Code 0 with no message means the worker finished without
+          // sending a result — treat as a generic failure rather than
+          // hanging the promise forever.
+          reject(new Error('Ranker retrain worker exited without producing a result'));
+        }
+      });
+    });
+  });
+};

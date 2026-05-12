@@ -236,7 +236,10 @@ import { collectHealth, type CaptureWarningHealth, type HealthReport } from '../
 import { collectWorkGraphHealth } from '../system/workGraphHealth.js';
 import { checkLatestVersion, type UpdateAdvisory } from '../system/versionCheck.js';
 import { COMPANION_VERSION } from '../version.js';
-import { maybeRetrainClosestVisitRanker } from '../ranker/retrain.js';
+import {
+  maybeRetrainClosestVisitRanker,
+  runMaybeRetrainInWorker,
+} from '../ranker/retrain.js';
 import {
   listAnnotations,
   softDeleteAnnotation,
@@ -4659,7 +4662,14 @@ const routes: readonly RouteDefinition[] = [
           'Connections snapshot is not ready.',
         );
       }
-      const result = await maybeRetrainClosestVisitRanker({
+      // Stage 5 polish — route the retrain call through the worker
+      // helper so the LightGBM training math runs off the main event
+      // loop. /v1/status + every other warm-path poll stay
+      // responsive while retrain is in flight.
+      // SIDETRACK_RANKER_RETRAIN_INLINE=1 opts back into the legacy
+      // inline path for fixtures + tests that don't carry a built
+      // worker bundle.
+      const retrainInput = {
         vaultRoot,
         merged: await context.eventLog.readMerged(),
         snapshot,
@@ -4668,7 +4678,11 @@ const routes: readonly RouteDefinition[] = [
           ? {}
           : { randomNegativeCandidatesPerPositive }),
         ...(trainNumRound === undefined ? {} : { trainOptions: { numRound: trainNumRound } }),
-      });
+      };
+      const result =
+        process.env['SIDETRACK_RANKER_RETRAIN_INLINE'] === '1'
+          ? await maybeRetrainClosestVisitRanker(retrainInput)
+          : await runMaybeRetrainInWorker(retrainInput);
       if (result.status === 'trained') {
         await context.refreshConnections?.();
       }
