@@ -425,6 +425,71 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     expect(health.lastError).toContain('disk wedged');
   });
 
+  // Stage 5.2 W3 — visit-similarity skip-gate. When the same set of
+  // visits is processed twice, the second drain reads the cached
+  // revision from disk instead of re-running embed (the most
+  // expensive pass on the materializer's hot path).
+  it('reuses an existing similarity revision when visit inputs are unchanged', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+    let embedCalls = 0;
+    const embed: VisitSimilarityEmbedder = async (texts) => {
+      embedCalls += 1;
+      return texts.map(() => unit([1, 0]));
+    };
+    const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store, embed });
+
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 1,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: {
+          eventId: 'timeline-alpha',
+          observedAt: '2026-05-07T10:00:00.000Z',
+          url: 'https://example.test/alpha',
+          canonicalUrl: 'https://example.test/alpha',
+          title: 'visit-alpha',
+          provider: 'generic',
+          transition: 'activated',
+          payloadVersion: 1,
+          dimensions: { engagement: { focusedWindowMs: 10_000 } },
+        },
+      }),
+    );
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 2,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: {
+          eventId: 'timeline-bravo',
+          observedAt: '2026-05-07T10:05:00.000Z',
+          url: 'https://example.test/bravo',
+          canonicalUrl: 'https://example.test/bravo',
+          title: 'visit-bravo',
+          provider: 'generic',
+          transition: 'activated',
+          payloadVersion: 1,
+          dimensions: { engagement: { focusedWindowMs: 10_000 } },
+        },
+      }),
+    );
+
+    // First drain populates the similarity revision (calls embed once
+    // for the two passages).
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+    const firstCalls = embedCalls;
+    expect(firstCalls).toBeGreaterThan(0);
+
+    // Second drain over the same visit set: skip-gate hits, no
+    // additional embed call.
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+    expect(embedCalls).toBe(firstCalls);
+  });
+
   it('handles set covers expected event types', async () => {
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
