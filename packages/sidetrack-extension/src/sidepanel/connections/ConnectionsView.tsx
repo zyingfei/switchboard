@@ -29,6 +29,7 @@ import { HopToggle } from './HopToggle';
 import { KindIcons, SearchIcon } from './icons';
 import { LinkedCenter } from './LinkedCenter';
 import { NodeChip } from './NodeChip';
+import { NodeSearchBox, type SearchableAnchor } from './NodeSearchBox';
 import { OrbitalCenter } from './OrbitalCenter';
 import { ProvenanceCard, ProvenanceEmpty } from './ProvenancePanel';
 import { TimelineRail } from './TimelineRail';
@@ -497,6 +498,35 @@ export const ConnectionsView = ({
 
   const selectedWorkstreamAnchor = anchor.startsWith('workstream:') ? anchor : '';
 
+  // Search pool — combines the user's named workstreams + recent
+  // anchors so the search box catches things even when they aren't
+  // in the current snapshot's neighbor scope. Deduped by id.
+  const searchExtras = useMemo<readonly SearchableAnchor[]>(() => {
+    const out: SearchableAnchor[] = [];
+    const seen = new Set<string>();
+    for (const w of workstreamAnchors) {
+      if (seen.has(w.id)) continue;
+      seen.add(w.id);
+      out.push({
+        id: w.id,
+        label: w.label,
+        kind: 'workstream',
+        ...(w.meta === undefined ? {} : { meta: w.meta }),
+      });
+    }
+    for (const r of recentAnchors) {
+      if (seen.has(r.id)) continue;
+      seen.add(r.id);
+      out.push({
+        id: r.id,
+        label: r.label,
+        kind: r.kind,
+        ...(r.meta === undefined ? {} : { meta: r.meta }),
+      });
+    }
+    return out;
+  }, [recentAnchors, workstreamAnchors]);
+
   const useNodeAsAnchor = (nodeId: string): void => {
     setSelectedEdge(null);
     setWhyVisitId(null);
@@ -754,6 +784,17 @@ export const ConnectionsView = ({
       {timeline !== null ? <TimelineRail data={timeline} ctx={ctx} /> : null}
       <div className="cx-cols">
         <aside className="cx-col-l">
+          <div className="cx-section">
+            <h4>Find</h4>
+            <NodeSearchBox
+              nodes={result?.snapshot.nodes ?? []}
+              extras={searchExtras}
+              ctx={ctx}
+              onPick={(id) => {
+                submitAnchor(id);
+              }}
+            />
+          </div>
           <div className="cx-section">
             <h4>Workstream</h4>
             <label className="cx-select">
