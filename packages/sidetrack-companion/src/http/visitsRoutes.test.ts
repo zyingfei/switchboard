@@ -224,13 +224,33 @@ describe('per-URL HTTP routes', () => {
     expect(body.data.byCanonicalUrl[canonicalUrl]?.currentAttribution?.workstreamId).toBeNull();
   });
 
+  it('POST /v1/visits/{url}/resolve returns `skipped-disabled` when env opts out', async () => {
+    const canonicalUrl = 'https://example.test/opt-out-url';
+    await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_a' });
+    installStrongUrlSnapshot(canonicalUrl);
+    const priorEnv = process.env['SIDETRACK_URL_RESOLVER_AUTO_APPLY'];
+    process.env['SIDETRACK_URL_RESOLVER_AUTO_APPLY'] = '0';
+    const response = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve`,
+      {
+        method: 'POST',
+        headers: headers('url-auto-apply-optout'),
+        body: JSON.stringify({ dryRun: false, policyMode: 'balanced' }),
+      },
+    );
+    if (priorEnv === undefined) delete process.env['SIDETRACK_URL_RESOLVER_AUTO_APPLY'];
+    else process.env['SIDETRACK_URL_RESOLVER_AUTO_APPLY'] = priorEnv;
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { readonly data?: { readonly status?: string } };
+    expect(body.data?.status).toBe('skipped-disabled');
+  });
+
   it('POST /v1/visits/{url}/resolve auto-applies a strong URL resolver decision', async () => {
     const canonicalUrl = 'https://example.test/strong-url';
     await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_a' });
     installStrongUrlSnapshot(canonicalUrl);
-    // URL auto-apply is OFF by default; opt in for this test.
-    const priorEnv = process.env['SIDETRACK_URL_RESOLVER_AUTO_APPLY'];
-    process.env['SIDETRACK_URL_RESOLVER_AUTO_APPLY'] = '1';
+    // URL auto-apply is ON by default; the env opts OUT (no setup needed
+    // for this test, the resolver will commit).
 
     const response = await fetch(
       `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve`,
@@ -240,8 +260,6 @@ describe('per-URL HTTP routes', () => {
         body: JSON.stringify({ dryRun: false, policyMode: 'balanced' }),
       },
     );
-    if (priorEnv === undefined) delete process.env['SIDETRACK_URL_RESOLVER_AUTO_APPLY'];
-    else process.env['SIDETRACK_URL_RESOLVER_AUTO_APPLY'] = priorEnv;
 
     expect(response.status).toBe(201);
     const body = (await response.json()) as {

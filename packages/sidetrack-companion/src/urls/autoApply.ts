@@ -16,15 +16,18 @@ export type AutoApplyUrlAttributionStatus =
   | 'skipped-policy'
   | 'skipped-disabled';
 
-// Env gate. Auto-apply is OFF by default — first-time rollout flips
-// this on per dogfood vault. Reversible: users can always re-organize
-// the URL themselves (their `user_asserted` move wins precedence tie
-// against the synthesized `inferred` attribution).
+// Env gate. Auto-apply is ON by default; the env is an opt-OUT for
+// users who want preview-only behavior. Set
+// SIDETRACK_URL_RESOLVER_AUTO_APPLY=0 (or 'false') to disable.
+// Auto-apply is reversible: the user's manual `user_asserted` move
+// always beats the synthesized `inferred` attribution on precedence
+// tie-break.
 export const URL_RESOLVER_AUTO_APPLY_ENV = 'SIDETRACK_URL_RESOLVER_AUTO_APPLY';
 
 const autoApplyEnabled = (): boolean => {
   const raw = process.env[URL_RESOLVER_AUTO_APPLY_ENV];
-  return raw === '1' || raw === 'true';
+  if (raw === undefined || raw === '') return true;
+  return raw !== '0' && raw.toLowerCase() !== 'false';
 };
 
 export interface AutoApplyUrlAttributionResult {
