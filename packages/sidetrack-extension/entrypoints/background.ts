@@ -3159,7 +3159,8 @@ export default defineBackground(() => {
   ]);
   const EDGE_EVENT_DRAIN_ROUTE_BATCH_SIZE = 10;
   const EDGE_EVENT_DRAIN_SCAN_BATCH_SIZE = 500;
-  const EDGE_EVENT_DRAIN_MAX_BATCHES = 50;
+  const EDGE_EVENT_DRAIN_DEFAULT_MAX_BATCHES = 1;
+  const EDGE_EVENT_DRAIN_BULK_MAX_BATCHES = 50;
 
   const mergeCounts = (
     ...counts: readonly Record<string, number>[]
@@ -3290,9 +3291,12 @@ export default defineBackground(() => {
     };
   };
 
-  const drainBufferedEdgeEventsLoop = async (): Promise<EdgeEventDrainStats> => {
+  const drainBufferedEdgeEventsLoop = async (
+    maxBatches = EDGE_EVENT_DRAIN_DEFAULT_MAX_BATCHES,
+  ): Promise<EdgeEventDrainStats> => {
     let total: EdgeEventDrainStats | null = null;
-    for (let i = 0; i < EDGE_EVENT_DRAIN_MAX_BATCHES; i += 1) {
+    const batchLimit = Math.max(1, Math.floor(maxBatches));
+    for (let i = 0; i < batchLimit; i += 1) {
       const next = await drainBufferedEdgeEventsOnce();
       total = total === null ? next : mergeEdgeEventDrainStats(total, next);
       if (next.remaining === 0) break;
@@ -3301,7 +3305,12 @@ export default defineBackground(() => {
     return total ?? emptyEdgeEventDrainStats(await engagementEventBuffer.count());
   };
 
-  const drainBufferedEdgeEvents = createEdgeEventDrainSingleFlight(drainBufferedEdgeEventsLoop);
+  const drainBufferedEdgeEvents = createEdgeEventDrainSingleFlight(() =>
+    drainBufferedEdgeEventsLoop(),
+  );
+  const drainBufferedEdgeEventsBulk = createEdgeEventDrainSingleFlight(() =>
+    drainBufferedEdgeEventsLoop(EDGE_EVENT_DRAIN_BULK_MAX_BATCHES),
+  );
 
   // Drop reminders bound to thread bac_ids that no longer exist.
   // Cleanup pass for the historical mess caused by the pre-fix
@@ -3457,7 +3466,8 @@ export default defineBackground(() => {
   //
   // Usage from the SW DevTools console:
   //   sidetrackDebug.build           — version/sha/dirty/builtAt
-  //   await sidetrackDebug.drainEdgeEvents()
+  //   await sidetrackDebug.drainEdgeEvents()      — one quick capped batch
+  //   await sidetrackDebug.drainEdgeEventsBulk()  — deliberate catch-up
   //   await sidetrackDebug.engagementBufferCount()
   //   await sidetrackDebug.engagementGate()
   //   await sidetrackDebug.engagementHostPermission()
@@ -3465,6 +3475,7 @@ export default defineBackground(() => {
   (globalThis as unknown as { sidetrackDebug?: unknown }).sidetrackDebug = {
     build: __BUILD_INFO__,
     drainEdgeEvents: drainBufferedEdgeEvents,
+    drainEdgeEventsBulk: drainBufferedEdgeEventsBulk,
     engagementBufferCount: () => engagementEventBuffer.count(),
     engagementGate: isEngagementPrivacyGateOpen,
     engagementHostPermission: hasEngagementHostPermission,
