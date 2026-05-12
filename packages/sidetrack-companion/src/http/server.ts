@@ -96,6 +96,7 @@ import {
   type UrlProjection,
 } from '../urls/projection.js';
 import { autoApplyUrlAttribution } from '../urls/autoApply.js';
+import { URL_IGNORED } from '../urls/events.js';
 import {
   appendEntry as appendEntryRaw,
   gcEntries as gcEntriesRaw,
@@ -2021,6 +2022,62 @@ const routes: readonly RouteDefinition[] = [
         // Stage 5.2 R5 — see matching block in the tab-session POST
         // route. (PR #141's invalidateCachedUrlProjection was a TTL
         // cache buster that R2/R5 makes redundant.)
+        const { projection: postProjection } = await loadUrlProjection(context, eventLog);
+        return [
+          201,
+          {
+            data: {
+              accepted,
+              projection: serializeUrlProjection(postProjection),
+            },
+          },
+        ];
+      });
+    },
+  },
+  {
+    // Stage 5 polish — explicit "don't bother me about this URL"
+    // signal. Distinct from POST /attribute with workstreamId:null
+    // (which says "meaningful but no workstream"). Writes a
+    // urls.ignored event; the URL projection's currentIgnored field
+    // hides it from Inbox + auto-apply.
+    method: 'POST',
+    pattern: /^\/v1\/visits\/(?<canonicalUrl>[^/]+)\/ignore$/u,
+    authRequired: true,
+    handle: async (request, _requestId, match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
+      if (canonicalUrl.length === 0) {
+        throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
+      }
+      const eventLog = context.eventLog;
+      const idempotencyKey = requireIdempotencyKey(request);
+      return await runIdempotent(context, 'urlIgnore', idempotencyKey, async () => {
+        const body = objectRecord(await readBody(request)) ?? {};
+        const rawReason = body['reason'];
+        const reason =
+          rawReason === 'noise' || rawReason === 'duplicate' || rawReason === 'private'
+            ? rawReason
+            : 'noise';
+        const payload = {
+          payloadVersion: 1 as const,
+          canonicalUrl,
+          reason,
+        };
+        const aggregateId = `url-ignored:${canonicalUrl}`;
+        const accepted = await eventLog.appendClient({
+          clientEventId: idempotencyKey,
+          aggregateId,
+          type: URL_IGNORED,
+          payload,
+          baseVector: await baseVectorForAggregate(eventLog, aggregateId),
+        });
         const { projection: postProjection } = await loadUrlProjection(context, eventLog);
         return [
           201,

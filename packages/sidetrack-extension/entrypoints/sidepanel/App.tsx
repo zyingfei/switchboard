@@ -2392,6 +2392,44 @@ const App = () => {
     void runAction(() => attributeUrlToWorkstream(canonicalUrl, workstreamId));
   };
 
+  // Stage 5 polish — explicit "ignore this URL" action. Distinct from
+  // workstreamId:null (which is "meaningful one-off"). Writes a
+  // urls.ignored event so the URL is hidden from Inbox + skipped by
+  // auto-apply. Reversible: re-organizing into a workstream clears
+  // the ignore in the projection mutator.
+  const ignoreUrl = async (
+    canonicalUrl: string,
+    reason: 'noise' | 'duplicate' | 'private' = 'noise',
+  ): Promise<WorkboardState> => {
+    if (port.length === 0 || bridgeKey.length === 0) {
+      throw new Error('Companion is not configured.');
+    }
+    const response = await fetch(
+      `http://127.0.0.1:${port}/v1/visits/${encodeURIComponent(canonicalUrl)}/ignore`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'idempotency-key': `url-ignore-${canonicalUrl}-${reason}-${String(Date.now())}`,
+          'x-bac-bridge-key': bridgeKey,
+        },
+        body: JSON.stringify({ reason }),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`URL ignore failed (${String(response.status)}).`);
+    }
+    await loadTabSessions({ forceRefetchSuggestions: true });
+    return await sendRequest({ type: messageTypes.getWorkboardState });
+  };
+
+  const handleUrlIgnore = (
+    canonicalUrl: string,
+    reason: 'noise' | 'duplicate' | 'private' = 'noise',
+  ) => {
+    void runAction(() => ignoreUrl(canonicalUrl, reason));
+  };
+
   const handleMoveTarget = (target: WorkstreamOption | { readonly create: string }) => {
     const threadId = moveThreadId;
     if (threadId === null) {
@@ -5291,6 +5329,77 @@ const App = () => {
             </button>
           ) : null}
         </div>
+        {/* Action bar: shows up when there's a focused URL. Primary
+            actions confirm (when there's a suggestion) or pick. The ⋯
+            overflow houses the terminal-state actions (`Not in any
+            stream` and `Ignore`) so they don't compete with the
+            common-case buttons. Pending state #1 / #2 distinction
+            wired here. */}
+        {focusedUrlRecord !== undefined ? (
+          <div className="tab-attribution-card-actions">
+            {focusedTabSuggestion !== undefined &&
+            focusedTabSuggestion.decision.workstreamId !== undefined &&
+            focusedUrlRecord.currentAttribution === undefined &&
+            focusedUrlRecord.currentIgnored === undefined ? (
+              <button
+                type="button"
+                className="tab-attribution-card-action primary"
+                onClick={() => {
+                  if (focusedTabSuggestion.decision.workstreamId !== undefined) {
+                    handleUrlAttribute(
+                      focusedUrlRecord.canonicalUrl,
+                      focusedTabSuggestion.decision.workstreamId,
+                    );
+                  }
+                }}
+                title="Confirm the suggested workstream"
+              >
+                Yes, that's right
+              </button>
+            ) : null}
+            <button
+              type="button"
+              className="tab-attribution-card-action"
+              onClick={() => {
+                setTabSessionMoveId(focusedUrlRecord.canonicalUrl);
+              }}
+              title="Pick a different workstream"
+            >
+              Pick another…
+            </button>
+            <details className="tab-attribution-card-overflow">
+              <summary
+                className="tab-attribution-card-action overflow"
+                title="More actions"
+                aria-label="More attribution actions"
+              >
+                ⋯
+              </summary>
+              <div className="tab-attribution-card-overflow-menu">
+                <button
+                  type="button"
+                  className="tab-attribution-card-overflow-item"
+                  onClick={() => {
+                    handleUrlAttribute(focusedUrlRecord.canonicalUrl, null);
+                  }}
+                  title="This page is meaningful but doesn't belong to any workstream"
+                >
+                  Not in any stream
+                </button>
+                <button
+                  type="button"
+                  className="tab-attribution-card-overflow-item"
+                  onClick={() => {
+                    handleUrlIgnore(focusedUrlRecord.canonicalUrl, 'noise');
+                  }}
+                  title="Mute this URL — don't bother me about it again"
+                >
+                  Ignore (admin / noise)
+                </button>
+              </div>
+            </details>
+          </div>
+        ) : null}
       </section>
 
       {suggestedOpenTabSession !== undefined && suggestedOpenTabSessionResolution !== undefined ? (

@@ -498,6 +498,75 @@ button:disabled {
   border-color: var(--accent, #0b57d0);
   color: var(--accent, #0b57d0);
 }
+
+/* Action bar under the Current Tab badge. Primary "Yes" stands out;
+   secondary "Pick another…" + the ⋯ overflow are softer. The overflow
+   uses a native <details> for low-JS click-outside-to-dismiss. */
+.tab-attribution-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 0 0 0;
+  flex-wrap: wrap;
+}
+.tab-attribution-card-action {
+  background: transparent;
+  border: 1px solid var(--hair);
+  padding: 3px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--ink-2);
+}
+.tab-attribution-card-action:hover {
+  border-color: var(--accent, #0b57d0);
+  color: var(--accent, #0b57d0);
+}
+.tab-attribution-card-action.primary {
+  background: var(--green-bg);
+  border-color: var(--green-tint);
+  color: var(--green);
+}
+.tab-attribution-card-action.overflow {
+  list-style: none;
+  display: inline-block;
+  padding: 2px 8px;
+}
+.tab-attribution-card-action.overflow::-webkit-details-marker {
+  display: none;
+}
+.tab-attribution-card-overflow {
+  display: inline-block;
+  position: relative;
+}
+.tab-attribution-card-overflow-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 4px;
+  min-width: 200px;
+  background: var(--paper);
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  padding: 4px 0;
+}
+.tab-attribution-card-overflow-item {
+  background: transparent;
+  border: 0;
+  padding: 6px 12px;
+  text-align: left;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--ink-1);
+}
+.tab-attribution-card-overflow-item:hover {
+  background: var(--ink-0);
+  color: var(--ink-1);
+}
 /* Explicit "Go to" affordance for tab-session cards (InboxCard) and the
    current-tab card. Mirrors `.thread-actions .thread-action-icon` from
    the workstream thread rows so the affordance reads identically across

@@ -224,6 +224,46 @@ describe('per-URL HTTP routes', () => {
     expect(body.data.byCanonicalUrl[canonicalUrl]?.currentAttribution?.workstreamId).toBeNull();
   });
 
+  it('POST /v1/visits/{url}/ignore writes urls.ignored event and hides URL from Inbox', async () => {
+    const canonicalUrl = 'https://example.test/admin-panel';
+    await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_a' });
+    const ignore = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/ignore`,
+      {
+        method: 'POST',
+        headers: headers('idem-ignore-1'),
+        body: JSON.stringify({ reason: 'noise' }),
+      },
+    );
+    expect(ignore.status).toBe(201);
+    const inbox = await fetch(`${serverUrl}/v1/visits/inbox`, { headers: headers() });
+    const body = (await inbox.json()) as { data: { items: unknown[]; total: number } };
+    expect(body.data.total).toBe(0);
+    expect(body.data.items).toHaveLength(0);
+  });
+
+  it('POST /v1/visits/{url}/ignore defaults reason to "noise" when omitted', async () => {
+    const canonicalUrl = 'https://example.test/some-page';
+    await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_a' });
+    const ignore = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/ignore`,
+      {
+        method: 'POST',
+        headers: headers('idem-ignore-default'),
+        body: JSON.stringify({}),
+      },
+    );
+    expect(ignore.status).toBe(201);
+    const body = (await ignore.json()) as {
+      data: {
+        projection: {
+          byCanonicalUrl: Record<string, { currentIgnored?: { reason?: string } }>;
+        };
+      };
+    };
+    expect(body.data.projection.byCanonicalUrl[canonicalUrl]?.currentIgnored?.reason).toBe('noise');
+  });
+
   it('POST /v1/visits/{url}/resolve returns `skipped-disabled` when env opts out', async () => {
     const canonicalUrl = 'https://example.test/opt-out-url';
     await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_a' });
