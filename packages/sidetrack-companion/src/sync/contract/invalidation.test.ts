@@ -2,6 +2,9 @@ import { describe, expect, it } from 'vitest';
 
 import { ANNOTATION_CREATED } from '../../annotations/events.js';
 import { DISPATCH_RECORDED } from '../../dispatches/events.js';
+import { ENGAGEMENT_SESSION_AGGREGATED } from '../../engagement/events.js';
+import { NAVIGATION_COMMITTED } from '../../navigation/events.js';
+import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
 import {
   USER_ENGAGEMENT_RELABELED,
   USER_FLOW_CONFIRMED,
@@ -236,6 +239,47 @@ describe('Stage 5.2 W6 — invalidation rules', () => {
   it('annotation / dispatch events are graph-additive — produce no invalidations', () => {
     expect(invalidationsForEvent(makeEvent(ANNOTATION_CREATED, {}))).toEqual([]);
     expect(invalidationsForEvent(makeEvent(DISPATCH_RECORDED, {}))).toEqual([]);
+  });
+
+  it('Class A — browser.timeline.observed contributes url + engagementVisit + topicMember keys', () => {
+    const keys = invalidationsForEvent(
+      makeEvent(BROWSER_TIMELINE_OBSERVED, {
+        eventId: 'visit-1',
+        observedAt: '2026-05-12T10:00:00.000Z',
+        url: 'https://example.com/a',
+        canonicalUrl: 'https://example.com/a',
+        transition: 'activated',
+      }),
+    );
+    expect(keys).toEqual([
+      { kind: 'url', canonicalUrl: 'https://example.com/a' },
+      { kind: 'engagementVisit', visitId: 'visit-1' },
+      { kind: 'topicMember', visitId: 'visit-1' },
+    ]);
+  });
+
+  it('navigation.committed contributes url + engagementVisit + topicMember keys', () => {
+    const keys = invalidationsForEvent(
+      makeEvent(NAVIGATION_COMMITTED, {
+        visitId: 'visit-1',
+        canonicalUrl: 'https://example.com/a',
+      }),
+    );
+    expect(keys).toEqual([
+      { kind: 'url', canonicalUrl: 'https://example.com/a' },
+      { kind: 'engagementVisit', visitId: 'visit-1' },
+      { kind: 'topicMember', visitId: 'visit-1' },
+    ]);
+  });
+
+  it('engagement.session.aggregated contributes engagementVisit + rankerLabels', () => {
+    const keys = invalidationsForEvent(
+      makeEvent(ENGAGEMENT_SESSION_AGGREGATED, { visitId: 'visit-1' }),
+    );
+    expect(keys).toEqual([
+      { kind: 'engagementVisit', visitId: 'visit-1' },
+      { kind: 'rankerLabels' },
+    ]);
   });
 
   it('unknown event type returns empty (caller decides)', () => {

@@ -75,11 +75,8 @@ describe('Stage 5.2 W2 wiring — materializer URL + tabSession accumulator pari
     await rm(vaultRoot, { recursive: true, force: true });
   });
 
-  const summary = (
-    projection:
-      | { byCanonicalUrl: ReadonlyMap<string, { currentAttribution?: { workstreamId: string | null } | undefined; visitCount: number; tabSessionIds: readonly string[] }> }
-      | { bySessionId: ReadonlyMap<string, { latestTitle?: string; latestUrl?: string }> },
-  ): string => JSON.stringify(projection, (_, value) => (value instanceof Map ? [...value.entries()] : value));
+  const summary = (projection: unknown): string =>
+    JSON.stringify(projection, (_, value) => (value instanceof Map ? [...value.entries()] : value));
 
   it('catchUp seeds accumulators from the event log; subsequent drain output is unchanged', async () => {
     const replica = await loadOrCreateReplica(vaultRoot);

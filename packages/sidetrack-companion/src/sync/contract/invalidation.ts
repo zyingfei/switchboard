@@ -29,7 +29,10 @@ import {
 } from '../../feedback/events.js';
 import { ANNOTATION_CREATED, ANNOTATION_DELETED, ANNOTATION_NOTE_SET } from '../../annotations/events.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
+import { ENGAGEMENT_SESSION_AGGREGATED } from '../../engagement/events.js';
+import { NAVIGATION_COMMITTED } from '../../navigation/events.js';
 import { QUEUE_CREATED, QUEUE_STATUS_SET } from '../../queue/events.js';
+import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
 import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from '../../recall/events.js';
 import { CAPTURE_EXTRACTION_PRODUCED } from '../../recall/extraction/events.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../../tabsession/events.js';
@@ -192,6 +195,42 @@ export const INVALIDATION_RULES: Readonly<Record<string, InvalidationRule>> = {
   [ANNOTATION_DELETED]: () => [],
   [DISPATCH_RECORDED]: () => [],
   [DISPATCH_LINKED]: () => [],
+  // Class A leaf observations — append-only at the event log, but
+  // each contributes a new visit / engagement signal the materializer
+  // must classify. Engagement classifier + similarity + topics all
+  // need to re-process when these arrive.
+  [BROWSER_TIMELINE_OBSERVED]: (event) => {
+    const p = asRecord(event.payload);
+    const canonicalUrl = str(p['canonicalUrl']) ?? str(p['url']);
+    const visitId = str(p['eventId']);
+    const keys: InvalidationKey[] = [];
+    if (canonicalUrl !== undefined) keys.push({ kind: 'url', canonicalUrl });
+    if (visitId !== undefined) {
+      keys.push({ kind: 'engagementVisit', visitId });
+      keys.push({ kind: 'topicMember', visitId });
+    }
+    return keys;
+  },
+  [NAVIGATION_COMMITTED]: (event) => {
+    const p = asRecord(event.payload);
+    const canonicalUrl = str(p['canonicalUrl']);
+    const visitId = str(p['visitId']);
+    const keys: InvalidationKey[] = [];
+    if (canonicalUrl !== undefined) keys.push({ kind: 'url', canonicalUrl });
+    if (visitId !== undefined) {
+      keys.push({ kind: 'engagementVisit', visitId });
+      keys.push({ kind: 'topicMember', visitId });
+    }
+    return keys;
+  },
+  [ENGAGEMENT_SESSION_AGGREGATED]: (event) => {
+    const visitId = str(asRecord(event.payload)['visitId']);
+    if (visitId === undefined) return [{ kind: 'rankerLabels' }];
+    return [
+      { kind: 'engagementVisit', visitId },
+      { kind: 'rankerLabels' },
+    ];
+  },
   // Group B (W7 content / recall index lane).
   [CAPTURE_RECORDED]: (event) => {
     const sourceUnitId = str(asRecord(event.payload)['sourceUnitId']);

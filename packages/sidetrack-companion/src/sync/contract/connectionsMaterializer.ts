@@ -294,6 +294,13 @@ export const createConnectionsMaterializer = (
   let tabSessionAccumulator: TabSessionProjectionAccumulator =
     createEmptyTabSessionProjectionAccumulator();
   let projectionAccumulatorsInitialized = false;
+  // Stage 5.2 W6 per-pass skip — cache the last engagement class
+  // revision so a drain whose W6 key set contains no engagement-touching
+  // keys (engagementVisit, rankerLabels) can reuse it. The classifier
+  // pass is O(events) and the dominant cost on a vault with many
+  // graph-additive events (annotations / dispatches / workstream
+  // mutations) — skipping it on those drains is a real win.
+  let lastEngagementClassRevision: ReturnType<typeof buildEngagementClassRevision> | undefined;
   let pending = false;
   let running = false;
   let dirty = false;
@@ -516,13 +523,34 @@ export const createConnectionsMaterializer = (
     const rawTimelineDays = buildTimelineDays(merged);
     mark(`buildTimelineDays days=${String(rawTimelineDays.length)}`);
     await yieldToEventLoop();
-    const engagementInputs = buildEngagementClassifierInputs(merged, rawTimelineDays);
-    const engagementClassRevision = buildEngagementClassRevision(engagementInputs, {
-      producedAt: maxAcceptedAtMs(merged),
-    });
-    mark(`engagementClassifier inputs=${String(engagementInputs.length)}`);
-    await engagementClassStore.putRevision(engagementClassRevision);
-    mark('engagementClassStore.putRevision');
+    // Stage 5.2 W6 per-pass skip — when no engagement-touching keys
+    // arrived since last drain AND a cached revision exists, reuse it.
+    // The classifier pass is O(events) so this is a real per-drain win
+    // for graph-additive drains (annotations / dispatches / workstream
+    // mutations / queue mutations).
+    const engagementTouchingKey = buildKeys.some(
+      (k) => k.kind === 'engagementVisit' || k.kind === 'rankerLabels',
+    );
+    let engagementInputs: ReturnType<typeof buildEngagementClassifierInputs>;
+    let engagementClassRevision: ReturnType<typeof buildEngagementClassRevision>;
+    if (!engagementTouchingKey && lastEngagementClassRevision !== undefined) {
+      // Reuse cached revision; we still need the inputs for downstream
+      // enrichTimelineDaysWithEngagement(...) which reads engagement
+      // dimensions per visit. Recomputing inputs alone is cheaper than
+      // re-running the classifier + putRevision.
+      engagementInputs = buildEngagementClassifierInputs(merged, rawTimelineDays);
+      engagementClassRevision = lastEngagementClassRevision;
+      mark(`engagementClassifier skip (w6 reuse) inputs=${String(engagementInputs.length)}`);
+    } else {
+      engagementInputs = buildEngagementClassifierInputs(merged, rawTimelineDays);
+      engagementClassRevision = buildEngagementClassRevision(engagementInputs, {
+        producedAt: maxAcceptedAtMs(merged),
+      });
+      mark(`engagementClassifier inputs=${String(engagementInputs.length)}`);
+      await engagementClassStore.putRevision(engagementClassRevision);
+      mark('engagementClassStore.putRevision');
+      lastEngagementClassRevision = engagementClassRevision;
+    }
     await yieldToEventLoop();
     const timelineDays = enrichTimelineDaysWithEngagement(rawTimelineDays, engagementInputs);
     mark('enrichTimelineDays');
@@ -729,6 +757,9 @@ export const createConnectionsMaterializer = (
     projectionAccumulatorsInitialized = false;
     urlAccumulator = createEmptyUrlProjectionAccumulator();
     tabSessionAccumulator = createEmptyTabSessionProjectionAccumulator();
+    // Stage 5.2 W6 per-pass — invalidate the engagement cache on
+    // catchUp so the next drain rebuilds against the fresh log.
+    lastEngagementClassRevision = undefined;
     try {
       await buildAndWrite();
       lastSuccessAt = new Date().toISOString();
