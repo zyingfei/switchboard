@@ -5342,12 +5342,13 @@ const App = () => {
             </button>
           ) : null}
         </div>
-        {/* Action bar: shows up when there's a focused URL. Primary
-            actions confirm (when there's a suggestion) or pick. The ⋯
-            overflow houses the terminal-state actions (`Not in any
-            stream` and `Ignore`) so they don't compete with the
-            common-case buttons. Pending state #1 / #2 distinction
-            wired here. */}
+        {/* Action bar: shows up when there's a focused URL. All four
+            choices flat — no overflow menu — so every state from the
+            5-state attribution model has a directly-clickable
+            affordance. "Yes, that's right" only renders when a
+            high-enough suggestion exists; the other three always
+            render so the user can take the corresponding action even
+            when no suggestion is present. */}
         {focusedUrlRecord !== undefined ? (
           <div className="tab-attribution-card-actions">
             {focusedTabSuggestion !== undefined &&
@@ -5380,37 +5381,26 @@ const App = () => {
             >
               Pick another…
             </button>
-            <details className="tab-attribution-card-overflow">
-              <summary
-                className="tab-attribution-card-action overflow"
-                title="More actions"
-                aria-label="More attribution actions"
-              >
-                ⋯
-              </summary>
-              <div className="tab-attribution-card-overflow-menu">
-                <button
-                  type="button"
-                  className="tab-attribution-card-overflow-item"
-                  onClick={() => {
-                    handleUrlAttribute(focusedUrlRecord.canonicalUrl, null);
-                  }}
-                  title="This page is meaningful but doesn't belong to any workstream"
-                >
-                  Not in any stream
-                </button>
-                <button
-                  type="button"
-                  className="tab-attribution-card-overflow-item"
-                  onClick={() => {
-                    handleUrlIgnore(focusedUrlRecord.canonicalUrl, 'noise');
-                  }}
-                  title="Mute this URL — don't bother me about it again"
-                >
-                  Ignore (admin / noise)
-                </button>
-              </div>
-            </details>
+            <button
+              type="button"
+              className="tab-attribution-card-action"
+              onClick={() => {
+                handleUrlAttribute(focusedUrlRecord.canonicalUrl, null);
+              }}
+              title="This page is meaningful but doesn't belong to any workstream"
+            >
+              Not in any stream
+            </button>
+            <button
+              type="button"
+              className="tab-attribution-card-action"
+              onClick={() => {
+                handleUrlIgnore(focusedUrlRecord.canonicalUrl, 'noise');
+              }}
+              title="Mute this URL — don't bother me about it again"
+            >
+              Ignore (admin / noise)
+            </button>
           </div>
         ) : null}
       </section>
