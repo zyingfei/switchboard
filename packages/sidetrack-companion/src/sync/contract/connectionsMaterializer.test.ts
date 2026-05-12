@@ -349,7 +349,9 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     });
     await eventLog.importPeerEvent(event);
     m.onAccepted(event, { origin: 'peer' });
-    await new Promise((r) => setTimeout(r, 30));
+    // Stage 5.2 W1a — drain is debounced; awaitIdle waits through
+    // debounce + the failing drain attempt that parks lastError.
+    await m.awaitIdle();
     expect(m.health().status).toBe('failed');
     expect(m.health().lastError).toContain('disk full');
 
@@ -442,5 +444,52 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     ];
     for (const t of expected) expect(m.handles.has(t)).toBe(true);
     expect(m.handles.has('unrelated.event')).toBe(false);
+  });
+
+  // Stage 5.2 W1a — burst-arrival events should coalesce to a single
+  // drain via the debounce window. Without debouncing, each accepted
+  // event triggers its own rebuild (with the existing per-iteration
+  // coalescing folding subsequent arrivals into the NEXT iteration);
+  // with debouncing, the whole burst becomes ONE rebuild.
+  it('debounce coalesces a burst of onAccepted events into a single putCurrent call', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    let putCurrentCalls = 0;
+    const store = {
+      putCurrent: async (snapshot: import('../../connections/snapshot.js').ConnectionsSnapshot) => {
+        putCurrentCalls += 1;
+        void snapshot;
+      },
+      readCurrent: async () => null,
+      putDay: async () => undefined,
+      readDay: async () => null,
+      listDays: async () => [],
+    };
+    const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store });
+
+    // 10 events accepted in tight succession (well under the 250ms
+    // debounce window). Each requestDrain resets the timer; only
+    // the last one should actually fire startDrain.
+    for (let i = 1; i <= 10; i += 1) {
+      const event = buildEvent({
+        seq: i,
+        type: THREAD_UPSERTED,
+        payload: {
+          bac_id: `thread_burst_${String(i)}`,
+          provider: 'chatgpt',
+          threadUrl: `https://x/${String(i)}`,
+          title: `t${String(i)}`,
+          lastSeenAt: `2026-05-07T${String(i + 9).padStart(2, '0')}:00:00.000Z`,
+          tags: [],
+        },
+      });
+      await eventLog.importPeerEvent(event);
+      m.onAccepted(event, { origin: 'peer' });
+    }
+    await m.awaitIdle();
+
+    // ONE drain even though 10 events were accepted.
+    expect(putCurrentCalls).toBe(1);
   });
 });

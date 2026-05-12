@@ -104,6 +104,13 @@ import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../../tabsession/events.js';
 
 const FAILURE_COOLDOWN_MS = 5_000;
 
+// Stage 5.2 W1a — debounce window between event accept and drain trigger.
+// Coalesces burst arrivals (multi-tab navigation, peer-event imports) into
+// a single drain instead of one rebuild per event. Sustained event streams
+// at a lower frequency than this window still produce per-event drains;
+// the worker_thread move (W1b) is the structural fix for those.
+const DRAIN_DEBOUNCE_MS = 250;
+
 // Hardcoded event types this materializer reacts to. Connections
 // has no registry surface, so we can't derive handles from
 // eventTypesForMaterializer('connections') — and we don't want to,
@@ -194,6 +201,12 @@ export const createConnectionsMaterializer = (
   let lastSuccessAt: string | null = null;
   let lastError: string | null = null;
   let lastFailureAtMs = 0;
+  // Stage 5.2 W1a — debounce timer. Coalesces burst event arrivals
+  // (e.g. multiple tabs activating in sequence, peer-event imports)
+  // into one drain. Cleared when a fresh requestDrain arrives within
+  // the window. unref() so a pending timer doesn't keep the process
+  // alive at shutdown.
+  let drainDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
   type TimelineEntryWithDimensions = TimelineDayProjection['entries'][number] & {
     readonly dimensions?: unknown;
@@ -423,14 +436,8 @@ export const createConnectionsMaterializer = (
     }
   };
 
-  const requestDrain = (): void => {
-    dirty = true;
-    pending = true;
+  const startDrain = (): void => {
     if (running) return;
-    // Failure cooldown gate — same pattern as timelineMaterializer.
-    // catchUp bypasses this gate; onAccepted respects it.
-    const sinceFailureMs = Date.now() - lastFailureAtMs;
-    if (lastError !== null && sinceFailureMs < FAILURE_COOLDOWN_MS) return;
     running = true;
     void (async () => {
       try {
@@ -440,6 +447,27 @@ export const createConnectionsMaterializer = (
         pending = dirty;
       }
     })();
+  };
+
+  const requestDrain = (): void => {
+    dirty = true;
+    pending = true;
+    if (running) return;
+    // Failure cooldown gate — same pattern as timelineMaterializer.
+    // catchUp bypasses this gate; onAccepted respects it.
+    const sinceFailureMs = Date.now() - lastFailureAtMs;
+    if (lastError !== null && sinceFailureMs < FAILURE_COOLDOWN_MS) return;
+    // Stage 5.2 W1a — debounce: coalesce burst event arrivals into a
+    // single drain. Each requestDrain resets the timer, so a steady
+    // stream of events triggers exactly one drain after the burst
+    // settles (or at debounceMs after the latest arrival).
+    if (drainDebounceTimer !== null) clearTimeout(drainDebounceTimer);
+    drainDebounceTimer = setTimeout(() => {
+      drainDebounceTimer = null;
+      if (!dirty || running) return;
+      startDrain();
+    }, DRAIN_DEBOUNCE_MS);
+    drainDebounceTimer.unref();
   };
 
   const onAccepted: Materializer['onAccepted'] = (event) => {
