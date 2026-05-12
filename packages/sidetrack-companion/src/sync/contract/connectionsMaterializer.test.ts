@@ -443,4 +443,72 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     for (const t of expected) expect(m.handles.has(t)).toBe(true);
     expect(m.handles.has('unrelated.event')).toBe(false);
   });
+
+  // Stage 5.2 W2b — high-frequency events that fold into the next
+  // natural drain (engagement aggregates, visual fingerprints) MUST NOT
+  // be in HANDLES, so they don't trigger their own per-event rebuild.
+  it('engagement.session.aggregated is NOT in handles (deferred to next structural drain)', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+    const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store });
+
+    expect(m.handles.has('engagement.session.aggregated')).toBe(false);
+    expect(m.handles.has('visual.fingerprint.observed')).toBe(false);
+  });
+
+  it('engagement bursts do not trigger any drain (deferred until next structural event)', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    let putCurrentCalls = 0;
+    const store = {
+      putCurrent: async (snapshot: import('../../connections/snapshot.js').ConnectionsSnapshot) => {
+        putCurrentCalls += 1;
+        void snapshot;
+      },
+      readCurrent: async () => null,
+      putDay: async () => undefined,
+      readDay: async () => null,
+      listDays: async () => [],
+    };
+    const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store });
+
+    // Simulate 50 engagement aggregates arriving while a user reads a
+    // page (every ~30s per tab × 4 tabs = these would have been 50
+    // per-event drains pre-W2b). With W2b they trigger zero drains
+    // because the materializer doesn't route the event type.
+    for (let i = 1; i <= 50; i += 1) {
+      const event = buildEvent({
+        seq: i,
+        type: 'engagement.session.aggregated',
+        payload: {
+          payloadVersion: 1,
+          visitId: `visit-${String(i % 5)}`,
+          sessionId: `session-${String(i)}`,
+          dimensions: {
+            engagement: {
+              activeMs: 1000,
+              visibleMs: 1000,
+              focusedWindowMs: 1000,
+              idleMs: 0,
+              foregroundBursts: 1,
+              returnCount: 0,
+              scrollEvents: 0,
+              maxScrollRatio: 0,
+              copyCount: 0,
+              pasteCount: 0,
+            },
+          },
+        },
+      });
+      await eventLog.importPeerEvent(event);
+      m.onAccepted(event, { origin: 'peer' });
+    }
+    await m.awaitIdle();
+
+    // No drains — engagement events are not in HANDLES.
+    expect(putCurrentCalls).toBe(0);
+  });
 });
