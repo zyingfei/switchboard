@@ -60,9 +60,11 @@ import {
 import { projectFeedback } from '../feedback/projection.js';
 import { projectPrivacy } from '../privacy/projection.js';
 import {
+  deserializeTabSessionProjection,
   projectTabSessions,
   serializeTabSessionProjection,
   tabSessionInbox,
+  type TabSessionProjection,
 } from '../tabsession/projection.js';
 import { autoApplyTabSessionAttribution } from '../tabsession/autoApply.js';
 import type {
@@ -71,9 +73,11 @@ import type {
 } from '../tabsession/policy.js';
 import { resolveAttribution, resolveUrlAttribution } from '../tabsession/resolver.js';
 import {
+  deserializeUrlProjection,
   projectUrls,
   serializeUrlProjection,
   urlInbox,
+  type UrlProjection,
 } from '../urls/projection.js';
 import {
   appendEntry as appendEntryRaw,
@@ -1137,6 +1141,46 @@ const parseThreadUpsertBody = async (vaultRoot: string, body: unknown) => {
   });
 };
 
+// Stage 5.2 R2 — snapshot-first projection lookup. HTTP routes prefer the
+// committed snapshot's embedded projection so reads don't pay the cost of
+// projectUrls(merged) / projectTabSessions(merged) on every request. Falls
+// back to re-deriving from the event log only when the snapshot is null
+// (cold start before first reconciliation) or doesn't yet carry the
+// projection field (loading a pre-R1 snapshot from disk).
+const loadUrlProjection = async (
+  context: CompanionHttpConfig,
+  eventLog: EventLog,
+): Promise<{ projection: UrlProjection; snapshotRevision: string | null }> => {
+  const snapshot = await context.connectionsStore?.readCurrent();
+  if (snapshot?.urlProjection !== undefined) {
+    return {
+      projection: deserializeUrlProjection(snapshot.urlProjection),
+      snapshotRevision: snapshot.snapshotRevision ?? null,
+    };
+  }
+  return {
+    projection: projectUrls(await eventLog.readMerged()),
+    snapshotRevision: snapshot?.snapshotRevision ?? null,
+  };
+};
+
+const loadTabSessionProjection = async (
+  context: CompanionHttpConfig,
+  eventLog: EventLog,
+): Promise<{ projection: TabSessionProjection; snapshotRevision: string | null }> => {
+  const snapshot = await context.connectionsStore?.readCurrent();
+  if (snapshot?.tabSessionProjection !== undefined) {
+    return {
+      projection: deserializeTabSessionProjection(snapshot.tabSessionProjection),
+      snapshotRevision: snapshot.snapshotRevision ?? null,
+    };
+  }
+  return {
+    projection: projectTabSessions(await eventLog.readMerged()),
+    snapshotRevision: snapshot?.snapshotRevision ?? null,
+  };
+};
+
 const routes: readonly RouteDefinition[] = [
   {
     method: 'GET',
@@ -1406,12 +1450,15 @@ const routes: readonly RouteDefinition[] = [
           'Event log is not configured on this companion.',
         );
       }
+      const { projection, snapshotRevision } = await loadTabSessionProjection(
+        context,
+        context.eventLog,
+      );
       return [
         200,
         {
-          data: serializeTabSessionProjection(
-            projectTabSessions(await context.eventLog.readMerged()),
-          ),
+          data: serializeTabSessionProjection(projection),
+          ...(snapshotRevision === null ? {} : { snapshotRevision }),
         },
       ];
     },
@@ -1433,7 +1480,10 @@ const routes: readonly RouteDefinition[] = [
       const offsetRaw = Number.parseInt(url.searchParams.get('offset') ?? '0', 10);
       const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 200) : 50;
       const offset = Number.isFinite(offsetRaw) && offsetRaw > 0 ? offsetRaw : 0;
-      const projection = projectTabSessions(await context.eventLog.readMerged());
+      const { projection, snapshotRevision } = await loadTabSessionProjection(
+        context,
+        context.eventLog,
+      );
       const items = tabSessionInbox(projection, { limit, offset });
       return [
         200,
@@ -1445,6 +1495,7 @@ const routes: readonly RouteDefinition[] = [
             limit,
             offset,
           },
+          ...(snapshotRevision === null ? {} : { snapshotRevision }),
         },
       ];
     },
@@ -1483,7 +1534,10 @@ const routes: readonly RouteDefinition[] = [
       }
       const tabSessionId = decodeURIComponent(match.tabSessionId ?? '');
       const merged = await context.eventLog.readMerged();
-      const projection = projectTabSessions(merged);
+      const projection =
+        snapshot.tabSessionProjection !== undefined
+          ? deserializeTabSessionProjection(snapshot.tabSessionProjection)
+          : projectTabSessions(merged);
       if (!projection.bySessionId.has(tabSessionId)) {
         throw new HttpRouteError(404, 'TAB_SESSION_NOT_FOUND', 'Tab session was not found.');
       }
@@ -1496,6 +1550,9 @@ const routes: readonly RouteDefinition[] = [
             projection,
             events: merged,
           }),
+          ...(snapshot.snapshotRevision === undefined
+            ? {}
+            : { snapshotRevision: snapshot.snapshotRevision }),
         },
       ];
     },
@@ -1537,7 +1594,13 @@ const routes: readonly RouteDefinition[] = [
           );
         }
         const tabSessionId = decodeURIComponent(match.tabSessionId ?? '');
-        const projection = projectTabSessions(await eventLog.readMerged());
+        // Auto-apply runs against the committed snapshot's projection; the
+        // event-log fallback covers a snapshot loaded from disk that was
+        // produced before R1 (no embedded projection).
+        const projection =
+          snapshot.tabSessionProjection !== undefined
+            ? deserializeTabSessionProjection(snapshot.tabSessionProjection)
+            : projectTabSessions(await eventLog.readMerged());
         if (!projection.bySessionId.has(tabSessionId)) {
           throw new HttpRouteError(404, 'TAB_SESSION_NOT_FOUND', 'Tab session was not found.');
         }
@@ -1598,7 +1661,11 @@ const routes: readonly RouteDefinition[] = [
             'Body must contain workstreamId as a non-empty string or null.',
           );
         }
-        const priorProjection = projectTabSessions(await eventLog.readMerged());
+        // Stage 5.2 R5 — pre-write reads prior attribution from snapshot's
+        // projection (cheap), post-write returns the full projectTabSessions
+        // result to guarantee read-your-writes (the just-appended event MUST
+        // be reflected). Half 2's W2 will upgrade this to a row-local fold.
+        const { projection: priorProjection } = await loadTabSessionProjection(context, eventLog);
         const fromWorkstreamId =
           priorProjection.bySessionId.get(tabSessionId)?.currentAttribution?.workstreamId;
         const payload = {
@@ -1651,10 +1718,12 @@ const routes: readonly RouteDefinition[] = [
           'Event log is not configured on this companion.',
         );
       }
+      const { projection, snapshotRevision } = await loadUrlProjection(context, context.eventLog);
       return [
         200,
         {
-          data: serializeUrlProjection(projectUrls(await context.eventLog.readMerged())),
+          data: serializeUrlProjection(projection),
+          ...(snapshotRevision === null ? {} : { snapshotRevision }),
         },
       ];
     },
@@ -1676,7 +1745,7 @@ const routes: readonly RouteDefinition[] = [
       const offsetRaw = Number.parseInt(url.searchParams.get('offset') ?? '0', 10);
       const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 200) : 50;
       const offset = Number.isFinite(offsetRaw) && offsetRaw > 0 ? offsetRaw : 0;
-      const projection = projectUrls(await context.eventLog.readMerged());
+      const { projection, snapshotRevision } = await loadUrlProjection(context, context.eventLog);
       const items = urlInbox(projection, { limit, offset });
       return [
         200,
@@ -1687,6 +1756,7 @@ const routes: readonly RouteDefinition[] = [
             limit,
             offset,
           },
+          ...(snapshotRevision === null ? {} : { snapshotRevision }),
         },
       ];
     },
@@ -1773,7 +1843,11 @@ const routes: readonly RouteDefinition[] = [
             'Body must contain workstreamId as a non-empty string or null.',
           );
         }
-        const priorProjection = projectUrls(await eventLog.readMerged());
+        // Stage 5.2 R5 — pre-write reads prior attribution from snapshot's
+        // projection (cheap); post-write keeps projectUrls(merged) for
+        // read-your-writes (just-appended event must be reflected). Half 2
+        // W2 will upgrade this to a row-local fold.
+        const { projection: priorProjection } = await loadUrlProjection(context, eventLog);
         const fromWorkstreamId =
           priorProjection.byCanonicalUrl.get(canonicalUrl)?.currentAttribution?.workstreamId;
         const payload = {

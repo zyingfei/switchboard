@@ -263,6 +263,22 @@ export const serializeTabSessionProjection = (
   openSessionsByTabId: Object.fromEntries(projection.openSessionsByTabId),
 });
 
+export const deserializeTabSessionProjection = (
+  serialized: SerializedTabSessionProjection,
+): TabSessionProjection => ({
+  schemaVersion: serialized.schemaVersion,
+  bySessionId: new Map(
+    Object.entries(serialized.bySessionId).sort(([left], [right]) =>
+      compareString(left, right),
+    ),
+  ),
+  openSessionsByTabId: new Map(
+    Object.entries(serialized.openSessionsByTabId).sort(([left], [right]) =>
+      compareString(left, right),
+    ),
+  ),
+});
+
 export const tabSessionInbox = (
   projection: TabSessionProjection,
   input: { readonly limit: number; readonly offset: number },

@@ -23,7 +23,6 @@ import {
   type VisitSimilarityEmbedder,
 } from '../../connections/visitSimilarity.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
-import { ENGAGEMENT_SESSION_AGGREGATED } from '../../engagement/events.js';
 import {
   USER_ENGAGEMENT_RELABELED,
   USER_FLOW_CONFIRMED,
@@ -81,7 +80,6 @@ import {
   type TimelineStore,
 } from '../../timeline/projection.js';
 import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
-import { VISUAL_FINGERPRINT_OBSERVED } from '../../visual/events.js';
 import type { AcceptedEvent } from '../causal.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
@@ -108,6 +106,13 @@ import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../../tabsession/events.js';
 
 const FAILURE_COOLDOWN_MS = 5_000;
 
+// Stage 5.2 W1a — debounce window between event accept and drain trigger.
+// Coalesces burst arrivals (multi-tab navigation, peer-event imports) into
+// a single drain instead of one rebuild per event. Sustained event streams
+// at a lower frequency than this window still produce per-event drains;
+// the worker_thread move (W1b) is the structural fix for those.
+const DRAIN_DEBOUNCE_MS = 250;
+
 // Hardcoded event types this materializer reacts to. Connections
 // has no registry surface, so we can't derive handles from
 // eventTypesForMaterializer('connections') — and we don't want to,
@@ -115,6 +120,27 @@ const FAILURE_COOLDOWN_MS = 5_000;
 // owners. The list mirrors the union of event types that affect
 // connection nodes or edges; any new event type that adds to the
 // graph (e.g. a future capture-note event) gets added here.
+//
+// Stage 5.2 W2b — high-frequency events that fold into the next
+// natural drain are intentionally OMITTED from HANDLES so they do not
+// each trigger a full O(events) rebuild. Specifically:
+//   - `engagement.session.aggregated` fires every ~30s per active
+//     tab. The engagement classifier ran inside `buildAndWrite`,
+//     reading the merged log from disk every time, which produced
+//     the per-event rebuild storm observed during dogfood. The
+//     engagement signal is still folded into the next drain (which
+//     reads the full log via `readMerged`), so the snapshot's
+//     engagement-derived edges remain correct — they just refresh on
+//     the next structural event (page nav, user action, etc).
+//   - `visual.fingerprint.observed` always pairs with a
+//     `browser.timeline.observed` event for the same nav, so its
+//     arrival never triggers a structurally-new rebuild — the paired
+//     timeline observation does.
+// If a session never produces a HOT event for an extended period
+// (passive read of one page), the engagement classification stays
+// stale until the next navigation or mutation. That is acceptable
+// for current UX: engagement classification is contextual signal,
+// not user-immediate-feedback.
 const HANDLES: ReadonlySet<string> = new Set<string>([
   THREAD_UPSERTED,
   THREAD_ARCHIVED,
@@ -133,7 +159,6 @@ const HANDLES: ReadonlySet<string> = new Set<string>([
   CAPTURE_EXTRACTION_PRODUCED,
   RECALL_TOMBSTONE_TARGET,
   NAVIGATION_COMMITTED,
-  ENGAGEMENT_SESSION_AGGREGATED,
   USER_ENGAGEMENT_RELABELED,
   USER_FLOW_CONFIRMED,
   USER_FLOW_REJECTED,
@@ -150,7 +175,6 @@ const HANDLES: ReadonlySet<string> = new Set<string>([
   // materializer reads the daily projection rather than the
   // event payload directly.
   BROWSER_TIMELINE_OBSERVED,
-  VISUAL_FINGERPRINT_OBSERVED,
 ]);
 
 export interface CreateConnectionsMaterializerDeps {
@@ -198,6 +222,12 @@ export const createConnectionsMaterializer = (
   let lastSuccessAt: string | null = null;
   let lastError: string | null = null;
   let lastFailureAtMs = 0;
+  // Stage 5.2 W1a — debounce timer. Coalesces burst event arrivals
+  // (e.g. multiple tabs activating in sequence, peer-event imports)
+  // into one drain. Cleared when a fresh requestDrain arrives within
+  // the window. unref() so a pending timer doesn't keep the process
+  // alive at shutdown.
+  let drainDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
   type TimelineEntryWithDimensions = TimelineDayProjection['entries'][number] & {
     readonly dimensions?: unknown;
@@ -358,16 +388,31 @@ export const createConnectionsMaterializer = (
     }
   };
 
+  // Stage 5.2 W1b — cooperative yielding. Each major sync-CPU phase
+  // is preceded by `yieldToEventLoop()` so HTTP request handlers and
+  // other I/O callbacks get a turn between phases. HTTP P99 during
+  // reconcile becomes "max phase duration" instead of "full rebuild
+  // duration." A future PR may move execution to a worker_thread,
+  // which would drop P99 to ~0; this is the lower-risk first step.
+  const yieldToEventLoop = (): Promise<void> =>
+    new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+
   const buildAndWrite = async (): Promise<void> => {
     const merged = await deps.eventLog.readMerged();
     const vault = await readVaultStores(deps.vaultRoot);
+    await yieldToEventLoop();
     const rawTimelineDays = buildTimelineDays(merged);
+    await yieldToEventLoop();
     const engagementInputs = buildEngagementClassifierInputs(merged, rawTimelineDays);
     const engagementClassRevision = buildEngagementClassRevision(engagementInputs, {
       producedAt: maxAcceptedAtMs(merged),
     });
     await engagementClassStore.putRevision(engagementClassRevision);
+    await yieldToEventLoop();
     const timelineDays = enrichTimelineDaysWithEngagement(rawTimelineDays, engagementInputs);
+    await yieldToEventLoop();
     // Stage 5.2 W3 — skip-gate the most expensive pass. The revisionId
     // is a hash over (model + threshold + topK + gate + per-visit
     // corpus/focus). If the same set of visits has already been
@@ -386,12 +431,14 @@ export const createConnectionsMaterializer = (
       await writeVisitSimilarityRevision(deps.vaultRoot, visitSimilarity);
     }
     const previousTopicRevision = await topicRevisionStore.readActiveRevision();
+    await yieldToEventLoop();
     const topicRevision = await buildSelectedTopicRevision({
       visits: timelineDays.flatMap((day) => day.entries.map(topicVisitFromEntry)),
       visitSimilarity,
       ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
     });
     await topicRevisionStore.putActiveRevision(topicRevision);
+    await yieldToEventLoop();
     const input: ConnectionsInput = {
       events: merged,
       ...vault,
@@ -402,7 +449,9 @@ export const createConnectionsMaterializer = (
       topicRevision,
       engagementClassRevision,
     };
+    await yieldToEventLoop();
     const baseSnapshot = buildConnectionsSnapshot(input);
+    await yieldToEventLoop();
     await rankerRetrainer({ merged, snapshot: baseSnapshot });
     const closestVisitRanker = await loadClosestVisitRanker();
     if (closestVisitRanker === null) {
@@ -411,6 +460,7 @@ export const createConnectionsMaterializer = (
     }
 
     try {
+      await yieldToEventLoop();
       const snapshot = buildConnectionsSnapshot({
         ...input,
         closestVisitRanker: closestVisitRanker.ranker,
@@ -439,14 +489,8 @@ export const createConnectionsMaterializer = (
     }
   };
 
-  const requestDrain = (): void => {
-    dirty = true;
-    pending = true;
+  const startDrain = (): void => {
     if (running) return;
-    // Failure cooldown gate — same pattern as timelineMaterializer.
-    // catchUp bypasses this gate; onAccepted respects it.
-    const sinceFailureMs = Date.now() - lastFailureAtMs;
-    if (lastError !== null && sinceFailureMs < FAILURE_COOLDOWN_MS) return;
     running = true;
     void (async () => {
       try {
@@ -456,6 +500,27 @@ export const createConnectionsMaterializer = (
         pending = dirty;
       }
     })();
+  };
+
+  const requestDrain = (): void => {
+    dirty = true;
+    pending = true;
+    if (running) return;
+    // Failure cooldown gate — same pattern as timelineMaterializer.
+    // catchUp bypasses this gate; onAccepted respects it.
+    const sinceFailureMs = Date.now() - lastFailureAtMs;
+    if (lastError !== null && sinceFailureMs < FAILURE_COOLDOWN_MS) return;
+    // Stage 5.2 W1a — debounce: coalesce burst event arrivals into a
+    // single drain. Each requestDrain resets the timer, so a steady
+    // stream of events triggers exactly one drain after the burst
+    // settles (or at debounceMs after the latest arrival).
+    if (drainDebounceTimer !== null) clearTimeout(drainDebounceTimer);
+    drainDebounceTimer = setTimeout(() => {
+      drainDebounceTimer = null;
+      if (!dirty || running) return;
+      startDrain();
+    }, DRAIN_DEBOUNCE_MS);
+    drainDebounceTimer.unref();
   };
 
   const onAccepted: Materializer['onAccepted'] = (event) => {
