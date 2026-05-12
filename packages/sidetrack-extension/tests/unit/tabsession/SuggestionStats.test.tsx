@@ -87,9 +87,32 @@ describe('SuggestionStats', () => {
     expect(screen.getByText(/cloud/)).toBeInTheDocument();
   });
 
-  it('returns null when no suggestion is provided', () => {
+  it('returns null when no suggestion is provided (default)', () => {
     const { container } = render(<SuggestionStats workstreams={workstreams} />);
     expect(container.firstChild).toBeNull();
+  });
+
+  it('renders empty placeholder when showEmptyPlaceholder + no suggestion', () => {
+    render(<SuggestionStats workstreams={workstreams} showEmptyPlaceholder />);
+    expect(screen.getByText('No signal yet')).toBeInTheDocument();
+    expect(screen.getByText(/Move similar pages/)).toBeInTheDocument();
+  });
+
+  it('renders empty placeholder when showEmptyPlaceholder + suggestion with no candidates', () => {
+    const empty: TabSessionResolutionResult = {
+      tabSessionId: 'https://cold-start.example/page',
+      dryRun: true,
+      decision: { action: 'inbox', margin: 0 },
+      fusedCandidates: [],
+    };
+    render(
+      <SuggestionStats
+        suggestion={empty}
+        workstreams={workstreams}
+        showEmptyPlaceholder
+      />,
+    );
+    expect(screen.getByText('No signal yet')).toBeInTheDocument();
   });
 
   it('hides alternatives by default (showAlternatives undefined)', () => {

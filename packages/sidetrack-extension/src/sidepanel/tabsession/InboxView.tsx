@@ -18,6 +18,11 @@ export interface InboxViewProps {
   readonly onRefresh: () => void;
   readonly onAttribute: (tabSessionId: string, workstreamId: string | null) => void;
   readonly onOpenTab?: (record: TabSessionRecord) => void;
+  readonly onPickAnother?: (tabSessionId: string) => void;
+  readonly onIgnore?: (
+    tabSessionId: string,
+    reason: 'noise' | 'duplicate' | 'private',
+  ) => void;
   readonly nodeById?: ReadonlyMap<string, ConnectionNode>;
   readonly displayCtx?: EntityDisplayCtx;
 }
@@ -31,6 +36,8 @@ export function InboxView({
   onRefresh,
   onAttribute,
   onOpenTab,
+  onPickAnother,
+  onIgnore,
   nodeById,
   displayCtx,
 }: InboxViewProps) {
@@ -60,6 +67,8 @@ export function InboxView({
             workstreams={workstreams}
             onAttribute={onAttribute}
             {...(onOpenTab === undefined ? {} : { onOpenTab })}
+            {...(onPickAnother === undefined ? {} : { onPickAnother })}
+            {...(onIgnore === undefined ? {} : { onIgnore })}
             {...(nodeById === undefined ? {} : { nodeById })}
             {...(displayCtx === undefined ? {} : { displayCtx })}
           />

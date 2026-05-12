@@ -36,24 +36,42 @@ const workstreams = [
 ];
 
 describe('SuggestionBanner', () => {
-  it('routes yes, no, and different choices through explicit attribution actions', () => {
+  it('routes all 4 flat action choices through the right callbacks', () => {
     const onAttribute = vi.fn();
+    const onPickAnother = vi.fn();
+    const onIgnore = vi.fn();
     render(
       <SuggestionBanner
         record={record}
         suggestion={suggestion}
         workstreams={workstreams}
         onAttribute={onAttribute}
+        onPickAnother={onPickAnother}
+        onIgnore={onIgnore}
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Yes' }));
-    fireEvent.click(screen.getByRole('button', { name: 'No' }));
-    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'ws_switchboard' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Different' }));
+    fireEvent.click(screen.getByRole('button', { name: "Yes, that's right" }));
+    fireEvent.click(screen.getByRole('button', { name: 'Pick another…' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Not in any stream' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Ignore (admin / noise)' }));
 
     expect(onAttribute).toHaveBeenNthCalledWith(1, 'tses_test', 'ws_security');
+    expect(onPickAnother).toHaveBeenCalledWith('tses_test');
     expect(onAttribute).toHaveBeenNthCalledWith(2, 'tses_test', null);
-    expect(onAttribute).toHaveBeenNthCalledWith(3, 'tses_test', 'ws_switchboard');
+    expect(onIgnore).toHaveBeenCalledWith('tses_test', 'noise');
+  });
+
+  it('disables Pick another / Ignore when their callbacks are absent', () => {
+    render(
+      <SuggestionBanner
+        record={record}
+        suggestion={suggestion}
+        workstreams={workstreams}
+        onAttribute={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole('button', { name: 'Pick another…' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Ignore (admin / noise)' })).toBeDisabled();
   });
 });

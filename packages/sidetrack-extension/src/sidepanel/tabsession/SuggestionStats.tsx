@@ -70,15 +70,41 @@ export interface SuggestionStatsProps {
   // Hide alternatives by default to keep the panel scannable; the
   // primary stats line always renders.
   readonly showAlternatives?: boolean;
+  // Stage 5 polish — when the caller wants a visible placeholder for
+  // the "resolver returned nothing" case (cold-start URLs, brand-new
+  // domains), pass `showEmptyPlaceholder`. Used by the Current Tab
+  // card so the user sees an explanation instead of a blank gap.
+  readonly showEmptyPlaceholder?: boolean;
 }
 
 export function SuggestionStats({
   suggestion,
   workstreams,
   showAlternatives = false,
+  showEmptyPlaceholder = false,
 }: SuggestionStatsProps) {
   if (suggestion === undefined || suggestion.fusedCandidates.length === 0) {
-    return null;
+    if (!showEmptyPlaceholder) return null;
+    return (
+      <div className="suggestion-stats is-empty">
+        <span className="suggestion-stats-row">
+          <span className="suggestion-stats-target subtle">No signal yet</span>
+          <span
+            className="suggestion-stats-info"
+            title={
+              'Sidetrack has no related visits, similar pages, or topic-cluster ' +
+              'evidence for this URL yet. Move a few similar pages into a ' +
+              'workstream and suggestions will start appearing.'
+            }
+          >
+            ⓘ
+          </span>
+        </span>
+        <span className="suggestion-stats-source mono subtle">
+          Move similar pages into a workstream to teach Sidetrack
+        </span>
+      </div>
+    );
   }
   const top = suggestion.fusedCandidates[0];
   if (top === undefined) return null;

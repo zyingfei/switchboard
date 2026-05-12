@@ -5315,15 +5315,21 @@ const App = () => {
             workstreams={tabSessionWorkstreams}
           />
           {/* Suggestion stats: bucket label + ⓘ tooltip + alternatives.
-              Only shows when the URL is unattributed/un-ignored AND a
-              suggestion exists. */}
-          {focusedTabSuggestion !== undefined &&
-          focusedUrlRecord?.currentAttribution === undefined &&
-          focusedUrlRecord?.currentIgnored === undefined ? (
+              Renders for any unattributed/un-ignored focused URL — when
+              the resolver has no candidates we still draw the empty
+              placeholder so the user sees why the badge is "?". */}
+          {focusedUrlRecord !== undefined &&
+          focusedUrlRecord.currentAttribution === undefined &&
+          focusedUrlRecord.currentIgnored === undefined ? (
             <SuggestionStats
-              suggestion={tabSessionResolutionFromUrl(focusedTabSuggestion)}
+              suggestion={
+                focusedTabSuggestion === undefined
+                  ? undefined
+                  : tabSessionResolutionFromUrl(focusedTabSuggestion)
+              }
               workstreams={tabSessionWorkstreams}
               showAlternatives
+              showEmptyPlaceholder
             />
           ) : null}
           {focusedUrlRecord !== undefined ? (
@@ -5411,6 +5417,10 @@ const App = () => {
           suggestion={tabSessionResolutionFromUrl(suggestedOpenTabSessionResolution)}
           workstreams={tabSessionWorkstreams}
           onAttribute={handleUrlAttribute}
+          onPickAnother={(canonicalUrl) => {
+            setTabSessionMoveId(canonicalUrl);
+          }}
+          onIgnore={handleUrlIgnore}
         />
       ) : null}
 
@@ -5819,6 +5829,10 @@ const App = () => {
                         workstreams={tabSessionWorkstreams}
                         onAttribute={handleUrlAttribute}
                         onOpenTab={openTabForSession}
+                        onPickAnother={(canonicalUrl) => {
+                          setTabSessionMoveId(canonicalUrl);
+                        }}
+                        onIgnore={handleUrlIgnore}
                         displayCtx={displayCtx}
                       />
                     );
@@ -5869,6 +5883,10 @@ const App = () => {
           }}
           onAttribute={handleUrlAttribute}
           onOpenTab={openTabForSession}
+          onPickAnother={(canonicalUrl) => {
+            setTabSessionMoveId(canonicalUrl);
+          }}
+          onIgnore={handleUrlIgnore}
           displayCtx={displayCtx}
         />
       ) : (

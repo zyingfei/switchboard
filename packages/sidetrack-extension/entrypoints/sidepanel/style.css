@@ -535,6 +535,10 @@ button:disabled {
 .suggestion-stats.is-not-likely .suggestion-stats-confidence {
   color: var(--ink-3);
 }
+.suggestion-stats.is-empty .suggestion-stats-target {
+  color: var(--ink-3);
+  font-style: italic;
+}
 .suggestion-stats-info {
   cursor: help;
   color: var(--ink-3);
