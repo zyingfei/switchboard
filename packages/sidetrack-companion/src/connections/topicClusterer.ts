@@ -242,6 +242,109 @@ const computeLineage = async (
   });
 };
 
+// -- Stage 5.2 W4 — incremental topic cluster accumulator -------------
+// Foundational additive path: maintain a UnionFind across drains so new
+// similarity edges merge components in O(α(n)) per edge instead of
+// re-clustering from scratch. Removal-aware fallback (the design doc's
+// "affected-component rebuild" for edge removals) is a follow-up; this
+// PR ships the hot-add path that covers the common Stage 5.2 case
+// (Class A leaf events keep producing similarity edges, never removing).
+//
+// What this PR does NOT do (yet):
+// - Lineage tracking across revisions (consumers still call
+//   buildTopicRevision for split/merge lineage).
+// - Engagement-gate filtering (the full builder filters visits by
+//   focusedWindowMs > engagementGateMs; the accumulator delegates that
+//   to the caller — only call addVisit / addEdge / addRelation for
+//   visits already past the gate).
+// - Eviction on edge removal. Callers needing splits must fall back to
+//   buildTopicRevision for the affected component.
+
+export interface IncrementalTopicComponent {
+  readonly topicId: string;
+  readonly memberCanonicalUrls: readonly string[];
+}
+
+export class IncrementalTopicClusterAccumulator {
+  private readonly uf = new UnionFind();
+  private readonly visitsByCanonical = new Map<string, TopicVisit>();
+
+  /** Register a visit (engagement-gated by caller). Idempotent. */
+  addVisit(visit: TopicVisit): void {
+    if (visit.canonicalUrl.length === 0) return;
+    this.uf.add(visit.canonicalUrl);
+    const existing = this.visitsByCanonical.get(visit.canonicalUrl);
+    if (existing === undefined) {
+      this.visitsByCanonical.set(visit.canonicalUrl, visit);
+      return;
+    }
+    // Latest-wins for metadata (caller is responsible for ordering;
+    // this matches sortedVisitsByCanonical's merge behaviour).
+    const title =
+      (existing.title ?? '').length >= (visit.title ?? '').length ? existing.title : visit.title;
+    this.visitsByCanonical.set(visit.canonicalUrl, {
+      canonicalUrl: visit.canonicalUrl,
+      ...(title === undefined ? {} : { title }),
+      focusedWindowMs: Math.max(existing.focusedWindowMs, visit.focusedWindowMs),
+      firstObservedAt:
+        existing.firstObservedAt < visit.firstObservedAt
+          ? existing.firstObservedAt
+          : visit.firstObservedAt,
+      lastObservedAt:
+        existing.lastObservedAt > visit.lastObservedAt
+          ? existing.lastObservedAt
+          : visit.lastObservedAt,
+      ...(visit.workstreamId !== undefined
+        ? { workstreamId: visit.workstreamId }
+        : existing.workstreamId !== undefined
+          ? { workstreamId: existing.workstreamId }
+          : {}),
+    });
+  }
+
+  /**
+   * Apply a similarity edge. If both endpoints are registered visits
+   * AND cosine >= threshold, merges the two components in O(α(n)).
+   */
+  addSimilarityEdge(edge: VisitSimilarityEdge, cosineThreshold: number): void {
+    if (edge.cosine < cosineThreshold) return;
+    if (!this.visitsByCanonical.has(edge.fromVisitKey)) return;
+    if (!this.visitsByCanonical.has(edge.toVisitKey)) return;
+    this.uf.union(edge.fromVisitKey, edge.toVisitKey);
+  }
+
+  /** Apply a user-asserted relation — always merges (no threshold). */
+  addUserAssertedRelation(relation: UserAssertedVisitRelation): void {
+    if (!this.visitsByCanonical.has(relation.fromVisitKey)) return;
+    if (!this.visitsByCanonical.has(relation.toVisitKey)) return;
+    this.uf.union(relation.fromVisitKey, relation.toVisitKey);
+  }
+
+  /**
+   * Return components keyed by topicId. Singleton components (one
+   * member) are filtered out — they're not topics, they're isolated
+   * visits. Caller responsible for downstream TopicRevisionTopic
+   * derivation (metadata, lineage, persistent revisionId).
+   */
+  async getComponents(): Promise<readonly IncrementalTopicComponent[]> {
+    const components: IncrementalTopicComponent[] = [];
+    for (const component of this.uf.components()) {
+      if (component.members.length < 2) continue;
+      const memberCanonicalUrls = [...component.members].sort(compareString);
+      components.push({
+        topicId: await topicId(memberCanonicalUrls),
+        memberCanonicalUrls,
+      });
+    }
+    return components.sort((a, b) => compareString(a.topicId, b.topicId));
+  }
+
+  // Note: no clear() method. UnionFind state is permanent — callers
+  // needing a fresh accumulator should drop the instance and create a
+  // new one. This matches the W4 design rule that hot-add never evicts;
+  // splits / removes route through buildTopicRevision's full rebuild.
+}
+
 export const buildTopicRevision = async (
   input: BuildTopicRevisionInput,
 ): Promise<TopicRevision> => {
