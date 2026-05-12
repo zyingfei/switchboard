@@ -638,6 +638,29 @@ button:disabled {
   gap: 6px;
 }
 
+/* Stage 5 polish — Inbox search row. Sits between sec-head and the
+   card list. Pure client-side filter over the already-loaded inbox
+   items, so behavior matches a quick scan. */
+.tab-session-inbox-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0 6px 0;
+}
+.tab-session-inbox-search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 4px 8px;
+  border: var(--hair-soft);
+  border-radius: 4px;
+  background: var(--paper);
+  color: var(--ink-1);
+  font-size: 12px;
+}
+.tab-session-inbox-search-input::placeholder {
+  color: var(--ink-3);
+}
+
 .tab-session-card {
   display: grid;
   grid-template-columns: 28px minmax(0, 1fr);
