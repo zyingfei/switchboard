@@ -59,6 +59,11 @@ import {
 } from '../../producers/visit-resembles-revision.js';
 import { QUEUE_CREATED, QUEUE_STATUS_SET } from '../../queue/events.js';
 import {
+  dedupeInvalidationKeys,
+  invalidationsForEvent,
+  type InvalidationKey,
+} from './invalidation.js';
+import {
   createDirtySourceQueue,
   foldGroupBEventIntoQueue,
   type DirtySourceQueueSnapshot,
@@ -229,6 +234,14 @@ export interface ConnectionsMaterializer extends Materializer {
    * (see the queue's `clear()` contract).
    */
   readonly clearDirtySources: (sourceUnitIds: readonly string[]) => void;
+  /**
+   * Stage 5.2 W6 — the dedupe'd InvalidationKey set consumed by the
+   * most recent buildAndWrite entry. Updated atomically at the start
+   * of each drain. Empty between drains (the accumulator clears
+   * itself once drained). Useful for telemetry / per-pass skip
+   * decisions in follow-up work.
+   */
+  readonly getInvalidationsSinceLastBuild: () => readonly InvalidationKey[];
 }
 
 export const createConnectionsMaterializer = (
@@ -249,6 +262,17 @@ export const createConnectionsMaterializer = (
   // queue itself is allocation-free at fold time — only sourceUnitId
   // strings are retained.
   const dirtySourceQueue = createDirtySourceQueue();
+  // Stage 5.2 W6 — per-drain invalidation accumulator. Each accepted
+  // event contributes invalidationsForEvent(event) (often []) and the
+  // set is dedupe'd at drain entry. Half 2's per-pass skip-gates
+  // consume the set; the connectionsStore.putCurrent revision check
+  // (W5) and the engagement / similarity / topic skip-gates (W3 / W4)
+  // already short-circuit redundant disk writes via content-hashing.
+  // W6 here adds an event-driven layer so callers can answer "which
+  // slices need recompute since last drain?" without re-deriving from
+  // the event log.
+  let accumulatedInvalidations: InvalidationKey[] = [];
+  let lastBuildInvalidations: readonly InvalidationKey[] = [];
   let pending = false;
   let running = false;
   let dirty = false;
@@ -445,6 +469,13 @@ export const createConnectionsMaterializer = (
       );
       phaseLast = now;
     };
+    // Stage 5.2 W6 — snapshot the invalidation keys accumulated since
+    // the last drain entry, then clear the accumulator. dedupe via JSON
+    // sig so logs and downstream skip-gates see a normalised set.
+    const buildKeys = dedupeInvalidationKeys(accumulatedInvalidations);
+    accumulatedInvalidations = [];
+    lastBuildInvalidations = buildKeys;
+    mark(`w6 keys=${String(buildKeys.length)}`);
     const merged = await deps.eventLog.readMerged();
     mark(`readMerged events=${String(merged.length)}`);
     const vault = await readVaultStores(deps.vaultRoot);
@@ -638,6 +669,13 @@ export const createConnectionsMaterializer = (
     // job. The buildAndWrite drain remains the byte-determinism oracle;
     // this queue is purely for the off-path content reconciler.
     foldGroupBEventIntoQueue(dirtySourceQueue, event);
+    // Stage 5.2 W6 — accumulate invalidation keys for this event so the
+    // next drain can answer "which slices are dirty?" Most events
+    // contribute one or two keys; ANNOTATION_* / DISPATCH_* return [].
+    const keys = invalidationsForEvent(event);
+    if (keys.length > 0) {
+      for (const key of keys) accumulatedInvalidations.push(key);
+    }
     requestDrain();
   };
 
@@ -684,6 +722,8 @@ export const createConnectionsMaterializer = (
   const clearDirtySources = (sourceUnitIds: readonly string[]): void => {
     dirtySourceQueue.clear(sourceUnitIds);
   };
+  const getInvalidationsSinceLastBuild = (): readonly InvalidationKey[] =>
+    lastBuildInvalidations;
 
   return {
     name: 'connections',
@@ -694,5 +734,6 @@ export const createConnectionsMaterializer = (
     health,
     getDirtySources,
     clearDirtySources,
+    getInvalidationsSinceLastBuild,
   };
 };
