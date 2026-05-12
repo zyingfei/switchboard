@@ -50,6 +50,30 @@ interface RecallActivityReport {
   readonly recent: readonly RecallActivityEvent[];
 }
 
+interface MaterializerHealth {
+  readonly status: 'healthy' | 'degraded' | 'failed';
+  readonly lastSuccessAt: string | null;
+  readonly lastError: string | null;
+  readonly pending: boolean;
+}
+
+interface SyncRelayHealth {
+  readonly mode: 'local' | 'remote';
+  readonly url: string;
+  readonly connected?: boolean;
+  readonly lastConnectedAtMs?: number;
+  readonly lastDisconnectedAtMs?: number;
+  readonly consecutiveFailures?: number;
+  readonly pendingPublishes?: number;
+}
+
+interface SyncSummary {
+  readonly replicaId: string;
+  readonly seq: number;
+  readonly relay?: SyncRelayHealth;
+  readonly materializers?: Record<string, MaterializerHealth>;
+}
+
 interface HealthReport {
   readonly uptimeSec: number;
   readonly vault: {
@@ -83,6 +107,7 @@ interface HealthReport {
     readonly activity?: RecallActivityReport;
   };
   readonly service: { readonly installed: boolean; readonly running: boolean };
+  readonly sync?: SyncSummary;
 }
 
 interface HealthPanelProps {
@@ -340,6 +365,15 @@ export function HealthPanel({
         </div>
       ) : (
         <>
+          {/* Stage 5 polish — three-lane locality grouping.
+              🖥 LOCAL = lives in this browser tab (extension SW).
+              ⚙ COMPANION = lives in the local companion Node process.
+              🔄 SYNC = flows across replicas via the relay. */}
+          <div className="hp-lane hp-lane-local">
+            <div className="hp-lane-head">
+              <span className="hp-lane-icon" aria-hidden>🖥</span>
+              <span className="hp-lane-label">LOCAL · in this browser</span>
+            </div>
           <div className="health-grid">
             <div className={'hc' + (queueWarn ? ' warn' : '')}>
               <div className="hc-lbl">queued captures</div>
@@ -355,6 +389,20 @@ export function HealthPanel({
                 cap 20 · dropped {dropped ?? 0} · {queueWarn ? 'warn' : 'ok'}
               </div>
             </div>
+          </div>
+          </div>
+
+          <div className="hp-lane hp-lane-companion">
+            <div className="hp-lane-head">
+              <span className="hp-lane-icon" aria-hidden>⚙</span>
+              <span className="hp-lane-label">
+                COMPANION · on this machine
+                {companionPort !== null && companionPort !== undefined
+                  ? ` (localhost:${String(companionPort)})`
+                  : ''}
+              </span>
+            </div>
+          <div className="health-grid">
             <div className="hc">
               <div className="hc-lbl">last capture</div>
               <div className="hc-num small">
@@ -490,6 +538,114 @@ export function HealthPanel({
                   <div className="r2">{warning.message}</div>
                 </div>
               ))
+            )}
+          </div>
+          </div>
+
+          {/* Sync lane: replica + relay state + per-materializer health.
+              Peer-event in/out counts + lastInbound/Outbound timestamps
+              are tracked as a follow-up — the relay transport exposes
+              connection state today but not event throughput. When
+              report.sync is undefined the relay isn't configured. */}
+          <div className="hp-lane hp-lane-sync">
+            <div className="hp-lane-head">
+              <span className="hp-lane-icon" aria-hidden>🔄</span>
+              <span className="hp-lane-label">
+                SYNC · across replicas
+                {report.sync?.relay?.mode !== undefined
+                  ? ` · ${report.sync.relay.mode}`
+                  : ''}
+              </span>
+            </div>
+            {report.sync === undefined ? (
+              <div className="hp-muted-row">Sync relay is not configured (single-replica mode).</div>
+            ) : (
+              <>
+                <div className="health-grid">
+                  <div className="hc">
+                    <div className="hc-lbl">this replica</div>
+                    <div className="hc-num small mono">
+                      {report.sync.replicaId.slice(0, 8)}…
+                    </div>
+                    <div className="hc-foot">seq · {String(report.sync.seq)}</div>
+                  </div>
+                  {report.sync.relay !== undefined ? (
+                    <div
+                      className={
+                        'hc' + (report.sync.relay.connected === false ? ' warn' : '')
+                      }
+                    >
+                      <div className="hc-lbl">relay</div>
+                      <div className="hc-num small">
+                        {report.sync.relay.connected === true
+                          ? 'connected'
+                          : report.sync.relay.connected === false
+                            ? 'disconnected'
+                            : 'unknown'}
+                      </div>
+                      <div className="hc-foot">{report.sync.relay.url}</div>
+                      {report.sync.relay.lastConnectedAtMs !== undefined ? (
+                        <div className="hc-foot">
+                          last connected:{' '}
+                          {formatWhen(
+                            new Date(report.sync.relay.lastConnectedAtMs).toISOString(),
+                          )}
+                        </div>
+                      ) : null}
+                      {report.sync.relay.lastDisconnectedAtMs !== undefined ? (
+                        <div className="hc-foot">
+                          last disconnected:{' '}
+                          {formatWhen(
+                            new Date(report.sync.relay.lastDisconnectedAtMs).toISOString(),
+                          )}
+                        </div>
+                      ) : null}
+                      {report.sync.relay.pendingPublishes !== undefined &&
+                      report.sync.relay.pendingPublishes > 0 ? (
+                        <div className="hc-foot warn">
+                          pending publish: {String(report.sync.relay.pendingPublishes)}
+                        </div>
+                      ) : null}
+                      {report.sync.relay.consecutiveFailures !== undefined &&
+                      report.sync.relay.consecutiveFailures > 0 ? (
+                        <div className="hc-foot warn">
+                          consecutive failures: {String(report.sync.relay.consecutiveFailures)}
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+                {report.sync.materializers !== undefined &&
+                Object.keys(report.sync.materializers).length > 0 ? (
+                  <div className="hp-sec">
+                    <div className="hp-sec-head">Materializers · per-replica health</div>
+                    {Object.entries(report.sync.materializers).map(([name, mat]) => (
+                      <div
+                        className="hp-row"
+                        key={name}
+                        title={
+                          mat.lastError !== null ? `Last error: ${mat.lastError}` : undefined
+                        }
+                      >
+                        <span className="prov-pill mono">{name}</span>
+                        <span className={`hp-state ${mat.status}`}>{mat.status}</span>
+                        <span className="hp-last muted">
+                          {mat.lastSuccessAt === null
+                            ? 'never'
+                            : formatWhen(mat.lastSuccessAt)}
+                        </span>
+                        {mat.pending ? (
+                          <span className="hp-num muted">pending</span>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+                <div className="hp-muted-row" style={{ fontSize: 10, opacity: 0.7 }}>
+                  Peer-event throughput + per-replica drill-down are coming —
+                  follow-up companion task tracked.
+                </div>
+              </>
             )}
           </div>
         </>

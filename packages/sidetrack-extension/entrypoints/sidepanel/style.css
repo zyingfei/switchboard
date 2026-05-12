@@ -5768,6 +5768,45 @@ button.btn-link.thread-dispatched-name:hover {
   gap: 8px;
   padding: 12px;
 }
+
+/* Stage 5 polish — three-lane locality grouping. Visual separator
+   each section so "this lives in browser SW" vs "this lives in
+   companion" vs "this flows across replicas" is unambiguous. */
+.hp-lane {
+  border-top: 1px solid var(--rule, #d4cdb8);
+}
+.hp-lane:first-of-type {
+  border-top: 0;
+}
+.hp-lane-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 12px 4px 12px;
+  font-size: 10px;
+  font-family: var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.7px;
+  color: var(--ink-3);
+}
+.hp-lane-icon {
+  font-size: 12px;
+}
+.hp-lane-label {
+  font-weight: 500;
+}
+.hp-lane-local .hp-lane-head {
+  color: var(--accent, #0b57d0);
+}
+.hp-lane-companion .hp-lane-head {
+  color: var(--ink-2);
+}
+.hp-lane-sync .hp-lane-head {
+  color: var(--green, #2d7a3e);
+}
+.hp-state.healthy { color: var(--green, #2d7a3e); }
+.hp-state.degraded { color: var(--amber, #b48a2e); }
+.hp-state.failed { color: var(--red, #a64141); }
 .hp-empty {
   padding: 28px 18px;
   display: grid;
