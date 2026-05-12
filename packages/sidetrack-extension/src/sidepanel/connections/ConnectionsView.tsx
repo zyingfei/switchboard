@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactElement } from 'react';
+import { useEffect, useMemo, useState, type ReactElement } from 'react';
 
 import { ContextPackComposer } from './ContextPackComposer';
 import {
@@ -491,6 +491,31 @@ export const ConnectionsView = ({
     history.navigate(nodeId);
   };
 
+  // Stage 5 polish — Connections refactor (Phase C usability).
+  // Browser-style Alt+← / Alt+→ keyboard shortcuts for anchor
+  // history. Cmd/Ctrl-modified keys are left alone so the browser's
+  // own back / forward still works at the top level.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent): void => {
+      if (!event.altKey || event.metaKey || event.ctrlKey || event.shiftKey) return;
+      if (event.key === 'ArrowLeft' && history.canBack) {
+        event.preventDefault();
+        setSelectedEdge(null);
+        setWhyVisitId(null);
+        history.back();
+      } else if (event.key === 'ArrowRight' && history.canForward) {
+        event.preventDefault();
+        setSelectedEdge(null);
+        setWhyVisitId(null);
+        history.forward();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [history]);
+
   const selectEdge = (edge: ConnectionEdge): void => {
     setWhyVisitId(null);
     setSelectedEdge(edge);
@@ -823,9 +848,12 @@ export const ConnectionsView = ({
           </div>
         </aside>
         <main className="cx-col-c">
-          {loading ? (
-            <div className="cx-mono cx-dim cx-loading" data-testid="connections-loading">
-              Loading…
+          {loading && result === null ? (
+            <div className="cx-loading-row" data-testid="connections-loading">
+              <span className="cx-spinner-dot" aria-hidden />
+              <span className="cx-mono cx-dim">
+                Fetching neighbors of <code>{anchor}</code>…
+              </span>
             </div>
           ) : null}
           {error !== null ? (
@@ -893,12 +921,31 @@ export const ConnectionsView = ({
           ) : (
             !loading &&
             error === null && (
-              <div className="cx-empty">
+              <div className="cx-empty" data-testid="connections-pick-anchor">
                 <h4>Pick an anchor to begin</h4>
                 <p>
-                  Type a node id on the left or click a recent anchor — the graph around it appears
-                  here.
+                  Choose a workstream on the left, click a recent anchor, or paste a node id —
+                  the graph around it appears here. Press <kbd>Alt</kbd>+<kbd>←</kbd> /{' '}
+                  <kbd>Alt</kbd>+<kbd>→</kbd> to navigate anchor history.
                 </p>
+                {recentAnchors.length > 0 ? (
+                  <div className="cx-empty-quickpick">
+                    <span className="cx-mono cx-dim">Try one:</span>
+                    {recentAnchors.slice(0, 4).map((r) => (
+                      <button
+                        type="button"
+                        key={r.id}
+                        className="cx-empty-quickpick-btn"
+                        onClick={() => {
+                          submitAnchor(r.id);
+                        }}
+                        data-testid={`connections-empty-quickpick-${r.id}`}
+                      >
+                        {r.label}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
               </div>
             )
           )}
