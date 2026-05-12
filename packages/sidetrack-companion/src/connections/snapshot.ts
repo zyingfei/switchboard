@@ -2377,8 +2377,22 @@ export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
 
   const dayPath = (date: string): string => join(snapshotsDir, `${date}.json`);
 
+  // Stage 5.2 W5 — store-level skip-write. The materializer publishes
+  // snapshots on every drain even when the inputs haven't changed
+  // (e.g., a benign event that lands while no relevant materializer
+  // input shifted). Each putCurrent writes 200KB+ to disk. We track
+  // the last-written snapshotRevision in memory and short-circuit if
+  // the new snapshot has the same revision id.
+  let lastWrittenRevision: string | null = null;
+
   const putCurrent = async (snapshot: ConnectionsSnapshot): Promise<void> => {
+    const revision = snapshot.snapshotRevision;
+    if (revision !== undefined && revision === lastWrittenRevision) {
+      // Same revision as last write — disk already has this snapshot.
+      return;
+    }
     await writeAtomic(currentPath, JSON.stringify(snapshot, null, 2));
+    if (revision !== undefined) lastWrittenRevision = revision;
   };
   const readCurrent = async (): Promise<ConnectionsSnapshot | null> => {
     try {
