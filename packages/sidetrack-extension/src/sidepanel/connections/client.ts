@@ -1,7 +1,7 @@
 import { messageTypes } from '../../messages';
 import type { ContextPackInput } from './contextPack';
 import { topicLabel, type TopicLabelResult } from './topicLabel';
-import type { ConnectionEdge, ConnectionsScopedResult } from './types';
+import type { ConnectionEdge, ConnectionNode, ConnectionsScopedResult } from './types';
 import type { Reason } from './why-related/reasons';
 
 // Side-panel client for the Connections HTTP routes. Background.ts
@@ -263,6 +263,24 @@ export const fetchConnectionsEdge = (
     }
     return response as ConnectionsClientResponse<ConnectionEdge>;
   });
+
+// Stage 5 polish — BFS path between two nodes via the companion's
+// /v1/connections/path route. The companion returns either:
+//   { found: true,  nodes: [...], edges: [...] }
+//   { found: false }
+// We expose both honestly so the UI can render a "no path" state.
+export interface ConnectionsPathResult {
+  readonly found: boolean;
+  readonly nodes?: readonly ConnectionNode[];
+  readonly edges?: readonly ConnectionEdge[];
+}
+
+export const fetchConnectionsPath = (input: {
+  readonly fromNodeId: string;
+  readonly toNodeId: string;
+  readonly maxHops?: number;
+}): Promise<ConnectionsClientResponse<ConnectionsPathResult>> =>
+  call<ConnectionsPathResult>(messageTypes.loadConnectionsPath, input);
 
 const textFromMetadata = (
   metadata: Record<string, unknown>,

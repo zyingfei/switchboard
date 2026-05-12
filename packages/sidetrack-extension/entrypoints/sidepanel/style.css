@@ -8114,6 +8114,60 @@ pre.diff {
   color: var(--ink-3);
   font-size: 10px;
 }
+/* Stage 5 polish — Connections path-finder strip. Collapsible row
+   below the mode tabs; pills + arrows render the BFS chain. */
+.cx-pathfinder {
+  border-bottom: 1px solid var(--rule-soft, #e5ddc9);
+  background: var(--paper-light);
+}
+.cx-pathfinder-toggle {
+  display: flex; align-items: center; gap: 6px;
+  width: 100%;
+  padding: 6px 14px;
+  border: 0; background: transparent;
+  color: var(--ink-2);
+  font-size: 11.5px;
+  cursor: pointer;
+  text-align: left;
+}
+.cx-pathfinder-toggle:hover { color: var(--ink-1); background: var(--paper-tinted); }
+.cx-pathfinder-anchor { color: var(--ink-1); font-weight: 500; }
+.cx-pathfinder-body {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 0 14px 10px;
+}
+.cx-pathfinder-search { max-width: 380px; }
+.cx-pathfinder-status {
+  font-size: 11.5px;
+  padding: 4px 0;
+}
+.cx-pathfinder-status.warn { color: #6b4500; }
+.cx-pathfinder-chain {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 4px;
+  padding: 2px 0;
+}
+.cx-pathfinder-step { display: inline-flex; align-items: center; gap: 4px; }
+.cx-pathfinder-pill {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 3px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: var(--paper);
+  color: var(--ink-1);
+  font-size: 11.5px;
+  cursor: pointer;
+  max-width: 240px;
+}
+.cx-pathfinder-pill:hover { background: var(--paper-tinted); }
+.cx-pathfinder-pill .cx-node-icon { width: 18px; height: 18px; flex: none; }
+.cx-pathfinder-pill-label {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cx-pathfinder-arrow { color: var(--ink-3); }
+.cx-pathfinder-edgecount {
+  margin-left: 8px;
+  font-size: 10px;
+}
 
 /* Wave D surfaces */
 .cx-flow {

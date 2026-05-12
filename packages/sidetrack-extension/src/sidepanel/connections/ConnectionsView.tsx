@@ -36,6 +36,7 @@ import {
   type TimeRangeKey,
 } from './TimeRangePills';
 import { OrbitalCenter } from './OrbitalCenter';
+import { PathFinder } from './PathFinder';
 import { ProvenanceCard, ProvenanceEmpty } from './ProvenancePanel';
 import { TimelineRail } from './TimelineRail';
 import { computeTimelineRail, type TimelineRailData } from './timelineWindows';
@@ -872,6 +873,16 @@ export const ConnectionsView = ({
           Context Pack
         </button>
       </div>
+      <PathFinder
+        anchorId={anchor}
+        anchorLabel={anchorNode === null ? null : formatEntityDisplay(anchorNode, ctx).primary}
+        nodes={result?.snapshot.nodes ?? []}
+        extras={searchExtras}
+        ctx={ctx}
+        onNodeClick={(nodeId) => {
+          useNodeAsAnchor(nodeId);
+        }}
+      />
       {timeline !== null ? <TimelineRail data={timeline} ctx={ctx} /> : null}
       <div className="cx-cols">
         <aside className="cx-col-l">

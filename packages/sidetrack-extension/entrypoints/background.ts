@@ -3680,6 +3680,20 @@ export default defineBackground(() => {
     } else if (message['type'] === messageTypes.loadConnectionsEdge) {
       const edgeId = String(message['edgeId'] ?? '');
       result = await fetchConnectionsHttp(`/v1/connections/edges/${encodeURIComponent(edgeId)}`);
+    } else if (message['type'] === messageTypes.loadConnectionsPath) {
+      // Stage 5 polish — BFS path between two nodes via the
+      // companion's /v1/connections/path route. Companion bounds
+      // maxHops to a safe ceiling internally; we pass through
+      // whatever the panel requested.
+      const fromNodeId = String(message['fromNodeId'] ?? '');
+      const toNodeId = String(message['toNodeId'] ?? '');
+      const maxHops = typeof message['maxHops'] === 'number' ? message['maxHops'] : 4;
+      const params = new URLSearchParams({
+        fromNodeId,
+        toNodeId,
+        maxHops: String(maxHops),
+      });
+      result = await fetchConnectionsHttp(`/v1/connections/path?${params.toString()}`);
     }
     if (result !== null) {
       connectionsCache.set(cacheKey, {
@@ -4227,6 +4241,7 @@ export default defineBackground(() => {
         ((message as { type?: unknown }).type === messageTypes.loadConnectionsSnapshot ||
           (message as { type?: unknown }).type === messageTypes.loadConnectionsNeighbors ||
           (message as { type?: unknown }).type === messageTypes.loadConnectionsEdge ||
+          (message as { type?: unknown }).type === messageTypes.loadConnectionsPath ||
           (message as { type?: unknown }).type === messageTypes.postConnectionsFeedbackEvent)
       ) {
         void handleConnectionsMessage(message as Record<string, unknown>)
