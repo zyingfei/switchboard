@@ -95,8 +95,20 @@ import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../../workstreams/event
 import type { AcceptedEvent } from '../causal.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
-import { projectTabSessions } from '../../tabsession/projection.js';
-import { projectUrls } from '../../urls/projection.js';
+import {
+  createEmptyTabSessionProjectionAccumulator,
+  foldEventIntoTabSessionProjectionAccumulator,
+  seedTabSessionProjectionAccumulator,
+  tabSessionProjectionFromAccumulator,
+  type TabSessionProjectionAccumulator,
+} from '../../tabsession/projection.js';
+import {
+  createEmptyUrlProjectionAccumulator,
+  foldEventIntoUrlProjectionAccumulator,
+  seedUrlProjectionAccumulator,
+  urlProjectionFromAccumulator,
+  type UrlProjectionAccumulator,
+} from '../../urls/projection.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../../tabsession/events.js';
 
 // Sync Contract v1 / Class B — Connections graph materializer.
@@ -273,6 +285,15 @@ export const createConnectionsMaterializer = (
   // the event log.
   let accumulatedInvalidations: InvalidationKey[] = [];
   let lastBuildInvalidations: readonly InvalidationKey[] = [];
+  // Stage 5.2 W2b/c wiring — projection accumulators. State carried
+  // across drains so per-drain cost is O(events-since-last-drain)
+  // instead of O(merged-log). First buildAndWrite seeds from the full
+  // log (same cost as today). Subsequent drains derive from the
+  // accumulator. catchUp resets initialized=false to force a re-seed.
+  let urlAccumulator: UrlProjectionAccumulator = createEmptyUrlProjectionAccumulator();
+  let tabSessionAccumulator: TabSessionProjectionAccumulator =
+    createEmptyTabSessionProjectionAccumulator();
+  let projectionAccumulatorsInitialized = false;
   let pending = false;
   let running = false;
   let dirty = false;
@@ -478,6 +499,17 @@ export const createConnectionsMaterializer = (
     mark(`w6 keys=${String(buildKeys.length)}`);
     const merged = await deps.eventLog.readMerged();
     mark(`readMerged events=${String(merged.length)}`);
+    // Stage 5.2 W2b/c wiring — first build (or post-catchUp reset)
+    // seeds the projection accumulators from the full event log; same
+    // cost as the legacy projectUrls(merged) + projectTabSessions(merged)
+    // calls below. Subsequent drains reuse the accumulator state that
+    // onAccepted has been folding into.
+    if (!projectionAccumulatorsInitialized) {
+      urlAccumulator = seedUrlProjectionAccumulator(merged);
+      tabSessionAccumulator = seedTabSessionProjectionAccumulator(merged);
+      projectionAccumulatorsInitialized = true;
+      mark('projectionAccumulators.seed');
+    }
     const vault = await readVaultStores(deps.vaultRoot);
     mark('readVaultStores');
     await yieldToEventLoop();
@@ -551,13 +583,13 @@ export const createConnectionsMaterializer = (
       events: merged,
       ...vault,
       timelineDays,
-      tabSessionProjection: projectTabSessions(merged),
-      urlProjection: projectUrls(merged),
+      tabSessionProjection: tabSessionProjectionFromAccumulator(tabSessionAccumulator),
+      urlProjection: urlProjectionFromAccumulator(urlAccumulator),
       visitSimilarity,
       topicRevision,
       engagementClassRevision,
     };
-    mark('projectTabSessions+projectUrls');
+    mark('projectionAccumulators.derive');
     await yieldToEventLoop();
     const baseSnapshot = buildConnectionsSnapshot(input);
     mark(`buildConnectionsSnapshot base nodes=${String(baseSnapshot.nodes.length)} edges=${String(baseSnapshot.edges.length)}`);
@@ -676,11 +708,27 @@ export const createConnectionsMaterializer = (
     if (keys.length > 0) {
       for (const key of keys) accumulatedInvalidations.push(key);
     }
+    // Stage 5.2 W2b/c — fold the event into the projection accumulators
+    // so the next buildAndWrite drains O(events-since-last-drain)
+    // instead of re-projecting the entire log. The fold is a no-op for
+    // event types neither projection cares about. Skipped before the
+    // first buildAndWrite seeds the accumulators from the log; we
+    // detect that via the initialized flag.
+    if (projectionAccumulatorsInitialized) {
+      foldEventIntoUrlProjectionAccumulator(urlAccumulator, event);
+      foldEventIntoTabSessionProjectionAccumulator(tabSessionAccumulator, event);
+    }
     requestDrain();
   };
 
   const catchUp: Materializer['catchUp'] = async () => {
     pending = true;
+    // Stage 5.2 W2b/c wiring — catchUp is the recovery / boot-time path;
+    // force a re-seed so any drift between the in-memory accumulators
+    // and the event log is corrected. The next buildAndWrite seeds.
+    projectionAccumulatorsInitialized = false;
+    urlAccumulator = createEmptyUrlProjectionAccumulator();
+    tabSessionAccumulator = createEmptyTabSessionProjectionAccumulator();
     try {
       await buildAndWrite();
       lastSuccessAt = new Date().toISOString();
