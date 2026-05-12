@@ -22,7 +22,6 @@ import {
   type VisitSimilarityEmbedder,
 } from '../../connections/visitSimilarity.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
-import { ENGAGEMENT_SESSION_AGGREGATED } from '../../engagement/events.js';
 import {
   USER_ENGAGEMENT_RELABELED,
   USER_FLOW_CONFIRMED,
@@ -77,7 +76,6 @@ import {
   type TimelineStore,
 } from '../../timeline/projection.js';
 import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
-import { VISUAL_FINGERPRINT_OBSERVED } from '../../visual/events.js';
 import type { AcceptedEvent } from '../causal.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
@@ -118,6 +116,27 @@ const DRAIN_DEBOUNCE_MS = 250;
 // owners. The list mirrors the union of event types that affect
 // connection nodes or edges; any new event type that adds to the
 // graph (e.g. a future capture-note event) gets added here.
+//
+// Stage 5.2 W2b — high-frequency events that fold into the next
+// natural drain are intentionally OMITTED from HANDLES so they do not
+// each trigger a full O(events) rebuild. Specifically:
+//   - `engagement.session.aggregated` fires every ~30s per active
+//     tab. The engagement classifier ran inside `buildAndWrite`,
+//     reading the merged log from disk every time, which produced
+//     the per-event rebuild storm observed during dogfood. The
+//     engagement signal is still folded into the next drain (which
+//     reads the full log via `readMerged`), so the snapshot's
+//     engagement-derived edges remain correct — they just refresh on
+//     the next structural event (page nav, user action, etc).
+//   - `visual.fingerprint.observed` always pairs with a
+//     `browser.timeline.observed` event for the same nav, so its
+//     arrival never triggers a structurally-new rebuild — the paired
+//     timeline observation does.
+// If a session never produces a HOT event for an extended period
+// (passive read of one page), the engagement classification stays
+// stale until the next navigation or mutation. That is acceptable
+// for current UX: engagement classification is contextual signal,
+// not user-immediate-feedback.
 const HANDLES: ReadonlySet<string> = new Set<string>([
   THREAD_UPSERTED,
   THREAD_ARCHIVED,
@@ -136,7 +155,6 @@ const HANDLES: ReadonlySet<string> = new Set<string>([
   CAPTURE_EXTRACTION_PRODUCED,
   RECALL_TOMBSTONE_TARGET,
   NAVIGATION_COMMITTED,
-  ENGAGEMENT_SESSION_AGGREGATED,
   USER_ENGAGEMENT_RELABELED,
   USER_FLOW_CONFIRMED,
   USER_FLOW_REJECTED,
@@ -153,7 +171,6 @@ const HANDLES: ReadonlySet<string> = new Set<string>([
   // materializer reads the daily projection rather than the
   // event payload directly.
   BROWSER_TIMELINE_OBSERVED,
-  VISUAL_FINGERPRINT_OBSERVED,
 ]);
 
 export interface CreateConnectionsMaterializerDeps {

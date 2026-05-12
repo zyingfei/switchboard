@@ -446,12 +446,21 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     expect(m.handles.has('unrelated.event')).toBe(false);
   });
 
-  // Stage 5.2 W1a — burst-arrival events should coalesce to a single
-  // drain via the debounce window. Without debouncing, each accepted
-  // event triggers its own rebuild (with the existing per-iteration
-  // coalescing folding subsequent arrivals into the NEXT iteration);
-  // with debouncing, the whole burst becomes ONE rebuild.
-  it('debounce coalesces a burst of onAccepted events into a single putCurrent call', async () => {
+  // Stage 5.2 W2b — high-frequency events that fold into the next
+  // natural drain (engagement aggregates, visual fingerprints) MUST NOT
+  // be in HANDLES, so they don't trigger their own per-event rebuild.
+  it('engagement.session.aggregated is NOT in handles (deferred to next structural drain)', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+    const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store });
+
+    expect(m.handles.has('engagement.session.aggregated')).toBe(false);
+    expect(m.handles.has('visual.fingerprint.observed')).toBe(false);
+  });
+
+  it('engagement bursts do not trigger any drain (deferred until next structural event)', async () => {
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
     const timelineStore = createTimelineStore(vaultRoot);
@@ -468,20 +477,32 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     };
     const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store });
 
-    // 10 events accepted in tight succession (well under the 250ms
-    // debounce window). Each requestDrain resets the timer; only
-    // the last one should actually fire startDrain.
-    for (let i = 1; i <= 10; i += 1) {
+    // Simulate 50 engagement aggregates arriving while a user reads a
+    // page (every ~30s per tab × 4 tabs = these would have been 50
+    // per-event drains pre-W2b). With W2b they trigger zero drains
+    // because the materializer doesn't route the event type.
+    for (let i = 1; i <= 50; i += 1) {
       const event = buildEvent({
         seq: i,
-        type: THREAD_UPSERTED,
+        type: 'engagement.session.aggregated',
         payload: {
-          bac_id: `thread_burst_${String(i)}`,
-          provider: 'chatgpt',
-          threadUrl: `https://x/${String(i)}`,
-          title: `t${String(i)}`,
-          lastSeenAt: `2026-05-07T${String(i + 9).padStart(2, '0')}:00:00.000Z`,
-          tags: [],
+          payloadVersion: 1,
+          visitId: `visit-${String(i % 5)}`,
+          sessionId: `session-${String(i)}`,
+          dimensions: {
+            engagement: {
+              activeMs: 1000,
+              visibleMs: 1000,
+              focusedWindowMs: 1000,
+              idleMs: 0,
+              foregroundBursts: 1,
+              returnCount: 0,
+              scrollEvents: 0,
+              maxScrollRatio: 0,
+              copyCount: 0,
+              pasteCount: 0,
+            },
+          },
         },
       });
       await eventLog.importPeerEvent(event);
@@ -489,7 +510,7 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     }
     await m.awaitIdle();
 
-    // ONE drain even though 10 events were accepted.
-    expect(putCurrentCalls).toBe(1);
+    // No drains — engagement events are not in HANDLES.
+    expect(putCurrentCalls).toBe(0);
   });
 });
