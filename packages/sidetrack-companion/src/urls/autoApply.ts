@@ -13,6 +13,7 @@ import { projectUrls, type UrlProjection } from './projection.js';
 export type AutoApplyUrlAttributionStatus =
   | 'applied'
   | 'skipped-existing-attribution'
+  | 'skipped-ignored'
   | 'skipped-policy'
   | 'skipped-disabled';
 
@@ -85,6 +86,18 @@ export const autoApplyUrlAttribution = async (
   if (existing !== undefined && existing.source !== 'inferred') {
     return {
       status: 'skipped-existing-attribution',
+      resolution,
+      projection: beforeProjection,
+    };
+  }
+
+  // Ignored URLs never get auto-attributed. User explicitly said
+  // "don't bother me." Reversible — re-organizing the URL into a
+  // workstream clears the ignore flag (via upsertAttribution).
+  const ignored = beforeProjection.byCanonicalUrl.get(input.canonicalUrl)?.currentIgnored;
+  if (ignored !== undefined) {
+    return {
+      status: 'skipped-ignored',
       resolution,
       projection: beforeProjection,
     };

@@ -13,7 +13,12 @@
 import type { AcceptedEvent } from '../sync/causal.js';
 import { USER_ORGANIZED_ITEM, isUserOrganizedItemPayload } from '../feedback/events.js';
 import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from '../timeline/events.js';
-import { URL_ATTRIBUTION_INFERRED, isUrlAttributionInferredPayload } from './events.js';
+import {
+  URL_ATTRIBUTION_INFERRED,
+  URL_IGNORED,
+  isUrlAttributionInferredPayload,
+  isUrlIgnoredPayload,
+} from './events.js';
 
 export const URL_PROJECTION_SCHEMA_VERSION = 1;
 
@@ -36,6 +41,20 @@ export interface UrlAttribution {
   readonly seq: number;
 }
 
+export interface UrlIgnoredState {
+  // Stage 5 polish — explicit user dismissal of a URL as "noise."
+  // Stronger than workstreamId:null + 'user_asserted' (which says
+  // "meaningful but no workstream"). Ignored URLs are hidden from
+  // Inbox, the workstream view, the connections graph, and topic
+  // clusters. Reversible: re-organizing the URL into a workstream
+  // supersedes the ignore.
+  readonly reason: 'noise' | 'duplicate' | 'private';
+  readonly observedAt: string;
+  readonly clientEventId: string;
+  readonly replicaId: string;
+  readonly seq: number;
+}
+
 export interface UrlVisitRecord {
   readonly canonicalUrl: string;
   readonly firstSeenAt: string;
@@ -47,6 +66,7 @@ export interface UrlVisitRecord {
   readonly visitCount: number;
   readonly tabSessionIds: readonly string[];
   readonly currentAttribution?: UrlAttribution;
+  readonly currentIgnored?: UrlIgnoredState;
   readonly attributionHistory: readonly UrlAttribution[];
 }
 
@@ -123,6 +143,18 @@ const upsertAttribution = (
   ].sort(compareAttribution);
   const currentAttribution = history[history.length - 1];
   const fallbackObservedAt = attribution.observedAt;
+  // Re-organize supersedes ignore: when the user explicitly attributes
+  // an ignored URL to a workstream (workstreamId !== null + source =
+  // user_asserted / tab-group-*), the prior `currentIgnored` is
+  // cleared. Inferred attributions never clear ignored (auto-apply
+  // should already be filtering ignored URLs upstream).
+  const userAssertedReorganize =
+    attribution.workstreamId !== null &&
+    (attribution.source === 'user_asserted' ||
+      attribution.source === 'tab-group-pull-in' ||
+      attribution.source === 'tab-group-pull-out');
+  const preserveIgnored =
+    existing?.currentIgnored !== undefined && !userAssertedReorganize;
   records.set(attribution.canonicalUrl, {
     canonicalUrl: attribution.canonicalUrl,
     firstSeenAt: existing?.firstSeenAt ?? fallbackObservedAt,
@@ -134,7 +166,57 @@ const upsertAttribution = (
     ...(existing?.provider === undefined ? {} : { provider: existing.provider }),
     ...(existing?.host === undefined ? {} : { host: existing.host }),
     ...(currentAttribution === undefined ? {} : { currentAttribution }),
+    ...(preserveIgnored && existing!.currentIgnored !== undefined
+      ? { currentIgnored: existing!.currentIgnored }
+      : {}),
     attributionHistory: history,
+  });
+};
+
+const upsertIgnored = (
+  records: Map<string, UrlVisitRecord>,
+  input: UrlIgnoredState & { readonly canonicalUrl: string },
+): void => {
+  const existing = records.get(input.canonicalUrl);
+  // Last-write-wins by event order. Compare against existing ignore
+  // (if any) via the same order semantics used for attributions.
+  const incomingCursor = {
+    observedAt: input.observedAt,
+    replicaId: input.replicaId,
+    seq: input.seq,
+    clientEventId: input.clientEventId,
+  };
+  const existingCursor = existing?.currentIgnored;
+  const keepExisting =
+    existingCursor !== undefined &&
+    (existingCursor.observedAt > incomingCursor.observedAt ||
+      (existingCursor.observedAt === incomingCursor.observedAt &&
+        existingCursor.seq > incomingCursor.seq));
+  const nextIgnored: UrlIgnoredState = keepExisting && existingCursor !== undefined
+    ? existingCursor
+    : {
+        reason: input.reason,
+        observedAt: input.observedAt,
+        clientEventId: input.clientEventId,
+        replicaId: input.replicaId,
+        seq: input.seq,
+      };
+  const fallbackObservedAt = input.observedAt;
+  records.set(input.canonicalUrl, {
+    canonicalUrl: input.canonicalUrl,
+    firstSeenAt: existing?.firstSeenAt ?? fallbackObservedAt,
+    lastSeenAt: existing?.lastSeenAt ?? fallbackObservedAt,
+    visitCount: existing?.visitCount ?? 0,
+    tabSessionIds: existing?.tabSessionIds ?? [],
+    ...(existing?.latestUrl === undefined ? {} : { latestUrl: existing.latestUrl }),
+    ...(existing?.latestTitle === undefined ? {} : { latestTitle: existing.latestTitle }),
+    ...(existing?.provider === undefined ? {} : { provider: existing.provider }),
+    ...(existing?.host === undefined ? {} : { host: existing.host }),
+    ...(existing?.currentAttribution === undefined
+      ? {}
+      : { currentAttribution: existing.currentAttribution }),
+    currentIgnored: nextIgnored,
+    attributionHistory: existing?.attributionHistory ?? [],
   });
 };
 
@@ -305,10 +387,32 @@ const foldUrlAttributionInferredIntoAccumulator = (
 ): void => {
   if (event.type !== URL_ATTRIBUTION_INFERRED) return;
   if (!isUrlAttributionInferredPayload(event.payload)) return;
+  // Auto-apply MUST skip ignored URLs — but server-side autoApplyUrl
+  // already filters them. Defensive check here too: if a stale
+  // inferred event arrives for an ignored URL, don't override the
+  // ignore signal.
+  const existing = acc.records.get(event.payload.canonicalUrl);
+  if (existing?.currentIgnored !== undefined) return;
   upsertAttribution(acc.records, {
     canonicalUrl: event.payload.canonicalUrl,
     workstreamId: event.payload.workstreamId,
     source: 'inferred',
+    observedAt: isoFromAcceptedAt(event.acceptedAtMs),
+    clientEventId: event.clientEventId,
+    replicaId: event.dot.replicaId,
+    seq: event.dot.seq,
+  });
+};
+
+const foldUrlIgnoredIntoAccumulator = (
+  acc: UrlProjectionAccumulator,
+  event: AcceptedEvent,
+): void => {
+  if (event.type !== URL_IGNORED) return;
+  if (!isUrlIgnoredPayload(event.payload)) return;
+  upsertIgnored(acc.records, {
+    canonicalUrl: event.payload.canonicalUrl,
+    reason: event.payload.reason ?? 'noise',
     observedAt: isoFromAcceptedAt(event.acceptedAtMs),
     clientEventId: event.clientEventId,
     replicaId: event.dot.replicaId,
@@ -323,6 +427,7 @@ export const foldEventIntoUrlProjectionAccumulator = (
   foldObservedVisitIntoAccumulator(acc, event);
   foldUserOrganizedIntoAccumulator(acc, event);
   foldUrlAttributionInferredIntoAccumulator(acc, event);
+  foldUrlIgnoredIntoAccumulator(acc, event);
 };
 
 export const seedUrlProjectionAccumulator = (
@@ -413,7 +518,12 @@ export const urlInbox = (
   input: { readonly limit: number; readonly offset: number },
 ): readonly UrlVisitRecord[] =>
   [...projection.byCanonicalUrl.values()]
-    .filter((record) => record.currentAttribution === undefined)
+    // Hide attributed URLs (they live in their workstream view) AND
+    // hide ignored URLs (user explicitly said "noise, don't bother").
+    .filter(
+      (record) =>
+        record.currentAttribution === undefined && record.currentIgnored === undefined,
+    )
     // Sort by FIRST seen (descending — newest URL on top), not last
     // seen. Sorting by lastSeenAt makes existing items jump around the
     // list every time the user revisits the page, which the user
