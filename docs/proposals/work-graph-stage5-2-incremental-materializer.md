@@ -77,14 +77,98 @@ the past, the fields it carries (`focusedWindowMs`, `observedAt`,
 visitId)` or `(streamName, canonicalUrl)` can be folded once and
 cached forever.
 
-The events that DO mutate state retroactively:
-- `user.organized.item` — workstream attribution can change later
-- `url.attribution.inferred` — overridable by later user assertion
-- `thread.upserted` — changes thread → URL attribution propagation
-- `privacy.gate.flipped` — could re-gate similarity / engagement
+The events that DO mutate state retroactively — full audit grouped
+by which derived state they invalidate:
 
-These four event types are the ONLY ones that should invalidate
-downstream projections beyond their own incremental fold.
+**User-driven attribution mutators** (the core "organize" surface):
+- `user.organized.item` — moves an item (URL / tab-session / thread)
+  between workstreams. Invalidates that one row's `currentAttribution`
+  + any `visit_instance_in_workstream` edges referencing it.
+- `user.engagement.relabeled` — overrides the engagement classifier
+  for one visit. Invalidates that visit's class + any downstream
+  feature that fed off the class (similarity gates, ranker labels).
+- `user.flow.confirmed` / `user.flow.rejected` — user accepts /
+  rejects a flow grouping. Invalidates flow membership for the
+  involved visits.
+- `user.topic.renamed` — changes a topic's display label. Display-
+  only; no data-shape invalidation.
+- `user.snippet.promoted` — promotes a snippet to first-class.
+  Invalidates snippet membership.
+
+**Workstream tree mutators** (the user's original "workstream changes"
+question):
+- `workstream.upserted` — creates a workstream OR renames an existing
+  one OR re-parents it. Invalidates:
+  - the workstream node's `label` in the graph
+  - the `workstream_parent_of` edge set if `parentId` changed
+  - the display path resolution for every URL / tab-session attributed
+    to it (paths like "sideproject / sidetrack" are derived from the
+    current tree shape, not snapshotted at attribution time)
+- `workstream.deleted` — tombstones a workstream. Invalidates:
+  - every `visit_instance_in_workstream` edge pointing to it (orphaned)
+  - every `currentAttribution.workstreamId` row pointing to it
+    (caller must fall back to a parent or drop the attribution)
+  - the workstream tree shape
+
+**Thread record mutators** (analogous to workstream):
+- `thread.upserted` — creates / renames / re-points a thread. The
+  thread carries a `primaryWorkstreamId` field; the materializer's
+  `projectUrls(merged, {threads})` propagates that attribution onto
+  the thread's canonical URL. Any change invalidates the URL's
+  thread-derived attribution.
+- `thread.archived` / `thread.unarchived` — changes Inbox visibility.
+  Invalidates the Inbox's filter.
+- `thread.deleted` — tombstones a thread. Same shape as
+  `workstream.deleted`.
+
+**Inferred-attribution mutators** (system-derived, overridable):
+- `urls.attribution.inferred` — system suggests a URL attribution.
+  Overridable by a later `user.organized.item`. Invalidates the URL
+  row.
+- `tabsession.attribution.inferred` — same shape for tab sessions.
+
+**Other state mutators**:
+- `privacy.gate.flipped` — toggles a subsystem gate. Re-gates
+  engagement / similarity / visual eligibility for *future* events;
+  past events are unaffected (the classifier already ran with the
+  prior gate state).
+- `privacy.permission.granted` / `privacy.permission.revoked` — same
+  shape, narrower scope (host permission only).
+- `queue.created` / `queue.statusSet` — queue projection.
+- `dispatch.linked` — links a dispatch to a thread; refines an
+  already-existing dispatch.
+- `recall.tombstone.target` — removes an item from the recall index.
+
+The design principle is more useful than the enumeration: **observation
+streams fold incrementally; user-driven and system-derived state
+mutators invalidate a specific, declared slice.** The full invalidation
+table (M6 in the migration plan below) is a declarative mapping from
+event type → set of affected slices; the incremental materializer reads
+that table and re-projects only the named slices.
+
+A helpful taxonomy for both halves:
+
+| Append-only LEAF streams (fold in O(1) forever) |
+|---|
+| `browser.timeline.observed` |
+| `engagement.interval.observed` |
+| `engagement.session.aggregated` |
+| `selection.copied` / `selection.pasted` |
+| `visual.fingerprint.observed` |
+| `capture.recorded` / `capture.extraction.produced` |
+| `coding.tick.observed` / `coding.session.turn.observed` / `coding.session.started` |
+| `dispatch.recorded` |
+
+| Retroactive MUTATORS (invalidate declared slices) |
+|---|
+| `user.organized.item`, `user.engagement.relabeled`, `user.flow.confirmed`, `user.flow.rejected`, `user.topic.renamed`, `user.snippet.promoted` |
+| `workstream.upserted`, `workstream.deleted` |
+| `thread.upserted`, `thread.archived`, `thread.unarchived`, `thread.deleted` |
+| `urls.attribution.inferred`, `tabsession.attribution.inferred` |
+| `privacy.gate.flipped`, `privacy.permission.granted`, `privacy.permission.revoked` |
+| `queue.created`, `queue.statusSet` |
+| `dispatch.linked` |
+| `recall.tombstone.target` |
 
 ## Why the current design chose batch rebuild
 
@@ -233,26 +317,82 @@ bytes after one full rebuild over the same events.
 
 ### M6 — Invalidation surface for mutating events
 
-The four mutating event types (`user.organized.item`,
-`url.attribution.inferred`, `thread.upserted`, `privacy.gate.flipped`)
-trigger re-projection of the affected slice. Implement a tiny
-declarative table:
+The full list of mutating event types (see the audit above; ~15
+types across user/workstream/thread/inferred/privacy/queue/dispatch/
+recall) each trigger re-projection of their declared affected slices.
+Implement a single declarative table that owns the mapping:
 
 ```ts
-const INVALIDATION_RULES: Record<EventType, (event) => InvalidationKey[]> = {
-  'user.organized.item': (e) => e.payload.itemKind === 'canonical-url'
-    ? [{ kind: 'url', id: e.payload.itemId }]
-    : [{ kind: 'tabSession', id: e.payload.itemId }],
-  'thread.upserted': (e) => [
-    { kind: 'thread', id: e.payload.bac_id },
-    { kind: 'url', id: e.payload.canonicalUrl },
-  ],
+type InvalidationKey =
+  | { kind: 'url'; canonicalUrl: string }
+  | { kind: 'tabSession'; tabSessionId: string }
+  | { kind: 'thread'; bacId: string }
+  | { kind: 'workstream'; bacId: string }
+  | { kind: 'workstreamTree' }              // structural change
+  | { kind: 'engagementVisit'; visitId: string }
+  | { kind: 'topicMember'; visitId: string }
+  | { kind: 'queue'; itemId: string }
+  | { kind: 'rankerLabels' }                // batch-level
+  | { kind: 'inboxFilter' };                // Inbox visibility predicate
+
+const INVALIDATION_RULES: Record<EventType, (event: AcceptedEvent) => InvalidationKey[]> = {
+  'user.organized.item': (e) => {
+    const k = e.payload.itemKind;
+    if (k === 'canonical-url') return [{ kind: 'url', canonicalUrl: e.payload.itemId }];
+    if (k === 'tab-session')   return [{ kind: 'tabSession', tabSessionId: e.payload.itemId }];
+    if (k === 'thread')        return [{ kind: 'thread', bacId: e.payload.itemId }];
+    return [];
+  },
+  'user.engagement.relabeled': (e) =>
+    [{ kind: 'engagementVisit', visitId: e.payload.visitId },
+     { kind: 'rankerLabels' }],
+  'user.flow.confirmed':   (e) => e.payload.visitIds.map(v => ({ kind: 'topicMember' as const, visitId: v })),
+  'user.flow.rejected':    (e) => e.payload.visitIds.map(v => ({ kind: 'topicMember' as const, visitId: v })),
+  'workstream.upserted':   (e) => [{ kind: 'workstream', bacId: e.payload.bac_id },
+                                   { kind: 'workstreamTree' }],
+  'workstream.deleted':    (e) => [{ kind: 'workstream', bacId: e.payload.bac_id },
+                                   { kind: 'workstreamTree' }],
+  'thread.upserted':       (e) => [{ kind: 'thread', bacId: e.payload.bac_id },
+                                   { kind: 'url', canonicalUrl: e.payload.canonicalUrl }],
+  'thread.archived':       (e) => [{ kind: 'thread', bacId: e.payload.bac_id },
+                                   { kind: 'inboxFilter' }],
+  'thread.unarchived':     (e) => [{ kind: 'thread', bacId: e.payload.bac_id },
+                                   { kind: 'inboxFilter' }],
+  'thread.deleted':        (e) => [{ kind: 'thread', bacId: e.payload.bac_id },
+                                   { kind: 'inboxFilter' }],
+  'urls.attribution.inferred':       (e) => [{ kind: 'url', canonicalUrl: e.payload.canonicalUrl }],
+  'tabsession.attribution.inferred': (e) => [{ kind: 'tabSession', tabSessionId: e.payload.tabSessionId }],
+  'privacy.gate.flipped':            ()  => [],   // affects future events only
+  'queue.created':                   (e) => [{ kind: 'queue', itemId: e.payload.itemId }],
+  'queue.statusSet':                 (e) => [{ kind: 'queue', itemId: e.payload.itemId }],
   // ...
 };
 ```
 
+Two important properties:
+
+1. **`workstream.upserted` returns BOTH** the specific workstream
+   slice AND `workstreamTree`. Renaming X invalidates X's label
+   AND every URL/tabSession whose `currentAttribution.workstreamId`
+   resolves a display path through X (which is "any descendant of
+   X plus X itself"). The materializer reads the affected
+   `workstreamTree` key as "rebuild any path-derived display labels
+   that traverse the changed node." Practical implementation: hold
+   a `workstreamId → resolved-path` memo, invalidate the memo
+   entries whose path includes the changed bac_id.
+2. **`workstream.deleted` may orphan attributions.** The reducer
+   should NOT mutate the attribution row's `workstreamId` field —
+   that violates byte-determinism if the deletion is later undone
+   on a peer. Instead, mark the workstream node as `tombstoned: true`
+   in the snapshot, and let the side panel render orphaned
+   attributions as such. Re-attribution becomes a user action
+   (`user.organized.item`) rather than an automatic recovery.
+
 **Acceptance:** invalidation-trace test — for each mutating event
-type, the exact set of recomputed slices matches the documented rule.
+type listed in the audit, the exact set of recomputed slices
+matches the documented rule. Property-test fixture: generate a
+random event sequence, run incremental + rebuild paths, assert
+identical slice content after each invalidation.
 
 ## Risks & open questions
 
