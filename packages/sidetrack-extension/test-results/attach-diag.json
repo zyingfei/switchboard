@@ -1,0 +1,380 @@
+{
+  "producedAt": "2026-05-11T20:44:45.447Z",
+  "extensionId": "ijgnchljgbgbpdnjnmidbgmpbpkclmoc",
+  "extensionPath": "/Users/yingfei/playground/playground/browser-ai-companion/packages/sidetrack-extension/.output/chrome-mv3",
+  "cdpAttached": true,
+  "serviceWorkerAwake": true,
+  "companionReachable": true,
+  "extensionBuildSha": "1cc9c1a8",
+  "extensionBuildAt": "2026-05-11T20:44:23.752Z",
+  "companionBuildSha": "1cc9c1a8",
+  "companionStartedAt": "2026-05-11T20:44:29.290Z",
+  "companionPort": 60502,
+  "companionBridgeKeyRedacted": "9VHd…TGbI",
+  "vaultRoot": "/var/folders/_p/qfpzpb_d7wj4tmgfhz2_837c0000gn/T/sidetrack-extension-e2e-vault-p50lU2",
+  "branch": "feat/work-graph-stage5-data-bridge",
+  "headSha": "1cc9c1a8",
+  "workingTreeDirty": true,
+  "stalenessWarning": null,
+  "privacy": {
+    "timelineGate": "open",
+    "engagementGate": "open",
+    "visualFingerprintGate": null
+  },
+  "permissions": {
+    "httpHostAccess": false
+  },
+  "contentScripts": {
+    "engagementRegistered": false,
+    "engagementScripts": [],
+    "engagementBuiltFileExists": true,
+    "engagementBuiltFilePath": "/Users/yingfei/playground/playground/browser-ai-companion/packages/sidetrack-extension/.output/chrome-mv3/engagement.js",
+    "visualFingerprintRegistered": false,
+    "visualFingerprintScripts": []
+  },
+  "engagement": {
+    "lastIntervalSeen": null,
+    "lastAggregatePosted": null,
+    "postError": null,
+    "eventCountBefore": 0,
+    "eventCountAfter": 0
+  },
+  "materializer": {
+    "engagementEligibleEntryCount": 0,
+    "entriesWithFocusedWindowMs": 0,
+    "similarityEdgeCount": 0,
+    "rankerStatus": "skipped",
+    "closestVisitEdgeCount": null,
+    "fullCounters": {
+      "schemaVersion": 1,
+      "producedAt": "2026-05-11T20:44:41.951Z",
+      "maxAcceptedAtMs": 1778532281946,
+      "timeline": {
+        "entryCount": 3,
+        "entriesWithTabSessionId": 3,
+        "entriesWithFocusedWindowMs": 0,
+        "engagementEligibleEntryCount": 0,
+        "engagementGateMs": 5000
+      },
+      "similarity": {
+        "revisionId": "334514884ae9c681",
+        "modelRevision": "761b726dd34fb83930e26aab4e9ac3899aa1fa78",
+        "threshold": 0.85,
+        "edgeCount": 0,
+        "producer": "embedding",
+        "effectiveConfig": {
+          "threshold": 0.85,
+          "topK": 50,
+          "engagementGateMs": 5000,
+          "lexicalThreshold": 0.3,
+          "lexicalFallbackEnabled": true
+        }
+      },
+      "topics": {
+        "revisionId": "Gdghny_iaVFaLH7F",
+        "algorithmVersion": "topic-revision:v1:union-find",
+        "topicCount": 0,
+        "memberCount": 0,
+        "componentSizes": [],
+        "lineageCount": 0
+      },
+      "ranker": {
+        "status": "skipped",
+        "reason": "no-labels",
+        "labelCount": 0,
+        "positiveLabelCount": 0,
+        "negativeLabelCount": 0,
+        "candidateCount": null,
+        "revisionId": null,
+        "error": null
+      },
+      "userAssertions": {
+        "byItemKind": {
+          "thread": 0,
+          "workstream": 0,
+          "visit": 0,
+          "tab-session": 0,
+          "tab-group-link": 0,
+          "topic": 0,
+          "snippet": 0,
+          "canonical-url": 0
+        },
+        "total": 0
+      },
+      "inferred": {
+        "urlAttributionInferredCount": 0,
+        "tabSessionAttributionInferredCount": 0
+      },
+      "engagement": {
+        "sessionAggregatedCount": 0,
+        "sumFocusedWindowMs": 0,
+        "maxFocusedWindowMs": 0
+      },
+      "urls": {
+        "canonicalUrlCount": 3,
+        "attributedCanonicalUrlCount": 0,
+        "attributedByUserCanonicalUrlCount": 0,
+        "attributionBySource": {}
+      },
+      "snapshot": {
+        "nodeCount": 10,
+        "edgeCount": 8,
+        "visitInstanceCount": 3,
+        "attributedVisitInstanceCount": 0,
+        "unattributedVisitInstanceCount": 3,
+        "nodeCountByKind": {
+          "tab-session": 4,
+          "timeline-visit": 3,
+          "visit-instance": 3
+        },
+        "edgeCountByKind": {
+          "tab_session_opener_chain": 2,
+          "visit_instance_in_tab_session": 3,
+          "visit_instance_same_url_as_timeline_visit": 3
+        }
+      }
+    }
+  },
+  "threadUrlPropagation": {
+    "urlAttributionBySource": {},
+    "threadCount": 0,
+    "threadsWithPrimaryWorkstream": 0,
+    "threadsWithUrl": 0,
+    "threadsMatchedToObservedCanonicalUrl": 0,
+    "propagatedCount": 0,
+    "missReasons": {
+      "noPrimaryWorkstream": 0,
+      "noThreadUrl": 0,
+      "urlNotObserved": 0,
+      "lostToPrecedence": 0
+    }
+  },
+  "engagementFailureClass": "missing permission",
+  "threadPropagationFailureClass": "no threads in vault",
+  "runtimeDiagBefore": {
+    "capturedAt": "2026-05-11T20:44:31.658Z",
+    "diagnostics": {
+      "materializer": {
+        "admitAttempts": 1,
+        "admittedCount": 1,
+        "companionReachable": true,
+        "lastAdmit": {
+          "activeCount": 0,
+          "at": "2026-05-11T20:44:31.091Z",
+          "clientEventId": "tl_07e49ab78565f258|https://gemini.google.com/app|2026-05-11T20:44:31.090Z",
+          "intent": "passive",
+          "ok": true,
+          "spoolCount": 0,
+          "tier": "active"
+        },
+        "lastDrain": {
+          "at": "2026-05-11T20:44:31.601Z",
+          "drainHookPresent": true,
+          "drainableCount": 1,
+          "remaining": 0,
+          "uploaded": 1
+        },
+        "lastError": null,
+        "lastObservedAt": "2026-05-11T20:44:31.090Z",
+        "rejectedCount": 0,
+        "spool": {
+          "active": 0,
+          "pendingSend": 0,
+          "spooled": 0,
+          "total": 0
+        }
+      },
+      "observer": {
+        "closeCalls": 1,
+        "closeDroppedMissingTab": 1,
+        "coalescedCalls": 0,
+        "droppedUrlTooLong": 0,
+        "emitCalls": 1,
+        "lastDecision": {
+          "at": "2026-05-11T20:44:31.090Z",
+          "canonicalUrl": "https://gemini.google.com/app",
+          "hasTabSessionId": true,
+          "kind": "emit",
+          "sanitizedUrl": "https://gemini.google.com/app",
+          "transition": "activated"
+        },
+        "observeCalls": 1
+      },
+      "wiring": {
+        "activeWorkstreamCache": {
+          "refreshes": 1,
+          "value": null
+        },
+        "capturedInitDepsPresent": true,
+        "contentTitleSink": {
+          "hits": 3,
+          "lastAt": "2026-05-11T20:43:54.204Z",
+          "lastValue": "ChatGPT",
+          "sinkAttached": true,
+          "skippedGateClosed": 0,
+          "skippedNotInit": 3,
+          "skippedUntrackable": 0
+        },
+        "initializeCalls": 2,
+        "initialized": true,
+        "lastDrainTrigger": null,
+        "lastGateRead": {
+          "at": "2026-05-11T20:44:31.129Z",
+          "boundary": "onUpdated",
+          "open": true
+        },
+        "lastObserveRequest": {
+          "at": "2026-05-11T20:44:31.090Z",
+          "source": "onActivated",
+          "tabSessionId": "tses_01KRCCHGZFA1N2ARSKGP9F1FGV",
+          "transition": "activated",
+          "url": "https://gemini.google.com/app"
+        },
+        "lastOnUpdated": {
+          "at": "2026-05-11T20:44:31.129Z",
+          "gateOpen": true,
+          "hasChangeUrl": false,
+          "sequence": 5,
+          "skippedReason": "non-trackable-scheme",
+          "status": "complete",
+          "tabId": 997206982,
+          "tabUrl": "chrome-extension://ijgnchljgbgbpdnjnmidbgmpbpkclmoc/sidepanel.html"
+        },
+        "listenerCalls": {
+          "onActivated": 2,
+          "onCreated": 1,
+          "onRemoved": 1,
+          "onUpdated": 5,
+          "onWindowRemoved": 0
+        },
+        "listeners": {
+          "alarm": 1,
+          "onActivated": 1,
+          "onCreated": 1,
+          "onRemoved": 1,
+          "onUpdated": 1,
+          "onWindowRemoved": 1,
+          "storageChangeAttached": true
+        },
+        "observerBridgeCalls": {
+          "close": 1,
+          "observe": 1
+        },
+        "successfulInitializeCalls": 1,
+        "triggerDrainCalls": 0
+      }
+    }
+  },
+  "runtimeDiagAfter": {
+    "capturedAt": "2026-05-11T20:44:45.138Z",
+    "diagnostics": {
+      "materializer": {
+        "admitAttempts": 7,
+        "admittedCount": 7,
+        "companionReachable": true,
+        "lastAdmit": {
+          "activeCount": 0,
+          "at": "2026-05-11T20:44:41.821Z",
+          "clientEventId": "tl_11b669eec12f2a6d|https://www.google.com/search?q=sidetrack+attach+diag+probe|2026-05-11T20:44:41.764Z",
+          "intent": "passive",
+          "ok": true,
+          "spoolCount": 0,
+          "tier": "active"
+        },
+        "lastDrain": {
+          "at": "2026-05-11T20:44:44.823Z",
+          "drainHookPresent": true,
+          "drainableCount": 0,
+          "remaining": 0,
+          "uploaded": 0
+        },
+        "lastError": null,
+        "lastObservedAt": "2026-05-11T20:44:41.764Z",
+        "rejectedCount": 0,
+        "spool": {
+          "active": 0,
+          "pendingSend": 0,
+          "spooled": 0,
+          "total": 0
+        }
+      },
+      "observer": {
+        "closeCalls": 4,
+        "closeDroppedMissingTab": 2,
+        "coalescedCalls": 5,
+        "droppedUrlTooLong": 0,
+        "emitCalls": 7,
+        "lastDecision": {
+          "at": "2026-05-11T20:44:44.530Z",
+          "kind": "close-missing-tab"
+        },
+        "observeCalls": 10
+      },
+      "wiring": {
+        "activeWorkstreamCache": {
+          "refreshes": 1,
+          "value": null
+        },
+        "capturedInitDepsPresent": true,
+        "contentTitleSink": {
+          "hits": 5,
+          "lastAt": "2026-05-11T20:44:38.833Z",
+          "lastValue": "sidetrack attach diag probe - Google Search",
+          "sinkAttached": true,
+          "skippedGateClosed": 0,
+          "skippedNotInit": 3,
+          "skippedUntrackable": 0
+        },
+        "initializeCalls": 2,
+        "initialized": true,
+        "lastDrainTrigger": {
+          "at": "2026-05-11T20:44:44.823Z",
+          "capturedInitDepsPresent": true,
+          "remaining": 0,
+          "uploaded": 0
+        },
+        "lastGateRead": {
+          "at": "2026-05-11T20:44:44.587Z",
+          "boundary": "onUpdated",
+          "open": true
+        },
+        "lastObserveRequest": {
+          "at": "2026-05-11T20:44:44.530Z",
+          "source": "onRemoved"
+        },
+        "lastOnUpdated": {
+          "at": "2026-05-11T20:44:44.587Z",
+          "gateOpen": true,
+          "hasChangeUrl": false,
+          "sequence": 31,
+          "skippedReason": "non-trackable-scheme",
+          "status": "complete",
+          "tabId": 997206989,
+          "tabUrl": "chrome-extension://ijgnchljgbgbpdnjnmidbgmpbpkclmoc/sidepanel.html"
+        },
+        "listenerCalls": {
+          "onActivated": 9,
+          "onCreated": 5,
+          "onRemoved": 4,
+          "onUpdated": 31,
+          "onWindowRemoved": 0
+        },
+        "listeners": {
+          "alarm": 1,
+          "onActivated": 1,
+          "onCreated": 1,
+          "onRemoved": 1,
+          "onUpdated": 1,
+          "onWindowRemoved": 1,
+          "storageChangeAttached": true
+        },
+        "observerBridgeCalls": {
+          "close": 4,
+          "observe": 8
+        },
+        "successfulInitializeCalls": 1,
+        "triggerDrainCalls": 5
+      }
+    }
+  }
+}

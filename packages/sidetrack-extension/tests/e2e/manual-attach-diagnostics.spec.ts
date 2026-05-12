@@ -1,0 +1,871 @@
+// Manual attach diagnostics — NOT a CI test.
+//
+// REQUIRES `e2e:chrome-debug` running in a separate terminal. This
+// spec attaches to that browser via CDP (localhost:9222). If
+// chrome-debug isn't running, the spec is skipped with a readable
+// message explaining what to start.
+//
+// Two-terminal flow:
+//
+//   Terminal A — keep this running for the duration of the diag:
+//     npm --prefix packages/sidetrack-extension run e2e:chrome-debug
+//
+//   Terminal B — runs in ~30 s, writes attach-diag.json + a summary:
+//     SIDETRACK_E2E_CDP_URL=http://localhost:9222 \
+//       npm --prefix packages/sidetrack-extension run e2e:attach-diag
+//
+// How this differs from `e2e:recorder`:
+//
+//   - e2e:recorder runs a 9-minute Patchright stealth session against
+//     a persistent ~/.sidetrack-vault. Real provider logins, recorded
+//     artifacts, no CDP exposed. The intended dogfooding harness.
+//
+//   - e2e:chrome-debug + e2e:attach-diag are a diagnostic pair. CfT
+//     launches in normal mode with CDP on port 9222; attach-diag
+//     connects, spawns a fresh ephemeral companion, configures the
+//     extension, opens the gates, exercises a few pages, and writes
+//     a JSON evidence block classifying any failure into one of
+//     N known buckets. NOT for recording user activity — for proving
+//     which condition failed.
+//
+// What it does (default = self-bootstrap mode) — without asking the
+// operator to manually click anything in the side panel:
+//
+//   1. Connects over CDP to the already-running Chrome.
+//   2. Wakes the MV3 service worker (opens chrome-extension://*/sidepanel.html).
+//   3. Spawns a temp companion process (startTestCompanion).
+//   4. Writes companion settings into chrome.storage.local so the SW
+//      knows where to reach the companion.
+//   5. POSTs `privacy.gate.flipped` for the 'timeline' + 'engagement'
+//      gates so the SW's privacy projection reads "open".
+//   6. Sends `sidetrack.timeline.reinit` + `sidetrack.privacy.gateChanged`
+//      runtime messages so the SW re-runs initializeTimelineWiring and
+//      registers chrome.tabs listeners.
+//   7. Probes everything: chrome.permissions, registered content
+//      scripts, dev.diag stash.
+//   8. Opens a benign https tab (Wikipedia main page) and a Google
+//      search URL for ~8 seconds each so engagement + timeline
+//      observation get a chance to fire, then queries the SW again.
+//   9. Calls the SW's `sidetrack.timeline.force-drain`.
+//  10. Hits the companion's HTTP for /v1/version, /v1/privacy/projection,
+//      /v1/threads/projections, /v1/visits/projection, and reads the
+//      materializer diagnostic from the spawned vault.
+//  11. Computes per-condition classifications for engagement +
+//      thread→URL propagation and writes the JSON report.
+//
+// Skip self-bootstrap with SIDETRACK_E2E_ATTACH_DIAG_LIVE=1 — then it
+// probes whatever state the chrome-debug session already has.
+
+import { mkdir, readFile, writeFile, stat as statFile } from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { expect, test } from '@playwright/test';
+
+import {
+  startTestCompanion,
+  type TestCompanion,
+} from './helpers/companion';
+import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
+
+const repoRoot = path.resolve(fileURLToPath(new URL('../../../../', import.meta.url)));
+
+// --- Types ----------------------------------------------------------
+
+interface RuntimeDiagStash {
+  readonly observer?: Record<string, unknown>;
+  readonly wiring?: Record<string, unknown>;
+  readonly contentTitleSink?: Record<string, unknown>;
+}
+
+interface CompanionEndpoint {
+  readonly port: number;
+  readonly bridgeKey: string;
+}
+
+interface ContentScriptRegistration {
+  readonly id: string;
+  readonly matches?: readonly string[];
+  readonly js?: readonly string[];
+  readonly runAt?: string;
+}
+
+interface AttachDiagReport {
+  readonly producedAt: string;
+  readonly extensionId: string;
+  readonly extensionPath: string;
+  readonly cdpAttached: boolean;
+  readonly serviceWorkerAwake: boolean;
+  readonly companionReachable: boolean;
+  readonly extensionBuildSha: string;
+  readonly extensionBuildAt: string | null;
+  readonly companionBuildSha: string | null;
+  readonly companionStartedAt: string | null;
+  readonly companionPort: number | null;
+  readonly companionBridgeKeyRedacted: string | null;
+  readonly vaultRoot: string | null;
+  readonly branch: string;
+  readonly headSha: string;
+  readonly workingTreeDirty: boolean;
+  readonly stalenessWarning: string | null;
+  readonly privacy: {
+    readonly timelineGate: string | null;
+    readonly engagementGate: string | null;
+    readonly visualFingerprintGate: string | null;
+  };
+  readonly permissions: {
+    readonly httpHostAccess: boolean | null;
+  };
+  readonly contentScripts: {
+    readonly engagementRegistered: boolean;
+    readonly engagementScripts: readonly ContentScriptRegistration[];
+    readonly engagementBuiltFileExists: boolean;
+    readonly engagementBuiltFilePath: string;
+    readonly visualFingerprintRegistered: boolean;
+    readonly visualFingerprintScripts: readonly ContentScriptRegistration[];
+  };
+  readonly engagement: {
+    readonly lastIntervalSeen: unknown;
+    readonly lastAggregatePosted: unknown;
+    readonly postError: unknown;
+    readonly eventCountBefore: number | null;
+    readonly eventCountAfter: number | null;
+  };
+  readonly materializer: {
+    readonly engagementEligibleEntryCount: number | null;
+    readonly entriesWithFocusedWindowMs: number | null;
+    readonly similarityEdgeCount: number | null;
+    readonly rankerStatus: string | null;
+    readonly closestVisitEdgeCount: number | null;
+    readonly fullCounters: unknown;
+  };
+  readonly threadUrlPropagation: {
+    readonly urlAttributionBySource: Record<string, number>;
+    readonly threadCount: number;
+    readonly threadsWithPrimaryWorkstream: number;
+    readonly threadsWithUrl: number;
+    readonly threadsMatchedToObservedCanonicalUrl: number;
+    readonly propagatedCount: number;
+    readonly missReasons: {
+      readonly noPrimaryWorkstream: number;
+      readonly noThreadUrl: number;
+      readonly urlNotObserved: number;
+      readonly lostToPrecedence: number;
+    };
+  };
+  readonly engagementFailureClass: string;
+  readonly threadPropagationFailureClass: string;
+  readonly runtimeDiagBefore: RuntimeDiagStash | null;
+  readonly runtimeDiagAfter: RuntimeDiagStash | null;
+}
+
+// --- Git helpers ----------------------------------------------------
+
+const gitCommand = async (args: string): Promise<string> => {
+  const { execSync } = await import('node:child_process');
+  try {
+    return execSync(`git ${args}`, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      cwd: repoRoot,
+    }).trim();
+  } catch {
+    return '';
+  }
+};
+
+// --- HTTP helpers ---------------------------------------------------
+
+const fetchCompanionJson = async (
+  endpoint: CompanionEndpoint,
+  pathPart: string,
+): Promise<unknown> => {
+  try {
+    const response = await fetch(`http://127.0.0.1:${String(endpoint.port)}${pathPart}`, {
+      headers: { 'x-bac-bridge-key': endpoint.bridgeKey },
+    });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch {
+    return null;
+  }
+};
+
+// --- Helpers for the sidepanel-side probe ---------------------------
+
+interface SidepanelProbeResult {
+  readonly companionPort: number | null;
+  readonly bridgeKey: string | null;
+  readonly httpHostAccess: boolean | null;
+  readonly engagementScripts: readonly ContentScriptRegistration[];
+  readonly visualFingerprintScripts: readonly ContentScriptRegistration[];
+  // Untyped on the wire because Playwright's evaluate marshals JSON
+  // and we can't carry our compile-time RuntimeDiagStash shape across
+  // the page boundary. Callers cast at the read site.
+  readonly devDiag: unknown;
+}
+
+const probeSidepanel = async (
+  runtime: ExtensionRuntime,
+): Promise<{ readonly result: SidepanelProbeResult; readonly cleanup: () => Promise<void> }> => {
+  const page = await runtime.context.newPage();
+  await page.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
+    waitUntil: 'domcontentloaded',
+    timeout: 15_000,
+  });
+  // Give the SW a beat to be reachable.
+  await page.waitForTimeout(500);
+  // Read companion config + permissions + scripts + diag stash in one block.
+  // The CDP-attached browser is vanilla Playwright (not Patchright), so
+  // `page.evaluate(fn)` runs in the page's main world by default — no
+  // third `isolatedContext` argument needed (or supported).
+  const result: SidepanelProbeResult = await page.evaluate(async () => {
+    const c = (globalThis as unknown as { chrome?: typeof chrome }).chrome;
+    if (c === undefined) {
+      return {
+        companionPort: null,
+        bridgeKey: null,
+        httpHostAccess: null,
+        engagementScripts: [],
+        visualFingerprintScripts: [],
+        devDiag: null,
+      };
+    }
+    const settingsKey = 'sidetrack.settings';
+    const got = await c.storage.local.get(settingsKey);
+    const settings = (got[settingsKey] ?? {}) as {
+      readonly companion?: { readonly port?: number; readonly bridgeKey?: string };
+    };
+    const companionPort =
+      typeof settings.companion?.port === 'number' ? settings.companion.port : null;
+    const bridgeKey =
+      typeof settings.companion?.bridgeKey === 'string' && settings.companion.bridgeKey.length > 0
+        ? settings.companion.bridgeKey
+        : null;
+    const httpHostAccess = await new Promise<boolean | null>((resolve) => {
+      try {
+        c.permissions.contains(
+          { origins: ['https://*/*', 'http://*/*'] },
+          (granted) => {
+            resolve(granted);
+          },
+        );
+      } catch {
+        resolve(null);
+      }
+    });
+    const fetchScripts = async (
+      id: string,
+    ): Promise<{ id: string; matches?: readonly string[]; js?: readonly string[]; runAt?: string }[]> => {
+      try {
+        const list = await c.scripting.getRegisteredContentScripts({ ids: [id] });
+        return list.map((entry) => ({
+          id: entry.id,
+          matches: entry.matches,
+          js: entry.js,
+          runAt: entry.runAt,
+        }));
+      } catch {
+        return [];
+      }
+    };
+    const engagementScripts = await fetchScripts('sidetrack-engagement');
+    const visualFingerprintScripts = await fetchScripts('sidetrack-visual-fingerprint');
+    // Trigger the SW's dev.diag stash. Two-step: send the message,
+    // then read chrome.storage.session in case the response races.
+    try {
+      await c.runtime.sendMessage({ type: 'sidetrack.dev.diag' });
+    } catch {
+      // ignore — fall back to storage read
+    }
+    await new Promise<void>((resolve) => {
+      setTimeout(() => {
+        resolve();
+      }, 250);
+    });
+    let devDiag: unknown = null;
+    try {
+      const sessionStorage = (c.storage as { readonly session?: typeof c.storage.local })
+        .session;
+      if (sessionStorage !== undefined) {
+        const stash = await sessionStorage.get('sidetrack.dev.diag');
+        devDiag = stash['sidetrack.dev.diag'] ?? null;
+      }
+    } catch {
+      devDiag = null;
+    }
+    return {
+      companionPort,
+      bridgeKey,
+      httpHostAccess,
+      engagementScripts,
+      visualFingerprintScripts,
+      devDiag,
+    };
+  });
+  return {
+    result,
+    cleanup: async () => {
+      await page.close();
+    },
+  };
+};
+
+const exerciseEngagementPage = async (
+  runtime: ExtensionRuntime,
+  durationMs: number,
+): Promise<void> => {
+  const exerc = await runtime.context.newPage();
+  try {
+    // Wikipedia main page — small, predictable, no auth, no aggressive
+    // redirects. Engagement aggregator emits an interval every ~30s
+    // OR on visibility change. We poll a shorter window and just keep
+    // the page in foreground.
+    await exerc.goto('https://en.wikipedia.org/wiki/Main_Page', {
+      waitUntil: 'domcontentloaded',
+      timeout: 20_000,
+    });
+    await exerc.bringToFront();
+    await exerc.waitForTimeout(durationMs);
+    // Scroll once to bump engagement aggregator's accumulated metrics.
+    await exerc.evaluate(() => {
+      window.scrollBy(0, 200);
+    });
+    await exerc.waitForTimeout(500);
+  } catch {
+    // ignore — page errors don't fail the diag
+  } finally {
+    await exerc.close();
+  }
+};
+
+// --- Classification helpers ----------------------------------------
+
+const classifyEngagementFailure = (
+  report: Pick<
+    AttachDiagReport,
+    | 'privacy'
+    | 'permissions'
+    | 'contentScripts'
+    | 'engagement'
+    | 'materializer'
+  >,
+): string => {
+  if (report.privacy.engagementGate !== 'open') return 'closed gate';
+  if (report.permissions.httpHostAccess !== true) return 'missing permission';
+  if (!report.contentScripts.engagementBuiltFileExists) return 'wrong built script path';
+  if (!report.contentScripts.engagementRegistered) return 'registration not called';
+  if (report.engagement.lastIntervalSeen === null || report.engagement.lastIntervalSeen === undefined) {
+    return 'script registered but not injected';
+  }
+  if (report.engagement.lastAggregatePosted === null || report.engagement.lastAggregatePosted === undefined) {
+    return 'SW did not receive interval';
+  }
+  if (
+    report.engagement.postError !== null &&
+    report.engagement.postError !== undefined
+  ) {
+    return 'companion post failed';
+  }
+  if (
+    report.materializer.engagementEligibleEntryCount === null ||
+    report.materializer.engagementEligibleEntryCount === 0
+  ) {
+    return 'materializer did not consume event';
+  }
+  return 'ok';
+};
+
+const classifyThreadPropagationFailure = (
+  propagation: AttachDiagReport['threadUrlPropagation'],
+): string => {
+  if (propagation.threadCount === 0) return 'no threads in vault';
+  if (propagation.threadsWithPrimaryWorkstream === 0) return 'no threads have primaryWorkstreamId';
+  if (propagation.threadsWithUrl === 0) return 'threads have no canonical/thread URL';
+  if (propagation.threadsMatchedToObservedCanonicalUrl === 0) {
+    return 'thread URLs are not in the URL projection';
+  }
+  const threadCount =
+    'thread' in propagation.urlAttributionBySource
+      ? propagation.urlAttributionBySource.thread
+      : 0;
+  if (threadCount === 0) {
+    if (propagation.missReasons.lostToPrecedence > 0) {
+      return `propagation ran but lost to direct user_asserted on ${String(propagation.missReasons.lostToPrecedence)} URLs`;
+    }
+    return 'propagation did not produce any thread-source attribution (companion likely stale)';
+  }
+  return 'ok';
+};
+
+// --- Self-bootstrap helpers ----------------------------------------
+
+const openPrivacyGateViaCompanion = async (
+  companion: TestCompanion,
+  gate: string,
+): Promise<void> => {
+  const idempotencyKey = `attach-diag-gate-${gate}-${String(Date.now())}`;
+  const response = await fetch(
+    `http://127.0.0.1:${String(companion.port)}/v1/privacy/events`,
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': companion.bridgeKey,
+        'idempotency-key': idempotencyKey,
+      },
+      body: JSON.stringify({
+        type: 'privacy.gate.flipped',
+        payload: {
+          payloadVersion: 1,
+          gate,
+          state: 'open',
+          actor: 'user',
+          reason: 'attach-diag',
+        },
+      }),
+    },
+  );
+  if (!response.ok) {
+    throw new Error(`openPrivacyGate(${gate}) failed: HTTP ${String(response.status)}`);
+  }
+};
+
+// Configure the extension's chrome.storage.local with companion
+// settings, then nudge the SW to re-init. Required because attaching
+// to a fresh chrome-debug session leaves the extension unconfigured —
+// timeline wiring's init reads readTimelineGateState (false) and
+// aborts before registering chrome.tabs listeners, so no URL
+// observation happens at all.
+const configureExtensionForCompanion = async (
+  runtime: ExtensionRuntime,
+  companion: TestCompanion,
+): Promise<void> => {
+  const page = await runtime.context.newPage();
+  try {
+    await page.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 15_000,
+    });
+    await page.waitForTimeout(300);
+    // Seed companion settings. The extension reads
+    // chrome.storage.local['sidetrack.settings'] for port + bridgeKey.
+    await page.evaluate(
+      async ({ port, bridgeKey }: { port: number; bridgeKey: string }) => {
+        const c = (globalThis as unknown as { chrome?: typeof chrome }).chrome;
+        if (c === undefined) return;
+        await c.storage.local.set({
+          'sidetrack.settings': {
+            companion: { port, bridgeKey },
+            autoTrack: true,
+            siteToggles: { chatgpt: true, claude: true, gemini: true, codex: true },
+            notifyOnQueueComplete: true,
+          },
+          'sidetrack.setup.completed': true,
+          'sidetrack.timeline.enabled': true,
+        });
+      },
+      { port: companion.port, bridgeKey: companion.bridgeKey },
+    );
+    // Nudge the SW to re-init now that storage is seeded + gates open.
+    // These match what the recorder spec does (reinitializeTimeline).
+    await page.evaluate(async () => {
+      const c = (globalThis as unknown as { chrome?: typeof chrome }).chrome;
+      if (c === undefined) return;
+      try {
+        await c.runtime.sendMessage({ type: 'sidetrack.timeline.reinit' });
+      } catch {
+        // ignore
+      }
+      try {
+        await c.runtime.sendMessage({ type: 'sidetrack.privacy.gateChanged' });
+      } catch {
+        // ignore
+      }
+    });
+    // Give the SW a moment to actually register the listeners.
+    await page.waitForTimeout(800);
+  } finally {
+    await page.close();
+  }
+};
+
+const bootstrapCompanionAndGates = async (runtime: ExtensionRuntime): Promise<TestCompanion> => {
+  const companion = await startTestCompanion({});
+  await openPrivacyGateViaCompanion(companion, 'timeline');
+  await openPrivacyGateViaCompanion(companion, 'engagement');
+  await configureExtensionForCompanion(runtime, companion);
+  return companion;
+};
+
+const exerciseGoogleSearchPage = async (
+  runtime: ExtensionRuntime,
+): Promise<void> => {
+  const exerc = await runtime.context.newPage();
+  try {
+    // Repro for the Google-search URL bug. Navigate directly to a
+    // search URL so we don't depend on the user typing in a search
+    // box (which would require a form-submit + new-window dance).
+    await exerc.goto(
+      'https://www.google.com/search?q=sidetrack+attach+diag+probe',
+      { waitUntil: 'domcontentloaded', timeout: 20_000 },
+    );
+    await exerc.bringToFront();
+    await exerc.waitForTimeout(3_000);
+  } catch {
+    // Some networks block google.com; skip silently. Wikipedia path
+    // remains the primary probe.
+  } finally {
+    await exerc.close();
+  }
+};
+
+// --- Main spec -----------------------------------------------------
+
+// Pre-flight: poke the CDP endpoint before Playwright tries to use
+// it. A failed connectOverCDP throws a low-level "ECONNREFUSED" stack
+// trace; this returns a friendly message that tells the operator
+// exactly what to do.
+const preflightCdpReachable = async (cdpUrl: string): Promise<string | null> => {
+  try {
+    const response = await fetch(`${cdpUrl}/json/version`);
+    if (!response.ok) {
+      return `CDP at ${cdpUrl} responded HTTP ${String(response.status)} — is the chrome-debug session healthy?`;
+    }
+    return null;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    return `Could not reach CDP at ${cdpUrl} (${detail}). Run this first in another terminal:\n  npm --prefix packages/sidetrack-extension run e2e:chrome-debug\nThen re-run e2e:attach-diag.`;
+  }
+};
+
+test.describe('manual attach diagnostics', () => {
+  test.skip(
+    process.env.SIDETRACK_E2E_CDP_URL === undefined,
+    'attach-diag requires SIDETRACK_E2E_CDP_URL; start `e2e:chrome-debug` in another terminal first',
+  );
+
+  test('produce a JSON report from the live browser', async () => {
+    test.setTimeout(180_000);
+
+    const cdpUrl = process.env.SIDETRACK_E2E_CDP_URL ?? 'http://localhost:9222';
+    const preflightError = await preflightCdpReachable(cdpUrl);
+    if (preflightError !== null) {
+      // Skip with a readable explanation instead of letting Playwright
+      // surface the connectOverCDP stack trace.
+      test.skip(true, preflightError);
+    }
+
+    const runtime = await launchExtensionRuntime({});
+    let bootstrappedCompanion: TestCompanion | null = null;
+    try {
+      // Self-bootstrap: spawn a companion + configure the extension +
+      // open the gates so the SW actually initializes its listeners.
+      // Skip when SIDETRACK_E2E_ATTACH_DIAG_LIVE=1 — caller wants to
+      // probe whatever state is already there.
+      if (process.env.SIDETRACK_E2E_ATTACH_DIAG_LIVE !== '1') {
+        bootstrappedCompanion = await bootstrapCompanionAndGates(runtime);
+      }
+
+      // 1-3: connect + wake + open sidepanel + initial probe.
+      const before = await probeSidepanel(runtime);
+
+      const companionEndpoint: CompanionEndpoint | null =
+        before.result.companionPort !== null && before.result.bridgeKey !== null
+          ? { port: before.result.companionPort, bridgeKey: before.result.bridgeKey }
+          : null;
+
+      // 4: companion-side data (best-effort; null when unreachable).
+      const privacyProjection =
+        companionEndpoint === null
+          ? null
+          : await fetchCompanionJson(companionEndpoint, '/v1/privacy/projection');
+      const versionProjection =
+        companionEndpoint === null ? null : await fetchCompanionJson(companionEndpoint, '/v1/version');
+      const threadsProjection =
+        companionEndpoint === null
+          ? null
+          : await fetchCompanionJson(companionEndpoint, '/v1/threads/projections');
+      const urlsProjection =
+        companionEndpoint === null
+          ? null
+          : await fetchCompanionJson(companionEndpoint, '/v1/visits/projection');
+
+      // 5: classification — read materializer diagnostics from disk
+      // (the vault path is reported by /v1/version when available).
+      const vaultRoot =
+        typeof (versionProjection as { data?: { vaultRoot?: string } } | null)?.data?.vaultRoot ===
+        'string'
+          ? (versionProjection as { data: { vaultRoot: string } }).data.vaultRoot
+          : null;
+      const matDiagPath =
+        vaultRoot === null
+          ? null
+          : path.join(vaultRoot, '_BAC/connections/diagnostics/latest.json');
+      const matDiag: unknown =
+        matDiagPath === null
+          ? null
+          : await readFile(matDiagPath, 'utf8')
+              .then((body) => JSON.parse(body) as unknown)
+              .catch(() => null);
+
+      // 6: exercise an engagement-eligible page + the Google search
+      // URL repro, then re-probe.
+      await exerciseEngagementPage(runtime, 5_000);
+      await exerciseGoogleSearchPage(runtime);
+      // Allow the timeline observer's coalesce + spool drain to flush.
+      const sidepanelPage = await runtime.context.newPage();
+      try {
+        await sidepanelPage.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
+          waitUntil: 'domcontentloaded',
+          timeout: 10_000,
+        });
+        await sidepanelPage.evaluate(async () => {
+          const c = (globalThis as unknown as { chrome?: typeof chrome }).chrome;
+          if (c === undefined) return;
+          try {
+            await c.runtime.sendMessage({ type: 'sidetrack.timeline.force-drain' });
+          } catch {
+            // ignore
+          }
+        });
+        await sidepanelPage.waitForTimeout(2_500);
+      } finally {
+        await sidepanelPage.close();
+      }
+      const after = await probeSidepanel(runtime);
+      const matDiagAfter: unknown =
+        matDiagPath === null
+          ? null
+          : await readFile(matDiagPath, 'utf8')
+              .then((body) => JSON.parse(body) as unknown)
+              .catch(() => null);
+
+      // 7: thread propagation classification.
+      const threads = ((threadsProjection as { data?: unknown[] } | null)?.data ?? []) as readonly {
+        readonly bac_id?: string;
+        readonly canonicalUrl?: string;
+        readonly threadUrl?: string;
+        readonly primaryWorkstreamId?: string;
+      }[];
+      const urlMap = new Map<string, unknown>(
+        Object.entries(
+          (urlsProjection as { data?: { byCanonicalUrl?: Record<string, unknown> } } | null)?.data
+            ?.byCanonicalUrl ?? {},
+        ),
+      );
+      const stripFragmentAndSlash = (url: string): string =>
+        url.replace(/#.*$/u, '').replace(/\/+$/u, '');
+      let threadsWithPrimary = 0;
+      let threadsWithUrl = 0;
+      let threadsMatched = 0;
+      let propagatedCount = 0;
+      let lostToPrecedence = 0;
+      for (const thread of threads) {
+        if (typeof thread.primaryWorkstreamId !== 'string' || thread.primaryWorkstreamId.length === 0) {
+          continue;
+        }
+        threadsWithPrimary += 1;
+        const candidate = thread.canonicalUrl ?? thread.threadUrl;
+        if (typeof candidate !== 'string' || candidate.length === 0) continue;
+        threadsWithUrl += 1;
+        const canonical = stripFragmentAndSlash(candidate);
+        const record = urlMap.get(canonical) as
+          | { readonly currentAttribution?: { readonly source?: string; readonly workstreamId?: string } }
+          | undefined;
+        if (record === undefined) continue;
+        threadsMatched += 1;
+        const source = record.currentAttribution?.source;
+        if (source === 'thread') propagatedCount += 1;
+        else if (source === 'user_asserted') lostToPrecedence += 1;
+      }
+
+      // 8: urlAttributionBySource — read from materializer diagnostic OR
+      // recompute from URL projection.
+      const matAttributionBySource =
+        (matDiagAfter as { urls?: { attributionBySource?: Record<string, number> } } | null)?.urls
+          ?.attributionBySource ?? null;
+      const urlAttributionBySource: Record<string, number> = matAttributionBySource ?? {};
+      if (matAttributionBySource === null) {
+        for (const record of urlMap.values()) {
+          const source = (record as { currentAttribution?: { source?: string } }).currentAttribution
+            ?.source;
+          if (typeof source === 'string') {
+            urlAttributionBySource[source] = (urlAttributionBySource[source] ?? 0) + 1;
+          }
+        }
+      }
+
+      // 9: build the report.
+      const builtFilePath = path.join(runtime.extensionPath, 'engagement.js');
+      const builtFileExists = await statFile(builtFilePath)
+        .then(() => true)
+        .catch(() => false);
+      const extensionBuildStat = await statFile(
+        path.join(runtime.extensionPath, 'background.js'),
+      ).catch(() => null);
+      const branch = (await gitCommand('symbolic-ref --short HEAD')) || 'detached';
+      const headSha = (await gitCommand('rev-parse --short HEAD')) || 'unknown';
+      const workingTreeDirty =
+        (await gitCommand('status --porcelain --untracked-files=no')).length > 0;
+      const companionStartedAt =
+        typeof (versionProjection as { data?: { startedAt?: string } } | null)?.data?.startedAt ===
+        'string'
+          ? (versionProjection as { data: { startedAt: string } }).data.startedAt
+          : null;
+      const companionBuildSha =
+        typeof (versionProjection as { data?: { gitSha?: string } } | null)?.data?.gitSha ===
+        'string'
+          ? (versionProjection as { data: { gitSha: string } }).data.gitSha
+          : null;
+      const stalenessWarning =
+        companionBuildSha !== null && headSha !== 'unknown' && !companionBuildSha.startsWith(headSha)
+          ? `STALE_PROCESS: extension build sha (${headSha}) and companion build sha (${companionBuildSha}) differ; restart the recorder/companion to interpret companion-side diagnostics`
+          : null;
+
+      const privacyData = (privacyProjection as { data?: { gateStates?: Record<string, string> } } | null)
+        ?.data?.gateStates ?? {};
+
+      const report: AttachDiagReport = {
+        producedAt: new Date().toISOString(),
+        extensionId: runtime.extensionId,
+        extensionPath: runtime.extensionPath,
+        cdpAttached: runtime.metadata?.cdpAttached === true,
+        serviceWorkerAwake: true,
+        companionReachable: companionEndpoint !== null && privacyProjection !== null,
+        extensionBuildSha: headSha,
+        extensionBuildAt: extensionBuildStat?.mtime.toISOString() ?? null,
+        companionBuildSha,
+        companionStartedAt,
+        companionPort: companionEndpoint?.port ?? null,
+        companionBridgeKeyRedacted:
+          companionEndpoint === null
+            ? null
+            : `${companionEndpoint.bridgeKey.slice(0, 4)}…${companionEndpoint.bridgeKey.slice(-4)}`,
+        vaultRoot,
+        branch,
+        headSha,
+        workingTreeDirty,
+        stalenessWarning,
+        privacy: {
+          timelineGate: privacyData.timeline,
+          engagementGate: privacyData.engagement,
+          visualFingerprintGate: privacyData['visual.fingerprint'] ?? null,
+        },
+        permissions: { httpHostAccess: after.result.httpHostAccess },
+        contentScripts: {
+          engagementRegistered: after.result.engagementScripts.length > 0,
+          engagementScripts: after.result.engagementScripts,
+          engagementBuiltFileExists: builtFileExists,
+          engagementBuiltFilePath: builtFilePath,
+          visualFingerprintRegistered: after.result.visualFingerprintScripts.length > 0,
+          visualFingerprintScripts: after.result.visualFingerprintScripts,
+        },
+        engagement: {
+          // The dev.diag stash doesn't currently track these. Best-effort
+          // read from chrome.storage.session keys the engagement runtime
+          // would set. The classification function tolerates nulls.
+          lastIntervalSeen:
+            (after.result.devDiag as { engagement?: { lastInterval?: unknown } } | null)?.engagement
+              ?.lastInterval ?? null,
+          lastAggregatePosted:
+            (after.result.devDiag as { engagement?: { lastAggregate?: unknown } } | null)?.engagement
+              ?.lastAggregate ?? null,
+          postError:
+            (after.result.devDiag as { engagement?: { lastPostError?: unknown } } | null)?.engagement
+              ?.lastPostError ?? null,
+          eventCountBefore:
+            (matDiag as { engagement?: { sessionAggregatedCount?: number } } | null)?.engagement
+              ?.sessionAggregatedCount ?? null,
+          eventCountAfter:
+            (matDiagAfter as { engagement?: { sessionAggregatedCount?: number } } | null)?.engagement
+              ?.sessionAggregatedCount ?? null,
+        },
+        materializer: {
+          engagementEligibleEntryCount:
+            (matDiagAfter as { timeline?: { engagementEligibleEntryCount?: number } } | null)
+              ?.timeline?.engagementEligibleEntryCount ?? null,
+          entriesWithFocusedWindowMs:
+            (matDiagAfter as { timeline?: { entriesWithFocusedWindowMs?: number } } | null)?.timeline
+              ?.entriesWithFocusedWindowMs ?? null,
+          similarityEdgeCount:
+            (matDiagAfter as { similarity?: { edgeCount?: number } } | null)?.similarity?.edgeCount ??
+            null,
+          rankerStatus:
+            (matDiagAfter as { ranker?: { status?: string } } | null)?.ranker?.status ?? null,
+          closestVisitEdgeCount:
+            (matDiagAfter as { snapshot?: { edgeCountByKind?: Record<string, number> } } | null)
+              ?.snapshot?.edgeCountByKind?.closest_visit ?? null,
+          fullCounters: matDiagAfter,
+        },
+        threadUrlPropagation: {
+          urlAttributionBySource,
+          threadCount: threads.length,
+          threadsWithPrimaryWorkstream: threadsWithPrimary,
+          threadsWithUrl,
+          threadsMatchedToObservedCanonicalUrl: threadsMatched,
+          propagatedCount,
+          missReasons: {
+            noPrimaryWorkstream: threads.length - threadsWithPrimary,
+            noThreadUrl: threadsWithPrimary - threadsWithUrl,
+            urlNotObserved: threadsWithUrl - threadsMatched,
+            lostToPrecedence,
+          },
+        },
+        engagementFailureClass: '',
+        threadPropagationFailureClass: '',
+        runtimeDiagBefore: (before.result.devDiag as RuntimeDiagStash | null) ?? null,
+        runtimeDiagAfter: (after.result.devDiag as RuntimeDiagStash | null) ?? null,
+      };
+
+      // 10: classify failure modes.
+      const finalReport: AttachDiagReport = {
+        ...report,
+        engagementFailureClass: classifyEngagementFailure(report),
+        threadPropagationFailureClass: classifyThreadPropagationFailure(report.threadUrlPropagation),
+      };
+
+      // 11: write the report.
+      const outDir = path.join(repoRoot, 'packages/sidetrack-extension/test-results');
+      await mkdir(outDir, { recursive: true });
+      const outPath = path.join(outDir, 'attach-diag.json');
+      await writeFile(outPath, `${JSON.stringify(finalReport, null, 2)}\n`, 'utf8');
+
+      // 12: print a compact summary to stdout.
+      const summary = {
+        extensionBuildSha: finalReport.extensionBuildSha,
+        companionBuildSha: finalReport.companionBuildSha,
+        stalenessWarning: finalReport.stalenessWarning,
+        privacy: finalReport.privacy,
+        permissions: finalReport.permissions,
+        contentScripts: {
+          engagementRegistered: finalReport.contentScripts.engagementRegistered,
+          engagementBuiltFileExists: finalReport.contentScripts.engagementBuiltFileExists,
+          visualFingerprintRegistered: finalReport.contentScripts.visualFingerprintRegistered,
+        },
+        materializer: {
+          engagementEligibleEntryCount: finalReport.materializer.engagementEligibleEntryCount,
+          similarityEdgeCount: finalReport.materializer.similarityEdgeCount,
+          rankerStatus: finalReport.materializer.rankerStatus,
+          closestVisitEdgeCount: finalReport.materializer.closestVisitEdgeCount,
+        },
+        threadUrlPropagation: finalReport.threadUrlPropagation,
+        engagementFailureClass: finalReport.engagementFailureClass,
+        threadPropagationFailureClass: finalReport.threadPropagationFailureClass,
+        reportWrittenTo: outPath,
+      };
+      // eslint-disable-next-line no-console
+      console.log(`\n=== attach-diag report ===\n${JSON.stringify(summary, null, 2)}`);
+
+      // The test always passes — its purpose is to produce evidence,
+      // not to enforce a verdict. Per-condition pass/fail belongs in
+      // the JSON report's *failureClass fields.
+      expect(finalReport.cdpAttached).toBe(true);
+    } finally {
+      if (bootstrappedCompanion !== null) {
+        await bootstrappedCompanion.stop().catch(() => undefined);
+      }
+      await runtime.close();
+    }
+  });
+});

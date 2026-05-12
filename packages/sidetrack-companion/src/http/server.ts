@@ -7,6 +7,22 @@ import { isBridgeKeyAccepted, rotateBridgeKey } from '../auth/bridgeKey.js';
 import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from '../timeline/events.js';
 import { sanitizeTimelinePayload } from '../timeline/sanitize.js';
 import {
+  ENGAGEMENT_INTERVAL_OBSERVED,
+  ENGAGEMENT_SESSION_AGGREGATED,
+  isEngagementIntervalObservedPayload,
+  isEngagementSessionAggregatedPayload,
+} from '../engagement/events.js';
+import {
+  SELECTION_COPIED,
+  SELECTION_PASTED,
+  isSelectionCopiedPayload,
+  isSelectionPastedPayload,
+} from '../snippets/events.js';
+import {
+  VISUAL_FINGERPRINT_OBSERVED,
+  isVisualFingerprintObservedPayload,
+} from '../visual/events.js';
+import {
   defaultAllowedTools,
   isAllowed,
   readTrust,
@@ -79,6 +95,7 @@ import {
   urlInbox,
   type UrlProjection,
 } from '../urls/projection.js';
+import { autoApplyUrlAttribution } from '../urls/autoApply.js';
 import {
   appendEntry as appendEntryRaw,
   gcEntries as gcEntriesRaw,
@@ -217,6 +234,7 @@ import { runAutoUpdate } from '../system/autoUpdate.js';
 import { collectHealth, type CaptureWarningHealth, type HealthReport } from '../system/health.js';
 import { collectWorkGraphHealth } from '../system/workGraphHealth.js';
 import { checkLatestVersion, type UpdateAdvisory } from '../system/versionCheck.js';
+import { COMPANION_VERSION } from '../version.js';
 import { maybeRetrainClosestVisitRanker } from '../ranker/retrain.js';
 import {
   listAnnotations,
@@ -1189,6 +1207,37 @@ const routes: readonly RouteDefinition[] = [
     handle: (_request, requestId) => Promise.resolve([200, { status: 'ok', requestId }]),
   },
   {
+    // Stage 5 follow-up — minimal version/identity probe used by the
+    // attach-diagnostic to detect a stale companion process (extension
+    // rebuilt but companion still running the prior build). Returns
+    // companion-controlled fields only; no auth needed because the
+    // information leak is harmless.
+    method: 'GET',
+    pattern: /^\/v1\/version$/,
+    authRequired: false,
+    handle: (_request, requestId, _match, context) =>
+      Promise.resolve([
+        200,
+        {
+          data: {
+            companionVersion: COMPANION_VERSION,
+            ...(context.vaultRoot === undefined ? {} : { vaultRoot: context.vaultRoot }),
+            ...(context.startedAt === undefined
+              ? {}
+              : { startedAt: context.startedAt.toISOString() }),
+            // gitSha is best-effort: it's set when the CLI is invoked
+            // with --git-sha or with the SIDETRACK_COMPANION_GIT_SHA
+            // env var. Absent in normal `node dist/cli.js` runs.
+            ...(typeof process.env['SIDETRACK_COMPANION_GIT_SHA'] === 'string' &&
+            process.env['SIDETRACK_COMPANION_GIT_SHA'].length > 0
+              ? { gitSha: process.env['SIDETRACK_COMPANION_GIT_SHA'] }
+              : {}),
+            requestId,
+          },
+        },
+      ]),
+  },
+  {
     method: 'GET',
     pattern: /^\/v1\/status$/,
     authRequired: true,
@@ -1457,6 +1506,10 @@ const routes: readonly RouteDefinition[] = [
       return [
         200,
         {
+          // PR #141 added a single-flight+TTL cache for this route;
+          // Stage 5.2 R2 supersedes it with snapshot-first reads via
+          // loadTabSessionProjection (same goal, architecturally aligned
+          // with the W2 accumulator wiring).
           data: serializeTabSessionProjection(projection),
           ...(snapshotRevision === null ? {} : { snapshotRevision }),
         },
@@ -1629,6 +1682,9 @@ const routes: readonly RouteDefinition[] = [
           ...(policyMode === undefined ? {} : { policyMode }),
           ...(policyTelemetry === undefined ? {} : { policyTelemetry }),
         });
+        // PR #141 invalidated the TTL cache here; Stage 5.2 R2 reads
+        // from the snapshot store so no manual invalidation is needed
+        // (the materializer's next drain publishes the fresh snapshot).
         return [
           result.status === 'applied' ? 201 : 200,
           {
@@ -1707,7 +1763,9 @@ const routes: readonly RouteDefinition[] = [
         // snapshot-first helper so we don't pay a full event-log
         // re-projection when the materializer has already published
         // the next snapshot. Falls back to the event log only when the
-        // snapshot is null or pre-R1.
+        // snapshot is null or pre-R1. (PR #141's
+        // invalidateCachedTabSessionProjection was a TTL cache buster
+        // that R2/R5 makes redundant.)
         const { projection: postProjection } = await loadTabSessionProjection(context, eventLog);
         return [
           201,
@@ -1743,6 +1801,7 @@ const routes: readonly RouteDefinition[] = [
       return [
         200,
         {
+          // PR #141 added a TTL cache here; superseded by Stage 5.2 R2.
           data: serializeUrlProjection(projection),
           ...(snapshotRevision === null ? {} : { snapshotRevision }),
         },
@@ -1833,6 +1892,76 @@ const routes: readonly RouteDefinition[] = [
   },
   {
     method: 'POST',
+    pattern: /^\/v1\/visits\/(?<canonicalUrl>[^/]+)\/resolve$/u,
+    authRequired: true,
+    handle: async (request, _requestId, match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      if (context.connectionsStore === undefined) {
+        throw new HttpRouteError(503, 'CONNECTIONS_NOT_WIRED', 'Connections is not configured.');
+      }
+      const eventLog = context.eventLog;
+      const connectionsStore = context.connectionsStore;
+      const idempotencyKey = requireIdempotencyKey(request);
+      return await runIdempotent(context, 'urlResolveAutoApply', idempotencyKey, async () => {
+        const body = objectRecord(await readBody(request)) ?? {};
+        if (body['dryRun'] !== false) {
+          throw new HttpRouteError(
+            400,
+            'VALIDATION_ERROR',
+            'Validation failed.',
+            'Body must set dryRun:false for auto-apply.',
+          );
+        }
+        const snapshot = await connectionsStore.readCurrent();
+        if (snapshot === null) {
+          throw new HttpRouteError(
+            409,
+            'CONNECTIONS_SNAPSHOT_MISSING',
+            'Connections snapshot is not ready.',
+          );
+        }
+        const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
+        if (canonicalUrl.length === 0) {
+          throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
+        }
+        const projection = projectUrls(await eventLog.readMerged());
+        if (!projection.byCanonicalUrl.has(canonicalUrl)) {
+          throw new HttpRouteError(404, 'URL_NOT_FOUND', 'URL was not found.');
+        }
+        const policyMode = optionalAttributionPolicyMode(body['policyMode'], 'policyMode');
+        const policyTelemetry = optionalAttributionPolicyTelemetry(
+          body['policyTelemetry'],
+          'policyTelemetry',
+        );
+        const result = await autoApplyUrlAttribution({
+          eventLog,
+          snapshot,
+          canonicalUrl,
+          ...(policyMode === undefined ? {} : { policyMode }),
+          ...(policyTelemetry === undefined ? {} : { policyTelemetry }),
+        });
+        // PR #141 invalidated the TTL cache here; Stage 5.2 R2 reads
+        // from the snapshot store so no manual invalidation is needed.
+        return [
+          result.status === 'applied' ? 201 : 200,
+          {
+            data: {
+              ...result,
+              projection: serializeUrlProjection(result.projection),
+            },
+          },
+        ];
+      });
+    },
+  },
+  {
+    method: 'POST',
     pattern: /^\/v1\/visits\/(?<canonicalUrl>[^/]+)\/attribute$/u,
     authRequired: true,
     handle: async (request, _requestId, match, context) => {
@@ -1889,7 +2018,9 @@ const routes: readonly RouteDefinition[] = [
           payload,
           baseVector: await baseVectorForAggregate(eventLog, aggregateId),
         });
-        // Stage 5.2 R5 — see matching block in the tab-session POST route.
+        // Stage 5.2 R5 — see matching block in the tab-session POST
+        // route. (PR #141's invalidateCachedUrlProjection was a TTL
+        // cache buster that R2/R5 makes redundant.)
         const { projection: postProjection } = await loadUrlProjection(context, eventLog);
         return [
           201,
@@ -4183,9 +4314,9 @@ const routes: readonly RouteDefinition[] = [
         const event = candidate as import('../sync/causal.js').AcceptedEvent;
         // Reviewer-flagged: this endpoint is timeline-only. Reject
         // any event whose type is not browser.timeline.observed OR
-        // whose payload fails the runtime predicate. Keeps the
-        // route narrow — a future generic `/v1/edge/events` router
-        // would be a separate route.
+        // whose payload fails the runtime predicate. Engagement /
+        // selection / visual-fingerprint events go through the
+        // companion's `/v1/edge/events` route (defined below).
         if (event.type !== BROWSER_TIMELINE_OBSERVED) {
           skipped.push({
             replicaId: event.dot.replicaId,
@@ -4216,6 +4347,110 @@ const routes: readonly RouteDefinition[] = [
           sanitizedPayload === event.payload ? event : { ...event, payload: sanitizedPayload };
         try {
           const result = await context.importEdgeEvent(sanitizedEvent);
+          if (result.imported) {
+            imported.push({ replicaId: event.dot.replicaId, seq: event.dot.seq });
+          } else {
+            skipped.push({
+              replicaId: event.dot.replicaId,
+              seq: event.dot.seq,
+              reason: 'already-imported',
+            });
+          }
+        } catch (err) {
+          skipped.push({
+            replicaId: event.dot.replicaId,
+            seq: event.dot.seq,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      void requestId;
+      return [200, { data: { imported, skipped } }];
+    },
+  },
+  // POST /v1/edge/events — generic ingest route for plugin-originated
+  // edge events that are NOT timeline observations: engagement
+  // (interval + session aggregated), selection (copied + pasted),
+  // visual fingerprint. The plugin's edge-event buffer drains here on
+  // its 1-minute alarm; pre-fix this route returned 404 and engagement
+  // events accumulated in the plugin's IndexedDB forever, starving
+  // similarity edges, URL inference, and the ranker. Same import +
+  // dedupe pipeline as /v1/timeline/events, narrowed to the set of
+  // event types this route accepts.
+  {
+    method: 'POST',
+    pattern: /^\/v1\/edge\/events$/u,
+    authRequired: true,
+    handle: async (request, requestId, _match, context) => {
+      if (context.importEdgeEvent === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EDGE_EVENTS_NOT_WIRED',
+          'Edge event import is not configured.',
+        );
+      }
+      const body = (await readBody(request)) as { events?: unknown };
+      if (body === null || typeof body !== 'object' || !Array.isArray(body.events)) {
+        throw new HttpRouteError(
+          400,
+          'INVALID_REQUEST',
+          'Body must be { events: AcceptedEvent[] }.',
+        );
+      }
+      const ACCEPTED_EDGE_EVENT_TYPES = new Set<string>([
+        ENGAGEMENT_INTERVAL_OBSERVED,
+        ENGAGEMENT_SESSION_AGGREGATED,
+        SELECTION_COPIED,
+        SELECTION_PASTED,
+        VISUAL_FINGERPRINT_OBSERVED,
+      ]);
+      const validatePayload = (type: string, payload: unknown): boolean => {
+        switch (type) {
+          case ENGAGEMENT_INTERVAL_OBSERVED:
+            return isEngagementIntervalObservedPayload(payload);
+          case ENGAGEMENT_SESSION_AGGREGATED:
+            return isEngagementSessionAggregatedPayload(payload);
+          case SELECTION_COPIED:
+            return isSelectionCopiedPayload(payload);
+          case SELECTION_PASTED:
+            return isSelectionPastedPayload(payload);
+          case VISUAL_FINGERPRINT_OBSERVED:
+            return isVisualFingerprintObservedPayload(payload);
+          default:
+            return false;
+        }
+      };
+      const imported: { replicaId: string; seq: number }[] = [];
+      const skipped: { replicaId: string; seq: number; reason: string }[] = [];
+      for (const candidate of body.events) {
+        if (
+          candidate === null ||
+          typeof candidate !== 'object' ||
+          typeof (candidate as { type?: unknown }).type !== 'string' ||
+          typeof (candidate as { dot?: unknown }).dot !== 'object' ||
+          (candidate as { dot?: { replicaId?: unknown } }).dot === null
+        ) {
+          continue;
+        }
+        const event = candidate as import('../sync/causal.js').AcceptedEvent;
+        if (!ACCEPTED_EDGE_EVENT_TYPES.has(event.type)) {
+          skipped.push({
+            replicaId: event.dot.replicaId,
+            seq: event.dot.seq,
+            reason: 'invalid-event-type',
+          });
+          continue;
+        }
+        if (!validatePayload(event.type, event.payload)) {
+          skipped.push({
+            replicaId: event.dot.replicaId,
+            seq: event.dot.seq,
+            reason: 'invalid-payload',
+          });
+          continue;
+        }
+        try {
+          const result = await context.importEdgeEvent(event);
           if (result.imported) {
             imported.push({ replicaId: event.dot.replicaId, seq: event.dot.seq });
           } else {

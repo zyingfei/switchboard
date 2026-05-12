@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import type { ConnectionsSnapshot } from '../connections/types.js';
+import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
 import {
   type FeedbackProjection,
   type FeedbackTrainingLabel,
@@ -25,6 +26,86 @@ import type { Candidate, CandidateSource } from './types.js';
 export const DEFAULT_RANKER_RETRAIN_LABEL_THRESHOLD = 50;
 export const DEFAULT_RANDOM_NEGATIVES_PER_POSITIVE_FROM = 5;
 export const RANKER_RETRAIN_STATE_SCHEMA_VERSION = 1;
+
+// Stage 5 / T4 — env-tunable retrain threshold for dogfood. Production
+// default stays at 50; dogfood values of 10–15 unblock training while
+// the user accumulates feedback. Explicit `threshold` option still
+// wins.
+export const RANKER_RETRAIN_LABEL_THRESHOLD_ENV = 'SIDETRACK_RANKER_RETRAIN_MIN_LABELS';
+
+const readEnvNumber = (name: string): number | undefined => {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return undefined;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : undefined;
+};
+
+// Derive visit→visit positive labels from user-asserted
+// `visit_instance_in_workstream` edges. Without this, the projection's
+// `(URL, workstreamId)` labels fail `candidateResolvesToTimelineVisits`
+// at training time because `workstreamId` isn't a timeline-visit key —
+// labels exist on disk but the ranker can never train from them.
+//
+// Scope rules (mirror T3 to keep label semantics consistent with
+// topic seeding):
+//   - Only edges with `producedBy.eventType === USER_ORGANIZED_ITEM`
+//     count. Inferred attributions stay out.
+//   - The visit-instance node must carry `metadata.canonicalUrl`
+//     (matches what the timeline-visit projection consumes).
+//   - All pairs are emitted directionally (a→b AND b→a) — the ranker
+//     is asymmetric on (from, to) input.
+export const deriveVisitPairLabelsFromSnapshot = (
+  snapshot: ConnectionsSnapshot,
+): readonly FeedbackTrainingLabel[] => {
+  const canonicalUrlByVisitInstance = new Map<string, string>();
+  for (const node of snapshot.nodes) {
+    if (node.kind !== 'visit-instance') continue;
+    const canonicalUrl = node.metadata.canonicalUrl;
+    if (typeof canonicalUrl === 'string' && canonicalUrl.length > 0) {
+      canonicalUrlByVisitInstance.set(node.id, canonicalUrl);
+    }
+  }
+
+  const urlsByWorkstream = new Map<string, Set<string>>();
+  for (const edge of snapshot.edges) {
+    if (edge.kind !== 'visit_instance_in_workstream') continue;
+    if (edge.producedBy.source !== 'event-log') continue;
+    if (edge.producedBy.eventType !== USER_ORGANIZED_ITEM) continue;
+    const canonicalUrl = canonicalUrlByVisitInstance.get(edge.fromNodeId);
+    if (canonicalUrl === undefined) continue;
+    const set = urlsByWorkstream.get(edge.toNodeId) ?? new Set<string>();
+    set.add(canonicalUrl);
+    urlsByWorkstream.set(edge.toNodeId, set);
+  }
+
+  const labels: FeedbackTrainingLabel[] = [];
+  for (const workstreamId of [...urlsByWorkstream.keys()].sort(compareText)) {
+    const list = [...(urlsByWorkstream.get(workstreamId) ?? [])].sort(compareText);
+    for (let i = 0; i < list.length; i += 1) {
+      const fromId = list[i];
+      if (fromId === undefined) continue;
+      for (let j = 0; j < list.length; j += 1) {
+        if (i === j) continue;
+        const toId = list[j];
+        if (toId === undefined) continue;
+        labels.push({ fromId, toId, weight: 1 });
+      }
+    }
+  }
+  return labels;
+};
+
+export const augmentFeedbackWithVisitPairLabels = (
+  feedback: FeedbackProjection,
+  snapshot: ConnectionsSnapshot,
+): FeedbackProjection => {
+  const visitPairLabels = deriveVisitPairLabelsFromSnapshot(snapshot);
+  if (visitPairLabels.length === 0) return feedback;
+  return {
+    ...feedback,
+    positiveLabels: [...feedback.positiveLabels, ...visitPairLabels],
+  };
+};
 
 const RANKER_RETRAIN_STATE_RELATIVE_PATH = '_BAC/connections/closest-visit/retrain-state.json';
 const TIMELINE_VISIT_PREFIX = 'timeline-visit:';
@@ -504,13 +585,16 @@ export const maybeRetrainClosestVisitRanker = async ({
   readState = readRankerRetrainState,
   writeState = writeRankerRetrainState,
 }: MaybeRetrainClosestVisitRankerInput): Promise<RankerRetrainResult> => {
-  const feedback = projectFeedback(merged);
+  const baseFeedback = projectFeedback(merged);
+  const feedback = augmentFeedbackWithVisitPairLabels(baseFeedback, snapshot);
   const fingerprint = fingerprintFeedbackTrainingLabels(feedback);
   const state = await readState(vaultRoot);
+  const resolvedThreshold =
+    threshold ?? readEnvNumber(RANKER_RETRAIN_LABEL_THRESHOLD_ENV);
   const plan = planRankerRetrain({
     fingerprint,
     state,
-    ...(threshold === undefined ? {} : { threshold }),
+    ...(resolvedThreshold === undefined ? {} : { threshold: resolvedThreshold }),
   });
 
   if (plan.action === 'skip') {

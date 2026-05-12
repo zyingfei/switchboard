@@ -9,7 +9,7 @@ import {
   timelineHealthSnapshot,
   timelinePluginMaterializer,
 } from '../../../src/timeline/materializer';
-import { readSpool } from '../../../src/sync/spool';
+import { readSpool, spoolTransition } from '../../../src/sync/spool';
 
 // Plugin-tier timeline materializer tests:
 //   - admitLocal active → spool transition.
@@ -201,6 +201,42 @@ describe('timeline plugin materializer (Class F)', () => {
     // (NOT stuck in 'pending-send' forever).
     expect(spool).toHaveLength(1);
     expect(spool[0]?.state).toBe('spooled');
+  });
+
+  it('drain retries entries orphaned in pending-send by a prior crashed drain', async () => {
+    // Observed in the wild: SW killed mid-drain (or rollback loop
+    // missed an entry on a readSpool race) leaves entries in
+    // 'pending-send' indefinitely. Without this fix the drain
+    // filter only included 'active' | 'spooled', so every subsequent
+    // drain reported drainableCount=0 even though pending-send
+    // entries existed — they were orphaned forever.
+    await (globalThis as unknown as {
+      chrome: { storage: { local: { set: (e: Record<string, unknown>) => Promise<void> } } };
+    }).chrome.storage.local.set({
+      [EDGE_KEY]: { edgeReplicaId: 'edge_test', nextSeq: 1 },
+    });
+    await timelinePluginMaterializer.admitLocal(
+      observationFromPayload(buildPayload({ eventId: 'a' })),
+      'passive',
+    );
+    // Simulate the orphan: directly transition to pending-send without
+    // running the drain that would normally roll it back to spooled.
+    const initialSpool = await readSpool('timeline');
+    expect(initialSpool).toHaveLength(1);
+    const orphanedDot = initialSpool[0]!.edgeDot;
+    await spoolTransition('timeline', orphanedDot, 'pending-send');
+    expect((await readSpool('timeline'))[0]?.state).toBe('pending-send');
+
+    // Companion confirms it had already imported the entry (the
+    // common cause: the prior POST succeeded but the SW died before
+    // running the ack handler).
+    setTimelineDrainHook(async (entries) => ({
+      uploaded: entries.map((e) => e.edgeDot),
+    }));
+    const result = await timelinePluginMaterializer.drainSpoolToCompanion();
+    expect(result.uploaded).toBe(1);
+    expect(result.remaining).toBe(0);
+    expect(await readSpool('timeline')).toHaveLength(0);
   });
 
   it('drain idempotency: second drain over the same entries is a no-op once acked', async () => {

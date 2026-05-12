@@ -178,6 +178,45 @@ describe('TimelineObserver — coalesce + debounce', () => {
     expect(emitted).toHaveLength(0);
   });
 
+  // Stage 5 follow-up — Google search URLs / marketing landing pages
+  // routinely produce 500+ char URLs. The default mintEventId used to
+  // concatenate the full URL into the eventId, pushing past the
+  // companion's TIMELINE_EVENT_ID_MAX_LENGTH (256) and causing the
+  // /v1/timeline/events POST to skip the event with invalid-payload.
+  // Now the URL portion is FNV-1a32 hashed so the eventId is bounded.
+  it('default mintEventId keeps eventId bounded for long URLs', async () => {
+    const { createTimelineObserver } = await import('../../../src/timeline/observer');
+    const emitted: { readonly eventId: string }[] = [];
+    const observer = createTimelineObserver({
+      hashTabId: () => 'tabhash',
+      hashWindowId: () => 'windowhash',
+      emit: (payload) => {
+        emitted.push({ eventId: payload.eventId });
+      },
+      clock: () => new Date('2026-05-11T18:57:00.000Z'),
+      // Default mintEventId — NOT overridden.
+    });
+    const longUrl =
+      'https://www.google.com/search?q=cartesian+pairs+multiplier&newwindow=1&sca_esv=' +
+      '43a6c5a008a39361&sxsrf=ANbL-n6_ko5CWFfBfcAioxLCbUfTZNSfoA%3A1778521009893' +
+      '&ei=sRMCarOVNq6O8L0P_pru2Qo&iflsig=AFdpzrgAAAAAagIvyx9Ajwyu3Y_D_2vTzTVvsdtU6H09' +
+      '&ved=0ahUKEwjzsZSI47GUAxUuB7wBHX6NO6sQ4dUDCBE&uact=5&oq=cartesian+pairs+multiplier' +
+      '&gs_lp=Egxnd3Mtd2l6LXNlcnAiG0NhcnRlc2lhbi1wYWlycyBtdWx0aXBsaWVyIDIEECMYJzIFEAAY7wU' +
+      '&sclient=gws-wiz-serp';
+    observer.observe({
+      tabId: 1,
+      windowId: 1,
+      url: longUrl,
+      transition: 'completed',
+    });
+    expect(emitted).toHaveLength(1);
+    // Was previously > 600 chars (full URL embedded). Now hashed.
+    const eventId = emitted[0]?.eventId ?? '';
+    expect(eventId.length).toBeLessThan(80);
+    // Sanity: must still contain the surrounding scaffolding.
+    expect(eventId.startsWith('tl_tabhash|')).toBe(true);
+  });
+
   it('truncates oversized title rather than dropping the observation', () => {
     const { emitted, observer } = setup();
     const longTitle = 'T'.repeat(2000);

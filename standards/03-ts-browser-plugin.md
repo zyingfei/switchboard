@@ -196,6 +196,143 @@ Required tests:
 - Service-worker lifecycle tests for idempotent initialization.
 - E2E smoke tests with Playwright or equivalent extension-capable test runner for critical flows.
 
+## Debugging-pit best practices
+
+Lessons that took weeks to learn debugging the engagement subsystem
+(Stage 5.0). Each one is paired with the symptom it produces so the
+next operator can recognize it faster.
+
+### 1. Plan-comments are not route implementations
+
+> Symptom: a critical event stream silently returns 0 in materializer
+> counters for weeks; everything looks correctly wired upstream.
+
+The plugin POSTed engagement events to `/v1/edge/events` for 3 weeks.
+The companion responded with 404 the whole time because the route had
+only been *planned* — there was a comment on `/v1/timeline/events`
+saying "a future generic `/v1/edge/events` router would be a separate
+route" and the future never arrived. The buffer drain swallowed the
+404 silently because it treats any non-2xx as transient.
+
+Rule: when a comment references a route or function as future work,
+either implement it the same commit or open a tracked issue. Never
+ship code that depends on a comment-only future commitment.
+
+### 2. `chrome.runtime.sendMessage` from SW DevTools is a no-op
+
+> Symptom: `await chrome.runtime.sendMessage({type: 'sidetrack.dev.ping'})`
+> in the service-worker DevTools console returns `undefined` even
+> though the listener is wired and the handler is reachable from
+> other contexts.
+
+Chrome routes `runtime.sendMessage` to all extension contexts EXCEPT
+the sender. The SW DevTools console IS the SW context. So a ping
+sent from there never reaches the SW's onMessage listener.
+
+Rule: never debug a SW message handler from the SW DevTools console.
+Open a side-panel or popup DevTools instead. For SW-only state, expose
+a `globalThis.__sidetrackDebug` hook the operator can read directly
+without going through the message bus.
+
+### 3. `chrome.storage.local.set` from inside the SW listener body is unreliable on Chrome 148+
+
+> Symptom: diagnostic journal stays empty even though the SW handler
+> definitely runs (we see its return value reach the caller).
+
+We hit this twice — once on a `lastMessage` stash, once on the
+engagement-sync journal. Writes from inside SW `onMessage` listener
+bodies intermittently fail to persist on Chrome 148. The same code
+works fine from a popup or side-panel page.
+
+Rule: diagnostic journals from the SW use a module-level array
+mirrored to `chrome.storage.session` AND `console.warn`. Read primary
+from `globalThis` via SW DevTools; read secondary from session storage
+via any page DevTools; tertiary from the console output stream.
+
+### 4. Per-row `useEffect` fetches do not scale
+
+> Symptom: console floods with `ERR_INSUFFICIENT_RESOURCES` failures;
+> Inbox stays empty for minutes; companion health probe flashes red
+> intermittently.
+
+A list of N suggestion rows where each row's `useEffect` fires a
+`/v1/suggestions/thread/{id}` fetch produces N parallel HTTP requests
+on first paint. Chrome's per-origin socket cap (~6 for HTTP/1.1) is
+exhausted; the companion's single-threaded HTTP loop chokes; the
+periodic health probe starves and the UI shows the companion as down.
+
+Rule: ALL fetches to the companion go through a module-level
+semaphore (`acquireCompanionFetchSlot`) capped at 4 in-flight. The
+semaphore must use slot-transfer on release (pop queue, call next
+WITHOUT decrement). The naive
+`active--; queue.shift()?.resolve()` has a microtask gap where a new
+acquire can slip in past MAX, and under load `active` drifts upward
+permanently — every waiter gets stuck.
+
+### 5. Manifest version must encode build time
+
+> Symptom: operator can't tell from chrome://extensions which bundle
+> is loaded; turnaround after every rebuild involves a guess about
+> whether the change took effect.
+
+The pkg.json version stays at `0.0.0` forever. Encode build identity
+into the chrome manifest version: `0.<YY>.<MMDD>.<HHMM>` (each
+segment 0-65535, the Chrome limit). Now `chrome://extensions` shows
+`0.26.511.2225` directly — instant freshness check.
+
+Append `-dirty` to the in-bundle sha when `git status --porcelain` is
+non-empty so the footer banner distinguishes built-from-WIP from
+built-from-clean-sha.
+
+### 6. The recorder must be CDP-attachable on demand
+
+> Symptom: a frustrating debug arc where every diagnostic requires
+> the operator to paste output from DevTools.
+
+Patchright stealth deliberately hides CDP (anti-detection wins it),
+but the same property prevents an agent or operator from attaching
+Playwright to inspect SW state directly. Gate a `--remote-debugging-port`
+flag behind `SIDETRACK_E2E_CDP_DEBUG_PORT=<port>` so operators can
+attach via `chromium.connectOverCDP("http://localhost:<port>")` when
+debugging — and turn it off for real recording sessions.
+
+### 7. Fold journals into existing diagnostic dumps
+
+> Symptom: a journal exists but nobody finds it because reading it
+> requires opening DevTools, knowing the storage key, and pasting the
+> result somewhere the agent can read.
+
+The recorder already writes a periodic SW-diag dump to
+`<run>/sw-diag/<ts>-{A,B}.json` every 20 s. Fold any new diagnostic
+journal into the `sidetrack.dev.diag` response shape so it lands in
+those artifact files automatically. Then an agent can read the files
+directly from disk — no operator turnaround.
+
+### 8. `chrome.scripting.registerContentScripts` only injects on FUTURE navigations
+
+> Symptom: engagement script is registered but emits zero events on
+> already-open tabs; engagement counters stay at zero until the user
+> manually refreshes every tab.
+
+Runtime registration is forward-looking. For tabs that were open
+BEFORE registration, you must `chrome.scripting.executeScript` against
+each one explicitly. Build this into the same code path as the
+registration call, not as a separate `reinjectContentScriptIntoOpenTabs`
+helper that gets forgotten.
+
+### 9. Privacy gates are state, not consent
+
+> Symptom: a privacy gate stays closed for production users forever
+> because no UI path opens it; only test scripts wrote
+> `privacy.gate.flipped` events.
+
+If a subsystem is "default-on after user opt-in to the umbrella
+feature," its privacy gate must auto-open the first time the
+umbrella feature is enabled. Test scripts opening a gate proves the
+mechanism works, not that users will actually flip it. Either flip
+it automatically (preferred) or expose a UI toggle (acceptable) — but
+never let a gate exist only in test code.
+
 ## Release standards
 
 - Use semantic versioning for extension releases.

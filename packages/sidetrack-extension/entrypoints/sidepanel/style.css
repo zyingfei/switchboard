@@ -229,6 +229,28 @@ h2 {
   margin-top: var(--r3);
 }
 
+.tab-attribution-card-pending {
+  margin-left: var(--r2);
+  color: var(--ink-3);
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+.deeper-access-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--r3);
+}
+.deeper-access-banner-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.deeper-access-banner-actions {
+  display: flex;
+  gap: var(--r2);
+  flex: 0 0 auto;
+}
+
 .toolbar,
 .settings-row,
 .queue-form,

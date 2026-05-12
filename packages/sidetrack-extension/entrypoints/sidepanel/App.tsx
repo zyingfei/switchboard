@@ -24,6 +24,7 @@ import {
   type WorkboardRequest,
 } from '../../src/messages';
 import { canonicalThreadUrl, detectProviderFromUrl } from '../../src/capture/providerDetection';
+import { sanitizeTimelineUrl } from '../../src/timeline/sanitize';
 import {
   CodingAttach,
   AutoSendQueueRow,
@@ -174,9 +175,55 @@ const tabSessionIdFromDragEvent = (event: DragEvent<HTMLElement>): string | null
   return plain.startsWith('tses_') ? plain : null;
 };
 
+// Module-level semaphore to cap concurrent fetches to the companion.
+// Without this, dozens of NeedsOrganizeSuggestionRow components mount
+// at once and each fires its own /v1/suggestions/thread/{id} fetch in
+// useEffect, blowing past Chrome's per-origin socket cap (~6 for
+// HTTP/1.1) and triggering ERR_INSUFFICIENT_RESOURCES failures + a
+// transient "companion disconnected" banner. Holding to 4 in-flight
+// keeps the companion's single-threaded HTTP loop responsive AND
+// keeps the periodic /v1/system/health probe from being starved.
+//
+// Implementation: when a release happens and the queue is non-empty,
+// the slot is TRANSFERRED to the waiter (active stays the same). Only
+// when the queue is empty does release decrement active. This avoids
+// the over-allocate drift that the simpler decrement-then-resolve
+// version exhibited under heavy load (the resolve→continuation gap
+// let another acquire slip in and over-allocate).
+const COMPANION_FETCH_MAX_CONCURRENCY = 4;
+const companionFetchState = { active: 0, queue: [] as Array<() => void> };
+const acquireCompanionFetchSlot = async (): Promise<() => void> => {
+  if (companionFetchState.active < COMPANION_FETCH_MAX_CONCURRENCY) {
+    companionFetchState.active += 1;
+  } else {
+    await new Promise<void>((resolve) => {
+      companionFetchState.queue.push(resolve);
+    });
+    // Slot was transferred to us by the previous releaser — active
+    // was NOT decremented in that path. Don't re-increment here.
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const next = companionFetchState.queue.shift();
+    if (next !== undefined) {
+      next(); // Transfer slot; active stays at MAX.
+    } else {
+      companionFetchState.active -= 1;
+    }
+  };
+};
+
+// The URL projection's byCanonicalUrl is keyed by what the observer
+// produced — `sanitizeTimelineUrl(canonicalThreadUrl(rawUrl))`. The live
+// `chrome.tabs` URL the side panel reads has NOT been through that
+// pipeline, so it can carry a fragment (Google appends `#scso=...`
+// post-load), marketing params, or sensitive params that the stored
+// canonical dropped. Apply the same pipeline here so lookup keys agree.
 const comparableTabUrl = (input: string | undefined): string | null => {
   if (input === undefined || input.length === 0) return null;
-  const canonical = canonicalThreadUrl(input);
+  const canonical = sanitizeTimelineUrl(canonicalThreadUrl(input));
   return canonical.length > 1 && canonical.endsWith('/') ? canonical.slice(0, -1) : canonical;
 };
 
@@ -576,6 +623,22 @@ const App = () => {
   const [settings, setSettings] = useState<SettingsDocument | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [healthPanelOpen, setHealthPanelOpen] = useState(false);
+  // Deeper-page-access banner: engagement + future content-extraction
+  // subsystems need `https://*/*` host permission. Default `true` so the
+  // first paint is clean; useEffect below corrects it after the
+  // chrome.permissions.contains probe resolves. When the user dismisses
+  // the banner manually we hide it for the session (re-shown on a fresh
+  // panel open if still missing).
+  const [hasDeeperPagePermission, setHasDeeperPagePermission] = useState<boolean>(true);
+  const [deeperAccessBannerDismissed, setDeeperAccessBannerDismissed] = useState<boolean>(false);
+  const [deeperAccessBannerBusy, setDeeperAccessBannerBusy] = useState<boolean>(false);
+  // Direct chrome.tabs read for the active tab URL. `state.activeTabUrl`
+  // only updates on the 15 s state poll, so the Current-tab card lagged
+  // visibly after every navigation. Subscribing to chrome.tabs events
+  // here pulls activeTabUrl into the side panel immediately, without
+  // waiting for the SW round-trip.
+  const [liveActiveTabUrl, setLiveActiveTabUrl] = useState<string | undefined>(undefined);
+  const [liveActiveTabTitle, setLiveActiveTabTitle] = useState<string | undefined>(undefined);
   const [threadSearchOpen, setThreadSearchOpen] = useState(false);
   const [threadSearchQuery, setThreadSearchQuery] = useState('');
   const [threadSearchResults, setThreadSearchResults] = useState<readonly ThreadSearchResult[]>([]);
@@ -637,6 +700,16 @@ const App = () => {
   const [urlInbox, setUrlInbox] = useState<UrlInboxData>(EMPTY_URL_INBOX);
   const [urlProjection, setUrlProjection] = useState<UrlProjection | null>(null);
   const [urlSuggestions, setUrlSuggestions] = useState<Record<string, UrlResolutionResult>>({});
+  // Stage 5 follow-up — refs let loadTabSessions read the latest
+  // suggestion cache without listing it as a dep (which would
+  // re-create the callback + tear down the 4s interval on every
+  // suggestion update).
+  const tabSessionSuggestionsRef = useRef(tabSessionSuggestions);
+  tabSessionSuggestionsRef.current = tabSessionSuggestions;
+  const urlSuggestionsRef = useRef(urlSuggestions);
+  urlSuggestionsRef.current = urlSuggestions;
+  const tabSessionSuggestionLoadInFlightRef = useRef(false);
+  const urlSuggestionLoadInFlightRef = useRef(false);
   const [pendingCodingOffers, setPendingCodingOffers] = useState<readonly OfferRecord[]>([]);
   // Per-row dismissals for the Needs-Organize inline suggestion. Local
   // (per-session) — survives panel close but not extension reload.
@@ -664,6 +737,154 @@ const App = () => {
       document.removeEventListener('mousedown', onDoc);
     };
   }, [actionMenuOpenFor]);
+  // Probe + watch the host permission state. `chrome.permissions.contains`
+  // is the source of truth; `onAdded`/`onRemoved` fire when the user
+  // grants or revokes (including from Chrome's chrome://extensions UI).
+  // Each chrome.* read is guarded because the test harness mounts the
+  // side panel against a partially-stubbed chrome.
+  useEffect(() => {
+    if (typeof chrome === 'undefined' || chrome.permissions === undefined) return undefined;
+    const origins = ['https://*/*', 'http://*/*'];
+    let cancelled = false;
+    const probe = (): void => {
+      try {
+        chrome.permissions.contains({ origins }, (granted) => {
+          if (!cancelled) setHasDeeperPagePermission(Boolean(granted));
+        });
+      } catch {
+        // Test harness without chrome.permissions — leave optimistic default.
+      }
+    };
+    probe();
+    const onChange = (): void => probe();
+    type ListenerEvent = {
+      readonly addListener?: (cb: (...args: unknown[]) => void) => void;
+      readonly removeListener?: (cb: (...args: unknown[]) => void) => void;
+    };
+    const onAdded = chrome.permissions.onAdded as unknown as ListenerEvent | undefined;
+    const onRemoved = chrome.permissions.onRemoved as unknown as ListenerEvent | undefined;
+    const onChangeAny = onChange as unknown as (...args: unknown[]) => void;
+    onAdded?.addListener?.(onChangeAny);
+    onRemoved?.addListener?.(onChangeAny);
+    return () => {
+      cancelled = true;
+      onAdded?.removeListener?.(onChangeAny);
+      onRemoved?.removeListener?.(onChangeAny);
+    };
+  }, []);
+  // Keep liveActiveTabUrl in sync with the focused tab using chrome.tabs
+  // directly. Listening to onActivated + onUpdated gives sub-second
+  // latency for the Current-tab card, instead of waiting on the SW's
+  // periodic state poll. Each chrome.* read is guarded because the test
+  // harness mounts the side panel against a partially-stubbed chrome.
+  useEffect(() => {
+    if (typeof chrome === 'undefined' || chrome.tabs === undefined) return undefined;
+    let cancelled = false;
+    // Only http(s) URLs can be tracked. The side panel page itself
+    // (chrome-extension://…) often comes back as "active" when its
+    // window is focused, especially in stealth Chromium contexts where
+    // the side panel surface is opened as a regular tab. Without this
+    // filter, the Current-tab card rendered "Sidetrack (capturing…)"
+    // for the side panel's own URL. chrome:// / file:// / about: tabs
+    // are never observed by the timeline wiring, so leaving the live
+    // state at undefined is the honest answer.
+    const isTrackableScheme = (url: string): boolean =>
+      url.startsWith('https://') || url.startsWith('http://');
+    const applyActiveTab = (tabs: readonly chrome.tabs.Tab[]): void => {
+      if (cancelled) return;
+      const tab = tabs.find(
+        (candidate) =>
+          candidate.active === true &&
+          typeof candidate.url === 'string' &&
+          candidate.url.length > 0 &&
+          isTrackableScheme(candidate.url),
+      );
+      const url = tab?.url;
+      const title = tab?.title;
+      setLiveActiveTabUrl(url);
+      setLiveActiveTabTitle(
+        url !== undefined && title !== undefined && title.length > 0 ? title : undefined,
+      );
+    };
+    const refresh = (): void => {
+      try {
+        chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
+          if (cancelled) return;
+          if (
+            tabs.some(
+              (tab) =>
+                tab.active === true &&
+                typeof tab.url === 'string' &&
+                tab.url.length > 0 &&
+                isTrackableScheme(tab.url),
+            )
+          ) {
+            applyActiveTab(tabs);
+            return;
+          }
+          // In the headed recorder, the "side panel" can be a regular
+          // chrome-extension:// tab. That tab may be the last-focused
+          // window even though the user is actively browsing in another
+          // window. Fall back to all active tabs and pick an http(s) tab
+          // so Current-tab renders from live tab state instead of waiting
+          // for the slower projection poll.
+          chrome.tabs.query({ active: true }, (allActiveTabs) => {
+            applyActiveTab(allActiveTabs);
+          });
+        });
+      } catch {
+        // Test harness — leave state untouched.
+      }
+    };
+    refresh();
+    const onActivated = (): void => refresh();
+    const onUpdated = (
+      _tabId: number,
+      changeInfo: { url?: string; title?: string },
+      tab: { active?: boolean },
+    ): void => {
+      if (tab.active !== true) return;
+      if (changeInfo.url !== undefined || changeInfo.title !== undefined) refresh();
+    };
+    const onFocusChanged = (): void => refresh();
+    type ListenerEvent = {
+      readonly addListener?: (cb: (...args: unknown[]) => void) => void;
+      readonly removeListener?: (cb: (...args: unknown[]) => void) => void;
+    };
+    const activatedApi = chrome.tabs.onActivated as unknown as ListenerEvent | undefined;
+    const updatedApi = chrome.tabs.onUpdated as unknown as ListenerEvent | undefined;
+    const focusApi = chrome.windows?.onFocusChanged as unknown as ListenerEvent | undefined;
+    const onActivatedAny = onActivated as unknown as (...args: unknown[]) => void;
+    const onUpdatedAny = onUpdated as unknown as (...args: unknown[]) => void;
+    const onFocusChangedAny = onFocusChanged as unknown as (...args: unknown[]) => void;
+    activatedApi?.addListener?.(onActivatedAny);
+    updatedApi?.addListener?.(onUpdatedAny);
+    focusApi?.addListener?.(onFocusChangedAny);
+    return () => {
+      cancelled = true;
+      activatedApi?.removeListener?.(onActivatedAny);
+      updatedApi?.removeListener?.(onUpdatedAny);
+      focusApi?.removeListener?.(onFocusChangedAny);
+    };
+  }, []);
+  const handleGrantDeeperPageAccess = useCallback(async (): Promise<void> => {
+    setDeeperAccessBannerBusy(true);
+    try {
+      const granted = await new Promise<boolean>((resolve) => {
+        chrome.permissions.request({ origins: ['https://*/*', 'http://*/*'] }, (g) => {
+          resolve(Boolean(g));
+        });
+      });
+      setHasDeeperPagePermission(granted);
+      if (granted) {
+        await chrome.runtime
+          .sendMessage({ type: 'sidetrack.timeline.permission.granted' })
+          .catch(() => undefined);
+      }
+    } finally {
+      setDeeperAccessBannerBusy(false);
+    }
+  }, []);
   // Cache of suggested workstream per thread, keyed by thread bac_id.
   // Populated from companion's GET /v1/suggestions/thread/{id} (PR #76
   // Track F) when the row is rendered. Empty fallback shows nothing.
@@ -931,10 +1152,51 @@ const App = () => {
     [bridgeKey, port],
   );
 
+  // Cap the resolver fan-out so the side panel doesn't fire 50+
+  // concurrent /resolve calls at once. The companion's HTTP loop is
+  // single-threaded — saturating it caused the periodic
+  // /v1/system/health probe to time out, briefly flashing the
+  // "companion disconnected" banner, and stalled Inbox updates by 10+
+  // seconds per refresh cycle. Bound to 4 in-flight requests.
+  const mapWithConcurrency = useCallback(
+    async <T, R>(
+      items: readonly T[],
+      limit: number,
+      worker: (item: T) => Promise<R>,
+    ): Promise<R[]> => {
+      const out: R[] = new Array(items.length) as R[];
+      let next = 0;
+      const runners = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+        while (true) {
+          const i = next;
+          next += 1;
+          if (i >= items.length) return;
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+          out[i] = await worker(items[i]!);
+        }
+      });
+      await Promise.all(runners);
+      return out;
+    },
+    [],
+  );
+
+  // Stage 5 follow-up — `/resolve?dryRun=true` runs the full
+  // resolver pipeline (PPR + cluster + similarity + ranker fusion) on
+  // the companion. Firing it for every unattributed item on every 4 s
+  // poll dominated the panel's HTTP budget AND the companion's CPU as
+  // the graph grew. Cache results per id; only fetch resolves for ids
+  // we haven't seen yet, or for ids the caller marks dirty via
+  // `forceRefetch`.
+  //
+  // The cache is invalidated entirely on user mutation (attribution,
+  // dismiss) because those change the resolver inputs.
   const loadTabSessionSuggestions = useCallback(
     async (
       projection: TabSessionProjection,
       inbox: TabSessionInboxData,
+      previous: Readonly<Record<string, TabSessionResolutionResult>>,
+      forceRefetch = false,
     ): Promise<Record<string, TabSessionResolutionResult>> => {
       const recordsById = new Map<string, TabSessionRecord>();
       for (const record of Object.values(projection.bySessionId)) {
@@ -947,130 +1209,186 @@ const App = () => {
           recordsById.set(record.tabSessionId, record);
         }
       }
-      const entries = await Promise.all(
-        [...recordsById.keys()].map(async (tabSessionId) => {
-          try {
-            const result = await fetchCompanionJson<unknown>(
-              `/v1/tabsessions/${encodeURIComponent(tabSessionId)}/resolve?dryRun=true`,
-            );
-            return isTabSessionResolutionResult(result) ? ([tabSessionId, result] as const) : null;
-          } catch {
-            return null;
-          }
-        }),
+      // Drop cached entries for ids no longer in the inbox.
+      const next: Record<string, TabSessionResolutionResult> = {};
+      for (const id of recordsById.keys()) {
+        if (!forceRefetch && previous[id] !== undefined) next[id] = previous[id];
+      }
+      const idsToFetch = [...recordsById.keys()].filter((id) =>
+        forceRefetch ? true : next[id] === undefined,
       );
-      return Object.fromEntries(
-        entries.filter(
-          (entry): entry is readonly [string, TabSessionResolutionResult] => entry !== null,
-        ),
-      );
+      const fetched = await mapWithConcurrency(idsToFetch, 4, async (tabSessionId) => {
+        try {
+          const result = await fetchCompanionJson<unknown>(
+            `/v1/tabsessions/${encodeURIComponent(tabSessionId)}/resolve?dryRun=true`,
+          );
+          return isTabSessionResolutionResult(result) ? ([tabSessionId, result] as const) : null;
+        } catch {
+          return null;
+        }
+      });
+      for (const entry of fetched) {
+        if (entry !== null) next[entry[0]] = entry[1];
+      }
+      return next;
     },
-    [fetchCompanionJson],
+    [fetchCompanionJson, mapWithConcurrency],
   );
 
   // Resolve every unattributed URL in the Inbox so the cards can show
-  // "Best guess: …" inline. Run in parallel; missing/errored URLs
-  // silently drop out of the result.
+  // "Best guess: …" inline. Cached across polls; refetched on user
+  // mutation.
   const loadUrlSuggestions = useCallback(
-    async (inbox: UrlInboxData): Promise<Record<string, UrlResolutionResult>> => {
+    async (
+      inbox: UrlInboxData,
+      previous: Readonly<Record<string, UrlResolutionResult>>,
+      forceRefetch = false,
+    ): Promise<Record<string, UrlResolutionResult>> => {
       const canonicalUrls = inbox.items
         .filter((item) => item.currentAttribution === undefined)
         .map((item) => item.canonicalUrl);
-      const entries = await Promise.all(
-        canonicalUrls.map(async (canonicalUrl) => {
-          try {
-            const result = await fetchCompanionJson<unknown>(
-              `/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve?dryRun=true`,
-            );
-            return isUrlResolutionResult(result) ? ([canonicalUrl, result] as const) : null;
-          } catch {
-            return null;
-          }
-        }),
+      const next: Record<string, UrlResolutionResult> = {};
+      for (const url of canonicalUrls) {
+        if (!forceRefetch && previous[url] !== undefined) next[url] = previous[url];
+      }
+      const toFetch = canonicalUrls.filter((url) =>
+        forceRefetch ? true : next[url] === undefined,
       );
-      return Object.fromEntries(
-        entries.filter((entry): entry is readonly [string, UrlResolutionResult] => entry !== null),
-      );
+      const fetched = await mapWithConcurrency(toFetch, 4, async (canonicalUrl) => {
+        try {
+          const result = await fetchCompanionJson<unknown>(
+            `/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve?dryRun=true`,
+          );
+          return isUrlResolutionResult(result) ? ([canonicalUrl, result] as const) : null;
+        } catch {
+          return null;
+        }
+      });
+      for (const entry of fetched) {
+        if (entry !== null) next[entry[0]] = entry[1];
+      }
+      return next;
     },
-    [fetchCompanionJson],
+    [fetchCompanionJson, mapWithConcurrency],
   );
 
-  const loadTabSessions = useCallback(async (): Promise<void> => {
-    if (port.length === 0 || bridgeKey.length === 0) {
-      setTabSessionProjection(null);
-      setTabSessionInbox(EMPTY_TAB_SESSION_INBOX);
-      setTabSessionSuggestions({});
-      setUrlProjection(null);
-      setUrlInbox(EMPTY_URL_INBOX);
-      setUrlSuggestions({});
-      return;
-    }
-    setTabSessionLoading(true);
-    setTabSessionError(null);
-    try {
-      const [tabProjection, tabInbox] = await Promise.all([
-        fetchCompanionJson<unknown>('/v1/tabsessions/projection'),
-        fetchCompanionJson<unknown>('/v1/tabsessions/inbox?limit=51&offset=0'),
-      ]);
-      if (!isTabSessionProjection(tabProjection) || !isTabSessionInboxData(tabInbox)) {
-        throw new Error('Companion returned an invalid tab-session projection.');
+  // Stage 5 follow-up — background polls should NOT flip the
+  // `tabSessionLoading` flag (it toggles the "Loading tab sessions…"
+  // line, which reflows the Inbox layout every 4 s = visible flicker).
+  // Only the initial load + the explicit refresh button surface
+  // loading state; the poll silently swaps in fresh data.
+  //
+  // Similarly: the error banner is only cleared on SUCCESS, not on
+  // every fetch start. A flaky companion (one failed poll out of
+  // ten) used to flash the red banner on/off; now it persists until
+  // the next successful refresh, which is the actual signal the user
+  // wants.
+  const loadTabSessions = useCallback(
+    async (
+      options: { readonly background?: boolean; readonly forceRefetchSuggestions?: boolean } = {},
+    ): Promise<void> => {
+      const background = options.background === true;
+      const forceRefetch = options.forceRefetchSuggestions === true;
+      if (port.length === 0 || bridgeKey.length === 0) {
+        setTabSessionProjection(null);
+        setTabSessionInbox(EMPTY_TAB_SESSION_INBOX);
+        setTabSessionSuggestions({});
+        setUrlProjection(null);
+        setUrlInbox(EMPTY_URL_INBOX);
+        setUrlSuggestions({});
+        return;
       }
-      setTabSessionProjection(tabProjection);
-      setTabSessionInbox(tabInbox);
-      setTabSessionSuggestions(await loadTabSessionSuggestions(tabProjection, tabInbox));
-    } catch (loadError) {
-      setTabSessionError(
-        loadError instanceof Error ? loadError.message : 'Could not load tab sessions.',
-      );
-      setTabSessionSuggestions({});
-    } finally {
-      setTabSessionLoading(false);
-    }
-    // URL projection (Phase B) is fetched independently — older
-    // companions that don't yet expose /v1/visits/* return 404, which
-    // we tolerate by leaving the URL state empty. Tab-session state
-    // above keeps working in that case.
-    try {
-      const [urlProj, urlInboxResp] = await Promise.all([
-        fetchCompanionJson<unknown>('/v1/visits/projection'),
-        fetchCompanionJson<unknown>('/v1/visits/inbox?limit=51&offset=0'),
-      ]);
-      if (isUrlProjection(urlProj) && isUrlInboxData(urlInboxResp)) {
-        setUrlProjection(urlProj);
-        setUrlInbox(urlInboxResp);
-        setUrlSuggestions(await loadUrlSuggestions(urlInboxResp));
-        // Diagnostic: log the URL record for whatever tab the user is
-        // currently looking at so we can see whether the projection
-        // already has the real title (companion-side) but the panel is
-        // stuck on a stale render.
-        // eslint-disable-next-line no-console
-        const focused =
-          typeof state.activeTabUrl === 'string'
-            ? (urlProj as UrlProjection).byCanonicalUrl[state.activeTabUrl]
-            : undefined;
-        // eslint-disable-next-line no-console
-        console.log(
-          '[sidetrack:panel] loadTabSessions',
-          'activeTabUrl=',
-          state.activeTabUrl,
-          'urlRecord=',
-          focused === undefined
-            ? '<not in projection>'
-            : { latestTitle: focused.latestTitle, latestUrl: focused.latestUrl },
-        );
-      } else {
-        // eslint-disable-next-line no-console
-        console.warn('[sidetrack:panel] loadTabSessions — invalid /v1/visits payload');
+      if (!background) {
+        setTabSessionLoading(true);
+        setTabSessionError(null);
       }
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.warn('[sidetrack:panel] loadTabSessions — /v1/visits fetch failed', err);
-    }
-  }, [bridgeKey, fetchCompanionJson, loadTabSessionSuggestions, loadUrlSuggestions, port, state.activeTabUrl]);
+      const loadUrlState = async (): Promise<void> => {
+        try {
+          const [urlProj, urlInboxResp] = await Promise.all([
+            fetchCompanionJson<unknown>('/v1/visits/projection'),
+            fetchCompanionJson<unknown>('/v1/visits/inbox?limit=51&offset=0'),
+          ]);
+          if (isUrlProjection(urlProj) && isUrlInboxData(urlInboxResp)) {
+            setUrlProjection(urlProj);
+            setUrlInbox(urlInboxResp);
+            if (!urlSuggestionLoadInFlightRef.current) {
+              urlSuggestionLoadInFlightRef.current = true;
+              void loadUrlSuggestions(urlInboxResp, urlSuggestionsRef.current, forceRefetch)
+                .then(setUrlSuggestions)
+                .catch(() => undefined)
+                .finally(() => {
+                  urlSuggestionLoadInFlightRef.current = false;
+                });
+            }
+          } else {
+            // eslint-disable-next-line no-console
+            console.warn('[sidetrack:panel] loadTabSessions — invalid /v1/visits payload');
+          }
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn('[sidetrack:panel] loadTabSessions — /v1/visits fetch failed', err);
+        }
+      };
+      void loadUrlState();
+      try {
+        const [tabProjection, tabInbox] = await Promise.all([
+          fetchCompanionJson<unknown>('/v1/tabsessions/projection'),
+          fetchCompanionJson<unknown>('/v1/tabsessions/inbox?limit=51&offset=0'),
+        ]);
+        if (!isTabSessionProjection(tabProjection) || !isTabSessionInboxData(tabInbox)) {
+          throw new Error('Companion returned an invalid tab-session projection.');
+        }
+        setTabSessionProjection(tabProjection);
+        setTabSessionInbox(tabInbox);
+        if (!tabSessionSuggestionLoadInFlightRef.current) {
+          tabSessionSuggestionLoadInFlightRef.current = true;
+          void loadTabSessionSuggestions(
+            tabProjection,
+            tabInbox,
+            tabSessionSuggestionsRef.current,
+            forceRefetch,
+          )
+            .then(setTabSessionSuggestions)
+            .catch(() => {
+              if (!background) setTabSessionSuggestions({});
+            })
+            .finally(() => {
+              tabSessionSuggestionLoadInFlightRef.current = false;
+            });
+        }
+        // Successful fetch — clear any error banner left over from a
+        // prior poll. Doing it here (vs at start) keeps the banner
+        // sticky until the situation actually recovers.
+        setTabSessionError(null);
+      } catch (loadError) {
+        // Only surface tab-session errors in the foreground. A
+        // single failed background poll doesn't deserve a red
+        // banner; if the failure persists, the next foreground
+        // action (refresh button, view-mode change, initial mount)
+        // will surface it.
+        if (!background) {
+          setTabSessionError(
+            loadError instanceof Error ? loadError.message : 'Could not load tab sessions.',
+          );
+          setTabSessionSuggestions({});
+        }
+      } finally {
+        if (!background) setTabSessionLoading(false);
+      }
+    },
+    [bridgeKey, fetchCompanionJson, loadTabSessionSuggestions, loadUrlSuggestions, port],
+  );
 
+  // Stage 5 follow-up — `state.updatedAt` and `viewMode` are reactive
+  // (workboard state bumps, panel-tab switches), not user-initiated
+  // loads. Firing the foreground loader here flipped
+  // `tabSessionLoading` every time an attribution landed, which made
+  // the "Loading tab sessions…" line appear above the existing cards
+  // and shift them down. Use background mode; the InboxView still
+  // shows a loading skeleton when there's no projection yet.
   useEffect(() => {
     if (state.companionStatus !== 'connected') return;
-    void loadTabSessions();
+    void loadTabSessions({ background: true });
   }, [loadTabSessions, state.companionStatus, state.updatedAt, viewMode]);
 
   // Periodic refresh while the companion is connected so newly observed
@@ -1082,7 +1400,7 @@ const App = () => {
   useEffect(() => {
     if (state.companionStatus !== 'connected') return;
     const handle = setInterval(() => {
-      void loadTabSessions();
+      void loadTabSessions({ background: true });
     }, 4000);
     return () => {
       clearInterval(handle);
@@ -1102,21 +1420,52 @@ const App = () => {
     const tabsApi = chromeApi?.tabs;
     if (tabsApi === undefined || typeof tabsApi.onUpdated?.addListener !== 'function') return;
     let pending: ReturnType<typeof setTimeout> | null = null;
+    let refreshInFlight: Promise<void> | null = null;
+    let refreshAgain = false;
+    const delay = (ms: number): Promise<void> =>
+      new Promise((resolve) => {
+        setTimeout(resolve, ms);
+      });
+    const forceDrainTimeline = (): Promise<void> =>
+      new Promise((resolve) => {
+        if (chromeApi?.runtime?.sendMessage === undefined) {
+          resolve();
+          return;
+        }
+        try {
+          chromeApi.runtime.sendMessage({ type: 'sidetrack.timeline.force-drain' }, () => {
+            // Reading lastError prevents Chrome from surfacing an
+            // unchecked runtime error if the SW restarted mid-drain.
+            const lastError = chromeApi?.runtime?.lastError;
+            void lastError;
+            resolve();
+          });
+        } catch {
+          resolve();
+        }
+      });
+    const runRefresh = (): void => {
+      if (refreshInFlight !== null) {
+        refreshAgain = true;
+        return;
+      }
+      refreshInFlight = (async () => {
+        do {
+          refreshAgain = false;
+          if (state.companionStatus !== 'connected') return;
+          await forceDrainTimeline();
+          await delay(150);
+          await loadTabSessions({ background: true });
+        } while (refreshAgain);
+      })().finally(() => {
+        refreshInFlight = null;
+      });
+    };
     const trigger = (): void => {
       if (pending !== null) clearTimeout(pending);
       pending = setTimeout(() => {
         pending = null;
-        if (state.companionStatus !== 'connected') return;
-        try {
-          chromeApi?.runtime?.sendMessage(
-            { type: 'sidetrack.timeline.force-drain' },
-            () => {
-              void loadTabSessions().catch(() => undefined);
-            },
-          );
-        } catch {
-          void loadTabSessions().catch(() => undefined);
-        }
+        runRefresh();
       }, 250);
     };
     const onUpdated = (
@@ -1901,7 +2250,8 @@ const App = () => {
     if (!response.ok) {
       throw new Error(`Tab-session attribution failed (${String(response.status)}).`);
     }
-    await loadTabSessions();
+    // User mutation — refetch resolver suggestions (cache is stale).
+    await loadTabSessions({ forceRefetchSuggestions: true });
     return await sendRequest({ type: messageTypes.getWorkboardState });
   };
 
@@ -1929,7 +2279,8 @@ const App = () => {
     if (!response.ok) {
       throw new Error(`URL attribution failed (${String(response.status)}).`);
     }
-    await loadTabSessions();
+    // User mutation — refetch resolver suggestions (cache is stale).
+    await loadTabSessions({ forceRefetchSuggestions: true });
     return await sendRequest({ type: messageTypes.getWorkboardState });
   };
 
@@ -3029,7 +3380,10 @@ const App = () => {
     [tabSessionProjection],
   );
   const focusedTabUrl = comparableTabUrl(
-    state.activeTabUrl ?? state.currentTab?.tabSnapshot?.url ?? state.currentTab?.threadUrl,
+    liveActiveTabUrl ??
+      state.activeTabUrl ??
+      state.currentTab?.tabSnapshot?.url ??
+      state.currentTab?.threadUrl,
   );
   // Per-URL state: every visible attribution surface (Current tab,
   // Inbox, Pages-in-this-workstream) reads from `urlProjection` instead
@@ -4617,6 +4971,43 @@ const App = () => {
         ) : null}
       </div>
 
+      {!hasDeeperPagePermission && !deeperAccessBannerDismissed ? (
+        <div
+          className="banner warning deeper-access-banner"
+          role="status"
+          aria-live="polite"
+          data-testid="deeper-access-banner"
+        >
+          <div className="deeper-access-banner-body">
+            <strong>Deeper page access not granted.</strong>{' '}
+            Engagement tracking (focus, scroll, copy) and future in-page features
+            need it. URL + title observation already works without it.
+          </div>
+          <div className="deeper-access-banner-actions">
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={deeperAccessBannerBusy}
+              onClick={() => {
+                void handleGrantDeeperPageAccess();
+              }}
+            >
+              {deeperAccessBannerBusy ? 'Requesting…' : 'Grant access'}
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost"
+              onClick={() => {
+                setDeeperAccessBannerDismissed(true);
+              }}
+              aria-label="Dismiss banner"
+            >
+              Not now
+            </button>
+          </div>
+        </div>
+      ) : null}
+
       {viewMode === 'workstream' ? (
         <WorkstreamBar
           currentWsLabel={currentWsLabel}
@@ -4722,7 +5113,12 @@ const App = () => {
 
       <section
         className={
-          'tab-attribution-card' + (focusedTabSession !== undefined ? ' is-active' : ' is-empty')
+          'tab-attribution-card' +
+          (focusedTabSession !== undefined
+            ? ' is-active'
+            : liveActiveTabUrl !== undefined
+              ? ' is-loading'
+              : ' is-empty')
         }
         data-testid="focused-tab-attribution"
         aria-label="Current tab attribution"
@@ -4735,6 +5131,22 @@ const App = () => {
               title={focusedTabSession.latestUrl ?? tabSessionDisplayTitle(focusedTabSession)}
             >
               {tabSessionDisplayTitle(focusedTabSession)}
+            </span>
+          ) : liveActiveTabUrl !== undefined ? (
+            // Optimistic render before urlProjection has the entry.
+            // The companion takes a few seconds to materialize the visit
+            // (observe → drain → projection → 4 s side-panel poll).
+            // Showing the live tab title + host instead of "No tracked
+            // tab in focus" gives instant feedback that the side panel
+            // sees the navigation.
+            <span
+              className="tab-attribution-card-title subtle"
+              title={liveActiveTabUrl}
+            >
+              {liveActiveTabTitle ?? (() => {
+                try { return new URL(liveActiveTabUrl).hostname; } catch { return liveActiveTabUrl; }
+              })()}
+              <span className="tab-attribution-card-pending mono"> (capturing…)</span>
             </span>
           ) : (
             <span className="tab-attribution-card-title subtle">No tracked tab in focus</span>
@@ -5213,7 +5625,10 @@ const App = () => {
             limit: urlInbox.limit,
             offset: urlInbox.offset,
           }}
-          loading={tabSessionLoading}
+          // Stage 5 follow-up — only surface the loading line on the
+          // actual first load (no projection yet). Subsequent fetches
+          // swap data silently so existing cards don't shift down.
+          loading={tabSessionLoading && tabSessionProjection === null && urlProjection === null}
           error={tabSessionError}
           workstreams={tabSessionWorkstreams}
           suggestions={Object.fromEntries(
@@ -6421,6 +6836,14 @@ function NeedsOrganizeSuggestionRow({
     let cancelled = false;
     setPending(true);
     void (async () => {
+      // Throttle: acquire a global slot before issuing the fetch so
+      // the simultaneous mount of N suggestion rows can't exhaust
+      // Chrome's per-origin socket pool. Slot releases on finally.
+      const release = await acquireCompanionFetchSlot();
+      if (cancelled) {
+        release();
+        return;
+      }
       try {
         const url = `http://127.0.0.1:${String(companionPort)}/v1/suggestions/thread/${threadId}?limit=1`;
         const response = await fetch(url, { headers: { 'x-bac-bridge-key': bridgeKey } });
@@ -6455,6 +6878,7 @@ function NeedsOrganizeSuggestionRow({
       } catch {
         // Silent — empty render
       } finally {
+        release();
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled mutated by cleanup
         if (!cancelled) setPending(false);
       }
