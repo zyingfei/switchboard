@@ -3159,6 +3159,7 @@ export default defineBackground(() => {
   ]);
   const EDGE_EVENT_DRAIN_ROUTE_BATCH_SIZE = 10;
   const EDGE_EVENT_DRAIN_SCAN_BATCH_SIZE = 500;
+  const EDGE_EVENT_DRAIN_MAX_BATCHES = 50;
 
   const mergeCounts = (
     ...counts: readonly Record<string, number>[]
@@ -3182,31 +3183,38 @@ export default defineBackground(() => {
     readonly skippedByReason: Record<string, number>;
   }
 
+  const emptyEdgeEventDrainStats = (remaining: number): EdgeEventDrainStats => ({
+    uploaded: 0,
+    evicted: 0,
+    remaining,
+    skipped: 0,
+    uploadedByType: {},
+    evictedByType: {},
+    skippedByReason: {},
+  });
+
+  const mergeEdgeEventDrainStats = (
+    left: EdgeEventDrainStats,
+    right: EdgeEventDrainStats,
+  ): EdgeEventDrainStats => ({
+    uploaded: left.uploaded + right.uploaded,
+    evicted: left.evicted + right.evicted,
+    remaining: right.remaining,
+    skipped: left.skipped + right.skipped,
+    uploadedByType: mergeCounts(left.uploadedByType, right.uploadedByType),
+    evictedByType: mergeCounts(left.evictedByType, right.evictedByType),
+    skippedByReason: mergeCounts(left.skippedByReason, right.skippedByReason),
+  });
+
   const drainBufferedEdgeEventsOnce = async (): Promise<EdgeEventDrainStats> => {
     const companion = await readTimelineCompanionConfig();
     if (companion === null || companion.url.trim().length === 0) {
-      return {
-        uploaded: 0,
-        evicted: 0,
-        remaining: await engagementEventBuffer.count(),
-        skipped: 0,
-        uploadedByType: {},
-        evictedByType: {},
-        skippedByReason: {},
-      };
+      return emptyEdgeEventDrainStats(await engagementEventBuffer.count());
     }
 
     const batch = await engagementEventBuffer.peek(EDGE_EVENT_DRAIN_SCAN_BATCH_SIZE);
     if (batch.length === 0) {
-      return {
-        uploaded: 0,
-        evicted: 0,
-        remaining: 0,
-        skipped: 0,
-        uploadedByType: {},
-        evictedByType: {},
-        skippedByReason: {},
-      };
+      return emptyEdgeEventDrainStats(0);
     }
 
     const {
@@ -3282,7 +3290,18 @@ export default defineBackground(() => {
     };
   };
 
-  const drainBufferedEdgeEvents = createEdgeEventDrainSingleFlight(drainBufferedEdgeEventsOnce);
+  const drainBufferedEdgeEventsLoop = async (): Promise<EdgeEventDrainStats> => {
+    let total: EdgeEventDrainStats | null = null;
+    for (let i = 0; i < EDGE_EVENT_DRAIN_MAX_BATCHES; i += 1) {
+      const next = await drainBufferedEdgeEventsOnce();
+      total = total === null ? next : mergeEdgeEventDrainStats(total, next);
+      if (next.remaining === 0) break;
+      if (next.uploaded === 0 && next.evicted === 0) break;
+    }
+    return total ?? emptyEdgeEventDrainStats(await engagementEventBuffer.count());
+  };
+
+  const drainBufferedEdgeEvents = createEdgeEventDrainSingleFlight(drainBufferedEdgeEventsLoop);
 
   // Drop reminders bound to thread bac_ids that no longer exist.
   // Cleanup pass for the historical mess caused by the pre-fix
