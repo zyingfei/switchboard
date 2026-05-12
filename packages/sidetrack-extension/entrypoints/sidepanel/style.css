@@ -499,6 +499,64 @@ button:disabled {
   color: var(--accent, #0b57d0);
 }
 
+/* Suggestion stats line under the Current Tab badge. Shows the
+   resolver's bucket label + raw stats on hover + an optional
+   alternatives list. */
+.suggestion-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  font-size: 11px;
+}
+.suggestion-stats-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.suggestion-stats-target {
+  font-weight: 500;
+  color: var(--ink-1);
+}
+.suggestion-stats-confidence {
+  color: var(--ink-2);
+}
+.suggestion-stats.is-highly-likely .suggestion-stats-confidence {
+  color: var(--green);
+}
+.suggestion-stats.is-likely .suggestion-stats-confidence {
+  color: var(--green);
+  opacity: 0.85;
+}
+.suggestion-stats.is-possible .suggestion-stats-confidence {
+  color: var(--amber);
+}
+.suggestion-stats.is-unlikely .suggestion-stats-confidence,
+.suggestion-stats.is-not-likely .suggestion-stats-confidence {
+  color: var(--ink-3);
+}
+.suggestion-stats-info {
+  cursor: help;
+  color: var(--ink-3);
+  font-size: 11px;
+  user-select: none;
+}
+.suggestion-stats-source {
+  color: var(--ink-3);
+  font-size: 10px;
+}
+.suggestion-stats-alts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--ink-3);
+  font-size: 10px;
+  padding-top: 2px;
+}
+.suggestion-stats-alt {
+  color: var(--ink-2);
+}
+
 /* Action bar under the Current Tab badge. Primary "Yes" stands out;
    secondary "Pick another…" + the ⋯ overflow are softer. The overflow
    uses a native <details> for low-JS click-outside-to-dismiss. */

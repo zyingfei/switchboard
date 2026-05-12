@@ -87,6 +87,7 @@ import { ConnectionsView } from '../../src/sidepanel/connections/ConnectionsView
 import { hostOf, type EntityDisplayCtx } from '../../src/sidepanel/entityDisplay/format';
 import { useReplicaAliasMap } from '../../src/sidepanel/entityDisplay/replicaAliases';
 import { AttributionBadge } from '../../src/sidepanel/tabsession/AttributionBadge';
+import { SuggestionStats } from '../../src/sidepanel/tabsession/SuggestionStats';
 import { tabSessionDisplayTitle } from '../../src/sidepanel/tabsession/displayTitle';
 import { InboxCard } from '../../src/sidepanel/tabsession/InboxCard';
 import { InboxView } from '../../src/sidepanel/tabsession/InboxView';
@@ -5313,6 +5314,18 @@ const App = () => {
             }
             workstreams={tabSessionWorkstreams}
           />
+          {/* Suggestion stats: bucket label + ⓘ tooltip + alternatives.
+              Only shows when the URL is unattributed/un-ignored AND a
+              suggestion exists. */}
+          {focusedTabSuggestion !== undefined &&
+          focusedUrlRecord?.currentAttribution === undefined &&
+          focusedUrlRecord?.currentIgnored === undefined ? (
+            <SuggestionStats
+              suggestion={tabSessionResolutionFromUrl(focusedTabSuggestion)}
+              workstreams={tabSessionWorkstreams}
+              showAlternatives
+            />
+          ) : null}
           {focusedUrlRecord !== undefined ? (
             <button
               type="button"
