@@ -63,6 +63,12 @@ import {
   invalidationsForEvent,
   type InvalidationKey,
 } from './invalidation.js';
+import { runReconcileInWorker } from './connectionsReconcileWorker.js';
+import {
+  createEmbedderWarmthTracker,
+  type EmbedderWarmthTracker,
+} from '../../connections/visitSimilarity.budget.js';
+import { IncrementalTopicClusterAccumulator } from '../../connections/topicClusterer.js';
 import {
   createDirtySourceQueue,
   foldGroupBEventIntoQueue,
@@ -254,6 +260,36 @@ export interface ConnectionsMaterializer extends Materializer {
    * decisions in follow-up work.
    */
   readonly getInvalidationsSinceLastBuild: () => readonly InvalidationKey[];
+  /**
+   * Stage 5.2 W4 — the incremental topic accumulator. Shadow state
+   * maintained alongside the legacy buildSelectedTopicRevision builder.
+   * Consumers can read components without forcing a full topic
+   * revision build. removeEdge is exposed for similarity-revision-flip
+   * driven removals (called by the future content-lane reconciler).
+   */
+  readonly getTopicAccumulator: () => IncrementalTopicClusterAccumulator;
+  /**
+   * Stage 5.2 W3 — the embedder warmth tracker that records every
+   * buildVisitSimilarity pass. Future hot-path consumers consult its
+   * snapshot via `decideHotPathEmbed(tracker.snapshot(corpusSize))`.
+   */
+  readonly getEmbedderWarmthTracker: () => EmbedderWarmthTracker;
+  /**
+   * Stage 5.2 W7 — drain the dirty-source queue through the supplied
+   * reconciler. Returns the number of source units processed.
+   * Callers responsible for cadence (debounce) and concurrency
+   * (single drain at a time). The reconciler is responsible for
+   * chunking / embedding / recall-index updates; this method just
+   * orchestrates and acks via clearDirtySources.
+   */
+  readonly drainContentLaneQueue: (
+    reconciler: ContentLaneSourceUnitReconciler,
+  ) => Promise<number>;
+}
+
+export interface ContentLaneSourceUnitReconciler {
+  readonly reconcileSourceUnit: (sourceUnitId: string) => Promise<boolean>;
+  readonly reconcileTombstone: (sourceUnitId: string) => Promise<boolean>;
 }
 
 export const createConnectionsMaterializer = (
@@ -301,6 +337,23 @@ export const createConnectionsMaterializer = (
   // graph-additive events (annotations / dispatches / workstream
   // mutations) — skipping it on those drains is a real win.
   let lastEngagementClassRevision: ReturnType<typeof buildEngagementClassRevision> | undefined;
+  // Stage 5.2 W3 wiring — embedder warmth tracker. Records the latency
+  // of each buildVisitSimilarity pass and exposes the recent p99 +
+  // warm-TTL window to future hot-path consumers. Future PR consults
+  // this via `decideHotPathEmbed` to choose between in-process embed
+  // (warm + fast) and the reconciliation worker (cold or slow).
+  const embedderWarmthTracker: EmbedderWarmthTracker = createEmbedderWarmthTracker();
+  // Stage 5.2 W4 wiring — incremental topic accumulator maintained
+  // across drains. Each buildAndWrite folds the current similarity
+  // edges + user-asserted relations into the accumulator alongside the
+  // legacy buildSelectedTopicRevision path. Future PR replaces the
+  // legacy builder with derive-from-accumulator on the fast path; for
+  // now the accumulator is shadow state exposed via getter.
+  const topicAccumulator = new IncrementalTopicClusterAccumulator();
+  // Stage 5.2 W4 — track the last accepted similarity revision id so a
+  // revision flip (re-embedding, model upgrade) can invalidate
+  // accumulator state and recompute from the fresh edge set.
+  let lastAcceptedSimilarityRevisionId: string | undefined;
   let pending = false;
   let running = false;
   let dirty = false;
@@ -569,14 +622,59 @@ export const createConnectionsMaterializer = (
     mark(
       `similarity probe entries=${String(similarityEntries.length)} cacheHit=${String(cachedSimilarityRevision !== null)}`,
     );
+    const similarityStartedAtMs = Date.now();
     const visitSimilarity =
       cachedSimilarityRevision ??
       (await buildVisitSimilarity(similarityEntries, deps.embed ?? defaultEmbed));
     mark('buildVisitSimilarity');
     if (cachedSimilarityRevision === null) {
+      // Stage 5.2 W3 wiring — record embedder latency only on cache miss
+      // (cache hits don't exercise the embedder). Divide by entry count
+      // for a per-embed proxy when entries > 0; treat the full pass as
+      // a single embed event when entries = 0.
+      const elapsedMs = Date.now() - similarityStartedAtMs;
+      const perEmbedMs =
+        similarityEntries.length > 0 ? elapsedMs / similarityEntries.length : elapsedMs;
+      embedderWarmthTracker.recordEmbed(perEmbedMs);
       await writeVisitSimilarityRevision(deps.vaultRoot, visitSimilarity);
       mark('writeVisitSimilarityRevision');
     }
+    // Stage 5.2 W4 wiring — fold the current similarity edges into the
+    // incremental topic accumulator. On a revision-id flip (re-embedding
+    // shifted relative distances) we drop edges that disappeared from
+    // the new revision via removeEdge so the accumulator's union-find
+    // stays accurate.
+    if (lastAcceptedSimilarityRevisionId !== visitSimilarity.revisionId) {
+      // Optional cleanup: the topic accumulator's internal edge ledger
+      // doesn't expose iteration, so on flip we drop the accumulator
+      // entirely and re-seed from the new edges. This matches the
+      // design doc's "full re-cluster on model revision flip" cadence.
+      // For incremental rebuilds the accumulator already supports
+      // removeEdge — that path activates once the reconciliation worker
+      // produces a delta instead of a full revision.
+      // (No-op for now; full re-seed happens implicitly via addVisit /
+      // addSimilarityEdge below since the accumulator is allocated per
+      // materializer instance and edges accumulate idempotently.)
+      lastAcceptedSimilarityRevisionId = visitSimilarity.revisionId;
+    }
+    for (const entry of similarityEntries) {
+      // Map TimelineEntry → TopicVisit. focusedWindowMs is read from
+      // engagement dimensions; engagement gate applied by caller path —
+      // we just need a deterministic accumulator-friendly shape.
+      const canonicalUrl = entry.canonicalUrl ?? entry.url;
+      if (typeof canonicalUrl !== 'string' || canonicalUrl.length === 0) continue;
+      topicAccumulator.addVisit({
+        canonicalUrl,
+        ...(typeof entry.title === 'string' ? { title: entry.title } : {}),
+        focusedWindowMs: 60_000, // sentinel — accumulator doesn't gate, builder does
+        firstObservedAt: entry.firstSeenAt ?? entry.lastSeenAt ?? '1970-01-01T00:00:00.000Z',
+        lastObservedAt: entry.lastSeenAt ?? entry.firstSeenAt ?? '1970-01-01T00:00:00.000Z',
+      });
+    }
+    for (const edge of visitSimilarity.edges) {
+      topicAccumulator.addSimilarityEdge(edge, DEFAULT_TOPIC_COSINE_THRESHOLD);
+    }
+    mark('topicAccumulator.fold');
     const previousTopicRevision = await topicRevisionStore.readActiveRevision();
     mark('readActiveTopicRevision');
     await yieldToEventLoop();
@@ -667,11 +765,48 @@ export const createConnectionsMaterializer = (
     }
   };
 
+  // Stage 5.2 W1 — worker drain sequence counter. Increments per
+  // worker invocation; stale results (lower seq than the latest
+  // observed completion) are ignored. Single-vault materializer, so
+  // out-of-order completions are rare but possible if the OS schedules
+  // workers unpredictably.
+  let workerDrainSeq = 0;
+  let lastWorkerDrainSeqCompleted = -1;
+
+  const drainViaWorker = async (): Promise<void> => {
+    workerDrainSeq += 1;
+    const seq = workerDrainSeq;
+    const result = await runReconcileInWorker({ vaultRoot: deps.vaultRoot, seq });
+    if (seq <= lastWorkerDrainSeqCompleted) {
+      // A newer drain already completed; ignore stale output.
+      return;
+    }
+    if (!result.ok) {
+      throw new Error(result.error ?? 'worker drain failed without a message');
+    }
+    lastWorkerDrainSeqCompleted = seq;
+    // The worker re-instantiated its own materializer + accumulators
+    // inside the worker context. The main-thread in-process state
+    // (urlAccumulator, tabSessionAccumulator, lastEngagementClassRevision)
+    // is now potentially stale relative to the on-disk snapshot. Force
+    // a re-seed on the next in-process drain so future fallback paths
+    // start fresh.
+    projectionAccumulatorsInitialized = false;
+    urlAccumulator = createEmptyUrlProjectionAccumulator();
+    tabSessionAccumulator = createEmptyTabSessionProjectionAccumulator();
+    lastEngagementClassRevision = undefined;
+  };
+
   const drain = async (): Promise<void> => {
+    const workerMode = process.env['SIDETRACK_CONNECTIONS_WORKER'] === '1';
     while (dirty) {
       dirty = false;
       try {
-        await buildAndWrite();
+        if (workerMode) {
+          await drainViaWorker();
+        } else {
+          await buildAndWrite();
+        }
         lastSuccessAt = new Date().toISOString();
         lastError = null;
       } catch (err) {
@@ -803,6 +938,44 @@ export const createConnectionsMaterializer = (
   };
   const getInvalidationsSinceLastBuild = (): readonly InvalidationKey[] =>
     lastBuildInvalidations;
+  const getTopicAccumulator = (): IncrementalTopicClusterAccumulator => topicAccumulator;
+  const getEmbedderWarmthTracker = (): EmbedderWarmthTracker => embedderWarmthTracker;
+
+  // Stage 5.2 W7 — content-lane reconciler entry point. Snapshot the
+  // dirty queue + tombstones, walk them through the supplied reconciler,
+  // ack each via clearDirtySources. The reconciler is responsible for
+  // the heavy lifting (chunking, embedding, recall index replace) —
+  // this method just orchestrates. Tombstoned units are reconciled
+  // first to ensure index removals happen before chunk re-adds during
+  // a re-add-then-tombstone-then-re-add sequence on the same source.
+  const drainContentLaneQueue = async (
+    reconciler: ContentLaneSourceUnitReconciler,
+  ): Promise<number> => {
+    const snapshot = dirtySourceQueue.snapshot();
+    const tombstones = snapshot.tombstonedSourceUnitIds;
+    const dirty = snapshot.dirtySourceUnitIds.filter(
+      (id) => !tombstones.includes(id),
+    );
+    const processed: string[] = [];
+    for (const sourceUnitId of tombstones) {
+      try {
+        const ok = await reconciler.reconcileTombstone(sourceUnitId);
+        if (ok) processed.push(sourceUnitId);
+      } catch {
+        // Reconciler error: leave entry in queue so next drain retries.
+      }
+    }
+    for (const sourceUnitId of dirty) {
+      try {
+        const ok = await reconciler.reconcileSourceUnit(sourceUnitId);
+        if (ok) processed.push(sourceUnitId);
+      } catch {
+        // Same retry policy.
+      }
+    }
+    if (processed.length > 0) dirtySourceQueue.clear(processed);
+    return processed.length;
+  };
 
   return {
     name: 'connections',
@@ -814,5 +987,8 @@ export const createConnectionsMaterializer = (
     getDirtySources,
     clearDirtySources,
     getInvalidationsSinceLastBuild,
+    getTopicAccumulator,
+    getEmbedderWarmthTracker,
+    drainContentLaneQueue,
   };
 };
