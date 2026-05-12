@@ -402,18 +402,36 @@ export const createConnectionsMaterializer = (
     });
 
   const buildAndWrite = async (): Promise<void> => {
+    const phaseLogs = process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] === '1';
+    const phaseStart = Date.now();
+    let phaseLast = phaseStart;
+    const mark = (label: string): void => {
+      if (!phaseLogs) return;
+      const now = Date.now();
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[connections-phase] ${label} dt=${String(now - phaseLast)}ms total=${String(now - phaseStart)}ms`,
+      );
+      phaseLast = now;
+    };
     const merged = await deps.eventLog.readMerged();
+    mark(`readMerged events=${String(merged.length)}`);
     const vault = await readVaultStores(deps.vaultRoot);
+    mark('readVaultStores');
     await yieldToEventLoop();
     const rawTimelineDays = buildTimelineDays(merged);
+    mark(`buildTimelineDays days=${String(rawTimelineDays.length)}`);
     await yieldToEventLoop();
     const engagementInputs = buildEngagementClassifierInputs(merged, rawTimelineDays);
     const engagementClassRevision = buildEngagementClassRevision(engagementInputs, {
       producedAt: maxAcceptedAtMs(merged),
     });
+    mark(`engagementClassifier inputs=${String(engagementInputs.length)}`);
     await engagementClassStore.putRevision(engagementClassRevision);
+    mark('engagementClassStore.putRevision');
     await yieldToEventLoop();
     const timelineDays = enrichTimelineDaysWithEngagement(rawTimelineDays, engagementInputs);
+    mark('enrichTimelineDays');
     await yieldToEventLoop();
     // Stage 5.2 W3 — skip-gate the most expensive pass. The revisionId
     // is a hash over (model + threshold + topK + gate + per-visit
@@ -426,13 +444,19 @@ export const createConnectionsMaterializer = (
       deps.vaultRoot,
       expectedSimilarityRevisionId,
     );
+    mark(
+      `similarity probe entries=${String(similarityEntries.length)} cacheHit=${String(cachedSimilarityRevision !== null)}`,
+    );
     const visitSimilarity =
       cachedSimilarityRevision ??
       (await buildVisitSimilarity(similarityEntries, deps.embed ?? defaultEmbed));
+    mark('buildVisitSimilarity');
     if (cachedSimilarityRevision === null) {
       await writeVisitSimilarityRevision(deps.vaultRoot, visitSimilarity);
+      mark('writeVisitSimilarityRevision');
     }
     const previousTopicRevision = await topicRevisionStore.readActiveRevision();
+    mark('readActiveTopicRevision');
     await yieldToEventLoop();
     // Stage 5.2 W4 — topic-revision skip-gate. The TopicRevision id is
     // derived from (visitSimilarityRevisionId + cosineThreshold +
@@ -453,8 +477,12 @@ export const createConnectionsMaterializer = (
             visitSimilarity,
             ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
           });
+    mark(
+      `buildSelectedTopicRevision cacheHit=${String(topicRevision === previousTopicRevision)}`,
+    );
     if (topicRevision !== previousTopicRevision) {
       await topicRevisionStore.putActiveRevision(topicRevision);
+      mark('putActiveTopicRevision');
     }
     await yieldToEventLoop();
     const input: ConnectionsInput = {
@@ -467,13 +495,39 @@ export const createConnectionsMaterializer = (
       topicRevision,
       engagementClassRevision,
     };
+    mark('projectTabSessions+projectUrls');
     await yieldToEventLoop();
     const baseSnapshot = buildConnectionsSnapshot(input);
+    mark(`buildConnectionsSnapshot base nodes=${String(baseSnapshot.nodes.length)} edges=${String(baseSnapshot.edges.length)}`);
+    // Stage 5.2 W3b — publish the base snapshot immediately so HTTP
+    // routes (and the side panel that reads them) have a valid current
+    // snapshot to serve. The ranker-augmented build below adds
+    // closest_visit edges; on a 5K-event vault that pass takes ~20s of
+    // synchronous CPU which would otherwise block HTTP. Publishing base
+    // first means HTTP is responsive within ~300ms; the ranker pass
+    // then overwrites the snapshot with the augmented version.
+    await deps.store.putCurrent(baseSnapshot);
+    mark('putCurrent baseSnapshot');
     await yieldToEventLoop();
     await rankerRetrainer({ merged, snapshot: baseSnapshot });
+    mark('rankerRetrainer');
+    // Stage 5.2 W3b/c — the ranker-augmented buildConnectionsSnapshot
+    // (pass 12: closest_visit top-K edges via LightGBM) is a 20+ second
+    // synchronous CPU block on a 5K-event vault. Until pass 12 is moved
+    // off the main thread (W1b-full worker_thread) or made incremental,
+    // gate the second snapshot build behind an opt-in env so the recorder
+    // and other HTTP-latency-sensitive consumers can suppress it. The
+    // base snapshot (already published above) still contains every node
+    // and all 14 deterministic edge kinds; only the predictive
+    // closest_visit edges are deferred.
+    if (process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'] === '1') {
+      mark('ranker-augmented skipped (SIDETRACK_SKIP_RANKER_SNAPSHOT=1)');
+      return;
+    }
     const closestVisitRanker = await loadClosestVisitRanker();
+    mark(`loadClosestVisitRanker ranker=${String(closestVisitRanker !== null)}`);
     if (closestVisitRanker === null) {
-      await deps.store.putCurrent(baseSnapshot);
+      // Base already published above.
       return;
     }
 
@@ -483,7 +537,9 @@ export const createConnectionsMaterializer = (
         ...input,
         closestVisitRanker: closestVisitRanker.ranker,
       });
+      mark(`buildConnectionsSnapshot ranker-augmented nodes=${String(snapshot.nodes.length)} edges=${String(snapshot.edges.length)}`);
       await deps.store.putCurrent(snapshot);
+      mark('putCurrent ranker-augmented');
     } finally {
       closestVisitRanker.model.dispose();
     }

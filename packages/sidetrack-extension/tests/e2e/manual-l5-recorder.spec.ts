@@ -211,11 +211,18 @@ const withTimeout = async <T>(
     ),
   ]);
 
+const apiTimeoutMs = (): number => {
+  const raw = process.env.SIDETRACK_E2E_API_TIMEOUT_MS;
+  if (raw === undefined || raw.length === 0) return 10_000;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 10_000;
+};
+
 const apiGet = async (comp: TestCompanion, requestPath: string): Promise<unknown> => {
   const controller = new AbortController();
   const timer = setTimeout(() => {
     controller.abort();
-  }, 10_000);
+  }, apiTimeoutMs());
   try {
     const res = await fetch(`http://127.0.0.1:${String(comp.port)}${requestPath}`, {
       headers: { 'x-bac-bridge-key': comp.bridgeKey },
@@ -237,7 +244,7 @@ const apiPost = async (
   const controller = new AbortController();
   const timer = setTimeout(() => {
     controller.abort();
-  }, 10_000);
+  }, apiTimeoutMs());
   try {
     const res = await fetch(`http://127.0.0.1:${String(comp.port)}${requestPath}`, {
       method: 'POST',
