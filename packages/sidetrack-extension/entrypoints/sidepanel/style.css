@@ -3450,6 +3450,11 @@ textarea.preview-body:focus {
 .icon-btn.pulsing {
   animation: icon-btn-pulse 4s ease-in-out infinite;
 }
+.icon-btn.warn {
+  color: #6b4500;
+  border-color: #d6a256;
+  background: #fff8ec;
+}
 /* Wider variant — used for the Auto/Manual capture-mode toggle.
    Carries an icon + a tiny uppercase mono label so the active mode
    reads at a glance without a tooltip. The grid layout switches to
@@ -4702,6 +4707,16 @@ input.thread-turn-annotate-input {
 .sp-status-pill.err {
   border-color: #b91c1c;
   color: #b91c1c;
+}
+.sp-status-pill.ok {
+  border-color: #5fa66f;
+  color: #166534;
+}
+.sp-status-pill-btn {
+  padding: 0 4px;
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
 }
 .sp-status-dot {
   width: 6px;

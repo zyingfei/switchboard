@@ -584,6 +584,15 @@ const App = () => {
   // "active workstream pill" intent). Keeps tab attribution and intent
   // independent so changing one doesn't accidentally change the other.
   const [tabSessionMoveId, setTabSessionMoveId] = useState<string | null>(null);
+  // Stage 5 polish — debug panel-state dump. Tracks the latest dump
+  // result so the icon button can flash a success/error chip with the
+  // file path the user can hand to an assistant.
+  const [dumpStatus, setDumpStatus] = useState<
+    | { readonly kind: 'idle' }
+    | { readonly kind: 'dumping' }
+    | { readonly kind: 'dumped'; readonly path: string }
+    | { readonly kind: 'error'; readonly message: string }
+  >({ kind: 'idle' });
   const [viewMode, setViewMode] = useState<'workstream' | 'all' | 'inbox' | 'connections'>(
     'workstream',
   );
@@ -2429,6 +2438,93 @@ const App = () => {
     reason: 'noise' | 'duplicate' | 'private' = 'noise',
   ) => {
     void runAction(() => ignoreUrl(canonicalUrl, reason));
+  };
+
+  // Stage 5 polish — "Dump panel state" button handler. Collects the
+  // panel's visible-to-debugging fields (focused tab, urlInbox slice,
+  // suggestions, view mode, companion status) and POSTs to the
+  // companion's /v1/debug/dump endpoint, which writes
+  // `${vaultRoot}/_BAC/debug-dumps/latest.json` (plus a timestamped
+  // copy). Falls back to clipboard if the companion is unreachable so
+  // the user always gets a usable artifact.
+  const handleDumpPanelState = () => {
+    setDumpStatus({ kind: 'dumping' });
+    const payload = {
+      viewMode,
+      companionStatus: state.companionStatus,
+      focused: {
+        canonicalUrl: focusedUrlRecord?.canonicalUrl,
+        record: focusedUrlRecord,
+        suggestion: focusedTabSuggestion,
+      },
+      urlInbox: {
+        total: urlInbox.total,
+        items: urlInbox.items.slice(0, 20),
+      },
+      urlSuggestions: Object.fromEntries(
+        Object.entries(urlSuggestions).slice(0, 50),
+      ),
+      workstreams: state.workstreams.map((w) => ({
+        bac_id: w.bac_id,
+        title: w.title,
+        parentId: w.parentId ?? null,
+        privacy: w.privacy,
+      })),
+      threadsLight: state.threads.map((t) => ({
+        bac_id: t.bac_id,
+        title: t.title,
+        provider: t.provider,
+        primaryWorkstreamId: t.primaryWorkstreamId ?? null,
+        status: t.status,
+        lastSeenAt: t.lastSeenAt,
+      })),
+      tabSessionMoveId,
+      activeTabUrl: state.activeTabUrl ?? null,
+      activeTabSessionId: state.activeTabSessionId ?? null,
+      capturedAt: new Date().toISOString(),
+    };
+    void (async () => {
+      try {
+        if (port.length === 0 || bridgeKey.length === 0) {
+          throw new Error('Companion not configured');
+        }
+        const response = await fetch(`http://127.0.0.1:${port}/v1/debug/dump`, {
+          method: 'POST',
+          headers: {
+            'x-bac-bridge-key': bridgeKey,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${String(response.status)}`);
+        }
+        const body = (await response.json()) as { readonly data?: { readonly path?: string } };
+        const path = body.data?.path;
+        if (typeof path !== 'string' || path.length === 0) {
+          throw new Error('No path returned');
+        }
+        setDumpStatus({ kind: 'dumped', path });
+      } catch (error) {
+        // Clipboard fallback so the user always walks away with the dump.
+        try {
+          await navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
+          setDumpStatus({
+            kind: 'error',
+            message: `Companion unreachable — copied to clipboard instead (${
+              error instanceof Error ? error.message : String(error)
+            })`,
+          });
+        } catch (clipError) {
+          setDumpStatus({
+            kind: 'error',
+            message: `Dump failed: ${error instanceof Error ? error.message : String(error)} / clipboard: ${
+              clipError instanceof Error ? clipError.message : String(clipError)
+            }`,
+          });
+        }
+      }
+    })();
   };
 
   const handleMoveTarget = (target: WorkstreamOption | { readonly create: string }) => {
@@ -4975,6 +5071,43 @@ const App = () => {
               <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
             </svg>
           </button>
+          {/* Stage 5 polish — "Dump panel state" button. POSTs every
+              user-facing piece of panel state to the companion, which
+              writes `${vault}/_BAC/debug-dumps/latest.json`. The user
+              hands me the path and I read it instead of asking for
+              another screenshot. */}
+          <button
+            className={
+              'icon-btn' +
+              (dumpStatus.kind === 'dumping' ? ' pulsing' : '') +
+              (dumpStatus.kind === 'dumped' ? ' on' : '') +
+              (dumpStatus.kind === 'error' ? ' warn' : '')
+            }
+            title={
+              dumpStatus.kind === 'dumped'
+                ? `Dumped: ${dumpStatus.path} — click again to refresh`
+                : dumpStatus.kind === 'error'
+                  ? dumpStatus.message
+                  : 'Dump panel state to a JSON file for review'
+            }
+            onClick={handleDumpPanelState}
+            type="button"
+            aria-label="Dump panel state"
+            data-testid="dump-panel-state"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="7 10 12 15 17 10" />
+              <line x1="12" y1="15" x2="12" y2="3" />
+            </svg>
+          </button>
           {/* Design preview — always-on for now (was gated by __DEV__).
               Re-gate once the surfaces it shows are wired into
               production rendering. */}
@@ -5101,6 +5234,61 @@ const App = () => {
               aria-hidden
             />
             recall {recallStatus === 'rebuilding' ? 'indexing' : recallStatus}
+          </span>
+        ) : null}
+        {/* Dump-state result chip. Click "copy" to put the absolute
+            path on the clipboard, "open" to ask the OS to reveal the
+            file. Errors stay in the same chip so the user doesn't have
+            to hunt for them. */}
+        {dumpStatus.kind === 'dumped' ? (
+          <span
+            className="sp-status-pill mono ok"
+            title={`Dump written to ${dumpStatus.path} — click "copy" for the path`}
+            data-testid="dump-result"
+          >
+            <span className="sp-status-dot green" aria-hidden />
+            dumped
+            <button
+              type="button"
+              className="btn-link sp-status-pill-btn"
+              onClick={() => {
+                void navigator.clipboard.writeText(dumpStatus.path);
+              }}
+              title="Copy path to clipboard"
+            >
+              copy
+            </button>
+            <button
+              type="button"
+              className="btn-link sp-status-pill-btn"
+              onClick={() => {
+                setDumpStatus({ kind: 'idle' });
+              }}
+              title="Dismiss"
+              aria-label="Dismiss dump notice"
+            >
+              ✕
+            </button>
+          </span>
+        ) : dumpStatus.kind === 'error' ? (
+          <span
+            className="sp-status-pill mono warn"
+            title={dumpStatus.message}
+            data-testid="dump-result"
+          >
+            <span className="sp-status-dot amber" aria-hidden />
+            dump → clipboard fallback
+            <button
+              type="button"
+              className="btn-link sp-status-pill-btn"
+              onClick={() => {
+                setDumpStatus({ kind: 'idle' });
+              }}
+              title="Dismiss"
+              aria-label="Dismiss dump notice"
+            >
+              ✕
+            </button>
           </span>
         ) : null}
       </div>

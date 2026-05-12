@@ -2786,4 +2786,36 @@ describe('companion HTTP server', () => {
       'detached',
     );
   });
+
+  it('writes a debug dump to vault and returns the stable latest path', async () => {
+    const result = await jsonFetch(context, `${baseUrl}/v1/debug/dump`, {
+      method: 'POST',
+      headers: { 'x-bac-bridge-key': bridgeKey, 'content-type': 'application/json' },
+      body: JSON.stringify({ view: 'inbox', urlInbox: { items: [], total: 0 } }),
+    });
+    expect(result.status).toBe(201);
+    const body = result.body as {
+      readonly data: {
+        readonly path: string;
+        readonly stampedPath: string;
+        readonly sizeBytes: number;
+      };
+    };
+    expect(body.data.path).toBe(join(vaultPath, '_BAC', 'debug-dumps', 'latest.json'));
+    expect(body.data.stampedPath.startsWith(join(vaultPath, '_BAC', 'debug-dumps', ''))).toBe(true);
+    expect(body.data.stampedPath.endsWith('.json')).toBe(true);
+    expect(body.data.sizeBytes).toBeGreaterThan(0);
+    const written = JSON.parse(await readFile(body.data.path, 'utf8')) as {
+      readonly header: { readonly vaultRoot: string };
+      readonly panel: { readonly view: string };
+    };
+    expect(written.header.vaultRoot).toBe(vaultPath);
+    expect(written.panel.view).toBe('inbox');
+    // Stamped copy contains the same payload — proves we wrote both
+    // files in a single round trip.
+    const stamped = JSON.parse(await readFile(body.data.stampedPath, 'utf8')) as {
+      readonly panel: { readonly view: string };
+    };
+    expect(stamped.panel.view).toBe('inbox');
+  });
 });

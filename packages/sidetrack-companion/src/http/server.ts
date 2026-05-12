@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { access, readFile, readdir, stat } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { buildAnchorFromTerm } from '../annotation/anchorBuilder.js';
@@ -4861,6 +4861,48 @@ const routes: readonly RouteDefinition[] = [
       const { findPath } = await import('../connections/snapshot.js');
       const result = findPath(snap, fromNodeId, toNodeId, maxHops);
       return [200, { data: result }];
+    },
+  },
+  // Stage 5 polish — debug snapshot endpoint. The side panel collects
+  // current visual state (focused tab, urlInbox, urlSuggestions, panel
+  // settings) and POSTs the JSON blob here. We always overwrite
+  // `${vaultRoot}/_BAC/debug-dumps/latest.json` so the user (and any
+  // assistant they hand the path to) can read a single stable location
+  // without tracking timestamps; the timestamped copy under the same
+  // directory is kept for short-history scrubbing.
+  {
+    method: 'POST',
+    pattern: /^\/v1\/debug\/dump$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      const body = await readBody(request);
+      const dumpsDir = join(vaultRoot, '_BAC', 'debug-dumps');
+      await mkdir(dumpsDir, { recursive: true });
+      // Use an ISO timestamp + millisecond suffix so rapid-fire dumps
+      // don't collide. Colons are valid on macOS / Linux but APFS
+      // displays them oddly in Finder — strip to a safe pattern.
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      const stamped = join(dumpsDir, `${ts}.json`);
+      const latest = join(dumpsDir, 'latest.json');
+      // Wrap the panel-supplied payload alongside a server-side header
+      // (timestamp + companion uptime + vaultRoot) so the dump is
+      // self-contained for offline review.
+      const wrapped = {
+        header: {
+          dumpedAt: new Date().toISOString(),
+          vaultRoot,
+          companion: 'sidetrack-companion',
+        },
+        panel: body,
+      };
+      const json = JSON.stringify(wrapped, null, 2);
+      await writeFile(stamped, json, 'utf8');
+      await writeFile(latest, json, 'utf8');
+      return [
+        201,
+        { data: { path: latest, stampedPath: stamped, sizeBytes: Buffer.byteLength(json, 'utf8') } },
+      ];
     },
   },
 ];
