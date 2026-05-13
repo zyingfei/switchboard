@@ -26,6 +26,17 @@ if (typeof process.send !== 'function') {
   process.exit(1);
 }
 
+// CRITICAL: break the fork-bomb. The CHILD env flag is inherited via
+// process.env when the parent forks us; if we leave it set, the
+// materializer we create below will see it and spawn ANOTHER child,
+// which will spawn another, and so on. The isMainThread guard only
+// blocks worker_threads recursion — child_process forks are their
+// own main thread. Force the in-process path inside the child so the
+// materializer we run here runs locally, not in a grandchild.
+delete process.env['SIDETRACK_CONNECTIONS_CHILD'];
+delete process.env['SIDETRACK_CONNECTIONS_WORKER'];
+process.env['SIDETRACK_CONNECTIONS_INPROCESS'] = '1';
+
 interface ReconcileMessage {
   readonly kind: 'reconcile';
   readonly vaultRoot: string;

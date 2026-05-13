@@ -1028,9 +1028,17 @@ export const createConnectionsMaterializer = (
   //      spawn cost per pass. Negligible vs. the 30s+ rebuilds the
   //      worker is replacing.
   const shouldUseWorker = (): boolean => {
+    // isMainThread blocks worker_threads recursion.
     if (!isMainThread) return false;
-    // Explicit in-process override wins (used by unit + e2e tests that
-    // need to assert against in-process accumulator state).
+    // Defense-in-depth against child_process recursion. If this
+    // process has an IPC channel to a parent (i.e. it was launched
+    // via fork()), refuse to spawn another subprocess. The child
+    // entry script also clears the env explicitly; this guard is a
+    // belt-and-suspenders second line so future callers that miss
+    // the env reset don't accidentally spawn a fork bomb.
+    if (typeof process.send === 'function') return false;
+    // Explicit in-process override wins (used by unit + e2e tests
+    // that need to assert against in-process accumulator state).
     if (process.env['SIDETRACK_CONNECTIONS_INPROCESS'] === '1') return false;
     // Either subprocess flavour qualifies. The child_process flavour is
     // the default; the worker_thread flavour is opt-in via WORKER=1.
