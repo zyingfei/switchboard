@@ -82,7 +82,15 @@ export const startRelayServer = async (
   const maxBufferBytes = options.maxBufferBytes ?? 100 * 1024 * 1024;
   const maxBufferAgeMs = options.maxBufferAgeMs ?? 24 * 60 * 60 * 1000;
   const maxEventBytes = options.maxEventBytes ?? 256 * 1024;
-  const ratePerHour = options.ratePerHour ?? 1_000;
+  // Rate limit guards against runaway publishers (compromised key,
+  // bug-storming sender). It is per-rendezvous, so legitimate two-
+  // browser sync shares the budget. Active browsing emits ~10–30
+  // events/sec across local events + engagement intervals + auto-apply
+  // inferences, so 1000/hr starves cross-replica sync within minutes:
+  // we observed Browser B receiving 10/990 peer events before the cap
+  // dropped the rest. Bump to 200k/hr (~55/sec) so a normal session
+  // does not bump into the gate while still catching a stuck loop.
+  const ratePerHour = options.ratePerHour ?? 200_000;
   const serverVersion = options.serverVersion ?? '0.0.0';
   const now = options.now ?? Date.now;
 

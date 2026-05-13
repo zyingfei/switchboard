@@ -101,6 +101,22 @@ export const autoApplyTabSessionAttribution = async (
     };
   }
 
+  // Idempotency: when the existing inferred attribution already points
+  // to the same workstream, re-emitting only varies the dependencyKey
+  // in clientEventId and produces a byte-different but semantically
+  // identical event. Same feedback loop as `urls/autoApply.ts`.
+  if (
+    existing !== undefined &&
+    existing.source === 'inferred' &&
+    existing.workstreamId === payload.workstreamId
+  ) {
+    return {
+      status: 'skipped-existing-attribution',
+      resolution,
+      projection: beforeProjection,
+    };
+  }
+
   const aggregateId = aggregateIdForInferredAttribution(input.tabSessionId);
   const accepted = await input.eventLog.appendServerObserved({
     clientEventId: clientEventIdForResolution(resolution),
