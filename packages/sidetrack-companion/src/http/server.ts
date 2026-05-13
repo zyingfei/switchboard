@@ -4507,32 +4507,24 @@ const routes: readonly RouteDefinition[] = [
           'Body must be { events: AcceptedEvent[] }.',
         );
       }
-      const ACCEPTED_EDGE_EVENT_TYPES = new Set<string>([
-        ENGAGEMENT_INTERVAL_OBSERVED,
-        ENGAGEMENT_SESSION_AGGREGATED,
-        SELECTION_COPIED,
-        SELECTION_PASTED,
-        VISUAL_FINGERPRINT_OBSERVED,
-        NAVIGATION_COMMITTED,
+      // Single source of truth for what `/v1/edge/events` accepts.
+      // Previously a parallel `ACCEPTED_EDGE_EVENT_TYPES` Set plus a
+      // `validatePayload` switch could drift (each new event type
+      // needed two synchronized edits — that's how navigation.committed
+      // shipped without a validator entry). One Map; adding a type
+      // means one entry, period.
+      const EDGE_EVENT_VALIDATORS = new Map<string, (payload: unknown) => boolean>([
+        [ENGAGEMENT_INTERVAL_OBSERVED, isEngagementIntervalObservedPayload],
+        [ENGAGEMENT_SESSION_AGGREGATED, isEngagementSessionAggregatedPayload],
+        [SELECTION_COPIED, isSelectionCopiedPayload],
+        [SELECTION_PASTED, isSelectionPastedPayload],
+        [VISUAL_FINGERPRINT_OBSERVED, isVisualFingerprintObservedPayload],
+        [NAVIGATION_COMMITTED, isNavigationCommittedPayload],
       ]);
-      const validatePayload = (type: string, payload: unknown): boolean => {
-        switch (type) {
-          case ENGAGEMENT_INTERVAL_OBSERVED:
-            return isEngagementIntervalObservedPayload(payload);
-          case ENGAGEMENT_SESSION_AGGREGATED:
-            return isEngagementSessionAggregatedPayload(payload);
-          case SELECTION_COPIED:
-            return isSelectionCopiedPayload(payload);
-          case SELECTION_PASTED:
-            return isSelectionPastedPayload(payload);
-          case VISUAL_FINGERPRINT_OBSERVED:
-            return isVisualFingerprintObservedPayload(payload);
-          case NAVIGATION_COMMITTED:
-            return isNavigationCommittedPayload(payload);
-          default:
-            return false;
-        }
-      };
+      const isAcceptedEdgeEventType = (type: string): boolean =>
+        EDGE_EVENT_VALIDATORS.has(type);
+      const validatePayload = (type: string, payload: unknown): boolean =>
+        EDGE_EVENT_VALIDATORS.get(type)?.(payload) ?? false;
       const imported: { replicaId: string; seq: number }[] = [];
       const skipped: { replicaId: string; seq: number; reason: string }[] = [];
       for (const candidate of body.events) {
@@ -4546,7 +4538,7 @@ const routes: readonly RouteDefinition[] = [
           continue;
         }
         const event = candidate as import('../sync/causal.js').AcceptedEvent;
-        if (!ACCEPTED_EDGE_EVENT_TYPES.has(event.type)) {
+        if (!isAcceptedEdgeEventType(event.type)) {
           skipped.push({
             replicaId: event.dot.replicaId,
             seq: event.dot.seq,

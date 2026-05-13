@@ -267,6 +267,26 @@ export const NODE_KIND_DISPLAY: Record<
   template: { label: 'Template', tintClass: 'cx-type-template' },
 };
 
+// `types.ts` keeps `ConnectionNodeKind` loose intentionally ("the
+// companion is the source of truth; the side panel reads what's on
+// the wire and renders it"). That means a new companion kind can
+// reach the panel before this map is updated, and a direct lookup
+// `NODE_KIND_DISPLAY[kind]` would crash with `undefined`. Use this
+// helper everywhere so the panel degrades to "Unknown" + a neutral
+// tint instead of breaking the whole view.
+const UNKNOWN_NODE_KIND_DISPLAY = {
+  label: 'Unknown',
+  tintClass: 'cx-type-unknown',
+} as const;
+
+export const nodeKindDisplayFor = (
+  kind: string,
+): { readonly label: string; readonly tintClass: string } => {
+  const direct = (NODE_KIND_DISPLAY as Record<string, { label: string; tintClass: string }>)[kind];
+  if (direct !== undefined) return direct;
+  return UNKNOWN_NODE_KIND_DISPLAY;
+};
+
 // Display order for kind groups in the linked-panels center column.
 // Workstream first (most "containing"), thread second (most common),
 // then evidence kinds (visit / annotation / queue / reminder).

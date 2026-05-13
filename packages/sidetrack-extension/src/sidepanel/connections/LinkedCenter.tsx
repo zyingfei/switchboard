@@ -3,9 +3,9 @@ import type { ReactElement } from 'react';
 import { formatNodeIdDisplay, type EntityDisplayCtx } from '../entityDisplay/format';
 import {
   EDGE_KINDS,
-  NODE_KIND_DISPLAY,
   NODE_KIND_GROUP_ORDER,
   contentDerivedHint,
+  nodeKindDisplayFor,
   type EdgeFamily,
 } from './edgeKinds';
 import { KindIcons } from './icons';
@@ -121,7 +121,7 @@ export const LinkedCenter = ({
         <div className="cx-mono cx-dim cx-note">{result.note}</div>
       ) : null}
       {orderedKinds.map((kind) => {
-        const display = NODE_KIND_DISPLAY[kind];
+        const display = nodeKindDisplayFor(kind);
         const nodes = groups.get(kind) ?? [];
         const plural = nodes.length === 1 ? display.label : `${display.label}s`;
         return (

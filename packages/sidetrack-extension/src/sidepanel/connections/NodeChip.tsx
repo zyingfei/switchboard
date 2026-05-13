@@ -1,7 +1,7 @@
 import type { ReactElement } from 'react';
 
 import { formatEntityDisplay, type EntityDisplayCtx } from '../entityDisplay/format';
-import { NODE_KIND_DISPLAY } from './edgeKinds';
+import { nodeKindDisplayFor } from './edgeKinds';
 import { KindIcons } from './icons';
 import type { ConnectionNode } from './types';
 
@@ -21,7 +21,7 @@ export const NodeChip = ({
   readonly size?: 'md' | 'lg';
   readonly ctx: EntityDisplayCtx;
 }): ReactElement => {
-  const display = NODE_KIND_DISPLAY[node.kind];
+  const display = nodeKindDisplayFor(node.kind);
   const entity = formatEntityDisplay(node, ctx);
   const cls =
     `cx-node ${display.tintClass}` +

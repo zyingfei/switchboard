@@ -1,9 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import {
-  ACCEPTED_EDGE_EVENT_STREAM_NAMES,
-  partitionEdgeEventDrainBatch,
-} from '../../../../src/background/storage/edge-event-drain';
+import { partitionEdgeEventDrainBatch } from '../../../../src/background/storage/edge-event-drain';
 import {
   InMemoryEventBuffer,
   type BufferedEvent,
@@ -85,13 +82,14 @@ describe('navigation.committed end-to-end seam', () => {
     const buffered = await buffer.peek(10);
     expect(buffered.map((e) => e.streamName)).toEqual([NAVIGATION_COMMITTED]);
 
-    // The production whitelist must route the listener-emitted event.
-    // This is the assertion that would have caught the original bug —
-    // it fails the instant a listener writes an event type the drain
-    // doesn't recognize.
+    // The drain no longer filters by stream name (the companion is
+    // the sole gatekeeper). The contract this test pins: whatever
+    // the listener writes makes it into the routeBatch and gets
+    // uploaded. If a future commit reintroduces a local whitelist
+    // that doesn't include navigation.committed, this assertion fails
+    // — same protection as before, simpler mechanism.
     const partition = partitionEdgeEventDrainBatch(
       buffered as readonly BufferedEvent[],
-      ACCEPTED_EDGE_EVENT_STREAM_NAMES,
       10,
     );
     expect(partition.routeBatch.map((e) => e.streamName)).toEqual([NAVIGATION_COMMITTED]);
@@ -121,17 +119,4 @@ describe('navigation.committed end-to-end seam', () => {
     expect(isNavigationCommittedPayload(payload)).toBe(true);
   });
 
-  it('every production whitelist entry has a matching EventStreamName (no orphans)', () => {
-    // Locks in the policy file. If anyone adds a new event type to
-    // EVENT_STREAMS without deciding routing, this list is the first
-    // place they read.
-    expect([...ACCEPTED_EDGE_EVENT_STREAM_NAMES].sort()).toEqual([
-      'engagement.interval.observed',
-      'engagement.session.aggregated',
-      'navigation.committed',
-      'selection.copied',
-      'selection.pasted',
-      'visual.fingerprint.observed',
-    ]);
-  });
 });

@@ -1,7 +1,7 @@
 import { useState, type ReactElement } from 'react';
 
 import { formatEntityDisplay, type EntityDisplayCtx } from '../entityDisplay/format';
-import { EDGE_KINDS, NODE_KIND_DISPLAY } from './edgeKinds';
+import { EDGE_KINDS, nodeKindDisplayFor } from './edgeKinds';
 import { KindIcons } from './icons';
 import { ReplicaDots } from './ReplicaDots';
 import type { ConnectionEdge, ConnectionNode } from './types';
@@ -59,7 +59,7 @@ export const NodeRow = ({
   const canOpenTab = onOpenUrl !== undefined && openUrl !== undefined && openUrl.length > 0;
   const [promoting, setPromoting] = useState<boolean>(false);
   const [promoteStatus, setPromoteStatus] = useState<'saved' | 'error' | null>(null);
-  const display = NODE_KIND_DISPLAY[node.kind];
+  const display = nodeKindDisplayFor(node.kind);
   const entity = formatEntityDisplay(node, ctx);
   const meta = edge !== null ? EDGE_KINDS[edge.kind] : null;
   const cls = `cx-row ${display.tintClass} ${selected ? 'is-selected' : ''}`;

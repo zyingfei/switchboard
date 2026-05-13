@@ -57,7 +57,6 @@ import {
 } from '../src/background/listeners/tabs';
 import { registerDefaultWebNavigationListeners } from '../src/background/listeners/web-navigation';
 import {
-  ACCEPTED_EDGE_EVENT_STREAM_NAMES,
   createEdgeEventDrainSingleFlight,
   partitionEdgeEventDrainBatch,
   summarizeEdgeEventDrain,
@@ -3151,7 +3150,6 @@ export default defineBackground(() => {
     return `${event.streamName}:${event.observedAt.slice(0, 10)}`;
   };
 
-  const acceptedEdgeEventStreamNames = ACCEPTED_EDGE_EVENT_STREAM_NAMES;
   const EDGE_EVENT_DRAIN_ROUTE_BATCH_SIZE = 10;
   const EDGE_EVENT_DRAIN_SCAN_BATCH_SIZE = 500;
   const EDGE_EVENT_DRAIN_DEFAULT_MAX_BATCHES = 1;
@@ -3218,15 +3216,9 @@ export default defineBackground(() => {
       locallyRejectedBatch,
       evictedByType: localEvictedByType,
       skippedByReason: localSkippedByReason,
-    } = partitionEdgeEventDrainBatch(
-      batch,
-      acceptedEdgeEventStreamNames,
-      EDGE_EVENT_DRAIN_ROUTE_BATCH_SIZE,
-    );
-    const locallyEvicted =
-      locallyRejectedBatch.length === 0
-        ? 0
-        : await engagementEventBuffer.deleteMany(locallyRejectedBatch);
+    } = partitionEdgeEventDrainBatch(batch, EDGE_EVENT_DRAIN_ROUTE_BATCH_SIZE);
+    const locallyEvicted = 0;
+    void locallyRejectedBatch; // always empty post-2026-05; kept for ABI
     if (routeBatch.length === 0) {
       return {
         uploaded: 0,

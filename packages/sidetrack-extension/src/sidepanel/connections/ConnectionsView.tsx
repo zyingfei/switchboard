@@ -10,7 +10,7 @@ import {
   postUserTopicRenamed,
   type UserFlowRelationKind,
 } from './client';
-import { NODE_KIND_DISPLAY } from './edgeKinds';
+import { nodeKindDisplayFor } from './edgeKinds';
 import { FamilyLegend } from './FamilyLegend';
 import {
   FlowPathView,
@@ -1413,13 +1413,13 @@ export const ConnectionsView = ({
                     data-testid={`recent-anchor-${r.id}`}
                   >
                     <span
-                      className={`cx-node-icon ${NODE_KIND_DISPLAY[r.kind].tintClass}`}
+                      className={`cx-node-icon ${nodeKindDisplayFor(r.kind).tintClass}`}
                       aria-hidden
                     >
                       {KindIcons[r.kind]}
                     </span>
                     <span className="cx-recent-anchor-label">{r.label}</span>
-                    <span className="cx-recent-meta">{NODE_KIND_DISPLAY[r.kind].label}</span>
+                    <span className="cx-recent-meta">{nodeKindDisplayFor(r.kind).label}</span>
                   </button>
                 ))}
               </div>
