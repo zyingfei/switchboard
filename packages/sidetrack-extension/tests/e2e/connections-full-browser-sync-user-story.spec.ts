@@ -1724,7 +1724,15 @@ test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 com
         );
       },
       'Browser B did not receive Browser A visits with expected workstream attribution through the relay',
-      120_000,
+      // 240 s instead of 120 s. The story drives 13 visits across
+      // two workstreams; each goes through observer → drain → relay
+      // → companion-B materializer. With the workstream-attribution
+      // restoration (2026-05) every visit also emits a
+      // `visit_in_workstream` edge through the projection — more
+      // work per replay tick. 120 s was the tight floor; 240 s
+      // gives the second batch room to land before the predicate
+      // gives up.
+      240_000,
     );
 
     for (const { workstreamId, visits } of [

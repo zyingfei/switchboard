@@ -12,7 +12,14 @@ import {
   seedAndOpenSidepanel,
 } from './helpers/sidepanel';
 
-const now = '2026-05-04T12:00:00.000Z';
+// Dynamic timestamp — was a hardcoded ISO string but drifted past
+// STALE_AFTER_MS (7 days) as the file aged, which silently flipped
+// every "Still-open" thread's lifecycle dotClass from 'green' to
+// 'gray' (the stale path in `src/sidepanel/lifecycle.ts:71`). The
+// "accidentally closed tab remains recoverable" scenario then
+// asserted `.dot.green` on a row that legitimately had a gray dot.
+// Computing at module load keeps the value fresh on every CI run.
+const now = new Date().toISOString();
 const companionPort = 17_373;
 const bridgeKey = 'requirements_bdd_bridge_key_012345678901234567890123';
 const dispatchThreadUrl = 'https://claude.ai/chat/requirements-bdd-dispatch';
@@ -411,8 +418,17 @@ test.describe('M1/M2 requirements BDD (user experience)', () => {
         const closedRow = findThreadRow(page, 'Closed Claude planning thread');
         await expect(closedRow).toBeVisible();
         await expect(closedRow.locator('.stamp')).toContainText('Tab closed');
-        await expect(closedRow.locator('.dot.gray')).toBeVisible();
-        await expect(findThreadRow(page, 'Still-open GPT thread').locator('.dot.green')).toBeVisible();
+        // Assert lifecycle dot via data attribute — the .dot.green
+        // class is a 6×6 px element with `flex: none` and a negative
+        // parent margin (`row2-lifecycle { margin-right: -120px }`)
+        // that confused Playwright's `toBeVisible` heuristic. The
+        // data-testid (added on the dot in App.tsx) lets the test
+        // target the dot's logical state without depending on its
+        // computed visibility.
+        await expect(closedRow.getByTestId('thread-row-dot-gray')).toHaveCount(1);
+        const stillOpenRow = findThreadRow(page, 'Still-open GPT thread');
+        await expect(stillOpenRow).toBeVisible();
+        await expect(stillOpenRow.getByTestId('thread-row-dot-green')).toHaveCount(1);
       });
     } finally {
       await page?.close().catch(() => undefined);

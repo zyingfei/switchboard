@@ -3982,7 +3982,11 @@ const App = () => {
           ) : null}
         </div>
         <div className="row2 row2-lifecycle">
-          <span className={'dot ' + dotClass} />
+          <span
+            className={'dot ' + dotClass}
+            data-testid={`thread-row-dot-${dotClass}`}
+            data-dot-class={dotClass}
+          />
           <span className="stamp">{stamp}</span>
           {/* Per spec: dot + stamp already convey lifecycle. The
               lifecycle pill is redundant for unread / waiting /
