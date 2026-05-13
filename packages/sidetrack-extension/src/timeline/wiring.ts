@@ -597,6 +597,9 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
       ...(tabSession.openerTabSessionId === undefined
         ? {}
         : { openerTabSessionId: tabSession.openerTabSessionId }),
+      ...(cachedActiveWorkstreamId === undefined
+        ? {}
+        : { workstreamId: cachedActiveWorkstreamId }),
     });
   };
 
@@ -647,6 +650,9 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
               ...(input.openerTabSessionId === undefined
                 ? {}
                 : { openerTabSessionId: input.openerTabSessionId }),
+              ...(cachedActiveWorkstreamId === undefined
+                ? {}
+                : { workstreamId: cachedActiveWorkstreamId }),
             });
           } catch {
             // chrome.scripting may fail on host_permissions denial — silent.
@@ -719,6 +725,9 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
           ...(tabSession.openerTabSessionId === undefined
             ? {}
             : { openerTabSessionId: tabSession.openerTabSessionId }),
+          ...(cachedActiveWorkstreamId === undefined
+            ? {}
+            : { workstreamId: cachedActiveWorkstreamId }),
         });
       } catch {
         // Tab might be gone by the time we look up — silent.
@@ -816,6 +825,9 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
         ...(tabSession.openerTabSessionId === undefined
           ? {}
           : { openerTabSessionId: tabSession.openerTabSessionId }),
+        ...(cachedActiveWorkstreamId === undefined
+          ? {}
+          : { workstreamId: cachedActiveWorkstreamId }),
       });
       // Stealth Chromium / patchright sometimes doesn't propagate
       // document.title back through `tab.title`, so the URL-as-title

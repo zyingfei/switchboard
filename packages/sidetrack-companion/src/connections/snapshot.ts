@@ -1160,6 +1160,34 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
               }),
         },
       });
+      // 2026-05 fix: emit the `visit_in_workstream` edge that the
+      // ranker, similarity producer, and tab-session resolver all
+      // consume but no companion code was producing. The original
+      // intent (see `timeline/events.ts` "Phase 2 restores
+      // visit_in_workstream") was to restore it via explicit
+      // tab-session attribution — that path never landed, leaving
+      // every consumer staring at empty arrays. The extension now
+      // stamps `workstreamId` on every timeline event (via the
+      // active-workstream cache in `timeline/wiring.ts`), so the
+      // projection's `entry.workstreamId` is populated for ambient
+      // browsing inside a focused workstream. Emit one edge per
+      // (visit, workstream) pair so the snapshot reflects the
+      // attribution.
+      if (entry.workstreamId !== undefined && entry.workstreamId.length > 0) {
+        upsertNode(nodes, {
+          kind: 'workstream',
+          key: entry.workstreamId,
+          label: entry.workstreamId,
+        });
+        upsertEdge(edges, {
+          kind: 'visit_in_workstream',
+          fromNodeId: nodeIdFor('timeline-visit', visitKey),
+          toNodeId: nodeIdFor('workstream', entry.workstreamId),
+          observedAt: entry.lastSeenAt,
+          producedBy: { source: 'timeline-projection' },
+          confidence: 'observed',
+        });
+      }
       const threadId = threadIdByUrl.get(visitKey);
       if (threadId !== undefined) {
         const thread = threadByBacId.get(threadId);

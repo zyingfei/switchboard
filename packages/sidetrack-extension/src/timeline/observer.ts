@@ -85,6 +85,13 @@ export interface ObserveInput {
   readonly transition: TimelineTransition;
   readonly tabSessionId?: string;
   readonly openerTabSessionId?: string;
+  // 2026-05 fix: the active-workstream pointer at observation time.
+  // Stamped on every emitted payload so the companion's projection
+  // can roll it onto the TimelineEntry → snapshot's timeline-visit
+  // node metadata → `visit_in_workstream` edge. This is the ambient
+  // attribution path used when no Class A user assertion exists for
+  // a URL (the user is just browsing inside a focused workstream).
+  readonly workstreamId?: string;
 }
 
 export interface CloseInput {
@@ -298,6 +305,9 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
         ...(input.openerTabSessionId === undefined
           ? {}
           : { openerTabSessionId: input.openerTabSessionId }),
+        ...(input.workstreamId === undefined || input.workstreamId.length === 0
+          ? {}
+          : { workstreamId: input.workstreamId }),
       };
       emitCalls += 1;
       lastDecision = {
@@ -346,6 +356,9 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
       ...(input.openerTabSessionId === undefined
         ? {}
         : { openerTabSessionId: input.openerTabSessionId }),
+      ...(input.workstreamId === undefined || input.workstreamId.length === 0
+        ? {}
+        : { workstreamId: input.workstreamId }),
     };
     emitCalls += 1;
     lastDecision = {

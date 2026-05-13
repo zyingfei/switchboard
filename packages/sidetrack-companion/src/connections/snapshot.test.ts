@@ -1340,7 +1340,14 @@ describe('connections — content-derived edges', () => {
       entryCount: 2,
     };
     const snap = buildConnectionsSnapshot(emptyInput({ timelineDays: [day] }));
-    expect(snap.edges.some((e) => e.kind === 'visit_in_workstream')).toBe(false);
+    // 2026-05 fix: visit_in_workstream is now emitted from
+    // `entry.workstreamId` (the timeline observer stamps it again).
+    // The earlier assertion expected zero edges because the
+    // "Phase 2 restore" comment in `timeline/events.ts` said the
+    // edge would come from explicit tab-session attribution — that
+    // path never landed, leaving the edge absent and breaking every
+    // downstream consumer (ranker, similarity, resolver). Restored.
+    expect(snap.edges.some((e) => e.kind === 'visit_in_workstream')).toBe(true);
     expect(snap.nodes.some((n) => n.id === nodeIdFor('tab-session', 'tses_child'))).toBe(true);
     expect(snap.nodes.some((n) => n.id === nodeIdFor('tab-session', 'tses_parent'))).toBe(true);
     const visitEdges = snap.edges.filter((e) => e.kind === 'visit_instance_in_tab_session');
