@@ -8175,6 +8175,10 @@ pre.diff {
   margin-right: 4px;
   flex-wrap: wrap;
   gap: 2px;
+  /* Override `.cx-pill-group { overflow: hidden }` so the calendar
+     popover anchored to this container can extend below it instead
+     of being clipped (root cause of "Custom… does nothing"). */
+  overflow: visible;
 }
 .cx-timerange-hidden {
   margin-left: 4px;
@@ -8460,9 +8464,36 @@ pre.diff {
 }
 .cx-flow-visit-cell {
   display: flex;
-  align-items: center;
+  align-items: stretch;
   gap: 4px;
 }
+.cx-flow-visit-wrap {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+.cx-flow-visit-open {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  background: var(--paper-light);
+  color: var(--ink-2);
+  font-size: 13px;
+  text-decoration: none;
+  opacity: 0.65;
+}
+.cx-flow-visit-wrap:hover .cx-flow-visit-open {
+  opacity: 1;
+  border-color: var(--rule);
+}
+.cx-flow-visit-open:hover { background: var(--paper-tinted); }
 .cx-flow-arrow {
   font-size: 14px;
   color: var(--ink-3);
@@ -8648,13 +8679,41 @@ pre.diff {
   height: 8px;
   border-radius: 50%;
   background: var(--ink-3);
+  flex-shrink: 0;
 }
+.cx-engagement-unset {
+  background: transparent;
+  border: 1px solid var(--rule);
+}
+.cx-engagement-parked_background { background: var(--ink-3); }
 .cx-engagement-glanced { background: #9a8f74; }
 .cx-engagement-skimmed { background: #8a7a3a; }
 .cx-engagement-engaged_read { background: #4f6f52; }
 .cx-engagement-worked_on_reference { background: #3f5530; }
 .cx-engagement-source_extracted { background: #5c544a; }
 .cx-engagement-execution_source { background: #8b5a2b; }
+.cx-focus-visit-labelbtn {
+  font: 10px var(--mono);
+  padding: 3px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+.cx-focus-visit-labelbtn:hover {
+  background: var(--paper-tinted);
+  color: var(--ink-2);
+}
+.cx-focus-visit-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+.cx-focus-visit-ms { flex: none; }
 .cx-why,
 .cx-context-pack {
   display: flex;

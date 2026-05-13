@@ -227,6 +227,7 @@ const deriveFlowVisits = (
       tabSessionIdHash,
       ...(engagementClass === undefined ? {} : { engagementClass }),
       ...(host === undefined ? {} : { host }),
+      ...(canonicalUrl === undefined ? {} : { url: canonicalUrl }),
       ...(focusedWindowMs > 0 ? { focusedWindowMs } : {}),
     });
   }
@@ -1224,7 +1225,6 @@ export const ConnectionsView = ({
             <details
               className="cx-advanced-anchor"
               data-testid="connections-advanced-anchor"
-              open={workstreamOptions.length === 0 || !anchor.startsWith('workstream:')}
             >
               <summary data-testid="connections-advanced-anchor-summary">
                 Advanced node anchor
@@ -1235,7 +1235,7 @@ export const ConnectionsView = ({
                 </span>
                 <input
                   type="text"
-                  placeholder="thread:bac_...  visit:https://..."
+                  placeholder="Paste a node id"
                   value={draftAnchor}
                   onChange={(e) => {
                     setDraftAnchor(e.target.value);

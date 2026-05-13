@@ -45,6 +45,7 @@ export interface TimelineVisit {
   readonly tabSessionIdHash: string;
   readonly engagementClass?: string;
   readonly host?: string;
+  readonly url?: string;
   readonly focusedWindowMs?: number;
 }
 
@@ -134,6 +135,7 @@ export const FlowPathView = ({
             <div className="cx-flow-visits">
               {tabVisits.map((visit, idx) => {
                 const duration = formatDuration(visit.focusedWindowMs);
+                const canOpen = visit.url !== undefined && visit.url.length > 0;
                 return (
                   <div key={visit.id} className="cx-flow-visit-cell">
                     {idx > 0 ? (
@@ -141,31 +143,46 @@ export const FlowPathView = ({
                         →
                       </span>
                     ) : null}
-                    <button
-                      type="button"
-                      className="cx-flow-visit"
-                      title={visit.id}
-                      onClick={() => onNodeClick(visit.id)}
-                      data-testid={`flow-visit-${visit.id}`}
-                    >
-                      <span className="cx-flow-visit-title">{visit.label}</span>
-                      {visit.host === undefined || visit.host.length === 0 ? null : (
-                        <span className="cx-flow-visit-host cx-dim">{visit.host}</span>
-                      )}
-                      <span className="cx-flow-visit-meta">
-                        <span className="cx-mono cx-dim" title={visit.commitTimestamp}>
-                          {localTimestamp(visit.commitTimestamp)}
-                        </span>
-                        {duration.length > 0 ? (
-                          <span
-                            className="cx-flow-visit-duration"
-                            title={`Focused window — ${String(visit.focusedWindowMs ?? 0)}ms`}
-                          >
-                            {duration}
+                    <div className="cx-flow-visit-wrap">
+                      <button
+                        type="button"
+                        className="cx-flow-visit"
+                        title={visit.id}
+                        onClick={() => onNodeClick(visit.id)}
+                        data-testid={`flow-visit-${visit.id}`}
+                      >
+                        <span className="cx-flow-visit-title">{visit.label}</span>
+                        {visit.host === undefined || visit.host.length === 0 ? null : (
+                          <span className="cx-flow-visit-host cx-dim">{visit.host}</span>
+                        )}
+                        <span className="cx-flow-visit-meta">
+                          <span className="cx-mono cx-dim" title={visit.commitTimestamp}>
+                            {localTimestamp(visit.commitTimestamp)}
                           </span>
-                        ) : null}
-                      </span>
-                    </button>
+                          {duration.length > 0 ? (
+                            <span
+                              className="cx-flow-visit-duration"
+                              title={`Focused window — ${String(visit.focusedWindowMs ?? 0)}ms`}
+                            >
+                              {duration}
+                            </span>
+                          ) : null}
+                        </span>
+                      </button>
+                      {canOpen ? (
+                        <a
+                          className="cx-flow-visit-open"
+                          href={visit.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          title={`Open ${visit.url ?? ''} in a new tab`}
+                          aria-label={`Open ${visit.label} in a new tab`}
+                          data-testid={`flow-visit-open-${visit.id}`}
+                        >
+                          ↗
+                        </a>
+                      ) : null}
+                    </div>
                   </div>
                 );
               })}
