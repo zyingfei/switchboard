@@ -49,6 +49,7 @@ import type {
 } from './types';
 import { useAnchorHistory } from './useAnchorHistory';
 import { useConnectionsEdge, useConnectionsSnapshot } from './useConnectionsSnapshot';
+import { useConnectionsFullSnapshot } from './useConnectionsFullSnapshot';
 import {
   formatEntityDisplay,
   formatNodeIdDisplay,
@@ -405,6 +406,11 @@ export const ConnectionsView = ({
   // Edge detail enrichment — companion serves extra metadata (ranker
   // contributions, etc.) the neighbor scope strips for size.
   const edgeDetail = useConnectionsEdge(selectedEdge);
+  // Stage 5 polish — full-snapshot pool for the search box, primed
+  // lazily when the input gains focus. Lets the user find any
+  // node in the vault, not just whatever the anchor's neighborhood
+  // happens to have loaded.
+  const fullSnapshot = useConnectionsFullSnapshot();
   // Local in-memory mutation of the cached snapshot (topic rename,
   // engagement relabel) — the snapshot is owned by the cache, so we
   // keep a transient override map until the next fetch refreshes the
@@ -544,6 +550,18 @@ export const ConnectionsView = ({
   };
 
   const selectedWorkstreamAnchor = anchor.startsWith('workstream:') ? anchor : '';
+
+  // Search pool — node candidates merged from (a) the current
+  // anchor's neighborhood (small, always fresh) + (b) the full
+  // snapshot (large, primed on search-box focus). Anchor scope
+  // takes precedence so labels updated via topic-rename / engagement-
+  // relabel still reflect immediately.
+  const searchNodes = useMemo<readonly ConnectionNode[]>(() => {
+    const byId = new Map<string, ConnectionNode>();
+    for (const n of fullSnapshot.nodes) byId.set(n.id, n);
+    for (const n of result?.snapshot.nodes ?? []) byId.set(n.id, n);
+    return [...byId.values()];
+  }, [fullSnapshot.nodes, result]);
 
   // Search pool — combines the user's named workstreams + recent
   // anchors so the search box catches things even when they aren't
@@ -951,7 +969,7 @@ export const ConnectionsView = ({
       <PathFinder
         anchorId={anchor}
         anchorLabel={anchorNode === null ? null : formatEntityDisplay(anchorNode, ctx).primary}
-        nodes={result?.snapshot.nodes ?? []}
+        nodes={searchNodes}
         extras={searchExtras}
         ctx={ctx}
         onNodeClick={(nodeId) => {
@@ -976,12 +994,14 @@ export const ConnectionsView = ({
           <div className="cx-section">
             <h4>Find</h4>
             <NodeSearchBox
-              nodes={result?.snapshot.nodes ?? []}
+              nodes={searchNodes}
               extras={searchExtras}
               ctx={ctx}
               onPick={(id) => {
                 submitAnchor(id);
               }}
+              onPrime={fullSnapshot.prime}
+              loading={fullSnapshot.loading}
             />
           </div>
           <div className="cx-section">

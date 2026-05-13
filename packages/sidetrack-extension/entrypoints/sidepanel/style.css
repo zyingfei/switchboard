@@ -7955,6 +7955,11 @@ pre.diff {
   font-size: 12px; color: var(--ink-3);
   line-height: 1.45;
 }
+.cx-search-loading {
+  padding: 6px 12px;
+  font-size: 11px;
+  border-bottom: 1px solid var(--rule-soft, #e5ddc9);
+}
 .cx-search-hit {
   display: flex; align-items: center; gap: 8px;
   width: 100%;

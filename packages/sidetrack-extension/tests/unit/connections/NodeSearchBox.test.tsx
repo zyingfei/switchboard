@@ -99,7 +99,42 @@ describe('NodeSearchBox', () => {
     fireEvent.change(screen.getByLabelText('Find an anchor by title'), {
       target: { value: 'zzzz-no-match' },
     });
-    expect(screen.getByText(/No matches in loaded snapshot/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/No matches across the full snapshot/),
+    ).toBeInTheDocument();
+  });
+
+  it('primes the full-snapshot fetch on focus when onPrime is provided', () => {
+    const onPrime = vi.fn();
+    render(
+      <NodeSearchBox
+        nodes={[]}
+        extras={[]}
+        ctx={ctx}
+        onPick={vi.fn()}
+        onPrime={onPrime}
+      />,
+    );
+    fireEvent.focus(screen.getByLabelText('Find an anchor by title'));
+    expect(onPrime).toHaveBeenCalled();
+  });
+
+  it('shows a "searching the whole vault" hint while loading', () => {
+    render(
+      <NodeSearchBox
+        nodes={[]}
+        extras={[]}
+        ctx={ctx}
+        onPick={vi.fn()}
+        loading
+      />,
+    );
+    fireEvent.change(screen.getByLabelText('Find an anchor by title'), {
+      target: { value: 'anything' },
+    });
+    expect(screen.getByTestId('connections-search-loading')).toHaveTextContent(
+      /Searching the whole vault/i,
+    );
   });
 
   it('clears + closes on Escape', () => {

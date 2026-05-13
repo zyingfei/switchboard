@@ -31,6 +31,14 @@ export interface NodeSearchBoxProps {
   readonly ctx: EntityDisplayCtx;
   readonly onPick: (anchorId: string) => void;
   readonly maxResults?: number;
+  // Stage 5 polish — backend-graph search hooks. When provided,
+  // focusing the input fires `onPrime()` so the parent can load
+  // the FULL snapshot in the background. While that fetch is in
+  // flight `loading` is true so the box shows a "Searching the
+  // whole vault…" hint. Without these props the box still works
+  // as a local-pool filter.
+  readonly onPrime?: () => void;
+  readonly loading?: boolean;
 }
 
 interface SearchHit {
@@ -61,6 +69,8 @@ export const NodeSearchBox = ({
   ctx,
   onPick,
   maxResults = 8,
+  onPrime,
+  loading,
 }: NodeSearchBoxProps): ReactElement => {
   const [query, setQuery] = useState<string>('');
   const [open, setOpen] = useState<boolean>(false);
@@ -116,6 +126,7 @@ export const NodeSearchBox = ({
           }}
           onFocus={() => {
             setOpen(true);
+            onPrime?.();
           }}
           onKeyDown={(event) => {
             if (event.key === 'Escape') {
@@ -144,10 +155,21 @@ export const NodeSearchBox = ({
       </label>
       {open && trimmed.length > 0 ? (
         <div className="cx-search-results" data-testid="connections-search-results">
+          {loading === true ? (
+            <div
+              className="cx-search-loading mono cx-dim"
+              data-testid="connections-search-loading"
+            >
+              Searching the whole vault…
+            </div>
+          ) : null}
           {hits.length === 0 ? (
             <div className="cx-search-empty">
-              No matches in loaded snapshot. Pick a workstream below or paste a node id under
-              <em> Advanced node anchor</em>.
+              {loading === true
+                ? 'Hold on — vault fetch in flight.'
+                : 'No matches across the full snapshot. Pick a workstream below or paste a node id under '}
+              {loading === true ? null : <em>Advanced node anchor</em>}
+              {loading === true ? null : '.'}
             </div>
           ) : (
             hits.map((hit) => {
