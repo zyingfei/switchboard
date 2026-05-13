@@ -1136,6 +1136,18 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
           title: entry.title,
           provider: entry.provider,
           visitCount: entry.visitCount,
+          // 2026-05 fix: surface the active-workstream id the
+          // extension stamped onto the timeline event (TimelineEntry
+          // carries it from the observer; the e2e suite asserts
+          // `metadata.workstreamId === <wsId>` on every captured
+          // timeline-visit, and the snapshot was silently dropping
+          // it). The visit_in_workstream edge is also emitted later
+          // in the pass — this metadata is the "what flow was the
+          // user in when this happened" hint, separate from the
+          // edge.
+          ...(entry.workstreamId === undefined || entry.workstreamId.length === 0
+            ? {}
+            : { workstreamId: entry.workstreamId }),
           ...(searchQuery === undefined ? {} : { searchQuery }),
           ...(engagementClass === undefined
             ? {}
