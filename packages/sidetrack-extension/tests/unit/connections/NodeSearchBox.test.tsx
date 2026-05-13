@@ -119,6 +119,51 @@ describe('NodeSearchBox', () => {
     expect(onPrime).toHaveBeenCalled();
   });
 
+  it('renders a "Content matches" group with recall hits and anchors on thread on click', () => {
+    const onPick = vi.fn();
+    render(
+      <NodeSearchBox
+        nodes={[]}
+        extras={[]}
+        ctx={ctx}
+        onPick={onPick}
+        recallHits={[
+          {
+            threadId: 'T1',
+            title: 'Pro-Questions - Copy Fail',
+            threadUrl: 'https://chatgpt.com/c/abc',
+            score: 0.95,
+          },
+        ]}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText('Find an anchor by title'), {
+      target: { value: 'copy fail' },
+    });
+    expect(screen.getByTestId('connections-search-recall-head')).toHaveTextContent(
+      /Content matches/i,
+    );
+    fireEvent.click(screen.getByTestId('connections-search-recall-T1'));
+    expect(onPick).toHaveBeenCalledWith('thread:T1');
+  });
+
+  it('shows "Content matches · searching…" when recall is loading and no hits yet', () => {
+    render(
+      <NodeSearchBox
+        nodes={[]}
+        extras={[]}
+        ctx={ctx}
+        onPick={vi.fn()}
+        recallLoading
+        recallHits={[]}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText('Find an anchor by title'), {
+      target: { value: 'anything' },
+    });
+    expect(screen.getByTestId('connections-search-recall-head')).toHaveTextContent(/searching…/i);
+  });
+
   it('shows a "searching the whole vault" hint while loading', () => {
     render(
       <NodeSearchBox

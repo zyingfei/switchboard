@@ -50,6 +50,7 @@ import type {
 import { useAnchorHistory } from './useAnchorHistory';
 import { useConnectionsEdge, useConnectionsSnapshot } from './useConnectionsSnapshot';
 import { useConnectionsFullSnapshot } from './useConnectionsFullSnapshot';
+import { useRecallSearch } from './useRecallSearch';
 import {
   formatEntityDisplay,
   formatNodeIdDisplay,
@@ -411,6 +412,11 @@ export const ConnectionsView = ({
   // node in the vault, not just whatever the anchor's neighborhood
   // happens to have loaded.
   const fullSnapshot = useConnectionsFullSnapshot();
+  // Recall-index full-text search. Debounced; fires on the
+  // controlled search-box query. Below 3 chars the hook returns
+  // an empty list so the panel doesn't spam the embedder.
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const recallResults = useRecallSearch(searchQuery);
   // Local in-memory mutation of the cached snapshot (topic rename,
   // engagement relabel) — the snapshot is owned by the cache, so we
   // keep a transient override map until the next fetch refreshes the
@@ -1000,8 +1006,18 @@ export const ConnectionsView = ({
               onPick={(id) => {
                 submitAnchor(id);
               }}
+              onQueryChange={setSearchQuery}
               onPrime={fullSnapshot.prime}
               loading={fullSnapshot.loading}
+              recallHits={recallResults.items.map((item) => ({
+                threadId: item.threadId,
+                ...(item.title === undefined ? {} : { title: item.title }),
+                ...(item.threadUrl === undefined ? {} : { threadUrl: item.threadUrl }),
+                ...(item.snippet === undefined ? {} : { snippet: item.snippet }),
+                score: item.score,
+              }))}
+              recallLoading={recallResults.loading}
+              recallError={recallResults.error}
             />
           </div>
           <div className="cx-section">

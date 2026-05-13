@@ -25,11 +25,20 @@ export interface SearchableAnchor {
   readonly meta?: string;
 }
 
+export interface RecallSearchHit {
+  readonly threadId: string;
+  readonly title?: string;
+  readonly threadUrl?: string;
+  readonly snippet?: string;
+  readonly score: number;
+}
+
 export interface NodeSearchBoxProps {
   readonly nodes: readonly ConnectionNode[];
   readonly extras: readonly SearchableAnchor[];
   readonly ctx: EntityDisplayCtx;
   readonly onPick: (anchorId: string) => void;
+  readonly onQueryChange?: (query: string) => void;
   readonly maxResults?: number;
   // Stage 5 polish — backend-graph search hooks. When provided,
   // focusing the input fires `onPrime()` so the parent can load
@@ -39,6 +48,11 @@ export interface NodeSearchBoxProps {
   // as a local-pool filter.
   readonly onPrime?: () => void;
   readonly loading?: boolean;
+  // Stage 5 polish — recall-index full-text hits, rendered as a
+  // separate "Content matches" group below the title hits.
+  readonly recallHits?: readonly RecallSearchHit[];
+  readonly recallLoading?: boolean;
+  readonly recallError?: string | null;
 }
 
 interface SearchHit {
@@ -68,9 +82,13 @@ export const NodeSearchBox = ({
   extras,
   ctx,
   onPick,
+  onQueryChange,
   maxResults = 8,
   onPrime,
   loading,
+  recallHits = [],
+  recallLoading = false,
+  recallError = null,
 }: NodeSearchBoxProps): ReactElement => {
   const [query, setQuery] = useState<string>('');
   const [open, setOpen] = useState<boolean>(false);
@@ -123,6 +141,7 @@ export const NodeSearchBox = ({
           onChange={(event) => {
             setQuery(event.target.value);
             setOpen(true);
+            onQueryChange?.(event.target.value);
           }}
           onFocus={() => {
             setOpen(true);
@@ -163,13 +182,18 @@ export const NodeSearchBox = ({
               Searching the whole vault…
             </div>
           ) : null}
-          {hits.length === 0 ? (
+          {hits.length > 0 ? (
+            <div className="cx-search-section-head mono">
+              Title matches · {String(hits.length)}
+            </div>
+          ) : null}
+          {hits.length === 0 && recallHits.length === 0 ? (
             <div className="cx-search-empty">
-              {loading === true
-                ? 'Hold on — vault fetch in flight.'
+              {loading === true || recallLoading
+                ? 'Hold on — fetch in flight.'
                 : 'No matches across the full snapshot. Pick a workstream below or paste a node id under '}
-              {loading === true ? null : <em>Advanced node anchor</em>}
-              {loading === true ? null : '.'}
+              {loading === true || recallLoading ? null : <em>Advanced node anchor</em>}
+              {loading === true || recallLoading ? null : '.'}
             </div>
           ) : (
             hits.map((hit) => {
@@ -206,6 +230,52 @@ export const NodeSearchBox = ({
               );
             })
           )}
+          {/* Recall content matches — separate section below the title
+              hits. Clicking a recall hit anchors on the parent thread
+              so the user can drill into its connections. */}
+          {recallLoading && recallHits.length === 0 && hits.length === 0 ? null : null}
+          {recallHits.length > 0 || recallLoading ? (
+            <div
+              className="cx-search-section-head mono"
+              data-testid="connections-search-recall-head"
+            >
+              Content matches{' '}
+              {recallLoading ? '· searching…' : `· ${String(recallHits.length)}`}
+            </div>
+          ) : null}
+          {recallError !== null && recallHits.length === 0 ? (
+            <div className="cx-search-empty warn" data-testid="connections-search-recall-error">
+              {recallError}
+            </div>
+          ) : null}
+          {recallHits.map((hit) => (
+            <button
+              key={`recall:${hit.threadId}`}
+              type="button"
+              className="cx-search-hit"
+              onClick={() => {
+                onPick(`thread:${hit.threadId}`);
+                setQuery('');
+                setOpen(false);
+              }}
+              data-testid={`connections-search-recall-${hit.threadId}`}
+              title={hit.snippet ?? hit.title ?? hit.threadUrl}
+            >
+              <span className="cx-search-hit-body">
+                <span className="cx-search-hit-primary">
+                  {hit.title !== undefined && hit.title.length > 0
+                    ? hit.title
+                    : '(thread)'}
+                </span>
+                {hit.snippet !== undefined && hit.snippet.length > 0 ? (
+                  <span className="cx-search-hit-snippet">{hit.snippet}</span>
+                ) : hit.threadUrl !== undefined ? (
+                  <span className="cx-search-hit-secondary">{hit.threadUrl}</span>
+                ) : null}
+              </span>
+              <span className="cx-search-hit-kind">Thread</span>
+            </button>
+          ))}
         </div>
       ) : null}
     </div>
