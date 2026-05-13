@@ -7675,16 +7675,24 @@ function WorkstreamPicker({
             <input
               type="text"
               className="ws-picker-create-input"
-              placeholder={
-                createParent === null
-                  ? 'New top-level workstream name…'
-                  : `New sub-workstream under ${parentTitle ?? 'current'}…`
-              }
+              // Unified placeholder — the user already knows whether
+              // they're creating a top-level workstream or a sub-
+              // workstream from the button they just clicked (the
+              // workstream-detail panel button labels are explicit).
+              // The placeholder doesn't need to repeat that context;
+              // a uniform "New workstream name…" reads cleaner and
+              // matches the e2e suite's expectations.
+              placeholder="New workstream name…"
               value={draftTitle}
               autoFocus
               onChange={(e) => {
                 setDraftTitle(e.target.value);
               }}
+              aria-label={
+                createParent === null
+                  ? 'New top-level workstream name'
+                  : `New sub-workstream under ${parentTitle ?? 'current'}`
+              }
             />
             {/* Optional description — flows into the suggester's
                 lexical match + cold-start centroid, so multi-language

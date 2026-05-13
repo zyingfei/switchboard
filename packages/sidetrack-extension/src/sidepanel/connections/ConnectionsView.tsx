@@ -1073,17 +1073,14 @@ export const ConnectionsView = ({
     };
   }, [anchor, result]);
 
-  // Stage 5 polish — sub-mode auto-recovery. If the user is on a
-  // gated sub-mode (Flow Path / Focus / Context Pack) and the new
-  // anchor's subgraph doesn't satisfy that mode's requirement (no
-  // visits / no topics / not a workstream), fall back to Linked
-  // automatically so the center pane never goes blank with no
-  // explanation. The tab's tooltip explains why it's disabled.
-  useEffect(() => {
-    if (subMode === 'flow' && !modeAvailability.flow.enabled) setSubMode('linked');
-    else if (subMode === 'focus' && !modeAvailability.focus.enabled) setSubMode('linked');
-    else if (subMode === 'context' && !modeAvailability.context.enabled) setSubMode('linked');
-  }, [subMode, modeAvailability]);
+  // 2026-05 cleanup: the auto-recovery used to bounce the user back
+  // to 'linked' the instant they clicked a mode tab whose data
+  // wasn't ready. That conflicted with the tabs being clickable —
+  // every click would flicker → bounce. The child views now render
+  // informative empty states for the "no visits / no topics / not a
+  // workstream" cases, so it's safe to land on a mode tab even
+  // without data; the user reads the empty state and learns what's
+  // needed. Auto-recovery removed entirely.
 
   // Stage 5 polish — auto-prime the full snapshot when Focus mode
   // is selected. The Focus derivation needs all `visit_in_topic`
@@ -1244,15 +1241,21 @@ export const ConnectionsView = ({
           type="button"
           role="tab"
           aria-selected={subMode === 'flow'}
+          // 2026-05 cleanup: the tabs were previously `disabled` when
+          // their data wasn't in scope, with a tooltip explaining
+          // why. Disabled tabs hide the affordance behind a hover —
+          // most users never see it. Each child view (FlowPathView,
+          // FocusView, ContextPackComposer) already renders an
+          // informative empty state when there's no data, so allow
+          // the click and let the panel teach by example. The
+          // `is-dim` class subtle-dims the label so power users
+          // still see "there's not much here" at a glance.
           className={
             'cx-mode' +
             (subMode === 'flow' ? ' is-active' : '') +
-            (modeAvailability.flow.enabled ? '' : ' is-disabled')
+            (modeAvailability.flow.enabled ? '' : ' is-dim')
           }
-          onClick={() => {
-            if (modeAvailability.flow.enabled) setSubMode('flow');
-          }}
-          disabled={!modeAvailability.flow.enabled}
+          onClick={() => setSubMode('flow')}
           title={modeAvailability.flow.reason}
           data-testid="connections-mode-flow"
         >
@@ -1265,12 +1268,9 @@ export const ConnectionsView = ({
           className={
             'cx-mode' +
             (subMode === 'focus' ? ' is-active' : '') +
-            (modeAvailability.focus.enabled ? '' : ' is-disabled')
+            (modeAvailability.focus.enabled ? '' : ' is-dim')
           }
-          onClick={() => {
-            if (modeAvailability.focus.enabled) setSubMode('focus');
-          }}
-          disabled={!modeAvailability.focus.enabled}
+          onClick={() => setSubMode('focus')}
           title={modeAvailability.focus.reason}
           data-testid="connections-mode-focus"
         >
@@ -1283,12 +1283,9 @@ export const ConnectionsView = ({
           className={
             'cx-mode' +
             (subMode === 'context' ? ' is-active' : '') +
-            (modeAvailability.context.enabled ? '' : ' is-disabled')
+            (modeAvailability.context.enabled ? '' : ' is-dim')
           }
-          onClick={() => {
-            if (modeAvailability.context.enabled) setSubMode('context');
-          }}
-          disabled={!modeAvailability.context.enabled}
+          onClick={() => setSubMode('context')}
           title={modeAvailability.context.reason}
           data-testid="connections-mode-context"
         >
@@ -1371,6 +1368,16 @@ export const ConnectionsView = ({
             <details
               className="cx-advanced-anchor"
               data-testid="connections-advanced-anchor"
+              // Always open by default. The earlier behavior auto-
+              // opened only for non-workstream anchors and leaked a
+              // raw `visit-instance:tses_*:<iso>:<URL>` id into the
+              // input via `value={initialAnchor}`. That root cause
+              // is gone now (draftAnchor defaults to '' and the
+              // placeholder is the friendly "Paste a node id"), so
+              // keeping the section open is safe and matches what
+              // every e2e spec + power-user workflow expects:
+              // a directly-clickable anchor input is always present.
+              open
             >
               <summary data-testid="connections-advanced-anchor-summary">
                 Advanced node anchor

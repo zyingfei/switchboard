@@ -1185,7 +1185,15 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
           toNodeId: nodeIdFor('workstream', entry.workstreamId),
           observedAt: entry.lastSeenAt,
           producedBy: { source: 'timeline-projection' },
-          confidence: 'observed',
+          // 'inferred' — the active-workstream pointer at observation
+          // time is an inference about user intent, not a direct
+          // observation about the URL→workstream relationship. The
+          // sister `timeline_same_url_as_thread` edge nearby also
+          // uses 'inferred' for the same reason. The e2e suite at
+          // `connections-mvp-user-story.spec.ts:291` and downstream
+          // resolver code rely on this classification to decide
+          // whether to weight the edge as evidence.
+          confidence: 'inferred',
         });
       }
       const threadId = threadIdByUrl.get(visitKey);
