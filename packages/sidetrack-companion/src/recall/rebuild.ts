@@ -131,8 +131,20 @@ export const rebuildFromEventLog = async (
     ...(item.title === undefined ? {} : { title: item.title }),
   }));
 
+  // Cooperative yield helper. The rebuild walks 13 k+ JSONL events,
+  // parses each, chunks each turn, encodes the index file — all
+  // synchronously per item. Without yields the main thread stays
+  // pinned for 60+ seconds and every /v1/status call sits in the
+  // kernel accept queue. Yielding every \`yieldEvery\` items
+  // releases the loop to libuv so HTTP requests interleave.
+  const YIELD_EVERY = 250;
+  const yieldNow = (): Promise<void> =>
+    new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
   // 2. Walk the legacy `_BAC/events/` log. Skip captures whose
   //    bac_id already appears in the per-replica log.
+  let parsedSinceYield = 0;
   for (const file of await eventFiles(eventLogPath)) {
     const raw = await readFile(file, 'utf8').catch(() => '');
     for (const line of raw.split('\n')) {
@@ -170,6 +182,11 @@ export const rebuildFromEventLog = async (
       } catch {
         // Ignore malformed event-log lines; the source of truth remains append-only.
       }
+      parsedSinceYield += 1;
+      if (parsedSinceYield >= YIELD_EVERY) {
+        parsedSinceYield = 0;
+        await yieldNow();
+      }
     }
   }
 
@@ -178,6 +195,7 @@ export const rebuildFromEventLog = async (
   // chunkIds, so a rebuild from the same merged log emits byte-equal
   // index files (PR #93's deterministic-build invariant).
   const chunks: { readonly chunk: RecallChunk; readonly raw: RawCaptureItem }[] = [];
+  let chunkedSinceYield = 0;
   for (const raw of rawItems) {
     const sourceBacId = raw.sourceBacId ?? raw.threadId;
     const produced = chunkTurn({
@@ -196,6 +214,11 @@ export const rebuildFromEventLog = async (
     });
     for (const chunk of produced) {
       chunks.push({ chunk, raw });
+    }
+    chunkedSinceYield += 1;
+    if (chunkedSinceYield >= YIELD_EVERY) {
+      chunkedSinceYield = 0;
+      await yieldNow();
     }
   }
 
