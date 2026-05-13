@@ -125,6 +125,10 @@ const waitForSnapshotToStabilize = async (comp: TestCompanion): Promise<void> =>
     });
     return await r.json();
   };
+  // 2500 ms stable window > materializer's 1500 ms drain debounce —
+  // without it we may declare "stable" while edgeCount is still 0
+  // (no drain has run yet). Also require at least one non-zero
+  // observation so we know the drain produced something.
   const startedMs = Date.now();
   let lastCount = -1;
   let stableSinceMs = 0;
@@ -134,7 +138,7 @@ const waitForSnapshotToStabilize = async (comp: TestCompanion): Promise<void> =>
     };
     const c = all.data.snapshot.edgeCount;
     if (c === lastCount) {
-      if (Date.now() - stableSinceMs >= 600) return;
+      if (Date.now() - stableSinceMs >= 2_500 && c > 0) return;
     } else {
       lastCount = c;
       stableSinceMs = Date.now();
