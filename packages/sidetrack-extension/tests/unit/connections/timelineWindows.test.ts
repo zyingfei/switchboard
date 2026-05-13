@@ -206,4 +206,49 @@ describe('connections — computeTimelineRail', () => {
     expect(rail!.anchorTime).toBeCloseTo(9 + 30 / 60, 3);
     expect(rail!.neighborTimes).toEqual([10 + 15 / 60]);
   });
+
+  it('falls back to node lastSeenAt when edges have no producer dot (inferred-only subgraph)', () => {
+    // Thread anchor at 1 hop often has only `timeline_same_url_as_thread`
+    // (inferred, no producedBy.dot). The fallback path uses each node's
+    // own lastSeenAt + originReplicaIds so the rail still renders.
+    const snap = baseSnap({
+      nodes: [
+        {
+          id: 'thread:t1',
+          kind: 'thread',
+          label: 'Some thread',
+          originReplicaIds: ['mac'],
+          metadata: {},
+          lastSeenAt: '2026-05-14T09:15:00.000Z',
+        },
+        {
+          id: 'timeline-visit:https://example.test/page',
+          kind: 'timeline-visit',
+          label: 'Page',
+          originReplicaIds: ['mac'],
+          metadata: { canonicalUrl: 'https://example.test/page' },
+          lastSeenAt: '2026-05-14T10:00:00.000Z',
+        },
+      ],
+      edges: [
+        {
+          id: 'e1',
+          kind: 'timeline_same_url_as_thread',
+          fromNodeId: 'thread:t1',
+          toNodeId: 'timeline-visit:https://example.test/page',
+          observedAt: '2026-05-14T10:00:00.000Z',
+          // Inferred edges carry no producedBy.dot
+          producedBy: { source: 'inferred' },
+          confidence: 'inferred',
+        },
+      ],
+    });
+    const rail = computeTimelineRail(snap, 'thread:t1');
+    expect(rail).not.toBeNull();
+    expect(rail!.date).toBe('2026-05-14');
+    expect(rail!.rows.length).toBe(1);
+    expect(rail!.rows[0]!.replicaId).toBe('mac');
+    expect(rail!.anchorTime).toBeCloseTo(9 + 15 / 60, 3);
+    expect(rail!.neighborTimes).toEqual([10]);
+  });
 });

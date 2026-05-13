@@ -80,6 +80,28 @@ export const computeTimelineRail = (
     dayCounts.set(day, (dayCounts.get(day) ?? 0) + 1);
   }
 
+  // Stage 5 polish — node-timestamp fallback. Inferred edges
+  // (timeline_same_url_as_thread, visit_resembles_visit) have no
+  // `producedBy.dot`, so a thread anchor at 1 hop with only
+  // inferred edges would render no timeline rail at all. Fall back
+  // to node-level `lastSeenAt` + `originReplicaIds` so the rail
+  // stays visible whenever there's ANY time signal in scope.
+  if (dayCounts.size === 0) {
+    for (const node of snapshot.nodes) {
+      const ms = parseTimestamp(node.lastSeenAt) ?? parseTimestamp(node.firstSeenAt);
+      if (ms === null) continue;
+      const replicaIds =
+        node.originReplicaIds.length > 0 ? node.originReplicaIds : ['unknown'];
+      for (const replicaId of replicaIds) {
+        const list = timestampsByReplica.get(replicaId);
+        if (list === undefined) timestampsByReplica.set(replicaId, [ms]);
+        else list.push(ms);
+      }
+      const day = isoDayUtc(ms);
+      dayCounts.set(day, (dayCounts.get(day) ?? 0) + 1);
+    }
+  }
+
   if (dayCounts.size === 0) return null;
 
   // Pick the busiest day. Tie-break: latest day wins so the rail
