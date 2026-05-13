@@ -1139,7 +1139,13 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
           ...(searchQuery === undefined ? {} : { searchQuery }),
           ...(engagementClass === undefined
             ? {}
-            : { engagement: { class: engagementClass.class } }),
+            : {
+                engagement: {
+                  class: engagementClass.class,
+                  focusedWindowMs: engagementClass.focusedWindowMs,
+                  scrollEvents: engagementClass.scrollEvents,
+                },
+              }),
         },
       });
       const threadId = threadIdByUrl.get(visitKey);
@@ -1184,6 +1190,12 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
     const instanceKey = visitInstanceKey(instance);
     const instanceNodeId = nodeIdFor(VISIT_INSTANCE_NODE_KIND, instanceKey);
     const timelineVisitNodeId = nodeIdFor('timeline-visit', instance.visitKey);
+    // Engagement is URL-aggregate (the classifier keys by canonicalUrl,
+    // not by tab session). Mirroring the same blob onto every
+    // visit-instance of the URL means three tabs of the same page will
+    // report the same "focused 2m 30s" — known trade-off, called out in
+    // the Flow Path tooltip.
+    const instanceEngagement = engagementClassByCanonicalUrl.get(instance.visitKey);
     upsertNode(nodes, {
       kind: VISIT_INSTANCE_NODE_KIND,
       key: instanceKey,
@@ -1197,6 +1209,15 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
         visitCount: instance.visitCount,
         tabSessionId: instance.tabSessionId,
         timelineVisitId: timelineVisitNodeId,
+        ...(instanceEngagement === undefined
+          ? {}
+          : {
+              engagement: {
+                class: instanceEngagement.class,
+                focusedWindowMs: instanceEngagement.focusedWindowMs,
+                scrollEvents: instanceEngagement.scrollEvents,
+              },
+            }),
       },
     });
     for (const replicaId of [...instance.replicaIds].sort()) {

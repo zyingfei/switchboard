@@ -243,6 +243,12 @@ export interface EngagementClassRevision {
     readonly visitId: string;
     readonly canonicalUrl: string;
     readonly class: EngagementClass;
+    // Subset of the engagement dimensions that drove the class. Plumbed
+    // through so the connections snapshot — and ultimately the Flow Path
+    // visit cell — can show "1m 30s focused · 24 scrolls" without
+    // every consumer carrying the full event stream.
+    readonly focusedWindowMs: number;
+    readonly scrollEvents: number;
   }[];
   readonly producedAt: number;
 }
@@ -378,6 +384,8 @@ export const buildEngagementClassRevision = (
       visitId: input.visitId,
       canonicalUrl: input.canonicalUrl,
       class: classifyEngagement(input, thresholds),
+      focusedWindowMs: input.engagement.focusedWindowMs,
+      scrollEvents: input.engagement.scrollEvents,
     }));
 
   return {
