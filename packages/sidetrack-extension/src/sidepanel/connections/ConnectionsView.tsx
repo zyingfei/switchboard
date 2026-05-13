@@ -97,6 +97,20 @@ type Props = {
   // to metadata.title or "Unknown workstream") and "Browser" for
   // replica aliases. Production callers pass a real ctx from App.tsx.
   readonly displayCtx?: EntityDisplayCtx;
+  // Stage 5 polish — cross-surface anchor request from outside the
+  // view (Inbox card "Graph" button). When this prop changes to a
+  // non-empty value the view auto-navigates to that anchor as if
+  // the user had typed it. Internal history.navigate is used so
+  // back/forward semantics still work afterward. `onRequestConsumed`
+  // clears the parent's request state so the same target can be
+  // re-jumped after the user navigated elsewhere.
+  readonly requestAnchor?: string;
+  readonly onRequestConsumed?: () => void;
+  // Cross-surface jump from Connections back to the Inbox. Fired
+  // when the user clicks "Find in Inbox" on a URL-bearing anchor.
+  // Receives the canonical URL; the parent decides whether to
+  // switch viewMode + pre-fill the Inbox search.
+  readonly onOpenInInbox?: (canonicalUrl: string) => void;
 };
 
 const DEFAULT_DISPLAY_CTX: EntityDisplayCtx = {
@@ -364,6 +378,9 @@ export const ConnectionsView = ({
   workstreamAnchors = [],
   onOpenUrl,
   displayCtx,
+  requestAnchor,
+  onRequestConsumed,
+  onOpenInInbox,
 }: Props): ReactElement => {
   const baseCtx: EntityDisplayCtx = displayCtx ?? DEFAULT_DISPLAY_CTX;
   // Anchor history — back/forward stack so drilling into a neighbor
@@ -562,6 +579,47 @@ export const ConnectionsView = ({
     setDraftAnchor(nodeId);
     history.navigate(nodeId);
   };
+
+  // Stage 5 polish — cross-surface anchor request from outside the
+  // view (Inbox "Graph" button). Re-anchors when the prop changes
+  // to a non-empty value; uses history.navigate so back/forward
+  // semantics still apply after the jump. `onRequestConsumed` clears
+  // the parent's state so the same target can be re-requested later.
+  useEffect(() => {
+    if (requestAnchor === undefined || requestAnchor.length === 0) return;
+    if (requestAnchor !== anchor) {
+      useNodeAsAnchor(requestAnchor);
+    }
+    onRequestConsumed?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- useNodeAsAnchor closes over
+    // history; the effect only needs to fire when the request itself changes.
+  }, [requestAnchor]);
+
+  // Stage 5 polish — derive a canonical URL from the current anchor
+  // so the "Find in Inbox" button can pass it back to App.tsx. Three
+  // anchor kinds carry a URL signal: timeline-visit (id is the URL),
+  // visit-instance (id is `visit-instance:tses_*:<iso>:<URL>`), and
+  // tab-session / thread (metadata.canonicalUrl). Returns null when
+  // the anchor doesn't carry a URL (workstreams, topics, snippets).
+  const anchorCanonicalUrl = useMemo<string | null>(() => {
+    if (anchor.length === 0) return null;
+    if (anchor.startsWith('timeline-visit:')) {
+      return anchor.slice('timeline-visit:'.length);
+    }
+    if (anchor.startsWith('visit-instance:')) {
+      const tail = anchor.slice('visit-instance:'.length);
+      const httpIdx = tail.indexOf(':http');
+      if (httpIdx >= 0) return tail.slice(httpIdx + 1);
+    }
+    if (anchorNode !== null) {
+      const meta = anchorNode.metadata as Record<string, unknown>;
+      const fromMeta = ['canonicalUrl', 'latestUrl', 'url']
+        .map((k) => meta[k])
+        .find((v): v is string => typeof v === 'string' && v.length > 0);
+      if (fromMeta !== undefined) return fromMeta;
+    }
+    return null;
+  }, [anchor, anchorNode]);
 
   // Stage 5 polish — Connections refactor (Phase C usability).
   // Browser-style Alt+← / Alt+→ keyboard shortcuts for anchor
@@ -789,6 +847,20 @@ export const ConnectionsView = ({
         >
           ↻
         </button>
+        {onOpenInInbox !== undefined && anchorCanonicalUrl !== null ? (
+          <button
+            type="button"
+            className="cx-anchor-nav-btn cx-anchor-nav-btn-wide"
+            onClick={() => {
+              onOpenInInbox(anchorCanonicalUrl);
+            }}
+            aria-label="Find this URL in Inbox"
+            title="Find in Inbox — switch to the Inbox tab and pre-fill the search with this URL"
+            data-testid="connections-anchor-open-inbox"
+          >
+            Inbox ⇄
+          </button>
+        ) : null}
         <TimeRangePills value={timeRange} onChange={setTimeRange} hiddenNodeCount={hiddenByTime} />
         <HopToggle value={hops} onChange={setHops} />
       </div>

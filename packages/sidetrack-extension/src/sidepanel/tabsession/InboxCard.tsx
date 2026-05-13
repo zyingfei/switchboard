@@ -43,6 +43,11 @@ export interface InboxCardProps {
   // the live connections snapshot to render human-friendly text.
   readonly nodeById?: ReadonlyMap<string, ConnectionNode>;
   readonly displayCtx?: EntityDisplayCtx;
+  // Stage 5 polish — cross-surface jump from an Inbox card into
+  // the Connections graph. Wires the URL's canonical timeline-visit
+  // node as the new Connections anchor and switches viewMode.
+  // When omitted, the affordance isn't rendered.
+  readonly onOpenInConnections?: (canonicalUrl: string) => void;
 }
 
 export function InboxCard({
@@ -55,6 +60,7 @@ export function InboxCard({
   onIgnore,
   nodeById,
   displayCtx,
+  onOpenInConnections,
 }: InboxCardProps) {
   const host = hostFor(record);
   const title = tabSessionDisplayTitle(record);
@@ -101,6 +107,24 @@ export function InboxCard({
                 {Icons.arrowR}
               </span>
               <span>Go to</span>
+            </button>
+          ) : null}
+          {onOpenInConnections !== undefined && record.latestUrl !== undefined ? (
+            <button
+              type="button"
+              className="tab-session-go-to"
+              onClick={() => {
+                // Use the URL-keyed canonical id (record.tabSessionId
+                // in the URL-projection adapter), surfacing the
+                // timeline-visit node in the Connections graph.
+                onOpenInConnections(record.tabSessionId);
+              }}
+              title="Open this URL in the Connections graph"
+              aria-label="Open in Connections"
+              data-testid={`tab-session-open-connections-${record.tabSessionId}`}
+            >
+              <span aria-hidden>⇄</span>
+              <span>Graph</span>
             </button>
           ) : null}
         </div>

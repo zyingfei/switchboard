@@ -596,6 +596,23 @@ const App = () => {
   const [viewMode, setViewMode] = useState<'workstream' | 'all' | 'inbox' | 'connections'>(
     'workstream',
   );
+  // Stage 5 polish — cross-surface jumps between Inbox and Connections.
+  // `connectionsAnchorRequest` is a string that ConnectionsView watches
+  // via its requestAnchor prop; when set non-empty, the view auto-anchors
+  // there. `inboxSearchRequest` is similar for InboxView's initialQuery.
+  const [connectionsAnchorRequest, setConnectionsAnchorRequest] = useState<string>('');
+  const [inboxSearchRequest, setInboxSearchRequest] = useState<string>('');
+  const requestSwitchToConnections = (canonicalUrl: string): void => {
+    // The timeline-visit node id IS the canonical URL — the snapshot
+    // builds them that way. So anchoring on `timeline-visit:<URL>`
+    // lands on the most useful neighborhood for an unattributed URL.
+    setConnectionsAnchorRequest(`timeline-visit:${canonicalUrl}`);
+    setViewMode('connections');
+  };
+  const requestSwitchToInbox = (canonicalUrl: string): void => {
+    setInboxSearchRequest(canonicalUrl);
+    setViewMode('inbox');
+  };
   const [queueDraft, setQueueDraft] = useState('');
   const [queueExpandFor, setQueueExpandFor] = useState<string | null>(null);
   // Set briefly after the user opens compose-at-end via the row's
@@ -5882,6 +5899,11 @@ const App = () => {
         <ConnectionsView
           {...(currentWsId === null ? {} : { initialAnchor: `workstream:${currentWsId}` })}
           displayCtx={displayCtx}
+          requestAnchor={connectionsAnchorRequest}
+          onRequestConsumed={() => {
+            setConnectionsAnchorRequest('');
+          }}
+          onOpenInInbox={requestSwitchToInbox}
           workstreamAnchors={state.workstreams.map((w) => ({
             id: `workstream:${w.bac_id}`,
             label: workstreamPath(w.bac_id, state.workstreams),
@@ -6022,6 +6044,7 @@ const App = () => {
                         }}
                         onIgnore={handleUrlIgnore}
                         displayCtx={displayCtx}
+                        onOpenInConnections={requestSwitchToConnections}
                       />
                     );
                   })}
@@ -6076,6 +6099,11 @@ const App = () => {
           }}
           onIgnore={handleUrlIgnore}
           displayCtx={displayCtx}
+          onOpenInConnections={requestSwitchToConnections}
+          initialQuery={inboxSearchRequest}
+          onQueryConsumed={() => {
+            setInboxSearchRequest('');
+          }}
         />
       ) : (
         <>

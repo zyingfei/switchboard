@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 import type { ConnectionNode } from '../connections/types';
 import type { EntityDisplayCtx } from '../entityDisplay/format';
@@ -27,6 +27,13 @@ export interface InboxViewProps {
   ) => void;
   readonly nodeById?: ReadonlyMap<string, ConnectionNode>;
   readonly displayCtx?: EntityDisplayCtx;
+  readonly onOpenInConnections?: (canonicalUrl: string) => void;
+  // Stage 5 polish — cross-surface jump from Connections: pre-fill
+  // the Inbox search query and scroll the matching card into view.
+  // `onQueryConsumed` clears the parent's request after we've
+  // applied it once so back-navigation doesn't re-fire.
+  readonly initialQuery?: string;
+  readonly onQueryConsumed?: () => void;
 }
 
 // Stage 5 polish — Inbox-only search filter. Pure client-side, runs on
@@ -55,8 +62,23 @@ export function InboxView({
   onIgnore,
   nodeById,
   displayCtx,
+  onOpenInConnections,
+  initialQuery,
+  onQueryConsumed,
 }: InboxViewProps) {
   const [query, setQuery] = useState('');
+  // Cross-surface request — accept a pre-filled query exactly once,
+  // applied via useEffect so re-renders with the same value don't
+  // keep stomping user edits. Cleared via onQueryConsumed so the
+  // parent's request state resets.
+  const lastAppliedRequest = useRef<string>('');
+  useEffect(() => {
+    if (initialQuery === undefined || initialQuery.length === 0) return;
+    if (lastAppliedRequest.current === initialQuery) return;
+    lastAppliedRequest.current = initialQuery;
+    setQuery(initialQuery);
+    onQueryConsumed?.();
+  }, [initialQuery, onQueryConsumed]);
   const trimmed = query.trim();
   const filtered = useMemo(
     () => (trimmed.length === 0 ? inbox.items : inbox.items.filter((r) => matchesQuery(r, trimmed))),
@@ -124,6 +146,7 @@ export function InboxView({
             {...(onIgnore === undefined ? {} : { onIgnore })}
             {...(nodeById === undefined ? {} : { nodeById })}
             {...(displayCtx === undefined ? {} : { displayCtx })}
+            {...(onOpenInConnections === undefined ? {} : { onOpenInConnections })}
           />
         ))}
       </div>
