@@ -31,10 +31,11 @@ import { LinkedCenter } from './LinkedCenter';
 import { NodeChip } from './NodeChip';
 import { NodeSearchBox, type SearchableAnchor } from './NodeSearchBox';
 import {
-  TimeRangePills,
+  ALL_RANGE,
+  TimeRangePicker,
   filterByTimeRange,
-  type TimeRangeKey,
-} from './TimeRangePills';
+  type TimeRangeValue,
+} from './TimeRangePicker';
 import { OrbitalCenter } from './OrbitalCenter';
 import { PathFinder } from './PathFinder';
 import { ProvenanceCard, ProvenanceEmpty } from './ProvenancePanel';
@@ -392,7 +393,7 @@ export const ConnectionsView = ({
   const [draftAnchor, setDraftAnchor] = useState<string>(initialAnchor);
   const [hops, setHops] = useState<number>(1);
   const [subMode, setSubMode] = useState<SubMode>('linked');
-  const [timeRange, setTimeRange] = useState<TimeRangeKey>('all');
+  const [timeRange, setTimeRange] = useState<TimeRangeValue>(ALL_RANGE);
   const [selectedEdge, setSelectedEdge] = useState<ConnectionEdge | null>(null);
   const [whyVisitId, setWhyVisitId] = useState<string | null>(null);
   const [whyAssertedOnly, setWhyAssertedOnly] = useState<boolean>(false);
@@ -958,11 +959,11 @@ export const ConnectionsView = ({
         }}
       />
       {result !== null ? (
-        // Thin filter strip — collapsible, only renders when there's
-        // a loaded result. Keeps the anchor bar single-line.
+        // Thin filter strip — only renders when there's a loaded
+        // result so empty states don't carry an unusable control.
         <div className="cx-filterbar" data-testid="connections-filterbar">
           <span className="cx-filterbar-label mono">Window</span>
-          <TimeRangePills
+          <TimeRangePicker
             value={timeRange}
             onChange={setTimeRange}
             hiddenNodeCount={hiddenByTime}

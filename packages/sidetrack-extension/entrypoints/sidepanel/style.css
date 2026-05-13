@@ -8140,8 +8140,13 @@ pre.diff {
 }
 .cx-mode.is-disabled:hover,
 .cx-mode:disabled:hover { color: var(--ink-3); }
-/* Stage 5 polish — Connections time-range pill bar in the anchor row. */
-.cx-timerange { margin-right: 4px; }
+/* Stage 5 polish — Connections time-range pill bar in the filter row. */
+.cx-timerange {
+  position: relative;
+  margin-right: 4px;
+  flex-wrap: wrap;
+  gap: 2px;
+}
 .cx-timerange-hidden {
   margin-left: 4px;
   padding: 2px 6px;
@@ -8149,6 +8154,45 @@ pre.diff {
   background: var(--paper-tinted);
   color: var(--ink-3);
   font-size: 10px;
+}
+.cx-timerange-active {
+  margin-left: 6px;
+  font-size: 10px;
+  color: var(--ink-3);
+}
+.cx-timerange-popover {
+  position: absolute;
+  z-index: 14;
+  top: calc(100% + 4px);
+  right: 0;
+  min-width: 240px;
+  padding: 10px;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: var(--rad-s);
+  box-shadow: 0 8px 20px rgba(0,0,0,0.08);
+  display: flex; flex-direction: column; gap: 8px;
+}
+.cx-timerange-field {
+  display: flex; flex-direction: column; gap: 3px;
+  font-size: 11px;
+  color: var(--ink-2);
+}
+.cx-timerange-field input {
+  padding: 4px 6px;
+  border: var(--hair-soft);
+  border-radius: 4px;
+  background: var(--paper-light);
+  font: inherit;
+  color: var(--ink-1);
+}
+.cx-timerange-error {
+  font-size: 11px;
+  color: #b91c1c;
+}
+.cx-timerange-actions {
+  display: flex; justify-content: flex-end; gap: 6px;
+  margin-top: 2px;
 }
 /* Stage 5 polish — Connections path-finder strip. Collapsible row
    below the mode tabs; pills + arrows render the BFS chain. */
