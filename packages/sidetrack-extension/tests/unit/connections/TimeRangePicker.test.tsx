@@ -97,16 +97,23 @@ describe('TimeRangePicker', () => {
     expect(onChange).toHaveBeenCalledWith({ kind: 'preset', preset: '24h' });
   });
 
-  it('opens the custom popover and applies a valid range', () => {
+  it('opens the custom popover, picks dates + times, applies', () => {
     const onChange = vi.fn();
     render(<TimeRangePicker value={{ kind: 'all' }} onChange={onChange} nowMs={NOW} />);
     fireEvent.click(screen.getByTestId('connections-timerange-custom'));
     expect(screen.getByTestId('connections-timerange-popover')).toBeInTheDocument();
-    fireEvent.change(screen.getByTestId('connections-timerange-start'), {
-      target: { value: '2026-05-10T08:00' },
+    // Change start/end via the date+time inputs (separate boxes now).
+    fireEvent.change(screen.getByTestId('connections-timerange-start-date'), {
+      target: { value: '2026-05-10' },
     });
-    fireEvent.change(screen.getByTestId('connections-timerange-end'), {
-      target: { value: '2026-05-11T08:00' },
+    fireEvent.change(screen.getByTestId('connections-timerange-start-time'), {
+      target: { value: '08:00' },
+    });
+    fireEvent.change(screen.getByTestId('connections-timerange-end-date'), {
+      target: { value: '2026-05-11' },
+    });
+    fireEvent.change(screen.getByTestId('connections-timerange-end-time'), {
+      target: { value: '08:00' },
     });
     fireEvent.click(screen.getByTestId('connections-timerange-apply'));
     expect(onChange).toHaveBeenCalled();
@@ -118,14 +125,44 @@ describe('TimeRangePicker', () => {
     const onChange = vi.fn();
     render(<TimeRangePicker value={{ kind: 'all' }} onChange={onChange} nowMs={NOW} />);
     fireEvent.click(screen.getByTestId('connections-timerange-custom'));
-    fireEvent.change(screen.getByTestId('connections-timerange-start'), {
-      target: { value: '2026-05-11T08:00' },
+    fireEvent.change(screen.getByTestId('connections-timerange-start-date'), {
+      target: { value: '2026-05-11' },
     });
-    fireEvent.change(screen.getByTestId('connections-timerange-end'), {
-      target: { value: '2026-05-10T08:00' },
+    fireEvent.change(screen.getByTestId('connections-timerange-end-date'), {
+      target: { value: '2026-05-10' },
     });
     fireEvent.click(screen.getByTestId('connections-timerange-apply'));
-    expect(screen.getByTestId('connections-timerange-error')).toHaveTextContent('Start must be before end.');
+    expect(screen.getByTestId('connections-timerange-error')).toHaveTextContent(
+      'Start must be before end.',
+    );
     expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('Quick Select "Last hour" fires onChange with a 1h custom range', () => {
+    const onChange = vi.fn();
+    render(<TimeRangePicker value={{ kind: 'all' }} onChange={onChange} nowMs={NOW} />);
+    fireEvent.click(screen.getByTestId('connections-timerange-custom'));
+    fireEvent.click(screen.getByText('Last hour'));
+    expect(onChange).toHaveBeenCalled();
+    const arg = onChange.mock.calls[0][0] as TimeRangeValue;
+    expect(arg.kind).toBe('custom');
+    if (arg.kind === 'custom') {
+      expect(arg.endMs - arg.startMs).toBe(60 * 60 * 1000);
+    }
+  });
+
+  it('Quick Select "All time" fires onChange with kind=all', () => {
+    const onChange = vi.fn();
+    render(<TimeRangePicker value={{ kind: 'custom', startMs: 0, endMs: NOW }} onChange={onChange} nowMs={NOW} />);
+    fireEvent.click(screen.getByTestId('connections-timerange-custom'));
+    fireEvent.click(screen.getByText('All time'));
+    expect(onChange).toHaveBeenCalledWith({ kind: 'all' });
+  });
+
+  it('renders the local timezone label in the calendar footer', () => {
+    render(<TimeRangePicker value={{ kind: 'all' }} onChange={vi.fn()} nowMs={NOW} />);
+    fireEvent.click(screen.getByTestId('connections-timerange-custom'));
+    const tz = screen.getByTestId('connections-timerange-tz');
+    expect(tz.textContent).toMatch(/Local|UTC/i);
   });
 });

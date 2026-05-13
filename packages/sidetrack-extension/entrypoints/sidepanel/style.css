@@ -8189,40 +8189,150 @@ pre.diff {
   font-size: 10px;
   color: var(--ink-3);
 }
+/* Stage 5 polish — calendar+quick-select popover.
+   Two-column layout matching the design mockup: month calendar
+   on the left, start/end fields + quick-select grid + actions on
+   the right. */
 .cx-timerange-popover {
   position: absolute;
   z-index: 14;
   top: calc(100% + 4px);
-  right: 0;
-  min-width: 240px;
-  padding: 10px;
+  left: 0;
+  min-width: 620px;
+  padding: 14px;
   background: var(--paper);
   border: 1px solid var(--rule);
-  border-radius: var(--rad-s);
-  box-shadow: 0 8px 20px rgba(0,0,0,0.08);
-  display: flex; flex-direction: column; gap: 8px;
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0,0,0,0.10);
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
 }
-.cx-timerange-field {
-  display: flex; flex-direction: column; gap: 3px;
-  font-size: 11px;
-  color: var(--ink-2);
+.cx-cal { display: flex; flex-direction: column; gap: 8px; }
+.cx-cal-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 4px;
 }
-.cx-timerange-field input {
-  padding: 4px 6px;
-  border: var(--hair-soft);
-  border-radius: 4px;
-  background: var(--paper-light);
-  font: inherit;
+.cx-cal-title {
+  font-size: 14px;
+  font-weight: 500;
   color: var(--ink-1);
 }
-.cx-timerange-error {
+.cx-cal-nav {
+  width: 28px; height: 28px;
+  border: 0;
+  background: transparent;
+  color: var(--ink-2);
+  font-size: 18px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.cx-cal-nav:hover { background: var(--paper-tinted); color: var(--ink-1); }
+.cx-cal-weekrow {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 2px;
+  padding: 0 2px;
+}
+.cx-cal-weekday {
+  text-align: center;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  color: var(--ink-3);
+}
+.cx-cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 2px;
+}
+.cx-cal-cell {
+  height: 34px;
+  border: 0;
+  background: transparent;
+  color: var(--ink-1);
+  font-size: 12.5px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.cx-cal-cell:hover { background: var(--paper-tinted); }
+.cx-cal-cell.is-other-month { color: var(--ink-3); opacity: 0.5; }
+.cx-cal-cell.is-in-range { background: var(--amber-bg, #fcefd6); }
+.cx-cal-cell.is-endpoint {
+  background: var(--accent, #c2410c);
+  color: #fff;
+}
+.cx-cal-cell.is-today {
+  outline: 1px solid var(--rule);
+}
+.cx-cal-tz {
+  display: flex; align-items: center; gap: 6px;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--ink-3);
+}
+.cx-cal-side { display: flex; flex-direction: column; gap: 10px; }
+.cx-cal-section { display: flex; flex-direction: column; gap: 5px; }
+.cx-cal-section-head {
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.cx-cal-row { display: flex; gap: 6px; }
+.cx-cal-input {
+  flex: 1;
+  padding: 6px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--paper-light);
+  color: var(--ink-1);
+  font: inherit;
+  font-size: 12px;
+}
+.cx-cal-quickgrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+.cx-cal-quick {
+  padding: 6px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--paper-light);
+  color: var(--ink-1);
+  font-size: 12px;
+  cursor: pointer;
+}
+.cx-cal-quick:hover { background: var(--paper-tinted); }
+.cx-cal-quick-wide { grid-column: span 2; }
+.cx-cal-error {
   font-size: 11px;
   color: #b91c1c;
 }
-.cx-timerange-actions {
-  display: flex; justify-content: flex-end; gap: 6px;
-  margin-top: 2px;
+.cx-cal-actions {
+  display: flex; justify-content: flex-end; gap: 8px;
+  margin-top: auto;
 }
+.cx-cal-cancel,
+.cx-cal-apply {
+  padding: 7px 14px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.cx-cal-cancel {
+  background: var(--paper-light);
+  border: 1px solid var(--rule);
+  color: var(--ink-1);
+}
+.cx-cal-apply {
+  background: var(--ink-1);
+  border: 1px solid var(--ink-1);
+  color: var(--paper);
+}
+.cx-cal-cancel:hover { background: var(--paper-tinted); }
+.cx-cal-apply:hover { opacity: 0.9; }
 /* Stage 5 polish — Connections path-finder strip. Collapsible row
    below the mode tabs; pills + arrows render the BFS chain. */
 .cx-pathfinder {
