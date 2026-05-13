@@ -92,16 +92,17 @@ describe('SuggestionStats', () => {
     expect(container.firstChild).toBeNull();
   });
 
-  it('renders empty placeholder when showEmptyPlaceholder + no suggestion', () => {
+  it('renders loading placeholder when showEmptyPlaceholder + no suggestion', () => {
+    // No suggestion = the companion hasn't returned yet. Show
+    // "Checking signals…" so the user knows the resolver is in
+    // flight; the "No signal yet" copy is reserved for the
+    // suggestion-arrived-but-empty case below.
     render(<SuggestionStats workstreams={workstreams} showEmptyPlaceholder />);
-    expect(screen.getByText('No signal yet')).toBeInTheDocument();
-    // Diagnostic subtext explains WHY there's no signal (3 evidence
-    // sources all came up empty) — previously this just said
-    // "Move similar pages into a workstream to teach Sidetrack",
-    // which read like a vague suggestion. New copy points the user
-    // at the ⓘ tooltip for the actual evidence-source breakdown.
+    expect(screen.getByText('Checking signals…')).toBeInTheDocument();
     expect(
-      screen.getByText(/First time seeing this URL — hover ⓘ/),
+      screen.getByText(
+        /Asking the companion for related visits, similarity, and topic membership/,
+      ),
     ).toBeInTheDocument();
   });
 

@@ -3582,10 +3582,16 @@ const App = () => {
   const showWizard = inFirstLaunchMode || wizardOpen;
   const localOnlyMode = state.companionStatus === 'local-only';
   // When local-only is the chosen mode, the companion isn't expected;
-  // "disconnected" only applies when a bridge key was set but the companion
-  // is unreachable.
+  // "disconnected" only applies when a bridge key was set but the
+  // companion is unreachable. The 'unknown' state means we haven't
+  // completed the first /status poll yet — don't surface the red
+  // banner during that gap; the panel just opened and is still
+  // dialing the companion. The status pill softens to "connecting…"
+  // for those few ticks.
   const companionDisconnected =
-    !localOnlyMode && (bridgeKey.trim().length === 0 || state.companionStatus === 'disconnected');
+    !localOnlyMode &&
+    state.companionStatus !== 'unknown' &&
+    (bridgeKey.trim().length === 0 || state.companionStatus === 'disconnected');
   // Relay banner is gated on the companion being reachable —
   // if companion is down we already show that, no point also
   // claiming peer-sync is paused (it definitionally is). Only

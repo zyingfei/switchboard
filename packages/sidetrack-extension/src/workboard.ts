@@ -8,7 +8,20 @@ import type {
 import type { DispatchEventRecord } from './dispatch/types';
 import type { ReviewDraft } from './review/types';
 
-export type CompanionStatus = 'connected' | 'disconnected' | 'vault-error' | 'local-only';
+// 'unknown' is the initial state every panel mount starts in. The
+// side panel re-mounts on every open, and the first /v1/status poll
+// takes one HTTP round trip (~50 ms when companion is hot, longer
+// during catchUp). Without 'unknown' the panel showed
+// `Companion: disconnected` on every mount until the first poll
+// landed — even when the companion was responsive. Treat 'unknown'
+// as "still checking" and don't surface the red banner until we've
+// actually heard back with a failure.
+export type CompanionStatus =
+  | 'unknown'
+  | 'connected'
+  | 'disconnected'
+  | 'vault-error'
+  | 'local-only';
 export type TrackingMode = 'auto' | 'manual' | 'stopped' | 'removed' | 'archived';
 export type PrivacyMode = 'private' | 'shared' | 'public';
 export type AllThreadsBucket = 'unread' | 'ungrouped' | 'waiting' | 'stale' | 'normal';
@@ -330,6 +343,13 @@ export const companionStatusLabel = (status: CompanionStatus): string => {
     return 'local-only';
   }
 
+  if (status === 'unknown') {
+    // First-mount state. The panel just opened and the /status poll
+    // hasn't completed yet. "Connecting…" is honest; "disconnected"
+    // would be a lie because we haven't tried yet.
+    return 'vault: connecting…';
+  }
+
   return 'vault: disconnected';
 };
 
@@ -368,7 +388,7 @@ export const defaultSettings: UiSettings = {
 export const createEmptyWorkboardState = (
   overrides: Partial<WorkboardState> = {},
 ): WorkboardState => ({
-  companionStatus: 'disconnected',
+  companionStatus: 'unknown',
   queuedCaptureCount: 0,
   droppedCaptureCount: 0,
   settings: defaultSettings,
