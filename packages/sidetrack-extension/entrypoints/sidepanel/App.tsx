@@ -563,8 +563,53 @@ const dispatchDiagnosticReasonText = (
   }
 };
 
+// Persist + hydrate the last-known companion status across panel
+// re-mounts. Without this hook the panel starts in 'unknown' on every
+// open and paints "vault: connecting…" for ~1 s while the first
+// /status poll round-trips. When the companion was reachable on close
+// (the common case) we can repaint "vault: synced" instantly and let
+// the live poll auto-correct if the world changed since.
+//
+// localStorage is the right tool here: it's synchronous (so we can
+// read it inside the useState factory) and side-panel pages have
+// their own per-origin store. The cache is tiny (one string) and
+// auto-recovers — a stale entry only ever lives until the next
+// refresh() lands, ~1 s after mount.
+const COMPANION_STATUS_CACHE_KEY = 'sidetrack.lastCompanionStatus';
+const COMPANION_STATUS_VALUES: ReadonlySet<string> = new Set([
+  'connected',
+  'disconnected',
+  'vault-error',
+  'local-only',
+  'unknown',
+]);
+const readCachedCompanionStatus = (): WorkboardState['companionStatus'] | undefined => {
+  try {
+    const raw = window.localStorage.getItem(COMPANION_STATUS_CACHE_KEY);
+    if (raw !== null && COMPANION_STATUS_VALUES.has(raw)) {
+      return raw as WorkboardState['companionStatus'];
+    }
+  } catch {
+    // localStorage may be unavailable (test env, private mode). Fall
+    // through to the default 'unknown' state.
+  }
+  return undefined;
+};
+const writeCachedCompanionStatus = (status: WorkboardState['companionStatus']): void => {
+  try {
+    window.localStorage.setItem(COMPANION_STATUS_CACHE_KEY, status);
+  } catch {
+    // Best-effort; cache miss on next mount is acceptable.
+  }
+};
+
 const App = () => {
-  const [state, setState] = useState<WorkboardState>(() => createEmptyWorkboardState());
+  const [state, setState] = useState<WorkboardState>(() => {
+    const cached = readCachedCompanionStatus();
+    return cached === undefined
+      ? createEmptyWorkboardState()
+      : createEmptyWorkboardState({ companionStatus: cached });
+  });
   const [bridgeKey, setBridgeKey] = useState('');
   const [port, setPort] = useState('17373');
   const [selectedWorkstream, setSelectedWorkstream] = useState('');
@@ -773,6 +818,14 @@ const App = () => {
   // Which thread row's action overflow menu (⋯) is open. One at a
   // time across the workboard.
   const [actionMenuOpenFor, setActionMenuOpenFor] = useState<string | null>(null);
+
+  // Persist companionStatus on every change so the next panel mount
+  // can hydrate from cache instead of starting in 'unknown'. Pair to
+  // readCachedCompanionStatus above; keeps the next reopen flash-free
+  // when the world hasn't changed.
+  useEffect(() => {
+    writeCachedCompanionStatus(state.companionStatus);
+  }, [state.companionStatus]);
 
   // Click-outside dismissal for the overflow menu. The menu's own
   // contents stop propagation, so any click that reaches document
