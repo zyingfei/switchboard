@@ -24,6 +24,14 @@ export default defineConfig({
   },
   fullyParallel: false,
   workers: 1,
+  // Single retry. Sequential e2e runs sometimes hit "Extension service
+  // worker never appeared in context.serviceWorkers() after 45 s"
+  // under sustained Chromium load — the SW just hasn't been observed
+  // by Playwright yet even though the extension installed. The
+  // condition self-heals on a fresh launch (confirmed: same test
+  // passes in 5 s when rerun in isolation), so one retry is enough
+  // and doesn't cost time when tests pass.
+  retries: 1,
   reporter: [['list']],
   outputDir: path.join(tmpdir(), 'sidetrack-extension-playwright-results'),
   use: {
