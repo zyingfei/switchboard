@@ -105,12 +105,29 @@ export const rebuildFromEventLog = async (
   eventLogPath: string,
   options: RebuildOptions = {},
 ): Promise<{ readonly indexed: number }> => {
+  // Phase-level timing so the operator can pinpoint which segment
+  // of the rebuild is slow on a real-world vault. Useful regardless
+  // of whether the rebuild runs in-process (legacy) or in the
+  // recall indexer child (production). Logs to stderr so they
+  // survive piping in either context. Enable verbose output with
+  // SIDETRACK_RECALL_PHASE_LOG=1; otherwise stays silent.
+  const phaseLogsEnabled = process.env['SIDETRACK_RECALL_PHASE_LOG'] === '1';
+  let phaseStart = Date.now();
+  const phase = (label: string): void => {
+    if (!phaseLogsEnabled) return;
+    const now = Date.now();
+    process.stderr.write(`[recall.rebuild.phase] ${label} ms=${String(now - phaseStart)}\n`);
+    phaseStart = now;
+  };
   // 1. Read the per-replica log first so we can dedupe legacy
   //    captures whose bac_id already appears as a `capture.recorded`
   //    event.
   const logEvents = options.eventLog === undefined ? [] : await options.eventLog.readMerged();
+  phase(`readMerged events=${String(logEvents.length)}`);
   const fromLog = projectRecallFromLog(logEvents);
+  phase(`projectRecallFromLog rawItems=${String(fromLog.length)}`);
   const logBacIds = collectLogBacIds(logEvents);
+  phase(`collectLogBacIds bacIds=${String(logBacIds.size)}`);
 
   const rawItems: RawCaptureItem[] = fromLog.map((item) => ({
     id: item.id,
@@ -221,6 +238,7 @@ export const rebuildFromEventLog = async (
       await yieldNow();
     }
   }
+  phase(`chunkTurns chunks=${String(chunks.length)}`);
 
   const total = chunks.length;
   const entries: IndexEntry[] = [];
@@ -251,12 +269,15 @@ export const rebuildFromEventLog = async (
     });
   }
 
+  phase(`embedBatches entries=${String(entries.length)}`);
   await upsertEntries(join(vaultRoot, '_BAC', 'recall', 'index.bin'), entries, MODEL_ID);
+  phase('upsertEntries');
   // Write the recall manifest so `recall verify` works after a
   // lifecycle rebuild — without this the rebuild path's index file
   // would be valid V3 but the manifest would say "not yet built".
   // Defer the import to keep the dependency narrow.
   const { writeRecallManifest } = await import('./ingestor.js');
   await writeRecallManifest(vaultRoot);
+  phase('writeRecallManifest');
   return { indexed: entries.length };
 };

@@ -140,6 +140,24 @@ export interface CreateRecallLifecycleOptions {
   // still apply locally but peers won't learn of the deletion via
   // sync — they'd resurrect entries on rebuild from their own log.
   readonly eventLog?: EventLog;
+  // Optional indexer client. When provided, scheduled rebuilds run
+  // in the recall indexer child process instead of in-process. The
+  // parent's main thread is free to serve /v1/status, /v1/recall/
+  // query, and every other route while the child reads, chunks,
+  // embeds, and writes the index. Falls back to in-process
+  // rebuilding when omitted (test mode + library callers).
+  readonly indexerClient?: {
+    readonly rebuild: (input: {
+      readonly vaultRoot: string;
+      readonly reason: string;
+      readonly onProgress?: (embedded: number, total: number) => void;
+    }) => Promise<{
+      readonly state: 'ready' | 'failed';
+      readonly indexed?: number;
+      readonly error?: string;
+      readonly durationMs: number;
+    }>;
+  };
 }
 
 // Rebuilder signature must accept an `onProgress` so the lifecycle
@@ -340,6 +358,35 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
     rebuildTotal = 0;
     rebuildPromise = enqueueWrite(async () => {
       try {
+        // Production path: hand off to the recall indexer child
+        // process. The parent's main thread is then free to serve
+        // /v1/status, /v1/recall/query (lexical-only while we
+        // rebuild), and everything else. The child does the read +
+        // chunk + embed + encode + write pipeline in isolation.
+        // Fallback to in-process rebuilder for tests / library
+        // callers that don't wire an indexerClient.
+        const indexer = opts.indexerClient;
+        if (indexer !== undefined) {
+          const outcome = await indexer.rebuild({
+            vaultRoot: opts.vaultRoot,
+            reason,
+            onProgress: (embedded, total) => {
+              rebuildEmbedded = embedded;
+              rebuildTotal = total;
+            },
+          });
+          if (outcome.state === 'failed') {
+            throw new Error(outcome.error ?? 'recall indexer child failed');
+          }
+          const indexed = outcome.indexed ?? 0;
+          opts.activity?.recordRebuildFinished(indexed);
+          lastRebuildAt = new Date().toISOString();
+          lastRebuildIndexed = indexed;
+          log(
+            `[recall] background rebuild finished via indexer child: indexed ${String(indexed)} entries in ${String(outcome.durationMs)} ms`,
+          );
+          return;
+        }
         const result = await rebuilder(opts.vaultRoot, eventLogPathFor(opts.vaultRoot), {
           onProgress: (embedded, total) => {
             rebuildEmbedded = embedded;

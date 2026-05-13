@@ -359,6 +359,28 @@ export const startCompanion = async (
       return accepted;
     },
   };
+  // Recall indexer client — runs full rebuilds in a separate OS
+  // process so the main thread is never pinned by the recall
+  // pipeline (read merged log + project + scan legacy JSONL +
+  // JSON.parse + chunk turns + encode index file). Earlier
+  // mitigations (embedder sidecar in 042b2642, per-text yield in
+  // 05c5ad6c, scan/chunk yields in 07b3c5ec) cut the worst case
+  // from 65 s to ~400 ms; the indexer-child approach drives it
+  // toward zero because the parent literally doesn't run the
+  // pipeline. Same SIDETRACK_EMBEDDER_INPROCESS=1 / TEST_EMBEDDER=1
+  // opt-out as the embedder sidecar: tests + library callers get
+  // the in-process rebuilder so they can assert on lifecycle state.
+  const useChildProcesses =
+    process.env['SIDETRACK_EMBEDDER_INPROCESS'] !== '1' &&
+    process.env['SIDETRACK_TEST_EMBEDDER'] !== '1';
+  const indexerClient = useChildProcesses
+    ? (await import('../recall/indexerClient.js')).createRecallIndexerClient()
+    : null;
+  if (indexerClient !== null) {
+    teardown.push(async () => {
+      await indexerClient.stop();
+    });
+  }
   const recallLifecycle = createRecallLifecycle({
     vaultRoot: options.vaultPath,
     companionVersion: COMPANION_VERSION,
@@ -368,6 +390,7 @@ export const startCompanion = async (
       nextSeq: replica.nextSeq,
     },
     eventLog,
+    ...(indexerClient === null ? {} : { indexerClient }),
   });
 
   // Recall materializer registers AFTER recallLifecycle exists. Uses
@@ -578,9 +601,7 @@ export const startCompanion = async (
   // env (SIDETRACK_TEST_EMBEDDER=1) ALWAYS routes in-process — the
   // deterministic test embedder is sync and the child overhead is
   // pure waste.
-  const inProcessEmbedder =
-    process.env['SIDETRACK_EMBEDDER_INPROCESS'] === '1' ||
-    process.env['SIDETRACK_TEST_EMBEDDER'] === '1';
+  const inProcessEmbedder = !useChildProcesses;
   const embedderClient = inProcessEmbedder ? null : createEmbedderClient();
   if (embedderClient !== null) {
     teardown.push(async () => {
