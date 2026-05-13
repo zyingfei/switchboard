@@ -453,7 +453,16 @@ export const whyRelatedReasonsFromConnections = (
         cohesion: topic === undefined ? 0 : numberFromMetadata(topic.metadata, 'cohesion', 0),
       });
     } else if (edge.kind === 'visit_resembles_visit') {
-      reasons.push({ code: 'COSINE_ABOVE_THRESHOLD', cosine: 0.85, threshold: 0.85 });
+      // The similarity producer's actual cosine + threshold now ride
+      // the edge metadata (snapshot.ts:1986). Fall back to the legacy
+      // 0.85 default only when reading older snapshots; once the
+      // companion redeploys, every edge carries real values.
+      const meta = edge.metadata ?? {};
+      reasons.push({
+        code: 'COSINE_ABOVE_THRESHOLD',
+        cosine: numberFromMetadata(meta, 'cosine', 0.85),
+        threshold: numberFromMetadata(meta, 'threshold', 0.85),
+      });
     } else if (edge.kind === 'closest_visit') {
       const reason = rankerReasonForEdge(edge);
       if (reason !== null) reasons.push(reason);

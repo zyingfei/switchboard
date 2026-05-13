@@ -1207,6 +1207,12 @@ describe('connections — content-derived edges', () => {
       source: 'visit-similarity',
       revisionId: 'visit-sim-rev-1',
     });
+    // Locks in metadata round-trip: the cosine + threshold were
+    // previously dropped here, forcing the UI to hardcode 0.85 in
+    // `extension/src/sidepanel/connections/client.ts:455`. The fix
+    // persists them on the edge so the why-related panel can show
+    // the real score.
+    expect(edge?.metadata).toEqual({ cosine: 0.91, threshold: 0.85 });
     expect(
       snap.edges.filter((candidate) => candidate.kind === 'visit_resembles_visit'),
     ).toHaveLength(1);

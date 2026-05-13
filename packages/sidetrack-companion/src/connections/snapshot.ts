@@ -1993,6 +1993,17 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
         },
         confidence: 'inferred',
         family: 'urlmatch',
+        // RCA 2026-05: the similarity producer computes cosine + uses
+        // a threshold to gate emission, but the snapshot previously
+        // wrote no metadata at all. The side panel's Why-related
+        // panel hardcoded `cosine: 0.85, threshold: 0.85` because it
+        // had no real values to display — every "via similarity"
+        // chip lied about the actual score. Persist both so the UI
+        // shows "cosine 0.87 (≥0.85)" instead of guessing.
+        metadata: {
+          cosine: Number(similarityEdge.cosine.toFixed(4)),
+          threshold: Number(input.visitSimilarity.threshold.toFixed(4)),
+        },
       });
     }
   }
