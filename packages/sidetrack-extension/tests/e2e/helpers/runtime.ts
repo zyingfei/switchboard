@@ -668,7 +668,10 @@ export const launchExtensionRuntime = async (
       // is bound to the main world on chrome-extension:// pages).
       // Under Patchright stealth the page's chrome is the web chrome
       // (csi/loadTimes only) and chrome.runtime is undefined — fall
-      // back to evaluating in the extension's service worker.
+      // back to a SW-driven path that sidesteps the SW→SW sendMessage
+      // loop (Chrome doesn't deliver chrome.runtime.sendMessage to the
+      // sender's own context, so SW.evaluate(sendMessage) gets no
+      // responder).
       const pageResult = await evaluateInMainWorld(
         senderPage,
         async (runtimeMessage) => {
@@ -682,10 +685,26 @@ export const launchExtensionRuntime = async (
         message,
       ).catch(() => ({ ok: false }) as const);
       if (pageResult.ok) return pageResult.response;
+      // Fallback: invoke the SW's chrome.runtime.onMessage listener
+      // directly via the `__sidetrackTestDispatchMessage` test hook
+      // (registered in background.ts alongside the listener). Chrome
+      // doesn't deliver chrome.runtime.sendMessage to the sender's own
+      // context, and chrome.scripting.executeScript refuses to inject
+      // into chrome-extension:// pages, so the test hook is the only
+      // way to reach SW message handlers from worker.evaluate.
       const sw = await getExtensionServiceWorker(context, extensionId);
-      return await sw.evaluate(async (runtimeMessage) => {
-        const response = (await chrome.runtime.sendMessage(runtimeMessage)) as unknown;
-        return response;
+      return await sw.evaluate(async (msg: unknown) => {
+        const hook = (
+          globalThis as unknown as {
+            __sidetrackTestDispatchMessage?: (m: unknown) => Promise<unknown>;
+          }
+        ).__sidetrackTestDispatchMessage;
+        if (hook === undefined) {
+          throw new Error(
+            'sendRuntimeMessage: __sidetrackTestDispatchMessage not installed on SW globalThis — rebuild the extension.',
+          );
+        }
+        return await hook(msg);
       }, message);
     },
     async seedStorage(senderPage: Page, values: Record<string, unknown>) {

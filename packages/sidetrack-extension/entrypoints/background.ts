@@ -3691,8 +3691,11 @@ export default defineBackground(() => {
     return result;
   };
 
-  chrome.runtime.onMessage.addListener(
-    (message: unknown, sender, sendResponse: (response: RuntimeResponse) => void) => {
+  const runtimeMessageListener = (
+    message: unknown,
+    sender: chrome.runtime.MessageSender,
+    sendResponse: (response: RuntimeResponse) => void,
+  ): boolean | undefined => {
       // Build-verification ping from any extension page (side panel,
       // any extension HTML). Returns the build sha + dirty flag + builtAt
       // so operators can confirm which bundle is loaded.
@@ -4264,8 +4267,43 @@ export default defineBackground(() => {
           });
         });
       return true;
-    },
-  );
+    };
+
+  chrome.runtime.onMessage.addListener(runtimeMessageListener);
+
+  // Test-only loopback for the e2e harness. Chrome doesn't deliver
+  // chrome.runtime.sendMessage back to the sender's own context, so
+  // when the Patchright stealth e2e routes through worker.evaluate
+  // (the only way to reach chrome.* from a stripped main world), the
+  // SW's own listeners never fire. Stash the listener fn on globalThis
+  // so the test runtime helper can invoke it directly with a fake
+  // sender and capture sendResponse. No production caller uses this —
+  // production messages flow through chrome.runtime.sendMessage from
+  // non-SW contexts, which works normally.
+  (
+    globalThis as unknown as {
+      __sidetrackTestDispatchMessage?: (message: unknown) => Promise<unknown>;
+    }
+  ).__sidetrackTestDispatchMessage = (message: unknown): Promise<unknown> =>
+    new Promise<unknown>((resolve) => {
+      let responded = false;
+      const sendResponse = (response: unknown): void => {
+        if (responded) return;
+        responded = true;
+        resolve(response);
+      };
+      const fakeSender = { id: chrome.runtime.id } as chrome.runtime.MessageSender;
+      const isAsync = runtimeMessageListener(
+        message,
+        fakeSender,
+        sendResponse as (response: RuntimeResponse) => void,
+      );
+      if (isAsync !== true && !responded) {
+        // Synchronous handler that didn't respond — match Chrome's
+        // "no responder" behaviour and resolve with undefined.
+        resolve(undefined);
+      }
+    });
 
   void replayQueuedCaptures().catch(() => undefined);
 
