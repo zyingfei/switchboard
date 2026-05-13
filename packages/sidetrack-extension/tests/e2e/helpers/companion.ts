@@ -233,6 +233,20 @@ export const startTestCompanion = async (
         // companion-side unit tests via vi.mock; the env-var path
         // is what the spawned subprocess sees.
         SIDETRACK_TEST_EMBEDDER: '1',
+        // The test embedder hashes tokens into 384 dims with ±0.25
+        // weight; even visits sharing 3-4 corpus tokens reach only
+        // ~0.35 cosine, well below the 0.85 production gate. Lower
+        // both the similarity producer + topic clusterer gates so the
+        // full-browser-sync e2e (and any other test that uses the
+        // deterministic embedder) actually forms clusters. Production
+        // companions keep the 0.85 default — these envs only fire for
+        // spawned test companions.
+        ...(process.env['SIDETRACK_SIMILARITY_THRESHOLD'] === undefined
+          ? { SIDETRACK_SIMILARITY_THRESHOLD: '0.2' }
+          : {}),
+        ...(process.env['SIDETRACK_TOPIC_COSINE_THRESHOLD'] === undefined
+          ? { SIDETRACK_TOPIC_COSINE_THRESHOLD: '0.2' }
+          : {}),
         // Stage 5 follow-up — inherit the test-harness's git SHA so the
         // companion's /v1/version reports the actual build identity.
         // Lets the attach-diag detect "extension rebuilt but the

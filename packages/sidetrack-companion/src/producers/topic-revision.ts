@@ -7,6 +7,22 @@ import { createRevision } from '../domain/ids.js';
 export const DEFAULT_TOPIC_COSINE_THRESHOLD = 0.85;
 export const DEFAULT_TOPIC_ENGAGEMENT_GATE_MS = 5_000;
 export const DEFAULT_TOPIC_WORKSTREAM_SHARE_THRESHOLD = 0.75;
+
+// Env override mirroring SIDETRACK_SIMILARITY_THRESHOLD on the
+// upstream producer. Keeps the production default at 0.85 (real
+// e5-small embeddings cluster well above) while letting e2e fixtures
+// that use the deterministic test embedder dial the gate down to
+// what hashed token vectors can actually reach.
+export const TOPIC_COSINE_THRESHOLD_ENV = 'SIDETRACK_TOPIC_COSINE_THRESHOLD';
+export const resolveTopicCosineThreshold = (): number => {
+  const raw = process.env[TOPIC_COSINE_THRESHOLD_ENV];
+  if (raw === undefined || raw === '') return DEFAULT_TOPIC_COSINE_THRESHOLD;
+  const parsed = Number.parseFloat(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 1) {
+    return DEFAULT_TOPIC_COSINE_THRESHOLD;
+  }
+  return parsed;
+};
 export const TOPIC_UNION_FIND_REVISION_KEY = 'topic-revision:v1:union-find' as const;
 export const TOPIC_HDBSCAN_REVISION_KEY = 'topic-revision:v2:hdbscan' as const;
 export const TOPIC_ALGORITHM_VERSION = TOPIC_UNION_FIND_REVISION_KEY;

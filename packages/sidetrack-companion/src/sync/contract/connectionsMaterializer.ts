@@ -55,11 +55,11 @@ import {
   readClosestVisitRankerRevision,
 } from '../../producers/closest-visit-revision.js';
 import {
-  DEFAULT_TOPIC_COSINE_THRESHOLD,
   TOPIC_HDBSCAN_REVISION_KEY,
   TOPIC_UNION_FIND_REVISION_KEY,
   createTopicRevisionId,
   createTopicRevisionStore,
+  resolveTopicCosineThreshold,
   type TopicAlgorithmVersion,
   type TopicRevision,
   type TopicRevisionStore,
@@ -791,8 +791,9 @@ export const createConnectionsMaterializer = (
         lastObservedAt: entry.lastSeenAt ?? entry.firstSeenAt ?? '1970-01-01T00:00:00.000Z',
       });
     }
+    const topicCosineThreshold = resolveTopicCosineThreshold();
     for (const edge of visitSimilarity.edges) {
-      topicAccumulator.addSimilarityEdge(edge, DEFAULT_TOPIC_COSINE_THRESHOLD);
+      topicAccumulator.addSimilarityEdge(edge, topicCosineThreshold);
     }
     mark('topicAccumulator.fold');
     const previousTopicRevision = await topicRevisionStore.readActiveRevision();
@@ -818,7 +819,7 @@ export const createConnectionsMaterializer = (
     });
     const expectedTopicRevisionId = await createTopicRevisionId({
       visitSimilarityRevisionId: visitSimilarity.revisionId,
-      cosineThreshold: DEFAULT_TOPIC_COSINE_THRESHOLD,
+      cosineThreshold: topicCosineThreshold,
       algorithmVersion: topicRevisionAlgorithm,
     });
     // Stage 5.2 W4 fast path — when SIDETRACK_CONNECTIONS_HOT_TOPICS=1
@@ -850,6 +851,7 @@ export const createConnectionsMaterializer = (
       topicRevision = await buildSelectedTopicRevision({
         visits: topicVisits,
         visitSimilarity,
+        options: { cosineThreshold: topicCosineThreshold },
         ...(userAssertedRelations.length === 0 ? {} : { userAssertedRelations }),
         ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
       });
