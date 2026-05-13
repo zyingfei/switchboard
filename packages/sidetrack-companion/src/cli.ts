@@ -750,6 +750,22 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
     process.env['SIDETRACK_OFFLINE_MODELS'] = '1';
   }
 
+  // Default the connections materializer into worker_thread mode for
+  // CLI starts. Cold-start catchUp on a real-world vault
+  // (seq=12 k+ in prod, ~30 s of pure CPU) pegs the main thread
+  // until the rebuild finishes, queuing every HTTP request — most
+  // visibly /status, which is what the side panel polls for its
+  // "Companion: connected" badge. The worker runs the rebuild on a
+  // dedicated thread so the HTTP listener stays responsive while
+  // catchUp churns. Tests + library callers that don't go through
+  // the CLI keep the in-process path because they need the main-
+  // thread accumulator state for assertions; setting the env
+  // explicitly to '0' here also lets users opt out from the shell
+  // without editing config.
+  if (process.env['SIDETRACK_CONNECTIONS_WORKER'] === undefined) {
+    process.env['SIDETRACK_CONNECTIONS_WORKER'] = '1';
+  }
+
   if (args.installService) {
     if (syncRequested(args)) {
       await ensureRendezvousSecret(args.vaultPath, args.syncRendezvousSecret);

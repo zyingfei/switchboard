@@ -126,6 +126,7 @@ import {
   type TimelineStore,
 } from '../../timeline/projection.js';
 import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
+import { isMainThread } from 'node:worker_threads';
 import type { AcceptedEvent } from '../causal.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
@@ -975,12 +976,40 @@ export const createConnectionsMaterializer = (
     lastEngagementClassRevision = undefined;
   };
 
+  // Decide whether the next pass (catchUp or drain) should be offloaded
+  // to a worker_thread instead of running buildAndWrite on the main
+  // thread. Three things matter:
+  //
+  //   1. Are we already running INSIDE a worker? The worker entry
+  //      script calls `materializer.catchUp(eventLog)` itself — if
+  //      that catchUp also tried to spawn a worker, we'd recurse
+  //      forever. `isMainThread === false` short-circuits the check.
+  //
+  //   2. The explicit env `SIDETRACK_CONNECTIONS_WORKER` opts the
+  //      pass into worker mode. With this change catchUp honours the
+  //      env too — the previous code path bypassed it, so a cold-
+  //      start rebuild over a real prod vault (12 k+ events) pinned
+  //      the main thread for 30+ seconds and queued /status behind
+  //      every other CPU-bound projection pass. The CLI sets this env
+  //      at startup so end users get the worker by default; tests
+  //      and programmatic users that import startCompanion directly
+  //      keep the in-process path so they can assert on in-process
+  //      accumulator state.
+  //
+  //   3. Per-pass overrides aren't supported — workers are spawned
+  //      per drain (`runReconcileInWorker`), so we pay ~50ms of
+  //      spawn cost per pass. Negligible vs. the 30s+ rebuilds the
+  //      worker is replacing.
+  const shouldUseWorker = (): boolean => {
+    if (!isMainThread) return false;
+    return process.env['SIDETRACK_CONNECTIONS_WORKER'] === '1';
+  };
+
   const drain = async (): Promise<void> => {
-    const workerMode = process.env['SIDETRACK_CONNECTIONS_WORKER'] === '1';
     while (dirty) {
       dirty = false;
       try {
-        if (workerMode) {
+        if (shouldUseWorker()) {
           await drainViaWorker();
         } else {
           await buildAndWrite();
@@ -1066,7 +1095,8 @@ export const createConnectionsMaterializer = (
     pending = true;
     // Stage 5.2 W2b/c wiring — catchUp is the recovery / boot-time path;
     // force a re-seed so any drift between the in-memory accumulators
-    // and the event log is corrected. The next buildAndWrite seeds.
+    // and the event log is corrected. The next buildAndWrite (or worker
+    // pass) seeds.
     projectionAccumulatorsInitialized = false;
     urlAccumulator = createEmptyUrlProjectionAccumulator();
     tabSessionAccumulator = createEmptyTabSessionProjectionAccumulator();
@@ -1074,7 +1104,17 @@ export const createConnectionsMaterializer = (
     // catchUp so the next drain rebuilds against the fresh log.
     lastEngagementClassRevision = undefined;
     try {
-      await buildAndWrite();
+      // 2026-05 cold-start fix: route catchUp through the worker the
+      // same way drain does. The previous direct buildAndWrite()
+      // pinned the main thread for the full re-projection (~30 s on a
+      // 12 k-event prod vault), which queued /status and every other
+      // HTTP request behind it. shouldUseWorker() respects the env
+      // opt-out AND skips itself when we're already inside a worker.
+      if (shouldUseWorker()) {
+        await drainViaWorker();
+      } else {
+        await buildAndWrite();
+      }
       lastSuccessAt = new Date().toISOString();
       lastError = null;
       dirty = false;
