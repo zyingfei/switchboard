@@ -8426,11 +8426,79 @@ pre.diff {
   gap: 12px;
   padding: 16px;
 }
+.cx-flow-summary {
+  padding: 0 0 4px 0;
+  font-size: 10.5px;
+  line-height: 1.5;
+}
 .cx-flow-row {
   display: grid;
-  grid-template-columns: 120px 1fr;
+  grid-template-columns: 140px 1fr;
   gap: 12px;
   align-items: start;
+}
+.cx-flow-tab-host {
+  font-size: 10px;
+  color: var(--ink-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cx-flow-tab-life {
+  font-size: 10px;
+  color: var(--ink-3);
+}
+.cx-flow-segment-label {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  align-self: center;
+  margin: 0 4px;
+}
+.cx-flow-visit-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 200px;
+  padding: 12px;
+  border: 1px dashed var(--rule);
+  border-radius: var(--rad-s);
+  background: transparent;
+  font-size: 11px;
+  color: var(--ink-3);
+  text-align: center;
+}
+.cx-flow-visit-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.cx-flow-visit-provider,
+.cx-flow-visit-engagement {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: var(--paper-warm, var(--paper));
+  border: 1px solid var(--rule-soft);
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+.cx-flow-visit-search-query {
+  display: block;
+  font-style: italic;
+  font-size: 10.5px;
+  color: var(--ink-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cx-flow-visit-count {
+  font-size: 10px;
 }
 .cx-flow-tab {
   font-family: var(--mono);

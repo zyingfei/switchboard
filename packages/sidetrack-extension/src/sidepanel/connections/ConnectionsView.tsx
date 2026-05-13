@@ -15,7 +15,9 @@ import { FamilyLegend } from './FamilyLegend';
 import {
   FlowPathView,
   type CrossReplicaEdge,
+  type FlowSummary,
   type NavigationEdge,
+  type TabSessionInfo,
   type TimelineVisit,
 } from './FlowPathView';
 import {
@@ -259,7 +261,22 @@ const deriveFlowVisits = (
       metadataString(node.metadata, ['canonicalUrl', 'url', 'latestUrl']) ??
       urlFromNodeId(node);
     const host = hostOf(canonicalUrl);
-    const focusedWindowMs = metadataNumber(node.metadata, 'focusedWindowMs', 0);
+    // Prefer the nested engagement.focusedWindowMs (companion writes it
+    // alongside engagement.class); fall back to a flat key for
+    // backward compatibility with older snapshots.
+    const engagementMeta = node.metadata['engagement'];
+    const engagementFocusedMs =
+      typeof engagementMeta === 'object' &&
+      engagementMeta !== null &&
+      !Array.isArray(engagementMeta) &&
+      typeof (engagementMeta as Record<string, unknown>)['focusedWindowMs'] === 'number'
+        ? ((engagementMeta as Record<string, unknown>)['focusedWindowMs'] as number)
+        : undefined;
+    const focusedWindowMs =
+      engagementFocusedMs ?? metadataNumber(node.metadata, 'focusedWindowMs', 0);
+    const provider = metadataString(node.metadata, ['provider']);
+    const visitCount = metadataNumber(node.metadata, 'visitCount', 0);
+    const searchQuery = metadataString(node.metadata, ['searchQuery']);
     const isAnchor =
       node.id === anchorId ||
       (anchorUrl !== undefined && canonicalUrl === anchorUrl);
@@ -276,6 +293,10 @@ const deriveFlowVisits = (
       ...(canonicalUrl === undefined ? {} : { url: canonicalUrl }),
       ...(focusedWindowMs > 0 ? { focusedWindowMs } : {}),
       ...(isAnchor ? { isAnchor: true } : {}),
+      ...(provider === undefined ? {} : { provider }),
+      ...(visitCount > 0 ? { visitCount } : {}),
+      ...(searchQuery === undefined ? {} : { searchQuery }),
+      ...(node.firstSeenAt === undefined ? {} : { firstSeenAt: node.firstSeenAt }),
     });
   }
   return out;
@@ -299,6 +320,84 @@ const deriveCrossReplicaEdges = (edges: readonly ConnectionEdge[]): readonly Cro
       fromVisitId: edge.fromNodeId,
       replicaId: edge.toNodeId.replace(/^replica:/u, ''),
     }));
+
+// Build tab-session info keyed by the same hash the visits use for
+// grouping (visit-instance's `metadata.tabSessionId`). Flow Path
+// renders this as the tab column header (title + host + lifespan).
+const deriveTabSessions = (
+  nodes: readonly ConnectionNode[],
+  ctx: EntityDisplayCtx,
+): ReadonlyMap<string, TabSessionInfo> => {
+  const out = new Map<string, TabSessionInfo>();
+  for (const node of nodes) {
+    if (node.kind !== 'tab-session') continue;
+    const tabSessionId = node.id.replace(/^tab-session:/u, '');
+    const lastActivityAt =
+      metadataString(node.metadata, ['lastActivityAt']) ?? node.lastSeenAt;
+    const firstSeenAt = node.firstSeenAt;
+    const lifespanMs =
+      lastActivityAt !== undefined && firstSeenAt !== undefined
+        ? Math.max(0, Date.parse(lastActivityAt) - Date.parse(firstSeenAt))
+        : undefined;
+    const latestUrl = metadataString(node.metadata, ['latestUrl', 'canonicalUrl']);
+    const host = hostOf(latestUrl);
+    out.set(tabSessionId, {
+      label: formatEntityDisplay(node, ctx).primary,
+      ...(host === undefined ? {} : { host }),
+      ...(lastActivityAt === undefined ? {} : { lastActivityAt }),
+      ...(firstSeenAt === undefined ? {} : { firstSeenAt }),
+      ...(lifespanMs === undefined ? {} : { lifespanMs }),
+    });
+  }
+  return out;
+};
+
+// Cross-tab opener map from `tab_session_opener_chain` edges. The
+// visit-level `opener_visit` map handled in FlowPathView is more
+// specific (knows WHICH visit opened the new tab); this fills the
+// gap when the source visit isn't loaded in scope.
+const deriveTabOpenerMap = (
+  edges: readonly ConnectionEdge[],
+): ReadonlyMap<string, string> => {
+  const out = new Map<string, string>();
+  for (const edge of edges) {
+    if (edge.kind !== 'tab_session_opener_chain') continue;
+    const dest = edge.fromNodeId.replace(/^tab-session:/u, '');
+    const src = edge.toNodeId.replace(/^tab-session:/u, '');
+    if (dest.length > 0 && src.length > 0) out.set(dest, src);
+  }
+  return out;
+};
+
+// Lifecycle stats for the strip above the Flow Path rows. Aggregates
+// across every TimelineVisit that matches the anchor URL — that's
+// how the user sees "Visited 3 times across 3 tabs · first 5 min ago".
+const deriveFlowSummary = (
+  visits: readonly TimelineVisit[],
+  crossReplicaEdges: readonly CrossReplicaEdge[],
+  replicaAlias: (id: string) => string,
+): FlowSummary => {
+  const anchorVisits = visits.filter((v) => v.isAnchor === true);
+  const tabHashes = new Set<string>();
+  for (const v of anchorVisits) tabHashes.add(v.tabSessionIdHash);
+  let earliestMs: number | undefined;
+  for (const v of anchorVisits) {
+    const seed = v.firstSeenAt ?? v.commitTimestamp;
+    const ms = Date.parse(seed);
+    if (Number.isFinite(ms) && (earliestMs === undefined || ms < earliestMs)) {
+      earliestMs = ms;
+    }
+  }
+  const replicaIds = new Set<string>();
+  for (const edge of crossReplicaEdges) replicaIds.add(edge.replicaId);
+  const replicaAliases = [...replicaIds].map((id) => replicaAlias(id)).sort();
+  return {
+    visitCount: anchorVisits.length,
+    tabCount: tabHashes.size,
+    ...(earliestMs === undefined ? {} : { firstSeenAt: new Date(earliestMs).toISOString() }),
+    replicaAliases,
+  };
+};
 
 // Stage 5 polish — the anchor-scoped subgraph only carries 1-2 hops
 // from the anchor. Navigation chains (previous_visit_in_tab_session,
@@ -1388,24 +1487,29 @@ export const ConnectionsView = ({
                 ctx={ctx}
               />
             ) : subMode === 'flow' ? (
-              <FlowPathView
-                visits={deriveFlowVisits(
-                  flowSubgraph.nodes.length > 0 ? flowSubgraph.nodes : result.snapshot.nodes,
-                  ctx,
-                  anchor,
-                )}
-                navigationEdges={deriveNavigationEdges(
-                  flowSubgraph.edges.length > 0 ? flowSubgraph.edges : result.snapshot.edges,
-                )}
-                crossReplicaEdges={deriveCrossReplicaEdges(
-                  flowSubgraph.edges.length > 0 ? flowSubgraph.edges : result.snapshot.edges,
-                )}
-                replicaAlias={ctx.replicaAlias}
-                onNodeClick={(visitId) => {
-                  setSelectedEdge(null);
-                  setWhyVisitId(visitId);
-                }}
-              />
+              (() => {
+                const flowNodes =
+                  flowSubgraph.nodes.length > 0 ? flowSubgraph.nodes : result.snapshot.nodes;
+                const flowEdges =
+                  flowSubgraph.edges.length > 0 ? flowSubgraph.edges : result.snapshot.edges;
+                const flowVisits = deriveFlowVisits(flowNodes, ctx, anchor);
+                const crossReplica = deriveCrossReplicaEdges(flowEdges);
+                return (
+                  <FlowPathView
+                    visits={flowVisits}
+                    navigationEdges={deriveNavigationEdges(flowEdges)}
+                    crossReplicaEdges={crossReplica}
+                    replicaAlias={ctx.replicaAlias}
+                    tabSessions={deriveTabSessions(flowNodes, ctx)}
+                    tabOpenerByDest={deriveTabOpenerMap(flowEdges)}
+                    summary={deriveFlowSummary(flowVisits, crossReplica, ctx.replicaAlias)}
+                    onNodeClick={(visitId) => {
+                      setSelectedEdge(null);
+                      setWhyVisitId(visitId);
+                    }}
+                  />
+                );
+              })()
             ) : subMode === 'focus' ? (
               <FocusView
                 topics={focusData.topics}

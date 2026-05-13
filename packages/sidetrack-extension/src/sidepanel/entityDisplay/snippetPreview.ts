@@ -72,7 +72,16 @@ export const useSnippetPreviewMap = (): PreviewLookup => {
       }
     };
     const onChangedHub = (
-      globalThis as { chrome?: { storage?: { onChanged?: chrome.storage.StorageChangedEvent } } }
+      globalThis as {
+        chrome?: {
+          storage?: {
+            onChanged?: {
+              addListener: (callback: typeof onChanged) => void;
+              removeListener: (callback: typeof onChanged) => void;
+            };
+          };
+        };
+      }
     ).chrome?.storage?.onChanged;
     onChangedHub?.addListener(onChanged);
     return () => {
