@@ -34,6 +34,7 @@ import {
   startHttpServer,
   type StartedHttpServer,
 } from '../http/server.js';
+import { startEventLoopMonitor } from './eventLoopMonitor.js';
 import { createEventLog } from '../sync/eventLog.js';
 import { createKnownReplicasStore } from '../sync/knownReplicas.js';
 import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
@@ -558,6 +559,16 @@ export const startCompanion = async (
       // verb + lifecycle stale-check rebuilds remain available.
     }
   })();
+  // Event-loop stall monitor. Spans the entire process lifetime so
+  // /v1/status can report `eventLoop.maxRecentStallMs` etc. independent
+  // of whether the materializer or recall lifecycle is doing work.
+  // Any synchronous-CPU phase that pins the main thread for >250 ms
+  // prints `[api.stall] eventLoopBlockedMs=… note=…` so the operator
+  // can locate the blocking phase without re-running with profilers.
+  const eventLoopMonitor = startEventLoopMonitor();
+  teardown.push(() => {
+    eventLoopMonitor.stop();
+  });
   const server = createCompanionHttpServer({
     bridgeKey: ensured.key,
     vaultWriter,
@@ -567,6 +578,7 @@ export const startCompanion = async (
     allowAutoUpdate: options.allowAutoUpdate ?? false,
     startedAt: new Date(),
     bucketRegistry: createBucketRegistry(options.vaultPath),
+    getEventLoopSnapshot: eventLoopMonitor.snapshot,
     ...(collectorFramework === null
       ? {}
       : {

@@ -446,6 +446,14 @@ export interface CompanionHttpConfig {
   // changes such as forced ranker retraining. Runtime wiring points
   // this at the connections materializer catchUp path.
   readonly refreshConnections?: () => Promise<void>;
+  // Event-loop stall snapshot. /v1/status surfaces it so operators
+  // can diagnose API stalls without re-running the companion under
+  // a profiler. The getter MUST be synchronous + side-effect-free
+  // (it reads a perf_hooks histogram). When omitted the field is
+  // simply absent from /v1/status — tests don't need it.
+  readonly getEventLoopSnapshot?: () => import(
+    '../runtime/eventLoopMonitor.js'
+  ).EventLoopSnapshot;
 }
 
 export interface StartedHttpServer {
@@ -1278,6 +1286,19 @@ const routes: readonly RouteDefinition[] = [
     pattern: /^\/v1\/status$/,
     authRequired: true,
     handle: async (_request, requestId, _match, context) => {
+      // /v1/status is the **liveness + cached-readiness** probe the
+      // side panel polls every 15s. It MUST:
+      //   - Return immediately even if the materializer is in the
+      //     middle of catchUp, the recall index is rebuilding, or
+      //     the ONNX embedder hasn't been initialised yet.
+      //   - Never trigger a rebuild, a model load, an embedder
+      //     warmup, or an unbounded `waitForRebuild()` call.
+      //   - Never transitively import recall/ingestor/embedder/
+      //     transformers/ONNX. The only allowed dependencies are
+      //     synchronous getters on the runtime context.
+      // The response shape reports subsystem state as data; the
+      // request itself does no work to make any subsystem ready.
+      //
       // When the companion manages an MCP child, probe its /mcp
       // endpoint so the side panel knows whether restart/config
       // changes succeeded. Distinguishes three states the user
@@ -1390,12 +1411,68 @@ const routes: readonly RouteDefinition[] = [
                       : { byReplica: relayLive.byReplica }),
                   }),
             };
+      // ---- cached subsystem state — no work allowed ----
+      // Snapshot state: the connections snapshot store's last
+      // committed revision. Read once, no rebuild trigger.
+      let snapshotState:
+        | { readonly state: 'missing' | 'ready'; readonly revision?: string; readonly updatedAt?: string }
+        | undefined;
+      if (context.connectionsStore !== undefined) {
+        try {
+          const current = await context.connectionsStore.readCurrent();
+          if (current === null) {
+            snapshotState = { state: 'missing' };
+          } else {
+            snapshotState = {
+              state: 'ready',
+              ...(current.snapshotRevision === undefined ? {} : { revision: current.snapshotRevision }),
+              updatedAt: current.updatedAt,
+            };
+          }
+        } catch {
+          snapshotState = { state: 'missing' };
+        }
+      }
+      // Recall state — uses `isRebuilding()` (sync) only. Calling
+      // `report()` here would read the index file (fast) but adds
+      // I/O latency; `/v1/system/health` already exposes the rich
+      // report for callers that want it. /status reports just the
+      // coarse state so the panel can render "warming" vs "ready".
+      let recallState:
+        | { readonly state: 'disabled' | 'rebuilding' | 'ready' }
+        | undefined;
+      if (context.recallLifecycle !== undefined) {
+        recallState = {
+          state: context.recallLifecycle.isRebuilding() ? 'rebuilding' : 'ready',
+        };
+      } else {
+        recallState = { state: 'disabled' };
+      }
+      // Materializer state — cached health snapshot (sync).
+      const materializerHealth = context.syncMaterializerHealth?.() ?? undefined;
+      const materializerState =
+        materializerHealth === undefined
+          ? undefined
+          : {
+              state: Object.values(materializerHealth).some((h) => h.status === 'failed')
+                ? 'failed'
+                : Object.values(materializerHealth).some((h) => h.pending)
+                  ? 'catching_up'
+                  : 'idle',
+              detail: materializerHealth,
+            };
+      const eventLoopState = context.getEventLoopSnapshot?.();
       return [
         200,
         {
           data: {
             companion: 'running',
             vault: await context.vaultWriter.status(),
+            api: { live: true },
+            ...(snapshotState === undefined ? {} : { snapshot: snapshotState }),
+            ...(recallState === undefined ? {} : { recall: recallState }),
+            ...(materializerState === undefined ? {} : { materializer: materializerState }),
+            ...(eventLoopState === undefined ? {} : { eventLoop: eventLoopState }),
             // P1-review: vaultRoot lets the side panel build Codex
             // MCP config snippets without asking the user to paste
             // the absolute vault path. Only included when the
