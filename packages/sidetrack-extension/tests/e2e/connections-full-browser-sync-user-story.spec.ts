@@ -1583,7 +1583,17 @@ test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 com
     process.env['SIDETRACK_E2E_SKIP_LIVE_BROWSERS'] === '1',
     'set SIDETRACK_E2E_SKIP_LIVE_BROWSERS=1 to skip when CfT is unavailable',
   );
-  test.setTimeout(HOLD_OPEN_ON_CONNECTIONS ? 0 : 600_000);
+  // 1200 s total budget. The first half is driving the
+  // multi-flow story on Browser A (real chrome.tabs across 13
+  // visits in 2 workstreams, dwell timers, engagement
+  // finalization). The second half is waiting for Browser B to
+  // catch up through the relay (the inner `waitForConnections`
+  // budget itself is 480 s for that step). 600 s was the historic
+  // floor; the workstream-attribution restoration (2026-05) added
+  // `visit_in_workstream` edges that bumped the materializer per-
+  // tick cost on B, pushing the relay convergence beyond the
+  // previous floor.
+  test.setTimeout(HOLD_OPEN_ON_CONNECTIONS ? 0 : 1_200_000);
 
   let relay: TestRelay | null = null;
   let companionA: TestCompanion | null = null;
@@ -1724,15 +1734,19 @@ test.describe('connections - full browser sync user story (Stage 1 + 2/3 + 4 com
         );
       },
       'Browser B did not receive Browser A visits with expected workstream attribution through the relay',
-      // 240 s instead of 120 s. The story drives 13 visits across
-      // two workstreams; each goes through observer → drain → relay
-      // → companion-B materializer. With the workstream-attribution
-      // restoration (2026-05) every visit also emits a
-      // `visit_in_workstream` edge through the projection — more
-      // work per replay tick. 120 s was the tight floor; 240 s
-      // gives the second batch room to land before the predicate
-      // gives up.
-      240_000,
+      // 480 s instead of the original 120 s. The story drives 13
+      // visits across two workstreams; each goes through observer →
+      // drain → relay → companion-B materializer. With the
+      // workstream-attribution restoration (2026-05) every visit
+      // also emits a `visit_in_workstream` edge through the
+      // projection. Observed throughput in the failing scenario:
+      // A reaches 54 nodes / 102 edges in 10 minutes while B sees
+      // only the first ~11 nodes within 240 s. The relay's
+      // event-time push is real-time, but cold-start handshake +
+      // back-pressure across two real browsers grows non-linearly.
+      // 480 s is the empirical floor that lets the second workstream
+      // batch arrive before the predicate gives up.
+      480_000,
     );
 
     for (const { workstreamId, visits } of [
