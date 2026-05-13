@@ -438,6 +438,27 @@ export const seedUrlProjectionAccumulator = (
   return acc;
 };
 
+// Async variant that yields to the event loop every `yieldEvery`
+// events. Used by the materializer's cold-start path so /status (and
+// any other HTTP request) gets a turn while a 10k+ event vault is
+// being re-projected. Byte-identical to the sync variant; the only
+// difference is the cooperative yield.
+export const seedUrlProjectionAccumulatorAsync = async (
+  events: readonly AcceptedEvent[],
+  yieldEvery = 500,
+): Promise<UrlProjectionAccumulator> => {
+  const acc = createEmptyUrlProjectionAccumulator();
+  for (let i = 0; i < events.length; i += 1) {
+    foldEventIntoUrlProjectionAccumulator(acc, events[i] as AcceptedEvent);
+    if ((i + 1) % yieldEvery === 0) {
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+    }
+  }
+  return acc;
+};
+
 export const urlProjectionFromAccumulator = (
   acc: UrlProjectionAccumulator,
 ): UrlProjection => ({

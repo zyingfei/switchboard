@@ -750,21 +750,17 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
     process.env['SIDETRACK_OFFLINE_MODELS'] = '1';
   }
 
-  // Default the connections materializer into worker_thread mode for
-  // CLI starts. Cold-start catchUp on a real-world vault
-  // (seq=12 k+ in prod, ~30 s of pure CPU) pegs the main thread
-  // until the rebuild finishes, queuing every HTTP request — most
-  // visibly /status, which is what the side panel polls for its
-  // "Companion: connected" badge. The worker runs the rebuild on a
-  // dedicated thread so the HTTP listener stays responsive while
-  // catchUp churns. Tests + library callers that don't go through
-  // the CLI keep the in-process path because they need the main-
-  // thread accumulator state for assertions; setting the env
-  // explicitly to '0' here also lets users opt out from the shell
-  // without editing config.
-  if (process.env['SIDETRACK_CONNECTIONS_WORKER'] === undefined) {
-    process.env['SIDETRACK_CONNECTIONS_WORKER'] = '1';
-  }
+  // Note: an earlier revision of this file defaulted
+  // SIDETRACK_CONNECTIONS_WORKER=1 here to keep /status responsive
+  // during cold-start catchUp. That fix regressed into a V8 fatal
+  // ("HeapObject::SafeSizeFromMap" in the concurrent major sweeper)
+  // on real prod vaults — the worker entry transitively loads
+  // onnxruntime-node + usearch + sharp, and those native addons
+  // appear to mishandle being instantiated in two V8 isolates in
+  // the same process. The worker_thread path is still available
+  // via explicit `SIDETRACK_CONNECTIONS_WORKER=1`; the in-process
+  // path now relies on cooperative yielding inside the seeders to
+  // keep the HTTP listener interleaved.
 
   if (args.installService) {
     if (syncRequested(args)) {

@@ -133,7 +133,7 @@ import type { Materializer, MaterializerHealth } from './materializer.js';
 import {
   createEmptyTabSessionProjectionAccumulator,
   foldEventIntoTabSessionProjectionAccumulator,
-  seedTabSessionProjectionAccumulator,
+  seedTabSessionProjectionAccumulatorAsync,
   tabSessionProjectionFromAccumulator,
   type TabSessionProjectionAccumulator,
 } from '../../tabsession/projection.js';
@@ -141,7 +141,7 @@ import {
   applyThreadAttributionsToAccumulator,
   createEmptyUrlProjectionAccumulator,
   foldEventIntoUrlProjectionAccumulator,
-  seedUrlProjectionAccumulator,
+  seedUrlProjectionAccumulatorAsync,
   urlProjectionFromAccumulator,
   type UrlProjectionAccumulator,
 } from '../../urls/projection.js';
@@ -595,8 +595,12 @@ export const createConnectionsMaterializer = (
     // calls below. Subsequent drains reuse the accumulator state that
     // onAccepted has been folding into.
     if (!projectionAccumulatorsInitialized) {
-      urlAccumulator = seedUrlProjectionAccumulator(merged);
-      tabSessionAccumulator = seedTabSessionProjectionAccumulator(merged);
+      // Async seeders yield every 500 events so /status (and every
+      // other HTTP request) interleaves with the cold-start fold over
+      // 10k+ events. Switching to the sync versions reintroduces the
+      // 30-second main-thread stall observed against real prod vaults.
+      urlAccumulator = await seedUrlProjectionAccumulatorAsync(merged);
+      tabSessionAccumulator = await seedTabSessionProjectionAccumulatorAsync(merged);
       projectionAccumulatorsInitialized = true;
       mark('projectionAccumulators.seed');
     }
