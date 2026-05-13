@@ -21,25 +21,29 @@ let stealthExperimentWarningPrinted = false;
 // gets baseEnvPort + cdpAllocationIndex.
 let cdpAllocationIndex = 0;
 
-// Patchright extends page.evaluate with a 3rd `isolatedContext: false` param
-// that forces evaluation in the page's main world. Without it, patchright
-// runs page.evaluate in an isolated context where chrome-extension page APIs
-// (chrome.runtime, chrome.storage, …) are NOT bound. Stock Playwright ignores
-// the extra arg.
-type PatchrightMainWorldPage = Page & {
-  readonly evaluate: <Arg, Result>(
-    pageFunction: (arg: Arg) => Result | Promise<Result>,
-    arg: Arg,
-    isolatedContext: false,
-  ) => Promise<Result>;
-};
-
+// Helper for evaluations that must run in a context where the page's
+// chrome.* extension APIs (chrome.runtime, chrome.storage, …) are
+// bound. Default launch path uses stock Playwright, whose
+// `page.evaluate` already runs in the page's main world, so this is
+// the standard 2-arg call. (Earlier versions of this file passed a
+// 3rd `false` arg targeting Patchright's `isolatedContext` overload —
+// current Playwright versions reject the extra arg with `Too many
+// arguments`. The stealth-experiment path uses Patchright via
+// `launchStealthPersistentContext` and Patchright defaults to main-
+// world bindings on extension pages, so the 2-arg call works on both
+// runtimes.)
 const evaluateInMainWorld = async <Arg, Result>(
   page: Page,
   pageFunction: (arg: Arg) => Result | Promise<Result>,
   arg: Arg,
 ): Promise<Result> =>
-  await (page as PatchrightMainWorldPage).evaluate(pageFunction, arg, false);
+  // The cast routes Playwright's overload resolution to the
+  // `(pageFunction, arg)` form regardless of whether `Arg` is
+  // narrowed to `void` at the call site.
+  await (page.evaluate as <A, R>(fn: (arg: A) => R | Promise<R>, arg: A) => Promise<R>)(
+    pageFunction,
+    arg,
+  );
 
 const isSidetrackExtensionWorker = (worker: Worker): boolean =>
   worker.url().startsWith('chrome-extension://') && worker.url().endsWith('/background.js');
