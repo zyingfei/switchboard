@@ -752,6 +752,12 @@ const App = () => {
   urlSuggestionsRef.current = urlSuggestions;
   const tabSessionSuggestionLoadInFlightRef = useRef(false);
   const urlSuggestionLoadInFlightRef = useRef(false);
+  // 2026-05 cleanup: with the 4 s background poll gone, the user can
+  // refresh a single suggestion via the per-card ↻ button. This set
+  // tracks which urls are currently re-fetching so the button can
+  // disable + show a spinner without a separate Map per card.
+  const [refreshingUrlSuggestionIds, setRefreshingUrlSuggestionIds] =
+    useState<ReadonlySet<string>>(() => new Set<string>());
   // URL auto-apply is reversible (your manual move beats the inferred
   // one on precedence tie-break) but we still don't want to retry the
   // same URL on every poll cycle. Track in-flight + completed attempts
@@ -1326,6 +1332,40 @@ const App = () => {
     [fetchCompanionJson, mapWithConcurrency],
   );
 
+  // Per-row refresh: re-resolves a single URL's suggestion without
+  // touching the rest of the inbox. With the 4 s background poll
+  // gone (2026-05), this is how the user manually picks up a fresher
+  // suggestion for ONE card — one /v1/visits/.../resolve call,
+  // instead of refetching the whole list.
+  const refreshUrlSuggestion = useCallback(
+    async (canonicalUrl: string): Promise<void> => {
+      setRefreshingUrlSuggestionIds((current) => {
+        if (current.has(canonicalUrl)) return current;
+        const next = new Set(current);
+        next.add(canonicalUrl);
+        return next;
+      });
+      try {
+        const result = await fetchCompanionJson<unknown>(
+          `/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve?dryRun=true`,
+        );
+        if (isUrlResolutionResult(result)) {
+          setUrlSuggestions((current) => ({ ...current, [canonicalUrl]: result }));
+        }
+      } catch {
+        // Per-card refresh failures stay silent — the user can retry.
+      } finally {
+        setRefreshingUrlSuggestionIds((current) => {
+          if (!current.has(canonicalUrl)) return current;
+          const next = new Set(current);
+          next.delete(canonicalUrl);
+          return next;
+        });
+      }
+    },
+    [fetchCompanionJson],
+  );
+
   // Stage 5 follow-up — background polls should NOT flip the
   // `tabSessionLoading` flag (it toggles the "Loading tab sessions…"
   // line, which reflows the Inbox layout every 4 s = visible flicker).
@@ -1464,21 +1504,19 @@ const App = () => {
     void loadTabSessions({ background: true });
   }, [loadTabSessions, state.companionStatus, state.updatedAt, viewMode]);
 
-  // Periodic refresh while the companion is connected so newly observed
-  // browser titles + recorder events flow into the Inbox / suggestion
-  // banner without waiting for state.updatedAt to bump. 4s is a balance
-  // between perceived latency (titles arrive a beat after status:complete)
-  // and HTTP load on the companion. Stops as soon as the companion
-  // disconnects.
-  useEffect(() => {
-    if (state.companionStatus !== 'connected') return;
-    const handle = setInterval(() => {
-      void loadTabSessions({ background: true });
-    }, 4000);
-    return () => {
-      clearInterval(handle);
-    };
-  }, [loadTabSessions, state.companionStatus]);
+  // 2026-05 cleanup: dropped the 4 s background poll. It was firing
+  // /v1/tabsessions/*/resolve four times per minute per visible card,
+  // for every warm-restart of the side panel, even when nothing had
+  // changed. The user explicitly asked for cache-first behavior:
+  // suggestions stick until the user hits Refresh (list-level), the
+  // per-card refresh button, or visibly navigates a tab (handled by
+  // the push-driven refresh below). The companion already publishes
+  // freshness through tab-navigation events, so this poll was pure
+  // overhead.
+  //
+  // If we ever need a heartbeat to detect companion-status changes,
+  // it should be a small "ping" call (no suggestions in the response)
+  // rather than re-fetching every suggestion in the visible list.
 
   // Push-driven refresh: the moment the user navigates a tab, force the
   // SW to drain its spool and reload the projection. Without this the
@@ -5605,6 +5643,23 @@ const App = () => {
             >
               Ignore (admin / noise)
             </button>
+            {/* Cross-surface jump to Connections, mirroring the
+                InboxCard "⇄ Graph" affordance. Anchors on the
+                timeline-visit for this URL so the user can see the
+                neighborhood that does (or doesn't) exist yet — useful
+                when SuggestionStats says "No signal yet" and the user
+                wants to know what evidence the resolver had. */}
+            <button
+              type="button"
+              className="tab-attribution-card-action"
+              onClick={() => {
+                requestSwitchToConnections(focusedUrlRecord.canonicalUrl);
+              }}
+              title="Open this URL's neighborhood in the Connections graph"
+              data-testid="focused-tab-open-in-connections"
+            >
+              ⇄ Graph
+            </button>
           </div>
         ) : null}
       </section>
@@ -6093,6 +6148,10 @@ const App = () => {
           onIgnore={handleUrlIgnore}
           displayCtx={displayCtx}
           onOpenInConnections={requestSwitchToConnections}
+          onRefreshSuggestion={(canonicalUrl) => {
+            void refreshUrlSuggestion(canonicalUrl);
+          }}
+          refreshingSuggestionIds={refreshingUrlSuggestionIds}
           initialQuery={inboxSearchRequest}
           onQueryConsumed={() => {
             setInboxSearchRequest('');

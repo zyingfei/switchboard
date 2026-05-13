@@ -28,6 +28,13 @@ export interface InboxViewProps {
   readonly nodeById?: ReadonlyMap<string, ConnectionNode>;
   readonly displayCtx?: EntityDisplayCtx;
   readonly onOpenInConnections?: (canonicalUrl: string) => void;
+  // Per-card refresh — re-resolves a single suggestion. Used to be
+  // unnecessary because the panel polled every 4 s; with the poll
+  // gone (2026-05), per-card refresh is how the user manually picks
+  // up a fresher suggestion without re-fetching the whole list.
+  readonly onRefreshSuggestion?: (tabSessionId: string) => void;
+  // Set of tab-session ids whose refresh is currently in flight.
+  readonly refreshingSuggestionIds?: ReadonlySet<string>;
   // Stage 5 polish — cross-surface jump from Connections: pre-fill
   // the Inbox search query and scroll the matching card into view.
   // `onQueryConsumed` clears the parent's request after we've
@@ -63,6 +70,8 @@ export function InboxView({
   nodeById,
   displayCtx,
   onOpenInConnections,
+  onRefreshSuggestion,
+  refreshingSuggestionIds,
   initialQuery,
   onQueryConsumed,
 }: InboxViewProps) {
@@ -147,6 +156,8 @@ export function InboxView({
             {...(nodeById === undefined ? {} : { nodeById })}
             {...(displayCtx === undefined ? {} : { displayCtx })}
             {...(onOpenInConnections === undefined ? {} : { onOpenInConnections })}
+            {...(onRefreshSuggestion === undefined ? {} : { onRefreshSuggestion })}
+            refreshingSuggestion={refreshingSuggestionIds?.has(record.tabSessionId) === true}
           />
         ))}
       </div>

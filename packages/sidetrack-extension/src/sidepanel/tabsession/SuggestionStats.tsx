@@ -85,6 +85,17 @@ export function SuggestionStats({
 }: SuggestionStatsProps) {
   if (suggestion === undefined || suggestion.fusedCandidates.length === 0) {
     if (!showEmptyPlaceholder) return null;
+    // The resolver needs ≥1 of these three to fire for a URL:
+    //   - PPR adjacency to a workstream (related visit edges exist)
+    //   - Visit similarity score above threshold (a workstream page
+    //     looks textually similar)
+    //   - Topic cluster posterior > 0 (URL belongs to a topic that
+    //     has dominant workstream attribution)
+    // For a brand-new URL on a new host with no prior context, all
+    // three are zero — that's not a bug, it's "we don't know yet".
+    // The Graph button (⇄ Graph in the Current Tab / Inbox card head
+    // row) is the diagnostic affordance: clicking it shows whether
+    // the neighborhood exists at all.
     return (
       <div className="suggestion-stats is-empty">
         <span className="suggestion-stats-row">
@@ -92,16 +103,19 @@ export function SuggestionStats({
           <span
             className="suggestion-stats-info"
             title={
-              'Sidetrack has no related visits, similar pages, or topic-cluster ' +
-              'evidence for this URL yet. Move a few similar pages into a ' +
-              'workstream and suggestions will start appearing.'
+              'Sidetrack checked three signals and all came up empty:\n' +
+              '· no related visits link to a workstream (PPR=0)\n' +
+              '· no workstream pages look similar (similarity=0)\n' +
+              '· this URL is not in any topic cluster yet (topic=0)\n\n' +
+              'Click "⇄ Graph" to see what Sidetrack does know about this URL, ' +
+              'or move similar pages to a workstream to teach the resolver.'
             }
           >
             ⓘ
           </span>
         </span>
         <span className="suggestion-stats-source mono subtle">
-          Move similar pages into a workstream to teach Sidetrack
+          First time seeing this URL — hover ⓘ for what was checked
         </span>
       </div>
     );

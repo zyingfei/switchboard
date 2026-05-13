@@ -95,7 +95,14 @@ describe('SuggestionStats', () => {
   it('renders empty placeholder when showEmptyPlaceholder + no suggestion', () => {
     render(<SuggestionStats workstreams={workstreams} showEmptyPlaceholder />);
     expect(screen.getByText('No signal yet')).toBeInTheDocument();
-    expect(screen.getByText(/Move similar pages/)).toBeInTheDocument();
+    // Diagnostic subtext explains WHY there's no signal (3 evidence
+    // sources all came up empty) — previously this just said
+    // "Move similar pages into a workstream to teach Sidetrack",
+    // which read like a vague suggestion. New copy points the user
+    // at the ⓘ tooltip for the actual evidence-source breakdown.
+    expect(
+      screen.getByText(/First time seeing this URL — hover ⓘ/),
+    ).toBeInTheDocument();
   });
 
   it('renders empty placeholder when showEmptyPlaceholder + suggestion with no candidates', () => {

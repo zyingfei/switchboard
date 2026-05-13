@@ -48,6 +48,16 @@ export interface InboxCardProps {
   // node as the new Connections anchor and switches viewMode.
   // When omitted, the affordance isn't rendered.
   readonly onOpenInConnections?: (canonicalUrl: string) => void;
+  // 2026-05 cleanup: per-card refresh. The panel used to poll every
+  // 4 s; that's gone, so the user needs a way to re-resolve a single
+  // suggestion when they suspect it's stale. The list-level refresh
+  // (in InboxView's header) re-fetches everything; this is the
+  // per-row equivalent that only hits ONE /v1/tabsessions/.../resolve
+  // call. When omitted, the affordance isn't rendered.
+  readonly onRefreshSuggestion?: (tabSessionId: string) => void;
+  // True while the per-card refresh is in flight. Used to dim the
+  // button + show a small spinner.
+  readonly refreshingSuggestion?: boolean;
 }
 
 export function InboxCard({
@@ -61,6 +71,8 @@ export function InboxCard({
   nodeById,
   displayCtx,
   onOpenInConnections,
+  onRefreshSuggestion,
+  refreshingSuggestion = false,
 }: InboxCardProps) {
   const host = hostFor(record);
   const title = tabSessionDisplayTitle(record);
@@ -125,6 +137,21 @@ export function InboxCard({
             >
               <span aria-hidden>⇄</span>
               <span>Graph</span>
+            </button>
+          ) : null}
+          {onRefreshSuggestion !== undefined ? (
+            <button
+              type="button"
+              className="tab-session-go-to"
+              onClick={() => {
+                onRefreshSuggestion(record.tabSessionId);
+              }}
+              disabled={refreshingSuggestion}
+              title="Re-resolve this URL's suggestion against the latest companion state"
+              aria-label="Refresh suggestion"
+              data-testid={`tab-session-refresh-${record.tabSessionId}`}
+            >
+              <span aria-hidden>{refreshingSuggestion ? '…' : '↻'}</span>
             </button>
           ) : null}
         </div>
