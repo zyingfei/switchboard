@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import type { Writable } from 'node:stream';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 import { ensureMcpAuthKey } from './auth/mcpAuthKey.js';
 import { pickInstaller } from './install/index.js';
@@ -932,7 +932,27 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
 
 const entrypointPath = process.argv[1];
 
-if (entrypointPath !== undefined && import.meta.url === pathToFileURL(entrypointPath).href) {
+// Determine whether this module is the process entry point. The naive
+// `import.meta.url === pathToFileURL(argv[1]).href` check fails when
+// the CLI is invoked through a symlink (e.g. an `npm link`-ed bin or a
+// global Homebrew shim): Node resolves the symlink for `import.meta
+// .url` but leaves `argv[1]` pointing at the symlink, so the URLs
+// differ even though the same script is the entry. Compare realpaths
+// instead, falling back to the symlink path if realpath fails (paths
+// inside a packaged binary, for example).
+const isCliEntry = (): boolean => {
+  if (entrypointPath === undefined) return false;
+  const moduleFile = fileURLToPath(import.meta.url);
+  let resolvedEntry: string;
+  try {
+    resolvedEntry = realpathSync(entrypointPath);
+  } catch {
+    resolvedEntry = entrypointPath;
+  }
+  return moduleFile === resolvedEntry;
+};
+
+if (isCliEntry()) {
   runCli(process.argv.slice(2), {
     stdout: process.stdout,
     stderr: process.stderr,
