@@ -83,7 +83,24 @@ export function SuggestionStats({
   showAlternatives = false,
   showEmptyPlaceholder = false,
 }: SuggestionStatsProps) {
-  if (suggestion === undefined || suggestion.fusedCandidates.length === 0) {
+  if (suggestion === undefined) {
+    // Distinct from "fetched but empty" below — the suggestion has not
+    // come back from the companion yet. Saying "No signal yet" here is
+    // a lie: we haven't *checked* yet. Render a loading affordance so
+    // the user doesn't conclude the resolver gave up before it ran.
+    if (!showEmptyPlaceholder) return null;
+    return (
+      <div className="suggestion-stats is-loading">
+        <span className="suggestion-stats-row">
+          <span className="suggestion-stats-target subtle">Checking signals…</span>
+        </span>
+        <span className="suggestion-stats-source mono subtle">
+          Asking the companion for related visits, similarity, and topic membership
+        </span>
+      </div>
+    );
+  }
+  if (suggestion.fusedCandidates.length === 0) {
     if (!showEmptyPlaceholder) return null;
     // The resolver needs ≥1 of these three to fire for a URL:
     //   - PPR adjacency to a workstream (related visit edges exist)
