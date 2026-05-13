@@ -246,6 +246,11 @@ export interface WorkboardState {
   readonly queuedCaptureCount: number;
   readonly droppedCaptureCount: number;
   readonly relayHealth?: RelayHealth;
+  // Connections snapshot revision. Side panel watches this to
+  // invalidate cached resolver suggestions when the materializer
+  // produces a new snapshot (e.g. after a freshly visited URL is
+  // folded into the graph).
+  readonly snapshotRevision?: string;
   // V3 no-data-loss surfaces. failedCaptureCount is explicit
   // captures that exhausted retries. lastQueueRejectionAt is set
   // when an explicit capture was rejected because the queue was

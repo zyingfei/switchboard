@@ -1190,13 +1190,19 @@ const verifyCompanionSettingsBeforeSave = async (
 // HTTP round-trip. Reset to null when settings change so a stale
 // "connected" banner doesn't survive a companion swap.
 let cachedRelayStatus: NonNullable<CompanionStatus['sync']>['relay'] | null = null;
+// Connections snapshot revision from the last /v1/status response.
+// Surfaces to the side panel via WorkboardState.snapshotRevision so
+// it can detect when cached resolver suggestions have gone stale.
+let cachedSnapshotRevision: string | null = null;
 
 export const peekCachedRelayStatus = (): typeof cachedRelayStatus => cachedRelayStatus;
+export const peekCachedSnapshotRevision = (): string | null => cachedSnapshotRevision;
 
 const assertCompanionReachable = async (): Promise<'connected' | 'vault-error' | 'local-only'> => {
   const settings = await readSettings();
   if (settings.companion.bridgeKey.length === 0) {
     cachedRelayStatus = null;
+    cachedSnapshotRevision = null;
     return 'local-only';
   }
   const status = await createCompanionClient(settings.companion).status();
@@ -1204,6 +1210,7 @@ const assertCompanionReachable = async (): Promise<'connected' | 'vault-error' |
   // builder can route a relay-disconnected banner without a
   // second round-trip.
   cachedRelayStatus = status.sync?.relay ?? null;
+  cachedSnapshotRevision = status.snapshotRevision ?? null;
   return status.vault === 'connected' ? 'connected' : 'vault-error';
 };
 
@@ -1653,8 +1660,10 @@ const buildState = async (
   // because withCompanionStatus calls assertCompanionReachable
   // before invoking buildState.
   const relayHealth = cachedRelayStatus ?? undefined;
+  const snapshotRevision = cachedSnapshotRevision ?? undefined;
   return {
     ...(await buildWorkboardState(companionStatus, lastError, relayHealth)),
+    ...(snapshotRevision === undefined ? {} : { snapshotRevision }),
     ...(tab?.url === undefined ? {} : { activeTabUrl: tab.url }),
     ...(activeTabSessionId === undefined ? {} : { activeTabSessionId }),
     currentTab: await currentTabThread(),

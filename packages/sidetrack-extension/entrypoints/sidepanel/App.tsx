@@ -1337,7 +1337,17 @@ const App = () => {
         }
       });
       for (const entry of fetched) {
-        if (entry !== null) next[entry[0]] = entry[1];
+        if (entry === null) continue;
+        const [id, result] = entry;
+        // Skip caching empty results. An empty resolution most often
+        // means the materializer hasn't folded the new visit into the
+        // snapshot yet (materializer drains run async in a child
+        // process). If we cached an empty result we'd stick on
+        // "No signal yet" forever — the snapshot.revision watcher
+        // will force a refetch when the drain lands, and any unrelated
+        // refresh trigger in the meantime gets a fresh attempt too.
+        if (result.fusedCandidates.length === 0) continue;
+        next[id] = result;
       }
       return next;
     },
@@ -1378,7 +1388,14 @@ const App = () => {
         }
       });
       for (const entry of fetched) {
-        if (entry !== null) next[entry[0]] = entry[1];
+        if (entry === null) continue;
+        const [url, result] = entry;
+        // Same self-heal as the tab-session cache: empty results
+        // usually mean the materializer hasn't drained the new visit
+        // yet. Don't cache them; let snapshot.revision changes (or
+        // any other refresh trigger) force a refetch.
+        if (result.fusedCandidates.length === 0) continue;
+        next[url] = result;
       }
       return next;
     },
@@ -1556,6 +1573,25 @@ const App = () => {
     if (state.companionStatus !== 'connected') return;
     void loadTabSessions({ background: true });
   }, [loadTabSessions, state.companionStatus, state.updatedAt, viewMode]);
+
+  // Watch the companion's snapshot revision. When the materializer
+  // produces a new snapshot (typically 1-5s after a freshly visited
+  // URL is captured), force a re-fetch of resolver suggestions so
+  // the Current Tab card stops showing "No signal yet" for URLs the
+  // graph now knows about. The cache-fill side of this also skips
+  // caching empty results — together they self-heal the stale state.
+  const lastSnapshotRevisionRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (state.companionStatus !== 'connected') return;
+    const rev = state.snapshotRevision;
+    if (rev === undefined) return;
+    if (lastSnapshotRevisionRef.current === rev) return;
+    // First observation: prime without refetching.
+    const previous = lastSnapshotRevisionRef.current;
+    lastSnapshotRevisionRef.current = rev;
+    if (previous === null) return;
+    void loadTabSessions({ background: true, forceRefetchSuggestions: true });
+  }, [loadTabSessions, state.companionStatus, state.snapshotRevision]);
 
   // 2026-05 cleanup: dropped the 4 s background poll. It was firing
   // /v1/tabsessions/*/resolve four times per minute per visible card,

@@ -78,6 +78,7 @@ const parseStatus = (value: unknown): CompanionStatus => {
     readonly vault?: unknown;
     readonly requestId?: unknown;
     readonly sync?: unknown;
+    readonly snapshot?: unknown;
   };
 
   if (statusData.companion !== 'running') {
@@ -122,7 +123,23 @@ const parseStatus = (value: unknown): CompanionStatus => {
     };
   }
 
-  return { companion: 'running', vault, requestId, ...(sync === undefined ? {} : { sync }) };
+  // Snapshot freshness — the side panel uses revision changes as a
+  // signal that resolver suggestions cached against the previous
+  // snapshot have gone stale. Parse defensively; a missing field
+  // just means the companion didn't publish a revision yet.
+  const snapshotIn = statusData.snapshot;
+  const snapshotRevision =
+    isRecord(snapshotIn) && typeof (snapshotIn as Record<string, unknown>)['revision'] === 'string'
+      ? ((snapshotIn as Record<string, unknown>)['revision'] as string)
+      : undefined;
+
+  return {
+    companion: 'running',
+    vault,
+    requestId,
+    ...(sync === undefined ? {} : { sync }),
+    ...(snapshotRevision === undefined ? {} : { snapshotRevision }),
+  };
 };
 
 const parseMutationResult = (value: unknown): MutationResult => {
