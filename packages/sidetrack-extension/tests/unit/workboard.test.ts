@@ -40,6 +40,11 @@ describe('workboard scaffold', () => {
     expect(companionStatusLabel('disconnected')).toBe('vault: disconnected');
     expect(companionStatusLabel('vault-error')).toBe('vault: unreachable');
     expect(companionStatusLabel('local-only')).toBe('local-only');
+    // 'unknown' is the first-mount state before the first /status
+    // poll lands. Surface it as "connecting…" so the user sees the
+    // resolver is still working; rendering "disconnected" here would
+    // flash on every panel reopen.
+    expect(companionStatusLabel('unknown')).toBe('vault: connecting…');
   });
 
   describe('compareQueueItems', () => {
