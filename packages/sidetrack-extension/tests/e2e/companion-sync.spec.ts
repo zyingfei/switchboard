@@ -34,7 +34,14 @@ test.describe('companion sync (synthetic)', () => {
       });
       await page.reload({ waitUntil: 'domcontentloaded' });
 
-      await expect(page.locator('.ws-status')).toHaveText('vault: disconnected');
+      // After re-mount the panel starts in the 'unknown' state ("vault:
+      // connecting…") and only transitions to 'disconnected' after the
+      // first /v1/status round trip fails. In Patchright the SW wake-up
+      // + ECONNREFUSED round trip is typically sub-second, but allow up
+      // to 30s for the cold-start path to be safe.
+      await expect(page.locator('.ws-status')).toHaveText('vault: disconnected', {
+        timeout: 30_000,
+      });
       const disconnectedBanner = page.locator('.sys-banner.sys-red');
       await expect(disconnectedBanner).toBeVisible();
       await expect(disconnectedBanner).toContainText('Companion: disconnected');
