@@ -7896,6 +7896,33 @@ pre.diff {
   text-transform: none;
   letter-spacing: 0;
 }
+/* Inline icon button — sits flush with the anchor chip, no border
+   group. Used for the "Find in Inbox" cross-surface affordance so
+   the anchor row stays single-line even when this is visible. */
+.cx-anchor-inline-btn {
+  border: 0;
+  background: transparent;
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+}
+.cx-anchor-inline-btn:hover:enabled { background: var(--paper-tinted); }
+/* Stage 5 polish — filter strip below the mode tabs. Compact row
+   that hosts the time-range control (and future filters) without
+   crowding the anchor bar. Renders only when there's a result. */
+.cx-filterbar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 14px 6px;
+  border-bottom: 1px solid var(--rule-soft, #e5ddc9);
+  background: var(--paper-light);
+}
+.cx-filterbar-label {
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  flex: none;
+}
 /* Stage 5 polish — Connections find-by-title search box.
    Sits at the top of the left rail; ranked dropdown shows up to 8
    hits across the loaded snapshot + workstream anchors + recents. */

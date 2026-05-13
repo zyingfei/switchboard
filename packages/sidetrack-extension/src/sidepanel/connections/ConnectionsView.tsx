@@ -835,6 +835,23 @@ export const ConnectionsView = ({
         ) : (
           <span className="cx-mono cx-dim">no anchor selected</span>
         )}
+        {onOpenInInbox !== undefined && anchorCanonicalUrl !== null ? (
+          // Inline icon next to the anchor chip — only when the
+          // anchor carries a canonical URL. Keeps the anchor row
+          // single-line at the cost of one extra glyph.
+          <button
+            type="button"
+            className="cx-anchor-nav-btn cx-anchor-inline-btn"
+            onClick={() => {
+              onOpenInInbox(anchorCanonicalUrl);
+            }}
+            aria-label="Find this URL in Inbox"
+            title={`Find in Inbox · ${anchorCanonicalUrl}`}
+            data-testid="connections-anchor-open-inbox"
+          >
+            ⇄
+          </button>
+        ) : null}
         <span className="cx-spacer" />
         <button
           type="button"
@@ -847,21 +864,6 @@ export const ConnectionsView = ({
         >
           ↻
         </button>
-        {onOpenInInbox !== undefined && anchorCanonicalUrl !== null ? (
-          <button
-            type="button"
-            className="cx-anchor-nav-btn cx-anchor-nav-btn-wide"
-            onClick={() => {
-              onOpenInInbox(anchorCanonicalUrl);
-            }}
-            aria-label="Find this URL in Inbox"
-            title="Find in Inbox — switch to the Inbox tab and pre-fill the search with this URL"
-            data-testid="connections-anchor-open-inbox"
-          >
-            Inbox ⇄
-          </button>
-        ) : null}
-        <TimeRangePills value={timeRange} onChange={setTimeRange} hiddenNodeCount={hiddenByTime} />
         <HopToggle value={hops} onChange={setHops} />
       </div>
       <div className="cx-modes" role="tablist" aria-label="View mode">
@@ -955,6 +957,18 @@ export const ConnectionsView = ({
           useNodeAsAnchor(nodeId);
         }}
       />
+      {result !== null ? (
+        // Thin filter strip — collapsible, only renders when there's
+        // a loaded result. Keeps the anchor bar single-line.
+        <div className="cx-filterbar" data-testid="connections-filterbar">
+          <span className="cx-filterbar-label mono">Window</span>
+          <TimeRangePills
+            value={timeRange}
+            onChange={setTimeRange}
+            hiddenNodeCount={hiddenByTime}
+          />
+        </div>
+      ) : null}
       {timeline !== null ? <TimelineRail data={timeline} ctx={ctx} /> : null}
       <div className="cx-cols">
         <aside className="cx-col-l">
