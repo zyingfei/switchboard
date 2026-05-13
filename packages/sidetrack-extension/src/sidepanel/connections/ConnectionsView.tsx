@@ -190,25 +190,38 @@ const engagementClassForNode = (node: ConnectionNode): EngagementClass | undefin
   return isEngagementClass(value) ? value : undefined;
 };
 
+// Stage 5 polish — Flow Path now sources its visits from
+// `visit-instance` nodes too, not just `timeline-visit`. The
+// navigation chain (`previous_visit_in_tab_session`,
+// `opener_visit`) connects visit-instance nodes — without
+// surfacing them here, the chain "HN front page → article →
+// comments" was invisible even at hops=2. Tab grouping uses
+// `metadata.tabSessionId` from visit-instances so each browser tab
+// becomes its own row in the Flow Path view.
 const deriveFlowVisits = (
   nodes: readonly ConnectionNode[],
   ctx: EntityDisplayCtx,
-): readonly TimelineVisit[] =>
-  nodes
-    .filter((node) => node.kind === 'timeline-visit')
-    .map((node) => ({
+): readonly TimelineVisit[] => {
+  const out: TimelineVisit[] = [];
+  for (const node of nodes) {
+    if (node.kind !== 'visit-instance' && node.kind !== 'timeline-visit') continue;
+    const tabSessionIdHash =
+      metadataString(node.metadata, ['tabSessionId', 'tabSessionIdHash', 'tabIdHash']) ??
+      (node.kind === 'timeline-visit' ? 'all-tabs' : 'unknown-tab');
+    const engagementClass = engagementClassForNode(node);
+    out.push({
       id: node.id,
       label: formatEntityDisplay(node, ctx).primary,
       commitTimestamp:
         node.lastSeenAt ??
         metadataString(node.metadata, ['commitTimestamp', 'lastSeenAt', 'observedAt']) ??
         '1970-01-01T00:00:00.000Z',
-      tabSessionIdHash:
-        metadataString(node.metadata, ['tabSessionIdHash', 'tabIdHash']) ?? 'unknown-tab',
-      ...(engagementClassForNode(node) === undefined
-        ? {}
-        : { engagementClass: engagementClassForNode(node) }),
-    }));
+      tabSessionIdHash,
+      ...(engagementClass === undefined ? {} : { engagementClass }),
+    });
+  }
+  return out;
+};
 
 const deriveNavigationEdges = (edges: readonly ConnectionEdge[]): readonly NavigationEdge[] =>
   edges
@@ -601,7 +614,12 @@ export const ConnectionsView = ({
   const useNodeAsAnchor = (nodeId: string): void => {
     setSelectedEdge(null);
     setWhyVisitId(null);
-    setDraftAnchor(nodeId);
+    // Stage 5 polish — DO NOT overwrite draftAnchor with the raw
+    // node id. Users complained that clicking a visit-instance
+    // populated the advanced-anchor input with the gibberish
+    // `visit-instance:tses_*:<iso>:<URL>` string. The advanced
+    // input is for user-typed input only; clicks navigate through
+    // history without leaking the raw id into a visible field.
     history.navigate(nodeId);
   };
 
@@ -1182,7 +1200,8 @@ export const ConnectionsView = ({
                 onTopicRename={submitTopicRename}
                 onEngagementRelabel={submitEngagementRelabel}
                 onTopicClick={(topicId) => {
-                  setDraftAnchor(topicId);
+                  // Same rationale as useNodeAsAnchor — don't dump
+                  // the raw topic id into the advanced anchor input.
                   history.navigate(topicId);
                 }}
                 onVisitClick={(visitId) => {

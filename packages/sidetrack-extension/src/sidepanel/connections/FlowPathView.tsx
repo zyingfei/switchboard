@@ -1,5 +1,24 @@
 import type { ReactElement } from 'react';
 
+// Render an ISO timestamp in the user's locale. Falls back to the
+// raw string when parsing fails so we never silently lose info.
+const localTimestamp = (iso: string): string => {
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return iso;
+  const d = new Date(ms);
+  try {
+    return d.toLocaleString(undefined, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  } catch {
+    return iso;
+  }
+};
+
 export interface TimelineVisit {
   readonly id: string;
   readonly label: string;
@@ -81,7 +100,9 @@ export const FlowPathView = ({
                 data-testid={`flow-visit-${visit.id}`}
               >
                 <span className="cx-flow-visit-title">{visit.label}</span>
-                <span className="cx-mono cx-dim">{visit.commitTimestamp}</span>
+                <span className="cx-mono cx-dim" title={visit.commitTimestamp}>
+                  {localTimestamp(visit.commitTimestamp)}
+                </span>
               </button>
             ))}
           </div>

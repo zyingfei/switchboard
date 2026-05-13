@@ -197,8 +197,11 @@ export const formatEntityDisplay = (
         tooltip: latestUrl ?? trimPrefix(node.id, 'tab-session:'),
       };
     }
-    case 'visit-instance':
-    case 'timeline-visit': {
+    case 'visit-instance': {
+      // Stage 5 polish — disambiguate visit-instance from the
+      // canonical timeline-visit (= "Page"). Both nodes carry the
+      // same title; visit-instance secondary now folds in the
+      // visit time so the user can tell two instances apart.
       const title = metaStr(metadata, ['title']);
       const canonicalUrl = metaStr(metadata, ['canonicalUrl', 'url']);
       const host = hostOf(canonicalUrl);
@@ -207,6 +210,26 @@ export const formatEntityDisplay = (
       const last = node.lastSeenAt ?? node.firstSeenAt;
       const secondary = composeSecondary([host, formatRelOrUndef(last)]);
       // Tooltip is canonical URL only — never the raw `visit-instance:tses_*:date:url` id.
+      return { primary, secondary, kindBadge, tooltip: canonicalUrl };
+    }
+    case 'timeline-visit': {
+      // The canonical aggregate. Secondary calls out the visitCount
+      // so it's clear this row represents N visits (not just one).
+      const title = metaStr(metadata, ['title']);
+      const canonicalUrl = metaStr(metadata, ['canonicalUrl', 'url']);
+      const host = hostOf(canonicalUrl);
+      const labelClean = cleanLabel(node.label);
+      const primary = title ?? labelClean ?? host ?? '(page)';
+      const visitCountRaw = metadata['visitCount'];
+      const visitCount =
+        typeof visitCountRaw === 'number' && Number.isFinite(visitCountRaw)
+          ? Math.max(0, Math.floor(visitCountRaw))
+          : undefined;
+      const visitsLabel =
+        visitCount !== undefined
+          ? `${String(visitCount)} visit${visitCount === 1 ? '' : 's'}`
+          : undefined;
+      const secondary = composeSecondary([host, visitsLabel]);
       return { primary, secondary, kindBadge, tooltip: canonicalUrl };
     }
     case 'dispatch': {

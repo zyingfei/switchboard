@@ -220,16 +220,27 @@ export const FocusView = ({
             ) : null}
             <div className="cx-focus-meta">
               <span>{topic.memberCount} members</span>
-              <span>cohesion {topic.cohesion.toFixed(2)}</span>
+              {topic.cohesion > 0 ? (
+                <span>cohesion {topic.cohesion.toFixed(2)}</span>
+              ) : (
+                <span
+                  className="cx-dim"
+                  title="Cohesion is the average pairwise similarity of cluster members. Missing or 0 means the companion didn't compute one (small cluster, or the similarity producer hasn't run yet for these members)."
+                >
+                  cohesion n/a
+                </span>
+              )}
               {topic.dominantWorkstreamId === undefined ? null : (
                 <span className="cx-focus-chip">Workstream</span>
               )}
             </div>
-            <div className="cx-focus-bar" aria-hidden>
-              <span
-                style={{ width: `${String(Math.max(0, Math.min(1, topic.cohesion)) * 100)}%` }}
-              />
-            </div>
+            {topic.cohesion > 0 ? (
+              <div className="cx-focus-bar" aria-hidden>
+                <span
+                  style={{ width: `${String(Math.max(0, Math.min(1, topic.cohesion)) * 100)}%` }}
+                />
+              </div>
+            ) : null}
             <button
               type="button"
               className="cx-focus-expand"

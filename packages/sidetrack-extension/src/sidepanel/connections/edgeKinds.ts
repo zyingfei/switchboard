@@ -250,9 +250,16 @@ export const NODE_KIND_DISPLAY: Record<
   'queue-item': { label: 'Queue item', tintClass: 'cx-type-queue' },
   'inbound-reminder': { label: 'Reminder', tintClass: 'cx-type-reminder' },
   'coding-session': { label: 'Coding session', tintClass: 'cx-type-coding' },
-  'timeline-visit': { label: 'Browser visit', tintClass: 'cx-type-visit' },
-  'visit-instance': { label: 'Visit instance', tintClass: 'cx-type-visit' },
-  'tab-session': { label: 'Tab session', tintClass: 'cx-type-tab-session' },
+  // Stage 5 polish — the three visit-shaped kinds confused the
+  // user (Orbital graph showed "Browser visit" + "Visit instance" +
+  // "Tab session" for the SAME URL with identical titles). New
+  // labels emphasize *what each one is uniquely capturing*:
+  //   timeline-visit  — Page (canonical aggregate across all tabs)
+  //   visit-instance  — Tab visit (one specific tab × one trip)
+  //   tab-session     — Browser tab (a tab's lifetime)
+  'timeline-visit': { label: 'Page', tintClass: 'cx-type-visit' },
+  'visit-instance': { label: 'Tab visit', tintClass: 'cx-type-visit' },
+  'tab-session': { label: 'Browser tab', tintClass: 'cx-type-tab-session' },
   annotation: { label: 'Annotation', tintClass: 'cx-type-annotation' },
   snippet: { label: 'Snippet', tintClass: 'cx-type-snippet' },
   topic: { label: 'Topic', tintClass: 'cx-type-topic' },
