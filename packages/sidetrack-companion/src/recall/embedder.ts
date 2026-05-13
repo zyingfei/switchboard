@@ -313,12 +313,31 @@ export const embed = async (texts: readonly string[]): Promise<readonly Float32A
   }
   const extractor = await getEmbedder();
   const vectors: Float32Array[] = [];
-  for (const text of texts) {
+  for (let i = 0; i < texts.length; i += 1) {
+    const text = texts[i] as string;
     const output = await extractor(`${E5_PREFIX}${text}`, {
       pooling: 'mean',
       normalize: true,
     });
     vectors.push(padOrTruncate(toFloat32(output.data)));
+    // Per-text yield so the event loop can accept HTTP requests
+    // (especially /v1/status) between ONNX inferences. transformers
+    // .js + onnxruntime-node call into native code; the C++ inference
+    // runs in one shot per `extractor(text)` call (~30–50 ms on
+    // Apple Silicon with Accelerate). Without this yield, a 16-text
+    // batch is one 700 ms main-thread block — long enough for
+    // /v1/status to time out at the panel's poll window. Yielding
+    // every text turns the block into 16 × ~50 ms ticks with idle
+    // slots in between; HTTP accept resumes immediately.
+    //
+    // Skip the trailing yield: the caller adds its own inter-batch
+    // yield and a redundant setImmediate just delays completion by
+    // one extra tick.
+    if (i < texts.length - 1) {
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+    }
   }
   return vectors;
 };
