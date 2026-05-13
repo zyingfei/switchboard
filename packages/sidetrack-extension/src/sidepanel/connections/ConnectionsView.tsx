@@ -54,6 +54,7 @@ import { useRecallSearch } from './useRecallSearch';
 import {
   formatEntityDisplay,
   formatNodeIdDisplay,
+  hostOf,
   type EntityDisplayCtx,
 } from '../entityDisplay/format';
 import type { FeedbackChoice } from '../feedback/FeedbackButtons';
@@ -209,6 +210,13 @@ const deriveFlowVisits = (
       metadataString(node.metadata, ['tabSessionId', 'tabSessionIdHash', 'tabIdHash']) ??
       (node.kind === 'timeline-visit' ? 'all-tabs' : 'unknown-tab');
     const engagementClass = engagementClassForNode(node);
+    const canonicalUrl = metadataString(node.metadata, [
+      'canonicalUrl',
+      'url',
+      'latestUrl',
+    ]);
+    const host = hostOf(canonicalUrl);
+    const focusedWindowMs = metadataNumber(node.metadata, 'focusedWindowMs', 0);
     out.push({
       id: node.id,
       label: formatEntityDisplay(node, ctx).primary,
@@ -218,6 +226,8 @@ const deriveFlowVisits = (
         '1970-01-01T00:00:00.000Z',
       tabSessionIdHash,
       ...(engagementClass === undefined ? {} : { engagementClass }),
+      ...(host === undefined ? {} : { host }),
+      ...(focusedWindowMs > 0 ? { focusedWindowMs } : {}),
     });
   }
   return out;
@@ -242,17 +252,93 @@ const deriveCrossReplicaEdges = (edges: readonly ConnectionEdge[]): readonly Cro
       replicaId: edge.toNodeId.replace(/^replica:/u, ''),
     }));
 
+// Stage 5 polish — the anchor-scoped subgraph only carries 1-2 hops
+// from the anchor. Navigation chains (previous_visit_in_tab_session,
+// opener_visit) often run 5-10 visits deep, so when the user
+// anchors on a single visit-instance the prev visit (the page they
+// arrived from) lives outside scope and never appears on Flow Path.
+//
+// Generic fix: when the full snapshot is loaded, BFS from the
+// in-scope visits over the navigation-edge kinds and pull in any
+// visits transitively reachable. Caps at 64 nodes / 8 iterations to
+// keep the panel responsive for hub visits with very wide chains.
+const NAV_EDGE_KINDS = new Set<string>([
+  'previous_visit_in_tab_session',
+  'opener_visit',
+  'visit_instance_same_url_as_timeline_visit',
+  'visit_in_tab_session',
+  'visit_instance_in_tab_session',
+]);
+
+const expandFlowSubgraph = (
+  scopeNodes: readonly ConnectionNode[],
+  fullNodes: readonly ConnectionNode[],
+  fullEdges: readonly ConnectionEdge[],
+): { readonly nodes: readonly ConnectionNode[]; readonly edges: readonly ConnectionEdge[] } => {
+  if (fullNodes.length === 0 || fullEdges.length === 0) {
+    return { nodes: scopeNodes, edges: [] };
+  }
+  const reachable = new Set<string>();
+  for (const node of scopeNodes) {
+    if (node.kind === 'visit-instance' || node.kind === 'timeline-visit') {
+      reachable.add(node.id);
+    }
+  }
+  const navEdges = fullEdges.filter((edge) => NAV_EDGE_KINDS.has(edge.kind));
+  const MAX_ITERATIONS = 8;
+  const MAX_NODES = 64;
+  for (let iter = 0; iter < MAX_ITERATIONS; iter += 1) {
+    let grew = false;
+    for (const edge of navEdges) {
+      if (reachable.size >= MAX_NODES) break;
+      const fromIn = reachable.has(edge.fromNodeId);
+      const toIn = reachable.has(edge.toNodeId);
+      if (fromIn && !toIn) {
+        reachable.add(edge.toNodeId);
+        grew = true;
+      } else if (toIn && !fromIn) {
+        reachable.add(edge.fromNodeId);
+        grew = true;
+      }
+    }
+    if (!grew) break;
+  }
+  const fullNodeById = new Map(fullNodes.map((node) => [node.id, node] as const));
+  const nodes: ConnectionNode[] = [];
+  for (const id of reachable) {
+    const node = fullNodeById.get(id);
+    if (node !== undefined) nodes.push(node);
+  }
+  const edges = fullEdges.filter(
+    (edge) => reachable.has(edge.fromNodeId) && reachable.has(edge.toNodeId),
+  );
+  return { nodes, edges };
+};
+
+// Stage 5 polish — Focus view sources visitsByTopic from the FULL
+// snapshot, not just the anchor's loaded neighborhood. The earlier
+// scope-bound derivation produced the "8 members listed but only 1
+// shown" gap users hit on screenshot #34: `topic.memberCount` is
+// from the topic-revision producer (global truth), while the
+// `visit_in_topic` edges only landed in scope when the anchor
+// reached them in 1-2 hops. Generic fix: derive from the full
+// snapshot when it's been primed; fall back to anchor-scope when
+// not yet loaded.
 const deriveFocusData = (
-  nodes: readonly ConnectionNode[],
-  edges: readonly ConnectionEdge[],
+  scopeNodes: readonly ConnectionNode[],
+  scopeEdges: readonly ConnectionEdge[],
+  fullNodes: readonly ConnectionNode[],
+  fullEdges: readonly ConnectionEdge[],
   ctx: EntityDisplayCtx,
 ): {
   readonly topics: readonly TopicNode[];
   readonly visitsByTopic: Record<string, readonly TopicVisit[]>;
   readonly engagementClassesByVisit: Record<string, EngagementClass>;
 } => {
-  const nodeById = new Map(nodes.map((node) => [node.id, node] as const));
-  const topics: TopicNode[] = nodes
+  // Topics come from the scope so we render only the topics
+  // reachable from the anchor — pulling every topic across the
+  // whole vault would drown the panel.
+  const topics: TopicNode[] = scopeNodes
     .filter((node) => node.kind === 'topic')
     .map((node) => ({
       id: node.id,
@@ -263,15 +349,18 @@ const deriveFocusData = (
         ? {}
         : { dominantWorkstreamId: metadataString(node.metadata, ['dominantWorkstreamId']) }),
     }));
+
+  // Build visitsByTopic from full-snapshot edges so the member
+  // list matches `memberCount`. Falls back to scope edges when
+  // the full snapshot isn't loaded yet (degrades to old behavior,
+  // just with a count mismatch the user might notice).
+  const hasFull = fullNodes.length > 0 && fullEdges.length > 0;
+  const sourceNodes = hasFull ? fullNodes : scopeNodes;
+  const sourceEdges = hasFull ? fullEdges : scopeEdges;
+  const nodeById = new Map(sourceNodes.map((node) => [node.id, node] as const));
+
   const visitsByTopic: Record<string, TopicVisit[]> = {};
-  const engagementClassesByVisit: Record<string, EngagementClass> = {};
-  for (const node of nodes) {
-    const engagementClass = engagementClassForNode(node);
-    if (node.kind === 'timeline-visit' && engagementClass !== undefined) {
-      engagementClassesByVisit[node.id] = engagementClass;
-    }
-  }
-  for (const edge of edges) {
+  for (const edge of sourceEdges) {
     if (edge.kind !== 'visit_in_topic') continue;
     const visit = nodeById.get(edge.fromNodeId);
     if (visit === undefined) continue;
@@ -284,6 +373,16 @@ const deriveFocusData = (
         focusedWindowMs: metadataNumber(visit.metadata, 'focusedWindowMs', 0),
       },
     ];
+  }
+
+  // Engagement classes — keep using scope nodes (the
+  // user's recent activity tends to be in scope already).
+  const engagementClassesByVisit: Record<string, EngagementClass> = {};
+  for (const node of scopeNodes) {
+    const engagementClass = engagementClassForNode(node);
+    if (node.kind === 'timeline-visit' && engagementClass !== undefined) {
+      engagementClassesByVisit[node.id] = engagementClass;
+    }
   }
   return { topics, visitsByTopic, engagementClassesByVisit };
 };
@@ -405,7 +504,11 @@ export const ConnectionsView = ({
   // onto the past stack.
   const history = useAnchorHistory(initialAnchor);
   const anchor = history.current;
-  const [draftAnchor, setDraftAnchor] = useState<string>(initialAnchor);
+  // Advanced-anchor input. Starts empty so the field isn't pre-loaded
+  // with a raw id like `visit-instance:tses_…:<iso>:<URL>` that nobody
+  // would type by hand. Submission reads from this draft only; click
+  // navigation never writes to it (see navigateToAnchor).
+  const [draftAnchor, setDraftAnchor] = useState<string>('');
   const [hops, setHops] = useState<number>(1);
   const [subMode, setSubMode] = useState<SubMode>('linked');
   const [timeRange, setTimeRange] = useState<TimeRangeValue>(ALL_RANGE);
@@ -560,9 +663,29 @@ export const ConnectionsView = ({
     return [...byId.values()].sort((left, right) => left.label.localeCompare(right.label));
   }, [anchor, anchorNode, ctx, recentAnchors, result, workstreamAnchors]);
 
-  const submitAnchor = (next?: string): void => {
-    const value = (next ?? draftAnchor).trim();
-    if (next !== undefined) setDraftAnchor(value);
+  // Stage 5 polish — separate two anchor-navigation paths so click
+  // navigation NEVER pollutes the advanced-anchor input:
+  //   - `submitAdvancedAnchor()` reads `draftAnchor` (only the
+  //     advanced-anchor input + the workstream dropdown call this
+  //     with `next` so the input value matches).
+  //   - `navigateToAnchor(id)` is what every click handler (search
+  //     hit, recent anchor, empty-state quickpick, path-finder
+  //     pill, Inbox jump) should call. Never touches draftAnchor.
+  //
+  // Root cause of "advanced anchor shows visit-instance:tses_…":
+  // the previous `submitAnchor(next?)` set draftAnchor whenever
+  // `next` was provided, so EVERY click handler that passed an id
+  // dumped that id into the visible input field.
+  const submitAdvancedAnchor = (): void => {
+    const value = draftAnchor.trim();
+    if (value.length === 0) return;
+    setSelectedEdge(null);
+    setWhyVisitId(null);
+    history.navigate(value);
+  };
+  const navigateToAnchor = (nextAnchorId: string): void => {
+    const value = nextAnchorId.trim();
+    if (value.length === 0) return;
     setSelectedEdge(null);
     setWhyVisitId(null);
     history.navigate(value);
@@ -814,6 +937,23 @@ export const ConnectionsView = ({
     else if (subMode === 'focus' && !modeAvailability.focus.enabled) setSubMode('linked');
     else if (subMode === 'context' && !modeAvailability.context.enabled) setSubMode('linked');
   }, [subMode, modeAvailability]);
+
+  // Stage 5 polish — auto-prime the full snapshot when Focus mode
+  // is selected. The Focus derivation needs all `visit_in_topic`
+  // edges (global) so the per-topic member list matches the topic's
+  // metadata.memberCount; without the full snapshot we'd show a
+  // truncated list. Also primes for path-finding which benefits
+  // from the same global pool.
+  useEffect(() => {
+    // Flow Path also needs the global snapshot — navigation chains
+    // run beyond 1-2 hops, so anchoring on a single visit-instance
+    // would otherwise hide its parent page (the "URL_A → URL_B"
+    // arrow the user expects).
+    if (subMode === 'focus' || subMode === 'flow') fullSnapshot.prime();
+    // Intentionally not depending on fullSnapshot itself — prime()
+    // is internally idempotent and the no-op guard handles repeats.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subMode]);
   const whyFeedbackEdge = useMemo(() => {
     if (result === null || whyVisitId === null) return null;
     return findFeedbackEdge(result.snapshot.edges, anchor, whyVisitId);
@@ -826,9 +966,27 @@ export const ConnectionsView = ({
     () =>
       result === null
         ? { topics: [], visitsByTopic: {}, engagementClassesByVisit: {} }
-        : deriveFocusData(result.snapshot.nodes, result.snapshot.edges, ctx),
-    [result, ctx],
+        : deriveFocusData(
+            result.snapshot.nodes,
+            result.snapshot.edges,
+            fullSnapshot.nodes,
+            fullSnapshot.edges,
+            ctx,
+          ),
+    [ctx, fullSnapshot.edges, fullSnapshot.nodes, result],
   );
+  // Flow Path subgraph — expand the anchor scope with the full
+  // snapshot's navigation-edge transitive closure (capped). Keeps
+  // the chain compact for hub visits while still surfacing the
+  // parent page when the user lands on a leaf visit-instance.
+  const flowSubgraph = useMemo(() => {
+    if (result === null) return { nodes: [], edges: [] } as const;
+    return expandFlowSubgraph(
+      result.snapshot.nodes,
+      fullSnapshot.nodes,
+      fullSnapshot.edges,
+    );
+  }, [result, fullSnapshot.nodes, fullSnapshot.edges]);
   const contextWorkstreamId = useMemo(() => {
     if (anchor.startsWith('workstream:')) return anchor.replace(/^workstream:/u, '');
     const workstream = result?.snapshot.nodes.find((node) => node.kind === 'workstream');
@@ -1022,7 +1180,7 @@ export const ConnectionsView = ({
               extras={searchExtras}
               ctx={ctx}
               onPick={(id) => {
-                submitAnchor(id);
+                navigateToAnchor(id);
               }}
               onQueryChange={setSearchQuery}
               onPrime={fullSnapshot.prime}
@@ -1045,7 +1203,8 @@ export const ConnectionsView = ({
               <select
                 value={selectedWorkstreamAnchor}
                 onChange={(event) => {
-                  if (event.currentTarget.value.length > 0) submitAnchor(event.currentTarget.value);
+                  if (event.currentTarget.value.length > 0)
+                    navigateToAnchor(event.currentTarget.value);
                 }}
                 aria-label="Connections workstream"
                 data-testid="connections-workstream-select"
@@ -1082,10 +1241,10 @@ export const ConnectionsView = ({
                     setDraftAnchor(e.target.value);
                   }}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter') submitAnchor();
+                    if (e.key === 'Enter') submitAdvancedAnchor();
                   }}
                   onBlur={() => {
-                    submitAnchor();
+                    submitAdvancedAnchor();
                   }}
                   aria-label="Connections anchor"
                   data-testid="connections-anchor-input"
@@ -1103,7 +1262,7 @@ export const ConnectionsView = ({
                     type="button"
                     className="cx-recent-anchor"
                     onClick={() => {
-                      submitAnchor(r.id);
+                      navigateToAnchor(r.id);
                     }}
                     data-testid={`recent-anchor-${r.id}`}
                   >
@@ -1183,9 +1342,16 @@ export const ConnectionsView = ({
               />
             ) : subMode === 'flow' ? (
               <FlowPathView
-                visits={deriveFlowVisits(result.snapshot.nodes, ctx)}
-                navigationEdges={deriveNavigationEdges(result.snapshot.edges)}
-                crossReplicaEdges={deriveCrossReplicaEdges(result.snapshot.edges)}
+                visits={deriveFlowVisits(
+                  flowSubgraph.nodes.length > 0 ? flowSubgraph.nodes : result.snapshot.nodes,
+                  ctx,
+                )}
+                navigationEdges={deriveNavigationEdges(
+                  flowSubgraph.edges.length > 0 ? flowSubgraph.edges : result.snapshot.edges,
+                )}
+                crossReplicaEdges={deriveCrossReplicaEdges(
+                  flowSubgraph.edges.length > 0 ? flowSubgraph.edges : result.snapshot.edges,
+                )}
                 replicaAlias={ctx.replicaAlias}
                 onNodeClick={(visitId) => {
                   setSelectedEdge(null);
@@ -1235,7 +1401,7 @@ export const ConnectionsView = ({
                         key={r.id}
                         className="cx-empty-quickpick-btn"
                         onClick={() => {
-                          submitAnchor(r.id);
+                          navigateToAnchor(r.id);
                         }}
                         data-testid={`connections-empty-quickpick-${r.id}`}
                       >

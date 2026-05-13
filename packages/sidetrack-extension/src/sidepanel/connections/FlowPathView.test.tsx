@@ -45,7 +45,7 @@ const visits: readonly TimelineVisit[] = [
 ];
 
 describe('FlowPathView', () => {
-  it('renders all visits and navigation edges', () => {
+  it('renders all visits with arrows between same-tab neighbors', () => {
     render(
       <FlowPathView
         visits={visits}
@@ -61,10 +61,27 @@ describe('FlowPathView', () => {
     );
 
     expect(screen.getAllByTestId(/^flow-visit-/u)).toHaveLength(6);
-    expect(screen.getAllByTestId(/^flow-nav-edge-/u)).toHaveLength(4);
     expect(screen.getByText('Tab 1')).toBeDefined();
     expect(screen.getByText('Tab 2')).toBeDefined();
-    expect(screen.getByTestId('flow-nav-edge-e1').textContent).toContain('Visit 1 -> Visit 2');
+    // Same-tab navigation now renders as → arrows between visits;
+    // each tab has (N-1) arrows for N visits, so 2 + 2 = 4.
+    const arrows = screen.getAllByText('→');
+    expect(arrows).toHaveLength(4);
+  });
+
+  it('renders opener badge between tabs', () => {
+    render(
+      <FlowPathView
+        visits={visits}
+        navigationEdges={[
+          { id: 'op1', fromVisitId: 'visit:3', toVisitId: 'visit:4', kind: 'openerVisitId' },
+        ]}
+        crossReplicaEdges={[]}
+        onNodeClick={() => undefined}
+      />,
+    );
+
+    expect(screen.getByText(/opened from Tab 1/u)).toBeDefined();
   });
 
   it('renders cross-replica edges dashed', () => {
@@ -80,6 +97,27 @@ describe('FlowPathView', () => {
     expect(screen.getByTestId('flow-cross-replica-edge-xr1').className).toContain(
       'cx-edge-cross-replica',
     );
+  });
+
+  it('renders duration when focusedWindowMs is provided', () => {
+    render(
+      <FlowPathView
+        visits={[
+          {
+            id: 'visit:1',
+            label: 'Visit 1',
+            commitTimestamp: '2026-05-08T10:00:00.000Z',
+            tabSessionIdHash: 'tab-a',
+            focusedWindowMs: 90_000,
+          },
+        ]}
+        navigationEdges={[]}
+        crossReplicaEdges={[]}
+        onNodeClick={() => undefined}
+      />,
+    );
+
+    expect(screen.getByText('1m 30s')).toBeDefined();
   });
 
   it('fires onNodeClick with the visit id', () => {

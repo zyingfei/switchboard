@@ -8198,32 +8198,36 @@ pre.diff {
   z-index: 14;
   top: calc(100% + 4px);
   left: 0;
-  min-width: 620px;
+  right: 0;
+  width: max-content;
+  max-width: min(620px, calc(100vw - 16px));
   padding: 14px;
   background: var(--paper);
   border: 1px solid var(--rule);
   border-radius: 10px;
   box-shadow: 0 12px 32px rgba(0,0,0,0.10);
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 .cx-cal { display: flex; flex-direction: column; gap: 8px; }
 .cx-cal-head {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 0 4px;
+  padding: 0 2px;
 }
 .cx-cal-title {
   font-size: 14px;
-  font-weight: 500;
+  font-weight: 600;
   color: var(--ink-1);
+  letter-spacing: 0.01em;
 }
 .cx-cal-nav {
-  width: 28px; height: 28px;
+  width: 26px; height: 26px;
   border: 0;
   background: transparent;
   color: var(--ink-2);
-  font-size: 18px;
+  font-size: 16px;
+  line-height: 1;
   border-radius: 4px;
   cursor: pointer;
 }
@@ -8247,28 +8251,33 @@ pre.diff {
   gap: 2px;
 }
 .cx-cal-cell {
-  height: 34px;
+  height: 30px;
+  min-width: 0;
   border: 0;
   background: transparent;
   color: var(--ink-1);
-  font-size: 12.5px;
+  font-size: 12px;
   border-radius: 4px;
   cursor: pointer;
 }
 .cx-cal-cell:hover { background: var(--paper-tinted); }
 .cx-cal-cell.is-other-month { color: var(--ink-3); opacity: 0.5; }
-.cx-cal-cell.is-in-range { background: var(--amber-bg, #fcefd6); }
+.cx-cal-cell.is-in-range { background: var(--amber-bg, #fcefd6); color: var(--ink-1); }
 .cx-cal-cell.is-endpoint {
   background: var(--accent, #c2410c);
   color: #fff;
+  font-weight: 600;
+}
+.cx-cal-cell.is-endpoint.is-in-range {
+  background: var(--accent, #c2410c);
 }
 .cx-cal-cell.is-today {
-  outline: 1px solid var(--rule);
+  box-shadow: inset 0 0 0 1px var(--rule);
 }
 .cx-cal-tz {
   display: flex; align-items: center; gap: 6px;
-  margin-top: 4px;
-  font-size: 11px;
+  margin-top: 2px;
+  font-size: 10.5px;
   color: var(--ink-3);
 }
 .cx-cal-side { display: flex; flex-direction: column; gap: 10px; }
@@ -8278,17 +8287,23 @@ pre.diff {
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--ink-3);
+  font-weight: 600;
 }
 .cx-cal-row { display: flex; gap: 6px; }
 .cx-cal-input {
   flex: 1;
-  padding: 6px 8px;
+  min-width: 0;
+  padding: 6px 10px;
   border: 1px solid var(--rule);
-  border-radius: 6px;
+  border-radius: 999px;
   background: var(--paper-light);
   color: var(--ink-1);
   font: inherit;
   font-size: 12px;
+}
+.cx-cal-input:focus {
+  outline: 0;
+  border-color: var(--accent, #c2410c);
 }
 .cx-cal-quickgrid {
   display: grid;
@@ -8298,7 +8313,7 @@ pre.diff {
 .cx-cal-quick {
   padding: 6px 8px;
   border: 1px solid var(--rule);
-  border-radius: 6px;
+  border-radius: 999px;
   background: var(--paper-light);
   color: var(--ink-1);
   font-size: 12px;
@@ -8312,13 +8327,14 @@ pre.diff {
 }
 .cx-cal-actions {
   display: flex; justify-content: flex-end; gap: 8px;
-  margin-top: auto;
+  margin-top: 4px;
 }
 .cx-cal-cancel,
 .cx-cal-apply {
-  padding: 7px 14px;
+  padding: 7px 16px;
   border-radius: 6px;
   font-size: 12px;
+  font-weight: 500;
   cursor: pointer;
 }
 .cx-cal-cancel {
@@ -8327,12 +8343,23 @@ pre.diff {
   color: var(--ink-1);
 }
 .cx-cal-apply {
-  background: var(--ink-1);
-  border: 1px solid var(--ink-1);
+  background: var(--ink-1, #1a1a1a);
+  border: 1px solid var(--ink-1, #1a1a1a);
   color: var(--paper);
 }
 .cx-cal-cancel:hover { background: var(--paper-tinted); }
 .cx-cal-apply:hover { opacity: 0.9; }
+
+/* Side-panel layout — two columns when ≥520px wide, stack below. */
+@media (min-width: 520px) {
+  .cx-timerange-popover {
+    display: grid;
+    grid-template-columns: minmax(260px, 1fr) minmax(220px, 1fr);
+    gap: 16px;
+  }
+  .cx-cal-tz { grid-column: 1 / 2; }
+  .cx-cal-actions { grid-column: 1 / -1; }
+}
 /* Stage 5 polish — Connections path-finder strip. Collapsible row
    below the mode tabs; pills + arrows render the BFS chain. */
 .cx-pathfinder {
@@ -8406,25 +8433,54 @@ pre.diff {
   font-size: 10px;
   color: var(--ink-3);
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.cx-flow-tab-name {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  font-size: 10px;
+  color: var(--ink-2);
+}
+.cx-flow-tab-opener {
+  font-size: 10px;
+  color: var(--ink-3);
+  white-space: normal;
 }
 .cx-flow-visits {
   display: flex;
-  gap: 8px;
+  align-items: stretch;
+  gap: 4px;
   overflow-x: auto;
   padding-bottom: 4px;
+  min-width: 0;
+}
+.cx-flow-visit-cell {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.cx-flow-arrow {
+  font-size: 14px;
+  color: var(--ink-3);
+  user-select: none;
+  flex-shrink: 0;
 }
 .cx-flow-visit {
   min-width: 132px;
-  max-width: 180px;
+  max-width: 200px;
   border: 1px solid var(--rule);
   border-radius: var(--rad-s);
   background: var(--paper-light);
   color: var(--ink);
   padding: 8px;
   text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 .cx-flow-visit:hover { border-color: var(--signal-tint); background: var(--signal-bg); }
 .cx-flow-visit-title {
@@ -8432,6 +8488,29 @@ pre.diff {
   font-size: 12.5px;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cx-flow-visit-host {
+  font-size: 10.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cx-flow-visit-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-top: 2px;
+}
+.cx-flow-visit-duration {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--ink-2);
+  background: var(--paper-warm, var(--paper));
+  border: 1px solid var(--rule-soft);
+  border-radius: 999px;
+  padding: 1px 6px;
   white-space: nowrap;
 }
 .cx-flow-edges {

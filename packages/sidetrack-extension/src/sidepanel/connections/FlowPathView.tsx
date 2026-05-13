@@ -19,12 +19,33 @@ const localTimestamp = (iso: string): string => {
   }
 };
 
+// Human-friendly duration. `5_000` -> `5s`, `90_000` -> `1m 30s`,
+// `3_900_000` -> `1h 5m`. Empty string when missing/zero so the
+// caller doesn't render a blank chip.
+const formatDuration = (ms: number | undefined): string => {
+  if (ms === undefined || !Number.isFinite(ms) || ms <= 0) return '';
+  const totalSeconds = Math.round(ms / 1000);
+  if (totalSeconds < 60) return `${String(totalSeconds)}s`;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (totalMinutes < 60) {
+    return seconds === 0
+      ? `${String(totalMinutes)}m`
+      : `${String(totalMinutes)}m ${String(seconds)}s`;
+  }
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return minutes === 0 ? `${String(hours)}h` : `${String(hours)}h ${String(minutes)}m`;
+};
+
 export interface TimelineVisit {
   readonly id: string;
   readonly label: string;
   readonly commitTimestamp: string;
   readonly tabSessionIdHash: string;
   readonly engagementClass?: string;
+  readonly host?: string;
+  readonly focusedWindowMs?: number;
 }
 
 export interface NavigationEdge {
@@ -82,58 +103,90 @@ export const FlowPathView = ({
   const replicaName = (replicaId: string): string =>
     replicaAlias !== undefined ? replicaAlias(replicaId) : 'Browser';
 
+  // Map opener edges by destination tab so we can render the
+  // "Opened from Tab N" badge next to the tab row that received the
+  // navigation. previous_visit_in_tab_session edges stay implicit —
+  // the → arrows between visits in the same tab already convey them.
+  const openerByDestTab = new Map<string, string>(); // destTab -> sourceTab
+  for (const edge of navigationEdges) {
+    if (edge.kind !== 'openerVisitId') continue;
+    const fromVisit = visitById.get(edge.fromVisitId);
+    const toVisit = visitById.get(edge.toVisitId);
+    if (fromVisit === undefined || toVisit === undefined) continue;
+    if (fromVisit.tabSessionIdHash === toVisit.tabSessionIdHash) continue;
+    openerByDestTab.set(toVisit.tabSessionIdHash, fromVisit.tabSessionIdHash);
+  }
+
   return (
     <section className="cx-flow" data-testid="flow-path-view">
-      {[...visitsByTab.entries()].map(([tabSessionIdHash, tabVisits]) => (
-        <div className="cx-flow-row" key={tabSessionIdHash}>
-          <div className="cx-flow-tab" title={tabSessionIdHash}>
-            {tabLabelByHash.get(tabSessionIdHash)}
+      {[...visitsByTab.entries()].map(([tabSessionIdHash, tabVisits]) => {
+        const openedFrom = openerByDestTab.get(tabSessionIdHash);
+        return (
+          <div className="cx-flow-row" key={tabSessionIdHash}>
+            <div className="cx-flow-tab" title={tabSessionIdHash}>
+              <div className="cx-flow-tab-name">{tabLabelByHash.get(tabSessionIdHash)}</div>
+              {openedFrom !== undefined ? (
+                <div className="cx-flow-tab-opener">
+                  ← opened from {tabLabelByHash.get(openedFrom)}
+                </div>
+              ) : null}
+            </div>
+            <div className="cx-flow-visits">
+              {tabVisits.map((visit, idx) => {
+                const duration = formatDuration(visit.focusedWindowMs);
+                return (
+                  <div key={visit.id} className="cx-flow-visit-cell">
+                    {idx > 0 ? (
+                      <span className="cx-flow-arrow" aria-hidden="true">
+                        →
+                      </span>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="cx-flow-visit"
+                      title={visit.id}
+                      onClick={() => onNodeClick(visit.id)}
+                      data-testid={`flow-visit-${visit.id}`}
+                    >
+                      <span className="cx-flow-visit-title">{visit.label}</span>
+                      {visit.host === undefined || visit.host.length === 0 ? null : (
+                        <span className="cx-flow-visit-host cx-dim">{visit.host}</span>
+                      )}
+                      <span className="cx-flow-visit-meta">
+                        <span className="cx-mono cx-dim" title={visit.commitTimestamp}>
+                          {localTimestamp(visit.commitTimestamp)}
+                        </span>
+                        {duration.length > 0 ? (
+                          <span
+                            className="cx-flow-visit-duration"
+                            title={`Focused window — ${String(visit.focusedWindowMs ?? 0)}ms`}
+                          >
+                            {duration}
+                          </span>
+                        ) : null}
+                      </span>
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
           </div>
-          <div className="cx-flow-visits">
-            {tabVisits.map((visit) => (
-              <button
-                key={visit.id}
-                type="button"
-                className="cx-flow-visit"
-                title={visit.id}
-                onClick={() => onNodeClick(visit.id)}
-                data-testid={`flow-visit-${visit.id}`}
-              >
-                <span className="cx-flow-visit-title">{visit.label}</span>
-                <span className="cx-mono cx-dim" title={visit.commitTimestamp}>
-                  {localTimestamp(visit.commitTimestamp)}
-                </span>
-              </button>
-            ))}
-          </div>
+        );
+      })}
+      {crossReplicaEdges.length === 0 ? null : (
+        <div className="cx-flow-edges" aria-label="Cross-replica observations">
+          {crossReplicaEdges.map((edge) => (
+            <span
+              key={edge.id}
+              className="cx-flow-edge cx-edge-cross-replica"
+              data-testid={`flow-cross-replica-edge-${edge.id}`}
+              title={edge.replicaId}
+            >
+              also seen on {replicaName(edge.replicaId)}: {visitLabel(edge.fromVisitId)}
+            </span>
+          ))}
         </div>
-      ))}
-      <div className="cx-flow-edges" aria-label="Navigation edges">
-        {navigationEdges.map((edge) => (
-          <span
-            key={edge.id}
-            className="cx-flow-edge"
-            data-testid={`flow-nav-edge-${edge.id}`}
-            title={`${edge.fromVisitId} -> ${edge.toVisitId}`}
-          >
-            {edge.kind}: {visitLabel(edge.fromVisitId)}
-            {' -> '}
-            {visitLabel(edge.toVisitId)}
-          </span>
-        ))}
-        {crossReplicaEdges.map((edge) => (
-          <span
-            key={edge.id}
-            className="cx-flow-edge cx-edge-cross-replica"
-            data-testid={`flow-cross-replica-edge-${edge.id}`}
-            title={edge.replicaId}
-          >
-            replica: {visitLabel(edge.fromVisitId)}
-            {' -> '}
-            {replicaName(edge.replicaId)}
-          </span>
-        ))}
-      </div>
+      )}
     </section>
   );
 };

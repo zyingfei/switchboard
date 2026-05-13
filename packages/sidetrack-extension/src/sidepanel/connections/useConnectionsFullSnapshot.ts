@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 
 import { fetchConnectionsSnapshot } from './client';
-import type { ConnectionNode, ConnectionsSnapshot } from './types';
+import type { ConnectionEdge, ConnectionNode, ConnectionsSnapshot } from './types';
 
 // Stage 5 polish — Connections backend search. The anchor-scoped
 // neighbor route (`/v1/connections/nodes/{id}/neighbors?hops=N`)
@@ -28,43 +28,54 @@ import type { ConnectionNode, ConnectionsSnapshot } from './types';
 interface FullSnapshotState {
   readonly kind: 'idle' | 'loading' | 'ready' | 'error';
   readonly nodes: readonly ConnectionNode[];
+  readonly edges: readonly ConnectionEdge[];
   readonly error?: string;
 }
 
 export interface UseFullSnapshotResult {
   readonly nodes: readonly ConnectionNode[];
+  readonly edges: readonly ConnectionEdge[];
   readonly loading: boolean;
   readonly error: string | null;
   readonly prime: () => void;
 }
 
+const EMPTY_NODES: readonly ConnectionNode[] = [];
+const EMPTY_EDGES: readonly ConnectionEdge[] = [];
+
 export const useConnectionsFullSnapshot = (): UseFullSnapshotResult => {
-  const [state, setState] = useState<FullSnapshotState>({ kind: 'idle', nodes: [] });
+  const [state, setState] = useState<FullSnapshotState>({
+    kind: 'idle',
+    nodes: EMPTY_NODES,
+    edges: EMPTY_EDGES,
+  });
   const inFlight = useRef<boolean>(false);
 
   const prime = (): void => {
     if (inFlight.current || state.kind === 'ready') return;
     inFlight.current = true;
-    setState({ kind: 'loading', nodes: state.nodes });
+    setState({ kind: 'loading', nodes: state.nodes, edges: state.edges });
     void fetchConnectionsSnapshot()
       .then((response) => {
         inFlight.current = false;
         if (!response.ok || response.data === undefined) {
           setState({
             kind: 'error',
-            nodes: [],
+            nodes: EMPTY_NODES,
+            edges: EMPTY_EDGES,
             error: response.error ?? 'unknown error',
           });
           return;
         }
         const snapshot: ConnectionsSnapshot = response.data.snapshot;
-        setState({ kind: 'ready', nodes: snapshot.nodes });
+        setState({ kind: 'ready', nodes: snapshot.nodes, edges: snapshot.edges });
       })
       .catch((error: unknown) => {
         inFlight.current = false;
         setState({
           kind: 'error',
-          nodes: [],
+          nodes: EMPTY_NODES,
+          edges: EMPTY_EDGES,
           error: error instanceof Error ? error.message : String(error),
         });
       });
@@ -80,6 +91,7 @@ export const useConnectionsFullSnapshot = (): UseFullSnapshotResult => {
 
   return {
     nodes: state.nodes,
+    edges: state.edges,
     loading: state.kind === 'loading',
     error: state.kind === 'error' ? state.error ?? null : null,
     prime,
