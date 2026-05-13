@@ -200,29 +200,53 @@ const reloadExtensionFromDisk = async (
   extensionId: string,
   previousWorker: Worker,
 ): Promise<Worker> => {
-  const reloadPage = await context.newPage();
-  try {
-    await reloadPage.goto(`chrome-extension://${extensionId}/sidepanel.html`, {
-      waitUntil: 'domcontentloaded',
-      timeout: 10_000,
-    });
-    await evaluateInMainWorld(
-      reloadPage,
-      () => {
-        chrome.runtime.reload();
-      },
-      undefined,
-    ).catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      if (
-        !message.includes('Target page, context or browser has been closed') &&
-        !message.includes('Execution context was destroyed')
-      ) {
-        throw error;
-      }
-    });
-  } finally {
-    await reloadPage.close().catch(() => undefined);
+  // Try the service worker first — under Patchright's stealth main-world
+  // binding `chrome` is sometimes scrubbed off extension pages, so the
+  // page-evaluate path below throws `Cannot read properties of undefined`.
+  // The SW always has chrome.runtime since it IS the runtime; calling
+  // reload() there is the canonical MV3 path anyway.
+  const swReloadOk = await previousWorker
+    .evaluate(() => {
+      chrome.runtime.reload();
+    })
+    .then(() => true)
+    .catch(() => false);
+  if (!swReloadOk) {
+    const reloadPage = await context.newPage();
+    try {
+      await reloadPage.goto(`chrome-extension://${extensionId}/sidepanel.html`, {
+        waitUntil: 'domcontentloaded',
+        timeout: 10_000,
+      });
+      await evaluateInMainWorld(
+        reloadPage,
+        () => {
+          if (typeof chrome === 'undefined' || chrome.runtime === undefined) {
+            throw new Error('chrome.runtime not available in main world');
+          }
+          chrome.runtime.reload();
+        },
+        undefined,
+      ).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        // Three classes of swallowed errors:
+        //   1. The page tore down during reload (expected race).
+        //   2. The execution context died (same).
+        //   3. chrome.runtime isn't reachable from the page world (Patchright
+        //      stealth). In that case the SW worker.evaluate() above already
+        //      tried + failed; the post-loop wakeServiceWorker still recovers.
+        if (
+          !message.includes('Target page, context or browser has been closed') &&
+          !message.includes('Execution context was destroyed') &&
+          !message.includes('chrome.runtime not available') &&
+          !message.includes("Cannot read properties of undefined (reading 'reload')")
+        ) {
+          throw error;
+        }
+      });
+    } finally {
+      await reloadPage.close().catch(() => undefined);
+    }
   }
 
   for (let attempt = 0; attempt < 40; attempt += 1) {
