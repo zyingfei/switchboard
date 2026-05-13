@@ -23,6 +23,10 @@ import {
   isVisualFingerprintObservedPayload,
 } from '../visual/events.js';
 import {
+  NAVIGATION_COMMITTED,
+  isNavigationCommittedPayload,
+} from '../navigation/events.js';
+import {
   defaultAllowedTools,
   isAllowed,
   readTrust,
@@ -4509,6 +4513,7 @@ const routes: readonly RouteDefinition[] = [
         SELECTION_COPIED,
         SELECTION_PASTED,
         VISUAL_FINGERPRINT_OBSERVED,
+        NAVIGATION_COMMITTED,
       ]);
       const validatePayload = (type: string, payload: unknown): boolean => {
         switch (type) {
@@ -4522,6 +4527,8 @@ const routes: readonly RouteDefinition[] = [
             return isSelectionPastedPayload(payload);
           case VISUAL_FINGERPRINT_OBSERVED:
             return isVisualFingerprintObservedPayload(payload);
+          case NAVIGATION_COMMITTED:
+            return isNavigationCommittedPayload(payload);
           default:
             return false;
         }

@@ -15,6 +15,7 @@ import {
 } from '../engagement/events.js';
 import { SELECTION_COPIED } from '../snippets/events.js';
 import { VISUAL_FINGERPRINT_OBSERVED } from '../visual/events.js';
+import { NAVIGATION_COMMITTED } from '../navigation/events.js';
 import { createCompanionHttpServer, startHttpServer } from './server.js';
 
 // The materializer-diag retrospective: `/v1/edge/events` was a
@@ -55,6 +56,31 @@ const interval = (seq: number): AcceptedEvent => ({
     },
   },
   acceptedAtMs: 1_030_000,
+});
+
+const navigation = (seq: number): AcceptedEvent => ({
+  clientEventId: `navigation.committed:edge:${String(seq)}`,
+  dot: { replicaId: 'edge_navigation', seq },
+  deps: {},
+  aggregateId: `navigation.committed:visit:https://x/a`,
+  type: NAVIGATION_COMMITTED,
+  payload: {
+    payloadVersion: 1,
+    visitId: `visit_${String(seq)}_abc`,
+    url: 'https://x/a',
+    canonicalUrl: 'https://x/a',
+    documentId: `doc_${String(seq)}`,
+    parentDocumentId: null,
+    tabSessionIdHash: 'tab_hash_a',
+    windowSessionIdHash: 'win_hash_a',
+    openerVisitId: null,
+    previousVisitId: null,
+    navigationSequence: 1,
+    transitionType: 'link',
+    transitionQualifiers: [],
+    commitTimestamp: 1_700_000_000_000 + seq,
+  },
+  acceptedAtMs: 1_700_000_000_000 + seq,
 });
 
 const sessionAggregated = (seq: number): AcceptedEvent => ({
@@ -143,6 +169,21 @@ describe('POST /v1/edge/events', () => {
 
   it('imports engagement.session.aggregated events', async () => {
     const r = await post('/v1/edge/events', { events: [sessionAggregated(2)] });
+    expect(r.status).toBe(200);
+    const body = r.data as { data: { imported: unknown[]; skipped: unknown[] } };
+    expect(body.data.imported).toHaveLength(1);
+    expect(body.data.skipped).toHaveLength(0);
+  });
+
+  // RCA 2026-05: the navigation.committed event type was missing from
+  // ACCEPTED_EDGE_EVENT_TYPES + validatePayload here, so every event
+  // the extension uploaded got skipped with 'invalid-event-type'. The
+  // user's vault had zero navigation.committed records, and Flow
+  // Path had no navigation chain to render. This test would have
+  // failed the day that route was added without all five sister
+  // event types being listed.
+  it('imports navigation.committed events (the listener-produced type)', async () => {
+    const r = await post('/v1/edge/events', { events: [navigation(8)] });
     expect(r.status).toBe(200);
     const body = r.data as { data: { imported: unknown[]; skipped: unknown[] } };
     expect(body.data.imported).toHaveLength(1);

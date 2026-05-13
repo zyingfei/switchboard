@@ -57,6 +57,7 @@ import {
 } from '../src/background/listeners/tabs';
 import { registerDefaultWebNavigationListeners } from '../src/background/listeners/web-navigation';
 import {
+  ACCEPTED_EDGE_EVENT_STREAM_NAMES,
   createEdgeEventDrainSingleFlight,
   partitionEdgeEventDrainBatch,
   summarizeEdgeEventDrain,
@@ -3150,13 +3151,7 @@ export default defineBackground(() => {
     return `${event.streamName}:${event.observedAt.slice(0, 10)}`;
   };
 
-  const acceptedEdgeEventStreamNames = new Set<BufferedEvent['streamName']>([
-    'engagement.interval.observed',
-    'engagement.session.aggregated',
-    'selection.copied',
-    'selection.pasted',
-    VISUAL_FINGERPRINT_OBSERVED,
-  ]);
+  const acceptedEdgeEventStreamNames = ACCEPTED_EDGE_EVENT_STREAM_NAMES;
   const EDGE_EVENT_DRAIN_ROUTE_BATCH_SIZE = 10;
   const EDGE_EVENT_DRAIN_SCAN_BATCH_SIZE = 500;
   const EDGE_EVENT_DRAIN_DEFAULT_MAX_BATCHES = 1;

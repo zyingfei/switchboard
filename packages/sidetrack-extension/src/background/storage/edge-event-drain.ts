@@ -1,5 +1,22 @@
 import type { BufferedEvent } from './in-memory-event-buffer';
 
+// Single source of truth for which event types the edge-event drain
+// is allowed to upload to the companion. Lives here (and not inline
+// in background.ts) so unit + seam tests can assert the policy without
+// the background entrypoint having to be importable in a test
+// environment. The mirror on the companion lives at
+// packages/sidetrack-companion/src/http/server.ts `ACCEPTED_EDGE_EVENT_TYPES`;
+// both must move together.
+export const ACCEPTED_EDGE_EVENT_STREAM_NAMES: ReadonlySet<BufferedEvent['streamName']> =
+  new Set<BufferedEvent['streamName']>([
+    'engagement.interval.observed',
+    'engagement.session.aggregated',
+    'selection.copied',
+    'selection.pasted',
+    'visual.fingerprint.observed',
+    'navigation.committed',
+  ]);
+
 export interface EdgeEventDrainResult {
   readonly acceptedEvents: readonly BufferedEvent[];
   readonly permanentlyRejectedEvents: readonly BufferedEvent[];
