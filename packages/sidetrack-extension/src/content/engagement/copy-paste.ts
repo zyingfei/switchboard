@@ -86,6 +86,43 @@ const digestSelection = async (value: string): Promise<{
   };
 };
 
+// Local-only preview cache (chrome.storage.local). The companion never
+// sees this — the wire payload stays rawTextStored:false. This is a
+// per-browser convenience so the side-panel snippet card can show the
+// first 120 chars of what the user copied instead of just "Code · 12
+// lines". LRU-capped at 200 entries.
+const SNIPPET_PREVIEW_KEY = 'sidetrack.snippetPreviewByHash';
+const SNIPPET_PREVIEW_MAX = 200;
+const SNIPPET_PREVIEW_CHARS = 120;
+
+const cacheSnippetPreview = async (selectionHash: string, text: string): Promise<void> => {
+  const preview = text.slice(0, SNIPPET_PREVIEW_CHARS);
+  try {
+    const storage = (globalThis as { chrome?: { storage?: { local?: chrome.storage.LocalStorageArea } } })
+      .chrome?.storage?.local;
+    if (storage === undefined) return;
+    const existing = await storage.get(SNIPPET_PREVIEW_KEY);
+    const map: Record<string, string> =
+      (existing[SNIPPET_PREVIEW_KEY] as Record<string, string> | undefined) ?? {};
+    // Simple LRU: delete then re-add to push to most-recent position.
+    if (selectionHash in map) delete map[selectionHash];
+    map[selectionHash] = preview;
+    const keys = Object.keys(map);
+    if (keys.length > SNIPPET_PREVIEW_MAX) {
+      const trimmed: Record<string, string> = {};
+      for (const key of keys.slice(keys.length - SNIPPET_PREVIEW_MAX)) {
+        trimmed[key] = map[key] ?? '';
+      }
+      await storage.set({ [SNIPPET_PREVIEW_KEY]: trimmed });
+    } else {
+      await storage.set({ [SNIPPET_PREVIEW_KEY]: map });
+    }
+  } catch {
+    // Best-effort — chrome.storage failures are non-fatal for the
+    // hash-only lineage flow.
+  }
+};
+
 export const attachCopyPasteLineage = (input: {
   readonly visitId: string;
   readonly send: (message: SelectionLineageMessage) => void;
@@ -110,6 +147,7 @@ export const attachCopyPasteLineage = (input: {
           rawTextStored: false,
         },
       });
+      void cacheSnippetPreview(digest.selectionHash, digest.normalized);
     });
   });
   document.addEventListener('paste', (event) => {

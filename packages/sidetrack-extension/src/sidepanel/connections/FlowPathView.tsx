@@ -47,6 +47,11 @@ export interface TimelineVisit {
   readonly host?: string;
   readonly url?: string;
   readonly focusedWindowMs?: number;
+  // True for the anchor visit (or any visit-instance whose URL
+  // matches the anchor URL). Used to highlight where the user is in
+  // each tab's chronological chain — "I am here, this is what came
+  // before, this is what came after".
+  readonly isAnchor?: boolean;
 }
 
 export interface NavigationEdge {
@@ -136,6 +141,12 @@ export const FlowPathView = ({
               {tabVisits.map((visit, idx) => {
                 const duration = formatDuration(visit.focusedWindowMs);
                 const canOpen = visit.url !== undefined && visit.url.length > 0;
+                const cellClasses = [
+                  'cx-flow-visit',
+                  visit.isAnchor === true ? 'is-anchor' : '',
+                ]
+                  .filter(Boolean)
+                  .join(' ');
                 return (
                   <div key={visit.id} className="cx-flow-visit-cell">
                     {idx > 0 ? (
@@ -146,11 +157,16 @@ export const FlowPathView = ({
                     <div className="cx-flow-visit-wrap">
                       <button
                         type="button"
-                        className="cx-flow-visit"
+                        className={cellClasses}
                         title={visit.id}
                         onClick={() => onNodeClick(visit.id)}
                         data-testid={`flow-visit-${visit.id}`}
                       >
+                        {visit.isAnchor === true ? (
+                          <span className="cx-flow-visit-anchor-mark" aria-hidden="true">
+                            You are here
+                          </span>
+                        ) : null}
                         <span className="cx-flow-visit-title">{visit.label}</span>
                         {visit.host === undefined || visit.host.length === 0 ? null : (
                           <span className="cx-flow-visit-host cx-dim">{visit.host}</span>

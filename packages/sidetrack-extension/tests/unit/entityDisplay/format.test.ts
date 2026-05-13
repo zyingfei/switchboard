@@ -76,19 +76,44 @@ describe('formatEntityDisplay — inbound-reminder enrichment', () => {
   });
 });
 
-describe('formatEntityDisplay — snippet metadata.match', () => {
-  it('surfaces the copied text instead of the snippet_<hex> id', () => {
+describe('formatEntityDisplay — snippet payload metrics', () => {
+  it('renders a derived summary from contentKindHint + charCount + lineCount', () => {
     const snippet = makeNode({
       kind: 'snippet',
       id: 'snippet:snippet_09696df0148b5907a28bab73',
       label: 'snippet_09696df0148b5907a28bab73',
-      metadata: { match: 'CLOB matching engine', charHashPrefix: '09696' },
+      metadata: {
+        match: 'exact',
+        charHashPrefix: '09696df0148b',
+        charCount: 350,
+        lineCount: 12,
+        contentKindHint: 'code-block',
+      },
     });
     const display = formatEntityDisplay(snippet, ctx());
+    expect(display.primary).toBe('Code · 12 lines · 350 chars');
+  });
+
+  it('uses the local preview when ctx.snippetPreview returns one', () => {
+    const snippet = makeNode({
+      kind: 'snippet',
+      id: 'snippet:snippet_09696df0148b5907a28bab73',
+      label: 'snippet_09696df0148b5907a28bab73',
+      metadata: {
+        match: 'exact',
+        charHashPrefix: '09696df0148b',
+        charCount: 350,
+        contentKindHint: 'code-block',
+      },
+    });
+    const display = formatEntityDisplay(
+      snippet,
+      ctx({ snippetPreview: () => 'CLOB matching engine' }),
+    );
     expect(display.primary).toBe('CLOB matching engine');
   });
 
-  it('falls back to "(snippet)" when no usable text is on the node', () => {
+  it('falls back to "(snippet)" when no metrics or preview are available', () => {
     const snippet = makeNode({
       kind: 'snippet',
       id: 'snippet:bare',

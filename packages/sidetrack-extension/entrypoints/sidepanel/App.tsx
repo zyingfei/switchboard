@@ -86,6 +86,7 @@ import { listPendingOffers, markStatus, type OfferRecord } from '../../src/codin
 import { ConnectionsView } from '../../src/sidepanel/connections/ConnectionsView';
 import { hostOf, type EntityDisplayCtx } from '../../src/sidepanel/entityDisplay/format';
 import { useReplicaAliasMap } from '../../src/sidepanel/entityDisplay/replicaAliases';
+import { useSnippetPreviewMap } from '../../src/sidepanel/entityDisplay/snippetPreview';
 import { AttributionBadge } from '../../src/sidepanel/tabsession/AttributionBadge';
 import { SuggestionStats } from '../../src/sidepanel/tabsession/SuggestionStats';
 import { tabSessionDisplayTitle } from '../../src/sidepanel/tabsession/displayTitle';
@@ -1101,6 +1102,7 @@ const App = () => {
     ...(localReplicaId === undefined ? {} : { localReplicaId }),
     observedReplicaIds: [],
   });
+  const snippetPreviews = useSnippetPreviewMap();
   const displayCtx = useMemo<EntityDisplayCtx>(
     () => ({
       resolveWorkstreamPath: (bacId) => {
@@ -1108,8 +1110,9 @@ const App = () => {
         return found === undefined ? null : workstreamPath(bacId, state.workstreams);
       },
       replicaAlias,
+      snippetPreview: snippetPreviews.lookup,
     }),
-    [state.workstreams, replicaAlias],
+    [state.workstreams, replicaAlias, snippetPreviews],
   );
   // Invalidate every cached suggestion when the workstream
   // fingerprint shifts (rename, member move, new/deleted workstream).

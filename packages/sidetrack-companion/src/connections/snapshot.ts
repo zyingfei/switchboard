@@ -2184,6 +2184,9 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
       metadata: {
         charHashPrefix: lineage.selectionHash.slice(0, 12),
         match: lineage.match,
+        charCount: lineage.charCount,
+        lineCount: lineage.lineCount,
+        contentKindHint: lineage.contentKindHint,
       },
     });
     upsertNode(nodes, {

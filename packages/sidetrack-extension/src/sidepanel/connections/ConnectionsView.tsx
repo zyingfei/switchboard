@@ -199,10 +199,55 @@ const engagementClassForNode = (node: ConnectionNode): EngagementClass | undefin
 // comments" was invisible even at hops=2. Tab grouping uses
 // `metadata.tabSessionId` from visit-instances so each browser tab
 // becomes its own row in the Flow Path view.
+// Parse the canonical URL out of a visit node id when the node's
+// metadata is missing it (common when the snapshot is anchor-scoped
+// and didn't hydrate every neighbor). Node id formats:
+//   timeline-visit:<url>
+//   visit-instance:<tabSessionId>:<isoTimestamp>:<url>
+// URLs contain colons (`http://…`) so reassemble after the last `:`
+// separator that begins the URL — for visit-instance that's after
+// the 3rd colon; for timeline-visit it's after the 1st.
+const urlFromNodeId = (node: ConnectionNode): string | undefined => {
+  const idx = node.id.indexOf(':');
+  if (idx < 0) return undefined;
+  if (node.kind === 'timeline-visit') {
+    return node.id.slice(idx + 1);
+  }
+  if (node.kind === 'visit-instance') {
+    const parts = node.id.split(':');
+    if (parts.length < 4) return undefined;
+    return parts.slice(3).join(':');
+  }
+  return undefined;
+};
+
 const deriveFlowVisits = (
   nodes: readonly ConnectionNode[],
   ctx: EntityDisplayCtx,
+  anchorId: string,
 ): readonly TimelineVisit[] => {
+  // Resolve the anchor URL so visit-instances whose URL matches can
+  // be marked `isAnchor` even though their node ids differ.
+  const anchorUrl = (() => {
+    const anchorNode = nodes.find((n) => n.id === anchorId);
+    if (anchorNode === undefined) {
+      // Anchor not in scope (yet) — try parsing the id directly so
+      // matching still works on first render.
+      if (anchorId.startsWith('timeline-visit:')) {
+        return anchorId.replace(/^timeline-visit:/u, '');
+      }
+      if (anchorId.startsWith('visit-instance:')) {
+        const parts = anchorId.split(':');
+        if (parts.length >= 4) return parts.slice(3).join(':');
+      }
+      return undefined;
+    }
+    return (
+      metadataString(anchorNode.metadata, ['canonicalUrl', 'url', 'latestUrl']) ??
+      urlFromNodeId(anchorNode)
+    );
+  })();
+
   const out: TimelineVisit[] = [];
   for (const node of nodes) {
     if (node.kind !== 'visit-instance' && node.kind !== 'timeline-visit') continue;
@@ -210,13 +255,14 @@ const deriveFlowVisits = (
       metadataString(node.metadata, ['tabSessionId', 'tabSessionIdHash', 'tabIdHash']) ??
       (node.kind === 'timeline-visit' ? 'all-tabs' : 'unknown-tab');
     const engagementClass = engagementClassForNode(node);
-    const canonicalUrl = metadataString(node.metadata, [
-      'canonicalUrl',
-      'url',
-      'latestUrl',
-    ]);
+    const canonicalUrl =
+      metadataString(node.metadata, ['canonicalUrl', 'url', 'latestUrl']) ??
+      urlFromNodeId(node);
     const host = hostOf(canonicalUrl);
     const focusedWindowMs = metadataNumber(node.metadata, 'focusedWindowMs', 0);
+    const isAnchor =
+      node.id === anchorId ||
+      (anchorUrl !== undefined && canonicalUrl === anchorUrl);
     out.push({
       id: node.id,
       label: formatEntityDisplay(node, ctx).primary,
@@ -229,6 +275,7 @@ const deriveFlowVisits = (
       ...(host === undefined ? {} : { host }),
       ...(canonicalUrl === undefined ? {} : { url: canonicalUrl }),
       ...(focusedWindowMs > 0 ? { focusedWindowMs } : {}),
+      ...(isAnchor ? { isAnchor: true } : {}),
     });
   }
   return out;
@@ -1345,6 +1392,7 @@ export const ConnectionsView = ({
                 visits={deriveFlowVisits(
                   flowSubgraph.nodes.length > 0 ? flowSubgraph.nodes : result.snapshot.nodes,
                   ctx,
+                  anchor,
                 )}
                 navigationEdges={deriveNavigationEdges(
                   flowSubgraph.edges.length > 0 ? flowSubgraph.edges : result.snapshot.edges,

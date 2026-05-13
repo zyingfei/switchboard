@@ -8501,6 +8501,7 @@ pre.diff {
   flex-shrink: 0;
 }
 .cx-flow-visit {
+  position: relative;
   min-width: 132px;
   max-width: 200px;
   border: 1px solid var(--rule);
@@ -8514,6 +8515,25 @@ pre.diff {
   gap: 2px;
 }
 .cx-flow-visit:hover { border-color: var(--signal-tint); background: var(--signal-bg); }
+.cx-flow-visit.is-anchor {
+  border-color: var(--accent, #c2410c);
+  background: var(--accent-bg, #fdf3eb);
+  box-shadow: 0 0 0 1px var(--accent, #c2410c);
+}
+.cx-flow-visit-anchor-mark {
+  position: absolute;
+  top: -8px;
+  left: 6px;
+  padding: 1px 6px;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--paper-light);
+  background: var(--accent, #c2410c);
+  border-radius: 999px;
+  pointer-events: none;
+}
 .cx-flow-visit-title {
   display: block;
   font-size: 12.5px;

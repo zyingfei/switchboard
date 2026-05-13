@@ -31,6 +31,13 @@ export interface EntityDisplayCtx {
   // surfaces without a snapshot (the Inbox path-resolver, for example)
   // still work — those kinds just won't get the enriched title.
   readonly nodeById?: ReadonlyMap<string, ConnectionNode>;
+  // Local-only snippet text preview lookup. The companion stays hash-
+  // only (rawTextStored:false on the payload), but the browser knows
+  // what the user actually copied and caches the first 120 chars in
+  // chrome.storage.local. The side panel passes a lookup keyed by
+  // selectionHash (or its 12-char prefix) so the snippet card shows
+  // the real text instead of a derived summary.
+  readonly snippetPreview?: (hashOrPrefix: string | undefined) => string | undefined;
 }
 
 export interface EntityDisplay {
@@ -300,14 +307,47 @@ export const formatEntityDisplay = (
       return { primary, secondary, kindBadge, tooltip: node.id };
     }
     case 'snippet': {
-      // Stage 5 polish — snippets carry `match` (the copied text) plus
-      // `charHashPrefix`. The text is the most useful primary; the
-      // legacy `node.label` (= the raw snippet_<hex> id) is rejected
-      // by cleanLabel. Truncate-by-CSS only, so the full text remains
-      // available on the tooltip.
-      const match = metaStr(metadata, ['match', 'text', 'title']);
+      // Stage 5 polish — hash-only snippet lineage means the raw text
+      // never leaves the user's device. Derive a useful primary from
+      // the payload metrics that DO travel: contentKindHint +
+      // charCount + lineCount. The legacy `match` field (= "exact" /
+      // "fuzzy") is just the match-strategy and was confusing as a
+      // title. If a local text preview is provided via context
+      // (chrome.storage on this machine), use it.
+      const localPreview =
+        ctx.snippetPreview === undefined
+          ? undefined
+          : ctx.snippetPreview(metaStr(metadata, ['selectionHash', 'charHashPrefix']));
+      if (localPreview !== undefined && localPreview.length > 0) {
+        const truncated = localPreview.length > 80
+          ? `${localPreview.slice(0, 80).trimEnd()}…`
+          : localPreview;
+        const tooltip = metaStr(metadata, ['canonicalUrl', 'url']) ?? node.id;
+        return { primary: truncated, kindBadge, tooltip };
+      }
+      const charCount = typeof metadata['charCount'] === 'number'
+        ? (metadata['charCount'] as number)
+        : undefined;
+      const lineCount = typeof metadata['lineCount'] === 'number'
+        ? (metadata['lineCount'] as number)
+        : undefined;
+      const contentKindHint = metaStr(metadata, ['contentKindHint']);
+      const kindLabel = (() => {
+        if (contentKindHint === 'code-block') return 'Code';
+        if (contentKindHint === 'url') return 'URL';
+        if (contentKindHint === 'mixed') return 'Mixed';
+        if (contentKindHint === 'prose') return 'Prose';
+        return undefined;
+      })();
+      const parts: string[] = [];
+      if (kindLabel !== undefined) parts.push(kindLabel);
+      if (lineCount !== undefined && lineCount > 1) {
+        parts.push(`${String(lineCount)} lines`);
+      }
+      if (charCount !== undefined) parts.push(`${String(charCount)} chars`);
       const labelClean = cleanLabel(node.label);
-      const primary = match ?? labelClean ?? '(snippet)';
+      const primary =
+        parts.length > 0 ? parts.join(' · ') : labelClean ?? '(snippet)';
       const tooltip = metaStr(metadata, ['canonicalUrl', 'url']) ?? node.id;
       return { primary, kindBadge, tooltip };
     }
