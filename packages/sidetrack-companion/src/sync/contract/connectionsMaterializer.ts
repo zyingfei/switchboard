@@ -77,6 +77,7 @@ import {
   type InvalidationKey,
 } from './invalidation.js';
 import { runReconcileInWorker } from './connectionsReconcileWorker.js';
+import { runReconcileInChild } from './connectionsReconcileChildClient.js';
 import {
   createEmbedderWarmthTracker,
   decideHotPathEmbed,
@@ -963,20 +964,35 @@ export const createConnectionsMaterializer = (
   let workerDrainSeq = 0;
   let lastWorkerDrainSeqCompleted = -1;
 
+  // Pick the off-main-thread runner. child_process.fork is the safe
+  // path — worker_threads triggers V8 heap corruption when native
+  // addons (onnx/usearch/sharp) load in two isolates of the same
+  // process. The child_process path is the default; the worker_thread
+  // path is retained only for opt-in stress testing.
+  const pickSubprocessRunner = (): ((
+    job: { vaultRoot: string; seq: number },
+  ) => Promise<{ seq: number; ok: boolean; snapshotRevision?: string; error?: string }>) => {
+    if (process.env['SIDETRACK_CONNECTIONS_WORKER'] === '1') {
+      return runReconcileInWorker;
+    }
+    return runReconcileInChild;
+  };
+
   const drainViaWorker = async (): Promise<void> => {
     workerDrainSeq += 1;
     const seq = workerDrainSeq;
-    const result = await runReconcileInWorker({ vaultRoot: deps.vaultRoot, seq });
+    const runner = pickSubprocessRunner();
+    const result = await runner({ vaultRoot: deps.vaultRoot, seq });
     if (seq <= lastWorkerDrainSeqCompleted) {
       // A newer drain already completed; ignore stale output.
       return;
     }
     if (!result.ok) {
-      throw new Error(result.error ?? 'worker drain failed without a message');
+      throw new Error(result.error ?? 'subprocess drain failed without a message');
     }
     lastWorkerDrainSeqCompleted = seq;
-    // The worker re-instantiated its own materializer + accumulators
-    // inside the worker context. The main-thread in-process state
+    // The subprocess re-instantiated its own materializer + accumulators
+    // inside the child context. The main-thread in-process state
     // (urlAccumulator, tabSessionAccumulator, lastEngagementClassRevision)
     // is now potentially stale relative to the on-disk snapshot. Force
     // a re-seed on the next in-process drain so future fallback paths
@@ -1013,7 +1029,14 @@ export const createConnectionsMaterializer = (
   //      worker is replacing.
   const shouldUseWorker = (): boolean => {
     if (!isMainThread) return false;
-    return process.env['SIDETRACK_CONNECTIONS_WORKER'] === '1';
+    // Explicit in-process override wins (used by unit + e2e tests that
+    // need to assert against in-process accumulator state).
+    if (process.env['SIDETRACK_CONNECTIONS_INPROCESS'] === '1') return false;
+    // Either subprocess flavour qualifies. The child_process flavour is
+    // the default; the worker_thread flavour is opt-in via WORKER=1.
+    if (process.env['SIDETRACK_CONNECTIONS_WORKER'] === '1') return true;
+    if (process.env['SIDETRACK_CONNECTIONS_CHILD'] === '1') return true;
+    return false;
   };
 
   const drain = async (): Promise<void> => {

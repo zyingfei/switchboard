@@ -750,17 +750,30 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
     process.env['SIDETRACK_OFFLINE_MODELS'] = '1';
   }
 
-  // Note: an earlier revision of this file defaulted
-  // SIDETRACK_CONNECTIONS_WORKER=1 here to keep /status responsive
-  // during cold-start catchUp. That fix regressed into a V8 fatal
-  // ("HeapObject::SafeSizeFromMap" in the concurrent major sweeper)
-  // on real prod vaults — the worker entry transitively loads
-  // onnxruntime-node + usearch + sharp, and those native addons
-  // appear to mishandle being instantiated in two V8 isolates in
-  // the same process. The worker_thread path is still available
-  // via explicit `SIDETRACK_CONNECTIONS_WORKER=1`; the in-process
-  // path now relies on cooperative yielding inside the seeders to
-  // keep the HTTP listener interleaved.
+  // Materializer reconcile runs in a forked child by default — this
+  // is the structural fix for the 30-60s [api.stall] events observed
+  // on real prod vaults. buildConnectionsSnapshot is sync CPU; with
+  // the reconcile in-process it pinned the API event loop, queued
+  // /v1/status + /v1/visits + /v1/connections behind it, and made
+  // every side-panel reopen feel broken.
+  //
+  // child_process.fork (NOT worker_threads) is the safe path: the
+  // reconcile entry transitively loads onnxruntime-node + usearch +
+  // sharp, and those native addons crash V8 ("HeapObject::
+  // SafeSizeFromMap" in the concurrent major sweeper) when
+  // instantiated in two isolates of the same process. Forking gives
+  // each instance its own V8, so the conflict is structurally
+  // impossible.
+  //
+  // Tests opt out via SIDETRACK_CONNECTIONS_INPROCESS=1 when they
+  // need to assert against in-process accumulator state.
+  if (
+    process.env['SIDETRACK_CONNECTIONS_INPROCESS'] !== '1' &&
+    process.env['SIDETRACK_CONNECTIONS_WORKER'] !== '1' &&
+    process.env['SIDETRACK_CONNECTIONS_CHILD'] === undefined
+  ) {
+    process.env['SIDETRACK_CONNECTIONS_CHILD'] = '1';
+  }
 
   if (args.installService) {
     if (syncRequested(args)) {
