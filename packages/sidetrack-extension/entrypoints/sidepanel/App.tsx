@@ -5537,21 +5537,11 @@ const App = () => {
               showEmptyPlaceholder
             />
           ) : null}
-          {focusedUrlRecord !== undefined ? (
-            <button
-              type="button"
-              className="tab-attribution-card-change"
-              onClick={() => {
-                // tabSessionMoveId carries the canonical URL post-Phase B
-                // — the move-target picker still works because the
-                // accept handler now dispatches to handleUrlAttribute.
-                setTabSessionMoveId(focusedUrlRecord.canonicalUrl);
-              }}
-              title="Attribute this page to a different workstream"
-            >
-              Change…
-            </button>
-          ) : null}
+          {/* Stage 5 polish — the legacy "Change…" button used to live
+              here. Removed because the flat 4-action bar below already
+              has "Pick another…" with the same behavior (opens the
+              WorkstreamPicker); rendering both was a duplicate
+              affordance the user flagged. */}
         </div>
         {/* Action bar: shows up when there's a focused URL. All four
             choices flat — no overflow menu — so every state from the

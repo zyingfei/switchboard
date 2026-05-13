@@ -561,17 +561,20 @@ button:disabled {
   color: var(--ink-2);
 }
 
-/* Action bar under the Current Tab badge. Same 2x2 grid as the
-   InboxCard + SuggestionBanner so all three surfaces read the same
-   shape regardless of how many cards stack. Primary "Yes, that's
-   right" still stands out via .primary; the other three are equal-
-   weight outlined buttons. */
+/* Action bar under the Current Tab badge. Flex-wrap so the row
+   collapses cleanly across the 3-vs-4 cases:
+     - 4 buttons (suggestion present + URL unattributed): wrap 2+2.
+     - 3 buttons (no suggestion OR already attributed): single row.
+   The 2x2 grid version forced 2 lines with an empty cell for any
+   3-button state — the user's screenshot showed that ugly layout.
+   Same flex pattern is used by the InboxCard + SuggestionBanner
+   action rows so all three surfaces feel identical. */
 .tab-attribution-card-actions {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
+  display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   padding: 6px 0 0 0;
-  align-items: stretch;
+  align-items: center;
 }
 .tab-attribution-card-action {
   background: transparent;
@@ -822,17 +825,17 @@ button:disabled {
 }
 
 .tab-session-suggestion-actions {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
+  display: flex;
+  flex-wrap: wrap;
   gap: 6px;
-  align-items: stretch;
+  align-items: center;
 }
 
 .tab-session-actions {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
+  display: flex;
+  flex-wrap: wrap;
   gap: 6px;
-  align-items: stretch;
+  align-items: center;
 }
 
 .tab-session-picker select {
