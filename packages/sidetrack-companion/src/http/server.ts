@@ -454,6 +454,15 @@ export interface CompanionHttpConfig {
   readonly getEventLoopSnapshot?: () => import(
     '../runtime/eventLoopMonitor.js'
   ).EventLoopSnapshot;
+  // Embedder sidecar status — drives /v1/status.recall.vectorState.
+  // Like getEventLoopSnapshot it MUST be synchronous + side-effect-
+  // free; reads cached state, never blocks on a spawn/warmup. When
+  // omitted (test mode / in-process embedder) /status reports
+  // \`vectorState: 'disabled'\`.
+  readonly getEmbedderStatus?: () => {
+    readonly state: 'disabled' | 'cold' | 'warming' | 'ready' | 'failed';
+    readonly lastError?: string;
+  };
 }
 
 export interface StartedHttpServer {
@@ -1438,15 +1447,22 @@ const routes: readonly RouteDefinition[] = [
       // I/O latency; `/v1/system/health` already exposes the rich
       // report for callers that want it. /status reports just the
       // coarse state so the panel can render "warming" vs "ready".
+      const embedderStatus = context.getEmbedderStatus?.() ?? { state: 'disabled' as const };
       let recallState:
-        | { readonly state: 'disabled' | 'rebuilding' | 'ready' }
+        | {
+            readonly state: 'disabled' | 'rebuilding' | 'ready';
+            readonly vectorState: 'disabled' | 'cold' | 'warming' | 'ready' | 'failed';
+            readonly vectorError?: string;
+          }
         | undefined;
       if (context.recallLifecycle !== undefined) {
         recallState = {
           state: context.recallLifecycle.isRebuilding() ? 'rebuilding' : 'ready',
+          vectorState: embedderStatus.state,
+          ...(embedderStatus.lastError === undefined ? {} : { vectorError: embedderStatus.lastError }),
         };
       } else {
-        recallState = { state: 'disabled' };
+        recallState = { state: 'disabled', vectorState: embedderStatus.state };
       }
       // Materializer state — cached health snapshot (sync).
       const materializerHealth = context.syncMaterializerHealth?.() ?? undefined;
@@ -3601,6 +3617,29 @@ const routes: readonly RouteDefinition[] = [
       if (index.items.length === 0) {
         return [200, { data: [] }];
       }
+      // Vector availability gate. The embedder runs in a child
+      // process; cold/warming/failed states return lexical-only
+      // results immediately. Callers that want to wait for the
+      // vector path can pass ?waitMs=N (capped at 5000) and we'll
+      // poll for ready up to that budget. Default is non-blocking
+      // — /v1/recall/query must not stall the side panel on a
+      // cold embedder.
+      const embedderStatus = context.getEmbedderStatus?.() ?? { state: 'disabled' as const };
+      const rawWait = Number.parseInt(url.searchParams.get('waitMs') ?? '0', 10);
+      const waitBudgetMs = Number.isFinite(rawWait) && rawWait > 0 ? Math.min(rawWait, 5_000) : 0;
+      const isVectorUsable = (s: string): boolean => s === 'ready' || s === 'disabled';
+      let vectorStateAtQuery = embedderStatus.state;
+      if (!isVectorUsable(vectorStateAtQuery) && waitBudgetMs > 0 && vectorStateAtQuery !== 'failed') {
+        const deadline = Date.now() + waitBudgetMs;
+        while (Date.now() < deadline) {
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, 50);
+          });
+          const next = context.getEmbedderStatus?.() ?? { state: 'disabled' as const };
+          vectorStateAtQuery = next.state;
+          if (isVectorUsable(vectorStateAtQuery)) break;
+        }
+      }
       // Embedding the query needs the local model. In offline mode
       // with an empty cache (or any other "we can't load the model"
       // failure path), the embedder throws RecallModelMissingError —
@@ -3609,24 +3648,29 @@ const routes: readonly RouteDefinition[] = [
       // "recall failed". Capture continues to work in that state
       // because POST /v1/events doesn't depend on the embedder.
       let queryEmbedding: Float32Array | undefined;
-      try {
-        [queryEmbedding] = await embed([query.q]);
-      } catch (error) {
-        if (error instanceof RecallModelMissingError) {
-          return [
-            503,
-            createProblem({
-              title: 'Recall embedding model is not available',
-              status: 503,
-              code: 'RECALL_MODEL_MISSING',
-              correlationId: createRequestId(),
-              detail: error.offline
-                ? `Companion is in offline-models mode and the cache at ${error.cacheDir} does not contain ${MODEL_ID}. Run \`sidetrack-companion models ensure\` (with network access) or disable --offline-models / SIDETRACK_OFFLINE_MODELS.`
-                : `Could not load ${MODEL_ID} from ${error.cacheDir}. Run \`sidetrack-companion models ensure\` to (re)download the model.`,
-            }),
-          ];
+      let vectorMode: 'used' | 'skipped-warming' | 'skipped-failed' = 'used';
+      if (!isVectorUsable(vectorStateAtQuery)) {
+        vectorMode = vectorStateAtQuery === 'failed' ? 'skipped-failed' : 'skipped-warming';
+      } else {
+        try {
+          [queryEmbedding] = await embed([query.q]);
+        } catch (error) {
+          if (error instanceof RecallModelMissingError) {
+            return [
+              503,
+              createProblem({
+                title: 'Recall embedding model is not available',
+                status: 503,
+                code: 'RECALL_MODEL_MISSING',
+                correlationId: createRequestId(),
+                detail: error.offline
+                  ? `Companion is in offline-models mode and the cache at ${error.cacheDir} does not contain ${MODEL_ID}. Run \`sidetrack-companion models ensure\` (with network access) or disable --offline-models / SIDETRACK_OFFLINE_MODELS.`
+                  : `Could not load ${MODEL_ID} from ${error.cacheDir}. Run \`sidetrack-companion models ensure\` to (re)download the model.`,
+              }),
+            ];
+          }
+          throw error;
         }
-        throw error;
       }
       const threadIds =
         query.workstreamId === undefined
@@ -3729,7 +3773,17 @@ const routes: readonly RouteDefinition[] = [
         queryLength: query.q.length,
         resultCount: enriched.length,
       });
-      return [200, { data: enriched }];
+      return [
+        200,
+        {
+          data: enriched,
+          meta: {
+            vectorMode,
+            vectorState: vectorStateAtQuery,
+            ...(waitBudgetMs > 0 ? { waitedMs: waitBudgetMs } : {}),
+          },
+        },
+      ];
     },
   },
   {

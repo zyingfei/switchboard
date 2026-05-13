@@ -35,6 +35,7 @@ import {
   type StartedHttpServer,
 } from '../http/server.js';
 import { startEventLoopMonitor } from './eventLoopMonitor.js';
+import { createEmbedderClient } from '../recall/embedderClient.js';
 import { createEventLog } from '../sync/eventLog.js';
 import { createKnownReplicasStore } from '../sync/knownReplicas.js';
 import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
@@ -569,6 +570,42 @@ export const startCompanion = async (
   teardown.push(() => {
     eventLoopMonitor.stop();
   });
+
+  // Embedder sidecar — owns ONNX + transformers.js in a child process
+  // so the main thread isn't blocked by inference. Opt-out with
+  // SIDETRACK_EMBEDDER_INPROCESS=1 if a caller (test harness, special
+  // diagnostic) wants the legacy in-process path. The test embedder
+  // env (SIDETRACK_TEST_EMBEDDER=1) ALWAYS routes in-process — the
+  // deterministic test embedder is sync and the child overhead is
+  // pure waste.
+  const inProcessEmbedder =
+    process.env['SIDETRACK_EMBEDDER_INPROCESS'] === '1' ||
+    process.env['SIDETRACK_TEST_EMBEDDER'] === '1';
+  const embedderClient = inProcessEmbedder ? null : createEmbedderClient();
+  if (embedderClient !== null) {
+    teardown.push(async () => {
+      await embedderClient.stop();
+    });
+    // Install the sidecar as the global embed implementation so all
+    // call sites (recall rebuild, recall ingestor, visit similarity)
+    // dispatch through the child process automatically. The override
+    // is module-scoped in `recall/embedder.ts`.
+    const { setEmbedderOverride } = await import('../recall/embedder.js');
+    setEmbedderOverride(embedderClient.embed);
+  }
+  const getEmbedderStatus = (): {
+    readonly state: 'disabled' | 'cold' | 'warming' | 'ready' | 'failed';
+    readonly lastError?: string;
+  } => {
+    if (embedderClient === null) {
+      return { state: 'disabled' };
+    }
+    const err = embedderClient.lastError();
+    return {
+      state: embedderClient.state(),
+      ...(err === undefined ? {} : { lastError: err }),
+    };
+  };
   const server = createCompanionHttpServer({
     bridgeKey: ensured.key,
     vaultWriter,
@@ -579,6 +616,7 @@ export const startCompanion = async (
     startedAt: new Date(),
     bucketRegistry: createBucketRegistry(options.vaultPath),
     getEventLoopSnapshot: eventLoopMonitor.snapshot,
+    getEmbedderStatus,
     ...(collectorFramework === null
       ? {}
       : {

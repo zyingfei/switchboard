@@ -407,16 +407,20 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     // awaitIdle must resolve within a reasonable bound — the bug
     // would have it spin forever at 5 ms intervals waiting for
     // dirty to clear (which never happens without another trigger
-    // because the failure cooldown blocks retries).
+    // because the failure cooldown blocks retries). Budget is the
+    // drain debounce (1500 ms) + headroom; the assertion below
+    // tightens that to "resolves before the budget" rather than a
+    // fixed wall-clock number that would drift with the debounce.
+    const budgetMs = 3_000;
     const start = Date.now();
     await Promise.race([
       m.awaitIdle(),
       new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('awaitIdle hung past 1s')), 1_000),
+        setTimeout(() => reject(new Error(`awaitIdle hung past ${String(budgetMs)} ms`)), budgetMs),
       ),
     ]);
     const elapsed = Date.now() - start;
-    expect(elapsed).toBeLessThan(1_000);
+    expect(elapsed).toBeLessThan(budgetMs);
 
     // health() reports the failure so callers know not to trust
     // the snapshot.

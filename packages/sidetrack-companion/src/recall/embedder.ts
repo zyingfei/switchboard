@@ -304,12 +304,28 @@ const testEmbed = (text: string): Float32Array => {
   return v;
 };
 
+// Override hook: when set, all production embed() calls dispatch
+// to this function instead of running ONNX in-process. The runtime
+// installs the embedder-sidecar client here so the recall rebuild,
+// recall ingestor, and visit-similarity producer all route through
+// the child process automatically. Test embedder bypasses the
+// override — the deterministic embedder is sync and the child
+// overhead is wasted on test inputs.
+type EmbedFn = (texts: readonly string[]) => Promise<readonly Float32Array[]>;
+let embedderOverride: EmbedFn | undefined;
+export const setEmbedderOverride = (fn: EmbedFn | undefined): void => {
+  embedderOverride = fn;
+};
+
 export const embed = async (texts: readonly string[]): Promise<readonly Float32Array[]> => {
   if (texts.length === 0) {
     return [];
   }
   if (isTestEmbedderEnabled()) {
     return texts.map(testEmbed);
+  }
+  if (embedderOverride !== undefined) {
+    return embedderOverride(texts);
   }
   const extractor = await getEmbedder();
   const vectors: Float32Array[] = [];

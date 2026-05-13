@@ -171,7 +171,14 @@ const FAILURE_COOLDOWN_MS = 5_000;
 // a single drain instead of one rebuild per event. Sustained event streams
 // at a lower frequency than this window still produce per-event drains;
 // the worker_thread move (W1b) is the structural fix for those.
-const DRAIN_DEBOUNCE_MS = 250;
+// Drain debounce. Bumped from 250 ms → 1500 ms to coalesce bursts of
+// incoming events on a real prod vault. Each buildAndWrite is ~600 ms
+// of main-thread sync CPU (buildConnectionsSnapshot dominates); with
+// 250 ms debounce a 10-event burst produces 10 drains and 6 s of
+// pinned main thread. 1500 ms collapses the same burst into one
+// drain. Side-panel views poll their own state and don't observe a
+// per-edit reactivity gap below ~2 s, so this is invisible UX-wise.
+const DRAIN_DEBOUNCE_MS = 1500;
 
 // Hardcoded event types this materializer reacts to. Connections
 // has no registry surface, so we can't derive handles from
