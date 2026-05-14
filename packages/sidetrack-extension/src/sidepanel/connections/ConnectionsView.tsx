@@ -1353,17 +1353,18 @@ export const ConnectionsView = ({
     focusEligibleVisitCount,
     focusData.previousTopicCount,
   );
-  const shadowFocusCollapsed = isCollapsedSuggestionSet(
-    shadowFocusData.topics,
-    shadowEligibleVisitCount,
-    shadowFocusData.previousTopicCount,
-  );
+  const scopedEmptyFocusData = useMemo(() => emptyFocusData(), []);
+  const shadowSnapshotReady = shadowFullSnapshot.nodes.length > 0 && !shadowFullSnapshot.loading;
   const renderedFocusData =
-    activeFocusCollapsed && shadowFocusData.topics.length > 0 && !shadowFocusCollapsed
+    activeFocusCollapsed && shadowFocusData.topics.length > 0
       ? shadowFocusData
-      : focusData;
+      : activeFocusCollapsed && shadowSnapshotReady
+        ? scopedEmptyFocusData
+        : focusData;
   const renderedFocusEligibleVisitCount =
-    renderedFocusData === shadowFocusData ? shadowEligibleVisitCount : focusEligibleVisitCount;
+    renderedFocusData === shadowFocusData ? shadowEligibleVisitCount
+    : renderedFocusData === scopedEmptyFocusData ? 0
+    : focusEligibleVisitCount;
   // Flow Path subgraph — expand the anchor scope with the full
   // snapshot's navigation-edge transitive closure (capped). Keeps
   // the chain compact for hub visits while still surfacing the

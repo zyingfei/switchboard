@@ -443,6 +443,119 @@ describe('ConnectionsView — engineering scaffold', () => {
     expect(screen.getByText('1 of 6 pages in this scope')).toBeDefined();
   });
 
+  it('does not fall back to the global collapsed topic when scoped shadow has no topic', async () => {
+    const collapsedSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: { nodeId: 'timeline-visit:https://github.com/microsoft/tokenweave', hops: 1 },
+        nodes: [
+          {
+            id: 'timeline-visit:https://github.com/microsoft/tokenweave',
+            kind: 'timeline-visit',
+            label: 'microsoft/tokenweave',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://github.com/microsoft/tokenweave' },
+          },
+          {
+            id: 'topic:collapsed',
+            kind: 'topic',
+            label: 'ChatGPT',
+            originReplicaIds: [],
+            metadata: { memberCount: 301, cohesion: 0.72 },
+          },
+        ],
+        edges: [
+          {
+            id: 'edge:collapsed-tokenweave',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://github.com/microsoft/tokenweave',
+            toNodeId: 'topic:collapsed',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-current' },
+            confidence: 'inferred',
+          },
+        ],
+        updatedAt: '2026-05-14T10:00:00.000Z',
+        nodeCount: 2,
+        edgeCount: 1,
+      },
+    };
+    const shadowSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: {},
+        nodes: [
+          {
+            id: 'timeline-visit:https://github.com/microsoft/tokenweave',
+            kind: 'timeline-visit',
+            label: 'microsoft/tokenweave',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://github.com/microsoft/tokenweave' },
+          },
+          {
+            id: 'timeline-visit:https://db.example/oracle',
+            kind: 'timeline-visit',
+            label: 'Oracle 26ai',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://db.example/oracle', focusedWindowMs: 8_000 },
+          },
+          {
+            id: 'topic:db',
+            kind: 'topic',
+            label: 'Oracle',
+            originReplicaIds: [],
+            metadata: { memberCount: 5, cohesion: 0.91 },
+          },
+        ],
+        edges: [
+          {
+            id: 'edge:shadow-db',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://db.example/oracle',
+            toNodeId: 'topic:db',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-shadow' },
+            confidence: 'inferred',
+          },
+        ],
+        updatedAt: '2026-05-14T10:00:00.000Z',
+        nodeCount: 3,
+        edgeCount: 1,
+      },
+    };
+    let shadowRequested = false;
+
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string; filters?: { topicVariant?: string } };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        return { ok: true, data: collapsedSnapshot };
+      }
+      if (m.type === messageTypes.loadConnectionsSnapshot) {
+        if (m.filters?.topicVariant === 'shadow') shadowRequested = true;
+        return {
+          ok: true,
+          data: m.filters?.topicVariant === 'shadow' ? shadowSnapshot : collapsedSnapshot,
+        };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+
+    render(
+      <ConnectionsView initialAnchor="timeline-visit:https://github.com/microsoft/tokenweave" />,
+    );
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-mode-focus')).not.toBeNull();
+    });
+    fireEvent.click(screen.getByTestId('connections-mode-focus'));
+
+    await waitFor(() => {
+      expect(shadowRequested).toBe(true);
+      expect(screen.queryByTestId('focus-collapse-guard')).toBeNull();
+    });
+    expect(screen.queryByText('ChatGPT')).toBeNull();
+    expect(screen.queryByTestId('focus-topic-topic:db')).toBeNull();
+  });
+
   it('can re-anchor from a visible neighbor row', async () => {
     const requestedNodeIds: string[] = [];
     setConnectionsClientTransportForTests(async (msg) => {
@@ -512,7 +625,14 @@ describe('ConnectionsView — engineering scaffold', () => {
       ok: true,
       data: {
         scope: 'plugin-active-only-companion-unreachable',
-        snapshot: { scope: {}, nodes: [], edges: [], updatedAt: '1970-01-01T00:00:00.000Z', nodeCount: 0, edgeCount: 0 },
+        snapshot: {
+          scope: {},
+          nodes: [],
+          edges: [],
+          updatedAt: '1970-01-01T00:00:00.000Z',
+          nodeCount: 0,
+          edgeCount: 0,
+        },
       },
     }));
     render(<ConnectionsView initialAnchor="thread:thread_a" />);
@@ -526,7 +646,14 @@ describe('ConnectionsView — engineering scaffold', () => {
       ok: true,
       data: {
         scope: 'companion-extended',
-        snapshot: { scope: {}, nodes: [], edges: [], updatedAt: '1970-01-01T00:00:00.000Z', nodeCount: 0, edgeCount: 0 },
+        snapshot: {
+          scope: {},
+          nodes: [],
+          edges: [],
+          updatedAt: '1970-01-01T00:00:00.000Z',
+          nodeCount: 0,
+          edgeCount: 0,
+        },
       },
     }));
     render(<ConnectionsView initialAnchor="thread:thread_a" />);
