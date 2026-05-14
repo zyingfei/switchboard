@@ -214,6 +214,21 @@ export const FocusView = ({
     );
   }
 
+  if (topics.length === 0) {
+    return (
+      <section className="cx-focus" data-testid="focus-view">
+        <article className="cx-focus-triage" data-testid="focus-empty">
+          <div className="cx-focus-triage-head">
+            <span className="cx-focus-chip cx-focus-chip-suggestion">No suggestion</span>
+            <span className="cx-mono cx-dim">computed focus</span>
+          </div>
+          <div className="cx-focus-triage-title">No scoped focus group</div>
+          <p>This page is not in the current candidate topic output.</p>
+        </article>
+      </section>
+    );
+  }
+
   return (
     <section className="cx-focus" data-testid="focus-view">
       {topics.map((topic) => {

@@ -120,6 +120,21 @@ describe('FocusView', () => {
     expect(screen.queryByTestId('focus-topic-topic:a')).toBeNull();
   });
 
+  it('renders an explicit empty state when scoped focus has no suggestion', () => {
+    render(
+      <FocusView
+        topics={[]}
+        visitsByTopic={{}}
+        engagementClassesByVisit={{}}
+        onTopicClick={() => undefined}
+        onVisitClick={() => undefined}
+      />,
+    );
+
+    expect(screen.getByTestId('focus-empty')).toBeDefined();
+    expect(screen.getByText('No scoped focus group')).toBeDefined();
+  });
+
   it('marks oversized suggestions for triage without enabling computed-topic rename', () => {
     render(
       <FocusView
