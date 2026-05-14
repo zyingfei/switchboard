@@ -668,15 +668,24 @@ const deriveShadowFocusScope = (
   if (shadowNodes.length === 0) return { nodes: [], edges: [] };
 
   const scopedVisitIds = new Set<string>();
+  const selectedTopicIds = new Set<string>();
   if (anchorId.startsWith('workstream:')) {
     addWorkstreamScopedVisitAliases(activeScopeNodes, activeScopeEdges, anchorId, scopedVisitIds);
     addWorkstreamScopedVisitAliases(shadowNodes, shadowEdges, anchorId, scopedVisitIds);
+  } else if (anchorId.startsWith('topic:')) {
+    selectedTopicIds.add(anchorId);
   } else {
     addAnchorScopedVisitAliases(activeScopeNodes, activeScopeEdges, anchorId, scopedVisitIds);
   }
 
+  for (const edge of shadowEdges) {
+    if (edge.kind === 'visit_in_topic' && scopedVisitIds.has(edge.fromNodeId)) {
+      selectedTopicIds.add(edge.toNodeId);
+    }
+  }
+
   const visitTopicEdges = shadowEdges.filter(
-    (edge) => edge.kind === 'visit_in_topic' && scopedVisitIds.has(edge.fromNodeId),
+    (edge) => edge.kind === 'visit_in_topic' && selectedTopicIds.has(edge.toNodeId),
   );
   const scopedTopicMemberCounts = new Map<string, number>();
   const scopedNodeIds = new Set<string>();
@@ -1355,12 +1364,16 @@ export const ConnectionsView = ({
   );
   const scopedEmptyFocusData = useMemo(() => emptyFocusData(), []);
   const shadowSnapshotReady = shadowFullSnapshot.nodes.length > 0 && !shadowFullSnapshot.loading;
+  const topicAnchorHasShadowFocus =
+    anchor.startsWith('topic:') && shadowFocusData.topics.length > 0;
   const renderedFocusData =
     activeFocusCollapsed && shadowFocusData.topics.length > 0
       ? shadowFocusData
-      : activeFocusCollapsed && shadowSnapshotReady
-        ? scopedEmptyFocusData
-        : focusData;
+      : topicAnchorHasShadowFocus
+        ? shadowFocusData
+        : activeFocusCollapsed && shadowSnapshotReady
+          ? scopedEmptyFocusData
+          : focusData;
   const renderedFocusEligibleVisitCount =
     renderedFocusData === shadowFocusData ? shadowEligibleVisitCount
     : renderedFocusData === scopedEmptyFocusData ? 0

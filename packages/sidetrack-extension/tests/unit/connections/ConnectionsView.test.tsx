@@ -210,11 +210,18 @@ describe('ConnectionsView — engineering scaffold', () => {
             metadata: { canonicalUrl: 'https://news.example/story', focusedWindowMs: 9_000 },
           },
           {
+            id: 'timeline-visit:https://ai.example/race',
+            kind: 'timeline-visit',
+            label: 'AI race',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://ai.example/race', focusedWindowMs: 7_000 },
+          },
+          {
             id: 'topic:db',
             kind: 'topic',
             label: 'Oracle',
             originReplicaIds: [],
-            metadata: { memberCount: 6, cohesion: 0.91 },
+            metadata: { memberCount: 2, cohesion: 0.91 },
           },
           {
             id: 'topic:hn',
@@ -235,6 +242,15 @@ describe('ConnectionsView — engineering scaffold', () => {
             confidence: 'inferred',
           },
           {
+            id: 'edge:shadow-db-peer',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://ai.example/race',
+            toNodeId: 'topic:db',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-shadow' },
+            confidence: 'inferred',
+          },
+          {
             id: 'edge:shadow-hn',
             kind: 'visit_in_topic',
             fromNodeId: 'timeline-visit:https://news.example/story',
@@ -245,14 +261,36 @@ describe('ConnectionsView — engineering scaffold', () => {
           },
         ],
         updatedAt: '2026-05-14T10:00:00.000Z',
-        nodeCount: 5,
-        edgeCount: 2,
+        nodeCount: 6,
+        edgeCount: 3,
+      },
+    };
+    const emptyTopicAnchorSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: { nodeId: 'topic:db', hops: 1 },
+        nodes: [
+          {
+            id: 'topic:db',
+            kind: 'topic',
+            label: 'Oracle',
+            originReplicaIds: [],
+            metadata: {},
+          },
+        ],
+        edges: [],
+        updatedAt: '2026-05-14T10:00:00.000Z',
+        nodeCount: 1,
+        edgeCount: 0,
       },
     };
 
     setConnectionsClientTransportForTests(async (msg) => {
-      const m = msg as { type: string; filters?: { topicVariant?: string } };
+      const m = msg as { type: string; nodeId?: string; filters?: { topicVariant?: string } };
       if (m.type === messageTypes.loadConnectionsNeighbors) {
+        if (m.nodeId?.startsWith('topic:')) {
+          return { ok: true, data: emptyTopicAnchorSnapshot };
+        }
         return { ok: true, data: collapsedSnapshot };
       }
       if (m.type === messageTypes.loadConnectionsSnapshot) {
@@ -274,14 +312,21 @@ describe('ConnectionsView — engineering scaffold', () => {
       expect(screen.queryByTestId('focus-topic-topic:db')).not.toBeNull();
     });
     expect(screen.queryByTestId('focus-topic-topic:hn')).toBeNull();
-    expect(screen.getByText('1 of 6 pages in this scope')).toBeDefined();
+    expect(screen.getByText('2 pages')).toBeDefined();
     fireEvent.click(screen.getByTestId('focus-expand-topic:db'));
     expect(
       screen.getByTestId('focus-visit-timeline-visit:https://db.example/oracle'),
     ).toBeDefined();
+    expect(screen.getByTestId('focus-visit-timeline-visit:https://ai.example/race')).toBeDefined();
     expect(
       screen.queryByTestId('focus-visit-timeline-visit:https://news.example/story'),
     ).toBeNull();
+
+    fireEvent.click(screen.getByText('Oracle'));
+    await waitFor(() => {
+      expect(screen.queryByText('No scoped focus group')).toBeNull();
+      expect(screen.queryByTestId('focus-topic-topic:db')).not.toBeNull();
+    });
   });
 
   it('does not broaden thread-anchor shadow focus through a collapsed topic scope', async () => {
