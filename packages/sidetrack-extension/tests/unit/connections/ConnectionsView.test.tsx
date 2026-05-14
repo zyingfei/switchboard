@@ -284,6 +284,165 @@ describe('ConnectionsView — engineering scaffold', () => {
     ).toBeNull();
   });
 
+  it('does not broaden thread-anchor shadow focus through a collapsed topic scope', async () => {
+    const collapsedSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: { nodeId: 'thread:db_oracle', hops: 3 },
+        nodes: [
+          {
+            id: 'thread:db_oracle',
+            kind: 'thread',
+            label: 'DB - Oracle 26ai Innovation and Competitors',
+            originReplicaIds: ['replica-A'],
+            metadata: {
+              canonicalUrl: 'https://db.example/oracle',
+              url: 'https://db.example/oracle',
+            },
+          },
+          {
+            id: 'timeline-visit:https://db.example/oracle',
+            kind: 'timeline-visit',
+            label: 'Oracle 26ai',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://db.example/oracle', focusedWindowMs: 8_000 },
+          },
+          {
+            id: 'timeline-visit:https://news.example/story',
+            kind: 'timeline-visit',
+            label: 'Unrelated HN',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://news.example/story', focusedWindowMs: 9_000 },
+          },
+          {
+            id: 'topic:collapsed',
+            kind: 'topic',
+            label: 'ChatGPT',
+            originReplicaIds: [],
+            metadata: { memberCount: 294, cohesion: 0.72 },
+          },
+        ],
+        edges: [
+          {
+            id: 'edge:same-url',
+            kind: 'timeline_same_url_as_thread',
+            fromNodeId: 'timeline-visit:https://db.example/oracle',
+            toNodeId: 'thread:db_oracle',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'snapshot' },
+            confidence: 'observed',
+          },
+          {
+            id: 'edge:collapsed-db',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://db.example/oracle',
+            toNodeId: 'topic:collapsed',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-current' },
+            confidence: 'inferred',
+          },
+          {
+            id: 'edge:collapsed-hn',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://news.example/story',
+            toNodeId: 'topic:collapsed',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-current' },
+            confidence: 'inferred',
+          },
+        ],
+        updatedAt: '2026-05-14T10:00:00.000Z',
+        nodeCount: 4,
+        edgeCount: 3,
+      },
+    };
+    const shadowSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: {},
+        nodes: [
+          {
+            id: 'timeline-visit:https://db.example/oracle',
+            kind: 'timeline-visit',
+            label: 'Oracle 26ai',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://db.example/oracle', focusedWindowMs: 8_000 },
+          },
+          {
+            id: 'timeline-visit:https://news.example/story',
+            kind: 'timeline-visit',
+            label: 'Unrelated HN',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://news.example/story', focusedWindowMs: 9_000 },
+          },
+          {
+            id: 'topic:db',
+            kind: 'topic',
+            label: 'Oracle',
+            originReplicaIds: [],
+            metadata: { memberCount: 6, cohesion: 0.91 },
+          },
+          {
+            id: 'topic:hn',
+            kind: 'topic',
+            label: 'Hacker News',
+            originReplicaIds: [],
+            metadata: { memberCount: 8, cohesion: 0.89 },
+          },
+        ],
+        edges: [
+          {
+            id: 'edge:shadow-db',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://db.example/oracle',
+            toNodeId: 'topic:db',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-shadow' },
+            confidence: 'inferred',
+          },
+          {
+            id: 'edge:shadow-hn',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://news.example/story',
+            toNodeId: 'topic:hn',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-shadow' },
+            confidence: 'inferred',
+          },
+        ],
+        updatedAt: '2026-05-14T10:00:00.000Z',
+        nodeCount: 4,
+        edgeCount: 2,
+      },
+    };
+
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string; filters?: { topicVariant?: string } };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        return { ok: true, data: collapsedSnapshot };
+      }
+      if (m.type === messageTypes.loadConnectionsSnapshot) {
+        return {
+          ok: true,
+          data: m.filters?.topicVariant === 'shadow' ? shadowSnapshot : collapsedSnapshot,
+        };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+
+    render(<ConnectionsView initialAnchor="thread:db_oracle" />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-mode-focus')).not.toBeNull();
+    });
+    fireEvent.click(screen.getByTestId('connections-mode-focus'));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('focus-topic-topic:db')).not.toBeNull();
+    });
+    expect(screen.queryByTestId('focus-topic-topic:hn')).toBeNull();
+    expect(screen.getByText('1 page')).toBeDefined();
+  });
+
   it('can re-anchor from a visible neighbor row', async () => {
     const requestedNodeIds: string[] = [];
     setConnectionsClientTransportForTests(async (msg) => {

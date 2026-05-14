@@ -584,6 +584,26 @@ const addVisitAliasesForNode = (node: ConnectionNode | undefined, out: Set<strin
   }
 };
 
+const addVisitAliasesForAnchorId = (anchorId: string, out: Set<string>): void => {
+  if (anchorId.startsWith('timeline-visit:')) {
+    out.add(anchorId);
+    return;
+  }
+  if (anchorId.startsWith('visit-instance:')) {
+    out.add(anchorId);
+    const canonicalUrl = urlFromNodeId({
+      id: anchorId,
+      kind: 'visit-instance',
+      label: anchorId,
+      originReplicaIds: [],
+      metadata: {},
+    });
+    if (canonicalUrl !== undefined) {
+      out.add(`timeline-visit:${canonicalUrl}`);
+    }
+  }
+};
+
 const addWorkstreamScopedVisitAliases = (
   nodes: readonly ConnectionNode[],
   edges: readonly ConnectionEdge[],
@@ -606,6 +626,30 @@ const addWorkstreamScopedVisitAliases = (
   }
 };
 
+const addAnchorScopedVisitAliases = (
+  nodes: readonly ConnectionNode[],
+  edges: readonly ConnectionEdge[],
+  anchorId: string,
+  out: Set<string>,
+): void => {
+  const nodeById = new Map(nodes.map((node) => [node.id, node] as const));
+  const anchorNode = nodeById.get(anchorId);
+  if (anchorNode === undefined) {
+    addVisitAliasesForAnchorId(anchorId, out);
+  } else {
+    addVisitAliasesForNode(anchorNode, out);
+  }
+
+  for (const edge of edges) {
+    if (edge.kind !== 'timeline_same_url_as_thread') continue;
+    if (edge.fromNodeId === anchorId) {
+      addVisitAliasesForNode(nodeById.get(edge.toNodeId), out);
+    } else if (edge.toNodeId === anchorId) {
+      addVisitAliasesForNode(nodeById.get(edge.fromNodeId), out);
+    }
+  }
+};
+
 const deriveShadowFocusScope = (
   anchorId: string,
   activeScopeNodes: readonly ConnectionNode[],
@@ -620,15 +664,7 @@ const deriveShadowFocusScope = (
     addWorkstreamScopedVisitAliases(activeScopeNodes, activeScopeEdges, anchorId, scopedVisitIds);
     addWorkstreamScopedVisitAliases(shadowNodes, shadowEdges, anchorId, scopedVisitIds);
   } else {
-    for (const node of activeScopeNodes) {
-      addVisitAliasesForNode(node, scopedVisitIds);
-    }
-  }
-
-  if (scopedVisitIds.size === 0) {
-    for (const node of activeScopeNodes) {
-      addVisitAliasesForNode(node, scopedVisitIds);
-    }
+    addAnchorScopedVisitAliases(activeScopeNodes, activeScopeEdges, anchorId, scopedVisitIds);
   }
 
   const visitTopicEdges = shadowEdges.filter(
