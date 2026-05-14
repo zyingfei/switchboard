@@ -552,6 +552,124 @@ const emptyFocusData = (): FocusData => ({
   previousTopicCount: undefined,
 });
 
+const WORKSTREAM_FOCUS_EDGE_KINDS = new Set<string>([
+  'thread_in_workstream',
+  'visit_in_workstream',
+  'visit_instance_in_workstream',
+]);
+
+const workstreamIdsMatch = (candidate: string | undefined, workstreamAnchorId: string): boolean => {
+  if (candidate === undefined) return false;
+  const normalized = normalizeWorkstreamAnchorId(candidate);
+  return normalized === workstreamAnchorId;
+};
+
+const addVisitAliasesForNode = (node: ConnectionNode | undefined, out: Set<string>): void => {
+  if (node === undefined) return;
+  if (
+    node.kind === 'timeline-visit' ||
+    node.kind === 'visit-instance' ||
+    node.kind === 'thread'
+  ) {
+    out.add(node.id);
+  }
+  const timelineVisitId = metadataString(node.metadata, ['timelineVisitId']);
+  if (timelineVisitId !== undefined) {
+    out.add(timelineVisitId);
+  }
+  const canonicalUrl =
+    metadataString(node.metadata, ['canonicalUrl', 'url', 'latestUrl']) ?? urlFromNodeId(node);
+  if (canonicalUrl !== undefined) {
+    out.add(`timeline-visit:${canonicalUrl}`);
+  }
+};
+
+const addWorkstreamScopedVisitAliases = (
+  nodes: readonly ConnectionNode[],
+  edges: readonly ConnectionEdge[],
+  workstreamAnchorId: string,
+  out: Set<string>,
+): void => {
+  const nodeById = new Map(nodes.map((node) => [node.id, node] as const));
+  for (const node of nodes) {
+    if (workstreamIdsMatch(metadataString(node.metadata, ['workstreamId']), workstreamAnchorId)) {
+      addVisitAliasesForNode(node, out);
+    }
+  }
+  for (const edge of edges) {
+    if (!WORKSTREAM_FOCUS_EDGE_KINDS.has(edge.kind)) continue;
+    if (edge.toNodeId === workstreamAnchorId) {
+      addVisitAliasesForNode(nodeById.get(edge.fromNodeId), out);
+    } else if (edge.fromNodeId === workstreamAnchorId) {
+      addVisitAliasesForNode(nodeById.get(edge.toNodeId), out);
+    }
+  }
+};
+
+const deriveShadowFocusScope = (
+  anchorId: string,
+  activeScopeNodes: readonly ConnectionNode[],
+  activeScopeEdges: readonly ConnectionEdge[],
+  shadowNodes: readonly ConnectionNode[],
+  shadowEdges: readonly ConnectionEdge[],
+): { readonly nodes: readonly ConnectionNode[]; readonly edges: readonly ConnectionEdge[] } => {
+  if (shadowNodes.length === 0) return { nodes: [], edges: [] };
+
+  const scopedVisitIds = new Set<string>();
+  if (anchorId.startsWith('workstream:')) {
+    addWorkstreamScopedVisitAliases(activeScopeNodes, activeScopeEdges, anchorId, scopedVisitIds);
+    addWorkstreamScopedVisitAliases(shadowNodes, shadowEdges, anchorId, scopedVisitIds);
+  } else {
+    for (const node of activeScopeNodes) {
+      addVisitAliasesForNode(node, scopedVisitIds);
+    }
+  }
+
+  if (scopedVisitIds.size === 0) {
+    for (const node of activeScopeNodes) {
+      addVisitAliasesForNode(node, scopedVisitIds);
+    }
+  }
+
+  const visitTopicEdges = shadowEdges.filter(
+    (edge) => edge.kind === 'visit_in_topic' && scopedVisitIds.has(edge.fromNodeId),
+  );
+  const scopedTopicMemberCounts = new Map<string, number>();
+  const scopedNodeIds = new Set<string>();
+  for (const edge of visitTopicEdges) {
+    scopedNodeIds.add(edge.fromNodeId);
+    scopedNodeIds.add(edge.toNodeId);
+    scopedTopicMemberCounts.set(
+      edge.toNodeId,
+      (scopedTopicMemberCounts.get(edge.toNodeId) ?? 0) + 1,
+    );
+  }
+
+  const fallbackNodeById = new Map(activeScopeNodes.map((node) => [node.id, node] as const));
+  const nodes = shadowNodes
+    .filter((node) => scopedNodeIds.has(node.id))
+    .map((node) => {
+      if (node.kind !== 'topic') return node;
+      const scopedMemberCount = scopedTopicMemberCounts.get(node.id) ?? 0;
+      return {
+        ...node,
+        metadata: {
+          ...node.metadata,
+          memberCount: scopedMemberCount,
+        },
+      };
+    });
+  const includedNodeIds = new Set(nodes.map((node) => node.id));
+  const fallbackNodes: ConnectionNode[] = [];
+  for (const nodeId of scopedNodeIds) {
+    if (includedNodeIds.has(nodeId)) continue;
+    const fallback = fallbackNodeById.get(nodeId);
+    if (fallback !== undefined) fallbackNodes.push(fallback);
+  }
+
+  return { nodes: [...nodes, ...fallbackNodes], edges: visitTopicEdges };
+};
+
 const eligibleVisitCountForFocusData = (focusData: FocusData): number =>
   focusData.topics.reduce((sum, topic) => sum + topic.memberCount, 0);
 
@@ -1145,17 +1263,26 @@ export const ConnectionsView = ({
     [ctx, fullSnapshot.edges, fullSnapshot.nodes, result],
   );
   const shadowFocusData = useMemo(
-    () =>
-      shadowFullSnapshot.nodes.length === 0
-        ? emptyFocusData()
-        : deriveFocusData(
-            shadowFullSnapshot.nodes,
-            shadowFullSnapshot.edges,
-            shadowFullSnapshot.nodes,
-            shadowFullSnapshot.edges,
-            shadowCtx,
-          ),
-    [shadowCtx, shadowFullSnapshot.edges, shadowFullSnapshot.nodes],
+    () => {
+      if (result === null || shadowFullSnapshot.nodes.length === 0) {
+        return emptyFocusData();
+      }
+      const shadowScope = deriveShadowFocusScope(
+        anchor,
+        result.snapshot.nodes,
+        result.snapshot.edges,
+        shadowFullSnapshot.nodes,
+        shadowFullSnapshot.edges,
+      );
+      return deriveFocusData(
+        shadowScope.nodes,
+        shadowScope.edges,
+        shadowScope.nodes,
+        shadowScope.edges,
+        shadowCtx,
+      );
+    },
+    [anchor, result, shadowCtx, shadowFullSnapshot.edges, shadowFullSnapshot.nodes],
   );
   const focusEligibleVisitCount = eligibleVisitCountForFocusData(focusData);
   const shadowEligibleVisitCount = eligibleVisitCountForFocusData(shadowFocusData);
