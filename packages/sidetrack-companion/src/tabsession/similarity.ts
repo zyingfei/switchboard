@@ -70,13 +70,21 @@ export const buildSimilarityEvidence = ({
   closestVisitRanker,
   k = 10,
 }: BuildSimilarityEvidenceInput): readonly SimilarityEvidence[] => {
+  const canonicalTargetVisitNodeIds = new Set(
+    [...targetVisitNodeIds].map((targetVisitNodeId) =>
+      canonicalVisitForNode(snapshot, targetVisitNodeId),
+    ),
+  );
   const visitWorkstream = new Map<string, string>();
   for (const edge of snapshot.edges) {
     if (edge.kind !== 'visit_in_workstream' && edge.kind !== 'visit_instance_in_workstream') {
       continue;
     }
     if (
-      !(edge.fromNodeId.startsWith(VISIT_PREFIX) || edge.fromNodeId.startsWith(VISIT_INSTANCE_PREFIX)) ||
+      !(
+        edge.fromNodeId.startsWith(VISIT_PREFIX) ||
+        edge.fromNodeId.startsWith(VISIT_INSTANCE_PREFIX)
+      ) ||
       !edge.toNodeId.startsWith(WORKSTREAM_PREFIX)
     ) {
       continue;
@@ -97,8 +105,8 @@ export const buildSimilarityEvidence = ({
   };
 
   const context = { merged: [...events], existingEdges: [...snapshot.edges] };
-  for (const targetVisitNodeId of [...targetVisitNodeIds].sort()) {
-    const targetVisitKey = visitKeyFromNodeOrRaw(canonicalVisitForNode(snapshot, targetVisitNodeId));
+  for (const targetVisitNodeId of [...canonicalTargetVisitNodeIds].sort()) {
+    const targetVisitKey = visitKeyFromNodeOrRaw(targetVisitNodeId);
     const scored = generateCandidates(targetVisitKey, context)
       .map((candidate) => {
         const score =
@@ -139,15 +147,17 @@ export const buildSimilarityEvidence = ({
     const score = scoreForEdge(edge.kind);
     if (score === 0) continue;
     const other =
-      targetVisitNodeIds.has(edge.fromNodeId) && edge.toNodeId.startsWith(VISIT_PREFIX)
+      canonicalTargetVisitNodeIds.has(edge.fromNodeId) && edge.toNodeId.startsWith(VISIT_PREFIX)
         ? edge.toNodeId
-      : targetVisitNodeIds.has(edge.toNodeId) && edge.fromNodeId.startsWith(VISIT_PREFIX)
-        ? edge.fromNodeId
-        : targetVisitNodeIds.has(edge.fromNodeId) && edge.toNodeId.startsWith(VISIT_INSTANCE_PREFIX)
-          ? canonicalVisitForNode(snapshot, edge.toNodeId)
-        : targetVisitNodeIds.has(edge.toNodeId) && edge.fromNodeId.startsWith(VISIT_INSTANCE_PREFIX)
-          ? canonicalVisitForNode(snapshot, edge.fromNodeId)
-          : null;
+        : canonicalTargetVisitNodeIds.has(edge.toNodeId) && edge.fromNodeId.startsWith(VISIT_PREFIX)
+          ? edge.fromNodeId
+          : canonicalTargetVisitNodeIds.has(edge.fromNodeId) &&
+              edge.toNodeId.startsWith(VISIT_INSTANCE_PREFIX)
+            ? canonicalVisitForNode(snapshot, edge.toNodeId)
+            : canonicalTargetVisitNodeIds.has(edge.toNodeId) &&
+                edge.fromNodeId.startsWith(VISIT_INSTANCE_PREFIX)
+              ? canonicalVisitForNode(snapshot, edge.fromNodeId)
+              : null;
     if (other === null) continue;
     addScore(visitWorkstream.get(other), score);
   }

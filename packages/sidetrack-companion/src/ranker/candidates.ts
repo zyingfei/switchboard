@@ -368,10 +368,17 @@ const workstreamGroupsFromEdges = (edges: readonly ConnectionEdge[]): ReadonlyMa
 
 const sameWorkstreamGenerator: SourceGenerator = (fromVisitId, context, generatedAt) => {
   const groups = new Map<string, Set<string>>();
-  for (const record of collectVisitRecords(context.merged)) {
-    if (record.workstreamId !== undefined) addToSetMap(groups, record.workstreamId, record.id);
+  const edgeGroups = workstreamGroupsFromEdges(context.existingEdges);
+  const visitsWithEdgeWorkstream = new Set<string>();
+  for (const visitIds of edgeGroups.values()) {
+    for (const visitId of visitIds) visitsWithEdgeWorkstream.add(visitId);
   }
-  for (const [workstreamId, visitIds] of workstreamGroupsFromEdges(context.existingEdges)) {
+  for (const record of collectVisitRecords(context.merged)) {
+    if (record.workstreamId !== undefined && !visitsWithEdgeWorkstream.has(record.id)) {
+      addToSetMap(groups, record.workstreamId, record.id);
+    }
+  }
+  for (const [workstreamId, visitIds] of edgeGroups) {
     for (const visitId of visitIds) addToSetMap(groups, workstreamId, visitId);
   }
 
