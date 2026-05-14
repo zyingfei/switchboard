@@ -6,8 +6,8 @@ import {
   postUserEngagementRelabeled,
   postUserFlowConfirmed,
   postUserFlowRejected,
+  postUserOrganizedItem,
   postUserSnippetPromoted,
-  postUserTopicRenamed,
   type UserFlowRelationKind,
 } from './client';
 import { nodeKindDisplayFor } from './edgeKinds';
@@ -481,6 +481,7 @@ const deriveFocusData = (
   readonly topics: readonly TopicNode[];
   readonly visitsByTopic: Record<string, readonly TopicVisit[]>;
   readonly engagementClassesByVisit: Record<string, EngagementClass>;
+  readonly previousTopicCount: number | undefined;
 } => {
   // Topics come from the scope so we render only the topics
   // reachable from the anchor — pulling every topic across the
@@ -507,7 +508,9 @@ const deriveFocusData = (
   const nodeById = new Map(sourceNodes.map((node) => [node.id, node] as const));
 
   const visitsByTopic: Record<string, TopicVisit[]> = {};
+  const previousTopicIds = new Set<string>();
   for (const edge of sourceEdges) {
+    if (edge.kind === 'topic.lineage') previousTopicIds.add(edge.fromNodeId);
     if (edge.kind !== 'visit_in_topic') continue;
     const visit = nodeById.get(edge.fromNodeId);
     if (visit === undefined) continue;
@@ -531,7 +534,12 @@ const deriveFocusData = (
       engagementClassesByVisit[node.id] = engagementClass;
     }
   }
-  return { topics, visitsByTopic, engagementClassesByVisit };
+  return {
+    topics,
+    visitsByTopic,
+    engagementClassesByVisit,
+    previousTopicCount: previousTopicIds.size === 0 ? undefined : previousTopicIds.size,
+  };
 };
 
 const reasonsForVisit = (
@@ -680,11 +688,9 @@ export const ConnectionsView = ({
   // an empty list so the panel doesn't spam the embedder.
   const [searchQuery, setSearchQuery] = useState<string>('');
   const recallResults = useRecallSearch(searchQuery);
-  // Local in-memory mutation of the cached snapshot (topic rename,
-  // engagement relabel) — the snapshot is owned by the cache, so we
-  // keep a transient override map until the next fetch refreshes the
-  // canonical labels.
-  const [labelOverrides, setLabelOverrides] = useState<Record<string, string>>({});
+  // Local in-memory mutation of the cached snapshot for engagement
+  // relabel. Computed topic labels are suggestions, so this view no
+  // longer carries an optimistic rename path for topic nodes.
   const [engagementOverrides, setEngagementOverrides] = useState<Record<string, EngagementClass>>(
     {},
   );
@@ -694,34 +700,24 @@ export const ConnectionsView = ({
   // overrides or the time filter at all.
   const result = useMemo(() => {
     if (rawSnapshot === null) return null;
-    // Step 1 — apply label / engagement overrides (topic rename,
-    // engagement relabel) so optimistic UI lands before the next
-    // companion fetch revalidates.
+    // Step 1 — apply engagement overrides so optimistic UI lands
+    // before the next companion fetch revalidates.
     let nodes = rawSnapshot.snapshot.nodes;
-    if (
-      Object.keys(labelOverrides).length > 0 ||
-      Object.keys(engagementOverrides).length > 0
-    ) {
+    if (Object.keys(engagementOverrides).length > 0) {
       nodes = nodes.map((node) => {
-        const labelOverride = labelOverrides[node.id];
         const engagementOverride = engagementOverrides[node.id];
-        if (labelOverride === undefined && engagementOverride === undefined) return node;
-        const nextMetadata =
-          engagementOverride === undefined
-            ? node.metadata
-            : {
-                ...node.metadata,
-                engagement: {
-                  ...((isRecord(node.metadata['engagement'])
-                    ? node.metadata['engagement']
-                    : {}) as Record<string, unknown>),
-                  class: engagementOverride,
-                },
-              };
+        if (engagementOverride === undefined) return node;
         return {
           ...node,
-          ...(labelOverride === undefined ? {} : { label: labelOverride }),
-          metadata: nextMetadata,
+          metadata: {
+            ...node.metadata,
+            engagement: {
+              ...((isRecord(node.metadata['engagement'])
+                ? node.metadata['engagement']
+                : {}) as Record<string, unknown>),
+              class: engagementOverride,
+            },
+          },
         };
       });
     }
@@ -741,7 +737,7 @@ export const ConnectionsView = ({
         edgeCount: filtered.edges.length,
       },
     };
-  }, [anchor, engagementOverrides, labelOverrides, rawSnapshot, timeRange]);
+  }, [anchor, engagementOverrides, rawSnapshot, timeRange]);
 
   // For the time-range pill bar — how many nodes are hidden by the
   // current filter. Computed cheaply from the difference between
@@ -964,13 +960,10 @@ export const ConnectionsView = ({
     setSelectedEdge(edge);
   };
 
-  // Local overrides for topic-rename + engagement-relabel optimistic
-  // UI. The next snapshot fetch refreshes canonical labels; until
-  // then, the override map applied in `resultWithOverrides` shows
-  // the user their just-renamed value without a round-trip.
-  const replaceNodeLabel = (nodeId: string, label: string): void => {
-    setLabelOverrides((current) => ({ ...current, [nodeId]: label }));
-  };
+  // Local overrides for engagement-relabel optimistic UI. The next
+  // snapshot fetch refreshes canonical labels; until then, the
+  // override map applied in `result` shows the relabeled value
+  // without a round-trip.
   const replaceNodeEngagementClass = (
     nodeId: string,
     engagementClass: EngagementClass,
@@ -1001,18 +994,6 @@ export const ConnectionsView = ({
     }
   };
 
-  const submitTopicRename = async (input: {
-    readonly topicId: string;
-    readonly previousName: string;
-    readonly newName: string;
-  }): Promise<void> => {
-    const response = await postUserTopicRenamed(input);
-    if (!response.ok) {
-      throw new Error(response.error ?? 'topic rename feedback failed');
-    }
-    replaceNodeLabel(input.topicId, input.newName);
-  };
-
   const submitEngagementRelabel = async (input: {
     readonly visitId: string;
     readonly fromClass: EngagementClass;
@@ -1036,6 +1017,23 @@ export const ConnectionsView = ({
     });
     if (!response.ok) {
       throw new Error(response.error ?? 'snippet promotion feedback failed');
+    }
+  };
+
+  const submitTopicPromote = async (input: {
+    readonly topicId: string;
+    readonly targetWorkstreamId: string;
+    readonly memberVisitIds: readonly string[];
+  }): Promise<void> => {
+    const response = await postUserOrganizedItem({
+      itemKind: 'topic',
+      itemId: input.topicId,
+      action: 'promote',
+      toContainer: input.targetWorkstreamId,
+      details: { memberIds: input.memberVisitIds },
+    });
+    if (!response.ok) {
+      throw new Error(response.error ?? 'topic promote feedback failed');
     }
   };
 
@@ -1109,7 +1107,12 @@ export const ConnectionsView = ({
   const focusData = useMemo(
     () =>
       result === null
-        ? { topics: [], visitsByTopic: {}, engagementClassesByVisit: {} }
+        ? {
+            topics: [],
+            visitsByTopic: {},
+            engagementClassesByVisit: {},
+            previousTopicCount: undefined,
+          }
         : deriveFocusData(
             result.snapshot.nodes,
             result.snapshot.edges,
@@ -1522,7 +1525,13 @@ export const ConnectionsView = ({
                 topics={focusData.topics}
                 visitsByTopic={focusData.visitsByTopic}
                 engagementClassesByVisit={focusData.engagementClassesByVisit}
-                onTopicRename={submitTopicRename}
+                eligibleVisitCount={focusData.topics.reduce(
+                  (sum, topic) => sum + topic.memberCount,
+                  0,
+                )}
+                previousTopicCount={focusData.previousTopicCount}
+                workstreamOptions={workstreamOptions}
+                onTopicPromote={submitTopicPromote}
                 onEngagementRelabel={submitEngagementRelabel}
                 onTopicClick={(topicId) => {
                   // Same rationale as useNodeAsAnchor — don't dump

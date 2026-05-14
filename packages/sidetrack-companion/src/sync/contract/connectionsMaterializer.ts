@@ -1,3 +1,6 @@
+import { mkdir, rename, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+
 import {
   ANNOTATION_CREATED,
   ANNOTATION_DELETED,
@@ -27,6 +30,11 @@ import {
   deriveUserAssertedRelations,
   knownCanonicalUrlsFor,
 } from '../../connections/userAssertedRelations.js';
+import {
+  buildTopicShadowCandidate,
+  shouldBuildTopicShadowCandidate,
+  type TopicShadowDiagnostics,
+} from '../../connections/topicShadowCandidate.js';
 import { buildHdbscanTopicRevision } from '../../connections/hdbscanClusterer.js';
 import {
   buildVisitSimilarity,
@@ -56,6 +64,7 @@ import {
 } from '../../producers/closest-visit-revision.js';
 import {
   TOPIC_HDBSCAN_REVISION_KEY,
+  TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
   TOPIC_UNION_FIND_REVISION_KEY,
   createTopicRevisionId,
   createTopicRevisionStore,
@@ -273,7 +282,26 @@ const topicRevisionBuilderFor = (algorithm: TopicAlgorithmVersion): TopicRevisio
       return buildTopicRevision;
     case TOPIC_HDBSCAN_REVISION_KEY:
       return buildHdbscanTopicRevision;
+    case TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY:
+      return buildTopicRevision;
   }
+};
+
+const writeShadowTopicRevision = async (
+  vaultRoot: string,
+  revision: TopicRevision,
+): Promise<void> => {
+  const root = join(vaultRoot, '_BAC', 'connections', 'topics');
+  await mkdir(root, { recursive: true });
+  const body = `${JSON.stringify(revision, null, 2)}\n`;
+  const revisionPath = join(root, `${revision.revisionId}.json`);
+  const shadowPath = join(root, 'current.shadow.json');
+  const tmpRevisionPath = `${revisionPath}.${String(process.pid)}.${String(Date.now())}.tmp`;
+  const tmpShadowPath = `${shadowPath}.${String(process.pid)}.${String(Date.now())}.tmp`;
+  await writeFile(tmpRevisionPath, body, 'utf8');
+  await rename(tmpRevisionPath, revisionPath);
+  await writeFile(tmpShadowPath, body, 'utf8');
+  await rename(tmpShadowPath, shadowPath);
 };
 
 export interface ConnectionsMaterializer extends Materializer {
@@ -876,6 +904,22 @@ export const createConnectionsMaterializer = (
       await topicRevisionStore.putActiveRevision(topicRevision);
       mark('putActiveTopicRevision');
     }
+    let topicShadowDiagnostics: TopicShadowDiagnostics | null = null;
+    if (shouldBuildTopicShadowCandidate()) {
+      const shadow = await buildTopicShadowCandidate({
+        visits: topicVisits,
+        visitSimilarity,
+        userAssertedRelations,
+        baselineRevision: topicRevision,
+        ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
+        cosineThreshold: DEFAULT_TOPIC_COSINE_THRESHOLD,
+      });
+      await writeShadowTopicRevision(deps.vaultRoot, shadow.revision);
+      topicShadowDiagnostics = shadow.diagnostics;
+      mark(
+        `topicShadowCandidate ${shadow.diagnostics.candidate} topics=${String(shadow.diagnostics.shadowTopicCount)} max=${String(shadow.diagnostics.shadowMaxTopicSize)} edges=${String(shadow.diagnostics.edgeCountAfterPruning)}`,
+      );
+    }
     await yieldToEventLoop();
     const input: ConnectionsInput = {
       events: merged,
@@ -944,6 +988,7 @@ export const createConnectionsMaterializer = (
       events: merged,
       urlProjection,
       snapshot: finalSnapshot,
+      ...(topicShadowDiagnostics === null ? {} : { topicShadowDiagnostics }),
     });
     try {
       await diagnosticsStore.write(diagnostics);

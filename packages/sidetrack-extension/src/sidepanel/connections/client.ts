@@ -65,6 +65,7 @@ export interface UserOrganizedItemPayload {
     readonly rename?: string;
     readonly mergeMembers?: readonly string[];
     readonly splitInto?: readonly string[];
+    readonly memberIds?: readonly string[];
   };
 }
 

@@ -198,13 +198,12 @@ describe('augmentFeedbackWithVisitPairLabels', () => {
     const feedback = {
       schemaVersion: 1 as const,
       perItem: {},
+      containerByItem: {},
+      organizedItemsByContainer: {},
       positiveLabels: [{ fromId: 'x', toId: 'y', weight: 1 }],
       negativeLabels: [],
     };
-    const result = augmentFeedbackWithVisitPairLabels(
-      feedback,
-      snapshot([], []),
-    );
+    const result = augmentFeedbackWithVisitPairLabels(feedback, snapshot([], []));
     expect(result).toBe(feedback);
   });
 
@@ -219,6 +218,8 @@ describe('augmentFeedbackWithVisitPairLabels', () => {
     const feedback = {
       schemaVersion: 1 as const,
       perItem: {},
+      containerByItem: {},
+      organizedItemsByContainer: {},
       positiveLabels: [{ fromId: 'pre-existing-from', toId: 'pre-existing-to', weight: 1 }],
       negativeLabels: [],
     };

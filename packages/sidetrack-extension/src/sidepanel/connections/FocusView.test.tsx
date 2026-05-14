@@ -19,6 +19,7 @@ describe('FocusView', () => {
     );
 
     expect(screen.getAllByTestId(/^focus-topic-/u)).toHaveLength(2);
+    expect(screen.getAllByText('Suggestion')).toHaveLength(2);
   });
 
   it('shows engagement class dots for visits', () => {
@@ -72,7 +73,7 @@ describe('FocusView', () => {
       />,
     );
 
-    expect(screen.getByText('Workstream')).toBeDefined();
+    expect(screen.getByText('Workstream signal')).toBeDefined();
     fireEvent.click(screen.getByText('Alpha'));
     fireEvent.click(screen.getByTestId('focus-expand-topic:a'));
     fireEvent.click(screen.getByTestId('focus-visit-visit:a'));
@@ -80,32 +81,63 @@ describe('FocusView', () => {
     expect(onVisitClick).toHaveBeenCalledWith('visit:a');
   });
 
-  it('fires inline topic rename feedback', async () => {
-    const onTopicRename = vi.fn(() => Promise.resolve());
+  it('hides collapsed computed groups behind a triage guard', () => {
+    const onTopicClick = vi.fn();
     render(
       <FocusView
-        topics={[{ id: 'topic:a', label: 'Alpha', memberCount: 1, cohesion: 0.91 }]}
+        topics={[{ id: 'topic:giant', label: 'Hacker News', memberCount: 272, cohesion: 0.62 }]}
         visitsByTopic={{}}
         engagementClassesByVisit={{}}
-        onTopicRename={onTopicRename}
+        onTopicClick={onTopicClick}
+        onVisitClick={() => undefined}
+      />,
+    );
+
+    expect(screen.getByTestId('focus-collapse-guard')).toBeDefined();
+    expect(screen.getByText('Needs triage')).toBeDefined();
+    expect(screen.queryByTestId('focus-topic-topic:giant')).toBeNull();
+
+    fireEvent.click(screen.getByTestId('focus-triage-inspect-topic:giant'));
+    expect(onTopicClick).toHaveBeenCalledWith('topic:giant');
+  });
+
+  it('hides two-topic sudden collapse when previous topic count was high', () => {
+    render(
+      <FocusView
+        topics={[
+          { id: 'topic:a', label: 'Alpha', memberCount: 10, cohesion: 0.8 },
+          { id: 'topic:b', label: 'Beta', memberCount: 9, cohesion: 0.8 },
+        ]}
+        previousTopicCount={6}
+        visitsByTopic={{}}
+        engagementClassesByVisit={{}}
         onTopicClick={() => undefined}
         onVisitClick={() => undefined}
       />,
     );
 
-    fireEvent.click(screen.getByTestId('focus-topic-rename-topic:a'));
-    fireEvent.change(screen.getByTestId('focus-topic-rename-input-topic:a'), {
-      target: { value: 'Renamed alpha' },
-    });
-    fireEvent.click(screen.getByTestId('focus-topic-rename-save-topic:a'));
+    expect(screen.getByTestId('focus-collapse-guard')).toBeDefined();
+    expect(screen.queryByTestId('focus-topic-topic:a')).toBeNull();
+  });
 
-    await waitFor(() => {
-      expect(onTopicRename).toHaveBeenCalledWith({
-        topicId: 'topic:a',
-        previousName: 'Alpha',
-        newName: 'Renamed alpha',
-      });
-    });
+  it('marks oversized suggestions for triage without enabling computed-topic rename', () => {
+    render(
+      <FocusView
+        topics={[
+          { id: 'topic:large', label: 'Large computed group', memberCount: 41, cohesion: 0.71 },
+          { id: 'topic:small', label: 'Small computed group', memberCount: 2, cohesion: 0.89 },
+        ]}
+        eligibleVisitCount={100}
+        visitsByTopic={{}}
+        engagementClassesByVisit={{}}
+        onTopicClick={() => undefined}
+        onVisitClick={() => undefined}
+      />,
+    );
+
+    expect(screen.getByTestId('focus-topic-topic:large')).toBeDefined();
+    expect(screen.getByText('Needs triage')).toBeDefined();
+    expect(screen.queryByText('Rename')).toBeNull();
   });
 
   it('fires per-visit engagement relabel feedback', async () => {
@@ -133,6 +165,39 @@ describe('FocusView', () => {
         visitId: 'visit:a',
         fromClass: 'skimmed',
         toClass: 'worked_on_reference',
+      });
+    });
+  });
+
+  it('promotes a computed suggestion to a workstream with frozen members', async () => {
+    const onTopicPromote = vi.fn(() => Promise.resolve());
+    render(
+      <FocusView
+        topics={[{ id: 'topic:a', label: 'Alpha', memberCount: 2, cohesion: 0.91 }]}
+        visitsByTopic={{
+          'topic:a': [
+            { id: 'timeline-visit:https://example.test/a', label: 'A', focusedWindowMs: 10_000 },
+            { id: 'timeline-visit:https://example.test/b', label: 'B', focusedWindowMs: 5_000 },
+          ],
+        }}
+        engagementClassesByVisit={{}}
+        workstreamOptions={[{ id: 'workstream:research', label: 'Research' }]}
+        onTopicPromote={onTopicPromote}
+        onTopicClick={() => undefined}
+        onVisitClick={() => undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('focus-promote-topic:a'));
+
+    await waitFor(() => {
+      expect(onTopicPromote).toHaveBeenCalledWith({
+        topicId: 'topic:a',
+        targetWorkstreamId: 'workstream:research',
+        memberVisitIds: [
+          'timeline-visit:https://example.test/a',
+          'timeline-visit:https://example.test/b',
+        ],
       });
     });
   });

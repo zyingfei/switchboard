@@ -137,6 +137,50 @@ describe('feedback event payload guards', () => {
       }),
     ).toBe(false);
   });
+
+  it('accepts immutable member snapshots for promoted computed topics', () => {
+    expect(
+      isUserOrganizedItemPayload({
+        payloadVersion: 1,
+        itemKind: 'topic',
+        itemId: 'topic:computed-rust',
+        action: 'promote',
+        toContainer: 'workstream:rust',
+        details: { memberIds: ['timeline-visit:rust-a', 'timeline-visit:rust-b'] },
+      }),
+    ).toBe(true);
+    expect(
+      isUserOrganizedItemPayload({
+        payloadVersion: 1,
+        itemKind: 'topic',
+        itemId: 'topic:computed-rust',
+        action: 'promote',
+        toContainer: 'workstream:rust',
+        details: { memberIds: ['timeline-visit:rust-a', 42] },
+      }),
+    ).toBe(false);
+  });
+
+  it('rejects renaming computed topics through the organized-item path', () => {
+    expect(
+      isUserOrganizedItemPayload({
+        payloadVersion: 1,
+        itemKind: 'topic',
+        itemId: 'topic:computed-rust',
+        action: 'rename',
+        details: { rename: 'Rust' },
+      }),
+    ).toBe(false);
+    expect(
+      isUserOrganizedItemPayload({
+        payloadVersion: 1,
+        itemKind: 'workstream',
+        itemId: 'workstream:rust',
+        action: 'rename',
+        details: { rename: 'Rust' },
+      }),
+    ).toBe(true);
+  });
 });
 
 describe('feedback event registry entries', () => {

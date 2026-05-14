@@ -8656,12 +8656,25 @@ pre.diff {
   gap: 12px;
   padding: 16px;
 }
+.cx-focus-triage-mode {
+  grid-template-columns: minmax(0, 1fr);
+}
 .cx-focus-card {
   border: 1px solid var(--rule);
   border-radius: var(--rad-s);
   background: var(--paper-light);
   padding: 12px;
   min-width: 0;
+}
+.cx-focus-card.is-triage {
+  border-style: dashed;
+}
+.cx-focus-card-head,
+.cx-focus-triage-head,
+.cx-focus-promote {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 .cx-focus-title {
   display: block;
@@ -8692,6 +8705,44 @@ pre.diff {
   background: var(--green-bg);
   border-radius: 3px;
   padding: 0 5px;
+}
+.cx-focus-chip-suggestion {
+  color: var(--ink-2);
+  border-color: var(--rule);
+  background: var(--paper);
+}
+.cx-focus-chip-warning {
+  color: #8a5a00;
+  border-color: rgba(138, 90, 0, 0.24);
+  background: rgba(138, 90, 0, 0.08);
+}
+.cx-focus-chip-workstream {
+  color: var(--green);
+  border-color: var(--green-tint);
+  background: var(--green-bg);
+}
+.cx-focus-promote {
+  margin: 10px 0;
+}
+.cx-focus-triage {
+  border: 1px dashed var(--rule);
+  border-radius: var(--rad-s);
+  background: var(--paper-light);
+  padding: 14px;
+  max-width: 560px;
+}
+.cx-focus-triage-title {
+  margin-top: 8px;
+  color: var(--ink);
+  font-family: var(--display);
+  font-size: 15px;
+  font-weight: 500;
+}
+.cx-focus-triage p {
+  margin: 8px 0 12px;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  line-height: 1.5;
 }
 .cx-focus-bar {
   height: 5px;

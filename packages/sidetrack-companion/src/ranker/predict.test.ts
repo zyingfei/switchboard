@@ -84,6 +84,8 @@ const syntheticTrainingSet = (): {
     feedback: {
       schemaVersion: 1,
       perItem: {},
+      containerByItem: {},
+      organizedItemsByContainer: {},
       positiveLabels,
       negativeLabels,
     },

@@ -50,6 +50,11 @@ export interface UserOrganizedItemDetails {
   readonly rename?: string;
   readonly mergeMembers?: readonly string[];
   readonly splitInto?: readonly string[];
+  // Optional immutable membership snapshot for promote/move actions.
+  // For computed topic promotion this freezes the concrete member ids
+  // that the user accepted, so later reclustering can only propose
+  // additions instead of silently changing the promoted workstream.
+  readonly memberIds?: readonly string[];
   readonly attributionSource?: 'manual' | 'tab-group-pull-in' | 'tab-group-pull-out';
 }
 
@@ -208,6 +213,7 @@ const isUserOrganizedItemDetails = (value: unknown): value is UserOrganizedItemD
     isOptionalString(value['rename']) &&
     isOptionalStringArray(value['mergeMembers']) &&
     isOptionalStringArray(value['splitInto']) &&
+    isOptionalStringArray(value['memberIds']) &&
     isOptionalAttributionSource(value['attributionSource'])
   );
 };
@@ -217,15 +223,19 @@ const isOptionalUserOrganizedItemDetails = (
 ): value is UserOrganizedItemDetails | undefined =>
   value === undefined || isUserOrganizedItemDetails(value);
 
-export const isUserOrganizedItemPayload = (value: unknown): value is UserOrganizedItemPayload =>
-  isRecord(value) &&
-  hasPayloadVersionAndNoDimensions(value) &&
-  isOrganizedItemKind(value['itemKind']) &&
-  isNonEmptyString(value['itemId']) &&
-  isOrganizedItemAction(value['action']) &&
-  isOptionalString(value['fromContainer']) &&
-  isOptionalStringOrNull(value['toContainer']) &&
-  isOptionalUserOrganizedItemDetails(value['details']);
+export const isUserOrganizedItemPayload = (value: unknown): value is UserOrganizedItemPayload => {
+  if (!isRecord(value) || !hasPayloadVersionAndNoDimensions(value)) return false;
+  const itemKind = value['itemKind'];
+  const action = value['action'];
+  if (!isOrganizedItemKind(itemKind) || !isOrganizedItemAction(action)) return false;
+  if (itemKind === 'topic' && action === 'rename') return false;
+  return (
+    isNonEmptyString(value['itemId']) &&
+    isOptionalString(value['fromContainer']) &&
+    isOptionalStringOrNull(value['toContainer']) &&
+    isOptionalUserOrganizedItemDetails(value['details'])
+  );
+};
 
 export const isUserEngagementRelabeledPayload = (
   value: unknown,

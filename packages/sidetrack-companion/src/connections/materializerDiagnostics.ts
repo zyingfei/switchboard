@@ -24,6 +24,7 @@ import type { TopicRevision } from '../producers/topic-revision.js';
 import type { RankerRetrainResult } from '../ranker/retrain.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import type { ConnectionsSnapshot, VisitSimilarityRevision } from './types.js';
+import type { TopicShadowDiagnostics } from './topicShadowCandidate.js';
 import type { EffectiveVisitSimilarityConfig } from './visitSimilarity.js';
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import type { UrlProjection } from '../urls/projection.js';
@@ -145,6 +146,7 @@ export interface MaterializerDiagnostics {
   readonly engagement: MaterializerEngagementCounters;
   readonly urls: MaterializerUrlCounters;
   readonly snapshot: MaterializerSnapshotCounters;
+  readonly shadowVsBaseline?: TopicShadowDiagnostics;
 }
 
 export interface MaterializerDiagnosticsInput {
@@ -165,6 +167,7 @@ export interface MaterializerDiagnosticsInput {
   readonly events: readonly AcceptedEvent[];
   readonly urlProjection: UrlProjection;
   readonly snapshot: ConnectionsSnapshot;
+  readonly topicShadowDiagnostics?: TopicShadowDiagnostics;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -434,6 +437,9 @@ export const collectMaterializerDiagnostics = (
     engagement: eventCounters.engagement,
     urls: collectUrlCounters(input.urlProjection),
     snapshot: collectSnapshotCounters(input.snapshot),
+    ...(input.topicShadowDiagnostics === undefined
+      ? {}
+      : { shadowVsBaseline: input.topicShadowDiagnostics }),
   };
 };
 
@@ -458,6 +464,14 @@ export const summarizeMaterializerDiagnostics = (
     `urlsAttributed=${String(diagnostics.urls.attributedCanonicalUrlCount)}/${String(diagnostics.urls.canonicalUrlCount)}`,
     `visitInstancesAttributed=${String(diagnostics.snapshot.attributedVisitInstanceCount)}/${String(diagnostics.snapshot.visitInstanceCount)}`,
   ];
+  if (diagnostics.shadowVsBaseline !== undefined) {
+    parts.push(
+      `shadow=${diagnostics.shadowVsBaseline.candidate}`,
+      `shadowTopics=${String(diagnostics.shadowVsBaseline.shadowTopicCount)}`,
+      `shadowMax=${String(diagnostics.shadowVsBaseline.shadowMaxTopicSize)}`,
+      `shadowNoise=${String(diagnostics.shadowVsBaseline.noiseShare)}`,
+    );
+  }
   return `[materializer-diag] ${parts.join(' ')}`;
 };
 
