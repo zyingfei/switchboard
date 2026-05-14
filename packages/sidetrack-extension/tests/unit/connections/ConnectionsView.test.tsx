@@ -214,7 +214,10 @@ describe('ConnectionsView — engineering scaffold', () => {
             kind: 'timeline-visit',
             label: 'AI race',
             originReplicaIds: ['replica-A'],
-            metadata: { canonicalUrl: 'https://ai.example/race', focusedWindowMs: 7_000 },
+            metadata: {
+              canonicalUrl: 'https://ai.example/race',
+              engagement: { focusedWindowMs: 7_000 },
+            },
           },
           {
             id: 'topic:db',
@@ -318,6 +321,7 @@ describe('ConnectionsView — engineering scaffold', () => {
       screen.getByTestId('focus-visit-timeline-visit:https://db.example/oracle'),
     ).toBeDefined();
     expect(screen.getByTestId('focus-visit-timeline-visit:https://ai.example/race')).toBeDefined();
+    expect(screen.getByText('7000 ms')).toBeDefined();
     expect(
       screen.queryByTestId('focus-visit-timeline-visit:https://news.example/story'),
     ).toBeNull();
@@ -499,7 +503,10 @@ describe('ConnectionsView — engineering scaffold', () => {
             kind: 'timeline-visit',
             label: 'microsoft/tokenweave',
             originReplicaIds: ['replica-A'],
-            metadata: { canonicalUrl: 'https://github.com/microsoft/tokenweave' },
+            metadata: {
+              canonicalUrl: 'https://github.com/microsoft/tokenweave',
+              engagement: { focusedWindowMs: 1_900 },
+            },
           },
           {
             id: 'topic:collapsed',
@@ -599,6 +606,9 @@ describe('ConnectionsView — engineering scaffold', () => {
     });
     expect(screen.queryByText('ChatGPT')).toBeNull();
     expect(screen.queryByTestId('focus-topic-topic:db')).toBeNull();
+    expect(
+      screen.getByText('Latest captured focus for this page is 1900 ms, below the 5000 ms topic gate.'),
+    ).toBeDefined();
   });
 
   it('can re-anchor from a visible neighbor row', async () => {

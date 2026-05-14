@@ -51,6 +51,7 @@ export interface FocusViewProps {
   readonly engagementClassesByVisit: Record<string, EngagementClass>;
   readonly eligibleVisitCount?: number;
   readonly previousTopicCount?: number;
+  readonly emptyDetail?: string;
   readonly workstreamOptions?: readonly FocusWorkstreamOption[];
   readonly onTopicClick: (topicId: string) => void;
   readonly onTopicPromote?: (input: {
@@ -109,6 +110,7 @@ export const FocusView = ({
   engagementClassesByVisit,
   eligibleVisitCount,
   previousTopicCount,
+  emptyDetail,
   workstreamOptions = [],
   onTopicClick,
   onTopicPromote,
@@ -223,7 +225,7 @@ export const FocusView = ({
             <span className="cx-mono cx-dim">computed focus</span>
           </div>
           <div className="cx-focus-triage-title">No scoped focus group</div>
-          <p>This page is not in the current candidate topic output.</p>
+          <p>{emptyDetail ?? 'This page is not in the current candidate topic output.'}</p>
         </article>
       </section>
     );

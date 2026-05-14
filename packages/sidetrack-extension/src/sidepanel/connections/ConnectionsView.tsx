@@ -130,6 +130,8 @@ type SubMode = 'linked' | 'orbital' | 'flow' | 'focus' | 'context';
 const normalizeWorkstreamAnchorId = (id: string): string =>
   id.startsWith('workstream:') ? id : `workstream:${id}`;
 
+const DEFAULT_TOPIC_ENGAGEMENT_GATE_MS = 5_000;
+
 const metadataString = (
   metadata: Record<string, unknown>,
   keys: readonly string[],
@@ -192,6 +194,17 @@ const engagementClassForNode = (node: ConnectionNode): EngagementClass | undefin
   }
   const value = (engagement as Record<string, unknown>)['class'];
   return isEngagementClass(value) ? value : undefined;
+};
+
+const focusedWindowMsForNode = (node: ConnectionNode): number => {
+  const engagement = node.metadata['engagement'];
+  if (isRecord(engagement)) {
+    const focusedWindowMs = engagement['focusedWindowMs'];
+    if (typeof focusedWindowMs === 'number' && Number.isFinite(focusedWindowMs)) {
+      return Math.max(0, focusedWindowMs);
+    }
+  }
+  return metadataNumber(node.metadata, 'focusedWindowMs', 0);
 };
 
 // Stage 5 polish — Flow Path now sources its visits from
@@ -265,16 +278,7 @@ const deriveFlowVisits = (
     // Prefer the nested engagement.focusedWindowMs (companion writes it
     // alongside engagement.class); fall back to a flat key for
     // backward compatibility with older snapshots.
-    const engagementMeta = node.metadata['engagement'];
-    const engagementFocusedMs =
-      typeof engagementMeta === 'object' &&
-      engagementMeta !== null &&
-      !Array.isArray(engagementMeta) &&
-      typeof (engagementMeta as Record<string, unknown>)['focusedWindowMs'] === 'number'
-        ? ((engagementMeta as Record<string, unknown>)['focusedWindowMs'] as number)
-        : undefined;
-    const focusedWindowMs =
-      engagementFocusedMs ?? metadataNumber(node.metadata, 'focusedWindowMs', 0);
+    const focusedWindowMs = focusedWindowMsForNode(node);
     const provider = metadataString(node.metadata, ['provider']);
     const visitCount = metadataNumber(node.metadata, 'visitCount', 0);
     const searchQuery = metadataString(node.metadata, ['searchQuery']);
@@ -529,7 +533,7 @@ const deriveFocusData = (
       {
         id: visit.id,
         label: formatEntityDisplay(visit, ctx).primary,
-        focusedWindowMs: metadataNumber(visit.metadata, 'focusedWindowMs', 0),
+        focusedWindowMs: focusedWindowMsForNode(visit),
       },
     ];
   }
@@ -656,6 +660,38 @@ const addAnchorScopedVisitAliases = (
       addVisitAliasesForNode(nodeById.get(edge.fromNodeId), out);
     }
   }
+};
+
+const maxFocusedWindowMsForAnchor = (
+  anchorId: string,
+  nodes: readonly ConnectionNode[],
+  edges: readonly ConnectionEdge[],
+): number | undefined => {
+  const aliases = new Set<string>();
+  addAnchorScopedVisitAliases(nodes, edges, anchorId, aliases);
+  let max: number | undefined;
+  for (const node of nodes) {
+    if (node.kind !== 'timeline-visit' && node.kind !== 'visit-instance') continue;
+    if (!aliases.has(node.id)) continue;
+    const focusedWindowMs = focusedWindowMsForNode(node);
+    max = max === undefined ? focusedWindowMs : Math.max(max, focusedWindowMs);
+  }
+  return max;
+};
+
+const focusEmptyDetailForAnchor = (
+  anchorId: string,
+  nodes: readonly ConnectionNode[],
+  edges: readonly ConnectionEdge[],
+): string => {
+  const focusedWindowMs = maxFocusedWindowMsForAnchor(anchorId, nodes, edges);
+  if (
+    focusedWindowMs !== undefined &&
+    focusedWindowMs < DEFAULT_TOPIC_ENGAGEMENT_GATE_MS
+  ) {
+    return `Latest captured focus for this page is ${String(focusedWindowMs)} ms, below the ${String(DEFAULT_TOPIC_ENGAGEMENT_GATE_MS)} ms topic gate.`;
+  }
+  return 'The candidate marked this page as ungrouped for now.';
 };
 
 const deriveShadowFocusScope = (
@@ -1378,6 +1414,21 @@ export const ConnectionsView = ({
     renderedFocusData === shadowFocusData ? shadowEligibleVisitCount
     : renderedFocusData === scopedEmptyFocusData ? 0
     : focusEligibleVisitCount;
+  const renderedFocusEmptyDetail = useMemo(() => {
+    if (renderedFocusData !== scopedEmptyFocusData || result === null) return undefined;
+    return focusEmptyDetailForAnchor(
+      anchor,
+      [...result.snapshot.nodes, ...shadowFullSnapshot.nodes],
+      [...result.snapshot.edges, ...shadowFullSnapshot.edges],
+    );
+  }, [
+    anchor,
+    renderedFocusData,
+    result,
+    scopedEmptyFocusData,
+    shadowFullSnapshot.edges,
+    shadowFullSnapshot.nodes,
+  ]);
   // Flow Path subgraph — expand the anchor scope with the full
   // snapshot's navigation-edge transitive closure (capped). Keeps
   // the chain compact for hub visits while still surfacing the
@@ -1783,6 +1834,7 @@ export const ConnectionsView = ({
                 engagementClassesByVisit={renderedFocusData.engagementClassesByVisit}
                 eligibleVisitCount={renderedFocusEligibleVisitCount}
                 previousTopicCount={renderedFocusData.previousTopicCount}
+                emptyDetail={renderedFocusEmptyDetail}
                 workstreamOptions={workstreamOptions}
                 onTopicPromote={submitTopicPromote}
                 onEngagementRelabel={submitEngagementRelabel}
