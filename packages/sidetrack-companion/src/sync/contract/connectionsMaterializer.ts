@@ -63,6 +63,7 @@ import {
   readClosestVisitRankerRevision,
 } from '../../producers/closest-visit-revision.js';
 import {
+  DEFAULT_TOPIC_COSINE_THRESHOLD,
   TOPIC_HDBSCAN_REVISION_KEY,
   TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
   TOPIC_UNION_FIND_REVISION_KEY,

@@ -113,6 +113,8 @@ import { rebuildFromEventLog } from '../recall/rebuild.js';
 import type { BucketRegistry } from '../routing/registry.js';
 import { redact } from '../safety/redaction.js';
 import { estimateTokens, tokenBudgetWarningThreshold } from '../safety/tokenBudget.js';
+import { overlayTopicRevisionOnSnapshot } from '../connections/topicSnapshotOverlay.js';
+import { createTopicRevisionStore } from '../producers/topic-revision.js';
 import { buildSignals, type BuildSignalsWorkstream } from '../suggestions/buildSignals.js';
 import { scoreSuggestions } from '../suggestions/score.js';
 import type { EventLog } from '../sync/eventLog.js';
@@ -4905,8 +4907,17 @@ const routes: readonly RouteDefinition[] = [
       const edgeKind = url.searchParams.get('edgeKind') ?? undefined;
       const provider = url.searchParams.get('provider') ?? undefined;
       const originReplicaId = url.searchParams.get('originReplicaId') ?? undefined;
+      const topicVariantRaw = url.searchParams.get('topicVariant') ?? undefined;
+      if (topicVariantRaw !== undefined && topicVariantRaw !== 'shadow') {
+        throw new HttpRouteError(
+          400,
+          'INVALID_REQUEST',
+          'topicVariant must be omitted or "shadow".',
+        );
+      }
+      const topicVariant = topicVariantRaw === 'shadow' ? topicVariantRaw : undefined;
 
-      const snap = await context.connectionsStore.readCurrent();
+      let snap = await context.connectionsStore.readCurrent();
       if (snap === null) {
         // Materializer hasn't run yet — return an empty scoped
         // envelope so callers don't have to special-case 404.
@@ -4916,7 +4927,7 @@ const routes: readonly RouteDefinition[] = [
             data: {
               scope: 'companion-extended',
               snapshot: {
-                scope: {},
+                scope: { ...(topicVariant === undefined ? {} : { topicVariant }) },
                 nodes: [],
                 edges: [],
                 updatedAt: '1970-01-01T00:00:00.000Z',
@@ -4926,6 +4937,33 @@ const routes: readonly RouteDefinition[] = [
             },
           },
         ];
+      }
+      if (topicVariant === 'shadow') {
+        const shadowRevision = await createTopicRevisionStore(
+          requireVaultRoot(context),
+        ).readShadowRevision();
+        if (shadowRevision === null) {
+          return [
+            200,
+            {
+              data: {
+                scope: 'companion-extended',
+                snapshot: {
+                  scope: { topicVariant },
+                  nodes: [],
+                  edges: [],
+                  updatedAt: snap.updatedAt,
+                  nodeCount: 0,
+                  edgeCount: 0,
+                  ...(snap.snapshotRevision === undefined
+                    ? {}
+                    : { snapshotRevision: `${snap.snapshotRevision}:shadow-missing` }),
+                },
+              },
+            },
+          ];
+        }
+        snap = overlayTopicRevisionOnSnapshot(snap, shadowRevision);
       }
       // Coarse filters — honoured by simple matchers. workstreamId
       // narrows to nodes either matching the ws id directly or
@@ -4972,7 +5010,10 @@ const routes: readonly RouteDefinition[] = [
           data: {
             scope: 'companion-extended',
             snapshot: {
-              scope: { ...(workstreamId === undefined ? {} : { workstreamId }) },
+              scope: {
+                ...(workstreamId === undefined ? {} : { workstreamId }),
+                ...(topicVariant === undefined ? {} : { topicVariant }),
+              },
               nodes,
               edges,
               updatedAt: snap.updatedAt,

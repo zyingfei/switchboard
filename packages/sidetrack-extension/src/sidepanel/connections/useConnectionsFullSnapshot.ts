@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 
-import { fetchConnectionsSnapshot } from './client';
+import { fetchConnectionsSnapshot, type ConnectionsTopicVariant } from './client';
 import type { ConnectionEdge, ConnectionNode, ConnectionsSnapshot } from './types';
 
 // Stage 5 polish — Connections backend search. The anchor-scoped
@@ -43,7 +43,12 @@ export interface UseFullSnapshotResult {
 const EMPTY_NODES: readonly ConnectionNode[] = [];
 const EMPTY_EDGES: readonly ConnectionEdge[] = [];
 
-export const useConnectionsFullSnapshot = (): UseFullSnapshotResult => {
+export const useConnectionsFullSnapshot = (
+  input: {
+    readonly topicVariant?: ConnectionsTopicVariant;
+  } = {},
+): UseFullSnapshotResult => {
+  const topicVariant = input.topicVariant;
   const [state, setState] = useState<FullSnapshotState>({
     kind: 'idle',
     nodes: EMPTY_NODES,
@@ -55,7 +60,7 @@ export const useConnectionsFullSnapshot = (): UseFullSnapshotResult => {
     if (inFlight.current || state.kind === 'ready') return;
     inFlight.current = true;
     setState({ kind: 'loading', nodes: state.nodes, edges: state.edges });
-    void fetchConnectionsSnapshot()
+    void fetchConnectionsSnapshot(topicVariant === undefined ? {} : { topicVariant })
       .then((response) => {
         inFlight.current = false;
         if (!response.ok || response.data === undefined) {
@@ -93,7 +98,7 @@ export const useConnectionsFullSnapshot = (): UseFullSnapshotResult => {
     nodes: state.nodes,
     edges: state.edges,
     loading: state.kind === 'loading',
-    error: state.kind === 'error' ? state.error ?? null : null,
+    error: state.kind === 'error' ? (state.error ?? null) : null,
     prime,
   };
 };

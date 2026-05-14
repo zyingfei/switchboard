@@ -10,6 +10,7 @@ import {
   postUserOrganizedItem,
   postUserSnippetPromoted,
   postUserTopicRenamed,
+  fetchConnectionsSnapshot,
   setConnectionsClientTransportForTests,
   topicLabelFromConnections,
   whyRelatedReasonsFromConnections,
@@ -160,6 +161,25 @@ describe('connections client helpers', () => {
         { code: 'OBSERVED_ON_OTHER_REPLICA', replicaId: 'mac' },
       ],
     });
+  });
+
+  it('requests the shadow topic variant through the runtime proxy', async () => {
+    const sent: unknown[] = [];
+    setConnectionsClientTransportForTests((message) => {
+      sent.push(message);
+      return Promise.resolve({ ok: true, data: result });
+    });
+
+    await expect(fetchConnectionsSnapshot({ topicVariant: 'shadow' })).resolves.toEqual({
+      ok: true,
+      data: result,
+    });
+    expect(sent).toEqual([
+      {
+        type: messageTypes.loadConnectionsSnapshot,
+        filters: { topicVariant: 'shadow' },
+      },
+    ]);
   });
 
   it('posts S23 feedback events through the runtime companion proxy', async () => {

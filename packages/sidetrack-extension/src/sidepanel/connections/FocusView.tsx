@@ -77,7 +77,7 @@ const largestTopic = (topics: readonly TopicNode[]): TopicNode | undefined =>
 const summedTopicMembers = (topics: readonly TopicNode[]): number =>
   topics.reduce((sum, topic) => sum + topic.memberCount, 0);
 
-const isCollapsedSuggestionSet = (
+export const isCollapsedSuggestionSet = (
   topics: readonly TopicNode[],
   eligibleVisitCount: number | undefined,
   previousTopicCount: number | undefined,

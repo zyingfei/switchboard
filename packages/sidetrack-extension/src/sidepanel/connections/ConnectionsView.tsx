@@ -23,6 +23,7 @@ import {
 import {
   ENGAGEMENT_CLASSES,
   FocusView,
+  isCollapsedSuggestionSet,
   type EngagementClass,
   type TopicNode,
   type TopicVisit,
@@ -542,6 +543,18 @@ const deriveFocusData = (
   };
 };
 
+type FocusData = ReturnType<typeof deriveFocusData>;
+
+const emptyFocusData = (): FocusData => ({
+  topics: [],
+  visitsByTopic: {},
+  engagementClassesByVisit: {},
+  previousTopicCount: undefined,
+});
+
+const eligibleVisitCountForFocusData = (focusData: FocusData): number =>
+  focusData.topics.reduce((sum, topic) => sum + topic.memberCount, 0);
+
 const reasonsForVisit = (
   nodes: readonly ConnectionNode[],
   edges: readonly ConnectionEdge[],
@@ -683,6 +696,7 @@ export const ConnectionsView = ({
   // node in the vault, not just whatever the anchor's neighborhood
   // happens to have loaded.
   const fullSnapshot = useConnectionsFullSnapshot();
+  const shadowFullSnapshot = useConnectionsFullSnapshot({ topicVariant: 'shadow' });
   // Recall-index full-text search. Debounced; fires on the
   // controlled search-box query. Below 3 chars the hook returns
   // an empty list so the panel doesn't spam the embedder.
@@ -758,6 +772,14 @@ export const ConnectionsView = ({
   const ctx: EntityDisplayCtx = useMemo(
     () => ({ ...baseCtx, nodeById: snapshotNodeById }),
     [baseCtx, snapshotNodeById],
+  );
+  const shadowSnapshotNodeById = useMemo(
+    () => new Map(shadowFullSnapshot.nodes.map((node) => [node.id, node] as const)),
+    [shadowFullSnapshot.nodes],
+  );
+  const shadowCtx: EntityDisplayCtx = useMemo(
+    () => ({ ...baseCtx, nodeById: shadowSnapshotNodeById }),
+    [baseCtx, shadowSnapshotNodeById],
   );
 
   const anchorNode = useMemo<ConnectionNode | null>(() => {
@@ -1091,7 +1113,12 @@ export const ConnectionsView = ({
     // run beyond 1-2 hops, so anchoring on a single visit-instance
     // would otherwise hide its parent page (the "URL_A → URL_B"
     // arrow the user expects).
-    if (subMode === 'focus' || subMode === 'flow') fullSnapshot.prime();
+    if (subMode === 'focus') {
+      fullSnapshot.prime();
+      shadowFullSnapshot.prime();
+    } else if (subMode === 'flow') {
+      fullSnapshot.prime();
+    }
     // Intentionally not depending on fullSnapshot itself — prime()
     // is internally idempotent and the no-op guard handles repeats.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1107,12 +1134,7 @@ export const ConnectionsView = ({
   const focusData = useMemo(
     () =>
       result === null
-        ? {
-            topics: [],
-            visitsByTopic: {},
-            engagementClassesByVisit: {},
-            previousTopicCount: undefined,
-          }
+        ? emptyFocusData()
         : deriveFocusData(
             result.snapshot.nodes,
             result.snapshot.edges,
@@ -1122,6 +1144,37 @@ export const ConnectionsView = ({
           ),
     [ctx, fullSnapshot.edges, fullSnapshot.nodes, result],
   );
+  const shadowFocusData = useMemo(
+    () =>
+      shadowFullSnapshot.nodes.length === 0
+        ? emptyFocusData()
+        : deriveFocusData(
+            shadowFullSnapshot.nodes,
+            shadowFullSnapshot.edges,
+            shadowFullSnapshot.nodes,
+            shadowFullSnapshot.edges,
+            shadowCtx,
+          ),
+    [shadowCtx, shadowFullSnapshot.edges, shadowFullSnapshot.nodes],
+  );
+  const focusEligibleVisitCount = eligibleVisitCountForFocusData(focusData);
+  const shadowEligibleVisitCount = eligibleVisitCountForFocusData(shadowFocusData);
+  const activeFocusCollapsed = isCollapsedSuggestionSet(
+    focusData.topics,
+    focusEligibleVisitCount,
+    focusData.previousTopicCount,
+  );
+  const shadowFocusCollapsed = isCollapsedSuggestionSet(
+    shadowFocusData.topics,
+    shadowEligibleVisitCount,
+    shadowFocusData.previousTopicCount,
+  );
+  const renderedFocusData =
+    activeFocusCollapsed && shadowFocusData.topics.length > 0 && !shadowFocusCollapsed
+      ? shadowFocusData
+      : focusData;
+  const renderedFocusEligibleVisitCount =
+    renderedFocusData === shadowFocusData ? shadowEligibleVisitCount : focusEligibleVisitCount;
   // Flow Path subgraph — expand the anchor scope with the full
   // snapshot's navigation-edge transitive closure (capped). Keeps
   // the chain compact for hub visits while still surfacing the
@@ -1522,14 +1575,11 @@ export const ConnectionsView = ({
               })()
             ) : subMode === 'focus' ? (
               <FocusView
-                topics={focusData.topics}
-                visitsByTopic={focusData.visitsByTopic}
-                engagementClassesByVisit={focusData.engagementClassesByVisit}
-                eligibleVisitCount={focusData.topics.reduce(
-                  (sum, topic) => sum + topic.memberCount,
-                  0,
-                )}
-                previousTopicCount={focusData.previousTopicCount}
+                topics={renderedFocusData.topics}
+                visitsByTopic={renderedFocusData.visitsByTopic}
+                engagementClassesByVisit={renderedFocusData.engagementClassesByVisit}
+                eligibleVisitCount={renderedFocusEligibleVisitCount}
+                previousTopicCount={renderedFocusData.previousTopicCount}
                 workstreamOptions={workstreamOptions}
                 onTopicPromote={submitTopicPromote}
                 onEngagementRelabel={submitEngagementRelabel}

@@ -3663,6 +3663,7 @@ export default defineBackground(() => {
         params.set('workstreamId', filters['workstreamId']);
       if (typeof filters['nodeKind'] === 'string') params.set('nodeKind', filters['nodeKind']);
       if (typeof filters['edgeKind'] === 'string') params.set('edgeKind', filters['edgeKind']);
+      if (filters['topicVariant'] === 'shadow') params.set('topicVariant', 'shadow');
       const search = params.toString();
       result = await fetchConnectionsHttp(
         `/v1/connections${search.length > 0 ? `?${search}` : ''}`,

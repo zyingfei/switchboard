@@ -19,6 +19,8 @@ export interface ConnectionsClientResponse<T> {
   readonly error?: string;
 }
 
+export type ConnectionsTopicVariant = 'shadow';
+
 export const USER_ORGANIZED_ITEM = 'user.organized.item' as const;
 export const USER_ENGAGEMENT_RELABELED = 'user.engagement.relabeled' as const;
 export const USER_FLOW_CONFIRMED = 'user.flow.confirmed' as const;
@@ -240,7 +242,12 @@ export const postUserEngagementRelabeled = (
   });
 
 export const fetchConnectionsSnapshot = (
-  filters: { workstreamId?: string; nodeKind?: string; edgeKind?: string } = {},
+  filters: {
+    workstreamId?: string;
+    nodeKind?: string;
+    edgeKind?: string;
+    topicVariant?: ConnectionsTopicVariant;
+  } = {},
 ): Promise<ConnectionsClientResponse<ConnectionsScopedResult>> =>
   call(messageTypes.loadConnectionsSnapshot, { filters });
 
