@@ -231,6 +231,15 @@ const parseLine = (line: string): AcceptedEvent | null => {
   }
 };
 
+// Stage 5 polish — cooperative-yield batch size for the event-log
+// parser. JSON.parse is synchronous; on a 5K-event dogfood vault the
+// parse loop pegs the event loop for ~500ms straight, which is
+// enough to starve /v1/status and produce the "Companion did not
+// respond within 5s" banner during catchUp / retrain.
+// `setImmediate` between batches lets the loop accept other I/O
+// without measurably extending total parse time.
+const EVENT_LOG_PARSE_YIELD_EVERY = 500;
+
 const readLogFile = async (path: string): Promise<AcceptedEvent[]> => {
   let text: string;
   try {
@@ -242,9 +251,16 @@ const readLogFile = async (path: string): Promise<AcceptedEvent[]> => {
     throw error;
   }
   const events: AcceptedEvent[] = [];
+  let processed = 0;
   for (const line of text.split('\n')) {
     const event = parseLine(line);
     if (event !== null) events.push(event);
+    processed += 1;
+    if (processed % EVENT_LOG_PARSE_YIELD_EVERY === 0) {
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+    }
   }
   return events;
 };

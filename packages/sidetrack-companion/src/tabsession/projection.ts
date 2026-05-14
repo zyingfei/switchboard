@@ -294,6 +294,26 @@ export const seedTabSessionProjectionAccumulator = (
   return acc;
 };
 
+// Async variant — yields every `yieldEvery` events so HTTP requests
+// (especially /status) interleave with a 10k+ event cold-start seed.
+// Byte-identical output to the sync variant.
+export const seedTabSessionProjectionAccumulatorAsync = async (
+  events: readonly AcceptedEvent[],
+  yieldEvery = 500,
+): Promise<TabSessionProjectionAccumulator> => {
+  const acc = createEmptyTabSessionProjectionAccumulator();
+  const sorted = [...events].sort(compareEventOrder);
+  for (let i = 0; i < sorted.length; i += 1) {
+    foldEventIntoTabSessionProjectionAccumulator(acc, sorted[i] as AcceptedEvent);
+    if ((i + 1) % yieldEvery === 0) {
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+    }
+  }
+  return acc;
+};
+
 /**
  * Stage 5.2 W2c — derive a TabSessionProjection from accumulator
  * state. Sorts bySessionId / openSessionsByTabId deterministically.

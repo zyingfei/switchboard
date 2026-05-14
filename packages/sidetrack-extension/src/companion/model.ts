@@ -289,6 +289,10 @@ export interface CompanionStatus {
       readonly pendingPublishes?: number;
     };
   };
+  // Connections snapshot revision. Bumps whenever the materializer
+  // produces a new snapshot. The side panel watches this to know
+  // when cached resolver suggestions have gone stale.
+  readonly snapshotRevision?: string;
 }
 
 export interface MutationResult {

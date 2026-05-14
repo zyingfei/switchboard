@@ -41,11 +41,33 @@ describe('engagement aggregator', () => {
     expect(message.final).toBe(true);
     expect(message.dimensions.engagement.activeMs).toBe(2_000);
     expect(message.dimensions.engagement.visibleMs).toBe(3_000);
-    expect(message.dimensions.engagement.focusedWindowMs).toBe(3_500);
+    // Stage 5 follow-up — focusedWindowMs now requires
+    // `visible && focused` to accrue, so the 0.5s after setVisible(false)
+    // at t=4000 doesn't count toward this tab's focused time. Previously
+    // accrued 3500 (the window was focused for that span even though the
+    // tab was hidden); 3000 is the corrected value.
+    expect(message.dimensions.engagement.focusedWindowMs).toBe(3_000);
     expect(message.dimensions.engagement.idleMs).toBe(1_000);
     expect(message.dimensions.engagement.scrollEvents).toBe(1);
     expect(message.dimensions.engagement.maxScrollRatio).toBe(0.5);
     expect(message.dimensions.engagement.copyCount).toBe(1);
     expect(message.dimensions.engagement.pasteCount).toBe(1);
+  });
+
+  it('does not over-count focusedWindowMs while the tab is in the background', () => {
+    let now = 0;
+    const aggregator = createEngagementAggregator({
+      visitId: 'visit:bg',
+      now: () => now,
+      visible: false,
+      focused: true,
+    });
+    // 5s elapse — window has OS focus the whole time, but THIS tab is
+    // not the selected one. Old behavior would accrue 5_000ms here.
+    now = 5_000;
+    const message = aggregator.snapshot(true, 5_000);
+    expect(message.dimensions.engagement.focusedWindowMs).toBe(0);
+    expect(message.dimensions.engagement.activeMs).toBe(0);
+    expect(message.dimensions.engagement.visibleMs).toBe(0);
   });
 });

@@ -55,6 +55,11 @@ export interface ConnectionsSnapshot {
   readonly updatedAt: string;
   readonly nodeCount: number;
   readonly edgeCount: number;
+  // Stage 5.2 R4 — companion-emitted byte-stable revision id for the
+  // committed snapshot. Hook caches use this to invalidate stale
+  // (anchor, hops) entries when the companion ships a new revision.
+  // Optional for backwards-compat with snapshots produced before R4.
+  readonly snapshotRevision?: string;
 }
 
 export interface ConnectionsScopedResult {

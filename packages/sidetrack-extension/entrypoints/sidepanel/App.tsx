@@ -86,7 +86,9 @@ import { listPendingOffers, markStatus, type OfferRecord } from '../../src/codin
 import { ConnectionsView } from '../../src/sidepanel/connections/ConnectionsView';
 import { hostOf, type EntityDisplayCtx } from '../../src/sidepanel/entityDisplay/format';
 import { useReplicaAliasMap } from '../../src/sidepanel/entityDisplay/replicaAliases';
+import { useSnippetPreviewMap } from '../../src/sidepanel/entityDisplay/snippetPreview';
 import { AttributionBadge } from '../../src/sidepanel/tabsession/AttributionBadge';
+import { SuggestionStats } from '../../src/sidepanel/tabsession/SuggestionStats';
 import { tabSessionDisplayTitle } from '../../src/sidepanel/tabsession/displayTitle';
 import { InboxCard } from '../../src/sidepanel/tabsession/InboxCard';
 import { InboxView } from '../../src/sidepanel/tabsession/InboxView';
@@ -150,6 +152,15 @@ const tabSessionRecordFromUrl = (url: UrlVisitRecord): TabSessionRecord => ({
   ...(url.currentAttribution === undefined
     ? {}
     : { currentAttribution: url.currentAttribution }),
+  ...(url.currentIgnored === undefined
+    ? {}
+    : {
+        currentIgnored: {
+          reason: url.currentIgnored.reason,
+          observedAt: url.currentIgnored.observedAt,
+          clientEventId: url.currentIgnored.clientEventId,
+        },
+      }),
   attributionHistory: url.attributionHistory,
 });
 
@@ -552,8 +563,53 @@ const dispatchDiagnosticReasonText = (
   }
 };
 
+// Persist + hydrate the last-known companion status across panel
+// re-mounts. Without this hook the panel starts in 'unknown' on every
+// open and paints "vault: connecting…" for ~1 s while the first
+// /status poll round-trips. When the companion was reachable on close
+// (the common case) we can repaint "vault: synced" instantly and let
+// the live poll auto-correct if the world changed since.
+//
+// localStorage is the right tool here: it's synchronous (so we can
+// read it inside the useState factory) and side-panel pages have
+// their own per-origin store. The cache is tiny (one string) and
+// auto-recovers — a stale entry only ever lives until the next
+// refresh() lands, ~1 s after mount.
+const COMPANION_STATUS_CACHE_KEY = 'sidetrack.lastCompanionStatus';
+const COMPANION_STATUS_VALUES: ReadonlySet<string> = new Set([
+  'connected',
+  'disconnected',
+  'vault-error',
+  'local-only',
+  'unknown',
+]);
+const readCachedCompanionStatus = (): WorkboardState['companionStatus'] | undefined => {
+  try {
+    const raw = window.localStorage.getItem(COMPANION_STATUS_CACHE_KEY);
+    if (raw !== null && COMPANION_STATUS_VALUES.has(raw)) {
+      return raw as WorkboardState['companionStatus'];
+    }
+  } catch {
+    // localStorage may be unavailable (test env, private mode). Fall
+    // through to the default 'unknown' state.
+  }
+  return undefined;
+};
+const writeCachedCompanionStatus = (status: WorkboardState['companionStatus']): void => {
+  try {
+    window.localStorage.setItem(COMPANION_STATUS_CACHE_KEY, status);
+  } catch {
+    // Best-effort; cache miss on next mount is acceptable.
+  }
+};
+
 const App = () => {
-  const [state, setState] = useState<WorkboardState>(() => createEmptyWorkboardState());
+  const [state, setState] = useState<WorkboardState>(() => {
+    const cached = readCachedCompanionStatus();
+    return cached === undefined
+      ? createEmptyWorkboardState()
+      : createEmptyWorkboardState({ companionStatus: cached });
+  });
   const [bridgeKey, setBridgeKey] = useState('');
   const [port, setPort] = useState('17373');
   const [selectedWorkstream, setSelectedWorkstream] = useState('');
@@ -574,9 +630,35 @@ const App = () => {
   // "active workstream pill" intent). Keeps tab attribution and intent
   // independent so changing one doesn't accidentally change the other.
   const [tabSessionMoveId, setTabSessionMoveId] = useState<string | null>(null);
+  // Stage 5 polish — debug panel-state dump. Tracks the latest dump
+  // result so the icon button can flash a success/error chip with the
+  // file path the user can hand to an assistant.
+  const [dumpStatus, setDumpStatus] = useState<
+    | { readonly kind: 'idle' }
+    | { readonly kind: 'dumping' }
+    | { readonly kind: 'dumped'; readonly path: string }
+    | { readonly kind: 'error'; readonly message: string }
+  >({ kind: 'idle' });
   const [viewMode, setViewMode] = useState<'workstream' | 'all' | 'inbox' | 'connections'>(
     'workstream',
   );
+  // Stage 5 polish — cross-surface jumps between Inbox and Connections.
+  // `connectionsAnchorRequest` is a string that ConnectionsView watches
+  // via its requestAnchor prop; when set non-empty, the view auto-anchors
+  // there. `inboxSearchRequest` is similar for InboxView's initialQuery.
+  const [connectionsAnchorRequest, setConnectionsAnchorRequest] = useState<string>('');
+  const [inboxSearchRequest, setInboxSearchRequest] = useState<string>('');
+  const requestSwitchToConnections = (canonicalUrl: string): void => {
+    // The timeline-visit node id IS the canonical URL — the snapshot
+    // builds them that way. So anchoring on `timeline-visit:<URL>`
+    // lands on the most useful neighborhood for an unattributed URL.
+    setConnectionsAnchorRequest(`timeline-visit:${canonicalUrl}`);
+    setViewMode('connections');
+  };
+  const requestSwitchToInbox = (canonicalUrl: string): void => {
+    setInboxSearchRequest(canonicalUrl);
+    setViewMode('inbox');
+  };
   const [queueDraft, setQueueDraft] = useState('');
   const [queueExpandFor, setQueueExpandFor] = useState<string | null>(null);
   // Set briefly after the user opens compose-at-end via the row's
@@ -638,6 +720,11 @@ const App = () => {
   // here pulls activeTabUrl into the side panel immediately, without
   // waiting for the SW round-trip.
   const [liveActiveTabUrl, setLiveActiveTabUrl] = useState<string | undefined>(undefined);
+  // Keep a ref so loadTabSessions (called from background polls) can
+  // read the current focused-tab URL without rebuilding the callback
+  // on every focus change.
+  const liveActiveTabUrlRef = useRef(liveActiveTabUrl);
+  liveActiveTabUrlRef.current = liveActiveTabUrl;
   const [liveActiveTabTitle, setLiveActiveTabTitle] = useState<string | undefined>(undefined);
   const [threadSearchOpen, setThreadSearchOpen] = useState(false);
   const [threadSearchQuery, setThreadSearchQuery] = useState('');
@@ -710,6 +797,18 @@ const App = () => {
   urlSuggestionsRef.current = urlSuggestions;
   const tabSessionSuggestionLoadInFlightRef = useRef(false);
   const urlSuggestionLoadInFlightRef = useRef(false);
+  // 2026-05 cleanup: with the 4 s background poll gone, the user can
+  // refresh a single suggestion via the per-card ↻ button. This set
+  // tracks which urls are currently re-fetching so the button can
+  // disable + show a spinner without a separate Map per card.
+  const [refreshingUrlSuggestionIds, setRefreshingUrlSuggestionIds] =
+    useState<ReadonlySet<string>>(() => new Set<string>());
+  // URL auto-apply is reversible (your manual move beats the inferred
+  // one on precedence tie-break) but we still don't want to retry the
+  // same URL on every poll cycle. Track in-flight + completed attempts
+  // per canonical URL so each URL is auto-applied at most once per
+  // session per server response.
+  const urlAutoApplyInFlightRef = useRef<Set<string>>(new Set<string>());
   const [pendingCodingOffers, setPendingCodingOffers] = useState<readonly OfferRecord[]>([]);
   // Per-row dismissals for the Needs-Organize inline suggestion. Local
   // (per-session) — survives panel close but not extension reload.
@@ -719,6 +818,14 @@ const App = () => {
   // Which thread row's action overflow menu (⋯) is open. One at a
   // time across the workboard.
   const [actionMenuOpenFor, setActionMenuOpenFor] = useState<string | null>(null);
+
+  // Persist companionStatus on every change so the next panel mount
+  // can hydrate from cache instead of starting in 'unknown'. Pair to
+  // readCachedCompanionStatus above; keeps the next reopen flash-free
+  // when the world hasn't changed.
+  useEffect(() => {
+    writeCachedCompanionStatus(state.companionStatus);
+  }, [state.companionStatus]);
 
   // Click-outside dismissal for the overflow menu. The menu's own
   // contents stop propagation, so any click that reaches document
@@ -1054,6 +1161,7 @@ const App = () => {
     ...(localReplicaId === undefined ? {} : { localReplicaId }),
     observedReplicaIds: [],
   });
+  const snippetPreviews = useSnippetPreviewMap();
   const displayCtx = useMemo<EntityDisplayCtx>(
     () => ({
       resolveWorkstreamPath: (bacId) => {
@@ -1061,8 +1169,9 @@ const App = () => {
         return found === undefined ? null : workstreamPath(bacId, state.workstreams);
       },
       replicaAlias,
+      snippetPreview: snippetPreviews.lookup,
     }),
-    [state.workstreams, replicaAlias],
+    [state.workstreams, replicaAlias, snippetPreviews],
   );
   // Invalidate every cached suggestion when the workstream
   // fingerprint shifts (rename, member move, new/deleted workstream).
@@ -1228,7 +1337,17 @@ const App = () => {
         }
       });
       for (const entry of fetched) {
-        if (entry !== null) next[entry[0]] = entry[1];
+        if (entry === null) continue;
+        const [id, result] = entry;
+        // Skip caching empty results. An empty resolution most often
+        // means the materializer hasn't folded the new visit into the
+        // snapshot yet (materializer drains run async in a child
+        // process). If we cached an empty result we'd stick on
+        // "No signal yet" forever — the snapshot.revision watcher
+        // will force a refetch when the drain lands, and any unrelated
+        // refresh trigger in the meantime gets a fresh attempt too.
+        if (result.fusedCandidates.length === 0) continue;
+        next[id] = result;
       }
       return next;
     },
@@ -1243,10 +1362,14 @@ const App = () => {
       inbox: UrlInboxData,
       previous: Readonly<Record<string, UrlResolutionResult>>,
       forceRefetch = false,
+      extraCanonicalUrls: readonly string[] = [],
     ): Promise<Record<string, UrlResolutionResult>> => {
-      const canonicalUrls = inbox.items
+      const inboxCanonicalUrls = inbox.items
         .filter((item) => item.currentAttribution === undefined)
         .map((item) => item.canonicalUrl);
+      // Merge inbox URLs with caller-supplied extras (e.g., the focused
+      // tab's URL when it's not in the inbox top page). Dedupe by Set.
+      const canonicalUrls = [...new Set<string>([...inboxCanonicalUrls, ...extraCanonicalUrls])];
       const next: Record<string, UrlResolutionResult> = {};
       for (const url of canonicalUrls) {
         if (!forceRefetch && previous[url] !== undefined) next[url] = previous[url];
@@ -1265,11 +1388,52 @@ const App = () => {
         }
       });
       for (const entry of fetched) {
-        if (entry !== null) next[entry[0]] = entry[1];
+        if (entry === null) continue;
+        const [url, result] = entry;
+        // Same self-heal as the tab-session cache: empty results
+        // usually mean the materializer hasn't drained the new visit
+        // yet. Don't cache them; let snapshot.revision changes (or
+        // any other refresh trigger) force a refetch.
+        if (result.fusedCandidates.length === 0) continue;
+        next[url] = result;
       }
       return next;
     },
     [fetchCompanionJson, mapWithConcurrency],
+  );
+
+  // Per-row refresh: re-resolves a single URL's suggestion without
+  // touching the rest of the inbox. With the 4 s background poll
+  // gone (2026-05), this is how the user manually picks up a fresher
+  // suggestion for ONE card — one /v1/visits/.../resolve call,
+  // instead of refetching the whole list.
+  const refreshUrlSuggestion = useCallback(
+    async (canonicalUrl: string): Promise<void> => {
+      setRefreshingUrlSuggestionIds((current) => {
+        if (current.has(canonicalUrl)) return current;
+        const next = new Set(current);
+        next.add(canonicalUrl);
+        return next;
+      });
+      try {
+        const result = await fetchCompanionJson<unknown>(
+          `/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve?dryRun=true`,
+        );
+        if (isUrlResolutionResult(result)) {
+          setUrlSuggestions((current) => ({ ...current, [canonicalUrl]: result }));
+        }
+      } catch {
+        // Per-card refresh failures stay silent — the user can retry.
+      } finally {
+        setRefreshingUrlSuggestionIds((current) => {
+          if (!current.has(canonicalUrl)) return current;
+          const next = new Set(current);
+          next.delete(canonicalUrl);
+          return next;
+        });
+      }
+    },
+    [fetchCompanionJson],
   );
 
   // Stage 5 follow-up — background polls should NOT flip the
@@ -1313,7 +1477,26 @@ const App = () => {
             setUrlInbox(urlInboxResp);
             if (!urlSuggestionLoadInFlightRef.current) {
               urlSuggestionLoadInFlightRef.current = true;
-              void loadUrlSuggestions(urlInboxResp, urlSuggestionsRef.current, forceRefetch)
+              // Include the currently-focused tab's URL in the suggestion
+              // fetch even when it's not in the inbox top page — otherwise
+              // the Current Tab card renders without a suggestion for
+              // late-page or attributed URLs the resolver could still
+              // give us advice on. Read from the latest active-tab state.
+              const focusedCanonical =
+                liveActiveTabUrlRef.current ??
+                state.activeTabUrl ??
+                state.currentTab?.tabSnapshot?.url ??
+                state.currentTab?.threadUrl;
+              const focusedExtras =
+                typeof focusedCanonical === 'string' && focusedCanonical.length > 0
+                  ? [focusedCanonical]
+                  : [];
+              void loadUrlSuggestions(
+                urlInboxResp,
+                urlSuggestionsRef.current,
+                forceRefetch,
+                focusedExtras,
+              )
                 .then(setUrlSuggestions)
                 .catch(() => undefined)
                 .finally(() => {
@@ -1391,21 +1574,38 @@ const App = () => {
     void loadTabSessions({ background: true });
   }, [loadTabSessions, state.companionStatus, state.updatedAt, viewMode]);
 
-  // Periodic refresh while the companion is connected so newly observed
-  // browser titles + recorder events flow into the Inbox / suggestion
-  // banner without waiting for state.updatedAt to bump. 4s is a balance
-  // between perceived latency (titles arrive a beat after status:complete)
-  // and HTTP load on the companion. Stops as soon as the companion
-  // disconnects.
+  // Watch the companion's snapshot revision. When the materializer
+  // produces a new snapshot (typically 1-5s after a freshly visited
+  // URL is captured), force a re-fetch of resolver suggestions so
+  // the Current Tab card stops showing "No signal yet" for URLs the
+  // graph now knows about. The cache-fill side of this also skips
+  // caching empty results — together they self-heal the stale state.
+  const lastSnapshotRevisionRef = useRef<string | null>(null);
   useEffect(() => {
     if (state.companionStatus !== 'connected') return;
-    const handle = setInterval(() => {
-      void loadTabSessions({ background: true });
-    }, 4000);
-    return () => {
-      clearInterval(handle);
-    };
-  }, [loadTabSessions, state.companionStatus]);
+    const rev = state.snapshotRevision;
+    if (rev === undefined) return;
+    if (lastSnapshotRevisionRef.current === rev) return;
+    // First observation: prime without refetching.
+    const previous = lastSnapshotRevisionRef.current;
+    lastSnapshotRevisionRef.current = rev;
+    if (previous === null) return;
+    void loadTabSessions({ background: true, forceRefetchSuggestions: true });
+  }, [loadTabSessions, state.companionStatus, state.snapshotRevision]);
+
+  // 2026-05 cleanup: dropped the 4 s background poll. It was firing
+  // /v1/tabsessions/*/resolve four times per minute per visible card,
+  // for every warm-restart of the side panel, even when nothing had
+  // changed. The user explicitly asked for cache-first behavior:
+  // suggestions stick until the user hits Refresh (list-level), the
+  // per-card refresh button, or visibly navigates a tab (handled by
+  // the push-driven refresh below). The companion already publishes
+  // freshness through tab-navigation events, so this poll was pure
+  // overhead.
+  //
+  // If we ever need a heartbeat to detect companion-status changes,
+  // it should be a small "ping" call (no suggestions in the response)
+  // rather than re-fetching every suggestion in the visible list.
 
   // Push-driven refresh: the moment the user navigates a tab, force the
   // SW to drain its spool and reload the projection. Without this the
@@ -2288,6 +2488,58 @@ const App = () => {
     void runAction(() => attributeTabSessionToWorkstream(tabSessionId, workstreamId));
   };
 
+  // High-confidence URL resolver auto-apply. Companion gate is
+  // `SIDETRACK_URL_RESOLVER_AUTO_APPLY=1`; when it's off the POST
+  // returns `skipped-disabled` and the projection is unchanged. We
+  // still attempt the call so that flipping the env on takes effect
+  // without an extension reload. Bounded by:
+  //   1. Only URLs with `decision.action === 'auto-apply'`.
+  //   2. Only URLs with no existing user-asserted attribution
+  //      (the companion enforces this too as a safety check).
+  //   3. Track in-flight per-URL to avoid spamming the same URL.
+  const triggerUrlAutoApply = useCallback(
+    async (canonicalUrl: string): Promise<void> => {
+      if (port.length === 0 || bridgeKey.length === 0) return;
+      if (urlAutoApplyInFlightRef.current.has(canonicalUrl)) return;
+      urlAutoApplyInFlightRef.current.add(canonicalUrl);
+      try {
+        await fetch(
+          `http://127.0.0.1:${port}/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve`,
+          {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'idempotency-key': `url-auto-apply-${canonicalUrl}-${String(Date.now())}`,
+              'x-bac-bridge-key': bridgeKey,
+            },
+            body: JSON.stringify({ dryRun: false, policyMode: 'balanced' }),
+          },
+        );
+        // Success or skipped-disabled — re-fetch suggestions so the
+        // panel reflects the applied attribution (or stays as-is when
+        // disabled).
+        await loadTabSessions({ background: true, forceRefetchSuggestions: true });
+      } catch {
+        // Silent — auto-apply is best-effort.
+      } finally {
+        urlAutoApplyInFlightRef.current.delete(canonicalUrl);
+      }
+    },
+    [bridgeKey, port, loadTabSessions],
+  );
+
+  // Trigger auto-apply when fresh suggestions arrive. Effect debounces
+  // implicitly by depending on `urlSuggestions` — runs once per fetch.
+  useEffect(() => {
+    if (urlProjection === null) return;
+    for (const [canonicalUrl, result] of Object.entries(urlSuggestions)) {
+      if (result.decision.action !== 'auto-apply') continue;
+      const existing = urlProjection.byCanonicalUrl[canonicalUrl]?.currentAttribution;
+      if (existing !== undefined && existing.source !== 'inferred') continue;
+      void triggerUrlAutoApply(canonicalUrl);
+    }
+  }, [urlSuggestions, urlProjection, triggerUrlAutoApply]);
+
   // Wrapper used by the Inbox + Current-tab card after the Phase B
   // switchover. The card's record is a synthesized TabSessionRecord
   // whose `tabSessionId` field carries the canonical URL — see
@@ -2295,6 +2547,131 @@ const App = () => {
   // per-URL attribution endpoint.
   const handleUrlAttribute = (canonicalUrl: string, workstreamId: string | null) => {
     void runAction(() => attributeUrlToWorkstream(canonicalUrl, workstreamId));
+  };
+
+  // Stage 5 polish — explicit "ignore this URL" action. Distinct from
+  // workstreamId:null (which is "meaningful one-off"). Writes a
+  // urls.ignored event so the URL is hidden from Inbox + skipped by
+  // auto-apply. Reversible: re-organizing into a workstream clears
+  // the ignore in the projection mutator.
+  const ignoreUrl = async (
+    canonicalUrl: string,
+    reason: 'noise' | 'duplicate' | 'private' = 'noise',
+  ): Promise<WorkboardState> => {
+    if (port.length === 0 || bridgeKey.length === 0) {
+      throw new Error('Companion is not configured.');
+    }
+    const response = await fetch(
+      `http://127.0.0.1:${port}/v1/visits/${encodeURIComponent(canonicalUrl)}/ignore`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'idempotency-key': `url-ignore-${canonicalUrl}-${reason}-${String(Date.now())}`,
+          'x-bac-bridge-key': bridgeKey,
+        },
+        body: JSON.stringify({ reason }),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`URL ignore failed (${String(response.status)}).`);
+    }
+    await loadTabSessions({ forceRefetchSuggestions: true });
+    return await sendRequest({ type: messageTypes.getWorkboardState });
+  };
+
+  const handleUrlIgnore = (
+    canonicalUrl: string,
+    reason: 'noise' | 'duplicate' | 'private' = 'noise',
+  ) => {
+    void runAction(() => ignoreUrl(canonicalUrl, reason));
+  };
+
+  // Stage 5 polish — "Dump panel state" button handler. Collects the
+  // panel's visible-to-debugging fields (focused tab, urlInbox slice,
+  // suggestions, view mode, companion status) and POSTs to the
+  // companion's /v1/debug/dump endpoint, which writes
+  // `${vaultRoot}/_BAC/debug-dumps/latest.json` (plus a timestamped
+  // copy). Falls back to clipboard if the companion is unreachable so
+  // the user always gets a usable artifact.
+  const handleDumpPanelState = () => {
+    setDumpStatus({ kind: 'dumping' });
+    const payload = {
+      viewMode,
+      companionStatus: state.companionStatus,
+      focused: {
+        canonicalUrl: focusedUrlRecord?.canonicalUrl,
+        record: focusedUrlRecord,
+        suggestion: focusedTabSuggestion,
+      },
+      urlInbox: {
+        total: urlInbox.total,
+        items: urlInbox.items.slice(0, 20),
+      },
+      urlSuggestions: Object.fromEntries(
+        Object.entries(urlSuggestions).slice(0, 50),
+      ),
+      workstreams: state.workstreams.map((w) => ({
+        bac_id: w.bac_id,
+        title: w.title,
+        parentId: w.parentId ?? null,
+        privacy: w.privacy,
+      })),
+      threadsLight: state.threads.map((t) => ({
+        bac_id: t.bac_id,
+        title: t.title,
+        provider: t.provider,
+        primaryWorkstreamId: t.primaryWorkstreamId ?? null,
+        status: t.status,
+        lastSeenAt: t.lastSeenAt,
+      })),
+      tabSessionMoveId,
+      activeTabUrl: state.activeTabUrl ?? null,
+      activeTabSessionId: state.activeTabSessionId ?? null,
+      capturedAt: new Date().toISOString(),
+    };
+    void (async () => {
+      try {
+        if (port.length === 0 || bridgeKey.length === 0) {
+          throw new Error('Companion not configured');
+        }
+        const response = await fetch(`http://127.0.0.1:${port}/v1/debug/dump`, {
+          method: 'POST',
+          headers: {
+            'x-bac-bridge-key': bridgeKey,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${String(response.status)}`);
+        }
+        const body = (await response.json()) as { readonly data?: { readonly path?: string } };
+        const path = body.data?.path;
+        if (typeof path !== 'string' || path.length === 0) {
+          throw new Error('No path returned');
+        }
+        setDumpStatus({ kind: 'dumped', path });
+      } catch (error) {
+        // Clipboard fallback so the user always walks away with the dump.
+        try {
+          await navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
+          setDumpStatus({
+            kind: 'error',
+            message: `Companion unreachable — copied to clipboard instead (${
+              error instanceof Error ? error.message : String(error)
+            })`,
+          });
+        } catch (clipError) {
+          setDumpStatus({
+            kind: 'error',
+            message: `Dump failed: ${error instanceof Error ? error.message : String(error)} / clipboard: ${
+              clipError instanceof Error ? clipError.message : String(clipError)
+            }`,
+          });
+        }
+      }
+    })();
   };
 
   const handleMoveTarget = (target: WorkstreamOption | { readonly create: string }) => {
@@ -3294,10 +3671,16 @@ const App = () => {
   const showWizard = inFirstLaunchMode || wizardOpen;
   const localOnlyMode = state.companionStatus === 'local-only';
   // When local-only is the chosen mode, the companion isn't expected;
-  // "disconnected" only applies when a bridge key was set but the companion
-  // is unreachable.
+  // "disconnected" only applies when a bridge key was set but the
+  // companion is unreachable. The 'unknown' state means we haven't
+  // completed the first /status poll yet — don't surface the red
+  // banner during that gap; the panel just opened and is still
+  // dialing the companion. The status pill softens to "connecting…"
+  // for those few ticks.
   const companionDisconnected =
-    !localOnlyMode && (bridgeKey.trim().length === 0 || state.companionStatus === 'disconnected');
+    !localOnlyMode &&
+    state.companionStatus !== 'unknown' &&
+    (bridgeKey.trim().length === 0 || state.companionStatus === 'disconnected');
   // Relay banner is gated on the companion being reachable —
   // if companion is down we already show that, no point also
   // claiming peer-sync is paused (it definitionally is). Only
@@ -3694,7 +4077,11 @@ const App = () => {
           ) : null}
         </div>
         <div className="row2 row2-lifecycle">
-          <span className={'dot ' + dotClass} />
+          <span
+            className={'dot ' + dotClass}
+            data-testid={`thread-row-dot-${dotClass}`}
+            data-dot-class={dotClass}
+          />
           <span className="stamp">{stamp}</span>
           {/* Per spec: dot + stamp already convey lifecycle. The
               lifecycle pill is redundant for unread / waiting /
@@ -4841,6 +5228,43 @@ const App = () => {
               <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
             </svg>
           </button>
+          {/* Stage 5 polish — "Dump panel state" button. POSTs every
+              user-facing piece of panel state to the companion, which
+              writes `${vault}/_BAC/debug-dumps/latest.json`. The user
+              hands me the path and I read it instead of asking for
+              another screenshot. */}
+          <button
+            className={
+              'icon-btn' +
+              (dumpStatus.kind === 'dumping' ? ' pulsing' : '') +
+              (dumpStatus.kind === 'dumped' ? ' on' : '') +
+              (dumpStatus.kind === 'error' ? ' warn' : '')
+            }
+            title={
+              dumpStatus.kind === 'dumped'
+                ? `Dumped: ${dumpStatus.path} — click again to refresh`
+                : dumpStatus.kind === 'error'
+                  ? dumpStatus.message
+                  : 'Dump panel state to a JSON file for review'
+            }
+            onClick={handleDumpPanelState}
+            type="button"
+            aria-label="Dump panel state"
+            data-testid="dump-panel-state"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="7 10 12 15 17 10" />
+              <line x1="12" y1="15" x2="12" y2="3" />
+            </svg>
+          </button>
           {/* Design preview — always-on for now (was gated by __DEV__).
               Re-gate once the surfaces it shows are wired into
               production rendering. */}
@@ -4967,6 +5391,61 @@ const App = () => {
               aria-hidden
             />
             recall {recallStatus === 'rebuilding' ? 'indexing' : recallStatus}
+          </span>
+        ) : null}
+        {/* Dump-state result chip. Click "copy" to put the absolute
+            path on the clipboard, "open" to ask the OS to reveal the
+            file. Errors stay in the same chip so the user doesn't have
+            to hunt for them. */}
+        {dumpStatus.kind === 'dumped' ? (
+          <span
+            className="sp-status-pill mono ok"
+            title={`Dump written to ${dumpStatus.path} — click "copy" for the path`}
+            data-testid="dump-result"
+          >
+            <span className="sp-status-dot green" aria-hidden />
+            dumped
+            <button
+              type="button"
+              className="btn-link sp-status-pill-btn"
+              onClick={() => {
+                void navigator.clipboard.writeText(dumpStatus.path);
+              }}
+              title="Copy path to clipboard"
+            >
+              copy
+            </button>
+            <button
+              type="button"
+              className="btn-link sp-status-pill-btn"
+              onClick={() => {
+                setDumpStatus({ kind: 'idle' });
+              }}
+              title="Dismiss"
+              aria-label="Dismiss dump notice"
+            >
+              ✕
+            </button>
+          </span>
+        ) : dumpStatus.kind === 'error' ? (
+          <span
+            className="sp-status-pill mono warn"
+            title={dumpStatus.message}
+            data-testid="dump-result"
+          >
+            <span className="sp-status-dot amber" aria-hidden />
+            dump → clipboard fallback
+            <button
+              type="button"
+              className="btn-link sp-status-pill-btn"
+              onClick={() => {
+                setDumpStatus({ kind: 'idle' });
+              }}
+              title="Dismiss"
+              aria-label="Dismiss dump notice"
+            >
+              ✕
+            </button>
           </span>
         ) : null}
       </div>
@@ -5180,22 +5659,108 @@ const App = () => {
             }
             workstreams={tabSessionWorkstreams}
           />
-          {focusedUrlRecord !== undefined ? (
+          {/* Suggestion stats: bucket label + ⓘ tooltip + alternatives.
+              Renders for any unattributed/un-ignored focused URL — when
+              the resolver has no candidates we still draw the empty
+              placeholder so the user sees why the badge is "?". */}
+          {focusedUrlRecord !== undefined &&
+          focusedUrlRecord.currentAttribution === undefined &&
+          focusedUrlRecord.currentIgnored === undefined ? (
+            <SuggestionStats
+              suggestion={
+                focusedTabSuggestion === undefined
+                  ? undefined
+                  : tabSessionResolutionFromUrl(focusedTabSuggestion)
+              }
+              workstreams={tabSessionWorkstreams}
+              showAlternatives
+              showEmptyPlaceholder
+            />
+          ) : null}
+          {/* Stage 5 polish — the legacy "Change…" button used to live
+              here. Removed because the flat 4-action bar below already
+              has "Pick another…" with the same behavior (opens the
+              WorkstreamPicker); rendering both was a duplicate
+              affordance the user flagged. */}
+        </div>
+        {/* Action bar: shows up when there's a focused URL. All four
+            choices flat — no overflow menu — so every state from the
+            5-state attribution model has a directly-clickable
+            affordance. "Yes, that's right" only renders when a
+            high-enough suggestion exists; the other three always
+            render so the user can take the corresponding action even
+            when no suggestion is present. */}
+        {focusedUrlRecord !== undefined ? (
+          <div className="tab-attribution-card-actions">
+            {focusedTabSuggestion !== undefined &&
+            focusedTabSuggestion.decision.workstreamId !== undefined &&
+            focusedUrlRecord.currentAttribution === undefined &&
+            focusedUrlRecord.currentIgnored === undefined ? (
+              <button
+                type="button"
+                className="tab-attribution-card-action primary"
+                onClick={() => {
+                  if (focusedTabSuggestion.decision.workstreamId !== undefined) {
+                    handleUrlAttribute(
+                      focusedUrlRecord.canonicalUrl,
+                      focusedTabSuggestion.decision.workstreamId,
+                    );
+                  }
+                }}
+                title="Confirm the suggested workstream"
+              >
+                Yes, that's right
+              </button>
+            ) : null}
             <button
               type="button"
-              className="tab-attribution-card-change"
+              className="tab-attribution-card-action"
               onClick={() => {
-                // tabSessionMoveId carries the canonical URL post-Phase B
-                // — the move-target picker still works because the
-                // accept handler now dispatches to handleUrlAttribute.
                 setTabSessionMoveId(focusedUrlRecord.canonicalUrl);
               }}
-              title="Attribute this page to a different workstream"
+              title="Pick a different workstream"
             >
-              Change…
+              Pick another…
             </button>
-          ) : null}
-        </div>
+            <button
+              type="button"
+              className="tab-attribution-card-action"
+              onClick={() => {
+                handleUrlAttribute(focusedUrlRecord.canonicalUrl, null);
+              }}
+              title="This page is meaningful but doesn't belong to any workstream"
+            >
+              Not in any stream
+            </button>
+            <button
+              type="button"
+              className="tab-attribution-card-action"
+              onClick={() => {
+                handleUrlIgnore(focusedUrlRecord.canonicalUrl, 'noise');
+              }}
+              title="Mute this URL — don't bother me about it again"
+            >
+              Ignore (admin / noise)
+            </button>
+            {/* Cross-surface jump to Connections, mirroring the
+                InboxCard "⇄ Graph" affordance. Anchors on the
+                timeline-visit for this URL so the user can see the
+                neighborhood that does (or doesn't) exist yet — useful
+                when SuggestionStats says "No signal yet" and the user
+                wants to know what evidence the resolver had. */}
+            <button
+              type="button"
+              className="tab-attribution-card-action"
+              onClick={() => {
+                requestSwitchToConnections(focusedUrlRecord.canonicalUrl);
+              }}
+              title="Open this URL's neighborhood in the Connections graph"
+              data-testid="focused-tab-open-in-connections"
+            >
+              ⇄ Graph
+            </button>
+          </div>
+        ) : null}
       </section>
 
       {suggestedOpenTabSession !== undefined && suggestedOpenTabSessionResolution !== undefined ? (
@@ -5204,6 +5769,10 @@ const App = () => {
           suggestion={tabSessionResolutionFromUrl(suggestedOpenTabSessionResolution)}
           workstreams={tabSessionWorkstreams}
           onAttribute={handleUrlAttribute}
+          onPickAnother={(canonicalUrl) => {
+            setTabSessionMoveId(canonicalUrl);
+          }}
+          onIgnore={handleUrlIgnore}
         />
       ) : null}
 
@@ -5293,7 +5862,14 @@ const App = () => {
         </form>
       ) : null}
 
-      <div className="ws-drop-strip" aria-label="Drop thread on a workstream">
+      {/* Workstream chip selector. Hidden on Inbox + Connections
+          views: in those views the user is triaging unattributed
+          pages or exploring the graph, not picking a workstream to
+          focus. "Workstream:" label here renames PR-141-era
+          "focused workstream" wording — the browser tab is the
+          only "focus" in the panel. */}
+      {viewMode === 'workstream' || viewMode === 'all' ? (
+      <div className="ws-drop-strip" aria-label="Pick a workstream">
         {state.workstreams.map((workstream) => (
           <button
             type="button"
@@ -5321,6 +5897,7 @@ const App = () => {
           </button>
         ))}
       </div>
+      ) : null}
 
       {wsPickerOpen ? (
         <WorkstreamPicker
@@ -5469,6 +6046,11 @@ const App = () => {
         <ConnectionsView
           {...(currentWsId === null ? {} : { initialAnchor: `workstream:${currentWsId}` })}
           displayCtx={displayCtx}
+          requestAnchor={connectionsAnchorRequest}
+          onRequestConsumed={() => {
+            setConnectionsAnchorRequest('');
+          }}
+          onOpenInInbox={requestSwitchToInbox}
           workstreamAnchors={state.workstreams.map((w) => ({
             id: `workstream:${w.bac_id}`,
             label: workstreamPath(w.bac_id, state.workstreams),
@@ -5604,7 +6186,12 @@ const App = () => {
                         workstreams={tabSessionWorkstreams}
                         onAttribute={handleUrlAttribute}
                         onOpenTab={openTabForSession}
+                        onPickAnother={(canonicalUrl) => {
+                          setTabSessionMoveId(canonicalUrl);
+                        }}
+                        onIgnore={handleUrlIgnore}
                         displayCtx={displayCtx}
+                        onOpenInConnections={requestSwitchToConnections}
                       />
                     );
                   })}
@@ -5619,8 +6206,20 @@ const App = () => {
           // urlInbox; each record's `tabSessionId` field carries the
           // canonical URL, and onAttribute dispatches to the URL
           // attribution endpoint.
+          //
+          // Dedupe against the focused tab: the Current Tab card at
+          // the top of the panel is its own surface for the URL in
+          // focus, so showing the same canonical URL twice (once at
+          // the top, once in the Inbox list) is the "dup items"
+          // confusion. Filter it out here.
           inbox={{
-            items: urlInbox.items.map(tabSessionRecordFromUrl),
+            items: urlInbox.items
+              .map(tabSessionRecordFromUrl)
+              .filter(
+                (item) =>
+                  focusedUrlRecord === undefined ||
+                  item.tabSessionId !== focusedUrlRecord.canonicalUrl,
+              ),
             total: urlInbox.total,
             limit: urlInbox.limit,
             offset: urlInbox.offset,
@@ -5642,7 +6241,20 @@ const App = () => {
           }}
           onAttribute={handleUrlAttribute}
           onOpenTab={openTabForSession}
+          onPickAnother={(canonicalUrl) => {
+            setTabSessionMoveId(canonicalUrl);
+          }}
+          onIgnore={handleUrlIgnore}
           displayCtx={displayCtx}
+          onOpenInConnections={requestSwitchToConnections}
+          onRefreshSuggestion={(canonicalUrl) => {
+            void refreshUrlSuggestion(canonicalUrl);
+          }}
+          refreshingSuggestionIds={refreshingUrlSuggestionIds}
+          initialQuery={inboxSearchRequest}
+          onQueryConsumed={() => {
+            setInboxSearchRequest('');
+          }}
         />
       ) : (
         <>
@@ -7026,17 +7638,50 @@ function WorkstreamPicker({
   const [draftTitle, setDraftTitle] = useState('');
   const [draftDescription, setDraftDescription] = useState('');
 
+  // Hierarchy-aware rendering: group workstreams as roots + per-root
+  // children. When a search query is active we flatten matches (search
+  // wins over hierarchy clarity); otherwise we render each root
+  // followed by its indented children.
   const matches = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (q.length === 0) {
-      return workstreams;
-    }
+    if (q.length === 0) return workstreams;
     return workstreams.filter((w) => w.title.toLowerCase().includes(q));
   }, [query, workstreams]);
+
+  const isSearching = query.trim().length > 0;
+  const hierarchical = useMemo(() => {
+    if (isSearching) return matches.map((w) => ({ ws: w, depth: 0 }));
+    // Build children index. Each entry's children get appended after it.
+    const byParent = new Map<string | null, WorkstreamNode[]>();
+    for (const w of workstreams) {
+      const key = w.parentId ?? null;
+      const list = byParent.get(key) ?? [];
+      list.push(w);
+      byParent.set(key, list);
+    }
+    const out: { ws: WorkstreamNode; depth: number }[] = [];
+    const walk = (parentId: string | null, depth: number): void => {
+      const children = byParent.get(parentId) ?? [];
+      for (const w of children) {
+        out.push({ ws: w, depth });
+        walk(w.bac_id, depth + 1);
+      }
+    };
+    walk(null, 0);
+    return out;
+  }, [isSearching, matches, workstreams]);
 
   const threadCountFor = (wsId: string): number =>
     threads.filter((t) => t.primaryWorkstreamId === wsId).length;
   const inboxCount = threads.filter((t) => t.primaryWorkstreamId === undefined).length;
+  // Track which parent the user is creating a sub-workstream under.
+  // null = top-level. Defaults to parentForNew (prop) but the user can
+  // toggle between "top-level" and "under current" via the trigger row.
+  const [createParent, setCreateParent] = useState<string | null>(parentForNew);
+  const parentTitle =
+    parentForNew === null
+      ? null
+      : workstreams.find((w) => w.bac_id === parentForNew)?.title ?? 'current';
 
   return (
     <div className="ws-picker-backdrop" onClick={onClose} role="presentation">
@@ -7058,34 +7703,58 @@ function WorkstreamPicker({
           }}
         />
         <div className="ws-picker-list">
+          {/* Column header explains what the right-hand count means. */}
+          <div className="ws-picker-header mono subtle">
+            <span>Workstream</span>
+            <span title="Threads currently attributed to this workstream">threads</span>
+          </div>
           <button
             type="button"
             className={'ws-picker-row' + (currentWsId === null ? ' on' : '')}
             onClick={() => {
               onSelect(null);
             }}
+            title="Inbox — threads waiting for you to assign a workstream"
           >
             <span className="ws-picker-name">
-              not set <em className="subtle">· captures land here</em>
+              <strong>Not assigned</strong>{' '}
+              <em className="subtle">— threads waiting for triage</em>
             </span>
-            <span className="mono subtle">{inboxCount}</span>
+            <span className="mono subtle" title={`${String(inboxCount)} unassigned threads`}>
+              {inboxCount}
+            </span>
           </button>
-          {matches.map((w) => (
-            <button
-              type="button"
-              key={w.bac_id}
-              className={'ws-picker-row' + (currentWsId === w.bac_id ? ' on' : '')}
-              onClick={() => {
-                onSelect(w.bac_id);
-              }}
-            >
-              <span className="ws-picker-name">
-                {w.title}
-                {w.parentId !== undefined ? <em className="subtle"> · sub</em> : null}
-              </span>
-              <span className="mono subtle">{threadCountFor(w.bac_id)}</span>
-            </button>
-          ))}
+          {hierarchical.map(({ ws: w, depth }) => {
+            const count = threadCountFor(w.bac_id);
+            return (
+              <button
+                type="button"
+                key={w.bac_id}
+                className={
+                  'ws-picker-row' +
+                  (currentWsId === w.bac_id ? ' on' : '') +
+                  (depth > 0 ? ' is-child' : '')
+                }
+                onClick={() => {
+                  onSelect(w.bac_id);
+                }}
+                title={
+                  depth > 0
+                    ? `Sub-workstream (nested ${String(depth)} deep)`
+                    : 'Top-level workstream'
+                }
+                style={depth > 0 ? { paddingLeft: `${String(12 + depth * 14)}px` } : undefined}
+              >
+                <span className="ws-picker-name">
+                  {depth > 0 ? <span className="ws-picker-indent">└ </span> : null}
+                  {w.title}
+                </span>
+                <span className="mono subtle" title={`${String(count)} threads in ${w.title}`}>
+                  {count}
+                </span>
+              </button>
+            );
+          })}
         </div>
         {creating ? (
           <form
@@ -7096,7 +7765,7 @@ function WorkstreamPicker({
               if (trimmed.length === 0) {
                 return;
               }
-              onCreate(trimmed, parentForNew, draftDescription.trim());
+              onCreate(trimmed, createParent, draftDescription.trim());
               setDraftTitle('');
               setDraftDescription('');
               setCreating(false);
@@ -7105,14 +7774,24 @@ function WorkstreamPicker({
             <input
               type="text"
               className="ws-picker-create-input"
-              placeholder={
-                parentForNew === null ? 'New workstream name…' : 'New sub-workstream under current…'
-              }
+              // Unified placeholder — the user already knows whether
+              // they're creating a top-level workstream or a sub-
+              // workstream from the button they just clicked (the
+              // workstream-detail panel button labels are explicit).
+              // The placeholder doesn't need to repeat that context;
+              // a uniform "New workstream name…" reads cleaner and
+              // matches the e2e suite's expectations.
+              placeholder="New workstream name…"
               value={draftTitle}
               autoFocus
               onChange={(e) => {
                 setDraftTitle(e.target.value);
               }}
+              aria-label={
+                createParent === null
+                  ? 'New top-level workstream name'
+                  : `New sub-workstream under ${parentTitle ?? 'current'}`
+              }
             />
             {/* Optional description — flows into the suggester's
                 lexical match + cold-start centroid, so multi-language
@@ -7144,15 +7823,32 @@ function WorkstreamPicker({
             </button>
           </form>
         ) : (
-          <button
-            type="button"
-            className="ws-picker-create-trigger"
-            onClick={() => {
-              setCreating(true);
-            }}
-          >
-            + New workstream{parentForNew !== null ? ' under current' : ''}
-          </button>
+          <div className="ws-picker-create-triggers">
+            {parentForNew !== null ? (
+              <button
+                type="button"
+                className="ws-picker-create-trigger"
+                onClick={() => {
+                  setCreateParent(parentForNew);
+                  setCreating(true);
+                }}
+                title={`Create a sub-workstream nested under ${parentTitle ?? 'current'}`}
+              >
+                + New under {parentTitle ?? 'current'}
+              </button>
+            ) : null}
+            <button
+              type="button"
+              className="ws-picker-create-trigger"
+              onClick={() => {
+                setCreateParent(null);
+                setCreating(true);
+              }}
+              title="Create a new top-level workstream (not nested under any other)"
+            >
+              + New top-level workstream
+            </button>
+          </div>
         )}
       </div>
     </div>

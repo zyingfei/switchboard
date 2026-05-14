@@ -13,7 +13,23 @@ import {
 export type AutoApplyTabSessionAttributionStatus =
   | 'applied'
   | 'skipped-existing-attribution'
-  | 'skipped-policy';
+  | 'skipped-policy'
+  | 'skipped-disabled';
+
+// Env gate. Auto-apply is ON by default; the env is an opt-OUT for
+// users who want preview-only behavior. Set
+// SIDETRACK_TABSESSION_RESOLVER_AUTO_APPLY=0 (or 'false') to disable.
+// Auto-apply is reversible: the user's manual `user_asserted` move
+// always beats the synthesized `inferred` attribution on precedence
+// tie-break. Mirrors the URL-level gate in `urls/autoApply.ts`.
+export const TABSESSION_RESOLVER_AUTO_APPLY_ENV =
+  'SIDETRACK_TABSESSION_RESOLVER_AUTO_APPLY';
+
+const autoApplyEnabled = (): boolean => {
+  const raw = process.env[TABSESSION_RESOLVER_AUTO_APPLY_ENV];
+  if (raw === undefined || raw === '') return true;
+  return raw !== '0' && raw.toLowerCase() !== 'false';
+};
 
 export interface AutoApplyTabSessionAttributionResult {
   readonly status: AutoApplyTabSessionAttributionStatus;
@@ -57,6 +73,17 @@ export const autoApplyTabSessionAttribution = async (
     ...(input.policyTelemetry === undefined ? {} : { policyTelemetry: input.policyTelemetry }),
   });
 
+  // Env gate. We compute the resolution either way (cheap, side-effect-free)
+  // so the response surface in dryRun-like calls stays consistent. We just
+  // don't commit the event when auto-apply is off. Mirrors the URL gate.
+  if (!autoApplyEnabled()) {
+    return {
+      status: 'skipped-disabled',
+      resolution,
+      projection: beforeProjection,
+    };
+  }
+
   if (existing !== undefined && existing.source !== 'inferred') {
     return {
       status: 'skipped-existing-attribution',
@@ -69,6 +96,22 @@ export const autoApplyTabSessionAttribution = async (
   if (payload === null) {
     return {
       status: 'skipped-policy',
+      resolution,
+      projection: beforeProjection,
+    };
+  }
+
+  // Idempotency: when the existing inferred attribution already points
+  // to the same workstream, re-emitting only varies the dependencyKey
+  // in clientEventId and produces a byte-different but semantically
+  // identical event. Same feedback loop as `urls/autoApply.ts`.
+  if (
+    existing !== undefined &&
+    existing.source === 'inferred' &&
+    existing.workstreamId === payload.workstreamId
+  ) {
+    return {
+      status: 'skipped-existing-attribution',
       resolution,
       projection: beforeProjection,
     };

@@ -9,6 +9,25 @@
 
 export const URL_ATTRIBUTION_INFERRED = 'urls.attribution.inferred' as const;
 
+// User explicit "don't bother me about this URL" signal. Distinct from
+// `user.organized.item` with workstreamId:null (which is "this is a
+// meaningful page but doesn't belong to any workstream"). Ignoring is
+// stronger: hide the URL from Inbox, the workstream view, the
+// connections graph, and topic clusters. Reversible — the user can
+// un-ignore by reorganizing the URL into a workstream (which records
+// a `user.organized.item` event that supersedes the ignore).
+export const URL_IGNORED = 'urls.ignored' as const;
+
+export interface UrlIgnoredPayload {
+  readonly payloadVersion: 1;
+  readonly canonicalUrl: string;
+  // Optional reason taxonomy. Initially "noise" is the catch-all
+  // (login pages, ad redirects, admin panels). Future categories
+  // (e.g. 'duplicate-of', 'too-short-engagement') can be added
+  // without breaking back-compat.
+  readonly reason?: 'noise' | 'duplicate' | 'private';
+}
+
 export interface UrlAttributionInferredPayload {
   readonly payloadVersion: 1;
   readonly canonicalUrl: string;
@@ -43,6 +62,21 @@ const isDominantSource = (
 
 const isFiniteNumber = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value);
+
+const isIgnoreReason = (value: unknown): value is UrlIgnoredPayload['reason'] =>
+  value === undefined ||
+  value === 'noise' ||
+  value === 'duplicate' ||
+  value === 'private';
+
+export const isUrlIgnoredPayload = (value: unknown): value is UrlIgnoredPayload => {
+  if (!isRecord(value)) return false;
+  return (
+    value['payloadVersion'] === 1 &&
+    isNonEmptyString(value['canonicalUrl']) &&
+    isIgnoreReason(value['reason'])
+  );
+};
 
 export const isUrlAttributionInferredPayload = (
   value: unknown,

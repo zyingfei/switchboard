@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import App, { formatBuildTimestamp } from '../../entrypoints/sidepanel/App';
@@ -575,7 +575,12 @@ describe('live side-panel App wiring', () => {
     });
     fireEvent.click(screen.getByRole('tab', { name: 'Inbox' }));
     expect(await screen.findByText('Copy fail')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Move' }));
+    // Stage 5 polish — flat 4-action layout aligned with Current Tab.
+    // Both the Current Tab card and the Inbox card now render "Pick
+    // another…"; scope the click to the inbox card for this URL.
+    const inboxCard = await screen.findByTestId('tab-session-card-https://copy.fail');
+    fireEvent.click(within(inboxCard).getByRole('button', { name: 'Pick another…' }));
+    fireEvent.click(await screen.findByRole('button', { name: /^Sidetrack/ }));
 
     // Phase B routes attribute through /v1/visits/{url}/attribute.
     await waitFor(() => {
@@ -708,8 +713,9 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
-    expect(await screen.findByLabelText('Tab-session suggestion')).toHaveTextContent('Sibling');
-    fireEvent.click(screen.getByRole('button', { name: 'Yes' }));
+    const banner = await screen.findByLabelText('Tab-session suggestion');
+    expect(banner).toHaveTextContent('Sibling');
+    fireEvent.click(within(banner).getByRole('button', { name: "Yes, that's right" }));
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(

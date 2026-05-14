@@ -547,13 +547,23 @@ const fetchNeighbors = async (
 // a drain on every onAccepted call and runs in the background. After
 // our seed POSTs return we have to wait for the drain to complete
 // before reading the snapshot. Poll every 100ms until edgeCount has
-// been stable for `stableMs` consecutive milliseconds, then return.
+// been stable for `stableMs` consecutive milliseconds AND at least
+// one drain has produced edges, then return.
+//
+// `stableMs` (2500 ms default) is intentionally above the
+// materializer's DRAIN_DEBOUNCE_MS (1500 ms). Without that headroom
+// the helper can return after 600 ms of "stable" zero-edge polling
+// before the first drain fires — the snapshot looks empty and every
+// assertion downstream reads zero edges. `requireNonZero` (default
+// true) defends against the same race for callers that seed real
+// data; pass `false` for "this test seeds nothing on purpose".
 const waitForSnapshotToStabilize = async (
   comp: TestCompanion,
-  options: { stableMs?: number; timeoutMs?: number } = {},
+  options: { stableMs?: number; timeoutMs?: number; requireNonZero?: boolean } = {},
 ): Promise<void> => {
-  const stableMs = options.stableMs ?? 600;
+  const stableMs = options.stableMs ?? 2_500;
   const timeoutMs = options.timeoutMs ?? 30_000;
+  const requireNonZero = options.requireNonZero ?? true;
   const startedMs = Date.now();
   let lastCount = -1;
   let stableSinceMs = 0;
@@ -561,7 +571,8 @@ const waitForSnapshotToStabilize = async (
     const all = (await apiGet(comp, '/v1/connections')) as ConnectionsEnvelope;
     const count = all.data.snapshot.edgeCount;
     if (count === lastCount) {
-      if (Date.now() - stableSinceMs >= stableMs) return;
+      const stable = Date.now() - stableSinceMs >= stableMs;
+      if (stable && (!requireNonZero || count > 0)) return;
     } else {
       lastCount = count;
       stableSinceMs = Date.now();

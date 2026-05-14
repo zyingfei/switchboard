@@ -32,6 +32,14 @@ export interface SnippetLineage {
   readonly copyDot: { readonly replicaId: string; readonly seq: number };
   readonly pasteDot: { readonly replicaId: string; readonly seq: number };
   readonly match: 'exact' | 'fuzzy';
+  // Hash-only metrics from the copy event payload. Stored so the
+  // side-panel snippet card can render a useful primary line
+  // ("Code · 12 lines · 350 chars") instead of just the match
+  // strategy. Raw text is never propagated — privacy posture
+  // unchanged (rawTextStored stays false on the payload).
+  readonly charCount: number;
+  readonly lineCount: number;
+  readonly contentKindHint: SelectionCopiedPayload['contentKindHint'];
 }
 
 export interface SnippetProjection {
@@ -108,6 +116,9 @@ export const projectSnippetLineage = (events: readonly AcceptedEvent[]): Snippet
       copyDot: fuzzy.event.dot,
       pasteDot: paste.event.dot,
       match: exact === undefined ? 'fuzzy' : 'exact',
+      charCount: fuzzy.payload.charCount,
+      lineCount: fuzzy.payload.lineCount,
+      contentKindHint: fuzzy.payload.contentKindHint,
     });
   }
 

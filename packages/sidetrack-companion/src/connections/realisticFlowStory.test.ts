@@ -117,23 +117,25 @@ describe('connections — realistic two-flow narration (CVE + Switchboard)', () 
     expect(sub.edges.some((e) => e.kind === 'thread_text_mentions_search_query')).toBe(true);
   });
 
-  it('YouTube visit anchor stays unattributed until Phase 2 tab-session attribution', () => {
-    // Phase 1 intentionally removes active-pointer visit attribution.
-    // Phase 2 restores visit_in_workstream from explicit
-    // tab-session attribution rather than workstream focus.
+  it('YouTube visit anchor surfaces visit_in_workstream from active-workstream stamping', () => {
+    // 2026-05 fix: the timeline observer stamps `workstreamId` on
+    // every event again, and the snapshot emits `visit_in_workstream`
+    // from `entry.workstreamId`. The earlier "Phase 2" gating that
+    // this test was pinning was a known gap (every consumer of
+    // `visit_in_workstream` saw empty arrays). Restored.
     const sub = subgraphForNode(snap, REALISTIC_FLOW_B_NODES.visits.youtube, 1);
     const ids = new Set(sub.nodes.map((n) => n.id));
     expect(ids.has(REALISTIC_FLOW_B_NODES.visits.youtube)).toBe(true);
-    expect(ids.has(REALISTIC_FLOW_B_NODES.workstream)).toBe(false);
-    expect(sub.edges.some((e) => e.kind === 'visit_in_workstream')).toBe(false);
+    expect(ids.has(REALISTIC_FLOW_B_NODES.workstream)).toBe(true);
+    expect(sub.edges.some((e) => e.kind === 'visit_in_workstream')).toBe(true);
   });
 
-  it('copy.fail homepage anchor stays unattributed until Phase 2 tab-session attribution', () => {
+  it('copy.fail homepage anchor surfaces visit_in_workstream from active-workstream stamping', () => {
     const sub = subgraphForNode(snap, REALISTIC_FLOW_A_NODES.visits.copyFail, 1);
     const ids = new Set(sub.nodes.map((n) => n.id));
     expect(ids.has(REALISTIC_FLOW_A_NODES.visits.copyFail)).toBe(true);
-    expect(ids.has(REALISTIC_FLOW_A_NODES.workstream)).toBe(false);
-    expect(sub.edges.some((e) => e.kind === 'visit_in_workstream')).toBe(false);
+    expect(ids.has(REALISTIC_FLOW_A_NODES.workstream)).toBe(true);
+    expect(sub.edges.some((e) => e.kind === 'visit_in_workstream')).toBe(true);
   });
 
   it('HN visit anchor surfaces zero connections — until the user pastes it (which Flow A does)', () => {

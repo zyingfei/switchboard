@@ -22,7 +22,15 @@ const event = (
 });
 
 describe('summarizeEdgeEventDrain', () => {
-  it('scans past the upload cap to evict local non-edge records in bulk', () => {
+  it('caps the upload batch at the route batch size; companion is the sole type gatekeeper', () => {
+    // The drain used to filter event types locally with a hand-
+    // maintained whitelist, which is the bug that hid
+    // `navigation.committed` for weeks (it captured but never
+    // uploaded). The new contract: send every buffered event to the
+    // companion, let the companion validate, and act on its
+    // `'invalid-event-type'` skip response on the next pass. This
+    // test pins that contract — the partition function now ONLY
+    // chunks by batch size; it never rejects locally.
     const batch = [
       event('navigation.committed', 1),
       event('engagement.interval.observed', 2),
@@ -30,16 +38,12 @@ describe('summarizeEdgeEventDrain', () => {
       event('navigation.committed', 4),
     ];
 
-    const partition = partitionEdgeEventDrainBatch(
-      batch,
-      new Set(['engagement.interval.observed', 'engagement.session.aggregated']),
-      1,
-    );
+    const partition = partitionEdgeEventDrainBatch(batch, 3);
 
-    expect(partition.routeBatch.map((e) => e.lamport)).toEqual([2]);
-    expect(partition.locallyRejectedBatch.map((e) => e.lamport)).toEqual([1, 4]);
-    expect(partition.evictedByType).toEqual({ 'navigation.committed': 2 });
-    expect(partition.skippedByReason).toEqual({ 'invalid-event-type': 2 });
+    expect(partition.routeBatch.map((e) => e.lamport)).toEqual([1, 2, 3]);
+    expect(partition.locallyRejectedBatch).toEqual([]);
+    expect(partition.evictedByType).toEqual({});
+    expect(partition.skippedByReason).toEqual({});
   });
 
   it('keeps uploaded accounting separate from permanent skip eviction', () => {

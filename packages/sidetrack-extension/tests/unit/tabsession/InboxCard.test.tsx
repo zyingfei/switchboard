@@ -45,18 +45,41 @@ const suggestion = (): TabSessionResolutionResult => ({
 });
 
 describe('InboxCard', () => {
-  it('moves a tab session to the selected workstream', () => {
+  it('confirms the suggested workstream via "Yes, that\'s right"', () => {
     const onAttribute = vi.fn();
-    render(<InboxCard record={record()} workstreams={workstreams} onAttribute={onAttribute} />);
+    render(
+      <InboxCard
+        record={record()}
+        suggestion={suggestion()}
+        workstreams={workstreams}
+        onAttribute={onAttribute}
+      />,
+    );
 
-    expect(screen.getByTitle('No tab-session attribution')).toHaveTextContent('?');
-    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'ws_switchboard' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Move' }));
-
+    fireEvent.click(screen.getByRole('button', { name: "Yes, that's right" }));
     expect(onAttribute).toHaveBeenCalledWith('tses_test', 'ws_switchboard');
   });
 
-  it('dismisses a tab session back to the inbox with a null attribution', () => {
+  it('opens the workstream picker via "Pick another…"', () => {
+    const onAttribute = vi.fn();
+    const onPickAnother = vi.fn();
+    render(
+      <InboxCard
+        record={record()}
+        workstreams={workstreams}
+        onAttribute={onAttribute}
+        onPickAnother={onPickAnother}
+      />,
+    );
+
+    expect(screen.getByTitle('No attribution')).toHaveTextContent('?');
+    fireEvent.click(screen.getByRole('button', { name: 'Pick another…' }));
+
+    expect(onPickAnother).toHaveBeenCalledWith('tses_test');
+    expect(onAttribute).not.toHaveBeenCalled();
+  });
+
+  it('dismisses with null attribution via "Not in any stream"', () => {
     const onAttribute = vi.fn();
     render(
       <InboxCard
@@ -73,35 +96,67 @@ describe('InboxCard', () => {
       />,
     );
 
-    expect(screen.getByTitle('Attributed to Security (user_asserted)')).toHaveTextContent(
-      'Security',
-    );
-    fireEvent.click(screen.getByRole('button', { name: 'Not in any workstream' }));
+    expect(screen.getByTitle('Moved here by you: Security')).toHaveTextContent('Security');
+    fireEvent.click(screen.getByRole('button', { name: 'Not in any stream' }));
 
     expect(onAttribute).toHaveBeenCalledWith('tses_test', null);
   });
 
-  it('renders resolver suggestions as outlined attribution and default move target', () => {
+  it('writes a urls.ignored event via "Ignore (admin / noise)"', () => {
     const onAttribute = vi.fn();
+    const onIgnore = vi.fn();
+    render(
+      <InboxCard
+        record={record()}
+        workstreams={workstreams}
+        onAttribute={onAttribute}
+        onIgnore={onIgnore}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Ignore (admin / noise)' }));
+    expect(onIgnore).toHaveBeenCalledWith('tses_test', 'noise');
+    expect(onAttribute).not.toHaveBeenCalled();
+  });
+
+  it('hides "Yes, that\'s right" when the URL is already attributed', () => {
+    render(
+      <InboxCard
+        record={record({
+          currentAttribution: {
+            workstreamId: 'ws_security',
+            source: 'user_asserted',
+            observedAt: '2026-05-10T10:06:00.000Z',
+            clientEventId: 'evt-1',
+          },
+        })}
+        suggestion={suggestion()}
+        workstreams={workstreams}
+        onAttribute={vi.fn()}
+      />,
+    );
+    // The other three flat actions remain so the user can still
+    // reorganize, dismiss, or ignore from any state.
+    expect(screen.queryByRole('button', { name: "Yes, that's right" })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Pick another…' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Not in any stream' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Ignore (admin / noise)' })).toBeInTheDocument();
+  });
+
+  it('renders resolver suggestions as outlined attribution + provenance line', () => {
     render(
       <InboxCard
         record={record()}
         suggestion={suggestion()}
         workstreams={workstreams}
-        onAttribute={onAttribute}
+        onAttribute={vi.fn()}
       />,
     );
 
     expect(screen.getByTitle('Suggested by Sidetrack: Switchboard')).toHaveTextContent(
       'Switchboard',
     );
-    // New provenance line surfaces the target path + dominant source,
-    // and uses "Best guess" vs "Suggested" depending on whether the
-    // resolver's policy already produced a decision-level workstreamId.
     expect(screen.getByText(/Suggested: Switchboard · ppr/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Move' }));
-
-    expect(onAttribute).toHaveBeenCalledWith('tses_test', 'ws_switchboard');
   });
 
   it('caps inbox rendering at 50 records per panel session', () => {

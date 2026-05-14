@@ -392,12 +392,17 @@ interface ConnectionsEnvelope {
   };
 }
 
+// `stableMs` (2500 ms default) is above the materializer's 1500 ms
+// drain debounce so we don't declare "stable" before the first drain
+// fires. `requireNonZero` (default true) blocks "stable at zero" for
+// callers that seed real data.
 const waitForSnapshotToStabilize = async (
   comp: TestCompanion,
-  options: { stableMs?: number; timeoutMs?: number } = {},
+  options: { stableMs?: number; timeoutMs?: number; requireNonZero?: boolean } = {},
 ): Promise<void> => {
-  const stableMs = options.stableMs ?? 600;
+  const stableMs = options.stableMs ?? 2_500;
   const timeoutMs = options.timeoutMs ?? 30_000;
+  const requireNonZero = options.requireNonZero ?? true;
   const startedMs = Date.now();
   let lastCount = -1;
   let stableSinceMs = 0;
@@ -405,7 +410,8 @@ const waitForSnapshotToStabilize = async (
     const all = (await apiGet(comp, '/v1/connections')) as ConnectionsEnvelope;
     const count = all.data.snapshot.edgeCount;
     if (count === lastCount) {
-      if (Date.now() - stableSinceMs >= stableMs) return;
+      const stable = Date.now() - stableSinceMs >= stableMs;
+      if (stable && (!requireNonZero || count > 0)) return;
     } else {
       lastCount = count;
       stableSinceMs = Date.now();

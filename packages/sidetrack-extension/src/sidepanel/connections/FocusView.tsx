@@ -75,6 +75,20 @@ export const FocusView = ({
   const [renameError, setRenameError] = useState<string | null>(null);
   const [relabelingVisitId, setRelabelingVisitId] = useState<string | null>(null);
   const [relabelError, setRelabelError] = useState<string | null>(null);
+  // Visits without a saved engagement class don't show a dropdown by
+  // default — for typical users the labeling UI is noise (every row
+  // would say "Parked", which the user reads as wrong data). Power
+  // users click "Label" to expose the picker for that row.
+  const [labelingVisitIds, setLabelingVisitIds] = useState<ReadonlySet<string>>(
+    () => new Set<string>(),
+  );
+  const openLabeler = (visitId: string): void => {
+    setLabelingVisitIds((current) => {
+      const next = new Set(current);
+      next.add(visitId);
+      return next;
+    });
+  };
 
   const toggle = (topicId: string): void => {
     setExpandedTopicIds((current) => {
@@ -219,17 +233,27 @@ export const FocusView = ({
               </div>
             ) : null}
             <div className="cx-focus-meta">
-              <span>{topic.memberCount} members</span>
-              <span>cohesion {topic.cohesion.toFixed(2)}</span>
+              <span>
+                {String(topic.memberCount)} {topic.memberCount === 1 ? 'page' : 'pages'}
+              </span>
+              {topic.cohesion > 0 ? (
+                <span
+                  title="Average pairwise similarity of pages in this topic. Higher means tighter cluster."
+                >
+                  cohesion {topic.cohesion.toFixed(2)}
+                </span>
+              ) : null}
               {topic.dominantWorkstreamId === undefined ? null : (
                 <span className="cx-focus-chip">Workstream</span>
               )}
             </div>
-            <div className="cx-focus-bar" aria-hidden>
-              <span
-                style={{ width: `${String(Math.max(0, Math.min(1, topic.cohesion)) * 100)}%` }}
-              />
-            </div>
+            {topic.cohesion > 0 ? (
+              <div className="cx-focus-bar" aria-hidden>
+                <span
+                  style={{ width: `${String(Math.max(0, Math.min(1, topic.cohesion)) * 100)}%` }}
+                />
+              </div>
+            ) : null}
             <button
               type="button"
               className="cx-focus-expand"
@@ -243,8 +267,12 @@ export const FocusView = ({
             {expanded ? (
               <div className="cx-focus-visits">
                 {visits.map((visit) => {
-                  const currentClass =
-                    engagementClassesByVisit[visit.id] ?? 'parked_background';
+                  const definedClass = engagementClassesByVisit[visit.id];
+                  const showLabeler =
+                    onEngagementRelabel !== undefined &&
+                    (definedClass !== undefined || labelingVisitIds.has(visit.id));
+                  const currentClass = definedClass ?? 'parked_background';
+                  const hasFocusedTime = visit.focusedWindowMs > 0;
                   return (
                     <div className="cx-focus-visit" key={visit.id}>
                       <button
@@ -254,15 +282,27 @@ export const FocusView = ({
                           onVisitClick(visit.id);
                         }}
                         data-testid={`focus-visit-${visit.id}`}
+                        title={visit.id}
                       >
                         <span
-                          className={`cx-engagement-dot cx-engagement-${currentClass}`}
+                          className={`cx-engagement-dot ${
+                            definedClass === undefined
+                              ? 'cx-engagement-unset'
+                              : `cx-engagement-${definedClass}`
+                          }`}
                           data-testid={`engagement-dot-${visit.id}`}
                         />
-                        <span>{visit.label}</span>
-                        <span className="cx-mono cx-dim">{visit.focusedWindowMs} ms</span>
+                        <span className="cx-focus-visit-title">{visit.label}</span>
+                        {hasFocusedTime ? (
+                          <span
+                            className="cx-mono cx-dim cx-focus-visit-ms"
+                            title="Time the visit was focused (ms)"
+                          >
+                            {String(visit.focusedWindowMs)} ms
+                          </span>
+                        ) : null}
                       </button>
-                      {onEngagementRelabel === undefined ? null : (
+                      {onEngagementRelabel === undefined ? null : showLabeler ? (
                         <select
                           className="cx-focus-visit-select"
                           aria-label={`Relabel engagement for ${visit.label}`}
@@ -282,6 +322,18 @@ export const FocusView = ({
                             </option>
                           ))}
                         </select>
+                      ) : (
+                        <button
+                          type="button"
+                          className="cx-focus-visit-labelbtn"
+                          onClick={() => {
+                            openLabeler(visit.id);
+                          }}
+                          data-testid={`focus-visit-label-${visit.id}`}
+                          title="Label engagement (researcher feature)"
+                        >
+                          Label
+                        </button>
                       )}
                     </div>
                   );

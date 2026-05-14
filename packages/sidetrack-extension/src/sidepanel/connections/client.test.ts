@@ -108,6 +108,42 @@ describe('connections client helpers', () => {
     ]);
   });
 
+  it('reads the real cosine + threshold from visit_resembles_visit edge metadata', () => {
+    // RCA: this reason was previously hardcoded to { cosine: 0.85,
+    // threshold: 0.85 } in client.ts because the companion never
+    // persisted the values. Once the snapshot.ts emitter passes them
+    // through, the UI MUST read them off the edge. If anyone ever
+    // hardcodes a number again, this test fails.
+    const resultWithSim: typeof result = {
+      ...result,
+      snapshot: {
+        ...result.snapshot,
+        edges: [
+          ...result.snapshot.edges,
+          {
+            id: 'edge:resembles',
+            kind: 'visit_resembles_visit',
+            fromNodeId: 'timeline-visit:https://example.test/a',
+            toNodeId: 'timeline-visit:https://example.test/b',
+            observedAt: '2026-05-08T10:00:00.000Z',
+            producedBy: { source: 'visit-similarity', revisionId: 'rev-1' },
+            confidence: 'inferred',
+            metadata: { cosine: 0.93, threshold: 0.82 },
+          },
+        ],
+      },
+    };
+    const reasons = whyRelatedReasonsFromConnections(
+      resultWithSim,
+      'timeline-visit:https://example.test/a',
+    );
+    expect(reasons).toContainEqual({
+      code: 'COSINE_ABOVE_THRESHOLD',
+      cosine: 0.93,
+      threshold: 0.82,
+    });
+  });
+
   it('uses the existing runtime message proxy for topic label and why-related reads', async () => {
     setConnectionsClientTransportForTests(() => Promise.resolve({ ok: true, data: result }));
 

@@ -498,6 +498,102 @@ button:disabled {
   border-color: var(--accent, #0b57d0);
   color: var(--accent, #0b57d0);
 }
+
+/* Suggestion stats line under the Current Tab badge. Shows the
+   resolver's bucket label + raw stats on hover + an optional
+   alternatives list. */
+.suggestion-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  font-size: 11px;
+}
+.suggestion-stats-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.suggestion-stats-target {
+  font-weight: 500;
+  color: var(--ink-1);
+}
+.suggestion-stats-confidence {
+  color: var(--ink-2);
+}
+.suggestion-stats.is-highly-likely .suggestion-stats-confidence {
+  color: var(--green);
+}
+.suggestion-stats.is-likely .suggestion-stats-confidence {
+  color: var(--green);
+  opacity: 0.85;
+}
+.suggestion-stats.is-possible .suggestion-stats-confidence {
+  color: var(--amber);
+}
+.suggestion-stats.is-unlikely .suggestion-stats-confidence,
+.suggestion-stats.is-not-likely .suggestion-stats-confidence {
+  color: var(--ink-3);
+}
+.suggestion-stats.is-empty .suggestion-stats-target {
+  color: var(--ink-3);
+  font-style: italic;
+}
+.suggestion-stats-info {
+  cursor: help;
+  color: var(--ink-3);
+  font-size: 11px;
+  user-select: none;
+}
+.suggestion-stats-source {
+  color: var(--ink-3);
+  font-size: 10px;
+}
+.suggestion-stats-alts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--ink-3);
+  font-size: 10px;
+  padding-top: 2px;
+}
+.suggestion-stats-alt {
+  color: var(--ink-2);
+}
+
+/* Action bar under the Current Tab badge. Flex-wrap so the row
+   collapses cleanly across the 3-vs-4 cases:
+     - 4 buttons (suggestion present + URL unattributed): wrap 2+2.
+     - 3 buttons (no suggestion OR already attributed): single row.
+   The 2x2 grid version forced 2 lines with an empty cell for any
+   3-button state — the user's screenshot showed that ugly layout.
+   Same flex pattern is used by the InboxCard + SuggestionBanner
+   action rows so all three surfaces feel identical. */
+.tab-attribution-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 0 0 0;
+  align-items: center;
+}
+.tab-attribution-card-action {
+  background: transparent;
+  border: 1px solid var(--hair);
+  padding: 3px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--ink-2);
+}
+.tab-attribution-card-action:hover {
+  border-color: var(--accent, #0b57d0);
+  color: var(--accent, #0b57d0);
+}
+.tab-attribution-card-action.primary {
+  background: var(--green-bg);
+  border-color: var(--green-tint);
+  color: var(--green);
+}
 /* Explicit "Go to" affordance for tab-session cards (InboxCard) and the
    current-tab card. Mirrors `.thread-actions .thread-action-icon` from
    the workstream thread rows so the affordance reads identically across
@@ -543,6 +639,29 @@ button:disabled {
 .tab-session-list {
   display: grid;
   gap: 6px;
+}
+
+/* Stage 5 polish — Inbox search row. Sits between sec-head and the
+   card list. Pure client-side filter over the already-loaded inbox
+   items, so behavior matches a quick scan. */
+.tab-session-inbox-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0 6px 0;
+}
+.tab-session-inbox-search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 4px 8px;
+  border: var(--hair-soft);
+  border-radius: 4px;
+  background: var(--paper);
+  color: var(--ink-1);
+  font-size: 12px;
+}
+.tab-session-inbox-search-input::placeholder {
+  color: var(--ink-3);
 }
 
 .tab-session-card {
@@ -616,21 +735,69 @@ button:disabled {
   font-size: 10px;
 }
 
-.tab-session-badge.is-asserted {
+/* user-asserted: you moved it (solid green). */
+.tab-session-badge.is-user-asserted {
   background: var(--green-bg);
   color: var(--green);
   border-color: var(--green-tint);
 }
 
+/* inferred: resolver auto-applied. Solid but tinted differently so
+   it's easy to scan "I did this" vs "the system did this." */
+.tab-session-badge.is-inferred {
+  background: var(--blue-bg, var(--green-bg));
+  color: var(--blue, var(--green));
+  border-color: var(--blue-tint, var(--green-tint));
+}
+
+/* thread: derived from thread→workstream membership. Softer treatment
+   because it's a transitive derivation, not a direct user action. */
+.tab-session-badge.is-thread {
+  background: var(--paper);
+  color: var(--ink-2);
+  border-color: var(--hair-soft);
+  border-style: dotted;
+}
+
+/* suggested: not applied yet, resolver has a guess. Dashed border
+   distinguishes it from any "this is settled" state. */
 .tab-session-badge.is-suggested {
   background: var(--paper);
   color: var(--amber);
   border-color: var(--amber-tint);
+  border-style: dashed;
+}
+
+/* ignored: user explicitly muted this URL. Struck-through + faded. */
+.tab-session-badge.is-ignored {
+  background: var(--ink-0);
+  color: var(--ink-3);
+  border-color: var(--hair-soft);
+  text-decoration: line-through;
 }
 
 .tab-session-badge.is-empty {
   background: var(--ink-0);
   color: var(--ink-3);
+}
+
+.tab-session-badge-marker {
+  margin-right: 4px;
+  font-size: 9px;
+  opacity: 0.85;
+}
+
+.tab-session-badge-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Backwards-compat: keep `.is-asserted` styled like user-asserted in
+   case any code still emits it. */
+.tab-session-badge.is-asserted {
+  background: var(--green-bg);
+  color: var(--green);
+  border-color: var(--green-tint);
 }
 
 .tab-session-suggestion-banner {
@@ -658,15 +825,15 @@ button:disabled {
 }
 
 .tab-session-suggestion-actions {
-  display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   align-items: center;
 }
 
 .tab-session-actions {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   align-items: center;
 }
@@ -3286,6 +3453,11 @@ textarea.preview-body:focus {
 .icon-btn.pulsing {
   animation: icon-btn-pulse 4s ease-in-out infinite;
 }
+.icon-btn.warn {
+  color: #6b4500;
+  border-color: #d6a256;
+  background: #fff8ec;
+}
 /* Wider variant — used for the Auto/Manual capture-mode toggle.
    Carries an icon + a tiny uppercase mono label so the active mode
    reads at a glance without a tooltip. The grid layout switches to
@@ -3627,6 +3799,42 @@ textarea.preview-body:focus {
   cursor: pointer;
   font-size: 12px;
   margin-top: 4px;
+}
+/* Side-by-side dual-create affordances: "under current" + "top-level".
+   Stack on narrow widths. */
+.ws-picker-create-triggers {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+.ws-picker-create-triggers .ws-picker-create-trigger {
+  flex: 1 1 140px;
+  margin-top: 0;
+}
+
+/* Column header above the workstream list — clarifies what the
+   right-hand count means. */
+.ws-picker-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--rule, #d4cdb8);
+  margin-bottom: 4px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* Indented sub-workstream row + leading tree connector. */
+.ws-picker-row.is-child {
+  color: var(--ink-2, #4a453d);
+}
+.ws-picker-indent {
+  color: var(--ink-3, #7a7165);
+  opacity: 0.7;
+  margin-right: 2px;
 }
 .ws-picker-create {
   display: flex;
@@ -4502,6 +4710,16 @@ input.thread-turn-annotate-input {
 .sp-status-pill.err {
   border-color: #b91c1c;
   color: #b91c1c;
+}
+.sp-status-pill.ok {
+  border-color: #5fa66f;
+  color: #166534;
+}
+.sp-status-pill-btn {
+  padding: 0 4px;
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
 }
 .sp-status-dot {
   width: 6px;
@@ -5557,6 +5775,129 @@ button.btn-link.thread-dispatched-name:hover {
   gap: 8px;
   padding: 12px;
 }
+
+/* Stage 5 polish — pipeline strip. Sits above the per-lane sections
+   so the user sees the capture→…→sync flow at a glance before
+   diving in. Each stage is a soft-bordered chip with a status dot;
+   the arrow between them makes the direction explicit. */
+.hp-pipeline {
+  padding: 10px 12px 8px 12px;
+  border-bottom: 1px solid var(--rule, #d4cdb8);
+  background: var(--paper-light, #fbf7ee);
+}
+.hp-pipeline-head {
+  font-size: 10px;
+  font-family: var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.7px;
+  color: var(--ink-3);
+  margin-bottom: 6px;
+}
+.hp-pipeline-flow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.hp-pipeline-stage-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.hp-pipeline-stage {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 3px 8px;
+  border: 1px solid var(--rule-soft, #e5ddc9);
+  border-radius: 6px;
+  background: var(--paper);
+  min-width: 0;
+}
+.hp-pipeline-stage.is-ok {
+  border-color: var(--green-tint, #b6dbc1);
+}
+.hp-pipeline-stage.is-warn {
+  border-color: var(--amber-tint, #d6a256);
+  background: var(--amber-bg, #fff8ec);
+}
+.hp-pipeline-stage.is-err {
+  border-color: var(--red-tint, #b91c1c);
+  background: #fff1f1;
+}
+.hp-pipeline-stage.is-idle {
+  opacity: 0.6;
+}
+.hp-pipeline-name {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ink-1);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.hp-pipeline-detail {
+  font-size: 9.5px;
+  color: var(--ink-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 140px;
+}
+.hp-pipeline-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ink-4, #a39a8c);
+  display: inline-block;
+}
+.hp-pipeline-dot.ok { background: #166534; }
+.hp-pipeline-dot.warn { background: #a16207; }
+.hp-pipeline-dot.err { background: #b91c1c; }
+.hp-pipeline-arrow {
+  color: var(--ink-4, #a39a8c);
+  font-size: 12px;
+  user-select: none;
+}
+
+/* Stage 5 polish — three-lane locality grouping. Visual separator
+   each section so "this lives in browser SW" vs "this lives in
+   companion" vs "this flows across replicas" is unambiguous. */
+.hp-lane {
+  border-top: 1px solid var(--rule, #d4cdb8);
+}
+.hp-lane:first-of-type {
+  border-top: 0;
+}
+.hp-lane-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 12px 4px 12px;
+  font-size: 10px;
+  font-family: var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.7px;
+  color: var(--ink-3);
+}
+.hp-lane-icon {
+  font-size: 12px;
+}
+.hp-lane-label {
+  font-weight: 500;
+}
+.hp-lane-local .hp-lane-head {
+  color: var(--accent, #0b57d0);
+}
+.hp-lane-companion .hp-lane-head {
+  color: var(--ink-2);
+}
+.hp-lane-sync .hp-lane-head {
+  color: var(--green, #2d7a3e);
+}
+.hp-state.healthy { color: var(--green, #2d7a3e); }
+.hp-state.degraded { color: var(--amber, #b48a2e); }
+.hp-state.failed { color: var(--red, #a64141); }
 .hp-empty {
   padding: 28px 18px;
   display: grid;
@@ -7525,6 +7866,154 @@ pre.diff {
   text-transform: uppercase; color: var(--ink-3);
 }
 .cx-anchorbar .cx-spacer { flex: 1; }
+/* Stage 5 polish — Connections refactor (Phase C usability):
+   browser-style back/forward + refresh buttons in the anchor bar
+   so drilling into a neighbor and returning is one click. */
+.cx-anchorbar-nav {
+  display: inline-flex; gap: 2px;
+  border: 1px solid var(--rule);
+  border-radius: var(--rad-m);
+  overflow: hidden;
+}
+.cx-anchor-nav-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 24px;
+  padding: 0;
+  border: 0;
+  background: var(--paper-light);
+  color: var(--ink-1);
+  font-family: var(--mono); font-size: 14px;
+  cursor: pointer;
+  user-select: none;
+}
+.cx-anchor-nav-btn:hover:enabled { background: var(--paper-tinted); }
+.cx-anchor-nav-btn:disabled {
+  color: var(--ink-3); cursor: default; opacity: 0.6;
+}
+.cx-anchor-nav-btn-wide {
+  width: auto;
+  padding: 0 8px;
+  font-family: var(--body);
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+}
+/* Inline icon button — sits flush with the anchor chip, no border
+   group. Used for the "Find in Inbox" cross-surface affordance so
+   the anchor row stays single-line even when this is visible. */
+.cx-anchor-inline-btn {
+  border: 0;
+  background: transparent;
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+}
+.cx-anchor-inline-btn:hover:enabled { background: var(--paper-tinted); }
+/* Stage 5 polish — filter strip below the mode tabs. Compact row
+   that hosts the time-range control (and future filters) without
+   crowding the anchor bar. Renders only when there's a result. */
+.cx-filterbar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 14px 6px;
+  border-bottom: 1px solid var(--rule-soft, #e5ddc9);
+  background: var(--paper-light);
+}
+.cx-filterbar-label {
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  flex: none;
+}
+/* Stage 5 polish — Connections find-by-title search box.
+   Sits at the top of the left rail; ranked dropdown shows up to 8
+   hits across the loaded snapshot + workstream anchors + recents. */
+.cx-search { position: relative; }
+.cx-search-input {
+  flex: 1; min-width: 0;
+  border: 0; outline: 0;
+  background: transparent; color: var(--ink-1);
+  font: inherit;
+}
+.cx-search-clear {
+  width: 20px; height: 20px;
+  padding: 0; border: 0; background: transparent;
+  color: var(--ink-3); cursor: pointer;
+  font-size: 16px; line-height: 1;
+}
+.cx-search-clear:hover { color: var(--ink-1); }
+.cx-search-results {
+  position: absolute; top: 100%; left: 0; right: 0;
+  z-index: 12;
+  margin-top: 4px;
+  max-height: 320px; overflow-y: auto;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: var(--rad-s);
+  box-shadow: 0 6px 18px rgba(0,0,0,0.08);
+}
+.cx-search-empty {
+  padding: 10px 12px;
+  font-size: 12px; color: var(--ink-3);
+  line-height: 1.45;
+}
+.cx-search-loading {
+  padding: 6px 12px;
+  font-size: 11px;
+  border-bottom: 1px solid var(--rule-soft, #e5ddc9);
+}
+.cx-search-section-head {
+  padding: 6px 10px 4px;
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  background: var(--paper-light);
+  border-bottom: 1px solid var(--rule-soft, #e5ddc9);
+  border-top: 1px solid var(--rule-soft, #e5ddc9);
+}
+.cx-search-hit-snippet {
+  font-size: 11px;
+  color: var(--ink-2);
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cx-search-empty.warn {
+  color: #6b4500;
+}
+.cx-search-hit {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0; border-top: 1px solid var(--rule-soft, #e5ddc9);
+  background: transparent; color: var(--ink-1);
+  text-align: left; cursor: pointer;
+}
+.cx-search-hit:first-child { border-top: 0; }
+.cx-search-hit:hover { background: var(--paper-tinted); }
+.cx-search-hit .cx-node-icon { width: 20px; height: 20px; flex: none; }
+.cx-search-hit-body {
+  display: flex; flex-direction: column; min-width: 0; flex: 1;
+}
+.cx-search-hit-primary {
+  font-size: 12.5px; color: var(--ink-1);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cx-search-hit-secondary {
+  font-family: var(--mono);
+  font-size: 10px; color: var(--ink-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cx-search-hit-kind {
+  font-family: var(--mono);
+  font-size: 9px; letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  flex: none;
+}
 
 /* hop / filter pills */
 .cx-pill-group {
@@ -7547,8 +8036,8 @@ pre.diff {
 /* 3-column shell */
 .cx-cols { display: flex; flex: 1; min-height: 0; }
 .cx-col-l { width: 240px; border-right: var(--hair-soft); display: flex; flex-direction: column; min-height: 0; flex: none; }
-.cx-col-c { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
-.cx-col-r { width: 320px; border-left: var(--hair); display: flex; flex-direction: column; min-height: 0; background: var(--paper); flex: none; }
+.cx-col-c { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; overflow: auto; }
+.cx-col-r { width: 320px; border-left: var(--hair); display: flex; flex-direction: column; min-height: 0; background: var(--paper); flex: none; overflow: auto; }
 .cx-section { padding: 14px 16px; border-bottom: var(--hair-soft); }
 .cx-section h4 {
   margin: 0 0 8px;
@@ -7672,6 +8161,263 @@ pre.diff {
   background: var(--paper-tinted); color: var(--ink-3);
 }
 .cx-mode.is-active .cx-count { background: var(--signal-bg); color: var(--signal); }
+.cx-mode.is-disabled,
+.cx-mode:disabled {
+  color: var(--ink-3);
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.cx-mode.is-disabled:hover,
+.cx-mode:disabled:hover { color: var(--ink-3); }
+/* Stage 5 polish — Connections time-range pill bar in the filter row. */
+.cx-timerange {
+  position: relative;
+  margin-right: 4px;
+  flex-wrap: wrap;
+  gap: 2px;
+  /* Override `.cx-pill-group { overflow: hidden }` so the calendar
+     popover anchored to this container can extend below it instead
+     of being clipped (root cause of "Custom… does nothing"). */
+  overflow: visible;
+}
+.cx-timerange-hidden {
+  margin-left: 4px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: var(--paper-tinted);
+  color: var(--ink-3);
+  font-size: 10px;
+}
+.cx-timerange-active {
+  margin-left: 6px;
+  font-size: 10px;
+  color: var(--ink-3);
+}
+/* Stage 5 polish — calendar+quick-select popover.
+   Two-column layout matching the design mockup: month calendar
+   on the left, start/end fields + quick-select grid + actions on
+   the right. */
+.cx-timerange-popover {
+  position: absolute;
+  z-index: 14;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  width: max-content;
+  max-width: min(620px, calc(100vw - 16px));
+  padding: 14px;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0,0,0,0.10);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.cx-cal { display: flex; flex-direction: column; gap: 8px; }
+.cx-cal-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 2px;
+}
+.cx-cal-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink-1);
+  letter-spacing: 0.01em;
+}
+.cx-cal-nav {
+  width: 26px; height: 26px;
+  border: 0;
+  background: transparent;
+  color: var(--ink-2);
+  font-size: 16px;
+  line-height: 1;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.cx-cal-nav:hover { background: var(--paper-tinted); color: var(--ink-1); }
+.cx-cal-weekrow {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 2px;
+  padding: 0 2px;
+}
+.cx-cal-weekday {
+  text-align: center;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  color: var(--ink-3);
+}
+.cx-cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 2px;
+}
+.cx-cal-cell {
+  height: 30px;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink-1);
+  font-size: 12px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.cx-cal-cell:hover { background: var(--paper-tinted); }
+.cx-cal-cell.is-other-month { color: var(--ink-3); opacity: 0.5; }
+.cx-cal-cell.is-in-range { background: var(--amber-bg, #fcefd6); color: var(--ink-1); }
+.cx-cal-cell.is-endpoint {
+  background: var(--accent, #c2410c);
+  color: #fff;
+  font-weight: 600;
+}
+.cx-cal-cell.is-endpoint.is-in-range {
+  background: var(--accent, #c2410c);
+}
+.cx-cal-cell.is-today {
+  box-shadow: inset 0 0 0 1px var(--rule);
+}
+.cx-cal-tz {
+  display: flex; align-items: center; gap: 6px;
+  margin-top: 2px;
+  font-size: 10.5px;
+  color: var(--ink-3);
+}
+.cx-cal-side { display: flex; flex-direction: column; gap: 10px; }
+.cx-cal-section { display: flex; flex-direction: column; gap: 5px; }
+.cx-cal-section-head {
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  font-weight: 600;
+}
+.cx-cal-row { display: flex; gap: 6px; }
+.cx-cal-input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: var(--paper-light);
+  color: var(--ink-1);
+  font: inherit;
+  font-size: 12px;
+}
+.cx-cal-input:focus {
+  outline: 0;
+  border-color: var(--accent, #c2410c);
+}
+.cx-cal-quickgrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+.cx-cal-quick {
+  padding: 6px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: var(--paper-light);
+  color: var(--ink-1);
+  font-size: 12px;
+  cursor: pointer;
+}
+.cx-cal-quick:hover { background: var(--paper-tinted); }
+.cx-cal-quick-wide { grid-column: span 2; }
+.cx-cal-error {
+  font-size: 11px;
+  color: #b91c1c;
+}
+.cx-cal-actions {
+  display: flex; justify-content: flex-end; gap: 8px;
+  margin-top: 4px;
+}
+.cx-cal-cancel,
+.cx-cal-apply {
+  padding: 7px 16px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.cx-cal-cancel {
+  background: var(--paper-light);
+  border: 1px solid var(--rule);
+  color: var(--ink-1);
+}
+.cx-cal-apply {
+  background: var(--ink-1, #1a1a1a);
+  border: 1px solid var(--ink-1, #1a1a1a);
+  color: var(--paper);
+}
+.cx-cal-cancel:hover { background: var(--paper-tinted); }
+.cx-cal-apply:hover { opacity: 0.9; }
+
+/* Side-panel layout — two columns when ≥520px wide, stack below. */
+@media (min-width: 520px) {
+  .cx-timerange-popover {
+    display: grid;
+    grid-template-columns: minmax(260px, 1fr) minmax(220px, 1fr);
+    gap: 16px;
+  }
+  .cx-cal-tz { grid-column: 1 / 2; }
+  .cx-cal-actions { grid-column: 1 / -1; }
+}
+/* Stage 5 polish — Connections path-finder strip. Collapsible row
+   below the mode tabs; pills + arrows render the BFS chain. */
+.cx-pathfinder {
+  border-bottom: 1px solid var(--rule-soft, #e5ddc9);
+  background: var(--paper-light);
+}
+.cx-pathfinder-toggle {
+  display: flex; align-items: center; gap: 6px;
+  width: 100%;
+  padding: 6px 14px;
+  border: 0; background: transparent;
+  color: var(--ink-2);
+  font-size: 11.5px;
+  cursor: pointer;
+  text-align: left;
+}
+.cx-pathfinder-toggle:hover { color: var(--ink-1); background: var(--paper-tinted); }
+.cx-pathfinder-anchor { color: var(--ink-1); font-weight: 500; }
+.cx-pathfinder-body {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 0 14px 10px;
+}
+.cx-pathfinder-search { max-width: 380px; }
+.cx-pathfinder-status {
+  font-size: 11.5px;
+  padding: 4px 0;
+}
+.cx-pathfinder-status.warn { color: #6b4500; }
+.cx-pathfinder-chain {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 4px;
+  padding: 2px 0;
+}
+.cx-pathfinder-step { display: inline-flex; align-items: center; gap: 4px; }
+.cx-pathfinder-pill {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 3px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: var(--paper);
+  color: var(--ink-1);
+  font-size: 11.5px;
+  cursor: pointer;
+  max-width: 240px;
+}
+.cx-pathfinder-pill:hover { background: var(--paper-tinted); }
+.cx-pathfinder-pill .cx-node-icon { width: 18px; height: 18px; flex: none; }
+.cx-pathfinder-pill-label {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cx-pathfinder-arrow { color: var(--ink-3); }
+.cx-pathfinder-edgecount {
+  margin-left: 8px;
+  font-size: 10px;
+}
 
 /* Wave D surfaces */
 .cx-flow {
@@ -7680,43 +8426,210 @@ pre.diff {
   gap: 12px;
   padding: 16px;
 }
+.cx-flow-summary {
+  padding: 0 0 4px 0;
+  font-size: 10.5px;
+  line-height: 1.5;
+}
 .cx-flow-row {
   display: grid;
-  grid-template-columns: 120px 1fr;
+  grid-template-columns: 140px 1fr;
   gap: 12px;
   align-items: start;
+}
+.cx-flow-tab-host {
+  font-size: 10px;
+  color: var(--ink-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cx-flow-tab-life {
+  font-size: 10px;
+  color: var(--ink-3);
+}
+.cx-flow-segment-label {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  align-self: center;
+  margin: 0 4px;
+}
+.cx-flow-visit-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 200px;
+  padding: 12px;
+  border: 1px dashed var(--rule);
+  border-radius: var(--rad-s);
+  background: transparent;
+  font-size: 11px;
+  color: var(--ink-3);
+  text-align: center;
+}
+.cx-flow-visit-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.cx-flow-visit-provider,
+.cx-flow-visit-engagement {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: var(--paper-warm, var(--paper));
+  border: 1px solid var(--rule-soft);
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+.cx-flow-visit-search-query {
+  display: block;
+  font-style: italic;
+  font-size: 10.5px;
+  color: var(--ink-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cx-flow-visit-count {
+  font-size: 10px;
 }
 .cx-flow-tab {
   font-family: var(--mono);
   font-size: 10px;
   color: var(--ink-3);
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.cx-flow-tab-name {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  font-size: 10px;
+  color: var(--ink-2);
+}
+.cx-flow-tab-opener {
+  font-size: 10px;
+  color: var(--ink-3);
+  white-space: normal;
 }
 .cx-flow-visits {
   display: flex;
-  gap: 8px;
+  align-items: stretch;
+  gap: 4px;
   overflow-x: auto;
   padding-bottom: 4px;
+  min-width: 0;
+}
+.cx-flow-visit-cell {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+}
+.cx-flow-visit-wrap {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+.cx-flow-visit-open {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  background: var(--paper-light);
+  color: var(--ink-2);
+  font-size: 13px;
+  text-decoration: none;
+  opacity: 0.65;
+}
+.cx-flow-visit-wrap:hover .cx-flow-visit-open {
+  opacity: 1;
+  border-color: var(--rule);
+}
+.cx-flow-visit-open:hover { background: var(--paper-tinted); }
+.cx-flow-arrow {
+  font-size: 14px;
+  color: var(--ink-3);
+  user-select: none;
+  flex-shrink: 0;
 }
 .cx-flow-visit {
+  position: relative;
   min-width: 132px;
-  max-width: 180px;
+  max-width: 200px;
   border: 1px solid var(--rule);
   border-radius: var(--rad-s);
   background: var(--paper-light);
   color: var(--ink);
   padding: 8px;
   text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 .cx-flow-visit:hover { border-color: var(--signal-tint); background: var(--signal-bg); }
+.cx-flow-visit.is-anchor {
+  border-color: var(--accent, #c2410c);
+  background: var(--accent-bg, #fdf3eb);
+  box-shadow: 0 0 0 1px var(--accent, #c2410c);
+}
+.cx-flow-visit-anchor-mark {
+  position: absolute;
+  top: -8px;
+  left: 6px;
+  padding: 1px 6px;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--paper-light);
+  background: var(--accent, #c2410c);
+  border-radius: 999px;
+  pointer-events: none;
+}
 .cx-flow-visit-title {
   display: block;
   font-size: 12.5px;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cx-flow-visit-host {
+  font-size: 10.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cx-flow-visit-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-top: 2px;
+}
+.cx-flow-visit-duration {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--ink-2);
+  background: var(--paper-warm, var(--paper));
+  border: 1px solid var(--rule-soft);
+  border-radius: 999px;
+  padding: 1px 6px;
   white-space: nowrap;
 }
 .cx-flow-edges {
@@ -7854,13 +8767,41 @@ pre.diff {
   height: 8px;
   border-radius: 50%;
   background: var(--ink-3);
+  flex-shrink: 0;
 }
+.cx-engagement-unset {
+  background: transparent;
+  border: 1px solid var(--rule);
+}
+.cx-engagement-parked_background { background: var(--ink-3); }
 .cx-engagement-glanced { background: #9a8f74; }
 .cx-engagement-skimmed { background: #8a7a3a; }
 .cx-engagement-engaged_read { background: #4f6f52; }
 .cx-engagement-worked_on_reference { background: #3f5530; }
 .cx-engagement-source_extracted { background: #5c544a; }
 .cx-engagement-execution_source { background: #8b5a2b; }
+.cx-focus-visit-labelbtn {
+  font: 10px var(--mono);
+  padding: 3px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+.cx-focus-visit-labelbtn:hover {
+  background: var(--paper-tinted);
+  color: var(--ink-2);
+}
+.cx-focus-visit-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+.cx-focus-visit-ms { flex: none; }
 .cx-why,
 .cx-context-pack {
   display: flex;
@@ -8058,4 +8999,107 @@ pre.diff {
 .cx-recent-anchor .cx-recent-meta {
   font-family: var(--mono); font-size: 9.5px; color: var(--ink-3);
   letter-spacing: 0.05em;
+}
+/* Stage 5 polish — Connections refactor (Phase D). All previously
+   inline `style={{}}` objects from ConnectionsView migrated here so
+   layout/spacing has one source of truth. */
+.cx-recent-anchor-list { display: flex; flex-direction: column; gap: 4px; }
+.cx-recent-anchor-label {
+  flex: 1; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.cx-input-icon {
+  color: var(--ink-3); display: grid; place-items: center;
+}
+.cx-hops-range {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 11px;
+  font-family: var(--mono); color: var(--ink-3);
+}
+.cx-hops-range select {
+  font: inherit; color: inherit; background: transparent; border: 0;
+}
+.cx-section-last { border-bottom: 0; }
+.cx-section-padded { padding: 14px; }
+.cx-legend-text { display: flex; flex-direction: column; }
+.cx-legend-desc { font-size: 11.5px; color: var(--ink-3); }
+.cx-loading { padding: 16px; }
+.cx-note { padding: 14px 16px 0; }
+.cx-row-click {
+  display: flex; align-items: center; gap: 9px;
+  flex: 1; min-width: 0; min-height: 0;
+  padding: 0; border: 0;
+  background: transparent; color: inherit;
+  text-align: left; cursor: pointer;
+}
+.cx-orbit-host { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.cx-orbit-sector-top { left: 50%; top: 12px; transform: translateX(-50%); }
+.cx-orbit-sector-right { right: 12px; top: 50%; transform: translateY(-50%); }
+.cx-orbit-sector-bottom { left: 50%; bottom: 12px; transform: translateX(-50%); }
+.cx-orbit-sector-left { left: 12px; top: 50%; transform: translateY(-50%); }
+.cx-prov-close {
+  background: transparent; border: 0; color: var(--ink-3);
+  cursor: pointer; display: grid; place-items: center;
+  width: 24px; height: 24px;
+}
+.cx-prov-arrow-label {
+  font-size: 9px; letter-spacing: 0.06em; text-transform: uppercase;
+}
+.cx-prov-feedback { padding-top: 10px; }
+.cx-prov-empty { display: block; }
+.cx-prov-empty-head {
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--ink-3); margin-bottom: 8px;
+}
+.cx-prov-empty-body {
+  margin-top: 14px; font-family: var(--body); font-size: 13px;
+  color: var(--ink-3); line-height: 1.55;
+}
+/* Stage 5 polish — Connections refactor (Phase C usability) —
+   improved loading and empty states. The spinner-dot is a
+   minimal-CSS pulsing indicator; the quickpick lets users start
+   with the most recent anchors without typing anything. */
+.cx-loading-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 16px;
+}
+.cx-spinner-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--accent, #0b57d0);
+  animation: cx-spinner-pulse 1.2s ease-in-out infinite;
+  flex: none;
+}
+@keyframes cx-spinner-pulse {
+  0%, 100% { opacity: 0.35; transform: scale(0.85); }
+  50%      { opacity: 1.0;  transform: scale(1.0); }
+}
+.cx-empty-quickpick {
+  margin-top: 16px;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
+  max-width: 480px;
+}
+.cx-empty-quickpick-btn {
+  padding: 4px 10px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: var(--paper-light);
+  color: var(--ink-1);
+  font-size: 12px;
+  cursor: pointer;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cx-empty-quickpick-btn:hover { background: var(--paper-tinted); }
+.cx-empty kbd {
+  display: inline-block;
+  padding: 1px 5px;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  background: var(--paper-light);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink-2);
 }

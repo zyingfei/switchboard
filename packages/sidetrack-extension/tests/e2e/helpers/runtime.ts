@@ -21,28 +21,57 @@ let stealthExperimentWarningPrinted = false;
 // gets baseEnvPort + cdpAllocationIndex.
 let cdpAllocationIndex = 0;
 
-// Patchright extends page.evaluate with a 3rd `isolatedContext: false` param
-// that forces evaluation in the page's main world. Without it, patchright
-// runs page.evaluate in an isolated context where chrome-extension page APIs
-// (chrome.runtime, chrome.storage, …) are NOT bound. Stock Playwright ignores
-// the extra arg.
-type PatchrightMainWorldPage = Page & {
-  readonly evaluate: <Arg, Result>(
-    pageFunction: (arg: Arg) => Result | Promise<Result>,
-    arg: Arg,
-    isolatedContext: false,
-  ) => Promise<Result>;
-};
-
+// Helper for evaluations that must run in a context where the page's
+// chrome.* extension APIs (chrome.runtime, chrome.storage, …) are
+// bound. Default launch path uses stock Playwright, whose
+// `page.evaluate` already runs in the page's main world, so this is
+// the standard 2-arg call. (Earlier versions of this file passed a
+// 3rd `false` arg targeting Patchright's `isolatedContext` overload —
+// current Playwright versions reject the extra arg with `Too many
+// arguments`. The stealth-experiment path uses Patchright via
+// `launchStealthPersistentContext` and Patchright defaults to main-
+// world bindings on extension pages, so the 2-arg call works on both
+// runtimes.)
 const evaluateInMainWorld = async <Arg, Result>(
   page: Page,
   pageFunction: (arg: Arg) => Result | Promise<Result>,
   arg: Arg,
 ): Promise<Result> =>
-  await (page as PatchrightMainWorldPage).evaluate(pageFunction, arg, false);
+  // The cast routes Playwright's overload resolution to the
+  // `(pageFunction, arg)` form regardless of whether `Arg` is
+  // narrowed to `void` at the call site.
+  await (page.evaluate as <A, R>(fn: (arg: A) => R | Promise<R>, arg: A) => Promise<R>)(
+    pageFunction,
+    arg,
+  );
 
 const isSidetrackExtensionWorker = (worker: Worker): boolean =>
   worker.url().startsWith('chrome-extension://') && worker.url().endsWith('/background.js');
+
+// Resolve the current extension service worker. Used by the page-API
+// helpers (seedStorage / sendRuntimeMessage / clearStorage) as a
+// fallback when the senderPage's main world has no chrome.* binding
+// (the Patchright stealth path). Waits briefly for the SW to wake.
+const getExtensionServiceWorker = async (
+  context: BrowserContext,
+  extensionId: string,
+): Promise<Worker> => {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const worker = context
+      .serviceWorkers()
+      .find(
+        (w) =>
+          isSidetrackExtensionWorker(w) &&
+          w.url().includes(`chrome-extension://${extensionId}/`),
+      );
+    if (worker !== undefined) return worker;
+    await wakeServiceWorker(context, extensionId).catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(
+    `getExtensionServiceWorker: no extension SW for ${extensionId} after 4s polling.`,
+  );
+};
 
 const expandHomeDir = (input: string): string =>
   input.startsWith('~')
@@ -196,29 +225,53 @@ const reloadExtensionFromDisk = async (
   extensionId: string,
   previousWorker: Worker,
 ): Promise<Worker> => {
-  const reloadPage = await context.newPage();
-  try {
-    await reloadPage.goto(`chrome-extension://${extensionId}/sidepanel.html`, {
-      waitUntil: 'domcontentloaded',
-      timeout: 10_000,
-    });
-    await evaluateInMainWorld(
-      reloadPage,
-      () => {
-        chrome.runtime.reload();
-      },
-      undefined,
-    ).catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      if (
-        !message.includes('Target page, context or browser has been closed') &&
-        !message.includes('Execution context was destroyed')
-      ) {
-        throw error;
-      }
-    });
-  } finally {
-    await reloadPage.close().catch(() => undefined);
+  // Try the service worker first — under Patchright's stealth main-world
+  // binding `chrome` is sometimes scrubbed off extension pages, so the
+  // page-evaluate path below throws `Cannot read properties of undefined`.
+  // The SW always has chrome.runtime since it IS the runtime; calling
+  // reload() there is the canonical MV3 path anyway.
+  const swReloadOk = await previousWorker
+    .evaluate(() => {
+      chrome.runtime.reload();
+    })
+    .then(() => true)
+    .catch(() => false);
+  if (!swReloadOk) {
+    const reloadPage = await context.newPage();
+    try {
+      await reloadPage.goto(`chrome-extension://${extensionId}/sidepanel.html`, {
+        waitUntil: 'domcontentloaded',
+        timeout: 10_000,
+      });
+      await evaluateInMainWorld(
+        reloadPage,
+        () => {
+          if (typeof chrome === 'undefined' || chrome.runtime === undefined) {
+            throw new Error('chrome.runtime not available in main world');
+          }
+          chrome.runtime.reload();
+        },
+        undefined,
+      ).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        // Three classes of swallowed errors:
+        //   1. The page tore down during reload (expected race).
+        //   2. The execution context died (same).
+        //   3. chrome.runtime isn't reachable from the page world (Patchright
+        //      stealth). In that case the SW worker.evaluate() above already
+        //      tried + failed; the post-loop wakeServiceWorker still recovers.
+        if (
+          !message.includes('Target page, context or browser has been closed') &&
+          !message.includes('Execution context was destroyed') &&
+          !message.includes('chrome.runtime not available') &&
+          !message.includes("Cannot read properties of undefined (reading 'reload')")
+        ) {
+          throw error;
+        }
+      });
+    } finally {
+      await reloadPage.close().catch(() => undefined);
+    }
   }
 
   for (let attempt = 0; attempt < 40; attempt += 1) {
@@ -611,22 +664,51 @@ export const launchExtensionRuntime = async (
       headed: !headless,
     },
     async sendRuntimeMessage(senderPage: Page, message: unknown) {
-      return await evaluateInMainWorld(
+      // Try the page first (normal Playwright path, extension chrome
+      // is bound to the main world on chrome-extension:// pages).
+      // Under Patchright stealth the page's chrome is the web chrome
+      // (csi/loadTimes only) and chrome.runtime is undefined — fall
+      // back to a SW-driven path that sidesteps the SW→SW sendMessage
+      // loop (Chrome doesn't deliver chrome.runtime.sendMessage to the
+      // sender's own context, so SW.evaluate(sendMessage) gets no
+      // responder).
+      const pageResult = await evaluateInMainWorld(
         senderPage,
         async (runtimeMessage) => {
+          const c = (globalThis as { chrome?: { runtime?: { sendMessage?: unknown } } }).chrome;
+          if (c?.runtime?.sendMessage === undefined) {
+            return { ok: false } as const;
+          }
           const response = (await chrome.runtime.sendMessage(runtimeMessage)) as unknown;
-          return response;
+          return { ok: true, response } as const;
         },
         message,
-      );
+      ).catch(() => ({ ok: false }) as const);
+      if (pageResult.ok) return pageResult.response;
+      // Fallback: invoke the SW's chrome.runtime.onMessage listener
+      // directly via the `__sidetrackTestDispatchMessage` test hook
+      // (registered in background.ts alongside the listener). Chrome
+      // doesn't deliver chrome.runtime.sendMessage to the sender's own
+      // context, and chrome.scripting.executeScript refuses to inject
+      // into chrome-extension:// pages, so the test hook is the only
+      // way to reach SW message handlers from worker.evaluate.
+      const sw = await getExtensionServiceWorker(context, extensionId);
+      return await sw.evaluate(async (msg: unknown) => {
+        const hook = (
+          globalThis as unknown as {
+            __sidetrackTestDispatchMessage?: (m: unknown) => Promise<unknown>;
+          }
+        ).__sidetrackTestDispatchMessage;
+        if (hook === undefined) {
+          throw new Error(
+            'sendRuntimeMessage: __sidetrackTestDispatchMessage not installed on SW globalThis — rebuild the extension.',
+          );
+        }
+        return await hook(msg);
+      }, message);
     },
     async seedStorage(senderPage: Page, values: Record<string, unknown>) {
-      // Wait briefly for chrome.storage to become available — under stealth /
-      // CFT launches the extension service worker can register a beat after
-      // the sidepanel page hits domcontentloaded. Force main-world evaluation
-      // so patchright doesn't run the probe in an isolated context where
-      // chrome.* extension APIs aren't bound.
-      const diagnostic = await evaluateInMainWorld(
+      const pageOk = await evaluateInMainWorld(
         senderPage,
         async ({ vals, retries, intervalMs }) => {
           const c = (
@@ -639,45 +721,25 @@ export const launchExtensionRuntime = async (
             const setFn = c?.storage?.local?.set;
             if (typeof setFn === 'function') {
               await setFn.call(c?.storage?.local, vals);
-              return { ok: true } as const;
+              return true;
             }
             await sleep(intervalMs);
           }
-          const chromeKeys = c === undefined ? [] : Object.keys(c).sort();
-          const runtimeKeys =
-            (c as { runtime?: object }).runtime === undefined
-              ? []
-              : Object.keys((c as { runtime: object }).runtime).sort();
-          const runtimeIdGetter =
-            (c as { runtime?: { id?: string } }).runtime?.id ?? '<undefined>';
-          return {
-            ok: false,
-            url: location.href,
-            chromePresent: c !== undefined,
-            storagePresent: c?.storage !== undefined,
-            localPresent: c?.storage?.local !== undefined,
-            chromeKeys,
-            runtimeKeys,
-            runtimeId: runtimeIdGetter,
-          } as const;
+          return false;
         },
-        { vals: values, retries: 50, intervalMs: 100 },
-      );
-      if (!diagnostic.ok) {
-        throw new Error(
-          `seedStorage: chrome.storage.local.set unavailable after 5s polling.\n` +
-            `  url=${diagnostic.url}\n` +
-            `  chromePresent=${String(diagnostic.chromePresent)}\n` +
-            `  storagePresent=${String(diagnostic.storagePresent)}\n` +
-            `  localPresent=${String(diagnostic.localPresent)}\n` +
-            `  chrome keys (first 20): ${diagnostic.chromeKeys.slice(0, 20).join(', ')}\n` +
-            `  chrome.runtime keys (first 20): ${diagnostic.runtimeKeys.slice(0, 20).join(', ')}\n` +
-            `  chrome.runtime.id: ${diagnostic.runtimeId}`,
-        );
-      }
+        { vals: values, retries: 10, intervalMs: 100 },
+      ).catch(() => false);
+      if (pageOk) return;
+      // Patchright stealth: chrome.* not on the page world. Seed via
+      // the extension service worker — it owns chrome.storage.local
+      // directly.
+      const sw = await getExtensionServiceWorker(context, extensionId);
+      await sw.evaluate(async (vals: Record<string, unknown>) => {
+        await chrome.storage.local.set(vals);
+      }, values);
     },
     async clearStorage(senderPage: Page) {
-      await evaluateInMainWorld(
+      const pageOk = await evaluateInMainWorld(
         senderPage,
         async ({ retries, intervalMs }) => {
           const c = (
@@ -699,13 +761,22 @@ export const launchExtensionRuntime = async (
               if (typeof clearSession === 'function') {
                 await clearSession.call(c?.storage?.session);
               }
-              return;
+              return true;
             }
             await sleep(intervalMs);
           }
+          return false;
         },
-        { retries: 50, intervalMs: 100 },
-      );
+        { retries: 10, intervalMs: 100 },
+      ).catch(() => false);
+      if (pageOk) return;
+      const sw = await getExtensionServiceWorker(context, extensionId);
+      await sw.evaluate(async () => {
+        await chrome.storage.local.clear();
+        if (chrome.storage.session !== undefined) {
+          await chrome.storage.session.clear();
+        }
+      });
     },
     async close() {
       try {

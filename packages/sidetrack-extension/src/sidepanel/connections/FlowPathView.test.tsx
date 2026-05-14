@@ -1,7 +1,12 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
-import { FlowPathView, type TimelineVisit } from './FlowPathView';
+import {
+  FlowPathView,
+  type FlowSummary,
+  type TabSessionInfo,
+  type TimelineVisit,
+} from './FlowPathView';
 
 const visits: readonly TimelineVisit[] = [
   {
@@ -45,7 +50,7 @@ const visits: readonly TimelineVisit[] = [
 ];
 
 describe('FlowPathView', () => {
-  it('renders all visits and navigation edges', () => {
+  it('renders all visits with arrows between same-tab neighbors', () => {
     render(
       <FlowPathView
         visits={visits}
@@ -61,10 +66,27 @@ describe('FlowPathView', () => {
     );
 
     expect(screen.getAllByTestId(/^flow-visit-/u)).toHaveLength(6);
-    expect(screen.getAllByTestId(/^flow-nav-edge-/u)).toHaveLength(4);
     expect(screen.getByText('Tab 1')).toBeDefined();
     expect(screen.getByText('Tab 2')).toBeDefined();
-    expect(screen.getByTestId('flow-nav-edge-e1').textContent).toContain('Visit 1 -> Visit 2');
+    // Same-tab navigation now renders as → arrows between visits;
+    // each tab has (N-1) arrows for N visits, so 2 + 2 = 4.
+    const arrows = screen.getAllByText('→');
+    expect(arrows).toHaveLength(4);
+  });
+
+  it('renders opener badge between tabs', () => {
+    render(
+      <FlowPathView
+        visits={visits}
+        navigationEdges={[
+          { id: 'op1', fromVisitId: 'visit:3', toVisitId: 'visit:4', kind: 'openerVisitId' },
+        ]}
+        crossReplicaEdges={[]}
+        onNodeClick={() => undefined}
+      />,
+    );
+
+    expect(screen.getByText(/opened from Tab 1/u)).toBeDefined();
   });
 
   it('renders cross-replica edges dashed', () => {
@@ -82,6 +104,27 @@ describe('FlowPathView', () => {
     );
   });
 
+  it('renders duration when focusedWindowMs is provided', () => {
+    render(
+      <FlowPathView
+        visits={[
+          {
+            id: 'visit:1',
+            label: 'Visit 1',
+            commitTimestamp: '2026-05-08T10:00:00.000Z',
+            tabSessionIdHash: 'tab-a',
+            focusedWindowMs: 90_000,
+          },
+        ]}
+        navigationEdges={[]}
+        crossReplicaEdges={[]}
+        onNodeClick={() => undefined}
+      />,
+    );
+
+    expect(screen.getByText('1m 30s')).toBeDefined();
+  });
+
   it('fires onNodeClick with the visit id', () => {
     const onNodeClick = vi.fn();
     render(
@@ -95,5 +138,142 @@ describe('FlowPathView', () => {
 
     fireEvent.click(screen.getByTestId('flow-visit-visit:1'));
     expect(onNodeClick).toHaveBeenCalledWith('visit:1');
+  });
+
+  it('renders the anchor lifecycle summary strip', () => {
+    const summary: FlowSummary = {
+      visitCount: 3,
+      tabCount: 3,
+      firstSeenAt: new Date(Date.now() - 5 * 60_000).toISOString(),
+      replicaAliases: ['Browser 2'],
+    };
+    render(
+      <FlowPathView
+        visits={visits}
+        navigationEdges={[]}
+        crossReplicaEdges={[]}
+        onNodeClick={() => undefined}
+        summary={summary}
+      />,
+    );
+    const strip = screen.getByTestId('flow-path-summary');
+    expect(strip.textContent).toContain('Visited 3 times across 3 tabs');
+    expect(strip.textContent).toContain('also on Browser 2');
+  });
+
+  it('uses tabSessions.get(hash).label for the column header', () => {
+    const tabSessions = new Map<string, TabSessionInfo>([
+      ['tab-a', { label: 'Sidetrack PRs', host: 'github.com' }],
+    ]);
+    render(
+      <FlowPathView
+        visits={visits.slice(0, 1)}
+        navigationEdges={[]}
+        crossReplicaEdges={[]}
+        onNodeClick={() => undefined}
+        tabSessions={tabSessions}
+      />,
+    );
+    expect(screen.getByText('Sidetrack PRs')).toBeDefined();
+    expect(screen.getByText('github.com')).toBeDefined();
+  });
+
+  it('renders the empty-chain placeholder for a solo anchor', () => {
+    render(
+      <FlowPathView
+        visits={[
+          {
+            id: 'visit:anchor',
+            label: 'Just this page',
+            commitTimestamp: '2026-05-08T10:00:00.000Z',
+            tabSessionIdHash: 'tab-a',
+            isAnchor: true,
+          },
+        ]}
+        navigationEdges={[]}
+        crossReplicaEdges={[]}
+        onNodeClick={() => undefined}
+      />,
+    );
+    expect(screen.getByTestId('flow-tab-placeholder-tab-a').textContent).toContain(
+      'Direct visit — no prior page in this tab',
+    );
+  });
+
+  it('renders Before / After segment labels around the anchor', () => {
+    render(
+      <FlowPathView
+        visits={[
+          {
+            id: 'visit:1',
+            label: 'Before page',
+            commitTimestamp: '2026-05-08T10:00:00.000Z',
+            tabSessionIdHash: 'tab-a',
+          },
+          {
+            id: 'visit:2',
+            label: 'Anchor page',
+            commitTimestamp: '2026-05-08T10:05:00.000Z',
+            tabSessionIdHash: 'tab-a',
+            isAnchor: true,
+          },
+          {
+            id: 'visit:3',
+            label: 'After page',
+            commitTimestamp: '2026-05-08T10:10:00.000Z',
+            tabSessionIdHash: 'tab-a',
+          },
+        ]}
+        navigationEdges={[]}
+        crossReplicaEdges={[]}
+        onNodeClick={() => undefined}
+      />,
+    );
+    expect(screen.getByText('Before')).toBeDefined();
+    expect(screen.getByText('After')).toBeDefined();
+  });
+
+  it('renders provider chip, engagement label, and visitCount on a cell', () => {
+    render(
+      <FlowPathView
+        visits={[
+          {
+            id: 'visit:1',
+            label: 'Some page',
+            commitTimestamp: '2026-05-08T10:00:00.000Z',
+            tabSessionIdHash: 'tab-a',
+            provider: 'chatgpt',
+            engagementClass: 'engaged_read',
+            visitCount: 5,
+          },
+        ]}
+        navigationEdges={[]}
+        crossReplicaEdges={[]}
+        onNodeClick={() => undefined}
+      />,
+    );
+    expect(screen.getByText('ChatGPT')).toBeDefined();
+    expect(screen.getByText('Read')).toBeDefined();
+    expect(screen.getByText('· 5 visits')).toBeDefined();
+  });
+
+  it('renders the search-query prefix when set', () => {
+    render(
+      <FlowPathView
+        visits={[
+          {
+            id: 'visit:1',
+            label: 'Search results',
+            commitTimestamp: '2026-05-08T10:00:00.000Z',
+            tabSessionIdHash: 'tab-a',
+            searchQuery: 'react hooks tutorial',
+          },
+        ]}
+        navigationEdges={[]}
+        crossReplicaEdges={[]}
+        onNodeClick={() => undefined}
+      />,
+    );
+    expect(screen.getByText(/q: react hooks tutorial/u)).toBeDefined();
   });
 });

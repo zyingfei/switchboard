@@ -78,6 +78,7 @@ const parseStatus = (value: unknown): CompanionStatus => {
     readonly vault?: unknown;
     readonly requestId?: unknown;
     readonly sync?: unknown;
+    readonly snapshot?: unknown;
   };
 
   if (statusData.companion !== 'running') {
@@ -122,7 +123,23 @@ const parseStatus = (value: unknown): CompanionStatus => {
     };
   }
 
-  return { companion: 'running', vault, requestId, ...(sync === undefined ? {} : { sync }) };
+  // Snapshot freshness — the side panel uses revision changes as a
+  // signal that resolver suggestions cached against the previous
+  // snapshot have gone stale. Parse defensively; a missing field
+  // just means the companion didn't publish a revision yet.
+  const snapshotIn = statusData.snapshot;
+  const snapshotRevision =
+    isRecord(snapshotIn) && typeof (snapshotIn as Record<string, unknown>)['revision'] === 'string'
+      ? ((snapshotIn as Record<string, unknown>)['revision'] as string)
+      : undefined;
+
+  return {
+    companion: 'running',
+    vault,
+    requestId,
+    ...(sync === undefined ? {} : { sync }),
+    ...(snapshotRevision === undefined ? {} : { snapshotRevision }),
+  };
 };
 
 const parseMutationResult = (value: unknown): MutationResult => {
@@ -255,7 +272,17 @@ export class HttpCompanionClient implements CompanionClient {
   }
 
   async status(): Promise<CompanionStatus> {
-    return parseStatus(await this.request('/status', { method: 'GET' }));
+    // Companion catchUp on a real-world vault (5K+ events on cold
+    // start) can pin the SW main thread for 30+ s before the HTTP
+    // listener gets a slot. Observed: first /status call took 39 s
+    // against a freshly-spawned companion, every call after was sub-
+    // 250 ms. A 5-second timeout on the cheap probe falsely flags
+    // the companion as dead during startup; the panel keeps showing
+    // "Companion: disconnected" until the user retries. Give /status
+    // a longer budget — the panel poll cadence is 15 s anyway, so a
+    // 45-second timeout still bounds the worst case to one extra
+    // poll window.
+    return parseStatus(await this.request('/status', { method: 'GET' }, 45_000));
   }
 
   async appendEvent(event: CaptureEvent, idempotencyKey: string): Promise<MutationResult> {
@@ -396,7 +423,11 @@ export class HttpCompanionClient implements CompanionClient {
     return (value as { data: CodingSession }).data;
   }
 
-  private async request(path: string, init: RequestInit): Promise<unknown> {
+  private async request(
+    path: string,
+    init: RequestInit,
+    timeoutMs: number = 5_000,
+  ): Promise<unknown> {
     const headers = new Headers(init.headers);
     headers.set('content-type', 'application/json');
     headers.set('x-bac-bridge-key', this.settings.bridgeKey);
@@ -409,13 +440,15 @@ export class HttpCompanionClient implements CompanionClient {
     // resolved as undefined → isRuntimeResponse() false → refresh()
     // threw → silent catch → panel kept whatever initial state it had
     // (default: 'disconnected'). Bounding the fetch ensures the SW
-    // handler always returns within ~5s with EITHER the parsed status
-    // OR a thrown error that withCompanionStatus catches and surfaces as
-    // 'disconnected' WITH state, so the panel always gets a fresh state
-    // payload and the next 15s poll can recover when the companion
-    // unblocks.
+    // handler always returns within `timeoutMs` with EITHER the parsed
+    // status OR a thrown error that withCompanionStatus catches and
+    // surfaces as 'disconnected' WITH state, so the panel always gets a
+    // fresh state payload and the next 15s poll can recover when the
+    // companion unblocks. Default 5 s for write/list paths; callers
+    // pass a longer budget for cold-start probes like /status (45 s)
+    // where the catchUp queue legitimately exceeds the default.
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 5_000);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const response = await fetch(`${this.baseUrl}${path}`, {
         ...init,
@@ -431,8 +464,9 @@ export class HttpCompanionClient implements CompanionClient {
       // Translate AbortError into something users can act on; otherwise
       // surface the underlying network error.
       if (error instanceof Error && error.name === 'AbortError') {
+        const seconds = Math.round(timeoutMs / 1000);
         throw new Error(
-          `Companion did not respond within 5s on ${path}. It may be busy (catchUp on a large vault). Retry in a few seconds.`,
+          `Companion did not respond within ${String(seconds)}s on ${path}. It may be busy (catchUp on a large vault). Retry in a few seconds.`,
         );
       }
       throw error;

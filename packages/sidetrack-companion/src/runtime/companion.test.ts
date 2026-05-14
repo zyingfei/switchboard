@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('../recall/embedder.js', () => ({
   MODEL_ID: 'test/model',
   embed: () => Promise.resolve([]),
+  setEmbedderOverride: () => undefined,
   RecallModelMissingError: class extends Error {
     readonly code = 'RECALL_MODEL_MISSING' as const;
   },

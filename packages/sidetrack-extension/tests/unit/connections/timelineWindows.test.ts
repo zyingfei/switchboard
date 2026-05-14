@@ -15,6 +15,15 @@ const baseSnap = (
   ...overrides,
 });
 
+// Build an ISO string for a specific LOCAL time. Used to make
+// timezone-aware tests deterministic across CI / dev machines —
+// the rail uses local hours, so we construct timestamps in local
+// time then serialize.
+const localIso = (year: number, month: number, day: number, hour: number, minute = 0): string =>
+  new Date(year, month - 1, day, hour, minute, 0, 0).toISOString();
+const localYmd = (year: number, month: number, day: number): string =>
+  `${String(year)}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+
 describe('connections — computeTimelineRail', () => {
   it('returns null when no event-log edges have a dot', () => {
     expect(computeTimelineRail(baseSnap(), 'thread:t1')).toBeNull();
@@ -28,7 +37,7 @@ describe('connections — computeTimelineRail', () => {
           kind: 'thread_in_workstream',
           fromNodeId: 'thread:t1',
           toNodeId: 'workstream:w1',
-          observedAt: '2026-05-14T09:10:00.000Z',
+          observedAt: localIso(2026, 5, 14, 9, 10),
           producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 1 } },
           confidence: 'asserted',
         },
@@ -37,7 +46,7 @@ describe('connections — computeTimelineRail', () => {
           kind: 'thread_in_workstream',
           fromNodeId: 'thread:t1',
           toNodeId: 'workstream:w1',
-          observedAt: '2026-05-14T09:25:00.000Z',
+          observedAt: localIso(2026, 5, 14, 9, 25),
           producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 2 } },
           confidence: 'asserted',
         },
@@ -61,7 +70,7 @@ describe('connections — computeTimelineRail', () => {
           kind: 'thread_in_workstream',
           fromNodeId: 'thread:t1',
           toNodeId: 'workstream:w1',
-          observedAt: '2026-05-14T09:00:00.000Z',
+          observedAt: localIso(2026, 5, 14, 9, 0),
           producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 1 } },
           confidence: 'asserted',
         },
@@ -70,7 +79,7 @@ describe('connections — computeTimelineRail', () => {
           kind: 'thread_in_workstream',
           fromNodeId: 'thread:t1',
           toNodeId: 'workstream:w1',
-          observedAt: '2026-05-14T11:00:00.000Z',
+          observedAt: localIso(2026, 5, 14, 11, 0),
           producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 2 } },
           confidence: 'asserted',
         },
@@ -88,7 +97,7 @@ describe('connections — computeTimelineRail', () => {
           kind: 'thread_in_workstream',
           fromNodeId: 'thread:t1',
           toNodeId: 'workstream:w1',
-          observedAt: '2026-05-14T09:00:00.000Z',
+          observedAt: localIso(2026, 5, 14, 9, 0),
           producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 1 } },
           confidence: 'asserted',
         },
@@ -97,7 +106,7 @@ describe('connections — computeTimelineRail', () => {
           kind: 'thread_in_workstream',
           fromNodeId: 'thread:t1',
           toNodeId: 'workstream:w1',
-          observedAt: '2026-05-14T10:30:00.000Z',
+          observedAt: localIso(2026, 5, 14, 10, 30),
           producedBy: { source: 'event-log', dot: { replicaId: 'pc', seq: 5 } },
           confidence: 'asserted',
         },
@@ -116,7 +125,7 @@ describe('connections — computeTimelineRail', () => {
           kind: 'dispatch_in_workstream',
           fromNodeId: 'dispatch:d1',
           toNodeId: 'workstream:w1',
-          observedAt: '2026-05-14T09:00:00.000Z',
+          observedAt: localIso(2026, 5, 14, 9, 0),
           producedBy: { source: 'workboard-state' },
           confidence: 'asserted',
         },
@@ -132,7 +141,7 @@ describe('connections — computeTimelineRail', () => {
         kind: 'thread_in_workstream',
         fromNodeId: 'thread:t1',
         toNodeId: 'workstream:w1',
-        observedAt: '2026-05-13T15:00:00.000Z',
+        observedAt: localIso(2026, 5, 13, 15, 0),
         producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 1 } },
         confidence: 'asserted',
       },
@@ -143,7 +152,7 @@ describe('connections — computeTimelineRail', () => {
         kind: 'thread_in_workstream',
         fromNodeId: 'thread:t1',
         toNodeId: 'workstream:w1',
-        observedAt: '2026-05-14T09:00:00.000Z',
+        observedAt: localIso(2026, 5, 14, 9, 0),
         producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 2 } },
         confidence: 'asserted',
       },
@@ -152,7 +161,7 @@ describe('connections — computeTimelineRail', () => {
         kind: 'thread_in_workstream',
         fromNodeId: 'thread:t1',
         toNodeId: 'workstream:w1',
-        observedAt: '2026-05-14T10:00:00.000Z',
+        observedAt: localIso(2026, 5, 14, 10, 0),
         producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 3 } },
         confidence: 'asserted',
       },
@@ -169,7 +178,7 @@ describe('connections — computeTimelineRail', () => {
           id: 'thread:t1',
           kind: 'thread',
           label: 'anchor',
-          lastSeenAt: '2026-05-14T09:30:00.000Z',
+          lastSeenAt: localIso(2026, 5, 14, 9, 30),
           originReplicaIds: ['mac'],
           metadata: {},
         },
@@ -177,7 +186,7 @@ describe('connections — computeTimelineRail', () => {
           id: 'workstream:w1',
           kind: 'workstream',
           label: 'ws',
-          lastSeenAt: '2026-05-14T10:15:00.000Z',
+          lastSeenAt: localIso(2026, 5, 14, 10, 15),
           originReplicaIds: ['mac'],
           metadata: {},
         },
@@ -185,7 +194,7 @@ describe('connections — computeTimelineRail', () => {
           id: 'thread:t_other_day',
           kind: 'thread',
           label: 'other day',
-          lastSeenAt: '2026-05-13T12:00:00.000Z',
+          lastSeenAt: localIso(2026, 5, 13, 12, 0),
           originReplicaIds: ['mac'],
           metadata: {},
         },
@@ -196,7 +205,7 @@ describe('connections — computeTimelineRail', () => {
           kind: 'thread_in_workstream',
           fromNodeId: 'thread:t1',
           toNodeId: 'workstream:w1',
-          observedAt: '2026-05-14T09:00:00.000Z',
+          observedAt: localIso(2026, 5, 14, 9, 0),
           producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 1 } },
           confidence: 'asserted',
         },
@@ -205,5 +214,50 @@ describe('connections — computeTimelineRail', () => {
     const rail = computeTimelineRail(snap, 'thread:t1');
     expect(rail!.anchorTime).toBeCloseTo(9 + 30 / 60, 3);
     expect(rail!.neighborTimes).toEqual([10 + 15 / 60]);
+  });
+
+  it('falls back to node lastSeenAt when edges have no producer dot (inferred-only subgraph)', () => {
+    // Thread anchor at 1 hop often has only `timeline_same_url_as_thread`
+    // (inferred, no producedBy.dot). The fallback path uses each node's
+    // own lastSeenAt + originReplicaIds so the rail still renders.
+    const snap = baseSnap({
+      nodes: [
+        {
+          id: 'thread:t1',
+          kind: 'thread',
+          label: 'Some thread',
+          originReplicaIds: ['mac'],
+          metadata: {},
+          lastSeenAt: localIso(2026, 5, 14, 9, 15),
+        },
+        {
+          id: 'timeline-visit:https://example.test/page',
+          kind: 'timeline-visit',
+          label: 'Page',
+          originReplicaIds: ['mac'],
+          metadata: { canonicalUrl: 'https://example.test/page' },
+          lastSeenAt: localIso(2026, 5, 14, 10, 0),
+        },
+      ],
+      edges: [
+        {
+          id: 'e1',
+          kind: 'timeline_same_url_as_thread',
+          fromNodeId: 'thread:t1',
+          toNodeId: 'timeline-visit:https://example.test/page',
+          observedAt: localIso(2026, 5, 14, 10, 0),
+          // Inferred edges carry no producedBy.dot
+          producedBy: { source: 'inferred' },
+          confidence: 'inferred',
+        },
+      ],
+    });
+    const rail = computeTimelineRail(snap, 'thread:t1');
+    expect(rail).not.toBeNull();
+    expect(rail!.date).toBe('2026-05-14');
+    expect(rail!.rows.length).toBe(1);
+    expect(rail!.rows[0]!.replicaId).toBe('mac');
+    expect(rail!.anchorTime).toBeCloseTo(9 + 15 / 60, 3);
+    expect(rail!.neighborTimes).toEqual([10]);
   });
 });

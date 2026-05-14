@@ -25,6 +25,19 @@ export interface EntityDisplayCtx {
   // Resolve a replica id to a human alias ("This browser" / "Browser 2"…).
   // Returns "Browser" while the alias map is hydrating from chrome.storage.
   readonly replicaAlias: (replicaId: string) => string;
+  // Stage 5 polish — cross-node lookup for kinds whose title depends on
+  // another node in the same snapshot. inbound-reminder needs the thread
+  // it points at; future kinds may follow the same pattern. Optional so
+  // surfaces without a snapshot (the Inbox path-resolver, for example)
+  // still work — those kinds just won't get the enriched title.
+  readonly nodeById?: ReadonlyMap<string, ConnectionNode>;
+  // Local-only snippet text preview lookup. The companion stays hash-
+  // only (rawTextStored:false on the payload), but the browser knows
+  // what the user actually copied and caches the first 120 chars in
+  // chrome.storage.local. The side panel passes a lookup keyed by
+  // selectionHash (or its 12-char prefix) so the snippet card shows
+  // the real text instead of a derived summary.
+  readonly snippetPreview?: (hashOrPrefix: string | undefined) => string | undefined;
 }
 
 export interface EntityDisplay {
@@ -49,6 +62,7 @@ const ID_LIKE_PATTERNS: readonly RegExp[] = [
   /^replica:/i,
   /^topic:/i,
   /^snippet:/i,
+  /^snippet_[a-z0-9]/i, // bare snippet id (no kind prefix)
   /^coding-session:/i,
   /^annotation:/i,
   /^queue-item:/i,
@@ -190,8 +204,11 @@ export const formatEntityDisplay = (
         tooltip: latestUrl ?? trimPrefix(node.id, 'tab-session:'),
       };
     }
-    case 'visit-instance':
-    case 'timeline-visit': {
+    case 'visit-instance': {
+      // Stage 5 polish — disambiguate visit-instance from the
+      // canonical timeline-visit (= "Page"). Both nodes carry the
+      // same title; visit-instance secondary now folds in the
+      // visit time so the user can tell two instances apart.
       const title = metaStr(metadata, ['title']);
       const canonicalUrl = metaStr(metadata, ['canonicalUrl', 'url']);
       const host = hostOf(canonicalUrl);
@@ -200,6 +217,26 @@ export const formatEntityDisplay = (
       const last = node.lastSeenAt ?? node.firstSeenAt;
       const secondary = composeSecondary([host, formatRelOrUndef(last)]);
       // Tooltip is canonical URL only — never the raw `visit-instance:tses_*:date:url` id.
+      return { primary, secondary, kindBadge, tooltip: canonicalUrl };
+    }
+    case 'timeline-visit': {
+      // The canonical aggregate. Secondary calls out the visitCount
+      // so it's clear this row represents N visits (not just one).
+      const title = metaStr(metadata, ['title']);
+      const canonicalUrl = metaStr(metadata, ['canonicalUrl', 'url']);
+      const host = hostOf(canonicalUrl);
+      const labelClean = cleanLabel(node.label);
+      const primary = title ?? labelClean ?? host ?? '(page)';
+      const visitCountRaw = metadata['visitCount'];
+      const visitCount =
+        typeof visitCountRaw === 'number' && Number.isFinite(visitCountRaw)
+          ? Math.max(0, Math.floor(visitCountRaw))
+          : undefined;
+      const visitsLabel =
+        visitCount !== undefined
+          ? `${String(visitCount)} visit${visitCount === 1 ? '' : 's'}`
+          : undefined;
+      const secondary = composeSecondary([host, visitsLabel]);
       return { primary, secondary, kindBadge, tooltip: canonicalUrl };
     }
     case 'dispatch': {
@@ -241,10 +278,81 @@ export const formatEntityDisplay = (
       const replicaId = trimPrefix(node.id, 'replica:');
       return { primary: ctx.replicaAlias(replicaId), kindBadge, tooltip: replicaId };
     }
-    case 'snippet':
+    case 'inbound-reminder': {
+      // Stage 5 polish — every inbound-reminder previously rendered as
+      // `(inbound-reminder)` because the snapshot's reminder nodes
+      // carry only `threadId / provider / status`. Resolve the thread
+      // via ctx.nodeById and surface "Reminder: <thread title>" so
+      // users can tell 40 reminders apart at a glance.
+      const threadId = metaStr(metadata, ['threadId']);
+      const provider = metaStr(metadata, ['provider']);
+      const status = metaStr(metadata, ['status']);
+      const labelClean = cleanLabel(node.label);
+      let primary: string;
+      const threadNode =
+        threadId === undefined
+          ? undefined
+          : ctx.nodeById?.get(threadId) ?? ctx.nodeById?.get(`thread:${threadId}`);
+      if (threadNode !== undefined) {
+        const threadTitle = formatEntityDisplay(threadNode, ctx).primary;
+        primary = `Reminder: ${threadTitle}`;
+      } else if (labelClean !== undefined) {
+        primary = labelClean;
+      } else if (provider !== undefined) {
+        primary = `Reminder · ${provider}`;
+      } else {
+        primary = 'Reminder';
+      }
+      const secondary = composeSecondary([status, formatRelOrUndef(node.lastSeenAt)]);
+      return { primary, secondary, kindBadge, tooltip: node.id };
+    }
+    case 'snippet': {
+      // Stage 5 polish — hash-only snippet lineage means the raw text
+      // never leaves the user's device. Derive a useful primary from
+      // the payload metrics that DO travel: contentKindHint +
+      // charCount + lineCount. The legacy `match` field (= "exact" /
+      // "fuzzy") is just the match-strategy and was confusing as a
+      // title. If a local text preview is provided via context
+      // (chrome.storage on this machine), use it.
+      const localPreview =
+        ctx.snippetPreview === undefined
+          ? undefined
+          : ctx.snippetPreview(metaStr(metadata, ['selectionHash', 'charHashPrefix']));
+      if (localPreview !== undefined && localPreview.length > 0) {
+        const truncated = localPreview.length > 80
+          ? `${localPreview.slice(0, 80).trimEnd()}…`
+          : localPreview;
+        const tooltip = metaStr(metadata, ['canonicalUrl', 'url']) ?? node.id;
+        return { primary: truncated, kindBadge, tooltip };
+      }
+      const charCount = typeof metadata['charCount'] === 'number'
+        ? (metadata['charCount'] as number)
+        : undefined;
+      const lineCount = typeof metadata['lineCount'] === 'number'
+        ? (metadata['lineCount'] as number)
+        : undefined;
+      const contentKindHint = metaStr(metadata, ['contentKindHint']);
+      const kindLabel = (() => {
+        if (contentKindHint === 'code-block') return 'Code';
+        if (contentKindHint === 'url') return 'URL';
+        if (contentKindHint === 'mixed') return 'Mixed';
+        if (contentKindHint === 'prose') return 'Prose';
+        return undefined;
+      })();
+      const parts: string[] = [];
+      if (kindLabel !== undefined) parts.push(kindLabel);
+      if (lineCount !== undefined && lineCount > 1) {
+        parts.push(`${String(lineCount)} lines`);
+      }
+      if (charCount !== undefined) parts.push(`${String(charCount)} chars`);
+      const labelClean = cleanLabel(node.label);
+      const primary =
+        parts.length > 0 ? parts.join(' · ') : labelClean ?? '(snippet)';
+      const tooltip = metaStr(metadata, ['canonicalUrl', 'url']) ?? node.id;
+      return { primary, kindBadge, tooltip };
+    }
     case 'annotation':
     case 'queue-item':
-    case 'inbound-reminder':
     case 'template': {
       const title = metaStr(metadata, ['title', 'text', 'note']);
       const labelClean = cleanLabel(node.label);

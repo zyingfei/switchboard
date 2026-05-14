@@ -442,6 +442,23 @@ describe('tab-session HTTP routes', () => {
     );
   });
 
+  it('POST /v1/tabsessions/{id}/resolve returns `skipped-disabled` when env opts out', async () => {
+    await appendObservedTabSession();
+    installStrongCausalSnapshot();
+    const priorEnv = process.env['SIDETRACK_TABSESSION_RESOLVER_AUTO_APPLY'];
+    process.env['SIDETRACK_TABSESSION_RESOLVER_AUTO_APPLY'] = '0';
+    const response = await fetch(`${serverUrl}/v1/tabsessions/tses_a/resolve`, {
+      method: 'POST',
+      headers: headers('tabsession-auto-apply-optout'),
+      body: JSON.stringify({ dryRun: false, policyMode: 'balanced' }),
+    });
+    if (priorEnv === undefined) delete process.env['SIDETRACK_TABSESSION_RESOLVER_AUTO_APPLY'];
+    else process.env['SIDETRACK_TABSESSION_RESOLVER_AUTO_APPLY'] = priorEnv;
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { readonly data?: { readonly status?: string } };
+    expect(body.data?.status).toBe('skipped-disabled');
+  });
+
   it('does not auto-apply over a user-asserted tab-session attribution', async () => {
     await appendObservedTabSession();
     installStrongCausalSnapshot();

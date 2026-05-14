@@ -1190,13 +1190,19 @@ const verifyCompanionSettingsBeforeSave = async (
 // HTTP round-trip. Reset to null when settings change so a stale
 // "connected" banner doesn't survive a companion swap.
 let cachedRelayStatus: NonNullable<CompanionStatus['sync']>['relay'] | null = null;
+// Connections snapshot revision from the last /v1/status response.
+// Surfaces to the side panel via WorkboardState.snapshotRevision so
+// it can detect when cached resolver suggestions have gone stale.
+let cachedSnapshotRevision: string | null = null;
 
 export const peekCachedRelayStatus = (): typeof cachedRelayStatus => cachedRelayStatus;
+export const peekCachedSnapshotRevision = (): string | null => cachedSnapshotRevision;
 
 const assertCompanionReachable = async (): Promise<'connected' | 'vault-error' | 'local-only'> => {
   const settings = await readSettings();
   if (settings.companion.bridgeKey.length === 0) {
     cachedRelayStatus = null;
+    cachedSnapshotRevision = null;
     return 'local-only';
   }
   const status = await createCompanionClient(settings.companion).status();
@@ -1204,6 +1210,7 @@ const assertCompanionReachable = async (): Promise<'connected' | 'vault-error' |
   // builder can route a relay-disconnected banner without a
   // second round-trip.
   cachedRelayStatus = status.sync?.relay ?? null;
+  cachedSnapshotRevision = status.snapshotRevision ?? null;
   return status.vault === 'connected' ? 'connected' : 'vault-error';
 };
 
@@ -1653,8 +1660,10 @@ const buildState = async (
   // because withCompanionStatus calls assertCompanionReachable
   // before invoking buildState.
   const relayHealth = cachedRelayStatus ?? undefined;
+  const snapshotRevision = cachedSnapshotRevision ?? undefined;
   return {
     ...(await buildWorkboardState(companionStatus, lastError, relayHealth)),
+    ...(snapshotRevision === undefined ? {} : { snapshotRevision }),
     ...(tab?.url === undefined ? {} : { activeTabUrl: tab.url }),
     ...(activeTabSessionId === undefined ? {} : { activeTabSessionId }),
     currentTab: await currentTabThread(),
@@ -3150,13 +3159,6 @@ export default defineBackground(() => {
     return `${event.streamName}:${event.observedAt.slice(0, 10)}`;
   };
 
-  const acceptedEdgeEventStreamNames = new Set<BufferedEvent['streamName']>([
-    'engagement.interval.observed',
-    'engagement.session.aggregated',
-    'selection.copied',
-    'selection.pasted',
-    VISUAL_FINGERPRINT_OBSERVED,
-  ]);
   const EDGE_EVENT_DRAIN_ROUTE_BATCH_SIZE = 10;
   const EDGE_EVENT_DRAIN_SCAN_BATCH_SIZE = 500;
   const EDGE_EVENT_DRAIN_DEFAULT_MAX_BATCHES = 1;
@@ -3223,15 +3225,9 @@ export default defineBackground(() => {
       locallyRejectedBatch,
       evictedByType: localEvictedByType,
       skippedByReason: localSkippedByReason,
-    } = partitionEdgeEventDrainBatch(
-      batch,
-      acceptedEdgeEventStreamNames,
-      EDGE_EVENT_DRAIN_ROUTE_BATCH_SIZE,
-    );
-    const locallyEvicted =
-      locallyRejectedBatch.length === 0
-        ? 0
-        : await engagementEventBuffer.deleteMany(locallyRejectedBatch);
+    } = partitionEdgeEventDrainBatch(batch, EDGE_EVENT_DRAIN_ROUTE_BATCH_SIZE);
+    const locallyEvicted = 0;
+    void locallyRejectedBatch; // always empty post-2026-05; kept for ABI
     if (routeBatch.length === 0) {
       return {
         uploaded: 0,
@@ -3680,6 +3676,20 @@ export default defineBackground(() => {
     } else if (message['type'] === messageTypes.loadConnectionsEdge) {
       const edgeId = String(message['edgeId'] ?? '');
       result = await fetchConnectionsHttp(`/v1/connections/edges/${encodeURIComponent(edgeId)}`);
+    } else if (message['type'] === messageTypes.loadConnectionsPath) {
+      // Stage 5 polish — BFS path between two nodes via the
+      // companion's /v1/connections/path route. Companion bounds
+      // maxHops to a safe ceiling internally; we pass through
+      // whatever the panel requested.
+      const fromNodeId = String(message['fromNodeId'] ?? '');
+      const toNodeId = String(message['toNodeId'] ?? '');
+      const maxHops = typeof message['maxHops'] === 'number' ? message['maxHops'] : 4;
+      const params = new URLSearchParams({
+        fromNodeId,
+        toNodeId,
+        maxHops: String(maxHops),
+      });
+      result = await fetchConnectionsHttp(`/v1/connections/path?${params.toString()}`);
     }
     if (result !== null) {
       connectionsCache.set(cacheKey, {
@@ -3690,8 +3700,11 @@ export default defineBackground(() => {
     return result;
   };
 
-  chrome.runtime.onMessage.addListener(
-    (message: unknown, sender, sendResponse: (response: RuntimeResponse) => void) => {
+  const runtimeMessageListener = (
+    message: unknown,
+    sender: chrome.runtime.MessageSender,
+    sendResponse: (response: RuntimeResponse) => void,
+  ): boolean | undefined => {
       // Build-verification ping from any extension page (side panel,
       // any extension HTML). Returns the build sha + dirty flag + builtAt
       // so operators can confirm which bundle is loaded.
@@ -4227,6 +4240,7 @@ export default defineBackground(() => {
         ((message as { type?: unknown }).type === messageTypes.loadConnectionsSnapshot ||
           (message as { type?: unknown }).type === messageTypes.loadConnectionsNeighbors ||
           (message as { type?: unknown }).type === messageTypes.loadConnectionsEdge ||
+          (message as { type?: unknown }).type === messageTypes.loadConnectionsPath ||
           (message as { type?: unknown }).type === messageTypes.postConnectionsFeedbackEvent)
       ) {
         void handleConnectionsMessage(message as Record<string, unknown>)
@@ -4262,8 +4276,43 @@ export default defineBackground(() => {
           });
         });
       return true;
-    },
-  );
+    };
+
+  chrome.runtime.onMessage.addListener(runtimeMessageListener);
+
+  // Test-only loopback for the e2e harness. Chrome doesn't deliver
+  // chrome.runtime.sendMessage back to the sender's own context, so
+  // when the Patchright stealth e2e routes through worker.evaluate
+  // (the only way to reach chrome.* from a stripped main world), the
+  // SW's own listeners never fire. Stash the listener fn on globalThis
+  // so the test runtime helper can invoke it directly with a fake
+  // sender and capture sendResponse. No production caller uses this —
+  // production messages flow through chrome.runtime.sendMessage from
+  // non-SW contexts, which works normally.
+  (
+    globalThis as unknown as {
+      __sidetrackTestDispatchMessage?: (message: unknown) => Promise<unknown>;
+    }
+  ).__sidetrackTestDispatchMessage = (message: unknown): Promise<unknown> =>
+    new Promise<unknown>((resolve) => {
+      let responded = false;
+      const sendResponse = (response: unknown): void => {
+        if (responded) return;
+        responded = true;
+        resolve(response);
+      };
+      const fakeSender = { id: chrome.runtime.id } as chrome.runtime.MessageSender;
+      const isAsync = runtimeMessageListener(
+        message,
+        fakeSender,
+        sendResponse as (response: RuntimeResponse) => void,
+      );
+      if (isAsync !== true && !responded) {
+        // Synchronous handler that didn't respond — match Chrome's
+        // "no responder" behaviour and resolve with undefined.
+        resolve(undefined);
+      }
+    });
 
   void replayQueuedCaptures().catch(() => undefined);
 

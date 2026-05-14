@@ -304,6 +304,19 @@ const testEmbed = (text: string): Float32Array => {
   return v;
 };
 
+// Override hook: when set, all production embed() calls dispatch
+// to this function instead of running ONNX in-process. The runtime
+// installs the embedder-sidecar client here so the recall rebuild,
+// recall ingestor, and visit-similarity producer all route through
+// the child process automatically. Test embedder bypasses the
+// override — the deterministic embedder is sync and the child
+// overhead is wasted on test inputs.
+type EmbedFn = (texts: readonly string[]) => Promise<readonly Float32Array[]>;
+let embedderOverride: EmbedFn | undefined;
+export const setEmbedderOverride = (fn: EmbedFn | undefined): void => {
+  embedderOverride = fn;
+};
+
 export const embed = async (texts: readonly string[]): Promise<readonly Float32Array[]> => {
   if (texts.length === 0) {
     return [];
@@ -311,14 +324,36 @@ export const embed = async (texts: readonly string[]): Promise<readonly Float32A
   if (isTestEmbedderEnabled()) {
     return texts.map(testEmbed);
   }
+  if (embedderOverride !== undefined) {
+    return embedderOverride(texts);
+  }
   const extractor = await getEmbedder();
   const vectors: Float32Array[] = [];
-  for (const text of texts) {
+  for (let i = 0; i < texts.length; i += 1) {
+    const text = texts[i] as string;
     const output = await extractor(`${E5_PREFIX}${text}`, {
       pooling: 'mean',
       normalize: true,
     });
     vectors.push(padOrTruncate(toFloat32(output.data)));
+    // Per-text yield so the event loop can accept HTTP requests
+    // (especially /v1/status) between ONNX inferences. transformers
+    // .js + onnxruntime-node call into native code; the C++ inference
+    // runs in one shot per `extractor(text)` call (~30–50 ms on
+    // Apple Silicon with Accelerate). Without this yield, a 16-text
+    // batch is one 700 ms main-thread block — long enough for
+    // /v1/status to time out at the panel's poll window. Yielding
+    // every text turns the block into 16 × ~50 ms ticks with idle
+    // slots in between; HTTP accept resumes immediately.
+    //
+    // Skip the trailing yield: the caller adds its own inter-batch
+    // yield and a redundant setImmediate just delays completion by
+    // one extra tick.
+    if (i < texts.length - 1) {
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+    }
   }
   return vectors;
 };

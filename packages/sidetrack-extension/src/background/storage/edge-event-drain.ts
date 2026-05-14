@@ -1,5 +1,17 @@
 import type { BufferedEvent } from './in-memory-event-buffer';
 
+// 2026-05 cleanup: the extension previously maintained
+// `ACCEPTED_EDGE_EVENT_STREAM_NAMES` as a parallel whitelist that had
+// to mirror the companion's `ACCEPTED_EDGE_EVENT_TYPES`. The two
+// drifted (navigation.committed got captured but never uploaded for
+// weeks because the extension whitelist forgot it). The fix is to
+// stop maintaining two lists at all: the COMPANION is the sole
+// gatekeeper for what its `/v1/edge/events` route accepts. Any event
+// in the extension's IndexedDB buffer is now routed to the companion;
+// if the companion rejects the type with `'invalid-event-type'`, the
+// drain summary marks it permanently rejected and the local buffer
+// evicts it. Same end-state, one source of truth.
+
 export interface EdgeEventDrainResult {
   readonly acceptedEvents: readonly BufferedEvent[];
   readonly permanentlyRejectedEvents: readonly BufferedEvent[];
@@ -50,43 +62,21 @@ const PERMANENT_SKIP_REASONS = new Set([
   'invalid-payload',
 ]);
 
-const countBufferedEventsByType = (
-  events: readonly BufferedEvent[],
-): Record<string, number> => {
-  const byType: Record<string, number> = {};
-  for (const event of events) {
-    byType[event.streamName] = (byType[event.streamName] ?? 0) + 1;
-  }
-  return byType;
-};
-
 export const partitionEdgeEventDrainBatch = (
   batch: readonly BufferedEvent[],
-  acceptedStreamNames: ReadonlySet<BufferedEvent['streamName']>,
   maxRouteBatchSize: number,
 ): EdgeEventDrainBatchPartition => {
-  const routeBatch: BufferedEvent[] = [];
-  const locallyRejectedBatch: BufferedEvent[] = [];
+  // No local whitelist filtering — the companion's
+  // `/v1/edge/events` route is the sole authority. Events with
+  // unknown types come back as `'invalid-event-type'` skips and
+  // `summarizeEdgeEventDrain` evicts them on the next pass.
   const routeLimit = Math.max(0, Math.floor(maxRouteBatchSize));
-
-  for (const event of batch) {
-    if (!acceptedStreamNames.has(event.streamName)) {
-      locallyRejectedBatch.push(event);
-      continue;
-    }
-    if (routeBatch.length < routeLimit) {
-      routeBatch.push(event);
-    }
-  }
-
+  const routeBatch = batch.slice(0, routeLimit);
   return {
     routeBatch,
-    locallyRejectedBatch,
-    evictedByType: countBufferedEventsByType(locallyRejectedBatch),
-    skippedByReason:
-      locallyRejectedBatch.length === 0
-        ? {}
-        : { 'invalid-event-type': locallyRejectedBatch.length },
+    locallyRejectedBatch: [],
+    evictedByType: {},
+    skippedByReason: {},
   };
 };
 

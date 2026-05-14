@@ -1,7 +1,7 @@
 import { messageTypes } from '../../messages';
 import type { ContextPackInput } from './contextPack';
 import { topicLabel, type TopicLabelResult } from './topicLabel';
-import type { ConnectionEdge, ConnectionsScopedResult } from './types';
+import type { ConnectionEdge, ConnectionNode, ConnectionsScopedResult } from './types';
 import type { Reason } from './why-related/reasons';
 
 // Side-panel client for the Connections HTTP routes. Background.ts
@@ -264,6 +264,24 @@ export const fetchConnectionsEdge = (
     return response as ConnectionsClientResponse<ConnectionEdge>;
   });
 
+// Stage 5 polish — BFS path between two nodes via the companion's
+// /v1/connections/path route. The companion returns either:
+//   { found: true,  nodes: [...], edges: [...] }
+//   { found: false }
+// We expose both honestly so the UI can render a "no path" state.
+export interface ConnectionsPathResult {
+  readonly found: boolean;
+  readonly nodes?: readonly ConnectionNode[];
+  readonly edges?: readonly ConnectionEdge[];
+}
+
+export const fetchConnectionsPath = (input: {
+  readonly fromNodeId: string;
+  readonly toNodeId: string;
+  readonly maxHops?: number;
+}): Promise<ConnectionsClientResponse<ConnectionsPathResult>> =>
+  call<ConnectionsPathResult>(messageTypes.loadConnectionsPath, input);
+
 const textFromMetadata = (
   metadata: Record<string, unknown>,
   keys: readonly string[],
@@ -435,7 +453,23 @@ export const whyRelatedReasonsFromConnections = (
         cohesion: topic === undefined ? 0 : numberFromMetadata(topic.metadata, 'cohesion', 0),
       });
     } else if (edge.kind === 'visit_resembles_visit') {
-      reasons.push({ code: 'COSINE_ABOVE_THRESHOLD', cosine: 0.85, threshold: 0.85 });
+      // The similarity producer's cosine + threshold ride the edge
+      // metadata (snapshot.ts:1986). No hardcoded fallback: if the
+      // companion didn't ship them (pre-fix snapshot or different
+      // producer), drop the reason entirely rather than display a
+      // made-up score. The UI is free to render this gap as
+      // "via similarity (score n/a)" if it wants.
+      const meta = edge.metadata ?? {};
+      const cosine = meta['cosine'];
+      const threshold = meta['threshold'];
+      if (
+        typeof cosine === 'number' &&
+        Number.isFinite(cosine) &&
+        typeof threshold === 'number' &&
+        Number.isFinite(threshold)
+      ) {
+        reasons.push({ code: 'COSINE_ABOVE_THRESHOLD', cosine, threshold });
+      }
     } else if (edge.kind === 'closest_visit') {
       const reason = rankerReasonForEdge(edge);
       if (reason !== null) reasons.push(reason);

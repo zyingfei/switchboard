@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { access, readFile, readdir, stat } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { buildAnchorFromTerm } from '../annotation/anchorBuilder.js';
@@ -22,6 +22,10 @@ import {
   VISUAL_FINGERPRINT_OBSERVED,
   isVisualFingerprintObservedPayload,
 } from '../visual/events.js';
+import {
+  NAVIGATION_COMMITTED,
+  isNavigationCommittedPayload,
+} from '../navigation/events.js';
 import {
   defaultAllowedTools,
   isAllowed,
@@ -96,6 +100,7 @@ import {
   type UrlProjection,
 } from '../urls/projection.js';
 import { autoApplyUrlAttribution } from '../urls/autoApply.js';
+import { URL_IGNORED } from '../urls/events.js';
 import {
   appendEntry as appendEntryRaw,
   gcEntries as gcEntriesRaw,
@@ -200,6 +205,20 @@ const syncSummaryDeps = (
                     ...(live.lastDisconnectedAtMs === undefined
                       ? {}
                       : { lastDisconnectedAtMs: live.lastDisconnectedAtMs }),
+                    // Stage 5 polish — peer-event throughput. Older
+                    // runtimes that haven't been recompiled won't have
+                    // these fields; guard via undefined.
+                    ...(live.eventsIn === undefined ? {} : { eventsIn: live.eventsIn }),
+                    ...(live.eventsOut === undefined ? {} : { eventsOut: live.eventsOut }),
+                    ...(live.lastInboundAtMs === undefined
+                      ? {}
+                      : { lastInboundAtMs: live.lastInboundAtMs }),
+                    ...(live.lastOutboundAtMs === undefined
+                      ? {}
+                      : { lastOutboundAtMs: live.lastOutboundAtMs }),
+                    ...(live.byReplica === undefined
+                      ? {}
+                      : { byReplica: live.byReplica }),
                   }),
             },
             ...materializersBlock,
@@ -235,7 +254,10 @@ import { collectHealth, type CaptureWarningHealth, type HealthReport } from '../
 import { collectWorkGraphHealth } from '../system/workGraphHealth.js';
 import { checkLatestVersion, type UpdateAdvisory } from '../system/versionCheck.js';
 import { COMPANION_VERSION } from '../version.js';
-import { maybeRetrainClosestVisitRanker } from '../ranker/retrain.js';
+import {
+  maybeRetrainClosestVisitRanker,
+  runMaybeRetrainInWorker,
+} from '../ranker/retrain.js';
 import {
   listAnnotations,
   softDeleteAnnotation,
@@ -311,6 +333,20 @@ export interface CompanionHttpConfig {
       readonly lastDisconnectedAtMs?: number;
       readonly consecutiveFailures: number;
       readonly pendingPublishes: number;
+      // Stage 5 polish — peer-event throughput counters. Optional so
+      // older runtimes that haven't shipped the relay change yet keep
+      // working against the new server typing.
+      readonly eventsIn?: number;
+      readonly eventsOut?: number;
+      readonly lastInboundAtMs?: number;
+      readonly lastOutboundAtMs?: number;
+      readonly byReplica?: ReadonlyArray<{
+        readonly replicaId: string;
+        readonly eventsIn: number;
+        readonly eventsOut: number;
+        readonly lastInboundAtMs?: number;
+        readonly lastOutboundAtMs?: number;
+      }>;
     } | null;
   };
   readonly updateChecker?: () => Promise<UpdateAdvisory>;
@@ -410,6 +446,23 @@ export interface CompanionHttpConfig {
   // changes such as forced ranker retraining. Runtime wiring points
   // this at the connections materializer catchUp path.
   readonly refreshConnections?: () => Promise<void>;
+  // Event-loop stall snapshot. /v1/status surfaces it so operators
+  // can diagnose API stalls without re-running the companion under
+  // a profiler. The getter MUST be synchronous + side-effect-free
+  // (it reads a perf_hooks histogram). When omitted the field is
+  // simply absent from /v1/status — tests don't need it.
+  readonly getEventLoopSnapshot?: () => import(
+    '../runtime/eventLoopMonitor.js'
+  ).EventLoopSnapshot;
+  // Embedder sidecar status — drives /v1/status.recall.vectorState.
+  // Like getEventLoopSnapshot it MUST be synchronous + side-effect-
+  // free; reads cached state, never blocks on a spawn/warmup. When
+  // omitted (test mode / in-process embedder) /status reports
+  // \`vectorState: 'disabled'\`.
+  readonly getEmbedderStatus?: () => {
+    readonly state: 'disabled' | 'cold' | 'warming' | 'ready' | 'failed';
+    readonly lastError?: string;
+  };
 }
 
 export interface StartedHttpServer {
@@ -1242,6 +1295,19 @@ const routes: readonly RouteDefinition[] = [
     pattern: /^\/v1\/status$/,
     authRequired: true,
     handle: async (_request, requestId, _match, context) => {
+      // /v1/status is the **liveness + cached-readiness** probe the
+      // side panel polls every 15s. It MUST:
+      //   - Return immediately even if the materializer is in the
+      //     middle of catchUp, the recall index is rebuilding, or
+      //     the ONNX embedder hasn't been initialised yet.
+      //   - Never trigger a rebuild, a model load, an embedder
+      //     warmup, or an unbounded `waitForRebuild()` call.
+      //   - Never transitively import recall/ingestor/embedder/
+      //     transformers/ONNX. The only allowed dependencies are
+      //     synchronous getters on the runtime context.
+      // The response shape reports subsystem state as data; the
+      // request itself does no work to make any subsystem ready.
+      //
       // When the companion manages an MCP child, probe its /mcp
       // endpoint so the side panel knows whether restart/config
       // changes succeeded. Distinguishes three states the user
@@ -1334,14 +1400,95 @@ const routes: readonly RouteDefinition[] = [
                     ...(relayLive.lastDisconnectedAtMs === undefined
                       ? {}
                       : { lastDisconnectedAtMs: relayLive.lastDisconnectedAtMs }),
+                    // Peer-event throughput counters mirrored from
+                    // /v1/system/health.sync — the side panel polls
+                    // /v1/status frequently for reachability, so
+                    // surfacing them here too means the throughput
+                    // chips can update at the same cadence.
+                    ...(relayLive.eventsIn === undefined ? {} : { eventsIn: relayLive.eventsIn }),
+                    ...(relayLive.eventsOut === undefined
+                      ? {}
+                      : { eventsOut: relayLive.eventsOut }),
+                    ...(relayLive.lastInboundAtMs === undefined
+                      ? {}
+                      : { lastInboundAtMs: relayLive.lastInboundAtMs }),
+                    ...(relayLive.lastOutboundAtMs === undefined
+                      ? {}
+                      : { lastOutboundAtMs: relayLive.lastOutboundAtMs }),
+                    ...(relayLive.byReplica === undefined
+                      ? {}
+                      : { byReplica: relayLive.byReplica }),
                   }),
             };
+      // ---- cached subsystem state — no work allowed ----
+      // Snapshot state: the connections snapshot store's last
+      // committed revision. Read once, no rebuild trigger.
+      let snapshotState:
+        | { readonly state: 'missing' | 'ready'; readonly revision?: string; readonly updatedAt?: string }
+        | undefined;
+      if (context.connectionsStore !== undefined) {
+        try {
+          const current = await context.connectionsStore.readCurrent();
+          if (current === null) {
+            snapshotState = { state: 'missing' };
+          } else {
+            snapshotState = {
+              state: 'ready',
+              ...(current.snapshotRevision === undefined ? {} : { revision: current.snapshotRevision }),
+              updatedAt: current.updatedAt,
+            };
+          }
+        } catch {
+          snapshotState = { state: 'missing' };
+        }
+      }
+      // Recall state — uses `isRebuilding()` (sync) only. Calling
+      // `report()` here would read the index file (fast) but adds
+      // I/O latency; `/v1/system/health` already exposes the rich
+      // report for callers that want it. /status reports just the
+      // coarse state so the panel can render "warming" vs "ready".
+      const embedderStatus = context.getEmbedderStatus?.() ?? { state: 'disabled' as const };
+      let recallState:
+        | {
+            readonly state: 'disabled' | 'rebuilding' | 'ready';
+            readonly vectorState: 'disabled' | 'cold' | 'warming' | 'ready' | 'failed';
+            readonly vectorError?: string;
+          }
+        | undefined;
+      if (context.recallLifecycle !== undefined) {
+        recallState = {
+          state: context.recallLifecycle.isRebuilding() ? 'rebuilding' : 'ready',
+          vectorState: embedderStatus.state,
+          ...(embedderStatus.lastError === undefined ? {} : { vectorError: embedderStatus.lastError }),
+        };
+      } else {
+        recallState = { state: 'disabled', vectorState: embedderStatus.state };
+      }
+      // Materializer state — cached health snapshot (sync).
+      const materializerHealth = context.syncMaterializerHealth?.() ?? undefined;
+      const materializerState =
+        materializerHealth === undefined
+          ? undefined
+          : {
+              state: Object.values(materializerHealth).some((h) => h.status === 'failed')
+                ? 'failed'
+                : Object.values(materializerHealth).some((h) => h.pending)
+                  ? 'catching_up'
+                  : 'idle',
+              detail: materializerHealth,
+            };
+      const eventLoopState = context.getEventLoopSnapshot?.();
       return [
         200,
         {
           data: {
             companion: 'running',
             vault: await context.vaultWriter.status(),
+            api: { live: true },
+            ...(snapshotState === undefined ? {} : { snapshot: snapshotState }),
+            ...(recallState === undefined ? {} : { recall: recallState }),
+            ...(materializerState === undefined ? {} : { materializer: materializerState }),
+            ...(eventLoopState === undefined ? {} : { eventLoop: eventLoopState }),
             // P1-review: vaultRoot lets the side panel build Codex
             // MCP config snippets without asking the user to paste
             // the absolute vault path. Only included when the
@@ -2021,6 +2168,62 @@ const routes: readonly RouteDefinition[] = [
         // Stage 5.2 R5 — see matching block in the tab-session POST
         // route. (PR #141's invalidateCachedUrlProjection was a TTL
         // cache buster that R2/R5 makes redundant.)
+        const { projection: postProjection } = await loadUrlProjection(context, eventLog);
+        return [
+          201,
+          {
+            data: {
+              accepted,
+              projection: serializeUrlProjection(postProjection),
+            },
+          },
+        ];
+      });
+    },
+  },
+  {
+    // Stage 5 polish — explicit "don't bother me about this URL"
+    // signal. Distinct from POST /attribute with workstreamId:null
+    // (which says "meaningful but no workstream"). Writes a
+    // urls.ignored event; the URL projection's currentIgnored field
+    // hides it from Inbox + auto-apply.
+    method: 'POST',
+    pattern: /^\/v1\/visits\/(?<canonicalUrl>[^/]+)\/ignore$/u,
+    authRequired: true,
+    handle: async (request, _requestId, match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
+      if (canonicalUrl.length === 0) {
+        throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
+      }
+      const eventLog = context.eventLog;
+      const idempotencyKey = requireIdempotencyKey(request);
+      return await runIdempotent(context, 'urlIgnore', idempotencyKey, async () => {
+        const body = objectRecord(await readBody(request)) ?? {};
+        const rawReason = body['reason'];
+        const reason =
+          rawReason === 'noise' || rawReason === 'duplicate' || rawReason === 'private'
+            ? rawReason
+            : 'noise';
+        const payload = {
+          payloadVersion: 1 as const,
+          canonicalUrl,
+          reason,
+        };
+        const aggregateId = `url-ignored:${canonicalUrl}`;
+        const accepted = await eventLog.appendClient({
+          clientEventId: idempotencyKey,
+          aggregateId,
+          type: URL_IGNORED,
+          payload,
+          baseVector: await baseVectorForAggregate(eventLog, aggregateId),
+        });
         const { projection: postProjection } = await loadUrlProjection(context, eventLog);
         return [
           201,
@@ -3414,6 +3617,29 @@ const routes: readonly RouteDefinition[] = [
       if (index.items.length === 0) {
         return [200, { data: [] }];
       }
+      // Vector availability gate. The embedder runs in a child
+      // process; cold/warming/failed states return lexical-only
+      // results immediately. Callers that want to wait for the
+      // vector path can pass ?waitMs=N (capped at 5000) and we'll
+      // poll for ready up to that budget. Default is non-blocking
+      // — /v1/recall/query must not stall the side panel on a
+      // cold embedder.
+      const embedderStatus = context.getEmbedderStatus?.() ?? { state: 'disabled' as const };
+      const rawWait = Number.parseInt(url.searchParams.get('waitMs') ?? '0', 10);
+      const waitBudgetMs = Number.isFinite(rawWait) && rawWait > 0 ? Math.min(rawWait, 5_000) : 0;
+      const isVectorUsable = (s: string): boolean => s === 'ready' || s === 'disabled';
+      let vectorStateAtQuery = embedderStatus.state;
+      if (!isVectorUsable(vectorStateAtQuery) && waitBudgetMs > 0 && vectorStateAtQuery !== 'failed') {
+        const deadline = Date.now() + waitBudgetMs;
+        while (Date.now() < deadline) {
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, 50);
+          });
+          const next = context.getEmbedderStatus?.() ?? { state: 'disabled' as const };
+          vectorStateAtQuery = next.state;
+          if (isVectorUsable(vectorStateAtQuery)) break;
+        }
+      }
       // Embedding the query needs the local model. In offline mode
       // with an empty cache (or any other "we can't load the model"
       // failure path), the embedder throws RecallModelMissingError —
@@ -3422,24 +3648,29 @@ const routes: readonly RouteDefinition[] = [
       // "recall failed". Capture continues to work in that state
       // because POST /v1/events doesn't depend on the embedder.
       let queryEmbedding: Float32Array | undefined;
-      try {
-        [queryEmbedding] = await embed([query.q]);
-      } catch (error) {
-        if (error instanceof RecallModelMissingError) {
-          return [
-            503,
-            createProblem({
-              title: 'Recall embedding model is not available',
-              status: 503,
-              code: 'RECALL_MODEL_MISSING',
-              correlationId: createRequestId(),
-              detail: error.offline
-                ? `Companion is in offline-models mode and the cache at ${error.cacheDir} does not contain ${MODEL_ID}. Run \`sidetrack-companion models ensure\` (with network access) or disable --offline-models / SIDETRACK_OFFLINE_MODELS.`
-                : `Could not load ${MODEL_ID} from ${error.cacheDir}. Run \`sidetrack-companion models ensure\` to (re)download the model.`,
-            }),
-          ];
+      let vectorMode: 'used' | 'skipped-warming' | 'skipped-failed' = 'used';
+      if (!isVectorUsable(vectorStateAtQuery)) {
+        vectorMode = vectorStateAtQuery === 'failed' ? 'skipped-failed' : 'skipped-warming';
+      } else {
+        try {
+          [queryEmbedding] = await embed([query.q]);
+        } catch (error) {
+          if (error instanceof RecallModelMissingError) {
+            return [
+              503,
+              createProblem({
+                title: 'Recall embedding model is not available',
+                status: 503,
+                code: 'RECALL_MODEL_MISSING',
+                correlationId: createRequestId(),
+                detail: error.offline
+                  ? `Companion is in offline-models mode and the cache at ${error.cacheDir} does not contain ${MODEL_ID}. Run \`sidetrack-companion models ensure\` (with network access) or disable --offline-models / SIDETRACK_OFFLINE_MODELS.`
+                  : `Could not load ${MODEL_ID} from ${error.cacheDir}. Run \`sidetrack-companion models ensure\` to (re)download the model.`,
+              }),
+            ];
+          }
+          throw error;
         }
-        throw error;
       }
       const threadIds =
         query.workstreamId === undefined
@@ -3542,7 +3773,17 @@ const routes: readonly RouteDefinition[] = [
         queryLength: query.q.length,
         resultCount: enriched.length,
       });
-      return [200, { data: enriched }];
+      return [
+        200,
+        {
+          data: enriched,
+          meta: {
+            vectorMode,
+            vectorState: vectorStateAtQuery,
+            ...(waitBudgetMs > 0 ? { waitedMs: waitBudgetMs } : {}),
+          },
+        },
+      ];
     },
   },
   {
@@ -4397,29 +4638,24 @@ const routes: readonly RouteDefinition[] = [
           'Body must be { events: AcceptedEvent[] }.',
         );
       }
-      const ACCEPTED_EDGE_EVENT_TYPES = new Set<string>([
-        ENGAGEMENT_INTERVAL_OBSERVED,
-        ENGAGEMENT_SESSION_AGGREGATED,
-        SELECTION_COPIED,
-        SELECTION_PASTED,
-        VISUAL_FINGERPRINT_OBSERVED,
+      // Single source of truth for what `/v1/edge/events` accepts.
+      // Previously a parallel `ACCEPTED_EDGE_EVENT_TYPES` Set plus a
+      // `validatePayload` switch could drift (each new event type
+      // needed two synchronized edits — that's how navigation.committed
+      // shipped without a validator entry). One Map; adding a type
+      // means one entry, period.
+      const EDGE_EVENT_VALIDATORS = new Map<string, (payload: unknown) => boolean>([
+        [ENGAGEMENT_INTERVAL_OBSERVED, isEngagementIntervalObservedPayload],
+        [ENGAGEMENT_SESSION_AGGREGATED, isEngagementSessionAggregatedPayload],
+        [SELECTION_COPIED, isSelectionCopiedPayload],
+        [SELECTION_PASTED, isSelectionPastedPayload],
+        [VISUAL_FINGERPRINT_OBSERVED, isVisualFingerprintObservedPayload],
+        [NAVIGATION_COMMITTED, isNavigationCommittedPayload],
       ]);
-      const validatePayload = (type: string, payload: unknown): boolean => {
-        switch (type) {
-          case ENGAGEMENT_INTERVAL_OBSERVED:
-            return isEngagementIntervalObservedPayload(payload);
-          case ENGAGEMENT_SESSION_AGGREGATED:
-            return isEngagementSessionAggregatedPayload(payload);
-          case SELECTION_COPIED:
-            return isSelectionCopiedPayload(payload);
-          case SELECTION_PASTED:
-            return isSelectionPastedPayload(payload);
-          case VISUAL_FINGERPRINT_OBSERVED:
-            return isVisualFingerprintObservedPayload(payload);
-          default:
-            return false;
-        }
-      };
+      const isAcceptedEdgeEventType = (type: string): boolean =>
+        EDGE_EVENT_VALIDATORS.has(type);
+      const validatePayload = (type: string, payload: unknown): boolean =>
+        EDGE_EVENT_VALIDATORS.get(type)?.(payload) ?? false;
       const imported: { replicaId: string; seq: number }[] = [];
       const skipped: { replicaId: string; seq: number; reason: string }[] = [];
       for (const candidate of body.events) {
@@ -4433,7 +4669,7 @@ const routes: readonly RouteDefinition[] = [
           continue;
         }
         const event = candidate as import('../sync/causal.js').AcceptedEvent;
-        if (!ACCEPTED_EDGE_EVENT_TYPES.has(event.type)) {
+        if (!isAcceptedEdgeEventType(event.type)) {
           skipped.push({
             replicaId: event.dot.replicaId,
             seq: event.dot.seq,
@@ -4594,24 +4830,49 @@ const routes: readonly RouteDefinition[] = [
         'randomNegativeCandidatesPerPositive',
       );
       const trainNumRound = optionalFiniteNumber(body['numRound'], 'numRound');
-      const snapshot = await context.connectionsStore.readCurrent();
-      if (snapshot === null) {
-        throw new HttpRouteError(
-          409,
-          'CONNECTIONS_SNAPSHOT_MISSING',
-          'Connections snapshot is not ready.',
-        );
+      // Stage 5 polish — route through the worker helper so BOTH the
+      // cold-path file reads (readMerged + readCurrent) AND the
+      // LightGBM training math run off the main event loop. /v1/status
+      // + every other warm-path poll stay responsive while retrain is
+      // in flight. The handler now returns to the request body only
+      // after the worker round-trip, but it never executes any
+      // CPU-heavy or I/O-heavy work on its own thread.
+      // SIDETRACK_RANKER_RETRAIN_INLINE=1 opts back into the legacy
+      // inline path for fixtures + tests that don't carry a built
+      // worker bundle.
+      const trainOptions = trainNumRound === undefined ? undefined : { numRound: trainNumRound };
+      let result: Awaited<ReturnType<typeof maybeRetrainClosestVisitRanker>>;
+      if (process.env['SIDETRACK_RANKER_RETRAIN_INLINE'] === '1') {
+        // Inline path also gets called for tests, which inject
+        // `context.eventLog` + `context.connectionsStore` directly.
+        const snapshot = await context.connectionsStore.readCurrent();
+        if (snapshot === null) {
+          throw new HttpRouteError(
+            409,
+            'CONNECTIONS_SNAPSHOT_MISSING',
+            'Connections snapshot is not ready.',
+          );
+        }
+        result = await maybeRetrainClosestVisitRanker({
+          vaultRoot,
+          merged: await context.eventLog.readMerged(),
+          snapshot,
+          ...(threshold === undefined ? {} : { threshold }),
+          ...(randomNegativeCandidatesPerPositive === undefined
+            ? {}
+            : { randomNegativeCandidatesPerPositive }),
+          ...(trainOptions === undefined ? {} : { trainOptions }),
+        });
+      } else {
+        result = await runMaybeRetrainInWorker({
+          vaultRoot,
+          ...(threshold === undefined ? {} : { threshold }),
+          ...(randomNegativeCandidatesPerPositive === undefined
+            ? {}
+            : { randomNegativeCandidatesPerPositive }),
+          ...(trainOptions === undefined ? {} : { trainOptions }),
+        });
       }
-      const result = await maybeRetrainClosestVisitRanker({
-        vaultRoot,
-        merged: await context.eventLog.readMerged(),
-        snapshot,
-        ...(threshold === undefined ? {} : { threshold }),
-        ...(randomNegativeCandidatesPerPositive === undefined
-          ? {}
-          : { randomNegativeCandidatesPerPositive }),
-        ...(trainNumRound === undefined ? {} : { trainOptions: { numRound: trainNumRound } }),
-      });
       if (result.status === 'trained') {
         await context.refreshConnections?.();
       }
@@ -4804,6 +5065,48 @@ const routes: readonly RouteDefinition[] = [
       const { findPath } = await import('../connections/snapshot.js');
       const result = findPath(snap, fromNodeId, toNodeId, maxHops);
       return [200, { data: result }];
+    },
+  },
+  // Stage 5 polish — debug snapshot endpoint. The side panel collects
+  // current visual state (focused tab, urlInbox, urlSuggestions, panel
+  // settings) and POSTs the JSON blob here. We always overwrite
+  // `${vaultRoot}/_BAC/debug-dumps/latest.json` so the user (and any
+  // assistant they hand the path to) can read a single stable location
+  // without tracking timestamps; the timestamped copy under the same
+  // directory is kept for short-history scrubbing.
+  {
+    method: 'POST',
+    pattern: /^\/v1\/debug\/dump$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      const body = await readBody(request);
+      const dumpsDir = join(vaultRoot, '_BAC', 'debug-dumps');
+      await mkdir(dumpsDir, { recursive: true });
+      // Use an ISO timestamp + millisecond suffix so rapid-fire dumps
+      // don't collide. Colons are valid on macOS / Linux but APFS
+      // displays them oddly in Finder — strip to a safe pattern.
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      const stamped = join(dumpsDir, `${ts}.json`);
+      const latest = join(dumpsDir, 'latest.json');
+      // Wrap the panel-supplied payload alongside a server-side header
+      // (timestamp + companion uptime + vaultRoot) so the dump is
+      // self-contained for offline review.
+      const wrapped = {
+        header: {
+          dumpedAt: new Date().toISOString(),
+          vaultRoot,
+          companion: 'sidetrack-companion',
+        },
+        panel: body,
+      };
+      const json = JSON.stringify(wrapped, null, 2);
+      await writeFile(stamped, json, 'utf8');
+      await writeFile(latest, json, 'utf8');
+      return [
+        201,
+        { data: { path: latest, stampedPath: stamped, sizeBytes: Buffer.byteLength(json, 'utf8') } },
+      ];
     },
   },
 ];

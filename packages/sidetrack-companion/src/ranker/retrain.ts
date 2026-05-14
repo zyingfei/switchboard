@@ -23,15 +23,26 @@ import {
 } from './train.js';
 import type { Candidate, CandidateSource } from './types.js';
 
-export const DEFAULT_RANKER_RETRAIN_LABEL_THRESHOLD = 50;
+// Lowered from 50 to 5 (post-PR141 backfill made 50 unreachable in
+// practice for normal dogfood cadence). Production cadence is now
+// guarded by the cooldown below — they're two halves of the same rule.
+export const DEFAULT_RANKER_RETRAIN_LABEL_THRESHOLD = 5;
 export const DEFAULT_RANDOM_NEGATIVES_PER_POSITIVE_FROM = 5;
+// Cooldown between successful retrains. Even if new-labels >= threshold,
+// hold off until cooldown elapses to avoid thrashing during a burst of
+// user organizing.
+export const DEFAULT_RANKER_RETRAIN_COOLDOWN_MS = 10 * 60_000;
 export const RANKER_RETRAIN_STATE_SCHEMA_VERSION = 1;
 
-// Stage 5 / T4 — env-tunable retrain threshold for dogfood. Production
-// default stays at 50; dogfood values of 10–15 unblock training while
-// the user accumulates feedback. Explicit `threshold` option still
-// wins.
+// Stage 5 / T4 — env-tunable retrain threshold for dogfood.
+// Explicit `threshold` option still wins over the env.
 export const RANKER_RETRAIN_LABEL_THRESHOLD_ENV = 'SIDETRACK_RANKER_RETRAIN_MIN_LABELS';
+// Cooldown env knob, in ms. Override DEFAULT_RANKER_RETRAIN_COOLDOWN_MS.
+export const RANKER_RETRAIN_COOLDOWN_MS_ENV = 'SIDETRACK_RANKER_RETRAIN_COOLDOWN_MS';
+// Force-train env: set to '1' to bypass threshold + cooldown checks
+// (still respects 'unchanged' / 'no-labels' / 'no-training-candidates'
+// skip reasons since those reflect real "nothing to train on" states).
+export const RANKER_RETRAIN_FORCE_ENV = 'SIDETRACK_RANKER_RETRAIN_FORCE';
 
 const readEnvNumber = (name: string): number | undefined => {
   const raw = process.env[name];
@@ -132,6 +143,7 @@ export type RankerRetrainSkipReason =
   | 'no-labels'
   | 'unchanged'
   | 'below-threshold'
+  | 'cooldown'
   | 'no-training-candidates';
 
 export type RankerRetrainPlan =
@@ -187,6 +199,12 @@ export interface PlanRankerRetrainInput {
   readonly fingerprint: RankerTrainingLabelDatasetFingerprint;
   readonly state: RankerRetrainState | null;
   readonly threshold?: number | undefined;
+  /** Cooldown in ms since last successful train; ignored when `force` set. */
+  readonly cooldownMs?: number | undefined;
+  /** `Date.now()` for cooldown comparison; injected for tests. */
+  readonly nowMs?: number | undefined;
+  /** Bypasses threshold + cooldown when true. */
+  readonly force?: boolean | undefined;
 }
 
 export interface BuildRankerTrainingCandidatesInput {
@@ -302,10 +320,20 @@ export const fingerprintFeedbackTrainingLabels = (
   };
 };
 
+const normalizedCooldownMs = (cooldownMs: number | undefined): number => {
+  if (cooldownMs === undefined || !Number.isFinite(cooldownMs)) {
+    return DEFAULT_RANKER_RETRAIN_COOLDOWN_MS;
+  }
+  return Math.max(0, Math.floor(cooldownMs));
+};
+
 export const planRankerRetrain = ({
   fingerprint,
   state,
   threshold,
+  cooldownMs,
+  nowMs,
+  force,
 }: PlanRankerRetrainInput): RankerRetrainPlan => {
   if (fingerprint.labelCount === 0) {
     return { action: 'skip', reason: 'no-labels', fingerprint, newLabelCount: 0 };
@@ -317,8 +345,28 @@ export const planRankerRetrain = ({
 
   const previousLabelCount = state?.lastTrainedLabelCount ?? 0;
   const newLabelCount = Math.max(0, fingerprint.labelCount - previousLabelCount);
+
+  // Force flag bypasses the next two checks entirely but still respects
+  // 'no-labels' + 'unchanged' (which mean there's literally nothing
+  // new to learn).
+  if (force === true) {
+    return { action: 'train', fingerprint, newLabelCount };
+  }
+
   if (newLabelCount < normalizedThreshold(threshold)) {
     return { action: 'skip', reason: 'below-threshold', fingerprint, newLabelCount };
+  }
+
+  // Cooldown — avoid retraining more than once per cooldown window
+  // even if labels keep arriving. Skipped when state has never trained
+  // (`state === null`) since there's no prior train to wait on.
+  if (state !== null) {
+    const lastTrainedAtMs = state.updatedAt;
+    const cooldown = normalizedCooldownMs(cooldownMs);
+    const now = nowMs ?? Date.now();
+    if (cooldown > 0 && now - lastTrainedAtMs < cooldown) {
+      return { action: 'skip', reason: 'cooldown', fingerprint, newLabelCount };
+    }
   }
 
   return { action: 'train', fingerprint, newLabelCount };
@@ -591,10 +639,15 @@ export const maybeRetrainClosestVisitRanker = async ({
   const state = await readState(vaultRoot);
   const resolvedThreshold =
     threshold ?? readEnvNumber(RANKER_RETRAIN_LABEL_THRESHOLD_ENV);
+  const cooldownEnv = readEnvNumber(RANKER_RETRAIN_COOLDOWN_MS_ENV);
+  const forceEnv = process.env[RANKER_RETRAIN_FORCE_ENV];
+  const force = forceEnv === '1' || forceEnv === 'true';
   const plan = planRankerRetrain({
     fingerprint,
     state,
     ...(resolvedThreshold === undefined ? {} : { threshold: resolvedThreshold }),
+    ...(cooldownEnv === undefined ? {} : { cooldownMs: cooldownEnv }),
+    force,
   });
 
   if (plan.action === 'skip') {
@@ -648,4 +701,80 @@ export const maybeRetrainClosestVisitRanker = async ({
       candidateCount: candidates.length,
     };
   }
+};
+
+// Stage 5 polish — Worker-thread spawn helper for ranker retrain.
+// The LightGBM training math AND the cold-path file reads
+// (readMerged, snapshot readCurrent) all run inside the worker so
+// /v1/status + every other warm-path poll stay responsive while
+// retrain is in flight.
+//
+// The worker accepts a minimal serializable job (vaultRoot + knobs),
+// constructs its own EventLog + connectionsStore inside the worker
+// context, and runs the full retrain pipeline. Mirrors the
+// `connectionsReconcileWorker.entry.ts` pattern that already
+// background-runs the materializer drain.
+//
+// The worker entry lives at `./retrain.worker.js` after build (the
+// matching .ts file in this directory).
+export interface RunMaybeRetrainInWorkerInput {
+  readonly vaultRoot: string;
+  readonly threshold?: number;
+  readonly randomNegativeCandidatesPerPositive?: number;
+  readonly trainOptions?: TrainRankerOptions;
+}
+
+export const runMaybeRetrainInWorker = async (
+  input: RunMaybeRetrainInWorkerInput,
+): Promise<RankerRetrainResult> => {
+  // Lazy-import worker_threads so the dual-purpose module (re-exported
+  // for unit tests in addition to the production code path) doesn't
+  // crash environments where worker_threads isn't available (e.g.
+  // future browser-side reuse). Lazy + dynamic also keeps the worker
+  // entry off the cold-start critical path.
+  const { Worker } = await import('node:worker_threads');
+  const workerUrl = new URL('./retrain.worker.js', import.meta.url);
+  return await new Promise<RankerRetrainResult>((resolve, reject) => {
+    const worker = new Worker(workerUrl, { workerData: input });
+    let settled = false;
+    const settle = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      fn();
+    };
+    worker.once(
+      'message',
+      (
+        msg:
+          | { readonly ok: true; readonly result: RankerRetrainResult }
+          | { readonly ok: false; readonly error: string },
+      ) => {
+        settle(() => {
+          if (msg.ok) {
+            resolve(msg.result);
+          } else {
+            reject(new Error(msg.error));
+          }
+        });
+        void worker.terminate();
+      },
+    );
+    worker.once('error', (err) => {
+      settle(() => {
+        reject(err);
+      });
+    });
+    worker.once('exit', (code) => {
+      settle(() => {
+        if (code !== 0) {
+          reject(new Error(`Ranker retrain worker exited with code ${String(code)}`));
+        } else {
+          // Code 0 with no message means the worker finished without
+          // sending a result — treat as a generic failure rather than
+          // hanging the promise forever.
+          reject(new Error('Ranker retrain worker exited without producing a result'));
+        }
+      });
+    });
+  });
 };

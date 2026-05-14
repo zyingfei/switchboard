@@ -23,9 +23,12 @@ export interface BrowserTimelineObservedPayload {
   readonly windowIdHash?: string;
   readonly tabSessionId?: string;
   readonly openerTabSessionId?: string;
-  // Legacy optional field accepted for older spool entries only. New
-  // observations are keyed by tabSessionId and do not stamp the active
-  // workstream pointer.
+  // The active-workstream pointer at observation time, when one was
+  // focused in the side panel. The companion's projection rolls this
+  // onto the timeline-visit node metadata; the snapshot emits a
+  // `visit_in_workstream` edge from it. This is the ambient
+  // attribution path (when no Class A user assertion exists for a
+  // URL, the active workstream during browsing is the best guess).
   readonly workstreamId?: string;
   readonly payloadVersion?: number;
   readonly dimensions?: Record<string, unknown>;

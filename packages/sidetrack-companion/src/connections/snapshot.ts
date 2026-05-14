@@ -1136,12 +1136,66 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
           title: entry.title,
           provider: entry.provider,
           visitCount: entry.visitCount,
+          // 2026-05 fix: surface the active-workstream id the
+          // extension stamped onto the timeline event (TimelineEntry
+          // carries it from the observer; the e2e suite asserts
+          // `metadata.workstreamId === <wsId>` on every captured
+          // timeline-visit, and the snapshot was silently dropping
+          // it). The visit_in_workstream edge is also emitted later
+          // in the pass — this metadata is the "what flow was the
+          // user in when this happened" hint, separate from the
+          // edge.
+          ...(entry.workstreamId === undefined || entry.workstreamId.length === 0
+            ? {}
+            : { workstreamId: entry.workstreamId }),
           ...(searchQuery === undefined ? {} : { searchQuery }),
           ...(engagementClass === undefined
             ? {}
-            : { engagement: { class: engagementClass.class } }),
+            : {
+                engagement: {
+                  class: engagementClass.class,
+                  focusedWindowMs: engagementClass.focusedWindowMs,
+                  scrollEvents: engagementClass.scrollEvents,
+                },
+              }),
         },
       });
+      // 2026-05 fix: emit the `visit_in_workstream` edge that the
+      // ranker, similarity producer, and tab-session resolver all
+      // consume but no companion code was producing. The original
+      // intent (see `timeline/events.ts` "Phase 2 restores
+      // visit_in_workstream") was to restore it via explicit
+      // tab-session attribution — that path never landed, leaving
+      // every consumer staring at empty arrays. The extension now
+      // stamps `workstreamId` on every timeline event (via the
+      // active-workstream cache in `timeline/wiring.ts`), so the
+      // projection's `entry.workstreamId` is populated for ambient
+      // browsing inside a focused workstream. Emit one edge per
+      // (visit, workstream) pair so the snapshot reflects the
+      // attribution.
+      if (entry.workstreamId !== undefined && entry.workstreamId.length > 0) {
+        upsertNode(nodes, {
+          kind: 'workstream',
+          key: entry.workstreamId,
+          label: entry.workstreamId,
+        });
+        upsertEdge(edges, {
+          kind: 'visit_in_workstream',
+          fromNodeId: nodeIdFor('timeline-visit', visitKey),
+          toNodeId: nodeIdFor('workstream', entry.workstreamId),
+          observedAt: entry.lastSeenAt,
+          producedBy: { source: 'timeline-projection' },
+          // 'inferred' — the active-workstream pointer at observation
+          // time is an inference about user intent, not a direct
+          // observation about the URL→workstream relationship. The
+          // sister `timeline_same_url_as_thread` edge nearby also
+          // uses 'inferred' for the same reason. The e2e suite at
+          // `connections-mvp-user-story.spec.ts:291` and downstream
+          // resolver code rely on this classification to decide
+          // whether to weight the edge as evidence.
+          confidence: 'inferred',
+        });
+      }
       const threadId = threadIdByUrl.get(visitKey);
       if (threadId !== undefined) {
         const thread = threadByBacId.get(threadId);
@@ -1184,6 +1238,12 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
     const instanceKey = visitInstanceKey(instance);
     const instanceNodeId = nodeIdFor(VISIT_INSTANCE_NODE_KIND, instanceKey);
     const timelineVisitNodeId = nodeIdFor('timeline-visit', instance.visitKey);
+    // Engagement is URL-aggregate (the classifier keys by canonicalUrl,
+    // not by tab session). Mirroring the same blob onto every
+    // visit-instance of the URL means three tabs of the same page will
+    // report the same "focused 2m 30s" — known trade-off, called out in
+    // the Flow Path tooltip.
+    const instanceEngagement = engagementClassByCanonicalUrl.get(instance.visitKey);
     upsertNode(nodes, {
       kind: VISIT_INSTANCE_NODE_KIND,
       key: instanceKey,
@@ -1197,6 +1257,15 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
         visitCount: instance.visitCount,
         tabSessionId: instance.tabSessionId,
         timelineVisitId: timelineVisitNodeId,
+        ...(instanceEngagement === undefined
+          ? {}
+          : {
+              engagement: {
+                class: instanceEngagement.class,
+                focusedWindowMs: instanceEngagement.focusedWindowMs,
+                scrollEvents: instanceEngagement.scrollEvents,
+              },
+            }),
       },
     });
     for (const replicaId of [...instance.replicaIds].sort()) {
@@ -1972,6 +2041,17 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
         },
         confidence: 'inferred',
         family: 'urlmatch',
+        // RCA 2026-05: the similarity producer computes cosine + uses
+        // a threshold to gate emission, but the snapshot previously
+        // wrote no metadata at all. The side panel's Why-related
+        // panel hardcoded `cosine: 0.85, threshold: 0.85` because it
+        // had no real values to display — every "via similarity"
+        // chip lied about the actual score. Persist both so the UI
+        // shows "cosine 0.87 (≥0.85)" instead of guessing.
+        metadata: {
+          cosine: Number(similarityEdge.cosine.toFixed(4)),
+          threshold: Number(input.visitSimilarity.threshold.toFixed(4)),
+        },
       });
     }
   }
@@ -2184,6 +2264,9 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
       metadata: {
         charHashPrefix: lineage.selectionHash.slice(0, 12),
         match: lineage.match,
+        charCount: lineage.charCount,
+        lineCount: lineage.lineCount,
+        contentKindHint: lineage.contentKindHint,
       },
     });
     upsertNode(nodes, {

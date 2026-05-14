@@ -55,11 +55,11 @@ import {
   readClosestVisitRankerRevision,
 } from '../../producers/closest-visit-revision.js';
 import {
-  DEFAULT_TOPIC_COSINE_THRESHOLD,
   TOPIC_HDBSCAN_REVISION_KEY,
   TOPIC_UNION_FIND_REVISION_KEY,
   createTopicRevisionId,
   createTopicRevisionStore,
+  resolveTopicCosineThreshold,
   type TopicAlgorithmVersion,
   type TopicRevision,
   type TopicRevisionStore,
@@ -77,6 +77,7 @@ import {
   type InvalidationKey,
 } from './invalidation.js';
 import { runReconcileInWorker } from './connectionsReconcileWorker.js';
+import { runReconcileInChild } from './connectionsReconcileChildClient.js';
 import {
   createEmbedderWarmthTracker,
   decideHotPathEmbed,
@@ -126,13 +127,14 @@ import {
   type TimelineStore,
 } from '../../timeline/projection.js';
 import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
+import { isMainThread } from 'node:worker_threads';
 import type { AcceptedEvent } from '../causal.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
 import {
   createEmptyTabSessionProjectionAccumulator,
   foldEventIntoTabSessionProjectionAccumulator,
-  seedTabSessionProjectionAccumulator,
+  seedTabSessionProjectionAccumulatorAsync,
   tabSessionProjectionFromAccumulator,
   type TabSessionProjectionAccumulator,
 } from '../../tabsession/projection.js';
@@ -140,7 +142,7 @@ import {
   applyThreadAttributionsToAccumulator,
   createEmptyUrlProjectionAccumulator,
   foldEventIntoUrlProjectionAccumulator,
-  seedUrlProjectionAccumulator,
+  seedUrlProjectionAccumulatorAsync,
   urlProjectionFromAccumulator,
   type UrlProjectionAccumulator,
 } from '../../urls/projection.js';
@@ -170,7 +172,14 @@ const FAILURE_COOLDOWN_MS = 5_000;
 // a single drain instead of one rebuild per event. Sustained event streams
 // at a lower frequency than this window still produce per-event drains;
 // the worker_thread move (W1b) is the structural fix for those.
-const DRAIN_DEBOUNCE_MS = 250;
+// Drain debounce. Bumped from 250 ms → 1500 ms to coalesce bursts of
+// incoming events on a real prod vault. Each buildAndWrite is ~600 ms
+// of main-thread sync CPU (buildConnectionsSnapshot dominates); with
+// 250 ms debounce a 10-event burst produces 10 drains and 6 s of
+// pinned main thread. 1500 ms collapses the same burst into one
+// drain. Side-panel views poll their own state and don't observe a
+// per-edit reactivity gap below ~2 s, so this is invisible UX-wise.
+const DRAIN_DEBOUNCE_MS = 1500;
 
 // Hardcoded event types this materializer reacts to. Connections
 // has no registry surface, so we can't derive handles from
@@ -594,8 +603,12 @@ export const createConnectionsMaterializer = (
     // calls below. Subsequent drains reuse the accumulator state that
     // onAccepted has been folding into.
     if (!projectionAccumulatorsInitialized) {
-      urlAccumulator = seedUrlProjectionAccumulator(merged);
-      tabSessionAccumulator = seedTabSessionProjectionAccumulator(merged);
+      // Async seeders yield every 500 events so /status (and every
+      // other HTTP request) interleaves with the cold-start fold over
+      // 10k+ events. Switching to the sync versions reintroduces the
+      // 30-second main-thread stall observed against real prod vaults.
+      urlAccumulator = await seedUrlProjectionAccumulatorAsync(merged);
+      tabSessionAccumulator = await seedTabSessionProjectionAccumulatorAsync(merged);
       projectionAccumulatorsInitialized = true;
       mark('projectionAccumulators.seed');
     }
@@ -791,8 +804,9 @@ export const createConnectionsMaterializer = (
         lastObservedAt: entry.lastSeenAt ?? entry.firstSeenAt ?? '1970-01-01T00:00:00.000Z',
       });
     }
+    const topicCosineThreshold = resolveTopicCosineThreshold();
     for (const edge of visitSimilarity.edges) {
-      topicAccumulator.addSimilarityEdge(edge, DEFAULT_TOPIC_COSINE_THRESHOLD);
+      topicAccumulator.addSimilarityEdge(edge, topicCosineThreshold);
     }
     mark('topicAccumulator.fold');
     const previousTopicRevision = await topicRevisionStore.readActiveRevision();
@@ -818,7 +832,7 @@ export const createConnectionsMaterializer = (
     });
     const expectedTopicRevisionId = await createTopicRevisionId({
       visitSimilarityRevisionId: visitSimilarity.revisionId,
-      cosineThreshold: DEFAULT_TOPIC_COSINE_THRESHOLD,
+      cosineThreshold: topicCosineThreshold,
       algorithmVersion: topicRevisionAlgorithm,
     });
     // Stage 5.2 W4 fast path — when SIDETRACK_CONNECTIONS_HOT_TOPICS=1
@@ -850,6 +864,7 @@ export const createConnectionsMaterializer = (
       topicRevision = await buildSelectedTopicRevision({
         visits: topicVisits,
         visitSimilarity,
+        options: { cosineThreshold: topicCosineThreshold },
         ...(userAssertedRelations.length === 0 ? {} : { userAssertedRelations }),
         ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
       });
@@ -949,20 +964,35 @@ export const createConnectionsMaterializer = (
   let workerDrainSeq = 0;
   let lastWorkerDrainSeqCompleted = -1;
 
+  // Pick the off-main-thread runner. child_process.fork is the safe
+  // path — worker_threads triggers V8 heap corruption when native
+  // addons (onnx/usearch/sharp) load in two isolates of the same
+  // process. The child_process path is the default; the worker_thread
+  // path is retained only for opt-in stress testing.
+  const pickSubprocessRunner = (): ((
+    job: { vaultRoot: string; seq: number },
+  ) => Promise<{ seq: number; ok: boolean; snapshotRevision?: string; error?: string }>) => {
+    if (process.env['SIDETRACK_CONNECTIONS_WORKER'] === '1') {
+      return runReconcileInWorker;
+    }
+    return runReconcileInChild;
+  };
+
   const drainViaWorker = async (): Promise<void> => {
     workerDrainSeq += 1;
     const seq = workerDrainSeq;
-    const result = await runReconcileInWorker({ vaultRoot: deps.vaultRoot, seq });
+    const runner = pickSubprocessRunner();
+    const result = await runner({ vaultRoot: deps.vaultRoot, seq });
     if (seq <= lastWorkerDrainSeqCompleted) {
       // A newer drain already completed; ignore stale output.
       return;
     }
     if (!result.ok) {
-      throw new Error(result.error ?? 'worker drain failed without a message');
+      throw new Error(result.error ?? 'subprocess drain failed without a message');
     }
     lastWorkerDrainSeqCompleted = seq;
-    // The worker re-instantiated its own materializer + accumulators
-    // inside the worker context. The main-thread in-process state
+    // The subprocess re-instantiated its own materializer + accumulators
+    // inside the child context. The main-thread in-process state
     // (urlAccumulator, tabSessionAccumulator, lastEngagementClassRevision)
     // is now potentially stale relative to the on-disk snapshot. Force
     // a re-seed on the next in-process drain so future fallback paths
@@ -973,12 +1003,55 @@ export const createConnectionsMaterializer = (
     lastEngagementClassRevision = undefined;
   };
 
+  // Decide whether the next pass (catchUp or drain) should be offloaded
+  // to a worker_thread instead of running buildAndWrite on the main
+  // thread. Three things matter:
+  //
+  //   1. Are we already running INSIDE a worker? The worker entry
+  //      script calls `materializer.catchUp(eventLog)` itself — if
+  //      that catchUp also tried to spawn a worker, we'd recurse
+  //      forever. `isMainThread === false` short-circuits the check.
+  //
+  //   2. The explicit env `SIDETRACK_CONNECTIONS_WORKER` opts the
+  //      pass into worker mode. With this change catchUp honours the
+  //      env too — the previous code path bypassed it, so a cold-
+  //      start rebuild over a real prod vault (12 k+ events) pinned
+  //      the main thread for 30+ seconds and queued /status behind
+  //      every other CPU-bound projection pass. The CLI sets this env
+  //      at startup so end users get the worker by default; tests
+  //      and programmatic users that import startCompanion directly
+  //      keep the in-process path so they can assert on in-process
+  //      accumulator state.
+  //
+  //   3. Per-pass overrides aren't supported — workers are spawned
+  //      per drain (`runReconcileInWorker`), so we pay ~50ms of
+  //      spawn cost per pass. Negligible vs. the 30s+ rebuilds the
+  //      worker is replacing.
+  const shouldUseWorker = (): boolean => {
+    // isMainThread blocks worker_threads recursion.
+    if (!isMainThread) return false;
+    // Defense-in-depth against child_process recursion. If this
+    // process has an IPC channel to a parent (i.e. it was launched
+    // via fork()), refuse to spawn another subprocess. The child
+    // entry script also clears the env explicitly; this guard is a
+    // belt-and-suspenders second line so future callers that miss
+    // the env reset don't accidentally spawn a fork bomb.
+    if (typeof process.send === 'function') return false;
+    // Explicit in-process override wins (used by unit + e2e tests
+    // that need to assert against in-process accumulator state).
+    if (process.env['SIDETRACK_CONNECTIONS_INPROCESS'] === '1') return false;
+    // Either subprocess flavour qualifies. The child_process flavour is
+    // the default; the worker_thread flavour is opt-in via WORKER=1.
+    if (process.env['SIDETRACK_CONNECTIONS_WORKER'] === '1') return true;
+    if (process.env['SIDETRACK_CONNECTIONS_CHILD'] === '1') return true;
+    return false;
+  };
+
   const drain = async (): Promise<void> => {
-    const workerMode = process.env['SIDETRACK_CONNECTIONS_WORKER'] === '1';
     while (dirty) {
       dirty = false;
       try {
-        if (workerMode) {
+        if (shouldUseWorker()) {
           await drainViaWorker();
         } else {
           await buildAndWrite();
@@ -1064,7 +1137,8 @@ export const createConnectionsMaterializer = (
     pending = true;
     // Stage 5.2 W2b/c wiring — catchUp is the recovery / boot-time path;
     // force a re-seed so any drift between the in-memory accumulators
-    // and the event log is corrected. The next buildAndWrite seeds.
+    // and the event log is corrected. The next buildAndWrite (or worker
+    // pass) seeds.
     projectionAccumulatorsInitialized = false;
     urlAccumulator = createEmptyUrlProjectionAccumulator();
     tabSessionAccumulator = createEmptyTabSessionProjectionAccumulator();
@@ -1072,7 +1146,17 @@ export const createConnectionsMaterializer = (
     // catchUp so the next drain rebuilds against the fresh log.
     lastEngagementClassRevision = undefined;
     try {
-      await buildAndWrite();
+      // 2026-05 cold-start fix: route catchUp through the worker the
+      // same way drain does. The previous direct buildAndWrite()
+      // pinned the main thread for the full re-projection (~30 s on a
+      // 12 k-event prod vault), which queued /status and every other
+      // HTTP request behind it. shouldUseWorker() respects the env
+      // opt-out AND skips itself when we're already inside a worker.
+      if (shouldUseWorker()) {
+        await drainViaWorker();
+      } else {
+        await buildAndWrite();
+      }
       lastSuccessAt = new Date().toISOString();
       lastError = null;
       dirty = false;

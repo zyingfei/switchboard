@@ -1207,6 +1207,12 @@ describe('connections — content-derived edges', () => {
       source: 'visit-similarity',
       revisionId: 'visit-sim-rev-1',
     });
+    // Locks in metadata round-trip: the cosine + threshold were
+    // previously dropped here, forcing the UI to hardcode 0.85 in
+    // `extension/src/sidepanel/connections/client.ts:455`. The fix
+    // persists them on the edge so the why-related panel can show
+    // the real score.
+    expect(edge?.metadata).toEqual({ cosine: 0.91, threshold: 0.85 });
     expect(
       snap.edges.filter((candidate) => candidate.kind === 'visit_resembles_visit'),
     ).toHaveLength(1);
@@ -1334,7 +1340,14 @@ describe('connections — content-derived edges', () => {
       entryCount: 2,
     };
     const snap = buildConnectionsSnapshot(emptyInput({ timelineDays: [day] }));
-    expect(snap.edges.some((e) => e.kind === 'visit_in_workstream')).toBe(false);
+    // 2026-05 fix: visit_in_workstream is now emitted from
+    // `entry.workstreamId` (the timeline observer stamps it again).
+    // The earlier assertion expected zero edges because the
+    // "Phase 2 restore" comment in `timeline/events.ts` said the
+    // edge would come from explicit tab-session attribution — that
+    // path never landed, leaving the edge absent and breaking every
+    // downstream consumer (ranker, similarity, resolver). Restored.
+    expect(snap.edges.some((e) => e.kind === 'visit_in_workstream')).toBe(true);
     expect(snap.nodes.some((n) => n.id === nodeIdFor('tab-session', 'tses_child'))).toBe(true);
     expect(snap.nodes.some((n) => n.id === nodeIdFor('tab-session', 'tses_parent'))).toBe(true);
     const visitEdges = snap.edges.filter((e) => e.kind === 'visit_instance_in_tab_session');
@@ -1361,7 +1374,14 @@ describe('connections — content-derived edges', () => {
       (n) => n.id === nodeIdFor('timeline-visit', 'https://copy.fail'),
     );
     expect(taggedVisit?.metadata['tabSessionId']).toBeUndefined();
-    expect(taggedVisit?.metadata['workstreamId']).toBeUndefined();
+    // 2026-05 fix: timeline-visit metadata now carries the active
+    // workstreamId the observer stamped on the event, matching the
+    // e2e suite's expectation at `connections-real-tabs.spec.ts:228`.
+    // The visit_in_workstream edge below is still the authoritative
+    // attribution link; this is the redundant breadcrumb that lets
+    // the side panel render the active-workstream chip without
+    // resolving the edge.
+    expect(taggedVisit?.metadata['workstreamId']).toBe('ws_security');
     expect(
       snap.edges.some(
         (edge) =>

@@ -1,5 +1,3 @@
-import { useState } from 'react';
-
 import { tabSessionDisplayTitle, tabSessionDisplayUrl } from './displayTitle';
 import type {
   TabSessionRecord,
@@ -22,6 +20,15 @@ export interface SuggestionBannerProps {
   readonly suggestion: TabSessionResolutionResult;
   readonly workstreams: readonly TabSessionWorkstreamOption[];
   readonly onAttribute: (tabSessionId: string, workstreamId: string | null) => void;
+  // Stage 5 polish — aligns SuggestionBanner with the Current Tab and
+  // InboxCard 4-action flat layout. When omitted, the corresponding
+  // affordances render disabled so the banner still draws but doesn't
+  // misbehave silently.
+  readonly onPickAnother?: (tabSessionId: string) => void;
+  readonly onIgnore?: (
+    tabSessionId: string,
+    reason: 'noise' | 'duplicate' | 'private',
+  ) => void;
 }
 
 export function SuggestionBanner({
@@ -29,11 +36,10 @@ export function SuggestionBanner({
   suggestion,
   workstreams,
   onAttribute,
+  onPickAnother,
+  onIgnore,
 }: SuggestionBannerProps) {
   const suggestedWorkstreamId = suggestion.decision.workstreamId;
-  const fallbackWorkstreamId = workstreams.length > 0 ? workstreams[0].bac_id : '';
-  const defaultWorkstreamId = suggestedWorkstreamId ?? fallbackWorkstreamId;
-  const [selectedWorkstreamId, setSelectedWorkstreamId] = useState(defaultWorkstreamId);
   if (suggestion.decision.action !== 'suggest' || suggestedWorkstreamId === undefined) {
     return null;
   }
@@ -50,47 +56,45 @@ export function SuggestionBanner({
       <div className="tab-session-suggestion-actions">
         <button
           type="button"
-          className="tab-session-action"
+          className="tab-session-action primary"
           onClick={() => {
             onAttribute(record.tabSessionId, suggestedWorkstreamId);
           }}
+          title="Confirm the suggested workstream"
         >
-          Yes
+          Yes, that's right
         </button>
-        <button
-          type="button"
-          className="tab-session-action subtle"
-          onClick={() => {
-            onAttribute(record.tabSessionId, null);
-          }}
-        >
-          No
-        </button>
-        <label className="tab-session-picker">
-          <span className="sr-only">Different workstream</span>
-          <select
-            value={selectedWorkstreamId}
-            onChange={(event) => {
-              setSelectedWorkstreamId(event.target.value);
-            }}
-            disabled={workstreams.length === 0}
-          >
-            {workstreams.map((workstream) => (
-              <option key={workstream.bac_id} value={workstream.bac_id}>
-                {workstream.path}
-              </option>
-            ))}
-          </select>
-        </label>
         <button
           type="button"
           className="tab-session-action"
-          disabled={selectedWorkstreamId.length === 0}
+          disabled={onPickAnother === undefined}
           onClick={() => {
-            onAttribute(record.tabSessionId, selectedWorkstreamId);
+            onPickAnother?.(record.tabSessionId);
           }}
+          title="Pick a different workstream"
         >
-          Different
+          Pick another…
+        </button>
+        <button
+          type="button"
+          className="tab-session-action"
+          onClick={() => {
+            onAttribute(record.tabSessionId, null);
+          }}
+          title="This page is meaningful but doesn't belong to any workstream"
+        >
+          Not in any stream
+        </button>
+        <button
+          type="button"
+          className="tab-session-action"
+          disabled={onIgnore === undefined}
+          onClick={() => {
+            onIgnore?.(record.tabSessionId, 'noise');
+          }}
+          title="Mute this URL — don't bother me about it again"
+        >
+          Ignore (admin / noise)
         </button>
       </div>
     </section>

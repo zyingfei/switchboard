@@ -156,4 +156,41 @@ describe('relay transport (integration)', () => {
     stopRelayTransport(attacker);
     stopRelayTransport(b);
   });
+
+  it('bumps peer-event in/out counters + per-replica drill on round-trip', async () => {
+    const { getRelayTransportStatus } = await import('./relayTransport.js');
+    const secret = generateRendezvousSecret();
+    const keysA = generateReplicaKeyPair();
+    const keysB = generateReplicaKeyPair();
+    const url = `ws://${server.host}:${String(server.port)}/`;
+    const a = createRelayTransport({
+      relayUrl: url,
+      rendezvousSecret: secret,
+      localReplicaId: 'A',
+      localKeyPair: keysA,
+      knownReplicas: createKnownReplicasStore(vaultA),
+    });
+    const b = createRelayTransport({
+      relayUrl: url,
+      rendezvousSecret: secret,
+      localReplicaId: 'B',
+      localKeyPair: keysB,
+      knownReplicas: createKnownReplicasStore(vaultB),
+    });
+    b.subscribePeers(new Set(), () => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await a.publishEvent('A', eventFor('A', 1, 'one'));
+    await a.publishEvent('A', eventFor('A', 2, 'two'));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const statusA = getRelayTransportStatus(a);
+    const statusB = getRelayTransportStatus(b);
+    // A published 2 events to peer A's own replica id; B received 2
+    // from A. Per-replica drill keys on the SENDER replicaId.
+    expect(statusA?.eventsOut).toBe(2);
+    expect(statusA?.byReplica.find((r) => r.replicaId === 'A')?.eventsOut).toBe(2);
+    expect(statusB?.eventsIn).toBe(2);
+    expect(statusB?.byReplica.find((r) => r.replicaId === 'A')?.eventsIn).toBe(2);
+    stopRelayTransport(a);
+    stopRelayTransport(b);
+  });
 });

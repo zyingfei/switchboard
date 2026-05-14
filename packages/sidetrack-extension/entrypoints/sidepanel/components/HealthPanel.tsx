@@ -50,6 +50,68 @@ interface RecallActivityReport {
   readonly recent: readonly RecallActivityEvent[];
 }
 
+interface MaterializerHealth {
+  readonly status: 'healthy' | 'degraded' | 'failed';
+  readonly lastSuccessAt: string | null;
+  readonly lastError: string | null;
+  readonly pending: boolean;
+}
+
+interface SyncRelayPeerReplicaHealth {
+  readonly replicaId: string;
+  readonly eventsIn: number;
+  readonly eventsOut: number;
+  readonly lastInboundAtMs?: number;
+  readonly lastOutboundAtMs?: number;
+}
+
+interface SyncRelayHealth {
+  readonly mode: 'local' | 'remote';
+  readonly url: string;
+  readonly connected?: boolean;
+  readonly lastConnectedAtMs?: number;
+  readonly lastDisconnectedAtMs?: number;
+  readonly consecutiveFailures?: number;
+  readonly pendingPublishes?: number;
+  // Stage 5 polish — peer-event throughput counters. `eventsIn` and
+  // `eventsOut` are total since companion process start. `byReplica`
+  // carries per-replica drill for the "who am I talking to?" panel.
+  readonly eventsIn?: number;
+  readonly eventsOut?: number;
+  readonly lastInboundAtMs?: number;
+  readonly lastOutboundAtMs?: number;
+  readonly byReplica?: readonly SyncRelayPeerReplicaHealth[];
+}
+
+interface SyncSummary {
+  readonly replicaId: string;
+  readonly seq: number;
+  readonly relay?: SyncRelayHealth;
+  readonly materializers?: Record<string, MaterializerHealth>;
+}
+
+interface WorkGraphRankerHealth {
+  readonly activeRevisionId: string | null;
+  readonly loadStatus: 'missing' | 'ready' | 'invalid-model';
+  // Epoch ms when the active ranker snapshot was trained. Drives the
+  // "ranker · snapshot Xh ago" detail line in the pipeline strip.
+  readonly trainedAt: number | null;
+  readonly retrainSkipReason: string | null;
+  readonly retrainNewLabelCount: number;
+}
+
+interface WorkGraphTopicProducerHealth {
+  readonly activeRevisionId: string | null;
+  readonly algorithmVersion: string | null;
+  readonly topicCount: number;
+  readonly lineageCount: number;
+}
+
+interface WorkGraphHealth {
+  readonly ranker: WorkGraphRankerHealth;
+  readonly topicProducer?: WorkGraphTopicProducerHealth;
+}
+
 interface HealthReport {
   readonly uptimeSec: number;
   readonly vault: {
@@ -57,6 +119,7 @@ interface HealthReport {
     readonly writable: boolean;
     readonly sizeBytes: number | null;
   };
+  readonly workGraph?: WorkGraphHealth;
   readonly capture: {
     readonly lastByProvider: Record<string, string | null>;
     readonly queueDepthHint: number | null;
@@ -83,6 +146,7 @@ interface HealthReport {
     readonly activity?: RecallActivityReport;
   };
   readonly service: { readonly installed: boolean; readonly running: boolean };
+  readonly sync?: SyncSummary;
 }
 
 interface HealthPanelProps {
@@ -295,6 +359,138 @@ export function HealthPanel({
   const lastProvider = providerRows.find((row) => row.lastCaptureAt !== null);
   const activity = report?.recall.activity;
 
+  // Stage 5 polish — pipeline-stage rollup. Each entry describes one
+  // logical stage in the capture → … → resolver flow, with a glance-
+  // able status dot + a short detail line that surfaces the most
+  // load-bearing fact for that stage (count, age, status). Drawn as a
+  // left-to-right strip at the top of the panel so the user sees
+  // where data is moving before diving into the per-lane sections.
+  type PipelineStatus = 'ok' | 'warn' | 'err' | 'idle';
+  interface PipelineStage {
+    readonly id: string;
+    readonly name: string;
+    readonly status: PipelineStatus;
+    readonly detail: string;
+  }
+  const pipelineStages: readonly PipelineStage[] = (() => {
+    if (report === null) return [];
+    const captureStatus: PipelineStatus = queueWarn
+      ? 'warn'
+      : lastProvider === undefined
+        ? 'idle'
+        : 'ok';
+    const captureDetail =
+      lastProvider === undefined
+        ? 'no events yet'
+        : `${String(providerRows.length)} provider${providerRows.length === 1 ? '' : 's'} · ${formatWhen(lastProvider.lastCaptureAt)}`;
+    const vaultStatus: PipelineStatus = report.vault.writable ? 'ok' : 'err';
+    const vaultDetail = report.vault.writable
+      ? `writable · ${formatBytes(report.vault.sizeBytes)}`
+      : 'not writable';
+    const materializers = report.sync?.materializers ?? {};
+    const matEntries = Object.entries(materializers);
+    const matFailed = matEntries.filter(([, m]) => m.status === 'failed').length;
+    const matDegraded = matEntries.filter(([, m]) => m.status === 'degraded').length;
+    const matStatus: PipelineStatus =
+      matFailed > 0 ? 'err' : matDegraded > 0 ? 'warn' : matEntries.length === 0 ? 'idle' : 'ok';
+    const matDetail =
+      matEntries.length === 0
+        ? 'not configured'
+        : `${String(matEntries.length - matFailed - matDegraded)}/${String(matEntries.length)} healthy`;
+    const recallStatus = report.recall.status;
+    const recallStatusFor: PipelineStatus =
+      recallStatus === 'rebuilding'
+        ? 'warn'
+        : recallStatus === 'missing' || recallStatus === 'stale'
+          ? 'err'
+          : recallStatus === 'empty'
+            ? 'warn'
+            : recallStatus === 'ready'
+              ? 'ok'
+              : 'idle';
+    const recallDetail =
+      recallStatus === 'rebuilding' &&
+      report.recall.rebuildTotal !== undefined &&
+      report.recall.rebuildTotal > 0
+        ? `rebuilding ${String(report.recall.rebuildEmbedded ?? 0)}/${String(report.recall.rebuildTotal)}`
+        : recallStatus === undefined
+          ? `${formatCount(report.recall.entryCount)} vectors`
+          : `${recallStatus} · ${formatCount(report.recall.entryCount)} vectors`;
+    // Ranker stage — driven by the workGraph health block exposed at
+    // /v1/system/health. `loadStatus = 'ready'` means an active
+    // snapshot is loaded; `trainedAt` is the epoch-ms timestamp of
+    // the last train. We show the snapshot age + the most recent
+    // skip reason so the user can tell whether the planner has been
+    // running but choosing not to retrain.
+    const rankerHealth = report.workGraph?.ranker;
+    const rankerStatus: PipelineStatus =
+      rankerHealth === undefined
+        ? 'idle'
+        : rankerHealth.loadStatus === 'ready'
+          ? 'ok'
+          : rankerHealth.loadStatus === 'invalid-model'
+            ? 'err'
+            : 'warn';
+    const rankerDetail =
+      rankerHealth === undefined
+        ? 'workGraph not reported'
+        : rankerHealth.loadStatus === 'ready' && rankerHealth.trainedAt !== null
+          ? `snapshot ${formatRelative(new Date(rankerHealth.trainedAt).toISOString())}`
+          : rankerHealth.loadStatus === 'missing'
+            ? rankerHealth.retrainSkipReason === null
+              ? 'no snapshot yet'
+              : `pending · ${rankerHealth.retrainSkipReason}`
+            : rankerHealth.loadStatus === 'invalid-model'
+              ? 'snapshot invalid'
+              : 'ready';
+    const relay = report.sync?.relay;
+    const syncStatus: PipelineStatus =
+      relay === undefined
+        ? 'idle'
+        : relay.connected === false
+          ? 'warn'
+          : relay.connected === true
+            ? 'ok'
+            : 'idle';
+    const syncDetail =
+      relay === undefined
+        ? 'single-replica'
+        : relay.connected === true
+          ? `connected · ${relay.mode}`
+          : relay.connected === false
+            ? `disconnected${relay.consecutiveFailures !== undefined && relay.consecutiveFailures > 0 ? ` · ${String(relay.consecutiveFailures)} fails` : ''}`
+            : 'unknown';
+    // Topics stage — depends on Embedding (similarity), feeds Ranker
+    // (cluster bias). `lineageCount` includes split + merge edges so
+    // the user can see whether clusters are evolving over time.
+    const topicHealth = report.workGraph?.topicProducer;
+    const topicStatus: PipelineStatus =
+      topicHealth === undefined
+        ? 'idle'
+        : topicHealth.activeRevisionId === null
+          ? 'warn'
+          : topicHealth.topicCount === 0
+            ? 'warn'
+            : 'ok';
+    const topicDetail =
+      topicHealth === undefined
+        ? 'workGraph not reported'
+        : topicHealth.activeRevisionId === null
+          ? 'no revision yet'
+          : topicHealth.topicCount === 0
+            ? 'no clusters yet'
+            : `${String(topicHealth.topicCount)} topic${topicHealth.topicCount === 1 ? '' : 's'} · ${String(topicHealth.lineageCount)} lineage`;
+    return [
+      { id: 'capture', name: 'Capture', status: captureStatus, detail: captureDetail },
+      { id: 'vault', name: 'Vault', status: vaultStatus, detail: vaultDetail },
+      { id: 'materializers', name: 'Materializers', status: matStatus, detail: matDetail },
+      { id: 'recall', name: 'Embedding', status: recallStatusFor, detail: recallDetail },
+      { id: 'topics', name: 'Topics', status: topicStatus, detail: topicDetail },
+      { id: 'ranker', name: 'Ranker', status: rankerStatus, detail: rankerDetail },
+      { id: 'sync', name: 'Sync', status: syncStatus, detail: syncDetail },
+    ];
+  })();
+
   const copyDiagnostics = () => {
     if (report === null) return;
     const dump = JSON.stringify(
@@ -340,6 +536,48 @@ export function HealthPanel({
         </div>
       ) : (
         <>
+          {/* Pipeline strip — glance-able status of every stage in the
+              capture-to-resolver flow. Stages are intentionally
+              ordered so the leftmost column is where data enters and
+              the rightmost is where decisions go out; arrows make the
+              direction explicit. Click a stage to scroll to its
+              underlying lane (TODO follow-up: anchor links). */}
+          {pipelineStages.length > 0 ? (
+            <div className="hp-pipeline" data-testid="hp-pipeline">
+              <div className="hp-pipeline-head">
+                Pipeline · capture → vault → materializers → embedding → topics → ranker → sync
+              </div>
+              <div className="hp-pipeline-flow">
+                {pipelineStages.map((stage, index) => (
+                  <span className="hp-pipeline-stage-wrap" key={stage.id}>
+                    <span
+                      className={`hp-pipeline-stage is-${stage.status}`}
+                      title={`${stage.name}: ${stage.detail}`}
+                      data-testid={`hp-pipeline-stage-${stage.id}`}
+                    >
+                      <span className={`hp-pipeline-dot ${stage.status}`} aria-hidden />
+                      <span className="hp-pipeline-name">{stage.name}</span>
+                      <span className="hp-pipeline-detail mono">{stage.detail}</span>
+                    </span>
+                    {index < pipelineStages.length - 1 ? (
+                      <span className="hp-pipeline-arrow" aria-hidden>
+                        →
+                      </span>
+                    ) : null}
+                  </span>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {/* Stage 5 polish — three-lane locality grouping.
+              🖥 LOCAL = lives in this browser tab (extension SW).
+              ⚙ COMPANION = lives in the local companion Node process.
+              🔄 SYNC = flows across replicas via the relay. */}
+          <div className="hp-lane hp-lane-local">
+            <div className="hp-lane-head">
+              <span className="hp-lane-icon" aria-hidden>🖥</span>
+              <span className="hp-lane-label">LOCAL · in this browser</span>
+            </div>
           <div className="health-grid">
             <div className={'hc' + (queueWarn ? ' warn' : '')}>
               <div className="hc-lbl">queued captures</div>
@@ -355,6 +593,41 @@ export function HealthPanel({
                 cap 20 · dropped {dropped ?? 0} · {queueWarn ? 'warn' : 'ok'}
               </div>
             </div>
+            {/* Stage 5 polish — companion-reachability chip sits in the
+                LOCAL lane because the in-browser SW owns the reach
+                check. Mirrors the pipeline strip's intent: tell the
+                user where data is going next from this side. */}
+            <div className={'hc' + (loadState === 'live' ? '' : ' warn')}>
+              <div className="hc-lbl">companion reach</div>
+              <div className="hc-num small">
+                {loadState === 'live'
+                  ? 'reachable'
+                  : loadState === 'loading'
+                    ? 'checking…'
+                    : loadState === 'not-configured'
+                      ? 'not configured'
+                      : 'unreachable'}
+              </div>
+              <div className="hc-foot">
+                {companionPort === null || companionPort === undefined
+                  ? 'no port set'
+                  : `localhost:${String(companionPort)}`}
+              </div>
+            </div>
+          </div>
+          </div>
+
+          <div className="hp-lane hp-lane-companion">
+            <div className="hp-lane-head">
+              <span className="hp-lane-icon" aria-hidden>⚙</span>
+              <span className="hp-lane-label">
+                COMPANION · on this machine
+                {companionPort !== null && companionPort !== undefined
+                  ? ` (localhost:${String(companionPort)})`
+                  : ''}
+              </span>
+            </div>
+          <div className="health-grid">
             <div className="hc">
               <div className="hc-lbl">last capture</div>
               <div className="hc-num small">
@@ -490,6 +763,182 @@ export function HealthPanel({
                   <div className="r2">{warning.message}</div>
                 </div>
               ))
+            )}
+          </div>
+          </div>
+
+          {/* Sync lane: replica + relay state + per-materializer health.
+              Peer-event in/out counts + lastInbound/Outbound timestamps
+              are tracked as a follow-up — the relay transport exposes
+              connection state today but not event throughput. When
+              report.sync is undefined the relay isn't configured. */}
+          <div className="hp-lane hp-lane-sync">
+            <div className="hp-lane-head">
+              <span className="hp-lane-icon" aria-hidden>🔄</span>
+              <span className="hp-lane-label">
+                SYNC · across replicas
+                {report.sync?.relay?.mode !== undefined
+                  ? ` · ${report.sync.relay.mode}`
+                  : ''}
+              </span>
+            </div>
+            {report.sync === undefined ? (
+              <div className="hp-muted-row">Sync relay is not configured (single-replica mode).</div>
+            ) : (
+              <>
+                <div className="health-grid">
+                  <div className="hc">
+                    <div className="hc-lbl">this replica</div>
+                    <div className="hc-num small mono">
+                      {report.sync.replicaId.slice(0, 8)}…
+                    </div>
+                    <div className="hc-foot">seq · {String(report.sync.seq)}</div>
+                  </div>
+                  {report.sync.relay !== undefined ? (
+                    <div
+                      className={
+                        'hc' + (report.sync.relay.connected === false ? ' warn' : '')
+                      }
+                    >
+                      <div className="hc-lbl">relay</div>
+                      <div className="hc-num small">
+                        {report.sync.relay.connected === true
+                          ? 'connected'
+                          : report.sync.relay.connected === false
+                            ? 'disconnected'
+                            : 'unknown'}
+                      </div>
+                      <div className="hc-foot">{report.sync.relay.url}</div>
+                      {report.sync.relay.lastConnectedAtMs !== undefined ? (
+                        <div className="hc-foot">
+                          last connected:{' '}
+                          {formatWhen(
+                            new Date(report.sync.relay.lastConnectedAtMs).toISOString(),
+                          )}
+                        </div>
+                      ) : null}
+                      {report.sync.relay.lastDisconnectedAtMs !== undefined ? (
+                        <div className="hc-foot">
+                          last disconnected:{' '}
+                          {formatWhen(
+                            new Date(report.sync.relay.lastDisconnectedAtMs).toISOString(),
+                          )}
+                        </div>
+                      ) : null}
+                      {report.sync.relay.pendingPublishes !== undefined &&
+                      report.sync.relay.pendingPublishes > 0 ? (
+                        <div className="hc-foot warn">
+                          pending publish: {String(report.sync.relay.pendingPublishes)}
+                        </div>
+                      ) : null}
+                      {report.sync.relay.consecutiveFailures !== undefined &&
+                      report.sync.relay.consecutiveFailures > 0 ? (
+                        <div className="hc-foot warn">
+                          consecutive failures: {String(report.sync.relay.consecutiveFailures)}
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+                {report.sync.materializers !== undefined &&
+                Object.keys(report.sync.materializers).length > 0 ? (
+                  <div className="hp-sec">
+                    <div className="hp-sec-head">Materializers · per-replica health</div>
+                    {Object.entries(report.sync.materializers).map(([name, mat]) => (
+                      <div
+                        className="hp-row"
+                        key={name}
+                        title={
+                          mat.lastError !== null ? `Last error: ${mat.lastError}` : undefined
+                        }
+                      >
+                        <span className="prov-pill mono">{name}</span>
+                        <span className={`hp-state ${mat.status}`}>{mat.status}</span>
+                        <span className="hp-last muted">
+                          {mat.lastSuccessAt === null
+                            ? 'never'
+                            : formatWhen(mat.lastSuccessAt)}
+                        </span>
+                        {mat.pending ? (
+                          <span className="hp-num muted">pending</span>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+                {report.sync.relay !== undefined &&
+                (report.sync.relay.eventsIn !== undefined ||
+                  report.sync.relay.eventsOut !== undefined) ? (
+                  <div className="hp-sec">
+                    <div className="hp-sec-head">
+                      Peer-event throughput · total since companion start
+                    </div>
+                    <div className="health-grid">
+                      <div className="hc">
+                        <div className="hc-lbl">in / out</div>
+                        <div className="hc-num small">
+                          {String(report.sync.relay.eventsIn ?? 0)} ·{' '}
+                          {String(report.sync.relay.eventsOut ?? 0)}
+                        </div>
+                        <div className="hc-foot">
+                          last in:{' '}
+                          {report.sync.relay.lastInboundAtMs !== undefined
+                            ? formatRelative(
+                                new Date(report.sync.relay.lastInboundAtMs).toISOString(),
+                              )
+                            : 'never'}
+                          {' · '}
+                          last out:{' '}
+                          {report.sync.relay.lastOutboundAtMs !== undefined
+                            ? formatRelative(
+                                new Date(report.sync.relay.lastOutboundAtMs).toISOString(),
+                              )
+                            : 'never'}
+                        </div>
+                      </div>
+                    </div>
+                    {report.sync.relay.byReplica !== undefined &&
+                    report.sync.relay.byReplica.length > 0 ? (
+                      <div className="hp-sec">
+                        <div className="hp-sec-head">Per-replica drill</div>
+                        {report.sync.relay.byReplica.map((peer) => (
+                          <div className="hp-row" key={peer.replicaId}>
+                            <span className="prov-pill mono">
+                              {peer.replicaId.slice(0, 8)}…
+                            </span>
+                            <span className="hp-num">
+                              {String(peer.eventsIn)}
+                              <span className="muted"> in</span>
+                            </span>
+                            <span className="hp-num">
+                              {String(peer.eventsOut)}
+                              <span className="muted"> out</span>
+                            </span>
+                            <span className="hp-last muted">
+                              {peer.lastInboundAtMs !== undefined ||
+                              peer.lastOutboundAtMs !== undefined
+                                ? formatRelative(
+                                    new Date(
+                                      Math.max(
+                                        peer.lastInboundAtMs ?? 0,
+                                        peer.lastOutboundAtMs ?? 0,
+                                      ),
+                                    ).toISOString(),
+                                  )
+                                : 'idle'}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : (
+                  <div className="hp-muted-row" style={{ fontSize: 10, opacity: 0.7 }}>
+                    No peer-event activity yet. Counters appear after the first inbound or
+                    outbound frame.
+                  </div>
+                )}
+              </>
             )}
           </div>
         </>

@@ -224,10 +224,73 @@ describe('per-URL HTTP routes', () => {
     expect(body.data.byCanonicalUrl[canonicalUrl]?.currentAttribution?.workstreamId).toBeNull();
   });
 
+  it('POST /v1/visits/{url}/ignore writes urls.ignored event and hides URL from Inbox', async () => {
+    const canonicalUrl = 'https://example.test/admin-panel';
+    await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_a' });
+    const ignore = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/ignore`,
+      {
+        method: 'POST',
+        headers: headers('idem-ignore-1'),
+        body: JSON.stringify({ reason: 'noise' }),
+      },
+    );
+    expect(ignore.status).toBe(201);
+    const inbox = await fetch(`${serverUrl}/v1/visits/inbox`, { headers: headers() });
+    const body = (await inbox.json()) as { data: { items: unknown[]; total: number } };
+    expect(body.data.total).toBe(0);
+    expect(body.data.items).toHaveLength(0);
+  });
+
+  it('POST /v1/visits/{url}/ignore defaults reason to "noise" when omitted', async () => {
+    const canonicalUrl = 'https://example.test/some-page';
+    await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_a' });
+    const ignore = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/ignore`,
+      {
+        method: 'POST',
+        headers: headers('idem-ignore-default'),
+        body: JSON.stringify({}),
+      },
+    );
+    expect(ignore.status).toBe(201);
+    const body = (await ignore.json()) as {
+      data: {
+        projection: {
+          byCanonicalUrl: Record<string, { currentIgnored?: { reason?: string } }>;
+        };
+      };
+    };
+    expect(body.data.projection.byCanonicalUrl[canonicalUrl]?.currentIgnored?.reason).toBe('noise');
+  });
+
+  it('POST /v1/visits/{url}/resolve returns `skipped-disabled` when env opts out', async () => {
+    const canonicalUrl = 'https://example.test/opt-out-url';
+    await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_a' });
+    installStrongUrlSnapshot(canonicalUrl);
+    const priorEnv = process.env['SIDETRACK_URL_RESOLVER_AUTO_APPLY'];
+    process.env['SIDETRACK_URL_RESOLVER_AUTO_APPLY'] = '0';
+    const response = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve`,
+      {
+        method: 'POST',
+        headers: headers('url-auto-apply-optout'),
+        body: JSON.stringify({ dryRun: false, policyMode: 'balanced' }),
+      },
+    );
+    if (priorEnv === undefined) delete process.env['SIDETRACK_URL_RESOLVER_AUTO_APPLY'];
+    else process.env['SIDETRACK_URL_RESOLVER_AUTO_APPLY'] = priorEnv;
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { readonly data?: { readonly status?: string } };
+    expect(body.data?.status).toBe('skipped-disabled');
+  });
+
   it('POST /v1/visits/{url}/resolve auto-applies a strong URL resolver decision', async () => {
     const canonicalUrl = 'https://example.test/strong-url';
     await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_a' });
     installStrongUrlSnapshot(canonicalUrl);
+    // URL auto-apply is ON by default; the env opts OUT (no setup needed
+    // for this test, the resolver will commit).
 
     const response = await fetch(
       `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve`,

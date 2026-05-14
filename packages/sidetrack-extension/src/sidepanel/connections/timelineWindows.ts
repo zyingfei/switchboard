@@ -40,17 +40,25 @@ export interface TimelineRailData {
   readonly neighborTimes: readonly number[];
 }
 
-const decimalHourUtc = (ms: number): number => {
+// Stage 5 polish — switch from UTC to local time so the rail aligns
+// with how the user actually browses. Tick labels (12 AM, 3 AM, …)
+// in the TimelineRail component are *also* the user's local clock.
+const decimalHourLocal = (ms: number): number => {
   const d = new Date(ms);
-  return d.getUTCHours() + d.getUTCMinutes() / 60 + d.getUTCSeconds() / 3600;
+  return d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600;
 };
 
-const isoDayUtc = (ms: number): string => {
+const isoDayLocal = (ms: number): string => {
   const d = new Date(ms);
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const day = String(d.getUTCDate()).padStart(2, '0');
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
   return `${String(y)}-${m}-${day}`;
+};
+
+const startOfLocalDay = (ms: number): number => {
+  const d = new Date(ms);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0).getTime();
 };
 
 const parseTimestamp = (s: string | undefined): number | null => {
@@ -76,8 +84,30 @@ export const computeTimelineRail = (
     const list = timestampsByReplica.get(dot.replicaId);
     if (list === undefined) timestampsByReplica.set(dot.replicaId, [ms]);
     else list.push(ms);
-    const day = isoDayUtc(ms);
+    const day = isoDayLocal(ms);
     dayCounts.set(day, (dayCounts.get(day) ?? 0) + 1);
+  }
+
+  // Stage 5 polish — node-timestamp fallback. Inferred edges
+  // (timeline_same_url_as_thread, visit_resembles_visit) have no
+  // `producedBy.dot`, so a thread anchor at 1 hop with only
+  // inferred edges would render no timeline rail at all. Fall back
+  // to node-level `lastSeenAt` + `originReplicaIds` so the rail
+  // stays visible whenever there's ANY time signal in scope.
+  if (dayCounts.size === 0) {
+    for (const node of snapshot.nodes) {
+      const ms = parseTimestamp(node.lastSeenAt) ?? parseTimestamp(node.firstSeenAt);
+      if (ms === null) continue;
+      const replicaIds =
+        node.originReplicaIds.length > 0 ? node.originReplicaIds : ['unknown'];
+      for (const replicaId of replicaIds) {
+        const list = timestampsByReplica.get(replicaId);
+        if (list === undefined) timestampsByReplica.set(replicaId, [ms]);
+        else list.push(ms);
+      }
+      const day = isoDayLocal(ms);
+      dayCounts.set(day, (dayCounts.get(day) ?? 0) + 1);
+    }
   }
 
   if (dayCounts.size === 0) return null;
@@ -93,9 +123,12 @@ export const computeTimelineRail = (
     }
   }
 
-  // Day window: [00:00 UTC, 24:00 UTC].
-  const dayStart = Date.parse(`${bestDay}T00:00:00.000Z`);
-  const dayEnd = dayStart + 24 * 60 * 60 * 1000;
+  // Day window in LOCAL time: [00:00, 24:00). `bestDay` is already
+  // a local-tz YYYY-MM-DD from isoDayLocal — reconstruct via the
+  // Date constructor (local) rather than parsing the string as UTC.
+  const [bestYear, bestMonth, bestDayOfMonth] = bestDay.split('-').map((p) => Number.parseInt(p, 10));
+  const dayStart = new Date(bestYear!, (bestMonth ?? 1) - 1, bestDayOfMonth ?? 1, 0, 0, 0, 0).getTime();
+  const dayEnd = startOfLocalDay(dayStart + 24 * 60 * 60 * 1000);
 
   const rows: ReplicaWindowRow[] = [];
   // Sort replica ids for determinism.
@@ -116,12 +149,12 @@ export const computeTimelineRail = (
       if (t - runEnd <= WINDOW_GAP_MS) {
         runEnd = t;
       } else {
-        windows.push([decimalHourUtc(runStart), decimalHourUtc(runEnd)]);
+        windows.push([decimalHourLocal(runStart), decimalHourLocal(runEnd)]);
         runStart = t;
         runEnd = t;
       }
     }
-    windows.push([decimalHourUtc(runStart), decimalHourUtc(runEnd)]);
+    windows.push([decimalHourLocal(runStart), decimalHourLocal(runEnd)]);
     // Floor window width: at least 6 minutes (0.1h) so single-point
     // observations stay clickable / visible.
     const floored: (readonly [number, number])[] = windows.map(([a, b]) => {
@@ -136,7 +169,7 @@ export const computeTimelineRail = (
   const anchorMs = parseTimestamp(anchorNode?.lastSeenAt);
   const anchorTime =
     anchorMs !== null && anchorMs >= dayStart && anchorMs < dayEnd
-      ? decimalHourUtc(anchorMs)
+      ? decimalHourLocal(anchorMs)
       : null;
 
   // Neighbor markers — every non-anchor node's lastSeenAt within
@@ -147,7 +180,7 @@ export const computeTimelineRail = (
     const ms = parseTimestamp(node.lastSeenAt);
     if (ms === null) continue;
     if (ms < dayStart || ms >= dayEnd) continue;
-    neighborSet.add(decimalHourUtc(ms));
+    neighborSet.add(decimalHourLocal(ms));
   }
   const neighborTimes = [...neighborSet].sort((a, b) => a - b);
 
