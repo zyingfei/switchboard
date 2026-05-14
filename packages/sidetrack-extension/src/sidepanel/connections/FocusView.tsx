@@ -29,6 +29,7 @@ export interface TopicNode {
   readonly id: string;
   readonly label: string;
   readonly memberCount: number;
+  readonly totalMemberCount?: number;
   readonly cohesion: number;
   readonly dominantWorkstreamId?: string;
 }
@@ -76,6 +77,13 @@ const largestTopic = (topics: readonly TopicNode[]): TopicNode | undefined =>
 
 const summedTopicMembers = (topics: readonly TopicNode[]): number =>
   topics.reduce((sum, topic) => sum + topic.memberCount, 0);
+
+const topicMemberLabel = (topic: TopicNode): string => {
+  if (topic.totalMemberCount !== undefined && topic.totalMemberCount > topic.memberCount) {
+    return `${String(topic.memberCount)} of ${String(topic.totalMemberCount)} pages in this scope`;
+  }
+  return `${String(topic.memberCount)} ${topic.memberCount === 1 ? 'page' : 'pages'}`;
+};
 
 export const isCollapsedSuggestionSet = (
   topics: readonly TopicNode[],
@@ -241,9 +249,7 @@ export const FocusView = ({
               </span>
             </div>
             <div className="cx-focus-meta">
-              <span>
-                {String(topic.memberCount)} {topic.memberCount === 1 ? 'page' : 'pages'}
-              </span>
+              <span>{topicMemberLabel(topic)}</span>
               {topic.cohesion > 0 ? (
                 <span title="Average pairwise similarity of pages in this topic. Higher means tighter cluster.">
                   cohesion {topic.cohesion.toFixed(2)}

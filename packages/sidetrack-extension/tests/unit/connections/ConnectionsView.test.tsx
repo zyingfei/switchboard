@@ -274,7 +274,7 @@ describe('ConnectionsView — engineering scaffold', () => {
       expect(screen.queryByTestId('focus-topic-topic:db')).not.toBeNull();
     });
     expect(screen.queryByTestId('focus-topic-topic:hn')).toBeNull();
-    expect(screen.getByText('1 page')).toBeDefined();
+    expect(screen.getByText('1 of 6 pages in this scope')).toBeDefined();
     fireEvent.click(screen.getByTestId('focus-expand-topic:db'));
     expect(
       screen.getByTestId('focus-visit-timeline-visit:https://db.example/oracle'),
@@ -440,7 +440,7 @@ describe('ConnectionsView — engineering scaffold', () => {
       expect(screen.queryByTestId('focus-topic-topic:db')).not.toBeNull();
     });
     expect(screen.queryByTestId('focus-topic-topic:hn')).toBeNull();
-    expect(screen.getByText('1 page')).toBeDefined();
+    expect(screen.getByText('1 of 6 pages in this scope')).toBeDefined();
   });
 
   it('can re-anchor from a visible neighbor row', async () => {

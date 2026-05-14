@@ -489,15 +489,23 @@ const deriveFocusData = (
   // whole vault would drown the panel.
   const topics: TopicNode[] = scopeNodes
     .filter((node) => node.kind === 'topic')
-    .map((node) => ({
-      id: node.id,
-      label: formatEntityDisplay(node, ctx).primary,
-      memberCount: metadataNumber(node.metadata, 'memberCount', 0),
-      cohesion: metadataNumber(node.metadata, 'cohesion', 0),
-      ...(metadataString(node.metadata, ['dominantWorkstreamId']) === undefined
-        ? {}
-        : { dominantWorkstreamId: metadataString(node.metadata, ['dominantWorkstreamId']) }),
-    }));
+    .map((node) => {
+      const memberCount = metadataNumber(node.metadata, 'memberCount', 0);
+      const totalMemberCount = Math.max(
+        metadataNumber(node.metadata, 'globalMemberCount', 0),
+        metadataNumber(node.metadata, 'totalMemberCount', 0),
+      );
+      return {
+        id: node.id,
+        label: formatEntityDisplay(node, ctx).primary,
+        memberCount,
+        ...(totalMemberCount > memberCount ? { totalMemberCount } : {}),
+        cohesion: metadataNumber(node.metadata, 'cohesion', 0),
+        ...(metadataString(node.metadata, ['dominantWorkstreamId']) === undefined
+          ? {}
+          : { dominantWorkstreamId: metadataString(node.metadata, ['dominantWorkstreamId']) }),
+      };
+    });
 
   // Build visitsByTopic from full-snapshot edges so the member
   // list matches `memberCount`. Falls back to scope edges when
@@ -687,10 +695,12 @@ const deriveShadowFocusScope = (
     .map((node) => {
       if (node.kind !== 'topic') return node;
       const scopedMemberCount = scopedTopicMemberCounts.get(node.id) ?? 0;
+      const globalMemberCount = metadataNumber(node.metadata, 'memberCount', scopedMemberCount);
       return {
         ...node,
         metadata: {
           ...node.metadata,
+          globalMemberCount,
           memberCount: scopedMemberCount,
         },
       };
@@ -717,6 +727,10 @@ const reasonsForVisit = (
 ): readonly Reason[] => {
   const nodeById = new Map(nodes.map((node) => [node.id, node] as const));
   const reasons: Reason[] = [];
+  let similarityReason:
+    | { readonly code: 'COSINE_ABOVE_THRESHOLD'; readonly cosine: number; readonly threshold: number }
+    | null = null;
+  let similarityMatchCount = 0;
   for (const edge of edges) {
     if (edge.fromNodeId !== visitId && edge.toNodeId !== visitId) continue;
     if (edge.kind === 'timeline_same_url_as_thread') {
@@ -727,7 +741,12 @@ const reasonsForVisit = (
         threadName: thread === undefined ? 'Unknown thread' : formatEntityDisplay(thread, ctx).primary,
       });
     } else if (edge.kind === 'visit_resembles_visit') {
-      reasons.push({ code: 'COSINE_ABOVE_THRESHOLD', cosine: 0.85, threshold: 0.85 });
+      const cosine = metadataNumber(edge.metadata ?? {}, 'cosine', 0.85);
+      const threshold = metadataNumber(edge.metadata ?? {}, 'threshold', 0.85);
+      similarityMatchCount += 1;
+      if (similarityReason === null || cosine > similarityReason.cosine) {
+        similarityReason = { code: 'COSINE_ABOVE_THRESHOLD', cosine, threshold };
+      }
     } else if (edge.kind === 'closest_visit') {
       const reason = rankerReasonForEdge(edge);
       if (reason !== null) reasons.push(reason);
@@ -761,6 +780,13 @@ const reasonsForVisit = (
         topTokens: query === undefined ? [fallback] : query.split(/\s+/u),
       });
     }
+  }
+  if (similarityReason !== null) {
+    reasons.push(
+      similarityMatchCount > 1
+        ? { ...similarityReason, matchCount: similarityMatchCount }
+        : similarityReason,
+    );
   }
   const fallbackVisitLabel = (() => {
     const node = nodeById.get(visitId);
