@@ -37,6 +37,7 @@ const entry = (
           ...(metadata.title === undefined ? {} : { title: metadata.title }),
           ...(metadata.role === undefined ? {} : { role: metadata.role }),
           ...(metadata.modelName === undefined ? {} : { modelName: metadata.modelName }),
+          ...(metadata.quality === undefined ? {} : { quality: metadata.quality }),
         },
       }),
 });
@@ -83,25 +84,23 @@ describe('rankHybrid — lexical + vector fusion', () => {
     // a poor embedding; B has a strong embedding but no overlap with
     // the query string. Lexical fusion should surface A first.
     const items: readonly IndexEntry[] = [
-      entry(
-        'chunk:A:0:0:aaaaaaaaaaaa',
-        'thread_a',
-        '2026-05-03T00:00:00.000Z',
-        [0.1, 0],
-        { text: 'Move the thread by calling sidetrack.threads.move on the workstream.' },
-      ),
-      entry(
-        'chunk:B:0:0:bbbbbbbbbbbb',
-        'thread_b',
-        '2026-05-03T00:00:00.000Z',
-        [1, 0],
-        { text: 'Discussion about archive workflows and unrelated content.' },
-      ),
+      entry('chunk:A:0:0:aaaaaaaaaaaa', 'thread_a', '2026-05-03T00:00:00.000Z', [0.1, 0], {
+        text: 'Move the thread by calling sidetrack.threads.move on the workstream.',
+      }),
+      entry('chunk:B:0:0:bbbbbbbbbbbb', 'thread_b', '2026-05-03T00:00:00.000Z', [1, 0], {
+        text: 'Discussion about archive workflows and unrelated content.',
+      }),
     ];
     const lexical = buildLexicalIndex(items);
-    const results = rankHybrid('sidetrack.threads.move', Float32Array.from([1, 0]), items, baseDate, {
-      lexical,
-    });
+    const results = rankHybrid(
+      'sidetrack.threads.move',
+      Float32Array.from([1, 0]),
+      items,
+      baseDate,
+      {
+        lexical,
+      },
+    );
     expect(results[0]?.id).toBe('chunk:A:0:0:aaaaaaaaaaaa');
     expect(results[0]?.lexical?.rank).toBeDefined();
   });
@@ -110,20 +109,12 @@ describe('rankHybrid — lexical + vector fusion', () => {
     // Vector-only retrieval — query words aren't in the chunk text,
     // but the embedding is identical so the vector ranker wins.
     const items: readonly IndexEntry[] = [
-      entry(
-        'chunk:A:0:0:aaaaaaaaaaaa',
-        'thread_a',
-        '2026-05-03T00:00:00.000Z',
-        [1, 0, 0],
-        { text: 'A discussion about local-first architecture and offline replication.' },
-      ),
-      entry(
-        'chunk:B:0:0:bbbbbbbbbbbb',
-        'thread_b',
-        '2026-05-03T00:00:00.000Z',
-        [0, 0, 1],
-        { text: 'Unrelated content about CSS layout patterns.' },
-      ),
+      entry('chunk:A:0:0:aaaaaaaaaaaa', 'thread_a', '2026-05-03T00:00:00.000Z', [1, 0, 0], {
+        text: 'A discussion about local-first architecture and offline replication.',
+      }),
+      entry('chunk:B:0:0:bbbbbbbbbbbb', 'thread_b', '2026-05-03T00:00:00.000Z', [0, 0, 1], {
+        text: 'Unrelated content about CSS layout patterns.',
+      }),
     ];
     const lexical = buildLexicalIndex(items);
     const results = rankHybrid(
@@ -140,21 +131,13 @@ describe('rankHybrid — lexical + vector fusion', () => {
   it('fused result outranks pure freshness — older relevant chunk beats newer irrelevant', () => {
     const items: readonly IndexEntry[] = [
       // 4 years old but exact match on identifier + good vector.
-      entry(
-        'chunk:relevant:0:0:cccccccccccc',
-        'thread_a',
-        '2022-05-03T00:00:00.000Z',
-        [1, 0],
-        { text: 'Use sidetrack.threads.move to relocate threads across workstreams.' },
-      ),
+      entry('chunk:relevant:0:0:cccccccccccc', 'thread_a', '2022-05-03T00:00:00.000Z', [1, 0], {
+        text: 'Use sidetrack.threads.move to relocate threads across workstreams.',
+      }),
       // Brand new but unrelated.
-      entry(
-        'chunk:fresh:0:0:dddddddddddd',
-        'thread_b',
-        '2026-05-03T00:00:00.000Z',
-        [0, 1],
-        { text: 'Unrelated chat about CSS.' },
-      ),
+      entry('chunk:fresh:0:0:dddddddddddd', 'thread_b', '2026-05-03T00:00:00.000Z', [0, 1], {
+        text: 'Unrelated chat about CSS.',
+      }),
     ];
     const lexical = buildLexicalIndex(items);
     const results = rankHybrid(
@@ -224,5 +207,306 @@ describe('rankHybrid — lexical + vector fusion', () => {
     expect(results[0]?.why?.length ?? 0).toBeGreaterThan(0);
     expect(results[0]?.snippet?.length ?? 0).toBeGreaterThan(0);
     expect(results[0]?.metadata?.title).toBe('Capture queue');
+  });
+});
+
+describe('rankHybrid — quality tiebreak', () => {
+  const baseDate = new Date('2026-05-03T00:00:00.000Z');
+
+  it('ranks the higher-quality chunk first when relevance is otherwise tied', () => {
+    // Two chunks with identical text + identical embedding +
+    // identical timestamp: pure RRF + freshness tie. Only the
+    // quality tier differs, so the high-quality chunk must win.
+    const text = 'Reciprocal rank fusion combines dense and sparse retrieval lists.';
+    const items: readonly IndexEntry[] = [
+      entry('chunk:low:0:0:aaaaaaaaaaaa', 'thread_a', '2026-05-03T00:00:00.000Z', [1, 0], {
+        text,
+        quality: 'low',
+      }),
+      entry('chunk:high:0:0:bbbbbbbbbbbb', 'thread_b', '2026-05-03T00:00:00.000Z', [1, 0], {
+        text,
+        quality: 'high',
+      }),
+    ];
+    const lexical = buildLexicalIndex(items);
+    const results = rankHybrid(
+      'rank fusion dense sparse',
+      Float32Array.from([1, 0]),
+      items,
+      baseDate,
+      {
+        lexical,
+      },
+    );
+    expect(results.map((r) => r.id)).toEqual([
+      'chunk:high:0:0:bbbbbbbbbbbb',
+      'chunk:low:0:0:aaaaaaaaaaaa',
+    ]);
+    // High-quality chunk gets a positive quality contribution; low
+    // gets a negative one. Their relevance is a tie — RRF only
+    // separates them by an arbitrary adjacent-rank artifact (rank r
+    // vs r+1 by insertion order), and the bounded quality tiebreak
+    // is precisely what overturns that artifact so quality decides.
+    const high = results.find((r) => r.id === 'chunk:high:0:0:bbbbbbbbbbbb');
+    const low = results.find((r) => r.id === 'chunk:low:0:0:aaaaaaaaaaaa');
+    expect(high?.explain?.qualityContribution ?? 0).toBeGreaterThan(0);
+    expect(low?.explain?.qualityContribution ?? 0).toBeLessThan(0);
+    // Both chunks hit BOTH lists, so the relevance "tie" surfaces as
+    // a doubled adjacent-rank RRF artifact: 2 × (1/(K+1) − 1/(K+2))
+    // ≈ 5.29e-4. Still a tie, not a genuine relevance gap (which
+    // would be a ≥2-rank, i.e. ≥ ~1e-3, separation).
+    const fusionGap = Math.abs((high?.explain?.fusion ?? 0) - (low?.explain?.fusion ?? 0));
+    expect(fusionGap).toBeLessThanOrEqual(2 * (1 / 61 - 1 / 62) + 1e-12);
+    // And the high-quality chunk's final score genuinely exceeds the
+    // low one's despite that adjacent-rank handicap.
+    expect(high?.score ?? 0).toBeGreaterThan(low?.score ?? 0);
+  });
+
+  it('does NOT let quality override a genuine relevance lead', () => {
+    // A low-quality chunk that is a strong lexical + vector match
+    // must still beat a high-quality chunk that only weakly matches.
+    const items: readonly IndexEntry[] = [
+      entry('chunk:lowrelevant:0:0:cccccccccccc', 'thread_a', '2026-05-03T00:00:00.000Z', [1, 0], {
+        text: 'Use sidetrack.threads.move to relocate threads across workstreams quickly.',
+        quality: 'low',
+      }),
+      entry('chunk:highnoise:0:0:dddddddddddd', 'thread_b', '2026-05-03T00:00:00.000Z', [0, 1], {
+        text: 'An unrelated essay about CSS grid layout and flexbox alignment.',
+        quality: 'high',
+      }),
+    ];
+    const lexical = buildLexicalIndex(items);
+    const results = rankHybrid(
+      'sidetrack.threads.move',
+      Float32Array.from([1, 0]),
+      items,
+      baseDate,
+      { lexical },
+    );
+    expect(results[0]?.id).toBe('chunk:lowrelevant:0:0:cccccccccccc');
+  });
+
+  it('treats a missing quality tier as the neutral medium (no penalty, no boost)', () => {
+    // Chunk A has no tier; chunk B is explicitly 'medium'. Identical
+    // relevance ⇒ both must get zero quality contribution and the
+    // score must equal the no-quality baseline (RRF + freshness).
+    const text = 'Embedding cache keyed by embedTextHash avoids recomputing vectors.';
+    const items: readonly IndexEntry[] = [
+      entry('chunk:untiered:0:0:eeeeeeeeeeee', 'thread_a', '2026-05-03T00:00:00.000Z', [1, 0], {
+        text,
+      }),
+      entry('chunk:medium:0:0:ffffffffffff', 'thread_b', '2026-05-03T00:00:00.000Z', [1, 0], {
+        text,
+        quality: 'medium',
+      }),
+    ];
+    const lexical = buildLexicalIndex(items);
+    const results = rankHybrid(
+      'embedding cache vectors',
+      Float32Array.from([1, 0]),
+      items,
+      baseDate,
+      {
+        lexical,
+      },
+    );
+    for (const r of results) {
+      expect(r.explain?.qualityContribution).toBe(0);
+      expect(r.explain?.qualityTier).toBe('medium');
+      // score == fusion + freshness only (quality is a pure no-op).
+      const expected = (r.explain?.fusion ?? 0) + (r.explain?.freshnessContribution ?? 0);
+      expect(r.score).toBeCloseTo(expected, 12);
+    }
+  });
+
+  it('leaves RRF + freshness math untouched when quality is equal across candidates', () => {
+    // The literal "RRF unchanged when quality equal" guarantee: when
+    // NO chunk carries a tier (⇒ all neutral 'medium'), the score is
+    // exactly the legacy fusion + freshness with zero quality term —
+    // byte-identical to pre-quality behavior. Tagging every chunk
+    // the SAME explicit tier preserves ORDER and the fusion backbone
+    // (only a constant, order-preserving offset is added).
+    const mk = (q?: 'high'): readonly IndexEntry[] => [
+      entry('chunk:x:0:0:111111111111', 'thread_a', '2024-01-01T00:00:00.000Z', [1, 0], {
+        text: 'Anti-entropy reconciliation merges event logs across replicas.',
+        ...(q === undefined ? {} : { quality: q }),
+      }),
+      entry('chunk:y:0:0:222222222222', 'thread_b', '2026-05-01T00:00:00.000Z', [0.6, 0], {
+        text: 'Anti-entropy gossip exchanges merkle digests for replica sync.',
+        ...(q === undefined ? {} : { quality: q }),
+      }),
+    ];
+    const q = 'anti-entropy replica sync';
+    const noneItems = mk();
+    const allHighItems = mk('high');
+    const none = rankHybrid(q, Float32Array.from([1, 0]), noneItems, baseDate, {
+      lexical: buildLexicalIndex(noneItems),
+    });
+    const allHigh = rankHybrid(q, Float32Array.from([1, 0]), allHighItems, baseDate, {
+      lexical: buildLexicalIndex(allHighItems),
+    });
+    // No tier ⇒ pure legacy math: score == fusion + freshness, quality term = 0.
+    none.forEach((r) => {
+      expect(r.explain?.qualityContribution).toBe(0);
+      expect(r.score).toBeCloseTo(
+        (r.explain?.fusion ?? 0) + (r.explain?.freshnessContribution ?? 0),
+        12,
+      );
+    });
+    // Uniform explicit tier: identical ordering + identical fusion
+    // backbone; only a constant, order-preserving offset differs.
+    expect(allHigh.map((r) => r.id)).toEqual(none.map((r) => r.id));
+    none.forEach((r, i) => {
+      expect(allHigh[i]?.explain?.fusion).toBeCloseTo(r.explain?.fusion ?? -1, 12);
+      expect(allHigh[i]?.explain?.freshnessContribution).toBeCloseTo(
+        r.explain?.freshnessContribution ?? -1,
+        12,
+      );
+      // The only delta is the uniform quality offset (same sign/size
+      // for every result ⇒ ranking is invariant).
+      const delta = (allHigh[i]?.score ?? 0) - r.score;
+      expect(delta).toBeCloseTo(allHigh[i]?.explain?.qualityContribution ?? -1, 12);
+      expect(delta).toBeGreaterThan(0);
+    });
+  });
+});
+
+describe('rankHybrid — explainability breakdown', () => {
+  const baseDate = new Date('2026-05-03T00:00:00.000Z');
+
+  it('emits a structured explain breakdown whose parts sum to the score', () => {
+    const items: readonly IndexEntry[] = [
+      entry('chunk:full:0:0:aaaaaaaaaaaa', 'thread_a', '2026-05-03T00:00:00.000Z', [1, 0], {
+        text: 'Sidetrack queues outbound captures with idempotency keys for retry safety.',
+        title: 'Capture queue',
+        headingPath: ['Architecture'],
+        quality: 'high',
+      }),
+    ];
+    const lexical = buildLexicalIndex(items);
+    const results = rankHybrid(
+      'idempotency key retry',
+      Float32Array.from([1, 0]),
+      items,
+      baseDate,
+      { lexical },
+    );
+    const top = results[0];
+    expect(top?.explain).toBeDefined();
+    const ex = top?.explain;
+    if (ex === undefined) throw new Error('explain missing');
+    // vector + lexical both hit ⇒ ranks present and 1-based.
+    expect(ex.vectorRank).toBe(1);
+    expect(ex.lexicalRank).toBe(1);
+    expect(ex.rrfVector).toBeCloseTo(1 / (60 + 1), 12);
+    expect(ex.rrfLexical).toBeCloseTo(1 / (60 + 1), 12);
+    expect(ex.fusion).toBeCloseTo(ex.rrfVector + ex.rrfLexical, 12);
+    // Composition identity: fusedScore == fusion + freshness + quality.
+    expect(ex.fusedScore).toBeCloseTo(
+      ex.fusion + ex.freshnessContribution + ex.qualityContribution,
+      12,
+    );
+    // fusedScore mirrors the back-compat top-level score field.
+    expect(ex.fusedScore).toBeCloseTo(top?.score ?? -1, 12);
+    expect(ex.qualityTier).toBe('high');
+    expect(ex.freshness).toBe(1);
+    // `why` still carries the human-readable strings (back-compat).
+    expect(top?.why?.some((w) => w.includes('quality high'))).toBe(true);
+    expect(top?.why?.some((w) => w.startsWith('vector rank'))).toBe(true);
+  });
+
+  it('omits lexicalRank (rrfLexical=0) for a chunk absent from the lexical list', () => {
+    // The flat vector scan ranks EVERY non-tombstoned chunk, so the
+    // observable "single list" shape is: matched the vector list,
+    // missed the lexical one. The lexically-matched chunk carries
+    // BOTH ranks; the no-lexical-overlap chunk carries only the
+    // vector rank with rrfLexical pinned to 0.
+    const items: readonly IndexEntry[] = [
+      entry('chunk:both:0:0:aaaaaaaaaaaa', 'thread_a', '2026-05-03T00:00:00.000Z', [1, 0, 0], {
+        text: 'The verbatim token zxqwvtoken appears only in this chunk.',
+      }),
+      entry(
+        'chunk:vecnolex:0:0:bbbbbbbbbbbb',
+        'thread_b',
+        '2026-05-03T00:00:00.000Z',
+        [0.9, 0, 0],
+        {
+          text: 'Completely different prose with no shared query terms at all.',
+        },
+      ),
+    ];
+    const lexical = buildLexicalIndex(items);
+    const results = rankHybrid('zxqwvtoken', Float32Array.from([1, 0, 0]), items, baseDate, {
+      lexical,
+    });
+    const both = results.find((r) => r.id === 'chunk:both:0:0:aaaaaaaaaaaa');
+    const vecOnly = results.find((r) => r.id === 'chunk:vecnolex:0:0:bbbbbbbbbbbb');
+    // Lexically-matched chunk: both ranks present, both RRF terms > 0.
+    expect(both?.explain?.lexicalRank).toBeDefined();
+    expect(both?.explain?.vectorRank).toBeDefined();
+    expect(both?.explain?.rrfLexical ?? 0).toBeGreaterThan(0);
+    // No-lexical-overlap chunk: vector rank only, lexical RRF == 0.
+    expect(vecOnly?.explain?.vectorRank).toBeDefined();
+    expect(vecOnly?.explain?.lexicalRank).toBeUndefined();
+    expect(vecOnly?.explain?.rrfLexical).toBe(0);
+    // fusion == rrfVector + rrfLexical holds for both shapes.
+    expect(vecOnly?.explain?.fusion).toBeCloseTo(vecOnly?.explain?.rrfVector ?? -1, 12);
+  });
+});
+
+describe('rankHybrid — vector-only fallback preserved', () => {
+  const baseDate = new Date('2026-05-03T00:00:00.000Z');
+
+  it('rank() (the 0-hybrid fallback path) is unchanged and ignores quality', () => {
+    // Plain rank() is the documented fallback the HTTP layer uses
+    // when rankHybrid returns nothing. It must NOT gain quality
+    // weighting, explain, or why — its shape stays byte-identical.
+    const items: readonly IndexEntry[] = [
+      entry('low', 'thread_a', '2026-05-03T00:00:00.000Z', [1, 0], {
+        text: 'identical relevance, low tier',
+        quality: 'low',
+      }),
+      entry('high', 'thread_b', '2026-05-03T00:00:00.000Z', [1, 0], {
+        text: 'identical relevance, high tier',
+        quality: 'high',
+      }),
+    ];
+    const results = rank(Float32Array.from([1, 0]), items, baseDate);
+    // cosine == 1 and freshness == 1 for both ⇒ identical score; the
+    // fallback does not reorder on quality.
+    expect(results).toHaveLength(2);
+    expect(results[0]?.score).toBeCloseTo(results[1]?.score ?? -1, 12);
+    for (const r of results) {
+      expect(r.score).toBeCloseTo(1, 12);
+      // Back-compat shape: no hybrid-only fields on the fallback path.
+      expect(r.explain).toBeUndefined();
+      expect(r.why).toBeUndefined();
+      expect(r.vector).toBeUndefined();
+      expect(r.lexical).toBeUndefined();
+    }
+  });
+
+  it('rankHybrid with an empty lexical index degenerates to vector ranking', () => {
+    // Empty corpus for minisearch ⇒ zero lexical hits. RRF collapses
+    // to the vector list; the vector-strongest chunk must rank first
+    // and quality is still only a within-tie nudge.
+    const items: readonly IndexEntry[] = [
+      entry('chunk:strong:0:0:aaaaaaaaaaaa', 'thread_a', '2026-05-03T00:00:00.000Z', [1, 0], {
+        text: 'alpha',
+      }),
+      entry('chunk:weak:0:0:bbbbbbbbbbbb', 'thread_b', '2026-05-03T00:00:00.000Z', [0.2, 0], {
+        text: 'beta',
+      }),
+    ];
+    const lexical = buildLexicalIndex(items);
+    // Query string shares no tokens with either chunk ⇒ lexical
+    // returns nothing; fusion is vector-only.
+    const results = rankHybrid('zzzznomatch', Float32Array.from([1, 0]), items, baseDate, {
+      lexical,
+    });
+    expect(results[0]?.id).toBe('chunk:strong:0:0:aaaaaaaaaaaa');
+    expect(results[0]?.explain?.lexicalRank).toBeUndefined();
+    expect(results[0]?.explain?.rrfLexical).toBe(0);
+    expect(results[0]?.vector?.rank).toBe(1);
   });
 });

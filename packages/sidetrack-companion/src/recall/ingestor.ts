@@ -103,6 +103,7 @@ const metadataFromChunk = (chunk: RecallChunk): ChunkMetadata => ({
   charEnd: chunk.charEnd,
   textHash: chunk.textHash,
   text: chunk.text,
+  ...(chunk.quality === undefined ? {} : { quality: chunk.quality }),
 });
 
 // Cap how many texts the embedder sees per call. Same value as
