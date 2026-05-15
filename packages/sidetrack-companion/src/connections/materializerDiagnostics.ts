@@ -12,6 +12,8 @@
 import { mkdir, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
+import { appendHealthHistory } from './healthHistory.js';
+
 import { ENGAGEMENT_SESSION_AGGREGATED } from '../engagement/events.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../tabsession/events.js';
 import {
@@ -516,6 +518,25 @@ export const createMaterializerDiagnosticsStore = (
     await rename(tmpPath, latestPath);
     const historyPath = join(historyDir, `${safeFilenameTimestamp(diagnostics.producedAt)}.json`);
     await writeFile(historyPath, body, 'utf8');
+    // Feed the dumb fixed-window ring (plan TODO-H5). Best-effort:
+    // observability must never break a drain, and the ring is the
+    // trend source the Focus surface reads instead of scanning the
+    // 3.5k-file history dir.
+    try {
+      const shadow = diagnostics.shadowVsBaseline;
+      const observation = diagnostics.shadowObservation;
+      await appendHealthHistory(vaultRoot, {
+        at: diagnostics.producedAt,
+        adjacentPerVisitChurn: observation?.adjacentPerVisitChurn ?? null,
+        shadowMaxTopicShare: shadow?.shadowMaxTopicShare ?? null,
+        noiseShare: shadow?.noiseShare ?? null,
+        shadowTopicCount: shadow?.shadowTopicCount ?? null,
+        runtimeMs: shadow?.runtimeMs ?? null,
+        vaultBytes: null,
+      });
+    } catch {
+      /* ring-buffer write is best-effort; never fail the drain */
+    }
   };
   return { write };
 };

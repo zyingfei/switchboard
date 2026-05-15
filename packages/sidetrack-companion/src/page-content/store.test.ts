@@ -4,11 +4,13 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  pageContentCoverageCounts,
   queryPageContent,
   readPageContentCoverage,
   writePageContentExtracted,
   writePageContentTombstoned,
 } from './store.js';
+import { PAGE_CONTENT_COVERAGE_STATES } from './types.js';
 import type { PageContentExtractedPayload } from './types.js';
 
 describe('page-content store', () => {
@@ -99,5 +101,78 @@ describe('page-content store', () => {
       state: 'tombstoned',
     });
     await expect(queryPageContent(root, 'oracle', { limit: 5 })).resolves.toEqual([]);
+  });
+
+  it('aggregates per-state coverage counts with explicit zeros', async () => {
+    // indexed (high quality)
+    await writePageContentExtracted(
+      root,
+      extractedPayload({ canonicalUrl: 'https://docs.example.com/a', url: 'https://docs.example.com/a' }),
+    );
+    // indexed_low_quality (passes floor, below medium thresholds)
+    await writePageContentExtracted(
+      root,
+      extractedPayload({
+        canonicalUrl: 'https://docs.example.com/b',
+        url: 'https://docs.example.com/b',
+        quality: 'low',
+        qualitySignals: {
+          extractedWordCount: 40,
+          contentToDomRatio: 0.1,
+          boilerplateFraction: 0.5,
+          extractionStrategy: 'visible-dom',
+        },
+        content: {
+          text: `${'low quality filler words '.repeat(50)}`,
+          contentHash: 'hash-low',
+          charCount: 1250,
+        },
+      }),
+    );
+    // metadata_only_error (below floor)
+    await writePageContentExtracted(
+      root,
+      extractedPayload({
+        canonicalUrl: 'https://docs.example.com/c',
+        url: 'https://docs.example.com/c',
+        quality: 'low',
+        qualitySignals: {
+          extractedWordCount: 8,
+          contentToDomRatio: 0.01,
+          boilerplateFraction: 0.9,
+          extractionStrategy: 'visible-dom',
+        },
+        content: { text: 'short noisy nav', contentHash: 'hash-c', charCount: 15 },
+      }),
+    );
+    // tombstoned
+    await writePageContentExtracted(
+      root,
+      extractedPayload({ canonicalUrl: 'https://docs.example.com/d', url: 'https://docs.example.com/d' }),
+    );
+    await writePageContentTombstoned(root, {
+      payloadVersion: 1,
+      canonicalUrl: 'https://docs.example.com/d',
+      tombstonedAt: '2026-05-15T11:00:00.000Z',
+      reason: 'user-delete',
+    });
+
+    const counts = await pageContentCoverageCounts(root);
+
+    expect(typeof counts.producedAt).toBe('string');
+    expect(Number.isNaN(Date.parse(counts.producedAt))).toBe(false);
+    expect(counts.total).toBe(4);
+    expect(counts.byState.indexed).toBe(1);
+    expect(counts.byState.indexed_low_quality).toBe(1);
+    expect(counts.byState.metadata_only_error).toBe(1);
+    expect(counts.byState.tombstoned).toBe(1);
+    expect(counts.indexed).toBe(2); // indexed + indexed_low_quality
+    expect(counts.bytes).toBeGreaterThan(0);
+    // Every known state present with an explicit zero, never missing.
+    for (const state of PAGE_CONTENT_COVERAGE_STATES) {
+      expect(counts.byState[state]).toBeTypeOf('number');
+    }
+    expect(counts.byState.indexing).toBe(0);
+    expect(counts.byState.stale_index).toBe(0);
   });
 });

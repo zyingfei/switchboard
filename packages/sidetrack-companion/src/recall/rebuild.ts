@@ -51,11 +51,26 @@ const EMBED_BATCH_SIZE = 16;
 // trimming up front saves the tokenizer + tensor cost.
 const EMBED_TEXT_CHARS = 4000;
 
+// Plan follow-up #17: per-step rebuild granularity. Emitted at the
+// START of each stage so a live indicator reflects the stage actually
+// running (notably `embed`, the slow one), not the last finished one.
+export type RecallRebuildPhase =
+  | 'read-log'
+  | 'project'
+  | 'collect-ids'
+  | 'chunk'
+  | 'embed'
+  | 'write-index'
+  | 'write-manifest';
+
 export interface RebuildOptions {
   // Optional progress callback so callers (e.g. RecallLifecycle)
   // can surface "embedded N of M" while a rebuild is in flight.
   // Fired after each batch completes, before the inter-batch yield.
   readonly onProgress?: (embedded: number, total: number) => void;
+  // Optional phase callback (parallel to onProgress); fires once when
+  // each rebuild stage begins.
+  readonly onPhase?: (phase: RecallRebuildPhase) => void;
   // Optional event log. When provided, the rebuild reads
   // `capture.recorded` and `recall.tombstone.target` events from
   // the per-replica log and merges them with the legacy `_BAC/events/`
@@ -122,12 +137,16 @@ export const rebuildFromEventLog = async (
   // 1. Read the per-replica log first so we can dedupe legacy
   //    captures whose bac_id already appears as a `capture.recorded`
   //    event.
+  options.onPhase?.('read-log');
   const logEvents = options.eventLog === undefined ? [] : await options.eventLog.readMerged();
   phase(`readMerged events=${String(logEvents.length)}`);
+  options.onPhase?.('project');
   const fromLog = projectRecallFromLog(logEvents);
   phase(`projectRecallFromLog rawItems=${String(fromLog.length)}`);
+  options.onPhase?.('collect-ids');
   const logBacIds = collectLogBacIds(logEvents);
   phase(`collectLogBacIds bacIds=${String(logBacIds.size)}`);
+  options.onPhase?.('chunk');
 
   const rawItems: RawCaptureItem[] = fromLog.map((item) => ({
     id: item.id,
@@ -242,6 +261,7 @@ export const rebuildFromEventLog = async (
 
   const total = chunks.length;
   const entries: IndexEntry[] = [];
+  options.onPhase?.('embed');
   for (let offset = 0; offset < total; offset += EMBED_BATCH_SIZE) {
     const batch = chunks.slice(offset, offset + EMBED_BATCH_SIZE);
     const vectors = await embed(batch.map(({ chunk }) => chunk.embedText.slice(0, EMBED_TEXT_CHARS)));
@@ -270,8 +290,10 @@ export const rebuildFromEventLog = async (
   }
 
   phase(`embedBatches entries=${String(entries.length)}`);
+  options.onPhase?.('write-index');
   await upsertEntries(join(vaultRoot, '_BAC', 'recall', 'index.bin'), entries, MODEL_ID);
   phase('upsertEntries');
+  options.onPhase?.('write-manifest');
   // Write the recall manifest so `recall verify` works after a
   // lifecycle rebuild — without this the rebuild path's index file
   // would be valid V3 but the manifest would say "not yet built".

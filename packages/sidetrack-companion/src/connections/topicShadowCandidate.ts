@@ -45,7 +45,7 @@ interface TermFrequency {
 export interface TopicShadowDiagnostics {
   readonly enabled: boolean;
   readonly candidate: typeof TOPIC_SHADOW_IDF_RKN_SPLIT_CANDIDATE;
-  readonly activeAlgorithmVersion: string;
+  readonly baselineAlgorithmVersion: string;
   readonly shadowAlgorithmVersion: typeof TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY;
   readonly baselineRevisionId: string;
   readonly shadowRevisionId: string;
@@ -717,7 +717,7 @@ export const buildTopicShadowCandidate = async (
   const diagnostics: TopicShadowDiagnostics = {
     enabled: true,
     candidate: TOPIC_SHADOW_IDF_RKN_SPLIT_CANDIDATE,
-    activeAlgorithmVersion: input.baselineRevision.algorithmVersion,
+    baselineAlgorithmVersion: input.baselineRevision.algorithmVersion,
     shadowAlgorithmVersion: TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
     baselineRevisionId: input.baselineRevision.revisionId,
     shadowRevisionId: revision.revisionId,

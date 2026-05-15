@@ -11,6 +11,25 @@ interface CaptureProviderHealth {
   readonly warn24h: number;
   readonly fail24h: number;
   readonly warning?: string;
+  // Content hint for the most recent capture — turns a bare
+  // heartbeat ("captured something 4m ago") into "captured the
+  // right thing" ("ChatGPT · 'Fixing Focus collapse' · 4m ago").
+  // Optional: an older companion omits these.
+  readonly lastCaptureTitle?: string;
+  readonly lastCaptureThreadId?: string;
+}
+
+// Server-derived honest reachability/freshness. Lets the panel render
+// one authoritative light without re-deriving worst-of client-side,
+// and — crucially — distinguish "metrics didn't load" (unavailable)
+// from a real empty (no events yet). Optional: an older companion
+// omits the whole block, in which case the client rollup still works.
+type SectionAvailability = 'ok' | 'stale' | 'unavailable';
+type ObservabilityStatus = 'ok' | 'degraded' | 'failed';
+interface HealthObservability {
+  readonly asOf: string;
+  readonly status: ObservabilityStatus;
+  readonly sections: Readonly<Record<string, SectionAvailability>>;
 }
 
 interface CaptureWarningHealth {
@@ -98,6 +117,20 @@ interface WorkGraphRankerHealth {
   readonly trainedAt: number | null;
   readonly retrainSkipReason: string | null;
   readonly retrainNewLabelCount: number;
+  // Honest training mix. Never show the negative count alone — the
+  // labeled triple prevents reading "0 user negatives" as "trained on
+  // no negatives". `trainingNegatives === null` renders as "unknown"
+  // (manifest predates capture), never as 0. Optional: an older
+  // companion omits the whole block.
+  readonly trainingMix?: {
+    readonly positivesAtTrain: number;
+    readonly userFeedbackNegativesAtTrain: number;
+    readonly trainingNegatives: number | null;
+  } | null;
+  // True when the feedback fingerprint differs from what the active
+  // model trained on — "data changed, model is behind". Optional on
+  // an older companion (treated as false / not surfaced).
+  readonly datasetChangedSinceTrain?: boolean;
 }
 
 interface WorkGraphTopicProducerHealth {
@@ -120,12 +153,20 @@ interface HealthReport {
     readonly sizeBytes: number | null;
   };
   readonly workGraph?: WorkGraphHealth;
+  readonly observability?: HealthObservability;
   readonly capture: {
     readonly lastByProvider: Record<string, string | null>;
     readonly queueDepthHint: number | null;
     readonly droppedHint: number | null;
     readonly providers?: readonly CaptureProviderHealth[];
     readonly recentWarnings?: readonly CaptureWarningHealth[];
+    // Rolling 1h capture counts. Turns "last capture 4m ago" into
+    // "is it still flowing?". Optional on an older companion.
+    readonly window1h?: {
+      readonly captures: number;
+      readonly warnings: number;
+      readonly fails: number;
+    };
   };
   readonly recall: {
     readonly indexExists: boolean;
@@ -141,6 +182,7 @@ interface HealthReport {
     readonly lastError?: string | null;
     readonly rebuildEmbedded?: number;
     readonly rebuildTotal?: number;
+    readonly rebuildPhase?: string | null;
     readonly embedderDevice?: 'cpu' | 'wasm' | 'webgpu' | 'unknown';
     readonly embedderAccelerator?: 'accelerate' | 'mkl' | 'cpu' | 'unknown';
     readonly activity?: RecallActivityReport;
@@ -249,7 +291,16 @@ const activityText = (event: RecallActivityEvent): string => {
   if (event.kind === 'query') {
     return `Thread search · ${String(event.resultCount ?? 0)} result${event.resultCount === 1 ? '' : 's'} · ${String(event.queryLength ?? 0)} chars`;
   }
-  return `Group recommendation · ${event.threadId ?? 'thread'} · ${String(event.resultCount ?? 0)} result${event.resultCount === 1 ? '' : 's'}`;
+  // Honest id presentation (TODO-H8 remainder): name resolution needs a
+  // heavy snapshot/threads read we deliberately keep off the polled
+  // health path, so present the id explicitly as a (truncated) thread
+  // reference rather than a mystery token — never fabricate a name.
+  const rawId = event.threadId;
+  const idRef =
+    rawId === undefined
+      ? 'thread'
+      : `thread ${rawId.length > 10 ? `${rawId.slice(0, 8)}…` : rawId}`;
+  return `Group recommendation · ${idRef} · ${String(event.resultCount ?? 0)} result${event.resultCount === 1 ? '' : 's'}`;
 };
 
 export function HealthPanel({
@@ -268,6 +319,12 @@ export function HealthPanel({
   );
   type RebuildState = { kind: 'idle' } | { kind: 'accepted' } | { kind: 'error'; message: string };
   const [rebuildState, setRebuildState] = useState<RebuildState>({ kind: 'idle' });
+  // Plan TODO-H8 (self-explanatory subset): the raw activity list is an
+  // ever-churning wall of opaque-id rows that reads like failures. Roll
+  // it into an honest rate header; the list is a collapsed drilldown.
+  // Live-only/ephemeral source is accepted for now; id→name resolution
+  // remains the open piece.
+  const [recallActivityOpen, setRecallActivityOpen] = useState(false);
 
   const fetchReport = async (): Promise<void> => {
     if (companionPort === undefined || companionPort === null || !bridgeKey) {
@@ -352,11 +409,19 @@ export function HealthPanel({
   const queueDepth = queuedCaptureCount ?? report?.capture.queueDepthHint ?? null;
   const dropped = droppedCaptureCount ?? report?.capture.droppedHint ?? null;
   const queueWarn = queueDepth !== null && queueDepth > 10;
+  // Honest unavailable-vs-zero: when the server says the capture
+  // section timed out we must NOT synthesize zero-count provider rows
+  // (those read as a dead provider). Only show the rows the server
+  // actually reported; a real empty (section ok, no providers) still
+  // falls through to "no captures yet".
+  const sections = report?.observability?.sections;
+  const captureUnavailable = sections?.['capture'] === 'unavailable';
   const providerRows =
-    report === null
+    report === null || captureUnavailable
       ? []
       : (report.capture.providers ?? fallbackProviderRows(report.capture.lastByProvider));
   const lastProvider = providerRows.find((row) => row.lastCaptureAt !== null);
+  const window1h = report?.capture.window1h;
   const activity = report?.recall.activity;
 
   // Stage 5 polish — pipeline-stage rollup. Each entry describes one
@@ -365,7 +430,11 @@ export function HealthPanel({
   // load-bearing fact for that stage (count, age, status). Drawn as a
   // left-to-right strip at the top of the panel so the user sees
   // where data is moving before diving into the per-lane sections.
-  type PipelineStatus = 'ok' | 'warn' | 'err' | 'idle';
+  // 'unavailable' = the server could not collect this section's
+  // metrics (timed out). Distinct from 'idle' (collected, nothing to
+  // show yet) so the strip never fabricates a 0 for a section that
+  // simply didn't load.
+  type PipelineStatus = 'ok' | 'warn' | 'err' | 'idle' | 'unavailable';
   interface PipelineStage {
     readonly id: string;
     readonly name: string;
@@ -374,15 +443,26 @@ export function HealthPanel({
   }
   const pipelineStages: readonly PipelineStage[] = (() => {
     if (report === null) return [];
-    const captureStatus: PipelineStatus = queueWarn
-      ? 'warn'
+    const captureStatus: PipelineStatus = captureUnavailable
+      ? 'unavailable'
+      : queueWarn
+        ? 'warn'
+        : lastProvider === undefined
+          ? 'idle'
+          : 'ok';
+    const window1hSummary =
+      window1h === undefined
+        ? ''
+        : ` · ${String(window1h.captures)} in 1h${
+            window1h.warnings > 0 || window1h.fails > 0
+              ? ` (${String(window1h.warnings)}w/${String(window1h.fails)}f)`
+              : ''
+          }`;
+    const captureDetail = captureUnavailable
+      ? 'unavailable — metrics didn’t load'
       : lastProvider === undefined
-        ? 'idle'
-        : 'ok';
-    const captureDetail =
-      lastProvider === undefined
-        ? 'no events yet'
-        : `${String(providerRows.length)} provider${providerRows.length === 1 ? '' : 's'} · ${formatWhen(lastProvider.lastCaptureAt)}`;
+        ? 'no captures yet'
+        : `${String(providerRows.length)} provider${providerRows.length === 1 ? '' : 's'} · ${formatWhen(lastProvider.lastCaptureAt)}${window1hSummary}`;
     const vaultStatus: PipelineStatus = report.vault.writable ? 'ok' : 'err';
     const vaultDetail = report.vault.writable
       ? `writable · ${formatBytes(report.vault.sizeBytes)}`
@@ -408,11 +488,14 @@ export function HealthPanel({
             : recallStatus === 'ready'
               ? 'ok'
               : 'idle';
+    const rebuildPhaseTag = report.recall.rebuildPhase
+      ? `[${report.recall.rebuildPhase}] `
+      : '';
     const recallDetail =
-      recallStatus === 'rebuilding' &&
-      report.recall.rebuildTotal !== undefined &&
-      report.recall.rebuildTotal > 0
-        ? `rebuilding ${String(report.recall.rebuildEmbedded ?? 0)}/${String(report.recall.rebuildTotal)}`
+      recallStatus === 'rebuilding'
+        ? report.recall.rebuildTotal !== undefined && report.recall.rebuildTotal > 0
+          ? `rebuilding ${rebuildPhaseTag}${String(report.recall.rebuildEmbedded ?? 0)}/${String(report.recall.rebuildTotal)}`
+          : `rebuilding ${rebuildPhaseTag}…`
         : recallStatus === undefined
           ? `${formatCount(report.recall.entryCount)} vectors`
           : `${recallStatus} · ${formatCount(report.recall.entryCount)} vectors`;
@@ -422,27 +505,54 @@ export function HealthPanel({
     // the last train. We show the snapshot age + the most recent
     // skip reason so the user can tell whether the planner has been
     // running but choosing not to retrain.
+    const workGraphUnavailable = sections?.['workGraph'] === 'unavailable';
     const rankerHealth = report.workGraph?.ranker;
-    const rankerStatus: PipelineStatus =
-      rankerHealth === undefined
+    const rankerStatus: PipelineStatus = workGraphUnavailable
+      ? 'unavailable'
+      : rankerHealth === undefined
         ? 'idle'
         : rankerHealth.loadStatus === 'ready'
           ? 'ok'
           : rankerHealth.loadStatus === 'invalid-model'
             ? 'err'
             : 'warn';
-    const rankerDetail =
-      rankerHealth === undefined
+    // Honest training mix — never the raw negative count alone. The
+    // labeled triple (positives / user-feedback negatives / training
+    // negatives) plus the dataset-changed flag and skip reason makes
+    // "0 user negatives" unambiguous and explains why a behind model
+    // hasn't retrained.
+    const mix = rankerHealth?.trainingMix;
+    const mixLine =
+      mix === undefined || mix === null
+        ? ''
+        : ` · +${String(mix.positivesAtTrain)} / uf-${String(
+            mix.userFeedbackNegativesAtTrain,
+          )} / neg-${mix.trainingNegatives === null ? 'unknown' : String(mix.trainingNegatives)}`;
+    const staleLine =
+      rankerHealth?.datasetChangedSinceTrain === true
+        ? ` · data changed since train${
+            rankerHealth.retrainSkipReason === null
+              ? ''
+              : ` (${rankerHealth.retrainSkipReason})`
+          }`
+        : '';
+    const rankerDetail = workGraphUnavailable
+      ? 'unavailable — metrics didn’t load'
+      : rankerHealth === undefined
         ? 'workGraph not reported'
         : rankerHealth.loadStatus === 'ready' && rankerHealth.trainedAt !== null
-          ? `snapshot ${formatRelative(new Date(rankerHealth.trainedAt).toISOString())}`
+          ? `snapshot ${formatRelative(
+              new Date(rankerHealth.trainedAt).toISOString(),
+            )}${mixLine}${staleLine}`
           : rankerHealth.loadStatus === 'missing'
-            ? rankerHealth.retrainSkipReason === null
-              ? 'no snapshot yet'
-              : `pending · ${rankerHealth.retrainSkipReason}`
+            ? `${
+                rankerHealth.retrainSkipReason === null
+                  ? 'no snapshot yet'
+                  : `pending · ${rankerHealth.retrainSkipReason}`
+              }${mixLine}`
             : rankerHealth.loadStatus === 'invalid-model'
               ? 'snapshot invalid'
-              : 'ready';
+              : `ready${mixLine}${staleLine}`;
     const relay = report.sync?.relay;
     const syncStatus: PipelineStatus =
       relay === undefined
@@ -464,22 +574,32 @@ export function HealthPanel({
     // (cluster bias). `lineageCount` includes split + merge edges so
     // the user can see whether clusters are evolving over time.
     const topicHealth = report.workGraph?.topicProducer;
-    const topicStatus: PipelineStatus =
-      topicHealth === undefined
+    const topicStatus: PipelineStatus = workGraphUnavailable
+      ? 'unavailable'
+      : topicHealth === undefined
         ? 'idle'
         : topicHealth.activeRevisionId === null
           ? 'warn'
           : topicHealth.topicCount === 0
             ? 'warn'
             : 'ok';
-    const topicDetail =
-      topicHealth === undefined
+    // `algorithmVersion` is the authoritative active topic algorithm
+    // (post-flip: topic-revision:shadow:idf-rkn-split). Surface it so
+    // the strip names which algorithm produced the live revision, not
+    // just the counts.
+    const algoLabel =
+      topicHealth?.algorithmVersion !== undefined && topicHealth.algorithmVersion !== null
+        ? ` · ${topicHealth.algorithmVersion}`
+        : '';
+    const topicDetail = workGraphUnavailable
+      ? 'unavailable — metrics didn’t load'
+      : topicHealth === undefined
         ? 'workGraph not reported'
         : topicHealth.activeRevisionId === null
           ? 'no revision yet'
           : topicHealth.topicCount === 0
             ? 'no clusters yet'
-            : `${String(topicHealth.topicCount)} topic${topicHealth.topicCount === 1 ? '' : 's'} · ${String(topicHealth.lineageCount)} lineage`;
+            : `${String(topicHealth.topicCount)} topic${topicHealth.topicCount === 1 ? '' : 's'} · ${String(topicHealth.lineageCount)} lineage${algoLabel}`;
     return [
       { id: 'capture', name: 'Capture', status: captureStatus, detail: captureDetail },
       { id: 'vault', name: 'Vault', status: vaultStatus, detail: vaultDetail },
@@ -490,6 +610,13 @@ export function HealthPanel({
       { id: 'sync', name: 'Sync', status: syncStatus, detail: syncDetail },
     ];
   })();
+
+  // Server-derived worst-of light. Preferred over an ad-hoc client
+  // rollup because the companion already computed it (and it accounts
+  // for sections the client can't see, e.g. timed-out collectors).
+  const overallStatus: ObservabilityStatus | null = report?.observability?.status ?? null;
+  const overallStatusClass =
+    overallStatus === 'failed' ? 'err' : overallStatus === 'degraded' ? 'warn' : 'ok';
 
   const copyDiagnostics = () => {
     if (report === null) return;
@@ -520,6 +647,15 @@ export function HealthPanel({
           <span style={{ display: 'inline-flex', width: 14, height: 14 }}>{Icons.back}</span>
         </button>
         <span className="title">Capture health</span>
+        {overallStatus !== null ? (
+          <span
+            className={`hp-state ${overallStatusClass}`}
+            data-testid="hp-overall-status"
+            title="Server-derived overall health"
+          >
+            {overallStatus}
+          </span>
+        ) : null}
         <span className="muted">snapshot · {loadState === 'live' ? 'live' : loadState}</span>
       </div>
 
@@ -628,16 +764,34 @@ export function HealthPanel({
               </span>
             </div>
           <div className="health-grid">
-            <div className="hc">
+            <div className={'hc' + (captureUnavailable ? ' warn' : '')}>
               <div className="hc-lbl">last capture</div>
               <div className="hc-num small">
-                {lastProvider === undefined ? '-' : formatWhen(lastProvider.lastCaptureAt)}
+                {captureUnavailable
+                  ? 'unavailable'
+                  : lastProvider === undefined
+                    ? '-'
+                    : formatWhen(lastProvider.lastCaptureAt)}
               </div>
               <div className="hc-foot">
-                {lastProvider === undefined
-                  ? 'no provider events'
-                  : `${providerLabel(lastProvider.provider)} · ${lastProvider.lastStatus ?? 'no canary'}`}
+                {captureUnavailable
+                  ? 'metrics didn’t load'
+                  : lastProvider === undefined
+                    ? 'no captures yet'
+                    : `${providerLabel(lastProvider.provider)}${
+                        lastProvider.lastCaptureTitle !== undefined &&
+                        lastProvider.lastCaptureTitle.length > 0
+                          ? ` · “${lastProvider.lastCaptureTitle}”`
+                          : ''
+                      } · ${lastProvider.lastStatus ?? 'no canary'}`}
               </div>
+              {!captureUnavailable && window1h !== undefined ? (
+                <div className={'hc-foot' + (window1h.fails > 0 ? ' warn' : '')}>
+                  {String(window1h.captures)} in 1h
+                  {window1h.warnings > 0 ? ` · ${String(window1h.warnings)} warn` : ''}
+                  {window1h.fails > 0 ? ` · ${String(window1h.fails)} fail` : ''}
+                </div>
+              ) : null}
             </div>
             <div className="hc">
               <div className="hc-lbl">recall index</div>
@@ -693,8 +847,15 @@ export function HealthPanel({
 
           <div className="hp-sec">
             <div className="hp-sec-head">By provider · last 24h</div>
-            {providerRows.length === 0 ? (
-              <div className="hp-muted-row">No capture events found.</div>
+            {captureUnavailable ? (
+              // Honest unavailable-vs-zero: the server could not
+              // collect capture metrics. Do NOT synthesize zero-count
+              // rows that read as a dead provider — say so explicitly.
+              <div className="hp-muted-row" data-testid="hp-capture-unavailable">
+                Capture metrics unavailable — they didn’t load this snapshot (not zero captures).
+              </div>
+            ) : providerRows.length === 0 ? (
+              <div className="hp-muted-row">No captures yet.</div>
             ) : (
               providerRows.map((row) => (
                 <div key={row.provider} className="hp-row">
@@ -717,6 +878,11 @@ export function HealthPanel({
                   <span className={`hp-state ${statusState(row.lastStatus)}`}>
                     {row.lastStatus ?? 'seen'}
                   </span>
+                  {row.lastCaptureTitle !== undefined && row.lastCaptureTitle.length > 0 ? (
+                    <span className="hp-row-note" title={row.lastCaptureTitle}>
+                      “{row.lastCaptureTitle}”
+                    </span>
+                  ) : null}
                   {row.warning !== undefined ? (
                     <span className="hp-row-note">{row.warning}</span>
                   ) : null}
@@ -730,15 +896,52 @@ export function HealthPanel({
             {activity === undefined || activity.recent.length === 0 ? (
               <div className="hp-muted-row">No recall activity recorded this run.</div>
             ) : (
-              <div className="hp-activity-list">
-                {activity.recent.slice(0, 8).map((event, index) => (
-                  <div className="hp-activity" key={`${event.kind}-${event.at}-${String(index)}`}>
-                    <span className="hp-dot signal" />
-                    <span>{activityText(event)}</span>
-                    <span className="muted">{formatWhen(event.at)}</span>
-                  </div>
-                ))}
-              </div>
+              (() => {
+                const recent = activity.recent;
+                const withResult = recent.filter(
+                  (event) => typeof event.resultCount === 'number',
+                );
+                const zero = withResult.filter((event) => event.resultCount === 0).length;
+                const newestAt = recent[0]?.at;
+                return (
+                  <>
+                    <div className="hp-activity-summary">
+                      <span className="hp-dot signal" />
+                      <span>
+                        {recent.length} recall event{recent.length === 1 ? '' : 's'} this run
+                        {withResult.length > 0
+                          ? ` · ${String(zero)}/${String(withResult.length)} zero-result (expected — recommender found nothing to suggest)`
+                          : ''}
+                        {newestAt !== undefined ? ` · last ${formatWhen(newestAt)}` : ''}
+                      </span>
+                      <button
+                        type="button"
+                        className="hp-link-btn"
+                        onClick={() => setRecallActivityOpen((open) => !open)}
+                      >
+                        {recallActivityOpen ? 'hide' : 'details'}
+                      </button>
+                    </div>
+                    {recallActivityOpen ? (
+                      <div className="hp-activity-list">
+                        {recent.slice(0, 8).map((event, index) => (
+                          <div
+                            className="hp-activity"
+                            key={`${event.kind}-${event.at}-${String(index)}`}
+                          >
+                            <span className="hp-dot signal" />
+                            <span>
+                              {activityText(event)}
+                              {event.resultCount === 0 ? ' (no match — expected)' : ''}
+                            </span>
+                            <span className="muted">{formatWhen(event.at)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                  </>
+                );
+              })()
             )}
           </div>
 

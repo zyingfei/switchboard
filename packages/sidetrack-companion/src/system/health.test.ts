@@ -36,7 +36,42 @@ describe('collectHealth', () => {
       },
       recall: { indexExists: true, entryCount: 7, modelId: 'model', sizeBytes: 4096 },
       service: { installed: true, running: false },
+      observability: {
+        asOf: '2026-05-03T00:00:42.000Z',
+        status: 'ok',
+        sections: { vault: 'ok', capture: 'ok', recall: 'ok', service: 'ok' },
+      },
     });
+  });
+
+  it('derives worst-of status from a failed materializer (not silently ok)', async () => {
+    const report = await collectHealth({
+      startedAt: new Date('2026-05-03T00:00:00.000Z'),
+      now: () => new Date('2026-05-03T00:00:00.000Z'),
+      vaultRoot: '/tmp/vault',
+      vaultWritable: () => Promise.resolve(true),
+      vaultSizeBytes: () => Promise.resolve(1),
+      captureSummary: () =>
+        Promise.resolve({ lastByProvider: {}, queueDepthHint: null, droppedHint: null }),
+      recallSummary: () =>
+        Promise.resolve({ indexExists: true, entryCount: 1, modelId: 'm', sizeBytes: 1 }),
+      serviceStatus: () => Promise.resolve({ installed: true, running: true }),
+      syncSummary: () => ({
+        replicaId: 'r1',
+        seq: 5,
+        materializers: {
+          connections: {
+            status: 'failed',
+            lastSuccessAt: null,
+            lastError: 'boom',
+            pending: true,
+          },
+        },
+      }),
+    });
+
+    expect(report.observability?.status).toBe('failed');
+    expect(report.observability?.sections['sync']).toBe('ok');
   });
 
   it('uses null recall fields when the index is missing', async () => {

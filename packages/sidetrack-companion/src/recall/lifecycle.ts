@@ -18,7 +18,7 @@ import {
   tombstoneByThread as tombstoneByThreadRaw,
 } from './indexFile.js';
 import type { IndexEntry } from './ranker.js';
-import { rebuildFromEventLog } from './rebuild.js';
+import { rebuildFromEventLog, type RecallRebuildPhase } from './rebuild.js';
 import type { RecallActivityTracker } from './activity.js';
 
 // Surfaces the current freshness of the recall index so the side
@@ -57,6 +57,11 @@ export interface RecallStatusReport {
   // before showing the fraction.
   readonly rebuildEmbedded: number;
   readonly rebuildTotal: number;
+  // Current rebuild stage (follow-up #17). Non-null only while an
+  // IN-PROCESS rebuild is running; null at rest AND during a
+  // child-indexer rebuild (the child does not stream phases over IPC —
+  // honest null, not a fabricated phase). Guard on `status` first.
+  readonly rebuildPhase: RecallRebuildPhase | null;
   // Resolved embedder backend + accelerator from the most recent
   // pipeline load. 'unknown' until the first embed() call has
   // completed, after which it stays sticky for the process
@@ -168,6 +173,7 @@ type RebuilderFn = (
   eventLogPath: string,
   options?: {
     readonly onProgress?: (embedded: number, total: number) => void;
+    readonly onPhase?: (phase: RecallRebuildPhase) => void;
     readonly eventLog?: EventLog;
   },
 ) => Promise<{ readonly indexed: number }>;
@@ -271,6 +277,7 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
   // a stale fraction.
   let rebuildEmbedded = 0;
   let rebuildTotal = 0;
+  let rebuildPhase: RecallRebuildPhase | null = null;
 
   // Single-writer mutex serialising every path that mutates the
   // index file. Rebuild, appendEntry, gcEntries, tombstoneByThread,
@@ -338,6 +345,7 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
       lastError,
       rebuildEmbedded,
       rebuildTotal,
+      rebuildPhase,
       embedderDevice: getResolvedEmbedderDevice(),
       embedderAccelerator: getResolvedEmbedderAccelerator(),
       drift: {
@@ -356,6 +364,7 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
     lastError = null;
     rebuildEmbedded = 0;
     rebuildTotal = 0;
+    rebuildPhase = null;
     rebuildPromise = enqueueWrite(async () => {
       try {
         // Production path: hand off to the recall indexer child
@@ -391,6 +400,9 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
           onProgress: (embedded, total) => {
             rebuildEmbedded = embedded;
             rebuildTotal = total;
+          },
+          onPhase: (phase) => {
+            rebuildPhase = phase;
           },
           ...(opts.eventLog === undefined ? {} : { eventLog: opts.eventLog }),
         });

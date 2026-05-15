@@ -197,6 +197,151 @@ describe('HealthPanel pipeline strip', () => {
     });
   });
 
+  it('renders an explicit capture-unavailable state and NOT a zero-count provider row when observability says capture is unavailable', async () => {
+    vi.unstubAllGlobals();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () =>
+          ({
+            data: mkHealth({
+              observability: {
+                asOf: '2026-05-15T00:00:00.000Z',
+                status: 'degraded' as const,
+                sections: { capture: 'unavailable' as const, vault: 'ok' as const },
+              },
+              // A timed-out collector still leaves lastByProvider
+              // present — the panel must NOT synthesize zero rows.
+              capture: {
+                lastByProvider: { chatgpt: '2026-05-12T20:00:00.000Z' },
+                queueDepthHint: null,
+                droppedHint: null,
+                recentWarnings: [],
+              },
+            }),
+          }),
+      })),
+    );
+
+    render(<HealthPanel onClose={vi.fn()} companionPort={17373} bridgeKey="key" />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('hp-capture-unavailable')).toBeInTheDocument();
+    });
+    // No synthesized "0 ok / 0 warn / 0 fail" provider row.
+    expect(screen.queryByText('seen')).not.toBeInTheDocument();
+    // Overall light uses the server-derived status.
+    const overall = screen.getByTestId('hp-overall-status');
+    expect(overall.textContent).toBe('degraded');
+    // Pipeline capture node is the unavailable state, not a 0/idle.
+    const stage = screen.getByTestId('hp-pipeline-stage-capture');
+    expect(stage.className).toContain('is-unavailable');
+    expect(stage.textContent).toContain('unavailable');
+    expect(stage.textContent).not.toContain('no captures yet');
+  });
+
+  it('shows the labeled training mix and "data changed" when datasetChangedSinceTrain', async () => {
+    vi.unstubAllGlobals();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () =>
+          ({
+            data: mkHealth({
+              workGraph: {
+                ranker: {
+                  activeRevisionId: 'rev_42',
+                  loadStatus: 'ready' as const,
+                  trainedAt: Date.now() - 2 * 60 * 60_000,
+                  retrainSkipReason: 'cooldown-active',
+                  retrainNewLabelCount: 7,
+                  trainingMix: {
+                    positivesAtTrain: 18,
+                    userFeedbackNegativesAtTrain: 0,
+                    trainingNegatives: null,
+                  },
+                  datasetChangedSinceTrain: true,
+                },
+                topicProducer: {
+                  activeRevisionId: 'rev_topic_42',
+                  algorithmVersion: 'topic-revision:shadow:idf-rkn-split',
+                  topicCount: 4,
+                  lineageCount: 2,
+                },
+              },
+            }),
+          }),
+      })),
+    );
+
+    render(<HealthPanel onClose={vi.fn()} companionPort={17373} bridgeKey="key" />);
+
+    await waitFor(() => {
+      const stage = screen.getByTestId('hp-pipeline-stage-ranker');
+      // Labeled triple — positives / user-feedback negatives /
+      // training negatives (null → "unknown", never 0).
+      expect(stage.textContent).toContain('+18');
+      expect(stage.textContent).toContain('uf-0');
+      expect(stage.textContent).toContain('neg-unknown');
+      expect(stage.textContent).not.toContain('neg-0');
+      // Behind-model surfaced with the skip reason explaining why.
+      expect(stage.textContent).toContain('data changed since train');
+      expect(stage.textContent).toContain('cooldown-active');
+    });
+    // Topics node uses algorithmVersion as the authoritative label.
+    const topics = screen.getByTestId('hp-pipeline-stage-topics');
+    expect(topics.textContent).toContain('topic-revision:shadow:idf-rkn-split');
+  });
+
+  it('shows the last-capture title and 1h window on the capture node and provider row', async () => {
+    vi.unstubAllGlobals();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () =>
+          ({
+            data: mkHealth({
+              capture: {
+                lastByProvider: { chatgpt: '2026-05-12T20:00:00.000Z' },
+                queueDepthHint: 1,
+                droppedHint: 0,
+                providers: [
+                  {
+                    provider: 'chatgpt',
+                    lastCaptureAt: '2026-05-12T20:00:00.000Z',
+                    lastStatus: 'ok' as const,
+                    ok24h: 5,
+                    warn24h: 0,
+                    fail24h: 0,
+                    lastCaptureTitle: 'Fixing Focus collapse',
+                    lastCaptureThreadId: 'bac_thread_9',
+                  },
+                ],
+                recentWarnings: [],
+                window1h: { captures: 6, warnings: 1, fails: 0 },
+              },
+            }),
+          }),
+      })),
+    );
+
+    render(<HealthPanel onClose={vi.fn()} companionPort={17373} bridgeKey="key" />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText(/Fixing Focus collapse/).length).toBeGreaterThan(0);
+    });
+    const stage = screen.getByTestId('hp-pipeline-stage-capture');
+    expect(stage.textContent).toContain('6 in 1h');
+    // 1h window also surfaces on the last-capture card.
+    expect(screen.getAllByText(/6 in 1h/).length).toBeGreaterThan(0);
+  });
+
   it('flags the vault stage err when writable=false', async () => {
     vi.unstubAllGlobals();
     vi.stubGlobal(

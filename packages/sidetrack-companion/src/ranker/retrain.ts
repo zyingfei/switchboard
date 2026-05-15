@@ -106,20 +106,201 @@ export const deriveVisitPairLabelsFromSnapshot = (
   return labels;
 };
 
+const RANKER_RETRAIN_STATE_RELATIVE_PATH = '_BAC/connections/closest-visit/retrain-state.json';
+const TIMELINE_VISIT_PREFIX = 'timeline-visit:';
+const TOPIC_PREFIX = 'topic:';
+const WORKSTREAM_PREFIX = 'workstream:';
+
+const stripTimelineVisitPrefix = (value: string): string =>
+  value.startsWith(TIMELINE_VISIT_PREFIX) ? value.slice(TIMELINE_VISIT_PREFIX.length) : value;
+
+// Map each `topic:`/`workstream:` container node id to the set of
+// member timeline-visit canonical URLs the snapshot attributes to it.
+//
+//   - `topic:<id>`     ← `visit_in_topic` edges
+//                        (from = `timeline-visit:<url>`, to = `topic:<id>`)
+//   - `workstream:<id>` ← direct `visit_in_workstream` /
+//                          `visit_instance_in_workstream` edges PLUS
+//                          transitive membership through
+//                          `topic_in_workstream` (every member of a
+//                          topic that lives in the workstream).
+//
+// `visit-instance` edges carry their canonical URL on the source node's
+// `metadata.canonicalUrl` (same convention the positive derivation
+// consumes); every other membership edge already references the
+// `timeline-visit:<url>` node directly.
+const containerMembersFromSnapshot = (
+  snapshot: ConnectionsSnapshot,
+): ReadonlyMap<string, ReadonlySet<string>> => {
+  const canonicalUrlByVisitInstance = new Map<string, string>();
+  for (const node of snapshot.nodes) {
+    if (node.kind !== 'visit-instance') continue;
+    const canonicalUrl = node.metadata.canonicalUrl;
+    if (typeof canonicalUrl === 'string' && canonicalUrl.length > 0) {
+      canonicalUrlByVisitInstance.set(node.id, canonicalUrl);
+    }
+  }
+
+  const topicMembers = new Map<string, Set<string>>();
+  const workstreamMembers = new Map<string, Set<string>>();
+  const topicsByWorkstream = new Map<string, Set<string>>();
+
+  const addMember = (
+    target: Map<string, Set<string>>,
+    containerId: string,
+    canonicalUrl: string,
+  ): void => {
+    const set = target.get(containerId) ?? new Set<string>();
+    set.add(canonicalUrl);
+    target.set(containerId, set);
+  };
+
+  for (const edge of snapshot.edges) {
+    if (edge.kind === 'visit_in_topic' && edge.toNodeId.startsWith(TOPIC_PREFIX)) {
+      const url = stripTimelineVisitPrefix(edge.fromNodeId);
+      if (url.length > 0 && url !== edge.fromNodeId) addMember(topicMembers, edge.toNodeId, url);
+      continue;
+    }
+    if (
+      edge.kind === 'visit_in_workstream' &&
+      edge.toNodeId.startsWith(WORKSTREAM_PREFIX)
+    ) {
+      const url = stripTimelineVisitPrefix(edge.fromNodeId);
+      if (url.length > 0 && url !== edge.fromNodeId) {
+        addMember(workstreamMembers, edge.toNodeId, url);
+      }
+      continue;
+    }
+    if (
+      edge.kind === 'visit_instance_in_workstream' &&
+      edge.toNodeId.startsWith(WORKSTREAM_PREFIX)
+    ) {
+      const url = canonicalUrlByVisitInstance.get(edge.fromNodeId);
+      if (url !== undefined) addMember(workstreamMembers, edge.toNodeId, url);
+      continue;
+    }
+    if (
+      edge.kind === 'topic_in_workstream' &&
+      edge.fromNodeId.startsWith(TOPIC_PREFIX) &&
+      edge.toNodeId.startsWith(WORKSTREAM_PREFIX)
+    ) {
+      const set = topicsByWorkstream.get(edge.toNodeId) ?? new Set<string>();
+      set.add(edge.fromNodeId);
+      topicsByWorkstream.set(edge.toNodeId, set);
+    }
+  }
+
+  // Fold each workstream's topic members into the workstream itself so a
+  // negative against a workstream covers the visits the snapshot only
+  // attributes to it transitively (via its topics).
+  for (const [workstreamId, topicIds] of topicsByWorkstream) {
+    for (const topicId of topicIds) {
+      for (const url of topicMembers.get(topicId) ?? []) {
+        addMember(workstreamMembers, workstreamId, url);
+      }
+    }
+  }
+
+  const merged = new Map<string, ReadonlySet<string>>();
+  for (const [containerId, urls] of topicMembers) merged.set(containerId, urls);
+  for (const [containerId, urls] of workstreamMembers) merged.set(containerId, urls);
+  return merged;
+};
+
+const isContainerId = (value: string): boolean =>
+  value.startsWith(TOPIC_PREFIX) || value.startsWith(WORKSTREAM_PREFIX);
+
+// Mirror `deriveVisitPairLabelsFromSnapshot` for the negative side.
+// Projection emits `ignore` / `split` / `user.flow.rejected` negatives
+// shaped `(timeline-visit:<url>, topic:<id>)` or `(…, workstream:<id>)`
+// (or the container on `fromId`). The container endpoint is not a
+// timeline-visit key, so `candidateResolvesToTimelineVisits` silently
+// drops the whole negative before training. Resolve each container
+// endpoint to its member timeline-visit URLs (from the snapshot) and
+// emit a correctly-shaped negative visit↔visit pair per member.
+//
+// Already-(visit, visit) negatives pass through unchanged. Containers
+// with no snapshot members yield nothing. Self-pairs are skipped and
+// the result is deduped + deterministically ordered. The resolution
+// gate is NOT weakened — this only reshapes containers into the visit
+// pairs the gate already accepts.
+export const deriveNegativeVisitPairLabelsFromSnapshot = (
+  feedback: FeedbackProjection,
+  snapshot: ConnectionsSnapshot,
+): readonly FeedbackTrainingLabel[] => {
+  if (feedback.negativeLabels.length === 0) return [];
+  const membersByContainer = containerMembersFromSnapshot(snapshot);
+
+  const seen = new Set<string>();
+  const labels: FeedbackTrainingLabel[] = [];
+  const emit = (fromId: string, toId: string, weight: number): void => {
+    if (fromId.length === 0 || toId.length === 0) return;
+    if (fromId === toId) return;
+    const key = `${fromId} ${toId} ${String(weight)}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    labels.push({ fromId, toId, weight });
+  };
+
+  for (const label of feedback.negativeLabels) {
+    const fromIsContainer = isContainerId(label.fromId);
+    const toIsContainer = isContainerId(label.toId);
+
+    // Already a visit↔visit (or otherwise non-container) negative —
+    // leave the resolution gate to accept/reject it as-is.
+    if (!fromIsContainer && !toIsContainer) {
+      emit(label.fromId, label.toId, label.weight);
+      continue;
+    }
+
+    if (toIsContainer && !fromIsContainer) {
+      const visitUrl = stripTimelineVisitPrefix(label.fromId);
+      for (const memberUrl of [
+        ...(membersByContainer.get(label.toId) ?? []),
+      ].sort(compareText)) {
+        emit(visitUrl, memberUrl, label.weight);
+      }
+      continue;
+    }
+
+    if (fromIsContainer && !toIsContainer) {
+      const visitUrl = stripTimelineVisitPrefix(label.toId);
+      for (const memberUrl of [
+        ...(membersByContainer.get(label.fromId) ?? []),
+      ].sort(compareText)) {
+        emit(memberUrl, visitUrl, label.weight);
+      }
+      continue;
+    }
+
+    // Both endpoints are containers (e.g. topic-into-workstream split):
+    // expand to the Cartesian product of their members so every
+    // cross-container visit pair becomes a negative.
+    const fromMembers = [...(membersByContainer.get(label.fromId) ?? [])].sort(compareText);
+    const toMembers = [...(membersByContainer.get(label.toId) ?? [])].sort(compareText);
+    for (const fromUrl of fromMembers) {
+      for (const toUrl of toMembers) {
+        emit(fromUrl, toUrl, label.weight);
+      }
+    }
+  }
+
+  return labels;
+};
+
 export const augmentFeedbackWithVisitPairLabels = (
   feedback: FeedbackProjection,
   snapshot: ConnectionsSnapshot,
 ): FeedbackProjection => {
   const visitPairLabels = deriveVisitPairLabelsFromSnapshot(snapshot);
-  if (visitPairLabels.length === 0) return feedback;
+  const negativeVisitPairLabels = deriveNegativeVisitPairLabelsFromSnapshot(feedback, snapshot);
+  if (visitPairLabels.length === 0 && negativeVisitPairLabels.length === 0) return feedback;
   return {
     ...feedback,
     positiveLabels: [...feedback.positiveLabels, ...visitPairLabels],
+    negativeLabels: [...feedback.negativeLabels, ...negativeVisitPairLabels],
   };
 };
-
-const RANKER_RETRAIN_STATE_RELATIVE_PATH = '_BAC/connections/closest-visit/retrain-state.json';
-const TIMELINE_VISIT_PREFIX = 'timeline-visit:';
 
 export interface RankerTrainingLabelDatasetFingerprint {
   readonly hash: string;
@@ -217,6 +398,12 @@ export interface BuildRankerTrainingCandidatesInput {
 export interface MaybeRetrainClosestVisitRankerInput extends RankerRetrainContext {
   readonly vaultRoot: string;
   readonly threshold?: number | undefined;
+  // Plan Part 8 / TODO-R7: a forced retrigger bypasses the *policy*
+  // gates (threshold + cooldown). planRankerRetrain still returns skip
+  // for the *substance* gates (no-labels / unchanged /
+  // no-training-candidates) — a manual retrigger may not manufacture a
+  // healthier model than the data supports.
+  readonly force?: boolean | undefined;
   readonly randomNegativeCandidatesPerPositive?: number | undefined;
   readonly trainOptions?: TrainRankerOptions | undefined;
   readonly train?: TrainRankerRevisionFn | undefined;
@@ -626,6 +813,7 @@ export const maybeRetrainClosestVisitRanker = async ({
   merged,
   snapshot,
   threshold,
+  force: forceInput,
   randomNegativeCandidatesPerPositive,
   trainOptions,
   train = trainRankerRevision,
@@ -641,7 +829,7 @@ export const maybeRetrainClosestVisitRanker = async ({
     threshold ?? readEnvNumber(RANKER_RETRAIN_LABEL_THRESHOLD_ENV);
   const cooldownEnv = readEnvNumber(RANKER_RETRAIN_COOLDOWN_MS_ENV);
   const forceEnv = process.env[RANKER_RETRAIN_FORCE_ENV];
-  const force = forceEnv === '1' || forceEnv === 'true';
+  const force = forceInput === true || forceEnv === '1' || forceEnv === 'true';
   const plan = planRankerRetrain({
     fingerprint,
     state,
@@ -720,6 +908,7 @@ export const maybeRetrainClosestVisitRanker = async ({
 export interface RunMaybeRetrainInWorkerInput {
   readonly vaultRoot: string;
   readonly threshold?: number;
+  readonly force?: boolean;
   readonly randomNegativeCandidatesPerPositive?: number;
   readonly trainOptions?: TrainRankerOptions;
 }
