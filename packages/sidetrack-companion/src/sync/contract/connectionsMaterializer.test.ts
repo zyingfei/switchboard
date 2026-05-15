@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { createConnectionsStore } from '../../connections/snapshot.js';
 import type { VisitSimilarityEmbedder } from '../../connections/visitSimilarity.js';
+import { ENGAGEMENT_SESSION_AGGREGATED } from '../../engagement/events.js';
 import { THREAD_UPSERTED } from '../../threads/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
 import { createTimelineStore } from '../../timeline/projection.js';
@@ -165,6 +166,81 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     const topicRevision = await createTopicRevisionStore(vaultRoot).readActiveRevision();
     expect(topicRevision?.algorithmVersion).toBe(TOPIC_UNION_FIND_REVISION_KEY);
     expect(m.health().status).toBe('healthy');
+  });
+
+  it('uses accumulated engagement aggregates for the topic gate', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+    const embed = embedFromVectors(
+      new Map<string, Float32Array>([
+        ['visit-alpha', unit([1, 0])],
+        ['visit-bravo', unit([1, 0])],
+      ]),
+    );
+    const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store, embed });
+
+    for (const [seq, key] of [
+      [1, 'alpha'],
+      [2, 'bravo'],
+    ] as const) {
+      await eventLog.importPeerEvent(
+        buildEvent({
+          seq,
+          type: BROWSER_TIMELINE_OBSERVED,
+          payload: {
+            eventId: `timeline-${key}`,
+            observedAt: `2026-05-07T10:0${String(seq)}:00.000Z`,
+            url: `https://example.test/${key}`,
+            canonicalUrl: `https://example.test/${key}`,
+            title: `visit-${key}`,
+            provider: 'generic',
+            transition: 'activated',
+            payloadVersion: 1,
+            dimensions: { engagement: { focusedWindowMs: 1_000 } },
+          },
+        }),
+      );
+      for (const offset of [10, 20] as const) {
+        await eventLog.importPeerEvent(
+          buildEvent({
+            seq: seq + offset,
+            type: ENGAGEMENT_SESSION_AGGREGATED,
+            payload: {
+              payloadVersion: 1,
+              visitId: `visit:https://example.test/${key}`,
+              sessionId: 'session:reused-edge',
+              dimensions: {
+                engagement: {
+                  activeMs: 3_000,
+                  visibleMs: 3_000,
+                  focusedWindowMs: 3_000,
+                  idleMs: 0,
+                  foregroundBursts: 1,
+                  returnCount: 0,
+                  scrollEvents: 0,
+                  maxScrollRatio: 0,
+                  copyCount: 0,
+                  pasteCount: 0,
+                },
+              },
+            },
+          }),
+        );
+      }
+    }
+
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+
+    const snap = await store.readCurrent();
+    expect(snap?.edges.find((edge) => edge.kind === 'visit_resembles_visit')).toBeDefined();
+    const topicRevision = await createTopicRevisionStore(vaultRoot).readActiveRevision();
+    expect(topicRevision?.topics[0]?.memberCanonicalUrls).toEqual([
+      'https://example.test/alpha',
+      'https://example.test/bravo',
+    ]);
   });
 
   it('writes the idf-rkn-split shadow topic revision behind the env flag', async () => {

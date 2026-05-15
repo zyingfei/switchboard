@@ -3,6 +3,7 @@ import { performance } from 'node:perf_hooks';
 
 import {
   TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
+  type TopicSecondaryAffiliation,
   type TopicNodeMetadata,
   type TopicRevision,
   type TopicRevisionTopic,
@@ -26,6 +27,9 @@ const SPLIT_SIZE_TRIGGER = 35;
 const SPLIT_SECONDARY_SIZE_TRIGGER = 20;
 const SPLIT_COHESION_TRIGGER = 0.78;
 const SPLIT_MAX_CHILD_RATIO = 0.85;
+const SECONDARY_AFFILIATION_LIMIT_PER_VISIT = 2;
+const SECONDARY_AFFILIATION_MIN_SCORE = 0.58;
+const SECONDARY_AFFILIATION_MIN_COSINE = 0.85;
 
 interface WeightedEdge extends VisitSimilarityEdge {
   readonly lexicalScore: number;
@@ -67,6 +71,7 @@ export interface TopicShadowDiagnostics {
   readonly noiseShare: number;
   readonly splitParentCount: number;
   readonly splitAcceptedCount: number;
+  readonly secondaryAffiliationCount: number;
   readonly perVisitChurn: number;
   readonly runtimeMs: number;
 }
@@ -383,6 +388,164 @@ const splitMembers = (
   return { groups: [members], parentConsidered: 1, splitAccepted: 0 };
 };
 
+const pairKey = (left: string, right: string): string =>
+  left < right ? `${left}\u0000${right}` : `${right}\u0000${left}`;
+
+const edgeLookupFor = (
+  edges: readonly VisitSimilarityEdge[],
+): ReadonlyMap<string, VisitSimilarityEdge> => {
+  const out = new Map<string, VisitSimilarityEdge>();
+  for (const edge of edges) out.set(pairKey(edge.fromVisitKey, edge.toVisitKey), edge);
+  return out;
+};
+
+const uniqueVisitsByCanonical = (visits: readonly TopicVisit[]): readonly TopicVisit[] => [
+  ...visits
+    .reduce((byCanonical, visit) => {
+      const existing = byCanonical.get(visit.canonicalUrl);
+      if (
+        existing === undefined ||
+        visit.focusedWindowMs > existing.focusedWindowMs ||
+        (visit.focusedWindowMs === existing.focusedWindowMs &&
+          visit.lastObservedAt > existing.lastObservedAt)
+      ) {
+        byCanonical.set(visit.canonicalUrl, visit);
+      }
+      return byCanonical;
+    }, new Map<string, TopicVisit>())
+    .values(),
+];
+
+interface SecondaryTopicCandidate {
+  readonly topicId: string;
+  readonly canonicalUrl: string;
+  readonly score: number;
+  readonly reasons: TopicSecondaryAffiliation['reasons'];
+  readonly supportCount: number;
+  readonly maxCosine: number;
+  readonly lexicalScore: number;
+  readonly reciprocalSupport: number;
+}
+
+const secondaryAffiliationsFor = (
+  topics: readonly TopicRevisionTopic[],
+  visits: readonly TopicVisit[],
+  visitSimilarity: VisitSimilarityRevision,
+): readonly TopicRevisionTopic[] => {
+  if (topics.length === 0) return topics;
+  const uniqueVisits = uniqueVisitsByCanonical(visits);
+  const visitByCanonical = new Map(
+    uniqueVisits.map((visit) => [visit.canonicalUrl, visit] as const),
+  );
+  const primaryTopicByVisit = new Map<string, string>();
+  for (const topic of topics) {
+    for (const member of topic.memberCanonicalUrls) primaryTopicByVisit.set(member, topic.topicId);
+  }
+  const edgeByPair = edgeLookupFor(visitSimilarity.edges);
+  const ranks = rankLookupFor(visitSimilarity.edges);
+  const { tokensByVisit, idfFor } = buildTokenStats(uniqueVisits);
+  const secondaryByTopic = new Map<string, TopicSecondaryAffiliation[]>();
+
+  for (const visit of uniqueVisits) {
+    const visitTokensForScore = tokensByVisit.get(visit.canonicalUrl) ?? [];
+    const candidates: SecondaryTopicCandidate[] = [];
+    for (const topic of topics) {
+      if (primaryTopicByVisit.get(visit.canonicalUrl) === topic.topicId) continue;
+      let supportCount = 0;
+      let maxCosine = 0;
+      let lexicalScore = 0;
+      let reciprocalSupport = 0;
+      for (const member of topic.memberCanonicalUrls) {
+        if (member === visit.canonicalUrl) continue;
+        const edge = edgeByPair.get(pairKey(visit.canonicalUrl, member));
+        if (edge !== undefined) {
+          supportCount += 1;
+          maxCosine = Math.max(maxCosine, edge.cosine);
+          const sourceRank = ranks.get(`${visit.canonicalUrl}\u0000${member}`);
+          const targetRank = ranks.get(`${member}\u0000${visit.canonicalUrl}`);
+          if (
+            sourceRank !== undefined &&
+            targetRank !== undefined &&
+            sourceRank <= RECIPROCAL_K &&
+            targetRank <= RECIPROCAL_K
+          ) {
+            reciprocalSupport += 1;
+          }
+        }
+        lexicalScore = Math.max(
+          lexicalScore,
+          idfCosine(visitTokensForScore, tokensByVisit.get(member) ?? [], idfFor),
+        );
+      }
+      const workstreamSignal =
+        visit.workstreamId !== undefined &&
+        topic.metadata.dominantWorkstreamId !== undefined &&
+        visit.workstreamId === topic.metadata.dominantWorkstreamId;
+      if (supportCount === 0 && !workstreamSignal) continue;
+      const supportScore = Math.min(1, supportCount / 3);
+      const reciprocalScore = supportCount === 0 ? 0 : reciprocalSupport / supportCount;
+      const score = roundMetric(
+        maxCosine * 0.65 +
+          lexicalScore * 0.1 +
+          supportScore * 0.15 +
+          reciprocalScore * 0.1 +
+          (workstreamSignal ? 0.08 : 0),
+      );
+      if (score < SECONDARY_AFFILIATION_MIN_SCORE) continue;
+      const reasons: TopicSecondaryAffiliation['reasons'] = [
+        ...(supportCount > 0 ? (['edge_support'] as const) : []),
+        ...(maxCosine >= SECONDARY_AFFILIATION_MIN_COSINE ? (['member_similarity'] as const) : []),
+        ...(reciprocalSupport > 0 ? (['reciprocal_support'] as const) : []),
+        ...(lexicalScore >= MIN_LEXICAL_SCORE ? (['term_overlap'] as const) : []),
+        ...(workstreamSignal ? (['workstream_signal'] as const) : []),
+      ];
+      candidates.push({
+        topicId: topic.topicId,
+        canonicalUrl: visit.canonicalUrl,
+        score,
+        reasons,
+        supportCount,
+        maxCosine: roundMetric(maxCosine),
+        lexicalScore: roundMetric(lexicalScore),
+        reciprocalSupport,
+      });
+    }
+    candidates
+      .sort(
+        (left, right) =>
+          right.score - left.score ||
+          right.maxCosine - left.maxCosine ||
+          compareString(left.topicId, right.topicId),
+      )
+      .slice(0, SECONDARY_AFFILIATION_LIMIT_PER_VISIT)
+      .forEach((candidate) => {
+        if (!visitByCanonical.has(candidate.canonicalUrl)) return;
+        const list = secondaryByTopic.get(candidate.topicId) ?? [];
+        secondaryByTopic.set(candidate.topicId, [
+          ...list,
+          {
+            canonicalUrl: candidate.canonicalUrl,
+            score: candidate.score,
+            reasons: candidate.reasons,
+            supportCount: candidate.supportCount,
+            maxCosine: candidate.maxCosine,
+            lexicalScore: candidate.lexicalScore,
+            reciprocalSupport: candidate.reciprocalSupport,
+          },
+        ]);
+      });
+  }
+
+  return topics.map((topic) => {
+    const secondaryAffiliations = (secondaryByTopic.get(topic.topicId) ?? []).sort((left, right) =>
+      left.canonicalUrl === right.canonicalUrl
+        ? right.score - left.score
+        : compareString(left.canonicalUrl, right.canonicalUrl),
+    );
+    return secondaryAffiliations.length === 0 ? topic : { ...topic, secondaryAffiliations };
+  });
+};
+
 const metadataForMembers = (
   members: readonly string[],
   visitsByCanonical: ReadonlyMap<string, TopicVisit>,
@@ -492,9 +655,14 @@ export const buildTopicShadowCandidate = async (
     }
   }
   topics.sort((left, right) => compareString(left.topicId, right.topicId));
+  const topicsWithSecondary = secondaryAffiliationsFor(topics, input.visits, input.visitSimilarity);
+  const secondaryAffiliationCount = topicsWithSecondary.reduce(
+    (sum, topic) => sum + (topic.secondaryAffiliations?.length ?? 0),
+    0,
+  );
   const revision: TopicRevision = {
     ...base,
-    topics,
+    topics: topicsWithSecondary,
   };
 
   const baselineMembers = Math.max(1, memberCountFor(input.baselineRevision));
@@ -532,6 +700,7 @@ export const buildTopicShadowCandidate = async (
     noiseShare: roundMetric((baselineMembers - shadowMembers) / baselineMembers),
     splitParentCount,
     splitAcceptedCount,
+    secondaryAffiliationCount,
     perVisitChurn: roundMetric(perVisitChurn(input.baselineRevision, revision)),
     runtimeMs: roundMetric(performance.now() - startedAt),
   };

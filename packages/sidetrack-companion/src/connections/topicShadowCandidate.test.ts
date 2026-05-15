@@ -85,4 +85,107 @@ describe('buildTopicShadowCandidate', () => {
     expect(shadow.diagnostics.shadowTopicCount).toBe(2);
     expect(shadow.diagnostics.shadowMaxTopicSize).toBe(2);
   });
+
+  it('adds capped secondary affiliations without changing primary topic membership', async () => {
+    const visits = [
+      visit('https://alpha-one.localdomain/design-patterns', 'alpha design patterns'),
+      visit('https://alpha-one.localdomain/system-design', 'alpha system design'),
+      visit('https://bravo-two.invalid/model-evaluation', 'bravo model evaluation'),
+      visit('https://bravo-two.invalid/model-training', 'bravo model training'),
+      visit('https://neutral-three.example/reference', 'unrelated reference'),
+    ];
+    const visitSimilarity = similarityRevision([
+      {
+        fromVisitKey: 'https://alpha-one.localdomain/design-patterns',
+        toVisitKey: 'https://alpha-one.localdomain/system-design',
+        cosine: 0.95,
+      },
+      {
+        fromVisitKey: 'https://bravo-two.invalid/model-evaluation',
+        toVisitKey: 'https://bravo-two.invalid/model-training',
+        cosine: 0.95,
+      },
+      {
+        fromVisitKey: 'https://alpha-one.localdomain/design-patterns',
+        toVisitKey: 'https://neutral-three.example/reference',
+        cosine: 0.9,
+      },
+      {
+        fromVisitKey: 'https://bravo-two.invalid/model-evaluation',
+        toVisitKey: 'https://neutral-three.example/reference',
+        cosine: 0.9,
+      },
+    ]);
+    const baselineRevision = await buildTopicRevision({
+      visits,
+      visitSimilarity,
+      options: { producedAt: Date.parse('2026-05-14T10:12:00.000Z') },
+    });
+
+    const shadow = await buildTopicShadowCandidate({
+      visits,
+      visitSimilarity,
+      userAssertedRelations: [],
+      baselineRevision,
+      cosineThreshold: 0.85,
+    });
+
+    const primaryMembers = new Set(
+      shadow.revision.topics.flatMap((topic) => topic.memberCanonicalUrls),
+    );
+    const secondaryAffiliations = shadow.revision.topics.flatMap(
+      (topic) => topic.secondaryAffiliations ?? [],
+    );
+    expect(primaryMembers.has('https://neutral-three.example/reference')).toBe(false);
+    expect(
+      secondaryAffiliations.filter(
+        (affiliation) => affiliation.canonicalUrl === 'https://neutral-three.example/reference',
+      ),
+    ).toHaveLength(2);
+    expect(shadow.diagnostics.secondaryAffiliationCount).toBe(2);
+  });
+
+  it('deduplicates secondary affiliations across repeated timeline entries', async () => {
+    const visits = [
+      visit('https://alpha-one.localdomain/design-patterns', 'alpha design patterns'),
+      visit('https://alpha-one.localdomain/system-design', 'alpha system design'),
+      visit('https://neutral-three.example/reference', 'neutral reference'),
+      visit('https://neutral-three.example/reference', 'neutral reference follow-up'),
+    ];
+    const visitSimilarity = similarityRevision([
+      {
+        fromVisitKey: 'https://alpha-one.localdomain/design-patterns',
+        toVisitKey: 'https://alpha-one.localdomain/system-design',
+        cosine: 0.95,
+      },
+      {
+        fromVisitKey: 'https://alpha-one.localdomain/design-patterns',
+        toVisitKey: 'https://neutral-three.example/reference',
+        cosine: 0.9,
+      },
+    ]);
+    const baselineRevision = await buildTopicRevision({
+      visits,
+      visitSimilarity,
+      options: { producedAt: Date.parse('2026-05-14T10:12:00.000Z') },
+    });
+
+    const shadow = await buildTopicShadowCandidate({
+      visits,
+      visitSimilarity,
+      userAssertedRelations: [],
+      baselineRevision,
+      cosineThreshold: 0.85,
+    });
+
+    const secondaryAffiliations = shadow.revision.topics.flatMap(
+      (topic) => topic.secondaryAffiliations ?? [],
+    );
+    expect(
+      secondaryAffiliations.filter(
+        (affiliation) => affiliation.canonicalUrl === 'https://neutral-three.example/reference',
+      ),
+    ).toHaveLength(1);
+    expect(shadow.diagnostics.secondaryAffiliationCount).toBe(1);
+  });
 });

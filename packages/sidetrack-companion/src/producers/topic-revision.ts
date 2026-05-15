@@ -47,10 +47,28 @@ export interface TopicNodeMetadata {
   readonly cohesion: number;
 }
 
+export type TopicSecondaryAffiliationReason =
+  | 'edge_support'
+  | 'member_similarity'
+  | 'reciprocal_support'
+  | 'term_overlap'
+  | 'workstream_signal';
+
+export interface TopicSecondaryAffiliation {
+  readonly canonicalUrl: string;
+  readonly score: number;
+  readonly reasons: readonly TopicSecondaryAffiliationReason[];
+  readonly supportCount: number;
+  readonly maxCosine: number;
+  readonly lexicalScore: number;
+  readonly reciprocalSupport: number;
+}
+
 export interface TopicRevisionTopic {
   readonly topicId: string;
   readonly memberCanonicalUrls: readonly string[];
   readonly metadata: TopicNodeMetadata;
+  readonly secondaryAffiliations?: readonly TopicSecondaryAffiliation[];
 }
 
 export interface TopicLineage {
@@ -121,7 +139,40 @@ const isTopicRevisionTopic = (value: unknown): value is TopicRevisionTopic =>
   isRecord(value) &&
   typeof value['topicId'] === 'string' &&
   isStringArray(value['memberCanonicalUrls']) &&
-  isTopicNodeMetadata(value['metadata']);
+  isTopicNodeMetadata(value['metadata']) &&
+  (value['secondaryAffiliations'] === undefined ||
+    (Array.isArray(value['secondaryAffiliations']) &&
+      value['secondaryAffiliations'].every(isTopicSecondaryAffiliation)));
+
+const TOPIC_SECONDARY_AFFILIATION_REASONS: readonly TopicSecondaryAffiliationReason[] = [
+  'edge_support',
+  'member_similarity',
+  'reciprocal_support',
+  'term_overlap',
+  'workstream_signal',
+];
+
+const isTopicSecondaryAffiliationReason = (
+  value: unknown,
+): value is TopicSecondaryAffiliationReason =>
+  typeof value === 'string' &&
+  TOPIC_SECONDARY_AFFILIATION_REASONS.some((candidate) => candidate === value);
+
+const isTopicSecondaryAffiliation = (value: unknown): value is TopicSecondaryAffiliation =>
+  isRecord(value) &&
+  typeof value['canonicalUrl'] === 'string' &&
+  typeof value['score'] === 'number' &&
+  Number.isFinite(value['score']) &&
+  Array.isArray(value['reasons']) &&
+  value['reasons'].every(isTopicSecondaryAffiliationReason) &&
+  typeof value['supportCount'] === 'number' &&
+  Number.isInteger(value['supportCount']) &&
+  typeof value['maxCosine'] === 'number' &&
+  Number.isFinite(value['maxCosine']) &&
+  typeof value['lexicalScore'] === 'number' &&
+  Number.isFinite(value['lexicalScore']) &&
+  typeof value['reciprocalSupport'] === 'number' &&
+  Number.isInteger(value['reciprocalSupport']);
 
 const isTopicLineage = (value: unknown): value is TopicLineage =>
   isRecord(value) &&

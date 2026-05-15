@@ -2156,6 +2156,38 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
           observedAt: topic.metadata.lastObservedAt,
           producedBy: topicProducedBy,
           confidence: 'inferred',
+          metadata: {
+            affiliation: 'primary',
+          },
+        });
+      }
+
+      for (const affiliation of topic.secondaryAffiliations ?? []) {
+        upsertNode(nodes, {
+          kind: 'timeline-visit',
+          key: affiliation.canonicalUrl,
+          label: affiliation.canonicalUrl,
+          observedAt: topic.metadata.lastObservedAt,
+          metadata: {
+            canonicalUrl: affiliation.canonicalUrl,
+          },
+        });
+        upsertEdge(edges, {
+          kind: 'visit_in_topic',
+          fromNodeId: nodeIdFor('timeline-visit', affiliation.canonicalUrl),
+          toNodeId: nodeIdFor('topic', topic.topicId),
+          observedAt: topic.metadata.lastObservedAt,
+          producedBy: topicProducedBy,
+          confidence: 'inferred',
+          metadata: {
+            affiliation: 'secondary',
+            score: affiliation.score,
+            reasons: affiliation.reasons,
+            supportCount: affiliation.supportCount,
+            maxCosine: affiliation.maxCosine,
+            lexicalScore: affiliation.lexicalScore,
+            reciprocalSupport: affiliation.reciprocalSupport,
+          },
         });
       }
 

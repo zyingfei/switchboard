@@ -1881,6 +1881,17 @@ describe('connections — content-derived edges', () => {
             lastObservedAt: '2026-05-07T12:00:00.000Z',
             cohesion: 0.91,
           },
+          secondaryAffiliations: [
+            {
+              canonicalUrl: 'https://topic.test/e',
+              score: 0.79,
+              reasons: ['edge_support', 'member_similarity'],
+              supportCount: 1,
+              maxCosine: 0.9,
+              lexicalScore: 0.1,
+              reciprocalSupport: 0,
+            },
+          ],
         },
       ],
       lineage: [
@@ -1932,6 +1943,15 @@ describe('connections — content-derived edges', () => {
           title: 'Topic D',
           visitCount: 1,
         },
+        {
+          id: 'https://topic.test/e',
+          firstSeenAt: '2026-05-07T09:40:00.000Z',
+          lastSeenAt: '2026-05-07T10:40:00.000Z',
+          url: 'https://topic.test/e',
+          canonicalUrl: 'https://topic.test/e',
+          title: 'Topic E',
+          visitCount: 1,
+        },
       ],
       updatedAt: '2026-05-07T10:30:00.000Z',
       entryCount: 4,
@@ -1949,7 +1969,17 @@ describe('connections — content-derived edges', () => {
 
     expect(topicNode?.label).toBe('Topic A');
     expect(topicNode?.metadata['cohesion']).toBe(0.91);
-    expect(snap.edges.filter((edge) => edge.kind === 'visit_in_topic')).toHaveLength(4);
+    const topicMembershipEdges = snap.edges.filter((edge) => edge.kind === 'visit_in_topic');
+    expect(topicMembershipEdges).toHaveLength(5);
+    expect(
+      topicMembershipEdges.find(
+        (edge) => edge.fromNodeId === nodeIdFor('timeline-visit', 'https://topic.test/e'),
+      )?.metadata,
+    ).toMatchObject({
+      affiliation: 'secondary',
+      score: 0.79,
+      reasons: ['edge_support', 'member_similarity'],
+    });
     expect(
       snap.edges.find(
         (edge) =>
