@@ -65,6 +65,25 @@ export interface FocusViewProps {
     readonly targetWorkstreamId: string;
     readonly memberVisitIds: readonly string[];
   }) => Promise<void> | void;
+  readonly onTopicHide?: (input: {
+    readonly topicId: string;
+    readonly memberVisitIds: readonly string[];
+  }) => Promise<void> | void;
+  readonly onTopicMerge?: (input: {
+    readonly topicId: string;
+    readonly targetTopicId: string;
+    readonly memberVisitIds: readonly string[];
+  }) => Promise<void> | void;
+  readonly onVisitMarkNotRelated?: (input: {
+    readonly topicId: string;
+    readonly visitId: string;
+    readonly memberVisitIds: readonly string[];
+  }) => Promise<void> | void;
+  readonly onVisitSplitOut?: (input: {
+    readonly topicId: string;
+    readonly visitId: string;
+    readonly memberVisitIds: readonly string[];
+  }) => Promise<void> | void;
   readonly onEngagementRelabel?: (input: {
     readonly visitId: string;
     readonly fromClass: EngagementClass;
@@ -164,6 +183,10 @@ export const FocusView = ({
   workstreamOptions = [],
   onTopicClick,
   onTopicPromote,
+  onTopicHide,
+  onTopicMerge,
+  onVisitMarkNotRelated,
+  onVisitSplitOut,
   onEngagementRelabel,
   onVisitClick,
 }: FocusViewProps): ReactElement => {
@@ -190,6 +213,12 @@ export const FocusView = ({
   const [promoteError, setPromoteError] = useState<string | null>(null);
   const [promoteErrorTopicId, setPromoteErrorTopicId] = useState<string | null>(null);
   const [promoteTargetsByTopic, setPromoteTargetsByTopic] = useState<Record<string, string>>({});
+  const [topicActionInFlight, setTopicActionInFlight] = useState<string | null>(null);
+  const [topicActionError, setTopicActionError] = useState<string | null>(null);
+  const [topicActionErrorTopicId, setTopicActionErrorTopicId] = useState<string | null>(null);
+  const [mergeTargetsByTopic, setMergeTargetsByTopic] = useState<Record<string, string>>({});
+  const [visitActionInFlight, setVisitActionInFlight] = useState<string | null>(null);
+  const [visitActionError, setVisitActionError] = useState<string | null>(null);
 
   const toggle = (topicId: string): void => {
     setExpandedTopicIds((current) => {
@@ -232,6 +261,59 @@ export const FocusView = ({
       })
       .finally(() => {
         setPromotingTopicId(null);
+      });
+  };
+
+  const submitTopicHide = (topic: TopicNode, memberVisitIds: readonly string[]): void => {
+    if (onTopicHide === undefined) return;
+    setTopicActionInFlight(`hide:${topic.id}`);
+    setTopicActionError(null);
+    setTopicActionErrorTopicId(null);
+    void Promise.resolve(onTopicHide({ topicId: topic.id, memberVisitIds }))
+      .catch((error: unknown) => {
+        setTopicActionError(error instanceof Error ? error.message : String(error));
+        setTopicActionErrorTopicId(topic.id);
+      })
+      .finally(() => {
+        setTopicActionInFlight(null);
+      });
+  };
+
+  const submitTopicMerge = (topic: TopicNode, memberVisitIds: readonly string[]): void => {
+    if (onTopicMerge === undefined) return;
+    const fallbackTarget = topics.find((candidate) => candidate.id !== topic.id)?.id ?? '';
+    const targetTopicId = mergeTargetsByTopic[topic.id] ?? fallbackTarget;
+    if (targetTopicId.length === 0 || targetTopicId === topic.id) return;
+    setTopicActionInFlight(`merge:${topic.id}`);
+    setTopicActionError(null);
+    setTopicActionErrorTopicId(null);
+    void Promise.resolve(onTopicMerge({ topicId: topic.id, targetTopicId, memberVisitIds }))
+      .catch((error: unknown) => {
+        setTopicActionError(error instanceof Error ? error.message : String(error));
+        setTopicActionErrorTopicId(topic.id);
+      })
+      .finally(() => {
+        setTopicActionInFlight(null);
+      });
+  };
+
+  const submitVisitTopicAction = (
+    action: 'not-related' | 'split-out',
+    topic: TopicNode,
+    visitId: string,
+    memberVisitIds: readonly string[],
+  ): void => {
+    const handler = action === 'not-related' ? onVisitMarkNotRelated : onVisitSplitOut;
+    if (handler === undefined) return;
+    const actionKey = `${action}:${topic.id}:${visitId}`;
+    setVisitActionInFlight(actionKey);
+    setVisitActionError(null);
+    void Promise.resolve(handler({ topicId: topic.id, visitId, memberVisitIds }))
+      .catch((error: unknown) => {
+        setVisitActionError(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => {
+        setVisitActionInFlight(null);
       });
   };
 
@@ -289,6 +371,9 @@ export const FocusView = ({
         const expanded = expandedTopicIds.has(topic.id);
         const oversized = topic.memberCount > SUGGESTION_MEMBER_LIMIT;
         const promoteTarget = promoteTargetsByTopic[topic.id] ?? workstreamOptions[0]?.id ?? '';
+        const mergeOptions = topics.filter((candidate) => candidate.id !== topic.id);
+        const mergeTarget = mergeTargetsByTopic[topic.id] ?? mergeOptions[0]?.id ?? '';
+        const primaryVisitIds = primaryVisits.map((visit) => visit.id);
         return (
           <article
             className={`cx-focus-card${oversized ? ' is-triage' : ''}`}
@@ -375,6 +460,65 @@ export const FocusView = ({
             {promoteError !== null && promoteErrorTopicId === topic.id ? (
               <div className="cx-mono cx-dim" role="alert" data-testid="focus-promote-error">
                 {promoteError}
+              </div>
+            ) : null}
+            {onTopicHide !== undefined ||
+            (onTopicMerge !== undefined && mergeOptions.length > 0) ? (
+              <div className="cx-focus-promote">
+                {onTopicHide === undefined ? null : (
+                  <button
+                    type="button"
+                    className="cx-focus-expand"
+                    disabled={topicActionInFlight === `hide:${topic.id}`}
+                    onClick={() => {
+                      submitTopicHide(topic, primaryVisitIds);
+                    }}
+                    data-testid={`focus-hide-${topic.id}`}
+                  >
+                    {topicActionInFlight === `hide:${topic.id}` ? 'Hiding' : 'Hide'}
+                  </button>
+                )}
+                {onTopicMerge !== undefined && mergeOptions.length > 0 ? (
+                  <>
+                    <select
+                      className="cx-focus-visit-select"
+                      aria-label={`Merge ${topic.label} into suggestion`}
+                      value={mergeTarget}
+                      disabled={topicActionInFlight === `merge:${topic.id}`}
+                      onChange={(event) => {
+                        setMergeTargetsByTopic((current) => ({
+                          ...current,
+                          [topic.id]: event.target.value,
+                        }));
+                      }}
+                      data-testid={`focus-merge-target-${topic.id}`}
+                    >
+                      {mergeOptions.map((option) => (
+                        <option key={option.id} value={option.id}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      className="cx-focus-expand"
+                      disabled={
+                        topicActionInFlight === `merge:${topic.id}` || mergeTarget.length === 0
+                      }
+                      onClick={() => {
+                        submitTopicMerge(topic, primaryVisitIds);
+                      }}
+                      data-testid={`focus-merge-${topic.id}`}
+                    >
+                      {topicActionInFlight === `merge:${topic.id}` ? 'Merging' : 'Merge'}
+                    </button>
+                  </>
+                ) : null}
+              </div>
+            ) : null}
+            {topicActionError !== null && topicActionErrorTopicId === topic.id ? (
+              <div className="cx-mono cx-dim" role="alert" data-testid="focus-topic-action-error">
+                {topicActionError}
               </div>
             ) : null}
             <button
@@ -468,9 +612,46 @@ export const FocusView = ({
                           Label
                         </button>
                       )}
+                      {onVisitMarkNotRelated === undefined ? null : (
+                        <button
+                          type="button"
+                          className="cx-focus-visit-labelbtn"
+                          disabled={visitActionInFlight === `not-related:${topic.id}:${visit.id}`}
+                          onClick={() => {
+                            submitVisitTopicAction('not-related', topic, visit.id, primaryVisitIds);
+                          }}
+                          data-testid={`focus-visit-not-related-${topic.id}-${visit.id}`}
+                          title="Remove this page from this suggestion"
+                        >
+                          Not related
+                        </button>
+                      )}
+                      {onVisitSplitOut === undefined || visit.affiliation === 'secondary' ? null : (
+                        <button
+                          type="button"
+                          className="cx-focus-visit-labelbtn"
+                          disabled={visitActionInFlight === `split-out:${topic.id}:${visit.id}`}
+                          onClick={() => {
+                            submitVisitTopicAction('split-out', topic, visit.id, primaryVisitIds);
+                          }}
+                          data-testid={`focus-visit-split-${topic.id}-${visit.id}`}
+                          title="Split this page out of this computed suggestion"
+                        >
+                          Split out
+                        </button>
+                      )}
                     </div>
                   );
                 })}
+                {visitActionError === null ? null : (
+                  <div
+                    className="cx-mono cx-dim"
+                    role="alert"
+                    data-testid="focus-visit-action-error"
+                  >
+                    {visitActionError}
+                  </div>
+                )}
                 {relabelError === null ? null : (
                   <div className="cx-mono cx-dim" role="alert" data-testid="focus-relabel-error">
                     {relabelError}

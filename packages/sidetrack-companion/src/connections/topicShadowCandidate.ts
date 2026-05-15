@@ -94,6 +94,9 @@ const compareString = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 
 
 const roundMetric = (value: number): number => Number(value.toFixed(6));
 
+const stableSuggestionIdFor = (medoidCanonicalUrl: string): string =>
+  `suggestion:${createHash('sha256').update(medoidCanonicalUrl).digest('base64url').slice(0, 16)}`;
+
 const safeDecode = (value: string): string => {
   try {
     return decodeURIComponent(value);
@@ -321,6 +324,31 @@ const averageCosine = (
     .map((edge) => edge.cosine);
   if (scores.length === 0) return 0;
   return scores.reduce((sum, score) => sum + score, 0) / scores.length;
+};
+
+const medoidForMembers = (
+  members: readonly string[],
+  visitsByCanonical: ReadonlyMap<string, TopicVisit>,
+  edges: readonly VisitSimilarityEdge[],
+): string | undefined => {
+  if (members.length === 0) return undefined;
+  const memberSet = new Set(members);
+  const scores = new Map<string, number>();
+  for (const member of members) scores.set(member, 0);
+  for (const edge of edges) {
+    if (!memberSet.has(edge.fromVisitKey) || !memberSet.has(edge.toVisitKey)) continue;
+    scores.set(edge.fromVisitKey, (scores.get(edge.fromVisitKey) ?? 0) + edge.cosine);
+    scores.set(edge.toVisitKey, (scores.get(edge.toVisitKey) ?? 0) + edge.cosine);
+  }
+  return [...members].sort((left, right) => {
+    const score = (scores.get(right) ?? 0) - (scores.get(left) ?? 0);
+    if (score !== 0) return score;
+    const focus =
+      (visitsByCanonical.get(right)?.focusedWindowMs ?? 0) -
+      (visitsByCanonical.get(left)?.focusedWindowMs ?? 0);
+    if (focus !== 0) return focus;
+    return compareString(left, right);
+  })[0];
 };
 
 const weightedChildCohesion = (
@@ -575,9 +603,16 @@ const metadataForMembers = (
       const title = visit.title?.trim();
       return title === undefined || title.length === 0 ? visit.canonicalUrl : title;
     });
+  const medoidCanonicalUrl = medoidForMembers(members, visitsByCanonical, edges);
   return {
     memberCount: members.length,
     ...(dominant === undefined ? {} : { dominantWorkstreamId: dominant[0] }),
+    ...(medoidCanonicalUrl === undefined
+      ? {}
+      : {
+          medoidCanonicalUrl,
+          stableSuggestionId: stableSuggestionIdFor(medoidCanonicalUrl),
+        }),
     representativeTitles,
     firstObservedAt: visits.map((visit) => visit.firstObservedAt).sort(compareString)[0] ?? '',
     lastObservedAt:

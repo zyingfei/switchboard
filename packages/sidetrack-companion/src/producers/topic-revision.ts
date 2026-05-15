@@ -36,11 +36,13 @@ export const TOPIC_REVISION_KEYS = [
 ] as const;
 
 export type TopicAlgorithmVersion = (typeof TOPIC_REVISION_KEYS)[number];
-export type TopicLineageKind = 'split' | 'merge';
+export type TopicLineageKind = 'birth' | 'continue' | 'split' | 'merge' | 'death' | 'resurface';
 
 export interface TopicNodeMetadata {
   readonly memberCount: number;
   readonly dominantWorkstreamId?: string;
+  readonly medoidCanonicalUrl?: string;
+  readonly stableSuggestionId?: string;
   readonly representativeTitles: readonly string[];
   readonly firstObservedAt: string;
   readonly lastObservedAt: string;
@@ -110,7 +112,12 @@ const isStringArray = (value: unknown): value is readonly string[] =>
   Array.isArray(value) && value.every((item) => typeof item === 'string');
 
 const isTopicLineageKind = (value: unknown): value is TopicLineageKind =>
-  value === 'split' || value === 'merge';
+  value === 'birth' ||
+  value === 'continue' ||
+  value === 'split' ||
+  value === 'merge' ||
+  value === 'death' ||
+  value === 'resurface';
 
 const isTopicAlgorithmVersion = (value: unknown): value is TopicAlgorithmVersion =>
   TOPIC_REVISION_KEYS.some((candidate) => candidate === value);
@@ -123,6 +130,18 @@ const isTopicNodeMetadata = (value: unknown): value is TopicNodeMetadata => {
   if (
     value['dominantWorkstreamId'] !== undefined &&
     typeof value['dominantWorkstreamId'] !== 'string'
+  ) {
+    return false;
+  }
+  if (
+    value['medoidCanonicalUrl'] !== undefined &&
+    typeof value['medoidCanonicalUrl'] !== 'string'
+  ) {
+    return false;
+  }
+  if (
+    value['stableSuggestionId'] !== undefined &&
+    typeof value['stableSuggestionId'] !== 'string'
   ) {
     return false;
   }
@@ -213,7 +232,12 @@ export interface TopicRevisionStore {
   readonly putRevision: (revision: TopicRevision) => Promise<void>;
   readonly putActiveRevision: (revision: TopicRevision) => Promise<void>;
   readonly putShadowRevision: (revision: TopicRevision) => Promise<void>;
+  readonly putCandidateShadowRevision: (
+    candidate: string,
+    revision: TopicRevision,
+  ) => Promise<void>;
   readonly readShadowRevision: () => Promise<TopicRevision | null>;
+  readonly readCandidateShadowRevision: (candidate: string) => Promise<TopicRevision | null>;
   readonly readRevision: (revisionId: string) => Promise<TopicRevision | null>;
   readonly readActiveRevision: () => Promise<TopicRevision | null>;
   readonly listRevisionIds: () => Promise<readonly string[]>;
@@ -224,6 +248,9 @@ export const createTopicRevisionStore = (vaultRoot: string): TopicRevisionStore 
   const currentPath = join(root, 'current.json');
   const shadowPath = join(root, 'current.shadow.json');
   const revisionPath = (revisionId: string): string => join(root, `${revisionId}.json`);
+  const candidateKey = (candidate: string): string => candidate.replace(/[^a-zA-Z0-9_.-]/gu, '_');
+  const candidateShadowPath = (candidate: string): string =>
+    join(root, `current.${candidateKey(candidate)}.shadow.json`);
 
   const writeAtomic = async (path: string, body: string): Promise<void> => {
     await mkdir(join(path, '..'), { recursive: true });
@@ -255,6 +282,14 @@ export const createTopicRevisionStore = (vaultRoot: string): TopicRevisionStore 
     await writeAtomic(shadowPath, JSON.stringify(revision, null, 2));
   };
 
+  const putCandidateShadowRevision = async (
+    candidate: string,
+    revision: TopicRevision,
+  ): Promise<void> => {
+    await putRevision(revision);
+    await writeAtomic(candidateShadowPath(candidate), JSON.stringify(revision, null, 2));
+  };
+
   const readRevision = async (revisionId: string): Promise<TopicRevision | null> =>
     readTopicRevision(revisionPath(revisionId));
 
@@ -263,6 +298,9 @@ export const createTopicRevisionStore = (vaultRoot: string): TopicRevisionStore 
 
   const readShadowRevision = async (): Promise<TopicRevision | null> =>
     readTopicRevision(shadowPath);
+
+  const readCandidateShadowRevision = async (candidate: string): Promise<TopicRevision | null> =>
+    readTopicRevision(candidateShadowPath(candidate));
 
   const listRevisionIds = async (): Promise<readonly string[]> => {
     const entries = await readdir(root).catch(() => [] as readonly string[]);
@@ -276,7 +314,9 @@ export const createTopicRevisionStore = (vaultRoot: string): TopicRevisionStore 
     putRevision,
     putActiveRevision,
     putShadowRevision,
+    putCandidateShadowRevision,
     readShadowRevision,
+    readCandidateShadowRevision,
     readRevision,
     readActiveRevision,
     listRevisionIds,

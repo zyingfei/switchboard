@@ -67,6 +67,8 @@ export interface UserOrganizedItemPayload {
     readonly rename?: string;
     readonly mergeMembers?: readonly string[];
     readonly splitInto?: readonly string[];
+    readonly reason?: 'hidden' | 'not-related' | 'split-out' | 'merged' | 'other';
+    readonly targetTopicId?: string;
     readonly memberIds?: readonly string[];
   };
 }

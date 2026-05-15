@@ -227,7 +227,7 @@ export interface ConnectionEdge {
 }
 
 export interface ConnectionEdgeMetadata {
-  readonly lineageKind?: 'split' | 'merge';
+  readonly lineageKind?: 'birth' | 'continue' | 'split' | 'merge' | 'death' | 'resurface';
   readonly [key: string]: unknown;
 }
 

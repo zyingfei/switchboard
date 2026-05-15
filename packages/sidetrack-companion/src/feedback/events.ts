@@ -50,6 +50,8 @@ export interface UserOrganizedItemDetails {
   readonly rename?: string;
   readonly mergeMembers?: readonly string[];
   readonly splitInto?: readonly string[];
+  readonly reason?: 'hidden' | 'not-related' | 'split-out' | 'merged' | 'other';
+  readonly targetTopicId?: string;
   // Optional immutable membership snapshot for promote/move actions.
   // For computed topic promotion this freezes the concrete member ids
   // that the user accepted, so later reclustering can only propose
@@ -184,6 +186,16 @@ const isOptionalAttributionSource = (
   value === 'tab-group-pull-in' ||
   value === 'tab-group-pull-out';
 
+const isOptionalOrganizedItemReason = (
+  value: unknown,
+): value is UserOrganizedItemDetails['reason'] =>
+  value === undefined ||
+  value === 'hidden' ||
+  value === 'not-related' ||
+  value === 'split-out' ||
+  value === 'merged' ||
+  value === 'other';
+
 const isOrganizedItemKind = (value: unknown): value is UserOrganizedItemKind =>
   typeof value === 'string' && ORGANIZED_ITEM_KINDS.has(value);
 
@@ -213,6 +225,8 @@ const isUserOrganizedItemDetails = (value: unknown): value is UserOrganizedItemD
     isOptionalString(value['rename']) &&
     isOptionalStringArray(value['mergeMembers']) &&
     isOptionalStringArray(value['splitInto']) &&
+    isOptionalOrganizedItemReason(value['reason']) &&
+    isOptionalString(value['targetTopicId']) &&
     isOptionalStringArray(value['memberIds']) &&
     isOptionalAttributionSource(value['attributionSource'])
   );

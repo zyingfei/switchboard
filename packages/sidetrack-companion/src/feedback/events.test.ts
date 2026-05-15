@@ -161,6 +161,32 @@ describe('feedback event payload guards', () => {
     ).toBe(false);
   });
 
+  it('accepts suggestion action details used by Focus controls', () => {
+    expect(
+      isUserOrganizedItemPayload({
+        payloadVersion: 1,
+        itemKind: 'visit',
+        itemId: 'timeline-visit:https://example.test/noisy',
+        action: 'ignore',
+        fromContainer: 'topic:topic-alpha',
+        details: {
+          reason: 'not-related',
+          targetTopicId: 'topic:topic-alpha',
+          memberIds: ['timeline-visit:https://example.test/a'],
+        },
+      }),
+    ).toBe(true);
+    expect(
+      isUserOrganizedItemPayload({
+        payloadVersion: 1,
+        itemKind: 'topic',
+        itemId: 'topic:topic-alpha',
+        action: 'ignore',
+        details: { reason: 'unsupported' },
+      }),
+    ).toBe(false);
+  });
+
   it('rejects renaming computed topics through the organized-item path', () => {
     expect(
       isUserOrganizedItemPayload({

@@ -1998,6 +1998,145 @@ describe('connections — content-derived edges', () => {
     });
   });
 
+  it('Pass 8 respects user actions over computed suggestions', () => {
+    const topicRevision: TopicRevision = {
+      revisionId: 'topic-rev-actions',
+      visitSimilarityRevisionId: 'visit-sim-1',
+      cosineThreshold: 0.85,
+      algorithmVersion: TOPIC_UNION_FIND_REVISION_KEY,
+      topics: [
+        {
+          topicId: 'topic:alpha',
+          memberCanonicalUrls: ['https://topic.test/alpha', 'https://topic.test/noisy'],
+          metadata: {
+            memberCount: 2,
+            representativeTitles: ['Alpha'],
+            firstObservedAt: '2026-05-07T09:00:00.000Z',
+            lastObservedAt: '2026-05-07T12:00:00.000Z',
+            cohesion: 0.9,
+          },
+          secondaryAffiliations: [
+            {
+              canonicalUrl: 'https://topic.test/secondary',
+              score: 0.8,
+              reasons: ['edge_support'],
+              supportCount: 1,
+              maxCosine: 0.91,
+              lexicalScore: 0.12,
+              reciprocalSupport: 0,
+            },
+          ],
+        },
+        {
+          topicId: 'topic:beta',
+          memberCanonicalUrls: ['https://topic.test/beta-a', 'https://topic.test/beta-b'],
+          metadata: {
+            memberCount: 2,
+            representativeTitles: ['Beta'],
+            firstObservedAt: '2026-05-07T09:10:00.000Z',
+            lastObservedAt: '2026-05-07T12:10:00.000Z',
+            cohesion: 0.88,
+          },
+        },
+        {
+          topicId: 'topic:hidden',
+          memberCanonicalUrls: ['https://topic.test/hidden-a', 'https://topic.test/hidden-b'],
+          metadata: {
+            memberCount: 2,
+            representativeTitles: ['Hidden'],
+            firstObservedAt: '2026-05-07T09:20:00.000Z',
+            lastObservedAt: '2026-05-07T12:20:00.000Z',
+            cohesion: 0.87,
+          },
+        },
+      ],
+      lineage: [],
+      producedAt: Date.parse('2026-05-07T12:00:00.000Z'),
+    };
+    const alphaTopicNodeId = nodeIdFor('topic', 'topic:alpha');
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        topicRevision,
+        events: [
+          buildEvent({
+            seq: 1,
+            type: USER_ORGANIZED_ITEM,
+            payload: {
+              payloadVersion: 1,
+              itemKind: 'topic',
+              itemId: nodeIdFor('topic', 'topic:hidden'),
+              action: 'ignore',
+              details: {
+                reason: 'hidden',
+                memberIds: [
+                  nodeIdFor('timeline-visit', 'https://topic.test/hidden-a'),
+                  nodeIdFor('timeline-visit', 'https://topic.test/hidden-b'),
+                ],
+              },
+            },
+          }),
+          buildEvent({
+            seq: 2,
+            type: USER_ORGANIZED_ITEM,
+            payload: {
+              payloadVersion: 1,
+              itemKind: 'visit',
+              itemId: nodeIdFor('timeline-visit', 'https://topic.test/secondary'),
+              action: 'ignore',
+              fromContainer: alphaTopicNodeId,
+              details: { reason: 'not-related', targetTopicId: alphaTopicNodeId },
+            },
+          }),
+          buildEvent({
+            seq: 3,
+            type: USER_ORGANIZED_ITEM,
+            payload: {
+              payloadVersion: 1,
+              itemKind: 'topic',
+              itemId: alphaTopicNodeId,
+              action: 'split',
+              details: {
+                reason: 'split-out',
+                memberIds: [nodeIdFor('timeline-visit', 'https://topic.test/noisy')],
+                splitInto: [nodeIdFor('timeline-visit', 'https://topic.test/noisy')],
+              },
+            },
+          }),
+          buildEvent({
+            seq: 4,
+            type: USER_ORGANIZED_ITEM,
+            payload: {
+              payloadVersion: 1,
+              itemKind: 'topic',
+              itemId: nodeIdFor('topic', 'topic:beta'),
+              action: 'merge',
+              toContainer: alphaTopicNodeId,
+              details: {
+                reason: 'merged',
+                targetTopicId: alphaTopicNodeId,
+                memberIds: [
+                  nodeIdFor('timeline-visit', 'https://topic.test/beta-a'),
+                  nodeIdFor('timeline-visit', 'https://topic.test/beta-b'),
+                ],
+              },
+            },
+          }),
+        ],
+      }),
+    );
+
+    const topicNodes = snap.nodes.filter((node) => node.kind === 'topic');
+    expect(topicNodes.map((node) => node.id)).toEqual([alphaTopicNodeId]);
+    expect(topicNodes[0]?.metadata['memberCount']).toBe(3);
+    const topicMemberships = snap.edges.filter((edge) => edge.kind === 'visit_in_topic');
+    expect(topicMemberships.map((edge) => edge.fromNodeId).sort()).toEqual([
+      nodeIdFor('timeline-visit', 'https://topic.test/alpha'),
+      nodeIdFor('timeline-visit', 'https://topic.test/beta-a'),
+      nodeIdFor('timeline-visit', 'https://topic.test/beta-b'),
+    ]);
+    expect(topicMemberships.every((edge) => edge.toNodeId === alphaTopicNodeId)).toBe(true);
+  });
+
   it('Pass 13 emits visit_in_template edges for visits sharing a DOM skeleton hash', () => {
     const domHash = 'd'.repeat(64);
     const events = ['visit-a', 'visit-b', 'visit-c'].map((visitId, index) =>

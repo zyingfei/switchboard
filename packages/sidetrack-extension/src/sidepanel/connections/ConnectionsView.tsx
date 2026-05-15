@@ -324,8 +324,7 @@ const deriveFlowVisits = (
       (node.kind === 'timeline-visit' ? 'all-tabs' : 'unknown-tab');
     const engagementClass = engagementClassForNode(node);
     const canonicalUrl =
-      metadataString(node.metadata, ['canonicalUrl', 'url', 'latestUrl']) ??
-      urlFromNodeId(node);
+      metadataString(node.metadata, ['canonicalUrl', 'url', 'latestUrl']) ?? urlFromNodeId(node);
     const host = hostOf(canonicalUrl);
     // Prefer the nested engagement.focusedWindowMs (companion writes it
     // alongside engagement.class); fall back to a flat key for
@@ -335,8 +334,7 @@ const deriveFlowVisits = (
     const visitCount = metadataNumber(node.metadata, 'visitCount', 0);
     const searchQuery = metadataString(node.metadata, ['searchQuery']);
     const isAnchor =
-      node.id === anchorId ||
-      (anchorUrl !== undefined && canonicalUrl === anchorUrl);
+      node.id === anchorId || (anchorUrl !== undefined && canonicalUrl === anchorUrl);
     out.push({
       id: node.id,
       label: formatEntityDisplay(node, ctx).primary,
@@ -389,8 +387,7 @@ const deriveTabSessions = (
   for (const node of nodes) {
     if (node.kind !== 'tab-session') continue;
     const tabSessionId = node.id.replace(/^tab-session:/u, '');
-    const lastActivityAt =
-      metadataString(node.metadata, ['lastActivityAt']) ?? node.lastSeenAt;
+    const lastActivityAt = metadataString(node.metadata, ['lastActivityAt']) ?? node.lastSeenAt;
     const firstSeenAt = node.firstSeenAt;
     const lifespanMs =
       lastActivityAt !== undefined && firstSeenAt !== undefined
@@ -413,9 +410,7 @@ const deriveTabSessions = (
 // visit-level `opener_visit` map handled in FlowPathView is more
 // specific (knows WHICH visit opened the new tab); this fills the
 // gap when the source visit isn't loaded in scope.
-const deriveTabOpenerMap = (
-  edges: readonly ConnectionEdge[],
-): ReadonlyMap<string, string> => {
+const deriveTabOpenerMap = (edges: readonly ConnectionEdge[]): ReadonlyMap<string, string> => {
   const out = new Map<string, string>();
   for (const edge of edges) {
     if (edge.kind !== 'tab_session_opener_chain') continue;
@@ -635,11 +630,7 @@ const workstreamIdsMatch = (candidate: string | undefined, workstreamAnchorId: s
 
 const addVisitAliasesForNode = (node: ConnectionNode | undefined, out: Set<string>): void => {
   if (node === undefined) return;
-  if (
-    node.kind === 'timeline-visit' ||
-    node.kind === 'visit-instance' ||
-    node.kind === 'thread'
-  ) {
+  if (node.kind === 'timeline-visit' || node.kind === 'visit-instance' || node.kind === 'thread') {
     out.add(node.id);
   }
   const timelineVisitId = metadataString(node.metadata, ['timelineVisitId']);
@@ -742,10 +733,7 @@ const focusEmptyDetailForAnchor = (
   edges: readonly ConnectionEdge[],
 ): string => {
   const focusedWindowMs = maxFocusedWindowMsForAnchor(anchorId, nodes, edges);
-  if (
-    focusedWindowMs !== undefined &&
-    focusedWindowMs < DEFAULT_TOPIC_ENGAGEMENT_GATE_MS
-  ) {
+  if (focusedWindowMs !== undefined && focusedWindowMs < DEFAULT_TOPIC_ENGAGEMENT_GATE_MS) {
     return `Latest captured focus for this page is ${String(focusedWindowMs)} ms, below the ${String(DEFAULT_TOPIC_ENGAGEMENT_GATE_MS)} ms topic gate.`;
   }
   return 'The candidate marked this page as ungrouped for now.';
@@ -843,9 +831,11 @@ const reasonsForVisit = (
 ): readonly Reason[] => {
   const nodeById = new Map(nodes.map((node) => [node.id, node] as const));
   const reasons: Reason[] = [];
-  let similarityReason:
-    | { readonly code: 'COSINE_ABOVE_THRESHOLD'; readonly cosine: number; readonly threshold: number }
-    | null = null;
+  let similarityReason: {
+    readonly code: 'COSINE_ABOVE_THRESHOLD';
+    readonly cosine: number;
+    readonly threshold: number;
+  } | null = null;
   let similarityMatchCount = 0;
   for (const edge of edges) {
     if (edge.fromNodeId !== visitId && edge.toNodeId !== visitId) continue;
@@ -854,7 +844,8 @@ const reasonsForVisit = (
       reasons.push({
         code: 'SAME_THREAD',
         threadId: thread?.id ?? 'thread:unknown',
-        threadName: thread === undefined ? 'Unknown thread' : formatEntityDisplay(thread, ctx).primary,
+        threadName:
+          thread === undefined ? 'Unknown thread' : formatEntityDisplay(thread, ctx).primary,
       });
     } else if (edge.kind === 'visit_resembles_visit') {
       const cosine = metadataNumber(edge.metadata ?? {}, 'cosine', 0.85);
@@ -889,8 +880,7 @@ const reasonsForVisit = (
     } else if (edge.kind === 'thread_text_mentions_search_query') {
       const visit = nodeById.get(visitId);
       const query = metadataString(visit?.metadata ?? {}, ['searchQuery']);
-      const fallback =
-        visit === undefined ? '(visit)' : formatEntityDisplay(visit, ctx).primary;
+      const fallback = visit === undefined ? '(visit)' : formatEntityDisplay(visit, ctx).primary;
       reasons.push({
         code: 'LEXICAL_OVERLAP',
         topTokens: query === undefined ? [fallback] : query.split(/\s+/u),
@@ -1282,10 +1272,7 @@ export const ConnectionsView = ({
   // snapshot fetch refreshes canonical labels; until then, the
   // override map applied in `result` shows the relabeled value
   // without a round-trip.
-  const replaceNodeEngagementClass = (
-    nodeId: string,
-    engagementClass: EngagementClass,
-  ): void => {
+  const replaceNodeEngagementClass = (nodeId: string, engagementClass: EngagementClass): void => {
     setEngagementOverrides((current) => ({ ...current, [nodeId]: engagementClass }));
   };
 
@@ -1353,6 +1340,90 @@ export const ConnectionsView = ({
     if (!response.ok) {
       throw new Error(response.error ?? 'topic promote feedback failed');
     }
+    refresh();
+  };
+
+  const submitTopicHide = async (input: {
+    readonly topicId: string;
+    readonly memberVisitIds: readonly string[];
+  }): Promise<void> => {
+    const response = await postUserOrganizedItem({
+      itemKind: 'topic',
+      itemId: input.topicId,
+      action: 'ignore',
+      details: { memberIds: input.memberVisitIds, reason: 'hidden' },
+    });
+    if (!response.ok) {
+      throw new Error(response.error ?? 'topic hide feedback failed');
+    }
+    refresh();
+  };
+
+  const submitTopicMerge = async (input: {
+    readonly topicId: string;
+    readonly targetTopicId: string;
+    readonly memberVisitIds: readonly string[];
+  }): Promise<void> => {
+    const response = await postUserOrganizedItem({
+      itemKind: 'topic',
+      itemId: input.topicId,
+      action: 'merge',
+      toContainer: input.targetTopicId,
+      details: {
+        mergeMembers: [input.targetTopicId],
+        memberIds: input.memberVisitIds,
+        reason: 'merged',
+        targetTopicId: input.targetTopicId,
+      },
+    });
+    if (!response.ok) {
+      throw new Error(response.error ?? 'topic merge feedback failed');
+    }
+    refresh();
+  };
+
+  const submitVisitMarkNotRelated = async (input: {
+    readonly topicId: string;
+    readonly visitId: string;
+    readonly memberVisitIds: readonly string[];
+  }): Promise<void> => {
+    const response = await postUserOrganizedItem({
+      itemKind: 'visit',
+      itemId: input.visitId,
+      action: 'ignore',
+      fromContainer: input.topicId,
+      details: {
+        memberIds: input.memberVisitIds,
+        reason: 'not-related',
+        targetTopicId: input.topicId,
+      },
+    });
+    if (!response.ok) {
+      throw new Error(response.error ?? 'visit not-related feedback failed');
+    }
+    refresh();
+  };
+
+  const submitVisitSplitOut = async (input: {
+    readonly topicId: string;
+    readonly visitId: string;
+    readonly memberVisitIds: readonly string[];
+  }): Promise<void> => {
+    const response = await postUserOrganizedItem({
+      itemKind: 'topic',
+      itemId: input.topicId,
+      action: 'split',
+      details: {
+        memberIds: [input.visitId],
+        splitInto: [input.visitId],
+        reason: 'split-out',
+        targetTopicId: input.visitId,
+      },
+    });
+    if (!response.ok) {
+      throw new Error(response.error ?? 'topic split feedback failed');
+    }
+    refresh();
   };
 
   const totalEdges = result?.snapshot.edgeCount ?? 0;
@@ -1440,28 +1511,25 @@ export const ConnectionsView = ({
           ),
     [ctx, fullSnapshot.edges, fullSnapshot.nodes, result],
   );
-  const shadowFocusData = useMemo(
-    () => {
-      if (result === null || shadowFullSnapshot.nodes.length === 0) {
-        return emptyFocusData();
-      }
-      const shadowScope = deriveShadowFocusScope(
-        anchor,
-        result.snapshot.nodes,
-        result.snapshot.edges,
-        shadowFullSnapshot.nodes,
-        shadowFullSnapshot.edges,
-      );
-      return deriveFocusData(
-        shadowScope.nodes,
-        shadowScope.edges,
-        shadowScope.nodes,
-        shadowScope.edges,
-        shadowCtx,
-      );
-    },
-    [anchor, result, shadowCtx, shadowFullSnapshot.edges, shadowFullSnapshot.nodes],
-  );
+  const shadowFocusData = useMemo(() => {
+    if (result === null || shadowFullSnapshot.nodes.length === 0) {
+      return emptyFocusData();
+    }
+    const shadowScope = deriveShadowFocusScope(
+      anchor,
+      result.snapshot.nodes,
+      result.snapshot.edges,
+      shadowFullSnapshot.nodes,
+      shadowFullSnapshot.edges,
+    );
+    return deriveFocusData(
+      shadowScope.nodes,
+      shadowScope.edges,
+      shadowScope.nodes,
+      shadowScope.edges,
+      shadowCtx,
+    );
+  }, [anchor, result, shadowCtx, shadowFullSnapshot.edges, shadowFullSnapshot.nodes]);
   const focusEligibleVisitCount = eligibleVisitCountForFocusData(focusData);
   const shadowEligibleVisitCount = eligibleVisitCountForFocusData(shadowFocusData);
   const activeFocusCollapsed = isCollapsedSuggestionSet(
@@ -1482,9 +1550,11 @@ export const ConnectionsView = ({
           ? scopedEmptyFocusData
           : focusData;
   const renderedFocusEligibleVisitCount =
-    renderedFocusData === shadowFocusData ? shadowEligibleVisitCount
-    : renderedFocusData === scopedEmptyFocusData ? 0
-    : focusEligibleVisitCount;
+    renderedFocusData === shadowFocusData
+      ? shadowEligibleVisitCount
+      : renderedFocusData === scopedEmptyFocusData
+        ? 0
+        : focusEligibleVisitCount;
   const renderedFocusEmptyDetail = useMemo(() => {
     if (renderedFocusData !== scopedEmptyFocusData || result === null) return undefined;
     return focusEmptyDetailForAnchor(
@@ -1506,11 +1576,7 @@ export const ConnectionsView = ({
   // parent page when the user lands on a leaf visit-instance.
   const flowSubgraph = useMemo(() => {
     if (result === null) return { nodes: [], edges: [] } as const;
-    return expandFlowSubgraph(
-      result.snapshot.nodes,
-      fullSnapshot.nodes,
-      fullSnapshot.edges,
-    );
+    return expandFlowSubgraph(result.snapshot.nodes, fullSnapshot.nodes, fullSnapshot.edges);
   }, [result, fullSnapshot.nodes, fullSnapshot.edges]);
   const contextWorkstreamId = useMemo(() => {
     if (anchor.startsWith('workstream:')) return anchor.replace(/^workstream:/u, '');
@@ -1908,6 +1974,10 @@ export const ConnectionsView = ({
                 emptyDetail={renderedFocusEmptyDetail}
                 workstreamOptions={workstreamOptions}
                 onTopicPromote={submitTopicPromote}
+                onTopicHide={submitTopicHide}
+                onTopicMerge={submitTopicMerge}
+                onVisitMarkNotRelated={submitVisitMarkNotRelated}
+                onVisitSplitOut={submitVisitSplitOut}
                 onEngagementRelabel={submitEngagementRelabel}
                 onTopicClick={(topicId) => {
                   // Same rationale as useNodeAsAnchor — don't dump
@@ -1932,9 +2002,9 @@ export const ConnectionsView = ({
               <div className="cx-empty" data-testid="connections-pick-anchor">
                 <h4>Pick an anchor to begin</h4>
                 <p>
-                  Choose a workstream on the left, click a recent anchor, or paste a node id —
-                  the graph around it appears here. Press <kbd>Alt</kbd>+<kbd>←</kbd> /{' '}
-                  <kbd>Alt</kbd>+<kbd>→</kbd> to navigate anchor history.
+                  Choose a workstream on the left, click a recent anchor, or paste a node id — the
+                  graph around it appears here. Press <kbd>Alt</kbd>+<kbd>←</kbd> / <kbd>Alt</kbd>+
+                  <kbd>→</kbd> to navigate anchor history.
                 </p>
                 {recentAnchors.length > 0 ? (
                   <div className="cx-empty-quickpick">
@@ -1963,7 +2033,12 @@ export const ConnectionsView = ({
             {whyVisitId !== null && result !== null ? (
               <WhyRelatedPanel
                 fromVisitId={whyVisitId}
-                reasons={reasonsForVisit(result.snapshot.nodes, result.snapshot.edges, whyVisitId, ctx)}
+                reasons={reasonsForVisit(
+                  result.snapshot.nodes,
+                  result.snapshot.edges,
+                  whyVisitId,
+                  ctx,
+                )}
                 showOnlyUserAsserted={whyAssertedOnly}
                 feedback={
                   whyFeedbackEdge === null

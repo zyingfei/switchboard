@@ -260,4 +260,88 @@ describe('FocusView', () => {
       });
     });
   });
+
+  it('fires hide, merge, not-related, and split suggestion actions', async () => {
+    const onTopicHide = vi.fn(() => Promise.resolve());
+    const onTopicMerge = vi.fn(() => Promise.resolve());
+    const onVisitMarkNotRelated = vi.fn(() => Promise.resolve());
+    const onVisitSplitOut = vi.fn(() => Promise.resolve());
+    render(
+      <FocusView
+        topics={[
+          { id: 'topic:a', label: 'Alpha', memberCount: 2, cohesion: 0.91 },
+          { id: 'topic:b', label: 'Beta', memberCount: 2, cohesion: 0.87 },
+        ]}
+        visitsByTopic={{
+          'topic:a': [
+            { id: 'timeline-visit:https://example.test/a', label: 'A', focusedWindowMs: 10_000 },
+            {
+              id: 'timeline-visit:https://example.test/noisy',
+              label: 'Noisy',
+              focusedWindowMs: 5_000,
+            },
+            {
+              id: 'timeline-visit:https://example.test/secondary',
+              label: 'Secondary',
+              focusedWindowMs: 2_000,
+              affiliation: 'secondary',
+            },
+          ],
+        }}
+        engagementClassesByVisit={{}}
+        onTopicHide={onTopicHide}
+        onTopicMerge={onTopicMerge}
+        onVisitMarkNotRelated={onVisitMarkNotRelated}
+        onVisitSplitOut={onVisitSplitOut}
+        onTopicClick={() => undefined}
+        onVisitClick={() => undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('focus-hide-topic:a'));
+    fireEvent.click(screen.getByTestId('focus-merge-topic:a'));
+    fireEvent.click(screen.getByTestId('focus-expand-topic:a'));
+    fireEvent.click(
+      screen.getByTestId(
+        'focus-visit-not-related-topic:a-timeline-visit:https://example.test/secondary',
+      ),
+    );
+    fireEvent.click(
+      screen.getByTestId('focus-visit-split-topic:a-timeline-visit:https://example.test/noisy'),
+    );
+
+    await waitFor(() => {
+      expect(onTopicHide).toHaveBeenCalledWith({
+        topicId: 'topic:a',
+        memberVisitIds: [
+          'timeline-visit:https://example.test/a',
+          'timeline-visit:https://example.test/noisy',
+        ],
+      });
+      expect(onTopicMerge).toHaveBeenCalledWith({
+        topicId: 'topic:a',
+        targetTopicId: 'topic:b',
+        memberVisitIds: [
+          'timeline-visit:https://example.test/a',
+          'timeline-visit:https://example.test/noisy',
+        ],
+      });
+      expect(onVisitMarkNotRelated).toHaveBeenCalledWith({
+        topicId: 'topic:a',
+        visitId: 'timeline-visit:https://example.test/secondary',
+        memberVisitIds: [
+          'timeline-visit:https://example.test/a',
+          'timeline-visit:https://example.test/noisy',
+        ],
+      });
+      expect(onVisitSplitOut).toHaveBeenCalledWith({
+        topicId: 'topic:a',
+        visitId: 'timeline-visit:https://example.test/noisy',
+        memberVisitIds: [
+          'timeline-visit:https://example.test/a',
+          'timeline-visit:https://example.test/noisy',
+        ],
+      });
+    });
+  });
 });
