@@ -8,6 +8,7 @@ import {
   type TopicRevisionTopic,
 } from '../producers/topic-revision.js';
 import type { FocusEvalPack, FocusEvalPair } from './focusEvalPack.js';
+import { louvainCommunityPartition } from './graphCommunityClusterer.js';
 import {
   buildTopicRevision,
   type TopicVisit,
@@ -20,7 +21,8 @@ export type TopicComparisonCandidate =
   | 'sparse-uf'
   | 'leiden-modularity'
   | 'leiden-cpm'
-  | 'bertopic-shaped';
+  | 'bertopic-shaped'
+  | 'louvain-community';
 
 export interface TopicAlgorithmComparisonMetrics {
   readonly pairwisePrecision: number;
@@ -458,7 +460,9 @@ const buildCandidateRevision = async (
       ? leidenLikePartition(nodeIds, edges, 'modularity')
       : candidate === 'leiden-cpm'
         ? leidenLikePartition(nodeIds, edges, 'cpm')
-        : densityLeafPartition(nodeIds, edges);
+        : candidate === 'louvain-community'
+          ? louvainCommunityPartition(nodeIds, edges)
+          : densityLeafPartition(nodeIds, edges);
   return revisionFromGroups({ candidate, groups, visits, visitSimilarity, threshold });
 };
 
@@ -470,6 +474,7 @@ export const runTopicAlgorithmComparison = async (
     'leiden-modularity',
     'leiden-cpm',
     'bertopic-shaped',
+    'louvain-community',
   ];
   const threshold = input.cosineThreshold ?? DEFAULT_THRESHOLD;
   const results: TopicAlgorithmComparisonResult[] = [];

@@ -33,6 +33,7 @@ describe('topic algorithm comparison', () => {
       'leiden-modularity',
       'leiden-cpm',
       'bertopic-shaped',
+      'louvain-community',
     ]);
     for (const result of results) {
       expect(result.metrics.topicCount).toBeGreaterThanOrEqual(1);
