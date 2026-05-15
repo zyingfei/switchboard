@@ -14,6 +14,7 @@ export const REASON_PRIORITY: Record<ReasonCode, number> = {
   COSINE_ABOVE_THRESHOLD: 8,
   LINK_OUT_FROM: 9,
   LINK_IN_TO: 9,
+  PAGE_CONTENT_COVERAGE: 10,
   LEXICAL_OVERLAP: 10,
 };
 

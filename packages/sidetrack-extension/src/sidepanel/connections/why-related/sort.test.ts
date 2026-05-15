@@ -25,6 +25,7 @@ describe('sortReasons', () => {
       'LINK_IN_TO',
       'LINK_OUT_FROM',
       'LEXICAL_OVERLAP',
+      'PAGE_CONTENT_COVERAGE',
     ]);
   });
 

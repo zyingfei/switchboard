@@ -68,6 +68,7 @@ export const LinkedCenter = ({
   result,
   anchorId,
   selectedEdge,
+  highlightedNodeId,
   onSelectEdge,
   onUseNodeAsAnchor,
   onPromoteSnippet,
@@ -77,6 +78,7 @@ export const LinkedCenter = ({
   readonly result: ConnectionsScopedResult;
   readonly anchorId: string;
   readonly selectedEdge: ConnectionEdge | null;
+  readonly highlightedNodeId?: string | null;
   readonly onSelectEdge: (edge: ConnectionEdge) => void;
   readonly onUseNodeAsAnchor: (nodeId: string) => void;
   readonly onPromoteSnippet: (input: {
@@ -143,6 +145,7 @@ export const LinkedCenter = ({
                     edge={edge ?? null}
                     direction={edge?.fromNodeId === anchorId ? 'out' : 'in'}
                     selected={selectedEdge?.id === edge?.id && edge !== undefined}
+                    highlighted={highlightedNodeId === n.id}
                     onPromoteSnippet={onPromoteSnippet}
                     onUseAsAnchor={() => {
                       onUseNodeAsAnchor(n.id);
@@ -168,6 +171,10 @@ export const LinkedCenter = ({
             const fam: EdgeFamily = meta?.family ?? 'urlmatch';
             const hint = contentDerivedHint(edge.kind);
             const isSelected = selectedEdge?.id === edge.id;
+            const isTimelineHovered =
+              highlightedNodeId !== undefined &&
+              highlightedNodeId !== null &&
+              (edge.fromNodeId === highlightedNodeId || edge.toNodeId === highlightedNodeId);
             return (
               <button
                 key={edge.id}
@@ -176,7 +183,14 @@ export const LinkedCenter = ({
                   onSelectEdge(edge);
                 }}
                 data-testid={`edge-${edge.id}`}
-                className={`cx-edgelabel cx-edge-summary ${isSelected ? 'is-selected' : ''}`}
+                className={[
+                  'cx-edgelabel',
+                  'cx-edge-summary',
+                  isSelected ? 'is-selected' : '',
+                  isTimelineHovered ? 'is-timeline-hovered' : '',
+                ]
+                  .filter(Boolean)
+                  .join(' ')}
                 title={`${edgeEndpointLabel(edge, nodeById, ctx)} · ${edgeKindLabel(edge)}`}
               >
                 <span

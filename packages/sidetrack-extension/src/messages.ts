@@ -15,6 +15,11 @@ import type {
 } from './companion/model';
 import type { ReviewVerdict } from './review/types';
 import type {
+  ContentSearchHit,
+  PageContentCoverage,
+  PageContentExtractedPayload,
+} from './companion/pageContentClient';
+import type {
   AllThreadsBucket,
   PrivacyMode,
   TrackingMode,
@@ -127,6 +132,14 @@ export const messageTypes = {
   // bypass that block. The SW returns the parsed RankedItem[] so
   // the popover can render titles and scores.
   recallQuery: 'sidetrack.recall.query',
+  pageContentExtract: 'sidetrack.pageContent.extract',
+  pageContentIndexCurrent: 'sidetrack.pageContent.indexCurrent',
+  pageContentIndexSelection: 'sidetrack.pageContent.indexSelection',
+  pageContentOpenTabsPreview: 'sidetrack.pageContent.openTabsPreview',
+  pageContentIndexOpenTabs: 'sidetrack.pageContent.indexOpenTabs',
+  pageContentCoverage: 'sidetrack.pageContent.coverage',
+  pageContentDelete: 'sidetrack.pageContent.delete',
+  contentQuery: 'sidetrack.content.query',
   // Side panel asks the chat tab to drop a margin annotation onto
   // a captured turn — without forcing the user to re-select text on
   // the live page or reload it. Background relays to the tab whose
@@ -211,9 +224,11 @@ export const isFocusThreadInSidePanelMessage = (
   (value.title === undefined || typeof value.title === 'string') &&
   (value.lastSeenAt === undefined || typeof value.lastSeenAt === 'string');
 
-export interface ContentRequest {
-  readonly type: typeof messageTypes.captureVisibleThread;
-}
+export type ContentRequest =
+  | {
+      readonly type: typeof messageTypes.captureVisibleThread;
+    }
+  | PageContentExtractContentRequest;
 
 export type ContentResponse =
   | {
@@ -232,6 +247,24 @@ export const isContentResponse = (value: unknown): value is ContentResponse => {
   if (value.ok) {
     return isRecord(value.capture);
   }
+  return typeof value.error === 'string';
+};
+
+export interface PageContentExtractContentRequest {
+  readonly type: typeof messageTypes.pageContentExtract;
+  readonly mode: 'page' | 'selection';
+  readonly trigger: 'manual' | 'bulk-open-tabs';
+}
+
+export type PageContentExtractContentResponse =
+  | { readonly ok: true; readonly payload: PageContentExtractedPayload }
+  | { readonly ok: false; readonly error: string };
+
+export const isPageContentExtractContentResponse = (
+  value: unknown,
+): value is PageContentExtractContentResponse => {
+  if (!isRecord(value) || typeof value.ok !== 'boolean') return false;
+  if (value.ok) return isRecord(value.payload);
   return typeof value.error === 'string';
 };
 
@@ -438,6 +471,32 @@ export type WorkboardRequest =
       readonly currentUrl?: string;
     }
   | {
+      readonly type: typeof messageTypes.pageContentIndexCurrent;
+    }
+  | {
+      readonly type: typeof messageTypes.pageContentIndexSelection;
+    }
+  | {
+      readonly type: typeof messageTypes.pageContentOpenTabsPreview;
+    }
+  | {
+      readonly type: typeof messageTypes.pageContentIndexOpenTabs;
+    }
+  | {
+      readonly type: typeof messageTypes.pageContentCoverage;
+      readonly canonicalUrl: string;
+    }
+  | {
+      readonly type: typeof messageTypes.pageContentDelete;
+      readonly canonicalUrl: string;
+    }
+  | {
+      readonly type: typeof messageTypes.contentQuery;
+      readonly q: string;
+      readonly limit?: number;
+      readonly sourceKind?: readonly ('page-content' | 'chat-turn')[];
+    }
+  | {
       readonly type: typeof messageTypes.annotateTurn;
       readonly threadUrl: string;
       // First few hundred chars of the turn body. Used as the text
@@ -504,6 +563,46 @@ export type RuntimeResponse =
 export interface RecallQueryResponse {
   readonly ok: boolean;
   readonly items: readonly unknown[];
+  readonly error?: string;
+}
+
+export interface PageContentOperationResponse {
+  readonly ok: boolean;
+  readonly coverage?: PageContentCoverage;
+  readonly error?: string;
+}
+
+export interface PageContentOpenTabPreview {
+  readonly tabId: number;
+  readonly title: string;
+  readonly url: string;
+  readonly eligible: boolean;
+  readonly reason?: string;
+}
+
+export interface PageContentOpenTabsPreviewResponse {
+  readonly ok: boolean;
+  readonly tabs: readonly PageContentOpenTabPreview[];
+  readonly eligibleCount: number;
+  readonly error?: string;
+}
+
+export interface PageContentBulkOperationResponse {
+  readonly ok: boolean;
+  readonly indexedCount: number;
+  readonly skippedCount: number;
+  readonly coverages: readonly PageContentCoverage[];
+  readonly failures: readonly {
+    readonly title?: string;
+    readonly url?: string;
+    readonly error: string;
+  }[];
+  readonly error?: string;
+}
+
+export interface ContentQueryResponse {
+  readonly ok: boolean;
+  readonly items: readonly ContentSearchHit[];
   readonly error?: string;
 }
 
@@ -755,6 +854,32 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
       (value.limit === undefined || typeof value.limit === 'number') &&
       (value.workstreamId === undefined || typeof value.workstreamId === 'string') &&
       (value.currentUrl === undefined || typeof value.currentUrl === 'string')
+    );
+  }
+
+  if (
+    hasType(value, messageTypes.pageContentIndexCurrent) ||
+    hasType(value, messageTypes.pageContentIndexSelection) ||
+    hasType(value, messageTypes.pageContentOpenTabsPreview) ||
+    hasType(value, messageTypes.pageContentIndexOpenTabs)
+  ) {
+    return true;
+  }
+
+  if (
+    hasType(value, messageTypes.pageContentCoverage) ||
+    hasType(value, messageTypes.pageContentDelete)
+  ) {
+    return typeof value.canonicalUrl === 'string';
+  }
+
+  if (hasType(value, messageTypes.contentQuery)) {
+    return (
+      typeof value.q === 'string' &&
+      (value.limit === undefined || typeof value.limit === 'number') &&
+      (value.sourceKind === undefined ||
+        (Array.isArray(value.sourceKind) &&
+          value.sourceKind.every((kind) => kind === 'page-content' || kind === 'chat-turn')))
     );
   }
 

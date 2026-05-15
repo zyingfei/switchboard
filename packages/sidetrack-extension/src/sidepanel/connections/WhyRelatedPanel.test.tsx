@@ -19,7 +19,7 @@ describe('WhyRelatedPanel', () => {
       />,
     );
 
-    expect(screen.getAllByRole('listitem')).toHaveLength(14);
+    expect(screen.getAllByRole('listitem')).toHaveLength(15);
   });
 
   it('toggles to user-asserted reasons', () => {

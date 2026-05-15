@@ -7852,6 +7852,10 @@ pre.diff {
 .cx-row-anchor-action {
   flex: none;
 }
+.cx-row-open-tab {
+  flex: none;
+  white-space: nowrap;
+}
 .cx-select {
   display: flex;
   flex-direction: column;
@@ -7958,6 +7962,9 @@ pre.diff {
   color: var(--signal);
   border-color: var(--signal-tint);
   background: var(--signal-bg);
+}
+.cx-edge-section {
+  min-height: 0;
 }
 .cx-edge-section-note {
   margin: -2px 0 8px;
@@ -8176,6 +8183,113 @@ pre.diff {
 }
 .cx-anchor-inline-btn:hover:enabled {
   background: var(--paper-tinted);
+}
+.cx-page-content-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  background: var(--paper-light);
+  border-bottom: var(--hair);
+  flex-wrap: wrap;
+}
+.cx-page-content-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+.cx-page-content-label,
+.cx-page-content-state,
+.cx-page-content-meta {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.cx-page-content-state {
+  color: var(--ink-1);
+}
+.cx-page-content-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.cx-mini-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--rule);
+  border-radius: var(--rad-s);
+  background: var(--paper);
+  color: var(--ink-1);
+  font-size: 11px;
+  cursor: pointer;
+}
+.cx-mini-btn:hover:enabled {
+  background: var(--paper-tinted);
+}
+.cx-mini-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.cx-mini-btn.danger {
+  color: #7a2e1d;
+  border-color: rgba(122, 46, 29, 0.25);
+}
+.cx-page-content-error {
+  flex-basis: 100%;
+  font-size: 11px;
+  color: #7a2e1d;
+}
+.cx-page-content-bulk {
+  flex-basis: 100%;
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--rule);
+  border-radius: var(--rad-s);
+  background: var(--paper);
+}
+.cx-page-content-bulk-head,
+.cx-page-content-bulk-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.cx-page-content-bulk-head {
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--ink-1);
+}
+.cx-page-content-bulk-list {
+  display: grid;
+  gap: 4px;
+}
+.cx-page-content-bulk-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+  color: var(--ink-1);
+}
+.cx-page-content-bulk-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cx-page-content-bulk-row small {
+  color: var(--ink-3);
+}
+.cx-page-content-bulk-row.muted {
+  opacity: 0.65;
 }
 /* Stage 5 polish — filter strip below the mode tabs. Compact row
    that hosts the time-range control (and future filters) without
@@ -8947,46 +9061,11 @@ pre.diff {
   font-size: 10.5px;
   line-height: 1.5;
 }
-.cx-flow-anchor {
-  display: grid;
-  gap: 2px;
-  padding: 10px 12px;
-  border: 1px solid var(--accent, #c2410c);
-  border-radius: var(--rad-s);
-  background: var(--accent-bg, #fdf3eb);
-}
-.cx-flow-anchor-kicker {
-  font-family: var(--mono);
-  font-size: 9.5px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--accent, #c2410c);
-}
-.cx-flow-anchor-title {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-weight: 600;
-  color: var(--ink);
-}
-.cx-flow-anchor-meta {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--mono);
-  font-size: 10px;
-  color: var(--ink-3);
-}
 .cx-flow-row {
   display: grid;
   grid-template-columns: 140px 1fr;
   gap: 12px;
   align-items: start;
-}
-.cx-flow-row.is-anchor-row {
-  order: -1;
 }
 .cx-flow-tab-host {
   font-size: 10px;
@@ -9262,6 +9341,12 @@ pre.diff {
   font-size: 13px;
   line-height: 1.4;
 }
+.cx-focus-triage-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
 .cx-focus-title {
   display: block;
   width: 100%;
@@ -9350,6 +9435,10 @@ pre.diff {
   color: var(--ink-2);
   border-color: var(--rule);
   background: var(--paper-tinted);
+}
+.cx-focus-chip-coverage {
+  color: var(--ink-3);
+  background: var(--paper-light);
 }
 .cx-focus-bar {
   height: 5px;
@@ -9562,6 +9651,16 @@ pre.diff {
 }
 .cx-focus-visit-open {
   text-decoration: none;
+}
+.cx-focus-visit-reject {
+  color: var(--signal);
+  border-color: var(--signal-tint);
+  background: var(--signal-bg);
+}
+.cx-focus-visit-reject:hover {
+  color: var(--signal);
+  border-color: var(--signal);
+  background: var(--signal-bg);
 }
 .cx-focus-visit-title {
   flex: 1;
@@ -9823,6 +9922,29 @@ pre.diff {
   background: var(--signal-bg);
   color: var(--signal);
   border-color: var(--signal-tint);
+}
+
+.cx-producer-pin {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  font: 11px var(--mono);
+  color: var(--ink-3);
+}
+.cx-producer-pin-rev {
+  font-size: 10px;
+}
+.cx-producer-pin-spacer {
+  flex: 1;
+}
+.cx-producer-pin-button {
+  font-size: 11px;
+  padding: 2px 8px;
+}
+.cx-producer-pin-other {
+  font-size: 10px;
+  color: var(--amber);
 }
 
 /* orbital graph (Concept B) */

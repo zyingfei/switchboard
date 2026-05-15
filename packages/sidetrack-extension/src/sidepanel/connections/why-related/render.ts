@@ -49,5 +49,9 @@ export const renderReason = (reason: Reason): string => {
       return 'This page links to that one';
     case 'LINK_IN_TO':
       return 'That page links to this one';
+    case 'PAGE_CONTENT_COVERAGE':
+      return reason.quality === undefined
+        ? `Page text coverage: ${reason.state}`
+        : `Page text coverage: ${reason.state} (${reason.quality})`;
   }
 };

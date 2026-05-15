@@ -76,8 +76,7 @@ export function ProducerPin({
   const [pinnedRevisionId, setPinnedRevisionId] = useState<string | null>(null);
   const [busy, setBusy] = useState<boolean>(false);
   const isPinnedToThis = pinnedRevisionId !== null && pinnedRevisionId === revisionId;
-  const isPinnedToOther =
-    pinnedRevisionId !== null && pinnedRevisionId !== revisionId;
+  const isPinnedToOther = pinnedRevisionId !== null && pinnedRevisionId !== revisionId;
 
   useEffect(() => {
     if (revisionId === null) return;
@@ -135,37 +134,22 @@ export function ProducerPin({
   };
 
   return (
-    <div
-      className="cx-producer-pin"
-      data-testid={`producer-pin-${source}`}
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: 8,
-        padding: '6px 8px',
-        fontSize: 11,
-        fontFamily: 'var(--mono)',
-        color: 'var(--ink-3)',
-      }}
-    >
+    <div className="cx-producer-pin" data-testid={`producer-pin-${source}`}>
       <span data-testid={`producer-pin-${source}-label`}>
         {labelHead}
         {corrections} ·{' '}
-        <code className="mono" style={{ fontSize: 10 }}>
-          rev {revisionId.slice(0, 8)}
-        </code>
+        <code className="mono cx-producer-pin-rev">rev {revisionId.slice(0, 8)}</code>
       </span>
-      <span style={{ flex: 1 }} />
+      <span className="cx-producer-pin-spacer" />
       {isPinnedToThis ? (
         <button
           type="button"
-          className="btn btn-ghost"
+          className="btn btn-ghost cx-producer-pin-button"
           disabled={busy}
           data-testid={`producer-pin-${source}-unpin`}
           onClick={() => {
             void handleUnpin();
           }}
-          style={{ fontSize: 11, padding: '2px 8px' }}
         >
           Unpin
         </button>
@@ -173,22 +157,20 @@ export function ProducerPin({
         <>
           {isPinnedToOther ? (
             <span
-              className="mono"
+              className="mono cx-producer-pin-other"
               data-testid={`producer-pin-${source}-other`}
-              style={{ fontSize: 10, color: 'var(--ink-warn, #c47b00)' }}
             >
               other version pinned
             </span>
           ) : null}
           <button
             type="button"
-            className="btn btn-primary"
+            className="btn btn-primary cx-producer-pin-button"
             disabled={busy}
             data-testid={`producer-pin-${source}-pin`}
             onClick={() => {
               void handlePin();
             }}
-            style={{ fontSize: 11, padding: '2px 8px' }}
           >
             Pin this version
           </button>

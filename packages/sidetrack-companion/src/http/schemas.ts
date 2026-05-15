@@ -549,6 +549,95 @@ export const recallQuerySchema = z.object({
   workstreamId: bacIdSchema.optional(),
 });
 
+export const contentQuerySchema = z.object({
+  q: z.string().min(1),
+  sourceKind: z
+    .string()
+    .optional()
+    .transform((value) =>
+      value === undefined
+        ? (['page-content', 'chat-turn'] as const)
+        : value
+            .split(',')
+            .map((entry) => entry.trim())
+            .filter(
+              (entry): entry is 'page-content' | 'chat-turn' =>
+                entry === 'page-content' || entry === 'chat-turn',
+            ),
+    ),
+  limit: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .transform((limit) => Math.min(limit ?? 20, 50)),
+  workstreamId: bacIdSchema.optional(),
+});
+
+export const pageContentCoverageQuerySchema = z.object({
+  canonicalUrl: z.url(),
+});
+
+const pageContentExtractionStrategySchema = z.enum([
+  'manual-selection',
+  'reader-mode',
+  'visible-dom',
+]);
+
+const pageContentQualitySchema = z.enum(['high', 'medium', 'low']);
+
+export const pageContentExtractedSchema = z.object({
+  payloadVersion: z.literal(1),
+  canonicalUrl: z.url(),
+  url: z.url(),
+  title: z.string().optional(),
+  provider: z.string().optional(),
+  extractedAt: isoDateTimeSchema,
+  extractionSource: pageContentExtractionStrategySchema,
+  extractionPolicy: z.object({
+    trigger: z.enum([
+      'manual',
+      'workstream-policy',
+      'save-suggestion',
+      'allowlist',
+      'attention-gate',
+      'bulk-open-tabs',
+    ]),
+    workstreamId: z.string().optional(),
+    domainPolicyId: z.string().optional(),
+  }),
+  quality: pageContentQualitySchema,
+  qualitySignals: z.object({
+    extractedWordCount: z.number().int().nonnegative(),
+    contentToDomRatio: z.number().nonnegative(),
+    boilerplateFraction: z.number().nonnegative(),
+    extractionStrategy: pageContentExtractionStrategySchema,
+    headingSignatureHash: z.string().optional(),
+  }),
+  content: z.object({
+    text: z.string().min(1),
+    markdown: z.string().optional(),
+    contentHash: z.string().min(1),
+    charCount: z.number().int().nonnegative(),
+  }),
+  redaction: z
+    .object({
+      applied: z.boolean(),
+      rules: z.array(z.string()),
+    })
+    .optional(),
+  dimensions: z.record(z.string(), z.unknown()).optional(),
+});
+
+export const pageContentTombstonedSchema = z.object({
+  payloadVersion: z.literal(1),
+  canonicalUrl: z.url(),
+  tombstonedAt: isoDateTimeSchema,
+  reason: z.enum(['user-delete', 'policy-revoked', 'retention-expired', 'quality-reject']),
+  contentHash: z.string().optional(),
+  dimensions: z.record(z.string(), z.unknown()).optional(),
+});
+
 export const suggestionQuerySchema = z.object({
   limit: z.coerce
     .number()

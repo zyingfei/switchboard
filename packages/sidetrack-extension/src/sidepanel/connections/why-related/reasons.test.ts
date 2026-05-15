@@ -23,6 +23,7 @@ const codeFor = (reason: Reason): Reason['code'] => {
     case 'LEXICAL_OVERLAP':
     case 'LINK_OUT_FROM':
     case 'LINK_IN_TO':
+    case 'PAGE_CONTENT_COVERAGE':
       return reason.code;
     default:
       return assertNever(reason);

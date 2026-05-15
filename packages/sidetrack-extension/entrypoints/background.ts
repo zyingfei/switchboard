@@ -83,6 +83,10 @@ import {
 import { allocateNextSeq, loadOrCreateEdgeReplica } from '../src/sync/edgeReplicaId';
 import { createVaultChangesClient } from '../src/companion/vaultChanges';
 import { createRecallClient } from '../src/companion/recallClient';
+import {
+  createPageContentClient,
+  type PageContentCoverage,
+} from '../src/companion/pageContentClient';
 import { buildReviewFollowUpText } from '../src/review/draft';
 import type { ReviewDraft } from '../src/review/types';
 import {
@@ -93,10 +97,16 @@ import {
 import { createChromeTabSessionStorage } from '../src/tabsession/storage';
 import {
   isContentResponse,
+  isPageContentExtractContentResponse,
   isRuntimeRequest,
   messageTypes,
   type AnnotateTurnResponse,
   type ListAnnotationsByUrlResponse,
+  type ContentQueryResponse,
+  type PageContentBulkOperationResponse,
+  type PageContentOperationResponse,
+  type PageContentOpenTabPreview,
+  type PageContentOpenTabsPreviewResponse,
   type PublishAnnotationToChatResponse,
   type RecallQueryResponse,
   type RuntimeRequest,
@@ -165,6 +175,8 @@ const activeTab = async (): Promise<chrome.tabs.Tab | undefined> => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   return tab;
 };
+
+const PAGE_CONTENT_BULK_OPEN_TABS_LIMIT = 50;
 
 let runtimeTabGroupWiring: TabGroupWiring | null = null;
 
@@ -915,6 +927,137 @@ const captureFromContentScript = async (tab: chrome.tabs.Tab): Promise<CaptureEv
   }
 
   return response.capture;
+};
+
+const extractPageContentFromTab = async (
+  tab: chrome.tabs.Tab,
+  mode: 'page' | 'selection',
+  trigger: 'manual' | 'bulk-open-tabs' = 'manual',
+): Promise<PageContentCoverage> => {
+  if (typeof tab.id !== 'number') {
+    throw new Error('Current tab has no tab id.');
+  }
+  if (tab.incognito === true) {
+    throw new Error('Page-content indexing is disabled in incognito tabs.');
+  }
+  const tabUrl = tab.url ?? '';
+  if (!/^https?:\/\//u.test(tabUrl)) {
+    throw new Error('Page-content indexing only supports HTTP(S) pages.');
+  }
+  const request = {
+    type: messageTypes.pageContentExtract,
+    mode,
+    trigger,
+  } as const;
+  let result = await sendToContentScriptWithRecovery(tab.id, request);
+  if (result.ok && !isPageContentExtractContentResponse(result.data)) {
+    const inject = await ensureContentScriptInTab(tab.id);
+    if (!inject.ok) {
+      throw new Error(
+        `Content script returned an invalid page-content response. Tried to recover but: ${inject.error ?? 'inject failed'}.`,
+      );
+    }
+    result = await sendToContentScriptWithRecovery(tab.id, request);
+  }
+  if (!result.ok) {
+    throw new Error(result.error ?? 'Content script is not reachable.');
+  }
+  if (!isPageContentExtractContentResponse(result.data)) {
+    throw new Error('Content script returned an invalid page-content response.');
+  }
+  if (!result.data.ok) {
+    throw new Error(result.data.error);
+  }
+  const settings = await readSettings();
+  if (settings.companion.bridgeKey.trim().length === 0) {
+    throw new Error('Companion not configured.');
+  }
+  return await createPageContentClient(settings.companion).index(result.data.payload);
+};
+
+const openTabPreviewForPageContent = (tab: chrome.tabs.Tab): PageContentOpenTabPreview => {
+  const title =
+    typeof tab.title === 'string' && tab.title.trim().length > 0
+      ? tab.title.trim()
+      : 'Untitled tab';
+  const url = tab.url ?? '';
+  const base = {
+    tabId: typeof tab.id === 'number' ? tab.id : -1,
+    title,
+    url,
+  };
+  if (typeof tab.id !== 'number') {
+    return { ...base, eligible: false, reason: 'Missing tab id' };
+  }
+  if (tab.incognito === true) {
+    return { ...base, eligible: false, reason: 'Incognito tab' };
+  }
+  if (!/^https?:\/\//u.test(url)) {
+    return { ...base, eligible: false, reason: 'Not an HTTP(S) page' };
+  }
+  return { ...base, eligible: true };
+};
+
+const pageContentOpenTabsPreview = async (): Promise<readonly PageContentOpenTabPreview[]> => {
+  const tabs = await chrome.tabs.query({});
+  const previews = tabs
+    .map(openTabPreviewForPageContent)
+    .sort(
+      (left, right) =>
+        Number(right.eligible) - Number(left.eligible) || left.title.localeCompare(right.title),
+    );
+  const seenCanonical = new Set<string>();
+  return previews.map((preview) => {
+    if (!preview.eligible) return preview;
+    const canonicalUrl = canonicalThreadUrl(preview.url);
+    if (seenCanonical.has(canonicalUrl)) {
+      return { ...preview, eligible: false, reason: 'Duplicate open URL' };
+    }
+    seenCanonical.add(canonicalUrl);
+    return preview;
+  });
+};
+
+const indexOpenPageContentTabs = async (): Promise<PageContentBulkOperationResponse> => {
+  const previews = await pageContentOpenTabsPreview();
+  const eligibleIds = new Set(
+    previews
+      .filter((preview) => preview.eligible)
+      .slice(0, PAGE_CONTENT_BULK_OPEN_TABS_LIMIT)
+      .map((preview) => preview.tabId),
+  );
+  const allTabs = await chrome.tabs.query({});
+  const eligibleTabs = allTabs.filter(
+    (tab) => typeof tab.id === 'number' && eligibleIds.has(tab.id),
+  );
+  const sortedTabs = eligibleTabs.sort(
+    (left, right) =>
+      Number(right.active === true) - Number(left.active === true) ||
+      (right.lastAccessed ?? 0) - (left.lastAccessed ?? 0),
+  );
+  const coverages: PageContentCoverage[] = [];
+  const failures: PageContentBulkOperationResponse['failures'][number][] = [];
+  for (const tab of sortedTabs) {
+    try {
+      coverages.push(await extractPageContentFromTab(tab, 'page', 'bulk-open-tabs'));
+    } catch (error) {
+      failures.push({
+        ...(typeof tab.title === 'string' ? { title: tab.title } : {}),
+        ...(typeof tab.url === 'string' ? { url: tab.url } : {}),
+        error: error instanceof Error ? error.message : 'Page-content indexing failed.',
+      });
+    }
+  }
+  const eligibleCount = previews.filter((preview) => preview.eligible).length;
+  const skippedCount = Math.max(0, eligibleCount - sortedTabs.length) + failures.length;
+  return {
+    ok: failures.length === 0,
+    indexedCount: coverages.length,
+    skippedCount,
+    coverages,
+    failures,
+    ...(failures.length === 0 ? {} : { error: `${String(failures.length)} open tab(s) failed.` }),
+  };
 };
 
 const storeCaptureEventLocal = async (event: CaptureEvent): Promise<void> => {
@@ -2480,6 +2623,145 @@ const handleRequest = async (
     return (await buildRecallResponse()) as unknown as RuntimeResponse;
   }
 
+  if (
+    request.type === messageTypes.pageContentIndexCurrent ||
+    request.type === messageTypes.pageContentIndexSelection
+  ) {
+    const buildPageContentResponse = async (): Promise<PageContentOperationResponse> => {
+      try {
+        const tab = await activeTab();
+        if (tab === undefined) return { ok: false, error: 'No active tab is available.' };
+        const coverage = await extractPageContentFromTab(
+          tab,
+          request.type === messageTypes.pageContentIndexSelection ? 'selection' : 'page',
+        );
+        return { ok: true, coverage };
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : 'Page-content indexing failed.',
+        };
+      }
+    };
+    return (await buildPageContentResponse()) as unknown as RuntimeResponse;
+  }
+
+  if (request.type === messageTypes.pageContentOpenTabsPreview) {
+    const buildPreviewResponse = async (): Promise<PageContentOpenTabsPreviewResponse> => {
+      try {
+        const tabs = await pageContentOpenTabsPreview();
+        return {
+          ok: true,
+          tabs,
+          eligibleCount: tabs.filter((tab) => tab.eligible).length,
+        };
+      } catch (error) {
+        return {
+          ok: false,
+          tabs: [],
+          eligibleCount: 0,
+          error: error instanceof Error ? error.message : 'Open-tab preview failed.',
+        };
+      }
+    };
+    return (await buildPreviewResponse()) as unknown as RuntimeResponse;
+  }
+
+  if (request.type === messageTypes.pageContentIndexOpenTabs) {
+    const buildBulkResponse = async (): Promise<PageContentBulkOperationResponse> => {
+      try {
+        const settings = await readSettings();
+        if (settings.companion.bridgeKey.trim().length === 0) {
+          return {
+            ok: false,
+            indexedCount: 0,
+            skippedCount: 0,
+            coverages: [],
+            failures: [],
+            error: 'Companion not configured.',
+          };
+        }
+        return await indexOpenPageContentTabs();
+      } catch (error) {
+        return {
+          ok: false,
+          indexedCount: 0,
+          skippedCount: 0,
+          coverages: [],
+          failures: [],
+          error: error instanceof Error ? error.message : 'Open-tab indexing failed.',
+        };
+      }
+    };
+    return (await buildBulkResponse()) as unknown as RuntimeResponse;
+  }
+
+  if (request.type === messageTypes.pageContentCoverage) {
+    const buildCoverageResponse = async (): Promise<PageContentOperationResponse> => {
+      try {
+        const settings = await readSettings();
+        if (settings.companion.bridgeKey.trim().length === 0) {
+          return { ok: false, error: 'Companion not configured.' };
+        }
+        const coverage = await createPageContentClient(settings.companion).coverage(
+          request.canonicalUrl,
+        );
+        return { ok: true, coverage };
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : 'Coverage lookup failed.',
+        };
+      }
+    };
+    return (await buildCoverageResponse()) as unknown as RuntimeResponse;
+  }
+
+  if (request.type === messageTypes.pageContentDelete) {
+    const buildDeleteResponse = async (): Promise<PageContentOperationResponse> => {
+      try {
+        const settings = await readSettings();
+        if (settings.companion.bridgeKey.trim().length === 0) {
+          return { ok: false, error: 'Companion not configured.' };
+        }
+        const coverage = await createPageContentClient(settings.companion).delete(
+          request.canonicalUrl,
+        );
+        return { ok: true, coverage };
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : 'Page-content delete failed.',
+        };
+      }
+    };
+    return (await buildDeleteResponse()) as unknown as RuntimeResponse;
+  }
+
+  if (request.type === messageTypes.contentQuery) {
+    const buildContentQueryResponse = async (): Promise<ContentQueryResponse> => {
+      try {
+        const settings = await readSettings();
+        if (settings.companion.bridgeKey.trim().length === 0) {
+          return { ok: false, items: [], error: 'Companion not configured.' };
+        }
+        const items = await createPageContentClient(settings.companion).query({
+          q: request.q,
+          ...(request.limit === undefined ? {} : { limit: request.limit }),
+          ...(request.sourceKind === undefined ? {} : { sourceKind: request.sourceKind }),
+        });
+        return { ok: true, items };
+      } catch (error) {
+        return {
+          ok: false,
+          items: [],
+          error: error instanceof Error ? error.message : 'Content query failed.',
+        };
+      }
+    };
+    return (await buildContentQueryResponse()) as unknown as RuntimeResponse;
+  }
+
   if (request.type === messageTypes.annotateTurn) {
     // Side-panel-driven turn annotation. We identify the chat tab by
     // canonical URL match — provider SPAs add ?session=… and other
@@ -3164,9 +3446,7 @@ export default defineBackground(() => {
   const EDGE_EVENT_DRAIN_DEFAULT_MAX_BATCHES = 1;
   const EDGE_EVENT_DRAIN_BULK_MAX_BATCHES = 50;
 
-  const mergeCounts = (
-    ...counts: readonly Record<string, number>[]
-  ): Record<string, number> => {
+  const mergeCounts = (...counts: readonly Record<string, number>[]): Record<string, number> => {
     const merged: Record<string, number> = {};
     for (const count of counts) {
       for (const [key, value] of Object.entries(count)) {
@@ -3279,10 +3559,7 @@ export default defineBackground(() => {
       remaining: await engagementEventBuffer.count(),
       skipped: skipped.length + locallyRejectedBatch.length,
       uploadedByType: summary.uploadedByType,
-      evictedByType: mergeCounts(
-        localEvictedByType,
-        summary.evictedByType,
-      ),
+      evictedByType: mergeCounts(localEvictedByType, summary.evictedByType),
       skippedByReason: mergeCounts(localSkippedByReason, summary.skippedByReason),
     };
   };
@@ -3706,578 +3983,579 @@ export default defineBackground(() => {
     sender: chrome.runtime.MessageSender,
     sendResponse: (response: RuntimeResponse) => void,
   ): boolean | undefined => {
-      // Build-verification ping from any extension page (side panel,
-      // any extension HTML). Returns the build sha + dirty flag + builtAt
-      // so operators can confirm which bundle is loaded.
-      // NOTE: invoking this from the SW DevTools console returns
-      // `undefined` — Chrome routes chrome.runtime.sendMessage to all
-      // extension contexts EXCEPT the sender, so the SW never receives
-      // its own messages. Use the side panel's DevTools instead, or read
-      // the footer banner.
-      if (
-        message !== null &&
-        typeof message === 'object' &&
-        (message as { type?: unknown }).type === 'sidetrack.dev.ping'
-      ) {
-        sendResponse({
-          ok: true,
-          build: __BUILD_INFO__,
-          listenerReached: true,
-        } as unknown as RuntimeResponse);
-        return true;
-      }
-      if (isVisualFingerprintObservedMessage(message)) {
-        void handleVisualFingerprintObserved(message)
-          .then(() => {
-            sendResponse({ ok: true } as unknown as RuntimeResponse);
-          })
-          .catch((error: unknown) => {
-            sendResponse({
-              ok: false,
-              error: error instanceof Error ? error.message : 'visual fingerprint failed',
-            } as unknown as RuntimeResponse);
-          });
-        return true;
-      }
-
-      if (isSelectionLineageMessage(message)) {
-        void handleSelectionLineage(message)
-          .then(() => {
-            sendResponse({ ok: true } as unknown as RuntimeResponse);
-          })
-          .catch((error: unknown) => {
-            sendResponse({
-              ok: false,
-              error: error instanceof Error ? error.message : 'selection lineage failed',
-            } as unknown as RuntimeResponse);
-          });
-        return true;
-      }
-
-      if (isEngagementIntervalMessage(message)) {
-        void handleEngagementInterval(message, sender.tab?.id)
-          .then(() => {
-            sendResponse({ ok: true } as unknown as RuntimeResponse);
-          })
-          .catch((error: unknown) => {
-            sendResponse({
-              ok: false,
-              error: error instanceof Error ? error.message : 'engagement interval failed',
-            } as unknown as RuntimeResponse);
-          });
-        return true;
-      }
-
-      if (
-        message !== null &&
-        typeof message === 'object' &&
-        (message as { type?: unknown }).type === 'sidetrack.privacy.gateChanged'
-      ) {
-        invalidateTimelineGateCache();
-        void syncPrivacyGatedContentScriptRegistrations()
-          .then(() => {
-            sendResponse({ ok: true } as unknown as RuntimeResponse);
-          })
-          .catch((error: unknown) => {
-            sendResponse({
-              ok: false,
-              error:
-                error instanceof Error
-                  ? error.message
-                  : 'privacy-gated registration refresh failed',
-            } as unknown as RuntimeResponse);
-          });
-        return true;
-      }
-
-      if (
-        message !== null &&
-        typeof message === 'object' &&
-        (message as { type?: unknown }).type === VISUAL_FINGERPRINT_PRIVACY_GET
-      ) {
-        void isVisualFingerprintPrivacyGateOpen()
-          .then((enabled) => {
-            sendResponse({ ok: true, enabled } as unknown as RuntimeResponse);
-          })
-          .catch((error: unknown) => {
-            sendResponse({
-              ok: false,
-              error: error instanceof Error ? error.message : 'visual privacy gate read failed',
-            } as unknown as RuntimeResponse);
-          });
-        return true;
-      }
-
-      if (
-        message !== null &&
-        typeof message === 'object' &&
-        (message as { type?: unknown }).type === 'sidetrack.timeline.privacy.get'
-      ) {
-        void isTimelinePrivacyGateOpen()
-          .then((enabled) => {
-            sendResponse({ ok: true, enabled } as unknown as RuntimeResponse);
-          })
-          .catch((error: unknown) => {
-            sendResponse({
-              ok: false,
-              error: error instanceof Error ? error.message : 'privacy gate read failed',
-            } as unknown as RuntimeResponse);
-          });
-        return true;
-      }
-
-      if (
-        message !== null &&
-        typeof message === 'object' &&
-        (message as { type?: unknown }).type === 'sidetrack.timeline.privacy.set'
-      ) {
-        const enabled = (message as { enabled?: unknown }).enabled === true;
-        void (async () => {
-          await setTimelinePrivacyGate(enabled);
-          invalidateTimelineGateCache();
-          resetTimelineWiringForTests();
-          await initializeTimelineWiring({
-            readCompanion: readTimelineCompanionConfig,
-            readTimelineGateState: isTimelinePrivacyGateOpen,
-          });
-        })()
-          .then(() => {
-            sendResponse({ ok: true, enabled } as unknown as RuntimeResponse);
-          })
-          .catch((error: unknown) => {
-            sendResponse({
-              ok: false,
-              error: error instanceof Error ? error.message : 'privacy gate write failed',
-            } as unknown as RuntimeResponse);
-          });
-        return true;
-      }
-
-      if (
-        message !== null &&
-        typeof message === 'object' &&
-        (message as { type?: unknown }).type === 'sidetrack.timeline.permission.granted'
-      ) {
-        // Stage 5 follow-up — record the grant event AND re-sync the
-        // privacy-gated content scripts. Pre-fix, the grant flowed
-        // into the vault but `syncPrivacyGatedContentScriptRegistrations`
-        // never ran, so the engagement content script stayed
-        // unregistered (its second gate, `hasEngagementHostPermission`,
-        // had just flipped to true but nothing rechecked it). Engagement
-        // events only flowed after a full SW restart.
-        void recordTimelinePermissionGranted()
-          .then(() => syncPrivacyGatedContentScriptRegistrations())
-          .then(() => {
-            sendResponse({ ok: true } as unknown as RuntimeResponse);
-          })
-          .catch((error: unknown) => {
-            sendResponse({
-              ok: false,
-              error: error instanceof Error ? error.message : 'permission grant event failed',
-            } as unknown as RuntimeResponse);
-          });
-        return true;
-      }
-
-      if (
-        message !== null &&
-        typeof message === 'object' &&
-        (message as { type?: unknown }).type === 'sidetrack.timeline.permission.revoked'
-      ) {
-        // Same as above — revoke flow must unregister the now-gated-out
-        // scripts so they stop injecting on subsequent navigations.
-        void recordTimelinePermissionRevoked()
-          .then(() => syncPrivacyGatedContentScriptRegistrations())
-          .then(() => {
-            sendResponse({ ok: true } as unknown as RuntimeResponse);
-          })
-          .catch((error: unknown) => {
-            sendResponse({
-              ok: false,
-              error: error instanceof Error ? error.message : 'permission revoke event failed',
-            } as unknown as RuntimeResponse);
-          });
-        return true;
-      }
-
-      // Re-init timeline wiring. After a legacy sidetrack.timeline.enabled
-      // seed or a privacy.gate.flipped write, this resets the init guard
-      // and re-runs initializeTimelineWiring so chrome.tabs listeners
-      // register without a SW reload.
-      if (
-        message !== null &&
-        typeof message === 'object' &&
-        (message as { type?: unknown }).type === 'sidetrack.timeline.reinit'
-      ) {
-        // Optional: callers (the replay-from-pack driver, the test's
-        // seedTimelineRuntime helper) may pass an `activeWorkstreamId`
-        // to atomically seed it from the SW context. The previous
-        // pattern of writing chrome.storage.local from the panel
-        // context (panel.evaluate) and then sending reinit was racy:
-        // refreshActiveWorkstreamCache (called from init below) could
-        // read chrome.storage BEFORE the panel→SW propagation
-        // completed, leaving the cache null until the next message.
-        // Writing from the SW context here resolves before init runs,
-        // so the refresh inside init sees the just-written value.
-        const explicitWorkstreamRaw = (message as { activeWorkstreamId?: unknown })
-          .activeWorkstreamId;
-        const explicitWorkstreamId =
-          typeof explicitWorkstreamRaw === 'string'
-            ? explicitWorkstreamRaw
-            : explicitWorkstreamRaw === null
-              ? null
-              : undefined;
-        void (async () => {
-          await bootstrapTimelinePrivacyGate().catch(() => undefined);
-          invalidateTimelineGateCache();
-          if (explicitWorkstreamId !== undefined) {
-            // Strings of length 0 are normalised to "remove the key"
-            // so the cache returns to the unfocused state.
-            if (typeof explicitWorkstreamId === 'string' && explicitWorkstreamId.length > 0) {
-              await chrome.storage.local.set({
-                [ACTIVE_WORKSTREAM_KEY]: explicitWorkstreamId,
-              });
-            } else {
-              await chrome.storage.local.remove(ACTIVE_WORKSTREAM_KEY);
-            }
-          }
-          resetTimelineWiringForTests();
-          await initializeTimelineWiring({
-            readCompanion: readTimelineCompanionConfig,
-            readTimelineGateState: isTimelinePrivacyGateOpen,
-          });
-        })()
-          .then(() => {
-            sendResponse({ ok: true } as unknown as RuntimeResponse);
-          })
-          .catch((error: unknown) => {
-            sendResponse({
-              ok: false,
-              error: error instanceof Error ? error.message : 'reinit failed',
-            } as unknown as RuntimeResponse);
-          });
-        return true;
-      }
-      if (
-        message !== null &&
-        typeof message === 'object' &&
-        (message as { type?: unknown }).type === 'sidetrack.timeline.diagnostics'
-      ) {
-        void (async () => {
-          if (!(await isTimelineReplayDebugEnabled())) {
-            return { ok: false, error: 'timeline replay diagnostics disabled' };
-          }
-          const diagnostics = await readTimelineReplayDiagnostics();
-          return { ok: true, diagnostics };
-        })()
-          .then((response) => {
-            sendResponse(response as unknown as RuntimeResponse);
-          })
-          .catch((error: unknown) => {
-            sendResponse({
-              ok: false,
-              error: error instanceof Error ? error.message : 'timeline diagnostics failed',
-            } as unknown as RuntimeResponse);
-          });
-        return true;
-      }
-      // Always-available diagnostic for the title-push pipeline.
-      //
-      // Stealth Chromium suspends the SW aggressively; the async
-      // sendMessage response sometimes drops with
-      //   "The message port closed before a response was received".
-      // Workaround: also stash the result in chrome.storage.session
-      // under 'sidetrack.dev.diag' so the caller can read it back even
-      // if the response message channel died.
-      //
-      // From any extension DevTools console:
-      //   chrome.runtime.sendMessage({type:'sidetrack.dev.diag'});
-      //   // ... then a moment later:
-      //   chrome.storage.session.get('sidetrack.dev.diag').then(console.log);
-      if (
-        message !== null &&
-        typeof message === 'object' &&
-        (message as { type?: unknown }).type === 'sidetrack.dev.diag'
-      ) {
-        void readTimelineReplayDiagnostics()
-          .then(async (diagnostics) => {
-            // Fold the engagement journal into the diag response so the
-            // recorder's existing periodic SW-diag dump captures it
-            // automatically — no separate plumbing needed.
-            const fullDiagnostics = {
-              ...diagnostics,
-              engagement: {
-                journal: [...engagementSyncJournal],
-                journalLength: engagementSyncJournal.length,
-              },
-            };
-            try {
-              await chrome.storage.session.set({
-                'sidetrack.dev.diag': {
-                  capturedAt: new Date().toISOString(),
-                  diagnostics: fullDiagnostics,
-                },
-              });
-            } catch {
-              // session storage may not be available in some test harnesses
-            }
-            sendResponse({
-              ok: true,
-              diagnostics: fullDiagnostics,
-            } as unknown as RuntimeResponse);
-          })
-          .catch((error: unknown) => {
-            sendResponse({
-              ok: false,
-              error: error instanceof Error ? error.message : 'diag failed',
-            } as unknown as RuntimeResponse);
-          });
-        return true;
-      }
-      // Content-script title push (entrypoints/title-watcher.content.ts).
-      // Bypasses tab.title's stealth-Chromium blind spots by reading
-      // document.title directly from the page DOM. Fire-and-forget;
-      // no response needed.
-      if (
-        message !== null &&
-        typeof message === 'object' &&
-        (message as { type?: unknown }).type === 'sidetrack.timeline.titleObserved'
-      ) {
-        const payload = message as { url?: unknown; title?: unknown };
-        const senderTab = sender.tab;
-        console.log(
-          '[sidetrack:title-handler] received',
-          typeof payload.title === 'string' ? payload.title : '<no-title>',
-          'tabId:',
-          senderTab?.id,
-          'url:',
-          typeof payload.url === 'string' ? payload.url : '<no-url>',
-        );
-        if (
-          typeof payload.url === 'string' &&
-          payload.url.length > 0 &&
-          typeof payload.title === 'string' &&
-          payload.title.length > 0 &&
-          senderTab !== undefined &&
-          typeof senderTab.id === 'number' &&
-          typeof senderTab.windowId === 'number'
-        ) {
-          void recordTitleFromContent({
-            tabId: senderTab.id,
-            windowId: senderTab.windowId,
-            url: payload.url,
-            title: payload.title,
-          })
-            .then(() => {
-              console.log('[sidetrack:title-handler] recorded', payload.title);
-            })
-            .catch((err: unknown) => {
-              console.warn('[sidetrack:title-handler] record failed', err);
-            });
-        } else {
-          console.warn(
-            '[sidetrack:title-handler] rejected payload — missing/invalid fields',
-            { hasUrl: typeof payload.url === 'string', hasTitle: typeof payload.title === 'string', hasTab: senderTab !== undefined },
-          );
-        }
-        sendResponse({ ok: true } as unknown as RuntimeResponse);
-        return true;
-      }
-      // Force-drain the timeline spool. Used by e2e tests + the
-      // side-panel "drain now" affordance. No-op when timeline wiring
-      // hasn't initialized (gate off or pre-boot).
-      if (
-        message !== null &&
-        typeof message === 'object' &&
-        (message as { type?: unknown }).type === 'sidetrack.timeline.force-drain'
-      ) {
-        void triggerTimelineDrain()
-          .then((result) => {
-            sendResponse({ ok: true, drain: result } as unknown as RuntimeResponse);
-          })
-          .catch((error: unknown) => {
-            sendResponse({
-              ok: false,
-              error: error instanceof Error ? error.message : 'force-drain failed',
-            } as unknown as RuntimeResponse);
-          });
-        return true;
-      }
-      // Synchronously refresh the active-workstream cache from
-      // chrome.storage.local. Used by the replay-from-pack driver
-      // after each workstreamSwitch event so the next navigation's
-      // emit reads a fresh workstream id rather than the stale
-      // value the chrome.storage.onChanged listener hasn't yet
-      // propagated. Returns the resolved id (or null when no
-      // workstream is focused) so callers can sanity-check.
-      if (
-        message !== null &&
-        typeof message === 'object' &&
-        (message as { type?: unknown }).type === 'sidetrack.timeline.refresh-workstream-cache'
-      ) {
-        void refreshActiveWorkstreamFromStorage()
-          .then((workstreamId) => {
-            sendResponse({
-              ok: true,
-              workstreamId: workstreamId ?? null,
-            } as unknown as RuntimeResponse);
-          })
-          .catch((error: unknown) => {
-            sendResponse({
-              ok: false,
-              error: error instanceof Error ? error.message : 'workstream-cache refresh failed',
-            } as unknown as RuntimeResponse);
-          });
-        return true;
-      }
-      // Set the active workstream — atomic version of seedStorage +
-      // refresh-workstream-cache. Updates the SW's in-memory cache
-      // first (sync), then writes chrome.storage.local. The cache
-      // update is what observer.observe reads on the emit hot path;
-      // doing it sync first guarantees that any chrome.tabs event
-      // arriving after this message-response sees the new workstream
-      // even if the storage write hasn't yet propagated to other
-      // consumers. The SAS race the previous refresh-workstream-cache
-      // path narrowed (storage write + cache read both async) is
-      // closed here because the cache is no longer derived from a
-      // separate storage read.
-      if (
-        message !== null &&
-        typeof message === 'object' &&
-        (message as { type?: unknown }).type === 'sidetrack.timeline.set-active-workstream'
-      ) {
-        const value = (message as { workstreamId?: unknown }).workstreamId;
-        const next = typeof value === 'string' && value.length > 0 ? value : null;
-        void (async () => {
-          setActiveWorkstreamCache(next);
-          try {
-            if (next === null) {
-              await chrome.storage.local.remove(ACTIVE_WORKSTREAM_KEY);
-            } else {
-              await chrome.storage.local.set({ [ACTIVE_WORKSTREAM_KEY]: next });
-            }
-            sendResponse({ ok: true, workstreamId: next } as unknown as RuntimeResponse);
-          } catch (error: unknown) {
-            sendResponse({
-              ok: false,
-              error:
-                error instanceof Error
-                  ? error.message
-                  : 'set-active-workstream storage write failed',
-            } as unknown as RuntimeResponse);
-          }
-        })();
-        return true;
-      }
-      if (
-        message !== null &&
-        typeof message === 'object' &&
-        (message as { type?: unknown }).type === 'sidetrack.tabgroups.test.pull-in-out'
-      ) {
-        const raw = message as {
-          seedUrl?: unknown;
-          targetUrl?: unknown;
-          workstreamId?: unknown;
-        };
-        void (async () => {
-          if (runtimeTabGroupWiring === null || chrome.tabGroups === undefined) {
-            throw new Error('tab-group wiring is unavailable');
-          }
-          const seedUrl = typeof raw.seedUrl === 'string' ? raw.seedUrl : '';
-          const targetUrl = typeof raw.targetUrl === 'string' ? raw.targetUrl : '';
-          const workstreamId = typeof raw.workstreamId === 'string' ? raw.workstreamId : '';
-          if (seedUrl.length === 0 || targetUrl.length === 0 || workstreamId.length === 0) {
-            throw new Error('seedUrl, targetUrl, and workstreamId are required');
-          }
-          const normalize = (input: string): string =>
-            canonicalThreadUrl(input).replace(/#.*$/u, '').replace(/\/+$/u, '');
-          const tabs = await chrome.tabs.query({});
-          const seedTab = tabs.find((tab) => typeof tab.url === 'string' && normalize(tab.url) === normalize(seedUrl));
-          const targetTab = tabs.find((tab) => typeof tab.url === 'string' && normalize(tab.url) === normalize(targetUrl));
-          if (typeof seedTab?.id !== 'number' || typeof targetTab?.id !== 'number') {
-            throw new Error('could not find seed and target tabs for tab-group replay');
-          }
-          const groupId = await chrome.tabs.group({ tabIds: seedTab.id });
-          await chrome.tabGroups.update(groupId, {
-            title: 'Sidetrack T1',
-            color: 'blue',
-          });
-          await delay(100);
-          await runtimeTabGroupWiring.linkGroupToWorkstream(groupId, workstreamId);
-          await chrome.tabs.group({ groupId, tabIds: targetTab.id });
-          await delay(100);
-          await chrome.tabs.ungroup(targetTab.id);
-          sendResponse({ ok: true, groupId } as unknown as RuntimeResponse);
-        })().catch((error: unknown) => {
+    // Build-verification ping from any extension page (side panel,
+    // any extension HTML). Returns the build sha + dirty flag + builtAt
+    // so operators can confirm which bundle is loaded.
+    // NOTE: invoking this from the SW DevTools console returns
+    // `undefined` — Chrome routes chrome.runtime.sendMessage to all
+    // extension contexts EXCEPT the sender, so the SW never receives
+    // its own messages. Use the side panel's DevTools instead, or read
+    // the footer banner.
+    if (
+      message !== null &&
+      typeof message === 'object' &&
+      (message as { type?: unknown }).type === 'sidetrack.dev.ping'
+    ) {
+      sendResponse({
+        ok: true,
+        build: __BUILD_INFO__,
+        listenerReached: true,
+      } as unknown as RuntimeResponse);
+      return true;
+    }
+    if (isVisualFingerprintObservedMessage(message)) {
+      void handleVisualFingerprintObserved(message)
+        .then(() => {
+          sendResponse({ ok: true } as unknown as RuntimeResponse);
+        })
+        .catch((error: unknown) => {
           sendResponse({
             ok: false,
-            error: error instanceof Error ? error.message : 'tab-group test hook failed',
+            error: error instanceof Error ? error.message : 'visual fingerprint failed',
           } as unknown as RuntimeResponse);
         });
-        return true;
-      }
-      if (
-        message !== null &&
-        typeof message === 'object' &&
-        (message as { type?: unknown }).type === 'sidetrack.edge-events.force-drain'
-      ) {
-        void drainBufferedEdgeEvents()
-          .then((result) => {
-            sendResponse({ ok: true, drain: result } as unknown as RuntimeResponse);
-          })
-          .catch((error: unknown) => {
-            sendResponse({
-              ok: false,
-              error: error instanceof Error ? error.message : 'edge-event drain failed',
-            } as unknown as RuntimeResponse);
-          });
-        return true;
-      }
-      // Try the connections handler first — it has its own response shape.
-      if (
-        message !== null &&
-        typeof message === 'object' &&
-        'type' in message &&
-        ((message as { type?: unknown }).type === messageTypes.loadConnectionsSnapshot ||
-          (message as { type?: unknown }).type === messageTypes.loadConnectionsNeighbors ||
-          (message as { type?: unknown }).type === messageTypes.loadConnectionsEdge ||
-          (message as { type?: unknown }).type === messageTypes.loadConnectionsPath ||
-          (message as { type?: unknown }).type === messageTypes.postConnectionsFeedbackEvent)
-      ) {
-        void handleConnectionsMessage(message as Record<string, unknown>)
-          .then((result) => {
-            // Cast: the connections response shape is intentionally
-            // different from RuntimeResponse; the side-panel client
-            // re-casts on receipt.
-            sendResponse(result as unknown as RuntimeResponse);
-          })
-          .catch((error: unknown) => {
-            sendResponse({
-              ok: false,
-              error: error instanceof Error ? error.message : 'Connections request failed.',
-            } as unknown as RuntimeResponse);
-          });
-        return true;
-      }
+      return true;
+    }
 
-      if (!isRuntimeRequest(message)) {
-        return undefined;
-      }
-
-      void handleRequest(message, sender.tab?.id)
-        .then(sendResponse)
-        .catch(async (error: unknown) => {
+    if (isSelectionLineageMessage(message)) {
+      void handleSelectionLineage(message)
+        .then(() => {
+          sendResponse({ ok: true } as unknown as RuntimeResponse);
+        })
+        .catch((error: unknown) => {
           sendResponse({
             ok: false,
-            error: error instanceof Error ? error.message : 'Sidetrack request failed.',
-            state: await buildState(
-              'disconnected',
-              error instanceof Error ? error.message : 'Request failed.',
-            ),
-          });
+            error: error instanceof Error ? error.message : 'selection lineage failed',
+          } as unknown as RuntimeResponse);
         });
       return true;
-    };
+    }
+
+    if (isEngagementIntervalMessage(message)) {
+      void handleEngagementInterval(message, sender.tab?.id)
+        .then(() => {
+          sendResponse({ ok: true } as unknown as RuntimeResponse);
+        })
+        .catch((error: unknown) => {
+          sendResponse({
+            ok: false,
+            error: error instanceof Error ? error.message : 'engagement interval failed',
+          } as unknown as RuntimeResponse);
+        });
+      return true;
+    }
+
+    if (
+      message !== null &&
+      typeof message === 'object' &&
+      (message as { type?: unknown }).type === 'sidetrack.privacy.gateChanged'
+    ) {
+      invalidateTimelineGateCache();
+      void syncPrivacyGatedContentScriptRegistrations()
+        .then(() => {
+          sendResponse({ ok: true } as unknown as RuntimeResponse);
+        })
+        .catch((error: unknown) => {
+          sendResponse({
+            ok: false,
+            error:
+              error instanceof Error ? error.message : 'privacy-gated registration refresh failed',
+          } as unknown as RuntimeResponse);
+        });
+      return true;
+    }
+
+    if (
+      message !== null &&
+      typeof message === 'object' &&
+      (message as { type?: unknown }).type === VISUAL_FINGERPRINT_PRIVACY_GET
+    ) {
+      void isVisualFingerprintPrivacyGateOpen()
+        .then((enabled) => {
+          sendResponse({ ok: true, enabled } as unknown as RuntimeResponse);
+        })
+        .catch((error: unknown) => {
+          sendResponse({
+            ok: false,
+            error: error instanceof Error ? error.message : 'visual privacy gate read failed',
+          } as unknown as RuntimeResponse);
+        });
+      return true;
+    }
+
+    if (
+      message !== null &&
+      typeof message === 'object' &&
+      (message as { type?: unknown }).type === 'sidetrack.timeline.privacy.get'
+    ) {
+      void isTimelinePrivacyGateOpen()
+        .then((enabled) => {
+          sendResponse({ ok: true, enabled } as unknown as RuntimeResponse);
+        })
+        .catch((error: unknown) => {
+          sendResponse({
+            ok: false,
+            error: error instanceof Error ? error.message : 'privacy gate read failed',
+          } as unknown as RuntimeResponse);
+        });
+      return true;
+    }
+
+    if (
+      message !== null &&
+      typeof message === 'object' &&
+      (message as { type?: unknown }).type === 'sidetrack.timeline.privacy.set'
+    ) {
+      const enabled = (message as { enabled?: unknown }).enabled === true;
+      void (async () => {
+        await setTimelinePrivacyGate(enabled);
+        invalidateTimelineGateCache();
+        resetTimelineWiringForTests();
+        await initializeTimelineWiring({
+          readCompanion: readTimelineCompanionConfig,
+          readTimelineGateState: isTimelinePrivacyGateOpen,
+        });
+      })()
+        .then(() => {
+          sendResponse({ ok: true, enabled } as unknown as RuntimeResponse);
+        })
+        .catch((error: unknown) => {
+          sendResponse({
+            ok: false,
+            error: error instanceof Error ? error.message : 'privacy gate write failed',
+          } as unknown as RuntimeResponse);
+        });
+      return true;
+    }
+
+    if (
+      message !== null &&
+      typeof message === 'object' &&
+      (message as { type?: unknown }).type === 'sidetrack.timeline.permission.granted'
+    ) {
+      // Stage 5 follow-up — record the grant event AND re-sync the
+      // privacy-gated content scripts. Pre-fix, the grant flowed
+      // into the vault but `syncPrivacyGatedContentScriptRegistrations`
+      // never ran, so the engagement content script stayed
+      // unregistered (its second gate, `hasEngagementHostPermission`,
+      // had just flipped to true but nothing rechecked it). Engagement
+      // events only flowed after a full SW restart.
+      void recordTimelinePermissionGranted()
+        .then(() => syncPrivacyGatedContentScriptRegistrations())
+        .then(() => {
+          sendResponse({ ok: true } as unknown as RuntimeResponse);
+        })
+        .catch((error: unknown) => {
+          sendResponse({
+            ok: false,
+            error: error instanceof Error ? error.message : 'permission grant event failed',
+          } as unknown as RuntimeResponse);
+        });
+      return true;
+    }
+
+    if (
+      message !== null &&
+      typeof message === 'object' &&
+      (message as { type?: unknown }).type === 'sidetrack.timeline.permission.revoked'
+    ) {
+      // Same as above — revoke flow must unregister the now-gated-out
+      // scripts so they stop injecting on subsequent navigations.
+      void recordTimelinePermissionRevoked()
+        .then(() => syncPrivacyGatedContentScriptRegistrations())
+        .then(() => {
+          sendResponse({ ok: true } as unknown as RuntimeResponse);
+        })
+        .catch((error: unknown) => {
+          sendResponse({
+            ok: false,
+            error: error instanceof Error ? error.message : 'permission revoke event failed',
+          } as unknown as RuntimeResponse);
+        });
+      return true;
+    }
+
+    // Re-init timeline wiring. After a legacy sidetrack.timeline.enabled
+    // seed or a privacy.gate.flipped write, this resets the init guard
+    // and re-runs initializeTimelineWiring so chrome.tabs listeners
+    // register without a SW reload.
+    if (
+      message !== null &&
+      typeof message === 'object' &&
+      (message as { type?: unknown }).type === 'sidetrack.timeline.reinit'
+    ) {
+      // Optional: callers (the replay-from-pack driver, the test's
+      // seedTimelineRuntime helper) may pass an `activeWorkstreamId`
+      // to atomically seed it from the SW context. The previous
+      // pattern of writing chrome.storage.local from the panel
+      // context (panel.evaluate) and then sending reinit was racy:
+      // refreshActiveWorkstreamCache (called from init below) could
+      // read chrome.storage BEFORE the panel→SW propagation
+      // completed, leaving the cache null until the next message.
+      // Writing from the SW context here resolves before init runs,
+      // so the refresh inside init sees the just-written value.
+      const explicitWorkstreamRaw = (message as { activeWorkstreamId?: unknown })
+        .activeWorkstreamId;
+      const explicitWorkstreamId =
+        typeof explicitWorkstreamRaw === 'string'
+          ? explicitWorkstreamRaw
+          : explicitWorkstreamRaw === null
+            ? null
+            : undefined;
+      void (async () => {
+        await bootstrapTimelinePrivacyGate().catch(() => undefined);
+        invalidateTimelineGateCache();
+        if (explicitWorkstreamId !== undefined) {
+          // Strings of length 0 are normalised to "remove the key"
+          // so the cache returns to the unfocused state.
+          if (typeof explicitWorkstreamId === 'string' && explicitWorkstreamId.length > 0) {
+            await chrome.storage.local.set({
+              [ACTIVE_WORKSTREAM_KEY]: explicitWorkstreamId,
+            });
+          } else {
+            await chrome.storage.local.remove(ACTIVE_WORKSTREAM_KEY);
+          }
+        }
+        resetTimelineWiringForTests();
+        await initializeTimelineWiring({
+          readCompanion: readTimelineCompanionConfig,
+          readTimelineGateState: isTimelinePrivacyGateOpen,
+        });
+      })()
+        .then(() => {
+          sendResponse({ ok: true } as unknown as RuntimeResponse);
+        })
+        .catch((error: unknown) => {
+          sendResponse({
+            ok: false,
+            error: error instanceof Error ? error.message : 'reinit failed',
+          } as unknown as RuntimeResponse);
+        });
+      return true;
+    }
+    if (
+      message !== null &&
+      typeof message === 'object' &&
+      (message as { type?: unknown }).type === 'sidetrack.timeline.diagnostics'
+    ) {
+      void (async () => {
+        if (!(await isTimelineReplayDebugEnabled())) {
+          return { ok: false, error: 'timeline replay diagnostics disabled' };
+        }
+        const diagnostics = await readTimelineReplayDiagnostics();
+        return { ok: true, diagnostics };
+      })()
+        .then((response) => {
+          sendResponse(response as unknown as RuntimeResponse);
+        })
+        .catch((error: unknown) => {
+          sendResponse({
+            ok: false,
+            error: error instanceof Error ? error.message : 'timeline diagnostics failed',
+          } as unknown as RuntimeResponse);
+        });
+      return true;
+    }
+    // Always-available diagnostic for the title-push pipeline.
+    //
+    // Stealth Chromium suspends the SW aggressively; the async
+    // sendMessage response sometimes drops with
+    //   "The message port closed before a response was received".
+    // Workaround: also stash the result in chrome.storage.session
+    // under 'sidetrack.dev.diag' so the caller can read it back even
+    // if the response message channel died.
+    //
+    // From any extension DevTools console:
+    //   chrome.runtime.sendMessage({type:'sidetrack.dev.diag'});
+    //   // ... then a moment later:
+    //   chrome.storage.session.get('sidetrack.dev.diag').then(console.log);
+    if (
+      message !== null &&
+      typeof message === 'object' &&
+      (message as { type?: unknown }).type === 'sidetrack.dev.diag'
+    ) {
+      void readTimelineReplayDiagnostics()
+        .then(async (diagnostics) => {
+          // Fold the engagement journal into the diag response so the
+          // recorder's existing periodic SW-diag dump captures it
+          // automatically — no separate plumbing needed.
+          const fullDiagnostics = {
+            ...diagnostics,
+            engagement: {
+              journal: [...engagementSyncJournal],
+              journalLength: engagementSyncJournal.length,
+            },
+          };
+          try {
+            await chrome.storage.session.set({
+              'sidetrack.dev.diag': {
+                capturedAt: new Date().toISOString(),
+                diagnostics: fullDiagnostics,
+              },
+            });
+          } catch {
+            // session storage may not be available in some test harnesses
+          }
+          sendResponse({
+            ok: true,
+            diagnostics: fullDiagnostics,
+          } as unknown as RuntimeResponse);
+        })
+        .catch((error: unknown) => {
+          sendResponse({
+            ok: false,
+            error: error instanceof Error ? error.message : 'diag failed',
+          } as unknown as RuntimeResponse);
+        });
+      return true;
+    }
+    // Content-script title push (entrypoints/title-watcher.content.ts).
+    // Bypasses tab.title's stealth-Chromium blind spots by reading
+    // document.title directly from the page DOM. Fire-and-forget;
+    // no response needed.
+    if (
+      message !== null &&
+      typeof message === 'object' &&
+      (message as { type?: unknown }).type === 'sidetrack.timeline.titleObserved'
+    ) {
+      const payload = message as { url?: unknown; title?: unknown };
+      const senderTab = sender.tab;
+      console.log(
+        '[sidetrack:title-handler] received',
+        typeof payload.title === 'string' ? payload.title : '<no-title>',
+        'tabId:',
+        senderTab?.id,
+        'url:',
+        typeof payload.url === 'string' ? payload.url : '<no-url>',
+      );
+      if (
+        typeof payload.url === 'string' &&
+        payload.url.length > 0 &&
+        typeof payload.title === 'string' &&
+        payload.title.length > 0 &&
+        senderTab !== undefined &&
+        typeof senderTab.id === 'number' &&
+        typeof senderTab.windowId === 'number'
+      ) {
+        void recordTitleFromContent({
+          tabId: senderTab.id,
+          windowId: senderTab.windowId,
+          url: payload.url,
+          title: payload.title,
+        })
+          .then(() => {
+            console.log('[sidetrack:title-handler] recorded', payload.title);
+          })
+          .catch((err: unknown) => {
+            console.warn('[sidetrack:title-handler] record failed', err);
+          });
+      } else {
+        console.warn('[sidetrack:title-handler] rejected payload — missing/invalid fields', {
+          hasUrl: typeof payload.url === 'string',
+          hasTitle: typeof payload.title === 'string',
+          hasTab: senderTab !== undefined,
+        });
+      }
+      sendResponse({ ok: true } as unknown as RuntimeResponse);
+      return true;
+    }
+    // Force-drain the timeline spool. Used by e2e tests + the
+    // side-panel "drain now" affordance. No-op when timeline wiring
+    // hasn't initialized (gate off or pre-boot).
+    if (
+      message !== null &&
+      typeof message === 'object' &&
+      (message as { type?: unknown }).type === 'sidetrack.timeline.force-drain'
+    ) {
+      void triggerTimelineDrain()
+        .then((result) => {
+          sendResponse({ ok: true, drain: result } as unknown as RuntimeResponse);
+        })
+        .catch((error: unknown) => {
+          sendResponse({
+            ok: false,
+            error: error instanceof Error ? error.message : 'force-drain failed',
+          } as unknown as RuntimeResponse);
+        });
+      return true;
+    }
+    // Synchronously refresh the active-workstream cache from
+    // chrome.storage.local. Used by the replay-from-pack driver
+    // after each workstreamSwitch event so the next navigation's
+    // emit reads a fresh workstream id rather than the stale
+    // value the chrome.storage.onChanged listener hasn't yet
+    // propagated. Returns the resolved id (or null when no
+    // workstream is focused) so callers can sanity-check.
+    if (
+      message !== null &&
+      typeof message === 'object' &&
+      (message as { type?: unknown }).type === 'sidetrack.timeline.refresh-workstream-cache'
+    ) {
+      void refreshActiveWorkstreamFromStorage()
+        .then((workstreamId) => {
+          sendResponse({
+            ok: true,
+            workstreamId: workstreamId ?? null,
+          } as unknown as RuntimeResponse);
+        })
+        .catch((error: unknown) => {
+          sendResponse({
+            ok: false,
+            error: error instanceof Error ? error.message : 'workstream-cache refresh failed',
+          } as unknown as RuntimeResponse);
+        });
+      return true;
+    }
+    // Set the active workstream — atomic version of seedStorage +
+    // refresh-workstream-cache. Updates the SW's in-memory cache
+    // first (sync), then writes chrome.storage.local. The cache
+    // update is what observer.observe reads on the emit hot path;
+    // doing it sync first guarantees that any chrome.tabs event
+    // arriving after this message-response sees the new workstream
+    // even if the storage write hasn't yet propagated to other
+    // consumers. The SAS race the previous refresh-workstream-cache
+    // path narrowed (storage write + cache read both async) is
+    // closed here because the cache is no longer derived from a
+    // separate storage read.
+    if (
+      message !== null &&
+      typeof message === 'object' &&
+      (message as { type?: unknown }).type === 'sidetrack.timeline.set-active-workstream'
+    ) {
+      const value = (message as { workstreamId?: unknown }).workstreamId;
+      const next = typeof value === 'string' && value.length > 0 ? value : null;
+      void (async () => {
+        setActiveWorkstreamCache(next);
+        try {
+          if (next === null) {
+            await chrome.storage.local.remove(ACTIVE_WORKSTREAM_KEY);
+          } else {
+            await chrome.storage.local.set({ [ACTIVE_WORKSTREAM_KEY]: next });
+          }
+          sendResponse({ ok: true, workstreamId: next } as unknown as RuntimeResponse);
+        } catch (error: unknown) {
+          sendResponse({
+            ok: false,
+            error:
+              error instanceof Error ? error.message : 'set-active-workstream storage write failed',
+          } as unknown as RuntimeResponse);
+        }
+      })();
+      return true;
+    }
+    if (
+      message !== null &&
+      typeof message === 'object' &&
+      (message as { type?: unknown }).type === 'sidetrack.tabgroups.test.pull-in-out'
+    ) {
+      const raw = message as {
+        seedUrl?: unknown;
+        targetUrl?: unknown;
+        workstreamId?: unknown;
+      };
+      void (async () => {
+        if (runtimeTabGroupWiring === null || chrome.tabGroups === undefined) {
+          throw new Error('tab-group wiring is unavailable');
+        }
+        const seedUrl = typeof raw.seedUrl === 'string' ? raw.seedUrl : '';
+        const targetUrl = typeof raw.targetUrl === 'string' ? raw.targetUrl : '';
+        const workstreamId = typeof raw.workstreamId === 'string' ? raw.workstreamId : '';
+        if (seedUrl.length === 0 || targetUrl.length === 0 || workstreamId.length === 0) {
+          throw new Error('seedUrl, targetUrl, and workstreamId are required');
+        }
+        const normalize = (input: string): string =>
+          canonicalThreadUrl(input).replace(/#.*$/u, '').replace(/\/+$/u, '');
+        const tabs = await chrome.tabs.query({});
+        const seedTab = tabs.find(
+          (tab) => typeof tab.url === 'string' && normalize(tab.url) === normalize(seedUrl),
+        );
+        const targetTab = tabs.find(
+          (tab) => typeof tab.url === 'string' && normalize(tab.url) === normalize(targetUrl),
+        );
+        if (typeof seedTab?.id !== 'number' || typeof targetTab?.id !== 'number') {
+          throw new Error('could not find seed and target tabs for tab-group replay');
+        }
+        const groupId = await chrome.tabs.group({ tabIds: seedTab.id });
+        await chrome.tabGroups.update(groupId, {
+          title: 'Sidetrack T1',
+          color: 'blue',
+        });
+        await delay(100);
+        await runtimeTabGroupWiring.linkGroupToWorkstream(groupId, workstreamId);
+        await chrome.tabs.group({ groupId, tabIds: targetTab.id });
+        await delay(100);
+        await chrome.tabs.ungroup(targetTab.id);
+        sendResponse({ ok: true, groupId } as unknown as RuntimeResponse);
+      })().catch((error: unknown) => {
+        sendResponse({
+          ok: false,
+          error: error instanceof Error ? error.message : 'tab-group test hook failed',
+        } as unknown as RuntimeResponse);
+      });
+      return true;
+    }
+    if (
+      message !== null &&
+      typeof message === 'object' &&
+      (message as { type?: unknown }).type === 'sidetrack.edge-events.force-drain'
+    ) {
+      void drainBufferedEdgeEvents()
+        .then((result) => {
+          sendResponse({ ok: true, drain: result } as unknown as RuntimeResponse);
+        })
+        .catch((error: unknown) => {
+          sendResponse({
+            ok: false,
+            error: error instanceof Error ? error.message : 'edge-event drain failed',
+          } as unknown as RuntimeResponse);
+        });
+      return true;
+    }
+    // Try the connections handler first — it has its own response shape.
+    if (
+      message !== null &&
+      typeof message === 'object' &&
+      'type' in message &&
+      ((message as { type?: unknown }).type === messageTypes.loadConnectionsSnapshot ||
+        (message as { type?: unknown }).type === messageTypes.loadConnectionsNeighbors ||
+        (message as { type?: unknown }).type === messageTypes.loadConnectionsEdge ||
+        (message as { type?: unknown }).type === messageTypes.loadConnectionsPath ||
+        (message as { type?: unknown }).type === messageTypes.postConnectionsFeedbackEvent)
+    ) {
+      void handleConnectionsMessage(message as Record<string, unknown>)
+        .then((result) => {
+          // Cast: the connections response shape is intentionally
+          // different from RuntimeResponse; the side-panel client
+          // re-casts on receipt.
+          sendResponse(result as unknown as RuntimeResponse);
+        })
+        .catch((error: unknown) => {
+          sendResponse({
+            ok: false,
+            error: error instanceof Error ? error.message : 'Connections request failed.',
+          } as unknown as RuntimeResponse);
+        });
+      return true;
+    }
+
+    if (!isRuntimeRequest(message)) {
+      return undefined;
+    }
+
+    void handleRequest(message, sender.tab?.id)
+      .then(sendResponse)
+      .catch(async (error: unknown) => {
+        sendResponse({
+          ok: false,
+          error: error instanceof Error ? error.message : 'Sidetrack request failed.',
+          state: await buildState(
+            'disconnected',
+            error instanceof Error ? error.message : 'Request failed.',
+          ),
+        });
+      });
+    return true;
+  };
 
   chrome.runtime.onMessage.addListener(runtimeMessageListener);
 

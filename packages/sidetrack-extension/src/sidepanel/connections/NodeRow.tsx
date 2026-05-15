@@ -36,6 +36,7 @@ export const NodeRow = ({
   edge,
   direction,
   selected,
+  highlighted,
   onPromoteSnippet,
   onUseAsAnchor,
   onClick,
@@ -46,6 +47,7 @@ export const NodeRow = ({
   readonly edge: ConnectionEdge | null;
   readonly direction: 'in' | 'out';
   readonly selected: boolean;
+  readonly highlighted?: boolean;
   readonly onPromoteSnippet?: (input: {
     readonly snippetId: string;
     readonly sourceVisitId: string;
@@ -62,7 +64,14 @@ export const NodeRow = ({
   const display = nodeKindDisplayFor(node.kind);
   const entity = formatEntityDisplay(node, ctx);
   const meta = edge !== null ? EDGE_KINDS[edge.kind] : null;
-  const cls = `cx-row ${display.tintClass} ${selected ? 'is-selected' : ''}`;
+  const cls = [
+    'cx-row',
+    display.tintClass,
+    selected ? 'is-selected' : '',
+    highlighted === true ? 'is-timeline-hovered' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
   const sourceVisitId = snippetSourceVisitId(node, edge);
   const canPromote =
     onPromoteSnippet !== undefined && node.kind === 'snippet' && sourceVisitId !== null;

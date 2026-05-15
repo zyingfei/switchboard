@@ -36,6 +36,7 @@ export interface UseFullSnapshotResult {
   readonly nodes: readonly ConnectionNode[];
   readonly edges: readonly ConnectionEdge[];
   readonly loading: boolean;
+  readonly ready: boolean;
   readonly error: string | null;
   readonly prime: () => void;
 }
@@ -98,6 +99,7 @@ export const useConnectionsFullSnapshot = (
     nodes: state.nodes,
     edges: state.edges,
     loading: state.kind === 'loading',
+    ready: state.kind === 'ready',
     error: state.kind === 'error' ? (state.error ?? null) : null,
     prime,
   };

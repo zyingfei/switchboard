@@ -13,6 +13,7 @@ export const REASON_CODES = [
   'LEXICAL_OVERLAP',
   'LINK_OUT_FROM',
   'LINK_IN_TO',
+  'PAGE_CONTENT_COVERAGE',
 ] as const;
 
 export type Reason =
@@ -52,7 +53,8 @@ export type Reason =
     }
   | { readonly code: 'LEXICAL_OVERLAP'; readonly topTokens: readonly string[] }
   | { readonly code: 'LINK_OUT_FROM'; readonly otherVisitId: string }
-  | { readonly code: 'LINK_IN_TO'; readonly otherVisitId: string };
+  | { readonly code: 'LINK_IN_TO'; readonly otherVisitId: string }
+  | { readonly code: 'PAGE_CONTENT_COVERAGE'; readonly state: string; readonly quality?: string };
 
 export type ReasonCode = Reason['code'];
 
@@ -76,6 +78,7 @@ export const reasonConfidence = (reason: Reason): ReasonConfidence => {
     case 'COSINE_ABOVE_THRESHOLD':
     case 'RANKER_SCORE':
     case 'LEXICAL_OVERLAP':
+    case 'PAGE_CONTENT_COVERAGE':
       return 'inferred';
   }
 };
