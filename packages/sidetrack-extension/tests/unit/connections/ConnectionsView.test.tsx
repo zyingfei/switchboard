@@ -1096,7 +1096,7 @@ describe('ConnectionsView — engineering scaffold', () => {
     expect(screen.queryByTestId('orbit-node-workstream:ws_x')).not.toBeNull();
   });
 
-  it('renders recent-anchor quick-pick that sets the anchor on click', async () => {
+  it('renders shortcut quick-pick (separate from history) that sets the anchor on click', async () => {
     let calls = 0;
     setConnectionsClientTransportForTests(async (msg) => {
       const m = msg as { type: string; nodeId?: string };
@@ -1135,8 +1135,12 @@ describe('ConnectionsView — engineering scaffold', () => {
         ]}
       />,
     );
-    expect(screen.queryByTestId('connections-recent-anchors')).not.toBeNull();
-    fireEvent.click(screen.getByTestId('recent-anchor-thread:thread_recent'));
+    // The thread/workstream prop now renders as a distinct "Shortcuts"
+    // section, separate from the real navigation-history "Recent
+    // anchors" list (empty until the user actually navigates).
+    expect(screen.queryByTestId('connections-anchor-shortcuts')).not.toBeNull();
+    expect(screen.queryByTestId('connections-recent-anchors')).toBeNull();
+    fireEvent.click(screen.getByTestId('shortcut-anchor-thread:thread_recent'));
     await waitFor(() => {
       expect(calls).toBeGreaterThan(0);
     });
