@@ -570,10 +570,12 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
+    // #4 — the current-tab attribution card is Inbox-only now, so
+    // switch to Inbox before asserting its contents.
+    fireEvent.click(screen.getByRole('tab', { name: 'Inbox' }));
     await waitFor(() => {
       expect(screen.getByTestId('focused-tab-attribution')).toHaveTextContent('Sidetrack');
     });
-    fireEvent.click(screen.getByRole('tab', { name: 'Inbox' }));
     expect(await screen.findByText('Copy fail')).toBeInTheDocument();
     // Stage 5 polish — flat 4-action layout aligned with Current Tab.
     // Both the Current Tab card and the Inbox card now render "Pick
@@ -713,6 +715,9 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
+    // #4 — the suggestion banner is part of the current-tab
+    // attribution cluster, Inbox-only now.
+    fireEvent.click(screen.getByRole('tab', { name: 'Inbox' }));
     const banner = await screen.findByLabelText('Tab-session suggestion');
     expect(banner).toHaveTextContent('Sibling');
     fireEvent.click(within(banner).getByRole('button', { name: "Yes, that's right" }));
@@ -826,6 +831,8 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
+    // #4 — the current-tab attribution card is Inbox-only now.
+    fireEvent.click(screen.getByRole('tab', { name: 'Inbox' }));
     await waitFor(() => {
       expect(screen.getByTestId('focused-tab-attribution')).toHaveTextContent('Sibling');
     });
