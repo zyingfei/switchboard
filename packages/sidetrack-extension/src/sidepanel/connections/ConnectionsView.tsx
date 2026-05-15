@@ -1326,6 +1326,11 @@ export const ConnectionsView = ({
 
   const selectedWorkstreamAnchor = anchor.startsWith('workstream:') ? anchor : '';
 
+  // #5 — responsive collapse. Default open; the toggles only appear on
+  // narrow widths (CSS-gated), so wide layouts are unaffected.
+  const [leftRailOpen, setLeftRailOpen] = useState(true);
+  const [anchorSummaryOpen, setAnchorSummaryOpen] = useState(true);
+
   // Honest "Recent anchors" — built from real navigation history
   // (clicks/navigation), not the thread/workstream shortcut prop.
   // Label prefers the human override captured on navigate; otherwise
@@ -2020,7 +2025,21 @@ export const ConnectionsView = ({
         <HopToggle value={hops} onChange={setHops} />
       </div>
       {anchorCanonicalUrl !== null ? (
-        <div className="cx-page-content-card" data-testid="connections-page-content-card">
+        <div
+          className={'cx-page-content-card' + (anchorSummaryOpen ? '' : ' is-collapsed')}
+          data-testid="connections-page-content-card"
+        >
+          <button
+            type="button"
+            className="cx-summary-toggle cx-mono cx-dim"
+            onClick={() => {
+              setAnchorSummaryOpen((v) => !v);
+            }}
+            aria-expanded={anchorSummaryOpen}
+            data-testid="connections-summary-toggle"
+          >
+            {anchorSummaryOpen ? '▾' : '▸'} Page text
+          </button>
           <div className="cx-page-content-main">
             <span className="cx-page-content-label">Page text</span>
             <span className="cx-page-content-state">
@@ -2241,7 +2260,18 @@ export const ConnectionsView = ({
         />
       ) : null}
       <div className="cx-cols">
-        <aside className="cx-col-l">
+        <aside className={'cx-col-l' + (leftRailOpen ? '' : ' is-collapsed')}>
+          <button
+            type="button"
+            className="cx-rail-toggle cx-mono cx-dim"
+            onClick={() => {
+              setLeftRailOpen((v) => !v);
+            }}
+            aria-expanded={leftRailOpen}
+            data-testid="connections-rail-toggle"
+          >
+            {leftRailOpen ? '▾' : '▸'} Panel
+          </button>
           <div className="cx-section">
             <h4>Find</h4>
             <NodeSearchBox

@@ -10270,3 +10270,33 @@ pre.diff {
   font-size: 10.5px;
   color: var(--ink-2);
 }
+
+/* #5 — responsive collapse (Anchor summary + left rail). Toggles are
+   hidden on wide layouts and sections always show, so desktop is
+   unchanged regardless of open/closed state (zero regression). On
+   narrow widths the toggle appears; `is-collapsed` hides the body.
+   Restrained: no new colors — reuses the cx-mono/cx-dim tokens. */
+.cx-rail-toggle,
+.cx-summary-toggle {
+  display: none;
+}
+@media (max-width: 720px) {
+  .cx-rail-toggle,
+  .cx-summary-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    padding: 6px 4px;
+    background: none;
+    border: 0;
+    text-align: left;
+    cursor: pointer;
+  }
+  .cx-col-l.is-collapsed > :not(.cx-rail-toggle) {
+    display: none;
+  }
+  .cx-page-content-card.is-collapsed > :not(.cx-summary-toggle) {
+    display: none;
+  }
+}
