@@ -35,6 +35,10 @@ import {
   shouldBuildTopicShadowCandidate,
   type TopicShadowDiagnostics,
 } from '../../connections/topicShadowCandidate.js';
+import {
+  buildTopicShadowObservationDiagnostics,
+  type TopicShadowObservationDiagnostics,
+} from '../../connections/topicShadowObservation.js';
 import { buildHdbscanTopicRevision } from '../../connections/hdbscanClusterer.js';
 import {
   buildVisitSimilarity,
@@ -352,9 +356,7 @@ export interface ConnectionsMaterializer extends Materializer {
    * chunking / embedding / recall-index updates; this method just
    * orchestrates and acks via clearDirtySources.
    */
-  readonly drainContentLaneQueue: (
-    reconciler: ContentLaneSourceUnitReconciler,
-  ) => Promise<number>;
+  readonly drainContentLaneQueue: (reconciler: ContentLaneSourceUnitReconciler) => Promise<number>;
 }
 
 export interface ContentLaneSourceUnitReconciler {
@@ -687,8 +689,7 @@ export const createConnectionsMaterializer = (
     // feed both the revision id + the build call. Honors env overrides:
     // SIDETRACK_SIMILARITY_{THRESHOLD,MIN_ENGAGEMENT_MS,TOP_K} +
     // SIDETRACK_SIMILARITY_LEXICAL_{THRESHOLD,FALLBACK_ENABLED}.
-    const similarityConfig: EffectiveVisitSimilarityConfig =
-      resolveVisitSimilarityConfig();
+    const similarityConfig: EffectiveVisitSimilarityConfig = resolveVisitSimilarityConfig();
     const expectedSimilarityRevisionId = computeVisitSimilarityRevisionId(
       similarityEntries,
       similarityConfig,
@@ -707,18 +708,12 @@ export const createConnectionsMaterializer = (
     // IncrementalVisitSimilarityIndex for cosine-only top-K. The
     // resulting revisionId carries a `:incremental` suffix so on-disk
     // cached revisions stay distinct from the legacy hybrid path.
-    const hotSimilarityMode =
-      process.env['SIDETRACK_CONNECTIONS_HOT_SIMILARITY'] === '1';
+    const hotSimilarityMode = process.env['SIDETRACK_CONNECTIONS_HOT_SIMILARITY'] === '1';
     const hotSimilarityDecision = hotSimilarityMode
-      ? decideHotPathEmbed(
-          embedderWarmthTracker.snapshot(incrementalSimilarityIndex.size()),
-        )
+      ? decideHotPathEmbed(embedderWarmthTracker.snapshot(incrementalSimilarityIndex.size()))
       : { shouldEmbedOnHotPath: false as const };
     let visitSimilarity;
-    if (
-      cachedSimilarityRevision !== null &&
-      !hotSimilarityDecision.shouldEmbedOnHotPath
-    ) {
+    if (cachedSimilarityRevision !== null && !hotSimilarityDecision.shouldEmbedOnHotPath) {
       visitSimilarity = cachedSimilarityRevision;
     } else if (hotSimilarityDecision.shouldEmbedOnHotPath) {
       // Embed only entries not yet in the index. The legacy path embeds
@@ -757,7 +752,10 @@ export const createConnectionsMaterializer = (
           index: incrementalSimilarityIndex,
           entries: similarityEntries,
           embeddingsByVisitKey,
-          options: { threshold: VISIT_SIMILARITY_DEFAULT_THRESHOLD, topK: VISIT_SIMILARITY_DEFAULT_TOP_K },
+          options: {
+            threshold: VISIT_SIMILARITY_DEFAULT_THRESHOLD,
+            topK: VISIT_SIMILARITY_DEFAULT_TOP_K,
+          },
         });
       }
       mark(
@@ -809,8 +807,7 @@ export const createConnectionsMaterializer = (
       );
       let removedCount = 0;
       for (const edge of prevSimilarityEdges) {
-        const sig =
-          edge.a < edge.b ? `${edge.a} ${edge.b}` : `${edge.b} ${edge.a}`;
+        const sig = edge.a < edge.b ? `${edge.a} ${edge.b}` : `${edge.b} ${edge.a}`;
         if (!newSimilarityPairs.has(sig)) {
           topicAccumulator.removeEdge(edge.a, edge.b);
           removedCount += 1;
@@ -906,7 +903,9 @@ export const createConnectionsMaterializer = (
       mark('putActiveTopicRevision');
     }
     let topicShadowDiagnostics: TopicShadowDiagnostics | null = null;
+    let topicShadowObservation: TopicShadowObservationDiagnostics | null = null;
     if (shouldBuildTopicShadowCandidate()) {
+      const previousShadowRevision = await topicRevisionStore.readShadowRevision();
       const shadow = await buildTopicShadowCandidate({
         visits: topicVisits,
         visitSimilarity,
@@ -917,6 +916,12 @@ export const createConnectionsMaterializer = (
       });
       await writeShadowTopicRevision(deps.vaultRoot, shadow.revision);
       topicShadowDiagnostics = shadow.diagnostics;
+      topicShadowObservation = buildTopicShadowObservationDiagnostics({
+        baselineRevision: topicRevision,
+        previousBaselineRevision: previousTopicRevision,
+        shadowRevision: shadow.revision,
+        previousShadowRevision,
+      });
       mark(
         `topicShadowCandidate ${shadow.diagnostics.candidate} topics=${String(shadow.diagnostics.shadowTopicCount)} max=${String(shadow.diagnostics.shadowMaxTopicSize)} edges=${String(shadow.diagnostics.edgeCountAfterPruning)}`,
       );
@@ -935,7 +940,9 @@ export const createConnectionsMaterializer = (
     mark('projectionAccumulators.derive');
     await yieldToEventLoop();
     const baseSnapshot = buildConnectionsSnapshot(input);
-    mark(`buildConnectionsSnapshot base nodes=${String(baseSnapshot.nodes.length)} edges=${String(baseSnapshot.edges.length)}`);
+    mark(
+      `buildConnectionsSnapshot base nodes=${String(baseSnapshot.nodes.length)} edges=${String(baseSnapshot.edges.length)}`,
+    );
     // Stage 5.2 W3b — publish the base snapshot immediately so HTTP
     // routes (and the side panel that reads them) have a valid current
     // snapshot to serve. The ranker-augmented build below adds
@@ -964,7 +971,9 @@ export const createConnectionsMaterializer = (
             ...input,
             closestVisitRanker: closestVisitRanker.ranker,
           });
-          mark(`buildConnectionsSnapshot ranker-augmented nodes=${String(finalSnapshot.nodes.length)} edges=${String(finalSnapshot.edges.length)}`);
+          mark(
+            `buildConnectionsSnapshot ranker-augmented nodes=${String(finalSnapshot.nodes.length)} edges=${String(finalSnapshot.edges.length)}`,
+          );
           await deps.store.putCurrent(finalSnapshot);
           mark('putCurrent ranker-augmented');
         }
@@ -990,6 +999,7 @@ export const createConnectionsMaterializer = (
       urlProjection,
       snapshot: finalSnapshot,
       ...(topicShadowDiagnostics === null ? {} : { topicShadowDiagnostics }),
+      ...(topicShadowObservation === null ? {} : { topicShadowObservation }),
     });
     try {
       await diagnosticsStore.write(diagnostics);
@@ -1015,9 +1025,10 @@ export const createConnectionsMaterializer = (
   // addons (onnx/usearch/sharp) load in two isolates of the same
   // process. The child_process path is the default; the worker_thread
   // path is retained only for opt-in stress testing.
-  const pickSubprocessRunner = (): ((
-    job: { vaultRoot: string; seq: number },
-  ) => Promise<{ seq: number; ok: boolean; snapshotRevision?: string; error?: string }>) => {
+  const pickSubprocessRunner = (): ((job: {
+    vaultRoot: string;
+    seq: number;
+  }) => Promise<{ seq: number; ok: boolean; snapshotRevision?: string; error?: string }>) => {
     if (process.env['SIDETRACK_CONNECTIONS_WORKER'] === '1') {
       return runReconcileInWorker;
     }
@@ -1246,8 +1257,7 @@ export const createConnectionsMaterializer = (
   const clearDirtySources = (sourceUnitIds: readonly string[]): void => {
     dirtySourceQueue.clear(sourceUnitIds);
   };
-  const getInvalidationsSinceLastBuild = (): readonly InvalidationKey[] =>
-    lastBuildInvalidations;
+  const getInvalidationsSinceLastBuild = (): readonly InvalidationKey[] => lastBuildInvalidations;
   const getTopicAccumulator = (): IncrementalTopicClusterAccumulator => topicAccumulator;
   const getEmbedderWarmthTracker = (): EmbedderWarmthTracker => embedderWarmthTracker;
 
@@ -1263,9 +1273,7 @@ export const createConnectionsMaterializer = (
   ): Promise<number> => {
     const snapshot = dirtySourceQueue.snapshot();
     const tombstones = snapshot.tombstonedSourceUnitIds;
-    const dirty = snapshot.dirtySourceUnitIds.filter(
-      (id) => !tombstones.includes(id),
-    );
+    const dirty = snapshot.dirtySourceUnitIds.filter((id) => !tombstones.includes(id));
     const processed: string[] = [];
     for (const sourceUnitId of tombstones) {
       try {
