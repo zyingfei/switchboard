@@ -1181,6 +1181,8 @@ export const createConnectionsMaterializer = (
 
   const catchUp: Materializer['catchUp'] = async () => {
     pending = true;
+    if (running) return;
+    running = true;
     // Stage 5.2 W2b/c wiring — catchUp is the recovery / boot-time path;
     // force a re-seed so any drift between the in-memory accumulators
     // and the event log is corrected. The next buildAndWrite (or worker
@@ -1191,6 +1193,7 @@ export const createConnectionsMaterializer = (
     // Stage 5.2 W6 per-pass — invalidate the engagement cache on
     // catchUp so the next drain rebuilds against the fresh log.
     lastEngagementClassRevision = undefined;
+    dirty = false;
     try {
       // 2026-05 cold-start fix: route catchUp through the worker the
       // same way drain does. The previous direct buildAndWrite()
@@ -1205,14 +1208,15 @@ export const createConnectionsMaterializer = (
       }
       lastSuccessAt = new Date().toISOString();
       lastError = null;
-      dirty = false;
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err);
       // Don't spin during catchUp — leave dirty=true so the next
       // event trigger (after cooldown) retries.
       dirty = true;
     } finally {
+      running = false;
       pending = dirty || running;
+      if (dirty && lastError === null) startDrain();
     }
   };
 

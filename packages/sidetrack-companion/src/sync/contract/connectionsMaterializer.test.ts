@@ -51,6 +51,8 @@ const embedFromVectors =
       return vector;
     });
 
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
 describe('connectionsMaterializer (Class B, consumer-only)', () => {
   let vaultRoot: string;
   beforeEach(async () => {
@@ -587,6 +589,74 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     const health = m.health();
     expect(health.status).toBe('failed');
     expect(health.lastError).toContain('disk wedged');
+  });
+
+  it('does not start a concurrent drain when an event arrives during catchUp', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    let calls = 0;
+    let releaseFirstPut: (() => void) | undefined;
+    let firstPutStartedResolve: (() => void) | undefined;
+    const firstPutStarted = new Promise<void>((resolve) => {
+      firstPutStartedResolve = resolve;
+    });
+    const store = {
+      putCurrent: async (snapshot: import('../../connections/snapshot.js').ConnectionsSnapshot) => {
+        void snapshot;
+        calls += 1;
+        if (calls === 1) {
+          firstPutStartedResolve?.();
+          await new Promise<void>((release) => {
+            releaseFirstPut = release;
+          });
+        }
+      },
+      readCurrent: async () => null,
+      putDay: async () => undefined,
+      readDay: async () => null,
+      listDays: async () => [],
+    };
+    const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store });
+
+    const first = buildEvent({
+      seq: 1,
+      type: THREAD_UPSERTED,
+      payload: {
+        bac_id: 'thread_a',
+        provider: 'chatgpt',
+        threadUrl: 'https://x/a',
+        title: 'A',
+        lastSeenAt: '2026-05-07T10:00:00.000Z',
+        tags: [],
+      },
+    });
+    await eventLog.importPeerEvent(first);
+    const catchUp = m.catchUp(eventLog);
+    await firstPutStarted;
+
+    const second = buildEvent({
+      seq: 2,
+      type: THREAD_UPSERTED,
+      payload: {
+        bac_id: 'thread_b',
+        provider: 'chatgpt',
+        threadUrl: 'https://x/b',
+        title: 'B',
+        lastSeenAt: '2026-05-07T10:01:00.000Z',
+        tags: [],
+      },
+    });
+    await eventLog.importPeerEvent(second);
+    m.onAccepted(second, { origin: 'peer' });
+
+    await delay(1_700);
+    expect(calls).toBe(1);
+    releaseFirstPut?.();
+    await catchUp;
+    await m.awaitIdle();
+    expect(calls).toBeGreaterThanOrEqual(2);
+    expect(m.health().status).toBe('healthy');
   });
 
   // Stage 5.2 W3 — visit-similarity skip-gate. When the same set of
