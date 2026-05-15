@@ -3102,6 +3102,9 @@ export const subgraphForNode = (
     updatedAt: snapshot.updatedAt,
     nodeCount: keptNodes.length,
     edgeCount: keptEdges.size,
+    ...(snapshot.snapshotRevision === undefined
+      ? {}
+      : { snapshotRevision: snapshot.snapshotRevision }),
   };
 };
 

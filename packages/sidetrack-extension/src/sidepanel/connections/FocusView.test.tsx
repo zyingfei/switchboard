@@ -18,7 +18,7 @@ describe('FocusView', () => {
       />,
     );
 
-    expect(screen.getAllByTestId(/^focus-topic-/u)).toHaveLength(2);
+    expect(screen.getAllByTestId(/^focus-topic-topic:/u)).toHaveLength(2);
     expect(screen.getAllByText('Suggestion')).toHaveLength(2);
   });
 
@@ -41,7 +41,7 @@ describe('FocusView', () => {
       />,
     );
 
-    fireEvent.click(screen.getByTestId('focus-expand-topic:a'));
+    fireEvent.click(screen.getByText('Alpha'));
     expect(screen.getByTestId('engagement-dot-visit:a').className).toContain(
       'cx-engagement-worked_on_reference',
     );
@@ -50,45 +50,52 @@ describe('FocusView', () => {
     );
   });
 
-  it('renders secondary affiliations as also-related visits', () => {
+  it('sorts visits by attention first, then recent activity', () => {
     render(
       <FocusView
-        topics={[
-          {
-            id: 'topic:a',
-            label: 'Alpha',
-            memberCount: 2,
-            secondaryCount: 1,
-            cohesion: 0.91,
-          },
-        ]}
+        topics={[{ id: 'topic:a', label: 'Alpha', memberCount: 3, cohesion: 0.91 }]}
         visitsByTopic={{
           'topic:a': [
-            { id: 'visit:a', label: 'Primary', focusedWindowMs: 10_000 },
             {
-              id: 'visit:b',
-              label: 'Secondary',
-              focusedWindowMs: 4_000,
-              affiliation: 'secondary',
-              secondaryScore: 0.78,
-              secondaryReasons: ['edge_support', 'member_similarity'],
+              id: 'visit:old-read',
+              label: 'Old read',
+              lastSeenAt: '2026-05-14T08:00:00.000Z',
+              focusedWindowMs: 10_000,
+            },
+            {
+              id: 'visit:recent-glance',
+              label: 'Recent glance',
+              lastSeenAt: '2026-05-14T12:00:00.000Z',
+              focusedWindowMs: 30_000,
+            },
+            {
+              id: 'visit:recent-read',
+              label: 'Recent read',
+              lastSeenAt: '2026-05-14T12:30:00.000Z',
+              focusedWindowMs: 5_000,
             },
           ],
         }}
-        engagementClassesByVisit={{}}
+        engagementClassesByVisit={{
+          'visit:old-read': 'engaged_read',
+          'visit:recent-glance': 'glanced',
+          'visit:recent-read': 'engaged_read',
+        }}
         onTopicClick={() => undefined}
         onVisitClick={() => undefined}
       />,
     );
 
-    expect(screen.getByText('2 pages · 1 also related')).toBeDefined();
-    fireEvent.click(screen.getByTestId('focus-expand-topic:a'));
-    expect(screen.getByText('Also related 0.78')).toBeDefined();
-    expect(screen.getByTitle('score 0.78 · edge_support, member_similarity')).toBeDefined();
+    fireEvent.click(screen.getByText('Alpha'));
+    expect(screen.getAllByTestId(/^focus-visit-visit:/u).map((row) => row.textContent)).toEqual([
+      expect.stringContaining('Recent read'),
+      expect.stringContaining('Old read'),
+      expect.stringContaining('Recent glance'),
+    ]);
   });
 
   it('renders the workstream chip and click handlers', () => {
-    const onTopicClick = vi.fn();
+    const onTopicAnchor = vi.fn();
     const onVisitClick = vi.fn();
     render(
       <FocusView
@@ -102,20 +109,35 @@ describe('FocusView', () => {
           },
         ]}
         visitsByTopic={{
-          'topic:a': [{ id: 'visit:a', label: 'A', focusedWindowMs: 10_000 }],
+          'topic:a': [
+            {
+              id: 'visit:a',
+              label: 'A',
+              url: 'https://example.test/a',
+              focusedWindowMs: 10_000,
+            },
+          ],
         }}
         engagementClassesByVisit={{ 'visit:a': 'engaged_read' }}
-        onTopicClick={onTopicClick}
+        onTopicClick={() => undefined}
+        onTopicAnchor={onTopicAnchor}
+        onEngagementRelabel={() => undefined}
         onVisitClick={onVisitClick}
       />,
     );
 
     expect(screen.getByText('Workstream signal')).toBeDefined();
+    fireEvent.click(screen.getByTestId('focus-topic-anchor-topic:a'));
+    expect(onTopicAnchor).toHaveBeenCalledWith({ topicId: 'topic:a', label: 'Alpha' });
     fireEvent.click(screen.getByText('Alpha'));
-    fireEvent.click(screen.getByTestId('focus-expand-topic:a'));
+    expect(screen.getByTestId('focus-detail-topic:a')).toBeDefined();
+    expect(screen.getByText('Read')).toBeDefined();
+    expect(screen.getByTestId('focus-visit-open-visit:a').getAttribute('href')).toBe(
+      'https://example.test/a',
+    );
     fireEvent.click(screen.getByTestId('focus-visit-visit:a'));
-    expect(onTopicClick).toHaveBeenCalledWith('topic:a');
     expect(onVisitClick).toHaveBeenCalledWith('visit:a');
+    expect(screen.queryByTestId('focus-visit-anchor-visit:a')).toBeNull();
   });
 
   it('hides collapsed computed groups behind a triage guard', () => {
@@ -172,7 +194,7 @@ describe('FocusView', () => {
     expect(screen.getByText('No scoped focus group')).toBeDefined();
   });
 
-  it('marks oversized suggestions for triage without enabling computed-topic rename', () => {
+  it('marks oversized suggestions for triage and keeps save-name inside details', () => {
     render(
       <FocusView
         topics={[
@@ -189,7 +211,9 @@ describe('FocusView', () => {
 
     expect(screen.getByTestId('focus-topic-topic:large')).toBeDefined();
     expect(screen.getByText('Needs triage')).toBeDefined();
-    expect(screen.queryByText('Rename')).toBeNull();
+    expect(screen.queryByText('Save name')).toBeNull();
+    fireEvent.click(screen.getByText('Large computed group'));
+    expect(screen.getAllByText('Save name').length).toBeGreaterThan(0);
   });
 
   it('fires per-visit engagement relabel feedback', async () => {
@@ -207,7 +231,8 @@ describe('FocusView', () => {
       />,
     );
 
-    fireEvent.click(screen.getByTestId('focus-expand-topic:a'));
+    fireEvent.click(screen.getByText('Alpha'));
+    fireEvent.click(screen.getByTestId('focus-visit-label-visit:a'));
     fireEvent.change(screen.getByTestId('focus-visit-engagement-visit:a'), {
       target: { value: 'worked_on_reference' },
     });
@@ -230,13 +255,6 @@ describe('FocusView', () => {
           'topic:a': [
             { id: 'timeline-visit:https://example.test/a', label: 'A', focusedWindowMs: 10_000 },
             { id: 'timeline-visit:https://example.test/b', label: 'B', focusedWindowMs: 5_000 },
-            {
-              id: 'timeline-visit:https://example.test/candidate',
-              label: 'Candidate',
-              focusedWindowMs: 2_000,
-              affiliation: 'secondary',
-              secondaryScore: 0.74,
-            },
           ],
         }}
         engagementClassesByVisit={{}}
@@ -247,6 +265,7 @@ describe('FocusView', () => {
       />,
     );
 
+    fireEvent.click(screen.getByText('Alpha'));
     fireEvent.click(screen.getByTestId('focus-promote-topic:a'));
 
     await waitFor(() => {
@@ -261,87 +280,79 @@ describe('FocusView', () => {
     });
   });
 
-  it('fires hide, merge, not-related, and split suggestion actions', async () => {
-    const onTopicHide = vi.fn(() => Promise.resolve());
-    const onTopicMerge = vi.fn(() => Promise.resolve());
-    const onVisitMarkNotRelated = vi.fn(() => Promise.resolve());
-    const onVisitSplitOut = vi.fn(() => Promise.resolve());
+  it('renames a suggestion optimistically', async () => {
+    const onTopicRename = vi.fn(() => Promise.resolve());
     render(
       <FocusView
-        topics={[
-          { id: 'topic:a', label: 'Alpha', memberCount: 2, cohesion: 0.91 },
-          { id: 'topic:b', label: 'Beta', memberCount: 2, cohesion: 0.87 },
-        ]}
-        visitsByTopic={{
-          'topic:a': [
-            { id: 'timeline-visit:https://example.test/a', label: 'A', focusedWindowMs: 10_000 },
-            {
-              id: 'timeline-visit:https://example.test/noisy',
-              label: 'Noisy',
-              focusedWindowMs: 5_000,
-            },
-            {
-              id: 'timeline-visit:https://example.test/secondary',
-              label: 'Secondary',
-              focusedWindowMs: 2_000,
-              affiliation: 'secondary',
-            },
-          ],
-        }}
+        topics={[{ id: 'topic:a', label: 'Alpha', memberCount: 1, cohesion: 0.91 }]}
+        visitsByTopic={{}}
         engagementClassesByVisit={{}}
-        onTopicHide={onTopicHide}
-        onTopicMerge={onTopicMerge}
-        onVisitMarkNotRelated={onVisitMarkNotRelated}
-        onVisitSplitOut={onVisitSplitOut}
+        onTopicRename={onTopicRename}
         onTopicClick={() => undefined}
         onVisitClick={() => undefined}
       />,
     );
 
-    fireEvent.click(screen.getByTestId('focus-hide-topic:a'));
-    fireEvent.click(screen.getByTestId('focus-merge-topic:a'));
-    fireEvent.click(screen.getByTestId('focus-expand-topic:a'));
-    fireEvent.click(
-      screen.getByTestId(
-        'focus-visit-not-related-topic:a-timeline-visit:https://example.test/secondary',
-      ),
+    fireEvent.click(screen.getByText('Alpha'));
+    fireEvent.change(screen.getByTestId('focus-rename-input-topic:a'), {
+      target: { value: 'Oracle research' },
+    });
+    fireEvent.click(screen.getByTestId('focus-rename-topic:a'));
+
+    await waitFor(() => {
+      expect(onTopicRename).toHaveBeenCalledWith({
+        topicId: 'topic:a',
+        previousName: 'Alpha',
+        newName: 'Oracle research',
+      });
+    });
+    expect(screen.getByText('Oracle research')).toBeDefined();
+  });
+
+  it('removes a visit from the visible suggestion and can restore it', async () => {
+    const onVisitMarkNotRelated = vi.fn(() => Promise.resolve());
+    const onVisitRestoreToTopic = vi.fn(() => Promise.resolve());
+    render(
+      <FocusView
+        topics={[{ id: 'topic:a', label: 'Alpha', memberCount: 2, cohesion: 0.91 }]}
+        visitsByTopic={{
+          'topic:a': [
+            { id: 'timeline-visit:https://example.test/a', label: 'A', focusedWindowMs: 10_000 },
+            { id: 'timeline-visit:https://example.test/b', label: 'B', focusedWindowMs: 5_000 },
+          ],
+        }}
+        engagementClassesByVisit={{}}
+        onVisitMarkNotRelated={onVisitMarkNotRelated}
+        onVisitRestoreToTopic={onVisitRestoreToTopic}
+        onTopicClick={() => undefined}
+        onVisitClick={() => undefined}
+      />,
     );
+
+    fireEvent.click(screen.getByText('Alpha'));
+    expect(screen.getAllByText('Remove')).toHaveLength(2);
     fireEvent.click(
-      screen.getByTestId('focus-visit-split-topic:a-timeline-visit:https://example.test/noisy'),
+      screen.getByTestId('focus-visit-not-related-topic:a-timeline-visit:https://example.test/b'),
     );
 
     await waitFor(() => {
-      expect(onTopicHide).toHaveBeenCalledWith({
-        topicId: 'topic:a',
-        memberVisitIds: [
-          'timeline-visit:https://example.test/a',
-          'timeline-visit:https://example.test/noisy',
-        ],
-      });
-      expect(onTopicMerge).toHaveBeenCalledWith({
-        topicId: 'topic:a',
-        targetTopicId: 'topic:b',
-        memberVisitIds: [
-          'timeline-visit:https://example.test/a',
-          'timeline-visit:https://example.test/noisy',
-        ],
-      });
       expect(onVisitMarkNotRelated).toHaveBeenCalledWith({
         topicId: 'topic:a',
-        visitId: 'timeline-visit:https://example.test/secondary',
+        visitId: 'timeline-visit:https://example.test/b',
         memberVisitIds: [
           'timeline-visit:https://example.test/a',
-          'timeline-visit:https://example.test/noisy',
-        ],
-      });
-      expect(onVisitSplitOut).toHaveBeenCalledWith({
-        topicId: 'topic:a',
-        visitId: 'timeline-visit:https://example.test/noisy',
-        memberVisitIds: [
-          'timeline-visit:https://example.test/a',
-          'timeline-visit:https://example.test/noisy',
+          'timeline-visit:https://example.test/b',
         ],
       });
     });
+    expect(screen.queryByTestId('focus-visit-timeline-visit:https://example.test/b')).toBeNull();
+    fireEvent.click(screen.getByText('Undo'));
+    await waitFor(() => {
+      expect(onVisitRestoreToTopic).toHaveBeenCalledWith({
+        topicId: 'topic:a',
+        visitId: 'timeline-visit:https://example.test/b',
+      });
+    });
+    expect(screen.getByTestId('focus-visit-timeline-visit:https://example.test/b')).toBeDefined();
   });
 });

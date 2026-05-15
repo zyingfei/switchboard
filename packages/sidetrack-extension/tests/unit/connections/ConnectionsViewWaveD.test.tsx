@@ -132,7 +132,8 @@ describe('ConnectionsView — Wave D modes', () => {
       expect(screen.queryByTestId('connections-mode-focus')).not.toBeNull();
     });
     fireEvent.click(screen.getByTestId('connections-mode-focus'));
-    fireEvent.click(screen.getByTestId('focus-expand-topic:topic_a'));
+    fireEvent.click(screen.getByText('Topic A'));
+    fireEvent.click(screen.getByTestId('focus-visit-label-timeline-visit:https://example.test/a'));
     fireEvent.change(
       screen.getByTestId('focus-visit-engagement-timeline-visit:https://example.test/a'),
       { target: { value: 'worked_on_reference' } },

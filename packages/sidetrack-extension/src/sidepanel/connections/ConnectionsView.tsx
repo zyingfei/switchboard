@@ -3,11 +3,12 @@ import { useEffect, useMemo, useState, type ReactElement } from 'react';
 import { ContextPackComposer } from './ContextPackComposer';
 import {
   feedbackRelationKindForEdgeKind,
+  postUserOrganizedItem,
   postUserEngagementRelabeled,
   postUserFlowConfirmed,
   postUserFlowRejected,
-  postUserOrganizedItem,
   postUserSnippetPromoted,
+  postUserTopicRenamed,
   type UserFlowRelationKind,
 } from './client';
 import { nodeKindDisplayFor } from './edgeKinds';
@@ -59,6 +60,8 @@ import {
   formatEntityDisplay,
   formatNodeIdDisplay,
   hostOf,
+  isInternalIdLike,
+  kindFromNodeId,
   type EntityDisplayCtx,
 } from '../entityDisplay/format';
 import type { FeedbackChoice } from '../feedback/FeedbackButtons';
@@ -132,6 +135,70 @@ const normalizeWorkstreamAnchorId = (id: string): string =>
   id.startsWith('workstream:') ? id : `workstream:${id}`;
 
 const DEFAULT_TOPIC_ENGAGEMENT_GATE_MS = 5_000;
+
+const urlFromAnchorNodeId = (nodeId: string): string | undefined => {
+  if (nodeId.startsWith('timeline-visit:')) {
+    const url = nodeId.slice('timeline-visit:'.length);
+    return url.length > 0 ? url : undefined;
+  }
+  if (nodeId.startsWith('visit-instance:')) {
+    const tail = nodeId.slice('visit-instance:'.length);
+    const httpIdx = tail.indexOf(':http');
+    if (httpIdx >= 0) {
+      const url = tail.slice(httpIdx + 1);
+      return url.length > 0 ? url : undefined;
+    }
+  }
+  return undefined;
+};
+
+const humanAnchorLabel = (label: string | undefined): string | undefined => {
+  const trimmed = label?.trim();
+  if (trimmed === undefined || trimmed.length === 0 || isInternalIdLike(trimmed)) {
+    return undefined;
+  }
+  return trimmed;
+};
+
+const applyAnchorLabel = (node: ConnectionNode, label: string | undefined): ConnectionNode => {
+  const clean = humanAnchorLabel(label);
+  if (clean === undefined) return node;
+  return {
+    ...node,
+    label: clean,
+    metadata:
+      node.kind === 'topic'
+        ? {
+            ...node.metadata,
+            representativeTitles: [clean],
+          }
+        : node.metadata,
+  };
+};
+
+const displayOnlyAnchorNode = (nodeId: string, label?: string): ConnectionNode | null => {
+  const kind = kindFromNodeId(nodeId);
+  if (kind === undefined) return null;
+  const url = urlFromAnchorNodeId(nodeId);
+  const cleanLabel = humanAnchorLabel(label);
+  return {
+    id: nodeId,
+    kind,
+    label: cleanLabel ?? (url === undefined ? nodeId : (hostOf(url) ?? nodeId)),
+    originReplicaIds: [],
+    metadata: {
+      ...(url === undefined
+        ? {}
+        : {
+            canonicalUrl: url,
+            url,
+          }),
+      ...(kind === 'topic' && cleanLabel !== undefined
+        ? { representativeTitles: [cleanLabel] }
+        : {}),
+    },
+  };
+};
 
 const metadataString = (
   metadata: Record<string, unknown>,
@@ -210,10 +277,8 @@ const engagementClassForNode = (node: ConnectionNode): EngagementClass | undefin
 const focusedWindowMsForNode = (node: ConnectionNode): number => {
   const engagement = node.metadata['engagement'];
   if (isRecord(engagement)) {
-    const focusedWindowMs = engagement['focusedWindowMs'];
-    if (typeof focusedWindowMs === 'number' && Number.isFinite(focusedWindowMs)) {
-      return Math.max(0, focusedWindowMs);
-    }
+    const value = engagement['focusedWindowMs'];
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
   }
   return metadataNumber(node.metadata, 'focusedWindowMs', 0);
 };
@@ -232,9 +297,13 @@ const topicVisitFromEdge = (
   const affiliation = topicVisitAffiliationForEdge(edge);
   const metadata = edge.metadata ?? {};
   const secondaryScore = metadataNumber(metadata, 'score', Number.NaN);
+  const visitUrl =
+    metadataString(visit.metadata, ['canonicalUrl', 'url', 'latestUrl']) ?? urlFromNodeId(visit);
   return {
     id: visit.id,
     label: formatEntityDisplay(visit, ctx).primary,
+    ...(visitUrl === undefined ? {} : { url: visitUrl }),
+    ...(visit.lastSeenAt === undefined ? {} : { lastSeenAt: visit.lastSeenAt }),
     focusedWindowMs: focusedWindowMsForNode(visit),
     affiliation,
     ...(affiliation === 'secondary' && Number.isFinite(secondaryScore) ? { secondaryScore } : {}),
@@ -464,7 +533,6 @@ const deriveFlowSummary = (
 const NAV_EDGE_KINDS = new Set<string>([
   'previous_visit_in_tab_session',
   'opener_visit',
-  'visit_instance_same_url_as_timeline_visit',
   'visit_in_tab_session',
   'visit_instance_in_tab_session',
 ]);
@@ -569,9 +637,12 @@ const deriveFocusData = (
   const sourceNodes = hasFull ? fullNodes : scopeNodes;
   const sourceEdges = hasFull ? fullEdges : scopeEdges;
   const nodeById = new Map(sourceNodes.map((node) => [node.id, node] as const));
+  const previousTopicIds = new Set<string>();
+  for (const edge of sourceEdges) {
+    if (edge.kind === 'topic.lineage') previousTopicIds.add(edge.fromNodeId);
+  }
 
   const visitsByTopicMap = new Map<string, Map<string, TopicVisit>>();
-  const previousTopicIds = new Set<string>();
   for (const edge of sourceEdges) {
     if (edge.kind === 'topic.lineage') previousTopicIds.add(edge.fromNodeId);
     if (edge.kind !== 'visit_in_topic') continue;
@@ -590,10 +661,11 @@ const deriveFocusData = (
     visitsByTopic[topicId] = [...topicVisits.values()];
   }
 
-  // Engagement classes — keep using scope nodes (the
-  // user's recent activity tends to be in scope already).
+  // Engagement classes come from the same node pool as rendered
+  // visits so topic anchors can show the current observed judgment
+  // even when the anchor-local active graph is empty.
   const engagementClassesByVisit: Record<string, EngagementClass> = {};
-  for (const node of scopeNodes) {
+  for (const node of sourceNodes) {
     const engagementClass = engagementClassForNode(node);
     if (node.kind === 'timeline-visit' && engagementClass !== undefined) {
       engagementClassesByVisit[node.id] = engagementClass;
@@ -651,13 +723,7 @@ const addVisitAliasesForAnchorId = (anchorId: string, out: Set<string>): void =>
   }
   if (anchorId.startsWith('visit-instance:')) {
     out.add(anchorId);
-    const canonicalUrl = urlFromNodeId({
-      id: anchorId,
-      kind: 'visit-instance',
-      label: anchorId,
-      originReplicaIds: [],
-      metadata: {},
-    });
+    const canonicalUrl = urlFromAnchorNodeId(anchorId);
     if (canonicalUrl !== undefined) {
       out.add(`timeline-visit:${canonicalUrl}`);
     }
@@ -963,12 +1029,14 @@ export const ConnectionsView = ({
   // would type by hand. Submission reads from this draft only; click
   // navigation never writes to it (see navigateToAnchor).
   const [draftAnchor, setDraftAnchor] = useState<string>('');
+  const [anchorLabelOverrides, setAnchorLabelOverrides] = useState<Record<string, string>>({});
   const [hops, setHops] = useState<number>(1);
   const [subMode, setSubMode] = useState<SubMode>('linked');
   const [timeRange, setTimeRange] = useState<TimeRangeValue>(ALL_RANGE);
   const [selectedEdge, setSelectedEdge] = useState<ConnectionEdge | null>(null);
   const [whyVisitId, setWhyVisitId] = useState<string | null>(null);
   const [whyAssertedOnly, setWhyAssertedOnly] = useState<boolean>(false);
+  const [timelineHoverNodeId, setTimelineHoverNodeId] = useState<string | null>(null);
 
   // Snapshot fetching: cached by (anchor, hops), revalidated in the
   // background when revisited so the user gets instant flips through
@@ -988,9 +1056,10 @@ export const ConnectionsView = ({
   // an empty list so the panel doesn't spam the embedder.
   const [searchQuery, setSearchQuery] = useState<string>('');
   const recallResults = useRecallSearch(searchQuery);
-  // Local in-memory mutation of the cached snapshot for engagement
-  // relabel. Computed topic labels are suggestions, so this view no
-  // longer carries an optimistic rename path for topic nodes.
+  // Local in-memory mutation of the cached snapshot (engagement
+  // relabel) — the snapshot is owned by the cache, so we
+  // keep a transient override map until the next fetch refreshes the
+  // canonical engagement metadata.
   const [engagementOverrides, setEngagementOverrides] = useState<Record<string, EngagementClass>>(
     {},
   );
@@ -1000,8 +1069,8 @@ export const ConnectionsView = ({
   // overrides or the time filter at all.
   const result = useMemo(() => {
     if (rawSnapshot === null) return null;
-    // Step 1 — apply engagement overrides so optimistic UI lands
-    // before the next companion fetch revalidates.
+    // Step 1 — apply engagement overrides so optimistic UI lands before the next
+    // companion fetch revalidates.
     let nodes = rawSnapshot.snapshot.nodes;
     if (Object.keys(engagementOverrides).length > 0) {
       nodes = nodes.map((node) => {
@@ -1051,10 +1120,26 @@ export const ConnectionsView = ({
   // node map so kinds like `inbound-reminder` (which surfaces its
   // thread's title in `formatEntityDisplay`) can resolve cross-node
   // references without per-callsite plumbing.
+  const anchorNode = useMemo<ConnectionNode | null>(() => {
+    if (result === null) return null;
+    const node = result.snapshot.nodes.find((n) => n.id === anchor) ?? null;
+    return node === null ? null : applyAnchorLabel(node, anchorLabelOverrides[anchor]);
+  }, [anchor, anchorLabelOverrides, result]);
+  const fallbackAnchorNode = useMemo<ConnectionNode | null>(() => {
+    if (anchor.length === 0 || anchorNode !== null) return null;
+    return displayOnlyAnchorNode(anchor, anchorLabelOverrides[anchor]);
+  }, [anchor, anchorLabelOverrides, anchorNode]);
+  const anchorDisplayNode = anchorNode ?? fallbackAnchorNode;
   const snapshotNodeById = useMemo(() => {
-    if (result === null) return new Map<string, ConnectionNode>();
-    return new Map(result.snapshot.nodes.map((node) => [node.id, node] as const));
-  }, [result]);
+    const byId =
+      result === null
+        ? new Map<string, ConnectionNode>()
+        : new Map(result.snapshot.nodes.map((node) => [node.id, node] as const));
+    if (fallbackAnchorNode !== null && !byId.has(fallbackAnchorNode.id)) {
+      byId.set(fallbackAnchorNode.id, fallbackAnchorNode);
+    }
+    return byId;
+  }, [fallbackAnchorNode, result]);
   const ctx: EntityDisplayCtx = useMemo(
     () => ({ ...baseCtx, nodeById: snapshotNodeById }),
     [baseCtx, snapshotNodeById],
@@ -1068,15 +1153,10 @@ export const ConnectionsView = ({
     [baseCtx, shadowSnapshotNodeById],
   );
 
-  const anchorNode = useMemo<ConnectionNode | null>(() => {
-    if (result === null) return null;
-    return result.snapshot.nodes.find((n) => n.id === anchor) ?? null;
-  }, [result, anchor]);
-
   const timeline = useMemo<TimelineRailData | null>(() => {
     if (result === null) return null;
-    return computeTimelineRail(result.snapshot, anchor);
-  }, [result, anchor]);
+    return computeTimelineRail(result.snapshot, anchor, { range: timeRange });
+  }, [result, anchor, timeRange]);
 
   const workstreamOptions = useMemo<readonly ConnectionsViewWorkstreamAnchor[]>(() => {
     const byId = new Map<string, ConnectionsViewWorkstreamAnchor>();
@@ -1105,14 +1185,14 @@ export const ConnectionsView = ({
     }
     if (anchor.startsWith('workstream:')) {
       const fallbackNodeById = new Map<string, ConnectionNode>();
-      if (anchorNode !== null) fallbackNodeById.set(anchorNode.id, anchorNode);
+      if (anchorDisplayNode !== null) fallbackNodeById.set(anchorDisplayNode.id, anchorDisplayNode);
       add({
         id: anchor,
         label: formatNodeIdDisplay(anchor, fallbackNodeById, ctx).primary,
       });
     }
     return [...byId.values()].sort((left, right) => left.label.localeCompare(right.label));
-  }, [anchor, anchorNode, ctx, recentAnchors, result, workstreamAnchors]);
+  }, [anchor, anchorDisplayNode, ctx, recentAnchors, result, workstreamAnchors]);
 
   // Stage 5 polish — separate two anchor-navigation paths so click
   // navigation NEVER pollutes the advanced-anchor input:
@@ -1134,9 +1214,13 @@ export const ConnectionsView = ({
     setWhyVisitId(null);
     history.navigate(value);
   };
-  const navigateToAnchor = (nextAnchorId: string): void => {
+  const navigateToAnchor = (nextAnchorId: string, label?: string): void => {
     const value = nextAnchorId.trim();
     if (value.length === 0) return;
+    const cleanLabel = humanAnchorLabel(label);
+    if (cleanLabel !== undefined) {
+      setAnchorLabelOverrides((current) => ({ ...current, [value]: cleanLabel }));
+    }
     setSelectedEdge(null);
     setWhyVisitId(null);
     history.navigate(value);
@@ -1147,8 +1231,7 @@ export const ConnectionsView = ({
   // Search pool — node candidates merged from (a) the current
   // anchor's neighborhood (small, always fresh) + (b) the full
   // snapshot (large, primed on search-box focus). Anchor scope
-  // takes precedence so labels updated via topic-rename / engagement-
-  // relabel still reflect immediately.
+  // takes precedence so engagement relabels still reflect immediately.
   const searchNodes = useMemo<readonly ConnectionNode[]>(() => {
     const byId = new Map<string, ConnectionNode>();
     for (const n of fullSnapshot.nodes) byId.set(n.id, n);
@@ -1220,14 +1303,8 @@ export const ConnectionsView = ({
   // the anchor doesn't carry a URL (workstreams, topics, snippets).
   const anchorCanonicalUrl = useMemo<string | null>(() => {
     if (anchor.length === 0) return null;
-    if (anchor.startsWith('timeline-visit:')) {
-      return anchor.slice('timeline-visit:'.length);
-    }
-    if (anchor.startsWith('visit-instance:')) {
-      const tail = anchor.slice('visit-instance:'.length);
-      const httpIdx = tail.indexOf(':http');
-      if (httpIdx >= 0) return tail.slice(httpIdx + 1);
-    }
+    const fromId = urlFromAnchorNodeId(anchor);
+    if (fromId !== undefined) return fromId;
     if (anchorNode !== null) {
       const meta = anchorNode.metadata as Record<string, unknown>;
       const fromMeta = ['canonicalUrl', 'latestUrl', 'url']
@@ -1268,10 +1345,10 @@ export const ConnectionsView = ({
     setSelectedEdge(edge);
   };
 
-  // Local overrides for engagement-relabel optimistic UI. The next
-  // snapshot fetch refreshes canonical labels; until then, the
-  // override map applied in `result` shows the relabeled value
-  // without a round-trip.
+  // Local override for engagement-relabel optimistic UI. The next
+  // snapshot fetch refreshes canonical metadata; until then, the
+  // override map applied in `result` shows the user's change without
+  // a round-trip.
   const replaceNodeEngagementClass = (nodeId: string, engagementClass: EngagementClass): void => {
     setEngagementOverrides((current) => ({ ...current, [nodeId]: engagementClass }));
   };
@@ -1340,46 +1417,17 @@ export const ConnectionsView = ({
     if (!response.ok) {
       throw new Error(response.error ?? 'topic promote feedback failed');
     }
-    refresh();
   };
 
-  const submitTopicHide = async (input: {
+  const submitTopicRename = async (input: {
     readonly topicId: string;
-    readonly memberVisitIds: readonly string[];
+    readonly previousName: string;
+    readonly newName: string;
   }): Promise<void> => {
-    const response = await postUserOrganizedItem({
-      itemKind: 'topic',
-      itemId: input.topicId,
-      action: 'ignore',
-      details: { memberIds: input.memberVisitIds, reason: 'hidden' },
-    });
+    const response = await postUserTopicRenamed(input);
     if (!response.ok) {
-      throw new Error(response.error ?? 'topic hide feedback failed');
+      throw new Error(response.error ?? 'topic rename feedback failed');
     }
-    refresh();
-  };
-
-  const submitTopicMerge = async (input: {
-    readonly topicId: string;
-    readonly targetTopicId: string;
-    readonly memberVisitIds: readonly string[];
-  }): Promise<void> => {
-    const response = await postUserOrganizedItem({
-      itemKind: 'topic',
-      itemId: input.topicId,
-      action: 'merge',
-      toContainer: input.targetTopicId,
-      details: {
-        mergeMembers: [input.targetTopicId],
-        memberIds: input.memberVisitIds,
-        reason: 'merged',
-        targetTopicId: input.targetTopicId,
-      },
-    });
-    if (!response.ok) {
-      throw new Error(response.error ?? 'topic merge feedback failed');
-    }
-    refresh();
   };
 
   const submitVisitMarkNotRelated = async (input: {
@@ -1393,37 +1441,27 @@ export const ConnectionsView = ({
       action: 'ignore',
       fromContainer: input.topicId,
       details: {
-        memberIds: input.memberVisitIds,
-        reason: 'not-related',
-        targetTopicId: input.topicId,
+        splitInto: input.memberVisitIds.filter((memberId) => memberId !== input.visitId),
       },
     });
     if (!response.ok) {
-      throw new Error(response.error ?? 'visit not-related feedback failed');
+      throw new Error(response.error ?? 'visit-topic feedback failed');
     }
-    refresh();
   };
 
-  const submitVisitSplitOut = async (input: {
+  const submitVisitRestoreToTopic = async (input: {
     readonly topicId: string;
     readonly visitId: string;
-    readonly memberVisitIds: readonly string[];
   }): Promise<void> => {
     const response = await postUserOrganizedItem({
-      itemKind: 'topic',
-      itemId: input.topicId,
-      action: 'split',
-      details: {
-        memberIds: [input.visitId],
-        splitInto: [input.visitId],
-        reason: 'split-out',
-        targetTopicId: input.visitId,
-      },
+      itemKind: 'visit',
+      itemId: input.visitId,
+      action: 'move',
+      toContainer: input.topicId,
     });
     if (!response.ok) {
-      throw new Error(response.error ?? 'topic split feedback failed');
+      throw new Error(response.error ?? 'visit-topic restore feedback failed');
     }
-    refresh();
   };
 
   const totalEdges = result?.snapshot.edgeCount ?? 0;
@@ -1498,6 +1536,29 @@ export const ConnectionsView = ({
     if (result === null || whyVisitId === null) return null;
     return findRevisionEdgeForVisit(result.snapshot.edges, whyVisitId);
   }, [result, whyVisitId]);
+  const filteredFullSnapshot = useMemo(() => {
+    if (timeRange.kind === 'all') {
+      return { nodes: fullSnapshot.nodes, edges: fullSnapshot.edges } as const;
+    }
+    const filtered = filterByTimeRange(fullSnapshot.nodes, fullSnapshot.edges, timeRange, {
+      anchorId: anchor,
+    });
+    return { nodes: filtered.nodes, edges: filtered.edges } as const;
+  }, [anchor, fullSnapshot.edges, fullSnapshot.nodes, timeRange]);
+  const filteredShadowSnapshot = useMemo(() => {
+    if (timeRange.kind === 'all') {
+      return { nodes: shadowFullSnapshot.nodes, edges: shadowFullSnapshot.edges } as const;
+    }
+    const filtered = filterByTimeRange(
+      shadowFullSnapshot.nodes,
+      shadowFullSnapshot.edges,
+      timeRange,
+      {
+        anchorId: anchor,
+      },
+    );
+    return { nodes: filtered.nodes, edges: filtered.edges } as const;
+  }, [anchor, shadowFullSnapshot.edges, shadowFullSnapshot.nodes, timeRange]);
   const focusData = useMemo(
     () =>
       result === null
@@ -1505,22 +1566,22 @@ export const ConnectionsView = ({
         : deriveFocusData(
             result.snapshot.nodes,
             result.snapshot.edges,
-            fullSnapshot.nodes,
-            fullSnapshot.edges,
+            filteredFullSnapshot.nodes,
+            filteredFullSnapshot.edges,
             ctx,
           ),
-    [ctx, fullSnapshot.edges, fullSnapshot.nodes, result],
+    [ctx, filteredFullSnapshot.edges, filteredFullSnapshot.nodes, result],
   );
   const shadowFocusData = useMemo(() => {
-    if (result === null || shadowFullSnapshot.nodes.length === 0) {
+    if (result === null || filteredShadowSnapshot.nodes.length === 0) {
       return emptyFocusData();
     }
     const shadowScope = deriveShadowFocusScope(
       anchor,
       result.snapshot.nodes,
       result.snapshot.edges,
-      shadowFullSnapshot.nodes,
-      shadowFullSnapshot.edges,
+      filteredShadowSnapshot.nodes,
+      filteredShadowSnapshot.edges,
     );
     return deriveFocusData(
       shadowScope.nodes,
@@ -1529,7 +1590,7 @@ export const ConnectionsView = ({
       shadowScope.edges,
       shadowCtx,
     );
-  }, [anchor, result, shadowCtx, shadowFullSnapshot.edges, shadowFullSnapshot.nodes]);
+  }, [anchor, filteredShadowSnapshot.edges, filteredShadowSnapshot.nodes, result, shadowCtx]);
   const focusEligibleVisitCount = eligibleVisitCountForFocusData(focusData);
   const shadowEligibleVisitCount = eligibleVisitCountForFocusData(shadowFocusData);
   const activeFocusCollapsed = isCollapsedSuggestionSet(
@@ -1538,13 +1599,12 @@ export const ConnectionsView = ({
     focusData.previousTopicCount,
   );
   const scopedEmptyFocusData = useMemo(() => emptyFocusData(), []);
-  const shadowSnapshotReady = shadowFullSnapshot.nodes.length > 0 && !shadowFullSnapshot.loading;
-  const topicAnchorHasShadowFocus =
-    anchor.startsWith('topic:') && shadowFocusData.topics.length > 0;
+  const shadowSnapshotReady =
+    filteredShadowSnapshot.nodes.length > 0 && !shadowFullSnapshot.loading;
   const renderedFocusData =
-    activeFocusCollapsed && shadowFocusData.topics.length > 0
+    anchor.startsWith('topic:') && shadowFocusData.topics.length > 0
       ? shadowFocusData
-      : topicAnchorHasShadowFocus
+      : activeFocusCollapsed && shadowFocusData.topics.length > 0
         ? shadowFocusData
         : activeFocusCollapsed && shadowSnapshotReady
           ? scopedEmptyFocusData
@@ -1559,25 +1619,43 @@ export const ConnectionsView = ({
     if (renderedFocusData !== scopedEmptyFocusData || result === null) return undefined;
     return focusEmptyDetailForAnchor(
       anchor,
-      [...result.snapshot.nodes, ...shadowFullSnapshot.nodes],
-      [...result.snapshot.edges, ...shadowFullSnapshot.edges],
+      [...result.snapshot.nodes, ...filteredShadowSnapshot.nodes],
+      [...result.snapshot.edges, ...filteredShadowSnapshot.edges],
     );
   }, [
     anchor,
+    filteredShadowSnapshot.edges,
+    filteredShadowSnapshot.nodes,
     renderedFocusData,
     result,
     scopedEmptyFocusData,
-    shadowFullSnapshot.edges,
-    shadowFullSnapshot.nodes,
   ]);
+  const whyUsesShadowFocusGraph = subMode === 'focus' && renderedFocusData === shadowFocusData;
+  const whyReasonNodes =
+    whyUsesShadowFocusGraph && filteredShadowSnapshot.nodes.length > 0
+      ? filteredShadowSnapshot.nodes
+      : (result?.snapshot.nodes ?? []);
+  const whyReasonEdges =
+    whyUsesShadowFocusGraph && filteredShadowSnapshot.edges.length > 0
+      ? filteredShadowSnapshot.edges
+      : (result?.snapshot.edges ?? []);
+  const whyReasonCtx = whyUsesShadowFocusGraph ? shadowCtx : ctx;
+  const whyPanelRevisionEdge =
+    whyVisitId === null
+      ? whyRevisionEdge
+      : (findRevisionEdgeForVisit(whyReasonEdges, whyVisitId) ?? whyRevisionEdge);
   // Flow Path subgraph — expand the anchor scope with the full
   // snapshot's navigation-edge transitive closure (capped). Keeps
   // the chain compact for hub visits while still surfacing the
   // parent page when the user lands on a leaf visit-instance.
   const flowSubgraph = useMemo(() => {
     if (result === null) return { nodes: [], edges: [] } as const;
-    return expandFlowSubgraph(result.snapshot.nodes, fullSnapshot.nodes, fullSnapshot.edges);
-  }, [result, fullSnapshot.nodes, fullSnapshot.edges]);
+    return expandFlowSubgraph(
+      result.snapshot.nodes,
+      filteredFullSnapshot.nodes,
+      filteredFullSnapshot.edges,
+    );
+  }, [result, filteredFullSnapshot.nodes, filteredFullSnapshot.edges]);
   const contextWorkstreamId = useMemo(() => {
     if (anchor.startsWith('workstream:')) return anchor.replace(/^workstream:/u, '');
     const workstream = result?.snapshot.nodes.find((node) => node.kind === 'workstream');
@@ -1620,8 +1698,8 @@ export const ConnectionsView = ({
           </button>
         </div>
         <span className="cx-anchor-label">Anchor</span>
-        {anchorNode !== null ? (
-          <NodeChip node={anchorNode} state="anchor" ctx={ctx} />
+        {anchorDisplayNode !== null ? (
+          <NodeChip node={anchorDisplayNode} state="anchor" ctx={ctx} />
         ) : anchor.length > 0 && loading ? (
           <span className="cx-mono cx-dim">resolving anchor…</span>
         ) : (
@@ -1741,7 +1819,9 @@ export const ConnectionsView = ({
       </div>
       <PathFinder
         anchorId={anchor}
-        anchorLabel={anchorNode === null ? null : formatEntityDisplay(anchorNode, ctx).primary}
+        anchorLabel={
+          anchorDisplayNode === null ? null : formatEntityDisplay(anchorDisplayNode, ctx).primary
+        }
         nodes={searchNodes}
         extras={searchExtras}
         ctx={ctx}
@@ -1761,7 +1841,14 @@ export const ConnectionsView = ({
           />
         </div>
       ) : null}
-      {timeline !== null ? <TimelineRail data={timeline} ctx={ctx} /> : null}
+      {timeline !== null ? (
+        <TimelineRail
+          data={timeline}
+          ctx={ctx}
+          highlightedNodeId={timelineHoverNodeId}
+          onHoverNode={setTimelineHoverNodeId}
+        />
+      ) : null}
       <div className="cx-cols">
         <aside className="cx-col-l">
           <div className="cx-section">
@@ -1924,6 +2011,7 @@ export const ConnectionsView = ({
                 result={result}
                 anchorId={anchor}
                 selectedEdge={selectedEdge}
+                highlightedNodeId={timelineHoverNodeId}
                 onSelectEdge={selectEdge}
                 onUseNodeAsAnchor={useNodeAsAnchor}
                 onPromoteSnippet={submitSnippetPromotion}
@@ -1957,6 +2045,7 @@ export const ConnectionsView = ({
                     tabSessions={deriveTabSessions(flowNodes, ctx)}
                     tabOpenerByDest={deriveTabOpenerMap(flowEdges)}
                     summary={deriveFlowSummary(flowVisits, crossReplica, ctx.replicaAlias)}
+                    highlightedVisitId={timelineHoverNodeId}
                     onNodeClick={(visitId) => {
                       setSelectedEdge(null);
                       setWhyVisitId(visitId);
@@ -1973,20 +2062,24 @@ export const ConnectionsView = ({
                 previousTopicCount={renderedFocusData.previousTopicCount}
                 emptyDetail={renderedFocusEmptyDetail}
                 workstreamOptions={workstreamOptions}
+                allowTriageTopicCards={anchor.startsWith('topic:')}
                 onTopicPromote={submitTopicPromote}
-                onTopicHide={submitTopicHide}
-                onTopicMerge={submitTopicMerge}
+                onTopicRename={submitTopicRename}
                 onVisitMarkNotRelated={submitVisitMarkNotRelated}
-                onVisitSplitOut={submitVisitSplitOut}
+                onVisitRestoreToTopic={submitVisitRestoreToTopic}
                 onEngagementRelabel={submitEngagementRelabel}
                 onTopicClick={(topicId) => {
                   // Same rationale as useNodeAsAnchor — don't dump
                   // the raw topic id into the advanced anchor input.
                   history.navigate(topicId);
                 }}
+                onTopicAnchor={({ topicId, label }) => {
+                  navigateToAnchor(topicId, label);
+                }}
                 onVisitClick={(visitId) => {
                   setWhyVisitId(visitId);
                 }}
+                {...(onOpenUrl === undefined ? {} : { onVisitOpen: onOpenUrl })}
               />
             ) : (
               <ContextPackComposer
@@ -2033,12 +2126,7 @@ export const ConnectionsView = ({
             {whyVisitId !== null && result !== null ? (
               <WhyRelatedPanel
                 fromVisitId={whyVisitId}
-                reasons={reasonsForVisit(
-                  result.snapshot.nodes,
-                  result.snapshot.edges,
-                  whyVisitId,
-                  ctx,
-                )}
+                reasons={reasonsForVisit(whyReasonNodes, whyReasonEdges, whyVisitId, whyReasonCtx)}
                 showOnlyUserAsserted={whyAssertedOnly}
                 feedback={
                   whyFeedbackEdge === null
@@ -2048,8 +2136,8 @@ export const ConnectionsView = ({
                         onFeedback: (choice) => submitFlowFeedback(whyFeedbackEdge, choice),
                       }
                 }
-                producedBy={whyRevisionEdge?.producedBy}
-                producerLabel={whyRevisionEdge?.kind}
+                producedBy={whyPanelRevisionEdge?.producedBy}
+                producerLabel={whyPanelRevisionEdge?.kind}
                 onToggleAssertedOnly={() => {
                   setWhyAssertedOnly((value) => !value);
                 }}
@@ -2068,7 +2156,7 @@ export const ConnectionsView = ({
                 ctx={ctx}
               />
             ) : (
-              <ProvenanceEmpty anchor={anchorNode} ctx={ctx} />
+              <ProvenanceEmpty anchor={anchorDisplayNode} ctx={ctx} />
             )}
           </div>
         </aside>

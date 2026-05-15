@@ -55,6 +55,7 @@ export type UserFlowRejectionReason =
   | 'stale'
   | 'duplicate'
   | 'other';
+export type UserTopicRenameSource = 'inline' | 'bulk-edit' | 'import';
 
 export interface UserOrganizedItemPayload {
   readonly payloadVersion: 1;
@@ -96,7 +97,7 @@ export interface UserTopicRenamedPayload {
   readonly topicId: string;
   readonly previousName: string;
   readonly newName: string;
-  readonly source: 'inline' | 'bulk-edit' | 'import';
+  readonly source: UserTopicRenameSource;
 }
 
 export interface UserSnippetPromotedPayload {
@@ -207,16 +208,6 @@ export const postUserFlowRejected = (
     payload: { payloadVersion: 1, ...payload },
   });
 
-export const postUserTopicRenamed = (
-  payload: Omit<UserTopicRenamedPayload, 'payloadVersion' | 'source'> & {
-    readonly source?: UserTopicRenamedPayload['source'];
-  },
-): Promise<ConnectionsClientResponse<FeedbackPostResult>> =>
-  postFeedbackEvent({
-    type: USER_TOPIC_RENAMED,
-    payload: { payloadVersion: 1, source: 'inline', ...payload },
-  });
-
 export const postUserSnippetPromoted = (
   payload: Omit<UserSnippetPromotedPayload, 'payloadVersion' | 'targetKind'> & {
     readonly targetKind?: UserSnippetPromotedPayload['targetKind'];
@@ -225,6 +216,16 @@ export const postUserSnippetPromoted = (
   postFeedbackEvent({
     type: USER_SNIPPET_PROMOTED,
     payload: { payloadVersion: 1, targetKind: 'source', ...payload },
+  });
+
+export const postUserTopicRenamed = (
+  payload: Omit<UserTopicRenamedPayload, 'payloadVersion' | 'source'> & {
+    readonly source?: UserTopicRenameSource;
+  },
+): Promise<ConnectionsClientResponse<FeedbackPostResult>> =>
+  postFeedbackEvent({
+    type: USER_TOPIC_RENAMED,
+    payload: { payloadVersion: 1, source: 'inline', ...payload },
   });
 
 export const postUserOrganizedItem = (
