@@ -354,11 +354,15 @@ describe('FlowPathView', () => {
     const anchorVisit = screen.getByTestId('flow-visit-visit:anchor');
     const laterVisit = screen.getByTestId('flow-visit-visit:later');
     expect(anchorVisit).toHaveTextContent('You are here');
-    expect(oldVisit.compareDocumentPosition(anchorVisit) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(
-      0,
-    );
-    expect(
-      anchorVisit.compareDocumentPosition(laterVisit) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).not.toBe(0);
+    // Ordering rework (not styling): the anchor's tab comes first;
+    // the other tab groups follow, sorted by opener relationship then
+    // recency. No opener edges here, so the more recent tab (later)
+    // precedes the older one (old). The surrounding rows are still
+    // rendered — just reordered under the anchor-first rule.
+    const followedBy = (a: Element, b: Element): boolean =>
+      (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+    expect(followedBy(anchorVisit, oldVisit)).toBe(true);
+    expect(followedBy(anchorVisit, laterVisit)).toBe(true);
+    expect(followedBy(laterVisit, oldVisit)).toBe(true);
   });
 });

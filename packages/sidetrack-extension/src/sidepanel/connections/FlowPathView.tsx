@@ -334,7 +334,52 @@ export const FlowPathView = ({
       }
       index += 1;
     }
-    return groups.sort((left, right) => left.firstIndex - right.firstIndex);
+    // Ordering (not styling): the anchor's tab first — its internal
+    // prior -> "You are here" -> later segmentation is handled per
+    // cell below — then the remaining tab groups by opener
+    // relationship to the anchor tab, then recency. Encounter order
+    // is only the final stable tie-break.
+    const anchorTabHash = visits.find((v) => v.isAnchor === true)?.tabSessionIdHash;
+    // Undirected opener adjacency: distance reflects "related to the
+    // anchor tab" regardless of which side opened which.
+    const openerAdj = new Map<string, Set<string>>();
+    const linkTabs = (a: string, b: string): void => {
+      (openerAdj.get(a) ?? openerAdj.set(a, new Set()).get(a))?.add(b);
+      (openerAdj.get(b) ?? openerAdj.set(b, new Set()).get(b))?.add(a);
+    };
+    for (const [dest, src] of openerByDestTab) linkTabs(dest, src);
+    const openerDistance = new Map<string, number>();
+    if (anchorTabHash !== undefined) {
+      openerDistance.set(anchorTabHash, 0);
+      let frontier: string[] = [anchorTabHash];
+      let depth = 0;
+      while (frontier.length > 0) {
+        const next: string[] = [];
+        for (const tab of frontier) {
+          for (const neighbor of openerAdj.get(tab) ?? []) {
+            if (openerDistance.has(neighbor)) continue;
+            openerDistance.set(neighbor, depth + 1);
+            next.push(neighbor);
+          }
+        }
+        frontier = next;
+        depth += 1;
+      }
+    }
+    const groupTab = (g: TabGroup): string => g.entries[0]?.tabSessionIdHash ?? g.key;
+    const recencyOf = (g: TabGroup): string =>
+      g.visits.reduce((max, v) => (v.commitTimestamp > max ? v.commitTimestamp : max), '');
+    const openerRank = (g: TabGroup): number =>
+      g.hasAnchor ? -1 : (openerDistance.get(groupTab(g)) ?? Number.POSITIVE_INFINITY);
+    return [...groups].sort((left, right) => {
+      const rl = openerRank(left);
+      const rr = openerRank(right);
+      if (rl !== rr) return rl - rr;
+      // Tie-break: more recent activity first, then stable encounter order.
+      const recencyCmp = recencyOf(right).localeCompare(recencyOf(left));
+      if (recencyCmp !== 0) return recencyCmp;
+      return left.firstIndex - right.firstIndex;
+    });
   })();
 
   return (
