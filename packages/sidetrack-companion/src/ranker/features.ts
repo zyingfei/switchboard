@@ -13,16 +13,15 @@ import {
   isUserEngagementRelabeledPayload,
   isUserOrganizedItemPayload,
 } from '../feedback/events.js';
+import { NAVIGATION_COMMITTED, isNavigationCommittedPayload } from '../navigation/events.js';
 import {
-  NAVIGATION_COMMITTED,
-  isNavigationCommittedPayload,
-} from '../navigation/events.js';
+  PAGE_CONTENT_EXTRACTED,
+  isPageContentExtractedPayload,
+  type PageContentQuality,
+} from '../page-content/events.js';
 import { SELECTION_COPIED, isSelectionCopiedPayload } from '../snippets/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
-import {
-  BROWSER_TIMELINE_OBSERVED,
-  isBrowserTimelineObservedPayload,
-} from '../timeline/events.js';
+import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from '../timeline/events.js';
 import { detectSearchUrl } from '../timeline/sanitize.js';
 import {
   FEATURE_SCHEMA_VERSION,
@@ -71,6 +70,25 @@ interface FeatureModel {
   readonly returnCountByVisit: ReadonlyMap<string, number>;
   readonly openerGraph: ReadonlyMap<string, ReadonlySet<string>>;
   readonly navigationGraph: ReadonlyMap<string, ReadonlySet<string>>;
+  // Active-topic membership: visit alias (canonicalUrl) → set of
+  // `topic:` node ids the visit is a *primary* member of. Derived
+  // read-only from the snapshot's materialized `visit_in_topic` edges
+  // (topicSnapshotOverlay). Secondary affiliations are excluded so
+  // "same active topic" reflects the clusterer's hard assignment.
+  readonly primaryTopicsByVisitKey: ReadonlyMap<string, ReadonlySet<string>>;
+  // Topic-lineage adjacency over merge/split ancestry only. Keyed by
+  // `topic:` node id; values are the topic ids it is related to by a
+  // materialized `topic.lineage` edge whose `lineageKind` is `merge`
+  // or `split` (either direction — the relation is symmetric for the
+  // ranker's purposes). `continue`/`birth`/`death`/`resurface` are
+  // excluded: they are intra-lineage continuity, not a cross-topic
+  // split/merge relationship.
+  readonly topicLineageMergeSplitGraph: ReadonlyMap<string, ReadonlySet<string>>;
+  // Page-content quality tier per visit alias (canonicalUrl). Latest
+  // `page.content.extracted` event wins by (acceptedAt, replicaId,
+  // seq). Tombstones are not modeled as a quality value — a missing
+  // entry is treated as "unknown" (feature value 0).
+  readonly pageQualityByVisitKey: ReadonlyMap<string, OrderedValue<PageContentQuality>>;
   readonly snapshot: ConnectionsSnapshot;
   readonly referenceMs: number | null;
 }
@@ -79,7 +97,18 @@ const TIMELINE_VISIT_PREFIX = 'timeline-visit:';
 const THREAD_PREFIX = 'thread:';
 const WORKSTREAM_PREFIX = 'workstream:';
 const SNIPPET_PREFIX = 'snippet:';
+const TOPIC_PREFIX = 'topic:';
 const DAY_MS = 24 * 60 * 60 * 1_000;
+
+// Ordinal encoding for the page-content quality tier. `low < medium <
+// high`; 0 is reserved for "no extracted content / unknown" so the
+// feature is monotonic and a missing value never looks like a real
+// tier.
+const PAGE_QUALITY_TIER: Readonly<Record<PageContentQuality, number>> = {
+  low: 1,
+  medium: 2,
+  high: 3,
+};
 
 const TITLE_PATH_STOP_TOKENS: ReadonlySet<string> = new Set([
   'about',
@@ -171,10 +200,7 @@ const unionSetsForAliases = (
   return out;
 };
 
-const countIntersection = (
-  left: ReadonlySet<string>,
-  right: ReadonlySet<string>,
-): number => {
+const countIntersection = (left: ReadonlySet<string>, right: ReadonlySet<string>): number => {
   let count = 0;
   const [smaller, larger] = left.size <= right.size ? [left, right] : [right, left];
   for (const value of smaller) {
@@ -183,10 +209,8 @@ const countIntersection = (
   return count;
 };
 
-const hasIntersection = (
-  left: ReadonlySet<string>,
-  right: ReadonlySet<string>,
-): boolean => countIntersection(left, right) > 0;
+const hasIntersection = (left: ReadonlySet<string>, right: ReadonlySet<string>): boolean =>
+  countIntersection(left, right) > 0;
 
 const toBinary = (value: boolean): BinaryFeature => (value ? 1 : 0);
 
@@ -283,7 +307,9 @@ const collectVisitRecords = (
         url: event.payload.url,
         canonicalUrl,
         observedAtMs: event.payload.commitTimestamp,
-        ...(event.payload.openerVisitId === null ? {} : { openerVisitId: event.payload.openerVisitId }),
+        ...(event.payload.openerVisitId === null
+          ? {}
+          : { openerVisitId: event.payload.openerVisitId }),
         ...(event.payload.previousVisitId === null
           ? {}
           : { previousVisitId: event.payload.previousVisitId }),
@@ -437,7 +463,7 @@ const searchQueriesForVisit = (model: FeatureModel, visitId: string): ReadonlySe
     const search =
       record === undefined
         ? detectSearchUrl(alias)
-        : detectSearchUrl(record.canonicalUrl) ?? detectSearchUrl(record.url);
+        : (detectSearchUrl(record.canonicalUrl) ?? detectSearchUrl(record.url));
     if (search !== null) {
       const query = normalizeSearchQuery(search.query);
       if (query.length > 0) queries.add(query);
@@ -451,10 +477,7 @@ const tokenize = (value: string): readonly string[] =>
     .split(/[^A-Za-z0-9]+/u)
     .map((token) => token.trim().toLowerCase())
     .filter(
-      (token) =>
-        token.length >= 3 &&
-        !/^\d+$/u.test(token) &&
-        !TITLE_PATH_STOP_TOKENS.has(token),
+      (token) => token.length >= 3 && !/^\d+$/u.test(token) && !TITLE_PATH_STOP_TOKENS.has(token),
     );
 
 const titleTokensForVisit = (model: FeatureModel, visitId: string): ReadonlySet<string> => {
@@ -536,11 +559,13 @@ const snippetEdgePair = (
 ): { readonly snippetId: string; readonly visitKey: string } | null => {
   const fromSnippet = parsePrefixedId(edge.fromNodeId, SNIPPET_PREFIX);
   const toVisit = parsePrefixedId(edge.toNodeId, TIMELINE_VISIT_PREFIX);
-  if (fromSnippet !== null && toVisit !== null) return { snippetId: fromSnippet, visitKey: toVisit };
+  if (fromSnippet !== null && toVisit !== null)
+    return { snippetId: fromSnippet, visitKey: toVisit };
 
   const toSnippet = parsePrefixedId(edge.toNodeId, SNIPPET_PREFIX);
   const fromVisit = parsePrefixedId(edge.fromNodeId, TIMELINE_VISIT_PREFIX);
-  if (toSnippet !== null && fromVisit !== null) return { snippetId: toSnippet, visitKey: fromVisit };
+  if (toSnippet !== null && fromVisit !== null)
+    return { snippetId: toSnippet, visitKey: fromVisit };
 
   return null;
 };
@@ -580,10 +605,7 @@ const containerKindForOrganizedTarget = (
 const organizedVisitIds = (payload: {
   readonly itemId: string;
   readonly details?: { readonly mergeMembers?: readonly string[] };
-}): readonly string[] => [
-  payload.itemId,
-  ...(payload.details?.mergeMembers ?? []),
-];
+}): readonly string[] => [payload.itemId, ...(payload.details?.mergeMembers ?? [])];
 
 const buildUserAssertedMaps = (
   events: readonly AcceptedEvent[],
@@ -598,7 +620,8 @@ const buildUserAssertedMaps = (
   for (const edge of snapshot.edges) {
     if (edge.confidence !== 'asserted') continue;
     const threadPair = visitAndContainerFromEdge(edge, THREAD_PREFIX);
-    if (threadPair !== null) addToSetMap(threadsByVisit, threadPair.visitKey, threadPair.containerId);
+    if (threadPair !== null)
+      addToSetMap(threadsByVisit, threadPair.visitKey, threadPair.containerId);
     const workstreamPair = visitAndContainerFromEdge(edge, WORKSTREAM_PREFIX);
     if (workstreamPair !== null) {
       addToSetMap(workstreamsByVisit, workstreamPair.visitKey, workstreamPair.containerId);
@@ -675,9 +698,7 @@ const buildEngagementClassMap = (
   return classes;
 };
 
-const buildReturnCountMap = (
-  events: readonly AcceptedEvent[],
-): ReadonlyMap<string, number> => {
+const buildReturnCountMap = (events: readonly AcceptedEvent[]): ReadonlyMap<string, number> => {
   const latestByVisitSession = new Map<string, ReturnSession>();
   for (const event of events) {
     if (
@@ -720,6 +741,86 @@ const buildChainGraph = (
     addToSetMap(graph, linked, record.id);
   }
   return graph;
+};
+
+// Read-only projection of the materialized `visit_in_topic` edges.
+// Only `affiliation === 'primary'` edges count toward active-topic
+// membership; secondary affiliations are softer and would inflate the
+// "same active topic" signal. The clusterer overlay sets the edge
+// metadata, so this stays a pure read of committed snapshot bytes.
+const buildPrimaryTopicsByVisitKey = (
+  snapshot: ConnectionsSnapshot,
+): ReadonlyMap<string, ReadonlySet<string>> => {
+  const byVisit = new Map<string, Set<string>>();
+  for (const edge of snapshot.edges) {
+    if (edge.kind !== 'visit_in_topic') continue;
+    const affiliation = edge.metadata?.['affiliation'];
+    if (affiliation !== undefined && affiliation !== 'primary') continue;
+    const visitKey = parsePrefixedId(edge.fromNodeId, TIMELINE_VISIT_PREFIX);
+    if (visitKey === null || !edge.toNodeId.startsWith(TOPIC_PREFIX)) continue;
+    addToSetMap(byVisit, visitKey, edge.toNodeId);
+  }
+  return byVisit;
+};
+
+// Symmetric merge/split ancestry adjacency over `topic.lineage`
+// edges. `lineageKind` is carried in the materialized edge metadata
+// (see topicSnapshotOverlay). We treat the relation as undirected so
+// the asymmetric (from, to) candidate input still benefits whether
+// the user is moving toward the merged topic or away from the split
+// parent.
+const buildTopicLineageMergeSplitGraph = (
+  snapshot: ConnectionsSnapshot,
+): ReadonlyMap<string, ReadonlySet<string>> => {
+  const graph = new Map<string, Set<string>>();
+  for (const edge of snapshot.edges) {
+    if (edge.kind !== 'topic.lineage') continue;
+    const lineageKind = edge.metadata?.['lineageKind'];
+    if (lineageKind !== 'merge' && lineageKind !== 'split') continue;
+    if (
+      !edge.fromNodeId.startsWith(TOPIC_PREFIX) ||
+      !edge.toNodeId.startsWith(TOPIC_PREFIX) ||
+      edge.fromNodeId === edge.toNodeId
+    ) {
+      continue;
+    }
+    addToSetMap(graph, edge.fromNodeId, edge.toNodeId);
+    addToSetMap(graph, edge.toNodeId, edge.fromNodeId);
+  }
+  return graph;
+};
+
+const isPageContentQuality = (value: unknown): value is PageContentQuality =>
+  value === 'high' || value === 'medium' || value === 'low';
+
+// Latest extracted page-content quality per canonical URL. Keyed by
+// the same `visitKeyForUrl`-normalized canonical URL the alias
+// resolver produces, so a candidate's aliases line up with the
+// quality map without an extra join.
+const buildPageQualityByVisitKey = (
+  events: readonly AcceptedEvent[],
+): ReadonlyMap<string, OrderedValue<PageContentQuality>> => {
+  const byVisit = new Map<string, OrderedValue<PageContentQuality>>();
+  const put = (key: string, value: OrderedValue<PageContentQuality>): void => {
+    if (key.length === 0) return;
+    const existing = byVisit.get(key);
+    if (existing === undefined || compareOrdered(existing, value) <= 0) {
+      byVisit.set(key, value);
+    }
+  };
+
+  for (const event of events) {
+    if (event.type !== PAGE_CONTENT_EXTRACTED) continue;
+    if (!isPageContentExtractedPayload(event.payload)) continue;
+    if (!isPageContentQuality(event.payload.quality)) continue;
+    put(visitKeyForUrl(event.payload.canonicalUrl), {
+      value: event.payload.quality,
+      acceptedAtMs: event.acceptedAtMs,
+      replicaId: event.dot.replicaId,
+      seq: event.dot.seq,
+    });
+  }
+  return byVisit;
 };
 
 const referenceMsFor = (
@@ -765,17 +866,23 @@ const buildFeatureModel = (
     returnCountByVisit: buildReturnCountMap(events),
     openerGraph: buildChainGraph(recordsById, (record) => record.openerVisitId),
     navigationGraph: buildChainGraph(recordsById, (record) => record.previousVisitId),
+    primaryTopicsByVisitKey: buildPrimaryTopicsByVisitKey(snapshot),
+    topicLineageMergeSplitGraph: buildTopicLineageMergeSplitGraph(snapshot),
+    pageQualityByVisitKey: buildPageQualityByVisitKey(events),
     snapshot,
     referenceMs: referenceMsFor(events, snapshot),
   };
 };
 
-const sameWorkstreamFeature = (
-  candidate: Candidate,
-  model: FeatureModel,
-): BinaryFeature => {
-  const left = unionSetsForAliases(model.workstreamsByVisit, aliasesForVisit(model, candidate.fromVisitId));
-  const right = unionSetsForAliases(model.workstreamsByVisit, aliasesForVisit(model, candidate.toVisitId));
+const sameWorkstreamFeature = (candidate: Candidate, model: FeatureModel): BinaryFeature => {
+  const left = unionSetsForAliases(
+    model.workstreamsByVisit,
+    aliasesForVisit(model, candidate.fromVisitId),
+  );
+  const right = unionSetsForAliases(
+    model.workstreamsByVisit,
+    aliasesForVisit(model, candidate.toVisitId),
+  );
   return toBinary(hasIntersection(left, right));
 };
 
@@ -806,20 +913,14 @@ const chainDepth = (
   return 0;
 };
 
-const openerChainDepthFeature = (
-  candidate: Candidate,
-  model: FeatureModel,
-): number =>
+const openerChainDepthFeature = (candidate: Candidate, model: FeatureModel): number =>
   chainDepth(
     model.openerGraph,
     aliasesForVisit(model, candidate.fromVisitId),
     aliasesForVisit(model, candidate.toVisitId),
   );
 
-const inNavigationChainFeature = (
-  candidate: Candidate,
-  model: FeatureModel,
-): BinaryFeature =>
+const inNavigationChainFeature = (candidate: Candidate, model: FeatureModel): BinaryFeature =>
   toBinary(
     chainDepth(
       model.navigationGraph,
@@ -828,21 +929,13 @@ const inNavigationChainFeature = (
     ) > 0,
   );
 
-const sameCanonicalUrlFeature = (
-  candidate: Candidate,
-  model: FeatureModel,
-): BinaryFeature => {
+const sameCanonicalUrlFeature = (candidate: Candidate, model: FeatureModel): BinaryFeature => {
   const fromCanonical = canonicalUrlForVisit(model, candidate.fromVisitId);
   const toCanonical = canonicalUrlForVisit(model, candidate.toVisitId);
-  return toBinary(
-    fromCanonical !== null && toCanonical !== null && fromCanonical === toCanonical,
-  );
+  return toBinary(fromCanonical !== null && toCanonical !== null && fromCanonical === toCanonical);
 };
 
-const sameHostFeature = (
-  candidate: Candidate,
-  model: FeatureModel,
-): BinaryFeature => {
+const sameHostFeature = (candidate: Candidate, model: FeatureModel): BinaryFeature => {
   const fromCanonical = canonicalUrlForVisit(model, candidate.fromVisitId);
   const toCanonical = canonicalUrlForVisit(model, candidate.toVisitId);
   if (fromCanonical === null || toCanonical === null) return 0;
@@ -851,10 +944,7 @@ const sameHostFeature = (
   return toBinary(fromHost !== null && toHost !== null && fromHost === toHost);
 };
 
-const sameRepoFeature = (
-  candidate: Candidate,
-  model: FeatureModel,
-): BinaryFeature => {
+const sameRepoFeature = (candidate: Candidate, model: FeatureModel): BinaryFeature => {
   const fromCanonical = canonicalUrlForVisit(model, candidate.fromVisitId);
   const toCanonical = canonicalUrlForVisit(model, candidate.toVisitId);
   if (fromCanonical === null || toCanonical === null) return 0;
@@ -863,10 +953,7 @@ const sameRepoFeature = (
   return toBinary(fromRepo !== null && toRepo !== null && fromRepo === toRepo);
 };
 
-const sameSearchQueryFeature = (
-  candidate: Candidate,
-  model: FeatureModel,
-): BinaryFeature =>
+const sameSearchQueryFeature = (candidate: Candidate, model: FeatureModel): BinaryFeature =>
   toBinary(
     hasIntersection(
       searchQueriesForVisit(model, candidate.fromVisitId),
@@ -874,28 +961,19 @@ const sameSearchQueryFeature = (
     ),
   );
 
-const sameCopiedSnippetCountFeature = (
-  candidate: Candidate,
-  model: FeatureModel,
-): number =>
+const sameCopiedSnippetCountFeature = (candidate: Candidate, model: FeatureModel): number =>
   countIntersection(
     unionSetsForAliases(model.snippetsByVisit, aliasesForVisit(model, candidate.fromVisitId)),
     unionSetsForAliases(model.snippetsByVisit, aliasesForVisit(model, candidate.toVisitId)),
   );
 
-const sharedTitleTokensFeature = (
-  candidate: Candidate,
-  model: FeatureModel,
-): number =>
+const sharedTitleTokensFeature = (candidate: Candidate, model: FeatureModel): number =>
   countIntersection(
     titleTokensForVisit(model, candidate.fromVisitId),
     titleTokensForVisit(model, candidate.toVisitId),
   );
 
-const sharedPathTokensFeature = (
-  candidate: Candidate,
-  model: FeatureModel,
-): number =>
+const sharedPathTokensFeature = (candidate: Candidate, model: FeatureModel): number =>
   countIntersection(
     pathTokensForVisit(model, candidate.fromVisitId),
     pathTokensForVisit(model, candidate.toVisitId),
@@ -921,10 +999,7 @@ const clampedUnit = (value: number): number => {
   return value;
 };
 
-const cosineSimilarityFeature = (
-  candidate: Candidate,
-  model: FeatureModel,
-): number => {
+const cosineSimilarityFeature = (candidate: Candidate, model: FeatureModel): number => {
   const fromAliases = aliasesForVisit(model, candidate.fromVisitId);
   const toAliases = aliasesForVisit(model, candidate.toVisitId);
   let best = 0;
@@ -940,10 +1015,7 @@ const cosineSimilarityFeature = (
   return best;
 };
 
-const latestObservedAtForVisit = (
-  candidateVisitId: string,
-  model: FeatureModel,
-): number | null => {
+const latestObservedAtForVisit = (candidateVisitId: string, model: FeatureModel): number | null => {
   let latest: number | null = null;
   for (const alias of aliasesForVisit(model, candidateVisitId)) {
     const record = model.recordsById.get(alias);
@@ -965,20 +1037,13 @@ const recencyScore = (candidateVisitId: string, model: FeatureModel): number => 
   return Math.exp(-ageDays / 30);
 };
 
-const recencyScoreFromFeature = (
-  candidate: Candidate,
-  model: FeatureModel,
-): number => recencyScore(candidate.fromVisitId, model);
+const recencyScoreFromFeature = (candidate: Candidate, model: FeatureModel): number =>
+  recencyScore(candidate.fromVisitId, model);
 
-const recencyScoreToFeature = (
-  candidate: Candidate,
-  model: FeatureModel,
-): number => recencyScore(candidate.toVisitId, model);
+const recencyScoreToFeature = (candidate: Candidate, model: FeatureModel): number =>
+  recencyScore(candidate.toVisitId, model);
 
-const engagementClassForVisit = (
-  candidateVisitId: string,
-  model: FeatureModel,
-): string | null => {
+const engagementClassForVisit = (candidateVisitId: string, model: FeatureModel): string | null => {
   let selected: OrderedValue<string> | null = null;
   for (const alias of aliasesForVisit(model, candidateVisitId)) {
     const value = model.engagementClassByVisit.get(alias);
@@ -988,19 +1053,13 @@ const engagementClassForVisit = (
   return selected?.value ?? null;
 };
 
-const engagementClassMatchFeature = (
-  candidate: Candidate,
-  model: FeatureModel,
-): BinaryFeature => {
+const engagementClassMatchFeature = (candidate: Candidate, model: FeatureModel): BinaryFeature => {
   const fromClass = engagementClassForVisit(candidate.fromVisitId, model);
   const toClass = engagementClassForVisit(candidate.toVisitId, model);
   return toBinary(fromClass !== null && toClass !== null && fromClass === toClass);
 };
 
-const returnCountForVisit = (
-  candidateVisitId: string,
-  model: FeatureModel,
-): number => {
+const returnCountForVisit = (candidateVisitId: string, model: FeatureModel): number => {
   let count = 0;
   const countedAliases = new Set<string>();
   for (const alias of aliasesForVisit(model, candidateVisitId)) {
@@ -1011,20 +1070,13 @@ const returnCountForVisit = (
   return count;
 };
 
-const returnCountFromFeature = (
-  candidate: Candidate,
-  model: FeatureModel,
-): number => returnCountForVisit(candidate.fromVisitId, model);
+const returnCountFromFeature = (candidate: Candidate, model: FeatureModel): number =>
+  returnCountForVisit(candidate.fromVisitId, model);
 
-const returnCountToFeature = (
-  candidate: Candidate,
-  model: FeatureModel,
-): number => returnCountForVisit(candidate.toVisitId, model);
+const returnCountToFeature = (candidate: Candidate, model: FeatureModel): number =>
+  returnCountForVisit(candidate.toVisitId, model);
 
-const userAssertedInThreadFeature = (
-  candidate: Candidate,
-  model: FeatureModel,
-): BinaryFeature =>
+const userAssertedInThreadFeature = (candidate: Candidate, model: FeatureModel): BinaryFeature =>
   toBinary(
     hasIntersection(
       unionSetsForAliases(model.userThreadsByVisit, aliasesForVisit(model, candidate.fromVisitId)),
@@ -1049,6 +1101,70 @@ const userAssertedInWorkstreamFeature = (
     ),
   );
 
+// ---------------------------------------------------------------------------
+// R5 ranker expansion — appended features (stable order; never reorder).
+//
+// SCOPE NOTE / documented follow-up: this pass only *adds* features to
+// the existing `closest_visit` ranker. It deliberately does NOT broaden
+// what the ranker ranks (e.g. `visit_resembles_visit` or topic-level
+// edges). Wiring the lineage/quality features into a topic-edge ranker
+// is a separate, larger change and is intentionally deferred so this
+// pass stays additive and verifiable.
+// ---------------------------------------------------------------------------
+
+const primaryTopicsForVisit = (
+  candidateVisitId: string,
+  model: FeatureModel,
+): ReadonlySet<string> =>
+  unionSetsForAliases(model.primaryTopicsByVisitKey, aliasesForVisit(model, candidateVisitId));
+
+// 1 when both visits are hard-assigned (primary affiliation) to at
+// least one shared active topic.
+const sameActiveTopicFeature = (candidate: Candidate, model: FeatureModel): BinaryFeature =>
+  toBinary(
+    hasIntersection(
+      primaryTopicsForVisit(candidate.fromVisitId, model),
+      primaryTopicsForVisit(candidate.toVisitId, model),
+    ),
+  );
+
+// 1 when the from-visit's topic(s) and the to-visit's topic(s) are
+// distinct but linked by a merge/split lineage edge — i.e. the two
+// pages live on opposite sides of a topic split or merge. Returns 0
+// when they share a topic outright (that is `same_active_topic`'s
+// job) or have no lineage relation.
+const topicLineageMergeSplitRelatedFeature = (
+  candidate: Candidate,
+  model: FeatureModel,
+): BinaryFeature => {
+  const fromTopics = primaryTopicsForVisit(candidate.fromVisitId, model);
+  const toTopics = primaryTopicsForVisit(candidate.toVisitId, model);
+  if (fromTopics.size === 0 || toTopics.size === 0) return 0;
+  if (hasIntersection(fromTopics, toTopics)) return 0;
+  for (const fromTopic of [...fromTopics].sort(compareText)) {
+    const related = model.topicLineageMergeSplitGraph.get(fromTopic);
+    if (related === undefined) continue;
+    if (hasIntersection(related, toTopics)) return 1;
+  }
+  return 0;
+};
+
+const pageQualityTierForVisit = (candidateVisitId: string, model: FeatureModel): number => {
+  let selected: OrderedValue<PageContentQuality> | null = null;
+  for (const alias of aliasesForVisit(model, candidateVisitId)) {
+    const value = model.pageQualityByVisitKey.get(alias);
+    if (value === undefined) continue;
+    if (selected === null || compareOrdered(selected, value) <= 0) selected = value;
+  }
+  return selected === null ? 0 : PAGE_QUALITY_TIER[selected.value];
+};
+
+const pageQualityTierFromFeature = (candidate: Candidate, model: FeatureModel): number =>
+  pageQualityTierForVisit(candidate.fromVisitId, model);
+
+const pageQualityTierToFeature = (candidate: Candidate, model: FeatureModel): number =>
+  pageQualityTierForVisit(candidate.toVisitId, model);
+
 export const extractFeatures: ExtractFeatures = (candidate, context): CandidatePairFeatures => {
   const model = buildFeatureModel(context.merged, context.snapshot);
 
@@ -1072,5 +1188,9 @@ export const extractFeatures: ExtractFeatures = (candidate, context): CandidateP
     return_count_to: returnCountToFeature(candidate, model),
     user_asserted_in_thread: userAssertedInThreadFeature(candidate, model),
     user_asserted_in_workstream: userAssertedInWorkstreamFeature(candidate, model),
+    same_active_topic: sameActiveTopicFeature(candidate, model),
+    topic_lineage_merge_split_related: topicLineageMergeSplitRelatedFeature(candidate, model),
+    page_quality_tier_from: pageQualityTierFromFeature(candidate, model),
+    page_quality_tier_to: pageQualityTierToFeature(candidate, model),
   };
 };

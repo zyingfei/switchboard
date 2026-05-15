@@ -122,6 +122,10 @@ const contributions = (overrides: Partial<Record<keyof CandidatePairFeatures, nu
     return_count_to: 0,
     user_asserted_in_thread: 0,
     user_asserted_in_workstream: 0.05,
+    same_active_topic: 0,
+    topic_lineage_merge_split_related: 0,
+    page_quality_tier_from: 0,
+    page_quality_tier_to: 0,
     ...overrides,
   }) satisfies Readonly<Record<keyof CandidatePairFeatures, number>>;
 
@@ -145,7 +149,7 @@ describe('sidetrack.debug.explainRanking', () => {
   it('returns exact stable debug JSON for a fixture visit pair', async () => {
     await expect(explainRanking({ from: fromVisit, to: toVisit }, deps())).resolves.toEqual({
       features: {
-        schemaVersion: 1,
+        schemaVersion: 2,
         same_workstream: 1,
         opener_chain_depth: 0,
         in_navigation_chain: 0,
@@ -164,6 +168,10 @@ describe('sidetrack.debug.explainRanking', () => {
         return_count_to: 0,
         user_asserted_in_thread: 0,
         user_asserted_in_workstream: 1,
+        same_active_topic: 0,
+        topic_lineage_merge_split_related: 0,
+        page_quality_tier_from: 0,
+        page_quality_tier_to: 0,
       },
       modelVersion: 'lightgbm-lambdamart-v1',
       revisionId: 'ranker-rev-fixture',
@@ -187,6 +195,10 @@ describe('sidetrack.debug.explainRanking', () => {
         { feature: 'return_count_to', weight: 0 },
         { feature: 'user_asserted_in_thread', weight: 0 },
         { feature: 'user_asserted_in_workstream', weight: 0.05 },
+        { feature: 'same_active_topic', weight: 0 },
+        { feature: 'topic_lineage_merge_split_related', weight: 0 },
+        { feature: 'page_quality_tier_from', weight: 0 },
+        { feature: 'page_quality_tier_to', weight: 0 },
       ],
       sortedReasonCodes: [
         {
