@@ -188,15 +188,15 @@ describe('connections client helpers', () => {
       fromClass: 'skimmed',
       toClass: 'worked_on_reference',
     });
-    await postUserTopicRenamed({
-      topicId: 'topic:alpha',
-      previousName: 'Old alpha',
-      newName: 'New alpha',
-    });
     await postUserSnippetPromoted({
       snippetId: 'snippet:1',
       targetId: 'visit:a',
       sourceVisitId: 'visit:a',
+    });
+    await postUserTopicRenamed({
+      topicId: 'topic:alpha',
+      previousName: 'Alpha',
+      newName: 'Oracle research',
     });
     await postUserOrganizedItem({
       itemKind: 'thread',
@@ -204,6 +204,7 @@ describe('connections client helpers', () => {
       action: 'move',
       fromContainer: 'workstream:old',
       toContainer: 'workstream:new',
+      details: { memberIds: ['timeline-visit:a', 'timeline-visit:b'] },
     });
 
     expect(sent).toEqual([
@@ -250,20 +251,6 @@ describe('connections client helpers', () => {
       expect.objectContaining({
         type: messageTypes.postConnectionsFeedbackEvent,
         event: {
-          type: 'user.topic.renamed',
-          payload: {
-            payloadVersion: 1,
-            topicId: 'topic:alpha',
-            previousName: 'Old alpha',
-            newName: 'New alpha',
-            source: 'inline',
-          },
-        },
-        clientEventId: expect.stringMatching(/^feedback-user\.topic\.renamed-/u),
-      }),
-      expect.objectContaining({
-        type: messageTypes.postConnectionsFeedbackEvent,
-        event: {
           type: 'user.snippet.promoted',
           payload: {
             payloadVersion: 1,
@@ -278,6 +265,20 @@ describe('connections client helpers', () => {
       expect.objectContaining({
         type: messageTypes.postConnectionsFeedbackEvent,
         event: {
+          type: 'user.topic.renamed',
+          payload: {
+            payloadVersion: 1,
+            topicId: 'topic:alpha',
+            previousName: 'Alpha',
+            newName: 'Oracle research',
+            source: 'inline',
+          },
+        },
+        clientEventId: expect.stringMatching(/^feedback-user\.topic\.renamed-/u),
+      }),
+      expect.objectContaining({
+        type: messageTypes.postConnectionsFeedbackEvent,
+        event: {
           type: 'user.organized.item',
           payload: {
             payloadVersion: 1,
@@ -286,6 +287,7 @@ describe('connections client helpers', () => {
             action: 'move',
             fromContainer: 'workstream:old',
             toContainer: 'workstream:new',
+            details: { memberIds: ['timeline-visit:a', 'timeline-visit:b'] },
           },
         },
         clientEventId: expect.stringMatching(/^feedback-user\.organized\.item-/u),
