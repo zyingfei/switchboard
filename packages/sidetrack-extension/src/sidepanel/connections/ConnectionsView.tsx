@@ -103,6 +103,26 @@ export interface ConnectionsViewWorkstreamAnchor {
   readonly meta?: string;
 }
 
+// Derive a node kind from an anchor id prefix so history entries get
+// the right icon/tint without a snapshot round-trip. Unknown shapes
+// fall back to the page kind (still iconed).
+const ANCHOR_KIND_BY_PREFIX: Partial<Record<string, ConnectionNodeKind>> = {
+  topic: 'topic',
+  workstream: 'workstream',
+  thread: 'thread',
+  'visit-instance': 'visit-instance',
+  'timeline-visit': 'timeline-visit',
+  'tab-session': 'tab-session',
+  snippet: 'snippet',
+  annotation: 'annotation',
+  'coding-session': 'coding-session',
+};
+const anchorKindFromId = (id: string): ConnectionNodeKind => {
+  const sep = id.indexOf(':');
+  const prefix = sep >= 0 ? id.slice(0, sep) : id;
+  return ANCHOR_KIND_BY_PREFIX[prefix] ?? 'timeline-visit';
+};
+
 type Props = {
   readonly initialAnchor?: string;
   readonly recentAnchors?: readonly ConnectionsViewRecentAnchor[];
@@ -1306,6 +1326,32 @@ export const ConnectionsView = ({
 
   const selectedWorkstreamAnchor = anchor.startsWith('workstream:') ? anchor : '';
 
+  // #5 — collapsible panels. Always-available restrained toggles:
+  // left rail (Find/Workstream/Recent/Shortcuts), the right anchor
+  // summary (cx-col-r: why-related / provenance), and the page-text
+  // card. Collapsing reclaims the fixed column width.
+  const [leftRailOpen, setLeftRailOpen] = useState(true);
+  const [rightPanelOpen, setRightPanelOpen] = useState(true);
+  const [anchorSummaryOpen, setAnchorSummaryOpen] = useState(true);
+
+  // Honest "Recent anchors" — built from real navigation history
+  // (clicks/navigation), not the thread/workstream shortcut prop.
+  // Label prefers the human override captured on navigate; otherwise
+  // resolve against the current snapshot.
+  const historyAnchors = useMemo<readonly ConnectionsViewRecentAnchor[]>(() => {
+    const nodeById = new Map(
+      (result?.snapshot.nodes ?? []).map((node) => [node.id, node] as const),
+    );
+    return history.recent.map((id) => {
+      const override = anchorLabelOverrides[id];
+      const label =
+        override !== undefined && override.length > 0
+          ? override
+          : formatNodeIdDisplay(id, nodeById, ctx).primary;
+      return { id, kind: anchorKindFromId(id), label };
+    });
+  }, [history.recent, anchorLabelOverrides, result, ctx]);
+
   // Search pool — node candidates merged from (a) the current
   // anchor's neighborhood (small, always fresh) + (b) the full
   // snapshot (large, primed on search-box focus). Anchor scope
@@ -1982,7 +2028,21 @@ export const ConnectionsView = ({
         <HopToggle value={hops} onChange={setHops} />
       </div>
       {anchorCanonicalUrl !== null ? (
-        <div className="cx-page-content-card" data-testid="connections-page-content-card">
+        <div
+          className={'cx-page-content-card' + (anchorSummaryOpen ? '' : ' is-collapsed')}
+          data-testid="connections-page-content-card"
+        >
+          <button
+            type="button"
+            className="cx-summary-toggle cx-mono cx-dim"
+            onClick={() => {
+              setAnchorSummaryOpen((v) => !v);
+            }}
+            aria-expanded={anchorSummaryOpen}
+            data-testid="connections-summary-toggle"
+          >
+            {anchorSummaryOpen ? '▾' : '▸'} Page text
+          </button>
           <div className="cx-page-content-main">
             <span className="cx-page-content-label">Page text</span>
             <span className="cx-page-content-state">
@@ -2203,7 +2263,18 @@ export const ConnectionsView = ({
         />
       ) : null}
       <div className="cx-cols">
-        <aside className="cx-col-l">
+        <aside className={'cx-col-l' + (leftRailOpen ? '' : ' is-collapsed')}>
+          <button
+            type="button"
+            className="cx-rail-toggle cx-mono cx-dim"
+            onClick={() => {
+              setLeftRailOpen((v) => !v);
+            }}
+            aria-expanded={leftRailOpen}
+            data-testid="connections-rail-toggle"
+          >
+            {leftRailOpen ? '▾' : '▸'} Panel
+          </button>
           <div className="cx-section">
             <h4>Find</h4>
             <NodeSearchBox
@@ -2295,9 +2366,36 @@ export const ConnectionsView = ({
               </label>
             </details>
           </div>
-          {recentAnchors.length > 0 ? (
+          {historyAnchors.length > 0 ? (
             <div className="cx-section" data-testid="connections-recent-anchors">
               <h4>Recent anchors</h4>
+              <div className="cx-recent-anchor-list">
+                {historyAnchors.map((r) => (
+                  <button
+                    key={r.id}
+                    type="button"
+                    className="cx-recent-anchor"
+                    onClick={() => {
+                      navigateToAnchor(r.id);
+                    }}
+                    data-testid={`recent-anchor-${r.id}`}
+                  >
+                    <span
+                      className={`cx-node-icon ${nodeKindDisplayFor(r.kind).tintClass}`}
+                      aria-hidden
+                    >
+                      {KindIcons[r.kind]}
+                    </span>
+                    <span className="cx-recent-anchor-label">{r.label}</span>
+                    <span className="cx-recent-meta">{nodeKindDisplayFor(r.kind).label}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {recentAnchors.length > 0 ? (
+            <div className="cx-section" data-testid="connections-anchor-shortcuts">
+              <h4>Shortcuts</h4>
               <div className="cx-recent-anchor-list">
                 {recentAnchors.map((r) => (
                   <button
@@ -2307,7 +2405,7 @@ export const ConnectionsView = ({
                     onClick={() => {
                       navigateToAnchor(r.id);
                     }}
-                    data-testid={`recent-anchor-${r.id}`}
+                    data-testid={`shortcut-anchor-${r.id}`}
                   >
                     <span
                       className={`cx-node-icon ${nodeKindDisplayFor(r.kind).tintClass}`}
@@ -2479,7 +2577,18 @@ export const ConnectionsView = ({
             )
           )}
         </main>
-        <aside className="cx-col-r">
+        <aside className={'cx-col-r' + (rightPanelOpen ? '' : ' is-collapsed')}>
+          <button
+            type="button"
+            className="cx-rightpanel-toggle cx-mono cx-dim"
+            onClick={() => {
+              setRightPanelOpen((v) => !v);
+            }}
+            aria-expanded={rightPanelOpen}
+            data-testid="connections-rightpanel-toggle"
+          >
+            {rightPanelOpen ? '▸ Anchor summary' : '◂ Anchor summary'}
+          </button>
           <div className="cx-section cx-section-last cx-section-padded">
             {whyVisitId !== null && result !== null ? (
               <WhyRelatedPanel

@@ -149,9 +149,7 @@ const tabSessionRecordFromUrl = (url: UrlVisitRecord): TabSessionRecord => ({
   ...(url.latestUrl === undefined ? {} : { latestUrl: url.latestUrl }),
   ...(url.latestTitle === undefined ? {} : { latestTitle: url.latestTitle }),
   ...(url.provider === undefined ? {} : { provider: url.provider }),
-  ...(url.currentAttribution === undefined
-    ? {}
-    : { currentAttribution: url.currentAttribution }),
+  ...(url.currentAttribution === undefined ? {} : { currentAttribution: url.currentAttribution }),
   ...(url.currentIgnored === undefined
     ? {}
     : {
@@ -169,9 +167,7 @@ const tabSessionRecordFromUrl = (url: UrlVisitRecord): TabSessionRecord => ({
 // a TabSessionResolutionResult ({ tabSessionId, … }). Same wire shape
 // apart from the key — surface-rename to keep the UI components
 // unaware of the underlying attribution unit.
-const tabSessionResolutionFromUrl = (
-  result: UrlResolutionResult,
-): TabSessionResolutionResult => ({
+const tabSessionResolutionFromUrl = (result: UrlResolutionResult): TabSessionResolutionResult => ({
   tabSessionId: result.canonicalUrl,
   dryRun: true,
   decision: result.decision,
@@ -269,9 +265,7 @@ const isTabSessionResolutionResult = (value: unknown): value is TabSessionResolu
   Array.isArray(value['fusedCandidates']);
 
 const isUrlProjection = (value: unknown): value is UrlProjection =>
-  isPlainRecord(value) &&
-  value['schemaVersion'] === 1 &&
-  isPlainRecord(value['byCanonicalUrl']);
+  isPlainRecord(value) && value['schemaVersion'] === 1 && isPlainRecord(value['byCanonicalUrl']);
 
 const isUrlInboxData = (value: unknown): value is UrlInboxData =>
   isPlainRecord(value) &&
@@ -648,6 +642,9 @@ const App = () => {
   // there. `inboxSearchRequest` is similar for InboxView's initialQuery.
   const [connectionsAnchorRequest, setConnectionsAnchorRequest] = useState<string>('');
   const [inboxSearchRequest, setInboxSearchRequest] = useState<string>('');
+  // #4 — the current-tab attribution card only belongs in the Inbox
+  // context, and is collapsible there.
+  const [currentTabCollapsed, setCurrentTabCollapsed] = useState(false);
   const requestSwitchToConnections = (canonicalUrl: string): void => {
     // The timeline-visit node id IS the canonical URL — the snapshot
     // builds them that way. So anchoring on `timeline-visit:<URL>`
@@ -801,8 +798,9 @@ const App = () => {
   // refresh a single suggestion via the per-card ↻ button. This set
   // tracks which urls are currently re-fetching so the button can
   // disable + show a spinner without a separate Map per card.
-  const [refreshingUrlSuggestionIds, setRefreshingUrlSuggestionIds] =
-    useState<ReadonlySet<string>>(() => new Set<string>());
+  const [refreshingUrlSuggestionIds, setRefreshingUrlSuggestionIds] = useState<ReadonlySet<string>>(
+    () => new Set<string>(),
+  );
   // URL auto-apply is reversible (your manual move beats the inferred
   // one on precedence tie-break) but we still don't want to retry the
   // same URL on every poll cycle. Track in-flight + completed attempts
@@ -1615,7 +1613,9 @@ const App = () => {
   // navigation coalesces into one refresh.
   useEffect(() => {
     const chromeApi = (
-      globalThis as unknown as { chrome?: { tabs?: typeof chrome.tabs; runtime?: typeof chrome.runtime } }
+      globalThis as unknown as {
+        chrome?: { tabs?: typeof chrome.tabs; runtime?: typeof chrome.runtime };
+      }
     ).chrome;
     const tabsApi = chromeApi?.tabs;
     if (tabsApi === undefined || typeof tabsApi.onUpdated?.addListener !== 'function') return;
@@ -2608,9 +2608,7 @@ const App = () => {
         total: urlInbox.total,
         items: urlInbox.items.slice(0, 20),
       },
-      urlSuggestions: Object.fromEntries(
-        Object.entries(urlSuggestions).slice(0, 50),
-      ),
+      urlSuggestions: Object.fromEntries(Object.entries(urlSuggestions).slice(0, 50)),
       workstreams: state.workstreams.map((w) => ({
         bac_id: w.bac_id,
         title: w.title,
@@ -5458,9 +5456,9 @@ const App = () => {
           data-testid="deeper-access-banner"
         >
           <div className="deeper-access-banner-body">
-            <strong>Deeper page access not granted.</strong>{' '}
-            Engagement tracking (focus, scroll, copy) and future in-page features
-            need it. URL + title observation already works without it.
+            <strong>Deeper page access not granted.</strong> Engagement tracking (focus, scroll,
+            copy) and future in-page features need it. URL + title observation already works without
+            it.
           </div>
           <div className="deeper-access-banner-actions">
             <button
@@ -5590,190 +5588,213 @@ const App = () => {
         </div>
       )}
 
-      <section
-        className={
-          'tab-attribution-card' +
-          (focusedTabSession !== undefined
-            ? ' is-active'
-            : liveActiveTabUrl !== undefined
-              ? ' is-loading'
-              : ' is-empty')
-        }
-        data-testid="focused-tab-attribution"
-        aria-label="Current tab attribution"
-      >
-        <div className="tab-attribution-card-head">
-          <span className="tab-attribution-card-eyebrow mono">Current tab</span>
-          {focusedTabSession !== undefined ? (
-            <span
-              className="tab-attribution-card-title"
-              title={focusedTabSession.latestUrl ?? tabSessionDisplayTitle(focusedTabSession)}
-            >
-              {tabSessionDisplayTitle(focusedTabSession)}
-            </span>
-          ) : liveActiveTabUrl !== undefined ? (
-            // Optimistic render before urlProjection has the entry.
-            // The companion takes a few seconds to materialize the visit
-            // (observe → drain → projection → 4 s side-panel poll).
-            // Showing the live tab title + host instead of "No tracked
-            // tab in focus" gives instant feedback that the side panel
-            // sees the navigation.
-            <span
-              className="tab-attribution-card-title subtle"
-              title={liveActiveTabUrl}
-            >
-              {liveActiveTabTitle ?? (() => {
-                try { return new URL(liveActiveTabUrl).hostname; } catch { return liveActiveTabUrl; }
-              })()}
-              <span className="tab-attribution-card-pending mono"> (capturing…)</span>
-            </span>
-          ) : (
-            <span className="tab-attribution-card-title subtle">No tracked tab in focus</span>
-          )}
-          {focusedTabSession !== undefined && focusedTabSession.latestUrl !== undefined ? (
-            <button
-              type="button"
-              className="tab-session-go-to"
-              onClick={() => {
-                openTabForSession(focusedTabSession);
-              }}
-              title="Switch to this tab or reopen it"
-              aria-label="Go to tab"
-              data-testid="focused-tab-go-to"
-            >
-              <span className="icon-12" aria-hidden>
-                {Icons.arrowR}
-              </span>
-              <span>Go to</span>
-            </button>
-          ) : null}
-        </div>
-        <div className="tab-attribution-card-body">
-          <span className="tab-attribution-card-prefix mono">In workstream:</span>
-          <AttributionBadge
-            record={focusedTabSession}
-            suggestion={
-              focusedTabSuggestion === undefined
-                ? undefined
-                : tabSessionResolutionFromUrl(focusedTabSuggestion)
+      {viewMode === 'inbox' ? (
+        <>
+          <section
+            className={
+              'tab-attribution-card' +
+              (focusedTabSession !== undefined
+                ? ' is-active'
+                : liveActiveTabUrl !== undefined
+                  ? ' is-loading'
+                  : ' is-empty')
             }
-            workstreams={tabSessionWorkstreams}
-          />
-          {/* Suggestion stats: bucket label + ⓘ tooltip + alternatives.
+            data-testid="focused-tab-attribution"
+            aria-label="Current tab attribution"
+          >
+            <div className="tab-attribution-card-head">
+              <span className="tab-attribution-card-eyebrow mono">Current tab</span>
+              {focusedTabSession !== undefined ? (
+                <span
+                  className="tab-attribution-card-title"
+                  title={focusedTabSession.latestUrl ?? tabSessionDisplayTitle(focusedTabSession)}
+                >
+                  {tabSessionDisplayTitle(focusedTabSession)}
+                </span>
+              ) : liveActiveTabUrl !== undefined ? (
+                // Optimistic render before urlProjection has the entry.
+                // The companion takes a few seconds to materialize the visit
+                // (observe → drain → projection → 4 s side-panel poll).
+                // Showing the live tab title + host instead of "No tracked
+                // tab in focus" gives instant feedback that the side panel
+                // sees the navigation.
+                <span className="tab-attribution-card-title subtle" title={liveActiveTabUrl}>
+                  {liveActiveTabTitle ??
+                    (() => {
+                      try {
+                        return new URL(liveActiveTabUrl).hostname;
+                      } catch {
+                        return liveActiveTabUrl;
+                      }
+                    })()}
+                  <span className="tab-attribution-card-pending mono"> (capturing…)</span>
+                </span>
+              ) : (
+                <span className="tab-attribution-card-title subtle">No tracked tab in focus</span>
+              )}
+              {focusedTabSession !== undefined && focusedTabSession.latestUrl !== undefined ? (
+                <button
+                  type="button"
+                  className="tab-session-go-to"
+                  onClick={() => {
+                    openTabForSession(focusedTabSession);
+                  }}
+                  title="Switch to this tab or reopen it"
+                  aria-label="Go to tab"
+                  data-testid="focused-tab-go-to"
+                >
+                  <span className="icon-12" aria-hidden>
+                    {Icons.arrowR}
+                  </span>
+                  <span>Go to</span>
+                </button>
+              ) : null}
+              <button
+                type="button"
+                className="tab-attribution-card-collapse"
+                onClick={() => {
+                  setCurrentTabCollapsed((v) => !v);
+                }}
+                aria-expanded={!currentTabCollapsed}
+                aria-label={currentTabCollapsed ? 'Expand current tab' : 'Collapse current tab'}
+                data-testid="focused-tab-collapse"
+              >
+                {currentTabCollapsed ? '▸' : '▾'}
+              </button>
+            </div>
+            {!currentTabCollapsed ? (
+              <>
+                <div className="tab-attribution-card-body">
+                  <span className="tab-attribution-card-prefix mono">In workstream:</span>
+                  <AttributionBadge
+                    record={focusedTabSession}
+                    suggestion={
+                      focusedTabSuggestion === undefined
+                        ? undefined
+                        : tabSessionResolutionFromUrl(focusedTabSuggestion)
+                    }
+                    workstreams={tabSessionWorkstreams}
+                  />
+                  {/* Suggestion stats: bucket label + ⓘ tooltip + alternatives.
               Renders for any unattributed/un-ignored focused URL — when
               the resolver has no candidates we still draw the empty
               placeholder so the user sees why the badge is "?". */}
-          {focusedUrlRecord !== undefined &&
-          focusedUrlRecord.currentAttribution === undefined &&
-          focusedUrlRecord.currentIgnored === undefined ? (
-            <SuggestionStats
-              suggestion={
-                focusedTabSuggestion === undefined
-                  ? undefined
-                  : tabSessionResolutionFromUrl(focusedTabSuggestion)
-              }
-              workstreams={tabSessionWorkstreams}
-              showAlternatives
-              showEmptyPlaceholder
-            />
-          ) : null}
-          {/* Stage 5 polish — the legacy "Change…" button used to live
+                  {focusedUrlRecord !== undefined &&
+                  focusedUrlRecord.currentAttribution === undefined &&
+                  focusedUrlRecord.currentIgnored === undefined ? (
+                    <SuggestionStats
+                      suggestion={
+                        focusedTabSuggestion === undefined
+                          ? undefined
+                          : tabSessionResolutionFromUrl(focusedTabSuggestion)
+                      }
+                      workstreams={tabSessionWorkstreams}
+                      showAlternatives
+                      showEmptyPlaceholder
+                    />
+                  ) : null}
+                  {/* Stage 5 polish — the legacy "Change…" button used to live
               here. Removed because the flat 4-action bar below already
               has "Pick another…" with the same behavior (opens the
               WorkstreamPicker); rendering both was a duplicate
               affordance the user flagged. */}
-        </div>
-        {/* Action bar: shows up when there's a focused URL. All four
+                </div>
+                {/* Action bar: shows up when there's a focused URL. All four
             choices flat — no overflow menu — so every state from the
             5-state attribution model has a directly-clickable
             affordance. "Yes, that's right" only renders when a
             high-enough suggestion exists; the other three always
             render so the user can take the corresponding action even
             when no suggestion is present. */}
-        {focusedUrlRecord !== undefined ? (
-          <div className="tab-attribution-card-actions">
-            {focusedTabSuggestion !== undefined &&
-            focusedTabSuggestion.decision.workstreamId !== undefined &&
-            focusedUrlRecord.currentAttribution === undefined &&
-            focusedUrlRecord.currentIgnored === undefined ? (
-              <button
-                type="button"
-                className="tab-attribution-card-action primary"
-                onClick={() => {
-                  if (focusedTabSuggestion.decision.workstreamId !== undefined) {
-                    handleUrlAttribute(
-                      focusedUrlRecord.canonicalUrl,
-                      focusedTabSuggestion.decision.workstreamId,
-                    );
-                  }
-                }}
-                title="Confirm the suggested workstream"
-              >
-                Yes, that's right
-              </button>
-            ) : null}
-            <button
-              type="button"
-              className="tab-attribution-card-action"
-              onClick={() => {
-                setTabSessionMoveId(focusedUrlRecord.canonicalUrl);
-              }}
-              title="Pick a different workstream"
-            >
-              Pick another…
-            </button>
-            <button
-              type="button"
-              className="tab-attribution-card-action"
-              onClick={() => {
-                handleUrlAttribute(focusedUrlRecord.canonicalUrl, null);
-              }}
-              title="This page is meaningful but doesn't belong to any workstream"
-            >
-              Not in any stream
-            </button>
-            <button
-              type="button"
-              className="tab-attribution-card-action"
-              onClick={() => {
-                handleUrlIgnore(focusedUrlRecord.canonicalUrl, 'noise');
-              }}
-              title="Mute this URL — don't bother me about it again"
-            >
-              Ignore (admin / noise)
-            </button>
-            {/* Cross-surface jump to Connections, mirroring the
+                {focusedUrlRecord !== undefined ? (
+                  <div className="tab-attribution-card-actions">
+                    {focusedTabSuggestion !== undefined &&
+                    focusedTabSuggestion.decision.workstreamId !== undefined &&
+                    focusedUrlRecord.currentAttribution === undefined &&
+                    focusedUrlRecord.currentIgnored === undefined ? (
+                      <button
+                        type="button"
+                        className="tab-attribution-card-action primary"
+                        onClick={() => {
+                          if (focusedTabSuggestion.decision.workstreamId !== undefined) {
+                            handleUrlAttribute(
+                              focusedUrlRecord.canonicalUrl,
+                              focusedTabSuggestion.decision.workstreamId,
+                            );
+                          }
+                        }}
+                        title="Confirm the suggested workstream"
+                      >
+                        Yes, that's right
+                      </button>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="tab-attribution-card-action"
+                      onClick={() => {
+                        setTabSessionMoveId(focusedUrlRecord.canonicalUrl);
+                      }}
+                      title="Pick a different workstream"
+                    >
+                      Pick another…
+                    </button>
+                    <button
+                      type="button"
+                      className="tab-attribution-card-action"
+                      onClick={() => {
+                        handleUrlAttribute(focusedUrlRecord.canonicalUrl, null);
+                      }}
+                      title="This page is meaningful but doesn't belong to any workstream"
+                    >
+                      Not in any stream
+                    </button>
+                    <button
+                      type="button"
+                      className="tab-attribution-card-action"
+                      onClick={() => {
+                        handleUrlIgnore(focusedUrlRecord.canonicalUrl, 'noise');
+                      }}
+                      title="Mute this URL — don't bother me about it again"
+                    >
+                      Ignore (admin / noise)
+                    </button>
+                    {/* Cross-surface jump to Connections, mirroring the
                 InboxCard "⇄ Graph" affordance. Anchors on the
                 timeline-visit for this URL so the user can see the
                 neighborhood that does (or doesn't) exist yet — useful
                 when SuggestionStats says "No signal yet" and the user
                 wants to know what evidence the resolver had. */}
-            <button
-              type="button"
-              className="tab-attribution-card-action"
-              onClick={() => {
-                requestSwitchToConnections(focusedUrlRecord.canonicalUrl);
-              }}
-              title="Open this URL's neighborhood in the Connections graph"
-              data-testid="focused-tab-open-in-connections"
-            >
-              ⇄ Graph
-            </button>
-          </div>
-        ) : null}
-      </section>
+                    <button
+                      type="button"
+                      className="tab-attribution-card-action"
+                      onClick={() => {
+                        requestSwitchToConnections(focusedUrlRecord.canonicalUrl);
+                      }}
+                      title="Open this URL's neighborhood in the Connections graph"
+                      data-testid="focused-tab-open-in-connections"
+                    >
+                      ⇄ Graph
+                    </button>
+                  </div>
+                ) : null}
+              </>
+            ) : null}
+          </section>
 
-      {suggestedOpenTabSession !== undefined && suggestedOpenTabSessionResolution !== undefined ? (
-        <SuggestionBanner
-          record={suggestedOpenTabSession}
-          suggestion={tabSessionResolutionFromUrl(suggestedOpenTabSessionResolution)}
-          workstreams={tabSessionWorkstreams}
-          onAttribute={handleUrlAttribute}
-          onPickAnother={(canonicalUrl) => {
-            setTabSessionMoveId(canonicalUrl);
-          }}
-          onIgnore={handleUrlIgnore}
-        />
+          {suggestedOpenTabSession !== undefined &&
+          suggestedOpenTabSessionResolution !== undefined ? (
+            <SuggestionBanner
+              record={suggestedOpenTabSession}
+              suggestion={tabSessionResolutionFromUrl(suggestedOpenTabSessionResolution)}
+              workstreams={tabSessionWorkstreams}
+              onAttribute={handleUrlAttribute}
+              onPickAnother={(canonicalUrl) => {
+                setTabSessionMoveId(canonicalUrl);
+              }}
+              onIgnore={handleUrlIgnore}
+            />
+          ) : null}
+        </>
       ) : null}
 
       {threadSearchOpen ? (
@@ -5869,34 +5890,34 @@ const App = () => {
           "focused workstream" wording — the browser tab is the
           only "focus" in the panel. */}
       {viewMode === 'workstream' || viewMode === 'all' ? (
-      <div className="ws-drop-strip" aria-label="Pick a workstream">
-        {state.workstreams.map((workstream) => (
-          <button
-            type="button"
-            key={workstream.bac_id}
-            className={
-              'ws-picker-pill' +
-              (workstream.bac_id === currentWsId ? ' current' : '') +
-              (dropWorkstreamId === workstream.bac_id ? ' drop-target' : '')
-            }
-            onClick={() => {
-              setCurrentWs(workstream.bac_id);
-            }}
-            onDragOver={(event) => {
-              allowThreadDrop(event, workstream.bac_id);
-            }}
-            onDragLeave={() => {
-              setDropWorkstreamId((current) => (current === workstream.bac_id ? null : current));
-            }}
-            onDrop={(event) => {
-              event.preventDefault();
-              handleWorkstreamDrop(event, workstream.bac_id);
-            }}
-          >
-            {workstream.title}
-          </button>
-        ))}
-      </div>
+        <div className="ws-drop-strip" aria-label="Pick a workstream">
+          {state.workstreams.map((workstream) => (
+            <button
+              type="button"
+              key={workstream.bac_id}
+              className={
+                'ws-picker-pill' +
+                (workstream.bac_id === currentWsId ? ' current' : '') +
+                (dropWorkstreamId === workstream.bac_id ? ' drop-target' : '')
+              }
+              onClick={() => {
+                setCurrentWs(workstream.bac_id);
+              }}
+              onDragOver={(event) => {
+                allowThreadDrop(event, workstream.bac_id);
+              }}
+              onDragLeave={() => {
+                setDropWorkstreamId((current) => (current === workstream.bac_id ? null : current));
+              }}
+              onDrop={(event) => {
+                event.preventDefault();
+                handleWorkstreamDrop(event, workstream.bac_id);
+              }}
+            >
+              {workstream.title}
+            </button>
+          ))}
+        </div>
       ) : null}
 
       {wsPickerOpen ? (
@@ -7681,7 +7702,7 @@ function WorkstreamPicker({
   const parentTitle =
     parentForNew === null
       ? null
-      : workstreams.find((w) => w.bac_id === parentForNew)?.title ?? 'current';
+      : (workstreams.find((w) => w.bac_id === parentForNew)?.title ?? 'current');
 
   return (
     <div className="ws-picker-backdrop" onClick={onClose} role="presentation">
@@ -7717,8 +7738,7 @@ function WorkstreamPicker({
             title="Inbox — threads waiting for you to assign a workstream"
           >
             <span className="ws-picker-name">
-              <strong>Not assigned</strong>{' '}
-              <em className="subtle">— threads waiting for triage</em>
+              <strong>Not assigned</strong> <em className="subtle">— threads waiting for triage</em>
             </span>
             <span className="mono subtle" title={`${String(inboxCount)} unassigned threads`}>
               {inboxCount}

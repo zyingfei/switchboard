@@ -10270,3 +10270,33 @@ pre.diff {
   font-size: 10.5px;
   color: var(--ink-2);
 }
+
+/* #5 — collapsible panels: left rail (Find/Workstream/Recent/
+   Shortcuts), the right anchor summary (cx-col-r: why-related /
+   provenance), and the page-text card. Always-available restrained
+   toggles (reuse cx-mono/cx-dim, no new colors). `is-collapsed`
+   hides the body and reclaims the fixed column width so the narrow
+   side panel gets that space back. */
+.cx-rail-toggle,
+.cx-rightpanel-toggle,
+.cx-summary-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 4px;
+  background: none;
+  border: 0;
+  text-align: left;
+  cursor: pointer;
+}
+.cx-col-l.is-collapsed,
+.cx-col-r.is-collapsed {
+  width: auto;
+  min-width: 0;
+}
+.cx-col-l.is-collapsed > :not(.cx-rail-toggle),
+.cx-col-r.is-collapsed > :not(.cx-rightpanel-toggle),
+.cx-page-content-card.is-collapsed > :not(.cx-summary-toggle) {
+  display: none;
+}

@@ -14,6 +14,11 @@ export interface AnchorHistory {
   readonly current: string;
   readonly canBack: boolean;
   readonly canForward: boolean;
+  // Distinct anchors the user has actually navigated to (most recent
+  // first, current excluded). This is the *honest* recent-anchor
+  // history — driven by clicks/navigation — as opposed to the
+  // thread/workstream shortcut list the host passes in as a prop.
+  readonly recent: readonly string[];
   readonly navigate: (next: string) => void;
   readonly back: () => void;
   readonly forward: () => void;
@@ -57,10 +62,26 @@ export const useAnchorHistory = (initial: string): AnchorHistory => {
     });
   }, [current]);
 
+  // `past` is [oldest … newest-previous]; reverse so the rail shows
+  // the most recently visited anchor first. Dedupe and drop the
+  // current anchor + empties; cap so the rail stays compact.
+  const recent = ((): readonly string[] => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const a of [...past].reverse()) {
+      if (a.length === 0 || a === current || seen.has(a)) continue;
+      seen.add(a);
+      out.push(a);
+      if (out.length >= 8) break;
+    }
+    return out;
+  })();
+
   return {
     current,
     canBack: past.length > 0,
     canForward: future.length > 0,
+    recent,
     navigate,
     back,
     forward,
