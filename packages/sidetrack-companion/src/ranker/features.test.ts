@@ -11,7 +11,7 @@ import {
 import { ENGAGEMENT_SESSION_AGGREGATED, type EngagementDimensions } from '../engagement/events.js';
 import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
 import { NAVIGATION_COMMITTED } from '../navigation/events.js';
-import { PAGE_CONTENT_EXTRACTED } from '../page-content/events.js';
+import { PAGE_CONTENT_EXTRACTED } from '../page-content/types.js';
 import { SELECTION_COPIED } from '../snippets/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';

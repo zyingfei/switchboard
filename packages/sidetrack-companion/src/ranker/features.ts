@@ -14,11 +14,8 @@ import {
   isUserOrganizedItemPayload,
 } from '../feedback/events.js';
 import { NAVIGATION_COMMITTED, isNavigationCommittedPayload } from '../navigation/events.js';
-import {
-  PAGE_CONTENT_EXTRACTED,
-  isPageContentExtractedPayload,
-  type PageContentQuality,
-} from '../page-content/events.js';
+import { isPageContentExtractedPayload } from '../page-content/events.js';
+import { PAGE_CONTENT_EXTRACTED, type PageContentQuality } from '../page-content/types.js';
 import { SELECTION_COPIED, isSelectionCopiedPayload } from '../snippets/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from '../timeline/events.js';
@@ -1156,7 +1153,7 @@ const pageQualityTierForVisit = (candidateVisitId: string, model: FeatureModel):
     if (value === undefined) continue;
     if (selected === null || compareOrdered(selected, value) <= 0) selected = value;
   }
-  return selected === null ? 0 : PAGE_QUALITY_TIER[selected.value];
+  return selected === null ? 0 : (PAGE_QUALITY_TIER[selected.value] ?? 0);
 };
 
 const pageQualityTierFromFeature = (candidate: Candidate, model: FeatureModel): number =>
