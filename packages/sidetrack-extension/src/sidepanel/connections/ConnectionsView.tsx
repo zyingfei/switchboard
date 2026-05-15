@@ -59,6 +59,7 @@ import {
   formatEntityDisplay,
   formatNodeIdDisplay,
   hostOf,
+  isInternalIdLike,
   kindFromNodeId,
   type EntityDisplayCtx,
 } from '../entityDisplay/format';
@@ -148,22 +149,51 @@ const urlFromAnchorNodeId = (nodeId: string): string | undefined => {
   return undefined;
 };
 
-const displayOnlyAnchorNode = (nodeId: string): ConnectionNode | null => {
+const humanAnchorLabel = (label: string | undefined): string | undefined => {
+  const trimmed = label?.trim();
+  if (trimmed === undefined || trimmed.length === 0 || isInternalIdLike(trimmed)) {
+    return undefined;
+  }
+  return trimmed;
+};
+
+const applyAnchorLabel = (node: ConnectionNode, label: string | undefined): ConnectionNode => {
+  const clean = humanAnchorLabel(label);
+  if (clean === undefined) return node;
+  return {
+    ...node,
+    label: clean,
+    metadata:
+      node.kind === 'topic'
+        ? {
+            ...node.metadata,
+            representativeTitles: [clean],
+          }
+        : node.metadata,
+  };
+};
+
+const displayOnlyAnchorNode = (nodeId: string, label?: string): ConnectionNode | null => {
   const kind = kindFromNodeId(nodeId);
   if (kind === undefined) return null;
   const url = urlFromAnchorNodeId(nodeId);
+  const cleanLabel = humanAnchorLabel(label);
   return {
     id: nodeId,
     kind,
-    label: url === undefined ? nodeId : (hostOf(url) ?? nodeId),
+    label: cleanLabel ?? (url === undefined ? nodeId : (hostOf(url) ?? nodeId)),
     originReplicaIds: [],
-    metadata:
-      url === undefined
+    metadata: {
+      ...(url === undefined
         ? {}
         : {
             canonicalUrl: url,
             url,
-          },
+          }),
+      ...(kind === 'topic' && cleanLabel !== undefined
+        ? { representativeTitles: [cleanLabel] }
+        : {}),
+    },
   };
 };
 
@@ -229,6 +259,15 @@ const engagementClassForNode = (node: ConnectionNode): EngagementClass | undefin
   }
   const value = (engagement as Record<string, unknown>)['class'];
   return isEngagementClass(value) ? value : undefined;
+};
+
+const focusedWindowMsForNode = (node: ConnectionNode): number => {
+  const engagement = node.metadata['engagement'];
+  if (isRecord(engagement)) {
+    const value = engagement['focusedWindowMs'];
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+  }
+  return metadataNumber(node.metadata, 'focusedWindowMs', 0);
 };
 
 // Stage 5 polish — Flow Path now sources its visits from
@@ -301,16 +340,7 @@ const deriveFlowVisits = (
     // Prefer the nested engagement.focusedWindowMs (companion writes it
     // alongside engagement.class); fall back to a flat key for
     // backward compatibility with older snapshots.
-    const engagementMeta = node.metadata['engagement'];
-    const engagementFocusedMs =
-      typeof engagementMeta === 'object' &&
-      engagementMeta !== null &&
-      !Array.isArray(engagementMeta) &&
-      typeof (engagementMeta as Record<string, unknown>)['focusedWindowMs'] === 'number'
-        ? ((engagementMeta as Record<string, unknown>)['focusedWindowMs'] as number)
-        : undefined;
-    const focusedWindowMs =
-      engagementFocusedMs ?? metadataNumber(node.metadata, 'focusedWindowMs', 0);
+    const focusedWindowMs = focusedWindowMsForNode(node);
     const provider = metadataString(node.metadata, ['provider']);
     const visitCount = metadataNumber(node.metadata, 'visitCount', 0);
     const searchQuery = metadataString(node.metadata, ['searchQuery']);
@@ -556,21 +586,26 @@ const deriveFocusData = (
     if (edge.kind !== 'visit_in_topic') continue;
     const visit = nodeById.get(edge.fromNodeId);
     if (visit === undefined) continue;
+    const visitUrl =
+      metadataString(visit.metadata, ['canonicalUrl', 'url', 'latestUrl']) ?? urlFromNodeId(visit);
     const list = visitsByTopic[edge.toNodeId] ?? [];
     visitsByTopic[edge.toNodeId] = [
       ...list,
       {
         id: visit.id,
         label: formatEntityDisplay(visit, ctx).primary,
-        focusedWindowMs: metadataNumber(visit.metadata, 'focusedWindowMs', 0),
+        ...(visitUrl === undefined ? {} : { url: visitUrl }),
+        ...(visit.lastSeenAt === undefined ? {} : { lastSeenAt: visit.lastSeenAt }),
+        focusedWindowMs: focusedWindowMsForNode(visit),
       },
     ];
   }
 
-  // Engagement classes — keep using scope nodes (the
-  // user's recent activity tends to be in scope already).
+  // Engagement classes come from the same node pool as rendered
+  // visits so topic anchors can show the current observed judgment
+  // even when the anchor-local active graph is empty.
   const engagementClassesByVisit: Record<string, EngagementClass> = {};
-  for (const node of scopeNodes) {
+  for (const node of sourceNodes) {
     const engagementClass = engagementClassForNode(node);
     if (node.kind === 'timeline-visit' && engagementClass !== undefined) {
       engagementClassesByVisit[node.id] = engagementClass;
@@ -691,7 +726,13 @@ const deriveShadowFocusScope = (
   if (shadowNodes.length === 0) return { nodes: [], edges: [] };
 
   const scopedVisitIds = new Set<string>();
-  if (anchorId.startsWith('workstream:')) {
+  if (anchorId.startsWith('topic:')) {
+    for (const edge of shadowEdges) {
+      if (edge.kind === 'visit_in_topic' && edge.toNodeId === anchorId) {
+        scopedVisitIds.add(edge.fromNodeId);
+      }
+    }
+  } else if (anchorId.startsWith('workstream:')) {
     addWorkstreamScopedVisitAliases(activeScopeNodes, activeScopeEdges, anchorId, scopedVisitIds);
     addWorkstreamScopedVisitAliases(shadowNodes, shadowEdges, anchorId, scopedVisitIds);
   } else {
@@ -699,7 +740,10 @@ const deriveShadowFocusScope = (
   }
 
   const visitTopicEdges = shadowEdges.filter(
-    (edge) => edge.kind === 'visit_in_topic' && scopedVisitIds.has(edge.fromNodeId),
+    (edge) =>
+      edge.kind === 'visit_in_topic' &&
+      scopedVisitIds.has(edge.fromNodeId) &&
+      (!anchorId.startsWith('topic:') || edge.toNodeId === anchorId),
   );
   const scopedTopicMemberCounts = new Map<string, number>();
   const scopedNodeIds = new Set<string>();
@@ -882,6 +926,7 @@ export const ConnectionsView = ({
   // would type by hand. Submission reads from this draft only; click
   // navigation never writes to it (see navigateToAnchor).
   const [draftAnchor, setDraftAnchor] = useState<string>('');
+  const [anchorLabelOverrides, setAnchorLabelOverrides] = useState<Record<string, string>>({});
   const [hops, setHops] = useState<number>(1);
   const [subMode, setSubMode] = useState<SubMode>('linked');
   const [timeRange, setTimeRange] = useState<TimeRangeValue>(ALL_RANGE);
@@ -974,12 +1019,13 @@ export const ConnectionsView = ({
   // references without per-callsite plumbing.
   const anchorNode = useMemo<ConnectionNode | null>(() => {
     if (result === null) return null;
-    return result.snapshot.nodes.find((n) => n.id === anchor) ?? null;
-  }, [result, anchor]);
+    const node = result.snapshot.nodes.find((n) => n.id === anchor) ?? null;
+    return node === null ? null : applyAnchorLabel(node, anchorLabelOverrides[anchor]);
+  }, [anchor, anchorLabelOverrides, result]);
   const fallbackAnchorNode = useMemo<ConnectionNode | null>(() => {
     if (anchor.length === 0 || anchorNode !== null) return null;
-    return displayOnlyAnchorNode(anchor);
-  }, [anchor, anchorNode]);
+    return displayOnlyAnchorNode(anchor, anchorLabelOverrides[anchor]);
+  }, [anchor, anchorLabelOverrides, anchorNode]);
   const anchorDisplayNode = anchorNode ?? fallbackAnchorNode;
   const snapshotNodeById = useMemo(() => {
     const byId =
@@ -1065,9 +1111,13 @@ export const ConnectionsView = ({
     setWhyVisitId(null);
     history.navigate(value);
   };
-  const navigateToAnchor = (nextAnchorId: string): void => {
+  const navigateToAnchor = (nextAnchorId: string, label?: string): void => {
     const value = nextAnchorId.trim();
     if (value.length === 0) return;
+    const cleanLabel = humanAnchorLabel(label);
+    if (cleanLabel !== undefined) {
+      setAnchorLabelOverrides((current) => ({ ...current, [value]: cleanLabel }));
+    }
     setSelectedEdge(null);
     setWhyVisitId(null);
     history.navigate(value);
@@ -1287,9 +1337,27 @@ export const ConnectionsView = ({
       itemId: input.visitId,
       action: 'ignore',
       fromContainer: input.topicId,
+      details: {
+        splitInto: input.memberVisitIds.filter((memberId) => memberId !== input.visitId),
+      },
     });
     if (!response.ok) {
       throw new Error(response.error ?? 'visit-topic feedback failed');
+    }
+  };
+
+  const submitVisitRestoreToTopic = async (input: {
+    readonly topicId: string;
+    readonly visitId: string;
+  }): Promise<void> => {
+    const response = await postUserOrganizedItem({
+      itemKind: 'visit',
+      itemId: input.visitId,
+      action: 'move',
+      toContainer: input.topicId,
+    });
+    if (!response.ok) {
+      throw new Error(response.error ?? 'visit-topic restore feedback failed');
     }
   };
 
@@ -1431,17 +1499,33 @@ export const ConnectionsView = ({
   const shadowSnapshotReady =
     filteredShadowSnapshot.nodes.length > 0 && !shadowFullSnapshot.loading;
   const renderedFocusData =
-    activeFocusCollapsed && shadowFocusData.topics.length > 0
+    anchor.startsWith('topic:') && shadowFocusData.topics.length > 0
       ? shadowFocusData
-      : activeFocusCollapsed && shadowSnapshotReady
-        ? scopedEmptyFocusData
-        : focusData;
+      : activeFocusCollapsed && shadowFocusData.topics.length > 0
+        ? shadowFocusData
+        : activeFocusCollapsed && shadowSnapshotReady
+          ? scopedEmptyFocusData
+          : focusData;
   const renderedFocusEligibleVisitCount =
     renderedFocusData === shadowFocusData
       ? shadowEligibleVisitCount
       : renderedFocusData === scopedEmptyFocusData
         ? 0
         : focusEligibleVisitCount;
+  const whyUsesShadowFocusGraph = subMode === 'focus' && renderedFocusData === shadowFocusData;
+  const whyReasonNodes =
+    whyUsesShadowFocusGraph && filteredShadowSnapshot.nodes.length > 0
+      ? filteredShadowSnapshot.nodes
+      : (result?.snapshot.nodes ?? []);
+  const whyReasonEdges =
+    whyUsesShadowFocusGraph && filteredShadowSnapshot.edges.length > 0
+      ? filteredShadowSnapshot.edges
+      : (result?.snapshot.edges ?? []);
+  const whyReasonCtx = whyUsesShadowFocusGraph ? shadowCtx : ctx;
+  const whyPanelRevisionEdge =
+    whyVisitId === null
+      ? whyRevisionEdge
+      : (findRevisionEdgeForVisit(whyReasonEdges, whyVisitId) ?? whyRevisionEdge);
   // Flow Path subgraph — expand the anchor scope with the full
   // snapshot's navigation-edge transitive closure (capped). Keeps
   // the chain compact for hub visits while still surfacing the
@@ -1859,18 +1943,24 @@ export const ConnectionsView = ({
                 eligibleVisitCount={renderedFocusEligibleVisitCount}
                 previousTopicCount={renderedFocusData.previousTopicCount}
                 workstreamOptions={workstreamOptions}
+                allowTriageTopicCards={anchor.startsWith('topic:')}
                 onTopicPromote={submitTopicPromote}
                 onTopicRename={submitTopicRename}
                 onVisitMarkNotRelated={submitVisitMarkNotRelated}
+                onVisitRestoreToTopic={submitVisitRestoreToTopic}
                 onEngagementRelabel={submitEngagementRelabel}
                 onTopicClick={(topicId) => {
                   // Same rationale as useNodeAsAnchor — don't dump
                   // the raw topic id into the advanced anchor input.
                   history.navigate(topicId);
                 }}
+                onTopicAnchor={({ topicId, label }) => {
+                  navigateToAnchor(topicId, label);
+                }}
                 onVisitClick={(visitId) => {
                   setWhyVisitId(visitId);
                 }}
+                {...(onOpenUrl === undefined ? {} : { onVisitOpen: onOpenUrl })}
               />
             ) : (
               <ContextPackComposer
@@ -1917,12 +2007,7 @@ export const ConnectionsView = ({
             {whyVisitId !== null && result !== null ? (
               <WhyRelatedPanel
                 fromVisitId={whyVisitId}
-                reasons={reasonsForVisit(
-                  result.snapshot.nodes,
-                  result.snapshot.edges,
-                  whyVisitId,
-                  ctx,
-                )}
+                reasons={reasonsForVisit(whyReasonNodes, whyReasonEdges, whyVisitId, whyReasonCtx)}
                 showOnlyUserAsserted={whyAssertedOnly}
                 feedback={
                   whyFeedbackEdge === null
@@ -1932,8 +2017,8 @@ export const ConnectionsView = ({
                         onFeedback: (choice) => submitFlowFeedback(whyFeedbackEdge, choice),
                       }
                 }
-                producedBy={whyRevisionEdge?.producedBy}
-                producerLabel={whyRevisionEdge?.kind}
+                producedBy={whyPanelRevisionEdge?.producedBy}
+                producerLabel={whyPanelRevisionEdge?.kind}
                 onToggleAssertedOnly={() => {
                   setWhyAssertedOnly((value) => !value);
                 }}

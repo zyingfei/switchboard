@@ -18,7 +18,7 @@ describe('FocusView', () => {
       />,
     );
 
-    expect(screen.getAllByTestId(/^focus-topic-/u)).toHaveLength(2);
+    expect(screen.getAllByTestId(/^focus-topic-topic:/u)).toHaveLength(2);
     expect(screen.getAllByText('Suggestion')).toHaveLength(2);
   });
 
@@ -50,7 +50,52 @@ describe('FocusView', () => {
     );
   });
 
+  it('sorts visits by attention first, then recent activity', () => {
+    render(
+      <FocusView
+        topics={[{ id: 'topic:a', label: 'Alpha', memberCount: 3, cohesion: 0.91 }]}
+        visitsByTopic={{
+          'topic:a': [
+            {
+              id: 'visit:old-read',
+              label: 'Old read',
+              lastSeenAt: '2026-05-14T08:00:00.000Z',
+              focusedWindowMs: 10_000,
+            },
+            {
+              id: 'visit:recent-glance',
+              label: 'Recent glance',
+              lastSeenAt: '2026-05-14T12:00:00.000Z',
+              focusedWindowMs: 30_000,
+            },
+            {
+              id: 'visit:recent-read',
+              label: 'Recent read',
+              lastSeenAt: '2026-05-14T12:30:00.000Z',
+              focusedWindowMs: 5_000,
+            },
+          ],
+        }}
+        engagementClassesByVisit={{
+          'visit:old-read': 'engaged_read',
+          'visit:recent-glance': 'glanced',
+          'visit:recent-read': 'engaged_read',
+        }}
+        onTopicClick={() => undefined}
+        onVisitClick={() => undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByText('Alpha'));
+    expect(screen.getAllByTestId(/^focus-visit-visit:/u).map((row) => row.textContent)).toEqual([
+      expect.stringContaining('Recent read'),
+      expect.stringContaining('Old read'),
+      expect.stringContaining('Recent glance'),
+    ]);
+  });
+
   it('renders the workstream chip and click handlers', () => {
+    const onTopicAnchor = vi.fn();
     const onVisitClick = vi.fn();
     render(
       <FocusView
@@ -64,19 +109,35 @@ describe('FocusView', () => {
           },
         ]}
         visitsByTopic={{
-          'topic:a': [{ id: 'visit:a', label: 'A', focusedWindowMs: 10_000 }],
+          'topic:a': [
+            {
+              id: 'visit:a',
+              label: 'A',
+              url: 'https://example.test/a',
+              focusedWindowMs: 10_000,
+            },
+          ],
         }}
         engagementClassesByVisit={{ 'visit:a': 'engaged_read' }}
         onTopicClick={() => undefined}
+        onTopicAnchor={onTopicAnchor}
+        onEngagementRelabel={() => undefined}
         onVisitClick={onVisitClick}
       />,
     );
 
     expect(screen.getByText('Workstream signal')).toBeDefined();
+    fireEvent.click(screen.getByTestId('focus-topic-anchor-topic:a'));
+    expect(onTopicAnchor).toHaveBeenCalledWith({ topicId: 'topic:a', label: 'Alpha' });
     fireEvent.click(screen.getByText('Alpha'));
     expect(screen.getByTestId('focus-detail-topic:a')).toBeDefined();
+    expect(screen.getByText('Read')).toBeDefined();
+    expect(screen.getByTestId('focus-visit-open-visit:a').getAttribute('href')).toBe(
+      'https://example.test/a',
+    );
     fireEvent.click(screen.getByTestId('focus-visit-visit:a'));
     expect(onVisitClick).toHaveBeenCalledWith('visit:a');
+    expect(screen.queryByTestId('focus-visit-anchor-visit:a')).toBeNull();
   });
 
   it('hides collapsed computed groups behind a triage guard', () => {
@@ -133,7 +194,7 @@ describe('FocusView', () => {
     expect(screen.getByText('No scoped focus group')).toBeDefined();
   });
 
-  it('marks oversized suggestions for triage and keeps rename inside details', () => {
+  it('marks oversized suggestions for triage and keeps save-name inside details', () => {
     render(
       <FocusView
         topics={[
@@ -150,9 +211,9 @@ describe('FocusView', () => {
 
     expect(screen.getByTestId('focus-topic-topic:large')).toBeDefined();
     expect(screen.getByText('Needs triage')).toBeDefined();
-    expect(screen.queryByText('Rename')).toBeNull();
+    expect(screen.queryByText('Save name')).toBeNull();
     fireEvent.click(screen.getByText('Large computed group'));
-    expect(screen.getAllByText('Rename').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('Save name').length).toBeGreaterThan(0);
   });
 
   it('fires per-visit engagement relabel feedback', async () => {
@@ -248,8 +309,9 @@ describe('FocusView', () => {
     expect(screen.getByText('Oracle research')).toBeDefined();
   });
 
-  it("removes a visit from the visible suggestion when it doesn't belong", async () => {
+  it('removes a visit from the visible suggestion and can restore it', async () => {
     const onVisitMarkNotRelated = vi.fn(() => Promise.resolve());
+    const onVisitRestoreToTopic = vi.fn(() => Promise.resolve());
     render(
       <FocusView
         topics={[{ id: 'topic:a', label: 'Alpha', memberCount: 2, cohesion: 0.91 }]}
@@ -261,12 +323,14 @@ describe('FocusView', () => {
         }}
         engagementClassesByVisit={{}}
         onVisitMarkNotRelated={onVisitMarkNotRelated}
+        onVisitRestoreToTopic={onVisitRestoreToTopic}
         onTopicClick={() => undefined}
         onVisitClick={() => undefined}
       />,
     );
 
     fireEvent.click(screen.getByText('Alpha'));
+    expect(screen.getAllByText('Remove')).toHaveLength(2);
     fireEvent.click(
       screen.getByTestId('focus-visit-not-related-topic:a-timeline-visit:https://example.test/b'),
     );
@@ -282,5 +346,13 @@ describe('FocusView', () => {
       });
     });
     expect(screen.queryByTestId('focus-visit-timeline-visit:https://example.test/b')).toBeNull();
+    fireEvent.click(screen.getByText('Undo'));
+    await waitFor(() => {
+      expect(onVisitRestoreToTopic).toHaveBeenCalledWith({
+        topicId: 'topic:a',
+        visitId: 'timeline-visit:https://example.test/b',
+      });
+    });
+    expect(screen.getByTestId('focus-visit-timeline-visit:https://example.test/b')).toBeDefined();
   });
 });

@@ -108,7 +108,10 @@ const labelsForOrganizedItem = (
   if (payload.action === 'ignore') {
     return {
       positive: [],
-      negative: label(payload.itemId, payload.fromContainer ?? payload.itemId),
+      negative: [
+        ...label(payload.itemId, payload.fromContainer ?? payload.itemId),
+        ...(payload.details?.splitInto ?? []).flatMap((targetId) => label(payload.itemId, targetId)),
+      ],
     };
   }
   return { positive: [], negative: [] };

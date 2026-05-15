@@ -113,6 +113,7 @@ import { rebuildFromEventLog } from '../recall/rebuild.js';
 import type { BucketRegistry } from '../routing/registry.js';
 import { redact } from '../safety/redaction.js';
 import { estimateTokens, tokenBudgetWarningThreshold } from '../safety/tokenBudget.js';
+import { applyFeedbackOverlayToSnapshot } from '../connections/feedbackOverlay.js';
 import { buildSignals, type BuildSignalsWorkstream } from '../suggestions/buildSignals.js';
 import { scoreSuggestions } from '../suggestions/score.js';
 import type { EventLog } from '../sync/eventLog.js';
@@ -4906,7 +4907,7 @@ const routes: readonly RouteDefinition[] = [
       const provider = url.searchParams.get('provider') ?? undefined;
       const originReplicaId = url.searchParams.get('originReplicaId') ?? undefined;
 
-      const snap = await context.connectionsStore.readCurrent();
+      let snap = await context.connectionsStore.readCurrent();
       if (snap === null) {
         // Materializer hasn't run yet — return an empty scoped
         // envelope so callers don't have to special-case 404.
@@ -4926,6 +4927,12 @@ const routes: readonly RouteDefinition[] = [
             },
           },
         ];
+      }
+      if (context.eventLog !== undefined) {
+        snap = applyFeedbackOverlayToSnapshot(
+          snap,
+          projectFeedback(await context.eventLog.readMerged()),
+        );
       }
       // Coarse filters — honoured by simple matchers. workstreamId
       // narrows to nodes either matching the ws id directly or
@@ -4978,6 +4985,9 @@ const routes: readonly RouteDefinition[] = [
               updatedAt: snap.updatedAt,
               nodeCount: nodes.length,
               edgeCount: edges.length,
+              ...(snap.snapshotRevision === undefined
+                ? {}
+                : { snapshotRevision: snap.snapshotRevision }),
             },
           },
         },
@@ -4998,7 +5008,7 @@ const routes: readonly RouteDefinition[] = [
       const url = new URL(request.url ?? '/v1/connections', 'http://internal');
       const hopsRaw = Number.parseInt(url.searchParams.get('hops') ?? '1', 10);
       const hops = Number.isFinite(hopsRaw) && hopsRaw >= 0 ? Math.min(hopsRaw, 4) : 1;
-      const snap = await context.connectionsStore.readCurrent();
+      let snap = await context.connectionsStore.readCurrent();
       if (snap === null) {
         return [
           200,
@@ -5016,6 +5026,12 @@ const routes: readonly RouteDefinition[] = [
             },
           },
         ];
+      }
+      if (context.eventLog !== undefined) {
+        snap = applyFeedbackOverlayToSnapshot(
+          snap,
+          projectFeedback(await context.eventLog.readMerged()),
+        );
       }
       const { subgraphForNode } = await import('../connections/snapshot.js');
       const sub = subgraphForNode(snap, nodeId, hops);

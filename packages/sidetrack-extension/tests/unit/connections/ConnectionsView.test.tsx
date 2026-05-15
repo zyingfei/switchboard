@@ -285,9 +285,11 @@ describe('ConnectionsView — engineering scaffold', () => {
       },
     };
 
+    const requestedNodeIds: string[] = [];
     setConnectionsClientTransportForTests(async (msg) => {
-      const m = msg as { type: string; filters?: { topicVariant?: string } };
+      const m = msg as { type: string; nodeId?: string; filters?: { topicVariant?: string } };
       if (m.type === messageTypes.loadConnectionsNeighbors) {
+        if (m.nodeId !== undefined) requestedNodeIds.push(m.nodeId);
         return { ok: true, data: collapsedSnapshot };
       }
       if (m.type === messageTypes.loadConnectionsSnapshot) {
@@ -309,7 +311,7 @@ describe('ConnectionsView — engineering scaffold', () => {
       expect(screen.queryByTestId('focus-topic-topic:db')).not.toBeNull();
     });
     expect(screen.queryByTestId('focus-topic-topic:hn')).toBeNull();
-    expect(screen.getByText('1 of 6 pages in this scope')).toBeDefined();
+    expect(screen.getByText('1 page shown here, 6 pages total')).toBeDefined();
     fireEvent.click(screen.getByText('Oracle'));
     expect(
       screen.getByTestId('focus-visit-timeline-visit:https://db.example/oracle'),
@@ -317,6 +319,13 @@ describe('ConnectionsView — engineering scaffold', () => {
     expect(
       screen.queryByTestId('focus-visit-timeline-visit:https://news.example/story'),
     ).toBeNull();
+    fireEvent.click(screen.getByTestId('focus-topic-anchor-topic:db'));
+    await waitFor(() => {
+      expect(requestedNodeIds).toContain('topic:db');
+    });
+    expect(screen.queryByText('(topic cluster)')).toBeNull();
+    expect(screen.queryByTestId('focus-empty')).toBeNull();
+    expect(screen.getByTestId('focus-topic-topic:db')).toBeDefined();
   });
 
   it('does not broaden thread-anchor shadow focus through a collapsed topic scope', async () => {
@@ -475,7 +484,118 @@ describe('ConnectionsView — engineering scaffold', () => {
       expect(screen.queryByTestId('focus-topic-topic:db')).not.toBeNull();
     });
     expect(screen.queryByTestId('focus-topic-topic:hn')).toBeNull();
-    expect(screen.getByText('1 of 6 pages in this scope')).toBeDefined();
+    expect(screen.getByText('1 page shown here, 6 pages total')).toBeDefined();
+  });
+
+  it('renders shadow topic members when the topic itself is the anchor', async () => {
+    const activeSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: { nodeId: 'topic:ai_race', hops: 1 },
+        nodes: [],
+        edges: [],
+        updatedAt: '2026-05-14T10:00:00.000Z',
+        nodeCount: 0,
+        edgeCount: 0,
+      },
+    };
+    const shadowSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: {},
+        nodes: [
+          {
+            id: 'timeline-visit:https://example.test/ai-race-a',
+            kind: 'timeline-visit',
+            label: 'The US Is Winning the AI Race',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://example.test/ai-race-a', focusedWindowMs: 8_000 },
+          },
+          {
+            id: 'timeline-visit:https://example.test/ai-race-b',
+            kind: 'timeline-visit',
+            label: 'AI Race Policy Brief',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://example.test/ai-race-b', focusedWindowMs: 6_000 },
+          },
+          {
+            id: 'topic:ai_race',
+            kind: 'topic',
+            label: 'The US Is Winning the AI Race',
+            originReplicaIds: [],
+            metadata: { memberCount: 2, cohesion: 0.92 },
+          },
+        ],
+        edges: [
+          {
+            id: 'edge:shadow-ai-a',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://example.test/ai-race-a',
+            toNodeId: 'topic:ai_race',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-shadow' },
+            confidence: 'inferred',
+          },
+          {
+            id: 'edge:shadow-ai-b',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://example.test/ai-race-b',
+            toNodeId: 'topic:ai_race',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-shadow' },
+            confidence: 'inferred',
+          },
+        ],
+        updatedAt: '2026-05-14T10:00:00.000Z',
+        nodeCount: 3,
+        edgeCount: 2,
+      },
+    };
+
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string; filters?: { topicVariant?: string } };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        return { ok: true, data: activeSnapshot };
+      }
+      if (m.type === messageTypes.loadConnectionsSnapshot) {
+        return {
+          ok: true,
+          data: m.filters?.topicVariant === 'shadow' ? shadowSnapshot : activeSnapshot,
+        };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+
+    render(<ConnectionsView initialAnchor="topic:ai_race" />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-mode-focus')).not.toBeNull();
+    });
+    fireEvent.click(screen.getByTestId('connections-mode-focus'));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('focus-topic-topic:ai_race')).not.toBeNull();
+    });
+    expect(screen.queryByTestId('focus-empty')).toBeNull();
+    expect(screen.getByText('2 pages')).toBeDefined();
+    fireEvent.click(screen.getByText('The US Is Winning the AI Race'));
+    expect(
+      screen.getByTestId('focus-visit-timeline-visit:https://example.test/ai-race-a'),
+    ).toBeDefined();
+    expect(
+      screen.getByTestId('focus-visit-timeline-visit:https://example.test/ai-race-b'),
+    ).toBeDefined();
+    expect(
+      screen
+        .getByTestId('focus-visit-open-timeline-visit:https://example.test/ai-race-a')
+        .getAttribute('href'),
+    ).toBe('https://example.test/ai-race-a');
+    fireEvent.click(
+      screen.getByTestId('focus-visit-timeline-visit:https://example.test/ai-race-a'),
+    );
+    await waitFor(() => {
+      expect(screen.getByText('Same topic (cohesion 0.92)')).toBeDefined();
+    });
+    expect(screen.queryByText(/Shared terms:/u)).toBeNull();
   });
 
   it('does not fall back to the global collapsed topic when scoped shadow has no topic', async () => {

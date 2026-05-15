@@ -1,6 +1,6 @@
 import { useState, type ReactElement } from 'react';
 
-import { CheckIcon, ClockIcon, EditIcon, RejectIcon, SaveIcon } from './icons';
+import { CheckIcon, ClockIcon, EditIcon, KindIcons, RejectIcon, SaveIcon } from './icons';
 
 export const ENGAGEMENT_CLASSES = [
   'parked_background',
@@ -39,6 +39,8 @@ export interface TopicNode {
 export interface TopicVisit {
   readonly id: string;
   readonly label: string;
+  readonly url?: string;
+  readonly lastSeenAt?: string;
   readonly focusedWindowMs: number;
 }
 
@@ -55,6 +57,7 @@ export interface FocusViewProps {
   readonly previousTopicCount?: number;
   readonly workstreamOptions?: readonly FocusWorkstreamOption[];
   readonly onTopicClick: (topicId: string) => void;
+  readonly onTopicAnchor?: (input: { readonly topicId: string; readonly label: string }) => void;
   readonly onTopicPromote?: (input: {
     readonly topicId: string;
     readonly targetWorkstreamId: string;
@@ -70,12 +73,18 @@ export interface FocusViewProps {
     readonly visitId: string;
     readonly memberVisitIds: readonly string[];
   }) => Promise<void> | void;
+  readonly onVisitRestoreToTopic?: (input: {
+    readonly topicId: string;
+    readonly visitId: string;
+  }) => Promise<void> | void;
   readonly onEngagementRelabel?: (input: {
     readonly visitId: string;
     readonly fromClass: EngagementClass;
     readonly toClass: EngagementClass;
   }) => Promise<void> | void;
   readonly onVisitClick: (visitId: string) => void;
+  readonly onVisitOpen?: (url: string) => void;
+  readonly allowTriageTopicCards?: boolean;
 }
 
 const COLLAPSE_TOPIC_MIN_MEMBERS = 50;
@@ -83,6 +92,16 @@ const COLLAPSE_SHARE_MIN_MEMBERS = 20;
 const COLLAPSE_MAX_TOPIC_SHARE = 0.5;
 const COLLAPSE_PREVIOUS_TOPIC_COUNT = 5;
 const SUGGESTION_MEMBER_LIMIT = 40;
+
+const ATTENTION_SORT_WEIGHT: Record<EngagementClass, number> = {
+  execution_source: 70,
+  source_extracted: 60,
+  worked_on_reference: 50,
+  engaged_read: 40,
+  skimmed: 30,
+  glanced: 20,
+  parked_background: 10,
+};
 
 const largestTopic = (topics: readonly TopicNode[]): TopicNode | undefined =>
   [...topics].sort((left, right) => right.memberCount - left.memberCount)[0];
@@ -95,7 +114,9 @@ const pageCountLabel = (count: number): string =>
 
 const topicMemberLabel = (topic: TopicNode): string => {
   if (topic.totalMemberCount !== undefined && topic.totalMemberCount > topic.memberCount) {
-    return `${String(topic.memberCount)} of ${pageCountLabel(topic.totalMemberCount)} in this scope`;
+    return `${pageCountLabel(topic.memberCount)} shown here, ${pageCountLabel(
+      topic.totalMemberCount,
+    )} total`;
   }
   return pageCountLabel(topic.memberCount);
 };
@@ -110,6 +131,18 @@ const focusedDurationLabel = (focusedWindowMs: number): string => {
   return remainingMinutes === 0
     ? `${String(hours)} hr`
     : `${String(hours)} hr ${String(remainingMinutes)} min`;
+};
+
+const sortScoreForVisit = (
+  visit: TopicVisit,
+  engagementClassesByVisit: Record<string, EngagementClass>,
+): number => {
+  const engagementClass = engagementClassesByVisit[visit.id];
+  const attentionWeight =
+    engagementClass === undefined ? 0 : ATTENTION_SORT_WEIGHT[engagementClass];
+  const recencySeconds =
+    visit.lastSeenAt === undefined ? 0 : Math.max(0, Date.parse(visit.lastSeenAt) / 1000);
+  return attentionWeight * 1_000_000_000_000 + recencySeconds + visit.focusedWindowMs / 1000;
 };
 
 const iconSlot = (icon: ReactElement): ReactElement => (
@@ -144,11 +177,15 @@ export const FocusView = ({
   previousTopicCount,
   workstreamOptions = [],
   onTopicClick,
+  onTopicAnchor,
   onTopicPromote,
   onTopicRename,
   onVisitMarkNotRelated,
+  onVisitRestoreToTopic,
   onEngagementRelabel,
   onVisitClick,
+  onVisitOpen,
+  allowTriageTopicCards = false,
 }: FocusViewProps): ReactElement => {
   const [expandedTopicIds, setExpandedTopicIds] = useState<ReadonlySet<string>>(
     () => new Set<string>(),
@@ -165,6 +202,9 @@ export const FocusView = ({
   const [renameErrorTopicId, setRenameErrorTopicId] = useState<string | null>(null);
   const [rejectedVisitIdsByTopic, setRejectedVisitIdsByTopic] = useState<
     Record<string, ReadonlySet<string>>
+  >({});
+  const [lastRemovedVisitByTopic, setLastRemovedVisitByTopic] = useState<
+    Record<string, TopicVisit | undefined>
   >({});
   const [visitActionInFlight, setVisitActionInFlight] = useState<string | null>(null);
   const [visitActionError, setVisitActionError] = useState<string | null>(null);
@@ -254,13 +294,15 @@ export const FocusView = ({
 
   const submitVisitNotRelated = (
     topic: TopicNode,
-    visitId: string,
+    visit: TopicVisit,
     memberVisitIds: readonly string[],
   ): void => {
     if (onVisitMarkNotRelated === undefined) return;
+    const visitId = visit.id;
     const actionKey = `not-related:${topic.id}:${visitId}`;
     setVisitActionInFlight(actionKey);
     setVisitActionError(null);
+    setLastRemovedVisitByTopic((current) => ({ ...current, [topic.id]: visit }));
     setRejectedVisitIdsByTopic((current) => {
       const next = new Set(current[topic.id] ?? []);
       next.add(visitId);
@@ -273,6 +315,7 @@ export const FocusView = ({
           next.delete(visitId);
           return { ...current, [topic.id]: next };
         });
+        setLastRemovedVisitByTopic((current) => ({ ...current, [topic.id]: undefined }));
         setVisitActionError(error instanceof Error ? error.message : String(error));
       })
       .finally(() => {
@@ -280,9 +323,40 @@ export const FocusView = ({
       });
   };
 
-  const collapsedTopic = isCollapsedSuggestionSet(topics, eligibleVisitCount, previousTopicCount)
-    ? largestTopic(topics)
-    : undefined;
+  const submitVisitRestore = (topic: TopicNode, visit: TopicVisit): void => {
+    const actionKey = `restore:${topic.id}:${visit.id}`;
+    setVisitActionInFlight(actionKey);
+    setVisitActionError(null);
+    setRejectedVisitIdsByTopic((current) => {
+      const next = new Set(current[topic.id] ?? []);
+      next.delete(visit.id);
+      return { ...current, [topic.id]: next };
+    });
+    setLastRemovedVisitByTopic((current) => ({ ...current, [topic.id]: undefined }));
+    if (onVisitRestoreToTopic === undefined) {
+      setVisitActionInFlight(null);
+      return;
+    }
+    void Promise.resolve(onVisitRestoreToTopic({ topicId: topic.id, visitId: visit.id }))
+      .catch((error: unknown) => {
+        setRejectedVisitIdsByTopic((current) => {
+          const next = new Set(current[topic.id] ?? []);
+          next.add(visit.id);
+          return { ...current, [topic.id]: next };
+        });
+        setLastRemovedVisitByTopic((current) => ({ ...current, [topic.id]: visit }));
+        setVisitActionError(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => {
+        setVisitActionInFlight(null);
+      });
+  };
+
+  const collapsedTopic =
+    !allowTriageTopicCards &&
+    isCollapsedSuggestionSet(topics, eligibleVisitCount, previousTopicCount)
+      ? largestTopic(topics)
+      : undefined;
   if (collapsedTopic !== undefined) {
     return (
       <section className="cx-focus cx-focus-triage-mode" data-testid="focus-view">
@@ -331,18 +405,26 @@ export const FocusView = ({
       {topics.map((topic) => {
         const visits = [...(visitsByTopic[topic.id] ?? [])].sort(
           (left, right) =>
-            right.focusedWindowMs - left.focusedWindowMs || left.id.localeCompare(right.id),
+            sortScoreForVisit(right, engagementClassesByVisit) -
+              sortScoreForVisit(left, engagementClassesByVisit) ||
+            left.id.localeCompare(right.id),
         );
         const rejectedVisitIds = rejectedVisitIdsByTopic[topic.id] ?? new Set<string>();
         const visibleVisits = visits.filter((visit) => !rejectedVisitIds.has(visit.id));
+        const lastRemovedVisit = lastRemovedVisitByTopic[topic.id];
         const expanded = expandedTopicIds.has(topic.id);
-        const oversized = topic.memberCount > SUGGESTION_MEMBER_LIMIT;
+        const needsTriage =
+          topic.memberCount > SUGGESTION_MEMBER_LIMIT ||
+          (allowTriageTopicCards &&
+            topics.length <= 1 &&
+            topic.memberCount >= COLLAPSE_SHARE_MIN_MEMBERS);
         const displayLabel = displayLabelFor(topic);
         const renameDraft = renameDraftFor(topic);
         const visibleVisitIds = visibleVisits.map((visit) => visit.id);
+        const canPromote = onTopicPromote !== undefined && workstreamOptions.length > 0;
         return (
           <article
-            className={`cx-focus-card${oversized ? ' is-triage' : ''}`}
+            className={`cx-focus-card${needsTriage ? ' is-triage' : ''}`}
             key={topic.id}
             data-testid={`focus-topic-${topic.id}`}
           >
@@ -357,13 +439,44 @@ export const FocusView = ({
               >
                 {displayLabel}
               </button>
-              <span
-                className={`cx-focus-chip ${
-                  oversized ? 'cx-focus-chip-warning' : 'cx-focus-chip-suggestion'
-                }`}
-              >
-                {oversized ? 'Needs triage' : 'Suggestion'}
-              </span>
+              <div className="cx-focus-head-actions">
+                <span
+                  className={`cx-focus-chip ${
+                    needsTriage ? 'cx-focus-chip-warning' : 'cx-focus-chip-suggestion'
+                  }`}
+                >
+                  {needsTriage ? 'Needs triage' : 'Suggestion'}
+                </span>
+                {canPromote ? (
+                  <button
+                    type="button"
+                    className="cx-focus-head-action"
+                    disabled={promotingTopicId === topic.id || visibleVisits.length === 0}
+                    onClick={() => {
+                      submitTopicPromote(topic, visibleVisitIds);
+                    }}
+                    data-testid={`focus-promote-${topic.id}`}
+                    title="Save this suggestion"
+                    aria-label={`Save ${displayLabel} suggestion`}
+                  >
+                    {iconSlot(SaveIcon)}
+                  </button>
+                ) : null}
+                {onTopicAnchor === undefined ? null : (
+                  <button
+                    type="button"
+                    className="cx-focus-head-action cx-focus-head-action-text"
+                    onClick={() => {
+                      onTopicAnchor({ topicId: topic.id, label: displayLabel });
+                    }}
+                    data-testid={`focus-topic-anchor-${topic.id}`}
+                    title="Set this suggestion as the graph anchor"
+                  >
+                    {iconSlot(KindIcons.topic)}
+                    Anchor
+                  </button>
+                )}
+              </div>
             </div>
             <div className="cx-focus-meta">
               <span>{topicMemberLabel(topic)}</span>
@@ -421,28 +534,12 @@ export const FocusView = ({
                     data-testid={`focus-rename-${topic.id}`}
                   >
                     {iconSlot(EditIcon)}
-                    {renamingTopicId === topic.id ? 'Renaming' : 'Rename'}
+                    {renamingTopicId === topic.id ? 'Saving' : 'Save name'}
                   </button>
                 </div>
                 {renameError !== null && renameErrorTopicId === topic.id ? (
                   <div className="cx-mono cx-dim" role="alert" data-testid="focus-rename-error">
                     {renameError}
-                  </div>
-                ) : null}
-                {onTopicPromote !== undefined && workstreamOptions.length > 0 ? (
-                  <div className="cx-focus-promote">
-                    <button
-                      type="button"
-                      className="cx-focus-expand cx-focus-inline-action"
-                      disabled={promotingTopicId === topic.id || visibleVisits.length === 0}
-                      onClick={() => {
-                        submitTopicPromote(topic, visibleVisitIds);
-                      }}
-                      data-testid={`focus-promote-${topic.id}`}
-                    >
-                      {iconSlot(SaveIcon)}
-                      {promotingTopicId === topic.id ? 'Saving' : 'Save suggestion'}
-                    </button>
                   </div>
                 ) : null}
                 {promoteError !== null && promoteErrorTopicId === topic.id ? (
@@ -454,14 +551,37 @@ export const FocusView = ({
                   <span>Pages</span>
                   <span className="cx-mono cx-dim">{pageCountLabel(visibleVisits.length)}</span>
                 </div>
+                {lastRemovedVisit === undefined ? null : (
+                  <div className="cx-focus-undo" data-testid={`focus-undo-${topic.id}`}>
+                    <span>Removed {lastRemovedVisit.label}</span>
+                    <button
+                      type="button"
+                      className="cx-focus-undo-action"
+                      disabled={
+                        visitActionInFlight === `restore:${topic.id}:${lastRemovedVisit.id}`
+                      }
+                      onClick={() => {
+                        submitVisitRestore(topic, lastRemovedVisit);
+                      }}
+                    >
+                      Undo
+                    </button>
+                  </div>
+                )}
                 <div className="cx-focus-visits">
                   {visibleVisits.map((visit) => {
                     const definedClass = engagementClassesByVisit[visit.id];
                     const showLabeler =
                       onEngagementRelabel !== undefined && labelingVisitIds.has(visit.id);
                     const currentClass = definedClass ?? 'parked_background';
+                    const attentionLabel =
+                      definedClass === undefined
+                        ? 'Attention'
+                        : ENGAGEMENT_CLASS_LABELS[definedClass];
                     const hasFocusedTime = visit.focusedWindowMs > 0;
                     const focusedDuration = focusedDurationLabel(visit.focusedWindowMs);
+                    const visitUrl = visit.url;
+                    const canOpenVisit = visitUrl !== undefined && visitUrl.length > 0;
                     return (
                       <div className="cx-focus-visit" key={visit.id}>
                         <button
@@ -497,6 +617,26 @@ export const FocusView = ({
                             </span>
                           ) : null}
                         </button>
+                        {canOpenVisit ? (
+                          <a
+                            className="cx-focus-visit-labelbtn cx-focus-visit-open"
+                            href={visitUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            onClick={
+                              onVisitOpen === undefined
+                                ? undefined
+                                : (event) => {
+                                    event.preventDefault();
+                                    onVisitOpen(visitUrl);
+                                  }
+                            }
+                            data-testid={`focus-visit-open-${visit.id}`}
+                            title={`Open ${visitUrl}`}
+                          >
+                            ↗ Open
+                          </a>
+                        ) : null}
                         {onEngagementRelabel === undefined ? null : showLabeler ? (
                           <select
                             className="cx-focus-visit-select"
@@ -525,9 +665,14 @@ export const FocusView = ({
                               openLabeler(visit.id);
                             }}
                             data-testid={`focus-visit-label-${visit.id}`}
-                            title="Label engagement (researcher feature)"
+                            title={
+                              definedClass === undefined
+                                ? 'Set attention label'
+                                : `Current attention label: ${attentionLabel}`
+                            }
                           >
-                            Label
+                            {iconSlot(EditIcon)}
+                            {attentionLabel}
                           </button>
                         )}
                         {onVisitMarkNotRelated === undefined ? null : (
@@ -536,13 +681,13 @@ export const FocusView = ({
                             className="cx-focus-visit-labelbtn cx-focus-visit-reject"
                             disabled={visitActionInFlight === `not-related:${topic.id}:${visit.id}`}
                             onClick={() => {
-                              submitVisitNotRelated(topic, visit.id, visibleVisitIds);
+                              submitVisitNotRelated(topic, visit, visibleVisitIds);
                             }}
                             data-testid={`focus-visit-not-related-${topic.id}-${visit.id}`}
-                            title="This page does not belong in this suggestion"
+                            title="Remove this page from this suggestion"
                           >
                             {iconSlot(RejectIcon)}
-                            Doesn't belong
+                            Remove
                           </button>
                         )}
                       </div>

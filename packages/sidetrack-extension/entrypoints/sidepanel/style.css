@@ -9276,6 +9276,38 @@ pre.diff {
   line-height: 1.25;
   overflow-wrap: anywhere;
 }
+.cx-focus-head-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex: none;
+}
+.cx-focus-head-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 22px;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  background: var(--paper);
+  color: var(--ink-2);
+  font: 10px var(--mono);
+  padding: 0 6px;
+  cursor: pointer;
+}
+.cx-focus-head-action:hover {
+  background: var(--paper-tinted);
+  color: var(--ink);
+}
+.cx-focus-head-action:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.cx-focus-head-action-text {
+  padding: 0 7px;
+}
 .cx-focus-meta {
   display: flex;
   align-items: center;
@@ -9300,9 +9332,9 @@ pre.diff {
   padding: 0 5px;
 }
 .cx-focus-chip-suggestion {
-  color: var(--slate);
+  color: var(--ink-2);
   border-color: var(--rule);
-  background: var(--slate-bg);
+  background: var(--paper);
 }
 .cx-focus-chip-warning {
   color: var(--amber);
@@ -9400,6 +9432,37 @@ pre.diff {
   justify-content: space-between;
   gap: 8px;
 }
+.cx-focus-undo {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--rad-s);
+  background: var(--paper-tinted);
+  color: var(--ink-3);
+  font: 10.5px var(--mono);
+  padding: 5px 7px;
+}
+.cx-focus-undo span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cx-focus-undo-action {
+  flex: none;
+  border: 0;
+  background: transparent;
+  color: var(--ink-2);
+  font: inherit;
+  cursor: pointer;
+  padding: 0;
+}
+.cx-focus-undo-action:hover {
+  color: var(--ink);
+}
 .cx-focus-visits {
   display: flex;
   flex-direction: column;
@@ -9491,6 +9554,9 @@ pre.diff {
 .cx-focus-visit-labelbtn:hover {
   background: var(--paper-tinted);
   color: var(--ink-2);
+}
+.cx-focus-visit-open {
+  text-decoration: none;
 }
 .cx-focus-visit-title {
   flex: 1;
