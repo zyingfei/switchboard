@@ -1326,9 +1326,12 @@ export const ConnectionsView = ({
 
   const selectedWorkstreamAnchor = anchor.startsWith('workstream:') ? anchor : '';
 
-  // #5 — responsive collapse. Default open; the toggles only appear on
-  // narrow widths (CSS-gated), so wide layouts are unaffected.
+  // #5 — collapsible panels. Always-available restrained toggles:
+  // left rail (Find/Workstream/Recent/Shortcuts), the right anchor
+  // summary (cx-col-r: why-related / provenance), and the page-text
+  // card. Collapsing reclaims the fixed column width.
   const [leftRailOpen, setLeftRailOpen] = useState(true);
+  const [rightPanelOpen, setRightPanelOpen] = useState(true);
   const [anchorSummaryOpen, setAnchorSummaryOpen] = useState(true);
 
   // Honest "Recent anchors" — built from real navigation history
@@ -2574,7 +2577,18 @@ export const ConnectionsView = ({
             )
           )}
         </main>
-        <aside className="cx-col-r">
+        <aside className={'cx-col-r' + (rightPanelOpen ? '' : ' is-collapsed')}>
+          <button
+            type="button"
+            className="cx-rightpanel-toggle cx-mono cx-dim"
+            onClick={() => {
+              setRightPanelOpen((v) => !v);
+            }}
+            aria-expanded={rightPanelOpen}
+            data-testid="connections-rightpanel-toggle"
+          >
+            {rightPanelOpen ? '▸ Anchor summary' : '◂ Anchor summary'}
+          </button>
           <div className="cx-section cx-section-last cx-section-padded">
             {whyVisitId !== null && result !== null ? (
               <WhyRelatedPanel
