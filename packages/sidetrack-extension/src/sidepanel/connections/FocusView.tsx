@@ -30,14 +30,20 @@ export interface TopicNode {
   readonly label: string;
   readonly memberCount: number;
   readonly totalMemberCount?: number;
+  readonly secondaryCount?: number;
   readonly cohesion: number;
   readonly dominantWorkstreamId?: string;
 }
+
+export type TopicVisitAffiliation = 'primary' | 'secondary';
 
 export interface TopicVisit {
   readonly id: string;
   readonly label: string;
   readonly focusedWindowMs: number;
+  readonly affiliation?: TopicVisitAffiliation;
+  readonly secondaryScore?: number;
+  readonly secondaryReasons?: readonly string[];
 }
 
 export interface FocusWorkstreamOption {
@@ -79,12 +85,56 @@ const largestTopic = (topics: readonly TopicNode[]): TopicNode | undefined =>
 const summedTopicMembers = (topics: readonly TopicNode[]): number =>
   topics.reduce((sum, topic) => sum + topic.memberCount, 0);
 
+const pageCountLabel = (count: number): string =>
+  `${String(count)} ${count === 1 ? 'page' : 'pages'}`;
+
 const topicMemberLabel = (topic: TopicNode): string => {
-  if (topic.totalMemberCount !== undefined && topic.totalMemberCount > topic.memberCount) {
-    return `${String(topic.memberCount)} of ${String(topic.totalMemberCount)} pages in this scope`;
+  const secondaryCount = topic.secondaryCount ?? 0;
+  if (topic.memberCount === 0 && secondaryCount > 0) {
+    const primaryLabel =
+      topic.totalMemberCount !== undefined && topic.totalMemberCount > 0
+        ? ` · ${pageCountLabel(topic.totalMemberCount)} primary`
+        : '';
+    return `${String(secondaryCount)} also related${primaryLabel}`;
   }
-  return `${String(topic.memberCount)} ${topic.memberCount === 1 ? 'page' : 'pages'}`;
+  const base =
+    topic.totalMemberCount !== undefined && topic.totalMemberCount > topic.memberCount
+      ? `${String(topic.memberCount)} of ${pageCountLabel(topic.totalMemberCount)} in this scope`
+      : pageCountLabel(topic.memberCount);
+  if (secondaryCount > 0) {
+    return `${base} · ${String(secondaryCount)} also related`;
+  }
+  return base;
 };
+
+const secondaryVisitTitle = (visit: TopicVisit): string => {
+  const details: string[] = [];
+  if (visit.secondaryScore !== undefined) {
+    details.push(`score ${visit.secondaryScore.toFixed(2)}`);
+  }
+  if (visit.secondaryReasons !== undefined && visit.secondaryReasons.length > 0) {
+    details.push(visit.secondaryReasons.join(', '));
+  }
+  return details.length === 0 ? 'Also related to this suggestion' : details.join(' · ');
+};
+
+const visitAffiliationRank = (visit: TopicVisit): number =>
+  visit.affiliation === 'secondary' ? 1 : 0;
+
+const secondaryScoreForSort = (visit: TopicVisit): number =>
+  visit.secondaryScore === undefined ? 0 : visit.secondaryScore;
+
+const primaryVisitsForPromotion = (visits: readonly TopicVisit[]): readonly TopicVisit[] =>
+  visits.filter((visit) => visit.affiliation !== 'secondary');
+
+const sortTopicVisits = (visits: readonly TopicVisit[]): TopicVisit[] =>
+  [...visits].sort(
+    (left, right) =>
+      visitAffiliationRank(left) - visitAffiliationRank(right) ||
+      secondaryScoreForSort(right) - secondaryScoreForSort(left) ||
+      right.focusedWindowMs - left.focusedWindowMs ||
+      left.id.localeCompare(right.id),
+  );
 
 export const isCollapsedSuggestionSet = (
   topics: readonly TopicNode[],
@@ -234,10 +284,8 @@ export const FocusView = ({
   return (
     <section className="cx-focus" data-testid="focus-view">
       {topics.map((topic) => {
-        const visits = [...(visitsByTopic[topic.id] ?? [])].sort(
-          (left, right) =>
-            right.focusedWindowMs - left.focusedWindowMs || left.id.localeCompare(right.id),
-        );
+        const visits = sortTopicVisits(visitsByTopic[topic.id] ?? []);
+        const primaryVisits = primaryVisitsForPromotion(visits);
         const expanded = expandedTopicIds.has(topic.id);
         const oversized = topic.memberCount > SUGGESTION_MEMBER_LIMIT;
         const promoteTarget = promoteTargetsByTopic[topic.id] ?? workstreamOptions[0]?.id ?? '';
@@ -307,11 +355,15 @@ export const FocusView = ({
                 <button
                   type="button"
                   className="cx-focus-expand"
-                  disabled={promotingTopicId === topic.id || promoteTarget.length === 0}
+                  disabled={
+                    promotingTopicId === topic.id ||
+                    promoteTarget.length === 0 ||
+                    primaryVisits.length === 0
+                  }
                   onClick={() => {
                     submitTopicPromote(
                       topic,
-                      visits.map((visit) => visit.id),
+                      primaryVisits.map((visit) => visit.id),
                     );
                   }}
                   data-testid={`focus-promote-${topic.id}`}
@@ -364,6 +416,16 @@ export const FocusView = ({
                           data-testid={`engagement-dot-${visit.id}`}
                         />
                         <span className="cx-focus-visit-title">{visit.label}</span>
+                        {visit.affiliation === 'secondary' ? (
+                          <span
+                            className="cx-focus-chip cx-focus-chip-secondary"
+                            title={secondaryVisitTitle(visit)}
+                          >
+                            {visit.secondaryScore === undefined
+                              ? 'Also related'
+                              : `Also related ${visit.secondaryScore.toFixed(2)}`}
+                          </span>
+                        ) : null}
                         {hasFocusedTime ? (
                           <span
                             className="cx-mono cx-dim cx-focus-visit-ms"

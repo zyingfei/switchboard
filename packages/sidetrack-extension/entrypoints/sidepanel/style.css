@@ -8721,6 +8721,12 @@ pre.diff {
   border-color: var(--green-tint);
   background: var(--green-bg);
 }
+.cx-focus-chip-secondary {
+  color: #5f4b1f;
+  border-color: rgba(95, 75, 31, 0.28);
+  background: rgba(95, 75, 31, 0.08);
+  white-space: nowrap;
+}
 .cx-focus-promote {
   margin: 10px 0;
 }
@@ -8787,7 +8793,7 @@ pre.diff {
 }
 .cx-focus-visit-main {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 8px;
   flex: 1;

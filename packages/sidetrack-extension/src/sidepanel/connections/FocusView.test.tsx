@@ -50,6 +50,43 @@ describe('FocusView', () => {
     );
   });
 
+  it('renders secondary affiliations as also-related visits', () => {
+    render(
+      <FocusView
+        topics={[
+          {
+            id: 'topic:a',
+            label: 'Alpha',
+            memberCount: 2,
+            secondaryCount: 1,
+            cohesion: 0.91,
+          },
+        ]}
+        visitsByTopic={{
+          'topic:a': [
+            { id: 'visit:a', label: 'Primary', focusedWindowMs: 10_000 },
+            {
+              id: 'visit:b',
+              label: 'Secondary',
+              focusedWindowMs: 4_000,
+              affiliation: 'secondary',
+              secondaryScore: 0.78,
+              secondaryReasons: ['edge_support', 'member_similarity'],
+            },
+          ],
+        }}
+        engagementClassesByVisit={{}}
+        onTopicClick={() => undefined}
+        onVisitClick={() => undefined}
+      />,
+    );
+
+    expect(screen.getByText('2 pages · 1 also related')).toBeDefined();
+    fireEvent.click(screen.getByTestId('focus-expand-topic:a'));
+    expect(screen.getByText('Also related 0.78')).toBeDefined();
+    expect(screen.getByTitle('score 0.78 · edge_support, member_similarity')).toBeDefined();
+  });
+
   it('renders the workstream chip and click handlers', () => {
     const onTopicClick = vi.fn();
     const onVisitClick = vi.fn();
@@ -193,6 +230,13 @@ describe('FocusView', () => {
           'topic:a': [
             { id: 'timeline-visit:https://example.test/a', label: 'A', focusedWindowMs: 10_000 },
             { id: 'timeline-visit:https://example.test/b', label: 'B', focusedWindowMs: 5_000 },
+            {
+              id: 'timeline-visit:https://example.test/candidate',
+              label: 'Candidate',
+              focusedWindowMs: 2_000,
+              affiliation: 'secondary',
+              secondaryScore: 0.74,
+            },
           ],
         }}
         engagementClassesByVisit={{}}

@@ -27,6 +27,7 @@ import {
   type EngagementClass,
   type TopicNode,
   type TopicVisit,
+  type TopicVisitAffiliation,
 } from './FocusView';
 import { HopToggle } from './HopToggle';
 import { KindIcons, SearchIcon } from './icons';
@@ -152,6 +153,16 @@ const metadataNumber = (
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 };
 
+const metadataStringList = (
+  metadata: Record<string, unknown>,
+  key: string,
+): readonly string[] | undefined => {
+  const value = metadata[key];
+  if (!Array.isArray(value)) return undefined;
+  const strings = value.filter((item): item is string => typeof item === 'string');
+  return strings.length === 0 ? undefined : strings;
+};
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
@@ -205,6 +216,47 @@ const focusedWindowMsForNode = (node: ConnectionNode): number => {
     }
   }
   return metadataNumber(node.metadata, 'focusedWindowMs', 0);
+};
+
+const topicVisitAffiliationForEdge = (edge: ConnectionEdge): TopicVisitAffiliation =>
+  edge.metadata?.['affiliation'] === 'secondary' ? 'secondary' : 'primary';
+
+const isSecondaryTopicEdge = (edge: ConnectionEdge): boolean =>
+  edge.kind === 'visit_in_topic' && topicVisitAffiliationForEdge(edge) === 'secondary';
+
+const topicVisitFromEdge = (
+  edge: ConnectionEdge,
+  visit: ConnectionNode,
+  ctx: EntityDisplayCtx,
+): TopicVisit => {
+  const affiliation = topicVisitAffiliationForEdge(edge);
+  const metadata = edge.metadata ?? {};
+  const secondaryScore = metadataNumber(metadata, 'score', Number.NaN);
+  return {
+    id: visit.id,
+    label: formatEntityDisplay(visit, ctx).primary,
+    focusedWindowMs: focusedWindowMsForNode(visit),
+    affiliation,
+    ...(affiliation === 'secondary' && Number.isFinite(secondaryScore) ? { secondaryScore } : {}),
+    ...(affiliation === 'secondary'
+      ? { secondaryReasons: metadataStringList(metadata, 'reasons') ?? [] }
+      : {}),
+  };
+};
+
+const isBetterTopicVisit = (candidate: TopicVisit, existing: TopicVisit): boolean => {
+  if (candidate.affiliation !== existing.affiliation) {
+    return candidate.affiliation !== 'secondary';
+  }
+  if (candidate.affiliation === 'secondary') {
+    const candidateScore = candidate.secondaryScore ?? 0;
+    const existingScore = existing.secondaryScore ?? 0;
+    if (candidateScore !== existingScore) return candidateScore > existingScore;
+  }
+  if (candidate.focusedWindowMs !== existing.focusedWindowMs) {
+    return candidate.focusedWindowMs > existing.focusedWindowMs;
+  }
+  return candidate.id < existing.id;
 };
 
 // Stage 5 polish — Flow Path now sources its visits from
@@ -504,6 +556,9 @@ const deriveFocusData = (
         label: formatEntityDisplay(node, ctx).primary,
         memberCount,
         ...(totalMemberCount > memberCount ? { totalMemberCount } : {}),
+        ...(metadataNumber(node.metadata, 'secondaryCount', 0) > 0
+          ? { secondaryCount: metadataNumber(node.metadata, 'secondaryCount', 0) }
+          : {}),
         cohesion: metadataNumber(node.metadata, 'cohesion', 0),
         ...(metadataString(node.metadata, ['dominantWorkstreamId']) === undefined
           ? {}
@@ -520,22 +575,24 @@ const deriveFocusData = (
   const sourceEdges = hasFull ? fullEdges : scopeEdges;
   const nodeById = new Map(sourceNodes.map((node) => [node.id, node] as const));
 
-  const visitsByTopic: Record<string, TopicVisit[]> = {};
+  const visitsByTopicMap = new Map<string, Map<string, TopicVisit>>();
   const previousTopicIds = new Set<string>();
   for (const edge of sourceEdges) {
     if (edge.kind === 'topic.lineage') previousTopicIds.add(edge.fromNodeId);
     if (edge.kind !== 'visit_in_topic') continue;
     const visit = nodeById.get(edge.fromNodeId);
     if (visit === undefined) continue;
-    const list = visitsByTopic[edge.toNodeId] ?? [];
-    visitsByTopic[edge.toNodeId] = [
-      ...list,
-      {
-        id: visit.id,
-        label: formatEntityDisplay(visit, ctx).primary,
-        focusedWindowMs: focusedWindowMsForNode(visit),
-      },
-    ];
+    const candidate = topicVisitFromEdge(edge, visit, ctx);
+    const topicVisits = visitsByTopicMap.get(edge.toNodeId) ?? new Map<string, TopicVisit>();
+    const existing = topicVisits.get(visit.id);
+    if (existing === undefined || isBetterTopicVisit(candidate, existing)) {
+      topicVisits.set(visit.id, candidate);
+    }
+    visitsByTopicMap.set(edge.toNodeId, topicVisits);
+  }
+  const visitsByTopic: Record<string, TopicVisit[]> = {};
+  for (const [topicId, topicVisits] of visitsByTopicMap) {
+    visitsByTopic[topicId] = [...topicVisits.values()];
   }
 
   // Engagement classes — keep using scope nodes (the
@@ -713,6 +770,7 @@ const deriveShadowFocusScope = (
   } else {
     addAnchorScopedVisitAliases(activeScopeNodes, activeScopeEdges, anchorId, scopedVisitIds);
   }
+  const anchorIsTopic = anchorId.startsWith('topic:');
 
   for (const edge of shadowEdges) {
     if (edge.kind === 'visit_in_topic' && scopedVisitIds.has(edge.fromNodeId)) {
@@ -721,17 +779,28 @@ const deriveShadowFocusScope = (
   }
 
   const visitTopicEdges = shadowEdges.filter(
-    (edge) => edge.kind === 'visit_in_topic' && selectedTopicIds.has(edge.toNodeId),
+    (edge) =>
+      edge.kind === 'visit_in_topic' &&
+      selectedTopicIds.has(edge.toNodeId) &&
+      (!isSecondaryTopicEdge(edge) || anchorIsTopic || scopedVisitIds.has(edge.fromNodeId)),
   );
   const scopedTopicMemberCounts = new Map<string, number>();
+  const scopedTopicSecondaryCounts = new Map<string, number>();
   const scopedNodeIds = new Set<string>();
   for (const edge of visitTopicEdges) {
     scopedNodeIds.add(edge.fromNodeId);
     scopedNodeIds.add(edge.toNodeId);
-    scopedTopicMemberCounts.set(
-      edge.toNodeId,
-      (scopedTopicMemberCounts.get(edge.toNodeId) ?? 0) + 1,
-    );
+    if (topicVisitAffiliationForEdge(edge) === 'secondary') {
+      scopedTopicSecondaryCounts.set(
+        edge.toNodeId,
+        (scopedTopicSecondaryCounts.get(edge.toNodeId) ?? 0) + 1,
+      );
+    } else {
+      scopedTopicMemberCounts.set(
+        edge.toNodeId,
+        (scopedTopicMemberCounts.get(edge.toNodeId) ?? 0) + 1,
+      );
+    }
   }
 
   const fallbackNodeById = new Map(activeScopeNodes.map((node) => [node.id, node] as const));
@@ -740,6 +809,7 @@ const deriveShadowFocusScope = (
     .map((node) => {
       if (node.kind !== 'topic') return node;
       const scopedMemberCount = scopedTopicMemberCounts.get(node.id) ?? 0;
+      const scopedSecondaryCount = scopedTopicSecondaryCounts.get(node.id) ?? 0;
       const globalMemberCount = metadataNumber(node.metadata, 'memberCount', scopedMemberCount);
       return {
         ...node,
@@ -747,6 +817,7 @@ const deriveShadowFocusScope = (
           ...node.metadata,
           globalMemberCount,
           memberCount: scopedMemberCount,
+          ...(scopedSecondaryCount > 0 ? { secondaryCount: scopedSecondaryCount } : {}),
         },
       };
     });

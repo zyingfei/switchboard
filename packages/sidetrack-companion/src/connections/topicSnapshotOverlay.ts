@@ -107,6 +107,42 @@ export const overlayTopicRevisionOnSnapshot = (
         observedAt: topic.metadata.lastObservedAt,
         producedBy: topicProducedBy,
         confidence: 'inferred',
+        metadata: { affiliation: 'primary' },
+      });
+    }
+
+    for (const affiliation of topic.secondaryAffiliations ?? []) {
+      const visitNodeId = nodeIdFor('timeline-visit', affiliation.canonicalUrl);
+      if (!nodesById.has(visitNodeId)) {
+        nodesById.set(visitNodeId, {
+          id: visitNodeId,
+          kind: 'timeline-visit',
+          label: affiliation.canonicalUrl,
+          firstSeenAt: topic.metadata.firstObservedAt,
+          lastSeenAt: topic.metadata.lastObservedAt,
+          originReplicaIds: [],
+          metadata: { canonicalUrl: affiliation.canonicalUrl },
+        });
+      }
+      const secondaryEdgeId = edgeIdFor('visit_in_topic', visitNodeId, topicNodeId);
+      if (edgesById.has(secondaryEdgeId)) continue;
+      edgesById.set(secondaryEdgeId, {
+        id: secondaryEdgeId,
+        kind: 'visit_in_topic',
+        fromNodeId: visitNodeId,
+        toNodeId: topicNodeId,
+        observedAt: topic.metadata.lastObservedAt,
+        producedBy: topicProducedBy,
+        confidence: 'inferred',
+        metadata: {
+          affiliation: 'secondary',
+          score: affiliation.score,
+          reasons: affiliation.reasons,
+          supportCount: affiliation.supportCount,
+          maxCosine: affiliation.maxCosine,
+          lexicalScore: affiliation.lexicalScore,
+          reciprocalSupport: affiliation.reciprocalSupport,
+        },
       });
     }
 
