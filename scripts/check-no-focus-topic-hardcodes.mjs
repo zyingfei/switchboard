@@ -12,6 +12,7 @@ const ignoredSegments = new Set(["__fixtures__"]);
 const ignoredSuffixes = [".test.ts", ".test.tsx", ".d.ts"];
 const banned = [
   "Hacker News",
+  "Oracle",
   "OCI",
   "Cactus",
   "Switchboard",

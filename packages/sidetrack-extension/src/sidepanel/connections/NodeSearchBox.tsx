@@ -26,7 +26,10 @@ export interface SearchableAnchor {
 }
 
 export interface RecallSearchHit {
-  readonly threadId: string;
+  readonly sourceKind?: 'page-content' | 'chat-turn';
+  readonly anchorNodeId?: string;
+  readonly threadId?: string;
+  readonly canonicalUrl?: string;
   readonly title?: string;
   readonly threadUrl?: string;
   readonly snippet?: string;
@@ -175,17 +178,12 @@ export const NodeSearchBox = ({
       {open && trimmed.length > 0 ? (
         <div className="cx-search-results" data-testid="connections-search-results">
           {loading === true ? (
-            <div
-              className="cx-search-loading mono cx-dim"
-              data-testid="connections-search-loading"
-            >
+            <div className="cx-search-loading mono cx-dim" data-testid="connections-search-loading">
               Searching the whole vault…
             </div>
           ) : null}
           {hits.length > 0 ? (
-            <div className="cx-search-section-head mono">
-              Title matches · {String(hits.length)}
-            </div>
+            <div className="cx-search-section-head mono">Title matches · {String(hits.length)}</div>
           ) : null}
           {hits.length === 0 && recallHits.length === 0 ? (
             <div className="cx-search-empty">
@@ -197,10 +195,12 @@ export const NodeSearchBox = ({
             </div>
           ) : (
             hits.map((hit) => {
-              const tintClass = (NODE_KIND_DISPLAY as Record<string, { tintClass: string }>)[hit.kind]
-                ?.tintClass;
-              const kindLabel = (NODE_KIND_DISPLAY as Record<string, { label: string }>)[hit.kind]
-                ?.label ?? hit.kind;
+              const tintClass = (NODE_KIND_DISPLAY as Record<string, { tintClass: string }>)[
+                hit.kind
+              ]?.tintClass;
+              const kindLabel =
+                (NODE_KIND_DISPLAY as Record<string, { label: string }>)[hit.kind]?.label ??
+                hit.kind;
               const Icon = (KindIcons as Record<string, ReactElement>)[hit.kind];
               return (
                 <button
@@ -239,8 +239,7 @@ export const NodeSearchBox = ({
               className="cx-search-section-head mono"
               data-testid="connections-search-recall-head"
             >
-              Content matches{' '}
-              {recallLoading ? '· searching…' : `· ${String(recallHits.length)}`}
+              Content matches {recallLoading ? '· searching…' : `· ${String(recallHits.length)}`}
             </div>
           ) : null}
           {recallError !== null && recallHits.length === 0 ? (
@@ -248,34 +247,46 @@ export const NodeSearchBox = ({
               {recallError}
             </div>
           ) : null}
-          {recallHits.map((hit) => (
-            <button
-              key={`recall:${hit.threadId}`}
-              type="button"
-              className="cx-search-hit"
-              onClick={() => {
-                onPick(`thread:${hit.threadId}`);
-                setQuery('');
-                setOpen(false);
-              }}
-              data-testid={`connections-search-recall-${hit.threadId}`}
-              title={hit.snippet ?? hit.title ?? hit.threadUrl}
-            >
-              <span className="cx-search-hit-body">
-                <span className="cx-search-hit-primary">
-                  {hit.title !== undefined && hit.title.length > 0
-                    ? hit.title
-                    : '(thread)'}
+          {recallHits.map((hit) => {
+            const anchorId =
+              hit.anchorNodeId ??
+              (hit.threadId === undefined ? undefined : `thread:${hit.threadId}`);
+            const sourceLabel = hit.sourceKind === 'page-content' ? 'Page' : 'Thread';
+            const testIdSuffix =
+              hit.sourceKind === 'page-content' ? anchorId : (hit.threadId ?? anchorId);
+            return anchorId === undefined ? null : (
+              <button
+                key={`recall:${anchorId}:${hit.title ?? ''}`}
+                type="button"
+                className="cx-search-hit"
+                onClick={() => {
+                  onPick(anchorId);
+                  setQuery('');
+                  setOpen(false);
+                }}
+                data-testid={`connections-search-recall-${testIdSuffix}`}
+                title={hit.snippet ?? hit.title ?? hit.canonicalUrl ?? hit.threadUrl}
+              >
+                <span className="cx-search-hit-body">
+                  <span className="cx-search-hit-primary">
+                    {hit.title !== undefined && hit.title.length > 0
+                      ? hit.title
+                      : hit.sourceKind === 'page-content'
+                        ? '(page)'
+                        : '(thread)'}
+                  </span>
+                  {hit.snippet !== undefined && hit.snippet.length > 0 ? (
+                    <span className="cx-search-hit-snippet">{hit.snippet}</span>
+                  ) : hit.canonicalUrl !== undefined ? (
+                    <span className="cx-search-hit-secondary">{hit.canonicalUrl}</span>
+                  ) : hit.threadUrl !== undefined ? (
+                    <span className="cx-search-hit-secondary">{hit.threadUrl}</span>
+                  ) : null}
                 </span>
-                {hit.snippet !== undefined && hit.snippet.length > 0 ? (
-                  <span className="cx-search-hit-snippet">{hit.snippet}</span>
-                ) : hit.threadUrl !== undefined ? (
-                  <span className="cx-search-hit-secondary">{hit.threadUrl}</span>
-                ) : null}
-              </span>
-              <span className="cx-search-hit-kind">Thread</span>
-            </button>
-          ))}
+                <span className="cx-search-hit-kind">{sourceLabel}</span>
+              </button>
+            );
+          })}
         </div>
       ) : null}
     </div>

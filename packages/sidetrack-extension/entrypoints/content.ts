@@ -10,6 +10,7 @@ import {
   type ContentRequest,
   type ContentResponse,
   type ListAnnotationsByUrlResponse,
+  type PageContentExtractContentResponse,
   type RecallQueryResponse,
 } from '../src/messages';
 import {
@@ -20,6 +21,7 @@ import {
   type RestoredAnchor,
 } from '../src/contentOverlays';
 import type { RankedItem } from '../src/companion/recallClient';
+import { settleAndExtractPageContent } from '../src/pageContent/extraction';
 
 // Per-provider composer + send-button + AI-done selectors. Sourced
 // from `tests/e2e/live-status-transitions.spec.ts` which proved each
@@ -117,7 +119,7 @@ const driveAutoSend = async (
   // The page's own "New chat" sidebar link uses Next.js client-side
   // navigation to reset state without re-redirecting; clicking it
   // pre-flight is the cleanest reset.
-  if (provider === 'chatgpt' && window.location.pathname.startsWith("/c/")) {
+  if (provider === 'chatgpt' && window.location.pathname.startsWith('/c/')) {
     const newChatLink = document.querySelector<HTMLElement>(
       'a[data-testid="create-new-chat-button"]',
     );
@@ -251,7 +253,12 @@ const isContentRequest = (value: unknown): value is ContentRequest =>
   typeof value === 'object' &&
   value !== null &&
   'type' in value &&
-  value.type === messageTypes.captureVisibleThread;
+  (value.type === messageTypes.captureVisibleThread ||
+    (value.type === messageTypes.pageContentExtract &&
+      'mode' in value &&
+      (value.mode === 'page' || value.mode === 'selection') &&
+      'trigger' in value &&
+      (value.trigger === 'manual' || value.trigger === 'bulk-open-tabs')));
 
 export default defineContentScript({
   matches: [
@@ -308,7 +315,14 @@ export default defineContentScript({
         // working. Try direct first; fall back to SW on a non-
         // success status (403, network error). This way both real
         // browsers and the existing e2e infrastructure are covered.
-        let annotations: readonly { readonly bac_id: string; readonly url: string; readonly pageTitle: string; readonly note: string; readonly createdAt: string; readonly anchor: import('../src/annotation/anchors').SerializedAnchor }[] = [];
+        let annotations: readonly {
+          readonly bac_id: string;
+          readonly url: string;
+          readonly pageTitle: string;
+          readonly note: string;
+          readonly createdAt: string;
+          readonly anchor: import('../src/annotation/anchors').SerializedAnchor;
+        }[] = [];
         try {
           const client = await createAnnotationClient();
           if (client !== undefined) {
@@ -1079,6 +1093,7 @@ export default defineContentScript({
         sendResponse: (
           response:
             | ContentResponse
+            | PageContentExtractContentResponse
             | AutoSendResult
             | { readonly ok: boolean; readonly error?: string; readonly annotationId?: string },
         ) => void,
@@ -1098,6 +1113,22 @@ export default defineContentScript({
           return true;
         }
         if (isContentRequest(message)) {
+          if (message.type === messageTypes.pageContentExtract) {
+            void settleAndExtractPageContent({
+              mode: message.mode,
+              trigger: message.trigger,
+            })
+              .then((result) => {
+                sendResponse(result);
+              })
+              .catch((error: unknown) => {
+                sendResponse({
+                  ok: false,
+                  error: error instanceof Error ? error.message : 'Page-content extraction failed.',
+                });
+              });
+            return true;
+          }
           try {
             void restoreAnnotations();
             sendResponse({ ok: true, capture: createCapture() });

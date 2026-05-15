@@ -163,3 +163,13 @@ export const SaveIcon = (
     <path d="M8 21v-6h8v6" />
   </svg>
 );
+
+export const TrashIcon = (
+  <svg {...baseProps}>
+    <path d="M4 7h16" />
+    <path d="M10 11v6" />
+    <path d="M14 11v6" />
+    <path d="M6 7l1 14h10l1-14" />
+    <path d="M9 7V4h6v3" />
+  </svg>
+);

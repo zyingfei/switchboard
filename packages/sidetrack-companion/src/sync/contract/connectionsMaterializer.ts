@@ -902,6 +902,14 @@ export const createConnectionsMaterializer = (
       await topicRevisionStore.putActiveRevision(topicRevision);
       mark('putActiveTopicRevision');
     }
+    // FLIP (shadow->active): when the idf-rkn-split shadow clustering is
+    // enabled it is the intended production clustering. The baseline
+    // union-find revision starves on raw e5 cosine (~0 topics on real
+    // embeddings). `topicRevision` stays the BASELINE so the diagnostics
+    // artifact and shadow-vs-baseline observation remain meaningful;
+    // `servedTopicRevision` is what we persist active + feed into the
+    // served snapshot. When shadow is disabled this is a no-op.
+    let servedTopicRevision = topicRevision;
     let topicShadowDiagnostics: TopicShadowDiagnostics | null = null;
     let topicShadowObservation: TopicShadowObservationDiagnostics | null = null;
     if (shouldBuildTopicShadowCandidate()) {
@@ -925,6 +933,12 @@ export const createConnectionsMaterializer = (
       mark(
         `topicShadowCandidate ${shadow.diagnostics.candidate} topics=${String(shadow.diagnostics.shadowTopicCount)} max=${String(shadow.diagnostics.shadowMaxTopicSize)} edges=${String(shadow.diagnostics.edgeCountAfterPruning)}`,
       );
+      // Promote the shadow clustering to the active/served revision so
+      // GET /v1/connections (no topicVariant) and the materialized
+      // snapshot serve it, and current.json mirrors current.shadow.json.
+      servedTopicRevision = shadow.revision;
+      await topicRevisionStore.putActiveRevision(shadow.revision);
+      mark('topicShadowCandidate->active (flip)');
     }
     await yieldToEventLoop();
     const input: ConnectionsInput = {
@@ -934,7 +948,7 @@ export const createConnectionsMaterializer = (
       tabSessionProjection,
       urlProjection,
       visitSimilarity,
-      topicRevision,
+      topicRevision: servedTopicRevision,
       engagementClassRevision,
     };
     mark('projectionAccumulators.derive');

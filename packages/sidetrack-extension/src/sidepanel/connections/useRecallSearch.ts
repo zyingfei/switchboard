@@ -14,7 +14,10 @@ import { messageTypes } from '../../messages';
 
 export interface RecallHit {
   readonly id: string;
-  readonly threadId: string;
+  readonly sourceKind?: 'page-content' | 'chat-turn';
+  readonly anchorNodeId?: string;
+  readonly threadId?: string;
+  readonly canonicalUrl?: string;
   readonly capturedAt: string;
   readonly score: number;
   readonly title?: string;
@@ -36,7 +39,7 @@ const isHit = (value: unknown): value is RecallHit => {
   const v = value as Partial<RecallHit>;
   return (
     typeof v.id === 'string' &&
-    typeof v.threadId === 'string' &&
+    (typeof v.threadId === 'string' || typeof v.anchorNodeId === 'string') &&
     typeof v.capturedAt === 'string' &&
     typeof v.score === 'number'
   );
@@ -44,7 +47,11 @@ const isHit = (value: unknown): value is RecallHit => {
 
 export const useRecallSearch = (
   query: string,
-  options: { readonly debounceMs?: number; readonly minQueryLength?: number; readonly limit?: number } = {},
+  options: {
+    readonly debounceMs?: number;
+    readonly minQueryLength?: number;
+    readonly limit?: number;
+  } = {},
 ): RecallSearchState => {
   const debounceMs = options.debounceMs ?? 300;
   const minLength = options.minQueryLength ?? 3;
@@ -78,7 +85,12 @@ export const useRecallSearch = (
     const timer = setTimeout(() => {
       const sendQuery = (): void => {
         chrome.runtime.sendMessage(
-          { type: messageTypes.recallQuery, q: trimmed, limit },
+          {
+            type: messageTypes.contentQuery,
+            q: trimmed,
+            limit,
+            sourceKind: ['page-content', 'chat-turn'],
+          },
           (response: unknown) => {
             // Ignore stale responses: user may have typed something new.
             if (latestRef.current !== trimmed) return;
@@ -92,11 +104,7 @@ export const useRecallSearch = (
               });
               return;
             }
-            if (
-              typeof response !== 'object' ||
-              response === null ||
-              !('items' in response)
-            ) {
+            if (typeof response !== 'object' || response === null || !('items' in response)) {
               setState({
                 query: trimmed,
                 items: EMPTY_ITEMS,

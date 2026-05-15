@@ -1,6 +1,14 @@
 import { useState, type ReactElement } from 'react';
 
-import { CheckIcon, ClockIcon, EditIcon, KindIcons, RejectIcon, SaveIcon } from './icons';
+import {
+  CheckIcon,
+  ClockIcon,
+  EditIcon,
+  KindIcons,
+  RejectIcon,
+  SaveIcon,
+  TrashIcon,
+} from './icons';
 
 export const ENGAGEMENT_CLASSES = [
   'parked_background',
@@ -48,6 +56,8 @@ export interface TopicVisit {
   readonly affiliation?: TopicVisitAffiliation;
   readonly secondaryScore?: number;
   readonly secondaryReasons?: readonly string[];
+  readonly pageContentState?: string;
+  readonly pageContentQuality?: string;
 }
 
 export interface FocusWorkstreamOption {
@@ -75,6 +85,10 @@ export interface FocusViewProps {
     readonly previousName: string;
     readonly newName: string;
   }) => Promise<void> | void;
+  readonly onTopicDismiss?: (input: {
+    readonly topicId: string;
+    readonly memberVisitIds: readonly string[];
+  }) => Promise<void> | void;
   readonly onVisitMarkNotRelated?: (input: {
     readonly topicId: string;
     readonly visitId: string;
@@ -92,6 +106,7 @@ export interface FocusViewProps {
   readonly onVisitClick: (visitId: string) => void;
   readonly onVisitOpen?: (url: string) => void;
   readonly allowTriageTopicCards?: boolean;
+  readonly resolving?: boolean;
 }
 
 const COLLAPSE_TOPIC_MIN_MEMBERS = 50;
@@ -147,6 +162,19 @@ const secondaryVisitTitle = (visit: TopicVisit): string => {
     details.push(visit.secondaryReasons.join(', '));
   }
   return details.length === 0 ? 'Also related to this suggestion' : details.join(' · ');
+};
+
+const pageContentBadge = (visit: TopicVisit): string => {
+  if (visit.pageContentState === 'indexed') {
+    return visit.pageContentQuality === undefined
+      ? 'Indexed'
+      : `Indexed · ${visit.pageContentQuality}`;
+  }
+  if (visit.pageContentState === 'indexed_low_quality') return 'Text low quality';
+  if (visit.pageContentState === 'stale_index') return 'Text stale';
+  if (visit.pageContentState === 'tombstoned') return 'Text deleted';
+  if (visit.pageContentState === 'metadata_only_error') return 'Metadata only';
+  return 'Metadata only';
 };
 
 const focusedDurationLabel = (focusedWindowMs: number): string => {
@@ -217,12 +245,14 @@ export const FocusView = ({
   onTopicAnchor,
   onTopicPromote,
   onTopicRename,
+  onTopicDismiss,
   onVisitMarkNotRelated,
   onVisitRestoreToTopic,
   onEngagementRelabel,
   onVisitClick,
   onVisitOpen,
   allowTriageTopicCards = false,
+  resolving = false,
 }: FocusViewProps): ReactElement => {
   const [expandedTopicIds, setExpandedTopicIds] = useState<ReadonlySet<string>>(
     () => new Set<string>(),
@@ -237,6 +267,12 @@ export const FocusView = ({
   const [renamingTopicId, setRenamingTopicId] = useState<string | null>(null);
   const [renameError, setRenameError] = useState<string | null>(null);
   const [renameErrorTopicId, setRenameErrorTopicId] = useState<string | null>(null);
+  const [dismissedTopicIds, setDismissedTopicIds] = useState<ReadonlySet<string>>(
+    () => new Set<string>(),
+  );
+  const [dismissingTopicId, setDismissingTopicId] = useState<string | null>(null);
+  const [dismissError, setDismissError] = useState<string | null>(null);
+  const [dismissErrorTopicId, setDismissErrorTopicId] = useState<string | null>(null);
   const [rejectedVisitIdsByTopic, setRejectedVisitIdsByTopic] = useState<
     Record<string, ReadonlySet<string>>
   >({});
@@ -264,6 +300,9 @@ export const FocusView = ({
 
   const renameDraftFor = (topic: TopicNode): string =>
     renameDraftsByTopic[topic.id] ?? displayLabelFor(topic);
+
+  const memberVisitIdsForTopic = (topic: TopicNode): readonly string[] =>
+    (visitsByTopic[topic.id] ?? []).map((visit) => visit.id);
 
   const toggle = (topicId: string): void => {
     setExpandedTopicIds((current) => {
@@ -329,6 +368,32 @@ export const FocusView = ({
       });
   };
 
+  const submitTopicDismiss = (topic: TopicNode): void => {
+    if (onTopicDismiss === undefined) return;
+    const memberVisitIds = memberVisitIdsForTopic(topic);
+    setDismissingTopicId(topic.id);
+    setDismissError(null);
+    setDismissErrorTopicId(null);
+    setDismissedTopicIds((current) => {
+      const next = new Set(current);
+      next.add(topic.id);
+      return next;
+    });
+    void Promise.resolve(onTopicDismiss({ topicId: topic.id, memberVisitIds }))
+      .catch((error: unknown) => {
+        setDismissedTopicIds((current) => {
+          const next = new Set(current);
+          next.delete(topic.id);
+          return next;
+        });
+        setDismissError(error instanceof Error ? error.message : String(error));
+        setDismissErrorTopicId(topic.id);
+      })
+      .finally(() => {
+        setDismissingTopicId(null);
+      });
+  };
+
   const submitVisitNotRelated = (
     topic: TopicNode,
     visit: TopicVisit,
@@ -389,49 +454,97 @@ export const FocusView = ({
       });
   };
 
-  const collapsedTopic =
+  const collapsedTopicCandidate =
     !allowTriageTopicCards &&
     isCollapsedSuggestionSet(topics, eligibleVisitCount, previousTopicCount)
       ? largestTopic(topics)
       : undefined;
-  if (collapsedTopic !== undefined) {
-    return (
-      <section className="cx-focus cx-focus-triage-mode" data-testid="focus-view">
-        <article className="cx-focus-triage" data-testid="focus-collapse-guard">
-          <div className="cx-focus-triage-head">
-            <span className="cx-focus-chip cx-focus-chip-warning">Needs triage</span>
-            <span className="cx-mono cx-dim">computed suggestion</span>
-          </div>
-          <div className="cx-focus-triage-title">{collapsedTopic.label}</div>
-          <p>
-            One computed group spans {String(collapsedTopic.memberCount)} pages, so it is not shown
-            as a focus suggestion.
-          </p>
+  const collapsedTopic =
+    collapsedTopicCandidate !== undefined && !dismissedTopicIds.has(collapsedTopicCandidate.id)
+      ? collapsedTopicCandidate
+      : undefined;
+  const renderedTopics = topics.filter(
+    (topic) => !dismissedTopicIds.has(topic.id) && topic.id !== collapsedTopic?.id,
+  );
+
+  const renderCollapsedTopicGuard = (topic: TopicNode): ReactElement => (
+    <article className="cx-focus-triage" data-testid="focus-collapse-guard">
+      <div className="cx-focus-triage-head">
+        <span className="cx-focus-chip cx-focus-chip-warning">Needs triage</span>
+        <span className="cx-mono cx-dim">computed suggestion</span>
+      </div>
+      <div className="cx-focus-triage-title">Large computed group</div>
+      <p>
+        {displayLabelFor(topic)} spans {String(topic.memberCount)} pages, so it is not shown as a
+        focus suggestion.
+      </p>
+      <div className="cx-focus-triage-actions">
+        <button
+          type="button"
+          className="cx-focus-expand"
+          onClick={() => {
+            onTopicClick(topic.id);
+          }}
+          data-testid={`focus-triage-inspect-${topic.id}`}
+        >
+          Inspect graph
+        </button>
+        {onTopicDismiss === undefined ? null : (
           <button
             type="button"
-            className="cx-focus-expand"
+            className="cx-focus-expand cx-focus-inline-action"
+            disabled={dismissingTopicId === topic.id}
             onClick={() => {
-              onTopicClick(collapsedTopic.id);
+              submitTopicDismiss(topic);
             }}
-            data-testid={`focus-triage-inspect-${collapsedTopic.id}`}
+            data-testid={`focus-triage-dismiss-${topic.id}`}
+            title="Delete this computed suggestion"
           >
-            Inspect graph
+            {iconSlot(TrashIcon)}
+            {dismissingTopicId === topic.id ? 'Deleting' : 'Delete suggestion'}
           </button>
-        </article>
+        )}
+      </div>
+      {dismissError !== null && dismissErrorTopicId === topic.id ? (
+        <div className="cx-mono cx-dim" role="alert" data-testid="focus-dismiss-error">
+          {dismissError}
+        </div>
+      ) : null}
+    </article>
+  );
+
+  if (collapsedTopic !== undefined && renderedTopics.length === 0) {
+    return (
+      <section className="cx-focus cx-focus-triage-mode" data-testid="focus-view">
+        {renderCollapsedTopicGuard(collapsedTopic)}
       </section>
     );
   }
 
-  if (topics.length === 0) {
+  if (renderedTopics.length === 0) {
     return (
       <section className="cx-focus" data-testid="focus-view">
-        <article className="cx-focus-triage" data-testid="focus-empty">
+        <article
+          className="cx-focus-triage"
+          data-testid={resolving ? 'focus-resolving' : 'focus-empty'}
+        >
           <div className="cx-focus-triage-head">
-            <span className="cx-focus-chip cx-focus-chip-suggestion">No suggestion</span>
-            <span className="cx-mono cx-dim">computed focus</span>
+            <span className="cx-focus-chip cx-focus-chip-suggestion">
+              {resolving ? 'Resolving' : 'No suggestion'}
+            </span>
+            <span className="cx-mono cx-dim">
+              {resolving ? 'candidate topic' : 'computed focus'}
+            </span>
           </div>
-          <div className="cx-focus-triage-title">No scoped focus group</div>
-          <p>{emptyDetail ?? 'This page is not in the current candidate topic output.'}</p>
+          <div className="cx-focus-triage-title">
+            {resolving ? 'Resolving focus group' : 'No scoped focus group'}
+          </div>
+          <p>
+            {emptyDetail ??
+              (resolving
+                ? 'Loading the candidate topic graph for this suggestion.'
+                : 'This page is not in the current candidate topic output.')}
+          </p>
         </article>
       </section>
     );
@@ -439,12 +552,11 @@ export const FocusView = ({
 
   return (
     <section className="cx-focus" data-testid="focus-view">
-      {topics.map((topic) => {
+      {renderedTopics.map((topic) => {
         const visits = [...(visitsByTopic[topic.id] ?? [])].sort(
           (left, right) =>
             sortScoreForVisit(right, engagementClassesByVisit) -
-              sortScoreForVisit(left, engagementClassesByVisit) ||
-            left.id.localeCompare(right.id),
+              sortScoreForVisit(left, engagementClassesByVisit) || left.id.localeCompare(right.id),
         );
         const rejectedVisitIds = rejectedVisitIdsByTopic[topic.id] ?? new Set<string>();
         const visibleVisits = visits.filter((visit) => !rejectedVisitIds.has(visit.id));
@@ -513,6 +625,21 @@ export const FocusView = ({
                     Anchor
                   </button>
                 )}
+                {needsTriage && onTopicDismiss !== undefined ? (
+                  <button
+                    type="button"
+                    className="cx-focus-head-action"
+                    disabled={dismissingTopicId === topic.id}
+                    onClick={() => {
+                      submitTopicDismiss(topic);
+                    }}
+                    data-testid={`focus-dismiss-${topic.id}`}
+                    title="Delete this computed suggestion"
+                    aria-label={`Delete ${displayLabel} suggestion`}
+                  >
+                    {iconSlot(TrashIcon)}
+                  </button>
+                ) : null}
               </div>
             </div>
             <div className="cx-focus-meta">
@@ -584,6 +711,11 @@ export const FocusView = ({
                     {promoteError}
                   </div>
                 ) : null}
+                {dismissError !== null && dismissErrorTopicId === topic.id ? (
+                  <div className="cx-mono cx-dim" role="alert" data-testid="focus-dismiss-error">
+                    {dismissError}
+                  </div>
+                ) : null}
                 <div className="cx-focus-detail-head">
                   <span>Pages</span>
                   <span className="cx-mono cx-dim">{pageCountLabel(visibleVisits.length)}</span>
@@ -644,6 +776,12 @@ export const FocusView = ({
                             }
                           />
                           <span className="cx-focus-visit-title">{visit.label}</span>
+                          <span
+                            className="cx-focus-chip cx-focus-chip-coverage"
+                            title="Page-content coverage"
+                          >
+                            {pageContentBadge(visit)}
+                          </span>
                           {visit.affiliation === 'secondary' ? (
                             <span
                               className="cx-focus-chip cx-focus-chip-secondary"
@@ -760,6 +898,7 @@ export const FocusView = ({
           </article>
         );
       })}
+      {collapsedTopic === undefined ? null : renderCollapsedTopicGuard(collapsedTopic)}
     </section>
   );
 };

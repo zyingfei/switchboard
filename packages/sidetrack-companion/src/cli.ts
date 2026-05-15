@@ -122,7 +122,7 @@ export const renderHelp = (): string =>
     '    Manage the local embedding-model cache. The default cache lives at',
     '    ~/Library/Application Support/Sidetrack/models on macOS,',
     '    ~/.local/share/sidetrack/models on Linux,',
-    "    %LOCALAPPDATA%/Sidetrack/models on Windows. Override with --models-dir or",
+    '    %LOCALAPPDATA%/Sidetrack/models on Windows. Override with --models-dir or',
     '    SIDETRACK_MODELS_DIR. Set SIDETRACK_OFFLINE_MODELS=1 to disable downloads.',
     '',
     'Recall subcommand (index lifecycle):',
@@ -132,6 +132,14 @@ export const renderHelp = (): string =>
     '    The recall index is a rebuildable cache. `reingest` walks the merged',
     '    event log and projects unprocessed capture events into chunk entries',
     '    without touching raw _BAC/log/ data.',
+    '',
+    'GC subcommand (derived data only):',
+    '  sidetrack-companion gc --vault <path> --dry-run [--json]',
+    '  sidetrack-companion gc --vault <path> --apply [--json]',
+    '    Plans or removes rebuildable Sidetrack-owned derived data only:',
+    '    connection revisions, diagnostics, debug dumps, temp files, expired',
+    '    idempotency records, and ranker caches. It never touches _BAC/log,',
+    '    _BAC/events, threads, workstreams, or other canonical user state.',
   ].join('\n');
 
 const writeLine = (stream: Writable, text: string): void => {
@@ -413,7 +421,10 @@ const runModelsSubcommand = async (
     const { embed } = await import('./recall/embedder.js');
     await embed(['warmup']);
     const post = await getModelCacheStatus({ ...opts, modelsDir: cacheDir });
-    writeLine(streams.stdout, post.present ? 'ok — model cached' : 'WARN — embedder ran but cache check still missing');
+    writeLine(
+      streams.stdout,
+      post.present ? 'ok — model cached' : 'WARN — embedder ran but cache check still missing',
+    );
     return post.present ? 0 : 1;
   }
 
@@ -463,9 +474,8 @@ const runRecallSubcommand = async (
 
   // Lazy imports so `models` runs (and all the help/version paths)
   // don't pull in the full eventLog + indexFile + embedder graph.
-  const { readIngestState, readRecallManifest, ingestIncremental } = await import(
-    './recall/ingestor.js'
-  );
+  const { readIngestState, readRecallManifest, ingestIncremental } =
+    await import('./recall/ingestor.js');
   const { readIndex } = await import('./recall/indexFile.js');
   const { createEventLog } = await import('./sync/eventLog.js');
   const { loadOrCreateReplica } = await import('./sync/replicaId.js');
@@ -517,9 +527,7 @@ const runRecallSubcommand = async (
     // race the atomic-rename pattern and the binary index can
     // tear / drift. Take the lock; refuse if another live PID owns
     // it.
-    const { acquireRecallProcessLock, RecallLockHeldError } = await import(
-      './recall/recovery.js'
-    );
+    const { acquireRecallProcessLock, RecallLockHeldError } = await import('./recall/recovery.js');
     let recallLock;
     try {
       recallLock = await acquireRecallProcessLock(vaultPath);
@@ -584,6 +592,60 @@ const runRecallSubcommand = async (
   return 2;
 };
 
+const runGcSubcommand = async (argv: readonly string[], streams: CliStreams): Promise<number> => {
+  if (argv.includes('--help') || argv.includes('help')) {
+    writeLine(
+      streams.stdout,
+      'Usage: sidetrack-companion gc --vault <path> (--dry-run | --apply) [--json]',
+    );
+    return 0;
+  }
+  const vaultPath = findArgValue(argv, '--vault');
+  if (vaultPath === undefined || vaultPath.length === 0) {
+    writeLine(streams.stderr, '--vault <path> is required for gc.');
+    return 2;
+  }
+  const dryRun = argv.includes('--dry-run');
+  const apply = argv.includes('--apply');
+  if (dryRun === apply) {
+    writeLine(streams.stderr, 'gc requires exactly one of --dry-run or --apply.');
+    return 2;
+  }
+  const json = argv.includes('--json');
+  const { applyGcPlan, buildGcPlan } = await import('./gc/plan.js');
+  const plan = await buildGcPlan(vaultPath);
+  if (dryRun) {
+    if (json) {
+      writeLine(streams.stdout, JSON.stringify({ mode: 'dry-run', plan }, null, 2));
+      return 0;
+    }
+    writeLine(
+      streams.stdout,
+      `gc dry-run: ${String(plan.entries.length)} files, ${String(plan.totalBytes)} bytes`,
+    );
+    for (const entry of plan.entries.slice(0, 50)) {
+      writeLine(streams.stdout, `${entry.group}\t${String(entry.bytes)}\t${entry.path}`);
+    }
+    if (plan.entries.length > 50) {
+      writeLine(streams.stdout, `… ${String(plan.entries.length - 50)} more`);
+    }
+    return 0;
+  }
+  const result = await applyGcPlan(plan);
+  if (json) {
+    writeLine(streams.stdout, JSON.stringify({ mode: 'apply', plan, result }, null, 2));
+    return result.errors.length === 0 ? 0 : 1;
+  }
+  writeLine(
+    streams.stdout,
+    `gc apply: removed ${String(result.removed)} files, ${String(result.bytes)} bytes`,
+  );
+  for (const error of result.errors) {
+    writeLine(streams.stderr, error);
+  }
+  return result.errors.length === 0 ? 0 : 1;
+};
+
 // Sync Contract v1 / Class F — companion `ingest --import <archive>`
 // CLI verb. Imports an archive pack of edge-origin events into the
 // companion's event log. Idempotent on edge dot — same archive
@@ -600,10 +662,7 @@ const runIngestSubcommand = async (
 ): Promise<number> => {
   const verb = argv[1];
   if (verb === undefined || verb === 'help' || verb === '--help') {
-    writeLine(
-      streams.stdout,
-      'Sync Contract v1 / Class F archive import.',
-    );
+    writeLine(streams.stdout, 'Sync Contract v1 / Class F archive import.');
     writeLine(streams.stdout, '');
     writeLine(streams.stdout, 'Usage:');
     writeLine(
@@ -669,6 +728,9 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
   }
   if (argv[0] === 'recall') {
     return await runRecallSubcommand(argv, streams);
+  }
+  if (argv[0] === 'gc') {
+    return await runGcSubcommand(argv, streams);
   }
   if (argv[0] === 'ingest') {
     return await runIngestSubcommand(argv, streams);

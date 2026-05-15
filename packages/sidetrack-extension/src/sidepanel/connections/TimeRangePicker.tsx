@@ -38,6 +38,22 @@ const PRESET_MS: Record<TimeRangePreset, number> = {
   '30d': 30 * 24 * 60 * 60 * 1000,
 };
 
+export interface TimeRangeWindow {
+  readonly startMs: number;
+  readonly endMs: number;
+}
+
+export const timeRangeWindowFor = (
+  range: TimeRangeValue,
+  nowMs = Date.now(),
+): TimeRangeWindow | null => {
+  if (range.kind === 'all') return null;
+  if (range.kind === 'preset') {
+    return { startMs: nowMs - PRESET_MS[range.preset], endMs: nowMs };
+  }
+  return { startMs: range.startMs, endMs: range.endMs };
+};
+
 const pad2 = (n: number): string => String(n).padStart(2, '0');
 
 const startOfLocalDay = (ms: number): number => {
@@ -142,7 +158,12 @@ export const TimeRangePicker = ({
 }: TimeRangePickerProps): ReactElement => {
   const [popoverOpen, setPopoverOpen] = useState<boolean>(false);
   const popoverRef = useRef<HTMLDivElement | null>(null);
-  const referenceMs = nowMs ?? Date.now();
+  const liveReferenceMs = nowMs ?? Date.now();
+  const referenceMsRef = useRef<number>(liveReferenceMs);
+  if (!popoverOpen) {
+    referenceMsRef.current = liveReferenceMs;
+  }
+  const referenceMs = nowMs ?? referenceMsRef.current;
 
   // Draft state for the custom popover.
   const draftSeed = useMemo(() => {
@@ -320,8 +341,12 @@ export const TimeRangePicker = ({
         </span>
       ) : null}
       {!isAll && hiddenNodeCount !== undefined && hiddenNodeCount > 0 ? (
-        <span className="cx-timerange-hidden mono" data-testid="connections-timerange-hidden">
-          −{hiddenNodeCount}
+        <span
+          className="cx-timerange-hidden mono"
+          data-testid="connections-timerange-hidden"
+          title={`${String(hiddenNodeCount)} nodes hidden by the selected time window`}
+        >
+          {String(hiddenNodeCount)} hidden
         </span>
       ) : null}
       {popoverOpen ? (
@@ -596,11 +621,10 @@ export const filterByTimeRange = (
   if (range.kind === 'all') {
     return { nodes, edges, hiddenNodeCount: 0, hiddenEdgeCount: 0 };
   }
-  const now = options.nowMs ?? Date.now();
-  const window =
-    range.kind === 'preset'
-      ? { startMs: now - PRESET_MS[range.preset], endMs: now }
-      : { startMs: range.startMs, endMs: range.endMs };
+  const window = timeRangeWindowFor(range, options.nowMs ?? Date.now());
+  if (window === null) {
+    return { nodes, edges, hiddenNodeCount: 0, hiddenEdgeCount: 0 };
+  }
   const kept = new Set<string>();
   if (options.anchorId !== undefined) kept.add(options.anchorId);
   for (const node of nodes) {

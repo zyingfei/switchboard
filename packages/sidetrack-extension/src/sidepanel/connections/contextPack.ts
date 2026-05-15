@@ -24,6 +24,14 @@ export interface ContextPackSnippet {
   readonly hash?: string;
 }
 
+export interface ContextPackIndexedPage {
+  readonly id: string;
+  readonly title: string;
+  readonly url: string;
+  readonly coverageState: string;
+  readonly quality?: string;
+}
+
 export interface ContextPackUserNote {
   readonly id: string;
   readonly text: string;
@@ -35,6 +43,7 @@ export interface ContextPackInput {
   readonly threads: readonly ContextPackThread[];
   readonly dispatches: readonly ContextPackDispatch[];
   readonly snippets: readonly ContextPackSnippet[];
+  readonly indexedPages?: readonly ContextPackIndexedPage[];
   readonly userNotes: readonly ContextPackUserNote[];
 }
 
@@ -117,6 +126,27 @@ export const buildContextPack = (input: ContextPackInput): string => {
             return `- ${snippet.id}: ${body}${
               snippet.hash === undefined ? '' : ` #${snippet.hash}`
             }`;
+          }),
+      ),
+    );
+  }
+
+  const indexedPages = input.indexedPages ?? [];
+  if (indexedPages.length > 0) {
+    sections.push(
+      section(
+        'Indexed Pages',
+        [...indexedPages]
+          .sort(
+            (left, right) =>
+              left.title.localeCompare(right.title) || left.id.localeCompare(right.id),
+          )
+          .map((page) => {
+            const suffix =
+              page.quality === undefined
+                ? ` [${page.coverageState}]`
+                : ` [${page.coverageState}, ${page.quality}]`;
+            return `- ${page.title} (${page.url})${suffix}`;
           }),
       ),
     );

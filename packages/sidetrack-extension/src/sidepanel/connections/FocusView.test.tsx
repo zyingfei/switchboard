@@ -154,10 +154,68 @@ describe('FocusView', () => {
 
     expect(screen.getByTestId('focus-collapse-guard')).toBeDefined();
     expect(screen.getByText('Needs triage')).toBeDefined();
+    expect(screen.getByText('Large computed group')).toBeDefined();
     expect(screen.queryByTestId('focus-topic-topic:giant')).toBeNull();
 
     fireEvent.click(screen.getByTestId('focus-triage-inspect-topic:giant'));
     expect(onTopicClick).toHaveBeenCalledWith('topic:giant');
+  });
+
+  it('renders usable suggestions before the suppressed collapsed group', () => {
+    render(
+      <FocusView
+        topics={[
+          { id: 'topic:giant', label: 'Large source cluster', memberCount: 272, cohesion: 0.62 },
+          { id: 'topic:small', label: 'Focused pocket', memberCount: 3, cohesion: 0.91 },
+        ]}
+        eligibleVisitCount={300}
+        visitsByTopic={{}}
+        engagementClassesByVisit={{}}
+        onTopicClick={() => undefined}
+        onVisitClick={() => undefined}
+      />,
+    );
+
+    expect(screen.getByTestId('focus-topic-topic:small')).toBeDefined();
+    expect(screen.queryByTestId('focus-topic-topic:giant')).toBeNull();
+    const cards = screen.getAllByTestId(/focus-(topic|collapse)/u);
+    expect(cards[0]?.getAttribute('data-testid')).toBe('focus-topic-topic:small');
+    expect(cards[1]?.getAttribute('data-testid')).toBe('focus-collapse-guard');
+  });
+
+  it('persists dismissal for a collapsed computed group', async () => {
+    const onTopicDismiss = vi.fn(() => Promise.resolve());
+    render(
+      <FocusView
+        topics={[
+          { id: 'topic:giant', label: 'Large source cluster', memberCount: 272, cohesion: 0.62 },
+        ]}
+        visitsByTopic={{
+          'topic:giant': [
+            { id: 'timeline-visit:https://example.test/a', label: 'A', focusedWindowMs: 10_000 },
+            { id: 'timeline-visit:https://example.test/b', label: 'B', focusedWindowMs: 5_000 },
+          ],
+        }}
+        engagementClassesByVisit={{}}
+        onTopicDismiss={onTopicDismiss}
+        onTopicClick={() => undefined}
+        onVisitClick={() => undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('focus-triage-dismiss-topic:giant'));
+
+    await waitFor(() => {
+      expect(onTopicDismiss).toHaveBeenCalledWith({
+        topicId: 'topic:giant',
+        memberVisitIds: [
+          'timeline-visit:https://example.test/a',
+          'timeline-visit:https://example.test/b',
+        ],
+      });
+    });
+    expect(screen.queryByTestId('focus-collapse-guard')).toBeNull();
+    expect(screen.getByTestId('focus-empty')).toBeDefined();
   });
 
   it('hides two-topic sudden collapse when previous topic count was high', () => {
@@ -192,6 +250,24 @@ describe('FocusView', () => {
 
     expect(screen.getByTestId('focus-empty')).toBeDefined();
     expect(screen.getByText('No scoped focus group')).toBeDefined();
+  });
+
+  it('renders a resolving state while candidate topic data loads', () => {
+    render(
+      <FocusView
+        topics={[]}
+        visitsByTopic={{}}
+        engagementClassesByVisit={{}}
+        emptyDetail="Loading the candidate topic graph for this suggestion."
+        resolving
+        onTopicClick={() => undefined}
+        onVisitClick={() => undefined}
+      />,
+    );
+
+    expect(screen.getByTestId('focus-resolving')).toBeDefined();
+    expect(screen.getByText('Resolving focus group')).toBeDefined();
+    expect(screen.queryByTestId('focus-empty')).toBeNull();
   });
 
   it('marks oversized suggestions for triage and keeps save-name inside details', () => {

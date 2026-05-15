@@ -78,5 +78,11 @@
     "code": "LINK_IN_TO",
     "otherVisitId": "timeline-visit:https://example.test/a",
     "expected": "That page links to this one"
+  },
+  {
+    "code": "PAGE_CONTENT_COVERAGE",
+    "state": "indexed",
+    "quality": "high",
+    "expected": "Page text coverage: indexed (high)"
   }
 ]

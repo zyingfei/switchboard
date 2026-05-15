@@ -345,6 +345,20 @@ const rankerReasonForEdge = (edge: ConnectionEdge): Reason | null => {
   };
 };
 
+const pageContentMetadata = (
+  metadata: Record<string, unknown>,
+): { readonly state: string; readonly quality?: string } | null => {
+  const raw = metadata['pageContent'];
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  const state = record['state'];
+  if (typeof state !== 'string') return null;
+  return {
+    state,
+    ...(typeof record['quality'] === 'string' ? { quality: record['quality'] } : {}),
+  };
+};
+
 export const contextPackInputFromConnections = (
   result: ConnectionsScopedResult,
   workstreamId: string,
@@ -401,6 +415,28 @@ export const contextPackInputFromConnections = (
         ...(textFromMetadata(node.metadata, ['hash', 'selectionHash']) === undefined
           ? {}
           : { hash: textFromMetadata(node.metadata, ['hash', 'selectionHash']) }),
+      })),
+    indexedPages: nodes
+      .filter((node) => node.kind === 'timeline-visit')
+      .map((node) => ({ node, pageContent: pageContentMetadata(node.metadata) }))
+      .filter(
+        (
+          entry,
+        ): entry is {
+          readonly node: typeof entry.node;
+          readonly pageContent: NonNullable<typeof entry.pageContent>;
+        } =>
+          entry.pageContent !== null &&
+          (entry.pageContent.state === 'indexed' ||
+            entry.pageContent.state === 'indexed_low_quality' ||
+            entry.pageContent.state === 'stale_index'),
+      )
+      .map(({ node, pageContent }) => ({
+        id: node.id,
+        title: node.label,
+        url: textFromMetadata(node.metadata, ['canonicalUrl', 'url']) ?? node.id,
+        coverageState: pageContent.state,
+        ...(pageContent.quality === undefined ? {} : { quality: pageContent.quality }),
       })),
     userNotes: nodes
       .filter((node) => node.kind === 'annotation')

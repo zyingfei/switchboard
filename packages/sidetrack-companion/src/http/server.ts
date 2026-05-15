@@ -22,10 +22,7 @@ import {
   VISUAL_FINGERPRINT_OBSERVED,
   isVisualFingerprintObservedPayload,
 } from '../visual/events.js';
-import {
-  NAVIGATION_COMMITTED,
-  isNavigationCommittedPayload,
-} from '../navigation/events.js';
+import { NAVIGATION_COMMITTED, isNavigationCommittedPayload } from '../navigation/events.js';
 import {
   defaultAllowedTools,
   isAllowed,
@@ -41,6 +38,21 @@ import type { RecallActivityTracker } from '../recall/activity.js';
 import { embed, MODEL_ID, RecallModelMissingError } from '../recall/embedder.js';
 import { CAPTURE_RECORDED } from '../recall/events.js';
 import { getModelCacheStatus } from '../recall/modelCache.js';
+import {
+  PAGE_CONTENT_EXTRACTED,
+  PAGE_CONTENT_TOMBSTONED,
+  type ContentSearchHit,
+  type PageContentExtractedPayload,
+  type PageContentTombstonedPayload,
+} from '../page-content/types.js';
+import {
+  canonicalizePageUrl,
+  queryPageContent,
+  readPageContentCoverage,
+  readPageContentCoverageMap,
+  writePageContentExtracted,
+  writePageContentTombstoned,
+} from '../page-content/store.js';
 import { THREAD_ARCHIVED, THREAD_UNARCHIVED, THREAD_UPSERTED } from '../threads/events.js';
 import { projectThread } from '../threads/projection.js';
 import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../workstreams/events.js';
@@ -87,10 +99,7 @@ import {
   type TabSessionProjection,
 } from '../tabsession/projection.js';
 import { autoApplyTabSessionAttribution } from '../tabsession/autoApply.js';
-import type {
-  AttributionPolicyMode,
-  AttributionPolicyTelemetry,
-} from '../tabsession/policy.js';
+import type { AttributionPolicyMode, AttributionPolicyTelemetry } from '../tabsession/policy.js';
 import { resolveAttribution, resolveUrlAttribution } from '../tabsession/resolver.js';
 import {
   deserializeUrlProjection,
@@ -219,9 +228,7 @@ const syncSummaryDeps = (
                     ...(live.lastOutboundAtMs === undefined
                       ? {}
                       : { lastOutboundAtMs: live.lastOutboundAtMs }),
-                    ...(live.byReplica === undefined
-                      ? {}
-                      : { byReplica: live.byReplica }),
+                    ...(live.byReplica === undefined ? {} : { byReplica: live.byReplica }),
                   }),
             },
             ...materializersBlock,
@@ -257,10 +264,7 @@ import { collectHealth, type CaptureWarningHealth, type HealthReport } from '../
 import { collectWorkGraphHealth } from '../system/workGraphHealth.js';
 import { checkLatestVersion, type UpdateAdvisory } from '../system/versionCheck.js';
 import { COMPANION_VERSION } from '../version.js';
-import {
-  maybeRetrainClosestVisitRanker,
-  runMaybeRetrainInWorker,
-} from '../ranker/retrain.js';
+import { maybeRetrainClosestVisitRanker, runMaybeRetrainInWorker } from '../ranker/retrain.js';
 import {
   listAnnotations,
   softDeleteAnnotation,
@@ -298,6 +302,10 @@ import {
   recallIndexSchema,
   recallGcSchema,
   recallQuerySchema,
+  contentQuerySchema,
+  pageContentCoverageQuerySchema,
+  pageContentExtractedSchema,
+  pageContentTombstonedSchema,
   reviewDraftEventBatchSchema,
   reviewDraftListQuerySchema,
   reviewEventSchema,
@@ -454,9 +462,7 @@ export interface CompanionHttpConfig {
   // a profiler. The getter MUST be synchronous + side-effect-free
   // (it reads a perf_hooks histogram). When omitted the field is
   // simply absent from /v1/status — tests don't need it.
-  readonly getEventLoopSnapshot?: () => import(
-    '../runtime/eventLoopMonitor.js'
-  ).EventLoopSnapshot;
+  readonly getEventLoopSnapshot?: () => import('../runtime/eventLoopMonitor.js').EventLoopSnapshot;
   // Embedder sidecar status — drives /v1/status.recall.vectorState.
   // Like getEventLoopSnapshot it MUST be synchronous + side-effect-
   // free; reads cached state, never blocks on a spawn/warmup. When
@@ -769,6 +775,193 @@ const readWorkstreams = async (vaultRoot: string): Promise<readonly BuildSignals
   }
   return workstreams;
 };
+
+const applyPageContentCoverageToSnapshot = async (
+  vaultRoot: string,
+  snapshot: import('../connections/snapshot.js').ConnectionsSnapshot,
+): Promise<import('../connections/snapshot.js').ConnectionsSnapshot> => {
+  const timelineUrls = snapshot.nodes
+    .filter((node) => node.kind === 'timeline-visit')
+    .map((node) =>
+      typeof node.metadata['canonicalUrl'] === 'string'
+        ? node.metadata['canonicalUrl']
+        : node.id.startsWith('timeline-visit:')
+          ? node.id.slice('timeline-visit:'.length)
+          : '',
+    )
+    .filter((url) => url.length > 0);
+  if (timelineUrls.length === 0) return snapshot;
+  const coverageByUrl = await readPageContentCoverageMap(vaultRoot, timelineUrls);
+  return {
+    ...snapshot,
+    nodes: snapshot.nodes.map((node) => {
+      if (node.kind !== 'timeline-visit') return node;
+      const canonicalUrl =
+        typeof node.metadata['canonicalUrl'] === 'string'
+          ? node.metadata['canonicalUrl']
+          : node.id.startsWith('timeline-visit:')
+            ? node.id.slice('timeline-visit:'.length)
+            : undefined;
+      if (canonicalUrl === undefined) return node;
+      const coverage = coverageByUrl.get(canonicalizePageUrl(canonicalUrl));
+      if (coverage === undefined) return node;
+      return {
+        ...node,
+        metadata: {
+          ...node.metadata,
+          pageContent: {
+            state: coverage.state,
+            ...(coverage.quality === undefined ? {} : { quality: coverage.quality }),
+            ...(coverage.lastIndexedAt === undefined
+              ? {}
+              : { lastIndexedAt: coverage.lastIndexedAt }),
+            ...(coverage.extractionSource === undefined
+              ? {}
+              : { extractionSource: coverage.extractionSource }),
+            ...(coverage.chunkCount === undefined ? {} : { chunkCount: coverage.chunkCount }),
+            ...(coverage.indexedCharCount === undefined
+              ? {}
+              : { indexedCharCount: coverage.indexedCharCount }),
+            ...(coverage.error === undefined ? {} : { error: coverage.error }),
+          },
+        },
+      };
+    }),
+  };
+};
+
+const queryRecallContent = async (
+  vaultRoot: string,
+  query: { readonly q: string; readonly limit: number; readonly workstreamId?: string },
+): Promise<readonly ContentSearchHit[]> => {
+  const indexFilePath = recallIndexPath(vaultRoot);
+  const index = await readIndex(indexFilePath);
+  if (index === null || index.items.length === 0) return [];
+  const indexStat = await stat(indexFilePath).catch(() => undefined);
+  const indexMtime = indexStat?.mtimeMs ?? 0;
+  const cached = lexicalIndexCache.get(indexFilePath);
+  const lexical: HybridLexicalIndex =
+    cached !== undefined &&
+    cached.mtimeMs === indexMtime &&
+    cached.entryCount === index.items.length
+      ? cached.index
+      : buildLexicalIndex(index.items);
+  if (
+    cached === undefined ||
+    cached.mtimeMs !== indexMtime ||
+    cached.entryCount !== index.items.length
+  ) {
+    lexicalIndexCache.set(indexFilePath, {
+      mtimeMs: indexMtime,
+      entryCount: index.items.length,
+      index: lexical,
+    });
+  }
+  const threadIds =
+    query.workstreamId === undefined
+      ? undefined
+      : await readWorkstreamThreadIds(vaultRoot, query.workstreamId);
+  const ranked = rankHybrid(query.q, new Float32Array(384), index.items, new Date(), {
+    limit: query.limit,
+    lexical,
+    ...(threadIds === undefined
+      ? {}
+      : { workstreamMembership: (threadId: string) => threadIds.has(threadId) }),
+  }).filter((item) => item.lexical !== undefined);
+  const meta = new Map<string, { title: string; threadUrl: string }>();
+  const hits = await Promise.all(
+    ranked.map(async (item): Promise<ContentSearchHit> => {
+      let info = meta.get(item.threadId);
+      if (info === undefined) {
+        try {
+          const threadFile = await readFile(
+            join(vaultRoot, '_BAC', 'threads', `${item.threadId}.json`),
+            'utf8',
+          );
+          const parsed = JSON.parse(threadFile) as {
+            readonly title?: unknown;
+            readonly threadUrl?: unknown;
+          };
+          info = {
+            title: typeof parsed.title === 'string' ? parsed.title : '',
+            threadUrl: typeof parsed.threadUrl === 'string' ? parsed.threadUrl : '',
+          };
+        } catch {
+          info = { title: '', threadUrl: '' };
+        }
+        meta.set(item.threadId, info);
+      }
+      return {
+        id: item.id,
+        sourceKind: 'chat-turn',
+        anchorNodeId: `thread:${item.threadId}`,
+        threadId: item.threadId,
+        title: item.metadata?.title ?? info.title,
+        ...(item.snippet === undefined ? {} : { snippet: item.snippet }),
+        score: item.score,
+        capturedAt: item.capturedAt,
+      };
+    }),
+  );
+  return hits.sort((left, right) => right.score - left.score).slice(0, query.limit);
+};
+
+const compactPageContentExtractedPayload = (
+  payload: ReturnType<typeof pageContentExtractedSchema.parse>,
+): PageContentExtractedPayload => ({
+  payloadVersion: payload.payloadVersion,
+  canonicalUrl: payload.canonicalUrl,
+  url: payload.url,
+  ...(payload.title === undefined ? {} : { title: payload.title }),
+  ...(payload.provider === undefined ? {} : { provider: payload.provider }),
+  extractedAt: payload.extractedAt,
+  extractionSource: payload.extractionSource,
+  extractionPolicy: {
+    trigger: payload.extractionPolicy.trigger,
+    ...(payload.extractionPolicy.workstreamId === undefined
+      ? {}
+      : { workstreamId: payload.extractionPolicy.workstreamId }),
+    ...(payload.extractionPolicy.domainPolicyId === undefined
+      ? {}
+      : { domainPolicyId: payload.extractionPolicy.domainPolicyId }),
+  },
+  quality: payload.quality,
+  qualitySignals: {
+    extractedWordCount: payload.qualitySignals.extractedWordCount,
+    contentToDomRatio: payload.qualitySignals.contentToDomRatio,
+    boilerplateFraction: payload.qualitySignals.boilerplateFraction,
+    extractionStrategy: payload.qualitySignals.extractionStrategy,
+    ...(payload.qualitySignals.headingSignatureHash === undefined
+      ? {}
+      : { headingSignatureHash: payload.qualitySignals.headingSignatureHash }),
+  },
+  content: {
+    text: payload.content.text,
+    ...(payload.content.markdown === undefined ? {} : { markdown: payload.content.markdown }),
+    contentHash: payload.content.contentHash,
+    charCount: payload.content.charCount,
+  },
+  ...(payload.redaction === undefined
+    ? {}
+    : {
+        redaction: {
+          applied: payload.redaction.applied,
+          rules: payload.redaction.rules,
+        },
+      }),
+  ...(payload.dimensions === undefined ? {} : { dimensions: payload.dimensions }),
+});
+
+const compactPageContentTombstonedPayload = (
+  payload: ReturnType<typeof pageContentTombstonedSchema.parse>,
+): PageContentTombstonedPayload => ({
+  payloadVersion: payload.payloadVersion,
+  canonicalUrl: payload.canonicalUrl,
+  tombstonedAt: payload.tombstonedAt,
+  reason: payload.reason,
+  ...(payload.contentHash === undefined ? {} : { contentHash: payload.contentHash }),
+  ...(payload.dimensions === undefined ? {} : { dimensions: payload.dimensions }),
+});
 
 const readVaultMarkdown = async (
   vaultRoot: string,
@@ -1427,7 +1620,11 @@ const routes: readonly RouteDefinition[] = [
       // Snapshot state: the connections snapshot store's last
       // committed revision. Read once, no rebuild trigger.
       let snapshotState:
-        | { readonly state: 'missing' | 'ready'; readonly revision?: string; readonly updatedAt?: string }
+        | {
+            readonly state: 'missing' | 'ready';
+            readonly revision?: string;
+            readonly updatedAt?: string;
+          }
         | undefined;
       if (context.connectionsStore !== undefined) {
         try {
@@ -1437,7 +1634,9 @@ const routes: readonly RouteDefinition[] = [
           } else {
             snapshotState = {
               state: 'ready',
-              ...(current.snapshotRevision === undefined ? {} : { revision: current.snapshotRevision }),
+              ...(current.snapshotRevision === undefined
+                ? {}
+                : { revision: current.snapshotRevision }),
               updatedAt: current.updatedAt,
             };
           }
@@ -1462,7 +1661,9 @@ const routes: readonly RouteDefinition[] = [
         recallState = {
           state: context.recallLifecycle.isRebuilding() ? 'rebuilding' : 'ready',
           vectorState: embedderStatus.state,
-          ...(embedderStatus.lastError === undefined ? {} : { vectorError: embedderStatus.lastError }),
+          ...(embedderStatus.lastError === undefined
+            ? {}
+            : { vectorError: embedderStatus.lastError }),
         };
       } else {
         recallState = { state: 'disabled', vectorState: embedderStatus.state };
@@ -1776,77 +1977,82 @@ const routes: readonly RouteDefinition[] = [
       const eventLog = context.eventLog;
       const connectionsStore = context.connectionsStore;
       const idempotencyKey = requireIdempotencyKey(request);
-      return await runIdempotent(context, 'tabSessionResolveAutoApply', idempotencyKey, async () => {
-        const body = objectRecord(await readBody(request)) ?? {};
-        if (body['dryRun'] !== false) {
-          throw new HttpRouteError(
-            400,
-            'VALIDATION_ERROR',
-            'Validation failed.',
-            'Body must set dryRun:false for auto-apply.',
+      return await runIdempotent(
+        context,
+        'tabSessionResolveAutoApply',
+        idempotencyKey,
+        async () => {
+          const body = objectRecord(await readBody(request)) ?? {};
+          if (body['dryRun'] !== false) {
+            throw new HttpRouteError(
+              400,
+              'VALIDATION_ERROR',
+              'Validation failed.',
+              'Body must set dryRun:false for auto-apply.',
+            );
+          }
+          const snapshot = await connectionsStore.readCurrent();
+          if (snapshot === null) {
+            throw new HttpRouteError(
+              409,
+              'CONNECTIONS_SNAPSHOT_MISSING',
+              'Connections snapshot is not ready.',
+            );
+          }
+          // Stage 5.2 R4 — stale-snapshot guard. Auto-apply mutates
+          // attribution state; the caller MUST act on a fresh-enough
+          // snapshot. If a `dependencyKey` is supplied and it doesn't
+          // match the current snapshotRevision, reject with 409. Stale
+          // suggestions are fine; stale mutations are not.
+          const dependencyKey = body['dependencyKey'];
+          if (
+            typeof dependencyKey === 'string' &&
+            snapshot.snapshotRevision !== undefined &&
+            dependencyKey !== snapshot.snapshotRevision
+          ) {
+            throw new HttpRouteError(
+              409,
+              'STALE_SNAPSHOT',
+              'Caller-supplied dependencyKey is stale.',
+              `Expected snapshotRevision=${snapshot.snapshotRevision}; client sent dependencyKey=${dependencyKey}. Re-fetch the resolve dry-run and retry.`,
+            );
+          }
+          const tabSessionId = decodeURIComponent(match.tabSessionId ?? '');
+          // Stage 5.2 R2 — snapshot-first via loadTabSessionProjection;
+          // the event-log fallback covers a snapshot loaded from disk that
+          // was produced before R1 (no embedded projection).
+          const { projection } = await loadTabSessionProjection(context, eventLog);
+          if (!projection.bySessionId.has(tabSessionId)) {
+            throw new HttpRouteError(404, 'TAB_SESSION_NOT_FOUND', 'Tab session was not found.');
+          }
+          const policyMode = optionalAttributionPolicyMode(body['policyMode'], 'policyMode');
+          const policyTelemetry = optionalAttributionPolicyTelemetry(
+            body['policyTelemetry'],
+            'policyTelemetry',
           );
-        }
-        const snapshot = await connectionsStore.readCurrent();
-        if (snapshot === null) {
-          throw new HttpRouteError(
-            409,
-            'CONNECTIONS_SNAPSHOT_MISSING',
-            'Connections snapshot is not ready.',
-          );
-        }
-        // Stage 5.2 R4 — stale-snapshot guard. Auto-apply mutates
-        // attribution state; the caller MUST act on a fresh-enough
-        // snapshot. If a `dependencyKey` is supplied and it doesn't
-        // match the current snapshotRevision, reject with 409. Stale
-        // suggestions are fine; stale mutations are not.
-        const dependencyKey = body['dependencyKey'];
-        if (
-          typeof dependencyKey === 'string' &&
-          snapshot.snapshotRevision !== undefined &&
-          dependencyKey !== snapshot.snapshotRevision
-        ) {
-          throw new HttpRouteError(
-            409,
-            'STALE_SNAPSHOT',
-            'Caller-supplied dependencyKey is stale.',
-            `Expected snapshotRevision=${snapshot.snapshotRevision}; client sent dependencyKey=${dependencyKey}. Re-fetch the resolve dry-run and retry.`,
-          );
-        }
-        const tabSessionId = decodeURIComponent(match.tabSessionId ?? '');
-        // Stage 5.2 R2 — snapshot-first via loadTabSessionProjection;
-        // the event-log fallback covers a snapshot loaded from disk that
-        // was produced before R1 (no embedded projection).
-        const { projection } = await loadTabSessionProjection(context, eventLog);
-        if (!projection.bySessionId.has(tabSessionId)) {
-          throw new HttpRouteError(404, 'TAB_SESSION_NOT_FOUND', 'Tab session was not found.');
-        }
-        const policyMode = optionalAttributionPolicyMode(body['policyMode'], 'policyMode');
-        const policyTelemetry = optionalAttributionPolicyTelemetry(
-          body['policyTelemetry'],
-          'policyTelemetry',
-        );
-        const result = await autoApplyTabSessionAttribution({
-          eventLog,
-          snapshot,
-          tabSessionId,
-          ...(policyMode === undefined ? {} : { policyMode }),
-          ...(policyTelemetry === undefined ? {} : { policyTelemetry }),
-        });
-        // PR #141 invalidated the TTL cache here; Stage 5.2 R2 reads
-        // from the snapshot store so no manual invalidation is needed
-        // (the materializer's next drain publishes the fresh snapshot).
-        return [
-          result.status === 'applied' ? 201 : 200,
-          {
-            data: {
-              status: result.status,
-              resolution: result.resolution,
-              ...(result.accepted === undefined ? {} : { accepted: result.accepted }),
-              projection: serializeTabSessionProjection(result.projection),
+          const result = await autoApplyTabSessionAttribution({
+            eventLog,
+            snapshot,
+            tabSessionId,
+            ...(policyMode === undefined ? {} : { policyMode }),
+            ...(policyTelemetry === undefined ? {} : { policyTelemetry }),
+          });
+          // PR #141 invalidated the TTL cache here; Stage 5.2 R2 reads
+          // from the snapshot store so no manual invalidation is needed
+          // (the materializer's next drain publishes the fresh snapshot).
+          return [
+            result.status === 'applied' ? 201 : 200,
+            {
+              data: {
+                status: result.status,
+                resolution: result.resolution,
+                ...(result.accepted === undefined ? {} : { accepted: result.accepted }),
+                projection: serializeTabSessionProjection(result.projection),
+              },
             },
-          },
-        ];
-      });
+          ];
+        },
+      );
     },
   },
   {
@@ -3632,7 +3838,11 @@ const routes: readonly RouteDefinition[] = [
       const waitBudgetMs = Number.isFinite(rawWait) && rawWait > 0 ? Math.min(rawWait, 5_000) : 0;
       const isVectorUsable = (s: string): boolean => s === 'ready' || s === 'disabled';
       let vectorStateAtQuery = embedderStatus.state;
-      if (!isVectorUsable(vectorStateAtQuery) && waitBudgetMs > 0 && vectorStateAtQuery !== 'failed') {
+      if (
+        !isVectorUsable(vectorStateAtQuery) &&
+        waitBudgetMs > 0 &&
+        vectorStateAtQuery !== 'failed'
+      ) {
         const deadline = Date.now() + waitBudgetMs;
         while (Date.now() < deadline) {
           await new Promise<void>((resolve) => {
@@ -3784,6 +3994,120 @@ const routes: readonly RouteDefinition[] = [
             vectorMode,
             vectorState: vectorStateAtQuery,
             ...(waitBudgetMs > 0 ? { waitedMs: waitBudgetMs } : {}),
+          },
+        },
+      ];
+    },
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/page-content\/extracted$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      const idempotencyKey = requireIdempotencyKey(request);
+      const payload = compactPageContentExtractedPayload(
+        pageContentExtractedSchema.parse(await readBody(request)),
+      );
+      return await runIdempotent(context, 'pageContentExtracted', idempotencyKey, async () => {
+        const coverage = await writePageContentExtracted(vaultRoot, payload);
+        if (context.eventLog !== undefined) {
+          await context.eventLog.appendServerObserved({
+            clientEventId: idempotencyKey,
+            aggregateId: `page-content:${coverage.canonicalUrl}`,
+            type: PAGE_CONTENT_EXTRACTED,
+            payload: { ...payload },
+          });
+        }
+        return [202, { data: { coverage } }];
+      });
+    },
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/page-content\/tombstone$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      const idempotencyKey = requireIdempotencyKey(request);
+      const payload = compactPageContentTombstonedPayload(
+        pageContentTombstonedSchema.parse(await readBody(request)),
+      );
+      return await runIdempotent(context, 'pageContentTombstone', idempotencyKey, async () => {
+        const coverage = await writePageContentTombstoned(vaultRoot, payload);
+        if (context.eventLog !== undefined) {
+          await context.eventLog.appendServerObserved({
+            clientEventId: idempotencyKey,
+            aggregateId: `page-content:${coverage.canonicalUrl}`,
+            type: PAGE_CONTENT_TOMBSTONED,
+            payload: { ...payload },
+          });
+        }
+        return [202, { data: { coverage } }];
+      });
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/page-content\/coverage(?:\?.*)?$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+      const query = pageContentCoverageQuerySchema.parse({
+        canonicalUrl: url.searchParams.get('canonicalUrl') ?? '',
+      });
+      const coverage = await readPageContentCoverage(vaultRoot, query.canonicalUrl);
+      return [200, { data: coverage }];
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/content\/query(?:\?.*)?$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+      const rawQ = url.searchParams.get('q');
+      if (rawQ === null) {
+        throw new HttpRouteError(
+          400,
+          'MISSING_PARAMETER',
+          'q query parameter is required.',
+          'GET /v1/content/query requires a q query parameter.',
+        );
+      }
+      const query = contentQuerySchema.parse({
+        q: rawQ,
+        sourceKind: url.searchParams.get('sourceKind') ?? undefined,
+        limit: url.searchParams.get('limit') ?? undefined,
+        workstreamId: url.searchParams.get('workstreamId') ?? undefined,
+      });
+      const sourceKinds = new Set(query.sourceKind);
+      const pageHits = sourceKinds.has('page-content')
+        ? await queryPageContent(vaultRoot, query.q, { limit: query.limit })
+        : [];
+      const recallHits = sourceKinds.has('chat-turn')
+        ? await queryRecallContent(vaultRoot, {
+            q: query.q,
+            limit: query.limit,
+            ...(query.workstreamId === undefined ? {} : { workstreamId: query.workstreamId }),
+          })
+        : [];
+      const merged = [...pageHits, ...recallHits]
+        .sort(
+          (left, right) =>
+            right.score - left.score || right.capturedAt.localeCompare(left.capturedAt),
+        )
+        .slice(0, query.limit);
+      return [
+        200,
+        {
+          data: merged,
+          meta: {
+            sourceKinds: [...sourceKinds].sort(),
+            pageContentCount: pageHits.length,
+            chatTurnCount: recallHits.length,
           },
         },
       ];
@@ -4173,9 +4497,7 @@ const routes: readonly RouteDefinition[] = [
           aggregateIds.add(event.aggregateId);
         }
       }
-      const projections = [...aggregateIds]
-        .sort()
-        .map((bacId) => projectWorkstream(bacId, events));
+      const projections = [...aggregateIds].sort().map((bacId) => projectWorkstream(bacId, events));
       return [200, { data: projections }];
     },
   },
@@ -4655,8 +4977,7 @@ const routes: readonly RouteDefinition[] = [
         [VISUAL_FINGERPRINT_OBSERVED, isVisualFingerprintObservedPayload],
         [NAVIGATION_COMMITTED, isNavigationCommittedPayload],
       ]);
-      const isAcceptedEdgeEventType = (type: string): boolean =>
-        EDGE_EVENT_VALIDATORS.has(type);
+      const isAcceptedEdgeEventType = (type: string): boolean => EDGE_EVENT_VALIDATORS.has(type);
       const validatePayload = (type: string, payload: unknown): boolean =>
         EDGE_EVENT_VALIDATORS.get(type)?.(payload) ?? false;
       const imported: { replicaId: string; seq: number }[] = [];
@@ -4972,6 +5293,7 @@ const routes: readonly RouteDefinition[] = [
           projectFeedback(await context.eventLog.readMerged()),
         );
       }
+      snap = await applyPageContentCoverageToSnapshot(requireVaultRoot(context), snap);
       // Coarse filters — honoured by simple matchers. workstreamId
       // narrows to nodes either matching the ws id directly or
       // having metadata.workstreamId pointing to it; edges between
@@ -5074,6 +5396,7 @@ const routes: readonly RouteDefinition[] = [
           projectFeedback(await context.eventLog.readMerged()),
         );
       }
+      snap = await applyPageContentCoverageToSnapshot(requireVaultRoot(context), snap);
       const { subgraphForNode } = await import('../connections/snapshot.js');
       const sub = subgraphForNode(snap, nodeId, hops);
       return [200, { data: { scope: 'companion-extended', snapshot: sub } }];
@@ -5162,7 +5485,9 @@ const routes: readonly RouteDefinition[] = [
       await writeFile(latest, json, 'utf8');
       return [
         201,
-        { data: { path: latest, stampedPath: stamped, sizeBytes: Buffer.byteLength(json, 'utf8') } },
+        {
+          data: { path: latest, stampedPath: stamped, sizeBytes: Buffer.byteLength(json, 'utf8') },
+        },
       ];
     },
   },

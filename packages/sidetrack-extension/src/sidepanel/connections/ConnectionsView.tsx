@@ -57,6 +57,14 @@ import { useConnectionsEdge, useConnectionsSnapshot } from './useConnectionsSnap
 import { useConnectionsFullSnapshot } from './useConnectionsFullSnapshot';
 import { useRecallSearch } from './useRecallSearch';
 import {
+  messageTypes,
+  type PageContentBulkOperationResponse,
+  type PageContentOpenTabPreview,
+  type PageContentOpenTabsPreviewResponse,
+  type PageContentOperationResponse,
+} from '../../messages';
+import type { PageContentCoverage } from '../../companion/pageContentClient';
+import {
   formatEntityDisplay,
   formatNodeIdDisplay,
   hostOf,
@@ -135,6 +143,17 @@ const normalizeWorkstreamAnchorId = (id: string): string =>
   id.startsWith('workstream:') ? id : `workstream:${id}`;
 
 const DEFAULT_TOPIC_ENGAGEMENT_GATE_MS = 5_000;
+
+const pageContentCanonicalUrl = (raw: string): string => {
+  try {
+    const parsed = new URL(raw);
+    parsed.hash = '';
+    parsed.search = '';
+    return parsed.toString().replace(/\/$/u, '');
+  } catch {
+    return raw;
+  }
+};
 
 const urlFromAnchorNodeId = (nodeId: string): string | undefined => {
   if (nodeId.startsWith('timeline-visit:')) {
@@ -233,6 +252,41 @@ const metadataStringList = (
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
+const pageContentCoverageFromNode = (node: ConnectionNode | null): PageContentCoverage | null => {
+  if (node === null) return null;
+  const raw = node.metadata['pageContent'];
+  if (!isRecord(raw)) return null;
+  const canonicalUrl = metadataString(node.metadata, ['canonicalUrl', 'url']);
+  const state = raw['state'];
+  if (canonicalUrl === undefined || typeof state !== 'string') return null;
+  return {
+    canonicalUrl,
+    state: state as PageContentCoverage['state'],
+    ...(typeof raw['quality'] === 'string'
+      ? { quality: raw['quality'] as PageContentCoverage['quality'] }
+      : {}),
+    ...(typeof raw['lastIndexedAt'] === 'string' ? { lastIndexedAt: raw['lastIndexedAt'] } : {}),
+    ...(typeof raw['extractionSource'] === 'string'
+      ? { extractionSource: raw['extractionSource'] as PageContentCoverage['extractionSource'] }
+      : {}),
+    ...(typeof raw['chunkCount'] === 'number' ? { chunkCount: raw['chunkCount'] } : {}),
+    ...(typeof raw['indexedCharCount'] === 'number'
+      ? { indexedCharCount: raw['indexedCharCount'] }
+      : {}),
+    ...(typeof raw['error'] === 'string' ? { error: raw['error'] } : {}),
+  };
+};
+
+const pageContentStatusLabel = (coverage: PageContentCoverage | null): string => {
+  if (coverage === null) return 'metadata only';
+  if (coverage.state === 'indexed') return coverage.quality ?? 'indexed';
+  if (coverage.state === 'indexed_low_quality') return 'low quality';
+  if (coverage.state === 'stale_index') return 'stale';
+  if (coverage.state === 'tombstoned') return 'deleted';
+  if (coverage.state === 'metadata_only_error') return 'not indexed';
+  return 'metadata only';
+};
+
 const rankerContributionFromUnknown = (
   value: unknown,
 ): { readonly feature: string; readonly weight: number } | null => {
@@ -299,6 +353,17 @@ const topicVisitFromEdge = (
   const secondaryScore = metadataNumber(metadata, 'score', Number.NaN);
   const visitUrl =
     metadataString(visit.metadata, ['canonicalUrl', 'url', 'latestUrl']) ?? urlFromNodeId(visit);
+  const pageContent = isRecord(visit.metadata['pageContent'])
+    ? visit.metadata['pageContent']
+    : undefined;
+  const pageContentState =
+    pageContent !== undefined && typeof pageContent['state'] === 'string'
+      ? pageContent['state']
+      : undefined;
+  const pageContentQuality =
+    pageContent !== undefined && typeof pageContent['quality'] === 'string'
+      ? pageContent['quality']
+      : undefined;
   return {
     id: visit.id,
     label: formatEntityDisplay(visit, ctx).primary,
@@ -310,6 +375,8 @@ const topicVisitFromEdge = (
     ...(affiliation === 'secondary'
       ? { secondaryReasons: metadataStringList(metadata, 'reasons') ?? [] }
       : {}),
+    ...(pageContentState === undefined ? {} : { pageContentState }),
+    ...(pageContentQuality === undefined ? {} : { pageContentQuality }),
   };
 };
 
@@ -897,6 +964,17 @@ const reasonsForVisit = (
 ): readonly Reason[] => {
   const nodeById = new Map(nodes.map((node) => [node.id, node] as const));
   const reasons: Reason[] = [];
+  const visitNode = nodeById.get(visitId);
+  const pageContent = isRecord(visitNode?.metadata['pageContent'])
+    ? visitNode.metadata['pageContent']
+    : undefined;
+  if (pageContent !== undefined && typeof pageContent['state'] === 'string') {
+    reasons.push({
+      code: 'PAGE_CONTENT_COVERAGE',
+      state: pageContent['state'],
+      ...(typeof pageContent['quality'] === 'string' ? { quality: pageContent['quality'] } : {}),
+    });
+  }
   let similarityReason: {
     readonly code: 'COSINE_ABOVE_THRESHOLD';
     readonly cosine: number;
@@ -1314,6 +1392,136 @@ export const ConnectionsView = ({
     }
     return null;
   }, [anchor, anchorNode]);
+  const [pageContentCoverageOverride, setPageContentCoverageOverride] =
+    useState<PageContentCoverage | null>(null);
+  const [pageContentBusy, setPageContentBusy] = useState<'index' | 'selection' | 'delete' | null>(
+    null,
+  );
+  const [pageContentBulkBusy, setPageContentBulkBusy] = useState<'preview' | 'index' | null>(null);
+  const [pageContentBulkPreview, setPageContentBulkPreview] = useState<
+    readonly PageContentOpenTabPreview[] | null
+  >(null);
+  const [pageContentError, setPageContentError] = useState<string | null>(null);
+  const pageContentCoverageMatchesAnchor =
+    pageContentCoverageOverride !== null &&
+    anchorCanonicalUrl !== null &&
+    pageContentCoverageOverride.canonicalUrl === pageContentCanonicalUrl(anchorCanonicalUrl);
+  const anchorPageContentCoverage = pageContentCoverageMatchesAnchor
+    ? pageContentCoverageOverride
+    : pageContentCoverageFromNode(anchorDisplayNode);
+
+  useEffect(() => {
+    if (anchorCanonicalUrl === null) {
+      setPageContentCoverageOverride(null);
+      setPageContentBulkPreview(null);
+      return;
+    }
+    if (typeof chrome === 'undefined' || chrome.runtime?.sendMessage === undefined) return;
+    let active = true;
+    chrome.runtime.sendMessage(
+      { type: messageTypes.pageContentCoverage, canonicalUrl: anchorCanonicalUrl },
+      (response: unknown) => {
+        if (!active) return;
+        const parsed = response as PageContentOperationResponse;
+        if (parsed.ok && parsed.coverage !== undefined) {
+          setPageContentCoverageOverride(parsed.coverage);
+        }
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, [anchorCanonicalUrl]);
+
+  const runPageContentAction = (
+    type:
+      | typeof messageTypes.pageContentIndexCurrent
+      | typeof messageTypes.pageContentIndexSelection
+      | typeof messageTypes.pageContentDelete,
+  ): void => {
+    if (type === messageTypes.pageContentDelete && anchorCanonicalUrl === null) return;
+    setPageContentBusy(
+      type === messageTypes.pageContentDelete
+        ? 'delete'
+        : type === messageTypes.pageContentIndexSelection
+          ? 'selection'
+          : 'index',
+    );
+    setPageContentError(null);
+    const message =
+      type === messageTypes.pageContentDelete
+        ? { type, canonicalUrl: anchorCanonicalUrl }
+        : { type };
+    chrome.runtime.sendMessage(message, (response: unknown) => {
+      setPageContentBusy(null);
+      const lastError = chrome.runtime.lastError;
+      if (lastError !== undefined) {
+        setPageContentError(lastError.message ?? 'Page-content operation failed.');
+        return;
+      }
+      const parsed = response as PageContentOperationResponse;
+      if (parsed.ok && parsed.coverage !== undefined) {
+        setPageContentCoverageOverride(parsed.coverage);
+        refresh();
+        return;
+      }
+      setPageContentError(parsed.error ?? 'Page-content operation failed.');
+    });
+  };
+
+  const loadPageContentBulkPreview = (): void => {
+    setPageContentBulkBusy('preview');
+    setPageContentError(null);
+    chrome.runtime.sendMessage(
+      { type: messageTypes.pageContentOpenTabsPreview },
+      (response: unknown) => {
+        setPageContentBulkBusy(null);
+        const lastError = chrome.runtime.lastError;
+        if (lastError !== undefined) {
+          setPageContentError(lastError.message ?? 'Open-tab preview failed.');
+          return;
+        }
+        const parsed = response as PageContentOpenTabsPreviewResponse;
+        if (!parsed.ok) {
+          setPageContentError(parsed.error ?? 'Open-tab preview failed.');
+          return;
+        }
+        setPageContentBulkPreview(parsed.tabs);
+      },
+    );
+  };
+
+  const runPageContentBulkIndex = (): void => {
+    setPageContentBulkBusy('index');
+    setPageContentError(null);
+    chrome.runtime.sendMessage(
+      { type: messageTypes.pageContentIndexOpenTabs },
+      (response: unknown) => {
+        setPageContentBulkBusy(null);
+        const lastError = chrome.runtime.lastError;
+        if (lastError !== undefined) {
+          setPageContentError(lastError.message ?? 'Open-tab indexing failed.');
+          return;
+        }
+        const parsed = response as PageContentBulkOperationResponse;
+        if (parsed.coverages.length > 0) {
+          const anchorCoverage =
+            anchorCanonicalUrl === null
+              ? undefined
+              : parsed.coverages.find(
+                  (coverage) =>
+                    coverage.canonicalUrl === pageContentCanonicalUrl(anchorCanonicalUrl),
+                );
+          if (anchorCoverage !== undefined) setPageContentCoverageOverride(anchorCoverage);
+          refresh();
+        }
+        setPageContentBulkPreview(null);
+        if (!parsed.ok && parsed.error !== undefined) {
+          setPageContentError(parsed.error);
+        }
+      },
+    );
+  };
 
   // Stage 5 polish — Connections refactor (Phase C usability).
   // Browser-style Alt+← / Alt+→ keyboard shortcuts for anchor
@@ -1430,6 +1638,24 @@ export const ConnectionsView = ({
     }
   };
 
+  const submitTopicDismiss = async (input: {
+    readonly topicId: string;
+    readonly memberVisitIds: readonly string[];
+  }): Promise<void> => {
+    const response = await postUserOrganizedItem({
+      itemKind: 'topic',
+      itemId: input.topicId,
+      action: 'ignore',
+      details: {
+        reason: 'hidden',
+        memberIds: input.memberVisitIds,
+      },
+    });
+    if (!response.ok) {
+      throw new Error(response.error ?? 'topic dismiss feedback failed');
+    }
+  };
+
   const submitVisitMarkNotRelated = async (input: {
     readonly topicId: string;
     readonly visitId: string;
@@ -1528,6 +1754,14 @@ export const ConnectionsView = ({
     // is internally idempotent and the no-op guard handles repeats.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [subMode]);
+  useEffect(() => {
+    if (anchor.startsWith('topic:')) {
+      shadowFullSnapshot.prime();
+    }
+    // Intentionally not depending on shadowFullSnapshot itself — prime()
+    // is idempotent and the hook guards in-flight/ready states.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [anchor]);
   const whyFeedbackEdge = useMemo(() => {
     if (result === null || whyVisitId === null) return null;
     return findFeedbackEdge(result.snapshot.edges, anchor, whyVisitId);
@@ -1599,16 +1833,19 @@ export const ConnectionsView = ({
     focusData.previousTopicCount,
   );
   const scopedEmptyFocusData = useMemo(() => emptyFocusData(), []);
-  const shadowSnapshotReady =
-    filteredShadowSnapshot.nodes.length > 0 && !shadowFullSnapshot.loading;
-  const renderedFocusData =
-    anchor.startsWith('topic:') && shadowFocusData.topics.length > 0
+  const anchorIsTopic = anchor.startsWith('topic:');
+  const shadowSnapshotReady = shadowFullSnapshot.ready;
+  const topicAnchorShadowResolving =
+    anchorIsTopic && !shadowSnapshotReady && shadowFullSnapshot.error === null;
+  const renderedFocusData = anchorIsTopic
+    ? shadowSnapshotReady && shadowFocusData.topics.length > 0
       ? shadowFocusData
-      : activeFocusCollapsed && shadowFocusData.topics.length > 0
-        ? shadowFocusData
-        : activeFocusCollapsed && shadowSnapshotReady
-          ? scopedEmptyFocusData
-          : focusData;
+      : scopedEmptyFocusData
+    : activeFocusCollapsed && shadowFocusData.topics.length > 0
+      ? shadowFocusData
+      : activeFocusCollapsed && shadowSnapshotReady
+        ? scopedEmptyFocusData
+        : focusData;
   const renderedFocusEligibleVisitCount =
     renderedFocusData === shadowFocusData
       ? shadowEligibleVisitCount
@@ -1617,6 +1854,12 @@ export const ConnectionsView = ({
         : focusEligibleVisitCount;
   const renderedFocusEmptyDetail = useMemo(() => {
     if (renderedFocusData !== scopedEmptyFocusData || result === null) return undefined;
+    if (topicAnchorShadowResolving) {
+      return 'Loading the candidate topic graph for this suggestion.';
+    }
+    if (anchorIsTopic && shadowFullSnapshot.error !== null) {
+      return `Could not load the candidate topic graph: ${shadowFullSnapshot.error}`;
+    }
     return focusEmptyDetailForAnchor(
       anchor,
       [...result.snapshot.nodes, ...filteredShadowSnapshot.nodes],
@@ -1624,21 +1867,23 @@ export const ConnectionsView = ({
     );
   }, [
     anchor,
+    anchorIsTopic,
     filteredShadowSnapshot.edges,
     filteredShadowSnapshot.nodes,
     renderedFocusData,
     result,
     scopedEmptyFocusData,
+    shadowFullSnapshot.error,
+    topicAnchorShadowResolving,
   ]);
-  const whyUsesShadowFocusGraph = subMode === 'focus' && renderedFocusData === shadowFocusData;
-  const whyReasonNodes =
-    whyUsesShadowFocusGraph && filteredShadowSnapshot.nodes.length > 0
-      ? filteredShadowSnapshot.nodes
-      : (result?.snapshot.nodes ?? []);
-  const whyReasonEdges =
-    whyUsesShadowFocusGraph && filteredShadowSnapshot.edges.length > 0
-      ? filteredShadowSnapshot.edges
-      : (result?.snapshot.edges ?? []);
+  const whyUsesShadowFocusGraph =
+    subMode === 'focus' && (renderedFocusData === shadowFocusData || anchorIsTopic);
+  const whyReasonNodes = whyUsesShadowFocusGraph
+    ? filteredShadowSnapshot.nodes
+    : (result?.snapshot.nodes ?? []);
+  const whyReasonEdges = whyUsesShadowFocusGraph
+    ? filteredShadowSnapshot.edges
+    : (result?.snapshot.edges ?? []);
   const whyReasonCtx = whyUsesShadowFocusGraph ? shadowCtx : ctx;
   const whyPanelRevisionEdge =
     whyVisitId === null
@@ -1736,6 +1981,114 @@ export const ConnectionsView = ({
         </button>
         <HopToggle value={hops} onChange={setHops} />
       </div>
+      {anchorCanonicalUrl !== null ? (
+        <div className="cx-page-content-card" data-testid="connections-page-content-card">
+          <div className="cx-page-content-main">
+            <span className="cx-page-content-label">Page text</span>
+            <span className="cx-page-content-state">
+              {pageContentStatusLabel(anchorPageContentCoverage)}
+            </span>
+            {anchorPageContentCoverage?.chunkCount !== undefined ? (
+              <span className="cx-page-content-meta">
+                {String(anchorPageContentCoverage.chunkCount)} chunks
+              </span>
+            ) : null}
+          </div>
+          <div className="cx-page-content-actions">
+            <button
+              type="button"
+              className="cx-mini-btn"
+              onClick={() => runPageContentAction(messageTypes.pageContentIndexCurrent)}
+              disabled={pageContentBusy !== null}
+              title="Index readable text from the active page"
+            >
+              {pageContentBusy === 'index' ? 'Indexing' : 'Index page'}
+            </button>
+            <button
+              type="button"
+              className="cx-mini-btn"
+              onClick={() => runPageContentAction(messageTypes.pageContentIndexSelection)}
+              disabled={pageContentBusy !== null}
+              title="Index the currently selected text on the active page"
+            >
+              {pageContentBusy === 'selection' ? 'Indexing' : 'Index selection'}
+            </button>
+            <button
+              type="button"
+              className="cx-mini-btn"
+              onClick={loadPageContentBulkPreview}
+              disabled={pageContentBusy !== null || pageContentBulkBusy !== null}
+              title="Preview currently open tabs before indexing their page text"
+            >
+              {pageContentBulkBusy === 'preview' ? 'Checking' : 'Index open tabs'}
+            </button>
+            {anchorPageContentCoverage?.state === 'indexed' ||
+            anchorPageContentCoverage?.state === 'indexed_low_quality' ||
+            anchorPageContentCoverage?.state === 'stale_index' ? (
+              <button
+                type="button"
+                className="cx-mini-btn danger"
+                onClick={() => runPageContentAction(messageTypes.pageContentDelete)}
+                disabled={pageContentBusy !== null}
+                title="Delete indexed text for this page"
+              >
+                Delete text
+              </button>
+            ) : null}
+          </div>
+          {pageContentError !== null ? (
+            <div className="cx-page-content-error">{pageContentError}</div>
+          ) : null}
+          {pageContentBulkPreview !== null ? (
+            <div className="cx-page-content-bulk" data-testid="connections-page-content-bulk">
+              <div className="cx-page-content-bulk-head">
+                <span>
+                  {String(pageContentBulkPreview.filter((tab) => tab.eligible).length)} open tabs
+                  eligible
+                </span>
+                <span className="cx-page-content-meta">
+                  {String(pageContentBulkPreview.length)} checked
+                </span>
+              </div>
+              <div className="cx-page-content-bulk-list">
+                {pageContentBulkPreview.slice(0, 6).map((tab) => (
+                  <div
+                    key={`${String(tab.tabId)}:${tab.url}`}
+                    className={`cx-page-content-bulk-row${tab.eligible ? '' : ' muted'}`}
+                    title={tab.url}
+                  >
+                    <span>{tab.title}</span>
+                    <small>{tab.eligible ? 'Eligible' : (tab.reason ?? 'Skipped')}</small>
+                  </div>
+                ))}
+              </div>
+              <div className="cx-page-content-bulk-actions">
+                <button
+                  type="button"
+                  className="cx-mini-btn"
+                  onClick={runPageContentBulkIndex}
+                  disabled={
+                    pageContentBulkBusy !== null ||
+                    pageContentBulkPreview.filter((tab) => tab.eligible).length === 0
+                  }
+                >
+                  {pageContentBulkBusy === 'index' ? 'Indexing tabs' : 'Confirm'}
+                </button>
+                <button
+                  type="button"
+                  className="cx-mini-btn"
+                  onClick={() => {
+                    setPageContentBulkPreview(null);
+                  }}
+                  disabled={pageContentBulkBusy !== null}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
       <div className="cx-modes" role="tablist" aria-label="View mode">
         <button
           type="button"
@@ -1864,7 +2217,10 @@ export const ConnectionsView = ({
               onPrime={fullSnapshot.prime}
               loading={fullSnapshot.loading}
               recallHits={recallResults.items.map((item) => ({
-                threadId: item.threadId,
+                ...(item.sourceKind === undefined ? {} : { sourceKind: item.sourceKind }),
+                ...(item.anchorNodeId === undefined ? {} : { anchorNodeId: item.anchorNodeId }),
+                ...(item.threadId === undefined ? {} : { threadId: item.threadId }),
+                ...(item.canonicalUrl === undefined ? {} : { canonicalUrl: item.canonicalUrl }),
                 ...(item.title === undefined ? {} : { title: item.title }),
                 ...(item.threadUrl === undefined ? {} : { threadUrl: item.threadUrl }),
                 ...(item.snippet === undefined ? {} : { snippet: item.snippet }),
@@ -2063,8 +2419,10 @@ export const ConnectionsView = ({
                 emptyDetail={renderedFocusEmptyDetail}
                 workstreamOptions={workstreamOptions}
                 allowTriageTopicCards={anchor.startsWith('topic:')}
+                resolving={topicAnchorShadowResolving}
                 onTopicPromote={submitTopicPromote}
                 onTopicRename={submitTopicRename}
+                onTopicDismiss={submitTopicDismiss}
                 onVisitMarkNotRelated={submitVisitMarkNotRelated}
                 onVisitRestoreToTopic={submitVisitRestoreToTopic}
                 onEngagementRelabel={submitEngagementRelabel}

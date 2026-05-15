@@ -50,6 +50,17 @@ const buildSnapshot = () => ({
   },
 });
 
+const deferred = <T,>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+} => {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+};
+
 describe('ConnectionsView — engineering scaffold', () => {
   beforeEach(() => {
     setConnectionsClientTransportForTests(null);
@@ -596,6 +607,121 @@ describe('ConnectionsView — engineering scaffold', () => {
       expect(screen.getByText('Same topic (cohesion 0.92)')).toBeDefined();
     });
     expect(screen.queryByText(/Shared terms:/u)).toBeNull();
+  });
+
+  it('resolves a cold topic anchor from shadow without rendering baseline focus', async () => {
+    const activeSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: { nodeId: 'topic:ai_race', hops: 1 },
+        nodes: [
+          {
+            id: 'topic:collapsed',
+            kind: 'topic',
+            label: 'ChatGPT',
+            originReplicaIds: [],
+            metadata: { memberCount: 301, cohesion: 0.72 },
+          },
+          {
+            id: 'timeline-visit:https://example.test/noise',
+            kind: 'timeline-visit',
+            label: 'Collapsed baseline member',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://example.test/noise', focusedWindowMs: 9_000 },
+          },
+        ],
+        edges: [
+          {
+            id: 'edge:collapsed-noise',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://example.test/noise',
+            toNodeId: 'topic:collapsed',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-current' },
+            confidence: 'inferred',
+          },
+        ],
+        updatedAt: '2026-05-14T10:00:00.000Z',
+        nodeCount: 2,
+        edgeCount: 1,
+      },
+    };
+    const shadowSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: {},
+        nodes: [
+          {
+            id: 'timeline-visit:https://example.test/ai-race-a',
+            kind: 'timeline-visit',
+            label: 'The US Is Winning the AI Race',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://example.test/ai-race-a', focusedWindowMs: 8_000 },
+          },
+          {
+            id: 'topic:ai_race',
+            kind: 'topic',
+            label: 'The US Is Winning the AI Race',
+            originReplicaIds: [],
+            metadata: { memberCount: 1, cohesion: 0.92 },
+          },
+        ],
+        edges: [
+          {
+            id: 'edge:shadow-ai-a',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://example.test/ai-race-a',
+            toNodeId: 'topic:ai_race',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-shadow' },
+            confidence: 'inferred',
+          },
+        ],
+        updatedAt: '2026-05-14T10:00:00.000Z',
+        nodeCount: 2,
+        edgeCount: 1,
+      },
+    };
+    const shadowResponse = deferred<{
+      readonly ok: true;
+      readonly data: typeof shadowSnapshot;
+    }>();
+    let shadowRequested = false;
+
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string; filters?: { topicVariant?: string } };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        return { ok: true, data: activeSnapshot };
+      }
+      if (m.type === messageTypes.loadConnectionsSnapshot) {
+        if (m.filters?.topicVariant === 'shadow') {
+          shadowRequested = true;
+          return shadowResponse.promise;
+        }
+        return { ok: true, data: activeSnapshot };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+
+    render(<ConnectionsView initialAnchor="topic:ai_race" />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-mode-focus')).not.toBeNull();
+    });
+    fireEvent.click(screen.getByTestId('connections-mode-focus'));
+
+    await waitFor(() => {
+      expect(shadowRequested).toBe(true);
+      expect(screen.queryByTestId('focus-resolving')).not.toBeNull();
+    });
+    expect(screen.queryByText('ChatGPT')).toBeNull();
+    expect(screen.queryByTestId('focus-empty')).toBeNull();
+
+    shadowResponse.resolve({ ok: true, data: shadowSnapshot });
+    await waitFor(() => {
+      expect(screen.queryByTestId('focus-topic-topic:ai_race')).not.toBeNull();
+    });
+    expect(screen.queryByTestId('focus-resolving')).toBeNull();
+    expect(screen.queryByText('ChatGPT')).toBeNull();
   });
 
   it('does not fall back to the global collapsed topic when scoped shadow has no topic', async () => {
