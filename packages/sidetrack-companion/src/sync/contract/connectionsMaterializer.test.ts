@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { createConnectionsStore } from '../../connections/snapshot.js';
 import type { VisitSimilarityEmbedder } from '../../connections/visitSimilarity.js';
+import { ENGAGEMENT_SESSION_AGGREGATED } from '../../engagement/events.js';
 import { THREAD_UPSERTED } from '../../threads/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
 import { createTimelineStore } from '../../timeline/projection.js';
@@ -49,6 +50,8 @@ const embedFromVectors =
       }
       return vector;
     });
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 describe('connectionsMaterializer (Class B, consumer-only)', () => {
   let vaultRoot: string;
@@ -165,6 +168,165 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     const topicRevision = await createTopicRevisionStore(vaultRoot).readActiveRevision();
     expect(topicRevision?.algorithmVersion).toBe(TOPIC_UNION_FIND_REVISION_KEY);
     expect(m.health().status).toBe('healthy');
+  });
+
+  it('uses accumulated engagement aggregates for the topic gate', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+    const embed = embedFromVectors(
+      new Map<string, Float32Array>([
+        ['visit-alpha', unit([1, 0])],
+        ['visit-bravo', unit([1, 0])],
+      ]),
+    );
+    const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store, embed });
+
+    for (const [seq, key] of [
+      [1, 'alpha'],
+      [2, 'bravo'],
+    ] as const) {
+      await eventLog.importPeerEvent(
+        buildEvent({
+          seq,
+          type: BROWSER_TIMELINE_OBSERVED,
+          payload: {
+            eventId: `timeline-${key}`,
+            observedAt: `2026-05-07T10:0${String(seq)}:00.000Z`,
+            url: `https://example.test/${key}`,
+            canonicalUrl: `https://example.test/${key}`,
+            title: `visit-${key}`,
+            provider: 'generic',
+            transition: 'activated',
+            payloadVersion: 1,
+            dimensions: { engagement: { focusedWindowMs: 1_000 } },
+          },
+        }),
+      );
+      for (const offset of [10, 20] as const) {
+        await eventLog.importPeerEvent(
+          buildEvent({
+            seq: seq + offset,
+            type: ENGAGEMENT_SESSION_AGGREGATED,
+            payload: {
+              payloadVersion: 1,
+              visitId: `visit:https://example.test/${key}`,
+              sessionId: 'session:reused-edge',
+              dimensions: {
+                engagement: {
+                  activeMs: 3_000,
+                  visibleMs: 3_000,
+                  focusedWindowMs: 3_000,
+                  idleMs: 0,
+                  foregroundBursts: 1,
+                  returnCount: 0,
+                  scrollEvents: 0,
+                  maxScrollRatio: 0,
+                  copyCount: 0,
+                  pasteCount: 0,
+                },
+              },
+            },
+          }),
+        );
+      }
+    }
+
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+
+    const snap = await store.readCurrent();
+    expect(snap?.edges.find((edge) => edge.kind === 'visit_resembles_visit')).toBeDefined();
+    const topicRevision = await createTopicRevisionStore(vaultRoot).readActiveRevision();
+    expect(topicRevision?.topics[0]?.memberCanonicalUrls).toEqual([
+      'https://example.test/alpha',
+      'https://example.test/bravo',
+    ]);
+  });
+
+  it('writes the idf-rkn-split shadow topic revision behind the env flag', async () => {
+    const previousFlag = process.env['SIDETRACK_TOPIC_SHADOW_CANDIDATE'];
+    process.env['SIDETRACK_TOPIC_SHADOW_CANDIDATE'] = 'idf-rkn-split';
+    try {
+      const replica = await loadOrCreateReplica(vaultRoot);
+      const eventLog = createEventLog(vaultRoot, replica);
+      const timelineStore = createTimelineStore(vaultRoot);
+      const store = createConnectionsStore(vaultRoot);
+      const embed = embedFromVectors(
+        new Map<string, Float32Array>([
+          ['visit-alpha', unit([1, 0])],
+          ['visit-bravo', unit([1, 0])],
+        ]),
+      );
+      const m = createConnectionsMaterializer({
+        vaultRoot,
+        eventLog,
+        timelineStore,
+        store,
+        embed,
+      });
+
+      await eventLog.importPeerEvent(
+        buildEvent({
+          seq: 1,
+          type: BROWSER_TIMELINE_OBSERVED,
+          payload: {
+            eventId: 'timeline-alpha',
+            observedAt: '2026-05-07T10:00:00.000Z',
+            url: 'https://example.test/alpha',
+            canonicalUrl: 'https://example.test/alpha',
+            title: 'visit-alpha',
+            provider: 'generic',
+            transition: 'activated',
+            payloadVersion: 1,
+            dimensions: { engagement: { focusedWindowMs: 10_000 } },
+          },
+        }),
+      );
+      await eventLog.importPeerEvent(
+        buildEvent({
+          seq: 2,
+          type: BROWSER_TIMELINE_OBSERVED,
+          payload: {
+            eventId: 'timeline-bravo',
+            observedAt: '2026-05-07T10:05:00.000Z',
+            url: 'https://example.test/bravo',
+            canonicalUrl: 'https://example.test/bravo',
+            title: 'visit-bravo',
+            provider: 'generic',
+            transition: 'activated',
+            payloadVersion: 1,
+            dimensions: { engagement: { focusedWindowMs: 10_000 } },
+          },
+        }),
+      );
+
+      await m.catchUp(eventLog);
+      await m.awaitIdle();
+
+      const shadowRaw = await readFile(
+        join(vaultRoot, '_BAC', 'connections', 'topics', 'current.shadow.json'),
+        'utf8',
+      );
+      expect(JSON.parse(shadowRaw)).toMatchObject({
+        algorithmVersion: 'topic-revision:shadow:idf-rkn-split',
+        topics: [
+          expect.objectContaining({ metadata: expect.objectContaining({ memberCount: 2 }) }),
+        ],
+      });
+      const diagnosticsRaw = await readFile(
+        join(vaultRoot, '_BAC', 'connections', 'diagnostics', 'latest.json'),
+        'utf8',
+      );
+      expect(JSON.parse(diagnosticsRaw).shadowVsBaseline).toMatchObject({
+        candidate: 'idf-rkn-split',
+        workstreamHardUnionEdgesRemoved: 0,
+      });
+    } finally {
+      if (previousFlag === undefined) delete process.env['SIDETRACK_TOPIC_SHADOW_CANDIDATE'];
+      else process.env['SIDETRACK_TOPIC_SHADOW_CANDIDATE'] = previousFlag;
+    }
   });
 
   it('can select the HDBSCAN topic revision builder by revision key', async () => {
@@ -427,6 +589,74 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     const health = m.health();
     expect(health.status).toBe('failed');
     expect(health.lastError).toContain('disk wedged');
+  });
+
+  it('does not start a concurrent drain when an event arrives during catchUp', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    let calls = 0;
+    let releaseFirstPut: (() => void) | undefined;
+    let firstPutStartedResolve: (() => void) | undefined;
+    const firstPutStarted = new Promise<void>((resolve) => {
+      firstPutStartedResolve = resolve;
+    });
+    const store = {
+      putCurrent: async (snapshot: import('../../connections/snapshot.js').ConnectionsSnapshot) => {
+        void snapshot;
+        calls += 1;
+        if (calls === 1) {
+          firstPutStartedResolve?.();
+          await new Promise<void>((release) => {
+            releaseFirstPut = release;
+          });
+        }
+      },
+      readCurrent: async () => null,
+      putDay: async () => undefined,
+      readDay: async () => null,
+      listDays: async () => [],
+    };
+    const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store });
+
+    const first = buildEvent({
+      seq: 1,
+      type: THREAD_UPSERTED,
+      payload: {
+        bac_id: 'thread_a',
+        provider: 'chatgpt',
+        threadUrl: 'https://x/a',
+        title: 'A',
+        lastSeenAt: '2026-05-07T10:00:00.000Z',
+        tags: [],
+      },
+    });
+    await eventLog.importPeerEvent(first);
+    const catchUp = m.catchUp(eventLog);
+    await firstPutStarted;
+
+    const second = buildEvent({
+      seq: 2,
+      type: THREAD_UPSERTED,
+      payload: {
+        bac_id: 'thread_b',
+        provider: 'chatgpt',
+        threadUrl: 'https://x/b',
+        title: 'B',
+        lastSeenAt: '2026-05-07T10:01:00.000Z',
+        tags: [],
+      },
+    });
+    await eventLog.importPeerEvent(second);
+    m.onAccepted(second, { origin: 'peer' });
+
+    await delay(1_700);
+    expect(calls).toBe(1);
+    releaseFirstPut?.();
+    await catchUp;
+    await m.awaitIdle();
+    expect(calls).toBeGreaterThanOrEqual(2);
+    expect(m.health().status).toBe('healthy');
   });
 
   // Stage 5.2 W3 — visit-similarity skip-gate. When the same set of

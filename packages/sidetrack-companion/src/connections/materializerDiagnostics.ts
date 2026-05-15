@@ -24,6 +24,8 @@ import type { TopicRevision } from '../producers/topic-revision.js';
 import type { RankerRetrainResult } from '../ranker/retrain.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import type { ConnectionsSnapshot, VisitSimilarityRevision } from './types.js';
+import type { TopicShadowDiagnostics } from './topicShadowCandidate.js';
+import type { TopicShadowObservationDiagnostics } from './topicShadowObservation.js';
 import type { EffectiveVisitSimilarityConfig } from './visitSimilarity.js';
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import type { UrlProjection } from '../urls/projection.js';
@@ -85,9 +87,7 @@ export interface MaterializerRankerCounters {
   readonly error: string | null;
 }
 
-export type MaterializerUserAssertionsByKind = Readonly<
-  Record<UserOrganizedItemKind, number>
->;
+export type MaterializerUserAssertionsByKind = Readonly<Record<UserOrganizedItemKind, number>>;
 
 export interface MaterializerUserAssertionCounters {
   readonly byItemKind: MaterializerUserAssertionsByKind;
@@ -145,6 +145,8 @@ export interface MaterializerDiagnostics {
   readonly engagement: MaterializerEngagementCounters;
   readonly urls: MaterializerUrlCounters;
   readonly snapshot: MaterializerSnapshotCounters;
+  readonly shadowVsBaseline?: TopicShadowDiagnostics;
+  readonly shadowObservation?: TopicShadowObservationDiagnostics;
 }
 
 export interface MaterializerDiagnosticsInput {
@@ -165,6 +167,8 @@ export interface MaterializerDiagnosticsInput {
   readonly events: readonly AcceptedEvent[];
   readonly urlProjection: UrlProjection;
   readonly snapshot: ConnectionsSnapshot;
+  readonly topicShadowDiagnostics?: TopicShadowDiagnostics;
+  readonly topicShadowObservation?: TopicShadowObservationDiagnostics;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -252,9 +256,7 @@ const collectTopicCounters = (revision: TopicRevision): MaterializerTopicCounter
   };
 };
 
-const collectRankerCounters = (
-  result: RankerRetrainResult | null,
-): MaterializerRankerCounters => {
+const collectRankerCounters = (result: RankerRetrainResult | null): MaterializerRankerCounters => {
   if (result === null) {
     return {
       status: 'not-run',
@@ -434,12 +436,16 @@ export const collectMaterializerDiagnostics = (
     engagement: eventCounters.engagement,
     urls: collectUrlCounters(input.urlProjection),
     snapshot: collectSnapshotCounters(input.snapshot),
+    ...(input.topicShadowDiagnostics === undefined
+      ? {}
+      : { shadowVsBaseline: input.topicShadowDiagnostics }),
+    ...(input.topicShadowObservation === undefined
+      ? {}
+      : { shadowObservation: input.topicShadowObservation }),
   };
 };
 
-export const summarizeMaterializerDiagnostics = (
-  diagnostics: MaterializerDiagnostics,
-): string => {
+export const summarizeMaterializerDiagnostics = (diagnostics: MaterializerDiagnostics): string => {
   const parts: string[] = [
     `nodes=${String(diagnostics.snapshot.nodeCount)}`,
     `edges=${String(diagnostics.snapshot.edgeCount)}`,
@@ -458,6 +464,35 @@ export const summarizeMaterializerDiagnostics = (
     `urlsAttributed=${String(diagnostics.urls.attributedCanonicalUrlCount)}/${String(diagnostics.urls.canonicalUrlCount)}`,
     `visitInstancesAttributed=${String(diagnostics.snapshot.attributedVisitInstanceCount)}/${String(diagnostics.snapshot.visitInstanceCount)}`,
   ];
+  if (diagnostics.shadowVsBaseline !== undefined) {
+    parts.push(
+      `shadow=${diagnostics.shadowVsBaseline.candidate}`,
+      `shadowTopics=${String(diagnostics.shadowVsBaseline.shadowTopicCount)}`,
+      `shadowMax=${String(diagnostics.shadowVsBaseline.shadowMaxTopicSize)}`,
+      `shadowNoise=${String(diagnostics.shadowVsBaseline.noiseShare)}`,
+      `shadowRuntimeMs=${String(diagnostics.shadowVsBaseline.runtimeMs)}`,
+    );
+  }
+  if (diagnostics.shadowObservation !== undefined) {
+    parts.push(
+      `shadowAdjChurn=${
+        diagnostics.shadowObservation.adjacentPerVisitChurn === undefined
+          ? 'n/a'
+          : String(diagnostics.shadowObservation.adjacentPerVisitChurn)
+      }`,
+      `shadowBoundaryChanged=${String(
+        diagnostics.shadowObservation.shadowCollapseBoundaryChanged ?? false,
+      )}`,
+      `activeBoundaryChanged=${String(
+        diagnostics.shadowObservation.activeCollapseBoundaryChanged ?? false,
+      )}`,
+      `shadowNoiseDelta=${
+        diagnostics.shadowObservation.noiseShareDeltaFromPrevious === undefined
+          ? 'n/a'
+          : String(diagnostics.shadowObservation.noiseShareDeltaFromPrevious)
+      }`,
+    );
+  }
   return `[materializer-diag] ${parts.join(' ')}`;
 };
 

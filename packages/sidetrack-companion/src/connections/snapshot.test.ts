@@ -370,18 +370,14 @@ describe('connections — snapshot reducer (Given/Then)', () => {
     // Stage 5.0 follow-up — evidence is stored on `edge.metadata.evidence`,
     // NOT `producedBy.evidence`. Assert both halves so a future move
     // back to producedBy doesn't pass silently.
-    expect(
-      (edge?.producedBy as Record<string, unknown> | undefined)?.['evidence'],
-    ).toBeUndefined();
+    expect((edge?.producedBy as Record<string, unknown> | undefined)?.['evidence']).toBeUndefined();
     const evidence = (edge?.metadata as { readonly evidence?: Record<string, unknown> } | undefined)
       ?.evidence;
     expect(evidence).toBeDefined();
     expect(evidence?.['providerMatched']).toBe(true);
     expect(evidence?.['titleJaccard']).toBeGreaterThanOrEqual(0.25);
     expect(evidence?.['recencyDeltaMs']).toBeTypeOf('number');
-    expect(evidence?.['recencyDeltaMs']).toBeLessThanOrEqual(
-      24 * 60 * 60 * 1000,
-    );
+    expect(evidence?.['recencyDeltaMs']).toBeLessThanOrEqual(24 * 60 * 60 * 1000);
   });
 
   it('drops timeline_same_url_as_thread when provider differs, titles do not overlap, and recency is irrelevant', () => {
@@ -416,9 +412,7 @@ describe('connections — snapshot reducer (Given/Then)', () => {
         timelineDays: [day],
       }),
     );
-    expect(
-      snap.edges.find((e) => e.kind === 'timeline_same_url_as_thread'),
-    ).toBeUndefined();
+    expect(snap.edges.find((e) => e.kind === 'timeline_same_url_as_thread')).toBeUndefined();
   });
 
   it('drops timeline_same_url_as_thread when recency exceeds the 24-hour window', () => {
@@ -455,9 +449,7 @@ describe('connections — snapshot reducer (Given/Then)', () => {
         timelineDays: [day],
       }),
     );
-    expect(
-      snap.edges.find((e) => e.kind === 'timeline_same_url_as_thread'),
-    ).toBeUndefined();
+    expect(snap.edges.find((e) => e.kind === 'timeline_same_url_as_thread')).toBeUndefined();
   });
 
   it('annotation URL match yields annotation_targets_thread', () => {
@@ -1448,6 +1440,7 @@ describe('connections — content-derived edges', () => {
           url: 'https://example.test/article',
           canonicalUrl: 'https://example.test/article',
           visitCount: 1,
+          workstreamId: 'ws_tabFallback',
           tabSessionId: 'tses_a',
         },
       ],
@@ -1513,6 +1506,24 @@ describe('connections — content-derived edges', () => {
     );
     expect(visitInstanceEdge?.toNodeId).toBe(nodeIdFor('workstream', 'ws_urlPrimary'));
     expect(visitInstanceEdge?.metadata?.['attributionOrigin']).toBe('canonical-url');
+    const timelineVisit = snap.nodes.find(
+      (node) => node.id === nodeIdFor('timeline-visit', 'https://example.test/article'),
+    );
+    expect(timelineVisit?.metadata['workstreamId']).toBe('ws_urlPrimary');
+    expect(timelineVisit?.metadata['workstreamAttributionOrigin']).toBe('canonical-url');
+    expect(
+      snap.edges.filter(
+        (edge) =>
+          edge.kind === 'visit_in_workstream' &&
+          edge.fromNodeId === nodeIdFor('timeline-visit', 'https://example.test/article'),
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        toNodeId: nodeIdFor('workstream', 'ws_urlPrimary'),
+        confidence: 'asserted',
+        metadata: expect.objectContaining({ attributionOrigin: 'canonical-url' }),
+      }),
+    ]);
     // Tab-session attribution still drives the tab_session_in_workstream
     // edge — it's a separate signal about the whole tab.
     const tabSessionEdge = snap.edges.find(
@@ -1521,6 +1532,62 @@ describe('connections — content-derived edges', () => {
         edge.fromNodeId === nodeIdFor('tab-session', 'tses_a'),
     );
     expect(tabSessionEdge?.toNodeId).toBe(nodeIdFor('workstream', 'ws_tabFallback'));
+  });
+
+  it('explicit null URL attribution suppresses stale timeline workstream stamps', () => {
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: [
+        {
+          id: 'https://example.test/article',
+          firstSeenAt: '2026-05-07T10:00:00.000Z',
+          lastSeenAt: '2026-05-07T10:00:30.000Z',
+          url: 'https://example.test/article',
+          canonicalUrl: 'https://example.test/article',
+          visitCount: 1,
+          workstreamId: 'ws_old',
+          tabSessionId: 'tses_a',
+        },
+      ],
+      updatedAt: '2026-05-07T10:00:30.000Z',
+      entryCount: 1,
+    };
+    const urlProjection = {
+      schemaVersion: 1 as const,
+      byCanonicalUrl: new Map([
+        [
+          'https://example.test/article',
+          {
+            canonicalUrl: 'https://example.test/article',
+            firstSeenAt: '2026-05-07T10:00:00.000Z',
+            lastSeenAt: '2026-05-07T10:00:30.000Z',
+            visitCount: 1,
+            tabSessionIds: ['tses_a'],
+            attributionHistory: [],
+            currentAttribution: {
+              workstreamId: null,
+              source: 'user_asserted' as const,
+              observedAt: '2026-05-07T10:02:00.000Z',
+              clientEventId: 'evt-url-1',
+              replicaId: 'r1',
+              seq: 2,
+            },
+          },
+        ],
+      ]),
+    };
+    const snap = buildConnectionsSnapshot(emptyInput({ timelineDays: [day], urlProjection }));
+    const timelineVisit = snap.nodes.find(
+      (node) => node.id === nodeIdFor('timeline-visit', 'https://example.test/article'),
+    );
+    expect(timelineVisit?.metadata['workstreamId']).toBeUndefined();
+    expect(
+      snap.edges.some(
+        (edge) =>
+          edge.kind === 'visit_in_workstream' &&
+          edge.fromNodeId === nodeIdFor('timeline-visit', 'https://example.test/article'),
+      ),
+    ).toBe(false);
   });
 
   it('tab-session label falls back to host when the projection has a URL but no title', () => {
@@ -1814,6 +1881,17 @@ describe('connections — content-derived edges', () => {
             lastObservedAt: '2026-05-07T12:00:00.000Z',
             cohesion: 0.91,
           },
+          secondaryAffiliations: [
+            {
+              canonicalUrl: 'https://topic.test/e',
+              score: 0.79,
+              reasons: ['edge_support', 'member_similarity'],
+              supportCount: 1,
+              maxCosine: 0.9,
+              lexicalScore: 0.1,
+              reciprocalSupport: 0,
+            },
+          ],
         },
       ],
       lineage: [
@@ -1865,6 +1943,15 @@ describe('connections — content-derived edges', () => {
           title: 'Topic D',
           visitCount: 1,
         },
+        {
+          id: 'https://topic.test/e',
+          firstSeenAt: '2026-05-07T09:40:00.000Z',
+          lastSeenAt: '2026-05-07T10:40:00.000Z',
+          url: 'https://topic.test/e',
+          canonicalUrl: 'https://topic.test/e',
+          title: 'Topic E',
+          visitCount: 1,
+        },
       ],
       updatedAt: '2026-05-07T10:30:00.000Z',
       entryCount: 4,
@@ -1882,7 +1969,17 @@ describe('connections — content-derived edges', () => {
 
     expect(topicNode?.label).toBe('Topic A');
     expect(topicNode?.metadata['cohesion']).toBe(0.91);
-    expect(snap.edges.filter((edge) => edge.kind === 'visit_in_topic')).toHaveLength(4);
+    const topicMembershipEdges = snap.edges.filter((edge) => edge.kind === 'visit_in_topic');
+    expect(topicMembershipEdges).toHaveLength(5);
+    expect(
+      topicMembershipEdges.find(
+        (edge) => edge.fromNodeId === nodeIdFor('timeline-visit', 'https://topic.test/e'),
+      )?.metadata,
+    ).toMatchObject({
+      affiliation: 'secondary',
+      score: 0.79,
+      reasons: ['edge_support', 'member_similarity'],
+    });
     expect(
       snap.edges.find(
         (edge) =>
@@ -1899,6 +1996,145 @@ describe('connections — content-derived edges', () => {
       source: 'topic-clusterer',
       revisionId: 'topic-rev-1',
     });
+  });
+
+  it('Pass 8 respects user actions over computed suggestions', () => {
+    const topicRevision: TopicRevision = {
+      revisionId: 'topic-rev-actions',
+      visitSimilarityRevisionId: 'visit-sim-1',
+      cosineThreshold: 0.85,
+      algorithmVersion: TOPIC_UNION_FIND_REVISION_KEY,
+      topics: [
+        {
+          topicId: 'topic:alpha',
+          memberCanonicalUrls: ['https://topic.test/alpha', 'https://topic.test/noisy'],
+          metadata: {
+            memberCount: 2,
+            representativeTitles: ['Alpha'],
+            firstObservedAt: '2026-05-07T09:00:00.000Z',
+            lastObservedAt: '2026-05-07T12:00:00.000Z',
+            cohesion: 0.9,
+          },
+          secondaryAffiliations: [
+            {
+              canonicalUrl: 'https://topic.test/secondary',
+              score: 0.8,
+              reasons: ['edge_support'],
+              supportCount: 1,
+              maxCosine: 0.91,
+              lexicalScore: 0.12,
+              reciprocalSupport: 0,
+            },
+          ],
+        },
+        {
+          topicId: 'topic:beta',
+          memberCanonicalUrls: ['https://topic.test/beta-a', 'https://topic.test/beta-b'],
+          metadata: {
+            memberCount: 2,
+            representativeTitles: ['Beta'],
+            firstObservedAt: '2026-05-07T09:10:00.000Z',
+            lastObservedAt: '2026-05-07T12:10:00.000Z',
+            cohesion: 0.88,
+          },
+        },
+        {
+          topicId: 'topic:hidden',
+          memberCanonicalUrls: ['https://topic.test/hidden-a', 'https://topic.test/hidden-b'],
+          metadata: {
+            memberCount: 2,
+            representativeTitles: ['Hidden'],
+            firstObservedAt: '2026-05-07T09:20:00.000Z',
+            lastObservedAt: '2026-05-07T12:20:00.000Z',
+            cohesion: 0.87,
+          },
+        },
+      ],
+      lineage: [],
+      producedAt: Date.parse('2026-05-07T12:00:00.000Z'),
+    };
+    const alphaTopicNodeId = nodeIdFor('topic', 'topic:alpha');
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        topicRevision,
+        events: [
+          buildEvent({
+            seq: 1,
+            type: USER_ORGANIZED_ITEM,
+            payload: {
+              payloadVersion: 1,
+              itemKind: 'topic',
+              itemId: nodeIdFor('topic', 'topic:hidden'),
+              action: 'ignore',
+              details: {
+                reason: 'hidden',
+                memberIds: [
+                  nodeIdFor('timeline-visit', 'https://topic.test/hidden-a'),
+                  nodeIdFor('timeline-visit', 'https://topic.test/hidden-b'),
+                ],
+              },
+            },
+          }),
+          buildEvent({
+            seq: 2,
+            type: USER_ORGANIZED_ITEM,
+            payload: {
+              payloadVersion: 1,
+              itemKind: 'visit',
+              itemId: nodeIdFor('timeline-visit', 'https://topic.test/secondary'),
+              action: 'ignore',
+              fromContainer: alphaTopicNodeId,
+              details: { reason: 'not-related', targetTopicId: alphaTopicNodeId },
+            },
+          }),
+          buildEvent({
+            seq: 3,
+            type: USER_ORGANIZED_ITEM,
+            payload: {
+              payloadVersion: 1,
+              itemKind: 'topic',
+              itemId: alphaTopicNodeId,
+              action: 'split',
+              details: {
+                reason: 'split-out',
+                memberIds: [nodeIdFor('timeline-visit', 'https://topic.test/noisy')],
+                splitInto: [nodeIdFor('timeline-visit', 'https://topic.test/noisy')],
+              },
+            },
+          }),
+          buildEvent({
+            seq: 4,
+            type: USER_ORGANIZED_ITEM,
+            payload: {
+              payloadVersion: 1,
+              itemKind: 'topic',
+              itemId: nodeIdFor('topic', 'topic:beta'),
+              action: 'merge',
+              toContainer: alphaTopicNodeId,
+              details: {
+                reason: 'merged',
+                targetTopicId: alphaTopicNodeId,
+                memberIds: [
+                  nodeIdFor('timeline-visit', 'https://topic.test/beta-a'),
+                  nodeIdFor('timeline-visit', 'https://topic.test/beta-b'),
+                ],
+              },
+            },
+          }),
+        ],
+      }),
+    );
+
+    const topicNodes = snap.nodes.filter((node) => node.kind === 'topic');
+    expect(topicNodes.map((node) => node.id)).toEqual([alphaTopicNodeId]);
+    expect(topicNodes[0]?.metadata['memberCount']).toBe(3);
+    const topicMemberships = snap.edges.filter((edge) => edge.kind === 'visit_in_topic');
+    expect(topicMemberships.map((edge) => edge.fromNodeId).sort()).toEqual([
+      nodeIdFor('timeline-visit', 'https://topic.test/alpha'),
+      nodeIdFor('timeline-visit', 'https://topic.test/beta-a'),
+      nodeIdFor('timeline-visit', 'https://topic.test/beta-b'),
+    ]);
+    expect(topicMemberships.every((edge) => edge.toNodeId === alphaTopicNodeId)).toBe(true);
   });
 
   it('Pass 13 emits visit_in_template edges for visits sharing a DOM skeleton hash', () => {
@@ -2500,7 +2736,9 @@ describe('connections — Stage 5.2 R1/R4 snapshot extension', () => {
 
   it('snapshot includes a populated tabSessionProjection field', () => {
     const tabSessionProjection = projectTabSessions([observation]);
-    const snap = buildConnectionsSnapshot(emptyInput({ events: [observation], tabSessionProjection }));
+    const snap = buildConnectionsSnapshot(
+      emptyInput({ events: [observation], tabSessionProjection }),
+    );
     expect(snap.tabSessionProjection?.schemaVersion).toBe(TAB_SESSION_PROJECTION_SCHEMA_VERSION);
     expect(Object.keys(snap.tabSessionProjection?.bySessionId ?? {})).toContain('tses_test');
   });

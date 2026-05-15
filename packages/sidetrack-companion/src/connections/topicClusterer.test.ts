@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 
 import { describe, expect, it } from 'vitest';
 
+import { TOPIC_UNION_FIND_REVISION_KEY } from '../producers/topic-revision.js';
 import {
   buildTopicRevision,
   type UserAssertedVisitRelation,
@@ -40,7 +41,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const isFiniteNumber = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value);
 
-type TopicLineageKind = 'split' | 'merge';
+type TopicLineageKind = 'birth' | 'continue' | 'split' | 'merge' | 'death' | 'resurface';
 
 interface TopicFixture {
   readonly visits: readonly TopicVisit[];
@@ -161,7 +162,14 @@ const parseExpectedLineageKinds = (
     throw new Error(`invalid topic expected lineage kinds in ${filename}`);
   }
   return value.map((kind) => {
-    if (kind !== 'split' && kind !== 'merge') {
+    if (
+      kind !== 'birth' &&
+      kind !== 'continue' &&
+      kind !== 'split' &&
+      kind !== 'merge' &&
+      kind !== 'death' &&
+      kind !== 'resurface'
+    ) {
       throw new Error(`invalid topic expected lineage kind in ${filename}`);
     }
     return kind;
@@ -449,6 +457,106 @@ describe('buildTopicRevision', () => {
     );
   });
 
+  it('stores a medoid-backed stable suggestion id in topic metadata', async () => {
+    const [a, b, c] = urls(['a', 'b', 'c']);
+    const revision = await buildTopicRevision({
+      visits: [
+        visit(a!, { focusedWindowMs: 7_000 }),
+        visit(b!, { focusedWindowMs: 9_000 }),
+        visit(c!, { focusedWindowMs: 6_000 }),
+      ],
+      visitSimilarity: {
+        revisionId: 'sim-medoid',
+        edges: [edge(a!, b!, 0.95), edge(b!, c!, 0.96), edge(a!, c!, 0.86)],
+      },
+      options: { producedAt },
+    });
+
+    expect(revision.topics[0]?.metadata.medoidCanonicalUrl).toBe(b);
+    expect(revision.topics[0]?.metadata.stableSuggestionId).toMatch(/^suggestion:/u);
+  });
+
+  it('emits continue, birth, and death lineage for adjacent revisions', async () => {
+    const [a, b, c, d, e, f] = urls(['a', 'b', 'c', 'd', 'e', 'f']);
+    const previous = await buildTopicRevision({
+      visits: [visit(a!), visit(b!), visit(c!), visit(d!)],
+      visitSimilarity: {
+        revisionId: 'sim-lineage-previous',
+        edges: [edge(a!, b!, 0.91), edge(c!, d!, 0.91)],
+      },
+      options: { producedAt: producedAt - 1_000 },
+    });
+
+    const current = await buildTopicRevision({
+      visits: [visit(a!), visit(b!), visit(e!), visit(f!)],
+      visitSimilarity: {
+        revisionId: 'sim-lineage-current',
+        edges: [edge(a!, b!, 0.91), edge(e!, f!, 0.91)],
+      },
+      previousRevision: previous,
+      options: { producedAt },
+    });
+
+    expect(current.lineage.map((lineage) => lineage.kind).sort()).toEqual([
+      'birth',
+      'continue',
+      'death',
+    ]);
+  });
+
+  it('emits resurface lineage when a stable medoid id reappears under a new member set', async () => {
+    const [a, b] = urls(['a', 'b']);
+    const currentWithoutPrior = await buildTopicRevision({
+      visits: [visit(a!), visit(b!)],
+      visitSimilarity: {
+        revisionId: 'sim-resurface-current-seed',
+        edges: [edge(a!, b!, 0.91)],
+      },
+      options: { producedAt: producedAt - 500 },
+    });
+    const stableSuggestionId = currentWithoutPrior.topics[0]?.metadata.stableSuggestionId;
+    expect(stableSuggestionId).toBeDefined();
+
+    const current = await buildTopicRevision({
+      visits: [visit(a!), visit(b!)],
+      visitSimilarity: {
+        revisionId: 'sim-resurface-current',
+        edges: [edge(a!, b!, 0.91)],
+      },
+      previousRevision: {
+        revisionId: 'topic-rev-old',
+        visitSimilarityRevisionId: 'sim-resurface-old',
+        cosineThreshold: 0.85,
+        algorithmVersion: TOPIC_UNION_FIND_REVISION_KEY,
+        topics: [
+          {
+            topicId: 'topic:old-suggestion',
+            memberCanonicalUrls: ['https://example.test/old-a', 'https://example.test/old-b'],
+            metadata: {
+              memberCount: 2,
+              representativeTitles: ['Old'],
+              medoidCanonicalUrl: 'https://example.test/old-a',
+              stableSuggestionId: stableSuggestionId!,
+              firstObservedAt: '2026-05-08T09:00:00.000Z',
+              lastObservedAt: '2026-05-08T09:30:00.000Z',
+              cohesion: 0.9,
+            },
+          },
+        ],
+        lineage: [],
+        producedAt: producedAt - 1_000,
+      },
+      options: { producedAt },
+    });
+
+    expect(current.lineage).toContainEqual({
+      fromTopicId: 'topic:old-suggestion',
+      toTopicId: current.topics[0]!.topicId,
+      kind: 'resurface',
+      observedAt: '2026-05-08T12:00:00.000Z',
+    });
+  });
+
   it('computes cohesion as mean cosine over in-topic similarity edges', async () => {
     const [a, b, c] = urls(['a', 'b', 'c']);
 
@@ -497,14 +605,9 @@ describe('buildTopicRevision', () => {
     const revision = await buildTopicRevision({
       // Both visits have 1 s focused time, well below the 5 s default
       // gate. The user-asserted relation still unions them.
-      visits: [
-        visit(a, { focusedWindowMs: 1_000 }),
-        visit(b, { focusedWindowMs: 1_000 }),
-      ],
+      visits: [visit(a, { focusedWindowMs: 1_000 }), visit(b, { focusedWindowMs: 1_000 })],
       visitSimilarity: { revisionId: 'sim-empty', edges: [] },
-      userAssertedRelations: [
-        { kind: 'in_workstream' as const, fromVisitKey: a, toVisitKey: b },
-      ],
+      userAssertedRelations: [{ kind: 'in_workstream' as const, fromVisitKey: a, toVisitKey: b }],
       options: { producedAt },
     });
     expect(revision.topics).toHaveLength(1);
@@ -528,9 +631,7 @@ describe('buildTopicRevision', () => {
         revisionId: 'sim-mixed',
         edges: [edge(a, c, 0.95)],
       },
-      userAssertedRelations: [
-        { kind: 'in_workstream' as const, fromVisitKey: a, toVisitKey: b },
-      ],
+      userAssertedRelations: [{ kind: 'in_workstream' as const, fromVisitKey: a, toVisitKey: b }],
       options: { producedAt },
     });
     expect(revision.topics).toHaveLength(1);
@@ -544,10 +645,7 @@ describe('buildTopicRevision', () => {
       const a = 'https://example.test/a';
       const b = 'https://example.test/b';
       const revision = await buildTopicRevision({
-        visits: [
-          visit(a, { focusedWindowMs: 800 }),
-          visit(b, { focusedWindowMs: 800 }),
-        ],
+        visits: [visit(a, { focusedWindowMs: 800 }), visit(b, { focusedWindowMs: 800 })],
         visitSimilarity: {
           revisionId: 'sim-env',
           edges: [edge(a, b, 0.95)],

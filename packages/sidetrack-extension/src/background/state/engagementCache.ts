@@ -26,6 +26,7 @@ export interface EngagementSessionAggregatedPayload {
 
 interface CachedEngagementSession {
   readonly visitId: string;
+  readonly sessionId: string;
   readonly intervalStart: number;
   readonly intervalEnd: number;
   readonly totals: EngagementTotals;
@@ -61,12 +62,11 @@ const toIntervalPayload = (
 });
 
 const toAggregatePayload = (
-  sessionId: string,
   cached: CachedEngagementSession,
 ): EngagementSessionAggregatedPayload => ({
   payloadVersion: 1,
   visitId: cached.visitId,
-  sessionId,
+  sessionId: cached.sessionId,
   dimensions: {
     engagement: cached.totals,
   },
@@ -86,6 +86,9 @@ export const createEngagementCache = (input: {
           : mergeEngagementTotals(existing.totals, message.dimensions.engagement);
       const cached: CachedEngagementSession = {
         visitId: message.visitId,
+        sessionId:
+          existing?.sessionId ??
+          `${input.sessionId}:tab:${String(tabId)}:start:${String(message.intervalStart)}`,
         intervalStart: Math.min(existing?.intervalStart ?? message.intervalStart, message.intervalStart),
         intervalEnd: Math.max(existing?.intervalEnd ?? message.intervalEnd, message.intervalEnd),
         totals,
@@ -97,7 +100,7 @@ export const createEngagementCache = (input: {
       }
       return {
         interval: toIntervalPayload(message),
-        aggregate: toAggregatePayload(input.sessionId, cached),
+        aggregate: toAggregatePayload(cached),
       };
     },
     finalizeTab(tabId, endedAt) {
@@ -113,7 +116,7 @@ export const createEngagementCache = (input: {
       };
       return {
         interval,
-        aggregate: toAggregatePayload(input.sessionId, {
+        aggregate: toAggregatePayload({
           ...existing,
           intervalEnd: endedAt,
         }),
@@ -127,19 +130,19 @@ export const isEngagementIntervalMessage = (
 ): value is EngagementIntervalMessage => {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
-  if (record['type'] !== 'sidetrack.engagement.interval' || record['version'] !== 1) {
+  if (record.type !== 'sidetrack.engagement.interval' || record.version !== 1) {
     return false;
   }
-  if (typeof record['visitId'] !== 'string' || record['visitId'].length === 0) return false;
-  if (typeof record['intervalStart'] !== 'number' || typeof record['intervalEnd'] !== 'number') {
+  if (typeof record.visitId !== 'string' || record.visitId.length === 0) return false;
+  if (typeof record.intervalStart !== 'number' || typeof record.intervalEnd !== 'number') {
     return false;
   }
-  if (typeof record['final'] !== 'boolean') return false;
-  const dimensions = record['dimensions'];
+  if (typeof record.final !== 'boolean') return false;
+  const dimensions = record.dimensions;
   if (typeof dimensions !== 'object' || dimensions === null || Array.isArray(dimensions)) {
     return false;
   }
-  const engagement = (dimensions as Record<string, unknown>)['engagement'];
+  const engagement = (dimensions as Record<string, unknown>).engagement;
   if (typeof engagement !== 'object' || engagement === null || Array.isArray(engagement)) {
     return false;
   }

@@ -113,6 +113,9 @@ import { rebuildFromEventLog } from '../recall/rebuild.js';
 import type { BucketRegistry } from '../routing/registry.js';
 import { redact } from '../safety/redaction.js';
 import { estimateTokens, tokenBudgetWarningThreshold } from '../safety/tokenBudget.js';
+import { applyFeedbackOverlayToSnapshot } from '../connections/feedbackOverlay.js';
+import { overlayTopicRevisionOnSnapshot } from '../connections/topicSnapshotOverlay.js';
+import { createTopicRevisionStore } from '../producers/topic-revision.js';
 import { buildSignals, type BuildSignalsWorkstream } from '../suggestions/buildSignals.js';
 import { scoreSuggestions } from '../suggestions/score.js';
 import type { EventLog } from '../sync/eventLog.js';
@@ -4905,8 +4908,17 @@ const routes: readonly RouteDefinition[] = [
       const edgeKind = url.searchParams.get('edgeKind') ?? undefined;
       const provider = url.searchParams.get('provider') ?? undefined;
       const originReplicaId = url.searchParams.get('originReplicaId') ?? undefined;
+      const topicVariantRaw = url.searchParams.get('topicVariant') ?? undefined;
+      if (topicVariantRaw !== undefined && topicVariantRaw !== 'shadow') {
+        throw new HttpRouteError(
+          400,
+          'INVALID_REQUEST',
+          'topicVariant must be omitted or "shadow".',
+        );
+      }
+      const topicVariant = topicVariantRaw === 'shadow' ? topicVariantRaw : undefined;
 
-      const snap = await context.connectionsStore.readCurrent();
+      let snap = await context.connectionsStore.readCurrent();
       if (snap === null) {
         // Materializer hasn't run yet — return an empty scoped
         // envelope so callers don't have to special-case 404.
@@ -4916,7 +4928,7 @@ const routes: readonly RouteDefinition[] = [
             data: {
               scope: 'companion-extended',
               snapshot: {
-                scope: {},
+                scope: { ...(topicVariant === undefined ? {} : { topicVariant }) },
                 nodes: [],
                 edges: [],
                 updatedAt: '1970-01-01T00:00:00.000Z',
@@ -4926,6 +4938,39 @@ const routes: readonly RouteDefinition[] = [
             },
           },
         ];
+      }
+      if (topicVariant === 'shadow') {
+        const shadowRevision = await createTopicRevisionStore(
+          requireVaultRoot(context),
+        ).readShadowRevision();
+        if (shadowRevision === null) {
+          return [
+            200,
+            {
+              data: {
+                scope: 'companion-extended',
+                snapshot: {
+                  scope: { topicVariant },
+                  nodes: [],
+                  edges: [],
+                  updatedAt: snap.updatedAt,
+                  nodeCount: 0,
+                  edgeCount: 0,
+                  ...(snap.snapshotRevision === undefined
+                    ? {}
+                    : { snapshotRevision: `${snap.snapshotRevision}:shadow-missing` }),
+                },
+              },
+            },
+          ];
+        }
+        snap = overlayTopicRevisionOnSnapshot(snap, shadowRevision);
+      }
+      if (context.eventLog !== undefined) {
+        snap = applyFeedbackOverlayToSnapshot(
+          snap,
+          projectFeedback(await context.eventLog.readMerged()),
+        );
       }
       // Coarse filters — honoured by simple matchers. workstreamId
       // narrows to nodes either matching the ws id directly or
@@ -4972,12 +5017,18 @@ const routes: readonly RouteDefinition[] = [
           data: {
             scope: 'companion-extended',
             snapshot: {
-              scope: { ...(workstreamId === undefined ? {} : { workstreamId }) },
+              scope: {
+                ...(workstreamId === undefined ? {} : { workstreamId }),
+                ...(topicVariant === undefined ? {} : { topicVariant }),
+              },
               nodes,
               edges,
               updatedAt: snap.updatedAt,
               nodeCount: nodes.length,
               edgeCount: edges.length,
+              ...(snap.snapshotRevision === undefined
+                ? {}
+                : { snapshotRevision: snap.snapshotRevision }),
             },
           },
         },
@@ -4998,7 +5049,7 @@ const routes: readonly RouteDefinition[] = [
       const url = new URL(request.url ?? '/v1/connections', 'http://internal');
       const hopsRaw = Number.parseInt(url.searchParams.get('hops') ?? '1', 10);
       const hops = Number.isFinite(hopsRaw) && hopsRaw >= 0 ? Math.min(hopsRaw, 4) : 1;
-      const snap = await context.connectionsStore.readCurrent();
+      let snap = await context.connectionsStore.readCurrent();
       if (snap === null) {
         return [
           200,
@@ -5016,6 +5067,12 @@ const routes: readonly RouteDefinition[] = [
             },
           },
         ];
+      }
+      if (context.eventLog !== undefined) {
+        snap = applyFeedbackOverlayToSnapshot(
+          snap,
+          projectFeedback(await context.eventLog.readMerged()),
+        );
       }
       const { subgraphForNode } = await import('../connections/snapshot.js');
       const sub = subgraphForNode(snap, nodeId, hops);

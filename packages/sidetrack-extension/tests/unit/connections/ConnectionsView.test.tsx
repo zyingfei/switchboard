@@ -84,6 +84,41 @@ describe('ConnectionsView — engineering scaffold', () => {
     expect(screen.getByText(/2×/u)).toBeDefined();
   });
 
+  it('shows a requested URL anchor even before the graph contains that node', async () => {
+    const requestedNodeIds: string[] = [];
+    const anchorId = 'timeline-visit:https://example.test/research';
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string; nodeId?: string };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        requestedNodeIds.push(m.nodeId ?? '');
+        return {
+          ok: true,
+          data: {
+            scope: 'companion-extended',
+            snapshot: {
+              scope: { nodeId: m.nodeId, hops: 1 },
+              nodes: [],
+              edges: [],
+              updatedAt: '2026-05-14T09:00:00.000Z',
+              nodeCount: 0,
+              edgeCount: 0,
+            },
+          },
+        };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+
+    render(<ConnectionsView requestAnchor={anchorId} onOpenInInbox={() => undefined} />);
+
+    await waitFor(() => {
+      expect(requestedNodeIds).toContain(anchorId);
+      expect(screen.queryAllByTestId(`node-${anchorId}`).length).toBeGreaterThan(0);
+    });
+    expect(screen.queryByText('no anchor selected')).toBeNull();
+    expect(screen.getByTitle('Find in Inbox · https://example.test/research')).toBeDefined();
+  });
+
   it('renders edge labels with readable endpoints instead of raw edge kinds only', async () => {
     setConnectionsClientTransportForTests(async (msg) => {
       const m = msg as { type: string };
@@ -128,6 +163,552 @@ describe('ConnectionsView — engineering scaffold', () => {
       expect(requestedNodeIds).toContain('workstream:ws_x');
     });
     expect(selector.value).toBe('workstream:ws_x');
+  });
+
+  it('scopes shadow focus suggestions to the selected workstream', async () => {
+    const collapsedSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: { nodeId: 'workstream:ws_db', hops: 1 },
+        nodes: [
+          {
+            id: 'workstream:ws_db',
+            kind: 'workstream',
+            label: 'DB',
+            originReplicaIds: ['replica-A'],
+            metadata: {},
+          },
+          {
+            id: 'visit-instance:tab-a:2026-05-14T10:00:00.000Z:https://db.example/oracle',
+            kind: 'visit-instance',
+            label: 'Oracle 26ai',
+            originReplicaIds: ['replica-A'],
+            metadata: {
+              canonicalUrl: 'https://db.example/oracle',
+              timelineVisitId: 'timeline-visit:https://db.example/oracle',
+              focusedWindowMs: 8_000,
+              engagement: { class: 'engaged_read' },
+            },
+          },
+          {
+            id: 'topic:collapsed',
+            kind: 'topic',
+            label: 'ChatGPT',
+            originReplicaIds: [],
+            metadata: { memberCount: 294, cohesion: 0.72 },
+          },
+        ],
+        edges: [
+          {
+            id: 'edge:visit-workstream',
+            kind: 'visit_instance_in_workstream',
+            fromNodeId: 'visit-instance:tab-a:2026-05-14T10:00:00.000Z:https://db.example/oracle',
+            toNodeId: 'workstream:ws_db',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'timeline' },
+            confidence: 'observed',
+          },
+        ],
+        updatedAt: '2026-05-14T10:00:00.000Z',
+        nodeCount: 3,
+        edgeCount: 1,
+      },
+    };
+    const shadowSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: {},
+        nodes: [
+          {
+            id: 'workstream:ws_db',
+            kind: 'workstream',
+            label: 'DB',
+            originReplicaIds: ['replica-A'],
+            metadata: {},
+          },
+          {
+            id: 'timeline-visit:https://db.example/oracle',
+            kind: 'timeline-visit',
+            label: 'Oracle 26ai',
+            originReplicaIds: ['replica-A'],
+            metadata: {
+              canonicalUrl: 'https://db.example/oracle',
+              focusedWindowMs: 8_000,
+              engagement: { class: 'engaged_read' },
+            },
+          },
+          {
+            id: 'timeline-visit:https://news.example/story',
+            kind: 'timeline-visit',
+            label: 'Unrelated HN',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://news.example/story', focusedWindowMs: 9_000 },
+          },
+          {
+            id: 'topic:db',
+            kind: 'topic',
+            label: 'Oracle',
+            originReplicaIds: [],
+            metadata: { memberCount: 6, cohesion: 0.91 },
+          },
+          {
+            id: 'topic:hn',
+            kind: 'topic',
+            label: 'Hacker News',
+            originReplicaIds: [],
+            metadata: { memberCount: 8, cohesion: 0.89 },
+          },
+        ],
+        edges: [
+          {
+            id: 'edge:shadow-db',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://db.example/oracle',
+            toNodeId: 'topic:db',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-shadow' },
+            confidence: 'inferred',
+          },
+          {
+            id: 'edge:shadow-hn',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://news.example/story',
+            toNodeId: 'topic:hn',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-shadow' },
+            confidence: 'inferred',
+          },
+        ],
+        updatedAt: '2026-05-14T10:00:00.000Z',
+        nodeCount: 5,
+        edgeCount: 2,
+      },
+    };
+
+    const requestedNodeIds: string[] = [];
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string; nodeId?: string; filters?: { topicVariant?: string } };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        if (m.nodeId !== undefined) requestedNodeIds.push(m.nodeId);
+        return { ok: true, data: collapsedSnapshot };
+      }
+      if (m.type === messageTypes.loadConnectionsSnapshot) {
+        return {
+          ok: true,
+          data: m.filters?.topicVariant === 'shadow' ? shadowSnapshot : collapsedSnapshot,
+        };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+
+    render(<ConnectionsView initialAnchor="workstream:ws_db" />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-mode-focus')).not.toBeNull();
+    });
+    fireEvent.click(screen.getByTestId('connections-mode-focus'));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('focus-topic-topic:db')).not.toBeNull();
+    });
+    expect(screen.queryByTestId('focus-topic-topic:hn')).toBeNull();
+    expect(screen.getByText('1 page shown here, 6 pages total')).toBeDefined();
+    fireEvent.click(screen.getByText('Oracle'));
+    expect(
+      screen.getByTestId('focus-visit-timeline-visit:https://db.example/oracle'),
+    ).toBeDefined();
+    expect(
+      screen.queryByTestId('focus-visit-timeline-visit:https://news.example/story'),
+    ).toBeNull();
+    fireEvent.click(screen.getByTestId('focus-topic-anchor-topic:db'));
+    await waitFor(() => {
+      expect(requestedNodeIds).toContain('topic:db');
+    });
+    expect(screen.queryByText('(topic cluster)')).toBeNull();
+    expect(screen.queryByTestId('focus-empty')).toBeNull();
+    expect(screen.getByTestId('focus-topic-topic:db')).toBeDefined();
+  });
+
+  it('does not broaden thread-anchor shadow focus through a collapsed topic scope', async () => {
+    const collapsedSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: { nodeId: 'thread:db_oracle', hops: 3 },
+        nodes: [
+          {
+            id: 'thread:db_oracle',
+            kind: 'thread',
+            label: 'DB - Oracle 26ai Innovation and Competitors',
+            originReplicaIds: ['replica-A'],
+            metadata: {
+              canonicalUrl: 'https://db.example/oracle',
+              url: 'https://db.example/oracle',
+            },
+          },
+          {
+            id: 'timeline-visit:https://db.example/oracle',
+            kind: 'timeline-visit',
+            label: 'Oracle 26ai',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://db.example/oracle', focusedWindowMs: 8_000 },
+          },
+          {
+            id: 'timeline-visit:https://news.example/story',
+            kind: 'timeline-visit',
+            label: 'Unrelated HN',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://news.example/story', focusedWindowMs: 9_000 },
+          },
+          {
+            id: 'topic:collapsed',
+            kind: 'topic',
+            label: 'ChatGPT',
+            originReplicaIds: [],
+            metadata: { memberCount: 294, cohesion: 0.72 },
+          },
+        ],
+        edges: [
+          {
+            id: 'edge:same-url',
+            kind: 'timeline_same_url_as_thread',
+            fromNodeId: 'timeline-visit:https://db.example/oracle',
+            toNodeId: 'thread:db_oracle',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'snapshot' },
+            confidence: 'observed',
+          },
+          {
+            id: 'edge:collapsed-db',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://db.example/oracle',
+            toNodeId: 'topic:collapsed',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-current' },
+            confidence: 'inferred',
+          },
+          {
+            id: 'edge:collapsed-hn',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://news.example/story',
+            toNodeId: 'topic:collapsed',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-current' },
+            confidence: 'inferred',
+          },
+        ],
+        updatedAt: '2026-05-14T10:00:00.000Z',
+        nodeCount: 4,
+        edgeCount: 3,
+      },
+    };
+    const shadowSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: {},
+        nodes: [
+          {
+            id: 'timeline-visit:https://db.example/oracle',
+            kind: 'timeline-visit',
+            label: 'Oracle 26ai',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://db.example/oracle', focusedWindowMs: 8_000 },
+          },
+          {
+            id: 'timeline-visit:https://news.example/story',
+            kind: 'timeline-visit',
+            label: 'Unrelated HN',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://news.example/story', focusedWindowMs: 9_000 },
+          },
+          {
+            id: 'topic:db',
+            kind: 'topic',
+            label: 'Oracle',
+            originReplicaIds: [],
+            metadata: { memberCount: 6, cohesion: 0.91 },
+          },
+          {
+            id: 'topic:hn',
+            kind: 'topic',
+            label: 'Hacker News',
+            originReplicaIds: [],
+            metadata: { memberCount: 8, cohesion: 0.89 },
+          },
+        ],
+        edges: [
+          {
+            id: 'edge:shadow-db',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://db.example/oracle',
+            toNodeId: 'topic:db',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-shadow' },
+            confidence: 'inferred',
+          },
+          {
+            id: 'edge:shadow-hn',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://news.example/story',
+            toNodeId: 'topic:hn',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-shadow' },
+            confidence: 'inferred',
+          },
+        ],
+        updatedAt: '2026-05-14T10:00:00.000Z',
+        nodeCount: 4,
+        edgeCount: 2,
+      },
+    };
+
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string; filters?: { topicVariant?: string } };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        return { ok: true, data: collapsedSnapshot };
+      }
+      if (m.type === messageTypes.loadConnectionsSnapshot) {
+        return {
+          ok: true,
+          data: m.filters?.topicVariant === 'shadow' ? shadowSnapshot : collapsedSnapshot,
+        };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+
+    render(<ConnectionsView initialAnchor="thread:db_oracle" />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-mode-focus')).not.toBeNull();
+    });
+    fireEvent.click(screen.getByTestId('connections-mode-focus'));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('focus-topic-topic:db')).not.toBeNull();
+    });
+    expect(screen.queryByTestId('focus-topic-topic:hn')).toBeNull();
+    expect(screen.getByText('1 page shown here, 6 pages total')).toBeDefined();
+  });
+
+  it('renders shadow topic members when the topic itself is the anchor', async () => {
+    const activeSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: { nodeId: 'topic:ai_race', hops: 1 },
+        nodes: [],
+        edges: [],
+        updatedAt: '2026-05-14T10:00:00.000Z',
+        nodeCount: 0,
+        edgeCount: 0,
+      },
+    };
+    const shadowSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: {},
+        nodes: [
+          {
+            id: 'timeline-visit:https://example.test/ai-race-a',
+            kind: 'timeline-visit',
+            label: 'The US Is Winning the AI Race',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://example.test/ai-race-a', focusedWindowMs: 8_000 },
+          },
+          {
+            id: 'timeline-visit:https://example.test/ai-race-b',
+            kind: 'timeline-visit',
+            label: 'AI Race Policy Brief',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://example.test/ai-race-b', focusedWindowMs: 6_000 },
+          },
+          {
+            id: 'topic:ai_race',
+            kind: 'topic',
+            label: 'The US Is Winning the AI Race',
+            originReplicaIds: [],
+            metadata: { memberCount: 2, cohesion: 0.92 },
+          },
+        ],
+        edges: [
+          {
+            id: 'edge:shadow-ai-a',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://example.test/ai-race-a',
+            toNodeId: 'topic:ai_race',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-shadow' },
+            confidence: 'inferred',
+          },
+          {
+            id: 'edge:shadow-ai-b',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://example.test/ai-race-b',
+            toNodeId: 'topic:ai_race',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-shadow' },
+            confidence: 'inferred',
+          },
+        ],
+        updatedAt: '2026-05-14T10:00:00.000Z',
+        nodeCount: 3,
+        edgeCount: 2,
+      },
+    };
+
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string; filters?: { topicVariant?: string } };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        return { ok: true, data: activeSnapshot };
+      }
+      if (m.type === messageTypes.loadConnectionsSnapshot) {
+        return {
+          ok: true,
+          data: m.filters?.topicVariant === 'shadow' ? shadowSnapshot : activeSnapshot,
+        };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+
+    render(<ConnectionsView initialAnchor="topic:ai_race" />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-mode-focus')).not.toBeNull();
+    });
+    fireEvent.click(screen.getByTestId('connections-mode-focus'));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('focus-topic-topic:ai_race')).not.toBeNull();
+    });
+    expect(screen.queryByTestId('focus-empty')).toBeNull();
+    expect(screen.getByText('2 pages')).toBeDefined();
+    fireEvent.click(screen.getByText('The US Is Winning the AI Race'));
+    expect(
+      screen.getByTestId('focus-visit-timeline-visit:https://example.test/ai-race-a'),
+    ).toBeDefined();
+    expect(
+      screen.getByTestId('focus-visit-timeline-visit:https://example.test/ai-race-b'),
+    ).toBeDefined();
+    expect(
+      screen
+        .getByTestId('focus-visit-open-timeline-visit:https://example.test/ai-race-a')
+        .getAttribute('href'),
+    ).toBe('https://example.test/ai-race-a');
+    fireEvent.click(
+      screen.getByTestId('focus-visit-timeline-visit:https://example.test/ai-race-a'),
+    );
+    await waitFor(() => {
+      expect(screen.getByText('Same topic (cohesion 0.92)')).toBeDefined();
+    });
+    expect(screen.queryByText(/Shared terms:/u)).toBeNull();
+  });
+
+  it('does not fall back to the global collapsed topic when scoped shadow has no topic', async () => {
+    const collapsedSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: { nodeId: 'timeline-visit:https://github.com/microsoft/tokenweave', hops: 1 },
+        nodes: [
+          {
+            id: 'timeline-visit:https://github.com/microsoft/tokenweave',
+            kind: 'timeline-visit',
+            label: 'microsoft/tokenweave',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://github.com/microsoft/tokenweave' },
+          },
+          {
+            id: 'topic:collapsed',
+            kind: 'topic',
+            label: 'ChatGPT',
+            originReplicaIds: [],
+            metadata: { memberCount: 301, cohesion: 0.72 },
+          },
+        ],
+        edges: [
+          {
+            id: 'edge:collapsed-tokenweave',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://github.com/microsoft/tokenweave',
+            toNodeId: 'topic:collapsed',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-current' },
+            confidence: 'inferred',
+          },
+        ],
+        updatedAt: '2026-05-14T10:00:00.000Z',
+        nodeCount: 2,
+        edgeCount: 1,
+      },
+    };
+    const shadowSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: {},
+        nodes: [
+          {
+            id: 'timeline-visit:https://github.com/microsoft/tokenweave',
+            kind: 'timeline-visit',
+            label: 'microsoft/tokenweave',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://github.com/microsoft/tokenweave' },
+          },
+          {
+            id: 'timeline-visit:https://db.example/oracle',
+            kind: 'timeline-visit',
+            label: 'Oracle 26ai',
+            originReplicaIds: ['replica-A'],
+            metadata: { canonicalUrl: 'https://db.example/oracle', focusedWindowMs: 8_000 },
+          },
+          {
+            id: 'topic:db',
+            kind: 'topic',
+            label: 'Oracle',
+            originReplicaIds: [],
+            metadata: { memberCount: 5, cohesion: 0.91 },
+          },
+        ],
+        edges: [
+          {
+            id: 'edge:shadow-db',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://db.example/oracle',
+            toNodeId: 'topic:db',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-shadow' },
+            confidence: 'inferred',
+          },
+        ],
+        updatedAt: '2026-05-14T10:00:00.000Z',
+        nodeCount: 3,
+        edgeCount: 1,
+      },
+    };
+    let shadowRequested = false;
+
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string; filters?: { topicVariant?: string } };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        return { ok: true, data: collapsedSnapshot };
+      }
+      if (m.type === messageTypes.loadConnectionsSnapshot) {
+        if (m.filters?.topicVariant === 'shadow') shadowRequested = true;
+        return {
+          ok: true,
+          data: m.filters?.topicVariant === 'shadow' ? shadowSnapshot : collapsedSnapshot,
+        };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+
+    render(
+      <ConnectionsView initialAnchor="timeline-visit:https://github.com/microsoft/tokenweave" />,
+    );
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-mode-focus')).not.toBeNull();
+    });
+    fireEvent.click(screen.getByTestId('connections-mode-focus'));
+
+    await waitFor(() => {
+      expect(shadowRequested).toBe(true);
+      expect(screen.queryByTestId('focus-collapse-guard')).toBeNull();
+    });
+    expect(screen.queryByText('ChatGPT')).toBeNull();
+    expect(screen.queryByTestId('focus-topic-topic:db')).toBeNull();
   });
 
   it('can re-anchor from a visible neighbor row', async () => {
@@ -199,7 +780,14 @@ describe('ConnectionsView — engineering scaffold', () => {
       ok: true,
       data: {
         scope: 'plugin-active-only-companion-unreachable',
-        snapshot: { scope: {}, nodes: [], edges: [], updatedAt: '1970-01-01T00:00:00.000Z', nodeCount: 0, edgeCount: 0 },
+        snapshot: {
+          scope: {},
+          nodes: [],
+          edges: [],
+          updatedAt: '1970-01-01T00:00:00.000Z',
+          nodeCount: 0,
+          edgeCount: 0,
+        },
       },
     }));
     render(<ConnectionsView initialAnchor="thread:thread_a" />);
@@ -213,7 +801,14 @@ describe('ConnectionsView — engineering scaffold', () => {
       ok: true,
       data: {
         scope: 'companion-extended',
-        snapshot: { scope: {}, nodes: [], edges: [], updatedAt: '1970-01-01T00:00:00.000Z', nodeCount: 0, edgeCount: 0 },
+        snapshot: {
+          scope: {},
+          nodes: [],
+          edges: [],
+          updatedAt: '1970-01-01T00:00:00.000Z',
+          nodeCount: 0,
+          edgeCount: 0,
+        },
       },
     }));
     render(<ConnectionsView initialAnchor="thread:thread_a" />);
@@ -321,57 +916,6 @@ describe('ConnectionsView — engineering scaffold', () => {
     });
     expect(screen.queryByTestId(`edge-hint-${refEdgeId}`)).not.toBeNull();
     expect(screen.getByText('via captured text')).toBeDefined();
-  });
-
-  it('renders the TimelineRail when the snapshot has event-log timestamps', async () => {
-    setConnectionsClientTransportForTests(async () => ({
-      ok: true,
-      data: {
-        scope: 'companion-extended',
-        snapshot: {
-          scope: { nodeId: 'thread:thread_a', hops: 1 },
-          nodes: [
-            {
-              id: 'thread:thread_a',
-              kind: 'thread',
-              label: 'A',
-              lastSeenAt: '2026-05-14T09:30:00.000Z',
-              originReplicaIds: ['mac'],
-              metadata: {},
-            },
-            {
-              id: 'workstream:ws_x',
-              kind: 'workstream',
-              label: 'WS',
-              lastSeenAt: '2026-05-14T09:45:00.000Z',
-              originReplicaIds: ['mac'],
-              metadata: {},
-            },
-          ],
-          edges: [
-            {
-              id: 'e1',
-              kind: 'thread_in_workstream',
-              fromNodeId: 'thread:thread_a',
-              toNodeId: 'workstream:ws_x',
-              observedAt: '2026-05-14T09:00:00.000Z',
-              producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 1 } },
-              confidence: 'asserted',
-            },
-          ],
-          updatedAt: '2026-05-14T09:45:00.000Z',
-          nodeCount: 2,
-          edgeCount: 1,
-        },
-      },
-    }));
-    render(<ConnectionsView initialAnchor="thread:thread_a" />);
-    await waitFor(() => {
-      expect(screen.queryByTestId('connections-timeline')).not.toBeNull();
-    });
-    const rail = screen.getByTestId('connections-timeline');
-    expect(within(rail).getByText('Observed activity')).toBeDefined();
-    expect(within(rail).getByText('2026-05-14')).toBeDefined();
   });
 
   it('switches to Orbital sub-mode and renders the SVG graph', async () => {

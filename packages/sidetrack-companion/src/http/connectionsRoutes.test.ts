@@ -4,6 +4,10 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { createConnectionsStore } from '../connections/snapshot.js';
+import {
+  createTopicRevisionStore,
+  TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
+} from '../producers/topic-revision.js';
 import { createConnectionsMaterializer } from '../sync/contract/connectionsMaterializer.js';
 import { createSyncContractRunner } from '../sync/contract/runner.js';
 import { createEventLog } from '../sync/eventLog.js';
@@ -128,6 +132,56 @@ describe('connections HTTP routes', () => {
     const r = await get('/v1/connections?nodeKind=thread');
     const body = r.data as { data: { snapshot: { nodes: { kind: string }[] } } };
     expect(body.data.snapshot.nodes.every((n) => n.kind === 'thread')).toBe(true);
+  });
+
+  it('GET /v1/connections?topicVariant=shadow overlays the shadow topic revision', async () => {
+    await createTopicRevisionStore(vaultRoot).putShadowRevision({
+      revisionId: 'topic-shadow-test',
+      visitSimilarityRevisionId: 'sim-test',
+      cosineThreshold: 0.85,
+      algorithmVersion: TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
+      topics: [
+        {
+          topicId: 'shadow-alpha',
+          memberCanonicalUrls: ['https://example.test/a', 'https://example.test/b'],
+          metadata: {
+            memberCount: 2,
+            representativeTitles: ['Shadow Alpha'],
+            firstObservedAt: '2026-05-07T10:00:00.000Z',
+            lastObservedAt: '2026-05-07T10:01:00.000Z',
+            cohesion: 0.91,
+          },
+        },
+      ],
+      lineage: [],
+      producedAt: Date.parse('2026-05-07T10:01:00.000Z'),
+    });
+
+    const r = await get('/v1/connections?topicVariant=shadow');
+    expect(r.status).toBe(200);
+    const body = r.data as {
+      data: {
+        snapshot: {
+          scope: { topicVariant?: string };
+          nodes: { id: string; kind: string; label: string }[];
+          edges: { kind: string; producedBy: { revisionId?: string } }[];
+        };
+      };
+    };
+    expect(body.data.snapshot.scope.topicVariant).toBe('shadow');
+    expect(body.data.snapshot.nodes).toContainEqual(
+      expect.objectContaining({
+        id: 'topic:shadow-alpha',
+        kind: 'topic',
+        label: 'Shadow Alpha',
+      }),
+    );
+    expect(body.data.snapshot.edges).toContainEqual(
+      expect.objectContaining({
+        kind: 'visit_in_topic',
+        producedBy: { source: 'topic-clusterer', revisionId: 'topic-shadow-test' },
+      }),
+    );
   });
 
   it('GET /v1/connections/nodes/<id>/neighbors?hops=1 returns the 1-hop subgraph', async () => {

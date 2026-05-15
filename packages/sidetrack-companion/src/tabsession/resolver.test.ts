@@ -2,7 +2,10 @@ import { describe, expect, it } from 'vitest';
 
 import type { ConnectionsSnapshot } from '../connections/types.js';
 import type { ClosestVisitRanker } from '../connections/snapshot.js';
-import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
+import {
+  BROWSER_TIMELINE_OBSERVED,
+  type BrowserTimelineObservedPayload,
+} from '../timeline/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { createPprCache, runPPR, seedHash } from './causalPpr.js';
 import { buildClusterEvidence } from './clusterEvidence.js';
@@ -23,15 +26,15 @@ const snapshot = (
   scope: {},
   nodes: nodeIds.map((id) => ({
     id,
-	    kind: id.startsWith('workstream:')
-	      ? 'workstream'
-	      : id.startsWith('tab-session:')
-	        ? 'tab-session'
-	        : id.startsWith('topic:')
-	          ? 'topic'
-	          : id.startsWith('visit-instance:')
-	            ? 'visit-instance'
-	            : 'timeline-visit',
+    kind: id.startsWith('workstream:')
+      ? 'workstream'
+      : id.startsWith('tab-session:')
+        ? 'tab-session'
+        : id.startsWith('topic:')
+          ? 'topic'
+          : id.startsWith('visit-instance:')
+            ? 'visit-instance'
+            : 'timeline-visit',
     label: id,
     originReplicaIds: [],
     metadata: {},
@@ -73,6 +76,24 @@ const observed = (
     ...(title === undefined ? {} : { title }),
   },
 });
+
+const observedWithWorkstream = (
+  seq: number,
+  tabSessionId: string,
+  url: string,
+  workstreamId: string,
+  title?: string,
+): AcceptedEvent => {
+  const event = observed(seq, tabSessionId, url, title);
+  const payload = event.payload as BrowserTimelineObservedPayload;
+  return {
+    ...event,
+    payload: {
+      ...payload,
+      workstreamId,
+    },
+  };
+};
 
 const emptyContributions = (): ReturnType<ClosestVisitRanker['predict']>['contributions'] => ({
   schemaVersion: 0,
@@ -243,6 +264,122 @@ describe('tab-session resolver', () => {
       workstreamId: 'ws_security',
       simTopScore: 0.91,
     });
+  });
+
+  it('deduplicates timeline and visit-instance anchors for URL similarity evidence', () => {
+    const currentUrl = 'https://example.test/current';
+    const anchorUrl = 'https://example.test/anchor';
+    const base = snapshot(
+      [
+        `timeline-visit:${currentUrl}`,
+        `visit-instance:tses_current:2026-05-10T10:00:00.000Z:${currentUrl}`,
+        `timeline-visit:${anchorUrl}`,
+        'workstream:ws_security',
+      ],
+      [
+        {
+          kind: 'visit_instance_same_url_as_timeline_visit',
+          from: `visit-instance:tses_current:2026-05-10T10:00:00.000Z:${currentUrl}`,
+          to: `timeline-visit:${currentUrl}`,
+        },
+        {
+          kind: 'visit_in_workstream',
+          from: `timeline-visit:${anchorUrl}`,
+          to: 'workstream:ws_security',
+        },
+      ],
+    );
+    const snap: ConnectionsSnapshot = {
+      ...base,
+      nodes: base.nodes.map((node) =>
+        node.id.startsWith('visit-instance:tses_current:')
+          ? {
+              ...node,
+              metadata: {
+                canonicalUrl: currentUrl,
+                timelineVisitId: `timeline-visit:${currentUrl}`,
+              },
+            }
+          : node,
+      ),
+    };
+    let predictCalls = 0;
+    const ranker: ClosestVisitRanker = {
+      revisionId: 'ranker-test',
+      predict: (_features, candidate) => {
+        predictCalls += 1;
+        return {
+          score: candidate.toVisitId === anchorUrl ? 0.91 : 0.01,
+          contributions: emptyContributions(),
+        };
+      },
+    };
+
+    const evidence = buildSimilarityEvidence({
+      snapshot: snap,
+      targetVisitNodeIds: new Set([
+        `timeline-visit:${currentUrl}`,
+        `visit-instance:tses_current:2026-05-10T10:00:00.000Z:${currentUrl}`,
+      ]),
+      events: [
+        observed(1, 'tses_current', currentUrl, 'Current research'),
+        observed(2, 'tses_anchor', anchorUrl, 'Anchor research'),
+      ],
+      closestVisitRanker: ranker,
+    });
+
+    expect(predictCalls).toBe(1);
+    expect(evidence).toEqual([
+      expect.objectContaining({
+        workstreamId: 'ws_security',
+        simAgreement: 0.1,
+      }),
+    ]);
+  });
+
+  it('treats current visit_in_workstream edges as authoritative over stale event stamps', () => {
+    const currentUrl = 'https://current.example.test/page';
+    const newAnchorUrl = 'https://new-anchor.example.test/page';
+    const oldAnchorUrl = 'https://old-anchor.example.test/page';
+    const snap = snapshot(
+      [
+        `timeline-visit:${currentUrl}`,
+        `timeline-visit:${newAnchorUrl}`,
+        `timeline-visit:${oldAnchorUrl}`,
+        'workstream:ws_new',
+        'workstream:ws_old',
+      ],
+      [
+        {
+          kind: 'visit_in_workstream',
+          from: `timeline-visit:${currentUrl}`,
+          to: 'workstream:ws_new',
+        },
+        {
+          kind: 'visit_in_workstream',
+          from: `timeline-visit:${newAnchorUrl}`,
+          to: 'workstream:ws_new',
+        },
+        {
+          kind: 'visit_in_workstream',
+          from: `timeline-visit:${oldAnchorUrl}`,
+          to: 'workstream:ws_old',
+        },
+      ],
+    );
+
+    const evidence = buildSimilarityEvidence({
+      snapshot: snap,
+      targetVisitNodeIds: new Set([`timeline-visit:${currentUrl}`]),
+      events: [
+        observedWithWorkstream(1, 'tses_current', currentUrl, 'ws_old', 'Current'),
+        observedWithWorkstream(2, 'tses_new', newAnchorUrl, 'ws_new', 'New anchor'),
+        observedWithWorkstream(3, 'tses_old', oldAnchorUrl, 'ws_old', 'Old anchor'),
+      ],
+    });
+
+    expect(evidence.map((item) => item.workstreamId)).toContain('ws_new');
+    expect(evidence.map((item) => item.workstreamId)).not.toContain('ws_old');
   });
 
   it('resolves a strong causal session with explainable candidates and no writes', () => {

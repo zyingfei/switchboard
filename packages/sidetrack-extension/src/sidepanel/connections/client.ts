@@ -19,6 +19,8 @@ export interface ConnectionsClientResponse<T> {
   readonly error?: string;
 }
 
+export type ConnectionsTopicVariant = 'shadow';
+
 export const USER_ORGANIZED_ITEM = 'user.organized.item' as const;
 export const USER_ENGAGEMENT_RELABELED = 'user.engagement.relabeled' as const;
 export const USER_FLOW_CONFIRMED = 'user.flow.confirmed' as const;
@@ -53,6 +55,7 @@ export type UserFlowRejectionReason =
   | 'stale'
   | 'duplicate'
   | 'other';
+export type UserTopicRenameSource = 'inline' | 'bulk-edit' | 'import';
 
 export interface UserOrganizedItemPayload {
   readonly payloadVersion: 1;
@@ -65,6 +68,9 @@ export interface UserOrganizedItemPayload {
     readonly rename?: string;
     readonly mergeMembers?: readonly string[];
     readonly splitInto?: readonly string[];
+    readonly reason?: 'hidden' | 'not-related' | 'split-out' | 'merged' | 'other';
+    readonly targetTopicId?: string;
+    readonly memberIds?: readonly string[];
   };
 }
 
@@ -91,7 +97,7 @@ export interface UserTopicRenamedPayload {
   readonly topicId: string;
   readonly previousName: string;
   readonly newName: string;
-  readonly source: 'inline' | 'bulk-edit' | 'import';
+  readonly source: UserTopicRenameSource;
 }
 
 export interface UserSnippetPromotedPayload {
@@ -202,16 +208,6 @@ export const postUserFlowRejected = (
     payload: { payloadVersion: 1, ...payload },
   });
 
-export const postUserTopicRenamed = (
-  payload: Omit<UserTopicRenamedPayload, 'payloadVersion' | 'source'> & {
-    readonly source?: UserTopicRenamedPayload['source'];
-  },
-): Promise<ConnectionsClientResponse<FeedbackPostResult>> =>
-  postFeedbackEvent({
-    type: USER_TOPIC_RENAMED,
-    payload: { payloadVersion: 1, source: 'inline', ...payload },
-  });
-
 export const postUserSnippetPromoted = (
   payload: Omit<UserSnippetPromotedPayload, 'payloadVersion' | 'targetKind'> & {
     readonly targetKind?: UserSnippetPromotedPayload['targetKind'];
@@ -220,6 +216,16 @@ export const postUserSnippetPromoted = (
   postFeedbackEvent({
     type: USER_SNIPPET_PROMOTED,
     payload: { payloadVersion: 1, targetKind: 'source', ...payload },
+  });
+
+export const postUserTopicRenamed = (
+  payload: Omit<UserTopicRenamedPayload, 'payloadVersion' | 'source'> & {
+    readonly source?: UserTopicRenameSource;
+  },
+): Promise<ConnectionsClientResponse<FeedbackPostResult>> =>
+  postFeedbackEvent({
+    type: USER_TOPIC_RENAMED,
+    payload: { payloadVersion: 1, source: 'inline', ...payload },
   });
 
 export const postUserOrganizedItem = (
@@ -239,7 +245,12 @@ export const postUserEngagementRelabeled = (
   });
 
 export const fetchConnectionsSnapshot = (
-  filters: { workstreamId?: string; nodeKind?: string; edgeKind?: string } = {},
+  filters: {
+    workstreamId?: string;
+    nodeKind?: string;
+    edgeKind?: string;
+    topicVariant?: ConnectionsTopicVariant;
+  } = {},
 ): Promise<ConnectionsClientResponse<ConnectionsScopedResult>> =>
   call(messageTypes.loadConnectionsSnapshot, { filters });
 

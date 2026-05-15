@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import {
   DEFAULT_TOPIC_COSINE_THRESHOLD,
   DEFAULT_TOPIC_ENGAGEMENT_GATE_MS,
@@ -58,11 +60,15 @@ export interface BuildTopicRevisionInput {
 interface CurrentComponent {
   readonly topicId: string;
   readonly memberCanonicalUrls: readonly string[];
+  readonly metadata: TopicNodeMetadata;
 }
 
 const compareString = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 const roundMetric = (value: number): number => Number(value.toFixed(6));
+
+const stableSuggestionIdFor = (medoidCanonicalUrl: string): string =>
+  `suggestion:${createHash('sha256').update(medoidCanonicalUrl).digest('base64url').slice(0, 16)}`;
 
 const sortedVisitsByCanonical = (visits: readonly TopicVisit[]): readonly TopicVisit[] => {
   const byCanonical = new Map<string, TopicVisit>();
@@ -99,6 +105,31 @@ const sortedVisitsByCanonical = (visits: readonly TopicVisit[]): readonly TopicV
 
 const pairKey = (a: string, b: string): string => (a < b ? `${a}\u0000${b}` : `${b}\u0000${a}`);
 
+const medoidForMembers = (
+  members: readonly string[],
+  visitsByCanonical: ReadonlyMap<string, TopicVisit>,
+  similarityEdges: readonly VisitSimilarityEdge[],
+): string | undefined => {
+  if (members.length === 0) return undefined;
+  const memberSet = new Set(members);
+  const scores = new Map<string, number>();
+  for (const member of members) scores.set(member, 0);
+  for (const edge of similarityEdges) {
+    if (!memberSet.has(edge.fromVisitKey) || !memberSet.has(edge.toVisitKey)) continue;
+    scores.set(edge.fromVisitKey, (scores.get(edge.fromVisitKey) ?? 0) + edge.cosine);
+    scores.set(edge.toVisitKey, (scores.get(edge.toVisitKey) ?? 0) + edge.cosine);
+  }
+  return [...members].sort((left, right) => {
+    const score = (scores.get(right) ?? 0) - (scores.get(left) ?? 0);
+    if (score !== 0) return score;
+    const leftVisit = visitsByCanonical.get(left);
+    const rightVisit = visitsByCanonical.get(right);
+    const focus = (rightVisit?.focusedWindowMs ?? 0) - (leftVisit?.focusedWindowMs ?? 0);
+    if (focus !== 0) return focus;
+    return compareString(left, right);
+  })[0];
+};
+
 const buildMetadata = (
   members: readonly string[],
   visitsByCanonical: ReadonlyMap<string, TopicVisit>,
@@ -118,6 +149,7 @@ const buildMetadata = (
     if (a[1] !== b[1]) return b[1] - a[1];
     return compareString(a[0], b[0]);
   })[0];
+  const medoidCanonicalUrl = medoidForMembers(members, visitsByCanonical, similarityEdges);
 
   const representativeTitles = [...visits]
     .sort((a, b) => {
@@ -155,6 +187,12 @@ const buildMetadata = (
   return {
     memberCount: members.length,
     ...(dominant === undefined ? {} : { dominantWorkstreamId: dominant[0] }),
+    ...(medoidCanonicalUrl === undefined
+      ? {}
+      : {
+          medoidCanonicalUrl,
+          stableSuggestionId: stableSuggestionIdFor(medoidCanonicalUrl),
+        }),
     representativeTitles,
     firstObservedAt,
     lastObservedAt,
@@ -213,6 +251,25 @@ const computeLineage = async (
     }
   }
 
+  const currentIdsByPreviousTopic = new Map<string, Set<string>>();
+  const previousIdsByCurrentTopic = new Map<string, Set<string>>();
+  const splitPreviousTopicIds = new Set<string>();
+  const splitCurrentTopicIds = new Set<string>();
+  for (const previousTopic of previousRevision.topics) {
+    const currentIds = new Set<string>();
+    for (const member of previousTopic.memberCanonicalUrls) {
+      const currentTopicId = currentTopicIdByMember.get(member);
+      if (currentTopicId !== undefined) currentIds.add(currentTopicId);
+    }
+    currentIdsByPreviousTopic.set(previousTopic.topicId, currentIds);
+    if (currentIds.size > 1) {
+      splitPreviousTopicIds.add(previousTopic.topicId);
+      for (const currentTopicId of currentIds) splitCurrentTopicIds.add(currentTopicId);
+    }
+  }
+
+  const mergedCurrentTopicIds = new Set<string>();
+  const mergedPreviousTopicIds = new Set<string>();
   for (const currentComponent of [...currentComponents].sort((a, b) =>
     compareString(a.topicId, b.topicId),
   )) {
@@ -222,8 +279,11 @@ const computeLineage = async (
       if (containingPreviousTopics === undefined) continue;
       for (const previousTopicId of containingPreviousTopics) previousIds.add(previousTopicId);
     }
+    previousIdsByCurrentTopic.set(currentComponent.topicId, previousIds);
     if (previousIds.size <= 1) continue;
+    mergedCurrentTopicIds.add(currentComponent.topicId);
     for (const previousTopicId of [...previousIds].sort(compareString)) {
+      mergedPreviousTopicIds.add(previousTopicId);
       push({
         fromTopicId: previousTopicId,
         toTopicId: currentComponent.topicId,
@@ -231,6 +291,68 @@ const computeLineage = async (
         observedAt,
       });
     }
+  }
+
+  const previousTopicByStableSuggestionId = new Map<string, TopicRevisionTopic>();
+  for (const previousTopic of previousRevision.topics) {
+    const stableSuggestionId = previousTopic.metadata.stableSuggestionId;
+    if (
+      stableSuggestionId !== undefined &&
+      !previousTopicByStableSuggestionId.has(stableSuggestionId)
+    ) {
+      previousTopicByStableSuggestionId.set(stableSuggestionId, previousTopic);
+    }
+  }
+
+  for (const currentComponent of [...currentComponents].sort((a, b) =>
+    compareString(a.topicId, b.topicId),
+  )) {
+    const previousIds =
+      previousIdsByCurrentTopic.get(currentComponent.topicId) ?? new Set<string>();
+    if (previousIds.size === 0) {
+      const resurfaced = currentComponent.metadata.stableSuggestionId
+        ? previousTopicByStableSuggestionId.get(currentComponent.metadata.stableSuggestionId)
+        : undefined;
+      push({
+        fromTopicId: resurfaced?.topicId ?? currentComponent.topicId,
+        toTopicId: currentComponent.topicId,
+        kind: resurfaced === undefined ? 'birth' : 'resurface',
+        observedAt,
+      });
+      continue;
+    }
+    if (
+      previousIds.size === 1 &&
+      !mergedCurrentTopicIds.has(currentComponent.topicId) &&
+      !splitCurrentTopicIds.has(currentComponent.topicId)
+    ) {
+      const previousTopicId = [...previousIds][0];
+      if (
+        previousTopicId !== undefined &&
+        !mergedPreviousTopicIds.has(previousTopicId) &&
+        !splitPreviousTopicIds.has(previousTopicId)
+      ) {
+        push({
+          fromTopicId: previousTopicId,
+          toTopicId: currentComponent.topicId,
+          kind: 'continue',
+          observedAt,
+        });
+      }
+    }
+  }
+
+  for (const previousTopic of [...previousRevision.topics].sort((a, b) =>
+    compareString(a.topicId, b.topicId),
+  )) {
+    const currentIds = currentIdsByPreviousTopic.get(previousTopic.topicId) ?? new Set<string>();
+    if (currentIds.size > 0) continue;
+    push({
+      fromTopicId: previousTopic.topicId,
+      toTopicId: previousTopic.topicId,
+      kind: 'death',
+      observedAt,
+    });
   }
 
   return lineage.sort((a, b) => {
@@ -286,8 +408,7 @@ interface EdgeRecord {
   readonly source: 'similarity' | 'user-asserted';
 }
 
-const edgePairKey = (a: string, b: string): string =>
-  a < b ? `${a} ${b}` : `${b} ${a}`;
+const edgePairKey = (a: string, b: string): string => (a < b ? `${a} ${b}` : `${b} ${a}`);
 
 export class IncrementalTopicClusterAccumulator {
   private uf = new UnionFind();
@@ -411,7 +532,11 @@ export class IncrementalTopicClusterAccumulator {
    * accumulator's union-find stays consistent. Returns a snapshot
    * sorted lexicographically by (a, b).
    */
-  getEdges(): readonly { readonly a: string; readonly b: string; readonly source: 'similarity' | 'user-asserted' }[] {
+  getEdges(): readonly {
+    readonly a: string;
+    readonly b: string;
+    readonly source: 'similarity' | 'user-asserted';
+  }[] {
     return [...this.edges.values()].sort((left, right) => {
       const a = compareString(left.a, right.a);
       if (a !== 0) return a;
@@ -514,9 +639,16 @@ export const buildTopicRevision = async (
   const currentComponents: CurrentComponent[] = [];
   for (const component of uf.components()) {
     const memberCanonicalUrls = [...component.members].sort(compareString);
+    const metadata = buildMetadata(
+      memberCanonicalUrls,
+      visitsByCanonical,
+      input.visitSimilarity.edges,
+      cosineThreshold,
+    );
     currentComponents.push({
       topicId: await topicId(memberCanonicalUrls),
       memberCanonicalUrls,
+      metadata,
     });
   }
   currentComponents.sort((a, b) => compareString(a.topicId, b.topicId));
@@ -527,12 +659,7 @@ export const buildTopicRevision = async (
     topics.push({
       topicId: component.topicId,
       memberCanonicalUrls: component.memberCanonicalUrls,
-      metadata: buildMetadata(
-        component.memberCanonicalUrls,
-        visitsByCanonical,
-        input.visitSimilarity.edges,
-        cosineThreshold,
-      ),
+      metadata: component.metadata,
     });
   }
   topics.sort((a, b) => compareString(a.topicId, b.topicId));
@@ -607,6 +734,12 @@ export const buildTopicRevisionFromAccumulator = async (
   const currentComponents: CurrentComponent[] = incrementalComponents.map((c) => ({
     topicId: c.topicId,
     memberCanonicalUrls: c.memberCanonicalUrls,
+    metadata: buildMetadata(
+      c.memberCanonicalUrls,
+      visitsByCanonical,
+      input.visitSimilarity.edges,
+      cosineThreshold,
+    ),
   }));
 
   const topics: TopicRevisionTopic[] = [];
@@ -614,12 +747,7 @@ export const buildTopicRevisionFromAccumulator = async (
     topics.push({
       topicId: component.topicId,
       memberCanonicalUrls: component.memberCanonicalUrls,
-      metadata: buildMetadata(
-        component.memberCanonicalUrls,
-        visitsByCanonical,
-        input.visitSimilarity.edges,
-        cosineThreshold,
-      ),
+      metadata: component.metadata,
     });
   }
   topics.sort((a, b) => compareString(a.topicId, b.topicId));

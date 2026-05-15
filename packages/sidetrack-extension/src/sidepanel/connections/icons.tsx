@@ -127,3 +127,39 @@ export const CloseIcon = (
     <path d="m6 6 12 12" />
   </svg>
 );
+
+export const CheckIcon = (
+  <svg {...baseProps}>
+    <path d="m20 6-11 11-5-5" />
+  </svg>
+);
+
+export const ClockIcon = (
+  <svg {...baseProps}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="M12 7v5l3 2" />
+  </svg>
+);
+
+export const EditIcon = (
+  <svg {...baseProps}>
+    <path d="M12 20h9" />
+    <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" />
+  </svg>
+);
+
+export const RejectIcon = (
+  <svg {...baseProps}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="m15 9-6 6" />
+    <path d="m9 9 6 6" />
+  </svg>
+);
+
+export const SaveIcon = (
+  <svg {...baseProps}>
+    <path d="M5 3h12l2 2v16H5z" />
+    <path d="M8 3v6h7V3" />
+    <path d="M8 21v-6h8v6" />
+  </svg>
+);

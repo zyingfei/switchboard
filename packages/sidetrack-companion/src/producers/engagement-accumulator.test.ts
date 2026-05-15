@@ -128,7 +128,7 @@ describe('Stage 5.2 W2a — engagement accumulator', () => {
     const extra = [
       navigationEvent({ seq: 3, visitId: 'v2', canonicalUrl: 'https://example.com/b' }),
       engagementEvent({ seq: 4, visitId: 'v2', sessionId: 's1', activeMs: 2000 }),
-      engagementEvent({ seq: 5, visitId: 'v1', sessionId: 's1', activeMs: 7000 }), // newer wins
+      engagementEvent({ seq: 5, visitId: 'v1', sessionId: 's1', activeMs: 7000 }),
     ];
     const acc = seedEngagementAccumulator(initial, emptyTimelineDays);
     for (const event of extra) foldEventIntoEngagementAccumulator(acc, event);
@@ -140,7 +140,7 @@ describe('Stage 5.2 W2a — engagement accumulator', () => {
     expect(streamed).toEqual(oneShot);
   });
 
-  it('newer engagement event for the same (visitId, sessionId) wins', () => {
+  it('sums repeated final aggregates for the same visit even when the session id is reused', () => {
     const events = [
       engagementEvent({ seq: 1, visitId: 'v1', sessionId: 's1', activeMs: 100 }),
       engagementEvent({ seq: 2, visitId: 'v1', sessionId: 's1', activeMs: 999 }),
@@ -148,19 +148,42 @@ describe('Stage 5.2 W2a — engagement accumulator', () => {
     const acc = createEmptyEngagementAccumulator();
     for (const event of events) foldEventIntoEngagementAccumulator(acc, event);
     const inputs = engagementClassifierInputsFromAccumulator(acc);
-    expect(inputs[0]?.engagement.activeMs).toBe(999);
+    expect(inputs[0]?.engagement.activeMs).toBe(1_099);
   });
 
-  it('out-of-order folds still pick the latest event by accepted order', () => {
+  it('does not let a short later aggregate erase earlier topic-gate focus', () => {
+    const events = [
+      engagementEvent({
+        seq: 1,
+        visitId: 'visit:https://example.com/reference',
+        sessionId: 'session:edge',
+        activeMs: 186_770,
+        focusedWindowMs: 186_770,
+      }),
+      engagementEvent({
+        seq: 2,
+        visitId: 'visit:https://example.com/reference',
+        sessionId: 'session:edge',
+        activeMs: 1_908,
+        focusedWindowMs: 1_908,
+      }),
+    ];
+    const acc = createEmptyEngagementAccumulator();
+    for (const event of events) foldEventIntoEngagementAccumulator(acc, event);
+    const inputs = engagementClassifierInputsFromAccumulator(acc);
+    expect(inputs[0]?.engagement.focusedWindowMs).toBe(188_678);
+  });
+
+  it('out-of-order folds still sum accepted aggregates deterministically', () => {
     const earlier = engagementEvent({ seq: 1, visitId: 'v1', sessionId: 's1', activeMs: 100 });
     const later = engagementEvent({ seq: 2, visitId: 'v1', sessionId: 's1', activeMs: 999 });
     const acc = createEmptyEngagementAccumulator();
-    // Fold the LATER event first, then the EARLIER one. The newer
-    // one (seq=2) still wins per compareEventOrder.
+    // Fold the later event first, then the earlier one. Derivation
+    // should not depend on event-arrival order.
     foldEventIntoEngagementAccumulator(acc, later);
     foldEventIntoEngagementAccumulator(acc, earlier);
     const inputs = engagementClassifierInputsFromAccumulator(acc);
-    expect(inputs[0]?.engagement.activeMs).toBe(999);
+    expect(inputs[0]?.engagement.activeMs).toBe(1_099);
   });
 
   it('non-engagement, non-navigation events are no-ops in fold', () => {

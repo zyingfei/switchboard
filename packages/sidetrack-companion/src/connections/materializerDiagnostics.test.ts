@@ -5,10 +5,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { ENGAGEMENT_SESSION_AGGREGATED } from '../engagement/events.js';
-import {
-  USER_ORGANIZED_ITEM,
-  type UserOrganizedItemPayload,
-} from '../feedback/events.js';
+import { USER_ORGANIZED_ITEM, type UserOrganizedItemPayload } from '../feedback/events.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../tabsession/events.js';
 import type { RankerRetrainResult } from '../ranker/retrain.js';
 import type { AcceptedEvent } from '../sync/causal.js';
@@ -68,10 +65,7 @@ const projection = (records: readonly UrlVisitRecord[]): UrlProjection => ({
   byCanonicalUrl: new Map(records.map((r) => [r.canonicalUrl, r])),
 });
 
-const url = (
-  canonicalUrl: string,
-  overrides: Partial<UrlVisitRecord> = {},
-): UrlVisitRecord => ({
+const url = (canonicalUrl: string, overrides: Partial<UrlVisitRecord> = {}): UrlVisitRecord => ({
   canonicalUrl,
   firstSeenAt: TIMESTAMP,
   lastSeenAt: TIMESTAMP,
@@ -144,7 +138,9 @@ const emptyTopicRevision = () => ({
   producedAt: ACCEPTED_AT_MS,
 });
 
-const baseInput = (overrides: Partial<MaterializerDiagnosticsInput> = {}): MaterializerDiagnosticsInput => ({
+const baseInput = (
+  overrides: Partial<MaterializerDiagnosticsInput> = {},
+): MaterializerDiagnosticsInput => ({
   producedAt: TIMESTAMP,
   maxAcceptedAtMs: ACCEPTED_AT_MS,
   engagementGateMs: 5_000,
@@ -393,11 +389,7 @@ describe('collectMaterializerDiagnostics', () => {
       });
     const diag = collectMaterializerDiagnostics(
       baseInput({
-        events: [
-          engagementEvent(1_200, 1),
-          engagementEvent(5_500, 2),
-          engagementEvent(0, 3),
-        ],
+        events: [engagementEvent(1_200, 1), engagementEvent(5_500, 2), engagementEvent(0, 3)],
       }),
     );
     expect(diag.engagement).toEqual({
@@ -450,6 +442,41 @@ describe('collectMaterializerDiagnostics', () => {
     const diag = collectMaterializerDiagnostics(baseInput());
     expect(diag.similarity.effectiveConfig).toBeUndefined();
   });
+
+  it('preserves shadow observation diagnostics for the dogfood window', () => {
+    const diag = collectMaterializerDiagnostics(
+      baseInput({
+        topicShadowObservation: {
+          shadowRevisionId: 'shadow-next',
+          previousShadowRevisionId: 'shadow-prev',
+          adjacentOverlapVisitCount: 10,
+          adjacentChangedVisitCount: 1,
+          adjacentPerVisitChurn: 0.1,
+          adjacentRawTopicIdChurn: 0.3,
+          previousShadowTopicCount: 8,
+          previousShadowMaxTopicSize: 12,
+          previousShadowAssignedVisitCount: 90,
+          topicCountDeltaFromPrevious: 2,
+          maxTopicSizeDeltaFromPrevious: -4,
+          assignedVisitCountDeltaFromPrevious: 6,
+          baselineCollapsed: true,
+          previousBaselineCollapsed: true,
+          activeCollapseBoundaryChanged: false,
+          shadowCollapsed: false,
+          previousShadowCollapsed: false,
+          shadowCollapseBoundaryChanged: false,
+        },
+      }),
+    );
+
+    expect(diag.shadowObservation).toMatchObject({
+      shadowRevisionId: 'shadow-next',
+      previousShadowRevisionId: 'shadow-prev',
+      adjacentPerVisitChurn: 0.1,
+      topicCountDeltaFromPrevious: 2,
+      shadowCollapseBoundaryChanged: false,
+    });
+  });
 });
 
 describe('summarizeMaterializerDiagnostics', () => {
@@ -487,6 +514,34 @@ describe('summarizeMaterializerDiagnostics', () => {
     void _producer;
     const diag = collectMaterializerDiagnostics(baseInput({ visitSimilarity: stripped }));
     expect(diag.similarity.producer).toBe('unknown');
+  });
+
+  it('includes adjacent shadow observation counters when present', () => {
+    const diag = collectMaterializerDiagnostics(
+      baseInput({
+        topicShadowObservation: {
+          shadowRevisionId: 'shadow-next',
+          previousShadowRevisionId: 'shadow-prev',
+          adjacentOverlapVisitCount: 10,
+          adjacentChangedVisitCount: 1,
+          adjacentPerVisitChurn: 0.1,
+          adjacentRawTopicIdChurn: 0.3,
+          baselineCollapsed: true,
+          previousBaselineCollapsed: false,
+          activeCollapseBoundaryChanged: true,
+          shadowCollapsed: false,
+          previousShadowCollapsed: false,
+          shadowCollapseBoundaryChanged: false,
+          noiseShareDeltaFromPrevious: 0.04,
+        },
+      }),
+    );
+
+    const summary = summarizeMaterializerDiagnostics(diag);
+    expect(summary).toContain('shadowAdjChurn=0.1');
+    expect(summary).toContain('shadowBoundaryChanged=false');
+    expect(summary).toContain('activeBoundaryChanged=true');
+    expect(summary).toContain('shadowNoiseDelta=0.04');
   });
 });
 

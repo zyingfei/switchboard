@@ -204,7 +204,12 @@ const foldEngagementAggregateIntoAccumulator = (
     replicaId: event.dot.replicaId,
     seq: event.dot.seq,
   };
-  const key = `${payload.visitId}\u0000${payload.sessionId}`;
+  const key = [
+    payload.visitId,
+    payload.sessionId,
+    event.dot.replicaId,
+    String(event.dot.seq),
+  ].join('\u0000');
   const existing = acc.latestByVisitSession.get(key);
   if (existing === undefined || compareEventOrder(existing, next) < 0) {
     acc.latestByVisitSession.set(key, next);

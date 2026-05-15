@@ -14,7 +14,7 @@ import {
   isDispatchRecordedPayload,
 } from '../dispatches/events.js';
 import { createRevision } from '../domain/ids.js';
-import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
+import { USER_ORGANIZED_ITEM, isUserOrganizedItemPayload } from '../feedback/events.js';
 import {
   buildCrossReplicaMaterialization,
   replicaIdFromNodeId,
@@ -27,7 +27,10 @@ import {
 } from '../navigation/events.js';
 import {
   DEFAULT_TOPIC_WORKSTREAM_SHARE_THRESHOLD,
+  type TopicNodeMetadata,
   type TopicRevision,
+  type TopicRevisionTopic,
+  type TopicSecondaryAffiliation,
 } from '../producers/topic-revision.js';
 import { QUEUE_CREATED, isQueueCreatedPayload } from '../queue/events.js';
 import { CAPTURE_RECORDED, isCaptureRecordedPayload } from '../recall/events.js';
@@ -42,7 +45,11 @@ import {
   serializeTabSessionProjection,
   type TabSessionProjection,
 } from '../tabsession/projection.js';
-import { serializeUrlProjection, type UrlProjection } from '../urls/projection.js';
+import {
+  serializeUrlProjection,
+  type UrlAttribution,
+  type UrlProjection,
+} from '../urls/projection.js';
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import { THREAD_UPSERTED, isThreadUpsertedPayload } from '../threads/events.js';
 import {
@@ -248,6 +255,9 @@ interface AccumNode {
 const sortAlphaById = <T extends { id: string }>(rows: readonly T[]): T[] =>
   [...rows].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
+const compareString = (left: string, right: string): number =>
+  left < right ? -1 : left > right ? 1 : 0;
+
 const compactMetadata = (m: Record<string, unknown>): ConnectionNodeMetadata => {
   // Drop undefined entries so the same logical metadata produces
   // byte-identical JSON across runs.
@@ -362,6 +372,13 @@ const snapshotFromAccumulators = (
 
 const stripFragmentAndTrailingSlash = (url: string): string =>
   url.replace(/#.*$/u, '').replace(/\/+$/u, '');
+
+const currentUrlAttributionFor = (
+  input: ConnectionsInput,
+  canonicalUrl: string,
+): UrlAttribution | undefined =>
+  input.urlProjection?.byCanonicalUrl.get(stripFragmentAndTrailingSlash(canonicalUrl))
+    ?.currentAttribution;
 
 // Stage 5 / T5 — `timeline_same_url_as_thread` gates. Pre-T5 the edge
 // fired whenever a timeline-visit's canonical URL matched a thread's
@@ -499,6 +516,312 @@ const visitKeyFromNodeOrRaw = (value: string): string =>
     ? value.slice(TIMELINE_VISIT_NODE_PREFIX.length)
     : stripFragmentAndTrailingSlash(value);
 
+const topicNodeIdFromTopicId = (topicId: string): string => nodeIdFor('topic', topicId);
+
+const visitNodeIdFromNodeOrRaw = (value: string): string =>
+  value.startsWith(TIMELINE_VISIT_NODE_PREFIX)
+    ? value
+    : nodeIdFor('timeline-visit', visitKeyFromNodeOrRaw(value));
+
+const memberNodeIdsFor = (members: readonly string[]): ReadonlySet<string> =>
+  new Set(members.map((member) => nodeIdFor('timeline-visit', member)));
+
+const normalizedMemberNodeIds = (members: readonly string[] | undefined): ReadonlySet<string> => {
+  const out = new Set<string>();
+  for (const member of members ?? []) {
+    out.add(visitNodeIdFromNodeOrRaw(member));
+  }
+  return out;
+};
+
+const memberOverlapMatches = (
+  actionMemberNodeIds: ReadonlySet<string>,
+  topicMemberCanonicalUrls: readonly string[],
+): boolean => {
+  if (actionMemberNodeIds.size < 2 || topicMemberCanonicalUrls.length < 2) return false;
+  const topicMemberNodeIds = memberNodeIdsFor(topicMemberCanonicalUrls);
+  let overlap = 0;
+  for (const memberId of actionMemberNodeIds) {
+    if (topicMemberNodeIds.has(memberId)) overlap += 1;
+  }
+  if (overlap < 2) return false;
+  return overlap / actionMemberNodeIds.size >= 0.8 && overlap / topicMemberNodeIds.size >= 0.5;
+};
+
+interface TopicActionProjection {
+  readonly hiddenTopics: readonly {
+    readonly topicKeys: ReadonlySet<string>;
+    readonly memberNodeIds: ReadonlySet<string>;
+  }[];
+  readonly suppressedVisitTopicPairs: readonly {
+    readonly visitNodeId: string;
+    readonly topicKeys: ReadonlySet<string>;
+    readonly memberNodeIds: ReadonlySet<string>;
+  }[];
+  readonly mergeRequests: readonly {
+    readonly sourceTopicKeys: ReadonlySet<string>;
+    readonly targetTopicKeys: ReadonlySet<string>;
+    readonly sourceMemberNodeIds: ReadonlySet<string>;
+  }[];
+}
+
+const topicKeysForAction = (value: string | null | undefined): ReadonlySet<string> => {
+  const out = new Set<string>();
+  if (value === undefined || value === null || value.length === 0) return out;
+  out.add(value);
+  if (!value.startsWith('topic:')) {
+    out.add(topicNodeIdFromTopicId(value));
+  } else {
+    out.add(topicNodeIdFromTopicId(value));
+    const unprefixed = value.replace(/^topic:/u, '');
+    if (unprefixed.length > 0) out.add(unprefixed);
+  }
+  return out;
+};
+
+const topicKeysMatch = (
+  topicKeys: ReadonlySet<string>,
+  topicId: string,
+  topicNodeId: string,
+): boolean => topicKeys.has(topicId) || topicKeys.has(topicNodeId);
+
+const topicActionMatches = (
+  action: { readonly topicKeys: ReadonlySet<string>; readonly memberNodeIds: ReadonlySet<string> },
+  topic: TopicRevisionTopic,
+): boolean =>
+  topicKeysMatch(action.topicKeys, topic.topicId, topicNodeIdFromTopicId(topic.topicId)) ||
+  memberOverlapMatches(action.memberNodeIds, topic.memberCanonicalUrls);
+
+const buildTopicActionProjection = (events: readonly AcceptedEvent[]): TopicActionProjection => {
+  const hiddenTopics: TopicActionProjection['hiddenTopics'][number][] = [];
+  const suppressedVisitTopicPairs: TopicActionProjection['suppressedVisitTopicPairs'][number][] =
+    [];
+  const mergeRequests: TopicActionProjection['mergeRequests'][number][] = [];
+
+  for (const event of events) {
+    if (event.type !== USER_ORGANIZED_ITEM || !isUserOrganizedItemPayload(event.payload)) {
+      continue;
+    }
+    const payload = event.payload;
+    const memberNodeIds = normalizedMemberNodeIds(payload.details?.memberIds);
+    if (payload.itemKind === 'topic' && payload.action === 'ignore') {
+      hiddenTopics.push({
+        topicKeys: topicKeysForAction(payload.itemId),
+        memberNodeIds,
+      });
+      continue;
+    }
+    if (payload.itemKind === 'visit' && payload.action === 'ignore') {
+      suppressedVisitTopicPairs.push({
+        visitNodeId: visitNodeIdFromNodeOrRaw(payload.itemId),
+        topicKeys: topicKeysForAction(payload.fromContainer ?? payload.details?.targetTopicId),
+        memberNodeIds,
+      });
+      continue;
+    }
+    if (payload.itemKind === 'topic' && payload.action === 'split') {
+      for (const memberId of payload.details?.memberIds ?? []) {
+        suppressedVisitTopicPairs.push({
+          visitNodeId: visitNodeIdFromNodeOrRaw(memberId),
+          topicKeys: topicKeysForAction(payload.itemId),
+          memberNodeIds,
+        });
+      }
+      continue;
+    }
+    if (payload.itemKind === 'topic' && payload.action === 'merge') {
+      const targetTopicId =
+        payload.details?.targetTopicId ?? payload.toContainer ?? payload.details?.mergeMembers?.[0];
+      mergeRequests.push({
+        sourceTopicKeys: topicKeysForAction(payload.itemId),
+        targetTopicKeys: topicKeysForAction(targetTopicId),
+        sourceMemberNodeIds: memberNodeIds,
+      });
+    }
+  }
+
+  return { hiddenTopics, suppressedVisitTopicPairs, mergeRequests };
+};
+
+const topicIsHiddenByUser = (actions: TopicActionProjection, topic: TopicRevisionTopic): boolean =>
+  actions.hiddenTopics.some((action) => topicActionMatches(action, topic));
+
+const visitTopicPairSuppressedByUser = (
+  actions: TopicActionProjection,
+  topic: TopicRevisionTopic,
+  memberCanonicalUrl: string,
+): boolean => {
+  const visitNodeId = nodeIdFor('timeline-visit', memberCanonicalUrl);
+  const topicNodeId = topicNodeIdFromTopicId(topic.topicId);
+  return actions.suppressedVisitTopicPairs.some(
+    (action) =>
+      action.visitNodeId === visitNodeId &&
+      (topicKeysMatch(action.topicKeys, topic.topicId, topicNodeId) ||
+        memberOverlapMatches(action.memberNodeIds, topic.memberCanonicalUrls)),
+  );
+};
+
+interface ProjectedTopic {
+  readonly topicId: string;
+  readonly memberCanonicalUrls: readonly string[];
+  readonly metadata: TopicNodeMetadata & { readonly secondaryCount?: number };
+  readonly secondaryAffiliations: readonly TopicSecondaryAffiliation[];
+}
+
+const mergeTopicMetadata = (
+  entries: readonly {
+    readonly metadata: TopicNodeMetadata;
+    readonly memberCount: number;
+    readonly secondaryCount: number;
+  }[],
+  memberCount: number,
+): ProjectedTopic['metadata'] => {
+  const representativeTitles = [
+    ...new Set(entries.flatMap((entry) => entry.metadata.representativeTitles)),
+  ].slice(0, 5);
+  const firstObservedAt =
+    entries.map((entry) => entry.metadata.firstObservedAt).sort(compareString)[0] ?? '';
+  const lastObservedAt =
+    entries.map((entry) => entry.metadata.lastObservedAt).sort((a, b) => compareString(b, a))[0] ??
+    '';
+  const weightedCohesion = entries.reduce(
+    (sum, entry) => sum + entry.metadata.cohesion * Math.max(1, entry.memberCount),
+    0,
+  );
+  const weightedMembers = entries.reduce((sum, entry) => sum + Math.max(1, entry.memberCount), 0);
+  const dominant = entries.find((entry) => entry.metadata.dominantWorkstreamId !== undefined)
+    ?.metadata.dominantWorkstreamId;
+  const secondaryCount = entries.reduce((sum, entry) => sum + entry.secondaryCount, 0);
+  return {
+    memberCount,
+    ...(dominant === undefined ? {} : { dominantWorkstreamId: dominant }),
+    representativeTitles,
+    firstObservedAt,
+    lastObservedAt,
+    cohesion: weightedMembers === 0 ? 0 : Number((weightedCohesion / weightedMembers).toFixed(6)),
+    ...(secondaryCount > 0 ? { secondaryCount } : {}),
+  };
+};
+
+const projectedTopicsForUserActions = (
+  topics: readonly TopicRevisionTopic[],
+  actions: TopicActionProjection,
+): readonly ProjectedTopic[] => {
+  const activeTopics = topics.filter((topic) => !topicIsHiddenByUser(actions, topic));
+  const topicByNodeId = new Map(
+    activeTopics.map((topic) => [topicNodeIdFromTopicId(topic.topicId), topic] as const),
+  );
+  const topicNodeIdByKey = new Map<string, string>();
+  for (const topic of activeTopics) {
+    const topicNodeId = topicNodeIdFromTopicId(topic.topicId);
+    topicNodeIdByKey.set(topic.topicId, topicNodeId);
+    topicNodeIdByKey.set(topicNodeId, topicNodeId);
+  }
+
+  const redirectByNodeId = new Map<string, string>();
+  for (const request of actions.mergeRequests) {
+    const targetNodeId = [...request.targetTopicKeys]
+      .map((key) => topicNodeIdByKey.get(key))
+      .find((candidate): candidate is string => candidate !== undefined);
+    if (targetNodeId === undefined) continue;
+    for (const topic of activeTopics) {
+      const sourceNodeId = topicNodeIdFromTopicId(topic.topicId);
+      const sourceMatches =
+        topicKeysMatch(request.sourceTopicKeys, topic.topicId, sourceNodeId) ||
+        memberOverlapMatches(request.sourceMemberNodeIds, topic.memberCanonicalUrls);
+      if (sourceMatches && sourceNodeId !== targetNodeId)
+        redirectByNodeId.set(sourceNodeId, targetNodeId);
+    }
+  }
+
+  const rootFor = (nodeId: string): string => {
+    let current = nodeId;
+    const seen = new Set<string>();
+    while (redirectByNodeId.has(current) && !seen.has(current)) {
+      seen.add(current);
+      current = redirectByNodeId.get(current) ?? current;
+    }
+    return current;
+  };
+
+  const grouped = new Map<
+    string,
+    {
+      readonly targetTopic: TopicRevisionTopic;
+      readonly memberCanonicalUrls: Set<string>;
+      readonly secondaryByUrl: Map<string, TopicSecondaryAffiliation>;
+      readonly metadataEntries: {
+        readonly metadata: TopicNodeMetadata;
+        readonly memberCount: number;
+        readonly secondaryCount: number;
+      }[];
+    }
+  >();
+
+  for (const topic of activeTopics) {
+    const topicNodeId = topicNodeIdFromTopicId(topic.topicId);
+    const targetNodeId = rootFor(topicNodeId);
+    const targetTopic = topicByNodeId.get(targetNodeId) ?? topic;
+    const existing = grouped.get(targetNodeId) ?? {
+      targetTopic,
+      memberCanonicalUrls: new Set<string>(),
+      secondaryByUrl: new Map<string, TopicSecondaryAffiliation>(),
+      metadataEntries: [],
+    };
+
+    for (const member of topic.memberCanonicalUrls) {
+      if (visitTopicPairSuppressedByUser(actions, topic, member)) continue;
+      if (
+        targetTopic.topicId !== topic.topicId &&
+        visitTopicPairSuppressedByUser(actions, targetTopic, member)
+      ) {
+        continue;
+      }
+      existing.memberCanonicalUrls.add(member);
+    }
+    for (const affiliation of topic.secondaryAffiliations ?? []) {
+      if (visitTopicPairSuppressedByUser(actions, topic, affiliation.canonicalUrl)) continue;
+      const current = existing.secondaryByUrl.get(affiliation.canonicalUrl);
+      if (current === undefined || affiliation.score > current.score) {
+        existing.secondaryByUrl.set(affiliation.canonicalUrl, affiliation);
+      }
+    }
+    existing.metadataEntries.push({
+      metadata: topic.metadata,
+      memberCount: topic.memberCanonicalUrls.length,
+      secondaryCount: topic.secondaryAffiliations?.length ?? 0,
+    });
+    grouped.set(targetNodeId, existing);
+  }
+
+  return [...grouped.values()]
+    .map((group) => {
+      const memberCanonicalUrls = [...group.memberCanonicalUrls].sort(compareString);
+      const secondaryAffiliations = [...group.secondaryByUrl.values()].sort((left, right) =>
+        left.canonicalUrl === right.canonicalUrl
+          ? right.score - left.score
+          : compareString(left.canonicalUrl, right.canonicalUrl),
+      );
+      return {
+        topicId: group.targetTopic.topicId,
+        memberCanonicalUrls,
+        metadata: mergeTopicMetadata(
+          group.metadataEntries.map((entry) =>
+            entry.metadata === group.targetTopic.metadata
+              ? { ...entry, memberCount: memberCanonicalUrls.length }
+              : entry,
+          ),
+          memberCanonicalUrls.length,
+        ),
+        secondaryAffiliations,
+      };
+    })
+    .filter(
+      (topic) => topic.memberCanonicalUrls.length > 0 || topic.secondaryAffiliations.length > 0,
+    )
+    .sort((left, right) => compareString(left.topicId, right.topicId));
+};
+
 const visitInstanceKey = (input: {
   readonly tabSessionId: string;
   readonly visitKey: string;
@@ -527,7 +850,8 @@ const collectVisitInstances = (input: {
     const existing = groups.get(groupKey);
     const increments =
       entry.visitCount ??
-      (entry.transition !== undefined && VISIT_INSTANCE_INCREMENTING_TRANSITIONS.has(entry.transition)
+      (entry.transition !== undefined &&
+      VISIT_INSTANCE_INCREMENTING_TRANSITIONS.has(entry.transition)
         ? 1
         : 0);
     if (existing === undefined) {
@@ -1114,6 +1438,15 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
     trackObservedAt(day.updatedAt);
     for (const entry of day.entries) {
       const visitKey = stripFragmentAndTrailingSlash(entry.canonicalUrl ?? entry.url);
+      const urlAttribution = currentUrlAttributionFor(input, visitKey);
+      const effectiveVisitWorkstreamId =
+        urlAttribution === undefined
+          ? entry.workstreamId !== undefined && entry.workstreamId.length > 0
+            ? entry.workstreamId
+            : undefined
+          : urlAttribution.workstreamId === null
+            ? undefined
+            : urlAttribution.workstreamId;
       const priorVisitObservedAt = visitObservedAtByKey.get(visitKey);
       if (priorVisitObservedAt === undefined || entry.lastSeenAt > priorVisitObservedAt) {
         visitObservedAtByKey.set(visitKey, entry.lastSeenAt);
@@ -1145,9 +1478,13 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
           // in the pass — this metadata is the "what flow was the
           // user in when this happened" hint, separate from the
           // edge.
-          ...(entry.workstreamId === undefined || entry.workstreamId.length === 0
+          ...(effectiveVisitWorkstreamId === undefined
             ? {}
-            : { workstreamId: entry.workstreamId }),
+            : {
+                workstreamId: effectiveVisitWorkstreamId,
+                workstreamAttributionOrigin:
+                  urlAttribution === undefined ? 'timeline-entry' : 'canonical-url',
+              }),
           ...(searchQuery === undefined ? {} : { searchQuery }),
           ...(engagementClass === undefined
             ? {}
@@ -1173,28 +1510,50 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
       // browsing inside a focused workstream. Emit one edge per
       // (visit, workstream) pair so the snapshot reflects the
       // attribution.
-      if (entry.workstreamId !== undefined && entry.workstreamId.length > 0) {
+      if (effectiveVisitWorkstreamId !== undefined) {
         upsertNode(nodes, {
           kind: 'workstream',
-          key: entry.workstreamId,
-          label: entry.workstreamId,
+          key: effectiveVisitWorkstreamId,
+          label: effectiveVisitWorkstreamId,
         });
-        upsertEdge(edges, {
-          kind: 'visit_in_workstream',
-          fromNodeId: nodeIdFor('timeline-visit', visitKey),
-          toNodeId: nodeIdFor('workstream', entry.workstreamId),
-          observedAt: entry.lastSeenAt,
-          producedBy: { source: 'timeline-projection' },
-          // 'inferred' — the active-workstream pointer at observation
-          // time is an inference about user intent, not a direct
-          // observation about the URL→workstream relationship. The
-          // sister `timeline_same_url_as_thread` edge nearby also
-          // uses 'inferred' for the same reason. The e2e suite at
-          // `connections-mvp-user-story.spec.ts:291` and downstream
-          // resolver code rely on this classification to decide
-          // whether to weight the edge as evidence.
-          confidence: 'inferred',
-        });
+        if (urlAttribution !== undefined && urlAttribution.workstreamId !== null) {
+          upsertEdge(edges, {
+            kind: 'visit_in_workstream',
+            fromNodeId: nodeIdFor('timeline-visit', visitKey),
+            toNodeId: nodeIdFor('workstream', effectiveVisitWorkstreamId),
+            observedAt: urlAttribution.observedAt,
+            producedBy: {
+              source: 'event-log',
+              eventType:
+                urlAttribution.source === 'inferred'
+                  ? URL_ATTRIBUTION_INFERRED
+                  : USER_ORGANIZED_ITEM,
+              dot: { replicaId: urlAttribution.replicaId, seq: urlAttribution.seq },
+            },
+            confidence: urlAttribution.source === 'inferred' ? 'inferred' : 'asserted',
+            metadata: {
+              attributionSource: urlAttribution.source,
+              attributionOrigin: 'canonical-url',
+            },
+          });
+        } else {
+          upsertEdge(edges, {
+            kind: 'visit_in_workstream',
+            fromNodeId: nodeIdFor('timeline-visit', visitKey),
+            toNodeId: nodeIdFor('workstream', effectiveVisitWorkstreamId),
+            observedAt: entry.lastSeenAt,
+            producedBy: { source: 'timeline-projection' },
+            // 'inferred' — the active-workstream pointer at observation
+            // time is an inference about user intent, not a direct
+            // observation about the URL→workstream relationship. The
+            // sister `timeline_same_url_as_thread` edge nearby also
+            // uses 'inferred' for the same reason. The e2e suite at
+            // `connections-mvp-user-story.spec.ts:291` and downstream
+            // resolver code rely on this classification to decide
+            // whether to weight the edge as evidence.
+            confidence: 'inferred',
+          });
+        }
       }
       const threadId = threadIdByUrl.get(visitKey);
       if (threadId !== undefined) {
@@ -1350,9 +1709,7 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
     ) {
       // Same hydration for the opener — degrade gracefully when its
       // projection record is absent.
-      const openerRecord = input.tabSessionProjection.bySessionId.get(
-        instance.openerTabSessionId,
-      );
+      const openerRecord = input.tabSessionProjection.bySessionId.get(instance.openerTabSessionId);
       const openerLabel =
         openerRecord?.latestTitle ??
         hostFromUrl(openerRecord?.latestUrl) ??
@@ -1399,9 +1756,7 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
     // inventory.
     const lookupCanonical = instance.canonicalUrl ?? instance.url;
     const urlAttribution =
-      lookupCanonical === undefined
-        ? undefined
-        : input.urlProjection?.byCanonicalUrl.get(lookupCanonical)?.currentAttribution;
+      lookupCanonical === undefined ? undefined : currentUrlAttributionFor(input, lookupCanonical);
     const tabSessionAttribution = input.tabSessionProjection.bySessionId.get(
       instance.tabSessionId,
     )?.currentAttribution;
@@ -1431,8 +1786,10 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
     // Pick the effective attribution for the visit-instance: URL takes
     // precedence; tab-session is the fallback.
     const effective =
-      urlAttribution !== undefined && urlAttribution.workstreamId !== null
-        ? { ...urlAttribution, origin: 'canonical-url' as const }
+      urlAttribution !== undefined
+        ? urlAttribution.workstreamId === null
+          ? null
+          : { ...urlAttribution, origin: 'canonical-url' as const }
         : tabSessionAttribution !== undefined && tabSessionAttribution.workstreamId !== null
           ? { ...tabSessionAttribution, origin: 'tab-session' as const }
           : null;
@@ -2066,6 +2423,7 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
   // -------------------------------------------------------------------
   if (input.topicRevision !== undefined) {
     const topicRevision = input.topicRevision;
+    const topicUserActions = buildTopicActionProjection(input.events);
     const topicProducedBy = {
       source: 'topic-clusterer',
       revisionId: topicRevision.revisionId,
@@ -2079,9 +2437,12 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
       return typeof value === 'string' && value.length > 0 ? value : undefined;
     };
 
-    for (const topic of [...topicRevision.topics].sort((a, b) =>
-      a.topicId < b.topicId ? -1 : a.topicId > b.topicId ? 1 : 0,
-    )) {
+    const projectedTopics = projectedTopicsForUserActions(
+      [...topicRevision.topics].sort((a, b) => compareString(a.topicId, b.topicId)),
+      topicUserActions,
+    );
+    const projectedTopicIds = new Set(projectedTopics.map((topic) => topic.topicId));
+    for (const topic of projectedTopics) {
       const topicNode = upsertNode(nodes, {
         kind: 'topic',
         key: topic.topicId,
@@ -2110,6 +2471,38 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
           observedAt: topic.metadata.lastObservedAt,
           producedBy: topicProducedBy,
           confidence: 'inferred',
+          metadata: {
+            affiliation: 'primary',
+          },
+        });
+      }
+
+      for (const affiliation of topic.secondaryAffiliations) {
+        upsertNode(nodes, {
+          kind: 'timeline-visit',
+          key: affiliation.canonicalUrl,
+          label: affiliation.canonicalUrl,
+          observedAt: topic.metadata.lastObservedAt,
+          metadata: {
+            canonicalUrl: affiliation.canonicalUrl,
+          },
+        });
+        upsertEdge(edges, {
+          kind: 'visit_in_topic',
+          fromNodeId: nodeIdFor('timeline-visit', affiliation.canonicalUrl),
+          toNodeId: nodeIdFor('topic', topic.topicId),
+          observedAt: topic.metadata.lastObservedAt,
+          producedBy: topicProducedBy,
+          confidence: 'inferred',
+          metadata: {
+            affiliation: 'secondary',
+            score: affiliation.score,
+            reasons: affiliation.reasons,
+            supportCount: affiliation.supportCount,
+            maxCosine: affiliation.maxCosine,
+            lexicalScore: affiliation.lexicalScore,
+            reciprocalSupport: affiliation.reciprocalSupport,
+          },
         });
       }
 
@@ -2143,6 +2536,7 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
     }
 
     for (const lineage of topicRevision.lineage) {
+      if (!projectedTopicIds.has(lineage.toTopicId)) continue;
       trackObservedAt(lineage.observedAt);
       upsertEdge(edges, {
         kind: 'topic.lineage',
@@ -2708,6 +3102,9 @@ export const subgraphForNode = (
     updatedAt: snapshot.updatedAt,
     nodeCount: keptNodes.length,
     edgeCount: keptEdges.size,
+    ...(snapshot.snapshotRevision === undefined
+      ? {}
+      : { snapshotRevision: snapshot.snapshotRevision }),
   };
 };
 

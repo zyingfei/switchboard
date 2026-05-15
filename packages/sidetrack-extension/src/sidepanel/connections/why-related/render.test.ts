@@ -20,4 +20,15 @@ describe('renderReason', () => {
 
     expect(first).toBe(second);
   });
+
+  it('renders aggregated similarity evidence without repeating rows', () => {
+    expect(
+      renderReason({
+        code: 'COSINE_ABOVE_THRESHOLD',
+        cosine: 0.9255,
+        threshold: 0.85,
+        matchCount: 6,
+      }),
+    ).toBe('Title similarity up to 0.93 across 6 pages (threshold 0.85)');
+  });
 });
