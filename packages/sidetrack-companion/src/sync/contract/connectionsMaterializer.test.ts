@@ -55,11 +55,20 @@ const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 
 describe('connectionsMaterializer (Class B, consumer-only)', () => {
   let vaultRoot: string;
+  // The idf-rkn-split shadow clustering is now ON by default. These
+  // tests assert the baseline active-revision behavior (union-find /
+  // HDBSCAN selection / skip-gate), so default the suite to the
+  // baseline; the shadow-specific test opts back in explicitly.
+  let prevShadowFlag: string | undefined;
   beforeEach(async () => {
     vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-connections-mat-'));
+    prevShadowFlag = process.env['SIDETRACK_TOPIC_SHADOW_CANDIDATE'];
+    process.env['SIDETRACK_TOPIC_SHADOW_CANDIDATE'] = 'off';
   });
   afterEach(async () => {
     await rm(vaultRoot, { recursive: true, force: true });
+    if (prevShadowFlag === undefined) delete process.env['SIDETRACK_TOPIC_SHADOW_CANDIDATE'];
+    else process.env['SIDETRACK_TOPIC_SHADOW_CANDIDATE'] = prevShadowFlag;
   });
 
   it('catchUp rebuilds the snapshot from event log alone (replay-recoverable)', async () => {

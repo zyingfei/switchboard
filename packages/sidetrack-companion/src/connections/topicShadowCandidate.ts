@@ -648,8 +648,16 @@ const perVisitChurn = (baseline: TopicRevision, shadow: TopicRevision): number =
   return changed / baselineTopicByVisit.size;
 };
 
-export const shouldBuildTopicShadowCandidate = (): boolean =>
-  process.env[TOPIC_SHADOW_CANDIDATE_ENV] === TOPIC_SHADOW_IDF_RKN_SPLIT_CANDIDATE;
+// Default ON: idf-rkn-split is the production topic clustering (the
+// legacy union-find baseline starves on raw e5 cosine -> ~0 topics).
+// Set SIDETRACK_TOPIC_SHADOW_CANDIDATE=off (or false/0/none) to fall
+// back to the baseline. `idf-rkn-split` and unset both mean on.
+const TOPIC_SHADOW_DISABLED_VALUES = new Set(['off', 'false', '0', 'none']);
+export const shouldBuildTopicShadowCandidate = (): boolean => {
+  const raw = process.env[TOPIC_SHADOW_CANDIDATE_ENV];
+  if (raw === undefined) return true;
+  return !TOPIC_SHADOW_DISABLED_VALUES.has(raw.trim().toLowerCase());
+};
 
 export const buildTopicShadowCandidate = async (
   input: BuildTopicShadowCandidateInput,
