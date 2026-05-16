@@ -264,7 +264,10 @@ import {
 } from '../vault/reviewDrafts.js';
 import { runAutoUpdate } from '../system/autoUpdate.js';
 import { collectHealth, type CaptureWarningHealth, type HealthReport } from '../system/health.js';
-import { collectWorkGraphHealth } from '../system/workGraphHealth.js';
+import {
+  collectWorkGraphHealth,
+  type ConnectionsDiagnosticSnapshot,
+} from '../system/workGraphHealth.js';
 import { checkLatestVersion, type UpdateAdvisory } from '../system/versionCheck.js';
 import { COMPANION_VERSION } from '../version.js';
 import { maybeRetrainClosestVisitRanker, runMaybeRetrainInWorker } from '../ranker/retrain.js';
@@ -431,6 +434,11 @@ export interface CompanionHttpConfig {
       readonly pending: boolean;
     }
   >;
+  // Live connections materializer diagnostic state that is not persisted
+  // in diagnostics/latest.json, surfaced under /v1/system/health
+  // workGraph.candidates. Optional because route tests often run
+  // without the runtime materializer.
+  readonly connectionsDiagnostics?: () => ConnectionsDiagnosticSnapshot;
   // Local monotonic projection-change feed. Browsers resume polling
   // with a numeric `sinceSeq` cursor; the counter never moves
   // backward and is independent of any host's wall clock.
@@ -2618,6 +2626,9 @@ const routes: readonly RouteDefinition[] = [
               collectWorkGraphHealth({
                 vaultRoot,
                 ...(context.eventLog === undefined ? {} : { eventLog: context.eventLog }),
+                ...(context.connectionsDiagnostics === undefined
+                  ? {}
+                  : { connectionsDiagnostics: context.connectionsDiagnostics }),
               }),
             ...syncSummaryDeps(context.replica, context.sync, context.syncMaterializerHealth),
           }),

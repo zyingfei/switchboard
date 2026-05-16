@@ -140,9 +140,24 @@ interface WorkGraphTopicProducerHealth {
   readonly lineageCount: number;
 }
 
+type DiagnosticCandidateMetric = string | number | boolean | null;
+
+interface DiagnosticCandidate {
+  readonly id: string;
+  readonly family: 'topic' | 'similarity' | 'ranker' | 'content-lane' | 'reconcile' | 'quality';
+  readonly lane: 'active' | 'standby' | 'shadow' | 'diagnostic';
+  readonly servingImpact: 'serving' | 'not-serving' | 'observe-only';
+  readonly status: 'ok' | 'off' | 'pending' | 'warning' | 'alarm' | 'unavailable';
+  readonly reason: string | null;
+  readonly revisionId: string | null;
+  readonly asOf: string | null;
+  readonly metrics: Readonly<Record<string, DiagnosticCandidateMetric>>;
+}
+
 interface WorkGraphHealth {
   readonly ranker: WorkGraphRankerHealth;
   readonly topicProducer?: WorkGraphTopicProducerHealth;
+  readonly candidates?: readonly DiagnosticCandidate[];
 }
 
 interface HealthReport {
@@ -362,6 +377,31 @@ const activityText = (event: RecallActivityEvent): string => {
 
 const fmtNum = (n: number | null | undefined, digits = 0): string =>
   n === null || n === undefined ? 'no signal yet' : n.toFixed(digits);
+
+const formatCandidateMetric = (value: DiagnosticCandidateMetric | undefined): string => {
+  if (value === null || value === undefined) return 'no signal yet';
+  if (typeof value === 'boolean') return value ? 'yes' : 'no';
+  if (typeof value === 'number') return Number.isInteger(value) ? String(value) : value.toFixed(3);
+  return value.length === 0 ? 'no signal yet' : value;
+};
+
+const formatCandidateStatus = (status: DiagnosticCandidate['status']): string => {
+  if (status === 'off') return 'disabled';
+  if (status === 'unavailable') return 'unavailable';
+  return status;
+};
+
+const candidateRowClass = (status: DiagnosticCandidate['status']): string | undefined =>
+  status === 'warning' || status === 'alarm' ? 'warn' : undefined;
+
+const candidateStatusStamp = (status: DiagnosticCandidate['status']): string =>
+  status === 'ok' ? 'deterministic' : status === 'alarm' ? 'signal' : 'partial';
+
+const metricSummary = (candidate: DiagnosticCandidate): string =>
+  Object.entries(candidate.metrics)
+    .slice(0, 4)
+    .map(([key, value]) => `${key}=${formatCandidateMetric(value)}`)
+    .join(' · ');
 
 type PipelineStatus = 'ok' | 'warn' | 'err' | 'idle' | 'unavailable';
 interface PipelineStage {
@@ -621,6 +661,26 @@ export function HealthPanel({
   const lastProvider = providerRows.find((row) => row.lastCaptureAt !== null);
   const window1h = report?.capture.window1h;
   const activity = report?.recall.activity;
+  const candidates = report?.workGraph?.candidates ?? [];
+  const activeServingCandidateAlarm = candidates.some(
+    (candidate) =>
+      candidate.status === 'alarm' &&
+      candidate.lane === 'active' &&
+      candidate.servingImpact === 'serving',
+  );
+  const candidateWarningCount = candidates.filter(
+    (candidate) =>
+      candidate.status === 'warning' ||
+      (candidate.status === 'alarm' &&
+        !(candidate.lane === 'active' && candidate.servingImpact === 'serving')),
+  ).length;
+  const disabledCandidateCount = candidates.filter(
+    (candidate) => candidate.status === 'off',
+  ).length;
+  const shadowCandidateCount = candidates.filter((candidate) => candidate.lane === 'shadow').length;
+  const standbyCandidateCount = candidates.filter(
+    (candidate) => candidate.lane === 'standby',
+  ).length;
 
   // Pipeline-stage rollup. Each entry describes one logical stage in
   // the capture → … → sync flow. 'unavailable' = the server could not
@@ -753,6 +813,26 @@ export function HealthPanel({
             ? 'Invalid model'
             : 'No snapshot';
 
+    const experimentsStatus: PipelineStatus = workGraphUnavailable
+      ? 'unavailable'
+      : candidates.length === 0
+        ? 'idle'
+        : activeServingCandidateAlarm
+          ? 'err'
+          : candidateWarningCount > 0
+            ? 'warn'
+            : 'ok';
+    const experimentsHead = workGraphUnavailable
+      ? 'Unavailable'
+      : candidates.length === 0
+        ? 'No signal yet'
+        : `${String(shadowCandidateCount)} shadow · ${String(standbyCandidateCount)} standby`;
+    const experimentsDetail = workGraphUnavailable
+      ? 'unavailable — metrics didn’t load'
+      : candidates.length === 0
+        ? 'candidate lanes not reported'
+        : `${String(candidateWarningCount)} warning${candidateWarningCount === 1 ? '' : 's'} · ${String(disabledCandidateCount)} disabled`;
+
     const relay = report.sync?.relay;
     const syncStatus: PipelineStatus =
       relay === undefined
@@ -865,6 +945,13 @@ export function HealthPanel({
         detail: rankerDetail,
       },
       {
+        id: 'experiments',
+        name: 'Experiments',
+        status: experimentsStatus,
+        head: experimentsHead,
+        detail: experimentsDetail,
+      },
+      {
         id: 'sync',
         name: 'Sync',
         status: syncStatus,
@@ -893,7 +980,7 @@ export function HealthPanel({
 
   // Active alarms — derive from the pipeline stages that aren't healthy
   // (err → signal, warn → amber). Links back into the same drill-down.
-  const alarms = pipelineStages
+  const pipelineAlarms = pipelineStages
     .filter((s) => s.status === 'err' || s.status === 'warn' || s.status === 'unavailable')
     .map((s) => ({
       stage: s.id,
@@ -902,6 +989,27 @@ export function HealthPanel({
       head: s.head,
       meta: s.detail,
     }));
+  const candidateAlarms = candidates
+    .filter(
+      (candidate) =>
+        candidate.status === 'warning' ||
+        candidate.status === 'alarm' ||
+        (candidate.status === 'unavailable' && candidate.lane === 'active'),
+    )
+    .map((candidate) => {
+      const signal =
+        candidate.status === 'alarm' &&
+        candidate.lane === 'active' &&
+        candidate.servingImpact === 'serving';
+      return {
+        stage: 'experiments',
+        sev: signal ? 'signal' : 'amber',
+        name: `${candidate.family} · ${candidate.lane}`,
+        head: formatCandidateStatus(candidate.status),
+        meta: `${candidate.id}${candidate.reason === null ? '' : ` · ${candidate.reason}`}`,
+      };
+    });
+  const alarms = [...pipelineAlarms, ...candidateAlarms];
 
   const copyDiagnostics = () => {
     if (report === null) return;
@@ -925,6 +1033,161 @@ export function HealthPanel({
   const node = pipelineStages.find((n) => n.id === stage) ?? pipelineStages[0];
 
   // ── Drill-downs ──────────────────────────────────────────────────
+
+  const renderExperimentsDrill = () => {
+    const activeServingRows = candidates.filter(
+      (candidate) => candidate.servingImpact === 'serving',
+    );
+    const diagnosticRows = candidates.filter((candidate) => candidate.lane === 'diagnostic');
+    const contentLane = candidates.find(
+      (candidate) => candidate.id === 'content-lane.dirty-source-queue',
+    );
+    const rankerMethodology = candidates.find(
+      (candidate) => candidate.id === 'ranker.methodology-spine',
+    );
+    const driftSidecar = candidates.find(
+      (candidate) => candidate.id === 'diagnostic.drift-sidecar',
+    );
+    const shadowHistory = focusHealth?.history ?? [];
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+        <h2 className="sx-drill-title">Experiments</h2>
+
+        {candidates.length === 0 ? (
+          <div className="sx-callout warn">
+            Candidate lanes are not reported by this companion. Disabled and unavailable paths are
+            intentionally not rendered as zero.
+          </div>
+        ) : null}
+
+        <div className="sx-tilegrid" style={{ gridTemplateColumns: 'repeat(4, 1fr)' }}>
+          <div className={`sx-tile${activeServingCandidateAlarm ? ' alarm' : ''}`}>
+            <div className="lbl">Serving rows</div>
+            <div className="num">{String(activeServingRows.length)}</div>
+            <div className="foot">red only when an active serving candidate alarms</div>
+          </div>
+          <div className={`sx-tile${candidateWarningCount > 0 ? ' warn' : ''}`}>
+            <div className="lbl">Warnings</div>
+            <div className="num">{String(candidateWarningCount)}</div>
+            <div className="foot">promotion blockers · drift · backlogs</div>
+          </div>
+          <div className="sx-tile">
+            <div className="lbl">Disabled</div>
+            <div className="num">{String(disabledCandidateCount)}</div>
+            <div className="foot">standby/off is informational</div>
+          </div>
+          <div className="sx-tile">
+            <div className="lbl">Diagnostic</div>
+            <div className="num">{String(diagnosticRows.length)}</div>
+            <div className="foot">observe-only</div>
+          </div>
+        </div>
+
+        <table className="sx-monotbl" data-testid="hp-experiments-table">
+          <thead>
+            <tr>
+              <th>Family</th>
+              <th>Lane</th>
+              <th>Serving impact</th>
+              <th>Candidate/revision</th>
+              <th>Status</th>
+              <th>Reason</th>
+              <th>Last observed</th>
+              <th>What changed</th>
+            </tr>
+          </thead>
+          <tbody>
+            {candidates.map((candidate) => (
+              <tr key={candidate.id} className={candidateRowClass(candidate.status)}>
+                <td>{candidate.family}</td>
+                <td>{candidate.lane}</td>
+                <td>{candidate.servingImpact}</td>
+                <td className="mono">{candidate.revisionId ?? candidate.id}</td>
+                <td>
+                  <span className={`sx-stamp ${candidateStatusStamp(candidate.status)}`}>
+                    {formatCandidateStatus(candidate.status)}
+                  </span>
+                </td>
+                <td>{candidate.reason ?? '—'}</td>
+                <td>{candidate.asOf === null ? 'no signal yet' : formatWhen(candidate.asOf)}</td>
+                <td className="mono">{metricSummary(candidate) || 'no signal yet'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+
+        <div className="sx-receipt">
+          <div className="sx-receipt-head">
+            <span className="sx-stamp deterministic">Receipts</span>
+            <span className="sx-mono sx-dim" style={{ flex: 1 }}>
+              workGraph.candidates[] · focus-health.history
+            </span>
+          </div>
+          <dl>
+            <ReceiptRow
+              dt="Content lane"
+              dd={`dirty ${formatCandidateMetric(
+                contentLane?.metrics.dirtySourceCount,
+              )} · tombstoned ${formatCandidateMetric(
+                contentLane?.metrics.tombstonedSourceCount,
+              )} · oldest ${formatCandidateMetric(contentLane?.metrics.oldestDirtySourceAgeMs)}`}
+            />
+            <ReceiptRow
+              dt="Ranker ship gate"
+              dd={`status ${formatCandidateMetric(
+                rankerMethodology?.metrics.shipGateStatus,
+              )} · enforced ${formatCandidateMetric(
+                rankerMethodology?.metrics.servingGateEnforced,
+              )}`}
+            />
+            <ReceiptRow
+              dt="Drift"
+              dd={`status ${formatCandidateMetric(
+                driftSidecar?.metrics.driftStatus,
+              )} · tripped ${formatCandidateMetric(
+                driftSidecar?.metrics.trippedSignalCount,
+              )} · warning ${formatCandidateMetric(driftSidecar?.metrics.warningSignalCount)}`}
+            />
+          </dl>
+        </div>
+
+        <h3 className="sx-h">Shadow trend</h3>
+        {shadowHistory.length === 0 ? (
+          <div className="sx-callout">
+            No ring-buffer history yet. The panel reports <em>no signal yet</em> rather than drawing
+            a synthetic trend.
+          </div>
+        ) : (
+          <table className="sx-monotbl">
+            <thead>
+              <tr>
+                <th>Drain</th>
+                <th className="right">Shadow topics</th>
+                <th className="right">Max share</th>
+                <th className="right">Noise</th>
+                <th className="right">Adjacent churn</th>
+              </tr>
+            </thead>
+            <tbody>
+              {shadowHistory
+                .slice()
+                .reverse()
+                .slice(0, 8)
+                .map((sample, index) => (
+                  <tr key={`${sample.at}-${String(index)}`}>
+                    <td>{formatWhen(sample.at)}</td>
+                    <td className="right">{sample.shadowTopicCount ?? '—'}</td>
+                    <td className="right">{fmtNum(sample.shadowMaxTopicShare, 3)}</td>
+                    <td className="right">{fmtNum(sample.noiseShare, 2)}</td>
+                    <td className="right">{fmtNum(sample.adjacentPerVisitChurn, 2)}</td>
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    );
+  };
 
   const renderTopicsDrill = () => {
     const tp = report?.workGraph?.topicProducer;
@@ -1654,6 +1917,8 @@ export function HealthPanel({
         return renderTopicsDrill();
       case 'ranker':
         return renderRankerDrill();
+      case 'experiments':
+        return renderExperimentsDrill();
       case 'capture':
         return renderCaptureDrill();
       case 'vault':

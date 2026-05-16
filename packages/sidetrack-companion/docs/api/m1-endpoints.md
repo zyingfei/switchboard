@@ -63,6 +63,11 @@ capture, recall, and service status, newer companions may include:
 - `recall.activity.lastIndexedAt`, `lastIndexedCount`, and
   `lastIndexedThreadIds`: the latest indexing work, with thread ids capped for
   diagnostics
+- `workGraph.candidates[]`: normalized active, standby, shadow, and diagnostic
+  candidate-lane rows for the health panel. Each row includes `family`, `lane`,
+  `servingImpact`, `status`, `reason`, `revisionId`, `asOf`, and JSON-safe
+  `metrics`. Disabled and unavailable candidates are reported explicitly; they
+  are never represented as zero counts.
 
 Recall activity intentionally records query length and result count, not raw
 query text.
