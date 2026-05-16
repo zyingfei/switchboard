@@ -13,12 +13,14 @@ import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import type { UrlProjection, UrlVisitRecord } from '../urls/projection.js';
 
 import {
+  attachDriftReport,
   collectMaterializerDiagnostics,
   createMaterializerDiagnosticsStore,
   summarizeMaterializerDiagnostics,
   type MaterializerDiagnostics,
   type MaterializerDiagnosticsInput,
 } from './materializerDiagnostics.js';
+import type { DriftStateStore, DriftPersistedState } from './drift/driftStateStore.js';
 import type {
   ConnectionEdge,
   ConnectionNode,
@@ -585,5 +587,141 @@ describe('createMaterializerDiagnosticsStore', () => {
       '2026-05-10T00-00-00-000Z.json',
       '2026-05-10T00-00-01-000Z.json',
     ]);
+  });
+});
+
+describe('attachDriftReport (drift layer wiring)', () => {
+  const memoryStore = (): DriftStateStore & {
+    current: () => DriftPersistedState | null;
+  } => {
+    let saved: DriftPersistedState | null = null;
+    return {
+      read: (): Promise<DriftPersistedState | null> => Promise.resolve(saved),
+      write: (state: DriftPersistedState): Promise<void> => {
+        saved = structuredClone(state);
+        return Promise.resolve();
+      },
+      current: (): DriftPersistedState | null => saved,
+    };
+  };
+
+  it('folds a drift report into the diagnostics without throwing', async () => {
+    const diagnostics = collectMaterializerDiagnostics(baseInput());
+    const store = memoryStore();
+    const result = await attachDriftReport({
+      diagnostics,
+      topics: [],
+      similarityEdges: [],
+      stateStore: store,
+    });
+    const drift = result.diagnostics.drift;
+    expect(drift).toBeDefined();
+    expect(['stable', 'warning', 'drift']).toContain(drift?.status);
+    expect(result.statePersisted).toBe(true);
+    expect(store.current()).not.toBeNull();
+    // Base diagnostics fields are untouched.
+    expect(result.diagnostics.snapshot).toEqual(diagnostics.snapshot);
+  });
+
+  it('summary line includes the drift status once attached', async () => {
+    const diagnostics = collectMaterializerDiagnostics(baseInput());
+    const result = await attachDriftReport({
+      diagnostics,
+      topics: [],
+      similarityEdges: [],
+      stateStore: memoryStore(),
+    });
+    const summary = summarizeMaterializerDiagnostics(result.diagnostics);
+    expect(summary).toContain('drift=');
+    expect(summary).toContain('silhouette=');
+  });
+
+  it('persists detector state across successive drains', async () => {
+    const store = memoryStore();
+    for (let i = 0; i < 5; i += 1) {
+      const diagnostics = collectMaterializerDiagnostics(baseInput());
+      await attachDriftReport({
+        diagnostics,
+        topics: [],
+        similarityEdges: [],
+        stateStore: store,
+      });
+    }
+    const state = store.current();
+    expect(state).not.toBeNull();
+    // Four always-available signals have accumulated detector windows.
+    expect(Object.keys(state?.signals ?? {}).sort()).toEqual(
+      ['similarityEdgeCount', 'snapshotEdgeCount', 'topicCount', 'topicMemberCount'].sort(),
+    );
+  });
+
+  it('never throws and yields a stable fallback when the store explodes', async () => {
+    const diagnostics = collectMaterializerDiagnostics(baseInput());
+    const explodingStore: DriftStateStore = {
+      read: (): Promise<DriftPersistedState | null> => Promise.reject(new Error('boom-read')),
+      write: (): Promise<void> => Promise.reject(new Error('boom-write')),
+    };
+    const result = await attachDriftReport({
+      diagnostics,
+      topics: [],
+      similarityEdges: [],
+      stateStore: explodingStore,
+    });
+    // loadDriftMonitor swallows the read error → fresh monitor still
+    // produces a report; the write error surfaces as stateError but
+    // never throws.
+    expect(result.diagnostics.drift).toBeDefined();
+    expect(result.diagnostics.drift?.status).toBe('stable');
+    expect(result.statePersisted).toBe(false);
+    expect(result.stateError).toBe('boom-write');
+  });
+
+  it('feeds shadow signals when the shadow block is present', async () => {
+    const diagnostics: MaterializerDiagnostics = {
+      ...collectMaterializerDiagnostics(baseInput()),
+      shadowVsBaseline: {
+        enabled: true,
+        candidate: 'idf-rkn-split',
+        activeAlgorithmVersion: 'topic-revision:v1:union-find',
+        shadowAlgorithmVersion: 'topic-revision:shadow:idf-rkn-split',
+        baselineRevisionId: 'b',
+        shadowRevisionId: 's',
+        edgeCountBeforePruning: 100,
+        edgeCountAfterPruning: 40,
+        reciprocalK: 10,
+        minLexicalScore: 0.05,
+        workstreamHardUnionEdgesRemoved: 0,
+        inThreadRelationsRetained: 0,
+        highDfTermsSuppressed: 0,
+        highDfTerms: [],
+        baselineTopicCount: 3,
+        shadowTopicCount: 4,
+        topicCountDelta: 1,
+        baselineMaxTopicSize: 10,
+        shadowMaxTopicSize: 7,
+        maxTopicSizeDelta: -3,
+        baselineMaxTopicShare: 0.5,
+        shadowMaxTopicShare: 0.35,
+        maxShareDelta: -0.15,
+        eligibleVisitCount: 20,
+        shadowAssignedVisitCount: 18,
+        noiseShare: 0.1,
+        splitParentCount: 1,
+        splitAcceptedCount: 1,
+        secondaryAffiliationCount: 0,
+        perVisitChurn: 0.2,
+        runtimeMs: 1,
+      },
+    };
+    const store = memoryStore();
+    await attachDriftReport({
+      diagnostics,
+      topics: [],
+      similarityEdges: [],
+      stateStore: store,
+    });
+    const signals = Object.keys(store.current()?.signals ?? {});
+    expect(signals).toContain('noiseShare');
+    expect(signals).toContain('perVisitChurn');
   });
 });

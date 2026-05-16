@@ -1,3 +1,5 @@
+import { Readability } from '@mozilla/readability';
+
 import type {
   PageContentExtractedPayload,
   PageContentExtractionStrategy,
@@ -108,6 +110,95 @@ const classifyQuality = (signals: PageContentQualitySignals): PageContentQuality
   return 'low';
 };
 
+/**
+ * Internal candidate produced by a single extraction strategy. `strategy`
+ * stays within the existing {@link PageContentExtractionStrategy} union so the
+ * companion's quality classifier and coverage projection are unchanged — the
+ * Readability strategy reports itself as `reader-mode` (it is a higher-fidelity
+ * reader-mode extractor of the same conceptual strategy).
+ */
+interface ExtractionCandidate {
+  readonly text: string;
+  readonly strategy: PageContentExtractionStrategy;
+  readonly contentToDomRatio: number;
+  readonly boilerplateFraction: number;
+}
+
+const QUALITY_TIER_RANK: Readonly<Record<PageContentQuality, number>> = {
+  high: 2,
+  medium: 1,
+  low: 0,
+};
+
+// Deterministic tiebreak when two candidates land in the same quality tier.
+const STRATEGY_PRIORITY: Readonly<Record<PageContentExtractionStrategy, number>> = {
+  'manual-selection': 3,
+  'reader-mode': 2,
+  'visible-dom': 1,
+};
+
+const candidateSignals = (candidate: ExtractionCandidate): PageContentQualitySignals => ({
+  extractedWordCount: wordCount(candidate.text),
+  contentToDomRatio: Number(candidate.contentToDomRatio.toFixed(4)),
+  boilerplateFraction: Number(candidate.boilerplateFraction.toFixed(4)),
+  extractionStrategy: candidate.strategy,
+});
+
+/**
+ * Ensemble selector: pick the candidate that maximizes the quality tier the
+ * companion would assign (mirrors `classifyPageContentQuality` thresholds via
+ * the local {@link classifyQuality}). Deterministic tiebreak inside a tier:
+ * higher word count, then strategy priority, then longer text, then earlier
+ * insertion order. Returns `null` when no candidate has any text so callers
+ * fall back to the prior single-strategy behavior with zero regression.
+ */
+const selectBestCandidate = (
+  candidates: readonly ExtractionCandidate[],
+): ExtractionCandidate | null => {
+  const usable = candidates.filter((candidate) => candidate.text.length > 0);
+  if (usable.length === 0) return null;
+  return usable.reduce((best, candidate) => {
+    const bestTier = QUALITY_TIER_RANK[classifyQuality(candidateSignals(best))];
+    const candidateTier = QUALITY_TIER_RANK[classifyQuality(candidateSignals(candidate))];
+    if (candidateTier !== bestTier) return candidateTier > bestTier ? candidate : best;
+    const bestWords = wordCount(best.text);
+    const candidateWords = wordCount(candidate.text);
+    if (candidateWords !== bestWords) return candidateWords > bestWords ? candidate : best;
+    const bestStrategy = STRATEGY_PRIORITY[best.strategy];
+    const candidateStrategy = STRATEGY_PRIORITY[candidate.strategy];
+    if (candidateStrategy !== bestStrategy) {
+      return candidateStrategy > bestStrategy ? candidate : best;
+    }
+    if (candidate.text.length !== best.text.length) {
+      return candidate.text.length > best.text.length ? candidate : best;
+    }
+    return best;
+  });
+};
+
+/**
+ * Run Mozilla Readability over a clone of the live document. Readability
+ * mutates the document it parses, so we always clone first. Returns `null`
+ * when Readability declines or throws — the ensemble then degrades to the
+ * existing heuristic + visible-dom candidates (zero regression).
+ */
+const readabilityCandidate = (domTextLength: number): ExtractionCandidate | null => {
+  try {
+    const cloned = document.cloneNode(true) as Document;
+    const article = new Readability(cloned).parse();
+    const text = normalizeWhitespace(article?.textContent ?? '');
+    if (text.length === 0) return null;
+    return {
+      text,
+      strategy: 'reader-mode',
+      contentToDomRatio: domTextLength === 0 ? 1 : text.length / domTextLength,
+      boilerplateFraction: repeatedLineFraction(text),
+    };
+  } catch {
+    return null;
+  }
+};
+
 const hasSensitiveEditableState = (): boolean => {
   const password = document.querySelector('input[type="password"]');
   if (password !== null) return true;
@@ -158,27 +249,55 @@ const extractTextNow = async (
       )),
     };
   }
+  const headingHash = await headingSignature();
+  const headingHashPart = headingHash === undefined ? {} : { headingSignatureHash: headingHash };
+
+  // Ensemble: gather every strategy that yields output, then pick the
+  // candidate that maximizes the quality tier the companion would assign.
+  const candidates: ExtractionCandidate[] = [];
   const reader = pickReaderElement();
   if (reader !== null) {
-    const text = normalizeWhitespace(visibleText(reader));
+    const readerText = normalizeWhitespace(visibleText(reader));
+    if (readerText.length > 0) {
+      candidates.push({
+        text: readerText,
+        strategy: 'reader-mode',
+        contentToDomRatio: domText.length === 0 ? 1 : readerText.length / domText.length,
+        boilerplateFraction: repeatedLineFraction(readerText),
+      });
+    }
+  }
+  const readability = readabilityCandidate(domText.length);
+  if (readability !== null) candidates.push(readability);
+  if (domText.length > 0) {
+    candidates.push({
+      text: domText,
+      strategy: 'visible-dom',
+      contentToDomRatio: 1,
+      boilerplateFraction: repeatedLineFraction(domText),
+    });
+  }
+
+  const best = selectBestCandidate(candidates);
+  if (best !== null) {
     return {
-      text,
-      strategy: 'reader-mode',
-      contentToDomRatio: domText.length === 0 ? 1 : text.length / domText.length,
-      boilerplateFraction: repeatedLineFraction(text),
-      ...(await headingSignature().then((hash) =>
-        hash === undefined ? {} : { headingSignatureHash: hash },
-      )),
+      text: best.text,
+      strategy: best.strategy,
+      contentToDomRatio: best.contentToDomRatio,
+      boilerplateFraction: best.boilerplateFraction,
+      ...headingHashPart,
     };
   }
+
+  // Zero-regression fallback: no strategy produced text — preserve the prior
+  // visible-dom shape (empty text triggers the existing "no readable text"
+  // error path downstream).
   return {
     text: domText,
     strategy: 'visible-dom',
     contentToDomRatio: 1,
     boilerplateFraction: repeatedLineFraction(domText),
-    ...(await headingSignature().then((hash) =>
-      hash === undefined ? {} : { headingSignatureHash: hash },
-    )),
+    ...headingHashPart,
   };
 };
 

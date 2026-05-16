@@ -11,6 +11,16 @@
 // continue to deserialize. A reader that finds them missing treats
 // the entry as `extractor='legacy', extractorVersion='0.0.0'` —
 // any newer revision dominates by the active-revision policy.
+
+// Page-content quality tier. Structurally identical to
+// page-content's `PageContentQuality` but re-declared locally so the
+// recall module stays self-contained (the same reason ChunkMetadata
+// re-declares its provenance fields instead of importing extraction
+// types). The classifier that produces this lives in
+// `src/page-content/quality.ts`; recall is only a consumer of the
+// label, never its owner.
+export type ChunkQualityTier = 'high' | 'medium' | 'low';
+
 export interface ChunkMetadata {
   readonly sourceBacId: string;
   readonly provider?: string;
@@ -36,6 +46,13 @@ export interface ChunkMetadata {
   readonly inputHash?: string;
   readonly outputHash?: string;
   readonly chunkerVersion?: string;
+  // Page-content quality tier (high/medium/low) as classified by
+  // `classifyPageContentQuality`. Optional for forward-compat with
+  // legacy V3 entries + chat-turn chunks that never carried a tier;
+  // a reader that finds it missing treats the chunk as the neutral
+  // 'medium' tier so quality is a pure tiebreak that never penalizes
+  // un-tiered content (see QUALITY_TIEBREAK_WEIGHT below).
+  readonly quality?: ChunkQualityTier;
 }
 
 export interface IndexEntry {
@@ -83,6 +100,38 @@ export interface RankedItem {
   readonly metadata?: ChunkMetadata;
   readonly snippet?: string;
   readonly why?: readonly string[];
+  // Structured "why this hit" — the same signals `why` renders as
+  // prose, exposed as numbers so callers (eval harness, debug panel)
+  // can reason about ranking without string-parsing. Only populated
+  // by rankHybrid; the vector-only path leaves it absent so the
+  // back-compat shape is byte-identical.
+  readonly explain?: ExplainBreakdown;
+}
+
+export interface ExplainBreakdown {
+  // 1-based position in the dense (vector) list, absent if the chunk
+  // never appeared there.
+  readonly vectorRank?: number;
+  // 1-based position in the sparse (lexical/minisearch) list, absent
+  // if the chunk never appeared there.
+  readonly lexicalRank?: number;
+  // Reciprocal-rank-fusion contributions BEFORE freshness/quality
+  // layering — i.e. 1/(k+rank) for each list (0 when absent).
+  readonly rrfVector: number;
+  readonly rrfLexical: number;
+  // Pure RRF sum (rrfVector + rrfLexical) — the relevance backbone
+  // that quality + freshness only nudge around.
+  readonly fusion: number;
+  // Final score after the freshness + quality multipliers. Always
+  // equals the RankedItem.score for the same result.
+  readonly fusedScore: number;
+  // Freshness band [0.3, 1] and its additive contribution to score.
+  readonly freshness: number;
+  readonly freshnessContribution: number;
+  // Quality tier used in the tiebreak ('medium' when the chunk
+  // carried no tier) and its additive contribution to score.
+  readonly qualityTier: ChunkQualityTier;
+  readonly qualityContribution: number;
 }
 
 import type { AnnVectorIndex } from './ann-index.js';
@@ -195,6 +244,41 @@ import MiniSearch, { type SearchResult } from 'minisearch';
 // signal.
 const RRF_K = 60;
 const FRESHNESS_BOOST_WEIGHT = 0.05;
+// Quality tiebreak. Bounded the same way freshness is: a small
+// additive nudge proportional to the fusion score, NOT a multiplier
+// that can reorder chunks across a meaningful relevance gap.
+//
+// Calibration (why this exact band). The per-chunk contribution is
+// QUALITY_TIEBREAK_WEIGHT × qCentered × fusion with qCentered ∈
+// [-0.5, +0.5], so the max score swing between two chunks (high vs
+// low) is w × 1.0 × fusion. RRF assigns even two *identically
+// relevant* chunks adjacent ranks (r and r+1) by arbitrary
+// insertion order, so an exact relevance tie still shows up as a
+// spurious 1-rank gap. For quality to act as a real tiebreak it
+// must be able to overturn exactly that 1-rank artifact, while
+// never overturning a genuine ≥2-rank relevance lead. Solving both
+// inequalities at the top of the list (worst case, gaps largest;
+// scale-invariant in the number of lists a chunk hits):
+//   overturn 1-rank artifact:  w > 1/(K+1) ≈ 0.0164
+//   never overturn 2-rank gap: w < 2/(K+1) ≈ 0.0328
+// w = 0.024 sits safely inside (0.0164, 0.0328): a chunk that is
+// only adjacent (relevance-tied) flips on quality, but any chunk
+// with a ≥2-rank relevance lead always wins regardless of tier.
+// Missing tier ⇒ 'medium' (neutral): un-tiered chat-turn / legacy
+// chunks are never penalized relative to a graded page.
+const QUALITY_TIEBREAK_WEIGHT = 0.024;
+const QUALITY_TIER_RANK: Readonly<Record<ChunkQualityTier, number>> = {
+  high: 1,
+  medium: 0.5,
+  low: 0,
+};
+const DEFAULT_QUALITY_TIER: ChunkQualityTier = 'medium';
+const isChunkQualityTier = (value: unknown): value is ChunkQualityTier =>
+  value === 'high' || value === 'medium' || value === 'low';
+
+const qualityTierForEntry = (entry: IndexEntry): ChunkQualityTier =>
+  isChunkQualityTier(entry.metadata?.quality) ? entry.metadata.quality : DEFAULT_QUALITY_TIER;
+
 // How many top results from each individual ranker to feed into
 // fusion. Larger windows broaden recall at the cost of more
 // downstream sorting; 50 is enough for the side panel's typical
@@ -255,7 +339,10 @@ export const buildLexicalIndex = (items: readonly IndexEntry[]): HybridLexicalIn
 
 const buildSnippet = (text: string, query: string, maxChars = 220): string => {
   const lower = text.toLowerCase();
-  const q = query.toLowerCase().split(/\s+/).filter((t) => t.length > 2);
+  const q = query
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((t) => t.length > 2);
   let bestIndex = -1;
   for (const term of q) {
     const idx = lower.indexOf(term);
@@ -314,7 +401,7 @@ export const rankHybrid = (
   const lexResults: SearchResult[] = opts.lexical.mini
     .search(queryText, { combineWith: 'OR' })
     .filter((result): result is SearchResult => {
-      const entry = opts.lexical.idToEntry.get(String(result['id']));
+      const entry = opts.lexical.idToEntry.get(String(result.id));
       if (entry === undefined) return false;
       if (entry.tombstoned === true) return false;
       if (opts.workstreamMembership !== undefined && !opts.workstreamMembership(entry.threadId)) {
@@ -326,14 +413,14 @@ export const rankHybrid = (
 
   // 3. RRF fusion: each list contributes 1/(k+rank); freshness is a
   //    small additive boost layered on top.
-  type Aggregate = {
+  interface Aggregate {
     readonly id: string;
     readonly entry: IndexEntry;
     readonly vectorRank?: number;
     readonly vectorSimilarity?: number;
     readonly lexicalRank?: number;
     readonly lexicalScore?: number;
-  };
+  }
   const byId = new Map<string, Aggregate>();
   vectorList.forEach((row, index) => {
     byId.set(row.item.id, {
@@ -344,7 +431,7 @@ export const rankHybrid = (
     });
   });
   lexResults.forEach((row, index) => {
-    const id = String(row['id']);
+    const id = String(row.id);
     const entry = opts.lexical.idToEntry.get(id);
     if (entry === undefined) return;
     const prior = byId.get(id);
@@ -356,7 +443,7 @@ export const rankHybrid = (
         ? {}
         : { vectorSimilarity: prior.vectorSimilarity }),
       lexicalRank: index + 1,
-      lexicalScore: typeof row['score'] === 'number' ? row['score'] : 0,
+      lexicalScore: typeof row.score === 'number' ? row.score : 0,
     });
   });
 
@@ -366,12 +453,21 @@ export const rankHybrid = (
     const rrfLexical = agg.lexicalRank !== undefined ? 1 / (RRF_K + agg.lexicalRank) : 0;
     const freshness = freshnessDecay(agg.entry.capturedAt, now);
     const fusion = rrfVector + rrfLexical;
-    const score = fusion + FRESHNESS_BOOST_WEIGHT * freshness * fusion;
+    // Quality tier: a chunk that carries no tier is treated as the
+    // neutral 'medium' so legacy / chat-turn chunks are neither
+    // rewarded nor penalized. The contribution is centered on the
+    // 'medium' rank (0.5) so 'medium' adds exactly zero — only
+    // high/low chunks shift, keeping RRF math byte-identical when all
+    // candidates share a tier (or none carry one).
+    const qualityTier = qualityTierForEntry(agg.entry);
+    const qualityCentered =
+      QUALITY_TIER_RANK[qualityTier] - QUALITY_TIER_RANK[DEFAULT_QUALITY_TIER];
+    const freshnessContribution = FRESHNESS_BOOST_WEIGHT * freshness * fusion;
+    const qualityContribution = QUALITY_TIEBREAK_WEIGHT * qualityCentered * fusion;
+    const score = fusion + freshnessContribution + qualityContribution;
     const why: string[] = [];
     if (agg.vectorRank !== undefined && agg.vectorSimilarity !== undefined) {
-      why.push(
-        `vector rank ${String(agg.vectorRank)} (sim ${agg.vectorSimilarity.toFixed(3)})`,
-      );
+      why.push(`vector rank ${String(agg.vectorRank)} (sim ${agg.vectorSimilarity.toFixed(3)})`);
     }
     if (agg.lexicalRank !== undefined) {
       why.push(`lexical rank ${String(agg.lexicalRank)}`);
@@ -379,6 +475,21 @@ export const rankHybrid = (
     if (freshness >= 1) {
       why.push('fresh ≤ 3d');
     }
+    if (isChunkQualityTier(agg.entry.metadata?.quality)) {
+      why.push(`quality ${qualityTier}`);
+    }
+    const explain: ExplainBreakdown = {
+      ...(agg.vectorRank === undefined ? {} : { vectorRank: agg.vectorRank }),
+      ...(agg.lexicalRank === undefined ? {} : { lexicalRank: agg.lexicalRank }),
+      rrfVector,
+      rrfLexical,
+      fusion,
+      fusedScore: score,
+      freshness,
+      freshnessContribution,
+      qualityTier,
+      qualityContribution,
+    };
     const text = agg.entry.metadata?.text ?? '';
     const snippet = text.length > 0 ? buildSnippet(text, queryText) : '';
     fused.push({
@@ -397,8 +508,15 @@ export const rankHybrid = (
       ...(agg.entry.metadata === undefined ? {} : { metadata: agg.entry.metadata }),
       ...(snippet.length === 0 ? {} : { snippet }),
       why,
+      explain,
     });
   }
 
-  return fused.sort((a, b) => b.score - a.score).slice(0, clampLimit(opts.limit));
+  // Stable tie-break: when two chunks land on an identical final
+  // score (e.g. quality disabled / equal AND same RRF + freshness),
+  // preserve a deterministic order by id so results never reshuffle
+  // run-to-run. The primary sort is still by score desc.
+  return fused
+    .sort((a, b) => b.score - a.score || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+    .slice(0, clampLimit(opts.limit));
 };

@@ -11,9 +11,9 @@ import {
 import { ENGAGEMENT_SESSION_AGGREGATED, type EngagementDimensions } from '../engagement/events.js';
 import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
 import { NAVIGATION_COMMITTED } from '../navigation/events.js';
+import { PAGE_CONTENT_EXTRACTED, PAGE_CONTENT_TOMBSTONED } from '../page-content/types.js';
 import { SELECTION_COPIED } from '../snippets/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
-import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import {
   CANDIDATE_PAIR_FEATURE_KEYS,
   FEATURE_SCHEMA_VERSION,
@@ -43,21 +43,25 @@ const event = (input: {
   acceptedAtMs: input.acceptedAtMs ?? BASE_TIME + input.seq * 1_000,
 });
 
-const candidate = (input: {
-  readonly fromVisitId?: string;
-  readonly toVisitId?: string;
-} = {}): Candidate => ({
+const candidate = (
+  input: {
+    readonly fromVisitId?: string;
+    readonly toVisitId?: string;
+  } = {},
+): Candidate => ({
   fromVisitId: input.fromVisitId ?? 'visit-a',
   toVisitId: input.toVisitId ?? 'visit-b',
   sources: [],
   generatedAt: BASE_TIME,
 });
 
-const snapshot = (input: {
-  readonly nodes?: readonly ConnectionNode[];
-  readonly edges?: readonly ConnectionEdge[];
-  readonly updatedAt?: string;
-} = {}) => ({
+const snapshot = (
+  input: {
+    readonly nodes?: readonly ConnectionNode[];
+    readonly edges?: readonly ConnectionEdge[];
+    readonly updatedAt?: string;
+  } = {},
+) => ({
   scope: {},
   nodes: input.nodes ?? [],
   edges: input.edges ?? [],
@@ -124,22 +128,6 @@ const navigationPayload = (input: {
   commitTimestamp: input.commitTimestamp ?? BASE_TIME,
 });
 
-const timelinePayload = (input: {
-  readonly url: string;
-  readonly title?: string;
-  readonly workstreamId?: string;
-}): unknown => ({
-  eventId: `timeline-${input.url}`,
-  observedAt: iso(),
-  url: input.url,
-  canonicalUrl: input.url,
-  provider: 'generic',
-  transition: 'activated',
-  payloadVersion: 1,
-  ...(input.title === undefined ? {} : { title: input.title }),
-  ...(input.workstreamId === undefined ? {} : { workstreamId: input.workstreamId }),
-});
-
 const snippetPayload = (input: {
   readonly visitId: string;
   readonly selectionHash: string;
@@ -194,13 +182,46 @@ const organizedVisitPayload = (input: {
   toContainer: input.toContainer,
 });
 
-const extract = (input: {
-  readonly candidate?: Candidate;
-  readonly merged?: readonly AcceptedEvent[];
-  readonly nodes?: readonly ConnectionNode[];
-  readonly edges?: readonly ConnectionEdge[];
-  readonly updatedAt?: string;
-} = {}): CandidatePairFeatures => {
+const pageContentPayload = (input: {
+  readonly canonicalUrl: string;
+  readonly quality: 'high' | 'medium' | 'low';
+}): unknown => ({
+  payloadVersion: 1,
+  canonicalUrl: input.canonicalUrl,
+  url: input.canonicalUrl,
+  extractedAt: iso(),
+  extractionSource: 'reader-mode',
+  extractionPolicy: { trigger: 'manual' },
+  quality: input.quality,
+  qualitySignals: {
+    extractedWordCount: 800,
+    contentToDomRatio: 0.6,
+    boilerplateFraction: 0.1,
+    extractionStrategy: 'reader-mode',
+  },
+  content: {
+    text: 'extracted body text',
+    contentHash: `hash-${input.canonicalUrl}`,
+    charCount: 19,
+  },
+});
+
+const pageContentTombstonePayload = (canonicalUrl: string): unknown => ({
+  payloadVersion: 1,
+  canonicalUrl,
+  tombstonedAt: iso(),
+  reason: 'user-delete',
+});
+
+const extract = (
+  input: {
+    readonly candidate?: Candidate;
+    readonly merged?: readonly AcceptedEvent[];
+    readonly nodes?: readonly ConnectionNode[];
+    readonly edges?: readonly ConnectionEdge[];
+    readonly updatedAt?: string;
+  } = {},
+): CandidatePairFeatures => {
   const snapshotInput = {
     ...(input.nodes === undefined ? {} : { nodes: input.nodes }),
     ...(input.edges === undefined ? {} : { edges: input.edges }),
@@ -217,13 +238,13 @@ describe('ranker feature schema', () => {
     const first = JSON.stringify(extract());
     const second = JSON.stringify(extract());
 
-    expect(FEATURE_SCHEMA_VERSION).toBe(1);
+    expect(FEATURE_SCHEMA_VERSION).toBe(2);
     expect(first).toBe(second);
     expect(Object.keys(JSON.parse(first) as Record<string, unknown>)).toEqual(
       CANDIDATE_PAIR_FEATURE_KEYS,
     );
     expect(JSON.parse(first) as CandidatePairFeatures).toEqual({
-      schemaVersion: 1,
+      schemaVersion: 2,
       same_workstream: 0,
       opener_chain_depth: 0,
       in_navigation_chain: 0,
@@ -242,6 +263,10 @@ describe('ranker feature schema', () => {
       return_count_to: 0,
       user_asserted_in_thread: 0,
       user_asserted_in_workstream: 0,
+      same_active_topic: 0,
+      topic_lineage_merge_split_related: 0,
+      page_quality_tier_from: 0,
+      page_quality_tier_to: 0,
     });
   });
 });
@@ -402,7 +427,10 @@ describe('ranker URL and text features', () => {
         toVisitId: 'https://docs.test/b',
       }),
       nodes: [
-        node({ key: 'https://docs.test/a', metadata: { title: 'Ranker feature extraction design' } }),
+        node({
+          key: 'https://docs.test/a',
+          metadata: { title: 'Ranker feature extraction design' },
+        }),
         node({ key: 'https://docs.test/b', metadata: { title: 'Feature extraction checklist' } }),
       ],
     });
@@ -426,11 +454,31 @@ describe('ranker content, recency, and engagement features', () => {
   it('counts shared copied snippets from copy events', () => {
     const features = extract({
       merged: [
-        event({ seq: 1, type: SELECTION_COPIED, payload: snippetPayload({ visitId: 'visit-a', selectionHash: 'hash-1' }) }),
-        event({ seq: 2, type: SELECTION_COPIED, payload: snippetPayload({ visitId: 'visit-b', selectionHash: 'hash-1' }) }),
-        event({ seq: 3, type: SELECTION_COPIED, payload: snippetPayload({ visitId: 'visit-a', selectionHash: 'hash-2' }) }),
-        event({ seq: 4, type: SELECTION_COPIED, payload: snippetPayload({ visitId: 'visit-b', selectionHash: 'hash-2' }) }),
-        event({ seq: 5, type: SELECTION_COPIED, payload: snippetPayload({ visitId: 'visit-a', selectionHash: 'hash-3' }) }),
+        event({
+          seq: 1,
+          type: SELECTION_COPIED,
+          payload: snippetPayload({ visitId: 'visit-a', selectionHash: 'hash-1' }),
+        }),
+        event({
+          seq: 2,
+          type: SELECTION_COPIED,
+          payload: snippetPayload({ visitId: 'visit-b', selectionHash: 'hash-1' }),
+        }),
+        event({
+          seq: 3,
+          type: SELECTION_COPIED,
+          payload: snippetPayload({ visitId: 'visit-a', selectionHash: 'hash-2' }),
+        }),
+        event({
+          seq: 4,
+          type: SELECTION_COPIED,
+          payload: snippetPayload({ visitId: 'visit-b', selectionHash: 'hash-2' }),
+        }),
+        event({
+          seq: 5,
+          type: SELECTION_COPIED,
+          payload: snippetPayload({ visitId: 'visit-a', selectionHash: 'hash-3' }),
+        }),
       ],
     });
 
@@ -518,24 +566,40 @@ describe('ranker content, recency, and engagement features', () => {
         event({
           seq: 1,
           type: ENGAGEMENT_SESSION_AGGREGATED,
-          payload: engagementPayload({ visitId: 'visit-a', sessionId: 'session-1', returnCount: 1 }),
+          payload: engagementPayload({
+            visitId: 'visit-a',
+            sessionId: 'session-1',
+            returnCount: 1,
+          }),
           acceptedAtMs: BASE_TIME + 1,
         }),
         event({
           seq: 2,
           type: ENGAGEMENT_SESSION_AGGREGATED,
-          payload: engagementPayload({ visitId: 'visit-a', sessionId: 'session-1', returnCount: 3 }),
+          payload: engagementPayload({
+            visitId: 'visit-a',
+            sessionId: 'session-1',
+            returnCount: 3,
+          }),
           acceptedAtMs: BASE_TIME + 2,
         }),
         event({
           seq: 3,
           type: ENGAGEMENT_SESSION_AGGREGATED,
-          payload: engagementPayload({ visitId: 'visit-a', sessionId: 'session-2', returnCount: 2 }),
+          payload: engagementPayload({
+            visitId: 'visit-a',
+            sessionId: 'session-2',
+            returnCount: 2,
+          }),
         }),
         event({
           seq: 4,
           type: ENGAGEMENT_SESSION_AGGREGATED,
-          payload: engagementPayload({ visitId: 'visit-b', sessionId: 'session-1', returnCount: 7 }),
+          payload: engagementPayload({
+            visitId: 'visit-b',
+            sessionId: 'session-1',
+            returnCount: 7,
+          }),
         }),
       ],
     });
@@ -588,5 +652,236 @@ describe('ranker user-asserted features', () => {
     });
 
     expect(features.user_asserted_in_workstream).toBe(1);
+  });
+});
+
+describe('ranker lineage-aware topic features', () => {
+  const visitInTopic = (input: {
+    readonly canonicalUrl: string;
+    readonly topicId: string;
+    readonly affiliation?: 'primary' | 'secondary';
+  }): ConnectionEdge =>
+    edge({
+      kind: 'visit_in_topic',
+      fromNodeId: nodeIdFor('timeline-visit', input.canonicalUrl),
+      toNodeId: nodeIdFor('topic', input.topicId),
+      metadata: { affiliation: input.affiliation ?? 'primary' },
+    });
+
+  const topicLineage = (input: {
+    readonly fromTopicId: string;
+    readonly toTopicId: string;
+    readonly lineageKind: 'birth' | 'continue' | 'split' | 'merge' | 'death' | 'resurface';
+  }): ConnectionEdge =>
+    edge({
+      kind: 'topic.lineage',
+      fromNodeId: nodeIdFor('topic', input.fromTopicId),
+      toNodeId: nodeIdFor('topic', input.toTopicId),
+      confidence: 'observed',
+      metadata: { lineageKind: input.lineageKind },
+    });
+
+  it('sets same_active_topic when both visits are primary members of one topic', () => {
+    const features = extract({
+      candidate: candidate({
+        fromVisitId: 'https://alpha.test/a',
+        toVisitId: 'https://alpha.test/b',
+      }),
+      edges: [
+        visitInTopic({ canonicalUrl: 'https://alpha.test/a', topicId: 'topic-1' }),
+        visitInTopic({ canonicalUrl: 'https://alpha.test/b', topicId: 'topic-1' }),
+      ],
+    });
+
+    expect(features.same_active_topic).toBe(1);
+    expect(features.topic_lineage_merge_split_related).toBe(0);
+  });
+
+  it('ignores secondary affiliations for same_active_topic', () => {
+    const features = extract({
+      candidate: candidate({
+        fromVisitId: 'https://alpha.test/a',
+        toVisitId: 'https://alpha.test/b',
+      }),
+      edges: [
+        visitInTopic({ canonicalUrl: 'https://alpha.test/a', topicId: 'topic-1' }),
+        visitInTopic({
+          canonicalUrl: 'https://alpha.test/b',
+          topicId: 'topic-1',
+          affiliation: 'secondary',
+        }),
+      ],
+    });
+
+    expect(features.same_active_topic).toBe(0);
+  });
+
+  it('sets topic_lineage_merge_split_related across a split lineage edge', () => {
+    const features = extract({
+      candidate: candidate({
+        fromVisitId: 'https://alpha.test/a',
+        toVisitId: 'https://alpha.test/b',
+      }),
+      edges: [
+        visitInTopic({ canonicalUrl: 'https://alpha.test/a', topicId: 'topic-old' }),
+        visitInTopic({ canonicalUrl: 'https://alpha.test/b', topicId: 'topic-new' }),
+        topicLineage({
+          fromTopicId: 'topic-old',
+          toTopicId: 'topic-new',
+          lineageKind: 'split',
+        }),
+      ],
+    });
+
+    expect(features.same_active_topic).toBe(0);
+    expect(features.topic_lineage_merge_split_related).toBe(1);
+  });
+
+  it('sets topic_lineage_merge_split_related for merge lineage regardless of edge direction', () => {
+    const features = extract({
+      candidate: candidate({
+        fromVisitId: 'https://alpha.test/b',
+        toVisitId: 'https://alpha.test/a',
+      }),
+      edges: [
+        visitInTopic({ canonicalUrl: 'https://alpha.test/a', topicId: 'topic-old' }),
+        visitInTopic({ canonicalUrl: 'https://alpha.test/b', topicId: 'topic-new' }),
+        topicLineage({
+          fromTopicId: 'topic-old',
+          toTopicId: 'topic-new',
+          lineageKind: 'merge',
+        }),
+      ],
+    });
+
+    expect(features.topic_lineage_merge_split_related).toBe(1);
+  });
+
+  it('does not treat continue/birth lineage as a merge/split relation', () => {
+    const features = extract({
+      candidate: candidate({
+        fromVisitId: 'https://alpha.test/a',
+        toVisitId: 'https://alpha.test/b',
+      }),
+      edges: [
+        visitInTopic({ canonicalUrl: 'https://alpha.test/a', topicId: 'topic-old' }),
+        visitInTopic({ canonicalUrl: 'https://alpha.test/b', topicId: 'topic-new' }),
+        topicLineage({
+          fromTopicId: 'topic-old',
+          toTopicId: 'topic-new',
+          lineageKind: 'continue',
+        }),
+      ],
+    });
+
+    expect(features.topic_lineage_merge_split_related).toBe(0);
+  });
+});
+
+describe('ranker page-content quality features', () => {
+  it('encodes the from/to page quality tier from extracted content events', () => {
+    const features = extract({
+      candidate: candidate({
+        fromVisitId: 'https://alpha.test/high',
+        toVisitId: 'https://alpha.test/low',
+      }),
+      merged: [
+        event({
+          seq: 1,
+          type: PAGE_CONTENT_EXTRACTED,
+          payload: pageContentPayload({
+            canonicalUrl: 'https://alpha.test/high',
+            quality: 'high',
+          }),
+        }),
+        event({
+          seq: 2,
+          type: PAGE_CONTENT_EXTRACTED,
+          payload: pageContentPayload({
+            canonicalUrl: 'https://alpha.test/low',
+            quality: 'low',
+          }),
+        }),
+      ],
+    });
+
+    expect(features.page_quality_tier_from).toBe(3);
+    expect(features.page_quality_tier_to).toBe(1);
+  });
+
+  it('keeps the latest extracted quality and 0 when no content was extracted', () => {
+    const features = extract({
+      candidate: candidate({
+        fromVisitId: 'https://alpha.test/upgraded',
+        toVisitId: 'https://alpha.test/unknown',
+      }),
+      merged: [
+        event({
+          seq: 1,
+          type: PAGE_CONTENT_EXTRACTED,
+          payload: pageContentPayload({
+            canonicalUrl: 'https://alpha.test/upgraded',
+            quality: 'low',
+          }),
+          acceptedAtMs: BASE_TIME + 1,
+        }),
+        event({
+          seq: 2,
+          type: PAGE_CONTENT_EXTRACTED,
+          payload: pageContentPayload({
+            canonicalUrl: 'https://alpha.test/upgraded',
+            quality: 'medium',
+          }),
+          acceptedAtMs: BASE_TIME + 2,
+        }),
+      ],
+    });
+
+    expect(features.page_quality_tier_from).toBe(2);
+    expect(features.page_quality_tier_to).toBe(0);
+  });
+
+  it('treats a later page-content tombstone as unknown quality', () => {
+    const features = extract({
+      candidate: candidate({
+        fromVisitId: 'https://alpha.test/deleted',
+        toVisitId: 'https://alpha.test/recreated',
+      }),
+      merged: [
+        event({
+          seq: 1,
+          type: PAGE_CONTENT_EXTRACTED,
+          payload: pageContentPayload({
+            canonicalUrl: 'https://alpha.test/deleted',
+            quality: 'high',
+          }),
+          acceptedAtMs: BASE_TIME + 1,
+        }),
+        event({
+          seq: 2,
+          type: PAGE_CONTENT_TOMBSTONED,
+          payload: pageContentTombstonePayload('https://alpha.test/deleted'),
+          acceptedAtMs: BASE_TIME + 2,
+        }),
+        event({
+          seq: 3,
+          type: PAGE_CONTENT_TOMBSTONED,
+          payload: pageContentTombstonePayload('https://alpha.test/recreated'),
+          acceptedAtMs: BASE_TIME + 1,
+        }),
+        event({
+          seq: 4,
+          type: PAGE_CONTENT_EXTRACTED,
+          payload: pageContentPayload({
+            canonicalUrl: 'https://alpha.test/recreated',
+            quality: 'medium',
+          }),
+          acceptedAtMs: BASE_TIME + 2,
+        }),
+      ],
+    });
+
+    expect(features.page_quality_tier_from).toBe(0);
+    expect(features.page_quality_tier_to).toBe(2);
   });
 });

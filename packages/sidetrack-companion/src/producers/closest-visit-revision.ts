@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import type { RankerRevision } from '../ranker/train.js';
+import { FEATURE_SCHEMA_VERSION } from '../ranker/feature-schema.js';
+import { RANKER_MODEL_VERSION, type RankerRevision } from '../ranker/train.js';
 
 const CLOSEST_VISIT_REVISION_DIR = '_BAC/connections/closest-visit';
 
@@ -61,13 +62,21 @@ const writeAtomic = async (path: string, body: string): Promise<void> => {
   await rename(tmp, path);
 };
 
+// Pinned to the *current* ranker constants (not inline literals): a
+// manifest persisted under an older model version or feature-schema
+// version fails validation, so `readClosestVisitRankerRevision`
+// returns null and the caller treats it as "no usable model" and
+// retrains. This is the back-compat gate — it prevents handing a
+// stale-feature-count booster a wider feature row (which LightGBM
+// would silently mis-score or the contribution decoder would throw
+// on).
 const isManifest = (value: unknown): value is ClosestVisitRankerRevisionManifest => {
   if (!isRecord(value)) return false;
   return (
     typeof value['revisionId'] === 'string' &&
     value['revisionId'].length > 0 &&
-    value['modelVersion'] === 'lightgbm-lambdamart-v1' &&
-    value['featureSchemaVersion'] === 1 &&
+    value['modelVersion'] === RANKER_MODEL_VERSION &&
+    value['featureSchemaVersion'] === FEATURE_SCHEMA_VERSION &&
     typeof value['trainingDatasetHash'] === 'string' &&
     /^[a-f0-9]{64}$/u.test(value['trainingDatasetHash']) &&
     typeof value['trainedAt'] === 'number' &&

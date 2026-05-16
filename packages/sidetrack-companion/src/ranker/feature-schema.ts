@@ -2,7 +2,12 @@ import type { ConnectionsSnapshot } from '../connections/types.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import type { Candidate } from './types.js';
 
-export const FEATURE_SCHEMA_VERSION = 1;
+// Bumped 1 → 2 when the lineage-aware + page-content-quality features
+// were appended (R5 ranker expansion). The feature *set* is part of
+// the model identity, so a schema bump forces a new ranker revision
+// and lets persisted models trained on the v1 feature count be
+// rejected (graceful fall back to retrain) instead of mis-scoring.
+export const FEATURE_SCHEMA_VERSION = 2;
 
 export type CandidatePairFeatures = {
   schemaVersion: typeof FEATURE_SCHEMA_VERSION;
@@ -24,6 +29,17 @@ export type CandidatePairFeatures = {
   return_count_to: number;
   user_asserted_in_thread: 0 | 1;
   user_asserted_in_workstream: 0 | 1;
+  // R5 expansion — appended (never reordered); existing keys above
+  // keep their column index so older training datasets stay
+  // comparable feature-by-feature.
+  // Lineage-aware: from/to share an active topic (primary
+  // affiliation), and from/to topics are merge/split lineage kin.
+  same_active_topic: 0 | 1;
+  topic_lineage_merge_split_related: 0 | 1;
+  // Page-content quality tier (0 = unknown, 1 = low, 2 = medium,
+  // 3 = high) of the from / to pages.
+  page_quality_tier_from: number;
+  page_quality_tier_to: number;
 };
 
 export const CANDIDATE_PAIR_FEATURE_KEYS = [
@@ -46,6 +62,10 @@ export const CANDIDATE_PAIR_FEATURE_KEYS = [
   'return_count_to',
   'user_asserted_in_thread',
   'user_asserted_in_workstream',
+  'same_active_topic',
+  'topic_lineage_merge_split_related',
+  'page_quality_tier_from',
+  'page_quality_tier_to',
 ] as const satisfies readonly (keyof CandidatePairFeatures)[];
 
 export type ExtractFeatures = (

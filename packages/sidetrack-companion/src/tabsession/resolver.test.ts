@@ -115,6 +115,10 @@ const emptyContributions = (): ReturnType<ClosestVisitRanker['predict']>['contri
   return_count_to: 0,
   user_asserted_in_thread: 0,
   user_asserted_in_workstream: 0,
+  same_active_topic: 0,
+  topic_lineage_merge_split_related: 0,
+  page_quality_tier_from: 0,
+  page_quality_tier_to: 0,
 });
 
 describe('tab-session resolver', () => {

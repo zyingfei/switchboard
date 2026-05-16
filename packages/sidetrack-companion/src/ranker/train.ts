@@ -13,7 +13,13 @@ import {
 } from './feature-schema.js';
 import type { Candidate } from './types.js';
 
-export const RANKER_MODEL_VERSION = 'lightgbm-lambdamart-v1' as const;
+// Bumped v1 → v2 alongside FEATURE_SCHEMA_VERSION 1 → 2: the R5
+// lineage + page-quality features change the model input vector, so
+// this is a new model revision. The closest-visit manifest validator
+// pins this exact string, so a model persisted under v1 fails to
+// load and the retrain loop produces a fresh v2 model rather than
+// feeding a v1 booster a v2-width feature row.
+export const RANKER_MODEL_VERSION = 'lightgbm-lambdamart-v2' as const;
 export const DEFAULT_RANKER_NUM_ROUND = 40;
 export const DEFAULT_RANKER_SEED = 20260508;
 
@@ -68,6 +74,12 @@ export const RANKER_FEATURE_KEYS = [
   'return_count_to',
   'user_asserted_in_thread',
   'user_asserted_in_workstream',
+  // R5 expansion — appended so the column index of every existing
+  // feature is unchanged; only new trailing columns are added.
+  'same_active_topic',
+  'topic_lineage_merge_split_related',
+  'page_quality_tier_from',
+  'page_quality_tier_to',
 ] as const satisfies readonly RankerFeatureKey[];
 
 const PREDICT_CONTRIB_BIAS_SLOT_COUNT = 1;

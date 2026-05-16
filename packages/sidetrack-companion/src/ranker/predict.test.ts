@@ -1,4 +1,5 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -6,7 +7,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import type { FeedbackProjection, FeedbackTrainingLabel } from '../feedback/projection.js';
 import {
+  activeClosestVisitRevisionManifestPath,
+  closestVisitRevisionDir,
+  closestVisitRevisionManifestPath,
+  closestVisitRevisionModelPath,
   listClosestVisitRankerRevisionIds,
+  readActiveClosestVisitRankerRevisionManifest,
   readClosestVisitRankerRevision,
   readClosestVisitRankerRevisionManifest,
   writeActiveClosestVisitRankerRevision,
@@ -48,6 +54,10 @@ const featuresFor = (score: number, sameWorkstream: 0 | 1): CandidatePairFeature
   return_count_to: sameWorkstream === 1 ? 3 : 0,
   user_asserted_in_thread: 0,
   user_asserted_in_workstream: sameWorkstream,
+  same_active_topic: sameWorkstream,
+  topic_lineage_merge_split_related: sameWorkstream,
+  page_quality_tier_from: sameWorkstream === 1 ? 3 : 1,
+  page_quality_tier_to: sameWorkstream === 1 ? 3 : 1,
 });
 
 const syntheticTrainingSet = (): {
@@ -180,5 +190,86 @@ describe('LightGBM LambdaMART ranker', () => {
     const input = syntheticTrainingSet();
 
     expect(buildRankerTrainingRows(input.feedback, input.candidates)).toHaveLength(100);
+  });
+});
+
+describe('ranker model version back-compat', () => {
+  it('pins the bumped model + feature-schema versions for the expanded feature set', () => {
+    expect(RANKER_MODEL_VERSION).toBe('lightgbm-lambdamart-v2');
+    expect(FEATURE_SCHEMA_VERSION).toBe(2);
+  });
+
+  it('rejects a persisted model whose manifest predates the feature-set bump', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'sidetrack-ranker-backcompat-'));
+    tempRoots.push(root);
+
+    // Simulate a model trained under the *previous* feature count: a
+    // valid-shaped manifest + base64 model body on disk, but stamped
+    // with the old model/feature-schema versions. The byte body is
+    // arbitrary — validation must reject on the version gate before
+    // any LightGBM load is attempted, so a stale-width booster can
+    // never be fed a wider feature row.
+    const staleModelBytes = Buffer.from('stale-v1-lightgbm-model-bytes');
+    const staleRevisionId = 'stale-v1-revision';
+    const staleManifest = {
+      revisionId: staleRevisionId,
+      modelVersion: 'lightgbm-lambdamart-v1',
+      featureSchemaVersion: 1,
+      trainingDatasetHash: 'a'.repeat(64),
+      trainedAt: generatedAt,
+      modelByteLength: staleModelBytes.byteLength,
+      modelSha256: createHash('sha256').update(staleModelBytes).digest('hex'),
+    };
+    await mkdir(closestVisitRevisionDir(root), { recursive: true });
+    await writeFile(
+      closestVisitRevisionManifestPath(root, staleRevisionId),
+      `${JSON.stringify(staleManifest, null, 2)}\n`,
+      'utf8',
+    );
+    await writeFile(
+      closestVisitRevisionModelPath(root, staleRevisionId),
+      `${staleModelBytes.toString('base64')}\n`,
+      'utf8',
+    );
+    await writeFile(
+      activeClosestVisitRevisionManifestPath(root),
+      `${JSON.stringify(staleManifest, null, 2)}\n`,
+      'utf8',
+    );
+
+    // Graceful fall back: the stale manifest fails the version gate,
+    // so the readers return null instead of handing back a revision
+    // that would crash prediction. Callers treat null as "no usable
+    // model" and retrain.
+    await expect(readClosestVisitRankerRevisionManifest(root, staleRevisionId)).resolves.toBeNull();
+    await expect(readActiveClosestVisitRankerRevisionManifest(root)).resolves.toBeNull();
+    await expect(readClosestVisitRankerRevision(root, staleRevisionId)).resolves.toBeNull();
+  });
+
+  it('round-trips and predicts a freshly trained v2 model after the bump', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'sidetrack-ranker-v2-'));
+    tempRoots.push(root);
+    const input = syntheticTrainingSet();
+    const revision = await trainRankerRevision({
+      ...input,
+      options: { seed: 41, numRound: 8, trainedAt: generatedAt },
+    });
+    expect(revision.modelVersion).toBe('lightgbm-lambdamart-v2');
+    expect(revision.featureSchemaVersion).toBe(2);
+
+    await writeActiveClosestVisitRankerRevision(root, revision);
+    const reloaded = await readClosestVisitRankerRevision(root, revision.revisionId);
+    expect(reloaded).not.toBeNull();
+    if (reloaded === null) throw new Error('expected reloaded v2 revision');
+
+    const model = await loadRankerModel(reloaded);
+    try {
+      const related = predictRanker(featuresFor(0.95, 1), model);
+      const unrelated = predictRanker(featuresFor(0.05, 0), model);
+      expect(Number.isFinite(related.score)).toBe(true);
+      expect(related.score).toBeGreaterThan(unrelated.score);
+    } finally {
+      model.dispose();
+    }
   });
 });
