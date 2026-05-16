@@ -7,7 +7,11 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { createConnectionsStore } from '../connections/snapshot.js';
 import type { ConnectionsSnapshot } from '../connections/types.js';
 import { nodeIdFor } from '../connections/types.js';
-import { USER_FLOW_CONFIRMED, USER_FLOW_REJECTED } from '../feedback/events.js';
+import {
+  USER_FLOW_CONFIRMED,
+  USER_FLOW_REJECTED,
+  USER_ORGANIZED_ITEM,
+} from '../feedback/events.js';
 import {
   projectFeedback,
   type FeedbackProjection,
@@ -123,6 +127,26 @@ const rejectedFeedbackEvent = (seq: number, fromId: string, toId: string): Accep
     fromId,
     toId,
     reason: 'not-related',
+  },
+  acceptedAtMs: observedAtMs + seq,
+});
+
+const organizedEvent = (
+  seq: number,
+  itemId: string,
+  toContainer: string | null,
+): AcceptedEvent => ({
+  clientEventId: `organized-${String(seq)}`,
+  dot: { replicaId: 'replica-a', seq },
+  deps: {},
+  aggregateId: `feedback:${itemId}`,
+  type: USER_ORGANIZED_ITEM,
+  payload: {
+    payloadVersion: 1,
+    itemKind: 'canonical-url',
+    itemId,
+    action: 'move',
+    toContainer,
   },
   acceptedAtMs: observedAtMs + seq,
 });
@@ -316,6 +340,7 @@ describe('ranker retraining loop', () => {
   it('trains, writes the active revision, and persists retrain state when threshold is met', async () => {
     const from = 'https://example.test/a';
     const to = 'https://example.test/b';
+    const negative = 'https://example.test/c';
     const trainInputs: TrainRankerInput[] = [];
     const writtenRevisions: RankerRevision[] = [];
     const writtenStates: RankerRetrainState[] = [];
@@ -330,10 +355,10 @@ describe('ranker retraining loop', () => {
 
     const result = await maybeRetrainClosestVisitRanker({
       vaultRoot: '/tmp/sidetrack-ranker-retrain-test',
-      merged: [feedbackEvent(1, from, to), feedbackEvent(2, from, to)],
-      snapshot: snapshotWithVisits([from, to]),
-      threshold: 2,
-      randomNegativeCandidatesPerPositive: 0,
+      merged: [feedbackEvent(1, from, to)],
+      snapshot: snapshotWithVisits([from, to, negative]),
+      threshold: 1,
+      randomNegativeCandidatesPerPositive: 1,
       train,
       writeActiveRevision,
       readState: () => Promise.resolve(emptyState()),
@@ -346,17 +371,49 @@ describe('ranker retraining loop', () => {
     expect(result).toMatchObject({
       status: 'trained',
       revisionId: 'revision-s25',
-      newLabelCount: 2,
-      candidateCount: 1,
+      newLabelCount: 1,
+      candidateCount: 2,
     });
-    expect(trainInputs[0]?.feedback.positiveLabels).toHaveLength(2);
-    expect(trainInputs[0]?.candidates).toHaveLength(1);
+    expect(trainInputs[0]?.feedback.positiveLabels).toHaveLength(1);
+    expect(trainInputs[0]?.feedback.negativeLabels).toHaveLength(0);
+    expect(trainInputs[0]?.candidates).toHaveLength(2);
     expect(writtenRevisions[0]?.revisionId).toBe('revision-s25');
     expect(writtenStates[0]).toMatchObject({
-      lastTrainedLabelCount: 2,
+      lastTrainedLabelCount: 1,
       activeRevisionId: 'revision-s25',
       rankerTrainingDatasetHash: '1'.repeat(64),
     });
+  });
+
+  it('skips before candidate generation when labels cannot form a usable query group', async () => {
+    const trainInputs: TrainRankerInput[] = [];
+    const train: TrainRankerRevisionFn = (input) => {
+      trainInputs.push(input);
+      return Promise.resolve(fakeRevision('1'.repeat(64)));
+    };
+
+    const result = await maybeRetrainClosestVisitRanker({
+      vaultRoot: '/tmp/sidetrack-ranker-retrain-test',
+      merged: [organizedEvent(1, 'https://example.test/a', 'workstream:alpha')],
+      snapshot: snapshotWithVisits(['https://example.test/a', 'https://example.test/b']),
+      force: true,
+      train,
+      writeActiveRevision: () => Promise.resolve(),
+      readState: () => Promise.resolve(emptyState()),
+      writeState: () => Promise.resolve(),
+    });
+
+    expect(result).toMatchObject({
+      status: 'skipped',
+      reason: 'no-usable-query-groups',
+      candidateCount: 0,
+      fingerprint: {
+        labelCount: 1,
+        positiveLabelCount: 1,
+        negativeLabelCount: 0,
+      },
+    });
+    expect(trainInputs).toEqual([]);
   });
 
   it('captures trainQuality (gradeHistogram + spread + in-sample metric) into the persisted manifest', async () => {

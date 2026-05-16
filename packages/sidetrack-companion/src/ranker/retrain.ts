@@ -283,7 +283,8 @@ export type RankerRetrainSkipReason =
   | 'unchanged'
   | 'below-threshold'
   | 'cooldown'
-  | 'no-training-candidates';
+  | 'no-training-candidates'
+  | 'no-usable-query-groups';
 
 export type RankerRetrainPlan =
   | {
@@ -593,6 +594,54 @@ const candidateResolvesToTimelineVisits = (
   visitKeys.has(visitKeyFromNodeOrRaw(candidate.fromVisitId)) &&
   visitKeys.has(visitKeyFromNodeOrRaw(candidate.toVisitId)) &&
   visitKeyFromNodeOrRaw(candidate.fromVisitId) !== visitKeyFromNodeOrRaw(candidate.toVisitId);
+
+const labelResolvesToTimelineVisits = (
+  label: FeedbackTrainingLabel,
+  visitKeys: ReadonlySet<string>,
+): boolean =>
+  candidateResolvesToTimelineVisits(
+    {
+      fromVisitId: label.fromId,
+      toVisitId: label.toId,
+      sources: ['user_confirmed'],
+      generatedAt: 0,
+    },
+    visitKeys,
+  );
+
+const feedbackHasUsableQueryGroup = (
+  feedback: FeedbackProjection,
+  visitKeysList: readonly string[],
+  randomNegativeCandidatesPerPositive: number | undefined,
+): boolean => {
+  const visitKeys = new Set(visitKeysList);
+  if (visitKeys.size < 2) return false;
+
+  const positiveFromIds = new Set(
+    feedback.positiveLabels
+      .filter((labelItem) => labelResolvesToTimelineVisits(labelItem, visitKeys))
+      .map((labelItem) => visitKeyFromNodeOrRaw(labelItem.fromId)),
+  );
+  if (positiveFromIds.size === 0) return false;
+
+  for (const labelItem of feedback.negativeLabels) {
+    if (
+      labelResolvesToTimelineVisits(labelItem, visitKeys) &&
+      positiveFromIds.has(visitKeyFromNodeOrRaw(labelItem.fromId))
+    ) {
+      return true;
+    }
+  }
+
+  // Random negatives are implicit training rows under the same
+  // fromVisitId as each positive. With at least three visit keys, a
+  // positive pair leaves at least one other visit as a possible
+  // unrelated competitor. Keep this as a conservative structural
+  // preflight; the full sampler still owns exact candidate choice.
+  return (
+    normalizedRandomNegativeCount(randomNegativeCandidatesPerPositive) > 0 && visitKeys.size >= 3
+  );
+};
 
 const maxObservedAt = (merged: readonly AcceptedEvent[], snapshot: ConnectionsSnapshot): number => {
   let generatedAt = parseTimestamp(snapshot.updatedAt) ?? 0;
@@ -938,6 +987,17 @@ export const maybeRetrainClosestVisitRanker = async ({
       reason: plan.reason,
       fingerprint,
       newLabelCount: plan.newLabelCount,
+    };
+  }
+
+  const visitKeysList = timelineVisitKeys(snapshot);
+  if (!feedbackHasUsableQueryGroup(feedback, visitKeysList, randomNegativeCandidatesPerPositive)) {
+    return {
+      status: 'skipped',
+      reason: 'no-usable-query-groups',
+      fingerprint,
+      newLabelCount: plan.newLabelCount,
+      candidateCount: 0,
     };
   }
 

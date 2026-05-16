@@ -67,7 +67,12 @@ describe('ranker retrain worker', () => {
     // readCurrent → planRetrain round-trip.
     expect(result.status).toBe('skipped');
     if (result.status === 'skipped') {
-      expect(['no-labels', 'unchanged', 'no-training-candidates']).toContain(result.reason);
+      expect([
+        'no-labels',
+        'unchanged',
+        'no-training-candidates',
+        'no-usable-query-groups',
+      ]).toContain(result.reason);
     }
   });
 });
