@@ -1,6 +1,9 @@
 # Sidetrack — Evolution: evidence quality, hybrid retrieval, drift/eval, grouping & ranker
 
-> **Status: implemented, draft PR #176 (`evolve/evidence-retrieval-drift`).**
+> **Status: implemented on draft branch `evolve/evidence-retrieval-drift`;
+> under review in PR #176; not merged.** Behavior is preserved unless
+> evidence/model availability enables the new paths — this is *integrated
+> and additive*, **not "product-complete"**.
 > Six ranked upgrades, each implemented as the *in-architecture*
 > equivalent, additive and independently verified. Companion 1177/1180
 > (2 skipped, 1 pre-existing flake), extension green. Not merged;
@@ -13,10 +16,12 @@
 ## Northern star (carried forward)
 
 > Facts are event-sourced. Interpretations are versioned. Suggestions
-> are explainable. User organization is authoritative. No inference
-> requires GPU / Apple-Silicon hardware.
+> are explainable. User organization is authoritative. No default-path
+> inference requires GPU / Apple-Silicon-specific hardware.
 
-This evolution does not touch the locks. It strengthens the weakest
+This evolution preserves the load-bearing locks (event-sourced facts,
+versioned interpretations, explainable suggestions, user-authoritative
+organization). It strengthens the weakest
 links in the existing evidence chain without replacing the
 event-sourced/local-first spine:
 
@@ -53,10 +58,19 @@ before:  capture → vault → materializers → embedding/recall(RRF) → idf-r
 after:   capture → vault → [evidence layer: Readability ensemble + rule-floor & learned gray-zone quality]
                           → [hybrid recall: RRF + quality tiebreak + explainability]
                           → idf-rkn-split active  +  Louvain measured candidate
-                          → [drift/eval: ADWIN + KSWIN + temporal silhouette, per drain]
+                          → [drift/eval SIDECAR over diagnostics: ADWIN + KSWIN + temporal silhouette, per drain — observes only; never gates output, never fails/delays the drain]
                           → LambdaMART(+lineage,+page-quality features, version-safe)
                           → sync                          (premium models deferred — ADR-0003)
 ```
+
+## Non-goal
+
+This proposal does **not** make Louvain grouping, drift alarms, or the
+learned quality scorer authoritative by default. They enter strictly as
+a measured candidate revision (R4), an observe-only diagnostic sidecar
+(R3), or a model-gated fallback that defaults to the existing rule (R1b)
+— each promoted to served behavior only by a separate, evidence-backed
+decision. Measured/candidate paths are not served truth.
 
 ## Per-rank design
 
@@ -191,12 +205,28 @@ Verification · Deferred.**
 
 ## Known issues & follow-ups
 
-- **Pre-existing flake (not a regression):** `tabsession/resolver.test.ts`
-  "deterministic signed PPR" fails only when its 10-test file runs under
-  load. `causalPpr.ts` is byte-identical to `main`; no commit here
-  touches PPR source; the single test passes 2/2 in true isolation. It
-  is an intra-file test-isolation weakness on `main` itself — fix
-  separately as test hygiene.
+- **PPR flake — tracked disposition (not waved away):**
+  `tabsession/resolver.test.ts` "deterministic signed PPR with an
+  iteration cap" intermittently fails *only under full-suite parallel
+  load* (163 files / 1180 tests, vitest parallelism + CPU contention).
+  Evidence it is resource-pressure, not a regression:
+  - `causalPpr.ts` and `resolver.ts` are **byte-identical to
+    `origin/main`**; no commit on this branch touches PPR source.
+  - Stress on this branch: `resolver.test.ts` full file **8/8 pass**
+    in file-isolation; the single PPR test **6/6 pass** in true `-t`
+    isolation → deterministic when not under whole-suite contention.
+  - The branch does **not** worsen it in isolation; the added
+    R2/R3/R4/R5 per-drain compute can only raise whole-suite CPU
+    pressure, making a timing/iteration-capped float assertion flakier
+    under parallelism — a pre-existing weakness present on `main` too.
+  - Repro: `npm --prefix packages/sidetrack-companion run test` (full,
+    parallel) flakes; `… run test -- tabsession/resolver -t
+    "deterministic signed PPR"` is green.
+  - **Disposition:** not a merge blocker for this branch (no behavior
+    change, byte-identical PPR, green in isolation), but **must be
+    issue-linked** and fixed as test-hygiene before the resolver path
+    is treated as stable — quarantine / loosen the float tolerance /
+    pin the iteration cap / run that file serially.
 - **Documented deferrals** (sensible, not gaps): R1b store wiring; R2
   quality producer; R5 beyond `closest_visit`; R4 multi-level Louvain.
 - **Engineering note:** built across six isolated parallel subagents;
