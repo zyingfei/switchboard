@@ -24,6 +24,7 @@ import {
   createRankerRevisionId,
   RANKER_MODEL_VERSION,
   trainRankerRevision,
+  type RankerRevision,
   type RankerTrainingCandidate,
 } from './train.js';
 
@@ -103,6 +104,50 @@ const syntheticTrainingSet = (): {
   };
 };
 
+const withPassingShipGate = (revision: RankerRevision): RankerRevision => {
+  const trainQuality = revision.trainQuality;
+  const methodologySpine = trainQuality?.methodologySpine;
+  if (trainQuality === undefined || methodologySpine === undefined) {
+    throw new Error('expected trained revision to include methodology spine diagnostics');
+  }
+  return {
+    ...revision,
+    trainQuality: {
+      ...trainQuality,
+      methodologySpine: {
+        ...methodologySpine,
+        shipGate: {
+          ...methodologySpine.shipGate,
+          status: 'pass',
+          reason: 'active-model-cleared-validation-and-reserved-test',
+        },
+      },
+    },
+  };
+};
+
+const withFailingShipGate = (revision: RankerRevision): RankerRevision => {
+  const trainQuality = revision.trainQuality;
+  const methodologySpine = trainQuality?.methodologySpine;
+  if (trainQuality === undefined || methodologySpine === undefined) {
+    throw new Error('expected trained revision to include methodology spine diagnostics');
+  }
+  return {
+    ...revision,
+    trainQuality: {
+      ...trainQuality,
+      methodologySpine: {
+        ...methodologySpine,
+        shipGate: {
+          ...methodologySpine.shipGate,
+          status: 'fail',
+          reason: 'reserved-test-below-floor',
+        },
+      },
+    },
+  };
+};
+
 describe('LightGBM LambdaMART ranker', () => {
   it('scores a held-out related pair above an unrelated pair after synthetic training', async () => {
     const input = syntheticTrainingSet();
@@ -169,10 +214,12 @@ describe('LightGBM LambdaMART ranker', () => {
     const root = await mkdtemp(join(tmpdir(), 'sidetrack-ranker-'));
     tempRoots.push(root);
     const input = syntheticTrainingSet();
-    const revision = await trainRankerRevision({
-      ...input,
-      options: { seed: 37, numRound: 8, trainedAt: generatedAt },
-    });
+    const revision = withPassingShipGate(
+      await trainRankerRevision({
+        ...input,
+        options: { seed: 37, numRound: 8, trainedAt: generatedAt },
+      }),
+    );
 
     await writeActiveClosestVisitRankerRevision(root, revision);
 
@@ -180,6 +227,27 @@ describe('LightGBM LambdaMART ranker', () => {
     const manifest = await readClosestVisitRankerRevisionManifest(root, revision.revisionId);
     expect(manifest?.revisionId).toBe(revision.revisionId);
     expect(manifest?.modelByteLength).toBe(revision.modelBytes.byteLength);
+    await expect(readClosestVisitRankerRevision(root, revision.revisionId)).resolves.toMatchObject({
+      revisionId: revision.revisionId,
+      trainingDatasetHash: revision.trainingDatasetHash,
+    });
+  });
+
+  it('keeps non-passing ship-gated revisions inspectable and loadable until serving gate lands', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'sidetrack-ranker-shipgate-'));
+    tempRoots.push(root);
+    const input = syntheticTrainingSet();
+    const revision = withFailingShipGate(
+      await trainRankerRevision({
+        ...input,
+        options: { seed: 39, numRound: 8, trainedAt: generatedAt },
+      }),
+    );
+
+    await writeActiveClosestVisitRankerRevision(root, revision);
+
+    const manifest = await readClosestVisitRankerRevisionManifest(root, revision.revisionId);
+    expect(manifest?.trainQuality?.methodologySpine?.shipGate.status).not.toBe('pass');
     await expect(readClosestVisitRankerRevision(root, revision.revisionId)).resolves.toMatchObject({
       revisionId: revision.revisionId,
       trainingDatasetHash: revision.trainingDatasetHash,
@@ -250,10 +318,12 @@ describe('ranker model version back-compat', () => {
     const root = await mkdtemp(join(tmpdir(), 'sidetrack-ranker-v3-'));
     tempRoots.push(root);
     const input = syntheticTrainingSet();
-    const revision = await trainRankerRevision({
-      ...input,
-      options: { seed: 41, numRound: 8, trainedAt: generatedAt },
-    });
+    const revision = withPassingShipGate(
+      await trainRankerRevision({
+        ...input,
+        options: { seed: 41, numRound: 8, trainedAt: generatedAt },
+      }),
+    );
     expect(revision.modelVersion).toBe('lightgbm-lambdamart-v3');
     expect(revision.featureSchemaVersion).toBe(3);
 

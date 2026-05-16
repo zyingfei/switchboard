@@ -7,8 +7,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { createConnectionsStore } from '../connections/snapshot.js';
 import type { ConnectionsSnapshot } from '../connections/types.js';
 import { nodeIdFor } from '../connections/types.js';
-import { USER_FLOW_CONFIRMED } from '../feedback/events.js';
-import type { FeedbackProjection, FeedbackTrainingLabel } from '../feedback/projection.js';
+import { USER_FLOW_CONFIRMED, USER_FLOW_REJECTED } from '../feedback/events.js';
+import {
+  projectFeedback,
+  type FeedbackProjection,
+  type FeedbackTrainingLabel,
+} from '../feedback/projection.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { createConnectionsMaterializer } from '../sync/contract/connectionsMaterializer.js';
 import { createEventLog } from '../sync/eventLog.js';
@@ -25,8 +29,10 @@ import {
   type WriteActiveRankerRevisionFn,
 } from './retrain.js';
 import {
+  DETERMINISTIC_BASELINE_VERSION,
   RANKER_FEATURE_KEYS,
   RANKER_MODEL_VERSION,
+  REGULARIZED_LOGISTIC_REGRESSION_VERSION,
   trainRankerRevision,
   trainRankerRevisionFromRows,
   type RankerRevision,
@@ -105,6 +111,22 @@ const feedbackEvent = (seq: number, fromId: string, toId: string): AcceptedEvent
   acceptedAtMs: observedAtMs + seq,
 });
 
+const rejectedFeedbackEvent = (seq: number, fromId: string, toId: string): AcceptedEvent => ({
+  clientEventId: `feedback-rejected-${String(seq)}`,
+  dot: { replicaId: 'replica-a', seq },
+  deps: {},
+  aggregateId: `feedback-rejected-${String(seq)}`,
+  type: USER_FLOW_REJECTED,
+  payload: {
+    payloadVersion: 1,
+    relationKind: 'closest_visit',
+    fromId,
+    toId,
+    reason: 'not-related',
+  },
+  acceptedAtMs: observedAtMs + seq,
+});
+
 const fakeRevision = (trainingDatasetHash: string): RankerRevision => ({
   revisionId: 'revision-s25',
   modelVersion: RANKER_MODEL_VERSION,
@@ -115,6 +137,31 @@ const fakeRevision = (trainingDatasetHash: string): RankerRevision => ({
 });
 
 const emptyState = (): RankerRetrainState | null => null;
+
+const fixtureDcgAt2 = (labels: readonly number[]): number =>
+  (labels[0] ?? 0) + (labels[1] ?? 0) / Math.log2(3);
+
+const fixtureMeanNdcg = (
+  labelsByGroup: readonly (readonly number[])[],
+  scoresByGroup: readonly (readonly number[])[],
+): number => {
+  let sum = 0;
+  for (let index = 0; index < labelsByGroup.length; index += 1) {
+    const labels = labelsByGroup[index] ?? [];
+    const scores = scoresByGroup[index] ?? [];
+    const ideal = [...labels].sort((left, right) => right - left);
+    const predicted = labels
+      .map((labelValue, rowIndex) => ({
+        label: labelValue,
+        score: scores[rowIndex] ?? 0,
+        rowIndex,
+      }))
+      .sort((left, right) => right.score - left.score || left.rowIndex - right.rowIndex)
+      .map((entry) => entry.label);
+    sum += fixtureDcgAt2(predicted) / fixtureDcgAt2(ideal);
+  }
+  return sum / labelsByGroup.length;
+};
 
 describe('ranker retraining loop', () => {
   it('fingerprints the training-label dataset independent of input order', () => {
@@ -378,6 +425,156 @@ describe('ranker retraining loop', () => {
     expect([...RANKER_FEATURE_KEYS]).not.toContain('user_asserted_in_workstream');
   });
 
+  it('keeps a synthetic workstream-leak fixture as evaluator calibration', () => {
+    // The live v3 scorer no longer consumes these two fields. This
+    // fixture is deliberately test-only: it re-injects the old predicate
+    // as a score to keep the Phase-0 instrument calibrated against the
+    // degenerate signature #182 describes.
+    const labelsByGroup = [
+      [0, 1],
+      [0, 1],
+      [0, 1],
+      [0, 1],
+    ] as const;
+    const leakedScoresByGroup = [
+      [0, 2],
+      [0, 2],
+      [0, 2],
+      [0, 2],
+    ] as const;
+    const ablatedScoresByGroup = [
+      [0, 0],
+      [0, 0],
+      [0, 0],
+      [0, 0],
+    ] as const;
+    const permutedLabelsByGroup = [
+      [1, 0],
+      [1, 0],
+      [1, 0],
+      [1, 0],
+    ] as const;
+    const permutedLeakedScoresByGroup = [
+      [2, 0],
+      [2, 0],
+      [2, 0],
+      [2, 0],
+    ] as const;
+
+    expect(fixtureMeanNdcg(labelsByGroup, leakedScoresByGroup)).toBe(1);
+    expect(fixtureMeanNdcg(labelsByGroup, ablatedScoresByGroup)).toBeLessThan(0.7);
+    expect(fixtureMeanNdcg(permutedLabelsByGroup, permutedLeakedScoresByGroup)).toBe(1);
+  });
+
+  it('uses feedback event timestamps for realistic held-out splitting', async () => {
+    const merged: AcceptedEvent[] = [];
+    const urls: string[] = [];
+    for (let group = 0; group < 5; group += 1) {
+      const from = `https://example.test/realistic-from-${String(group)}`;
+      const positive = `https://example.test/realistic-positive-${String(group)}`;
+      const negative = `https://example.test/realistic-negative-${String(group)}`;
+      urls.push(from, positive, negative);
+      merged.push(
+        {
+          ...feedbackEvent(group * 10 + 1, from, positive),
+          acceptedAtMs: observedAtMs + group * 10_000,
+        },
+        {
+          ...rejectedFeedbackEvent(group * 10 + 2, from, negative),
+          acceptedAtMs: observedAtMs + group * 10_000 + 1,
+        },
+      );
+    }
+
+    const feedback = projectFeedback(merged);
+    const candidates = buildRankerTrainingCandidates({
+      feedback,
+      merged,
+      snapshot: snapshotWithVisits(urls),
+      randomNegativeCandidatesPerPositive: 0,
+    });
+    const candidateTimes = new Set(candidates.map((candidate) => candidate.candidate.generatedAt));
+    expect(candidateTimes.size).toBeGreaterThan(1);
+
+    const revision = await trainRankerRevision({
+      feedback,
+      candidates,
+      options: { numRound: 5, trainedAt: observedAtMs },
+    });
+
+    expect(revision.trainQuality?.heldOutMetric).toMatchObject({
+      kind: 'time-split held-out ndcg@5',
+      trainGroupCount: 3,
+      heldOutGroupCount: 1,
+    });
+    expect(revision.trainQuality?.methodologySpine).toMatchObject({
+      split: {
+        status: 'available',
+        trainGroupCount: 3,
+        validationGroupCount: 1,
+        testGroupCount: 1,
+      },
+      novelPairSlice: {
+        rowCount: 2,
+        positiveRows: 1,
+        negativeRows: 1,
+      },
+      labelPermutation: {
+        rowCount: 2,
+        groupCount: 1,
+        metric: {
+          kind: 'label-permutation validation ndcg@5',
+        },
+      },
+      workstreamFeatureAblation: {
+        status: 'not-in-feature-vector',
+      },
+    });
+    expect(
+      revision.trainQuality?.methodologySpine?.labelPermutation.metric?.value,
+    ).toBeGreaterThanOrEqual(0);
+    expect(
+      revision.trainQuality?.methodologySpine?.labelPermutation.metric?.value,
+    ).toBeLessThanOrEqual(1);
+    expect(revision.trainQuality?.methodologySpine?.reservedTestMetric).toMatchObject({
+      kind: 'reserved-test ndcg@5',
+      rowCount: 2,
+      groupCount: 1,
+    });
+    expect(revision.trainQuality?.methodologySpine?.tuning).toMatchObject({
+      status: 'available',
+      strategy: 'validation-num-round-grid',
+      requestedNumRound: 5,
+      validationCandidateCount: 3,
+    });
+    expect(
+      revision.trainQuality?.methodologySpine?.tuning.candidates.map((item) => item.numRound),
+    ).toEqual([2, 5, 10]);
+    expect(revision.trainQuality?.methodologySpine?.modelChoice).toMatchObject({
+      deterministicBaseline: {
+        candidate: DETERMINISTIC_BASELINE_VERSION,
+      },
+      activeModel: {
+        candidate: RANKER_MODEL_VERSION,
+      },
+      regularizedLogisticRegression: {
+        candidate: REGULARIZED_LOGISTIC_REGRESSION_VERSION,
+      },
+      graduation: {
+        minValidationDelta: 0.005,
+      },
+    });
+    expect(revision.trainQuality?.methodologySpine?.shipGate).toMatchObject({
+      candidate: RANKER_MODEL_VERSION,
+      reservedTestUsedExactlyOnce: true,
+      minValidationDeltaVsBaseline: 0.005,
+      minReservedTestNdcg: 0.5,
+    });
+    expect(['pass', 'fail', 'unavailable']).toContain(
+      revision.trainQuality?.methodologySpine?.shipGate.status,
+    );
+  });
+
   it('reports an honest time-split held-out metric when row timestamps allow it', async () => {
     const rows: RankerTrainingRow[] = [];
     for (let group = 0; group < 5; group += 1) {
@@ -431,8 +628,19 @@ describe('ranker retraining loop', () => {
 
     expect(revision.trainQuality?.heldOutMetric).toMatchObject({
       kind: 'time-split held-out ndcg@5',
-      trainGroupCount: 4,
+      trainGroupCount: 3,
       heldOutGroupCount: 1,
+    });
+    expect(revision.trainQuality?.methodologySpine?.split).toMatchObject({
+      status: 'available',
+      trainGroupCount: 3,
+      validationGroupCount: 1,
+      testGroupCount: 1,
+    });
+    expect(revision.trainQuality?.methodologySpine?.reservedTestMetric).toMatchObject({
+      kind: 'reserved-test ndcg@5',
+      rowCount: 2,
+      groupCount: 1,
     });
     expect(revision.trainQuality?.heldOutMetric?.value).toBeGreaterThanOrEqual(0);
     expect(revision.trainQuality?.heldOutMetric?.value).toBeLessThanOrEqual(1);
