@@ -1043,6 +1043,130 @@ describe('ConnectionsView — engineering scaffold', () => {
     expect(screen.queryByTestId('focus-topic-topic:db')).toBeNull();
   });
 
+  it('records closest_visit rejection when removing a scoped focus visit', async () => {
+    const anchorId = 'timeline-visit:https://example.test/oracle';
+    const removedId = 'timeline-visit:https://example.test/aws';
+    const snapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: { nodeId: anchorId, hops: 1 },
+        nodes: [
+          {
+            id: anchorId,
+            kind: 'timeline-visit',
+            label: 'Oracle page',
+            originReplicaIds: ['replica-A'],
+            metadata: {
+              canonicalUrl: 'https://example.test/oracle',
+              focusedWindowMs: 8_000,
+            },
+            firstSeenAt: '2026-05-14T10:00:00.000Z',
+            lastSeenAt: '2026-05-14T10:00:00.000Z',
+          },
+          {
+            id: removedId,
+            kind: 'timeline-visit',
+            label: 'AWS page',
+            originReplicaIds: ['replica-A'],
+            metadata: {
+              canonicalUrl: 'https://example.test/aws',
+              focusedWindowMs: 6_000,
+            },
+            firstSeenAt: '2026-05-14T10:01:00.000Z',
+            lastSeenAt: '2026-05-14T10:01:00.000Z',
+          },
+          {
+            id: 'topic:db',
+            kind: 'topic',
+            label: 'Database pages',
+            originReplicaIds: [],
+            metadata: { memberCount: 2, cohesion: 0.91 },
+          },
+        ],
+        edges: [
+          {
+            id: 'edge:topic-anchor',
+            kind: 'visit_in_topic',
+            fromNodeId: anchorId,
+            toNodeId: 'topic:db',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-shadow' },
+            confidence: 'inferred',
+          },
+          {
+            id: 'edge:topic-removed',
+            kind: 'visit_in_topic',
+            fromNodeId: removedId,
+            toNodeId: 'topic:db',
+            observedAt: '2026-05-14T10:01:00.000Z',
+            producedBy: { source: 'topic-shadow' },
+            confidence: 'inferred',
+          },
+        ],
+        updatedAt: '2026-05-14T10:01:00.000Z',
+        nodeCount: 3,
+        edgeCount: 2,
+      },
+    };
+    const feedbackMessages: unknown[] = [];
+
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        return { ok: true, data: snapshot };
+      }
+      if (m.type === messageTypes.loadConnectionsSnapshot) {
+        return { ok: true, data: snapshot };
+      }
+      if (m.type === messageTypes.postConnectionsFeedbackEvent) {
+        feedbackMessages.push(msg);
+        return { ok: true, data: { accepted: true } };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+
+    render(<ConnectionsView initialAnchor={anchorId} />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-mode-focus')).not.toBeNull();
+    });
+    fireEvent.click(screen.getByTestId('connections-mode-focus'));
+    await waitFor(() => {
+      expect(screen.queryByTestId('focus-topic-topic:db')).not.toBeNull();
+    });
+    fireEvent.click(screen.getByText('Database pages'));
+    fireEvent.click(screen.getByTestId(`focus-visit-not-related-topic:db-${removedId}`));
+
+    await waitFor(() => {
+      expect(feedbackMessages).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            event: {
+              type: 'user.flow.rejected',
+              payload: {
+                payloadVersion: 1,
+                relationKind: 'closest_visit',
+                fromId: anchorId,
+                toId: removedId,
+                reason: 'not-related',
+              },
+            },
+          }),
+          expect.objectContaining({
+            event: expect.objectContaining({
+              type: 'user.organized.item',
+              payload: expect.objectContaining({
+                itemKind: 'visit',
+                itemId: removedId,
+                action: 'ignore',
+                fromContainer: 'topic:db',
+              }),
+            }),
+          }),
+        ]),
+      );
+    });
+  });
+
   it('can re-anchor from a visible neighbor row', async () => {
     const requestedNodeIds: string[] = [];
     setConnectionsClientTransportForTests(async (msg) => {

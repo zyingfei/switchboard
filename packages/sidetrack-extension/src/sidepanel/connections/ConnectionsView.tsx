@@ -1833,9 +1833,22 @@ export const ConnectionsView = ({
 
   const submitVisitMarkNotRelated = async (input: {
     readonly topicId: string;
+    readonly fromVisitId?: string;
     readonly visitId: string;
     readonly memberVisitIds: readonly string[];
   }): Promise<void> => {
+    if (input.fromVisitId !== undefined && input.fromVisitId !== input.visitId) {
+      const flowResponse = await postUserFlowRejected({
+        relationKind: 'closest_visit',
+        fromId: input.fromVisitId,
+        toId: input.visitId,
+        reason: 'not-related',
+      });
+      if (!flowResponse.ok) {
+        throw new Error(flowResponse.error ?? 'visit-topic rejection feedback failed');
+      }
+    }
+
     const response = await postUserOrganizedItem({
       itemKind: 'visit',
       itemId: input.visitId,

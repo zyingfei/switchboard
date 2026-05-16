@@ -92,6 +92,7 @@ export interface FocusViewProps {
   }) => Promise<void> | void;
   readonly onVisitMarkNotRelated?: (input: {
     readonly topicId: string;
+    readonly fromVisitId?: string;
     readonly visitId: string;
     readonly memberVisitIds: readonly string[];
   }) => Promise<void> | void;
@@ -421,7 +422,14 @@ export const FocusView = ({
       next.add(visitId);
       return { ...current, [topic.id]: next };
     });
-    void Promise.resolve(onVisitMarkNotRelated({ topicId: topic.id, visitId, memberVisitIds }))
+    void Promise.resolve(
+      onVisitMarkNotRelated({
+        topicId: topic.id,
+        ...(anchorVisitId === undefined ? {} : { fromVisitId: anchorVisitId }),
+        visitId,
+        memberVisitIds,
+      }),
+    )
       .catch((error: unknown) => {
         setRejectedVisitIdsByTopic((current) => {
           const next = new Set(current[topic.id] ?? []);
