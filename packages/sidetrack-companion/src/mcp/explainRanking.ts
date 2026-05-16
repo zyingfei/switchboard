@@ -129,12 +129,6 @@ const topContributions = (
 
 const reasonDefinitions: readonly ReasonDefinition[] = [
   {
-    code: 'SAME_WORKSTREAM',
-    features: ['same_workstream'],
-    payload: (features) =>
-      features.same_workstream === 1 ? { feature: 'same_workstream', value: 1 } : null,
-  },
-  {
     code: 'OPENER_CHAIN',
     features: ['opener_chain_depth'],
     payload: (features) =>
@@ -227,14 +221,6 @@ const reasonDefinitions: readonly ReasonDefinition[] = [
     payload: (features) =>
       features.user_asserted_in_thread === 1
         ? { feature: 'user_asserted_in_thread', value: 1 }
-        : null,
-  },
-  {
-    code: 'USER_ASSERTED_IN_WORKSTREAM',
-    features: ['user_asserted_in_workstream'],
-    payload: (features) =>
-      features.user_asserted_in_workstream === 1
-        ? { feature: 'user_asserted_in_workstream', value: 1 }
         : null,
   },
 ];

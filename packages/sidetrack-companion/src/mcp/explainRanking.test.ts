@@ -104,7 +104,7 @@ const snapshot: ConnectionsSnapshot = {
 const contributions = (overrides: Partial<Record<keyof CandidatePairFeatures, number>>) =>
   ({
     schemaVersion: 0.1,
-    same_workstream: 0.31,
+    same_workstream: 0,
     opener_chain_depth: 0,
     in_navigation_chain: 0,
     same_canonical_url: 0,
@@ -121,7 +121,7 @@ const contributions = (overrides: Partial<Record<keyof CandidatePairFeatures, nu
     return_count_from: 0,
     return_count_to: 0,
     user_asserted_in_thread: 0,
-    user_asserted_in_workstream: 0.05,
+    user_asserted_in_workstream: 0,
     same_active_topic: 0,
     topic_lineage_merge_split_related: 0,
     page_quality_tier_from: 0,
@@ -149,7 +149,7 @@ describe('sidetrack.debug.explainRanking', () => {
   it('returns exact stable debug JSON for a fixture visit pair', async () => {
     await expect(explainRanking({ from: fromVisit, to: toVisit }, deps())).resolves.toEqual({
       features: {
-        schemaVersion: 2,
+        schemaVersion: 3,
         same_workstream: 1,
         opener_chain_depth: 0,
         in_navigation_chain: 0,
@@ -177,7 +177,7 @@ describe('sidetrack.debug.explainRanking', () => {
       revisionId: 'ranker-rev-fixture',
       score: 0.812346,
       contributions: [
-        { feature: 'same_workstream', weight: 0.31 },
+        { feature: 'same_workstream', weight: 0 },
         { feature: 'opener_chain_depth', weight: 0 },
         { feature: 'in_navigation_chain', weight: 0 },
         { feature: 'same_canonical_url', weight: 0 },
@@ -194,7 +194,7 @@ describe('sidetrack.debug.explainRanking', () => {
         { feature: 'return_count_from', weight: 0 },
         { feature: 'return_count_to', weight: 0 },
         { feature: 'user_asserted_in_thread', weight: 0 },
-        { feature: 'user_asserted_in_workstream', weight: 0.05 },
+        { feature: 'user_asserted_in_workstream', weight: 0 },
         { feature: 'same_active_topic', weight: 0 },
         { feature: 'topic_lineage_merge_split_related', weight: 0 },
         { feature: 'page_quality_tier_from', weight: 0 },
@@ -206,23 +206,18 @@ describe('sidetrack.debug.explainRanking', () => {
           payload: {
             score: 0.812346,
             topContributions: [
-              { feature: 'same_workstream', weight: 0.31 },
               { feature: 'cosine_similarity', weight: 0.22 },
               { feature: 'same_host', weight: 0.12 },
+              { feature: 'shared_path_tokens', weight: 0.11 },
             ],
           },
         },
-        { code: 'SAME_WORKSTREAM', payload: { feature: 'same_workstream', value: 1 } },
         { code: 'COSINE_SIMILARITY', payload: { value: 0.82 } },
         { code: 'SAME_HOST', payload: { feature: 'same_host', value: 1 } },
         { code: 'SHARED_PATH_TOKENS', payload: { count: 2 } },
         {
           code: 'ENGAGEMENT_CLASS_MATCH',
           payload: { feature: 'engagement_class_match', value: 1 },
-        },
-        {
-          code: 'USER_ASSERTED_IN_WORKSTREAM',
-          payload: { feature: 'user_asserted_in_workstream', value: 1 },
         },
         { code: 'RECENCY', payload: { from: 1, to: 1 } },
         { code: 'SHARED_TITLE_TOKENS', payload: { count: 2 } },

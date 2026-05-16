@@ -2,12 +2,11 @@ import type { ConnectionsSnapshot } from '../connections/types.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import type { Candidate } from './types.js';
 
-// Bumped 1 → 2 when the lineage-aware + page-content-quality features
-// were appended (R5 ranker expansion). The feature *set* is part of
-// the model identity, so a schema bump forces a new ranker revision
-// and lets persisted models trained on the v1 feature count be
-// rejected (graceful fall back to retrain) instead of mis-scoring.
-export const FEATURE_SCHEMA_VERSION = 2;
+// Bumped 2 → 3 when the closest_visit scorer stopped consuming
+// workstream-identity leakage features. Persisted v2 models are
+// rejected so the scorer cannot keep emitting edges from a model whose
+// input vector was trained on leaked workstream closure.
+export const FEATURE_SCHEMA_VERSION = 3;
 
 export interface CandidatePairFeatures {
   schemaVersion: typeof FEATURE_SCHEMA_VERSION;

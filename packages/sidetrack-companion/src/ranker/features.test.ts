@@ -238,13 +238,13 @@ describe('ranker feature schema', () => {
     const first = JSON.stringify(extract());
     const second = JSON.stringify(extract());
 
-    expect(FEATURE_SCHEMA_VERSION).toBe(2);
+    expect(FEATURE_SCHEMA_VERSION).toBe(3);
     expect(first).toBe(second);
     expect(Object.keys(JSON.parse(first) as Record<string, unknown>)).toEqual(
       CANDIDATE_PAIR_FEATURE_KEYS,
     );
     expect(JSON.parse(first) as CandidatePairFeatures).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       same_workstream: 0,
       opener_chain_depth: 0,
       in_navigation_chain: 0,

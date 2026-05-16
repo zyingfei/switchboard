@@ -13,17 +13,17 @@ import {
 } from './feature-schema.js';
 import type { Candidate } from './types.js';
 
-// Bumped v1 → v2 alongside FEATURE_SCHEMA_VERSION 1 → 2: the R5
-// lineage + page-quality features change the model input vector, so
-// this is a new model revision. The closest-visit manifest validator
-// pins this exact string, so a model persisted under v1 fails to
-// load and the retrain loop produces a fresh v2 model rather than
-// feeding a v1 booster a v2-width feature row.
-export const RANKER_MODEL_VERSION = 'lightgbm-lambdamart-v2' as const;
+// Bumped v2 → v3 alongside FEATURE_SCHEMA_VERSION 2 → 3: the
+// closest_visit scorer no longer consumes workstream-identity leakage
+// features. The manifest validator pins this exact string, so a model
+// persisted under v2 fails to load and the retrain loop produces a
+// fresh non-leaky model instead of reusing leaked weights.
+export const RANKER_MODEL_VERSION = 'lightgbm-lambdamart-v3' as const;
 export const DEFAULT_RANKER_NUM_ROUND = 40;
 export const DEFAULT_RANKER_SEED = 20260508;
 // k for the in-sample NDCG@k offline metric captured at train time.
 export const RANKER_IN_SAMPLE_NDCG_K = 5;
+export const RANKER_HELD_OUT_NDCG_K = 5;
 
 export type RankerGrade = '0' | '1' | '2' | '3' | '4';
 
@@ -39,6 +39,20 @@ export type RankerGrade = '0' | '1' | '2' | '3' | '4';
 export interface RankerTrainQuality {
   /** Count of training rows per relevance grade 0..4. Always present. */
   readonly gradeHistogram: Record<RankerGrade, number>;
+  /**
+   * Labeling accountability for the candidate pool passed to training.
+   * Unlabeled candidates are still excluded because there is no
+   * supervision for them, but the exclusion is now explicit and visible
+   * instead of being a silent `null` drop.
+   */
+  readonly candidateLabeling: {
+    readonly totalCandidates: number;
+    readonly labeledRows: number;
+    readonly positiveRows: number;
+    readonly negativeRows: number;
+    readonly implicitNegativeRows: number;
+    readonly unlabeledCandidateCount: number;
+  };
   /**
    * Spread of the freshly trained model's scores over the SAME training
    * rows. Computed by reusing the in-process booster (a single extra
@@ -62,6 +76,18 @@ export interface RankerTrainQuality {
     readonly kind: string;
     readonly value: number;
   };
+  /**
+   * Time-split held-out metric when the training rows contain enough
+   * query groups across at least two candidate timestamps. Unlike the
+   * in-sample metric, these rows are not included in the trained model.
+   */
+  readonly heldOutMetric?: {
+    readonly kind: string;
+    readonly value: number;
+    readonly trainGroupCount: number;
+    readonly heldOutGroupCount: number;
+    readonly cutoffGeneratedAt: number;
+  };
 }
 
 export interface RankerRevision {
@@ -83,6 +109,20 @@ export interface RankerTrainingRow extends RankerTrainingCandidate {
   readonly label: number;
 }
 
+export interface RankerTrainingLabelingSummary {
+  readonly totalCandidates: number;
+  readonly labeledRows: number;
+  readonly positiveRows: number;
+  readonly negativeRows: number;
+  readonly implicitNegativeRows: number;
+  readonly unlabeledCandidateCount: number;
+}
+
+export interface RankerTrainingRowsResult {
+  readonly rows: readonly RankerTrainingRow[];
+  readonly labelingSummary: RankerTrainingLabelingSummary;
+}
+
 export interface TrainRankerOptions {
   readonly seed?: number;
   readonly numRound?: number;
@@ -98,7 +138,6 @@ export interface TrainRankerInput {
 type RankerFeatureKey = Exclude<keyof CandidatePairFeatures, 'schemaVersion'>;
 
 export const RANKER_FEATURE_KEYS = [
-  'same_workstream',
   'opener_chain_depth',
   'in_navigation_chain',
   'same_canonical_url',
@@ -115,9 +154,9 @@ export const RANKER_FEATURE_KEYS = [
   'return_count_from',
   'return_count_to',
   'user_asserted_in_thread',
-  'user_asserted_in_workstream',
-  // R5 expansion — appended so the column index of every existing
-  // feature is unchanged; only new trailing columns are added.
+  // R5 lineage/page-quality features remain after the v3 de-leak. The
+  // removed workstream-identity fields still exist on the debug feature
+  // object for other consumers, but they are not model inputs.
   'same_active_topic',
   'topic_lineage_merge_split_related',
   'page_quality_tier_from',
@@ -190,44 +229,97 @@ const candidateHasImplicitNegativeSource = (candidate: Candidate): boolean =>
     (source) => source === 'random_unrelated' || source === 'recently_skipped',
   );
 
-const relevanceForCandidate = (
+type CandidateTrainingLabel =
+  | { readonly kind: 'positive'; readonly label: number }
+  | { readonly kind: 'negative'; readonly label: 0; readonly implicit: false }
+  | { readonly kind: 'negative'; readonly label: 0; readonly implicit: true }
+  | { readonly kind: 'unlabeled' };
+
+const trainingLabelForCandidate = (
   candidate: Candidate,
   positiveWeights: ReadonlyMap<string, number>,
   negativeWeights: ReadonlyMap<string, number>,
-): number | null => {
+): CandidateTrainingLabel => {
   const key = pairKey(candidate.fromVisitId, candidate.toVisitId);
   const positive = positiveWeights.get(key) ?? 0;
   const negative = negativeWeights.get(key) ?? 0;
-  if (positive > negative) return Math.min(4, Math.max(1, Math.round(positive)));
-  if (negative > 0 || candidateHasImplicitNegativeSource(candidate)) return 0;
-  return null;
+  if (positive > negative) {
+    return { kind: 'positive', label: Math.min(4, Math.max(1, Math.round(positive))) };
+  }
+  if (negative > 0) return { kind: 'negative', label: 0, implicit: false };
+  if (candidateHasImplicitNegativeSource(candidate)) {
+    return { kind: 'negative', label: 0, implicit: true };
+  }
+  return { kind: 'unlabeled' };
+};
+
+export const buildRankerTrainingRowsWithSummary = (
+  feedback: FeedbackProjection,
+  candidates: readonly RankerTrainingCandidate[],
+): RankerTrainingRowsResult => {
+  const positiveWeights = labelWeights(feedback.positiveLabels);
+  const negativeWeights = labelWeights(feedback.negativeLabels);
+  const rows: RankerTrainingRow[] = [];
+  let positiveRows = 0;
+  let negativeRows = 0;
+  let implicitNegativeRows = 0;
+  let unlabeledCandidateCount = 0;
+
+  for (const item of candidates) {
+    const label = trainingLabelForCandidate(item.candidate, positiveWeights, negativeWeights);
+    if (label.kind === 'unlabeled') {
+      unlabeledCandidateCount += 1;
+      continue;
+    }
+    if (label.kind === 'positive') positiveRows += 1;
+    if (label.kind === 'negative') {
+      negativeRows += 1;
+      if (label.implicit) implicitNegativeRows += 1;
+    }
+    rows.push({ ...item, label: label.label });
+  }
+
+  const sortedRows = rows.sort(compareTrainingRow);
+  return {
+    rows: sortedRows,
+    labelingSummary: {
+      totalCandidates: candidates.length,
+      labeledRows: sortedRows.length,
+      positiveRows,
+      negativeRows,
+      implicitNegativeRows,
+      unlabeledCandidateCount,
+    },
+  };
 };
 
 export const buildRankerTrainingRows = (
   feedback: FeedbackProjection,
   candidates: readonly RankerTrainingCandidate[],
-): readonly RankerTrainingRow[] => {
-  const positiveWeights = labelWeights(feedback.positiveLabels);
-  const negativeWeights = labelWeights(feedback.negativeLabels);
-  const rows: RankerTrainingRow[] = [];
-
-  for (const item of candidates) {
-    const label = relevanceForCandidate(item.candidate, positiveWeights, negativeWeights);
-    if (label === null) continue;
-    rows.push({ ...item, label });
-  }
-
-  return rows.sort(compareTrainingRow);
-};
+): readonly RankerTrainingRow[] => buildRankerTrainingRowsWithSummary(feedback, candidates).rows;
 
 const compareTrainingRow = (left: RankerTrainingRow, right: RankerTrainingRow): number =>
   compareText(left.candidate.fromVisitId, right.candidate.fromVisitId) ||
   compareText(left.candidate.toVisitId, right.candidate.toVisitId) ||
   right.label - left.label;
 
-const groupUsableRows = (
-  rows: readonly RankerTrainingRow[],
-): { readonly rows: readonly RankerTrainingRow[]; readonly groupSizes: readonly number[] } => {
+interface UsableRankerRowGroup {
+  readonly fromId: string;
+  readonly rows: readonly RankerTrainingRow[];
+  readonly generatedAt: number;
+}
+
+const maxGeneratedAt = (rows: readonly RankerTrainingRow[]): number => {
+  let generatedAt = 0;
+  for (const row of rows) {
+    if (Number.isFinite(row.candidate.generatedAt)) {
+      generatedAt = Math.max(generatedAt, row.candidate.generatedAt);
+    }
+  }
+  return generatedAt;
+};
+
+const usableRowGroups = (rows: readonly RankerTrainingRow[]): readonly UsableRankerRowGroup[] => {
   const byFrom = new Map<string, RankerTrainingRow[]>();
   for (const row of rows) {
     const group = byFrom.get(row.candidate.fromVisitId);
@@ -238,17 +330,67 @@ const groupUsableRows = (
     }
   }
 
-  const usableRows: RankerTrainingRow[] = [];
-  const groupSizes: number[] = [];
+  const groups: UsableRankerRowGroup[] = [];
   for (const fromId of [...byFrom.keys()].sort(compareText)) {
     const group = [...(byFrom.get(fromId) ?? [])].sort(compareTrainingRow);
     const labels = new Set(group.map((row) => row.label));
     if (group.length < 2 || labels.size < 2) continue;
-    usableRows.push(...group);
-    groupSizes.push(group.length);
+    groups.push({ fromId, rows: group, generatedAt: maxGeneratedAt(group) });
   }
+  return groups;
+};
 
-  return { rows: usableRows, groupSizes };
+const flattenRowGroups = (
+  groups: readonly UsableRankerRowGroup[],
+): { readonly rows: readonly RankerTrainingRow[]; readonly groupSizes: readonly number[] } => {
+  const rows: RankerTrainingRow[] = [];
+  const groupSizes: number[] = [];
+  for (const group of groups) {
+    rows.push(...group.rows);
+    groupSizes.push(group.rows.length);
+  }
+  return { rows, groupSizes };
+};
+
+interface TimeSplitRankerRows {
+  readonly trainGroups: readonly UsableRankerRowGroup[];
+  readonly heldOutGroups: readonly UsableRankerRowGroup[];
+  readonly cutoffGeneratedAt: number;
+}
+
+const timeSplitGroups = (groups: readonly UsableRankerRowGroup[]): TimeSplitRankerRows | null => {
+  if (groups.length < 3) return null;
+  const sorted = [...groups].sort(
+    (left, right) => left.generatedAt - right.generatedAt || compareText(left.fromId, right.fromId),
+  );
+  if (new Set(sorted.map((group) => group.generatedAt)).size < 2) return null;
+  const heldOutCount = Math.max(1, Math.floor(sorted.length * 0.2));
+  const trainGroups = sorted.slice(0, sorted.length - heldOutCount);
+  const heldOutGroups = sorted.slice(sorted.length - heldOutCount);
+  if (trainGroups.length === 0 || heldOutGroups.length === 0) return null;
+  const cutoffGeneratedAt = Math.max(...trainGroups.map((group) => group.generatedAt));
+  const earliestHeldOut = Math.min(...heldOutGroups.map((group) => group.generatedAt));
+  if (earliestHeldOut <= cutoffGeneratedAt) return null;
+  return { trainGroups, heldOutGroups, cutoffGeneratedAt };
+};
+
+const defaultLabelingSummary = (
+  rows: readonly RankerTrainingRow[],
+): RankerTrainingLabelingSummary => {
+  let positiveRows = 0;
+  let negativeRows = 0;
+  for (const row of rows) {
+    if (row.label > 0) positiveRows += 1;
+    else negativeRows += 1;
+  }
+  return {
+    totalCandidates: rows.length,
+    labeledRows: rows.length,
+    positiveRows,
+    negativeRows,
+    implicitNegativeRows: 0,
+    unlabeledCandidateCount: 0,
+  };
 };
 
 const stableFeatureObject = (
@@ -307,16 +449,6 @@ export const encodeRankerFeatureMatrix = (
 
 const labelsForRows = (rows: readonly RankerTrainingRow[]): Float32Array =>
   new Float32Array(rows.map((row) => row.label));
-
-const maxGeneratedAt = (rows: readonly RankerTrainingRow[]): number => {
-  let generatedAt = 0;
-  for (const row of rows) {
-    if (Number.isFinite(row.candidate.generatedAt)) {
-      generatedAt = Math.max(generatedAt, row.candidate.generatedAt);
-    }
-  }
-  return generatedAt;
-};
 
 const lightGbmParamString = (
   options: Required<Pick<TrainRankerOptions, 'seed' | 'numRound'>>,
@@ -392,8 +524,6 @@ const setLightGbmGroupField = async (
   }
 };
 
-const RANKER_GRADES = ['0', '1', '2', '3', '4'] as const satisfies readonly RankerGrade[];
-
 const gradeHistogramForRows = (rows: readonly RankerTrainingRow[]): Record<RankerGrade, number> => {
   const histogram: Record<RankerGrade, number> = { '0': 0, '1': 0, '2': 0, '3': 0, '4': 0 };
   for (const row of rows) {
@@ -441,13 +571,7 @@ const dcgAtK = (gains: readonly number[], k: number): number => {
   return dcg;
 };
 
-/**
- * Mean in-sample NDCG@k over query groups. Each group is ordered by the
- * trained model's score (desc) and scored against its graded labels. A
- * group whose ideal DCG is 0 (no positive grades) is skipped — it
- * carries no ranking signal. In-sample by construction.
- */
-const inSampleNdcg = (
+const ndcgForGroupedRows = (
   rows: readonly RankerTrainingRow[],
   groupSizes: readonly number[],
   scores: readonly number[],
@@ -479,13 +603,16 @@ const inSampleNdcg = (
 export const trainRankerRevisionFromRows = async (
   rowsInput: readonly RankerTrainingRow[],
   options: TrainRankerOptions = {},
+  labelingSummary: RankerTrainingLabelingSummary = defaultLabelingSummary(rowsInput),
 ): Promise<RankerRevision> => {
-  const { rows, groupSizes } = groupUsableRows(rowsInput);
-  if (rows.length === 0 || groupSizes.length === 0) {
+  const allGroups = usableRowGroups(rowsInput);
+  if (allGroups.length === 0) {
     throw new Error(
       'ranker training requires at least one query group with positive and negative labels',
     );
   }
+  const split = timeSplitGroups(allGroups);
+  const { rows, groupSizes } = flattenRowGroups(split?.trainGroups ?? allGroups);
 
   const seed = options.seed ?? DEFAULT_RANKER_SEED;
   const numRound = options.numRound ?? DEFAULT_RANKER_NUM_ROUND;
@@ -515,10 +642,46 @@ export const trainRankerRevisionFromRows = async (
       const spread = scores.length === rows.length ? scoreSpread(scores) : undefined;
       const ndcg =
         scores.length === rows.length
-          ? inSampleNdcg(rows, groupSizes, scores, RANKER_IN_SAMPLE_NDCG_K)
+          ? ndcgForGroupedRows(rows, groupSizes, scores, RANKER_IN_SAMPLE_NDCG_K)
           : undefined;
+      const heldOut = (() => {
+        if (split === null) return undefined;
+        const heldOutRows = flattenRowGroups(split.heldOutGroups);
+        if (heldOutRows.rows.length === 0 || heldOutRows.groupSizes.length === 0) {
+          return undefined;
+        }
+        const heldOutMatrix = encodeRankerFeatureMatrix(
+          heldOutRows.rows.map((row) => row.features),
+        );
+        const rawHeldOutScores = booster.predict(
+          heldOutMatrix,
+          heldOutRows.rows.length,
+          RANKER_FEATURE_KEYS.length,
+          {},
+        );
+        const heldOutScores: number[] = [];
+        for (const score of rawHeldOutScores) {
+          if (Number.isFinite(score)) heldOutScores.push(score);
+        }
+        if (heldOutScores.length !== heldOutRows.rows.length) return undefined;
+        const value = ndcgForGroupedRows(
+          heldOutRows.rows,
+          heldOutRows.groupSizes,
+          heldOutScores,
+          RANKER_HELD_OUT_NDCG_K,
+        );
+        if (value === undefined) return undefined;
+        return {
+          kind: `time-split held-out ndcg@${String(RANKER_HELD_OUT_NDCG_K)}`,
+          value,
+          trainGroupCount: split.trainGroups.length,
+          heldOutGroupCount: split.heldOutGroups.length,
+          cutoffGeneratedAt: split.cutoffGeneratedAt,
+        };
+      })();
       const trainQuality: RankerTrainQuality = {
         gradeHistogram: gradeHistogramForRows(rows),
+        candidateLabeling: labelingSummary,
         ...(spread === undefined ? {} : { scoreSpread: spread }),
         ...(ndcg === undefined
           ? {}
@@ -528,13 +691,14 @@ export const trainRankerRevisionFromRows = async (
                 value: ndcg,
               },
             }),
+        ...(heldOut === undefined ? {} : { heldOutMetric: heldOut }),
       };
       return {
         revisionId,
         modelVersion: RANKER_MODEL_VERSION,
         featureSchemaVersion: FEATURE_SCHEMA_VERSION,
         trainingDatasetHash,
-        trainedAt: options.trainedAt ?? maxGeneratedAt(rows),
+        trainedAt: options.trainedAt ?? maxGeneratedAt(rowsInput),
         modelBytes: toOwnedArrayBuffer(booster.saveModel()),
         trainQuality,
       };
@@ -547,7 +711,11 @@ export const trainRankerRevisionFromRows = async (
 };
 
 export const trainRankerRevision = async (input: TrainRankerInput): Promise<RankerRevision> =>
-  trainRankerRevisionFromRows(
-    buildRankerTrainingRows(input.feedback, input.candidates),
-    input.options ?? {},
-  );
+  (() => {
+    const trainingRows = buildRankerTrainingRowsWithSummary(input.feedback, input.candidates);
+    return trainRankerRevisionFromRows(
+      trainingRows.rows,
+      input.options ?? {},
+      trainingRows.labelingSummary,
+    );
+  })();
