@@ -6,7 +6,7 @@
 > is not polluted with completed work. Update this doc as items close;
 > do not re-narrate the diagnosis (that is #179/#182).
 
-## Status as of 2026-05-16 (verified against `origin/main` `626de70a`)
+## Status as of 2026-05-16 (verified against `origin/main` `e07d09b4`)
 
 | PR | What | State |
 |---|---|---|
@@ -18,6 +18,8 @@
 | #185 | vNext implementation plan | **MERGED → main** 09:49Z |
 | #186 | Ship-gate health diagnostics (`/v1/system/health` + work-graph health) | **MERGED → main** 10:01Z |
 | #187 | Fast-fail `no-usable-query-groups` retrain preflight | **MERGED → main** 11:12Z |
+| #188 | Dogfood blocker note: real-vault retrain is blocked by missing legitimate positive visit-pair supervision | **MERGED → main** 11:16Z |
+| #189 | Focus positive feedback UI: scoped `Keep` action emits explicit `USER_FLOW_CONFIRMED` / `closest_visit` visit-pair supervision | **MERGED → main** 11:33Z |
 | #178 | Bun workspace adoption — **occupies ADR-0004** | MERGED → main (context) |
 
 **Net:** the leak is gone on `main` (#181), the methodology spine is
@@ -27,14 +29,16 @@ on the real vault and has **not** passed: post-#186 retraining reached
 `63864` candidates and `136` distinct labeled-row timestamps, but
 produced `0` positive training rows and `0` usable query groups. #187
 then made that failure shape fast and explicit:
-`skipped:no-usable-query-groups` with `candidateCount: 0`.
+`skipped:no-usable-query-groups` with `candidateCount: 0`. #189 closes
+the product/modeling decision for CV-13 by adding the allowed explicit
+positive-supervision path, but the real vault still needs actual
+`Keep` confirmations before CV-3 can pass.
 
 ## Outstanding TODOs
 
 | ID | Item | Type | Priority | Depends on | Owner |
 |---|---|---|---|---|---|
 | CV-3 | Empirical dogfood validation: restamp makes the split fire; shipGate lands at expected status; `closest_visit` darkness is attributable via `shipGate.reason` | validation | **HIGH** | #183 + CV-1/CV-2 | User dogfood + verify |
-| CV-13 | Decide legitimate positive-supervision shaping for `closest_visit` without restoring workstream all-pairs closure | product/modeling decision | **HIGH** | CV-12 diagnostics | User + impl |
 | CV-14 | Add richer row-builder diagnostics for the case where structural preflight passes but built training rows still have no usable groups | code + diagnostics | MED | future failure evidence | impl |
 | CV-8 | Hard negatives (#179 plan step 5, still open): negatives remain `random_unrelated`/`recently_skipped` only. More relevant now — the ship gate compares vs baseline/LR; trivially-easy negatives weaken the discriminative bar | code | MED | — | impl |
 | CV-9 | #183 ablation is a **static attestation** (`status:'not-in-feature-vector'`), not the re-trained dynamic ablation #182 §3(1) envisioned — accept or upgrade | design | LOW | — | decision |
@@ -52,8 +56,9 @@ then made that failure shape fast and explicit:
 | CV-6 | **Closed by #182.** The doc was renumbered and Bun-era grounding was updated. |
 | CV-7 | **Closed by #182.** The plan doc merged standalone to `main`. |
 | CV-12 | **Closed by #187.** The real-vault failure now returns immediately as `skipped:no-usable-query-groups` with `candidateCount: 0`; it does not fabricate positives and does not restore workstream closure. |
+| CV-13 | **Closed by #189.** Legitimate positive supervision is now explicit visit-pair confirmation: Focus shows a scoped `Keep` action for non-anchor pages in a suggestion and emits `USER_FLOW_CONFIRMED` with `relationKind: 'closest_visit'`. It does not derive positives from workstream membership or topic membership. This supplies the missing product path, but it does not itself satisfy CV-3 until real dogfood clicks exist in the vault and retraining produces usable groups. |
 
-## Detail — the HIGH items
+## Detail — the HIGH item
 
 **CV-3 — the empirical proof.** The whole arc's claim ("correctly
 silent until a learned model earns its place") is unproven until a
@@ -74,18 +79,11 @@ the retrain reached `63864` candidates and `136` distinct labeled-row
 timestamps, then failed because row-building produced `0` positive
 rows and `0` usable query groups. The post-#187 run returned
 immediately with `skipped:no-usable-query-groups`, `790` labels
-(`218` positive / `572` negative), and `candidateCount: 0`. Keep CV-3
-open until a future run trains a candidate model with legitimate
-positive rows and produces methodology-spine/ship-gate output.
-
-**CV-13 — decide legitimate positive supervision.** The real-vault
-positive labels are mostly item/container-shaped
-`user.organized.item` evidence. General workstream membership closure
-is forbidden by #179/#181, so a replacement positive expansion must be
-explicitly justified: for example, true `USER_FLOW_CONFIRMED`
-visit-pair feedback, snippet lineage that resolves to visits, or a
-separately accepted suggestion/member snapshot. This is a product and
-modeling decision, not a row-builder hack.
+(`218` positive / `572` negative), and `candidateCount: 0`. After #189
+merged, a pre-dogfood vault check still showed `0`
+`user.flow.confirmed` entries. Keep CV-3 open until a future run trains
+a candidate model with legitimate positive rows and produces
+methodology-spine/ship-gate output.
 
 ## Closing rule
 
