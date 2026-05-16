@@ -28,6 +28,20 @@ export interface ClosestVisitRankerRevisionManifest {
   readonly trainQuality?: RankerTrainQuality;
 }
 
+export interface ClosestVisitRankerRevisionManifestProbe {
+  readonly revisionId: string | null;
+  readonly activeModelVersion: string | null;
+  readonly expectedModelVersion: typeof RANKER_MODEL_VERSION;
+  readonly activeFeatureSchemaVersion: number | null;
+  readonly expectedFeatureSchemaVersion: typeof FEATURE_SCHEMA_VERSION;
+  readonly staleModelSchema: boolean;
+}
+
+export const expectedClosestVisitRankerSchema = {
+  modelVersion: RANKER_MODEL_VERSION,
+  featureSchemaVersion: FEATURE_SCHEMA_VERSION,
+} as const;
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
@@ -77,13 +91,18 @@ const writeAtomic = async (path: string, body: string): Promise<void> => {
 const isFiniteNumber = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value);
 
+const stringOrNull = (value: unknown): string | null => (typeof value === 'string' ? value : null);
+
+const numberOrNull = (value: unknown): number | null =>
+  typeof value === 'number' && Number.isFinite(value) ? value : null;
+
 const isGradeHistogram = (value: unknown): value is RankerTrainQuality['gradeHistogram'] => {
   if (!isRecord(value)) return false;
   return (['0', '1', '2', '3', '4'] as const).every(
     (grade) =>
       typeof value[grade] === 'number' &&
       Number.isInteger(value[grade]) &&
-      (value[grade] as number) >= 0,
+      value[grade] >= 0,
   );
 };
 
@@ -159,8 +178,15 @@ const finalizeManifest = (
     (value as { readonly trainQuality?: unknown }).trainQuality,
   );
   if (trainQuality === undefined) {
-    const { trainQuality: _drop, ...rest } = value;
-    return rest;
+    return {
+      revisionId: value.revisionId,
+      modelVersion: value.modelVersion,
+      featureSchemaVersion: value.featureSchemaVersion,
+      trainingDatasetHash: value.trainingDatasetHash,
+      trainedAt: value.trainedAt,
+      modelByteLength: value.modelByteLength,
+      modelSha256: value.modelSha256,
+    };
   }
   return { ...value, trainQuality };
 };
@@ -187,6 +213,41 @@ export const readActiveClosestVisitRankerRevisionManifest = async (
       await readFile(activeClosestVisitRevisionManifestPath(vaultRoot), 'utf8'),
     ) as unknown;
     return isManifest(parsed) ? finalizeManifest(parsed) : null;
+  } catch {
+    return null;
+  }
+};
+
+export const readActiveClosestVisitRankerRevisionManifestProbe = async (
+  vaultRoot: string,
+): Promise<ClosestVisitRankerRevisionManifestProbe | null> => {
+  try {
+    const parsed: unknown = JSON.parse(
+      await readFile(activeClosestVisitRevisionManifestPath(vaultRoot), 'utf8'),
+    );
+    if (!isRecord(parsed)) {
+      return {
+        revisionId: null,
+        activeModelVersion: null,
+        expectedModelVersion: RANKER_MODEL_VERSION,
+        activeFeatureSchemaVersion: null,
+        expectedFeatureSchemaVersion: FEATURE_SCHEMA_VERSION,
+        staleModelSchema: false,
+      };
+    }
+    const activeModelVersion = stringOrNull(parsed['modelVersion']);
+    const activeFeatureSchemaVersion = numberOrNull(parsed['featureSchemaVersion']);
+    return {
+      revisionId: stringOrNull(parsed['revisionId']),
+      activeModelVersion,
+      expectedModelVersion: RANKER_MODEL_VERSION,
+      activeFeatureSchemaVersion,
+      expectedFeatureSchemaVersion: FEATURE_SCHEMA_VERSION,
+      staleModelSchema:
+        (activeModelVersion !== null && activeModelVersion !== RANKER_MODEL_VERSION) ||
+        (activeFeatureSchemaVersion !== null &&
+          activeFeatureSchemaVersion !== FEATURE_SCHEMA_VERSION),
+    };
   } catch {
     return null;
   }

@@ -23,7 +23,9 @@ import {
   type UserOrganizedItemKind,
 } from '../feedback/events.js';
 import type { TopicRevision } from '../producers/topic-revision.js';
+import { FEATURE_SCHEMA_VERSION } from '../ranker/feature-schema.js';
 import type { RankerRetrainResult } from '../ranker/retrain.js';
+import { RANKER_MODEL_VERSION } from '../ranker/train.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import type { ConnectionsSnapshot, VisitSimilarityRevision } from './types.js';
 import type { TopicShadowDiagnostics } from './topicShadowCandidate.js';
@@ -98,6 +100,31 @@ export interface MaterializerRankerCounters {
   readonly error: string | null;
 }
 
+export type MaterializerRankerAugmentationStatus =
+  | 'not-run'
+  | 'skipped'
+  | 'absent'
+  | 'emitted'
+  | 'failed';
+
+export type MaterializerRankerModelFreshness = 'fresh' | 'stale' | 'unknown' | null;
+
+export interface MaterializerRankerAugmentationCounters {
+  readonly status: MaterializerRankerAugmentationStatus;
+  readonly reason: string | null;
+  readonly activeRevisionId: string | null;
+  readonly activeModelVersion: string | null;
+  readonly expectedModelVersion: string;
+  readonly activeFeatureSchemaVersion: number | null;
+  readonly expectedFeatureSchemaVersion: number;
+  readonly needsRetrain: boolean;
+  readonly modelFreshness: MaterializerRankerModelFreshness;
+  readonly baseEdgeCount: number;
+  readonly finalEdgeCount: number;
+  readonly closestVisitEdgeCount: number;
+  readonly rankerSourceEdgeCount: number;
+}
+
 export type MaterializerUserAssertionsByKind = Readonly<Record<UserOrganizedItemKind, number>>;
 
 export interface MaterializerUserAssertionCounters {
@@ -151,6 +178,7 @@ export interface MaterializerDiagnostics {
   readonly similarity: MaterializerSimilarityCounters;
   readonly topics: MaterializerTopicCounters;
   readonly ranker: MaterializerRankerCounters;
+  readonly rankerAugmentation: MaterializerRankerAugmentationCounters;
   readonly userAssertions: MaterializerUserAssertionCounters;
   readonly inferred: MaterializerInferredEventCounters;
   readonly engagement: MaterializerEngagementCounters;
@@ -180,6 +208,7 @@ export interface MaterializerDiagnosticsInput {
   readonly visitSimilarity: VisitSimilarityRevision;
   readonly topicRevision: TopicRevision;
   readonly rankerRetrainResult: RankerRetrainResult | null;
+  readonly rankerAugmentation?: MaterializerRankerAugmentationCounters;
   readonly events: readonly AcceptedEvent[];
   readonly urlProjection: UrlProjection;
   readonly snapshot: ConnectionsSnapshot;
@@ -326,6 +355,25 @@ const collectRankerCounters = (result: RankerRetrainResult | null): Materializer
   }
 };
 
+const collectDefaultRankerAugmentationCounters = (
+  snapshot: ConnectionsSnapshot,
+): MaterializerRankerAugmentationCounters => ({
+  status: 'not-run',
+  reason: null,
+  activeRevisionId: null,
+  activeModelVersion: null,
+  expectedModelVersion: RANKER_MODEL_VERSION,
+  activeFeatureSchemaVersion: null,
+  expectedFeatureSchemaVersion: FEATURE_SCHEMA_VERSION,
+  needsRetrain: false,
+  modelFreshness: 'unknown',
+  baseEdgeCount: snapshot.edges.length,
+  finalEdgeCount: snapshot.edges.length,
+  closestVisitEdgeCount: snapshot.edges.filter((edge) => edge.kind === 'closest_visit').length,
+  rankerSourceEdgeCount: snapshot.edges.filter((edge) => edge.producedBy.source === 'ranker')
+    .length,
+});
+
 const isRecordLite = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
@@ -447,6 +495,8 @@ export const collectMaterializerDiagnostics = (
     similarity: collectSimilarityCounters(input.visitSimilarity, input.similarityEffectiveConfig),
     topics: collectTopicCounters(input.topicRevision),
     ranker: collectRankerCounters(input.rankerRetrainResult),
+    rankerAugmentation:
+      input.rankerAugmentation ?? collectDefaultRankerAugmentationCounters(input.snapshot),
     userAssertions: eventCounters.userAssertions,
     inferred: eventCounters.inferred,
     engagement: eventCounters.engagement,
@@ -472,6 +522,18 @@ export const summarizeMaterializerDiagnostics = (diagnostics: MaterializerDiagno
     `topics=${String(diagnostics.topics.topicCount)}`,
     `topicMembers=${String(diagnostics.topics.memberCount)}`,
     `ranker=${diagnostics.ranker.status}${diagnostics.ranker.reason === null ? '' : `:${diagnostics.ranker.reason}`}`,
+    `rankerAug=${diagnostics.rankerAugmentation.status}${
+      diagnostics.rankerAugmentation.reason === null
+        ? ''
+        : `:${diagnostics.rankerAugmentation.reason}`
+    }${
+      diagnostics.rankerAugmentation.modelFreshness === null
+        ? ''
+        : `:${diagnostics.rankerAugmentation.modelFreshness}`
+    }`,
+    `rankerNeedsRetrain=${String(diagnostics.rankerAugmentation.needsRetrain)}`,
+    `closestVisit=${String(diagnostics.rankerAugmentation.closestVisitEdgeCount)}`,
+    `rankerSource=${String(diagnostics.rankerAugmentation.rankerSourceEdgeCount)}`,
     `labels=${String(diagnostics.ranker.labelCount)}(+${String(diagnostics.ranker.positiveLabelCount)}/-${String(diagnostics.ranker.negativeLabelCount)})`,
     `newLabels=${diagnostics.ranker.newLabelCount === null ? 'n/a' : String(diagnostics.ranker.newLabelCount)}`,
     `userAssertions=${String(diagnostics.userAssertions.total)}`,

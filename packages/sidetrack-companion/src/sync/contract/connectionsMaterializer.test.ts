@@ -1,10 +1,15 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { createConnectionsStore } from '../../connections/snapshot.js';
+import { createConnectionsStore, type ConnectionsSnapshot } from '../../connections/snapshot.js';
 import type { VisitSimilarityEmbedder } from '../../connections/visitSimilarity.js';
+import { activeClosestVisitRevisionManifestPath } from '../../producers/closest-visit-revision.js';
+import { FEATURE_SCHEMA_VERSION } from '../../ranker/feature-schema.js';
+import type { LightGBMModel, RankerContributions } from '../../ranker/predict.js';
+import { RANKER_MODEL_VERSION } from '../../ranker/train.js';
+import { collectWorkGraphHealth } from '../../system/workGraphHealth.js';
 import { ENGAGEMENT_SESSION_AGGREGATED } from '../../engagement/events.js';
 import { THREAD_UPSERTED } from '../../threads/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
@@ -13,6 +18,7 @@ import {
   TOPIC_HDBSCAN_REVISION_KEY,
   TOPIC_UNION_FIND_REVISION_KEY,
   createTopicRevisionStore,
+  type TopicRevision,
 } from '../../producers/topic-revision.js';
 import type { AcceptedEvent } from '../causal.js';
 import { createEventLog } from '../eventLog.js';
@@ -41,15 +47,119 @@ const keyFromEmbeddingText = (text: string): string => {
 
 const embedFromVectors =
   (vectors: ReadonlyMap<string, Float32Array>): VisitSimilarityEmbedder =>
-  async (texts) =>
-    texts.map((text) => {
-      const key = keyFromEmbeddingText(text);
-      const vector = vectors.get(key);
-      if (vector === undefined) {
-        throw new Error(`missing vector for ${key}`);
-      }
-      return vector;
-    });
+  (texts) =>
+    Promise.resolve().then(() =>
+      texts.map((text) => {
+        const key = keyFromEmbeddingText(text);
+        const vector = vectors.get(key);
+        if (vector === undefined) {
+          throw new Error(`missing vector for ${key}`);
+        }
+        return vector;
+      }),
+    );
+
+const noRetrain = () =>
+  Promise.resolve({
+    status: 'skipped' as const,
+    reason: 'below-threshold' as const,
+    fingerprint: {
+      hash: '0'.repeat(64),
+      labelCount: 0,
+      positiveLabelCount: 0,
+      negativeLabelCount: 0,
+    },
+    newLabelCount: 0,
+  });
+
+const rankerContributions = (weight: number): RankerContributions => ({
+  schemaVersion: 0,
+  same_workstream: 0,
+  opener_chain_depth: 0,
+  in_navigation_chain: 0,
+  same_canonical_url: 0,
+  same_host: weight,
+  same_repo: 0,
+  same_search_query: 0,
+  same_copied_snippet_count: 0,
+  shared_title_tokens: 0,
+  shared_path_tokens: 0,
+  cosine_similarity: 0,
+  recency_score_from: 0,
+  recency_score_to: 0,
+  engagement_class_match: 0,
+  return_count_from: 0,
+  return_count_to: 0,
+  user_asserted_in_thread: 0,
+  user_asserted_in_workstream: 0,
+  same_active_topic: 0,
+  topic_lineage_merge_split_related: 0,
+  page_quality_tier_from: 0,
+  page_quality_tier_to: 0,
+});
+
+const timelineObservedEvent = (input: {
+  readonly seq: number;
+  readonly slug: string;
+  readonly observedAt: string;
+}): AcceptedEvent =>
+  buildEvent({
+    seq: input.seq,
+    type: BROWSER_TIMELINE_OBSERVED,
+    payload: {
+      eventId: `timeline-${input.slug}`,
+      observedAt: input.observedAt,
+      url: `https://ranker.test/${input.slug}`,
+      canonicalUrl: `https://ranker.test/${input.slug}`,
+      title: `ranker ${input.slug}`,
+      provider: 'generic',
+      transition: 'activated',
+      payloadVersion: 1,
+      dimensions: { engagement: { focusedWindowMs: 10_000 } },
+    },
+  });
+
+const createRecordingStore = (
+  root: string,
+): {
+  readonly store: ReturnType<typeof createConnectionsStore>;
+  readonly writes: ConnectionsSnapshot[];
+} => {
+  const base = createConnectionsStore(root);
+  const writes: ConnectionsSnapshot[] = [];
+  return {
+    writes,
+    store: {
+      ...base,
+      putCurrent: async (snapshot) => {
+        writes.push(snapshot);
+        await base.putCurrent(snapshot);
+      },
+    },
+  };
+};
+
+const writeStaleV1RankerManifest = async (root: string): Promise<void> => {
+  const manifestPath = activeClosestVisitRevisionManifestPath(root);
+  await mkdir(dirname(manifestPath), { recursive: true });
+  await writeFile(
+    manifestPath,
+    `${JSON.stringify(
+      {
+        revisionId: 'ranker-rev-v1',
+        modelVersion: 'lightgbm-lambdamart-v1',
+        featureSchemaVersion: 1,
+        trainingDatasetHash: 'a'.repeat(64),
+        trainedAt: Date.parse('2026-05-01T00:00:00.000Z'),
+        modelByteLength: 0,
+        modelSha256: 'b'.repeat(64),
+      },
+      null,
+      2,
+    )}\n`,
+    'utf8',
+  );
+};
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -60,15 +170,20 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
   // HDBSCAN selection / skip-gate), so default the suite to the
   // baseline; the shadow-specific test opts back in explicitly.
   let prevShadowFlag: string | undefined;
+  let prevSkipRankerSnapshot: string | undefined;
   beforeEach(async () => {
     vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-connections-mat-'));
     prevShadowFlag = process.env['SIDETRACK_TOPIC_SHADOW_CANDIDATE'];
+    prevSkipRankerSnapshot = process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'];
     process.env['SIDETRACK_TOPIC_SHADOW_CANDIDATE'] = 'off';
+    delete process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'];
   });
   afterEach(async () => {
     await rm(vaultRoot, { recursive: true, force: true });
     if (prevShadowFlag === undefined) delete process.env['SIDETRACK_TOPIC_SHADOW_CANDIDATE'];
     else process.env['SIDETRACK_TOPIC_SHADOW_CANDIDATE'] = prevShadowFlag;
+    if (prevSkipRankerSnapshot === undefined) delete process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'];
+    else process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'] = prevSkipRankerSnapshot;
   });
 
   it('catchUp rebuilds the snapshot from event log alone (replay-recoverable)', async () => {
@@ -99,10 +214,11 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
 
     const snap = await store.readCurrent();
     expect(snap, 'current snapshot written').not.toBeNull();
-    const ids = snap!.nodes.map((n) => n.id);
+    if (snap === null) throw new Error('current snapshot written');
+    const ids = snap.nodes.map((n) => n.id);
     expect(ids).toContain('thread:thread_a');
     expect(ids).toContain('workstream:ws_x');
-    expect(snap!.edges.find((e) => e.kind === 'thread_in_workstream')).toBeDefined();
+    expect(snap.edges.find((e) => e.kind === 'thread_in_workstream')).toBeDefined();
     expect(m.health().status).toBe('healthy');
   });
 
@@ -177,6 +293,342 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     const topicRevision = await createTopicRevisionStore(vaultRoot).readActiveRevision();
     expect(topicRevision?.algorithmVersion).toBe(TOPIC_UNION_FIND_REVISION_KEY);
     expect(m.health().status).toBe('healthy');
+  });
+
+  it('skips ranker-augmented snapshot when SIDETRACK_SKIP_RANKER_SNAPSHOT=1 and reports it', async () => {
+    process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'] = '1';
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const { store, writes } = createRecordingStore(vaultRoot);
+    const embed = embedFromVectors(
+      new Map<string, Float32Array>([
+        ['ranker', unit([1, 0])],
+        ['ranker', unit([1, 0])],
+      ]),
+    );
+    let loaderCalls = 0;
+    const m = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store,
+      embed,
+      rankerRetrainer: noRetrain,
+      closestVisitRankerLoader: () => {
+        loaderCalls += 1;
+        return Promise.resolve({
+          status: 'missing',
+          activeRevisionId: null,
+          reason: 'no-active-manifest',
+        });
+      },
+    });
+
+    await eventLog.importPeerEvent(
+      timelineObservedEvent({
+        seq: 1,
+        slug: 'alpha',
+        observedAt: '2026-05-07T10:00:00.000Z',
+      }),
+    );
+    await eventLog.importPeerEvent(
+      timelineObservedEvent({
+        seq: 2,
+        slug: 'bravo',
+        observedAt: '2026-05-07T10:05:00.000Z',
+      }),
+    );
+
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+
+    expect(loaderCalls).toBe(0);
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.edges.some((edge) => edge.kind === 'closest_visit')).toBe(false);
+    const diagnosticsRaw = await readFile(
+      join(vaultRoot, '_BAC', 'connections', 'diagnostics', 'latest.json'),
+      'utf8',
+    );
+    const diagnostics = JSON.parse(diagnosticsRaw) as {
+      readonly rankerAugmentation?: {
+        readonly status?: string;
+        readonly reason?: string;
+        readonly activeModelVersion?: string | null;
+        readonly expectedModelVersion?: string;
+        readonly activeFeatureSchemaVersion?: number | null;
+        readonly expectedFeatureSchemaVersion?: number;
+        readonly needsRetrain?: boolean;
+        readonly closestVisitEdgeCount?: number;
+        readonly rankerSourceEdgeCount?: number;
+      };
+    };
+    expect(diagnostics.rankerAugmentation).toMatchObject({
+      status: 'skipped',
+      reason: 'SIDETRACK_SKIP_RANKER_SNAPSHOT=1',
+      activeModelVersion: null,
+      expectedModelVersion: RANKER_MODEL_VERSION,
+      activeFeatureSchemaVersion: null,
+      expectedFeatureSchemaVersion: FEATURE_SCHEMA_VERSION,
+      needsRetrain: false,
+      closestVisitEdgeCount: 0,
+      rankerSourceEdgeCount: 0,
+    });
+    expect(m.health().status).toBe('healthy');
+  });
+
+  it('publishes the base snapshot first, then emits closest_visit with an active ranker', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const { store, writes } = createRecordingStore(vaultRoot);
+    const embed = embedFromVectors(
+      new Map<string, Float32Array>([
+        ['ranker', unit([1, 0])],
+        ['ranker', unit([1, 0])],
+      ]),
+    );
+    let disposeCalls = 0;
+    const m = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store,
+      embed,
+      rankerRetrainer: noRetrain,
+      closestVisitRankerLoader: () =>
+        Promise.resolve({
+          status: 'ready',
+          activeRevisionId: 'ranker-rev-test',
+          model: {
+            dispose: () => {
+              disposeCalls += 1;
+            },
+          } as LightGBMModel,
+          ranker: {
+            revisionId: 'ranker-rev-test',
+            threshold: 0.1,
+            topK: 1,
+            predict: () => ({ score: 0.9, contributions: rankerContributions(0.5) }),
+          },
+        }),
+    });
+
+    await eventLog.importPeerEvent(
+      timelineObservedEvent({
+        seq: 1,
+        slug: 'alpha',
+        observedAt: '2026-05-07T10:00:00.000Z',
+      }),
+    );
+    await eventLog.importPeerEvent(
+      timelineObservedEvent({
+        seq: 2,
+        slug: 'bravo',
+        observedAt: '2026-05-07T10:05:00.000Z',
+      }),
+    );
+
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+
+    expect(writes).toHaveLength(2);
+    expect(writes[0]?.edges.some((edge) => edge.kind === 'closest_visit')).toBe(false);
+    const closestVisitEdges =
+      writes[1]?.edges.filter((edge) => edge.kind === 'closest_visit') ?? [];
+    expect(closestVisitEdges.length).toBeGreaterThan(0);
+    expect(
+      closestVisitEdges.every(
+        (edge) =>
+          edge.producedBy.source === 'ranker' && edge.producedBy.revisionId === 'ranker-rev-test',
+      ),
+    ).toBe(true);
+    expect(disposeCalls).toBe(1);
+    const diagnosticsRaw = await readFile(
+      join(vaultRoot, '_BAC', 'connections', 'diagnostics', 'latest.json'),
+      'utf8',
+    );
+    const diagnostics = JSON.parse(diagnosticsRaw) as {
+      readonly rankerAugmentation?: {
+        readonly status?: string;
+        readonly activeRevisionId?: string;
+        readonly activeModelVersion?: string | null;
+        readonly expectedModelVersion?: string;
+        readonly activeFeatureSchemaVersion?: number | null;
+        readonly expectedFeatureSchemaVersion?: number;
+        readonly needsRetrain?: boolean;
+        readonly modelFreshness?: string;
+        readonly closestVisitEdgeCount?: number;
+        readonly rankerSourceEdgeCount?: number;
+      };
+    };
+    expect(diagnostics.rankerAugmentation).toMatchObject({
+      status: 'emitted',
+      activeRevisionId: 'ranker-rev-test',
+      activeModelVersion: RANKER_MODEL_VERSION,
+      expectedModelVersion: RANKER_MODEL_VERSION,
+      activeFeatureSchemaVersion: FEATURE_SCHEMA_VERSION,
+      expectedFeatureSchemaVersion: FEATURE_SCHEMA_VERSION,
+      needsRetrain: false,
+      modelFreshness: 'fresh',
+      closestVisitEdgeCount: closestVisitEdges.length,
+      rankerSourceEdgeCount: closestVisitEdges.length,
+    });
+  });
+
+  it('reports stale-model-schema and needsRetrain when the active manifest is v1 under the v2 runtime', async () => {
+    await writeStaleV1RankerManifest(vaultRoot);
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const { store, writes } = createRecordingStore(vaultRoot);
+    const embed = embedFromVectors(
+      new Map<string, Float32Array>([
+        ['ranker', unit([1, 0])],
+        ['ranker', unit([1, 0])],
+      ]),
+    );
+    const m = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store,
+      embed,
+      rankerRetrainer: noRetrain,
+    });
+
+    await eventLog.importPeerEvent(
+      timelineObservedEvent({
+        seq: 1,
+        slug: 'alpha',
+        observedAt: '2026-05-07T10:00:00.000Z',
+      }),
+    );
+    await eventLog.importPeerEvent(
+      timelineObservedEvent({
+        seq: 2,
+        slug: 'bravo',
+        observedAt: '2026-05-07T10:05:00.000Z',
+      }),
+    );
+
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.edges.some((edge) => edge.kind === 'closest_visit')).toBe(false);
+    const diagnosticsRaw = await readFile(
+      join(vaultRoot, '_BAC', 'connections', 'diagnostics', 'latest.json'),
+      'utf8',
+    );
+    const diagnostics = JSON.parse(diagnosticsRaw) as {
+      readonly ranker?: {
+        readonly status?: string;
+      };
+      readonly rankerAugmentation?: {
+        readonly status?: string;
+        readonly reason?: string;
+        readonly activeRevisionId?: string | null;
+        readonly activeModelVersion?: string | null;
+        readonly expectedModelVersion?: string;
+        readonly activeFeatureSchemaVersion?: number | null;
+        readonly expectedFeatureSchemaVersion?: number;
+        readonly needsRetrain?: boolean;
+      };
+    };
+    expect(diagnostics.ranker?.status).toBe('skipped');
+    expect(diagnostics.rankerAugmentation).toMatchObject({
+      status: 'absent',
+      reason: 'stale-model-schema',
+      activeRevisionId: 'ranker-rev-v1',
+      activeModelVersion: 'lightgbm-lambdamart-v1',
+      expectedModelVersion: RANKER_MODEL_VERSION,
+      activeFeatureSchemaVersion: 1,
+      expectedFeatureSchemaVersion: FEATURE_SCHEMA_VERSION,
+      needsRetrain: true,
+    });
+    const health = await collectWorkGraphHealth({ vaultRoot, eventLog });
+    expect(health.ranker).toMatchObject({
+      activeRevisionId: 'ranker-rev-v1',
+      loadStatus: 'invalid-model',
+      activeModelVersion: 'lightgbm-lambdamart-v1',
+      expectedModelVersion: RANKER_MODEL_VERSION,
+      activeFeatureSchemaVersion: 1,
+      expectedFeatureSchemaVersion: FEATURE_SCHEMA_VERSION,
+      needsRetrain: true,
+      augmentation: {
+        status: 'absent',
+        reason: 'stale-model-schema',
+        needsRetrain: true,
+      },
+    });
+  });
+
+  it('does not crash when the active ranker manifest is missing and reports absence', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const { store, writes } = createRecordingStore(vaultRoot);
+    const embed = embedFromVectors(
+      new Map<string, Float32Array>([
+        ['ranker', unit([1, 0])],
+        ['ranker', unit([1, 0])],
+      ]),
+    );
+    const m = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store,
+      embed,
+      rankerRetrainer: noRetrain,
+    });
+
+    await eventLog.importPeerEvent(
+      timelineObservedEvent({
+        seq: 1,
+        slug: 'alpha',
+        observedAt: '2026-05-07T10:00:00.000Z',
+      }),
+    );
+    await eventLog.importPeerEvent(
+      timelineObservedEvent({
+        seq: 2,
+        slug: 'bravo',
+        observedAt: '2026-05-07T10:05:00.000Z',
+      }),
+    );
+
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+
+    expect(m.health().status).toBe('healthy');
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.edges.some((edge) => edge.kind === 'closest_visit')).toBe(false);
+    const diagnosticsRaw = await readFile(
+      join(vaultRoot, '_BAC', 'connections', 'diagnostics', 'latest.json'),
+      'utf8',
+    );
+    const diagnostics = JSON.parse(diagnosticsRaw) as {
+      readonly rankerAugmentation?: {
+        readonly status?: string;
+        readonly reason?: string;
+        readonly activeModelVersion?: string | null;
+        readonly expectedModelVersion?: string;
+        readonly activeFeatureSchemaVersion?: number | null;
+        readonly expectedFeatureSchemaVersion?: number;
+        readonly needsRetrain?: boolean;
+      };
+    };
+    expect(diagnostics.rankerAugmentation).toMatchObject({
+      status: 'absent',
+      reason: 'no-active-manifest',
+      activeModelVersion: null,
+      expectedModelVersion: RANKER_MODEL_VERSION,
+      activeFeatureSchemaVersion: null,
+      expectedFeatureSchemaVersion: FEATURE_SCHEMA_VERSION,
+      needsRetrain: false,
+    });
   });
 
   it('uses accumulated engagement aggregates for the topic gate', async () => {
@@ -494,15 +946,16 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     const timelineStore = createTimelineStore(vaultRoot);
     let calls = 0;
     const store = {
-      putCurrent: async (snapshot: import('../../connections/snapshot.js').ConnectionsSnapshot) => {
+      putCurrent: (snapshot: ConnectionsSnapshot): Promise<void> => {
         calls += 1;
-        if (calls === 1) throw new Error('disk full');
+        if (calls === 1) return Promise.reject(new Error('disk full'));
         void snapshot;
+        return Promise.resolve();
       },
-      readCurrent: async () => null,
-      putDay: async () => undefined,
-      readDay: async () => null,
-      listDays: async () => [],
+      readCurrent: () => Promise.resolve(null),
+      putDay: () => Promise.resolve(undefined),
+      readDay: () => Promise.resolve(null),
+      listDays: () => Promise.resolve([]),
     };
     const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store });
 
@@ -549,14 +1002,14 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     const eventLog = createEventLog(vaultRoot, replica);
     const timelineStore = createTimelineStore(vaultRoot);
     const store = {
-      putCurrent: async (snapshot: import('../../connections/snapshot.js').ConnectionsSnapshot) => {
+      putCurrent: (snapshot: ConnectionsSnapshot): Promise<void> => {
         void snapshot;
-        throw new Error('disk wedged');
+        return Promise.reject(new Error('disk wedged'));
       },
-      readCurrent: async () => null,
-      putDay: async () => undefined,
-      readDay: async () => null,
-      listDays: async () => [],
+      readCurrent: () => Promise.resolve(null),
+      putDay: () => Promise.resolve(undefined),
+      readDay: () => Promise.resolve(null),
+      listDays: () => Promise.resolve([]),
     };
     const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store });
 
@@ -586,9 +1039,11 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     const start = Date.now();
     await Promise.race([
       m.awaitIdle(),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`awaitIdle hung past ${String(budgetMs)} ms`)), budgetMs),
-      ),
+      new Promise<never>((_, reject) => {
+        setTimeout(() => {
+          reject(new Error(`awaitIdle hung past ${String(budgetMs)} ms`));
+        }, budgetMs);
+      }),
     ]);
     const elapsed = Date.now() - start;
     expect(elapsed).toBeLessThan(budgetMs);
@@ -611,7 +1066,7 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
       firstPutStartedResolve = resolve;
     });
     const store = {
-      putCurrent: async (snapshot: import('../../connections/snapshot.js').ConnectionsSnapshot) => {
+      putCurrent: async (snapshot: ConnectionsSnapshot) => {
         void snapshot;
         calls += 1;
         if (calls === 1) {
@@ -621,10 +1076,10 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
           });
         }
       },
-      readCurrent: async () => null,
-      putDay: async () => undefined,
-      readDay: async () => null,
-      listDays: async () => [],
+      readCurrent: () => Promise.resolve(null),
+      putDay: () => Promise.resolve(undefined),
+      readDay: () => Promise.resolve(null),
+      listDays: () => Promise.resolve([]),
     };
     const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store });
 
@@ -678,9 +1133,9 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     const timelineStore = createTimelineStore(vaultRoot);
     const store = createConnectionsStore(vaultRoot);
     let embedCalls = 0;
-    const embed: VisitSimilarityEmbedder = async (texts) => {
+    const embed: VisitSimilarityEmbedder = (texts) => {
       embedCalls += 1;
-      return texts.map(() => unit([1, 0]));
+      return Promise.resolve(texts.map(() => unit([1, 0])));
     };
     const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store, embed });
 
@@ -774,14 +1229,15 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     const timelineStore = createTimelineStore(vaultRoot);
     let putCurrentCalls = 0;
     const store = {
-      putCurrent: async (snapshot: import('../../connections/snapshot.js').ConnectionsSnapshot) => {
+      putCurrent: (snapshot: ConnectionsSnapshot): Promise<void> => {
         putCurrentCalls += 1;
         void snapshot;
+        return Promise.resolve();
       },
-      readCurrent: async () => null,
-      putDay: async () => undefined,
-      readDay: async () => null,
-      listDays: async () => [],
+      readCurrent: () => Promise.resolve(null),
+      putDay: () => Promise.resolve(undefined),
+      readDay: () => Promise.resolve(null),
+      listDays: () => Promise.resolve([]),
     };
     const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store });
 
@@ -836,9 +1292,7 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     const baseTopicStore = createTopicRevisionStore(vaultRoot);
     const topicRevisionStore = {
       ...baseTopicStore,
-      putActiveRevision: async (
-        revision: import('../../producers/topic-revision.js').TopicRevision,
-      ) => {
+      putActiveRevision: async (revision: TopicRevision) => {
         putActiveRevisionCalls += 1;
         await baseTopicStore.putActiveRevision(revision);
       },

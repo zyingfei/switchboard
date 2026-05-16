@@ -6,8 +6,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { ENGAGEMENT_SESSION_AGGREGATED } from '../engagement/events.js';
 import { USER_ORGANIZED_ITEM, type UserOrganizedItemPayload } from '../feedback/events.js';
+import { FEATURE_SCHEMA_VERSION } from '../ranker/feature-schema.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../tabsession/events.js';
 import type { RankerRetrainResult } from '../ranker/retrain.js';
+import { RANKER_MODEL_VERSION } from '../ranker/train.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import type { UrlProjection, UrlVisitRecord } from '../urls/projection.js';
@@ -316,6 +318,61 @@ describe('collectMaterializerDiagnostics', () => {
     expect(diag.ranker.revisionId).toBeNull();
   });
 
+  it('reports ranker augmentation status and emitted edge counts', () => {
+    const snap = snapshot(
+      [
+        visitNode('timeline-visit:https://example.test/a'),
+        visitNode('timeline-visit:https://example.test/b'),
+      ],
+      [
+        {
+          ...edgeOf(
+            'closest_visit',
+            'timeline-visit:https://example.test/a',
+            'timeline-visit:https://example.test/b',
+          ),
+          producedBy: { source: 'ranker', revisionId: 'ranker-rev-1' },
+          confidence: 'inferred',
+        },
+      ],
+    );
+    const diag = collectMaterializerDiagnostics(
+      baseInput({
+        snapshot: snap,
+        rankerAugmentation: {
+          status: 'emitted',
+          reason: null,
+          activeRevisionId: 'ranker-rev-1',
+          activeModelVersion: RANKER_MODEL_VERSION,
+          expectedModelVersion: RANKER_MODEL_VERSION,
+          activeFeatureSchemaVersion: FEATURE_SCHEMA_VERSION,
+          expectedFeatureSchemaVersion: FEATURE_SCHEMA_VERSION,
+          needsRetrain: false,
+          modelFreshness: 'fresh',
+          baseEdgeCount: 0,
+          finalEdgeCount: 1,
+          closestVisitEdgeCount: 1,
+          rankerSourceEdgeCount: 1,
+        },
+      }),
+    );
+    expect(diag.rankerAugmentation).toEqual({
+      status: 'emitted',
+      reason: null,
+      activeRevisionId: 'ranker-rev-1',
+      activeModelVersion: RANKER_MODEL_VERSION,
+      expectedModelVersion: RANKER_MODEL_VERSION,
+      activeFeatureSchemaVersion: FEATURE_SCHEMA_VERSION,
+      expectedFeatureSchemaVersion: FEATURE_SCHEMA_VERSION,
+      needsRetrain: false,
+      modelFreshness: 'fresh',
+      baseEdgeCount: 0,
+      finalEdgeCount: 1,
+      closestVisitEdgeCount: 1,
+      rankerSourceEdgeCount: 1,
+    });
+  });
+
   it('counts canonical-url attribution by source from the URL projection', () => {
     const urls = projection([
       url('https://example.test/a', {
@@ -494,6 +551,7 @@ describe('summarizeMaterializerDiagnostics', () => {
     expect(summary).toContain('simEdges=0(embedding)');
     expect(summary).toContain('engagementEligible=1');
     expect(summary).toContain('ranker=not-run');
+    expect(summary).toContain('rankerAug=not-run:unknown');
     expect(summary).toContain('newLabels=n/a');
   });
 

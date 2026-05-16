@@ -36,6 +36,11 @@ export interface StartTestCompanionOptions {
   // .sidetrack-browser-profiles/<runner>/companion-vault so the user
   // doesn't have to recreate workstreams every time.
   readonly vaultDir?: string;
+  // Scoped opt-out for latency-sensitive manual/recorder flows. The
+  // helper strips SIDETRACK_SKIP_RANKER_SNAPSHOT from inherited env so
+  // a debug shell export does not silently affect every spawned
+  // companion.
+  readonly skipRankerSnapshot?: boolean;
 }
 
 const packageRoot = path.resolve(fileURLToPath(new URL('../../../', import.meta.url)));
@@ -60,6 +65,17 @@ const readGitShaForEnv = (): { readonly SIDETRACK_COMPANION_GIT_SHA?: string } =
 };
 
 type CompanionProcess = ChildProcessByStdio<null, Readable, Readable>;
+
+const companionEnv = (
+  options: Pick<StartTestCompanionOptions, 'skipRankerSnapshot'> = {},
+): NodeJS.ProcessEnv => {
+  const env = { ...process.env };
+  delete env['SIDETRACK_SKIP_RANKER_SNAPSHOT'];
+  if (options.skipRankerSnapshot === true) {
+    env['SIDETRACK_SKIP_RANKER_SNAPSHOT'] = '1';
+  }
+  return env;
+};
 
 const reservePort = async (): Promise<number> => {
   return await new Promise((resolve, reject) => {
@@ -158,7 +174,7 @@ const runCli = async (args: readonly string[]): Promise<void> => {
       cwd: companionRoot,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: {
-        ...process.env,
+        ...companionEnv(),
         SIDETRACK_TEST_EMBEDDER: '1',
       },
     });
@@ -225,7 +241,7 @@ export const startTestCompanion = async (
       cwd: companionRoot,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: {
-        ...process.env,
+        ...companionEnv(options),
         // Sync Contract v1 / L1-G2 + L1-G3 e2e fixture: enable the
         // deterministic test embedder so the spawned companion can
         // build a recall index without loading the 100+MB HF
