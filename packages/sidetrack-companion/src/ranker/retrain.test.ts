@@ -25,9 +25,12 @@ import {
   type WriteActiveRankerRevisionFn,
 } from './retrain.js';
 import {
+  RANKER_FEATURE_KEYS,
   RANKER_MODEL_VERSION,
   trainRankerRevision,
+  trainRankerRevisionFromRows,
   type RankerRevision,
+  type RankerTrainingRow,
   type TrainRankerInput,
 } from './train.js';
 import {
@@ -257,7 +260,7 @@ describe('ranker retraining loop', () => {
       positive,
       negative,
     ]);
-    expect(candidates[0]?.candidate.sources).toEqual(['same_workstream']);
+    expect(candidates[0]?.candidate.sources).toEqual(['user_confirmed']);
     expect(candidates[0]?.features.same_host).toBe(1);
     expect(candidates[1]?.candidate.sources).toEqual(['recently_skipped']);
     expect(candidates[1]?.features.same_host).toBe(1);
@@ -342,6 +345,12 @@ describe('ranker retraining loop', () => {
     expect(revision.trainQuality).toBeDefined();
     const histogram = revision.trainQuality?.gradeHistogram;
     expect(histogram).toMatchObject({ '0': 2, '1': 2 });
+    expect(revision.trainQuality?.candidateLabeling).toMatchObject({
+      totalCandidates: candidates.length,
+      labeledRows: 4,
+      positiveRows: 2,
+      negativeRows: 2,
+    });
     // Every graded row is accounted for exactly once across grades 0..4.
     const totalGraded = Object.values(histogram ?? {}).reduce((sum, n) => sum + n, 0);
     expect(totalGraded).toBe(4);
@@ -358,6 +367,75 @@ describe('ranker retraining loop', () => {
     await writeActiveClosestVisitRankerRevision(vaultRoot, revision);
     const manifest = await readActiveClosestVisitRankerRevisionManifest(vaultRoot);
     expect(manifest?.trainQuality?.gradeHistogram).toMatchObject({ '0': 2, '1': 2 });
+    expect(manifest?.trainQuality?.candidateLabeling).toMatchObject({
+      labeledRows: 4,
+      unlabeledCandidateCount: 0,
+    });
+  });
+
+  it('keeps workstream identity out of the closest_visit scorer feature vector', () => {
+    expect([...RANKER_FEATURE_KEYS]).not.toContain('same_workstream');
+    expect([...RANKER_FEATURE_KEYS]).not.toContain('user_asserted_in_workstream');
+  });
+
+  it('reports an honest time-split held-out metric when row timestamps allow it', async () => {
+    const rows: RankerTrainingRow[] = [];
+    for (let group = 0; group < 5; group += 1) {
+      const fromVisitId = `heldout-from-${String(group)}`;
+      const generatedAt = observedAtMs + group * 1_000;
+      for (const [suffix, labelValue, cosine] of [
+        ['positive', 1, 0.9],
+        ['negative', 0, 0.1],
+      ] as const) {
+        rows.push({
+          candidate: {
+            fromVisitId,
+            toVisitId: `heldout-${suffix}-${String(group)}`,
+            sources: labelValue === 1 ? ['user_confirmed'] : ['random_unrelated'],
+            generatedAt,
+          },
+          features: {
+            schemaVersion: FEATURE_SCHEMA_VERSION,
+            same_workstream: 0,
+            opener_chain_depth: 0,
+            in_navigation_chain: 0,
+            same_canonical_url: 0,
+            same_host: 0,
+            same_repo: 0,
+            same_search_query: 0,
+            same_copied_snippet_count: 0,
+            shared_title_tokens: labelValue,
+            shared_path_tokens: 0,
+            cosine_similarity: cosine,
+            recency_score_from: 0,
+            recency_score_to: 0,
+            engagement_class_match: 0,
+            return_count_from: 0,
+            return_count_to: 0,
+            user_asserted_in_thread: 0,
+            user_asserted_in_workstream: 0,
+            same_active_topic: 0,
+            topic_lineage_merge_split_related: 0,
+            page_quality_tier_from: 0,
+            page_quality_tier_to: 0,
+          },
+          label: labelValue,
+        });
+      }
+    }
+
+    const revision = await trainRankerRevisionFromRows(rows, {
+      numRound: 5,
+      trainedAt: observedAtMs,
+    });
+
+    expect(revision.trainQuality?.heldOutMetric).toMatchObject({
+      kind: 'time-split held-out ndcg@5',
+      trainGroupCount: 4,
+      heldOutGroupCount: 1,
+    });
+    expect(revision.trainQuality?.heldOutMetric?.value).toBeGreaterThanOrEqual(0);
+    expect(revision.trainQuality?.heldOutMetric?.value).toBeLessThanOrEqual(1);
   });
 
   it('connections materializer schedules retrain checks for feedback events', async () => {

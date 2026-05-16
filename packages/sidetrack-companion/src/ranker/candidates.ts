@@ -1,4 +1,5 @@
 import { type ConnectionEdge } from '../connections/types.js';
+import { USER_FLOW_CONFIRMED } from '../feedback/events.js';
 import { NAVIGATION_COMMITTED, isNavigationCommittedPayload } from '../navigation/events.js';
 import { SELECTION_COPIED, isSelectionCopiedPayload } from '../snippets/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
@@ -27,6 +28,7 @@ interface VisitRecord {
 }
 
 export const CANDIDATE_SOURCES = [
+  'user_confirmed',
   'same_workstream',
   'opener_chain',
   'navigation_chain',
@@ -292,8 +294,10 @@ const walkGraph = (
   const seen = new Set<string>([start]);
   const queue: string[] = [...toSortedIds(graph.get(start))];
 
-  for (let index = 0; index < queue.length; index += 1) {
+  let index = 0;
+  while (index < queue.length) {
     const current = queue[index];
+    index += 1;
     if (current === undefined || seen.has(current)) continue;
     seen.add(current);
     for (const next of toSortedIds(graph.get(current))) {
@@ -646,6 +650,11 @@ export const generateSameWorkstreamCandidates: GenerateCandidates = sourceWrappe
   sameWorkstreamGenerator,
 );
 
+export const generateUserConfirmedCandidates: GenerateCandidates = sourceWrapper(
+  'user_confirmed',
+  explicitPairGenerator(USER_FLOW_CONFIRMED, 'user_confirmed'),
+);
+
 export const generateOpenerChainCandidates: GenerateCandidates = sourceWrapper(
   'opener_chain',
   chainGenerator('opener_chain', (record) => record.openerVisitId),
@@ -702,6 +711,7 @@ export const generateRecentlySkippedCandidates: GenerateCandidates = sourceWrapp
 );
 
 export const CANDIDATE_GENERATORS: Readonly<Record<CandidateSource, GenerateCandidates>> = {
+  user_confirmed: generateUserConfirmedCandidates,
   same_workstream: generateSameWorkstreamCandidates,
   opener_chain: generateOpenerChainCandidates,
   navigation_chain: generateNavigationChainCandidates,

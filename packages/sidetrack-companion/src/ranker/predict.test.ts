@@ -83,7 +83,7 @@ const syntheticTrainingSet = (): {
           fromVisitId,
           toVisitId,
           generatedAt: generatedAt + query,
-          sources: positive ? ['same_workstream'] : ['random_unrelated'],
+          sources: positive ? ['user_confirmed'] : ['random_unrelated'],
         },
         features: featuresFor(positive ? 0.78 + item / 100 : item / 100, positive ? 1 : 0),
       });
@@ -195,8 +195,8 @@ describe('LightGBM LambdaMART ranker', () => {
 
 describe('ranker model version back-compat', () => {
   it('pins the bumped model + feature-schema versions for the expanded feature set', () => {
-    expect(RANKER_MODEL_VERSION).toBe('lightgbm-lambdamart-v2');
-    expect(FEATURE_SCHEMA_VERSION).toBe(2);
+    expect(RANKER_MODEL_VERSION).toBe('lightgbm-lambdamart-v3');
+    expect(FEATURE_SCHEMA_VERSION).toBe(3);
   });
 
   it('rejects a persisted model whose manifest predates the feature-set bump', async () => {
@@ -246,21 +246,21 @@ describe('ranker model version back-compat', () => {
     await expect(readClosestVisitRankerRevision(root, staleRevisionId)).resolves.toBeNull();
   });
 
-  it('round-trips and predicts a freshly trained v2 model after the bump', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'sidetrack-ranker-v2-'));
+  it('round-trips and predicts a freshly trained v3 model after the bump', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'sidetrack-ranker-v3-'));
     tempRoots.push(root);
     const input = syntheticTrainingSet();
     const revision = await trainRankerRevision({
       ...input,
       options: { seed: 41, numRound: 8, trainedAt: generatedAt },
     });
-    expect(revision.modelVersion).toBe('lightgbm-lambdamart-v2');
-    expect(revision.featureSchemaVersion).toBe(2);
+    expect(revision.modelVersion).toBe('lightgbm-lambdamart-v3');
+    expect(revision.featureSchemaVersion).toBe(3);
 
     await writeActiveClosestVisitRankerRevision(root, revision);
     const reloaded = await readClosestVisitRankerRevision(root, revision.revisionId);
     expect(reloaded).not.toBeNull();
-    if (reloaded === null) throw new Error('expected reloaded v2 revision');
+    if (reloaded === null) throw new Error('expected reloaded v3 revision');
 
     const model = await loadRankerModel(reloaded);
     try {

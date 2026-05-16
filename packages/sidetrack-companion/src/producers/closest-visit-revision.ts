@@ -104,12 +104,44 @@ const isGradeHistogram = (value: unknown): value is RankerTrainQuality['gradeHis
   );
 };
 
+const normalizeCandidateLabeling = (
+  value: unknown,
+): RankerTrainQuality['candidateLabeling'] | undefined => {
+  if (!isRecord(value)) return undefined;
+  const totalCandidates = value['totalCandidates'];
+  const labeledRows = value['labeledRows'];
+  const positiveRows = value['positiveRows'];
+  const negativeRows = value['negativeRows'];
+  const implicitNegativeRows = value['implicitNegativeRows'];
+  const unlabeledCandidateCount = value['unlabeledCandidateCount'];
+  if (
+    typeof totalCandidates !== 'number' ||
+    typeof labeledRows !== 'number' ||
+    typeof positiveRows !== 'number' ||
+    typeof negativeRows !== 'number' ||
+    typeof implicitNegativeRows !== 'number' ||
+    typeof unlabeledCandidateCount !== 'number'
+  ) {
+    return undefined;
+  }
+  return {
+    totalCandidates,
+    labeledRows,
+    positiveRows,
+    negativeRows,
+    implicitNegativeRows,
+    unlabeledCandidateCount,
+  };
+};
+
 // Lenient: a malformed `trainQuality` is pure observability, so it is
 // dropped rather than failing the whole manifest. A manifest without
 // `trainQuality` (older writers) is also valid — returns undefined.
 const normalizeTrainQuality = (value: unknown): RankerTrainQuality | undefined => {
   if (!isRecord(value)) return undefined;
   if (!isGradeHistogram(value['gradeHistogram'])) return undefined;
+  const candidateLabeling = normalizeCandidateLabeling(value['candidateLabeling']);
+  if (candidateLabeling === undefined) return undefined;
   const spreadRaw = value['scoreSpread'];
   const spread =
     isRecord(spreadRaw) &&
@@ -133,10 +165,28 @@ const normalizeTrainQuality = (value: unknown): RankerTrainQuality | undefined =
     isFiniteNumber(metricRaw['value'])
       ? { kind: metricRaw['kind'], value: metricRaw['value'] }
       : undefined;
+  const heldOutRaw = value['heldOutMetric'];
+  const heldOut =
+    isRecord(heldOutRaw) &&
+    typeof heldOutRaw['kind'] === 'string' &&
+    isFiniteNumber(heldOutRaw['value']) &&
+    isFiniteNumber(heldOutRaw['trainGroupCount']) &&
+    isFiniteNumber(heldOutRaw['heldOutGroupCount']) &&
+    isFiniteNumber(heldOutRaw['cutoffGeneratedAt'])
+      ? {
+          kind: heldOutRaw['kind'],
+          value: heldOutRaw['value'],
+          trainGroupCount: heldOutRaw['trainGroupCount'],
+          heldOutGroupCount: heldOutRaw['heldOutGroupCount'],
+          cutoffGeneratedAt: heldOutRaw['cutoffGeneratedAt'],
+        }
+      : undefined;
   return {
     gradeHistogram: value['gradeHistogram'],
+    candidateLabeling,
     ...(spread === undefined ? {} : { scoreSpread: spread }),
     ...(metric === undefined ? {} : { inSampleMetric: metric }),
+    ...(heldOut === undefined ? {} : { heldOutMetric: heldOut }),
   };
 };
 

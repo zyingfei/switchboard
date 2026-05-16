@@ -130,8 +130,8 @@ describe('tab-session resolver', () => {
       to: node,
     }));
     const graph = buildEvidenceGraph(snapshot(nodes, edges));
-    const first = runPPR(graph, new Map([[nodes[0]!, 1]]), 0.15, 1e-9, 50);
-    const second = runPPR(graph, new Map([[nodes[0]!, 1]]), 0.15, 1e-9, 50);
+    const first = runPPR(graph, new Map([[nodes[0]!, 1]]), 0.15, 1e-9, 50, Infinity);
+    const second = runPPR(graph, new Map([[nodes[0]!, 1]]), 0.15, 1e-9, 50, Infinity);
 
     expect([...first.entries()]).toEqual([...second.entries()]);
     expect(first.get(nodes[0]!)).toBeGreaterThan(first.get(nodes[49]!) ?? 0);

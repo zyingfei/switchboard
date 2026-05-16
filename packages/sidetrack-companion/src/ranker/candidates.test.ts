@@ -6,6 +6,7 @@ import type {
   ConnectionEdgeProducedBy,
 } from '../connections/types.js';
 import { nodeIdFor } from '../connections/types.js';
+import { USER_FLOW_CONFIRMED } from '../feedback/events.js';
 import { NAVIGATION_COMMITTED } from '../navigation/events.js';
 import { SELECTION_COPIED } from '../snippets/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
@@ -25,6 +26,7 @@ import {
   generateSameSearchQueryCandidates,
   generateSameTitlePathTokensCandidates,
   generateSameWorkstreamCandidates,
+  generateUserConfirmedCandidates,
 } from './candidates.js';
 import type { CandidateSource, GenerateCandidates } from './types.js';
 
@@ -147,6 +149,7 @@ const expectSingleSourceCandidate = (
 describe('ranker candidate generation', () => {
   it('keeps the CandidateSource registry in schema order', () => {
     expect(CANDIDATE_SOURCES).toEqual([
+      'user_confirmed',
       'same_workstream',
       'opener_chain',
       'navigation_chain',
@@ -164,6 +167,27 @@ describe('ranker candidate generation', () => {
 
   it('returns no candidates for empty input', () => {
     expect(generateCandidates('visit-a', context())).toEqual([]);
+  });
+
+  it('generates user_confirmed candidates', () => {
+    const ctx = context([
+      event({
+        seq: 3,
+        type: USER_FLOW_CONFIRMED,
+        payload: {
+          fromVisitId: 'https://alpha.test/a',
+          toVisitId: 'https://bravo.test/b',
+        },
+      }),
+    ]);
+
+    expectSingleSourceCandidate(
+      generateUserConfirmedCandidates,
+      'user_confirmed',
+      'https://alpha.test/a',
+      'https://bravo.test/b',
+      ctx,
+    );
   });
 
   it('generates same_workstream candidates', () => {
@@ -524,11 +548,17 @@ describe('ranker candidate generation', () => {
     ];
 
     const forward = JSON.stringify(generateCandidates('https://alpha.test/a', context(merged)));
+    const [first, second, third, fourth] = merged;
+    if (
+      first === undefined ||
+      second === undefined ||
+      third === undefined ||
+      fourth === undefined
+    ) {
+      throw new Error('expected four merged events');
+    }
     const shuffled = JSON.stringify(
-      generateCandidates(
-        'https://alpha.test/a',
-        context([merged[2]!, merged[0]!, merged[3]!, merged[1]!]),
-      ),
+      generateCandidates('https://alpha.test/a', context([third, first, fourth, second])),
     );
 
     expect(shuffled).toBe(forward);

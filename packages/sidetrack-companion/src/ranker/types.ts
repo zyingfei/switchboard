@@ -2,6 +2,7 @@ import type { ConnectionEdge } from '../connections/types.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 
 export type CandidateSource =
+  | 'user_confirmed'
   | 'same_workstream'
   | 'opener_chain'
   | 'navigation_chain'
@@ -16,10 +17,10 @@ export type CandidateSource =
   | 'recently_skipped';
 
 export interface Candidate {
-  fromVisitId: string;
-  toVisitId: string;
-  sources: readonly CandidateSource[];
-  generatedAt: number;
+  readonly fromVisitId: string;
+  readonly toVisitId: string;
+  readonly sources: readonly CandidateSource[];
+  readonly generatedAt: number;
 }
 
 export type GenerateCandidates = (
