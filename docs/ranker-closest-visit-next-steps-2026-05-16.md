@@ -5,8 +5,9 @@
 >
 > **Builds on:**
 > [`ranker-closest-visit-leak-diagnosis-and-plan-2026-05-16.md`](./ranker-closest-visit-leak-diagnosis-and-plan-2026-05-16.md)
-> (the leakage diagnosis; PR #179). Stacked on that branch so both
-> docs are co-present.
+> (the leakage diagnosis; PR #179 — **merged to `main`**). This PR's
+> base is re-pointed to `main` (#184 CV-7); its net diff is this single
+> doc.
 >
 > **Inputs reconciled here:** a Claude deep-research discussion on eval
 > methodology vs. model choice, plus the repo's locked architecture
@@ -19,8 +20,10 @@
 
 PR #181 (`fix(ranker): remove closest_visit workstream leakage`, →
 `main`, model `v2→v3` / schema `2→3`) landed **after** this plan was
-written and changes its status. Read this section first; §§1–9 below
-are the original reasoning and remain valid except where noted.
+written and changes its status. As of 2026-05-16 **#179 and #181 are
+merged to `main`**; #182 (this doc) and #183 remain open. Read this
+section first; §§1–9 below are the original reasoning and remain valid
+except where noted.
 
 **Status delta:**
 
@@ -81,11 +84,13 @@ scaffold actually fires; (c) add the still-missing probes —
 feature-ablation, label-permutation, novel-pair slice — plus the
 reserved untouched test slice.
 
-**ADR-0004 is now validated in practice:** #181 performed label
-cleaning and added a held-out scaffold **without changing model
-class** — exactly the methodology/model separation ADR-0004 asserts.
-Recommend moving ADR-0004 from *proposed* to *accepted* on the
-strength of #181.
+**ADR-0005 is now validated in practice and filed:** #181 performed
+label cleaning and added a held-out scaffold **without changing model
+class** — exactly the methodology/model separation this ADR asserts.
+This branch files it as
+[`ADR-0005`](./adr/0005-ranker-evaluation-methodology.md) (not 0004 —
+`0004` is taken by `0004-bun-runtime-install` on `main`; #184
+CV-5/CV-6) and marks it accepted on the strength of #181/#183.
 
 ---
 
@@ -232,6 +237,12 @@ need repo-aware constraints:
   first, ESM, no Python/Rust*). "Embeddings-as-features" here means
   *richer use of the existing local vectors*, not a new model
   dependency.
+  > **Bun-era note (#184 CV-6):** ADR-0003's "ESM, no Python/Rust"
+  > framing predates Bun adoption (ADR-0004 = `bun-runtime-install`,
+  > merged via #178). The runtime story has shifted; the recommendation
+  > here is unchanged (reuse the existing local embedding stage; no new
+  > heavy model dependency), but cite current runtime reality, not the
+  > pre-Bun framing, when this lands as ADR-0005.
 - **Model graduation** (deterministic → regularized LR → trees) must
   enter via the repo's established **measured-candidate-revision**
   pattern (how `idf-rkn-split`, Louvain R4, the gray-zone scorer R1b
@@ -280,15 +291,17 @@ interpretable → model choice (Phase 2) → tuned ship gate (Phase 3).**
 The spine is built before labels; its *reading* is load-bearing only
 after them.
 
-## 7. Recommended ADR-0004 (proposed text — decision of record)
+## 7. ADR-0005 (filed decision of record)
 
 Consistent with how this repo records decisions (ADR-0003; the
 evolution proposal explicitly lists follow-up-ADR candidates), the
-methodology/model orthogonality is a decision of record. Proposed,
-**not** filed here (decider is User + Claude, per ADR convention):
+methodology/model orthogonality is a decision of record. **Number:
+0005** — `0004` is occupied by `0004-bun-runtime-install` on `main`
+(verified; #184 CV-5/CV-6). The accepted ADR is filed at
+[`docs/adr/0005-ranker-evaluation-methodology.md`](./adr/0005-ranker-evaluation-methodology.md).
 
-> **ADR-0004 — Ranker evaluation methodology is mandatory, orthogonal
-> to model choice, and built before the leak fix.**
+> **ADR-0005 — Ranker evaluation methodology is mandatory and
+> model-orthogonal.**
 > The `closest_visit` (and any future learned) ranker requires a
 > per-user, forward-chaining time-split held-out evaluation with a
 > reserved untouched test slice and label-leakage probes
@@ -306,8 +319,8 @@ methodology/model orthogonality is a decision of record. Proposed,
 - No model retrain.
 - Phase 0 is evaluation infrastructure; it is not the leak fix and
   does not alter ranker scoring.
-- ADR-0004 is *proposed* here, not filed — it needs the User+Claude
-  decision step ADRs use.
+- ADR-0005 is filed as an accepted decision of record; implementation
+  remains separate.
 
 ## 9. Definition of done for Phase 0 (the only thing this plan unblocks)
 
