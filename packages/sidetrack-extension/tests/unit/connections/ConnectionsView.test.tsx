@@ -176,6 +176,61 @@ describe('ConnectionsView — engineering scaffold', () => {
     expect(selector.value).toBe('workstream:ws_x');
   });
 
+  it('opens a full Search mode and anchors picked results', async () => {
+    const requestedNodeIds: string[] = [];
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string; nodeId?: string };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        requestedNodeIds.push(m.nodeId ?? '');
+        return { ok: true, data: buildSnapshot() };
+      }
+      if (m.type === messageTypes.loadConnectionsSnapshot) {
+        return {
+          ok: true,
+          data: {
+            scope: 'companion-extended',
+            snapshot: {
+              scope: {},
+              nodes: [
+                ...buildSnapshot().snapshot.nodes,
+                {
+                  id: 'thread:oracle',
+                  kind: 'thread',
+                  label: 'Oracle Cloud Infrastructure Cloud Adoption Framework',
+                  originReplicaIds: ['replica-A'],
+                  metadata: { title: 'Oracle Cloud Infrastructure Cloud Adoption Framework' },
+                },
+              ],
+              edges: buildSnapshot().snapshot.edges,
+              updatedAt: '2026-05-07T10:00:00.000Z',
+              nodeCount: 3,
+              edgeCount: 1,
+            },
+          },
+        };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+
+    render(<ConnectionsView initialAnchor="thread:thread_a" />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-mode-search')).not.toBeNull();
+    });
+    fireEvent.click(screen.getByTestId('connections-mode-search'));
+    expect(screen.getByTestId('connections-search-tab')).toBeDefined();
+    fireEvent.change(screen.getByTestId('connections-search-tab-input'), {
+      target: { value: 'or' },
+    });
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-search-tab-hit-thread:oracle')).not.toBeNull();
+    });
+    fireEvent.click(screen.getByTestId('connections-search-tab-hit-thread:oracle'));
+    await waitFor(() => {
+      expect(requestedNodeIds).toContain('thread:oracle');
+    });
+    expect(screen.getByTestId('connections-mode-linked')).toHaveAttribute('aria-selected', 'true');
+  });
+
   it('scopes shadow focus suggestions to the selected workstream', async () => {
     const collapsedSnapshot = {
       scope: 'companion-extended',

@@ -44,6 +44,7 @@ import {
 import { OrbitalCenter } from './OrbitalCenter';
 import { PathFinder } from './PathFinder';
 import { ProvenanceCard, ProvenanceEmpty } from './ProvenancePanel';
+import { SearchTab } from './SearchTab';
 import { TimelineRail } from './TimelineRail';
 import { computeTimelineRail, type TimelineRailData } from './timelineWindows';
 import type {
@@ -157,7 +158,7 @@ const DEFAULT_DISPLAY_CTX: EntityDisplayCtx = {
   replicaAlias: () => 'Browser',
 };
 
-type SubMode = 'linked' | 'orbital' | 'flow' | 'focus' | 'context';
+type SubMode = 'linked' | 'orbital' | 'flow' | 'focus' | 'context' | 'search';
 
 const normalizeWorkstreamAnchorId = (id: string): string =>
   id.startsWith('workstream:') ? id : `workstream:${id}`;
@@ -1793,7 +1794,7 @@ export const ConnectionsView = ({
     if (subMode === 'focus') {
       fullSnapshot.prime();
       shadowFullSnapshot.prime();
-    } else if (subMode === 'flow') {
+    } else if (subMode === 'flow' || subMode === 'search') {
       fullSnapshot.prime();
     }
     // Intentionally not depending on fullSnapshot itself — prime()
@@ -1952,6 +1953,34 @@ export const ConnectionsView = ({
     const workstream = result?.snapshot.nodes.find((node) => node.kind === 'workstream');
     return workstream?.id.replace(/^workstream:/u, '') ?? anchor;
   }, [anchor, result]);
+  const searchTab = (
+    <SearchTab
+      nodes={searchNodes}
+      extras={searchExtras}
+      ctx={ctx}
+      query={searchQuery}
+      onQueryChange={setSearchQuery}
+      onPrime={fullSnapshot.prime}
+      loading={fullSnapshot.loading}
+      recallHits={recallResults.items.map((item) => ({
+        ...(item.sourceKind === undefined ? {} : { sourceKind: item.sourceKind }),
+        ...(item.anchorNodeId === undefined ? {} : { anchorNodeId: item.anchorNodeId }),
+        ...(item.threadId === undefined ? {} : { threadId: item.threadId }),
+        ...(item.canonicalUrl === undefined ? {} : { canonicalUrl: item.canonicalUrl }),
+        ...(item.title === undefined ? {} : { title: item.title }),
+        ...(item.threadUrl === undefined ? {} : { threadUrl: item.threadUrl }),
+        ...(item.snippet === undefined ? {} : { snippet: item.snippet }),
+        score: item.score,
+      }))}
+      recallLoading={recallResults.loading}
+      recallError={recallResults.error}
+      onPick={(anchorId, label) => {
+        navigateToAnchor(anchorId, label);
+        setSubMode('linked');
+      }}
+      {...(onOpenUrl === undefined ? {} : { onOpenUrl })}
+    />
+  );
 
   return (
     <div className="cx-shell-host bac-connections-view" data-testid="connections-view">
@@ -2229,6 +2258,19 @@ export const ConnectionsView = ({
         >
           Context Pack
         </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={subMode === 'search'}
+          className={'cx-mode' + (subMode === 'search' ? ' is-active' : '')}
+          onClick={() => {
+            setSubMode('search');
+            fullSnapshot.prime();
+          }}
+          data-testid="connections-mode-search"
+        >
+          Search
+        </button>
       </div>
       <PathFinder
         anchorId={anchor}
@@ -2299,6 +2341,11 @@ export const ConnectionsView = ({
               }))}
               recallLoading={recallResults.loading}
               recallError={recallResults.error}
+              onOpenFullSearch={(query) => {
+                setSearchQuery(query);
+                setSubMode('search');
+                fullSnapshot.prime();
+              }}
             />
           </div>
           <div className="cx-section">
@@ -2459,7 +2506,9 @@ export const ConnectionsView = ({
               <p>{error}</p>
             </div>
           ) : null}
-          {result !== null ? (
+          {subMode === 'search' ? (
+            searchTab
+          ) : result !== null ? (
             subMode === 'linked' ? (
               <LinkedCenter
                 result={result}
