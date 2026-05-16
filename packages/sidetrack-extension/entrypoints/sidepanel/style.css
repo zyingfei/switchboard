@@ -8760,11 +8760,15 @@ pre.diff {
 }
 .cx-search-tab-kind {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
   color: var(--ink-2);
   font-size: 12.5px;
+  cursor: pointer;
+}
+.cx-search-tab-kind input {
+  accent-color: var(--ink);
 }
 .cx-search-tab-kind .cx-node-icon {
   width: 20px;
@@ -8789,6 +8793,47 @@ pre.diff {
   color: var(--signal);
   border-radius: 2px;
   padding: 0 2px;
+}
+.cx-filter-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.cx-filter-check {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.cx-filter-check input {
+  accent-color: var(--ink);
+}
+.cx-filter-check .cx-node-icon {
+  width: 20px;
+  height: 20px;
+}
+.cx-filter-check-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cx-filter-check-body {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.cx-family-filter-check {
+  grid-template-columns: auto 34px minmax(0, 1fr) auto;
+  align-items: start;
+}
+.cx-family-filter-check .cx-edge {
+  margin-top: 6px;
 }
 @media (max-width: 860px) {
   .cx-search-tab-opbar {
@@ -8846,6 +8891,13 @@ pre.diff {
   display: flex;
   flex: 1;
   min-height: 0;
+}
+.cx-cols.is-search-mode {
+  display: block;
+  overflow: hidden;
+}
+.cx-cols.is-search-mode .cx-col-c {
+  height: 100%;
 }
 .cx-col-l {
   width: 240px;

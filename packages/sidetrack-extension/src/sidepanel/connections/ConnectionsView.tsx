@@ -11,8 +11,13 @@ import {
   postUserTopicRenamed,
   type UserFlowRelationKind,
 } from './client';
-import { nodeKindDisplayFor } from './edgeKinds';
-import { FamilyLegend } from './FamilyLegend';
+import {
+  EDGE_KINDS,
+  FAMILIES,
+  NODE_KIND_GROUP_ORDER,
+  nodeKindDisplayFor,
+  type EdgeFamily,
+} from './edgeKinds';
 import {
   FlowPathView,
   type CrossReplicaEdge,
@@ -159,6 +164,90 @@ const DEFAULT_DISPLAY_CTX: EntityDisplayCtx = {
 };
 
 type SubMode = 'linked' | 'orbital' | 'flow' | 'focus' | 'context' | 'search';
+
+const FILTERED_SUBMODES = new Set<SubMode>(['linked', 'orbital', 'flow']);
+
+const edgeFamilyForKind = (kind: string): EdgeFamily => {
+  const meta = (EDGE_KINDS as Partial<Record<string, { readonly family: EdgeFamily }>>)[kind];
+  return meta?.family ?? 'urlmatch';
+};
+
+const toggleSetValue = <T,>(current: ReadonlySet<T>, value: T): ReadonlySet<T> => {
+  const next = new Set(current);
+  if (next.has(value)) next.delete(value);
+  else next.add(value);
+  return next;
+};
+
+const filterSnapshotForConnectionModes = (
+  result: ConnectionsScopedResult,
+  anchorId: string,
+  hiddenNodeKinds: ReadonlySet<ConnectionNodeKind>,
+  hiddenEdgeFamilies: ReadonlySet<EdgeFamily>,
+): ConnectionsScopedResult => {
+  if (hiddenNodeKinds.size === 0 && hiddenEdgeFamilies.size === 0) return result;
+  const nodeById = new Map(result.snapshot.nodes.map((node) => [node.id, node] as const));
+  const allowedNode = (nodeId: string): boolean => {
+    if (nodeId === anchorId) return true;
+    const node = nodeById.get(nodeId);
+    return node === undefined || !hiddenNodeKinds.has(node.kind);
+  };
+  const edges = result.snapshot.edges.filter(
+    (edge) =>
+      !hiddenEdgeFamilies.has(edgeFamilyForKind(edge.kind)) &&
+      allowedNode(edge.fromNodeId) &&
+      allowedNode(edge.toNodeId),
+  );
+  const includedNodeIds = new Set<string>([anchorId]);
+  for (const edge of edges) {
+    includedNodeIds.add(edge.fromNodeId);
+    includedNodeIds.add(edge.toNodeId);
+  }
+  const nodes = result.snapshot.nodes.filter(
+    (node) => includedNodeIds.has(node.id) && allowedNode(node.id),
+  );
+  return {
+    ...result,
+    snapshot: {
+      ...result.snapshot,
+      nodes,
+      edges,
+      nodeCount: nodes.length,
+      edgeCount: edges.length,
+    },
+  };
+};
+
+const filterGraphPartsForConnectionModes = (
+  nodes: readonly ConnectionNode[],
+  edges: readonly ConnectionEdge[],
+  anchorId: string,
+  hiddenNodeKinds: ReadonlySet<ConnectionNodeKind>,
+  hiddenEdgeFamilies: ReadonlySet<EdgeFamily>,
+): { readonly nodes: readonly ConnectionNode[]; readonly edges: readonly ConnectionEdge[] } => {
+  if (hiddenNodeKinds.size === 0 && hiddenEdgeFamilies.size === 0) return { nodes, edges };
+  const nodeById = new Map(nodes.map((node) => [node.id, node] as const));
+  const allowedNode = (nodeId: string): boolean => {
+    if (nodeId === anchorId) return true;
+    const node = nodeById.get(nodeId);
+    return node === undefined || !hiddenNodeKinds.has(node.kind);
+  };
+  const filteredEdges = edges.filter(
+    (edge) =>
+      !hiddenEdgeFamilies.has(edgeFamilyForKind(edge.kind)) &&
+      allowedNode(edge.fromNodeId) &&
+      allowedNode(edge.toNodeId),
+  );
+  const includedNodeIds = new Set<string>([anchorId]);
+  for (const edge of filteredEdges) {
+    includedNodeIds.add(edge.fromNodeId);
+    includedNodeIds.add(edge.toNodeId);
+  }
+  const filteredNodes = nodes.filter(
+    (node) => includedNodeIds.has(node.id) && allowedNode(node.id),
+  );
+  return { nodes: filteredNodes, edges: filteredEdges };
+};
 
 const normalizeWorkstreamAnchorId = (id: string): string =>
   id.startsWith('workstream:') ? id : `workstream:${id}`;
@@ -1136,6 +1225,12 @@ export const ConnectionsView = ({
   const [whyVisitId, setWhyVisitId] = useState<string | null>(null);
   const [whyAssertedOnly, setWhyAssertedOnly] = useState<boolean>(false);
   const [timelineHoverNodeId, setTimelineHoverNodeId] = useState<string | null>(null);
+  const [hiddenNodeKinds, setHiddenNodeKinds] = useState<ReadonlySet<ConnectionNodeKind>>(
+    () => new Set<ConnectionNodeKind>(),
+  );
+  const [hiddenEdgeFamilies, setHiddenEdgeFamilies] = useState<ReadonlySet<EdgeFamily>>(
+    () => new Set<EdgeFamily>(),
+  );
 
   // Snapshot fetching: cached by (anchor, hops), revalidated in the
   // background when revisited so the user gets instant flips through
@@ -1392,6 +1487,39 @@ export const ConnectionsView = ({
     }
     return out;
   }, [recentAnchors, workstreamAnchors]);
+
+  const nodeKindFilterOptions = useMemo(() => {
+    const counts = new Map<ConnectionNodeKind, number>();
+    for (const node of result?.snapshot.nodes ?? []) {
+      if (node.id === anchor) continue;
+      counts.set(node.kind, (counts.get(node.kind) ?? 0) + 1);
+    }
+    return [...counts.entries()].sort(([left], [right]) => {
+      const leftRank = NODE_KIND_GROUP_ORDER.indexOf(left);
+      const rightRank = NODE_KIND_GROUP_ORDER.indexOf(right);
+      return (
+        (leftRank < 0 ? 99 : leftRank) - (rightRank < 0 ? 99 : rightRank) ||
+        nodeKindDisplayFor(left).label.localeCompare(nodeKindDisplayFor(right).label)
+      );
+    });
+  }, [anchor, result]);
+
+  const edgeFamilyFilterOptions = useMemo(() => {
+    const counts = new Map<EdgeFamily, number>();
+    for (const edge of result?.snapshot.edges ?? []) {
+      const family = edgeFamilyForKind(edge.kind);
+      counts.set(family, (counts.get(family) ?? 0) + 1);
+    }
+    return (Object.keys(FAMILIES) as EdgeFamily[]).map(
+      (family) => [family, counts.get(family) ?? 0] as const,
+    );
+  }, [result]);
+
+  const panelFilterActive = FILTERED_SUBMODES.has(subMode);
+  const filteredPanelResult = useMemo(() => {
+    if (result === null || !panelFilterActive) return result;
+    return filterSnapshotForConnectionModes(result, anchor, hiddenNodeKinds, hiddenEdgeFamilies);
+  }, [anchor, hiddenEdgeFamilies, hiddenNodeKinds, panelFilterActive, result]);
 
   const useNodeAsAnchor = (nodeId: string): void => {
     setSelectedEdge(null);
@@ -1948,6 +2076,17 @@ export const ConnectionsView = ({
       filteredFullSnapshot.edges,
     );
   }, [result, filteredFullSnapshot.nodes, filteredFullSnapshot.edges]);
+  const filteredFlowSubgraph = useMemo(
+    () =>
+      filterGraphPartsForConnectionModes(
+        flowSubgraph.nodes,
+        flowSubgraph.edges,
+        anchor,
+        hiddenNodeKinds,
+        hiddenEdgeFamilies,
+      ),
+    [anchor, flowSubgraph.edges, flowSubgraph.nodes, hiddenEdgeFamilies, hiddenNodeKinds],
+  );
   const contextWorkstreamId = useMemo(() => {
     if (anchor.startsWith('workstream:')) return anchor.replace(/^workstream:/u, '');
     const workstream = result?.snapshot.nodes.find((node) => node.kind === 'workstream');
@@ -2272,19 +2411,21 @@ export const ConnectionsView = ({
           Search
         </button>
       </div>
-      <PathFinder
-        anchorId={anchor}
-        anchorLabel={
-          anchorDisplayNode === null ? null : formatEntityDisplay(anchorDisplayNode, ctx).primary
-        }
-        nodes={searchNodes}
-        extras={searchExtras}
-        ctx={ctx}
-        onNodeClick={(nodeId) => {
-          useNodeAsAnchor(nodeId);
-        }}
-      />
-      {result !== null ? (
+      {subMode === 'search' ? null : (
+        <PathFinder
+          anchorId={anchor}
+          anchorLabel={
+            anchorDisplayNode === null ? null : formatEntityDisplay(anchorDisplayNode, ctx).primary
+          }
+          nodes={searchNodes}
+          extras={searchExtras}
+          ctx={ctx}
+          onNodeClick={(nodeId) => {
+            useNodeAsAnchor(nodeId);
+          }}
+        />
+      )}
+      {result !== null && subMode !== 'search' ? (
         // Thin filter strip — only renders when there's a loaded
         // result so empty states don't carry an unusable control.
         <div className="cx-filterbar" data-testid="connections-filterbar">
@@ -2296,7 +2437,7 @@ export const ConnectionsView = ({
           />
         </div>
       ) : null}
-      {timeline !== null ? (
+      {timeline !== null && subMode !== 'search' ? (
         <TimelineRail
           data={timeline}
           ctx={ctx}
@@ -2304,193 +2445,272 @@ export const ConnectionsView = ({
           onHoverNode={setTimelineHoverNodeId}
         />
       ) : null}
-      <div className="cx-cols">
-        <aside className={'cx-col-l' + (leftRailOpen ? '' : ' is-collapsed')}>
-          <button
-            type="button"
-            className="cx-rail-toggle cx-mono cx-dim"
-            onClick={() => {
-              setLeftRailOpen((v) => !v);
-            }}
-            aria-expanded={leftRailOpen}
-            data-testid="connections-rail-toggle"
-          >
-            {leftRailOpen ? '▾' : '▸'} Panel
-          </button>
-          <div className="cx-section">
-            <h4>Find</h4>
-            <NodeSearchBox
-              nodes={searchNodes}
-              extras={searchExtras}
-              ctx={ctx}
-              onPick={(id) => {
-                navigateToAnchor(id);
+      <div className={'cx-cols' + (subMode === 'search' ? ' is-search-mode' : '')}>
+        {subMode === 'search' ? null : (
+          <aside className={'cx-col-l' + (leftRailOpen ? '' : ' is-collapsed')}>
+            <button
+              type="button"
+              className="cx-rail-toggle cx-mono cx-dim"
+              onClick={() => {
+                setLeftRailOpen((v) => !v);
               }}
-              onQueryChange={setSearchQuery}
-              onPrime={fullSnapshot.prime}
-              loading={fullSnapshot.loading}
-              recallHits={recallResults.items.map((item) => ({
-                ...(item.sourceKind === undefined ? {} : { sourceKind: item.sourceKind }),
-                ...(item.anchorNodeId === undefined ? {} : { anchorNodeId: item.anchorNodeId }),
-                ...(item.threadId === undefined ? {} : { threadId: item.threadId }),
-                ...(item.canonicalUrl === undefined ? {} : { canonicalUrl: item.canonicalUrl }),
-                ...(item.title === undefined ? {} : { title: item.title }),
-                ...(item.threadUrl === undefined ? {} : { threadUrl: item.threadUrl }),
-                ...(item.snippet === undefined ? {} : { snippet: item.snippet }),
-                score: item.score,
-              }))}
-              recallLoading={recallResults.loading}
-              recallError={recallResults.error}
-              onOpenFullSearch={(query) => {
-                setSearchQuery(query);
-                setSubMode('search');
-                fullSnapshot.prime();
-              }}
-            />
-          </div>
-          <div className="cx-section">
-            <h4>Workstream</h4>
-            <label className="cx-select">
-              <span className="cx-select-label">Show connections around</span>
-              <select
-                value={selectedWorkstreamAnchor}
-                onChange={(event) => {
-                  if (event.currentTarget.value.length > 0)
-                    navigateToAnchor(event.currentTarget.value);
-                }}
-                aria-label="Connections workstream"
-                data-testid="connections-workstream-select"
-                disabled={workstreamOptions.length === 0}
-              >
-                <option value="">
-                  {workstreamOptions.length === 0 ? 'No workstreams in view' : 'Choose workstream'}
-                </option>
-                {workstreamOptions.map((workstream) => (
-                  <option key={workstream.id} value={workstream.id}>
-                    {workstream.label}
-                    {workstream.meta === undefined ? '' : ` · ${workstream.meta}`}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <details
-              className="cx-advanced-anchor"
-              data-testid="connections-advanced-anchor"
-              // Always open by default. The earlier behavior auto-
-              // opened only for non-workstream anchors and leaked a
-              // raw `visit-instance:tses_*:<iso>:<URL>` id into the
-              // input via `value={initialAnchor}`. That root cause
-              // is gone now (draftAnchor defaults to '' and the
-              // placeholder is the friendly "Paste a node id"), so
-              // keeping the section open is safe and matches what
-              // every e2e spec + power-user workflow expects:
-              // a directly-clickable anchor input is always present.
-              open
+              aria-expanded={leftRailOpen}
+              data-testid="connections-rail-toggle"
             >
-              <summary data-testid="connections-advanced-anchor-summary">
-                Advanced node anchor
-              </summary>
-              <label className="cx-input">
-                <span aria-hidden className="cx-input-icon">
-                  {SearchIcon}
-                </span>
-                <input
-                  type="text"
-                  placeholder="Paste a node id"
-                  value={draftAnchor}
-                  onChange={(e) => {
-                    setDraftAnchor(e.target.value);
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') submitAdvancedAnchor();
-                  }}
-                  onBlur={() => {
-                    submitAdvancedAnchor();
-                  }}
-                  aria-label="Connections anchor"
-                  data-testid="connections-anchor-input"
-                />
-              </label>
-            </details>
-          </div>
-          {historyAnchors.length > 0 ? (
-            <div className="cx-section" data-testid="connections-recent-anchors">
-              <h4>Recent anchors</h4>
-              <div className="cx-recent-anchor-list">
-                {historyAnchors.map((r) => (
-                  <button
-                    key={r.id}
-                    type="button"
-                    className="cx-recent-anchor"
-                    onClick={() => {
-                      navigateToAnchor(r.id);
-                    }}
-                    data-testid={`recent-anchor-${r.id}`}
-                  >
-                    <span
-                      className={`cx-node-icon ${nodeKindDisplayFor(r.kind).tintClass}`}
-                      aria-hidden
-                    >
-                      {KindIcons[r.kind]}
-                    </span>
-                    <span className="cx-recent-anchor-label">{r.label}</span>
-                    <span className="cx-recent-meta">{nodeKindDisplayFor(r.kind).label}</span>
-                  </button>
-                ))}
-              </div>
-            </div>
-          ) : null}
-          {recentAnchors.length > 0 ? (
-            <div className="cx-section" data-testid="connections-anchor-shortcuts">
-              <h4>Shortcuts</h4>
-              <div className="cx-recent-anchor-list">
-                {recentAnchors.map((r) => (
-                  <button
-                    key={r.id}
-                    type="button"
-                    className="cx-recent-anchor"
-                    onClick={() => {
-                      navigateToAnchor(r.id);
-                    }}
-                    data-testid={`shortcut-anchor-${r.id}`}
-                  >
-                    <span
-                      className={`cx-node-icon ${nodeKindDisplayFor(r.kind).tintClass}`}
-                      aria-hidden
-                    >
-                      {KindIcons[r.kind]}
-                    </span>
-                    <span className="cx-recent-anchor-label">{r.label}</span>
-                    <span className="cx-recent-meta">{nodeKindDisplayFor(r.kind).label}</span>
-                  </button>
-                ))}
-              </div>
-            </div>
-          ) : null}
-          <div className="cx-section">
-            <h4>Hops</h4>
-            <label className="cx-hops-range">
-              <span>Range</span>
-              <select
-                value={hops}
-                onChange={(e) => {
-                  setHops(Number.parseInt(e.target.value, 10) || 1);
+              {leftRailOpen ? '▾' : '▸'} Panel
+            </button>
+            <div className="cx-section">
+              <h4>Find</h4>
+              <NodeSearchBox
+                nodes={searchNodes}
+                extras={searchExtras}
+                ctx={ctx}
+                onPick={(id) => {
+                  navigateToAnchor(id);
                 }}
-                data-testid="connections-hops-select"
-              >
-                {[1, 2, 3, 4].map((h) => (
-                  <option key={h} value={h}>
-                    {h}-hop
+                onQueryChange={setSearchQuery}
+                onPrime={fullSnapshot.prime}
+                loading={fullSnapshot.loading}
+                recallHits={recallResults.items.map((item) => ({
+                  ...(item.sourceKind === undefined ? {} : { sourceKind: item.sourceKind }),
+                  ...(item.anchorNodeId === undefined ? {} : { anchorNodeId: item.anchorNodeId }),
+                  ...(item.threadId === undefined ? {} : { threadId: item.threadId }),
+                  ...(item.canonicalUrl === undefined ? {} : { canonicalUrl: item.canonicalUrl }),
+                  ...(item.title === undefined ? {} : { title: item.title }),
+                  ...(item.threadUrl === undefined ? {} : { threadUrl: item.threadUrl }),
+                  ...(item.snippet === undefined ? {} : { snippet: item.snippet }),
+                  score: item.score,
+                }))}
+                recallLoading={recallResults.loading}
+                recallError={recallResults.error}
+                onOpenFullSearch={(query) => {
+                  setSearchQuery(query);
+                  setSubMode('search');
+                  fullSnapshot.prime();
+                }}
+              />
+            </div>
+            <div className="cx-section">
+              <h4>Workstream</h4>
+              <label className="cx-select">
+                <span className="cx-select-label">Show connections around</span>
+                <select
+                  value={selectedWorkstreamAnchor}
+                  onChange={(event) => {
+                    if (event.currentTarget.value.length > 0)
+                      navigateToAnchor(event.currentTarget.value);
+                  }}
+                  aria-label="Connections workstream"
+                  data-testid="connections-workstream-select"
+                  disabled={workstreamOptions.length === 0}
+                >
+                  <option value="">
+                    {workstreamOptions.length === 0
+                      ? 'No workstreams in view'
+                      : 'Choose workstream'}
                   </option>
-                ))}
-              </select>
-            </label>
-          </div>
-          <div className="cx-section cx-section-last">
-            <h4>Edge family</h4>
-            <FamilyLegend />
-          </div>
-        </aside>
+                  {workstreamOptions.map((workstream) => (
+                    <option key={workstream.id} value={workstream.id}>
+                      {workstream.label}
+                      {workstream.meta === undefined ? '' : ` · ${workstream.meta}`}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <details
+                className="cx-advanced-anchor"
+                data-testid="connections-advanced-anchor"
+                // Always open by default. The earlier behavior auto-
+                // opened only for non-workstream anchors and leaked a
+                // raw `visit-instance:tses_*:<iso>:<URL>` id into the
+                // input via `value={initialAnchor}`. That root cause
+                // is gone now (draftAnchor defaults to '' and the
+                // placeholder is the friendly "Paste a node id"), so
+                // keeping the section open is safe and matches what
+                // every e2e spec + power-user workflow expects:
+                // a directly-clickable anchor input is always present.
+                open
+              >
+                <summary data-testid="connections-advanced-anchor-summary">
+                  Advanced node anchor
+                </summary>
+                <label className="cx-input">
+                  <span aria-hidden className="cx-input-icon">
+                    {SearchIcon}
+                  </span>
+                  <input
+                    type="text"
+                    placeholder="Paste a node id"
+                    value={draftAnchor}
+                    onChange={(e) => {
+                      setDraftAnchor(e.target.value);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') submitAdvancedAnchor();
+                    }}
+                    onBlur={() => {
+                      submitAdvancedAnchor();
+                    }}
+                    aria-label="Connections anchor"
+                    data-testid="connections-anchor-input"
+                  />
+                </label>
+              </details>
+            </div>
+            {historyAnchors.length > 0 ? (
+              <div className="cx-section" data-testid="connections-recent-anchors">
+                <h4>Recent anchors</h4>
+                <div className="cx-recent-anchor-list">
+                  {historyAnchors.map((r) => (
+                    <button
+                      key={r.id}
+                      type="button"
+                      className="cx-recent-anchor"
+                      onClick={() => {
+                        navigateToAnchor(r.id);
+                      }}
+                      data-testid={`recent-anchor-${r.id}`}
+                    >
+                      <span
+                        className={`cx-node-icon ${nodeKindDisplayFor(r.kind).tintClass}`}
+                        aria-hidden
+                      >
+                        {KindIcons[r.kind]}
+                      </span>
+                      <span className="cx-recent-anchor-label">{r.label}</span>
+                      <span className="cx-recent-meta">{nodeKindDisplayFor(r.kind).label}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            {recentAnchors.length > 0 ? (
+              <div className="cx-section" data-testid="connections-anchor-shortcuts">
+                <h4>Shortcuts</h4>
+                <div className="cx-recent-anchor-list">
+                  {recentAnchors.map((r) => (
+                    <button
+                      key={r.id}
+                      type="button"
+                      className="cx-recent-anchor"
+                      onClick={() => {
+                        navigateToAnchor(r.id);
+                      }}
+                      data-testid={`shortcut-anchor-${r.id}`}
+                    >
+                      <span
+                        className={`cx-node-icon ${nodeKindDisplayFor(r.kind).tintClass}`}
+                        aria-hidden
+                      >
+                        {KindIcons[r.kind]}
+                      </span>
+                      <span className="cx-recent-anchor-label">{r.label}</span>
+                      <span className="cx-recent-meta">{nodeKindDisplayFor(r.kind).label}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            {panelFilterActive ? (
+              <div className="cx-section" data-testid="connections-object-filter">
+                <h4>Object filter</h4>
+                <div className="cx-filter-list">
+                  {nodeKindFilterOptions.length === 0 ? (
+                    <span className="cx-mono cx-dim">No node kinds in scope</span>
+                  ) : null}
+                  {nodeKindFilterOptions.map(([kind, count]) => {
+                    const display = nodeKindDisplayFor(kind);
+                    const checked = !hiddenNodeKinds.has(kind);
+                    return (
+                      <label className="cx-filter-check" key={kind}>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => {
+                            setHiddenNodeKinds((current) => toggleSetValue(current, kind));
+                          }}
+                          data-testid={`connections-object-filter-${kind}`}
+                        />
+                        <span className={`cx-node-icon ${display.tintClass}`} aria-hidden>
+                          {KindIcons[kind]}
+                        </span>
+                        <span className="cx-filter-check-label">{display.label}</span>
+                        <span className="cx-mono cx-dim">{String(count)}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
+            <div className="cx-section">
+              <h4>Hops</h4>
+              <label className="cx-hops-range">
+                <span>Range</span>
+                <select
+                  value={hops}
+                  onChange={(e) => {
+                    setHops(Number.parseInt(e.target.value, 10) || 1);
+                  }}
+                  data-testid="connections-hops-select"
+                >
+                  {[1, 2, 3, 4].map((h) => (
+                    <option key={h} value={h}>
+                      {h}-hop
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div className="cx-section cx-section-last">
+              <h4>Edge family</h4>
+              {panelFilterActive ? (
+                <div className="cx-filter-list" data-testid="connections-edge-family-filter">
+                  {edgeFamilyFilterOptions.map(([family, count]) => {
+                    const familyMeta = FAMILIES[family];
+                    const checked = !hiddenEdgeFamilies.has(family);
+                    return (
+                      <label className="cx-filter-check cx-family-filter-check" key={family}>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => {
+                            setHiddenEdgeFamilies((current) => toggleSetValue(current, family));
+                          }}
+                          data-testid={`connections-family-filter-${family}`}
+                        />
+                        <span className={`cx-edge fam-${family}`} aria-hidden>
+                          <span className="cx-edge-line" />
+                        </span>
+                        <span className="cx-filter-check-body">
+                          <span className="cx-legend-label">{familyMeta.label}</span>
+                          <span className="cx-legend-desc">{familyMeta.description}</span>
+                        </span>
+                        <span className="cx-mono cx-dim">{String(count)}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="cx-legend">
+                  {(Object.keys(FAMILIES) as EdgeFamily[]).map((family) => {
+                    const familyMeta = FAMILIES[family];
+                    return (
+                      <div key={family} className="cx-legend-row">
+                        <span className={`cx-edge fam-${family}`} aria-hidden>
+                          <span className="cx-edge-line" />
+                        </span>
+                        <span className="cx-legend-text">
+                          <span className="cx-legend-label">{familyMeta.label}</span>
+                          <span className="cx-legend-desc">{familyMeta.description}</span>
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </aside>
+        )}
         <main className="cx-col-c">
           {loading && result === null ? (
             <div className="cx-loading-row" data-testid="connections-loading">
@@ -2511,7 +2731,7 @@ export const ConnectionsView = ({
           ) : result !== null ? (
             subMode === 'linked' ? (
               <LinkedCenter
-                result={result}
+                result={filteredPanelResult ?? result}
                 anchorId={anchor}
                 selectedEdge={selectedEdge}
                 highlightedNodeId={timelineHoverNodeId}
@@ -2523,7 +2743,7 @@ export const ConnectionsView = ({
               />
             ) : subMode === 'orbital' ? (
               <OrbitalCenter
-                result={result}
+                result={filteredPanelResult ?? result}
                 anchorId={anchor}
                 hops={hops}
                 selectedEdge={selectedEdge}
@@ -2534,9 +2754,13 @@ export const ConnectionsView = ({
             ) : subMode === 'flow' ? (
               (() => {
                 const flowNodes =
-                  flowSubgraph.nodes.length > 0 ? flowSubgraph.nodes : result.snapshot.nodes;
+                  filteredFlowSubgraph.nodes.length > 0
+                    ? filteredFlowSubgraph.nodes
+                    : (filteredPanelResult ?? result).snapshot.nodes;
                 const flowEdges =
-                  flowSubgraph.edges.length > 0 ? flowSubgraph.edges : result.snapshot.edges;
+                  filteredFlowSubgraph.edges.length > 0
+                    ? filteredFlowSubgraph.edges
+                    : (filteredPanelResult ?? result).snapshot.edges;
                 const flowVisits = deriveFlowVisits(flowNodes, ctx, anchor);
                 const crossReplica = deriveCrossReplicaEdges(flowEdges);
                 return (
@@ -2626,56 +2850,63 @@ export const ConnectionsView = ({
             )
           )}
         </main>
-        <aside className={'cx-col-r' + (rightPanelOpen ? '' : ' is-collapsed')}>
-          <button
-            type="button"
-            className="cx-rightpanel-toggle cx-mono cx-dim"
-            onClick={() => {
-              setRightPanelOpen((v) => !v);
-            }}
-            aria-expanded={rightPanelOpen}
-            data-testid="connections-rightpanel-toggle"
-          >
-            {rightPanelOpen ? '▸ Anchor summary' : '◂ Anchor summary'}
-          </button>
-          <div className="cx-section cx-section-last cx-section-padded">
-            {whyVisitId !== null && result !== null ? (
-              <WhyRelatedPanel
-                fromVisitId={whyVisitId}
-                reasons={reasonsForVisit(whyReasonNodes, whyReasonEdges, whyVisitId, whyReasonCtx)}
-                showOnlyUserAsserted={whyAssertedOnly}
-                feedback={
-                  whyFeedbackEdge === null
-                    ? undefined
-                    : {
-                        label: 'relation',
-                        onFeedback: (choice) => submitFlowFeedback(whyFeedbackEdge, choice),
-                      }
-                }
-                producedBy={whyPanelRevisionEdge?.producedBy}
-                producerLabel={whyPanelRevisionEdge?.kind}
-                onToggleAssertedOnly={() => {
-                  setWhyAssertedOnly((value) => !value);
-                }}
-                onClose={() => {
-                  setWhyVisitId(null);
-                }}
-              />
-            ) : edgeDetail !== null ? (
-              <ProvenanceCard
-                edge={edgeDetail}
-                allNodes={result?.snapshot.nodes ?? []}
-                onFlowFeedback={(edge, choice) => submitFlowFeedback(edge, choice)}
-                onClose={() => {
-                  setSelectedEdge(null);
-                }}
-                ctx={ctx}
-              />
-            ) : (
-              <ProvenanceEmpty anchor={anchorDisplayNode} ctx={ctx} />
-            )}
-          </div>
-        </aside>
+        {subMode === 'search' ? null : (
+          <aside className={'cx-col-r' + (rightPanelOpen ? '' : ' is-collapsed')}>
+            <button
+              type="button"
+              className="cx-rightpanel-toggle cx-mono cx-dim"
+              onClick={() => {
+                setRightPanelOpen((v) => !v);
+              }}
+              aria-expanded={rightPanelOpen}
+              data-testid="connections-rightpanel-toggle"
+            >
+              {rightPanelOpen ? '▸ Anchor summary' : '◂ Anchor summary'}
+            </button>
+            <div className="cx-section cx-section-last cx-section-padded">
+              {whyVisitId !== null && result !== null ? (
+                <WhyRelatedPanel
+                  fromVisitId={whyVisitId}
+                  reasons={reasonsForVisit(
+                    whyReasonNodes,
+                    whyReasonEdges,
+                    whyVisitId,
+                    whyReasonCtx,
+                  )}
+                  showOnlyUserAsserted={whyAssertedOnly}
+                  feedback={
+                    whyFeedbackEdge === null
+                      ? undefined
+                      : {
+                          label: 'relation',
+                          onFeedback: (choice) => submitFlowFeedback(whyFeedbackEdge, choice),
+                        }
+                  }
+                  producedBy={whyPanelRevisionEdge?.producedBy}
+                  producerLabel={whyPanelRevisionEdge?.kind}
+                  onToggleAssertedOnly={() => {
+                    setWhyAssertedOnly((value) => !value);
+                  }}
+                  onClose={() => {
+                    setWhyVisitId(null);
+                  }}
+                />
+              ) : edgeDetail !== null ? (
+                <ProvenanceCard
+                  edge={edgeDetail}
+                  allNodes={result?.snapshot.nodes ?? []}
+                  onFlowFeedback={(edge, choice) => submitFlowFeedback(edge, choice)}
+                  onClose={() => {
+                    setSelectedEdge(null);
+                  }}
+                  ctx={ctx}
+                />
+              ) : (
+                <ProvenanceEmpty anchor={anchorDisplayNode} ctx={ctx} />
+              )}
+            </div>
+          </aside>
+        )}
       </div>
     </div>
   );

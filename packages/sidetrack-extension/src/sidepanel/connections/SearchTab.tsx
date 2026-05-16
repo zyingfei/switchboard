@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, type ReactElement } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
 
 import { nodeKindDisplayFor } from './edgeKinds';
 import { ExternalLinkIcon, FilterIcon, KindIcons, SearchIcon } from './icons';
@@ -81,6 +81,22 @@ const sourceLabelForRecallHit = (hit: RecallSearchHit): string =>
 const anchorIdForRecallHit = (hit: RecallSearchHit): string | undefined =>
   hit.anchorNodeId ?? (hit.threadId === undefined ? undefined : `thread:${hit.threadId}`);
 
+const kindForRecallHit = (hit: RecallSearchHit): ConnectionNodeKind => {
+  const anchorId = anchorIdForRecallHit(hit);
+  if (anchorId !== undefined) return kindFromAnchorId(anchorId);
+  return hit.sourceKind === 'page-content' ? 'timeline-visit' : 'thread';
+};
+
+const toggleKind = (
+  current: ReadonlySet<ConnectionNodeKind>,
+  kind: ConnectionNodeKind,
+): ReadonlySet<ConnectionNodeKind> => {
+  const next = new Set(current);
+  if (next.has(kind)) next.delete(kind);
+  else next.add(kind);
+  return next;
+};
+
 const SearchHighlight = ({
   text,
   query,
@@ -116,6 +132,9 @@ export const SearchTab = ({
   onOpenUrl,
 }: SearchTabProps): ReactElement => {
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const [hiddenKinds, setHiddenKinds] = useState<ReadonlySet<ConnectionNodeKind>>(
+    () => new Set<ConnectionNodeKind>(),
+  );
   const trimmed = query.trim();
 
   useEffect(() => {
@@ -196,6 +215,10 @@ export const SearchTab = ({
       const kind = isConnectionNodeKind(extra.kind) ? extra.kind : kindFromAnchorId(extra.id);
       counts.set(kind, (counts.get(kind) ?? 0) + 1);
     }
+    for (const hit of recallHits) {
+      const kind = kindForRecallHit(hit);
+      counts.set(kind, (counts.get(kind) ?? 0) + 1);
+    }
     return [...counts.entries()]
       .sort(
         (left, right) =>
@@ -203,16 +226,31 @@ export const SearchTab = ({
           nodeKindDisplayFor(left[0]).label.localeCompare(nodeKindDisplayFor(right[0]).label),
       )
       .slice(0, 8);
-  }, [extras, nodes]);
+  }, [extras, nodes, recallHits]);
+
+  const filteredTitleHits = useMemo(
+    () => titleHits.filter((hit) => !hiddenKinds.has(hit.kind)),
+    [hiddenKinds, titleHits],
+  );
+
+  const filteredQuickPicks = useMemo(
+    () => quickPicks.filter((hit) => !hiddenKinds.has(hit.kind)),
+    [hiddenKinds, quickPicks],
+  );
+
+  const filteredRecallHits = useMemo(
+    () => recallHits.filter((hit) => !hiddenKinds.has(kindForRecallHit(hit))),
+    [hiddenKinds, recallHits],
+  );
 
   const titleCountLabel =
-    trimmed.length === 0 ? 'Quick picks' : `Title matches · ${String(titleHits.length)}`;
+    trimmed.length === 0 ? 'Quick picks' : `Title matches · ${String(filteredTitleHits.length)}`;
   const recallCountLabel = recallLoading
     ? 'Content matches · searching…'
-    : `Content matches · ${String(recallHits.length)}`;
+    : `Content matches · ${String(filteredRecallHits.length)}`;
 
   const pickTop = (): void => {
-    const first = titleHits[0];
+    const first = filteredTitleHits[0];
     if (first !== undefined) onPick(first.id, first.primary);
   };
 
@@ -332,14 +370,23 @@ export const SearchTab = ({
             <div className="cx-search-tab-kind-list">
               {kindCounts.map(([kind, count]) => {
                 const display = nodeKindDisplayFor(kind);
+                const checked = !hiddenKinds.has(kind);
                 return (
-                  <div className="cx-search-tab-kind" key={kind}>
+                  <label className="cx-search-tab-kind" key={kind}>
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() => {
+                        setHiddenKinds((current) => toggleKind(current, kind));
+                      }}
+                      data-testid={`connections-search-kind-filter-${kind}`}
+                    />
                     <span className={`cx-node-icon ${display.tintClass}`} aria-hidden>
                       {KindIcons[kind]}
                     </span>
                     <span>{display.label}</span>
                     <span className="cx-mono cx-dim">{String(count)}</span>
-                  </div>
+                  </label>
                 );
               })}
             </div>
@@ -362,8 +409,8 @@ export const SearchTab = ({
               ) : null}
             </div>
             <div className="cx-search-tab-list">
-              {(trimmed.length === 0 ? quickPicks : titleHits).map(renderTitleHit)}
-              {trimmed.length > 0 && titleHits.length === 0 ? (
+              {(trimmed.length === 0 ? filteredQuickPicks : filteredTitleHits).map(renderTitleHit)}
+              {trimmed.length > 0 && filteredTitleHits.length === 0 ? (
                 <div
                   className="cx-search-tab-empty"
                   data-testid="connections-search-tab-title-empty"
@@ -390,7 +437,7 @@ export const SearchTab = ({
               </div>
             ) : null}
             {trimmed.length > 0 &&
-            recallHits.length === 0 &&
+            filteredRecallHits.length === 0 &&
             !recallLoading &&
             recallError === null ? (
               <div className="cx-search-tab-empty">
@@ -398,7 +445,7 @@ export const SearchTab = ({
               </div>
             ) : null}
             <div className="cx-search-tab-list">
-              {recallHits.map((hit) => {
+              {filteredRecallHits.map((hit) => {
                 const anchorId = anchorIdForRecallHit(hit);
                 if (anchorId === undefined) return null;
                 const url = hit.canonicalUrl ?? hit.threadUrl;

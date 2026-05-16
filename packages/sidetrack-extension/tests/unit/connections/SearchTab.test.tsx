@@ -79,4 +79,57 @@ describe('SearchTab', () => {
     expect(onOpenUrl).toHaveBeenCalledWith('https://docs.oracle.example/cloud');
     expect(onPick).not.toHaveBeenCalled();
   });
+
+  it('filters title and content results by object kind', () => {
+    const visitId = 'timeline-visit:https://docs.oracle.example/cloud';
+    render(
+      <SearchTab
+        nodes={[
+          node({
+            id: 'thread:oracle',
+            kind: 'thread',
+            metadata: { title: 'Oracle Cloud Infrastructure thread' },
+          }),
+          node({
+            id: visitId,
+            kind: 'timeline-visit',
+            metadata: {
+              title: 'Oracle Cloud Infrastructure docs',
+              canonicalUrl: 'https://docs.oracle.example/cloud',
+            },
+          }),
+        ]}
+        extras={[]}
+        ctx={ctx}
+        query="oracle"
+        onQueryChange={vi.fn()}
+        onPick={vi.fn()}
+        recallHits={[
+          {
+            sourceKind: 'chat-turn',
+            threadId: 'oracle',
+            title: 'Oracle chat transcript',
+            score: 0.91,
+          },
+          {
+            sourceKind: 'page-content',
+            anchorNodeId: visitId,
+            canonicalUrl: 'https://docs.oracle.example/cloud',
+            title: 'Oracle docs page',
+            score: 0.88,
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.queryByTestId('connections-search-tab-hit-thread:oracle')).not.toBeNull();
+    expect(screen.queryByTestId('connections-search-tab-recall-thread:oracle')).not.toBeNull();
+    expect(screen.queryByTestId(`connections-search-tab-recall-${visitId}`)).not.toBeNull();
+
+    fireEvent.click(screen.getByTestId('connections-search-kind-filter-thread'));
+
+    expect(screen.queryByTestId('connections-search-tab-hit-thread:oracle')).toBeNull();
+    expect(screen.queryByTestId('connections-search-tab-recall-thread:oracle')).toBeNull();
+    expect(screen.queryByTestId(`connections-search-tab-recall-${visitId}`)).not.toBeNull();
+  });
 });
