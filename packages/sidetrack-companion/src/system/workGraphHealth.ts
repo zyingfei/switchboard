@@ -381,7 +381,9 @@ const buildDiagnosticCandidates = (input: {
   const hasDirtySourceWork =
     connectionsDiagnostics !== null && connectionsDiagnostics.dirtySourceCount > 0;
   const hasDirtySourceBacklog =
-    oldestDirtySourceAgeMs !== null && oldestDirtySourceAgeMs > CONTENT_LANE_BACKLOG_WARN_MS;
+    hasDirtySourceWork &&
+    oldestDirtySourceAgeMs !== null &&
+    oldestDirtySourceAgeMs > CONTENT_LANE_BACKLOG_WARN_MS;
   const contentLaneStatus: DiagnosticCandidate['status'] =
     connectionsDiagnostics === null
       ? 'unavailable'

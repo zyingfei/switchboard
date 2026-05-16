@@ -271,4 +271,32 @@ describe('work graph diagnostic candidates', () => {
       ]),
     );
   });
+
+  it('does not warn for an aged content-lane snapshot with no dirty work', async () => {
+    const health = await collectWorkGraphHealth({
+      vaultRoot,
+      now: () => new Date('2026-05-16T13:05:00.000Z'),
+      connectionsDiagnostics: () => ({
+        dirtySourceCount: 0,
+        tombstonedSourceCount: 0,
+        latestExtractionCount: 0,
+        oldestDirtySourceAgeMs: 600_001,
+      }),
+    });
+
+    expect(health.candidates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'content-lane.dirty-source-queue',
+          status: 'ok',
+          reason: null,
+          asOf: '2026-05-16T13:05:00.000Z',
+          metrics: expect.objectContaining({
+            dirtySourceCount: 0,
+            oldestDirtySourceAgeMs: 600_001,
+          }),
+        }),
+      ]),
+    );
+  });
 });
