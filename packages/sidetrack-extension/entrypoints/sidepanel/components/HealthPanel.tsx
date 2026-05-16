@@ -1261,6 +1261,21 @@ export function HealthPanel({
           </div>
         )}
 
+        <div className="sx-tilegrid" style={{ gridTemplateColumns: '1fr 1fr' }}>
+          <div className={`sx-tile${queueDepth === null ? ' unavail' : queueWarn ? ' warn' : ''}`}>
+            <div className="lbl">Queued captures</div>
+            <div className="num">{queueDepth === null ? 'no signal yet' : String(queueDepth)}</div>
+            <div className="foot">local extension buffer</div>
+          </div>
+          <div className={`sx-tile${dropped === null ? ' unavail' : dropped > 0 ? ' warn' : ''}`}>
+            <div className="lbl">Dropped captures</div>
+            <div className="num">{dropped === null ? 'no signal yet' : String(dropped)}</div>
+            <div className="foot">
+              {dropped === null ? 'local count unavailable' : `dropped ${String(dropped)} this run`}
+            </div>
+          </div>
+        </div>
+
         <h3 className="sx-h">Providers</h3>
         {captureUnavailable ? (
           <div className="sx-callout">

@@ -506,11 +506,14 @@ describe('UX skeleton components — render-without-crash + key text present', (
       />,
     );
 
+    fireEvent.click(await screen.findByTestId('hp-pipeline-stage-capture'));
     expect(await screen.findByText('ChatGPT')).toBeInTheDocument();
-    expect(screen.getByText('queued captures')).toBeInTheDocument();
+    expect(screen.getByText('Queued captures')).toBeInTheDocument();
     expect(screen.getByText(/dropped 1/)).toBeInTheDocument();
-    expect(screen.getByText(/Group recommendation/)).toBeInTheDocument();
-    expect(screen.getAllByText('Visible text is unusually long.').length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Visible text is unusually long/).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByTestId('hp-pipeline-stage-recall'));
+    fireEvent.click(await screen.findByRole('button', { name: 'details' }));
+    expect(await screen.findByText(/Group recommendation/)).toBeInTheDocument();
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith('http://127.0.0.1:17373/v1/system/health', {
         headers: { 'x-bac-bridge-key': 'bridge' },
