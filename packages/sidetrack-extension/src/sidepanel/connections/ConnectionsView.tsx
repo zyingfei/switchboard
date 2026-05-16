@@ -1850,6 +1850,20 @@ export const ConnectionsView = ({
     }
   };
 
+  const submitVisitConfirmRelated = async (input: {
+    readonly fromVisitId: string;
+    readonly toVisitId: string;
+  }): Promise<void> => {
+    const response = await postUserFlowConfirmed({
+      relationKind: 'closest_visit',
+      fromId: input.fromVisitId,
+      toId: input.toVisitId,
+    });
+    if (!response.ok) {
+      throw new Error(response.error ?? 'visit-topic confirmation feedback failed');
+    }
+  };
+
   const submitVisitRestoreToTopic = async (input: {
     readonly topicId: string;
     readonly visitId: string;
@@ -2794,8 +2808,10 @@ export const ConnectionsView = ({
                 onTopicPromote={submitTopicPromote}
                 onTopicRename={submitTopicRename}
                 onTopicDismiss={submitTopicDismiss}
+                {...(anchor.startsWith('timeline-visit:') ? { anchorVisitId: anchor } : {})}
                 onVisitMarkNotRelated={submitVisitMarkNotRelated}
                 onVisitRestoreToTopic={submitVisitRestoreToTopic}
+                onVisitConfirmRelated={submitVisitConfirmRelated}
                 onEngagementRelabel={submitEngagementRelabel}
                 onTopicClick={(topicId) => {
                   // Same rationale as useNodeAsAnchor — don't dump

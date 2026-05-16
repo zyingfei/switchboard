@@ -69,6 +69,7 @@ export interface FocusViewProps {
   readonly topics: readonly TopicNode[];
   readonly visitsByTopic: Record<string, readonly TopicVisit[]>;
   readonly engagementClassesByVisit: Record<string, EngagementClass>;
+  readonly anchorVisitId?: string;
   readonly eligibleVisitCount?: number;
   readonly previousTopicCount?: number;
   readonly emptyDetail?: string;
@@ -97,6 +98,11 @@ export interface FocusViewProps {
   readonly onVisitRestoreToTopic?: (input: {
     readonly topicId: string;
     readonly visitId: string;
+  }) => Promise<void> | void;
+  readonly onVisitConfirmRelated?: (input: {
+    readonly topicId: string;
+    readonly fromVisitId: string;
+    readonly toVisitId: string;
   }) => Promise<void> | void;
   readonly onEngagementRelabel?: (input: {
     readonly visitId: string;
@@ -237,6 +243,7 @@ export const FocusView = ({
   topics,
   visitsByTopic,
   engagementClassesByVisit,
+  anchorVisitId,
   eligibleVisitCount,
   previousTopicCount,
   emptyDetail,
@@ -248,6 +255,7 @@ export const FocusView = ({
   onTopicDismiss,
   onVisitMarkNotRelated,
   onVisitRestoreToTopic,
+  onVisitConfirmRelated,
   onEngagementRelabel,
   onVisitClick,
   onVisitOpen,
@@ -274,6 +282,9 @@ export const FocusView = ({
   const [dismissError, setDismissError] = useState<string | null>(null);
   const [dismissErrorTopicId, setDismissErrorTopicId] = useState<string | null>(null);
   const [rejectedVisitIdsByTopic, setRejectedVisitIdsByTopic] = useState<
+    Record<string, ReadonlySet<string>>
+  >({});
+  const [confirmedVisitIdsByScope, setConfirmedVisitIdsByScope] = useState<
     Record<string, ReadonlySet<string>>
   >({});
   const [lastRemovedVisitByTopic, setLastRemovedVisitByTopic] = useState<
@@ -418,6 +429,38 @@ export const FocusView = ({
           return { ...current, [topic.id]: next };
         });
         setLastRemovedVisitByTopic((current) => ({ ...current, [topic.id]: undefined }));
+        setVisitActionError(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => {
+        setVisitActionInFlight(null);
+      });
+  };
+
+  const submitVisitConfirmRelated = (topic: TopicNode, visit: TopicVisit): void => {
+    if (onVisitConfirmRelated === undefined || anchorVisitId === undefined) return;
+    if (anchorVisitId === visit.id) return;
+    const scopeKey = `${topic.id}\u0000${anchorVisitId}`;
+    const actionKey = `confirm-related:${scopeKey}:${visit.id}`;
+    setVisitActionInFlight(actionKey);
+    setVisitActionError(null);
+    setConfirmedVisitIdsByScope((current) => {
+      const next = new Set(current[scopeKey] ?? []);
+      next.add(visit.id);
+      return { ...current, [scopeKey]: next };
+    });
+    void Promise.resolve(
+      onVisitConfirmRelated({
+        topicId: topic.id,
+        fromVisitId: anchorVisitId,
+        toVisitId: visit.id,
+      }),
+    )
+      .catch((error: unknown) => {
+        setConfirmedVisitIdsByScope((current) => {
+          const next = new Set(current[scopeKey] ?? []);
+          next.delete(visit.id);
+          return { ...current, [scopeKey]: next };
+        });
         setVisitActionError(error instanceof Error ? error.message : String(error));
       })
       .finally(() => {
@@ -751,6 +794,16 @@ export const FocusView = ({
                     const focusedDuration = focusedDurationLabel(visit.focusedWindowMs);
                     const visitUrl = visit.url;
                     const canOpenVisit = visitUrl !== undefined && visitUrl.length > 0;
+                    const canConfirmRelated =
+                      onVisitConfirmRelated !== undefined &&
+                      anchorVisitId !== undefined &&
+                      anchorVisitId !== visit.id;
+                    const confirmScopeKey =
+                      anchorVisitId === undefined ? undefined : `${topic.id}\u0000${anchorVisitId}`;
+                    const confirmedRelated =
+                      confirmScopeKey === undefined
+                        ? false
+                        : confirmedVisitIdsByScope[confirmScopeKey]?.has(visit.id);
                     return (
                       <div className="cx-focus-visit" key={visit.id}>
                         <button
@@ -860,6 +913,25 @@ export const FocusView = ({
                             {attentionLabel}
                           </button>
                         )}
+                        {canConfirmRelated ? (
+                          <button
+                            type="button"
+                            className="cx-focus-visit-labelbtn cx-focus-visit-confirm"
+                            disabled={
+                              visitActionInFlight ===
+                                `confirm-related:${confirmScopeKey ?? ''}:${visit.id}` ||
+                              confirmedRelated === true
+                            }
+                            onClick={() => {
+                              submitVisitConfirmRelated(topic, visit);
+                            }}
+                            data-testid={`focus-visit-confirm-related-${topic.id}-${visit.id}`}
+                            title="Keep this page in this suggestion"
+                          >
+                            {iconSlot(CheckIcon)}
+                            {confirmedRelated === true ? 'Kept' : 'Keep'}
+                          </button>
+                        ) : null}
                         {onVisitMarkNotRelated === undefined ? null : (
                           <button
                             type="button"
