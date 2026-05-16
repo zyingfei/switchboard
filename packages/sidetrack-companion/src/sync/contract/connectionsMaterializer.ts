@@ -9,6 +9,7 @@ import {
 import { buildEngagementClassRevision } from '../../connections/engagementClassifier.js';
 import { readVaultStores } from '../../connections/loader.js';
 import {
+  attachDriftReport,
   collectMaterializerDiagnostics,
   createMaterializerDiagnosticsStore,
   logMaterializerDiagnostics,
@@ -1015,15 +1016,29 @@ export const createConnectionsMaterializer = (
       ...(topicShadowDiagnostics === null ? {} : { topicShadowDiagnostics }),
       ...(topicShadowObservation === null ? {} : { topicShadowObservation }),
     });
+    // Statistical drift/evaluation layer — feed the diagnostic series
+    // through the change detectors and fold the status into the
+    // artifact. `attachDriftReport` wraps all of its own I/O; it never
+    // throws, so the drain stays unaffected by the drift layer.
+    const driftRun = await attachDriftReport({
+      diagnostics,
+      topics: topicRevision.topics,
+      similarityEdges: visitSimilarity.edges,
+      vaultRoot: deps.vaultRoot,
+    });
+    if (driftRun.stateError !== null) {
+      console.warn(`[materializer-diag] drift state persist failed: ${driftRun.stateError}`);
+    }
+    const diagnosticsWithDrift = driftRun.diagnostics;
     try {
-      await diagnosticsStore.write(diagnostics);
+      await diagnosticsStore.write(diagnosticsWithDrift);
     } catch (err) {
       // Diagnostics is observability — never fail the drain on its IO.
       const message = err instanceof Error ? err.message : String(err);
       // eslint-disable-next-line no-console
       console.warn(`[materializer-diag] write failed: ${message}`);
     }
-    diagnosticsLogger(diagnostics);
+    diagnosticsLogger(diagnosticsWithDrift);
   };
 
   // Stage 5.2 W1 — worker drain sequence counter. Increments per
