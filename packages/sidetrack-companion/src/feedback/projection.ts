@@ -350,3 +350,98 @@ export const projectFeedback = (events: readonly AcceptedEvent[]): FeedbackProje
     negativeLabels: negativeLabels.sort(compareLabel),
   };
 };
+
+export const projectFeedbackOverlay = (events: readonly AcceptedEvent[]): FeedbackProjection => {
+  const perItem = new Map<string, UserAction[]>();
+
+  for (const event of [...events].sort(compareEventOrder)) {
+    if (event.type === USER_ORGANIZED_ITEM && isUserOrganizedItemPayload(event.payload)) {
+      pushAction(perItem, {
+        eventType: USER_ORGANIZED_ITEM,
+        itemId: event.payload.itemId,
+        action: event.payload.action,
+        acceptedAtMs: event.acceptedAtMs,
+        replicaId: event.dot.replicaId,
+        seq: event.dot.seq,
+        payload: event.payload,
+      });
+      continue;
+    }
+
+    if (
+      event.type === USER_ENGAGEMENT_RELABELED &&
+      isUserEngagementRelabeledPayload(event.payload)
+    ) {
+      pushAction(perItem, {
+        eventType: USER_ENGAGEMENT_RELABELED,
+        itemId: event.payload.visitId,
+        action: 'relabeled',
+        acceptedAtMs: event.acceptedAtMs,
+        replicaId: event.dot.replicaId,
+        seq: event.dot.seq,
+        payload: event.payload,
+      });
+      continue;
+    }
+
+    if (event.type === USER_FLOW_CONFIRMED && isUserFlowConfirmedPayload(event.payload)) {
+      pushAction(perItem, {
+        eventType: USER_FLOW_CONFIRMED,
+        itemId: `${event.payload.fromId}\u0000${event.payload.toId}`,
+        action: 'confirmed',
+        acceptedAtMs: event.acceptedAtMs,
+        replicaId: event.dot.replicaId,
+        seq: event.dot.seq,
+        payload: event.payload,
+      });
+      continue;
+    }
+
+    if (event.type === USER_FLOW_REJECTED && isUserFlowRejectedPayload(event.payload)) {
+      pushAction(perItem, {
+        eventType: USER_FLOW_REJECTED,
+        itemId: `${event.payload.fromId}\u0000${event.payload.toId}`,
+        action: 'rejected',
+        acceptedAtMs: event.acceptedAtMs,
+        replicaId: event.dot.replicaId,
+        seq: event.dot.seq,
+        payload: event.payload,
+      });
+      continue;
+    }
+
+    if (event.type === USER_TOPIC_RENAMED && isUserTopicRenamedPayload(event.payload)) {
+      pushAction(perItem, {
+        eventType: USER_TOPIC_RENAMED,
+        itemId: event.payload.topicId,
+        action: 'renamed',
+        acceptedAtMs: event.acceptedAtMs,
+        replicaId: event.dot.replicaId,
+        seq: event.dot.seq,
+        payload: event.payload,
+      });
+      continue;
+    }
+
+    if (event.type === USER_SNIPPET_PROMOTED && isUserSnippetPromotedPayload(event.payload)) {
+      pushAction(perItem, {
+        eventType: USER_SNIPPET_PROMOTED,
+        itemId: event.payload.snippetId,
+        action: 'promoted',
+        acceptedAtMs: event.acceptedAtMs,
+        replicaId: event.dot.replicaId,
+        seq: event.dot.seq,
+        payload: event.payload,
+      });
+    }
+  }
+
+  return {
+    schemaVersion: FEEDBACK_PROJECTION_SCHEMA_VERSION,
+    perItem: stablePerItem(perItem),
+    containerByItem: {},
+    organizedItemsByContainer: {},
+    positiveLabels: [],
+    negativeLabels: [],
+  };
+};

@@ -92,7 +92,11 @@ import {
   isUserSnippetPromotedPayload,
   isUserTopicRenamedPayload,
 } from '../feedback/events.js';
-import { projectFeedback } from '../feedback/projection.js';
+import {
+  projectFeedback,
+  projectFeedbackOverlay,
+  type FeedbackProjection,
+} from '../feedback/projection.js';
 import { projectPrivacy } from '../privacy/projection.js';
 import {
   deserializeTabSessionProjection,
@@ -833,6 +837,23 @@ const applyPageContentCoverageToSnapshot = async (
   };
 };
 
+const timelineVisitUrlKey = (raw: string): string => raw.replace(/#.*$/u, '').replace(/\/+$/u, '');
+
+const normalizeConnectionsNodeId = (nodeId: string): string => {
+  if (nodeId.startsWith('timeline-visit:')) {
+    return `timeline-visit:${timelineVisitUrlKey(nodeId.slice('timeline-visit:'.length))}`;
+  }
+  if (nodeId.startsWith('visit-instance:')) {
+    const tail = nodeId.slice('visit-instance:'.length);
+    const httpIdx = tail.indexOf(':http');
+    if (httpIdx < 0) return nodeId;
+    const prefix = nodeId.slice(0, 'visit-instance:'.length + httpIdx + 1);
+    const rawUrl = nodeId.slice(prefix.length);
+    return `${prefix}${timelineVisitUrlKey(rawUrl)}`;
+  }
+  return nodeId;
+};
+
 const queryRecallContent = async (
   vaultRoot: string,
   query: { readonly q: string; readonly limit: number; readonly workstreamId?: string },
@@ -1349,6 +1370,30 @@ const isPrivacyPayloadForType = (
 const privacyEventsFrom = (events: readonly import('../sync/causal.js').AcceptedEvent[]) =>
   events.filter((event) => isPrivacyEventType(event.type));
 
+const FEEDBACK_OVERLAY_PROJECTION_CACHE_TTL_MS = 5_000;
+const feedbackOverlayProjectionCache = new WeakMap<
+  EventLog,
+  { readonly expiresAtMs: number; readonly projection: FeedbackProjection }
+>();
+
+const clearFeedbackOverlayProjectionCache = (eventLog: EventLog): void => {
+  feedbackOverlayProjectionCache.delete(eventLog);
+};
+
+const projectFeedbackOverlayCached = async (eventLog: EventLog): Promise<FeedbackProjection> => {
+  const now = Date.now();
+  const cached = feedbackOverlayProjectionCache.get(eventLog);
+  if (cached !== undefined && cached.expiresAtMs > now) {
+    return cached.projection;
+  }
+  const projection = projectFeedbackOverlay(await eventLog.readMerged());
+  feedbackOverlayProjectionCache.set(eventLog, {
+    expiresAtMs: now + FEEDBACK_OVERLAY_PROJECTION_CACHE_TTL_MS,
+    projection,
+  });
+  return projection;
+};
+
 const isFeedbackEventType = (
   value: unknown,
 ): value is
@@ -1845,6 +1890,7 @@ const routes: readonly RouteDefinition[] = [
           payload,
           baseVector: await baseVectorForAggregate(eventLog, aggregateId),
         });
+        clearFeedbackOverlayProjectionCache(eventLog);
         return [201, { data: { accepted } }];
       });
     },
@@ -5402,7 +5448,7 @@ const routes: readonly RouteDefinition[] = [
       if (context.eventLog !== undefined) {
         snap = applyFeedbackOverlayToSnapshot(
           snap,
-          projectFeedback(await context.eventLog.readMerged()),
+          await projectFeedbackOverlayCached(context.eventLog),
         );
       }
       snap = await applyPageContentCoverageToSnapshot(requireVaultRoot(context), snap);
@@ -5479,7 +5525,7 @@ const routes: readonly RouteDefinition[] = [
       }
       // Path params are URI-encoded (we accept the whole node id
       // as the URL segment); decode and validate length.
-      const nodeId = decodeURIComponent(match.connectionsNodeId ?? '');
+      const nodeId = normalizeConnectionsNodeId(decodeURIComponent(match.connectionsNodeId ?? ''));
       const url = new URL(request.url ?? '/v1/connections', 'http://internal');
       const hopsRaw = Number.parseInt(url.searchParams.get('hops') ?? '1', 10);
       const hops = Number.isFinite(hopsRaw) && hopsRaw >= 0 ? Math.min(hopsRaw, 4) : 1;
@@ -5505,7 +5551,7 @@ const routes: readonly RouteDefinition[] = [
       if (context.eventLog !== undefined) {
         snap = applyFeedbackOverlayToSnapshot(
           snap,
-          projectFeedback(await context.eventLog.readMerged()),
+          await projectFeedbackOverlayCached(context.eventLog),
         );
       }
       snap = await applyPageContentCoverageToSnapshot(requireVaultRoot(context), snap);

@@ -33,6 +33,7 @@ describe('connections HTTP routes', () => {
   let vaultRoot: string;
   let serverUrl: string;
   let close: (() => Promise<void>) | null = null;
+  let connectionsStore: ReturnType<typeof createConnectionsStore>;
   const BRIDGE = 'connections-bridge-key';
 
   beforeEach(async () => {
@@ -40,7 +41,7 @@ describe('connections HTTP routes', () => {
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
     const timelineStore = createTimelineStore(vaultRoot);
-    const connectionsStore = createConnectionsStore(vaultRoot);
+    connectionsStore = createConnectionsStore(vaultRoot);
     const runner = createSyncContractRunner();
     runner.register(
       createConnectionsMaterializer({
@@ -192,6 +193,46 @@ describe('connections HTTP routes', () => {
     const ids = body.data.snapshot.nodes.map((n) => n.id).sort();
     expect(ids).toContain('thread:thread_a');
     expect(ids).toContain('workstream:ws_x');
+  });
+
+  it('normalizes timeline-visit neighbor anchors the same way as timeline projection', async () => {
+    await connectionsStore.putCurrent({
+      scope: {},
+      nodes: [
+        {
+          id: 'timeline-visit:https://example.test/research',
+          kind: 'timeline-visit',
+          label: 'Research',
+          originReplicaIds: ['replica-A'],
+          metadata: { canonicalUrl: 'https://example.test/research/' },
+        },
+      ],
+      edges: [],
+      updatedAt: '2026-05-07T10:00:00.000Z',
+      nodeCount: 1,
+      edgeCount: 0,
+    });
+
+    const r = await get(
+      `/v1/connections/nodes/${encodeURIComponent(
+        'timeline-visit:https://example.test/research/',
+      )}/neighbors?hops=1`,
+    );
+    expect(r.status).toBe(200);
+    const body = r.data as {
+      data: {
+        snapshot: {
+          scope: { nodeId: string };
+          nodes: { id: string }[];
+        };
+      };
+    };
+    expect(body.data.snapshot.scope.nodeId).toBe(
+      'timeline-visit:https://example.test/research',
+    );
+    expect(body.data.snapshot.nodes.map((node) => node.id)).toContain(
+      'timeline-visit:https://example.test/research',
+    );
   });
 
   it('GET /v1/connections/edges/<id> returns provenance', async () => {

@@ -649,7 +649,7 @@ const App = () => {
     // The timeline-visit node id IS the canonical URL — the snapshot
     // builds them that way. So anchoring on `timeline-visit:<URL>`
     // lands on the most useful neighborhood for an unattributed URL.
-    setConnectionsAnchorRequest(`timeline-visit:${canonicalUrl}`);
+    setConnectionsAnchorRequest(`timeline-visit:${comparableTabUrl(canonicalUrl) ?? canonicalUrl}`);
     setViewMode('connections');
   };
   const requestSwitchToInbox = (canonicalUrl: string): void => {

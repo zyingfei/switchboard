@@ -314,6 +314,26 @@ const scopedResultFromLoadedGraph = ({
 const normalizeWorkstreamAnchorId = (id: string): string =>
   id.startsWith('workstream:') ? id : `workstream:${id}`;
 
+const timelineVisitUrlKey = (raw: string): string => raw.replace(/#.*$/u, '').replace(/\/+$/u, '');
+
+const normalizedTimelineVisitNodeId = (raw: string): string =>
+  `timeline-visit:${timelineVisitUrlKey(raw)}`;
+
+const normalizeAnchorId = (id: string): string => {
+  if (id.startsWith('timeline-visit:')) {
+    return normalizedTimelineVisitNodeId(id.slice('timeline-visit:'.length));
+  }
+  if (id.startsWith('visit-instance:')) {
+    const tail = id.slice('visit-instance:'.length);
+    const httpIdx = tail.indexOf(':http');
+    if (httpIdx < 0) return id;
+    const prefix = id.slice(0, 'visit-instance:'.length + httpIdx + 1);
+    const rawUrl = id.slice(prefix.length);
+    return `${prefix}${timelineVisitUrlKey(rawUrl)}`;
+  }
+  return id;
+};
+
 const DEFAULT_TOPIC_ENGAGEMENT_GATE_MS = 5_000;
 
 const pageContentCanonicalUrl = (raw: string): string => {
@@ -959,28 +979,34 @@ const addVisitAliasesForNode = (node: ConnectionNode | undefined, out: Set<strin
   if (node === undefined) return;
   if (node.kind === 'timeline-visit' || node.kind === 'visit-instance' || node.kind === 'thread') {
     out.add(node.id);
+    out.add(normalizeAnchorId(node.id));
   }
   const timelineVisitId = metadataString(node.metadata, ['timelineVisitId']);
   if (timelineVisitId !== undefined) {
     out.add(timelineVisitId);
+    out.add(normalizeAnchorId(timelineVisitId));
   }
   const canonicalUrl =
     metadataString(node.metadata, ['canonicalUrl', 'url', 'latestUrl']) ?? urlFromNodeId(node);
   if (canonicalUrl !== undefined) {
     out.add(`timeline-visit:${canonicalUrl}`);
+    out.add(normalizedTimelineVisitNodeId(canonicalUrl));
   }
 };
 
 const addVisitAliasesForAnchorId = (anchorId: string, out: Set<string>): void => {
   if (anchorId.startsWith('timeline-visit:')) {
     out.add(anchorId);
+    out.add(normalizeAnchorId(anchorId));
     return;
   }
   if (anchorId.startsWith('visit-instance:')) {
     out.add(anchorId);
+    out.add(normalizeAnchorId(anchorId));
     const canonicalUrl = urlFromAnchorNodeId(anchorId);
     if (canonicalUrl !== undefined) {
       out.add(`timeline-visit:${canonicalUrl}`);
+      out.add(normalizedTimelineVisitNodeId(canonicalUrl));
     }
   }
 };
@@ -1288,7 +1314,7 @@ export const ConnectionsView = ({
   // and returning is one click. `history.current` is the anchor the
   // hook is currently focused on; `history.navigate(next)` pushes
   // onto the past stack.
-  const history = useAnchorHistory(initialAnchor);
+  const history = useAnchorHistory(normalizeAnchorId(initialAnchor));
   const anchor = history.current;
   // Advanced-anchor input. Starts empty so the field isn't pre-loaded
   // with a raw id like `visit-instance:tses_…:<iso>:<URL>` that nobody
@@ -1485,14 +1511,14 @@ export const ConnectionsView = ({
   // `next` was provided, so EVERY click handler that passed an id
   // dumped that id into the visible input field.
   const submitAdvancedAnchor = (): void => {
-    const value = draftAnchor.trim();
+    const value = normalizeAnchorId(draftAnchor.trim());
     if (value.length === 0) return;
     setSelectedEdge(null);
     setWhyVisitId(null);
     history.navigate(value);
   };
   const navigateToAnchor = (nextAnchorId: string, label?: string): void => {
-    const value = nextAnchorId.trim();
+    const value = normalizeAnchorId(nextAnchorId.trim());
     if (value.length === 0) return;
     const cleanLabel = humanAnchorLabel(label);
     if (cleanLabel !== undefined) {
@@ -1622,7 +1648,7 @@ export const ConnectionsView = ({
     // `visit-instance:tses_*:<iso>:<URL>` string. The advanced
     // input is for user-typed input only; clicks navigate through
     // history without leaking the raw id into a visible field.
-    history.navigate(nodeId);
+    history.navigate(normalizeAnchorId(nodeId));
   };
 
   // Stage 5 polish — cross-surface anchor request from outside the
@@ -1630,15 +1656,17 @@ export const ConnectionsView = ({
   // to a non-empty value; uses history.navigate so back/forward
   // semantics still apply after the jump. `onRequestConsumed` clears
   // the parent's state so the same target can be re-requested later.
+  const navigateHistory = history.navigate;
   useEffect(() => {
     if (requestAnchor === undefined || requestAnchor.length === 0) return;
-    if (requestAnchor !== anchor) {
-      useNodeAsAnchor(requestAnchor);
+    const normalizedRequestAnchor = normalizeAnchorId(requestAnchor);
+    if (normalizedRequestAnchor !== anchor) {
+      setSelectedEdge(null);
+      setWhyVisitId(null);
+      navigateHistory(normalizedRequestAnchor);
     }
     onRequestConsumed?.();
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- useNodeAsAnchor closes over
-    // history; the effect only needs to fire when the request itself changes.
-  }, [requestAnchor]);
+  }, [anchor, navigateHistory, onRequestConsumed, requestAnchor]);
 
   // Stage 5 polish — derive a canonical URL from the current anchor
   // so the "Find in Inbox" button can pass it back to App.tsx. Three
@@ -2210,6 +2238,24 @@ export const ConnectionsView = ({
     shadowFullSnapshot.error,
     topicAnchorShadowResolving,
   ]);
+  const renderedFocusAnchorVisitId = useMemo((): string | undefined => {
+    if (anchor.startsWith('timeline-visit:')) return normalizeAnchorId(anchor);
+    if (!anchorIsTopic) return undefined;
+    const topicMemberIds = new Set<string>();
+    for (const visits of Object.values(renderedFocusData.visitsByTopic)) {
+      for (const visit of visits) topicMemberIds.add(normalizeAnchorId(visit.id));
+    }
+    for (const recentAnchor of history.recent) {
+      const normalizedRecentAnchor = normalizeAnchorId(recentAnchor);
+      if (
+        normalizedRecentAnchor.startsWith('timeline-visit:') &&
+        topicMemberIds.has(normalizedRecentAnchor)
+      ) {
+        return normalizedRecentAnchor;
+      }
+    }
+    return undefined;
+  }, [anchor, anchorIsTopic, history.recent, renderedFocusData.visitsByTopic]);
   const whyUsesShadowFocusGraph =
     subMode === 'focus' && (renderedFocusData === shadowFocusData || anchorIsTopic);
   const whyReasonNodes = whyUsesShadowFocusGraph
@@ -2960,7 +3006,9 @@ export const ConnectionsView = ({
                 onTopicPromote={submitTopicPromote}
                 onTopicRename={submitTopicRename}
                 onTopicDismiss={submitTopicDismiss}
-                {...(anchor.startsWith('timeline-visit:') ? { anchorVisitId: anchor } : {})}
+                {...(renderedFocusAnchorVisitId === undefined
+                  ? {}
+                  : { anchorVisitId: renderedFocusAnchorVisitId })}
                 onVisitMarkNotRelated={submitVisitMarkNotRelated}
                 onVisitRestoreToTopic={submitVisitRestoreToTopic}
                 onVisitConfirmRelated={submitVisitConfirmRelated}

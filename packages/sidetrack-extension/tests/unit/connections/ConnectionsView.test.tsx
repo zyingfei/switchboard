@@ -149,6 +149,7 @@ describe('ConnectionsView — engineering scaffold', () => {
 
   it('shows a requested URL anchor even before the graph contains that node', async () => {
     const requestedNodeIds: string[] = [];
+    const requestedAnchorId = 'timeline-visit:https://example.test/research/';
     const anchorId = 'timeline-visit:https://example.test/research';
     setConnectionsClientTransportForTests(async (msg) => {
       const m = msg as { type: string; nodeId?: string };
@@ -172,7 +173,7 @@ describe('ConnectionsView — engineering scaffold', () => {
       return { ok: false, error: 'unexpected' };
     });
 
-    render(<ConnectionsView requestAnchor={anchorId} onOpenInInbox={() => undefined} />);
+    render(<ConnectionsView requestAnchor={requestedAnchorId} onOpenInInbox={() => undefined} />);
 
     await waitFor(() => {
       expect(requestedNodeIds).toContain(anchorId);
@@ -1423,6 +1424,181 @@ describe('ConnectionsView — engineering scaffold', () => {
                 fromContainer: 'topic:db',
               }),
             }),
+          }),
+        ]),
+      );
+    });
+  });
+
+  it('keeps the previous page anchor when reviewing a topic suggestion', async () => {
+    const anchorId = 'timeline-visit:https://example.test/oracle';
+    const removedId = 'timeline-visit:https://example.test/aws';
+    const topicId = 'topic:db';
+    const collapsedSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: { nodeId: anchorId, hops: 1 },
+        nodes: [
+          {
+            id: anchorId,
+            kind: 'timeline-visit',
+            label: 'Oracle page',
+            originReplicaIds: ['replica-A'],
+            metadata: {
+              canonicalUrl: 'https://example.test/oracle',
+              focusedWindowMs: 8_000,
+            },
+            firstSeenAt: '2026-05-14T10:00:00.000Z',
+            lastSeenAt: '2026-05-14T10:00:00.000Z',
+          },
+          {
+            id: 'topic:collapsed',
+            kind: 'topic',
+            label: 'Collapsed',
+            originReplicaIds: [],
+            metadata: { memberCount: 301, cohesion: 0.72 },
+          },
+        ],
+        edges: [
+          {
+            id: 'edge:collapsed-anchor',
+            kind: 'visit_in_topic',
+            fromNodeId: anchorId,
+            toNodeId: 'topic:collapsed',
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-current' },
+            confidence: 'inferred',
+          },
+        ],
+        updatedAt: '2026-05-14T10:00:00.000Z',
+        nodeCount: 2,
+        edgeCount: 1,
+      },
+    };
+    const activeTopicSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: { nodeId: topicId, hops: 1 },
+        nodes: [],
+        edges: [],
+        updatedAt: '2026-05-14T10:00:00.000Z',
+        nodeCount: 0,
+        edgeCount: 0,
+      },
+    };
+    const shadowSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: { topicVariant: 'shadow' },
+        nodes: [
+          {
+            id: anchorId,
+            kind: 'timeline-visit',
+            label: 'Oracle page',
+            originReplicaIds: ['replica-A'],
+            metadata: {
+              canonicalUrl: 'https://example.test/oracle',
+              focusedWindowMs: 8_000,
+            },
+          },
+          {
+            id: removedId,
+            kind: 'timeline-visit',
+            label: 'AWS page',
+            originReplicaIds: ['replica-A'],
+            metadata: {
+              canonicalUrl: 'https://example.test/aws',
+              focusedWindowMs: 6_000,
+            },
+          },
+          {
+            id: topicId,
+            kind: 'topic',
+            label: 'Database pages',
+            originReplicaIds: [],
+            metadata: { memberCount: 2, cohesion: 0.91 },
+          },
+        ],
+        edges: [
+          {
+            id: 'edge:topic-anchor',
+            kind: 'visit_in_topic',
+            fromNodeId: anchorId,
+            toNodeId: topicId,
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-shadow' },
+            confidence: 'inferred',
+          },
+          {
+            id: 'edge:topic-removed',
+            kind: 'visit_in_topic',
+            fromNodeId: removedId,
+            toNodeId: topicId,
+            observedAt: '2026-05-14T10:01:00.000Z',
+            producedBy: { source: 'topic-shadow' },
+            confidence: 'inferred',
+          },
+        ],
+        updatedAt: '2026-05-14T10:01:00.000Z',
+        nodeCount: 3,
+        edgeCount: 2,
+      },
+    };
+    const feedbackMessages: unknown[] = [];
+
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string; nodeId?: string; filters?: { topicVariant?: string } };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        return { ok: true, data: m.nodeId === topicId ? activeTopicSnapshot : collapsedSnapshot };
+      }
+      if (m.type === messageTypes.loadConnectionsSnapshot) {
+        return {
+          ok: true,
+          data: m.filters?.topicVariant === 'shadow' ? shadowSnapshot : collapsedSnapshot,
+        };
+      }
+      if (m.type === messageTypes.postConnectionsFeedbackEvent) {
+        feedbackMessages.push(msg);
+        return { ok: true, data: { accepted: true } };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+
+    render(<ConnectionsView initialAnchor={anchorId} />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-mode-focus')).not.toBeNull();
+    });
+    fireEvent.click(screen.getByTestId('connections-mode-focus'));
+    await waitFor(() => {
+      expect(screen.queryByTestId(`focus-topic-${topicId}`)).not.toBeNull();
+    });
+    fireEvent.click(screen.getByTestId(`focus-topic-anchor-${topicId}`));
+    await waitFor(() => {
+      expect(screen.queryByTestId(`focus-topic-${topicId}`)).not.toBeNull();
+    });
+    fireEvent.click(
+      within(screen.getByTestId(`focus-topic-${topicId}`)).getByRole('button', {
+        name: 'Database pages',
+      }),
+    );
+
+    expect(screen.getByTestId(`focus-visit-confirm-related-${topicId}-${removedId}`)).toBeDefined();
+    fireEvent.click(screen.getByTestId(`focus-visit-not-related-${topicId}-${removedId}`));
+
+    await waitFor(() => {
+      expect(feedbackMessages).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            event: {
+              type: 'user.flow.rejected',
+              payload: {
+                payloadVersion: 1,
+                relationKind: 'closest_visit',
+                fromId: anchorId,
+                toId: removedId,
+                reason: 'not-related',
+              },
+            },
           }),
         ]),
       );
