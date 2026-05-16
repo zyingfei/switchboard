@@ -273,6 +273,12 @@ const QUALITY_TIER_RANK: Readonly<Record<ChunkQualityTier, number>> = {
   low: 0,
 };
 const DEFAULT_QUALITY_TIER: ChunkQualityTier = 'medium';
+const isChunkQualityTier = (value: unknown): value is ChunkQualityTier =>
+  value === 'high' || value === 'medium' || value === 'low';
+
+const qualityTierForEntry = (entry: IndexEntry): ChunkQualityTier =>
+  isChunkQualityTier(entry.metadata?.quality) ? entry.metadata.quality : DEFAULT_QUALITY_TIER;
+
 // How many top results from each individual ranker to feed into
 // fusion. Larger windows broaden recall at the cost of more
 // downstream sorting; 50 is enough for the side panel's typical
@@ -395,7 +401,7 @@ export const rankHybrid = (
   const lexResults: SearchResult[] = opts.lexical.mini
     .search(queryText, { combineWith: 'OR' })
     .filter((result): result is SearchResult => {
-      const entry = opts.lexical.idToEntry.get(String(result['id']));
+      const entry = opts.lexical.idToEntry.get(String(result.id));
       if (entry === undefined) return false;
       if (entry.tombstoned === true) return false;
       if (opts.workstreamMembership !== undefined && !opts.workstreamMembership(entry.threadId)) {
@@ -407,14 +413,14 @@ export const rankHybrid = (
 
   // 3. RRF fusion: each list contributes 1/(k+rank); freshness is a
   //    small additive boost layered on top.
-  type Aggregate = {
+  interface Aggregate {
     readonly id: string;
     readonly entry: IndexEntry;
     readonly vectorRank?: number;
     readonly vectorSimilarity?: number;
     readonly lexicalRank?: number;
     readonly lexicalScore?: number;
-  };
+  }
   const byId = new Map<string, Aggregate>();
   vectorList.forEach((row, index) => {
     byId.set(row.item.id, {
@@ -425,7 +431,7 @@ export const rankHybrid = (
     });
   });
   lexResults.forEach((row, index) => {
-    const id = String(row['id']);
+    const id = String(row.id);
     const entry = opts.lexical.idToEntry.get(id);
     if (entry === undefined) return;
     const prior = byId.get(id);
@@ -437,7 +443,7 @@ export const rankHybrid = (
         ? {}
         : { vectorSimilarity: prior.vectorSimilarity }),
       lexicalRank: index + 1,
-      lexicalScore: typeof row['score'] === 'number' ? row['score'] : 0,
+      lexicalScore: typeof row.score === 'number' ? row.score : 0,
     });
   });
 
@@ -453,7 +459,7 @@ export const rankHybrid = (
     // 'medium' rank (0.5) so 'medium' adds exactly zero — only
     // high/low chunks shift, keeping RRF math byte-identical when all
     // candidates share a tier (or none carry one).
-    const qualityTier: ChunkQualityTier = agg.entry.metadata?.quality ?? DEFAULT_QUALITY_TIER;
+    const qualityTier = qualityTierForEntry(agg.entry);
     const qualityCentered =
       QUALITY_TIER_RANK[qualityTier] - QUALITY_TIER_RANK[DEFAULT_QUALITY_TIER];
     const freshnessContribution = FRESHNESS_BOOST_WEIGHT * freshness * fusion;
@@ -469,7 +475,7 @@ export const rankHybrid = (
     if (freshness >= 1) {
       why.push('fresh ≤ 3d');
     }
-    if (agg.entry.metadata?.quality !== undefined) {
+    if (isChunkQualityTier(agg.entry.metadata?.quality)) {
       why.push(`quality ${qualityTier}`);
     }
     const explain: ExplainBreakdown = {

@@ -11,10 +11,9 @@ import {
 import { ENGAGEMENT_SESSION_AGGREGATED, type EngagementDimensions } from '../engagement/events.js';
 import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
 import { NAVIGATION_COMMITTED } from '../navigation/events.js';
-import { PAGE_CONTENT_EXTRACTED } from '../page-content/types.js';
+import { PAGE_CONTENT_EXTRACTED, PAGE_CONTENT_TOMBSTONED } from '../page-content/types.js';
 import { SELECTION_COPIED } from '../snippets/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
-import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import {
   CANDIDATE_PAIR_FEATURE_KEYS,
   FEATURE_SCHEMA_VERSION,
@@ -129,22 +128,6 @@ const navigationPayload = (input: {
   commitTimestamp: input.commitTimestamp ?? BASE_TIME,
 });
 
-const timelinePayload = (input: {
-  readonly url: string;
-  readonly title?: string;
-  readonly workstreamId?: string;
-}): unknown => ({
-  eventId: `timeline-${input.url}`,
-  observedAt: iso(),
-  url: input.url,
-  canonicalUrl: input.url,
-  provider: 'generic',
-  transition: 'activated',
-  payloadVersion: 1,
-  ...(input.title === undefined ? {} : { title: input.title }),
-  ...(input.workstreamId === undefined ? {} : { workstreamId: input.workstreamId }),
-});
-
 const snippetPayload = (input: {
   readonly visitId: string;
   readonly selectionHash: string;
@@ -221,6 +204,13 @@ const pageContentPayload = (input: {
     contentHash: `hash-${input.canonicalUrl}`,
     charCount: 19,
   },
+});
+
+const pageContentTombstonePayload = (canonicalUrl: string): unknown => ({
+  payloadVersion: 1,
+  canonicalUrl,
+  tombstonedAt: iso(),
+  reason: 'user-delete',
 });
 
 const extract = (
@@ -849,5 +839,49 @@ describe('ranker page-content quality features', () => {
 
     expect(features.page_quality_tier_from).toBe(2);
     expect(features.page_quality_tier_to).toBe(0);
+  });
+
+  it('treats a later page-content tombstone as unknown quality', () => {
+    const features = extract({
+      candidate: candidate({
+        fromVisitId: 'https://alpha.test/deleted',
+        toVisitId: 'https://alpha.test/recreated',
+      }),
+      merged: [
+        event({
+          seq: 1,
+          type: PAGE_CONTENT_EXTRACTED,
+          payload: pageContentPayload({
+            canonicalUrl: 'https://alpha.test/deleted',
+            quality: 'high',
+          }),
+          acceptedAtMs: BASE_TIME + 1,
+        }),
+        event({
+          seq: 2,
+          type: PAGE_CONTENT_TOMBSTONED,
+          payload: pageContentTombstonePayload('https://alpha.test/deleted'),
+          acceptedAtMs: BASE_TIME + 2,
+        }),
+        event({
+          seq: 3,
+          type: PAGE_CONTENT_TOMBSTONED,
+          payload: pageContentTombstonePayload('https://alpha.test/recreated'),
+          acceptedAtMs: BASE_TIME + 1,
+        }),
+        event({
+          seq: 4,
+          type: PAGE_CONTENT_EXTRACTED,
+          payload: pageContentPayload({
+            canonicalUrl: 'https://alpha.test/recreated',
+            quality: 'medium',
+          }),
+          acceptedAtMs: BASE_TIME + 2,
+        }),
+      ],
+    });
+
+    expect(features.page_quality_tier_from).toBe(0);
+    expect(features.page_quality_tier_to).toBe(2);
   });
 });

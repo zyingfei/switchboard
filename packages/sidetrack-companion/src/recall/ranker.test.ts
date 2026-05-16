@@ -319,6 +319,42 @@ describe('rankHybrid — quality tiebreak', () => {
     }
   });
 
+  it('treats malformed persisted quality metadata as neutral', () => {
+    const item = entry(
+      'chunk:badquality:0:0:aaaaaaaaaaaa',
+      'thread_a',
+      baseDate.toISOString(),
+      [1, 0],
+      {
+        text: 'Persisted recall metadata is parsed from disk and must be defensive.',
+        quality: 'high',
+      },
+    );
+    const metadata = item.metadata;
+    if (metadata === undefined) throw new Error('metadata missing');
+    const items: readonly IndexEntry[] = [
+      {
+        ...item,
+        metadata: { ...metadata, quality: 'corrupt' } as unknown as ChunkMetadata,
+      },
+    ];
+    const results = rankHybrid(
+      'persisted recall metadata',
+      Float32Array.from([1, 0]),
+      items,
+      baseDate,
+      {
+        lexical: buildLexicalIndex(items),
+      },
+    );
+
+    expect(results[0]?.score).toBeTypeOf('number');
+    expect(Number.isNaN(results[0]?.score)).toBe(false);
+    expect(results[0]?.explain?.qualityTier).toBe('medium');
+    expect(results[0]?.explain?.qualityContribution).toBe(0);
+    expect(results[0]?.why?.some((why) => why.includes('quality'))).toBe(false);
+  });
+
   it('leaves RRF + freshness math untouched when quality is equal across candidates', () => {
     // The literal "RRF unchanged when quality equal" guarantee: when
     // NO chunk carries a tier (⇒ all neutral 'medium'), the score is

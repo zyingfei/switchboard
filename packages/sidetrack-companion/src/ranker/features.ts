@@ -14,8 +14,15 @@ import {
   isUserOrganizedItemPayload,
 } from '../feedback/events.js';
 import { NAVIGATION_COMMITTED, isNavigationCommittedPayload } from '../navigation/events.js';
-import { isPageContentExtractedPayload } from '../page-content/events.js';
-import { PAGE_CONTENT_EXTRACTED, type PageContentQuality } from '../page-content/types.js';
+import {
+  isPageContentExtractedPayload,
+  isPageContentTombstonedPayload,
+} from '../page-content/events.js';
+import {
+  PAGE_CONTENT_EXTRACTED,
+  PAGE_CONTENT_TOMBSTONED,
+  type PageContentQuality,
+} from '../page-content/types.js';
 import { SELECTION_COPIED, isSelectionCopiedPayload } from '../snippets/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from '../timeline/events.js';
@@ -82,10 +89,10 @@ interface FeatureModel {
   // split/merge relationship.
   readonly topicLineageMergeSplitGraph: ReadonlyMap<string, ReadonlySet<string>>;
   // Page-content quality tier per visit alias (canonicalUrl). Latest
-  // `page.content.extracted` event wins by (acceptedAt, replicaId,
-  // seq). Tombstones are not modeled as a quality value — a missing
-  // entry is treated as "unknown" (feature value 0).
-  readonly pageQualityByVisitKey: ReadonlyMap<string, OrderedValue<PageContentQuality>>;
+  // page-content event wins by (acceptedAt, replicaId, seq). Tombstone
+  // events clear the value, so deleted/policy-revoked content is
+  // treated as "unknown" (feature value 0).
+  readonly pageQualityByVisitKey: ReadonlyMap<string, OrderedValue<PageContentQuality | null>>;
   readonly snapshot: ConnectionsSnapshot;
   readonly referenceMs: number | null;
 }
@@ -772,7 +779,7 @@ const buildTopicLineageMergeSplitGraph = (
   const graph = new Map<string, Set<string>>();
   for (const edge of snapshot.edges) {
     if (edge.kind !== 'topic.lineage') continue;
-    const lineageKind = edge.metadata?.['lineageKind'];
+    const lineageKind = edge.metadata?.lineageKind;
     if (lineageKind !== 'merge' && lineageKind !== 'split') continue;
     if (
       !edge.fromNodeId.startsWith(TOPIC_PREFIX) ||
@@ -796,9 +803,9 @@ const isPageContentQuality = (value: unknown): value is PageContentQuality =>
 // quality map without an extra join.
 const buildPageQualityByVisitKey = (
   events: readonly AcceptedEvent[],
-): ReadonlyMap<string, OrderedValue<PageContentQuality>> => {
-  const byVisit = new Map<string, OrderedValue<PageContentQuality>>();
-  const put = (key: string, value: OrderedValue<PageContentQuality>): void => {
+): ReadonlyMap<string, OrderedValue<PageContentQuality | null>> => {
+  const byVisit = new Map<string, OrderedValue<PageContentQuality | null>>();
+  const put = (key: string, value: OrderedValue<PageContentQuality | null>): void => {
     if (key.length === 0) return;
     const existing = byVisit.get(key);
     if (existing === undefined || compareOrdered(existing, value) <= 0) {
@@ -807,15 +814,25 @@ const buildPageQualityByVisitKey = (
   };
 
   for (const event of events) {
-    if (event.type !== PAGE_CONTENT_EXTRACTED) continue;
-    if (!isPageContentExtractedPayload(event.payload)) continue;
-    if (!isPageContentQuality(event.payload.quality)) continue;
-    put(visitKeyForUrl(event.payload.canonicalUrl), {
-      value: event.payload.quality,
-      acceptedAtMs: event.acceptedAtMs,
-      replicaId: event.dot.replicaId,
-      seq: event.dot.seq,
-    });
+    if (event.type === PAGE_CONTENT_EXTRACTED) {
+      if (!isPageContentExtractedPayload(event.payload)) continue;
+      if (!isPageContentQuality(event.payload.quality)) continue;
+      put(visitKeyForUrl(event.payload.canonicalUrl), {
+        value: event.payload.quality,
+        acceptedAtMs: event.acceptedAtMs,
+        replicaId: event.dot.replicaId,
+        seq: event.dot.seq,
+      });
+      continue;
+    }
+    if (event.type === PAGE_CONTENT_TOMBSTONED && isPageContentTombstonedPayload(event.payload)) {
+      put(visitKeyForUrl(event.payload.canonicalUrl), {
+        value: null,
+        acceptedAtMs: event.acceptedAtMs,
+        replicaId: event.dot.replicaId,
+        seq: event.dot.seq,
+      });
+    }
   }
   return byVisit;
 };
@@ -895,9 +912,7 @@ const chainDepth = (
     queue.push({ key: start, depth: 0 });
   }
 
-  for (let index = 0; index < queue.length; index += 1) {
-    const current = queue[index];
-    if (current === undefined) continue;
+  for (const current of queue) {
     if (current.depth > 0 && targets.has(current.key)) return current.depth;
     const neighbors = graph.get(current.key);
     if (neighbors === undefined) continue;
@@ -1147,13 +1162,14 @@ const topicLineageMergeSplitRelatedFeature = (
 };
 
 const pageQualityTierForVisit = (candidateVisitId: string, model: FeatureModel): number => {
-  let selected: OrderedValue<PageContentQuality> | null = null;
+  let selected: OrderedValue<PageContentQuality | null> | null = null;
   for (const alias of aliasesForVisit(model, candidateVisitId)) {
     const value = model.pageQualityByVisitKey.get(alias);
     if (value === undefined) continue;
     if (selected === null || compareOrdered(selected, value) <= 0) selected = value;
   }
-  return selected === null ? 0 : (PAGE_QUALITY_TIER[selected.value] ?? 0);
+  const quality = selected?.value;
+  return quality === undefined || quality === null ? 0 : PAGE_QUALITY_TIER[quality];
 };
 
 const pageQualityTierFromFeature = (candidate: Candidate, model: FeatureModel): number =>
