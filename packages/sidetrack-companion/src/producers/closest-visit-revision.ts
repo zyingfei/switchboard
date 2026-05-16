@@ -4,7 +4,9 @@ import { join } from 'node:path';
 
 import { FEATURE_SCHEMA_VERSION } from '../ranker/feature-schema.js';
 import {
+  DETERMINISTIC_BASELINE_VERSION,
   RANKER_MODEL_VERSION,
+  REGULARIZED_LOGISTIC_REGRESSION_VERSION,
   type RankerRevision,
   type RankerTrainQuality,
 } from '../ranker/train.js';
@@ -134,6 +136,325 @@ const normalizeCandidateLabeling = (
   };
 };
 
+const normalizeSimpleMetric = (
+  value: unknown,
+): { readonly kind: string; readonly value: number } | undefined =>
+  isRecord(value) && typeof value['kind'] === 'string' && isFiniteNumber(value['value'])
+    ? { kind: value['kind'], value: value['value'] }
+    : undefined;
+
+const stringArrayOrUndefined = (value: unknown): readonly string[] | undefined =>
+  Array.isArray(value) && value.every((entry) => typeof entry === 'string') ? value : undefined;
+
+const normalizeTuning = (
+  value: unknown,
+): NonNullable<RankerTrainQuality['methodologySpine']>['tuning'] => {
+  const fallback = {
+    status: 'unavailable' as const,
+    strategy: 'validation-num-round-grid' as const,
+    requestedNumRound: 0,
+    selectedNumRound: 0,
+    validationCandidateCount: 0,
+    candidates: [],
+    reason: 'split-unavailable' as const,
+  };
+  if (!isRecord(value)) return fallback;
+  const rawCandidates = value['candidates'];
+  const candidates =
+    Array.isArray(rawCandidates) &&
+    rawCandidates.every(
+      (candidate) =>
+        isRecord(candidate) &&
+        isFiniteNumber(candidate['numRound']) &&
+        (candidate['metric'] === undefined ||
+          normalizeSimpleMetric(candidate['metric']) !== undefined),
+    )
+      ? rawCandidates.map((candidate) => {
+          if (!isRecord(candidate) || !isFiniteNumber(candidate['numRound'])) {
+            return { numRound: 0 };
+          }
+          const metric = normalizeSimpleMetric(candidate['metric']);
+          return {
+            numRound: candidate['numRound'],
+            ...(metric === undefined ? {} : { metric }),
+          };
+        })
+      : [];
+  const reason =
+    value['reason'] === 'split-unavailable' || value['reason'] === 'validation-metric-unavailable'
+      ? value['reason']
+      : undefined;
+  if (
+    (value['status'] !== 'available' && value['status'] !== 'unavailable') ||
+    value['strategy'] !== 'validation-num-round-grid' ||
+    !isFiniteNumber(value['requestedNumRound']) ||
+    !isFiniteNumber(value['selectedNumRound']) ||
+    !isFiniteNumber(value['validationCandidateCount'])
+  ) {
+    return fallback;
+  }
+  return {
+    status: value['status'],
+    strategy: 'validation-num-round-grid',
+    requestedNumRound: value['requestedNumRound'],
+    selectedNumRound: value['selectedNumRound'],
+    validationCandidateCount: value['validationCandidateCount'],
+    candidates,
+    ...(reason === undefined ? {} : { reason }),
+  };
+};
+
+const normalizeModelChoice = (
+  value: unknown,
+): NonNullable<RankerTrainQuality['methodologySpine']>['modelChoice'] => {
+  const fallback = {
+    deterministicBaseline: {
+      candidate: DETERMINISTIC_BASELINE_VERSION,
+    },
+    activeModel: {
+      candidate: RANKER_MODEL_VERSION,
+    },
+    regularizedLogisticRegression: {
+      candidate: REGULARIZED_LOGISTIC_REGRESSION_VERSION,
+    },
+    graduation: {
+      status: 'unavailable' as const,
+      minValidationDelta: 0.005,
+      reason: 'validation-metric-unavailable' as const,
+    },
+  };
+  if (!isRecord(value)) return fallback;
+  const baselineRaw = value['deterministicBaseline'];
+  const activeRaw = value['activeModel'];
+  const logisticRaw = value['regularizedLogisticRegression'];
+  const graduationRaw = value['graduation'];
+  if (
+    !isRecord(baselineRaw) ||
+    baselineRaw['candidate'] !== DETERMINISTIC_BASELINE_VERSION ||
+    !isRecord(activeRaw) ||
+    activeRaw['candidate'] !== RANKER_MODEL_VERSION ||
+    !isRecord(logisticRaw) ||
+    logisticRaw['candidate'] !== REGULARIZED_LOGISTIC_REGRESSION_VERSION ||
+    !isRecord(graduationRaw) ||
+    !isFiniteNumber(graduationRaw['minValidationDelta'])
+  ) {
+    return fallback;
+  }
+  const graduationReason = graduationRaw['reason'];
+  const graduationStatus = graduationRaw['status'];
+  if (
+    (graduationStatus !== 'earned' &&
+      graduationStatus !== 'not-earned' &&
+      graduationStatus !== 'unavailable') ||
+    (graduationReason !== 'active-model-beats-comparison-baseline' &&
+      graduationReason !== 'active-model-does-not-beat-comparison-baseline' &&
+      graduationReason !== 'validation-metric-unavailable')
+  ) {
+    return fallback;
+  }
+  const baselineValidationMetric = normalizeSimpleMetric(baselineRaw['validationMetric']);
+  const baselineReservedTestMetric = normalizeSimpleMetric(baselineRaw['reservedTestMetric']);
+  const activeValidationMetric = normalizeSimpleMetric(activeRaw['validationMetric']);
+  const activeReservedTestMetric = normalizeSimpleMetric(activeRaw['reservedTestMetric']);
+  const logisticValidationMetric = normalizeSimpleMetric(logisticRaw['validationMetric']);
+  const logisticReservedTestMetric = normalizeSimpleMetric(logisticRaw['reservedTestMetric']);
+  const validationDelta = isFiniteNumber(graduationRaw['validationDelta'])
+    ? graduationRaw['validationDelta']
+    : undefined;
+  const comparisonCandidate =
+    graduationRaw['comparisonCandidate'] === DETERMINISTIC_BASELINE_VERSION ||
+    graduationRaw['comparisonCandidate'] === REGULARIZED_LOGISTIC_REGRESSION_VERSION
+      ? graduationRaw['comparisonCandidate']
+      : undefined;
+  return {
+    deterministicBaseline: {
+      candidate: DETERMINISTIC_BASELINE_VERSION,
+      ...(baselineValidationMetric === undefined
+        ? {}
+        : { validationMetric: baselineValidationMetric }),
+      ...(baselineReservedTestMetric === undefined
+        ? {}
+        : { reservedTestMetric: baselineReservedTestMetric }),
+    },
+    activeModel: {
+      candidate: RANKER_MODEL_VERSION,
+      ...(activeValidationMetric === undefined ? {} : { validationMetric: activeValidationMetric }),
+      ...(activeReservedTestMetric === undefined
+        ? {}
+        : { reservedTestMetric: activeReservedTestMetric }),
+    },
+    regularizedLogisticRegression: {
+      candidate: REGULARIZED_LOGISTIC_REGRESSION_VERSION,
+      ...(logisticValidationMetric === undefined
+        ? {}
+        : { validationMetric: logisticValidationMetric }),
+      ...(logisticReservedTestMetric === undefined
+        ? {}
+        : { reservedTestMetric: logisticReservedTestMetric }),
+    },
+    graduation: {
+      status: graduationStatus,
+      minValidationDelta: graduationRaw['minValidationDelta'],
+      ...(validationDelta === undefined ? {} : { validationDelta }),
+      ...(comparisonCandidate === undefined ? {} : { comparisonCandidate }),
+      reason: graduationReason,
+    },
+  };
+};
+
+const normalizeShipGate = (
+  value: unknown,
+): NonNullable<RankerTrainQuality['methodologySpine']>['shipGate'] => {
+  const fallback = {
+    status: 'unavailable' as const,
+    candidate: RANKER_MODEL_VERSION,
+    minValidationDeltaVsBaseline: 0.005,
+    minReservedTestNdcg: 0.5,
+    reservedTestUsedExactlyOnce: true as const,
+    reason: 'validation-or-test-metric-unavailable' as const,
+  };
+  if (!isRecord(value)) return fallback;
+  const status = value['status'];
+  const reason = value['reason'];
+  if (
+    (status !== 'pass' && status !== 'fail' && status !== 'unavailable') ||
+    value['candidate'] !== RANKER_MODEL_VERSION ||
+    !isFiniteNumber(value['minValidationDeltaVsBaseline']) ||
+    !isFiniteNumber(value['minReservedTestNdcg']) ||
+    value['reservedTestUsedExactlyOnce'] !== true ||
+    (reason !== 'active-model-cleared-validation-and-reserved-test' &&
+      reason !== 'active-model-does-not-beat-comparison-baseline' &&
+      reason !== 'reserved-test-below-floor' &&
+      reason !== 'novel-pair-supervision-unavailable' &&
+      reason !== 'validation-or-test-metric-unavailable')
+  ) {
+    return fallback;
+  }
+  return {
+    status,
+    candidate: RANKER_MODEL_VERSION,
+    minValidationDeltaVsBaseline: value['minValidationDeltaVsBaseline'],
+    minReservedTestNdcg: value['minReservedTestNdcg'],
+    reservedTestUsedExactlyOnce: true,
+    reason,
+  };
+};
+
+const normalizeMethodologySpine = (
+  value: unknown,
+): RankerTrainQuality['methodologySpine'] | undefined => {
+  if (!isRecord(value)) return undefined;
+  const splitRaw = value['split'];
+  if (!isRecord(splitRaw)) return undefined;
+  const split =
+    splitRaw['status'] === 'available' &&
+    splitRaw['strategy'] === 'forward-chaining-time' &&
+    splitRaw['timestampSource'] === 'supervision-event-or-visit-observed-at' &&
+    isFiniteNumber(splitRaw['trainGroupCount']) &&
+    isFiniteNumber(splitRaw['validationGroupCount']) &&
+    isFiniteNumber(splitRaw['testGroupCount']) &&
+    isFiniteNumber(splitRaw['validationCutoffGeneratedAt']) &&
+    isFiniteNumber(splitRaw['testCutoffGeneratedAt'])
+      ? {
+          status: 'available' as const,
+          strategy: 'forward-chaining-time' as const,
+          timestampSource: 'supervision-event-or-visit-observed-at' as const,
+          trainGroupCount: splitRaw['trainGroupCount'],
+          validationGroupCount: splitRaw['validationGroupCount'],
+          testGroupCount: splitRaw['testGroupCount'],
+          validationCutoffGeneratedAt: splitRaw['validationCutoffGeneratedAt'],
+          testCutoffGeneratedAt: splitRaw['testCutoffGeneratedAt'],
+        }
+      : splitRaw['status'] === 'unavailable' &&
+          splitRaw['reason'] === 'insufficient-time-separated-groups'
+        ? {
+            status: 'unavailable' as const,
+            reason: 'insufficient-time-separated-groups' as const,
+          }
+        : undefined;
+  if (split === undefined) return undefined;
+
+  const novelRaw = value['novelPairSlice'];
+  const sourceKinds = isRecord(novelRaw)
+    ? stringArrayOrUndefined(novelRaw['sourceKinds'])
+    : undefined;
+  if (
+    !isRecord(novelRaw) ||
+    !isFiniteNumber(novelRaw['rowCount']) ||
+    !isFiniteNumber(novelRaw['groupCount']) ||
+    !isFiniteNumber(novelRaw['positiveRows']) ||
+    !isFiniteNumber(novelRaw['negativeRows']) ||
+    sourceKinds === undefined
+  ) {
+    return undefined;
+  }
+  const novelMetric = normalizeSimpleMetric(novelRaw['metric']);
+
+  const permutationRaw = value['labelPermutation'];
+  if (
+    !isRecord(permutationRaw) ||
+    !isFiniteNumber(permutationRaw['seed']) ||
+    !isFiniteNumber(permutationRaw['rowCount']) ||
+    !isFiniteNumber(permutationRaw['groupCount'])
+  ) {
+    return undefined;
+  }
+  const permutationMetric = normalizeSimpleMetric(permutationRaw['metric']);
+
+  const ablationRaw = value['workstreamFeatureAblation'];
+  const droppedFeatures = isRecord(ablationRaw)
+    ? stringArrayOrUndefined(ablationRaw['droppedFeatures'])
+    : undefined;
+  if (
+    !isRecord(ablationRaw) ||
+    droppedFeatures === undefined ||
+    ablationRaw['status'] !== 'not-in-feature-vector'
+  ) {
+    return undefined;
+  }
+
+  const testRaw = value['reservedTestMetric'];
+  const reservedTestMetric =
+    isRecord(testRaw) &&
+    typeof testRaw['kind'] === 'string' &&
+    isFiniteNumber(testRaw['value']) &&
+    isFiniteNumber(testRaw['rowCount']) &&
+    isFiniteNumber(testRaw['groupCount'])
+      ? {
+          kind: testRaw['kind'],
+          value: testRaw['value'],
+          rowCount: testRaw['rowCount'],
+          groupCount: testRaw['groupCount'],
+        }
+      : undefined;
+
+  return {
+    split,
+    novelPairSlice: {
+      rowCount: novelRaw['rowCount'],
+      groupCount: novelRaw['groupCount'],
+      positiveRows: novelRaw['positiveRows'],
+      negativeRows: novelRaw['negativeRows'],
+      sourceKinds,
+      ...(novelMetric === undefined ? {} : { metric: novelMetric }),
+    },
+    labelPermutation: {
+      seed: permutationRaw['seed'],
+      rowCount: permutationRaw['rowCount'],
+      groupCount: permutationRaw['groupCount'],
+      ...(permutationMetric === undefined ? {} : { metric: permutationMetric }),
+    },
+    workstreamFeatureAblation: {
+      droppedFeatures,
+      status: 'not-in-feature-vector',
+    },
+    ...(reservedTestMetric === undefined ? {} : { reservedTestMetric }),
+    tuning: normalizeTuning(value['tuning']),
+    modelChoice: normalizeModelChoice(value['modelChoice']),
+    shipGate: normalizeShipGate(value['shipGate']),
+  };
+};
+
 // Lenient: a malformed `trainQuality` is pure observability, so it is
 // dropped rather than failing the whole manifest. A manifest without
 // `trainQuality` (older writers) is also valid — returns undefined.
@@ -181,12 +502,14 @@ const normalizeTrainQuality = (value: unknown): RankerTrainQuality | undefined =
           cutoffGeneratedAt: heldOutRaw['cutoffGeneratedAt'],
         }
       : undefined;
+  const methodologySpine = normalizeMethodologySpine(value['methodologySpine']);
   return {
     gradeHistogram: value['gradeHistogram'],
     candidateLabeling,
     ...(spread === undefined ? {} : { scoreSpread: spread }),
     ...(metric === undefined ? {} : { inSampleMetric: metric }),
     ...(heldOut === undefined ? {} : { heldOutMetric: heldOut }),
+    ...(methodologySpine === undefined ? {} : { methodologySpine }),
   };
 };
 

@@ -4,6 +4,14 @@ import { dirname, join } from 'node:path';
 
 import type { ConnectionsSnapshot } from '../connections/types.js';
 import {
+  USER_FLOW_CONFIRMED,
+  USER_FLOW_REJECTED,
+  USER_SNIPPET_PROMOTED,
+  isUserFlowConfirmedPayload,
+  isUserFlowRejectedPayload,
+  isUserSnippetPromotedPayload,
+} from '../feedback/events.js';
+import {
   type FeedbackProjection,
   type FeedbackTrainingLabel,
   projectFeedback,
@@ -599,6 +607,141 @@ const maxObservedAt = (merged: readonly AcceptedEvent[], snapshot: ConnectionsSn
   return generatedAt;
 };
 
+const labelPairKey = (fromId: string, toId: string): string => `${fromId}\u0000${toId}`;
+
+const putMaxTimestamp = (map: Map<string, number>, key: string, timestamp: number): void => {
+  if (!Number.isFinite(timestamp)) return;
+  map.set(key, Math.max(map.get(key) ?? 0, timestamp));
+};
+
+interface TrainingTimestampContext {
+  readonly positiveByPair: ReadonlyMap<string, number>;
+  readonly negativeByPair: ReadonlyMap<string, number>;
+  readonly positiveByFrom: ReadonlyMap<string, number>;
+  readonly visitObservedAt: ReadonlyMap<string, number>;
+  readonly fallbackObservedAt: number;
+}
+
+const visitObservedTimesFromSnapshot = (
+  snapshot: ConnectionsSnapshot,
+): ReadonlyMap<string, number> => {
+  const observedAt = new Map<string, number>();
+  for (const node of snapshot.nodes) {
+    if (node.kind !== 'timeline-visit') continue;
+    const visitKey = visitKeyFromNodeOrRaw(node.id);
+    const firstSeenAt = parseTimestamp(node.firstSeenAt);
+    const lastSeenAt = parseTimestamp(node.lastSeenAt);
+    const timestamp = Math.max(firstSeenAt ?? 0, lastSeenAt ?? 0);
+    if (visitKey.length > 0 && timestamp > 0) {
+      putMaxTimestamp(observedAt, visitKey, timestamp);
+    }
+  }
+  return observedAt;
+};
+
+const addPositivePairTimestamp = (
+  positiveByPair: Map<string, number>,
+  positiveByFrom: Map<string, number>,
+  fromId: string,
+  toId: string,
+  timestamp: number,
+): void => {
+  putMaxTimestamp(positiveByPair, labelPairKey(fromId, toId), timestamp);
+  putMaxTimestamp(positiveByFrom, visitKeyFromNodeOrRaw(fromId), timestamp);
+};
+
+const buildTrainingTimestampContext = (
+  merged: readonly AcceptedEvent[],
+  snapshot: ConnectionsSnapshot,
+  fallbackObservedAt: number,
+): TrainingTimestampContext => {
+  const positiveByPair = new Map<string, number>();
+  const negativeByPair = new Map<string, number>();
+  const positiveByFrom = new Map<string, number>();
+
+  for (const event of merged) {
+    const timestamp = event.acceptedAtMs;
+    if (!Number.isFinite(timestamp)) continue;
+
+    if (event.type === USER_FLOW_CONFIRMED && isUserFlowConfirmedPayload(event.payload)) {
+      addPositivePairTimestamp(
+        positiveByPair,
+        positiveByFrom,
+        event.payload.fromId,
+        event.payload.toId,
+        timestamp,
+      );
+      continue;
+    }
+
+    if (event.type === USER_SNIPPET_PROMOTED && isUserSnippetPromotedPayload(event.payload)) {
+      addPositivePairTimestamp(
+        positiveByPair,
+        positiveByFrom,
+        event.payload.sourceVisitId ?? event.payload.snippetId,
+        event.payload.targetId,
+        timestamp,
+      );
+      continue;
+    }
+
+    if (event.type === USER_FLOW_REJECTED && isUserFlowRejectedPayload(event.payload)) {
+      putMaxTimestamp(
+        negativeByPair,
+        labelPairKey(event.payload.fromId, event.payload.toId),
+        timestamp,
+      );
+    }
+  }
+
+  return {
+    positiveByPair,
+    negativeByPair,
+    positiveByFrom,
+    visitObservedAt: visitObservedTimesFromSnapshot(snapshot),
+    fallbackObservedAt,
+  };
+};
+
+const maxVisitObservedAtForCandidate = (
+  candidate: Candidate,
+  timestamps: TrainingTimestampContext,
+): number | undefined => {
+  const from = timestamps.visitObservedAt.get(visitKeyFromNodeOrRaw(candidate.fromVisitId)) ?? 0;
+  const to = timestamps.visitObservedAt.get(visitKeyFromNodeOrRaw(candidate.toVisitId)) ?? 0;
+  const observedAt = Math.max(from, to);
+  return observedAt > 0 ? observedAt : undefined;
+};
+
+const timestampForTrainingCandidate = (
+  candidate: Candidate,
+  timestamps: TrainingTimestampContext,
+): number => {
+  const pair = labelPairKey(candidate.fromVisitId, candidate.toVisitId);
+  const positiveTimestamp = timestamps.positiveByPair.get(pair);
+  if (positiveTimestamp !== undefined) return positiveTimestamp;
+
+  const negativeTimestamp = timestamps.negativeByPair.get(pair);
+  if (negativeTimestamp !== undefined) return negativeTimestamp;
+
+  if (candidate.sources.includes('random_unrelated')) {
+    const positiveFromTimestamp = timestamps.positiveByFrom.get(
+      visitKeyFromNodeOrRaw(candidate.fromVisitId),
+    );
+    if (positiveFromTimestamp !== undefined) return positiveFromTimestamp;
+  }
+
+  return maxVisitObservedAtForCandidate(candidate, timestamps) ?? timestamps.fallbackObservedAt;
+};
+
+const restampTrainingCandidate = (
+  candidate: Candidate,
+  timestamps: TrainingTimestampContext,
+): Candidate => ({
+  ...candidate,
+  generatedAt: timestampForTrainingCandidate(candidate, timestamps),
+});
+
 const addFeedbackLabelCandidates = (
   candidates: Map<string, Candidate>,
   labels: readonly FeedbackTrainingLabel[],
@@ -690,6 +833,7 @@ export const buildRankerTrainingCandidates = ({
 
   const candidates = new Map<string, Candidate>();
   const generatedAt = maxObservedAt(merged, snapshot);
+  const timestampContext = buildTrainingTimestampContext(merged, snapshot, generatedAt);
   const context = { merged: [...merged], existingEdges: [...snapshot.edges] };
 
   for (const fromVisitId of visitKeysList) {
@@ -730,6 +874,7 @@ export const buildRankerTrainingCandidates = ({
   );
 
   return [...candidates.values()]
+    .map((candidate) => restampTrainingCandidate(candidate, timestampContext))
     .sort(
       (left, right) =>
         compareText(left.fromVisitId, right.fromVisitId) ||
