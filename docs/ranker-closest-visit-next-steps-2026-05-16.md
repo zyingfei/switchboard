@@ -92,6 +92,45 @@ This branch files it as
 `0004` is taken by `0004-bun-runtime-install` on `main`; #184
 CV-5/CV-6) and marks it accepted on the strength of #181/#183.
 
+### 0.1. Update 2026-05-16 — post-#186 dogfood retry
+
+PR #186 later surfaced the methodology-spine health state in
+`/v1/system/health` and work-graph diagnostics, closing the CV-1/CV-2
+observability prerequisites. A real-vault forced retrain was then run
+against `origin/main` `b8dff3b2` with the v3 code path.
+
+That run **did not pass CV-3**:
+
+- the active on-disk ranker was still the stale
+  `lightgbm-lambdamart-v2` / feature-schema `2` revision and was
+  correctly rejected by the v3 runtime as `invalid-model`;
+- the forced retrain ran for about `1325s` and failed with
+  `ranker training requires at least one query group with positive and
+  negative labels`;
+- the retrain fingerprint had `790` labels (`218` positive, `572`
+  negative) and `63864` candidates, but the row builder produced
+  `0` positive training rows, `1075` negative rows, and `0` usable
+  query groups;
+- the labeled rows had `136` distinct `generatedAt` values, so the
+  timestamp/batch-stamp hypothesis is no longer the immediate blocker
+  for the dogfood vault.
+
+The current blocker is **positive-supervision shape**, not split
+timestamp availability. Most positive feedback labels resolve as
+item/container relations rather than visit-to-visit candidate pairs,
+so they never become positive rows. Do not reintroduce workstream
+closure to make CV-3 pass; the next safe engineering step is a cheap
+preflight for `no-usable-query-groups`, followed by an explicit
+decision about which positive supervision is legitimate enough to
+train `closest_visit`.
+
+PR #187 landed that cheap structural preflight. The same real-vault
+forced retrain now returns immediately as
+`skipped:no-usable-query-groups` with `candidateCount: 0`. This makes
+the failure safe and attributable, but it does **not** satisfy CV-3:
+no v3 model is trained, no methodology-spine split is produced, and no
+ship gate can pass until legitimate visit-to-visit positives exist.
+
 ---
 
 ## 1. What the deep-research input got right (adopt it)
