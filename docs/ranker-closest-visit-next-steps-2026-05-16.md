@@ -15,6 +15,80 @@
 
 ---
 
+## 0. Update 2026-05-16 — reconciliation with PR #181 (as-shipped)
+
+PR #181 (`fix(ranker): remove closest_visit workstream leakage`, →
+`main`, model `v2→v3` / schema `2→3`) landed **after** this plan was
+written and changes its status. Read this section first; §§1–9 below
+are the original reasoning and remain valid except where noted.
+
+**Status delta:**
+
+- **Phase 1 (clean labels) is shipped by #181**, not pending:
+  `deriveVisitPairLabelsFromSnapshot` returns `[]`; the positive-label
+  candidate tag moved `same_workstream → user_confirmed`;
+  `same_workstream` / `user_asserted_in_workstream` removed from
+  `RANKER_FEATURE_KEYS`; the v3 manifest gate rejects the leaked v2
+  model. The tautology is genuinely gone.
+- **Phase 0 was partially but *inertly* started by #181** — it added a
+  held-out NDCG scaffold and `trainQuality.candidateLabeling`
+  accountability. A good down payment; it does **not** yet constitute
+  the spine.
+
+**Three findings from reviewing #181 that sharpen Phase 0:**
+
+1. **The held-out metric is inert in production (the batch-stamp
+   trap).** #181's `timeSplitGroups` derives the split boundary from
+   candidate `generatedAt`. But training candidates are batch-stamped
+   with a single `maxObservedAt(merged, snapshot)` — positives via
+   `addFeedbackLabelCandidates` and random negatives via
+   `addRandomNegativeCandidates` both take that one value — so a
+   usable group's rows share one timestamp,
+   `Set(generatedAt).size < 2`, `timeSplitGroups` returns `null`, and
+   `heldOutMetric` is silently omitted on every real retrain. It only
+   fires in unit tests that hand-vary timestamps (hence #181's honest
+   test name *"when row timestamps allow it"*). **New hard Phase-0
+   requirement:** the split boundary must derive from a *real
+   per-event/observation* timestamp — the `USER_FLOW_CONFIRMED` event
+   `acceptedAtMs`, or the visit `observedAt` / `firstSeenAt` — never
+   the candidate batch stamp. Correct split logic over the wrong
+   timestamp source is still no spine.
+2. **The pinned negative control (§3 probe 4) must become synthetic.**
+   That probe assumed you can "keep one run of *today's* construction"
+   at 1.0/1.0 as calibration. #181 made that impossible: the leaked v2
+   model is rejected by the v3 gate and the closure-label path returns
+   `[]`, so the leaked pipeline can no longer be run. The calibration
+   moves to a **synthetic leak fixture** in the Phase-0 test suite —
+   re-inject workstream-closure positives + the two workstream
+   features into a test-only dataset and assert the degenerate
+   signature. The control is now a regression test, not a pinned live
+   run.
+3. **`closest_visit` going quiet makes the spine load-bearing, not
+   optional.** #181 correctly collapses positives to genuine
+   `USER_FLOW_CONFIRMED` / snippet feedback; in current dogfood that is
+   plausibly near-zero, so `closest_visit` likely emits ~0 edges (or
+   training throws → `status:'failed'` → no model). "Correctly silent
+   because there is no supervision" and "silently broken" are
+   **indistinguishable without** the novel-pair slice (§3 probe 3)
+   plus the shipped `candidateLabeling`. Phase 0 has moved from good
+   practice to a prerequisite for operating #181 safely.
+
+**Build on the down payment, don't duplicate it.** Phase 0 should:
+(a) reuse `trainQuality.candidateLabeling` as the unlabeled-
+accountability surface (already shipped, already round-trips through
+the manifest); (b) fix the timestamp source so the existing held-out
+scaffold actually fires; (c) add the still-missing probes —
+feature-ablation, label-permutation, novel-pair slice — plus the
+reserved untouched test slice.
+
+**ADR-0004 is now validated in practice:** #181 performed label
+cleaning and added a held-out scaffold **without changing model
+class** — exactly the methodology/model separation ADR-0004 asserts.
+Recommend moving ADR-0004 from *proposed* to *accepted* on the
+strength of #181.
+
+---
+
 ## 1. What the deep-research input got right (adopt it)
 
 The diagnosis plan (PR #179) treated held-out evaluation as remediation
@@ -115,6 +189,10 @@ model:
    control reading. Relabeling is "doing real work" only when probe 3's
    slice becomes non-empty and beats a deterministic baseline on it —
    **not** when in-sample NDCG moves (it can't; it's already 1.0).
+   > **Superseded by §0(2):** post-#181 the leaked pipeline cannot be
+   > run (v2 model rejected, closure path returns `[]`). This control
+   > is now a *synthetic* leak fixture in the Phase-0 test suite, not a
+   > pinned live run.
 
 This resolves the tension: the spine *is* built first (the
 deep-research input's valid point), but its output is interpreted as a
@@ -169,18 +247,24 @@ now, dependency-free:
 
 - **Phase 0 — Build the methodology spine (no label dependency; start
   now).** Per-user forward-chaining time-split harness + reserved
-  untouched test slice + the four §3 probes + pin today's construction
-  as the negative control. Pure-TS, no new deps; mirrors R3's
-  "never fails the drain" persistence contract but as an *evaluator*,
-  not a sidecar.
-- **Phase 1 — Clean labels** (PR #179 §4 steps 1–4: kill
-  workstream-closure positives `retrain.ts:68-107,:824-825`; stop the
-  null-drop `train.ts:193-204,:215-216`; de-leak features
-  `train.ts:100-125`; define the real label from
-  `USER_FLOW_CONFIRMED`/snippet `projection.ts:295,:336`). Each
-  sub-step is *proven* by the Phase 0 probes (novel-pair slice goes
-  empty→populated; ablation flips; permutation starts scoring
-  ≈chance).
+  untouched test slice + the four §3 probes + the negative control.
+  Pure-TS, no new deps; mirrors R3's "never fails the drain"
+  persistence contract but as an *evaluator*, not a sidecar.
+  > **Sharpened by §0(1):** the split boundary must come from a real
+  > per-event/observation timestamp (event `acceptedAtMs` / visit
+  > `observedAt`), never the batch-stamped candidate `generatedAt` —
+  > else the split silently never fires (the #181 trap). Reuse the
+  > shipped `trainQuality.candidateLabeling`; add the missing probes.
+- **Phase 1 — Clean labels — DONE via PR #181 (see §0).** What #181
+  did, against the pre-#181 (v2) anchors: killed workstream-closure
+  positives (`deriveVisitPairLabelsFromSnapshot` → `[]`); made the
+  null-drop explicit/counted instead of silent; removed
+  `same_workstream` / `user_asserted_in_workstream` from
+  `RANKER_FEATURE_KEYS`; defined the real label from
+  `USER_FLOW_CONFIRMED` / snippet. The fix shipped; it is **not yet
+  proven** — that proof is exactly the Phase 0 probes (novel-pair
+  slice goes empty→populated; ablation flips; permutation → ≈chance),
+  which do not exist yet.
 - **Phase 2 — Model choice.** Only now is held-out signal meaningful.
   Deterministic / hand-set log-LR baseline first; graduate to
   regularized LR over existing embedding + behavioral features, then
@@ -230,16 +314,27 @@ methodology/model orthogonality is a decision of record. Proposed,
 A future Phase-0 PR is complete when, with **no change to the ranker
 itself**:
 
-- A per-user forward-chaining time-split + reserved test slice exists
-  and is unit-tested (stationary → reproducible; the split never
+- The time-split boundary is derived from a real per-event/observation
+  timestamp (event `acceptedAtMs` / visit `observedAt`), **not** the
+  batch-stamped candidate `generatedAt`, verified by an assertion that
+  the metric actually fires on a realistic retrain fixture (the #181
+  scaffold does not — §0(1)).
+- A per-user forward-chaining time-split + reserved untouched test
+  slice exists and is unit-tested (stationary → reproducible; never
   trains on the future).
-- The four §3 probes run and are reported alongside in-sample metrics.
-- Run against today's construction it reports the **expected control**:
-  in-sample ≈ held-out ≈ NDCG 1.0, ablation→collapse,
-  permutation→still-high (leak confirmed), novel-pair slice ≈ empty —
-  and the harness *labels this as the degenerate control*, not a pass.
+- The still-missing §3 probes (feature-ablation, label-permutation,
+  novel-pair slice) run and are reported next to the shipped
+  `trainQuality.candidateLabeling`; Phase 0 reuses that surface rather
+  than duplicating it.
+- A **synthetic leak fixture** (re-injected workstream closure +
+  workstream features) is a permanent regression test asserting the
+  degenerate signature (in-sample ≈ held-out ≈ 1.0, ablation→collapse,
+  permutation→still-high). This replaces the old "pin today's
+  construction" control, which #181 made impossible (§0(2)).
 - The evaluator obeys the observability contract (atomic, wrapped,
   cannot fail/delay a drain), like R3.
 
-That known-degenerate baseline is the instrument calibration. Phase 1
-(label cleaning per PR #179) is what it then measures.
+The synthetic-leak fixture is the instrument calibration. #181 already
+performed the label cleaning; Phase 0 is what tells you whether it
+worked — and is the only way to distinguish "correctly silent" from
+"silently broken" now that `closest_visit` may emit nothing (§0(3)).
