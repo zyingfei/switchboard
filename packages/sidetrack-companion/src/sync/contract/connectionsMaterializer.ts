@@ -15,11 +15,14 @@ import {
   logMaterializerDiagnostics,
   type MaterializerDiagnostics,
   type MaterializerDiagnosticsStore,
+  type MaterializerRankerAugmentationCounters,
+  type MaterializerRankerModelFreshness,
 } from '../../connections/materializerDiagnostics.js';
 import {
   buildConnectionsSnapshot,
   type ClosestVisitRanker,
   type ConnectionsInput,
+  type ConnectionsSnapshot,
 } from '../../connections/snapshot.js';
 import type { ConnectionsStore } from '../../connections/snapshot.js';
 import {
@@ -64,7 +67,9 @@ import {
   type EngagementClassRevisionStore,
 } from '../../producers/engagement-class-revision.js';
 import {
+  expectedClosestVisitRankerSchema,
   readActiveClosestVisitRankerRevisionManifest,
+  readActiveClosestVisitRankerRevisionManifestProbe,
   readClosestVisitRankerRevision,
 } from '../../producers/closest-visit-revision.js';
 import {
@@ -80,7 +85,11 @@ import {
   type TopicRevisionStore,
 } from '../../producers/topic-revision.js';
 import { loadRankerModel, predictRanker, type LightGBMModel } from '../../ranker/predict.js';
-import { maybeRetrainClosestVisitRanker, type RankerRetrainer } from '../../ranker/retrain.js';
+import {
+  maybeRetrainClosestVisitRanker,
+  type RankerRetrainer,
+  type RankerRetrainResult,
+} from '../../ranker/retrain.js';
 import {
   readVisitSimilarityRevision,
   writeVisitSimilarityRevision,
@@ -270,6 +279,7 @@ export interface CreateConnectionsMaterializerDeps {
   readonly topicRevisionStore?: TopicRevisionStore;
   readonly engagementClassStore?: EngagementClassRevisionStore;
   readonly rankerRetrainer?: RankerRetrainer;
+  readonly closestVisitRankerLoader?: ClosestVisitRankerLoader;
   readonly diagnosticsStore?: MaterializerDiagnosticsStore;
   readonly diagnosticsLogger?: (diagnostics: MaterializerDiagnostics) => void;
   readonly diagnosticsNow?: () => Date;
@@ -277,10 +287,45 @@ export interface CreateConnectionsMaterializerDeps {
 
 type TopicRevisionBuilder = (input: BuildTopicRevisionInput) => Promise<TopicRevision>;
 
-interface LoadedClosestVisitRanker {
-  readonly ranker: ClosestVisitRanker;
-  readonly model: LightGBMModel;
-}
+type ClosestVisitRankerLoadResult =
+  | {
+      readonly status: 'ready';
+      readonly activeRevisionId: string;
+      readonly ranker: ClosestVisitRanker;
+      readonly model: LightGBMModel;
+      readonly activeModelVersion?: string | null;
+      readonly expectedModelVersion?: string;
+      readonly activeFeatureSchemaVersion?: number | null;
+      readonly expectedFeatureSchemaVersion?: number;
+      readonly needsRetrain?: boolean;
+    }
+  | {
+      readonly status: 'missing';
+      readonly activeRevisionId: null;
+      readonly reason: 'no-active-manifest';
+      readonly activeModelVersion?: string | null;
+      readonly expectedModelVersion?: string;
+      readonly activeFeatureSchemaVersion?: number | null;
+      readonly expectedFeatureSchemaVersion?: number;
+      readonly needsRetrain?: boolean;
+    }
+  | {
+      readonly status: 'invalid';
+      readonly activeRevisionId: string | null;
+      readonly reason:
+        | 'stale-model-schema'
+        | 'invalid-active-manifest'
+        | 'missing-revision'
+        | 'load-failed';
+      readonly error: string | null;
+      readonly activeModelVersion?: string | null;
+      readonly expectedModelVersion?: string;
+      readonly activeFeatureSchemaVersion?: number | null;
+      readonly expectedFeatureSchemaVersion?: number;
+      readonly needsRetrain?: boolean;
+    };
+
+type ClosestVisitRankerLoader = () => Promise<ClosestVisitRankerLoadResult>;
 
 const topicRevisionBuilderFor = (algorithm: TopicAlgorithmVersion): TopicRevisionBuilder => {
   switch (algorithm) {
@@ -577,24 +622,143 @@ export const createConnectionsMaterializer = (
   const maxAcceptedAtMs = (events: readonly AcceptedEvent[]): number =>
     events.reduce((max, event) => Math.max(max, event.acceptedAtMs), 0);
 
-  const loadClosestVisitRanker = async (): Promise<LoadedClosestVisitRanker | null> => {
+  const countClosestVisitEdges = (snapshot: ConnectionsSnapshot): number =>
+    snapshot.edges.filter((edge) => edge.kind === 'closest_visit').length;
+
+  const countRankerSourceEdges = (snapshot: ConnectionsSnapshot): number =>
+    snapshot.edges.filter((edge) => edge.producedBy.source === 'ranker').length;
+
+  const modelFreshnessFor = (
+    result: RankerRetrainResult | null,
+  ): MaterializerRankerModelFreshness => {
+    if (result === null) return 'unknown';
+    if (result.status === 'trained') return 'fresh';
+    if (result.status === 'failed') return 'stale';
+    return result.newLabelCount > 0 ? 'stale' : 'fresh';
+  };
+
+  const rankerAugmentationCounters = (input: {
+    readonly status: MaterializerRankerAugmentationCounters['status'];
+    readonly reason: string | null;
+    readonly activeRevisionId: string | null;
+    readonly activeModelVersion: string | null;
+    readonly expectedModelVersion: string;
+    readonly activeFeatureSchemaVersion: number | null;
+    readonly expectedFeatureSchemaVersion: number;
+    readonly needsRetrain: boolean;
+    readonly modelFreshness: MaterializerRankerModelFreshness;
+    readonly baseSnapshot: ConnectionsSnapshot;
+    readonly finalSnapshot: ConnectionsSnapshot;
+  }): MaterializerRankerAugmentationCounters => ({
+    status: input.status,
+    reason: input.reason,
+    activeRevisionId: input.activeRevisionId,
+    activeModelVersion: input.activeModelVersion,
+    expectedModelVersion: input.expectedModelVersion,
+    activeFeatureSchemaVersion: input.activeFeatureSchemaVersion,
+    expectedFeatureSchemaVersion: input.expectedFeatureSchemaVersion,
+    needsRetrain: input.needsRetrain,
+    modelFreshness: input.modelFreshness,
+    baseEdgeCount: input.baseSnapshot.edges.length,
+    finalEdgeCount: input.finalSnapshot.edges.length,
+    closestVisitEdgeCount: countClosestVisitEdges(input.finalSnapshot),
+    rankerSourceEdgeCount: countRankerSourceEdges(input.finalSnapshot),
+  });
+
+  const schemaDiagnosticsFor = (
+    result: ClosestVisitRankerLoadResult | null,
+  ): Pick<
+    MaterializerRankerAugmentationCounters,
+    | 'activeModelVersion'
+    | 'expectedModelVersion'
+    | 'activeFeatureSchemaVersion'
+    | 'expectedFeatureSchemaVersion'
+    | 'needsRetrain'
+  > => ({
+    activeModelVersion:
+      result?.activeModelVersion ??
+      (result?.status === 'ready' ? expectedClosestVisitRankerSchema.modelVersion : null),
+    expectedModelVersion:
+      result?.expectedModelVersion ?? expectedClosestVisitRankerSchema.modelVersion,
+    activeFeatureSchemaVersion:
+      result?.activeFeatureSchemaVersion ??
+      (result?.status === 'ready' ? expectedClosestVisitRankerSchema.featureSchemaVersion : null),
+    expectedFeatureSchemaVersion:
+      result?.expectedFeatureSchemaVersion ?? expectedClosestVisitRankerSchema.featureSchemaVersion,
+    needsRetrain: result?.needsRetrain ?? false,
+  });
+
+  const loadClosestVisitRanker = async (): Promise<ClosestVisitRankerLoadResult> => {
     const manifest = await readActiveClosestVisitRankerRevisionManifest(deps.vaultRoot);
-    if (manifest === null) return null;
+    if (manifest === null) {
+      const probe = await readActiveClosestVisitRankerRevisionManifestProbe(deps.vaultRoot);
+      if (probe !== null) {
+        return {
+          status: 'invalid',
+          activeRevisionId: probe.revisionId,
+          reason: probe.staleModelSchema ? 'stale-model-schema' : 'invalid-active-manifest',
+          error: null,
+          activeModelVersion: probe.activeModelVersion,
+          expectedModelVersion: probe.expectedModelVersion,
+          activeFeatureSchemaVersion: probe.activeFeatureSchemaVersion,
+          expectedFeatureSchemaVersion: probe.expectedFeatureSchemaVersion,
+          needsRetrain: probe.staleModelSchema,
+        };
+      }
+      return {
+        status: 'missing',
+        activeRevisionId: null,
+        reason: 'no-active-manifest',
+        needsRetrain: false,
+      };
+    }
     const revision = await readClosestVisitRankerRevision(deps.vaultRoot, manifest.revisionId);
-    if (revision === null) return null;
+    if (revision === null) {
+      return {
+        status: 'invalid',
+        activeRevisionId: manifest.revisionId,
+        reason: 'missing-revision',
+        error: null,
+        activeModelVersion: manifest.modelVersion,
+        expectedModelVersion: expectedClosestVisitRankerSchema.modelVersion,
+        activeFeatureSchemaVersion: manifest.featureSchemaVersion,
+        expectedFeatureSchemaVersion: expectedClosestVisitRankerSchema.featureSchemaVersion,
+        needsRetrain: false,
+      };
+    }
     try {
       const model = await loadRankerModel(revision);
       return {
+        status: 'ready',
+        activeRevisionId: manifest.revisionId,
         model,
+        activeModelVersion: manifest.modelVersion,
+        expectedModelVersion: expectedClosestVisitRankerSchema.modelVersion,
+        activeFeatureSchemaVersion: manifest.featureSchemaVersion,
+        expectedFeatureSchemaVersion: expectedClosestVisitRankerSchema.featureSchemaVersion,
+        needsRetrain: false,
         ranker: {
           revisionId: model.revisionId,
           predict: (features) => predictRanker(features, model),
         },
       };
-    } catch {
-      return null;
+    } catch (err) {
+      return {
+        status: 'invalid',
+        activeRevisionId: manifest.revisionId,
+        reason: 'load-failed',
+        error: err instanceof Error ? err.message : String(err),
+        activeModelVersion: manifest.modelVersion,
+        expectedModelVersion: expectedClosestVisitRankerSchema.modelVersion,
+        activeFeatureSchemaVersion: manifest.featureSchemaVersion,
+        expectedFeatureSchemaVersion: expectedClosestVisitRankerSchema.featureSchemaVersion,
+        needsRetrain: false,
+      };
     }
   };
+  const closestVisitRankerLoader =
+    deps.closestVisitRankerLoader ??
+    ((): Promise<ClosestVisitRankerLoadResult> => loadClosestVisitRanker());
 
   // Stage 5.2 W1b — cooperative yielding. Each major sync-CPU phase
   // is preceded by `yieldToEventLoop()` so HTTP request handlers and
@@ -614,7 +778,6 @@ export const createConnectionsMaterializer = (
     const mark = (label: string): void => {
       if (!phaseLogs) return;
       const now = Date.now();
-      // eslint-disable-next-line no-console
       console.warn(
         `[connections-phase] ${label} dt=${String(now - phaseLast)}ms total=${String(now - phaseStart)}ms`,
       );
@@ -728,14 +891,14 @@ export const createConnectionsMaterializer = (
         try {
           const embedded = await (deps.embed ?? defaultEmbed)(texts);
           for (let i = 0; i < newEntries.length; i += 1) {
+            const entry = newEntries[i];
             const embedding = embedded[i];
-            if (embedding !== undefined) {
-              embeddingsByVisitKey.set(visitKeyForVisitEntry(newEntries[i]!), embedding);
+            if (entry !== undefined && embedding !== undefined) {
+              embeddingsByVisitKey.set(visitKeyForVisitEntry(entry), embedding);
             }
           }
         } catch (error) {
           // Fast-path embed failure: log + fall back to legacy path.
-          // eslint-disable-next-line no-console
           console.warn(
             `[connections] W3 fast-path embed failed; falling back: ${
               error instanceof Error ? error.message : String(error)
@@ -748,17 +911,15 @@ export const createConnectionsMaterializer = (
           );
         }
       }
-      if (visitSimilarity === undefined) {
-        visitSimilarity = buildVisitSimilarityIncremental({
-          index: incrementalSimilarityIndex,
-          entries: similarityEntries,
-          embeddingsByVisitKey,
-          options: {
-            threshold: VISIT_SIMILARITY_DEFAULT_THRESHOLD,
-            topK: VISIT_SIMILARITY_DEFAULT_TOP_K,
-          },
-        });
-      }
+      visitSimilarity ??= buildVisitSimilarityIncremental({
+        index: incrementalSimilarityIndex,
+        entries: similarityEntries,
+        embeddingsByVisitKey,
+        options: {
+          threshold: VISIT_SIMILARITY_DEFAULT_THRESHOLD,
+          topK: VISIT_SIMILARITY_DEFAULT_TOP_K,
+        },
+      });
       mark(
         `buildVisitSimilarityIncremental newEmbedded=${String(newEntries.length)} indexSize=${String(incrementalSimilarityIndex.size())}`,
       );
@@ -827,8 +988,8 @@ export const createConnectionsMaterializer = (
         canonicalUrl,
         ...(typeof entry.title === 'string' ? { title: entry.title } : {}),
         focusedWindowMs: 60_000, // sentinel — accumulator doesn't gate, builder does
-        firstObservedAt: entry.firstSeenAt ?? entry.lastSeenAt ?? '1970-01-01T00:00:00.000Z',
-        lastObservedAt: entry.lastSeenAt ?? entry.firstSeenAt ?? '1970-01-01T00:00:00.000Z',
+        firstObservedAt: entry.firstSeenAt,
+        lastObservedAt: entry.lastSeenAt,
       });
     }
     const topicCosineThreshold = resolveTopicCosineThreshold();
@@ -972,15 +1133,26 @@ export const createConnectionsMaterializer = (
     // ranker-augmented form when it was produced, the base form when
     // the ranker pass was skipped.
     let finalSnapshot = baseSnapshot;
-    let closestVisitRanker: Awaited<ReturnType<typeof loadClosestVisitRanker>> | null = null;
+    let closestVisitRanker: ClosestVisitRankerLoadResult | null = null;
+    let rankerAugmentation = rankerAugmentationCounters({
+      status: 'not-run',
+      reason: null,
+      activeRevisionId: null,
+      ...schemaDiagnosticsFor(null),
+      modelFreshness: 'unknown',
+      baseSnapshot,
+      finalSnapshot,
+    });
     try {
       // Stage 5.2 W3b/c — gate the ranker-augmented build behind
       // SIDETRACK_SKIP_RANKER_SNAPSHOT for HTTP-latency-sensitive
       // consumers (recorder).
       if (process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'] !== '1') {
-        closestVisitRanker = await loadClosestVisitRanker();
-        mark(`loadClosestVisitRanker ranker=${String(closestVisitRanker !== null)}`);
-        if (closestVisitRanker !== null) {
+        closestVisitRanker = await closestVisitRankerLoader();
+        mark(
+          `loadClosestVisitRanker status=${closestVisitRanker.status} revision=${closestVisitRanker.activeRevisionId ?? 'none'}`,
+        );
+        if (closestVisitRanker.status === 'ready') {
           await yieldToEventLoop();
           finalSnapshot = buildConnectionsSnapshot({
             ...input,
@@ -991,12 +1163,44 @@ export const createConnectionsMaterializer = (
           );
           await deps.store.putCurrent(finalSnapshot);
           mark('putCurrent ranker-augmented');
+          rankerAugmentation = rankerAugmentationCounters({
+            status: 'emitted',
+            reason: null,
+            activeRevisionId: closestVisitRanker.activeRevisionId,
+            ...schemaDiagnosticsFor(closestVisitRanker),
+            modelFreshness: modelFreshnessFor(rankerRetrainResult),
+            baseSnapshot,
+            finalSnapshot,
+          });
+        } else {
+          const reason =
+            closestVisitRanker.status === 'missing'
+              ? closestVisitRanker.reason
+              : `${closestVisitRanker.reason}${closestVisitRanker.error === null ? '' : `:${closestVisitRanker.error}`}`;
+          rankerAugmentation = rankerAugmentationCounters({
+            status: 'absent',
+            reason,
+            activeRevisionId: closestVisitRanker.activeRevisionId,
+            ...schemaDiagnosticsFor(closestVisitRanker),
+            modelFreshness: null,
+            baseSnapshot,
+            finalSnapshot,
+          });
         }
       } else {
         mark('ranker-augmented skipped (SIDETRACK_SKIP_RANKER_SNAPSHOT=1)');
+        rankerAugmentation = rankerAugmentationCounters({
+          status: 'skipped',
+          reason: 'SIDETRACK_SKIP_RANKER_SNAPSHOT=1',
+          activeRevisionId: null,
+          ...schemaDiagnosticsFor(null),
+          modelFreshness: 'unknown',
+          baseSnapshot,
+          finalSnapshot,
+        });
       }
     } finally {
-      closestVisitRanker?.model.dispose();
+      if (closestVisitRanker?.status === 'ready') closestVisitRanker.model.dispose();
     }
     // PR #141 — write the diagnostics artifact after publishing. Uses
     // `finalSnapshot` so the artifact reflects whichever snapshot the
@@ -1013,6 +1217,7 @@ export const createConnectionsMaterializer = (
       events: merged,
       urlProjection,
       snapshot: finalSnapshot,
+      rankerAugmentation,
       ...(topicShadowDiagnostics === null ? {} : { topicShadowDiagnostics }),
       ...(topicShadowObservation === null ? {} : { topicShadowObservation }),
     });
@@ -1035,7 +1240,6 @@ export const createConnectionsMaterializer = (
     } catch (err) {
       // Diagnostics is observability — never fail the drain on its IO.
       const message = err instanceof Error ? err.message : String(err);
-      // eslint-disable-next-line no-console
       console.warn(`[materializer-diag] write failed: ${message}`);
     }
     diagnosticsLogger(diagnosticsWithDrift);

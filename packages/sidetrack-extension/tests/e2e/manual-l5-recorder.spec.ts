@@ -17,6 +17,7 @@
 //   SIDETRACK_USER_DATA_DIR=~/.sidetrack-test-profile  (browser profile — sticky)
 //   SIDETRACK_VAULT_DIR=~/.sidetrack-vault             (companion vault — sticky)
 //   SIDETRACK_VAULT_FRESH=1                            (archive + restart fresh)
+//   SIDETRACK_RECORDER_SKIP_RANKER_SNAPSHOT=1          (latency debug opt-out)
 // The legacy SIDETRACK_MANUAL_L5_VAULT_DIR is still honoured for back-compat.
 
 import { execSync } from 'node:child_process';
@@ -808,14 +809,17 @@ test.describe('manual full-browser recorder', () => {
         vaultEnvOverride !== undefined && vaultEnvOverride.length > 0
           ? expandTilde(vaultEnvOverride)
           : await resolveVaultRoot('~/.sidetrack-vault');
+      const skipRankerSnapshot = process.env.SIDETRACK_RECORDER_SKIP_RANKER_SNAPSHOT === '1';
       companionA = await startTestCompanion({
         syncRelay: relay.url,
         syncRendezvousSecret: secret,
         vaultDir: persistentVaultRoot,
+        skipRankerSnapshot,
       });
       companionB = await startTestCompanion({
         syncRelay: relay.url,
         syncRendezvousSecret: secret,
+        skipRankerSnapshot,
       });
 
       // Stealth experiment uses a Sidetrack-owned dir (resolved inside

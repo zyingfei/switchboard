@@ -1,5 +1,10 @@
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+
 import {
+  expectedClosestVisitRankerSchema,
   readActiveClosestVisitRankerRevisionManifest,
+  readActiveClosestVisitRankerRevisionManifestProbe,
   readClosestVisitRankerRevision,
 } from '../producers/closest-visit-revision.js';
 import { createTopicRevisionStore } from '../producers/topic-revision.js';
@@ -18,6 +23,11 @@ export interface WorkGraphHealthReport {
   readonly ranker: {
     readonly activeRevisionId: string | null;
     readonly loadStatus: 'missing' | 'ready' | 'invalid-model';
+    readonly activeModelVersion: string | null;
+    readonly expectedModelVersion: string;
+    readonly activeFeatureSchemaVersion: number | null;
+    readonly expectedFeatureSchemaVersion: number;
+    readonly needsRetrain: boolean;
     readonly trainedAt: number | null;
     readonly trainingDatasetHash: string | null;
     readonly retrainSkipReason: RankerRetrainSkipReason | null;
@@ -40,6 +50,20 @@ export interface WorkGraphHealthReport {
     // True when the current feedback fingerprint differs from what the
     // active model was trained on — "data changed, model is behind".
     readonly datasetChangedSinceTrain: boolean;
+    readonly augmentation: {
+      readonly status: string;
+      readonly reason: string | null;
+      readonly activeRevisionId: string | null;
+      readonly activeModelVersion: string | null;
+      readonly expectedModelVersion: string;
+      readonly activeFeatureSchemaVersion: number | null;
+      readonly expectedFeatureSchemaVersion: number;
+      readonly needsRetrain: boolean;
+      readonly modelFreshness: string | null;
+      readonly closestVisitEdgeCount: number;
+      readonly rankerSourceEdgeCount: number;
+      readonly asOf: string | null;
+    } | null;
   };
   readonly ann: {
     readonly backend: 'hnsw' | 'flat';
@@ -81,6 +105,54 @@ const annStatus = async (): Promise<WorkGraphHealthReport['ann']> => {
   }
 };
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const stringOrNull = (value: unknown): string | null => (typeof value === 'string' ? value : null);
+
+const numberOrZero = (value: unknown): number =>
+  typeof value === 'number' && Number.isFinite(value) ? value : 0;
+
+const numberOrNull = (value: unknown): number | null =>
+  typeof value === 'number' && Number.isFinite(value) ? value : null;
+
+const booleanOrFalse = (value: unknown): boolean => (typeof value === 'boolean' ? value : false);
+
+const readRankerAugmentationStatus = async (
+  vaultRoot: string,
+): Promise<WorkGraphHealthReport['ranker']['augmentation']> => {
+  try {
+    const raw = await readFile(
+      join(vaultRoot, '_BAC', 'connections', 'diagnostics', 'latest.json'),
+      'utf8',
+    );
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed)) return null;
+    const rankerAugmentation = parsed['rankerAugmentation'];
+    if (!isRecord(rankerAugmentation)) return null;
+    return {
+      status: stringOrNull(rankerAugmentation['status']) ?? 'unknown',
+      reason: stringOrNull(rankerAugmentation['reason']),
+      activeRevisionId: stringOrNull(rankerAugmentation['activeRevisionId']),
+      activeModelVersion: stringOrNull(rankerAugmentation['activeModelVersion']),
+      expectedModelVersion:
+        stringOrNull(rankerAugmentation['expectedModelVersion']) ??
+        expectedClosestVisitRankerSchema.modelVersion,
+      activeFeatureSchemaVersion: numberOrNull(rankerAugmentation['activeFeatureSchemaVersion']),
+      expectedFeatureSchemaVersion:
+        numberOrNull(rankerAugmentation['expectedFeatureSchemaVersion']) ??
+        expectedClosestVisitRankerSchema.featureSchemaVersion,
+      needsRetrain: booleanOrFalse(rankerAugmentation['needsRetrain']),
+      modelFreshness: stringOrNull(rankerAugmentation['modelFreshness']),
+      closestVisitEdgeCount: numberOrZero(rankerAugmentation['closestVisitEdgeCount']),
+      rankerSourceEdgeCount: numberOrZero(rankerAugmentation['rankerSourceEdgeCount']),
+      asOf: stringOrNull(parsed['producedAt']),
+    };
+  } catch {
+    return null;
+  }
+};
+
 export const collectWorkGraphHealth = async ({
   vaultRoot,
   eventLog,
@@ -88,12 +160,15 @@ export const collectWorkGraphHealth = async ({
   const merged = eventLog === undefined ? emptyEvents : await eventLog.readMerged();
   const feedback = projectFeedback(merged);
   const fingerprint = fingerprintFeedbackTrainingLabels(feedback);
-  const [activeManifest, retrainState, ann, topicRevision] = await Promise.all([
-    readActiveClosestVisitRankerRevisionManifest(vaultRoot),
-    readRankerRetrainState(vaultRoot),
-    annStatus(),
-    createTopicRevisionStore(vaultRoot).readActiveRevision(),
-  ]);
+  const [activeManifest, activeManifestProbe, retrainState, ann, topicRevision, augmentation] =
+    await Promise.all([
+      readActiveClosestVisitRankerRevisionManifest(vaultRoot),
+      readActiveClosestVisitRankerRevisionManifestProbe(vaultRoot),
+      readRankerRetrainState(vaultRoot),
+      annStatus(),
+      createTopicRevisionStore(vaultRoot).readActiveRevision(),
+      readRankerAugmentationStatus(vaultRoot),
+    ]);
   const activeRevision =
     activeManifest === null
       ? null
@@ -118,15 +193,34 @@ export const collectWorkGraphHealth = async ({
     retrainState !== null && retrainState.lastTrainedLabelDatasetHash !== fingerprint.hash;
   return {
     ranker: {
-      activeRevisionId: activeManifest?.revisionId ?? null,
+      activeRevisionId: activeManifest?.revisionId ?? activeManifestProbe?.revisionId ?? null,
       loadStatus:
-        activeManifest === null ? 'missing' : activeRevision === null ? 'invalid-model' : 'ready',
+        activeManifest === null
+          ? activeManifestProbe === null
+            ? 'missing'
+            : 'invalid-model'
+          : activeRevision === null
+            ? 'invalid-model'
+            : 'ready',
+      activeModelVersion:
+        activeManifestProbe?.activeModelVersion ?? activeManifest?.modelVersion ?? null,
+      expectedModelVersion:
+        activeManifestProbe?.expectedModelVersion ?? expectedClosestVisitRankerSchema.modelVersion,
+      activeFeatureSchemaVersion:
+        activeManifestProbe?.activeFeatureSchemaVersion ??
+        activeManifest?.featureSchemaVersion ??
+        null,
+      expectedFeatureSchemaVersion:
+        activeManifestProbe?.expectedFeatureSchemaVersion ??
+        expectedClosestVisitRankerSchema.featureSchemaVersion,
+      needsRetrain: activeManifestProbe?.staleModelSchema ?? false,
       trainedAt: activeManifest?.trainedAt ?? null,
       trainingDatasetHash: activeManifest?.trainingDatasetHash ?? null,
       retrainSkipReason: retrainPlan.action === 'skip' ? retrainPlan.reason : null,
       retrainNewLabelCount: retrainPlan.newLabelCount,
       trainingMix,
       datasetChangedSinceTrain,
+      augmentation,
     },
     ann,
     feedback: {
