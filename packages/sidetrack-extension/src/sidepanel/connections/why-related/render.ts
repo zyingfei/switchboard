@@ -7,6 +7,11 @@ export const renderReason = (reason: Reason): string => {
     case 'SAME_TOPIC':
       return `Same topic (cohesion ${reason.cohesion.toFixed(2)})`;
     case 'COSINE_ABOVE_THRESHOLD':
+      if (reason.matchCount !== undefined && reason.matchCount > 1) {
+        return `Title similarity up to ${reason.cosine.toFixed(2)} across ${String(
+          reason.matchCount,
+        )} pages (threshold ${reason.threshold.toFixed(2)})`;
+      }
       return `Title similarity ${reason.cosine.toFixed(2)} >= ${reason.threshold.toFixed(2)}`;
     case 'OPENER_CHAIN':
       return `Opened from another visit (${String(reason.depth)} hop${

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { AcceptedEvent } from './causal.js';
 import type { EventLog } from './eventLog.js';
 import type { ProjectionChangeFeed } from './projectionChanges.js';
-import { runImportProjectors } from './projectors.js';
+import { runImportProjectorsFromEvents } from './projectors.js';
 
 // Bumped whenever a projector's output shape changes (new field,
 // renamed field, fixed bug that altered the projection content). The
@@ -63,6 +63,24 @@ const latestPerAggregate = (events: readonly AcceptedEvent[]): readonly Accepted
   return [...byId.values()];
 };
 
+const eventsByAggregate = (
+  events: readonly AcceptedEvent[],
+): ReadonlyMap<string, readonly AcceptedEvent[]> => {
+  const byId = new Map<string, AcceptedEvent[]>();
+  for (const event of events) {
+    const list = byId.get(event.aggregateId) ?? [];
+    list.push(event);
+    byId.set(event.aggregateId, list);
+  }
+  return byId;
+};
+
+const yieldToEventLoop = async (): Promise<void> => {
+  await new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+};
+
 export interface ReprojectOnVersionMismatchDeps {
   readonly vaultRoot: string;
   readonly eventLog: EventLog;
@@ -93,9 +111,12 @@ export const reprojectOnVersionMismatch = async (
     };
   }
   const merged = await deps.eventLog.readMerged();
+  const byAggregate = eventsByAggregate(merged);
   const latest = latestPerAggregate(merged);
-  for (const event of latest) {
-    await runImportProjectors(
+  for (let index = 0; index < latest.length; index += 1) {
+    const event = latest[index];
+    if (event === undefined) continue;
+    await runImportProjectorsFromEvents(
       {
         vaultRoot: deps.vaultRoot,
         eventLog: deps.eventLog,
@@ -104,7 +125,11 @@ export const reprojectOnVersionMismatch = async (
           : { projectionChanges: deps.projectionChanges }),
       },
       event,
+      byAggregate.get(event.aggregateId) ?? [],
     ).catch(() => undefined);
+    if ((index + 1) % 100 === 0) {
+      await yieldToEventLoop();
+    }
   }
   await writeVersionFile(deps.vaultRoot, PROJECTOR_VERSION);
   return {

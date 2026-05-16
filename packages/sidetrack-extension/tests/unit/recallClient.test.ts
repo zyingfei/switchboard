@@ -60,4 +60,44 @@ describe('RecallClient', () => {
     const body = JSON.parse(rawBody) as { items: readonly unknown[] };
     expect(body.items).toHaveLength(1);
   });
+
+  it('query preserves stable bac_id and human metadata from recall results', async () => {
+    const fetchMock = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            data: [
+              {
+                id: 'chunk:provider-thread:0:0:abc',
+                threadId: '69fcb926-3a98-8328-bbe4-baee4da7fbef',
+                bacId: 'QMPG4BZ0SQC1HMJ0',
+                capturedAt: '2026-05-14T05:04:59.674Z',
+                score: 0.42,
+                title: 'Switchboard - Correctness audit findings',
+                provider: 'chatgpt',
+                threadUrl: 'https://chatgpt.com/c/69fcb926-3a98-8328-bbe4-baee4da7fbef',
+                snippet: 'relevant remembered text',
+              },
+            ],
+          }),
+      }),
+    ) as unknown as typeof fetch;
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createRecallClient(settings);
+    await expect(client.query('correctness audit')).resolves.toEqual([
+      {
+        id: 'chunk:provider-thread:0:0:abc',
+        threadId: '69fcb926-3a98-8328-bbe4-baee4da7fbef',
+        bacId: 'QMPG4BZ0SQC1HMJ0',
+        capturedAt: '2026-05-14T05:04:59.674Z',
+        score: 0.42,
+        title: 'Switchboard - Correctness audit findings',
+        provider: 'chatgpt',
+        threadUrl: 'https://chatgpt.com/c/69fcb926-3a98-8328-bbe4-baee4da7fbef',
+        snippet: 'relevant remembered text',
+      },
+    ]);
+  });
 });

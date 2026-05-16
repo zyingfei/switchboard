@@ -5,10 +5,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { ENGAGEMENT_SESSION_AGGREGATED } from '../engagement/events.js';
-import {
-  USER_ORGANIZED_ITEM,
-  type UserOrganizedItemPayload,
-} from '../feedback/events.js';
+import { USER_ORGANIZED_ITEM, type UserOrganizedItemPayload } from '../feedback/events.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../tabsession/events.js';
 import type { RankerRetrainResult } from '../ranker/retrain.js';
 import type { AcceptedEvent } from '../sync/causal.js';
@@ -68,10 +65,7 @@ const projection = (records: readonly UrlVisitRecord[]): UrlProjection => ({
   byCanonicalUrl: new Map(records.map((r) => [r.canonicalUrl, r])),
 });
 
-const url = (
-  canonicalUrl: string,
-  overrides: Partial<UrlVisitRecord> = {},
-): UrlVisitRecord => ({
+const url = (canonicalUrl: string, overrides: Partial<UrlVisitRecord> = {}): UrlVisitRecord => ({
   canonicalUrl,
   firstSeenAt: TIMESTAMP,
   lastSeenAt: TIMESTAMP,
@@ -144,7 +138,9 @@ const emptyTopicRevision = () => ({
   producedAt: ACCEPTED_AT_MS,
 });
 
-const baseInput = (overrides: Partial<MaterializerDiagnosticsInput> = {}): MaterializerDiagnosticsInput => ({
+const baseInput = (
+  overrides: Partial<MaterializerDiagnosticsInput> = {},
+): MaterializerDiagnosticsInput => ({
   producedAt: TIMESTAMP,
   maxAcceptedAtMs: ACCEPTED_AT_MS,
   engagementGateMs: 5_000,
@@ -393,11 +389,7 @@ describe('collectMaterializerDiagnostics', () => {
       });
     const diag = collectMaterializerDiagnostics(
       baseInput({
-        events: [
-          engagementEvent(1_200, 1),
-          engagementEvent(5_500, 2),
-          engagementEvent(0, 3),
-        ],
+        events: [engagementEvent(1_200, 1), engagementEvent(5_500, 2), engagementEvent(0, 3)],
       }),
     );
     expect(diag.engagement).toEqual({

@@ -46,6 +46,8 @@ const projection = (
 ): FeedbackProjection => ({
   schemaVersion: 1,
   perItem: {},
+  containerByItem: {},
+  organizedItemsByContainer: {},
   positiveLabels,
   negativeLabels,
 });

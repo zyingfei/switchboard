@@ -351,6 +351,27 @@ export const startCompanion = async (
       onLocalAccepted(accepted);
       return accepted;
     },
+    appendClientObservedBatch: async <T extends Record<string, unknown>>(
+      inputs: readonly Parameters<typeof baseEventLog.appendClientObserved<T>>[0][],
+    ) => {
+      const batch = await baseEventLog.appendClientObservedBatch?.(inputs);
+      if (batch === undefined) {
+        const results: {
+          readonly event: Awaited<ReturnType<typeof baseEventLog.appendClientObserved<T>>>;
+          readonly appended: boolean;
+        }[] = [];
+        for (const input of inputs) {
+          const event = await baseEventLog.appendClientObserved(input);
+          results.push({ event, appended: true });
+        }
+        for (const result of results) onLocalAccepted(result.event);
+        return results;
+      }
+      for (const result of batch) {
+        if (result.appended) onLocalAccepted(result.event);
+      }
+      return batch;
+    },
     appendServerObserved: async <T extends Record<string, unknown>>(
       input: Parameters<typeof baseEventLog.appendServerObserved<T>>[0],
     ) => {
@@ -359,6 +380,13 @@ export const startCompanion = async (
       return accepted;
     },
   };
+  // Event-loop stall monitor. Start it before any background catch-up
+  // work so startup stalls are visible in /v1/status and runtime logs.
+  const eventLoopMonitor = startEventLoopMonitor();
+  teardown.push(() => {
+    eventLoopMonitor.stop();
+  });
+
   // Recall indexer client — runs full rebuilds in a separate OS
   // process so the main thread is never pinned by the recall
   // pipeline (read merged log + project + scan legacy JSONL +
@@ -381,6 +409,33 @@ export const startCompanion = async (
       await indexerClient.stop();
     });
   }
+  // Embedder sidecar — owns ONNX + transformers.js in a child process
+  // so the main thread isn't blocked by inference. Install the global
+  // override before recall lifecycle/materializer catch-up starts; the
+  // startup catch-up path can invoke incremental ingest and visit
+  // similarity embedding.
+  const inProcessEmbedder = !useChildProcesses;
+  const embedderClient = inProcessEmbedder ? null : createEmbedderClient();
+  if (embedderClient !== null) {
+    teardown.push(async () => {
+      await embedderClient.stop();
+    });
+    const { setEmbedderOverride } = await import('../recall/embedder.js');
+    setEmbedderOverride(embedderClient.embed);
+  }
+  const getEmbedderStatus = (): {
+    readonly state: 'disabled' | 'cold' | 'warming' | 'ready' | 'failed';
+    readonly lastError?: string;
+  } => {
+    if (embedderClient === null) {
+      return { state: 'disabled' };
+    }
+    const err = embedderClient.lastError();
+    return {
+      state: embedderClient.state(),
+      ...(err === undefined ? {} : { lastError: err }),
+    };
+  };
   const recallLifecycle = createRecallLifecycle({
     vaultRoot: options.vaultPath,
     companionVersion: COMPANION_VERSION,
@@ -581,52 +636,26 @@ export const startCompanion = async (
     } catch {
       // Errors are non-fatal — the manual `recall reingest` CLI
       // verb + lifecycle stale-check rebuilds remain available.
+    } finally {
+      if (embedderClient !== null) {
+        void embedderClient.embed(['sidetrack warmup']).catch(() => undefined);
+      }
     }
   })();
-  // Event-loop stall monitor. Spans the entire process lifetime so
-  // /v1/status can report `eventLoop.maxRecentStallMs` etc. independent
-  // of whether the materializer or recall lifecycle is doing work.
-  // Any synchronous-CPU phase that pins the main thread for >250 ms
-  // prints `[api.stall] eventLoopBlockedMs=… note=…` so the operator
-  // can locate the blocking phase without re-running with profilers.
-  const eventLoopMonitor = startEventLoopMonitor();
-  teardown.push(() => {
-    eventLoopMonitor.stop();
-  });
-
-  // Embedder sidecar — owns ONNX + transformers.js in a child process
-  // so the main thread isn't blocked by inference. Opt-out with
-  // SIDETRACK_EMBEDDER_INPROCESS=1 if a caller (test harness, special
-  // diagnostic) wants the legacy in-process path. The test embedder
-  // env (SIDETRACK_TEST_EMBEDDER=1) ALWAYS routes in-process — the
-  // deterministic test embedder is sync and the child overhead is
-  // pure waste.
-  const inProcessEmbedder = !useChildProcesses;
-  const embedderClient = inProcessEmbedder ? null : createEmbedderClient();
-  if (embedderClient !== null) {
-    teardown.push(async () => {
-      await embedderClient.stop();
-    });
-    // Install the sidecar as the global embed implementation so all
-    // call sites (recall rebuild, recall ingestor, visit similarity)
-    // dispatch through the child process automatically. The override
-    // is module-scoped in `recall/embedder.ts`.
-    const { setEmbedderOverride } = await import('../recall/embedder.js');
-    setEmbedderOverride(embedderClient.embed);
-  }
-  const getEmbedderStatus = (): {
-    readonly state: 'disabled' | 'cold' | 'warming' | 'ready' | 'failed';
-    readonly lastError?: string;
-  } => {
-    if (embedderClient === null) {
-      return { state: 'disabled' };
-    }
-    const err = embedderClient.lastError();
-    return {
-      state: embedderClient.state(),
-      ...(err === undefined ? {} : { lastError: err }),
-    };
+  const importEdgeEvents = async (
+    events: readonly AcceptedEvent[],
+  ): Promise<readonly { readonly imported: boolean }[]> => {
+    const inputs = events.map((event) => ({
+      clientEventId: event.clientEventId,
+      aggregateId: event.aggregateId,
+      type: event.type,
+      payload: event.payload as Record<string, unknown>,
+      baseVector: {},
+    }));
+    const results = await eventLog.appendClientObservedBatch(inputs);
+    return results.map((result) => ({ imported: result.appended }));
   };
+
   const server = createCompanionHttpServer({
     bridgeKey: ensured.key,
     vaultWriter,
@@ -682,19 +711,10 @@ export const startCompanion = async (
     // replica id, which IS what the relay subscription is bound to,
     // so peer companions correctly receive the event.
     importEdgeEvent: async (event) => {
-      const existing = await baseEventLog.findByClientEventId(event.clientEventId);
-      if (existing !== null) {
-        return { imported: false };
-      }
-      await eventLog.appendClientObserved({
-        clientEventId: event.clientEventId,
-        aggregateId: event.aggregateId,
-        type: event.type,
-        payload: event.payload as Record<string, unknown>,
-        baseVector: {},
-      });
-      return { imported: true };
+      const [result] = await importEdgeEvents([event]);
+      return result ?? { imported: false };
     },
+    importEdgeEvents,
     timelineStore,
     connectionsStore,
     refreshConnections: async () => {

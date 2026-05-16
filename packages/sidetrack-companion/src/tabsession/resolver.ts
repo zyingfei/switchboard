@@ -30,6 +30,87 @@ const VISIT_INSTANCE_PREFIX = 'visit-instance:';
 const WORKSTREAM_PREFIX = 'workstream:';
 const MODEL_REVISION = 'tabsession-resolver-v1';
 const pprCache = createPprCache();
+type EvidenceGraph = ReturnType<typeof buildEvidenceGraph>;
+const evidenceGraphCache = new WeakMap<ConnectionsSnapshot, EvidenceGraph>();
+const tabResolutionCache = new WeakMap<
+  ConnectionsSnapshot,
+  WeakMap<readonly AcceptedEvent[], Map<string, ResolutionResult>>
+>();
+const urlResolutionCache = new WeakMap<
+  ConnectionsSnapshot,
+  WeakMap<readonly AcceptedEvent[], Map<string, UrlResolutionResult>>
+>();
+
+const evidenceForSnapshot = (snapshot: ConnectionsSnapshot): EvidenceGraph => {
+  const cached = evidenceGraphCache.get(snapshot);
+  if (cached !== undefined) return cached;
+  const evidence = buildEvidenceGraph(snapshot);
+  evidenceGraphCache.set(snapshot, evidence);
+  return evidence;
+};
+
+const canUseResolutionCache = (input: {
+  readonly policyTelemetry?: AttributionPolicyTelemetry;
+  readonly closestVisitRanker?: ClosestVisitRanker;
+  readonly nowMs?: number;
+}): boolean =>
+  input.policyTelemetry === undefined &&
+  input.closestVisitRanker === undefined &&
+  input.nowMs === undefined;
+
+const cachedTabResolution = (
+  input: ResolveAttributionInput,
+  key: string,
+): ResolutionResult | undefined => {
+  if (!canUseResolutionCache(input)) return undefined;
+  return tabResolutionCache.get(input.snapshot)?.get(input.events)?.get(key);
+};
+
+const cacheTabResolution = (
+  input: ResolveAttributionInput,
+  key: string,
+  result: ResolutionResult,
+): void => {
+  if (!canUseResolutionCache(input)) return;
+  let byEvents = tabResolutionCache.get(input.snapshot);
+  if (byEvents === undefined) {
+    byEvents = new WeakMap<readonly AcceptedEvent[], Map<string, ResolutionResult>>();
+    tabResolutionCache.set(input.snapshot, byEvents);
+  }
+  let byKey = byEvents.get(input.events);
+  if (byKey === undefined) {
+    byKey = new Map<string, ResolutionResult>();
+    byEvents.set(input.events, byKey);
+  }
+  byKey.set(key, result);
+};
+
+const cachedUrlResolution = (
+  input: ResolveUrlAttributionInput,
+  key: string,
+): UrlResolutionResult | undefined => {
+  if (!canUseResolutionCache(input)) return undefined;
+  return urlResolutionCache.get(input.snapshot)?.get(input.events)?.get(key);
+};
+
+const cacheUrlResolution = (
+  input: ResolveUrlAttributionInput,
+  key: string,
+  result: UrlResolutionResult,
+): void => {
+  if (!canUseResolutionCache(input)) return;
+  let byEvents = urlResolutionCache.get(input.snapshot);
+  if (byEvents === undefined) {
+    byEvents = new WeakMap<readonly AcceptedEvent[], Map<string, UrlResolutionResult>>();
+    urlResolutionCache.set(input.snapshot, byEvents);
+  }
+  let byKey = byEvents.get(input.events);
+  if (byKey === undefined) {
+    byKey = new Map<string, UrlResolutionResult>();
+    byEvents.set(input.events, byKey);
+  }
+  byKey.set(key, result);
+};
 
 // Enriched anchor — the resolver now ships kind + best-effort label
 // alongside the raw node id so the extension's AttributionProvenance
@@ -304,10 +385,18 @@ export const resolveUrlAttribution = (
   input: ResolveUrlAttributionInput,
 ): UrlResolutionResult => {
   const mode = input.policyMode ?? 'balanced';
-  const evidence = buildEvidenceGraph(input.snapshot);
+  const resultCacheKey = `${input.canonicalUrl}|${mode}`;
+  const cached = cachedUrlResolution(input, resultCacheKey);
+  if (cached !== undefined) return cached;
+
+  const evidence = evidenceForSnapshot(input.snapshot);
   const anchors = collectUrlAnchors(input.snapshot, input.canonicalUrl).filter((anchor) =>
     evidence.graph.hasNode(anchor),
   );
+  const similarityTargetVisitNodeIds =
+    anchors.length > 0
+      ? new Set(anchors)
+      : new Set<string>([`timeline-visit:${input.canonicalUrl}`]);
   const seed = new Map<string, number>();
   for (const anchor of anchors) seed.set(anchor, 1);
   for (const [anchor, value] of urlNegativeSeeds(input)) seed.set(anchor, value);
@@ -326,7 +415,7 @@ export const resolveUrlAttribution = (
   const similarity = new Map(
     buildSimilarityEvidence({
       snapshot: input.snapshot,
-      targetVisitNodeIds: new Set(anchors),
+      targetVisitNodeIds: similarityTargetVisitNodeIds,
       events: input.events,
       ...(input.closestVisitRanker === undefined
         ? {}
@@ -365,7 +454,8 @@ export const resolveUrlAttribution = (
   const nodeById = new Map<string, ConnectionNode>(
     input.snapshot.nodes.map((node) => [node.id, node] as const),
   );
-  const enrichedAnchors: readonly AttributionAnchor[] = anchors
+  const contributingAnchors = anchors.length > 0 ? anchors : [...similarityTargetVisitNodeIds].sort(compareString);
+  const enrichedAnchors: readonly AttributionAnchor[] = contributingAnchors
     .slice(0, 3)
     .map((anchorId) => enrichAnchor(anchorId, nodeById));
 
@@ -378,7 +468,7 @@ export const resolveUrlAttribution = (
     }));
   const decision = decideAttribution(fusedCandidates, mode, input.policyTelemetry);
 
-  return {
+  const result: UrlResolutionResult = {
     canonicalUrl: input.canonicalUrl,
     dryRun: true,
     policyMode: mode,
@@ -389,15 +479,21 @@ export const resolveUrlAttribution = (
       modelRevision: MODEL_REVISION,
       graphRevision: evidence.revision,
       evidenceHash,
-      targetAnchors: anchors,
-      topContributingAnchors: anchors.slice(0, 3),
+      targetAnchors: contributingAnchors,
+      topContributingAnchors: contributingAnchors.slice(0, 3),
     },
   };
+  cacheUrlResolution(input, resultCacheKey, result);
+  return result;
 };
 
 export const resolveAttribution = (input: ResolveAttributionInput): ResolutionResult => {
   const mode = input.policyMode ?? 'balanced';
-  const evidence = buildEvidenceGraph(input.snapshot);
+  const resultCacheKey = `${input.tabSessionId}|${mode}`;
+  const cached = cachedTabResolution(input, resultCacheKey);
+  if (cached !== undefined) return cached;
+
+  const evidence = evidenceForSnapshot(input.snapshot);
   const tabNode = tabSessionNodeId(input.tabSessionId);
   const visits = targetVisitNodes(input.snapshot, input.tabSessionId);
   const anchors = [tabNode, ...[...visits].sort(compareString)].filter((anchor) =>
@@ -475,7 +571,7 @@ export const resolveAttribution = (input: ResolveAttributionInput): ResolutionRe
     }));
   const decision = decideAttribution(fusedCandidates, mode, input.policyTelemetry);
 
-  return {
+  const result: ResolutionResult = {
     tabSessionId: input.tabSessionId,
     dryRun: true,
     policyMode: mode,
@@ -490,6 +586,8 @@ export const resolveAttribution = (input: ResolveAttributionInput): ResolutionRe
       topContributingAnchors: anchors.slice(0, 3),
     },
   };
+  cacheTabResolution(input, resultCacheKey, result);
+  return result;
 };
 
 export const inferredAttributionPayloadFromResolution = (

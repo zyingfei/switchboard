@@ -1,7 +1,7 @@
 import type { AcceptedEvent } from './causal.js';
 import type { EventLog } from './eventLog.js';
 import type { ProjectionChangeFeed } from './projectionChanges.js';
-import { runImportProjectors } from './projectors.js';
+import { runImportProjectorsFromEvents } from './projectors.js';
 
 // Periodic anti-entropy. Scans the merged event log every N minutes,
 // picks the latest event per aggregate, and re-runs the projector.
@@ -54,6 +54,24 @@ const latestPerAggregate = (events: readonly AcceptedEvent[]): readonly Accepted
   return [...byId.values()];
 };
 
+const eventsByAggregate = (
+  events: readonly AcceptedEvent[],
+): ReadonlyMap<string, readonly AcceptedEvent[]> => {
+  const byId = new Map<string, AcceptedEvent[]>();
+  for (const event of events) {
+    const list = byId.get(event.aggregateId) ?? [];
+    list.push(event);
+    byId.set(event.aggregateId, list);
+  }
+  return byId;
+};
+
+const yieldToEventLoop = async (): Promise<void> => {
+  await new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+};
+
 export const startAntiEntropyTask = (deps: StartAntiEntropyDeps): AntiEntropyHandle => {
   const intervalMs = deps.intervalMs ?? 30 * 60 * 1000;
   let stopped = false;
@@ -62,10 +80,13 @@ export const startAntiEntropyTask = (deps: StartAntiEntropyDeps): AntiEntropyHan
     if (stopped) return 0;
     try {
       const merged = await deps.eventLog.readMerged();
+      const byAggregate = eventsByAggregate(merged);
       const latest = latestPerAggregate(merged);
-      for (const event of latest) {
+      for (let index = 0; index < latest.length; index += 1) {
+        const event = latest[index];
+        if (event === undefined) continue;
         if (stopped) break;
-        await runImportProjectors(
+        await runImportProjectorsFromEvents(
           {
             vaultRoot: deps.vaultRoot,
             eventLog: deps.eventLog,
@@ -74,7 +95,11 @@ export const startAntiEntropyTask = (deps: StartAntiEntropyDeps): AntiEntropyHan
               : { projectionChanges: deps.projectionChanges }),
           },
           event,
+          byAggregate.get(event.aggregateId) ?? [],
         ).catch(() => undefined);
+        if ((index + 1) % 100 === 0) {
+          await yieldToEventLoop();
+        }
       }
       deps.onScanComplete?.(latest.length);
       return latest.length;

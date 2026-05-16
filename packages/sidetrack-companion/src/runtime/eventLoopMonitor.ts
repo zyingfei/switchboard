@@ -84,10 +84,36 @@ export const startEventLoopMonitor = (
   // Sampling tick: read the running max and clear so the next window
   // is a fresh measurement. Anything above warnThresholdMs becomes a
   // logged stall. Separately, if the loop ran near-100% busy for the
-  // entire tick window, emit a `[api.busy]` line — that's what
-  // produces a multi-second pile-up of small ticks that look fine
-  // sample-by-sample but starve incoming HTTP connections.
+  // entire tick window, track that — but collapse consecutive busy
+  // windows into one "busy started" + one "busy ended" log pair so a
+  // 60-second pinned phase doesn't produce 600 lines of repetition.
   const tickMs = Math.max(resolutionMs * 5, 100);
+  // Throttled `[api.busy]` reporter state. Logging every 100 ms during
+  // a sustained-busy phase produced ~600 lines per minute of
+  // repetition that drowned out the actual signal in /tmp/runtime.log.
+  // Instead: log once when the busy window opens, once when it closes
+  // (with cumulative stats), and one periodic heartbeat every 5 s
+  // while sustained-busy is still active so operators know it's still
+  // pinned without flooding.
+  const busyHeartbeatMs = 5_000;
+  let busyOpenAtMs: number | null = null;
+  let busyOpenStallStartUtil = 0;
+  let busyCumulativeActiveMs = 0;
+  let busyLastHeartbeatAtMs = 0;
+  let busyMaxUtilization = 0;
+  let busyTickCount = 0;
+  const closeBusyWindow = (): void => {
+    if (busyOpenAtMs === null) return;
+    const durationMs = Date.now() - busyOpenAtMs;
+    log(
+      `[api.busy.end] durationMs=${String(durationMs)} maxUtilization=${busyMaxUtilization.toFixed(3)} cumulativeActiveMs=${String(Math.round(busyCumulativeActiveMs))} ticks=${String(busyTickCount)}`,
+    );
+    busyOpenAtMs = null;
+    busyOpenStallStartUtil = 0;
+    busyCumulativeActiveMs = 0;
+    busyMaxUtilization = 0;
+    busyTickCount = 0;
+  };
   const interval = setInterval(() => {
     const maxNs = histogram.max;
     histogram.reset();
@@ -104,10 +130,34 @@ export const startEventLoopMonitor = (
     utilizationBaseline = performance.eventLoopUtilization();
     if (elu.utilization >= sustainedUtilizationThreshold) {
       lastBusyWindowAt = new Date().toISOString();
-      busyWindowCount += 1;
-      log(
-        `[api.busy] utilization=${elu.utilization.toFixed(3)} windowMs=${String(Math.round(elu.idle + elu.active))} activeMs=${String(Math.round(elu.active))} idleMs=${String(Math.round(elu.idle))} note=main thread near-100% busy; HTTP accept queue likely stalling`,
-      );
+      const now = Date.now();
+      if (busyOpenAtMs === null) {
+        busyOpenAtMs = now;
+        busyLastHeartbeatAtMs = now;
+        busyOpenStallStartUtil = elu.utilization;
+        busyCumulativeActiveMs = 0;
+        busyMaxUtilization = elu.utilization;
+        busyTickCount = 0;
+        // Count this window's lifetime once at open, not per tick.
+        busyWindowCount += 1;
+        log(
+          `[api.busy.start] utilization=${elu.utilization.toFixed(3)} threshold=${String(sustainedUtilizationThreshold)} note=main thread sustained-busy; HTTP accept queue likely stalling`,
+        );
+      }
+      busyCumulativeActiveMs += elu.active;
+      busyMaxUtilization = Math.max(busyMaxUtilization, elu.utilization);
+      busyTickCount += 1;
+      if (now - busyLastHeartbeatAtMs >= busyHeartbeatMs) {
+        busyLastHeartbeatAtMs = now;
+        log(
+          `[api.busy.tick] elapsedMs=${String(now - busyOpenAtMs)} maxUtilization=${busyMaxUtilization.toFixed(3)} cumulativeActiveMs=${String(Math.round(busyCumulativeActiveMs))} ticks=${String(busyTickCount)} note=still busy`,
+        );
+      }
+      // Silence the unused-binding lint without shipping reflection
+      // code into the hot path.
+      void busyOpenStallStartUtil;
+    } else if (busyOpenAtMs !== null) {
+      closeBusyWindow();
     }
   }, tickMs);
   interval.unref();

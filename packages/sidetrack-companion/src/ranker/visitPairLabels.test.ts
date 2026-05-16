@@ -8,11 +8,7 @@ import { describe, expect, it } from 'vitest';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../tabsession/events.js';
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
-import type {
-  ConnectionEdge,
-  ConnectionNode,
-  ConnectionsSnapshot,
-} from '../connections/types.js';
+import type { ConnectionEdge, ConnectionNode, ConnectionsSnapshot } from '../connections/types.js';
 
 import {
   augmentFeedbackWithVisitPairLabels,
@@ -21,10 +17,7 @@ import {
 
 const TIMESTAMP = '2026-05-10T10:00:00.000Z';
 
-const visitInstance = (
-  id: string,
-  canonicalUrl: string | undefined,
-): ConnectionNode => ({
+const visitInstance = (id: string, canonicalUrl: string | undefined): ConnectionNode => ({
   id,
   kind: 'visit-instance',
   label: id,
@@ -42,10 +35,7 @@ const workstreamNode = (key: string): ConnectionNode => ({
   metadata: {},
 });
 
-const userAssertedEdge = (
-  fromNodeId: string,
-  toNodeId: string,
-): ConnectionEdge => ({
+const userAssertedEdge = (fromNodeId: string, toNodeId: string): ConnectionEdge => ({
   id: `edge:visit_instance_in_workstream:${fromNodeId}:${toNodeId}`,
   kind: 'visit_instance_in_workstream',
   fromNodeId,
@@ -59,10 +49,7 @@ const userAssertedEdge = (
   confidence: 'asserted',
 });
 
-const urlInferredEdge = (
-  fromNodeId: string,
-  toNodeId: string,
-): ConnectionEdge => ({
+const urlInferredEdge = (fromNodeId: string, toNodeId: string): ConnectionEdge => ({
   id: `edge:visit_instance_in_workstream:${fromNodeId}:${toNodeId}`,
   kind: 'visit_instance_in_workstream',
   fromNodeId,
@@ -76,10 +63,7 @@ const urlInferredEdge = (
   confidence: 'inferred',
 });
 
-const tabSessionInferredEdge = (
-  fromNodeId: string,
-  toNodeId: string,
-): ConnectionEdge => ({
+const tabSessionInferredEdge = (fromNodeId: string, toNodeId: string): ConnectionEdge => ({
   id: `edge:visit_instance_in_workstream:${fromNodeId}:${toNodeId}`,
   kind: 'visit_instance_in_workstream',
   fromNodeId,
@@ -112,8 +96,14 @@ const sortLabels = (labels: readonly { fromId: string; toId: string }[]) =>
 
 describe('deriveVisitPairLabelsFromSnapshot', () => {
   it('emits directional (URL, URL) pairs for visits user-asserted into the same workstream', () => {
-    const visitA = visitInstance('visit-instance:tses-1:1:https://example.test/a', 'https://example.test/a');
-    const visitB = visitInstance('visit-instance:tses-1:1:https://example.test/b', 'https://example.test/b');
+    const visitA = visitInstance(
+      'visit-instance:tses-1:1:https://example.test/a',
+      'https://example.test/a',
+    );
+    const visitB = visitInstance(
+      'visit-instance:tses-1:1:https://example.test/b',
+      'https://example.test/b',
+    );
     const ws = workstreamNode('ws-1');
     const snap = snapshot(
       [visitA, visitB, ws],
@@ -146,8 +136,14 @@ describe('deriveVisitPairLabelsFromSnapshot', () => {
   });
 
   it('keeps pairs scoped to a single workstream (no cross-workstream pairs)', () => {
-    const visitA = visitInstance('visit-instance:tses-1:1:https://example.test/a', 'https://example.test/a');
-    const visitB = visitInstance('visit-instance:tses-1:1:https://example.test/b', 'https://example.test/b');
+    const visitA = visitInstance(
+      'visit-instance:tses-1:1:https://example.test/a',
+      'https://example.test/a',
+    );
+    const visitB = visitInstance(
+      'visit-instance:tses-1:1:https://example.test/b',
+      'https://example.test/b',
+    );
     const ws1 = workstreamNode('ws-1');
     const ws2 = workstreamNode('ws-2');
     const snap = snapshot(
@@ -159,8 +155,14 @@ describe('deriveVisitPairLabelsFromSnapshot', () => {
   });
 
   it('excludes edges produced by URL_ATTRIBUTION_INFERRED', () => {
-    const visitA = visitInstance('visit-instance:tses-1:1:https://example.test/a', 'https://example.test/a');
-    const visitB = visitInstance('visit-instance:tses-1:1:https://example.test/b', 'https://example.test/b');
+    const visitA = visitInstance(
+      'visit-instance:tses-1:1:https://example.test/a',
+      'https://example.test/a',
+    );
+    const visitB = visitInstance(
+      'visit-instance:tses-1:1:https://example.test/b',
+      'https://example.test/b',
+    );
     const ws = workstreamNode('ws-1');
     const snap = snapshot(
       [visitA, visitB, ws],
@@ -170,8 +172,14 @@ describe('deriveVisitPairLabelsFromSnapshot', () => {
   });
 
   it('excludes edges produced by TAB_SESSION_ATTRIBUTION_INFERRED', () => {
-    const visitA = visitInstance('visit-instance:tses-1:1:https://example.test/a', 'https://example.test/a');
-    const visitB = visitInstance('visit-instance:tses-1:1:https://example.test/b', 'https://example.test/b');
+    const visitA = visitInstance(
+      'visit-instance:tses-1:1:https://example.test/a',
+      'https://example.test/a',
+    );
+    const visitB = visitInstance(
+      'visit-instance:tses-1:1:https://example.test/b',
+      'https://example.test/b',
+    );
     const ws = workstreamNode('ws-1');
     const snap = snapshot(
       [visitA, visitB, ws],
@@ -198,19 +206,24 @@ describe('augmentFeedbackWithVisitPairLabels', () => {
     const feedback = {
       schemaVersion: 1 as const,
       perItem: {},
+      containerByItem: {},
+      organizedItemsByContainer: {},
       positiveLabels: [{ fromId: 'x', toId: 'y', weight: 1 }],
       negativeLabels: [],
     };
-    const result = augmentFeedbackWithVisitPairLabels(
-      feedback,
-      snapshot([], []),
-    );
+    const result = augmentFeedbackWithVisitPairLabels(feedback, snapshot([], []));
     expect(result).toBe(feedback);
   });
 
   it('appends derived visit-pair labels to positiveLabels', () => {
-    const visitA = visitInstance('visit-instance:tses-1:1:https://example.test/a', 'https://example.test/a');
-    const visitB = visitInstance('visit-instance:tses-1:1:https://example.test/b', 'https://example.test/b');
+    const visitA = visitInstance(
+      'visit-instance:tses-1:1:https://example.test/a',
+      'https://example.test/a',
+    );
+    const visitB = visitInstance(
+      'visit-instance:tses-1:1:https://example.test/b',
+      'https://example.test/b',
+    );
     const ws = workstreamNode('ws-1');
     const snap = snapshot(
       [visitA, visitB, ws],
@@ -219,13 +232,19 @@ describe('augmentFeedbackWithVisitPairLabels', () => {
     const feedback = {
       schemaVersion: 1 as const,
       perItem: {},
+      containerByItem: {},
+      organizedItemsByContainer: {},
       positiveLabels: [{ fromId: 'pre-existing-from', toId: 'pre-existing-to', weight: 1 }],
       negativeLabels: [],
     };
     const result = augmentFeedbackWithVisitPairLabels(feedback, snap);
     expect(result.positiveLabels).toHaveLength(3); // 1 pre-existing + 2 derived
-    expect(sortLabels(result.positiveLabels)).toContain('https://example.test/a|https://example.test/b');
-    expect(sortLabels(result.positiveLabels)).toContain('https://example.test/b|https://example.test/a');
+    expect(sortLabels(result.positiveLabels)).toContain(
+      'https://example.test/a|https://example.test/b',
+    );
+    expect(sortLabels(result.positiveLabels)).toContain(
+      'https://example.test/b|https://example.test/a',
+    );
     expect(sortLabels(result.positiveLabels)).toContain('pre-existing-from|pre-existing-to');
   });
 });

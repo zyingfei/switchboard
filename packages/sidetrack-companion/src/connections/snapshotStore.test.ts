@@ -72,4 +72,21 @@ describe('connectionsStore — Stage 5.2 W5 store-level skip-write', () => {
     // Without a revision, we can't dedupe, so each call writes.
     expect(t2).toBeGreaterThan(t1);
   });
+
+  it('caches current snapshot reads until another process replaces the file', async () => {
+    const store = createConnectionsStore(vaultRoot);
+    await store.putCurrent(buildSnapshot('rev-a'));
+
+    const first = await store.readCurrent();
+    const second = await store.readCurrent();
+    expect(second).toBe(first);
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const externalWriter = createConnectionsStore(vaultRoot);
+    await externalWriter.putCurrent(buildSnapshot('rev-b'));
+
+    const third = await store.readCurrent();
+    expect(third).not.toBe(first);
+    expect(third?.snapshotRevision).toBe('rev-b');
+  });
 });

@@ -205,6 +205,29 @@ describe('rankHybrid — lexical + vector fusion', () => {
     expect(results.map((r) => r.id)).toEqual(['chunk:in:0:0:111111111111']);
   });
 
+  it('honors excludeIds on both rankers', () => {
+    const items: readonly IndexEntry[] = [
+      entry('chunk:excluded:0:0:111111111111', 'thread_a', '2026-05-03T00:00:00.000Z', [1, 0], {
+        text: 'sidetrack.threads.move exact match',
+      }),
+      entry('chunk:kept:0:0:222222222222', 'thread_b', '2026-05-03T00:00:00.000Z', [0.5, 0], {
+        text: 'sidetrack move fallback candidate',
+      }),
+    ];
+    const lexical = buildLexicalIndex(items);
+    const results = rankHybrid(
+      'sidetrack.threads.move',
+      Float32Array.from([1, 0]),
+      items,
+      baseDate,
+      {
+        lexical,
+        excludeIds: new Set(['chunk:excluded:0:0:111111111111']),
+      },
+    );
+    expect(results.map((r) => r.id)).toEqual(['chunk:kept:0:0:222222222222']);
+  });
+
   it('populates `why`, `snippet`, and `metadata` on every result', () => {
     const items: readonly IndexEntry[] = [
       entry('chunk:full:0:0:aaaaaaaaaaaa', 'thread_a', '2026-05-03T00:00:00.000Z', [1, 0], {

@@ -43,11 +43,27 @@ interface ReconcileMessage {
   readonly seq: number;
 }
 
-const post = (result: ReconcileWorkerResult): void => {
+const post = (result: ReconcileWorkerResult, afterSend?: () => void): void => {
   try {
-    process.send?.(result);
+    if (process.send === undefined) {
+      afterSend?.();
+      return;
+    }
+    process.send(result, () => {
+      afterSend?.();
+    });
   } catch {
     // Parent disappeared.
+    afterSend?.();
+  }
+};
+
+const finishSuccessfully = (): void => {
+  process.exitCode = 0;
+  try {
+    process.disconnect?.();
+  } catch {
+    // IPC may already be closed.
   }
 };
 
@@ -70,14 +86,16 @@ const run = async (msg: ReconcileMessage): Promise<void> => {
     });
     await materializer.catchUp(eventLog);
     const snapshot = await store.readCurrent();
-    post({
-      seq: msg.seq,
-      ok: true,
-      ...(snapshot?.snapshotRevision === undefined
-        ? {}
-        : { snapshotRevision: snapshot.snapshotRevision }),
-    });
-    process.exit(0);
+    post(
+      {
+        seq: msg.seq,
+        ok: true,
+        ...(snapshot?.snapshotRevision === undefined
+          ? {}
+          : { snapshotRevision: snapshot.snapshotRevision }),
+      },
+      finishSuccessfully,
+    );
   } catch (err) {
     post({
       seq: msg.seq,

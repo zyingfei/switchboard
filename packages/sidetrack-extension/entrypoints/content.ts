@@ -762,6 +762,25 @@ export default defineContentScript({
       reviewChipMounted = null;
     };
 
+    const recallFallbackTitle = (result: RankedItem): string => {
+      const title = result.title?.trim();
+      if (title !== undefined && title.length > 0 && !/^thread\s+[a-z0-9-]{8,}$/iu.test(title)) {
+        return title;
+      }
+      const provider = detectProviderFromUrl(result.threadUrl ?? window.location.href);
+      if (provider === 'chatgpt') return 'ChatGPT conversation';
+      if (provider === 'claude') return 'Claude conversation';
+      if (provider === 'gemini') return 'Gemini conversation';
+      if (result.threadUrl !== undefined && result.threadUrl.length > 0) {
+        try {
+          return new URL(result.threadUrl).hostname;
+        } catch {
+          return 'Recalled page';
+        }
+      }
+      return 'Recalled thread';
+    };
+
     // Selection-anchored review chip. Fires when the user highlights
     // text inside an extracted turn element (provider config's
     // directSources). The chip lets the user attach a comment that
@@ -880,7 +899,7 @@ export default defineContentScript({
           items: results.map(
             (r: RankedItem): DejaVuItem => ({
               id: r.id,
-              title: r.title ?? `thread ${r.threadId.slice(0, 12)}`,
+              title: recallFallbackTitle(r),
               snippet: r.snippet ?? '',
               score: r.score,
               relativeWhen: r.capturedAt,
@@ -894,15 +913,20 @@ export default defineContentScript({
               // was a copy-paste leftover that made every Jump a no-op
               // (focus-in-side-panel for the page you're already on).
               ...(r.threadUrl === undefined ? {} : { threadUrl: r.threadUrl }),
-              bacId: r.threadId,
+              bacId: r.bacId ?? r.sourceBacId ?? r.threadId,
             }),
           ),
           anchorRect,
           onJump: (item) => {
-            if (item.threadUrl !== undefined) {
+            if (
+              (item.threadUrl !== undefined && item.threadUrl.length > 0) ||
+              (item.bacId !== undefined && item.bacId.length > 0)
+            ) {
               void chrome.runtime.sendMessage({
                 type: messageTypes.focusThreadInSidePanel,
-                threadUrl: item.threadUrl,
+                ...(item.threadUrl === undefined || item.threadUrl.length === 0
+                  ? {}
+                  : { threadUrl: item.threadUrl }),
                 // Pass the matched thread's bac_id + title + last-seen
                 // through to the side panel. Lets the focus handler
                 // render a synthetic card for recall results that

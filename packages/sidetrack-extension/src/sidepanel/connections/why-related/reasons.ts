@@ -22,6 +22,7 @@ export type Reason =
       readonly code: 'COSINE_ABOVE_THRESHOLD';
       readonly cosine: number;
       readonly threshold: number;
+      readonly matchCount?: number;
     }
   | {
       readonly code: 'OPENER_CHAIN';

@@ -101,7 +101,9 @@ import {
   type TabSessionRecord,
   type TabSessionResolutionResult,
   type TabSessionWorkstreamOption,
+  type UrlAttribution,
   type UrlInboxData,
+  type UrlIgnoredState,
   type UrlProjection,
   type UrlResolutionResult,
   type UrlVisitRecord,
@@ -136,6 +138,179 @@ const EMPTY_URL_INBOX: UrlInboxData = {
   total: 0,
   limit: 51,
   offset: 0,
+};
+
+// Resolver calls are CPU-heavy on the companion: each one runs graph
+// evidence + similarity + policy scoring. Prefetch only the hottest
+// cards and let per-card refresh cover deeper Inbox triage, so a new
+// focused tab is not queued behind 50 background resolves.
+const RESOLVER_PREFETCH_LIMIT = 8;
+const RESOLVER_FETCH_CONCURRENCY = 2;
+const FOCUSED_RESOLVER_RETRY_DELAY_MS = 1500;
+const FOCUSED_RESOLVER_RETRY_MAX_ATTEMPTS = 24;
+const FOCUSED_URL_PROJECTION_RETRY_DELAY_MS = 750;
+const FOCUSED_URL_PROJECTION_RETRY_MAX_ATTEMPTS = 16;
+
+const randomClientEventSuffix = (): string => {
+  const cryptoApi: Crypto | undefined = globalThis.crypto;
+  if (cryptoApi !== undefined && typeof cryptoApi.randomUUID === 'function') {
+    return cryptoApi.randomUUID();
+  }
+  return `${String(Date.now())}-${Math.random().toString(36).slice(2)}`;
+};
+
+const urlMutationClientEventId = (kind: 'attribute' | 'ignore'): string =>
+  `url-${kind}-${randomClientEventSuffix()}`;
+
+const compareUrlInboxRecords = (left: UrlVisitRecord, right: UrlVisitRecord): number => {
+  if (left.firstSeenAt !== right.firstSeenAt) {
+    return left.firstSeenAt < right.firstSeenAt ? 1 : -1;
+  }
+  return left.canonicalUrl.localeCompare(right.canonicalUrl);
+};
+
+const urlInboxDataFromProjection = (
+  projection: UrlProjection,
+  previous: UrlInboxData,
+): UrlInboxData => {
+  const items = Object.values(projection.byCanonicalUrl)
+    .filter(
+      (record) =>
+        record.currentAttribution === undefined && record.currentIgnored === undefined,
+    )
+    .sort(compareUrlInboxRecords);
+  return {
+    items: items.slice(previous.offset, previous.offset + previous.limit),
+    total: items.length,
+    limit: previous.limit,
+    offset: previous.offset,
+  };
+};
+
+const removeUrlFromInbox = (inbox: UrlInboxData, canonicalUrl: string): UrlInboxData => {
+  const items = inbox.items.filter((item) => item.canonicalUrl !== canonicalUrl);
+  const removedCount = inbox.items.length - items.length;
+  if (removedCount === 0) return inbox;
+  return {
+    ...inbox,
+    items,
+    total: Math.max(0, inbox.total - removedCount),
+  };
+};
+
+const restoreUrlInboxItem = (inbox: UrlInboxData, record: UrlVisitRecord): UrlInboxData => {
+  if (record.currentAttribution !== undefined || record.currentIgnored !== undefined) return inbox;
+  if (inbox.items.some((item) => item.canonicalUrl === record.canonicalUrl)) return inbox;
+  const visible = [...inbox.items, record].sort(compareUrlInboxRecords);
+  return {
+    ...inbox,
+    items: visible.slice(0, inbox.limit),
+    total: inbox.total + 1,
+  };
+};
+
+const withoutUrlSuggestion = (
+  suggestions: Readonly<Record<string, UrlResolutionResult>>,
+  canonicalUrl: string,
+): Record<string, UrlResolutionResult> =>
+  Object.fromEntries(
+    Object.entries(suggestions).filter(
+      ([key, result]) => key !== canonicalUrl && result.canonicalUrl !== canonicalUrl,
+    ),
+  );
+
+interface UrlMutationSnapshot {
+  readonly record?: UrlVisitRecord;
+  readonly inboxItem?: UrlVisitRecord;
+  readonly suggestion?: UrlResolutionResult;
+}
+
+type OptimisticUrlMutation =
+  | {
+      readonly kind: 'attribute';
+      readonly clientEventId: string;
+      readonly observedAt: string;
+      readonly workstreamId: string | null;
+    }
+  | {
+      readonly kind: 'ignore';
+      readonly clientEventId: string;
+      readonly observedAt: string;
+      readonly reason: UrlIgnoredState['reason'];
+    };
+
+const urlRecordHasOptimisticMutation = (
+  record: UrlVisitRecord | undefined,
+  mutation: OptimisticUrlMutation,
+): boolean =>
+  mutation.kind === 'attribute'
+    ? record?.currentAttribution?.clientEventId === mutation.clientEventId
+    : record?.currentIgnored?.clientEventId === mutation.clientEventId;
+
+const urlRecordWithOptimisticMutation = (
+  record: UrlVisitRecord,
+  mutation: OptimisticUrlMutation,
+): UrlVisitRecord => {
+  if (mutation.kind === 'ignore') {
+    return {
+      ...record,
+      currentIgnored: {
+        reason: mutation.reason,
+        observedAt: mutation.observedAt,
+        clientEventId: mutation.clientEventId,
+      },
+    };
+  }
+  const attribution: UrlAttribution = {
+    workstreamId: mutation.workstreamId,
+    source: 'user_asserted',
+    observedAt: mutation.observedAt,
+    clientEventId: mutation.clientEventId,
+  };
+  const { currentIgnored, ...recordWithoutIgnored } = record;
+  const attributionHistory = record.attributionHistory.some(
+    (item) => item.clientEventId === mutation.clientEventId,
+  )
+    ? record.attributionHistory
+    : [...record.attributionHistory, attribution];
+  const baseRecord: UrlVisitRecord = {
+    ...recordWithoutIgnored,
+    currentAttribution: attribution,
+    attributionHistory,
+  };
+  return mutation.workstreamId === null && currentIgnored !== undefined
+    ? { ...baseRecord, currentIgnored }
+    : baseRecord;
+};
+
+const urlProjectionWithOptimisticMutations = (
+  projection: UrlProjection,
+  mutations: ReadonlyMap<string, OptimisticUrlMutation>,
+): UrlProjection => {
+  let byCanonicalUrl = projection.byCanonicalUrl;
+  let changed = false;
+  for (const [canonicalUrl, mutation] of mutations) {
+    const record = byCanonicalUrl[canonicalUrl];
+    if (record === undefined || urlRecordHasOptimisticMutation(record, mutation)) continue;
+    if (!changed) {
+      byCanonicalUrl = { ...byCanonicalUrl };
+      changed = true;
+    }
+    byCanonicalUrl[canonicalUrl] = urlRecordWithOptimisticMutation(record, mutation);
+  }
+  return changed ? { ...projection, byCanonicalUrl } : projection;
+};
+
+const reconcileUrlProjectionForLocalMutations = (
+  projection: UrlProjection,
+  mutations: Map<string, OptimisticUrlMutation>,
+): UrlProjection => {
+  for (const [canonicalUrl, mutation] of mutations) {
+    if (urlRecordHasOptimisticMutation(projection.byCanonicalUrl[canonicalUrl], mutation)) {
+      mutations.delete(canonicalUrl);
+    }
+  }
+  return urlProjectionWithOptimisticMutations(projection, mutations);
 };
 
 // Adapt a UrlVisitRecord to the TabSessionRecord shape the existing
@@ -177,6 +352,18 @@ const tabSessionResolutionFromUrl = (
   decision: result.decision,
   fusedCandidates: result.fusedCandidates,
 });
+
+const urlAutoApplyAttemptKey = (result: UrlResolutionResult): string =>
+  [
+    result.canonicalUrl,
+    result.decision.action,
+    result.decision.workstreamId ?? '',
+    result.decision.margin.toFixed(6),
+    ...result.fusedCandidates.map(
+      (candidate) =>
+        `${candidate.workstreamId}:${candidate.dominantSource}:${candidate.rawFusionLogit.toFixed(6)}`,
+    ),
+  ].join('|');
 
 const tabSessionIdFromDragEvent = (event: DragEvent<HTMLElement>): string | null => {
   if (typeof event.dataTransfer.getData !== 'function') return null;
@@ -232,10 +419,28 @@ const acquireCompanionFetchSlot = async (): Promise<() => void> => {
 // pipeline, so it can carry a fragment (Google appends `#scso=...`
 // post-load), marketing params, or sensitive params that the stored
 // canonical dropped. Apply the same pipeline here so lookup keys agree.
+const timelineVisitKeyForUrl = (input: string): string => {
+  const canonical = sanitizeTimelineUrl(canonicalThreadUrl(input));
+  return canonical.replace(/#.*$/u, '').replace(/\/+$/u, '');
+};
+
 const comparableTabUrl = (input: string | undefined): string | null => {
   if (input === undefined || input.length === 0) return null;
-  const canonical = sanitizeTimelineUrl(canonicalThreadUrl(input));
-  return canonical.length > 1 && canonical.endsWith('/') ? canonical.slice(0, -1) : canonical;
+  const canonical = timelineVisitKeyForUrl(input);
+  return canonical.length > 0 ? canonical : null;
+};
+
+const urlRecordForFocusedUrl = (
+  projection: UrlProjection,
+  focusedRawUrl: string | undefined,
+): UrlVisitRecord | undefined => {
+  const comparable = comparableTabUrl(focusedRawUrl);
+  if (comparable === null) return undefined;
+  const direct = projection.byCanonicalUrl[comparable];
+  if (direct !== undefined) return direct;
+  return Object.values(projection.byCanonicalUrl).find(
+    (record) => comparableTabUrl(record.canonicalUrl) === comparable,
+  );
 };
 
 const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
@@ -273,6 +478,14 @@ const isUrlProjection = (value: unknown): value is UrlProjection =>
   value['schemaVersion'] === 1 &&
   isPlainRecord(value['byCanonicalUrl']);
 
+const snapshotRevisionFromStatusData = (value: unknown): string | null => {
+  if (!isPlainRecord(value)) return null;
+  const snapshot = value['snapshot'];
+  if (!isPlainRecord(snapshot)) return null;
+  const revision = snapshot['revision'];
+  return typeof revision === 'string' && revision.length > 0 ? revision : null;
+};
+
 const isUrlInboxData = (value: unknown): value is UrlInboxData =>
   isPlainRecord(value) &&
   Array.isArray(value['items']) &&
@@ -290,6 +503,20 @@ const isUrlResolutionResult = (value: unknown): value is UrlResolutionResult =>
     typeof value['decision']['workstreamId'] === 'string') &&
   typeof value['decision']['margin'] === 'number' &&
   Array.isArray(value['fusedCandidates']);
+
+const readUrlMutationProjection = async (response: Response): Promise<UrlProjection | null> => {
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return null;
+  }
+  if (!isPlainRecord(body)) return null;
+  const data = body['data'];
+  if (!isPlainRecord(data)) return null;
+  const projection = data['projection'];
+  return isUrlProjection(projection) ? projection : null;
+};
 
 const sendRequestRaw = async (
   request: WorkboardRequest,
@@ -610,6 +837,12 @@ const App = () => {
       ? createEmptyWorkboardState()
       : createEmptyWorkboardState({ companionStatus: cached });
   });
+  // Mirror of `state` for callbacks/listeners whose identity is kept
+  // stable while still needing the latest focused-tab and thread data.
+  const stateRef = useRef(state);
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
   const [bridgeKey, setBridgeKey] = useState('');
   const [port, setPort] = useState('17373');
   const [selectedWorkstream, setSelectedWorkstream] = useState('');
@@ -652,7 +885,7 @@ const App = () => {
     // The timeline-visit node id IS the canonical URL — the snapshot
     // builds them that way. So anchoring on `timeline-visit:<URL>`
     // lands on the most useful neighborhood for an unattributed URL.
-    setConnectionsAnchorRequest(`timeline-visit:${canonicalUrl}`);
+    setConnectionsAnchorRequest(`timeline-visit:${timelineVisitKeyForUrl(canonicalUrl)}`);
     setViewMode('connections');
   };
   const requestSwitchToInbox = (canonicalUrl: string): void => {
@@ -793,10 +1026,17 @@ const App = () => {
   // suggestion update).
   const tabSessionSuggestionsRef = useRef(tabSessionSuggestions);
   tabSessionSuggestionsRef.current = tabSessionSuggestions;
+  const urlProjectionRef = useRef(urlProjection);
+  urlProjectionRef.current = urlProjection;
+  const urlInboxRef = useRef(urlInbox);
+  urlInboxRef.current = urlInbox;
   const urlSuggestionsRef = useRef(urlSuggestions);
   urlSuggestionsRef.current = urlSuggestions;
   const tabSessionSuggestionLoadInFlightRef = useRef(false);
   const urlSuggestionLoadInFlightRef = useRef(false);
+  const tabSessionLoadInFlightRef = useRef(false);
+  const urlStateLoadInFlightRef = useRef(false);
+  const focusedUrlSuggestionInFlightRef = useRef<Set<string>>(new Set<string>());
   // 2026-05 cleanup: with the 4 s background poll gone, the user can
   // refresh a single suggestion via the per-card ↻ button. This set
   // tracks which urls are currently re-fetching so the button can
@@ -809,6 +1049,13 @@ const App = () => {
   // per canonical URL so each URL is auto-applied at most once per
   // session per server response.
   const urlAutoApplyInFlightRef = useRef<Set<string>>(new Set<string>());
+  const urlAutoApplyAttemptedRef = useRef<Map<string, string>>(new Map<string, string>());
+  const urlMutationInFlightRef = useRef<Set<string>>(new Set<string>());
+  const optimisticUrlMutationsRef = useRef<Map<string, OptimisticUrlMutation>>(
+    new Map<string, OptimisticUrlMutation>(),
+  );
+  const urlMutationReconcileInFlightRef = useRef(false);
+  const urlMutationReconcileQueuedRef = useRef(false);
   const [pendingCodingOffers, setPendingCodingOffers] = useState<readonly OfferRecord[]>([]);
   // Per-row dismissals for the Needs-Organize inline suggestion. Local
   // (per-session) — survives panel close but not extension reload.
@@ -1266,7 +1513,8 @@ const App = () => {
   // single-threaded — saturating it caused the periodic
   // /v1/system/health probe to time out, briefly flashing the
   // "companion disconnected" banner, and stalled Inbox updates by 10+
-  // seconds per refresh cycle. Bound to 4 in-flight requests.
+  // seconds per refresh cycle. Resolver prefetches use the smaller
+  // RESOLVER_FETCH_CONCURRENCY cap below.
   const mapWithConcurrency = useCallback(
     async <T, R>(
       items: readonly T[],
@@ -1298,8 +1546,11 @@ const App = () => {
   // we haven't seen yet, or for ids the caller marks dirty via
   // `forceRefetch`.
   //
-  // The cache is invalidated entirely on user mutation (attribution,
-  // dismiss) because those change the resolver inputs.
+  // Empty "no signal" results are cached too. Freshness comes from
+  // explicit refetch triggers: user mutation, per-card refresh, and
+  // snapshot-revision changes. Without negative caching the panel
+  // re-ran the same empty resolver checks every refresh and competed
+  // with the current-tab suggestion path.
   const loadTabSessionSuggestions = useCallback(
     async (
       projection: TabSessionProjection,
@@ -1321,32 +1572,38 @@ const App = () => {
       // Drop cached entries for ids no longer in the inbox.
       const next: Record<string, TabSessionResolutionResult> = {};
       for (const id of recordsById.keys()) {
-        if (!forceRefetch && previous[id] !== undefined) next[id] = previous[id];
-      }
-      const idsToFetch = [...recordsById.keys()].filter((id) =>
-        forceRefetch ? true : next[id] === undefined,
-      );
-      const fetched = await mapWithConcurrency(idsToFetch, 4, async (tabSessionId) => {
-        try {
-          const result = await fetchCompanionJson<unknown>(
-            `/v1/tabsessions/${encodeURIComponent(tabSessionId)}/resolve?dryRun=true`,
-          );
-          return isTabSessionResolutionResult(result) ? ([tabSessionId, result] as const) : null;
-        } catch {
-          return null;
+        if (!forceRefetch && previous[id] !== undefined) {
+          next[id] = previous[id];
         }
-      });
+      }
+      const idsToFetch = [...recordsById.values()]
+        .sort((left, right) =>
+          left.lastActivityAt < right.lastActivityAt
+            ? 1
+            : left.lastActivityAt > right.lastActivityAt
+              ? -1
+              : left.tabSessionId.localeCompare(right.tabSessionId),
+        )
+        .map((record) => record.tabSessionId)
+        .filter((id) => (forceRefetch ? true : next[id] === undefined))
+        .slice(0, RESOLVER_PREFETCH_LIMIT);
+      const fetched = await mapWithConcurrency(
+        idsToFetch,
+        RESOLVER_FETCH_CONCURRENCY,
+        async (tabSessionId) => {
+          try {
+            const result = await fetchCompanionJson<unknown>(
+              `/v1/tabsessions/${encodeURIComponent(tabSessionId)}/resolve?dryRun=true`,
+            );
+            return isTabSessionResolutionResult(result) ? ([tabSessionId, result] as const) : null;
+          } catch {
+            return null;
+          }
+        },
+      );
       for (const entry of fetched) {
         if (entry === null) continue;
         const [id, result] = entry;
-        // Skip caching empty results. An empty resolution most often
-        // means the materializer hasn't folded the new visit into the
-        // snapshot yet (materializer drains run async in a child
-        // process). If we cached an empty result we'd stick on
-        // "No signal yet" forever — the snapshot.revision watcher
-        // will force a refetch when the drain lands, and any unrelated
-        // refresh trigger in the meantime gets a fresh attempt too.
-        if (result.fusedCandidates.length === 0) continue;
         next[id] = result;
       }
       return next;
@@ -1364,42 +1621,121 @@ const App = () => {
       forceRefetch = false,
       extraCanonicalUrls: readonly string[] = [],
     ): Promise<Record<string, UrlResolutionResult>> => {
+      const canonicalExtras = extraCanonicalUrls.filter((url) => url.length > 0);
       const inboxCanonicalUrls = inbox.items
         .filter((item) => item.currentAttribution === undefined)
         .map((item) => item.canonicalUrl);
       // Merge inbox URLs with caller-supplied extras (e.g., the focused
-      // tab's URL when it's not in the inbox top page). Dedupe by Set.
-      const canonicalUrls = [...new Set<string>([...inboxCanonicalUrls, ...extraCanonicalUrls])];
+      // tab's URL when it's not in the inbox top page). Extras go
+      // first so Current Tab is not queued behind the Inbox batch.
+      const canonicalUrls = [...new Set<string>([...canonicalExtras, ...inboxCanonicalUrls])];
       const next: Record<string, UrlResolutionResult> = {};
       for (const url of canonicalUrls) {
-        if (!forceRefetch && previous[url] !== undefined) next[url] = previous[url];
-      }
-      const toFetch = canonicalUrls.filter((url) =>
-        forceRefetch ? true : next[url] === undefined,
-      );
-      const fetched = await mapWithConcurrency(toFetch, 4, async (canonicalUrl) => {
-        try {
-          const result = await fetchCompanionJson<unknown>(
-            `/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve?dryRun=true`,
-          );
-          return isUrlResolutionResult(result) ? ([canonicalUrl, result] as const) : null;
-        } catch {
-          return null;
+        const cached = previous[url];
+        if (!forceRefetch && cached !== undefined) {
+          next[url] = cached;
         }
-      });
+      }
+      const toFetch = canonicalUrls
+        .filter((url) => !focusedUrlSuggestionInFlightRef.current.has(url))
+        .filter((url) => (forceRefetch ? true : next[url] === undefined))
+        .slice(0, RESOLVER_PREFETCH_LIMIT);
+      const fetched = await mapWithConcurrency(
+        toFetch,
+        RESOLVER_FETCH_CONCURRENCY,
+        async (canonicalUrl) => {
+          try {
+            const result = await fetchCompanionJson<unknown>(
+              `/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve?dryRun=true`,
+            );
+            return isUrlResolutionResult(result) ? ([canonicalUrl, result] as const) : null;
+          } catch {
+            return null;
+          }
+        },
+      );
       for (const entry of fetched) {
         if (entry === null) continue;
         const [url, result] = entry;
-        // Same self-heal as the tab-session cache: empty results
-        // usually mean the materializer hasn't drained the new visit
-        // yet. Don't cache them; let snapshot.revision changes (or
-        // any other refresh trigger) force a refetch.
-        if (result.fusedCandidates.length === 0) continue;
         next[url] = result;
+        next[result.canonicalUrl] = result;
       }
       return next;
     },
     [fetchCompanionJson, mapWithConcurrency],
+  );
+
+  const loadFocusedUrlSuggestion = useCallback(
+    async (
+      canonicalUrl: string,
+      options: { readonly cacheEmpty?: boolean } = { cacheEmpty: true },
+    ): Promise<UrlResolutionResult | null> => {
+      if (focusedUrlSuggestionInFlightRef.current.has(canonicalUrl)) return null;
+      focusedUrlSuggestionInFlightRef.current.add(canonicalUrl);
+      try {
+        const result = await fetchCompanionJson<unknown>(
+          `/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve?dryRun=true`,
+        );
+        if (!isUrlResolutionResult(result)) return null;
+        if (result.fusedCandidates.length > 0 || options.cacheEmpty !== false) {
+          setUrlSuggestions((current) => ({
+            ...current,
+            [canonicalUrl]: result,
+            [result.canonicalUrl]: result,
+          }));
+        }
+        return result;
+      } catch {
+        // Silent — the bulk refresh path or per-card refresh can retry.
+        return null;
+      } finally {
+        focusedUrlSuggestionInFlightRef.current.delete(canonicalUrl);
+      }
+    },
+    [fetchCompanionJson],
+  );
+
+  const refreshFocusedUrlProjection = useCallback(
+    async (focusedRawUrl: string | undefined): Promise<boolean> => {
+      if (port.length === 0 || bridgeKey.length === 0) return false;
+      if (focusedRawUrl === undefined || focusedRawUrl.length === 0) return false;
+      try {
+        const currentProjection = urlProjectionRef.current;
+        if (currentProjection !== null) {
+          const currentRecord = urlRecordForFocusedUrl(currentProjection, focusedRawUrl);
+          if (currentRecord !== undefined) {
+            if (
+              currentRecord.currentAttribution === undefined &&
+              currentRecord.currentIgnored === undefined &&
+              urlSuggestionsRef.current[currentRecord.canonicalUrl] === undefined
+            ) {
+              void loadFocusedUrlSuggestion(currentRecord.canonicalUrl);
+            }
+            return true;
+          }
+        }
+        const urlProj = await fetchCompanionJson<unknown>('/v1/visits/projection');
+        if (!isUrlProjection(urlProj)) return false;
+        const reconciledUrlProj = reconcileUrlProjectionForLocalMutations(
+          urlProj,
+          optimisticUrlMutationsRef.current,
+        );
+        setUrlProjection(reconciledUrlProj);
+        const focusedRecord = urlRecordForFocusedUrl(reconciledUrlProj, focusedRawUrl);
+        if (focusedRecord === undefined) return false;
+        if (
+          focusedRecord.currentAttribution === undefined &&
+          focusedRecord.currentIgnored === undefined &&
+          urlSuggestionsRef.current[focusedRecord.canonicalUrl] === undefined
+        ) {
+          void loadFocusedUrlSuggestion(focusedRecord.canonicalUrl);
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [bridgeKey, fetchCompanionJson, loadFocusedUrlSuggestion, port],
   );
 
   // Per-row refresh: re-resolves a single URL's suggestion without
@@ -1420,7 +1756,11 @@ const App = () => {
           `/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve?dryRun=true`,
         );
         if (isUrlResolutionResult(result)) {
-          setUrlSuggestions((current) => ({ ...current, [canonicalUrl]: result }));
+          setUrlSuggestions((current) => ({
+            ...current,
+            [canonicalUrl]: result,
+            [result.canonicalUrl]: result,
+          }));
         }
       } catch {
         // Per-card refresh failures stay silent — the user can retry.
@@ -1453,6 +1793,8 @@ const App = () => {
     ): Promise<void> => {
       const background = options.background === true;
       const forceRefetch = options.forceRefetchSuggestions === true;
+      if (background && tabSessionLoadInFlightRef.current) return;
+      tabSessionLoadInFlightRef.current = true;
       if (port.length === 0 || bridgeKey.length === 0) {
         setTabSessionProjection(null);
         setTabSessionInbox(EMPTY_TAB_SESSION_INBOX);
@@ -1460,6 +1802,7 @@ const App = () => {
         setUrlProjection(null);
         setUrlInbox(EMPTY_URL_INBOX);
         setUrlSuggestions({});
+        tabSessionLoadInFlightRef.current = false;
         return;
       }
       if (!background) {
@@ -1473,31 +1816,49 @@ const App = () => {
             fetchCompanionJson<unknown>('/v1/visits/inbox?limit=51&offset=0'),
           ]);
           if (isUrlProjection(urlProj) && isUrlInboxData(urlInboxResp)) {
-            setUrlProjection(urlProj);
-            setUrlInbox(urlInboxResp);
+            const reconciledUrlProj = reconcileUrlProjectionForLocalMutations(
+              urlProj,
+              optimisticUrlMutationsRef.current,
+            );
+            const reconciledUrlInbox =
+              optimisticUrlMutationsRef.current.size === 0
+                ? urlInboxResp
+                : urlInboxDataFromProjection(reconciledUrlProj, urlInboxResp);
+            setUrlProjection(reconciledUrlProj);
+            setUrlInbox(reconciledUrlInbox);
+            const focusedRawUrl =
+              liveActiveTabUrlRef.current ??
+              stateRef.current.activeTabUrl ??
+              stateRef.current.currentTab?.tabSnapshot?.url ??
+              stateRef.current.currentTab?.threadUrl;
+            const focusedRecord = urlRecordForFocusedUrl(reconciledUrlProj, focusedRawUrl);
+            const focusedExtras = focusedRecord === undefined ? [] : [focusedRecord.canonicalUrl];
+            const focusedCached =
+              focusedRecord === undefined
+                ? undefined
+                : urlSuggestionsRef.current[focusedRecord.canonicalUrl];
+            if (
+              focusedRecord !== undefined &&
+              (forceRefetch || focusedCached === undefined)
+            ) {
+              void loadFocusedUrlSuggestion(focusedRecord.canonicalUrl);
+            }
             if (!urlSuggestionLoadInFlightRef.current) {
               urlSuggestionLoadInFlightRef.current = true;
-              // Include the currently-focused tab's URL in the suggestion
-              // fetch even when it's not in the inbox top page — otherwise
-              // the Current Tab card renders without a suggestion for
-              // late-page or attributed URLs the resolver could still
-              // give us advice on. Read from the latest active-tab state.
-              const focusedCanonical =
-                liveActiveTabUrlRef.current ??
-                state.activeTabUrl ??
-                state.currentTab?.tabSnapshot?.url ??
-                state.currentTab?.threadUrl;
-              const focusedExtras =
-                typeof focusedCanonical === 'string' && focusedCanonical.length > 0
-                  ? [focusedCanonical]
-                  : [];
+              // Include the focused tab's canonical URL first when it
+              // exists in the projection. The single focused fetch above
+              // usually wins the race and paints Current Tab quickly;
+              // this bulk pass keeps Inbox suggestions warm without
+              // requiring a second code path for cache replacement.
               void loadUrlSuggestions(
-                urlInboxResp,
+                reconciledUrlInbox,
                 urlSuggestionsRef.current,
                 forceRefetch,
                 focusedExtras,
               )
-                .then(setUrlSuggestions)
+                .then((next) => {
+                  setUrlSuggestions((current) => ({ ...current, ...next }));
+                })
                 .catch(() => undefined)
                 .finally(() => {
                   urlSuggestionLoadInFlightRef.current = false;
@@ -1512,7 +1873,12 @@ const App = () => {
           console.warn('[sidetrack:panel] loadTabSessions — /v1/visits fetch failed', err);
         }
       };
-      void loadUrlState();
+      if (!urlStateLoadInFlightRef.current) {
+        urlStateLoadInFlightRef.current = true;
+        void loadUrlState().finally(() => {
+          urlStateLoadInFlightRef.current = false;
+        });
+      }
       try {
         const [tabProjection, tabInbox] = await Promise.all([
           fetchCompanionJson<unknown>('/v1/tabsessions/projection'),
@@ -1557,9 +1923,17 @@ const App = () => {
         }
       } finally {
         if (!background) setTabSessionLoading(false);
+        tabSessionLoadInFlightRef.current = false;
       }
     },
-    [bridgeKey, fetchCompanionJson, loadTabSessionSuggestions, loadUrlSuggestions, port],
+    [
+      bridgeKey,
+      fetchCompanionJson,
+      loadFocusedUrlSuggestion,
+      loadTabSessionSuggestions,
+      loadUrlSuggestions,
+      port,
+    ],
   );
 
   // Stage 5 follow-up — `state.updatedAt` and `viewMode` are reactive
@@ -1626,6 +2000,11 @@ const App = () => {
       new Promise((resolve) => {
         setTimeout(resolve, ms);
       });
+    const focusedRawUrl = (): string | undefined =>
+      liveActiveTabUrlRef.current ??
+      stateRef.current.activeTabUrl ??
+      stateRef.current.currentTab?.tabSnapshot?.url ??
+      stateRef.current.currentTab?.threadUrl;
     const forceDrainTimeline = (): Promise<void> =>
       new Promise((resolve) => {
         if (chromeApi?.runtime?.sendMessage === undefined) {
@@ -1644,6 +2023,34 @@ const App = () => {
           resolve();
         }
       });
+    const readSnapshotRevision = async (): Promise<string | null> => {
+      try {
+        const status = await fetchCompanionJson<unknown>('/v1/status');
+        return snapshotRevisionFromStatusData(status);
+      } catch {
+        return null;
+      }
+    };
+    const refreshFocusedProjectionWithRetry = async (): Promise<boolean> => {
+      await delay(150);
+      if (await refreshFocusedUrlProjection(focusedRawUrl())) return true;
+      let lastProjectionRevision = stateRef.current.snapshotRevision ?? null;
+      for (let attempt = 0; attempt < FOCUSED_URL_PROJECTION_RETRY_MAX_ATTEMPTS; attempt += 1) {
+        await delay(FOCUSED_URL_PROJECTION_RETRY_DELAY_MS);
+        if (refreshAgain) return false;
+        const nextRevision = await readSnapshotRevision();
+        if (
+          nextRevision !== null &&
+          nextRevision === lastProjectionRevision &&
+          attempt < FOCUSED_URL_PROJECTION_RETRY_MAX_ATTEMPTS - 1
+        ) {
+          continue;
+        }
+        lastProjectionRevision = nextRevision;
+        if (await refreshFocusedUrlProjection(focusedRawUrl())) return true;
+      }
+      return false;
+    };
     const runRefresh = (): void => {
       if (refreshInFlight !== null) {
         refreshAgain = true;
@@ -1654,8 +2061,10 @@ const App = () => {
           refreshAgain = false;
           if (state.companionStatus !== 'connected') return;
           await forceDrainTimeline();
-          await delay(150);
-          await loadTabSessions({ background: true });
+          const focusedProjectionFound = await refreshFocusedProjectionWithRetry();
+          if (!focusedProjectionFound) {
+            await loadTabSessions({ background: true });
+          }
         } while (refreshAgain);
       })().finally(() => {
         refreshInFlight = null;
@@ -1691,7 +2100,7 @@ const App = () => {
       tabsApi.onActivated.removeListener(onActivated);
       if (pending !== null) clearTimeout(pending);
     };
-  }, [loadTabSessions, state.companionStatus]);
+  }, [fetchCompanionJson, loadTabSessions, refreshFocusedUrlProjection, state.companionStatus]);
 
   useEffect(() => {
     void refresh()
@@ -1900,23 +2309,36 @@ const App = () => {
         // setFocusingThreadId fires correctly but no DOM row exists
         // for the .focusing class to attach to → Jump silently looks
         // like a no-op.
-        const targetCanonical = canonicalThreadUrl(message.threadUrl);
+        const targetCanonical =
+          message.threadUrl === undefined || message.threadUrl.length === 0
+            ? null
+            : canonicalThreadUrl(message.threadUrl);
         void (async () => {
-          let match = stateRef.current.threads.find(
-            (thread) =>
-              thread.threadUrl === message.threadUrl ||
-              canonicalThreadUrl(thread.threadUrl) === targetCanonical,
-          );
+          let match =
+            message.bacId === undefined
+              ? undefined
+              : stateRef.current.threads.find(
+                  (thread) =>
+                    thread.bac_id === message.bacId || thread.threadId === message.bacId,
+                );
+          if (match === undefined && targetCanonical !== null) {
+            match = stateRef.current.threads.find(
+              (thread) =>
+                thread.threadUrl === message.threadUrl ||
+                canonicalThreadUrl(thread.threadUrl) === targetCanonical,
+            );
+          }
           // No local card for this thread (typical for recall hits
           // sourced from the companion vault that the local cache
           // never captured). Synthesize one inline from the message
           // payload so the user can still focus + click into it.
           if (match === undefined && message.bacId !== undefined) {
+            const syntheticUrl = message.threadUrl ?? '';
             const synthesized: TrackedThread = {
               bac_id: message.bacId,
-              provider: detectProviderFromUrl(message.threadUrl),
-              threadUrl: message.threadUrl,
-              title: message.title ?? message.threadUrl,
+              provider: detectProviderFromUrl(syntheticUrl),
+              threadUrl: syntheticUrl,
+              title: message.title ?? message.threadUrl ?? 'Recalled thread',
               lastSeenAt: message.lastSeenAt ?? new Date().toISOString(),
               status: 'active',
               trackingMode: 'manual',
@@ -2101,16 +2523,7 @@ const App = () => {
   // row. Map mutated via the ref callback below.
   const threadRowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const [focusingThreadId, setFocusingThreadId] = useState<string | null>(null);
-  // Mirror of `state` for the message listener registered with empty
-  // deps. Without this, the listener can only see state via a
-  // setState((current) => ...) callback — and React 18 will skip
-  // re-renders if the callback returns the same reference, suppressing
-  // any nested state setters fired inside.
-  const stateRef = useRef(state);
-  useEffect(() => {
-    stateRef.current = state;
-  }, [state]);
-  // Same trick for the bits the focus-thread handler needs to read
+  // Same ref trick for the bits the focus-thread handler needs to read
   // from outside the empty-deps useEffect closure: which view we're
   // on, which workstream is selected, and the helper that expands
   // the All-Threads bucket containing a given thread. Each is mirrored
@@ -2455,22 +2868,172 @@ const App = () => {
     return await sendRequest({ type: messageTypes.getWorkboardState });
   };
 
-  // Per-canonical-URL attribution (Phase B). The Inbox + Current-tab
-  // card now route through here — they attribute the PAGE, not the tab.
-  const attributeUrlToWorkstream = async (
+  const handleTabSessionAttribute = (tabSessionId: string, workstreamId: string | null) => {
+    void runAction(() => attributeTabSessionToWorkstream(tabSessionId, workstreamId));
+  };
+
+  const scheduleUrlMutationReconcile = useCallback((): void => {
+    if (urlMutationReconcileInFlightRef.current) {
+      urlMutationReconcileQueuedRef.current = true;
+      return;
+    }
+    const run = (): void => {
+      urlMutationReconcileInFlightRef.current = true;
+      void loadTabSessions({ background: true, forceRefetchSuggestions: true })
+        .catch(() => undefined)
+        .finally(() => {
+          if (urlMutationReconcileQueuedRef.current) {
+            urlMutationReconcileQueuedRef.current = false;
+            run();
+            return;
+          }
+          urlMutationReconcileInFlightRef.current = false;
+        });
+    };
+    run();
+  }, [loadTabSessions]);
+
+  const snapshotUrlMutation = (canonicalUrl: string): UrlMutationSnapshot => {
+    const record = urlProjectionRef.current?.byCanonicalUrl[canonicalUrl];
+    const inboxItem = urlInboxRef.current.items.find(
+      (item) => item.canonicalUrl === canonicalUrl,
+    );
+    const suggestion = urlSuggestionsRef.current[canonicalUrl];
+    return {
+      ...(record === undefined ? {} : { record }),
+      ...(inboxItem === undefined ? {} : { inboxItem }),
+      ...(suggestion === undefined ? {} : { suggestion }),
+    };
+  };
+
+  const applyCommittedUrlProjection = (
+    projection: UrlProjection,
+    canonicalUrl: string,
+    clientEventId: string,
+    kind: 'attribute' | 'ignore',
+  ): boolean => {
+    const record = projection.byCanonicalUrl[canonicalUrl];
+    const committed =
+      kind === 'attribute'
+        ? record?.currentAttribution?.clientEventId === clientEventId
+        : record?.currentIgnored?.clientEventId === clientEventId;
+    if (!committed) return false;
+    optimisticUrlMutationsRef.current.delete(canonicalUrl);
+    const reconciledProjection = reconcileUrlProjectionForLocalMutations(
+      projection,
+      optimisticUrlMutationsRef.current,
+    );
+    setUrlProjection(reconciledProjection);
+    setUrlInbox((current) => urlInboxDataFromProjection(reconciledProjection, current));
+    setUrlSuggestions((current) => withoutUrlSuggestion(current, canonicalUrl));
+    return true;
+  };
+
+  const rollbackOptimisticUrlMutation = (
+    canonicalUrl: string,
+    clientEventId: string,
+    snapshot: UrlMutationSnapshot,
+  ): void => {
+    optimisticUrlMutationsRef.current.delete(canonicalUrl);
+    setUrlProjection((current) => {
+      if (current === null) return current;
+      const record = current.byCanonicalUrl[canonicalUrl];
+      const stillOptimistic =
+        record?.currentAttribution?.clientEventId === clientEventId ||
+        record?.currentIgnored?.clientEventId === clientEventId;
+      if (!stillOptimistic) return current;
+      const byCanonicalUrl = { ...current.byCanonicalUrl };
+      if (snapshot.record === undefined) {
+        delete byCanonicalUrl[canonicalUrl];
+      } else {
+        byCanonicalUrl[canonicalUrl] = snapshot.record;
+      }
+      return { ...current, byCanonicalUrl };
+    });
+    const inboxItem = snapshot.inboxItem;
+    if (inboxItem !== undefined) {
+      setUrlInbox((current) => restoreUrlInboxItem(current, inboxItem));
+    }
+    setUrlSuggestions((current) => {
+      const next = withoutUrlSuggestion(current, canonicalUrl);
+      if (snapshot.suggestion === undefined) return next;
+      return {
+        ...next,
+        [canonicalUrl]: snapshot.suggestion,
+        [snapshot.suggestion.canonicalUrl]: snapshot.suggestion,
+      };
+    });
+  };
+
+  const applyOptimisticUrlAttribution = (
     canonicalUrl: string,
     workstreamId: string | null,
-  ): Promise<WorkboardState> => {
-    if (port.length === 0 || bridgeKey.length === 0) {
-      throw new Error('Companion is not configured.');
-    }
+    clientEventId: string,
+  ): void => {
+    const observedAt = new Date().toISOString();
+    const mutation: OptimisticUrlMutation = {
+      kind: 'attribute',
+      clientEventId,
+      observedAt,
+      workstreamId,
+    };
+    optimisticUrlMutationsRef.current.set(canonicalUrl, mutation);
+    setUrlProjection((current) => {
+      if (current === null) return current;
+      const existing = current.byCanonicalUrl[canonicalUrl];
+      if (existing === undefined) return current;
+      return {
+        ...current,
+        byCanonicalUrl: {
+          ...current.byCanonicalUrl,
+          [canonicalUrl]: urlRecordWithOptimisticMutation(existing, mutation),
+        },
+      };
+    });
+    setUrlInbox((current) => removeUrlFromInbox(current, canonicalUrl));
+    setUrlSuggestions((current) => withoutUrlSuggestion(current, canonicalUrl));
+  };
+
+  const applyOptimisticUrlIgnore = (
+    canonicalUrl: string,
+    reason: UrlIgnoredState['reason'],
+    clientEventId: string,
+  ): void => {
+    const mutation: OptimisticUrlMutation = {
+      kind: 'ignore',
+      reason,
+      observedAt: new Date().toISOString(),
+      clientEventId,
+    };
+    optimisticUrlMutationsRef.current.set(canonicalUrl, mutation);
+    setUrlProjection((current) => {
+      if (current === null) return current;
+      const existing = current.byCanonicalUrl[canonicalUrl];
+      if (existing === undefined) return current;
+      return {
+        ...current,
+        byCanonicalUrl: {
+          ...current.byCanonicalUrl,
+          [canonicalUrl]: urlRecordWithOptimisticMutation(existing, mutation),
+        },
+      };
+    });
+    setUrlInbox((current) => removeUrlFromInbox(current, canonicalUrl));
+    setUrlSuggestions((current) => withoutUrlSuggestion(current, canonicalUrl));
+  };
+
+  const commitUrlAttribution = async (
+    canonicalUrl: string,
+    workstreamId: string | null,
+    clientEventId: string,
+  ): Promise<UrlProjection | null> => {
     const response = await fetch(
       `http://127.0.0.1:${port}/v1/visits/${encodeURIComponent(canonicalUrl)}/attribute`,
       {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          'idempotency-key': `url-${canonicalUrl}-${workstreamId ?? 'inbox'}-${String(Date.now())}`,
+          'idempotency-key': clientEventId,
           'x-bac-bridge-key': bridgeKey,
         },
         body: JSON.stringify({ workstreamId }),
@@ -2479,13 +3042,30 @@ const App = () => {
     if (!response.ok) {
       throw new Error(`URL attribution failed (${String(response.status)}).`);
     }
-    // User mutation — refetch resolver suggestions (cache is stale).
-    await loadTabSessions({ forceRefetchSuggestions: true });
-    return await sendRequest({ type: messageTypes.getWorkboardState });
+    return await readUrlMutationProjection(response);
   };
 
-  const handleTabSessionAttribute = (tabSessionId: string, workstreamId: string | null) => {
-    void runAction(() => attributeTabSessionToWorkstream(tabSessionId, workstreamId));
+  const commitUrlIgnore = async (
+    canonicalUrl: string,
+    reason: UrlIgnoredState['reason'],
+    clientEventId: string,
+  ): Promise<UrlProjection | null> => {
+    const response = await fetch(
+      `http://127.0.0.1:${port}/v1/visits/${encodeURIComponent(canonicalUrl)}/ignore`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'idempotency-key': clientEventId,
+          'x-bac-bridge-key': bridgeKey,
+        },
+        body: JSON.stringify({ reason }),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`URL ignore failed (${String(response.status)}).`);
+    }
+    return await readUrlMutationProjection(response);
   };
 
   // High-confidence URL resolver auto-apply. Companion gate is
@@ -2498,9 +3078,11 @@ const App = () => {
   //      (the companion enforces this too as a safety check).
   //   3. Track in-flight per-URL to avoid spamming the same URL.
   const triggerUrlAutoApply = useCallback(
-    async (canonicalUrl: string): Promise<void> => {
+    async (canonicalUrl: string, evidenceHash: string): Promise<void> => {
       if (port.length === 0 || bridgeKey.length === 0) return;
       if (urlAutoApplyInFlightRef.current.has(canonicalUrl)) return;
+      if (urlAutoApplyAttemptedRef.current.get(canonicalUrl) === evidenceHash) return;
+      urlAutoApplyAttemptedRef.current.set(canonicalUrl, evidenceHash);
       urlAutoApplyInFlightRef.current.add(canonicalUrl);
       try {
         await fetch(
@@ -2535,8 +3117,8 @@ const App = () => {
     for (const [canonicalUrl, result] of Object.entries(urlSuggestions)) {
       if (result.decision.action !== 'auto-apply') continue;
       const existing = urlProjection.byCanonicalUrl[canonicalUrl]?.currentAttribution;
-      if (existing !== undefined && existing.source !== 'inferred') continue;
-      void triggerUrlAutoApply(canonicalUrl);
+      if (existing !== undefined) continue;
+      void triggerUrlAutoApply(canonicalUrl, urlAutoApplyAttemptKey(result));
     }
   }, [urlSuggestions, urlProjection, triggerUrlAutoApply]);
 
@@ -2544,9 +3126,37 @@ const App = () => {
   // switchover. The card's record is a synthesized TabSessionRecord
   // whose `tabSessionId` field carries the canonical URL — see
   // `tabSessionRecordFromUrl` in this file. This dispatches to the
-  // per-URL attribution endpoint.
+  // per-URL attribution endpoint, but accepts locally first so the
+  // Inbox row disappears before the companion finishes the write.
   const handleUrlAttribute = (canonicalUrl: string, workstreamId: string | null) => {
-    void runAction(() => attributeUrlToWorkstream(canonicalUrl, workstreamId));
+    if (port.length === 0 || bridgeKey.length === 0) {
+      setError('Companion is not configured.');
+      return;
+    }
+    if (urlMutationInFlightRef.current.has(canonicalUrl)) return;
+    const clientEventId = urlMutationClientEventId('attribute');
+    const snapshot = snapshotUrlMutation(canonicalUrl);
+    urlMutationInFlightRef.current.add(canonicalUrl);
+    setError(null);
+    applyOptimisticUrlAttribution(canonicalUrl, workstreamId, clientEventId);
+    void commitUrlAttribution(canonicalUrl, workstreamId, clientEventId)
+      .then((projection) => {
+        if (projection !== null) {
+          applyCommittedUrlProjection(projection, canonicalUrl, clientEventId, 'attribute');
+        }
+        setError(null);
+        scheduleUrlMutationReconcile();
+      })
+      .catch((mutationError) => {
+        rollbackOptimisticUrlMutation(canonicalUrl, clientEventId, snapshot);
+        setError(
+          mutationError instanceof Error ? mutationError.message : 'URL attribution failed.',
+        );
+        scheduleUrlMutationReconcile();
+      })
+      .finally(() => {
+        urlMutationInFlightRef.current.delete(canonicalUrl);
+      });
   };
 
   // Stage 5 polish — explicit "ignore this URL" action. Distinct from
@@ -2554,37 +3164,36 @@ const App = () => {
   // urls.ignored event so the URL is hidden from Inbox + skipped by
   // auto-apply. Reversible: re-organizing into a workstream clears
   // the ignore in the projection mutator.
-  const ignoreUrl = async (
-    canonicalUrl: string,
-    reason: 'noise' | 'duplicate' | 'private' = 'noise',
-  ): Promise<WorkboardState> => {
-    if (port.length === 0 || bridgeKey.length === 0) {
-      throw new Error('Companion is not configured.');
-    }
-    const response = await fetch(
-      `http://127.0.0.1:${port}/v1/visits/${encodeURIComponent(canonicalUrl)}/ignore`,
-      {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'idempotency-key': `url-ignore-${canonicalUrl}-${reason}-${String(Date.now())}`,
-          'x-bac-bridge-key': bridgeKey,
-        },
-        body: JSON.stringify({ reason }),
-      },
-    );
-    if (!response.ok) {
-      throw new Error(`URL ignore failed (${String(response.status)}).`);
-    }
-    await loadTabSessions({ forceRefetchSuggestions: true });
-    return await sendRequest({ type: messageTypes.getWorkboardState });
-  };
-
   const handleUrlIgnore = (
     canonicalUrl: string,
-    reason: 'noise' | 'duplicate' | 'private' = 'noise',
+    reason: UrlIgnoredState['reason'] = 'noise',
   ) => {
-    void runAction(() => ignoreUrl(canonicalUrl, reason));
+    if (port.length === 0 || bridgeKey.length === 0) {
+      setError('Companion is not configured.');
+      return;
+    }
+    if (urlMutationInFlightRef.current.has(canonicalUrl)) return;
+    const clientEventId = urlMutationClientEventId('ignore');
+    const snapshot = snapshotUrlMutation(canonicalUrl);
+    urlMutationInFlightRef.current.add(canonicalUrl);
+    setError(null);
+    applyOptimisticUrlIgnore(canonicalUrl, reason, clientEventId);
+    void commitUrlIgnore(canonicalUrl, reason, clientEventId)
+      .then((projection) => {
+        if (projection !== null) {
+          applyCommittedUrlProjection(projection, canonicalUrl, clientEventId, 'ignore');
+        }
+        setError(null);
+        scheduleUrlMutationReconcile();
+      })
+      .catch((mutationError) => {
+        rollbackOptimisticUrlMutation(canonicalUrl, clientEventId, snapshot);
+        setError(mutationError instanceof Error ? mutationError.message : 'URL ignore failed.');
+        scheduleUrlMutationReconcile();
+      })
+      .finally(() => {
+        urlMutationInFlightRef.current.delete(canonicalUrl);
+      });
   };
 
   // Stage 5 polish — "Dump panel state" button handler. Collects the
@@ -2788,6 +3397,10 @@ const App = () => {
   //     query all tabs matching threadUrl and focus the first one.
   // (3) Otherwise create a new tab at threadUrl.
   const openTabForThread = (thread: TrackedThread) => {
+    if (thread.threadUrl.length === 0) {
+      setError('No source URL is available for this recalled thread yet.');
+      return;
+    }
     const tabId = thread.tabSnapshot?.tabId;
     const focusByQuery = async () => {
       try {
@@ -3797,6 +4410,45 @@ const App = () => {
   );
   const focusedTabSuggestion =
     focusedUrlRecord === undefined ? undefined : urlSuggestions[focusedUrlRecord.canonicalUrl];
+  useEffect(() => {
+    if (state.companionStatus !== 'connected') return undefined;
+    if (focusedUrlRecord === undefined) return undefined;
+    if (
+      focusedUrlRecord.currentAttribution !== undefined ||
+      focusedUrlRecord.currentIgnored !== undefined
+    ) {
+      return undefined;
+    }
+    if (focusedTabSuggestion !== undefined) {
+      return undefined;
+    }
+
+    const canonicalUrl = focusedUrlRecord.canonicalUrl;
+    let cancelled = false;
+    let attempts = 0;
+    let timer: number | null = null;
+    const run = (): void => {
+      attempts += 1;
+      void loadFocusedUrlSuggestion(canonicalUrl).then((result) => {
+        if (cancelled) return;
+        if (result !== null) {
+          return;
+        }
+        if (attempts >= FOCUSED_RESOLVER_RETRY_MAX_ATTEMPTS) return;
+        timer = window.setTimeout(run, FOCUSED_RESOLVER_RETRY_DELAY_MS);
+      });
+    };
+    timer = window.setTimeout(run, FOCUSED_RESOLVER_RETRY_DELAY_MS);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [
+    focusedTabSuggestion,
+    focusedUrlRecord,
+    loadFocusedUrlSuggestion,
+    state.companionStatus,
+  ]);
   const focusedSuggestionIsActionable =
     focusedUrlRecord !== undefined &&
     focusedUrlRecord.currentAttribution === undefined &&
@@ -5763,7 +6415,9 @@ const App = () => {
         ) : null}
       </section>
 
-      {suggestedOpenTabSession !== undefined && suggestedOpenTabSessionResolution !== undefined ? (
+      {viewMode === 'inbox' &&
+      suggestedOpenTabSession !== undefined &&
+      suggestedOpenTabSessionResolution !== undefined ? (
         <SuggestionBanner
           record={suggestedOpenTabSession}
           suggestion={tabSessionResolutionFromUrl(suggestedOpenTabSessionResolution)}
@@ -7433,9 +8087,19 @@ function NeedsOrganizeSuggestionRow({
   } | null>(cached ?? null);
   const [refreshTick, setRefreshTick] = useState(0);
   const [pending, setPending] = useState(false);
+  const onCacheRef = useRef(onCache);
+
+  useEffect(() => {
+    onCacheRef.current = onCache;
+  }, [onCache]);
 
   useEffect(() => {
     if (companionPort === null || bridgeKey === null) return undefined;
+    if (cached !== undefined && refreshTick === 0) {
+      setSuggestion(cached);
+      setPending(false);
+      return undefined;
+    }
     // Suppress fetches while the recall index is rebuilding —
     // partially-rebuilt index gives oscillating scores and the user
     // reads the flicker as instability. The deps below include
@@ -7486,7 +8150,7 @@ function NeedsOrganizeSuggestionRow({
         const label = resolveLabel(top.workstreamId);
         const next = { workstreamId: top.workstreamId, label, confidence: top.score };
         setSuggestion(next);
-        onCache(next);
+        onCacheRef.current(next);
       } catch {
         // Silent — empty render
       } finally {
@@ -7502,7 +8166,6 @@ function NeedsOrganizeSuggestionRow({
     companionPort,
     bridgeKey,
     threadId,
-    onCache,
     resolveLabel,
     workstreamFingerprint,
     indexRebuilding,

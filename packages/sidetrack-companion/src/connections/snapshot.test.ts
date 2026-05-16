@@ -370,18 +370,14 @@ describe('connections — snapshot reducer (Given/Then)', () => {
     // Stage 5.0 follow-up — evidence is stored on `edge.metadata.evidence`,
     // NOT `producedBy.evidence`. Assert both halves so a future move
     // back to producedBy doesn't pass silently.
-    expect(
-      (edge?.producedBy as Record<string, unknown> | undefined)?.['evidence'],
-    ).toBeUndefined();
+    expect((edge?.producedBy as Record<string, unknown> | undefined)?.['evidence']).toBeUndefined();
     const evidence = (edge?.metadata as { readonly evidence?: Record<string, unknown> } | undefined)
       ?.evidence;
     expect(evidence).toBeDefined();
     expect(evidence?.['providerMatched']).toBe(true);
     expect(evidence?.['titleJaccard']).toBeGreaterThanOrEqual(0.25);
     expect(evidence?.['recencyDeltaMs']).toBeTypeOf('number');
-    expect(evidence?.['recencyDeltaMs']).toBeLessThanOrEqual(
-      24 * 60 * 60 * 1000,
-    );
+    expect(evidence?.['recencyDeltaMs']).toBeLessThanOrEqual(24 * 60 * 60 * 1000);
   });
 
   it('drops timeline_same_url_as_thread when provider differs, titles do not overlap, and recency is irrelevant', () => {
@@ -416,9 +412,7 @@ describe('connections — snapshot reducer (Given/Then)', () => {
         timelineDays: [day],
       }),
     );
-    expect(
-      snap.edges.find((e) => e.kind === 'timeline_same_url_as_thread'),
-    ).toBeUndefined();
+    expect(snap.edges.find((e) => e.kind === 'timeline_same_url_as_thread')).toBeUndefined();
   });
 
   it('drops timeline_same_url_as_thread when recency exceeds the 24-hour window', () => {
@@ -455,9 +449,7 @@ describe('connections — snapshot reducer (Given/Then)', () => {
         timelineDays: [day],
       }),
     );
-    expect(
-      snap.edges.find((e) => e.kind === 'timeline_same_url_as_thread'),
-    ).toBeUndefined();
+    expect(snap.edges.find((e) => e.kind === 'timeline_same_url_as_thread')).toBeUndefined();
   });
 
   it('annotation URL match yields annotation_targets_thread', () => {
@@ -1448,6 +1440,7 @@ describe('connections — content-derived edges', () => {
           url: 'https://example.test/article',
           canonicalUrl: 'https://example.test/article',
           visitCount: 1,
+          workstreamId: 'ws_tabFallback',
           tabSessionId: 'tses_a',
         },
       ],
@@ -1513,6 +1506,24 @@ describe('connections — content-derived edges', () => {
     );
     expect(visitInstanceEdge?.toNodeId).toBe(nodeIdFor('workstream', 'ws_urlPrimary'));
     expect(visitInstanceEdge?.metadata?.['attributionOrigin']).toBe('canonical-url');
+    const timelineVisit = snap.nodes.find(
+      (node) => node.id === nodeIdFor('timeline-visit', 'https://example.test/article'),
+    );
+    expect(timelineVisit?.metadata['workstreamId']).toBe('ws_urlPrimary');
+    expect(timelineVisit?.metadata['workstreamAttributionOrigin']).toBe('canonical-url');
+    expect(
+      snap.edges.filter(
+        (edge) =>
+          edge.kind === 'visit_in_workstream' &&
+          edge.fromNodeId === nodeIdFor('timeline-visit', 'https://example.test/article'),
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        toNodeId: nodeIdFor('workstream', 'ws_urlPrimary'),
+        confidence: 'asserted',
+        metadata: expect.objectContaining({ attributionOrigin: 'canonical-url' }),
+      }),
+    ]);
     // Tab-session attribution still drives the tab_session_in_workstream
     // edge — it's a separate signal about the whole tab.
     const tabSessionEdge = snap.edges.find(
@@ -1521,6 +1532,62 @@ describe('connections — content-derived edges', () => {
         edge.fromNodeId === nodeIdFor('tab-session', 'tses_a'),
     );
     expect(tabSessionEdge?.toNodeId).toBe(nodeIdFor('workstream', 'ws_tabFallback'));
+  });
+
+  it('explicit null URL attribution suppresses stale timeline workstream stamps', () => {
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: [
+        {
+          id: 'https://example.test/article',
+          firstSeenAt: '2026-05-07T10:00:00.000Z',
+          lastSeenAt: '2026-05-07T10:00:30.000Z',
+          url: 'https://example.test/article',
+          canonicalUrl: 'https://example.test/article',
+          visitCount: 1,
+          workstreamId: 'ws_old',
+          tabSessionId: 'tses_a',
+        },
+      ],
+      updatedAt: '2026-05-07T10:00:30.000Z',
+      entryCount: 1,
+    };
+    const urlProjection = {
+      schemaVersion: 1 as const,
+      byCanonicalUrl: new Map([
+        [
+          'https://example.test/article',
+          {
+            canonicalUrl: 'https://example.test/article',
+            firstSeenAt: '2026-05-07T10:00:00.000Z',
+            lastSeenAt: '2026-05-07T10:00:30.000Z',
+            visitCount: 1,
+            tabSessionIds: ['tses_a'],
+            attributionHistory: [],
+            currentAttribution: {
+              workstreamId: null,
+              source: 'user_asserted' as const,
+              observedAt: '2026-05-07T10:02:00.000Z',
+              clientEventId: 'evt-url-1',
+              replicaId: 'r1',
+              seq: 2,
+            },
+          },
+        ],
+      ]),
+    };
+    const snap = buildConnectionsSnapshot(emptyInput({ timelineDays: [day], urlProjection }));
+    const timelineVisit = snap.nodes.find(
+      (node) => node.id === nodeIdFor('timeline-visit', 'https://example.test/article'),
+    );
+    expect(timelineVisit?.metadata['workstreamId']).toBeUndefined();
+    expect(
+      snap.edges.some(
+        (edge) =>
+          edge.kind === 'visit_in_workstream' &&
+          edge.fromNodeId === nodeIdFor('timeline-visit', 'https://example.test/article'),
+      ),
+    ).toBe(false);
   });
 
   it('tab-session label falls back to host when the projection has a URL but no title', () => {
@@ -2500,7 +2567,9 @@ describe('connections — Stage 5.2 R1/R4 snapshot extension', () => {
 
   it('snapshot includes a populated tabSessionProjection field', () => {
     const tabSessionProjection = projectTabSessions([observation]);
-    const snap = buildConnectionsSnapshot(emptyInput({ events: [observation], tabSessionProjection }));
+    const snap = buildConnectionsSnapshot(
+      emptyInput({ events: [observation], tabSessionProjection }),
+    );
     expect(snap.tabSessionProjection?.schemaVersion).toBe(TAB_SESSION_PROJECTION_SCHEMA_VERSION);
     expect(Object.keys(snap.tabSessionProjection?.bySessionId ?? {})).toContain('tses_test');
   });

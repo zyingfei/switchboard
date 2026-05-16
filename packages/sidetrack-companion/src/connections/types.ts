@@ -261,6 +261,7 @@ export interface ConnectionsSnapshotScope {
   readonly workstreamId?: string;
   readonly nodeId?: string;
   readonly hops?: number;
+  readonly topicVariant?: 'shadow';
 }
 
 export interface ConnectionsSnapshot {

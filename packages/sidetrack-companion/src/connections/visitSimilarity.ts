@@ -649,22 +649,22 @@ export const buildVisitSimilarity = async (
     revisionId: embeddingRevisionId,
     items: indexEntries,
   });
+  const lexicalIndex = buildLexicalIndex(indexEntries);
   const edges: VisitSimilarityEdge[] = [];
 
   for (let sourceIndex = 0; sourceIndex < eligible.length; sourceIndex += 1) {
     const source = eligible[sourceIndex]!;
     const queryVector = queryVectors[sourceIndex];
     if (queryVector === undefined) continue;
-    const candidateEntries = indexEntries.filter((entry) => entry.id !== source.visitKey);
     const ranked = [
       ...rankHybrid(
         source.corpus,
         queryVector,
-        candidateEntries,
+        indexEntries,
         new Date(source.lastSeenAt),
         {
           limit: topK,
-          lexical: buildLexicalIndex(candidateEntries),
+          lexical: lexicalIndex,
           vectorIndex,
           excludeIds: new Set<string>([source.visitKey]),
         },

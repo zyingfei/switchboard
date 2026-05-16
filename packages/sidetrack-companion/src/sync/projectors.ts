@@ -50,7 +50,11 @@ export interface RunImportProjectorsDeps {
 
 interface ProjectorEntry {
   readonly aggregate: string;
-  readonly project: (deps: RunImportProjectorsDeps, event: AcceptedEvent) => Promise<void>;
+  readonly project: (
+    deps: RunImportProjectorsDeps,
+    event: AcceptedEvent,
+    aggregateEvents: readonly AcceptedEvent[],
+  ) => Promise<void>;
 }
 
 const PROJECTOR_REGISTRY: Record<string, ProjectorEntry> = {
@@ -75,13 +79,22 @@ export const runImportProjectors = async (
   deps: RunImportProjectorsDeps,
   event: AcceptedEvent,
 ): Promise<void> => {
+  const aggregateEvents = await deps.eventLog.readByAggregate(event.aggregateId);
+  await runImportProjectorsFromEvents(deps, event, aggregateEvents);
+};
+
+export const runImportProjectorsFromEvents = async (
+  deps: RunImportProjectorsDeps,
+  event: AcceptedEvent,
+  aggregateEvents: readonly AcceptedEvent[],
+): Promise<void> => {
   if (isReviewDraftEvent(event)) {
-    await projectReviewDraftAfterImport(deps, event);
+    await projectReviewDraftAfterImport(deps, event, aggregateEvents);
     return;
   }
   const entry = PROJECTOR_REGISTRY[event.type];
   if (entry === undefined) return;
-  await entry.project(deps, event);
+  await entry.project(deps, event, aggregateEvents);
 };
 
 interface WriteProjectionParams {
@@ -127,11 +140,11 @@ const writeProjection = async (
 async function projectThreadAfterImport(
   deps: RunImportProjectorsDeps,
   event: AcceptedEvent,
+  aggregateEvents: readonly AcceptedEvent[],
 ): Promise<void> {
   const bacId = event.aggregateId;
   if (typeof bacId !== 'string' || bacId.length === 0) return;
-  const merged = await deps.eventLog.readByAggregate(bacId);
-  const projection = projectThread(bacId, merged);
+  const projection = projectThread(bacId, aggregateEvents);
   await writeProjection(deps, {
     aggregate: 'thread',
     aggregateId: bacId,
@@ -145,11 +158,11 @@ async function projectThreadAfterImport(
 async function projectWorkstreamAfterImport(
   deps: RunImportProjectorsDeps,
   event: AcceptedEvent,
+  aggregateEvents: readonly AcceptedEvent[],
 ): Promise<void> {
   const bacId = event.aggregateId;
   if (typeof bacId !== 'string' || bacId.length === 0) return;
-  const merged = await deps.eventLog.readByAggregate(bacId);
-  const projection = projectWorkstream(bacId, merged);
+  const projection = projectWorkstream(bacId, aggregateEvents);
   await writeProjection(deps, {
     aggregate: 'workstream',
     aggregateId: bacId,
@@ -163,11 +176,11 @@ async function projectWorkstreamAfterImport(
 async function projectAnnotationAfterImport(
   deps: RunImportProjectorsDeps,
   event: AcceptedEvent,
+  aggregateEvents: readonly AcceptedEvent[],
 ): Promise<void> {
   const bacId = event.aggregateId;
   if (typeof bacId !== 'string' || bacId.length === 0) return;
-  const merged = await deps.eventLog.readByAggregate(bacId);
-  const projection = projectAnnotations(merged);
+  const projection = projectAnnotations(aggregateEvents);
   const entry = projection.entries.find((candidate) => candidate.bac_id === bacId);
   if (entry === undefined) return;
   await writeProjection(deps, {
@@ -183,11 +196,11 @@ async function projectAnnotationAfterImport(
 async function projectQueueItemAfterImport(
   deps: RunImportProjectorsDeps,
   event: AcceptedEvent,
+  aggregateEvents: readonly AcceptedEvent[],
 ): Promise<void> {
   const bacId = event.aggregateId;
   if (typeof bacId !== 'string' || bacId.length === 0) return;
-  const merged = await deps.eventLog.readByAggregate(bacId);
-  const projection = projectQueueItem(bacId, merged);
+  const projection = projectQueueItem(bacId, aggregateEvents);
   await writeProjection(deps, {
     aggregate: 'queue',
     aggregateId: bacId,
@@ -201,11 +214,11 @@ async function projectQueueItemAfterImport(
 async function projectDispatchAfterImport(
   deps: RunImportProjectorsDeps,
   event: AcceptedEvent,
+  aggregateEvents: readonly AcceptedEvent[],
 ): Promise<void> {
   const bacId = event.aggregateId;
   if (typeof bacId !== 'string' || bacId.length === 0) return;
-  const merged = await deps.eventLog.readByAggregate(bacId);
-  const projection = projectDispatches(merged);
+  const projection = projectDispatches(aggregateEvents);
   const recorded = projection.entries.find((candidate) => candidate.bac_id === bacId);
   const link = projection.links.find((candidate) => candidate.dispatchId === bacId);
   if (recorded === undefined && link === undefined) return;
@@ -227,10 +240,10 @@ async function projectDispatchAfterImport(
 async function projectReviewDraftAfterImport(
   deps: RunImportProjectorsDeps,
   event: AcceptedEvent,
+  aggregateEvents: readonly AcceptedEvent[],
 ): Promise<void> {
   const threadId = event.aggregateId;
-  const merged = await deps.eventLog.readByAggregate(threadId);
-  const reviewEvents = merged.filter((entry) => isReviewDraftEvent(entry));
+  const reviewEvents = aggregateEvents.filter((entry) => isReviewDraftEvent(entry));
   const existing = await readReviewDraft(deps.vaultRoot, threadId);
   const threadUrl = existing?.threadUrl ?? event.target?.canonicalUrl ?? '';
   const projection = projectReviewDraft(threadId, threadUrl, reviewEvents);

@@ -54,11 +54,18 @@ const USER_FLOW_REJECTED = 'user.flow.rejected';
 const compareText = (left: string, right: string): number =>
   left < right ? -1 : left > right ? 1 : 0;
 
+const generatedAtCache = new WeakMap<CandidateContext, number>();
+const visitRecordsCache = new WeakMap<CandidateContext, readonly VisitRecord[]>();
+const visitRecordsByIdCache = new WeakMap<CandidateContext, ReadonlyMap<string, VisitRecord>>();
+const explicitPairsCache = new WeakMap<
+  CandidateContext,
+  Map<string, readonly { readonly from: string; readonly to: string }[]>
+>();
+
 const visitKeyForUrl = (url: string): string =>
   url.trim().replace(/#.*$/u, '').replace(/\/+$/u, '');
 
-const maybeTimestamp = (value: number): number | null =>
-  Number.isFinite(value) ? value : null;
+const maybeTimestamp = (value: number): number | null => (Number.isFinite(value) ? value : null);
 
 const parseTimestamp = (value: string): number | null => {
   const parsed = Date.parse(value);
@@ -69,6 +76,9 @@ const maxTimestamp = (current: number, candidate: number | null): number =>
   candidate === null || candidate <= current ? current : candidate;
 
 const stableGeneratedAt = (context: CandidateContext): number => {
+  const cached = generatedAtCache.get(context);
+  if (cached !== undefined) return cached;
+
   let generatedAt = 0;
 
   for (const event of context.merged) {
@@ -88,6 +98,7 @@ const stableGeneratedAt = (context: CandidateContext): number => {
     generatedAt = maxTimestamp(generatedAt, parseTimestamp(edge.observedAt));
   }
 
+  generatedAtCache.set(context, generatedAt);
   return generatedAt;
 };
 
@@ -154,7 +165,10 @@ const pickOptionalLatestText = (
   return pickLatestText(left, leftObservedAtMs, right, rightObservedAtMs);
 };
 
-const pickRicherTitle = (left: string | undefined, right: string | undefined): string | undefined => {
+const pickRicherTitle = (
+  left: string | undefined,
+  right: string | undefined,
+): string | undefined => {
   if (left === undefined || left.length === 0) return right;
   if (right === undefined || right.length === 0) return left;
   if (right.length > left.length) return right;
@@ -225,7 +239,9 @@ const collectVisitRecords = (events: readonly AcceptedEvent[]): readonly VisitRe
         url: event.payload.url,
         canonicalUrl,
         observedAtMs,
-        ...(event.payload.openerVisitId === null ? {} : { openerVisitId: event.payload.openerVisitId }),
+        ...(event.payload.openerVisitId === null
+          ? {}
+          : { openerVisitId: event.payload.openerVisitId }),
         ...(event.payload.previousVisitId === null
           ? {}
           : { previousVisitId: event.payload.previousVisitId }),
@@ -259,8 +275,24 @@ const collectVisitRecords = (events: readonly AcceptedEvent[]): readonly VisitRe
   return [...byId.values()].sort((left, right) => compareText(left.id, right.id));
 };
 
+const visitRecordsForContext = (context: CandidateContext): readonly VisitRecord[] => {
+  const cached = visitRecordsCache.get(context);
+  if (cached !== undefined) return cached;
+  const records = collectVisitRecords(context.merged);
+  visitRecordsCache.set(context, records);
+  return records;
+};
+
 const recordsById = (records: readonly VisitRecord[]): ReadonlyMap<string, VisitRecord> =>
   new Map(records.map((record) => [record.id, record] as const));
+
+const recordsByIdForContext = (context: CandidateContext): ReadonlyMap<string, VisitRecord> => {
+  const cached = visitRecordsByIdCache.get(context);
+  if (cached !== undefined) return cached;
+  const byId = recordsById(visitRecordsForContext(context));
+  visitRecordsByIdCache.set(context, byId);
+  return byId;
+};
 
 const addToSetMap = (map: Map<string, Set<string>>, key: string, value: string): void => {
   if (key.length === 0 || value.length === 0) return;
@@ -281,7 +313,10 @@ const addUndirected = (graph: Map<string, Set<string>>, left: string, right: str
   addToSetMap(graph, right, left);
 };
 
-const walkGraph = (graph: ReadonlyMap<string, ReadonlySet<string>>, start: string): readonly string[] => {
+const walkGraph = (
+  graph: ReadonlyMap<string, ReadonlySet<string>>,
+  start: string,
+): readonly string[] => {
   const seen = new Set<string>([start]);
   const queue: string[] = [...toSortedIds(graph.get(start))];
 
@@ -298,25 +333,29 @@ const walkGraph = (graph: ReadonlyMap<string, ReadonlySet<string>>, start: strin
   return [...seen].sort(compareText);
 };
 
-const pairSourceGenerator = (
-  source: CandidateSource,
-  readPairs: (context: CandidateContext) => readonly { readonly from: string; readonly to: string }[],
-): SourceGenerator => (fromVisitId, context, generatedAt) => {
-  const fromKey = fromKeyFor(fromVisitId);
-  return candidatesFromIds(
-    fromVisitId,
-    readPairs(context)
-      .filter((pair) => pair.from === fromKey)
-      .map((pair) => pair.to),
-    source,
-    generatedAt,
-  );
-};
+const pairSourceGenerator =
+  (
+    source: CandidateSource,
+    readPairs: (
+      context: CandidateContext,
+    ) => readonly { readonly from: string; readonly to: string }[],
+  ): SourceGenerator =>
+  (fromVisitId, context, generatedAt) => {
+    const fromKey = fromKeyFor(fromVisitId);
+    return candidatesFromIds(
+      fromVisitId,
+      readPairs(context)
+        .filter((pair) => pair.from === fromKey)
+        .map((pair) => pair.to),
+      source,
+      generatedAt,
+    );
+  };
 
-const sourceWrapper = (source: CandidateSource, generator: SourceGenerator): GenerateCandidates => (
-  fromVisitId,
-  context,
-) => generator(fromVisitId, context, stableGeneratedAt(context));
+const sourceWrapper =
+  (source: CandidateSource, generator: SourceGenerator): GenerateCandidates =>
+  (fromVisitId, context) =>
+    generator(fromVisitId, context, stableGeneratedAt(context));
 
 const groupedRecordCandidates = (
   fromVisitId: string,
@@ -325,8 +364,8 @@ const groupedRecordCandidates = (
   generatedAt: number,
   keyForRecord: (record: VisitRecord) => readonly string[],
 ): readonly Candidate[] => {
-  const records = collectVisitRecords(context.merged);
-  const byId = recordsById(records);
+  const records = visitRecordsForContext(context);
+  const byId = recordsByIdForContext(context);
   const fromRecord = byId.get(fromKeyFor(fromVisitId));
   if (fromRecord === undefined) return [];
 
@@ -347,7 +386,9 @@ const groupedRecordCandidates = (
   return candidatesFromIds(fromVisitId, toVisitIds, source, generatedAt);
 };
 
-const workstreamGroupsFromEdges = (edges: readonly ConnectionEdge[]): ReadonlyMap<string, Set<string>> => {
+const workstreamGroupsFromEdges = (
+  edges: readonly ConnectionEdge[],
+): ReadonlyMap<string, Set<string>> => {
   const groups = new Map<string, Set<string>>();
   for (const edge of edges) {
     if (edge.kind !== 'visit_in_workstream') continue;
@@ -368,10 +409,17 @@ const workstreamGroupsFromEdges = (edges: readonly ConnectionEdge[]): ReadonlyMa
 
 const sameWorkstreamGenerator: SourceGenerator = (fromVisitId, context, generatedAt) => {
   const groups = new Map<string, Set<string>>();
-  for (const record of collectVisitRecords(context.merged)) {
-    if (record.workstreamId !== undefined) addToSetMap(groups, record.workstreamId, record.id);
+  const edgeGroups = workstreamGroupsFromEdges(context.existingEdges);
+  const visitsWithEdgeWorkstream = new Set<string>();
+  for (const visitIds of edgeGroups.values()) {
+    for (const visitId of visitIds) visitsWithEdgeWorkstream.add(visitId);
   }
-  for (const [workstreamId, visitIds] of workstreamGroupsFromEdges(context.existingEdges)) {
+  for (const record of visitRecordsForContext(context)) {
+    if (record.workstreamId !== undefined && !visitsWithEdgeWorkstream.has(record.id)) {
+      addToSetMap(groups, record.workstreamId, record.id);
+    }
+  }
+  for (const [workstreamId, visitIds] of edgeGroups) {
     for (const visitId of visitIds) addToSetMap(groups, workstreamId, visitId);
   }
 
@@ -385,17 +433,24 @@ const sameWorkstreamGenerator: SourceGenerator = (fromVisitId, context, generate
   return candidatesFromIds(fromVisitId, toVisitIds, 'same_workstream', generatedAt);
 };
 
-const chainGenerator = (
-  source: CandidateSource,
-  linkForRecord: (record: VisitRecord) => string | undefined,
-): SourceGenerator => (fromVisitId, context, generatedAt) => {
-  const graph = new Map<string, Set<string>>();
-  for (const record of collectVisitRecords(context.merged)) {
-    const linked = linkForRecord(record);
-    if (linked !== undefined) addUndirected(graph, record.id, linked);
-  }
-  return candidatesFromIds(fromVisitId, walkGraph(graph, fromKeyFor(fromVisitId)), source, generatedAt);
-};
+const chainGenerator =
+  (
+    source: CandidateSource,
+    linkForRecord: (record: VisitRecord) => string | undefined,
+  ): SourceGenerator =>
+  (fromVisitId, context, generatedAt) => {
+    const graph = new Map<string, Set<string>>();
+    for (const record of visitRecordsForContext(context)) {
+      const linked = linkForRecord(record);
+      if (linked !== undefined) addUndirected(graph, record.id, linked);
+    }
+    return candidatesFromIds(
+      fromVisitId,
+      walkGraph(graph, fromKeyFor(fromVisitId)),
+      source,
+      generatedAt,
+    );
+  };
 
 const repoOrDomainKeys = (record: VisitRecord): readonly string[] => {
   try {
@@ -465,10 +520,7 @@ const tokenizeTitlePathText = (value: string): readonly string[] =>
     .split(/[^A-Za-z0-9]+/u)
     .map((token) => token.trim().toLowerCase())
     .filter(
-      (token) =>
-        token.length >= 3 &&
-        !/^\d+$/u.test(token) &&
-        !TITLE_PATH_STOP_TOKENS.has(token),
+      (token) => token.length >= 3 && !/^\d+$/u.test(token) && !TITLE_PATH_STOP_TOKENS.has(token),
     );
 
 const titlePathTokenKeys = (record: VisitRecord): readonly string[] => {
@@ -485,7 +537,9 @@ const titlePathTokenKeys = (record: VisitRecord): readonly string[] => {
   return [...new Set(tokenizeTitlePathText(pieces.join(' ')))].map((token) => `token:${token}`);
 };
 
-const snippetGroupsFromEvents = (events: readonly AcceptedEvent[]): ReadonlyMap<string, Set<string>> => {
+const snippetGroupsFromEvents = (
+  events: readonly AcceptedEvent[],
+): ReadonlyMap<string, Set<string>> => {
   const groups = new Map<string, Set<string>>();
   for (const event of events) {
     if (event.type !== SELECTION_COPIED || !isSelectionCopiedPayload(event.payload)) continue;
@@ -494,7 +548,9 @@ const snippetGroupsFromEvents = (events: readonly AcceptedEvent[]): ReadonlyMap<
   return groups;
 };
 
-const snippetGroupsFromEdges = (edges: readonly ConnectionEdge[]): ReadonlyMap<string, Set<string>> => {
+const snippetGroupsFromEdges = (
+  edges: readonly ConnectionEdge[],
+): ReadonlyMap<string, Set<string>> => {
   const groups = new Map<string, Set<string>>();
   for (const edge of edges) {
     if (edge.kind !== 'snippet_copied_from_visit') continue;
@@ -537,8 +593,8 @@ const embeddingNeighborhoodGenerator: SourceGenerator = (fromVisitId, context, g
 };
 
 const crossReplicaContinuationGenerator: SourceGenerator = (fromVisitId, context, generatedAt) => {
-  const records = collectVisitRecords(context.merged);
-  const byId = recordsById(records);
+  const records = visitRecordsForContext(context);
+  const byId = recordsByIdForContext(context);
   const fromRecord = byId.get(fromKeyFor(fromVisitId));
   if (fromRecord === undefined || fromRecord.replicaId === undefined) return [];
 
@@ -556,7 +612,9 @@ const crossReplicaContinuationGenerator: SourceGenerator = (fromVisitId, context
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
-const pairFromPayload = (payload: unknown): { readonly from: string; readonly to: string } | null => {
+const pairFromPayload = (
+  payload: unknown,
+): { readonly from: string; readonly to: string } | null => {
   if (!isRecord(payload)) return null;
   const from =
     typeof payload['fromVisitId'] === 'string'
@@ -576,23 +634,35 @@ const pairFromPayload = (payload: unknown): { readonly from: string; readonly to
   return { from, to };
 };
 
+const explicitPairsForContext = (
+  context: CandidateContext,
+  eventType: string,
+): readonly { readonly from: string; readonly to: string }[] => {
+  let byEventType = explicitPairsCache.get(context);
+  if (byEventType === undefined) {
+    byEventType = new Map<string, readonly { readonly from: string; readonly to: string }[]>();
+    explicitPairsCache.set(context, byEventType);
+  }
+  const cached = byEventType.get(eventType);
+  if (cached !== undefined) return cached;
+
+  const pairs: { from: string; to: string }[] = [];
+  for (const event of context.merged) {
+    if (event.type !== eventType) continue;
+    const pair = pairFromPayload(event.payload);
+    if (pair !== null) pairs.push(pair);
+  }
+  byEventType.set(eventType, pairs);
+  return pairs;
+};
+
 const explicitPairGenerator = (eventType: string, source: CandidateSource): SourceGenerator =>
-  pairSourceGenerator(source, (context) =>
-    context.merged.flatMap((event): readonly { readonly from: string; readonly to: string }[] => {
-      if (event.type !== eventType) return [];
-      const pair = pairFromPayload(event.payload);
-      return pair === null ? [] : [pair];
-    }),
-  );
+  pairSourceGenerator(source, (context) => explicitPairsForContext(context, eventType));
 
 const sameCanonicalUrlGenerator: SourceGenerator = (fromVisitId, context, generatedAt) =>
-  groupedRecordCandidates(
-    fromVisitId,
-    context,
-    'same_canonical_url',
-    generatedAt,
-    (record) => [`canonical:${record.canonicalUrl}`],
-  );
+  groupedRecordCandidates(fromVisitId, context, 'same_canonical_url', generatedAt, (record) => [
+    `canonical:${record.canonicalUrl}`,
+  ]);
 
 const sameRepoOrDomainGenerator: SourceGenerator = (fromVisitId, context, generatedAt) =>
   groupedRecordCandidates(
@@ -604,13 +674,7 @@ const sameRepoOrDomainGenerator: SourceGenerator = (fromVisitId, context, genera
   );
 
 const sameSearchQueryGenerator: SourceGenerator = (fromVisitId, context, generatedAt) =>
-  groupedRecordCandidates(
-    fromVisitId,
-    context,
-    'same_search_query',
-    generatedAt,
-    searchQueryKeys,
-  );
+  groupedRecordCandidates(fromVisitId, context, 'same_search_query', generatedAt, searchQueryKeys);
 
 const sameTitlePathTokensGenerator: SourceGenerator = (fromVisitId, context, generatedAt) =>
   groupedRecordCandidates(

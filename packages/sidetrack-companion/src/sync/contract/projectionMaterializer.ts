@@ -1,7 +1,7 @@
 import type { AcceptedEvent } from '../causal.js';
 import type { EventLog } from '../eventLog.js';
 import type { ProjectionChangeFeed } from '../projectionChanges.js';
-import { runImportProjectors } from '../projectors.js';
+import { runImportProjectors, runImportProjectorsFromEvents } from '../projectors.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
 import { eventTypesForMaterializer } from './registry.js';
 
@@ -78,19 +78,23 @@ export const createProjectionMaterializer = (
     pending = true;
     try {
       const merged = await eventLog.readMerged();
-      // Process each aggregate's latest event. Same logic as
-      // antiEntropy + reproject, here unified.
+      const byAggregate = new Map<string, AcceptedEvent[]>();
       const latest = new Map<string, AcceptedEvent>();
       for (const event of merged) {
-        if (!handles.has(event.type)) continue;
-        const prior = latest.get(event.aggregateId);
-        if (prior === undefined || event.acceptedAtMs >= prior.acceptedAtMs) {
-          latest.set(event.aggregateId, event);
+        const aggregateEvents = byAggregate.get(event.aggregateId) ?? [];
+        aggregateEvents.push(event);
+        byAggregate.set(event.aggregateId, aggregateEvents);
+        if (handles.has(event.type)) {
+          const prior = latest.get(event.aggregateId);
+          if (prior === undefined || event.acceptedAtMs >= prior.acceptedAtMs) {
+            latest.set(event.aggregateId, event);
+          }
         }
       }
+      let projected = 0;
       for (const event of latest.values()) {
         try {
-          await runImportProjectors(
+          await runImportProjectorsFromEvents(
             {
               vaultRoot: deps.vaultRoot,
               eventLog,
@@ -99,9 +103,16 @@ export const createProjectionMaterializer = (
                 : { projectionChanges: deps.projectionChanges }),
             },
             event,
+            byAggregate.get(event.aggregateId) ?? [],
           );
         } catch (err) {
           lastError = err instanceof Error ? err.message : String(err);
+        }
+        projected += 1;
+        if (projected % 100 === 0) {
+          await new Promise<void>((resolve) => {
+            setImmediate(resolve);
+          });
         }
       }
       lastSuccessAt = new Date().toISOString();

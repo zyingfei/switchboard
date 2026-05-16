@@ -2019,6 +2019,78 @@ describe('companion HTTP server', () => {
     expect(body.data[0]?.id).toBe('chunk:thread_a:0:0:111111111111');
   });
 
+  it('GET /v1/recall/query resolves provider thread ids to stable bac_id metadata', async () => {
+    const { writeIndex } = await import('../recall/indexFile.js');
+    const providerThreadId = '69fcb926-3a98-8328-bbe4-baee4da7fbef';
+    const stableBacId = 'QMPG4BZ0SQC1HMJ0';
+    const threadUrl = `https://chatgpt.com/c/${providerThreadId}`;
+    await mkdir(join(vaultPath, '_BAC', 'threads'), { recursive: true });
+    await writeFile(
+      join(vaultPath, '_BAC', 'threads', `${stableBacId}.json`),
+      `${JSON.stringify({
+        bac_id: stableBacId,
+        provider: 'chatgpt',
+        threadId: providerThreadId,
+        threadUrl,
+        title: 'Switchboard - Correctness audit findings',
+        lastSeenAt: '2026-05-14T05:04:59.674Z',
+        updatedAt: '2026-05-14T05:05:01.148Z',
+      })}\n`,
+    );
+    const embedding = new Float32Array(384);
+    embedding[0] = 1;
+    await writeIndex(
+      join(vaultPath, '_BAC', 'recall', 'index.bin'),
+      [
+        {
+          id: 'chunk:capture_event_1:0:0:444444444444',
+          threadId: providerThreadId,
+          capturedAt: '2026-05-14T05:04:59.674Z',
+          embedding,
+          replicaId: 'local',
+          lamport: 1,
+          tombstoned: false,
+          metadata: {
+            sourceBacId: 'capture_event_1',
+            provider: 'chatgpt',
+            threadUrl,
+            title: 'Metadata fallback title',
+            turnOrdinal: 0,
+            headingPath: [],
+            paragraphIndex: 0,
+            charStart: 0,
+            charEnd: 46,
+            textHash: 'c'.repeat(64),
+            text: 'correctness audit stable identity regression',
+          },
+        },
+      ],
+      'test/model',
+    );
+
+    const response = await jsonFetch(
+      context,
+      `${baseUrl}/v1/recall/query?q=${encodeURIComponent('stable identity regression')}`,
+      { headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+
+    expect(response.status).toBe(200);
+    const body = response.body as {
+      readonly data: readonly {
+        readonly threadId: string;
+        readonly bacId?: string;
+        readonly title?: string;
+        readonly threadUrl?: string;
+      }[];
+    };
+    expect(body.data[0]).toMatchObject({
+      threadId: providerThreadId,
+      bacId: stableBacId,
+      title: 'Switchboard - Correctness audit findings',
+      threadUrl,
+    });
+  });
+
   it('GET /v1/recall/query returns 503 RECALL_MODEL_MISSING when the embedder cannot load the model', async () => {
     // Seed a non-empty index so the route reaches the embed() call
     // (it short-circuits to data:[] when the index file is missing).

@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import App, { formatBuildTimestamp } from '../../entrypoints/sidepanel/App';
 import { messageTypes, type WorkboardRequest } from '../../src/messages';
+import { setConnectionsClientTransportForTests } from '../../src/sidepanel/connections/client';
 import {
   createEmptyWorkboardState,
   defaultSettings,
@@ -156,6 +157,7 @@ const installChromeMock = (
 };
 
 afterEach(() => {
+  setConnectionsClientTransportForTests(null);
   vi.unstubAllGlobals();
 });
 
@@ -594,12 +596,330 @@ describe('live side-panel App wiring', () => {
     });
   });
 
+  it('accepts Inbox URL actions before the companion commit finishes', async () => {
+    installChromeMock(
+      {
+        ...liveState(),
+        companionStatus: 'connected',
+      },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    const slowRecord = {
+      canonicalUrl: 'https://slow.test/page',
+      firstSeenAt: NOW,
+      lastSeenAt: NOW,
+      visitCount: 1,
+      tabSessionIds: ['tses_slow'],
+      latestUrl: 'https://slow.test/page',
+      latestTitle: 'Slow page',
+      attributionHistory: [],
+    };
+    const committedRecord = {
+      ...slowRecord,
+      currentAttribution: {
+        workstreamId: null,
+        source: 'user_asserted',
+        observedAt: NOW,
+        clientEventId: 'server-commit',
+      },
+    };
+    const tabProjection = {
+      schemaVersion: 1,
+      bySessionId: {},
+      openSessionsByTabId: {},
+    };
+    const unresolvedUrlSuggestion = {
+      canonicalUrl: slowRecord.canonicalUrl,
+      dryRun: true,
+      decision: {
+        action: 'inbox',
+        margin: 0,
+      },
+      fusedCandidates: [],
+    };
+    type MockFetchResponse = {
+      readonly ok: boolean;
+      readonly status: number;
+      readonly json: () => Promise<unknown>;
+      readonly text: () => Promise<string>;
+    };
+    const jsonResponse = (data: unknown, status = 200): MockFetchResponse => ({
+      ok: status >= 200 && status < 300,
+      status,
+      json: async () => ({ data }),
+      text: async () => JSON.stringify({ data }),
+    });
+    let committed = false;
+    let resolveAttribute: ((response: MockFetchResponse) => void) | undefined;
+    const attributePromise = new Promise<MockFetchResponse>((resolve) => {
+      resolveAttribute = resolve;
+    });
+    const fetchMock = vi.fn((input: RequestInfo | URL, _init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/v1/tabsessions/projection')) {
+        return Promise.resolve(jsonResponse(tabProjection));
+      }
+      if (url.includes('/v1/tabsessions/inbox')) {
+        return Promise.resolve(jsonResponse({ items: [], total: 0, limit: 51, offset: 0 }));
+      }
+      if (url.includes('/v1/visits/projection')) {
+        return Promise.resolve(
+          jsonResponse({
+            schemaVersion: 1,
+            byCanonicalUrl: {
+              [slowRecord.canonicalUrl]: committed ? committedRecord : slowRecord,
+            },
+          }),
+        );
+      }
+      if (url.includes('/v1/visits/inbox')) {
+        return Promise.resolve(
+          jsonResponse({
+            items: committed ? [] : [slowRecord],
+            total: committed ? 0 : 1,
+            limit: 51,
+            offset: 0,
+          }),
+        );
+      }
+      if (url.includes('/v1/visits/') && url.includes('/resolve')) {
+        return Promise.resolve(jsonResponse(unresolvedUrlSuggestion));
+      }
+      if (url.includes('/v1/visits/') && url.includes('/attribute')) {
+        return attributePromise;
+      }
+      return Promise.resolve({ ok: false, status: 404, text: async () => 'not found' });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('tab', { name: 'Inbox' }));
+    const inboxCard = await screen.findByTestId(`tab-session-card-${slowRecord.canonicalUrl}`);
+    fireEvent.click(within(inboxCard).getByRole('button', { name: 'Not in any stream' }));
+
+    expect(
+      screen.queryByTestId(`tab-session-card-${slowRecord.canonicalUrl}`),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText('Loading tab sessions…')).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        `http://127.0.0.1:17373/v1/visits/${encodeURIComponent(slowRecord.canonicalUrl)}/attribute`,
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ workstreamId: null }),
+          headers: expect.objectContaining({
+            'idempotency-key': expect.stringMatching(/^url-attribute-/u),
+          }),
+        }),
+      );
+    });
+
+    const projectionCallsBeforeRefresh = fetchMock.mock.calls.filter(([input]) =>
+      String(input).includes('/v1/visits/projection'),
+    ).length;
+    fireEvent.click(screen.getByRole('button', { name: 'refresh' }));
+    await waitFor(() => {
+      const projectionCallsAfterRefresh = fetchMock.mock.calls.filter(([input]) =>
+        String(input).includes('/v1/visits/projection'),
+      ).length;
+      expect(projectionCallsAfterRefresh).toBeGreaterThan(projectionCallsBeforeRefresh);
+    });
+    expect(
+      screen.queryByTestId(`tab-session-card-${slowRecord.canonicalUrl}`),
+    ).not.toBeInTheDocument();
+
+    const projectionCallsBeforeCommit = fetchMock.mock.calls.filter(([input]) =>
+      String(input).includes('/v1/visits/projection'),
+    ).length;
+    committed = true;
+    if (resolveAttribute === undefined) {
+      throw new Error('Expected attribute request to be pending.');
+    }
+    resolveAttribute(jsonResponse({ accepted: {} }, 201));
+    await waitFor(() => {
+      const projectionCallsAfterCommit = fetchMock.mock.calls.filter(([input]) =>
+        String(input).includes('/v1/visits/projection'),
+      ).length;
+      expect(projectionCallsAfterCommit).toBeGreaterThan(projectionCallsBeforeCommit);
+    });
+    expect(
+      screen.queryByTestId(`tab-session-card-${slowRecord.canonicalUrl}`),
+    ).not.toBeInTheDocument();
+  });
+
+  it('refreshes the focused URL after the materializer projection catches up', async () => {
+    const focusedUrl = 'https://delayed.test/page';
+    const state = {
+      ...liveState(),
+      companionStatus: 'connected',
+      activeTabUrl: focusedUrl,
+    };
+    const onUpdatedListeners: ((...args: unknown[]) => void)[] = [];
+    const onActivatedListeners: ((...args: unknown[]) => void)[] = [];
+    const sendMessage = vi.fn(
+      (
+        request: WorkboardRequest | { readonly type?: unknown },
+        callback?: (response: unknown) => void,
+      ) => {
+        const response = { ok: true, state, request };
+        if (callback !== undefined) callback(response);
+        return Promise.resolve(response);
+      },
+    );
+    const storageValues: Record<string, unknown> = { [SETUP_COMPLETED_KEY]: true };
+    const get = vi.fn((query: StorageQuery): Promise<Record<string, unknown>> => {
+      if (typeof query === 'string') return Promise.resolve({ [query]: storageValues[query] });
+      if (Array.isArray(query)) {
+        return Promise.resolve(Object.fromEntries(query.map((key) => [key, storageValues[key]])));
+      }
+      if (query !== null && query !== undefined) {
+        return Promise.resolve(
+          Object.fromEntries(
+            Object.entries(query).map(([key, fallback]) => [key, storageValues[key] ?? fallback]),
+          ),
+        );
+      }
+      return Promise.resolve({ ...storageValues });
+    });
+    const set = vi.fn((values: Record<string, unknown>): Promise<void> => {
+      Object.assign(storageValues, values);
+      return Promise.resolve();
+    });
+    vi.stubGlobal('chrome', {
+      runtime: {
+        sendMessage,
+        lastError: undefined,
+        onMessage: { addListener: vi.fn(), removeListener: vi.fn() },
+      },
+      storage: { local: { get, set }, session: { get, set } },
+      tabs: {
+        query: vi.fn(
+          (
+            _queryInfo: chrome.tabs.QueryInfo,
+            callback?: (tabs: chrome.tabs.Tab[]) => void,
+          ) => {
+            const tabs = [
+              { active: true, url: focusedUrl, title: 'Delayed page' },
+            ] as chrome.tabs.Tab[];
+            if (callback !== undefined) callback(tabs);
+            return Promise.resolve(tabs);
+          },
+        ),
+        onUpdated: {
+          addListener: vi.fn((listener: (...args: unknown[]) => void) => {
+            onUpdatedListeners.push(listener);
+          }),
+          removeListener: vi.fn(),
+        },
+        onActivated: {
+          addListener: vi.fn((listener: (...args: unknown[]) => void) => {
+            onActivatedListeners.push(listener);
+          }),
+          removeListener: vi.fn(),
+        },
+      },
+    });
+
+    const focusedRecord = {
+      canonicalUrl: focusedUrl,
+      firstSeenAt: NOW,
+      lastSeenAt: NOW,
+      visitCount: 1,
+      tabSessionIds: ['tses_delayed'],
+      latestUrl: focusedUrl,
+      latestTitle: 'Delayed page',
+      attributionHistory: [],
+    };
+    const tabProjection = {
+      schemaVersion: 1,
+      bySessionId: {},
+      openSessionsByTabId: {},
+    };
+    const suggestion = {
+      canonicalUrl: focusedUrl,
+      dryRun: true,
+      decision: {
+        action: 'suggest',
+        workstreamId: 'bac_workstream_sibling',
+        margin: 1.1,
+      },
+      fusedCandidates: [
+        {
+          workstreamId: 'bac_workstream_sibling',
+          rawFusionLogit: 2,
+          dominantSource: 'ppr',
+          reasons: [],
+        },
+      ],
+    };
+    type MockFetchResponse = {
+      readonly ok: boolean;
+      readonly status: number;
+      readonly json: () => Promise<unknown>;
+      readonly text: () => Promise<string>;
+    };
+    const jsonResponse = (data: unknown): MockFetchResponse => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ data }),
+      text: async () => JSON.stringify({ data }),
+    });
+    let projectionReady = false;
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v1/tabsessions/projection')) {
+        return Promise.resolve(jsonResponse(tabProjection));
+      }
+      if (url.includes('/v1/tabsessions/inbox')) {
+        return Promise.resolve(jsonResponse({ items: [], total: 0, limit: 51, offset: 0 }));
+      }
+      if (url.includes('/v1/visits/projection')) {
+        return Promise.resolve(
+          jsonResponse({
+            schemaVersion: 1,
+            byCanonicalUrl: projectionReady ? { [focusedUrl]: focusedRecord } : {},
+          }),
+        );
+      }
+      if (url.includes('/v1/visits/inbox')) {
+        return Promise.resolve(jsonResponse({ items: [], total: 0, limit: 51, offset: 0 }));
+      }
+      if (url.includes('/v1/visits/') && url.includes('/resolve')) {
+        return Promise.resolve(jsonResponse(suggestion));
+      }
+      return Promise.resolve({ ok: false, status: 404, text: async () => 'not found' });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('focused-tab-attribution')).toHaveTextContent('(capturing…)');
+      expect(onUpdatedListeners.length).toBeGreaterThan(0);
+      expect(onActivatedListeners.length).toBeGreaterThan(0);
+    });
+
+    projectionReady = true;
+    for (const listener of onUpdatedListeners) {
+      listener(123, { url: focusedUrl }, { active: true });
+    }
+
+    expect(screen.queryByLabelText('Tab-session suggestion')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: /^Inbox/u }));
+    const banner = await screen.findByLabelText('Tab-session suggestion', undefined, {
+      timeout: 3_500,
+    });
+    expect(banner).toHaveTextContent('Sibling');
+    expect(screen.getByTestId('focused-tab-attribution')).not.toHaveTextContent('(capturing…)');
+  });
+
   it('renders resolver suggestions and confirms them through tab-session attribution', async () => {
     installChromeMock(
       {
         ...liveState(),
         companionStatus: 'connected',
-        activeTabUrl: 'https://example.test/research',
+        activeTabUrl: 'https://example.test/research#fragment',
       },
       { [SETUP_COMPLETED_KEY]: true },
     );
@@ -693,8 +1013,8 @@ describe('live side-panel App wiring', () => {
           status: 200,
           json: async () => ({
             data: {
-              items: [urlProjection.byCanonicalUrl['https://example.test/research']],
-              total: 1,
+              items: [],
+              total: 0,
               limit: 51,
               offset: 0,
             },
@@ -713,6 +1033,14 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        `http://127.0.0.1:17373/v1/visits/${encodeURIComponent('https://example.test/research')}/resolve?dryRun=true`,
+        expect.anything(),
+      );
+    });
+    expect(screen.queryByLabelText('Tab-session suggestion')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: /^Inbox/u }));
     const banner = await screen.findByLabelText('Tab-session suggestion');
     expect(banner).toHaveTextContent('Sibling');
     fireEvent.click(within(banner).getByRole('button', { name: "Yes, that's right" }));
@@ -726,6 +1054,116 @@ describe('live side-panel App wiring', () => {
         }),
       );
     });
+  });
+
+  it('opens the focused URL graph on the normalized timeline-visit anchor', async () => {
+    const focusedUrl = 'https://example.test/research/#section';
+    const focusedCanonicalUrl = 'https://example.test/research';
+    installChromeMock(
+      {
+        ...liveState(),
+        companionStatus: 'connected',
+        activeTabUrl: focusedUrl,
+      },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    const requestedNodeIds: string[] = [];
+    setConnectionsClientTransportForTests(async (msg) => {
+      const request = msg as { readonly type?: string; readonly nodeId?: string; readonly hops?: number };
+      if (request.type !== messageTypes.loadConnectionsNeighbors) {
+        return { ok: false, error: 'unexpected' };
+      }
+      requestedNodeIds.push(request.nodeId ?? '');
+      return {
+        ok: true,
+        data: {
+          scope: 'companion-extended',
+          snapshot: {
+            scope: { nodeId: request.nodeId, hops: request.hops ?? 1 },
+            nodes: [],
+            edges: [],
+            updatedAt: NOW,
+            nodeCount: 0,
+            edgeCount: 0,
+          },
+        },
+      };
+    });
+    const urlProjection = {
+      schemaVersion: 1,
+      byCanonicalUrl: {
+        [focusedCanonicalUrl]: {
+          canonicalUrl: focusedCanonicalUrl,
+          firstSeenAt: NOW,
+          lastSeenAt: NOW,
+          visitCount: 1,
+          tabSessionIds: ['tses_focused_graph'],
+          latestUrl: focusedCanonicalUrl,
+          latestTitle: 'Focused research',
+          attributionHistory: [],
+        },
+      },
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v1/tabsessions/projection')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: { schemaVersion: 1, bySessionId: {}, openSessionsByTabId: {} },
+          }),
+        };
+      }
+      if (url.includes('/v1/tabsessions/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+        };
+      }
+      if (url.includes('/v1/visits/projection')) {
+        return { ok: true, status: 200, json: async () => ({ data: urlProjection }) };
+      }
+      if (url.includes('/v1/visits/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+        };
+      }
+      if (url.includes('/v1/visits/') && url.includes('/resolve')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: {
+              canonicalUrl: focusedCanonicalUrl,
+              dryRun: true,
+              decision: { action: 'inbox', margin: 0 },
+              fusedCandidates: [],
+            },
+          }),
+        };
+      }
+      return { ok: false, status: 404, text: async () => 'not found' };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+
+    const focusedCard = await screen.findByTestId('focused-tab-attribution');
+    await waitFor(() => {
+      expect(focusedCard).toHaveTextContent('Focused research');
+    });
+    fireEvent.click(within(focusedCard).getByRole('button', { name: '⇄ Graph' }));
+
+    const expectedAnchor = `timeline-visit:${focusedCanonicalUrl}`;
+    await waitFor(() => {
+      expect(requestedNodeIds).toContain(expectedAnchor);
+      expect(screen.queryAllByTestId(`node-${expectedAnchor}`).length).toBeGreaterThan(0);
+    });
+    expect(screen.queryByText('no anchor selected')).not.toBeInTheDocument();
   });
 
   it('matches the focused tab cue by tabSessionId before falling back to URL', async () => {

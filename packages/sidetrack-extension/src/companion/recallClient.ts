@@ -80,9 +80,12 @@ export class RecallClient {
 export interface RankedItem {
   readonly id: string;
   readonly threadId: string;
+  readonly bacId?: string;
+  readonly sourceBacId?: string;
   readonly capturedAt: string;
   readonly score: number;
   readonly title?: string;
+  readonly provider?: string;
   readonly snippet?: string;
   // Canonical URL of the source thread, populated by the companion
   // from the thread JSON. Used for: dedup across stale duplicate
@@ -97,8 +100,14 @@ const isRankedItem = (value: unknown): value is RankedItem =>
   isRecord(value) &&
   typeof value.id === 'string' &&
   typeof value.threadId === 'string' &&
+  (value.bacId === undefined || typeof value.bacId === 'string') &&
+  (value.sourceBacId === undefined || typeof value.sourceBacId === 'string') &&
   typeof value.capturedAt === 'string' &&
-  typeof value.score === 'number';
+  typeof value.score === 'number' &&
+  (value.title === undefined || typeof value.title === 'string') &&
+  (value.provider === undefined || typeof value.provider === 'string') &&
+  (value.snippet === undefined || typeof value.snippet === 'string') &&
+  (value.threadUrl === undefined || typeof value.threadUrl === 'string');
 
 export const createRecallClient = (settings: CompanionSettings): RecallClient =>
   new RecallClient(settings);

@@ -161,9 +161,18 @@ describe('FlowPathView', () => {
     expect(strip.textContent).toContain('also on Browser 2');
   });
 
-  it('uses tabSessions.get(hash).label for the column header', () => {
+  it('uses tabSessions.get(hash).label and renders a time description for the column header', () => {
     const tabSessions = new Map<string, TabSessionInfo>([
-      ['tab-a', { label: 'Sidetrack PRs', host: 'github.com' }],
+      [
+        'tab-a',
+        {
+          label: 'Sidetrack PRs',
+          host: 'github.com',
+          firstSeenAt: '2026-05-08T09:59:46.000Z',
+          lastActivityAt: '2026-05-08T10:00:00.000Z',
+          lifespanMs: 14_000,
+        },
+      ],
     ]);
     render(
       <FlowPathView
@@ -176,6 +185,7 @@ describe('FlowPathView', () => {
     );
     expect(screen.getByText('Sidetrack PRs')).toBeDefined();
     expect(screen.getByText('github.com')).toBeDefined();
+    expect(screen.getByText(/14s · 1 visit/u)).toBeDefined();
   });
 
   it('renders the empty-chain placeholder for a solo anchor', () => {
@@ -275,5 +285,67 @@ describe('FlowPathView', () => {
       />,
     );
     expect(screen.getByText(/q: react hooks tutorial/u)).toBeDefined();
+  });
+
+  it('keeps same-title tabs as separate rows instead of grouping by canonical name', () => {
+    const tabSessions = new Map<string, TabSessionInfo>([
+      ['tab-a', { label: 'Google', host: 'www.google.com' }],
+      ['tab-b', { label: 'Google', host: 'www.google.com' }],
+    ]);
+    render(
+      <FlowPathView
+        visits={[
+          {
+            id: 'visit:1',
+            label: 'Google',
+            commitTimestamp: '2026-05-08T10:00:00.000Z',
+            tabSessionIdHash: 'tab-a',
+          },
+          {
+            id: 'visit:2',
+            label: 'Google',
+            commitTimestamp: '2026-05-08T10:05:00.000Z',
+            tabSessionIdHash: 'tab-b',
+          },
+        ]}
+        navigationEdges={[]}
+        crossReplicaEdges={[]}
+        onNodeClick={() => undefined}
+        tabSessions={tabSessions}
+      />,
+    );
+    expect(screen.getAllByText('Google')).toHaveLength(4);
+    expect(screen.getAllByText('www.google.com')).toHaveLength(2);
+    expect(screen.queryByText('2 tabs aggregated')).toBeNull();
+  });
+
+  it('promotes the anchor row and renders a timestamped You are here header', () => {
+    render(
+      <FlowPathView
+        visits={[
+          {
+            id: 'visit:old',
+            label: 'Old page',
+            commitTimestamp: '2026-05-08T09:00:00.000Z',
+            tabSessionIdHash: 'tab-a',
+          },
+          {
+            id: 'visit:anchor',
+            label: 'Anchor page',
+            commitTimestamp: '2026-05-08T10:00:00.000Z',
+            tabSessionIdHash: 'tab-b',
+            host: 'example.test',
+            isAnchor: true,
+          },
+        ]}
+        navigationEdges={[]}
+        crossReplicaEdges={[]}
+        onNodeClick={() => undefined}
+      />,
+    );
+    const header = screen.getByTestId('flow-path-anchor');
+    expect(header).toHaveTextContent('You are here');
+    expect(header).toHaveTextContent('Anchor page');
+    expect(header).toHaveTextContent('example.test');
   });
 });

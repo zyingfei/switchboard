@@ -89,6 +89,37 @@ describe('InboxView search', () => {
     expect(screen.queryByText('Other page')).toBeNull();
   });
 
+  it('matches a full Connections URL against the canonical record id', () => {
+    render(
+      <InboxView
+        inbox={inbox([
+          record({
+            tabSessionId: 'https://www.chronox.de/libkcapi/html/ch02s04.html',
+            latestTitle: 'Kernel Crypto API',
+          }),
+          record({
+            tabSessionId: 'https://example.test/page',
+            latestTitle: 'Other page',
+            latestUrl: 'https://example.test/page',
+          }),
+        ])}
+        loading={false}
+        error={null}
+        workstreams={workstreams}
+        suggestions={{}}
+        onRefresh={vi.fn()}
+        onAttribute={vi.fn()}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText('Search inbox'), {
+      target: { value: 'https://www.chronox.de/libkcapi/html/ch02s04.html' },
+    });
+
+    expect(screen.getByText('Kernel Crypto API')).toBeInTheDocument();
+    expect(screen.queryByText('Other page')).toBeNull();
+  });
+
   it('shows "no matches" state and clear button when query has no hits', () => {
     render(
       <InboxView

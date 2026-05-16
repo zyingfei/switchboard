@@ -2433,23 +2433,64 @@ const handleRequest = async (
           ...(request.workstreamId === undefined ? {} : { workstreamId: request.workstreamId }),
         });
         // Cache local threads once for both the current-page filter
-        // and bac_id → threadUrl fallback (older companions that
-        // didn't enrich threadUrl).
+        // and identity/URL fallback. Older companions returned
+        // provider conversation ids as item.threadId; side-panel rows
+        // are keyed by Sidetrack bac_id, so resolve through local
+        // threadId/threadUrl indexes before handing results to content.
         const localThreads = await readThreads();
-        const threadUrlByBacId = new Map(
-          localThreads.map((thread) => [thread.bac_id, thread.threadUrl]),
+        const threadByBacId = new Map(localThreads.map((thread) => [thread.bac_id, thread]));
+        const threadByProviderThreadId = new Map(
+          localThreads
+            .filter((thread) => typeof thread.threadId === 'string' && thread.threadId.length > 0)
+            .map((thread) => [thread.threadId ?? '', thread]),
+        );
+        const threadByCanonicalUrl = new Map(
+          localThreads.map((thread) => [canonicalThreadUrl(thread.threadUrl), thread]),
         );
         const currentCanonical =
           request.currentUrl !== undefined && request.currentUrl.length > 0
             ? canonicalThreadUrl(request.currentUrl)
             : '';
+        const localThreadForItem = (item: (typeof raw)[number]): TrackedThread | undefined => {
+          if (item.bacId !== undefined) {
+            const byBacId = threadByBacId.get(item.bacId);
+            if (byBacId !== undefined) return byBacId;
+          }
+          const byThreadIdAsBacId = threadByBacId.get(item.threadId);
+          if (byThreadIdAsBacId !== undefined) return byThreadIdAsBacId;
+          const byProviderThreadId = threadByProviderThreadId.get(item.threadId);
+          if (byProviderThreadId !== undefined) return byProviderThreadId;
+          if (item.sourceBacId !== undefined) {
+            const bySourceBacId = threadByBacId.get(item.sourceBacId);
+            if (bySourceBacId !== undefined) return bySourceBacId;
+          }
+          if (item.threadUrl !== undefined && item.threadUrl.length > 0) {
+            return threadByCanonicalUrl.get(canonicalThreadUrl(item.threadUrl));
+          }
+          return undefined;
+        };
+        const enrichRecallItem = (item: (typeof raw)[number]): (typeof raw)[number] => {
+          const localThread = localThreadForItem(item);
+          const bacId = item.bacId ?? localThread?.bac_id;
+          const threadUrl = item.threadUrl ?? localThread?.threadUrl;
+          const title = item.title ?? localThread?.title;
+          return {
+            ...item,
+            ...(bacId === undefined ? {} : { bacId }),
+            ...(threadUrl === undefined ? {} : { threadUrl }),
+            ...(title === undefined ? {} : { title }),
+          };
+        };
         const dedupKey = (item: (typeof raw)[number]): string => {
           // Prefer the server-provided threadUrl; fall back to the
-          // local thread record's URL; last resort, the bac_id (so
-          // stale results without any URL still dedup against
-          // themselves rather than collapsing across threads).
-          const url = item.threadUrl ?? threadUrlByBacId.get(item.threadId) ?? '';
-          return url.length > 0 ? canonicalThreadUrl(url) : `bac:${item.threadId}`;
+          // resolved local thread record's URL; last resort, the
+          // stable bac_id when known, otherwise the raw recall threadId
+          // so stale results without any URL still dedup against
+          // themselves rather than collapsing across threads.
+          const url = item.threadUrl ?? '';
+          if (url.length > 0) return canonicalThreadUrl(url);
+          const stableId = item.bacId ?? item.sourceBacId ?? item.threadId;
+          return `bac:${stableId}`;
         };
         // Dedup by canonical URL, keeping the highest-scoring row per
         // thread. URL-based dedup catches the case where the same
@@ -2458,11 +2499,12 @@ const handleRequest = async (
         // Summary" all from the same Gemini conversation).
         const bestPerUrl = new Map<string, (typeof raw)[number]>();
         for (const item of raw) {
-          const key = dedupKey(item);
+          const enriched = enrichRecallItem(item);
+          const key = dedupKey(enriched);
           if (key === currentCanonical) continue; // skip current page
           const existing = bestPerUrl.get(key);
-          if (existing === undefined || item.score > existing.score) {
-            bestPerUrl.set(key, item);
+          if (existing === undefined || enriched.score > existing.score) {
+            bestPerUrl.set(key, enriched);
           }
         }
         const items = Array.from(bestPerUrl.values())
@@ -2614,7 +2656,12 @@ const handleRequest = async (
     void chrome.runtime
       .sendMessage({
         type: messageTypes.focusThreadInSidePanel,
-        threadUrl: request.threadUrl,
+        ...(request.threadUrl === undefined || request.threadUrl.length === 0
+          ? {}
+          : { threadUrl: request.threadUrl }),
+        ...(request.bacId === undefined ? {} : { bacId: request.bacId }),
+        ...(request.title === undefined ? {} : { title: request.title }),
+        ...(request.lastSeenAt === undefined ? {} : { lastSeenAt: request.lastSeenAt }),
       })
       .catch(() => undefined);
     return await withCompanionStatus();
@@ -3159,9 +3206,14 @@ export default defineBackground(() => {
     return `${event.streamName}:${event.observedAt.slice(0, 10)}`;
   };
 
-  const EDGE_EVENT_DRAIN_ROUTE_BATCH_SIZE = 10;
+  // Keep companion imports in small slices. Each accepted edge event
+  // touches the durable event log + materializer fan-out; a 10-event
+  // POST was long enough to trigger ~800ms API busy windows. The loop
+  // below can still drain several slices per alarm, but other panel
+  // requests get chances to run between requests.
+  const EDGE_EVENT_DRAIN_ROUTE_BATCH_SIZE = 3;
   const EDGE_EVENT_DRAIN_SCAN_BATCH_SIZE = 500;
-  const EDGE_EVENT_DRAIN_DEFAULT_MAX_BATCHES = 1;
+  const EDGE_EVENT_DRAIN_DEFAULT_MAX_BATCHES = 4;
   const EDGE_EVENT_DRAIN_BULK_MAX_BATCHES = 50;
 
   const mergeCounts = (
@@ -3663,6 +3715,7 @@ export default defineBackground(() => {
         params.set('workstreamId', filters['workstreamId']);
       if (typeof filters['nodeKind'] === 'string') params.set('nodeKind', filters['nodeKind']);
       if (typeof filters['edgeKind'] === 'string') params.set('edgeKind', filters['edgeKind']);
+      if (filters['topicVariant'] === 'shadow') params.set('topicVariant', 'shadow');
       const search = params.toString();
       result = await fetchConnectionsHttp(
         `/v1/connections${search.length > 0 ? `?${search}` : ''}`,

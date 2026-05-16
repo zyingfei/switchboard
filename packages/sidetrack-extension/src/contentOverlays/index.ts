@@ -267,6 +267,15 @@ const OVERLAY_CSS = `
   background: var(--signal-bg);
   color: var(--ink);
 }
+.sidetrack-deja-row .r2 button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.sidetrack-deja-row .r2 button:disabled:hover {
+  border-color: var(--rule);
+  background: var(--paper-light);
+  color: var(--ink-2);
+}
 .sidetrack-deja-foot {
   display: flex;
   align-items: center;
@@ -996,6 +1005,9 @@ const providerLabel = (provider: ProviderId | undefined): string => {
   return 'Generic';
 };
 
+const safeDejaVuTitle = (title: string): string =>
+  /^thread\s+[a-z0-9-]{8,}$/iu.test(title.trim()) ? 'Recalled thread' : title;
+
 // Mount the Déjà-vu popover anchored just above the selection's bounding
 // rect, clamped to the viewport with 8px padding. Empty items now
 // renders an explicit "no matches found" panel so the user sees
@@ -1061,18 +1073,29 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
         </div>
       `;
       const titleEl = row.querySelector('.title');
-      if (titleEl !== null) titleEl.textContent = item.title;
+      if (titleEl !== null) titleEl.textContent = safeDejaVuTitle(item.title);
       const providerEl = row.querySelector('.sidetrack-deja-provider');
       if (providerEl !== null) providerEl.textContent = providerLabel(item.provider);
       const whenEl = row.querySelector('.sidetrack-deja-when');
       if (whenEl !== null) whenEl.textContent = formatRelative(item.relativeWhen);
       const scoreEl = row.querySelector('.score');
-      if (scoreEl !== null) scoreEl.textContent = item.score.toFixed(2);
+      scoreEl?.remove();
       const snippetEl = row.querySelector('.snippet');
       if (snippetEl !== null) snippetEl.textContent = item.snippet;
-      row.querySelector('.jump')?.addEventListener('click', () => {
-        opts.onJump?.(item);
-      });
+      const jumpButton = row.querySelector<HTMLButtonElement>('.jump');
+      if (jumpButton !== null) {
+        if (
+          (item.threadUrl === undefined || item.threadUrl.length === 0) &&
+          (item.bacId === undefined || item.bacId.length === 0)
+        ) {
+          jumpButton.disabled = true;
+          jumpButton.title = 'No source thread identity available for this recall result.';
+        } else {
+          jumpButton.addEventListener('click', () => {
+            opts.onJump?.(item);
+          });
+        }
+      }
       row.querySelector('.mute')?.addEventListener('click', () => {
         opts.onMute?.();
       });

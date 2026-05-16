@@ -361,6 +361,7 @@ describe('per-URL HTTP routes', () => {
 describe('per-URL HTTP routes — Stage 5.2 R2 snapshot-first read path', () => {
   let vaultRoot: string;
   let serverUrl: string;
+  let eventLog: EventLog;
   let close: (() => Promise<void>) | null = null;
   const bridgeKey = 'visits-snapshot-bridge-key';
 
@@ -405,7 +406,7 @@ describe('per-URL HTTP routes — Stage 5.2 R2 snapshot-first read path', () => 
   beforeEach(async () => {
     vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-visits-snapshot-'));
     const replica = await loadOrCreateReplica(vaultRoot);
-    const eventLog = createEventLog(vaultRoot, replica);
+    eventLog = createEventLog(vaultRoot, replica);
     const server = createCompanionHttpServer({
       bridgeKey,
       vaultWriter: createVaultWriter(vaultRoot),
@@ -441,6 +442,35 @@ describe('per-URL HTTP routes — Stage 5.2 R2 snapshot-first read path', () => 
     expect(Object.keys(body.data.byCanonicalUrl)).toEqual(['https://snapshot.test/a']);
     expect(body.data.byCanonicalUrl['https://snapshot.test/a']?.latestTitle).toBe('From snapshot');
     expect(body.snapshotRevision).toBe('rev-test-abc');
+  });
+
+  it('GET /v1/visits/projection?fresh=1 reads the event log for navigation hot path', async () => {
+    await eventLog.appendClient({
+      clientEventId: 'observed-fresh-url',
+      aggregateId: '2026-05-07',
+      type: BROWSER_TIMELINE_OBSERVED,
+      payload: {
+        eventId: 'tl-fresh',
+        observedAt: '2026-05-07T10:00:00.000Z',
+        url: 'https://fresh.test/b',
+        canonicalUrl: 'https://fresh.test/b',
+        transition: 'updated',
+        title: 'From event log',
+      },
+      baseVector: {},
+    });
+
+    const response = await fetch(`${serverUrl}/v1/visits/projection?fresh=1`, {
+      headers: reqHeaders(),
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      data: { byCanonicalUrl: Record<string, { latestTitle?: string }> };
+      snapshotRevision?: string;
+    };
+    expect(Object.keys(body.data.byCanonicalUrl)).toEqual(['https://fresh.test/b']);
+    expect(body.data.byCanonicalUrl['https://fresh.test/b']?.latestTitle).toBe('From event log');
+    expect(body.snapshotRevision).toBeUndefined();
   });
 
   it('GET /v1/visits/inbox reads from the snapshot and emits snapshotRevision', async () => {

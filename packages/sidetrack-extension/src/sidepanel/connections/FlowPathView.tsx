@@ -42,6 +42,53 @@ const formatDuration = (ms: number | undefined): string => {
   return minutes === 0 ? `${String(hours)}h` : `${String(hours)}h ${String(minutes)}m`;
 };
 
+const compactTimestamp = (iso: string): string => {
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return iso;
+  const d = new Date(ms);
+  try {
+    return d.toLocaleString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  } catch {
+    return iso;
+  }
+};
+
+const compareVisit = (left: TimelineVisit, right: TimelineVisit): number =>
+  left.commitTimestamp.localeCompare(right.commitTimestamp) || left.id.localeCompare(right.id);
+
+const tabTimeDescription = (
+  tabVisits: readonly TimelineVisit[],
+  tabInfo: TabSessionInfo | undefined,
+): string => {
+  const sorted = [...tabVisits].sort(compareVisit);
+  const firstIso = tabInfo?.firstSeenAt ?? sorted[0]?.firstSeenAt ?? sorted[0]?.commitTimestamp;
+  const lastIso =
+    tabInfo?.lastActivityAt ?? sorted[sorted.length - 1]?.commitTimestamp ?? firstIso;
+  const firstMs = firstIso === undefined ? Number.NaN : Date.parse(firstIso);
+  const lastMs = lastIso === undefined ? Number.NaN : Date.parse(lastIso);
+  const span =
+    tabInfo?.lifespanMs ??
+    (Number.isFinite(firstMs) && Number.isFinite(lastMs)
+      ? Math.max(0, lastMs - firstMs)
+      : undefined);
+  const timePart =
+    firstIso === undefined || lastIso === undefined
+      ? ''
+      : firstIso === lastIso
+        ? compactTimestamp(lastIso)
+        : `${compactTimestamp(firstIso)} - ${compactTimestamp(lastIso)}`;
+  const duration = formatDuration(span);
+  const visitsPart = `${String(tabVisits.length)} ${tabVisits.length === 1 ? 'visit' : 'visits'}`;
+  return [timePart, duration.length > 0 ? duration : undefined, visitsPart]
+    .filter((part): part is string => part !== undefined && part.length > 0)
+    .join(' · ');
+};
+
 export interface TimelineVisit {
   readonly id: string;
   readonly label: string;
@@ -112,10 +159,8 @@ export interface FlowPathViewProps {
   // opened from another tab gets an "opened from" badge even when the
   // specific source visit isn't in scope.
   readonly tabOpenerByDest?: ReadonlyMap<string, string>;
+  readonly highlightedVisitId?: string | null;
 }
-
-const compareVisit = (left: TimelineVisit, right: TimelineVisit): number =>
-  left.commitTimestamp.localeCompare(right.commitTimestamp) || left.id.localeCompare(right.id);
 
 const PROVIDER_LABELS: Record<string, string> = {
   chatgpt: 'ChatGPT',
@@ -152,6 +197,7 @@ export const FlowPathView = ({
   tabSessions,
   tabOpenerByDest,
   summary,
+  highlightedVisitId,
 }: FlowPathViewProps): ReactElement => {
   const visitsByTab = new Map<string, TimelineVisit[]>();
   for (const visit of [...visits].sort(compareVisit)) {
@@ -224,9 +270,95 @@ export const FlowPathView = ({
       summaryParts.push(`also on ${summary.replicaAliases.join(', ')}`);
     }
   }
+  const anchorVisits = visits.filter((visit) => visit.isAnchor === true).sort(compareVisit);
+  const primaryAnchorVisit = anchorVisits[anchorVisits.length - 1] ?? anchorVisits[0];
+  const tabEntryGroups = (() => {
+    type TabEntry = {
+      readonly tabSessionIdHash: string;
+      readonly visits: readonly TimelineVisit[];
+      readonly label: string;
+      readonly host?: string;
+      readonly timeDescription: string;
+      readonly openedFrom?: string;
+      readonly hasAnchor: boolean;
+    };
+    type TabGroup = {
+      readonly key: string;
+      readonly label: string;
+      readonly host?: string;
+      readonly entries: TabEntry[];
+      readonly visits: readonly TimelineVisit[];
+      readonly hasAnchor: boolean;
+      readonly firstIndex: number;
+    };
+    const groups: TabGroup[] = [];
+    const groupByKey = new Map<string, TabGroup>();
+    let index = 0;
+    for (const [tabSessionIdHash, tabVisits] of visitsByTab.entries()) {
+      const tabInfo = tabSessions?.get(tabSessionIdHash);
+      const label = tabHeaderLabel(tabSessionIdHash);
+      const host = tabInfo?.host;
+      const entry: TabEntry = {
+        tabSessionIdHash,
+        visits: tabVisits,
+        label,
+        ...(host === undefined ? {} : { host }),
+        timeDescription: tabTimeDescription(tabVisits, tabInfo),
+        ...(openerByDestTab.get(tabSessionIdHash) === undefined
+          ? {}
+          : { openedFrom: openerByDestTab.get(tabSessionIdHash) }),
+        hasAnchor: tabVisits.some((visit) => visit.isAnchor === true),
+      };
+      const key = `tab:${tabSessionIdHash}`;
+      const existing = groupByKey.get(key);
+      if (existing === undefined) {
+        const next: TabGroup = {
+          key,
+          label: entry.label,
+          ...(entry.host === undefined ? {} : { host: entry.host }),
+          entries: [entry],
+          visits: entry.visits,
+          hasAnchor: entry.hasAnchor,
+          firstIndex: index,
+        };
+        groupByKey.set(key, next);
+        groups.push(next);
+      } else {
+        const next: TabGroup = {
+          ...existing,
+          entries: [...existing.entries, entry],
+          visits: [...existing.visits, ...entry.visits].sort(compareVisit),
+          hasAnchor: existing.hasAnchor || entry.hasAnchor,
+        };
+        groupByKey.set(key, next);
+        const at = groups.findIndex((group) => group.key === key);
+        if (at >= 0) groups[at] = next;
+      }
+      index += 1;
+    }
+    return groups.sort((left, right) => {
+      if (left.hasAnchor !== right.hasAnchor) return left.hasAnchor ? -1 : 1;
+      return left.firstIndex - right.firstIndex;
+    });
+  })();
 
   return (
     <section className="cx-flow" data-testid="flow-path-view">
+      {primaryAnchorVisit !== undefined ? (
+        <header className="cx-flow-anchor" data-testid="flow-path-anchor">
+          <span className="cx-flow-anchor-kicker">You are here</span>
+          <span className="cx-flow-anchor-title">{primaryAnchorVisit.label}</span>
+          <span className="cx-flow-anchor-meta">
+            {[
+              primaryAnchorVisit.host,
+              localTimestamp(primaryAnchorVisit.commitTimestamp),
+              formatRelative(primaryAnchorVisit.commitTimestamp),
+            ]
+              .filter((part): part is string => part !== undefined && part.length > 0)
+              .join(' · ')}
+          </span>
+        </header>
+      ) : null}
       {summaryParts.length > 0 ? (
         <header
           className="cx-flow-summary cx-dim cx-mono"
@@ -235,34 +367,41 @@ export const FlowPathView = ({
           {summaryParts.join(' · ')}
         </header>
       ) : null}
-      {[...visitsByTab.entries()].map(([tabSessionIdHash, tabVisits]) => {
-        const openedFrom = openerByDestTab.get(tabSessionIdHash);
-        const tabInfo = tabSessions?.get(tabSessionIdHash);
-        const tabLifespan = formatDuration(tabInfo?.lifespanMs);
-        const tabLastActivity =
-          tabInfo?.lastActivityAt === undefined
-            ? undefined
-            : formatRelative(tabInfo.lastActivityAt);
+      {tabEntryGroups.map((tabGroup) => {
+        const tabVisits = tabGroup.visits;
+        const openedFrom =
+          tabGroup.entries.length === 1 ? tabGroup.entries[0]?.openedFrom : undefined;
+        const tabTime =
+          tabGroup.entries.length === 1 ? (tabGroup.entries[0]?.timeDescription ?? '') : '';
         // Empty-chain detection — solo anchor visit, no incoming
         // prev-visit edge AND no inbound opener.
         const soloAnchor =
           tabVisits.length === 1 &&
           tabVisits[0]?.isAnchor === true &&
-          !tabsWithIncomingPrev.has(tabSessionIdHash) &&
+          !tabsWithIncomingPrev.has(tabVisits[0].tabSessionIdHash) &&
           openedFrom === undefined;
         const anchorIdx = tabVisits.findIndex((v) => v.isAnchor === true);
         return (
-          <div className="cx-flow-row" key={tabSessionIdHash}>
-            <div className="cx-flow-tab" title={tabSessionIdHash}>
-              <div className="cx-flow-tab-name">{tabHeaderLabel(tabSessionIdHash)}</div>
-              {tabInfo?.host !== undefined && tabInfo.host.length > 0 ? (
-                <div className="cx-flow-tab-host cx-dim">{tabInfo.host}</div>
+          <div
+            className={`cx-flow-row${tabGroup.hasAnchor ? ' is-anchor-row' : ''}`}
+            key={tabGroup.key}
+          >
+            <div
+              className="cx-flow-tab"
+              title={tabGroup.entries.map((entry) => entry.tabSessionIdHash).join('\n')}
+            >
+              <div className="cx-flow-tab-name">{tabGroup.label}</div>
+              {tabGroup.host !== undefined && tabGroup.host.length > 0 ? (
+                <div className="cx-flow-tab-host cx-dim">{tabGroup.host}</div>
               ) : null}
-              {tabLifespan.length > 0 || tabLastActivity !== undefined ? (
+              {tabGroup.entries.length > 1 ? (
                 <div className="cx-flow-tab-life cx-dim">
-                  {[tabLastActivity, tabLifespan.length > 0 ? tabLifespan : undefined]
-                    .filter((part): part is string => part !== undefined)
-                    .join(' · ')}
+                  {String(tabGroup.entries.length)} tabs aggregated
+                </div>
+              ) : null}
+              {tabTime.length > 0 ? (
+                <div className="cx-flow-tab-life cx-dim">
+                  {tabTime}
                 </div>
               ) : null}
               {openedFrom !== undefined ? (
@@ -275,7 +414,7 @@ export const FlowPathView = ({
               {soloAnchor ? (
                 <div
                   className="cx-flow-visit-placeholder cx-dim"
-                  data-testid={`flow-tab-placeholder-${tabSessionIdHash}`}
+                  data-testid={`flow-tab-placeholder-${tabVisits[0]?.tabSessionIdHash ?? tabGroup.key}`}
                 >
                   Direct visit — no prior page in this tab
                 </div>
@@ -286,6 +425,7 @@ export const FlowPathView = ({
                 const cellClasses = [
                   'cx-flow-visit',
                   visit.isAnchor === true ? 'is-anchor' : '',
+                  highlightedVisitId === visit.id ? 'is-timeline-hovered' : '',
                 ]
                   .filter(Boolean)
                   .join(' ');
@@ -302,6 +442,11 @@ export const FlowPathView = ({
                   anchorIdx >= 0 &&
                   anchorIdx < tabVisits.length - 1 &&
                   idx === anchorIdx + 1;
+                const previousVisit = tabVisits[idx - 1];
+                const showArrow =
+                  idx > 0 &&
+                  !showAfterLabel &&
+                  previousVisit?.tabSessionIdHash === visit.tabSessionIdHash;
                 return (
                   <div key={visit.id} className="cx-flow-visit-cell">
                     {showBeforeLabel ? (
@@ -310,7 +455,7 @@ export const FlowPathView = ({
                     {showAfterLabel ? (
                       <span className="cx-flow-segment-label">After</span>
                     ) : null}
-                    {idx > 0 && !showAfterLabel ? (
+                    {showArrow ? (
                       <span className="cx-flow-arrow" aria-hidden="true">
                         →
                       </span>

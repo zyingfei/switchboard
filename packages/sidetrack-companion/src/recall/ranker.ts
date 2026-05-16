@@ -302,6 +302,7 @@ export const rankHybrid = (
     }) ??
     items
       .filter((item) => item.tombstoned !== true)
+      .filter((item) => opts.excludeIds?.has(item.id) !== true)
       .filter((item) => opts.workstreamMembership?.(item.threadId) ?? true)
       .map((item) => ({
         item,
@@ -314,7 +315,9 @@ export const rankHybrid = (
   const lexResults: SearchResult[] = opts.lexical.mini
     .search(queryText, { combineWith: 'OR' })
     .filter((result): result is SearchResult => {
-      const entry = opts.lexical.idToEntry.get(String(result['id']));
+      const id = String(result['id']);
+      if (opts.excludeIds?.has(id) === true) return false;
+      const entry = opts.lexical.idToEntry.get(id);
       if (entry === undefined) return false;
       if (entry.tombstoned === true) return false;
       if (opts.workstreamMembership !== undefined && !opts.workstreamMembership(entry.threadId)) {

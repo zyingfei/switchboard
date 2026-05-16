@@ -43,16 +43,48 @@ export interface InboxViewProps {
   readonly onQueryConsumed?: () => void;
 }
 
+const normalizeSearchText = (value: string): string => {
+  let decoded = value;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    // Keep the raw value when the user typed a partial percent escape.
+  }
+  return decoded
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//u, '')
+    .replace(/^www\./u, '')
+    .replace(/\/+$/u, '');
+};
+
 // Stage 5 polish — Inbox-only search filter. Pure client-side, runs on
 // the URL records the Inbox already loaded, no extra round-trips to the
-// companion. Matches against latestTitle / latestUrl / provider on a
-// case-insensitive substring.
+// companion. Matches against title / URL / provider / canonical record
+// id on a case-insensitive substring, with URL normalization so a
+// Connections-origin full URL can find the Inbox card even when the
+// stored card only has the canonical URL as its tabSessionId.
 const matchesQuery = (record: TabSessionRecord, q: string): boolean => {
   if (q.length === 0) return true;
   const lower = q.toLowerCase();
-  if ((record.latestTitle ?? '').toLowerCase().includes(lower)) return true;
-  if ((record.latestUrl ?? '').toLowerCase().includes(lower)) return true;
-  if ((record.provider ?? '').toLowerCase().includes(lower)) return true;
+  const normalized = normalizeSearchText(q);
+  const fields = [
+    record.latestTitle,
+    record.latestUrl,
+    record.provider,
+    record.tabSessionId,
+  ].filter((value): value is string => typeof value === 'string' && value.length > 0);
+  for (const field of fields) {
+    const fieldLower = field.toLowerCase();
+    if (fieldLower.includes(lower)) return true;
+    const fieldNormalized = normalizeSearchText(field);
+    if (
+      normalized.length > 0 &&
+      (fieldNormalized.includes(normalized) || normalized.includes(fieldNormalized))
+    ) {
+      return true;
+    }
+  }
   return false;
 };
 

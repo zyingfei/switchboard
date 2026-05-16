@@ -97,6 +97,19 @@ describe('TimeRangePicker', () => {
     expect(onChange).toHaveBeenCalledWith({ kind: 'preset', preset: '24h' });
   });
 
+  it('labels hidden nodes instead of showing a raw negative count', () => {
+    render(
+      <TimeRangePicker
+        value={{ kind: 'custom', startMs: NOW - 15 * 60 * 1000, endMs: NOW }}
+        onChange={vi.fn()}
+        hiddenNodeCount={19}
+        nowMs={NOW}
+      />,
+    );
+    expect(screen.getByTestId('connections-timerange-hidden')).toHaveTextContent('19 hidden');
+    expect(screen.getByTestId('connections-timerange-hidden')).not.toHaveTextContent('−19');
+  });
+
   it('opens the custom popover, picks dates + times, applies', () => {
     const onChange = vi.fn();
     render(<TimeRangePicker value={{ kind: 'all' }} onChange={onChange} nowMs={NOW} />);
@@ -119,6 +132,45 @@ describe('TimeRangePicker', () => {
     expect(onChange).toHaveBeenCalled();
     const arg = onChange.mock.calls[0][0] as TimeRangeValue;
     expect(arg.kind).toBe('custom');
+    if (arg.kind === 'custom') {
+      expect(arg.startMs).toBe(new Date(2026, 4, 10, 8, 0, 0, 0).getTime());
+      expect(arg.endMs).toBe(new Date(2026, 4, 11, 8, 0, 0, 0).getTime());
+    }
+  });
+
+  it('keeps manual custom edits while the popover rerenders with a live clock', () => {
+    const onChange = vi.fn();
+    const baseNow = Date.parse('2026-05-12T20:00:00.000Z');
+    let tick = 0;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => {
+      tick += 1;
+      return baseNow + tick * 1000;
+    });
+    try {
+      render(<TimeRangePicker value={{ kind: 'all' }} onChange={onChange} />);
+      fireEvent.click(screen.getByTestId('connections-timerange-custom'));
+      fireEvent.change(screen.getByTestId('connections-timerange-start-date'), {
+        target: { value: '2026-05-10' },
+      });
+      fireEvent.change(screen.getByTestId('connections-timerange-start-time'), {
+        target: { value: '08:30' },
+      });
+      fireEvent.change(screen.getByTestId('connections-timerange-end-date'), {
+        target: { value: '2026-05-11' },
+      });
+      fireEvent.change(screen.getByTestId('connections-timerange-end-time'), {
+        target: { value: '09:45' },
+      });
+      fireEvent.click(screen.getByTestId('connections-timerange-apply'));
+    } finally {
+      nowSpy.mockRestore();
+    }
+    const arg = onChange.mock.calls[0][0] as TimeRangeValue;
+    expect(arg.kind).toBe('custom');
+    if (arg.kind === 'custom') {
+      expect(arg.startMs).toBe(new Date(2026, 4, 10, 8, 30, 0, 0).getTime());
+      expect(arg.endMs).toBe(new Date(2026, 4, 11, 9, 45, 0, 0).getTime());
+    }
   });
 
   it('rejects an invalid range (start ≥ end) with an inline error', () => {

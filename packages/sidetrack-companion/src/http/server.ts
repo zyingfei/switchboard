@@ -83,6 +83,7 @@ import {
   deserializeTabSessionProjection,
   projectTabSessions,
   serializeTabSessionProjection,
+  type SerializedTabSessionProjection,
   tabSessionInbox,
   type TabSessionProjection,
 } from '../tabsession/projection.js';
@@ -96,6 +97,7 @@ import {
   deserializeUrlProjection,
   projectUrls,
   serializeUrlProjection,
+  type SerializedUrlProjection,
   urlInbox,
   type UrlProjection,
 } from '../urls/projection.js';
@@ -108,12 +110,15 @@ import {
   tombstoneByThread as tombstoneByThreadRaw,
 } from '../recall/indexFile.js';
 import type { RecallLifecycle } from '../recall/lifecycle.js';
+import { createAnnIndexCache, readAnnIndexFile } from '../recall/ann-index.js';
 import { buildLexicalIndex, rank, rankHybrid, type HybridLexicalIndex } from '../recall/ranker.js';
 import { rebuildFromEventLog } from '../recall/rebuild.js';
 import type { BucketRegistry } from '../routing/registry.js';
 import { redact } from '../safety/redaction.js';
 import { estimateTokens, tokenBudgetWarningThreshold } from '../safety/tokenBudget.js';
 import { applyFeedbackOverlayToSnapshot } from '../connections/feedbackOverlay.js';
+import { overlayTopicRevisionOnSnapshot } from '../connections/topicSnapshotOverlay.js';
+import { createTopicRevisionStore } from '../producers/topic-revision.js';
 import { buildSignals, type BuildSignalsWorkstream } from '../suggestions/buildSignals.js';
 import { scoreSuggestions } from '../suggestions/score.js';
 import type { EventLog } from '../sync/eventLog.js';
@@ -437,6 +442,9 @@ export interface CompanionHttpConfig {
   readonly importEdgeEvent?: (
     event: import('../sync/causal.js').AcceptedEvent,
   ) => Promise<{ imported: boolean }>;
+  readonly importEdgeEvents?: (
+    events: readonly import('../sync/causal.js').AcceptedEvent[],
+  ) => Promise<readonly { readonly imported: boolean }[]>;
   // Optional timeline projection store, exposing read access for
   // the GET /v1/timeline route. When unset that route returns 503.
   readonly timelineStore?: import('../timeline/projection.js').TimelineStore;
@@ -547,9 +555,109 @@ const responseHeaders = {
   'content-type': 'application/json; charset=utf-8',
 };
 
+const jsonStringCache = new WeakMap<object, string>();
+
 const sendJson = (response: ServerResponse, status: number, value: unknown): void => {
   response.writeHead(status, responseHeaders);
-  response.end(status === 204 ? '' : `${JSON.stringify(value)}\n`);
+  if (status === 204) {
+    response.end('');
+    return;
+  }
+  if (typeof value === 'object' && value !== null) {
+    let cached = jsonStringCache.get(value);
+    if (cached === undefined) {
+      cached = `${JSON.stringify(value)}\n`;
+      jsonStringCache.set(value, cached);
+    }
+    response.end(cached);
+    return;
+  }
+  response.end(`${JSON.stringify(value)}\n`);
+};
+
+const eventImportYieldInterval = 2;
+const yieldToHttpLoop = async (): Promise<void> =>
+  new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+
+interface RouteMetricBucket {
+  count: number;
+  totalMs: number;
+  maxMs: number;
+  statuses: Map<number, number>;
+}
+
+const routeMetrics = new Map<string, RouteMetricBucket>();
+let routeMetricWindowStartedAt = Date.now();
+const routeMetricWindowMs = 5_000;
+
+const routeMetricPath = (pathname: string): string => {
+  if (/^\/v1\/visits\/[^/]+\/resolve$/u.test(pathname)) return '/v1/visits/:url/resolve';
+  if (/^\/v1\/visits\/[^/]+\/attribute$/u.test(pathname)) return '/v1/visits/:url/attribute';
+  if (/^\/v1\/visits\/[^/]+\/ignore$/u.test(pathname)) return '/v1/visits/:url/ignore';
+  if (/^\/v1\/tabsessions\/[^/]+\/resolve$/u.test(pathname)) {
+    return '/v1/tabsessions/:id/resolve';
+  }
+  if (/^\/v1\/tabsessions\/[^/]+\/attribute$/u.test(pathname)) {
+    return '/v1/tabsessions/:id/attribute';
+  }
+  if (/^\/v1\/connections\/nodes\/[^/]+\/neighbors$/u.test(pathname)) {
+    return '/v1/connections/nodes/:id/neighbors';
+  }
+  if (/^\/v1\/connections\/edges\/[^/]+$/u.test(pathname)) return '/v1/connections/edges/:id';
+  if (/^\/v1\/workstreams\/[^/]+\/projection$/u.test(pathname)) {
+    return '/v1/workstreams/:id/projection';
+  }
+  if (/^\/v1\/workstreams\/[^/]+\/trust$/u.test(pathname)) return '/v1/workstreams/:id/trust';
+  return pathname;
+};
+
+const routeMetricStatusSummary = (statuses: ReadonlyMap<number, number>): string =>
+  [...statuses.entries()]
+    .sort((left, right) => left[0] - right[0])
+    .map(([status, count]) => `${String(status)}:${String(count)}`)
+    .join(',');
+
+const flushRouteMetricsIfDue = (now: number): void => {
+  if (now - routeMetricWindowStartedAt < routeMetricWindowMs) return;
+  const windowMs = now - routeMetricWindowStartedAt;
+  const hot = [...routeMetrics.entries()]
+    .filter(([, metric]) => metric.count >= 10 || metric.totalMs >= 500)
+    .sort((left, right) => right[1].totalMs - left[1].totalMs)
+    .slice(0, 8);
+  for (const [route, metric] of hot) {
+    console.info(
+      `[api.route.hot] windowMs=${String(windowMs)} route="${route}" count=${String(metric.count)} totalMs=${String(Math.round(metric.totalMs))} avgMs=${String(Math.round(metric.totalMs / metric.count))} maxMs=${String(Math.round(metric.maxMs))} statuses=${routeMetricStatusSummary(metric.statuses)}`,
+    );
+  }
+  routeMetrics.clear();
+  routeMetricWindowStartedAt = now;
+};
+
+const recordRouteMetric = (
+  method: string,
+  pathname: string,
+  status: number,
+  startedAtMs: number,
+): void => {
+  const now = Date.now();
+  const key = `${method} ${routeMetricPath(pathname)}`;
+  const metric =
+    routeMetrics.get(key) ??
+    ({
+      count: 0,
+      totalMs: 0,
+      maxMs: 0,
+      statuses: new Map<number, number>(),
+    } satisfies RouteMetricBucket);
+  const elapsedMs = Math.max(0, now - startedAtMs);
+  metric.count += 1;
+  metric.totalMs += elapsedMs;
+  metric.maxMs = Math.max(metric.maxMs, elapsedMs);
+  metric.statuses.set(status, (metric.statuses.get(status) ?? 0) + 1);
+  routeMetrics.set(key, metric);
+  flushRouteMetricsIfDue(now);
 };
 
 const mutationResponse = (
@@ -719,6 +827,7 @@ interface LexicalCacheEntry {
   readonly index: HybridLexicalIndex;
 }
 const lexicalIndexCache = new Map<string, LexicalCacheEntry>();
+const recallAnnIndexCache = createAnnIndexCache();
 
 const readWorkstreamThreadIds = async (
   vaultRoot: string,
@@ -998,7 +1107,31 @@ interface ThreadMetadata {
   readonly title?: string;
   readonly threadUrl?: string;
   readonly provider?: string;
+  readonly lastSeenAt?: string;
+  readonly updatedAt?: string;
 }
+
+const parseThreadMetadata = (raw: string): ThreadMetadata | null => {
+  const parsed = JSON.parse(raw) as {
+    readonly bac_id?: unknown;
+    readonly title?: unknown;
+    readonly threadUrl?: unknown;
+    readonly provider?: unknown;
+    readonly lastSeenAt?: unknown;
+    readonly updatedAt?: unknown;
+  };
+  if (typeof parsed.bac_id !== 'string') {
+    return null;
+  }
+  return {
+    bac_id: parsed.bac_id,
+    ...(typeof parsed.title === 'string' ? { title: parsed.title } : {}),
+    ...(typeof parsed.threadUrl === 'string' ? { threadUrl: parsed.threadUrl } : {}),
+    ...(typeof parsed.provider === 'string' ? { provider: parsed.provider } : {}),
+    ...(typeof parsed.lastSeenAt === 'string' ? { lastSeenAt: parsed.lastSeenAt } : {}),
+    ...(typeof parsed.updatedAt === 'string' ? { updatedAt: parsed.updatedAt } : {}),
+  };
+};
 
 // Cheap thread-record fetch for await-capture enrichment. Returns
 // just the fields the MCP outputSchema needs; full reads go through
@@ -1009,21 +1142,47 @@ const readThreadMetadata = async (
 ): Promise<ThreadMetadata | null> => {
   try {
     const raw = await readFile(join(vaultRoot, '_BAC', 'threads', `${threadId}.json`), 'utf8');
-    const parsed = JSON.parse(raw) as {
-      readonly bac_id?: unknown;
-      readonly title?: unknown;
-      readonly threadUrl?: unknown;
-      readonly provider?: unknown;
-    };
-    if (typeof parsed.bac_id !== 'string') {
-      return null;
+    return parseThreadMetadata(raw);
+  } catch {
+    return null;
+  }
+};
+
+const canonicalRecallThreadUrl = (value: string): string =>
+  value.trim().replace(/#.*$/u, '').replace(/\/+$/u, '');
+
+const threadMetadataFreshness = (metadata: ThreadMetadata): string =>
+  metadata.updatedAt ?? metadata.lastSeenAt ?? '';
+
+const readThreadMetadataByUrl = async (
+  vaultRoot: string,
+  threadUrl: string,
+): Promise<ThreadMetadata | null> => {
+  const target = canonicalRecallThreadUrl(threadUrl);
+  if (target.length === 0) return null;
+  try {
+    const entries = await readdir(join(vaultRoot, '_BAC', 'threads'), { withFileTypes: true });
+    let best: ThreadMetadata | null = null;
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      let metadata: ThreadMetadata | null = null;
+      try {
+        metadata = parseThreadMetadata(
+          await readFile(join(vaultRoot, '_BAC', 'threads', entry.name), 'utf8'),
+        );
+      } catch {
+        continue;
+      }
+      if (metadata?.threadUrl === undefined) continue;
+      if (canonicalRecallThreadUrl(metadata.threadUrl) !== target) continue;
+      if (
+        best === null ||
+        threadMetadataFreshness(metadata).localeCompare(threadMetadataFreshness(best)) > 0
+      ) {
+        best = metadata;
+      }
     }
-    return {
-      bac_id: parsed.bac_id,
-      ...(typeof parsed.title === 'string' ? { title: parsed.title } : {}),
-      ...(typeof parsed.threadUrl === 'string' ? { threadUrl: parsed.threadUrl } : {}),
-      ...(typeof parsed.provider === 'string' ? { provider: parsed.provider } : {}),
-    };
+    return best;
   } catch {
     return null;
   }
@@ -1222,7 +1381,14 @@ const parseThreadUpsertBody = async (vaultRoot: string, body: unknown) => {
 const loadUrlProjection = async (
   context: CompanionHttpConfig,
   eventLog: EventLog,
+  options: { readonly freshFromEventLog?: boolean } = {},
 ): Promise<{ projection: UrlProjection; snapshotRevision: string | null }> => {
+  if (options.freshFromEventLog === true) {
+    return {
+      projection: projectUrls(await eventLog.readMerged()),
+      snapshotRevision: null,
+    };
+  }
   const snapshot = await context.connectionsStore?.readCurrent();
   if (snapshot?.urlProjection !== undefined) {
     return {
@@ -1251,6 +1417,157 @@ const loadTabSessionProjection = async (
     projection: projectTabSessions(await eventLog.readMerged()),
     snapshotRevision: snapshot?.snapshotRevision ?? null,
   };
+};
+
+const maxSerializedResponseCacheEntries = 64;
+
+const serializedProjectionResponseCache = new Map<string, unknown>();
+const serializedInboxResponseCache = new Map<string, unknown>();
+
+const setBoundedSerializedResponseCacheEntry = (
+  cache: Map<string, unknown>,
+  key: string,
+  value: unknown,
+): void => {
+  cache.set(key, value);
+  if (cache.size <= maxSerializedResponseCacheEntries) return;
+  const oldestKey = cache.keys().next().value;
+  if (oldestKey !== undefined) cache.delete(oldestKey);
+};
+
+const cachedSerializedProjectionResponse = (
+  kind: 'tabsession' | 'url',
+  snapshotRevision: string | undefined,
+  data: SerializedTabSessionProjection | SerializedUrlProjection,
+): unknown => {
+  if (snapshotRevision === undefined) return { data };
+  const key = `${kind}:${snapshotRevision}`;
+  const cached = serializedProjectionResponseCache.get(key);
+  if (cached !== undefined) return cached;
+  const body = { data, snapshotRevision };
+  setBoundedSerializedResponseCacheEntry(serializedProjectionResponseCache, key, body);
+  return body;
+};
+
+const cachedSerializedTabSessionInboxResponse = (
+  snapshotRevision: string | undefined,
+  projection: SerializedTabSessionProjection,
+  input: { readonly limit: number; readonly offset: number },
+): unknown | null => {
+  if (snapshotRevision === undefined) return null;
+  const key = `tabsession-inbox:${snapshotRevision}:${String(input.limit)}:${String(input.offset)}`;
+  const cached = serializedInboxResponseCache.get(key);
+  if (cached !== undefined) return cached;
+  const sorted = Object.values(projection.bySessionId)
+    .filter((record) => record.closedAt === undefined && record.currentAttribution === undefined)
+    .sort((left, right) => {
+      if (left.lastActivityAt !== right.lastActivityAt) {
+        return left.lastActivityAt < right.lastActivityAt ? 1 : -1;
+      }
+      return left.tabSessionId.localeCompare(right.tabSessionId);
+    });
+  const body = {
+    data: {
+      items: sorted.slice(input.offset, input.offset + input.limit),
+      total: sorted.length,
+      limit: input.limit,
+      offset: input.offset,
+    },
+    snapshotRevision,
+  };
+  setBoundedSerializedResponseCacheEntry(serializedInboxResponseCache, key, body);
+  return body;
+};
+
+const cachedSerializedUrlInboxResponse = (
+  snapshotRevision: string | undefined,
+  projection: SerializedUrlProjection,
+  input: { readonly limit: number; readonly offset: number },
+): unknown | null => {
+  if (snapshotRevision === undefined) return null;
+  const key = `url-inbox:${snapshotRevision}:${String(input.limit)}:${String(input.offset)}`;
+  const cached = serializedInboxResponseCache.get(key);
+  if (cached !== undefined) return cached;
+  const sorted = Object.values(projection.byCanonicalUrl)
+    .filter(
+      (record) =>
+        record.currentAttribution === undefined && record.currentIgnored === undefined,
+    )
+    .sort((left, right) => {
+      if (left.firstSeenAt !== right.firstSeenAt) {
+        return left.firstSeenAt < right.firstSeenAt ? 1 : -1;
+      }
+      return left.canonicalUrl.localeCompare(right.canonicalUrl);
+    });
+  const body = {
+    data: {
+      items: sorted.slice(input.offset, input.offset + input.limit),
+      total: sorted.length,
+      limit: input.limit,
+      offset: input.offset,
+    },
+    snapshotRevision,
+  };
+  setBoundedSerializedResponseCacheEntry(serializedInboxResponseCache, key, body);
+  return body;
+};
+
+const freshUrlProjectionResponseCacheTtlMs = 2_000;
+const freshUrlProjectionResponseCache = new WeakMap<
+  EventLog,
+  { readonly expiresAtMs: number; readonly body: unknown }
+>();
+
+const cachedFreshUrlProjectionResponse = async (eventLog: EventLog): Promise<unknown> => {
+  const now = Date.now();
+  const cached = freshUrlProjectionResponseCache.get(eventLog);
+  if (cached !== undefined && cached.expiresAtMs > now) return cached.body;
+  const body = { data: serializeUrlProjection(projectUrls(await eventLog.readMerged())) };
+  freshUrlProjectionResponseCache.set(eventLog, {
+    expiresAtMs: now + freshUrlProjectionResponseCacheTtlMs,
+    body,
+  });
+  return body;
+};
+
+// Longer than the side panel's 15s status refresh. Resolver dry-runs
+// are deterministic for a snapshot revision, so repeated UI refreshes
+// should be memory hits until a materializer revision or explicit
+// refetch asks for a new answer.
+const resolverResponseCacheTtlMs = 120_000;
+const maxResolverResponseCacheEntries = 512;
+const resolverResponseCache = new Map<
+  string,
+  { readonly expiresAtMs: number; readonly body: unknown }
+>();
+
+const resolverResponseCacheKey = (
+  kind: 'tabsession' | 'url',
+  snapshotRevision: string | undefined,
+  id: string,
+): string | null =>
+  snapshotRevision === undefined ? null : `${kind}:${snapshotRevision}:${id}`;
+
+const cachedResolverResponse = (key: string | null): unknown | null => {
+  if (key === null) return null;
+  const cached = resolverResponseCache.get(key);
+  if (cached === undefined) return null;
+  if (cached.expiresAtMs <= Date.now()) {
+    resolverResponseCache.delete(key);
+    return null;
+  }
+  return cached.body;
+};
+
+const setCachedResolverResponse = (key: string | null, body: unknown): void => {
+  if (key === null) return;
+  resolverResponseCache.set(key, {
+    expiresAtMs: Date.now() + resolverResponseCacheTtlMs,
+    body,
+  });
+  if (resolverResponseCache.size <= maxResolverResponseCacheEntries) return;
+  const oldestKey = resolverResponseCache.keys().next().value;
+  if (oldestKey !== undefined) resolverResponseCache.delete(oldestKey);
 };
 
 const routes: readonly RouteDefinition[] = [
@@ -1647,6 +1964,17 @@ const routes: readonly RouteDefinition[] = [
           'Event log is not configured on this companion.',
         );
       }
+      const snapshot = await context.connectionsStore?.readCurrent();
+      if (snapshot?.tabSessionProjection !== undefined) {
+        return [
+          200,
+          cachedSerializedProjectionResponse(
+            'tabsession',
+            snapshot.snapshotRevision,
+            snapshot.tabSessionProjection,
+          ),
+        ];
+      }
       const { projection, snapshotRevision } = await loadTabSessionProjection(
         context,
         context.eventLog,
@@ -1681,6 +2009,15 @@ const routes: readonly RouteDefinition[] = [
       const offsetRaw = Number.parseInt(url.searchParams.get('offset') ?? '0', 10);
       const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 200) : 50;
       const offset = Number.isFinite(offsetRaw) && offsetRaw > 0 ? offsetRaw : 0;
+      const snapshot = await context.connectionsStore?.readCurrent();
+      if (snapshot?.tabSessionProjection !== undefined) {
+        const cached = cachedSerializedTabSessionInboxResponse(
+          snapshot.snapshotRevision,
+          snapshot.tabSessionProjection,
+          { limit, offset },
+        );
+        if (cached !== null) return [200, cached];
+      }
       const { projection, snapshotRevision } = await loadTabSessionProjection(
         context,
         context.eventLog,
@@ -1734,26 +2071,32 @@ const routes: readonly RouteDefinition[] = [
         );
       }
       const tabSessionId = decodeURIComponent(match.tabSessionId ?? '');
+      const cacheKey = resolverResponseCacheKey(
+        'tabsession',
+        snapshot.snapshotRevision,
+        tabSessionId,
+      );
+      const cached = cachedResolverResponse(cacheKey);
+      if (cached !== null) return [200, cached];
       const merged = await context.eventLog.readMerged();
       // Stage 5.2 R2 — snapshot-first via loadTabSessionProjection.
       const { projection } = await loadTabSessionProjection(context, context.eventLog);
       if (!projection.bySessionId.has(tabSessionId)) {
         throw new HttpRouteError(404, 'TAB_SESSION_NOT_FOUND', 'Tab session was not found.');
       }
-      return [
-        200,
-        {
-          data: resolveAttribution({
-            tabSessionId,
-            snapshot,
-            projection,
-            events: merged,
-          }),
-          ...(snapshot.snapshotRevision === undefined
-            ? {}
-            : { snapshotRevision: snapshot.snapshotRevision }),
-        },
-      ];
+      const body = {
+        data: resolveAttribution({
+          tabSessionId,
+          snapshot,
+          projection,
+          events: merged,
+        }),
+        ...(snapshot.snapshotRevision === undefined
+          ? {}
+          : { snapshotRevision: snapshot.snapshotRevision }),
+      };
+      setCachedResolverResponse(cacheKey, body);
+      return [200, body];
     },
   },
   {
@@ -1937,7 +2280,7 @@ const routes: readonly RouteDefinition[] = [
     method: 'GET',
     pattern: /^\/v1\/visits\/projection$/u,
     authRequired: true,
-    handle: async (_request, _requestId, _match, context) => {
+    handle: async (request, _requestId, _match, context) => {
       if (context.eventLog === undefined) {
         throw new HttpRouteError(
           503,
@@ -1945,7 +2288,28 @@ const routes: readonly RouteDefinition[] = [
           'Event log is not configured on this companion.',
         );
       }
-      const { projection, snapshotRevision } = await loadUrlProjection(context, context.eventLog);
+      const url = new URL(request.url ?? '/v1/visits/projection', 'http://internal');
+      const fresh = url.searchParams.get('fresh');
+      if (fresh === '1' || fresh === 'true') {
+        return [200, await cachedFreshUrlProjectionResponse(context.eventLog)];
+      }
+      if (fresh !== '1' && fresh !== 'true') {
+        const snapshot = await context.connectionsStore?.readCurrent();
+        if (snapshot?.urlProjection !== undefined) {
+          return [
+            200,
+            cachedSerializedProjectionResponse(
+              'url',
+              snapshot.snapshotRevision,
+              snapshot.urlProjection,
+            ),
+          ];
+        }
+      }
+      const { projection, snapshotRevision } = await loadUrlProjection(
+        context,
+        context.eventLog,
+      );
       return [
         200,
         {
@@ -1973,6 +2337,15 @@ const routes: readonly RouteDefinition[] = [
       const offsetRaw = Number.parseInt(url.searchParams.get('offset') ?? '0', 10);
       const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 200) : 50;
       const offset = Number.isFinite(offsetRaw) && offsetRaw > 0 ? offsetRaw : 0;
+      const snapshot = await context.connectionsStore?.readCurrent();
+      if (snapshot?.urlProjection !== undefined) {
+        const cached = cachedSerializedUrlInboxResponse(
+          snapshot.snapshotRevision,
+          snapshot.urlProjection,
+          { limit, offset },
+        );
+        if (cached !== null) return [200, cached];
+      }
       const { projection, snapshotRevision } = await loadUrlProjection(context, context.eventLog);
       const items = urlInbox(projection, { limit, offset });
       return [
@@ -2025,17 +2398,23 @@ const routes: readonly RouteDefinition[] = [
       if (canonicalUrl.length === 0) {
         throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
       }
+      const cacheKey = resolverResponseCacheKey(
+        'url',
+        snapshot.snapshotRevision,
+        canonicalUrl,
+      );
+      const cached = cachedResolverResponse(cacheKey);
+      if (cached !== null) return [200, cached];
       const merged = await context.eventLog.readMerged();
-      return [
-        200,
-        {
-          data: resolveUrlAttribution({
-            canonicalUrl,
-            snapshot,
-            events: merged,
-          }),
-        },
-      ];
+      const body = {
+        data: resolveUrlAttribution({
+          canonicalUrl,
+          snapshot,
+          events: merged,
+        }),
+      };
+      setCachedResolverResponse(cacheKey, body);
+      return [200, body];
     },
   },
   {
@@ -2056,32 +2435,59 @@ const routes: readonly RouteDefinition[] = [
       const eventLog = context.eventLog;
       const connectionsStore = context.connectionsStore;
       const idempotencyKey = requireIdempotencyKey(request);
-      return await runIdempotent(context, 'urlResolveAutoApply', idempotencyKey, async () => {
-        const body = objectRecord(await readBody(request)) ?? {};
-        if (body['dryRun'] !== false) {
-          throw new HttpRouteError(
-            400,
-            'VALIDATION_ERROR',
-            'Validation failed.',
-            'Body must set dryRun:false for auto-apply.',
-          );
-        }
-        const snapshot = await connectionsStore.readCurrent();
-        if (snapshot === null) {
-          throw new HttpRouteError(
-            409,
-            'CONNECTIONS_SNAPSHOT_MISSING',
-            'Connections snapshot is not ready.',
-          );
-        }
-        const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
-        if (canonicalUrl.length === 0) {
-          throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
-        }
-        const projection = projectUrls(await eventLog.readMerged());
-        if (!projection.byCanonicalUrl.has(canonicalUrl)) {
+      const body = objectRecord(await readBody(request)) ?? {};
+      if (body['dryRun'] !== false) {
+        throw new HttpRouteError(
+          400,
+          'VALIDATION_ERROR',
+          'Validation failed.',
+          'Body must set dryRun:false for auto-apply.',
+        );
+      }
+      const snapshot = await connectionsStore.readCurrent();
+      if (snapshot === null) {
+        throw new HttpRouteError(
+          409,
+          'CONNECTIONS_SNAPSHOT_MISSING',
+          'Connections snapshot is not ready.',
+        );
+      }
+      const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
+      if (canonicalUrl.length === 0) {
+        throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
+      }
+      const snapshotRecord = snapshot.urlProjection?.byCanonicalUrl[canonicalUrl];
+      if (snapshot.urlProjection !== undefined && snapshotRecord === undefined) {
+        throw new HttpRouteError(404, 'URL_NOT_FOUND', 'URL was not found.');
+      }
+      if (snapshotRecord?.currentAttribution !== undefined) {
+        return [
+          200,
+          {
+            data: {
+              status: 'skipped-existing-attribution',
+            },
+          },
+        ];
+      }
+      if (snapshot.urlProjection === undefined) {
+        const { projection: currentProjection } = await loadUrlProjection(context, eventLog);
+        const currentRecord = currentProjection.byCanonicalUrl.get(canonicalUrl);
+        if (currentRecord === undefined) {
           throw new HttpRouteError(404, 'URL_NOT_FOUND', 'URL was not found.');
         }
+        if (currentRecord.currentAttribution !== undefined) {
+          return [
+            200,
+            {
+              data: {
+                status: 'skipped-existing-attribution',
+              },
+            },
+          ];
+        }
+      }
+      return await runIdempotent(context, 'urlResolveAutoApply', idempotencyKey, async () => {
         const policyMode = optionalAttributionPolicyMode(body['policyMode'], 'policyMode');
         const policyTelemetry = optionalAttributionPolicyTelemetry(
           body['policyTelemetry'],
@@ -3605,10 +4011,11 @@ const routes: readonly RouteDefinition[] = [
         workstreamId: url.searchParams.get('workstreamId') ?? undefined,
       });
       const indexFilePath = recallIndexPath(vaultRoot);
-      const index = await readIndex(indexFilePath);
-      if (index === null) {
+      const annSnapshot = await readAnnIndexFile(indexFilePath, recallAnnIndexCache);
+      if (annSnapshot === null) {
         return [200, { data: [] }];
       }
+      const { index, vectorIndex } = annSnapshot;
       // Short-circuit when the index is empty. The lifecycle's first
       // background rebuild creates an empty index file on a fresh
       // vault, so `index !== null` doesn't imply there's anything to
@@ -3683,8 +4090,7 @@ const routes: readonly RouteDefinition[] = [
       // query is wasteful for large indexes. Falls back to vector-
       // only ranking when the index has zero entries that carry
       // chunk metadata (V2 holdovers post-rebuild).
-      const indexStat = await stat(indexFilePath).catch(() => undefined);
-      const indexMtime = indexStat?.mtimeMs ?? 0;
+      const indexMtime = annSnapshot.mtimeMs;
       const cached = lexicalIndexCache.get(indexFilePath);
       const lexical: HybridLexicalIndex =
         cached !== undefined &&
@@ -3716,6 +4122,7 @@ const routes: readonly RouteDefinition[] = [
         {
           limit: query.limit,
           lexical,
+          vectorIndex,
           ...(threadIds === undefined
             ? {}
             : { workstreamMembership: (threadId: string) => threadIds.has(threadId) }),
@@ -3730,43 +4137,65 @@ const routes: readonly RouteDefinition[] = [
           ? hybridRanked
           : rank(queryEmbedding ?? new Float32Array(384), index.items, new Date(), {
               limit: query.limit,
+              vectorIndex,
               ...(threadIds === undefined
                 ? {}
                 : { workstreamMembership: (threadId: string) => threadIds.has(threadId) }),
             });
-      // Enrich each result with the thread title + canonical URL so
-      // the side panel can render meaningful labels and the SW proxy
-      // can dedup across stale duplicate bac_ids that point at the
-      // same chat URL. The cost is O(limit) tiny JSON reads —
-      // acceptable because the limit is clamped at 50.
+      // Enrich each result with the stable Sidetrack thread identity,
+      // title, and canonical URL so the side panel can focus the
+      // correct row. Recall entries built from legacy capture logs may
+      // have item.threadId = provider conversation id (for example a
+      // ChatGPT UUID), while vault thread files are keyed by bac_id.
+      // Resolve by file id first for current incremental entries, then
+      // by captured threadUrl for rebuilt/legacy entries.
+      //
+      // The cost is O(limit) tiny JSON reads plus a lazy URL scan only
+      // when needed; acceptable because the limit is clamped at 50.
       // Snippet remains absent for now (would need an index format
       // bump to store per-turn text without re-reading event logs).
-      const meta = new Map<string, { title: string; threadUrl: string }>();
+      const metadataById = new Map<string, ThreadMetadata | null>();
+      const metadataByUrl = new Map<string, ThreadMetadata | null>();
+      const resolveById = async (id: string): Promise<ThreadMetadata | null> => {
+        const cached = metadataById.get(id);
+        if (cached !== undefined) return cached;
+        const value = await readThreadMetadata(vaultRoot, id);
+        metadataById.set(id, value);
+        return value;
+      };
+      const resolveByUrl = async (threadUrl: string): Promise<ThreadMetadata | null> => {
+        const key = canonicalRecallThreadUrl(threadUrl);
+        const cached = metadataByUrl.get(key);
+        if (cached !== undefined) return cached;
+        const value = await readThreadMetadataByUrl(vaultRoot, threadUrl);
+        metadataByUrl.set(key, value);
+        return value;
+      };
+      const resolveThreadMetadataForRecall = async (
+        item: (typeof ranked)[number],
+      ): Promise<ThreadMetadata | null> => {
+        const byThreadId = await resolveById(item.threadId);
+        if (byThreadId !== null) return byThreadId;
+        if (item.metadata?.sourceBacId !== undefined) {
+          const bySourceBacId = await resolveById(item.metadata.sourceBacId);
+          if (bySourceBacId !== null) return bySourceBacId;
+        }
+        if (item.metadata?.threadUrl !== undefined) {
+          return await resolveByUrl(item.metadata.threadUrl);
+        }
+        return null;
+      };
       const enriched = await Promise.all(
         ranked.map(async (item) => {
-          let info = meta.get(item.threadId);
-          if (info === undefined) {
-            try {
-              const threadFile = await readFile(
-                join(vaultRoot, '_BAC', 'threads', `${item.threadId}.json`),
-                'utf8',
-              );
-              const parsed = JSON.parse(threadFile) as {
-                readonly title?: unknown;
-                readonly threadUrl?: unknown;
-              };
-              info = {
-                title: typeof parsed.title === 'string' ? parsed.title : '',
-                threadUrl: typeof parsed.threadUrl === 'string' ? parsed.threadUrl : '',
-              };
-            } catch {
-              info = { title: '', threadUrl: '' };
-            }
-            meta.set(item.threadId, info);
-          }
+          const info = await resolveThreadMetadataForRecall(item);
+          const title = info?.title ?? item.metadata?.title;
+          const threadUrl = info?.threadUrl ?? item.metadata?.threadUrl;
+          const provider = info?.provider ?? item.metadata?.provider;
           const additions: Record<string, string> = {};
-          if (info.title.length > 0) additions['title'] = info.title;
-          if (info.threadUrl.length > 0) additions['threadUrl'] = info.threadUrl;
+          if (info?.bac_id !== undefined) additions['bacId'] = info.bac_id;
+          if (title !== undefined && title.length > 0) additions['title'] = title;
+          if (threadUrl !== undefined && threadUrl.length > 0) additions['threadUrl'] = threadUrl;
+          if (provider !== undefined && provider.length > 0) additions['provider'] = provider;
           return Object.keys(additions).length > 0 ? { ...item, ...additions } : item;
         }),
       );
@@ -4543,7 +4972,15 @@ const routes: readonly RouteDefinition[] = [
       }
       const imported: { replicaId: string; seq: number }[] = [];
       const skipped: { replicaId: string; seq: number; reason: string }[] = [];
+      let processedCandidates = 0;
       for (const candidate of body.events) {
+        if (
+          processedCandidates > 0 &&
+          processedCandidates % eventImportYieldInterval === 0
+        ) {
+          await yieldToHttpLoop();
+        }
+        processedCandidates += 1;
         if (
           candidate === null ||
           typeof candidate !== 'object' ||
@@ -4624,7 +5061,7 @@ const routes: readonly RouteDefinition[] = [
     pattern: /^\/v1\/edge\/events$/u,
     authRequired: true,
     handle: async (request, requestId, _match, context) => {
-      if (context.importEdgeEvent === undefined) {
+      if (context.importEdgeEvent === undefined && context.importEdgeEvents === undefined) {
         throw new HttpRouteError(
           503,
           'EDGE_EVENTS_NOT_WIRED',
@@ -4657,9 +5094,18 @@ const routes: readonly RouteDefinition[] = [
         EDGE_EVENT_VALIDATORS.has(type);
       const validatePayload = (type: string, payload: unknown): boolean =>
         EDGE_EVENT_VALIDATORS.get(type)?.(payload) ?? false;
+      const validEvents: import('../sync/causal.js').AcceptedEvent[] = [];
       const imported: { replicaId: string; seq: number }[] = [];
       const skipped: { replicaId: string; seq: number; reason: string }[] = [];
+      let processedCandidates = 0;
       for (const candidate of body.events) {
+        if (
+          processedCandidates > 0 &&
+          processedCandidates % eventImportYieldInterval === 0
+        ) {
+          await yieldToHttpLoop();
+        }
+        processedCandidates += 1;
         if (
           candidate === null ||
           typeof candidate !== 'object' ||
@@ -4686,23 +5132,59 @@ const routes: readonly RouteDefinition[] = [
           });
           continue;
         }
+        validEvents.push(event);
+      }
+      if (validEvents.length > 0 && context.importEdgeEvents !== undefined) {
         try {
-          const result = await context.importEdgeEvent(event);
-          if (result.imported) {
-            imported.push({ replicaId: event.dot.replicaId, seq: event.dot.seq });
-          } else {
+          const results = await context.importEdgeEvents(validEvents);
+          for (let index = 0; index < validEvents.length; index += 1) {
+            const event = validEvents[index];
+            if (event === undefined) continue;
+            const result = results[index];
+            if (result?.imported === true) {
+              imported.push({ replicaId: event.dot.replicaId, seq: event.dot.seq });
+            } else {
+              skipped.push({
+                replicaId: event.dot.replicaId,
+                seq: event.dot.seq,
+                reason: 'already-imported',
+              });
+            }
+          }
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          for (const event of validEvents) {
+            skipped.push({ replicaId: event.dot.replicaId, seq: event.dot.seq, reason });
+          }
+        }
+      } else {
+        const importEdgeEvent = context.importEdgeEvent;
+        if (importEdgeEvent === undefined) {
+          throw new HttpRouteError(
+            503,
+            'EDGE_EVENTS_NOT_WIRED',
+            'Edge event import is not configured.',
+          );
+        }
+        for (const event of validEvents) {
+          try {
+            const result = await importEdgeEvent(event);
+            if (result.imported) {
+              imported.push({ replicaId: event.dot.replicaId, seq: event.dot.seq });
+            } else {
+              skipped.push({
+                replicaId: event.dot.replicaId,
+                seq: event.dot.seq,
+                reason: 'already-imported',
+              });
+            }
+          } catch (err) {
             skipped.push({
               replicaId: event.dot.replicaId,
               seq: event.dot.seq,
-              reason: 'already-imported',
+              reason: err instanceof Error ? err.message : String(err),
             });
           }
-        } catch (err) {
-          skipped.push({
-            replicaId: event.dot.replicaId,
-            seq: event.dot.seq,
-            reason: err instanceof Error ? err.message : String(err),
-          });
         }
       }
       void requestId;
@@ -4906,6 +5388,15 @@ const routes: readonly RouteDefinition[] = [
       const edgeKind = url.searchParams.get('edgeKind') ?? undefined;
       const provider = url.searchParams.get('provider') ?? undefined;
       const originReplicaId = url.searchParams.get('originReplicaId') ?? undefined;
+      const topicVariantRaw = url.searchParams.get('topicVariant') ?? undefined;
+      if (topicVariantRaw !== undefined && topicVariantRaw !== 'shadow') {
+        throw new HttpRouteError(
+          400,
+          'INVALID_REQUEST',
+          'topicVariant must be omitted or "shadow".',
+        );
+      }
+      const topicVariant = topicVariantRaw === 'shadow' ? topicVariantRaw : undefined;
 
       let snap = await context.connectionsStore.readCurrent();
       if (snap === null) {
@@ -4917,7 +5408,7 @@ const routes: readonly RouteDefinition[] = [
             data: {
               scope: 'companion-extended',
               snapshot: {
-                scope: {},
+                scope: { ...(topicVariant === undefined ? {} : { topicVariant }) },
                 nodes: [],
                 edges: [],
                 updatedAt: '1970-01-01T00:00:00.000Z',
@@ -4928,11 +5419,35 @@ const routes: readonly RouteDefinition[] = [
           },
         ];
       }
+      if (topicVariant === 'shadow') {
+        const shadowRevision = await createTopicRevisionStore(
+          requireVaultRoot(context),
+        ).readShadowRevision();
+        if (shadowRevision === null) {
+          return [
+            200,
+            {
+              data: {
+                scope: 'companion-extended',
+                snapshot: {
+                  scope: { topicVariant },
+                  nodes: [],
+                  edges: [],
+                  updatedAt: snap.updatedAt,
+                  nodeCount: 0,
+                  edgeCount: 0,
+                  ...(snap.snapshotRevision === undefined
+                    ? {}
+                    : { snapshotRevision: `${snap.snapshotRevision}:shadow-missing` }),
+                },
+              },
+            },
+          ];
+        }
+        snap = overlayTopicRevisionOnSnapshot(snap, shadowRevision);
+      }
       if (context.eventLog !== undefined) {
-        snap = applyFeedbackOverlayToSnapshot(
-          snap,
-          projectFeedback(await context.eventLog.readMerged()),
-        );
+        snap = applyFeedbackOverlayToSnapshot(snap, projectFeedback(await context.eventLog.readMerged()));
       }
       // Coarse filters — honoured by simple matchers. workstreamId
       // narrows to nodes either matching the ws id directly or
@@ -4979,15 +5494,16 @@ const routes: readonly RouteDefinition[] = [
           data: {
             scope: 'companion-extended',
             snapshot: {
-              scope: { ...(workstreamId === undefined ? {} : { workstreamId }) },
+              scope: {
+                ...(workstreamId === undefined ? {} : { workstreamId }),
+                ...(topicVariant === undefined ? {} : { topicVariant }),
+              },
               nodes,
               edges,
               updatedAt: snap.updatedAt,
               nodeCount: nodes.length,
               edgeCount: edges.length,
-              ...(snap.snapshotRevision === undefined
-                ? {}
-                : { snapshotRevision: snap.snapshotRevision }),
+              ...(snap.snapshotRevision === undefined ? {} : { snapshotRevision: snap.snapshotRevision }),
             },
           },
         },
@@ -5028,10 +5544,7 @@ const routes: readonly RouteDefinition[] = [
         ];
       }
       if (context.eventLog !== undefined) {
-        snap = applyFeedbackOverlayToSnapshot(
-          snap,
-          projectFeedback(await context.eventLog.readMerged()),
-        );
+        snap = applyFeedbackOverlayToSnapshot(snap, projectFeedback(await context.eventLog.readMerged()));
       }
       const { subgraphForNode } = await import('../connections/snapshot.js');
       const sub = subgraphForNode(snap, nodeId, hops);
@@ -5224,10 +5737,14 @@ export const handleRequest = async (
     return;
   }
 
+  const metricStartedAtMs = Date.now();
+  const metricMethod = method ?? 'UNKNOWN';
+  const metricPathname = url.pathname;
   try {
     const match = route.pattern.exec(url.pathname);
     const [status, body] = await route.handle(request, requestId, match?.groups ?? {}, context);
     sendJson(response, status, body);
+    recordRouteMetric(metricMethod, metricPathname, status, metricStartedAtMs);
   } catch (error) {
     const issues = getValidationIssues(error);
     const routeError = error instanceof HttpRouteError ? error : undefined;
@@ -5286,6 +5803,7 @@ export const handleRequest = async (
         ...(issues === undefined ? {} : { issues }),
       }),
     );
+    recordRouteMetric(metricMethod, metricPathname, status, metricStartedAtMs);
   }
 };
 

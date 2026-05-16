@@ -14,6 +14,9 @@ import {
   isUserTopicRenamedPayload,
   type FeedbackEventType,
   type FeedbackPayload,
+  type UserOrganizedItemAction,
+  type UserOrganizedItemKind,
+  type UserOrganizedItemPayload,
 } from './events.js';
 
 export const FEEDBACK_PROJECTION_SCHEMA_VERSION = 1;
@@ -34,9 +37,24 @@ export interface FeedbackTrainingLabel {
   readonly weight: number;
 }
 
+type FeedbackMembershipAction = Extract<UserOrganizedItemAction, 'move' | 'merge' | 'promote'>;
+
+export interface FeedbackOrganizedMembership {
+  readonly itemId: string;
+  readonly containerId: string;
+  readonly sourceItemId: string;
+  readonly sourceItemKind: UserOrganizedItemKind;
+  readonly action: FeedbackMembershipAction;
+  readonly acceptedAtMs: number;
+  readonly replicaId: string;
+  readonly seq: number;
+}
+
 export interface FeedbackProjection {
   readonly schemaVersion: typeof FEEDBACK_PROJECTION_SCHEMA_VERSION;
   readonly perItem: Record<string, readonly UserAction[]>;
+  readonly containerByItem: Record<string, FeedbackOrganizedMembership>;
+  readonly organizedItemsByContainer: Record<string, readonly FeedbackOrganizedMembership[]>;
   readonly positiveLabels: readonly FeedbackTrainingLabel[];
   readonly negativeLabels: readonly FeedbackTrainingLabel[];
 }
@@ -68,6 +86,26 @@ const compareLabel = (left: FeedbackTrainingLabel, right: FeedbackTrainingLabel)
   return left.weight - right.weight;
 };
 
+const compareMembership = (
+  left: FeedbackOrganizedMembership,
+  right: FeedbackOrganizedMembership,
+): number => {
+  const item = compareString(left.itemId, right.itemId);
+  if (item !== 0) return item;
+  const container = compareString(left.containerId, right.containerId);
+  if (container !== 0) return container;
+  const source = compareString(left.sourceItemId, right.sourceItemId);
+  if (source !== 0) return source;
+  const kind = compareString(left.sourceItemKind, right.sourceItemKind);
+  if (kind !== 0) return kind;
+  const action = compareString(left.action, right.action);
+  if (action !== 0) return action;
+  if (left.acceptedAtMs !== right.acceptedAtMs) return left.acceptedAtMs - right.acceptedAtMs;
+  const replica = compareString(left.replicaId, right.replicaId);
+  if (replica !== 0) return replica;
+  return left.seq - right.seq;
+};
+
 const pushAction = (perItem: Map<string, UserAction[]>, action: UserAction): void => {
   const list = perItem.get(action.itemId);
   if (list === undefined) {
@@ -86,6 +124,55 @@ const label = (fromId: string | undefined, toId: string | undefined): FeedbackTr
 
 const nonNullContainer = (value: string | null | undefined): string | undefined =>
   value === null ? undefined : value;
+
+const sortedUniqueStrings = (values: readonly string[]): readonly string[] =>
+  [...new Set(values)].sort(compareString);
+
+const membershipItemIdsFor = (payload: UserOrganizedItemPayload): readonly string[] => {
+  const explicitMemberIds = payload.details?.memberIds;
+  if (explicitMemberIds !== undefined && explicitMemberIds.length > 0) {
+    return sortedUniqueStrings(explicitMemberIds);
+  }
+  if (payload.action === 'merge') {
+    return sortedUniqueStrings([payload.itemId, ...(payload.details?.mergeMembers ?? [])]);
+  }
+  return [payload.itemId];
+};
+
+const applyOrganizedMembership = (
+  containerByItem: Map<string, FeedbackOrganizedMembership>,
+  payload: UserOrganizedItemPayload,
+  event: AcceptedEvent,
+): void => {
+  if (payload.action === 'split' || payload.action === 'ignore') {
+    containerByItem.delete(payload.itemId);
+    for (const memberId of payload.details?.memberIds ?? []) containerByItem.delete(memberId);
+    return;
+  }
+  if (payload.action !== 'move' && payload.action !== 'merge' && payload.action !== 'promote') {
+    return;
+  }
+
+  const containerId = nonNullContainer(payload.toContainer);
+  const memberIds = membershipItemIdsFor(payload);
+  if (containerId === undefined) {
+    for (const memberId of memberIds) containerByItem.delete(memberId);
+    return;
+  }
+
+  for (const memberId of memberIds) {
+    containerByItem.set(memberId, {
+      itemId: memberId,
+      containerId,
+      sourceItemId: payload.itemId,
+      sourceItemKind: payload.itemKind,
+      action: payload.action,
+      acceptedAtMs: event.acceptedAtMs,
+      replicaId: event.dot.replicaId,
+      seq: event.dot.seq,
+    });
+  }
+};
 
 const labelsForOrganizedItem = (
   payload: Extract<FeedbackPayload, { readonly itemId: string }>,
@@ -127,8 +214,37 @@ const stablePerItem = (
   return out;
 };
 
+const stableContainerByItem = (
+  containerByItem: ReadonlyMap<string, FeedbackOrganizedMembership>,
+): Record<string, FeedbackOrganizedMembership> => {
+  const out: Record<string, FeedbackOrganizedMembership> = {};
+  for (const key of [...containerByItem.keys()].sort(compareString)) {
+    const membership = containerByItem.get(key);
+    if (membership !== undefined) out[key] = membership;
+  }
+  return out;
+};
+
+const stableItemsByContainer = (
+  containerByItem: ReadonlyMap<string, FeedbackOrganizedMembership>,
+): Record<string, readonly FeedbackOrganizedMembership[]> => {
+  const byContainer = new Map<string, FeedbackOrganizedMembership[]>();
+  for (const membership of containerByItem.values()) {
+    const list = byContainer.get(membership.containerId) ?? [];
+    list.push(membership);
+    byContainer.set(membership.containerId, list);
+  }
+
+  const out: Record<string, readonly FeedbackOrganizedMembership[]> = {};
+  for (const containerId of [...byContainer.keys()].sort(compareString)) {
+    out[containerId] = [...(byContainer.get(containerId) ?? [])].sort(compareMembership);
+  }
+  return out;
+};
+
 export const projectFeedback = (events: readonly AcceptedEvent[]): FeedbackProjection => {
   const perItem = new Map<string, UserAction[]>();
+  const containerByItem = new Map<string, FeedbackOrganizedMembership>();
   const positiveLabels: FeedbackTrainingLabel[] = [];
   const negativeLabels: FeedbackTrainingLabel[] = [];
 
@@ -143,6 +259,7 @@ export const projectFeedback = (events: readonly AcceptedEvent[]): FeedbackProje
         seq: event.dot.seq,
         payload: event.payload,
       });
+      applyOrganizedMembership(containerByItem, event.payload, event);
       const labels = labelsForOrganizedItem(event.payload);
       positiveLabels.push(...labels.positive);
       negativeLabels.push(...labels.negative);
@@ -157,6 +274,19 @@ export const projectFeedback = (events: readonly AcceptedEvent[]): FeedbackProje
         eventType: USER_ENGAGEMENT_RELABELED,
         itemId: event.payload.visitId,
         action: 'relabeled',
+        acceptedAtMs: event.acceptedAtMs,
+        replicaId: event.dot.replicaId,
+        seq: event.dot.seq,
+        payload: event.payload,
+      });
+      continue;
+    }
+
+    if (event.type === USER_TOPIC_RENAMED && isUserTopicRenamedPayload(event.payload)) {
+      pushAction(perItem, {
+        eventType: USER_TOPIC_RENAMED,
+        itemId: event.payload.topicId,
+        action: 'renamed',
         acceptedAtMs: event.acceptedAtMs,
         replicaId: event.dot.replicaId,
         seq: event.dot.seq,
@@ -193,19 +323,6 @@ export const projectFeedback = (events: readonly AcceptedEvent[]): FeedbackProje
       continue;
     }
 
-    if (event.type === USER_TOPIC_RENAMED && isUserTopicRenamedPayload(event.payload)) {
-      pushAction(perItem, {
-        eventType: USER_TOPIC_RENAMED,
-        itemId: event.payload.topicId,
-        action: 'renamed',
-        acceptedAtMs: event.acceptedAtMs,
-        replicaId: event.dot.replicaId,
-        seq: event.dot.seq,
-        payload: event.payload,
-      });
-      continue;
-    }
-
     if (event.type === USER_SNIPPET_PROMOTED && isUserSnippetPromotedPayload(event.payload)) {
       pushAction(perItem, {
         eventType: USER_SNIPPET_PROMOTED,
@@ -225,6 +342,8 @@ export const projectFeedback = (events: readonly AcceptedEvent[]): FeedbackProje
   return {
     schemaVersion: FEEDBACK_PROJECTION_SCHEMA_VERSION,
     perItem: stablePerItem(perItem),
+    containerByItem: stableContainerByItem(containerByItem),
+    organizedItemsByContainer: stableItemsByContainer(containerByItem),
     positiveLabels: positiveLabels.sort(compareLabel),
     negativeLabels: negativeLabels.sort(compareLabel),
   };

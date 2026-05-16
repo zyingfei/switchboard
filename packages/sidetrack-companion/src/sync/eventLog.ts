@@ -1,4 +1,4 @@
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import {
@@ -136,6 +136,16 @@ export interface EventLog {
   readonly appendClientObserved: <TPayload extends Record<string, unknown>>(
     input: AppendInputObserved<TPayload>,
   ) => Promise<AcceptedEvent<TPayload>>;
+  /**
+   * Batch form for browser-driven events. The implementation reads the
+   * merged log once, appends only new clientEventIds, and reports which
+   * inputs were durable writes vs idempotent replays.
+   */
+  readonly appendClientObservedBatch?: <TPayload extends Record<string, unknown>>(
+    inputs: readonly AppendInputObserved<TPayload>[],
+  ) => Promise<
+    readonly { readonly event: AcceptedEvent<TPayload>; readonly appended: boolean }[]
+  >;
   /**
    * Server-driven event append. System stamps deps from the
    * aggregate's prior events. See `AppendInputServerObserved`.
@@ -280,6 +290,50 @@ const listJsonlFiles = async (dir: string): Promise<string[]> => {
     .map((entry) => join(dir, entry.name));
 };
 
+interface JsonlFileState {
+  readonly path: string;
+  readonly size: bigint;
+  readonly mtimeNs: bigint;
+}
+
+const listJsonlFileStates = async (dir: string): Promise<readonly JsonlFileState[]> => {
+  const files = await listJsonlFiles(dir);
+  const states: JsonlFileState[] = [];
+  for (const path of files) {
+    try {
+      const fileStat = await stat(path, { bigint: true });
+      states.push({
+        path,
+        size: fileStat.size,
+        mtimeNs: fileStat.mtimeNs,
+      });
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+        continue;
+      }
+      throw error;
+    }
+  }
+  return states.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
+};
+
+const manifestKeyFor = (
+  replicaFiles: readonly {
+    readonly replicaId: string;
+    readonly files: readonly JsonlFileState[];
+  }[],
+): string =>
+  replicaFiles
+    .map((replica) =>
+      [
+        replica.replicaId,
+        ...replica.files.map(
+          (file) => `${file.path}\u0000${String(file.size)}\u0000${String(file.mtimeNs)}`,
+        ),
+      ].join('\u0001'),
+    )
+    .join('\u0002');
+
 export const createEventLog = (
   vaultPath: string,
   replica: ReplicaContext,
@@ -288,6 +342,17 @@ export const createEventLog = (
   const now = options.now ?? (() => new Date());
 
   let writeChain: Promise<unknown> = Promise.resolve();
+  let mergedCache:
+    | {
+        readonly manifestKey: string;
+        readonly events: readonly AcceptedEvent[];
+      }
+    | null = null;
+
+  const invalidateReadCache = (): void => {
+    mergedCache = null;
+  };
+
   const enqueueAppend = <T>(task: () => Promise<T>): Promise<T> => {
     const next = writeChain.then(task, task);
     writeChain = next.then(
@@ -328,11 +393,29 @@ export const createEventLog = (
 
   const readMerged = async (): Promise<readonly AcceptedEvent[]> => {
     const ids = await listReplicaIds();
-    const all: AcceptedEvent[] = [];
-    for (const id of ids) {
-      for (const event of await readReplica(id)) all.push(event);
+    const replicaFiles = await Promise.all(
+      ids.map(async (id) => ({
+        replicaId: id,
+        files: await listJsonlFileStates(replicaLogDir(vaultPath, id)),
+      })),
+    );
+    const manifestKey = manifestKeyFor(replicaFiles);
+    if (mergedCache?.manifestKey === manifestKey) {
+      return mergedCache.events;
     }
-    return sortAcceptedEvents(all);
+
+    const all: AcceptedEvent[] = [];
+    for (const replica of replicaFiles) {
+      for (const file of replica.files) {
+        const events = await readLogFile(file.path);
+        for (const event of events) {
+          if (event.dot.replicaId === replica.replicaId) all.push(event);
+        }
+      }
+    }
+    const events = sortAcceptedEvents(all);
+    mergedCache = { manifestKey, events };
+    return events;
   };
 
   const readByAggregate = async (
@@ -358,43 +441,74 @@ export const createEventLog = (
     );
   };
 
-  const appendClient = <TPayload extends Record<string, unknown>>(
-    input: AppendInput<TPayload>,
-  ): Promise<AcceptedEvent<TPayload>> =>
+  const appendClientBatch = <TPayload extends Record<string, unknown>>(
+    inputs: readonly AppendInput<TPayload>[],
+  ): Promise<
+    readonly { readonly event: AcceptedEvent<TPayload>; readonly appended: boolean }[]
+  > =>
     enqueueAppend(async () => {
-      const existing = await findByClientEventId(input.clientEventId);
-      if (existing !== null) {
-        return existing as AcceptedEvent<TPayload>;
-      }
-      // Resolve clientDeps to dots so deps reflects "everything the
-      // editor caused or observed at edit time."
+      if (inputs.length === 0) return [];
       const merged = await readMerged();
-      const deps = computeDepsFromInput(input, merged);
-      const seq = await replica.nextSeq();
-      const event: AcceptedEvent<TPayload> = {
-        clientEventId: input.clientEventId,
-        dot: { replicaId: replica.replicaId, seq },
-        deps,
-        aggregateId: input.aggregateId,
-        type: input.type,
-        payload: input.payload,
-        acceptedAtMs: now().getTime(),
-        ...(input.target === undefined ? {} : { target: input.target }),
-        ...(input.hlc === undefined
-          ? options.hlcStamper !== undefined
-            ? maybeAttachHlc(options.hlcStamper())
-            : {}
-          : { hlc: input.hlc }),
-      };
-      const dir = replicaLogDir(vaultPath, replica.replicaId);
-      await mkdir(dir, { recursive: true });
-      await writeFile(
-        replicaLogPath(vaultPath, replica.replicaId, now()),
-        `${JSON.stringify(event)}\n`,
-        { encoding: 'utf8', flag: 'a' },
-      );
-      return event;
+      const knownEvents: AcceptedEvent[] = [...merged];
+      const byClientId = new Map<string, AcceptedEvent>();
+      for (const event of knownEvents) byClientId.set(event.clientEventId, event);
+      const writesByPath = new Map<string, string[]>();
+      const results: { event: AcceptedEvent<TPayload>; appended: boolean }[] = [];
+
+      for (const input of inputs) {
+        const existing = byClientId.get(input.clientEventId);
+        if (existing !== undefined) {
+          results.push({ event: existing as AcceptedEvent<TPayload>, appended: false });
+          continue;
+        }
+        const acceptedAt = now();
+        const deps = computeDepsFromInput(input, knownEvents);
+        const seq = await replica.nextSeq();
+        const event: AcceptedEvent<TPayload> = {
+          clientEventId: input.clientEventId,
+          dot: { replicaId: replica.replicaId, seq },
+          deps,
+          aggregateId: input.aggregateId,
+          type: input.type,
+          payload: input.payload,
+          acceptedAtMs: acceptedAt.getTime(),
+          ...(input.target === undefined ? {} : { target: input.target }),
+          ...(input.hlc === undefined
+            ? options.hlcStamper !== undefined
+              ? maybeAttachHlc(options.hlcStamper())
+              : {}
+            : { hlc: input.hlc }),
+        };
+        const path = replicaLogPath(vaultPath, replica.replicaId, acceptedAt);
+        const existingWrites = writesByPath.get(path);
+        if (existingWrites === undefined) {
+          writesByPath.set(path, [`${JSON.stringify(event)}\n`]);
+        } else {
+          existingWrites.push(`${JSON.stringify(event)}\n`);
+        }
+        knownEvents.push(event);
+        byClientId.set(event.clientEventId, event);
+        results.push({ event, appended: true });
+      }
+      if (writesByPath.size > 0) {
+        await mkdir(replicaLogDir(vaultPath, replica.replicaId), { recursive: true });
+        for (const [path, lines] of writesByPath) {
+          await writeFile(path, lines.join(''), { encoding: 'utf8', flag: 'a' });
+        }
+        invalidateReadCache();
+      }
+      return results;
     });
+
+  const appendClient = async <TPayload extends Record<string, unknown>>(
+    input: AppendInput<TPayload>,
+  ): Promise<AcceptedEvent<TPayload>> => {
+    const [result] = await appendClientBatch([input]);
+    if (result === undefined) {
+      throw new Error('appendClient returned no event for a non-empty batch.');
+    }
+    return result.event;
+  };
 
   const importPeerEvent = (
     event: AcceptedEvent,
@@ -426,6 +540,7 @@ export const createEventLog = (
         `${JSON.stringify(event)}\n`,
         { encoding: 'utf8', flag: 'a' },
       );
+      invalidateReadCache();
       // Each replica's seq counter is independent; we don't bump our
       // own seq when ingesting a peer event (that would corrupt our
       // local namespace). Causal ordering across replicas is handled
@@ -448,6 +563,24 @@ export const createEventLog = (
       ...(input.hlc === undefined ? {} : { hlc: input.hlc }),
     });
 
+  const appendClientObservedBatch = <TPayload extends Record<string, unknown>>(
+    inputs: readonly AppendInputObserved<TPayload>[],
+  ): Promise<
+    readonly { readonly event: AcceptedEvent<TPayload>; readonly appended: boolean }[]
+  > =>
+    appendClientBatch<TPayload>(
+      inputs.map((input) => ({
+        clientEventId: input.clientEventId,
+        aggregateId: input.aggregateId,
+        type: input.type,
+        payload: input.payload,
+        baseVector: input.baseVector,
+        ...(input.clientDeps === undefined ? {} : { clientDeps: input.clientDeps }),
+        ...(input.target === undefined ? {} : { target: input.target }),
+        ...(input.hlc === undefined ? {} : { hlc: input.hlc }),
+      })),
+    );
+
   const appendServerObserved = <TPayload extends Record<string, unknown>>(
     input: AppendInputServerObserved<TPayload>,
   ): Promise<AcceptedEvent<TPayload>> =>
@@ -465,6 +598,7 @@ export const createEventLog = (
   return {
     appendClient,
     appendClientObserved,
+    appendClientObservedBatch,
     appendServerObserved,
     readMerged,
     readReplica,

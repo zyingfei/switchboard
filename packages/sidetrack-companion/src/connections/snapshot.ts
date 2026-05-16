@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { ANNOTATION_CREATED, isAnnotationCreatedPayload } from '../annotations/events.js';
@@ -42,7 +42,11 @@ import {
   serializeTabSessionProjection,
   type TabSessionProjection,
 } from '../tabsession/projection.js';
-import { serializeUrlProjection, type UrlProjection } from '../urls/projection.js';
+import {
+  serializeUrlProjection,
+  type UrlAttribution,
+  type UrlProjection,
+} from '../urls/projection.js';
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import { THREAD_UPSERTED, isThreadUpsertedPayload } from '../threads/events.js';
 import {
@@ -363,6 +367,13 @@ const snapshotFromAccumulators = (
 const stripFragmentAndTrailingSlash = (url: string): string =>
   url.replace(/#.*$/u, '').replace(/\/+$/u, '');
 
+const currentUrlAttributionFor = (
+  input: ConnectionsInput,
+  canonicalUrl: string,
+): UrlAttribution | undefined =>
+  input.urlProjection?.byCanonicalUrl.get(stripFragmentAndTrailingSlash(canonicalUrl))
+    ?.currentAttribution;
+
 // Stage 5 / T5 — `timeline_same_url_as_thread` gates. Pre-T5 the edge
 // fired whenever a timeline-visit's canonical URL matched a thread's
 // URL, which is noisy: shared URLs across tabs, reloads, preview
@@ -527,7 +538,8 @@ const collectVisitInstances = (input: {
     const existing = groups.get(groupKey);
     const increments =
       entry.visitCount ??
-      (entry.transition !== undefined && VISIT_INSTANCE_INCREMENTING_TRANSITIONS.has(entry.transition)
+      (entry.transition !== undefined &&
+      VISIT_INSTANCE_INCREMENTING_TRANSITIONS.has(entry.transition)
         ? 1
         : 0);
     if (existing === undefined) {
@@ -1114,6 +1126,15 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
     trackObservedAt(day.updatedAt);
     for (const entry of day.entries) {
       const visitKey = stripFragmentAndTrailingSlash(entry.canonicalUrl ?? entry.url);
+      const urlAttribution = currentUrlAttributionFor(input, visitKey);
+      const effectiveVisitWorkstreamId =
+        urlAttribution === undefined
+          ? entry.workstreamId !== undefined && entry.workstreamId.length > 0
+            ? entry.workstreamId
+            : undefined
+          : urlAttribution.workstreamId === null
+            ? undefined
+            : urlAttribution.workstreamId;
       const priorVisitObservedAt = visitObservedAtByKey.get(visitKey);
       if (priorVisitObservedAt === undefined || entry.lastSeenAt > priorVisitObservedAt) {
         visitObservedAtByKey.set(visitKey, entry.lastSeenAt);
@@ -1145,9 +1166,13 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
           // in the pass — this metadata is the "what flow was the
           // user in when this happened" hint, separate from the
           // edge.
-          ...(entry.workstreamId === undefined || entry.workstreamId.length === 0
+          ...(effectiveVisitWorkstreamId === undefined
             ? {}
-            : { workstreamId: entry.workstreamId }),
+            : {
+                workstreamId: effectiveVisitWorkstreamId,
+                workstreamAttributionOrigin:
+                  urlAttribution === undefined ? 'timeline-entry' : 'canonical-url',
+              }),
           ...(searchQuery === undefined ? {} : { searchQuery }),
           ...(engagementClass === undefined
             ? {}
@@ -1173,28 +1198,50 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
       // browsing inside a focused workstream. Emit one edge per
       // (visit, workstream) pair so the snapshot reflects the
       // attribution.
-      if (entry.workstreamId !== undefined && entry.workstreamId.length > 0) {
+      if (effectiveVisitWorkstreamId !== undefined) {
         upsertNode(nodes, {
           kind: 'workstream',
-          key: entry.workstreamId,
-          label: entry.workstreamId,
+          key: effectiveVisitWorkstreamId,
+          label: effectiveVisitWorkstreamId,
         });
-        upsertEdge(edges, {
-          kind: 'visit_in_workstream',
-          fromNodeId: nodeIdFor('timeline-visit', visitKey),
-          toNodeId: nodeIdFor('workstream', entry.workstreamId),
-          observedAt: entry.lastSeenAt,
-          producedBy: { source: 'timeline-projection' },
-          // 'inferred' — the active-workstream pointer at observation
-          // time is an inference about user intent, not a direct
-          // observation about the URL→workstream relationship. The
-          // sister `timeline_same_url_as_thread` edge nearby also
-          // uses 'inferred' for the same reason. The e2e suite at
-          // `connections-mvp-user-story.spec.ts:291` and downstream
-          // resolver code rely on this classification to decide
-          // whether to weight the edge as evidence.
-          confidence: 'inferred',
-        });
+        if (urlAttribution !== undefined && urlAttribution.workstreamId !== null) {
+          upsertEdge(edges, {
+            kind: 'visit_in_workstream',
+            fromNodeId: nodeIdFor('timeline-visit', visitKey),
+            toNodeId: nodeIdFor('workstream', effectiveVisitWorkstreamId),
+            observedAt: urlAttribution.observedAt,
+            producedBy: {
+              source: 'event-log',
+              eventType:
+                urlAttribution.source === 'inferred'
+                  ? URL_ATTRIBUTION_INFERRED
+                  : USER_ORGANIZED_ITEM,
+              dot: { replicaId: urlAttribution.replicaId, seq: urlAttribution.seq },
+            },
+            confidence: urlAttribution.source === 'inferred' ? 'inferred' : 'asserted',
+            metadata: {
+              attributionSource: urlAttribution.source,
+              attributionOrigin: 'canonical-url',
+            },
+          });
+        } else {
+          upsertEdge(edges, {
+            kind: 'visit_in_workstream',
+            fromNodeId: nodeIdFor('timeline-visit', visitKey),
+            toNodeId: nodeIdFor('workstream', effectiveVisitWorkstreamId),
+            observedAt: entry.lastSeenAt,
+            producedBy: { source: 'timeline-projection' },
+            // 'inferred' — the active-workstream pointer at observation
+            // time is an inference about user intent, not a direct
+            // observation about the URL→workstream relationship. The
+            // sister `timeline_same_url_as_thread` edge nearby also
+            // uses 'inferred' for the same reason. The e2e suite at
+            // `connections-mvp-user-story.spec.ts:291` and downstream
+            // resolver code rely on this classification to decide
+            // whether to weight the edge as evidence.
+            confidence: 'inferred',
+          });
+        }
       }
       const threadId = threadIdByUrl.get(visitKey);
       if (threadId !== undefined) {
@@ -1350,9 +1397,7 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
     ) {
       // Same hydration for the opener — degrade gracefully when its
       // projection record is absent.
-      const openerRecord = input.tabSessionProjection.bySessionId.get(
-        instance.openerTabSessionId,
-      );
+      const openerRecord = input.tabSessionProjection.bySessionId.get(instance.openerTabSessionId);
       const openerLabel =
         openerRecord?.latestTitle ??
         hostFromUrl(openerRecord?.latestUrl) ??
@@ -1399,9 +1444,7 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
     // inventory.
     const lookupCanonical = instance.canonicalUrl ?? instance.url;
     const urlAttribution =
-      lookupCanonical === undefined
-        ? undefined
-        : input.urlProjection?.byCanonicalUrl.get(lookupCanonical)?.currentAttribution;
+      lookupCanonical === undefined ? undefined : currentUrlAttributionFor(input, lookupCanonical);
     const tabSessionAttribution = input.tabSessionProjection.bySessionId.get(
       instance.tabSessionId,
     )?.currentAttribution;
@@ -1431,8 +1474,10 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
     // Pick the effective attribution for the visit-instance: URL takes
     // precedence; tab-session is the fallback.
     const effective =
-      urlAttribution !== undefined && urlAttribution.workstreamId !== null
-        ? { ...urlAttribution, origin: 'canonical-url' as const }
+      urlAttribution !== undefined
+        ? urlAttribution.workstreamId === null
+          ? null
+          : { ...urlAttribution, origin: 'canonical-url' as const }
         : tabSessionAttribution !== undefined && tabSessionAttribution.workstreamId !== null
           ? { ...tabSessionAttribution, origin: 'tab-session' as const }
           : null;
@@ -2407,6 +2452,14 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
       ),
     ].sort();
     const merged = [...input.events];
+    const candidateContext = {
+      merged,
+      existingEdges: [...baseSnapshot.edges],
+    };
+    const featureContext = {
+      merged,
+      snapshot: baseSnapshot,
+    };
 
     const observedAtForVisit = (visitKey: string): string => {
       const node = baseNodeById.get(nodeIdFor('timeline-visit', visitKey));
@@ -2415,17 +2468,11 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
 
     for (const fromVisitKey of visitKeys) {
       if (topK === 0) break;
-      const scoredCandidates = generateCandidates(fromVisitKey, {
-        merged,
-        existingEdges: [...baseSnapshot.edges],
-      })
+      const scoredCandidates = generateCandidates(fromVisitKey, candidateContext)
         .map((candidate) => {
           const toVisitKey = visitKeyFromNodeOrRaw(candidate.toVisitId);
           if (!baseNodeById.has(nodeIdFor('timeline-visit', toVisitKey))) return null;
-          const features = extractFeatures(candidate, {
-            merged,
-            snapshot: baseSnapshot,
-          });
+          const features = extractFeatures(candidate, featureContext);
           const prediction = ranker.predict(features, candidate);
           if (!Number.isFinite(prediction.score) || prediction.score < threshold) {
             return null;
@@ -2613,6 +2660,11 @@ export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
   // the last-written snapshotRevision in memory and short-circuit if
   // the new snapshot has the same revision id.
   let lastWrittenRevision: string | null = null;
+  let currentReadCache: {
+    readonly mtimeNs: bigint;
+    readonly size: bigint;
+    readonly snapshot: ConnectionsSnapshot;
+  } | null = null;
 
   const putCurrent = async (snapshot: ConnectionsSnapshot): Promise<void> => {
     const revision = snapshot.snapshotRevision;
@@ -2621,11 +2673,38 @@ export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
       return;
     }
     await writeAtomic(currentPath, JSON.stringify(snapshot, null, 2));
+    try {
+      const writtenStat = await stat(currentPath, { bigint: true });
+      currentReadCache = {
+        mtimeNs: writtenStat.mtimeNs,
+        size: writtenStat.size,
+        snapshot,
+      };
+    } catch {
+      currentReadCache = null;
+    }
     if (revision !== undefined) lastWrittenRevision = revision;
   };
   const readCurrent = async (): Promise<ConnectionsSnapshot | null> => {
     try {
-      return JSON.parse(await readFile(currentPath, 'utf8')) as ConnectionsSnapshot;
+      const currentStat = await stat(currentPath, { bigint: true });
+      if (
+        currentReadCache !== null &&
+        currentReadCache.mtimeNs === currentStat.mtimeNs &&
+        currentReadCache.size === currentStat.size
+      ) {
+        return currentReadCache.snapshot;
+      }
+      const snapshot = JSON.parse(await readFile(currentPath, 'utf8')) as ConnectionsSnapshot;
+      currentReadCache = {
+        mtimeNs: currentStat.mtimeNs,
+        size: currentStat.size,
+        snapshot,
+      };
+      if (snapshot.snapshotRevision !== undefined) {
+        lastWrittenRevision = snapshot.snapshotRevision;
+      }
+      return snapshot;
     } catch {
       return null;
     }

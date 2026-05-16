@@ -25,11 +25,14 @@ export const resolveTopicCosineThreshold = (): number => {
 };
 export const TOPIC_UNION_FIND_REVISION_KEY = 'topic-revision:v1:union-find' as const;
 export const TOPIC_HDBSCAN_REVISION_KEY = 'topic-revision:v2:hdbscan' as const;
+export const TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY =
+  'topic-revision:shadow:idf-rkn-split' as const;
 export const TOPIC_ALGORITHM_VERSION = TOPIC_UNION_FIND_REVISION_KEY;
 
 export const TOPIC_REVISION_KEYS = [
   TOPIC_UNION_FIND_REVISION_KEY,
   TOPIC_HDBSCAN_REVISION_KEY,
+  TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
 ] as const;
 
 export type TopicAlgorithmVersion = (typeof TOPIC_REVISION_KEYS)[number];
@@ -158,6 +161,8 @@ export const parseTopicRevision = (value: unknown): TopicRevision | null => {
 export interface TopicRevisionStore {
   readonly putRevision: (revision: TopicRevision) => Promise<void>;
   readonly putActiveRevision: (revision: TopicRevision) => Promise<void>;
+  readonly putShadowRevision: (revision: TopicRevision) => Promise<void>;
+  readonly readShadowRevision: () => Promise<TopicRevision | null>;
   readonly readRevision: (revisionId: string) => Promise<TopicRevision | null>;
   readonly readActiveRevision: () => Promise<TopicRevision | null>;
   readonly listRevisionIds: () => Promise<readonly string[]>;
@@ -166,6 +171,7 @@ export interface TopicRevisionStore {
 export const createTopicRevisionStore = (vaultRoot: string): TopicRevisionStore => {
   const root = join(vaultRoot, '_BAC', 'connections', 'topics');
   const currentPath = join(root, 'current.json');
+  const shadowPath = join(root, 'current.shadow.json');
   const revisionPath = (revisionId: string): string => join(root, `${revisionId}.json`);
 
   const writeAtomic = async (path: string, body: string): Promise<void> => {
@@ -193,11 +199,19 @@ export const createTopicRevisionStore = (vaultRoot: string): TopicRevisionStore 
     await writeAtomic(currentPath, JSON.stringify(revision, null, 2));
   };
 
+  const putShadowRevision = async (revision: TopicRevision): Promise<void> => {
+    await putRevision(revision);
+    await writeAtomic(shadowPath, JSON.stringify(revision, null, 2));
+  };
+
   const readRevision = async (revisionId: string): Promise<TopicRevision | null> =>
     readTopicRevision(revisionPath(revisionId));
 
   const readActiveRevision = async (): Promise<TopicRevision | null> =>
     readTopicRevision(currentPath);
+
+  const readShadowRevision = async (): Promise<TopicRevision | null> =>
+    readTopicRevision(shadowPath);
 
   const listRevisionIds = async (): Promise<readonly string[]> => {
     const entries = await readdir(root).catch(() => [] as readonly string[]);
@@ -210,6 +224,8 @@ export const createTopicRevisionStore = (vaultRoot: string): TopicRevisionStore 
   return {
     putRevision,
     putActiveRevision,
+    putShadowRevision,
+    readShadowRevision,
     readRevision,
     readActiveRevision,
     listRevisionIds,

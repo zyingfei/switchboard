@@ -58,8 +58,8 @@ describe('connections — computeTimelineRail', () => {
     expect(rail!.rows[0]!.replicaId).toBe('mac');
     expect(rail!.rows[0]!.windows.length).toBe(1);
     const [a, b] = rail!.rows[0]!.windows[0]!;
-    expect(a).toBeCloseTo(9 + 10 / 60, 3);
-    expect(b).toBeCloseTo(9 + 25 / 60, 3);
+    expect(a).toBe(Date.parse(localIso(2026, 5, 14, 9, 10)));
+    expect(b).toBe(Date.parse(localIso(2026, 5, 14, 9, 25)));
   });
 
   it('splits a >30min gap into separate windows', () => {
@@ -134,7 +134,7 @@ describe('connections — computeTimelineRail', () => {
     expect(computeTimelineRail(snap, 'thread:t1')).toBeNull();
   });
 
-  it('picks the most-populated UTC day when the snapshot spans days', () => {
+  it('All range scales to the observed event span when the snapshot spans days', () => {
     const dayA: ConnectionsSnapshot['edges'] = [
       {
         id: 'eA1',
@@ -168,10 +168,13 @@ describe('connections — computeTimelineRail', () => {
     ];
     const snap = baseSnap({ edges: [...dayA, ...dayB] });
     const rail = computeTimelineRail(snap, 'thread:t1');
-    expect(rail!.date).toBe('2026-05-14');
+    expect(rail!.date).toBe(`${localYmd(2026, 5, 13)}-${localYmd(2026, 5, 14)}`);
+    expect(rail!.scaleLabel).toBe('hours');
+    expect(rail!.startMs).toBe(Date.parse(localIso(2026, 5, 13, 15, 0)));
+    expect(rail!.endMs).toBe(Date.parse(localIso(2026, 5, 14, 10, 0)));
   });
 
-  it('resolves anchor + neighbor markers from node lastSeenAt within the chosen day', () => {
+  it('resolves anchor + neighbor markers from node lastSeenAt within the chosen range', () => {
     const snap = baseSnap({
       nodes: [
         {
@@ -212,8 +215,12 @@ describe('connections — computeTimelineRail', () => {
       ],
     });
     const rail = computeTimelineRail(snap, 'thread:t1');
-    expect(rail!.anchorTime).toBeCloseTo(9 + 30 / 60, 3);
-    expect(rail!.neighborTimes).toEqual([10 + 15 / 60]);
+    expect(rail!.anchorTime).toBe(Date.parse(localIso(2026, 5, 14, 9, 30)));
+    expect(rail!.neighborTimes).toEqual([Date.parse(localIso(2026, 5, 14, 10, 15))]);
+    expect(rail!.markers.map((marker) => [marker.kind, marker.nodeId])).toEqual([
+      ['anchor', 'thread:t1'],
+      ['related', 'workstream:w1'],
+    ]);
   });
 
   it('falls back to node lastSeenAt when edges have no producer dot (inferred-only subgraph)', () => {
@@ -257,7 +264,66 @@ describe('connections — computeTimelineRail', () => {
     expect(rail!.date).toBe('2026-05-14');
     expect(rail!.rows.length).toBe(1);
     expect(rail!.rows[0]!.replicaId).toBe('mac');
-    expect(rail!.anchorTime).toBeCloseTo(9 + 15 / 60, 3);
-    expect(rail!.neighborTimes).toEqual([10]);
+    expect(rail!.anchorTime).toBe(Date.parse(localIso(2026, 5, 14, 9, 15)));
+    expect(rail!.neighborTimes).toEqual([Date.parse(localIso(2026, 5, 14, 10, 0))]);
+  });
+
+  it('honors a selected preset range', () => {
+    const snap = baseSnap({
+      edges: [
+        {
+          id: 'old',
+          kind: 'thread_in_workstream',
+          fromNodeId: 'thread:t1',
+          toNodeId: 'workstream:w1',
+          observedAt: localIso(2026, 5, 14, 8, 0),
+          producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 1 } },
+          confidence: 'asserted',
+        },
+        {
+          id: 'fresh',
+          kind: 'thread_in_workstream',
+          fromNodeId: 'thread:t1',
+          toNodeId: 'workstream:w1',
+          observedAt: localIso(2026, 5, 14, 9, 45),
+          producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 2 } },
+          confidence: 'asserted',
+        },
+      ],
+    });
+    const rail = computeTimelineRail(snap, 'thread:t1', {
+      range: { kind: 'preset', preset: '1h' },
+      nowMs: Date.parse(localIso(2026, 5, 14, 10, 0)),
+    });
+    expect(rail).not.toBeNull();
+    expect(rail!.startMs).toBe(Date.parse(localIso(2026, 5, 14, 9, 0)));
+    expect(rail!.endMs).toBe(Date.parse(localIso(2026, 5, 14, 10, 0)));
+    expect(rail!.rows[0]!.windows).toHaveLength(1);
+    expect(rail!.rows[0]!.windows[0]![0]).toBe(Date.parse(localIso(2026, 5, 14, 9, 45)));
+  });
+
+  it('keeps boundary observations visible at the end of the selected range', () => {
+    const endMs = Date.parse(localIso(2026, 5, 14, 10, 0));
+    const snap = baseSnap({
+      edges: [
+        {
+          id: 'at-end',
+          kind: 'thread_in_workstream',
+          fromNodeId: 'thread:t1',
+          toNodeId: 'workstream:w1',
+          observedAt: new Date(endMs).toISOString(),
+          producedBy: { source: 'event-log', dot: { replicaId: 'mac', seq: 1 } },
+          confidence: 'asserted',
+        },
+      ],
+    });
+    const rail = computeTimelineRail(snap, 'thread:t1', {
+      range: { kind: 'preset', preset: '1h' },
+      nowMs: endMs,
+    });
+    expect(rail).not.toBeNull();
+    const [start, end] = rail!.rows[0]!.windows[0]!;
+    expect(start).toBeLessThan(end);
+    expect(end).toBe(endMs);
   });
 });

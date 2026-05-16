@@ -32,6 +32,7 @@ import {
 import type { Candidate } from './types.js';
 
 type BinaryFeature = 0 | 1;
+type FeatureContext = Parameters<ExtractFeatures>[1];
 
 interface VisitRecord {
   readonly id: string;
@@ -71,9 +72,17 @@ interface FeatureModel {
   readonly returnCountByVisit: ReadonlyMap<string, number>;
   readonly openerGraph: ReadonlyMap<string, ReadonlySet<string>>;
   readonly navigationGraph: ReadonlyMap<string, ReadonlySet<string>>;
+  readonly resemblanceEdgesByVisit: ReadonlyMap<string, readonly ConnectionEdge[]>;
+  readonly aliasesByVisit: Map<string, ReadonlySet<string>>;
+  readonly searchQueriesByVisit: Map<string, ReadonlySet<string>>;
+  readonly titleTokensByVisit: Map<string, ReadonlySet<string>>;
+  readonly pathTokensByVisit: Map<string, ReadonlySet<string>>;
+  readonly latestObservedAtByVisit: Map<string, number | null>;
   readonly snapshot: ConnectionsSnapshot;
   readonly referenceMs: number | null;
 }
+
+const featureModelCache = new WeakMap<FeatureContext, FeatureModel>();
 
 const TIMELINE_VISIT_PREFIX = 'timeline-visit:';
 const THREAD_PREFIX = 'thread:';
@@ -354,6 +363,9 @@ const timelineNodesByVisitKey = (
 };
 
 const aliasesForVisit = (model: FeatureModel, visitId: string): ReadonlySet<string> => {
+  const cached = model.aliasesByVisit.get(visitId);
+  if (cached !== undefined) return cached;
+
   const aliases = new Set<string>();
   const rawKey = visitKeyFromNodeOrRaw(visitId);
   const urlKey = normalizedUrlCandidate(rawKey);
@@ -374,6 +386,7 @@ const aliasesForVisit = (model: FeatureModel, visitId: string): ReadonlySet<stri
     for (const id of idsForCanonical) aliases.add(id);
   }
 
+  model.aliasesByVisit.set(visitId, aliases);
   return aliases;
 };
 
@@ -425,6 +438,9 @@ const normalizeSearchQuery = (value: string): string =>
   value.replace(/\s+/gu, ' ').trim().toLowerCase();
 
 const searchQueriesForVisit = (model: FeatureModel, visitId: string): ReadonlySet<string> => {
+  const cached = model.searchQueriesByVisit.get(visitId);
+  if (cached !== undefined) return cached;
+
   const queries = new Set<string>();
   const aliases = aliasesForVisit(model, visitId);
   for (const alias of aliases) {
@@ -443,6 +459,7 @@ const searchQueriesForVisit = (model: FeatureModel, visitId: string): ReadonlySe
       if (query.length > 0) queries.add(query);
     }
   }
+  model.searchQueriesByVisit.set(visitId, queries);
   return queries;
 };
 
@@ -458,6 +475,9 @@ const tokenize = (value: string): readonly string[] =>
     );
 
 const titleTokensForVisit = (model: FeatureModel, visitId: string): ReadonlySet<string> => {
+  const cached = model.titleTokensByVisit.get(visitId);
+  if (cached !== undefined) return cached;
+
   const tokens = new Set<string>();
   for (const alias of aliasesForVisit(model, visitId)) {
     const record = model.recordsById.get(alias);
@@ -469,6 +489,7 @@ const titleTokensForVisit = (model: FeatureModel, visitId: string): ReadonlySet<
       for (const token of tokenize(node.metadata.title)) tokens.add(token);
     }
   }
+  model.titleTokensByVisit.set(visitId, tokens);
   return tokens;
 };
 
@@ -482,10 +503,17 @@ const pathTokensForUrl = (url: string): readonly string[] => {
 };
 
 const pathTokensForVisit = (model: FeatureModel, visitId: string): ReadonlySet<string> => {
+  const cached = model.pathTokensByVisit.get(visitId);
+  if (cached !== undefined) return cached;
+
   const tokens = new Set<string>();
   const canonicalUrl = canonicalUrlForVisit(model, visitId);
-  if (canonicalUrl === null) return tokens;
+  if (canonicalUrl === null) {
+    model.pathTokensByVisit.set(visitId, tokens);
+    return tokens;
+  }
   for (const token of pathTokensForUrl(canonicalUrl)) tokens.add(token);
+  model.pathTokensByVisit.set(visitId, tokens);
   return tokens;
 };
 
@@ -722,6 +750,25 @@ const buildChainGraph = (
   return graph;
 };
 
+const buildResemblanceEdgeIndex = (
+  snapshot: ConnectionsSnapshot,
+): ReadonlyMap<string, readonly ConnectionEdge[]> => {
+  const byVisit = new Map<string, ConnectionEdge[]>();
+  const add = (visitId: string, edge: ConnectionEdge): void => {
+    const key = visitKeyFromNodeOrRaw(visitId);
+    const list = byVisit.get(key) ?? [];
+    list.push(edge);
+    byVisit.set(key, list);
+  };
+
+  for (const edge of snapshot.edges) {
+    if (edge.kind !== 'visit_resembles_visit') continue;
+    add(edge.fromNodeId, edge);
+    add(edge.toNodeId, edge);
+  }
+  return byVisit;
+};
+
 const referenceMsFor = (
   events: readonly AcceptedEvent[],
   snapshot: ConnectionsSnapshot,
@@ -765,9 +812,23 @@ const buildFeatureModel = (
     returnCountByVisit: buildReturnCountMap(events),
     openerGraph: buildChainGraph(recordsById, (record) => record.openerVisitId),
     navigationGraph: buildChainGraph(recordsById, (record) => record.previousVisitId),
+    resemblanceEdgesByVisit: buildResemblanceEdgeIndex(snapshot),
+    aliasesByVisit: new Map<string, ReadonlySet<string>>(),
+    searchQueriesByVisit: new Map<string, ReadonlySet<string>>(),
+    titleTokensByVisit: new Map<string, ReadonlySet<string>>(),
+    pathTokensByVisit: new Map<string, ReadonlySet<string>>(),
+    latestObservedAtByVisit: new Map<string, number | null>(),
     snapshot,
     referenceMs: referenceMsFor(events, snapshot),
   };
+};
+
+const featureModelForContext = (context: FeatureContext): FeatureModel => {
+  const cached = featureModelCache.get(context);
+  if (cached !== undefined) return cached;
+  const model = buildFeatureModel(context.merged, context.snapshot);
+  featureModelCache.set(context, model);
+  return model;
 };
 
 const sameWorkstreamFeature = (
@@ -927,9 +988,15 @@ const cosineSimilarityFeature = (
 ): number => {
   const fromAliases = aliasesForVisit(model, candidate.fromVisitId);
   const toAliases = aliasesForVisit(model, candidate.toVisitId);
+  const candidateEdges = new Set<ConnectionEdge>();
+  for (const alias of fromAliases) {
+    const edges = model.resemblanceEdgesByVisit.get(alias);
+    if (edges === undefined) continue;
+    for (const edge of edges) candidateEdges.add(edge);
+  }
+
   let best = 0;
-  for (const edge of model.snapshot.edges) {
-    if (edge.kind !== 'visit_resembles_visit') continue;
+  for (const edge of candidateEdges) {
     if (!edgeConnectsCandidate(edge, fromAliases, toAliases)) continue;
     const raw =
       edge.metadata?.['cosine'] ??
@@ -944,6 +1011,10 @@ const latestObservedAtForVisit = (
   candidateVisitId: string,
   model: FeatureModel,
 ): number | null => {
+  if (model.latestObservedAtByVisit.has(candidateVisitId)) {
+    return model.latestObservedAtByVisit.get(candidateVisitId) ?? null;
+  }
+
   let latest: number | null = null;
   for (const alias of aliasesForVisit(model, candidateVisitId)) {
     const record = model.recordsById.get(alias);
@@ -954,6 +1025,7 @@ const latestObservedAtForVisit = (
     const nodeMs = parseTimestamp(node?.lastSeenAt) ?? parseTimestamp(node?.firstSeenAt);
     if (nodeMs !== null) latest = latest === null ? nodeMs : Math.max(latest, nodeMs);
   }
+  model.latestObservedAtByVisit.set(candidateVisitId, latest);
   return latest;
 };
 
@@ -1050,7 +1122,7 @@ const userAssertedInWorkstreamFeature = (
   );
 
 export const extractFeatures: ExtractFeatures = (candidate, context): CandidatePairFeatures => {
-  const model = buildFeatureModel(context.merged, context.snapshot);
+  const model = featureModelForContext(context);
 
   return {
     schemaVersion: FEATURE_SCHEMA_VERSION,

@@ -195,7 +195,7 @@ export const isWorkboardChangedMessage = (value: unknown): value is WorkboardCha
 // no-op behavior since there's nothing to focus on.
 export interface FocusThreadInSidePanelMessage {
   readonly type: typeof messageTypes.focusThreadInSidePanel;
-  readonly threadUrl: string;
+  readonly threadUrl?: string;
   readonly bacId?: string;
   readonly title?: string;
   readonly lastSeenAt?: string;
@@ -206,7 +206,9 @@ export const isFocusThreadInSidePanelMessage = (
 ): value is FocusThreadInSidePanelMessage =>
   isRecord(value) &&
   value.type === messageTypes.focusThreadInSidePanel &&
-  typeof value.threadUrl === 'string' &&
+  ((typeof value.threadUrl === 'string' && value.threadUrl.length > 0) ||
+    (typeof value.bacId === 'string' && value.bacId.length > 0)) &&
+  (value.threadUrl === undefined || typeof value.threadUrl === 'string') &&
   (value.bacId === undefined || typeof value.bacId === 'string') &&
   (value.title === undefined || typeof value.title === 'string') &&
   (value.lastSeenAt === undefined || typeof value.lastSeenAt === 'string');
@@ -321,7 +323,10 @@ export type WorkboardRequest =
     }
   | {
       readonly type: typeof messageTypes.focusThreadInSidePanel;
-      readonly threadUrl: string;
+      readonly threadUrl?: string;
+      readonly bacId?: string;
+      readonly title?: string;
+      readonly lastSeenAt?: string;
     }
   | {
       readonly type: typeof messageTypes.createReminder;
@@ -635,7 +640,14 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
   }
 
   if (hasType(value, messageTypes.focusThreadInSidePanel)) {
-    return typeof value.threadUrl === 'string';
+    return (
+      ((typeof value.threadUrl === 'string' && value.threadUrl.length > 0) ||
+        (typeof value.bacId === 'string' && value.bacId.length > 0)) &&
+      (value.threadUrl === undefined || typeof value.threadUrl === 'string') &&
+      (value.bacId === undefined || typeof value.bacId === 'string') &&
+      (value.title === undefined || typeof value.title === 'string') &&
+      (value.lastSeenAt === undefined || typeof value.lastSeenAt === 'string')
+    );
   }
 
   if (hasType(value, messageTypes.createReminder)) {

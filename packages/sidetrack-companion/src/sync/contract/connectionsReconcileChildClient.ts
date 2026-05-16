@@ -64,14 +64,35 @@ export const runReconcileInChild = (
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
     let settled = false;
-    const settle = (result: ReconcileWorkerResult): void => {
-      if (settled) return;
-      settled = true;
-      // Best-effort terminate; ignore errors from already-exited child.
+    let exited = false;
+    let reapTimer: ReturnType<typeof setTimeout> | undefined;
+    const clearReapTimer = (): void => {
+      if (reapTimer === undefined) return;
+      clearTimeout(reapTimer);
+      reapTimer = undefined;
+    };
+    const terminateChild = (): void => {
       try {
         child.kill('SIGTERM');
       } catch {
         /* child already exited */
+      }
+    };
+    const settle = (result: ReconcileWorkerResult, mode: 'graceful' | 'terminate'): void => {
+      if (settled) return;
+      settled = true;
+      if (mode === 'terminate') {
+        terminateChild();
+      } else {
+        try {
+          if (child.connected) child.disconnect();
+        } catch {
+          /* child already disconnected */
+        }
+        reapTimer = setTimeout(() => {
+          if (!exited) terminateChild();
+        }, 30_000);
+        reapTimer.unref();
       }
       resolve(result);
     };
@@ -82,18 +103,20 @@ export const runReconcileInChild = (
       process.stderr.write(`[reconcile.child] ${buf.toString('utf8')}`);
     });
     child.on('message', (raw: unknown) => {
-      settle(raw as ReconcileWorkerResult);
+      settle(raw as ReconcileWorkerResult, 'graceful');
     });
     child.on('error', (err) => {
-      settle({ seq: job.seq, ok: false, error: err.message });
+      settle({ seq: job.seq, ok: false, error: err.message }, 'terminate');
     });
     child.on('exit', (code, signal) => {
+      exited = true;
+      clearReapTimer();
       if (settled) return;
       settle({
         seq: job.seq,
         ok: false,
         error: `reconcile child exited code=${String(code)} signal=${String(signal ?? '')} without posting result`,
-      });
+      }, 'terminate');
     });
     const message: ReconcileChildMessage = {
       kind: 'reconcile',

@@ -178,6 +178,44 @@ describe('event log', () => {
     expect(second.deps[first.dot.replicaId]).toBe(first.dot.seq);
   });
 
+  it('batch appends browser-observed events and reports idempotent replays', async () => {
+    const log = createEventLog(vaultRoot, replica);
+    const first = await log.appendClientObservedBatch?.([
+      {
+        clientEventId: 'batch-a',
+        aggregateId: 'visit:a',
+        type: 'navigation.committed',
+        payload: { payloadVersion: 1 },
+        baseVector: {},
+      },
+      {
+        clientEventId: 'batch-b',
+        aggregateId: 'visit:b',
+        type: 'navigation.committed',
+        payload: { payloadVersion: 1 },
+        baseVector: {},
+        clientDeps: ['batch-a'],
+      },
+    ]);
+    expect(first?.map((entry) => entry.appended)).toEqual([true, true]);
+    expect(first?.[1]?.event.deps[replica.replicaId]).toBe(first?.[0]?.event.dot.seq);
+
+    const replay = await log.appendClientObservedBatch?.([
+      {
+        clientEventId: 'batch-a',
+        aggregateId: 'visit:a',
+        type: 'navigation.committed',
+        payload: { payloadVersion: 1 },
+        baseVector: {},
+      },
+    ]);
+    expect(replay?.[0]?.appended).toBe(false);
+    expect((await log.readMerged()).map((event) => event.clientEventId)).toEqual([
+      'batch-a',
+      'batch-b',
+    ]);
+  });
+
   it('readMerged + readByAggregate filter and sort consistently', async () => {
     const log = createEventLog(vaultRoot, replica);
     await log.appendClient({
