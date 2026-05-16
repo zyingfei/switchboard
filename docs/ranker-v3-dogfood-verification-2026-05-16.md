@@ -261,6 +261,22 @@ The response was saved at
 vault count still showed `0` `user.flow.confirmed` events, so #189
 supplies the missing UI path but does not by itself satisfy CV-3.
 
+### Follow-up: CV-3 needs four distinct anchors
+
+A single `Keep` click is useful for proving that the UI can emit
+`USER_FLOW_CONFIRMED`, but it is not enough to validate CV-3. The
+trainer builds usable query groups by `fromVisitId`; a group must have
+at least two rows and at least two labels, and `timeSplitGroups` returns
+`null` unless there are at least four usable groups with time-separated
+`generatedAt` values. Practically, the dogfood run needs at least four
+real `Keep` confirmations from four distinct anchor pages before the
+methodology spine can prove that the restamp makes the split fire.
+
+The local dogfood watcher was adjusted accordingly after this check:
+`MIN_CONFIRMED=4` and `MIN_DISTINCT_FROM=4`. This does not fabricate
+labels; it only prevents a premature retrain after a first click that
+can prove the event path but cannot satisfy the CV-3 validation gate.
+
 ## Conclusion
 
 The verification confirms the core safety improvement over the v2
@@ -282,6 +298,7 @@ blocker:
 | post-#187 forced retrain | n/a | `skipped:no-usable-query-groups`, `candidateCount: 0` |
 | post-#190 latest-main retrain | n/a | `skipped:no-usable-query-groups`, `candidateCount: 0` |
 | explicit positive-feedback UI path | absent | present via #189 `Keep` action; no real dogfood clicks yet |
+| minimum CV-3 dogfood input | n/a | at least 4 `Keep` confirmations from 4 distinct anchor pages |
 | v3 replacement model written | n/a | no |
 
 This should be treated as a safe-block result, not a quality win for

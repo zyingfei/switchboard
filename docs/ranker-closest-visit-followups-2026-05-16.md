@@ -85,6 +85,13 @@ merged, a pre-dogfood vault check still showed `0`
 a candidate model with legitimate positive rows and produces
 methodology-spine/ship-gate output.
 
+The next dogfood run should not trigger on the first `Keep` event. One
+event proves the feedback path but cannot satisfy CV-3: usable groups
+are keyed by anchor visit (`fromVisitId`), and the forward time split
+requires at least four usable groups. Collect at least four `Keep`
+confirmations from four distinct anchor pages before treating a forced
+retrain as a CV-3 validation attempt.
+
 ## Closing rule
 
 An item is removed from the table only when its change is **merged**
