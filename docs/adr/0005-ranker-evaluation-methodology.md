@@ -135,10 +135,14 @@ status, revision IDs, and label counts.
 
 ## Follow-ups
 
-- [ ] Surface `methodologySpine.shipGate.status` and `.reason` in
+- [x] Surface `methodologySpine.shipGate.status` and `.reason` in
       work-graph health diagnostics before enforcing a fail-closed
-      load-time ship gate.
-- [ ] Add a cheap preflight for "no usable query group with both
+      load-time ship gate. Done in PR #186.
+- [x] Add a cheap preflight for "no usable query group with both
       positive and negative labels" before LightGBM/tuning work starts.
+      The post-#186 dogfood retry made this urgent: the retrain spent
+      about `1325s`, then failed with `0` positive rows and `0` usable
+      query groups. Done in PR #187 as a structural preflight before
+      candidate generation.
 - [ ] Generalize the feature-provenance invariant into CI before
       future learned rankers are added.
